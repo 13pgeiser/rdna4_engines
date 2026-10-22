@@ -35,6 +35,19 @@ use hipfire_runtime::spec::{
     MtpSpeculator, MtpWindow, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig,
     SpecScratch, SpecStep, SpecTarget, Speculator,
 };
+use hipfire_runtime::spec_economics::{
+    derived_offer_bin, fn_measured_ar_price, fn_measured_depth_counts, fn_measured_load_identity,
+    fn_measured_reference_supported, fn_measured_window_price, fn_phase1_ar_price,
+    fn_phase1_window_price, native_margin_bin, CalibrationCounts, ContextBucket, DerivedAction,
+    DerivedCard, DerivedCostMode, DerivedDepth, DerivedFeature, DerivedPrice, DerivedRequest,
+    DerivedSource, NativeMarginBin, ResidualKey, DERIVED_MAX_DRAFTS, FN_DERIVED_VERSION,
+};
+#[cfg(test)]
+use hipfire_runtime::spec_economics::{fresh_agreement, Agreement, MAX_DEPTH};
+use hipfire_runtime::spec_economics::{
+    observe_agreement, observe_agreement_counts, valid_us, Action, NativeWindow, WindowStats,
+    AGREEMENT_PRIOR, DEFAULT_DECAY,
+};
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
     DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
@@ -179,10 +192,68 @@ impl HeadTicket {
 use std::ops::ControlFlow;
 use std::time::Instant;
 
-/// `HIPFIRE_MTP_FLOOR_TRACE=1`: one `QWEN4_FLOOR_TRACE` JSON line per AR
-/// token, calibration, native and external window on stderr.
+/// `HIPFIRE_MTP_FLOOR_TRACE=1` (or `2`): one `QWEN4_FLOOR_TRACE` JSON line
+/// per AR token, calibration, native and external window on stderr.
 fn floor_trace_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_TRACE").is_ok_and(|value| value == "1")
+    hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "2"))
+}
+
+/// `HIPFIRE_MTP_FLOOR_TRACE=2`: besides every `QWEN4_FLOOR_TRACE` line, one
+/// `QWEN4_FLOOR_CALL` line per call into the floor's public API, with its
+/// exact inputs and outputs, so a replay can feed the same call sequence into
+/// a re-implementation and compare every return value bit for bit
+/// ([`hipfire_runtime::spec_economics::replay_call_log`]).
+fn floor_call_trace_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_TRACE").is_ok_and(|value| value == "2")
+}
+
+/// The prefix of the floor's `HIPFIRE_MTP_FLOOR_TRACE=1` state lines.
+const FLOOR_TRACE_PREFIX: &str = "QWEN4_FLOOR_TRACE";
+
+/// The prefix of the floor's `HIPFIRE_MTP_FLOOR_TRACE=2` call-log lines.
+const FLOOR_CALL_PREFIX: &str = "QWEN4_FLOOR_CALL";
+
+/// `floor` with the exact call log on stderr under `HIPFIRE_MTP_FLOOR_TRACE=2`
+/// (its `install` line: what built it, `owner`, and whether the floor is
+/// `enabled` for its request); `floor` itself otherwise.
+pub(crate) fn floor_with_call_log(
+    floor: Qwen4Floor,
+    owner: &'static str,
+    enabled: bool,
+) -> Qwen4Floor {
+    if floor_call_trace_enabled() {
+        floor.with_call_log_enabled(FLOOR_CALL_PREFIX, owner, enabled)
+    } else {
+        floor
+    }
+}
+
+/// A finite `f32` as `{}` (shortest round trip); `null` otherwise, which a
+/// JSON number cannot be.
+struct JsonF32(f32);
+
+impl std::fmt::Display for JsonF32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_finite() {
+            write!(f, "{}", self.0)
+        } else {
+            f.write_str("null")
+        }
+    }
+}
+
+/// A finite `f64` as `{}`; `null` otherwise.
+struct JsonF64(f64);
+
+impl std::fmt::Display for JsonF64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_finite() {
+            write!(f, "{}", self.0)
+        } else {
+            f.write_str("null")
+        }
+    }
 }
 
 /// `HIPFIRE_MTP_PHASE_TIMING=1`: per-window phase lines on stderr.
@@ -435,6 +506,14 @@ pub fn window_to_spec_step(window: MtpWindow) -> Result<SpecStep, String> {
 pub struct Qwen4SpecScratch {
     block_size: usize,
     target_snapshot: Option<TargetTicket>,
+    #[cfg(feature = "reference-parity")]
+    fault_after_snapshot: Option<usize>,
+    #[cfg(feature = "reference-parity")]
+    fault_receipt: Option<rdna_compute::LabKernelFaultReceipt>,
+    #[cfg(all(feature = "reference-parity", feature = "kernel-timing"))]
+    profile_after_snapshot: bool,
+    #[cfg(all(feature = "reference-parity", feature = "kernel-timing"))]
+    kernel_report: Option<hip_bridge::KernelTimingReport>,
 }
 
 /// [`SpecTarget::spec_advance`] on one rank inside an EP fan-out (mesh
@@ -890,11 +969,18 @@ impl Qwen4Bundle {
         }
     }
 
-    /// Most rows (the seed included) one speculative verify or replay forward
-    /// of this load may take: [`spec_verify_rows_cap`] of the load's CPU
-    /// splice flag, fixed at load.
+    /// Physical CPU-owned verify storage, including the seed. A legacy load
+    /// retains its default window; an admitted+prewarmed load uses its actual
+    /// reserved extent. Qualification remains a separate per-call bound.
     pub(crate) fn spec_verify_rows_cap(&self) -> usize {
-        spec_verify_rows_cap(self.has_cpu_deferred_experts())
+        let storage = self.cpu_storage_capacity_rows();
+        let cpu = self.has_cpu_deferred_experts() || storage > 0;
+        let default = spec_verify_rows_cap(cpu);
+        if cpu {
+            storage.max(default)
+        } else {
+            default
+        }
     }
 
     /// Refuse a `rows`-row speculative verify or replay on an armed CPU
@@ -999,6 +1085,73 @@ impl Qwen4Bundle {
             Qwen4Ops::Single(gpu) => Some(std::mem::replace(&mut gpu.lane_rows_scope, true)),
             Qwen4Ops::Mesh(_) => None,
         };
+        #[cfg(feature = "reference-parity")]
+        let inject_fault = {
+            let s = scratch
+                .as_any_mut()
+                .downcast_mut::<Qwen4SpecScratch>()
+                .ok_or("Qwen4 verify_block: scratch is not Qwen4SpecScratch")?;
+            std::mem::take(&mut s.fault_after_snapshot)
+        };
+        #[cfg(feature = "reference-parity")]
+        let result = (|| {
+            #[cfg(feature = "kernel-timing")]
+            let profile = {
+                let s = scratch
+                    .as_any_mut()
+                    .downcast_mut::<Qwen4SpecScratch>()
+                    .ok_or("Qwen4 verify profiling: wrong scratch type")?;
+                std::mem::take(&mut s.profile_after_snapshot)
+            };
+            #[cfg(feature = "kernel-timing")]
+            if profile {
+                ops.gpu()?
+                    .lab_begin_kernel_timing()
+                    .map_err(|e| e.to_string())?;
+            }
+            let result = match inject_fault {
+                Some(n) => match ops.gpu()?.lab_arm_kernel_fault_after(n) {
+                    Ok(()) => {
+                        let result = self.ops_spec_rows(ops, block, read_picks);
+                        let receipt = ops.gpu()?.lab_disarm_kernel_fault();
+                        if let Some(s) = scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
+                            s.fault_receipt = Some(receipt);
+                        }
+                        result
+                    }
+                    Err(error) => Err(error.to_string()),
+                },
+                None => self.ops_spec_rows(ops, block, read_picks),
+            };
+            #[cfg(feature = "kernel-timing")]
+            if profile {
+                if result.is_err() {
+                    ops.gpu()?
+                        .lab_cancel_kernel_timing()
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    match ops.gpu()?.lab_finish_kernel_timing() {
+                        Ok(report) => {
+                            if let Some(s) = scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>()
+                            {
+                                s.kernel_report = Some(report);
+                            }
+                        }
+                        Err(error) => {
+                            let cancel = ops.gpu()?.lab_cancel_kernel_timing();
+                            return Err(match cancel {
+                                Ok(()) => error.to_string(),
+                                Err(cancel) => {
+                                    format!("{error}; collector cancellation failed: {cancel}")
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            result
+        })();
+        #[cfg(not(feature = "reference-parity"))]
         let result = self.ops_spec_rows(ops, block, read_picks);
         if let (Some(previous), Qwen4Ops::Single(gpu)) = (rows_scope, &mut *ops) {
             gpu.lane_rows_scope = previous;
@@ -1212,6 +1365,14 @@ impl Qwen4Bundle {
         Ok(Box::new(Qwen4SpecScratch {
             block_size,
             target_snapshot: None,
+            #[cfg(feature = "reference-parity")]
+            fault_after_snapshot: None,
+            #[cfg(feature = "reference-parity")]
+            fault_receipt: None,
+            #[cfg(all(feature = "reference-parity", feature = "kernel-timing"))]
+            profile_after_snapshot: false,
+            #[cfg(all(feature = "reference-parity", feature = "kernel-timing"))]
+            kernel_report: None,
         }))
     }
 }
@@ -1239,6 +1400,75 @@ impl Qwen4Bundle {
         )
     }
 
+    pub(crate) fn dev_verify_fault_after_snapshot(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        scratch: &mut dyn SpecScratch,
+        successful_launches: usize,
+    ) -> Result<crate::wide_verify_oracle::DevVerifyFaultOutcome, String> {
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 fault injection: wrong scratch type")?;
+        s.fault_after_snapshot = Some(successful_launches);
+        s.fault_receipt = None;
+        let position = self.state.position;
+        let result = self.dev_verify_block_rows(gpu, block, position, scratch, false);
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 fault injection: wrong scratch type")?;
+        s.fault_after_snapshot = None;
+        let receipt = s.fault_receipt.take();
+        match result {
+            Err(verify_error) => {
+                let receipt = receipt.filter(|r| r.injected).ok_or_else(|| {
+                    format!("verify failed without the requested kernel fault: {verify_error}")
+                })?;
+                Ok(crate::wide_verify_oracle::DevVerifyFaultOutcome {
+                    verify_error,
+                    receipt,
+                })
+            }
+            Ok(_) => {
+                self.dev_rollback_verify(gpu, scratch)?;
+                Err("requested kernel fault did not fire; successful verify was rolled back".into())
+            }
+        }
+    }
+
+    #[cfg(feature = "kernel-timing")]
+    pub(crate) fn dev_verify_resident_profiled(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<hip_bridge::KernelTimingReport, String> {
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 verify profiling: wrong scratch type")?;
+        s.profile_after_snapshot = true;
+        s.kernel_report = None;
+        let position = self.state.position;
+        let result = self.dev_verify_block_rows(gpu, block, position, scratch, false);
+        let s = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 verify profiling: wrong scratch type")?;
+        s.profile_after_snapshot = false;
+        let report = s.kernel_report.take();
+        result?;
+        match report {
+            Some(report) => Ok(report),
+            None => {
+                self.dev_rollback_verify(gpu, scratch)?;
+                Err("verify succeeded without a kernel report; transaction rolled back".into())
+            }
+        }
+    }
+
     /// Rewind a finished local verify without committing: take its target
     /// ticket out of scratch, reject a mesh ticket, then restore and consume
     /// the local snapshot (also releasing its arena entry on copy failure).
@@ -1257,6 +1487,68 @@ impl Qwen4Bundle {
             .local()?;
         self.restore(gpu, snapshot)
             .map_err(|error| error.to_string())
+    }
+
+    /// The production native partial-accept finish of the verify the scratch
+    /// ticket brackets, target side only: keep the first `keep` rows of the
+    /// armed `block.len()`-row verify by the retain-path recurrence repair
+    /// (`rollback_verify_rows_retain`, the captured-row route the batched
+    /// window uses), or none for a full accept, then commit the ticket and
+    /// consume it. The generic `commit_prefix` (restore + replay) is a
+    /// different path. Refuses, before any mutation, a keep outside
+    /// `1..=block.len()`, a missing ticket and, for a partial keep, a capture
+    /// ring that does not hold the verify's rows (it never falls back to the
+    /// replay). The ticket stays active on any error.
+    pub(crate) fn dev_commit_captured_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        keep: usize,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        if block.is_empty() || keep == 0 || keep > block.len() {
+            return Err(format!(
+                "Qwen4 native commit: keep {keep} outside 1..={}",
+                block.len()
+            ));
+        }
+        let scratch = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 native commit: scratch is not Qwen4SpecScratch")?;
+        let ticket = scratch
+            .target_snapshot
+            .ok_or("Qwen4 native commit: target snapshot is not active")?;
+        let snapshot = ticket.local()?;
+        self.validate_commit(snapshot)
+            .map_err(|error| error.to_string())?;
+        let verified_end = self.state.position;
+        let start = verified_end
+            .checked_sub(block.len())
+            .ok_or("Qwen4 native commit: position below the verified block")?;
+        if keep < block.len() {
+            if !self.ops_ring_eligible(ticket, block.len()) {
+                return Err(format!(
+                    "Qwen4 native commit: the {}-row capture ring does not hold the {}-row verify (no native repair route)",
+                    self.state.row_capture_rows(),
+                    block.len()
+                ));
+            }
+            self.rollback_verify_rows_retain(gpu, snapshot, keep, block)
+                .map_err(|error| error.to_string())?;
+        }
+        if self.state.position != start + keep {
+            return Err(format!(
+                "Qwen4 native commit ended at position {}, expected {}",
+                self.state.position,
+                start + keep
+            ));
+        }
+        self.commit(gpu, snapshot)
+            .map_err(|error| error.to_string())?;
+        scratch.target_snapshot = None;
+        self.state.row_capture_armed = false;
+        Ok(())
     }
 }
 
@@ -1590,11 +1882,6 @@ fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
 /// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
 /// 8 ~98) plus ~2.7 ms per draft step.
 pub(crate) const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
-/// Per-window decay of the per-depth agreement counts, and of the AR floor's
-/// measured window costs and n-gram yield history (~8-window memory): the
-/// Flash-Next lanes' value, and the singleton drafter's on every arch
-/// without a measured longer memory ([`singleton_agreement_decay`]).
-pub(crate) const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// The singleton drafter's decay on gfx1151 (~30-window memory). The floor
 /// retires a request to AR, stickily, once no native route's measured cost
 /// per expected token beats AR. With the ~8-window memory an early run of
@@ -1602,44 +1889,6 @@ pub(crate) const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// winning: on sampled HumanEval/0-9 (Strix Halo), /1 and /6 retired in every
 /// run. Decaying only the agreement at 0.97 still retired /6 in every run.
 const MTP_AGREEMENT_DECAY_GFX1151: f32 = 0.97;
-/// Per-depth (accepted, compared) counts a request starts from (0.8).
-pub(crate) const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
-/// Per-window relaxation of a depth the window did not compare toward the
-/// agreement of the next-shallower depth (depth 0: `MTP_AGREEMENT_PRIOR`),
-/// at the prior's weight, while that agreement is below the depth's own
-/// (see [`MTP_AGREEMENT_RELAX_UP`]). An unobserved depth must drift back so
-/// the chooser re-explores it: a ratio frozen below the depth's threshold
-/// (one rejected depth-3 draft) keeps that depth out of every later window,
-/// so it is never observed again. It drifts toward the request's own
-/// deepest observed acceptance rather than a fixed 0.8 because the
-/// conditional acceptance is flat in depth past the first draft
-/// (Flash-Next, forced K=5: Halo code 0.89-0.96 and prose 0.68-0.76 at
-/// depths 2-5; forced K=5/7 on the R9700: 0.70-0.86 at depths 2-7), so a
-/// fixed prior under-prices every deeper draft of a code request and
-/// over-prices a prose one.
-const MTP_AGREEMENT_RELAX: f32 = 0.95;
-/// [`MTP_AGREEMENT_RELAX`] while the shallower depth's agreement is above
-/// the uncompared depth's own (~5-window memory instead of ~20), so the
-/// depths past the one a request runs catch up with its body's acceptance
-/// after the early rejections a response's first windows often take
-/// ([`MTP_SINGLETON_FLOOR_MIN_WINDOWS`]); falling stays slow, so a depth's
-/// own rejections are not forgotten.  On the deterministic CPU streams of
-/// the `chooser_*` tests (16 seeds, Halo window costs, code acceptance) it
-/// emits ~1% more tokens per ms than 0.95 both ways; prose and R9700
-/// streams move by less than 1%.
-const MTP_AGREEMENT_RELAX_UP: f32 = 0.8;
-/// Window cost of one more drafted row, in AR steps, that the chooser's
-/// per-request cost fit assumes until the request has priced windows at two
-/// drafted depths ([`MtpFloor::modeled_us`]): gfx1151 Flash-Next mq4-xts,
-/// 6.43 ms of verify plus ~1.3 ms of draft step per row against a 28.45 ms
-/// AR step (`release-0.4.3/device-sample/VERIFY-BREAKDOWN.md` §7). The
-/// R9700's row is ~0.52 AR steps (§3); the prior only prices the first
-/// one-depth exploration, after which the request's own slope takes over.
-const MTP_ROW_COST_PRIOR: f64 = 0.27;
-/// Ridge weight of [`MTP_ROW_COST_PRIOR`] in the per-request cost fit, in
-/// the fit's depth-spread units (`Σw(d - d̄)²`): two windows one depth
-/// apart, so a handful of windows at two depths outweigh it.
-const MTP_ROW_COST_PRIOR_WEIGHT: f64 = 0.5;
 /// Emitted tokens a request's first takeover is assumed to yield (one
 /// pseudo-window): the offline 5/3/3 TC/Hermes accepted-prefix-plus-bonus on
 /// a pool hit was 2.9-3.2 (`release-0.4.1/mtp-ngram-plan.md` §1).
@@ -1670,8 +1919,6 @@ const NGRAM_UNCONFIRMED_MIN_ACCEPT: f32 = 0.9;
 /// prior's weight, which no confirmation-free takeover may rest on (kept at
 /// 4 by the replay grid above; 2 and 8 were no better).
 const NGRAM_UNCONFIRMED_MIN_EVIDENCE: f32 = 4.0;
-/// Draft depths tracked (the drafter's K is clamped to this).
-pub(crate) const MTP_MAX_DEPTH: usize = 10;
 /// Smallest probability that a verify row's whole draft prefix is accepted
 /// for the row (plus its draft step) to pay: ~6 ms of a ~47 ms window
 /// emitting ~2-3.5 tokens.
@@ -1719,14 +1966,9 @@ fn gdn_residual_trace_field(state: &crate::state::Qwen4State) -> String {
     }
 }
 
-/// Speculative windows (native or external, `k > 0`) the AR floor observes
-/// before its first measured decision.  Together with the one calibration
-/// token this bounds the speculation work that precedes the first decision:
-/// at most one head append plus this many windows.
-const MTP_FLOOR_PROBE_WINDOWS: usize = 3;
-
 /// Speculative windows a singleton request's floor observes before it may
-/// retire.  Measured routing still starts after [`MTP_FLOOR_PROBE_WINDOWS`];
+/// retire.  Measured routing still starts after
+/// [`hipfire_runtime::spec_economics::FLOOR_PROBE_WINDOWS`];
 /// only the sticky retirement waits.  The first windows of a response accept
 /// poorly far more often than its body: on Strix Halo real-text serve, with
 /// retirement at the probe budget, 5 of 9 sampled 32K requests retired within
@@ -1746,69 +1988,6 @@ const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
 /// response.  Six probes bound the mean's error to a few percent.
 const MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS: usize = 6;
 
-/// Per-window decay of the realized-cost memory a retirement must be
-/// confirmed against (at least the floor's own decay): about 25 windows.
-/// The 8-window `combined` memory dips below AR on any streak of rejected
-/// drafts (records_parser_1k: 27.8 ms/token at window 15 against a 19.2
-/// ms/token mean) and a retirement is sticky.
-const MTP_FLOOR_RETIRE_DECAY: f32 = 0.96;
-
-/// Routed depth at or below which native evidence is shallow: the incumbent
-/// cap-3 chooser, the depth a deeper (capability-default) budget must be able
-/// to fall back to before a request retires stickily.
-const MTP_FLOOR_SHALLOW_CAP: usize = 3;
-
-/// Hard bound on the windows one shallow re-probe may spend (native or
-/// external, first-use unpriced ones included): twice
-/// [`MTP_FLOOR_PROBE_WINDOWS`], so every priced window of the probe budget
-/// can still be preceded by one unpriced first use.
-const MTP_FLOOR_SHALLOW_MAX_WINDOWS: usize = 2 * MTP_FLOOR_PROBE_WINDOWS;
-
-/// Phase of the fresh-shallow evidence a would-be retirement of a deeper
-/// budget asks for ([`MtpFloor::retire_or_probe`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ShallowState {
-    /// No re-probe running or decided since the last deep window.
-    #[default]
-    Idle,
-    /// Shallow windows are running; the verdict waits for
-    /// [`MTP_FLOOR_PROBE_WINDOWS`] priced ones or the window bound.
-    Probing,
-    /// Shallow priced below AR: no retirement while that holds; deeper caps
-    /// need positive evidence ([`MtpFloor::update_climb_evidence`]).
-    Holding,
-    /// Priced shallow windows did not beat AR: the verdict retires.
-    Lost,
-    /// The window bound ended with no priced shallow window (every timing
-    /// invalid): no win can be asserted, so the verdict retires (the
-    /// invalid-AR-price rule).
-    Unpriced,
-}
-
-impl ShallowState {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Probing => "probing",
-            Self::Holding => "holding",
-            Self::Lost => "lost",
-            Self::Unpriced => "unpriced",
-        }
-    }
-}
-
-/// Fresh shallow evidence of one re-probe (then, while holding, its decayed
-/// continuation).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct ShallowEvidence {
-    /// Windows spent, priced or not.
-    windows: usize,
-    /// Windows with a valid timing.
-    priced: usize,
-    /// (wall us, emitted tokens) of the priced windows.
-    cost: (f32, f32),
-}
-
 /// The singleton request's retirement threshold:
 /// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
 /// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
@@ -1822,43 +2001,23 @@ fn singleton_floor_min_windows() -> usize {
 
 /// The singleton drafter's agreement / floor-cost / n-gram-yield decay on
 /// `arch`: [`MTP_AGREEMENT_DECAY_GFX1151`] on gfx1151, where the longer
-/// memory was measured, else [`MTP_AGREEMENT_DECAY`]. The lanes keep
-/// [`MTP_AGREEMENT_DECAY`].
+/// memory was measured, else [`DEFAULT_DECAY`]. The lanes keep
+/// [`DEFAULT_DECAY`].
 fn singleton_agreement_decay(arch: &str) -> f32 {
     if arch == "gfx1151" {
         MTP_AGREEMENT_DECAY_GFX1151
     } else {
-        MTP_AGREEMENT_DECAY
+        DEFAULT_DECAY
     }
 }
 
-pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
-
-/// Route the floor picks for one native window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FloorRoute {
-    /// Ordinary target-only token, no head work (after sticky retirement).
-    Ar,
-    /// Ordinary target-only token timed for the floor, head kept synced (an
-    /// AR probe of a would-be retirement).
-    ArSample,
-    Interleaved,
-    Batched(usize),
-}
-
-/// Which native route a measured window ran.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeWindow {
-    Interleaved,
-    Batched,
-}
-
-fn valid_us(us: f32) -> bool {
-    us.is_finite() && us > 0.0
-}
+/// The qwen4 route's floor: native K 1..7 ([`MTP_WINDOW_COST`]) and a takeover slot per
+/// n-gram depth (`NGRAM_DEPTHS + 1`).
+pub(crate) type Qwen4Floor =
+    hipfire_runtime::spec_economics::Floor<{ MTP_WINDOW_COST.len() }, { NGRAM_DEPTHS + 1 }>;
 
 /// Fresh AR samples a singleton request's floor takes at a would-be
-/// retirement (see [`MtpFloor::with_retire_evidence`]).
+/// retirement (see [`Qwen4Floor::with_retire_evidence`]).
 /// `HIPFIRE_MTP_FLOOR_AR_PROBE=<n>` overrides it; `0` is the kill switch and
 /// restores the single-calibration-token floor.
 fn singleton_floor_ar_probe_tokens() -> usize {
@@ -1866,1109 +2025,6 @@ fn singleton_floor_ar_probe_tokens() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS)
-}
-
-/// Add one observation to a `decay`-decayed `(sum, weight)` pair; only the
-/// entry being observed decays.
-fn decay_add(entry: &mut (f32, f32), sum: f32, weight: f32, decay: f32) {
-    entry.0 = entry.0 * decay + sum;
-    entry.1 = entry.1 * decay + weight;
-}
-
-/// Only the drafts compared before the first rejection count, so each
-/// depth measures the agreement conditional on its prefix being accepted
-/// (the same quantity on both routes). Compared depths decay by `decay` and
-/// take the observation; depths the window did not compare relax toward
-/// the next-shallower depth's agreement at the weight of
-/// `MTP_AGREEMENT_PRIOR` (depth 0 toward the prior itself) instead of
-/// decaying: up at `MTP_AGREEMENT_RELAX_UP`, down at `MTP_AGREEMENT_RELAX`.
-/// A depth rejected once is re-explored rather than frozen below its
-/// threshold, and depths no window reached are priced at the request's
-/// deepest observed acceptance.
-pub(crate) fn observe_agreement(agreement: &mut [(f32, f32)], window: &MtpWindow, decay: f32) {
-    observe_agreement_counts(agreement, window.accepted, window.drafts_generated, decay);
-}
-
-/// [`observe_agreement`] on a window's `(accepted, drafts_generated)` alone,
-/// for observations with no committed tokens to carry (the n-gram shadow,
-/// [`Qwen4MtpDrafter::observe_ngram_shadow`]).
-fn observe_agreement_counts(
-    agreement: &mut [(f32, f32)],
-    accepted_drafts: usize,
-    drafts: usize,
-    decay: f32,
-) {
-    let compared = (accepted_drafts + 1).min(drafts);
-    let prior_total = MTP_AGREEMENT_PRIOR.1;
-    let mut shallower = MTP_AGREEMENT_PRIOR;
-    for (depth, entry) in agreement.iter_mut().enumerate() {
-        let (accepted, total) = entry;
-        if depth < compared {
-            *accepted *= decay;
-            *total *= decay;
-            *total += 1.0;
-            *accepted += f32::from(u8::from(depth < accepted_drafts));
-        } else {
-            let target = shallower.0 / shallower.1.max(f32::MIN_POSITIVE);
-            let relax = if target > *accepted / total.max(f32::MIN_POSITIVE) {
-                MTP_AGREEMENT_RELAX_UP
-            } else {
-                MTP_AGREEMENT_RELAX
-            };
-            *accepted = *accepted * relax + prior_total * target * (1.0 - relax);
-            *total = *total * relax + prior_total * (1.0 - relax);
-        }
-        shallower = *entry;
-    }
-}
-
-/// Draft depth for the next window: the K maximizing expected emitted
-/// tokens (1 + sum over depths of the accepted-prefix probability) per
-/// window cost, or 0 (interleaved) when no batched window beats one
-/// token per interleaved step.
-pub(crate) fn batched_depth(agreement: &Agreement, k: usize) -> usize {
-    let mut best = (0, 1.0f32);
-    let mut prefix = 1.0f32;
-    let mut expected = 1.0f32;
-    let depths = agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
-    for (i, (&(accepted, total), &cost)) in depths.enumerate() {
-        let depth = i + 1;
-        prefix *= accepted / total.max(f32::MIN_POSITIVE);
-        expected += prefix;
-        let rate = expected / cost;
-        if rate > best.1 {
-            best = (depth, rate);
-        }
-    }
-    best.0
-}
-
-/// One finished native window as the floor prices it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WindowStats {
-    /// Committed tokens (accepted drafts plus the bonus).
-    pub(crate) emitted: usize,
-    /// Drafts generated (the margin prune may stop below `cap`).
-    pub(crate) drafts: usize,
-    /// The depth the window was routed at (batched); 0 for interleaved.
-    pub(crate) cap: usize,
-}
-
-impl WindowStats {
-    pub(crate) fn of(window: &MtpWindow, cap: usize) -> Self {
-        Self {
-            emitted: window.committed.len(),
-            drafts: window.drafts_generated,
-            cap,
-        }
-    }
-}
-
-/// Decayed statistics of the batched windows routed at one cap.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct CapStats {
-    /// Wall us.
-    us: f32,
-    /// Committed tokens.
-    emitted: f32,
-    windows: f32,
-    /// Windows by the depth they drafted (the margin prune stops some below
-    /// the cap).
-    drafted: [f32; MTP_WINDOW_COST.len()],
-}
-
-/// Expected tokens a window drafting `d` tokens emits, for every `d`: the
-/// bonus plus the accepted-prefix probabilities of the per-depth agreement.
-fn expected_emitted_by_depth(agreement: &Agreement) -> [f32; MTP_WINDOW_COST.len()] {
-    let mut expected = [1.0f32; MTP_WINDOW_COST.len()];
-    let mut prefix = 1.0f32;
-    for d in 1..expected.len() {
-        let (accepted, total) = agreement[d - 1];
-        prefix *= accepted / total.max(f32::MIN_POSITIVE);
-        expected[d] = expected[d - 1] + prefix;
-    }
-    expected
-}
-
-/// Same-request AR floor of native MTP.
-///
-/// The price of AR is `ar_us`, measured on this request, on this GPU, by one
-/// calibration token (the ordinary target-only forward, including a sampled
-/// draw; never the drafter's first, which pays one-time costs:
-/// [`Qwen4MtpDrafter::floor_observe_ar`]).  Speculation is priced from this
-/// request's own windows by their realized decayed wall time per emitted
-/// token: a batched window under the depth (cap) it was routed at, the
-/// margin prune's shorter windows included, and the interleaved route.  The
-/// Halo cost table only orders
-/// the options while fewer than [`MTP_FLOOR_PROBE_WINDOWS`] windows have
-/// been observed.  After that budget the AR verdict reads only measured
-/// options: the request retires, stickily, to head-free AR as soon as no
-/// measured option costs strictly less per emitted token than AR (a tie
-/// retires).  An invalid AR measurement retires at the budget too: without
-/// a price, a win cannot be asserted.
-///
-/// Depth choice (once a measured option beats AR): the candidates are the
-/// measured caps plus every unmeasured cap next to a measured one, priced
-/// from that neighbour ([`Self::cap_cost`]): one cap down saves a row on
-/// the windows that drafted the whole cap and loses a token on those that
-/// also accepted it all; one cap up adds a row on the former and gains the
-/// next draft's agreement on the latter.  The row is the request's own
-/// window-cost fit ([`Self::fit_line`]: a decayed least-squares line of
-/// wall time on drafted depth).  The cheapest per token runs, so a request
-/// climbs one cap at a time (up to `MTP_WINDOW_COST.len() - 1`) while the
-/// next row pays.  Pricing by cap, not by drafted depth over the
-/// agreement-predicted tokens, counts the windows the margin prune cuts
-/// short at their real (lower) cost: on Halo prose a cap of 4 with the prune
-/// beat cap 2 (forced K=4 +8.4%) while the drafted-depth model kept prose
-/// requests at 2.
-///
-/// External (n-gram) windows are tracked separately and never feed the
-/// native agreement; they count toward the shared probe budget.  A request
-/// stays alive on a losing (or unmeasured) native route only while external
-/// windows are measured and unblocked (cost per token below AR) AND the
-/// realized per-token cost of all its windows, native and external, decayed
-/// (`combined`), is strictly below AR (a tie loses).  Such a request routes
-/// the cheapest measured native option within `k`, else interleaved; it
-/// retires, stickily, at the first window where that stops holding.  A
-/// measured native option that beats AR needs no external help.
-///
-/// Retire evidence (the singleton request, [`Self::with_retire_evidence`]):
-/// the calibration token is one token, and under the Flash-Next expert hot
-/// set one token's AR cost is a property of its routed experts, not of the
-/// request (7–26% off the request's mean AR token on the R9700 traces).  A
-/// verdict that would retire therefore first spends `probe_tokens` ordinary
-/// AR tokens (the calibration step again, head kept synced; they are real
-/// tokens, and retirement would run them anyway) and re-prices AR by their
-/// mean, at most once per `retire_after` observed windows.  The verdict then
-/// also needs the slow-memory (`slow`, ~25 windows) realized cost of all
-/// windows to lose to that price: the 8-window memories dip on any streak of
-/// rejected drafts and a retirement is sticky.
-///
-/// Fresh shallow evidence (singleton and lane floors, a budget above
-/// [`MTP_FLOOR_SHALLOW_CAP`]): a request that explored deeper caps and whose
-/// verdict would retire first needs fresh shallow native evidence, i.e.
-/// [`MTP_FLOOR_PROBE_WINDOWS`] priced shallow windows (batched at a routed
-/// cap ≤ 3, or interleaved) since the last deep window.  The decayed cap
-/// statistics never count: only `shallow_since_deep`, which a deep window
-/// zeroes.  Without it, after the AR re-price the floor spends at most
-/// [`MTP_FLOOR_SHALLOW_MAX_WINDOWS`] windows on its best measured shallow
-/// option (first-use unpriced windows and external windows spend the bound
-/// unpriced); priced below AR it holds (no retirement, the climb waits for
-/// [`MTP_FLOOR_PROBE_WINDOWS`] consecutive windows of a deeper candidate
-/// pricing below the shallow one), priced at or above AR or never priced
-/// it retires.  A budget of at most [`MTP_FLOOR_SHALLOW_CAP`] never probes.
-#[derive(Clone, Debug)]
-pub(crate) struct MtpFloor {
-    calibrated: bool,
-    /// Microseconds of one ordinary AR token; 0 when the measurement was
-    /// invalid.
-    ar_us: f32,
-    probes: usize,
-    /// Speculative windows observed (uncapped; the probe budget caps `probes`).
-    observed: usize,
-    /// `observed` a losing verdict needs before it retires the request.
-    retire_after: usize,
-    retired: bool,
-    /// Per actually drafted depth: decayed (wall us, windows); the physical
-    /// window cost an n-gram takeover of that many candidates is priced at.
-    batched: [(f32, f32); MTP_WINDOW_COST.len()],
-    /// Per routed cap: decayed realized window statistics, what the chooser
-    /// prices a cap by.
-    caps: [CapStats; MTP_WINDOW_COST.len()],
-    /// Decayed least-squares sums `[w, Σd, Σus, Σd², Σd·us]` of every priced
-    /// batched window's wall `us` on its drafted depth `d`, the data of
-    /// [`Self::modeled_us`] (f64: the cross terms of ~1e5 us cancel).
-    fit: [f64; 5],
-    /// Decayed (wall us, emitted tokens).
-    interleaved: (f32, f32),
-    /// Decayed (wall us, emitted tokens) of external windows.
-    external: (f32, f32),
-    /// Per candidate count: decayed (wall us, windows) of this request's
-    /// n-gram takeover windows, what [`Self::takeover_cost`] prices a take
-    /// length by.
-    external_depth: [(f32, f32); NGRAM_DEPTHS + 1],
-    external_blocked: bool,
-    /// Decayed realized (wall us, emitted tokens) over every valid window
-    /// observed after calibration, native and external alike.
-    combined: (f32, f32),
-    /// Per-window decay of every decayed pair above.
-    decay: f32,
-    /// Realized (wall us, emitted tokens) over every valid window after
-    /// calibration with the slower [`MTP_FLOOR_RETIRE_DECAY`] memory.
-    slow: (f32, f32),
-    /// AR probe tokens a would-be retirement takes (0 disables the probes
-    /// and the `slow` confirmation).
-    probe_tokens: usize,
-    /// AR probe tokens still to run.
-    probe_left: usize,
-    /// Valid wall times of the probe tokens run so far.
-    probe_samples: Vec<f32>,
-    /// `observed` when the last probe set started.
-    probed_at: Option<usize>,
-    /// Draft budget `k` of the last routed or observed native window.
-    budget_k: usize,
-    /// A window routed deeper than [`MTP_FLOOR_SHALLOW_CAP`] was observed.
-    deep_seen: bool,
-    /// Priced shallow windows since the last deep window.
-    shallow_since_deep: usize,
-    shallow_state: ShallowState,
-    shallow: ShallowEvidence,
-    /// Consecutive windows a deeper candidate priced below the held
-    /// shallow one.
-    climb_streak: usize,
-}
-
-impl MtpFloor {
-    pub(crate) fn new() -> Self {
-        Self::with_retire_after(MTP_FLOOR_PROBE_WINDOWS)
-    }
-
-    /// A fresh floor that may retire only after `retire_after` observed
-    /// windows (at least the probe budget), decaying by
-    /// [`MTP_AGREEMENT_DECAY`].
-    pub(crate) fn with_retire_after(retire_after: usize) -> Self {
-        Self {
-            calibrated: false,
-            ar_us: 0.0,
-            probes: 0,
-            observed: 0,
-            retire_after: retire_after.max(MTP_FLOOR_PROBE_WINDOWS),
-            retired: false,
-            batched: [(0.0, 0.0); MTP_WINDOW_COST.len()],
-            caps: [CapStats::default(); MTP_WINDOW_COST.len()],
-            fit: [0.0; 5],
-            interleaved: (0.0, 0.0),
-            external: (0.0, 0.0),
-            external_depth: [(0.0, 0.0); NGRAM_DEPTHS + 1],
-            external_blocked: false,
-            combined: (0.0, 0.0),
-            decay: MTP_AGREEMENT_DECAY,
-            slow: (0.0, 0.0),
-            probe_tokens: 0,
-            probe_left: 0,
-            probe_samples: Vec::new(),
-            probed_at: None,
-            budget_k: 0,
-            deep_seen: false,
-            shallow_since_deep: 0,
-            shallow_state: ShallowState::Idle,
-            shallow: ShallowEvidence::default(),
-            climb_streak: 0,
-        }
-    }
-
-    /// The same floor giving a would-be retirement `probe_tokens` fresh AR
-    /// samples to re-price AR (0: none, and no realized-cost confirmation:
-    /// the floor retires on its first verdict, the lanes' behavior).
-    pub(crate) fn with_retire_evidence(self, probe_tokens: usize) -> Self {
-        Self {
-            probe_tokens,
-            ..self
-        }
-    }
-
-    /// The same floor decaying its measured costs by `decay`.
-    pub(crate) fn with_decay(self, decay: f32) -> Self {
-        Self { decay, ..self }
-    }
-
-    /// Whether the floor retired stickily to head-free AR.
-    pub(crate) fn retired(&self) -> bool {
-        self.retired
-    }
-
-    /// Start a new probe phase with this request's original thresholds.
-    fn rearm(&mut self) {
-        let mut samples = std::mem::take(&mut self.probe_samples);
-        samples.clear();
-        *self = Self::with_retire_after(self.retire_after)
-            .with_decay(self.decay)
-            .with_retire_evidence(self.probe_tokens);
-        self.probe_samples = samples;
-    }
-
-    /// Native window cost at `depth` drafts in AR-step units, once probing
-    /// finishes: the measured mean, else the request's cost fit.
-    fn batched_cost(&self, depth: usize) -> Option<f32> {
-        if self.probing() || !valid_us(self.ar_us) {
-            return None;
-        }
-        let &(sum, windows) = self.batched.get(depth)?;
-        if windows > 0.0 {
-            return valid_us(sum).then(|| sum / windows / self.ar_us);
-        }
-        self.modeled_us(depth).map(|us| us / self.ar_us)
-    }
-
-    /// Window cost of an n-gram takeover of `d` candidates in AR-step units,
-    /// once probing finishes with a valid AR price: the measured mean of this
-    /// request's takeover windows of `d` candidates; else the nearest
-    /// measured takeover depth `d'` (ties: more windows) moved by the fit's
-    /// per-row slope (`MTP_ROW_COST_PRIOR` AR steps without a fit); else the
-    /// native window cost at `d` drafts ([`Self::batched_cost`]'s measurement
-    /// or fit, the fit also past the native table).
-    fn takeover_cost(&self, d: usize) -> Option<f32> {
-        if self.probing() || !valid_us(self.ar_us) {
-            return None;
-        }
-        let measured = |depth: usize| {
-            self.external_depth
-                .get(depth)
-                .filter(|&&(us, windows)| windows > 0.0 && valid_us(us))
-                .map(|&(us, windows)| (us / windows, windows))
-        };
-        if let Some((mean, _)) = measured(d) {
-            return Some(mean / self.ar_us);
-        }
-        let nearest = (1..self.external_depth.len())
-            .filter_map(|depth| measured(depth).map(|(mean, windows)| (depth, mean, windows)))
-            .min_by(|a, b| {
-                a.0.abs_diff(d)
-                    .cmp(&b.0.abs_diff(d))
-                    .then(b.2.total_cmp(&a.2))
-            });
-        if let Some((near, mean, _)) = nearest {
-            let row_us = self.fit_line().map_or(
-                MTP_ROW_COST_PRIOR * f64::from(self.ar_us),
-                |(_, _, slope)| slope,
-            ) as f32;
-            let us = mean + row_us * (d as f32 - near as f32);
-            if valid_us(us) {
-                return Some(us / self.ar_us);
-            }
-        }
-        let native = match self.batched.get(d) {
-            Some(&(sum, windows)) if windows > 0.0 => valid_us(sum).then(|| sum / windows),
-            _ => self.modeled_us(d),
-        };
-        native.map(|us| us / self.ar_us)
-    }
-
-    /// This request's window-cost line `(mean depth, mean us, us per
-    /// drafted row)`: the decayed least-squares line of every priced batched
-    /// window's wall time on its drafted depth, its slope (one more verify
-    /// row and draft step on this GPU) ridge-pulled toward
-    /// [`MTP_ROW_COST_PRIOR`] AR steps with weight
-    /// [`MTP_ROW_COST_PRIOR_WEIGHT`] and never negative.  With windows at one
-    /// depth only the slope is the prior; it becomes the request's own as
-    /// soon as two depths are priced.  `None` before any batched window was
-    /// priced or without a valid AR price.
-    fn fit_line(&self) -> Option<(f64, f64, f64)> {
-        let [w, sd, sus, sdd, sdus] = self.fit;
-        if w <= 0.0 || !valid_us(self.ar_us) {
-            return None;
-        }
-        let (mean_d, mean_us) = (sd / w, sus / w);
-        let spread = (sdd - w * mean_d * mean_d).max(0.0);
-        let covariance = sdus - w * mean_d * mean_us;
-        let prior = MTP_ROW_COST_PRIOR * f64::from(self.ar_us);
-        let slope = ((covariance + MTP_ROW_COST_PRIOR_WEIGHT * prior)
-            / (spread + MTP_ROW_COST_PRIOR_WEIGHT))
-            .max(0.0);
-        Some((mean_d, mean_us, slope))
-    }
-
-    /// [`Self::fit_line`]'s wall time (us) of a batched window drafting
-    /// `depth` tokens, when positive.
-    fn modeled_us(&self, depth: usize) -> Option<f32> {
-        let (mean_d, mean_us, slope) = self.fit_line()?;
-        let us = (mean_us + slope * (depth as f64 - mean_d)) as f32;
-        valid_us(us).then_some(us)
-    }
-
-    /// Wall us per expected emitted token of routing `cap`: the decayed
-    /// mean window wall time at that cap over the expected tokens of its
-    /// windows' drafted-depth mix (each drafted depth `d` at the current
-    /// agreement's `1 + Σ prefix`), so the windows the margin prune stops
-    /// short count at their real, lower, cost and yield.  The neighbouring
-    /// cap with more windows also counts, for the evidence it holds beyond
-    /// this cap's own, shifted by one row: one cap down, its windows that
-    /// drafted its whole cap draft one row (`row` us, the fit's slope) less;
-    /// one cap up, one more (a window the prune stopped short is the same at
-    /// either cap).  Every cap's evidence decays with every batched window
-    /// ([`Self::observe_window`]), so an unmeasured cap next to the one a
-    /// request runs is priced from it, and a cap measured once (a probe
-    /// window during a response's poor start) is re-priced from its running
-    /// neighbour instead of keeping that stale price for good.
-    fn cap_cost(&self, agreement: &Agreement, cap: usize) -> Option<f32> {
-        if cap == 0 || cap >= self.caps.len() {
-            return None;
-        }
-        let own = self.caps[cap];
-        let (mut us, mut windows, mut mix) = (own.us, own.windows, own.drafted);
-        let neighbour = [cap - 1, cap + 1]
-            .into_iter()
-            .filter(|&c| c >= 1 && c < self.caps.len() && self.caps[c].windows > own.windows)
-            .max_by(|&a, &b| self.caps[a].windows.total_cmp(&self.caps[b].windows));
-        if let (Some(c), Some((_, _, row))) = (neighbour, self.fit_line()) {
-            let from = self.caps[c];
-            let weight = from.windows - own.windows;
-            let share = weight / from.windows;
-            let mut shifted = from.drafted.map(|windows| windows * share);
-            let moved = std::mem::take(&mut shifted[c]);
-            shifted[cap] += moved;
-            us += from.us * share + row as f32 * moved * (cap as f32 - c as f32);
-            windows += weight;
-            for (total, add) in mix.iter_mut().zip(shifted) {
-                *total += add;
-            }
-        }
-        if windows <= 0.0 {
-            return None;
-        }
-        let expected = expected_emitted_by_depth(agreement);
-        let emitted: f32 = mix.iter().zip(expected).map(|(w, e)| w * e).sum::<f32>() / windows;
-        let window_us = us / windows;
-        (valid_us(window_us) && emitted > 0.0).then(|| window_us / emitted)
-    }
-
-    /// Cheapest candidate within `max_depth` drafts, `(route, us per
-    /// emitted token)`: the measured options of [`Self::best_native`] plus
-    /// the unmeasured neighbours of [`Self::cap_cost`].  Ties keep the
-    /// earlier (shallower) option.
-    fn best_candidate(&self, agreement: &Agreement, max_depth: usize) -> Option<(FloorRoute, f32)> {
-        let mut best = (self.interleaved.1 > 0.0).then(|| {
-            (
-                FloorRoute::Interleaved,
-                self.interleaved.0 / self.interleaved.1,
-            )
-        });
-        for cap in 1..self.caps.len().min(max_depth.saturating_add(1)) {
-            let Some(cost) = self.cap_cost(agreement, cap) else {
-                continue;
-            };
-            if best.is_none_or(|(_, cheapest)| cost < cheapest) {
-                best = Some((FloorRoute::Batched(cap), cost));
-            }
-        }
-        best
-    }
-
-    /// Expected emitted tokens per AR step of window cost of the cheapest
-    /// candidate within `max_depth` (at least 1, the interleaved route's
-    /// rate), once probing finishes with a valid AR price: the native rate
-    /// an n-gram takeover must match.
-    fn candidate_rate(&self, agreement: &Agreement, max_depth: usize) -> Option<f32> {
-        if self.probing() || !valid_us(self.ar_us) {
-            return None;
-        }
-        let (_, cost) = self.best_candidate(agreement, max_depth)?;
-        Some((self.ar_us / cost).max(1.0))
-    }
-
-    fn probing(&self) -> bool {
-        self.probes < MTP_FLOOR_PROBE_WINDOWS
-    }
-
-    fn count_probe(&mut self) {
-        self.probes = (self.probes + 1).min(MTP_FLOOR_PROBE_WINDOWS);
-        self.observed = self.observed.saturating_add(1);
-    }
-
-    /// Still inside the window count a losing verdict must wait for.
-    fn in_grace(&self) -> bool {
-        self.observed < self.retire_after
-    }
-
-    /// One finished ordinary AR token with wall time `us`.  The request's
-    /// first observed one prices AR (an invalid timing prices it 0, which
-    /// retires at the probe budget); the tokens a would-be retirement asked
-    /// for ([`Self::retire_or_probe`]) re-price it by their mean and
-    /// re-decide.
-    pub(crate) fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
-        if !self.calibrated {
-            self.calibrated = true;
-            self.ar_us = if valid_us(us) { us } else { 0.0 };
-            self.decide(agreement);
-            return;
-        }
-        if self.probe_left == 0 || self.retired {
-            return;
-        }
-        self.probe_left -= 1;
-        if valid_us(us) {
-            self.probe_samples.push(us);
-        }
-        if self.probe_left == 0 {
-            if !self.probe_samples.is_empty() {
-                self.ar_us =
-                    self.probe_samples.iter().sum::<f32>() / self.probe_samples.len() as f32;
-            }
-            self.decide(agreement);
-        }
-    }
-
-    /// Whether the next window must be an ordinary AR token timed for the
-    /// floor: the request's first, or one of the probes of a would-be
-    /// retirement.
-    pub(crate) fn needs_ar_sample(&self) -> bool {
-        !self.calibrated || self.probe_left > 0
-    }
-
-    /// One finished native window of `k > 0` budget with wall time `us`,
-    /// a batched one routed at the depth it drafted (see
-    /// [`Self::observe_window`]).
-    pub(crate) fn observe_native(
-        &mut self,
-        route: NativeWindow,
-        window: &MtpWindow,
-        us: f32,
-        k: usize,
-        agreement: &Agreement,
-    ) {
-        let stats = WindowStats::of(window, window.drafts_generated);
-        self.observe_window(route, stats, us, k, agreement);
-    }
-
-    /// One finished native window of `k > 0` budget with wall time `us`.
-    pub(crate) fn observe_window(
-        &mut self,
-        route: NativeWindow,
-        window: WindowStats,
-        us: f32,
-        k: usize,
-        agreement: &Agreement,
-    ) {
-        if k == 0 || self.retired || !self.calibrated {
-            return;
-        }
-        self.budget_k = k;
-        // An unusable timing records no cost but still spends probe budget,
-        // so the number of unmeasured windows stays bounded.
-        if valid_us(us) {
-            let decay = self.decay;
-            let emitted = window.emitted as f32;
-            decay_add(&mut self.combined, us, emitted, decay);
-            decay_add(
-                &mut self.slow,
-                us,
-                emitted,
-                decay.max(MTP_FLOOR_RETIRE_DECAY),
-            );
-            match route {
-                NativeWindow::Interleaved => decay_add(&mut self.interleaved, us, emitted, decay),
-                NativeWindow::Batched => {
-                    let depth = window.drafts;
-                    if let Some(entry) = self.batched.get_mut(depth).filter(|_| depth >= 1) {
-                        decay_add(entry, us, 1.0, decay);
-                        let (d, us, decay) = (depth as f64, f64::from(us), f64::from(decay));
-                        for (sum, x) in self.fit.iter_mut().zip([1.0, d, us, d * d, d * us]) {
-                            *sum = *sum * decay + x;
-                        }
-                    }
-                    // Every cap's evidence ages with every batched window, so
-                    // a cap not run lately counts for less than the one that
-                    // runs (see `cap_cost`).
-                    let cap = window.cap.min(self.caps.len());
-                    for (c, stats) in self.caps.iter_mut().enumerate() {
-                        let hit = c == cap && c >= 1;
-                        stats.us = stats.us * decay + if hit { us } else { 0.0 };
-                        stats.emitted = stats.emitted * decay + if hit { emitted } else { 0.0 };
-                        stats.windows = stats.windows * decay + f32::from(u8::from(hit));
-                        for (d, windows) in stats.drafted.iter_mut().enumerate() {
-                            *windows = *windows * decay + f32::from(u8::from(hit && d == depth));
-                        }
-                    }
-                }
-            }
-        }
-        self.observe_shallow_epoch(route, window, us, agreement);
-        self.count_probe();
-        self.decide(agreement);
-    }
-
-    /// One finished external window (`drafts > 0` offered, `emitted` tokens
-    /// committed, `wall_us` including its verify).  Returns `true` when the
-    /// caller must not take over again this request: the floor retired, or
-    /// external windows cost no less per token than AR.
-    fn observe_external(
-        &mut self,
-        emitted: usize,
-        wall_us: f32,
-        drafts: usize,
-        agreement: &Agreement,
-    ) -> bool {
-        if !self.retired && drafts > 0 {
-            if valid_us(wall_us) {
-                let decay = self.decay;
-                if self.calibrated {
-                    decay_add(&mut self.combined, wall_us, emitted as f32, decay);
-                    decay_add(
-                        &mut self.slow,
-                        wall_us,
-                        emitted as f32,
-                        decay.max(MTP_FLOOR_RETIRE_DECAY),
-                    );
-                }
-                if emitted > 0 {
-                    decay_add(&mut self.external, wall_us, emitted as f32, decay);
-                }
-            }
-            self.spend_shallow_window(None);
-            self.count_probe();
-            self.decide(agreement);
-        }
-        self.retired || self.external_blocked
-    }
-
-    /// One finished external window of the n-gram copy lane (`drafts > 0`
-    /// offered, `emitted` tokens committed, `wall_us` including its verify).
-    /// Returns `true` when the caller must not take over again this request:
-    /// the floor retired, or external windows cost no less per token than AR.
-    ///
-    /// A retired floor keeps pricing external windows (`external`,
-    /// `external_depth`, `external_blocked`): retirement says native
-    /// drafting loses to AR, nothing about a copy source.  It neither
-    /// un-retires, nor counts probes, nor touches native routing, and it
-    /// returns `external_blocked` alone, so the caller stops taking over only
-    /// when takeovers themselves lose to AR.
-    fn observe_external_copy(
-        &mut self,
-        emitted: usize,
-        wall_us: f32,
-        drafts: usize,
-        agreement: &Agreement,
-    ) -> bool {
-        let was_retired = self.retired;
-        if drafts > 0 {
-            if valid_us(wall_us) {
-                let decay = self.decay;
-                if self.calibrated && !was_retired {
-                    decay_add(&mut self.combined, wall_us, emitted as f32, decay);
-                    decay_add(
-                        &mut self.slow,
-                        wall_us,
-                        emitted as f32,
-                        decay.max(MTP_FLOOR_RETIRE_DECAY),
-                    );
-                }
-                if emitted > 0 {
-                    decay_add(&mut self.external, wall_us, emitted as f32, decay);
-                }
-                if let Some(entry) = self.external_depth.get_mut(drafts) {
-                    decay_add(entry, wall_us, 1.0, decay);
-                }
-            }
-            if was_retired {
-                let external = (self.external.1 > 0.0).then(|| self.external.0 / self.external.1);
-                self.external_blocked =
-                    valid_us(self.ar_us) && external.is_some_and(|cost| cost >= self.ar_us);
-            } else {
-                self.spend_shallow_window(None);
-                self.count_probe();
-                self.decide(agreement);
-            }
-        }
-        if was_retired {
-            self.external_blocked
-        } else {
-            self.retired || self.external_blocked
-        }
-    }
-
-    /// Cheapest measured native option with at most `max_depth` drafts
-    /// (interleaved is always eligible): `(route, us per emitted token)`, a
-    /// cap priced by [`Self::cap_cost`].  Ties keep the earlier (shallower)
-    /// option.
-    fn best_native(&self, agreement: &Agreement, max_depth: usize) -> Option<(FloorRoute, f32)> {
-        let mut best = (self.interleaved.1 > 0.0).then(|| {
-            (
-                FloorRoute::Interleaved,
-                self.interleaved.0 / self.interleaved.1,
-            )
-        });
-        for cap in 1..self.caps.len().min(max_depth.saturating_add(1)) {
-            if self.caps[cap].windows <= 0.0 {
-                continue;
-            }
-            let Some(cost) = self.cap_cost(agreement, cap) else {
-                continue;
-            };
-            if best.is_none_or(|(_, cheapest)| cost < cheapest) {
-                best = Some((FloorRoute::Batched(cap), cost));
-            }
-        }
-        best
-    }
-
-    /// External windows are measured and their price is below AR.
-    fn external_alive(&self) -> bool {
-        self.external.1 > 0.0 && !self.external_blocked
-    }
-
-    /// The decayed realized per-token cost of every window (native and
-    /// external) is strictly below AR.
-    fn combined_wins(&self) -> bool {
-        self.combined.1 > 0.0 && self.combined.0 / self.combined.1 < self.ar_us
-    }
-
-    /// The fresh AR price this verdict would retire on is not yet measured:
-    /// the floor was given AR probes
-    /// ([`Self::with_retire_evidence`]), has a valid price to replace, and has
-    /// not taken a probe set within the last `retire_after` windows.
-    fn should_probe(&self) -> bool {
-        self.probe_tokens > 0
-            && self.probe_left == 0
-            && valid_us(self.ar_us)
-            && self.probed_at.map_or(true, |at| {
-                self.observed >= at.saturating_add(self.retire_after)
-            })
-    }
-
-    /// A losing verdict past the grace: sticky retirement, unless AR has not
-    /// been re-priced where the request is now (the next windows are AR
-    /// probe tokens, re-evaluated on their mean by `observe_calibration`),
-    /// or a deeper budget has no fresh shallow evidence yet (the next
-    /// windows are the bounded shallow re-probe,
-    /// [`Self::needs_shallow_evidence`]).  Returns the route for the next
-    /// window.
-    fn retire_or_probe(&mut self, agreement: &Agreement) -> FloorRoute {
-        if self.should_probe() {
-            self.probe_left = self.probe_tokens;
-            self.probe_samples.clear();
-            self.probed_at = Some(self.observed);
-            FloorRoute::ArSample
-        } else if self.needs_shallow_evidence() {
-            self.shallow_state = ShallowState::Probing;
-            self.shallow = ShallowEvidence::default();
-            self.climb_streak = 0;
-            self.shallow_route(agreement, self.budget_k)
-        } else {
-            self.retired = true;
-            FloorRoute::Ar
-        }
-    }
-
-    /// The verdict would retire a request that explored past
-    /// [`MTP_FLOOR_SHALLOW_CAP`] on a budget above it, with no priced shallow
-    /// window since its last deep one and no shallow verdict already taken.
-    fn needs_shallow_evidence(&self) -> bool {
-        self.shallow_state == ShallowState::Idle
-            && self.budget_k > MTP_FLOOR_SHALLOW_CAP
-            && self.deep_seen
-            && self.shallow_since_deep < MTP_FLOOR_PROBE_WINDOWS
-            && valid_us(self.ar_us)
-    }
-
-    /// Route of a shallow window within `k`: the cheapest measured shallow
-    /// option, else the deepest shallow cap.
-    fn shallow_route(&self, agreement: &Agreement, k: usize) -> FloorRoute {
-        let limit = k.min(MTP_FLOOR_SHALLOW_CAP);
-        match self.best_native(agreement, limit) {
-            Some((route, _)) => route,
-            None if limit == 0 => FloorRoute::Interleaved,
-            None => FloorRoute::Batched(limit),
-        }
-    }
-
-    /// Fresh shallow realized wall us per emitted token.
-    fn shallow_cost(&self) -> Option<f32> {
-        let (us, emitted) = self.shallow.cost;
-        (emitted > 0.0 && valid_us(us)).then(|| us / emitted)
-    }
-
-    /// The held shallow evidence still prices below AR.
-    fn shallow_wins(&self) -> bool {
-        self.shallow_state == ShallowState::Holding
-            && self.shallow_cost().is_some_and(|cost| cost < self.ar_us)
-    }
-
-    /// Draft budget the route may use: a held shallow request stays at or
-    /// below [`MTP_FLOOR_SHALLOW_CAP`] until a deeper candidate has the
-    /// positive evidence of [`Self::update_climb_evidence`].
-    fn hold_limit(&self, k: usize) -> usize {
-        if self.shallow_state == ShallowState::Holding
-            && self.climb_streak < MTP_FLOOR_PROBE_WINDOWS
-        {
-            k.min(MTP_FLOOR_SHALLOW_CAP)
-        } else {
-            k
-        }
-    }
-
-    /// Count one finished window of a held shallow request toward a climb:
-    /// the cheapest candidate within the budget is deeper than the shallow
-    /// cap and prices strictly below both the cheapest shallow candidate and
-    /// AR.
-    fn update_climb_evidence(&mut self, agreement: &Agreement) {
-        let k = self.budget_k;
-        let deeper = k > MTP_FLOOR_SHALLOW_CAP
-            && match (
-                self.best_candidate(agreement, MTP_FLOOR_SHALLOW_CAP),
-                self.best_candidate(agreement, k),
-            ) {
-                (Some((_, shallow)), Some((FloorRoute::Batched(cap), cost))) => {
-                    cap > MTP_FLOOR_SHALLOW_CAP && cost < shallow && cost < self.ar_us
-                }
-                _ => false,
-            };
-        self.climb_streak = if deeper {
-            self.climb_streak.saturating_add(1)
-        } else {
-            0
-        };
-    }
-
-    /// Track the shallow epoch with one finished native window: a deep
-    /// window zeroes the shallow count and ends a held or decided shallow
-    /// verdict; a shallow one counts when priced and feeds the re-probe or
-    /// the held evidence.
-    fn observe_shallow_epoch(
-        &mut self,
-        route: NativeWindow,
-        window: WindowStats,
-        us: f32,
-        agreement: &Agreement,
-    ) {
-        if route == NativeWindow::Batched && window.cap > MTP_FLOOR_SHALLOW_CAP {
-            self.deep_seen = true;
-            self.shallow_since_deep = 0;
-            self.climb_streak = 0;
-            match self.shallow_state {
-                ShallowState::Probing => self.spend_shallow_window(None),
-                ShallowState::Idle => {}
-                _ => self.shallow_state = ShallowState::Idle,
-            }
-            return;
-        }
-        let priced = valid_us(us);
-        if priced {
-            self.shallow_since_deep = self.shallow_since_deep.saturating_add(1);
-        }
-        let emitted = window.emitted as f32;
-        match self.shallow_state {
-            ShallowState::Probing => self.spend_shallow_window(priced.then_some((us, emitted))),
-            ShallowState::Holding => {
-                if priced {
-                    let decay = self.decay.max(MTP_FLOOR_RETIRE_DECAY);
-                    decay_add(&mut self.shallow.cost, us, emitted, decay);
-                }
-                self.update_climb_evidence(agreement);
-            }
-            _ => {}
-        }
-    }
-
-    /// Spend one window of the shallow re-probe (`evidence`: its wall us and
-    /// emitted tokens when priced), and take the verdict at
-    /// [`MTP_FLOOR_PROBE_WINDOWS`] priced windows or the window bound.
-    fn spend_shallow_window(&mut self, evidence: Option<(f32, f32)>) {
-        if self.shallow_state != ShallowState::Probing {
-            return;
-        }
-        self.shallow.windows += 1;
-        if let Some((us, emitted)) = evidence {
-            self.shallow.priced += 1;
-            self.shallow.cost.0 += us;
-            self.shallow.cost.1 += emitted;
-        }
-        if self.shallow.priced < MTP_FLOOR_PROBE_WINDOWS
-            && self.shallow.windows < MTP_FLOOR_SHALLOW_MAX_WINDOWS
-        {
-            return;
-        }
-        self.shallow_state = if self.shallow.priced == 0 {
-            ShallowState::Unpriced
-        } else if self.shallow_cost().is_some_and(|cost| cost < self.ar_us) {
-            self.deep_seen = false;
-            self.shallow_since_deep = self.shallow.priced;
-            self.climb_streak = 0;
-            ShallowState::Holding
-        } else {
-            ShallowState::Lost
-        };
-    }
-
-    /// The slow-memory realized per-token cost of every window is strictly
-    /// below AR.  Only floors given retire evidence consult it.
-    fn slow_wins(&self) -> bool {
-        self.probe_tokens > 0 && self.slow.1 > 0.0 && self.slow.0 / self.slow.1 < self.ar_us
-    }
-
-    /// Retire when, after the probe budget and at least `retire_after`
-    /// observed windows, nothing measured beats AR, external windows are
-    /// not alive on a mixture that beats AR, and (with retire evidence) the
-    /// slow-memory realized cost does not beat AR either; first re-pricing
-    /// AR with fresh probes ([`Self::retire_or_probe`]).
-    fn decide(&mut self, agreement: &Agreement) {
-        if self.retired
-            || !self.calibrated
-            || self.probing()
-            || self.probe_left > 0
-            || self.shallow_state == ShallowState::Probing
-        {
-            return;
-        }
-        if self.ar_us <= 0.0 {
-            self.retired = true;
-            return;
-        }
-        let external = (self.external.1 > 0.0).then(|| self.external.0 / self.external.1);
-        self.external_blocked = external.is_some_and(|cost| cost >= self.ar_us);
-        let native_wins = self
-            .best_native(agreement, usize::MAX)
-            .is_some_and(|(_, cost)| cost < self.ar_us);
-        if !native_wins
-            && !(self.external_alive() && self.combined_wins())
-            && !self.slow_wins()
-            && !self.shallow_wins()
-            && !self.in_grace()
-        {
-            self.retire_or_probe(agreement);
-        }
-    }
-
-    /// Route for the next native window with `k` drafts of budget.
-    /// `provisional` is the unchanged Halo-table `batched_depth(k)`, used
-    /// only while the probe budget lasts.  Afterwards a window may draft
-    /// only while a measured option within `k` costs strictly less per
-    /// emitted token than AR; it then runs the cheapest candidate within `k`
-    /// ([`Self::best_candidate`]: a measured cap, or an unmeasured cap next
-    /// to a measured one priced from it).  When no
-    /// measured option wins (an external-only budget, `k` below every
-    /// winning measured depth, a losing measured option, no valid AR price)
-    /// the request retires, stickily, and runs AR: no losing route, and no
-    /// unmeasured route without a measured winner, is ever run after the
-    /// budget.  Exceptions: inside the retirement grace (`retire_after`
-    /// observed windows) a request with a valid AR price keeps drafting on
-    /// its cheapest measured option within `k`, else the provisional depth;
-    /// and a floor with retire evidence ([`Self::with_retire_evidence`])
-    /// first runs [`FloorRoute::ArSample`] probe tokens, then keeps drafting
-    /// while the slow-memory realized cost beats the probed AR price.
-    pub(crate) fn route(
-        &mut self,
-        agreement: &Agreement,
-        k: usize,
-        provisional: usize,
-    ) -> FloorRoute {
-        self.budget_k = k;
-        if self.retired {
-            return FloorRoute::Ar;
-        }
-        if self.probe_left > 0 {
-            return FloorRoute::ArSample;
-        }
-        if self.probing() || !self.calibrated {
-            return match provisional {
-                0 => FloorRoute::Interleaved,
-                depth => FloorRoute::Batched(depth),
-            };
-        }
-        if self.shallow_state == ShallowState::Probing {
-            return self.shallow_route(agreement, k);
-        }
-        let limit = self.hold_limit(k);
-        let best = self.best_native(agreement, limit);
-        if let Some((route, cost)) = best {
-            if cost < self.ar_us {
-                // The candidates include every measured option, so the
-                // cheapest one costs no more than `cost`.
-                return self
-                    .best_candidate(agreement, limit)
-                    .map_or(route, |(candidate, _)| candidate);
-            }
-        }
-        if (self.external_alive() && self.combined_wins())
-            || self.slow_wins()
-            || self.shallow_wins()
-        {
-            // Losing native route kept alive for the external windows, the
-            // realized mixture or the held shallow evidence: the cheapest
-            // measured option within the limit, else interleaved.
-            return best.map_or(FloorRoute::Interleaved, |(route, _)| route);
-        }
-        if self.in_grace() && valid_us(self.ar_us) {
-            return best.map_or_else(
-                || match provisional {
-                    0 => FloorRoute::Interleaved,
-                    depth => FloorRoute::Batched(depth),
-                },
-                |(route, _)| route,
-            );
-        }
-        self.retire_or_probe(agreement)
-    }
-
-    /// One `QWEN4_FLOOR_TRACE` JSON line (`HIPFIRE_MTP_FLOOR_TRACE=1`): the
-    /// floor's state after `event`, with every candidate option in
-    /// microseconds per emitted token next to `ar_us` (`capN`: routed at
-    /// depth N; `modeled`: priced from a measured neighbour, `win_us` /
-    /// `emit` per window, `full` / `all` the shares of windows that drafted
-    /// the whole cap / also accepted it all).
-    pub(crate) fn trace_line(
-        &self,
-        agreement: &Agreement,
-        event: &str,
-        us: f32,
-        emitted: usize,
-        drafts: usize,
-    ) -> String {
-        let mut options = String::new();
-        if self.interleaved.1 > 0.0 {
-            options.push_str(&format!(
-                "{{\"route\":\"interleaved\",\"us_per_tok\":{:.1}}}",
-                self.interleaved.0 / self.interleaved.1
-            ));
-        }
-        for cap in 1..self.caps.len() {
-            let Some(cost) = self.cap_cost(agreement, cap) else {
-                continue;
-            };
-            if !options.is_empty() {
-                options.push(',');
-            }
-            let stats = self.caps[cap];
-            let per = |x: f32| {
-                if stats.windows > 0.0 {
-                    x / stats.windows
-                } else {
-                    0.0
-                }
-            };
-            let mean_drafted: f32 = stats
-                .drafted
-                .iter()
-                .enumerate()
-                .map(|(d, &w)| d as f32 * w)
-                .sum();
-            options.push_str(&format!(
-                "{{\"route\":\"cap{cap}\",\"modeled\":{},\"win_us\":{:.1},\"emit\":{:.3},\"drafted\":{:.2},\"us_per_tok\":{cost:.1}}}",
-                stats.windows <= 0.0,
-                per(stats.us),
-                per(stats.emitted),
-                per(mean_drafted),
-            ));
-        }
-        let row_us = self.fit_line().map_or(0.0, |(_, _, slope)| slope);
-        let combined = if self.combined.1 > 0.0 {
-            self.combined.0 / self.combined.1
-        } else {
-            0.0
-        };
-        let slow = if self.slow.1 > 0.0 {
-            self.slow.0 / self.slow.1
-        } else {
-            0.0
-        };
-        let shallow = self.shallow_cost().unwrap_or(0.0);
-        let shallow_state = self.shallow_state.name();
-        format!(
-            "QWEN4_FLOOR_TRACE {{\"event\":\"{event}\",\"us\":{us:.1},\"emitted\":{emitted},\"drafts\":{drafts},\"ar_us\":{:.1},\"observed\":{},\"probes\":{},\"retire_after\":{},\"retired\":{},\"probe_left\":{},\"combined_us_per_tok\":{combined:.1},\"slow_us_per_tok\":{slow:.1},\"row_us\":{row_us:.1},\"budget_k\":{},\"deep_seen\":{},\"shallow_state\":\"{shallow_state}\",\"shallow_windows\":{},\"shallow_priced\":{},\"shallow_budget\":{},\"shallow_since_deep\":{},\"shallow_us_per_tok\":{shallow:.1},\"climb_streak\":{},\"options\":[{options}]}}",
-            self.ar_us,
-            self.observed,
-            self.probes,
-            self.retire_after,
-            self.retired,
-            self.probe_left,
-            self.budget_k,
-            self.deep_seen,
-            self.shallow.windows,
-            self.shallow.priced,
-            MTP_FLOOR_SHALLOW_MAX_WINDOWS,
-            self.shallow_since_deep,
-            self.climb_streak
-        )
-    }
 }
 
 fn elapsed_us(start: Instant) -> f32 {
@@ -4248,8 +3304,9 @@ impl SampledVerify {
 pub struct Qwen4PromotionParts<'a> {
     /// The next window's row-0 hidden (F32, `hc_count * hidden`).
     pub pending_hidden: &'a GpuTensor,
-    /// Per-depth agreement (performance only).
-    pub agreement: [(f32, f32); 10],
+    /// Full request-capacity agreement (performance only), borrowed until the
+    /// receiving lane takes ownership at promotion.
+    pub agreement: &'a [(f32, f32)],
     /// The floor retired the request: the head lags, the lane must stay
     /// `ArRetired`.
     pub retired: bool,
@@ -4440,6 +3497,9 @@ fn terminal_repair_replay(
 /// head's position - 1) and a pre-window copy of it for a terminal repair.
 pub struct Qwen4MtpDrafter {
     max_k: usize,
+    /// Only a user-specified K limits the derived policy; the load default
+    /// remains the incumbent chooser's starting point.
+    explicit_mtp_k: Option<usize>,
     ctx_capacity: usize,
     /// Rows a 2+ row verify forward of the target runs row-exact on this GPU
     /// ([`Qwen4Bundle::row_exact_verify_rows`]); the copy lane's n-gram take
@@ -4465,7 +3525,7 @@ pub struct Qwen4MtpDrafter {
     /// Recent agreement per draft depth as decayed (accepted, compared)
     /// counts (see `observe_agreement`); picks the verify route and draft
     /// depth when `HIPFIRE_MTP_INCREMENTAL` is unset.
-    agreement: [(f32, f32); MTP_MAX_DEPTH],
+    agreement: Vec<(f32, f32)>,
     /// `speculation.mtp_sampled`, resolved at construction.
     sampled_enabled: bool,
     /// `HIPFIRE_MTP_SAMPLED_MODE`, resolved at construction; an invalid
@@ -4527,7 +3587,7 @@ pub struct Qwen4MtpDrafter {
     /// the native per-depth agreement and observed by shadow on every window
     /// that had a proposal, whichever source ran it
     /// ([`Self::observe_ngram_shadow`]).
-    ngram_agreement: [(f32, f32); NGRAM_DEPTHS],
+    ngram_agreement: Vec<(f32, f32)>,
     /// The full pool proposal (up to `n_max`) of the last plan that had one
     /// (reused buffer).
     ngram_proposal: Vec<u32>,
@@ -4556,7 +3616,7 @@ pub struct Qwen4MtpDrafter {
     /// Same-request AR floor; reset by request configuration or a newly
     /// emitted think-close after retirement. Realignment and head refills
     /// otherwise preserve sticky retirement.
-    floor: MtpFloor,
+    floor: Qwen4Floor,
     /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read once per request by
     /// `configure_request`; false restores the pre-floor chooser.
     floor_enabled: bool,
@@ -4591,7 +3651,7 @@ pub struct Qwen4MtpDrafter {
     /// tokens, so that row count's one-time verify work is done (see
     /// [`Self::floor_observe_native`]). Lives as long as the drafter, across
     /// requests.
-    warm_depths: u16,
+    warm_depths: u64,
     /// This drafter already timed a calibration-path AR token, so the
     /// decode route's one-time work is done (see [`Self::floor_observe_ar`]).
     /// Lives as long as the drafter, across requests.
@@ -4599,6 +3659,48 @@ pub struct Qwen4MtpDrafter {
     /// The last native window, priced for the floor only when the next
     /// window is planned (see [`Self::finish_floor_window`]).
     floor_pending: Option<FloorPending>,
+    /// Derived-K state of the current request (`HIPFIRE_QWEN4_MTP_DERIVED_K`
+    /// read once by `configure_request`); `None` when off, on a follower, or
+    /// for a sampled request.
+    derived: Option<DerivedPhase>,
+    /// Absolute context position of the window being planned, carried by the
+    /// singleton `mtp_step` only (other plan callers leave it `None` and never
+    /// consult); never `emitted.len()`.
+    derived_position: Option<usize>,
+    /// Last admitted row-exact verify capacity, including the seed row.
+    /// Refreshed from the bundle before planning; profile extent is not a cap.
+    verify_row_limit: usize,
+    /// Immutable measured-load descriptor for this load (`None` in tests and
+    /// in any loader that has not supplied one): the `LoadIdentityMuse`
+    /// `Qwen4MeasuredLoadIdentity` shared once per load, borrowed by
+    /// reference per request, never hashed or re-serialized per window. A
+    /// directly constructed drafter without the descriptor (synthetic CPU
+    /// tests included) stays a real incumbent for the derived policy:
+    /// synthetic tables exercise the inner binder without ever claiming
+    /// production eligibility.
+    measured_load_identity:
+        Option<std::sync::Arc<crate::measured_identity::Qwen4MeasuredLoadIdentity>>,
+    /// Reusable native-margin scratch: the actual logit margin of every head
+    /// row drafted this native window (`None` for a non-finite or negative
+    /// margin, which carries no evidence). Reserved for [`DERIVED_MAX_DRAFTS`]
+    /// once per drafter and reused by every window, so no allocation happens
+    /// mid-window. Reset at each native draft entry, appended by every actual
+    /// head step, consumed (as bins) by the post-row re-solve and by the lab
+    /// forced-window receipt. Present (allocated) only while derived is bound
+    /// or a lab forced-cost window is armed; the off path stores nothing.
+    derived_margins: Option<Vec<Option<f32>>>,
+    #[cfg(feature = "reference-parity")]
+    lab_force_drafts: Option<usize>,
+    #[cfg(feature = "reference-parity")]
+    lab_copy_enabled: Option<bool>,
+    #[cfg(feature = "reference-parity")]
+    lab_forced_window: Option<crate::wide_verify_oracle::DevForcedWindow>,
+    #[cfg(feature = "reference-parity")]
+    lab_confirmation: Option<bool>,
+    #[cfg(feature = "reference-parity")]
+    lab_requested_confirmation: bool,
+    #[cfg(feature = "reference-parity")]
+    lab_actual_route: Option<crate::wide_verify_oracle::DevWindowRoute>,
     /// Lab window observation arming (`lab_observe_windows`).
     #[cfg(feature = "lab")]
     lab_arm: crate::lab_window::LabWindowArm,
@@ -4608,6 +3710,230 @@ pub struct Qwen4MtpDrafter {
     /// Closed window observations awaiting `lab_take_window_observation`.
     #[cfg(feature = "lab")]
     lab_done: std::collections::VecDeque<crate::lab_window::LabWindow>,
+}
+
+#[cfg(feature = "reference-parity")]
+impl Qwen4MtpDrafter {
+    /// Pin qualification width, not acceptance or tokens. Clearing it restores
+    /// the production planner; the setting survives prefill and reset.
+    pub fn lab_force_window_drafts(&mut self, drafts: Option<usize>) -> Result<(), String> {
+        if drafts.is_some_and(|d| d > DERIVED_MAX_DRAFTS) {
+            return Err("forced draft width exceeds physical executor capacity 63".into());
+        }
+        self.lab_force_drafts = drafts;
+        self.refresh_chooser_capacity();
+        Ok(())
+    }
+
+    /// Gate copy offers without clearing either pool or resetting evidence.
+    /// None restores the configured source policy.
+    pub fn lab_force_copy_enabled(&mut self, enabled: Option<bool>) {
+        self.lab_copy_enabled = enabled;
+    }
+
+    pub fn lab_retire_native(&mut self) -> Result<(), String> {
+        if self.follower {
+            return Err("lab retirement requires the singleton planner".into());
+        }
+        self.floor.seed_retired(true);
+        self.stats.mtp_retired = true;
+        Ok(())
+    }
+
+    fn lab_policy_forced(&self) -> bool {
+        self.lab_force_drafts.is_some() || self.lab_forced_window.is_some()
+    }
+
+    fn lab_ngram_width(&self) -> Option<usize> {
+        use crate::wide_verify_oracle::DevWindowSource;
+        if self.lab_copy_enabled == Some(false) {
+            return None;
+        }
+        match self.lab_forced_window {
+            Some(r) if r.source == DevWindowSource::Ngram => Some(r.drafts),
+            Some(_) => None,
+            None => self.lab_force_drafts.filter(|&d| d > 0),
+        }
+    }
+
+    fn lab_plan_window(
+        &mut self,
+        emitted: &[u32],
+        caller_k: usize,
+        trace: bool,
+        plan_start: Instant,
+    ) -> Result<WindowPlan, String> {
+        use crate::wide_verify_oracle::DevWindowSource;
+        let request = self.lab_forced_window;
+        let d = request
+            .map_or_else(|| self.lab_force_drafts.unwrap_or(0), |r| r.drafts)
+            .min(caller_k);
+        self.ngram_candidates.clear();
+        self.ngram_proposal.clear();
+        let offered_hit = self.ngram_hit(emitted, caller_k);
+        let hit = match request.map(|r| r.source) {
+            Some(DevWindowSource::Mtp | DevWindowSource::ArRouted) => false,
+            _ => offered_hit,
+        };
+        if request.is_some_and(|r| r.source == DevWindowSource::Ngram) && !hit {
+            return Err(format!(
+                "unsupported real ngram offer: requested {d}, available {}",
+                self.ngram_proposal.len()
+            ));
+        }
+        if request.is_some_and(|r| r.source == DevWindowSource::Mtp) && self.floor.retired() {
+            return Err("unsupported forced native window: request is retired".into());
+        }
+        let confirm = hit && self.ngram_decision.is_none_or(|v| v.confirm);
+        self.lab_requested_confirmation = confirm;
+        self.trace_ngram_plan(trace, emitted, plan_start, self.floor.retired());
+        let route = if self.floor.retired() {
+            WindowRoute::ArRetired
+        } else if request.is_some_and(|r| r.source == DevWindowSource::ArRouted) {
+            WindowRoute::ArRouted
+        } else {
+            WindowRoute::Native { depth: d }
+        };
+        Ok(WindowPlan {
+            route,
+            k: d,
+            trace,
+            floor_active: false,
+            ngram_hit: hit,
+            ngram_confirm: !hit || confirm,
+            ngram_candidates: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dev_run_forced_window(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        eos: u32,
+        request: crate::wide_verify_oracle::DevForcedWindow,
+    ) -> Result<crate::wide_verify_oracle::DevWindowMeasurement, String> {
+        use crate::wide_verify_oracle::{dev_verify_caps, DevWindowMeasurement, DevWindowSource};
+        if self.follower || bundle.ep_mesh().is_some() {
+            return Err("forced window timing supports singleton only".into());
+        }
+        if self.lab_forced_window.is_some() {
+            return Err("forced window timing is already active".into());
+        }
+        if request.drafts > DERIVED_MAX_DRAFTS
+            || (request.source == DevWindowSource::ArRouted) != (request.drafts == 0)
+        {
+            return Err("forced window requires AR K0 or native/real-ngram K1..63".into());
+        }
+        if self.sampled.is_some() {
+            return Err("forced window timing requires greedy verification".into());
+        }
+        if request.source == DevWindowSource::ArRouted && self.floor.retired() {
+            return Err("unsupported ArRouted profile: request is already retired".into());
+        }
+        if bundle.state.position != position || emitted.last() != Some(&seed) {
+            return Err("forced window position or pending seed does not match live state".into());
+        }
+        let caps = dev_verify_caps(bundle, gpu);
+        let cpu = bundle.has_cpu_deferred_experts() || bundle.cpu_storage_capacity_rows() > 0;
+        let qualified = if cpu {
+            let lab_armed =
+                rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&gpu.arch)
+                    && !gpu.replay.is_recording()
+                    && !gpu.graphs.capture_mode;
+            bundle.cpu_qualified_verify_rows(gpu, lab_armed)
+        } else {
+            caps.row_exact_verify_rows
+        };
+        let limit = if request.timing_only && !cpu {
+            caps.spec_verify_rows_cap
+        } else {
+            caps.spec_verify_rows_cap.min(qualified)
+        };
+        if request.drafts + 1 > limit {
+            return Err(format!(
+                "unsupported forced width {} rows; effective cap {limit}",
+                request.drafts + 1
+            ));
+        }
+        let before = self.stats.ngram_mod_windows;
+        let saved_copy = self.lab_copy_enabled;
+        self.lab_forced_window = Some(request);
+        self.refresh_chooser_capacity();
+        self.lab_copy_enabled = None;
+        self.lab_confirmation = None;
+        self.lab_requested_confirmation = false;
+        self.lab_actual_route = None;
+        // The lab receipt copies the scratch out below; the batched draft
+        // loop arms it when derived or forced-cost measurement is active.
+        let timed = (|| {
+            gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+            let start = Instant::now();
+            let window = self.mtp_step(
+                gpu,
+                bundle,
+                position,
+                seed,
+                emitted,
+                request.drafts,
+                eos,
+                None,
+            )?;
+            gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+            let total_us = start.elapsed().as_secs_f64() * 1e6;
+            let source = if self.stats.ngram_mod_windows > before {
+                DevWindowSource::Ngram
+            } else if request.source == DevWindowSource::ArRouted {
+                DevWindowSource::ArRouted
+            } else {
+                DevWindowSource::Mtp
+            };
+            // Busy window? No: a requested/actual mismatch keeps the observed
+            // window as a raw incomplete measurement (the curve consumer gates
+            // `complete` on requested == actual and on the margins length).
+            // Only a real transaction failure (position/seed/caps/route latch)
+            // is `Err` here.
+            let outcome_mismatch =
+                source != request.source || window.drafts_generated != request.drafts;
+            let native_draft_margins = if source == DevWindowSource::Mtp {
+                // The lab receipt copies the captured vector out once;
+                // production keeps no copy. Native only: every other route
+                // is empty. `None` is an actual invalid head-step margin,
+                // never padding: the curve length gate preserves an
+                // incomplete raw receipt.
+                self.derived_margins
+                    .as_ref()
+                    .map(|scratch| scratch.iter().copied().collect::<Vec<Option<f32>>>())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Ok(DevWindowMeasurement {
+                requested_drafts: request.drafts,
+                actual_drafts: window.drafts_generated,
+                offered: self.ngram_proposal.len(),
+                accepted_prefix: window.accepted,
+                source,
+                route: self
+                    .lab_actual_route
+                    .ok_or("forced window did not latch an execution route")?,
+                cost_mode: self.derived_cost_mode(),
+                requested_confirmation: self.lab_requested_confirmation,
+                head_confirmation: self.lab_confirmation,
+                terminal: window.committed.contains(&self.end_of_turn.unwrap_or(eos)),
+                total_us,
+                window,
+                native_draft_margins,
+                outcome_mismatch,
+            })
+        })();
+        self.lab_forced_window = None;
+        self.lab_copy_enabled = saved_copy;
+        timed
+    }
 }
 
 /// A finished native window awaiting its floor price.
@@ -4641,17 +3967,1174 @@ struct NgramDecision {
     a1: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Derived K (`HIPFIRE_QWEN4_MTP_DERIVED_K=1`, developer-only, default off).
+//
+// One E/T objective (`hipfire_runtime::spec_economics::DerivedRequest`) over
+// the frozen `fn-phase1-v1` calibration and the measured total window prices
+// of the request's cost mode. (a) Before the window it enumerates every
+// measured, supported prefix up to the legal ceiling (the qualified row-exact
+// verify rows less the seed, the physical draft rows, the head's own K that an
+// explicit `speculation.mtp_k` sets, the caller's remaining budget and, for an
+// n-gram take, the pool's offer) and runs the global maximum: it neither
+// inherits the incumbent's depth, its fresh-request shallow cap nor the
+// margin prune's fixed worth as a ceiling, and may widen as well as narrow.
+// (b) After each drafted row it re-solves the same objective over the
+// remaining measured prefixes `k >= drafted` (stopping now is `k == drafted`;
+// a drafted row cannot be discarded and the total price of every such `k`
+// already contains the heads spent so far exactly once). It picks no source
+// and never bypasses the n-gram confirmation. Forced routes, the floor's own
+// AR calibration/retirement and every sampled, PP, EP, lane or unidentified
+// request keep the incumbent. A window whose cost mode (OffPool, or OnCopy
+// with the copy lane) has no measured price keeps the incumbent and says so
+// in the trace; the modes' prices are never mixed. Off (the flag unset or any
+// value but `1`) the drafter holds no derived state at all: no allocation, no
+// table query, no trace line and no extra Floor call.
+// ---------------------------------------------------------------------------
+
+/// A frozen median window price lookup: `(median_us, context_pooled)`;
+/// `None` = no measured price in that mode (never another mode's).
+type DerivedWindowPrice =
+    fn(DerivedCard, DerivedCostMode, DerivedSource, ContextBucket, u8, bool) -> Option<(f64, bool)>;
+
+/// Frozen calibration counts and window/AR prices. Production binds
+/// [`FN_PHASE1_TABLES`]; a test binds scripted tables, so the planner hook is
+/// exercised without the generated table's values.
+#[derive(Clone, Copy)]
+struct DerivedTables {
+    counts: fn(
+        DerivedCard,
+        DerivedCostMode,
+        DerivedSource,
+        u8,
+        DerivedFeature,
+    ) -> Option<CalibrationCounts>,
+    window_price: DerivedWindowPrice,
+    ar_price: fn(DerivedCard, DerivedCostMode, ContextBucket) -> Option<(f64, bool)>,
+}
+
+const FN_PHASE1_TABLES: DerivedTables = DerivedTables {
+    counts: fn_measured_depth_counts,
+    window_price: fn_measured_window_price,
+    ar_price: fn_measured_ar_price,
+};
+
+/// The PLE rows' class the calibration was measured with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DerivedPle {
+    /// An attached Q8F16 sidecar (the R9700 receipt).
+    Q8Sidecar,
+    /// An attached Q4LM sidecar (the Halo receipt).
+    Q4Sidecar,
+    /// Embedded shards, absent rows or any other encoding: unknown class.
+    Other,
+}
+
+/// What the loaded target is, bound once per request from the first prefill's
+/// GPU and bundle ([`Qwen4MtpDrafter::derived_bind_target`]). The loader ->
+/// runtime identity closure (immutable verified artifact/sidecar plus resolved
+/// placement/state/route, cheap per-request reference) is owned separately;
+/// `DerivedIdentity` does not re-derive or re-hash it here. A missing or
+/// mismatched book keeps the real incumbent: no invented prices.
+#[derive(Clone, Copy, Debug)]
+struct DerivedIdentity<'a> {
+    /// `gpu.arch`: exactly `gfx1201` (R9700) or `gfx1151` (Halo).
+    arch: &'a str,
+    /// `config.profile` is `Qwen4Profile::FlashNext`.
+    flash_next: bool,
+    /// The loaded manifest's recipe is `Qwen4TierRecipe::FlashNextPacked`.
+    packed_recipe: bool,
+    /// The config declares the one-layer MTP head and the bundle attached it.
+    mtp_head: bool,
+    /// No `expert_keep` subset.
+    full_experts: bool,
+    ple: DerivedPle,
+    qsa: crate::QsaKvFormat,
+    gdn: crate::GdnStateFormat,
+    /// No PP mesh, EP mesh or placement, lane store or follower replica.
+    singleton: bool,
+}
+
+/// The card a frozen calibration exists for, or the reason this identity is
+/// outside it. Exact arch strings; per card the receipts' state class: R9700
+/// QSA fp8 + GDN q8 + Q8F16 PLE sidecar, Halo QSA q8 + GDN f32 + Q4LM sidecar.
+#[cfg(test)]
+fn derived_eligibility(id: &DerivedIdentity<'_>) -> Result<DerivedCard, &'static str> {
+    derived_arithmetic_eligibility(id, false)
+}
+
+/// The generic book may qualify Q4 on gfx1201 without changing the live
+/// arithmetic. Every other architecture, recipe, state and placement law stays
+/// identical to the legacy receipt.
+fn derived_arithmetic_eligibility(
+    id: &DerivedIdentity<'_>,
+    qualified_generic: bool,
+) -> Result<DerivedCard, &'static str> {
+    let card = match id.arch {
+        "gfx1201" => DerivedCard::R9700,
+        "gfx1151" => DerivedCard::Halo,
+        _ => return Err("unsupported_arch"),
+    };
+    if !id.singleton {
+        return Err("not_singleton");
+    }
+    if !id.flash_next {
+        return Err("profile");
+    }
+    if !id.packed_recipe {
+        return Err("recipe");
+    }
+    if !id.mtp_head {
+        return Err("no_mtp_head");
+    }
+    if !id.full_experts {
+        return Err("expert_keep");
+    }
+    let (ple, state_ok) = match card {
+        DerivedCard::R9700 => (
+            DerivedPle::Q8Sidecar,
+            matches!(
+                (id.qsa, id.gdn),
+                (crate::QsaKvFormat::Fp8, crate::GdnStateFormat::Q8)
+            ),
+        ),
+        DerivedCard::Halo => (
+            DerivedPle::Q4Sidecar,
+            matches!(
+                (id.qsa, id.gdn),
+                (crate::QsaKvFormat::Q8, crate::GdnStateFormat::F32)
+            ),
+        ),
+    };
+    if id.ple != ple
+        && !(qualified_generic && card == DerivedCard::R9700 && id.ple == DerivedPle::Q4Sidecar)
+    {
+        return Err("ple_class");
+    }
+    if !state_ok {
+        return Err("state_format");
+    }
+    Ok(card)
+}
+
+/// Admission is an exact cached product descriptor match to a nonempty,
+/// qualified measured profile, never merely the same card/mode or PLE class.
+fn derived_measured_eligibility(
+    id: &DerivedIdentity<'_>,
+    cached: Option<&str>,
+    admitted: impl FnOnce(DerivedCard) -> Option<&'static str>,
+) -> Result<DerivedCard, &'static str> {
+    let card = derived_arithmetic_eligibility(id, true)?;
+    match (cached, admitted(card)) {
+        (Some(cached), Some(profile)) if cached == profile => Ok(card),
+        (Some(_), Some(_)) => Err("measured_load_mismatch"),
+        _ => Err("measured_load_missing"),
+    }
+}
+
+/// The identity of a loaded target. `shared_scope`: the request does not own
+/// the whole model on one device (a PP mesh or a follower replica).
+fn derived_identity_of<'a>(
+    bundle: &Qwen4Bundle,
+    arch: &'a str,
+    shared_scope: bool,
+) -> DerivedIdentity<'a> {
+    use hipfire_runtime::external_rows::RowEncoding;
+    let ple = match bundle.ple_source() {
+        Some(crate::artifact::Qwen4PleRows::Sidecar {
+            encoding: RowEncoding::Q8F16,
+            ..
+        }) => DerivedPle::Q8Sidecar,
+        Some(crate::artifact::Qwen4PleRows::Sidecar {
+            encoding: RowEncoding::Q4Lm,
+            ..
+        }) => DerivedPle::Q4Sidecar,
+        _ => DerivedPle::Other,
+    };
+    let state = bundle.state_format();
+    DerivedIdentity {
+        arch,
+        flash_next: matches!(
+            bundle.config.profile,
+            crate::config::Qwen4Profile::FlashNext
+        ),
+        packed_recipe: matches!(
+            bundle.weights.manifest.identity.recipe,
+            crate::Qwen4TierRecipe::FlashNextPacked { .. }
+        ),
+        mtp_head: bundle.config.mtp.is_some() && bundle.mtp.is_some(),
+        full_experts: bundle.config.expert_keep.is_none()
+            && bundle.weights.manifest.expert_keep.is_none(),
+        ple,
+        qsa: state.qsa,
+        gdn: state.gdn,
+        singleton: !shared_scope
+            && !bundle.pp_mesh_active()
+            && bundle.ep_mesh().is_none()
+            && bundle
+                .weights
+                .ep_placement()
+                .is_none_or(|placement| placement.ranks <= 1)
+            && bundle.lanes().is_none(),
+    }
+}
+
+/// A request's derived-K lifecycle. The drafter's `derived` is `None` when
+/// the flag is off, the drafter is a follower replica, or the request is
+/// sampled.
+enum DerivedPhase {
+    /// Configured with the flag on; the first prefill binds the identity.
+    Unbound,
+    /// Bound, and outside every frozen calibration: the incumbent runs.
+    Ineligible,
+    Bound(Box<DerivedState>),
+}
+
+/// A bound request's chooser state. The policy vectors are provisioned once
+/// for the physical maximum ([`DERIVED_MAX_DRAFTS`] depths, one more price)
+/// and reused by every window whatever rows the executor qualifies; only the
+/// sparse residual cells follow the admitted capacity.
+struct DerivedState {
+    card: DerivedCard,
+    tables: DerivedTables,
+    request: DerivedRequest,
+    capacity: usize,
+    depths: Vec<DerivedDepth>,
+    prices: Vec<DerivedPrice>,
+    resolve: Vec<DerivedPrice>,
+    keys: Vec<ResidualKey>,
+    pending: Option<DerivedPending>,
+    /// Cost mode the bind-time identity was admitted under: a mode flip
+    /// after bind invalidates the window (see [`Self::derived_route_changed`]).
+    mode_hint: Option<DerivedCostMode>,
+    /// Reusable per-depth re-solve inputs: `depths` with every measured
+    /// legal depth re-keyed to the latest observed margin cell. Reused by
+    /// every re-solve and every window; never reallocated mid-window.
+    margined: Vec<DerivedDepth>,
+    /// Reusable commit bins of the executed rows' observed margins, indexed
+    /// `row - 1`. Reused by every commit; never reallocated per window.
+    margin_bins: Vec<Option<NativeMarginBin>>,
+    /// Last re-solve's evidence: the committed row whose margin re-keyed
+    /// `margined`, and how many depths carried a measured margin cell.
+    /// `measured == 0` means the re-solve ran on the unconditional evidence.
+    last_margin: Option<(usize, NativeMarginBin)>,
+    last_measured: usize,
+    /// Refreshed from the actual bundle/GPU before each production plan.
+    /// Scripted CPU table tests have no device reference.
+    reference: Option<bool>,
+    #[cfg(test)]
+    consults: u32,
+    #[cfg(test)]
+    observes: u32,
+    #[cfg(test)]
+    resolves: u32,
+}
+
+impl DerivedState {
+    fn new(card: DerivedCard, tables: DerivedTables, capacity: usize) -> Self {
+        Self {
+            card,
+            tables,
+            request: DerivedRequest::with_max_drafts(card, capacity),
+            capacity,
+            mode_hint: None,
+            depths: Vec::with_capacity(DERIVED_MAX_DRAFTS),
+            prices: Vec::with_capacity(DERIVED_MAX_DRAFTS + 1),
+            resolve: Vec::with_capacity(DERIVED_MAX_DRAFTS + 1),
+            margined: Vec::with_capacity(DERIVED_MAX_DRAFTS),
+            margin_bins: Vec::with_capacity(DERIVED_MAX_DRAFTS),
+            keys: Vec::with_capacity(DERIVED_MAX_DRAFTS),
+            pending: None,
+            last_margin: None,
+            last_measured: 0,
+            reference: None,
+            #[cfg(test)]
+            consults: 0,
+            #[cfg(test)]
+            observes: 0,
+            #[cfg(test)]
+            resolves: 0,
+        }
+    }
+
+    fn set_capacity(&mut self, capacity: usize) {
+        if capacity == self.capacity {
+            return;
+        }
+        self.capacity = capacity;
+        // Only the sparse residual cells follow the admitted capacity; the
+        // policy vectors were provisioned for the physical maximum.
+        self.request.set_capacity(capacity);
+    }
+}
+
+/// What a consulted window needs at its observation boundary.
+#[derive(Clone, Copy, Debug)]
+struct DerivedPending {
+    /// The source whose depths were priced (the incumbent's).
+    source: DerivedSource,
+    /// The cost mode the prices were taken in.
+    mode: DerivedCostMode,
+    /// Pre-window price identity, not an observed confirmation outcome.
+    confirmation: bool,
+    /// Absolute context position of the window.
+    position: usize,
+    /// The incumbent width: the native depth or the n-gram take.
+    incumbent: u8,
+    /// `None`: the chooser found no priced action; `Some(0)`: AR.
+    chosen: Option<u8>,
+    /// The chosen action's total window cost and expected tokens.
+    chosen_cost_us: f64,
+    chosen_expected: f64,
+    /// The widest measured legal prefix the window priced.
+    hi: u8,
+    /// The legal draft ceiling of this window before the caller's budget.
+    legal: usize,
+    /// The caller's draft budget, whose `+ 1` is the window's commit cap.
+    caller_k: usize,
+    /// Some priced action used the all-context pooled median.
+    pooled: bool,
+    /// The n-gram takeover ran (the head's confirmation matched), as opposed
+    /// to the native window that replaces an unconfirmed hit.
+    ran_ngram: bool,
+}
+
+/// Replay2's context label of `bucket`.
+fn derived_context_label(bucket: ContextBucket) -> &'static str {
+    match bucket {
+        ContextBucket::Le2K => "<=2K",
+        ContextBucket::Le8K => "<=8K",
+        ContextBucket::Le16K => "<=16K",
+        ContextBucket::Over16K => "32K+",
+    }
+}
+
+/// The `source` label of a derived trace line.
+fn derived_source_label(source: DerivedSource) -> &'static str {
+    match source {
+        DerivedSource::Mtp => "mtp",
+        DerivedSource::Ngram => "ngram",
+    }
+}
+
+/// The `mode` label of a derived trace line.
+fn derived_mode_label(mode: DerivedCostMode) -> &'static str {
+    match mode {
+        DerivedCostMode::OffPool => "off_pool",
+        DerivedCostMode::OnCopy => "on_copy",
+    }
+}
+
+impl Qwen4MtpDrafter {
+    /// The request's derived-K state: reset by every configuration. `enabled`
+    /// is the flag, read once by [`MtpDrafter::configure_request`]. A
+    /// follower replica never plans; a sampled request (a non-finite or
+    /// positive temperature) creates no state and says so once.
+    fn derived_configure(&mut self, cfg: &SpecRequestConfig, enabled: bool) {
+        self.derived = None;
+        self.derived_position = None;
+        if !enabled || self.follower {
+            return;
+        }
+        if !cfg.temp.is_finite() || cfg.temp > 1.0e-6 {
+            self.trace_derived_request(false, Some("sampled"), None);
+            return;
+        }
+        self.derived = Some(DerivedPhase::Unbound);
+    }
+
+    /// Bind the request's identity outcome (first call only). The mode hint
+    /// is stamped from the drafter's current cost mode so a later flip
+    /// invalidates the window.
+    fn derived_bind(&mut self, outcome: Result<DerivedCard, &'static str>, tables: DerivedTables) {
+        if !matches!(self.derived, Some(DerivedPhase::Unbound)) {
+            return;
+        }
+        let mode = self.derived_cost_mode();
+        match outcome {
+            Ok(card) => {
+                let mut state =
+                    DerivedState::new(card, tables, self.derived_legal_cap(DerivedSource::Mtp));
+                state.mode_hint = Some(mode);
+                self.derived = Some(DerivedPhase::Bound(Box::new(state)));
+                self.refresh_chooser_capacity();
+                self.trace_derived_request(true, None, Some(card));
+            }
+            Err(reason) => {
+                self.derived = Some(DerivedPhase::Ineligible);
+                self.trace_derived_request(false, Some(reason), None);
+            }
+        }
+    }
+
+    /// Bind from the first prefill's GPU and target. A PP mesh is not a
+    /// singleton. The cached canonical JSON (supplied once by the loader via
+    /// [`Self::with_measured_load_identity`]) is compared once here against
+    /// the runtime's admitted identity for the request's cost mode; any
+    /// mismatch (or any missing descriptor) keeps the real incumbent via
+    /// `Ineligible`, never invented prices.
+    fn derived_bind_target(&mut self, ops: &mut Qwen4Ops<'_>, target: &mut dyn SpecTarget) {
+        let mesh = ops.is_mesh();
+        let arch = ops.gpu().map(|gpu| gpu.arch.clone()).unwrap_or_default();
+        let shared_scope = mesh || self.follower;
+        let mode = self.derived_cost_mode();
+        // Typed descriptor, compared as its cached canonical JSON string:
+        // no re-serialization per request, no hashing. Any mismatch or
+        // missing descriptor keeps the real incumbent via `Ineligible`.
+        let measured = self
+            .measured_load_identity
+            .as_deref()
+            .map(|identity| identity.canonical_json());
+        let outcome = match Self::bundle(target) {
+            Ok(bundle) => derived_measured_eligibility(
+                &derived_identity_of(bundle, &arch, shared_scope),
+                measured,
+                |card| fn_measured_load_identity(card, mode),
+            ),
+            Err(_) => Err("not_qwen4_bundle"),
+        };
+        self.derived_bind(outcome, FN_PHASE1_TABLES);
+    }
+
+    /// The once-per-request `derived_k_request` trace line.
+    fn trace_derived_request(
+        &self,
+        eligible: bool,
+        reason: Option<&str>,
+        card: Option<DerivedCard>,
+    ) {
+        let enabled =
+            hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
+        if !enabled || self.follower {
+            return;
+        }
+        let reason = reason.map_or_else(|| "null".to_string(), |reason| format!("\"{reason}\""));
+        let card = match card {
+            Some(DerivedCard::R9700) => "\"R9700\"",
+            Some(DerivedCard::Halo) => "\"Halo\"",
+            None => "null",
+        };
+        eprintln!(
+            "QWEN4_MTP_TRACE {{\"event\":\"derived_k_request\",\"version\":\"{FN_DERIVED_VERSION}\",\"eligible\":{eligible},\"reason\":{reason},\"card\":{card}}}"
+        );
+    }
+
+    /// A consulted window awaits its observation.
+    fn derived_pending_open(&self) -> bool {
+        matches!(&self.derived, Some(DerivedPhase::Bound(state)) if state.pending.is_some())
+    }
+
+    /// Drop the consulted window without an update (a failed or rolled-back
+    /// window, a reset, a prefill or a terminal repair). The scratch is left
+    /// alone on purpose: the lab receipt reads it after this call on the
+    /// failed-window path, and the next batched window re-arms from its own
+    /// entry reset. Stale margins never leak into a later re-solve because
+    /// every batched entry resets before the first head step.
+    fn derived_drop_pending(&mut self) {
+        if let Some(DerivedPhase::Bound(state)) = self.derived.as_mut() {
+            state.pending = None;
+        }
+    }
+
+    /// The window's n-gram takeover ran, so the queried n-gram source
+    /// executed (a confirmation miss never reaches it).
+    fn derived_note_takeover(&mut self) {
+        if let Some(DerivedPhase::Bound(state)) = self.derived.as_mut() {
+            if let Some(pending) = state.pending.as_mut() {
+                pending.ran_ngram = true;
+            }
+        }
+    }
+
+    /// The planner hook, after the incumbent chose a batched native route of
+    /// depth >= 1: consult the chooser over the incumbent source's prefixes.
+    /// The live target/state/placement/mode identity is re-checked once per
+    /// request bind (see [`Self::derived_bind_target`]); a relevant
+    /// transition after bind invalidates to `Ineligible` here: a copy-lane
+    /// mode flip, or an AR-reference fallback/record transition away from the
+    /// reference the admitted profile was measured with. The production
+    /// window refreshes the exact bundle/GPU reference before consulting;
+    /// no per-window hashing or serialization is needed.
+    fn derived_plan(&mut self, plan: &mut WindowPlan, caller_k: usize) {
+        if self.derived_route_changed(plan) {
+            self.derived = Some(DerivedPhase::Ineligible);
+            return;
+        }
+        let Some(position) = self.derived_position else {
+            return;
+        };
+        if !matches!(self.derived, Some(DerivedPhase::Bound(_))) {
+            return;
+        }
+        let Some(DerivedPhase::Bound(mut state)) = self.derived.take() else {
+            return;
+        };
+        self.derived_consult(&mut state, plan, caller_k, position);
+        self.derived = Some(DerivedPhase::Bound(state));
+    }
+
+    /// Whether the window's live execution route no longer matches the bound
+    /// identity: a copy-lane mode flip, or an AR-reference fallback/record
+    /// transition away from the admitted profile's reference. The production
+    /// caller supplies the exact current reference; scripted CPU table tests
+    /// exercise the same optimizer without a live device.
+    fn derived_route_changed(&self, plan: &WindowPlan) -> bool {
+        let Some(DerivedPhase::Bound(state)) = self.derived.as_ref() else {
+            return false;
+        };
+        let mode = self.derived_cost_mode();
+        if state.mode_hint != Some(mode) {
+            return true;
+        }
+        let source = if plan.ngram_hit {
+            DerivedSource::Ngram
+        } else {
+            DerivedSource::Mtp
+        };
+        state.reference.is_some_and(|recorded| {
+            !fn_measured_reference_supported(state.card, mode, source, recorded)
+        })
+    }
+
+    /// The mode a window's prices are keyed by: the copy lane routes (and so
+    /// costs) every window differently from the default pool route, so its
+    /// prices are a separate measured profile, never the pool's.
+    fn derived_cost_mode(&self) -> DerivedCostMode {
+        if self.copy_lane {
+            DerivedCostMode::OnCopy
+        } else {
+            DerivedCostMode::OffPool
+        }
+    }
+
+    /// The admitted request ceiling, independent of historical profile extent.
+    fn incumbent_max_k(&self) -> usize {
+        self.max_k
+            .min(self.explicit_mtp_k.unwrap_or(DERIVED_MAX_DRAFTS))
+            .min(self.verify_row_limit.saturating_sub(1))
+            .min(self.draft_rows_cap())
+            .min(DERIVED_MAX_DRAFTS)
+    }
+
+    /// The incumbent ceiling when off; otherwise only physical/qualified
+    /// capacity and an explicit user override, never the load's default K.
+    fn k_ceiling(&self) -> usize {
+        #[cfg(feature = "reference-parity")]
+        if self.lab_policy_forced() {
+            return self
+                .lab_forced_window
+                .map(|r| r.drafts)
+                .or(self.lab_force_drafts)
+                .unwrap_or(0)
+                .min(self.draft_rows_cap());
+        }
+        if matches!(
+            self.derived,
+            Some(DerivedPhase::Unbound | DerivedPhase::Bound(_))
+        ) {
+            self.derived_legal_cap(DerivedSource::Mtp)
+        } else {
+            self.incumbent_max_k()
+        }
+    }
+
+    /// Every source obeys the same physical/qualified and explicit user caps.
+    /// Real n-gram availability is an additional bound at consultation.
+    fn derived_legal_cap(&self, _source: DerivedSource) -> usize {
+        self.explicit_mtp_k
+            .unwrap_or(DERIVED_MAX_DRAFTS)
+            .min(self.verify_row_limit.saturating_sub(1))
+            .min(self.draft_rows_cap())
+            .min(DERIVED_MAX_DRAFTS)
+    }
+
+    /// Refresh the executor's qualified capacity before planning, without
+    /// changing the profile or promoting an unqualified load.
+    fn derived_refresh_rows(&mut self, rows: usize) {
+        self.verify_row_limit = rows;
+        self.refresh_chooser_capacity();
+    }
+
+    fn refresh_chooser_capacity(&mut self) {
+        let capacity = self.k_ceiling().min(self.draft_rows_cap());
+        if self.agreement.len() != capacity {
+            self.agreement.resize(capacity, AGREEMENT_PRIOR);
+        }
+        self.floor.set_capacity(capacity);
+        let derived_capacity = self.derived_legal_cap(DerivedSource::Mtp);
+        if let Some(DerivedPhase::Bound(state)) = self.derived.as_mut() {
+            state.set_capacity(derived_capacity);
+        }
+        if self.derived_margins_active() {
+            // Provisioned for the physical maximum, never the current rows:
+            // the executor's qualified rows can change between windows and
+            // the per-window path must not allocate.
+            let scratch = self.derived_margins.get_or_insert_with(Vec::new);
+            scratch.reserve(DERIVED_MAX_DRAFTS.saturating_sub(scratch.len()));
+        }
+    }
+
+    /// Price, decide and apply (a). Without a measured priced drafted width
+    /// (every width unpriced in this window's cost mode: an AR price alone
+    /// would leave the chooser nothing to compare) nothing is consulted, so
+    /// the window is not observed either; the incumbent runs and the trace
+    /// says why.
+    fn derived_consult(
+        &mut self,
+        state: &mut DerivedState,
+        plan: &mut WindowPlan,
+        caller_k: usize,
+        position: usize,
+    ) {
+        let WindowRoute::Native { depth } = plan.route else {
+            return;
+        };
+        let (source, incumbent) = if plan.ngram_hit {
+            (DerivedSource::Ngram, self.ngram_candidates.len())
+        } else {
+            (DerivedSource::Mtp, depth)
+        };
+        let legal = self.derived_legal_cap(source);
+        state.set_capacity(legal);
+        // Prefixes the window can run: the legal ceiling, the caller's
+        // remaining budget and, for a take, what the pool offered.
+        let mut cap = legal.min(caller_k);
+        if source == DerivedSource::Ngram {
+            cap = cap.min(self.ngram_proposal.len());
+        }
+        let mode = self.derived_cost_mode();
+        let bucket = ContextBucket::of(position);
+        let (card, tables) = (state.card, state.tables);
+        state.prices.clear();
+        let mut pooled = false;
+        let mut hi = 0u8;
+        for width in 1..=cap.min(DERIVED_MAX_DRAFTS) {
+            let k = width as u8;
+            if let Some((cost_us, pool)) =
+                (tables.window_price)(card, mode, source, bucket, k, plan.ngram_confirm)
+            {
+                state.prices.push(DerivedPrice { k, cost_us });
+                pooled |= pool;
+                hi = k;
+            }
+        }
+        if hi == 0 {
+            self.trace_derived_unsupported(
+                plan,
+                position,
+                source,
+                mode,
+                incumbent,
+                legal,
+                caller_k,
+                "no_measured_price",
+            );
+            return;
+        }
+        if let Some((cost_us, pool)) = (tables.ar_price)(card, mode, bucket) {
+            state.prices.insert(0, DerivedPrice { k: 0, cost_us });
+            pooled |= pool;
+        }
+        // The n-gram feature of every depth of this window: the pool's full
+        // offer (kept before the incumbent's take truncated it), the matched
+        // key's exact length and the last executed n-gram window's first token.
+        let ngram_feature = match source {
+            DerivedSource::Mtp => None,
+            DerivedSource::Ngram => {
+                let meta = if self.copy_lane {
+                    self.ngram_copy
+                        .as_ref()
+                        .and_then(MtpCopyContext::last_proposal)
+                } else {
+                    self.ngram.as_ref().and_then(MtpNgramContext::last_proposal)
+                };
+                Some((
+                    derived_offer_bin(Some(self.ngram_proposal.len())),
+                    meta.and_then(|meta| u32::try_from(meta.key_len).ok()),
+                    state.request.last_first(DerivedSource::Ngram),
+                ))
+            }
+        };
+        state.keys.clear();
+        state.depths.clear();
+        for depth in 1..=hi {
+            let feature = match ngram_feature {
+                None => DerivedFeature::Native,
+                Some((offered, key_len, last_first)) => DerivedFeature::Ngram {
+                    offered,
+                    key_len,
+                    last_first,
+                },
+            };
+            let key = ResidualKey {
+                source,
+                depth,
+                feature,
+            };
+            let Some(counts) = (tables.counts)(card, mode, source, depth, feature) else {
+                break;
+            };
+            state.keys.push(key);
+            state.depths.push(DerivedDepth { key, counts });
+        }
+        // A price alone cannot support an uncalibrated depth. In particular
+        // wide OnCopy never borrows the old population's unseen .8 prior.
+        state
+            .prices
+            .retain(|p| usize::from(p.k) <= state.depths.len());
+        hi = state.prices.iter().map(|p| p.k).max().unwrap_or(0);
+        if hi == 0 {
+            self.trace_derived_unsupported(
+                plan,
+                position,
+                source,
+                mode,
+                incumbent,
+                legal,
+                caller_k,
+                "no_measured_counts",
+            );
+            return;
+        }
+        state.depths.truncate(usize::from(hi));
+        state.keys.truncate(usize::from(hi));
+        let incumbent_u8 = u8::try_from(incumbent).unwrap_or(u8::MAX);
+        let decision = state
+            .request
+            .choose(&state.depths, &state.prices, incumbent_u8);
+        let chosen = decision.map(|decision| match decision.action {
+            DerivedAction::Ar => 0,
+            DerivedAction::Prefix(k) => k,
+        });
+        state.pending = Some(DerivedPending {
+            source,
+            mode,
+            position,
+            incumbent: incumbent_u8,
+            confirmation: plan.ngram_confirm,
+            chosen,
+            chosen_cost_us: decision.map_or(f64::NAN, |decision| decision.cost_us),
+            chosen_expected: decision.map_or(f64::NAN, |decision| decision.expected),
+            hi,
+            legal,
+            caller_k,
+            pooled,
+            ran_ngram: false,
+        });
+        #[cfg(test)]
+        {
+            state.consults += 1;
+        }
+        match chosen {
+            // AR is per window: the head-free AR token after the resource
+            // pass and head catch-up, with no hit and no sticky retirement.
+            Some(0) => {
+                plan.route = WindowRoute::ArRouted;
+                plan.ngram_hit = false;
+                plan.ngram_confirm = true;
+            }
+            // Native: the draft loop may run up to the widest measured legal
+            // prefix; the post-row re-solve ([`Self::derived_resolve`]) stops
+            // it at the objective's width. An n-gram take is exactly the
+            // chosen prefix of the pool's offer (the confirmation and the
+            // native fallback depth stay the incumbent's).
+            Some(width) => match source {
+                DerivedSource::Mtp => {
+                    plan.route = WindowRoute::Native {
+                        depth: usize::from(hi),
+                    };
+                    plan.k = plan.k.max(usize::from(hi));
+                }
+                DerivedSource::Ngram => {
+                    self.ngram_candidates.clear();
+                    self.ngram_candidates
+                        .extend_from_slice(&self.ngram_proposal[..usize::from(width)]);
+                }
+            },
+            None => {}
+        }
+    }
+
+    /// This window's draft loop is driven by the derived objective: a
+    /// consulted native-MTP window that chose a drafted width. The incumbent's
+    /// fixed-worth margin prune does not run there.
+    fn derived_loop_active(&self) -> bool {
+        matches!(
+            &self.derived,
+            Some(DerivedPhase::Bound(state))
+                if state.pending.is_some_and(|pending| {
+                    pending.source == DerivedSource::Mtp
+                        && pending.chosen.is_some_and(|k| k > 0)
+                })
+        )
+    }
+
+    /// Whether the drafter stores native draft margins this window: derived
+    /// is bound or the lab forced-cost window is armed. The off path (no
+    /// derived state, no forced measurement) stores nothing.
+    fn derived_margins_active(&self) -> bool {
+        if matches!(self.derived, Some(DerivedPhase::Bound(_))) {
+            return true;
+        }
+        #[cfg(feature = "reference-parity")]
+        if self.lab_forced_window.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Clear the capacity-sized margin scratch provisioned at admission/bind.
+    /// Inactive windows neither store margins nor free reusable storage.
+    fn derived_margins_reset(&mut self) {
+        if let Some(scratch) = self.derived_margins.as_mut() {
+            scratch.clear();
+        }
+    }
+
+    /// Append one actual head-step margin to the scratch, when armed (see
+    /// [`Self::derived_margins_reset`]). A non-finite or negative margin is
+    /// stored as `None`: it carries no evidence and the re-solve falls back
+    /// to the unconditional depth evidence.
+    fn derived_margins_push(&mut self, margin: f32) {
+        if !self.derived_margins_active() {
+            return;
+        }
+        let capacity = self.k_ceiling().min(self.draft_rows_cap());
+        let Some(scratch) = self.derived_margins.as_mut() else {
+            return;
+        };
+        if scratch.len() >= capacity {
+            return;
+        }
+        scratch.push(if margin.is_finite() && margin >= 0.0 {
+            Some(margin)
+        } else {
+            None
+        });
+    }
+
+    /// Bin of the margin observed at committed draft row `observed_depth`
+    /// (1-based), or `None` when the row produced no usable margin.
+    fn derived_margin_bin(&self, observed_depth: usize) -> Option<NativeMarginBin> {
+        let scratch = self.derived_margins.as_ref()?;
+        let margin = (*scratch.get(observed_depth.checked_sub(1)?)?)?;
+        native_margin_bin(margin)
+    }
+
+    /// Trace a dropped (non-finite or negative) head-step margin: explicit
+    /// diagnostic, no invented bin. Gated on `HIPFIRE_MTP_TRACE=1` and never
+    /// from a follower.
+    fn trace_derived_margin_dropped(&self, position: usize, observed_depth: usize) {
+        if self.follower {
+            return;
+        }
+        if !hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1") {
+            return;
+        }
+        eprintln!(
+            "QWEN4_MTP_TRACE {{\"event\":\"derived_k_margin_dropped\",\"version\":\"{FN_DERIVED_VERSION}\",\"position\":{position},\"observed_depth\":{observed_depth},\"reason\":\"nonfinite_or_negative\"}}"
+        );
+    }
+
+    /// Re-key `state.margined` in place to the margin observed at committed
+    /// row `observed_depth`: every measured legal depth `1..=hi` (the whole
+    /// re-solve domain, since acceptance of every depth is still unknown
+    /// after the current row) reads its margin-conditional counts, falling
+    /// back to the pre-decision unconditional depth where the margin is
+    /// unusable or the cell is unsupported. Only the legal `hi` governs:
+    /// the sparse price count is not the maximum K. Counts how many depths
+    /// carried a measured cell and records the evidence in
+    /// `last_margin`/`last_measured` for the truthful commit trace.
+    /// `observed = u8::MAX` is unrepresentable: depths are contiguous
+    /// `1..=hi` with `hi <= DERIVED_MAX_DRAFTS` (63).
+    fn derived_rekey_margined(
+        state: &mut DerivedState,
+        mode: DerivedCostMode,
+        observed_depth: usize,
+        bin: Option<NativeMarginBin>,
+    ) {
+        let Some(bin) = bin else {
+            state.margined.clear();
+            state.margined.extend_from_slice(&state.depths);
+            state.last_margin = None;
+            state.last_measured = 0;
+            return;
+        };
+        let observed = u8::try_from(observed_depth).unwrap_or(u8::MAX);
+        let card = state.card;
+        state.margined.clear();
+        state.last_measured = 0;
+        if observed == u8::MAX {
+            state.margined.extend_from_slice(&state.depths);
+            state.last_margin = None;
+            return;
+        }
+        state.last_margin = Some((observed_depth, bin));
+        let mut measured = 0usize;
+        state.margined.extend(state.depths.iter().map(|depth| {
+            let key = ResidualKey {
+                source: DerivedSource::Mtp,
+                depth: depth.key.depth,
+                feature: DerivedFeature::NativeMargin {
+                    observed_depth: observed,
+                    margin: bin,
+                },
+            };
+            match (state.tables.counts)(
+                card,
+                mode,
+                DerivedSource::Mtp,
+                depth.key.depth,
+                key.feature,
+            ) {
+                Some(counts) => {
+                    measured += 1;
+                    DerivedDepth { key, counts }
+                }
+                None => *depth,
+            }
+        }));
+        state.last_measured = measured;
+        if measured == 0 {
+            // Every cell fell back: the re-solve ran on the unconditional
+            // evidence, so no margin row is claimed as its evidence.
+            state.last_margin = None;
+        }
+    }
+
+    /// (b): the single global re-solve over the remaining measured legal
+    /// prefixes `k >= drafted`. Reads the most recently observed margin (the
+    /// caller passes the latest `drafted` row); `None` is the same
+    /// unconditional re-solve. The current margin informs ALL target depths
+    /// `1..=hi`, not only `k >= drafted`: the whole draft's acceptance is
+    /// still unknown evidence about the prefix. Non-derived production never
+    /// runs this. Returns whether to draft another row.
+    fn derived_resolve(&mut self, drafted: usize) -> bool {
+        let observed_depth = drafted;
+        let bin = self.derived_margin_bin(observed_depth);
+        let mode = self.derived_cost_mode();
+        // Disjoint borrows: the drafter's scratch bins the margin while the
+        // bound state re-solves in place — no allocation, no borrow conflict.
+        let Some(DerivedPhase::Bound(state)) = self.derived.as_mut() else {
+            return false;
+        };
+        let Some(pending) = state.pending else {
+            return false;
+        };
+        if pending.source != DerivedSource::Mtp {
+            return false;
+        }
+        Self::derived_rekey_margined(state, mode, observed_depth, bin);
+        state.resolve.clear();
+        state.resolve.extend(
+            state
+                .prices
+                .iter()
+                .copied()
+                .filter(|price| price.k >= 1 && usize::from(price.k) >= drafted),
+        );
+        #[cfg(test)]
+        {
+            state.resolves += 1;
+        }
+        let decision =
+            state
+                .request
+                .choose(&state.margined, &state.resolve, pending.chosen.unwrap_or(0));
+        if let (Some(decision), Some(pending)) = (decision, state.pending.as_mut()) {
+            pending.chosen = Some(match decision.action {
+                DerivedAction::Ar => 0,
+                DerivedAction::Prefix(k) => k,
+            });
+            pending.chosen_cost_us = decision.cost_us;
+            pending.chosen_expected = decision.expected;
+        }
+        decision.is_some_and(|decision| {
+            matches!(decision.action, DerivedAction::Prefix(k) if usize::from(k) > drafted)
+        })
+    }
+
+    /// The `derived_k_unsupported` trace line: a window the chooser could not
+    /// price in its cost mode, which therefore runs the incumbent.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_derived_unsupported(
+        &self,
+        plan: &WindowPlan,
+        position: usize,
+        source: DerivedSource,
+        mode: DerivedCostMode,
+        incumbent: usize,
+        legal: usize,
+        caller_k: usize,
+        reason: &str,
+    ) {
+        if !plan.trace || self.follower {
+            return;
+        }
+        eprintln!(
+            "QWEN4_MTP_TRACE {{\"event\":\"derived_k_unsupported\",\"version\":\"{FN_DERIVED_VERSION}\",\"source\":\"{}\",\"mode\":\"{}\",\"position\":{position},\"context\":\"{}\",\"reason\":\"{reason}\",\"incumbent_k\":{incumbent},\"legal_cap\":{legal},\"caller_k\":{caller_k},\"row_limit\":{},\"user_k\":{},\"confirmation\":{},\"offered\":{}}}",
+            derived_source_label(source),
+            derived_mode_label(mode),
+            derived_context_label(ContextBucket::of(position)),
+            self.verify_row_limit,
+            self.explicit_mtp_k.map_or_else(|| "null".to_owned(), |k| k.to_string()),
+            plan.ngram_confirm,
+            self.ngram_proposal.len()
+        );
+    }
+
+    /// Observe a consulted window exactly once at its verified-window
+    /// boundary (where the `window` trace receipt is written, before the
+    /// emitter's final publish): a successful window updates the residuals,
+    /// a failed one only drops the pending.
+    ///
+    /// Only the queried source's own execution is credited: an AR window, or
+    /// an n-gram hit whose confirmation missed and fell back to the native
+    /// window, ages the residuals with `executed == 0` and donates nothing.
+    /// `accepted` is clamped to what the window actually committed and to the
+    /// caller's window cap `caller_k + 1`. A window is terminal when it
+    /// committed the end-of-turn token or hit that cap. The caller bounds
+    /// every window by `k = min(capacity, remaining - 1)` (there is no
+    /// separate max-output setting here), so a window that commits
+    /// `caller_k + 1` tokens accepted every executed draft: marking it
+    /// terminal censors no rejection and changes no counted outcome. Stop
+    /// strings and cancellation clip tokens only after the window is emitted
+    /// and end the request, so no later decision exists to bias; they are
+    /// not terminal here.
+    fn derived_observe(&mut self, plan: &WindowPlan, eos: u32, result: &Result<MtpWindow, String>) {
+        if !matches!(self.derived, Some(DerivedPhase::Bound(_))) {
+            return;
+        }
+        let Some(DerivedPhase::Bound(mut state)) = self.derived.take() else {
+            return;
+        };
+        if let (Some(pending), Ok(window)) = (state.pending.take(), result) {
+            let ran = match (plan.route, pending.source) {
+                (WindowRoute::Native { .. }, DerivedSource::Mtp) => !plan.ngram_hit,
+                (WindowRoute::Native { .. }, DerivedSource::Ngram) => {
+                    plan.ngram_hit && pending.ran_ngram
+                }
+                _ => false,
+            };
+            let committed = window.committed.len();
+            let cap = pending.caller_k.saturating_add(1);
+            let drafted = if ran {
+                window.drafts_generated.min(state.keys.len())
+            } else {
+                0
+            };
+            let accepted = if ran {
+                window.accepted.min(committed).min(cap)
+            } else {
+                0
+            };
+            let terminal = window.committed.contains(&eos) || committed == cap;
+            let observed = u8::try_from(drafted).unwrap_or(u8::MAX);
+            // Commit-only evidence, exactly once at this boundary: single
+            // aging, base update verbatim, then per-row margin bumps on
+            // reached depths with identical censoring. Bins fill the reused
+            // `margin_bins` scratch in place (no per-window allocation);
+            // disjoint borrows keep `self.derived` out of the fill.
+            let (evidenced, commit_measured) =
+                if ran && pending.source == DerivedSource::Mtp && drafted > 0 {
+                    let margins = self.derived_margins.as_ref();
+                    state.margin_bins.clear();
+                    state.margin_bins.extend((0..drafted).map(|row| {
+                        margins
+                            .and_then(|scratch| scratch.get(row))
+                            .copied()
+                            .flatten()
+                            .and_then(native_margin_bin)
+                    }));
+                    let evidenced = state.margin_bins.iter().any(|bin| bin.is_some());
+                    if evidenced {
+                        state.request.observe_with_margins(
+                            &state.keys,
+                            &state.margin_bins,
+                            observed,
+                            accepted,
+                            terminal,
+                        );
+                    } else {
+                        state
+                            .request
+                            .observe(&state.keys, observed, accepted, terminal);
+                    }
+                    (evidenced, true)
+                } else {
+                    state
+                        .request
+                        .observe(&state.keys, observed, accepted, terminal);
+                    (false, false)
+                };
+            #[cfg(test)]
+            {
+                state.observes += 1;
+            }
+            {
+                let margin_evidence = if evidenced { "measured" } else { "unmeasured" };
+                let margin_rows = state.last_measured;
+                let margin_bin = state
+                    .last_margin
+                    .map(|(_, bin)| bin.index().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let margin_depth = state
+                    .last_margin
+                    .map(|(depth, _)| depth.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                if plan.trace && !self.follower {
+                    let priced = state
+                        .prices
+                        .iter()
+                        .map(|price| price.k.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let chosen = pending
+                        .chosen
+                        .map_or_else(|| "null".to_string(), |k| k.to_string());
+                    let changed = pending.chosen.is_some_and(|k| k != pending.incumbent);
+                    eprintln!(
+                        "QWEN4_MTP_TRACE {{\"event\":\"derived_k\",\"version\":\"{FN_DERIVED_VERSION}\",\"source\":\"{}\",\"mode\":\"{}\",\"verify_route\":\"batched\",\"position\":{},\"context\":\"{}\",\"incumbent_k\":{},\"chosen_k\":{chosen},\"changed\":{changed},\"priced_k\":[{priced}],\"context_pooled\":{},\"legal_cap\":{},\"caller_k\":{},\"widest_priced_k\":{},\"row_limit\":{},\"user_k\":{},\"chosen_cost_us\":{},\"chosen_expected\":{},\"drafted_k\":{drafted},\"accepted\":{accepted},\"confirmation\":{},\"offered\":{},\"price_boundary\":\"total_window\",\"margin_evidence\":\"{margin_evidence}\",\"margin_observed_depth\":{margin_depth},\"margin_bin\":{margin_bin},\"margin_measured_depths\":{margin_rows},\"commit_margins\":{commit_measured}}}",
+                        derived_source_label(pending.source),
+                        derived_mode_label(pending.mode),
+                        pending.position,
+                        derived_context_label(ContextBucket::of(pending.position)),
+                        pending.incumbent,
+                        pending.pooled,
+                        pending.legal,
+                        pending.caller_k,
+                        pending.hi,
+                        self.verify_row_limit,
+                        self.explicit_mtp_k.map_or_else(|| "null".to_owned(), |k| k.to_string()),
+                        JsonF64(pending.chosen_cost_us),
+                        JsonF64(pending.chosen_expected),
+                        pending.confirmation,
+                        self.ngram_proposal.len()
+                    );
+                }
+            }
+        }
+        self.derived = Some(DerivedPhase::Bound(state));
+    }
+}
+
 impl Qwen4MtpDrafter {
     pub fn new(max_k: usize, ctx_capacity: usize, end_of_turn: Option<u32>) -> Self {
+        let max_k = max_k.clamp(1, DERIVED_MAX_DRAFTS);
+        let capacity =
+            max_k.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS.saturating_sub(1));
+        let mut floor = floor_with_call_log(Qwen4Floor::new(MTP_WINDOW_COST), "drafter_new", true);
+        floor.set_capacity(capacity);
         Self {
-            max_k: max_k.clamp(1, 10),
+            max_k,
+            explicit_mtp_k: None,
             ctx_capacity,
             request: SpecRequestConfig::default(),
             scratch: None,
             pending_hidden: None,
             row_hidden: None,
             prefill_rows: 0,
-            agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
+            agreement: vec![AGREEMENT_PRIOR; capacity],
             sampled_enabled: hipfire_config::mtp_sampled_enabled(),
             sampled_mode: SampledMode::from_env(),
             sampled: None,
@@ -4661,6 +5144,7 @@ impl Qwen4MtpDrafter {
             emitted_seen: None,
             ngram_config: None,
             row_exact_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+            verify_row_limit: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
             spec_rows_cap: usize::MAX,
             copy_lane: false,
             ngram: None,
@@ -4668,16 +5152,16 @@ impl Qwen4MtpDrafter {
             ngram_active: false,
             ngram_candidates: Vec::new(),
             ngram_yield: (0.0, 0.0),
-            ngram_agreement: [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS],
+            ngram_agreement: Vec::new(),
             ngram_proposal: Vec::new(),
             ngram_proposed_at: None,
             ngram_last_first_accepted: false,
             ngram_decision: None,
             ngram_warm_depths: 0,
             ngram_row_cost: None,
-            agreement_decay: MTP_AGREEMENT_DECAY,
+            agreement_decay: DEFAULT_DECAY,
             takeover_block: Vec::new(),
-            floor: MtpFloor::new(),
+            floor,
             floor_enabled: true,
             head_lag: HeadLag::default(),
             stats: MtpRequestStats::default(),
@@ -4689,6 +5173,22 @@ impl Qwen4MtpDrafter {
             warm_depths: 0,
             warm_ar: false,
             floor_pending: None,
+            derived: None,
+            derived_position: None,
+            measured_load_identity: None,
+            derived_margins: None,
+            #[cfg(feature = "reference-parity")]
+            lab_force_drafts: None,
+            #[cfg(feature = "reference-parity")]
+            lab_copy_enabled: None,
+            #[cfg(feature = "reference-parity")]
+            lab_forced_window: None,
+            #[cfg(feature = "reference-parity")]
+            lab_confirmation: None,
+            #[cfg(feature = "reference-parity")]
+            lab_requested_confirmation: false,
+            #[cfg(feature = "reference-parity")]
+            lab_actual_route: None,
             #[cfg(feature = "lab")]
             lab_arm: crate::lab_window::LabWindowArm::default(),
             #[cfg(feature = "lab")]
@@ -4698,10 +5198,31 @@ impl Qwen4MtpDrafter {
         }
     }
 
+    /// Supply this load's immutable measured-load descriptor: the
+    /// `Qwen4MeasuredLoadIdentity` cached canonical JSON (`canonical_json`)
+    /// from the loader's carriers factory. Stored once as the shared `Arc`,
+    /// borrowed by reference at request bind; `None` keeps the real incumbent.
+    /// No per-window hashing or serialization, no second cache.
+    pub fn with_measured_load_identity(
+        mut self,
+        identity: Option<std::sync::Arc<crate::measured_identity::Qwen4MeasuredLoadIdentity>>,
+    ) -> Self {
+        self.measured_load_identity = identity;
+        self
+    }
+
+    /// Preserve the distinction between a load default and a user's cap.
+    pub fn with_explicit_mtp_k_override(mut self, value: Option<usize>) -> Self {
+        self.explicit_mtp_k = value.map(|k| k.min(DERIVED_MAX_DRAFTS));
+        self
+    }
+
     /// Enable n-gram takeover windows with `config` for requests that arm
     /// `allow_ngram_modifier`; `None` keeps every window native.
     pub fn with_ngram(mut self, config: Option<NgramModConfig>) -> Self {
         self.ngram_config = config;
+        let capacity = config.map_or(0, |config| config.n_max.min(NGRAM_DEPTHS));
+        self.ngram_agreement.resize(capacity, AGREEMENT_PRIOR);
         self
     }
 
@@ -4747,6 +5268,7 @@ impl Qwen4MtpDrafter {
     /// drafter).
     fn bind_spec_rows(&mut self, target: &mut dyn SpecTarget) -> Result<(), String> {
         self.spec_rows_cap = Self::bundle(target)?.spec_verify_rows_cap();
+        self.refresh_chooser_capacity();
         Ok(())
     }
 
@@ -4776,6 +5298,7 @@ impl Qwen4MtpDrafter {
         target: &mut dyn SpecTarget,
     ) -> Result<(), String> {
         self.bind_arch(ops.gpu()?);
+        self.bind_spec_rows(target)?;
         // The copy lane's take cap reads the single card's row-exact rows; a
         // mesh never arms n-gram (refused before any state changes), so only
         // an armed pool under a mesh reaches the refusal.
@@ -4783,7 +5306,12 @@ impl Qwen4MtpDrafter {
             let rows = Self::bundle(target)?.row_exact_verify_rows(ops.single("n-gram takeover")?);
             self.row_exact_rows = rows;
         }
-        self.bind_spec_rows(target)?;
+        // Every native chooser follows the admitted executor, not a profile's
+        // historical last measured depth. Mesh paths remain conservative.
+        if !ops.is_mesh() {
+            let rows = Self::bundle(target)?.row_exact_verify_rows(ops.single("derived K")?);
+            self.derived_refresh_rows(rows);
+        }
         let width = {
             let bundle = Self::bundle(target)?;
             bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -4808,7 +5336,7 @@ impl Qwen4MtpDrafter {
                 let window_rows = if copy_lane {
                     capacity + 1
                 } else {
-                    self.max_k + 1
+                    self.k_ceiling() + 1
                 };
                 let capture_rows = native_mtp_capture_rows(ops.gpu()?, window_rows);
                 bundle.ops_ensure_row_capture(ops, capture_rows)?;
@@ -4837,7 +5365,7 @@ impl Qwen4MtpDrafter {
             }
         } else if self.scratch.is_none() {
             let scratch = Self::bundle(target)?
-                .ops_new_spec_scratch(ops, (self.max_k + 1).max(prefill_rows))?;
+                .ops_new_spec_scratch(ops, (self.k_ceiling() + 1).max(prefill_rows))?;
             self.scratch = Some(scratch);
         }
         self.prefill_rows = prefill_rows;
@@ -5115,8 +5643,9 @@ impl Qwen4MtpDrafter {
                 .collect::<Vec<_>>()
                 .join(",");
             let gdn_resets = gdn_residual_trace_field(&Self::bundle(target)?.state);
+            let row_limit = Self::bundle(target)?.row_exact_verify_rows(ops.gpu()?);
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}{gdn_resets}}}",
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"verify_rows\":1,\"row_limit\":{row_limit},\"rows\":[{rows}],\"committed\":{committed:?}{gdn_resets}}}",
                 accept_route_label(sampled.as_deref())
             );
         }
@@ -5146,27 +5675,26 @@ impl Qwen4MtpDrafter {
     /// With no agreement evidence, start at K=3 (or the smaller budget);
     /// evidence may still grow the chooser to the unchanged configured cap.
     fn batched_depth(&self, k: usize) -> usize {
-        if self.agreement == [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH] {
+        if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
             k.min(3)
         } else {
-            batched_depth(&self.agreement, k)
+            self.floor.provisional_depth(&self.agreement, k)
         }
     }
 
     /// Price both sources on the same clock; unsupported arches retain the
     /// original chooser. Depth drafts require depth + 1 verify rows.
     fn ngram_window_cost(&self, depth: usize) -> f32 {
-        let legacy_depth = depth.min(MTP_WINDOW_COST.len() - 1);
         let Some((single, extra)) = self.ngram_row_cost else {
-            return MTP_WINDOW_COST[legacy_depth];
+            return MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY);
         };
         if self.floor_enabled {
             if let Some(cost) = self.floor.batched_cost(depth) {
                 return cost;
             }
         }
-        let ar_ms = if self.floor_enabled && valid_us(self.floor.ar_us) {
-            self.floor.ar_us / 1000.0
+        let ar_ms = if self.floor_enabled && valid_us(self.floor.ar_us()) {
+            self.floor.ar_us() / 1000.0
         } else {
             single
         };
@@ -5185,10 +5713,10 @@ impl Qwen4MtpDrafter {
     /// offers at the current agreement (the interleaved route is 1.0): on a
     /// priced arch with a measured floor, the floor's cheapest candidate
     /// within `k` (the depth the chooser would run,
-    /// [`MtpFloor::candidate_rate`]); before that, `batched_depth`'s
+    /// [`Qwen4Floor::candidate_rate`]); before that, `batched_depth`'s
     /// objective over [`Self::ngram_window_cost`].
     fn native_rate(&self, k: usize) -> f32 {
-        let depths = k.min(MTP_WINDOW_COST.len() - 1);
+        let depths = k.min(self.agreement.len());
         if self.floor_enabled && self.ngram_row_cost.is_some() {
             if let Some(rate) = self.floor.candidate_rate(&self.agreement, depths) {
                 return rate;
@@ -5219,7 +5747,7 @@ impl Qwen4MtpDrafter {
         let (emitted, windows) = self.ngram_yield;
         let expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
         let cost = self.ngram_window_cost(n);
-        expected / cost >= self.native_rate(k.min(self.max_k))
+        expected / cost >= self.native_rate(k.min(self.incumbent_max_k()))
     }
 
     /// Extend only a well-established copy source, never a fresh or uncertain
@@ -5245,7 +5773,7 @@ impl Qwen4MtpDrafter {
             prefix *= acceptance;
             expected += prefix;
             let rate = expected / self.ngram_window_cost(depth);
-            if rate > best.1 && rate >= self.native_rate(current.min(self.max_k)) {
+            if rate > best.1 && rate >= self.native_rate(current.min(self.incumbent_max_k())) {
                 best = (depth, rate);
             }
         }
@@ -5263,7 +5791,7 @@ impl Qwen4MtpDrafter {
 
     /// Window cost of a takeover of `d` candidates in AR-step units: the
     /// request's measured takeover costs on a priced arch with the floor on
-    /// ([`MtpFloor::takeover_cost`]); before that, and on unpriced arches,
+    /// ([`Qwen4Floor::takeover_cost`]); before that, and on unpriced arches,
     /// the static price [`Self::ngram_window_cost`].
     fn takeover_cost(&self, d: usize) -> f32 {
         if self.floor_enabled && self.ngram_row_cost.is_some() {
@@ -5419,11 +5947,15 @@ impl Qwen4MtpDrafter {
             self.floor_observe_ar(us);
             self.stats.mtp_windows += 1;
             self.stats.floor_ar_windows += 1;
-            self.stats.mtp_retired = self.floor.retired;
+            self.stats.mtp_retired = self.floor.retired();
         } else {
             self.owe_head_row(ops, target, position, seed)?;
             if floor_trace_enabled() {
-                eprintln!("{}", self.floor.trace_line(&self.agreement, "ar", us, 1, 0));
+                eprintln!(
+                    "{}",
+                    self.floor
+                        .trace_line(FLOOR_TRACE_PREFIX, &self.agreement, "ar", us, 1, 0)
+                );
             }
             self.stats.ar_windows += 1;
         }
@@ -5742,7 +6274,7 @@ impl Qwen4MtpDrafter {
     /// ags run whose depth collapsed, and 9.35 s once), and as the AR price
     /// it would let every losing request keep drafting (nothing measured
     /// costs as much per token) and price each extra draft at several real
-    /// rows ([`MTP_ROW_COST_PRIOR`] AR steps).  The floor still needs the
+    /// rows (the floor's row-cost prior, 0.27 AR steps).  The floor still needs the
     /// sample, so the next window is a calibration token again: one extra AR
     /// token per drafter, the same rule as its first window at each depth
     /// ([`Self::finish_floor_window`]).
@@ -5753,7 +6285,7 @@ impl Qwen4MtpDrafter {
         }
         let event = if first_use {
             "calibration_first_use"
-        } else if self.floor.calibrated {
+        } else if self.floor.calibrated() {
             "ar_probe"
         } else {
             "calibration"
@@ -5764,7 +6296,8 @@ impl Qwen4MtpDrafter {
         if floor_trace_enabled() {
             eprintln!(
                 "{}",
-                self.floor.trace_line(&self.agreement, event, us, 1, 0)
+                self.floor
+                    .trace_line(FLOOR_TRACE_PREFIX, &self.agreement, event, us, 1, 0)
             );
         }
     }
@@ -5793,7 +6326,7 @@ impl Qwen4MtpDrafter {
     ) {
         self.stats.mtp_windows += 1;
         let first_use = route == NativeWindow::Batched && {
-            let bit = 1u16 << window.drafts.min(MTP_MAX_DEPTH);
+            let bit = 1u64 << window.drafts.min(DERIVED_MAX_DRAFTS);
             let first = self.warm_depths & bit == 0;
             self.warm_depths |= bit;
             first
@@ -5842,6 +6375,7 @@ impl Qwen4MtpDrafter {
             eprintln!(
                 "{}",
                 self.floor.trace_line(
+                    FLOOR_TRACE_PREFIX,
                     &self.agreement,
                     event,
                     us,
@@ -5850,7 +6384,7 @@ impl Qwen4MtpDrafter {
                 )
             );
         }
-        self.stats.mtp_retired = self.floor.retired;
+        self.stats.mtp_retired = self.floor.retired();
     }
 
     /// [`Self::finish_floor_window`] priced at `us` at once, a batched
@@ -5875,13 +6409,13 @@ impl Qwen4MtpDrafter {
     /// extended.
     #[allow(dead_code)]
     pub(crate) fn floor_retired(&self) -> bool {
-        self.floor.retired
+        self.floor.retired()
     }
 
     /// Whether the next window must be a timed AR token: the request's first
     /// (the calibration token; the first two on a drafter's first request,
     /// [`Self::floor_observe_ar`]), or one of the AR probes a would-be
-    /// retirement takes ([`MtpFloor::with_retire_evidence`]).  False for a
+    /// retirement takes ([`Qwen4Floor::with_retire_evidence`]).  False for a
     /// developer-forced route (`HIPFIRE_MTP_INCREMENTAL` `0|1`) and with the
     /// floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`), which bypass the floor.  A
     /// caller that composes an external drafter must not take over while this
@@ -5894,7 +6428,7 @@ impl Qwen4MtpDrafter {
     /// `floor_retired() || floor_needs_calibration()`: the exact guard an
     /// external takeover must pass before it runs.
     pub(crate) fn floor_takeover_blocked(&self) -> bool {
-        self.floor.retired || self.floor_needs_calibration()
+        self.floor.retired() || self.floor_needs_calibration()
     }
 
     /// What a promoted singleton hands its lane: the next window's row-0
@@ -5914,8 +6448,8 @@ impl Qwen4MtpDrafter {
         })?;
         Ok(Qwen4PromotionParts {
             pending_hidden,
-            agreement: self.agreement,
-            retired: self.floor_enabled && self.floor.retired,
+            agreement: &self.agreement,
+            retired: self.floor_enabled && self.floor.retired(),
         })
     }
 
@@ -5971,11 +6505,17 @@ impl Qwen4MtpDrafter {
         if floor_trace_enabled() {
             eprintln!(
                 "{}",
-                self.floor
-                    .trace_line(&self.agreement, "external", wall_us, emitted, drafts)
+                self.floor.trace_line(
+                    FLOOR_TRACE_PREFIX,
+                    &self.agreement,
+                    "external",
+                    wall_us,
+                    emitted,
+                    drafts
+                )
             );
         }
-        self.stats.mtp_retired = self.floor.retired;
+        self.stats.mtp_retired = self.floor.retired();
         stop
     }
 
@@ -6084,6 +6624,16 @@ impl Qwen4MtpDrafter {
             hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
         let interleaved = hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL")
             .is_ok_and(|value| value == "1");
+        #[cfg(feature = "reference-parity")]
+        let interleaved = interleaved && self.lab_forced_window.is_none();
+        #[cfg(feature = "reference-parity")]
+        {
+            self.lab_actual_route = Some(if interleaved {
+                crate::wide_verify_oracle::DevWindowRoute::Interleaved
+            } else {
+                crate::wide_verify_oracle::DevWindowRoute::Batched
+            });
+        }
         let mut sampled = self.sampled.take();
         let window = if interleaved {
             let tickets = self.open_one_row_tickets(
@@ -6137,12 +6687,19 @@ impl Qwen4MtpDrafter {
     /// equals `ngram_candidates[0]`. With the copy lane the decision is
     /// [`Self::copy_hit`]'s.
     fn ngram_hit(&mut self, emitted: &[u32], k: usize) -> bool {
+        #[cfg(feature = "reference-parity")]
+        if self.lab_copy_enabled == Some(false) {
+            return false;
+        }
         if self.copy_lane {
             self.copy_hit(emitted, k)
         } else {
             // The floor's calibration token must be the request's first window,
             // and a retired request's head lags the target: no takeover then.
-            if !self.ngram_active || self.floor_takeover_blocked() {
+            let blocked = self.floor_takeover_blocked();
+            #[cfg(feature = "reference-parity")]
+            let blocked = blocked && !self.lab_policy_forced();
+            if !self.ngram_active || blocked {
                 return false;
             }
             // `k` already includes the remaining emit budget: n-gram extension may
@@ -6157,7 +6714,26 @@ impl Qwen4MtpDrafter {
             };
             self.ngram_candidates.clear();
             self.ngram_candidates.extend_from_slice(candidates);
-            let native_depth = k.min(self.max_k);
+            // The pool's full offer, kept before the incumbent's take
+            // truncates it: the derived chooser prices (and may widen to)
+            // prefixes of it, and bins the offer, not the take.
+            if matches!(self.derived, Some(DerivedPhase::Bound(_))) {
+                self.ngram_proposal.clear();
+                self.ngram_proposal
+                    .extend_from_slice(&self.ngram_candidates);
+            }
+            #[cfg(feature = "reference-parity")]
+            if self.lab_policy_forced() {
+                self.ngram_proposal.clone_from(&self.ngram_candidates);
+                if let Some(d) = self.lab_ngram_width() {
+                    if d > self.ngram_candidates.len() || d > k {
+                        return false;
+                    }
+                    self.ngram_candidates.truncate(d);
+                    return d > 0;
+                }
+            }
+            let native_depth = k.min(self.incumbent_max_k());
             let depth = self.ngram_takeover_depth(self.ngram_candidates.len(), native_depth);
             if self.ngram_config.is_some_and(|config| depth < config.n_min) {
                 return false;
@@ -6192,7 +6768,10 @@ impl Qwen4MtpDrafter {
     fn copy_hit(&mut self, emitted: &[u32], k: usize) -> bool {
         self.ngram_decision = None;
         // The floor's calibration token must be the request's first window.
-        if !self.ngram_active || self.floor_needs_calibration() {
+        let blocked = self.floor_needs_calibration();
+        #[cfg(feature = "reference-parity")]
+        let blocked = blocked && !self.lab_policy_forced();
+        if !self.ngram_active || blocked {
             return false;
         }
         let Some(config) = self.ngram_config else {
@@ -6211,7 +6790,7 @@ impl Qwen4MtpDrafter {
         let available = self.ngram_proposal.len();
         // `k` already includes the remaining emit budget: a takeover commits
         // seed + candidates to both device owners before the host sees them.
-        let cap = self.ngram_take_cap().min(k).min(NGRAM_DEPTHS);
+        let cap = self.ngram_take_cap().min(k).min(self.ngram_agreement.len());
         let (a1_sum, a1_weight) = self.ngram_agreement[0];
         let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
         let mut decision = NgramDecision {
@@ -6222,13 +6801,32 @@ impl Qwen4MtpDrafter {
             native_rate: 0.0,
             a1,
         };
+        #[cfg(feature = "reference-parity")]
+        if let Some(d) = self.lab_ngram_width() {
+            // Bypass the take-length chooser only. These are the exact
+            // source's real tokens, never fabricated longer offers.
+            if d > available || d > k {
+                self.ngram_decision = Some(decision);
+                return false;
+            }
+            decision.take = d;
+            decision.confirm = !(d >= NGRAM_UNCONFIRMED_MIN_TAKE
+                && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
+                && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
+                && self.ngram_last_first_accepted);
+            self.ngram_candidates.clear();
+            self.ngram_candidates
+                .extend_from_slice(&self.ngram_proposal[..d]);
+            self.ngram_decision = Some(decision);
+            return d > 0;
+        }
         let hi = available.min(cap);
         let lo = config.n_min.max(1);
         if hi >= lo {
-            let native_rate = if self.floor.retired {
+            let native_rate = if self.floor.retired() {
                 1.0
             } else {
-                self.native_rate(k.min(self.max_k))
+                self.native_rate(k.min(self.incumbent_max_k()))
             };
             let (mut prefix, mut expected) = (1.0f32, 1.0f32);
             let mut best = (0usize, 0.0f32);
@@ -6252,7 +6850,7 @@ impl Qwen4MtpDrafter {
             // have failed with it): once retired, take only while the last
             // shadow observation accepted its first candidate. A copy span
             // that resumes re-arms after one AR token.
-            let retired_cold = self.floor.retired && !self.ngram_last_first_accepted;
+            let retired_cold = self.floor.retired() && !self.ngram_last_first_accepted;
             if best.1 >= native_rate && !retired_cold {
                 decision.take = best.0;
                 decision.confirm = !(best.0 >= NGRAM_UNCONFIRMED_MIN_TAKE
@@ -6322,6 +6920,7 @@ impl Qwen4MtpDrafter {
         eos: u32,
         probe: Option<TakeoverProbe>,
     ) -> Result<MtpWindow, String> {
+        self.derived_note_takeover();
         // The floor prices the takeover over its whole window: from the
         // native window whose row-0 step confirmed it, to the drained head
         // fill after commit.
@@ -6535,8 +7134,10 @@ impl Qwen4MtpDrafter {
                 .map_err(|error| error.to_string())?;
             if trace && !self.follower {
                 let gdn_resets = gdn_residual_trace_field(&bundle.state);
+                let verify_rows = n + 1;
+                let row_limit = bundle.row_exact_verify_rows(gpu);
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{},\"rows\":[{}],\"committed\":{:?},\"baseline\":true{gdn_resets}}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{},\"verify_rows\":{verify_rows},\"row_limit\":{row_limit},\"rows\":[{}],\"committed\":{:?},\"baseline\":true{gdn_resets}}}",
                     accept_route_label(sampled.as_deref()),
                     acceptance.accepted,
                     trace_rows(candidates, &target_picks),
@@ -6810,8 +7411,9 @@ impl Qwen4MtpDrafter {
         }
         if trace && !self.follower {
             let gdn_resets = gdn_residual_trace_field(&bundle.state);
+            let row_limit = bundle.row_exact_verify_rows(gpu);
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"rows\":[{}],\"committed\":{committed:?}{gdn_resets}}}",
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"verify_rows\":1,\"row_limit\":{row_limit},\"rows\":[{}],\"committed\":{committed:?}{gdn_resets}}}",
                 accept_route_label(sampled.as_deref()),
                 trace_rows(candidates, &picks)
             );
@@ -7361,7 +7963,7 @@ impl Qwen4MtpDrafter {
     fn bind_arch(&mut self, gpu: &Gpu) {
         self.ngram_row_cost = Self::ngram_row_cost_for(gpu);
         self.agreement_decay = singleton_agreement_decay(&gpu.arch);
-        self.floor.decay = self.agreement_decay;
+        self.floor.set_decay(self.agreement_decay);
     }
 
     /// Every timing- or host-state-dependent decision of the next window,
@@ -7395,7 +7997,7 @@ impl Qwen4MtpDrafter {
                 .is_some_and(|close| emitted[start..].contains(&close))
         {
             self.floor.rearm();
-            self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+            self.agreement.fill(AGREEMENT_PRIOR);
             self.stats.mtp_retired = false;
         }
     }
@@ -7408,6 +8010,8 @@ impl Qwen4MtpDrafter {
         incremental: Option<&str>,
         trace: bool,
     ) -> Result<WindowPlan, String> {
+        // A plan that never ran leaves no consulted window behind.
+        self.derived_drop_pending();
         // The previous native window ends here (its price includes its GPU
         // tail); this plan reads its cost.
         let plan_start = Instant::now();
@@ -7430,8 +8034,13 @@ impl Qwen4MtpDrafter {
         let forced = matches!(incremental, Some("0" | "1"));
         let floor_active = self.floor_enabled && !forced;
         self.observe_think_close(emitted, floor_active);
+        #[cfg(feature = "reference-parity")]
+        if self.lab_policy_forced() {
+            return self.lab_plan_window(emitted, k, trace, plan_start);
+        }
         // Otherwise the window drafts natively, within the head's own K.
-        let native_k = k.min(self.max_k);
+        let native_k = k.min(self.incumbent_max_k());
+        let caller_k = k;
         let ar = |route| WindowPlan {
             route,
             k: native_k,
@@ -7441,7 +8050,7 @@ impl Qwen4MtpDrafter {
             ngram_confirm: true,
             ngram_candidates: Vec::new(),
         };
-        if floor_active && self.floor.retired {
+        if floor_active && self.floor.retired() {
             if !self.copy_lane {
                 return Ok(ar(WindowRoute::ArRetired));
             }
@@ -7487,16 +8096,16 @@ impl Qwen4MtpDrafter {
             _ => match {
                 let provisional = self.batched_depth(k);
                 let route = self.floor.route(&self.agreement, k, provisional);
-                self.stats.mtp_retired = self.floor.retired;
+                self.stats.mtp_retired = self.floor.retired();
                 route
             } {
-                FloorRoute::Ar => return Ok(ar(WindowRoute::ArRouted)),
-                FloorRoute::ArSample => return Ok(ar(WindowRoute::ArCalibrate)),
-                FloorRoute::Interleaved => 0,
-                FloorRoute::Batched(depth) => depth,
+                Action::ArHeadFree => return Ok(ar(WindowRoute::ArRouted)),
+                Action::ArSynced => return Ok(ar(WindowRoute::ArCalibrate)),
+                Action::Interleaved => 0,
+                Action::Native(depth) => depth,
             },
         };
-        Ok(WindowPlan {
+        let mut plan = WindowPlan {
             route: WindowRoute::Native { depth },
             k,
             trace,
@@ -7504,7 +8113,45 @@ impl Qwen4MtpDrafter {
             ngram_hit,
             ngram_confirm: !ngram_hit || self.ngram_decision.is_none_or(|d| d.confirm),
             ngram_candidates: Vec::new(),
-        })
+        };
+        // A native incumbent's depth is not an economic ceiling, including
+        // an unforced interleaved incumbent. Explicit/floor AR routes above
+        // remain authoritative.
+        if floor_active {
+            self.derived_plan(&mut plan, caller_k);
+        }
+        Ok(plan)
+    }
+
+    /// The `request` trace event (`HIPFIRE_MTP_TRACE=1`, rank 0): what the
+    /// request configured, the context its `window` events are read in.
+    /// Non-finite floats print as `null`.
+    fn trace_request(&self, cfg: &SpecRequestConfig) {
+        let enabled =
+            hipfire_config::developer_var("HIPFIRE_MTP_TRACE").is_ok_and(|value| value == "1");
+        if !enabled || self.follower {
+            return;
+        }
+        let ngram = match (self.ngram_active, self.ngram_config) {
+            (true, Some(config)) => format!(
+                ",\"n_match\":{},\"n_min\":{},\"n_max\":{}",
+                config.n_match, config.n_min, config.n_max
+            ),
+            _ => String::new(),
+        };
+        eprintln!(
+            "QWEN4_MTP_TRACE {{\"event\":\"request\",\"k\":{},\"copy_lane\":{},\"floor\":{},\"temp\":{},\"repeat_penalty\":{},\"repeat_window\":{},\"presence_penalty\":{},\"frequency_penalty\":{},\"ngram\":{}{ngram},\"sampled\":{}}}",
+            self.max_k,
+            self.copy_lane,
+            self.floor_enabled,
+            JsonF32(cfg.temp),
+            JsonF32(cfg.repeat_penalty),
+            cfg.repeat_window,
+            JsonF32(cfg.presence_penalty),
+            JsonF32(cfg.frequency_penalty),
+            self.ngram_active,
+            self.sampled.is_some()
+        );
     }
 
     /// The `ngram_plan` trace line (`HIPFIRE_MTP_TRACE=1`, rank 0) of the
@@ -7514,8 +8161,21 @@ impl Qwen4MtpDrafter {
             return;
         }
         if let Some(decision) = self.ngram_decision {
+            let meta = if self.copy_lane {
+                self.ngram_copy
+                    .as_ref()
+                    .and_then(MtpCopyContext::last_proposal)
+            } else {
+                self.ngram.as_ref().and_then(MtpNgramContext::last_proposal)
+            };
+            let source = meta.map_or_else(String::new, |meta| {
+                let source_pos = meta
+                    .source_pos
+                    .map_or_else(String::new, |pos| format!(",\"source_pos\":{pos}"));
+                format!(",\"key_len\":{}{source_pos}", meta.key_len)
+            });
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"ngram_plan\",\"emitted\":{},\"available\":{},\"take\":{},\"confirm\":{},\"rate\":{:.3},\"native_rate\":{:.3},\"a1\":{:.3},\"plan_us\":{:.3},\"retired\":{retired}}}",
+                "QWEN4_MTP_TRACE {{\"event\":\"ngram_plan\",\"emitted\":{},\"available\":{},\"take\":{},\"confirm\":{},\"rate\":{:.3},\"native_rate\":{:.3},\"a1\":{:.3},\"plan_us\":{:.3},\"retired\":{retired}{source}}}",
                 emitted.len(),
                 decision.available,
                 decision.take,
@@ -7677,7 +8337,54 @@ impl Qwen4MtpDrafter {
     ) -> Result<MtpWindow, String> {
         #[cfg(feature = "lab")]
         let observed = self.lab_window_begin(target, position, seed, plan);
+        let prior_ngram = self.stats.ngram_mod_windows;
         let result = self.run_window_ops_body(ops, target, position, seed, emitted, eos, plan);
+        if plan.trace && !self.follower {
+            if let Ok(window) = &result {
+                let ngram = self.stats.ngram_mod_windows > prior_ngram;
+                if ngram || matches!(plan.route, WindowRoute::Native { .. }) {
+                    let source = if ngram { "ngram" } else { "mtp" };
+                    let mut interleaved = if ngram {
+                        hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref()
+                            == Ok("1")
+                    } else {
+                        matches!(plan.route, WindowRoute::Native { depth: 0 })
+                    };
+                    #[cfg(feature = "reference-parity")]
+                    if ngram && self.lab_forced_window.is_some() {
+                        interleaved = false;
+                    }
+                    let verified_rows = if interleaved {
+                        1
+                    } else {
+                        window.drafts_generated + 1
+                    };
+                    if let Ok(bundle) = Self::bundle(target) {
+                        let keep = bundle.state.position.saturating_sub(position);
+                        let repair_route = if interleaved || keep >= verified_rows {
+                            "none"
+                        } else if self
+                            .retained
+                            .is_some_and(|r| bundle.ops_ring_eligible(r.target, verified_rows))
+                        {
+                            "native_capture"
+                        } else {
+                            "replay"
+                        };
+                        eprintln!(
+                            "QWEN4_MTP_TRACE {{\"event\":\"window_commit\",\"source\":\"{source}\",\"position\":{position},\"verified_rows\":{verified_rows},\"keep\":{keep},\"repair_route\":\"{repair_route}\",\"retired\":{}}}",
+                            self.floor.retired()
+                        );
+                    }
+                }
+            }
+        }
+        // Derived K: the verified-window boundary, where the `window` trace
+        // receipt is written; failed windows are dropped without an update.
+        if self.derived_pending_open() {
+            let eos = self.end_of_turn.unwrap_or(eos);
+            self.derived_observe(plan, eos, &result);
+        }
         #[cfg(feature = "lab")]
         if observed {
             self.lab_window_end(target, &result);
@@ -7718,6 +8425,11 @@ impl Qwen4MtpDrafter {
         self.release_retained(target);
         if plan.route == WindowRoute::ArRetired {
             if !hit {
+                #[cfg(feature = "reference-parity")]
+                {
+                    self.lab_actual_route =
+                        Some(crate::wide_verify_oracle::DevWindowRoute::TargetOnly);
+                }
                 return self.mtp_ar_step(ops, target, position, seed, false);
             }
             // The n-gram takeover is a one-card route: refused under a mesh
@@ -7731,6 +8443,10 @@ impl Qwen4MtpDrafter {
             if plan.ngram_confirm {
                 let matched =
                     self.probe_first_draft(ops.single("n-gram takeover")?, target, position, seed)?;
+                #[cfg(feature = "reference-parity")]
+                {
+                    self.lab_confirmation = Some(matched);
+                }
                 if trace && self.copy_lane && !self.follower {
                     eprintln!(
                         "QWEN4_MTP_TRACE {{\"event\":\"ngram_confirm\",\"position\":{position},\"match\":{matched}}}"
@@ -7757,6 +8473,10 @@ impl Qwen4MtpDrafter {
         // them up before calibration or any draft overwrites spec hidden;
         // pending stays the head's predecessor hidden until catch-up uses it.
         self.catch_up_head(ops, target)?;
+        #[cfg(feature = "reference-parity")]
+        if !matches!(plan.route, WindowRoute::Native { .. }) {
+            self.lab_actual_route = Some(crate::wide_verify_oracle::DevWindowRoute::TargetOnly);
+        }
         let depth = match plan.route {
             WindowRoute::Native { depth } => depth,
             WindowRoute::ArCalibrate => return self.mtp_ar_step(ops, target, position, seed, true),
@@ -7778,10 +8498,19 @@ impl Qwen4MtpDrafter {
             );
         }
         if depth == 0 {
+            #[cfg(feature = "reference-parity")]
+            {
+                self.lab_actual_route =
+                    Some(crate::wide_verify_oracle::DevWindowRoute::Interleaved);
+            }
             let window_start = Instant::now();
             if hit {
                 let matched =
                     self.probe_first_draft(ops.single("n-gram takeover")?, target, position, seed)?;
+                #[cfg(feature = "reference-parity")]
+                {
+                    self.lab_confirmation = Some(matched);
+                }
                 if trace && self.copy_lane && !self.follower {
                     eprintln!(
                         "QWEN4_MTP_TRACE {{\"event\":\"ngram_confirm\",\"position\":{position},\"match\":{matched}}}"
@@ -7826,6 +8555,8 @@ impl Qwen4MtpDrafter {
             );
             return Ok(window);
         }
+        // The interleaved route issues no head draft steps of its own (the
+        // head reads the target's rows teacher-forced): no margin exists.
         // History picks the route and the most drafts; the drafts' own
         // margins stop early.
         let k_max = depth;
@@ -7879,7 +8610,9 @@ impl Qwen4MtpDrafter {
         let mut emitted_len = 0usize;
         let mut sampled = self.sampled.take();
         let result = (|| -> Result<NativeOutcome, String> {
-            timers.mark(ops.gpu()?, "draft");
+            if self.derived_margins_active() {
+                self.derived_margins_reset();
+            }
             let mut drafts = Vec::with_capacity(k_max);
             let mut margins: Vec<f32> = Vec::with_capacity(k_max);
             let mut input = seed;
@@ -7891,6 +8624,11 @@ impl Qwen4MtpDrafter {
             // Probability the whole draft prefix is accepted, from each
             // draft's exact logit margin over its runner-up.
             let mut prefix = 1.0f32;
+            // The derived objective drives this window's depth: its re-solve
+            // after each row replaces the incumbent's fixed-worth margin prune.
+            let derived_loop = self.derived_loop_active();
+            #[cfg(feature = "reference-parity")]
+            let derived_loop = derived_loop || self.lab_policy_forced();
             // Every proposal starts with a fresh QSA selection; only later
             // draft rows within this window reuse it.
             for index in 0..k_max {
@@ -7911,6 +8649,10 @@ impl Qwen4MtpDrafter {
                 // window is abandoned here; the target was never touched.
                 if index == 0 && hit {
                     let matched = self.ngram_candidates.first() == Some(&argmax);
+                    #[cfg(feature = "reference-parity")]
+                    {
+                        self.lab_confirmation = Some(matched);
+                    }
                     if trace && self.copy_lane && !self.follower {
                         eprintln!(
                             "QWEN4_MTP_TRACE {{\"event\":\"ngram_confirm\",\"position\":{position},\"match\":{matched}}}"
@@ -7928,17 +8670,28 @@ impl Qwen4MtpDrafter {
                 prefix *= draft_accept_estimate(margin);
                 // A verify row pays only while its whole prefix is likely
                 // accepted; the first draft always rides.
-                if index > 0 && prefix < MTP_ROW_WORTH {
+                if !derived_loop && index > 0 && prefix < MTP_ROW_WORTH {
                     break;
                 }
                 margins.push(margin);
                 drafts.push(input);
+                let drafted = drafts.len();
+                // The actual head-step margin is causal evidence the moment it
+                // is read: store it before any prune or re-solve, so the lab
+                // receipt and the post-row re-solve share one capture.
+                self.derived_margins_push(margin);
+                if !margin.is_finite() || margin < 0.0 {
+                    self.trace_derived_margin_dropped(position, drafted);
+                }
                 // Only a kept draft enters the penalty history: a pruned
                 // proposal broke out above.
                 if let Some(s) = sampled.as_mut() {
                     s.history.push_draft(input);
                 }
-                if prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH {
+                if !derived_loop && prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH {
+                    break;
+                }
+                if self.derived_loop_active() && !self.derived_resolve(drafted) {
                     break;
                 }
                 if index + 1 < k_max {
@@ -7950,6 +8703,10 @@ impl Qwen4MtpDrafter {
             let mut block = Vec::with_capacity(k + 1);
             block.push(seed);
             block.extend_from_slice(&drafts);
+            #[cfg(feature = "reference-parity")]
+            {
+                self.lab_actual_route = Some(crate::wide_verify_oracle::DevWindowRoute::Batched);
+            }
             timers.mark(ops.gpu()?, "verify");
             let skip_picks = sampled
                 .as_ref()
@@ -8010,8 +8767,10 @@ impl Qwen4MtpDrafter {
                     .collect::<Vec<_>>()
                     .join(",");
                 let gdn_resets = gdn_residual_trace_field(&picks.state);
+                let verify_rows = k + 1;
+                let row_limit = picks.row_exact_verify_rows(ops.gpu()?);
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true{gdn_resets}}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"verify_rows\":{verify_rows},\"row_limit\":{row_limit},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true{gdn_resets}}}",
                     accept_route_label(sampled.as_ref()),
                     acceptance.committed
                 );
@@ -8113,7 +8872,13 @@ impl Qwen4MtpDrafter {
         };
         if let Ok(window) = &result {
             self.observe_agreement(window);
-            let stats = WindowStats::of(window, k_max);
+            // A derived window was routed at the width it drafted.
+            let cap = if self.derived_loop_active() {
+                window.drafts_generated
+            } else {
+                k_max
+            };
+            let stats = WindowStats::of(window, cap);
             self.finish_floor_window(!floor_active, NativeWindow::Batched, stats, k, window_start);
         }
         if timers.enabled() {
@@ -8171,6 +8936,11 @@ impl Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // Bind the derived-K identity once per request, before any device
+        // work (the request's first prefill; a realigning re-prefill keeps it).
+        if matches!(self.derived, Some(DerivedPhase::Unbound)) {
+            self.derived_bind_target(ops, target);
+        }
         if ops.is_mesh() {
             self.refuse_unsupported_under_pp()?;
             if cache_hit || start_pos != 0 {
@@ -8181,7 +8951,7 @@ impl Qwen4MtpDrafter {
                 );
             }
         }
-        self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+        self.agreement.fill(AGREEMENT_PRIOR);
         // The request's n-gram history starts from the full canonical prompt
         // (cache hit or miss), once per request: a realignment re-prefill
         // keeps the history it already holds.
@@ -8198,6 +8968,7 @@ impl Qwen4MtpDrafter {
         // row is owed afterwards (the prefill overwrites spec hidden).
         let reused = if cache_hit { start_pos } else { 0 };
         self.head_lag.clear();
+        self.derived_drop_pending();
         self.release_retained(target);
         if ops.is_mesh() {
             // Cold only (checked above): every band and the head reset, no
@@ -8516,6 +9287,7 @@ impl Qwen4MtpDrafter {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
+        self.derived_drop_pending();
         let Some(window) = self.retained.take() else {
             return Ok(false);
         };
@@ -8973,11 +9745,62 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // The floor's n-gram pricing and decay read the arch before the
         // window's resource pass sets them again (to the same values).
         self.bind_arch(gpu);
-        if self.copy_lane {
-            self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
-        }
         self.bind_spec_rows(target)?;
-        let mut plan = self.plan_window(emitted, k)?;
+        let rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
+        if self.copy_lane {
+            self.row_exact_rows = rows;
+        }
+        self.derived_refresh_rows(rows);
+        #[cfg(feature = "reference-parity")]
+        if self.lab_policy_forced() {
+            if ep {
+                return Err("forced windows require singleton execution".into());
+            }
+            let bundle = Self::bundle(target)?;
+            let caps = crate::wide_verify_oracle::dev_verify_caps(bundle, gpu);
+            let cpu = bundle.has_cpu_deferred_experts() || bundle.cpu_storage_capacity_rows() > 0;
+            let qualified = if cpu {
+                let lab_armed =
+                    rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&gpu.arch)
+                        && !gpu.replay.is_recording()
+                        && !gpu.graphs.capture_mode;
+                bundle.cpu_qualified_verify_rows(gpu, lab_armed)
+            } else {
+                caps.row_exact_verify_rows
+            };
+            let timing_only = self.lab_forced_window.is_some_and(|r| r.timing_only);
+            let limit = if timing_only && !cpu {
+                caps.spec_verify_rows_cap
+            } else {
+                caps.spec_verify_rows_cap.min(qualified)
+            };
+            let d = self
+                .lab_forced_window
+                .map(|r| r.drafts)
+                .or(self.lab_force_drafts)
+                .unwrap_or(0)
+                .min(k);
+            check_spec_verify_rows(limit, d + 1, "forced Qwen4 window")?;
+        }
+        // The absolute position is the derived-K context bucket's input; only
+        // this singleton route carries it (EP and PP never consult).
+        if !ep && self.derived.is_some() {
+            self.derived_position = Some(position);
+            let reference = Self::bundle(target)?.ar_verify_reference(gpu);
+            if let Some(DerivedPhase::Bound(state)) = self.derived.as_mut() {
+                if let Some(reference) = reference {
+                    state.reference = Some(matches!(
+                        reference,
+                        rdna_compute::prefill_invariant::Qwen4VerifyReference::Recorded
+                    ));
+                } else {
+                    self.derived = Some(DerivedPhase::Ineligible);
+                }
+            }
+        }
+        let plan = self.plan_window(emitted, k);
+        self.derived_position = None;
+        let mut plan = plan?;
         if !ep {
             return self.run_window(gpu, target, position, seed, emitted, eos, &plan);
         }
@@ -9069,6 +9892,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.push_replay(ReplayOp::Reset);
         self.head_lag.clear();
+        self.derived_drop_pending();
         self.retained = None;
         // A reset's work is not the last window's: leave it unpriced.
         self.floor_pending = None;
@@ -9142,26 +9966,33 @@ impl MtpDrafter for Qwen4MtpDrafter {
     }
 
     fn k(&self) -> usize {
-        self.max_k.min(self.draft_rows_cap())
+        self.k_ceiling().min(self.draft_rows_cap())
     }
 
     /// An armed n-gram pool may offer up to its `n_max` candidates (with the
     /// copy lane: take up to [`qwen4_ngram_take_cap`] candidates, never the
     /// longer proposal it observes); native windows still draft at most K.
-    /// On a CPU splice load no window verifies more than
-    /// [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] rows, so the capacity
-    /// (and with it every caller's draft budget) is at most one fewer.
+    /// Every caller stays inside actual reserved verify storage. CPU-owned
+    /// product qualification remains narrow; only the explicitly armed lab
+    /// path may use a separately admitted and prewarmed wider window.
     fn proposal_capacity(&self) -> usize {
+        if matches!(
+            self.derived,
+            Some(DerivedPhase::Unbound | DerivedPhase::Bound(_))
+        ) {
+            return self.derived_legal_cap(DerivedSource::Mtp);
+        }
+        let ceiling = self.k_ceiling();
         let capacity = if self.copy_lane {
             if self.ngram_active {
-                self.max_k.max(self.ngram_take_cap())
+                ceiling.max(self.ngram_take_cap())
             } else {
-                self.max_k
+                ceiling
             }
         } else {
             match (self.ngram_active, self.ngram_config) {
-                (true, Some(config)) => self.max_k.max(config.n_max),
-                _ => self.max_k,
+                (true, Some(config)) => ceiling.max(config.n_max),
+                _ => ceiling,
             }
         };
         capacity.min(self.draft_rows_cap())
@@ -9184,11 +10015,18 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.head_lag.clear();
         self.retained = None;
         self.floor_pending = None;
-        self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows())
-            .with_decay(self.agreement_decay)
-            .with_retire_evidence(singleton_floor_ar_probe_tokens());
         self.floor_enabled =
             hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
+        self.floor.clear_call_log();
+        self.floor.reset_request(
+            singleton_floor_min_windows(),
+            self.agreement_decay,
+            singleton_floor_ar_probe_tokens(),
+        );
+        if floor_call_trace_enabled() {
+            self.floor
+                .set_call_log_enabled(FLOOR_CALL_PREFIX, "drafter", self.floor_enabled);
+        }
         if let Some(device) = self.sampled.as_mut().and_then(|state| state.device.take()) {
             self.device_spare.push(device);
         }
@@ -9202,7 +10040,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.stats = MtpRequestStats::default();
         self.ngram_active = false;
         self.ngram_yield = (0.0, 0.0);
-        self.ngram_agreement = [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS];
+        self.ngram_agreement.fill(AGREEMENT_PRIOR);
         self.ngram_proposal.clear();
         self.ngram_proposed_at = None;
         self.ngram_last_first_accepted = false;
@@ -9235,6 +10073,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
         }
         self.stats.mtp_ngram = self.ngram_active;
+        self.trace_request(&cfg);
+        let derived =
+            hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_DERIVED_K").as_deref() == Ok("1");
+        if let Some(scratch) = self.derived_margins.as_mut() {
+            scratch.clear();
+        }
+        self.derived_configure(&cfg, derived);
+        self.refresh_chooser_capacity();
         self.push_replay(ReplayOp::Configure(cfg));
     }
 
@@ -9264,17 +10110,23 @@ impl MtpDrafter for Qwen4MtpDrafter {
 /// ([`qwen4_mtp_sampled_allowed`]).
 pub fn build_qwen4_mtp_speculator(
     max_k: usize,
+    explicit_mtp_k: Option<usize>,
     ctx_capacity: usize,
     end_of_turn: Option<u32>,
     think_close: Option<u32>,
     ngram: Option<NgramModConfig>,
     copy_lane: bool,
     gdn: crate::GdnStateFormat,
+    measured_load_identity: Option<
+        std::sync::Arc<crate::measured_identity::Qwen4MeasuredLoadIdentity>,
+    >,
 ) -> Box<dyn Speculator> {
     let mut drafter = Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn)
+        .with_explicit_mtp_k_override(explicit_mtp_k)
         .with_ngram(ngram)
         .with_copy_lane(copy_lane)
-        .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn));
+        .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn))
+        .with_measured_load_identity(measured_load_identity);
     drafter.think_close = think_close;
     Box::new(MtpSpeculator::new(drafter))
 }
@@ -9323,13 +10175,10 @@ pub fn qwen4_ngram_take_cap(config: &NgramModConfig, row_exact_rows: usize) -> u
     config.n_max.min(row_exact_rows.saturating_sub(1))
 }
 
-/// Most rows (the seed included) one speculative verify or replay forward of
-/// a load may take. An armed CPU splice (`Qwen4Bundle::has_cpu_deferred_experts`)
-/// runs host-placed experts on the CPU only for a decode row or a verify of at
-/// most [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] rows; a wider block would
-/// run the GPU grouped expert read, not the arithmetic of the AR decode it must
-/// match. So an armed load verifies at most that many rows (K <= 3, an n-gram
-/// take <= 3); an unarmed load has no such bound.
+/// Default speculative verify rows before any wider CPU-owned storage was
+/// admitted and prewarmed. The bundle's physical cap additionally reads that
+/// actual reservation; this default never claims wider qualification.
+/// An unarmed GPU load has no CPU storage restriction.
 pub(crate) const fn spec_verify_rows_cap(cpu_splice: bool) -> usize {
     if cpu_splice {
         crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -9369,20 +10218,27 @@ fn window_verify_rows(route: WindowRoute, ngram_hit: bool, candidates: usize) ->
 }
 
 /// The most drafts any window of a native MTP request on `gpu_arch` verifies
-/// (the seed row excluded): the head's `max_k` (at most [`MTP_MAX_DEPTH`]),
-/// or, with the n-gram copy lane on
+/// (the seed row excluded): the head's `max_k` (at most [`DERIVED_MAX_DRAFTS`],
+/// the physical executor width), or, with the n-gram copy lane on
 /// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`) where the n-gram
 /// source arms (`hipfire_config::mtp_ngram_enabled_for_arch`), the copy
 /// lane's take cap ([`qwen4_ngram_take_cap`] at the arch's row-exact verify
 /// rows). Admission sizes the verify rows and the GDN row capture by it: on
 /// gfx1201 (K=3) with the copy lane on, an armed takeover verifies 8 rows
 /// where native windows verify 4; without it admission sizes the native
-/// windows alone.
+/// windows alone. Sizing only: this never widens the incumbent chooser's
+/// execution depths or prunes.
 pub fn native_mtp_proposal_drafts(max_k: usize, gpu_arch: &str) -> usize {
+    if hipfire_config::developer_var("HIPFIRE_QWEN4_MTP_DERIVED_K").as_deref() == Ok("1") {
+        return DERIVED_MAX_DRAFTS;
+    }
     if !(hipfire_config::mtp_ngram_enabled_for_arch(crate::ARCH_ID, gpu_arch)
         && hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch))
     {
-        return max_k.min(MTP_MAX_DEPTH);
+        // Admission reserves the requested executor extent before the load.
+        // Runtime agreement and cost evidence follow its admitted capacity;
+        // the finite historical profile does not impose a tuning ceiling.
+        return max_k.min(DERIVED_MAX_DRAFTS);
     }
     qwen4_ngram_mod_config(hipfire_config::ngram_mod_triple_for_arch(
         crate::ARCH_ID,
@@ -9504,6 +10360,25 @@ pub fn native_mtp_capture(
             native_mtp_capture_rows(gpu, native_mtp_window_rows(max_k)),
         )
     })
+}
+/// Public byte bridge for the loader's resource snapshot: the device bytes of
+/// the ACTUAL capture ring this config/GDN owns at `rows` rows over
+/// `owned_gdn_layers` GDN layers, via the one
+/// [`crate::state::Qwen4State::row_capture_bytes_scoped`] formula (never a
+/// parallel memory planner). Full single-device layer count, as the settled
+/// state uses; PP/EP bands stay absent upstream. `None` on arithmetic
+/// overflow or an unsupported layer predicate.
+pub fn qwen4_capture_bytes(
+    config: &crate::Qwen4Config,
+    gdn: crate::GdnStateFormat,
+    rows: usize,
+    owned_gdn_layers: usize,
+) -> Option<u64> {
+    if owned_gdn_layers == 0 || owned_gdn_layers != config.n_linear_layers() {
+        return None;
+    }
+    crate::state::Qwen4State::row_capture_bytes_scoped(config, gdn, rows, owned_gdn_layers)
+        .and_then(|bytes| u64::try_from(bytes).ok())
 }
 
 /// Whether a native MTP request on this GPU allocates the prompt-fill Append
@@ -9646,8 +10521,13 @@ pub fn mtp_error(error: MtpError) -> String {
 }
 
 #[cfg(test)]
+mod adapter_recovery_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_runtime::spec_economics::{
+        batched_depth, replay_call_log, CapStats, ReplayReport, FLOOR_PROBE_WINDOWS,
+    };
 
     fn mtp_contexts() -> Vec<crate::Qwen4ContextCommit> {
         use crate::kv_backend::Qwen4KvBackend;
@@ -9679,7 +10559,7 @@ mod tests {
                     None,
                     Some((G::Q8, 2)),
                     Some((G::Q8Ef, 8)),
-                    Some((G::F32, 65)),
+                    Some((G::F32, hipfire_config::QWEN4_VERIFY_MAX_ROWS)),
                 ] {
                     for fill in [false, true] {
                         let sizes = native_mtp_request_allocation_sizes(
@@ -10310,7 +11190,7 @@ mod tests {
         assert!(drafter.ngram_wins(3, 3), "a fresh request tries the pool");
         // A pool emitting 2 tokens per 3-candidate window (the Halo smoke's
         // code_edit_rewrite_copy pattern) loses to native MTP agreeing at 0.95.
-        drafter.agreement = [(0.95, 1.0); MTP_MAX_DEPTH];
+        drafter.agreement.fill((0.95, 1.0));
         drafter.ngram_yield = (16.0, 8.0);
         assert!(!drafter.ngram_wins(3, 3));
         // A verbatim copy (4 tokens per window) beats it.
@@ -10321,7 +11201,7 @@ mod tests {
     #[test]
     fn ngram_arch_pricing_refuses_r9700_copy_but_keeps_halo_winner() {
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
-        drafter.agreement = [(0.95, 1.0); MTP_MAX_DEPTH];
+        drafter.agreement.fill((0.95, 1.0));
         drafter.agreement[1] = (0.86 / 0.95, 1.0);
         // Five takeovers averaging 2.4 emitted tokens; preserve the prior.
         drafter.ngram_yield = (12.0, 5.0);
@@ -10338,14 +11218,14 @@ mod tests {
     fn ngram_pricing_uses_request_measurements_after_probing() {
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
         drafter.ngram_row_cost = Some((30.3, 14.8));
-        drafter.floor.ar_us = 30_000.0;
-        drafter.floor.batched[3] = (240_000.0, 2.0);
+        drafter.floor.seed_ar_us(30_000.0);
+        drafter.floor.seed_batched(3, (240_000.0, 2.0));
         assert!(drafter.floor.batched_cost(3).is_none());
-        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
+        drafter.floor.seed_probes_done();
         assert_eq!(drafter.floor.batched_cost(3), Some(4.0));
         assert_eq!(drafter.ngram_window_cost(3), 4.0);
         assert!(!drafter.ngram_wins(3, 2));
-        drafter.floor.batched[3] = (30_000.0, 2.0);
+        drafter.floor.seed_batched(3, (30_000.0, 2.0));
         assert!(drafter.ngram_wins(3, 2));
         drafter.ngram_row_cost = None;
         assert_eq!(drafter.ngram_window_cost(3), MTP_WINDOW_COST[3]);
@@ -10500,7 +11380,7 @@ mod tests {
             };
             drafter.configure_request(cfg);
             drafter.floor_enabled = true;
-            drafter.floor = MtpFloor::with_retire_after(5)
+            drafter.floor = Qwen4Floor::with_retire_after(MTP_WINDOW_COST, 5)
                 .with_decay(0.97)
                 .with_retire_evidence(2);
             assert_eq!(
@@ -10510,7 +11390,7 @@ mod tests {
                     .route,
                 WindowRoute::ArCalibrate
             );
-            drafter.agreement = agreement(0.0, 2.0);
+            drafter.agreement.fill((0.0, 2.0));
             drafter.floor.observe_calibration(30.0, &drafter.agreement);
             for _ in 0..5 {
                 drafter.floor.observe_native(
@@ -10547,16 +11427,17 @@ mod tests {
                 WindowRoute::ArCalibrate
             );
             assert!(!drafter.floor.retired() && !drafter.stats.mtp_retired);
-            assert!(!drafter.floor.calibrated);
-            assert_eq!((drafter.floor.observed, drafter.floor.probes), (0, 0));
-            assert_eq!(drafter.floor.retire_after, 5);
-            assert_eq!(drafter.floor.probe_tokens, 2);
-            assert_eq!(drafter.floor.decay, 0.97);
-            assert_eq!(drafter.floor.combined, (0.0, 0.0));
-            assert_eq!(drafter.floor.slow, (0.0, 0.0));
+            assert!(!drafter.floor.calibrated());
+            let floor_state = drafter.floor.diagnostics();
+            assert_eq!((floor_state.observed, floor_state.probes), (0, 0));
+            assert_eq!(drafter.floor.diagnostics().retire_after, 5);
+            assert_eq!(drafter.floor.diagnostics().probe_tokens, 2);
+            assert_eq!(drafter.floor.diagnostics().decay, 0.97);
+            assert_eq!(drafter.floor.diagnostics().combined, (0.0, 0.0));
+            assert_eq!(drafter.floor.diagnostics().slow, (0.0, 0.0));
             assert_eq!(
-                drafter.floor.caps,
-                [CapStats::default(); MTP_WINDOW_COST.len()]
+                drafter.floor.diagnostics().caps,
+                [CapStats::<{ MTP_WINDOW_COST.len() }>::default(); MTP_WINDOW_COST.len()]
             );
             assert_eq!(drafter.request, cfg);
             assert_eq!(
@@ -10582,10 +11463,10 @@ mod tests {
     fn rearm_each_think_close_is_consumed_once_even_after_another_retirement() {
         let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
         drafter.think_close = Some(99);
-        drafter.floor.retired = true;
+        drafter.floor.seed_retired(true);
         drafter.observe_think_close(&[10, 99], true);
         assert!(!drafter.floor.retired());
-        drafter.floor.retired = true;
+        drafter.floor.seed_retired(true);
         drafter.observe_think_close(&[10, 99], true);
         drafter.observe_think_close(&[10, 99, 12], true);
         assert!(
@@ -10607,15 +11488,15 @@ mod tests {
         ] {
             let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
             drafter.think_close = close;
-            drafter.floor.retired = retired;
-            drafter.floor.observed = 42;
+            drafter.floor.seed_retired(retired);
+            drafter.floor.seed_observed(42);
             drafter.observe_think_close(&[99], active);
             assert_eq!(drafter.floor.retired(), retired);
-            assert_eq!(drafter.floor.observed, 42);
+            assert_eq!(drafter.floor.diagnostics().observed, 42);
         }
         let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
         drafter.think_close = Some(99);
-        drafter.floor.retired = true;
+        drafter.floor.seed_retired(true);
         // A first plan may carry a prompt prefix in a direct caller's history:
         // only its pending seed is newly generated, not that older close.
         drafter.observe_think_close(&[99, 10], true);
@@ -10684,7 +11565,7 @@ mod tests {
         // takeover yield history is untouched.
         let mut drafter = armed_ngram_drafter(1, 8);
         drafter.floor_enabled = true;
-        drafter.floor.retired = true;
+        drafter.floor.seed_retired(true);
         drafter.ngram_yield = (20.0, 5.0);
         let plan = plan_of(&mut drafter, 3, None);
         assert_eq!(plan.route, WindowRoute::ArRetired);
@@ -10712,32 +11593,32 @@ mod tests {
         let plan = plan_of(&mut drafter, 2, Some("0"));
         assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
         assert_eq!(plan.k, 2);
-        assert!(!drafter.floor.calibrated && !drafter.floor.retired);
+        assert!(!drafter.floor.calibrated() && !drafter.floor.retired());
     }
 
     #[test]
     fn plan_window_routes_through_the_floor_and_retires_in_the_plan() {
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
         assert!(plan_window_budget_error(&mut drafter, 4).contains("proposal capacity"));
-        drafter.floor.calibrated = true;
-        drafter.floor.ar_us = 30_000.0;
+        drafter.floor.seed_calibrated(30_000.0);
         // Probing: the Halo-table depth of the agreement prior, clamped to K.
         let plan = plan_of(&mut drafter, 3, None);
         assert_eq!(
             plan.route,
             WindowRoute::Native {
-                depth: batched_depth(&drafter.agreement, 3)
+                depth: batched_depth(&drafter.agreement, 3, &MTP_WINDOW_COST)
             }
         );
         assert_eq!(plan.k, 3);
-        assert!(!drafter.floor.retired && !drafter.stats.mtp_retired);
+        assert!(!drafter.floor.retired() && !drafter.stats.mtp_retired);
         // Past the probe budget and the grace with no measured winner, the
         // routing itself retires the request (rank 0's state) and says AR.
-        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
-        drafter.floor.observed = drafter.floor.retire_after;
+        drafter.floor.seed_probes_done();
+        let retire_after = drafter.floor.diagnostics().retire_after;
+        drafter.floor.seed_observed(retire_after);
         let plan = plan_of(&mut drafter, 3, None);
         assert_eq!(plan.route, WindowRoute::ArRouted);
-        assert!(drafter.floor.retired && drafter.stats.mtp_retired);
+        assert!(drafter.floor.retired() && drafter.stats.mtp_retired);
         // Retirement is sticky: the next window skips the resource pass.
         assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
     }
@@ -10757,7 +11638,7 @@ mod tests {
         assert_eq!(
             plan.route,
             WindowRoute::Native {
-                depth: batched_depth(&drafter.agreement, 3)
+                depth: batched_depth(&drafter.agreement, 3, &MTP_WINDOW_COST)
             }
         );
         // Single card allocates nothing for the plan; EP attaches the copy.
@@ -10842,8 +11723,17 @@ mod tests {
         assert!(!qwen4_mtp_sampled_allowed(GdnStateFormat::Q8Ef));
         assert!(qwen4_mtp_sampled_allowed(GdnStateFormat::Q8));
         assert!(qwen4_mtp_sampled_allowed(GdnStateFormat::F32));
-        let speculator =
-            build_qwen4_mtp_speculator(3, 4096, None, None, None, false, GdnStateFormat::Q8Ef);
+        let speculator = build_qwen4_mtp_speculator(
+            3,
+            None,
+            4096,
+            None,
+            None,
+            None,
+            false,
+            GdnStateFormat::Q8Ef,
+            None,
+        );
         assert!(speculator.requires_greedy());
         assert!(!speculator.supports_temp_verify());
 
@@ -10864,7 +11754,8 @@ mod tests {
         let plain = Qwen4MtpDrafter::new(3, 4096, None);
         assert_eq!(plain.sampled_enabled, sampled);
         for gdn in [GdnStateFormat::Q8, GdnStateFormat::F32] {
-            let speculator = build_qwen4_mtp_speculator(3, 4096, None, None, None, false, gdn);
+            let speculator =
+                build_qwen4_mtp_speculator(3, None, 4096, None, None, None, false, gdn, None);
             assert_eq!(speculator.supports_temp_verify(), sampled, "{gdn:?}");
             assert_eq!(speculator.requires_greedy(), !sampled, "{gdn:?}");
             let gated = Qwen4MtpDrafter::new(3, 4096, None)
@@ -10883,14 +11774,13 @@ mod tests {
             drafts_generated: 1,
         };
         for drafter in [&mut leader, &mut replica] {
-            drafter.floor.calibrated = true;
-            drafter.floor.ar_us = 1_000_000.0;
+            drafter.floor.seed_calibrated(1_000_000.0);
             drafter.floor_observe_native(false, NativeWindow::Interleaved, &window, 10.0, 1);
             assert!(!drafter.floor_observe_external_window(2, 10.0, 1));
         }
-        assert_eq!(leader.floor.observed, 2);
-        assert_eq!(replica.floor.observed, 0);
-        assert!(!replica.floor.retired);
+        assert_eq!(leader.floor.diagnostics().observed, 2);
+        assert_eq!(replica.floor.diagnostics().observed, 0);
+        assert!(!replica.floor.retired());
         // Both count the window (stats are rank-local bookkeeping).
         assert_eq!(leader.stats.mtp_windows, replica.stats.mtp_windows);
         assert_eq!(window_key(Ok(window.clone())), Ok((vec![1, 2], 1, 1)));
@@ -10927,7 +11817,7 @@ mod tests {
 
     #[test]
     fn singleton_decay_is_long_on_gfx1151_only_and_reaches_the_request_floor() {
-        assert_eq!(MTP_AGREEMENT_DECAY, 0.875);
+        assert_eq!(DEFAULT_DECAY, 0.875);
         assert_eq!(MTP_AGREEMENT_DECAY_GFX1151, 0.97);
         assert_eq!(singleton_agreement_decay("gfx1151"), 0.97);
         for arch in [
@@ -10943,7 +11833,7 @@ mod tests {
         ] {
             assert_eq!(singleton_agreement_decay(arch), 0.875, "{arch}");
         }
-        assert_eq!(MtpFloor::new().decay, 0.875);
+        assert_eq!(Qwen4Floor::new(MTP_WINDOW_COST).diagnostics().decay, 0.875);
         // Binding an arch selects one decay for agreement and every floor
         // cost pair; configuring another request must preserve that choice.
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
@@ -10951,11 +11841,11 @@ mod tests {
         for arch in ["gfx1151", "gfx1201", "gfx1151", "gfx942"] {
             let decay = singleton_agreement_decay(arch);
             drafter.agreement_decay = decay;
-            drafter.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+            drafter.agreement.fill(AGREEMENT_PRIOR);
             MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
-            assert_eq!(drafter.floor.decay, decay, "{arch}");
+            assert_eq!(drafter.floor.diagnostics().decay, decay, "{arch}");
             drafter.observe_agreement(&window(0, 1));
-            let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
+            let (prior_accepted, prior_total) = AGREEMENT_PRIOR;
             assert_eq!(
                 drafter.agreement[0],
                 (prior_accepted * decay, prior_total * decay + 1.0),
@@ -10971,36 +11861,42 @@ mod tests {
                     combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
                 }
             }
-            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(drafter.floor.diagnostics().combined, combined);
             assert_eq!(
-                drafter.floor.interleaved,
+                drafter.floor.diagnostics().interleaved,
                 (40.0 * decay + 40.0, 2.0 * decay + 2.0)
             );
-            assert_eq!(drafter.floor.batched[1], (40.0 * decay + 40.0, decay + 1.0));
+            assert_eq!(
+                drafter.floor.diagnostics().batched[1],
+                (40.0 * decay + 40.0, decay + 1.0)
+            );
             for _ in 0..2 {
                 assert!(!drafter
                     .floor
                     .observe_external(2, 40.0, 1, &drafter.agreement));
                 combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
             }
-            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(drafter.floor.diagnostics().combined, combined);
             assert_eq!(
-                drafter.floor.external,
+                drafter.floor.diagnostics().external,
                 (40.0 * decay + 40.0, 2.0 * decay + 2.0)
             );
-            drafter.floor.retired = true;
+            drafter.floor.seed_retired(true);
             drafter.ngram_yield = (8.0, 2.0);
-            let agreement = drafter.agreement;
+            let agreement = drafter.agreement.clone();
             MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
             assert_eq!(drafter.agreement_decay, decay);
-            assert_eq!(drafter.floor.decay, decay);
-            assert!(!drafter.floor.retired);
-            assert!(!drafter.floor.calibrated);
-            assert_eq!(drafter.floor.observed, 0);
-            assert_eq!(drafter.floor.combined, (0.0, 0.0));
-            assert_eq!(drafter.floor.external, (0.0, 0.0));
-            assert_eq!(drafter.floor.interleaved, (0.0, 0.0));
-            assert_eq!(drafter.floor.batched, [(0.0, 0.0); MTP_WINDOW_COST.len()]);
+            assert_eq!(drafter.floor.diagnostics().decay, decay);
+            assert!(!drafter.floor.retired());
+            assert!(!drafter.floor.calibrated());
+            assert_eq!(drafter.floor.diagnostics().observed, 0);
+            assert_eq!(drafter.floor.diagnostics().combined, (0.0, 0.0));
+            assert_eq!(drafter.floor.diagnostics().external, (0.0, 0.0));
+            assert_eq!(drafter.floor.diagnostics().interleaved, (0.0, 0.0));
+            assert_eq!(
+                drafter.floor.diagnostics().batched,
+                [(0.0, 0.0); MTP_WINDOW_COST.len()]
+            );
             assert_eq!(drafter.ngram_yield, (0.0, 0.0));
             // Agreement restarts during prefill, not configure_request.
             assert_eq!(drafter.agreement, agreement);
@@ -11022,7 +11918,7 @@ mod tests {
     }
 
     fn agreement(accepted: f32, total: f32) -> Agreement {
-        [(accepted, total); MTP_MAX_DEPTH]
+        [(accepted, total); MAX_DEPTH]
     }
 
     fn window(accepted: usize, drafts: usize) -> MtpWindow {
@@ -11033,8 +11929,8 @@ mod tests {
         }
     }
 
-    fn calibrated(ar_us: f32, agreement: &Agreement) -> MtpFloor {
-        let mut floor = MtpFloor::new();
+    fn calibrated(ar_us: f32, agreement: &[(f32, f32)]) -> Qwen4Floor {
+        let mut floor = Qwen4Floor::new(MTP_WINDOW_COST);
         floor.observe_calibration(ar_us, agreement);
         floor
     }
@@ -11042,8 +11938,8 @@ mod tests {
     /// `n` batched windows routed at and drafting `depth`, every draft
     /// accepted, `us` each.
     fn batched_windows(
-        floor: &mut MtpFloor,
-        agreement: &Agreement,
+        floor: &mut Qwen4Floor,
+        agreement: &[(f32, f32)],
         depth: usize,
         us: f32,
         n: usize,
@@ -11057,154 +11953,6 @@ mod tests {
                 agreement,
             );
         }
-    }
-
-    /// `n` batched windows that drafted `depth` tokens but realized three
-    /// committed tokens in 60 us (20 us per token), whatever the agreement
-    /// predicts.
-    fn batched_windows_realized(
-        floor: &mut MtpFloor,
-        agreement: &Agreement,
-        depth: usize,
-        n: usize,
-    ) {
-        for _ in 0..n {
-            floor.observe_native(NativeWindow::Batched, &window(2, depth), 60.0, 7, agreement);
-        }
-    }
-
-    #[test]
-    fn floor_low_acceptance_retires_within_the_probe_budget() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            assert!(!floor.retired);
-            assert_eq!(floor.route(&bad, 3, 2), FloorRoute::Batched(2));
-            floor.observe_native(NativeWindow::Batched, &window(0, 2), 90.0, 3, &bad);
-        }
-        assert!(floor.retired);
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        assert_eq!(floor.route(&bad, 3, 2), FloorRoute::Ar);
-    }
-
-    #[test]
-    fn floor_winning_cost_depth_is_unchanged() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(33.0, &good);
-        batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(!floor.retired);
-        // The provisional (Halo-table) depth is ignored once measured. The
-        // cost fit prices the unmeasured neighbour 4 at 75 + 0.27 x 33 us
-        // (83.9 us for 4.10 predicted tokens, 20.5 us per token) against
-        // depth 3's measured 21.8: the chooser explores one depth up, never
-        // to the table's 5 or past the budget.
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(4));
-        assert_eq!(floor.route(&good, 3, 5), FloorRoute::Batched(3));
-        // `k` below the measured winning depth: no eligible measured option,
-        // so the request retires to AR rather than run an unmeasured route.
-        assert_eq!(floor.route(&good, 2, 5), FloorRoute::Ar);
-        assert!(floor.retired);
-    }
-
-    #[test]
-    fn floor_tie_with_ar_retires() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        // All at one cap: a neighbour's shifted evidence would price it below
-        // its own windows.
-        for _ in 1..=MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_native(NativeWindow::Batched, &window(0, 2), 30.0, 3, &bad);
-        }
-        assert!(floor.retired);
-    }
-
-    #[test]
-    fn floor_true_ar_price_changes_choices_across_cards() {
-        let good = agreement(1.8, 2.0);
-        // Identical measured windows (75 us for 3.44 predicted tokens, 21.8
-        // us per token); only the card's measured AR price differs.
-        for (ar_us, retires) in [(33.0, false), (22.0, false), (21.0, true), (10.0, true)] {
-            let mut floor = calibrated(ar_us, &good);
-            batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS);
-            assert_eq!(floor.retired, retires, "ar_us {ar_us}");
-        }
-    }
-
-    #[test]
-    fn floor_interleaved_is_priced_per_emitted_token() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_native(NativeWindow::Interleaved, &window(1, 1), 50.0, 3, &bad);
-        }
-        assert!(!floor.retired);
-        assert_eq!(floor.route(&bad, 3, 2), FloorRoute::Interleaved);
-    }
-
-    #[test]
-    fn floor_probe_budget_is_bounded_even_for_unusable_timings() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = MtpFloor::new();
-        floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
-        assert_eq!(floor.probes, 0, "uncalibrated windows are not observed");
-        floor.observe_calibration(33.0, &good);
-        floor.observe_native(NativeWindow::Batched, &window(0, 0), 75.0, 0, &good);
-        assert_eq!(floor.probes, 0, "k == 0 is not a probe");
-        // Unusable timings record nothing but spend the budget, and with
-        // nothing measured the request retires at the budget.
-        for us in [f32::NAN, f32::INFINITY, 0.0, -1.0, f32::NAN] {
-            floor.observe_native(NativeWindow::Batched, &window(2, 2), us, 3, &good);
-            assert!(floor.probes <= MTP_FLOOR_PROBE_WINDOWS);
-        }
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        assert_eq!(floor.batched[2], (0.0, 0.0));
-        assert!(floor.retired);
-
-        let mut floor = calibrated(33.0, &good);
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_external(0, f32::NAN, 4, &good);
-        }
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(floor.retired);
-
-        let mut floor = calibrated(33.0, &good);
-        batched_windows(&mut floor, &good, 2, 60.0, 2);
-        floor.observe_external(4, 60.0, 4, &good);
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        batched_windows(&mut floor, &good, 2, 60.0, 10);
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-    }
-
-    #[test]
-    fn floor_probe_route_is_the_provisional_depth() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = MtpFloor::new();
-        for calibration in [false, true] {
-            if calibration {
-                floor.observe_calibration(33.0, &good);
-            }
-            for provisional in 0..=7 {
-                let expected = match provisional {
-                    0 => FloorRoute::Interleaved,
-                    depth => FloorRoute::Batched(depth),
-                };
-                assert_eq!(floor.route(&good, 7, provisional), expected);
-            }
-        }
-    }
-
-    #[test]
-    fn floor_retirement_is_sticky() {
-        let bad = agreement(0.0, 2.0);
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        batched_windows(&mut floor, &bad, 2, 90.0, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(floor.retired);
-        batched_windows(&mut floor, &good, 3, 5.0, 10);
-        assert!(floor.observe_external(8, 10.0, 8, &good));
-        floor.observe_calibration(1000.0, &good);
-        assert!(floor.retired);
-        assert_eq!(floor.route(&good, 7, 3), FloorRoute::Ar);
     }
 
     #[test]
@@ -11251,300 +11999,6 @@ mod tests {
         assert!(drafter.head_lag.tokens.is_empty());
     }
 
-    #[test]
-    fn floor_external_costs_are_separate_from_native_agreement() {
-        let good = agreement(1.8, 2.0);
-        let before = good;
-        let mut floor = calibrated(30.0, &good);
-        batched_windows(&mut floor, &good, 3, 75.0, 2);
-        // 15 us per external token beats AR; native wins too.
-        assert!(!floor.observe_external(4, 60.0, 4, &good));
-        assert!(!floor.retired);
-        assert_eq!(good, before);
-        assert_eq!(floor.interleaved, (0.0, 0.0));
-        // Once external windows lose, takeover stops; native keeps running.
-        let mut stopped = false;
-        for _ in 0..30 {
-            if floor.observe_external(1, 200.0, 4, &good) {
-                stopped = true;
-                break;
-            }
-        }
-        assert!(stopped && !floor.retired);
-        assert_eq!(floor.route(&good, 3, 5), FloorRoute::Batched(3));
-    }
-
-    #[test]
-    fn floor_good_external_keeps_a_losing_native_route_alive_while_the_mixture_beats_ar() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        // 10 us per external token beats AR.
-        assert!(!floor.observe_external(4, 40.0, 4, &bad));
-        assert!(!floor.observe_external(4, 40.0, 4, &bad));
-        // One losing native window (90 us for one token) spends the budget;
-        // the realized mixture (~20.6 us per token) still beats AR.
-        floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(!floor.retired);
-        // The measured native route loses to AR, yet it keeps running while
-        // the mixture wins.
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
-        assert!(!floor.retired);
-        // Losing native windows drag the mixture up to AR; it then retires at
-        // the first window where the mixture stops beating AR, stickily.
-        let mut kept_alive = 0;
-        while !floor.retired {
-            assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
-            floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
-            kept_alive += 1;
-            assert!(kept_alive < 50, "never retired");
-        }
-        assert!(kept_alive > 0);
-        assert!(floor.combined.0 / floor.combined.1 >= 30.0);
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
-        assert!(floor.retired);
-        assert!(floor.observe_external(4, 40.0, 4, &bad));
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
-    }
-
-    #[test]
-    fn floor_three_good_external_hits_do_not_retire_and_route_interleaved() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(30.0, &good);
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            assert!(!floor.observe_external(4, 60.0, 4, &good));
-            assert!(!floor.retired);
-        }
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        // More good hits with zero native observations still keep it alive.
-        assert!(!floor.observe_external(4, 60.0, 4, &good));
-        assert!(!floor.retired);
-        // No native option is measured: the next native window runs the
-        // interleaved route rather than retiring.
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Interleaved);
-        assert!(!floor.retired);
-    }
-
-    #[test]
-    fn floor_good_external_with_no_native_measured_within_k_routes_interleaved() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(30.0, &good);
-        assert!(!floor.observe_external(4, 40.0, 4, &good));
-        assert!(!floor.observe_external(4, 40.0, 4, &good));
-        // Depth 3: 150 us over 3.44 predicted tokens loses to AR, but the
-        // realized mixture (~20 us per token) wins.
-        floor.observe_native(NativeWindow::Batched, &window(3, 3), 150.0, 7, &good);
-        assert!(!floor.retired);
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
-        // `k` below the only measured depth: nothing measured within k.
-        assert_eq!(floor.route(&good, 2, 5), FloorRoute::Interleaved);
-        assert!(!floor.retired);
-    }
-
-    #[test]
-    fn floor_blocked_external_does_not_keep_a_losing_native_route_alive() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        // Native windows lose by prediction (one token per window) while
-        // their realized cost (20 us per token) would win the mixture.
-        batched_windows_realized(&mut floor, &bad, 1, 2);
-        // One external window at exactly AR's price is blocked (a tie loses).
-        assert!(floor.observe_external(1, 30.0, 4, &bad));
-        assert!(floor.combined.0 / floor.combined.1 < 30.0);
-        assert!(floor.retired);
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
-    }
-
-    #[test]
-    fn floor_combined_mixture_prices_every_valid_window_after_calibration() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = MtpFloor::new();
-        floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
-        assert_eq!(
-            floor.combined,
-            (0.0, 0.0),
-            "uncalibrated windows are not priced"
-        );
-        floor.observe_calibration(30.0, &good);
-        floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
-        assert_eq!(floor.combined, (75.0, 3.0));
-        floor.observe_native(NativeWindow::Interleaved, &window(1, 1), 40.0, 3, &good);
-        assert_eq!(
-            floor.combined,
-            (
-                75.0 * MTP_AGREEMENT_DECAY + 40.0,
-                3.0 * MTP_AGREEMENT_DECAY + 2.0
-            )
-        );
-        let before = floor.combined;
-        floor.observe_native(NativeWindow::Batched, &window(1, 1), f32::NAN, 3, &good);
-        assert_eq!(floor.combined, before, "invalid timings are not priced");
-        floor.observe_external(4, 40.0, 4, &good);
-        assert_eq!(
-            floor.combined,
-            (
-                before.0 * MTP_AGREEMENT_DECAY + 40.0,
-                before.1 * MTP_AGREEMENT_DECAY + 4.0
-            )
-        );
-        assert_eq!(MtpFloor::new().combined, (0.0, 0.0));
-    }
-
-    #[test]
-    fn floor_bad_external_retires_when_native_does_not_win() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        batched_windows(&mut floor, &bad, 1, 90.0, 2);
-        assert!(floor.observe_external(1, 200.0, 4, &bad));
-        assert!(floor.retired);
-    }
-
-    #[test]
-    fn floor_blocked_external_leaves_winning_native_running() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(30.0, &good);
-        batched_windows(&mut floor, &good, 3, 75.0, 2);
-        assert!(floor.observe_external(1, 90.0, 2, &good));
-        assert!(!floor.retired);
-        assert_eq!(floor.route(&good, 3, 5), FloorRoute::Batched(3));
-    }
-
-    #[test]
-    fn floor_invalid_ar_price_retires_at_the_budget_not_before() {
-        let good = agreement(1.8, 2.0);
-        for bad_us in [f32::NAN, 0.0, -5.0] {
-            let mut floor = calibrated(bad_us, &good);
-            batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS - 1);
-            assert!(!floor.retired);
-            batched_windows(&mut floor, &good, 3, 75.0, 1);
-            assert!(floor.retired);
-        }
-    }
-
-    #[test]
-    fn floor_depth_is_keyed_by_drafts_actually_generated() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(33.0, &good);
-        floor.observe_native(NativeWindow::Batched, &window(1, 1), 50.0, 3, &good);
-        assert!(floor.batched[1].1 > 0.0);
-        assert_eq!(floor.batched[3], (0.0, 0.0));
-        let depth_one = floor.batched[1];
-        floor.observe_native(NativeWindow::Batched, &window(2, 2), 60.0, 3, &good);
-        assert_eq!(floor.batched[1], depth_one, "decay is entry-local");
-    }
-
-    #[test]
-    fn floor_max_k_beyond_the_cost_table_is_clamped() {
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(100.0, &good);
-        let top = MTP_WINDOW_COST.len() - 1;
-        assert!(top < MTP_MAX_DEPTH);
-        floor.observe_native(NativeWindow::Batched, &window(top, top), 100.0, 10, &good);
-        floor.observe_native(NativeWindow::Batched, &window(top, top), 100.0, 10, &good);
-        // A window longer than the table has no cost entry; it must not
-        // panic and does not create one.
-        floor.observe_native(
-            NativeWindow::Batched,
-            &window(top + 1, top + 1),
-            100.0,
-            10,
-            &good,
-        );
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        assert_eq!(floor.batched.len(), MTP_WINDOW_COST.len());
-        assert!(!floor.retired);
-        // Nothing past the table is ever a candidate: within k = 10 the
-        // choice is the measured top (100 us for 5.70 predicted tokens) or
-        // its fitted neighbour below (100 - 0.27 x 100 = 73 us for 5.22),
-        // the cheaper per token.
-        assert_eq!(floor.route(&good, 10, 5), FloorRoute::Batched(top - 1));
-    }
-
-    /// A batched window routed at `cap` that drafted `drafts` and accepted
-    /// `accepted` of them.
-    fn capped(cap: usize, drafts: usize, accepted: usize) -> WindowStats {
-        WindowStats {
-            emitted: accepted + 1,
-            drafts,
-            cap,
-        }
-    }
-
-    #[test]
-    fn floor_prices_caps_by_their_drafted_mix_and_neighbours() {
-        let good = agreement(1.6, 2.0);
-        let ar = 28_600.0;
-        let mut floor = calibrated(ar, &good).with_decay(MTP_AGREEMENT_DECAY_GFX1151);
-        // Cap 3: two windows drafted all 3, one was pruned to a single draft.
-        for (stats, us) in [
-            (capped(3, 3, 3), 73_500.0),
-            (capped(3, 3, 1), 73_500.0),
-            (capped(3, 1, 0), 48_700.0),
-        ] {
-            floor.observe_window(NativeWindow::Batched, stats, us, 7, &good);
-        }
-        let caps = floor.caps[3];
-        let window_us = caps.us / caps.windows;
-        let (one, three) = (
-            caps.drafted[1] / caps.windows,
-            caps.drafted[3] / caps.windows,
-        );
-        assert!((one - 1.0 / 3.0).abs() < 0.05 && (three - 2.0 / 3.0).abs() < 0.05);
-        // At 0.8 agreement a window drafting d emits 1 + 0.8 + ... + 0.8^d.
-        let e = |d: i32| (0..=d).map(|i| 0.8f32.powi(i)).sum::<f32>();
-        let cost = |cap| floor.cap_cost(&good, cap).expect("priced");
-        let priced = window_us / (one * e(1) + three * e(3));
-        assert!((cost(3) - priced).abs() < 1.0, "{} vs {priced}", cost(3));
-        // Neighbours shift only the windows the prune let through to the
-        // whole cap: one row more (up) or less (down).
-        let row = floor.fit_line().expect("fit").2 as f32;
-        let up = (window_us + row * three) / (one * e(1) + three * e(4));
-        let down = (window_us - row * three) / (one * e(1) + three * e(2));
-        assert!((cost(4) - up).abs() < 1.0, "{} vs {up}", cost(4));
-        assert!((cost(2) - down).abs() < 1.0, "{} vs {down}", cost(2));
-        assert_eq!(floor.cap_cost(&good, 1), None);
-        assert_eq!(floor.cap_cost(&good, 5), None);
-        assert!(floor
-            .trace_line(&good, "t", 1.0, 1, 3)
-            .contains("\"route\":\"cap4\",\"modeled\":true"));
-        // The row is the request's own: windows drafting 2 and 3 rows at the
-        // R9700's 12.4 ms per row fit it within a few percent.
-        for _ in 0..20 {
-            floor.observe_window(NativeWindow::Batched, capped(2, 2, 2), 61_100.0, 7, &good);
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 73_500.0, 7, &good);
-        }
-        let row = floor.modeled_us(4).expect("fit") - floor.modeled_us(3).expect("fit");
-        assert!((row - 12_400.0).abs() < 0.03 * 12_400.0, "row {row}");
-    }
-
-    #[test]
-    fn uncompared_depths_relax_toward_the_shallower_agreement() {
-        let ratio = |(accepted, total): (f32, f32)| accepted / total;
-        // Windows that accept both of two drafts never compare depth 5; it
-        // drifts to the request's own acceptance, not to the 0.8 prior.
-        let mut agreement = [(1.9, 2.0); MTP_MAX_DEPTH];
-        for _ in 0..100 {
-            observe_agreement(&mut agreement, &window(2, 2), MTP_AGREEMENT_DECAY);
-        }
-        assert!(ratio(agreement[5]) > 0.95, "{:?}", agreement[5]);
-        // Rejections at depth 0 pull every deeper depth toward depth 0's rate
-        // (each depth lags the one above it by the relaxation's ~20 windows).
-        let mut agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
-        for _ in 0..300 {
-            observe_agreement(&mut agreement, &window(0, 3), MTP_AGREEMENT_DECAY);
-        }
-        assert!(ratio(agreement[0]) < 0.01);
-        assert!(ratio(agreement[4]) < 0.2, "{:?}", agreement[4]);
-        // Depth 0 itself, when no draft was compared, relaxes to the prior.
-        let mut agreement = [(0.0, 2.0); MTP_MAX_DEPTH];
-        for _ in 0..200 {
-            observe_agreement(&mut agreement, &window(0, 0), MTP_AGREEMENT_DECAY);
-        }
-        let prior = ratio(MTP_AGREEMENT_PRIOR);
-        assert!((ratio(agreement[0]) - prior).abs() < 1e-3);
-        assert!((ratio(agreement[MTP_MAX_DEPTH - 1]) - prior).abs() < 0.05);
-    }
-
     /// Deterministic draws in `[0, 1)` (xorshift32).
     struct Draws(u32);
 
@@ -11575,10 +12029,11 @@ mod tests {
         seed: u32,
         stream: impl Fn(usize) -> (f32, usize),
     ) -> ChooserRun {
-        let mut agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
-        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
-            .with_decay(decay)
-            .with_retire_evidence(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
+        let mut agreement = [AGREEMENT_PRIOR; MAX_DEPTH];
+        let mut floor =
+            Qwen4Floor::with_retire_after(MTP_WINDOW_COST, MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+                .with_decay(decay)
+                .with_retire_evidence(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
         let mut draws = Draws(seed.max(1));
         let mut run = ChooserRun {
             depths: Vec::with_capacity(windows),
@@ -11594,18 +12049,22 @@ mod tests {
             }
             let (p, kept) = stream(run.depths.len());
             let route = match forced {
-                Some(depth) => FloorRoute::Batched(depth),
-                None => floor.route(&agreement, k, batched_depth(&agreement, k)),
+                Some(depth) => Action::Native(depth),
+                None => floor.route(
+                    &agreement,
+                    k,
+                    batched_depth(&agreement, k, &MTP_WINDOW_COST),
+                ),
             };
             let (cap, drafts, accepted, us, route) = match route {
-                FloorRoute::Ar => {
+                Action::ArHeadFree => {
                     run.depths.push(8);
                     run.tokens += 1.0;
                     run.us += ar_us;
                     continue;
                 }
-                FloorRoute::ArSample => continue,
-                FloorRoute::Interleaved => {
+                Action::ArSynced => continue,
+                Action::Interleaved => {
                     let accepted = (0..k).take_while(|_| draws.next() < p).count();
                     let us = ar_us * (accepted + 1) as f32;
                     (
@@ -11616,7 +12075,7 @@ mod tests {
                         NativeWindow::Interleaved,
                     )
                 }
-                FloorRoute::Batched(cap) => {
+                Action::Native(cap) => {
                     let drafted = cap.min(kept.max(1));
                     let accepted = (0..drafted).take_while(|_| draws.next() < p).count();
                     (
@@ -11760,9 +12219,7 @@ mod tests {
     /// acceptance (0.72) on either card the chooser stays at 2-3.
     #[test]
     fn chooser_stays_shallow_where_deeper_rows_lose() {
-        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| {
-            (0.8, 7)
-        });
+        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, DEFAULT_DECAY, |_| (0.8, 7));
         assert!(matches!(r9700.best_depth(), 2 | 3), "{r9700:?}");
         assert!(r9700.forced[5] < 0.94 * r9700.forced[3], "{r9700:?}");
         assert!(
@@ -11777,9 +12234,7 @@ mod tests {
         );
         let prose = |w: usize| if w < 4 { (0.3, 2) } else { (0.72, 7) };
         for s in [
-            chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| {
-                (0.72, 7)
-            }),
+            chooser_scenario(R9700_WINDOW_US, R9700_AR_US, DEFAULT_DECAY, |_| (0.72, 7)),
             chooser_scenario(
                 HALO_WINDOW_US,
                 HALO_AR_US,
@@ -11826,7 +12281,7 @@ mod tests {
             halo.late_share(|d| d + 1 >= halo.best_depth() && d <= halo.best_depth() + 1) >= 0.7,
             "{halo:?}"
         );
-        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, mixed);
+        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, DEFAULT_DECAY, mixed);
         assert!(
             r9700.rate >= 0.93 * r9700.forced[r9700.best_depth()],
             "{r9700:?}"
@@ -11837,530 +12292,20 @@ mod tests {
     /// prices at code acceptance.
     #[test]
     fn chooser_goes_deep_on_r9700_costs_when_acceptance_pays() {
-        let s = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| {
-            (0.93, 7)
-        });
+        let s = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, DEFAULT_DECAY, |_| (0.93, 7));
         assert!(s.best_depth() >= 4, "{s:?}");
         assert!(s.late_share(|d| d >= 4 && d < 8) >= 0.6, "{s:?}");
         assert!(s.rate >= 0.95 * s.forced[s.best_depth()], "{s:?}");
     }
 
-    /// A window of `emitted` committed tokens that drafted `drafts`.
-    fn emitted_window(emitted: usize, drafts: usize) -> MtpWindow {
-        MtpWindow {
-            committed: vec![0; emitted],
-            accepted: emitted.saturating_sub(1),
-            drafts_generated: drafts,
-        }
-    }
-
     /// Run the AR probe tokens a would-be retirement asks for, each costing
     /// `us`, asserting the route stays `ArSample` until the last.
-    fn run_probes(floor: &mut MtpFloor, agreement: &Agreement, n: usize, us: f32) {
+    fn run_probes(floor: &mut Qwen4Floor, agreement: &[(f32, f32)], n: usize, us: f32) {
         for _ in 0..n {
             assert!(floor.needs_ar_sample());
-            assert_eq!(floor.route(agreement, 3, 3), FloorRoute::ArSample);
+            assert_eq!(floor.route(agreement, 3, 3), Action::ArSynced);
             floor.observe_calibration(us, agreement);
         }
-    }
-
-    /// humaneval_0 on the Flash-Next hot set (trace of `a-tier-1`): the
-    /// calibration token cost 19.6 ms against 24-28 ms for the AR tokens
-    /// after it; the native windows that lost to the 19.6 ms price retired a
-    /// request whose mixture of n-gram and native windows cost 20.5 ms per
-    /// token.  Fresh AR probes price AR where the request is, and the
-    /// mixture then wins.
-    #[test]
-    fn floor_retire_evidence_reprices_ar_before_a_sticky_retirement() {
-        let poor = agreement(0.5, 2.0);
-        let run = |evidence: usize| {
-            let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(evidence);
-            floor.observe_calibration(19_600.0, &poor);
-            for _ in 0..5 {
-                floor.observe_native(
-                    NativeWindow::Batched,
-                    &emitted_window(1, 3),
-                    60_000.0,
-                    3,
-                    &poor,
-                );
-            }
-            for _ in 0..8 {
-                floor.observe_external(4, 55_000.0, 3, &poor);
-            }
-            for _ in 0..4 {
-                floor.observe_native(
-                    NativeWindow::Batched,
-                    &emitted_window(1, 3),
-                    70_000.0,
-                    3,
-                    &poor,
-                );
-            }
-            floor
-        };
-        // Without evidence the single calibration price retires it.
-        let mut floor = run(0);
-        assert!(floor.retired);
-        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Ar);
-        // With evidence the verdict first asks for the probes.
-        let mut floor = run(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
-        assert!(
-            !floor.retired,
-            "a verdict on one early token must not retire"
-        );
-        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::ArSample);
-        assert!(floor.needs_ar_sample());
-        let probes = MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS;
-        run_probes(&mut floor, &poor, probes - 1, 30_000.0);
-        assert!(floor.needs_ar_sample());
-        floor.observe_calibration(30_000.0, &poor);
-        assert!(!floor.needs_ar_sample());
-        assert_eq!(
-            floor.ar_us, 30_000.0,
-            "the probe mean replaces the calibration price"
-        );
-        assert!(
-            !floor.retired,
-            "the realized mixture (~27 ms/token) beats 30 ms"
-        );
-        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Batched(3));
-        // Probes ask for nothing while the verdict stays a win.
-        assert!(!floor.needs_ar_sample());
-    }
-
-    /// records_parser_1k (trace of `a-tier-1`): a streak of rejected drafts
-    /// at windows 12-15 pushed the 8-window cost to 27.8 ms/token against a
-    /// 19.2 ms/token mean; the verdict at the first post-grace window is a
-    /// coin flip around AR.  The slow realized memory keeps it alive.
-    #[test]
-    fn floor_retire_evidence_slow_realized_cost_survives_a_rejection_streak() {
-        let poor = agreement(0.5, 2.0);
-        let run = |evidence: usize| {
-            let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(evidence);
-            floor.observe_calibration(25_000.0, &poor);
-            for _ in 0..11 {
-                floor.observe_native(
-                    NativeWindow::Batched,
-                    &emitted_window(4, 3),
-                    60_000.0,
-                    3,
-                    &poor,
-                );
-            }
-            for _ in 0..5 {
-                floor.observe_native(
-                    NativeWindow::Batched,
-                    &emitted_window(1, 3),
-                    62_000.0,
-                    3,
-                    &poor,
-                );
-            }
-            floor
-        };
-        let floor = run(0);
-        assert!(floor.combined.0 / floor.combined.1 > 25_000.0);
-        assert!(floor.retired, "the fast memory alone retires on the streak");
-        let mut floor = run(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
-        assert!(floor.combined.0 / floor.combined.1 > 25_000.0);
-        assert!(floor.slow.0 / floor.slow.1 < 25_000.0);
-        assert!(!floor.retired && !floor.needs_ar_sample());
-        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Batched(3));
-        assert!(!floor.retired);
-    }
-
-    /// A request whose windows really lose retires after its probes, at no
-    /// more than the probe tokens' cost, and a retired request never probes.
-    #[test]
-    fn floor_retire_evidence_still_retires_a_losing_request_after_its_probes() {
-        let poor = agreement(0.0, 2.0);
-        let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(6);
-        floor.observe_calibration(25_000.0, &poor);
-        for observed in 1..=15 {
-            floor.observe_native(
-                NativeWindow::Batched,
-                &emitted_window(1, 3),
-                70_000.0,
-                3,
-                &poor,
-            );
-            assert!(
-                !floor.retired && !floor.needs_ar_sample(),
-                "grace window {observed}"
-            );
-        }
-        floor.observe_native(
-            NativeWindow::Batched,
-            &emitted_window(1, 3),
-            70_000.0,
-            3,
-            &poor,
-        );
-        assert!(!floor.retired);
-        assert!(floor.needs_ar_sample());
-        run_probes(&mut floor, &poor, 5, 24_000.0);
-        // The probes are not windows: nothing observed, nothing decayed.
-        assert_eq!(floor.observed, 16);
-        floor.observe_calibration(f32::NAN, &poor);
-        assert!(
-            floor.retired,
-            "an invalid probe is skipped, the rest price AR"
-        );
-        assert_eq!(floor.ar_us, 24_000.0);
-        assert!(!floor.needs_ar_sample());
-        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Ar);
-        floor.observe_calibration(24_000.0, &poor);
-        assert_eq!(floor.probe_left, 0);
-    }
-
-    /// A winning request is re-probed at most once per `retire_after`
-    /// windows, and only when a verdict would retire it.
-    #[test]
-    fn floor_retire_evidence_probes_at_most_once_per_grace() {
-        let poor = agreement(0.5, 2.0);
-        let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(2);
-        floor.observe_calibration(10_000.0, &poor);
-        for _ in 0..16 {
-            floor.observe_native(
-                NativeWindow::Batched,
-                &emitted_window(1, 3),
-                60_000.0,
-                3,
-                &poor,
-            );
-        }
-        assert!(floor.needs_ar_sample() && !floor.retired);
-        let started = floor.probed_at;
-        assert_eq!(started, Some(16));
-        // Fresh AR now costs more than the windows (60 ms for 1 token loses
-        // to nothing under 60 ms): the verdict flips to a win.
-        run_probes(&mut floor, &poor, 2, 70_000.0);
-        assert!(!floor.retired);
-        // The same windows keep winning against 70 ms: no new probe.
-        for _ in 0..15 {
-            floor.observe_native(
-                NativeWindow::Batched,
-                &emitted_window(1, 3),
-                60_000.0,
-                3,
-                &poor,
-            );
-            assert!(!floor.needs_ar_sample() && !floor.retired);
-        }
-        // AR gets cheap again; the verdict loses, but only once 16 windows
-        // passed since the last probe does it ask for fresh evidence first.
-        floor.ar_us = 10_000.0;
-        floor.observe_native(
-            NativeWindow::Batched,
-            &emitted_window(1, 3),
-            60_000.0,
-            3,
-            &poor,
-        );
-        assert_eq!(floor.observed, 32);
-        assert!(floor.needs_ar_sample() && !floor.retired);
-        assert_eq!(floor.probed_at, Some(32));
-    }
-
-    /// A singleton floor on a budget of 7 that ran cap 5 for its whole grace,
-    /// every window losing to a 30 ms AR step, then re-priced AR: its
-    /// verdict would retire, so it starts the bounded shallow re-probe.
-    fn deep_only_losing_floor(bad: &Agreement) -> MtpFloor {
-        let mut floor =
-            MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS).with_retire_evidence(2);
-        floor.observe_calibration(30_000.0, bad);
-        for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, bad);
-        }
-        assert!(floor.needs_ar_sample() && !floor.retired);
-        for _ in 0..2 {
-            floor.observe_calibration(30_000.0, bad);
-        }
-        assert_eq!(floor.ar_us, 30_000.0);
-        assert!(!floor.retired && !floor.needs_ar_sample());
-        assert_eq!(floor.shallow_state, ShallowState::Probing);
-        assert!(floor.deep_seen && floor.shallow_since_deep == 0);
-        floor
-    }
-
-    /// Deep-only losing evidence re-probes shallow before retiring; a
-    /// shallow control that beats AR keeps the request alive on its shallow
-    /// route, and the trace carries the state.
-    #[test]
-    fn floor_shallow_reprobe_win_prevents_retirement() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = deep_only_losing_floor(&bad);
-        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
-        for done in 1..=MTP_FLOOR_PROBE_WINDOWS {
-            assert_eq!(floor.shallow_state, ShallowState::Probing, "window {done}");
-            assert!(!floor.retired);
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
-        }
-        assert_eq!(floor.shallow_state, ShallowState::Holding);
-        assert!(!floor.retired);
-        assert_eq!(floor.shallow.priced, MTP_FLOOR_PROBE_WINDOWS);
-        assert_eq!(floor.shallow_cost(), Some(15_000.0));
-        assert!(!floor.deep_seen);
-        assert_eq!(floor.shallow_since_deep, MTP_FLOOR_PROBE_WINDOWS);
-        // The chooser's own cap-3 price (no accepted prefix predicted) still
-        // loses; the fresh realized shallow cost keeps the request on cap 3.
-        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
-        assert!(!floor.retired);
-        let trace = floor.trace_line(&bad, "t", 1.0, 1, 3);
-        for field in [
-            "\"shallow_state\":\"holding\"",
-            "\"shallow_priced\":3",
-            "\"shallow_windows\":3",
-            "\"shallow_budget\":6",
-            "\"budget_k\":7",
-            "\"deep_seen\":false",
-            "\"shallow_since_deep\":3",
-            "\"shallow_us_per_tok\":15000.0",
-            "\"climb_streak\":0",
-        ] {
-            assert!(trace.contains(field), "{field} in {trace}");
-        }
-    }
-
-    /// Shallow windows that also lose to AR end the re-probe in a sticky
-    /// retirement, after exactly the probe budget of priced windows.
-    #[test]
-    fn floor_shallow_reprobe_loss_retires() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = deep_only_losing_floor(&bad);
-        for done in 1..=MTP_FLOOR_PROBE_WINDOWS {
-            assert!(!floor.retired, "window {done}");
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
-        }
-        assert_eq!(floor.shallow_state, ShallowState::Lost);
-        assert!(floor.retired);
-        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Ar);
-        assert!(floor
-            .trace_line(&bad, "t", 1.0, 1, 3)
-            .contains("\"shallow_state\":\"lost\""));
-    }
-
-    /// The lane floor (no AR probe tokens, retiring at the probe budget)
-    /// takes the same shallow control before its sticky retirement.
-    #[test]
-    fn floor_shallow_reprobe_guards_floors_without_ar_probes() {
-        let bad = agreement(0.0, 2.0);
-        let deep = || {
-            let mut floor = MtpFloor::new();
-            floor.observe_calibration(30_000.0, &bad);
-            for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-                floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
-            }
-            floor
-        };
-        let mut floor = deep();
-        assert!(!floor.retired);
-        assert_eq!(floor.shallow_state, ShallowState::Probing);
-        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
-        }
-        assert_eq!(floor.shallow_state, ShallowState::Holding);
-        assert!(!floor.retired);
-        let mut floor = deep();
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
-        }
-        assert!(floor.retired);
-    }
-
-    /// First-use unpriced windows spend the hard window bound but not the
-    /// priced budget: a valid control still wins, and a probe whose every
-    /// timing is invalid ends, finitely, in the fail-closed retirement.
-    #[test]
-    fn floor_shallow_reprobe_budget_is_bounded_with_unpriced_first_uses() {
-        let bad = agreement(0.0, 2.0);
-        assert_eq!(MTP_FLOOR_SHALLOW_MAX_WINDOWS, 2 * MTP_FLOOR_PROBE_WINDOWS);
-        // Two unpriced first uses (drafted depths 1 and 2), then a priced
-        // winner at depth 3: five windows, inside the bound.
-        let mut floor = deep_only_losing_floor(&bad);
-        for depth in [1, 2] {
-            floor.observe_window(
-                NativeWindow::Batched,
-                capped(3, depth, 0),
-                f32::NAN,
-                7,
-                &bad,
-            );
-        }
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS - 1 {
-            assert_eq!(floor.shallow_state, ShallowState::Probing);
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
-        }
-        assert_eq!(floor.shallow_state, ShallowState::Probing);
-        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
-        assert_eq!(floor.shallow_state, ShallowState::Holding);
-        assert_eq!(floor.shallow.windows, 2 + MTP_FLOOR_PROBE_WINDOWS);
-        assert_eq!(floor.shallow.priced, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(!floor.retired);
-
-        // One priced winner among five unpriced windows ends at the bound
-        // with that control's verdict.
-        let mut floor = deep_only_losing_floor(&bad);
-        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
-        for spent in 2..MTP_FLOOR_SHALLOW_MAX_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
-            assert_eq!(floor.shallow_state, ShallowState::Probing, "window {spent}");
-        }
-        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
-        assert_eq!(floor.shallow_state, ShallowState::Holding);
-        assert_eq!(floor.shallow.windows, MTP_FLOOR_SHALLOW_MAX_WINDOWS);
-        assert_eq!(floor.shallow.priced, 1);
-        assert!(!floor.retired);
-
-        // No priced control at all: bounded, then retired (an unpriced win
-        // cannot be asserted).
-        let mut floor = deep_only_losing_floor(&bad);
-        for spent in 1..MTP_FLOOR_SHALLOW_MAX_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
-            assert_eq!(floor.shallow_state, ShallowState::Probing, "window {spent}");
-            assert!(!floor.retired);
-            assert_eq!(floor.shallow.windows, spent);
-            assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
-        }
-        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
-        assert_eq!(floor.shallow_state, ShallowState::Unpriced);
-        assert!(floor.retired);
-        assert_eq!(floor.shallow.priced, 0);
-        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Ar);
-        assert!(floor
-            .trace_line(&bad, "t", 1.0, 1, 3)
-            .contains("\"shallow_state\":\"unpriced\""));
-
-        // External windows spend the same bound, so a probe cannot outlive
-        // it while takeovers run.
-        let mut floor = deep_only_losing_floor(&bad);
-        for spent in 1..MTP_FLOOR_SHALLOW_MAX_WINDOWS {
-            floor.observe_external(1, 200_000.0, 4, &bad);
-            assert_eq!(floor.shallow.windows, spent);
-            assert_eq!(floor.shallow_state, ShallowState::Probing);
-            assert!(!floor.retired);
-        }
-        floor.observe_external(1, 200_000.0, 4, &bad);
-        assert_eq!(floor.shallow_state, ShallowState::Unpriced);
-        assert!(floor.retired);
-    }
-
-    /// Only the request's current budget asks for the probe: a budget of at
-    /// most 3 (an explicit K below 3, or a route `k` override back to 3)
-    /// retires on its own evidence without shallow windows.
-    #[test]
-    fn floor_shallow_reprobe_is_skipped_for_budgets_at_or_below_three() {
-        let bad = agreement(0.0, 2.0);
-        for k in 1..=MTP_FLOOR_SHALLOW_CAP {
-            let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
-                .with_retire_evidence(2);
-            floor.observe_calibration(30_000.0, &bad);
-            for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
-                floor.observe_window(NativeWindow::Batched, capped(k, k, 0), 60_000.0, k, &bad);
-            }
-            assert!(floor.needs_ar_sample() && !floor.retired, "k {k}");
-            for _ in 0..2 {
-                floor.observe_calibration(30_000.0, &bad);
-            }
-            assert!(floor.retired, "k {k}");
-            assert_eq!(floor.shallow_state, ShallowState::Idle, "k {k}");
-            assert_eq!(floor.shallow.windows, 0, "k {k}");
-        }
-        // A deep request whose current route budget is 3: the override
-        // starts no shallow windows even though deep windows were seen.
-        let mut floor =
-            MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS).with_retire_evidence(2);
-        floor.observe_calibration(30_000.0, &bad);
-        for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
-        }
-        assert!(floor.deep_seen && floor.needs_ar_sample());
-        assert_eq!(floor.route(&bad, 3, 3), FloorRoute::ArSample);
-        for _ in 0..2 {
-            floor.observe_calibration(30_000.0, &bad);
-        }
-        assert!(floor.retired);
-        assert_eq!(floor.shallow_state, ShallowState::Idle);
-    }
-
-    /// Stale shallow samples are not fresh evidence: cap-3 windows decayed
-    /// into the cap statistics before the deep exploration still leave the
-    /// retirement needing its own shallow windows.
-    #[test]
-    fn floor_shallow_reprobe_ignores_stale_shallow_samples() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor =
-            MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS).with_retire_evidence(2);
-        floor.observe_calibration(30_000.0, &bad);
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
-        }
-        for _ in MTP_FLOOR_PROBE_WINDOWS..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
-        }
-        assert!(floor.caps[3].windows > 0.0, "decayed cap-3 samples remain");
-        assert!(floor.needs_ar_sample());
-        for _ in 0..2 {
-            floor.observe_calibration(30_000.0, &bad);
-        }
-        assert_eq!(floor.shallow_state, ShallowState::Probing);
-        assert_eq!(floor.shallow_since_deep, 0);
-        assert!(!floor.retired);
-    }
-
-    /// Positive evidence gates the climb: a held shallow request stays at
-    /// cap 3 until a deeper candidate has priced below the shallow one and
-    /// AR for the probe budget of consecutive windows; a deep window then
-    /// ends the hold.
-    #[test]
-    fn floor_shallow_hold_resumes_the_climb_only_on_positive_evidence() {
-        let bad = agreement(0.0, 2.0);
-        let good = agreement(2.0, 2.0);
-        let mut floor = deep_only_losing_floor(&bad);
-        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
-        }
-        assert_eq!(floor.shallow_state, ShallowState::Holding);
-        assert_eq!(floor.climb_streak, 0);
-        // The deep exploration's window-cost fit would only slow the
-        // shallow row price's convergence; drop it to isolate the evidence
-        // rule (every later window is a depth-3 one, row = the prior).
-        floor.fit = [0.0; 5];
-        let mut climbed = None;
-        for window in 1..=40 {
-            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &good);
-            assert_eq!(
-                floor.shallow_state,
-                ShallowState::Holding,
-                "window {window}"
-            );
-            assert!(!floor.retired);
-            let route = floor.route(&good, 7, 3);
-            if floor.climb_streak < MTP_FLOOR_PROBE_WINDOWS {
-                assert!(
-                    matches!(route, FloorRoute::Batched(cap) if cap <= MTP_FLOOR_SHALLOW_CAP),
-                    "window {window}: {route:?}"
-                );
-            } else {
-                assert!(
-                    matches!(route, FloorRoute::Batched(cap) if cap > MTP_FLOOR_SHALLOW_CAP),
-                    "window {window}: {route:?}"
-                );
-                climbed = Some(window);
-                break;
-            }
-        }
-        assert!(
-            climbed.is_some_and(|window| window >= MTP_FLOOR_PROBE_WINDOWS),
-            "{climbed:?}"
-        );
-        floor.observe_window(NativeWindow::Batched, capped(4, 4, 4), 70_000.0, 7, &good);
-        assert_eq!(floor.shallow_state, ShallowState::Idle);
-        assert!(floor.deep_seen);
-        assert_eq!(floor.shallow_since_deep, 0);
-        assert_eq!(floor.climb_streak, 0);
     }
 
     /// The singleton path turns retire evidence on (default
@@ -12368,27 +12313,29 @@ mod tests {
     /// a pending probe blocks every takeover and is planned as an AR token.
     #[test]
     fn floor_retire_evidence_is_singleton_only_and_blocks_takeover_while_probing() {
-        assert_eq!(MtpFloor::new().probe_tokens, 0);
+        assert_eq!(
+            Qwen4Floor::new(MTP_WINDOW_COST).diagnostics().probe_tokens,
+            0
+        );
         let mut drafter = floor_drafter(true);
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         assert_eq!(
-            drafter.floor.probe_tokens,
+            drafter.floor.diagnostics().probe_tokens,
             singleton_floor_ar_probe_tokens()
         );
         assert_eq!(
-            drafter.floor.probe_tokens,
+            drafter.floor.diagnostics().probe_tokens,
             MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS
         );
-        drafter.floor.calibrated = true;
-        drafter.floor.ar_us = 30_000.0;
-        drafter.floor.probe_left = 2;
+        drafter.floor.seed_calibrated(30_000.0);
+        drafter.floor.seed_probe_left(2);
         assert!(drafter.floor_needs_calibration());
         assert!(drafter.floor_takeover_blocked());
         assert_eq!(
             plan_of(&mut drafter, 3, None).route,
             WindowRoute::ArCalibrate
         );
-        drafter.floor.probe_left = 0;
+        drafter.floor.seed_probe_left(0);
         assert!(!drafter.floor_needs_calibration());
         assert!(!drafter.floor_takeover_blocked());
     }
@@ -12402,7 +12349,7 @@ mod tests {
     #[test]
     fn floor_optout_never_calibrates_or_blocks_takeover() {
         let drafter = floor_drafter(false);
-        assert!(!drafter.floor.calibrated);
+        assert!(!drafter.floor.calibrated());
         assert!(!drafter.floor_needs_calibration());
         assert!(!drafter.floor_takeover_blocked());
         assert!(!drafter.floor_retired());
@@ -12411,12 +12358,12 @@ mod tests {
     #[test]
     fn floor_optout_external_windows_never_stop_takeover_or_retire() {
         let mut drafter = floor_drafter(false);
-        for _ in 0..(4 * MTP_FLOOR_PROBE_WINDOWS) {
+        for _ in 0..(4 * FLOOR_PROBE_WINDOWS) {
             assert!(!drafter.floor_observe_external_window(0, f32::INFINITY, 4));
             assert!(!drafter.floor_observe_external_window(1, 1.0e9, 4));
         }
-        assert!(!drafter.floor.retired);
-        assert_eq!(drafter.floor.probes, 0);
+        assert!(!drafter.floor.retired());
+        assert_eq!(drafter.floor.diagnostics().probes, 0);
         assert!(!drafter.request_stats().mtp_retired);
         assert_eq!(drafter.request_stats().ar_windows, 0);
         assert!(!drafter.floor_takeover_blocked());
@@ -12426,15 +12373,15 @@ mod tests {
     fn floor_optout_native_windows_count_without_observing_the_floor() {
         let mut drafter = floor_drafter(false);
         let good = window(2, 2);
-        for _ in 0..(2 * MTP_FLOOR_PROBE_WINDOWS) {
+        for _ in 0..(2 * FLOOR_PROBE_WINDOWS) {
             drafter.floor_observe_native(true, NativeWindow::Batched, &good, 1.0e9, 3);
             drafter.floor_observe_native(true, NativeWindow::Interleaved, &good, 1.0e9, 3);
         }
         let stats = drafter.request_stats();
-        assert_eq!(stats.mtp_windows, 4 * MTP_FLOOR_PROBE_WINDOWS);
+        assert_eq!(stats.mtp_windows, 4 * FLOOR_PROBE_WINDOWS);
         assert!(!stats.mtp_retired);
         assert_eq!(stats.ar_windows, 0);
-        assert_eq!(drafter.floor.probes, 0);
+        assert_eq!(drafter.floor.diagnostics().probes, 0);
     }
 
     /// The first batched window a drafter runs at a drafted depth (the
@@ -12448,13 +12395,13 @@ mod tests {
         let mut drafter = floor_drafter(true);
         drafter.floor.observe_calibration(30_000.0, &good);
         drafter.floor_observe_native(false, NativeWindow::Batched, &window(3, 3), 90_000.0, 7);
-        assert_eq!(drafter.floor.batched[3], (0.0, 0.0));
-        assert_eq!(drafter.floor.fit, [0.0; 5]);
-        assert_eq!(drafter.floor.probes, 1);
+        assert_eq!(drafter.floor.diagnostics().batched[3], (0.0, 0.0));
+        assert_eq!(drafter.floor.diagnostics().fit, [0.0; 5]);
+        assert_eq!(drafter.floor.diagnostics().probes, 1);
         drafter.floor_observe_native(false, NativeWindow::Batched, &window(3, 3), 75_000.0, 7);
-        assert_eq!(drafter.floor.batched[3], (75_000.0, 1.0));
+        assert_eq!(drafter.floor.diagnostics().batched[3], (75_000.0, 1.0));
         drafter.floor_observe_native(false, NativeWindow::Interleaved, &window(1, 2), 40_000.0, 7);
-        assert_eq!(drafter.floor.interleaved, (40_000.0, 2.0));
+        assert_eq!(drafter.floor.diagnostics().interleaved, (40_000.0, 2.0));
         // A forced route (bypass) still runs the depth's first window.
         drafter.floor_observe_native(true, NativeWindow::Batched, &window(5, 5), 1.0e9, 7);
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
@@ -12468,7 +12415,7 @@ mod tests {
                 7,
             );
             assert_eq!(
-                drafter.floor.batched[depth],
+                drafter.floor.diagnostics().batched[depth],
                 (75_000.0, 1.0),
                 "depth {depth}"
             );
@@ -12494,15 +12441,15 @@ mod tests {
     fn floor_optout_depth_is_the_pre_floor_batched_depth() {
         let mut drafter = floor_drafter(false);
         for (accepted, total) in [(0.0, 2.0), (1.0, 2.0), (1.8, 2.0), (2.0, 2.0)] {
-            drafter.agreement = agreement(accepted, total);
+            drafter.agreement.fill((accepted, total));
             for k in 0..=drafter.max_k {
                 assert_eq!(drafter.floor_off_depth(k), drafter.batched_depth(k));
             }
         }
         // Perfect agreement pays for batching; none falls back to interleaved.
-        drafter.agreement = agreement(2.0, 2.0);
+        drafter.agreement.fill((2.0, 2.0));
         assert!(drafter.floor_off_depth(drafter.max_k) > 0);
-        drafter.agreement = agreement(0.0, 2.0);
+        drafter.agreement.fill((0.0, 2.0));
         assert_eq!(drafter.floor_off_depth(drafter.max_k), 0);
     }
 
@@ -13123,8 +13070,8 @@ mod tests {
 
     /// An n-gram acceptance table with `ratio` at every depth backed by
     /// `weight` windows of evidence.
-    fn ngram_table(ratio: f32, weight: f32) -> [(f32, f32); NGRAM_DEPTHS] {
-        [(ratio * weight, weight); NGRAM_DEPTHS]
+    fn ngram_table(ratio: f32, weight: f32) -> Vec<(f32, f32)> {
+        vec![(ratio * weight, weight); NGRAM_DEPTHS]
     }
 
     #[test]
@@ -13134,8 +13081,8 @@ mod tests {
         // pool below native MTP agreeing at 0.9, but the proposal is still
         // kept for the shadow observation.
         let mut drafter = armed_copy_drafter(1, 8);
-        drafter.agreement = [(0.9, 1.0); MTP_MAX_DEPTH];
-        drafter.ngram_agreement = [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS];
+        drafter.agreement.fill((0.9, 1.0));
+        drafter.ngram_agreement.fill(AGREEMENT_PRIOR);
         assert!(!drafter.ngram_hit(&emitted, 8));
         assert_eq!(drafter.ngram_proposed_at, Some(2));
         assert_eq!(drafter.ngram_proposal.len(), 8);
@@ -13160,7 +13107,7 @@ mod tests {
         for ((single, extra), takes) in [((30.5, 6.9), true), ((30.3, 14.8), false)] {
             let mut drafter = armed_copy_drafter(1, 8);
             drafter.ngram_row_cost = Some((single, extra));
-            drafter.agreement = [(0.92, 1.0); MTP_MAX_DEPTH];
+            drafter.agreement.fill((0.92, 1.0));
             drafter.ngram_agreement = ngram_table(0.9, 20.0);
             // Halo's cheap rows pay for the long take; the R9700's dearer
             // rows leave the 0.9 source below the native window at every
@@ -13182,17 +13129,17 @@ mod tests {
     fn ngram_pricing_uses_request_measurements_after_probing_copy_lane() {
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_copy_lane(true);
         drafter.ngram_row_cost = Some((30.3, 14.8));
-        drafter.floor.ar_us = 30_000.0;
-        drafter.floor.batched[3] = (240_000.0, 2.0);
+        drafter.floor.seed_ar_us(30_000.0);
+        drafter.floor.seed_batched(3, (240_000.0, 2.0));
         assert!(drafter.floor.batched_cost(3).is_none());
         assert!(drafter.floor.takeover_cost(3).is_none());
-        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
+        drafter.floor.seed_probes_done();
         assert_eq!(drafter.floor.batched_cost(3), Some(4.0));
         assert_eq!(drafter.ngram_window_cost(3), 4.0);
         // A takeover with no measured takeover window is priced as the
         // native window of its row count.
         assert_eq!(drafter.takeover_cost(3), 4.0);
-        drafter.floor.external_depth[3] = (60_000.0, 2.0);
+        drafter.floor.seed_external_depth(3, (60_000.0, 2.0));
         assert_eq!(drafter.takeover_cost(3), 1.0);
         drafter.floor_enabled = false;
         assert!((drafter.takeover_cost(3) - 74.7 / 30.3).abs() < 1e-5);
@@ -13205,7 +13152,7 @@ mod tests {
     fn ngram_take_length_stops_where_the_chain_stops_paying() {
         let emitted = [0u32, 1];
         let mut drafter = armed_copy_drafter(1, 8);
-        drafter.agreement = [(0.9, 1.0); MTP_MAX_DEPTH];
+        drafter.agreement.fill((0.9, 1.0));
         // Depths 1-3 accept at 0.99, deeper ones at 0.3: the fourth row adds
         // 0.29 tokens for a 0.55 AR-step dearer window.
         let mut table = ngram_table(0.99, 20.0);
@@ -13251,10 +13198,9 @@ mod tests {
         // not the copy source, which must beat AR's 1.0 token per step.
         let mut drafter = armed_copy_drafter(1, 8);
         drafter.floor_enabled = true;
-        drafter.floor.calibrated = true;
-        drafter.floor.ar_us = 30_000.0;
-        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
-        drafter.floor.retired = true;
+        drafter.floor.seed_calibrated(30_000.0);
+        drafter.floor.seed_probes_done();
+        drafter.floor.seed_retired(true);
         // Retired and cold (no shadow observation has accepted a first
         // candidate yet): the pool proposes, the shadow state is set, and
         // nothing is taken.
@@ -13295,7 +13241,7 @@ mod tests {
         let plan = plan_of(&mut drafter, 2, Some("0"));
         assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
         assert_eq!(plan.k, 2);
-        assert!(!drafter.floor.calibrated && !drafter.floor.retired);
+        assert!(!drafter.floor.calibrated() && !drafter.floor.retired());
     }
 
     #[test]
@@ -13308,7 +13254,7 @@ mod tests {
         assert_eq!(
             plan.route,
             WindowRoute::Native {
-                depth: batched_depth(&drafter.agreement, 3)
+                depth: batched_depth(&drafter.agreement, 3, &MTP_WINDOW_COST)
             }
         );
         // Single card allocates nothing for the plan; EP attaches the copy.
@@ -13335,7 +13281,7 @@ mod tests {
 
     #[test]
     fn singleton_decay_is_long_on_gfx1151_only_and_reaches_the_request_floor_copy_lane() {
-        assert_eq!(MTP_AGREEMENT_DECAY, 0.875);
+        assert_eq!(DEFAULT_DECAY, 0.875);
         assert_eq!(MTP_AGREEMENT_DECAY_GFX1151, 0.97);
         assert_eq!(singleton_agreement_decay("gfx1151"), 0.97);
         for arch in [
@@ -13351,7 +13297,7 @@ mod tests {
         ] {
             assert_eq!(singleton_agreement_decay(arch), 0.875, "{arch}");
         }
-        assert_eq!(MtpFloor::new().decay, 0.875);
+        assert_eq!(Qwen4Floor::new(MTP_WINDOW_COST).diagnostics().decay, 0.875);
         // Binding an arch selects one decay for agreement and every floor
         // cost pair; configuring another request must preserve that choice.
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
@@ -13359,11 +13305,11 @@ mod tests {
         for arch in ["gfx1151", "gfx1201", "gfx1151", "gfx942"] {
             let decay = singleton_agreement_decay(arch);
             drafter.agreement_decay = decay;
-            drafter.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+            drafter.agreement.fill(AGREEMENT_PRIOR);
             MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
-            assert_eq!(drafter.floor.decay, decay, "{arch}");
+            assert_eq!(drafter.floor.diagnostics().decay, decay, "{arch}");
             drafter.observe_agreement(&window(0, 1));
-            let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
+            let (prior_accepted, prior_total) = AGREEMENT_PRIOR;
             assert_eq!(
                 drafter.agreement[0],
                 (prior_accepted * decay, prior_total * decay + 1.0),
@@ -13379,92 +13325,52 @@ mod tests {
                     combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
                 }
             }
-            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(drafter.floor.diagnostics().combined, combined);
             assert_eq!(
-                drafter.floor.interleaved,
+                drafter.floor.diagnostics().interleaved,
                 (40.0 * decay + 40.0, 2.0 * decay + 2.0)
             );
-            assert_eq!(drafter.floor.batched[1], (40.0 * decay + 40.0, decay + 1.0));
+            assert_eq!(
+                drafter.floor.diagnostics().batched[1],
+                (40.0 * decay + 40.0, decay + 1.0)
+            );
             for _ in 0..2 {
                 assert!(!drafter
                     .floor
                     .observe_external_copy(2, 40.0, 1, &drafter.agreement));
                 combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
             }
-            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(drafter.floor.diagnostics().combined, combined);
             assert_eq!(
-                drafter.floor.external,
+                drafter.floor.diagnostics().external,
                 (40.0 * decay + 40.0, 2.0 * decay + 2.0)
             );
-            drafter.floor.retired = true;
+            drafter.floor.seed_retired(true);
             drafter.ngram_agreement = ngram_table(0.9, 20.0);
             drafter.ngram_proposal = vec![1, 2, 3];
             drafter.ngram_proposed_at = Some(3);
-            let agreement = drafter.agreement;
+            let agreement = drafter.agreement.clone();
             MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
             assert_eq!(drafter.agreement_decay, decay);
-            assert_eq!(drafter.floor.decay, decay);
-            assert!(!drafter.floor.retired);
-            assert!(!drafter.floor.calibrated);
-            assert_eq!(drafter.floor.observed, 0);
-            assert_eq!(drafter.floor.combined, (0.0, 0.0));
-            assert_eq!(drafter.floor.external, (0.0, 0.0));
-            assert_eq!(drafter.floor.interleaved, (0.0, 0.0));
-            assert_eq!(drafter.floor.batched, [(0.0, 0.0); MTP_WINDOW_COST.len()]);
-            assert_eq!(drafter.ngram_agreement, [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS]);
+            assert_eq!(drafter.floor.diagnostics().decay, decay);
+            assert!(!drafter.floor.retired());
+            assert!(!drafter.floor.calibrated());
+            assert_eq!(drafter.floor.diagnostics().observed, 0);
+            assert_eq!(drafter.floor.diagnostics().combined, (0.0, 0.0));
+            assert_eq!(drafter.floor.diagnostics().external, (0.0, 0.0));
+            assert_eq!(drafter.floor.diagnostics().interleaved, (0.0, 0.0));
+            assert_eq!(
+                drafter.floor.diagnostics().batched,
+                [(0.0, 0.0); MTP_WINDOW_COST.len()]
+            );
+            assert!(drafter
+                .ngram_agreement
+                .iter()
+                .all(|&entry| entry == AGREEMENT_PRIOR));
             assert!(drafter.ngram_proposal.is_empty() && drafter.ngram_proposed_at.is_none());
             // Agreement restarts during prefill, not configure_request.
             assert_eq!(drafter.agreement, agreement);
         }
-    }
-
-    #[test]
-    fn floor_retirement_is_sticky_copy_lane() {
-        let bad = agreement(0.0, 2.0);
-        let good = agreement(1.8, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        batched_windows(&mut floor, &bad, 2, 90.0, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(floor.retired);
-        batched_windows(&mut floor, &good, 3, 5.0, 10);
-        // A good takeover does not stop the lane of a retired request.
-        assert!(!floor.observe_external_copy(8, 10.0, 8, &good));
-        floor.observe_calibration(1000.0, &good);
-        assert!(floor.retired);
-        assert_eq!(floor.route(&good, 7, 3), FloorRoute::Ar);
-    }
-
-    #[test]
-    fn floor_good_external_keeps_a_losing_native_route_alive_while_the_mixture_beats_ar_copy_lane()
-    {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        // 10 us per external token beats AR.
-        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
-        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
-        // One losing native window (90 us for one token) spends the budget;
-        // the realized mixture (~20.6 us per token) still beats AR.
-        floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
-        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
-        assert!(!floor.retired);
-        // The measured native route loses to AR, yet it keeps running while
-        // the mixture wins.
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
-        assert!(!floor.retired);
-        // Losing native windows drag the mixture up to AR; it then retires at
-        // the first window where the mixture stops beating AR, stickily.
-        let mut kept_alive = 0;
-        while !floor.retired {
-            assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
-            floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
-            kept_alive += 1;
-            assert!(kept_alive < 50, "never retired");
-        }
-        assert!(kept_alive > 0);
-        assert!(floor.combined.0 / floor.combined.1 >= 30.0);
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
-        assert!(floor.retired);
-        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
-        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
     }
 
     // ---- The n-gram copy lane (CPU: the real planner and take-length
@@ -13721,7 +13627,7 @@ mod tests {
             run.windows.push((start, kind));
             run.routes.push(plan.route);
             run.proposed.push(drafter.ngram_decision.is_some());
-            run.retired.push(drafter.floor.retired);
+            run.retired.push(drafter.floor.retired());
             run.costs.push((committed as f32, us));
             run.tokens += committed as f32;
             run.us += us;
@@ -13774,6 +13680,16 @@ mod tests {
             window_verify_rows(WindowRoute::Native { depth: 5 }, true, 2),
             6
         );
+    }
+
+    #[test]
+    fn admitted_cpu_storage_does_not_promote_unqualified_product_windows() {
+        let mut drafter = Qwen4MtpDrafter::new(63, 4096, None);
+        drafter.spec_rows_cap = 64;
+        drafter.derived_refresh_rows(4);
+        assert_eq!((drafter.k(), drafter.proposal_capacity()), (3, 3));
+        assert_eq!(drafter.agreement.len(), 3);
+        assert!(drafter.plan_window_with(&[1], 63, None, false).is_err());
     }
 
     #[test]
@@ -13986,11 +13902,12 @@ mod tests {
         let ratio = |(accepted, total): (f32, f32)| accepted / total;
         let fresh = |proposal: &[u32], at: usize| {
             let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+            drafter.ngram_agreement = vec![AGREEMENT_PRIOR; 4];
             drafter.ngram_proposal = proposal.to_vec();
             drafter.ngram_proposed_at = Some(at);
             drafter
         };
-        let prior = ratio(MTP_AGREEMENT_PRIOR);
+        let prior = ratio(AGREEMENT_PRIOR);
 
         // Proposal [a, b, c, d] against committed [a, b]: depths 1-2 accepted,
         // nothing compared beyond.
@@ -14001,15 +13918,15 @@ mod tests {
         for depth in 0..2 {
             let entry = drafter.ngram_agreement[depth];
             assert!(
-                entry.1 > MTP_AGREEMENT_PRIOR.1 + 0.5,
+                entry.1 > AGREEMENT_PRIOR.1 + 0.5,
                 "depth {depth}: {entry:?}"
             );
             assert!(ratio(entry) > prior, "depth {depth}: {entry:?}");
         }
-        for depth in 2..NGRAM_DEPTHS {
+        for depth in 2..drafter.ngram_agreement.len() {
             let entry = drafter.ngram_agreement[depth];
             assert!(
-                (entry.1 - MTP_AGREEMENT_PRIOR.1).abs() < 1e-4,
+                (entry.1 - AGREEMENT_PRIOR.1).abs() < 1e-4,
                 "depth {depth}: {entry:?}"
             );
         }
@@ -14019,22 +13936,25 @@ mod tests {
         let mut drafter = fresh(&[a, b, c, d], 1);
         drafter.observe_ngram_shadow(&[99, a, 77, 78]);
         let [first, second, third] = [0, 1, 2].map(|depth| drafter.ngram_agreement[depth]);
-        assert!(ratio(first) > prior && first.1 > MTP_AGREEMENT_PRIOR.1 + 0.5);
-        assert!(ratio(second) < prior && second.1 > MTP_AGREEMENT_PRIOR.1 + 0.5);
-        assert!((third.1 - MTP_AGREEMENT_PRIOR.1).abs() < 1e-4);
+        assert!(ratio(first) > prior && first.1 > AGREEMENT_PRIOR.1 + 0.5);
+        assert!(ratio(second) < prior && second.1 > AGREEMENT_PRIOR.1 + 0.5);
+        assert!((third.1 - AGREEMENT_PRIOR.1).abs() < 1e-4);
 
         // A proposal shorter than the committed tokens is censored at its own
         // length: all of it accepted, none of the bonus compared.
         let mut drafter = fresh(&[a, b], 1);
         drafter.observe_ngram_shadow(&[99, a, b, c, d]);
         assert!(ratio(drafter.ngram_agreement[1]) > prior);
-        assert!((drafter.ngram_agreement[2].1 - MTP_AGREEMENT_PRIOR.1).abs() < 1e-4);
+        assert!((drafter.ngram_agreement[2].1 - AGREEMENT_PRIOR.1).abs() < 1e-4);
 
         // No committed token yet: nothing is observed and the proposal stays.
         let mut drafter = fresh(&[a, b], 3);
         drafter.observe_ngram_shadow(&[99, a, b]);
         assert_eq!(drafter.ngram_proposed_at, Some(3));
-        assert_eq!(drafter.ngram_agreement, [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS]);
+        assert!(drafter
+            .ngram_agreement
+            .iter()
+            .all(|&entry| entry == AGREEMENT_PRIOR));
     }
 
     #[test]
@@ -14045,7 +13965,7 @@ mod tests {
         let mut floor = calibrated(ar, &good);
         // No price while the probe budget lasts.
         assert!(floor.takeover_cost(3).is_none());
-        batched_windows(&mut floor, &good, 3, 75_000.0, MTP_FLOOR_PROBE_WINDOWS);
+        batched_windows(&mut floor, &good, 3, 75_000.0, FLOOR_PROBE_WINDOWS);
         let row_us = floor.fit_line().expect("a priced native depth").2 as f32;
 
         // (c) No takeover measured: the native window cost at that row count,
@@ -14055,7 +13975,7 @@ mod tests {
             floor.takeover_cost(5).unwrap(),
             (75_000.0 + 2.0 * row_us) / ar
         ));
-        assert!(floor.batched.get(9).is_none());
+        assert!(floor.diagnostics().batched.get(9).is_none());
         assert!(close(
             floor.takeover_cost(9).unwrap(),
             (75_000.0 + 6.0 * row_us) / ar
@@ -14082,7 +14002,7 @@ mod tests {
         // An unusable timing (a drafter's first takeover of a row count)
         // records nothing: the neighbour still prices it.
         floor.observe_external_copy(6, f32::NAN, 5, &good);
-        assert_eq!(floor.external_depth[5], (0.0, 0.0));
+        assert_eq!(floor.diagnostics().external_depth[5], (0.0, 0.0));
         assert!(close(
             floor.takeover_cost(5).unwrap(),
             (90_000.0 - 2.0 * row_us) / ar
@@ -14092,7 +14012,7 @@ mod tests {
 
         // Equidistant measured depths: the one with more windows prices it.
         let mut floor = calibrated(ar, &good);
-        batched_windows(&mut floor, &good, 3, 75_000.0, MTP_FLOOR_PROBE_WINDOWS);
+        batched_windows(&mut floor, &good, 3, 75_000.0, FLOOR_PROBE_WINDOWS);
         let row_us = floor.fit_line().expect("a priced native depth").2 as f32;
         floor.observe_external_copy(3, 60_000.0, 2, &good);
         for _ in 0..3 {
@@ -14110,8 +14030,8 @@ mod tests {
         for _ in 0..3 {
             drafter.floor_observe_external_window(8, 90_000.0, 7);
         }
-        let decay = drafter.floor.decay;
-        let (sum, windows) = drafter.floor.external_depth[7];
+        let decay = drafter.floor.diagnostics().decay;
+        let (sum, windows) = drafter.floor.diagnostics().external_depth[7];
         assert!((windows - (1.0 + decay)).abs() < 1e-5, "{windows}");
         assert!((sum - 90_000.0 * (1.0 + decay)).abs() < 1.0, "{sum}");
         assert_eq!(drafter.ngram_warm_depths, 1 << 7);
@@ -14255,10 +14175,9 @@ mod tests {
         // A retired request's takeovers that cost at least AR per token
         // disarm the lane (the first of a row count is observed unpriced).
         let mut drafter = copy_drafter(&prompt, true);
-        drafter.floor.calibrated = true;
-        drafter.floor.ar_us = HALO_AR_US;
-        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
-        drafter.floor.retired = true;
+        drafter.floor.seed_calibrated(HALO_AR_US);
+        drafter.floor.seed_probes_done();
+        drafter.floor.seed_retired(true);
         let wasted = MtpWindow {
             committed: vec![0],
             accepted: 0,
@@ -14270,35 +14189,9 @@ mod tests {
             "an unpriced takeover cannot block the lane"
         );
         drafter.finish_takeover(&wasted, halo_takeover_us(4));
-        assert!(!drafter.ngram_active && drafter.floor.retired);
+        assert!(!drafter.ngram_active && drafter.floor.retired());
         assert_eq!(drafter.request_stats().ngram_mod_windows, 2);
         assert!(drafter.request_stats().mtp_retired);
-    }
-
-    #[test]
-    fn floor_retired_keeps_pricing_external_windows_and_stops_only_when_they_lose() {
-        let bad = agreement(0.0, 2.0);
-        let mut floor = calibrated(30.0, &bad);
-        batched_windows(&mut floor, &bad, 1, 90.0, 2);
-        // Native loses by prediction: the third window retires the request.
-        batched_windows(&mut floor, &bad, 1, 90.0, 20);
-        assert!(floor.retired);
-        let (probes, observed) = (floor.probes, floor.observed);
-        // Takeovers beating AR (10 us per token against 30) are priced and do
-        // not stop the lane, the retirement and the routing stay.
-        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
-        assert!(floor.retired && floor.external.1 > 0.0 && floor.external_depth[4].1 > 0.0);
-        assert_eq!((floor.probes, floor.observed), (probes, observed));
-        assert_eq!(floor.route(&bad, 3, 3), FloorRoute::Ar);
-        // Takeovers losing to AR block the lane.
-        let mut stopped = false;
-        for _ in 0..30 {
-            if floor.observe_external_copy(1, 200.0, 4, &bad) {
-                stopped = true;
-                break;
-            }
-        }
-        assert!(stopped && floor.retired && floor.external_blocked);
     }
 
     /// A request that arms the n-gram source.
@@ -14451,7 +14344,7 @@ mod tests {
                 run.us += f64::from(us);
             }
         }
-        run.retired = drafter.floor.retired;
+        run.retired = drafter.floor.retired();
         run
     }
 
@@ -14474,8 +14367,8 @@ mod tests {
                 assert_eq!(plan.route, WindowRoute::ArCalibrate, "request {request}");
                 drafter.floor_observe_ar(us);
             }
-            assert!(drafter.floor.calibrated, "request {request}");
-            assert_eq!(drafter.floor.ar_us, ar_tokens[ar_tokens.len() - 1]);
+            assert!(drafter.floor.calibrated(), "request {request}");
+            assert_eq!(drafter.floor.ar_us(), ar_tokens[ar_tokens.len() - 1]);
             let plan = drafter
                 .plan_window_with(&[0], 3, None, false)
                 .expect("plan");
@@ -14521,7 +14414,7 @@ mod tests {
 
     /// The Halo ags depth collapse and its root fix.  Priced from an
     /// inflated first decode token (4.7 AR tokens), the cost fit's prior row
-    /// ([`MTP_ROW_COST_PRIOR`] AR steps) is several real rows: native
+    /// (the floor's row-cost prior, 0.27 AR steps) is several real rows: native
     /// acceptance dips to 0.45 for 200 windows (the copy lane takes the
     /// confident spans and leaves the native windows the rest) and
     /// recovers to 0.72, and the floor keeps one draft after the recovery
@@ -14559,4 +14452,1336 @@ mod tests {
             );
         }
     }
+
+    thread_local! {
+        static FLOOR_CALL_LINES: std::cell::RefCell<Vec<String>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+
+    fn capture_floor_call(line: &str) {
+        FLOOR_CALL_LINES.with(|lines| lines.borrow_mut().push(line.to_string()));
+    }
+
+    /// `lines` replayed on the qwen4 route's floor: its window-cost table and
+    /// its takeover slots.
+    fn replay_qwen4_floor_log<'a>(lines: impl Iterator<Item = &'a str>) -> ReplayReport {
+        replay_call_log::<{ MTP_WINDOW_COST.len() }, { NGRAM_DEPTHS + 1 }>(
+            lines,
+            FLOOR_CALL_PREFIX,
+            MTP_WINDOW_COST,
+        )
+    }
+
+    /// A singleton-configured qwen4 floor driven the way the drafter drives it
+    /// (calibration and AR probes, batched and interleaved windows, takeover
+    /// windows, a decay rebind and a re-arm, a terrible stretch that pushes it
+    /// toward retirement) with its exact call log captured.
+    #[test]
+    fn floor_call_log_replays_a_scripted_qwen4_floor_bit_identically() {
+        FLOOR_CALL_LINES.with(|lines| lines.borrow_mut().clear());
+        let decay = MTP_AGREEMENT_DECAY_GFX1151;
+        let mut agreement = fresh_agreement();
+        let mut floor =
+            Qwen4Floor::with_retire_after(MTP_WINDOW_COST, MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+                .with_decay(decay)
+                .with_retire_evidence(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS)
+                .with_call_log_to(FLOOR_CALL_PREFIX, "test", true, capture_floor_call);
+        let mut state = 0x2545_f491u32;
+        let mut draw = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for step in 0..160usize {
+            // From step 80 every window costs far more than AR.
+            let slow = if step >= 80 { 6.0 } else { 1.0 };
+            if floor.needs_ar_sample() {
+                floor.observe_calibration(28_000.0 + (draw() % 4_000) as f32, &agreement);
+                continue;
+            }
+            let provisional = floor.provisional_depth(&agreement, 7);
+            match floor.route(&agreement, 7, provisional) {
+                Action::ArHeadFree => {
+                    floor.observe_external_copy(3, 60_000.0, 3, &agreement);
+                }
+                Action::ArSynced => {}
+                Action::Interleaved => {
+                    let accepted = (draw() % 2) as usize;
+                    let w = window(accepted, 1);
+                    observe_agreement(&mut agreement, &w, decay);
+                    let us = slow * 30_000.0 * (accepted + 1) as f32;
+                    floor.observe_native(NativeWindow::Interleaved, &w, us, 7, &agreement);
+                }
+                Action::Native(depth) => {
+                    let accepted = (draw() % (depth as u32 + 1)) as usize;
+                    let w = window(accepted, depth);
+                    observe_agreement(&mut agreement, &w, decay);
+                    let us = slow * (35_000.0 + 8_000.0 * depth as f32 + (draw() % 3_000) as f32);
+                    floor.observe_native(NativeWindow::Batched, &w, us, 7, &agreement);
+                }
+            }
+            if step % 11 == 0 {
+                floor.observe_external(2, slow * 70_000.0, 3, &agreement);
+            }
+            if step % 13 == 0 {
+                let drafts = 1 + (draw() % 7) as usize;
+                floor.observe_external_copy(drafts, slow * 50_000.0, drafts, &agreement);
+            }
+            if step == 60 {
+                floor.set_decay(DEFAULT_DECAY);
+            }
+            if step == 120 {
+                floor.rearm();
+                agreement = fresh_agreement();
+            }
+        }
+        let lines = FLOOR_CALL_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+        assert!(lines[0].contains("\"op\":\"install\""), "{}", lines[0]);
+        assert!(lines.iter().any(|line| line.contains("\"op\":\"route\"")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"op\":\"observe_native\"")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"op\":\"observe_external_copy\"")));
+        let report = replay_qwen4_floor_log(lines.iter().map(String::as_str));
+        assert_eq!(report.malformed, 0, "{:?}", report.first_malformed);
+        assert_eq!(report.orphan_calls, 0);
+        assert_eq!(report.floors.len(), 1);
+        assert!(report.calls() > 0);
+        assert_eq!(report.calls(), lines.len() - 1);
+        assert_eq!(
+            report.mismatches(),
+            0,
+            "{:?}",
+            report.floors[0].first_mismatch
+        );
+    }
+
+    // ---- Derived K (HIPFIRE_QWEN4_MTP_DERIVED_K) --------------------------
+
+    fn derived_counts_narrow(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        depth: u8,
+        _: DerivedFeature,
+    ) -> Option<CalibrationCounts> {
+        Some(CalibrationCounts {
+            depth_s: if depth == 1 { 10_000 } else { 0 },
+            depth_n: 10_000,
+            cell_s: 0,
+            cell_n: 0,
+        })
+    }
+
+    fn derived_counts_dead(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: u8,
+        _: DerivedFeature,
+    ) -> Option<CalibrationCounts> {
+        Some(CalibrationCounts {
+            depth_s: 0,
+            depth_n: 10_000,
+            cell_s: 0,
+            cell_n: 0,
+        })
+    }
+
+    fn derived_window_price(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: ContextBucket,
+        k: u8,
+        _: bool,
+    ) -> Option<(f64, bool)> {
+        Some((30_000.0 + 2_000.0 * f64::from(k), false))
+    }
+
+    fn derived_window_price_missing(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: ContextBucket,
+        _: u8,
+        _: bool,
+    ) -> Option<(f64, bool)> {
+        None
+    }
+
+    /// Only the OffPool profile is measured; OnCopy has no price at all.
+    fn derived_window_price_off_only(
+        _: DerivedCard,
+        mode: DerivedCostMode,
+        _: DerivedSource,
+        _: ContextBucket,
+        k: u8,
+        _: bool,
+    ) -> Option<(f64, bool)> {
+        (mode == DerivedCostMode::OffPool).then(|| (30_000.0 + 2_000.0 * f64::from(k), false))
+    }
+
+    /// Two measured profiles that disagree: a steep per-row price off the
+    /// copy route, a nearly flat one on it.
+    fn derived_window_price_by_mode(
+        _: DerivedCard,
+        mode: DerivedCostMode,
+        _: DerivedSource,
+        _: ContextBucket,
+        k: u8,
+        _: bool,
+    ) -> Option<(f64, bool)> {
+        let per_row = match mode {
+            DerivedCostMode::OffPool => 8_000.0,
+            DerivedCostMode::OnCopy => 100.0,
+        };
+        Some((30_000.0 + per_row * f64::from(k), false))
+    }
+
+    /// A non-monotone curve (widths 1..=3 only): the adjacent step 1 -> 2
+    /// loses rate but width 3 wins globally.
+    fn derived_window_price_nonmonotone(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: ContextBucket,
+        k: u8,
+        _: bool,
+    ) -> Option<(f64, bool)> {
+        match k {
+            1 => Some((30_000.0, false)),
+            2 => Some((45_000.0, false)),
+            3 => Some((40_000.0, false)),
+            _ => None,
+        }
+    }
+
+    fn derived_ar_price(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: ContextBucket,
+    ) -> Option<(f64, bool)> {
+        Some((25_000.0, false))
+    }
+
+    fn derived_ar_price_missing(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: ContextBucket,
+    ) -> Option<(f64, bool)> {
+        None
+    }
+
+    /// Every depth near-certain (acceptance ~1.0).
+    fn derived_counts_certain(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: u8,
+        _: DerivedFeature,
+    ) -> Option<CalibrationCounts> {
+        Some(CalibrationCounts {
+            depth_s: 10_000,
+            depth_n: 10_000,
+            cell_s: 0,
+            cell_n: 0,
+        })
+    }
+
+    /// Every depth conditionally accepted at 0.5.
+    fn derived_counts_half(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: u8,
+        _: DerivedFeature,
+    ) -> Option<CalibrationCounts> {
+        Some(CalibrationCounts {
+            depth_s: 5_000,
+            depth_n: 10_000,
+            cell_s: 0,
+            cell_n: 0,
+        })
+    }
+
+    /// Every depth conditionally accepted at 0.8.
+    fn derived_counts_eighty(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: u8,
+        _: DerivedFeature,
+    ) -> Option<CalibrationCounts> {
+        Some(CalibrationCounts {
+            depth_s: 8_000,
+            depth_n: 10_000,
+            cell_s: 0,
+            cell_n: 0,
+        })
+    }
+
+    /// Depth 1 near-certain, deeper depths never accepted: the narrowest
+    /// prefix (K=1) beats AR and every wider prefix.
+    const DERIVED_NARROW: DerivedTables = DerivedTables {
+        counts: derived_counts_narrow,
+        window_price: derived_window_price,
+        ar_price: derived_ar_price,
+    };
+    /// Nothing is ever accepted: AR beats every priced prefix.
+    const DERIVED_DEAD: DerivedTables = DerivedTables {
+        counts: derived_counts_dead,
+        window_price: derived_window_price,
+        ar_price: derived_ar_price,
+    };
+    /// AR is priced but no drafted width is.
+    const DERIVED_UNPRICED: DerivedTables = DerivedTables {
+        counts: derived_counts_dead,
+        window_price: derived_window_price_missing,
+        ar_price: derived_ar_price,
+    };
+    /// Every depth near-certain and rows cheap: the widest legal prefix wins.
+    const DERIVED_CERTAIN: DerivedTables = DerivedTables {
+        counts: derived_counts_certain,
+        window_price: derived_window_price,
+        ar_price: derived_ar_price,
+    };
+    /// Measured OffPool prices only.
+    const DERIVED_OFF_ONLY: DerivedTables = DerivedTables {
+        counts: derived_counts_certain,
+        window_price: derived_window_price_off_only,
+        ar_price: derived_ar_price,
+    };
+    /// Different measured profiles per cost mode.
+    const DERIVED_BY_MODE: DerivedTables = DerivedTables {
+        counts: derived_counts_half,
+        window_price: derived_window_price_by_mode,
+        ar_price: derived_ar_price,
+    };
+    /// A non-monotone window curve at acceptance 0.8, no AR price.
+    const DERIVED_NONMONOTONE: DerivedTables = DerivedTables {
+        counts: derived_counts_eighty,
+        window_price: derived_window_price_nonmonotone,
+        ar_price: derived_ar_price_missing,
+    };
+
+    fn derived_test_identity(arch: &str) -> DerivedIdentity<'_> {
+        DerivedIdentity {
+            arch,
+            flash_next: true,
+            packed_recipe: true,
+            mtp_head: true,
+            full_experts: true,
+            ple: DerivedPle::Q8Sidecar,
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: crate::GdnStateFormat::Q8,
+            singleton: true,
+        }
+    }
+
+    fn derived_test_floor() -> Qwen4Floor {
+        Qwen4Floor::with_retire_after(MTP_WINDOW_COST, MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+            .with_decay(DEFAULT_DECAY)
+            .with_retire_evidence(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS)
+            .with_call_log_to(FLOOR_CALL_PREFIX, "test", true, capture_floor_call)
+    }
+
+    /// A calibrated drafter whose floor call log is captured: its first plan
+    /// routes `Native { depth: batched_depth(prior, 3) }`.
+    fn derived_floor_drafter() -> Qwen4MtpDrafter {
+        FLOOR_CALL_LINES.with(|lines| lines.borrow_mut().clear());
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_explicit_mtp_k_override(Some(3));
+        drafter.floor = derived_test_floor();
+        drafter.floor.seed_calibrated(30_000.0);
+        drafter
+    }
+
+    fn derived_test_cfg(temp: f32) -> SpecRequestConfig {
+        SpecRequestConfig {
+            temp,
+            ..SpecRequestConfig::default()
+        }
+    }
+
+    /// Flag on, greedy, bound eligible on the R9700 identity, position set as
+    /// `mtp_step` carries it.
+    fn derived_bind_test(drafter: &mut Qwen4MtpDrafter, tables: DerivedTables) {
+        drafter.derived_configure(&derived_test_cfg(0.0), true);
+        drafter.derived_bind(
+            derived_eligibility(&derived_test_identity("gfx1201")),
+            tables,
+        );
+        drafter.derived_position = Some(1500);
+    }
+
+    fn derived_drafter(tables: DerivedTables) -> Qwen4MtpDrafter {
+        let mut drafter = derived_floor_drafter();
+        derived_bind_test(&mut drafter, tables);
+        drafter
+    }
+
+    fn derived_state(drafter: &Qwen4MtpDrafter) -> &DerivedState {
+        match &drafter.derived {
+            Some(DerivedPhase::Bound(state)) => state,
+            _ => panic!("derived state is not bound"),
+        }
+    }
+
+    fn derived_incumbent_depth(plan: &WindowPlan) -> usize {
+        match plan.route {
+            WindowRoute::Native { depth } => depth,
+            other => panic!("expected a native route, got {other:?}"),
+        }
+    }
+
+    /// The scripted plan sequence of a drafter and its captured Floor calls,
+    /// with the process-global `seq` and `floor` identifiers stripped (they
+    /// count every floor and call in the test binary, across threads); every
+    /// other byte of each call line is compared.
+    fn derived_scripted_plans(mut drafter: Qwen4MtpDrafter) -> (Vec<WindowPlan>, Vec<String>) {
+        let plans: Vec<WindowPlan> = (0..12).map(|_| plan_of(&mut drafter, 3, None)).collect();
+        let lines = FLOOR_CALL_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+        let lines = lines
+            .into_iter()
+            .map(|line| {
+                let op = line
+                    .find("\"op\":")
+                    .unwrap_or_else(|| panic!("floor call line without an op: {line}"));
+                let head = line
+                    .find('{')
+                    .unwrap_or_else(|| panic!("floor call line without a body: {line}"));
+                format!("{}{}", &line[..=head], &line[op..])
+            })
+            .collect();
+        (plans, lines)
+    }
+
+    #[test]
+    fn derived_k_off_keeps_the_floor_calls_and_plans_byte_identical() {
+        let mut unset = derived_floor_drafter();
+        // A position carried by a caller is inert while the state is absent.
+        unset.derived_position = Some(1500);
+        let (unset_plans, unset_lines) = derived_scripted_plans(unset);
+        let mut zero = derived_floor_drafter();
+        zero.derived_configure(&derived_test_cfg(0.0), false);
+        zero.derived_position = Some(1500);
+        assert!(zero.derived.is_none());
+        let (zero_plans, zero_lines) = derived_scripted_plans(zero);
+        assert!(unset_lines
+            .iter()
+            .any(|line| line.contains("\"op\":\"route\"")));
+        assert_eq!(unset_plans, zero_plans);
+        assert_eq!(unset_lines, zero_lines);
+
+        // Enabled but sampled: no state is created and nothing changes.
+        for temp in [0.8f32, f32::NAN] {
+            let mut sampled = derived_floor_drafter();
+            sampled.derived_configure(&derived_test_cfg(temp), true);
+            sampled.derived_bind(Ok(DerivedCard::R9700), DERIVED_NARROW);
+            sampled.derived_position = Some(1500);
+            assert!(sampled.derived.is_none(), "temp={temp}");
+            let (plans, lines) = derived_scripted_plans(sampled);
+            assert_eq!(plans, unset_plans, "temp={temp}");
+            assert_eq!(lines, unset_lines, "temp={temp}");
+        }
+    }
+
+    #[test]
+    fn derived_k_ineligible_identity_names_its_reason_and_retains_the_incumbent() {
+        assert_eq!(
+            derived_eligibility(&derived_test_identity("gfx1100")),
+            Err("unsupported_arch")
+        );
+        assert_eq!(
+            derived_eligibility(&derived_test_identity("gfx1201")),
+            Ok(DerivedCard::R9700)
+        );
+        let halo = DerivedIdentity {
+            ple: DerivedPle::Q4Sidecar,
+            qsa: crate::QsaKvFormat::Q8,
+            gdn: crate::GdnStateFormat::F32,
+            ..derived_test_identity("gfx1151")
+        };
+        assert_eq!(derived_eligibility(&halo), Ok(DerivedCard::Halo));
+        // Each card keeps only its own calibrated state class.
+        assert_eq!(
+            derived_eligibility(&DerivedIdentity {
+                ple: DerivedPle::Q4Sidecar,
+                ..derived_test_identity("gfx1201")
+            }),
+            Err("ple_class")
+        );
+        let q4 = DerivedIdentity {
+            ple: DerivedPle::Q4Sidecar,
+            ..derived_test_identity("gfx1201")
+        };
+        // The production helper requires the exact nonempty qualified book
+        // descriptor. Empty shipping books cannot turn Q4 into the Q8 receipt.
+        let profile = "sealed-qualified-q4-profile";
+        assert_eq!(
+            derived_measured_eligibility(&q4, Some(profile), |_| Some(profile)),
+            Ok(DerivedCard::R9700)
+        );
+        for (cached, admitted) in [
+            (None, None),
+            (Some(profile), None),
+            (None, Some(profile)),
+            (Some(profile), Some("different-state-or-placement")),
+        ] {
+            assert!(derived_measured_eligibility(&q4, cached, |_| admitted).is_err());
+        }
+        assert_eq!(
+            derived_measured_eligibility(
+                &DerivedIdentity {
+                    singleton: false,
+                    ..q4
+                },
+                Some(profile),
+                |_| Some(profile),
+            ),
+            Err("not_singleton")
+        );
+        assert_eq!(
+            derived_eligibility(&DerivedIdentity {
+                gdn: crate::GdnStateFormat::F32,
+                ..derived_test_identity("gfx1201")
+            }),
+            Err("state_format")
+        );
+        assert_eq!(
+            derived_eligibility(&DerivedIdentity {
+                qsa: crate::QsaKvFormat::Fp8,
+                ..halo
+            }),
+            Err("state_format")
+        );
+        assert_eq!(
+            derived_eligibility(&DerivedIdentity {
+                singleton: false,
+                ..derived_test_identity("gfx1201")
+            }),
+            Err("not_singleton")
+        );
+        assert_eq!(
+            derived_eligibility(&DerivedIdentity {
+                packed_recipe: false,
+                ..derived_test_identity("gfx1201")
+            }),
+            Err("recipe")
+        );
+
+        let (base_plans, base_lines) = derived_scripted_plans(derived_floor_drafter());
+        let mut drafter = derived_floor_drafter();
+        drafter.derived_configure(&derived_test_cfg(0.0), true);
+        assert!(matches!(drafter.derived, Some(DerivedPhase::Unbound)));
+        // Unbound: the window consults nothing.
+        drafter.derived_position = Some(1500);
+        let (plans, lines) = derived_scripted_plans(drafter);
+        assert_eq!((plans, lines), (base_plans.clone(), base_lines.clone()));
+
+        let mut drafter = derived_floor_drafter();
+        drafter.derived_configure(&derived_test_cfg(0.0), true);
+        drafter.derived_bind(
+            derived_eligibility(&derived_test_identity("gfx1100")),
+            DERIVED_NARROW,
+        );
+        assert!(matches!(drafter.derived, Some(DerivedPhase::Ineligible)));
+        drafter.derived_position = Some(1500);
+        let (plans, lines) = derived_scripted_plans(drafter);
+        assert_eq!((plans, lines), (base_plans, base_lines));
+    }
+
+    #[test]
+    fn derived_k_chooses_the_objective_width_and_observes_each_consulted_window_once() {
+        let (base_plans, _) = derived_scripted_plans(derived_floor_drafter());
+        let incumbent = derived_incumbent_depth(&base_plans[0]);
+        assert!(incumbent >= 2, "incumbent depth {incumbent}");
+
+        let mut drafter = derived_drafter(DERIVED_NARROW);
+        let plan = plan_of(&mut drafter, 3, None);
+        // The draft loop may run to the widest measured legal prefix (here
+        // the head's K = 3); the objective's width (1) is where it stops.
+        assert_eq!(plan.route, WindowRoute::Native { depth: 3 });
+        assert!(!plan.ngram_hit);
+        assert!(drafter.derived_loop_active());
+        {
+            let state = derived_state(&drafter);
+            assert_eq!(state.consults, 1);
+            assert_eq!(state.observes, 0);
+            let pending = state.pending.expect("a consulted window holds its pending");
+            assert_eq!(pending.source, DerivedSource::Mtp);
+            assert_eq!(pending.mode, DerivedCostMode::OffPool);
+            assert_eq!(usize::from(pending.incumbent), incumbent);
+            assert_eq!(pending.chosen, Some(1));
+            assert_eq!((pending.hi, pending.legal), (3, 3));
+            assert_eq!(pending.caller_k, 3);
+            assert_eq!(pending.position, 1500);
+            assert_eq!(state.keys.len(), 3);
+            assert!(state.keys.iter().enumerate().all(|(index, key)| {
+                key.source == DerivedSource::Mtp
+                    && usize::from(key.depth) == index + 1
+                    && key.feature == DerivedFeature::Native
+            }));
+            let priced: Vec<u8> = state.prices.iter().map(|price| price.k).collect();
+            assert_eq!(priced, vec![0, 1, 2, 3]);
+        }
+        // After the first drafted row the re-solve over `k >= 1` stops there.
+        assert!(!drafter.derived_resolve(1));
+        assert_eq!(derived_state(&drafter).resolves, 1);
+        let window = MtpWindow {
+            committed: vec![5, 6],
+            accepted: 1,
+            drafts_generated: 1,
+        };
+        drafter.derived_observe(&plan, 99, &Ok(window));
+        {
+            let state = derived_state(&drafter);
+            assert_eq!(state.observes, 1);
+            assert!(state.pending.is_none());
+            assert_eq!(state.request.last_first(DerivedSource::Mtp), Some(true));
+        }
+        // Without a new consult nothing is observed again.
+        assert!(!drafter.derived_pending_open());
+        drafter.derived_observe(
+            &plan,
+            99,
+            &Ok(MtpWindow {
+                committed: vec![5],
+                accepted: 0,
+                drafts_generated: 1,
+            }),
+        );
+        let state = derived_state(&drafter);
+        assert_eq!(state.observes, 1);
+        assert_eq!(state.request.last_first(DerivedSource::Mtp), Some(true));
+    }
+
+    /// A bound, calibrated drafter of head K `max_k` whose bundle reported
+    /// `rows` qualified row-exact verify rows.
+    fn derived_wide_drafter(max_k: usize, rows: usize, tables: DerivedTables) -> Qwen4MtpDrafter {
+        FLOOR_CALL_LINES.with(|lines| lines.borrow_mut().clear());
+        let mut drafter =
+            Qwen4MtpDrafter::new(max_k, 4096, None).with_explicit_mtp_k_override(Some(max_k));
+        drafter.floor = derived_test_floor();
+        drafter.floor.seed_calibrated(30_000.0);
+        derived_bind_test(&mut drafter, tables);
+        drafter.derived_refresh_rows(rows);
+        drafter
+    }
+
+    fn derived_pending(drafter: &Qwen4MtpDrafter) -> DerivedPending {
+        derived_state(drafter)
+            .pending
+            .expect("a consulted window holds its pending")
+    }
+
+    /// Synthetic CPU evidence only: neither success nor rejection is certain.
+    fn derived_uncertain_counts<const BOUNDARY: u8>(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        depth: u8,
+        _: DerivedFeature,
+    ) -> Option<CalibrationCounts> {
+        Some(CalibrationCounts {
+            depth_s: if depth <= BOUNDARY { 19_600 } else { 200 },
+            depth_n: 20_000,
+            cell_s: 0,
+            cell_n: 0,
+        })
+    }
+
+    fn derived_uncertain_cost(
+        _: DerivedCard,
+        _: DerivedCostMode,
+        _: DerivedSource,
+        _: ContextBucket,
+        k: u8,
+        _: bool,
+    ) -> Option<(f64, bool)> {
+        Some((30_000.0 + 100.0 * f64::from(k), false))
+    }
+
+    fn assert_uncertain_boundary<const BOUNDARY: u8>() {
+        let tables = DerivedTables {
+            counts: derived_uncertain_counts::<BOUNDARY>,
+            window_price: derived_uncertain_cost,
+            ar_price: derived_ar_price,
+        };
+        // Independent exhaustive finite-cost reference: directly integrate the
+        // posterior survival chain, without invoking the runtime objective.
+        let reference = |cap: usize| {
+            let (mut survival, mut emitted) = (1.0, 1.0);
+            let mut best = (0usize, 1.0 / 25_000.0);
+            for k in 1..=cap {
+                let successes = if k <= usize::from(BOUNDARY) {
+                    19_600.0
+                } else {
+                    200.0
+                };
+                survival *= (successes + 1.6) / 20_002.0;
+                emitted += survival;
+                let rate = emitted / (30_000.0 + 100.0 * k as f64);
+                if rate > best.1 {
+                    best = (k, rate);
+                }
+            }
+            best.0
+        };
+        assert_eq!(reference(63), usize::from(BOUNDARY));
+        for (rows, explicit, budget) in [(64, 63, 63), (33, 63, 32), (64, 16, 16), (64, 63, 11)] {
+            let mut drafter = derived_wide_drafter(63, rows, tables);
+            drafter.explicit_mtp_k = Some(explicit);
+            drafter.refresh_chooser_capacity();
+            let cap = (rows - 1).min(explicit).min(budget);
+            let storage = (drafter.agreement.as_ptr(), drafter.agreement.capacity());
+            let plan = plan_of(&mut drafter, budget, None);
+            let optimum = reference(cap);
+            assert_eq!(derived_pending(&drafter).chosen, Some(optimum as u8));
+            assert!(optimum <= cap);
+            for drafted in 1..optimum {
+                assert!(drafter.derived_resolve(drafted));
+            }
+            assert!(!drafter.derived_resolve(optimum));
+            assert_eq!(
+                storage,
+                (drafter.agreement.as_ptr(), drafter.agreement.capacity())
+            );
+            assert_eq!(plan.route, WindowRoute::Native { depth: cap });
+        }
+    }
+
+    #[test]
+    fn native_agreement_tracks_admitted_capacity_and_observes_depth_sixty_three() {
+        let mut drafter = Qwen4MtpDrafter::new(63, 4096, None);
+        drafter.derived_refresh_rows(64);
+        assert_eq!(drafter.k(), 63);
+        assert_eq!(drafter.agreement.len(), 63);
+        drafter.observe_agreement(&window(63, 63));
+        assert!(drafter.agreement[62].0 > AGREEMENT_PRIOR.0);
+        let storage = (drafter.agreement.as_ptr(), drafter.agreement.capacity());
+        drafter.refresh_chooser_capacity();
+        assert_eq!(
+            storage,
+            (drafter.agreement.as_ptr(), drafter.agreement.capacity())
+        );
+        drafter.explicit_mtp_k = Some(16);
+        drafter.refresh_chooser_capacity();
+        assert_eq!((drafter.k(), drafter.agreement.len()), (16, 16));
+        drafter.spec_rows_cap = 4;
+        drafter.refresh_chooser_capacity();
+        assert_eq!((drafter.k(), drafter.agreement.len()), (3, 3));
+        assert_eq!(
+            storage,
+            (drafter.agreement.as_ptr(), drafter.agreement.capacity())
+        );
+        drafter.explicit_mtp_k = Some(0);
+        drafter.refresh_chooser_capacity();
+        assert_eq!((drafter.k(), drafter.agreement.len()), (0, 0));
+    }
+
+    #[test]
+    fn derived_k_uncertain_boundaries_beyond_ten_match_finite_reference() {
+        assert_uncertain_boundary::<16>();
+        assert_uncertain_boundary::<32>();
+        assert_uncertain_boundary::<63>();
+    }
+
+    #[test]
+    fn derived_k_wide_capacity_without_prices_or_qualification_never_promotes() {
+        let mut unpriced = derived_wide_drafter(63, 64, DERIVED_UNPRICED);
+        let _ = plan_of(&mut unpriced, 63, None);
+        assert!(derived_state(&unpriced).pending.is_none());
+        assert_eq!(derived_state(&unpriced).consults, 0);
+        let mut unqualified = derived_wide_drafter(63, 8, DERIVED_CERTAIN);
+        let _ = plan_of(&mut unqualified, 7, None);
+        assert_eq!(derived_pending(&unqualified).chosen, Some(7));
+        assert!(unqualified.plan_window_with(&[1], 63, None, false).is_err());
+    }
+
+    #[test]
+    fn derived_k_widens_beyond_the_incumbent_up_to_the_legal_cap() {
+        let mut plain = Qwen4MtpDrafter::new(7, 4096, None);
+        plain.floor = derived_test_floor();
+        plain.floor.seed_calibrated(30_000.0);
+        let incumbent = derived_incumbent_depth(&plan_of(&mut plain, 7, None));
+        assert!(incumbent < 7, "incumbent depth {incumbent}");
+
+        let mut drafter = derived_wide_drafter(7, 8, DERIVED_CERTAIN);
+        let plan = plan_of(&mut drafter, 7, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 7 });
+        assert!(plan.k >= 7);
+        let pending = derived_pending(&drafter);
+        assert_eq!(pending.chosen, Some(7));
+        assert_eq!(usize::from(pending.incumbent), incumbent);
+        assert_eq!((pending.hi, pending.legal, pending.caller_k), (7, 7, 7));
+        // The stationary re-solve keeps extending to the objective's width.
+        for drafted in 1..7 {
+            assert!(drafter.derived_resolve(drafted), "drafted {drafted}");
+        }
+        assert!(!drafter.derived_resolve(7));
+    }
+
+    #[test]
+    fn derived_k_legal_cap_is_the_qualified_rows_the_physical_rows_and_the_explicit_k() {
+        // Qualified rows 5 (4 drafts), whatever the head's K.
+        let mut drafter = derived_wide_drafter(7, 5, DERIVED_CERTAIN);
+        assert_eq!((drafter.k(), drafter.proposal_capacity()), (4, 4));
+        let plan = plan_of(&mut drafter, 4, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 4 });
+        assert_eq!(derived_pending(&drafter).chosen, Some(4));
+        assert_eq!(derived_pending(&drafter).legal, 4);
+        // The physical rows (a CPU splice window) bind it below the qualified ones.
+        let mut drafter = derived_wide_drafter(7, 8, DERIVED_CERTAIN);
+        drafter.spec_rows_cap = 3;
+        assert_eq!(drafter.k(), 2);
+        let _ = plan_of(&mut drafter, 2, None);
+        assert_eq!(derived_pending(&drafter).chosen, Some(2));
+        // An explicit K below the qualified rows is the cap, not the old 3.
+        let mut drafter = derived_wide_drafter(2, 8, DERIVED_CERTAIN);
+        assert_eq!(drafter.k(), 2);
+        let _ = plan_of(&mut drafter, 2, None);
+        assert_eq!(derived_pending(&drafter).chosen, Some(2));
+        let mut drafter = derived_wide_drafter(5, 8, DERIVED_CERTAIN);
+        let _ = plan_of(&mut drafter, 5, None);
+        assert_eq!(derived_pending(&drafter).chosen, Some(5));
+        // An unqualified default never exceeds the qualified rows (8 today),
+        // even with a huge explicit K and a physical capacity of 64.
+        let mut drafter = derived_wide_drafter(63, 8, DERIVED_CERTAIN);
+        drafter.spec_rows_cap = 64;
+        assert_eq!(drafter.k(), 7);
+        let _ = plan_of(&mut drafter, 7, None);
+        assert_eq!(derived_pending(&drafter).chosen, Some(7));
+        assert_eq!(derived_pending(&drafter).legal, 7);
+        // A caller budget below the cap (the remaining tokens) binds too.
+        let mut drafter = derived_wide_drafter(7, 8, DERIVED_CERTAIN);
+        let _ = plan_of(&mut drafter, 2, None);
+        assert_eq!(derived_pending(&drafter).chosen, Some(2));
+    }
+
+    #[test]
+    fn derived_k_reaches_the_physical_executor_only_with_a_qualified_getter_and_allocates_nothing()
+    {
+        let mut drafter = derived_wide_drafter(63, 64, DERIVED_CERTAIN);
+        drafter.spec_rows_cap = 64;
+        assert_eq!(drafter.k(), 63);
+        let capacities = |drafter: &Qwen4MtpDrafter| {
+            let state = derived_state(drafter);
+            (
+                state.depths.capacity(),
+                state.prices.capacity(),
+                state.resolve.capacity(),
+                state.keys.capacity(),
+            )
+        };
+        let before = capacities(&drafter);
+        assert!(before.0 >= 63 && before.1 >= 64 && before.2 >= 64 && before.3 >= 63);
+        let plan = plan_of(&mut drafter, 63, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 63 });
+        assert_eq!(derived_pending(&drafter).chosen, Some(63));
+        for drafted in 1..63 {
+            assert!(drafter.derived_resolve(drafted));
+        }
+        assert!(!drafter.derived_resolve(63));
+        drafter.derived_observe(
+            &plan,
+            99,
+            &Ok(MtpWindow {
+                committed: vec![1; 64],
+                accepted: 63,
+                drafts_generated: 63,
+            }),
+        );
+        assert_eq!(capacities(&drafter), before);
+    }
+
+    #[test]
+    fn derived_k_off_or_ineligible_keeps_the_incumbent_ceiling() {
+        let off = Qwen4MtpDrafter::new(63, 4096, None);
+        let qualified = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1;
+        assert_eq!((off.k(), off.proposal_capacity()), (qualified, qualified));
+        let mut ineligible = Qwen4MtpDrafter::new(63, 4096, None);
+        ineligible.derived_configure(&derived_test_cfg(0.0), true);
+        ineligible.derived_bind(
+            derived_eligibility(&derived_test_identity("gfx1100")),
+            DERIVED_CERTAIN,
+        );
+        assert_eq!(ineligible.k(), qualified);
+        let mut sampled = Qwen4MtpDrafter::new(63, 4096, None);
+        sampled.derived_configure(&derived_test_cfg(0.8), true);
+        assert_eq!(sampled.k(), qualified);
+    }
+
+    #[test]
+    fn derived_k_prices_each_cost_mode_from_its_own_profile() {
+        // Synthetic CPU tables use the inner binder, not shipping admission.
+        // Set the execution mode before binding, as the loader/request path
+        // does: changing it afterwards deliberately invalidates the identity.
+        let bound_in_mode = |tables, copy_lane| {
+            let mut drafter = derived_floor_drafter();
+            drafter.copy_lane = copy_lane;
+            derived_bind_test(&mut drafter, tables);
+            drafter.derived_refresh_rows(8);
+            drafter
+        };
+        // Off the copy route the steep profile loses to AR ...
+        let mut off = bound_in_mode(DERIVED_BY_MODE, false);
+        assert_eq!(off.derived_cost_mode(), DerivedCostMode::OffPool);
+        assert_eq!(
+            derived_state(&off).mode_hint,
+            Some(DerivedCostMode::OffPool)
+        );
+        let plan = plan_of(&mut off, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRouted);
+        assert_eq!(derived_pending(&off).mode, DerivedCostMode::OffPool);
+        assert_eq!(derived_pending(&off).chosen_cost_us, 25_000.0);
+        assert_eq!(derived_state(&off).prices[1].cost_us, 38_000.0);
+        // ... on it the flat profile makes the widest prefix win.
+        let mut copy = bound_in_mode(DERIVED_BY_MODE, true);
+        assert_eq!(copy.derived_cost_mode(), DerivedCostMode::OnCopy);
+        assert_eq!(
+            derived_state(&copy).mode_hint,
+            Some(DerivedCostMode::OnCopy)
+        );
+        let plan = plan_of(&mut copy, 3, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 3 });
+        let pending = derived_pending(&copy);
+        assert_eq!(pending.mode, DerivedCostMode::OnCopy);
+        assert_eq!(pending.chosen, Some(3));
+        assert_eq!(pending.chosen_cost_us, 30_300.0);
+        assert_eq!(derived_state(&copy).prices[1].cost_us, 30_100.0);
+
+        // A mode with no measured profile is unsupported: the incumbent runs
+        // and the OffPool price is never borrowed.
+        let mut base = derived_floor_drafter();
+        base.copy_lane = true;
+        let base_plan = plan_of(&mut base, 3, None);
+        let mut unsupported = bound_in_mode(DERIVED_OFF_ONLY, true);
+        let plan = plan_of(&mut unsupported, 3, None);
+        assert_eq!(plan, base_plan);
+        assert_eq!(derived_state(&unsupported).consults, 0);
+        assert!(derived_state(&unsupported).pending.is_none());
+        let mut supported = bound_in_mode(DERIVED_OFF_ONLY, false);
+        let _ = plan_of(&mut supported, 3, None);
+        assert_eq!(derived_state(&supported).consults, 1);
+
+        // A genuinely changed execution mode must not reuse either bound
+        // profile, even when the synthetic table prices both modes.
+        for copy_lane in [false, true] {
+            let mut changed = bound_in_mode(DERIVED_BY_MODE, copy_lane);
+            changed.copy_lane = !copy_lane;
+            let mut incumbent = derived_floor_drafter();
+            incumbent.copy_lane = !copy_lane;
+            assert_eq!(
+                plan_of(&mut changed, 3, None),
+                plan_of(&mut incumbent, 3, None)
+            );
+            assert!(matches!(changed.derived, Some(DerivedPhase::Ineligible)));
+        }
+    }
+
+    #[test]
+    fn derived_k_production_tables_never_price_the_copy_mode() {
+        // The production table, through the same fn pointers the planner binds.
+        for card in [DerivedCard::R9700, DerivedCard::Halo] {
+            for bucket in [
+                ContextBucket::Le2K,
+                ContextBucket::Le8K,
+                ContextBucket::Le16K,
+                ContextBucket::Over16K,
+            ] {
+                assert!(fn_phase1_ar_price(card, DerivedCostMode::OnCopy, bucket).is_none());
+                for k in 1..=DERIVED_MAX_DRAFTS as u8 {
+                    for source in [DerivedSource::Mtp, DerivedSource::Ngram] {
+                        assert!(
+                            fn_phase1_window_price(
+                                card,
+                                DerivedCostMode::OnCopy,
+                                source,
+                                bucket,
+                                k,
+                                true
+                            )
+                            .is_none(),
+                            "{card:?} {bucket:?} {source:?} k={k}"
+                        );
+                    }
+                }
+            }
+            // The OffPool profile is the measured one, widths never interpolated.
+            let price = FN_PHASE1_TABLES.window_price;
+            for k in 1..=7 {
+                assert!(price(
+                    card,
+                    DerivedCostMode::OffPool,
+                    DerivedSource::Mtp,
+                    ContextBucket::Le2K,
+                    k,
+                    true
+                )
+                .is_some());
+            }
+            assert!(price(
+                card,
+                DerivedCostMode::OffPool,
+                DerivedSource::Mtp,
+                ContextBucket::Le2K,
+                8,
+                true
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn derived_k_resolves_the_global_objective_not_the_first_failed_marginal() {
+        use hipfire_runtime::spec_economics::DerivedYield;
+        // The adjacent step 1 -> 2 loses rate ...
+        let first = DerivedYield::seed().append(0.8);
+        let second = first.append(0.8);
+        assert!(!first
+            .objective(30_000.0)
+            .marginal_to(second.objective(45_000.0))
+            .improves_rate());
+        // ... yet width 3 is the global optimum, so the post-row re-solve
+        // keeps drafting through the failed step instead of stopping at 1.
+        let mut drafter = derived_wide_drafter(3, 8, DERIVED_NONMONOTONE);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 3 });
+        assert_eq!(derived_pending(&drafter).chosen, Some(3));
+        assert!(drafter.derived_resolve(1));
+        assert!(drafter.derived_resolve(2));
+        assert!(!drafter.derived_resolve(3));
+        assert_eq!(derived_state(&drafter).resolves, 3);
+    }
+
+    #[test]
+    fn derived_k_draft_loop_is_not_driven_by_the_incumbent_prune_without_a_consult() {
+        let mut drafter = derived_drafter(DERIVED_DEAD);
+        // An AR window and an unconsulted window leave the incumbent loop.
+        let _ = plan_of(&mut drafter, 3, None);
+        assert!(!drafter.derived_loop_active());
+        let mut drafter = derived_drafter(DERIVED_UNPRICED);
+        let _ = plan_of(&mut drafter, 3, None);
+        assert!(!drafter.derived_loop_active());
+        let mut drafter = derived_drafter(DERIVED_NARROW);
+        assert!(!drafter.derived_loop_active());
+        let _ = plan_of(&mut drafter, 3, None);
+        assert!(drafter.derived_loop_active());
+    }
+
+    #[test]
+    fn derived_k_chooses_ar_per_window_without_retiring_the_floor() {
+        let mut drafter = derived_drafter(DERIVED_DEAD);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRouted);
+        assert!(!plan.ngram_hit);
+        assert!(!drafter.floor.retired());
+        assert_eq!(
+            derived_state(&drafter).pending.expect("pending").chosen,
+            Some(0)
+        );
+        drafter.derived_observe(
+            &plan,
+            99,
+            &Ok(MtpWindow {
+                committed: vec![9],
+                accepted: 0,
+                drafts_generated: 0,
+            }),
+        );
+        let state = derived_state(&drafter);
+        assert_eq!(state.observes, 1);
+        // AR ages the residuals but learns no draft outcome.
+        assert_eq!(state.request.last_first(DerivedSource::Mtp), None);
+        // The next window is planned from the floor again.
+        let next = plan_of(&mut drafter, 3, None);
+        assert_eq!(next.route, WindowRoute::ArRouted);
+        assert!(!drafter.floor.retired());
+    }
+
+    #[test]
+    fn derived_k_without_a_priced_width_does_not_consult() {
+        let (base_plans, _) = derived_scripted_plans(derived_floor_drafter());
+        let mut drafter = derived_drafter(DERIVED_UNPRICED);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan, base_plans[0]);
+        let state = derived_state(&drafter);
+        assert_eq!(state.consults, 0);
+        assert!(state.pending.is_none());
+        // A window nobody consulted observes nothing.
+        assert!(!drafter.derived_pending_open());
+    }
+
+    #[test]
+    fn derived_k_forced_and_floor_off_routes_bypass_the_chooser() {
+        for incremental in [Some("0"), Some("1")] {
+            let mut drafter = derived_drafter(DERIVED_DEAD);
+            let plan = plan_of(&mut drafter, 3, incremental);
+            assert!(!plan.floor_active);
+            assert_ne!(plan.route, WindowRoute::ArRouted);
+            assert_eq!(derived_state(&drafter).consults, 0);
+        }
+        let mut drafter = derived_drafter(DERIVED_DEAD);
+        drafter.floor_enabled = false;
+        let plan = plan_of(&mut drafter, 3, None);
+        assert!(!plan.floor_active);
+        assert_ne!(plan.route, WindowRoute::ArRouted);
+        assert_eq!(derived_state(&drafter).consults, 0);
+        // A caller that carries no absolute position never consults.
+        let mut drafter = derived_drafter(DERIVED_DEAD);
+        drafter.derived_position = None;
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_ne!(plan.route, WindowRoute::ArRouted);
+        assert_eq!(derived_state(&drafter).consults, 0);
+    }
+
+    fn derived_ngram_drafter(tables: Option<DerivedTables>) -> Qwen4MtpDrafter {
+        FLOOR_CALL_LINES.with(|lines| lines.borrow_mut().clear());
+        let mut drafter = armed_ngram_drafter(1, 8);
+        drafter.floor_enabled = true;
+        drafter.floor = derived_test_floor();
+        drafter.floor.seed_calibrated(30_000.0);
+        if let Some(tables) = tables {
+            derived_bind_test(&mut drafter, tables);
+        }
+        drafter
+    }
+
+    #[test]
+    fn derived_k_narrows_only_the_ngram_take_and_credits_the_source_that_ran() {
+        let mut base = derived_ngram_drafter(None);
+        let base_plan = plan_of(&mut base, 3, None);
+        assert!(base_plan.ngram_hit, "the fixture's pool hit");
+        let base_take = base.ngram_candidates.len();
+        assert!(base_take >= 2, "take {base_take}");
+
+        let mut drafter = derived_ngram_drafter(Some(DERIVED_NARROW));
+        let plan = plan_of(&mut drafter, 3, None);
+        // The incumbent's source, native cap and confirmation are kept;
+        // only the take is narrowed.
+        assert!(plan.ngram_hit);
+        assert_eq!(plan.route, base_plan.route);
+        assert_eq!(plan.ngram_confirm, base_plan.ngram_confirm);
+        assert_eq!(drafter.ngram_candidates.len(), 1);
+        assert_eq!(drafter.ngram_candidates[..], base.ngram_candidates[..1]);
+        assert!(drafter.ngram_proposal.len() >= base_take);
+        let key_len = drafter
+            .ngram
+            .as_ref()
+            .and_then(MtpNgramContext::last_proposal)
+            .map(|meta| meta.key_len as u32);
+        {
+            let state = derived_state(&drafter);
+            let pending = state.pending.expect("pending");
+            assert_eq!(pending.source, DerivedSource::Ngram);
+            assert_eq!(usize::from(pending.incumbent), base_take);
+            assert_eq!(pending.chosen, Some(1));
+            assert_eq!(usize::from(pending.hi), drafter.ngram_proposal.len().min(3));
+            assert_eq!(state.keys.len(), usize::from(pending.hi));
+            assert_eq!(
+                state.keys[0].feature,
+                DerivedFeature::Ngram {
+                    offered: derived_offer_bin(Some(drafter.ngram_proposal.len())),
+                    key_len,
+                    last_first: None,
+                }
+            );
+        }
+        // The takeover ran: its outcome is the n-gram source's.
+        drafter.derived_note_takeover();
+        drafter.derived_observe(
+            &plan,
+            99,
+            &Ok(MtpWindow {
+                committed: vec![2, 3],
+                accepted: 1,
+                drafts_generated: 1,
+            }),
+        );
+        let state = derived_state(&drafter);
+        assert_eq!(state.observes, 1);
+        assert_eq!(state.request.last_first(DerivedSource::Ngram), Some(true));
+        assert_eq!(state.request.last_first(DerivedSource::Mtp), None);
+
+        // A confirmation miss falls back to the native window: the queried
+        // source did not execute, so its residuals only age and the native
+        // outcome is not donated to them.
+        let mut missed = derived_ngram_drafter(Some(DERIVED_NARROW));
+        let plan = plan_of(&mut missed, 3, None);
+        assert!(plan.ngram_hit);
+        missed.derived_observe(
+            &plan,
+            99,
+            &Ok(MtpWindow {
+                committed: vec![7, 8],
+                accepted: 1,
+                drafts_generated: 1,
+            }),
+        );
+        let state = derived_state(&missed);
+        assert_eq!(state.observes, 1);
+        assert_eq!(state.request.last_first(DerivedSource::Ngram), None);
+        assert_eq!(state.request.last_first(DerivedSource::Mtp), None);
+
+        // AR chosen for an ngram window disables the hit for that window only.
+        let mut ar = derived_ngram_drafter(Some(DERIVED_DEAD));
+        let plan = plan_of(&mut ar, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRouted);
+        assert!(!plan.ngram_hit);
+        assert!(!ar.floor.retired());
+    }
+
+    #[test]
+    fn derived_k_widens_an_ngram_take_to_the_pools_offer() {
+        let mut base = derived_ngram_drafter(None);
+        let base_plan = plan_of(&mut base, 7, None);
+        assert!(base_plan.ngram_hit, "the fixture's pool hit");
+        let base_take = base.ngram_candidates.len();
+
+        let mut drafter = derived_ngram_drafter(Some(DERIVED_CERTAIN));
+        let plan = plan_of(&mut drafter, 7, None);
+        assert!(plan.ngram_hit);
+        assert_eq!(plan.route, base_plan.route);
+        let offered = drafter.ngram_proposal.len();
+        let width = offered.min(7);
+        assert!(width >= base_take);
+        // The take is exactly the chosen prefix of the pool's whole offer.
+        assert_eq!(
+            drafter.ngram_candidates[..],
+            drafter.ngram_proposal[..width]
+        );
+        let pending = derived_pending(&drafter);
+        assert_eq!(pending.source, DerivedSource::Ngram);
+        assert_eq!(pending.mode, DerivedCostMode::OffPool);
+        assert_eq!(pending.chosen, Some(width as u8));
+        assert_eq!(pending.legal, 7);
+    }
+
+    fn derived_copy_drafter(tables: Option<DerivedTables>) -> Qwen4MtpDrafter {
+        FLOOR_CALL_LINES.with(|lines| lines.borrow_mut().clear());
+        let mut drafter = armed_copy_drafter(1, 8);
+        drafter.floor_enabled = true;
+        drafter.floor = derived_test_floor();
+        drafter.floor.seed_calibrated(30_000.0);
+        if let Some(tables) = tables {
+            derived_bind_test(&mut drafter, tables);
+        }
+        drafter
+    }
+
+    #[test]
+    fn derived_k_prices_the_copy_lane_takeover_in_its_own_mode() {
+        let mut base = derived_copy_drafter(None);
+        let base_plan = plan_of(&mut base, 7, None);
+        assert!(
+            base_plan.ngram_hit,
+            "the fixture's copy proposal takes the window"
+        );
+        let base_candidates = base.ngram_candidates.clone();
+
+        // A measured OnCopy profile prices the take in that mode.
+        let mut drafter = derived_copy_drafter(Some(DERIVED_BY_MODE));
+        let plan = plan_of(&mut drafter, 7, None);
+        assert!(plan.ngram_hit);
+        let pending = derived_pending(&drafter);
+        assert_eq!(
+            (pending.source, pending.mode),
+            (DerivedSource::Ngram, DerivedCostMode::OnCopy)
+        );
+        let width = usize::from(pending.chosen.expect("a priced take"));
+        assert!(width >= 1 && width <= drafter.ngram_proposal.len().min(7));
+        assert_eq!(
+            drafter.ngram_candidates[..],
+            drafter.ngram_proposal[..width]
+        );
+
+        // Only the OffPool profile is measured: the copy window keeps the
+        // incumbent's take and consults nothing.
+        let mut unsupported = derived_copy_drafter(Some(DERIVED_OFF_ONLY));
+        let plan = plan_of(&mut unsupported, 7, None);
+        assert_eq!(plan, base_plan);
+        assert_eq!(unsupported.ngram_candidates, base_candidates);
+        assert_eq!(derived_state(&unsupported).consults, 0);
+        assert!(derived_state(&unsupported).pending.is_none());
+    }
+
+    #[test]
+    fn derived_k_failed_window_and_resets_do_not_donate_outcomes() {
+        let mut drafter = derived_drafter(DERIVED_NARROW);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert!(drafter.derived_pending_open());
+        drafter.derived_observe(&plan, 99, &Err("verify failed".to_string()));
+        {
+            let state = derived_state(&drafter);
+            assert_eq!((state.consults, state.observes), (1, 0));
+            assert!(state.pending.is_none());
+            assert_eq!(state.request.last_first(DerivedSource::Mtp), None);
+        }
+        // The lifecycle clears (prefill, reset, terminal repair) drop it too.
+        let plan = plan_of(&mut drafter, 3, None);
+        drafter.derived_drop_pending();
+        assert!(!drafter.derived_pending_open());
+        drafter.derived_observe(
+            &plan,
+            99,
+            &Ok(MtpWindow {
+                committed: vec![5, 6],
+                accepted: 1,
+                drafts_generated: 1,
+            }),
+        );
+        assert_eq!(derived_state(&drafter).observes, 0);
+        // A stale pending is replaced by the next consult, never observed.
+        let _ = plan_of(&mut drafter, 3, None);
+        let _ = plan_of(&mut drafter, 3, None);
+        assert_eq!(derived_state(&drafter).consults, 4);
+        assert_eq!(derived_state(&drafter).observes, 0);
+        // A new request starts unbound with no residuals.
+        drafter.derived_configure(&derived_test_cfg(0.0), true);
+        assert!(matches!(drafter.derived, Some(DerivedPhase::Unbound)));
+        assert!(drafter.derived_position.is_none());
+    }
+
+    #[test]
+    fn derived_k_clamps_acceptance_and_censors_a_terminal_rejection() {
+        let mut drafter = derived_drafter(DERIVED_NARROW);
+        let window = |committed: Vec<u32>, accepted: usize| MtpWindow {
+            committed,
+            accepted,
+            drafts_generated: 1,
+        };
+        // An end-of-turn that rejects the draft is censored: history unknown.
+        let plan = plan_of(&mut drafter, 3, None);
+        drafter.derived_observe(&plan, 99, &Ok(window(vec![99], 0)));
+        assert_eq!(
+            derived_state(&drafter)
+                .request
+                .last_first(DerivedSource::Mtp),
+            None
+        );
+        // A rejection that is not terminal is a failure at depth 1.
+        let plan = plan_of(&mut drafter, 3, None);
+        drafter.derived_observe(&plan, 99, &Ok(window(vec![7], 0)));
+        assert_eq!(
+            derived_state(&drafter)
+                .request
+                .last_first(DerivedSource::Mtp),
+            Some(false)
+        );
+        // An over-claimed acceptance is clamped to what was committed.
+        let plan = plan_of(&mut drafter, 3, None);
+        drafter.derived_observe(&plan, 99, &Ok(window(vec![1, 2], 5)));
+        let state = derived_state(&drafter);
+        assert_eq!(state.request.last_first(DerivedSource::Mtp), Some(true));
+        assert_eq!(state.observes, 3);
+    }
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/floor_call_log_replay.rs"
+    ));
 }

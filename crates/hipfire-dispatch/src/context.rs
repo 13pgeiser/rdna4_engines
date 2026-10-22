@@ -38,6 +38,15 @@ pub struct DispatchCtx {
     /// Lets shape-driven route choices (e.g. MoE grouped vs indexed) see
     /// the batch width without a signature change at every call site.
     pub batch_size: usize,
+    /// Per-call actual eager-verify scope for the CPU-owned expert window.
+    /// Default `false`; the FN forward sets it ONLY for a real eager verify
+    /// call (non-prefill scope, `>= 2` rows, not recording/capturing, oracle
+    /// override present). A whole 64-row ordinary prefill (whose rows equal
+    /// the canonical chunk) MUST NOT set it: `rows == route_rows` alone never
+    /// implies verify. Not a user knob; unrelated to DFlash
+    /// `verify_tile_attend`. Lanes, S1 tiles, tests and non-FN seals keep the
+    /// default `false` unchanged.
+    pub cpu_wide_verify: bool,
     device_id: i32,
 }
 
@@ -56,6 +65,7 @@ impl DispatchCtx {
             workload: DispatchWorkload::Standard,
             verify_tile_attend: false,
             batch_size: 0,
+            cpu_wide_verify: false,
             device_id: gpu.device_id,
         }
     }
@@ -76,6 +86,20 @@ impl DispatchCtx {
     pub fn with_verify_tile_attend(mut self, verify_tile_attend: bool) -> Self {
         self.verify_tile_attend = verify_tile_attend;
         self
+    }
+
+    /// Mark this call as an actual eager-verify scope for the CPU-owned
+    /// expert window (see [`Self::cpu_wide_verify`]). The FN forward computes
+    /// this; no other caller sets it.
+    pub fn with_cpu_wide_verify(mut self, cpu_wide_verify: bool) -> Self {
+        self.cpu_wide_verify = cpu_wide_verify;
+        self
+    }
+
+    /// Whether this call runs inside an actual eager-verify scope for the
+    /// CPU-owned expert window.
+    pub fn cpu_wide_verify(&self) -> bool {
+        self.cpu_wide_verify
     }
 
     /// Attach the token-row count of the current batch. 0 (default) means
@@ -99,6 +123,7 @@ impl DispatchCtx {
             workload: DispatchWorkload::Standard,
             verify_tile_attend: false,
             batch_size: 0,
+            cpu_wide_verify: false,
             device_id,
         }
     }

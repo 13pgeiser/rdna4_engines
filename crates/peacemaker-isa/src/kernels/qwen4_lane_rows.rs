@@ -4,12 +4,12 @@
 
 //! gfx1151 Flash-Next exact decode GEMV twins in `qwen4_lane_rows_pm`.
 //!
-//! The first four exports are the frozen 1..=8-row specializations. Wide
-//! capacities 16 and 32 follow them without changing their emitted text.
-//! Ordinary wide entries use eight wave32 output owners and an 8-row K256
-//! F32 activation tile (8192 B LDS); HC k8 uses two output owners with eight
-//! partitions each and a two-row partition tile (16384 B LDS). Runtime B
-//! masks inactive rows; invalid output waves still participate in barriers.
+//! The first four exports are the frozen 1..=8-row specializations. Fixed
+//! eight-row tiles follow them, accepting total logical rows 1..=64 without
+//! changing singleton/narrow emitted text. Ordinary tiled entries use eight
+//! wave32 output owners and an 8-row K256 F32 activation tile (8192 B LDS).
+//! HC k8 retains eight fixed K partitions per output. Inactive output waves
+//! still stage inputs and participate in barriers; token tails do no work.
 //! Each row preserves its selected single-decode arithmetic DAG. See the
 //! family authors for the weight reconstruction, stream and fold contracts.
 use super::iu4_gemm::ModuleProof;
@@ -20,39 +20,28 @@ use crate::{Arch, Emitted};
 pub const MODULE: &str = "qwen4_lane_rows_pm";
 
 /// The frozen exports, in module order.
-pub const SYMBOLS: [&str; 18] = [
+pub const SYMBOLS: [&str; 11] = [
     "gemv_mq6g256v2_xbatch_pm",
     "gemv_mq6g256v2_x4_xbatch_pm",
     "gemv_q8_0_k8_xbatch_pm",
     "gemv_q8_0_k320_xbatch_pm",
-    "gemv_mq6g256v2_xbatch_wide_r16_pm",
-    "gemv_mq6g256v2_xbatch_wide_r32_pm",
-    "gemv_mq6g256v2_x4_xbatch_wide_r16_pm",
-    "gemv_mq6g256v2_x4_xbatch_wide_r32_pm",
-    "gemv_q8_0_k8_xbatch_wide_r16_pm",
-    "gemv_q8_0_k8_xbatch_wide_r32_pm",
-    "gemv_q8_0_k320_xbatch_wide_r16_pm",
-    "gemv_q8_0_k320_xbatch_wide_r32_pm",
-    "gemv_q8_0_k2560_xbatch_wide_r16_pm",
-    "gemv_q8_0_k2560_xbatch_wide_r32_pm",
-    "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm",
-    "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
-    "gemv_q8_0_wide_xbatch_wide_r16_pm",
-    "gemv_q8_0_wide_xbatch_wide_r32_pm",
+    "gemv_mq6g256v2_rows_t8_pm_gfx1151",
+    "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
+    "gemv_q8_0_k8_rows_t8_pm_gfx1151",
+    "gemv_q8_0_k320_rows_t8_pm_gfx1151",
+    "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
+    "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
+    "gemv_q8_0_wide_rows_t8_pm_gfx1151",
 ];
 
 /// Kernarg block size in bytes of each export, in [`SYMBOLS`] order.
-pub const KERNARG_BYTES: [u32; 18] = [
-    36, 96, 44, 32, 36, 36, 96, 96, 44, 44, 36, 36, 36, 36, 56, 56, 36, 36,
-];
+pub const KERNARG_BYTES: [u32; 11] = [36, 96, 44, 32, 36, 96, 44, 36, 36, 56, 36];
 
 /// Workgroup size (threads) of each export, in [`SYMBOLS`] order.
-pub const WORKGROUP_SIZE: [u32; 18] = [
-    32, 32, 256, 64, 256, 256, 256, 256, 512, 512, 256, 256, 256, 256, 256, 256, 256, 256,
-];
+pub const WORKGROUP_SIZE: [u32; 11] = [32, 32, 256, 64, 256, 256, 512, 256, 256, 256, 256];
 
 /// `(offset, size)` of every kernarg of each export, in [`SYMBOLS`] order.
-pub const KERNARGS: [&[(u32, u32)]; 18] = [
+pub const KERNARGS: [&[(u32, u32)]; 11] = [
     &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4), (32, 4)],
     &[
         (0, 8),
@@ -83,18 +72,11 @@ pub const KERNARGS: [&[(u32, u32)]; 18] = [
     ],
     &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4)],
     SINGLE_ARGS,
-    SINGLE_ARGS,
-    X4_ARGS,
     X4_ARGS,
     HC_ARGS,
-    HC_ARGS,
-    SINGLE_ARGS,
-    SINGLE_ARGS,
     SINGLE_ARGS,
     SINGLE_ARGS,
     X2_ARGS,
-    X2_ARGS,
-    SINGLE_ARGS,
     SINGLE_ARGS,
 ];
 
@@ -158,11 +140,12 @@ pub fn emit_module() -> Result<(Vec<Emitted>, String, ModuleProof), String> {
         qwen4_lane_rows_mq6::build_gfx1151().map_err(|e| format!("{MODULE}: mq6: {e}"))?;
     emitted.extend(qwen4_lane_rows_q8::build_gfx1151().map_err(|e| format!("{MODULE}: q8: {e}"))?);
     emitted.extend(
-        qwen4_lane_rows_mq6::build_wide_gfx1151()
-            .map_err(|e| format!("{MODULE}: mq6 wide: {e}"))?,
+        qwen4_lane_rows_mq6::build_rowtiles_gfx1151()
+            .map_err(|e| format!("{MODULE}: mq6 rowtiles: {e}"))?,
     );
     emitted.extend(
-        qwen4_lane_rows_q8::build_wide_gfx1151().map_err(|e| format!("{MODULE}: q8 wide: {e}"))?,
+        qwen4_lane_rows_q8::build_rowtiles_gfx1151()
+            .map_err(|e| format!("{MODULE}: q8 rowtiles: {e}"))?,
     );
     let got: Vec<&str> = emitted.iter().map(|e| exported(e).unwrap_or("")).collect();
     if got != SYMBOLS {

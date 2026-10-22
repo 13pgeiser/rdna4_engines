@@ -266,6 +266,127 @@ fn quick_relevant(
     })
 }
 
+/// Project a locally returned descriptor field in its constructing function's
+/// context. The file-wide field resolver cannot bind `tile` in `tile.symbols`:
+/// it deliberately resolves field initializers in an empty context.
+fn descriptor_field_names(
+    world: &World,
+    ctx: &Ctx,
+    ex: &[Tt],
+    sloc: &[usize],
+    field: Option<&str>,
+    depth: usize,
+) -> Option<Res> {
+    if depth > 24 {
+        let mut r = Res::default();
+        r.unres.insert("<depth>".into());
+        return Some(r);
+    }
+    if let Some(name) = ex.first().and_then(Tt::id).filter(|_| ex.len() == 1) {
+        if !ctx.idx.assigns.contains_key(name) {
+            if let Some(b) = ctx.idx.visible(name, sloc) {
+                // Tuple bindings still need the existing component resolver.
+                if b.let_pos.is_none() && b.for_pos.is_none() {
+                    return descriptor_field_names(world, ctx, &b.init, &b.loc, field, depth + 1);
+                }
+            }
+        }
+    }
+    if field.is_none()
+        && ex.len() >= 3
+        && ex[0].id().is_some()
+        && ex[1].is_p('.')
+        && ex[2].id().is_some()
+        && (ex.len() == 3 || ex[3].is_g('['))
+    {
+        if let Some(r) = descriptor_field_names(world, ctx, &ex[..1], sloc, ex[2].id(), depth + 1) {
+            return Some(r);
+        }
+    }
+    let Some(field) = field else {
+        return Some(world.resolve(ex, ctx, sloc, 0, true));
+    };
+    let mut result = Res::default();
+    let mut found = false;
+    // Only inspect the returned value, not descriptors discarded by preceding
+    // statements. Keep original indices so constructor-local bindings stay scoped.
+    let start = ex.iter().rposition(|t| t.is_p(';')).map_or(0, |i| i + 1);
+    // Follow actual calls, never origin mentions or policy-supplied candidates.
+    for (i, token) in ex.iter().enumerate().skip(start) {
+        if let Some(name) = token.id().filter(|_| {
+            ex.get(i + 1).map_or(false, |t| t.is_g('(')) && (i == 0 || !ex[i - 1].is_p('.'))
+        }) {
+            let defs: Vec<_> = world
+                .files
+                .iter()
+                .flat_map(|f| f.fns.iter().map(move |d| (f, d)))
+                .filter(|(_, d)| d.name == name)
+                .collect();
+            if defs.len() == 1 {
+                let (file, func) = defs[0];
+                if !func
+                    .attrs
+                    .iter()
+                    .any(|a| attr_is_cfg_any_empty(a) || attr_is_test(a))
+                {
+                    let idx = BindIndex::build(&func.body);
+                    let callee = Ctx {
+                        file: &file.path,
+                        body: &func.body,
+                        params: fn_params(func),
+                        idx: &idx,
+                    };
+                    if let Some(r) = descriptor_field_names(
+                        world,
+                        &callee,
+                        &func.body,
+                        &[usize::MAX],
+                        Some(field),
+                        depth + 1,
+                    ) {
+                        result.merge(&r);
+                        found = true;
+                    }
+                }
+            }
+        }
+        if let Tt::G(_, body, _) = token {
+            // A named struct literal's requested field, including shorthand.
+            if token.is_g('{') && i > 0 && ex[i - 1].id().is_some() {
+                for part in split_top(body, ',') {
+                    if part.first().map_or(false, |t| t.is_id(field))
+                        && (part.len() == 1 || part.get(1).map_or(false, |t| t.is_p(':')))
+                    {
+                        let value = if part.len() == 1 {
+                            &part[..]
+                        } else {
+                            &part[2..]
+                        };
+                        let mut loc = sloc[..sloc.len().saturating_sub(1)].to_vec();
+                        loc.push(i);
+                        loc.push(usize::MAX);
+                        if let Some(r) =
+                            descriptor_field_names(world, ctx, value, &loc, None, depth + 1)
+                        {
+                            result.merge(&r);
+                            found = true;
+                        }
+                    }
+                }
+            }
+            let mut loc = sloc[..sloc.len().saturating_sub(1)].to_vec();
+            loc.push(i);
+            loc.push(usize::MAX);
+            if let Some(r) = descriptor_field_names(world, ctx, body, &loc, Some(field), depth + 1)
+            {
+                result.merge(&r);
+                found = true;
+            }
+        }
+    }
+    found.then_some(result)
+}
+
 /// One call of a launch helper: its blob layouts against the kernels that call names.
 /// Returns (ABI problems, unsupported-shape errors, pairs checked).
 fn check_group(
@@ -891,7 +1012,19 @@ pub fn analyze(world: &World, syms: &Symbols, policy: &Policy) -> Analysis {
                     }
                 }
                 let mut strict_decls = true;
-                let r = world.resolve(&site.name_ex, &ctx, &site.loc, 0, true);
+                let mut r = world.resolve(&site.name_ex, &ctx, &site.loc, 0, true);
+                if !r.lits.iter().any(|l| names.contains(l))
+                    && policy
+                        .checked_delegations
+                        .values()
+                        .any(|d| d.returns && d.chain.last() == Some(&key(&file.path, &func.name)))
+                {
+                    if let Some(projected) =
+                        descriptor_field_names(world, &ctx, &site.name_ex, &site.loc, None, 0)
+                    {
+                        r.merge(&projected);
+                    }
+                }
                 if r.unres.contains("<depth>") && !rep.inert {
                     rep.errors.push(format!(
                         "site {si} (line {}): the kernel-name resolution was truncated by its depth budget; cannot prove which kernels this launch names",
@@ -1210,6 +1343,104 @@ pub fn analyze(world: &World, syms: &Symbols, policy: &Policy) -> Analysis {
         }
     }
 
+    // Unlike parameter-name forwarders, these rows add no candidates or coverage:
+    // the real terminal launch must already check the complete origin symbol set.
+    for (origin, delegation) in &policy.checked_delegations {
+        let checked = (|| -> Result<usize, String> {
+            if delegation.chain.len() < 2 || delegation.chain.first() != Some(origin) {
+                return Err(
+                    "chain must start at its inventory key and contain a terminal launcher".into(),
+                );
+            }
+            let mut functions = Vec::new();
+            let mut distinct = BTreeSet::new();
+            for entry in &delegation.chain {
+                if !distinct.insert(entry) {
+                    return Err(format!("repeated chain function {entry}"));
+                }
+                let (path, name) = entry
+                    .rsplit_once("::")
+                    .ok_or_else(|| format!("invalid function key {entry}"))?;
+                let file = world
+                    .file(path)
+                    .ok_or_else(|| format!("unscanned file {path}"))?;
+                let defs: Vec<_> = file.fns.iter().filter(|f| f.name == name).collect();
+                if defs.len() != 1 {
+                    return Err(format!("{entry}: expected exactly one definition"));
+                }
+                if defs[0]
+                    .attrs
+                    .iter()
+                    .any(|a| attr_is_cfg_any_empty(a) || attr_is_test(a))
+                {
+                    return Err(format!(
+                        "{entry}: chain function is not live production code"
+                    ));
+                }
+                functions.push(defs[0]);
+            }
+            for pair in functions.windows(2) {
+                let (caller, callee) = if delegation.returns {
+                    (pair[1], pair[0])
+                } else {
+                    (pair[0], pair[1])
+                };
+                if world
+                    .files
+                    .iter()
+                    .flat_map(|f| &f.fns)
+                    .filter(|f| {
+                        f.name == callee.name
+                            && !f
+                                .attrs
+                                .iter()
+                                .any(|a| attr_is_cfg_any_empty(a) || attr_is_test(a))
+                    })
+                    .count()
+                    != 1
+                {
+                    return Err(format!("{}: ambiguous call target", callee.name));
+                }
+                let mut calls = BTreeSet::new();
+                call_names(&caller.body, &mut calls);
+                if !calls.contains(&callee.name) {
+                    return Err(format!("{} no longer calls {}", caller.name, callee.name));
+                }
+            }
+            let find_report = |entry: &str| {
+                reports
+                    .iter()
+                    .position(|r| key(&r.file, &r.func) == entry && !r.inert && !r.is_test)
+            };
+            let start = find_report(origin).ok_or("origin has no live changed-kernel report")?;
+            let end = find_report(delegation.chain.last().unwrap())
+                .ok_or("terminal has no live checked report")?;
+            let terminal = &reports[end];
+            let symbols: BTreeSet<_> = terminal
+                .sites
+                .iter()
+                .flat_map(|(_, c)| c.iter().cloned())
+                .collect();
+            if terminal.sites.is_empty()
+                || !terminal.problems.is_empty()
+                || !terminal.errors.is_empty()
+            {
+                return Err("terminal launch has no successful ABI check".into());
+            }
+            if reports[start].mentions.is_empty() || !reports[start].mentions.is_subset(&symbols) {
+                return Err(format!(
+                    "terminal does not check every origin symbol {:?}",
+                    reports[start].mentions
+                ));
+            }
+            Ok(start)
+        })();
+        match checked {
+            Ok(start) => reports[start].cleared = true,
+            Err(e) => policy_errors.push(format!("checked forwarder {origin}: {e}")),
+        }
+    }
+
     // A launch helper that takes the kernel name as a parameter, called from a
     // function that mentions changed kernels, is not resolvable here: fail closed.
     let helper_names: BTreeSet<String> = param_helpers
@@ -1250,6 +1481,13 @@ pub fn analyze(world: &World, syms: &Symbols, policy: &Policy) -> Analysis {
     }
 }
 
+/// A source-checked call chain or returned-descriptor consumer chain. The final
+/// function must already have ABI-checked sites covering every origin symbol.
+pub struct CheckedDelegation {
+    pub chain: Vec<String>,
+    pub returns: bool,
+}
+
 /// Inventory-driven policy.
 #[derive(Default)]
 pub struct Policy {
@@ -1261,6 +1499,8 @@ pub struct Policy {
     /// names to a launcher through a `&str` parameter. The launcher's candidate set
     /// is extended with the symbols the forwarder mentions.
     pub forwarders: BTreeMap<String, (String, String)>,
+    /// Typed `forwarders` rows for wrappers and descriptor-returning selectors.
+    pub checked_delegations: BTreeMap<String, CheckedDelegation>,
     /// "file::fn#condition=bool" -> reason: launch variants that deliberately build the
     /// OLD (pre-guard) kernarg ABI. Exempt one by one; every other variant is checked.
     pub old_variants: BTreeMap<String, String>,

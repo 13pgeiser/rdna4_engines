@@ -107,6 +107,23 @@
 //! read of the tensor is its last byte, so the required tail padding is zero ([`word_end`],
 //! [`scale_end`]). X rows go through the raw descriptor of `x_src_rows*x_row_stride*4` bytes (a row
 //! at or past it reads 0), exactly as the incumbent.
+//!
+//! # Cn eight-output-wave workgroup ([`emit_cn_rows8`], gfx1201 only, candidate; production dispatch unchanged)
+//! The one-wave entries above stage the whole 1,536-byte table once **per output row** (256 `s_mov` + 256
+//! `v_writelane` + 67 MASK VALU per wave). Production K gives 20 gate / 5 down K128 groups; the gate body
+//! has seven static group instances (four loop instances plus three possible tails).
+//! The candidate serves eight rows per workgroup: launch grid `[ceil(M/8), U, 1]`, block `[256, 1, 1]`, `tid = v0`,
+//! `lane = tid & 31`, wave `w = tid >> 5` (uniform, `v_readfirstlane_b32` into `s5`), `row = 8 * wg_x + w`. The eight
+//! waves publish ONE table copy cooperatively (`stage_rows8`): each wave writes only its own LUT chunk `w`
+//! (32 `s_mov` + 32 `v_writelane`, behind a uniform wave-index branch) and waves 0-3 each write one 32-entry quarter of
+//! MASK, after which all eight waves meet at the one barrier. Everything workgroup-uniform (`row`-independent) still
+//! returns before the stage and its barrier: expert index `>= U`, `n == 0` or `n > 8`, `offsets[u+1] > 10*C`, expert id
+//! `>= n_experts`; only `row >= M` moves behind the barrier (such waves load nothing and store nothing). Group body, decode
+//! network, per-slot chains, fold, shuffle tree and stores are the incumbent's text on the wave's own registers (the
+//! wave's `lane` is `tid & 31`, kept in the dead `x_address` register); the same 96-byte kernarg ABI and VGPR / SGPR
+//! counts as the incumbent entry (112 / 88 VGPR gate / down, SGPR 88), LDS 1,536 B per workgroup instead of per row.
+//! Both new SGPR/VGPR roles reuse registers the incumbent already reserves, so the resource ceilings are unchanged.
+//! No speedup is claimed.
 
 use crate::arch::WgIdSource;
 use crate::insn::{Instruction, MemoryClass};
@@ -286,6 +303,16 @@ pub const SGPRS: u8 = 88;
 /// which no other instruction of the entry touches (the plan's SGPR ceiling and the physical assignment of every
 /// other register are unchanged). An `expert_ids` entry at or past it is never used to index the table.
 const SNEXP: u8 = 4;
+/// The uniform wave index of the eight-output-wave entry (`tid >> 5` via `v_readfirstlane_b32`): `s5`, a gfx12
+/// SGPR no other instruction of the entry names (declared in the plan only for that entry).
+const WAVE: u8 = 5;
+/// Tiled gfx11 z id occupies s4; move the expert extent to the otherwise unused s6.
+const TILE_NEXP: u8 = 6;
+const WGZ: u8 = USER_SGPRS + 2;
+const TILE: u8 = 7;
+/// Fixed union descriptor capacity and byte stride, including both codec buckets.
+const TILE_SLOTS: u32 = 80;
+const TILE_BYTES: u32 = 1928;
 
 // ----------------------------------------------------------------------- VGPRs
 const LANE: u8 = 0;
@@ -293,6 +320,11 @@ const LANE: u8 = 0;
 /// VGPR layout of one entry, assigned sequentially so no range can overlap.
 #[derive(Clone, Copy, Debug)]
 struct Lay {
+    /// Eight-output-wave workgroup (`Lay::lane` is then `tid & 31`, not the work-item id).
+    rows8: bool,
+    rowtiles: bool,
+    /// VGPR holding the lane index `0..32`.
+    lane: u8,
     /// Accumulator chains per slot.
     chains: u8,
     caddr: u8,
@@ -322,7 +354,7 @@ struct Lay {
     end: u8,
 }
 impl Lay {
-    fn new(spec: Spec) -> Self {
+    fn new(spec: Spec, rows8: bool) -> Self {
         let chains = spec.kind.chains();
         let mut n = 1u8;
         let mut take = |len: u8, align: u8| {
@@ -357,6 +389,11 @@ impl Lay {
         let ya = take(MAX_SLOTS as u8, 1);
         let end = n.div_ceil(8) * 8;
         Self {
+            rows8,
+            rowtiles: false,
+            // The lane index: the work-item id in the one-wave entry; `tid & 31`, held in `x_address`
+            // (dead until the first group; recomputed in the epilogue), in the eight-wave entry.
+            lane: if rows8 { xa } else { LANE },
             chains,
             caddr,
             saddr,
@@ -385,6 +422,13 @@ impl Lay {
             end,
         }
     }
+    fn label(&self, spec: Spec, name: &str) -> String {
+        if self.rowtiles {
+            format!(".Le8pi4moe_{}_t8_{name}", spec.tag())
+        } else {
+            format!(".Le8pi4moe_{}_{name}", spec.tag())
+        }
+    }
     /// First X register of slot `i` (four consecutive registers).
     fn xr(&self, i: u32) -> u8 {
         self.x + i as u8 * LANE_ELEMS
@@ -393,10 +437,6 @@ impl Lay {
     fn ac(&self, i: u32, c: u8) -> u8 {
         self.acc + i as u8 * self.chains + c
     }
-}
-
-fn lbl(spec: Spec, name: &str) -> String {
-    format!(".Le8pi4moe_{}_{name}", spec.tag())
 }
 
 /// Declare `len` registers from `base` as the legal ranges the plan allows (widths 1, 2, 4 or 8, SGPR
@@ -420,6 +460,9 @@ fn plan(l: &Lay, arch: Arch) -> Result<RegPlan, String> {
         for (name, base) in [("workgroup_id_x", WGX), ("workgroup_id_y", WGY)] {
             declare(&mut regs, name, RKind::S, base, 1)?;
         }
+        if l.rowtiles {
+            declare(&mut regs, "workgroup_id_z", RKind::S, WGZ, 1)?;
+        }
     }
     for (name, base, len) in [
         ("kernarg", KARG, 2),
@@ -427,7 +470,11 @@ fn plan(l: &Lay, arch: Arch) -> Result<RegPlan, String> {
         ("kernel_arguments_x_y_m_k", XROT, 8),
         ("kernel_arguments_u_c_div_src", SU, 4),
         ("kernel_arguments_strides", SXSTR, 2),
-        ("kernel_arguments_n_experts", SNEXP, 1),
+        (
+            "kernel_arguments_n_experts",
+            if l.rowtiles { TILE_NEXP } else { SNEXP },
+            1,
+        ),
         ("row", ROW, 1),
         ("expert_index", UIDX, 1),
         ("expert_offsets_pair", OFF0, 2),
@@ -463,6 +510,12 @@ fn plan(l: &Lay, arch: Arch) -> Result<RegPlan, String> {
         ("table_literals", LITS, 8),
     ] {
         declare(&mut regs, name, RKind::S, base, len)?;
+    }
+    if l.rows8 {
+        declare(&mut regs, "wave_index", RKind::S, WAVE, 1)?;
+    }
+    if l.rowtiles {
+        declare(&mut regs, "row_tile", RKind::S, TILE, 1)?;
     }
     for (name, base, len) in [
         ("lane", LANE, 1),
@@ -502,8 +555,14 @@ fn plan(l: &Lay, arch: Arch) -> Result<RegPlan, String> {
 
 /// Emit one entry.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
+    emit_with(spec, false, false)
+}
+
+/// The shared emitter: `rows8` selects the eight-output-wave workgroup (module docs), `false` the incumbent text.
+fn emit_with(spec: Spec, rows8: bool, rowtiles: bool) -> Result<Emitted, String> {
     spec.validate()?;
-    let l = Lay::new(spec);
+    let mut l = Lay::new(spec, rows8);
+    l.rowtiles = rowtiles;
     let kernargs = KernargLayout::new(KERNARG_BYTES)
         .pointer_access("expert_weight_ptrs", 0, Access::ReadOnly)
         .pointer_access("expert_ids", 8, Access::ReadOnly)
@@ -522,27 +581,57 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         .hidden("y_slot_stride", 84, 4, "by_value")
         .hidden("n_experts", 88, 4, "by_value")
         .hidden("reserved", 92, 4, "by_value");
+    let (symbol, variant, workgroup_size) = if rowtiles {
+        (
+            format!("{}_t8", spec.symbol()),
+            format!("{}_t8", spec.tag()),
+            CN_ROWS8_WORKGROUP_SIZE,
+        )
+    } else if rows8 {
+        (
+            cn_rows8_symbol(spec),
+            format!("{}_cn_rows8", spec.tag()),
+            CN_ROWS8_WORKGROUP_SIZE,
+        )
+    } else {
+        (spec.symbol(), spec.tag(), WORKGROUP_SIZE)
+    };
     let kspec = KernelSpec {
         kernel_id: "e8p_i4_moe_gemv".into(),
-        variant: spec.tag(),
+        variant,
         arch: spec.arch,
-        symbol: spec.symbol(),
+        symbol,
         kernargs,
         user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
-        workgroup_size: WORKGROUP_SIZE as u16,
+        workgroup_size: workgroup_size as u16,
         group_segment_fixed_size: STAGE_BYTES,
         wave32: true,
         cu_mode: false,
     };
     let mut b = Builder::new(kspec, plan(&l, spec.arch)?);
     b.enable_delay_alu();
+    if rowtiles {
+        b.enable_workgroup_id_z();
+    }
     if b.lds_slot("e8p_tables", 0, STAGE_BYTES)? != 0 {
         return Err("LDS slot order".into());
     }
     prologue(&mut b, spec, &l)?;
     b.wait_all()?;
-    stage(&mut b, &l)?;
+    if rows8 {
+        stage_rows8(&mut b, spec, &l)?;
+        // Rows past `M` leave only now: every wave of a live workgroup runs the table barrier above.
+        sop(
+            &mut b,
+            format!("s_cmp_ge_u32 s{ROW}, s{SM}"),
+            &[],
+            &[ROW, SM],
+        )?;
+        branch(&mut b, &format!("s_cbranch_scc1 {}", l.label(spec, "exit")))?;
+    } else {
+        stage(&mut b, &l)?;
+    }
     match spec.kind {
         Kind::GateUp => {
             // Groups strictly ascending; group g feeds chain g & 3: whole quads in the
@@ -554,8 +643,8 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                 &[GROUPS],
             )?;
             sop(&mut b, format!("s_cmp_eq_u32 s{QUADS}, 0"), &[], &[QUADS])?;
-            branch(&mut b, &format!("s_cbranch_scc1 {}", lbl(spec, "tail")))?;
-            b.loop_(&lbl(spec, "quad"), |b| {
+            branch(&mut b, &format!("s_cbranch_scc1 {}", l.label(spec, "tail")))?;
+            b.loop_(&l.label(spec, "quad"), |b| {
                 for chain in 0..4 {
                     group(b, spec, &l, chain, &format!("q{chain}"))?;
                 }
@@ -565,9 +654,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                     &[],
                     &[GI, QUADS],
                 )?;
-                branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "quad")))
+                branch(b, &format!("s_cbranch_scc1 {}", l.label(spec, "quad")))
             })?;
-            b.label(&lbl(spec, "tail"))?;
+            b.label(&l.label(spec, "tail"))?;
             for chain in 0..3 {
                 sop(
                     &mut b,
@@ -575,14 +664,20 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                     &[],
                     &[GI, GROUPS],
                 )?;
-                branch(&mut b, &format!("s_cbranch_scc0 {}", lbl(spec, "reduce")))?;
+                branch(
+                    &mut b,
+                    &format!("s_cbranch_scc0 {}", l.label(spec, "reduce")),
+                )?;
                 group(&mut b, spec, &l, chain, &format!("t{chain}"))?;
             }
         }
         Kind::Down => {
             sop(&mut b, format!("s_cmp_eq_u32 s{GROUPS}, 0"), &[], &[GROUPS])?;
-            branch(&mut b, &format!("s_cbranch_scc1 {}", lbl(spec, "reduce")))?;
-            b.loop_(&lbl(spec, "group"), |b| {
+            branch(
+                &mut b,
+                &format!("s_cbranch_scc1 {}", l.label(spec, "reduce")),
+            )?;
+            b.loop_(&l.label(spec, "group"), |b| {
                 group(b, spec, &l, 0, "g")?;
                 sop(
                     b,
@@ -590,11 +685,11 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                     &[],
                     &[GI, GROUPS],
                 )?;
-                branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "group")))
+                branch(b, &format!("s_cbranch_scc1 {}", l.label(spec, "group")))
             })?;
         }
     }
-    b.label(&lbl(spec, "reduce"))?;
+    b.label(&l.label(spec, "reduce"))?;
     epilogue(&mut b, spec, &l)?;
     b.finish()
 }
@@ -611,6 +706,54 @@ pub fn emit_module(
     Ok((emitted, text, proof))
 }
 
+/// Name of the gfx1201 Cn eight-output-wave module ([`emit_cn_rows8_module`]).
+pub const CN_ROWS8_MODULE: &str = "e8p_i4_moe_gemv_cn_rows8_pm_gfx1201";
+/// Output rows (waves) one workgroup of the eight-output-wave entry serves.
+pub const CN_ROWS8_ROWS: u32 = 8;
+/// Workgroup size (threads) of the eight-output-wave entry: eight wave32.
+pub const CN_ROWS8_WORKGROUP_SIZE: u32 = CN_ROWS8_ROWS * 32;
+
+/// The exported symbol of the Cn eight-output-wave entry of `spec`: the incumbent [`Spec::symbol`] plus `_cn_rows8`.
+pub fn cn_rows8_symbol(spec: Spec) -> String {
+    format!("{}_cn_rows8", spec.symbol())
+}
+
+/// One entry of the gfx1201 **Cn eight-output-wave** candidate (module docs, "Cn eight-output-wave workgroup"):
+/// the incumbent network with one workgroup serving eight output rows, one wave32 each, over a single cooperatively
+/// staged E8P table. Launch grid `[ceil(M/8), U, 1]`, block `[256, 1, 1]`, wave `w` of workgroup `x` = row `8x + w`;
+/// same 96-byte ABI (final reserved word included), guards, per-row arithmetic, fold and stores as [`emit`];
+/// symbol [`cn_rows8_symbol`]. Errors for any spec that is not gfx1201.
+pub fn emit_cn_rows8(spec: Spec) -> Result<Emitted, String> {
+    if spec.arch != Arch::Gfx1201 {
+        return Err(format!(
+            "e8p_i4_moe_gemv cn_rows8 is gfx1201 only, got {:?}",
+            spec.arch
+        ));
+    }
+    emit_with(spec, true, false)
+}
+
+/// The two Cn eight-output-wave entries (gate, down) as one code object [`CN_ROWS8_MODULE`].
+pub fn emit_cn_rows8_module() -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String>
+{
+    let emitted = module_specs(Arch::Gfx1201)
+        .into_iter()
+        .map(emit_cn_rows8)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = super::iu4_gemm::module(&emitted, CN_ROWS8_MODULE)?;
+    Ok((emitted, text, proof))
+}
+
+/// Fixed-eight-row unions over every logical width 1..64. The 96-byte ABI is unchanged:
+/// U=80, C=total logical rows, grid `[ceil(M/8),80,ceil(C/8)]`, block256.
+/// Only descriptor pointers advance by `1928*blockIdx.z`; slot ids remain absolute, so
+/// X/Y bases and their original slot/divisor addressing never receive a second tile offset.
+/// gfx11 uses its existing singleton ISA arm and cooperative `s_barrier`, not a retagged image.
+/// Availability here does not change product codec admission or certify hardware identity.
+pub fn emit_rowtiles(spec: Spec) -> Result<Emitted, String> {
+    emit_with(spec, true, true)
+}
+
 fn s_sub_i32(a: Arch) -> &'static str {
     if a.gfx12() {
         "s_sub_co_i32"
@@ -624,21 +767,72 @@ fn s_sub_i32(a: Arch) -> &'static str {
 /// The LDS store address `4 * tid` is derived first, in the entry block (before the first branch).
 fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     let a = b.spec.arch;
-    let exit = lbl(spec, "exit");
-    valu(
-        b,
-        &format!("v_lshlrev_b32_e32 v{}, 2, v{LANE}", l.lds),
-        &[l.lds],
-        &[LANE],
-        &[],
-    )?;
+    let exit = l.label(spec, "exit");
+    if l.rows8 {
+        // Eight-wave workgroup: tid = 32 * wave + lane. The LDS store address folds to `4 * (tid & 127)` (see
+        // `stage_rows8`); the lane index and the uniform wave index come from the work-item id (dead `x_address` /
+        // `x_base` registers until the first group).
+        valu(
+            b,
+            &format!("v_and_b32_e32 v{}, {}, v{LANE}", l.lds, lit(127)),
+            &[l.lds],
+            &[LANE],
+            &[],
+        )?;
+        valu(
+            b,
+            &format!("v_lshlrev_b32_e32 v{0}, 2, v{0}", l.lds),
+            &[l.lds],
+            &[l.lds],
+            &[],
+        )?;
+        valu(
+            b,
+            &format!("v_and_b32_e32 v{}, 31, v{LANE}", l.lane),
+            &[l.lane],
+            &[LANE],
+            &[],
+        )?;
+        valu(
+            b,
+            &format!("v_lshrrev_b32_e32 v{}, 5, v{LANE}", l.xb),
+            &[l.xb],
+            &[LANE],
+            &[],
+        )?;
+        op(
+            b,
+            format!("v_readfirstlane_b32 s{WAVE}, v{}", l.xb),
+            &[s(WAVE)],
+            &[v(l.xb)],
+        )?;
+    } else {
+        valu(
+            b,
+            &format!("v_lshlrev_b32_e32 v{}, 2, v{LANE}", l.lds),
+            &[l.lds],
+            &[LANE],
+            &[],
+        )?;
+    }
     smem(b, WPTRS, 8, KARG, 0)?;
     smem(b, XROT, 8, KARG, 0x20)?;
     smem(b, SU, 4, KARG, 0x40)?;
     smem(b, SXSTR, 2, KARG, 0x50)?;
-    smem(b, SNEXP, 1, KARG, 0x58)?;
+    let snexp = if l.rowtiles { TILE_NEXP } else { SNEXP };
+    smem(b, snexp, 1, KARG, 0x58)?;
     if a.gfx12() {
-        sop(b, format!("s_mov_b32 s{ROW}, ttmp9"), &[ROW], &[])?;
+        if l.rows8 {
+            sop(b, format!("s_lshl_b32 s{ROW}, ttmp9, 3"), &[ROW], &[])?;
+            sop(
+                b,
+                format!("{} s{ROW}, s{ROW}, s{WAVE}", s_add_i32(a)),
+                &[ROW],
+                &[ROW, WAVE],
+            )?;
+        } else {
+            sop(b, format!("s_mov_b32 s{ROW}, ttmp9"), &[ROW], &[])?;
+        }
         sop(b, format!("s_and_b32 s{UIDX}, ttmp7, 0xffff"), &[UIDX], &[])?;
     } else {
         // gfx11 workgroup ids are system SGPRs (after the user SGPRs), not ttmp registers.
@@ -646,11 +840,57 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         if (ids.x, ids.y) != (WgIdSource::Sgpr(WGX), WgIdSource::Sgpr(WGY)) {
             return Err(format!("unexpected workgroup id ABI {ids:?}"));
         }
-        sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+        if l.rows8 {
+            sop(b, format!("s_lshl_b32 s{ROW}, s{WGX}, 3"), &[ROW], &[WGX])?;
+            sop(
+                b,
+                format!("{} s{ROW}, s{ROW}, s{WAVE}", s_add_i32(a)),
+                &[ROW],
+                &[ROW, WAVE],
+            )?;
+        } else {
+            sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+        }
         sop(b, format!("s_mov_b32 s{UIDX}, s{WGY}"), &[UIDX], &[WGY])?;
     }
-    sop(b, format!("s_cmp_ge_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
-    branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    if l.rowtiles {
+        if a.gfx12() {
+            sop(b, format!("s_lshr_b32 s{TILE}, ttmp7, 16"), &[TILE], &[])?;
+        } else {
+            sop(b, format!("s_mov_b32 s{TILE}, s{WGZ}"), &[TILE], &[WGZ])?;
+        }
+        // A dead tile/domain exits before any descriptor or table access, uniformly.
+        sop(b, format!("s_cmp_eq_u32 s{SC}, 0"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_gt_u32 s{SC}, 64"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(
+            b,
+            format!("s_cmp_eq_u32 s{SU}, {}", lit(TILE_SLOTS)),
+            &[],
+            &[SU],
+        )?;
+        branch(b, &format!("s_cbranch_scc0 {exit}"))?;
+        sop(b, format!("s_lshl_b32 s{TMP}, s{TILE}, 3"), &[TMP], &[TILE])?;
+        sop(b, format!("s_cmp_ge_u32 s{TMP}, s{SC}"), &[], &[TMP, SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_and_b32 s{TMP}, s{ROW}, -8"), &[TMP], &[ROW])?;
+        sop(b, format!("s_cmp_ge_u32 s{TMP}, s{SM}"), &[], &[TMP, SM])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(
+            b,
+            format!("s_mul_i32 s{TMP}, s{TILE}, {}", lit(TILE_BYTES)),
+            &[TMP],
+            &[TILE],
+        )?;
+        for ptr in [EIDS, OFFS, SLOTS] {
+            add64(b, ptr, ptr, TMP)?;
+        }
+    }
+    if !l.rows8 {
+        sop(b, format!("s_cmp_ge_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    }
     sop(b, format!("s_cmp_ge_u32 s{UIDX}, s{SU}"), &[], &[UIDX, SU])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     // offsets[u], offsets[u+1] and the expert id; the expert's tensor pointer from the table.
@@ -669,7 +909,16 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_cmp_gt_u32 s{NS}, {MAX_SLOTS}"), &[], &[NS])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-    sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
+    if l.rowtiles {
+        sop(
+            b,
+            format!("s_mov_b32 s{TMP}, {}", lit(TILE_SLOTS)),
+            &[TMP],
+            &[],
+        )?;
+    } else {
+        sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
+    }
     sop(
         b,
         format!("s_cmp_gt_u32 s{OFF1}, s{TMP}"),
@@ -681,9 +930,9 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     // `n_experts` (unsigned, so a negative id too) exits without a table load or a store.
     sop(
         b,
-        format!("s_cmp_ge_u32 s{EID}, s{SNEXP}"),
+        format!("s_cmp_ge_u32 s{EID}, s{snexp}"),
         &[],
-        &[EID, SNEXP],
+        &[EID, snexp],
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
@@ -823,23 +1072,23 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     // (2*(l>>1) = l & 30) and the half shift 16*(l&1).
     valu(
         b,
-        &format!("v_lshlrev_b32_e32 v{}, 4, v{LANE}", l.xl),
+        &format!("v_lshlrev_b32_e32 v{}, 4, v{}", l.xl, l.lane),
         &[l.xl],
-        &[LANE],
+        &[l.lane],
         &[],
     )?;
     valu(
         b,
-        &format!("v_and_b32_e32 v{}, 30, v{LANE}", l.cl),
+        &format!("v_and_b32_e32 v{}, 30, v{}", l.cl, l.lane),
         &[l.cl],
-        &[LANE],
+        &[l.lane],
         &[],
     )?;
     valu(
         b,
-        &format!("v_and_b32_e32 v{}, 1, v{LANE}", l.hsh),
+        &format!("v_and_b32_e32 v{}, 1, v{}", l.hsh, l.lane),
         &[l.hsh],
-        &[LANE],
+        &[l.lane],
         &[],
     )?;
     valu(
@@ -864,9 +1113,9 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     let (sid, xq, t0, yq, p) = (l.x, l.x + 1, l.x + 2, l.x + 6, l.x + 7);
     valu(
         b,
-        &format!("v_min_u32_e32 v{p}, s{NSM1}, v{LANE}"),
+        &format!("v_min_u32_e32 v{p}, s{NSM1}, v{}", l.lane),
         &[p],
-        &[LANE],
+        &[l.lane],
         &[NSM1],
     )?;
     valu(
@@ -884,6 +1133,27 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         &[],
     )?;
     gload(b, "global_load_b32", sid, p, SLOTS, "")?;
+    if l.rowtiles {
+        // Each wave reads the same eight slot lanes (inactive lanes duplicate the final
+        // live slot). A bad absolute slot therefore exits the entire workgroup before
+        // the table barrier, without deriving an out-of-window X/Y address.
+        sop(b, format!("s_mul_i32 s{TMP2}, s{SC}, 10"), &[TMP2], &[SC])?;
+        for i in 0..MAX_SLOTS {
+            op(
+                b,
+                format!("v_readlane_b32 s{TMP}, v{sid}, {i}"),
+                &[s(TMP)],
+                &[v(sid)],
+            )?;
+            sop(
+                b,
+                format!("s_cmp_ge_u32 s{TMP}, s{TMP2}"),
+                &[],
+                &[TMP, TMP2],
+            )?;
+            branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        }
+    }
     gather_offset(
         b,
         xq,
@@ -987,113 +1257,158 @@ fn stage(b: &mut Builder, l: &Lay) -> R {
             )?;
             e
         };
-        // x = sign7 | parity(sign7) << 7; parity by xor-shift reduction (sign7 < 128).
-        valu(
-            b,
-            &format!("v_lshrrev_b32_e32 v{x}, 4, v{src}"),
-            &[x],
-            &[src],
-            &[],
-        )?;
-        valu(
-            b,
-            &format!("v_xor_b32_e32 v{pc}, v{src}, v{x}"),
-            &[pc],
-            &[src, x],
-            &[],
-        )?;
-        for sh in [2u8, 1] {
-            valu(
-                b,
-                &format!("v_lshrrev_b32_e32 v{x}, {sh}, v{pc}"),
-                &[x],
-                &[pc],
-                &[],
-            )?;
-            valu(
-                b,
-                &format!("v_xor_b32_e32 v{pc}, v{pc}, v{x}"),
-                &[pc],
-                &[pc, x],
-                &[],
-            )?;
-        }
-        valu(
-            b,
-            &format!("v_lshlrev_b32_e32 v{pc}, 7, v{pc}"),
-            &[pc],
-            &[pc],
-            &[],
-        )?;
-        valu(
-            b,
-            &format!("v_bfi_b32 v{x}, 0x80, v{pc}, v{src}"),
-            &[x],
-            &[pc, src],
-            &[],
-        )?;
-        // Spread bit k to nibble k.
-        for (shift, mask) in [(12u32, 0x000f_000fu32), (6, 0x0303_0303), (3, ONES)] {
-            valu(
-                b,
-                &format!("v_lshl_or_b32 v{x}, v{x}, {shift}, v{x}"),
-                &[x],
-                &[x],
-                &[],
-            )?;
-            valu(
-                b,
-                &format!("v_and_b32_e32 v{x}, {}, v{x}", lit(mask)),
-                &[x],
-                &[x],
-                &[],
-            )?;
-        }
-        // 0xF per set bit: (x << 4) - x.
-        valu(
-            b,
-            &format!("v_lshlrev_b32_e32 v{y}, 4, v{x}"),
-            &[y],
-            &[x],
-            &[],
-        )?;
-        valu(
-            b,
-            &format!("v_sub_nc_u32_e32 v{y}, v{y}, v{x}"),
-            &[y],
-            &[y, x],
-            &[],
-        )?;
+        mask_word(b, src, pc, x, y)?;
         b.ds_store(0, ds_store_b32(l.lds, y, LUT_BYTES + 128 * j))?;
     }
     // LUT: eight chunks of 32 dwords, one chunk register each, lane q of chunk c = LUT[32c + q].
     for c in 0..8u32 {
         let vc = chunks + c as u8;
-        for batch in 0..4u32 {
-            for q in 0..8u32 {
-                let r = LITS + q as u8;
-                sop(
-                    b,
-                    format!(
-                        "s_mov_b32 s{r}, {}",
-                        lit(lut[(32 * c + 8 * batch + q) as usize])
-                    ),
-                    &[r],
-                    &[],
-                )?;
-            }
-            for q in 0..8u32 {
-                let r = LITS + q as u8;
-                op(
-                    b,
-                    format!("v_writelane_b32 v{vc}, s{r}, {}", 8 * batch + q),
-                    &[v(vc)],
-                    &[v(vc), s(r)],
-                )?;
-            }
-        }
+        lut_chunk(b, &lut, c, vc)?;
         b.ds_store(0, ds_store_b32(l.lds, vc, 128 * c))?;
     }
+    b.barrier(&[Transition::Ready(0)])
+}
+
+/// LUT chunk `c` (32 dwords, lane `q` = `LUT[32c + q]`) written lane by lane into `vc` from SGPR literals.
+fn lut_chunk(b: &mut Builder, lut: &[u32; 256], c: u32, vc: u8) -> R {
+    for batch in 0..4u32 {
+        for q in 0..8u32 {
+            let r = LITS + q as u8;
+            sop(
+                b,
+                format!(
+                    "s_mov_b32 s{r}, {}",
+                    lit(lut[(32 * c + 8 * batch + q) as usize])
+                ),
+                &[r],
+                &[],
+            )?;
+        }
+        for q in 0..8u32 {
+            let r = LITS + q as u8;
+            op(
+                b,
+                format!("v_writelane_b32 v{vc}, s{r}, {}", 8 * batch + q),
+                &[v(vc)],
+                &[v(vc), s(r)],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The MASK dword `y` (`0xF` per set bit of `x = sign7 | parity(sign7) << 7`, bit `k` spread to nibble `k`, then
+/// `(x << 4) - x`) of table index `src` (`< 128`), through the scratch `pc`, `x`; [`stage_mask_model`] is its model.
+fn mask_word(b: &mut Builder, src: u8, pc: u8, x: u8, y: u8) -> R {
+    // x = sign7 | parity(sign7) << 7; parity by xor-shift reduction (sign7 < 128).
+    valu(
+        b,
+        &format!("v_lshrrev_b32_e32 v{x}, 4, v{src}"),
+        &[x],
+        &[src],
+        &[],
+    )?;
+    valu(
+        b,
+        &format!("v_xor_b32_e32 v{pc}, v{src}, v{x}"),
+        &[pc],
+        &[src, x],
+        &[],
+    )?;
+    for sh in [2u8, 1] {
+        valu(
+            b,
+            &format!("v_lshrrev_b32_e32 v{x}, {sh}, v{pc}"),
+            &[x],
+            &[pc],
+            &[],
+        )?;
+        valu(
+            b,
+            &format!("v_xor_b32_e32 v{pc}, v{pc}, v{x}"),
+            &[pc],
+            &[pc, x],
+            &[],
+        )?;
+    }
+    valu(
+        b,
+        &format!("v_lshlrev_b32_e32 v{pc}, 7, v{pc}"),
+        &[pc],
+        &[pc],
+        &[],
+    )?;
+    valu(
+        b,
+        &format!("v_bfi_b32 v{x}, 0x80, v{pc}, v{src}"),
+        &[x],
+        &[pc, src],
+        &[],
+    )?;
+    // Spread bit k to nibble k.
+    for (shift, mask) in [(12u32, 0x000f_000fu32), (6, 0x0303_0303), (3, ONES)] {
+        valu(
+            b,
+            &format!("v_lshl_or_b32 v{x}, v{x}, {shift}, v{x}"),
+            &[x],
+            &[x],
+            &[],
+        )?;
+        valu(
+            b,
+            &format!("v_and_b32_e32 v{x}, {}, v{x}", lit(mask)),
+            &[x],
+            &[x],
+            &[],
+        )?;
+    }
+    // 0xF per set bit: (x << 4) - x.
+    valu(
+        b,
+        &format!("v_lshlrev_b32_e32 v{y}, 4, v{x}"),
+        &[y],
+        &[x],
+        &[],
+    )?;
+    valu(
+        b,
+        &format!("v_sub_nc_u32_e32 v{y}, v{y}, v{x}"),
+        &[y],
+        &[y, x],
+        &[],
+    )
+}
+
+/// The eight-wave entry's cooperative table stage. The workgroup's eight waves publish ONE copy of the 1,536-byte
+/// tables: wave `w` writes LUT chunk `w` (its 32 lanes = `LUT[32w ..]`, from SGPR literals selected by the uniform
+/// wave index) and stores it at `4 * (tid & 127) + 512 * (w >> 2)` (the entry-block LDS address `l.lds`; waves 0-3
+/// at offset 0, waves 4-7 at offset 512); waves 0-3 also compute the MASK dword of table index `tid` and store it at
+/// `l.lds + 1024`; waves 4-7 branch over the MASK work. Every address is a function of the work-item id derived in the
+/// entry block and every access ends `<= 1536`. Each path drains its stores and all eight waves meet at the one
+/// barrier that publishes the checked slot. Scratch is the dead X-value block (`pc, x, y, chunk`).
+fn stage_rows8(b: &mut Builder, spec: Spec, l: &Lay) -> R {
+    let lut = build_lut256u32();
+    let (pc, x, y) = (l.x + 1, l.x + 2, l.x + 3);
+    let vc = l.x + 4;
+    for c in 0..8u32 {
+        let skip = l.label(spec, &format!("lut{c}_skip"));
+        sop(b, format!("s_cmp_eq_u32 s{WAVE}, {c}"), &[], &[WAVE])?;
+        branch(b, &format!("s_cbranch_scc0 {skip}"))?;
+        lut_chunk(b, &lut, c, vc)?;
+        b.label(&skip)?;
+    }
+    let (hi, join) = (l.label(spec, "stage_hi"), l.label(spec, "stage_join"));
+    sop(b, format!("s_cmp_gt_u32 s{WAVE}, 3"), &[], &[WAVE])?;
+    branch(b, &format!("s_cbranch_scc1 {hi}"))?;
+    mask_word(b, LANE, pc, x, y)?;
+    b.ds_store(0, ds_store_b32(l.lds, y, LUT_BYTES))?;
+    b.ds_store(0, ds_store_b32(l.lds, vc, 0))?;
+    b.wait_all()?;
+    branch(b, &format!("s_branch {join}"))?;
+    b.label(&hi)?;
+    b.ds_store(0, ds_store_b32(l.lds, vc, 512))?;
+    b.wait_all()?;
+    b.label(&join)?;
     b.barrier(&[Transition::Ready(0)])
 }
 
@@ -1147,7 +1462,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
     gload(b, "global_load_u16", l.wrd, l.caddr, ROW_PTR, "")?;
     gload(b, "global_load_u16", l.d, l.saddr, SCALE_PTR, "")?;
     // X loads of the live slots (slot 0 always: n >= 1), each slot's own X row.
-    let xdone = lbl(spec, &format!("{inst}_xdone"));
+    let xdone = l.label(spec, &format!("{inst}_xdone"));
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &xdone)?
@@ -1165,7 +1480,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
     b.wait_all()?;
     unpack(b, l)?;
     // Per-slot chains on the shared weights: p = RN(w0*x0), then fma(w_j, x_j, p) for j = 1..3.
-    let done = lbl(spec, &format!("{inst}_done"));
+    let done = l.label(spec, &format!("{inst}_done"));
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &done)?
@@ -1337,15 +1652,27 @@ fn unpack(b: &mut Builder, l: &Lay) -> R {
 
 /// Shuffle tables, the per-slot fold + snapshot shuffle-down tree, then the lane-0 stores.
 fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
+    // The lane index: the work-item id itself in the one-wave entry; `tid & 31` (into the dead `x_address`) when
+    // the workgroup is eight waves.
+    let lane = l.lane;
+    if l.rows8 {
+        valu(
+            b,
+            &format!("v_and_b32_e32 v{lane}, 31, v{LANE}"),
+            &[lane],
+            &[LANE],
+            &[],
+        )?;
+    }
     // Shuffle step k (offset 16 >> k): mask lane < 32 - off, address (lane + off or lane) * 4.
     let offsets = [16u32, 8, 4, 2, 1];
     for (k, off) in offsets.into_iter().enumerate() {
         let (m, sh) = (SHM + k as u8, l.shuf + k as u8);
         op(
             b,
-            format!("v_cmp_gt_u32_e64 s{m}, {}, v{LANE}", 32 - off),
+            format!("v_cmp_gt_u32_e64 s{m}, {}, v{lane}", 32 - off),
             &[s(m)],
-            &[v(LANE)],
+            &[v(lane)],
         )?;
         valu(
             b,
@@ -1356,13 +1683,13 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         )?;
         valu(
             b,
-            &format!("v_add_lshl_u32 v{sh}, v{sh}, v{LANE}, 2"),
+            &format!("v_add_lshl_u32 v{sh}, v{sh}, v{lane}, 2"),
             &[sh],
-            &[sh, LANE],
+            &[sh, lane],
             &[],
         )?;
     }
-    let red_done = lbl(spec, "red_done");
+    let red_done = l.label(spec, "red_done");
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &red_done)?
@@ -1423,12 +1750,12 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     // Lane 0 stores each live slot's value at its original slot's row.
     valu(
         b,
-        &format!("v_cmpx_eq_u32_e32 0, v{LANE}"),
+        &format!("v_cmpx_eq_u32_e32 0, v{lane}"),
         &[],
-        &[LANE],
+        &[lane],
         &[],
     )?;
-    let st_done = lbl(spec, "st_done");
+    let st_done = l.label(spec, "st_done");
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &st_done)?
@@ -1445,7 +1772,7 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     }
     b.label(&st_done)?;
     b.wait_all()?;
-    b.label(&lbl(spec, "exit"))?;
+    b.label(&l.label(spec, "exit"))?;
     branch(b, "s_endpgm")
 }
 
@@ -1585,6 +1912,13 @@ fn ds_load_b32(dst: u8, addr: u8, off: u32) -> Instruction {
 /// `s_waitcnt*`, which gfx11 requires after every load; the gfx1201 contract is unchanged.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
     let gfx12 = spec.arch.gfx12();
+    let symbol = if e.proof.variant.ends_with("_t8") {
+        format!("{}_t8", spec.symbol())
+    } else if e.proof.variant.ends_with("_cn_rows8") {
+        cn_rows8_symbol(spec)
+    } else {
+        spec.symbol()
+    };
     let counted: &[&str] = if gfx12 { &COUNTED } else { &COUNTED_GFX11 };
     let mut counts = serde_json::Map::new();
     for &name in counted {
@@ -1637,7 +1971,7 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         ])
     };
     serde_json::json!({
-        "symbol": spec.symbol(), "counts": counts,
+        "symbol": symbol, "counts": counts,
         "forbidden": forbidden,
         "vgpr_max": e.shape.next_free_vgpr, "sgpr_max": e.shape.next_free_sgpr,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,

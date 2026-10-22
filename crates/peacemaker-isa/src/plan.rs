@@ -146,6 +146,9 @@ pub struct BuilderProof {
     pub reg_plan: Vec<Range>,
     pub next_free_vgpr: u16,
     pub next_free_sgpr: u16,
+    /// The descriptor enables workgroup Z (gfx11 SGPR or gfx12 `ttmp7[31:16]`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub system_sgpr_workgroup_id_z: bool,
     pub waits: Vec<WaitProof>,
     pub hazards: Vec<HazardProof>,
     pub clauses: Vec<ClauseProof>,
@@ -155,6 +158,9 @@ pub struct BuilderProof {
     pub loop_fixpoints: Vec<LoopFixpoint>,
     pub forbidden_mnemonics_checked: Vec<String>,
     pub s_text_sha256: String,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 #[derive(Clone, Debug)]
 pub struct Emitted {

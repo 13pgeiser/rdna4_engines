@@ -12,7 +12,7 @@
 //! Frozen 96-byte kernarg ABI (DESIGN §4.2 plus the trailing `n_experts` and a reserved zero word, identical for all four symbols):
 //! u64 pointers `expert_weight_ptrs@0` (table indexed by expert id; each entry is
 //! the projection tensor's code-plane base of that expert, never
-//! `expert_id * stride`), `expert_ids@8` (`u32[U]`, ascending), `expert_offsets@16`
+//! `expert_id * stride`), `expert_ids@8` (`u32[U]`, planner first-occurrence order), `expert_offsets@16`
 //! (`u32[U+1]`), `slot_ids@24` (`u32[10*C]`, original slots `lane*10+rank`),
 //! `Xrot@32` (F32 rotated input), `Y0@40`, `Y1@48`; u32 `M@56`, `K@60`, `U@64`,
 //! `C@68`, `x_row_div@72`, `x_src_rows@76`, `x_row_stride@80`, `y_slot_stride@84`, `n_experts@88` (the extent of
@@ -79,11 +79,18 @@
 //! comparison; no speed claim is made for either network. The network is an emitter choice, not a
 //! symbol axis or ABI field; `Mq4Sym` and every arithmetic step are unchanged.
 //!
-//! Wide twins (`_c16`, `_c32`, [`Cap`]; [`wide`]): the same four symbols with the suffix `_c16` / `_c32`, row-exact wide
-//! verify for up to 16 / 32 token lanes (`n <= 16 | 32` slots per expert, `U` distinct experts up to `10*C`). Same 96-byte ABI
+//! Legacy diagnostic twins (`_c16`, `_c32`, [`Cap`]; [`wide`]) retain the same four
+//! symbols for 16 / 32 token lanes (`n <= 16 | 32`, `U <= 10*C`). Same 96-byte ABI
 //! and the same arithmetic; grid `[ceil(M/8), U, 1]`, block 256 (one wave per matrix-local output row, eight rows per
 //! workgroup, every slot of the expert per wave), the slots' X staged through LDS eight at a time. The C8 entries above are
 //! unchanged byte for byte.
+//!
+//! Row tiles ([`emit_rowtiles`]) use fixed eight-slot unions at every logical width
+//! 1..=64, not larger accumulator banks. The unchanged 96-byte ABI has `U=80`,
+//! `C=total rows`; grid `[ceil(M/8),80,ceil(C/8)]`, block256. Only descriptor
+//! pointers advance by `1928*wg_z` bytes. Slots remain absolute and X/Y retain
+//! their whole-window bases. gfx1151 uses its incumbent Cn schedule and symbol
+//! family; gfx1201 uses the eight-output-wave read-once schedule in [`wide`].
 
 use crate::arch::{WgIdSource, WgIds};
 use crate::insn::{Instruction, MemoryClass};
@@ -251,8 +258,9 @@ impl Spec {
     }
 }
 
-/// Every entry of one architecture in module order: the C8 entries (Mq3I4 gate, Mq3I4 down, Mq4Sym gate, Mq4Sym down),
-/// then the same four at C16, then at C32.
+/// Diagnostic module order: four C8 entries, then four C16 and four C32 entries.
+/// Production image composition uses [`narrow_specs`] plus [`emit_rowtiles`],
+/// not the legacy wide diagnostics.
 pub fn module_specs(arch: Arch) -> Vec<Spec> {
     Cap::ALL
         .into_iter()
@@ -541,6 +549,35 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     emit_with_network(spec, Network::Reference)
 }
 
+/// Fixed-eight-row descriptor tiles for total logical rows 1..=64.
+///
+/// `cap` does not select a register-bank width here: the physical capacity is
+/// always eight. The architecture's incumbent projection symbol gains `_t8`.
+/// gfx1151 keeps its Cn symbol/module family; gfx1201 keeps this module family.
+pub fn emit_rowtiles(spec: Spec) -> Result<Emitted, String> {
+    spec.validate()?;
+    if spec.arch == Arch::Gfx1151 {
+        use super::mq_i4_moe_gemv_cn as cn;
+        return cn::emit_rowtiles(cn::Spec::new(
+            match spec.codec {
+                Codec::Mq3I4 => cn::Codec::Mq3I4,
+                Codec::Mq4Sym => cn::Codec::Mq4Sym,
+            },
+            match spec.kind {
+                Kind::GateUp => cn::Kind::GateUp,
+                Kind::Down => cn::Kind::Down,
+            },
+        ));
+    }
+    wide::emit(
+        Spec {
+            cap: Cap::C8,
+            ..spec
+        },
+        Network::Reference,
+    )
+}
+
 /// The retained revised network (one `global_load_u16` packet); byte-exact on GPU but slower by measurement, so not production.
 pub fn emit_optimized(spec: Spec) -> Result<Emitted, String> {
     emit_with_network(spec, Network::Optimized)
@@ -652,7 +689,7 @@ fn emit_with_network(spec: Spec, net: Network) -> Result<Emitted, String> {
     b.finish()
 }
 
-/// All twelve entries as one code object (`Spec::module`): the four C8 entries, then the C16 and C32 twins.
+/// Diagnostic code object containing the four C8 entries and C16/C32 comparisons.
 pub fn emit_module(
     arch: Arch,
 ) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
@@ -1499,6 +1536,32 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
 /// Committed as `kernels/mq_i4_moe_gemv.<arch>.<tag>.contract.json`. The forbidden wait
 /// family is the other architecture's: `s_waitcnt*` on gfx12, the gfx12 counter waits on gfx11.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
+    contract_impl(spec, e, false)
+}
+
+/// Contract for [`emit_rowtiles`], including its architecture-local symbol and
+/// fixed-eight-slot LDS resources rather than the legacy `cap` schedule.
+pub fn contract_rowtiles(spec: Spec, e: &Emitted) -> serde_json::Value {
+    contract_impl(spec, e, true)
+}
+
+fn contract_impl(spec: Spec, e: &Emitted, rowtiles: bool) -> serde_json::Value {
+    if rowtiles && spec.arch == Arch::Gfx1151 {
+        use super::mq_i4_moe_gemv_cn as cn;
+        return cn::contract_rowtiles(
+            cn::Spec::new(
+                match spec.codec {
+                    Codec::Mq3I4 => cn::Codec::Mq3I4,
+                    Codec::Mq4Sym => cn::Codec::Mq4Sym,
+                },
+                match spec.kind {
+                    Kind::GateUp => cn::Kind::GateUp,
+                    Kind::Down => cn::Kind::Down,
+                },
+            ),
+            e,
+        );
+    }
     let mut counts = serde_json::Map::new();
     for name in COUNTED {
         let n = e
@@ -1511,7 +1574,7 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         }
     }
     // Narrow entries: the committed list, in its committed order; the wide twins use LDS and barriers.
-    let narrow = spec.cap == Cap::C8;
+    let narrow = spec.cap == Cap::C8 && !rowtiles;
     let mut forbidden = vec!["scratch_*", "flat_*"];
     if narrow {
         forbidden.extend(["ds_load*", "ds_store*"])
@@ -1534,11 +1597,12 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
     }
     forbidden.extend(["s_setpc*", "s_swappc*"]);
     serde_json::json!({
-        "symbol": spec.symbol(), "counts": counts,
+        "symbol": if rowtiles { format!("mq_i4_moe_gemv_{}_{}_t8", spec.codec.tag(), spec.kind.tag()) } else { spec.symbol() }, "counts": counts,
         "forbidden": forbidden,
         "vgpr_max": e.shape.next_free_vgpr, "sgpr_max": e.shape.next_free_sgpr,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
-        "launch_dynamic_lds_bytes": 0, "group_segment_fixed_bytes": spec.lds_bytes(),
+        "launch_dynamic_lds_bytes": 0,
+        "group_segment_fixed_bytes": if rowtiles { wide::SLOT_TILE * 32 * 4 * u32::from(spec.lane_elems()) } else { spec.lds_bytes() },
     })
 }
 const COUNTED: [&str; 35] = [

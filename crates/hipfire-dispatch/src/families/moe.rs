@@ -1980,6 +1980,7 @@ pub struct MoePrefillParams<'a> {
     /// Layer index handed to `ep_row_gather` (it selects the gather buffer);
     /// read only when `ep_row_gather` is `Some`, `0` otherwise.
     pub ep_layer_idx: u16,
+
     /// Owner-routed EP chunk exchange (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): when
     /// `Some`, the lowering admits only the grouped symmetric IU4 prefill (the
     /// verified-symmetric QT44/QT53 route at >= 512 rows), inserts a
@@ -2276,10 +2277,200 @@ pub fn gated_moe_prefill_admissible(
 /// verify use site, not here.
 pub const NARROW_VERIFY_MAX_ROWS: usize = 4;
 
+/// Actual storage bound (rows) of a CPU split executor: the single
+/// [`crate::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS`] declaration (64) owned by
+/// `cpu_split.rs`. Storage only, NOT a qualification or a default: the legacy
+/// default route still admits at most [`NARROW_VERIFY_MAX_ROWS`] rows, and a
+/// 5..64-row call additionally needs an explicit lab-wide qualification (the
+/// routing/admission owners' `verify_rows > 8` scope). Never define a second
+/// spelling of either width here.
+pub use crate::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS;
+
+/// Per-call lab-wide verify scope the routing slice measured for this call.
+///
+/// G2/G4 contract: BOTH explicit lab arms — `wide8` and `wide64` — execute the
+/// FULL logical R1..64 CPU expert backend after actual 640-slot storage. The
+/// `wide8` arm only closes the GPU few-row projection routes above 8 (the
+/// incumbent prefill-kernel baseline); it MUST NOT leave a CPU backend hard
+/// cap of 8/4 or force a whole-forward chunk.
+///
+/// Gate (presence, not value): the CPU experimental capacity is gated on
+/// EXPLICIT existing-oracle-override presence plus the eager-verify scope and
+/// actual allocated storage — never on `Gpu::few_row_limit` as a CPU physical
+/// capacity (that is a GPU projection-route limit, not CPU storage). Concretely
+/// `lab_armed` is true only when the caller observed the existing oracle
+/// override present (the `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` developer var or the
+/// runtime override) on an exact oracle arch alongside an eager (non-prefill,
+/// non-captured) verify scope. Default (no lab override present) remains
+/// qualified CPU 4; ordinary prefill and lanes are unchanged (they never arm).
+/// Carried per call (never a global), so an ordinary prefill in the same
+/// process keeps the default 4-row route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuWideVerifyScope {
+    /// Explicit lab override observed present for this call.
+    pub lab_armed: bool,
+    /// Frozen row-exact verify rows measured for this call (the existing
+    /// override value clamped `8..=64`, or the per-arch table default).
+    /// Informational only: NEVER a CPU capacity (see `lab_armed`).
+    pub verify_rows: usize,
+}
+
+impl CpuWideVerifyScope {
+    /// Default product scope: no lab override observed.
+    pub const fn default_scope() -> Self {
+        Self {
+            lab_armed: false,
+            verify_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+        }
+    }
+
+    /// Scope from an observed override presence plus the measured
+    /// `verify_rows` value (already clamped `8..=64` by the frozen getter).
+    /// `lab_armed` MUST be the existing-override presence (env or runtime) on
+    /// an exact oracle arch with an eager verify scope — never derived from
+    /// `few_row_limit`, which is a GPU route limit, not CPU storage.
+    pub const fn from_lab_presence(lab_armed: bool, verify_rows: usize) -> Self {
+        Self {
+            lab_armed,
+            verify_rows,
+        }
+    }
+
+    /// Scope from a measured `verify_rows` value alone (no presence signal).
+    /// Presence-unknown callers MUST use this: a value above 8 does NOT arm
+    /// the lab path by itself (a wide GPU arm is not CPU storage proof).
+    /// Kept for back-compat; prefer [`Self::from_lab_presence`].
+    pub const fn from_verify_rows(verify_rows: usize) -> Self {
+        Self {
+            lab_armed: false,
+            verify_rows,
+        }
+    }
+
+    /// Whether this call runs inside an explicit lab-wide eager-verify scope:
+    /// the existing oracle override was observed present. Ordinary prefill,
+    /// lanes and the default product route read `false`.
+    pub const fn is_lab_wide(&self) -> bool {
+        self.lab_armed
+    }
+
+    /// Qualified CPU rows for this call: 4 on the default route; inside an
+    /// explicit lab-wide scope, `min(capacity, STORAGE)` — the ACTUAL
+    /// allocated capacity, never the `verify_rows` clamp. `verify_rows` is the
+    /// informational GPU arm width only; the wide8 baseline
+    /// (`from_lab_presence(true, 8)`) with 64-row storage qualifies the FULL
+    /// R1..64 CPU backend. The executor gate independently checks allocated
+    /// capacity. Default (unarmed) stays qualified 4.
+    pub const fn qualified_max_rows(&self, capacity_rows: usize) -> usize {
+        if !self.lab_armed {
+            return NARROW_VERIFY_MAX_ROWS;
+        }
+        if capacity_rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        } else {
+            capacity_rows
+        }
+    }
+}
+
+/// Prewarmed D1 host-slot scratch rows visible to the routing slice (the
+/// admission owner's `reserve_moe_cpu_host_slot_scratch` reservation, in rows;
+/// `0` until the admission owner prewarms 64-row storage). Room for the
+/// admission owner to back this with its real reservation getter without a
+/// routing-slice edit: routing calls ONLY this function for the D1 capacity
+/// source, never a constant. D1 has no split executor, so the executor
+/// capacity API does not apply here.
+/// D1 capacity source: the binding minimum of actual prewarmed host-slot
+/// scratch rows and actual pinned-transfer stage rows for this call's
+/// geometry, on the calling thread. `dim/mi/top_k` are the call's expert
+/// geometry; `device_id` is the sealing context's device. Returns `0`
+/// (legacy `<= 4` windows only, fail-closed) when nothing is prewarmed, when
+/// geometry is zero/overflows, or when the stage belongs to another device or
+/// is pending. Routing calls ONLY this function for the D1 capacity source,
+/// never a constant. The admission owner prewarms both (`admission` +
+/// `reserve_cpu_transfer_values`); this function only reads actuals.
+///
+/// Stage formula authority (`cpu_exec.rs`): `stage_bytes = (n_x + slots) * 8`
+/// with `n_x = R*dim` (activation + residual) and `slots = R*top_k` (indices +
+/// weights), so `stage_rows = bytes / (8 * (dim + top_k))`. A `4*(dim+2*top_k)`
+/// inverse would undercharge the stage and overstate capacity — never use it.
+pub fn cpu_d1_prewarmed_scratch_rows(dim: usize, mi: usize, top_k: usize, device_id: i32) -> usize {
+    let host_rows = crate::cpu_exec::moe_cpu_host_slot_scratch_capacity_rows(dim, mi, top_k);
+    if host_rows == 0 {
+        return 0;
+    }
+    let per_row = (dim as u128)
+        .checked_add(top_k as u128)
+        .unwrap_or(u128::MAX);
+    if per_row == 0 {
+        return 0;
+    }
+    let stage_bytes = crate::cpu_exec::cpu_transfer_capacity_bytes(device_id) as u128;
+    let denom = per_row.checked_mul(8).unwrap_or(0);
+    if denom == 0 {
+        return 0;
+    }
+    let stage_rows = (stage_bytes / denom).min(usize::MAX as u128) as usize;
+    host_rows.min(stage_rows)
+}
+
+/// Whether a D1 (`cpu_deferred_experts`) window of `rows` real rows over
+/// `route_rows` routing rows takes the CPU splice under this call's lab-wide
+/// scope with prewarmed host scratch: decode and a whole verify window of at
+/// most `scope.qualified_max_rows(scratch_rows)` rows, and only when the real
+/// rows are the whole routing window. Default (no lab override present, or no
+/// prewarm yet) keeps the legacy 4-row gate; an explicit lab-wide eager-verify
+/// scope with actual 64-row prewarmed scratch admits the whole logical 1..64
+/// window. Ordinary prefill and lanes never arm (their `armed` is false or
+/// their rows are not the whole routing window). No chunking, no new math.
+pub const fn cpu_d1_wide_window_qualified(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    scope: CpuWideVerifyScope,
+    scratch_rows: usize,
+) -> bool {
+    // The legacy `<= 4`-row windows never need prewarmed scratch (an armed
+    // scope with nothing prewarmed is fail-closed to them, not to zero rows).
+    let scoped = scope.qualified_max_rows(scratch_rows);
+    let qualified = if scoped < NARROW_VERIFY_MAX_ROWS {
+        NARROW_VERIFY_MAX_ROWS
+    } else {
+        scoped
+    };
+    crate::cpu_split::cpu_splice_window_qualified(armed, rows, route_rows, qualified)
+}
+
+/// Whether a call of `rows` real rows over `route_rows` routing rows takes the
+/// CPU routed-expert window on a layer that is `armed`, under this call's
+/// lab-wide scope and the executor's allocated capacity: decode and a verify
+/// window of at most `scope.qualified_max_rows(capacity_rows)` rows, and only
+/// when the real rows are the whole routing window. A call over a wider
+/// routing window (a short tail of a long prefill whose `route_rows` is the
+/// canonical chunk) takes the GPU route. No chunking: the whole logical
+/// 1..64-row window seals one forward; GDN/QSA/PLE/capture keep full-window
+/// state. `capacity_rows` is the executor's allocated
+/// [`crate::cpu_split::CpuSplitExecutor::capacity_rows`]; callers MUST pass
+/// the executor's own value, never a constant.
+pub const fn cpu_wide_window_qualified(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    scope: CpuWideVerifyScope,
+    capacity_rows: usize,
+) -> bool {
+    let qualified = scope.qualified_max_rows(capacity_rows);
+    crate::cpu_split::cpu_splice_window_qualified(armed, rows, route_rows, qualified)
+}
+
 /// The layer's CPU split executor when a `rows`-row call takes the split mode
-/// (`1..=CPU_SPLIT_MAX_ROWS` rows and the owner attached an executor). The one
-/// predicate both sealing and execution read; wider windows return `None` and
-/// stay ordinary wide prefill.
+/// on the default route (`1..=NARROW_VERIFY_MAX_ROWS` rows and the owner
+/// attached an executor with allocated capacity for them). Storage-only gate:
+/// wider logical windows return `None` here and qualify only through
+/// [`cpu_wide_window_qualified`] with an explicit lab-wide scope plus the
+/// executor's allocated [`crate::cpu_split::CpuSplitExecutor::capacity_rows`].
+/// The one predicate both sealing and execution read on the default path;
+/// unqualified wider windows stay ordinary wide prefill.
 pub fn cpu_split_executor(
     experts: &dyn RoutedExpertWeights,
     rows: usize,
@@ -2289,7 +2480,28 @@ pub fn cpu_split_executor(
     }
     experts
         .cpu_split()
-        .filter(|executor| rows <= executor.max_rows())
+        .filter(|executor| rows <= executor.capacity_rows())
+}
+
+/// The layer's CPU split executor for a call inside an explicit lab-wide
+/// verify scope: `1..=STORAGE`-row logical windows whose executor has
+/// allocated capacity for them. The routing slice calls this ONLY after
+/// [`cpu_wide_window_qualified`] admitted the window (armed layer, whole
+/// routing window, qualified width, allocated capacity); the executor then
+/// independently refuses any `rows` past its allocation. Unqualified windows
+/// (ordinary prefill, lanes, default route) never reach this and keep the
+/// [`cpu_split_executor`] default-4 gate. Full-window state/capture/ticket
+/// stay intact: one forward, never chunked.
+pub fn cpu_split_executor_wide(
+    experts: &dyn RoutedExpertWeights,
+    rows: usize,
+) -> Option<&crate::cpu_split::CpuSplitExecutor> {
+    if rows == 0 || rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+        return None;
+    }
+    experts
+        .cpu_split()
+        .filter(|executor| rows <= executor.capacity_rows())
 }
 
 impl<'a> MoeParams<'a> {
@@ -3105,6 +3317,120 @@ mod tests {
             );
         }
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&(NARROW_VERIFY_MAX_ROWS + 1)));
+    }
+
+    #[test]
+    fn cpu_wide_scope_truth_table_is_1_to_64_wiring_only() {
+        // Wiring only — MUST NOT be counted as numeric proof. The G1/G2
+        // family gates (real-layer exact parity, long-prefill staging) still
+        // qualify 5..64; this test only pins the routing/admission truth:
+        // default scope admits 1..=4, lab-wide scope admits whole 1..64
+        // windows with allocated capacity, tails never qualify.
+        use crate::cpu_split::{cpu_splice_window_qualified, CPU_SPLIT_MAX_ROWS};
+        assert_eq!(NARROW_VERIFY_MAX_ROWS, 4);
+        assert_eq!(CPU_SPLIT_STORAGE_MAX_ROWS, 64);
+        let default = CpuWideVerifyScope::default_scope();
+        assert!(!default.is_lab_wide());
+        assert_eq!(default.qualified_max_rows(64), 4);
+        // Value alone never arms: a wide GPU arm without override presence is
+        // not CPU storage proof (G2/G4: never gate on few_row_limit-as-value).
+        for verify in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            let scope = CpuWideVerifyScope::from_verify_rows(verify);
+            assert!(!scope.is_lab_wide(), "verify={verify}");
+            assert_eq!(scope.qualified_max_rows(64), 4, "verify={verify}");
+        }
+        // Presence arms both lab widths: wide8 AND wide64 execute the FULL
+        // logical R1..64 backend after actual storage (wide8 only closes the
+        // GPU few-row projection routes above 8; it must not cap the CPU at 8).
+        // Qualification is actual capacity clamped to storage — NEVER the
+        // verify_rows value (required wide8-baseline R64 CPU reachability).
+        assert_eq!(
+            CpuWideVerifyScope::from_lab_presence(true, 8).qualified_max_rows(64),
+            64,
+        );
+        for verify in [8usize, 9, 16, 64] {
+            let scope = CpuWideVerifyScope::from_lab_presence(true, verify);
+            assert!(scope.is_lab_wide(), "verify={verify}");
+            for capacity in [0usize, 1, 4, 8, 40, 64, 65, 512] {
+                assert_eq!(
+                    scope.qualified_max_rows(capacity),
+                    capacity.min(CPU_SPLIT_STORAGE_MAX_ROWS),
+                    "verify={verify} capacity={capacity}"
+                );
+            }
+        }
+        // Lab-wide scope at every width qualifies actual capacity (capped by
+        // storage), independent of the verify width; unarmed stays 4.
+        for verify in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            let scope = CpuWideVerifyScope::from_lab_presence(true, verify);
+            assert!(scope.is_lab_wide(), "verify={verify}");
+            assert_eq!(scope.qualified_max_rows(64), 64, "verify={verify}");
+            assert_eq!(scope.qualified_max_rows(4), 4, "verify={verify}");
+        }
+        // Whole-window predicate across the full logical 1..64 range: armed
+        // whole windows qualify iff within the qualified width; tails
+        // (`rows != route_rows`) and zero rows never do.
+        for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            assert!(
+                cpu_splice_window_qualified(true, rows, rows, CPU_SPLIT_MAX_ROWS) == (rows <= 4)
+            );
+            assert!(cpu_wide_window_qualified(true, rows, rows, default, 64) == (rows <= 4));
+            // wide8 presence executes the FULL R1..64 backend (not capped at 8).
+            let lab8 = CpuWideVerifyScope::from_lab_presence(true, 8);
+            assert!(
+                cpu_wide_window_qualified(true, rows, rows, lab8, 64),
+                "wide8 rows={rows}"
+            );
+            let lab64 = CpuWideVerifyScope::from_lab_presence(true, 64);
+            assert!(cpu_wide_window_qualified(true, rows, rows, lab64, 64));
+            assert!(!cpu_wide_window_qualified(true, rows, rows, lab64, 4) || rows <= 4);
+            assert!(!cpu_wide_window_qualified(true, rows, rows + 1, lab64, 64));
+            assert!(!cpu_wide_window_qualified(true, rows, 64, lab64, 64) || rows == 64);
+        }
+        assert!(!cpu_wide_window_qualified(true, 0, 0, default, 64));
+        assert!(!cpu_wide_window_qualified(false, 4, 4, default, 64));
+        // Storage gate: beyond-64 never resolves, even lab-wide.
+        assert!(cpu_split_executor_wide_is_none_past_storage());
+    }
+
+    #[test]
+    fn cpu_d1_wide_truth_is_1_to_64_wiring_only() {
+        // Wiring only — MUST NOT be counted as numeric proof. Default keeps the
+        // legacy `<= 4` gate; lab presence with prewarmed scratch admits whole
+        // logical 1..64 windows; tails/zero/unprewarmed refuse.
+        let default = CpuWideVerifyScope::default_scope();
+        let lab64 = CpuWideVerifyScope::from_lab_presence(true, 64);
+        let lab8 = CpuWideVerifyScope::from_lab_presence(true, 8);
+        for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, default, 64) == (rows <= 4));
+            // No prewarm (0 rows): only legacy windows qualify, even when armed.
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, lab64, 0) == (rows <= 4));
+            // Prewarmed 64: full window qualifies (wide8 presence included).
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, lab64, 64));
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, lab8, 64));
+            // Tails never qualify.
+            assert!(!cpu_d1_wide_window_qualified(
+                true,
+                rows,
+                rows + 1,
+                lab64,
+                64
+            ));
+            // Unprewarmed geometry reports 0 rows (fail-closed): zero dims and
+            // an unreserved thread hold no rows.
+            assert_eq!(cpu_d1_prewarmed_scratch_rows(0, 640, 10, 0), 0);
+            assert_eq!(cpu_d1_prewarmed_scratch_rows(2560, 0, 10, 0), 0);
+            assert_eq!(cpu_d1_prewarmed_scratch_rows(2560, 640, 0, 0), 0);
+        }
+        assert!(!cpu_d1_wide_window_qualified(true, 0, 0, lab64, 64));
+        assert!(!cpu_d1_wide_window_qualified(false, 4, 4, lab64, 64));
+    }
+
+    #[cfg(test)]
+    fn cpu_split_executor_wide_is_none_past_storage() -> bool {
+        // The storage gate refuses 65+ structurally (no executor needed: the
+        // row bound itself rejects). Proved by the bound, not by hardware.
+        65 > CPU_SPLIT_STORAGE_MAX_ROWS
     }
 
     fn fp8_b128_refusal(err: DispatchError) -> bool {

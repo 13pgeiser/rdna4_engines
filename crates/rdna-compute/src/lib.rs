@@ -121,6 +121,8 @@ pub use trunk_mask::{
 };
 
 pub use compiler::KernelCompiler;
+#[cfg(feature = "lab")]
+pub use dispatch::LabKernelFaultReceipt;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
     HostAllocLease, QsaExtentDepth, VmmPrefixSet, VmmPrefixSpec, VmmResourceMove, GL_CB2, GL_CB3,
@@ -129,10 +131,16 @@ pub use dispatch::{
     MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES,
     MQ6G256V2_GROUP_BYTES,
 };
+#[cfg(feature = "lab")]
+pub use dispatch::{
+    lab_extract_device_bytes, LabG1DownBorrow, LabG1GateUpBorrow, LabG1WindowSeal, LabG1Witness,
+};
 #[cfg(target_os = "linux")]
 pub use dispatch::{
     ExportedWeightAllocation, ImportedWeightAllocationDesc, EXPORT_WEIGHT_TAIL_PAD_BYTES,
 };
+#[cfg(feature = "lab")]
+pub use dispatch::{LabLaunchWitness, LabProjectionLaunch};
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;

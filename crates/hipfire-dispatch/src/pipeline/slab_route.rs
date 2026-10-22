@@ -30,12 +30,12 @@ use super::layer_ops::hip;
 use crate::families::moe::MoeDtypes;
 use crate::types::DispatchError;
 use rdna_compute::slab_moe::{
-    k1_rows8_cold_codec, SlabBuckets, SLAB_EXPERTS, SLAB_NARROW_MAX_LANES, SLAB_TOP_K,
+    k1_rows8_cold_codec, SlabBuckets, SLAB_EXPERTS, SLAB_NARROW_MAX_LANES,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Lanes of one unchanged narrow K1 launch; wider admitted calls either select
-/// an opted-in C16/C32 twin or retain exact groups of this size.
+/// Lanes of one unchanged narrow K1 launch. Wider admitted calls use fixed
+/// eight-row tile descriptors for the whole window, never host launch groups.
 pub const K1_MAX_ROWS: usize = SLAB_NARROW_MAX_LANES;
 /// Bytes of the u8 codec table.
 pub const CODEC_U8_BYTES: usize = SLAB_EXPERTS;
@@ -123,42 +123,24 @@ pub(crate) fn codec_i32(tags: &GpuTensor) -> Result<GpuTensor, DispatchError> {
     })
 }
 
-/// One K1 launch group of a wide call: `n` lanes (`<= K1_MAX_ROWS`) starting at
-/// lane `first`.
-fn k1_groups(lanes: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..lanes)
-        .step_by(K1_MAX_ROWS)
-        .map(move |first| (first, K1_MAX_ROWS.min(lanes - first)))
-}
-
 fn k1_check_lanes(gpu: &Gpu, what: &str, lanes: usize) -> Result<(), DispatchError> {
-    let limit = gpu.few_row_limit();
+    let limit = gpu
+        .few_row_limit()
+        .min(rdna_compute::slab_moe::SLAB_MAX_LANES);
     if lanes == 0 || lanes > limit {
         return Err(refuse(&format!("{what}: lanes must be 1..={limit}")));
     }
     Ok(())
 }
 
-/// The `[n * 10]` id view of lanes `first..first + n` of `topk` (slot = lane * 10
-/// + rank, i32 words).
-fn topk_group(topk: &GpuTensor, first: usize, n: usize) -> GpuTensor {
-    GpuTensor {
-        buf: topk
-            .buf
-            .byte_view(first * SLAB_TOP_K * 4, n * SLAB_TOP_K * 4),
-        shape: vec![n * SLAB_TOP_K],
-        dtype: topk.dtype,
-    }
-}
-
 /// K1 gate/up of `lanes` lanes (up to the shared per-architecture exact cap):
 /// union of `topk` and launches every non-empty bucket. `xr` `[lanes, 2560]`
 /// F32 rotated activations; `gate_out`/`up_out` `[lanes * 10, 640]` F32.
 ///
-/// The K1 opt-in selects one C16/C32 union and launch for wider admitted calls.
-/// Otherwise consecutive <=8-lane groups retain S1's exact fallback, with a
-/// separate union plan immediately before each launch. The scratch then holds
-/// only the last group's plan on return (see [`k1_down`]).
+/// Wider calls require a tile-capable K1 twin before any planner mutation.
+/// One union-planner launch writes all eight-row tile descriptors; each codec
+/// projection consumes that whole window in one launch. The descriptors remain
+/// immutable across SwiGLU and are reused by [`k1_down`].
 ///
 /// One lane of an MQ4 or W3 layer on gfx1151 (unless `HIPFIRE_QWEN4_SLAB_K1_C1=0`) takes K1-C1
 /// instead: one launch for both codecs straight from `topk`, no union plan (bitwise the K1 result).
@@ -187,52 +169,30 @@ pub(crate) fn k1_gate_up(
             layer.cold_codec,
         ));
     }
-    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
-        hip(gpu.qwen4_slab_union_plan(topk, layer.buckets, lanes))?;
-        return hip(gpu.mq_i4_moe_gemv_slab(
-            false,
-            layer.buckets,
-            gate_up_ptrs,
-            xr,
-            gate_out,
-            Some(up_out),
-            lanes,
-            layer.cold_codec,
+    if lanes > K1_MAX_ROWS && !gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
+        return Err(refuse(
+            "k1_gate_up: wide lanes require an admitted tile-capable K1 twin",
         ));
     }
-    const GATE_UP_K: usize = rdna_compute::slab_moe::SLAB_GATE_UP_K;
-    const GATE_UP_HALF: usize = rdna_compute::slab_moe::SLAB_GATE_UP_M / 2;
-    for (first, n) in k1_groups(lanes) {
-        let ids = topk_group(topk, first, n);
-        let slots = (first * SLAB_TOP_K, n * SLAB_TOP_K);
-        let x = xr.sub_offset(first * GATE_UP_K, n * GATE_UP_K);
-        let gate = gate_out.sub_offset(slots.0 * GATE_UP_HALF, slots.1 * GATE_UP_HALF);
-        let up = up_out.sub_offset(slots.0 * GATE_UP_HALF, slots.1 * GATE_UP_HALF);
-        hip(gpu.qwen4_slab_union_plan(&ids, layer.buckets, n))?;
-        hip(gpu.mq_i4_moe_gemv_slab(
-            false,
-            layer.buckets,
-            gate_up_ptrs,
-            &x,
-            &gate,
-            Some(&up),
-            n,
-            layer.cold_codec,
-        ))?;
-    }
-    Ok(())
+    hip(gpu.qwen4_slab_union_plan(topk, layer.buckets, lanes))?;
+    hip(gpu.mq_i4_moe_gemv_slab(
+        false,
+        layer.buckets,
+        gate_up_ptrs,
+        xr,
+        gate_out,
+        Some(up_out),
+        lanes,
+        layer.cold_codec,
+    ))
 }
 
 /// K1 down of `lanes` lanes (up to the shared per-architecture exact cap): `xrot`
 /// `[lanes * 10, 640]` F32, `y0` `[lanes * 10, 2560]` F32 unweighted.
 ///
-/// Narrow and opted-in C16/C32 calls use the union gate/up planned (K1-C1 at one lane reads
-/// `topk` instead and needs no union).
-/// Otherwise a wider call runs 8-lane groups like [`k1_gate_up`]; the union
-/// scratch holds only the last gate/up group's plan (the SwiGLU stage sits
-/// between the two calls), so each group re-plans its own `topk` ids
-/// immediately before its launch, which makes every group's down read exactly
-/// the union its gate/up read.
+/// Narrow and wide tiled calls consume the immutable union descriptors from
+/// gate/up, without replanning after SwiGLU. K1-C1 at one lane reads `topk`
+/// instead and needs no union.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k1_down(
     gpu: &mut Gpu,
@@ -256,59 +216,36 @@ pub(crate) fn k1_down(
             layer.cold_codec,
         ));
     }
-    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
-        return hip(gpu.mq_i4_moe_gemv_slab(
-            true,
-            layer.buckets,
-            down_ptrs,
-            xrot,
-            y0,
-            None,
-            lanes,
-            layer.cold_codec,
+    if lanes > K1_MAX_ROWS && !gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
+        return Err(refuse(
+            "k1_down: wide lanes require an admitted tile-capable K1 twin",
         ));
     }
-    const DOWN_K: usize = rdna_compute::slab_moe::SLAB_DOWN_K;
-    const DOWN_M: usize = rdna_compute::slab_moe::SLAB_DOWN_M;
-    for (first, n) in k1_groups(lanes) {
-        let ids = topk_group(topk, first, n);
-        let (slot0, slots) = (first * SLAB_TOP_K, n * SLAB_TOP_K);
-        let x = xrot.sub_offset(slot0 * DOWN_K, slots * DOWN_K);
-        let y = y0.sub_offset(slot0 * DOWN_M, slots * DOWN_M);
-        hip(gpu.qwen4_slab_union_plan(&ids, layer.buckets, n))?;
-        hip(gpu.mq_i4_moe_gemv_slab(
-            true,
-            layer.buckets,
-            down_ptrs,
-            &x,
-            &y,
-            None,
-            n,
-            layer.cold_codec,
-        ))?;
-    }
-    Ok(())
+    hip(gpu.mq_i4_moe_gemv_slab(
+        true,
+        layer.buckets,
+        down_ptrs,
+        xrot,
+        y0,
+        None,
+        lanes,
+        layer.cold_codec,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::slab_moe_decode::{self as k1, BucketKey, Codec, Kind};
-    use super::{k1_groups, K1_MAX_ROWS};
+    use super::K1_MAX_ROWS;
     use rdna_compute::slab_moe as gpu;
 
     #[test]
-    fn capacity_does_not_widen_narrow_fallback_groups() {
-        assert_eq!(gpu::SLAB_MAX_LANES, 32);
+    fn runtime_capacity_keeps_the_narrow_oracle_separate() {
+        assert_eq!(gpu::SLAB_MAX_LANES, 64);
         assert_eq!(K1_MAX_ROWS, 8);
-        for lanes in 1..=gpu::SLAB_MAX_LANES {
-            let mut next = 0;
-            for (first, n) in k1_groups(lanes) {
-                assert_eq!(first, next);
-                assert!((1..=8).contains(&n));
-                next += n;
-            }
-            assert_eq!(next, lanes);
-        }
+        // This old CPU planner models one non-tiled union, not a 64-row window.
+        assert_eq!(k1::MAX_LANES, 32);
+        assert!(K1_MAX_ROWS <= k1::MAX_LANES);
     }
 
     /// The launcher's constants are the certified K1 contract's: symbols in
@@ -324,17 +261,18 @@ mod tests {
                 );
             }
         }
-        for (cap_index, capacity) in [16, 32].into_iter().enumerate() {
-            for bucket in 0..2 {
-                for kind in 0..2 {
-                    assert_eq!(
-                        gpu::MQ_I4_MOE_GEMV_WIDE_SYMBOLS[cap_index][bucket][kind],
-                        format!("{}_c{capacity}", gpu::MQ_I4_MOE_GEMV_SYMBOLS[bucket][kind])
-                    );
-                }
+        for bucket in 0..2 {
+            for kind in 0..2 {
+                assert_eq!(
+                    gpu::MQ_I4_MOE_GEMV_ROWTILE_SYMBOLS[bucket][kind],
+                    format!("{}_t8", gpu::MQ_I4_MOE_GEMV_SYMBOLS[bucket][kind])
+                );
+                assert_eq!(
+                    gpu::MQ_I4_MOE_GEMV_CN_ROWTILE_SYMBOLS[bucket][kind],
+                    format!("{}_t8", gpu::MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][kind])
+                );
             }
         }
-        assert_eq!(gpu::SLAB_MAX_LANES, k1::MAX_LANES);
         assert_eq!(gpu::SLAB_TOP_K, k1::TOP_K);
         assert_eq!(gpu::SLAB_EXPERTS, k1::MAX_EXPERTS);
         assert_eq!(
@@ -396,15 +334,100 @@ mod tests {
         );
     }
 
-    /// The planner's fixed-capacity layout is `6 S + 2` words per call.
+    /// The unchanged non-tiled CPU oracle retains its own 32-lane capacity.
     #[test]
-    fn union_scratch_words_match_the_descriptor_layout() {
-        for lanes in 1..=gpu::SLAB_MAX_LANES {
+    fn narrow_union_scratch_words_match_the_descriptor_layout() {
+        for lanes in 1..=k1::MAX_LANES {
             let s = 10 * lanes;
             assert_eq!(
                 rdna_compute::scratch::qwen4_slab_union_words(lanes),
                 2 * s + 2 * (s + 1) + 2 * s
             );
         }
+    }
+
+    /// Fixed physical descriptors cover a whole window, including a partial
+    /// final tile. These are CPU address/extent contracts, not a device receipt.
+    #[test]
+    fn rowtile_descriptor_geometry_and_tail_guards() {
+        use rdna_compute::scratch::{qwen4_slab_rowtile_bytes, qwen4_slab_rowtile_words_checked};
+
+        const S: usize = 8 * k1::TOP_K;
+        const WORDS: usize = 6 * S + 2;
+        const GUARD: u32 = 0xdead_beef;
+        assert_eq!((S, WORDS), (80, 482));
+        for lanes in 1..=gpu::SLAB_MAX_LANES {
+            let tiles = lanes.div_ceil(K1_MAX_ROWS);
+            let words = qwen4_slab_rowtile_words_checked(lanes).unwrap();
+            assert_eq!(words, tiles * WORDS);
+            assert_eq!(qwen4_slab_rowtile_bytes(lanes), Some(tiles * 1928));
+            let mut guarded = vec![GUARD; words + 2];
+            let mut visits = vec![0; lanes * k1::TOP_K];
+            for tile in 0..tiles {
+                let first = tile * K1_MAX_ROWS;
+                let live_rows = K1_MAX_ROWS.min(lanes - first);
+                let live_slots = live_rows * k1::TOP_K;
+                let descriptor = &mut guarded[1 + tile * WORDS..1 + (tile + 1) * WORDS];
+                descriptor.fill(0);
+                for bucket in 0..2 {
+                    let ids = bucket * S;
+                    let offsets = 2 * S + bucket * (S + 1);
+                    let slots = 4 * S + 2 + bucket * S;
+                    assert!(ids + S <= 2 * S);
+                    assert!(offsets + S + 1 <= 4 * S + 2);
+                    assert!(slots + S <= WORDS);
+                }
+                // A uniform bucket with ten distinct experts gives every
+                // expert <=8 slots. Store absolute slot ids even in the tail.
+                let ids = 0;
+                let offsets = 2 * S;
+                let slots = 4 * S + 2;
+                for rank in 0..k1::TOP_K {
+                    descriptor[ids + rank] = rank as u32;
+                    descriptor[offsets + rank] = (rank * live_rows) as u32;
+                    for row in 0..live_rows {
+                        let slot = (first + row) * k1::TOP_K + rank;
+                        descriptor[slots + rank * live_rows + row] = slot as u32;
+                    }
+                }
+                descriptor[offsets + k1::TOP_K..offsets + S + 1].fill(live_slots as u32);
+                assert!(descriptor[ids + k1::TOP_K..ids + S]
+                    .iter()
+                    .all(|&id| id == 0));
+                assert!(descriptor[slots + live_slots..slots + S]
+                    .iter()
+                    .all(|&slot| slot == 0));
+                for rank in 0..k1::TOP_K {
+                    let start = descriptor[offsets + rank] as usize;
+                    let end = descriptor[offsets + rank + 1] as usize;
+                    assert_eq!(end - start, live_rows);
+                    assert!(end - start <= K1_MAX_ROWS);
+                    assert!(end <= S);
+                    for &slot in &descriptor[slots + start..slots + end] {
+                        let slot = slot as usize;
+                        assert!(slot < lanes * k1::TOP_K);
+                        // Full-window X/Y bases: no second tile offset.
+                        assert_eq!(slot / k1::TOP_K / K1_MAX_ROWS, tile);
+                        for kind in [Kind::GateUp, Kind::Down] {
+                            assert!(slot / kind.x_row_div() < kind.x_src_rows(lanes));
+                            assert!(
+                                slot * kind.y_slot_stride() + kind.y_slot_stride()
+                                    <= lanes * k1::TOP_K * kind.y_slot_stride()
+                            );
+                        }
+                        visits[slot] += 1;
+                    }
+                }
+                // The unused codec bucket and its offset sentinel stay empty.
+                assert!(descriptor[S..2 * S].iter().all(|&v| v == 0));
+                assert!(descriptor[2 * S + S + 1..4 * S + 2].iter().all(|&v| v == 0));
+                assert!(descriptor[4 * S + 2 + S..].iter().all(|&v| v == 0));
+            }
+            assert!(visits.iter().all(|&count| count == 1));
+            assert_eq!(guarded[0], GUARD);
+            assert_eq!(guarded[words + 1], GUARD);
+        }
+        assert_eq!(qwen4_slab_rowtile_words_checked(64), Some(3856));
+        assert_eq!(qwen4_slab_rowtile_bytes(64), Some(15_424));
     }
 }

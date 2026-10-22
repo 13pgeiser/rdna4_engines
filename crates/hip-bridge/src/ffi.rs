@@ -13,6 +13,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "kernel-timing")]
+pub mod kernel_timing;
+
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
 /// clock to specific HIP runtime calls.
@@ -632,6 +635,8 @@ pub struct HipRuntime {
     launch_grid_yz_limit: AtomicU32,
     /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
     stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
+    #[cfg(feature = "kernel-timing")]
+    kernel_timing_control: std::sync::OnceLock<Arc<kernel_timing::TimingControl>>,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -1500,6 +1505,8 @@ impl HipRuntime {
             _lib: Arc::new(lib),
             launch_grid_yz_limit: AtomicU32::new(u32::MAX),
             stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
+            #[cfg(feature = "kernel-timing")]
+            kernel_timing_control: std::sync::OnceLock::new(),
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -2816,12 +2823,16 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let t = std::time::Instant::now();
+        #[cfg(feature = "kernel-timing")]
+        timing.record_start(stream_raw)?;
         let code = (self.fn_module_launch_kernel)(
             func.0,
             grid[0],
@@ -2835,8 +2846,12 @@ impl HipRuntime {
             params.as_mut_ptr(),
             ptr::null_mut(),
         );
+        #[cfg(feature = "kernel-timing")]
+        let timing_result = timing.record_stop(code);
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
         memory_effects::launch();
+        #[cfg(feature = "kernel-timing")]
+        timing_result?;
         self.check(code, "hipModuleLaunchKernel")
     }
 
@@ -2873,6 +2888,8 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
@@ -2895,6 +2912,8 @@ impl HipRuntime {
 
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let t = std::time::Instant::now();
+        #[cfg(feature = "kernel-timing")]
+        timing.record_start(stream_raw)?;
         let code = (self.fn_module_launch_kernel)(
             func.0,
             grid[0],
@@ -2908,8 +2927,12 @@ impl HipRuntime {
             ptr::null_mut(), // kernelParams = null (we use extra)
             extra.as_mut_ptr(),
         );
+        #[cfg(feature = "kernel-timing")]
+        let timing_result = timing.record_stop(code);
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
         memory_effects::launch();
+        #[cfg(feature = "kernel-timing")]
+        timing_result?;
         self.check(code, "hipModuleLaunchKernel(extra blob)")
     }
     /// Max active blocks per multiprocessor for a loaded module function
@@ -3285,6 +3308,8 @@ impl HipRuntime {
     /// Begin capturing all operations on `stream` into a graph.
     /// mode=0 is hipStreamCaptureModeGlobal.
     pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        kernel_timing::reject_active(self, "graph capture unsupported by kernel timing")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3330,6 +3355,8 @@ impl HipRuntime {
 
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        #[cfg(feature = "kernel-timing")]
+        kernel_timing::reject_active(self, "graph replay unsupported by kernel timing")?;
         let t = std::time::Instant::now();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller

@@ -2134,11 +2134,11 @@ pub static FIELDS: &[ConfigField] = &[
         Speculation,
         ModelLoad,
         DefaultValue::String("auto"),
-        ValueRule::AutoInteger { min: 1, max: 10 },
+        ValueRule::AutoInteger { min: 1, max: 63 },
         true,
         false,
         Some("HIPFIRE_MTP_K"),
-        "MTP draft window. Default `auto` = 4 for native Qwen4 MTP (Flash-Next, arch 16) on gfx1151, else 3; an explicit 1-10 overrides; `3` restores the previous gfx1151 cap."
+        "MTP draft window. Default `auto` = one below the qualified row-exact verify rows for native Qwen4 MTP (Flash-Next, arch 16), narrowed to the CPU-owned expert window after placement; else 3. Explicit 1-63 overrides the default, not executor/qualified-row/CPU constraints. Other producers retain their own limits."
     ),
     field!(
         "speculation.mtp_ngram",
@@ -4921,6 +4921,12 @@ fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
 /// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model that
 /// does not report a row-exact verify capability (see [`mtp_k_default`]).
 pub const MTP_K_DEFAULT: usize = 3;
+/// Physical capacity of a Qwen4 verify window, including its seed row.
+///
+/// This is a storage/executor bound, not a row-exactness certificate or a
+/// shipping admission limit. The proven per-architecture tables below remain
+/// authoritative until byte, state, ID and cost qualification permits widening.
+pub const QWEN4_VERIFY_MAX_ROWS: usize = 64;
 /// Verify rows a Qwen4 forward runs bitwise like the single-row decode on a
 /// GPU whose row-exactness oracle has not proven a wider block: the historic
 /// few-row route limit (`rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS`,
@@ -8071,6 +8077,7 @@ mod tests {
     fn mtp_k_default_per_arch_and_auto_rule() {
         assert_eq!(mtp_k_default(16, 8), 7);
         assert_eq!(mtp_k_default(16, 16), 15);
+        assert_eq!(mtp_k_default(16, 64), 63);
         assert_eq!(mtp_k_default(16, 4), 3);
         assert_eq!(mtp_k_default(16, 1), 1);
         assert_eq!(mtp_k_default(16, 0), 1);
@@ -8086,11 +8093,11 @@ mod tests {
 
         let field = field("speculation.mtp_k").expect("speculation.mtp_k field");
         assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());
-        for k in 1..=10 {
+        for k in 1..=63 {
             assert!(field.validate(&ConfigValue::Integer(k)).is_ok(), "k={k}");
         }
         assert!(field.validate(&ConfigValue::Integer(0)).is_err());
-        assert!(field.validate(&ConfigValue::Integer(11)).is_err());
+        assert!(field.validate(&ConfigValue::Integer(64)).is_err());
         assert!(field.validate(&ConfigValue::String("fast".into())).is_err());
     }
 

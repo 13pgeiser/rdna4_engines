@@ -2483,6 +2483,12 @@ struct PrefillResult {
     receipts: Vec<Value>,
     checks: Vec<Value>,
     seconds: f64,
+    /// LAB-only actual witness (`lab` only). `None` = absent/non-pass (no
+    /// grouped launch observed) with ordinary success untouched.
+    #[cfg(feature = "lab")]
+    fn_witness: Option<Value>,
+    #[cfg(not(feature = "lab"))]
+    fn_witness: (),
 }
 
 impl Ctx {
@@ -2505,15 +2511,47 @@ impl Ctx {
                 ranges.clone()
             }
         };
+        #[cfg(feature = "lab")]
+        self.gpu.lab_fn_begin();
+        match Self::prefill_inner(self, prompt, &calls, how, arm, mode, expect, sealed) {
+            Ok((receipts, checks, seconds)) => Ok(PrefillResult {
+                calls,
+                receipts,
+                checks,
+                seconds,
+                #[cfg(feature = "lab")]
+                fn_witness: Self::lab_fn_export(&mut self.gpu),
+                #[cfg(not(feature = "lab"))]
+                fn_witness: (),
+            }),
+            Err(error) => {
+                #[cfg(feature = "lab")]
+                self.gpu.lab_fn_reset();
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_inner(
+        ctx: &mut Ctx,
+        prompt: &[u32],
+        calls: &[(usize, usize)],
+        how: &PrefillPlan,
+        arm: Arm,
+        mode: SlowlinkMode,
+        expect: &Expect,
+        sealed: Option<&SealedExpect>,
+    ) -> Result<(Vec<Value>, Vec<Value>, f64), String> {
         let started = Instant::now();
         let mut receipts = Vec::with_capacity(calls.len());
         let mut checks = Vec::with_capacity(calls.len());
         match how {
             PrefillPlan::Production => {
-                self.bundle
-                    .prefill_final(&mut self.gpu, prompt, 0, &self.logits)
+                ctx.bundle
+                    .prefill_final(&mut ctx.gpu, prompt, 0, &ctx.logits)
                     .map_err(|e| format!("prefill: {e}"))?;
-                self.record_receipt(
+                ctx.record_receipt(
                     0,
                     &calls[0],
                     arm,
@@ -2525,14 +2563,14 @@ impl Ctx {
                 )?;
             }
             PrefillPlan::Direct(_) => {
-                self.bundle
-                    .reset(&mut self.gpu)
+                ctx.bundle
+                    .reset(&mut ctx.gpu)
                     .map_err(|e| format!("reset: {e}"))?;
                 for (call, &(start, end)) in calls.iter().enumerate() {
-                    self.bundle
-                        .forward_chunk_final(&mut self.gpu, &prompt[start..end], &self.logits, None)
+                    ctx.bundle
+                        .forward_chunk_final(&mut ctx.gpu, &prompt[start..end], &ctx.logits, None)
                         .map_err(|e| format!("direct prefill {start}..{end}: {e}"))?;
-                    self.record_receipt(
+                    ctx.record_receipt(
                         call,
                         &(start, end),
                         arm,
@@ -2545,24 +2583,19 @@ impl Ctx {
                 }
             }
         }
-        self.gpu
+        ctx.gpu
             .hip
             .device_synchronize()
             .map_err(|e| format!("device synchronize: {e}"))?;
         let seconds = started.elapsed().as_secs_f64();
-        if self.bundle.state.position != prompt.len() {
+        if ctx.bundle.state.position != prompt.len() {
             return Err(format!(
                 "after the prefill the context holds {} tokens, expected {}",
-                self.bundle.state.position,
+                ctx.bundle.state.position,
                 prompt.len()
             ));
         }
-        Ok(PrefillResult {
-            calls,
-            receipts,
-            checks,
-            seconds,
-        })
+        Ok((receipts, checks, seconds))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2594,6 +2627,43 @@ impl Ctx {
         receipts.push(receipt);
         checks.push(check);
         Ok(())
+    }
+
+    /// LAB-only actual witness export: drain the `Gpu` window and map owned
+    /// records to JSON. `None` = absent/non-pass with ordinary success
+    /// untouched. Full geometry uses the actual existing identity methods
+    /// (module/container/device resolved at the launch boundary).
+    #[cfg(feature = "lab")]
+    fn lab_fn_export(gpu: &mut Gpu) -> Option<Value> {
+        let (records, overflow) = gpu.lab_fn_end()?;
+        let launches: Vec<Value> = records
+            .into_iter()
+            .map(|record| {
+                json!({
+                    "symbol": record.symbol,
+                    "module": record.module,
+                    "container_sha256": record.container_sha256,
+                    "device_sha256": record.device_sha256,
+                    "grid": record.grid,
+                    "block": record.block,
+                    "down": record.down,
+                    "width": record.width,
+                    "grouped_rows": record.grouped_rows,
+                    "n_experts": record.n_experts,
+                    "total_slots": record.total_slots,
+                    "source_rows": record.source_rows,
+                    "host_mapped": record.host_mapped,
+                    "bf16_round_trip": record.bf16_round_trip,
+                    "chunk_rows": record.chunk_rows,
+                })
+            })
+            .collect();
+        Some(json!({
+            "schema": "hipfire.qwen4.lab_fn_witness.v1",
+            "overflowed": overflow.0,
+            "complete": overflow.0 == 0,
+            "launches": launches,
+        }))
     }
 }
 
@@ -2640,6 +2710,7 @@ fn load_ctx(
 ) -> Result<(Ctx, Value), String> {
     let mode = SlowlinkMode::from_env();
     check_mode(arm, mode)?;
+    hipfire_loader::prepare_host_memory_for(model);
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     let loaded = slowlink_load_bundle(
         &mut gpu,
@@ -3025,6 +3096,8 @@ impl Run<'_> {
             if let Some(retained) = map.get("retained_ids").filter(|v| v.is_array()).cloned() {
                 map.insert("retained_ids_match".into(), json!(retained == json!(ids)));
             }
+            #[cfg(feature = "lab")]
+            map.insert("fn_witness".into(), pre.fn_witness.unwrap_or(Value::Null));
         }
         append_line(&mut self.cells_file, "cells.jsonl", &cell.to_string())?;
         self.done.push(json!({

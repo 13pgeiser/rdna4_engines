@@ -246,6 +246,25 @@ impl NgramModPool {
     }
 }
 
+/// What the last successful proposal of an n-gram context matched, kept in
+/// plain integers at proposal time ([`MtpNgramContext::last_proposal`],
+/// [`MtpCopyContext::last_proposal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalMeta {
+    /// Matched suffix-key length actually used: the [`COPY_KEY_LADDER`] key
+    /// (or `n_match`) whose copy was proposed; `n_match` for the chain pool.
+    pub key_len: usize,
+    /// Index in [`MtpCopyContext::history`] of the first copied token (the
+    /// position just past the matched key's earlier occurrence). `None` for
+    /// the chain pool, which has no single source.
+    pub source_pos: Option<usize>,
+    /// Continuation tokens available before any cap: the copy source's
+    /// remaining history (`history.len() - source_pos`) for the copy lane;
+    /// for the chain pool, the chain length drafted (already capped by
+    /// `n_max` and the caller).
+    pub available: usize,
+}
+
 /// Request-local n-gram proposal owner shared by the Qwen3.5 and Qwen4 MTP
 /// drafters.
 ///
@@ -266,6 +285,8 @@ pub struct MtpNgramContext {
     emitted_len: usize,
     /// Reusable draft buffer; capacity reserved to `n_max` once in `new`.
     candidate: Vec<u32>,
+    /// Metadata of the last successful proposal ([`Self::last_proposal`]).
+    last: Option<ProposalMeta>,
     /// `begin_request` ran and `reset_request` has not since.
     begun: bool,
 }
@@ -280,6 +301,7 @@ impl MtpNgramContext {
             indexed_until: 0,
             emitted_len: 0,
             candidate: Vec::with_capacity(config.n_max),
+            last: None,
             begun: false,
         })
     }
@@ -308,6 +330,7 @@ impl MtpNgramContext {
         self.pool.insert_range(&self.history, n_match);
         self.indexed_until = self.history.len();
         self.candidate.clear();
+        self.last = None;
         self.begun = true;
     }
 
@@ -347,12 +370,18 @@ impl MtpNgramContext {
         if !self.begun {
             return None;
         }
+        self.last = None;
         self.sync_emitted(emitted);
         if self
             .pool
             .draft_into(&self.history, caller_max, &mut self.candidate)
             && !self.candidate.is_empty()
         {
+            self.last = Some(ProposalMeta {
+                key_len: self.pool.config().n_match,
+                source_pos: None,
+                available: self.candidate.len(),
+            });
             Some(&self.candidate)
         } else {
             self.candidate.clear();
@@ -377,6 +406,7 @@ impl MtpNgramContext {
         self.indexed_until = 0;
         self.emitted_len = 0;
         self.candidate.clear();
+        self.last = None;
         self.begun = false;
     }
 
@@ -384,6 +414,14 @@ impl MtpNgramContext {
     #[inline]
     pub fn history(&self) -> &[u32] {
         &self.history
+    }
+
+    /// Metadata of the last successful [`propose`](Self::propose): `None`
+    /// before one, after a declined proposal, and across a request boundary.
+    /// Stored at proposal time; no history scan.
+    #[inline]
+    pub fn last_proposal(&self) -> Option<ProposalMeta> {
+        self.last
     }
 }
 
@@ -438,6 +476,8 @@ pub struct MtpCopyContext {
     emitted_len: usize,
     /// Reusable proposal buffer; capacity reserved to `n_max` once in `new`.
     candidate: Vec<u32>,
+    /// Metadata of the last successful proposal ([`Self::last_proposal`]).
+    last: Option<ProposalMeta>,
     begun: bool,
 }
 
@@ -481,6 +521,7 @@ impl MtpCopyContext {
             indexed_until: 0,
             emitted_len: 0,
             candidate: Vec::with_capacity(config.n_max),
+            last: None,
             begun: false,
         })
     }
@@ -505,6 +546,7 @@ impl MtpCopyContext {
         self.indexed_until = 0;
         self.emitted_len = 0;
         self.candidate.clear();
+        self.last = None;
         self.index_new();
         self.begun = true;
     }
@@ -545,6 +587,7 @@ impl MtpCopyContext {
             return None;
         }
         self.sync_emitted(emitted);
+        self.last = None;
         self.candidate.clear();
         let limit = self.config.n_max.min(caller_max);
         if limit == 0 || self.config.n_min > limit {
@@ -570,6 +613,11 @@ impl MtpCopyContext {
             }
             self.candidate
                 .extend_from_slice(&self.history[pos..pos + take]);
+            self.last = Some(ProposalMeta {
+                key_len: n,
+                source_pos: Some(pos),
+                available: end - pos,
+            });
             return Some(&self.candidate);
         }
         None
@@ -660,6 +708,7 @@ impl MtpCopyContext {
         self.indexed_until = 0;
         self.emitted_len = 0;
         self.candidate.clear();
+        self.last = None;
         self.begun = false;
     }
 
@@ -667,6 +716,14 @@ impl MtpCopyContext {
     #[inline]
     pub fn history(&self) -> &[u32] {
         &self.history
+    }
+
+    /// Metadata of the last successful [`propose`](Self::propose): `None`
+    /// before one, after a declined proposal, and across a request boundary.
+    /// Stored at proposal time; no history scan.
+    #[inline]
+    pub fn last_proposal(&self) -> Option<ProposalMeta> {
+        self.last
     }
 
     /// Table index of a key hash: the top bits of a multiplicative mix, so
@@ -1078,6 +1135,36 @@ mod tests {
         assert_eq!(capped, &[102, 103, 104]);
         // caller_max below n_min yields no proposal.
         assert!(ctx.propose(&emitted, 1).is_none());
+    }
+
+    #[test]
+    fn context_reports_the_last_proposal_metadata() {
+        let mut ctx = MtpNgramContext::new(ctx_cfg()).unwrap();
+        assert_eq!(ctx.last_proposal(), None);
+        assert!(ctx.propose(&[100, 101], 4).is_none());
+        assert_eq!(ctx.last_proposal(), None);
+        let prompt: Vec<u32> = (100..110).collect();
+        ctx.begin_request(&prompt);
+        assert_eq!(ctx.last_proposal(), None);
+        let emitted = [100u32, 101];
+        assert_eq!(ctx.propose(&emitted, 4).unwrap(), &[102, 103, 104, 105]);
+        // The chain has no single source position; it keys on `n_match`.
+        assert_eq!(
+            ctx.last_proposal(),
+            Some(ProposalMeta {
+                key_len: 2,
+                source_pos: None,
+                available: 4,
+            })
+        );
+        assert_eq!(ctx.propose(&emitted, 3).unwrap(), &[102, 103, 104]);
+        assert_eq!(ctx.last_proposal().map(|meta| meta.available), Some(3));
+        // A declined proposal clears it, as does a request boundary.
+        assert!(ctx.propose(&emitted, 1).is_none());
+        assert_eq!(ctx.last_proposal(), None);
+        assert!(ctx.propose(&emitted, 4).is_some());
+        ctx.begin_request(&prompt);
+        assert_eq!(ctx.last_proposal(), None);
     }
 
     #[test]
@@ -1741,5 +1828,38 @@ mod tests {
             );
         }
         assert!(some > 0);
+    }
+
+    #[test]
+    fn copy_context_reports_the_last_proposal_metadata() {
+        // `1..=40` then 40 distinct filler tokens: a tail of `m` emitted
+        // tokens copied from `41 - m..=40` matches the key of length `m`
+        // (the ladder's 32/16/8, then n_match = 3) at position 40.
+        let mut prompt: Vec<u32> = (1..=40).collect();
+        prompt.extend(1000..1040);
+        for m in [32u32, 16, 8, 3] {
+            let mut ctx = MtpCopyContext::new(copy_cfg(3, 1, 8)).unwrap();
+            assert_eq!(ctx.last_proposal(), None);
+            ctx.begin_request(&prompt);
+            assert_eq!(ctx.last_proposal(), None);
+            let emitted: Vec<u32> = (41 - m..=40).collect();
+            let proposal = ctx.propose(&emitted, 8).unwrap().to_vec();
+            assert_eq!(proposal, (1000..1008).collect::<Vec<u32>>());
+            let meta = ProposalMeta {
+                key_len: m as usize,
+                source_pos: Some(40),
+                available: 40 + m as usize,
+            };
+            assert_eq!(ctx.last_proposal(), Some(meta));
+            // A caller cap shortens the copy, not the continuation available.
+            assert_eq!(ctx.propose(&emitted, 2).unwrap(), &[1000, 1001]);
+            assert_eq!(ctx.last_proposal(), Some(meta));
+            // A declined proposal leaves no metadata behind.
+            assert!(ctx.propose(&emitted, 0).is_none());
+            assert_eq!(ctx.last_proposal(), None);
+            assert!(ctx.propose(&emitted, 8).is_some());
+            ctx.reset_request();
+            assert_eq!(ctx.last_proposal(), None);
+        }
     }
 }

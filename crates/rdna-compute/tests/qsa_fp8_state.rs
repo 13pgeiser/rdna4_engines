@@ -17,8 +17,11 @@
 //!   tie values. The decoded element must stay within
 //!   `|x|/16 + scale/1024 + 2^-22 |x|` of the F32 cache element, and the cache
 //!   prefix/suffix around the appended rows must stay zero.
-//! * `qsa_fp8_attention_matches_decoded_reference`: the single-row entry and
-//!   the production batch (rows 1..=8) at lengths 64/1131/2048/8195, and the
+//! * `qsa_fp8_attention_matches_decoded_reference`: same-codec production-
+//!   versus-sequential-production G1 for every R=1..64 in Eager/Recorded AR
+//!   arithmetic scopes, using full live bytes and poisoned inactive/tail bytes.
+//!   Separately, the single-row entry and production batch (rows 1..=8)
+//!   at lengths 64/1131/2048/8195, and the
 //!   gathered F16 WMMA lab entry (`pm = false`, only when the route is enabled)
 //!   at modest shapes, against an f64 CPU attention over the *decoded* Fp8
 //!   cache bytes (not the original F32 data). Exact routes: per head
@@ -1002,6 +1005,202 @@ fn run(
     got
 }
 
+/// Same-codec G1, independent of the approximate decoded/F32 checks below.
+/// Recorded binds the existing AR arithmetic scope; it does not pretend to
+/// capture a graph. Receipts describe only the actual terminal invocation.
+fn check_fp8_wide_bytes(gpu: &mut Gpu, cache: &Cache) {
+    use rdna_compute::prefill_invariant::Qwen4VerifyReference;
+    use rdna_compute::tensor_ops::qsa_decode_attention_policy_for_row_for_test;
+
+    let old_wide = gpu.set_wide_verify_rows(64);
+    let original_k = gpu.download_raw_bytes(&cache.k8).expect("snapshot FP8 K");
+    let original_v = gpu.download_raw_bytes(&cache.v8).expect("snapshot FP8 V");
+    let guard = 37;
+    let row_elements = NH * HD;
+    for mode in [Qwen4VerifyReference::Eager, Qwen4VerifyReference::Recorded] {
+        let old_mode = gpu.set_qwen4_verify_reference(Some(mode));
+        for seed in [0x47f8_0001, 0x47f8_0002] {
+            let mut rng = Rng(seed);
+            for rows in 1..=64 {
+                // 8188 is the last parallel selection: selected*8 + 32 <=
+                // 65536. Include windows crossing it, short/empty selection,
+                // and every compression residue at a nonzero position.
+                for (position, layout) in [
+                    (
+                        1,
+                        Layout {
+                            budget: 0,
+                            compress: 1,
+                            capacity: 1,
+                        },
+                    ),
+                    (
+                        67,
+                        Layout {
+                            budget: 1,
+                            compress: 4,
+                            capacity: 7,
+                        },
+                    ),
+                    (
+                        128,
+                        Layout {
+                            budget: HUGE,
+                            compress: 4,
+                            capacity: 64,
+                        },
+                    ),
+                    (
+                        129,
+                        Layout {
+                            budget: HUGE,
+                            compress: 4,
+                            capacity: 64,
+                        },
+                    ),
+                    (
+                        130,
+                        Layout {
+                            budget: HUGE,
+                            compress: 4,
+                            capacity: 64,
+                        },
+                    ),
+                    (
+                        131,
+                        Layout {
+                            budget: HUGE,
+                            compress: 4,
+                            capacity: 64,
+                        },
+                    ),
+                    (
+                        8187,
+                        Layout {
+                            budget: HUGE,
+                            compress: 4,
+                            capacity: 8195,
+                        },
+                    ),
+                    (
+                        8188,
+                        Layout {
+                            budget: HUGE,
+                            compress: 4,
+                            capacity: 8195,
+                        },
+                    ),
+                ] {
+                    let case = build_case(&mut rng, rows, position + rows, layout, false, 3.0);
+                    let mut outputs = Vec::new();
+                    for singleton in [false, true] {
+                        let mut live = Vec::new();
+                        for r in 0..if singleton { rows } else { 1 } {
+                            let count = if singleton { 1 } else { rows };
+                            let first = if singleton { r } else { 0 };
+                            let q_host = &case.q
+                                [first * 2 * row_elements..(first + count) * 2 * row_elements];
+                            let q = gpu.upload_f32(q_host, &[q_host.len()]).expect("G1 query");
+                            let selected = upload_selected(gpu, &case.sel[first..first + count]);
+                            let q_before = gpu.download_raw_bytes(&q).expect("snapshot query");
+                            let selected_before = gpu
+                                .download_raw_bytes(&selected)
+                                .expect("snapshot selection");
+                            // Retain the real owning allocation around its view:
+                            // prefix, two inactive rows, and non-row-aligned tail.
+                            let active = count * row_elements;
+                            let owner = sentinel(gpu, (count + 2) * row_elements + 2 * guard);
+                            let out = owner.sub_offset(guard, (count + 2) * row_elements);
+                            let before = gpu
+                                .download_raw_bytes(&owner)
+                                .expect("snapshot output owner");
+                            let p = IndexedAttentionAttentionBatch {
+                                q_with_gate: &q,
+                                full_keys: &cache.k8,
+                                full_values: &cache.v8,
+                                selected: &selected,
+                                output: &out,
+                                rows: count,
+                                position_start: position + first,
+                                n_heads: NH,
+                                n_kv_heads: NKV,
+                                head_dim: HD,
+                                budget_blocks: layout.budget,
+                                compress: layout.compress,
+                                capacity: layout.capacity,
+                                full_capacity: FULL_CAP,
+                                format: QsaKvFormat::Fp8,
+                                shape_selected: layout.capacity,
+                            };
+                            let policies: Vec<_> = (0..count)
+                                .map(|i| {
+                                    qsa_decode_attention_policy_for_row_for_test(gpu, &p, i)
+                                        .expect("G1 actual wide production row not admitted")
+                                })
+                                .collect();
+                            indexed_attention_attention_batch(gpu, &p)
+                                .expect("G1 actual FP8 production dispatch");
+                            let symbol = gpu
+                                .last_launched_kernel()
+                                .expect("G1 missing actual launch")
+                                .to_owned();
+                            assert!(
+                                matches!(
+                                    symbol.as_str(),
+                                    "indexed_attention_attention_fp8_batched"
+                                        | "indexed_attention_attention_fp8_batched_serial"
+                                ),
+                                "G1 unexpected actual FP8 production kernel: {symbol}"
+                            );
+                            let (module, container, device) = gpu
+                                .lab_kernel_device_identity(&symbol)
+                                .expect("G1 missing loaded raw device ELF identity");
+                            sync(gpu);
+                            let after = gpu
+                                .download_raw_bytes(&owner)
+                                .expect("G1 output owner bytes");
+                            assert_eq!(
+                                &after[..guard * 4],
+                                &before[..guard * 4],
+                                "G1 prefix overwrite R={rows} mode={mode:?} position={position}"
+                            );
+                            assert_eq!(&after[(guard + active) * 4..], &before[(guard + active) * 4..],
+                                "G1 inactive/tail overwrite R={rows} mode={mode:?} position={position}");
+                            assert_eq!(gpu.download_raw_bytes(&q).expect("query after"), q_before);
+                            assert_eq!(
+                                gpu.download_raw_bytes(&selected).expect("selection after"),
+                                selected_before
+                            );
+                            assert_eq!(
+                                gpu.download_raw_bytes(&cache.k8).expect("K after"),
+                                original_k
+                            );
+                            assert_eq!(
+                                gpu.download_raw_bytes(&cache.v8).expect("V after"),
+                                original_v
+                            );
+                            eprintln!("G1 FP8 arch={} R={rows} mode={mode:?} seed={seed} singleton={singleton} row={first} position={} rows={count} budget={} compress={} capacity={} shape_selected={} policies={policies:?} live_bytes={} allocation_bytes={} query_bytes={} selection_bytes={} kv_bytes={} terminal_symbol={symbol} module={module} container_sha256={container} raw_device_elf_sha256={device}",
+                                gpu.arch, position + first, layout.budget, layout.compress,
+                                layout.capacity, layout.capacity, active * 4, after.len(),
+                                q_before.len(), selected_before.len(), original_k.len());
+                            eprintln!("G1 FP8 output_live_offset_bytes={} prefix_guard_bytes={} inactive_bytes={} tail_guard_bytes={}",
+                                guard * 4, guard * 4, 2 * row_elements * 4, guard * 4);
+                            live.extend_from_slice(&after[guard * 4..(guard + active) * 4]);
+                            drop(out);
+                            free(gpu, vec![q, selected, owner]);
+                        }
+                        outputs.push(live);
+                    }
+                    assert_eq!(outputs[0], outputs[1],
+                        "G1 FP8 full live bytes R={rows} mode={mode:?} seed={seed} position={position}");
+                }
+            }
+        }
+        gpu.set_qwen4_verify_reference(old_mode);
+    }
+    gpu.set_wide_verify_rows(old_wide);
+}
+
 // ---------------------------------------------------------------------------
 // Test 2: GPU Fp8 attention against the f64 decoded reference
 // ---------------------------------------------------------------------------
@@ -1131,6 +1330,7 @@ fn check_exact(
 fn qsa_fp8_attention_matches_decoded_reference() {
     let mut gpu = init_gpu();
     let cache = Cache::build(&mut gpu);
+    check_fp8_wide_bytes(&mut gpu, &cache);
     let gathered_on = qsa_gathered_wmma_enabled(&gpu, QsaKvFormat::Fp8);
     let mut fails: Vec<String> = Vec::new();
     let mut rng = Rng(0x2ef8_0002);

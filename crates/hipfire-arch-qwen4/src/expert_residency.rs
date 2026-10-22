@@ -2446,6 +2446,106 @@ impl PlacementCharges {
         }
     }
 }
+/// Actual D1 CPU-owned expert storage (admission side).
+///
+/// Storage only, NOT a qualification or a default: the legacy default route still
+/// admits at most [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] rows, and a 5..64-row
+/// window additionally needs the explicit lab-wide scope owned by the routing slice.
+/// Never a metadata bump of the qualified width: this section only reserves and reports
+/// the real bytes/slots the [`hipfire_dispatch::cpu_exec`] backend consumes.
+///
+/// Two thread-local pools back every D1 splice on the calling thread
+/// ([`hipfire_dispatch::cpu_exec`]: the `CPU_TRANSFER` pinned stage and the
+/// `MOE_SCRATCH` host-slot scratch, both grown on demand by the first window that
+/// needs them). Admission prewarms both for the actually requested window
+/// ([`cpu_d1_required_storage_rows`]) so no first wide window grows them on the hot
+/// path; the routing slice reads the binding capacity through
+/// [`hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows`] (the live
+/// thread-local minimum of host-scratch rows and stage rows — never a constant).
+///
+/// Checked formulas (exact [`hipfire_dispatch::cpu_exec::moe_cpu_experts`] extents;
+/// `None` on zero geometry or overflow → the caller refuses before any allocation):
+/// - [`cpu_d1_host_slots`]: `rows * top_k` computed slots (64 x 10 = 640).
+/// - [`cpu_d1_stage_values`]: `2 * (rows * dim + rows * top_k)` f32 stage values,
+///   exactly the `(n_x + slots) * 8` stage bytes / 4 the splice stages the route,
+///   weights, activation and residual through.
+/// - [`cpu_d1_stage_capacity_rows`]: the inverse over live stage bytes.
+/// Whether the CPU expert splice may arm for one layer. Every field is an
+/// input; [`Self::armed`] is the single decision.
+///
+/// Computed host slots of a `rows`-row D1 window at `top_k` experts per row.
+/// `None` for zero rows or on overflow: the caller refuses before any allocation.
+pub fn cpu_d1_host_slots(rows: usize, top_k: usize) -> Option<usize> {
+    if rows == 0 || top_k == 0 {
+        return None;
+    }
+    rows.checked_mul(top_k)
+}
+
+/// f32 stage values the D1 splice's pinned transfer stage holds for a `rows`-row
+/// window: `2 * (rows * dim + rows * top_k)`, exactly `moe_cpu_experts`'
+/// `(n_x + slots) * 8` stage bytes / 4 (route ids, route weights, rotated
+/// activation download plus the residual upload through the same stage).
+/// `None` for zero geometry or on overflow: the caller refuses before any allocation.
+pub fn cpu_d1_stage_values(dim: usize, top_k: usize, rows: usize) -> Option<usize> {
+    if dim == 0 || top_k == 0 || rows == 0 {
+        return None;
+    }
+    let route = rows.checked_mul(dim)?;
+    let slots = rows.checked_mul(top_k)?;
+    route.checked_add(slots)?.checked_mul(2)
+}
+
+/// Logical rows a `stage_bytes`-byte pinned stage serves at `(dim, top_k)`:
+/// `bytes / (8 * (dim + top_k))`, the inverse of [`cpu_d1_stage_values`].
+/// `0` for zero geometry, on overflow, or when the stage cannot hold one row.
+pub fn cpu_d1_stage_capacity_rows(stage_bytes: usize, dim: usize, top_k: usize) -> usize {
+    let per_row_values = match dim.checked_add(top_k) {
+        Some(v) if v > 0 => v,
+        _ => return 0,
+    };
+    let per_row_bytes = match per_row_values.checked_mul(8) {
+        Some(v) if v > 0 => v,
+        _ => return 0,
+    };
+    stage_bytes / per_row_bytes
+}
+
+/// Actually requested D1 storage rows (logical window rows) for this load, or `0`
+/// for no prewarm. Prewarm is NOT unconditional: legacy default loads (no lab-wide
+/// override, small K) keep on-demand growth and byte-identical placement; only an
+/// explicit lab-wide scope on a CPU-owned single-device Flash-Next load reserves up
+/// to the physical 64. Both lab arms with an admitted 64-row window therefore
+/// prewarm the same real 64.
+///
+/// - `lab_override_present`: the canonical
+///   [`rdna_compute::prefill_invariant::qwen4_wide_verify_override_present`] signal
+///   (runtime override — including the `Some(8)` baseline — or the parsed developer
+///   var, on an exact oracle arch). Presence only, never a capacity value.
+/// - `cpu_owned_single_fn`: single-device Flash-Next scope with a CPU owner (D1 splice
+///   or D2 split armed) and no EP/PP/lane route (those never take the CPU path).
+/// - `requested_window_rows`: the admitted native/copy/verify need in rows — the
+///   planned native-MTP capture rows the loader already derived (drafts + 1 saturating
+///   at the physical bound, at least the row-exact floor). `0` (AR load, unadmitted
+///   capture) requests nothing.
+///
+/// Returns `0` unless the scope holds and more than the legacy
+/// [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] rows are actually requested;
+/// else `requested` saturating at
+/// [`hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS`].
+pub fn cpu_d1_required_storage_rows(
+    lab_override_present: bool,
+    cpu_owned_single_fn: bool,
+    requested_window_rows: usize,
+) -> usize {
+    if !lab_override_present || !cpu_owned_single_fn {
+        return 0;
+    }
+    if requested_window_rows <= crate::program::QWEN4_CPU_SPLICE_MAX_ROWS {
+        return 0;
+    }
+    requested_window_rows.min(hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS)
+}
 
 /// The long-prefill stage a `whole-first` load runs with
 /// (`HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY`), the existing G2 stage unchanged.
@@ -4092,11 +4192,13 @@ mod tests {
         let census = real_census(&config, 16384);
         // 97 + 144 + 48 + 2 shadowed BF16 owners.
         assert_eq!(census.f16_shadows, 1_298_923_520);
-        // The 4096-row pool workspace with every short tail (slab union plan
-        // sized for 32 lanes: 7688 B).
+        // The 4096-row pool workspace with every short tail (slab descriptor
+        // sized for the 64 slab lanes: max(union 15,368 B, 8 native row tiles
+        // x 1,928 B = 15,424 B) = 15,424 B, 7,736 B above the former 32-lane
+        // 7,688 B).
         assert_eq!(
             census.workspace.iter().map(|term| term.1).sum::<u64>(),
-            153_261_832
+            153_269_568
         );
         // The split selector's constant score + filter extent.
         assert_eq!(census.qsa_selector, 83_894_272);
@@ -4809,9 +4911,11 @@ mod tests {
             assert_eq!(new.placement_bytes(true), new.census_total);
             assert_eq!(new.census_total - old.census_total, shadows);
             if chunk == 1536 {
-                // The 1,536-row incumbent: the measured census base and the
+                // The 1,536-row incumbent: the source census base (2,237,111,724 B
+                // with the former 32-lane slab union, 7,736 B more with the 64-lane
+                // native row-tile descriptor) and the
                 // historical floor still win by a wide margin.
-                assert_eq!(old.census_total, 2_237_111_724);
+                assert_eq!(old.census_total, 2_237_119_460);
                 assert_eq!(
                     new.bytes(),
                     old.bytes(),

@@ -1568,8 +1568,9 @@ fn resource_model(arch: &str, out_elements: usize) -> Value {
     } else {
         vec![("E8P", SLAB_CODEC_E8P)]
     };
-    let union_scratch =
-        (rdna_compute::scratch::qwen4_slab_union_words(slab_moe::SLAB_MAX_LANES) * 4) as u64;
+    let union_scratch = rdna_compute::scratch::qwen4_slab_descriptor_bytes(slab_moe::SLAB_MAX_LANES)
+        .expect("the fixed slab lane capacity has a valid descriptor extent")
+        as u64;
     let transient = peak_transient();
     let per_phase: Vec<Value> = phases
         .iter()

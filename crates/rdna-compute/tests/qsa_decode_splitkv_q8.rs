@@ -2,17 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Hardware tests of the q8 split-KV QSA decode attention helper
-//! `tensor_ops::indexed_attention_attention_splitkv_q8_for_test` (the
-//! `qsa_decode_splitkv_partial_q8` / `qsa_decode_splitkv_merge_f32` pair in
-//! `kernels/src/qsa_decode_splitkv_q8.hip`, the q8 subset of the measured
-//! f1771197a kernels) against the incumbent exact per-head reference
-//! `indexed_attention_attention_batch_exact` (`QsaKvFormat::Q8` K/V through
-//! `indexed_attention_attention_q8_batched`; n_heads 24, n_kv_heads 2,
-//! head_dim 256). The F32 split-K kernels are tested in `qsa_decode_splitk.rs`.
-//! The split count is the only parameter: the kernels have one KV-group
-//! schedule (banked 64-key tiles, 12 head waves per KV group, each K/V element
-//! read once per KV group and split).
+//! Q8 QSA hardware diagnostics and strict production-dispatch G1 row-byte gate.
+//! Direct split-KV-vs-per-head tolerance checks below are diagnostics only.
+//! The wide gate invokes `indexed_attention_attention_batch` at every R=1..64
+//! under actual `Qwen4VerifyReference::{Eager, Recorded}` bindings and compares
+//! every output byte to sequential singleton calls through that same dispatcher.
+//! Both references launch eagerly; Recorded binds recorded singleton arithmetic,
+//! not a graph replay. All calls share an immutable, seeded, nonzero cache S0
+//! and advance the singleton position. This attention-only fixture does not
+//! exercise cache append, pooling, or selector-state transitions.
 //!
 //! The Q8 cache is the dense q8 KV row: per token and KV head eight 34-byte
 //! Q8_0 blocks (little-endian f16 scale, then 32 int8 codes; 272 bytes per head,
@@ -36,9 +34,15 @@
 //!   an all-invalid row inside every batch of two or more rows). Every output
 //!   starts as a NaN sentinel; batched outputs are also compared with the exact
 //!   reference.
-//! * `qsa_splitk_q8_batched_rows_bitwise_individual_wide`: the same check on
-//!   32-row windows (the wide-verify width), launched at 1, 8, 9, 16, 31 and 32
-//!   rows.
+//! * `qsa_splitk_q8_batched_rows_bitwise_individual_wide`: strict production
+//!   parity for all widths 1..64, multiple seeds, compress 1/4/8 and every
+//!   starting residue, empty/short/capacity-max selections and contexts spanning
+//!   the per-head LDS boundary. Split enabled/disabled arms assert the reached
+//!   policy; Q8 split-KV has fixed LDS, not a context-dependent split threshold.
+//!   Output prefix/tail guards and inactive rows are poisoned; query, selections,
+//!   and K/V must remain immutable. Candidate refusal/mismatch, missing device,
+//!   and unsupported wide architecture are fatal. Physical 64 is a lab scope,
+//!   not promotion of the production-certified eight-row capability.
 //! * `qsa_splitk_q8_selected_tiles_rows_1_2_8`: launches of rows 1, 2 and 8 with
 //!   partially filled selected tiles (selected_len 2051 = 32 tiles + 3 tokens
 //!   through a capacity clamp and through a block budget, 63..70 around one
@@ -47,8 +51,10 @@
 //!   (8300 tokens) and a 256K-like cache (262144 tokens, selected tokens drawn
 //!   from the whole range).
 //!
-//! Every test prints aggregate fixture/row/head counts, mismatch counts and the
-//! worst maxdiff/tolerance ratio per split count.
+//! Diagnostic tests print tolerance summaries. The strict wide gate prints
+//! mode/width/policy and terminal-launch module/object SHA receipts (not a
+//! provenance claim for every stage), and accepts raw bytes only. These are
+//! finite synthetic operands, not an exceptional-value or full-model proof.
 //!
 //! `#[ignore]`d: needs a working HIP device. Run explicitly, one test thread
 //! (the tests share the one GPU):
@@ -60,9 +66,12 @@
 
 #![cfg(feature = "lab")]
 
+use rdna_compute::prefill_invariant::Qwen4VerifyReference;
 use rdna_compute::tensor_ops::{
-    indexed_attention_attention_batch_exact, indexed_attention_attention_splitkv_q8_for_test,
-    IndexedAttentionAttentionBatch, QsaKvFormat, QSA_DECODE_SPLITK_SPLITS,
+    indexed_attention_attention_batch, indexed_attention_attention_batch_exact,
+    indexed_attention_attention_splitkv_q8_for_test, qsa_decode_attention_policy_for_row_for_test,
+    IndexedAttentionAttentionBatch, QsaDecodeAttentionPolicy, QsaKvFormat,
+    QSA_DECODE_SPLITK_SPLITS,
 };
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -836,8 +845,7 @@ fn row_mode(r: usize, force: Option<Mode>) -> Mode {
     }
 }
 
-/// Host data of a config's first `rows` rows (8 for the production-sized
-/// windows, 32 for the wide-verify width).
+/// Host data of a config's first `rows` rows (eight in the direct diagnostic).
 fn batch_host(
     cfg: &BatchCfg,
     force: Option<Mode>,
@@ -1016,23 +1024,373 @@ fn qsa_splitk_q8_batched_rows_bitwise_individual() {
     );
 }
 
-/// The same batched-equals-individual check at the wide-verify width: windows
-/// of `QSA_DECODE_SPLITK_RESERVE_ROWS` (32) rows, launched at 1, 8, 9, 16, 31
-/// and 32 rows (the production admission is 1..=few_row_limit, up to 32 inside
-/// an eager exact-wide verify).
-#[test]
-#[ignore = "needs a HIP device"]
-fn qsa_splitk_q8_batched_rows_bitwise_individual_wide() {
-    const WIDE_ROWS: usize = 32;
-    let mut gpu = Gpu::init().expect("gpu init");
-    let dev = make_dev_q8(&mut gpu, FULL_CAP, 0x5a5a_0008);
-    batched_bitwise_sweep(
-        &mut gpu,
-        &dev,
-        "q8 wide batched rows vs single-row launches (8K cache)",
-        WIDE_ROWS,
-        &[1, 8, 9, 16, 31, 32],
+fn assert_raw_equal(got: &[u8], want: &[u8], label: &str) {
+    assert_eq!(got.len(), want.len(), "{label}: byte extent");
+    if let Some(i) = got.iter().zip(want).position(|(a, b)| a != b) {
+        panic!(
+            "{label}: first mismatch byte={i} row={} head={} word={} got={:#04x} want={:#04x}",
+            i / (NH * HD * 4),
+            (i / (HD * 4)) % NH,
+            (i / 4) % HD,
+            got[i],
+            want[i],
+        );
+    }
+}
+
+fn assert_poison(bytes: &[u8], label: &str) {
+    assert_eq!(bytes.len() % 4, 0);
+    let poison = SENTINEL.to_le_bytes();
+    if let Some(i) = bytes.chunks_exact(4).position(|word| word != poison) {
+        panic!("{label}: guard/inactive word {i} overwritten");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strict_dispatch(
+    gpu: &mut Gpu,
+    dev: &Dev,
+    cfg: &BatchCfg,
+    q: &GpuTensor,
+    selected: &GpuTensor,
+    out: &GpuTensor,
+    rows: usize,
+    position_start: usize,
+    reference: Qwen4VerifyReference,
+    split_enabled: bool,
+    label: &str,
+) -> QsaDecodeAttentionPolicy {
+    let p = IndexedAttentionAttentionBatch {
+        q_with_gate: q,
+        full_keys: &dev.keys,
+        full_values: &dev.values,
+        selected,
+        output: out,
+        rows,
+        position_start,
+        n_heads: NH,
+        n_kv_heads: NKV,
+        head_dim: HD,
+        budget_blocks: cfg.budget,
+        compress: cfg.compress,
+        capacity: cfg.capacity,
+        full_capacity: dev.full_cap,
+        format: dev.format,
+        shape_selected: cfg.capacity,
+    };
+    assert_eq!(
+        gpu.qwen4_verify_reference(),
+        Some(reference),
+        "{label}: reference scope"
     );
+    let expected =
+        if reference == Qwen4VerifyReference::Eager && split_enabled && gpu.arch == "gfx1151" {
+            QsaDecodeAttentionPolicy::SplitKvQ8 {
+                splits: QSA_DECODE_SPLITK_SPLITS,
+            }
+        } else {
+            QsaDecodeAttentionPolicy::PerHead
+        };
+    for row in 0..rows {
+        assert_eq!(
+            qsa_decode_attention_policy_for_row_for_test(gpu, &p, row),
+            Some(expected),
+            "{label}: row {row} refused or policy mismatch",
+        );
+    }
+    assert_eq!(
+        qsa_decode_attention_policy_for_row_for_test(gpu, &p, rows),
+        None
+    );
+    indexed_attention_attention_batch(gpu, &p)
+        .unwrap_or_else(|e| panic!("{label}: production candidate refused: {e:?}"));
+    let expected_terminal = if matches!(expected, QsaDecodeAttentionPolicy::SplitKvQ8 { .. }) {
+        "qsa_decode_splitkv_merge_f32"
+    } else {
+        let bound = cfg.budget * cfg.compress + cfg.compress - 1;
+        let selected_extent = if reference == Qwen4VerifyReference::Recorded {
+            cfg.capacity
+        } else {
+            (position_start + rows).min(cfg.capacity).min(bound)
+        };
+        let parallel = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
+            && selected_extent > 0
+            && selected_extent * 8 + 32 <= 64 * 1024;
+        if parallel {
+            "indexed_attention_attention_q8_batched"
+        } else {
+            "indexed_attention_attention_q8_batched_serial"
+        }
+    };
+    assert_eq!(
+        gpu.last_launched_kernel(),
+        Some(expected_terminal),
+        "{label}: actual terminal policy/LDS subroute",
+    );
+    expected
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strict_production_fixture(
+    gpu: &mut Gpu,
+    dev: &Dev,
+    cfg: &BatchCfg,
+    seed: u64,
+    reference: Qwen4VerifyReference,
+    split_enabled: bool,
+) {
+    const ROWS: usize = 64;
+    const GUARD: usize = 64;
+    const Q_ROW: usize = 2 * NH * HD;
+    const O_ROW: usize = NH * HD;
+    let label = format!(
+        "arch={} seed={seed:#x} mode={reference:?} split={split_enabled} {} ps={} c={} budget={} cap={}",
+        gpu.arch, cfg.name, cfg.position_start, cfg.compress, cfg.budget, cfg.capacity,
+    );
+    assert!(cfg.position_start > 0);
+    assert!(cfg.position_start + ROWS < dev.full_cap, "{label}");
+    let mut rng = Rng(seed ^ ((cfg.position_start as u64) << 16) ^ cfg.budget as u64);
+    let q_host = make_q(&mut rng, ROWS);
+    let selected_host: Vec<Vec<i32>> = (0..ROWS)
+        .map(|r| {
+            let visible = cfg.position_start + r + 1;
+            gen_row(
+                &mut rng,
+                row_mode(r, None),
+                visible,
+                selected_len(visible, cfg.budget, cfg.compress, cfg.capacity),
+                cfg.capacity,
+                dev.full_cap,
+            )
+        })
+        .collect();
+    let q = upload_q(gpu, &q_host);
+    let selected = upload_selected(gpu, &selected_host);
+    let q_before = gpu.download_raw_bytes(&q).expect("query S0 bytes");
+    let selected_before = gpu
+        .download_raw_bytes(&selected)
+        .expect("selection S0 bytes");
+    let keys_before = gpu.download_raw_bytes(&dev.keys).expect("K S0 bytes");
+    let values_before = gpu.download_raw_bytes(&dev.values).expect("V S0 bytes");
+
+    // A persistent S0 is shared by the sequential reference calls. Attention is
+    // read-only: only visibility/position advances; no append pipeline is claimed.
+    let oracle_owner = sentinel(gpu, 2 * GUARD + (ROWS + 1) * O_ROW);
+    for r in 0..ROWS {
+        let qr = q.sub_offset(r * Q_ROW, Q_ROW);
+        // Raw selected tensors are byte-addressed (each i32 occupies four).
+        let sr = selected.sub_offset(r * cfg.capacity * 4, cfg.capacity * 4);
+        let out = oracle_owner.sub_offset(GUARD + r * O_ROW, O_ROW);
+        strict_dispatch(
+            gpu,
+            dev,
+            cfg,
+            &qr,
+            &sr,
+            &out,
+            1,
+            cfg.position_start + r,
+            reference,
+            split_enabled,
+            &format!("{label} singleton row={r}"),
+        );
+        let bytes = gpu
+            .download_raw_bytes(&oracle_owner)
+            .expect("singleton output bytes");
+        assert_poison(&bytes[..GUARD * 4], &label);
+        assert_poison(&bytes[(GUARD + (r + 1) * O_ROW) * 4..], &label);
+        assert!(
+            bytes[(GUARD + r * O_ROW) * 4..(GUARD + (r + 1) * O_ROW) * 4]
+                .chunks_exact(4)
+                .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
+            "{label}: singleton row={r} nonfinite/unwritten",
+        );
+    }
+    let oracle = gpu
+        .download_raw_bytes(&oracle_owner)
+        .expect("sequential oracle bytes");
+    assert_raw_equal(
+        &gpu.download_raw_bytes(&dev.keys)
+            .expect("singleton K final"),
+        &keys_before,
+        &format!("{label} singleton immutable K"),
+    );
+    assert_raw_equal(
+        &gpu.download_raw_bytes(&dev.values)
+            .expect("singleton V final"),
+        &values_before,
+        &format!("{label} singleton immutable V"),
+    );
+    assert_raw_equal(
+        &gpu.download_raw_bytes(&q).expect("singleton query final"),
+        &q_before,
+        &format!("{label} singleton immutable query"),
+    );
+    assert_raw_equal(
+        &gpu.download_raw_bytes(&selected)
+            .expect("singleton selection final"),
+        &selected_before,
+        &format!("{label} singleton immutable selections"),
+    );
+    // 8188 entries fit the 64KiB per-head LDS budget (8 bytes/entry + 32).
+    // Q8 split-KV itself has fixed LDS. The split-disabled Eager arm crosses
+    // parallel/serial within a window; Recorded preserves shape_selected instead.
+    if cfg.name == "lds-boundary" {
+        let first = (cfg.position_start + 1).min(cfg.capacity);
+        let last = (cfg.position_start + ROWS).min(cfg.capacity);
+        assert!(
+            first <= 8192 && last > 8188,
+            "{label}: LDS context coverage"
+        );
+        if cfg.position_start < 8188 {
+            assert!(first * 8 + 32 <= 65536 && last * 8 + 32 > 65536);
+        }
+    }
+    for rows in 1..=ROWS {
+        let candidate_label = format!("{label} R={rows} output_bytes={}", rows * O_ROW * 4);
+        let owner = sentinel(gpu, 2 * GUARD + (ROWS + 1) * O_ROW);
+        let out = owner.sub_offset(GUARD, ROWS * O_ROW);
+        let policy = strict_dispatch(
+            gpu,
+            dev,
+            cfg,
+            &q,
+            &selected,
+            &out,
+            rows,
+            cfg.position_start,
+            reference,
+            split_enabled,
+            &candidate_label,
+        );
+        let terminal = gpu
+            .last_launched_kernel()
+            .expect("production dispatch must launch a kernel")
+            .to_owned();
+        let (module, container_sha, sha) = gpu
+            .lab_kernel_device_identity(&terminal)
+            .expect("strict G1 requires terminal launched-object provenance");
+        let got = gpu.download_raw_bytes(&owner).expect("candidate bytes");
+        assert_poison(&got[..GUARD * 4], &candidate_label);
+        assert_poison(&got[(GUARD + rows * O_ROW) * 4..], &candidate_label);
+        assert_raw_equal(
+            &got[GUARD * 4..(GUARD + rows * O_ROW) * 4],
+            &oracle[GUARD * 4..(GUARD + rows * O_ROW) * 4],
+            &candidate_label,
+        );
+        for r in 0..rows {
+            let visible = cfg.position_start + r + 1;
+            let len = selected_len(visible, cfg.budget, cfg.compress, cfg.capacity);
+            if valid_count(&selected_host[r], len, visible, dev.full_cap) == 0 {
+                assert!(
+                    got[(GUARD + r * O_ROW) * 4..(GUARD + (r + 1) * O_ROW) * 4]
+                        .iter()
+                        .all(|&b| b == 0),
+                    "{candidate_label}: empty/all-invalid row {r} must be +0 bytes",
+                );
+            }
+        }
+        assert_raw_equal(
+            &gpu.download_raw_bytes(&q).expect("candidate query final"),
+            &q_before,
+            &format!("{candidate_label} immutable query"),
+        );
+        assert_raw_equal(
+            &gpu.download_raw_bytes(&selected)
+                .expect("candidate selection final"),
+            &selected_before,
+            &format!("{candidate_label} immutable selections"),
+        );
+        println!(
+            "{candidate_label} policy={policy:?} terminal={terminal} module={module} container_sha256={container_sha} object_sha256={sha} q_bytes={} selected_bytes={} kv_bytes_each={} shape_selected={} byte_equal=true",
+            q_before.len(), selected_before.len(), keys_before.len(), cfg.capacity,
+        );
+        gpu.free_tensor(owner)
+            .expect("free guarded candidate owner");
+    }
+    gpu.free_tensor(oracle_owner)
+        .expect("free guarded oracle owner");
+    gpu.free_tensor(q).expect("free query owner");
+    gpu.free_tensor(selected).expect("free selected owner");
+}
+
+/// Strict G1 production-dispatch gate; the direct tolerance oracle is not used.
+#[test]
+#[ignore = "strict G1: needs a supported HIP device; refusal is fatal"]
+fn qsa_splitk_q8_batched_rows_bitwise_individual_wide() {
+    let mut gpu = Gpu::init().expect("strict G1 requires a working HIP device");
+    assert!(
+        matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201"),
+        "strict wide QSA admission unavailable on {}",
+        gpu.arch
+    );
+    let prior_rows = gpu.set_wide_verify_rows(64);
+    let prior_reference = gpu.qwen4_verify_reference();
+    let prior_flags = gpu.flags.clone();
+    // Restore host scope even if a candidate refusal/mismatch panics.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eq!(gpu.few_row_limit(), 64, "strict candidate was not admitted");
+        for seed in [0x5a5a_0040, 0xd3c0_de64] {
+            let dev = make_dev_q8(&mut gpu, FULL_CAP, seed);
+            let keys = gpu.download_raw_bytes(&dev.keys).expect("cache K S0");
+            let values = gpu.download_raw_bytes(&dev.values).expect("cache V S0");
+            assert!(keys.iter().any(|&b| b != 0) && values.iter().any(|&b| b != 0));
+            for split_enabled in [true, false] {
+                let mut flags = (*prior_flags).clone();
+                flags.qwen4_qsa_decode_splitk = split_enabled;
+                gpu.flags = std::sync::Arc::new(flags);
+                for reference in [Qwen4VerifyReference::Eager, Qwen4VerifyReference::Recorded] {
+                    gpu.set_qwen4_verify_reference(Some(reference));
+                    for compress in [1, 4, 8] {
+                        for residue in 0..compress {
+                            // Nonzero initial prefix in every fixture; all compress residues.
+                            let start = 16 * compress + residue;
+                            for (name, position_start, budget, capacity) in [
+                                ("empty-short", start, 0, 16),
+                                ("short-budget", start, 1, 16),
+                                ("capacity-max", start, HUGE, 64),
+                                ("lds-boundary", 8184 + residue, HUGE, 8256),
+                            ] {
+                                let cfg = BatchCfg {
+                                    name,
+                                    compress,
+                                    budget,
+                                    position_start,
+                                    capacity,
+                                };
+                                strict_production_fixture(
+                                    &mut gpu,
+                                    &dev,
+                                    &cfg,
+                                    seed,
+                                    reference,
+                                    split_enabled,
+                                );
+                                assert_raw_equal(
+                                    &gpu.download_raw_bytes(&dev.keys).expect("cache K final"),
+                                    &keys,
+                                    "immutable K cache S0",
+                                );
+                                assert_raw_equal(
+                                    &gpu.download_raw_bytes(&dev.values).expect("cache V final"),
+                                    &values,
+                                    "immutable V cache S0",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            gpu.free_tensor(dev.keys).expect("free cache K");
+            gpu.free_tensor(dev.values).expect("free cache V");
+        }
+    }));
+    gpu.flags = prior_flags;
+    gpu.set_qwen4_verify_reference(prior_reference);
+    gpu.set_wide_verify_rows(prior_rows);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[test]

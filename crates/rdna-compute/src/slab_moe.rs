@@ -11,10 +11,10 @@
 //! [`slab_cold_kernels`]. The per-arch modules (with the hot MQ4 K1 bucket) are
 //! [`SlabArchKernels`], the per-cold-codec cold K1 blobs and symbols [`SlabCold`].
 //!
-//! * K1 decode: [`Gpu::qwen4_slab_union_plan`] turns the routed ids into the
-//!   fixed-capacity per-codec-bucket lane-union descriptor the four
-//!   `mq_i4_moe_gemv_*` symbols read (the data-dependent bucket counts stay on
-//!   the device; unused bucket tails are empty experts the kernels skip), and
+//! * K1 decode: [`Gpu::qwen4_slab_union_plan`] builds one immutable window
+//!   descriptor, shared by gate/up and down. Above eight logical rows the PM
+//!   planner emits fixed-eight-row descriptors and K1 consumes them with grid-z
+//!   tiling; unused expert slots are deterministically empty.
 //!   [`Gpu::mq_i4_moe_gemv_slab`] launches a projection over the non-empty
 //!   buckets. Both go through `launch_maybe_blob`, so they are recorded by the
 //!   replay recorder and captured by graphs like every other route launch.
@@ -59,27 +59,28 @@ pub const MQ_I4_MOE_GEMV_SYMBOLS: [[&str; 2]; 2] = [
     ],
 ];
 
-/// Wide K1 entries, `[capacity (16/32)][codec][kind]`; the same 96-byte ABI as the narrow entries (`n_experts@88`, zero `reserved@92`).
-pub const MQ_I4_MOE_GEMV_WIDE_SYMBOLS: [[[&str; 2]; 2]; 2] = [
+/// Fixed-eight-row K1 exports in the gfx1201 shared image, `[bucket][kind]`.
+/// Every descriptor has 80 slots, irrespective of the logical window length.
+pub const MQ_I4_MOE_GEMV_ROWTILE_SYMBOLS: [[&str; 2]; 2] = [
     [
-        [
-            "mq_i4_moe_gemv_mq3i4_r256_gate_up_c16",
-            "mq_i4_moe_gemv_mq3i4_r128_down_c16",
-        ],
-        [
-            "mq_i4_moe_gemv_mq4sym_r256_gate_up_c16",
-            "mq_i4_moe_gemv_mq4sym_r128_down_c16",
-        ],
+        "mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
+        "mq_i4_moe_gemv_mq3i4_r128_down_t8",
     ],
     [
-        [
-            "mq_i4_moe_gemv_mq3i4_r256_gate_up_c32",
-            "mq_i4_moe_gemv_mq3i4_r128_down_c32",
-        ],
-        [
-            "mq_i4_moe_gemv_mq4sym_r256_gate_up_c32",
-            "mq_i4_moe_gemv_mq4sym_r128_down_c32",
-        ],
+        "mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
+        "mq_i4_moe_gemv_mq4sym_r128_down_t8",
+    ],
+];
+
+/// Fixed-eight-row exports in the gfx1151 Cn image, `[bucket][kind]`.
+pub const MQ_I4_MOE_GEMV_CN_ROWTILE_SYMBOLS: [[&str; 2]; 2] = [
+    [
+        "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8",
+        "mq_i4_moe_gemv_cn_mq3i4_r128_down_t8",
+    ],
+    [
+        "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up_t8",
+        "mq_i4_moe_gemv_cn_mq4sym_r128_down_t8",
     ],
 ];
 
@@ -165,6 +166,9 @@ pub enum SlabK1Module {
     /// Eight rows per 256-thread workgroup with the expert's slots' X in LDS
     /// (`mq_i4_moe_gemv_cn_pm_gfx1151`), bitwise K1; gfx1151 MQ4/W3 layers only.
     Cn,
+    /// Fixed-eight-row descriptors and grid-z scheduling. Explicit selection is
+    /// the byte-oracle path, independent of the product family selector.
+    RowTiles,
 }
 
 /// The module the default dispatch picks: Cn on gfx1151 when `2 <= lanes <= 8` and the switch is
@@ -187,10 +191,10 @@ pub struct SlabK1Pick {
     pub block: [u32; 3],
 }
 
-/// The module/symbol/geometry of bucket `bucket` (0 = W3, 1 = MQ4) of a projection with `m` output
-/// rows over `slots` union slots. K1: the bucket's entry `k1`, grid `[m, slots, 1]`, block
-/// `[32, 1, 1]`; Cn (gfx1151 MQ4/W3 layers; `k1` unused): grid `[m / 8, slots, 1]`, block
-/// `[256, 1, 1]`.
+/// The module/symbol/geometry of bucket `bucket` (0 = W3, 1 = MQ4) of a projection.
+/// `slots` is the whole-window slot count. K1 uses `[m, slots, 1]`, Cn
+/// `[m / 8, slots, 1]`, and RowTiles `[ceil(m/8), 80, ceil(slots/80)]`.
+/// Callers validate dimensions and codec/architecture inventory before selecting.
 pub fn slab_k1_pick(
     k1: &SlabK1,
     module: SlabK1Module,
@@ -214,6 +218,9 @@ pub fn slab_k1_pick(
             grid: [(m / MQ_I4_MOE_GEMV_CN_ROWS_PER_WG) as u32, slots as u32, 1],
             block: [MQ_I4_MOE_GEMV_CN_BLOCK, 1, 1],
         },
+        SlabK1Module::RowTiles => {
+            slab_rowtile_pick(k1, down, m, slots / SLAB_TOP_K).expect("validated rowtile launch")
+        }
     }
 }
 
@@ -494,22 +501,197 @@ pub fn slab_cold_k1_metadata(arch: &str, cold_codec: u8) -> Option<&'static Slab
     }
 }
 
-/// Whether `k1` is one of the shared MQ4/W3 K1 entries ([`MQ_I4_MOE_GEMV_SYMBOLS`], gfx1151 and
-/// gfx1201) that the wide `_c16/_c32` twins ([`MQ_I4_MOE_GEMV_WIDE_SYMBOLS`]) are exports of the
-/// same image for. gfx1100's MQ4-only and E8P K1 entries have no wide twin.
-fn slab_k1_wide_capable(k1: &SlabK1) -> bool {
-    MQ_I4_MOE_GEMV_SYMBOLS.contains(&k1.symbols)
+/// Read-only provenance of the gfx1151 production one-row C1 image.
+/// This is inventory, not codec admission or a request to select C1.
+pub fn slab_c1_k1_metadata(arch: &str) -> Option<SlabK1> {
+    (arch == "gfx1151").then_some(SlabK1 {
+        module: MQ_I4_MOE_GEMV_C1_MODULE,
+        image: kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151,
+        symbols: MQ_I4_MOE_GEMV_C1_SYMBOLS,
+    })
 }
 
-/// Whether every K1 bucket a layer launches on `arch` (the hot MQ4 bucket and `cold`, `None` for an
-/// MQ4-only layer) has a wide twin; the wide launch uses one symbol family for both buckets.
+/// The architecture-specific rowtile image for an existing, admission-checked
+/// bucket. Inventory alone does not grant codec admission.
+pub fn slab_rowtile_k1(k1: &SlabK1) -> Option<SlabK1> {
+    let (module, image, symbols) = match (k1.module, k1.symbols) {
+        (MQ_I4_MOE_GEMV_GFX1151_MODULE, symbols) if MQ_I4_MOE_GEMV_SYMBOLS.contains(&symbols) => {
+            let bucket = usize::from(symbols == MQ_I4_MOE_GEMV_SYMBOLS[1]);
+            (
+                MQ_I4_MOE_GEMV_CN_MODULE,
+                kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+                MQ_I4_MOE_GEMV_CN_ROWTILE_SYMBOLS[bucket],
+            )
+        }
+        (MQ_I4_MOE_GEMV_MODULE, symbols) if MQ_I4_MOE_GEMV_SYMBOLS.contains(&symbols) => {
+            let bucket = usize::from(symbols == MQ_I4_MOE_GEMV_SYMBOLS[1]);
+            (k1.module, k1.image, MQ_I4_MOE_GEMV_ROWTILE_SYMBOLS[bucket])
+        }
+        (MQ_I4_MOE_GEMV_GFX1100_MODULE, MQ_I4_MOE_GEMV_GFX1100_MQ4_SYMBOLS) => (
+            k1.module,
+            k1.image,
+            [
+                "mq_i4_moe_gemv_mq4sym_r256_gate_up_pm_gfx1100_t8",
+                "mq_i4_moe_gemv_mq4sym_r128_down_pm_gfx1100_t8",
+            ],
+        ),
+        ("e8p_i4_moe_gemv_pm_gfx1201", _) => (
+            k1.module,
+            k1.image,
+            [
+                "e8p_i4_moe_gemv_r256_gate_up_t8",
+                "e8p_i4_moe_gemv_r128_down_t8",
+            ],
+        ),
+        (E8P_I4_MOE_GEMV_GFX1100_MODULE, _) => (
+            k1.module,
+            k1.image,
+            [
+                "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8",
+                "e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8",
+            ],
+        ),
+        ("e8p_i4_moe_gemv_pm_gfx1151", _) => (
+            k1.module,
+            k1.image,
+            [
+                "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151_t8",
+                "e8p_i4_moe_gemv_r128_down_pm_gfx1151_t8",
+            ],
+        ),
+        _ => return None,
+    };
+    Some(SlabK1 {
+        module,
+        image,
+        symbols,
+    })
+}
+
+/// Read-only PM planner provenance. The module key and export have the same
+/// spelling. Availability is inventory only, never an architecture admission.
+pub fn slab_rowtile_planner(arch: &str) -> Option<(&'static str, &'static [u8])> {
+    match arch {
+        "gfx1151" => Some((
+            "qwen4_slab_union_plan_t8_pm_gfx1151",
+            kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151,
+        )),
+        "gfx1201" => Some((
+            "qwen4_slab_union_plan_t8_pm_gfx1201",
+            kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201,
+        )),
+        "gfx1100" => Some((
+            "qwen4_slab_union_plan_t8_pm_gfx1100",
+            kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100,
+        )),
+        _ => None,
+    }
+}
+
+fn slab_check_rowtile_pin(image: &[u8], expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    if expected.is_empty() {
+        return Err("slab rowtile image SHA256 is not pinned".into());
+    }
+    let actual = format!("{:x}", Sha256::digest(image));
+    if actual != expected {
+        return Err(format!(
+            "slab rowtile image SHA256 {actual} differs from pinned {expected}"
+        ));
+    }
+    Ok(())
+}
+
+/// Independent qualification-pin check, once per image actually requested.
+/// Module-cache identity checks still run on every embedded-kernel binding.
+fn slab_verify_rowtile_pin(module: &str) -> HipResult<()> {
+    macro_rules! verify {
+        ($image:ident, $pin:ident) => {{
+            static VERIFIED: std::sync::LazyLock<Result<(), String>> =
+                std::sync::LazyLock::new(|| slab_check_rowtile_pin(kernels::$image, kernels::$pin));
+            VERIFIED
+                .as_ref()
+                .map(|_| ())
+                .map_err(|reason| hip_bridge::HipError::new(1, reason))
+        }};
+    }
+    match module {
+        "qwen4_slab_union_plan_t8_pm_gfx1151" => verify!(
+            QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151,
+            QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151_SHA256
+        ),
+        "qwen4_slab_union_plan_t8_pm_gfx1201" => verify!(
+            QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201,
+            QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201_SHA256
+        ),
+        "qwen4_slab_union_plan_t8_pm_gfx1100" => verify!(
+            QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100,
+            QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100_SHA256
+        ),
+        MQ_I4_MOE_GEMV_CN_MODULE => verify!(
+            MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+            MQ_I4_MOE_GEMV_CN_PM_GFX1151_SHA256
+        ),
+        MQ_I4_MOE_GEMV_MODULE => {
+            verify!(MQ_I4_MOE_GEMV_PM_GFX1201, MQ_I4_MOE_GEMV_PM_GFX1201_SHA256)
+        }
+        MQ_I4_MOE_GEMV_GFX1100_MODULE => verify!(
+            MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100,
+            MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100_SHA256
+        ),
+        "e8p_i4_moe_gemv_pm_gfx1201" => verify!(
+            E8P_I4_MOE_GEMV_PM_GFX1201,
+            E8P_I4_MOE_GEMV_PM_GFX1201_SHA256
+        ),
+        "e8p_i4_moe_gemv_pm_gfx1151" => verify!(
+            E8P_I4_MOE_GEMV_PM_GFX1151,
+            E8P_I4_MOE_GEMV_PM_GFX1151_SHA256
+        ),
+        E8P_I4_MOE_GEMV_GFX1100_MODULE => verify!(
+            E8P_I4_MOE_GEMV_PM_GFX1100,
+            E8P_I4_MOE_GEMV_PM_GFX1100_SHA256
+        ),
+        _ => Err(hip_bridge::HipError::new(
+            1,
+            "slab rowtile image has no qualification pin",
+        )),
+    }
+}
+
+fn slab_plan_geometry(lanes: usize, tiled: bool) -> Option<([u32; 3], [u32; 3], i32)> {
+    if lanes == 0 || lanes > SLAB_MAX_LANES || (!tiled && lanes > SLAB_NARROW_MAX_LANES) {
+        return None;
+    }
+    Some(if tiled {
+        ([lanes.div_ceil(8) as u32, 1, 1], [128, 1, 1], lanes as i32)
+    } else {
+        ([1, 1, 1], [512, 1, 1], (SLAB_TOP_K * lanes) as i32)
+    })
+}
+
 fn slab_wide_capable(arch: &SlabArchKernels, cold: Option<&SlabCold>) -> bool {
-    slab_k1_wide_capable(&arch.mq4_k1) && cold.is_none_or(|cold| slab_k1_wide_capable(&cold.k1))
+    slab_rowtile_planner(arch.arch).is_some()
+        && slab_rowtile_k1(&arch.mq4_k1).is_some()
+        && cold.is_none_or(|cold| slab_rowtile_k1(&cold.k1).is_some())
+}
+
+fn slab_rowtile_pick(k1: &SlabK1, down: bool, m: usize, lanes: usize) -> Option<SlabK1Pick> {
+    if lanes == 0 || lanes > SLAB_MAX_LANES || m == 0 || m > i32::MAX as usize {
+        return None;
+    }
+    let tile = slab_rowtile_k1(k1)?;
+    Some(SlabK1Pick {
+        module_key: tile.module,
+        image: tile.image,
+        symbol: tile.symbols[down as usize],
+        grid: [m.div_ceil(8) as u32, 80, lanes.div_ceil(8) as u32],
+        block: [256, 1, 1],
+    })
 }
 
 /// Descriptor/allocation capacity, not the architecture's row admission.
-pub const SLAB_MAX_LANES: usize = 32;
-/// Capacity of the unchanged decode K1 entries and S1 fallback groups.
+pub const SLAB_MAX_LANES: usize = 64;
+/// Capacity of the unchanged decode K1 entries and one physical row tile.
 pub const SLAB_NARROW_MAX_LANES: usize = 8;
 /// Routed experts per lane.
 pub const SLAB_TOP_K: usize = 10;
@@ -553,12 +735,9 @@ pub enum SlabBuckets<'a> {
 }
 
 impl Gpu {
-    /// Whether a wide K1 launch of `lanes` lanes is admitted for a layer whose cold bucket is
-    /// codec `cold_codec` (`0` = none): the developer opt-in is on, the row admission
-    /// ([`Gpu::wide_twin_cap`]) holds, and every K1 bucket the layer launches is a shared
-    /// MQ4/W3 K1 entry with a `_c16/_c32` twin ([`slab_wide_capable`]). Allocation capacity alone
-    /// never widens the shared row-exact admission; gfx1100 and E8P layers keep the unchanged
-    /// <=8-lane entries (S1 groups of [`SLAB_NARROW_MAX_LANES`] above 8).
+    /// Whether product dispatch admits a rowtile K1 launch for this layer.
+    /// Requires the shared exact-row policy, the K1 family selector and an
+    /// architecture-specific tile image for every admission-checked bucket.
     pub fn qwen4_slab_wide_twin(&self, lanes: usize, cold_codec: u8) -> bool {
         let Some(arch) = slab_arch_kernels(&self.arch) else {
             return false;
@@ -570,7 +749,7 @@ impl Gpu {
                 None => return false,
             },
         };
-        self.wide_twin_cap(WideTwinFamily::K1, lanes).is_some() && slab_wide_capable(arch, cold)
+        self.row_tile_twin_enabled(WideTwinFamily::K1, lanes) && slab_wide_capable(arch, cold)
     }
 
     /// Load the sealed slab's kernels (call before graph capture) for a layer whose cold bucket
@@ -667,8 +846,19 @@ impl Gpu {
             }
         }
         if WideTwinFamily::K1.enabled() && slab_wide_capable(arch, cold) {
-            for symbol in MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten() {
-                self.ensure_embedded_kernel(arch.mq4_k1.module, arch.mq4_k1.image, symbol)?;
+            let (module, image) = slab_rowtile_planner(arch.arch).expect("tile-capable planner");
+            slab_verify_rowtile_pin(module)?;
+            self.ensure_embedded_kernel(module, image, module)?;
+            for k1 in cold
+                .map(|cold| &cold.k1)
+                .into_iter()
+                .chain(std::iter::once(&arch.mq4_k1))
+            {
+                let tile = slab_rowtile_k1(k1).expect("tile-capable bucket");
+                slab_verify_rowtile_pin(tile.module)?;
+                for symbol in tile.symbols {
+                    self.ensure_embedded_kernel(tile.module, tile.image, symbol)?;
+                }
             }
         }
         if self.slab_k1_c1() && k1_rows8_cold_codec(cold_codec) {
@@ -735,16 +925,24 @@ impl Gpu {
     /// and `tiles` masked tile ids per codec) before any capture.
     pub fn reserve_qwen4_slab(&mut self, tiles: usize) -> HipResult<()> {
         self.slab_kernels("reserve_qwen4_slab")?;
+        // Preflight every extent before invalidating replay or changing storage.
+        let union_bytes =
+            crate::scratch::qwen4_slab_descriptor_bytes(SLAB_MAX_LANES).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "reserve_qwen4_slab: descriptor extent overflow")
+            })?;
+        let tile_bytes = crate::scratch::qwen4_slab_tiles_bytes(tiles).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_qwen4_slab: tile mask extent overflow")
+        })?;
         self.bind_thread()?;
         if crate::scratch::scratch_will_grow(
             self.scratch.qwen4_slab_union_scratch_bytes,
             self.scratch.qwen4_slab_union_scratch.is_some(),
-            crate::scratch::qwen4_slab_union_words(SLAB_MAX_LANES) * 4,
+            union_bytes,
         ) || (tiles != 0
             && crate::scratch::scratch_will_grow(
                 self.scratch.qwen4_slab_tiles_scratch_bytes,
                 self.scratch.qwen4_slab_tiles_scratch.is_some(),
-                2 * tiles * 4,
+                tile_bytes,
             ))
         {
             self.invalidate_for_scratch_growth();
@@ -761,6 +959,40 @@ impl Gpu {
             .ok_or_else(|| hip_bridge::HipError::new(0, "slab union scratch is not reserved"))
     }
 
+    /// Raw descriptor view for byte oracles; invalidated by the next union plan
+    /// or pointer-changing scratch growth. `rowtiles` must match the planner used.
+    pub fn qwen4_slab_union_descriptor_view(
+        &self,
+        lanes: usize,
+        rowtiles: bool,
+    ) -> HipResult<GpuTensor> {
+        if lanes == 0 || lanes > SLAB_MAX_LANES {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slab descriptor view: lanes must be 1..=64",
+            ));
+        }
+        let bytes = if rowtiles {
+            crate::scratch::qwen4_slab_rowtile_bytes(lanes)
+        } else {
+            crate::scratch::qwen4_slab_union_bytes(lanes)
+        }
+        .ok_or_else(|| hip_bridge::HipError::new(0, "slab descriptor view: extent overflow"))?;
+        let buf = self
+            .scratch
+            .qwen4_slab_union_scratch
+            .as_ref()
+            .filter(|buf| buf.size() >= bytes)
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "slab descriptor view: scratch not reserved")
+            })?;
+        Ok(GpuTensor {
+            buf: buf.byte_view(0, bytes),
+            shape: vec![bytes / 4],
+            dtype: DType::F32,
+        })
+    }
+
     /// Plan the lane union of `lanes` decode lanes from `topk` (`[lanes * 10]`
     /// i32 routed ids, slot = lane * 10 + rank) into the slab union scratch.
     /// Stream-ordered; no readback.
@@ -770,13 +1002,34 @@ impl Gpu {
         buckets: SlabBuckets<'_>,
         lanes: usize,
     ) -> HipResult<()> {
+        self.slab_union_plan_with(topk, buckets, lanes, lanes > SLAB_NARROW_MAX_LANES)
+    }
+
+    /// Direct byte-oracle planner for the tiled layout at every R=1..64.
+    /// Pair with `mq_i4_moe_gemv_slab_with(..., Some(SlabK1Module::RowTiles))`.
+    pub fn qwen4_slab_union_plan_rowtiles(
+        &mut self,
+        topk: &GpuTensor,
+        buckets: SlabBuckets<'_>,
+        lanes: usize,
+    ) -> HipResult<()> {
+        self.slab_union_plan_with(topk, buckets, lanes, true)
+    }
+
+    fn slab_union_plan_with(
+        &mut self,
+        topk: &GpuTensor,
+        buckets: SlabBuckets<'_>,
+        lanes: usize,
+        tiled: bool,
+    ) -> HipResult<()> {
         let arch = self.slab_kernels("qwen4_slab_union_plan")?;
-        if lanes == 0 || lanes > SLAB_MAX_LANES {
-            return Err(hip_bridge::HipError::new(
+        let (grid, block, sv) = slab_plan_geometry(lanes, tiled).ok_or_else(|| {
+            hip_bridge::HipError::new(
                 0,
-                "qwen4_slab_union_plan: lanes must be 1..=32",
-            ));
-        }
+                "qwen4_slab_union_plan: invalid row count or planner geometry",
+            )
+        })?;
         let slots = SLAB_TOP_K * lanes;
         if topk.buf.size() < slots * 4 {
             return Err(hip_bridge::HipError::new(
@@ -805,16 +1058,27 @@ impl Gpu {
             }
         };
         self.bind_thread()?;
-        self.ensure_kernel(arch.plan_module, (arch.plan_src)(), PLAN_SYMBOL)?;
+        let symbol = if tiled {
+            let (module, image) = slab_rowtile_planner(arch.arch).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "qwen4_slab_union_plan: no rowtile planner")
+            })?;
+            slab_verify_rowtile_pin(module)?;
+            self.ensure_embedded_kernel(module, image, module)?;
+            module
+        } else {
+            // slab_plan_geometry limits this to <=80 slots, never >320.
+            self.ensure_kernel(arch.plan_module, (arch.plan_src)(), PLAN_SYMBOL)?;
+            PLAN_SYMBOL
+        };
         if self.scratch.qwen4_slab_union_scratch_bytes
-            < crate::scratch::qwen4_slab_union_words(SLAB_MAX_LANES) * 4
+            < crate::scratch::qwen4_slab_descriptor_bytes(SLAB_MAX_LANES)
+                .expect("bounded slab extent")
             || self.scratch.qwen4_slab_union_scratch.is_none()
         {
             self.reserve_qwen4_slab(0)?;
         }
         let out = self.slab_union_base()?;
         let tp = topk.buf.as_ptr();
-        let sv = slots as i32;
         let nexp = SLAB_EXPERTS as i32;
         let mut params = [
             &tp as *const _ as *mut c_void,
@@ -824,7 +1088,7 @@ impl Gpu {
             &uniform as *const _ as *mut c_void,
             &nexp as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(PLAN_SYMBOL, [1, 1, 1], [512, 1, 1], 0, &mut params, || {
+        self.launch_maybe_blob(symbol, grid, block, 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(tp);
             b.push_ptr(codec_ptr);
@@ -872,11 +1136,13 @@ impl Gpu {
         )
     }
 
-    /// [`Gpu::mq_i4_moe_gemv_slab`] with the K1 schedule optionally forced (`None` = the default
-    /// dispatch: [`SlabK1Module::Cn`] on gfx1151 for `2 <= lanes <= 8` of an MQ4/W3 layer
-    /// ([`k1_rows8_cold_codec`]) unless `HIPFIRE_QWEN4_SLAB_K1_CN=0`, else [`SlabK1Module::K1`]).
+    /// [`Gpu::mq_i4_moe_gemv_slab`] with an optionally forced oracle schedule.
+    /// Product dispatch uses rowtiles above eight rows, Cn on gfx1151 MQ4/W3
+    /// at 2..=8 when enabled, and the incumbent K1 schedule otherwise.
     /// Forcing `Cn` is an error off gfx1151, above 8 lanes and for any other cold codec; the oracle
     /// forces both modules over the same union plan to compare them bitwise.
+    /// Explicit `RowTiles` bypasses the product family selector, not codec
+    /// admission; use the rowtile planner even at R<=8 for that oracle arm.
     #[allow(clippy::too_many_arguments)]
     pub fn mq_i4_moe_gemv_slab_with(
         &mut self,
@@ -921,14 +1187,24 @@ impl Gpu {
         if lanes == 0 || lanes > SLAB_MAX_LANES {
             return Err(hip_bridge::HipError::new(
                 0,
-                "mq_i4_moe_gemv_slab: lanes must be 1..=32",
+                "mq_i4_moe_gemv_slab: lanes must be 1..=64",
             ));
         }
-        let wide = self.qwen4_slab_wide_twin(lanes, cold_codec);
-        if lanes > SLAB_NARROW_MAX_LANES && !wide {
+        let direct_tiles = module == SlabK1Module::RowTiles;
+        let wide = lanes > SLAB_NARROW_MAX_LANES || direct_tiles;
+        if wide && !slab_wide_capable(arch, cold) {
             return Err(hip_bridge::HipError::new(
                 0,
-                "mq_i4_moe_gemv_slab: wide lanes require the K1 opt-in, shared architecture admission and an MQ4/W3 K1 layer",
+                "mq_i4_moe_gemv_slab: a bucket has no architecture-specific rowtile image",
+            ));
+        }
+        if lanes > SLAB_NARROW_MAX_LANES
+            && !direct_tiles
+            && !self.qwen4_slab_wide_twin(lanes, cold_codec)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: wide lanes require admitted K1 rowtiles",
             ));
         }
         let slots = SLAB_TOP_K * lanes;
@@ -967,11 +1243,41 @@ impl Gpu {
                     "mq_i4_moe_gemv_slab: bucket must be 0 or 1",
                 ))
             }
-            SlabBuckets::Table(_) => [true, true],
+            SlabBuckets::Table(table) => {
+                if table.buf.size() < SLAB_EXPERTS {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "mq_i4_moe_gemv_slab: short codec table",
+                    ));
+                }
+                [true, true]
+            }
         };
+        if present[0] && cold.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: cold bucket requested without an admitted cold codec",
+            ));
+        }
+        let descriptor_bytes = if wide {
+            crate::scratch::qwen4_slab_rowtile_bytes(lanes)
+        } else {
+            crate::scratch::qwen4_slab_union_bytes(lanes)
+        }
+        .expect("bounded descriptor extent");
+        if self.scratch.qwen4_slab_union_scratch_bytes < descriptor_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: descriptor scratch too small",
+            ));
+        }
         self.bind_thread()?;
         let union = self.slab_union_base()? as usize;
-        let s = slots;
+        let s = if wide {
+            SLAB_TOP_K * SLAB_NARROW_MAX_LANES
+        } else {
+            slots
+        };
         let wp = weight_ptrs.buf.as_ptr();
         let xp = xrot.buf.as_ptr();
         let y0p = y0.buf.as_ptr();
@@ -993,18 +1299,14 @@ impl Gpu {
                 &arch.mq4_k1
             };
             let pick = if wide {
-                SlabK1Pick {
-                    module_key: k1.module,
-                    image: k1.image,
-                    symbol: MQ_I4_MOE_GEMV_WIDE_SYMBOLS[usize::from(lanes > 16)][bucket]
-                        [down as usize],
-                    grid: [(m as u32).div_ceil(8), s as u32, 1],
-                    block: [256, 1, 1],
-                }
+                slab_rowtile_pick(k1, down, m, lanes).expect("validated rowtile launch")
             } else {
                 slab_k1_pick(k1, module, bucket, down, m, s)
             };
             let func = pick.symbol;
+            if wide {
+                slab_verify_rowtile_pin(pick.module_key)?;
+            }
             self.ensure_embedded_kernel(pick.module_key, pick.image, func)?;
             let ids = (union + bucket * s * 4) as *mut c_void;
             let offs = (union + (2 * s + bucket * (s + 1)) * 4) as *mut c_void;
@@ -2819,48 +3121,161 @@ mod tests {
         }
     }
 
-    /// The wide `_c16/_c32` twins live only in the shared gfx1151/gfx1201 MQ4/W3 K1 images: gfx1100 and the
-    /// E8P cold bucket never select them, so those layers keep the unchanged <=8-lane entries.
     #[test]
-    fn wide_twins_exist_only_for_the_shared_mq4_w3_k1_images() {
-        for arch in ["gfx1151", "gfx1201"] {
-            let k = slab_arch_kernels(arch).unwrap();
-            assert!(slab_wide_capable(k, None), "{arch}: MQ4-only layer");
-            assert!(
-                slab_wide_capable(k, slab_cold_kernels(arch, 1)),
-                "{arch}: W3 cold layer"
-            );
-            for symbol in MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten() {
-                assert!(
-                    contains_bytes(k.mq4_k1.image, symbol.as_bytes()),
-                    "{arch}: shared image exports {symbol}"
+    fn rowtile_pin_checks_fail_closed() {
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(slab_check_rowtile_pin(b"abc", abc).is_ok());
+        assert!(slab_check_rowtile_pin(b"abc", "").is_err());
+        assert!(slab_check_rowtile_pin(b"abcd", abc).is_err());
+        assert!(slab_check_rowtile_pin(b"abc", &abc.to_uppercase()).is_err());
+    }
+
+    #[test]
+    fn c1_metadata_is_exact_arch_inventory() {
+        let k1 = slab_c1_k1_metadata("gfx1151").unwrap();
+        assert_eq!(k1.module, MQ_I4_MOE_GEMV_C1_MODULE);
+        assert_eq!(k1.image, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151);
+        assert_eq!(k1.symbols, MQ_I4_MOE_GEMV_C1_SYMBOLS);
+        for arch in ["gfx1151x", "gfx1201", "gfx1100", ""] {
+            assert!(slab_c1_k1_metadata(arch).is_none());
+        }
+    }
+
+    #[test]
+    fn planner_geometry_rejects_wide_hip_calls_before_writes() {
+        for lanes in 1usize..=64 {
+            let (grid, block, rows) = slab_plan_geometry(lanes, true).unwrap();
+            assert_eq!(grid, [lanes.div_ceil(8) as u32, 1, 1]);
+            assert_eq!(block, [128, 1, 1]);
+            assert_eq!(rows, lanes as i32);
+            if lanes <= 8 {
+                assert_eq!(
+                    slab_plan_geometry(lanes, false),
+                    Some(([1, 1, 1], [512, 1, 1], (lanes * 10) as i32)),
                 );
+            } else {
+                assert!(slab_plan_geometry(lanes, false).is_none());
             }
         }
-        let e8p = slab_cold_kernels("gfx1201", 3).unwrap();
-        assert!(!slab_wide_capable(
-            slab_arch_kernels("gfx1201").unwrap(),
-            Some(e8p)
-        ));
-        let gfx1100 = slab_arch_kernels("gfx1100").unwrap();
-        assert!(!slab_wide_capable(gfx1100, None));
-        assert!(!slab_wide_capable(gfx1100, slab_cold_kernels("gfx1100", 3)));
-        // gfx1151 E8P is a served cold table exactly when the shared matrix admits it (the
-        // receipts switch); the table is inventory either way.
-        assert_eq!(
-            slab_cold_kernels("gfx1151", 3).is_some(),
-            crate::qwen4_slab_codec_admitted("gfx1151", 3)
-        );
-        assert!(slab_cold_k1_metadata("gfx1151", 3).is_some());
-        for symbol in MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten() {
-            assert!(!contains_bytes(
-                kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100,
-                symbol.as_bytes()
-            ));
-            assert!(!contains_bytes(
-                kernels::E8P_I4_MOE_GEMV_PM_GFX1201,
-                symbol.as_bytes()
-            ));
+        for lanes in [0, 65, usize::MAX] {
+            assert!(slab_plan_geometry(lanes, false).is_none());
+            assert!(slab_plan_geometry(lanes, true).is_none());
+        }
+    }
+    /// Inventory is architecture-specific; serving remains codec-admission-gated.
+    #[test]
+    fn rowtiles_cover_every_existing_slab_bucket_without_admitting_codecs() {
+        assert_eq!(SLAB_MAX_LANES, 64);
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            let k = slab_arch_kernels(arch).unwrap();
+            assert!(slab_wide_capable(k, None), "{arch}: MQ4-only layer");
+            assert!(slab_rowtile_planner(arch).is_some());
+            for cold_codec in [1, 3] {
+                if let Some(cold) = slab_cold_k1_metadata(arch, cold_codec) {
+                    assert!(
+                        slab_wide_capable(k, Some(cold)),
+                        "{arch}: codec {cold_codec}"
+                    );
+                    assert_eq!(
+                        slab_cold_kernels(arch, cold_codec).is_some(),
+                        crate::qwen4_slab_codec_admitted(arch, cold_codec),
+                    );
+                }
+            }
+            for k1 in std::iter::once(&k.mq4_k1).chain(
+                [1, 3]
+                    .into_iter()
+                    .filter_map(|codec| slab_cold_k1_metadata(arch, codec).map(|c| &c.k1)),
+            ) {
+                let tile = slab_rowtile_k1(k1).unwrap();
+                for symbol in tile.symbols {
+                    assert!(
+                        contains_bytes(tile.image, format!("{symbol}.kd").as_bytes()),
+                        "{arch}: {symbol}"
+                    );
+                }
+                for lanes in 1..=64 {
+                    for (down, m) in [(false, SLAB_GATE_UP_M), (true, SLAB_DOWN_M)] {
+                        let pick = slab_rowtile_pick(k1, down, m, lanes).unwrap();
+                        assert_eq!(pick.symbol, tile.symbols[down as usize]);
+                        assert_eq!(
+                            pick.grid,
+                            [m.div_ceil(8) as u32, 80, lanes.div_ceil(8) as u32]
+                        );
+                        assert_eq!(pick.block, [256, 1, 1]);
+                    }
+                }
+                for lanes in [0, 65, usize::MAX] {
+                    assert!(slab_rowtile_pick(k1, false, SLAB_GATE_UP_M, lanes).is_none());
+                }
+                assert!(slab_rowtile_pick(k1, false, 0, 1).is_none());
+                assert!(slab_rowtile_pick(k1, false, i32::MAX as usize + 1, 1).is_none());
+                for m in [1usize, 2, 7, 8, 9, 1279] {
+                    assert_eq!(
+                        slab_rowtile_pick(k1, false, m, 64).unwrap().grid[0],
+                        m.div_ceil(8) as u32
+                    );
+                }
+            }
+        }
+        for arch in ["gfx1151x", "gfx1101", "gfx942", ""] {
+            assert!(slab_rowtile_planner(arch).is_none());
+        }
+    }
+
+    #[test]
+    fn rowtile_images_keep_the_frozen_abis() {
+        for (arch_name, arch) in [
+            ("gfx1151", Arch::Gfx1151),
+            ("gfx1201", Arch::Gfx1201),
+            ("gfx1100", Arch::Gfx1100),
+        ] {
+            let k = slab_arch_kernels(arch_name).unwrap();
+            for k1 in std::iter::once(&k.mq4_k1).chain(
+                [1, 3]
+                    .into_iter()
+                    .filter_map(|codec| slab_cold_k1_metadata(arch_name, codec).map(|c| &c.k1)),
+            ) {
+                let tile = slab_rowtile_k1(k1).unwrap();
+                let (_, images) = Source::read(tile.image, arch).expect("tile image metadata");
+                for symbol in tile.symbols {
+                    let image = images
+                        .iter()
+                        .find(|image| image.name == symbol)
+                        .unwrap_or_else(|| panic!("{arch_name}: missing {symbol}"));
+                    let metadata = &image.metadata.parsed;
+                    assert_eq!(metadata.kernarg_segment_size, 96, "{symbol}");
+                    let args: Vec<_> = metadata
+                        .args
+                        .iter()
+                        .filter(|arg| !arg.value_kind.starts_with("hidden_"))
+                        .collect();
+                    assert_eq!(args.len(), MQ_I4_MOE_GEMV_KERNARG_COUNT, "{symbol}");
+                    for (arg, offset) in args.iter().zip([
+                        0, 8, 16, 24, 32, 40, 48, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92,
+                    ]) {
+                        assert_eq!(arg.offset, offset, "{symbol}: {}", arg.name);
+                    }
+                    assert_eq!(args[15].name, "n_experts");
+                    assert_eq!(args[16].name, "reserved");
+                }
+            }
+            let (symbol, bytes) = slab_rowtile_planner(arch_name).unwrap();
+            let (_, images) = Source::read(bytes, arch).expect("planner image metadata");
+            let metadata = &images
+                .iter()
+                .find(|image| image.name == symbol)
+                .expect("planner export")
+                .metadata
+                .parsed;
+            assert_eq!(metadata.kernarg_segment_size, 40);
+            let offsets: Vec<_> = metadata
+                .args
+                .iter()
+                .filter(|arg| !arg.value_kind.starts_with("hidden_"))
+                .map(|arg| arg.offset)
+                .collect();
+            assert_eq!(offsets, [0, 8, 16, 24, 28, 32]);
         }
     }
 
@@ -3015,11 +3430,7 @@ mod tests {
             (Arch::Gfx1201, kernels::MQ_I4_MOE_GEMV_PM_GFX1201),
         ] {
             let (_, images) = Source::read(bytes, arch).expect("embedded K1 metadata must parse");
-            for symbol in MQ_I4_MOE_GEMV_SYMBOLS
-                .iter()
-                .flatten()
-                .chain(MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten())
-            {
+            for symbol in MQ_I4_MOE_GEMV_SYMBOLS.iter().flatten() {
                 let image = images
                     .iter()
                     .find(|image| image.name == *symbol)

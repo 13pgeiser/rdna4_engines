@@ -161,6 +161,8 @@
   "pm_emitters": [
     "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs",
     "crates/peacemaker-isa/src/kernels/ep_gather_grouped_rows_by_tile_owner.rs",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs",
     "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv.rs",
     "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv/wide.rs",
     "crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs",
@@ -171,6 +173,8 @@
   "pm_images": [
     "kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1100.hxaco",
     "kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco",
+    "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco",
+    "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco",
     "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
     "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco",
     "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
@@ -191,6 +195,14 @@
       "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1100.hxaco",
       "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201.hxaco"
     ],
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs": [
+      "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco",
+      "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs": [
+      "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco",
+      "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco"
+    ],
     "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv.rs": [
       "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
       "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco"
@@ -210,9 +222,21 @@
       "kernels/qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151.hxaco"
     ]
   },
+  "image_symbol_owners": {
+    "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco": {
+      "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched_t8_pm_gfx1201": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs",
+      "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1201": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs"
+    },
+    "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco": {
+      "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched_t8_pm_gfx1151": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs",
+      "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1151": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs"
+    }
+  },
   "emitter_abi": {
     "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs": "hip_twin:kernels/src/pm_cdna/fp8_moe_gate_up.gfx942.hip#gemm_fp8b128_moe_grouped_fp8mfma",
     "crates/peacemaker-isa/src/kernels/ep_gather_grouped_rows_by_tile_owner.rs": "image-metadata (48-byte plain and 104-byte n8 variants are per image)",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs": "const:KERNARG_BYTES",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs": "const:KERNARG_BYTES",
     "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv.rs": "const:KERNARG_BYTES (96, the K1 ABI: 17 arguments, reserved at byte 92)",
     "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv/wide.rs": "image-metadata (wide entries live in the mq_i4_moe_gemv images owned by mq_i4_moe_gemv.rs)",
     "crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs": "const:KERNARG_BYTES (64)",
@@ -298,6 +322,7 @@
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_group_module_src": "module/source selector returning (module key, HIP source) by arch for the stable grouping kernels (gfx1100 binds the registered canonical twin module qwen4_moe_scatter_stable_top10_gfx1100, other arches the bare module); no launch, ensure or compile call — the three grouping launches live in moe_scatter_stable_top10_with, a checked launcher",
     "crates/rdna-compute/src/kernel_registry.rs::entries": "kernel registry table (module, symbols, source); compile inventory only",
     "crates/rdna-compute/src/kernel_registry.rs::default_route_entries": "kernel registry table of the default Redline routes; compile inventory only",
+    "crates/rdna-compute/src/kernel_registry.rs::legacy_mq4_rowtile_image": "pure architecture-specific image factory returning the legacy GU/Down module, image, qualification pin and actual export names; no launch or compilation call, with the real launch sites checked independently",
     "crates/rdna-compute/src/moe.rs::ep_tile_pull_kernel": "returns (image, symbol) of the EP tile pull; Gpu::ep_gather_grouped_rows_by_tile_owner launches through it and is checked",
     "crates/rdna-compute/src/replay.rs::pointer_effects": "retained-replay classification by symbol name; reads recorded launches, never issues one",
     "crates/rdna-compute/src/replay.rs::expected_kernarg_bytes": "retained-replay table of expected kernarg byte sizes by symbol; names and sizes only",
@@ -313,12 +338,28 @@
     "crates/rdna-compute/src/slab_moe.rs::plan_src_shared": "returns the shared union-plan HIP source (QWEN4_SLAB_UNION_PLAN_SRC) through the SlabArchKernels.plan_src function pointer; the planner launcher compiles it with ensure_kernel and launches qwen4_slab_union_plan, which is a checked site",
     "crates/rdna-compute/src/slab_moe.rs::slab_arch_kernels": "per-arch slab table lookup returning &'static SlabArchKernels (module, image and symbol names, plan source); names only, the launchers mq_i4_moe_gemv_slab, qwen4_moe_rotate128_i4_slab and the planner are checked sites",
     "crates/rdna-compute/src/slab_moe.rs::slab_cold_k1_metadata": "cold K1 table lookup by (arch, cold codec) returning &'static SlabCold (module, image and symbol names); names only, mq_i4_moe_gemv_slab launches through it and is a checked site",
-    "crates/rdna-compute/src/slab_moe.rs::slab_k1_wide_capable": "predicate comparing a SlabK1's symbol table with MQ_I4_MOE_GEMV_SYMBOLS; names only, never issues a launch",
     "crates/rdna-compute/src/gemm.rs::slab_k2_raw": "ungated K2 inventory selector keyed by (arch, slab codec) returning (module name, [gate/up, down] symbol names) from slab_k2_metadata and the QWEN4_MOE_SYM_PM_*/QWEN4_MOE_SYM_W3_* name constants; names only, it has no launch, ensure or compile call and its only caller is expert_capabilities::k2_raw, which builds a RawKernel name pair for the admission matrix",
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols_wide": "reporting-only twin of qwen4_moe_sym_gemm_symbols: returns the canonical native pair except the F2 widened resident NT8 gate/up entry; names only, never launches (launchers call qwen4_moe_sym_gemm)",
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols": "reporting-only twin target of qwen4_moe_sym_gemm_symbols_wide: returns the canonical native pair over the descriptor entries; names only, never launches (launchers call qwen4_moe_sym_gemm)"
   },
   "forwarders": {
+    "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_whole_chain": {
+      "checked_chain": [
+        "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_whole_chain",
+        "crates/rdna-compute/src/moe.rs::moe_router_softmax_top10_f32"
+      ],
+      "flow": "calls",
+      "reason": "the whole-chain oracle calls the production router for batched and singleton rows; its two router identity names must both be covered by that callee's real checked params/blob launch variants"
+    },
+    "crates/rdna-compute/src/slab_moe.rs::slab_rowtile_k1": {
+      "checked_chain": [
+        "crates/rdna-compute/src/slab_moe.rs::slab_rowtile_k1",
+        "crates/rdna-compute/src/slab_moe.rs::slab_rowtile_pick",
+        "crates/rdna-compute/src/slab_moe.rs::mq_i4_moe_gemv_slab_with"
+      ],
+      "flow": "returns",
+      "reason": "the rowtile selector returns SlabK1 metadata consumed by slab_rowtile_pick, whose symbol and launch geometry reach mq_i4_moe_gemv_slab_with; every mentioned K1 export must already be covered by that launcher's checked 17-argument params/blob ABI"
+    },
     "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_moe_grouped_top10_bf16out": {
       "to": "gemm_mq4g256v2_moe_grouped_wmma_k2_impl",
       "reason": "passes its BF16-output entry name to the shared launcher through the gfx11_entry parameter"
@@ -359,13 +400,6 @@
   "old_variants": {},
   "probe_candidates": {
     "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_kind": {
-      "images": [
-        "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
-        "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco"
-      ],
-      "reason": "Hand-handle launch_kernel_blob of K1 images: the kernel symbol is chosen by ctx.func(codec, kind) from a loaded module, so no literal name is in the function; the blob is the 96-byte kernarg() array."
-    },
-    "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_kind_wide": {
       "images": [
         "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
         "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco"

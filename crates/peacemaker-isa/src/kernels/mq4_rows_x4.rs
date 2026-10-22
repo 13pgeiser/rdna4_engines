@@ -5,9 +5,8 @@
 //! Few-row (B = 1..8 activation rows) exact MQ4G256V2 GEMV over up to four
 //! matrices per launch, emitted with the checked ISA builder for gfx1151 and
 //! gfx1201: `gemv_mq4g256v2_rows_x4_pm_<arch>`, module `mq4_rows_x4_pm_<arch>`,
-//! which also exports the row-exact wide twins
-//! `gemv_mq4g256v2_rows_x4_wide_r{16,32}_pm_<arch>` ([`wide`], 9..=32 verify rows;
-//! this entry is unchanged by them).
+//! which also exports the fixed-eight-row grid-y twin from [`emit_rowtiles`].
+//! The original narrow entry remains unchanged.
 //!
 //! ABI (96-byte kernarg segment): `A0@0 A1@8 A2@16 A3@24` (weights, read-only
 //! pointers), `x@32` (read-only), `y0@40 y1@48 y2@56 y3@64` (write-only),
@@ -27,6 +26,19 @@
 //! element `e` at byte `8 + e/2`, low nibble even). `x` is `[B][K]` f32,
 //! `y_i` is `[B][M_i]` f32 (`y_i[b*M_i + row]`). Every matrix, `x` and `y`
 //! byte span is at most `u32::MAX` (32-bit buffer/global offsets).
+//!
+//! Rowtile contract: `gemv_mq4g256v2_rows_x4_t8_pm_<arch>` takes total
+//! `R = 1..64` at offset 92 with the same other kernargs. Grid is
+//! `[sum_i ceil(M_i/2), ceil(R/8), 1]`, block32, LDS0. Workgroup y owns
+//! `[8*y, min(8*y+8,R))`; both X and the selected Y retain their full-window
+//! bases/strides, with at most eight rows' accumulators. Invalid domains and
+//! dead workgroups exit uniformly without X/weight loads or output stores.
+//! gfx1100 uses the scalar singleton recipe for both outputs; gfx1151 uses it
+//! for the forced-scalar LM matrix M248320/K2048. These scalar sections start
+//! every dot with terms 1,0,2..7, keep the object's main/tail operand orientation,
+//! and fold `(a0+a1)+(a3+a2)`. Other gfx1151/gfx1201 matrices use the paired
+//! recipe below. Nondefault singleton-route flags require separate admission
+//! and object parity; the emitter does not grant runtime qualification.
 //!
 //! Exactness: each output (matrix `i`, column `b`, row `r`) is bitwise the
 //! 1-row decode GEMV's (`gemv_mq4g256v2` = `gemv_mq4g256v2_multirow_r2`) for
@@ -72,9 +84,6 @@
 //! not order buffer against global loads on gfx11).
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 
-/// The wide R=16/32 twins linked into the same module.
-#[path = "mq4_rows_x4_wide.rs"]
-pub mod wide;
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, lit, op, s_add_i32, smem, sop, sr, SRD_WORD3};
 use crate::ledger::Counter;
@@ -88,6 +97,10 @@ type R = Result<(), String>;
 pub const KERNARG_BYTES: u32 = 96;
 /// Most activation rows (columns of `x`) one launch takes.
 pub const MAX_COLUMNS: u8 = 8;
+/// Physical activation-row tile; independent of the logical window width.
+pub const ROW_TILE: u8 = 8;
+/// Maximum logical row count of the rowtile entry (not the narrow entry).
+pub const MAX_ROWS: u8 = 64;
 /// Weight rows one wave owns.
 pub const ROWS_PER_WORKGROUP: u8 = 2;
 
@@ -160,6 +173,11 @@ const KB: u8 = 52;
 const MB: u8 = 53;
 const R0B: u8 = 54;
 const STMP: u8 = 55;
+// Only the rowtile entry reserves these otherwise-unused scalar slots.
+const ROW_BASE: u8 = 56;
+const TOTAL_ROWS: u8 = 57;
+const SCALAR_RECIPE: u8 = 58;
+const MAIN_GROUPS: u8 = 59;
 /// Column `c`'s `x` base pointer pair.
 const XCOL: u8 = 64;
 fn xbase(c: u8) -> u8 {
@@ -180,12 +198,19 @@ fn red_tmp(c: u8, row: u8) -> u8 {
     16 + 2 * c + row
 }
 
-const END: &str = ".Lmq4rx_end";
-fn lbl(nb: u8, name: &str) -> String {
-    format!(".Lmq4rx_b{nb}_{name}")
+fn end_label(rowtiles: bool) -> &'static str {
+    if rowtiles {
+        ".Lmq4rxt8_end"
+    } else {
+        ".Lmq4rx_end"
+    }
+}
+fn lbl(nb: u8, name: &str, rowtiles: bool) -> String {
+    let prefix = if rowtiles { ".Lmq4rxt8" } else { ".Lmq4rx" };
+    format!("{prefix}_b{nb}_{name}")
 }
 
-fn plan(arch: Arch) -> Result<RegPlan, String> {
+fn plan(arch: Arch, rowtiles: bool) -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(128, 80)?;
     let mut s_ranges: Vec<(&str, u8, u8)> = vec![
         ("kernarg", KARG, 2),
@@ -222,6 +247,15 @@ fn plan(arch: Arch) -> Result<RegPlan, String> {
     ];
     if !arch.gfx12() {
         s_ranges.push(("workgroup_id", WGIN, 1));
+        if rowtiles {
+            s_ranges.push(("workgroup_id_y", WGIN + 1, 1));
+        }
+    }
+    if rowtiles {
+        s_ranges.push(("activation_row_base", ROW_BASE, 1));
+        s_ranges.push(("total_rows", TOTAL_ROWS, 1));
+        s_ranges.push(("scalar_recipe", SCALAR_RECIPE, 1));
+        s_ranges.push(("main_groups", MAIN_GROUPS, 1));
     }
     for (name, base, len) in s_ranges {
         regs.add_range(name, Kind::S, base, len, Live::Whole)?;
@@ -272,7 +306,20 @@ fn s_sub_i32(arch: Arch) -> &'static str {
 }
 
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
-    spec.validate()?;
+    emit_inner(spec, false)
+}
+
+/// Emit the actual default singleton recipes over fixed-eight-row tiles.
+/// gfx1100 uses its scalar recipe; gfx1151 selects that recipe for the forced
+/// scalar LM shape. Other gfx1151/gfx1201 matrices use their paired recipe.
+pub fn emit_rowtiles(spec: Spec) -> Result<Emitted, String> {
+    emit_inner(spec, true)
+}
+
+fn emit_inner(spec: Spec, rowtiles: bool) -> Result<Emitted, String> {
+    if !(rowtiles && spec.arch == Arch::Gfx1100) {
+        spec.validate()?;
+    }
     let arch = spec.arch;
     let kernargs = KernargLayout::new(KERNARG_BYTES)
         .pointer_access("A0", 0, Access::ReadOnly)
@@ -289,48 +336,66 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         .hidden("M2", 80, 4, "by_value")
         .hidden("M3", 84, 4, "by_value")
         .hidden("K", 88, 4, "by_value")
-        .hidden("B", 92, 4, "by_value");
+        .hidden(if rowtiles { "R" } else { "B" }, 92, 4, "by_value");
     let kspec = KernelSpec {
         kernel_id: "mq4_rows_x4".into(),
-        variant: "exact_columns_r2_b8_x4".into(),
+        variant: if rowtiles {
+            "exact_default_rowtiles_t8_x4"
+        } else {
+            "exact_columns_r2_b8_x4"
+        }
+        .into(),
         arch,
-        symbol: spec.symbol(),
+        symbol: if rowtiles {
+            format!("gemv_mq4g256v2_rows_x4_t8_pm_{}", arch.name())
+        } else {
+            spec.symbol()
+        },
         kernargs,
         user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: false,
+        system_sgpr_workgroup_id_y: rowtiles,
         workgroup_size: 32,
         group_segment_fixed_size: 0,
         wave32: true,
         cu_mode: false,
     };
-    let mut b = Builder::new(kspec, plan(arch)?);
+    let mut b = Builder::new(kspec, plan(arch, rowtiles)?);
     b.enable_delay_alu();
-    prologue(&mut b)?;
-    for nb in 1..=MAX_COLUMNS {
-        section(&mut b, nb)?;
+    prologue(&mut b, rowtiles)?;
+    if arch != Arch::Gfx1100 {
+        for nb in 1..=MAX_COLUMNS {
+            section(&mut b, nb, false)?;
+        }
     }
-    b.label(END)?;
+    if rowtiles && !arch.gfx12() {
+        for nb in 1..=MAX_COLUMNS {
+            section(&mut b, nb, true)?;
+        }
+    }
+    b.label(end_label(rowtiles))?;
     branch(&mut b, "s_endpgm")?;
     b.finish()
 }
 
-/// The module `mq4_rows_x4_pm_<arch>`: the narrow entry, then the wide
-/// twins `wide::Spec { cap: 16 | 32 }` (`mq4_rows_x4_wide.rs`).
+/// The production module: the unchanged narrow entry, then the rowtile entry.
+/// gfx1100 has no legacy narrow entry, so its image contains only the rowtile.
 pub fn emit_module(
     arch: Arch,
 ) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let mut emitted = vec![emit(Spec { arch })?];
-    for cap in wide::CAPS {
-        emitted.push(wide::emit(wide::Spec { arch, cap })?);
-    }
+    let emitted = if arch == Arch::Gfx1100 {
+        vec![emit_rowtiles(Spec { arch })?]
+    } else {
+        vec![emit(Spec { arch })?, emit_rowtiles(Spec { arch })?]
+    };
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
     Ok((emitted, text, proof))
 }
 
 /// Kernarg loads, matrix routing, the selected matrix's resource and row
 /// pair, the per-column `x` bases, and the runtime dispatch on `B`.
-fn prologue(b: &mut Builder) -> R {
+fn prologue(b: &mut Builder, rowtiles: bool) -> R {
     let a = b.spec.arch;
+    let end = end_label(rowtiles);
     smem(b, PA, 8, KARG, 0)?;
     smem(b, PXY, 8, KARG, 32)?;
     smem(b, Y3M, 4, KARG, 64)?;
@@ -339,6 +404,9 @@ fn prologue(b: &mut Builder) -> R {
         sop(b, format!("s_mov_b32 s{SW}, ttmp9"), &[SW], &[])?;
     } else {
         sop(b, format!("s_mov_b32 s{SW}, s{WGIN}"), &[SW], &[WGIN])?;
+    }
+    if rowtiles {
+        rowtile_domain(b)?;
     }
     // Cumulative pair counts: Pi = ceil(Mi / 2).
     sop(
@@ -359,7 +427,7 @@ fn prologue(b: &mut Builder) -> R {
         )?;
     }
     sop(b, format!("s_cmp_ge_u32 s{SW}, s{CP3}"), &[], &[SW, CP3])?;
-    branch(b, &format!("s_cbranch_scc1 {END}"))?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
     // First matrix i with w < P0+..+Pi: matrix 2 or 3, then 1, then 0.
     let pair = |n: u8| sr(n, 2);
     sop(b, format!("s_cmp_lt_u32 s{SW}, s{CP2}"), &[], &[SW, CP2])?;
@@ -539,6 +607,55 @@ fn prologue(b: &mut Builder) -> R {
     sop(b, format!("s_lshl_b32 s{KB}, s{SK}, 2"), &[KB], &[SK])?;
     sop(b, format!("s_lshl_b32 s{MB}, s{SM}, 2"), &[MB], &[SM])?;
     sop(b, format!("s_lshl_b32 s{R0B}, s{ROW0}, 2"), &[R0B], &[ROW0])?;
+    if rowtiles {
+        // Scalar singleton: all outputs use the odd-start dot, a reversed
+        // second fold pair, and the object's distinct tail operand order.
+        sop(
+            b,
+            format!("s_and_b32 s{MAIN_GROUPS}, s{GROUPS}, -4"),
+            &[MAIN_GROUPS],
+            &[GROUPS],
+        )?;
+        if a == Arch::Gfx1100 {
+            sop(
+                b,
+                format!("s_mov_b32 s{SCALAR_RECIPE}, 1"),
+                &[SCALAR_RECIPE],
+                &[],
+            )?;
+        } else if a == Arch::Gfx1151 {
+            sop(b, format!("s_cmp_eq_u32 s{SM}, 0x3ca00"), &[], &[SM])?;
+            sop(
+                b,
+                format!("s_cselect_b32 s{SCALAR_RECIPE}, 1, 0"),
+                &[SCALAR_RECIPE],
+                &[],
+            )?;
+            sop(b, format!("s_cmp_eq_u32 s{SK}, 0x800"), &[], &[SK])?;
+            sop(
+                b,
+                format!("s_cselect_b32 s{SCALAR_RECIPE}, s{SCALAR_RECIPE}, 0"),
+                &[SCALAR_RECIPE],
+                &[SCALAR_RECIPE],
+            )?;
+        }
+        // Rebase once by the absolute token row, not by the local tail count.
+        // The narrow body's c*K and c*M offsets remain unchanged.
+        sop(
+            b,
+            format!("s_mul_i32 s{STMP}, s{ROW_BASE}, s{KB}"),
+            &[STMP],
+            &[ROW_BASE, KB],
+        )?;
+        add64(b, XP, XP, STMP)?;
+        sop(
+            b,
+            format!("s_mul_i32 s{STMP}, s{ROW_BASE}, s{MB}"),
+            &[STMP],
+            &[ROW_BASE, MB],
+        )?;
+        add64(b, SY, SY, STMP)?;
+    }
     for c in 0..MAX_COLUMNS {
         let p = xbase(c);
         sop(b, format!("s_mul_i32 s{p}, s{KB}, {c}"), &[p], &[KB])?;
@@ -560,16 +677,126 @@ fn prologue(b: &mut Builder) -> R {
         }
     }
     b.wait_all()?;
-    for nb in 1..=MAX_COLUMNS {
-        sop(b, format!("s_cmp_eq_u32 s{SB}, {nb}"), &[], &[SB])?;
-        branch(b, &format!("s_cbranch_scc1 {}", lbl(nb, "start")))?;
+    if rowtiles && !a.gfx12() {
+        sop(
+            b,
+            format!("s_cmp_lg_u32 s{SCALAR_RECIPE}, 0"),
+            &[],
+            &[SCALAR_RECIPE],
+        )?;
+        branch(b, "s_cbranch_scc1 .Lmq4rxt8_scalar_dispatch")?;
     }
-    branch(b, &format!("s_branch {END}"))
+    if a != Arch::Gfx1100 {
+        for nb in 1..=MAX_COLUMNS {
+            sop(b, format!("s_cmp_eq_u32 s{SB}, {nb}"), &[], &[SB])?;
+            branch(b, &format!("s_cbranch_scc1 {}", lbl(nb, "start", rowtiles)))?;
+        }
+        branch(b, &format!("s_branch {end}"))?;
+    }
+    if rowtiles && !a.gfx12() {
+        b.label(".Lmq4rxt8_scalar_dispatch")?;
+        for nb in 1..=MAX_COLUMNS {
+            sop(b, format!("s_cmp_eq_u32 s{SB}, {nb}"), &[], &[SB])?;
+            branch(
+                b,
+                &format!("s_cbranch_scc1 {}", lbl(nb + MAX_COLUMNS, "start", true)),
+            )?;
+        }
+        branch(b, &format!("s_branch {end}"))?;
+    }
+    Ok(())
 }
 
-fn section(b: &mut Builder, nb: u8) -> R {
+/// Uniform validation and local row count, before any data-memory access.
+/// Grid-y is read with the architecture's actual system-register convention.
+fn rowtile_domain(b: &mut Builder) -> R {
     let a = b.spec.arch;
-    b.label(&lbl(nb, "start"))?;
+    let end = end_label(true);
+    sop(
+        b,
+        format!("s_mov_b32 s{TOTAL_ROWS}, s{SB}"),
+        &[TOTAL_ROWS],
+        &[SB],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_eq_u32 s{TOTAL_ROWS}, 0"),
+        &[],
+        &[TOTAL_ROWS],
+    )?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    sop(
+        b,
+        format!("s_cmp_gt_u32 s{TOTAL_ROWS}, {MAX_ROWS}"),
+        &[],
+        &[TOTAL_ROWS],
+    )?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    sop(b, format!("s_cmp_le_i32 s{SK}, 0"), &[], &[SK])?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    sop(
+        b,
+        format!("s_and_b32 s{TMP}, s{SK}, {}", lit(255)),
+        &[TMP],
+        &[SK],
+    )?;
+    sop(b, format!("s_cmp_lg_u32 s{TMP}, 0"), &[], &[TMP])?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    for m in [M0, M1, M2, M3] {
+        sop(b, format!("s_cmp_lt_i32 s{m}, 0"), &[], &[m])?;
+        branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    }
+    if a.gfx12() {
+        sop(
+            b,
+            format!("s_and_b32 s{ROW_BASE}, ttmp7, 0xffff"),
+            &[ROW_BASE],
+            &[],
+        )?;
+    } else {
+        sop(
+            b,
+            format!("s_mov_b32 s{ROW_BASE}, s{}", WGIN + 1),
+            &[ROW_BASE],
+            &[WGIN + 1],
+        )?;
+    }
+    // Reject before shifting, so an excess grid cannot wrap onto a live tile.
+    sop(b, format!("s_cmp_ge_u32 s{ROW_BASE}, 8"), &[], &[ROW_BASE])?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{ROW_BASE}, s{ROW_BASE}, 3"),
+        &[ROW_BASE],
+        &[ROW_BASE],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_u32 s{ROW_BASE}, s{TOTAL_ROWS}"),
+        &[],
+        &[ROW_BASE, TOTAL_ROWS],
+    )?;
+    branch(b, &format!("s_cbranch_scc1 {end}"))?;
+    sop(
+        b,
+        format!("{} s{SB}, s{TOTAL_ROWS}, s{ROW_BASE}", s_sub_i32(a)),
+        &[SB],
+        &[TOTAL_ROWS, ROW_BASE],
+    )?;
+    sop(b, format!("s_cmp_gt_u32 s{SB}, {ROW_TILE}"), &[], &[SB])?;
+    sop(
+        b,
+        format!("s_cselect_b32 s{SB}, {ROW_TILE}, s{SB}"),
+        &[SB],
+        &[SB],
+    )
+}
+
+fn section(b: &mut Builder, nb: u8, scalar: bool) -> R {
+    let a = b.spec.arch;
+    let rowtiles = b.spec.system_sgpr_workgroup_id_y;
+    let label_nb = if scalar { nb + MAX_COLUMNS } else { nb };
+    b.label(&lbl(label_nb, "start", rowtiles))?;
     for c in 0..nb {
         for s in 0..4 {
             for r in 0..2 {
@@ -580,8 +807,11 @@ fn section(b: &mut Builder, nb: u8) -> R {
     }
     sop(b, format!("s_mov_b32 s{GI}, 0"), &[GI], &[])?;
     sop(b, format!("s_cmp_eq_u32 s{GROUPS}, 0"), &[], &[GROUPS])?;
-    branch(b, &format!("s_cbranch_scc1 {}", lbl(nb, "fold")))?;
-    b.loop_(&lbl(nb, "group"), |b| {
+    branch(
+        b,
+        &format!("s_cbranch_scc1 {}", lbl(label_nb, "fold", rowtiles)),
+    )?;
+    b.loop_(&lbl(label_nb, "group", rowtiles), |b| {
         sop(
             b,
             format!("s_mul_i32 s{GOFF}, s{GI}, {}", lit(0x88)),
@@ -617,18 +847,45 @@ fn section(b: &mut Builder, nb: u8) -> R {
         )?;
         for s in 0..3 {
             sop(b, format!("s_cmp_eq_u32 s{STREAM}, {s}"), &[], &[STREAM])?;
-            branch(b, &format!("s_cbranch_scc1 {}", lbl(nb, &format!("s{s}"))))?;
+            branch(
+                b,
+                &format!(
+                    "s_cbranch_scc1 {}",
+                    lbl(label_nb, &format!("s{s}"), rowtiles)
+                ),
+            )?;
         }
-        branch(b, &format!("s_branch {}", lbl(nb, "s3")))?;
+        branch(b, &format!("s_branch {}", lbl(label_nb, "s3", rowtiles)))?;
         for s in 0..4 {
-            b.label(&lbl(nb, &format!("s{s}")))?;
-            columns(b, nb, s)?;
+            b.label(&lbl(label_nb, &format!("s{s}"), rowtiles))?;
+            if scalar {
+                let tail = lbl(label_nb, &format!("s{s}_tail"), rowtiles);
+                let done = lbl(label_nb, &format!("s{s}_dot_done"), rowtiles);
+                sop(
+                    b,
+                    format!("s_cmp_ge_u32 s{GI}, s{MAIN_GROUPS}"),
+                    &[],
+                    &[GI, MAIN_GROUPS],
+                )?;
+                branch(b, &format!("s_cbranch_scc1 {tail}"))?;
+                columns(b, nb, s, Some(false))?;
+                b.wait_all()?;
+                branch(b, &format!("s_branch {done}"))?;
+                b.label(&tail)?;
+                columns(b, nb, s, Some(true))?;
+                b.label(&done)?;
+            } else {
+                columns(b, nb, s, None)?;
+            }
             b.wait_all()?;
             if s < 3 {
-                branch(b, &format!("s_branch {}", lbl(nb, "group_done")))?;
+                branch(
+                    b,
+                    &format!("s_branch {}", lbl(label_nb, "group_done", rowtiles)),
+                )?;
             }
         }
-        b.label(&lbl(nb, "group_done"))?;
+        b.label(&lbl(label_nb, "group_done", rowtiles))?;
         sop(b, format!("{} s{GI}, s{GI}, 1", s_add_i32(a)), &[GI], &[GI])?;
         sop(
             b,
@@ -636,11 +893,19 @@ fn section(b: &mut Builder, nb: u8) -> R {
             &[],
             &[GI, GROUPS],
         )?;
-        branch(b, &format!("s_cbranch_scc1 {}", lbl(nb, "group")))
+        branch(
+            b,
+            &format!("s_cbranch_scc1 {}", lbl(label_nb, "group", rowtiles)),
+        )
     })?;
-    b.label(&lbl(nb, "fold"))?;
+    b.label(&lbl(label_nb, "fold", rowtiles))?;
     for c in 0..nb {
-        for (lhs, rhs) in [(0, 1), (2, 3), (0, 2)] {
+        let fold = if scalar {
+            [(0, 1), (3, 2), (0, 3)]
+        } else {
+            [(0, 1), (2, 3), (0, 2)]
+        };
+        for (lhs, rhs) in fold {
             b.vopd(
                 VopdOp {
                     op: VopdF32::Add,
@@ -658,7 +923,7 @@ fn section(b: &mut Builder, nb: u8) -> R {
         }
     }
     reduce(b, nb)?;
-    store(b, nb)
+    store(b, nb, label_nb)
 }
 
 fn weight_loads(b: &mut Builder) -> R {
@@ -817,7 +1082,34 @@ fn fmac(b: &mut Builder, dst: u8, w: u8, x: u8) -> R {
     )
 }
 
-fn columns(b: &mut Builder, nb: u8, s: u8) -> R {
+/// Source-matched HIP scalar objects on gfx1151/gfx1100 start every output
+/// with term 1, then term 0. Full quads multiply (weight, X); residual groups
+/// multiply (X, weight). Keep both operand orders, even for commutative inputs.
+/// Pinned source-matched objects are recorded in PLAN's singleton-reference
+/// packet: Halo cache `gemv_mq4g256v2_mq4v2.92ecf66b777f981f` and XTX cache
+/// `gemv_mq4g256v2_rdna3_mq4v2.37cf66a5274c0003`. Their scalar fold is 01+32.
+fn scalar_dots(b: &mut Builder, x: u8, tail: bool) -> R {
+    for (r, &w) in W.iter().enumerate() {
+        let dst = DOT[r];
+        for (term, n) in [1, 0, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
+            let (lhs, rhs) = if tail { (x + n, w + n) } else { (w + n, x + n) };
+            if term == 0 {
+                valu(
+                    b,
+                    &format!("v_mul_f32_e32 v{dst}, v{lhs}, v{rhs}"),
+                    &[dst],
+                    &[lhs, rhs],
+                    &[],
+                )?;
+            } else {
+                fmac(b, dst, lhs, rhs)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn columns(b: &mut Builder, nb: u8, s: u8, scalar_tail: Option<bool>) -> R {
     let a = b.spec.arch;
     for c in 0..nb {
         let x = ring(c);
@@ -826,13 +1118,25 @@ fn columns(b: &mut Builder, nb: u8, s: u8) -> R {
         // textual predecessor is a different forward-dispatch arm. Retire
         // current while leaving next in flight; the last column drains.
         b.wait(load_counter(a), if c + 1 < nb { 2 } else { 0 })?;
-        dots(b, x)?;
+        if let Some(tail) = scalar_tail {
+            scalar_dots(b, x, tail)?;
+        } else {
+            dots(b, x)?;
+        }
         b.vopd(
             VopdOp {
                 op: VopdF32::Add,
                 dst: acc(c, s, 0),
-                src0: Operand::V(DOT[0]),
-                src1: acc(c, s, 0),
+                src0: Operand::V(if scalar_tail.is_some() {
+                    acc(c, s, 0)
+                } else {
+                    DOT[0]
+                }),
+                src1: if scalar_tail.is_some() {
+                    DOT[0]
+                } else {
+                    acc(c, s, 0)
+                },
             },
             VopdOp {
                 op: VopdF32::Add,
@@ -928,8 +1232,10 @@ fn reduce(b: &mut Builder, nb: u8) -> R {
 }
 
 /// Lane 0 stores `y[c*M + row0]` (and `+4` for the odd row when it exists).
-fn store(b: &mut Builder, nb: u8) -> R {
+fn store(b: &mut Builder, nb: u8, label_nb: u8) -> R {
     let a = b.spec.arch;
+    let rowtiles = b.spec.system_sgpr_workgroup_id_y;
+    let end = end_label(rowtiles);
     valu(b, "v_cmpx_eq_u32_e32 0, v0", &[], &[0], &[])?;
     for c in 0..nb {
         sop(b, format!("s_mul_i32 s{STMP}, s{MB}, {c}"), &[STMP], &[MB])?;
@@ -969,7 +1275,10 @@ fn store(b: &mut Builder, nb: u8) -> R {
         &[],
         &[ROW1, ROW0],
     )?;
-    branch(b, &format!("s_cbranch_scc1 {}", lbl(nb, "stored")))?;
+    branch(
+        b,
+        &format!("s_cbranch_scc1 {}", lbl(label_nb, "stored", rowtiles)),
+    )?;
     for c in 0..nb {
         vmem(
             b,
@@ -985,9 +1294,9 @@ fn store(b: &mut Builder, nb: u8) -> R {
             true,
         )?;
     }
-    b.label(&lbl(nb, "stored"))?;
+    b.label(&lbl(label_nb, "stored", rowtiles))?;
     b.wait_all()?;
-    branch(b, &format!("s_branch {END}"))
+    branch(b, &format!("s_branch {end}"))
 }
 
 fn refs(kind: Kind, indices: &[u8]) -> Vec<RegRef> {
@@ -1014,4 +1323,24 @@ fn vmem(b: &mut Builder, text: &str, defs: &[u8], uses: &[u8], scalar: &[u8], st
 }
 fn branch(b: &mut Builder, text: &str) -> R {
     b.control(Instruction::new(text, vec![], vec![]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rowtile_k_mask_uses_canonical_hex_literal() {
+        for arch in [Arch::Gfx1151, Arch::Gfx1201, Arch::Gfx1100] {
+            let e = emit_rowtiles(Spec { arch }).expect("rowtile emission");
+            assert!(
+                e.s_text.contains(&format!("s_and_b32 s{TMP}, s{SK}, 0xff")),
+                "{arch:?}: missing canonical K mask"
+            );
+            assert!(
+                !e.s_text.contains(&format!("s_and_b32 s{TMP}, s{SK}, 255")),
+                "{arch:?}: raw decimal K mask"
+            );
+        }
+    }
 }

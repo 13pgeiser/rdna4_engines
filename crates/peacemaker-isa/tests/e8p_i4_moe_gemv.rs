@@ -397,7 +397,24 @@ fn committed_images_and_byproducts_are_byte_identical_to_the_emission() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels");
     for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
         let module = Spec::module(arch);
-        let (emitted, text, proof) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
+        // The committed module is the CLI row image: the two narrow entries
+        // followed by their two fixed-row-tile `_t8` twins (never the narrow
+        // subset `emit_module` alone returns).
+        let (emitted, text, proof) = {
+            let mut entries = Vec::new();
+            for tiled in [false, true] {
+                for spec in e8p_i4_moe_gemv::module_specs(arch) {
+                    entries.push(if tiled {
+                        e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap()
+                    } else {
+                        e8p_i4_moe_gemv::emit(spec).unwrap()
+                    });
+                }
+            }
+            let (text, proof) =
+                peacemaker_isa::kernels::iu4_gemm::module(&entries, &module).unwrap();
+            (entries, text, proof)
+        };
         let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
         let bundle =
             peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
@@ -2147,6 +2164,730 @@ mod toolchain {
                 .unwrap_or_else(|err| panic!("{symbol}: {err}"));
             }
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// CPU-only rowtile contract tests. These execute emitted/lifted ISA, not a coordinate-only
+/// simulation; agreement with the incumbent and the independent F4 transcription is not
+/// hardware qualification. Keep the narrow tests above as a separate, unchanged oracle.
+mod rowtiles {
+    use super::*;
+    use peacemaker_ir::emu::{Emulator, Launch, Memory, Region};
+    use peacemaker_ir::inst::Frontend;
+
+    const ARCHES: [Arch; 3] = [Arch::Gfx1201, Arch::Gfx1151, Arch::Gfx1100];
+    /// Arches whose transcendental (`v_rcp_iflag_f32`, ...) numerics the interpreter models. gfx1100 is
+    /// refused by `peacemaker-ir` (`emu/alu.rs`: "unqualified numerical architecture"), so numerical
+    /// oracles cannot execute its kernels; its guard and structural coverage stays on `ARCHES`.
+    const NUMERIC_ARCHES: [Arch; 2] = [Arch::Gfx1201, Arch::Gfx1151];
+    const KA: u64 = 0x1_0000;
+    const TABLE: u64 = 0x10_0000;
+    // z=1 crosses the low-dword boundary: descriptor additions must carry.
+    const DESC: u64 = 0x2_ffff_ff00;
+    const X: u64 = 0x8000_0000;
+    const Y: [u64; 2] = [0x9000_0000, 0xa000_0000];
+    const EXPERT: u64 = 0x1000_0000;
+    const EXPERT_STRIDE: u64 = 0x10_0000;
+    const NEXP: usize = 640;
+    const WORDS: usize = 482;
+    const GUARD: usize = 64;
+    const POISON: u8 = 0xa5;
+
+    fn lift(bytes: &[u8]) -> peacemaker_ir::Program {
+        peacemaker_lift::lift_object(
+            bytes,
+            peacemaker_lift::Options {
+                frontend: Frontend::Builder,
+            },
+        )
+        .unwrap()
+        .program
+    }
+
+    fn region<'a>(mem: &'a Memory, name: &str) -> &'a Region {
+        mem.regions.iter().find(|r| r.name == name).unwrap()
+    }
+
+    fn put(mem: &mut Memory, name: &str, base: u64, bytes: Vec<u8>) {
+        if let Some(r) = mem.regions.iter_mut().find(|r| r.name == name) {
+            r.bytes = bytes;
+        } else {
+            mem.map(name.into(), base, bytes).unwrap();
+        }
+    }
+
+    fn u32s(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    fn launch(emu: &Emulator<'_>, mem: &mut Memory, wg: [u32; 3], block: u32) {
+        emu.run_workgroup(
+            &Launch {
+                kernarg_ptr: KA,
+                workgroup: wg,
+                block: [block, 1, 1],
+                dynamic_lds: 0,
+            },
+            mem,
+        )
+        .unwrap_or_else(|e| panic!("workgroup {wg:?}, block {block}: {e}"));
+    }
+
+    struct Fixture {
+        spec: Spec,
+        c: usize,
+        m: usize,
+        k: usize,
+        bucket: usize,
+        ys: usize,
+        xrs: usize,
+        xsrc: usize,
+        route: Vec<u32>,
+        xs: Vec<f32>,
+        weights: Vec<(Vec<u8>, Vec<u16>)>,
+        mem: Memory,
+    }
+
+    impl Fixture {
+        fn new(spec: Spec, c: usize, m: usize, k: usize, mode: usize) -> Self {
+            let mut rng = Rng((0x91e1_7283 ^ (c * 193 + m * 17 + k + mode) as u64) | 1);
+            let ys = if gate(spec) { m / 2 } else { m } + 3;
+            let xrs = k + 4;
+            let xsrc = if gate(spec) { c } else { 10 * c };
+            // Identical, disjoint, and partially shared routes; experts are unique within
+            // each token. Permute ids so first occurrence differs from sorted order.
+            let route: Vec<u32> = (0..10 * c)
+                .map(|s| {
+                    let token = s / 10;
+                    let rank = (s % 10 * 3 + 7) % 10;
+                    (match mode % 3 {
+                        0 => rank,
+                        1 => token * 10 + rank,
+                        _ => (token % 3) * 10 + rank,
+                    }) as u32
+                })
+                .collect();
+            let bucket = mode % 2;
+            let mut mem = Memory::default();
+            let mut table = vec![0u8; NEXP * 8];
+            let mut weights = vec![(Vec::new(), Vec::new()); NEXP];
+            for &id in &route {
+                if !weights[id as usize].0.is_empty() {
+                    continue;
+                }
+                let plane: Vec<u8> = (0..m * k / 8)
+                    .flat_map(|_| (rng.next() as u16).to_le_bytes())
+                    .collect();
+                let scales: Vec<u16> = (0..m * k / 128)
+                    .map(|i| match i % 7 {
+                        0 => 0x0400,
+                        1 => 0x7bff,
+                        _ => 0x0400 + rng.below(0x7bff - 0x0400 + 1) as u16,
+                    })
+                    .collect();
+                let mut tensor = plane.clone();
+                tensor.extend(scales.iter().flat_map(|s| s.to_le_bytes()));
+                let addr = EXPERT + u64::from(id) * EXPERT_STRIDE;
+                table[id as usize * 8..id as usize * 8 + 8].copy_from_slice(&addr.to_le_bytes());
+                mem.map(format!("expert{id}"), addr, tensor).unwrap();
+                weights[id as usize] = (plane, scales);
+            }
+            mem.map("table".into(), TABLE, table).unwrap();
+            let xs: Vec<f32> = (0..xsrc * xrs)
+                .map(|i| if i % xrs >= k { f32::NAN } else { rng.f32() })
+                .collect();
+            mem.map(
+                "x".into(),
+                X,
+                xs.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect(),
+            )
+            .unwrap();
+            // Reserve poison for all eight physical tiles, not merely the logical tail.
+            for (name, addr) in [("y0", Y[0]), ("y1", Y[1])] {
+                mem.map(name.into(), addr, vec![POISON; GUARD * 2 + 640 * ys * 4])
+                    .unwrap();
+            }
+            let mut f = Self {
+                spec,
+                c,
+                m,
+                k,
+                bucket,
+                ys,
+                xrs,
+                xsrc,
+                route,
+                xs,
+                weights,
+                mem,
+            };
+            let args = f.args(80, c, xsrc);
+            put(&mut f.mem, "kernarg", KA, args);
+            f
+        }
+
+        fn args(&self, u: usize, c: usize, xsrc: usize) -> Vec<u8> {
+            let b = self.bucket as u64;
+            let mut bytes = Vec::new();
+            for p in [
+                TABLE,
+                DESC + b * 320,
+                DESC + (160 + b * 81) * 4,
+                DESC + (322 + b * 80) * 4,
+                X,
+                Y[0] + GUARD as u64,
+                if gate(self.spec) {
+                    Y[1] + GUARD as u64
+                } else {
+                    0
+                },
+            ] {
+                bytes.extend(p.to_le_bytes());
+            }
+            for v in [
+                self.m,
+                self.k,
+                u,
+                c,
+                if gate(self.spec) { 10 } else { 1 },
+                xsrc,
+                self.xrs,
+                self.ys,
+                NEXP,
+                0,
+            ] {
+                bytes.extend((v as u32).to_le_bytes());
+            }
+            assert_eq!(bytes.len(), 96);
+            bytes
+        }
+
+        /// Current union law: first-occurrence experts, ascending absolute slots.
+        /// The other bucket stays poisoned to detect accidental bucket/base selection.
+        fn descriptors(&self, ranges: impl IntoIterator<Item = std::ops::Range<usize>>) -> Vec<u8> {
+            let mut words = Vec::new();
+            for range in ranges {
+                let mut d = vec![u32::MAX; WORDS];
+                let (ids, offs, slots) = (
+                    self.bucket * 80,
+                    160 + self.bucket * 81,
+                    322 + self.bucket * 80,
+                );
+                let mut order = Vec::new();
+                for s in range.clone() {
+                    let id = self.route[s];
+                    if !order.contains(&id) {
+                        order.push(id);
+                    }
+                }
+                let mut p = 0;
+                for (u, &id) in order.iter().enumerate() {
+                    d[ids + u] = id;
+                    d[offs + u] = p as u32;
+                    for s in range.clone().filter(|&s| self.route[s] == id) {
+                        d[slots + p] = s as u32;
+                        p += 1;
+                    }
+                }
+                d[offs + order.len()..offs + 81].fill(p as u32);
+                words.extend(d);
+            }
+            u32s(&words)
+        }
+
+        fn run(&self, emu: &Emulator<'_>, xsrc: usize) -> Memory {
+            let mut mem = self.mem.clone();
+            let descriptors = self.descriptors(
+                (0..self.c.div_ceil(8)).map(|t| 80 * t..(80 * t + 80).min(10 * self.c)),
+            );
+            put(&mut mem, "descriptor", DESC, descriptors);
+            put(&mut mem, "kernarg", KA, self.args(80, self.c, xsrc));
+            for z in 0..self.c.div_ceil(8) as u32 {
+                for y in 0..80 {
+                    for x in 0..self.m.div_ceil(8) as u32 {
+                        launch(emu, &mut mem, [x, y, z], 256);
+                    }
+                }
+            }
+            mem
+        }
+
+        fn singleton(&self, emu: &Emulator<'_>, xsrc: usize) -> Memory {
+            let mut mem = self.mem.clone();
+            for token in 0..self.c {
+                let desc = self.descriptors([10 * token..10 * token + 10]);
+                put(&mut mem, "descriptor", DESC, desc);
+                put(&mut mem, "kernarg", KA, self.args(10, self.c, xsrc));
+                for y in 0..10 {
+                    for x in 0..self.m as u32 {
+                        launch(emu, &mut mem, [x, y, 0], 32);
+                    }
+                }
+            }
+            mem
+        }
+
+        fn compare(&self, got: &Memory, singleton: &Memory, xsrc: usize) {
+            let out_rows = if gate(self.spec) { self.m / 2 } else { self.m };
+            for (part, name) in ["y0", "y1"].into_iter().enumerate() {
+                let (a, b) = (region(got, name), region(singleton, name));
+                assert_eq!(
+                    a.bytes, b.bytes,
+                    "{:?} C={} M={} K={} {name}",
+                    self.spec, self.c, self.m, self.k
+                );
+                for byte in 0..a.bytes.len() {
+                    let payload = byte >= GUARD && byte < GUARD + 10 * self.c * self.ys * 4;
+                    let j = byte.saturating_sub(GUARD) / 4;
+                    let live = payload && j % self.ys < out_rows && (part == 0 || gate(self.spec));
+                    assert_eq!(
+                        a.written.contains(byte),
+                        live,
+                        "{name} byte {byte}: tile ownership"
+                    );
+                    assert_eq!(
+                        b.written.contains(byte),
+                        live,
+                        "{name} byte {byte}: singleton ownership"
+                    );
+                    if !live {
+                        assert_eq!(a.bytes[byte], POISON, "{name} poison byte {byte}");
+                    }
+                }
+                if part == 1 && !gate(self.spec) {
+                    continue;
+                }
+                for slot in 0..10 * self.c {
+                    let xr = slot / if gate(self.spec) { 10 } else { 1 };
+                    let zero = vec![0.0; self.k];
+                    let x = if xr < xsrc {
+                        &self.xs[xr * self.xrs..xr * self.xrs + self.k]
+                    } else {
+                        &zero
+                    };
+                    let (plane, scales) = &self.weights[self.route[slot] as usize];
+                    for r in 0..out_rows {
+                        let row = part * out_rows + r;
+                        let want = twin_row(gate(self.spec), self.k / 128, x, |j| {
+                            let at = row * self.k / 4 + 2 * (j / 8);
+                            let word = u16::from_le_bytes([plane[at], plane[at + 1]]);
+                            let v = k_e1::decode8(
+                                word as u8,
+                                ((word >> 8) & 127) as u8,
+                                word >> 15 != 0,
+                            )[j % 8];
+                            (e8p_i4_moe_gemv::f16_bits_to_f32(
+                                scales[row * (self.k / 128) + j / 128],
+                            ) * 0.25)
+                                * f32::from(v)
+                        });
+                        let at = GUARD + (slot * self.ys + r) * 4;
+                        let actual = u32::from_le_bytes(a.bytes[at..at + 4].try_into().unwrap());
+                        assert_eq!(
+                            actual,
+                            want.to_bits(),
+                            "{:?} C={} slot={slot} row={row}: independent singleton DAG",
+                            self.spec,
+                            self.c
+                        );
+                    }
+                }
+            }
+            for mem in [got, singleton] {
+                for r in &mem.regions {
+                    if r.name != "y0" && r.name != "y1" {
+                        assert_eq!(r.written.count(), 0, "{} input modified", r.name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_logical_width_matches_committed_singleton_and_independent_dag() {
+        use sha2::{Digest, Sha256};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels");
+        for arch in NUMERIC_ARCHES {
+            let path = dir.join(format!("{}.hxaco", Spec::module(arch)));
+            let object = std::fs::read(&path).unwrap();
+            // Record the actual oracle object, never silently substitute another architecture.
+            eprintln!(
+                "E8P rowtiles singleton={} sha256={:x}",
+                path.display(),
+                Sha256::digest(&object)
+            );
+            let incumbent = lift(&object);
+            for spec in e8p_i4_moe_gemv::module_specs(arch) {
+                let e = e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+                let program = lift(&peacemaker_isa::native::assemble(&e.s_text, arch).unwrap());
+                let candidate = Emulator::new(&program, &format!("{}_t8", spec.symbol())).unwrap();
+                let singleton = Emulator::new(&incumbent, &spec.symbol()).unwrap();
+                for c in 1usize..=64 {
+                    let m = if gate(spec) {
+                        [2, 6, 14, 16, 18][c % 5]
+                    } else {
+                        [1, 3, 7, 8, 9][c % 5]
+                    };
+                    let groups = if gate(spec) {
+                        [2, 4, 6, 8, 10][c % 5]
+                    } else {
+                        [1, 2, 3, 4, 5, 7, 8, 9][c % 8]
+                    };
+                    let f = Fixture::new(spec, c, m, 128 * groups, c);
+                    let got = f.run(&candidate, f.xsrc);
+                    let want = f.singleton(&singleton, f.xsrc);
+                    f.compare(&got, &want, f.xsrc);
+                }
+                // Buffer-descriptor OOB rows must read zero, not poisoned stride padding.
+                let f = Fixture::new(spec, 9, if gate(spec) { 18 } else { 9 }, 256, 0);
+                let xsrc = if gate(spec) { 4 } else { 40 };
+                f.compare(
+                    &f.run(&candidate, xsrc),
+                    &f.singleton(&singleton, xsrc),
+                    xsrc,
+                );
+            }
+        }
+    }
+
+    fn untouched(mem: &Memory) {
+        for r in &mem.regions {
+            assert_eq!(r.written.count(), 0, "{} unexpectedly written", r.name);
+            if r.name == "y0" || r.name == "y1" {
+                assert!(r.bytes.iter().all(|&b| b == POISON), "{} poison", r.name);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_guards_exit_without_dereferencing_poisoned_inputs() {
+        for arch in ARCHES {
+            for spec in e8p_i4_moe_gemv::module_specs(arch) {
+                let e = e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+                let program = lift(&peacemaker_isa::native::assemble(&e.s_text, arch).unwrap());
+                let emu = Emulator::new(&program, &format!("{}_t8", spec.symbol())).unwrap();
+                let f = Fixture::new(spec, 9, if gate(spec) { 18 } else { 9 }, 256, 0);
+                // Domain/dead workgroup guards must not even touch descriptors.
+                // The weight table, X and all weights are deliberately unmapped.
+                for (c, u, wg) in [
+                    (0, 80, [0, 0, 0]),
+                    (65, 80, [0, 0, 0]),
+                    (9, 0, [0, 0, 0]),
+                    (9, 79, [0, 0, 0]),
+                    (9, 81, [0, 0, 0]),
+                    (9, 80, [0, 0, 2]),
+                    (9, 80, [f.m.div_ceil(8) as u32, 0, 1]),
+                    (9, 80, [0, 80, 1]),
+                ] {
+                    let mut mem = f.mem.clone();
+                    mem.regions
+                        .retain(|r| r.name == "kernarg" || r.name.starts_with('y'));
+                    put(&mut mem, "kernarg", KA, f.args(u, c, f.xsrc));
+                    launch(&emu, &mut mem, wg, 256);
+                    untouched(&mem);
+                }
+                // z=1 makes offset81 legal under the obsolete 10*C (=90) bound,
+                // but illegal under the fixed descriptor capacity80.
+                for (id, start, end, slot, bad_slot) in [
+                    (0, 0, 0, 80, false),   // empty capacity entry
+                    (0, 0, 9, 80, false),   // nine slots
+                    (0, 9, 1, 80, false),   // negative count underflows
+                    (0, 80, 81, 80, false), // local offsets past80
+                    (NEXP as u32, 0, 1, 80, false),
+                    (NEXP as u32 + 1, 0, 1, 80, false),
+                    (u32::MAX, 0, 1, 80, false),
+                    (i32::MIN as u32, 0, 1, 80, false),
+                    (0, 0, 1, 90, true), // first absolute tail slot
+                    (0, 0, 1, u32::MAX, true),
+                ] {
+                    let mut mem = f.mem.clone();
+                    mem.regions.retain(|r| {
+                        r.name == "kernarg"
+                            || r.name.starts_with('y')
+                            || (bad_slot && r.name == "table")
+                    });
+                    let mut desc = vec![u32::MAX; 2 * WORDS];
+                    let base = WORDS;
+                    desc[base] = id;
+                    desc[base + 160] = start;
+                    desc[base + 161] = end;
+                    desc[base + 322] = slot;
+                    put(&mut mem, "descriptor", DESC, u32s(&desc));
+                    launch(&emu, &mut mem, [0, 0, 1], 256);
+                    untouched(&mem);
+                }
+                // One bad slot among otherwise valid slots rejects uniformly, not
+                // merely the lane that happened to load it (all waves share a barrier).
+                for bad_lane in 0..8 {
+                    let mut mem = f.mem.clone();
+                    mem.regions
+                        .retain(|r| !r.name.starts_with("expert") && r.name != "x");
+                    let mut desc = vec![u32::MAX; 2 * WORDS];
+                    desc[WORDS] = 0;
+                    desc[WORDS + 160] = 0;
+                    desc[WORDS + 161] = 8;
+                    desc[WORDS + 322..WORDS + 330].fill(80);
+                    desc[WORDS + 322 + bad_lane] = 90;
+                    put(&mut mem, "descriptor", DESC, u32s(&desc));
+                    launch(&emu, &mut mem, [0, 0, 1], 256);
+                    untouched(&mem);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn perturbing_one_absolute_input_row_isolates_its_outputs_across_tiles() {
+        for arch in NUMERIC_ARCHES {
+            for spec in e8p_i4_moe_gemv::module_specs(arch) {
+                let e = e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+                let program = lift(&peacemaker_isa::native::assemble(&e.s_text, arch).unwrap());
+                let emu = Emulator::new(&program, &format!("{}_t8", spec.symbol())).unwrap();
+                let mut f = Fixture::new(spec, 17, if gate(spec) { 2 } else { 1 }, 256, 0);
+                let before = f.run(&emu, f.xsrc);
+                let victim = if gate(spec) { 8 } else { 80 };
+                f.xs[victim * f.xrs..victim * f.xrs + f.k].fill(0.0);
+                put(
+                    &mut f.mem,
+                    "x",
+                    X,
+                    f.xs.iter()
+                        .flat_map(|x| x.to_bits().to_le_bytes())
+                        .collect(),
+                );
+                let after = f.run(&emu, f.xsrc);
+                let out_rows = if gate(spec) { f.m / 2 } else { f.m };
+                for name in ["y0", "y1"]
+                    .into_iter()
+                    .take(if gate(spec) { 2 } else { 1 })
+                {
+                    let (a, b) = (region(&before, name), region(&after, name));
+                    let mut changed = 0;
+                    for slot in 0..10 * f.c {
+                        let victim_slot = slot / if gate(spec) { 10 } else { 1 } == victim;
+                        for row in 0..out_rows {
+                            let at = GUARD + (slot * f.ys + row) * 4;
+                            if victim_slot {
+                                let bits =
+                                    u32::from_le_bytes(b.bytes[at..at + 4].try_into().unwrap());
+                                assert_eq!(bits << 1, 0, "{name} victim slot {slot}: zero row");
+                                changed += usize::from(a.bytes[at..at + 4] != b.bytes[at..at + 4]);
+                            } else {
+                                assert_eq!(
+                                    a.bytes[at..at + 4],
+                                    b.bytes[at..at + 4],
+                                    "{name} unrelated absolute slot {slot}"
+                                );
+                            }
+                        }
+                    }
+                    assert!(
+                        changed > 0,
+                        "{name}: isolation fixture must change live outputs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emission_abi_resources_isa_and_barrier_order_are_arch_specific() {
+        for arch in ARCHES {
+            for spec in e8p_i4_moe_gemv::module_specs(arch) {
+                let e = e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+                let again = e8p_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+                let narrow = e8p_i4_moe_gemv::emit(spec).unwrap();
+                let t = &e.s_text;
+                assert_eq!(t, &again.s_text);
+                assert_eq!(e.proof.arch, arch);
+                assert!(t.contains(&format!(".amdhsa_kernel {}_t8\n", spec.symbol())));
+                assert_eq!(
+                    field(t, ".offset:"),
+                    ARGS.iter().map(|a| a.0).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    field(t, ".size:"),
+                    ARGS.iter().map(|a| a.1).collect::<Vec<_>>()
+                );
+                for needle in [
+                    ".kernarg_segment_size: 96\n",
+                    ".amdhsa_kernarg_size 96\n",
+                    ".amdhsa_wavefront_size32 1",
+                    ".amdhsa_system_sgpr_workgroup_id_z 1",
+                    ".private_segment_fixed_size: 0\n",
+                    ".sgpr_spill_count: 0\n",
+                    ".vgpr_spill_count: 0\n",
+                ] {
+                    assert!(t.contains(needle), "{spec:?}: {needle}");
+                }
+                assert_eq!(field(t, ".max_flat_workgroup_size:"), [256]);
+                assert_eq!(field(t, ".group_segment_fixed_size:"), [1536]);
+                assert_eq!(e.shape.next_free_vgpr, narrow.shape.next_free_vgpr);
+                assert_eq!(e.shape.next_free_sgpr, narrow.shape.next_free_sgpr);
+                let lines = insns(t);
+                let pos = |needle: &str| {
+                    lines
+                        .iter()
+                        .position(|l| *l == needle)
+                        .unwrap_or_else(|| panic!("{spec:?}: {needle}"))
+                };
+                assert!(t.contains("s_load_b32 s6, s[0:1], 0x58"));
+                assert!(t.contains("v_readfirstlane_b32 s5, v"));
+                let barrier = if arch.gfx12() {
+                    "s_barrier_wait 0xffff"
+                } else {
+                    "s_barrier"
+                };
+                let publish = pos(barrier);
+                let row_guard = pos("s_cmp_ge_u32 s30, s22");
+                assert!(
+                    publish < row_guard,
+                    "inactive output waves must publish tables"
+                );
+                for guard in [
+                    "s_cmp_eq_u32 s25, 0",
+                    "s_cmp_gt_u32 s25, 64",
+                    "s_cmp_eq_u32 s24, 0x50",
+                    "s_cmp_gt_u32 s35, 8",
+                    "s_mov_b32 s51, 0x50",
+                    "s_cmp_gt_u32 s33, s51",
+                    "s_cmp_ge_u32 s34, s6",
+                    "s_cmp_ge_u32 s51, s52",
+                ] {
+                    assert!(pos(guard) < publish, "{spec:?}: guard {guard} after stage");
+                }
+                assert!(t.contains("s_mul_i32 s51, s7, 0x788"));
+                for op in [
+                    "global_load_u16",
+                    "buffer_load_b128",
+                    "ds_load_b32",
+                    "v_bfe_i32",
+                    "v_add3_u32",
+                    "v_cvt_f32_i32_e32",
+                    "v_cvt_f32_f16_e64",
+                    "ds_bpermute_b32",
+                    "global_store_b32",
+                ] {
+                    assert_eq!(
+                        count(t, op),
+                        count(&narrow.s_text, op),
+                        "{spec:?}: singleton {op} census"
+                    );
+                }
+                assert_eq!(count(t, "global_store_b32"), 8);
+                assert_eq!(
+                    count(t, "global_load_u16"),
+                    2 * spec.group_instances() as usize
+                );
+                assert_eq!(e.shape.next_free_sgpr, 88);
+                assert_eq!(e.shape.next_free_vgpr, if gate(spec) { 112 } else { 88 });
+                assert!(lines[..publish]
+                    .iter()
+                    .all(|l| mnemonic(l) != "ds_load_b32"));
+                assert!(lines[publish + 1..]
+                    .iter()
+                    .all(|l| mnemonic(l) != "ds_store_b32"));
+                assert!(lines[..publish]
+                    .iter()
+                    .any(|l| mnemonic(l) == "ds_store_b32"));
+                if arch.gfx12() {
+                    assert!(t.contains("s_lshr_b32 s7, ttmp7, 16"));
+                    assert!(t.contains("s_lshl_b32 s30, ttmp9, 3"));
+                    assert_eq!(
+                        (count(t, "s_barrier_signal"), count(t, "s_barrier_wait")),
+                        (1, 1)
+                    );
+                    assert_eq!(count(t, "s_barrier"), 0);
+                } else {
+                    assert!(t.contains("s_mov_b32 s7, s4"));
+                    assert!(t.contains("s_lshl_b32 s30, s2, 3"));
+                    assert!(t.contains("s_mov_b32 s31, s3"));
+                    assert!(!t.contains("ttmp"));
+                    assert_eq!(count(t, "s_barrier"), 1);
+                    for banned in [
+                        "s_barrier_signal",
+                        "s_barrier_wait",
+                        "s_wait_loadcnt",
+                        "s_wait_dscnt",
+                        "s_wait_kmcnt",
+                        "s_wait_storecnt",
+                        "s_add_co_i32",
+                        "s_sub_co_i32",
+                    ] {
+                        assert_eq!(count(t, banned), 0, "{spec:?}: {banned}");
+                    }
+                }
+                // Compare the ordered arithmetic operands, not just an operation count.
+                // Stage scheduling/addressing may differ; each slot's FP DAG may not.
+                let fp = |text: &str| -> Vec<String> {
+                    insns(text)
+                        .into_iter()
+                        .filter(|l| {
+                            matches!(
+                                mnemonic(l),
+                                "v_mul_f32_e32"
+                                    | "v_fmac_f32_e32"
+                                    | "v_add_f32_e32"
+                                    | "v_cvt_f32_f16_e64"
+                                    | "v_cvt_f32_i32_e32"
+                                    | "ds_bpermute_b32"
+                            )
+                        })
+                        .map(str::to_owned)
+                        .collect()
+                };
+                assert_eq!(
+                    fp(t),
+                    fp(&narrow.s_text),
+                    "{spec:?}: singleton F4 operand DAG"
+                );
+                for prefix in [
+                    "scratch_",
+                    "flat_",
+                    "global_atomic",
+                    "buffer_atomic",
+                    "v_wmma",
+                    "v_mul_f16",
+                    "v_fma_mix",
+                ] {
+                    assert!(
+                        !lines.iter().any(|l| mnemonic(l).starts_with(prefix)),
+                        "{spec:?}: {prefix}"
+                    );
+                }
+                assert!(peacemaker_isa::native::assemble(t, arch)
+                    .unwrap()
+                    .starts_with(b"\x7fELF"));
+                #[cfg(feature = "toolchain")]
+                peacemaker_isa::ledger_replay::replay_waits(t, arch).unwrap();
+                assert_eq!(
+                    e8p_i4_moe_gemv::contract(spec, &e)["symbol"],
+                    format!("{}_t8", spec.symbol())
+                );
+                let (combined, _) = peacemaker_isa::kernels::iu4_gemm::module(
+                    &[narrow, e],
+                    &format!("e8p_rowtiles_test_{}_{}", arch.name(), spec.tag()),
+                )
+                .unwrap();
+                let labels: Vec<&str> = combined
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with(".L") && l.ends_with(':'))
+                    .collect();
+                let unique: std::collections::HashSet<_> = labels.iter().copied().collect();
+                assert_eq!(
+                    labels.len(),
+                    unique.len(),
+                    "{spec:?}: narrow/t8 label collision"
+                );
+                assert!(peacemaker_isa::native::assemble(&combined, arch)
+                    .unwrap()
+                    .starts_with(b"\x7fELF"));
+            }
+        }
+        for spec in e8p_i4_moe_gemv::module_specs(Arch::Gfx942) {
+            assert!(e8p_i4_moe_gemv::emit_rowtiles(spec).is_err());
         }
     }
 }

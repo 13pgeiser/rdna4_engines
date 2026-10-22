@@ -867,6 +867,11 @@ fn vector(
         // this repo's decode (`isa/gfx12.tbl`, `v_bfi_b32 v5, v3, 0, 32`) matches
         // with S0=v3, S1=0, S2=32, giving D = ~v3 & 32.
         "v_bfi_b32" => (Class::Int, (raw(0)? & raw(1)?) | (!raw(0)? & raw(2)?)),
+        // D = ({S0, S1} >> S2[4:0])[31:0]: S0 is the high dword of the 64-bit funnel input.
+        "v_alignbit_b32" => (
+            Class::Int,
+            (((u64::from(raw(0)?) << 32) | u64::from(raw(1)?)) >> (raw(2)? & 31)) as u32,
+        ),
         "v_bfe_u32" => {
             let width = raw(2)? & 31;
             (
@@ -875,6 +880,20 @@ fn vector(
                     0
                 } else {
                     (raw(0)? >> (raw(1)? & 31)) & ((1u32 << width) - 1)
+                },
+            )
+        }
+        // D = signext(((S0.i32 >> S1[4:0]) & ((1 << S2[4:0]) - 1)), S2[4:0]); width 0 gives 0. The shift is arithmetic
+        // (ISA `S0.i32 >> S1[4:0]`); the width is at most 31, so the field never needs the full dword.
+        "v_bfe_i32" => {
+            let width = raw(2)? & 31;
+            let field = (((raw(0)? as i32) >> (raw(1)? & 31)) as u32) & ((1u32 << width) - 1);
+            (
+                Class::Int,
+                if width == 0 {
+                    0
+                } else {
+                    (((field << (32 - width)) as i32) >> (32 - width)) as u32
                 },
             )
         }
@@ -1982,6 +2001,13 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             } else {
                 (((field << (32 - width)) as i32) >> (32 - width)) as u32
             })
+        }
+        // tmp = (S0.u32 >> S1[4:0]) & ((1U << S1[22:16]) - 1U); D = tmp; SCC = D != 0. With a width of 32..=127 the shifted-out
+        // `1U << width` is 0, so the mask is all ones (-1U) and the field is the whole shifted source.
+        "s_bfe_u32" => {
+            let width = (b >> 16) & 0x7f;
+            let mask = 1u32.checked_shl(width).unwrap_or(0).wrapping_sub(1);
+            nonzero((a >> (b & 31)) & mask)
         }
         // gfx1151 scalar float: D = f16_to_f32(S0.f16) of the low/high half. NaN payload handling is not measured.
         "s_cvt_f32_f16" | "s_cvt_hi_f32_f16" => (

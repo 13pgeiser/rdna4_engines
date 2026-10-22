@@ -793,7 +793,7 @@ fn run() -> Result<bool> {
     for &rows in &opts.rows {
         per_rows.push(json!({
             "rows": rows,
-            "wide_twin_cap": gpu.wide_twin_cap(WideTwinFamily::Mq6, rows),
+            "row_tile_twin_enabled": gpu.row_tile_twin_enabled(WideTwinFamily::Mq6, rows),
         }));
 
         // Reference: `rows` separate AR launches into their own allocation.

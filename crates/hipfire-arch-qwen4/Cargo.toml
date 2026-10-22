@@ -25,9 +25,14 @@ rayon.workspace = true
 railgun = { path = "../railgun", features = ["npu"] }
 
 [dev-dependencies]
+half.workspace = true
 memmap2.workspace = true
 saddle-quant = { path = "../saddle-quant" }
-half.workspace = true
+# `greedy_mtp_identity_hw` loads through the product loader (`load_qwen4_rank`) so the
+# split-base PLE sidecar, trunk overlay and expert hot set are the serve load's own.
+# hipfire-loader depends on this crate as a normal edge; dev-dep cycles are legal
+# (same pattern as hipfire-runtime's dev-dependency on hipfire-loader).
+hipfire-loader = { path = "../hipfire-loader" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["test-utils"] }
 
 [features]
@@ -35,8 +40,8 @@ hipfire-dispatch = { path = "../hipfire-dispatch", features = ["test-utils"] }
 qwen4-dev-profiles = []
 reference-parity = ["rdna-compute/lab", "hipfire-dispatch/test-utils"]
 # Tools-only S1 validation surface: the lab feature enables the S1
-# validation tools and gates (`slowlink_load`, injection, selftest facades).
 lab = ["hipfire-dispatch/test-utils"]
+kernel-timing = ["lab", "rdna-compute/kernel-timing"]
 [[example]]
 name = "qwen4_parity"
 required-features = ["reference-parity"]
@@ -56,6 +61,14 @@ required-features = ["reference-parity"]
 [[example]]
 name = "qwen4_wide_verify"
 required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_rowtile_capture"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_legacy_mq4_rowtile_oracle"
+required-features = ["lab", "reference-parity"]
 
 [[example]]
 name = "qwen4_kld"
@@ -107,6 +120,10 @@ required-features = ["lab"]
 # GDN in-projection group byte probe: grouped MQ6 x4 / MQ4 rows_x4 routes vs the singletons (GPU; optional real layer).
 [[example]]
 name = "qwen4_gdn_in_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_cost_prompts"
 required-features = ["lab"]
 
 [[test]]

@@ -187,12 +187,10 @@ pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item 
     )
 }
 
-/// Rows of the speculative logit and argmax buffers.  Only verify blocks
-/// return every row's argmax (native MTP verifies at most `K + 1 = 11`
-/// rows; block drafters on the shared `SpecTarget` contract get the rest);
-/// prompt advances and MTP prefill read their final row only.  A
-/// chunk-sized buffer cost `vocab * 4` bytes per chunk row.
-pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = 64;
+/// Physical rows of the speculative logit and argmax buffers. Native MTP
+/// reserves one row for its seed; prompt advances and MTP prefill read their
+/// final row only. Actual admission also requires allocated forward scratch.
+pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
 
 /// Rows a verify forward on this GPU runs row-exact (each row bitwise the
 /// sequential single-row decode): the per-arch value of
@@ -259,27 +257,25 @@ pub(crate) fn qwen4_ar_launch(
     Qwen4ArLaunch::Recorded
 }
 
-/// Verify rows a forward may run row-exact given the AR launch mode: rows
-/// above the historic `FEW_ROW_ROUTE_ROWS` (8) stay at it when the one-row AR
-/// decode is recorded/captured while its eager launch takes a different QSA
-/// attention arithmetic (`attention_eager_differs`: eager split-K versus the
-/// per-head kernel a recorded launch keeps). A wide verify is always eager, so
-/// widening there would compare eager split-K rows against recorded per-head
-/// AR rows. `attention_eager_differs` is evaluated only when it can matter.
-pub(crate) fn qwen4_wide_verify_rows_guard(
-    requested: usize,
-    ar: Qwen4ArLaunch,
-    attention_eager_differs: impl FnOnce() -> bool,
-) -> usize {
-    let historic = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
-    if requested > historic && ar == Qwen4ArLaunch::Recorded && attention_eager_differs() {
-        historic
-    } else {
-        requested
-    }
-}
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
+}
+
+/// Qualified numeric verify width: the Single Flash-Next scope keeps `rows`;
+/// every other scope clamps to the proven `FEW_ROW_ROUTE_ROWS` bound. The CPU
+/// window still narrows either case. Pure numeric cap only: the caller owns
+/// the eligibility predicate.
+fn qwen4_scoped_verify_rows(
+    rows: usize,
+    eligible_single_fn: bool,
+    cpu_window_rows: Option<usize>,
+) -> usize {
+    let qualified = if eligible_single_fn {
+        rows
+    } else {
+        rows.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
+    };
+    cpu_window_rows.map_or(qualified, |cpu_rows| qualified.min(cpu_rows))
 }
 
 /// Allocation plan of one [`Qwen4GpuForwardScratch`].
@@ -1118,9 +1114,9 @@ pub(crate) fn ple_desc<'a>(
 }
 
 /// `HIPFIRE_QWEN4_PLE_FUSE`: whether a `rows`-row forward stages the PLE rows
-/// straight as F16 for the BF16 key/value projections (the singleton chunk
-/// forward and the prefill wave decide it with this one expression; under the
-/// invariant prefill profile the F16 route applies at every row count).
+/// straight as F16 for BF16 key/value projections. Admitted wide exact verify
+/// keeps the singleton F32 input representation before staging, not merely
+/// at projection dispatch; ordinary/invariant prefill keeps its F16 route.
 pub(crate) fn qwen4_ple_rows_f16(
     gpu: &Gpu,
     bf16_state: bool,
@@ -1129,6 +1125,12 @@ pub(crate) fn qwen4_ple_rows_f16(
     ple: &Qwen4PleWeights<'_>,
     rows: usize,
 ) -> bool {
+    let route_rows = gpu.route_rows(rows);
+    if route_rows > rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS
+        && route_rows <= gpu.few_row_limit()
+    {
+        return false;
+    }
     bf16_state
         && gpu.flags.qwen4_ple_fuse_enabled()
         && hc_count <= 4
@@ -1699,13 +1701,35 @@ impl Qwen4MoeLayerRuntime {
     /// The weights binding for a call: this runtime when the D2 split may serve
     /// it (or none is attached), otherwise the executor-less view. `d2_phase`
     /// is false inside a prefill tile (see [`d2_executor_admitted`]).
+    /// `lab_armed` is the existing-oracle-override presence for this call
+    /// (env or runtime override on an exact oracle arch with an eager verify
+    /// scope): only presence with allocated executor capacity admits a
+    /// 5..64-row window — never the `few_row_limit` value as a capacity (that
+    /// is a GPU projection-route limit, not CPU storage). `verify_rows` is the
+    /// frozen row-exact width, an upper clamp only. Ordinary prefill and lane
+    /// callers pass `false` and keep the default-4 gate.
     pub(crate) fn routed_view(
         &self,
         d2_phase: bool,
         rows: usize,
         route_rows: usize,
+        lab_armed: bool,
+        verify_rows: usize,
     ) -> &dyn RoutedExpertWeights {
-        if d2_executor_admitted(self.cpu_split.is_some(), d2_phase, rows, route_rows) {
+        let capacity = self
+            .cpu_split
+            .as_ref()
+            .map(|executor| executor.capacity_rows())
+            .unwrap_or(0);
+        if d2_executor_admitted(
+            self.cpu_split.is_some(),
+            d2_phase,
+            rows,
+            route_rows,
+            lab_armed,
+            verify_rows,
+            capacity,
+        ) {
             return self;
         }
         // The view must outlive the sealed step list that borrows it, so it
@@ -1941,14 +1965,41 @@ pub(crate) fn ep_lane<'a>(
 }
 /// Whether a layer's D2 executor is bound for one MoE call: always when no
 /// executor is attached (nothing to withhold), otherwise only in a non-prefill
-/// phase (decode, verify; `d2_phase`) **and** for a window of at most the
-/// narrow cap whose real rows are the whole routing window
-/// ([`hipfire_dispatch::cpu_split::cpu_splice_window`]). A prompt of 1..=4
-/// rows inside a prefill tile, a 1..=4-row tail of a long prefill and every
-/// wider window take the GPU route.
-fn d2_executor_admitted(has_split: bool, d2_phase: bool, rows: usize, route_rows: usize) -> bool {
-    !has_split
-        || (d2_phase && hipfire_dispatch::cpu_split::cpu_splice_window(true, rows, route_rows))
+/// phase (decode, verify; `d2_phase`) **and** for a whole-routing-window call
+/// inside the qualified width: at most 4 rows on the default route, or a whole
+/// logical 1..64-row window inside an explicit lab-wide scope (existing oracle
+/// override present + eager verify) when the executor's allocated
+/// `capacity_rows` covers it. `lab_armed` is that presence signal — never the
+/// `few_row_limit` value (a GPU route limit, not CPU storage). A prompt of
+/// 1..=4 rows inside a prefill tile, a 1..=4-row tail of a long prefill and
+/// every unqualified wider window take the GPU route. No chunking: an admitted
+/// wide window runs one forward with full-window state/capture.
+fn d2_executor_admitted(
+    has_split: bool,
+    d2_phase: bool,
+    rows: usize,
+    route_rows: usize,
+    lab_armed: bool,
+    verify_rows: usize,
+    capacity_rows: usize,
+) -> bool {
+    if !has_split {
+        return true;
+    }
+    if !d2_phase {
+        return false;
+    }
+    let scope = hipfire_dispatch::families::moe::CpuWideVerifyScope::from_lab_presence(
+        lab_armed,
+        verify_rows,
+    );
+    hipfire_dispatch::families::moe::cpu_wide_window_qualified(
+        true,
+        rows,
+        route_rows,
+        scope,
+        capacity_rows,
+    )
 }
 
 /// Whether a load runs host arithmetic on **every** call: a D1 whole-layer
@@ -1964,15 +2015,30 @@ const fn host_arith_every_call(d1: bool, has_split: bool, split_explicit: bool) 
 
 /// Whether one call runs host arithmetic: `every_call` (a load
 /// [`host_arith_every_call`] holds for), or an armed D2 split (`has_split`) on
-/// a whole narrow non-prefill window ([`d2_executor_admitted`]).
+/// a whole qualified non-prefill window ([`d2_executor_admitted`]): at most 4
+/// rows by default, or a whole 1..64-row window inside an explicit lab-wide
+/// scope (override presence + eager verify) with allocated capacity.
 fn host_arith_call(
     every_call: bool,
     has_split: bool,
     prefill: bool,
     rows: usize,
     route_rows: usize,
+    lab_armed: bool,
+    verify_rows: usize,
+    capacity_rows: usize,
 ) -> bool {
-    every_call || (has_split && d2_executor_admitted(true, !prefill, rows, route_rows))
+    every_call
+        || (has_split
+            && d2_executor_admitted(
+                true,
+                !prefill,
+                rows,
+                route_rows,
+                lab_armed,
+                verify_rows,
+                capacity_rows,
+            ))
 }
 
 /// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers and
@@ -3045,6 +3111,16 @@ impl Qwen4MoeLayerRuntime {
         self.tier.as_ref()
     }
 
+    /// Actual per-layer D2 split executor storage for the bundle census: the
+    /// live executor when this layer is armed, `None` otherwise. Pure (no
+    /// allocation, mutation or qualification); capacity and qualified reads
+    /// stay on their own getters.
+    pub(crate) fn cpu_split_storage_executor(
+        &self,
+    ) -> Option<&hipfire_dispatch::cpu_split::CpuSplitExecutor> {
+        self.cpu_split.as_ref()
+    }
+
     /// EP decode runtime: the resident expert tensors are this rank's compact
     /// `placement.local_count(num_experts)` experts; owned experts name them, every other
     /// expert names `dummy`.
@@ -3807,57 +3883,27 @@ impl Qwen4MoeLayerRuntime {
         // the kill values) leave the executor exactly as `new` built it. A
         // refused `mapped` or `cpwait` is capability routing, logged here and
         // summarized once per load by the loader, never silent.
-        let built: Result<hipfire_dispatch::cpu_split::CpuSplitExecutor, String> = (|| {
-            let request = hipfire_config::memory::qwen4_d2_return()?;
-            let ready = hipfire_config::memory::qwen4_d2_ready()?;
-            let join = hipfire_config::memory::qwen4_d2_join()?;
-            let mut executor = hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
-                gpu,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                config.num_experts_per_tok,
-                hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
-                &placement,
-            )
-            .map_err(|error| format!("{error:?}"))?;
-            let release = |executor: hipfire_dispatch::cpu_split::CpuSplitExecutor,
-                           error: String| {
-                let release = executor
-                    .free_gpu(gpu)
-                    .err()
-                    .map(|free| format!("; executor release also failed: {free:?}"))
-                    .unwrap_or_default();
-                format!("{error}{release}")
-            };
-            if request == hipfire_config::memory::D2Return::Mapped {
-                if let Err(error) = executor.enable_mapped_return(gpu) {
-                    return Err(release(executor, format!("{error:?}")));
-                }
-                if let Some(reason) = executor.return_refusal() {
-                    eprintln!(
-                        "  qwen4 D2 return: layer {}: mapped refused, copy kept: {reason}",
-                        self.label
-                    );
-                }
-            }
-            if ready == hipfire_config::memory::D2Ready::Event {
-                if let Err(error) = executor.enable_event_ready() {
-                    return Err(release(executor, format!("{error:?}")));
-                }
-            }
-            if join == hipfire_config::memory::D2Join::CpWait {
-                if let Err(error) = executor.enable_cpwait_join(gpu) {
-                    return Err(release(executor, format!("{error:?}")));
-                }
-                if let Some(reason) = executor.join_refusal() {
-                    eprintln!(
-                        "  qwen4 D2 join: layer {}: cpwait refused, host kept: {reason}",
-                        self.label
-                    );
-                }
-            }
-            Ok(executor)
-        })();
+        // The initial ctor keeps the legacy default-4 executor rows; the
+        // load-only post-admission prewarm (`reserve_d2_wide_rows`) resizes an
+        // armed layer to the real need before the first window.
+        let request = hipfire_config::memory::qwen4_d2_return().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
+        })?;
+        let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
+        })?;
+        let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
+        })?;
+        let built = self.new_split_executor(
+            gpu,
+            config,
+            &placement,
+            hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
+            request,
+            ready,
+            join,
+        );
         match built {
             Ok(executor) => {
                 self.cpu_split = Some(executor);
@@ -4262,6 +4308,134 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last.
         runtime.attach_cpu_split(gpu, config)
+    }
+
+    /// Load-only D2 prewarm/reserve: replace this layer's default-4 executor
+    /// with one sized for the REAL requested rows (from
+    /// `Qwen4Bundle::native_mtp_capture_rows`, passed by the loader
+    /// post-admission), preserving the Return/Ready/Join selections. The
+    /// caller (C: bundle/load) owns the memory charge and calls this BEFORE
+    /// the first window — never with a window in flight (the old executor is
+    /// freed first, so a temporary peak of old+new is charged, never hot
+    /// growth). `requested_rows` is clamped to `4..=STORAGE`; unarmed layers
+    /// (no cold owner / no executor) are a no-op returning `false`, as is an
+    /// executor that already covers the request. Returns whether this layer
+    /// was resized. Existing pure [`Self::min_split_capacity_rows`] stays the
+    /// actual-instance capacity reader for Bundle/Rate (no Vec, no alloc).
+    pub(crate) fn reserve_d2_wide_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        requested_rows: usize,
+    ) -> Result<bool, Qwen4GpuForwardError> {
+        if self.cpu_cold_owners.is_none() || self.cpu_split.is_none() {
+            return Ok(false);
+        }
+        use hipfire_dispatch::cpu_split::{CPU_SPLIT_MAX_ROWS, CPU_SPLIT_STORAGE_MAX_ROWS};
+        let rows = requested_rows.clamp(CPU_SPLIT_MAX_ROWS, CPU_SPLIT_STORAGE_MAX_ROWS);
+        let covered = self
+            .cpu_split
+            .as_ref()
+            .is_some_and(|executor| executor.capacity_rows() >= rows);
+        if covered {
+            return Ok(false);
+        }
+        // Return/Ready/Join are load-immutable process-snapshot selections:
+        // re-reading them here yields exactly what the initial ctor applied,
+        // so the resized executor preserves them. Snapshot refusal before any
+        // new storage exists (same as the initial path).
+        let request = hipfire_config::memory::qwen4_d2_return().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
+        })?;
+        let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
+        })?;
+        let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
+            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
+        })?;
+        let placement = self
+            .cpu_cold_owners
+            .as_ref()
+            .map(|owners| owners.placement())
+            .expect("checked above");
+        let old = self.cpu_split.take().expect("checked above");
+        if let Err(error) = old.free_gpu(gpu) {
+            return Err(Qwen4GpuForwardError::Dispatch(format!(
+                "layer {} D2 prewarm release: {error:?}",
+                self.label
+            )));
+        }
+        let label = self.label;
+        let fresh = self
+            .new_split_executor(gpu, config, &placement, rows, request, ready, join)
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("layer {label} D2 prewarm: {error}"))
+            })?;
+        // Re-apply is inside new_split_executor; publish under the same log lines.
+        self.cpu_split = Some(fresh);
+        Ok(true)
+    }
+
+    /// Shared executor construction behind [`Self::attach_cpu_split`] (initial
+    /// default path) and [`Self::reserve_d2_wide_rows`] (post-admission resize):
+    /// build for `rows` with explicit Return/Ready/Join requests. Refused
+    /// `mapped`/`cpwait` keep capability routing (logged, never silent).
+    fn new_split_executor(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        placement: &[u8],
+        rows: usize,
+        request: hipfire_config::memory::D2Return,
+        ready: hipfire_config::memory::D2Ready,
+        join: hipfire_config::memory::D2Join,
+    ) -> Result<hipfire_dispatch::cpu_split::CpuSplitExecutor, String> {
+        use hipfire_config::memory::{D2Join, D2Ready, D2Return};
+        let mut executor = hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
+            gpu,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.num_experts_per_tok,
+            rows,
+            placement,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let release = |executor: hipfire_dispatch::cpu_split::CpuSplitExecutor, error: String| {
+            let release = executor
+                .free_gpu(gpu)
+                .err()
+                .map(|free| format!("; executor release also failed: {free:?}"))
+                .unwrap_or_default();
+            format!("{error}{release}")
+        };
+        if request == D2Return::Mapped {
+            if let Err(error) = executor.enable_mapped_return(gpu) {
+                return Err(release(executor, format!("{error:?}")));
+            }
+            if let Some(reason) = executor.return_refusal() {
+                eprintln!(
+                    "  qwen4 D2 return: layer {}: mapped refused, copy kept: {reason}",
+                    self.label
+                );
+            }
+        }
+        if ready == D2Ready::Event {
+            if let Err(error) = executor.enable_event_ready() {
+                return Err(release(executor, format!("{error:?}")));
+            }
+        }
+        if join == D2Join::CpWait {
+            if let Err(error) = executor.enable_cpwait_join(gpu) {
+                return Err(release(executor, format!("{error:?}")));
+            }
+            if let Some(reason) = executor.join_refusal() {
+                eprintln!(
+                    "  qwen4 D2 join: layer {}: cpwait refused, host kept: {reason}",
+                    self.label
+                );
+            }
+        }
+        Ok(executor)
     }
 
     /// Check every routed expert header of this layer for the symmetric grid
@@ -7308,6 +7482,10 @@ pub struct Qwen4GpuForward {
     /// runs always on gfx942 and with `HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151. Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
+    /// Lab receipt of the reference actually bound by the most recent
+    /// multi-row verify attempt, retained after the temporary GPU scope exits.
+    #[cfg(feature = "lab")]
+    pub(crate) last_verify_reference: Option<rdna_compute::prefill_invariant::Qwen4VerifyReference>,
     /// The band this forward runs: the weights' and the state's scope (the
     /// whole model is [`Qwen4BandScope::single`]).
     scope: Qwen4BandScope,
@@ -7569,14 +7747,8 @@ fn check_band_admission(
         || map.owns_output() != scope.output
     {
         return Err(invalid(format!(
-            "Qwen4 state scope {:?} (input {}, output {}) differs from the weights' band {:?} \
-             (input {}, output {})",
-            map.band(),
-            map.owns_input(),
-            map.owns_output(),
-            scope.band,
-            scope.input,
-            scope.output
+            "band {:?} (input {}, output {}) disagrees with state {:?}",
+            scope.band, scope.input, scope.output, map,
         )));
     }
     if !single_scope
@@ -7589,6 +7761,23 @@ fn check_band_admission(
     Ok(())
 }
 
+impl Qwen4GpuForward {
+    /// Live D2 executor capacity for the bundle's common cap: the minimum allocated
+    /// capacity across armed split layers, `None` when no layer owns an executor.
+    /// `None` means D2 contributes nothing and must not clip a D1 64.
+    pub(crate) fn d2_storage_capacity_rows(&self) -> Option<usize> {
+        let mut min: Option<usize> = None;
+        for layer in self.moe.iter().flatten() {
+            let Some(executor) = layer.cpu_split.as_ref() else {
+                continue;
+            };
+            min = Some(min.map_or(executor.capacity_rows(), |m: usize| {
+                m.min(executor.capacity_rows())
+            }));
+        }
+        min
+    }
+}
 /// Environment knob naming the routing-trace output file (appended).
 pub const ROUTE_TRACE_ENV: &str = "HIPFIRE_QWEN4_ROUTE_TRACE";
 
@@ -7799,20 +7988,91 @@ impl Qwen4GpuForward {
         )
     }
     /// Whether a call of `rows` rows over `route_rows` routing rows in the
-    /// given phase executes host arithmetic ([`host_arith_call`]).
+    /// given phase executes host arithmetic ([`host_arith_call`]). `gpu`
+    /// supplies this call's frozen row-exact width; capacity is the minimum
+    /// allocated [`capacity_rows`](hipfire_dispatch::cpu_split::CpuSplitExecutor::capacity_rows)
+    /// across armed layers, so a wide window runs only when every layer that
+    /// owns it has storage for it.
+    /// `lab_armed` is the caller-observed existing-oracle-override presence
+    /// for this call (env or runtime override on an exact oracle arch with an
+    /// eager verify scope) — never derived from `few_row_limit` here (that is
+    /// a GPU projection-route limit, not CPU storage). Production threads it
+    /// from the forward's eager-verify scope; tests pass it explicitly.
+    /// `dim/mi/top_k` are this call's expert geometry (the D1 capacity
+    /// source reads actual prewarmed rows for them); `device_id` is the
+    /// sealing device. Tests pass explicit values.
     pub(crate) fn call_executes_host_arith(
         &self,
+        gpu: &Gpu,
         prefill: bool,
         rows: usize,
         route_rows: usize,
+        lab_armed: bool,
+        dim: usize,
+        mi: usize,
+        top_k: usize,
     ) -> bool {
-        host_arith_call(
+        if host_arith_call(
             self.has_cpu_deferred_experts(),
             self.cpu_split_layers > 0,
             prefill,
             rows,
             route_rows,
+            lab_armed,
+            qwen4_row_exact_verify_rows(gpu),
+            self.min_split_capacity_rows(),
+        ) {
+            return true;
+        }
+        // D1 wide per-call path (no split executor): an armed D1 layer runs
+        // host arithmetic on a whole logical 1..64-row eager-verify window
+        // when the lab is armed and host scratch is actually prewarmed.
+        // Default (unarmed, tail, or no prewarm) stays false.
+        if prefill || !lab_armed || !self.cpu_deferred_experts {
+            return false;
+        }
+        let scope = hipfire_dispatch::families::moe::CpuWideVerifyScope::from_lab_presence(
+            lab_armed,
+            qwen4_row_exact_verify_rows(gpu),
+        );
+        hipfire_dispatch::families::moe::cpu_d1_wide_window_qualified(
+            true,
+            rows,
+            route_rows,
+            scope,
+            hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows(
+                dim,
+                mi,
+                top_k,
+                gpu.device_id,
+            ),
         )
+    }
+
+    /// Existing-oracle-override presence for this GPU: the canonical
+    /// [`rdna_compute::prefill_invariant::qwen4_wide_verify_override_present`]
+    /// signal (runtime override — including the `Some(8)` baseline — or the
+    /// parsed developer var, on an exact oracle arch). Pure presence signal
+    /// for the CPU experimental capacity gate — never a capacity value, never
+    /// `few_row_limit` (that is a GPU projection-route limit, not CPU
+    /// storage). Tests pass `lab_armed` explicitly instead of reading it here.
+    pub(crate) fn cpu_lab_override_present(gpu: &Gpu) -> bool {
+        rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&gpu.arch)
+    }
+
+    /// Minimum allocated executor capacity across armed split layers (`0`
+    /// when none is armed). Internal routing reader for the per-call D2 gate
+    /// (unarmed callers fail closed on 0). Bundle's common cap uses
+    /// [`Self::d2_storage_capacity_rows`] instead (`None` = unowned, must not
+    /// clip a D1 64). Same instances, distinct contracts — not duplicates.
+    pub(crate) fn min_split_capacity_rows(&self) -> usize {
+        self.moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| layer.cpu_split.as_ref())
+            .map(|executor| executor.capacity_rows())
+            .min()
+            .unwrap_or(0)
     }
     /// Verify rows the armed CPU numerical modes run row-exact, read from each
     /// mode's own ownership and exported window, **independent of**
@@ -8153,6 +8413,10 @@ impl Qwen4GpuForward {
                     )
                 })?;
             } else {
+                // Initial ctor keeps the default 4 until the real need is known;
+                // the loader's post-admission prewarm (`reserve_d2_wide_rows`)
+                // sizes armed layers to the actual need once, before the first
+                // window (no hot growth, no in-flight replacement).
                 populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {
                     Qwen4MoeLayerRuntime::from_moe(
                         gpu,
@@ -8659,6 +8923,8 @@ impl Qwen4GpuForward {
             layer_capture: None,
             lane_scope: false,
             prefill_scope: false,
+            #[cfg(feature = "lab")]
+            last_verify_reference: None,
             scope,
             mesh_route_rows: None,
             mesh_segment: None,
@@ -9949,49 +10215,61 @@ impl Qwen4GpuForward {
         final_chunk
     }
 
-    /// [`qwen4_row_exact_verify_rows`] guarded by the bundle's actual AR launch
-    /// mode ([`qwen4_ar_launch`]) and the QSA attention policy of this bundle's
-    /// K/V format
-    /// ([`rdna_compute::tensor_ops::qsa_decode_attention_eager_differs_from_recorded`],
-    /// evaluated at the shortest and the full selected length so the LDS fit of
-    /// either end counts). gfx1201 resolves to per-head attention in both modes,
-    /// so it keeps the table value; gfx1151 F32 splits eagerly only.
+    /// Effective arithmetic/storage limit for eager verify. QSA follows the
+    /// actual AR reference bound at window entry, including recorded AR; it
+    /// does not impose an eager/recorded mismatch fallback. Nondefault MQ4
+    /// singleton recipes without a matching rowtile remain explicitly narrow.
     pub(crate) fn guarded_wide_verify_rows(&self, bundle: &Qwen4Bundle, gpu: &Gpu) -> usize {
-        if self.has_cpu_deferred_experts() {
-            return cpu_splice::NARROW_VERIFY_MAX_ROWS;
-        }
-        let requested = qwen4_row_exact_verify_rows(gpu);
-        if requested <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS {
-            return requested;
-        }
-        let config = &bundle.config;
-        let retained_candidate = self.ep.is_none()
-            && !self.has_cpu_deferred_experts()
-            && config.profile.is_flash_next()
+        let admitted = qwen4_row_exact_verify_rows(gpu);
+        let recipe_rows = if gpu.qwen4_row_tile_reference_supported() {
+            admitted
+        } else {
+            admitted.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
+        };
+        let rows = recipe_rows.min(qwen4_spec_logit_rows(self.scratch.max_chunk));
+        let eligible_single_fn = self.ep.is_none()
+            && self.scope == Qwen4BandScope::single(&bundle.config)
+            && bundle.config.profile.is_flash_next()
             && !self.lane_scope
             && self.qsa_tap.is_none()
+            && self.mesh_route_rows.is_none()
+            && self.cut_layers.is_none()
+            && bundle.ep.is_none()
+            && bundle.pp.is_none()
+            && bundle.pp_band.is_none()
             && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
-        let ar = qwen4_ar_launch(
+        qwen4_scoped_verify_rows(rows, eligible_single_fn, self.native_mtp_cpu_window_rows())
+    }
+
+    /// The singleton continuation's eligibility, not this multi-row call's.
+    /// Keep the bundle terms in sync with the retained-body boundary below.
+    pub(crate) fn ar_launch_reference(&self, bundle: &Qwen4Bundle, gpu: &Gpu) -> Qwen4ArLaunch {
+        let (pm_invariant, append) = Self::route_scopes(false, gpu, 1);
+        let retained_candidate = self.ep.is_none()
+            && !pm_invariant
+            && !append
+            && !self.call_executes_host_arith(
+                gpu,
+                false,
+                1,
+                1,
+                false,
+                bundle.config.hidden_size,
+                bundle.config.moe_intermediate_size,
+                bundle.config.num_experts_per_tok,
+            )
+            && bundle.config.profile.is_flash_next()
+            && !self.lane_scope
+            && self.qsa_tap.is_none()
+            && self.mesh_route_rows.is_none()
+            && self.cut_layers.is_none()
+            && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+        qwen4_ar_launch(
             retained_candidate,
             gpu.replay.request(),
             gpu.replay.state(),
             gpu.graphs.capture_mode,
-        );
-        qwen4_wide_verify_rows_guard(requested, ar, || {
-            let full = config.qsa_selected_capacity();
-            bundle.state.qsa.iter().any(|qsa| {
-                [1, full].into_iter().any(|max_selected| {
-                    rdna_compute::tensor_ops::qsa_decode_attention_eager_differs_from_recorded(
-                        gpu,
-                        qsa.format,
-                        config.head_dim,
-                        config.num_attention_heads,
-                        config.num_key_value_heads,
-                        max_selected,
-                    )
-                })
-            })
-        })
+        )
     }
 
     /// Number of MoE runtimes this forward holds.
@@ -10315,7 +10593,6 @@ impl Qwen4GpuForward {
     pub(crate) fn abandon_mesh_program(&mut self) {
         self.mesh_next_op = None;
     }
-
     /// Set the Gpu routing scopes one forward of `rows` rows runs under and
     /// return the previous values (restore with [`Self::leave_tile_scopes`]):
     /// [`Gpu::qwen4_scope`] (admits the Qwen4-only MQ6 X-LDS defaults), the
@@ -10368,8 +10645,8 @@ impl Qwen4GpuForward {
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
     }
 
-    /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
-    /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
+    /// Every forward runs under this call's routing scopes; a multi-row
+    /// verify latches the singleton AR reference before installing them.
     #[allow(clippy::too_many_arguments)]
     fn forward_chunk_inner(
         &mut self,
@@ -10382,15 +10659,26 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        // Latch before installing this call's routing scopes: a multi-row
+        // verify remains eager but must reproduce the singleton AR arithmetic
+        // that would run at this exact boundary.
+        let verify_reference = if !self.prefill_scope && tokens.len() >= 2 {
+            use rdna_compute::prefill_invariant::Qwen4VerifyReference;
+            Some(match self.ar_launch_reference(bundle, gpu) {
+                Qwen4ArLaunch::Eager => Qwen4VerifyReference::Eager,
+                Qwen4ArLaunch::Recorded => Qwen4VerifyReference::Recorded,
+            })
+        } else {
+            None
+        };
+        #[cfg(feature = "lab")]
+        if verify_reference.is_some() {
+            self.last_verify_reference = verify_reference;
+        }
         let (scopes, _append) = self.enter_tile_scopes(gpu, tokens.len());
-        // A verify forward (not a prefill tile, 2+ rows) runs row-exact up to
-        // the arch's proven limit: the few-row decode-twin routes widen to it
-        // (`Gpu::few_row_limit`), so each row is bitwise the sequential decode
-        // row. A one-row forward is the decode itself; prefill keeps the
-        // historic limit. Rows above the historic 8 additionally require that
-        // the AR decode they reproduce takes the same QSA attention arithmetic
-        // as this eager verify (`guarded_wide_verify_rows`). Restored below on
-        // the single return path.
+        // Only eager verify widens the few-row routes. Its reference binding
+        // selects the actual AR attention arithmetic without enabling replay.
+        // Restore both host scopes on the single success/error return path.
         let wide_verify = if !self.prefill_scope && tokens.len() >= 2 {
             self.guarded_wide_verify_rows(bundle, gpu)
         } else {
@@ -10402,6 +10690,7 @@ impl Qwen4GpuForward {
         // incumbent), as the lane step does.
         let prior_rows_scope = gpu.lane_rows_scope;
         gpu.lane_rows_scope |= wide_verify > 0;
+        let prior_verify_reference = gpu.set_qwen4_verify_reference(verify_reference);
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -10415,6 +10704,7 @@ impl Qwen4GpuForward {
         Self::leave_tile_scopes(gpu, scopes);
         gpu.set_wide_verify_rows(prior_wide_verify);
         gpu.lane_rows_scope = prior_rows_scope;
+        gpu.set_qwen4_verify_reference(prior_verify_reference);
         result
     }
 
@@ -10435,10 +10725,21 @@ impl Qwen4GpuForward {
         // the automatic default's D2 only for the calls that execute it (a real
         // narrow non-prefill window), so wide verify and prefill keep their
         // old graph/replay behaviour.
+        // Lab presence for the CPU experimental capacity: the existing
+        // oracle override must be present AND this must be an eager verify
+        // call (non-prefill scope, >= 2 rows). Ordinary prefill, decode and
+        // captured/recorded calls never arm, whatever the GPU few-row limit is.
+        let lab_armed =
+            !self.prefill_scope && tokens.len() >= 2 && Self::cpu_lab_override_present(gpu);
         let host_arith_call = self.call_executes_host_arith(
+            gpu,
             self.prefill_scope,
             tokens.len(),
             gpu.route_rows(tokens.len()),
+            lab_armed,
+            bundle.config.hidden_size,
+            bundle.config.moe_intermediate_size,
+            bundle.config.num_experts_per_tok,
         );
         self.ensure_cpu_splice_eager(gpu, host_arith_call)?;
         let cpu_deferred_experts = host_arith_call;
@@ -10828,7 +11129,24 @@ impl Qwen4GpuForward {
             // layers compute (the legacy donors refill from their own MoE).
             stage.slab_prime(gpu, self.moe.len())?;
         }
-        let ctx = DispatchCtx::new(gpu);
+        // The MoE seal reads this call's canonical route rows from the
+        // dispatch context (`batch_size = route_rows`): a short tail of a long
+        // prefill keeps `rows != route_rows` and the GPU route, while a whole
+        // logical verify window (`rows == route_rows`) may take the qualified
+        // CPU path. Ordinary prefill chunk seals keep `route_rows` = chunk.
+        // Per-call actual eager-verify scope for the CPU-owned expert window:
+        // global override presence alone MUST NOT arm it (a whole 64-row
+        // ordinary prefill has `rows == route_rows` too). Only a real eager
+        // verify call sets it: non-prefill scope, `>= 2` rows, neither
+        // recording nor graph-capturing, override present.
+        let cpu_wide_verify = !self.prefill_scope
+            && n >= 2
+            && !gpu.replay.is_recording()
+            && !gpu.graphs.capture_mode
+            && Self::cpu_lab_override_present(gpu);
+        let ctx = DispatchCtx::new(gpu)
+            .with_batch_size(route_n)
+            .with_cpu_wide_verify(cpu_wide_verify);
         // Heap, not an inline SmallVec: 384 inline steps are ~567 KiB, and the `attempt`
         // closure below moves `steps`, so the frame held three copies (~1.7 MiB). That
         // overflowed the 2 MiB stack of an EP peer rank's worker thread in a chunk forward.
@@ -10968,18 +11286,30 @@ impl Qwen4GpuForward {
 
             match &description.ffn {
                 Qwen4FfnBinding::Moe(moe) => {
-                    // The D2 executor gate (`cpu_split_executor`) sees only the
-                    // row count, so a call whose real rows are not its whole
-                    // routing window (a 1..=4-row tail of a long prefill) or
-                    // that is wider than the narrow cap is bound to a view of
-                    // the runtime this layer actually selected (`layer_moe`:
-                    // balanced live, EP full chunk, or static) with no executor.
-                    // The view must be of that same runtime: its table and
-                    // cache were bound to it, and the seal compares them.
+                    // The D2 executor gate sees the whole routing window plus
+                    // this call's qualified width and allocated capacity, so a
+                    // call whose real rows are not its whole routing window (a
+                    // short tail of a long prefill) or that is wider than the
+                    // qualified cap is bound to a view of the runtime this
+                    // layer actually selected (`layer_moe`: balanced live, EP
+                    // full chunk, or static) with no executor. The view must be
+                    // of that same runtime: its table and cache were bound to
+                    // it, and the seal compares them. An admitted whole-window
+                    // 1..64-row verify keeps one forward with full-window
+                    // state/capture, never chunked.
                     let mut moe = *moe;
+                    let verify_rows = qwen4_row_exact_verify_rows(gpu);
+                    let lab_armed =
+                        !self.prefill_scope && n >= 2 && Self::cpu_lab_override_present(gpu);
                     moe.routed_experts =
                         bind_routed_view(layer_moe, moe.routed_experts, |runtime| {
-                            runtime.routed_view(!self.prefill_scope, n, route_n)
+                            runtime.routed_view(
+                                !self.prefill_scope,
+                                n,
+                                route_n,
+                                lab_armed,
+                                verify_rows,
+                            )
                         });
                     layer_env.moe_steps(
                         &mut steps,
@@ -11981,8 +12311,7 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
 
 #[cfg(test)]
 mod wide_verify_guard_tests {
-    use super::{qwen4_ar_launch, qwen4_wide_verify_rows_guard, Qwen4ArLaunch};
-    use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
+    use super::{qwen4_ar_launch, qwen4_spec_logit_rows, Qwen4ArLaunch};
     use rdna_compute::replay::{ReplayBackendRequest as Request, ReplayState as State};
 
     #[test]
@@ -12028,46 +12357,52 @@ mod wide_verify_guard_tests {
     }
 
     #[test]
-    fn guard_keeps_eight_only_when_recorded_ar_differs() {
-        use Qwen4ArLaunch::{Eager, Recorded};
-        for requested in [FEW_ROW_ROUTE_ROWS, 16, WIDE_VERIFY_MAX_ROWS] {
-            // Eager AR: eager verify and eager AR share every route.
+    fn physical_verify_rows_respect_actual_scratch() {
+        let physical = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        assert_eq!(physical, 64);
+        for scratch_rows in 0..=physical + 1 {
             assert_eq!(
-                qwen4_wide_verify_rows_guard(requested, Eager, || true),
-                requested
-            );
-            assert_eq!(
-                qwen4_wide_verify_rows_guard(requested, Eager, || false),
-                requested
-            );
-            // Recorded AR on a per-head arch (gfx1201): both modes agree.
-            assert_eq!(
-                qwen4_wide_verify_rows_guard(requested, Recorded, || false),
-                requested
+                qwen4_spec_logit_rows(scratch_rows),
+                scratch_rows.min(physical)
             );
         }
-        // Recorded AR whose eager launch splits (gfx1151 F32): stay at 8.
-        for requested in [16, WIDE_VERIFY_MAX_ROWS] {
-            assert_eq!(
-                qwen4_wide_verify_rows_guard(requested, Recorded, || true),
-                FEW_ROW_ROUTE_ROWS
-            );
-        }
-        assert_eq!(
-            qwen4_wide_verify_rows_guard(FEW_ROW_ROUTE_ROWS, Recorded, || true),
-            FEW_ROW_ROUTE_ROWS
-        );
+        assert_eq!(qwen4_spec_logit_rows(usize::MAX), physical);
     }
 
     #[test]
-    fn guard_evaluates_attention_policy_only_when_it_matters() {
+    fn scoped_verify_width_never_widens_non_single_fn() {
+        use rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
+        assert_eq!(FEW_ROW_ROUTE_ROWS, 8);
+        for rows in 1..=hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+            assert_eq!(super::qwen4_scoped_verify_rows(rows, true, None), rows);
+            assert_eq!(
+                super::qwen4_scoped_verify_rows(rows, false, None),
+                rows.min(FEW_ROW_ROUTE_ROWS)
+            );
+            assert_eq!(
+                super::qwen4_scoped_verify_rows(rows, true, Some(4)),
+                rows.min(4)
+            );
+            assert_eq!(
+                super::qwen4_scoped_verify_rows(rows, false, Some(4)),
+                rows.min(4)
+            );
+        }
+    }
+
+    #[test]
+    fn ar_reference_recomputed_after_retained_fallback() {
         use Qwen4ArLaunch::{Eager, Recorded};
-        let panics = || -> bool { panic!("attention policy evaluated needlessly") };
-        assert_eq!(
-            qwen4_wide_verify_rows_guard(FEW_ROW_ROUTE_ROWS, Recorded, panics),
-            FEW_ROW_ROUTE_ROWS
-        );
-        assert_eq!(qwen4_wide_verify_rows_guard(32, Eager, panics), 32);
+        let transitions = [
+            (State::Armed, Recorded),
+            (State::Ready, Recorded),
+            (State::Fallback, Eager),
+            (State::Hip, Eager),
+            (State::Armed, Recorded),
+        ];
+        for (state, expected) in transitions {
+            assert_eq!(qwen4_ar_launch(true, Request::Auto, state, false), expected);
+        }
     }
 }
 
@@ -12810,44 +13145,94 @@ mod tests {
     }
 
     /// The decision `routed_view` applies, over every phase and window: the D2
-    /// executor is bound only outside a prefill tile and only for a window of
-    /// at most the narrow cap whose real rows are the whole routing window.
+    /// executor is bound only outside a prefill tile and only for a whole
+    /// qualified window — at most the narrow cap on the default route, or a
+    /// whole logical 1..64-row window inside an explicit lab-wide scope with
+    /// allocated capacity. Wiring only, not numeric proof.
     #[test]
     fn d2_executor_is_admitted_only_outside_prefill_and_for_whole_narrow_windows() {
         use super::d2_executor_admitted as admitted;
         let chunk = 8192;
+        // Default scope (unarmed): legacy truth unchanged.
+        let default = |has_split: bool, d2_phase: bool, rows: usize, route: usize| {
+            admitted(has_split, d2_phase, rows, route, false, 8, 4)
+        };
         for has_split in [false, true] {
             // Decode (1 row) and a <=4-row verify, outside a prefill tile.
             for rows in 1..=4 {
-                assert!(admitted(has_split, true, rows, rows), "verify rows={rows}");
+                assert!(default(has_split, true, rows, rows), "verify rows={rows}");
                 // The same <=4-row window INSIDE a prefill tile (a short prompt
                 // whose routing window equals its rows) never takes D2.
                 assert_eq!(
-                    admitted(has_split, false, rows, rows),
+                    default(has_split, false, rows, rows),
                     !has_split,
                     "prefill-phase rows={rows}"
                 );
                 // A 1..=4-row tail of a long prefill: routing window is the chunk.
                 assert_eq!(
-                    admitted(has_split, true, rows, chunk),
+                    default(has_split, true, rows, chunk),
                     !has_split,
                     "tail rows={rows}"
                 );
             }
-            // Wide windows never take D2, in either phase.
+            // Wide windows never take D2 on the default route, in either phase.
             for rows in [5, 8, 768, chunk] {
                 assert_eq!(
-                    admitted(has_split, true, rows, rows),
+                    default(has_split, true, rows, rows),
                     !has_split,
                     "wide rows={rows}"
                 );
                 assert_eq!(
-                    admitted(has_split, false, rows, rows),
+                    default(has_split, false, rows, rows),
                     !has_split,
                     "wide prefill rows={rows}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn d2_executor_wide_truth_is_1_to_64_wiring_only() {
+        // Wiring only — MUST NOT be counted as numeric proof (G1/G2 family
+        // qualification still required). Lab-wide scope (`verify_rows = 64`)
+        // with allocated 64-row capacity admits every whole logical 1..64-row
+        // window outside a prefill tile; tails, prefill-phase calls, default
+        // scope and short capacity refuse.
+        use super::d2_executor_admitted as admitted;
+        // Presence arms BOTH lab widths: wide8 AND wide64 execute the FULL
+        // logical R1..64 backend (wide8 only closes the GPU few-row projection
+        // routes above 8; it must not cap the CPU at 8). Value alone (armed =
+        // false) never qualifies wide, whatever verify_rows reads.
+        for rows in 1..=64usize {
+            for verify in [8usize, 64] {
+                assert!(
+                    admitted(true, true, rows, rows, true, verify, 64),
+                    "lab verify={verify} rows={rows}"
+                );
+            }
+            assert!(
+                !admitted(true, false, rows, rows, true, 64, 64),
+                "prefill rows={rows}"
+            );
+            assert!(
+                !admitted(true, true, rows, rows + 1, true, 64, 64),
+                "tail rows={rows}"
+            );
+            assert_eq!(
+                admitted(true, true, rows, rows, false, 64, 64),
+                rows <= 4,
+                "unforced rows={rows}"
+            );
+            // Short capacity binds: a 4-row allocation admits only 1..=4.
+            assert_eq!(
+                admitted(true, true, rows, rows, true, 64, 4),
+                rows <= 4,
+                "short-cap rows={rows}"
+            );
+        }
+        // Structural bounds (capacity 64, armed):
+        assert!(!admitted(true, true, 65, 65, true, 64, 64));
+        assert!(!admitted(true, true, 0, 0, true, 64, 64));
     }
 
     /// Which calls of a load run host arithmetic (and so need eager HIP): D1
@@ -12866,6 +13251,9 @@ mod tests {
                 prefill,
                 rows,
                 route,
+                false,
+                8,
+                4,
             )
         };
         let chunk = 8192;
@@ -12924,15 +13312,11 @@ mod tests {
         }
     }
 
-    /// Speculative width with the automatic D2 default armed is the unarmed
-    /// load's: only a load-wide arm (D1, explicit-mode D2) reaches the 4-row
-    /// caps — `spec_verify_rows_cap` (MTP verify/replay), the bundle's and the
-    /// lanes' 4-row verify refusals, `guarded_wide_verify_rows`'s narrow return
-    /// and the loader's MTP `k` clamp all key on `has_cpu_deferred_experts`,
-    /// which is `host_arith_every_call` of the load. So a wide MTP / n-gram
-    /// verify of an automatic-D2 load runs the unarmed GPU route at the
-    /// unarmed width ([`host_arith_call`] is false for it, so the executor-less
-    /// view is bound and no eager rule is added).
+    /// The load-wide speculative refusal does not arm for automatic D2:
+    /// explicit wide forwards still bind its executor-less GPU view. This is
+    /// not row-exact admission against CPU-arithmetic singleton decode:
+    /// `guarded_wide_verify_rows` also applies `native_mtp_cpu_window_rows`,
+    /// including automatic D2, so exact native/copy windows retain the CPU cap.
     #[test]
     fn automatic_d2_keeps_the_unarmed_speculative_width() {
         use super::{host_arith_call, host_arith_every_call};
@@ -12958,12 +13342,12 @@ mod tests {
             super::cpu_splice::NARROW_VERIFY_MAX_ROWS,
             QWEN4_CPU_SPLICE_MAX_ROWS
         );
-        // Every verify wider than the cap, up to the widest lane/row-exact
-        // verify, runs no host arithmetic on the automatic load.
+        // Explicit wider forwards (not a row-exact admission certificate)
+        // run no host arithmetic on the automatic load.
         let widest = crate::gpu_forward_lanes::LANE_MAX_ROWS.max(16);
         for rows in QWEN4_CPU_SPLICE_MAX_ROWS + 1..=widest {
             assert!(
-                !host_arith_call(automatic, true, false, rows, rows),
+                !host_arith_call(automatic, true, false, rows, rows, false, 8, 4),
                 "rows={rows}"
             );
         }
@@ -14631,8 +15015,24 @@ mod seal_view_identity_tests {
 
         /// The fixture's `routed_view`: the same decision, the fixture's
         /// executor-less view.
-        fn view(&self, d2_phase: bool, rows: usize, route_rows: usize) -> &dyn RoutedExpertWeights {
-            if d2_executor_admitted(self.split, d2_phase, rows, route_rows) {
+        fn view(
+            &self,
+            d2_phase: bool,
+            rows: usize,
+            route_rows: usize,
+            lab_armed: bool,
+            verify_rows: usize,
+        ) -> &dyn RoutedExpertWeights {
+            let capacity = if self.split { 64 } else { 0 };
+            if d2_executor_admitted(
+                self.split,
+                d2_phase,
+                rows,
+                route_rows,
+                lab_armed,
+                verify_rows,
+                capacity,
+            ) {
                 return self;
             }
             &self.withheld
@@ -14689,6 +15089,24 @@ mod seal_view_identity_tests {
             rows: usize,
             route_rows: usize,
         ) -> (&FakeRuntime, &dyn RoutedExpertWeights) {
+            self.bind_scoped(
+                ep, balanced, full_chunk, tile_route, d2_phase, rows, route_rows, false, 8,
+            )
+        }
+
+        /// Same with an explicit lab scope (presence + frozen verify rows).
+        fn bind_scoped(
+            &self,
+            ep: bool,
+            balanced: bool,
+            full_chunk: bool,
+            tile_route: bool,
+            d2_phase: bool,
+            rows: usize,
+            route_rows: usize,
+            lab_armed: bool,
+            verify_rows: usize,
+        ) -> (&FakeRuntime, &dyn RoutedExpertWeights) {
             let selected = select_layer_moe(
                 balanced.then_some(&self.live),
                 ep.then_some(Some(&self.full)),
@@ -14698,7 +15116,7 @@ mod seal_view_identity_tests {
             );
             let described: &dyn RoutedExpertWeights = selected.expect("a runtime is selected");
             let view = bind_routed_view(selected, described, |runtime| {
-                runtime.view(d2_phase, rows, route_rows)
+                runtime.view(d2_phase, rows, route_rows, lab_armed, verify_rows)
             });
             (selected.unwrap(), view)
         }
@@ -14743,7 +15161,7 @@ mod seal_view_identity_tests {
                 // Withheld exactly when the unchanged D2 gate refuses it.
                 assert_eq!(
                     address(view) != address(selected),
-                    !d2_executor_admitted(split, d2_phase, rows, route_rows)
+                    !d2_executor_admitted(split, d2_phase, rows, route_rows, false, 8, 4)
                 );
             }
         }
@@ -14772,7 +15190,7 @@ mod seal_view_identity_tests {
         for (balanced, full_chunk, id) in [(true, false, LIVE_ID), (false, true, FULL_ID)] {
             let (selected, _) = rt.bind(true, balanced, full_chunk, false, true, 4, 4);
             assert_eq!(selected.id, id);
-            let stale = rt.static_moe.view(true, 4, 4);
+            let stale = rt.static_moe.view(true, 4, 4, false, 8);
             assert_ne!(stale.immutable_identity(), Some(selected.id));
         }
     }
@@ -14798,7 +15216,7 @@ mod seal_view_identity_tests {
                     rt.bind(false, false, rows > 1, false, d2_phase, rows, route_rows);
                 assert_eq!(selected.id, STATIC_ID);
                 assert_eq!(view.immutable_identity(), Some(selected.id));
-                let admitted = d2_executor_admitted(split, d2_phase, rows, route_rows);
+                let admitted = d2_executor_admitted(split, d2_phase, rows, route_rows, false, 8, 4);
                 assert_eq!(address(view) == address(selected), admitted);
                 if !split {
                     // Nothing armed: never withheld.
@@ -14808,12 +15226,44 @@ mod seal_view_identity_tests {
         }
     }
 
+    /// Lab scope (wiring only, not numeric proof): a whole logical 1..64-row
+    /// window outside a prefill tile binds the runtime itself when the lab is
+    /// armed with capacity; tails, prefill-phase calls and unarmed scopes bind
+    /// the withheld view.
+    #[test]
+    fn lab_scope_binds_whole_1_to_64_windows_wiring_only() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for rows in 1..=64usize {
+                let (selected, view) =
+                    rt.bind_scoped(false, false, rows > 1, false, true, rows, rows, true, 64);
+                assert_eq!(view.immutable_identity(), Some(selected.id));
+                let admitted = d2_executor_admitted(split, true, rows, rows, true, 64, 64);
+                assert_eq!(address(view) == address(selected), admitted);
+                // Tails and prefill-phase calls stay withheld even when armed.
+                let (selected, tail) =
+                    rt.bind_scoped(false, false, true, false, true, rows, 8192, true, 64);
+                assert_eq!(
+                    address(tail) == address(selected),
+                    d2_executor_admitted(split, true, rows, 8192, true, 64, 64)
+                );
+                let (selected, prefill) =
+                    rt.bind_scoped(false, false, true, false, false, rows, rows, true, 64);
+                assert_eq!(
+                    address(prefill) == address(selected),
+                    d2_executor_admitted(split, false, rows, rows, true, 64, 64)
+                );
+            }
+        }
+    }
+
     /// Without a selected runtime the description's own binding stands.
     #[test]
     fn no_selected_runtime_keeps_the_described_binding() {
         let described = FakeSet { id: 0x77 };
-        let view =
-            bind_routed_view::<FakeRuntime>(None, &described, |runtime| runtime.view(true, 1, 1));
+        let view = bind_routed_view::<FakeRuntime>(None, &described, |runtime| {
+            runtime.view(true, 1, 1, false, 8)
+        });
         assert_eq!(address(view), address(&described));
     }
 
@@ -14839,7 +15289,7 @@ mod seal_view_identity_tests {
                     assert_eq!(lane.id, if balanced { LIVE_ID } else { STATIC_ID });
                     let described: &dyn RoutedExpertWeights = lane;
                     let view = bind_routed_view(Some(lane), described, |runtime| {
-                        runtime.view(true, rows, rows)
+                        runtime.view(true, rows, rows, false, 8)
                     });
                     assert_eq!(address(view), address(singleton_view));
                     assert_eq!(view.immutable_identity(), Some(lane.id));

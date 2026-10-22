@@ -41,6 +41,14 @@
 //! Resources (design §4 ceilings; the emitted counts are in the contract): gate `4*C` accumulators per lane
 //! (C32: 128), down `C`; one `nw`-register weight group, one `nw`-register X vector; the plan is
 //! checked in `u16` and refused above 256 VGPRs.
+//!
+//! `Cap::C8` is reserved internally for the new `_t8` path: one eight-slot
+//! descriptor per grid-z tile, total `C` in 1..=64, fixed `U=80`. It allocates
+//! only 32 gate accumulators (eight down), independent of total logical rows.
+//! Descriptor pointers advance by 1928 bytes per tile; absolute slot IDs keep
+//! X/Y at their original bases. Legacy C16/C32 entries retain their schedule.
+//! Tiled offsets must fit both the physical 80-slot descriptor and `10*C`.
+//! All clamped slot IDs are validated before reading the expert pointer table.
 use super::*;
 use crate::lds::Transition;
 
@@ -59,6 +67,16 @@ const XSL: u8 = 83;
 /// `n_experts@88`: the extent of the `expert_weight_ptrs` table (the narrow entries' `SNEXP`, moved clear of `WAVE`).
 const SNEXP_W: u8 = 84;
 const SGPRS: u8 = 88;
+const TILE: u8 = 85;
+
+// A separate label namespace lets a rowtile and its singleton coexist in one image.
+fn lbl(spec: Spec, name: &str) -> String {
+    if spec.cap == Cap::C8 {
+        format!(".Lmqi4moe_{}_t8_{name}", spec.tag())
+    } else {
+        super::lbl(spec, name)
+    }
+}
 
 /// VGPR layout of a wide entry: the narrow [`Lay`] fields for the shared pieces (`xo` / `ya` are one lane
 /// register each, `acc` holds `C * chains` accumulators) plus the LDS addressing registers.
@@ -226,6 +244,9 @@ fn plan(arch: Arch, l: &WLay) -> Result<RegPlan, String> {
         SNEXP_W,
         1,
     )?;
+    if l.cap == SLOT_TILE {
+        declare(&mut regs, "row_tile", RKind::S, TILE, 1)?;
+    }
     let chains = u16::from(b.chains);
     for (name, base, len) in [
         ("thread_id", LANE, 1),
@@ -289,6 +310,8 @@ fn row_gate(b: &mut Builder, target: &str) -> R {
 
 pub(super) fn emit(spec: Spec, net: Network) -> Result<Emitted, String> {
     let l = WLay::new(spec)?;
+    let rowtiles = spec.cap == Cap::C8;
+    let lds_bytes = SLOT_TILE * 32 * 4 * u32::from(spec.lane_elems());
     let kernargs = KernargLayout::new(KERNARG_BYTES)
         .pointer_access("expert_weight_ptrs", 0, Access::ReadOnly)
         .pointer_access("expert_ids", 8, Access::ReadOnly)
@@ -309,20 +332,31 @@ pub(super) fn emit(spec: Spec, net: Network) -> Result<Emitted, String> {
         .hidden("reserved", 92, 4, "by_value");
     let kspec = KernelSpec {
         kernel_id: "mq_i4_moe_gemv".into(),
-        variant: spec.tag(),
+        variant: if rowtiles {
+            format!("{}_t8", spec.tag())
+        } else {
+            spec.tag()
+        },
         arch: spec.arch,
-        symbol: spec.symbol(),
+        symbol: if rowtiles {
+            format!("{}_t8", spec.symbol())
+        } else {
+            spec.symbol()
+        },
         kernargs,
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: true,
         workgroup_size: WORKGROUP_SIZE as u16,
-        group_segment_fixed_size: spec.lds_bytes(),
+        group_segment_fixed_size: lds_bytes,
         wave32: true,
         cu_mode: false,
     };
     let mut b = Builder::new(kspec, plan(spec.arch, &l)?);
     b.enable_delay_alu();
-    let slot = b.lds_slot("x_tile", 0, spec.lds_bytes())?;
+    if rowtiles {
+        b.enable_workgroup_id_z();
+    }
+    let slot = b.lds_slot("x_tile", 0, lds_bytes)?;
     prologue(&mut b, spec, &l)?;
     b.wait_all()?;
     match spec.kind {
@@ -379,6 +413,33 @@ pub(super) fn emit(spec: Spec, net: Network) -> Result<Emitted, String> {
     b.label(&lbl(spec, "reduce"))?;
     epilogue(&mut b, spec, &l)?;
     b.finish()
+}
+
+/// Stage the expert's slot IDs once, clamping duplicate lanes to its last live slot.
+fn load_slots(b: &mut Builder, l: &WLay) -> R {
+    let (sid, p) = (l.l.x, l.l.x + 7);
+    valu(
+        b,
+        &format!("v_min_u32_e32 v{p}, s{NSM1}, v{}", l.lane),
+        &[p],
+        &[l.lane],
+        &[NSM1],
+    )?;
+    valu(
+        b,
+        &format!("v_add_nc_u32_e32 v{p}, s{OFF0}, v{p}"),
+        &[p],
+        &[p],
+        &[OFF0],
+    )?;
+    valu(
+        b,
+        &format!("v_lshlrev_b32_e32 v{p}, 2, v{p}"),
+        &[p],
+        &[p],
+        &[],
+    )?;
+    gload(b, "global_load_b32", sid, p, SLOTS, "")
 }
 
 /// Kernarg loads, the work-item-derived LDS addresses (entry block: the M7 LDS bound executes it), the
@@ -469,6 +530,41 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
             ))
         }
     }
+    if spec.cap == Cap::C8 {
+        // gfx1201 packs y/z into the low/high halves of ttmp7.
+        sop(b, format!("s_lshr_b32 s{TILE}, ttmp7, 16"), &[TILE], &[])?;
+        sop(b, format!("s_cmp_eq_u32 s{SC}, 0"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_gt_u32 s{SC}, 64"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_eq_u32 s{SU}, {}", lit(80)), &[], &[SU])?;
+        branch(b, &format!("s_cbranch_scc0 {exit}"))?;
+        sop(b, format!("s_lshl_b32 s{TMP}, s{TILE}, 3"), &[TMP], &[TILE])?;
+        sop(b, format!("s_cmp_ge_u32 s{TMP}, s{SC}"), &[], &[TMP, SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_eq_u32 s{SDIV}, 0"), &[], &[SDIV])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_eq_u32 s{SK}, 0"), &[], &[SK])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        let mask = if spec.lane_elems() == 8 { 255 } else { 127 };
+        sop(
+            b,
+            format!("s_and_b32 s{TMP}, s{SK}, {}", lit(mask)),
+            &[TMP],
+            &[SK],
+        )?;
+        sop(b, format!("s_cmp_eq_u32 s{TMP}, 0"), &[], &[TMP])?;
+        branch(b, &format!("s_cbranch_scc0 {exit}"))?;
+        sop(
+            b,
+            format!("s_mul_i32 s{TMP}, s{TILE}, {}", lit(1928)),
+            &[TMP],
+            &[TILE],
+        )?;
+        for ptr in [EIDS, OFFS, SLOTS] {
+            add64(b, ptr, ptr, TMP)?;
+        }
+    }
     sop(
         b,
         format!("s_lshl_b32 s{ROWB}, s{ROWB}, 3"),
@@ -495,7 +591,20 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_cmp_gt_u32 s{NS}, {}", l.cap), &[], &[NS])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-    sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
+    if spec.cap == Cap::C8 {
+        sop(b, format!("s_mov_b32 s{TMP}, {}", lit(80)), &[TMP], &[])?;
+        // Bound both offsets: subtraction can otherwise wrap from UINT_MAX
+        // to a small apparently live count.
+        sop(
+            b,
+            format!("s_cmp_gt_u32 s{OFF0}, s{TMP}"),
+            &[],
+            &[OFF0, TMP],
+        )?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    } else {
+        sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
+    }
     sop(
         b,
         format!("s_cmp_gt_u32 s{OFF1}, s{TMP}"),
@@ -503,6 +612,18 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
         &[OFF1, TMP],
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    if spec.cap == Cap::C8 {
+        // The final tile may contain fewer than eight logical rows: its
+        // physical slot capacity does not enlarge the logical 10*C domain.
+        sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
+        sop(
+            b,
+            format!("s_cmp_gt_u32 s{OFF1}, s{TMP}"),
+            &[],
+            &[OFF1, TMP],
+        )?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    }
     // Expert id range check before the table index (the narrow entries' guard): an id at or past `n_experts`
     // (unsigned, so a negative id too) exits without a load or a store.
     sop(
@@ -512,6 +633,25 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
         &[EID, SNEXP_W],
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    if spec.cap == Cap::C8 {
+        sop(
+            b,
+            format!("{} s{NSM1}, s{NS}, -1", s_add_i32(a)),
+            &[NSM1],
+            &[NS],
+        )?;
+        load_slots(b, l)?;
+        // Every wave sees the same complete slot list, including clamped
+        // duplicate lanes. Reject uniformly before the table or any barrier.
+        valu(
+            b,
+            &format!("v_cmp_le_u32_e32 vcc_lo, s{TMP}, v{}", ll.x),
+            &[],
+            &[ll.x],
+            &[TMP],
+        )?;
+        branch(b, &format!("s_cbranch_vccnz {exit}"))?;
+    }
     sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
     add64(b, TPTR, WPTRS, TMP)?;
     smem(b, WPTR, 2, TPTR, 0)?;
@@ -665,12 +805,14 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
         &[SYS4],
         &[SYSTR],
     )?;
-    sop(
-        b,
-        format!("{} s{NSM1}, s{NS}, -1", s_add_i32(a)),
-        &[NSM1],
-        &[NS],
-    )?;
+    if spec.cap != Cap::C8 {
+        sop(
+            b,
+            format!("{} s{NSM1}, s{NS}, -1", s_add_i32(a)),
+            &[NSM1],
+            &[NS],
+        )?;
+    }
     // X descriptor: base Xrot, x_src_rows*x_row_stride*4 records (rows past it read 0).
     sop(b, format!("s_mov_b32 s{SRDX}, s{XROT}"), &[SRDX], &[XROT])?;
     sop(
@@ -773,29 +915,10 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
     // Slot metadata, one slot per hardware lane: lane p loads slot position min(p, n-1) of the expert (never
     // past its slots), derives the X byte offset (slot / x_row_div * x_row_stride * 4) and the Y byte offset
     // (slot * y_slot_stride * 4 + row-in-Y * 4). Slot positions are then read with `v_readlane_b32`.
-    let (sid, t0, p) = (ll.x, ll.x + 2, ll.x + 7);
-    valu(
-        b,
-        &format!("v_min_u32_e32 v{p}, s{NSM1}, v{}", l.lane),
-        &[p],
-        &[l.lane],
-        &[NSM1],
-    )?;
-    valu(
-        b,
-        &format!("v_add_nc_u32_e32 v{p}, s{OFF0}, v{p}"),
-        &[p],
-        &[p],
-        &[OFF0],
-    )?;
-    valu(
-        b,
-        &format!("v_lshlrev_b32_e32 v{p}, 2, v{p}"),
-        &[p],
-        &[p],
-        &[],
-    )?;
-    gload(b, "global_load_b32", sid, p, SLOTS, "")?;
+    let (sid, t0) = (ll.x, ll.x + 2);
+    if spec.cap != Cap::C8 {
+        load_slots(b, l)?;
+    }
     gather_offset(
         b,
         ll.xo,

@@ -237,6 +237,13 @@ pub struct Qwen4Bundle {
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
     pub(crate) npu_model_index: Option<Result<String, String>>,
+    /// Actually reserved D1 CPU-owned expert window rows (logical window rows; 0 =
+    /// none). Stored only by the loader after the real prewarm lands (see
+    /// [`Self::note_cpu_d1_wide_storage_prewarmed`]), never inferred from scope: a
+    /// wide window stays refused until it is nonzero. Storage only, never a
+    /// qualification: the routing slice still gates on the per-call lab-wide scope
+    /// and the caller's live thread-local capacity.
+    pub(crate) cpu_d1_storage_rows: usize,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -905,6 +912,7 @@ impl Qwen4Bundle {
             ep_seal: None,
             trunk_overlay: None,
             npu_model_index: None,
+            cpu_d1_storage_rows: 0,
         })
     }
 
@@ -1108,6 +1116,178 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .and_then(Qwen4GpuForward::native_mtp_cpu_window_rows)
+    }
+    /// Actually reserved D1 CPU-owned expert storage rows (logical window rows) of
+    /// this load: `0` when no lab-wide 64-row window was admitted AND prewarmed
+    /// (the legacy default, on-demand growth, byte-identical placement), else the
+    /// stored admitted + prewarmed window saturating at
+    /// [`hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS`]. Storage only —
+    /// never a qualification, never a default: wide routing still reads
+    /// [`Self::cpu_qualified_verify_rows`] with the per-call lab-wide scope, which
+    /// additionally gates on the caller's live thread-local capacity.
+    /// Stored (loader-proven), never inferred from scope: set to nonzero only by
+    /// [`Self::note_cpu_d1_wide_storage_prewarmed`] after the real prewarm lands, so
+    /// a wide window stays refused — fail-closed, never a metadata claim.
+    pub fn cpu_d1_storage_capacity_rows(&self) -> usize {
+        self.cpu_d1_storage_rows
+    }
+
+    /// Common actual CPU-owned expert capacity: the BINDING minimum of every actually
+    /// owned store — the stored D1 window when a D1 splice is armed, and the minimum
+    /// live D2 executor capacity across armed split layers. Unowned modes contribute
+    /// nothing (they must not mask an owned one): D1 storage 0 on a D2-only load does
+    /// NOT clip the D2 executor's 64, and absent executors do not clip a D1 64.
+    /// `0` when no CPU expert mode owns storage. Storage only, never qualification:
+    /// routing still gates on the per-call lab-wide scope + live capacities.
+    /// Rate reads this as the physical cap (with the still-frozen qualified getter).
+    pub fn cpu_storage_capacity_rows(&self) -> usize {
+        let d1 = self
+            .has_cpu_deferred_experts()
+            .then(|| self.cpu_d1_storage_rows);
+        match (d1, self.execution.as_ref()) {
+            (Some(d1), Some(forward)) => match forward.d2_storage_capacity_rows() {
+                Some(d2) => d1.min(d2),
+                None => d1,
+            },
+            (Some(d1), None) => d1,
+            (None, Some(forward)) => forward.d2_storage_capacity_rows().unwrap_or(0),
+            (None, None) => 0,
+        }
+    }
+
+    /// Qualified CPU verify width of this load, from actual storage plus scope:
+    /// [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] (4) on the default route;
+    /// the actual stored window only when `lab_armed` (the caller's per-call lab-wide
+    /// presence gate, from the canonical override signal on the sealing device —
+    /// never a stored constant) AND the admitted+prewarmed storage above covers it.
+    /// The frozen GPU width is informational arm width only — it never narrows the
+    /// CPU result below actual storage (wide8 presence with 64-row storage qualifies
+    /// the FULL R1..64 CPU backend for both lab arms). No override, no constant-64
+    /// claim: without the scope (or without admitted storage) this stays 4.
+    /// Pass the ACTUAL per-call override presence: storage without presence must not
+    /// qualify (prewarmed 64 + cleared override ⇒ product 4/K3, not a GPU fallback).
+    pub fn cpu_qualified_verify_rows(&self, gpu: &Gpu, lab_armed: bool) -> usize {
+        use hipfire_dispatch::families::moe::CpuWideVerifyScope;
+        let scope = CpuWideVerifyScope::from_lab_presence(
+            lab_armed,
+            crate::gpu_forward::qwen4_row_exact_verify_rows(gpu),
+        );
+        scope.qualified_max_rows(self.cpu_storage_capacity_rows())
+    }
+
+    /// Planned D1 storage need in rows: 0 unless carrying an admitted native capture
+    /// (the loader reserves the capture before any window grows it); the native-MTP
+    /// capture rows are the window need (`max_k` drafts + 1, saturating the physical
+    /// bound). `None` max_k (AR load) requests nothing. Pure, no allocation.
+    pub fn cpu_d1_requested_window_rows(&self) -> usize {
+        self.native_mtp_capture_rows()
+    }
+
+    /// Whether the load qualifies for a lab-wide D1 reservation before prewarm: the
+    /// single non-EP/PP/lane Flash-Next scope with an armed D1 splice
+    /// ([`Self::has_cpu_deferred_experts`]) whose allocated GPU scratch actually holds
+    /// the capture rows. D2-only loads (armed split, no D1 splice) are excluded: they
+    /// reserve their own executor storage and must never prewarm an unused D1 pinned
+    /// stage (the TLS host-slot scratch is shared; the pinned stage is per-mode).
+    /// Scope gate only (actual rows come from [`Self::cpu_d1_requested_window_rows`]);
+    /// the stored capacity above stays 0 until the real prewarm lands.
+    pub fn cpu_d1_owned_single_fn(&self) -> bool {
+        if !self.config.profile.is_flash_next()
+            || self.ep.is_some()
+            || self.pp.is_some()
+            || self.pp_band.is_some()
+            || self.lanes.is_some()
+        {
+            return false;
+        }
+        if !self.has_cpu_deferred_experts() {
+            return false;
+        }
+        let Some(forward) = self.execution.as_ref() else {
+            return false;
+        };
+        let need = self.cpu_d1_requested_window_rows();
+        need > 0
+            && forward.scratch.max_chunk >= need
+            && crate::gpu_forward::qwen4_spec_logit_rows(forward.scratch.max_chunk) >= need
+    }
+
+    /// Geometry `(hidden, intermediate, top_k)` the D1 splice actually runs: the
+    /// model config (`None` for zero `top_k`, which admits no expert window).
+    pub fn cpu_d1_geometry(&self) -> Option<(usize, usize, usize)> {
+        (self.config.num_experts_per_tok != 0).then_some((
+            self.config.hidden_size,
+            self.config.moe_intermediate_size,
+            self.config.num_experts_per_tok,
+        ))
+    }
+
+    /// Record the loader's real D1 prewarm: the actually reserved window `rows`
+    /// (logical rows, 1..=STORAGE, derived from [`cpu_d1_required_storage_rows`] and
+    /// reserved on the execution thread) after BOTH reservations land — the pinned
+    /// transfer stage (`2 * (rows * dim + rows * top_k)` f32 values, exactly
+    /// `moe_cpu_experts`' `(n_x + slots) * 8` stage bytes / 4) and the host-slot
+    /// scratch (`rows * top_k` slots) — with the GPU full-slot views checked
+    /// Refuses (returns `false`, storing nothing) when the scope/need is absent, when
+    /// `rows` exceeds the physical storage bound, or when live thread-local capacity
+    /// ([`hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows`]) does not
+    /// cover `rows` on the calling thread: no fake admitted metadata ever lands.
+    /// Called once, before the first window; retained pointer invalidations precede
+    /// the reservations (never after), so growth cannot strand live views.
+    pub fn note_cpu_d1_wide_storage_prewarmed(&mut self, rows: usize, device_id: i32) -> bool {
+        let Some((dim, mi, top_k)) = self.cpu_d1_geometry() else {
+            return false;
+        };
+        if rows == 0
+            || rows > hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS
+            || !self.cpu_d1_owned_single_fn()
+        {
+            return false;
+        }
+        let need = crate::expert_residency::cpu_d1_required_storage_rows(
+            true,
+            true,
+            self.cpu_d1_requested_window_rows(),
+        );
+        if need == 0 || rows > need {
+            return false;
+        }
+        let live = hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows(
+            dim, mi, top_k, device_id,
+        );
+        if live < rows {
+            return false;
+        }
+        self.cpu_d1_storage_rows = rows;
+        true
+    }
+
+    /// Load-only D2 prewarm/reserve for the REAL requested window rows: resize every
+    /// armed split layer's default-4 executor to `requested_rows` (preserving the
+    /// load-immutable Return/Ready/Join selections), on the execution thread, BEFORE
+    /// the first window — never with a window in flight (the old executor is freed
+    /// before its replacement is built, so no old+new overlap peak exists to charge).
+    /// Unarmed layers (no cold owner / no executor) and executors that already cover
+    /// the request are a no-op. Returns whether any layer resized. A reservation
+    /// failure leaves that layer without an executor and returns the error: the caller
+    /// must fail the load (free GPU, load error), never run narrowed or silent.
+    pub fn reserve_cpu_d2_wide_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        requested_rows: usize,
+    ) -> Result<bool, BundleError> {
+        let Some(forward) = self.execution.as_mut() else {
+            return Ok(false);
+        };
+        let config = &self.config;
+        let mut resized_any = false;
+        for layer in forward.moe.iter_mut().flatten() {
+            let resized = layer
+                .reserve_d2_wide_rows(gpu, config, requested_rows)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+            resized_any |= resized;
+        }
+        Ok(resized_any)
     }
 
     /// Trunk layers armed for the opt-in CPU-cold/GPU-hot routed slot join.
@@ -1443,6 +1623,27 @@ impl Qwen4Bundle {
         // native-MTP load: bind it with the head, never on a request.
         self.slowlink_bind_pending_save(gpu)?;
         Ok(())
+    }
+
+    /// Reserve the GDN capture ring the first native MTP window captures into,
+    /// before any window or captured graph can grow it: the support and rows of
+    /// [`crate::mtp_spec::native_mtp_capture`] for a `max_k`-draft window, ensured
+    /// on the state ring (a no-op where the route captures no rows). The caller
+    /// passes the resource (reserve) drafts; execution keeps its own `max_k`.
+    /// Staged allocation failure leaves the bundle untouched.
+    pub fn prepare_native_mtp_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        max_k: usize,
+    ) -> Result<(), BundleError> {
+        let Some((_, rows)) =
+            crate::mtp_spec::native_mtp_capture(gpu, &self.config, self.state_format.gdn, max_k)
+        else {
+            return Ok(());
+        };
+        self.state
+            .ensure_row_capture(gpu, rows, self.config.linear_conv_kernel_dim - 1)
+            .map_err(BundleError::State)
     }
 
     /// Native MTP attaches only where the profile's weights carry an MTP head
@@ -1872,15 +2073,21 @@ impl Qwen4Bundle {
                 "Qwen4 spec forward cannot process an empty block".to_string(),
             ));
         }
-        if !prefill
-            && self.has_cpu_deferred_experts()
-            && tokens.len() > crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
-        {
-            return Err(BundleError::Forward(format!(
-                "Qwen4 spec verify of {} rows exceeds the {}-row CPU routed-expert window",
-                tokens.len(),
-                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
-            )));
+        if !prefill && self.has_cpu_deferred_experts() {
+            let qualified = self
+                .cpu_qualified_verify_rows(
+                    gpu,
+                    crate::gpu_forward::Qwen4GpuForward::cpu_lab_override_present(gpu),
+                )
+                .max(crate::program::QWEN4_CPU_SPLICE_MAX_ROWS);
+            if tokens.len() > qualified {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 spec verify of {} rows exceeds the {}-row qualified CPU routed-expert window (legacy {})",
+                    tokens.len(),
+                    qualified,
+                    crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+                )));
+            }
         }
         let max_chunk = self
             .execution
@@ -2051,21 +2258,360 @@ impl Qwen4Bundle {
         .map_err(BundleError::Hip)
     }
 
-    /// Rows a 2+ row eager verify would admit as row-exact right now: the
-    /// per-GPU proven rows ([`crate::gpu_forward::qwen4_row_exact_verify_rows`])
-    /// guarded by this bundle's AR launch mode and QSA attention policy
-    /// (`Qwen4GpuForward::guarded_wide_verify_rows`), or the historic
-    /// [`rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS`] without forward
-    /// resources. The n-gram copy lane caps a window's take at this minus one.
+    /// Effective rows for an eager verify: admitted arithmetic (with the AR
+    /// reference bound at entry), CPU-expert restriction, physical capacity,
+    /// and the actually allocated forward/logit/argmax scratch. Before forward
+    /// resources are attached this retains the historic conservative getter.
+    /// The n-gram copy lane caps a window's take at this minus one.
     pub(crate) fn row_exact_verify_rows(&self, gpu: &Gpu) -> usize {
-        self.execution.as_ref().map_or(
-            rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
-            |forward| forward.guarded_wide_verify_rows(self, gpu),
+        let Some(forward) = self.execution.as_ref() else {
+            return rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
+        };
+        let logits_rows = self.spec_logits.as_ref().map_or(0, |tensor| {
+            tensor
+                .numel()
+                .checked_div(self.config.vocab_size)
+                .unwrap_or(0)
+        });
+        let top1_rows = self
+            .spec_top1
+            .as_ref()
+            .map_or(0, |tensor| tensor.byte_size() / std::mem::size_of::<i32>());
+        forward
+            .guarded_wide_verify_rows(self, gpu)
+            .min(logits_rows)
+            .min(top1_rows)
+    }
+
+    /// The actual AR arithmetic reference latched by the most recent
+    /// multi-row verify attempt, not the replay backend requested by flags.
+    /// Singleton forwards do not bind a verify reference.
+    #[cfg(feature = "lab")]
+    pub(crate) fn last_verify_reference(
+        &self,
+    ) -> Option<rdna_compute::prefill_invariant::Qwen4VerifyReference> {
+        self.execution
+            .as_ref()
+            .and_then(|forward| forward.last_verify_reference)
+    }
+
+    /// Checked device allocation plan for this loaded owner's capture ring,
+    /// both halves and all retained inputs/output/table, not a measured peak.
+    #[cfg(feature = "lab")]
+    pub(crate) fn row_capture_planned_bytes(&self, rows: usize) -> Option<usize> {
+        Qwen4State::row_capture_bytes_scoped(
+            &self.config,
+            self.state_format.gdn,
+            rows,
+            self.state.gdn.len(),
         )
     }
+
+    /// Checked byte census of the admitted CPU-owned expert window (D1 + D2): the real host
+    /// transfer-stage bytes, host-slot count, full-slot GPU view extents and the SUM of
+    /// actual D2 executor instance bytes at the stored common capacity: the SourceB
+    /// [`storage_bytes`]/[`transfer_bytes_for`] authorities plus the mapped cold-return
+    /// and `masked_indices` device bytes per armed layer, with the thread-local host-slot
+    /// scratch pool for the stored rows — every formula checked
+    /// (the existing [`expert_residency`] + [`gpu_forward`] + SourceB authorities),
+    /// `None` on overflow (the caller refuses before any allocation). No measured peak,
+    /// no second planner: only the D1 stage row-count term is D1-specific (0 on a
+    /// D2-only load reports the D2 shares and skips the pinned stage); input/output
+    /// stages are the one D1 stage formula, GPU views are the allocated
+    /// forward/provider extents, capture is the planned ring,
+    /// [`Self::cpu_d1_requested_window_rows`] is the plan need used pre-reserve.
+    /// `0`-storage loads report zeros (legacy default: nothing reserved).
+    pub fn cpu_storage_bytes(&self) -> Option<CpuStorageBytes> {
+        let rows = self.cpu_storage_capacity_rows();
+        if rows == 0 {
+            return Some(CpuStorageBytes::default());
+        }
+        let Some((dim, mi, top_k)) = self.cpu_d1_geometry() else {
+            return None;
+        };
+        // D1 owns the pinned transfer stage only when a D1 splice is armed; a D2-only
+        // load reports the shared scratch + D2 bytes with a 0 stage (nothing pinned).
+        let d1_stage_values = if self.has_cpu_deferred_experts() {
+            crate::expert_residency::cpu_d1_stage_values(dim, top_k, rows)?
+        } else {
+            0
+        };
+        let slots = crate::expert_residency::cpu_d1_host_slots(rows, top_k)?;
+        let stage_bytes = d1_stage_values.checked_mul(4)?;
+        let forward = self.execution.as_ref()?;
+        let need = |have: usize, need: usize| (have >= need).then_some(need);
+        let x_rot = need(forward.scratch.ffn_output.numel(), rows.checked_mul(dim)?)?;
+        let topk = need(forward.scratch.moe_topk_indices.numel(), slots)?;
+        let _ = need(forward.scratch.moe_topk_weights.numel(), topk)?;
+        let expanded = need(
+            forward.scratch.moe_down_expanded.numel(),
+            slots.checked_mul(dim)?,
+        )?;
+        let spec = crate::gpu_forward::qwen4_forward_device_bytes(
+            &self.config,
+            forward.scratch.max_chunk,
+            forward.scratch.mode,
+        )?;
+        let capture = self.row_capture_planned_bytes_lab(rows)?;
+        let (d2_input, d2_mask, d2_output, d2_transfer, d2_mapped, d2_device) =
+            self.cpu_d2_storage_bytes().unwrap_or((0, 0, 0, 0, 0, 0));
+        // The thread-local host-slot scratch the settled reservation actually grew:
+        // the live pool capacity translated back through SourceB's reserve formulas is
+        // thread-local and mutable state, so the settled census charges the SAME checked
+        // requested-size pool the preflight plan computed, never a live read.
+        let host_scratch_bytes = {
+            let count_f32 = |n: usize| n.checked_mul(4);
+            let count_u32 = |n: usize| n.checked_mul(4);
+            let slots2mi = slots.checked_mul(mi)?;
+            count_f32(slots2mi.checked_mul(2)?)?
+                .checked_add(count_f32(slots2mi)?)?
+                .checked_add(count_f32(slots.checked_mul(dim)?)?)?
+                .checked_add(count_f32((2usize).checked_mul(mi)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?.checked_mul(2)?)?
+                .checked_add(
+                    std::mem::size_of::<usize>()
+                        .checked_mul(slots.checked_add(1)?)?
+                        .checked_mul(2)?,
+                )?
+        };
+        Some(CpuStorageBytes {
+            rows,
+            slots,
+            stage_values: d1_stage_values,
+            stage_bytes,
+            x_rot_elements: x_rot,
+            topk_elements: topk,
+            down_expanded_elements: expanded,
+            forward_device_bytes: spec,
+            capture_bytes: capture,
+            d2_input_bytes: d2_input,
+            d2_mask_bytes: d2_mask,
+            d2_output_bytes: d2_output,
+            d2_transfer_bytes: d2_transfer,
+            d2_mapped_bytes: d2_mapped,
+            d2_device_bytes: d2_device,
+            host_scratch_bytes,
+        })
+    }
+
+    /// Actual D2 executor storage bytes summed over live instances: per armed layer the
+    /// SourceB [`storage_bytes`] triple for its allocated capacity rows plus the
+    /// [`transfer_bytes_for`] up+down for this load's cold slots (all-cold upper bound
+    /// `slots`), the mapped cold-return bytes (0 on the copy transport) and the
+    /// `masked_indices` device bytes — each checked (overflow ⇒ `None` ⇒ caller refuses
+    /// before allocation). `None` when no layer owns an executor (D2 contributes nothing)
+    /// or on overflow; `(0,0,0,0,0,0)` never returned for an armed layer (capacity rows
+    /// are always ≥ 1).
+    pub(crate) fn cpu_d2_storage_bytes(
+        &self,
+    ) -> Option<(usize, usize, usize, usize, usize, usize)> {
+        use hipfire_dispatch::cpu_split::CpuSplitExecutor;
+        let forward = self.execution.as_ref()?;
+        let mut total = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut armed = false;
+        for layer in forward.moe.iter().flatten() {
+            let Some(executor) = layer.cpu_split_storage_executor() else {
+                continue;
+            };
+            armed = true;
+            let cap = executor.capacity_rows();
+            let (input, mask, output) =
+                CpuSplitExecutor::storage_bytes(cap, executor.dim(), executor.top_k());
+            if input == usize::MAX || mask == usize::MAX || output == usize::MAX {
+                return None;
+            }
+            let Some((_, _, top_k)) = self.cpu_d1_geometry() else {
+                return None;
+            };
+            let slots = cap.checked_mul(top_k)?;
+            let mapped =
+                executor.return_mode() == hipfire_dispatch::cpu_split::D2ReturnMode::Mapped;
+            let (up, down) =
+                CpuSplitExecutor::transfer_bytes_for(executor.dim(), top_k, mapped, cap, slots);
+            if up == usize::MAX || down == usize::MAX {
+                return None;
+            }
+            let mapped_bytes = if mapped {
+                executor.dim().checked_mul(slots)?.checked_mul(4)?
+            } else {
+                0
+            };
+            total.0 = total.0.checked_add(input)?;
+            total.1 = total.1.checked_add(mask)?;
+            total.2 = total.2.checked_add(output)?;
+            total.3 = total.3.checked_add(up)?.checked_add(down)?;
+            total.4 = total.4.checked_add(mapped_bytes)?;
+            total.5 = total.5.checked_add(mask)?;
+        }
+        armed.then_some(total)
+    }
+
+    /// Checked REQUESTED storage plan for the loader's load-time CPU preflight: the
+    /// sum of actual armed-D2 per-layer requested bytes at `requested_rows` (replacement
+    /// executors) + the D1 owned stage for `d1_rows` (0 = D2-only, skip the pinned stage)
+    /// + the called-thread host-slot scratch real reservation bytes for `requested_rows`
+    /// + reconciled-not-charged GPU views (full-slot views must fit the allocated
+    /// forward scratch) and the planned capture ring. `None` on any overflow, on missing
+    /// geometry/executors, or when the settled GPU scratch cannot hold the request.
+    /// `0`-request loads report zeros (legacy default: nothing reserved). Called BEFORE
+    /// any allocation; the sibling [`Self::cpu_storage_bytes`] census reads the ACTUAL
+    /// settled instances so the loader reconciles plan with post-reserve fact. No
+    /// allocation, no mutation, no Vec: read through the existing authorities. The caller
+    /// owns the host/device charge of these bytes and the sequential-replacement
+    /// discipline (old freed before new is built), so no old+new peak is claimed here.
+    pub fn cpu_requested_storage_bytes(
+        &self,
+        requested_rows: usize,
+        d1_rows: usize,
+    ) -> Option<CpuStorageBytes> {
+        if requested_rows > hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS {
+            return None;
+        }
+        if requested_rows == 0 {
+            return Some(CpuStorageBytes::default());
+        }
+        if d1_rows > requested_rows {
+            return None;
+        }
+        let Some((dim, mi, top_k)) = self.cpu_d1_geometry() else {
+            return None;
+        };
+        let forward = self.execution.as_ref()?;
+        // D1 owned stage: real f32 values + bytes for the D1-owned rows only (0 when
+        // D2-only; the TLS host-slot scratch below is still needed by D2). `slots` is
+        // the full-request host-slot count, so the plan's view terms match the full-slot
+        // extents the settled census reports.
+        let d1_stage_values = if d1_rows > 0 {
+            crate::expert_residency::cpu_d1_stage_values(dim, top_k, d1_rows)?
+        } else {
+            0
+        };
+        let d1_stage_bytes = d1_stage_values.checked_mul(4)?;
+        let slots = requested_rows.checked_mul(top_k)?;
+        // The thread-local host-slot scratch the loader reserves for the request: the
+        // actual `MOE_SCRATCH` vector capacities from SourceB's reserve formulas (gu,
+        // hidden, dn, gather, order/group_id/slot_group/slot_si, group_start/group_off),
+        // checked so any overflow refuses before allocation. D1 and D2 share the one
+        // TLS pool (`reserve_moe_cpu_host_slot_scratch(dim, mi, max_slots)`); the plan
+        // charges the request's full pool once, never per mode and never per layer.
+        let host_scratch_bytes = {
+            let count_f32 = |n: usize| n.checked_mul(4);
+            let count_u32 = |n: usize| n.checked_mul(4);
+            let slots2mi = slots.checked_mul(mi)?;
+            count_f32(slots2mi.checked_mul(2)?)?
+                .checked_add(count_f32(slots2mi)?)?
+                .checked_add(count_f32(slots.checked_mul(dim)?)?)?
+                .checked_add(count_f32((2usize).checked_mul(mi)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?.checked_mul(2)?)?
+                .checked_add(
+                    std::mem::size_of::<usize>()
+                        .checked_mul(slots.checked_add(1)?)?
+                        .checked_mul(2)?,
+                )?
+        };
+        // Requested D2 bytes: the same SourceB authorities the settled census reads,
+        // evaluated at the REQUESTED rows (the replacement executors' capacity) with the
+        // CURRENT per-layer mapped/copy selection. Old+new overlap is not charged: the
+        // replacement discipline frees the old executor before building the new one.
+        use hipfire_dispatch::cpu_split::CpuSplitExecutor;
+        let mut d2_input = 0usize;
+        let mut d2_mask = 0usize;
+        let mut d2_output = 0usize;
+        let mut d2_transfer = 0usize;
+        let mut d2_mapped = 0usize;
+        let mut d2_device = 0usize;
+        for layer in forward.moe.iter().flatten() {
+            let Some(executor) = layer.cpu_split_storage_executor() else {
+                continue;
+            };
+            let (input, mask, output) =
+                CpuSplitExecutor::storage_bytes(requested_rows, executor.dim(), executor.top_k());
+            if input == usize::MAX || mask == usize::MAX || output == usize::MAX {
+                return None;
+            }
+            let mapped =
+                executor.return_mode() == hipfire_dispatch::cpu_split::D2ReturnMode::Mapped;
+            let (up, down) = CpuSplitExecutor::transfer_bytes_for(
+                executor.dim(),
+                top_k,
+                mapped,
+                requested_rows,
+                slots,
+            );
+            if up == usize::MAX || down == usize::MAX {
+                return None;
+            }
+            if mapped {
+                d2_mapped =
+                    d2_mapped.checked_add(executor.dim().checked_mul(slots)?.checked_mul(4)?)?;
+            }
+            d2_device = d2_device.checked_add(mask)?;
+            d2_input = d2_input.checked_add(input)?;
+            d2_mask = d2_mask.checked_add(mask)?;
+            d2_output = d2_output.checked_add(output)?;
+            d2_transfer = d2_transfer.checked_add(up)?.checked_add(down)?;
+        }
+        let need = |have: usize, need: usize| (have >= need).then_some(need);
+        let x_rot_elements = need(
+            forward.scratch.ffn_output.numel(),
+            requested_rows.checked_mul(dim)?,
+        )?;
+        let topk_elements = need(forward.scratch.moe_topk_indices.numel(), slots)?;
+        let _ = need(forward.scratch.moe_topk_weights.numel(), topk_elements)?;
+        let down_expanded_elements = need(
+            forward.scratch.moe_down_expanded.numel(),
+            slots.checked_mul(dim)?,
+        )?;
+        let forward_device_bytes = crate::gpu_forward::qwen4_forward_device_bytes(
+            &self.config,
+            forward.scratch.max_chunk,
+            forward.scratch.mode,
+        )?;
+        let capture_bytes = self.row_capture_planned_bytes_lab(requested_rows)?;
+        Some(CpuStorageBytes {
+            rows: requested_rows,
+            slots,
+            stage_values: d1_stage_values,
+            stage_bytes: d1_stage_bytes,
+            x_rot_elements,
+            topk_elements,
+            down_expanded_elements,
+            forward_device_bytes,
+            capture_bytes,
+            d2_input_bytes: d2_input,
+            d2_mask_bytes: d2_mask,
+            d2_output_bytes: d2_output,
+            d2_transfer_bytes: d2_transfer,
+            d2_mapped_bytes: d2_mapped,
+            d2_device_bytes: d2_device,
+            host_scratch_bytes,
+        })
+    }
+
+    /// [`Self::row_capture_planned_bytes`] without the lab gate: the loader's
+    /// production prewarm path reads the same checked plan the lab oracle does.
+    pub(crate) fn row_capture_planned_bytes_lab(&self, rows: usize) -> Option<usize> {
+        Qwen4State::row_capture_bytes_scoped(
+            &self.config,
+            self.state_format.gdn,
+            rows,
+            self.state.gdn.len(),
+        )
+    }
+
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
-    /// active snapshot ticket brackets, without re-running them; the ticket
-    /// stays active for the caller's commit or restore.
+    /// active snapshot ticket brackets, replaying only the captured recurrence
+    /// (not projections); the ticket stays active for commit or restore.
     pub(crate) fn rollback_verify_rows_retain(
         &mut self,
         gpu: &mut Gpu,
@@ -3743,6 +4289,32 @@ impl Qwen4Bundle {
         self.state_format
     }
 
+    /// The exact singleton AR launch reference (`Eager` = ordinary HIP launches,
+    /// `Recorded` = retained-body route), from the attached forward's production
+    /// predicate; `None` while the forward is not attached. For the exact-load
+    /// chooser dynamic-route invalidation and the AR cost receipt n=1.
+    pub fn ar_verify_reference(
+        &self,
+        gpu: &Gpu,
+    ) -> Option<rdna_compute::prefill_invariant::Qwen4VerifyReference> {
+        let forward = self.execution.as_ref()?;
+        Some(match forward.ar_launch_reference(self, gpu) {
+            crate::gpu_forward::Qwen4ArLaunch::Eager => {
+                rdna_compute::prefill_invariant::Qwen4VerifyReference::Eager
+            }
+            crate::gpu_forward::Qwen4ArLaunch::Recorded => {
+                rdna_compute::prefill_invariant::Qwen4VerifyReference::Recorded
+            }
+        })
+    }
+
+    /// Measured native MTP capture rows: the state ring's actual
+    /// `row_capture_rows` (0 where the route captures no rows), not a
+    /// qualified cap or planner value. For the immutable load descriptor.
+    pub fn native_mtp_capture_rows(&self) -> usize {
+        self.state.row_capture_rows()
+    }
+
     /// Stage the exact lane store: `max_lanes` request owners, at most
     /// `row_budget` decode lanes per step. Lane states are allocated on first
     /// admission into a slot. With `spec` every lane is an MTP lane (native
@@ -3775,7 +4347,11 @@ impl Qwen4Bundle {
         }
         if let Some(spec) = spec {
             let verify_rows = if self.has_cpu_deferred_experts() {
-                crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+                self.cpu_qualified_verify_rows(
+                    gpu,
+                    crate::gpu_forward::Qwen4GpuForward::cpu_lab_override_present(gpu),
+                )
+                .max(crate::program::QWEN4_CPU_SPLICE_MAX_ROWS)
             } else {
                 crate::gpu_forward_lanes::LANE_MAX_ROWS
             };
@@ -5269,6 +5845,54 @@ fn first_bundle_error(results: [Result<(), BundleError>; 7]) -> Result<(), Bundl
         }
     }
     first.map_or(Ok(()), Err)
+}
+
+/// Checked byte census of the admitted CPU-owned expert window (D1 + D2): the real
+/// host transfer-stage bytes, host-slot count, full-slot GPU view extents and the
+/// SUM of actual D2 executor instance bytes at the stored common capacity, plus the
+/// real thread-local host-slot scratch pool bytes and the mapped cold-return bytes.
+/// Checked, `None` on overflow; `0`-storage loads report zeros (legacy default:
+/// nothing reserved). Read both pre-reserve (the REQUESTED plan:
+/// [`Self::cpu_requested_storage_bytes`]) and post-reserve (the settled instances:
+/// [`Self::cpu_storage_bytes`]) so the loader reconciles plan with fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuStorageBytes {
+    /// Logical window rows actually reserved (`0` = legacy default).
+    pub rows: usize,
+    /// Computed host slots (`rows * top_k`; 640 at the physical 64 x top_k 10).
+    pub slots: usize,
+    /// Pinned transfer-stage f32 values (`2 * (rows * dim + rows * top_k)`).
+    pub stage_values: usize,
+    /// Pinned transfer-stage bytes (`stage_values * 4`).
+    pub stage_bytes: usize,
+    /// Full-slot `x_rot` view elements covered (`rows * dim`).
+    pub x_rot_elements: usize,
+    /// Full-slot router `topk` view elements covered (`slots`).
+    pub topk_elements: usize,
+    /// Full-slot expanded-down view elements covered (`slots * dim`).
+    pub down_expanded_elements: usize,
+    /// Allocated forward device bytes at the attached chunk/scratch plan.
+    pub forward_device_bytes: u64,
+    /// Planned native-MTP capture-ring bytes at `rows`.
+    pub capture_bytes: usize,
+    /// SUM of live D2 executor `input` bytes over armed layers (0 = no D2 owner).
+    pub d2_input_bytes: usize,
+    /// SUM of live D2 executor `mask` bytes over armed layers (0 = no D2 owner).
+    pub d2_mask_bytes: usize,
+    /// SUM of live D2 executor `output` bytes over armed layers (0 = no D2 owner).
+    pub d2_output_bytes: usize,
+    /// SUM of live D2 executor transfer up+down bytes over armed layers (0 = none).
+    pub d2_transfer_bytes: usize,
+    /// SUM of requested/live D2 mapped cold-return bytes over mapped layers (0 = copy).
+    /// Host-mapped memory, never a device allocation; the charge is the host/GTT side.
+    pub d2_mapped_bytes: usize,
+    /// SUM of requested/live D2 device bytes (the `masked_indices` malloc per layer).
+    /// The pinned/mapped transfer buffers above are host allocations; this field is
+    /// the only device-side D2 allocation the preflight charges to device memory.
+    pub d2_device_bytes: usize,
+    /// Called-thread `MOE_SCRATCH` host-slot scratch pool bytes for the window (0 =
+    /// legacy default). D1 and D2 share the one TLS pool; charged once per request.
+    pub host_scratch_bytes: usize,
 }
 
 #[derive(Debug)]

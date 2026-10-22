@@ -2344,7 +2344,7 @@ fn forward_lanes_scoped(
                             // `lane_layer_moe`).
                             if let Some(runtime) = lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer)
                             {
-                                moe.routed_experts = runtime.routed_view(!prefill, r, rr);
+                                moe.routed_experts = runtime.routed_view(!prefill, r, rr, false, 8);
                             }
                             // Under EP the invocation runs the singleton's
                             // gathered forward: the row gather, the few-row

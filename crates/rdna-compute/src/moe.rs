@@ -3113,6 +3113,125 @@ impl Gpu {
         } else {
             (MODULE, 1)
         };
+        // Only the frozen eager admission selects the physical eight-row PM
+        // tile. Narrow, capture and generic prefill keep their original ABI.
+        if batch_size > 8
+            && self.row_tile_twin_enabled(crate::gemv::WideTwinFamily::Mq4, batch_size)
+        {
+            if m != 2560 || k != 640 || k_top != 10 {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "unsupported legacy MQ4 down row-tile shape",
+                ));
+            }
+            let symbol = match self.arch.as_str() {
+                "gfx1151" => "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1151",
+                "gfx1201" => "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1201",
+                _ => {
+                    return Err(hip_bridge::HipError::new(
+                        1,
+                        "unsupported legacy MQ4 down row-tile architecture",
+                    ))
+                }
+            };
+            // The full-R output/hidden/indices spans above already hold; only
+            // the pointer table and the signed device window remain to check.
+            // Caller n_exp is authoritative (prefix table selection allowed):
+            // never recomputed from allocation capacity.
+            if n_exp == 0 {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "invalid MQ4 down pointer table",
+                ));
+            }
+            let n_experts_val = i32::try_from(n_exp).map_err(|_| {
+                hip_bridge::HipError::new(1, "MQ4 down pointer-table count exceeds i32")
+            })?;
+            require_span(expert_ptrs, &[n_exp, 8], "MQ4 down row-tile pointer table")?;
+            let rows_val = i32::try_from(batch_size)
+                .map_err(|_| hip_bridge::HipError::new(1, "MQ4 down row count exceeds i32"))?;
+            // Device indexing is signed i32, including the complete window.
+            if batch_size
+                .checked_mul(k_top)
+                .and_then(|n| n.checked_mul(k))
+                .is_none_or(|n| n > i32::MAX as usize)
+                || batch_size
+                    .checked_mul(k_top)
+                    .and_then(|n| n.checked_mul(m))
+                    .is_none_or(|n| n > i32::MAX as usize)
+            {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "MQ4 down device offset exceeds i32",
+                ));
+            }
+            self.ensure_legacy_mq4_rowtile_pm_entry(symbol)?;
+            let pp = expert_ptrs.buf.as_ptr();
+            let ip = topk_indices.buf.as_ptr();
+            let xp = hidden_batch.buf.as_ptr();
+            let yp = expert_outputs.buf.as_ptr();
+            let m_val = 2560i32;
+            let k_val = 640i32;
+            let total_r = rows_val;
+            let kt_val = 10i32;
+            let mut params = [
+                &pp as *const _ as *mut c_void,
+                &ip as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &total_r as *const _ as *mut c_void,
+                &n_experts_val as *const _ as *mut c_void,
+                &kt_val as *const _ as *mut c_void,
+            ];
+            let bytes = batch_size.saturating_mul(k_top).saturating_mul(
+                m.saturating_mul(k.div_ceil(128).saturating_mul(68))
+                    .saturating_add(k.saturating_mul(4))
+                    .saturating_add(m.saturating_mul(4)),
+            );
+            let timer = crate::profile::begin_timer(&self.hip, "gemv", symbol, bytes);
+            let result = self.launch_maybe_blob(
+                symbol,
+                [m as u32, 10, batch_size.div_ceil(8) as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    // Down retains the original 52-byte ABI with total R already at N@40.
+                    let mut b = hip_bridge::KernargBlob::with_capacity(52);
+                    b.push_ptr(pp);
+                    b.push_ptr(ip);
+                    b.push_ptr(xp);
+                    b.push_ptr(yp);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(total_r);
+                    b.push_i32(n_experts_val);
+                    b.push_i32(kt_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            result?;
+            #[cfg(feature = "lab")]
+            self.lab_observe_g1(crate::dispatch::LabG1Witness::Down(
+                crate::dispatch::LabG1DownBorrow {
+                    expert_ptrs,
+                    topk_indices,
+                    hidden: hidden_batch,
+                    expert_outputs,
+                    m,
+                    k,
+                    rows: batch_size,
+                    n_exp,
+                    k_top,
+                },
+            ))?;
+            return Ok(());
+        }
         self.ensure_kernel(
             MODULE,
             kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
@@ -3171,7 +3290,22 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        result
+        result?;
+        #[cfg(feature = "lab")]
+        self.lab_observe_g1(crate::dispatch::LabG1Witness::Down(
+            crate::dispatch::LabG1DownBorrow {
+                expert_ptrs,
+                topk_indices,
+                hidden: hidden_batch,
+                expert_outputs,
+                m,
+                k,
+                rows: batch_size,
+                n_exp,
+                k_top,
+            },
+        ))?;
+        Ok(())
     }
 
     /// Qwen4 qt53 grouped prefill down. K is logical intermediate width and

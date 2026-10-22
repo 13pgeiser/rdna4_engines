@@ -22,6 +22,7 @@
 //! (`Gpu::qwen4_append_f16_moe_scope`).
 
 use crate::dispatch::Gpu;
+use crate::gemv::WideTwinFamily;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
@@ -125,10 +126,10 @@ pub fn qwen4_append_wmma_route(
 /// lane->K map, FMA chain and reduction tree). Shared with `hipfire-config`,
 /// whose `auto` MTP cap derives from the same row-exact rows.
 pub const FEW_ROW_ROUTE_ROWS: usize = hipfire_config::QWEN4_FEW_ROW_ROUTE_ROWS;
-/// Largest verify block the few-row routes are built for. Every few-row
-/// launcher capped at 8 rows serves up to this many by looping its existing
-/// <=8-row launch over row groups.
-pub const WIDE_VERIFY_MAX_ROWS: usize = 32;
+/// Physical verify capacity, independent of the proven per-architecture
+/// admission table. Projection twins use fixed eight-row tiles through this
+/// bound; this constant alone does not qualify a route.
+pub const WIDE_VERIFY_MAX_ROWS: usize = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
 /// gfx1151 row-exact verify rows (owned by `hipfire-config`); raised only
 /// after the row-exactness oracle proves the arch at that many rows.
 pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize =
@@ -170,12 +171,16 @@ pub fn set_qwen4_wide_verify_rows_override(rows: Option<usize>) {
 
 /// Precedence of the verify-rows sources: runtime override (`0` = unset),
 /// then the env override, then the table.
-fn resolve_verify_rows(runtime: usize, env: Option<usize>, table: usize) -> usize {
-    if runtime != 0 {
+fn resolve_verify_rows(arch: &str, runtime: usize, env: Option<usize>, table: usize) -> usize {
+    if !matches!(arch, "gfx1151" | "gfx1201" | "gfx1100") {
+        return FEW_ROW_ROUTE_ROWS;
+    }
+    let rows = if runtime != 0 {
         runtime
     } else {
         env.unwrap_or(table)
-    }
+    };
+    rows.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS)
 }
 
 /// Per-arch proven row-exact verify rows (other arches
@@ -183,29 +188,92 @@ fn resolve_verify_rows(runtime: usize, env: Option<usize>, table: usize) -> usiz
 /// ([`set_qwen4_wide_verify_rows_override`]) wins, then
 /// `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` (developer var, read once, clamped to
 /// `FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS`), then the table; both
-/// overrides apply on exact gfx1151/gfx1201 only (oracle runs).
+/// overrides apply on exact gfx1151/gfx1201/gfx1100 only (oracle runs).
+/// Whether the existing wide-verify oracle override is present for `arch`:
+/// the in-process runtime override ([`set_qwen4_wide_verify_rows_override`],
+/// nonzero = set, including the `Some(8)` baseline) or the parsed
+/// `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` developer override is set — on an exact
+/// oracle arch (`gfx1151`/`gfx1201`/`gfx1100`) only. Presence, not value: an
+/// unparsable env var parses to `None` and MUST NOT arm. No new knob; the
+/// existing getter/setter are unchanged. This is the required real-oracle
+/// consumer signal (the `qwen4_wide_verify` arms use the process runtime
+/// setter), not a production-override promotion: production without either
+/// override reads `false` and keeps the default route.
+/// Callers combine this with their own eager-verify scope; the CPU routing
+/// slice additionally requires allocated storage before admitting wide rows.
+pub fn qwen4_wide_verify_override_present(arch: &str) -> bool {
+    matches!(arch, "gfx1151" | "gfx1201" | "gfx1100")
+        && (QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed) != 0
+            || (*QWEN4_WIDE_VERIFY_ROWS_OVERRIDE).is_some())
+}
+
 pub fn qwen4_row_exact_verify_rows(arch: &str) -> usize {
-    if !matches!(arch, "gfx1151" | "gfx1201") {
-        return FEW_ROW_ROUTE_ROWS;
-    }
     resolve_verify_rows(
+        arch,
         QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed),
         *QWEN4_WIDE_VERIFY_ROWS_OVERRIDE,
         hipfire_config::qwen4_row_exact_verify_rows_table(arch),
     )
 }
 
+/// Singleton AR arithmetic latched at the beginning of an eager verify window.
+/// This does not start recording or capture; `None` retains normal launch policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen4VerifyReference {
+    Eager,
+    Recorded,
+}
+
 /// Largest `route_rows` a few-row (decode-exact) route serves given the
 /// current verify rows (`0` = not in a verify forward) and whether launches
-/// are eager. Wide verify is eager-only: while a replay is recording or a
-/// graph is being captured the limit stays [`FEW_ROW_ROUTE_ROWS`].
+/// are eager. Unknown/unqualified architectures and scopes above the physical
+/// bound stay conservative. Recording/capture never widens the historic limit.
 #[inline]
-fn few_row_limit_for(wide_verify_rows: usize, eager: bool) -> usize {
-    if eager {
+fn few_row_limit_for(arch: &str, wide_verify_rows: usize, eager: bool) -> usize {
+    if eager
+        && matches!(arch, "gfx1151" | "gfx1201" | "gfx1100")
+        && wide_verify_rows <= WIDE_VERIFY_MAX_ROWS
+    {
         FEW_ROW_ROUTE_ROWS.max(wide_verify_rows)
     } else {
         FEW_ROW_ROUTE_ROWS
     }
+}
+
+/// Architecture support is not shape admission. Each launcher still validates
+/// its singleton recipe, geometry and extents before binding a tile symbol.
+fn row_tile_family_supported(arch: &str, family: WideTwinFamily) -> bool {
+    match arch {
+        "gfx1151" => true,
+        // Halo Q8's decode recipe is not the gfx1201 singleton.
+        "gfx1201" => family != WideTwinFamily::Q8,
+        // gfx1100 uses dedicated singleton-derived recipes, never Halo aliases.
+        // In particular Q8 launchers must enforce their source-proven K domain.
+        "gfx1100" => true,
+        _ => false,
+    }
+}
+
+fn row_tile_reference_supported(arch: &str, gemv_rows: u32, pm_decode: bool) -> bool {
+    match arch {
+        "gfx1151" => gemv_rows == 2,
+        "gfx1201" => gemv_rows == 2 && pm_decode,
+        "gfx1100" => gemv_rows == 1,
+        _ => false,
+    }
+}
+
+fn row_tile_scope_enabled(
+    rows: usize,
+    wide_verify_rows: usize,
+    eager: bool,
+    prefill_invariant: bool,
+) -> bool {
+    eager
+        && !prefill_invariant
+        && (1..=WIDE_VERIFY_MAX_ROWS).contains(&wide_verify_rows)
+        && rows != 0
+        && rows <= wide_verify_rows
 }
 
 /// `(first_row, row_count)` groups a wide few-row launcher serves `rows` with:
@@ -231,8 +299,9 @@ impl Gpu {
     }
 
     /// Largest `route_rows` a few-row (decode-exact) route serves right now:
-    /// [`FEW_ROW_ROUTE_ROWS`], or inside an eager verify forward
-    /// `max(FEW_ROW_ROUTE_ROWS, wide_verify_rows)`. Wide verify is eager-only:
+    /// [`FEW_ROW_ROUTE_ROWS`], or inside a supported eager verify forward with
+    /// a scope at most [`WIDE_VERIFY_MAX_ROWS`], `max(8, wide_verify_rows)`.
+    /// Wide verify is eager-only:
     /// while a replay is recording or a graph is being captured
     /// (`replay.is_recording()` / `graphs.capture_mode`) the limit is
     /// [`FEW_ROW_ROUTE_ROWS`] even when `wide_verify_rows` is set. Under
@@ -241,9 +310,59 @@ impl Gpu {
     #[inline]
     pub fn few_row_limit(&self) -> usize {
         few_row_limit_for(
+            &self.arch,
             self.wide_verify_rows,
             !(self.replay.is_recording() || self.graphs.capture_mode),
         )
+    }
+
+    /// Whether this family's fixed-eight-row PM twin may serve an admitted
+    /// eager verify. This is a lab family selector, not a capability promotion.
+    /// Callers must additionally validate their architecture-specific shape.
+    /// Product callers may keep narrow incumbents at <=8; direct byte oracles
+    /// can exercise the same tile ABI at every logical width 1..=64.
+    /// gfx1100 lab tiles use their own singleton-derived images; widening the
+    /// lab scope does not promote its proven shipping table.
+    #[inline]
+    pub fn row_tile_twin_enabled(&self, family: WideTwinFamily, rows: usize) -> bool {
+        family.enabled()
+            && row_tile_family_supported(&self.arch, family)
+            && (family != WideTwinFamily::Mq4 || self.qwen4_row_tile_reference_supported())
+            && row_tile_scope_enabled(
+                rows,
+                self.wide_verify_rows,
+                !(self.replay.is_recording() || self.graphs.capture_mode),
+                self.prefill_invariant_scope,
+            )
+    }
+
+    /// Whether the actual singleton MQ4 recipe matches the available full
+    /// verify tile program. This does not grant width admission or change AR.
+    /// Use the resolved row count: R2 on gfx1151/gfx1201, native scalar R1 on
+    /// gfx1100. Halo's default LM forced-R1 shape is handled by the tile itself.
+    #[inline]
+    pub fn qwen4_row_tile_reference_supported(&self) -> bool {
+        row_tile_reference_supported(
+            &self.arch,
+            self.arch_caps.gemv_rows_default(),
+            self.flags.pm_decode,
+        )
+    }
+
+    /// Bind the actual singleton AR reference for this verify scope; return
+    /// the prior binding so the forward owner can restore it on success/error.
+    #[inline]
+    pub fn set_qwen4_verify_reference(
+        &mut self,
+        value: Option<Qwen4VerifyReference>,
+    ) -> Option<Qwen4VerifyReference> {
+        std::mem::replace(&mut self.qwen4_verify_reference, value)
+    }
+
+    /// The singleton arithmetic bound to this scope, not the recorder state.
+    #[inline]
+    pub fn qwen4_verify_reference(&self) -> Option<Qwen4VerifyReference> {
+        self.qwen4_verify_reference
     }
 
     /// Set the verify forward's row-exact rows (`0` = not in a verify
@@ -315,7 +434,7 @@ mod tests {
     #[test]
     fn every_arch_is_at_the_few_row_limit() {
         for arch in ["gfx1151", "gfx1201", "gfx1100"] {
-            assert_eq!(qwen4_row_exact_verify_rows(arch), 8, "{arch}");
+            assert_eq!(resolve_verify_rows(arch, 0, None, 8), 8, "{arch}");
         }
     }
 
@@ -330,8 +449,14 @@ mod tests {
 
         let resolved = hipfire_config::resolve([]).unwrap();
         for arch in ["gfx1151", "gfx1201", "gfx1100", "gfx1150", "gfx942"] {
-            let cap = mtp_k_default(16, qwen4_row_exact_verify_rows(arch));
-            assert_eq!(cap, qwen4_row_exact_verify_rows(arch) - 1, "{arch}");
+            let rows = resolve_verify_rows(
+                arch,
+                0,
+                None,
+                hipfire_config::qwen4_row_exact_verify_rows_table(arch),
+            );
+            let cap = mtp_k_default(16, rows);
+            assert_eq!(cap, rows - 1, "{arch}");
             assert_eq!(cap, 7, "{arch}");
             let ctx = ArchCtx {
                 gpu_arch: Some(arch.into()),
@@ -347,7 +472,7 @@ mod tests {
             );
         }
         assert_eq!(
-            mtp_k_default(5, qwen4_row_exact_verify_rows("gfx1151")),
+            mtp_k_default(5, resolve_verify_rows("gfx1151", 0, None, 8)),
             MTP_K_DEFAULT
         );
     }
@@ -357,19 +482,107 @@ mod tests {
 mod wide_verify_tests {
     use super::*;
 
+    const BOUNDARY_ROWS: [usize; 10] = [0, 1, 8, 9, 32, 33, 63, 64, 65, usize::MAX];
+
     #[test]
-    fn few_row_limit_is_historic_outside_verify_and_widens_inside() {
-        assert_eq!(few_row_limit_for(0, true), FEW_ROW_ROUTE_ROWS);
-        assert_eq!(few_row_limit_for(1, true), FEW_ROW_ROUTE_ROWS);
-        assert_eq!(few_row_limit_for(8, true), 8);
-        assert_eq!(few_row_limit_for(9, true), 9);
-        assert_eq!(few_row_limit_for(32, true), 32);
+    fn few_row_limit_scope_recording_capture_truth_table() {
+        assert_eq!(FEW_ROW_ROUTE_ROWS, 8);
+        assert_eq!(WIDE_VERIFY_MAX_ROWS, 64);
+        for arch in [
+            "gfx1151",
+            "gfx1201",
+            "gfx1100",
+            "gfx1150",
+            "gfx942",
+            "gfx1151-x",
+            "",
+        ] {
+            for scope in BOUNDARY_ROWS {
+                for recording in [false, true] {
+                    for capture in [false, true] {
+                        let eager = !(recording || capture);
+                        let limit = few_row_limit_for(arch, scope, eager);
+                        let expected = if matches!(arch, "gfx1151" | "gfx1201" | "gfx1100")
+                            && eager
+                            && scope <= WIDE_VERIFY_MAX_ROWS
+                        {
+                            scope.max(FEW_ROW_ROUTE_ROWS)
+                        } else {
+                            FEW_ROW_ROUTE_ROWS
+                        };
+                        assert_eq!(limit, expected, "{arch} scope={scope}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn few_row_limit_is_historic_while_recording_or_capturing() {
-        for rows in [0, 8, 9, 32] {
-            assert_eq!(few_row_limit_for(rows, false), FEW_ROW_ROUTE_ROWS);
+    fn row_tile_scope_truth_table() {
+        for rows in BOUNDARY_ROWS {
+            for scope in BOUNDARY_ROWS {
+                for recording in [false, true] {
+                    for capture in [false, true] {
+                        for invariant in [false, true] {
+                            let eager = !(recording || capture);
+                            let expected = eager
+                                && !invariant
+                                && (1..=64).contains(&scope)
+                                && rows > 0
+                                && rows <= scope;
+                            assert_eq!(
+                                row_tile_scope_enabled(rows, scope, eager, invariant),
+                                expected,
+                                "rows={rows} scope={scope} recording={recording} capture={capture} invariant={invariant}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_tile_family_architecture_truth_table() {
+        for family in WideTwinFamily::ALL {
+            assert!(row_tile_family_supported("gfx1151", family));
+            assert_eq!(
+                row_tile_family_supported("gfx1201", family),
+                family != WideTwinFamily::Q8,
+            );
+            assert!(row_tile_family_supported("gfx1100", family));
+            for arch in ["gfx1150", "gfx942", "gfx1151-x", "gfx1201-x", ""] {
+                assert!(
+                    !row_tile_family_supported(arch, family),
+                    "{arch} {family:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_tile_reference_actual_singleton_recipe_truth_table() {
+        for arch in [
+            "gfx1151",
+            "gfx1201",
+            "gfx1100",
+            "gfx1150",
+            "gfx942",
+            "gfx1201-x",
+            "",
+        ] {
+            for rows in [0, 1, 2, 4, 8, u32::MAX] {
+                for pm_decode in [false, true] {
+                    let expected = (rows == 2
+                        && (arch == "gfx1151" || (arch == "gfx1201" && pm_decode)))
+                        || (arch == "gfx1100" && rows == 1);
+                    assert_eq!(
+                        row_tile_reference_supported(arch, rows, pm_decode),
+                        expected,
+                        "{arch} effective_rows={rows} pm_decode={pm_decode}",
+                    );
+                }
+            }
         }
     }
 
@@ -388,11 +601,12 @@ mod wide_verify_tests {
             Some(FEW_ROW_ROUTE_ROWS)
         );
         assert_eq!(wide_verify_rows_override_value(Some(" 16 ")), Some(16));
-        assert_eq!(wide_verify_rows_override_value(Some("32")), Some(32));
-        assert_eq!(
-            wide_verify_rows_override_value(Some("33")),
-            Some(WIDE_VERIFY_MAX_ROWS)
-        );
+        for rows in BOUNDARY_ROWS {
+            assert_eq!(
+                wide_verify_rows_override_value(Some(&rows.to_string())),
+                Some(rows.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS)),
+            );
+        }
         assert_eq!(
             wide_verify_rows_override_value(Some("9999")),
             Some(WIDE_VERIFY_MAX_ROWS)
@@ -402,11 +616,24 @@ mod wide_verify_tests {
     #[test]
     fn verify_rows_source_precedence() {
         // runtime > env > table
-        assert_eq!(resolve_verify_rows(16, Some(24), 8), 16);
-        assert_eq!(resolve_verify_rows(16, None, 8), 16);
-        assert_eq!(resolve_verify_rows(0, Some(24), 8), 24);
-        assert_eq!(resolve_verify_rows(0, None, 8), 8);
-        assert_eq!(resolve_verify_rows(32, Some(9), 8), 32);
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            for rows in BOUNDARY_ROWS {
+                let clamped = rows.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS);
+                assert_eq!(
+                    resolve_verify_rows(arch, rows, Some(24), 8),
+                    if rows == 0 { 24 } else { clamped },
+                );
+                assert_eq!(resolve_verify_rows(arch, 0, Some(rows), 8), clamped);
+                assert_eq!(resolve_verify_rows(arch, 0, None, 8), 8);
+            }
+        }
+        // Unknown architectures cannot acquire global wide admission from
+        // either lab override.
+        for arch in ["gfx1150", "gfx942", "gfx1151-x", "gfx1100-x", ""] {
+            for rows in BOUNDARY_ROWS {
+                assert_eq!(resolve_verify_rows(arch, rows, Some(64), 8), 8);
+            }
+        }
     }
 
     #[test]
@@ -434,7 +661,7 @@ mod wide_verify_tests {
         ] {
             assert!((FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows));
         }
-        for arch in ["gfx1100", "gfx1150", "gfx942", "gfx1151-x", ""] {
+        for arch in ["gfx1150", "gfx942", "gfx1151-x", "gfx1100-x", ""] {
             assert_eq!(qwen4_row_exact_verify_rows(arch), FEW_ROW_ROUTE_ROWS);
         }
     }
@@ -452,7 +679,16 @@ mod few_row_groups_tests {
         assert_eq!(few_row_groups(9).collect::<Vec<_>>(), vec![(0, 8), (8, 1)]);
         assert_eq!(
             few_row_groups(WIDE_VERIFY_MAX_ROWS).collect::<Vec<_>>(),
-            vec![(0, 8), (8, 8), (16, 8), (24, 8)]
+            vec![
+                (0, 8),
+                (8, 8),
+                (16, 8),
+                (24, 8),
+                (32, 8),
+                (40, 8),
+                (48, 8),
+                (56, 8)
+            ]
         );
         for rows in 1..=WIDE_VERIFY_MAX_ROWS {
             let groups: Vec<_> = few_row_groups(rows).collect();

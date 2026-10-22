@@ -1934,7 +1934,7 @@ enum DigestRow {
 /// The ordered rows of a digest over `map`. The non-canonical plan is
 /// [`Qwen4State::debug_digest`]: under the whole-model map it is exactly the
 /// historical row order. The canonical plan ([`Qwen4State::canonical_digest_rows`])
-/// keeps only semantic state: it drops the capacity rows (`row_capture_rows`,
+/// drops the capacity rows (`row_capture_rows`,
 /// `qsa_mapped_tokens`) and the rollback re-run's discarded `row_capture_output`
 /// scratch (written fully by the re-run launch, never read by any forward or
 /// repair), and replaces the two global host rows by per-layer rows so every
@@ -2930,11 +2930,13 @@ impl Qwen4State {
     ///
     /// Device rows are `"<sha256 hex> bytes=<n>"` (fixed-size state) or
     /// `"<sha256 hex> bytes=<n> rows=<r>"` (QSA arenas):
-    /// * fixed-size state every forward fully owns, hashed whole
-    ///   (`byte_size()`): every GDN recurrent (the live ring-slot view), live
-    ///   EF residual when present, conv, PLE conv, hyper feedback, and verify
-    ///   row-capture rings/inputs/recurrence/output when allocated. EF is
-    ///   reset by recorded dispatch; serialized layouts never include it.
+    /// * fixed-size live state, hashed whole (`byte_size()`): every GDN
+    ///   recurrent (the live ring-slot view), live EF residual when present,
+    ///   conv, PLE conv and hyper feedback. EF is reset by recorded dispatch;
+    ///   serialized layouts never include it.
+    /// * allocated row-capture rings/inputs/recurrence/output, hashed whole
+    ///   as transaction evidence. A verify writes only its final ring state,
+    ///   not every intermediate slot; these are not logical-state digests.
     /// * QSA arenas, hashed over exactly the ACTIVE prefix the layer's marks
     ///   name (rows beyond it, and freshly mapped VMM pages, are not
     ///   guaranteed written): `full_keys` / `full_values` the first
@@ -2954,8 +2956,8 @@ impl Qwen4State {
         self.digest_rows(gpu, false)
     }
 
-    /// Canonical logical ownership projection of this rank's state: the
-    /// semantic rows of [`Self::debug_digest`] keyed by ABSOLUTE layer
+    /// Canonical layer-ownership projection of this rank's debug receipt:
+    /// rows of [`Self::debug_digest`] keyed by ABSOLUTE layer
     /// (`qsa[L11].full_keys`, `gdn[L0].recurrent`, `row_capture[L0].ring`)
     /// instead of the local slot, in ascending absolute order. Values are the
     /// same digests. The union over the ranks of a placement equals the
@@ -2967,6 +2969,11 @@ impl Qwen4State {
     /// counters) are not part of it: the rollback re-run's discarded output
     /// is rewritten in full by every re-run launch before anything could
     /// read it, so no live cache hides behind that exclusion.
+    ///
+    /// Capture rings/inputs/recurrence and physical live indices intentionally
+    /// remain for same-call EP receipts. AR-vs-verify logical comparisons must
+    /// compare live semantic tensors/marks, with ring indices reported
+    /// separately, rather than treating this complete receipt as logical state.
     pub fn canonical_digest_rows(
         &self,
         gpu: &mut Gpu,
@@ -3574,6 +3581,9 @@ impl Qwen4State {
         rows: usize,
         gdn_layers: usize,
     ) -> Option<usize> {
+        if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+            return None;
+        }
         let sizes = Self::row_capture_allocation_sizes_scoped(config, gdn, rows, gdn_layers)?;
         let total = sizes
             .iter()
@@ -3585,38 +3595,48 @@ impl Qwen4State {
     /// [`Self::ensure_row_capture`], in its allocation order: per GDN layer
     /// the two-half recurrent ring (storage format), the F32 input rows and
     /// the F32 recurrence inputs, then the one F32 output block and the
-    /// pointer table (at least one byte; a band with no GDN layer is still
-    /// charged them, as the byte query does). Empty below two rows; `None`
-    /// on overflow.
+    /// pointer table. Empty below two rows or for a band with no GDN layer
+    /// (nothing is allocated); `None` on overflow.
     pub(crate) fn row_capture_allocation_sizes_scoped(
         config: &Qwen4Config,
         gdn: GdnStateFormat,
         rows: usize,
         gdn_layers: usize,
     ) -> Option<Vec<u64>> {
-        if rows < 2 {
+        if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+            return None;
+        }
+        if rows < 2 || gdn_layers == 0 {
+            // A band with no GDN layer allocates nothing: `ensure_row_capture`
+            // returns before the output block and pointer table.
             return Some(Vec::new());
         }
         let value_heads = config.linear_num_value_heads;
         let f32_bytes = std::mem::size_of::<f32>();
-        let ring = gdn
-            .storage()
-            .state_units(
-                value_heads,
-                config.linear_key_head_dim,
-                config.linear_value_head_dim,
-            )
+        let key_units = match gdn.storage() {
+            GdnStateFormat::F32 => config.linear_key_head_dim,
+            GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => {
+                config.linear_key_head_dim.checked_add(4)?
+            }
+        };
+        let ring = value_heads
+            .checked_mul(config.linear_value_head_dim)?
+            .checked_mul(key_units)?
             .checked_mul(gdn.storage().dtype().size())?
             .checked_mul(rows.checked_mul(2)?)?;
-        let qkv = (2 * config.linear_num_key_heads)
+        let qkv = config
+            .linear_num_key_heads
+            .checked_mul(2)?
             .checked_mul(config.linear_key_head_dim)?
             .checked_add(value_heads.checked_mul(config.linear_value_head_dim)?)?;
-        let inputs = rows.checked_mul(qkv)?.checked_mul(f32_bytes)?;
+        let inputs = rows
+            .checked_mul(qkv)?
+            .checked_mul(std::mem::size_of::<f32>())?;
         let recurrence = rows
-            .checked_mul(qkv.checked_add(2 * value_heads)?)?
-            .checked_mul(f32_bytes)?;
+            .checked_mul(qkv.checked_add(value_heads.checked_mul(2)?)?)?
+            .checked_mul(std::mem::size_of::<f32>())?;
         let output = rows
-            .checked_mul(value_heads * GDN_HEAD_DIM)?
+            .checked_mul(value_heads.checked_mul(GDN_HEAD_DIM)?)?
             .checked_mul(f32_bytes)?;
         let table = gdn_layers
             .checked_mul(2 * std::mem::size_of::<u64>())?
@@ -3640,22 +3660,39 @@ impl Qwen4State {
             .collect()
     }
 
-    /// Allocate the few-row verify rollback points for blocks of up to
-    /// `rows` rows (`conv_history` = convolution kernel - 1). Only called
-    /// where the GDN route captures rows (see `GatedDeltaNetOp::row_capture`).
+    /// Allocate two capture halves and retained recurrence inputs for blocks
+    /// of up to `rows` rows (`conv_history` = convolution kernel - 1).
+    /// Only the last state is materialized; prefix repair re-runs recurrence.
+    /// Admission/growth must precede arming and taking a snapshot.
     pub(crate) fn ensure_row_capture(
         &mut self,
         gpu: &mut Gpu,
         rows: usize,
         conv_history: usize,
     ) -> Result<(), StateError> {
+        if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+            return Err(StateError::Length {
+                what: "verify capture rows",
+                expected: hipfire_config::QWEN4_VERIFY_MAX_ROWS,
+                actual: rows,
+            });
+        }
         if rows <= self.row_capture_rows || rows < 2 {
             return Ok(());
+        }
+        if self.snapshot_arena.active || self.row_capture_armed {
+            return Err(StateError::SnapshotBusy);
+        }
+        if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+            return Err(StateError::Config(
+                "GDN capture growth must precede replay recording or graph capture".into(),
+            ));
         }
         if self.gdn.is_empty() {
             // A band without GDN layers has no recurrence to capture; the
             // rows and live slot still track the other owners so a rollback
             // agrees with them.
+            self.snapshot_arena.invalidate();
             self.row_capture_rows = rows;
             self.gdn_live = 0;
             #[cfg(feature = "lab")]
@@ -3663,49 +3700,116 @@ impl Qwen4State {
                 .ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
             return Ok(());
         }
-        let mut next = Vec::with_capacity(self.gdn.len());
-        let mut widest_value = 0;
+        // Validate every extent before allocating or publishing anything.
+        let overflow = || StateError::DimensionOverflow;
+        let value_width = self
+            .gdn_value_heads
+            .checked_mul(GDN_HEAD_DIM)
+            .ok_or_else(overflow)?;
+        let output_elements = rows.checked_mul(value_width).ok_or_else(overflow)?;
+        let table_bytes = self
+            .gdn
+            .len()
+            .checked_mul(2 * std::mem::size_of::<u64>())
+            .ok_or_else(overflow)?;
+        output_elements
+            .checked_mul(DType::F32.size())
+            .ok_or_else(overflow)?;
         for layer in &self.gdn {
-            let state = layer.recurrent.numel();
-            let ring = gpu
-                .zeros(&[2 * rows * state], layer.recurrent.dtype)
-                .map_err(StateError::Hip)?;
-            gpu.copy_d2d(
-                &layer.recurrent,
-                &ring.sub_offset(0, state),
-                layer.recurrent.byte_size(),
-            )
-            .map_err(StateError::Hip)?;
+            if conv_history == 0 || !layer.conv.numel().is_multiple_of(conv_history) {
+                return Err(StateError::Config(
+                    "invalid GDN capture convolution history".into(),
+                ));
+            }
             let qkv = layer.conv.numel() / conv_history;
-            let inputs = gpu
-                .zeros(&[rows * qkv], DType::F32)
-                .map_err(StateError::Hip)?;
-            let value_heads = self.gdn_value_heads;
-            let recurrence = gpu
-                .zeros(&[rows * (qkv + 2 * value_heads)], DType::F32)
-                .map_err(StateError::Hip)?;
-            widest_value = widest_value.max(value_heads * GDN_HEAD_DIM);
-            next.push((ring, inputs, recurrence));
+            let ring = rows
+                .checked_mul(2)
+                .and_then(|n| n.checked_mul(layer.recurrent.numel()))
+                .ok_or_else(overflow)?;
+            ring.checked_mul(layer.recurrent.dtype.size())
+                .ok_or_else(overflow)?;
+            let recurrence = qkv
+                .checked_add(self.gdn_value_heads.checked_mul(2).ok_or_else(overflow)?)
+                .and_then(|n| rows.checked_mul(n))
+                .ok_or_else(overflow)?;
+            rows.checked_mul(qkv)
+                .and_then(|n| n.checked_mul(DType::F32.size()))
+                .ok_or_else(overflow)?;
+            recurrence
+                .checked_mul(DType::F32.size())
+                .ok_or_else(overflow)?;
         }
-        let output = gpu
-            .zeros(&[rows * widest_value], DType::F32)
-            .map_err(StateError::Hip)?;
-        let pointers: Vec<u8> = next
-            .iter()
-            .flat_map(|(ring, _, recurrence)| [recurrence.buf.as_ptr(), ring.buf.as_ptr()])
-            .flat_map(|pointer| (pointer as u64).to_ne_bytes())
+        // Stage all allocations, following the snapshot arena's cleanup
+        // convention. Allocation/copy/upload failure leaves live pointers,
+        // ticket generation, and capacities untouched.
+        let mut allocated = Vec::with_capacity(3 * self.gdn.len() + 2);
+        let staged = (|| -> Result<(), StateError> {
+            for layer in &self.gdn {
+                let state = layer.recurrent.numel();
+                allocated.push(
+                    gpu.zeros(&[2 * rows * state], layer.recurrent.dtype)
+                        .map_err(StateError::Hip)?,
+                );
+                gpu.copy_d2d(
+                    &layer.recurrent,
+                    &allocated.last().expect("ring").sub_offset(0, state),
+                    layer.recurrent.byte_size(),
+                )
+                .map_err(StateError::Hip)?;
+                let qkv = layer.conv.numel() / conv_history;
+                allocated.push(
+                    gpu.zeros(&[rows * qkv], DType::F32)
+                        .map_err(StateError::Hip)?,
+                );
+                allocated.push(
+                    gpu.zeros(&[rows * (qkv + 2 * self.gdn_value_heads)], DType::F32)
+                        .map_err(StateError::Hip)?,
+                );
+            }
+            let pointers: Vec<u8> = allocated
+                .chunks_exact(3)
+                .flat_map(|layer| [layer[2].buf.as_ptr(), layer[0].buf.as_ptr()])
+                .flat_map(|pointer| (pointer as u64).to_ne_bytes())
+                .collect();
+            allocated.push(
+                gpu.zeros(&[output_elements], DType::F32)
+                    .map_err(StateError::Hip)?,
+            );
+            allocated.push(
+                gpu.zeros(&[table_bytes], DType::Raw)
+                    .map_err(StateError::Hip)?,
+            );
+            gpu.memcpy_htod_auto(&allocated.last().expect("pointer table").buf, &pointers)
+                .map_err(StateError::Hip)?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            for tensor in allocated.into_iter().rev() {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(error);
+        }
+        let mut allocated = allocated.into_iter();
+        let next: Vec<_> = (0..self.gdn.len())
+            .map(|_| {
+                (
+                    allocated.next().expect("ring"),
+                    allocated.next().expect("inputs"),
+                    allocated.next().expect("recurrence"),
+                )
+            })
             .collect();
-        let table = gpu
-            .zeros(&[pointers.len().max(1)], DType::Raw)
-            .map_err(StateError::Hip)?;
-        gpu.memcpy_htod_auto(&table.buf, &pointers)
-            .map_err(StateError::Hip)?;
-        if let Some((output, table)) = self.row_capture_output.replace((output, table)) {
-            gpu.free_tensor(output).map_err(StateError::Hip)?;
-            gpu.free_tensor(table).map_err(StateError::Hip)?;
-        }
+        let output = allocated.next().expect("discard output");
+        let table = allocated.next().expect("pointer table");
+        // Captured graphs may bake the recurrent pointers replaced below: drop
+        // captured execution state before publishing the new ring (real growth
+        // only; no-ops returned above, staged failure never reaches here).
+        gpu.invalidate_for_scratch_growth();
+        self.snapshot_arena.invalidate();
+        let previous_output = self.row_capture_output.replace((output, table));
         let previous = std::mem::replace(&mut self.row_capture, next);
         let ringed = !previous.is_empty();
+        let mut old_states = Vec::new();
         for (index, layer) in self.gdn.iter_mut().enumerate() {
             let state = layer.recurrent.numel();
             let old = std::mem::replace(
@@ -3713,16 +3817,27 @@ impl Qwen4State {
                 self.row_capture[index].0.sub_offset(0, state),
             );
             if !ringed {
-                gpu.free_tensor(old).map_err(StateError::Hip)?;
+                old_states.push(old);
             }
-        }
-        for (ring, inputs, recurrence) in previous {
-            gpu.free_tensor(ring).map_err(StateError::Hip)?;
-            gpu.free_tensor(inputs).map_err(StateError::Hip)?;
-            gpu.free_tensor(recurrence).map_err(StateError::Hip)?;
         }
         self.row_capture_rows = rows;
         self.gdn_live = 0;
+        // Publish a complete coherent ring before releasing previous storage.
+        for tensor in old_states
+            .into_iter()
+            .chain(
+                previous
+                    .into_iter()
+                    .flat_map(|(ring, inputs, recurrence)| [ring, inputs, recurrence]),
+            )
+            .chain(
+                previous_output
+                    .into_iter()
+                    .flat_map(|(output, table)| [output, table]),
+            )
+        {
+            gpu.free_tensor(tensor).map_err(StateError::Hip)?;
+        }
         #[cfg(feature = "lab")]
         self.lab
             .ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
@@ -3752,9 +3867,9 @@ impl Qwen4State {
         }
     }
 
-    /// The rollback points GDN layer `slot` writes in an armed `rows`-row
-    /// verify forward: its last row's state into the free half of the ring,
-    /// plus the convolution and recurrence inputs.
+    /// Retained inputs and a destination half for an armed verify. Only
+    /// `base + rows - 1` receives a recurrent state; earlier slots are not a
+    /// state tape. Prefix repair must re-run the captured recurrence inputs.
     pub(crate) fn gdn_row_capture(&self, slot: usize, rows: usize) -> Option<GdnRowCapture<'_>> {
         if !self.row_capture_armed || rows < 2 || rows > self.row_capture_rows {
             return None;
@@ -4278,7 +4393,7 @@ mod tests {
             live(GdnStateFormat::Q8Ef) - live(GdnStateFormat::Q8),
             54 * 1024 * 1024
         );
-        for rows in [4, 8, 32] {
+        for rows in [4, 8, 32, hipfire_config::QWEN4_VERIFY_MAX_ROWS] {
             let ring = |gdn| Qwen4State::row_capture_bytes(&config, gdn, rows).unwrap();
             assert_eq!(ring(GdnStateFormat::Q8Ef), ring(GdnStateFormat::Q8));
             assert_eq!(
@@ -4879,7 +4994,15 @@ mod tests {
             let geometry = StateGeometry::new(&config, &format, 1024).unwrap();
             let history = config.linear_conv_kernel_dim - 1;
             let qkv = geometry.conv_len / history;
-            for rows in [0usize, 1, 2, 4, 8, 32, 65] {
+            for rows in [
+                0usize,
+                1,
+                2,
+                4,
+                8,
+                32,
+                hipfire_config::QWEN4_VERIFY_MAX_ROWS,
+            ] {
                 let sizes =
                     Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, layers)
                         .unwrap();
@@ -5785,18 +5908,507 @@ mod tests {
     }
 
     #[test]
+    fn row_capture_64_byte_plan_covers_both_halves_and_all_inputs() {
+        let config = crate::config::compact_test_config();
+        let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        assert_eq!(rows, 64);
+        let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        for format in [
+            GdnStateFormat::F32,
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+        ] {
+            for layers in [0, 1, config.n_linear_layers()] {
+                for n in 0..=rows {
+                    let expected = if n < 2 || layers == 0 {
+                        0
+                    } else {
+                        let ring = 2
+                            * n
+                            * format.state_bytes(
+                                config.linear_num_value_heads,
+                                config.linear_key_head_dim,
+                                config.linear_value_head_dim,
+                            );
+                        let inputs = 4 * n * (2 * qkv + 2 * config.linear_num_value_heads);
+                        let discard = 4 * n * config.linear_num_value_heads * GDN_HEAD_DIM;
+                        layers * (ring + inputs) + discard + 16 * layers
+                    };
+                    assert_eq!(
+                        Qwen4State::row_capture_bytes_scoped(&config, format, n, layers),
+                        Some(expected),
+                        "{format:?} rows={n} layers={layers}",
+                    );
+                }
+            }
+            for n in [rows + 1, usize::MAX / 2, usize::MAX] {
+                assert_eq!(Qwen4State::row_capture_bytes(&config, format, n), None);
+            }
+            for field in 0..5 {
+                let mut huge = config.clone();
+                match field {
+                    0 => huge.linear_num_value_heads = usize::MAX,
+                    1 => huge.linear_num_key_heads = usize::MAX,
+                    2 => huge.linear_key_head_dim = usize::MAX,
+                    3 => huge.linear_value_head_dim = usize::MAX,
+                    _ => {}
+                }
+                let layers = if field == 4 { usize::MAX } else { 1 };
+                assert_eq!(
+                    Qwen4State::row_capture_bytes_scoped(&huge, format, rows, layers),
+                    None,
+                    "{format:?} overflowing field {field}",
+                );
+            }
+        }
+    }
+
+    fn capture_test_config() -> Qwen4Config {
+        let mut config = crate::config::synthetic_test_config(
+            crate::config::Qwen4FfnConfig::Dense {
+                intermediate_size: 16,
+            },
+            16,
+            1,
+            false,
+            false,
+        );
+        config.linear_num_key_heads = 1;
+        config.linear_num_value_heads = 2;
+        config.linear_key_head_dim = GDN_HEAD_DIM;
+        config.linear_value_head_dim = GDN_HEAD_DIM;
+        config
+    }
+
+    // EP's canonical digest deliberately retains capture storage and physical
+    // live indices for same-call receipts. AR-vs-verify logical equality must
+    // omit those transaction details, not compare untouched ring slots.
+    fn capture_semantic_digest(state: &Qwen4State, gpu: &mut Gpu) -> Vec<(String, String)> {
+        state
+            .canonical_digest_rows(gpu)
+            .expect("digest")
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with("row_capture[") && !key.ends_with("].live"))
+            .collect()
+    }
+
+    #[test]
+    fn row_capture_64_growth_refuses_before_mutation_and_preserves_live_state() {
+        let Some(mut gpu) = try_gpu() else { return };
+        let config = capture_test_config();
+        let max = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        let history = config.linear_conv_kernel_dim - 1;
+        let mut state =
+            Qwen4State::new(&mut gpu, &config, 256, Qwen4StateFormat::F32).expect("state");
+        state
+            .ensure_row_capture(&mut gpu, 4, history)
+            .expect("initial ring");
+        state.set_gdn_live(7);
+        gpu.hip
+            .memset(
+                &state.gdn[0].recurrent.buf,
+                0x35,
+                state.gdn[0].recurrent.byte_size(),
+            )
+            .expect("seed old live slot");
+        let before = capture_semantic_digest(&state, &mut gpu);
+        let pointer = state.gdn[0].recurrent.buf.as_ptr();
+        let generation = state.snapshot_arena.generation;
+        for rows in [max + 1, usize::MAX] {
+            assert!(matches!(
+                state.ensure_row_capture(&mut gpu, rows, history),
+                Err(StateError::Length { .. })
+            ));
+        }
+        assert!(matches!(
+            state.ensure_row_capture(&mut gpu, max, 0),
+            Err(StateError::Config(_))
+        ));
+        let heads = state.gdn_value_heads;
+        state.gdn_value_heads = usize::MAX;
+        assert!(matches!(
+            state.ensure_row_capture(&mut gpu, max, history),
+            Err(StateError::DimensionOverflow)
+        ));
+        state.gdn_value_heads = heads;
+        gpu.graphs.capture_mode = true;
+        let capturing = state.ensure_row_capture(&mut gpu, max, history);
+        gpu.graphs.capture_mode = false;
+        assert!(matches!(capturing, Err(StateError::Config(_))));
+        assert_eq!(state.snapshot_arena.generation, generation);
+        assert_eq!(state.gdn[0].recurrent.buf.as_ptr(), pointer);
+        assert_eq!(state.row_capture_rows, 4);
+        assert_eq!(state.gdn_live, 7);
+        assert_eq!(capture_semantic_digest(&state, &mut gpu), before);
+        // The real upload seam fails publication's staged pointer table;
+        // it is not a simulated memory-budget or malloc refusal.
+        hip_bridge::arm_hip_fault("upload", 1);
+        let staged_failure = state.ensure_row_capture(&mut gpu, max, history);
+        hip_bridge::arm_hip_fault("upload", 0);
+        assert!(matches!(&staged_failure, Err(StateError::Hip(error))
+            if error.to_string().contains("injected upload failure")));
+        assert_eq!(state.snapshot_arena.generation, generation);
+        assert_eq!(state.gdn[0].recurrent.buf.as_ptr(), pointer);
+        assert_eq!((state.row_capture_rows, state.gdn_live), (4, 7));
+        assert_eq!(capture_semantic_digest(&state, &mut gpu), before);
+
+        state.row_capture_armed = true;
+        let ticket = state.snapshot(&mut gpu).expect("armed snapshot");
+        assert!(matches!(
+            state.ensure_row_capture(&mut gpu, max, history),
+            Err(StateError::SnapshotBusy)
+        ));
+        state.row_capture_armed = false;
+        state.retain_validated(ticket);
+        assert!(matches!(
+            state.ensure_row_capture(&mut gpu, max, history),
+            Err(StateError::SnapshotBusy)
+        ));
+        state.release_retained();
+        state
+            .ensure_row_capture(&mut gpu, max, history)
+            .expect("grow to 64");
+        assert_eq!(state.row_capture_rows, max);
+        assert_eq!(state.gdn_live, 0);
+        assert_eq!(capture_semantic_digest(&state, &mut gpu), before);
+        assert!(state.snapshot_arena.generation > generation);
+        let current = state.snapshot(&mut gpu).expect("new generation");
+        assert!(matches!(
+            state.validate_commit(ticket),
+            Err(StateError::SnapshotTicket)
+        ));
+        state.restore(&mut gpu, current).expect("restore current");
+        assert!(matches!(
+            state.validate_commit(current),
+            Err(StateError::SnapshotInactive)
+        ));
+        // After the failed staging and successful growth, a real singleton
+        // recurrence can use the published live slot and scratch.
+        let qk = config.linear_num_key_heads * GDN_HEAD_DIM;
+        let value = config.linear_num_value_heads * GDN_HEAD_DIM;
+        rdna_compute::tensor_ops::gated_delta_step(
+            &mut gpu,
+            &rdna_compute::tensor_ops::GatedDeltaStep {
+                q: &state.gdn[0].conv.sub_offset(0, qk),
+                k: &state.gdn[0].conv.sub_offset(qk, qk),
+                v: &state.gdn[0].conv.sub_offset(2 * qk, value),
+                gate: &state.gdn[0]
+                    .conv
+                    .sub_offset(0, config.linear_num_value_heads),
+                beta: &state.gdn[0]
+                    .conv
+                    .sub_offset(0, config.linear_num_value_heads),
+                state: &state.gdn[0].recurrent,
+                format: GdnStateFormat::F32,
+                residual: None,
+                output: &state
+                    .row_capture_output
+                    .as_ref()
+                    .expect("discard output")
+                    .0
+                    .sub_offset(0, value),
+                key_heads: config.linear_num_key_heads,
+                value_heads: config.linear_num_value_heads,
+                key_dim: GDN_HEAD_DIM,
+                value_dim: GDN_HEAD_DIM,
+                position: state.position,
+            },
+        )
+        .expect("singleton after failed staging and ring growth");
+        state.free_gpu(&mut gpu).expect("free");
+    }
+
+    /// Exercises the real state repair entrypoint, not a replay transcription:
+    /// 64-row capture, every kept prefix (zero means abort), both halves,
+    /// subsequent singleton and another captured window. GDN-only fixture;
+    /// full-model QSA/PLE/transaction gates remain the strict wide oracle.
+    #[test]
+    fn row_capture_64_prefix_abort_and_continuation_match_singletons() {
+        use rdna_compute::tensor_ops::{
+            gated_delta_step, gated_delta_step_batched, GatedDeltaStep, GatedDeltaStepBatched,
+        };
+        let Some(mut gpu) = try_gpu() else { return };
+        let config = capture_test_config();
+        let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        let start = 37;
+        let history = config.linear_conv_kernel_dim - 1;
+        let value = config.linear_num_value_heads * GDN_HEAD_DIM;
+        let qk = config.linear_num_key_heads * GDN_HEAD_DIM;
+        let qkv = 2 * qk + value;
+        let wave = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 37 % 1009) as f32 - 504.0) * scale)
+                .collect()
+        };
+        let projection = wave((rows + 3) * qkv, 0.002);
+        let gate = vec![-0.6; (rows + 3) * config.linear_num_value_heads];
+        let beta = vec![0.4; gate.len()];
+        let proj = gpu
+            .upload_f32(&projection, &[projection.len()])
+            .expect("projection");
+        let gates = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let betas = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let initial = gpu
+            .upload_f32(&wave(value * GDN_HEAD_DIM, 0.0003), &[value * GDN_HEAD_DIM])
+            .expect("seed");
+        let output = gpu
+            .zeros(&[(rows + 3) * value], DType::F32)
+            .expect("output");
+        // No PLE owner in this fixture, so the repair never reads this view.
+        let ple = gpu.zeros(&[1], DType::F32).expect("unused PLE input");
+        let tokens: Vec<_> = (0..rows + 3).map(|i| 10 + i as u32).collect();
+        let singleton = |gpu: &mut Gpu, state: &Qwen4State, row: usize| {
+            gated_delta_step(
+                gpu,
+                &GatedDeltaStep {
+                    q: &proj.sub_offset(row * qkv, qk),
+                    k: &proj.sub_offset(row * qkv + qk, qk),
+                    v: &proj.sub_offset(row * qkv + 2 * qk, value),
+                    gate: &gates.sub_offset(
+                        row * config.linear_num_value_heads,
+                        config.linear_num_value_heads,
+                    ),
+                    beta: &betas.sub_offset(
+                        row * config.linear_num_value_heads,
+                        config.linear_num_value_heads,
+                    ),
+                    state: &state.gdn[0].recurrent,
+                    format: state.gdn_format,
+                    residual: None,
+                    output: &output.sub_offset(row * value, value),
+                    key_heads: config.linear_num_key_heads,
+                    value_heads: config.linear_num_value_heads,
+                    key_dim: GDN_HEAD_DIM,
+                    value_dim: GDN_HEAD_DIM,
+                    position: start + row,
+                },
+            )
+            .expect("singleton recurrence");
+        };
+        let advance_history = |gpu: &mut Gpu, state: &mut Qwen4State, row: usize| {
+            gpu.hip
+                .memcpy_htod(
+                    &state.gdn[0]
+                        .conv
+                        .sub_offset((start + row) % history * qkv, qkv)
+                        .buf,
+                    &projection[row * qkv..][..qkv]
+                        .iter()
+                        .flat_map(|x| x.to_ne_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("conv input");
+            state.ple_history.push(tokens[row]);
+            state.position = start + row + 1;
+        };
+        let capture = |gpu: &mut Gpu, state: &mut Qwen4State, first: usize, n: usize| {
+            let captured = state.gdn_row_capture(0, n).expect("armed capture");
+            let recurrence: Vec<u8> = projection[first * qkv..][..n * qkv]
+                .iter()
+                .chain(
+                    &gate[first * config.linear_num_value_heads..]
+                        [..n * config.linear_num_value_heads],
+                )
+                .chain(
+                    &beta[first * config.linear_num_value_heads..]
+                        [..n * config.linear_num_value_heads],
+                )
+                .flat_map(|x| x.to_ne_bytes())
+                .collect();
+            gpu.hip
+                .memcpy_htod(&captured.recurrence.buf, &recurrence)
+                .expect("recurrence inputs");
+            let inputs: Vec<u8> = projection[first * qkv..][..n * qkv]
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect();
+            gpu.hip
+                .memcpy_htod(&captured.inputs.buf, &inputs)
+                .expect("conv inputs");
+            gated_delta_step_batched(
+                gpu,
+                &GatedDeltaStepBatched {
+                    projection: &proj.sub_offset(first * qkv, n * qkv),
+                    gate: &gates.sub_offset(
+                        first * config.linear_num_value_heads,
+                        n * config.linear_num_value_heads,
+                    ),
+                    beta: &betas.sub_offset(
+                        first * config.linear_num_value_heads,
+                        n * config.linear_num_value_heads,
+                    ),
+                    state: &state.gdn[0].recurrent,
+                    format: state.gdn_format,
+                    residual: None,
+                    output: &output.sub_offset(first * value, n * value),
+                    row_states: Some(&captured.states),
+                    rows: n,
+                    qkv_width: qkv,
+                    key_heads: config.linear_num_key_heads,
+                    value_heads: config.linear_num_value_heads,
+                    key_dim: GDN_HEAD_DIM,
+                    value_dim: GDN_HEAD_DIM,
+                    position: start + first,
+                },
+            )
+            .expect("captured recurrence");
+            state.commit_row_capture(n);
+            for row in first..first + n {
+                advance_history(gpu, state, row);
+            }
+        };
+        for format in [GdnStateFormat::F32, GdnStateFormat::Q8] {
+            let state_format = Qwen4StateFormat {
+                gdn: format,
+                ..Qwen4StateFormat::F32
+            };
+            let mut reference =
+                Qwen4State::new(&mut gpu, &config, 256, state_format).expect("reference");
+            let mut candidate =
+                Qwen4State::new(&mut gpu, &config, 256, state_format).expect("candidate");
+            candidate
+                .ensure_row_capture(&mut gpu, rows, history)
+                .expect("64 ring");
+            let reference_history = reference.ple_history;
+            let seed = |gpu: &mut Gpu, state: &mut Qwen4State| {
+                if format == GdnStateFormat::F32 {
+                    gpu.copy_d2d(&initial, &state.gdn[0].recurrent, initial.byte_size())
+                        .expect("seed F32 recurrence");
+                } else {
+                    gpu.hip
+                        .memset(
+                            &state.gdn[0].recurrent.buf,
+                            0,
+                            state.gdn[0].recurrent.byte_size(),
+                        )
+                        .expect("clear Q8 seed");
+                    singleton(gpu, state, 0);
+                }
+                gpu.hip
+                    .memset(&state.gdn[0].conv.buf, 0x32, state.gdn[0].conv.byte_size())
+                    .expect("seed conv");
+                state.position = start;
+                state.ple_history = reference_history;
+            };
+            seed(&mut gpu, &mut reference);
+            let mut expected = vec![capture_semantic_digest(&reference, &mut gpu)];
+            for row in 0..rows + 3 {
+                singleton(&mut gpu, &reference, row);
+                advance_history(&mut gpu, &mut reference, row);
+                expected.push(capture_semantic_digest(&reference, &mut gpu));
+            }
+            for base in [0, rows] {
+                for keep in 0..=rows {
+                    candidate.set_gdn_live(if base == 0 { 2 * rows - 1 } else { rows - 1 });
+                    seed(&mut gpu, &mut candidate);
+                    let old_live = candidate.gdn_live;
+                    let state_units = candidate.gdn[0].recurrent.numel();
+                    let old_bytes = gpu
+                        .download_raw_bytes(&candidate.gdn[0].recurrent)
+                        .expect("old live bytes");
+                    let destination = candidate.row_capture[0]
+                        .0
+                        .sub_offset(base * state_units, rows * state_units);
+                    gpu.hip
+                        .memset(&destination.buf, 0xa5, destination.byte_size())
+                        .expect("poison free half");
+                    candidate.row_capture_armed = true;
+                    let ticket = candidate.snapshot(&mut gpu).expect("armed snapshot");
+                    capture(&mut gpu, &mut candidate, 0, rows);
+                    assert_eq!(candidate.gdn_live, base + rows - 1);
+                    let old_slot = candidate.row_capture[0]
+                        .0
+                        .sub_offset(old_live * state_units, state_units);
+                    assert_eq!(
+                        gpu.download_raw_bytes(&old_slot).expect("old slot"),
+                        old_bytes
+                    );
+                    for slot in [base, base + rows - 2] {
+                        let intermediate = candidate.row_capture[0]
+                            .0
+                            .sub_offset(slot * state_units, state_units);
+                        assert!(
+                            gpu.download_raw_bytes(&intermediate)
+                                .expect("uncaptured slot")
+                                .iter()
+                                .all(|byte| *byte == 0xa5),
+                            "intermediate state was materialized"
+                        );
+                    }
+                    candidate.row_capture_armed = false;
+                    if keep == 0 {
+                        candidate.restore(&mut gpu, ticket).expect("abort");
+                        assert_eq!(candidate.gdn_live, old_live);
+                    } else {
+                        if keep < rows {
+                            candidate
+                                .rollback_rows_retain(
+                                    &mut gpu,
+                                    ticket,
+                                    keep,
+                                    rows,
+                                    &tokens,
+                                    &ple,
+                                    0,
+                                    history,
+                                    config.indexer_compress_ratio,
+                                    config.indexer_budget,
+                                )
+                                .expect("native prefix repair");
+                        }
+                        assert_eq!(candidate.gdn_live, base + keep - 1);
+                        candidate.commit(ticket, &mut gpu).expect("commit prefix");
+                    }
+                    assert_eq!(
+                        capture_semantic_digest(&candidate, &mut gpu),
+                        expected[keep],
+                        "{format:?} base={base} keep={keep}"
+                    );
+                    singleton(&mut gpu, &candidate, keep);
+                    advance_history(&mut gpu, &mut candidate, keep);
+                    assert_eq!(
+                        capture_semantic_digest(&candidate, &mut gpu),
+                        expected[keep + 1]
+                    );
+                    let next_base = candidate.capture_base(candidate.gdn_live);
+                    candidate.row_capture_armed = true;
+                    let next = candidate.snapshot(&mut gpu).expect("continuation snapshot");
+                    capture(&mut gpu, &mut candidate, keep + 1, 2);
+                    candidate.row_capture_armed = false;
+                    candidate
+                        .commit(next, &mut gpu)
+                        .expect("continuation commit");
+                    assert_eq!(candidate.gdn_live, next_base + 1);
+                    assert_eq!(
+                        capture_semantic_digest(&candidate, &mut gpu),
+                        expected[keep + 3]
+                    );
+                }
+            }
+            reference.free_gpu(&mut gpu).expect("free reference");
+            candidate.free_gpu(&mut gpu).expect("free candidate");
+        }
+        for tensor in [proj, gates, betas, initial, output, ple] {
+            gpu.free_tensor(tensor).expect("free fixture");
+        }
+    }
+
+    #[test]
     fn map_ahead_draft_rows_cover_the_widest_scheduled_window() {
         // A window wider than the configured depth sets the bound.
         assert_eq!(map_ahead_draft_rows(3, 32), 31);
         assert_eq!(map_ahead_draft_rows(10, 9), 10);
+        let max = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        assert_eq!(map_ahead_draft_rows(3, max), max - 1);
         // No wider window: the configured depth (an AR lane has none).
         assert_eq!(map_ahead_draft_rows(0, 0), 0);
         assert_eq!(map_ahead_draft_rows(0, 1), 0);
         assert_eq!(map_ahead_draft_rows(7, 8), 7);
         // The widest window's end stays inside the mapped target.
-        let rows = map_ahead_draft_rows(3, 32);
-        let target = decode_map_ahead_tokens(100, Some(64), rows, 4096).unwrap();
-        assert!(target >= 100 + 64 - 1 + 32);
+        let drafts = map_ahead_draft_rows(3, max);
+        let target = decode_map_ahead_tokens(100, Some(64), drafts, 4096).unwrap();
+        assert!(target >= 100 + 64 - 1 + max);
     }
 
     #[test]

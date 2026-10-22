@@ -10,7 +10,15 @@
 //! load precedes the first barrier and none follows it, no weight load sits in a slot branch, the X staging and `vmcnt`
 //! ladder of the two-phase gate), the per-slot instruction census of K1's numerical tree (dequantization once per group,
 //! the partial/chain add per live slot, the fold and the bpermute reduction per live slot), the derived shape contract, the
-//! committed bundle and contract files, and (feature `toolchain`) wait replay and M7.
+//! committed eight-entry narrow + `_t8` production bundle and contracts, and (feature `toolchain`) narrow diagnostic wait replay and M7.
+//!
+//! Executed `_t8` consumers cover R1..64 with first/last production output blocks,
+//! independent C1 narrow-K1 references, descriptor-z/absolute-slot addressing,
+//! exact output bytes/write masks, sparse guard exits, clipped X, and count8
+//! output tails (including padded strides and the unaligned gate split).
+//! This is CPU evidence only: waits are no-ops and ended waves are excluded from
+//! barrier rendezvous. It proves neither hardware wait/barrier timing, native
+//! floating-point equivalence, capture/replay, throughput, nor product admission.
 use peacemaker_isa::emit::CODE_END_TAIL;
 use peacemaker_isa::kernels::mq_i4_moe_gemv_cn::{self as cn, Codec, Kind, Spec};
 use peacemaker_isa::{native, Arch};
@@ -20,6 +28,16 @@ const SYMBOLS: [&str; 4] = [
     "mq_i4_moe_gemv_cn_mq3i4_r128_down",
     "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up",
     "mq_i4_moe_gemv_cn_mq4sym_r128_down",
+];
+const PRODUCT_SYMBOLS: [&str; 8] = [
+    "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up",
+    "mq_i4_moe_gemv_cn_mq3i4_r128_down",
+    "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up",
+    "mq_i4_moe_gemv_cn_mq4sym_r128_down",
+    "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8",
+    "mq_i4_moe_gemv_cn_mq3i4_r128_down_t8",
+    "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up_t8",
+    "mq_i4_moe_gemv_cn_mq4sym_r128_down_t8",
 ];
 const MODULE: &str = "mq_i4_moe_gemv_cn_pm_gfx1151";
 /// K1's frozen ABI: `(offset, size, name)` in kernarg order.
@@ -93,6 +111,30 @@ fn mq4(spec: Spec) -> bool {
     spec.codec == Codec::Mq4Sym
 }
 
+/// Mirror RegistryCli: all narrow entries, then all rowtiles, in the same image.
+/// `cn::emit_module` deliberately remains the four-entry diagnostic API.
+fn product_module() -> (
+    Vec<peacemaker_isa::Emitted>,
+    String,
+    peacemaker_isa::kernels::iu4_gemm::ModuleProof,
+) {
+    let mut emitted = cn::module_specs()
+        .into_iter()
+        .map(cn::emit)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    emitted.extend(
+        cn::module_specs()
+            .into_iter()
+            .map(cn::emit_rowtiles)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    );
+    let (text, proof) =
+        peacemaker_isa::kernels::iu4_gemm::module(&emitted, &Spec::module()).unwrap();
+    (emitted, text, proof)
+}
+
 /// The trimmed lines of the kernel body (after `.Lcn_<tag>_body:` up to `_exit:`).
 fn kernel_lines(text: &str, spec: Spec) -> Vec<&str> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
@@ -117,7 +159,7 @@ fn between<'a>(body: &[&'a str], spec: Spec, from: &str, to: &str) -> Vec<&'a st
 }
 
 #[test]
-fn module_exports_are_the_four_frozen_symbols_in_order() {
+fn diagnostic_module_exports_are_the_four_frozen_symbols_in_order() {
     let specs = cn::module_specs();
     assert_eq!(specs.iter().map(Spec::symbol).collect::<Vec<_>>(), SYMBOLS);
     assert_eq!(cn::SYMBOLS, SYMBOLS);
@@ -151,6 +193,166 @@ fn module_exports_are_the_four_frozen_symbols_in_order() {
         );
     }
     assert!(text.contains("amdgcn-amd-amdhsa--gfx1151"));
+}
+
+#[test]
+fn production_module_exports_narrow_and_rowtiles_in_registry_order() {
+    let (emitted, text, proof) = product_module();
+    assert_eq!(emitted.len(), 8);
+    assert_eq!((proof.module.as_str(), proof.arch), (MODULE, Arch::Gfx1151));
+    assert_eq!(proof.kernels.len(), 8);
+    let exports: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(".amdhsa_kernel "))
+        .collect();
+    assert_eq!(exports, PRODUCT_SYMBOLS);
+    assert_eq!(text.matches(".globl ").count(), 8);
+    for symbol in PRODUCT_SYMBOLS {
+        assert!(text.contains(&format!(".globl {symbol}\n")), "{symbol}");
+        assert!(text.contains(&format!(".name: {symbol}\n")), "{symbol}");
+    }
+    assert!(text.contains("amdgcn-amd-amdhsa--gfx1151"));
+
+    let elf = native::assemble(&text, Arch::Gfx1151).unwrap();
+    let strings = section(&elf, ".strtab");
+    let mut exports: Vec<String> = section(&elf, ".symtab")
+        .chunks_exact(24)
+        .filter(|symbol| symbol[4] == 0x12 && u16_at(symbol, 6) != 0)
+        .map(|symbol| {
+            let start = u32_at(symbol, 0);
+            let end = start + strings[start..].iter().position(|&byte| byte == 0).unwrap();
+            String::from_utf8(strings[start..end].to_vec()).unwrap()
+        })
+        .collect();
+    exports.sort();
+    let mut expected = PRODUCT_SYMBOLS.map(str::to_owned);
+    expected.sort();
+    assert_eq!(exports, expected, "native production object exports");
+}
+
+/// The total-row tile ABI changes neither the 96-byte layout nor the cap8 bank.
+#[test]
+fn rowtiles_keep_the_frozen_abi_resources_and_derive_their_own_contracts() {
+    for spec in arch_specs() {
+        let e = cn::emit_rowtiles(spec).unwrap();
+        let again = cn::emit_rowtiles(spec).unwrap();
+        let narrow = cn::emit(spec).unwrap();
+        let symbol = format!("{}_t8", spec.symbol());
+        assert_eq!(e.s_text, again.s_text, "{symbol}: deterministic source");
+        assert_eq!(e.proof.s_text_sha256, again.proof.s_text_sha256);
+        assert_eq!(e.proof.variant, format!("{}_t8", spec.tag()));
+        for marker in [
+            format!(".amdhsa_kernel {symbol}\n"),
+            format!(".name: {symbol}\n"),
+            ".amdhsa_kernarg_size 96\n".to_owned(),
+            ".kernarg_segment_size: 96\n".to_owned(),
+            ".amdhsa_wavefront_size32 1\n".to_owned(),
+            ".amdhsa_system_sgpr_workgroup_id_y 1\n".to_owned(),
+            ".amdhsa_system_sgpr_workgroup_id_z 1\n".to_owned(),
+            ".private_segment_fixed_size: 0\n".to_owned(),
+            ".sgpr_spill_count: 0\n".to_owned(),
+            ".vgpr_spill_count: 0\n".to_owned(),
+        ] {
+            assert!(e.s_text.contains(&marker), "{symbol}: {marker}");
+        }
+        assert!(!narrow
+            .s_text
+            .contains(".amdhsa_system_sgpr_workgroup_id_z 1\n"));
+        assert_eq!(field(&e.s_text, ".offset:"), ARGS.map(|arg| arg.0));
+        assert_eq!(field(&e.s_text, ".size:"), ARGS.map(|arg| arg.1));
+        let names: Vec<&str> = e
+            .s_text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(".name: "))
+            .take(ARGS.len())
+            .collect();
+        assert_eq!(names, ARGS.map(|arg| arg.2));
+        for (name, access) in [
+            ("expert_weight_ptrs", "read_only"),
+            ("expert_ids", "read_only"),
+            ("expert_offsets", "read_only"),
+            ("slot_ids", "read_only"),
+            ("Xrot", "read_only"),
+            ("Y0", "write_only"),
+            ("Y1", "write_only"),
+        ] {
+            assert!(e.s_text.contains(&format!("      - .actual_access: {access}\n        .address_space: global\n        .name: {name}\n")), "{symbol}: {name} access");
+        }
+        assert!(
+            !e.s_text.contains("s[0:1], 0x5c"),
+            "{symbol}: reserved is unread"
+        );
+        assert_eq!(field(&e.s_text, ".max_flat_workgroup_size:"), [256]);
+        assert_eq!(
+            field(&e.s_text, ".group_segment_fixed_size:"),
+            [spec.kind.lds_bytes()]
+        );
+        assert_eq!(
+            field(&e.s_text, ".amdhsa_group_segment_fixed_size"),
+            [spec.kind.lds_bytes()]
+        );
+        assert_eq!(e.shape.next_free_vgpr, narrow.shape.next_free_vgpr);
+        assert_eq!(e.shape.next_free_sgpr, narrow.shape.next_free_sgpr);
+        assert!(e.shape.next_free_vgpr <= 128, "{symbol}");
+        assert_eq!(
+            field(&e.s_text, ".amdhsa_next_free_vgpr"),
+            [u32::from(e.shape.next_free_vgpr)]
+        );
+        assert_eq!(
+            field(&e.s_text, ".vgpr_count:"),
+            [u32::from(e.shape.next_free_vgpr)]
+        );
+        assert_eq!(field(&e.s_text, ".sgpr_count:"), [101]);
+        assert_eq!(e.shape.barriers, if gate(spec) { 3 } else { 1 });
+        assert!(
+            e.s_text.contains("s_mul_i32 s41, s4, 0x788"),
+            "{symbol}: descriptor stride"
+        );
+
+        let contract = cn::contract_rowtiles(spec, &e);
+        assert_eq!(contract, cn::contract_rowtiles(spec, &again));
+        assert_eq!(contract["symbol"].as_str(), Some(symbol.as_str()));
+        assert_eq!(
+            contract["vgpr_max"].as_u64(),
+            Some(u64::from(e.shape.next_free_vgpr))
+        );
+        assert_eq!(
+            contract["sgpr_max"].as_u64(),
+            Some(u64::from(e.shape.next_free_sgpr))
+        );
+        assert_eq!(contract["group_segment_fixed_bytes"], spec.kind.lds_bytes());
+        assert_eq!(contract["launch_dynamic_lds_bytes"], 0);
+        for flag in [
+            "require_wave32",
+            "require_zero_spills",
+            "require_zero_private",
+        ] {
+            assert_eq!(contract[flag], true, "{symbol}: {flag}");
+        }
+        assert_eq!(
+            contract["forbidden"],
+            cn::contract(spec, &narrow)["forbidden"]
+        );
+        for (name, n) in contract["counts"].as_object().unwrap() {
+            let have = e
+                .s_text
+                .lines()
+                .filter(|line| mnemonic(line) == name)
+                .count() as u64;
+            assert_eq!(n.as_u64(), Some(have), "{symbol}: {name}");
+        }
+        assert_eq!(
+            contract["counts"]["s_barrier"],
+            if gate(spec) { 3 } else { 1 }
+        );
+    }
+    for arch in [Arch::Gfx1100, Arch::Gfx1201, Arch::Gfx942] {
+        for codec in Codec::ALL {
+            for kind in Kind::ALL {
+                assert!(cn::emit_rowtiles(Spec { arch, codec, kind }).is_err());
+            }
+        }
+    }
 }
 
 /// Emission is bit-deterministic, and every architecture but gfx1151 is refused (no implicit alias).
@@ -1115,32 +1317,45 @@ fn shape_contract_is_derived_from_the_emission() {
     }
 }
 
-/// The shipped `kernels/mq_i4_moe_gemv_cn_pm_gfx1151.hxaco` is exactly what the builder emits today (the whole offload
-/// bundle, byte for byte, native writer, no ROCm), and the committed contract files are the derived contracts.
+/// The shipped eight-entry production bundle is exactly the RegistryCli composition,
+/// byte for byte (native writer, no ROCm), including all narrow and `_t8` contracts.
 #[test]
 fn committed_bundle_and_contracts_equal_fresh_emission() {
     let root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
     let path = format!("{root}/kernels/{MODULE}.hxaco");
     let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_moe_gemv_cn --arch gfx1151 --epi all ... --bundle)"));
-    let (emitted, text, _) = cn::emit_module().unwrap();
+    let (emitted, text, _) = product_module();
+    assert_eq!(emitted.len(), PRODUCT_SYMBOLS.len());
     let elf = native::assemble(&text, Arch::Gfx1151).unwrap();
     let fresh = native::bundle(&elf, Arch::Gfx1151, native::DEFAULT_HOST_TARGET);
     assert!(
         committed == fresh,
         "{MODULE}: fresh emission differs from the committed bundle {path}"
     );
-    for (spec, e) in arch_specs().into_iter().zip(&emitted) {
+    let entries = [false, true]
+        .into_iter()
+        .flat_map(|tiled| arch_specs().into_iter().map(move |spec| (tiled, spec)));
+    for ((tiled, spec), e) in entries.zip(&emitted) {
+        let tag = if tiled {
+            format!("{}_t8", spec.tag())
+        } else {
+            spec.tag()
+        };
         let file = format!(
             "{}/kernels/mq_i4_moe_gemv_cn.gfx1151.{}.contract.json",
             env!("CARGO_MANIFEST_DIR"),
-            spec.tag()
+            tag
         );
         let committed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap_or_else(|e| panic!("{file}: {e}")))
                 .unwrap();
         assert_eq!(
             committed,
-            cn::contract(spec, e),
+            if tiled {
+                cn::contract_rowtiles(spec, e)
+            } else {
+                cn::contract(spec, e)
+            },
             "{file}: committed contract differs from the derived contract"
         );
     }
@@ -1385,25 +1600,34 @@ struct Rig {
     cn: peacemaker_ir::Program,
     k1: peacemaker_ir::Program,
 }
+fn lift_program(text: &str) -> peacemaker_ir::Program {
+    let elf = native::assemble(text, Arch::Gfx1151).unwrap();
+    peacemaker_lift::lift_object(
+        &elf,
+        peacemaker_lift::Options {
+            frontend: Frontend::Builder,
+        },
+    )
+    .unwrap()
+    .program
+}
 impl Rig {
     fn new() -> Self {
-        let lift = |text: &str| {
-            let elf = native::assemble(text, Arch::Gfx1151).unwrap();
-            peacemaker_lift::lift_object(
-                &elf,
-                peacemaker_lift::Options {
-                    frontend: Frontend::Builder,
-                },
-            )
-            .unwrap()
-            .program
-        };
         let (_, cn_text, _) = cn::emit_module().unwrap();
         let (_, k1_text, _) = k1::emit_module(Arch::Gfx1151).unwrap();
         Rig {
-            cn: lift(&cn_text),
-            k1: lift(&k1_text),
+            cn: lift_program(&cn_text),
+            k1: lift_program(&k1_text),
         }
+    }
+}
+
+fn rowtile_rig() -> Rig {
+    let (_, text, _) = product_module();
+    let (_, k1_text, _) = k1::emit_module(Arch::Gfx1151).unwrap();
+    Rig {
+        cn: lift_program(&text),
+        k1: lift_program(&k1_text),
     }
 }
 
@@ -1597,6 +1821,431 @@ fn run_k1(rig: &Rig, d: &Data, id: i32) -> Result<Out, String> {
     Ok(collect(&mem, ["r0", "r1"]))
 }
 
+type TileGroups = Vec<Vec<(u32, Vec<u32>)>>;
+#[derive(Clone)]
+struct TileCase {
+    spec: Spec,
+    rows: u32,
+    m: usize,
+    k: usize,
+    x_stride: u32,
+    y_stride: u32,
+    x_src_rows: u32,
+    n_experts: u32,
+    x: std::sync::Arc<[u8]>,
+    tensors: Vec<std::sync::Arc<[u8]>>,
+    descriptor: Vec<u8>,
+    groups: TileGroups,
+    bucket: usize,
+}
+fn tile_case(spec: Spec, rows: u32, m: usize, x_pad: u32, y_pad: usize) -> TileCase {
+    let k = spec.kind.k() as usize;
+    let x_stride = spec.kind.k() + x_pad;
+    let gate = spec.kind == Kind::GateUp;
+    let y_stride = (if gate { m / 2 } else { m }) as u32 + y_pad as u32;
+    let x_src_rows = if gate { rows } else { 10 * rows };
+    let mut rng =
+        Rng(0x9e37_79b9_7f4a_7c15 ^ k as u64 ^ ((spec.codec as u64) << 40) ^ ((m as u64) << 24));
+    let n_tiles = rows.div_ceil(8) as usize;
+    let mut tensors = Vec::new();
+    for _ in 0..2usize {
+        tensors.push(
+            match spec.codec {
+                Codec::Mq3I4 => w3_tensor(&mut rng, m, k),
+                Codec::Mq4Sym => mq4_tensor(&mut rng, spec.kind, m, k),
+            }
+            .into(),
+        );
+    }
+    let mut x = vec![0u8; x_src_rows as usize * x_stride as usize * 4];
+    let xr = x_rows(&mut rng, x_src_rows as usize, k);
+    for r in 0..x_src_rows as usize {
+        x[r * x_stride as usize * 4..r * x_stride as usize * 4 + k * 4]
+            .copy_from_slice(&xr[r * k * 4..(r + 1) * k * 4]);
+        for b in x[r * x_stride as usize * 4 + k * 4..(r + 1) * x_stride as usize * 4].iter_mut() {
+            *b = SENTINEL;
+        }
+    }
+    let mut groups: TileGroups = Vec::new();
+    for tile in 0..n_tiles {
+        let mut tile_groups: Vec<(u32, Vec<u32>)> = Vec::new();
+        let start = tile * 8;
+        for token in 0..8u32 {
+            let r = start as u32 + token;
+            if r >= rows {
+                break;
+            }
+            let rank = if r % 2 == 0 { 0u32 } else { 9u32 };
+            let slot = 10 * r + rank;
+            let expert = if tile % 2 == 0 { 0u32 } else { E_N - 1 };
+            if let Some((_, slots)) = tile_groups.iter_mut().find(|(e, _)| *e == expert) {
+                slots.push(slot);
+            } else {
+                tile_groups.push((expert, vec![slot]));
+            }
+        }
+        groups.push(tile_groups);
+    }
+    let bucket = usize::from(spec.codec == Codec::Mq4Sym);
+    let descriptor = tile_descriptors(bucket, &groups);
+    TileCase {
+        spec,
+        rows,
+        m,
+        k,
+        x_stride,
+        y_stride,
+        x_src_rows,
+        n_experts: E_N,
+        x: x.into(),
+        tensors,
+        descriptor,
+        groups,
+        bucket,
+    }
+}
+fn tile_descriptors(bucket: usize, groups: &TileGroups) -> Vec<u8> {
+    let mut words = vec![0u32; 482 * groups.len().max(1)];
+    for (tile, tile_groups) in groups.iter().enumerate() {
+        let base = tile * 482;
+        let off = base + 160 + bucket * 81;
+        let count: usize = tile_groups.iter().map(|(_, s)| s.len()).sum();
+        for o in 0..81usize {
+            words[off + o] = count as u32;
+        }
+        let mut position = 0usize;
+        for (gi, (expert, slots)) in tile_groups.iter().enumerate() {
+            words[base + bucket * 80 + gi] = *expert;
+            words[off + gi] = position as u32;
+            for (j, slot) in slots.iter().enumerate() {
+                words[base + 322 + bucket * 80 + position + j] = *slot;
+            }
+            position += slots.len();
+        }
+    }
+    words.into_iter().flat_map(u32::to_le_bytes).collect()
+}
+fn encode_kernarg(ptrs: [u64; 7], values: [u32; 10]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
+    for p in ptrs {
+        out.extend(p.to_le_bytes());
+    }
+    for v in values {
+        out.extend(v.to_le_bytes());
+    }
+    assert_eq!(out.len(), 96);
+    out
+}
+fn tile_kernarg(case: &TileCase) -> Vec<u8> {
+    let ids = E_IDS + GUARD as u64 + case.bucket as u64 * 80 * 4;
+    let offs = E_IDS + GUARD as u64 + (160 + 81 * case.bucket as u64) * 4;
+    let slots = E_IDS + GUARD as u64 + (322 + 80 * case.bucket as u64) * 4;
+    let gate = case.spec.kind == Kind::GateUp;
+    encode_kernarg(
+        [
+            E_TABLE,
+            ids,
+            offs,
+            slots,
+            E_X,
+            E_Y0 + GUARD as u64,
+            if gate { E_Y1 + GUARD as u64 } else { 0 },
+        ],
+        [
+            case.m as u32,
+            case.k as u32,
+            80,
+            case.rows,
+            if gate { 10 } else { 1 },
+            case.x_src_rows,
+            case.x_stride,
+            case.y_stride,
+            case.n_experts,
+            0,
+        ],
+    )
+}
+fn tile_memory(case: &TileCase) -> Result<Memory, String> {
+    let mut mem = Memory::default();
+    let mut table = vec![0u8; case.n_experts as usize * 8];
+    for (tensor, expert) in case.tensors.iter().zip([0, case.n_experts - 1]) {
+        let base = E_EXPERTS + u64::from(expert) * E_STRIDE;
+        assert!((tensor.len() as u64) < E_STRIDE);
+        table[expert as usize * 8..expert as usize * 8 + 8].copy_from_slice(&base.to_le_bytes());
+        mem.map(format!("e{expert}"), base, tensor.to_vec())?;
+    }
+    mem.map("table".into(), E_TABLE, table)?;
+    let mut descriptor = vec![SENTINEL; GUARD];
+    descriptor.extend_from_slice(&case.descriptor);
+    descriptor.extend_from_slice(&[SENTINEL; GUARD]);
+    mem.map("desc".into(), E_IDS, descriptor)?;
+    if case.x_src_rows != 0 {
+        let extent = case.x_src_rows as usize * case.x_stride as usize * 4;
+        mem.map("x".into(), E_X, case.x[..extent].to_vec())?;
+    }
+    let gate = case.spec.kind == Kind::GateUp;
+    let total = 10 * case.rows as usize * case.y_stride as usize * 4 + 2 * GUARD;
+    mem.map("y0".into(), E_Y0, vec![SENTINEL; total])?;
+    if gate {
+        mem.map("y1".into(), E_Y1, vec![SENTINEL; total])?;
+    }
+    Ok(mem)
+}
+fn run_t8(rig: &Rig, case: &TileCase, workgroups: &[[u32; 3]]) -> Result<Memory, String> {
+    let mut mem = tile_memory(case)?;
+    mem.map("kernarg".into(), E_KERNARG, tile_kernarg(case))?;
+    let before = mem.clone();
+    let emu = Emulator::new(&rig.cn, &format!("{}_t8", case.spec.symbol()))?;
+    for wg in workgroups {
+        emu.run_workgroup(
+            &Launch {
+                kernarg_ptr: E_KERNARG,
+                workgroup: *wg,
+                block: [256, 1, 1],
+                dynamic_lds: 0,
+            },
+            &mut mem,
+        )?;
+    }
+    assert_immutable(&before, &mem);
+    Ok(mem)
+}
+fn run_k1_singleton(
+    rig: &Rig,
+    case: &TileCase,
+    token: u32,
+    rank: u32,
+    expert: u32,
+    output_rows: &[u32],
+) -> Result<Vec<[u8; 4]>, String> {
+    assert!(token < case.rows && rank < 10);
+    let gate = case.spec.kind == Kind::GateUp;
+    let xdiv = if gate { 10u32 } else { 1u32 };
+    let mut mem = Memory::default();
+    let mut table = vec![0u8; case.n_experts as usize * 8];
+    let base = E_EXPERTS + u64::from(expert) * E_STRIDE;
+    table[expert as usize * 8..expert as usize * 8 + 8].copy_from_slice(&base.to_le_bytes());
+    mem.map("table".into(), E_TABLE, table)?;
+    let tensor = &case.tensors[usize::from(expert != 0)];
+    mem.map(format!("e{expert}"), base, tensor.to_vec())?;
+    mem.map("ids".into(), E_IDS, (expert).to_le_bytes().to_vec())?;
+    mem.map(
+        "offs".into(),
+        E_OFFS,
+        [0u32, 1u32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+    )?;
+    mem.map("slots".into(), E_SLOTS, rank.to_le_bytes().to_vec())?;
+    let k = case.k as u32;
+    let xrows_full = if gate { 1 } else { 10 };
+    let ys = if gate { case.m / 2 } else { case.m } as u32;
+    let ybytes = 10 * ys as usize * 4 + 2 * GUARD;
+    mem.map("r0".into(), E_R0, vec![SENTINEL; ybytes])?;
+    if gate {
+        mem.map("r1".into(), E_R1, vec![SENTINEL; ybytes])?;
+    }
+    let first = if gate { token } else { 10 * token };
+    let local_xrows = case.x_src_rows.saturating_sub(first).min(xrows_full);
+    if local_xrows != 0 {
+        let mut x = Vec::with_capacity(local_xrows as usize * case.k * 4);
+        for row in first..first + local_xrows {
+            let start = row as usize * case.x_stride as usize * 4;
+            x.extend_from_slice(&case.x[start..start + case.k * 4]);
+        }
+        mem.map("x".into(), E_X, x)?;
+    }
+    let codec = match case.spec.codec {
+        Codec::Mq3I4 => k1::Codec::Mq3I4,
+        Codec::Mq4Sym => k1::Codec::Mq4Sym,
+    };
+    let kind = match case.spec.kind {
+        Kind::GateUp => k1::Kind::GateUp,
+        Kind::Down => k1::Kind::Down,
+    };
+    let karg = encode_kernarg(
+        [
+            E_TABLE,
+            E_IDS,
+            E_OFFS,
+            E_SLOTS,
+            E_X,
+            E_R0 + GUARD as u64,
+            if gate { E_R1 + GUARD as u64 } else { 0 },
+        ],
+        [
+            case.m as u32,
+            k,
+            1,
+            1,
+            xdiv,
+            local_xrows,
+            k,
+            ys,
+            case.n_experts,
+            0,
+        ],
+    );
+    mem.map("kernarg".into(), E_KERNARG_REF, karg)?;
+    let before = mem.clone();
+    let emu = Emulator::new(
+        &rig.k1,
+        &k1::Spec::narrow(Arch::Gfx1151, codec, kind).symbol(),
+    )?;
+    for row in output_rows {
+        emu.run_workgroup(
+            &Launch {
+                kernarg_ptr: E_KERNARG_REF,
+                workgroup: [*row, 0, 0],
+                block: [32, 1, 1],
+                dynamic_lds: 0,
+            },
+            &mut mem,
+        )?;
+    }
+    assert_immutable(&before, &mem);
+    let r0 = mem
+        .read(E_R0 + GUARD as u64, 10 * ys as usize * 4)?
+        .to_vec();
+    let r1 = if gate {
+        mem.read(E_R1 + GUARD as u64, 10 * ys as usize * 4)?
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    let at = |slot: u32, row: u32| -> [u8; 4] {
+        if gate {
+            let mi = case.m as u32 / 2;
+            let (buf, rr) = if row < mi {
+                (&r0, row)
+            } else {
+                (&r1, row - mi)
+            };
+            let o = (slot as usize * ys as usize + rr as usize) * 4;
+            [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]
+        } else {
+            let o = (slot as usize * ys as usize + row as usize) * 4;
+            [r0[o], r0[o + 1], r0[o + 2], r0[o + 3]]
+        }
+    };
+    let words: Vec<_> = output_rows.iter().map(|row| at(rank, *row)).collect();
+    for (which, name) in [(0, "r0"), (1, "r1")] {
+        if which == 1 && !gate {
+            continue;
+        }
+        let mut expected = vec![SENTINEL; ybytes];
+        let mut written = vec![false; ybytes];
+        for (&row, word) in output_rows.iter().zip(&words) {
+            let is_y1 = gate && row >= case.m as u32 / 2;
+            if usize::from(is_y1) != which {
+                continue;
+            }
+            let local = if is_y1 { row - case.m as u32 / 2 } else { row };
+            let offset = GUARD + 4 * (rank as usize * ys as usize + local as usize);
+            expected[offset..offset + 4].copy_from_slice(word);
+            written[offset..offset + 4].fill(true);
+        }
+        assert_output_map(&mem, name, &expected, &written);
+    }
+    Ok(words)
+}
+fn assert_immutable(before: &Memory, after: &Memory) {
+    for b in &before.regions {
+        let a = after
+            .regions
+            .iter()
+            .find(|r| r.name == b.name)
+            .unwrap_or_else(|| panic!("region {} missing after", b.name));
+        let input = !matches!(b.name.as_str(), "y0" | "y1" | "r0" | "r1");
+        if input {
+            assert!(a.bytes == b.bytes, "input region {} changed", b.name);
+            for i in 0..b.bytes.len() {
+                assert!(
+                    !a.written.contains(i),
+                    "input region {} byte {i} written",
+                    b.name
+                );
+            }
+        }
+    }
+}
+fn assert_output_map(mem: &Memory, region: &str, expected: &[u8], expected_written: &[bool]) {
+    let r = mem
+        .regions
+        .iter()
+        .find(|r| r.name == region)
+        .unwrap_or_else(|| panic!("region {region} missing"));
+    assert_eq!(r.bytes.len(), expected.len(), "{region}: length");
+    assert_eq!(r.bytes, expected, "{region}: bytes");
+    assert_eq!(
+        r.written.count(),
+        expected_written.iter().filter(|b| **b).count(),
+        "{region}: written count"
+    );
+    for (i, w) in expected_written.iter().enumerate() {
+        assert_eq!(r.written.contains(i), *w, "{region}: byte {i}");
+    }
+}
+
+/// Scatter independent C1 words; all other bytes and write bits stay untouched.
+fn assert_tile_reference(
+    rig: &Rig,
+    tile: &TileCase,
+    mem: &Memory,
+    wgs: &[[u32; 3]],
+    require_nonzero: bool,
+) {
+    let gate = tile.spec.kind == Kind::GateUp;
+    let len = 10 * tile.rows as usize * tile.y_stride as usize * 4 + 2 * GUARD;
+    let mut expected = [
+        vec![SENTINEL; len],
+        vec![SENTINEL; if gate { len } else { 0 }],
+    ];
+    let mut written = [vec![false; len], vec![false; if gate { len } else { 0 }]];
+    let mut varied = std::collections::HashSet::new();
+    let mut live = 0;
+    for &[x, u, z] in wgs {
+        let (expert, slots) = &tile.groups[z as usize][u as usize];
+        let rows: Vec<u32> = (8 * x..(8 * x + 8).min(tile.m as u32)).collect();
+        for &slot in slots {
+            let words = run_k1_singleton(rig, tile, slot / 10, slot % 10, *expert, &rows)
+                .unwrap_or_else(|e| panic!("{} slot {slot}: K1: {e}", tile.spec.tag()));
+            for (&row, word) in rows.iter().zip(words) {
+                let value = f32::from_le_bytes(word);
+                assert!(
+                    value.is_finite(),
+                    "{} slot {slot} row {row}",
+                    tile.spec.tag()
+                );
+                varied.insert(value.to_bits());
+                let (which, local_row) = if gate && row >= tile.m as u32 / 2 {
+                    (1, row - tile.m as u32 / 2)
+                } else {
+                    (0, row)
+                };
+                let at = GUARD + 4 * (slot as usize * tile.y_stride as usize + local_row as usize);
+                expected[which][at..at + 4].copy_from_slice(&word);
+                assert!(written[which][at..at + 4].iter().all(|v| !v));
+                written[which][at..at + 4].fill(true);
+                live += 1;
+            }
+        }
+    }
+    assert!(live > 0);
+    if require_nonzero {
+        assert!(
+            varied.iter().any(|v| f32::from_bits(*v) != 0.0),
+            "zero-only K1"
+        );
+        assert!(varied.len() > 1, "constant K1");
+    }
+    assert_output_map(mem, "y0", &expected[0], &written[0]);
+    if gate {
+        assert_output_map(mem, "y1", &expected[1], &written[1]);
+    }
+}
+
 /// Invalid ids `-1`, `i32::MIN` (whose `<< 3` is 0: unguarded it would alias table entry 0 and run the expert through it),
 /// `n` and `n + 1` (one past a table with exactly `n` entries, whose weight-pointer read would fault) exit with no store; the
 /// valid id `n - 1` produces exactly the bytes the permissive `n_experts = u32::MAX` run produces AND the bytes of the
@@ -1652,6 +2301,316 @@ fn out_of_range_expert_ids_exit_with_no_store_or_dereference_and_valid_ids_are_u
         );
     }
 }
+#[test]
+fn rowtiles_all_rows_match_independent_k1_singletons() {
+    let rig = rowtile_rig();
+    // Reuse identical maximum-width inputs and independent references across R.
+    let mut fixtures: Vec<_> = arch_specs()
+        .into_iter()
+        .map(|spec| {
+            let m = if spec.kind == Kind::GateUp {
+                1280
+            } else {
+                2560
+            };
+            (
+                tile_case(spec, 64, m, 0, 0),
+                std::collections::HashMap::<(u32, u32, u32, u32), [u8; 4]>::new(),
+            )
+        })
+        .collect();
+    for rows in [9u32].into_iter().chain((1..=64).filter(|r| *r != 9)) {
+        // All four R9 cases precede expansion to every remaining R exactly once.
+        for (maximum, cache) in &mut fixtures {
+            let mut tile = maximum.clone();
+            let spec = tile.spec;
+            let case = spec.tag();
+            let m = tile.m;
+            let gate = spec.kind == Kind::GateUp;
+            let ys = tile.y_stride;
+            let xgs = [0, (m as u32).div_ceil(8) - 1];
+            tile.rows = rows;
+            tile.x_src_rows = if gate { rows } else { 10 * rows };
+            tile.groups.truncate(rows.div_ceil(8) as usize);
+            tile.groups.last_mut().unwrap()[0]
+                .1
+                .retain(|slot| *slot < 10 * rows);
+            tile.descriptor = tile_descriptors(tile.bucket, &tile.groups);
+            let n_tiles = rows.div_ceil(8);
+            let mut wgs: Vec<[u32; 3]> = Vec::new();
+            for xg in xgs {
+                for z in (0..n_tiles).rev() {
+                    wgs.push([xg, 0, z]);
+                }
+            }
+            let mem = run_t8(&rig, &tile, &wgs)
+                .unwrap_or_else(|e| panic!("{case}: R{rows}: t8 fault: {e}"));
+            let mut exp0 = vec![SENTINEL; 10 * rows as usize * ys as usize * 4 + 2 * GUARD];
+            let mut exp1 = if gate {
+                Some(vec![
+                    SENTINEL;
+                    10 * rows as usize * ys as usize * 4 + 2 * GUARD
+                ])
+            } else {
+                None
+            };
+            let mut w0 = vec![false; exp0.len()];
+            let mut w1 = if gate {
+                Some(vec![false; exp0.len()])
+            } else {
+                None
+            };
+            let mut live = 0usize;
+            let mut ref_nonzero = 0usize;
+            let mut ref_varied = std::collections::HashSet::new();
+            for token in 0..rows {
+                let rank = if token % 2 == 0 { 0u32 } else { 9u32 };
+                let slot = 10 * token + rank;
+                let expert = if (token / 8) % 2 == 0 { 0u32 } else { E_N - 1 };
+                for xg in xgs {
+                    let out_rows: Vec<u32> = (0..8u32)
+                        .map(|w| xg * 8 + w)
+                        .filter(|r| (*r as usize) < m)
+                        .collect();
+                    if !cache.contains_key(&(token, rank, expert, out_rows[0])) {
+                        let words = run_k1_singleton(&rig, &tile, token, rank, expert, &out_rows)
+                            .unwrap_or_else(|e| panic!("{case}: R{rows} token {token}: K1: {e}"));
+                        for (&row, word) in out_rows.iter().zip(words) {
+                            cache.insert((token, rank, expert, row), word);
+                        }
+                    }
+                    let refs: Vec<_> = out_rows
+                        .iter()
+                        .map(|row| cache[&(token, rank, expert, *row)])
+                        .collect();
+                    for (row, word) in out_rows.iter().zip(refs.iter()) {
+                        let w = u32::from_le_bytes(*word);
+                        assert!(
+                            f32::from_bits(w).is_finite(),
+                            "{case}: R{rows} token {token} row {row}: non-finite {w:#x}"
+                        );
+                        if w != 0 {
+                            ref_nonzero += 1;
+                        }
+                        ref_varied.insert(w);
+                        let o = (slot as usize * ys as usize
+                            + if gate {
+                                let mi = m as u32 / 2;
+                                if *row < mi {
+                                    *row
+                                } else {
+                                    *row - mi
+                                }
+                            } else {
+                                *row
+                            } as usize)
+                            * 4;
+                        if gate {
+                            let mi = m as u32 / 2;
+                            if *row < mi {
+                                exp0[GUARD + o..GUARD + o + 4].copy_from_slice(word);
+                                for b in 0..4 {
+                                    w0[GUARD + o + b] = true;
+                                }
+                            } else if let (Some(e1), Some(ww1)) = (exp1.as_mut(), w1.as_mut()) {
+                                e1[GUARD + o..GUARD + o + 4].copy_from_slice(word);
+                                for b in 0..4 {
+                                    ww1[GUARD + o + b] = true;
+                                }
+                            }
+                        } else {
+                            exp0[GUARD + o..GUARD + o + 4].copy_from_slice(word);
+                            for b in 0..4 {
+                                w0[GUARD + o + b] = true;
+                            }
+                        }
+                        live += 1;
+                    }
+                }
+            }
+            assert!(live > 0, "{case}: R{rows}: no live words");
+            assert!(ref_nonzero > 0, "{case}: R{rows}: zero-only reference");
+            assert!(ref_varied.len() > 1, "{case}: R{rows}: constant reference");
+            assert_output_map(&mem, "y0", &exp0, &w0);
+            if let (Some(e1), Some(ww1)) = (exp1.as_ref(), w1.as_ref()) {
+                assert_output_map(&mem, "y1", e1, ww1);
+            }
+        }
+    }
+}
+#[test]
+fn rowtiles_output_tails_stage_all_slots_without_loading_tail_weights() {
+    let rig = rowtile_rig();
+    for spec in arch_specs() {
+        let gate = spec.kind == Kind::GateUp;
+        let m = if gate { 1282 } else { 2563 };
+        for (x_pad, y_pad) in [(0, 0), (4, 5)] {
+            let tile = tile_case(spec, 8, m, x_pad, y_pad);
+            let mut blocks = vec![(m as u32).div_ceil(8) - 1];
+            if gate {
+                blocks.push(m as u32 / 2 / 8);
+            }
+            for x in blocks {
+                let wgs = [[x, 0, 0]];
+                let mem = run_t8(&rig, &tile, &wgs).unwrap_or_else(|e| {
+                    panic!("{} tail block{x}, padding{x_pad}/{y_pad}: {e}", spec.tag())
+                });
+                assert_tile_reference(&rig, &tile, &mem, &wgs, true);
+            }
+        }
+        if gate {
+            for zero_phase in 0..2 {
+                let mut tile = tile_case(spec, 8, m, 0, 0);
+                // Actual stage_x_phase uses col = phase*1280 + lane*4 + j*128.
+                let half = tile.k / 2;
+                let x = std::sync::Arc::make_mut(&mut tile.x);
+                for row in 0..tile.x_src_rows as usize {
+                    let start = (row * tile.x_stride as usize + zero_phase * half) * 4;
+                    x[start..start + half * 4].fill(0);
+                }
+                let wgs = [[(m as u32).div_ceil(8) - 1, 0, 0]];
+                let mem = run_t8(&rig, &tile, &wgs)
+                    .unwrap_or_else(|e| panic!("{} zero phase{zero_phase}: {e}", spec.tag()));
+                assert_tile_reference(&rig, &tile, &mem, &wgs, true);
+            }
+        }
+    }
+}
+
+#[test]
+fn rowtiles_invalid_descriptors_exit_without_downstream_dereference() {
+    let rig = rowtile_rig();
+    for spec in arch_specs() {
+        let gate = spec.kind == Kind::GateUp;
+        let m = if gate { 1280 } else { 2560 };
+        let base_tile = tile_case(spec, 64, m, 0, 0);
+        // Only map the particular fields that must precede the targeted exit.
+        // In particular, offsets/IDs never make slots or the table readable.
+        let run_sparse = |karg: Vec<u8>, wg: [u32; 3], desc: Option<(i32, u32, u32, Vec<u32>)>| {
+            let mut mem = Memory::default();
+            let len = 640 * base_tile.y_stride as usize * 4 + 2 * GUARD;
+            mem.map("y0".into(), E_Y0, vec![SENTINEL; len]).unwrap();
+            if gate {
+                mem.map("y1".into(), E_Y1, vec![SENTINEL; len]).unwrap();
+            }
+            if let Some((id, start, end, slots)) = desc {
+                let z = u64::from(wg[2]) * 1928;
+                let pointer = |at| u64::from_le_bytes(karg[at..at + 8].try_into().unwrap()) + z;
+                mem.map("ids".into(), pointer(8), id.to_le_bytes().to_vec())
+                    .unwrap();
+                mem.map(
+                    "offsets".into(),
+                    pointer(16),
+                    [start, end]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                )
+                .unwrap();
+                if !slots.is_empty() {
+                    mem.map(
+                        "slots".into(),
+                        pointer(24) + u64::from(start) * 4,
+                        slots.into_iter().flat_map(u32::to_le_bytes).collect(),
+                    )
+                    .unwrap();
+                }
+            }
+            mem.map("kernarg".into(), E_KERNARG, karg).unwrap();
+            let before = mem.clone();
+            let emu = Emulator::new(&rig.cn, &format!("{}_t8", spec.symbol())).unwrap();
+            emu.run_workgroup(
+                &Launch {
+                    kernarg_ptr: E_KERNARG,
+                    workgroup: wg,
+                    block: [256, 1, 1],
+                    dynamic_lds: 0,
+                },
+                &mut mem,
+            )
+            .unwrap_or_else(|e| panic!("{} sparse {wg:?}: {e}", spec.tag()));
+            assert_immutable(&before, &mem);
+            let poison = vec![SENTINEL; len];
+            let unwritten = vec![false; len];
+            assert_output_map(&mem, "y0", &poison, &unwritten);
+            if gate {
+                assert_output_map(&mem, "y1", &poison, &unwritten);
+            }
+        };
+        for (offset, value) in [
+            (68, 0),
+            (68, 65),
+            (64, 79),
+            (64, 81),
+            (60, base_tile.k as u32 + 128),
+        ] {
+            let mut karg = tile_kernarg(&base_tile);
+            karg[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            run_sparse(karg, [0, 0, 0], None);
+        }
+        for wg in [[(m as u32).div_ceil(8), 0, 0], [0, 80, 0], [0, 0, 8]] {
+            run_sparse(tile_kernarg(&base_tile), wg, None);
+        }
+        for z in [0, 7] {
+            run_sparse(tile_kernarg(&base_tile), [0, 0, z], Some((0, 0, 0, vec![])));
+        }
+        for (start, end) in [(0, 9), (8, 7), (81, 82), (79, 81)] {
+            run_sparse(
+                tile_kernarg(&base_tile),
+                [0, 0, 0],
+                Some((0, start, end, vec![])),
+            );
+        }
+        {
+            let mut karg = tile_kernarg(&base_tile);
+            karg[68..72].copy_from_slice(&1u32.to_le_bytes());
+            run_sparse(karg, [0, 0, 0], Some((0, 8, 11, vec![])));
+        }
+        for id in [-1, i32::MIN, E_N as i32, E_N as i32 + 1] {
+            run_sparse(
+                tile_kernarg(&base_tile),
+                [0, 0, 0],
+                Some((id, 0, 1, vec![])),
+            );
+        }
+        {
+            let mut karg = tile_kernarg(&base_tile);
+            karg[88..92].copy_from_slice(&0u32.to_le_bytes());
+            run_sparse(karg, [0, 0, 0], Some((0, 0, 1, vec![])));
+        }
+        for position in 0..8 {
+            for bad in [640, u32::MAX] {
+                let mut slots: Vec<u32> = (0..8).collect();
+                slots[position] = bad;
+                run_sparse(tile_kernarg(&base_tile), [0, 0, 0], Some((0, 0, 8, slots)));
+            }
+        }
+        // Source clipping zero-fills contributions, but still writes live Y.
+        // The singleton reference uses the same bounds with token-local X.
+        for source_rows in [if gate { 7 } else { 79 }, 0] {
+            let mut tile = tile_case(spec, 8, m, 0, 0);
+            tile.x_src_rows = source_rows;
+            let wgs = [[0, 0, 0], [(m as u32).div_ceil(8) - 1, 0, 0]];
+            let mem = run_t8(&rig, &tile, &wgs)
+                .unwrap_or_else(|e| panic!("{} X rows{source_rows}: {e}", spec.tag()));
+            assert_tile_reference(&rig, &tile, &mem, &wgs, source_rows != 0);
+            assert_eq!(mem.regions.iter().any(|r| r.name == "x"), source_rows != 0);
+        }
+        // Ten experts, eight slots each: the last list is exactly [72,80).
+        // Only the two launched experts have readable table entries/tensors.
+        let mut distinct = base_tile.clone();
+        distinct.n_experts = 10;
+        distinct.groups[7] = (0..10u32)
+            .map(|expert| (expert, (56..64).map(|token| 10 * token + expert).collect()))
+            .collect();
+        distinct.descriptor = tile_descriptors(distinct.bucket, &distinct.groups);
+        let last = (m as u32).div_ceil(8) - 1;
+        let wgs = [[0, 0, 7], [0, 9, 7], [last, 0, 7], [last, 9, 7]];
+        let mem = run_t8(&rig, &distinct, &wgs)
+            .unwrap_or_else(|e| panic!("{} terminal offset80: {e}", spec.tag()));
+        assert_tile_reference(&rig, &distinct, &mem, &wgs, true);
+    }
+}
 
 #[cfg(feature = "toolchain")]
 mod toolchain {
@@ -1662,12 +2621,20 @@ mod toolchain {
     /// parses as an `IsaShapeContract`, and M7 lifts the natively linked object byte-exactly with no obligations.
     #[test]
     fn every_export_passes_wait_replay_and_m7() {
-        let (emitted, text, _) = cn::emit_module().unwrap();
-        for (spec, e) in arch_specs().into_iter().zip(&emitted) {
+        let (emitted, text, _) = product_module();
+        let entries = [false, true]
+            .into_iter()
+            .flat_map(|tiled| arch_specs().into_iter().map(move |spec| (tiled, spec)));
+        for ((tiled, spec), e) in entries.zip(&emitted) {
             ledger_replay::replay_waits(&e.s_text, Arch::Gfx1151)
                 .unwrap_or_else(|err| panic!("{}: {err}", e.proof.variant));
             assert!(e.s_text.contains(".kernarg_segment_size: 96\n"));
-            serde_json::from_value::<IsaShapeContract>(cn::contract(spec, e)).unwrap();
+            serde_json::from_value::<IsaShapeContract>(if tiled {
+                cn::contract_rowtiles(spec, e)
+            } else {
+                cn::contract(spec, e)
+            })
+            .unwrap();
         }
         ledger_replay::replay_waits(&text, Arch::Gfx1151).unwrap();
         let dir =
@@ -1675,7 +2642,7 @@ mod toolchain {
         std::fs::create_dir_all(&dir).unwrap();
         let co = dir.join("module.co");
         std::fs::write(&co, native::assemble(&text, Arch::Gfx1151).unwrap()).unwrap();
-        for symbol in SYMBOLS {
+        for symbol in PRODUCT_SYMBOLS {
             let m7 =
                 pm_check::m7(&co, "gfx1151", symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
             assert_eq!(

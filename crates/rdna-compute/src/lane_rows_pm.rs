@@ -5,7 +5,7 @@
 //! Builder (PeaceMaker) multi-column row kernels of the Flash-Next lane step,
 //! exact gfx1151 (`peacemaker-isa` module `qwen4_lane_rows_pm`).
 //!
-//! Each export computes up to [`LANE_ROWS_PM_MAX`] activation columns per
+//! Each narrow export computes up to [`LANE_ROWS_PM_MAX`] activation columns per
 //! launch. Every column keeps the arithmetic DAG of its 1-row HIP incumbent,
 //! so column `c` of `y` is byte-identical to the 1-row kernel launched on
 //! `x[c*K..]` and to the incumbent rows kernel's column `c`; what changes is
@@ -30,6 +30,11 @@
 //! `gemv_q8_0_k8_rows`, `gemv_q8_0_staged_rows` at K = 320) when
 //! [`Gpu::lane_rows_pm_enabled`] holds; they themselves do not consult the
 //! flag (the byte oracle `lane_rows_pm_oracle` calls them directly).
+//!
+//! Fixed-eight-row tile exports accept total logical rows in
+//! `1..=hipfire_config::QWEN4_VERIFY_MAX_ROWS`, including partial final tiles.
+//! Their grid y is `ceil(rows / 8)`; the physical tile does not limit logical
+//! admission. The narrow launchers and their shape rules remain unchanged.
 
 use crate::{kernels, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult};
@@ -37,11 +42,8 @@ use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::sync::LazyLock;
 
-/// Largest column count of one launch.
+/// Largest column count of one narrow launch.
 pub const LANE_ROWS_PM_MAX: usize = 8;
-/// Largest column count of one S2 wide launch (the `_wide_r{16,32}_pm` exports
-/// serve 9..=this; `<= LANE_ROWS_PM_MAX` keeps the narrow exports).
-pub const LANE_ROWS_PM_WIDE_MAX: usize = 32;
 
 const MODULE: &str = "qwen4_lane_rows_pm";
 const MQ6: &str = "gemv_mq6g256v2_xbatch_pm";
@@ -49,52 +51,25 @@ const MQ6_X4: &str = "gemv_mq6g256v2_x4_xbatch_pm";
 const Q8_K8: &str = "gemv_q8_0_k8_xbatch_pm";
 const Q8_K320: &str = "gemv_q8_0_k320_xbatch_pm";
 
-// S2 exact-wide exports of the same module and image (`[r16, r32]`): block 256 with
-// eight weight rows per workgroup (HC k8: block 512, two rows). The activations
-// are staged in bounded row tiles, every column keeps the 1-row DAG.
-pub(crate) const MQ6_WIDE: [&str; 2] = [
-    "gemv_mq6g256v2_xbatch_wide_r16_pm",
-    "gemv_mq6g256v2_xbatch_wide_r32_pm",
-];
-pub(crate) const MQ6_X4_WIDE: [&str; 2] = [
-    "gemv_mq6g256v2_x4_xbatch_wide_r16_pm",
-    "gemv_mq6g256v2_x4_xbatch_wide_r32_pm",
-];
-pub(crate) const Q8_K8_WIDE: [&str; 2] = [
-    "gemv_q8_0_k8_xbatch_wide_r16_pm",
-    "gemv_q8_0_k8_xbatch_wide_r32_pm",
-];
-pub(crate) const Q8_K320_WIDE: [&str; 2] = [
-    "gemv_q8_0_k320_xbatch_wide_r16_pm",
-    "gemv_q8_0_k320_xbatch_wide_r32_pm",
-];
-pub(crate) const Q8_K2560_WIDE: [&str; 2] = [
-    "gemv_q8_0_k2560_xbatch_wide_r16_pm",
-    "gemv_q8_0_k2560_xbatch_wide_r32_pm",
-];
-pub(crate) const Q8_SMALL_WIDE: [&str; 2] = [
-    "gemv_q8_0_wide_xbatch_wide_r16_pm",
-    "gemv_q8_0_wide_xbatch_wide_r32_pm",
-];
-pub(crate) const Q8_K2560_X2_WIDE: [&str; 2] = [
-    "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm",
-    "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
-];
-/// The MQ6 symbols of the module's wide exports, for route closure.
-pub(crate) const MQ6_WIDE_SYMBOLS: [&str; 4] =
-    [MQ6_WIDE[0], MQ6_WIDE[1], MQ6_X4_WIDE[0], MQ6_X4_WIDE[1]];
-/// The Q8 symbols of the module's wide exports, for route closure.
-pub(crate) const Q8_WIDE_SYMBOLS: [&str; 10] = [
-    Q8_K8_WIDE[0],
-    Q8_K8_WIDE[1],
-    Q8_K320_WIDE[0],
-    Q8_K320_WIDE[1],
-    Q8_K2560_WIDE[0],
-    Q8_K2560_WIDE[1],
-    Q8_SMALL_WIDE[0],
-    Q8_SMALL_WIDE[1],
-    Q8_K2560_X2_WIDE[0],
-    Q8_K2560_X2_WIDE[1],
+// Fixed-eight-row exports of the same module and image: block 256 with eight
+// weight rows per workgroup (HC k8: block 512, two weight rows). Grid y selects
+// activation row tiles; each live row keeps the singleton arithmetic DAG.
+pub(crate) const MQ6_ROWTILE: &str = "gemv_mq6g256v2_rows_t8_pm_gfx1151";
+pub(crate) const MQ6_X4_ROWTILE: &str = "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151";
+pub(crate) const Q8_K8_ROWTILE: &str = "gemv_q8_0_k8_rows_t8_pm_gfx1151";
+pub(crate) const Q8_K320_ROWTILE: &str = "gemv_q8_0_k320_rows_t8_pm_gfx1151";
+pub(crate) const Q8_K2560_ROWTILE: &str = "gemv_q8_0_k2560_rows_t8_pm_gfx1151";
+pub(crate) const Q8_SMALL_ROWTILE: &str = "gemv_q8_0_wide_rows_t8_pm_gfx1151";
+pub(crate) const Q8_K2560_X2_ROWTILE: &str = "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151";
+/// The MQ6 tile symbols of the module, for wide-route closure.
+pub(crate) const MQ6_WIDE_SYMBOLS: [&str; 2] = [MQ6_ROWTILE, MQ6_X4_ROWTILE];
+/// The Q8 tile symbols of the module, for wide-route closure.
+pub(crate) const Q8_WIDE_SYMBOLS: [&str; 5] = [
+    Q8_K8_ROWTILE,
+    Q8_K320_ROWTILE,
+    Q8_K2560_ROWTILE,
+    Q8_SMALL_ROWTILE,
+    Q8_K2560_X2_ROWTILE,
 ];
 
 /// MQ6G256V2 bytes per 256-weight group.
@@ -140,9 +115,9 @@ fn narrow(batch: usize) -> bool {
     (1..=LANE_ROWS_PM_MAX).contains(&batch)
 }
 
-/// `batch` is a wide-launch column count (`LANE_ROWS_PM_MAX + 1..=`[`LANE_ROWS_PM_WIDE_MAX`]).
-fn wide(batch: usize) -> bool {
-    (LANE_ROWS_PM_MAX + 1..=LANE_ROWS_PM_WIDE_MAX).contains(&batch)
+/// Total logical rows of a fixed-eight-row tile launch, including singleton.
+fn rowtile(rows: usize) -> bool {
+    (1..=hipfire_config::QWEN4_VERIFY_MAX_ROWS).contains(&rows)
 }
 
 /// Column-count-independent MQ6 shape rule.
@@ -183,9 +158,9 @@ pub(crate) fn mq6_admits(m: usize, k: usize, batch: usize) -> bool {
     narrow(batch) && mq6_shape(m, k, batch)
 }
 
-/// `gemv_mq6g256v2_xbatch_wide_r{16,32}_pm` admits `(m, k, rows)`.
-pub(crate) fn mq6_wide_admits(m: usize, k: usize, rows: usize) -> bool {
-    wide(rows) && mq6_shape(m, k, rows)
+/// [`MQ6_ROWTILE`] admits `(m, k, rows)`.
+pub(crate) fn mq6_rowtile_admits(m: usize, k: usize, rows: usize) -> bool {
+    rowtile(rows) && mq6_shape(m, k, rows)
 }
 
 /// `gemv_mq6g256v2_x4_xbatch_pm` admits four matrices of heights `ms` (unused
@@ -194,11 +169,11 @@ pub(crate) fn mq6_x4_admits(ms: [usize; 4], k: usize, batch: usize) -> bool {
     narrow(batch) && mq6_x4_shape(ms, k, batch)
 }
 
-/// `gemv_mq6g256v2_x4_xbatch_wide_r{16,32}_pm` admits `(ms, k, rows)`; the
-/// grid is `sum ceil(Mi / 8)`, so the 4-row bound of the narrow rule is
-/// only a sufficient 32-bit grid check.
-pub(crate) fn mq6_x4_wide_admits(ms: [usize; 4], k: usize, rows: usize) -> bool {
-    wide(rows) && mq6_x4_shape(ms, k, rows)
+/// [`MQ6_X4_ROWTILE`] admits `(ms, k, rows)`; the grid is
+/// `sum ceil(Mi / 8)`, so the narrow rule's 4-row bound is a sufficient
+/// 32-bit grid check.
+pub(crate) fn mq6_x4_rowtile_admits(ms: [usize; 4], k: usize, rows: usize) -> bool {
+    rowtile(rows) && mq6_x4_shape(ms, k, rows)
 }
 
 /// `gemv_q8_0_k8_xbatch_pm` admits `(m, k, batch)`.
@@ -206,11 +181,11 @@ pub(crate) fn q8_k8_admits(m: usize, k: usize, batch: usize) -> bool {
     narrow(batch) && k.is_multiple_of(K8_K_MULTIPLE) && q8_shape(m, k, batch)
 }
 
-/// `gemv_q8_0_k8_xbatch_wide_r{16,32}_pm` admits `(m, k, rows)`: `K % 256 == 0`
-/// (short final partition tiles included, as the HIP `gemv_q8_0_k8` singleton);
+/// [`Q8_K8_ROWTILE`] admits `(m, k, rows)`: `K % 256 == 0` (short final
+/// partition tiles included, as the HIP `gemv_q8_0_k8` singleton);
 /// the narrow export keeps `K % 2048`.
-pub(crate) fn q8_k8_wide_admits(m: usize, k: usize, rows: usize) -> bool {
-    wide(rows) && k.is_multiple_of(256) && q8_shape(m, k, rows)
+pub(crate) fn q8_k8_rowtile_admits(m: usize, k: usize, rows: usize) -> bool {
+    rowtile(rows) && k.is_multiple_of(256) && q8_shape(m, k, rows)
 }
 
 /// `gemv_q8_0_k320_xbatch_pm` admits `(m, k, batch)`.
@@ -218,20 +193,20 @@ pub(crate) fn q8_k320_admits(m: usize, k: usize, batch: usize) -> bool {
     narrow(batch) && k == K320 && q8_shape(m, K320, batch)
 }
 
-/// `gemv_q8_0_k320_xbatch_wide_r{16,32}_pm` admits `(m, k, rows)`.
-pub(crate) fn q8_k320_wide_admits(m: usize, k: usize, rows: usize) -> bool {
-    wide(rows) && k == K320 && q8_shape(m, K320, rows)
+/// [`Q8_K320_ROWTILE`] admits `(m, k, rows)`.
+pub(crate) fn q8_k320_rowtile_admits(m: usize, k: usize, rows: usize) -> bool {
+    rowtile(rows) && k == K320 && q8_shape(m, K320, rows)
 }
 
-/// `gemv_q8_0_k2560_xbatch_wide_r{16,32}_pm` and the x2 pair admit `(m, k, rows)`.
-pub(crate) fn q8_k2560_wide_admits(m: usize, k: usize, rows: usize) -> bool {
-    wide(rows) && k == 2560 && q8_shape(m, 2560, rows)
+/// [`Q8_K2560_ROWTILE`] and [`Q8_K2560_X2_ROWTILE`] admit `(m, k, rows)`.
+pub(crate) fn q8_k2560_rowtile_admits(m: usize, k: usize, rows: usize) -> bool {
+    rowtile(rows) && k == 2560 && q8_shape(m, 2560, rows)
 }
 
-/// `gemv_q8_0_wide_xbatch_wide_r{16,32}_pm` (four-chain small K: every staged
-/// K <= 1536, K % 32 == 0 other than K = 320) admits `(m, k, rows)`.
-pub(crate) fn q8_small_wide_admits(m: usize, k: usize, rows: usize) -> bool {
-    wide(rows) && k != K320 && k <= 1536 && k.is_multiple_of(32) && q8_shape(m, k, rows)
+/// [`Q8_SMALL_ROWTILE`] (four-chain small K: every staged K <= 1536,
+/// K % 32 == 0 other than K = 320) admits `(m, k, rows)`.
+pub(crate) fn q8_small_rowtile_admits(m: usize, k: usize, rows: usize) -> bool {
+    rowtile(rows) && k != K320 && k <= 1536 && k.is_multiple_of(32) && q8_shape(m, k, rows)
 }
 
 fn need(name: &str, what: &str, tensor: &GpuTensor, bytes: usize) -> HipResult<()> {
@@ -264,8 +239,8 @@ impl Gpu {
             && !self.graphs.capture_mode
     }
 
-    /// Verify the pinned `qwen4_lane_rows_pm` image and load `symbol` (narrow or
-    /// S2 `_wide_r{16,32}_pm` export; exact gfx1151 only), so byte oracles can
+    /// Verify the pinned `qwen4_lane_rows_pm` image and load `symbol` (narrow
+    /// or fixed-eight-row tile export; exact gfx1151 only), so byte oracles can
     /// launch any export by name with raw blobs.
     pub fn ensure_lane_rows_pm_entry(&mut self, symbol: &str) -> HipResult<()> {
         if !self.arch_caps.is_gfx1151() {
@@ -324,6 +299,21 @@ impl Gpu {
         need(NAME, "x", x, batch * k * 4)?;
         need(NAME, "y", y, batch * m * 4)?;
         self.ensure_lane_rows_pm(NAME, MQ6)?;
+        #[cfg(feature = "lab")]
+        self.lab_observe_projection(crate::dispatch::LabProjectionLaunch {
+            symbol: MQ6,
+            family: crate::gemv::WideTwinFamily::Mq6,
+            form: "narrow",
+            weights: [Some((a_raw, m)), None, None, None],
+            x,
+            rows: batch,
+            k,
+            scale: None,
+            hc_act: false,
+            grid: [m.div_ceil(4) as u32, 1, 1],
+            block: [32, 1, 1],
+            shared_mem: 0,
+        })?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -382,6 +372,21 @@ impl Gpu {
             }
         }
         self.ensure_lane_rows_pm(NAME, MQ6_X4)?;
+        #[cfg(feature = "lab")]
+        self.lab_observe_projection(crate::dispatch::LabProjectionLaunch {
+            symbol: MQ6_X4,
+            family: crate::gemv::WideTwinFamily::Mq6,
+            form: "narrow_x4",
+            weights: parts.map(|(w, _, m)| (m > 0).then_some((w, m))),
+            x,
+            rows: batch,
+            k,
+            scale: None,
+            hc_act: false,
+            grid: [ms.iter().map(|m| m.div_ceil(4)).sum::<usize>() as u32, 1, 1],
+            block: [32, 1, 1],
+            shared_mem: 0,
+        })?;
         let a = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = ms.map(|m| m as i32);
@@ -453,6 +458,21 @@ impl Gpu {
         need(NAME, "x", x, batch * k * 4)?;
         need(NAME, "y", y, batch * m * 4)?;
         self.ensure_lane_rows_pm(NAME, Q8_K8)?;
+        #[cfg(feature = "lab")]
+        self.lab_observe_projection(crate::dispatch::LabProjectionLaunch {
+            symbol: Q8_K8,
+            family: crate::gemv::WideTwinFamily::Q8,
+            form: "narrow",
+            weights: [Some((weight, m)), None, None, None],
+            x,
+            rows: batch,
+            k,
+            scale: hc_act_scale,
+            hc_act: hc_act_scale.is_some(),
+            grid: [m.div_ceil(4) as u32, 1, 1],
+            block: [256, 1, 1],
+            shared_mem: 0,
+        })?;
         let w_ptr = weight.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -513,6 +533,21 @@ impl Gpu {
         need(NAME, "x", x, batch * K320 * 4)?;
         need(NAME, "y", y, batch * m * 4)?;
         self.ensure_lane_rows_pm(NAME, Q8_K320)?;
+        #[cfg(feature = "lab")]
+        self.lab_observe_projection(crate::dispatch::LabProjectionLaunch {
+            symbol: Q8_K320,
+            family: crate::gemv::WideTwinFamily::Q8,
+            form: "narrow",
+            weights: [Some((a_raw, m)), None, None, None],
+            x,
+            rows: batch,
+            k: K320,
+            scale: None,
+            hc_act: false,
+            grid: [m.div_ceil(16) as u32, 1, 1],
+            block: [64, 1, 1],
+            shared_mem: 0,
+        })?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -584,5 +619,129 @@ mod tests {
         assert!(q8_k320_admits(1, 320, 2));
         assert!(!q8_k320_admits(17, 640, 2));
         assert!(!q8_k320_admits(17, 320, 9));
+    }
+
+    #[test]
+    fn rowtile_admission_covers_every_logical_width_and_output_tail() {
+        assert_eq!(hipfire_config::QWEN4_VERIFY_MAX_ROWS, 64);
+        for rows in 1..=hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+            for m in [1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+                assert!(mq6_rowtile_admits(m, 2560, rows));
+                assert!(mq6_x4_rowtile_admits([m, 0, m + 1, 0], 2560, rows));
+                assert!(q8_k8_rowtile_admits(m, 2304, rows));
+                assert!(q8_k320_rowtile_admits(m, 320, rows));
+                assert!(q8_k2560_rowtile_admits(m, 2560, rows));
+                for k in [32, 96, 128, 640, 1504, 1536] {
+                    assert!(q8_small_rowtile_admits(m, k, rows));
+                }
+            }
+        }
+        for rows in [0, hipfire_config::QWEN4_VERIFY_MAX_ROWS + 1, usize::MAX] {
+            assert!(!mq6_rowtile_admits(1, 256, rows));
+            assert!(!mq6_x4_rowtile_admits([1, 0, 0, 0], 256, rows));
+            assert!(!q8_k8_rowtile_admits(1, 256, rows));
+            assert!(!q8_k320_rowtile_admits(1, 320, rows));
+            assert!(!q8_k2560_rowtile_admits(1, 2560, rows));
+            assert!(!q8_small_rowtile_admits(1, 640, rows));
+        }
+    }
+
+    #[test]
+    fn rowtile_admission_preserves_each_singleton_shape_domain() {
+        let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        for k in [0, 1, 255, 257, 2559, usize::MAX] {
+            assert!(!mq6_rowtile_admits(7, k, rows));
+            assert!(!mq6_x4_rowtile_admits([7, 0, 9, 0], k, rows));
+            assert!(!q8_k8_rowtile_admits(7, k, rows));
+        }
+        assert!(!mq6_rowtile_admits(0, 256, rows));
+        assert!(!mq6_x4_rowtile_admits([0; 4], 256, rows));
+        assert!(!mq6_x4_rowtile_admits([7, usize::MAX, 0, 0], 256, rows));
+        for k in [256, 768, 2048, 2304, 2560, 10240] {
+            assert!(q8_k8_rowtile_admits(7, k, rows));
+        }
+        for k in [0, 32, 319, 321, 640, 2560, usize::MAX] {
+            assert!(!q8_k320_rowtile_admits(7, k, rows));
+        }
+        for k in [0, 32, 320, 2559, 2561, usize::MAX] {
+            assert!(!q8_k2560_rowtile_admits(7, k, rows));
+        }
+        for k in 0..=1568 {
+            assert_eq!(
+                q8_small_rowtile_admits(7, k, rows),
+                k > 0 && k <= 1536 && k != 320 && k.is_multiple_of(32),
+                "small-K domain at K={k}",
+            );
+        }
+        assert!(!q8_small_rowtile_admits(7, usize::MAX, rows));
+        assert!(!q8_k8_rowtile_admits(0, 256, rows));
+        assert!(!q8_k320_rowtile_admits(0, 320, rows));
+        assert!(!q8_k2560_rowtile_admits(0, 2560, rows));
+        assert!(!q8_small_rowtile_admits(0, 640, rows));
+    }
+
+    #[test]
+    fn rowtile_admission_checks_full_window_offsets_and_overflow() {
+        let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        let output_limit = u32::MAX as usize / (rows * 4);
+        assert!(mq6_rowtile_admits(output_limit, 256, rows));
+        assert!(!mq6_rowtile_admits(output_limit + 1, 256, rows));
+        assert!(!mq6_x4_rowtile_admits(
+            [1, output_limit + 1, 0, 0],
+            256,
+            rows
+        ));
+        assert!(q8_small_rowtile_admits(output_limit, 32, rows));
+        assert!(!q8_small_rowtile_admits(output_limit + 1, 32, rows));
+
+        // Full-window X can overflow device offsets while one row still fits.
+        let k_overflow = (output_limit / 256 + 1) * 256;
+        assert!(mq6_rowtile_admits(1, k_overflow, 1));
+        assert!(!mq6_rowtile_admits(1, k_overflow, rows));
+        assert!(q8_k8_rowtile_admits(1, k_overflow, 1));
+        assert!(!q8_k8_rowtile_admits(1, k_overflow, rows));
+
+        // Weight extents remain bounded independently of the activation tile.
+        assert!(!mq6_rowtile_admits(21_500_000, 2560, 1));
+        assert!(!q8_k8_rowtile_admits(20_000_000, 2048, 1));
+        for (k, admits) in [
+            (
+                320,
+                q8_k320_rowtile_admits as fn(usize, usize, usize) -> bool,
+            ),
+            (2560, q8_k2560_rowtile_admits),
+            (1536, q8_small_rowtile_admits),
+        ] {
+            let weight_limit = u32::MAX as usize / (k / 32 * Q8_BLOCK_BYTES);
+            assert!(admits(weight_limit, k, rows));
+            assert!(!admits(weight_limit + 1, k, rows));
+            assert!(!admits(usize::MAX, k, rows));
+        }
+        assert!(!mq6_rowtile_admits(usize::MAX, 256, rows));
+        assert!(!q8_k8_rowtile_admits(usize::MAX, 256, rows));
+        assert!(!mq6_rowtile_admits(1, i32::MAX as usize + 1, rows));
+        assert!(!q8_k8_rowtile_admits(1, i32::MAX as usize + 1, rows));
+        assert!(!fits_u32(usize::MAX.checked_mul(4)));
+    }
+
+    #[test]
+    fn rowtile_route_closure_contains_each_frozen_export_once() {
+        assert_eq!(
+            MQ6_WIDE_SYMBOLS,
+            [
+                "gemv_mq6g256v2_rows_t8_pm_gfx1151",
+                "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
+            ]
+        );
+        assert_eq!(
+            Q8_WIDE_SYMBOLS,
+            [
+                "gemv_q8_0_k8_rows_t8_pm_gfx1151",
+                "gemv_q8_0_k320_rows_t8_pm_gfx1151",
+                "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
+                "gemv_q8_0_wide_rows_t8_pm_gfx1151",
+                "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
+            ]
+        );
     }
 }

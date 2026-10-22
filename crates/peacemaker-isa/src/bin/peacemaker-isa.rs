@@ -9,6 +9,7 @@ use peacemaker_isa::{
     vopd::{Operand, VopdF32, VopdOp},
 };
 use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
+use sha2::{Digest, Sha256};
 use std::{env, fs};
 
 fn probe(arch: Arch) -> Result<Emitted, String> {
@@ -105,8 +106,61 @@ fn probe(arch: Arch) -> Result<Emitted, String> {
     b.control(Instruction::new("s_endpgm", vec![], vec![]))?;
     b.finish()
 }
-const USAGE:&str="usage: peacemaker-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
-const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       peacemaker-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)\n       peacemaker-isa emit --kernel mq4_verify [--epi <qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel mq4_fp8_verify [--epi <qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (tiles bt1w1, bt{2,4,8}w{4,8}; with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_fp8_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (the four-export lane-rows module qwen4_lane_rows_pm; --co is required and M7 runs on every export of the linked object)\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module mq4_rows_x4_pm_<arch> holds the exports gemv_mq4g256v2_rows_x4_pm_<arch> and gemv_mq4g256v2_rows_x4_wide_r{16,32}_pm_<arch>)\n       peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi r16|r32|k4_r16|k4_r32|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module bf16_rows_wide_pm_gfx1151 holds the four exports gemv_bf16_xf32_x4_rows_wide_r{16,32}_pm_gfx1151 and gemv_bf16_xf32_k4_rows_wide_r{16,32}_pm_gfx1151; no --shape/--m7: its contracts are committed in kernels/)\n       peacemaker-isa emit --kernel mq_i4_rows [--epi w3_r256|w3_r128|w2_r256|w2_r128|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (the four-export planar MQ-I4 row module mq_i4_rows_pm_gfx1201; with --co, M7 runs on every selected export of the linked object; --shape writes DIR/mq_i4_rows.gfx1201.<codec>_<rotation>.contract.json)\n       peacemaker-isa emit --kernel mtp_dense_det_gfx11 [--epi w8|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (experimental standalone DET dense F16 WMMA GEMM, module mtp_dense_det_pm_gfx1151; --co is required and M7 runs on the single export of the linked object; no --shape: its contract is committed in kernels/)";
+const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE
+       peacemaker-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE
+       peacemaker-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE
+       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE
+       peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
+       peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
+const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]]
+         (native assembly/link/bundle needs no ROCm tools; --bundle also writes FILE.sha256, bare lowercase SHA256)
+       peacemaker-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]
+         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2)
+       peacemaker-isa emit --kernel mq4_verify [--epi <qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]
+       peacemaker-isa emit --kernel mq4_fp8_verify [--epi <qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]
+         (with --co, M7 runs on every selected export; --shape writes DIR/<kernel>.<arch>.<entry>.contract.json)
+       peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]
+         (qwen4_lane_rows_pm: four unchanged narrow exports plus seven t8 exports, exactly SYMBOLS; no --shape)
+       peacemaker-isa emit --kernel qwen4_lane_rows [--epi all] --arch gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (qwen4_lane_rows_pm_gfx1100: two actual gfx1100 MQ6 tiles then five actual gfx1100 Q8 tiles;
+          source builders must provide every frozen export; unsupported singleton recipes refuse emission, never retag Halo;
+          Q8 k2560 single accepts K>1536 divisible32, x2 only K2560; k320 and small-wide use the actual four-chain singleton)
+       peacemaker-isa emit --kernel lane_rows_mq6_gfx1201|lane_rows_bf16_gfx1201 [--epi all] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (lane_rows_mq6_pm_gfx1201 / lane_rows_bf16_pm_gfx1201: ten unchanged narrow exports then two t8 exports)
+       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|t8|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (mq4_rows_x4_pm_<arch>: unchanged narrow plus t8 on gfx1151/gfx1201; gfx1100 has only the actual scalar-DAG t8 export, no narrow entry; no r16/r32 exports)
+       peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi t8|k4_t8|all] --arch gfx1151|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (bf16_rows_wide_pm_<arch>: ordinary x4 ABI96 and HC k4 logical44/segment48 t8 exports only;
+          gfx1100 uses its independent actual-object builder, never the Halo body with a different target)
+       peacemaker-isa emit --kernel mq_i4_moe_gemv [--epi <codec>_<kind>[_t8]|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (mq_i4_moe_gemv_pm_gfx1201: four narrow plus four t8 exports, no c16/c32)
+         (--arch gfx1151 retains the old common diagnostic image; product Halo rowtiles use mq_i4_moe_gemv_cn, not that image)
+       peacemaker-isa emit --kernel mq_i4_moe_gemv_mq4only [--epi mq4sym_<kind>[_t8]|all] --arch gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (artifact stem mq_i4_moe_gemv_mq4only_pm_gfx1100, internal module mq_i4_moe_gemv_pm_gfx1100:
+          two genuine MQ4 narrow exports then their two t8 exports; the retired mixed W2 image is not emitted)
+       peacemaker-isa emit --kernel mq_i4_moe_gemv_cn [--epi <codec>_<kind>[_t8]|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (mq_i4_moe_gemv_cn_pm_gfx1151: four unchanged narrow plus four t8 exports)
+       peacemaker-isa emit --kernel e8p_i4_moe_gemv [--epi r256_gate_up[_t8]|r128_down[_t8]|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (e8p_i4_moe_gemv_pm_<arch>: two unchanged narrow plus two t8 exports; emission is not codec admission)
+       peacemaker-isa emit --kernel qwen4_slab_union_plan [--epi t8|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (qwen4_slab_union_plan_t8_pm_<arch>: one export, logical36B/segment40B, grid ceil(rows/8), block128, LDS1280)
+       peacemaker-isa emit --kernel legacy_mq4_rowtiles --epi all --arch ARCH --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (legacy_mq4_rowtiles_pm_<arch>: original aggregate indexed gate/up and unweighted down ABIs;
+          two physical-eight-token exports, original weight buffers without repacking; unsupported AR recipes refuse emission)
+         (row images require --features toolchain and --co; M7 runs on EVERY linked export even without --m7;
+          --shape writes DIR/<kernel>.<arch>.<proof-variant>.contract.json with exact emitted ABI/resources and tile geometry;
+          t8 means physical eight-row tiles, total logical rows 1..64, never old r8 geometry or an admission claim)
+       peacemaker-isa emit --kernel mq_i4_rows [--epi w3_r256|w3_r128|w2_r256|w2_r128|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]
+       peacemaker-isa emit --kernel mtp_dense_det_gfx11 [--epi w8|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]
+         (experimental DET dense F16 WMMA GEMM; no --shape; M7 requires --features toolchain)";
 const FA_PREFILL_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 Q8_0 FA2-GQA twin: one module, exports attention_fa2_q_preconvert_pm_gfx1201 then attention_q8_0_fa2_gqa_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_pm.gfx1201.{preconvert,direct}.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_PREFILL_FP8_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_fp8_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 native-fp8 E4M3 FA2-GQA twin: one module, ONE export attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201 (the Q preconvert/qprep stay in the Q8 and F5 modules); --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_fp8_pm.gfx1201.direct.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_QPREP_USAGE:&str="       peacemaker-isa emit --kernel fa_qprep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 rotary-64 Q prep: one module, one export attention_fa2_qprep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_qprep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
@@ -618,58 +672,475 @@ fn qwen4_mq4_x4_gfx11(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
-/// Few-row exact MQ4G256V2 GEMV over four matrices, gfx1151 and gfx1201:
-/// the one entry (`--epi entry|all`, default `all`), which is also the module.
-fn mq4_rows_x4(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
-    use peacemaker_isa::kernels::mq4_rows_x4::{self, Spec};
-    if epi == "all" {
-        let (_, text, proof) = mq4_rows_x4::emit_module(arch)?;
-        return Ok((
-            text,
-            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-        ));
-    }
-    if epi != "entry" {
-        return Err(format!("mq4_rows_x4 --epi {epi} (entry|all)"));
-    }
-    let e = mq4_rows_x4::emit(Spec { arch })?;
-    Ok((
-        e.s_text,
-        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
-    ))
+/// Production row images retain their narrow exports and add only fixed-eight
+/// physical tiles. Diagnostic cap16/cap32 builders are not production exports.
+struct RowImage {
+    module: String,
+    entries: Vec<Emitted>,
+    contracts: Vec<serde_json::Value>,
 }
-/// gfx1151 BF16 exact wide verify GEMV over four matrices (`kernels::qwen4_bf16_rows_wide`, module
-/// `bf16_rows_wide_pm_gfx1151`): `--epi r16|r32` one ordinary x4 export, `k4_r16|k4_r32` one k4 HC export,
-/// `all` (default) the four-export module.
-fn qwen4_bf16_rows_wide(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
-    use peacemaker_isa::kernels::qwen4_bf16_rows_wide::{self, Spec};
-    if epi == "all" {
-        let (_, text, proof) = qwen4_bf16_rows_wide::emit_module(arch)?;
-        return Ok((
-            text,
-            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-        ));
+
+fn row_export(e: &Emitted) -> Result<&str, String> {
+    e.s_text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(".amdhsa_kernel "))
+        .map(str::trim)
+        .ok_or_else(|| format!("{}: missing exported descriptor", e.proof.variant))
+}
+
+impl RowImage {
+    fn new(module: String) -> Self {
+        Self {
+            module,
+            entries: Vec::new(),
+            contracts: Vec::new(),
+        }
     }
-    let (cap, k4) = match epi {
-        "r16" => (16, false),
-        "r32" => (32, false),
-        "k4_r16" => (16, true),
-        "k4_r32" => (32, true),
-        _ => {
-            return Err(format!(
-                "qwen4_bf16_rows_wide --epi {epi} (r16|r32|k4_r16|k4_r32|all)"
-            ))
+
+    fn push(
+        &mut self,
+        e: Emitted,
+        grid: [&str; 3],
+        row_domain: serde_json::Value,
+        mut contract: serde_json::Value,
+    ) -> Result<(), String> {
+        let symbol = row_export(&e)?;
+        let metadata = e
+            .s_text
+            .split_once(".amdgpu_metadata\n")
+            .ok_or_else(|| format!("{symbol}: missing metadata"))?
+            .1;
+        let field = |name: &str| -> Result<u32, String> {
+            metadata
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(name))
+                .ok_or_else(|| format!("{symbol}: missing metadata field {name}"))?
+                .trim()
+                .parse::<u32>()
+                .map_err(|err| format!("{symbol}: {name}: {err}"))
+        };
+        if !contract.is_object() {
+            return Err(format!("{symbol}: shape contract is not an object"));
+        }
+        // Bind resources and ABI to this emitted entry, never an old wide
+        // geometry or a guessed register/LDS ceiling. The metadata preserves
+        // every kernarg's name, byte offset, size and access mode verbatim.
+        contract["symbol"] = symbol.into();
+        contract["module"] = self.module.clone().into();
+        contract["arch"] = e.proof.arch.name().into();
+        contract["kernarg_segment_bytes"] = field(".kernarg_segment_size:")?.into();
+        contract["group_segment_fixed_bytes"] = field(".group_segment_fixed_size:")?.into();
+        contract["launch_dynamic_lds_bytes"] = 0.into();
+        contract["vgpr_max"] = e.shape.next_free_vgpr.into();
+        contract["sgpr_max"] = e.shape.next_free_sgpr.into();
+        contract["require_wave32"] = true.into();
+        contract["require_zero_spills"] = true.into();
+        contract["require_zero_private"] = true.into();
+        contract["launch"] = serde_json::json!({
+            "grid": grid, "block": [field(".max_flat_workgroup_size:")?, 1, 1],
+            "row_domain": row_domain,
+        });
+        contract["amdgpu_metadata"] = metadata.into();
+        contract["builder_proof"] =
+            serde_json::to_value(&e.proof).map_err(|err| err.to_string())?;
+        contract["isa_shape"] = serde_json::to_value(&e.shape).map_err(|err| err.to_string())?;
+        self.contracts.push(contract);
+        self.entries.push(e);
+        Ok(())
+    }
+}
+
+fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, String> {
+    use peacemaker_isa::kernels;
+    use serde_json::json;
+    let empty = || json!({});
+    let rows = |max| json!({"logical_rows": {"min": 1, "max": max}});
+    let slots = |tiled| {
+        if tiled {
+            json!({"C": "total logical rows 1..64", "U": 80,
+            "descriptor_words": 482, "descriptor_stride_bytes": 1928,
+            "slot_ids": "absolute; X/Y remain full-window bases"})
+        } else {
+            json!({"C": "1..8", "U": "distinct experts", "slot_ids": "absolute"})
         }
     };
-    let e = if k4 {
-        qwen4_bf16_rows_wide::emit_hc(Spec { arch, cap })?
-    } else {
-        qwen4_bf16_rows_wide::emit(Spec { arch, cap })?
+    let selected = |tag: &str, tiled: bool| {
+        epi == "all"
+            || if tiled {
+                epi.strip_suffix("_t8") == Some(tag)
+            } else {
+                epi == tag
+            }
     };
-    Ok((
-        e.s_text,
-        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
-    ))
+    let mut image = match kernel {
+        "qwen4_lane_rows" if arch == Arch::Gfx1100 => {
+            if epi != "all" {
+                return Err("qwen4_lane_rows --arch gfx1100 requires --epi all".into());
+            }
+            RowImage::new("qwen4_lane_rows_pm_gfx1100".into())
+        }
+        "lane_rows_mq6_gfx1201" | "lane_rows_bf16_gfx1201" => {
+            if arch != Arch::Gfx1201 || epi != "all" {
+                return Err(format!("{kernel} requires --arch gfx1201 --epi all"));
+            }
+            RowImage::new(if kernel == "lane_rows_mq6_gfx1201" {
+                kernels::lane_rows_mq6_gfx1201::MODULE.into()
+            } else {
+                kernels::lane_rows_bf16_gfx1201::MODULE.into()
+            })
+        }
+        "mq4_rows_x4" => RowImage::new(kernels::mq4_rows_x4::Spec::module(arch)),
+        "qwen4_bf16_rows_wide" => RowImage::new(kernels::qwen4_bf16_rows_wide::module(arch)),
+        "legacy_mq4_rowtiles" => {
+            if epi != "all" {
+                return Err("legacy_mq4_rowtiles requires --epi all".into());
+            }
+            RowImage::new(format!("legacy_mq4_rowtiles_pm_{}", arch.name()))
+        }
+        "mq_i4_moe_gemv" if arch == Arch::Gfx1100 => {
+            return Err("gfx1100 production uses --kernel mq_i4_moe_gemv_mq4only; the retired mixed image is not emitted".into());
+        }
+        "mq_i4_moe_gemv_mq4only" => {
+            if arch != Arch::Gfx1100 {
+                return Err("mq_i4_moe_gemv_mq4only is gfx1100 only".into());
+            }
+            // Preserve the landing object's internal module ID; its dedicated
+            // filename and MQ4-only export set identify the production image.
+            RowImage::new(kernels::mq_i4_moe_gemv_gfx1100::Spec::module(arch))
+        }
+        "mq_i4_moe_gemv" => RowImage::new(kernels::mq_i4_moe_gemv::Spec::module(arch)),
+        "mq_i4_moe_gemv_cn" => {
+            if arch != Arch::Gfx1151 {
+                return Err("mq_i4_moe_gemv_cn is gfx1151 only".into());
+            }
+            RowImage::new(kernels::mq_i4_moe_gemv_cn::Spec::module())
+        }
+        "e8p_i4_moe_gemv" => RowImage::new(kernels::e8p_i4_moe_gemv::Spec::module(arch)),
+        "qwen4_slab_union_plan" => RowImage::new(kernels::qwen4_slab_union_plan::symbol(arch)),
+        _ => return Ok(None),
+    };
+    match kernel {
+        "qwen4_lane_rows" => {
+            let mut entries = kernels::qwen4_lane_rows_mq6::build_rowtiles_gfx1100()?;
+            entries.extend(kernels::qwen4_lane_rows_q8_gfx1100::build_rowtiles_gfx1100()?);
+            let exports = [
+                ("gemv_mq6g256v2_rows_t8_pm_gfx1100", "ceil(M/8)"),
+                (
+                    "gemv_mq6g256v2_rows_x4_t8_pm_gfx1100",
+                    "sum ceil(max(Mi,0)/8)",
+                ),
+                ("gemv_q8_0_k8_rows_t8_pm_gfx1100", "ceil(M/2)"),
+                ("gemv_q8_0_k320_rows_t8_pm_gfx1100", "ceil(M/8)"),
+                ("gemv_q8_0_k2560_rows_t8_pm_gfx1100", "ceil(M/8)"),
+                (
+                    "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1100",
+                    "ceil(M0/8)+ceil(M1/8)",
+                ),
+                ("gemv_q8_0_wide_rows_t8_pm_gfx1100", "ceil(M/8)"),
+            ];
+            if entries.len() != exports.len() {
+                return Err(format!(
+                    "{}: expected {} exports, got {}",
+                    image.module,
+                    exports.len(),
+                    entries.len()
+                ));
+            }
+            for (e, (symbol, grid)) in entries.into_iter().zip(exports) {
+                if e.proof.arch != arch || row_export(&e)? != symbol {
+                    return Err(format!(
+                        "{}: expected exact gfx1100 export {symbol}, got {} ({:?})",
+                        image.module,
+                        row_export(&e)?,
+                        e.proof.arch
+                    ));
+                }
+                let contract = match symbol {
+                    "gemv_q8_0_k8_rows_t8_pm_gfx1100" => json!({
+                        "shape_domain": {"K": "K>0 && K%256==0"},
+                        "arithmetic_recipe": "gfx1100 actual HC singleton, eight fixed K partitions",
+                    }),
+                    "gemv_q8_0_k320_rows_t8_pm_gfx1100" => json!({
+                        "shape_domain": {"K": "K==320"},
+                        "arithmetic_recipe": "gfx1100 actual small-K four-chain singleton; not Halo K320",
+                    }),
+                    "gemv_q8_0_k2560_rows_t8_pm_gfx1100" => json!({
+                        "shape_domain": {"K": "K>1536 && K%32==0"},
+                        "arithmetic_recipe": "gfx1100 actual plain one-chain singleton",
+                        "symbol_note": "k2560 is historical naming, not a literal K restriction",
+                    }),
+                    "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1100" => json!({
+                        "shape_domain": {"K": "K==2560"},
+                        "arithmetic_recipe": "gfx1100 actual plain one-chain singleton",
+                    }),
+                    "gemv_q8_0_wide_rows_t8_pm_gfx1100" => json!({
+                        "shape_domain": {"K": "K>0 && K<=1536 && K%32==0"},
+                        "arithmetic_recipe": "gfx1100 actual small-K four-chain singleton",
+                    }),
+                    _ => empty(),
+                };
+                image.push(e, [grid, "ceil(R/8)", "1"], rows(64), contract)?;
+            }
+        }
+        "lane_rows_mq6_gfx1201" => {
+            use kernels::lane_rows_mq6_gfx1201 as k;
+            for (spec, grid) in k::SPECS.into_iter().zip(k::GRID_RULE) {
+                image.push(k::emit(spec)?, [grid, "1", "1"], rows(spec.cap), empty())?;
+            }
+            for x4 in [false, true] {
+                image.push(
+                    k::emit_rowtiles(k::Spec {
+                        x4,
+                        cap: 8,
+                        wg8: true,
+                    })?,
+                    [
+                        if x4 {
+                            "sum ceil(max(Mi,0)/8)"
+                        } else {
+                            "ceil(M/8)"
+                        },
+                        "ceil(R/8)",
+                        "1",
+                    ],
+                    rows(64),
+                    empty(),
+                )?;
+            }
+        }
+        "lane_rows_bf16_gfx1201" => {
+            use kernels::lane_rows_bf16_gfx1201 as k;
+            for (entry, grid) in k::ENTRIES.into_iter().zip(k::GRID_RULE) {
+                image.push(k::build(entry)?, [grid, "1", "1"], rows(entry.cap), empty())?;
+            }
+            for hc in [false, true] {
+                image.push(
+                    k::build_rowtiles(k::Entry {
+                        hc,
+                        wg8: false,
+                        cap: 8,
+                    })?,
+                    [if hc { "M" } else { "sum max(Mi,0)" }, "ceil(R/8)", "1"],
+                    rows(64),
+                    empty(),
+                )?;
+            }
+        }
+        "mq4_rows_x4" => {
+            use kernels::mq4_rows_x4 as k;
+            if epi != "all" && epi != "entry" && epi != "t8" {
+                return Err(format!("{kernel} --epi {epi} (entry|t8|all)"));
+            }
+            if arch == Arch::Gfx1100 && epi == "entry" {
+                return Err("mq4_rows_x4 --arch gfx1100 supports only --epi t8|all; no narrow export exists".into());
+            }
+            // The emitter owns composition: narrow+t8, or gfx1100 t8-only.
+            let (entries, _, _) = k::emit_module(arch)?;
+            for (i, e) in entries.into_iter().enumerate() {
+                let tiled = arch == Arch::Gfx1100 || i == 1;
+                if epi == "all" || (epi == "t8") == tiled {
+                    image.push(
+                        e,
+                        [
+                            "sum ceil(max(Mi,0)/2)",
+                            if tiled { "ceil(R/8)" } else { "1" },
+                            "1",
+                        ],
+                        rows(if tiled { 64 } else { 8 }),
+                        empty(),
+                    )?;
+                }
+            }
+        }
+        "qwen4_bf16_rows_wide" => {
+            use kernels::qwen4_bf16_rows_wide as k;
+            if !matches!(epi, "all" | "t8" | "k4_t8") {
+                return Err(format!("{kernel} --epi {epi} (t8|k4_t8|all)"));
+            }
+            for hc in [false, true] {
+                if epi == "all" || (epi == "k4_t8") == hc {
+                    let e = if arch == Arch::Gfx1100 {
+                        kernels::qwen4_bf16_rows_gfx1100::emit_rowtiles(hc)?
+                    } else {
+                        k::emit_rowtiles(arch, hc)?
+                    };
+                    image.push(
+                        e,
+                        [if hc { "M" } else { "sum max(Mi,0)" }, "ceil(R/8)", "1"],
+                        rows(64),
+                        empty(),
+                    )?;
+                }
+            }
+        }
+        "mq_i4_moe_gemv_mq4only" => {
+            use kernels::mq_i4_moe_gemv_gfx1100 as k;
+            for tiled in [false, true] {
+                for spec in k::module_specs(arch)
+                    .into_iter()
+                    .filter(|s| s.codec == k::Codec::Mq4Sym)
+                {
+                    if selected(&spec.tag(), tiled) {
+                        let e = if tiled {
+                            k::emit_rowtiles(spec)?
+                        } else {
+                            k::emit(spec)?
+                        };
+                        let contract = k::contract(spec, &e);
+                        image.push(
+                            e,
+                            if tiled {
+                                ["ceil(M/8)", "80", "ceil(C/8)"]
+                            } else {
+                                ["M", "U", "1"]
+                            },
+                            slots(tiled),
+                            contract,
+                        )?;
+                    }
+                }
+            }
+        }
+        "mq_i4_moe_gemv" if arch == Arch::Gfx1151 => {
+            // This common Halo image remains a legacy diagnostic/reference
+            // object. Product rowtiles belong to mq_i4_moe_gemv_cn instead.
+            use kernels::mq_i4_moe_gemv as k;
+            for spec in k::module_specs(arch) {
+                if selected(&spec.tag(), false) {
+                    let e = k::emit(spec)?;
+                    let contract = k::contract(spec, &e);
+                    image.push(e, [if spec.cap == k::Cap::C8 { "M" } else { "ceil(M/8)" }, "U", "1"],
+                        json!({"C_max": spec.cap.slots(), "U": "distinct experts", "diagnostic": true}),
+                        contract)?;
+                }
+            }
+        }
+        "mq_i4_moe_gemv" => {
+            use kernels::mq_i4_moe_gemv as k;
+            for tiled in [false, true] {
+                for spec in k::narrow_specs(arch) {
+                    if selected(&spec.tag(), tiled) {
+                        let e = if tiled {
+                            k::emit_rowtiles(spec)?
+                        } else {
+                            k::emit(spec)?
+                        };
+                        let contract = if tiled {
+                            k::contract_rowtiles(spec, &e)
+                        } else {
+                            k::contract(spec, &e)
+                        };
+                        image.push(
+                            e,
+                            if tiled {
+                                ["ceil(M/8)", "80", "ceil(C/8)"]
+                            } else {
+                                ["M", "U", "1"]
+                            },
+                            slots(tiled),
+                            contract,
+                        )?;
+                    }
+                }
+            }
+        }
+        "mq_i4_moe_gemv_cn" => {
+            use kernels::mq_i4_moe_gemv_cn as k;
+            for tiled in [false, true] {
+                for spec in k::module_specs() {
+                    if selected(&spec.tag(), tiled) {
+                        let e = if tiled {
+                            k::emit_rowtiles(spec)?
+                        } else {
+                            k::emit(spec)?
+                        };
+                        let contract = if tiled {
+                            k::contract_rowtiles(spec, &e)
+                        } else {
+                            k::contract(spec, &e)
+                        };
+                        image.push(
+                            e,
+                            if tiled {
+                                ["ceil(M/8)", "80", "ceil(C/8)"]
+                            } else {
+                                ["M/8", "U", "1"]
+                            },
+                            slots(tiled),
+                            contract,
+                        )?;
+                    }
+                }
+            }
+        }
+        "e8p_i4_moe_gemv" => {
+            use kernels::e8p_i4_moe_gemv as k;
+            for tiled in [false, true] {
+                for spec in k::module_specs(arch) {
+                    if selected(&spec.tag(), tiled) {
+                        let e = if tiled {
+                            k::emit_rowtiles(spec)?
+                        } else {
+                            k::emit(spec)?
+                        };
+                        let contract = k::contract(spec, &e);
+                        image.push(
+                            e,
+                            if tiled {
+                                ["ceil(M/8)", "80", "ceil(C/8)"]
+                            } else {
+                                ["M", "U", "1"]
+                            },
+                            slots(tiled),
+                            contract,
+                        )?;
+                    }
+                }
+            }
+        }
+        "legacy_mq4_rowtiles" => {
+            let stages = [
+                ("gate_up", ["M/8", "10", "ceil(R/8)"]),
+                ("down", ["M", "top_k", "ceil(R/8)"]),
+            ];
+            for ((stage, grid), e) in stages
+                .into_iter()
+                .zip(kernels::legacy_mq4_rowtiles::build_rowtiles(arch)?)
+            {
+                image.push(
+                    e,
+                    grid,
+                    json!({
+                        "logical_rows": {"min": 1, "max": 64},
+                        "physical_token_rows": 8,
+                    }),
+                    json!({
+                        "projection": stage,
+                        "representation": "legacy aggregate qt44 gate/up and qt53 down",
+                        "reference": "original indexed singleton AR recipe",
+                        "weight_storage": "original aggregate buffers; no repacking",
+                    }),
+                )?;
+            }
+        }
+        "qwen4_slab_union_plan" => {
+            if epi != "all" && epi != "t8" {
+                return Err(format!("{kernel} --epi {epi} (t8|all)"));
+            }
+            image.push(kernels::qwen4_slab_union_plan::emit(arch)?, ["ceil(rows/8)", "1", "1"],
+                json!({"argument": "rows", "min": 1, "max": 64,
+                    "descriptor_words": 482, "descriptor_stride_bytes": 1928,
+                    "slot_capacity": 80, "expert_order": "first occurrence", "slot_ids": "absolute"}),
+                empty())?;
+        }
+        _ => unreachable!(),
+    }
+    if image.entries.is_empty() {
+        return Err(format!(
+            "{kernel}: unknown --epi {epi}; use all or an incumbent tag with optional _t8"
+        ));
+    }
+    Ok(Some(image))
 }
 /// gfx1201 planar MQ3-I4 / MQ2-I4 one-row decode GEMVs (`kernels::mq_i4_rows`):
 /// `--epi <w3|w2>_<r256|r128>` one entry, `all` (default) the four-entry module.
@@ -755,37 +1226,6 @@ fn moe_rotate_i4_pm(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> 
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
-/// gfx1151 / gfx1201 pointer-addressed F4 read-once lane-union decode GEMVs (`kernels::mq_i4_moe_gemv`):
-/// `--epi <mq3i4|mq4sym>_<r256_gate_up|r128_down>[_c16|_c32]` one entry (`_c16` / `_c32`: the wide twins), `all` (default) the twelve-entry module.
-fn mq_i4_moe_gemv_specs(
-    epi: &str,
-    arch: Arch,
-) -> Result<Vec<peacemaker_isa::kernels::mq_i4_moe_gemv::Spec>, String> {
-    use peacemaker_isa::kernels::mq_i4_moe_gemv;
-    let all = mq_i4_moe_gemv::module_specs(arch);
-    if epi == "all" {
-        return Ok(all);
-    }
-    all.into_iter().find(|s|s.tag()==epi).map(|s|vec![s]).ok_or_else(||format!("mq_i4_moe_gemv --epi {epi} ((mq3i4_r256_gate_up|mq3i4_r128_down|mq4sym_r256_gate_up|mq4sym_r128_down)[_c16|_c32]|all)"))
-}
-fn mq_i4_moe_gemv(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
-    use peacemaker_isa::kernels::mq_i4_moe_gemv;
-    if epi == "all" {
-        let (_, text, proof) = mq_i4_moe_gemv::emit_module(arch)?;
-        return Ok((
-            text,
-            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-        ));
-    }
-    let [spec] = mq_i4_moe_gemv_specs(epi, arch)?[..] else {
-        return Err("mq_i4_moe_gemv: one entry expected".into());
-    };
-    let e = mq_i4_moe_gemv::emit(spec)?;
-    Ok((
-        e.s_text,
-        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
-    ))
-}
 /// gfx1151 K1-C1 one-lane slab decode GEMVs (`kernels::mq_i4_moe_gemv_c1`, both codecs per launch):
 /// `--epi <r256_gate_up|r128_down>` one entry, `all` (default) the two-entry module.
 fn mq_i4_moe_gemv_c1_specs(
@@ -826,78 +1266,6 @@ fn mq_i4_moe_gemv_c1(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String>
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
-/// gfx1151 K1-Cn multi-lane (2..8 lanes) slab decode GEMVs (`kernels::mq_i4_moe_gemv_cn`, one codec per symbol):
-/// `--epi <mq3i4|mq4sym>_<r256_gate_up|r128_down>` one entry, `all` (default) the four-entry module.
-fn mq_i4_moe_gemv_cn_specs(
-    epi: &str,
-    arch: Arch,
-) -> Result<Vec<peacemaker_isa::kernels::mq_i4_moe_gemv_cn::Spec>, String> {
-    use peacemaker_isa::kernels::mq_i4_moe_gemv_cn;
-    if arch != Arch::Gfx1151 {
-        return Err("mq_i4_moe_gemv_cn is gfx1151 only".into());
-    }
-    let all = mq_i4_moe_gemv_cn::module_specs();
-    if epi == "all" {
-        return Ok(all);
-    }
-    all.into_iter().find(|s|s.tag()==epi).map(|s|vec![s]).ok_or_else(||format!("mq_i4_moe_gemv_cn --epi {epi} (mq3i4_r256_gate_up|mq3i4_r128_down|mq4sym_r256_gate_up|mq4sym_r128_down|all)"))
-}
-fn mq_i4_moe_gemv_cn(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
-    use peacemaker_isa::kernels::mq_i4_moe_gemv_cn;
-    if arch != Arch::Gfx1151 {
-        return Err("mq_i4_moe_gemv_cn is gfx1151 only".into());
-    }
-    if epi == "all" {
-        let (_, text, proof) = mq_i4_moe_gemv_cn::emit_module()?;
-        return Ok((
-            text,
-            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-        ));
-    }
-    let [spec] = mq_i4_moe_gemv_cn_specs(epi, arch)?[..] else {
-        return Err("mq_i4_moe_gemv_cn: one entry expected".into());
-    };
-    let e = mq_i4_moe_gemv_cn::emit(spec)?;
-    Ok((
-        e.s_text,
-        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
-    ))
-}
-/// gfx1201 pointer-addressed E8P-I4 F4 read-once C1-C8 lane-union decode GEMVs (`kernels::e8p_i4_moe_gemv`):
-/// `--epi <r256_gate_up|r128_down>` one entry, `all` (default) the two-entry module.
-fn e8p_i4_moe_gemv_specs(
-    epi: &str,
-    arch: Arch,
-) -> Result<Vec<peacemaker_isa::kernels::e8p_i4_moe_gemv::Spec>, String> {
-    use peacemaker_isa::kernels::e8p_i4_moe_gemv;
-    let all = e8p_i4_moe_gemv::module_specs(arch);
-    if epi == "all" {
-        return Ok(all);
-    }
-    all.into_iter()
-        .find(|s| s.tag() == epi)
-        .map(|s| vec![s])
-        .ok_or_else(|| format!("e8p_i4_moe_gemv --epi {epi} (r256_gate_up|r128_down|all)"))
-}
-fn e8p_i4_moe_gemv(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
-    use peacemaker_isa::kernels::e8p_i4_moe_gemv;
-    if epi == "all" {
-        let (_, text, proof) = e8p_i4_moe_gemv::emit_module(arch)?;
-        return Ok((
-            text,
-            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-        ));
-    }
-    let [spec] = e8p_i4_moe_gemv_specs(epi, arch)?[..] else {
-        return Err("e8p_i4_moe_gemv: one entry expected".into());
-    };
-    let e = e8p_i4_moe_gemv::emit(spec)?;
-    Ok((
-        e.s_text,
-        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
-    ))
-}
-/// gfx1151 Flash-Next shared-expert gate/up (fused GEMM + BF16-recipe SwiGLU + selector sigmoid + F16 hidden):
 /// `--epi w8|w4` one entry, `all` the module.
 fn qwen4_shared_gu_gfx11(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::qwen4_shared_gu_gfx11::{self, Spec};
@@ -1336,111 +1704,118 @@ fn run() -> Result<(), String> {
     }
     let kernel = kernel.ok_or("missing --kernel")?;
     let arch = arch.ok_or("missing --arch")?;
-    let (text, proof_json) = match kernel.as_str() {
-        "fold_magic" => {
-            if let Some(var) = variant {
-                if var != "probe" {
-                    return Err("fold_magic supports only variant probe".into());
+    let row_image = row_image(&kernel, epi.as_deref().unwrap_or("all"), arch)?;
+    let (text, proof_json) = if let Some(image) = &row_image {
+        let (text, proof) =
+            peacemaker_isa::kernels::iu4_gemm::module(&image.entries, &image.module)?;
+        (
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        )
+    } else {
+        match kernel.as_str() {
+            "fold_magic" => {
+                if let Some(var) = variant {
+                    if var != "probe" {
+                        return Err("fold_magic supports only variant probe".into());
+                    }
                 }
+                let emitted = probe(arch)?;
+                (
+                    emitted.s_text,
+                    serde_json::to_vec_pretty(&emitted.proof).map_err(|e| e.to_string())?,
+                )
             }
-            let emitted = probe(arch)?;
-            (
-                emitted.s_text,
-                serde_json::to_vec_pretty(&emitted.proof).map_err(|e| e.to_string())?,
-            )
-        }
-        "iu4_gemm" => iu4_gemm(
-            fold.as_deref().unwrap_or("k128"),
-            tile.as_deref().ok_or("missing --tile")?,
-            cacc.as_deref().unwrap_or("1"),
-            epi.as_deref().ok_or("missing --epi")?,
-            alayout.as_deref().unwrap_or("token"),
-            arch,
-        )?,
-        "gdn_scan" => {
-            let e = peacemaker_isa::kernels::gdn_scan::emit(arch)?;
-            (
-                e.s_text,
-                serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
-            )
-        }
-        "iu4_v2c" => iu4_v2c(epi.as_deref().unwrap_or("set"), arch)?,
-        "iu4_v2b" => iu4_v2b(epi.as_deref().ok_or("missing --epi")?, arch)?,
-        "iu4_v2b_a4" => iu4_v2b_a4(epi.as_deref().ok_or("missing --epi")?, arch)?,
-        "qwen4_moe_sym" => qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?, arch)?,
-        "qwen4_moe_sym_w3" => qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_moe_sym_w3_nt4" => qwen4_moe_sym_w3_nt4(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_moe_sym_e8p" => qwen4_moe_sym_e8p(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_moe_sym_gfx11_e8p" => {
-            qwen4_moe_sym_gfx11_e8p(epi.as_deref().unwrap_or("all"), arch)?
-        }
-        "qsa_gather" => qsa_gather(epi.as_deref().unwrap_or("all"), arch)?,
-        "qsa_select" => qsa_select(epi.as_deref().unwrap_or("all"), arch)?,
-        "dflash_accept" => dflash_accept(epi.as_deref().unwrap_or("all"), arch)?,
-        "spec_sampling_rows_pm" => spec_sampling_rows(arch)?,
-        "spec_accept_pm" => spec_accept(arch)?,
-        "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
-        "ep_tile_mask_pm" => ep_tile_mask(arch)?,
-        "moe_slot_ops_pm" => moe_slot_ops(arch)?,
-        "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
-        "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
-            peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,
-            arch,
-        )?,
-        "ep_gather_grouped_rows_by_tile_owner_n8_pm" => ep_tile_pull(
-            peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::N8,
-            arch,
-        )?,
-        "qwen4_mq6_x4" => qwen4_mq6_x4(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_mq6_x4_gfx11" => qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
-        "npu_trunk" => {
-            if arch != Arch::Gfx1151 {
-                return Err("npu_trunk is gfx1151 only".into());
+            "iu4_gemm" => iu4_gemm(
+                fold.as_deref().unwrap_or("k128"),
+                tile.as_deref().ok_or("missing --tile")?,
+                cacc.as_deref().unwrap_or("1"),
+                epi.as_deref().ok_or("missing --epi")?,
+                alayout.as_deref().unwrap_or("token"),
+                arch,
+            )?,
+            "gdn_scan" => {
+                let e = peacemaker_isa::kernels::gdn_scan::emit(arch)?;
+                (
+                    e.s_text,
+                    serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+                )
             }
-            let (_, text, proof) = peacemaker_isa::npu_trunk::emit_module()?;
-            (
-                text,
-                serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-            )
-        }
-        "npu_trunk_arena" => {
-            if arch != Arch::Gfx1151 {
-                return Err("npu_trunk_arena is gfx1151 only".into());
+            "iu4_v2c" => iu4_v2c(epi.as_deref().unwrap_or("set"), arch)?,
+            "iu4_v2b" => iu4_v2b(epi.as_deref().ok_or("missing --epi")?, arch)?,
+            "iu4_v2b_a4" => iu4_v2b_a4(epi.as_deref().ok_or("missing --epi")?, arch)?,
+            "qwen4_moe_sym" => qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?, arch)?,
+            "qwen4_moe_sym_w3" => qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_moe_sym_w3_nt4" => qwen4_moe_sym_w3_nt4(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_moe_sym_e8p" => qwen4_moe_sym_e8p(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_moe_sym_gfx11_e8p" => {
+                qwen4_moe_sym_gfx11_e8p(epi.as_deref().unwrap_or("all"), arch)?
             }
-            let (_, text, proof) = peacemaker_isa::npu_trunk_arena::emit_module()?;
-            (
-                text,
-                serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
-            )
+            "qsa_gather" => qsa_gather(epi.as_deref().unwrap_or("all"), arch)?,
+            "qsa_select" => qsa_select(epi.as_deref().unwrap_or("all"), arch)?,
+            "dflash_accept" => dflash_accept(epi.as_deref().unwrap_or("all"), arch)?,
+            "spec_sampling_rows_pm" => spec_sampling_rows(arch)?,
+            "spec_accept_pm" => spec_accept(arch)?,
+            "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
+            "ep_tile_mask_pm" => ep_tile_mask(arch)?,
+            "moe_slot_ops_pm" => moe_slot_ops(arch)?,
+            "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
+            "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
+                peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,
+                arch,
+            )?,
+            "ep_gather_grouped_rows_by_tile_owner_n8_pm" => ep_tile_pull(
+                peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::N8,
+                arch,
+            )?,
+            "qwen4_mq6_x4" => qwen4_mq6_x4(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_mq6_x4_gfx11" => qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
+            "npu_trunk" => {
+                if arch != Arch::Gfx1151 {
+                    return Err("npu_trunk is gfx1151 only".into());
+                }
+                let (_, text, proof) = peacemaker_isa::npu_trunk::emit_module()?;
+                (
+                    text,
+                    serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+                )
+            }
+            "npu_trunk_arena" => {
+                if arch != Arch::Gfx1151 {
+                    return Err("npu_trunk_arena is gfx1151 only".into());
+                }
+                let (_, text, proof) = peacemaker_isa::npu_trunk_arena::emit_module()?;
+                (
+                    text,
+                    serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+                )
+            }
+            "qwen4_lane_rows" => qwen4_lane_rows(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_mq4_x4_gfx11" => qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
+            "mq_i4_rows" => mq_i4_rows(epi.as_deref().unwrap_or("all"), arch)?,
+            "mq_i4_a4" => mq_i4_a4(epi.as_deref().unwrap_or("all"), arch)?,
+            "moe_rotate_i4_pm" => moe_rotate_i4_pm(epi.as_deref().unwrap_or("all"), arch)?,
+            "mq_i4_moe_gemv_c1" => mq_i4_moe_gemv_c1(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_shared_gu_gfx11" => {
+                qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"), arch)?
+            }
+            "mtp_dense_det_gfx11" => mtp_dense_det_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
+            "mtp_q8_det_gfx11" => mtp_q8_det_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
+            "mq4_verify" => mq4_verify(epi.as_deref().unwrap_or("all"), arch)?,
+            "fa_prefill_pm" => fa_prefill_pm(arch)?,
+            "fa_prefill_fp8_pm" => fa_prefill_fp8_pm(arch)?,
+            "fa_qprep_pm" => fa_qprep_pm(arch)?,
+            "iu4_c8_producer_pm" => iu4_c8_producer_pm(arch)?,
+            "gdn_chunk_prep_pm" => gdn_chunk_prep_pm(arch)?,
+            "mq4_fp8_verify" => mq4_fp8_verify(epi.as_deref().unwrap_or("all"), arch)?,
+            "fp8_gemm" => fp8_gemm(
+                scale.as_deref().ok_or("missing --scale")?,
+                epi.as_deref().ok_or("missing --epi")?,
+                arch,
+            )?,
+            k if k.starts_with("pm_decode_") => pm_decode(&k["pm_decode_".len()..], arch)?,
+            _ => return Err(format!("kernel {kernel} is not authored\n{USAGE}")),
         }
-        "qwen4_lane_rows" => qwen4_lane_rows(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_mq4_x4_gfx11" => qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq4_rows_x4" => mq4_rows_x4(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_bf16_rows_wide" => qwen4_bf16_rows_wide(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq_i4_rows" => mq_i4_rows(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq_i4_a4" => mq_i4_a4(epi.as_deref().unwrap_or("all"), arch)?,
-        "moe_rotate_i4_pm" => moe_rotate_i4_pm(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq_i4_moe_gemv" => mq_i4_moe_gemv(epi.as_deref().unwrap_or("all"), arch)?,
-        "e8p_i4_moe_gemv" => e8p_i4_moe_gemv(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq_i4_moe_gemv_c1" => mq_i4_moe_gemv_c1(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq_i4_moe_gemv_cn" => mq_i4_moe_gemv_cn(epi.as_deref().unwrap_or("all"), arch)?,
-        "qwen4_shared_gu_gfx11" => qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
-        "mtp_dense_det_gfx11" => mtp_dense_det_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
-        "mtp_q8_det_gfx11" => mtp_q8_det_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
-        "mq4_verify" => mq4_verify(epi.as_deref().unwrap_or("all"), arch)?,
-        "fa_prefill_pm" => fa_prefill_pm(arch)?,
-        "fa_prefill_fp8_pm" => fa_prefill_fp8_pm(arch)?,
-        "fa_qprep_pm" => fa_qprep_pm(arch)?,
-        "iu4_c8_producer_pm" => iu4_c8_producer_pm(arch)?,
-        "gdn_chunk_prep_pm" => gdn_chunk_prep_pm(arch)?,
-        "mq4_fp8_verify" => mq4_fp8_verify(epi.as_deref().unwrap_or("all"), arch)?,
-        "fp8_gemm" => fp8_gemm(
-            scale.as_deref().ok_or("missing --scale")?,
-            epi.as_deref().ok_or("missing --epi")?,
-            arch,
-        )?,
-        k if k.starts_with("pm_decode_") => pm_decode(&k["pm_decode_".len()..], arch)?,
-        _ => return Err(format!("kernel {kernel} is not authored\n{USAGE}")),
     };
     let pm_module = kernel.strip_prefix("pm_decode_");
     let mq4v = kernel == "mq4_verify";
@@ -1450,15 +1825,12 @@ fn run() -> Result<(), String> {
     let iu4c8 = kernel == "iu4_c8_producer_pm";
     let gcp = kernel == "gdn_chunk_prep_pm";
     let mq4f8 = kernel == "mq4_fp8_verify";
-    let mqi4 = kernel == "mq_i4_rows"
-        || kernel == "mq_i4_moe_gemv"
-        || kernel == "e8p_i4_moe_gemv"
-        || kernel == "mq_i4_moe_gemv_c1"
-        || kernel == "mq_i4_moe_gemv_cn";
+    let mqi4 = kernel == "mq_i4_rows" || kernel == "mq_i4_moe_gemv_c1";
     let mqia4 = kernel == "mq_i4_a4";
     let mrot = kernel == "moe_rotate_i4_pm";
-    let lane_rows =
-        kernel == "qwen4_lane_rows" || kernel == "npu_trunk" || kernel == "npu_trunk_arena";
+    let lane_rows = (kernel == "qwen4_lane_rows" && row_image.is_none())
+        || kernel == "npu_trunk"
+        || kernel == "npu_trunk_arena";
     let spec_pm = kernel == "spec_sampling_rows_pm"
         || kernel == "spec_accept_pm"
         || kernel == "qwen4_ep_owner_assign_pm"
@@ -1477,6 +1849,7 @@ fn run() -> Result<(), String> {
         && !iu4c8
         && !gcp
         && !mq4f8
+        && row_image.is_none()
         && !mqi4
         && !mqia4
         && !mrot
@@ -1572,15 +1945,61 @@ fn run() -> Result<(), String> {
             "moe_rotate_i4_pm --shape/--m7 require --co (M7 certifies the linked object)".into(),
         );
     }
+    if row_image.is_some() && co.is_none() {
+        return Err(format!(
+            "{kernel} emission requires --co (M7 certifies every linked export)"
+        ));
+    }
+    #[cfg(not(feature = "toolchain"))]
+    if row_image.is_some() {
+        return Err(format!(
+            "{kernel} emission certifies with M7: build peacemaker-isa with --features toolchain"
+        ));
+    }
     // Native emission: the code object `llvm-mc` + `ld.lld -shared` would link, and its bundle.
     if co.is_some() || bundle.is_some() {
         let elf = peacemaker_isa::native::assemble(&text, arch)?;
         if let Some(path) = &co {
             fs::write(path, &elf).map_err(|e| format!("{path}: {e}"))?
         }
-        if let Some(path) = bundle {
-            fs::write(&path, peacemaker_isa::native::bundle(&elf, arch, &host))
-                .map_err(|e| format!("{path}: {e}"))?
+        if let Some(path) = &bundle {
+            let bytes = peacemaker_isa::native::bundle(&elf, arch, &host);
+            fs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+            let hash_path = format!("{path}.sha256");
+            fs::write(&hash_path, format!("{:x}", Sha256::digest(&bytes)))
+                .map_err(|e| format!("{hash_path}: {e}"))?;
+        }
+    }
+    #[cfg(feature = "toolchain")]
+    if let Some(image) = &row_image {
+        let path = co.as_deref().ok_or("missing --co")?;
+        let mut receipts = serde_json::Map::new();
+        if let Some(dir) = &shape {
+            fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+        }
+        for (e, contract) in image.entries.iter().zip(&image.contracts) {
+            let symbol = row_export(e)?;
+            receipts.insert(
+                symbol.to_owned(),
+                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), symbol)?,
+            );
+            if let Some(dir) = &shape {
+                let file = format!(
+                    "{dir}/{kernel}.{}.{}.contract.json",
+                    arch.name(),
+                    e.proof.variant
+                );
+                fs::write(
+                    &file,
+                    serde_json::to_vec_pretty(contract).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| format!("{file}: {e}"))?;
+            }
+        }
+        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
+        println!("{}", String::from_utf8_lossy(&receipts));
+        if let Some(file) = &m7 {
+            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?;
         }
     }
     // PM decode twins: M7 (lift byte-exact, obligations {}, no ambiguous delays) on every export of the linked object.
@@ -1926,72 +2345,6 @@ fn run() -> Result<(), String> {
             fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
         }
     }
-    // mq_i4_moe_gemv: the same for the four F4 lane-union decode GEMV entries.
-    #[cfg(feature = "toolchain")]
-    if kernel == "mq_i4_moe_gemv" && co.is_some() {
-        let path = co.as_deref().ok_or("missing --co")?;
-        let mut receipts = serde_json::Map::new();
-        for spec in mq_i4_moe_gemv_specs(epi.as_deref().unwrap_or("all"), arch)? {
-            let symbol = spec.symbol();
-            let m7 =
-                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), &symbol)?;
-            if let Some(dir) = &shape {
-                let e = peacemaker_isa::kernels::mq_i4_moe_gemv::emit(spec)?;
-                let file = format!(
-                    "{dir}/mq_i4_moe_gemv.{}.{}.contract.json",
-                    arch.name(),
-                    spec.tag()
-                );
-                fs::write(
-                    &file,
-                    serde_json::to_vec_pretty(&peacemaker_isa::kernels::mq_i4_moe_gemv::contract(
-                        spec, &e,
-                    ))
-                    .map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| format!("{file}: {e}"))?;
-            }
-            receipts.insert(symbol, m7);
-        }
-        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
-        println!("{}", String::from_utf8_lossy(&receipts));
-        if let Some(file) = &m7 {
-            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
-        }
-    }
-    // e8p_i4_moe_gemv: the same for the two E8P-I4 F4 lane-union decode GEMV entries.
-    #[cfg(feature = "toolchain")]
-    if kernel == "e8p_i4_moe_gemv" && co.is_some() {
-        let path = co.as_deref().ok_or("missing --co")?;
-        let mut receipts = serde_json::Map::new();
-        for spec in e8p_i4_moe_gemv_specs(epi.as_deref().unwrap_or("all"), arch)? {
-            let symbol = spec.symbol();
-            let m7 =
-                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), &symbol)?;
-            if let Some(dir) = &shape {
-                let e = peacemaker_isa::kernels::e8p_i4_moe_gemv::emit(spec)?;
-                let file = format!(
-                    "{dir}/e8p_i4_moe_gemv.{}.{}.contract.json",
-                    arch.name(),
-                    spec.tag()
-                );
-                fs::write(
-                    &file,
-                    serde_json::to_vec_pretty(&peacemaker_isa::kernels::e8p_i4_moe_gemv::contract(
-                        spec, &e,
-                    ))
-                    .map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| format!("{file}: {e}"))?;
-            }
-            receipts.insert(symbol, m7);
-        }
-        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
-        println!("{}", String::from_utf8_lossy(&receipts));
-        if let Some(file) = &m7 {
-            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
-        }
-    }
     // mq_i4_moe_gemv_c1: M7 on the linked object's two exports, plus their shape contracts (--shape DIR).
     #[cfg(feature = "toolchain")]
     if kernel == "mq_i4_moe_gemv_c1" && co.is_some() {
@@ -2012,39 +2365,6 @@ fn run() -> Result<(), String> {
                     &file,
                     serde_json::to_vec_pretty(
                         &peacemaker_isa::kernels::mq_i4_moe_gemv_c1::contract(spec, &e),
-                    )
-                    .map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| format!("{file}: {e}"))?;
-            }
-            receipts.insert(symbol, m7);
-        }
-        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
-        println!("{}", String::from_utf8_lossy(&receipts));
-        if let Some(file) = &m7 {
-            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
-        }
-    }
-    // mq_i4_moe_gemv_cn: M7 on the linked object's four exports, plus their shape contracts (--shape DIR).
-    #[cfg(feature = "toolchain")]
-    if kernel == "mq_i4_moe_gemv_cn" && co.is_some() {
-        let path = co.as_deref().ok_or("missing --co")?;
-        let mut receipts = serde_json::Map::new();
-        for spec in mq_i4_moe_gemv_cn_specs(epi.as_deref().unwrap_or("all"), arch)? {
-            let symbol = spec.symbol();
-            let m7 =
-                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), &symbol)?;
-            if let Some(dir) = &shape {
-                let e = peacemaker_isa::kernels::mq_i4_moe_gemv_cn::emit(spec)?;
-                let file = format!(
-                    "{dir}/mq_i4_moe_gemv_cn.{}.{}.contract.json",
-                    arch.name(),
-                    spec.tag()
-                );
-                fs::write(
-                    &file,
-                    serde_json::to_vec_pretty(
-                        &peacemaker_isa::kernels::mq_i4_moe_gemv_cn::contract(spec, &e),
                     )
                     .map_err(|e| e.to_string())?,
                 )

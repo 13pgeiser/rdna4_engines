@@ -1443,6 +1443,17 @@ pub const fn qwen4_slab_union_words_checked(lanes: usize) -> Option<usize> {
     }
 }
 
+/// Words of the native eight-row slab descriptors: `ceil(lanes / 8) * 482`.
+/// Each descriptor reserves all 80 slots, including an incomplete tail tile.
+/// Zero lanes need no descriptors; `None` on overflow.
+pub const fn qwen4_slab_rowtile_words_checked(lanes: usize) -> Option<usize> {
+    let tiles = match (lanes / 8).checked_add(if lanes % 8 == 0 { 0 } else { 1 }) {
+        Some(tiles) => tiles,
+        None => return None,
+    };
+    tiles.checked_mul(482)
+}
+
 pub(crate) fn grow_scratch_slot(
     hip: &HipRuntime,
     slot: &mut Option<DeviceBuffer>,
@@ -1644,6 +1655,21 @@ pub fn qwen4_slab_union_bytes(lanes: usize) -> Option<usize> {
     qwen4_slab_union_words_checked(lanes)?.checked_mul(4)
 }
 
+/// Bytes of the native eight-row slab descriptors; zero for zero lanes and
+/// `None` on overflow. Each physical tile occupies 1928 bytes.
+pub fn qwen4_slab_rowtile_bytes(lanes: usize) -> Option<usize> {
+    qwen4_slab_rowtile_words_checked(lanes)?.checked_mul(4)
+}
+
+/// Shared descriptor allocation required by both the legacy lane union and
+/// native row tiles. Both representations must fit; `None` on either overflow.
+/// Reservation, replay-growth checks and admission must use this same extent.
+pub fn qwen4_slab_descriptor_bytes(lanes: usize) -> Option<usize> {
+    let union = qwen4_slab_union_bytes(lanes)?;
+    let rowtiles = qwen4_slab_rowtile_bytes(lanes)?;
+    Some(union.max(rowtiles))
+}
+
 /// Bytes of the FP16 X scratch for `n_elems` F16 elements; `None` on overflow.
 pub fn fp16_x_bytes(n_elems: usize) -> Option<usize> {
     n_elems.checked_mul(2)
@@ -1737,7 +1763,7 @@ pub fn qwen4_prefill_workspace_terms(
         (0, 0, 0, 0)
     };
     let slab_union = if routed {
-        qwen4_slab_union_bytes(crate::slab_moe::SLAB_MAX_LANES)?
+        qwen4_slab_descriptor_bytes(crate::slab_moe::SLAB_MAX_LANES)?
     } else {
         0
     };
@@ -3101,16 +3127,20 @@ impl ScratchState {
         )
     }
 
-    /// Reserve the sealed expert-slab scratch: the union descriptor for
-    /// `max_lanes` decode lanes and `tiles` masked tile ids per codec.
+    /// Reserve the sealed expert-slab scratch: enough descriptor space for both
+    /// representations of `max_lanes` lanes and `tiles` masked tile ids per codec.
+    /// Preflight all size arithmetic before either allocation can change.
     pub fn reserve_qwen4_slab(
         &mut self,
         hip: &HipRuntime,
         max_lanes: usize,
         tiles: usize,
     ) -> HipResult<()> {
-        let union_bytes = qwen4_slab_union_bytes(max_lanes).ok_or_else(|| {
+        let union_bytes = qwen4_slab_descriptor_bytes(max_lanes).ok_or_else(|| {
             hip_bridge::HipError::new(0, "reserve_qwen4_slab: union descriptor extent overflow")
+        })?;
+        let tile_bytes = qwen4_slab_tiles_bytes(tiles).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_qwen4_slab: tile mask extent overflow")
         })?;
         grow_scratch_buffer(
             hip,
@@ -3119,9 +3149,6 @@ impl ScratchState {
             union_bytes,
         )?;
         if tiles != 0 {
-            let tile_bytes = qwen4_slab_tiles_bytes(tiles).ok_or_else(|| {
-                hip_bridge::HipError::new(0, "reserve_qwen4_slab: tile mask extent overflow")
-            })?;
             grow_scratch_buffer(
                 hip,
                 &mut self.qwen4_slab_tiles_scratch,
@@ -4302,14 +4329,95 @@ mod prefill_workspace_tests {
         assert_eq!(qwen4_grouped_rows_bound(40960, 512), Some(48_640));
         assert_eq!(qwen4_slab_tiles_bytes(3040), Some(24_320));
         assert_eq!(qwen4_slab_union_bytes(16), Some(3848));
+        assert_eq!(qwen4_slab_union_bytes(32), Some(7688));
+        assert_eq!(qwen4_slab_union_bytes(64), Some(15_368));
         assert_eq!(
-            qwen4_slab_union_bytes(crate::slab_moe::SLAB_MAX_LANES),
-            Some(7688)
+            qwen4_slab_descriptor_bytes(crate::slab_moe::SLAB_MAX_LANES),
+            Some(15_424)
         );
         assert_eq!(qwen4_slab_union_bytes(usize::MAX), None);
         assert_eq!(fp16_x_bytes(4096 * 10240), Some(83_886_080));
         assert_eq!(fp16_x_bytes(usize::MAX), None);
         assert_eq!(MQ_FIXED_WORKSPACE_BYTES, 167_424);
+    }
+
+    #[test]
+    fn slab_rowtile_sizes_cover_every_width_and_fixed_tail() {
+        const ONE_TILE_WORDS: Option<usize> = qwen4_slab_rowtile_words_checked(1);
+        assert_eq!(ONE_TILE_WORDS, Some(482));
+        assert_eq!(qwen4_slab_rowtile_words_checked(0), Some(0));
+        assert_eq!(qwen4_slab_rowtile_bytes(0), Some(0));
+        // The legacy representation retains its two terminal offsets at zero.
+        assert_eq!(qwen4_slab_union_words_checked(0), Some(2));
+        assert_eq!(qwen4_slab_union_bytes(0), Some(8));
+        assert_eq!(qwen4_slab_descriptor_bytes(0), Some(8));
+        for lanes in 1usize..=64 {
+            let tiles = lanes.div_ceil(8);
+            let words = tiles * 482;
+            assert_eq!(qwen4_slab_rowtile_words_checked(lanes), Some(words));
+            assert_eq!(qwen4_slab_rowtile_bytes(lanes), Some(words * 4));
+            assert_eq!(
+                qwen4_slab_rowtile_bytes(lanes),
+                qwen4_slab_rowtile_bytes(tiles * 8),
+                "tail descriptor must remain full-sized at R={lanes}"
+            );
+            assert_eq!(qwen4_slab_union_words_checked(lanes), Some(lanes * 60 + 2));
+            assert_eq!(qwen4_slab_union_words(lanes), lanes * 60 + 2);
+            assert_eq!(qwen4_slab_union_bytes(lanes), Some((lanes * 60 + 2) * 4));
+            assert_eq!(
+                qwen4_slab_descriptor_bytes(lanes),
+                Some(((lanes * 60 + 2) * 4).max(words * 4))
+            );
+            if lanes % 8 == 1 && lanes > 1 {
+                assert_eq!(
+                    qwen4_slab_rowtile_bytes(lanes).unwrap()
+                        - qwen4_slab_rowtile_bytes(lanes - 1).unwrap(),
+                    1928
+                );
+            }
+        }
+        assert_eq!(qwen4_slab_rowtile_words_checked(64), Some(3856));
+        assert_eq!(qwen4_slab_rowtile_bytes(64), Some(15_424));
+        assert_eq!(qwen4_slab_descriptor_bytes(64), Some(15_424));
+    }
+
+    #[test]
+    fn slab_descriptor_size_overflows_are_checked() {
+        let max_word_tiles = usize::MAX / 482;
+        let max_word_lanes = max_word_tiles * 8;
+        assert_eq!(
+            qwen4_slab_rowtile_words_checked(max_word_lanes),
+            Some(max_word_tiles * 482)
+        );
+        assert_eq!(qwen4_slab_rowtile_words_checked(max_word_lanes + 1), None);
+        let max_byte_tiles = usize::MAX / 1928;
+        let max_byte_lanes = max_byte_tiles * 8;
+        assert_eq!(
+            qwen4_slab_rowtile_bytes(max_byte_lanes),
+            Some(max_byte_tiles * 1928)
+        );
+        // Word sizing still fits when conversion to bytes first overflows.
+        assert!(qwen4_slab_rowtile_words_checked(max_byte_lanes + 1).is_some());
+        assert_eq!(qwen4_slab_rowtile_bytes(max_byte_lanes + 1), None);
+        assert_eq!(qwen4_slab_descriptor_bytes(max_byte_lanes + 1), None);
+        let max_union_lanes = (usize::MAX - 2) / 60;
+        assert!(qwen4_slab_union_words_checked(max_union_lanes).is_some());
+        assert_eq!(qwen4_slab_union_words_checked(max_union_lanes + 1), None);
+        let max_union_byte_lanes = (usize::MAX / 4 - 2) / 60;
+        assert!(qwen4_slab_union_bytes(max_union_byte_lanes).is_some());
+        assert_eq!(qwen4_slab_union_bytes(max_union_byte_lanes + 1), None);
+        assert_eq!(qwen4_slab_descriptor_bytes(max_union_byte_lanes + 1), None);
+        assert_eq!(qwen4_slab_rowtile_words_checked(usize::MAX), None);
+        assert_eq!(qwen4_slab_rowtile_bytes(usize::MAX), None);
+        assert_eq!(qwen4_slab_descriptor_bytes(usize::MAX), None);
+        assert_eq!(qwen4_slab_tiles_bytes(0), Some(0));
+        let max_mask_tiles = usize::MAX / 8;
+        assert_eq!(
+            qwen4_slab_tiles_bytes(max_mask_tiles),
+            Some(max_mask_tiles * 8)
+        );
+        assert_eq!(qwen4_slab_tiles_bytes(max_mask_tiles + 1), None);
+        assert_eq!(qwen4_slab_tiles_bytes(usize::MAX), None);
     }
 
     #[cfg(feature = "deltanet")]
@@ -4342,19 +4450,19 @@ mod prefill_workspace_tests {
         assert_eq!(
             values,
             [
-                83_886_080, 20_971_520, 5_898_240, 821_248, 14_745_600, 24_320, 7_688, 167_424,
+                83_886_080, 20_971_520, 5_898_240, 821_248, 14_745_600, 24_320, 15_424, 167_424,
                 25_165_824, 1_572_864, 1_024,
             ]
         );
-        assert_eq!(sum(terms), 153_261_832);
+        assert_eq!(sum(terms), 153_269_568);
         let no_tails = qwen4_prefill_workspace_terms(
             4096,
             &flash_next(Some(crate::tensor_ops::GdnStateFormat::Q8), false),
         )
         .unwrap();
-        assert_eq!(sum(no_tails), 153_260_808);
+        assert_eq!(sum(no_tails), 153_268_544);
         let no_gdn = qwen4_prefill_workspace_terms(4096, &flash_next(None, false)).unwrap();
-        assert_eq!(sum(no_gdn), 153_260_808 - 25_165_824 - 1_572_864);
+        assert_eq!(sum(no_gdn), 153_268_544 - 25_165_824 - 1_572_864);
     }
 
     /// The dense scan's A scratch is charged for every admitted GDN state (Q8, Q8Ef); the

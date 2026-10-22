@@ -117,9 +117,9 @@ fn is_slab(p: &MoePrefillParams<'_>) -> bool {
         .is_some_and(|policy| policy.capability.is_slab())
 }
 
-/// Whether this slab call runs the K2 grouped IU4 kernels (`route_rows > 8`:
-/// long prefill, and every row count under the batch-invariant profile); the
-/// other slab calls run the K1 lane-union GEMV in the path-1 stage shape.
+/// Whether this slab call exceeds the actual eager exact-row admission and
+/// runs K2 grouped IU4. K1 uses fixed eight-row physical tiles, not an
+/// eight-row logical limit; recording and ordinary prefill retain their cap.
 fn slab_k2(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     is_slab(p)
         && super::slab_route::arch_supported(&gpu.arch)
@@ -127,6 +127,16 @@ fn slab_k2(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
         && p.x_norm_batch.dtype == DType::F32
         && p.down_k == p.mi
         && gpu.route_rows(p.batch_size) > gpu.few_row_limit()
+}
+
+/// The sealed lowerer may have selected grouped stages before entering the
+/// eager verify scope. Every stage must agree on slot-ordered decode layout.
+fn grouped_path_for_rows(requested: bool, route: usize, limit: usize) -> bool {
+    requested && !super::layer_ops::wide_exact_route(route, limit)
+}
+
+fn grouped_path(gpu: &Gpu, p: &MoePrefillParams<'_>, requested: bool) -> bool {
+    grouped_path_for_rows(requested, gpu.route_rows(p.batch_size), gpu.few_row_limit())
 }
 
 /// Geometry gate of whichever grouped route `p` declares.
@@ -262,6 +272,7 @@ impl ScratchRoute {
         if is_fp8(p) {
             return Self::fp8();
         }
+        let use_path2 = grouped_path(gpu, p, use_path2);
         Self {
             path2: use_path2,
             fp8: false,
@@ -292,7 +303,7 @@ impl ScratchRoute {
     /// - path-2 F32 arms: F32 `[G, 2 mi]` / `[G, down_m]` (BF16 on the gfx11
     ///   WMMA arms), plus the unscattered activation unless gate/up stores
     ///   SwiGLU for the down's own unscatter;
-    /// - indexed down (<= 8 rows) and path 1: the `[rows * k_top, ...]`
+    /// - indexed down and path 1: the `[rows * k_top, ...]`
     ///   batch buffers and the expanded down rows;
     /// - every route that has a shared expert: its F32 `[rows, down_m]` down
     ///   in `down_expanded`, because the BF16 epilogue may decline at run time.
@@ -427,6 +438,7 @@ pub(crate) fn writes_slot_ordered_rows(
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> bool {
+    let use_path2 = grouped_path(gpu, p, use_path2);
     // The FP8 grouped down leaves grouped rows, never slot-ordered rows.
     !is_fp8(p)
         && p.expert_stage_ptrs.is_none()
@@ -478,6 +490,11 @@ fn batch_projection(
         // packed basis once per layer, so no per-projection rotation is owed.
         DType::BF16 => super::project_weight(gpu, weight, x, y, batch_size, None),
         DType::F32 => hip(gpu.gemm_f32_batched(weight.buf, x, y, weight.m, weight.k, batch_size)),
+        DType::MQ4G256V2 if (2..=gpu.few_row_limit()).contains(&gpu.route_rows(batch_size)) => {
+            let part = (weight.buf, y, weight.m);
+            let none = (weight.buf, y, 0);
+            hip(gpu.gemv_mq4g256v2_rows_x4([part, none, none, none], x, weight.k, batch_size))
+        }
         DType::MQ4G256V2 => {
             hip(gpu.gemm_mq4g256v2(weight.buf, x, y, weight.m, weight.k, batch_size))
         }
@@ -523,6 +540,13 @@ pub(crate) fn router_projection(
     )
 }
 
+fn router_shared_bf16_basis(router: &WeightRef<'_>, shared: [&WeightRef<'_>; 3]) -> bool {
+    router.dtype == DType::BF16
+        && shared
+            .iter()
+            .all(|w| w.dtype == DType::BF16 && w.k == router.k)
+}
+
 /// Whether a few-row forward (route rows within `Gpu::few_row_limit`: the
 /// historic 8, or the verify scope's admitted exact cap, where the grouped
 /// BF16 row kernel is bitwise each projection's own) projects the router
@@ -533,15 +557,15 @@ pub(crate) fn router_projection(
 /// mismatched K keeps the independent router launch.
 fn router_with_shared(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     gpu.route_rows(p.batch_size) <= gpu.few_row_limit()
-        && p.prelude.router.dtype == DType::BF16
         && p.prelude.shared.as_ref().is_some_and(|shared| {
-            [
-                &shared.weights.selector,
-                &shared.weights.gate,
-                &shared.weights.up,
-            ]
-            .iter()
-            .all(|w| w.dtype == DType::BF16 && w.k == p.prelude.router.k)
+            router_shared_bf16_basis(
+                &p.prelude.router,
+                [
+                    &shared.weights.selector,
+                    &shared.weights.gate,
+                    &shared.weights.up,
+                ],
+            )
         })
 }
 
@@ -666,7 +690,7 @@ pub(crate) fn shared_gate_up(
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let weights = &shared.weights;
     if router_with_shared(gpu, p) {
-        // All read the natural activation: one launch (one F16 conversion).
+        // All read the natural F32 activation; admitted rows share the exact x4 launch.
         super::layer_ops::project_weights(
             gpu,
             p.x_norm_batch,
@@ -902,7 +926,8 @@ pub(crate) fn shared_down(
     let target = p.routed_out.unwrap_or(p.x_batch);
     // The fused shared gate/up leaves the activation as F16 in `rotated`'s bytes.
     let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
-    if down.dtype == DType::BF16
+    if !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && down.dtype == DType::BF16
         && p.recipe.bf16_round_trip()
         && hip(gpu.qwen4_shared_down_bf16_epi(
             down.buf,
@@ -1128,7 +1153,8 @@ fn hc_shared_down_admits(gpu: &Gpu, p: &MoePrefillParams<'_>, hc: &HcSharedDown)
     };
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
-    gpu.flags.qwen4_hc_fuse_level() >= 3
+    !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && gpu.flags.qwen4_hc_fuse_level() >= 3
         && down.dtype == DType::BF16
         && down.rotation.is_none()
         && down.awq_scale.is_none()
@@ -1253,7 +1279,8 @@ fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     if is_slab(p) {
         return use_path2 && slab_k2(gpu, p);
     }
-    use_path2
+    !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && use_path2
         && p.route_policy
             .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
         && p.recipe.bf16_round_trip()
@@ -1274,6 +1301,9 @@ pub(crate) fn scatter(
         return fp8_scatter(gpu, p, grouped_rows);
     }
     require_geometry(p)?;
+    if super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
+        return Ok(());
+    }
     let total_slots = p.batch_size * p.k_top;
     if sym_iu4(gpu, p, true) || (p.ep_tile_exchange.is_some() && wmma_tile_route(gpu, p, true)) {
         if is_slab(p) {
@@ -1321,7 +1351,8 @@ pub(crate) fn scatter(
 /// BF16 rows: the recipe rounds gate/up to BF16 before SiLU anyway.  The
 /// BF16-output entries exist in the gfx11 source only.
 fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    !is_slab(p)
+    !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && !is_slab(p)
         && p.recipe.bf16_round_trip()
         && gpu.arch_caps.has_wmma_w32()
         && gpu.qwen4_moe_gateup_wmma_applies(2 * p.mi, p.gate_up_k, p.batch_size)
@@ -1330,7 +1361,8 @@ fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 /// Whether the grouped down takes the F16 WMMA arm: rotated straight to F16 in
 /// `down`, output as BF16 for the combine, which rounds every row to BF16.
 fn down_wmma(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    !is_slab(p)
+    !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && !is_slab(p)
         && p.down_k == p.mi
         && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
 }
@@ -1468,6 +1500,7 @@ pub(crate) fn gate_up(
         return fp8_gate_up(gpu, p, grouped_rows);
     }
     require_geometry(p)?;
+    let use_path2 = grouped_path(gpu, p, use_path2);
     validate_scratch(gpu, p, use_path2, grouped_rows)?;
     let gate_up_ptrs = p
         .expert_stage_ptrs
@@ -1533,6 +1566,14 @@ pub(crate) fn gate_up(
             p.batch_size,
         ))
     } else {
+        #[cfg(feature = "test-utils")]
+        super::bind_g1_window(
+            gpu,
+            p.routed_experts,
+            p.n_exp,
+            p.topk_weights,
+            p.recipe.bf16_round_trip(),
+        )?;
         hip(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
             gate_up_ptrs,
             p.topk_indices,
@@ -1548,7 +1589,9 @@ pub(crate) fn gate_up(
             .checked_mul(p.k_top)
             .and_then(|slots| slots.checked_mul(p.mi))
             .ok_or_else(|| DispatchError::Hip("grouped gate/up extent overflows".into()))?;
-        if p.recipe.bf16_round_trip() {
+        // Wide verify uses the singleton fused reader below, which owns these
+        // round trips. Keep the raw gate/up outputs just as decode does.
+        if p.recipe.bf16_round_trip() && !super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
             hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
             hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
         }
@@ -1573,6 +1616,9 @@ pub(crate) fn unscatter(
         return fp8_unscatter(gpu, p, grouped_rows);
     }
     require_geometry(p)?;
+    if super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
+        return Ok(());
+    }
     validate_scratch(gpu, p, true, grouped_rows)?;
     // The slab route has no unscatter: K2 keeps SwiGLU in the gate/up epilogue
     // and rotates in `down`; K1 writes slot-ordered F32 rows.
@@ -1646,7 +1692,8 @@ pub(crate) fn unscatter(
 /// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
 /// (in the same launch), leaving [`activation`] nothing to do.
 fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    !is_slab(p)
+    !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && !is_slab(p)
         && !sym_iu4(gpu, p, true)
         && !gateup_bf16(gpu, p)
         && !down_wmma(gpu, p)
@@ -1679,15 +1726,32 @@ pub(crate) fn activation(
         return fp8_validate(gpu, p, p.m_total_max).map(drop);
     }
     require_geometry(p)?;
+    let use_path2 = grouped_path(gpu, p, use_path2);
     let total_slots = p.batch_size * p.k_top;
     if is_slab(p) {
         return slab_activation(gpu, p);
     }
+    let live = total_slots
+        .checked_mul(p.mi)
+        .ok_or_else(|| DispatchError::Hip("routed activation extent overflows".into()))?;
+    let gate = f32_view(p.gate_batch, 0, live);
+    let up = f32_view(p.up_batch, 0, live);
+    let rotated = f32_view(p.rot_batch, 0, live);
+    if p.recipe.bf16_round_trip() && super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
+        return hip(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
+            &gate,
+            &up,
+            &rotated,
+            p.mi,
+            total_slots,
+            None,
+        ));
+    }
     // Path 2's unscatter already produced the activation.
     if !use_path2 {
-        hip(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
+        hip(gpu.silu_mul_f32(&gate, &up, &rotated))?;
         if p.recipe.bf16_round_trip() {
-            hip(gpu.bf16_round_trip_f32(p.rot_batch))?;
+            hip(gpu.bf16_round_trip_f32(&rotated))?;
         }
     }
     // The F16 WMMA and symmetric IU4 downs rotate the grouped rows themselves
@@ -1695,7 +1759,7 @@ pub(crate) fn activation(
     if use_path2 && (sym_iu4(gpu, p, use_path2) || down_wmma(gpu, p) || unscatter_rotates(gpu, p)) {
         return Ok(());
     }
-    hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
+    hip(gpu.rotate_x_mq_128_v2(&rotated, &rotated, p.mi, total_slots))
 }
 
 /// A few-row forward (speculative verify) on grouped path 2 without the WMMA
@@ -1741,6 +1805,7 @@ fn down_stage(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    let use_path2 = grouped_path(gpu, p, use_path2);
     let down_ptrs = p
         .expert_stage_ptrs
         .map_or(p.expert_down_ptrs, |stage| stage.down);
@@ -1841,6 +1906,14 @@ fn down_stage(
         // reads, so a separate pass over all (padded) grouped rows would only
         // re-round values that are already BF16-exact.
     } else {
+        #[cfg(feature = "test-utils")]
+        super::bind_g1_window(
+            gpu,
+            p.routed_experts,
+            p.n_exp,
+            p.topk_weights,
+            p.recipe.bf16_round_trip(),
+        )?;
         hip(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
             down_ptrs,
             p.topk_indices,
@@ -1868,7 +1941,7 @@ pub(crate) fn combine_initial_zero_applies(
     use_path2: bool,
 ) -> bool {
     !is_fp8(p)
-        && use_path2
+        && grouped_path(gpu, p, use_path2)
         && !indexed_down(gpu, p, use_path2)
         && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2))
         && p.recipe.shared_after_combine()
@@ -1904,6 +1977,7 @@ fn combine_stage(
     initial_zero: bool,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
+    let use_path2 = grouped_path(gpu, p, use_path2);
     let target = p.routed_out.unwrap_or(p.x_batch);
     if initial_zero && !combine_initial_zero_applies(gpu, p, use_path2) {
         return Err(DispatchError::Hip(
@@ -1957,7 +2031,7 @@ fn combine_stage(
     // A shared down placed after the combine rounds `target` to BF16 as its
     // first read, so the round trip is owed only when nothing follows.
     if p.recipe.bf16_round_trip() && !p.recipe.shared_after_combine() {
-        hip(gpu.bf16_round_trip_f32(target))?;
+        hip(gpu.bf16_round_trip_f32(&f32_view(target, 0, p.batch_size * p.down_m)))?;
     }
     Ok(())
 }
@@ -2005,7 +2079,7 @@ fn slab_gate_up(
             p.up_batch,
             p.batch_size,
         )?;
-        if p.recipe.bf16_round_trip() {
+        if p.recipe.bf16_round_trip() && !super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
             hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
             hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
         }
@@ -2086,6 +2160,16 @@ fn slab_activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), Dispat
     let gate = f32_view(p.gate_batch, 0, active);
     let up = f32_view(p.up_batch, 0, active);
     let rot = f32_view(p.rot_batch, 0, active);
+    if p.recipe.bf16_round_trip() && super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
+        return hip(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
+            &gate,
+            &up,
+            &rot,
+            p.mi,
+            total_slots,
+            None,
+        ));
+    }
     hip(gpu.silu_mul_f32(&gate, &up, &rot))?;
     if p.recipe.bf16_round_trip() {
         hip(gpu.bf16_round_trip_f32(&rot))?;
@@ -3238,6 +3322,71 @@ mod scratch_tests {
     const N_EXP: usize = 512;
     const WORD: usize = 4;
 
+    #[test]
+    fn eager_exact_rows_override_a_frozen_grouped_stage_layout() {
+        for limit in [8, 9, 16, 32, 64] {
+            for rows in 1..=65 {
+                assert!(!grouped_path_for_rows(false, rows, limit));
+                assert_eq!(
+                    grouped_path_for_rows(true, rows, limit),
+                    !(rows > 8 && rows <= limit),
+                );
+            }
+        }
+        for limit in [1, 4, 8] {
+            for rows in 1..=64 {
+                assert!(grouped_path_for_rows(true, rows, limit));
+            }
+        }
+    }
+
+    #[test]
+    fn router_fusion_preserves_weight_descriptors_and_mixed_q8_copies() {
+        let bf16 = GpuTensor::null_for_test();
+        let q8 = GpuTensor::null_for_test();
+        let weight = |buf, dtype, m, k| WeightRef {
+            buf,
+            dtype,
+            m,
+            k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        };
+        let router = weight(&bf16, DType::BF16, N_EXP, HIDDEN);
+        let selector = weight(&bf16, DType::BF16, 1, HIDDEN);
+        let gate = weight(&bf16, DType::BF16, MI, HIDDEN);
+        let up = weight(&bf16, DType::BF16, MI, HIDDEN);
+        let gate_copy = weight(&q8, DType::Q8_0, MI, HIDDEN);
+        let up_copy = weight(&q8, DType::Q8_0, MI, HIDDEN);
+        let wrong_k = weight(&bf16, DType::BF16, MI, HIDDEN + 32);
+        for rows in 1..=64 {
+            assert!(!grouped_path_for_rows(false, rows, 64));
+            assert!(router_shared_bf16_basis(&router, [&selector, &gate, &up]));
+            assert!(!router_shared_bf16_basis(
+                &router,
+                [&selector, &gate_copy, &up_copy]
+            ));
+            assert!(!router_shared_bf16_basis(
+                &router,
+                [&selector, &gate, &wrong_k]
+            ));
+            // Route selection borrows, never recreates/requantizes, the immutable copy.
+            assert!(std::ptr::eq(gate_copy.buf, &q8));
+            assert_eq!(
+                (gate_copy.dtype, gate_copy.m, gate_copy.k),
+                (DType::Q8_0, MI, HIDDEN)
+            );
+            assert_eq!(
+                (up_copy.dtype, up_copy.m, up_copy.k),
+                (DType::Q8_0, MI, HIDDEN)
+            );
+        }
+    }
+
     fn dims(rows: usize) -> ScratchDims {
         let slots = rows * K_TOP;
         ScratchDims {
@@ -3425,18 +3574,21 @@ mod scratch_tests {
 
     #[test]
     fn indexed_down_and_path1_need_the_batch_buffers() {
-        let rows = 8;
-        let slots = rows * K_TOP;
-        let few = indexed().requirement(&dims(rows)).unwrap();
-        assert_eq!(few.down_expanded, slots * HIDDEN * 4);
-        assert_eq!(few.rot_batch, slots * MI * 4);
-        assert_eq!(few.y_down_grouped, 0);
-        let path1 = route(false).requirement(&dims(rows)).unwrap();
-        assert_eq!(path1.gate_batch, slots * MI * 4);
-        assert_eq!(path1.up_batch, slots * MI * 4);
-        assert_eq!(path1.rot_batch, slots * MI * 4);
-        assert_eq!(path1.down_expanded, slots * HIDDEN * 4);
-        assert_eq!((path1.y_gate_up_grouped, path1.y_down_grouped), (0, 0));
+        for rows in 1..=64 {
+            let slots = rows * K_TOP;
+            let few = indexed().requirement(&dims(rows)).unwrap();
+            assert_eq!(few.down_expanded, slots * HIDDEN * 4);
+            assert_eq!(few.rot_batch, slots * MI * 4);
+            assert_eq!(few.y_down_grouped, 0);
+            let path1 = route(grouped_path_for_rows(rows > 8, rows, 64))
+                .requirement(&dims(rows))
+                .unwrap();
+            assert_eq!(path1.gate_batch, slots * MI * 4);
+            assert_eq!(path1.up_batch, slots * MI * 4);
+            assert_eq!(path1.rot_batch, slots * MI * 4);
+            assert_eq!(path1.down_expanded, slots * HIDDEN * 4);
+            assert_eq!((path1.y_gate_up_grouped, path1.y_down_grouped), (0, 0));
+        }
     }
 
     #[test]

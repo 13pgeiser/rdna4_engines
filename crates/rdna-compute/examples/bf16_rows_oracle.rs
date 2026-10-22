@@ -2,61 +2,68 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Row-exactness oracle of the ordinary BF16 x4 rows kernels and the BF16 HC k4
-//! rows kernels for 1..=32 activation rows, including the S2 wide twins
-//! `gemv_bf16_xf32_x4_rows_wide_r{16,32}` and `gemv_bf16_xf32_k4_rows_wide_r{16,32}`
-//! (`kernels/src/qwen4_gemv_bf16_xf32.hip`).
+//! G1 BF16 fixed-eight-row PM tile oracle, logical R=1..64, exact gfx1151/1201.
 //!
-//! The reference is always the actual single-row decode object, one launch per
-//! activation row: `Gpu::gemv_bf16_xf32_x4` (router / selector / shared gate /
-//! shared up group) and `Gpu::gemv_bf16_xf32` (single projection) for x4,
-//! `Gpu::gemv_bf16_xf32_k4` for HC k4 (gates M=4 and read-down M=320, K=10240).
-//! Every output word is compared with `to_bits()` against `[GUARD sentinel]
-//! [expected][GUARD sentinel]`; outputs are pre-filled with a NaN payload no
-//! kernel produces so an unwritten word cannot pass.
+//! References remain the actual architecture's `gemv_bf16_xf32`, singleton
+//! `gemv_bf16_xf32_x4`, and singleton HC `gemv_bf16_xf32_k4` objects, never PM C1.
+//! The routed arm requires the BF16 selector and eager verify scope; R>8 must
+//! actually launch the new tile, not a loop or an obsolete r16/r32 object.
+//! Direct PM launches include R=1, use the frozen 96B/48B kernargs, and use
+//! grid [sum Mi,ceil(R/8),1], block32 (ordinary) or [M,ceil(R/8),1],
+//! block128 (HC). Every observed launch requires its loaded module/object SHA.
+//! Direct blobs use the recorder-aware launch funnel so each receipt observes
+//! the submitted tile, not the preceding singleton reference launch.
 //!
-//! Arms (each prints its own summary line):
-//!  * `routed`: the public launchers `gemv_bf16_xf32_x4_rows` /
-//!    `gemv_bf16_xf32_k4_rows` at rows 1..=32 with the `Bf16` wide-twin switch
-//!    on and the verify gate opened (`set_wide_verify_rows(32)`); the launched
-//!    symbol is asserted per row count (9..=16 -> `_wide_r16`, 17..=32 ->
-//!    `_wide_r32`; x4 with K % 8 != 0 keeps the exact <=8-row group loop on
-//!    gfx1201 and takes the admitted PM twin on gfx1151, and the four-column
-//!    HC gate may report the tiled fallback).
-//!  * `direct16` / `direct32`: the wide kernels launched by name for every
-//!    R in 1..=16 / 1..=32 (R below the capacity exercises the row masks),
-//!    including the K % 8 != 0 scalar domain of x4 that the launcher never
-//!    routes to the HIP wide kernel; eager with X contents A, then X contents B
-//!    rewritten at the same device address, then a HIP graph captured with the
-//!    B contents and replayed after the X buffer is rewritten to A.
-//!  * HC handoff: `hyper_write_norm` producing gate quarters into both
-//!    alternating slots of a guarded scratch (`quarters_out`), the exact
-//!    per-quarter dots against `Gpu::gemv_bf16_xf32` on the quarter slices,
-//!    the `(q0 + q1) + (q2 + q3)` fold against the wide k4 gate output, and the
-//!    consumer launch with `quarters_in` against the consumer fed the wide k4
-//!    result as plain gates.
+//! Production and ragged M/K shapes, scalar K%8 tails, raw/activated HC with
+//! realistic and extreme scales, stable-address A/B rewrites and graph replay
+//! are separate fatal byte gates. Inactive X rows and full-capacity Y tails
+//! are poisoned; inputs/weights are checked immutable. All live words and
+//! guards are compared, with first-mismatch diagnostics. HC quarters_out/in
+//! handoff retains both alternating guarded scratch slots and stale-slot,
+//! perturbed-input and swapped-weight negative controls.
 //!
-//! Data: random BF16 weights with +-0, BF16 subnormals, wide exponents and
-//! cancelling neighbours; activation rows of very different magnitude with
-//! +-0, F32 subnormals, alternating signs, duplicated pairs and all-zero rows.
-//! Negative controls (perturbed X, swapped weights, stale quarter slot) must
-//! disagree, so a vacuous pass is impossible.
+//! Synthetic cases are labelled synthetic, not captured model evidence.
+//! `--captured-hc MANIFEST.json` additionally gates real captured HC operands.
+//! Canonical `qwen4-rowtile-operands-v1` BF16 `hc_k4` manifests bind the
+//! pinned source index, model/prompt, four W bindings and 64 sequential AR
+//! recipes to the actual loaded singleton module/symbol/raw and container SHA.
+//! Only the captured mode qualifies: `scale:null,hc_act:false` means raw
+//! `None`; finite scale with `hc_act:true` means `Some(scale)`.
+//! Legacy manifests retain `arch`, `source`, `m`, `k`, optional/null finite
+//! `scale`, optional consistent `hc_act`, `weights`, `weights_sha256`, `x`,
+//! `x_sha256`; paths are manifest-relative BF16 [M,K] and F32 [64,K].
+//! Their extra raw exercise is labelled legacy-extra-HC, not captured mode.
+//! `--captured-ordinary MANIFEST.json` (repeatable) gates canonical
+//! `qwen4-rowtile-operands-v1` BF16 `single`/`x4` captures and their pinned
+//! `qwen4-rowtile-source-v1` index, model/prompt, four immutable W bindings
+//! and 64 eager AR recipes. The actual loaded single or x4 C1 object's
+//! module/symbol/raw object SHA must match the source; reference-mode policies
+//! are unchanged. Each capture runs routed/direct for every R=1..64 with
+//! the existing full-word, inactive/tail/guard and immutable-input checks.
+//! Without a manifest the final receipt explicitly withholds real-capture
+//! qualification; it never claims a full PLAN G1 certificate.
 //!
-//! `HIPFIRE_QWEN4_WIDE_TWIN_BF16=1 cargo run --release -p rdna-compute --features lab --example bf16_rows_oracle`
-//! Exact gfx1151 or gfx1201 only (exit 2 elsewhere); exits nonzero on mismatch.
+//! HIPFIRE_QWEN4_WIDE_TWIN_BF16=1 cargo run --release -p rdna-compute \
+//!   --features lab --example bf16_rows_oracle -- \
+//!   [--captured-ordinary MANIFEST.json] [--captured-hc MANIFEST.json]
+//! Refused architecture/device, absent identity, launch errors and mismatches
+//! exit nonzero. gfx1100 is refused until actual singleton/tile hooks exist.
 
 use hip_bridge::KernargBlob;
 use rdna_compute::gemv::WideTwinFamily;
-use rdna_compute::kernels::QWEN4_GEMV_BF16_XF32_SRC;
 use rdna_compute::tensor_ops::{hyper_write_norm, HyperNextGates, HyperWrite};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 const GUARD: usize = 64;
 /// A quiet NaN with a payload no arithmetic produces.
 const SENTINEL: u32 = 0x7fc0_beef;
-const MODULE: &str = "qwen4_gemv_bf16_xf32";
-const MAX_ROWS: usize = 32;
+const MAX_ROWS: usize = 64;
+/// Include a whole extra tile after the logical capacity to catch R=64 overruns.
+const OUTPUT_ROWS: usize = MAX_ROWS + 8;
 const HC_K: usize = 10240;
 const HC_PART: usize = 2560;
 
@@ -148,9 +155,18 @@ fn gen_x(rows: usize, k: usize, exp_lo: i32, exp_hi: i32, rng: &mut Rng) -> Vec<
     x
 }
 
+fn upload_raw_pooled(gpu: &mut Gpu, bytes: &[u8], context: &str) -> GpuTensor {
+    let t = gpu.alloc_tensor(&[bytes.len()], DType::Raw).expect(context);
+    if let Err(err) = gpu.hip.memcpy_htod(&t.buf, bytes) {
+        gpu.free_tensor(t).expect("free failed Raw upload");
+        panic!("{context}: {err:?}");
+    }
+    t
+}
+
 fn upload_bf16(gpu: &mut Gpu, bits: &[u16]) -> GpuTensor {
     let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
-    let mut t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload bf16");
+    let mut t = upload_raw_pooled(gpu, &bytes, "upload bf16");
     t.dtype = DType::BF16;
     t.shape = vec![bits.len()];
     t
@@ -206,7 +222,92 @@ fn guarded(expected: &[u32]) -> Vec<u32> {
 
 fn mismatches(got: &[u32], want: &[u32]) -> usize {
     assert_eq!(got.len(), want.len(), "guarded length");
+    if let Some((i, (g, w))) = got.iter().zip(want).enumerate().find(|(_, (g, w))| g != w) {
+        eprintln!("first mismatch word={i} got=0x{g:08x} expected=0x{w:08x}");
+    }
     got.iter().zip(want).filter(|(a, b)| a != b).count()
+}
+
+fn guarded_rows(expected: &[u32], rows: usize, m: usize) -> Bits {
+    assert_eq!(expected.len(), rows * m);
+    let mut full = vec![SENTINEL; OUTPUT_ROWS * m];
+    full[..expected.len()].copy_from_slice(expected);
+    guarded(&full)
+}
+
+fn check_k4(got: &[u32], reference: &[u32], rows: usize, m: usize) -> usize {
+    let expected = guarded_rows(&reference[..rows * m], rows, m);
+    if let Some(i) = got.iter().zip(&expected).position(|(g, e)| g != e) {
+        let live = i.checked_sub(GUARD).filter(|&j| j < rows * m);
+        eprintln!(
+            "matrix=0 R={rows} M={m} first_word={i} row_output={:?} output_bytes={}",
+            live.map(|j| (j / m, j % m)),
+            rows * m * 4
+        );
+    }
+    mismatches(got, &expected)
+}
+
+fn raw(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
+    gpu.hip.device_synchronize().expect("sync immutable input");
+    gpu.download_raw_bytes(t).expect("read immutable input")
+}
+
+/// Last-launch evidence comes from the actual dispatch, not a route predictor.
+fn receipt(gpu: &Gpu, expected: &str, mode: &str, rows: usize, shape: &str) {
+    assert_eq!(
+        gpu.last_launched_kernel(),
+        Some(expected),
+        "missing/wrong actual route: {mode} {shape} R={rows}"
+    );
+    let (module, container_sha, sha) = gpu
+        .lab_kernel_device_identity(expected)
+        .expect("actual loaded object identity");
+    assert!(
+        !module.is_empty()
+            && sha.len() == 64
+            && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            && container_sha.len() == 64
+            && container_sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid loaded object identity for {expected}"
+    );
+    println!("G1 arch={} device={} module={module} symbol={expected} object_sha256={sha} container_sha256={container_sha} R={rows} mode={mode:?} {shape}",
+        gpu.arch, gpu.device_id);
+}
+
+fn tile_symbol(gpu: &Gpu, hc: bool) -> String {
+    let family = if hc {
+        "gemv_bf16_xf32_k4_rows"
+    } else {
+        "gemv_bf16_xf32_rows_x4"
+    };
+    format!("{family}_t8_pm_{}", gpu.arch)
+}
+
+/// Rewrite only inactive rows; preserve live input bits including signed zero.
+fn poisoned_x(host: &[f32], k: usize, rows: usize) -> Vec<f32> {
+    let mut poisoned = host.to_vec();
+    poisoned[rows * k..MAX_ROWS * k].fill(f32::from_bits(SENTINEL));
+    poisoned
+}
+
+fn assert_input(gpu: &Gpu, x: &GpuTensor, expected: &[f32]) {
+    let want: Bits = expected.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(
+        mismatches(&fetch(gpu, x), &want),
+        0,
+        "input/tail bytes mutated"
+    );
+}
+
+fn assert_weights(gpu: &Gpu, weights: &[&GpuTensor], before: &[Vec<u8>]) {
+    for (i, (w, expected)) in weights.iter().zip(before).enumerate() {
+        let got = raw(gpu, w);
+        if let Some(j) = got.iter().zip(expected).position(|(g, e)| g != e) {
+            panic!("immutable weight matrix={i} byte={j} mutated");
+        }
+        assert_eq!(got.len(), expected.len(), "immutable weight extent");
+    }
 }
 
 type Bits = Vec<u32>;
@@ -251,19 +352,29 @@ struct Mat {
     w: GpuTensor,
 }
 
-fn make_mats(gpu: &mut Gpu, ms: &[usize; 4], k: usize, rng: &mut Rng) -> Vec<Mat> {
+fn make_mats(
+    gpu: &mut Gpu,
+    ms: &[usize; 4],
+    k: usize,
+    rng: &mut Rng,
+    captured: Option<&[Vec<u8>; 4]>,
+) -> Vec<Mat> {
     let mut mats = Vec::new();
-    for &m in ms {
-        let bits = if m == 0 {
-            vec![0u16; 8]
+    for (i, &m) in ms.iter().enumerate() {
+        let w = if m == 0 {
+            // Zero-M slots have pinned empty captures but still need valid
+            // never-read device pointers for the existing grouped ABI.
+            upload_bf16(gpu, &[0u16; 8])
+        } else if let Some(weights) = captured {
+            let bytes = &weights[i];
+            let mut w = upload_raw_pooled(gpu, bytes, "upload captured BF16 W");
+            w.dtype = DType::BF16;
+            w.shape = vec![bytes.len() / 2];
+            w
         } else {
-            gen_weights(m, k, 0.25, 40, rng)
+            upload_bf16(gpu, &gen_weights(m, k, 0.25, 40, rng))
         };
-        mats.push(Mat {
-            m,
-            k,
-            w: upload_bf16(gpu, &bits),
-        });
+        mats.push(Mat { m, k, w });
     }
     mats
 }
@@ -282,8 +393,17 @@ fn parts_of<'a>(
 
 /// `rows` singleton `gemv_bf16_xf32_x4` launches (the decode object of a
 /// router/shared group); per matrix `[rows * m]` bits.
-fn ref_x4(gpu: &mut Gpu, mats: &[Mat], x: &GpuTensor, rows: usize) -> Vec<Bits> {
+fn ref_x4(
+    gpu: &mut Gpu,
+    mats: &[Mat],
+    x: &GpuTensor,
+    rows: usize,
+    source: Option<&CapturedOrdinary>,
+) -> Vec<Bits> {
     let k = mats[0].k;
+    let x_before = raw(gpu, x);
+    let weights: Vec<&GpuTensor> = mats.iter().map(|m| &m.w).collect();
+    let w_before: Vec<Vec<u8>> = weights.iter().map(|w| raw(gpu, w)).collect();
     let outs: Vec<GpuTensor> = mats.iter().map(|m| alloc_out(gpu, rows * m.m)).collect();
     for r in 0..rows {
         let xv = x.sub_offset(r * k, k);
@@ -294,11 +414,33 @@ fn ref_x4(gpu: &mut Gpu, mats: &[Mat], x: &GpuTensor, rows: usize) -> Vec<Bits> 
             .collect();
         gpu.gemv_bf16_xf32_x4(parts_of(mats, &views), &xv, k)
             .expect("singleton gemv_bf16_xf32_x4");
+        receipt(
+            gpu,
+            "gemv_bf16_xf32_x4",
+            "actual-singleton-x4",
+            1,
+            &format!(
+                "reference_row={r} M={:?} K={k}",
+                mats.iter().map(|m| m.m).collect::<Vec<_>>()
+            ),
+        );
+        if let Some(source) = source {
+            source.assert_identity(gpu);
+        }
     }
     let mut got = Vec::new();
     for (y, m) in outs.iter().zip(mats) {
-        got.push(fetch(gpu, y)[GUARD..GUARD + rows * m.m].to_vec());
+        let all = fetch(gpu, y);
+        let live = all[GUARD..GUARD + rows * m.m].to_vec();
+        assert_eq!(
+            mismatches(&all, &guarded(&live)),
+            0,
+            "singleton x4 output guards"
+        );
+        got.push(live);
     }
+    assert_eq!(raw(gpu, x), x_before, "singleton x4 mutated X");
+    assert_weights(gpu, &weights, &w_before);
     for y in outs {
         gpu.free_tensor(y).expect("free ref");
     }
@@ -307,7 +449,15 @@ fn ref_x4(gpu: &mut Gpu, mats: &[Mat], x: &GpuTensor, rows: usize) -> Vec<Bits> 
 
 /// `rows` singleton `gemv_bf16_xf32` launches (the decode object of a single
 /// projection) of one matrix.
-fn ref_single(gpu: &mut Gpu, mat: &Mat, x: &GpuTensor, rows: usize) -> Bits {
+fn ref_single(
+    gpu: &mut Gpu,
+    mat: &Mat,
+    x: &GpuTensor,
+    rows: usize,
+    source: Option<&CapturedOrdinary>,
+) -> Bits {
+    let x_before = raw(gpu, x);
+    let w_before = raw(gpu, &mat.w);
     let y = alloc_out(gpu, rows * mat.m);
     for r in 0..rows {
         gpu.gemv_bf16_xf32(
@@ -318,8 +468,26 @@ fn ref_single(gpu: &mut Gpu, mat: &Mat, x: &GpuTensor, rows: usize) -> Bits {
             mat.k,
         )
         .expect("singleton gemv_bf16_xf32");
+        receipt(
+            gpu,
+            "gemv_bf16_xf32",
+            "actual-singleton-single",
+            1,
+            &format!("reference_row={r} M={} K={}", mat.m, mat.k),
+        );
+        if let Some(source) = source {
+            source.assert_identity(gpu);
+        }
     }
-    let bits = fetch(gpu, &y)[GUARD..GUARD + rows * mat.m].to_vec();
+    let all = fetch(gpu, &y);
+    let bits = all[GUARD..GUARD + rows * mat.m].to_vec();
+    assert_eq!(
+        mismatches(&all, &guarded(&bits)),
+        0,
+        "singleton single output guards"
+    );
+    assert_eq!(raw(gpu, x), x_before, "singleton single mutated X");
+    assert_weights(gpu, &[&mat.w], &[w_before]);
     gpu.free_tensor(y).expect("free ref");
     bits
 }
@@ -327,35 +495,31 @@ fn ref_single(gpu: &mut Gpu, mat: &Mat, x: &GpuTensor, rows: usize) -> Bits {
 #[derive(Clone, Copy)]
 enum Arm {
     Routed,
-    Direct(usize),
+    Direct,
 }
 
 impl Arm {
-    fn name(self) -> String {
+    fn name(self) -> &'static str {
         match self {
-            Arm::Routed => "routed".to_string(),
-            Arm::Direct(cap) => format!("direct{cap}"),
+            Arm::Routed => "routed",
+            Arm::Direct => "direct-t8",
         }
     }
     fn max_rows(self) -> usize {
-        match self {
-            Arm::Routed => MAX_ROWS,
-            Arm::Direct(cap) => cap,
-        }
+        MAX_ROWS
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn direct_x4(
     gpu: &mut Gpu,
-    cap: usize,
     parts: [(&GpuTensor, &GpuTensor, usize); 4],
     x: &GpuTensor,
     k: usize,
     rows: usize,
     keep: &mut Vec<KernargBlob>,
 ) -> Result<(), String> {
-    let func = format!("gemv_bf16_xf32_x4_rows_wide_r{cap}");
+    let func = tile_symbol(gpu, false);
     let mut b = KernargBlob::new();
     for p in &parts {
         b.push_ptr(p.0.buf.as_ptr());
@@ -370,11 +534,18 @@ fn direct_x4(
     b.push_i32(k as i32);
     b.push_i32(rows as i32);
     b.pad_to(16);
-    let blocks: usize = parts.iter().map(|p| p.2.div_ceil(8)).sum();
+    let blocks: usize = parts.iter().map(|p| p.2).sum();
     keep.push(b);
     let blob = keep.last_mut().expect("blob").as_mut_slice();
-    gpu.launch_kernel_blob(&func, [blocks as u32, 1, 1], [256, 1, 1], 0, blob)
-        .map_err(|e| format!("{e:?}"))
+    gpu.launch_blob_recorded(
+        &func,
+        [blocks as u32, rows.div_ceil(8) as u32, 1],
+        [32, 1, 1],
+        0,
+        blob,
+        Default::default(),
+    )
+    .map_err(|e| format!("{e:?}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -387,17 +558,36 @@ fn launch_x4(
     rows: usize,
     keep: &mut Vec<KernargBlob>,
 ) -> Result<(), String> {
+    let ms = parts.map(|p| p.2);
+    let expected = match arm {
+        Arm::Direct => tile_symbol(gpu, false),
+        Arm::Routed if rows > 8 => tile_symbol(gpu, false),
+        Arm::Routed if rows == 1 => "gemv_bf16_xf32_x4".into(),
+        Arm::Routed => format!("gemv_bf16_xf32_x4_rows_r{rows}"),
+    };
     match arm {
-        Arm::Routed => {
-            let launched = if rows == 1 {
-                gpu.gemv_bf16_xf32_x4(parts, x, k)
-            } else {
-                gpu.gemv_bf16_xf32_x4_rows(parts, x, k, rows)
-            };
-            launched.map_err(|e| format!("{e:?}"))
-        }
-        Arm::Direct(cap) => direct_x4(gpu, cap, parts, x, k, rows, keep),
+        Arm::Routed if rows == 1 => gpu
+            .gemv_bf16_xf32_x4(parts, x, k)
+            .map_err(|e| format!("{e:?}"))?,
+        Arm::Routed => gpu
+            .gemv_bf16_xf32_x4_rows(parts, x, k, rows)
+            .map_err(|e| format!("{e:?}"))?,
+        Arm::Direct => direct_x4(gpu, parts, x, k, rows, keep)?,
     }
+    receipt(
+        gpu,
+        &expected,
+        arm.name(),
+        rows,
+        &format!(
+            "M={ms:?} K={k} X_bytes={} Y_bytes={:?} tile_grid=[{}, {}, 1] tile_block=32",
+            rows * k * 4,
+            ms.map(|m| rows * m * 4),
+            ms.iter().sum::<usize>(),
+            rows.div_ceil(8)
+        ),
+    );
+    Ok(())
 }
 
 /// Capture `launch` into a HIP graph, optionally rewrite `swap` (a device
@@ -428,31 +618,23 @@ fn replay_graph(
     gpu.hip.graph_destroy(g).expect("destroy graph");
 }
 
-fn x4_symbol_ok(sym: &str, rows: usize, k: usize) -> bool {
-    let wide = if rows <= 16 {
-        "gemv_bf16_xf32_x4_rows_wide_r16"
-    } else {
-        "gemv_bf16_xf32_x4_rows_wide_r32"
-    };
-    // gfx1151 prefers the admitted PeaceMaker twin (`*_pm_gfx1151`, an
-    // exact-gfx1151 image, never loaded elsewhere) for K % 8 == 0 and the
-    // scalar domain alike (`gemv.rs` x4 rows route); bytes are checked either way.
-    let pm = sym == format!("{wide}_pm_gfx1151");
-    match rows {
-        1 => sym == "gemv_bf16_xf32_x4",
-        2..=8 => sym == format!("gemv_bf16_xf32_x4_rows_r{rows}"),
-        _ if k % 8 == 0 => sym == wide || pm,
-        // K % 8 != 0: the HIP wide kernel never serves the scalar domain; the
-        // incumbent exact group loop does, or the gfx1151 PM twin.
-        _ => pm || sym == "gemv_bf16_xf32_x4" || sym.starts_with("gemv_bf16_xf32_x4_rows_r"),
-    }
-}
-
 fn check_x4(got: &[Bits], want: &[Bits], mats: &[Mat], rows: usize) -> usize {
     got.iter()
         .zip(want)
         .zip(mats)
-        .map(|((g, w), m)| mismatches(g, &guarded(&w[..rows * m.m])))
+        .enumerate()
+        .map(|(matrix, ((g, w), m))| {
+            let expected = guarded_rows(&w[..rows * m.m], rows, m.m);
+            if let Some(i) = g.iter().zip(&expected).position(|(g, e)| g != e) {
+                let live = i.checked_sub(GUARD).filter(|&j| j < rows * m.m);
+                eprintln!(
+                    "matrix={matrix} R={rows} first_word={i} row_output={:?} output_bytes={}",
+                    live.map(|j| (j / m.m, j % m.m)),
+                    rows * m.m * 4
+                );
+            }
+            mismatches(g, &expected)
+        })
         .sum()
 }
 
@@ -469,18 +651,23 @@ fn run_x4(
     keep: &mut Vec<KernargBlob>,
 ) -> (Vec<Bits>, Option<String>) {
     let k = mats[0].k;
-    let outs: Vec<GpuTensor> = mats.iter().map(|m| alloc_out(gpu, rows * m.m)).collect();
+    let original: Vec<f32> = fetch(gpu, x).into_iter().map(f32::from_bits).collect();
+    let capture_x = poisoned_x(&original, k, rows);
+    let replay_x = graph.map(|host| poisoned_x(host, k, rows));
+    let weights: Vec<&GpuTensor> = mats.iter().map(|m| &m.w).collect();
+    let before: Vec<Vec<u8>> = weights.iter().map(|w| raw(gpu, w)).collect();
+    write_x(gpu, x, &capture_x);
+    let outs: Vec<GpuTensor> = mats
+        .iter()
+        .map(|m| alloc_out(gpu, OUTPUT_ROWS * m.m))
+        .collect();
     let views: Vec<GpuTensor> = mats
         .iter()
         .zip(&outs)
         .map(|(m, y)| out_view(y, rows * m.m))
         .collect();
-    let mut sym = None;
-    match graph {
-        None => {
-            launch_x4(gpu, arm, parts_of(mats, &views), x, k, rows, keep).expect("x4 launch");
-            sym = gpu.last_launched_kernel().map(str::to_owned);
-        }
+    match &replay_x {
+        None => launch_x4(gpu, arm, parts_of(mats, &views), x, k, rows, keep).expect("x4 launch"),
         Some(host) => {
             let parts = parts_of(mats, &views);
             replay_graph(gpu, &outs, Some((x, host)), |g| {
@@ -488,6 +675,30 @@ fn run_x4(
             });
         }
     }
+    let sym = Some(
+        gpu.last_launched_kernel()
+            .expect("missing actual x4 launch")
+            .to_owned(),
+    );
+    receipt(
+        gpu,
+        sym.as_deref().expect("x4 receipt"),
+        if graph.is_some() {
+            "graph-captured-and-replayed-stable-X"
+        } else {
+            "eager-stable-X"
+        },
+        rows,
+        &format!(
+            "M={:?} K={k} X_address=0x{:x} inactive_X_rows={} Y_capacity_rows={OUTPUT_ROWS}",
+            mats.iter().map(|m| m.m).collect::<Vec<_>>(),
+            x.buf.as_ptr() as u64,
+            MAX_ROWS - rows
+        ),
+    );
+    assert_input(gpu, x, replay_x.as_deref().unwrap_or(&capture_x));
+    assert_weights(gpu, &weights, &before);
+    write_x(gpu, x, graph.unwrap_or(&original));
     let got: Vec<Bits> = outs.iter().map(|y| fetch(gpu, y)).collect();
     for y in outs {
         gpu.free_tensor(y).expect("free out");
@@ -495,13 +706,15 @@ fn run_x4(
     (got, sym)
 }
 
-const X4_CASES: [(&str, [usize; 4], usize); 17] = [
+const X4_CASES: &[(&str, [usize; 4], usize)] = &[
     (
         "router|selector|shared_gate|shared_up K=2560",
         [512, 1, 512, 512],
         2560,
     ),
     ("single M=1 K=2560", [1, 0, 0, 0], 2560),
+    ("single M=2 K=2560", [2, 0, 0, 0], 2560),
+    ("single M=3 K=2560", [3, 0, 0, 0], 2560),
     ("single M=7 K=2560", [7, 0, 0, 0], 2560),
     ("single M=8 K=2560", [8, 0, 0, 0], 2560),
     ("single M=9 K=2560", [9, 0, 0, 0], 2560),
@@ -517,27 +730,30 @@ const X4_CASES: [(&str, [usize; 4], usize); 17] = [
     ("scalar domain K=100", [9, 8, 0, 17], 100),
     ("scalar domain K=333", [9, 8, 0, 17], 333),
     ("scalar domain K=2561", [9, 8, 0, 17], 2561),
+    ("scalar domain K=258", [3, 2, 7, 9], 258),
+    ("scalar domain K=259", [3, 2, 7, 9], 259),
+    ("scalar domain K=262", [3, 2, 7, 9], 262),
 ];
 
-fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
+fn run_x4_cases(gpu: &mut Gpu, report: &mut Report, seed: u64) {
     let mut keep: Vec<KernargBlob> = Vec::new();
     for (ci, &(name, ms, k)) in X4_CASES.iter().enumerate() {
-        let mut rng = Rng((ci as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407));
-        let mats = make_mats(gpu, &ms, k, &mut rng);
+        let mut rng = Rng((ci as u64 + 1 + seed * 4096).wrapping_mul(0xA24B_AED4_963E_E407));
+        let mats = make_mats(gpu, &ms, k, &mut rng, None);
         let xa = gen_x(MAX_ROWS, k, -8, 8, &mut rng);
         let xb = gen_x(MAX_ROWS, k, -6, 10, &mut rng);
         let x = gpu.upload_f32(&xa, &[xa.len()]).expect("upload x");
 
         // The decode objects of this group on both X contents; the grouped
         // singleton and the single-projection singleton must agree.
-        let ref_a = ref_x4(gpu, &mats, &x, MAX_ROWS);
+        let ref_a = ref_x4(gpu, &mats, &x, MAX_ROWS, None);
         let single_a: Vec<Bits> = mats
             .iter()
             .map(|m| {
                 if m.m == 0 {
                     Vec::new()
                 } else {
-                    ref_single(gpu, m, &x, MAX_ROWS)
+                    ref_single(gpu, m, &x, MAX_ROWS, None)
                 }
             })
             .collect();
@@ -552,7 +768,7 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
             }
         }
         write_x(gpu, &x, &xb);
-        let ref_b = ref_x4(gpu, &mats, &x, MAX_ROWS);
+        let ref_b = ref_x4(gpu, &mats, &x, MAX_ROWS, None);
         write_x(gpu, &x, &xa);
         if ref_a
             .iter()
@@ -565,9 +781,9 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
             ));
         }
 
-        let arms = [Arm::Routed, Arm::Direct(16), Arm::Direct(32)];
+        let arms = [Arm::Routed, Arm::Direct];
         for arm in arms {
-            let label = format!("x4 {} {name}", arm.name());
+            let label = format!("synthetic seed={seed} x4 {} {name}", arm.name());
             for rows in 1..=arm.max_rows() {
                 // Eager, X contents A.
                 let (got, sym) = run_x4(gpu, arm, &mats, &x, rows, None, &mut keep);
@@ -576,12 +792,7 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
                     &format!("rows={rows} eager A"),
                     check_x4(&got, &ref_a, &mats, rows),
                 );
-                if let (Arm::Routed, Some(sym)) = (arm, sym) {
-                    report.symbol(&sym);
-                    if !x4_symbol_ok(&sym, rows, k) {
-                        report.fail(&format!("{name}: rows={rows} launched {sym}"));
-                    }
-                }
+                report.symbol(sym.as_deref().expect("x4 actual launch evidence"));
                 // Eager, X contents rewritten at the same address.
                 write_x(gpu, &x, &xb);
                 let (got, _) = run_x4(gpu, arm, &mats, &x, rows, None, &mut keep);
@@ -591,7 +802,7 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
                     check_x4(&got, &ref_b, &mats, rows),
                 );
                 // Graph captured with B, X rewritten to A before the replay.
-                if let Arm::Direct(_) = arm {
+                if let Arm::Direct = arm {
                     let (got, _) = run_x4(gpu, arm, &mats, &x, rows, Some(&xa), &mut keep);
                     report.record(
                         &label,
@@ -608,7 +819,7 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
         // Negative controls on the router group only.
         if ci == 0 {
             let rows = 20;
-            let (got, _) = run_x4(gpu, Arm::Direct(32), &mats, &x, rows, None, &mut keep);
+            let (got, _) = run_x4(gpu, Arm::Direct, &mats, &x, rows, None, &mut keep);
             let mut xp = xa.clone();
             for r in 0..MAX_ROWS {
                 for j in (0..k).step_by(7) {
@@ -616,12 +827,12 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
                 }
             }
             let xt = gpu.upload_f32(&xp, &[xp.len()]).expect("upload x'");
-            let ref_p = ref_x4(gpu, &mats, &xt, rows);
+            let ref_p = ref_x4(gpu, &mats, &xt, rows, None);
             let bad: Vec<usize> = got
                 .iter()
                 .zip(&ref_p)
                 .zip(&mats)
-                .map(|((g, w), m)| mismatches(g, &guarded(&w[..rows * m.m])))
+                .map(|((g, w), m)| mismatches(g, &guarded_rows(&w[..rows * m.m], rows, m.m)))
                 .collect();
             println!(
                 "bf16_rows_oracle: negative control perturbed-x mismatch words per output {bad:?}"
@@ -629,7 +840,10 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
             if bad.iter().any(|&n| n == 0) {
                 report.fail("negative control: a perturbed-X reference agreed with the launch (vacuous oracle)");
             }
-            let swapped = mismatches(&got[2], &guarded(&ref_a[3][..rows * mats[3].m]));
+            let swapped = mismatches(
+                &got[2],
+                &guarded_rows(&ref_a[3][..rows * mats[3].m], rows, mats[3].m),
+            );
             println!("bf16_rows_oracle: negative control swapped shared gate/up mismatch words {swapped}");
             if swapped == 0 {
                 report.fail(
@@ -650,7 +864,7 @@ fn run_x4_cases(gpu: &mut Gpu, report: &mut Report) {
 // ────────────────────────────────── HC k4 ───────────────────────────────────
 
 /// `(m, k)` of the gates / read-down and boundary shapes (all K % 32 == 0).
-const K4_SHAPES: [(&str, usize, usize); 10] = [
+const K4_SHAPES: [(&str, usize, usize); 11] = [
     ("gates M=4 K=10240", 4, 10240),
     ("read-down M=320 K=10240", 320, 10240),
     ("M=1 K=10240", 1, 10240),
@@ -658,6 +872,7 @@ const K4_SHAPES: [(&str, usize, usize); 10] = [
     ("M=3 K=10240", 3, 10240),
     ("M=5 K=2048", 5, 2048),
     ("M=7 K=96 (partial lanes)", 7, 96),
+    ("M=8 K=32 (minimum partition)", 8, 32),
     ("M=9 K=1056 (one lane in tail tile)", 9, 1056),
     ("M=33 K=1280", 33, 1280),
     ("M=16 K=1024", 16, 1024),
@@ -666,7 +881,6 @@ const K4_SHAPES: [(&str, usize, usize); 10] = [
 #[allow(clippy::too_many_arguments)]
 fn direct_k4(
     gpu: &mut Gpu,
-    cap: usize,
     w: &GpuTensor,
     x: &GpuTensor,
     y: &GpuTensor,
@@ -676,7 +890,7 @@ fn direct_k4(
     rows: usize,
     keep: &mut Vec<KernargBlob>,
 ) -> Result<(), String> {
-    let func = format!("gemv_bf16_xf32_k4_rows_wide_r{cap}");
+    let func = tile_symbol(gpu, true);
     let mut b = KernargBlob::new();
     b.push_ptr(w.buf.as_ptr());
     b.push_ptr(x.buf.as_ptr());
@@ -689,8 +903,15 @@ fn direct_k4(
     b.pad_to(16);
     keep.push(b);
     let blob = keep.last_mut().expect("blob").as_mut_slice();
-    gpu.launch_kernel_blob(&func, [m.div_ceil(2) as u32, 1, 1], [256, 1, 1], 0, blob)
-        .map_err(|e| format!("{e:?}"))
+    gpu.launch_blob_recorded(
+        &func,
+        [m as u32, rows.div_ceil(8) as u32, 1],
+        [128, 1, 1],
+        0,
+        blob,
+        Default::default(),
+    )
+    .map_err(|e| format!("{e:?}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -706,33 +927,22 @@ fn launch_k4(
     rows: usize,
     keep: &mut Vec<KernargBlob>,
 ) -> Result<(), String> {
+    let expected = match arm {
+        Arm::Direct => tile_symbol(gpu, true),
+        Arm::Routed if rows > 8 => tile_symbol(gpu, true),
+        Arm::Routed if rows == 1 => "gemv_bf16_xf32_k4".into(),
+        Arm::Routed => format!("gemv_bf16_xf32_k4_rows_r{rows}"),
+    };
     match arm {
         Arm::Routed => gpu
             .gemv_bf16_xf32_k4_rows(w, x, y, m, k, act, rows)
-            .map_err(|e| format!("{e:?}")),
-        Arm::Direct(cap) => direct_k4(gpu, cap, w, x, y, m, k, act, rows, keep),
+            .map_err(|e| format!("{e:?}"))?,
+        Arm::Direct => direct_k4(gpu, w, x, y, m, k, act, rows, keep)?,
     }
-}
-
-fn k4_symbol_ok(sym: &str, rows: usize, m: usize) -> bool {
-    match rows {
-        1 => sym == "gemv_bf16_xf32_k4",
-        2..=8 => sym == format!("gemv_bf16_xf32_k4_rows_r{rows}"),
-        _ => {
-            let wide = if rows <= 16 {
-                "gemv_bf16_xf32_k4_rows_wide_r16"
-            } else {
-                "gemv_bf16_xf32_k4_rows_wide_r32"
-            };
-            // The four-column gate (two workgroups) may stay on exact row tiling;
-            // gfx1151 prefers the admitted PeaceMaker twin (`*_pm_gfx1151`).
-            sym == wide
-                || sym == format!("{wide}_pm_gfx1151")
-                || (m <= 4
-                    && (sym == "gemv_bf16_xf32_k4"
-                        || sym.starts_with("gemv_bf16_xf32_k4_rows_tiled_r")))
-        }
-    }
+    receipt(gpu, &expected, arm.name(), rows,
+        &format!("M={m} K={k} scale_bits={:?} X_bytes={} Y_bytes={} tile_grid=[{m}, {}, 1] tile_block=128",
+            act.map(f32::to_bits), rows * k * 4, rows * m * 4, rows.div_ceil(8)));
+    Ok(())
 }
 
 /// `rows` singleton `gemv_bf16_xf32_k4` launches; `[rows * m]` bits.
@@ -745,6 +955,22 @@ fn ref_k4(
     act: Option<f32>,
     rows: usize,
 ) -> Bits {
+    ref_k4_bound(gpu, w, x, m, k, act, rows, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ref_k4_bound(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+    act: Option<f32>,
+    rows: usize,
+    source: Option<&CapturedOrdinary>,
+) -> Bits {
+    let x_before = raw(gpu, x);
+    let w_before = raw(gpu, w);
     let y = alloc_out(gpu, rows * m);
     for r in 0..rows {
         gpu.gemv_bf16_xf32_k4(
@@ -756,8 +982,29 @@ fn ref_k4(
             act,
         )
         .expect("singleton gemv_bf16_xf32_k4");
+        receipt(
+            gpu,
+            "gemv_bf16_xf32_k4",
+            "actual-singleton-k4",
+            1,
+            &format!(
+                "reference_row={r} M={m} K={k} scale_bits={:?}",
+                act.map(f32::to_bits)
+            ),
+        );
+        if let Some(source) = source {
+            source.assert_identity(gpu);
+        }
     }
-    let bits = fetch(gpu, &y)[GUARD..GUARD + rows * m].to_vec();
+    let all = fetch(gpu, &y);
+    let bits = all[GUARD..GUARD + rows * m].to_vec();
+    assert_eq!(
+        mismatches(&all, &guarded(&bits)),
+        0,
+        "singleton k4 output guards"
+    );
+    assert_eq!(raw(gpu, x), x_before, "singleton k4 mutated X");
+    assert_weights(gpu, &[w], &[w_before]);
     gpu.free_tensor(y).expect("free ref");
     bits
 }
@@ -775,74 +1022,94 @@ fn run_k4(
     graph: Option<&[f32]>,
     keep: &mut Vec<KernargBlob>,
 ) -> (Bits, Option<String>) {
-    let out = alloc_out(gpu, rows * m);
+    let original: Vec<f32> = fetch(gpu, x).into_iter().map(f32::from_bits).collect();
+    let capture_x = poisoned_x(&original, k, rows);
+    let replay_x = graph.map(|host| poisoned_x(host, k, rows));
+    let before = raw(gpu, w);
+    write_x(gpu, x, &capture_x);
+    let out = alloc_out(gpu, OUTPUT_ROWS * m);
     let view = out_view(&out, rows * m);
-    let mut sym = None;
-    match graph {
-        None => {
-            launch_k4(gpu, arm, w, x, &view, m, k, act, rows, keep).expect("k4 launch");
-            sym = gpu.last_launched_kernel().map(str::to_owned);
-        }
+    match &replay_x {
+        None => launch_k4(gpu, arm, w, x, &view, m, k, act, rows, keep).expect("k4 launch"),
         Some(host) => {
             replay_graph(gpu, std::slice::from_ref(&out), Some((x, host)), |g| {
                 launch_k4(g, arm, w, x, &view, m, k, act, rows, keep)
             });
         }
     }
+    let sym = Some(
+        gpu.last_launched_kernel()
+            .expect("missing actual k4 launch")
+            .to_owned(),
+    );
+    receipt(gpu, sym.as_deref().expect("k4 receipt"),
+        if graph.is_some() { "graph-captured-and-replayed-stable-X" } else { "eager-stable-X" },
+        rows, &format!("M={m} K={k} scale_bits={:?} X_address=0x{:x} inactive_X_rows={} Y_capacity_rows={OUTPUT_ROWS}",
+            act.map(f32::to_bits), x.buf.as_ptr() as u64, MAX_ROWS - rows));
+    assert_input(gpu, x, replay_x.as_deref().unwrap_or(&capture_x));
+    assert_weights(gpu, &[w], &[before]);
+    write_x(gpu, x, graph.unwrap_or(&original));
     let bits = fetch(gpu, &out);
     gpu.free_tensor(out).expect("free out");
     (bits, sym)
 }
 
-fn run_k4_cases(gpu: &mut Gpu, report: &mut Report) {
+fn run_k4_cases(gpu: &mut Gpu, report: &mut Report, seed: u64) {
     let mut keep: Vec<KernargBlob> = Vec::new();
     for (ci, &(name, m, k)) in K4_SHAPES.iter().enumerate() {
-        let mut rng = Rng((ci as u64 + 101).wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let mut rng = Rng((ci as u64 + 101 + seed * 4096).wrapping_mul(0xD1B5_4A32_D192_ED03));
         // exp_span 5 keeps products in the HC activation's interesting range.
         let wbits = gen_weights(m, k, 0.05, 5, &mut rng);
         let w = upload_bf16(gpu, &wbits);
-        let xa = gen_x(MAX_ROWS, k, -6, 6, &mut rng);
-        let xb = gen_x(MAX_ROWS, k, -5, 7, &mut rng);
+        // The second seed stresses finite operands, not merely the scale.
+        let (lo, hi) = if seed == 0 { (-6, 6) } else { (-60, 60) };
+        let xa = gen_x(MAX_ROWS, k, lo, hi, &mut rng);
+        let xb = gen_x(MAX_ROWS, k, lo + 1, hi + 1, &mut rng);
         let x = gpu.upload_f32(&xa, &[xa.len()]).expect("upload x");
-        for act in [None, Some(0.25f32)] {
+        for act in [
+            None,
+            Some(0.25f32),
+            Some(0.0),
+            Some(-0.0),
+            Some(-0.25),
+            Some(f32::MIN_POSITIVE),
+            Some(f32::from_bits(1)),
+            Some(1.0e20),
+            Some(f32::MAX),
+        ] {
             let ref_a = ref_k4(gpu, &w, &x, m, k, act, MAX_ROWS);
             write_x(gpu, &x, &xb);
             let ref_b = ref_k4(gpu, &w, &x, m, k, act, MAX_ROWS);
             write_x(gpu, &x, &xa);
-            if ref_a == ref_b {
+            if act.is_none_or(|s| s == 0.25) && ref_a == ref_b {
                 report.fail(&format!(
                     "{name} act={act:?}: X contents A and B give identical references (vacuous)"
                 ));
             }
-            for arm in [Arm::Routed, Arm::Direct(16), Arm::Direct(32)] {
-                let label = format!("k4 {} {name} act={act:?}", arm.name());
+            for arm in [Arm::Routed, Arm::Direct] {
+                let label = format!("synthetic seed={seed} k4 {} {name} act={act:?}", arm.name());
                 for rows in 1..=arm.max_rows() {
                     let (got, sym) = run_k4(gpu, arm, &w, &x, m, k, act, rows, None, &mut keep);
                     report.record(
                         &label,
                         &format!("rows={rows} eager A"),
-                        mismatches(&got, &guarded(&ref_a[..rows * m])),
+                        check_k4(&got, &ref_a, rows, m),
                     );
-                    if let (Arm::Routed, Some(sym)) = (arm, sym) {
-                        report.symbol(&sym);
-                        if !k4_symbol_ok(&sym, rows, m) {
-                            report.fail(&format!("{name}: rows={rows} launched {sym}"));
-                        }
-                    }
+                    report.symbol(sym.as_deref().expect("k4 actual launch evidence"));
                     write_x(gpu, &x, &xb);
                     let (got, _) = run_k4(gpu, arm, &w, &x, m, k, act, rows, None, &mut keep);
                     report.record(
                         &label,
                         &format!("rows={rows} eager B"),
-                        mismatches(&got, &guarded(&ref_b[..rows * m])),
+                        check_k4(&got, &ref_b, rows, m),
                     );
-                    if let Arm::Direct(_) = arm {
+                    if let Arm::Direct = arm {
                         let (got, _) =
                             run_k4(gpu, arm, &w, &x, m, k, act, rows, Some(&xa), &mut keep);
                         report.record(
                             &label,
                             &format!("rows={rows} graph (B captured, A replayed)"),
-                            mismatches(&got, &guarded(&ref_a[..rows * m])),
+                            check_k4(&got, &ref_a, rows, m),
                         );
                     } else {
                         write_x(gpu, &x, &xa);
@@ -884,6 +1151,11 @@ fn hc_consume(
     q_in: Option<&GpuTensor>,
     rows: usize,
 ) -> (Bits, Bits) {
+    let mut inputs = vec![streams, mix, wn, gates];
+    if let Some(q) = q_in {
+        inputs.push(q);
+    }
+    let before: Vec<Vec<u8>> = inputs.iter().map(|t| raw(gpu, t)).collect();
     let o = alloc_out(gpu, rows * HC_K);
     let ov = out_view(&o, rows * HC_K);
     let n = alloc_out(gpu, rows * HC_K);
@@ -907,7 +1179,26 @@ fn hc_consume(
         None,
     )
     .expect("hyper_write_norm consumer");
+    let symbol = gpu
+        .last_launched_kernel()
+        .expect("HC consumer route")
+        .to_owned();
+    receipt(
+        gpu,
+        &symbol,
+        "hc-quarters-consumer",
+        rows,
+        "branches=4 hidden=2560",
+    );
+    assert_weights(gpu, &inputs, &before);
     let bits = (fetch(gpu, &o), fetch(gpu, &n));
+    for output in [&bits.0, &bits.1] {
+        assert_eq!(
+            mismatches(output, &guarded(&output[GUARD..GUARD + rows * HC_K])),
+            0,
+            "HC consumer output guards"
+        );
+    }
     gpu.free_tensor(o).expect("free o");
     gpu.free_tensor(n).expect("free n");
     bits
@@ -932,7 +1223,6 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
     }
     let mut keep: Vec<KernargBlob> = Vec::new();
     for rows in 1..=MAX_ROWS {
-        let cap = if rows <= 16 { 16 } else { 32 };
         for slot in 0..2usize {
             let label = format!("hc handoff slot {slot}");
             let streams = gpu
@@ -942,14 +1232,18 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
                 .upload_f32(&gen_x(rows, hidden, -1, 0, &mut rng), &[rows * hidden])
                 .expect("mix");
             let logits = gen_x(rows, 4, 0, 2, &mut rng);
-            // Scratch [GUARD][gates R*4][slot A 16R][slot B 16R][GUARD], sentinel except the gates.
-            let cap_words = rows * 4 + 2 * rows * 16;
+            let immutable = [&streams, &mix, &wn, &inject];
+            let before: Vec<Vec<u8>> = immutable.iter().map(|t| raw(gpu, t)).collect();
+            // Fixed-capacity scratch; inactive rows in either slot stay poisoned.
+            // [GUARD][gates MAX_ROWS*4][slot A 16*MAX_ROWS][slot B 16*MAX_ROWS][GUARD].
+            let cap_words = MAX_ROWS * 4 + 2 * MAX_ROWS * 16;
             let mut host = vec![f32::from_bits(SENTINEL); GUARD + cap_words + GUARD];
             host[GUARD..GUARD + rows * 4].copy_from_slice(&logits);
             let scratch = gpu.upload_f32(&host, &[host.len()]).expect("scratch");
             let gates = scratch.sub_offset(GUARD, rows * 4);
-            let q_slot = scratch.sub_offset(GUARD + rows * 4 + slot * 16 * rows, 16 * rows);
-            let q_other = scratch.sub_offset(GUARD + rows * 4 + (1 - slot) * 16 * rows, 16 * rows);
+            let q_slot = scratch.sub_offset(GUARD + MAX_ROWS * 4 + slot * 16 * MAX_ROWS, 16 * rows);
+            let q_other =
+                scratch.sub_offset(GUARD + MAX_ROWS * 4 + (1 - slot) * 16 * MAX_ROWS, 16 * rows);
 
             // Producer: write the streams and the quarters of the NEXT write's gate rows.
             let out1 = alloc_out(gpu, rows * HC_K);
@@ -980,8 +1274,29 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
                 None,
             )
             .expect("hyper_write_norm producer");
+            let producer = gpu
+                .last_launched_kernel()
+                .expect("HC producer route")
+                .to_owned();
+            receipt(
+                gpu,
+                &producer,
+                "hc-quarters-producer",
+                rows,
+                "branches=4 hidden=2560",
+            );
+            assert_weights(gpu, &immutable, &before);
+            for output in [&out1, &norm1] {
+                let bits = fetch(gpu, output);
+                assert_eq!(
+                    mismatches(&bits, &guarded(&bits[GUARD..GUARD + rows * HC_K])),
+                    0,
+                    "HC producer output guards"
+                );
+            }
+            let normalized_before = raw(gpu, &norm1v);
             let scratch_bits = fetch(gpu, &scratch);
-            let q_start = GUARD + rows * 4 + slot * 16 * rows;
+            let q_start = GUARD + MAX_ROWS * 4 + slot * 16 * MAX_ROWS;
             let q_dev: Vec<u32> = scratch_bits[q_start..q_start + 16 * rows].to_vec();
             // Canaries: guards, the other slot and the live gates are untouched; the slot is fully written.
             let mut canary_bad = 0usize;
@@ -1012,12 +1327,29 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
                         HC_PART,
                     )
                     .expect("quarter gemv");
+                    receipt(
+                        gpu,
+                        "gemv_bf16_xf32",
+                        "actual-singleton-quarter",
+                        1,
+                        &format!("reference_row={r} quarter={b} M=4 K={HC_PART}"),
+                    );
                 }
                 let yq_bits = fetch(gpu, &yq);
+                assert_eq!(
+                    mismatches(&yq_bits, &guarded(&yq_bits[GUARD..GUARD + rows * 4])),
+                    0,
+                    "quarter singleton guards"
+                );
                 for r in 0..rows {
                     for g in 0..4 {
-                        quarter_bad +=
-                            usize::from(q_dev[r * 16 + g * 4 + b] != yq_bits[GUARD + r * 4 + g]);
+                        if q_dev[r * 16 + g * 4 + b] != yq_bits[GUARD + r * 4 + g] {
+                            if quarter_bad == 0 {
+                                eprintln!("HC quarters first mismatch R={rows} row={r} gate={g} quarter={b} got={:08x} expected={:08x}",
+                                    q_dev[r * 16 + g * 4 + b], yq_bits[GUARD + r * 4 + g]);
+                            }
+                            quarter_bad += 1;
+                        }
                     }
                 }
                 gpu.free_tensor(yq).expect("free yq");
@@ -1039,10 +1371,22 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
             let single = ref_k4(gpu, &inject, &norm1v, 4, HC_K, None, rows);
             let wide_out = alloc_out(gpu, rows * 4);
             let wide_view = out_view(&wide_out, rows * 4);
-            direct_k4(
-                gpu, cap, &inject, &norm1v, &wide_view, 4, HC_K, None, rows, &mut keep,
+            let norm_before = raw(gpu, &norm1v);
+            let inject_before = raw(gpu, &inject);
+            launch_k4(
+                gpu,
+                Arm::Direct,
+                &inject,
+                &norm1v,
+                &wide_view,
+                4,
+                HC_K,
+                None,
+                rows,
+                &mut keep,
             )
-            .expect("wide k4 gates");
+            .expect("tile k4 gates");
+            assert_weights(gpu, &[&norm1v, &inject], &[norm_before, inject_before]);
             let wide_bits = fetch(gpu, &wide_out);
             report.record(
                 &label,
@@ -1094,6 +1438,17 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
                     report.fail("negative control: stale quarters slot agreed with the correct handoff (vacuous)");
                 }
             }
+            assert_weights(gpu, &immutable, &before);
+            assert_eq!(
+                raw(gpu, &norm1v),
+                normalized_before,
+                "quarter/k4 reference mutated normalized input"
+            );
+            assert_eq!(
+                fetch(gpu, &scratch),
+                scratch_bits,
+                "HC consumer mutated scratch quarters/gates/guards"
+            );
 
             for t in [
                 streams, mix, scratch, out1, norm1, wide_out, poison, gates_wide,
@@ -1111,7 +1466,625 @@ fn run_hc_handoff(gpu: &mut Gpu, report: &mut Report) {
     }
 }
 
+/// External model captures are an additional claim, never generated substitutes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedHc {
+    arch: String,
+    source: String,
+    m: usize,
+    k: usize,
+    scale: Option<f32>,
+    #[serde(default)]
+    hc_act: Option<bool>,
+    weights: PathBuf,
+    weights_sha256: String,
+    x: PathBuf,
+    x_sha256: String,
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn captured_bytes(base: &Path, path: &Path, expected: &str, bytes: usize) -> Vec<u8> {
+    assert!(
+        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "capture file must have a SHA256"
+    );
+    let full = base.join(path);
+    let data = std::fs::read(&full).unwrap_or_else(|e| panic!("capture {}: {e}", full.display()));
+    assert_eq!(data.len(), bytes, "capture extent {}", full.display());
+    assert_eq!(
+        sha256(&data),
+        expected.to_ascii_lowercase(),
+        "capture hash {}",
+        full.display()
+    );
+    data
+}
+
+struct CapturedOrdinary {
+    name: String,
+    form: String,
+    ms: [usize; 4],
+    k: usize,
+    scale: Option<f32>,
+    weights: [Vec<u8>; 4],
+    x: Vec<f32>,
+    symbol: String,
+    module: String,
+    object_sha: String,
+    container_sha: Option<String>,
+}
+
+impl CapturedOrdinary {
+    fn assert_identity(&self, gpu: &Gpu) {
+        assert_eq!(
+            gpu.last_launched_kernel(),
+            Some(self.symbol.as_str()),
+            "captured source must use its actual single/x4 C1 reference"
+        );
+        let (module, container_sha, sha) = gpu
+            .lab_kernel_device_identity(&self.symbol)
+            .expect("loaded captured C1 identity");
+        assert_eq!(module, self.module, "captured C1 module mismatch");
+        assert_eq!(sha, self.object_sha, "captured C1 raw object SHA mismatch");
+        if let Some(expected) = &self.container_sha {
+            assert_eq!(
+                &container_sha, expected,
+                "captured C1 container SHA mismatch"
+            );
+        }
+    }
+}
+
+fn capture_sha(value: &serde_json::Value) -> &str {
+    let pin = value.as_str().expect("capture needs SHA256 string");
+    assert!(
+        pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid capture SHA256"
+    );
+    pin
+}
+
+fn capture_relative(base: &Path, value: &serde_json::Value) -> PathBuf {
+    let path = Path::new(value.as_str().expect("capture needs relative path"));
+    assert!(
+        !path.as_os_str().is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "capture operand/provenance path must stay inside its fixture"
+    );
+    base.join(path)
+}
+
+/// Same streamed model/prompt pin policy as the canonical operands consumer.
+fn capture_artifact(
+    base: &Path,
+    value: &serde_json::Value,
+    verified: &mut BTreeMap<PathBuf, String>,
+) {
+    use std::io::Read as _;
+    let raw = value["path"].as_str().expect("model/prompt path required");
+    assert!(!raw.is_empty(), "model/prompt path required");
+    let path = base.join(raw);
+    let pin = capture_sha(&value["sha256"]).to_ascii_lowercase();
+    if let Some(previous) = verified.get(&path) {
+        assert_eq!(previous, &pin, "conflicting model/prompt pins");
+        return;
+    }
+    let mut file = std::fs::File::open(&path)
+        .unwrap_or_else(|e| panic!("capture artifact {}: {e}", path.display()));
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer).expect("read capture artifact");
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    assert_eq!(
+        format!("{:x}", hash.finalize()),
+        pin,
+        "capture artifact SHA"
+    );
+    verified.insert(path, pin);
+}
+
+fn ordinary_extent(a: usize, b: usize, width: usize) -> usize {
+    a.checked_mul(b)
+        .and_then(|n| n.checked_mul(width))
+        .filter(|&n| n <= i32::MAX as usize)
+        .expect("captured ordinary extent exceeds device offset domain")
+}
+
+fn load_captured_ordinary(
+    gpu: &Gpu,
+    path: &Path,
+    verified: &mut BTreeMap<PathBuf, String>,
+) -> CapturedOrdinary {
+    let manifest_bytes = std::fs::read(path).expect("read ordinary capture manifest");
+    let c: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("parse ordinary capture manifest");
+    assert_eq!(c["schema"], "qwen4-rowtile-operands-v1");
+    assert_eq!(
+        c["arch"].as_str(),
+        Some(gpu.arch.as_str()),
+        "capture architecture"
+    );
+    assert_eq!(c["rows"].as_u64(), Some(MAX_ROWS as u64));
+    assert_eq!(c["family"], "bf16", "ordinary capture requires BF16");
+    let name = c["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .expect("capture name");
+    let form = c["form"].as_str().expect("capture form");
+    assert!(
+        matches!(form, "single" | "x4" | "hc_k4"),
+        "only single/x4/HC captures"
+    );
+    let scale = if form == "hc_k4" {
+        let active = c["hc_act"].as_bool().expect("HC activation flag");
+        assert!(c.get("scale").is_some(), "HC scale required");
+        if active {
+            let value = c["scale"].as_f64().expect("activated HC scale");
+            let scale = value as f32;
+            assert!(value.is_finite() && scale.is_finite(), "finite HC scale");
+            Some(scale)
+        } else {
+            assert!(c["scale"].is_null(), "raw HC scale must be null");
+            None
+        }
+    } else {
+        assert_eq!(
+            c["hc_act"], false,
+            "ordinary capture cannot be activated HC"
+        );
+        assert!(
+            c.get("scale").is_some() && c["scale"].is_null(),
+            "ordinary scale must be null"
+        );
+        None
+    };
+    let k = c["k"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0 && n <= i32::MAX as usize)
+        .expect("capture K");
+    let heights = c["ms"]
+        .as_array()
+        .filter(|a| a.len() == 4)
+        .expect("four capture heights");
+    let mut ms = [0usize; 4];
+    for (m, value) in ms.iter_mut().zip(heights) {
+        *m = value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n <= i32::MAX as usize)
+            .expect("capture M");
+        ordinary_extent(OUTPUT_ROWS, *m, 4);
+    }
+    let total_m = ms
+        .iter()
+        .try_fold(0usize, |n, &m| n.checked_add(m))
+        .expect("capture grid extent");
+    assert!(
+        total_m > 0 && total_m <= i32::MAX as usize,
+        "capture grid domain"
+    );
+    if matches!(form, "single" | "hc_k4") {
+        assert!(
+            ms[0] > 0 && ms[1..] == [0, 0, 0],
+            "single source requires only slot0"
+        );
+    }
+    if form == "hc_k4" {
+        assert_eq!(k % 32, 0, "HC K alignment");
+    }
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let source_path = capture_relative(base, &c["provenance"]["source"]);
+    let source_bytes = std::fs::read(&source_path).expect("read ordinary source index");
+    let source_sha = capture_sha(&c["provenance"]["source_sha256"]);
+    assert_eq!(
+        sha256(&source_bytes),
+        source_sha.to_ascii_lowercase(),
+        "source index SHA"
+    );
+    let source: serde_json::Value =
+        serde_json::from_slice(&source_bytes).expect("parse source index");
+    assert_eq!(source["schema"], "qwen4-rowtile-source-v1");
+    assert_eq!(source["capture_mode"], "eager-liveprojection-operands-only");
+    assert_eq!(source["retained_identity_claim"], false);
+    for key in [
+        "name", "family", "form", "ms", "k", "rows", "weights", "x", "hc_act", "scale",
+    ] {
+        assert!(c.get(key).is_some(), "missing manifest binding {key}");
+        assert_eq!(source.get(key), c.get(key), "capture/source binding {key}");
+    }
+    assert_eq!(source["component_offset"], 0, "ordinary component offset");
+    assert!(
+        source.get("mixed").is_some() && source["mixed"].is_null(),
+        "not a mixed caller"
+    );
+    let singleton = &source["singleton"];
+    let symbol = singleton["symbol"]
+        .as_str()
+        .expect("source singleton symbol");
+    assert_eq!(
+        symbol,
+        if form == "hc_k4" {
+            "gemv_bf16_xf32_k4"
+        } else if form == "single" {
+            "gemv_bf16_xf32"
+        } else {
+            "gemv_bf16_xf32_x4"
+        },
+        "source form requires its actual single/x4 C1, not a labelled substitute"
+    );
+    let module = singleton["module"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .expect("source module");
+    let object_sha = capture_sha(&singleton["object_sha256"]).to_ascii_lowercase();
+    let container_sha = singleton
+        .get("container_sha256")
+        .map(|value| capture_sha(value).to_ascii_lowercase());
+    if form == "hc_k4" {
+        assert!(
+            container_sha.is_some(),
+            "canonical HC requires container SHA"
+        );
+    }
+    let recipes = source["captures"]
+        .as_array()
+        .filter(|a| a.len() == MAX_ROWS)
+        .expect("source needs 64 real AR recipes");
+    let start = recipes[0]["position"].as_u64().expect("source position");
+    let occurrence = recipes[0]["occurrence"]
+        .as_u64()
+        .expect("source occurrence");
+    let grid = serde_json::json!([total_m, 1, 1]);
+    let block = serde_json::json!([if form == "hc_k4" { 128 } else { 32 }, 1, 1]);
+    for (row, recipe) in recipes.iter().enumerate() {
+        assert_eq!(recipe["row"].as_u64(), Some(row as u64), "source row");
+        let position = start
+            .checked_add(row as u64)
+            .expect("source position overflow");
+        assert_eq!(
+            recipe["position"].as_u64(),
+            Some(position),
+            "source sequential position"
+        );
+        assert_eq!(
+            recipe["occurrence"].as_u64(),
+            Some(occurrence),
+            "source stable occurrence"
+        );
+        assert!(
+            recipe["token"]
+                .as_u64()
+                .is_some_and(|n| n <= u32::MAX as u64),
+            "source token"
+        );
+        assert_eq!(recipe["grid"], grid, "source actual singleton grid");
+        assert_eq!(recipe["block"], block, "source actual singleton block");
+        assert_eq!(
+            recipe["shared_mem"].as_u64(),
+            Some(0),
+            "source singleton LDS"
+        );
+    }
+    let source_base = source_path.parent().unwrap_or(base);
+    capture_artifact(source_base, &source["model"], verified);
+    capture_artifact(source_base, &source["prompt"], verified);
+    let descriptors = c["weights"]
+        .as_array()
+        .filter(|a| a.len() == 4)
+        .expect("four pinned W files");
+    let bindings = source["weight_bindings"]
+        .as_array()
+        .filter(|a| a.len() == 4)
+        .expect("four immutable W bindings");
+    let mut weights: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::new());
+    for i in 0..4 {
+        let bytes = ordinary_extent(ms[i], k, 2);
+        assert_eq!(
+            bindings[i]["bytes"].as_u64(),
+            Some(bytes as u64),
+            "W binding extent"
+        );
+        assert!(
+            ["bytes", "byte_offset", "name", "layer"]
+                .iter()
+                .all(|key| bindings[i].get(*key).is_some())
+                && bindings[i]["byte_offset"].as_u64().is_some()
+                && (bindings[i]["name"].is_null() || bindings[i]["name"].is_string())
+                && (bindings[i]["layer"].is_null() || bindings[i]["layer"].is_i64()),
+            "immutable W binding metadata"
+        );
+        let w_path = capture_relative(base, &descriptors[i]["path"]);
+        weights[i] = captured_bytes(
+            Path::new(""),
+            &w_path,
+            capture_sha(&descriptors[i]["sha256"]),
+            bytes,
+        );
+        assert!(
+            weights[i].chunks_exact(2).all(|b| {
+                f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16).is_finite()
+            }),
+            "capture requires finite BF16 W"
+        );
+    }
+    let x_path = capture_relative(base, &c["x"]["path"]);
+    let xb = captured_bytes(
+        Path::new(""),
+        &x_path,
+        capture_sha(&c["x"]["sha256"]),
+        ordinary_extent(MAX_ROWS, k, 4),
+    );
+    let x: Vec<f32> = xb
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert!(
+        x.iter().all(|v| v.is_finite()),
+        "capture requires finite F32 X"
+    );
+    println!("G1 capture_manifest={} manifest_sha256={} source_sha256={source_sha} model_sha256={} prompt_sha256={} W_sha256={:?} X_sha256={} form={form} source_singleton={module}/{symbol} object_sha256={object_sha} container_sha256={container_sha:?} retained_identity_claim=false",
+        path.display(), sha256(&manifest_bytes), source["model"]["sha256"], source["prompt"]["sha256"],
+        descriptors.iter().map(|w| &w["sha256"]).collect::<Vec<_>>(), c["x"]["sha256"]);
+    CapturedOrdinary {
+        name: name.to_string(),
+        form: form.to_string(),
+        ms,
+        k,
+        scale,
+        weights,
+        x,
+        symbol: symbol.to_string(),
+        module: module.to_string(),
+        object_sha,
+        container_sha,
+    }
+}
+
+fn run_captured_ordinary(gpu: &mut Gpu, report: &mut Report, c: &CapturedOrdinary) {
+    assert!(
+        matches!(c.form.as_str(), "single" | "x4"),
+        "--captured-ordinary requires ordinary single/x4 form"
+    );
+    let mut unused_rng = Rng(1);
+    let mats = make_mats(gpu, &c.ms, c.k, &mut unused_rng, Some(&c.weights));
+    let x = gpu
+        .upload_f32(&c.x, &[c.x.len()])
+        .expect("upload captured ordinary X");
+    // Preserve the source form, including x4 with only one nonzero slot.
+    let reference = if c.form == "single" {
+        vec![
+            ref_single(gpu, &mats[0], &x, MAX_ROWS, Some(c)),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]
+    } else {
+        ref_x4(gpu, &mats, &x, MAX_ROWS, Some(c))
+    };
+    let mut keep = Vec::new();
+    for arm in [Arm::Routed, Arm::Direct] {
+        let label = format!(
+            "captured-ordinary {} {} source={:?}",
+            c.form,
+            arm.name(),
+            c.name
+        );
+        for rows in 1..=MAX_ROWS {
+            let (got, sym) = run_x4(gpu, arm, &mats, &x, rows, None, &mut keep);
+            report.symbol(sym.as_deref().expect("captured ordinary actual route"));
+            report.record(
+                &label,
+                &format!("rows={rows} eager"),
+                check_x4(&got, &reference, &mats, rows),
+            );
+            if let Arm::Direct = arm {
+                let (got, _) = run_x4(gpu, arm, &mats, &x, rows, Some(&c.x), &mut keep);
+                report.record(
+                    &label,
+                    &format!("rows={rows} graph"),
+                    check_x4(&got, &reference, &mats, rows),
+                );
+            }
+            keep.clear();
+        }
+    }
+    assert_input(gpu, &x, &c.x);
+    for (i, mat) in mats.into_iter().enumerate() {
+        if mat.m != 0 {
+            assert_eq!(
+                raw(gpu, &mat.w),
+                c.weights[i],
+                "captured ordinary immutable W"
+            );
+        }
+        gpu.free_tensor(mat.w).expect("free captured ordinary W");
+    }
+    gpu.free_tensor(x).expect("free captured ordinary X");
+}
+
+fn capture_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut hc = Vec::new();
+    let mut ordinary = Vec::new();
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        let paths = if arg == "--captured-hc" {
+            &mut hc
+        } else if arg == "--captured-ordinary" {
+            &mut ordinary
+        } else {
+            panic!("unknown argument {arg:?}; expected --captured-hc or --captured-ordinary MANIFEST.json");
+        };
+        paths.push(PathBuf::from(
+            args.next().expect("capture flag needs a manifest path"),
+        ));
+    }
+    (hc, ordinary)
+}
+
+fn run_captured_hc(gpu: &mut Gpu, report: &mut Report, path: &Path) {
+    let manifest = std::fs::read(path).expect("read captured HC manifest");
+    let value: serde_json::Value =
+        serde_json::from_slice(&manifest).expect("parse captured HC manifest");
+    let mut canonical = if value.get("schema").is_some() {
+        let loaded = load_captured_ordinary(gpu, path, &mut BTreeMap::new());
+        assert_eq!(loaded.form, "hc_k4", "--captured-hc requires HC form");
+        Some(loaded)
+    } else {
+        None
+    };
+    let c: CapturedHc = if let Some(source) = &canonical {
+        CapturedHc {
+            arch: gpu.arch.clone(),
+            source: source.name.clone(),
+            m: source.ms[0],
+            k: source.k,
+            scale: source.scale,
+            hc_act: Some(source.scale.is_some()),
+            weights: PathBuf::new(),
+            weights_sha256: capture_sha(&value["weights"][0]["sha256"]).to_string(),
+            x: PathBuf::new(),
+            x_sha256: capture_sha(&value["x"]["sha256"]).to_string(),
+        }
+    } else {
+        serde_json::from_value(value).expect("parse legacy captured HC manifest")
+    };
+    if let Some(active) = c.hc_act {
+        assert_eq!(active, c.scale.is_some(), "HC activation/scale mismatch");
+    }
+    assert_eq!(c.arch, gpu.arch, "capture must match actual architecture");
+    assert!(!c.source.trim().is_empty(), "capture provenance required");
+    assert!(
+        c.m > 0 && c.k > 0 && c.k % 32 == 0 && c.scale.is_none_or(f32::is_finite),
+        "invalid captured HC domain"
+    );
+    // Device byte offsets remain 32-bit; do not silently truncate extents.
+    let w_bytes =
+        c.m.checked_mul(c.k)
+            .and_then(|n| n.checked_mul(2))
+            .expect("capture W extent");
+    let x_bytes = MAX_ROWS
+        .checked_mul(c.k)
+        .and_then(|n| n.checked_mul(4))
+        .expect("capture X extent");
+    let y_bytes = OUTPUT_ROWS
+        .checked_mul(c.m)
+        .and_then(|n| n.checked_mul(4))
+        .expect("capture Y extent");
+    assert!(
+        c.m <= i32::MAX as usize
+            && c.k <= i32::MAX as usize
+            && [w_bytes, x_bytes, y_bytes]
+                .iter()
+                .all(|&n| n <= i32::MAX as usize),
+        "captured HC extent exceeds device offset domain"
+    );
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let (wb, x_host) = if let Some(source) = &mut canonical {
+        (
+            std::mem::take(&mut source.weights[0]),
+            std::mem::take(&mut source.x),
+        )
+    } else {
+        let wb = captured_bytes(base, &c.weights, &c.weights_sha256, w_bytes);
+        let xb = captured_bytes(base, &c.x, &c.x_sha256, x_bytes);
+        let x = xb
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect::<Vec<_>>();
+        (wb, x)
+    };
+    let weights: Vec<u16> = wb
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    assert!(
+        weights
+            .iter()
+            .all(|&w| f32::from_bits((w as u32) << 16).is_finite())
+            && x_host.iter().all(|x| x.is_finite()),
+        "capture claim requires finite model operands"
+    );
+    println!("G1 capture_manifest={} manifest_sha256={} source={:?} W_sha256={} X_sha256={} M={} K={} scale_bits={:?} hc_act={} capture_format={}",
+        path.display(), sha256(&manifest), c.source, c.weights_sha256, c.x_sha256,
+        c.m, c.k, c.scale.map(f32::to_bits), c.scale.is_some(),
+        if canonical.is_some() { "qwen4-rowtile-operands-v1" } else { "legacy-hc" });
+    let w = upload_bf16(gpu, &weights);
+    let x = gpu
+        .upload_f32(&x_host, &[x_host.len()])
+        .expect("upload captured X");
+    let mut keep = Vec::new();
+    // Canonical qualification is exactly the captured mode; legacy fixtures retain
+    // their historical extra raw-mode exercise, labelled separately.
+    let modes = if canonical.is_none() && c.scale.is_some() {
+        vec![c.scale, None]
+    } else {
+        vec![c.scale]
+    };
+    for act in modes {
+        let reference = ref_k4_bound(gpu, &w, &x, c.m, c.k, act, MAX_ROWS, canonical.as_ref());
+        for arm in [Arm::Routed, Arm::Direct] {
+            let label = format!(
+                "{} {} source={:?} act={act:?}",
+                if act == c.scale {
+                    "captured-HC"
+                } else {
+                    "legacy-extra-HC"
+                },
+                arm.name(),
+                c.source
+            );
+            for rows in 1..=MAX_ROWS {
+                let (got, sym) = run_k4(gpu, arm, &w, &x, c.m, c.k, act, rows, None, &mut keep);
+                report.symbol(sym.as_deref().expect("captured HC actual route"));
+                report.record(
+                    &label,
+                    &format!("rows={rows} eager"),
+                    check_k4(&got, &reference, rows, c.m),
+                );
+                if let Arm::Direct = arm {
+                    let (got, _) = run_k4(
+                        gpu,
+                        arm,
+                        &w,
+                        &x,
+                        c.m,
+                        c.k,
+                        act,
+                        rows,
+                        Some(&x_host),
+                        &mut keep,
+                    );
+                    report.record(
+                        &label,
+                        &format!("rows={rows} graph"),
+                        check_k4(&got, &reference, rows, c.m),
+                    );
+                }
+                keep.clear();
+            }
+        }
+    }
+    assert_eq!(raw(gpu, &w), wb, "capture W immutable");
+    assert_input(gpu, &x, &x_host);
+    gpu.free_tensor(w).expect("free captured W");
+    gpu.free_tensor(x).expect("free captured X");
+}
+
 fn main() {
+    let (captures, ordinary_paths) = capture_paths();
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
     println!("bf16_rows_oracle: arch={arch}");
@@ -1126,22 +2099,43 @@ fn main() {
         );
         std::process::exit(2);
     }
-    // The verify-scope gate: wide twins serve 9..=32 rows only inside it (eager launches).
+    // Only eager routed calls use the selector; direct tiles must also cover R=1.
     gpu.set_wide_verify_rows(MAX_ROWS);
-    // Load every wide kernel before any graph capture (no compile mid-capture).
-    for cap in [16, 32] {
-        for func in [
-            format!("gemv_bf16_xf32_x4_rows_wide_r{cap}"),
-            format!("gemv_bf16_xf32_k4_rows_wide_r{cap}"),
-        ] {
-            gpu.ensure_kernel_public(MODULE, QWEN4_GEMV_BF16_XF32_SRC, &func)
-                .unwrap_or_else(|e| panic!("load {func}: {e:?}"));
-        }
+    // Load exact-architecture fixed8 objects before graph capture.
+    for hc in [false, true] {
+        let func = tile_symbol(&gpu, hc);
+        gpu.ensure_row_tile_pm_entry(&func)
+            .unwrap_or_else(|e| panic!("load {func}: {e:?}"));
     }
     let mut report = Report::default();
-    run_x4_cases(&mut gpu, &mut report);
-    run_k4_cases(&mut gpu, &mut report);
+    for seed in 0..2 {
+        run_x4_cases(&mut gpu, &mut report, seed);
+        run_k4_cases(&mut gpu, &mut report, seed);
+    }
     run_hc_handoff(&mut gpu, &mut report);
+    for path in &captures {
+        run_captured_hc(&mut gpu, &mut report, path);
+    }
+    let mut verified_artifacts = BTreeMap::new();
+    let mut single_captures = 0;
+    let mut x4_captures = 0;
+    for path in &ordinary_paths {
+        let capture = load_captured_ordinary(&gpu, path, &mut verified_artifacts);
+        run_captured_ordinary(&mut gpu, &mut report, &capture);
+        if capture.form == "single" {
+            single_captures += 1;
+        } else {
+            x4_captures += 1;
+        }
+    }
+    if captures.is_empty() && ordinary_paths.is_empty() {
+        println!("G1 capture_status=NOT_PROVIDED qualification=synthetic-components-only real-model-capture-gate=unqualified");
+    } else {
+        println!(
+            "G1 capture_status=executed hc_manifests={} ordinary_single_manifests={single_captures} ordinary_x4_manifests={x4_captures} scope=provided-component-captures-only full-G1-qualification=withheld",
+            captures.len()
+        );
+    }
 
     println!("bf16_rows_oracle: per-case summary (runs, mismatching words)");
     for (label, s) in &report.rows {
@@ -1155,11 +2149,10 @@ fn main() {
     let bad: usize = report.rows.values().map(|s| s.bad).sum();
     if report.failures != 0 || bad != 0 {
         println!(
-            "bf16_rows_oracle: FAIL runs={runs} failures={} mismatch_bytes={}",
+            "bf16_rows_oracle: FAIL runs={runs} failures={} mismatch_words={bad}",
             report.failures,
-            bad * 4
         );
         std::process::exit(1);
     }
-    println!("bf16_rows_oracle: PASS runs={runs} mismatch_bytes=0");
+    println!("bf16_rows_oracle: PASS executed component arms runs={runs} mismatch_words=0");
 }

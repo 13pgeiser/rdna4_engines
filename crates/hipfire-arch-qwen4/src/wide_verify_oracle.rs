@@ -19,6 +19,195 @@ use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::SpecScratch;
 use rdna_compute::Gpu;
 
+/// Live qualified and physical bounds. Timing-only callers may exceed only
+/// `row_exact_verify_rows`, never the other two or the executor's 64 rows.
+#[derive(Clone, Copy, Debug)]
+pub struct DevVerifyCaps {
+    pub spec_verify_rows_cap: usize,
+    pub forward_max_chunk: usize,
+    pub row_exact_verify_rows: usize,
+}
+
+pub fn dev_verify_caps(bundle: &Qwen4Bundle, gpu: &Gpu) -> DevVerifyCaps {
+    let forward_max_chunk = bundle.execution.as_ref().map_or(0, |f| f.scratch.max_chunk);
+    let logits = bundle
+        .spec_logits
+        .as_ref()
+        .map_or(0, |t| t.numel() / bundle.config.vocab_size.max(1));
+    let top1 = bundle.spec_top1.as_ref().map_or(0, |t| t.byte_size() / 4);
+    let physical = crate::gpu_forward::qwen4_spec_logit_rows(forward_max_chunk)
+        .min(logits)
+        .min(top1)
+        .min(bundle.spec_verify_rows_cap())
+        .min(bundle.native_mtp_cpu_window_rows().unwrap_or(usize::MAX));
+    DevVerifyCaps {
+        spec_verify_rows_cap: physical,
+        forward_max_chunk,
+        row_exact_verify_rows: bundle.row_exact_verify_rows(gpu),
+    }
+}
+
+/// Effective row-exact verify rows of the live bundle: the frozen
+/// `row_exact_verify_rows` getter (admitted arithmetic with AR reference,
+/// CPU-expert restriction, physical capacity, allocated scratch).
+pub fn dev_effective_row_exact_rows(bundle: &Qwen4Bundle, gpu: &Gpu) -> usize {
+    bundle.row_exact_verify_rows(gpu)
+}
+
+/// The captured-input recurrence repair path, not restore plus replay.
+pub fn dev_native_retain_supported(bundle: &Qwen4Bundle, n: usize) -> bool {
+    n == 1 || (n >= 2 && bundle.state.row_capture_rows() >= n)
+}
+
+pub fn dev_commit_captured_prefix(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    block: &[u32],
+    keep: usize,
+    scratch: &mut dyn SpecScratch,
+) -> Result<(), String> {
+    bundle.dev_commit_captured_prefix(gpu, block, keep, scratch)
+}
+
+/// `accept_len` excludes the seed; `keep` in the captured-prefix API includes it.
+pub fn dev_commit_native_retain(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    block: &[u32],
+    accept_len: usize,
+    scratch: &mut dyn SpecScratch,
+) -> Result<(), String> {
+    let keep = accept_len
+        .checked_add(1)
+        .ok_or("native accept length overflow")?;
+    dev_commit_captured_prefix(bundle, gpu, block, keep, scratch)
+}
+
+pub fn dev_head_pending_hidden(
+    drafter: &crate::mtp_spec::Qwen4MtpDrafter,
+    gpu: &Gpu,
+) -> Result<Vec<u8>, String> {
+    let values = gpu
+        .download_f32(drafter.pending_hidden_for_parity()?)
+        .map_err(|e| e.to_string())?;
+    Ok(values.into_iter().flat_map(f32::to_le_bytes).collect())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevWindowSource {
+    ArRouted,
+    Mtp,
+    Ngram,
+}
+
+/// Actual execution branch, latched by the executor rather than inferred
+/// from a requested width or an environment setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevWindowRoute {
+    TargetOnly,
+    Batched,
+    Interleaved,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DevForcedWindow {
+    pub source: DevWindowSource,
+    pub drafts: usize,
+    /// Explicit diagnostic opt-in: never an identity qualification.
+    pub timing_only: bool,
+}
+
+pub struct DevWindowMeasurement {
+    pub requested_drafts: usize,
+    pub actual_drafts: usize,
+    pub offered: usize,
+    pub accepted_prefix: usize,
+    pub source: DevWindowSource,
+    pub route: DevWindowRoute,
+    pub requested_confirmation: bool,
+    pub cost_mode: hipfire_runtime::spec_economics::DerivedCostMode,
+    pub head_confirmation: Option<bool>,
+    pub terminal: bool,
+    pub total_us: f64,
+    pub window: hipfire_runtime::spec::MtpWindow,
+    /// Actual head-row logit margins of this native window: entry `j` is the
+    /// margin read at committed draft row `j + 1` (`Some` iff finite and
+    /// non-negative, else `None`). Native only; every other source is empty.
+    /// The curve consumer gates `complete` on requested == actual and on
+    /// this length matching `actual_drafts`. Copied out of the drafter
+    /// scratch once for the receipt; production paths keep no copy.
+    pub native_draft_margins: Vec<Option<f32>>,
+    /// The observed window did not match the request (source or width):
+    /// the curve consumer keeps it as a raw incomplete receipt
+    /// (`complete: false` + `missing_reason`), never a priced window.
+    /// Only real transaction failures (position/seed/caps, route latch)
+    /// surface as `Err`.
+    pub outcome_mismatch: bool,
+}
+
+pub struct DevVerifyFaultOutcome {
+    pub verify_error: String,
+    pub receipt: rdna_compute::LabKernelFaultReceipt,
+}
+
+/// Inject through the real verify transaction after its snapshot is open.
+/// `0` fails its first kernel; `n > 0` permits exactly n successful kernel
+/// submissions before failure. Disarming precedes automatic target restore.
+pub fn dev_verify_resident_fault_after_snapshot(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    block: &[u32],
+    scratch: &mut dyn SpecScratch,
+    successful_launches: usize,
+) -> Result<DevVerifyFaultOutcome, String> {
+    bundle.dev_verify_fault_after_snapshot(gpu, block, scratch, successful_launches)
+}
+
+/// Kernel-only eager-HIP launch events from the production verify's forward,
+/// excluding its snapshot. Prepare the GPU's event pool before calling this;
+/// a successful result leaves the normal verify ticket active for commit/undo.
+#[cfg(feature = "kernel-timing")]
+pub fn dev_verify_resident_profiled(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    block: &[u32],
+    scratch: &mut dyn SpecScratch,
+) -> Result<hip_bridge::KernelTimingReport, String> {
+    bundle.dev_verify_resident_profiled(gpu, block, scratch)
+}
+
+/// One real production window. No manufactured copy candidates or component
+/// sums: the device-synced total includes lookup, planning, head alignment,
+/// verification, acceptance, rollback, head fill and the commit boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn dev_run_forced_window(
+    drafter: &mut crate::mtp_spec::Qwen4MtpDrafter,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    position: usize,
+    seed: u32,
+    emitted: &[u32],
+    eos: u32,
+    request: DevForcedWindow,
+) -> Result<DevWindowMeasurement, String> {
+    drafter.dev_run_forced_window(bundle, gpu, position, seed, emitted, eos, request)
+}
+
+/// Exact arithmetic reference of the last multi-row verify attempt. Singleton
+/// cells are unbound and must not reuse a previous multi-row receipt.
+#[cfg(feature = "lab")]
+pub fn dev_last_verify_reference(
+    bundle: &Qwen4Bundle,
+) -> Option<rdna_compute::prefill_invariant::Qwen4VerifyReference> {
+    bundle.last_verify_reference()
+}
+
+/// Checked device allocation plan, not a measured peak or host-locked charge.
+#[cfg(feature = "lab")]
+pub fn dev_row_capture_planned_bytes(bundle: &Qwen4Bundle, rows: usize) -> Option<usize> {
+    bundle.row_capture_planned_bytes(rows)
+}
+
 /// Make the GDN row-capture ring hold at least `rows` rows, so
 /// `verify_block_rows` arms capture for blocks of up to `rows` rows (its rule:
 /// `block.len() >= 2 && row_capture_rows() >= block.len()`).
@@ -154,4 +343,74 @@ pub fn dev_state_digest(
         .into_iter()
         .map(|(_, key, digest)| (key, digest))
         .collect())
+}
+
+/// A taken snapshot of the MTP head (state and the draft head's request-local
+/// policy), bracketing a timed run of [`dev_head_chain`]; consume it with
+/// [`dev_head_rollback`].
+pub struct DevHeadTicket {
+    snapshot: crate::mtp_gpu::MtpGpuStateSnapshot,
+    draft: hipfire_dispatch::pipeline::DraftHeadRequestState,
+}
+
+/// The bundle has an attached MTP head.
+pub fn dev_head_attached(bundle: &Qwen4Bundle) -> bool {
+    bundle.mtp_position().is_ok()
+}
+
+/// The head's position.
+pub fn dev_head_position(bundle: &Qwen4Bundle) -> Result<usize, String> {
+    bundle.mtp_position().map_err(|error| error.to_string())
+}
+
+/// Snapshot the head and its draft request state before a chain.
+pub fn dev_head_open(bundle: &mut Qwen4Bundle, gpu: &mut Gpu) -> Result<DevHeadTicket, String> {
+    let snapshot = bundle
+        .mtp_snapshot(gpu)
+        .map_err(|error| error.to_string())?;
+    let draft = bundle
+        .mtp_draft_request_state()
+        .map_err(|error| error.to_string())?;
+    Ok(DevHeadTicket { snapshot, draft })
+}
+
+/// Exactly `depth` production batched-route head steps (the drafting loop's
+/// `mtp_forward_token` calls: row 0 reads `pending` and selects QSA afresh,
+/// later rows chain the previous draft) without the margin prune: no sync and
+/// no download beyond what each step does. Returns the drafts.
+pub fn dev_head_chain(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    seed: u32,
+    pending: &rdna_compute::GpuTensor,
+    position: usize,
+    depth: usize,
+) -> Result<Vec<u32>, String> {
+    let mut drafts = Vec::with_capacity(depth);
+    let mut input = seed;
+    for index in 0..depth {
+        let hidden = (index == 0).then_some(pending);
+        let token_position = position
+            .checked_add(index)
+            .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
+        input = bundle
+            .mtp_forward_token(gpu, input, hidden, token_position, index == 0)
+            .map_err(|error| error.to_string())?;
+        drafts.push(input);
+    }
+    Ok(drafts)
+}
+
+/// Restore the head and its draft request state to the ticket's.
+pub fn dev_head_rollback(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    ticket: DevHeadTicket,
+) -> Result<(), String> {
+    bundle
+        .mtp_restore(gpu, ticket.snapshot)
+        .map_err(|error| error.to_string())?;
+    bundle
+        .set_mtp_draft_request_state(ticket.draft)
+        .map_err(|error| error.to_string())
 }

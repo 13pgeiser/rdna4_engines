@@ -307,69 +307,83 @@ pub fn lever_state(env: &BTreeMap<String, String>) -> Value {
     })
 }
 
-/// Size and full-file SHA-256 of one file. The hash is cached in
-/// `cache_dir/hash-<path digest>.json`, keyed by path, size and mtime, so the
-/// children of one parent hash a multi-GB artifact once.
-fn file_identity(file: &Path, cache_dir: &Path) -> Result<Value, String> {
-    let meta = fs::metadata(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let mtime_ns = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let path_text = file.display().to_string();
-    let key = json!({
-        "path": path_text,
-        "size": meta.len(),
-        "mtime_ns": mtime_ns,
-    });
-    let digest = sha256_hex(path_text.as_bytes());
-    let cache = cache_dir.join(format!("hash-{}.json", &digest[..16]));
-    if let Ok(bytes) = fs::read(&cache) {
-        if let Ok(cached) = serde_json::from_slice::<Value>(&bytes) {
-            if cached["key"] == key {
-                if let Some(sha) = cached["sha256"].as_str() {
-                    return Ok(json!({ "size": meta.len(), "sha256": sha }));
-                }
-            }
-        }
-    }
-    let sha = sha256_file(file)?;
-    let tmp = cache.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(
-        &tmp,
-        serde_json::to_vec_pretty(&json!({ "key": key, "sha256": sha }))
-            .map_err(|e| e.to_string())?,
+/// Size and full-file SHA-256 from the genuine verification cache only.
+/// Missing, stale or malformed proof is an integrity prerequisite, never
+/// permission to read an artifact, trust a weaker receipt, or seed the cache.
+fn file_identity(file: &Path, _cache_dir: &Path) -> Result<Value, String> {
+    let home = hipfire_config::hipfire_home().map_err(|e| {
+        format!(
+            "REFUSE artifact identity {}: verification home: {e}",
+            file.display()
+        )
+    })?;
+    file_identity_from_cache(
+        file,
+        &hipfire_runtime::verified_cache::VerifiedCache::in_home(&home),
     )
-    .map_err(|e| format!("{}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &cache).map_err(|e| format!("{}: {e}", cache.display()))?;
-    Ok(json!({ "size": meta.len(), "sha256": sha }))
+}
+
+fn file_identity_from_cache(
+    file: &Path,
+    cache: &hipfire_runtime::verified_cache::VerifiedCache,
+) -> Result<Value, String> {
+    use hipfire_runtime::verified_cache::StatKey;
+    let refusal = |reason: &str| format!("REFUSE artifact identity {}: {reason}", file.display());
+    let canonical =
+        fs::canonicalize(file).map_err(|e| refusal(&format!("canonical path unavailable: {e}")))?;
+    if canonical.to_str().is_none() {
+        return Err(refusal("canonical path is not UTF-8"));
+    }
+    let before =
+        fs::metadata(&canonical).map_err(|e| refusal(&format!("stat before cache lookup: {e}")))?;
+    if !before.is_file() {
+        return Err(refusal("artifact is not a regular file"));
+    }
+    let stat = StatKey::of(&before);
+    let digest = cache.verified_digest(&canonical, &stat);
+    let after =
+        fs::metadata(&canonical).map_err(|e| refusal(&format!("stat after cache lookup: {e}")))?;
+    let resolved_after = fs::canonicalize(file)
+        .map_err(|e| refusal(&format!("canonical path after cache lookup: {e}")))?;
+    if StatKey::of(&after) != stat || resolved_after != canonical {
+        return Err(refusal("artifact changed during read-only cache lookup"));
+    }
+    let sha = digest.ok_or_else(|| {
+        refusal("missing, stale, malformed or wrong-version genuine verification proof; no payload hashing is permitted")
+    })?;
+    Ok(json!({ "size": before.len(), "sha256": sha }))
+}
+
+fn optional_file_identity(file: &Path, cache_dir: &Path) -> Result<Value, String> {
+    match fs::symlink_metadata(file) {
+        Ok(_) => file_identity(file, cache_dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        Err(e) => Err(format!(
+            "REFUSE artifact identity {}: sidecar presence stat: {e}",
+            file.display()
+        )),
+    }
 }
 
 /// The model artifact, any `<model>.ple-q4` / `<model>.ple-q8` PLE-row
-/// sidecar next to it (the loader attaches one when the base is split) and
-/// its `<model>.trunk-overlay` (the loader applies one on its default
-/// architecture): size and full-file SHA-256 of each, `null` for an absent
-/// sidecar.
+/// sidecar next to it (the loader attaches one when the base is split), its
+/// `<model>.trunk-overlay` (the loader applies one on its default
+/// architecture) and its `<model>.expert-hotset` (the loader applies one on
+/// gfx1201 discrete loads): size and full-file SHA-256 of each, `null` for an
+/// absent sidecar. Presence is not use: the arms record which of these the
+/// loader actually applied.
 pub fn model_identity(model: &Path, cache_dir: &Path) -> Result<Value, String> {
     let mut identity = file_identity(model, cache_dir)?;
     for suffix in ["ple-q4", "ple-q8"] {
         let mut name = model.as_os_str().to_os_string();
         name.push(format!(".{suffix}"));
         let sidecar = std::path::PathBuf::from(name);
-        identity[suffix] = if sidecar.is_file() {
-            file_identity(&sidecar, cache_dir)?
-        } else {
-            Value::Null
-        };
+        identity[suffix] = optional_file_identity(&sidecar, cache_dir)?;
     }
     let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(model);
-    identity["trunk-overlay"] = if overlay.is_file() {
-        file_identity(&overlay, cache_dir)?
-    } else {
-        Value::Null
-    };
+    identity["trunk-overlay"] = optional_file_identity(&overlay, cache_dir)?;
+    let hotset = hipfire_config::memory::expert_hotset_sidecar_path(model);
+    identity["expert-hotset"] = optional_file_identity(&hotset, cache_dir)?;
     Ok(identity)
 }
 
@@ -575,6 +589,148 @@ pub fn require_same_config(config_path: &Path, expected: &Value) -> Result<(), S
 #[cfg(test)]
 mod lever_state_tests {
     use super::*;
+
+    struct IdentityFixture {
+        root: std::path::PathBuf,
+        payload: std::path::PathBuf,
+        cache_file: std::path::PathBuf,
+    }
+
+    impl IdentityFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "hipfire-hw-identity-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            fs::create_dir(&root).unwrap();
+            let payload = root.join("tiny-artifact");
+            fs::write(&payload, b"tiny verified fixture").unwrap();
+            let payload = fs::canonicalize(payload).unwrap();
+            let cache_file = root.join("verified-artifacts.json");
+            Self {
+                root,
+                payload,
+                cache_file,
+            }
+        }
+
+        fn record(&self) -> Value {
+            let stat =
+                hipfire_runtime::verified_cache::StatKey::of(&fs::metadata(&self.payload).unwrap());
+            let mut record = serde_json::to_value(stat).unwrap();
+            record["sha256"] = json!(sha256_hex(b"tiny verified fixture"));
+            record["verified_at"] = json!(1);
+            record
+        }
+
+        fn seed(&self, record: Value) {
+            let mut records = serde_json::Map::new();
+            records.insert(self.payload.to_str().unwrap().to_string(), record);
+            fs::write(
+                &self.cache_file,
+                serde_json::to_vec(&json!({
+                    "version": 1, "records": records,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn identity(&self) -> Result<Value, String> {
+            file_identity_from_cache(
+                &self.payload,
+                &hipfire_runtime::verified_cache::VerifiedCache::at(self.cache_file.clone()),
+            )
+        }
+    }
+
+    impl Drop for IdentityFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn artifact_identity_cache_hit_is_read_only() {
+        let fixture = IdentityFixture::new();
+        // Force any payload read to advance atime, even with relatime mounts.
+        fs::File::open(&fixture.payload)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(std::time::UNIX_EPOCH))
+            .unwrap();
+        fixture.seed(fixture.record());
+        let cache_before = fs::read(&fixture.cache_file).unwrap();
+        let stat_before = fs::metadata(&fixture.cache_file).unwrap();
+        let payload_atime = fs::metadata(&fixture.payload).unwrap().accessed().unwrap();
+        let identity = fixture.identity().unwrap();
+        assert_eq!(
+            identity,
+            json!({
+                "size": b"tiny verified fixture".len(),
+                "sha256": sha256_hex(b"tiny verified fixture"),
+            })
+        );
+        assert_eq!(
+            fs::metadata(&fixture.payload).unwrap().accessed().unwrap(),
+            payload_atime
+        );
+        assert_eq!(fs::read(&fixture.cache_file).unwrap(), cache_before);
+        assert_eq!(
+            hipfire_runtime::verified_cache::StatKey::of(
+                &fs::metadata(&fixture.cache_file).unwrap()
+            ),
+            hipfire_runtime::verified_cache::StatKey::of(&stat_before),
+        );
+        assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn artifact_identity_cache_miss_stale_malformed_refuse() {
+        let fixture = IdentityFixture::new();
+        let assert_refused = || {
+            let error = fixture.identity().unwrap_err();
+            assert!(error.contains("REFUSE artifact identity"), "{error}");
+            assert!(error.contains("genuine verification proof"), "{error}");
+        };
+        assert_refused();
+        assert!(!fixture.cache_file.exists());
+        for field in ["dev", "ino", "size", "mtime_sec", "mtime_nsec"] {
+            let mut record = fixture.record();
+            record[field] = json!(record[field].as_i64().unwrap() + 1);
+            fixture.seed(record);
+            let before = fs::read(&fixture.cache_file).unwrap();
+            assert_refused();
+            assert_eq!(fs::read(&fixture.cache_file).unwrap(), before);
+        }
+        for digest in ["", "abc", &"z".repeat(64)] {
+            let mut record = fixture.record();
+            record["sha256"] = json!(digest);
+            fixture.seed(record);
+            assert_refused();
+        }
+        for contents in [b"not json".as_slice(), br#"{"version":9,"records":{}}"#] {
+            fs::write(&fixture.cache_file, contents).unwrap();
+            assert_refused();
+            assert_eq!(fs::read(&fixture.cache_file).unwrap(), contents);
+        }
+        let mut other_path = fixture.record();
+        other_path["sha256"] = json!(sha256_hex(b"tiny verified fixture"));
+        fs::write(
+            &fixture.cache_file,
+            serde_json::to_vec(&json!({
+                "version": 1, "records": { "wrong/canonical/path": other_path },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_refused();
+    }
 
     fn env_with(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

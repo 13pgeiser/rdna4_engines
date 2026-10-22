@@ -13,6 +13,10 @@
 //! addresses `0xBE78..0xC104`). Every floating-point operation below is the
 //! decoded singleton operation with the decoded constants and operand order;
 //! only the bit-exact BF16 rounding selects are restructured (see below).
+//! This immutable decode snapshot and its `.decode.json` / `.identity.json`
+//! retain the historical singleton object's identity; they do not certify the
+//! current same-stem rowtile image. Its emission evidence lives in the current
+//! `.proof.json`, `.m7.json` and `.shape.d` artifacts.
 //!
 //! # Contract
 //!

@@ -822,10 +822,13 @@ fn target_families(
     let mut recurrent = Family::new();
     let mut conv = Family::new();
     for layer in &state.gdn {
-        append_f32(
+        // Compare the live slot's storage bytes, including Q8 codes/scales;
+        // an F32 download is not a storage-byte oracle for Q8.
+        append_raw(
             gpu,
             &mut recurrent,
             &layer.recurrent,
+            layer.recurrent.numel(),
             layer.recurrent.numel(),
         )?;
         append_f32(gpu, &mut conv, &layer.conv, layer.conv.numel())?;
@@ -1181,6 +1184,7 @@ fn rollback_failure(
     case: &str,
     injected: Option<&str>,
 ) -> Result<Value, String> {
+    let scope_before = verify_scope(gpu);
     target.reset(gpu).map_err(|e| e.to_string())?;
     mtp.reset(gpu).map_err(|e| e.to_string())?;
     for (position, &token) in [10u32, 11, 12, 13].iter().enumerate() {
@@ -1203,13 +1207,15 @@ fn rollback_failure(
     let target_compare =
         compare_family_maps(&before_target, &target_families(gpu, config, target)?);
     let mtp_compare = compare_family_maps(&before_mtp, &mtp_families(gpu, config, mtp)?);
-    let pass = target_compare.0 && mtp_compare.0;
+    let scope_restored = verify_scope(gpu) == scope_before;
+    let pass = target_compare.0 && mtp_compare.0 && scope_restored;
     Ok(json!({
         "case": case,
         "status": if pass {"pass"} else {"fail"},
         "replay_error": failure,
         "target_rollback": target_compare.1,
         "mtp_rollback": mtp_compare.1,
+        "gpu_scope_restored": scope_restored,
     }))
 }
 
@@ -2083,6 +2089,83 @@ pub fn run_state_parity(
     })))
 }
 
+// The rows API intentionally only exposes a replacing setter. Observe it
+// without leaving a changed scope; no test-only public getter is necessary.
+fn verify_scope(
+    gpu: &mut Gpu,
+) -> (
+    usize,
+    Option<rdna_compute::prefill_invariant::Qwen4VerifyReference>,
+) {
+    let rows = gpu.set_wide_verify_rows(0);
+    gpu.set_wide_verify_rows(rows);
+    (rows, gpu.qwen4_verify_reference())
+}
+
+/// The snapshot itself launches copy_regions, so it MUST precede arming the
+/// first-launch seam. This exercises scoped forward failure plus a manual
+/// ticket abort, not aggregate verify auto-abort or failure after kernel work.
+fn scoped_launch_abort_probe(
+    gpu: &mut Gpu,
+    bundle: &mut crate::bundle::Qwen4Bundle,
+    block: &[u32],
+) -> Result<Value, String> {
+    let scope_before = verify_scope(gpu);
+    let conv_history = bundle.config.linear_conv_kernel_dim - 1;
+    bundle
+        .ensure_spec_hidden(gpu, block.len())
+        .map_err(|e| e.to_string())?;
+    bundle
+        .state
+        .ensure_row_capture(gpu, block.len(), conv_history)
+        .map_err(|e| e.to_string())?;
+    let before = target_families(gpu, &bundle.config, &bundle.state)?;
+    bundle.state.row_capture_armed = true;
+    let ticket = match bundle.snapshot(gpu) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            bundle.state.row_capture_armed = false;
+            return Err(error.to_string());
+        }
+    };
+    hip_bridge::arm_hip_fault("launch", 1);
+    let failure = bundle
+        .spec_forward_rows(gpu, block, true)
+        .err()
+        .map(|e| e.to_string());
+    hip_bridge::arm_hip_fault("launch", 0);
+    bundle.state.row_capture_armed = false;
+    let scope_restored = verify_scope(gpu) == scope_before;
+    #[cfg(feature = "lab")]
+    let scope_entry_observed = Some(bundle.last_verify_reference().is_some());
+    #[cfg(not(feature = "lab"))]
+    let scope_entry_observed: Option<bool> = None;
+    bundle.restore(gpu, ticket).map_err(|e| e.to_string())?;
+    let state = compare_family_maps(
+        &before,
+        &target_families(gpu, &bundle.config, &bundle.state)?,
+    );
+    let injected = failure
+        .as_ref()
+        .is_some_and(|error| error.contains("injected launch failure"));
+    if !injected || !scope_restored || !state.0 || scope_entry_observed == Some(false) {
+        return Err(format!(
+            "scoped first-launch/manual-abort probe failed: error={failure:?}, scope={scope_restored}, entry={scope_entry_observed:?}, state={}",
+            state.1,
+        ));
+    }
+    Ok(json!({
+        "status": "pass",
+        "failure": failure,
+        "rows": block.len(),
+        "scope_restored": scope_restored,
+        "scope_entry_observed": scope_entry_observed,
+        "abort": "manual_ticket_restore_after_scoped_forward_failure",
+        "after_partial_kernel_work": false,
+        "state_families": state.1,
+    }))
+}
+
 fn real_model_probe(
     gpu: &mut Gpu,
     bundle: &mut crate::bundle::Qwen4Bundle,
@@ -2090,6 +2173,37 @@ fn real_model_probe(
     corpus: &Value,
 ) -> Result<Value, String> {
     let vocab = bundle.config.vocab_size;
+    use hipfire_runtime::spec::SpecTarget;
+    let entry_scope = verify_scope(gpu);
+    let effective_rows = bundle.row_exact_verify_rows(gpu);
+    if let Some(forward) = bundle.execution.as_ref() {
+        let logits_rows = bundle.spec_logits.as_ref().map_or(0, |t| t.numel() / vocab);
+        let top1_rows = bundle.spec_top1.as_ref().map_or(0, GpuTensor::byte_size) / 4;
+        let physical_rows = crate::gpu_forward::qwen4_spec_logit_rows(forward.scratch.max_chunk)
+            .min(logits_rows)
+            .min(top1_rows);
+        if effective_rows > physical_rows
+            || forward
+                .native_mtp_cpu_window_rows()
+                .is_some_and(|cap| effective_rows > cap)
+        {
+            return Err(format!(
+                "effective verify capacity {effective_rows} exceeds actual scratch/CPU capacity"
+            ));
+        }
+    }
+    // A block larger than its allocated transaction scratch must be refused
+    // before any target snapshot/launch, with both GPU scopes untouched.
+    let mut refusal_scratch = bundle.new_spec_scratch(gpu, 1)?;
+    let position = bundle.state.position;
+    let prelaunch_refusal = bundle
+        .verify_block(gpu, &[0, 0], position, refusal_scratch.as_mut(), None)
+        .err();
+    refusal_scratch.free(gpu);
+    let prelaunch_scope_restored = verify_scope(gpu) == entry_scope;
+    if prelaunch_refusal.is_none() || !prelaunch_scope_restored {
+        return Err("verify prelaunch refusal did not preserve rows/reference scope".into());
+    }
     let ar_elements = tokens
         .len()
         .checked_mul(vocab)
@@ -2141,6 +2255,15 @@ fn real_model_probe(
             return Err(format!("real native MTP prefill: {error}"));
         }
     };
+    let scoped_abort = match scoped_launch_abort_probe(gpu, bundle, &[seed, seed]) {
+        Ok(report) => report,
+        Err(error) => {
+            MtpDrafter::mtp_free(Box::new(drafter), gpu);
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
+            return Err(error);
+        }
+    };
     let eos = bundle.config.eos_token_id;
     let window = match drafter.mtp_step(
         gpu,
@@ -2157,9 +2280,18 @@ fn real_model_probe(
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
             let _ = gpu.free_tensor(mtp_buffer);
             let _ = gpu.free_tensor(ar_buffer);
-            return Err(format!("real native MTP step: {error}"));
+            let restored = verify_scope(gpu) == entry_scope;
+            return Err(format!(
+                "real native MTP step: {error}; verify scope restored={restored}"
+            ));
         }
     };
+    let verify_scope_restored = verify_scope(gpu) == entry_scope;
+    #[cfg(feature = "lab")]
+    let reference_bound =
+        (window.drafts_generated != 0).then(|| bundle.last_verify_reference().is_some());
+    #[cfg(not(feature = "lab"))]
+    let reference_bound: Option<bool> = None;
     let probe_token = window.committed.last().copied().unwrap_or(seed);
     let mtp_position = match bundle.mtp_position() {
         Ok(position) => position,
@@ -2205,12 +2337,18 @@ fn real_model_probe(
     let finite = ar_logits.values.iter().all(|value| value.is_finite())
         && mtp_logits.values.iter().all(|value| value.is_finite());
     let result = json!({
-        "status": if finite {"pass"} else {"fail"},
+        "status": if finite && verify_scope_restored && reference_bound != Some(false) {"pass"} else {"fail"},
         "corpus": corpus,
         "ar_logit_row": tokens.len() - 1,
         "ar_token_count": tokens.len(),
         "accepted_drafts": window.accepted,
         "drafts_generated": window.drafts_generated,
+        "effective_row_exact_rows": effective_rows,
+        "verify_prelaunch_refusal": prelaunch_refusal,
+        "verify_prelaunch_scope_restored": prelaunch_scope_restored,
+        "scoped_first_launch_manual_abort": scoped_abort,
+        "verify_scope_restored": verify_scope_restored,
+        "multirow_reference_bound": reference_bound,
         "committed": window.committed,
         "seed": seed,
         "probe_token": probe_token,
@@ -2970,6 +3108,175 @@ mod tests {
             eprintln!("skip: Qwen4 compact state parity requires a GPU");
             None
         })
+    }
+
+    /// Descriptor-only GPU fixture: real allocations, no arithmetic kernel
+    /// claim. Every admitted verify width reuses the immutable Q8 copy.
+    #[test]
+    fn decode_copy_descriptor_identity_through_64() {
+        use hipfire_dispatch::families::gemv::WeightRef;
+        let Some(mut gpu) = try_gpu() else { return };
+        let max = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        for k in [320, 640, 2560] {
+            let m = 3;
+            let source_buf = gpu.zeros(&[m * k], DType::BF16).expect("source");
+            let stride = crate::projection::row_stride(DType::Q8_0, k);
+            let copies = [gpu.zeros(&[m * stride], DType::Raw).expect("Q8 copy")];
+            gpu.hip
+                .memset(&copies[0].buf, 0x5a, copies[0].byte_size())
+                .expect("seed copy");
+            let original = gpu.download_raw_bytes(&copies[0]).expect("copy bytes");
+            let source = WeightRef {
+                buf: &source_buf,
+                dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 2 * k,
+                rotation: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            };
+            for rows in 1..=max {
+                let selected = crate::gpu_forward::decode_copy(&copies, 0, rows, max, source);
+                assert!(std::ptr::eq(selected.buf, &copies[0]));
+                assert_eq!(selected.buf.buf.as_ptr(), copies[0].buf.as_ptr());
+                assert_eq!(selected.dtype, DType::Q8_0);
+                assert_eq!(
+                    (selected.m, selected.k, selected.row_stride),
+                    (m, k, stride)
+                );
+            }
+            for (index, rows, limit) in [(0, max + 1, max), (0, 9, 8), (1, max, max)] {
+                let selected = crate::gpu_forward::decode_copy(&copies, index, rows, limit, source);
+                assert!(std::ptr::eq(selected.buf, &source_buf));
+                assert_eq!(selected.dtype, source.dtype);
+                assert_eq!((selected.m, selected.k, selected.row_stride), (m, k, 2 * k));
+            }
+            assert_eq!(
+                gpu.download_raw_bytes(&copies[0]).expect("unchanged copy"),
+                original
+            );
+            gpu.free_tensor(source_buf).expect("free source");
+            for copy in copies {
+                gpu.free_tensor(copy).expect("free copy");
+            }
+        }
+    }
+
+    /// Extends the existing append/select + restore/replay parity harness:
+    /// all 64 kept prefixes, full abort and subsequent append/transaction.
+    /// This is snapshot/QSA state coverage, not full-model row arithmetic.
+    #[test]
+    fn state_parity_64_restore_prefixes_abort_and_continuation() {
+        let Some(mut gpu) = try_gpu() else { return };
+        let config = crate::config::synthetic_test_config(
+            crate::config::Qwen4FfnConfig::Dense {
+                intermediate_size: 16,
+            },
+            16,
+            2,
+            true,
+            false,
+        );
+        let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        let mut ar = Qwen4State::new(&mut gpu, &config, 128, crate::state::Qwen4StateFormat::F32)
+            .expect("AR state");
+        let mut candidate =
+            Qwen4State::new(&mut gpu, &config, 128, crate::state::Qwen4StateFormat::F32)
+                .expect("candidate state");
+        let block: Vec<_> = (0..rows).map(|r| 10 + r as u32).collect();
+        for keep in 0..=rows {
+            reset_target(&mut gpu, &mut ar).expect("reset AR");
+            reset_target(&mut gpu, &mut candidate).expect("reset candidate");
+            for (position, token) in [1, 2, 3, 4].into_iter().enumerate() {
+                append_target_pair(&mut gpu, &config, &mut ar, &mut candidate, position, token)
+                    .expect("prefix");
+            }
+            select_target_pair(&mut gpu, &config, &mut ar, &mut candidate, PREFIX)
+                .expect("select prefix");
+            let ticket = candidate.snapshot(&mut gpu).expect("snapshot");
+            for (row, &token) in block.iter().enumerate() {
+                append_target_single(&mut gpu, &config, &mut candidate, PREFIX + row, token)
+                    .expect("verify append");
+            }
+            select_target(&mut gpu, &config, &mut candidate, PREFIX + rows)
+                .expect("select verified end");
+            if keep < rows {
+                mutate_target(&mut gpu, &mut candidate).expect("partial work");
+                candidate
+                    .restore_retain(&mut gpu, ticket)
+                    .expect("restore before replay");
+                for (row, &token) in block[..keep].iter().enumerate() {
+                    append_target_single(&mut gpu, &config, &mut candidate, PREFIX + row, token)
+                        .expect("kept replay");
+                }
+            }
+            candidate
+                .commit(ticket, &mut gpu)
+                .expect("commit or finish abort");
+            for (row, &token) in block[..keep].iter().enumerate() {
+                append_target_single(&mut gpu, &config, &mut ar, PREFIX + row, token)
+                    .expect("AR kept");
+            }
+            select_target_pair(&mut gpu, &config, &mut ar, &mut candidate, PREFIX + keep)
+                .expect("select kept end");
+            let compare = compare_family_maps(
+                &target_families(&gpu, &config, &ar).expect("AR digest"),
+                &target_families(&gpu, &config, &candidate).expect("candidate digest"),
+            );
+            assert!(compare.0, "keep={keep}: {}", compare.1);
+            assert!(
+                candidate.validate_commit(ticket).is_err(),
+                "consumed ticket keep={keep}"
+            );
+            append_target_pair(
+                &mut gpu,
+                &config,
+                &mut ar,
+                &mut candidate,
+                PREFIX + keep,
+                BONUS,
+            )
+            .expect("AR continuation");
+            // A second transaction rejects its suffix, then continues from
+            // the restored marks, catching stale pooled/selection visibility.
+            let next = candidate.snapshot(&mut gpu).expect("next snapshot");
+            append_target_single(
+                &mut gpu,
+                &config,
+                &mut candidate,
+                PREFIX + keep + 1,
+                BONUS + 1,
+            )
+            .expect("next verify append");
+            candidate.restore(&mut gpu, next).expect("next abort");
+            append_target_pair(
+                &mut gpu,
+                &config,
+                &mut ar,
+                &mut candidate,
+                PREFIX + keep + 1,
+                BONUS + 2,
+            )
+            .expect("post-abort continuation");
+            select_target_pair(
+                &mut gpu,
+                &config,
+                &mut ar,
+                &mut candidate,
+                PREFIX + keep + 2,
+            )
+            .expect("select continuation");
+            let compare = compare_family_maps(
+                &target_families(&gpu, &config, &ar).expect("continued AR digest"),
+                &target_families(&gpu, &config, &candidate).expect("continued candidate digest"),
+            );
+            assert!(compare.0, "continuation keep={keep}: {}", compare.1);
+        }
+        ar.free_gpu(&mut gpu).expect("free AR");
+        candidate.free_gpu(&mut gpu).expect("free candidate");
     }
 
     fn field<'a>(value: &'a Value, name: &str) -> &'a Value {

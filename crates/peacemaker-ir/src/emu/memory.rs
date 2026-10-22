@@ -12,6 +12,7 @@ use crate::{
 fn width(name: &str) -> Result<usize> {
     for token in name.split('_') {
         match token {
+            "b512" => return Ok(64),
             "b256" => return Ok(32),
             "b128" => return Ok(16),
             "b96" => return Ok(12),

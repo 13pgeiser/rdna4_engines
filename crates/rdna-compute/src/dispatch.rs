@@ -1297,6 +1297,270 @@ static IU4_VERIFY_SCOPE_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 static IU4_VERIFY_SCOPE_F16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static IU4_VERIFY_SCOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Borrowed actual operands at a loaded projection's eager launch boundary.
+/// The observer may download them synchronously but must not retain references.
+#[cfg(feature = "lab")]
+pub struct LabProjectionLaunch<'a> {
+    pub symbol: &'a str,
+    pub family: crate::gemv::WideTwinFamily,
+    pub form: &'static str,
+    pub weights: [Option<(&'a GpuTensor, usize)>; 4],
+    pub x: &'a GpuTensor,
+    pub rows: usize,
+    pub k: usize,
+    pub scale: Option<f32>,
+    pub hc_act: bool,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+}
+#[cfg(feature = "lab")]
+pub type LabProjectionObserver =
+    dyn for<'a> Fn(&Gpu, &LabProjectionLaunch<'a>) -> HipResult<()> + Send + Sync;
+
+#[cfg(feature = "lab")]
+pub struct LabLaunchWitness<'a> {
+    pub symbol: &'a str,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+}
+
+#[cfg(feature = "lab")]
+pub type LabLaunchObserver =
+    dyn for<'a> Fn(&Gpu, &LabLaunchWitness<'a>) -> HipResult<()> + Send + Sync;
+
+/// Borrowed gate/up launch operands at a legacy G1 aggregation launch site.
+/// `#[cfg(lab)]`-only neutral metadata: per-GPU borrowed observer pattern,
+/// existing borrowed-field style — every pointer borrows the owner and the
+/// observer downloads synchronously without retaining references or copying
+/// weight payload. Both MQ4 aggregate weights stay in place in their
+/// admitted resident/host-mapped owners; this struct carries no payload copy.
+#[cfg(feature = "lab")]
+pub struct LabG1GateUpBorrow<'a> {
+    /// Resident G1 expert pointer table (device pointers per expert).
+    pub expert_ptrs: &'a GpuTensor,
+    /// Per-token top-10 expert indices (u32/i32 words, rows x k_top).
+    pub topk_indices: &'a GpuTensor,
+    /// Per-token FWHT-rotated input rows (F32, rows x 2560).
+    pub x: &'a GpuTensor,
+    /// Gate output rows (F32, rows x k_top x mi); the observer downloads
+    /// the per-row reference words synchronously at the launch boundary.
+    pub y_gate: &'a GpuTensor,
+    /// Up output rows (F32, rows x k_top x mi).
+    pub y_up: &'a GpuTensor,
+    /// Output dim (M = 2*mi; canonical 1280). NOT the token count.
+    pub m: usize,
+    /// Sealed top-k (canonical 10).
+    pub k_top: usize,
+    /// Logical token rows 1..=64 covered by this G1 window.
+    pub rows: usize,
+    /// Number of resident experts (table extent `n_exp`).
+    pub n_exp: usize,
+}
+
+/// Borrowed down launch operands at a legacy G1 aggregation launch site.
+/// Same neutral borrowed-observer contract as [`LabG1GateUpBorrow`].
+#[cfg(feature = "lab")]
+pub struct LabG1DownBorrow<'a> {
+    /// Resident G1 down expert pointer table.
+    pub expert_ptrs: &'a GpuTensor,
+    /// Per-token top-10 expert indices.
+    pub topk_indices: &'a GpuTensor,
+    /// Unweighted native expanded outputs, observed after successful launch.
+    pub expert_outputs: &'a GpuTensor,
+    /// FWHT-rotated activations (F32, rows x down_k = 640); small
+    /// activation values are allowed reads.
+    pub hidden: &'a GpuTensor,
+    /// Output dim (canonical hidden 2560).
+    pub m: usize,
+    /// Activation width (canonical down_k 640).
+    pub k: usize,
+    /// Logical token rows 1..=64 (original N semantics = total R).
+    pub rows: usize,
+    /// Number of resident experts.
+    pub n_exp: usize,
+    /// Runtime k_top actually launched (canonical 10).
+    pub k_top: usize,
+}
+
+/// Neutral lab G1 witness: borrowed per-GPU G1 launch observation.
+/// The `Gpu` reference gives the observer `lab_kernel_identity`,
+/// `lab_kernel_device_identity`, and `lab_kernel_device_bytes` for the
+/// actually loaded owner; the variant borrows the launch operands in place.
+/// The observer must not alter production selection, recording, or math:
+/// with no hook installed the launch path is byte-identical (zero overhead).
+
+/// Neutral lab actual grouped SymIU4 launch record: per-phase grouped GU/down
+/// evidence from actual successful launches. Owned std data only (no borrowed
+/// device memory): symbol, width, grid/block shapes, slots/experts/rows, the
+/// loaded owner module, the admitted container SHA-256 and the per-arch raw
+/// device SHA-256 resolved at the launch boundary via the existing
+/// [`Gpu::lab_kernel_identity`] / [`Gpu::lab_kernel_device_identity`] proofs —
+/// never a source or container substitution. A missing launch exports an
+/// absent (`None`) witness, never a pass.
+#[cfg(any(feature = "lab", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabFnRecord {
+    /// Actually launched symbol.
+    pub symbol: String,
+    /// Grid actually launched.
+    pub grid: [u32; 3],
+    /// Block actually launched.
+    pub block: [u32; 3],
+    /// Output width `m` of the stage (gate/up `2*mi`, down `down_m`).
+    pub width: usize,
+    /// True for the grouped down stage, false for gate/up.
+    pub down: bool,
+    /// Actual grouped rows launched.
+    pub grouped_rows: usize,
+    /// Actual expert-table extent (`n_exp` owner count).
+    pub n_experts: usize,
+    /// Actual total routed slots (`x_row_div * x_src_rows`).
+    pub total_slots: usize,
+    /// Actual source rows (`x_src_rows`).
+    pub source_rows: usize,
+    /// Loaded owner module of the actually launched symbol.
+    pub module: String,
+    /// Admitted container SHA-256 (hex) of the actually launched symbol.
+    pub container_sha256: String,
+    /// Per-arch raw device SHA-256 (hex) of the actually launched symbol.
+    pub device_sha256: String,
+    /// Placement proven on this launch (host-mapped bit).
+    pub host_mapped: bool,
+    /// Recipe proven on this launch (symmetric IU4 arm is always BF16
+    /// round-trip; carried explicitly so absent/non-pass exports name it).
+    pub bf16_round_trip: bool,
+    /// Scratch chunk rows of the call (`chunk_rows` bound).
+    pub chunk_rows: usize,
+}
+
+/// Bounded capacity of the opaque lab carve (collector bound only, not a
+/// launch cap and not a claim about trunk depth). Overflow never changes
+/// launch execution: the launch still returns `Ok`, the collector only marks
+/// the window incomplete/non-pass and stops collecting further records.
+#[cfg(feature = "lab")]
+pub const LAB_FN_CARVE_CAP: usize = 97;
+
+/// Overflow marker drained alongside records: `Some(count)` means the window
+/// observed more actual grouped launches than the finite cap holds; the
+/// export must render non-pass and name the overflow.
+#[cfg(any(feature = "lab", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LabFnOverflow(pub usize);
+
+#[cfg(feature = "lab")]
+pub enum LabG1Witness<'a> {
+    GateUp(LabG1GateUpBorrow<'a>),
+    Down(LabG1DownBorrow<'a>),
+}
+#[cfg(feature = "lab")]
+pub type LabG1Observer = dyn for<'a> Fn(&Gpu, &LabG1Witness<'a>) -> HipResult<()> + Send + Sync;
+
+/// Current production G1 stage seal, bound only while an observer is active.
+/// The pipeline supplies its immutable routed-owner identity, admitted count,
+/// placement, recipe and actual router probability words. Each singleton AR
+/// stage refreshes the seal; the consumer requires the same immutable owner
+/// across its 64 positions. No observer means no identity work or readback.
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabG1WindowSeal {
+    /// `RoutedExpertWeights::immutable_identity` of the bound expert set.
+    pub expert_set_identity: u64,
+    /// Admitted resident expert count (`n_exp`).
+    pub n_exp: usize,
+    /// Admitted placement of the expert tables.
+    pub experts_host_mapped: bool,
+    /// Actual pipeline-selected router probability words for this singleton.
+    pub router_probability_words: [u32; 10],
+    pub bf16_round_trip: bool,
+}
+
+/// One-shot scoped fault evidence. Successful launches are HIP submissions that
+/// returned success through the dispatch funnels, not attempts or host calls.
+#[cfg(feature = "lab")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LabKernelFaultReceipt {
+    pub successful_launches: usize,
+    pub injected: bool,
+}
+
+#[cfg(feature = "lab")]
+struct LabKernelFaultCountdown {
+    remaining: AtomicUsize,
+    successful: AtomicUsize,
+    injected: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "lab")]
+impl Default for LabKernelFaultCountdown {
+    fn default() -> Self {
+        Self {
+            remaining: AtomicUsize::new(usize::MAX),
+            successful: AtomicUsize::new(0),
+            injected: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(feature = "lab")]
+impl LabKernelFaultCountdown {
+    fn arm(&self, successful_launches: usize) -> HipResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if successful_launches == usize::MAX || self.remaining.load(Relaxed) != usize::MAX {
+            return Err(HipError::new(
+                1,
+                "kernel fault countdown is active or count is unrepresentable",
+            ));
+        }
+        self.successful.store(0, Relaxed);
+        self.injected.store(false, Relaxed);
+        self.remaining.store(successful_launches, Relaxed);
+        Ok(())
+    }
+
+    fn before_launch(&self) -> HipResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self
+            .remaining
+            .compare_exchange(0, usize::MAX, Relaxed, Relaxed)
+            .is_ok()
+        {
+            self.injected.store(true, Relaxed);
+            return Err(HipError::new(
+                999,
+                &format!(
+                    "lab: injected one-shot kernel launch failure after {} successful launches",
+                    self.successful.load(Relaxed),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn launched_successfully(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self
+            .remaining
+            .fetch_update(Relaxed, Relaxed, |n| {
+                (n != usize::MAX && n != 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            self.successful.fetch_add(1, Relaxed);
+        }
+    }
+
+    fn disarm(&self) -> LabKernelFaultReceipt {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.remaining.store(usize::MAX, Relaxed);
+        LabKernelFaultReceipt {
+            successful_launches: self.successful.swap(0, Relaxed),
+            injected: self.injected.swap(false, Relaxed),
+        }
+    }
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 ///
 /// Tape completeness invariant: for any body executed via `Gpu`,
@@ -1371,6 +1635,37 @@ pub struct Gpu {
     /// when a sync times out. Scratch-helper converts and the optional CK
     /// path bypass this funnel and are deliberately not tracked here.
     last_kernel: Option<String>,
+    #[cfg(feature = "lab")]
+    lab_kernel_fault: LabKernelFaultCountdown,
+    #[cfg(feature = "lab")]
+    lab_projection_observer: Option<Arc<LabProjectionObserver>>,
+    #[cfg(feature = "lab")]
+    lab_launch_observer: Option<Arc<LabLaunchObserver>>,
+    #[cfg(feature = "lab")]
+    lab_g1_observer: Option<Arc<LabG1Observer>>,
+    /// LAB-only opaque grouped SymIU4 carve: bounded begin/end lifetime.
+    /// `None` = disarmed (production default: no hook, no collection, no
+    /// overhead). `Some((records, overflowed))` = armed window collecting
+    /// owned records up to [`LAB_FN_CARVE_CAP`]; `overflowed` counts actual
+    /// launches beyond the cap (honest non-pass, never truncation as pass).
+    #[cfg(feature = "lab")]
+    lab_fn_carve: Option<(Vec<LabFnRecord>, usize)>,
+    /// Current G1 window seal bound by the dispatch pipeline (`#[cfg(lab)]`
+    /// only). `None` outside a sealed G1 window; launch-site borrows read
+    /// this binding and the observer fails closed on mismatch.
+    #[cfg(feature = "lab")]
+    pub(crate) lab_g1_window: Option<LabG1WindowSeal>,
+    /// Strict HIP kernel-timing pool (cfg `kernel-timing` only). Allocated by
+    /// `lab_prepare_kernel_timing` outside the measured window; owned here so
+    /// no borrow of `Gpu`/runtime crosses `begin`. `None` until prepared or
+    /// after `lab_close_kernel_timing`.
+    #[cfg(feature = "kernel-timing")]
+    pub(crate) kernel_timing_pool: Option<hip_bridge::KernelTimingPool>,
+    /// `replay.replay_observation()` latched by `lab_begin_kernel_timing`;
+    /// `lab_finish_kernel_timing` rejects any drift (actual native work inside
+    /// a HIP-only timing claim invalidates the claim, never reports zero).
+    #[cfg(feature = "kernel-timing")]
+    pub(crate) kernel_timing_replay_baseline: crate::replay::ReplayObservation,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
@@ -1503,6 +1798,10 @@ pub struct Gpu {
     /// n-row verify is bitwise the sequential decode rows; prefill and every
     /// non-verify forward keep it `0`.
     pub wide_verify_rows: usize,
+    /// Actual singleton AR arithmetic for an eager verify window. The forward
+    /// owner restores this host scope binding after success or error; it never
+    /// changes recorder/graph state.
+    pub(crate) qwen4_verify_reference: Option<crate::prefill_invariant::Qwen4VerifyReference>,
     /// SKU-emulation state (`HIPFIRE_EMU`): profile, host facts and the
     /// installed budget id. `None` when emulation is off (the default).
     pub(crate) emu: Option<crate::emu::EmuGpuState>,
@@ -1874,6 +2173,307 @@ impl Gpu {
         self.last_kernel.as_deref()
     }
 
+    /// Install/restore the lab operand observer without changing calibration
+    /// capture. Launch owners call it only after the actual symbol is loaded.
+    #[cfg(feature = "lab")]
+    pub fn set_lab_projection_observer(
+        &mut self,
+        observer: Option<Arc<LabProjectionObserver>>,
+    ) -> Option<Arc<LabProjectionObserver>> {
+        std::mem::replace(&mut self.lab_projection_observer, observer)
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn lab_observe_projection(&self, launch: LabProjectionLaunch<'_>) -> HipResult<()> {
+        if let Some(observer) = &self.lab_projection_observer {
+            observer(self, &launch)?;
+        }
+        Ok(())
+    }
+
+    /// Install/restore the neutral per-launch code-object witness observer.
+    /// Same install/restore contract as the projection observer; observes
+    /// every actual bound launch funnel, projections and K1 alike, with only
+    /// borrowed launch metadata (symbol, grid, block, shared memory).
+    #[cfg(feature = "lab")]
+    pub fn set_lab_launch_observer(
+        &mut self,
+        observer: Option<Arc<LabLaunchObserver>>,
+    ) -> Option<Arc<LabLaunchObserver>> {
+        std::mem::replace(&mut self.lab_launch_observer, observer)
+    }
+
+    #[cfg(feature = "lab")]
+    fn lab_observe_launch(
+        &self,
+        symbol: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+    ) -> HipResult<()> {
+        if let Some(observer) = &self.lab_launch_observer {
+            observer(
+                self,
+                &LabLaunchWitness {
+                    symbol,
+                    grid,
+                    block,
+                    shared_mem,
+                },
+            )?;
+        }
+        Ok(())
+    }
+    /// Neutral per-GPU G1 observer (`cfg(lab)` only). Same install/restore
+    /// contract as the projection observer: `None` by default so the launch
+    /// path is untouched (zero overhead, byte-identical math/selection/
+    /// recording) when no hook is installed. Launch owners call the notify
+    /// entry only after the actual original symbol is loaded, with the
+    /// borrowed in-place operands.
+    /// Named borrowed type the parent may root-export: [`LabG1Witness`].
+    #[cfg(feature = "lab")]
+    pub fn set_lab_g1_observer(
+        &mut self,
+        observer: Option<Arc<LabG1Observer>>,
+    ) -> Option<Arc<LabG1Observer>> {
+        std::mem::replace(&mut self.lab_g1_observer, observer)
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn lab_g1_observer_active(&self) -> bool {
+        self.lab_g1_observer.is_some()
+    }
+
+    /// Notify the installed G1 observer of one actual launch boundary.
+    /// The witness borrows; the observer must download synchronously and
+    /// retain nothing. Any observer error fails the launch closed.
+    #[cfg(feature = "lab")]
+    pub fn lab_observe_g1(&self, witness: LabG1Witness<'_>) -> HipResult<()> {
+        if let Some(observer) = &self.lab_g1_observer {
+            observer(self, &witness)?;
+        }
+        Ok(())
+    }
+
+    /// LAB-only opaque grouped SymIU4 carve (`cfg(lab)` only): explicit
+    /// opt-in with a bounded reset/begin/end lifetime. `reset` clears and
+    /// disarms. `begin` arms an empty window of capacity [`LAB_FN_CARVE_CAP`].
+    /// `end` drains the owned records plus the overflow count and disarms;
+    /// `None` is the absent/non-pass export (no actual launch observed) with
+    /// ordinary success untouched. `None` by default so production installs
+    /// no hook and the launch path is byte-identical.
+    #[cfg(feature = "lab")]
+    pub fn lab_fn_reset(&mut self) {
+        self.lab_fn_carve = None;
+    }
+
+    /// Arm an empty collection window.
+    #[cfg(feature = "lab")]
+    pub fn lab_fn_begin(&mut self) {
+        self.lab_fn_carve = Some((Vec::new(), 0));
+    }
+
+    /// Drain the window and disarm. `None` when disarmed or armed-but-empty
+    /// (absent/non-pass). Consumes the window.
+    #[cfg(feature = "lab")]
+    pub fn lab_fn_end(&mut self) -> Option<(Vec<LabFnRecord>, LabFnOverflow)> {
+        Self::lab_fn_split(self.lab_fn_carve.take()?)
+    }
+
+    /// Real production drain helper: split an armed window's owned records +
+    /// overflow count into the export pair. `None` = absent/non-pass (empty
+    /// and no overflow); otherwise the launch list plus the overflow marker
+    /// (incomplete/non-pass when nonzero). `end` and the tests both call
+    /// this — no mirrored logic.
+    #[cfg(any(feature = "lab", test))]
+    pub(crate) fn lab_fn_split(
+        window: (Vec<LabFnRecord>, usize),
+    ) -> Option<(Vec<LabFnRecord>, LabFnOverflow)> {
+        let (records, overflowed) = window;
+        if records.is_empty() && overflowed == 0 {
+            return None;
+        }
+        Some((records, LabFnOverflow(overflowed)))
+    }
+
+    /// Whether a collection window is currently armed.
+    #[cfg(feature = "lab")]
+    pub(crate) fn lab_fn_armed(&self) -> bool {
+        self.lab_fn_carve.is_some()
+    }
+
+    /// Record one actual grouped launch (owned data only). Called only after
+    /// the grouped symbol launched successfully; resolves the loaded owner
+    /// via the existing identity proofs. Not collected when disarmed.
+    /// Any identity error fails the launch closed. Beyond
+    /// [`LAB_FN_CARVE_CAP`] the collector only marks the window
+    /// incomplete/non-pass and stops collecting: the successful launch still
+    /// returns `Ok`, quality execution is unchanged.
+    #[cfg(feature = "lab")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lab_note_fn(
+        &mut self,
+        symbol: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        width: usize,
+        down: bool,
+        grouped_rows: usize,
+        n_experts: usize,
+        total_slots: usize,
+        source_rows: usize,
+        host_mapped: bool,
+        bf16_round_trip: bool,
+        chunk_rows: usize,
+    ) -> HipResult<()> {
+        if self.lab_fn_carve.is_none() {
+            return Ok(());
+        }
+        let (module, container) = self.lab_kernel_identity(symbol)?;
+        let (_, _, device) = self.lab_kernel_device_identity(symbol)?;
+        let Some((records, overflowed)) = self.lab_fn_carve.as_mut() else {
+            return Ok(());
+        };
+        if records.len() >= LAB_FN_CARVE_CAP {
+            *overflowed += 1;
+            return Ok(());
+        }
+        records.push(LabFnRecord {
+            symbol: symbol.to_string(),
+            grid,
+            block,
+            width,
+            down,
+            grouped_rows,
+            n_experts,
+            total_slots,
+            source_rows,
+            module,
+            container_sha256: container,
+            device_sha256: device,
+            host_mapped,
+            bf16_round_trip,
+            chunk_rows,
+        });
+        Ok(())
+    }
+
+    /// Install/replace the active stage seal; returns the previous seal.
+    /// The dispatch pipeline refreshes it before observed legacy stages.
+    /// `None` clears the binding.
+    #[cfg(feature = "lab")]
+    pub fn set_lab_g1_window(&mut self, seal: Option<LabG1WindowSeal>) -> Option<LabG1WindowSeal> {
+        std::mem::replace(&mut self.lab_g1_window, seal)
+    }
+    /// Current G1 window seal, if the pipeline bound one (`#[cfg(lab)]` only).
+    /// Launch-site borrows read this; the oracle fails closed when `None`.
+    #[cfg(feature = "lab")]
+    pub fn lab_g1_window(&self) -> Option<LabG1WindowSeal> {
+        self.lab_g1_window
+    }
+
+    /// Arm after the transaction snapshot. N means N successful submissions
+    /// followed by one failure, not N repeated failures. Caller owns this Gpu
+    /// exclusively until disarming, and must disarm before rollback/restoration.
+    #[cfg(feature = "lab")]
+    pub fn lab_arm_kernel_fault_after(&mut self, successful_launches: usize) -> HipResult<()> {
+        self.lab_kernel_fault.arm(successful_launches)
+    }
+
+    #[cfg(feature = "lab")]
+    pub fn lab_disarm_kernel_fault(&mut self) -> LabKernelFaultReceipt {
+        self.lab_kernel_fault.disarm()
+    }
+
+    /// Allocate the strict kernel-timing event pool outside the measured
+    /// window. Errors when a pool is already held so a prepared pool is never
+    /// silently dropped (event-destroy errors would be unobservable under Drop).
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_prepare_kernel_timing(&mut self, capacity: usize) -> HipResult<()> {
+        if self.kernel_timing_pool.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing pool already prepared",
+            ));
+        }
+        self.kernel_timing_pool = Some(self.hip.kernel_timing_pool(capacity)?);
+        Ok(())
+    }
+
+    /// Activate collection on the prepared pool. Refuses an ACTIVE replay
+    /// recording, G0 observation or graph capture — a merely prepared retained
+    /// AR is fine — then latches the replay observation for the finish check.
+    /// Slice C rejects native enqueue while the scope is live.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_begin_kernel_timing(&mut self) -> HipResult<()> {
+        if self.replay.is_recording() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing refused: replay recording is active",
+            ));
+        }
+        if self.replay.is_g0_observing() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing refused: G0 observation is active",
+            ));
+        }
+        if self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing refused: graph capture is active",
+            ));
+        }
+        let pool = self.kernel_timing_pool.as_mut().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "kernel timing begin without a prepared pool")
+        })?;
+        pool.begin()?;
+        self.kernel_timing_replay_baseline = self.replay.replay_observation();
+        Ok(())
+    }
+
+    /// Detach collection and publish the strict report. Any drift of the replay
+    /// observation since begin (actual native work entered the claim) cancels
+    /// the scope and errors instead of reporting. On error the poisoned pool
+    /// stays held; `lab_close_kernel_timing` still applies and its error must
+    /// reach publication before any claim is made.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_finish_kernel_timing(&mut self) -> HipResult<hip_bridge::KernelTimingReport> {
+        let pool = self.kernel_timing_pool.as_mut().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "kernel timing finish without a prepared pool")
+        })?;
+        if self.replay.replay_observation() != self.kernel_timing_replay_baseline {
+            let _ = pool.cancel();
+            return Err(hip_bridge::HipError::new(
+                0,
+                "kernel timing invalidated: replay observation changed during scope",
+            ));
+        }
+        pool.finish()
+    }
+
+    /// Cancel and drain on a host forward error. The pool is permanently
+    /// poisoned (see `KernelTimingPool::cancel`); close and re-prepare before
+    /// any new scope. Safe with no pool held.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_cancel_kernel_timing(&mut self) -> HipResult<()> {
+        match self.kernel_timing_pool.as_mut() {
+            Some(pool) => pool.cancel(),
+            None => Ok(()),
+        }
+    }
+
+    /// Destroy all timing events. Consumes the held pool; destroy errors
+    /// propagate here because `Drop` alone cannot report them. Call before
+    /// publishing a strict timing claim. Idempotent: `Ok` when no pool held.
+    #[cfg(feature = "kernel-timing")]
+    pub fn lab_close_kernel_timing(&mut self) -> HipResult<()> {
+        match self.kernel_timing_pool.take() {
+            Some(pool) => pool.close(),
+            None => Ok(()),
+        }
+    }
+
     /// Every kernel name currently loaded on this device, sorted.
     ///
     /// Diagnostic only: a retained-capture census uses it to name the kernels a
@@ -2225,6 +2825,22 @@ impl Gpu {
             router_fault: None,
             active_stream: None,
             last_kernel: None,
+            #[cfg(feature = "lab")]
+            lab_kernel_fault: LabKernelFaultCountdown::default(),
+            #[cfg(feature = "lab")]
+            lab_projection_observer: None,
+            #[cfg(feature = "lab")]
+            lab_launch_observer: None,
+            #[cfg(feature = "lab")]
+            lab_g1_observer: None,
+            #[cfg(feature = "lab")]
+            lab_fn_carve: None,
+            #[cfg(feature = "lab")]
+            lab_g1_window: None,
+            #[cfg(feature = "kernel-timing")]
+            kernel_timing_pool: None,
+            #[cfg(feature = "kernel-timing")]
+            kernel_timing_replay_baseline: crate::replay::ReplayObservation::default(),
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -2358,6 +2974,7 @@ impl Gpu {
             lane_rows_scope: false,
             prefill_invariant_scope: false,
             wide_verify_rows: 0,
+            qwen4_verify_reference: None,
             emu,
             qwen4_append_f16_moe_scope: false,
         })
@@ -3476,6 +4093,10 @@ impl Gpu {
                 self.replay.rearm_after_layout_growth();
             }
         }
+        #[cfg(feature = "lab")]
+        self.lab_kernel_fault
+            .before_launch()
+            .map_err(|e| e.with_kernel(func_name))?;
         let result: HipResult<()> = if record
             || observe
             || self.graphs.capture_mode
@@ -3551,6 +4172,12 @@ impl Gpu {
             }
         };
         if result.is_ok() {
+            #[cfg(feature = "lab")]
+            if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
+                return Err(e.with_kernel(func_name));
+            }
+            #[cfg(feature = "lab")]
+            self.lab_kernel_fault.launched_successfully();
             self.last_kernel = Some(func_name.to_string());
         }
         result.map_err(|e| e.with_kernel(func_name))
@@ -3695,11 +4322,19 @@ impl Gpu {
                 &format!("launch_kernel_blob: function '{func_name}' not loaded"),
             )
         })?;
-        unsafe {
+        #[cfg(feature = "lab")]
+        self.lab_kernel_fault
+            .before_launch()
+            .map_err(|e| e.with_kernel(func_name))?;
+        let result = unsafe {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
+        };
+        #[cfg(feature = "lab")]
+        if result.is_ok() {
+            self.lab_kernel_fault.launched_successfully();
         }
-        .map_err(|e| e.with_kernel(func_name))
+        result.map_err(|e| e.with_kernel(func_name))
     }
     /// Occupancy probe for a pre-loaded kernel by name (oracle metadata gate).
     pub fn occupancy_max_active_blocks(
@@ -3764,6 +4399,10 @@ impl Gpu {
                 &[],
             );
         }
+        #[cfg(feature = "lab")]
+        self.lab_kernel_fault
+            .before_launch()
+            .map_err(|e| e.with_kernel(func_name))?;
         let result = if self.graphs.capture_mode {
             // Retain the exact bytes for graph instantiation: HIP records the
             // blob pointer, so graph-owned storage must outlive the capture.
@@ -3809,6 +4448,12 @@ impl Gpu {
             }
         };
         if result.is_ok() {
+            #[cfg(feature = "lab")]
+            if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
+                return Err(e.with_kernel(func_name));
+            }
+            #[cfg(feature = "lab")]
+            self.lab_kernel_fault.launched_successfully();
             self.last_kernel = Some(func_name.to_string());
         }
         result.map_err(|e| e.with_kernel(func_name))
@@ -3824,6 +4469,90 @@ impl Gpu {
             ));
         }
         Ok(())
+    }
+
+    /// Actual loaded module and SHA-256 of its admitted object for a lab oracle.
+    /// Refuse unloaded/unbound symbols rather than substituting a source hash,
+    /// an expected embedded pin, or a module-name heuristic.
+    pub fn lab_kernel_identity(&self, symbol: &str) -> HipResult<(String, String)> {
+        let (module, artifact) = self.loaded_owner(symbol)?;
+        Ok((module, artifact.id().to_hex()))
+    }
+
+    /// Actual loaded module, container SHA-256 and per-arch raw device
+    /// SHA-256 of its admitted object (`#[cfg(lab)]`-only). Reuses the exact
+    /// loaded-symbol/Arc-owner proof of [`Self::lab_kernel_identity`] so
+    /// ownership cannot differ; the container return is byte-identical to the
+    /// frozen getter. The device digest is the SHA-256 of the `arch` ELF
+    /// extracted from the admitted bytes (cached per artifact/arch); a
+    /// refused extraction is a typed error, never the container fallback.
+    #[cfg(feature = "lab")]
+    pub fn lab_kernel_device_identity(&self, symbol: &str) -> HipResult<(String, String, String)> {
+        let (module, artifact) = self.loaded_owner(symbol)?;
+        let device = artifact.device_id(&self.arch).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("kernel device identity: symbol {symbol:?} has no decodable device image"),
+            )
+        })?;
+        Ok((module, artifact.id().to_hex(), device.to_hex()))
+    }
+    /// Borrowed raw device bytes of the actually loaded symbol's admitted
+    /// object (`#[cfg(lab)]`-only). Same [`Self::loaded_owner`] Arc-owner
+    /// proof as the identity getters, then the `arch` ELF slice of the
+    /// borrowed admitted payload via the existing
+    /// `scratch::device_code_object` decoder — no container bytes, no
+    /// model/weight read or copy, no fresh decode beyond that helper.
+    /// The slice borrows the admitted artifact retained by `self`'s registry;
+    /// the borrow prevents a load from mutating that owner while it is live.
+    #[cfg(feature = "lab")]
+    pub fn lab_kernel_device_bytes(&self, symbol: &str) -> HipResult<&[u8]> {
+        let (_, artifact) = self.loaded_owner(symbol)?;
+        let image = artifact.image().as_bytes();
+        crate::scratch::device_code_object(image, &self.arch).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("kernel device bytes: symbol {symbol:?} has no decodable device image"),
+            )
+        })
+    }
+
+    /// Shared loaded-symbol/Arc-owner proof, borrowing the registry's owner.
+    fn loaded_owner(
+        &self,
+        symbol: &str,
+    ) -> HipResult<(String, &crate::code_object::RecordedArtifact)> {
+        if !self.functions.contains_key(symbol) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("kernel identity: symbol {symbol:?} is not loaded"),
+            ));
+        }
+        let registry = self.compiler.code_objects();
+        let artifact = registry.function(symbol).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("kernel identity: loaded symbol {symbol:?} has no object binding"),
+            )
+        })?;
+        // Function bindings retain the exact Arc admitted for their module,
+        // including HIP cache loads. Equal digests alone cannot name an owner:
+        // two separately loaded modules may contain identical object bytes.
+        let module = self
+            .modules
+            .keys()
+            .find(|name| {
+                registry
+                    .module(name)
+                    .is_some_and(|bound| Arc::ptr_eq(bound, artifact))
+            })
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("kernel identity: symbol {symbol:?} has no loaded owner module"),
+                )
+            })?;
+        Ok((module.clone(), artifact))
     }
 
     /// Compile and load a kernel, caching the result. A pending planned route
@@ -8703,6 +9432,17 @@ impl Gpu {
     }
 }
 
+/// Borrowed `arch` device ELF of an explicitly supplied code image
+/// (`#[cfg(lab)]`-only, neutral, no model/weight read). Wraps the existing
+/// `scratch::device_code_object` decoder so lab oracles can pin an explicit
+/// external `--reference-*-co` file by its ACTUAL raw device SHA instead of
+/// a module label, container proxy, or expected digest. Returns `None`
+/// exactly when the helper refuses (compressed/missing/ambiguous/malformed).
+#[cfg(feature = "lab")]
+pub fn lab_extract_device_bytes<'a>(image: &'a [u8], arch: &str) -> Option<&'a [u8]> {
+    crate::scratch::device_code_object(image, arch)
+}
+
 impl Drop for Gpu {
     /// Defensive: bind owning device before any future per-field `Drop`
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
@@ -9055,7 +9795,115 @@ mod slowlink_host_lease_tests {
 }
 
 #[cfg(test)]
+mod lab_fn_carve_tests {
+    use super::{Gpu, LabFnOverflow, LabFnRecord};
+
+    fn record(symbol: &str) -> LabFnRecord {
+        LabFnRecord {
+            symbol: symbol.to_string(),
+            grid: [1, 2, 1],
+            block: [128, 1, 1],
+            width: 1280,
+            down: false,
+            grouped_rows: 16,
+            n_experts: 8,
+            total_slots: 80,
+            source_rows: 8,
+            module: "mod".to_string(),
+            container_sha256: "c".to_string(),
+            device_sha256: "d".to_string(),
+            host_mapped: false,
+            bf16_round_trip: true,
+            chunk_rows: 8,
+        }
+    }
+
+    #[test]
+    fn success_record_drains_with_full_geometry_and_provenance() {
+        let out = Gpu::lab_fn_split((vec![record("gate_up"), record("down")], 0))
+            .expect("success drains");
+        assert_eq!(out.1, LabFnOverflow(0));
+        assert_eq!(out.0.len(), 2);
+        assert_eq!(out.0[0].width, 1280);
+        assert_eq!(out.0[0].total_slots, 80);
+        assert_eq!(out.0[0].source_rows, 8);
+        assert_eq!(out.0[0].n_experts, 8);
+        assert_eq!(out.0[0].module, "mod");
+    }
+
+    #[test]
+    fn empty_window_is_omitted_absent_nonpass() {
+        assert!(Gpu::lab_fn_split((Vec::new(), 0)).is_none());
+    }
+
+    #[test]
+    fn overflow_marks_incomplete_and_keeps_collected_prefix() {
+        let (kept, overflow) =
+            Gpu::lab_fn_split((vec![record("gate_up")], 3)).expect("overflow drains");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(overflow, LabFnOverflow(3));
+        assert!(overflow.0 != 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_kernel_fault_counts_successes_then_fails_once_and_disarms() {
+        let fault = super::LabKernelFaultCountdown::default();
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert_eq!(fault.disarm(), super::LabKernelFaultReceipt::default());
+        fault.arm(2).unwrap();
+        fault.before_launch().unwrap();
+        // A failed HIP submission does not call launched_successfully.
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert!(fault.before_launch().is_err());
+        // One-shot: repair launches cannot see a second failure.
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert_eq!(
+            fault.disarm(),
+            super::LabKernelFaultReceipt {
+                successful_launches: 2,
+                injected: true,
+            }
+        );
+        assert_eq!(fault.disarm(), super::LabKernelFaultReceipt::default());
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_kernel_fault_disarm_cancels_pending_failure() {
+        let fault = super::LabKernelFaultCountdown::default();
+        assert!(fault.arm(usize::MAX).is_err());
+        fault.arm(1).unwrap();
+        assert!(fault.arm(1).is_err());
+        fault.before_launch().unwrap();
+        fault.launched_successfully();
+        assert_eq!(
+            fault.disarm(),
+            super::LabKernelFaultReceipt {
+                successful_launches: 1,
+                injected: false,
+            }
+        );
+        fault.before_launch().unwrap();
+        fault.arm(0).unwrap();
+        assert!(fault.before_launch().is_err());
+        assert_eq!(
+            fault.disarm(),
+            super::LabKernelFaultReceipt {
+                successful_launches: 0,
+                injected: true,
+            }
+        );
+    }
+
     const QSA_MIB: usize = 1 << 20;
 
     fn qsa_verdict(

@@ -236,7 +236,7 @@
 //! (default and minimum 128) IDs and checks, from the per-window records,
 //! that at least one request shows calibration (drafted 0, accepted 0,
 //! `mtp_windows` 0 -> 1, one position) -> the source's
-//! `MTP_FLOOR_PROBE_WINDOWS` probe windows -> `mtp_retired` false -> true ->
+//! `FLOOR_PROBE_WINDOWS` probe windows -> `mtp_retired` false -> true ->
 //! a later target-only window (`ar_windows` +1, still retired) that emitted at
 //! index >= 31. The pilot is coverage, not statistics. If the fixture does
 //! not retire, declare a longer `HIPFIRE_SAMPLED_MTP_LATE_TOKENS` or commit a
@@ -1880,23 +1880,10 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The `MTP_FLOOR_PROBE_WINDOWS` the binary under test was built with, read
-/// from the embedded `mtp_spec.rs` source rather than copied here.
+/// The `FLOOR_PROBE_WINDOWS` the binary under test was built with: the shared
+/// economics module's constant, not a copy.
 fn floor_probe_budget() -> Result<usize, String> {
-    const SOURCE: &str = include_str!("../src/mtp_spec.rs");
-    let line = SOURCE
-        .lines()
-        .find(|line| {
-            line.trim_start()
-                .starts_with("const MTP_FLOOR_PROBE_WINDOWS: usize")
-        })
-        .ok_or("MTP_FLOOR_PROBE_WINDOWS is not declared in mtp_spec.rs")?;
-    line.split('=')
-        .nth(1)
-        .map(|value| value.trim().trim_end_matches(';').trim())
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|budget| *budget > 0)
-        .ok_or_else(|| format!("cannot read the probe budget from {line:?}"))
+    Ok(hipfire_runtime::spec_economics::FLOOR_PROBE_WINDOWS)
 }
 
 /// What a window did to the request's counters.

@@ -52,23 +52,28 @@
 //! plain VALU. Every VOPD pair is validated by `vopd::validate_pair` while
 //! the kernel is built.
 //!
-//! Wide twins (`build_wide_gfx1151`, module `wide`): `gemv_mq6g256v2_xbatch_wide_r{16,32}_pm`
-//! and `gemv_mq6g256v2_x4_xbatch_wide_r{16,32}_pm`, appended to the module after
-//! every narrow export (the narrow exports above are unchanged). They keep the
-//! narrow ABIs byte for byte (36 B `A@0 x@8 y@16 M@24 K@28 R@32`; 96 B x4 with
-//! `R@92`), but `R` is the actual row count `1..=cap` (any other value returns
-//! before the first barrier and stores nothing). Grid `ceil(M/8)` /
-//! `sum ceil(Mi/8)`, block 256 (eight wave32, `cu_mode = false`), static LDS
-//! 8192 B. Wave `v` owns matrix-local output column `8*(w - base) + v` for all
-//! `R` rows: it loads/dequantizes its weight group once, keeps it in VGPRs for
-//! every 8-row X tile of the group and never reloads it inside the row tiles.
-//! X is staged through LDS in 8-row x K256 tiles with two uniform workgroup
-//! barriers per tile; waves past `M` still produce X and run every barrier and
-//! skip only the weights, arithmetic and stores. The per-(row, column)
-//! arithmetic is exactly the DAG above (term order x1 mul, x0, x2..x7; a
-//! separate stream add; `(a0+a1)+(a3+a2)`; swizzle-16 then bpermute 8/4/2/1,
-//! own + other); only the schedule differs. See `wide` for the register
-//! ceilings (128 / 192 VGPRs) and the checked high-water arithmetic.
+//! Historical r16/r32 wide twins (`gemv_mq6g256v2[_x4]_xbatch_wide_r{16,32}_pm`,
+//! `build_wide_gfx1151`/`wide::SYMBOLS`) were removed; the runtime/registry is
+//! t8-only. The fixed-eight `build_rowtiles_*` twins below are the sole wide
+//! path. Narrow exports above are unchanged.
+//!
+//! `build_rowtiles_gfx1151` emits single/x4 `_rows_t8_pm_gfx1151` twins with
+//! the same 36/96-byte ABI, interpreting R as total rows in 1..=64. Grid y
+//! selects an independent eight-row tile; block256/LDS8192 and the Halo DAG
+//! stay fixed. Only eight rows' four streams are retained (72 VGPR high-water,
+//! budget96), irrespective of total R. X/Y bases advance by `8*grid_y*K/M`,
+//! preserving full matrix strides.
+//!
+//! `build_rowtiles_gfx1100` is a separate singleton-derived recipe: its dot
+//! uses `x,w` operands (Halo uses `w,x`). The source-pinned scalar and x4
+//! objects in `row-exact-wide/xtx-singleton-reference/mq6-{scalar,x4}.co`
+//! decode the same dual-half headers and use the same stream fold/tree.
+//! Reference SHA256s: scalar
+//! `8fcbc20aabfb6afffb37eeb8408ee027b68b345be5a988ae60520ec1efcb958e`,
+//! x4 `d22b31fad623cb825b6993d2139b66a78165ad2769d3c1685a3c05eabde9dc7c`.
+//! Scalar dot PCs 0x1970/0x198c and x4 0x2bd8/0x2bf4 fix operand order;
+//! folds are at 0x20a8/0x20bc and 0x3310/0x3324 respectively. Emitting these
+//! twins is not a gfx1100 product-admission or byte/performance certificate.
 use super::common::smem_off;
 use crate::insn::{Instruction, MemoryClass};
 use crate::plan::Access;
@@ -1185,54 +1190,29 @@ fn branch(b: &mut Builder, text: &str) -> Result<(), String> {
     b.control(Instruction::new(text, vec![], vec![]))
 }
 
-/// The wide exports, appended after every narrow export: single r16, single
-/// r32, x4 r16, x4 r32 (`wide::SYMBOLS` order).
-pub fn build_wide_gfx1151() -> Result<Vec<Emitted>, String> {
-    let mut out = Vec::new();
-    for x4 in [false, true] {
-        for cap in wide::CAPS {
-            out.push(wide::emit(wide::Spec { x4, cap })?);
-        }
-    }
-    Ok(out)
+/// Single then x4, fixed-eight physical row tiles, total logical R in 1..=64.
+pub fn build_rowtiles_gfx1151() -> Result<Vec<Emitted>, String> {
+    [false, true]
+        .into_iter()
+        .map(|x4| wide::emit_rowtiles(x4))
+        .collect()
 }
 
-/// Row-exact wide verify twins of the MQ6G256V2 lane-step GEMV (design
-/// `WideTwinGemvSol.md` section 2.2). Symbols
-/// `gemv_mq6g256v2_xbatch_wide_r{16,32}_pm` and
-/// `gemv_mq6g256v2_x4_xbatch_wide_r{16,32}_pm`, exact gfx1151 only.
-///
-/// Geometry: grid `ceil(M/8)` (x4: `sum_i ceil(max(Mi,0)/8)`, workgroup `w`
-/// routed to the first matrix `i` with `w < P0+..+Pi`, never spanning two),
-/// block 256 (wave `v = tid >> 5`), static LDS 8192 B (8 rows x 256 K x 4 B),
-/// `cu_mode = false`. Wave `v` owns matrix-LOCAL column `m = 8*(w - base_i) +
-/// v` for every row `r < R` (`R` in `1..=cap`; anything else exits uniformly
-/// before the first barrier): `4*cap` accumulators (4 streams per row) stay in
-/// its VGPRs for the whole K sweep.
-///
-/// Schedule per K group `g` (ascending, unrolled by four so the stream
-/// `g % 4` is a compile-time register choice): each valid wave loads and
-/// dequantizes its 200-byte group ONCE (`v_fma_mix_f32` weights, q5 word
-/// boundary as narrow); then for row tiles `rb = 0, 8, 16, 24` (`rb < R`):
-/// producer wave `v` loads X row `rb + v` (`g*256 + 8*lane + j`, two b128
-/// loads) and stores the unchanged f32 bits to LDS word `(v*8 + j)*32 + lane`;
-/// uniform barrier; every valid wave consumes the tile's rows (LDS reads, the
-/// 8-term chain x1 mul, x0, x2..x7 with the weights held in registers, then
-/// `a_s = a_s + d`); uniform barrier before the tile is overwritten. There is
-/// no weight load inside the row loop. Waves with `m >= M_i` produce X and
-/// execute every barrier and skip the weight loads, arithmetic and stores;
-/// they leave only after the last barrier. Every barrier decision depends on
-/// `R`, `K` and the workgroup id alone. Rows `>= R` are never loaded,
-/// consumed or stored (their accumulators stay +0 and are folded along).
-///
-/// Epilogue per row: `(a0 + a1) + (a3 + a2)`, `ds_swizzle` offset 16
-/// (`"1pppp"`) then `ds_bpermute` +8/+4/+2/+1 (own lane when out of range),
-/// `own + other` each level, lane 0 stores `y[r*M + m]`.
-///
-/// Register ceilings (rejected above the budget and above 256, checked in
-/// `usize`): VGPR `ACC0 + 4*cap` = 104 of 128 (r16) / 168 of 192 (r32); SGPR 60
-/// of 80. The LDS address VGPRs are derived in the entry block from the
-/// work-item id and never redefined (`pm_check::lds_bounds` evaluates them).
+/// gfx1100 scalar/x4 singleton-derived twins, with activation-first products.
+/// The launch ABI and fixed8 schedule match Halo; the arithmetic recipe does not.
+pub fn build_rowtiles_gfx1100() -> Result<Vec<Emitted>, String> {
+    [false, true]
+        .into_iter()
+        .map(|x4| wide::emit_rowtiles_for_arch(x4, Arch::Gfx1100))
+        .collect()
+}
+
+/// Historical r16/r32 wide verify twins (`gemv_mq6g256v2[_x4]_xbatch_wide_r{16,32}_pm`,
+/// design `WideTwinGemvSol.md` §2.2) were removed with their `CAPS`/`SYMBOLS`, the
+/// `cap`-parameterized accumulator schedule and the legacy builder/tests. The fixed-eight
+/// `wide` schedule below is the shared t8 row-tile path only (grid y selects one
+/// eight-row tile, total R in 1..=64); the per-(row, column) arithmetic, LDS staging
+/// and barrier discipline are unchanged.
 pub mod wide {
     use super::{branch, valu, vmem, GROUP, TERMS};
     use crate::insn::{Instruction, MemoryClass};
@@ -1245,8 +1225,7 @@ pub mod wide {
 
     type R = Result<(), String>;
 
-    /// Compiled row capacities.
-    pub const CAPS: [u8; 2] = [16, 32];
+    /// Fixed-eight physical row tile (total logical R in 1..=64); `cap` is frozen at 8.
     /// Output columns (waves) per workgroup.
     pub const M_BLOCK: u32 = 8;
     /// Threads per workgroup.
@@ -1256,47 +1235,26 @@ pub mod wide {
     /// Kernarg bytes of the single and x4 exports (the narrow ABIs).
     pub const SINGLE_KERNARG_BYTES: u32 = 36;
     pub const X4_KERNARG_BYTES: u32 = 96;
-    /// The four exports in `build_wide_gfx1151` order.
-    pub const SYMBOLS: [&str; 4] = [
-        "gemv_mq6g256v2_xbatch_wide_r16_pm",
-        "gemv_mq6g256v2_xbatch_wide_r32_pm",
-        "gemv_mq6g256v2_x4_xbatch_wide_r16_pm",
-        "gemv_mq6g256v2_x4_xbatch_wide_r32_pm",
-    ];
 
-    /// One wide export: single or x4, row capacity `cap` (16 or 32).
+    /// One fixed-eight row-tile export: single or x4.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Spec {
         pub x4: bool,
-        pub cap: u8,
     }
     impl Spec {
-        pub fn symbol(&self) -> String {
-            format!(
-                "gemv_mq6g256v2_{}xbatch_wide_r{}_pm",
-                if self.x4 { "x4_" } else { "" },
-                self.cap
-            )
+        /// Physical tile rows; total logical rows live in the `R` kernarg.
+        pub const fn cap(&self) -> u8 {
+            8
         }
-        pub fn validate(&self) -> R {
-            if !CAPS.contains(&self.cap) {
-                return Err(format!("mq6 wide capacity {} is not 16 or 32", self.cap));
-            }
-            Ok(())
-        }
-        /// Declared VGPR budget (design ceilings).
+        /// Declared VGPR budget (fixed-eight design ceiling).
         pub fn vgpr_budget(&self) -> u16 {
-            if self.cap == 16 {
-                128
-            } else {
-                192
-            }
+            96
         }
         fn tiles(&self) -> u32 {
-            u32::from(self.cap) / 8
+            1
         }
         fn tag(&self) -> String {
-            format!("mq6{}w{}", if self.x4 { "x4" } else { "" }, self.cap)
+            format!("mq6{}t8", if self.x4 { "x4" } else { "" })
         }
     }
 
@@ -1338,6 +1296,9 @@ pub mod wide {
     const STMP: u8 = 51;
     const SVAL: u8 = 52;
     const R0B: u8 = 53;
+    /// Rowtile-only system workgroup id y and its logical row origin.
+    const TILE_Y: u8 = 3;
+    const TILE_ROW: u8 = 54;
     /// `XT[t] = (8t + wave) * K * 4`: byte offset of tile `t`'s producer row.
     const XT: u8 = 56;
     const SGPR_BUDGET: u16 = 80;
@@ -1382,14 +1343,13 @@ pub mod wide {
     }
     /// The high-water marks must fit the budgets and the architectural limits.
     fn layout(spec: Spec) -> R {
-        let hw = vgpr_high_water(spec.cap);
+        let hw = vgpr_high_water(spec.cap());
         if hw > 256 {
-            return Err(format!("mq6 wide r{} needs {hw} VGPRs (> 256)", spec.cap));
+            return Err(format!("mq6 rowtile needs {hw} VGPRs (> 256)"));
         }
         if hw > usize::from(spec.vgpr_budget()) {
             return Err(format!(
-                "mq6 wide r{} needs {hw} VGPRs (> budget {})",
-                spec.cap,
+                "mq6 rowtile needs {hw} VGPRs (> budget {})",
                 spec.vgpr_budget()
             ));
         }
@@ -1416,13 +1376,15 @@ pub mod wide {
         }
     }
 
-    fn plan(spec: Spec) -> Result<RegPlan, String> {
+    fn plan_impl(spec: Spec) -> Result<RegPlan, String> {
         layout(spec)?;
         let mut regs = RegPlan::new(spec.vgpr_budget(), SGPR_BUDGET)?;
         let mut s_ranges: Vec<(&str, u8, u8)> = vec![
             ("kernarg", KARG, 2),
             ("workgroup_id", SW, 1),
             ("weight_resource", SRD, 4),
+            ("workgroup_id_y", TILE_Y, 1),
+            ("tile_row", TILE_ROW, 1),
         ];
         if spec.x4 {
             s_ranges.extend([
@@ -1483,7 +1445,7 @@ pub mod wide {
         ] {
             regs.add_range(name, Kind::V, base, len, Live::Whole)?;
         }
-        for block in 0..(4 * usize::from(spec.cap) / 8) {
+        for block in 0..(4 * usize::from(spec.cap()) / 8) {
             let base = u8::try_from(usize::from(ACC0) + 8 * block)
                 .map_err(|_| "accumulator block past v255".to_string())?;
             regs.add_range(&format!("acc_block{block}"), Kind::V, base, 8, Live::Whole)?;
@@ -1491,9 +1453,22 @@ pub mod wide {
         Ok(regs)
     }
 
-    pub fn emit(spec: Spec) -> Result<Emitted, String> {
-        spec.validate()?;
-        let (variant, kernargs) = if spec.x4 {
+    pub(super) fn emit_rowtiles(x4: bool) -> Result<Emitted, String> {
+        emit_rowtiles_for_arch(x4, Arch::Gfx1151)
+    }
+
+    pub(super) fn emit_rowtiles_for_arch(x4: bool, arch: Arch) -> Result<Emitted, String> {
+        if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1100) {
+            return Err(format!(
+                "mq6 rowtiles lack a singleton recipe for {}",
+                arch.name()
+            ));
+        }
+        emit_impl(Spec { x4 }, arch)
+    }
+
+    fn emit_impl(spec: Spec, arch: Arch) -> Result<Emitted, String> {
+        let kernargs = if spec.x4 {
             let mut k = KernargLayout::new(X4_KERNARG_BYTES);
             for (i, name) in ["A0", "A1", "A2", "A3"].into_iter().enumerate() {
                 k = k.pointer_access(name, 8 * i as u32, Access::ReadOnly);
@@ -1505,42 +1480,41 @@ pub mod wide {
             for (i, name) in ["M0", "M1", "M2", "M3"].into_iter().enumerate() {
                 k = k.hidden(name, 72 + 4 * i as u32, 4, "by_value");
             }
-            (
-                format!("x4_xbatch_wide_r{}_m8w8", spec.cap),
-                k.hidden("K", 88, 4, "by_value")
-                    .hidden("R", 92, 4, "by_value"),
-            )
+            k.hidden("K", 88, 4, "by_value")
+                .hidden("R", 92, 4, "by_value")
         } else {
-            (
-                format!("xbatch_wide_r{}_m8w8", spec.cap),
-                KernargLayout::new(SINGLE_KERNARG_BYTES)
-                    .pointer_access("A", 0, Access::ReadOnly)
-                    .pointer_access("x", 8, Access::ReadOnly)
-                    .pointer_access("y", 16, Access::WriteOnly)
-                    .hidden("M", 24, 4, "by_value")
-                    .hidden("K", 28, 4, "by_value")
-                    .hidden("R", 32, 4, "by_value"),
-            )
+            KernargLayout::new(SINGLE_KERNARG_BYTES)
+                .pointer_access("A", 0, Access::ReadOnly)
+                .pointer_access("x", 8, Access::ReadOnly)
+                .pointer_access("y", 16, Access::WriteOnly)
+                .hidden("M", 24, 4, "by_value")
+                .hidden("K", 28, 4, "by_value")
+                .hidden("R", 32, 4, "by_value")
         };
         let kspec = KernelSpec {
             kernel_id: "qwen4_lane_rows_mq6".into(),
-            variant,
-            arch: Arch::Gfx1151,
-            symbol: spec.symbol(),
+            variant: format!("{}rows_t8_m8w8", if spec.x4 { "x4_" } else { "" }),
+            arch,
+            symbol: format!(
+                "gemv_mq6g256v2_rows_{}t8_pm_{}",
+                if spec.x4 { "x4_" } else { "" },
+                arch.name()
+            ),
             kernargs,
             user_sgpr_count: 2,
-            system_sgpr_workgroup_id_y: false,
+            system_sgpr_workgroup_id_y: true,
             workgroup_size: BLOCK,
             group_segment_fixed_size: LDS_BYTES,
             wave32: true,
             cu_mode: false,
         };
-        let mut b = Builder::new(kspec, plan(spec)?);
+        let regs = plan_impl(spec)?;
+        let mut b = Builder::new(kspec, regs);
         b.enable_delay_alu();
         let slot = b.lds_slot("x_tile", 0, LDS_BYTES)?;
         prologue(&mut b, spec)?;
-        // Zero the 4*cap accumulators (+0, as the incumbent's streams).
-        for row in 0..u32::from(spec.cap) {
+        // Zero the 4*8 accumulators (+0, as the incumbent's streams).
+        for row in 0..u32::from(spec.cap()) {
             for st in 0..4 {
                 valu(
                     &mut b,
@@ -1565,7 +1539,7 @@ pub mod wide {
                     )?;
                     branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "fold")))?;
                 }
-                group(b, spec, slot, st)?;
+                group(b, spec, slot, st, arch == Arch::Gfx1100)?;
                 sop(b, format!("s_add_i32 s{GI}, s{GI}, 1"), &[GI], &[GI])?;
             }
             sop(
@@ -1688,18 +1662,75 @@ pub mod wide {
         } else {
             blocks(b, CP3, None, SM)?;
         }
-        // Workgroups past the sum return; so does an R outside 1..=cap (all
+        // Workgroups past the sum return; so does an R outside 1..=64 (all
         // uniform, before the first barrier).
         sop(b, format!("s_cmp_ge_u32 s{SW}, s{CP3}"), &[], &[SW, CP3])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
         sop(b, format!("s_cmp_eq_u32 s{SR}, 0"), &[], &[SR])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
-        sop(b, format!("s_cmp_gt_u32 s{SR}, {}", spec.cap), &[], &[SR])?;
+        sop(b, format!("s_cmp_gt_u32 s{SR}, 64"), &[], &[SR])?;
         branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
         if spec.x4 {
             route(b)?;
         } else {
             sop(b, format!("s_mov_b32 s{SBASE}, 0"), &[SBASE], &[])?;
+        }
+        sop(b, format!("s_cmp_le_i32 s{SK}, 0"), &[], &[SK])?;
+        branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
+        sop(
+            b,
+            format!("s_and_b32 s{TMP}, s{SK}, {}", lit(255)),
+            &[TMP],
+            &[SK],
+        )?;
+        sop(b, format!("s_cmp_lg_u32 s{TMP}, 0"), &[], &[TMP])?;
+        branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
+        sop(b, format!("s_cmp_ge_u32 s{TILE_Y}, 8"), &[], &[TILE_Y])?;
+        branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
+        // Uniformly reject dead grid-y tiles before any barrier. Convert
+        // total R to this tile's live count; all body guards stay local.
+        sop(
+            b,
+            format!("s_lshl_b32 s{TILE_ROW}, s{TILE_Y}, 3"),
+            &[TILE_ROW],
+            &[TILE_Y],
+        )?;
+        sop(
+            b,
+            format!("s_cmp_ge_u32 s{TILE_ROW}, s{SR}"),
+            &[],
+            &[TILE_ROW, SR],
+        )?;
+        branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
+        sop(
+            b,
+            format!("s_sub_u32 s{SR}, s{SR}, s{TILE_ROW}"),
+            &[SR],
+            &[SR, TILE_ROW],
+        )?;
+        sop(b, format!("s_min_u32 s{SR}, s{SR}, 8"), &[SR], &[SR])?;
+        // Extents obey the existing checked 32-bit byte-offset contract.
+        // Rebase only after x4 routing has selected its matrix-local M/Y.
+        for (pointer, stride) in [(XP, SK), (SY, SM)] {
+            sop(
+                b,
+                format!("s_mul_i32 s{TMP}, s{TILE_ROW}, s{stride}"),
+                &[TMP],
+                &[TILE_ROW, stride],
+            )?;
+            sop(b, format!("s_lshl_b32 s{TMP}, s{TMP}, 2"), &[TMP], &[TMP])?;
+            sop(
+                b,
+                format!("s_add_u32 s{pointer}, s{pointer}, s{TMP}"),
+                &[pointer],
+                &[pointer, TMP],
+            )?;
+            sop(
+                b,
+                format!("s_addc_u32 s{}, s{}, 0", pointer + 1, pointer + 1),
+                &[pointer + 1],
+                &[pointer + 1],
+            )?;
         }
         // This wave's matrix-local column m = 8*(w - base) + wave, and whether it exists.
         sop(
@@ -1891,7 +1922,7 @@ pub mod wide {
     }
 
     /// One K group with the compile-time stream `st` (`g % 4`).
-    fn group(b: &mut Builder, spec: Spec, slot: usize, st: u32) -> R {
+    fn group(b: &mut Builder, spec: Spec, slot: usize, st: u32, x_first: bool) -> R {
         sop(
             b,
             format!("s_mul_i32 s{GOFF}, s{GI}, {}", lit(GROUP)),
@@ -1922,7 +1953,7 @@ pub mod wide {
         dequant(b)?;
         b.label(&wdone)?;
         for t in 0..spec.tiles() {
-            tile(b, spec, slot, st, t)?;
+            tile(b, spec, slot, st, t, x_first)?;
         }
         Ok(())
     }
@@ -2052,7 +2083,7 @@ pub mod wide {
     }
 
     /// Row tile `t` (rows `8t..8t+7`) of one group: fill, barrier, consume, barrier.
-    fn tile(b: &mut Builder, spec: Spec, slot: usize, st: u32, t: u32) -> R {
+    fn tile(b: &mut Builder, spec: Spec, slot: usize, st: u32, t: u32, x_first: bool) -> R {
         let rb = 8 * t;
         let done = glbl(spec, st, t, "tile_done");
         // The whole tile is past R: skipped by every wave of the workgroup.
@@ -2115,16 +2146,23 @@ pub mod wide {
                 sop(b, format!("s_cmp_le_u32 s{SR}, {}", rb + r), &[], &[SR])?;
                 branch(b, &format!("s_cbranch_scc1 {cdone}"))?;
             }
-            consume_row(b, slot, st, rb + r, 1024 * r)?;
+            consume_row(b, slot, st, rb + r, 1024 * r, x_first)?;
         }
         b.label(&cdone)?;
         b.barrier(&[Transition::Retire(slot)])?;
         b.label(&done)
     }
 
-    /// One row's group dot (x1 mul, then x0, x2..x7 `v_fmac`, multiplicand order
-    /// `w, x`) and its separate stream add.
-    fn consume_row(b: &mut Builder, slot: usize, st: u32, row: u32, row_off: u32) -> R {
+    /// One row's group dot (x1 mul, then x0, x2..x7 `v_fmac`) and its
+    /// separate stream add. Halo's operands are `w,x`, gfx1100's are `x,w`.
+    fn consume_row(
+        b: &mut Builder,
+        slot: usize,
+        st: u32,
+        row: u32,
+        row_off: u32,
+        x_first: bool,
+    ) -> R {
         for n in TERMS {
             let x = XS + n;
             b.ds_load(
@@ -2142,20 +2180,21 @@ pub mod wide {
         }
         for (term, n) in TERMS.into_iter().enumerate() {
             let (w, x) = (WS + n, XS + n);
+            let (lhs, rhs) = if x_first { (x, w) } else { (w, x) };
             if term == 0 {
                 valu(
                     b,
-                    &format!("v_mul_f32_e32 v{DOT}, v{w}, v{x}"),
+                    &format!("v_mul_f32_e32 v{DOT}, v{lhs}, v{rhs}"),
                     &[DOT],
-                    &[w, x],
+                    &[lhs, rhs],
                     &[],
                 )?;
             } else {
                 valu(
                     b,
-                    &format!("v_fmac_f32_e32 v{DOT}, v{w}, v{x}"),
+                    &format!("v_fmac_f32_e32 v{DOT}, v{lhs}, v{rhs}"),
                     &[DOT],
-                    &[DOT, w, x],
+                    &[DOT, lhs, rhs],
                     &[],
                 )?;
             }
@@ -2171,9 +2210,11 @@ pub mod wide {
     }
 
     fn epilogue(b: &mut Builder, spec: Spec) -> R {
-        let cap = u32::from(spec.cap);
+        let cap = u32::from(spec.cap());
         // Fold (a0 + a1) + (a3 + a2) for every row (rows >= R fold zeros).
         for r in 0..cap {
+            sop(b, format!("s_cmp_le_u32 s{SR}, {r}"), &[], &[SR])?;
+            branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "fold_done")))?;
             for (l, h) in [(0, 1), (3, 2), (0, 3)] {
                 let (d, x) = (acc(r, l), acc(r, h));
                 valu(
@@ -2185,9 +2226,14 @@ pub mod wide {
                 )?;
             }
         }
-        // 16/8/4/2/1 own+other tree, 16 rows at a time on the dead x/temp VGPRs.
-        for batch in 0..cap.div_ceil(16) {
-            let rows: Vec<u32> = (16 * batch..cap.min(16 * batch + 16)).collect();
+        b.label(&lbl(spec, "fold_done"))?;
+        // The tile path guards each row before any floating-point reduction;
+        // inactive tail rows perform no arithmetic, loads or stores.
+        // 16/8/4/2/1 own+other tree, one row at a time on the dead x/temp VGPRs.
+        for batch in 0..cap {
+            let rows = [batch];
+            sop(b, format!("s_cmp_le_u32 s{SR}, {batch}"), &[], &[SR])?;
+            branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "reduce_done")))?;
             let tmp = |i: usize| XS + i as u8;
             for (i, &r) in rows.iter().enumerate() {
                 let (val, t) = (acc(r, 0), tmp(i));
@@ -2258,7 +2304,8 @@ pub mod wide {
                 }
             }
         }
-        // Lane 0 stores y[r*M + m] for every r < R (16 address VGPRs per batch).
+        b.label(&lbl(spec, "reduce_done"))?;
+        // Lane 0 stores y[r*M + m] for every r < R (one address VGPR per batch).
         valu(
             b,
             &format!("v_cmpx_eq_u32_e32 0, v{LANE}"),
@@ -2267,8 +2314,10 @@ pub mod wide {
             &[],
         )?;
         let ys = [SY, SY + 1];
-        for batch in 0..cap.div_ceil(16) {
-            let rows: Vec<u32> = (16 * batch..cap.min(16 * batch + 16)).collect();
+        for batch in 0..cap {
+            let rows = [batch];
+            sop(b, format!("s_cmp_le_u32 s{SR}, {batch}"), &[], &[SR])?;
+            branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
             for (i, &r) in rows.iter().enumerate() {
                 sop(b, format!("s_mul_i32 s{STMP}, s{MB}, {r}"), &[STMP], &[MB])?;
                 sop(
@@ -2305,13 +2354,8 @@ pub mod wide {
             }
             b.label(&bdone)?;
             b.wait_all()?;
-            if 16 * (batch + 1) < cap {
-                sop(
-                    b,
-                    format!("s_cmp_le_u32 s{SR}, {}", 16 * (batch + 1)),
-                    &[],
-                    &[SR],
-                )?;
+            if batch + 1 < cap {
+                sop(b, format!("s_cmp_le_u32 s{SR}, {}", batch + 1), &[], &[SR])?;
                 branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "end")))?;
             }
         }
@@ -2323,24 +2367,208 @@ pub mod wide {
         use super::*;
 
         #[test]
-        fn register_ceilings_hold_in_wide_arithmetic() {
-            assert_eq!(vgpr_high_water(16), 104);
-            assert_eq!(vgpr_high_water(32), 168);
-            for cap in CAPS {
-                let spec = Spec { x4: false, cap };
+        fn rowtiles_keep_fixed_resources_and_halo_operand_order() {
+            assert_eq!(vgpr_high_water(8), 72);
+            for x4 in [false, true] {
+                plan_impl(Spec { x4 }).expect("fixed8 plan");
+                let e = emit_rowtiles(x4).expect("rowtile emission");
+                let symbol = format!(
+                    "gemv_mq6g256v2_rows_{}t8_pm_gfx1151",
+                    if x4 { "x4_" } else { "" }
+                );
+                for text in [
+                    format!("{symbol}:"),
+                    ".amdhsa_system_sgpr_workgroup_id_y 1".into(),
+                    ".amdhsa_group_segment_fixed_size 8192".into(),
+                    format!("s_cmp_gt_u32 s{SR}, 64"),
+                    format!("s_lshl_b32 s{TILE_ROW}, s{TILE_Y}, 3"),
+                    format!("s_sub_u32 s{SR}, s{SR}, s{TILE_ROW}"),
+                    format!("s_min_u32 s{SR}, s{SR}, 8"),
+                    format!("v_mul_f32_e32 v{DOT}, v{}, v{}", WS + 1, XS + 1),
+                    format!("v_fmac_f32_e32 v{DOT}, v{WS}, v{XS}"),
+                    "v_add_f32_e32 v40, v40, v41".into(),
+                    "v_add_f32_e32 v43, v43, v42".into(),
+                    "v_add_f32_e32 v40, v40, v43".into(),
+                ] {
+                    assert!(e.s_text.contains(&text), "{symbol}: missing {text}");
+                }
+                let before_barrier = e.s_text.split("s_barrier").next().unwrap();
+                for guard in [
+                    format!("s_cmp_eq_u32 s{SR}, 0"),
+                    format!("s_cmp_gt_u32 s{SR}, 64"),
+                    format!("s_cmp_ge_u32 s{TILE_Y}, 8"),
+                    format!("s_cmp_ge_u32 s{TILE_ROW}, s{SR}"),
+                    format!("s_and_b32 s{TMP}, s{SK}, {}", lit(255)),
+                ] {
+                    assert!(before_barrier.contains(&guard), "{symbol}: {guard}");
+                }
+                let declared_vgprs = e
+                    .s_text
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix(".amdhsa_next_free_vgpr "))
+                    .unwrap()
+                    .parse::<u16>()
+                    .unwrap();
+                assert!(declared_vgprs <= 96);
+                assert_eq!(e.proof.lds_slots.len(), 1);
+                assert!(!e.s_text.contains("scratch_"));
+                let row_load = if x4 {
+                    format!("s_load_b128 s[{M2}:{SR}], s[0:1], 0x50")
+                } else {
+                    format!("s_load_b32 s{SR}, s[0:1], 0x20")
+                };
+                assert!(e.s_text.contains(&row_load), "{symbol}: total-R ABI");
+            }
+        }
+
+        #[test]
+        fn gfx1100_rowtiles_pin_the_actual_singleton_operand_dag() {
+            let emitted = super::super::build_rowtiles_gfx1100().expect("gfx1100 rowtiles");
+            assert_eq!(emitted.len(), 2);
+            for (e, x4) in emitted.iter().zip([false, true]) {
+                let symbol = format!(
+                    "gemv_mq6g256v2_rows_{}t8_pm_gfx1100",
+                    if x4 { "x4_" } else { "" }
+                );
+                assert_eq!(e.proof.arch, Arch::Gfx1100);
+                assert_eq!(e.shape.next_free_vgpr, 72);
+                assert!(e.shape.next_free_sgpr <= SGPR_BUDGET);
+                for text in [
+                    format!("{symbol}:"),
+                    ".amdhsa_system_sgpr_workgroup_id_y 1".into(),
+                    ".amdhsa_group_segment_fixed_size 8192".into(),
+                    format!(".kernarg_segment_size: {}", if x4 { 96 } else { 36 }),
+                    format!("s_cmp_gt_u32 s{SR}, 64"),
+                    format!("s_min_u32 s{SR}, s{SR}, 8"),
+                    format!("v_mul_f32_e32 v{DOT}, v{}, v{}", XS + 1, WS + 1),
+                    format!("v_fmac_f32_e32 v{DOT}, v{XS}, v{WS}"),
+                    format!("v_fma_mix_f32 v{WS}, v{HDR}, v{WS}, v{HDR} op_sel:[0,0,1] op_sel_hi:[1,0,1]"),
+                    "v_add_f32_e32 v40, v40, v41".into(),
+                    "v_add_f32_e32 v43, v43, v42".into(),
+                    "v_add_f32_e32 v40, v40, v43".into(),
+                ] {
+                    assert!(e.s_text.contains(&text), "{symbol}: {text}");
+                }
+                for n in [0, 2, 3, 4, 5, 6, 7] {
+                    assert!(
+                        e.s_text.contains(&format!(
+                            "v_fmac_f32_e32 v{DOT}, v{}, v{}",
+                            XS + n,
+                            WS + n
+                        )),
+                        "{symbol}: singleton term {n}"
+                    );
+                }
+                assert!(
+                    !e.s_text
+                        .contains(&format!("v_mul_f32_e32 v{DOT}, v{}, v{}", WS + 1, XS + 1)),
+                    "{symbol}: Halo product must not leak into gfx1100"
+                );
+            }
+            assert!(emit_rowtiles_for_arch(false, Arch::Gfx1201).is_err());
+        }
+
+        #[test]
+        fn rowtile_single_and_x4_addressing_covers_every_live_word_once() {
+            // Independent integer oracle for rebase + local-row addressing,
+            // including empty matrices, every output-wave tail, and R tails.
+            for rows in 1u32..=64 {
+                for m in 1u32..=17 {
+                    let ms = [m, 0, m + 1, 3];
+                    let mut seen: Vec<Vec<u8>> =
+                        ms.iter().map(|&n| vec![0; (rows * n) as usize]).collect();
+                    let ends = ms.map(|n| n.div_ceil(8));
+                    for tile in 0..rows.div_ceil(8) {
+                        let first = 8 * tile;
+                        let live = (rows - first).min(8);
+                        for wg in 0..ends.iter().sum::<u32>() {
+                            let mut base = 0;
+                            let matrix = (0..4)
+                                .find(|&i| {
+                                    if wg < base + ends[i] {
+                                        true
+                                    } else {
+                                        base += ends[i];
+                                        false
+                                    }
+                                })
+                                .unwrap();
+                            for wave in 0..8 {
+                                let column = 8 * (wg - base) + wave;
+                                if column >= ms[matrix] {
+                                    continue;
+                                }
+                                for local in 0..live {
+                                    let y = first * ms[matrix] + local * ms[matrix] + column;
+                                    assert_eq!(y, (first + local) * ms[matrix] + column);
+                                    seen[matrix][y as usize] += 1;
+                                    for k in [256, 768, 1024, 1792] {
+                                        let x = first * k + local * k;
+                                        assert_eq!(x, (first + local) * k);
+                                        assert!(x + k <= rows * k);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert!(seen.iter().flatten().all(|&count| count == 1));
+                }
+            }
+        }
+
+        #[cfg(feature = "toolchain")]
+        #[test]
+        fn rowtiles_lds_bounds_and_m7() {
+            let dir = std::env::temp_dir().join(format!(
+                "peacemaker-isa-mq6-rowtiles-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (arch, x4) in [Arch::Gfx1151, Arch::Gfx1100]
+                .into_iter()
+                .flat_map(|arch| [false, true].map(|x4| (arch, x4)))
+            {
+                let e = emit_rowtiles_for_arch(x4, arch).expect("rowtiles");
+                let symbol = format!(
+                    "gemv_mq6g256v2_rows_{}t8_pm_{}",
+                    if x4 { "x4_" } else { "" },
+                    arch.name()
+                );
+                assert_eq!(
+                    crate::pm_check::lds_bounds(
+                        &e.s_text,
+                        &symbol,
+                        u32::from(BLOCK) / 32,
+                        LDS_BYTES
+                    )
+                    .expect("LDS bounds"),
+                    LDS_BYTES
+                );
+                let elf = crate::native::assemble(&e.s_text, arch).expect("native assemble");
+                let co = dir.join(format!("{symbol}.test.co"));
+                std::fs::write(&co, elf).unwrap();
+                let report = crate::pm_check::m7(&co, arch.name(), &symbol).expect("M7");
+                assert_eq!(report["obligations"], serde_json::json!({}), "{report}");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn register_ceilings_hold_in_rowtile_arithmetic() {
+            assert_eq!(vgpr_high_water(8), 72);
+            for x4 in [false, true] {
+                let spec = Spec { x4 };
                 layout(spec).expect("fits");
-                assert!(vgpr_high_water(cap) <= usize::from(spec.vgpr_budget()));
+                assert!(vgpr_high_water(8) <= usize::from(spec.vgpr_budget()));
                 // The last accumulator is addressable as u8 and the plan accepts the layout.
                 assert_eq!(
-                    usize::from(acc(u32::from(cap) - 1, 3)) + 1,
-                    vgpr_high_water(cap)
+                    usize::from(acc(u32::from(spec.cap()) - 1, 3)) + 1,
+                    vgpr_high_water(spec.cap())
                 );
-                plan(spec).expect("plan");
+                plan_impl(spec).expect("plan");
             }
             assert!(sgpr_high_water() <= usize::from(SGPR_BUDGET));
-            // A capacity past the ceilings is refused, never wrapped.
-            assert!(Spec { x4: false, cap: 64 }.validate().is_err());
-            assert!(vgpr_high_water(64) > usize::from(u8::MAX));
+            assert_eq!(usize::from(vgpr_high_water(8)), 72);
             // LDS address registers, weights, X slots, temps and accumulators are disjoint.
             assert_eq!(usize::from(TS) + 8, usize::from(ACC0));
             assert_eq!(usize::from(XS) + 16, usize::from(ACC0));
@@ -2348,77 +2576,19 @@ pub mod wide {
             assert!(PKB < WS);
         }
 
+        /// Historical r16/r32 wide exports were removed; the t8 row-tile path above
+        /// is the sole wide path. This pins the negative absence in emitted text.
         #[test]
-        fn builds_four_wide_exports_in_contract_order() {
-            let emitted = super::super::build_wide_gfx1151().expect("mq6 wide");
-            assert_eq!(emitted.len(), 4);
-            for (e, symbol) in emitted.iter().zip(SYMBOLS) {
-                assert!(e.s_text.contains(&format!("{symbol}:")), "{symbol}");
-                assert!(
-                    e.s_text.contains("ds_swizzle_b32") && e.s_text.contains("ds_bpermute_b32"),
-                    "{symbol}"
-                );
-                assert!(
-                    e.s_text.contains("v_fma_mix_f32")
-                        && e.s_text.contains("ds_store_b32")
-                        && e.s_text.contains("ds_load_b32"),
-                    "{symbol}"
-                );
-                assert!(e.s_text.contains("s_barrier"), "{symbol}");
-                assert!(
-                    !e.s_text.contains("v_dual_")
-                        && !e.s_text.contains("ttmp")
-                        && !e.s_text.contains("s_wait_alu"),
-                    "{symbol}"
-                );
-            }
-            assert_eq!(
-                [(false, 16), (false, 32), (true, 16), (true, 32)].map(|(x4, cap)| Spec {
-                    x4,
-                    cap
-                }
-                .symbol()),
-                SYMBOLS.map(String::from)
-            );
-            // The narrow exports are a separate builder, untouched by the wide one.
-            assert_eq!(super::super::build_gfx1151().expect("narrow").len(), 2);
-        }
-
-        #[cfg(feature = "toolchain")]
-        #[test]
-        fn wide_lds_bounds_and_m7() {
-            let dir = std::env::temp_dir().join(format!(
-                "peacemaker-isa-lane-rows-mq6-wide-{}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            for (emitted, symbol) in super::super::build_wide_gfx1151()
-                .expect("mq6 wide")
+        fn legacy_wide_exports_are_absent() {
+            for e in super::super::build_rowtiles_gfx1151()
+                .expect("mq6 rowtiles")
                 .into_iter()
-                .zip(SYMBOLS)
+                .chain(super::super::build_rowtiles_gfx1100().expect("gfx1100 rowtiles"))
             {
-                let end = crate::pm_check::lds_bounds(
-                    &emitted.s_text,
-                    symbol,
-                    u32::from(BLOCK) / 32,
-                    LDS_BYTES,
-                )
-                .expect("LDS bounds");
-                assert_eq!(end, LDS_BYTES, "{symbol}");
-                let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1151)
-                    .expect("native assemble");
-                std::fs::write(dir.join(format!("{symbol}.test.s")), &emitted.s_text).unwrap();
-                let co = dir.join(format!("{symbol}.test.co"));
-                std::fs::write(&co, &elf).unwrap();
-                let report = crate::pm_check::m7(&co, "gfx1151", symbol).expect("M7");
-                println!("{symbol}: {report}");
-                assert_eq!(
-                    report["obligations"],
-                    serde_json::json!({}),
-                    "{symbol}: {report}"
-                );
+                assert!(!e.s_text.contains("xbatch_wide_r16"));
+                assert!(!e.s_text.contains("xbatch_wide_r32"));
             }
-            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(super::super::build_gfx1151().expect("narrow").len(), 2);
         }
     }
 }

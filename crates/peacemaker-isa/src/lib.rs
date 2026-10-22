@@ -52,6 +52,9 @@ pub mod kernels {
     pub mod iu4_v2b;
     pub mod iu4_v2b_a4;
     pub mod iu4_v2c;
+    pub mod lane_rows_bf16_gfx1201;
+    pub mod lane_rows_mq6_gfx1201;
+    pub mod legacy_mq4_rowtiles;
     pub mod moe_rotate_i4_pm;
     pub mod moe_slot_ops;
     pub mod mq4_fp8_verify;
@@ -61,6 +64,7 @@ pub mod kernels {
     pub mod mq_i4_moe_gemv;
     pub mod mq_i4_moe_gemv_c1;
     pub mod mq_i4_moe_gemv_cn;
+    pub mod mq_i4_moe_gemv_gfx1100;
     pub mod mq_i4_rows;
     pub mod mtp_dense_det_gfx11;
     pub mod mtp_q8_det_gfx11;
@@ -74,12 +78,14 @@ pub mod kernels {
     pub mod qsa_topk;
     /// Shared HC epilogue emission helpers of the BF16 wide k4 entries.
     pub mod qwen4_bf16_hc_epilogue;
-    /// gfx1151 BF16 exact wide verify GEMV, ordinary x4 and k4 HC entries: `gemv_bf16_xf32_x4_rows_wide_r{16,32}_pm_gfx1151`, k4 HC twins.
+    pub mod qwen4_bf16_rows_gfx1100;
+    /// BF16 singleton-DAG verify twins: fixed eight-row physical tiles, logical rows 1..64, ordinary x4 and k4 HC entries.
     pub mod qwen4_bf16_rows_wide;
     pub mod qwen4_ep_owner_assign_pm;
     pub mod qwen4_lane_rows;
     pub mod qwen4_lane_rows_mq6;
     pub mod qwen4_lane_rows_q8;
+    pub mod qwen4_lane_rows_q8_gfx1100;
     pub mod qwen4_moe_sym;
     /// gfx11 (gfx1100, gfx1151) NT1 grouped symmetric IU4 MoE GEMMs; the E8P-I4 module is the gfx1151 Halo port (`--kernel qwen4_moe_sym_gfx11_e8p`).
     #[allow(dead_code, unused_imports)]
@@ -90,6 +96,7 @@ pub mod kernels {
     pub mod qwen4_mq6_x4_gfx11;
     pub mod qwen4_mq6_x4_gfx11_hcw;
     pub mod qwen4_shared_gu_gfx11;
+    pub mod qwen4_slab_union_plan;
     pub mod spec_accept_pm;
     pub mod spec_sampling_rows_pm;
     /// gfx942 (CDNA3) kernels built with `crate::cdna::builder`.
@@ -144,6 +151,7 @@ pub struct Builder {
     current_label: String,
     lds_access_allowed: bool,
     previous_wmma_dst: Vec<reg::RegRef>,
+    workgroup_id_z: bool,
     pending_barrier: Option<Vec<Transition>>,
     /// Driven by `peacemaker_author::Workgroup`: LDS, barriers, branches and
     /// loops go through the typed core (`author`), and the untyped entry
@@ -205,6 +213,7 @@ impl Builder {
             labels: vec!["entry".into()],
             current_label: "entry".into(),
             lds_access_allowed: false,
+            workgroup_id_z: false,
             previous_wmma_dst: vec![],
             pending_barrier: None,
             seal: Default::default(),
@@ -224,6 +233,16 @@ impl Builder {
     /// `hazard::DelayAlu`). Opt-in, so existing kernels keep their bytes.
     pub fn enable_delay_alu(&mut self) {
         self.delay_alu = Some(DelayAlu::default())
+    }
+    /// Enable the descriptor's workgroup Z input without changing instructions.
+    ///
+    /// On gfx11 it follows the enabled X/Y system SGPRs: with two user
+    /// SGPRs and Y enabled, Z is `s4`. Declare that live input in the register
+    /// plan. On gfx1201 Z is the upper 16 bits of `ttmp7`, not an ordinary
+    /// SGPR. The emitter must extract it and mask Y to the lower 16 bits.
+    /// Disabled by default so existing kernel images retain their bytes.
+    pub fn enable_workgroup_id_z(&mut self) {
+        self.workgroup_id_z = true;
     }
     pub fn label(&mut self, name: &str) -> Result<(), String> {
         if self.exits.iter().any(|e| e == name) {
@@ -832,17 +851,25 @@ impl Builder {
             );
         }
         self.regs.verify_lifetimes(&self.labels)?;
+        let next_free_sgpr =
+            emit::sgpr_high_water(&self.spec, &self.regs, &self.program, self.workgroup_id_z);
         if self.regs.next_free_vgpr() > self.regs.vgpr_budget
-            || self.regs.next_free_sgpr() > self.regs.sgpr_budget
+            || next_free_sgpr > self.regs.sgpr_budget
         {
             return Err("register plan exceeds budget".into());
         }
-        let text = emit::assembly(&self.spec, &self.regs, &self.program)?;
+        let text = emit::assembly_with_workgroup_id_z(
+            &self.spec,
+            &self.regs,
+            &self.program,
+            self.workgroup_id_z,
+            next_free_sgpr,
+        )?;
         let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
         let mut shape = IsaShape {
             instructions: self.program.instructions.len(),
             next_free_vgpr: self.regs.next_free_vgpr(),
-            next_free_sgpr: self.regs.next_free_sgpr(),
+            next_free_sgpr,
             waits: self.waits.len() + self.hazards.len(),
             barriers: self.barriers.len(),
             ..Default::default()
@@ -875,6 +902,7 @@ impl Builder {
             reg_plan: self.regs.ranges,
             next_free_vgpr: shape.next_free_vgpr,
             next_free_sgpr: shape.next_free_sgpr,
+            system_sgpr_workgroup_id_z: self.workgroup_id_z,
             waits: self.waits,
             hazards: self.hazards,
             clauses: self.clauses,

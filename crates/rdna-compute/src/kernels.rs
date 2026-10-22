@@ -4430,23 +4430,18 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
-/// Certified builder module of the gfx1151 Flash-Next lane-step row kernels
-/// (`peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151`, M7
-/// obligation-free): four multi-column (1..=8 activation columns) GEMVs that
-/// keep every column byte-identical to the 1-row HIP incumbent while sharing
-/// the activation loads across weight rows: `gemv_mq6g256v2_xbatch_pm`,
-/// `gemv_mq6g256v2_x4_xbatch_pm`, `gemv_q8_0_k8_xbatch_pm` and
-/// `gemv_q8_0_k320_xbatch_pm` (`crate::lane_rows_pm`). Routed from the four
-/// incumbent rows launchers only inside the lane step (typed flag
-/// `fn_lane_pm_rows`, gfx1151 default on, `0` kills it).
-/// SHA-256 pin: [`QWEN4_LANE_ROWS_PM_GFX1151_SHA256`]
-/// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
+/// gfx1151 Flash-Next lane-row module: four unchanged narrow exports followed
+/// by two MQ6 and five Q8 fixed-eight-row-tile exports. Tiled entries accept
+/// total rows 1..=64; image availability does not certify product admission.
+/// Generate with `peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151`.
+/// Proof and linked-object M7 receipts must cover every export.
+/// SHA-256 pin: [`QWEN4_LANE_ROWS_PM_GFX1151_SHA256`].
 pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco");
-/// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
-/// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
+/// Bare lowercase SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], generated alongside
+/// the bundle (exactly 64 bytes, without a newline).
 pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
-    "8ea2cac1b40aae940b26da08348d28db6f2fb67cc4797aeda6347499303be945";
+    include_str!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco.sha256");
 /// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
 /// `crates/peacemaker-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
 /// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
@@ -4460,35 +4455,70 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
 /// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
-/// Certified builder modules of the few-row MQ4G256V2 projection kernels (`peacemaker-isa
-/// emit --kernel mq4_rows_x4 --arch gfx{1151,1201}`), each module three exports:
-/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (MTP verify, 2..=8 activation rows; grid
-/// `[sum(ceil(M_i/2)), 1, 1]`, block 32) and the row-exact wide twins
-/// `gemv_mq4g256v2_rows_x4_wide_r{16,32}_pm_gfx{1151,1201}` (rows 1..=16 / 1..=32; grid
-/// `[sum(ceil(M_i/8)), 1, 1]`, block 256, static LDS 8192, one output column per wave).
-/// All three take the same 96-byte kernarg (A0..A3, x, y0..y3, M0..M3, K, B/R) and give
-/// every output bitwise the AR decode GEMV `gemv_mq4g256v2` on that activation row. Default
-/// on (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
-/// SHA-256 286c86739400f69859ea22c32a9c1e0df2f0569f610ca833085ddd18d2f4ffc7
-/// (`sha256sum kernels/mq4_rows_x4_pm_gfx1151.hxaco`).
+/// MQ4 projection modules: unchanged paired-output narrow entry plus its
+/// fixed-eight-row-tile twin `gemv_mq4g256v2_rows_x4_t8_pm_<arch>`.
+/// Both use the 96-byte x4 ABI; tiled R@92 is total rows 1..=64.
+/// Tiled grid is `[sum ceil(Mi/2), ceil(R/8), 1]`, block32, LDS0.
+/// Image generation/certification is separate from byte/state/cost admission.
 pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of [`MQ4_ROWS_X4_PM_GFX1151`], without a newline.
+pub const MQ4_ROWS_X4_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco.sha256");
 /// The gfx1201 image of [`MQ4_ROWS_X4_PM_GFX1151`].
-/// SHA-256 d73f1431721d52b0610fa82a64b0042c2daae944fcc4b30e3669ff05c5bb1306
-/// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
 pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
-/// gfx1151 BF16 row-exact wide GEMV builders: ordinary x4 and HC k4, each at
-/// capacities 16/32 (runtime R). Ordinary: ABI96, grid sum ceil(Mi/8), LDS8192;
-/// HC: ABI48, grid ceil(M/2), LDS16384. All use block256, wave32 and WGP mode.
-/// The HC epilogue preserves the decode object's scalar fold/scale and full
-/// exp/divide instruction DAG. Hardware byte/state admission is a separate gate.
-/// Emitter/proof/shape/decode receipts: `kernels/bf16_rows_wide_pm_gfx1151.*`.
+/// Bare lowercase SHA-256 of [`MQ4_ROWS_X4_PM_GFX1201`], without a newline.
+pub const MQ4_ROWS_X4_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco.sha256");
+/// gfx1151 BF16 fixed-eight-row-tile GEMVs: ordinary x4 (ABI96) and HC k4
+/// (logical44/segment48). Grid y is ceil(total rows/8), for total rows 1..=64.
+/// Each entry preserves its architecture's singleton arithmetic, including
+/// HC quarter folds, scale and the full exp/divide expansion.
+/// Hardware byte/state/cost admission is a separate gate.
 pub const BF16_ROWS_WIDE_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/bf16_rows_wide_pm_gfx1151.hxaco");
-/// SHA-256 of [`BF16_ROWS_WIDE_PM_GFX1151`], checked before image admission.
+/// Bare lowercase SHA-256 of [`BF16_ROWS_WIDE_PM_GFX1151`], without a newline.
 pub const QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256: &str =
-    "f1d14ba22190a6be4e85bc5905ed240d31395c51f7a3d9583d21fb09e55a4122";
+    include_str!("../../../kernels/bf16_rows_wide_pm_gfx1151.hxaco.sha256");
+/// gfx1201 MQ6 singleton/narrow exports plus single/x4 fixed-eight-row tiles.
+/// Rowtile ABI36/96, block256, LDS8192; grid x uses eight output owners and
+/// grid y is ceil(total rows/8). No other architecture's object is reused.
+pub const LANE_ROWS_MQ6_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/lane_rows_mq6_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`LANE_ROWS_MQ6_PM_GFX1201`], without a newline.
+pub const LANE_ROWS_MQ6_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/lane_rows_mq6_pm_gfx1201.hxaco.sha256");
+/// gfx1201 BF16 singleton/narrow exports plus ordinary/HC fixed-eight-row
+/// tiles. Initial S1 uses block32/LDS0 (ordinary), block128/LDS128 (HC).
+/// Logical rows are 1..=64; arbitrary-K scalar tails retain singleton order.
+pub const LANE_ROWS_BF16_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/lane_rows_bf16_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`LANE_ROWS_BF16_PM_GFX1201`], without a newline.
+pub const LANE_ROWS_BF16_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/lane_rows_bf16_pm_gfx1201.hxaco.sha256");
+/// Genuine gfx1100 MQ6/Q8 fixed-eight-row-tile module. Each family is derived
+/// from its gfx1100 singleton object; unsupported shape recipes refuse rather
+/// than substituting another architecture's arithmetic.
+pub const QWEN4_LANE_ROWS_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1100`], without a newline.
+pub const QWEN4_LANE_ROWS_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/qwen4_lane_rows_pm_gfx1100.hxaco.sha256");
+/// Genuine gfx1100 BF16 x4 (ABI96) and HC k4 (logical44/segment48)
+/// row tiles. HC retains the actual singleton's VALU epilogue, not Halo SALU.
+pub const BF16_ROWS_WIDE_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/bf16_rows_wide_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`BF16_ROWS_WIDE_PM_GFX1100`], without a newline.
+pub const BF16_ROWS_WIDE_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/bf16_rows_wide_pm_gfx1100.hxaco.sha256");
+/// Genuine gfx1100 scalar-singleton-derived MQ4 x4 row tile (ABI96).
+/// This architecture's tile-only image introduces no new narrow recipe.
+pub const MQ4_ROWS_X4_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of [`MQ4_ROWS_X4_PM_GFX1100`], without a newline.
+pub const MQ4_ROWS_X4_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/mq4_rows_x4_pm_gfx1100.hxaco.sha256");
 /// Certified builder module of gfx1151's fused Flash-Next shared-expert gate/up
 /// (`peacemaker-isa emit --kernel qwen4_shared_gu_gfx11 --epi all --arch gfx1151`, M7
 /// obligation-free): one launch of `qwen4_shared_gu_pm_gfx1151_{w8,w4}` replaces the
@@ -4613,25 +4643,43 @@ pub fn qwen4_moe_scatter_stable_top10_gfx1100_src() -> &'static str {
 /// fixed-capacity per-codec-bucket K1 descriptors, no host readback.
 pub const QWEN4_SLAB_UNION_PLAN_SRC: &str =
     include_str!("../../../kernels/src/qwen4_slab_union_plan.hip");
+/// Fixed-eight-row-union PM planners. Each workgroup writes a complete
+/// 482-word/1928-byte descriptor with absolute slot IDs. ABI logical36,
+/// segment40; grid `[ceil(rows/8),1,1]`, block128, LDS1280; rows 1..=64.
+pub const QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_slab_union_plan_t8_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of the gfx1151 tiled planner image.
+pub const QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/qwen4_slab_union_plan_t8_pm_gfx1151.hxaco.sha256");
+/// Genuine gfx1201 planner image; not a retagged gfx1151 object.
+pub const QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_slab_union_plan_t8_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of the gfx1201 tiled planner image.
+pub const QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/qwen4_slab_union_plan_t8_pm_gfx1201.hxaco.sha256");
+/// Genuine gfx1100 planner image; availability does not widen codec admission.
+pub const QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/qwen4_slab_union_plan_t8_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of the gfx1100 tiled planner image.
+pub const QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/qwen4_slab_union_plan_t8_pm_gfx1100.hxaco.sha256");
 /// Sealed expert-slab K2 codec tile mask on gfx1151 (hipcc twin of the gfx1201
 /// builder `ep_tile_mask_pm_gfx1201`, same law and bytes).
 pub const QWEN4_SLAB_TILE_MASK_SRC: &str =
     include_str!("../../../kernels/src/qwen4_slab_tile_mask.hip");
-/// K1 (`mq_i4_moe_gemv`) certified builder module, gfx1201: the four
-/// F4 read-once C8 decode GEMV entries over pointer-addressed MQ3-I4 / MQ4
-/// expert tensors (`peacemaker-isa emit --kernel mq_i4_moe_gemv`).
+/// gfx1201 K1 image: four unchanged narrow MQ3-I4/MQ4 entries plus their
+/// `_t8` projections using whole-window per-tile descriptors. All retain the
+/// 96-byte pointer-table ABI; generation does not certify codec admission.
 pub const MQ_I4_MOE_GEMV_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco");
-/// K1 builder module of gfx1151 (`peacemaker-isa emit --kernel mq_i4_moe_gemv --arch
-/// gfx1151`): the same twelve symbols and 96-byte kernarg ABI (`n_experts@88`) as the gfx1201 module above.
+/// Narrow gfx1151 K1 diagnostic/reference module. Wide production uses its
+/// Cn image's tiled twin; this image retains its genuine narrow consumers.
 pub const MQ_I4_MOE_GEMV_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco");
-/// SHA-256 pin of the gfx1201 K1 module image: twelve symbols (the four C8 entries plus their `_c16` / `_c32` wide twins)
-/// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco`).
+/// Bare lowercase SHA-256 of the gfx1201 narrow+rowtile K1 image.
 pub const MQ_I4_MOE_GEMV_PM_GFX1201_SHA256: &str =
-    "96d54224118e48d321d44c99b85cfe410c9b4b4d9d92ea7a530444afe442a432";
-/// SHA-256 pin of the gfx1151 K1 module image: the same twelve symbols
-/// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco`).
+    include_str!("../../../kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco.sha256");
+/// SHA-256 of the unchanged gfx1151 diagnostic/reference image.
 pub const MQ_I4_MOE_GEMV_PM_GFX1151_SHA256: &str =
     "443f03cf0eed10bf1d6b34dd61ecb22c72fe00d5c72c4de3c9405374aeee9633";
 /// K1-C1 builder module of gfx1151 (`peacemaker-isa emit --kernel mq_i4_moe_gemv_c1 --arch
@@ -4642,11 +4690,26 @@ pub const MQ_I4_MOE_GEMV_PM_GFX1151_SHA256: &str =
 pub const MQ_I4_MOE_GEMV_C1_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_c1_pm_gfx1151.hxaco");
 /// K1-Cn builder module of gfx1151 (`peacemaker-isa emit --kernel mq_i4_moe_gemv_cn --arch
-/// gfx1151`): the multi-lane (MTP verify, `2 <= lanes <= 8`) rows8 schedule of the K1 arithmetic
-/// with the expert's slots' X staged in LDS. Module `mq_i4_moe_gemv_cn_pm_gfx1151`, the four
-/// symbols `mq_i4_moe_gemv_cn_{mq3i4,mq4sym}_{r256_gate_up,r128_down}`, the bounded K1 96-byte kernarg ABI (`n_experts` @88, zero reserved @92).
+/// gfx1151`): unchanged multi-lane (2..=8) exports plus `_t8` twins accepting
+/// total rows 1..=64 via per-tile descriptors. The 96-byte K1 ABI is unchanged;
+/// tiled grid `[ceil(M/8),80,ceil(rows/8)]`, block256, keeps absolute slot IDs.
 pub const MQ_I4_MOE_GEMV_CN_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_cn_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of the gfx1151 narrow+rowtile Cn image.
+pub const MQ_I4_MOE_GEMV_CN_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/mq_i4_moe_gemv_cn_pm_gfx1151.hxaco.sha256");
+/// Legacy aggregate MQ4 indexed decode twins, not slab K1 descriptors.
+/// GU retains its 52-byte C1 prefix and appends total R (56 bytes); Down
+/// retains its original 52-byte ABI with total R already at N@40.
+pub const LEGACY_MQ4_ROWTILES_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco");
+pub const LEGACY_MQ4_ROWTILES_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco.sha256");
+pub const LEGACY_MQ4_ROWTILES_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco");
+pub const LEGACY_MQ4_ROWTILES_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco.sha256");
+
 /// Certified builder module of the MQ3-I4 NT1 entries on gfx1151
 /// (`peacemaker-isa emit --kernel qwen4_moe_sym_w3 --epi all --arch gfx1151`): module
 /// `qwen4_moe_iu4_sym_w3_pm_gfx1151`, the gfx1201 module's four symbols with `gfx1151` in
@@ -4662,8 +4725,13 @@ pub const QWEN4_MOE_IU4_SYM_W3_NT4_PM_GFX1151: &[u8] =
 /// E8P-I4 F4 lane-pair MoE decode, 96-byte pointer-table ABI (the 88-byte frozen F4 layout plus trailing `n_experts@88`
 /// and a zero `reserved@92`, like the shared MQ4/W3 K1 images): a workgroup whose expert id is not `< n_experts`
 /// (unsigned) exits before the pointer-table index, weight prefetch and first barrier, with no store.
+/// The image also contains each incumbent projection's `_t8` twin, using
+/// absolute slot IDs and grid z = ceil(total rows/8), without route weights.
 pub const E8P_I4_MOE_GEMV_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of the gfx1201 narrow+rowtile E8P image.
+pub const E8P_I4_MOE_GEMV_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1201.hxaco.sha256");
 /// K2 (`qwen4_moe_iu4_sym_e8p`) certified builder module, gfx1201: the E8P-I4 NT1 grouped
 /// symmetric IU4 GEMMs (64-byte ABI of the W3 NT1 entries, trailing `n_experts@60`), serving symbols
 /// `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1201` (the `_acc` twins are never served).
@@ -4692,22 +4760,30 @@ pub fn qwen4_slab_union_plan_gfx1100_src() -> &'static str {
 /// decode GEMVs over pointer-addressed MQ4 expert tensors; 96-byte kernarg ABI, trailing `n_experts@88` and zero
 /// `reserved@92`, the shared K1 guard). The image carries no W2 (`mq2i4`)
 /// entry; the retired mixed image `mq_i4_moe_gemv_pm_gfx1100.hxaco` is not embedded.
+/// Each narrow projection is accompanied by its `_t8` descriptor twin; no W2
+/// codec or cross-architecture singleton recipe is introduced.
 pub const MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_mq4only_pm_gfx1100.hxaco");
-/// K1 `e8p_i4_moe_gemv_pm_gfx1100` certified builder module for gfx1100: the slab's cold E8P-I4
-/// entries `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1100` (96-byte kernarg ABI: the frozen
-/// 88-byte F4 layout plus trailing `n_experts@88` and zero `reserved@92`, with the uniform invalid-expert skip before
-/// the pointer-table index, 1,536 B static LDS). Served for codec 3 on gfx1100 (cold bucket of E8P layers) through
-/// the admission-gated `slab_cold_kernels`; presence of the image is not permission.
+/// Bare lowercase SHA-256 of the gfx1100 narrow+rowtile MQ4-only image.
+pub const MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/mq_i4_moe_gemv_mq4only_pm_gfx1100.hxaco.sha256");
+/// gfx1100 E8P-I4 K1 image: unchanged narrow projections and their `_t8`
+/// descriptor twins, all using the 96-byte guarded pointer-table ABI.
+/// Codec 3 remains gated by `slab_cold_kernels`; an embedded tile export does
+/// not grant capability or replace byte/state/cost qualification.
 pub const E8P_I4_MOE_GEMV_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1100.hxaco");
-/// K1 `e8p_i4_moe_gemv_pm_gfx1151` certified builder module for gfx1151: the gfx1100 K1 arm with
-/// only the arch-forced deltas; the cold E8P-I4 entries
-/// `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1151` (same 96-byte kernarg ABI, trailing
-/// `n_experts@88` and zero `reserved@92` with the uniform invalid-expert skip, 1,536 B static LDS). Served for codec 3 on gfx1151 only through the admission-gated
-/// `slab_cold_kernels`; presence of the image is not permission.
+/// Bare lowercase SHA-256 of the gfx1100 narrow+rowtile E8P image.
+pub const E8P_I4_MOE_GEMV_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1100.hxaco.sha256");
+/// gfx1151 E8P-I4 K1 image: unchanged narrow projections and their `_t8`
+/// descriptor twins. The arithmetic is architecture-specific, with the
+/// 96-byte guarded pointer-table ABI and unchanged cold-codec admission.
 pub const E8P_I4_MOE_GEMV_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of the gfx1151 narrow+rowtile E8P image.
+pub const E8P_I4_MOE_GEMV_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1151.hxaco.sha256");
 /// K3 (`mq_i4_a4`) certified builder module for gfx1100: the row-local R128/K640
 /// `block_i4_128` down-sidecar producer `mq_i4_a4_r128_k640_gfx1100`.
 pub const MQ_I4_A4_PM_GFX1100: &[u8] = include_bytes!("../../../kernels/mq_i4_a4_pm_gfx1100.hxaco");

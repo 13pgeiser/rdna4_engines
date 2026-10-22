@@ -29,6 +29,68 @@ pub fn q8_0_batched_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
         .map(move |off| (off, (n - off).min(Q8_0_BATCHED_MAX_BATCH)))
 }
 
+// Safety routing is independent of optional PM family selectors: an admitted
+// eager verify must retain the actual singleton even when no tile is enabled.
+fn q8_0_exact_verify_scope(
+    rows: usize,
+    verify_rows: usize,
+    prefill_invariant: bool,
+    recording: bool,
+    capture: bool,
+) -> bool {
+    !prefill_invariant
+        && !recording
+        && !capture
+        && (1..=crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&verify_rows)
+        && rows != 0
+        && rows <= verify_rows
+}
+
+fn q8_0_verify_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]> {
+    if m == 0
+        || m > i32::MAX as usize
+        || k == 0
+        || k > i32::MAX as usize
+        || k % 32 != 0
+        || !(1..=crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&rows)
+    {
+        return None;
+    }
+    let bytes = [
+        m.checked_mul(k / 32)?.checked_mul(34)?,
+        rows.checked_mul(k)?.checked_mul(4)?,
+        rows.checked_mul(m)?.checked_mul(4)?,
+    ];
+    bytes
+        .iter()
+        .all(|&n| n <= u32::MAX as usize)
+        .then_some(bytes)
+}
+
+const F32_BATCHED_MAX_GRID_Y: usize = 65535;
+
+fn f32_batched_chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows)
+        .step_by(F32_BATCHED_MAX_GRID_Y)
+        .map(move |off| (off, (rows - off).min(F32_BATCHED_MAX_GRID_Y)))
+}
+
+fn f32_batched_extents(m: usize, k: usize, rows: usize) -> Option<[usize; 3]> {
+    // The signed device K loop increments by 32 even on its final iteration.
+    if m > i32::MAX as usize || k > i32::MAX as usize - 31 {
+        return None;
+    }
+    let bytes = [
+        m.checked_mul(k)?.checked_mul(4)?,
+        rows.checked_mul(k)?.checked_mul(4)?,
+        rows.checked_mul(m)?.checked_mul(4)?,
+    ];
+    bytes
+        .iter()
+        .all(|&n| n <= isize::MAX as usize)
+        .then_some(bytes)
+}
+
 /// `gdn_chunk_prep` targets of the fused F2 QKVZA epilogue
 /// ([`Gpu::gemm_qkvza_mq4g256v2_fp8_gdn_prepared`]).
 pub struct F2GdnTargets<'a> {
@@ -26677,15 +26739,15 @@ impl Gpu {
         self.gemm_q8_0_batched_f32_chunked(a_raw, x, y, m, k, n)
     }
 
-    /// Explicit F32-precision Q8_0 batched GEMM: always runs the scalar
-    /// `gemm_q8_0_batched` path (F32 activations and F32
-    /// dequant of Q8 weights). Separate from [`Self::gemm_q8_0_batched_chunked`],
-    /// whose automatic WMMA selector rounds both F32 inputs and dequant weights
-    /// to F16 on gfx12 — that loss breaks Gemma prefill/decode continuation.
-    /// Keeps the same portable Always contract as the generic F32 kernels; no
-    /// arch gate. Y[n, m] = X[n, k] @ A_q8[m, k]^T. The name predates #732: the
-    /// 64-row split now lives in `gemm_q8_0_batched`; this entry only adds the
-    /// gfx1151 staged-rows route.
+    /// Explicit F32-precision Q8_0 batched GEMM. Outside eager verify this
+    /// delegates to scalar `gemm_q8_0_batched` (F32 activations/dequant),
+    /// which owns the physical 64-row split, unlike the automatic F16 WMMA
+    /// selector in [`Self::gemm_q8_0_batched_chunked`]. In admitted eager
+    /// verify, retain Halo's staged singleton recipe where available, then
+    /// use an admitted architecture's actual row tile when supported;
+    /// otherwise execute [`Self::gemv_q8_0`] independently for each row.
+    /// The tile method owns architecture, family, scope, K-domain, and
+    /// full-window validation. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     pub fn gemm_q8_0_batched_f32_chunked(
         &mut self,
         a_raw: &GpuTensor,
@@ -26695,10 +26757,44 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        let exact_verify = q8_0_exact_verify_scope(
+            n,
+            self.wide_verify_rows,
+            self.prefill_invariant_scope,
+            self.replay.is_recording(),
+            self.graphs.capture_mode,
+        );
+        if exact_verify {
+            let bytes = q8_0_verify_extents(m, k, n).ok_or_else(|| {
+                hip_bridge::HipError::new(1, "Q8 verify dimensions or byte extents overflow")
+            })?;
+            if x.dtype != DType::F32
+                || y.dtype != DType::F32
+                || a_raw.buf.size() < bytes[0]
+                || x.buf.size() < bytes[1]
+                || y.buf.size() < bytes[2]
+            {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "Q8 verify needs full-window weights and F32 activation/output views",
+                ));
+            }
+        }
         // Few rows (speculative verify) on gfx1151: the decode kernels over
         // every row, weights read once.
         if self.gemv_q8_0_staged_rows_supported(k, self.route_rows(n)) {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
+        }
+        if exact_verify {
+            if n > 8 && self.gemv_q8_0_rowtile_supported(k, n) {
+                return self.lab_gemv_q8_0_rows_t8(a_raw, x, y, m, k, n);
+            }
+            for row in 0..n {
+                let x_row = x.sub_offset(row * k, k);
+                let y_row = y.sub_offset(row * m, m);
+                self.gemv_q8_0(a_raw, &x_row, &y_row, m, k)?;
+            }
+            return Ok(());
         }
         self.gemm_q8_0_batched(a_raw, x, y, m, k, n)
     }
@@ -28916,7 +29012,9 @@ impl Gpu {
         )
     }
 
-    /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
+    /// Batched GEMM for F32: Y[N,M] = B[N,K] @ A[M,K]^T.
+    /// `gemm_f32.hip` uses N only to guard blockIdx.y: every row retains
+    /// the singleton lane-strided K loop and shuffle tree at all verify widths.
     pub fn gemm_f32_batched(
         &mut self,
         a: &GpuTensor,
@@ -28926,20 +29024,32 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        let bytes = f32_batched_extents(m, k, n).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "F32 GEMM dimensions or byte extents overflow")
+        })?;
+        if a.dtype != DType::F32
+            || b.dtype != DType::F32
+            || y.dtype != DType::F32
+            || a.buf.size() < bytes[0]
+            || b.buf.size() < bytes[1]
+            || y.buf.size() < bytes[2]
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "F32 GEMM needs full-window F32 weight/activation/output views",
+            ));
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_f32_batched",
             kernels::GEMM_F32_SRC,
             "gemm_f32_batched",
         )?;
-        // The kernel reads batch row `n` from blockIdx.y (<= 65535 blocks), so
-        // rows beyond that launch in chunks with B and Y advanced by whole
-        // rows; every row keeps the same K-loop and reduction as one launch.
-        const MAX_GRID_Y: usize = 65535;
-        let mut result = Ok(());
-        for chunk in 0..n.div_ceil(MAX_GRID_Y).max(1) {
-            let off = chunk * MAX_GRID_Y;
-            let take = (n - off).min(MAX_GRID_Y);
+        // Chunk only the grid-y extent, never the K loop or reduction.
+        for (off, take) in f32_batched_chunks(n) {
             let mut ap = a.buf.as_ptr();
             let mut bp = b
                 .buf
@@ -28952,7 +29062,7 @@ impl Gpu {
             let mut mi = m as i32;
             let mut ki = k as i32;
             let mut ni = take as i32;
-            let mut params: Vec<*mut c_void> = vec![
+            let mut params = [
                 &mut ap as *mut _ as *mut c_void,
                 &mut bp as *mut _ as *mut c_void,
                 &mut yp as *mut _ as *mut c_void,
@@ -28960,19 +29070,16 @@ impl Gpu {
                 &mut ki as *mut _ as *mut c_void,
                 &mut ni as *mut _ as *mut c_void,
             ];
-            result = launch_params_blob!(
+            launch_params_blob!(
                 self,
                 "gemm_f32_batched",
                 [m as u32, take as u32, 1],
                 [32, 1, 1],
                 0,
                 params; ap, bp, yp, mi, ki, ni
-            );
-            if result.is_err() {
-                break;
-            }
+            )?;
         }
-        result
+        Ok(())
     }
     /// Native-BF16 weight × F32 input batched GEMM.
     ///
@@ -51382,7 +51489,27 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        result
+        result?;
+        #[cfg(feature = "lab")]
+        if self.lab_fn_armed() {
+            let n_experts = usize::try_from(nev).unwrap_or(0);
+            // NT1 entries are the resident/no-host-mapped-width path.
+            self.lab_note_fn(
+                func,
+                grid,
+                [block, 1, 1],
+                dims[0],
+                down,
+                dims[3],
+                n_experts,
+                dims[2].saturating_mul(dims[4]),
+                dims[4],
+                false,
+                true,
+                dims[4],
+            )?;
+        }
+        Ok(())
     }
 
     /// [`Gpu::qwen4_moe_sym_nt1_gemm`] over the sealed-slab NT1 K2 entries of slab codec `codec`
@@ -51562,7 +51689,27 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        result
+        result?;
+        #[cfg(feature = "lab")]
+        if self.lab_fn_armed() {
+            let n_experts = usize::try_from(nev).unwrap_or(0);
+            // W3 NT4 entries are the resident/no-host-mapped-width path.
+            self.lab_note_fn(
+                func,
+                grid,
+                [block, 1, 1],
+                dims[0],
+                down,
+                dims[3],
+                n_experts,
+                dims[2].saturating_mul(dims[4]),
+                dims[4],
+                false,
+                true,
+                dims[4],
+            )?;
+        }
+        Ok(())
     }
 
     /// Shared 64-byte kernarg launch (the 60-byte frozen ABI plus trailing `n_experts`) of the two
@@ -51668,6 +51815,24 @@ impl Gpu {
         }
         result?;
         self.moe_route_census.count_sym_iu4(down);
+        #[cfg(feature = "lab")]
+        if self.lab_fn_armed() {
+            let n_experts = usize::try_from(nev).unwrap_or(0);
+            self.lab_note_fn(
+                func,
+                grid,
+                [block, 1, 1],
+                dims[0],
+                down,
+                dims[3],
+                n_experts,
+                dims[2].saturating_mul(dims[4]),
+                dims[4],
+                host_mapped,
+                true,
+                dims[4],
+            )?;
+        }
         Ok(())
     }
 }
@@ -51676,6 +51841,199 @@ impl Gpu {
 mod tests {
     use super::*;
 
+    #[test]
+    fn q8_verify_fallthrough_scope_covers_every_admitted_width() {
+        for admitted in 1..=64 {
+            for rows in 0..=65 {
+                for prefill in [false, true] {
+                    for recording in [false, true] {
+                        for capture in [false, true] {
+                            assert_eq!(
+                                q8_0_exact_verify_scope(rows, admitted, prefill, recording, capture),
+                                rows != 0 && rows <= admitted && !prefill && !recording && !capture,
+                                "rows={rows} admitted={admitted} prefill={prefill} recording={recording} capture={capture}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for invalid in [0, 65, usize::MAX] {
+            assert!(!q8_0_exact_verify_scope(1, invalid, false, false, false));
+        }
+        // No architecture or optional PM family selector participates in safety.
+        let source = include_str!("gemm.rs");
+        let method = source
+            .split("pub fn gemm_q8_0_batched_f32_chunked(")
+            .nth(1)
+            .unwrap();
+        let method = method.split("\n    pub fn ").next().unwrap();
+        assert!(method.contains("self.wide_verify_rows"));
+        assert!(method.contains("self.gemv_q8_0(a_raw, &x_row, &y_row, m, k)?"));
+        assert!(!method.contains("WideTwinFamily"));
+        assert!(method.contains("if n > 8 && self.gemv_q8_0_rowtile_supported(k, n)"));
+        assert!(method.contains("return self.lab_gemv_q8_0_rows_t8(a_raw, x, y, m, k, n);"));
+        assert!(
+            method.find("self.gemv_q8_0_staged_rows_supported").unwrap()
+                < method.find("self.gemv_q8_0_rowtile_supported").unwrap()
+        );
+        assert!(
+            method.find("self.gemv_q8_0_rowtile_supported").unwrap()
+                < method.find("for row in 0..n").unwrap()
+        );
+        // The 64-row chunk loop lives in `gemm_q8_0_batched` (#732), not in the
+        // wrapper: the exact-verify per-row fallthrough must precede the
+        // unchanged ordinary batched fallback.
+        assert!(
+            method.find("self.gemv_q8_0(a_raw").unwrap()
+                < method
+                    .find("self.gemm_q8_0_batched(a_raw, x, y, m, k, n)")
+                    .unwrap()
+        );
+        let batched = source
+            .split("pub fn gemm_q8_0_batched(")
+            .nth(1)
+            .unwrap()
+            .split("\n    pub fn ")
+            .next()
+            .unwrap();
+        assert!(batched.contains("for (off, take) in q8_0_batched_chunks(batch_size)"));
+    }
+
+    #[test]
+    fn q8_verify_fallthrough_extents_cover_census_and_tails() {
+        for rows in 1..=64 {
+            // Canonical MTP raw-Q8 projection shapes, plus small-K/tail recipes.
+            for (m, k) in [
+                (12288, 2560),
+                (512, 2560),
+                (640, 2560),
+                (2560, 6144),
+                (1, 32),
+                (3, 96),
+                (7, 320),
+                (9, 640),
+                (17, 1536),
+            ] {
+                let bytes = q8_0_verify_extents(m, k, rows).unwrap();
+                assert_eq!(bytes, [m * (k / 32) * 34, rows * k * 4, rows * m * 4]);
+                for row in 0..rows {
+                    assert!((row + 1) * k * 4 <= bytes[1]);
+                    assert!((row + 1) * m * 4 <= bytes[2]);
+                }
+            }
+        }
+        for (m, k, rows) in [
+            (0, 32, 1),
+            (1, 0, 1),
+            (1, 33, 1),
+            (1, 32, 0),
+            (1, 32, 65),
+            (usize::MAX, 32, 1),
+            (1, usize::MAX, 1),
+            (1, 32, usize::MAX),
+            (i32::MAX as usize, 32, 64),
+            (1, i32::MAX as usize, 1),
+        ] {
+            assert_eq!(q8_0_verify_extents(m, k, rows), None, "{m}/{k}/{rows}");
+        }
+    }
+
+    #[test]
+    fn f32_batched_row_local_source_and_extents_cover_one_through_64() {
+        let source = kernels::GEMM_F32_SRC;
+        assert!(source.contains("int M, int K, int N"));
+        assert!(source.contains("if (m >= M || n >= N) return;"));
+        let body = source.split(") {").nth(1).unwrap();
+        assert_eq!(body.matches('N').count(), 1, "N must only guard the row");
+        assert!(source.contains("A + (size_t)m * K"));
+        assert!(source.contains("B + (size_t)n * K"));
+        assert!(source.contains("for (int k = tid; k < K; k += 32)"));
+        assert!(source.contains("sum += a_row[k] * b_row[k];"));
+        assert!(source.contains("sum += __shfl_down(sum, offset, 32);"));
+        assert!(source.contains("Y[(size_t)n * M + m] = sum;"));
+        for rows in 1..=64 {
+            assert_eq!(f32_batched_chunks(rows).collect::<Vec<_>>(), [(0, rows)]);
+            for m in [1, 7, 248320] {
+                for k in [0, 1, 31, 32, 33, 2560] {
+                    let bytes = f32_batched_extents(m, k, rows).unwrap();
+                    let singleton = f32_batched_extents(m, k, 1).unwrap();
+                    assert_eq!(
+                        bytes,
+                        [singleton[0], rows * singleton[1], rows * singleton[2]]
+                    );
+                    for row in 0..rows {
+                        assert_eq!(row * k * 4 + singleton[1], (row + 1) * k * 4);
+                        assert_eq!(row * m * 4 + singleton[2], (row + 1) * m * 4);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f32_batched_checked_launch_geometry_and_overflow() {
+        assert_eq!(f32_batched_chunks(0).count(), 0);
+        for rows in [65534, 65535, 65536, 131070, 131071] {
+            let mut next = 0;
+            for (off, take) in f32_batched_chunks(rows) {
+                assert_eq!(off, next);
+                assert!((1..=65535).contains(&take));
+                next += take;
+            }
+            assert_eq!(next, rows);
+        }
+        assert!(f32_batched_extents(1, i32::MAX as usize - 31, 1).is_some());
+        for (m, k, rows) in [
+            (i32::MAX as usize + 1, 1, 1),
+            (1, i32::MAX as usize - 30, 1),
+            (usize::MAX, 1, 1),
+            (1, usize::MAX, 1),
+            (1, 1, usize::MAX),
+            (i32::MAX as usize, i32::MAX as usize - 31, 1),
+        ] {
+            assert_eq!(f32_batched_extents(m, k, rows), None, "{m}/{k}/{rows}");
+        }
+    }
+
+    #[test]
+    fn f32_batched_launcher_matches_six_argument_abi() {
+        let source = include_str!("gemm.rs");
+        let method = source.split("pub fn gemm_f32_batched(").nth(1).unwrap();
+        let method = method.split("\n    pub fn ").next().unwrap();
+        let params = method
+            .split("let mut params = [")
+            .nth(1)
+            .unwrap()
+            .split("];")
+            .next()
+            .unwrap();
+        assert_eq!(
+            params
+                .lines()
+                .filter(|line| line.contains("c_void"))
+                .count(),
+            6
+        );
+        assert!(method.contains("params; ap, bp, yp, mi, ki, ni"));
+        for rows in 1..=64 {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for ptr in [0x1000usize, 0x2000, 0x3000] {
+                blob.push_ptr(ptr as *const c_void);
+            }
+            blob.push_i32(7);
+            blob.push_i32(33);
+            blob.push_i32(rows);
+            let bytes = blob.as_bytes();
+            assert_eq!(bytes.len(), 36);
+            for (offset, expected) in [(0, 0x1000usize), (8, 0x2000), (16, 0x3000)] {
+                assert_eq!(&bytes[offset..offset + 8], &expected.to_ne_bytes());
+            }
+            for (offset, expected) in [(24, 7i32), (28, 33), (32, rows)] {
+                assert_eq!(&bytes[offset..offset + 4], &expected.to_ne_bytes());
+            }
+        }
+    }
     #[test]
     fn qwen4_prefill_ksplit_bytes_known_and_checked() {
         // Flash-Next R = 4096, hc_lowrank = 320, hidden = 2560: 4-way split.

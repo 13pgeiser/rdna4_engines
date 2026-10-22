@@ -30,6 +30,7 @@ pub(super) fn handles(name: &str) -> bool {
             | "v_add_f64"
             | "v_min_f64"
             | "v_lshrrev_b64"
+            | "v_lshlrev_b64"
             | "v_subrev_co_u32"
             | "v_sub_co_ci_u32"
     )
@@ -164,6 +165,10 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
             "v_lshrrev_b64" => {
                 s.read_wide(src(2)?, lane, Wide::Unsigned)? >> (s.read(src(1)?, lane, 0)? & 63)
             }
+            // D0.u64 = S1.u64 << S0[5:0]
+            "v_lshlrev_b64" => {
+                s.read_wide(src(2)?, lane, Wide::Unsigned)? << (s.read(src(1)?, lane, 0)? & 63)
+            }
             // tmp = S1 - S0; carry-out = S0 > S1 (unsigned borrow).
             "v_subrev_co_u32" => {
                 let (a, b) = (s.read(src(2)?, lane, 0)?, s.read(src(3)?, lane, 0)?);
@@ -198,6 +203,7 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
                 | "v_add_f64"
                 | "v_min_f64"
                 | "v_lshrrev_b64"
+                | "v_lshlrev_b64"
         ) {
             s.put_wide(&o[0], lane, vals[lane])?;
         } else {

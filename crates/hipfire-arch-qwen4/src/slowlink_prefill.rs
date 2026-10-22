@@ -2464,6 +2464,10 @@ fn with_tile_frames<T>(
         false,
         forward.moe.get(layer_index).and_then(Option::as_ref),
     );
+    // S1 per-call CPU-wide scope: never armed from the global lab override.
+    // Ordinary prefill tiles stay on the default-4 gate; the frozen row-exact
+    // width is an upper clamp only. Read once from this GPU device.
+    let verify_rows = crate::gpu_forward::qwen4_row_exact_verify_rows(gpu);
     let tile_streams: Vec<GpuTensor> = tiles
         .iter()
         .map(|tile| f32_view(streams, tile.stream_offset, tile.rows * geo.wide))
@@ -2499,7 +2503,15 @@ fn with_tile_frames<T>(
                 moe.routed_experts = crate::gpu_forward::bind_routed_view(
                     layer_moe,
                     moe.routed_experts,
-                    |runtime| runtime.routed_view(false, tile.rows, tile.routing.route_rows),
+                    |runtime| {
+                        runtime.routed_view(
+                            false,
+                            tile.rows,
+                            tile.routing.route_rows,
+                            false,
+                            verify_rows,
+                        )
+                    },
                 );
             }
             Ok::<_, Qwen4GpuForwardError>(description)

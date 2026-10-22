@@ -764,6 +764,27 @@ mod tests {
     }
 
     #[test]
+    fn physical_verify_capacity_does_not_promote_shipping_admission() {
+        assert_eq!(crate::QWEN4_VERIFY_MAX_ROWS, 64);
+        assert_eq!(crate::QWEN4_FEW_ROW_ROUTE_ROWS, 8);
+        for arch in [
+            "gfx1151",
+            "gfx1201",
+            "gfx1100",
+            "gfx1151:sramecc+",
+            "unknown",
+            "",
+        ] {
+            let rows = qwen4_row_exact_verify_rows_table(arch);
+            assert_eq!(rows, 8, "{arch}");
+            assert!(rows <= crate::QWEN4_VERIFY_MAX_ROWS, "{arch}");
+            let mut c = ctx(arch);
+            c.model_arch_id = Some(16);
+            assert_eq!(eff(MTP_K_KEY, &c).value, ConfigValue::Integer(7), "{arch}");
+        }
+    }
+
+    #[test]
     fn mtp_k_auto_is_row_exact_rows_minus_one_for_flash_next_else_3() {
         for arch in ["gfx1151", "gfx1201", "gfx1100", ""] {
             let mut c = ctx(arch);

@@ -204,6 +204,24 @@ fn mq6_i8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
         && gpu.gemm_mq6g256v2_i8_applies(weight.m, weight.k, rows)
 }
 
+/// Only an admitted eager verify may extend the singleton routes past eight.
+/// Keep this tied to the actual scoped limit, not the executor's storage cap.
+pub(super) fn wide_exact_route(route: usize, limit: usize) -> bool {
+    route > rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS && route <= limit
+}
+
+pub(super) fn wide_exact_rows(gpu: &Gpu, rows: usize) -> bool {
+    wide_exact_route(gpu.route_rows(rows), gpu.few_row_limit())
+}
+
+fn wide_projection_uses_singletons(dtype: DType, route: usize, limit: usize) -> bool {
+    wide_exact_route(route, limit)
+        && matches!(
+            dtype,
+            DType::MQ2G256V2 | DType::MQ3G256V2 | DType::MQ5G256V2
+        )
+}
+
 /// [`project_weights`] with the MQ6 a/b/z row-region fold (three F32 outputs
 /// of shared-rotation MQ6 siblings, one launch) enabled for exactly the
 /// projections `region_members` flags (parallel to `projections`) instead of
@@ -224,8 +242,7 @@ fn project_weights_inner(
     // few-row decode-twin launches below; the shared-F16-rotation WMMA routes
     // are not row-exact, so they decline there (and nowhere else: outside a
     // verify forward `few_row_limit()` is the historic limit).
-    let wide_exact =
-        route > rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS && route <= gpu.few_row_limit();
+    let wide_exact = wide_exact_route(route, gpu.few_row_limit());
     let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
         !wide_exact
             && match w.dtype {
@@ -382,7 +399,7 @@ fn project_weights_inner(
     // BF16 weights on the F16 WMMA route: one F16 conversion per K.
     for i in 0..projections.len() {
         let (weight, _) = projections[i];
-        if done[i] || weight.dtype != DType::BF16 {
+        if wide_exact || done[i] || weight.dtype != DType::BF16 {
             continue;
         }
         let group: SmallVec<[(&GpuTensor, &GpuTensor, usize); 4]> = projections[i..]
@@ -625,27 +642,62 @@ fn project_trunk_masked(
         .find(|(w, _)| w.dtype == DType::MQ4G256V2)
         .map(|(w, _)| w.k);
     if let (Some(k), DType::F32) = (k, input.dtype) {
-        let mq4: SmallVec<[usize; 4]> = (0..projections.len())
-            .filter(|&j| {
-                !done[j] && projections[j].0.dtype == DType::MQ4G256V2 && projections[j].0.k == k
-            })
-            .collect();
-        let dense: SmallVec<[usize; 4]> = if gpu.qwen4_trunk_iu4_applies(rows) {
-            mq4.iter().copied().filter(|&j| a4[j]).collect()
+        if wide_exact_rows(gpu, rows) {
+            // Wide-exact route keeps the singleton path; fall through to the
+            // generic handling below (syntax-only nesting: edition 2021 has no
+            // let-chains; semantics identical to `&& !wide_exact_rows`).
         } else {
-            SmallVec::new()
-        };
-        if !gpu.qwen4_trunk_iu4_applies(rows) {
-            if let (Some(n_pad), Some(fold)) = (gpu.qwen4_trunk_iu4_ragged(rows), zba.as_ref()) {
-                if let Some([y_z, y_beta, y_alpha]) = fold.padded_outputs {
-                    let z = projections[fold.z].0;
+            let mq4: SmallVec<[usize; 4]> = (0..projections.len())
+                .filter(|&j| {
+                    !done[j]
+                        && projections[j].0.dtype == DType::MQ4G256V2
+                        && projections[j].0.k == k
+                })
+                .collect();
+            let dense: SmallVec<[usize; 4]> = if gpu.qwen4_trunk_iu4_applies(rows) {
+                mq4.iter().copied().filter(|&j| a4[j]).collect()
+            } else {
+                SmallVec::new()
+            };
+            if !gpu.qwen4_trunk_iu4_applies(rows) {
+                if let (Some(n_pad), Some(fold)) = (gpu.qwen4_trunk_iu4_ragged(rows), zba.as_ref())
+                {
+                    if let Some([y_z, y_beta, y_alpha]) = fold.padded_outputs {
+                        let z = projections[fold.z].0;
+                        if [fold.z, fold.beta, fold.alpha]
+                            .iter()
+                            .all(|&j| a4[j] && mq4.contains(&j))
+                            && projections[fold.beta].0.m == 48
+                            && projections[fold.alpha].0.m == 48
+                            && hip(gpu.qwen4_trunk_zba_ragged(
+                                input, rows, n_pad, k, fold.rows, z.m, y_z, y_beta, y_alpha,
+                            ))?
+                        {
+                            done[fold.z] = true;
+                            done[fold.beta] = true;
+                            done[fold.alpha] = true;
+                        }
+                    }
+                }
+            }
+            if !dense.is_empty() {
+                let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
+                let prepared =
+                    hip(gpu.rotate_x_mq_i4_batched(input, None, None, reservation, k, rows))?;
+                if let Some(fold) = zba {
+                    let (z, y_z) = projections[fold.z];
                     if [fold.z, fold.beta, fold.alpha]
                         .iter()
-                        .all(|&j| a4[j] && mq4.contains(&j))
-                        && projections[fold.beta].0.m == 48
-                        && projections[fold.alpha].0.m == 48
-                        && hip(gpu.qwen4_trunk_zba_ragged(
-                            input, rows, n_pad, k, fold.rows, z.m, y_z, y_beta, y_alpha,
+                        .all(|j| dense.contains(j))
+                        && hip(gpu.gemm_qwen4_trunk_zba_iu4(
+                            fold.rows,
+                            &prepared,
+                            y_z,
+                            projections[fold.beta].1,
+                            projections[fold.alpha].1,
+                            z.m,
+                            k,
+                            rows,
                         ))?
                     {
                         done[fold.z] = true;
@@ -653,39 +705,13 @@ fn project_trunk_masked(
                         done[fold.alpha] = true;
                     }
                 }
-            }
-        }
-        if !dense.is_empty() {
-            let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
-            let prepared =
-                hip(gpu.rotate_x_mq_i4_batched(input, None, None, reservation, k, rows))?;
-            if let Some(fold) = zba {
-                let (z, y_z) = projections[fold.z];
-                if [fold.z, fold.beta, fold.alpha]
-                    .iter()
-                    .all(|j| dense.contains(j))
-                    && hip(gpu.gemm_qwen4_trunk_zba_iu4(
-                        fold.rows,
-                        &prepared,
-                        y_z,
-                        projections[fold.beta].1,
-                        projections[fold.alpha].1,
-                        z.m,
-                        k,
-                        rows,
-                    ))?
-                {
-                    done[fold.z] = true;
-                    done[fold.beta] = true;
-                    done[fold.alpha] = true;
-                }
-            }
-            for &j in &dense {
-                if !done[j] {
-                    let (w, out) = projections[j];
-                    let xq = hip(gpu.int4_mmq_prepared_ptr(&prepared, k, rows))?;
-                    hip(gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(w.buf, xq, out, w.m, k, rows))?;
-                    done[j] = true;
+                for &j in &dense {
+                    if !done[j] {
+                        let (w, out) = projections[j];
+                        let xq = hip(gpu.int4_mmq_prepared_ptr(&prepared, k, rows))?;
+                        hip(gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(w.buf, xq, out, w.m, k, rows))?;
+                        done[j] = true;
+                    }
                 }
             }
         }
@@ -794,6 +820,29 @@ fn project_rotated(
     rows: usize,
 ) -> Result<(), DispatchError> {
     let route = gpu.route_rows(rows);
+    // These are post-load HIPFIRE_QWEN4_REQUANT experiments, not packed
+    // Flash-Next source tiers. Their batched entries unconditionally use
+    // F16 WMMA; retain each format's own singleton rather than silently
+    // changing its arithmetic. This baseline grants no throughput qualification.
+    if wide_projection_uses_singletons(weight.dtype, route, gpu.few_row_limit()) {
+        for row in 0..rows {
+            let input = view(x, row * weight.k, weight.k);
+            let out = view(output, row * weight.m, weight.m);
+            hip(match weight.dtype {
+                DType::MQ2G256V2 => {
+                    gpu.gemv_mq2g256v2(weight.buf, &input, &out, weight.m, weight.k)
+                }
+                DType::MQ3G256V2 => {
+                    gpu.gemv_mq3g256v2(weight.buf, &input, &out, weight.m, weight.k)
+                }
+                DType::MQ5G256V2 => {
+                    gpu.gemv_mq5g256v2(weight.buf, &input, &out, weight.m, weight.k)
+                }
+                _ => unreachable!(),
+            })?;
+        }
+        return Ok(());
+    }
     if weight.dtype == DType::MQ6G256V2 && (2..=gpu.few_row_limit()).contains(&route) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
@@ -1149,6 +1198,18 @@ pub fn execute_hyper_read_prenormed(
     }
 }
 
+/// HC keeps singleton K/4 or K/8 owners even when token rows are tiled.
+fn hc_decode_partitions(dtype: DType, k: usize, route: usize, limit: usize) -> Option<usize> {
+    if route > limit {
+        return None;
+    }
+    match dtype {
+        DType::BF16 if k.is_multiple_of(32) => Some(4),
+        DType::Q8_0 if k.is_multiple_of(256) => Some(8),
+        _ => None,
+    }
+}
+
 /// The F16 WMMA read route of [`execute_hyper_read_inner`]: the norm writes
 /// the F16 down input directly and the BF16 WMMA up read reuses it.
 fn hyper_read_wmma_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
@@ -1162,7 +1223,8 @@ fn hyper_read_wmma_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
         && op.low_rank % 8 == 0
         && (257..=512).contains(&op.low_rank)
         && op.hidden % 8 == 0;
-    let f16 = up_fused
+    let f16 = !wide_exact_rows(gpu, op.rows)
+        && up_fused
         && op.input_mix_down.dtype == DType::BF16
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0
@@ -1207,7 +1269,8 @@ fn execute_hyper_read_inner(
     // F16 WMMA down projection: the norm writes its F16 input directly.  The
     // BF16 WMMA up read reuses that F16 copy; the SIMT fused read instead
     // takes `normalized` as BF16 bits, which only it reads.
-    let f16 = up_fused
+    let f16 = !wide_exact_rows(gpu, op.rows)
+        && up_fused
         && op.input_mix_down.dtype == DType::BF16
         && gpu.qwen4_f16_wmma_applies(op.input_mix_down.buf, op.input_mix_down.k, op.rows);
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
@@ -1256,9 +1319,13 @@ fn execute_hyper_read_inner(
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(op.rows) <= gpu.few_row_limit()
-        && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
-            || (op.input_mix_down.dtype == DType::Q8_0 && op.input_mix_down.k.is_multiple_of(256)))
+        && hc_decode_partitions(
+            op.input_mix_down.dtype,
+            op.input_mix_down.k,
+            gpu.route_rows(op.rows),
+            gpu.few_row_limit(),
+        )
+        .is_some()
     {
         // Decode and few-row verify: the long-K down GEMV splits each row
         // across four (BF16) or eight (Q8_0) waves and applies the activation
@@ -1496,7 +1563,8 @@ fn project_output_into_hyper_write(
         }
         _ => false,
     };
-    if gpu.flags.qwen4_hc_fuse_level() < 2
+    if wide_exact_rows(gpu, rows)
+        || gpu.flags.qwen4_hc_fuse_level() < 2
         || !covered
         || weight.m != write.hidden
         || write.branches != 4
@@ -1694,9 +1762,12 @@ fn hyper_write_gates(
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
     let k4 = gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(op.rows) <= gpu.few_row_limit()
-        && op.block_inject.dtype == DType::BF16
-        && op.block_inject.k.is_multiple_of(32);
+        && hc_decode_partitions(
+            op.block_inject.dtype,
+            op.block_inject.k,
+            gpu.route_rows(op.rows),
+            gpu.few_row_limit(),
+        ) == Some(4);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
@@ -2097,7 +2168,8 @@ pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
         value_dim: op.value_dim,
         position: op.start_position,
     };
-    persistent_batch
+    !wide_exact_rows(gpu, op.rows)
+        && persistent_batch
         && gated_delta_chunk_route(gpu, &dims)
         && match op.qkv.dtype {
             DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(op.qkv.k, op.rows),
@@ -2693,7 +2765,8 @@ fn execute_gated_delta_net_hc_impl(
     // MQ4 has BF16 output only in the PM module and never when the IU4 route
     // (`a4` = the projection's trunk bit; F32 output only) takes the projection.
     let bf16_store = |w: &WeightRef<'_>, a4: u16, gpu: &Gpu| {
-        chunked
+        !wide_exact_rows(gpu, op.rows)
+            && chunked
             && match w.dtype {
                 DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows),
                 DType::MQ4G256V2 => {
@@ -3783,10 +3856,9 @@ fn execute_indexed_attention_hc_impl(
     if phase == MixerPhase::OutProj {
         return qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
     }
-    // Wide verify (`few_row_limit` above the historic eight, eager only) runs
-    // the whole op in one launch per stage at full width: prologue, select and
-    // attention are per-row (grid.y / grid.z = rows) with the one-row decode's
-    // arithmetic, so no row grouping is needed.
+    // Admitted eager verify keeps full-width decode prologue/selection
+    // arithmetic. Attention binds the actual singleton AR policy separately
+    // for each row's absolute position, batching only adjacent equal policies.
     // The prologue's kernel rotates `min(dim, 64)` channels of the queries,
     // keys and indexer; any other width takes the batched launches below.
     let prologue_rotary =
@@ -4319,6 +4391,11 @@ pub fn execute_grouped_depthwise(
     gpu: &mut Gpu,
     op: &GroupedDepthwiseOp<'_>,
 ) -> Result<(), DispatchError> {
+    if op.rows_f16 && wide_exact_rows(gpu, op.rows) {
+        return Err(DispatchError::Hip(
+            "row-exact PLE requires the original F32 rows, not prefill F16 staging".into(),
+        ));
+    }
     let channels = op.branches * op.hidden;
     let streams = view(op.streams, 0, op.rows * channels);
     let query = view(op.query, 0, op.rows * channels);
@@ -4863,6 +4940,55 @@ pub fn execute_argmax(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_route_uses_the_admitted_eager_limit_not_storage_capacity() {
+        for limit in [8, 9, 16, 32, 63, 64] {
+            for rows in 1..=65 {
+                assert_eq!(wide_exact_route(rows, limit), rows > 8 && rows <= limit);
+            }
+        }
+        // CPU/unknown-arch and recorder limits never inherit a storage cap64.
+        for limit in [0, 1, 4, 8] {
+            for rows in 1..=64 {
+                assert!(!wide_exact_route(rows, limit));
+            }
+        }
+        assert!(!wide_exact_route(usize::MAX, 64));
+    }
+
+    #[test]
+    fn hc_partitions_follow_the_singleton_descriptor_not_token_count() {
+        for rows in 1..=64 {
+            for k in [32, 320, 2560, 10240] {
+                assert_eq!(hc_decode_partitions(DType::BF16, k, rows, 64), Some(4));
+            }
+            for k in [256, 2560, 10240] {
+                assert_eq!(hc_decode_partitions(DType::Q8_0, k, rows, 64), Some(8));
+            }
+            assert_eq!(
+                hc_decode_partitions(DType::BF16, 10240, rows, 8),
+                (rows <= 8).then_some(4),
+            );
+        }
+        assert_eq!(hc_decode_partitions(DType::BF16, 33, 64, 64), None);
+        assert_eq!(hc_decode_partitions(DType::Q8_0, 320, 64, 64), None);
+        assert_eq!(hc_decode_partitions(DType::F32, 10240, 64, 64), None);
+        assert_eq!(hc_decode_partitions(DType::BF16, 10240, 5, 4), None);
+    }
+
+    #[test]
+    fn requant_experiments_do_not_leak_wmma_into_admitted_wide_verify() {
+        for dtype in [DType::MQ2G256V2, DType::MQ3G256V2, DType::MQ5G256V2] {
+            for rows in 1..=64 {
+                assert_eq!(wide_projection_uses_singletons(dtype, rows, 64), rows > 8);
+                assert!(!wide_projection_uses_singletons(dtype, rows, 8));
+            }
+        }
+        for dtype in [DType::BF16, DType::Q8_0, DType::MQ4G256V2, DType::MQ6G256V2] {
+            assert!(!wide_projection_uses_singletons(dtype, 64, 64));
+        }
+    }
 
     fn tensor(elements: usize, dtype: DType) -> GpuTensor {
         let mut tensor = GpuTensor::null_for_test();

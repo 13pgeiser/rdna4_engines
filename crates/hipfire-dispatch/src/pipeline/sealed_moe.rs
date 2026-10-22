@@ -2213,7 +2213,12 @@ impl<'a> SealedMoeCall<'a> {
             (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection))
                 if selection.cpu_split =>
             {
-                moe_program::validate_split_prefill(gpu, params, selection)?;
+                moe_program::validate_split_prefill_exec(
+                    gpu,
+                    params,
+                    selection,
+                    self.dispatch_ctx.cpu_wide_verify(),
+                )?;
             }
             _ => {}
         }
@@ -8575,7 +8580,9 @@ mod tests {
             "decode root partial",
             "single-device",
         );
-        // Row caps: decode is one row; the grouped window is one to four rows.
+        // Row caps: decode is one row; the default grouped window is one to
+        // four rows. A wide window without a lab-wide scope refuses with the
+        // qualified-window message (wiring only, not numeric proof).
         split_refused(
             split_decode_stages(route, true, |p| p.batch_size = 2, |_| {}),
             "decode two rows",
@@ -8585,8 +8592,23 @@ mod tests {
             split_refused(
                 split_prefill_stages(rows, route, true, |_| {}, |_| {}),
                 &format!("prefill rows={rows}"),
-                "four-row cap",
+                "wider windows are ordinary wide prefill",
             );
+        }
+        // Wiring truth across the full logical 1..64 window: default scope
+        // (no lab override) admits 1..=4 and refuses 5..=64 before any write.
+        // These are routing/admission assertions only and MUST NOT be counted
+        // as numeric proof (G1/G2 family qualification still required).
+        for rows in 1..=crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS {
+            let conflict = moe_program::cpu_split_prefill_conflict_width(rows, 4);
+            if rows <= crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                assert!(conflict.is_none(), "rows={rows}: default route must admit");
+            } else {
+                assert!(
+                    conflict.is_some(),
+                    "rows={rows}: default route must refuse wide windows"
+                );
+            }
         }
     }
 

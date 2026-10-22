@@ -26,6 +26,10 @@ pub use error::{
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
+#[cfg(feature = "kernel-timing")]
+pub use ffi::kernel_timing::{
+    reject_kernel_timing_backend, KernelTimingCoverage, KernelTimingPool, KernelTimingReport,
+};
 pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{

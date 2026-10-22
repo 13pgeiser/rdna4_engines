@@ -2,70 +2,50 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Hardware tests of the split-K QSA decode attention helper
-//! `tensor_ops::indexed_attention_attention_splitk_for_test` against the
-//! incumbent exact per-head reference `indexed_attention_attention_batch_exact`
-//! (F32 K/V, n_heads 24, n_kv_heads 2, head_dim 256).
+//! F32 QSA attention component gates (24 query heads, 2 KV heads, HD256).
 //!
-//! * `qsa_splitk_rows1_matches_exact`: single-row launches at lengths
-//!   {1, S-1, S, 64, 1131, 2048, 8195} (for every tuned split count S, up to
-//!   48), four compress/budget/capacity formulas, random q/K/V, a pure-valid
-//!   selection and a mixed one that carries negative tokens, tokens >= visible
-//!   and tokens >= full_capacity. Per head: maxdiff <= 1e-5 * maxabsref + 1e-7
-//!   for the head layouts 0/1 at S = 4/8/12/16 and the grouped layout 2 at
-//!   S = 8/16/24/32/48 (plus the production defaults, when they differ). A row
-//!   with no valid token must be exactly +0, as in the reference.
-//! * `qsa_splitk_all_invalid_zero`: all-invalid selections (rows 1 and
-//!   batched 1..8) write exactly +0.0 for every split count and layout.
-//! * `qsa_splitk_batched_rows_bitwise_individual`: rows 1..8 batched launches
-//!   equal, bit for bit, the single-row launches of the same q row, selected row
-//!   and position_start + row, for heterogeneous selected_len (compress 8,
-//!   budgets around the block boundary, empty slices, S > len, capacity clamp,
-//!   an all-invalid row inside every batch of two or more rows). Every output
-//!   starts as a NaN sentinel; batched outputs are also compared with the exact
-//!   reference.
-//! * `qsa_splitk_wide_rows_*_bitwise_individual` (wide verify, design 7B): the
-//!   production geometry (compress 4, budget 512, capacity 2051, F32 K/V,
-//!   24 heads / 2 KV heads / head_dim 256) at end depths 8192 / 32768 / 131072 /
-//!   262144 (full cache capacity = depth), end displacements 0..3 (selected
-//!   lengths 2048..2051 across every tail phase). Batched n = 1..=32 rows
-//!   (every n at displacement 0, ragged 1/2/3/4/5/8/9/15/16/17/31/32 elsewhere)
-//!   equal bit for bit the n single-row launches of the same (splits, layout):
-//!   production S32/layout 2, lab S16/S48 layout 2 and layouts 0/1 at S8, plus
-//!   the production dispatcher (`indexed_attention_attention_batch`, split-K on
-//!   gfx1151, the per-head kernels on gfx1201). Selections mix padded, garbage-
-//!   after-ell, invalid-token and all-invalid rows; K/V rows no earlier row may
-//!   read (>= its visible count) are set huge and the earlier rows must not
-//!   change. The wide gate is set inside `launch` through
-//!   `Gpu::set_wide_verify_rows` (32 for a batched launch, 0 for one row), never
-//!   by env. The existing batched tests now run rows 1..=32.
-//! * `qsa_splitk_timing_table`: hipEvent timing (100 calls per sample, median
-//!   of 5, warmup) of the incumbent and every split/layout at rows 1, lengths
-//!   1131 and 8188 (the longest length whose incumbent still fits the 64 KiB
-//!   dynamic-LDS parallel kernel; 8195 falls to the serial kernel and is not
-//!   timed). Each row carries the modelled K/V bytes per call (K and V
-//!   separately and total, all tokens valid): 49152 * len for the per-head
-//!   layouts 0/1 and the incumbent, 4096 * len for the grouped layout 2. The
-//!   best head and best group combos are compared per length. Nothing is
-//!   asserted on timings.
+//! `qsa_splitk_wide_production_reference_bytes` is the strict G1 dispatcher
+//! gate: every R1..64, two finite-input seeds, every compress4/8 starting residue
+//! at nonzero positions, empty/short/maximum selections, and windows spanning
+//! per-head and split-K LDS boundaries. Both `Qwen4VerifyReference` modes execute
+//! the production dispatcher eagerly and compare every output byte with
+//! sequential singleton dispatcher calls bound to the same mode. Recorded is
+//! an arithmetic binding, not graph capture. Row and reference scopes are
+//! restored before reporting launch errors. Policy metadata and the terminal
+//! launch's bound module/object SHA are reported; terminal identity alone is
+//! not an inventory of every launch in a multi-run window.
 //!
-//! `#[ignore]`d: needs a working HIP device. Run explicitly, one test thread
-//! (the tests share the one GPU):
+//! The nonzero, prepopulated immutable K/V prefix is the same S0 in both arms;
+//! absolute positions advance sequentially and future cache rows stay invisible.
+//! This attention-only test does NOT exercise cache append/pooling/selection,
+//! retained replay, full-model state transitions, or throughput qualification.
+//! Output guards/inactive rows are poisoned, inputs and K/V are checked bytewise,
+//! and future-cache perturbations must not affect earlier output rows.
 //!
-//!   HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0 cargo test -p rdna-compute --release --features lab --test qsa_decode_splitk \
+//! `qsa_splitk_wide_rows_*_bitwise_individual` separately checks direct split
+//! layouts at every R1..64, all compress4 residues, two seeds, and 8K..256K
+//! contexts. The older `*_matches_exact`, batched, and all-invalid tests retain
+//! their approximate split-vs-per-head diagnostic comparisons; their tolerance
+//! is NOT the strict production-reference byte oracle. Timing is diagnostic.
+//! Finite seeded operands are not an all-NaN/exceptional-domain proof. Physical
+//! capacity64 and explicit lab admission do not promote the certified table8.
+//!
+//! Ignored hardware gates refuse fatally on missing devices, unsupported
+//! architectures, unadmitted rows, launch errors, or mismatches. Run serially:
+//!
+//!   HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1 cargo test -p rdna-compute --release --features lab --test qsa_decode_splitk qsa_splitk_wide_ \
 //!       -- --ignored --nocapture --test-threads=1
 //!
-//! No environment variable is set by this file. `qsa_splitk_timing_table`
-//! requires `HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0` in the caller's environment
-//! (split-K is on by default on gfx1151), so its production-dispatch row is the
-//! per-head incumbent route.
+//! Run the separate timing diagnostic with HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0.
+//! This file never changes environment variables.
 
 #![cfg(feature = "lab")]
 
-use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+use rdna_compute::prefill_invariant::{Qwen4VerifyReference, WIDE_VERIFY_MAX_ROWS};
 use rdna_compute::tensor_ops::{
     indexed_attention_attention_batch, indexed_attention_attention_batch_exact,
-    indexed_attention_attention_splitk_for_test, IndexedAttentionAttentionBatch, QsaKvFormat,
+    indexed_attention_attention_splitk_for_test, qsa_decode_attention_policy_for_row_for_test,
+    IndexedAttentionAttentionBatch, QsaDecodeAttentionPolicy, QsaKvFormat,
     QSA_DECODE_SPLITK_SCORING_LAYOUT, QSA_DECODE_SPLITK_SPLITS,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -260,6 +240,52 @@ fn download(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
     gpu.download_f32(t).expect("download")
 }
 
+fn device_bytes(gpu: &Gpu, tensor: &GpuTensor, bytes: usize) -> Vec<u8> {
+    let mut data = vec![0u8; bytes];
+    gpu.hip
+        .memcpy_dtoh_at(&mut data, &tensor.buf, 0)
+        .expect("download tensor bytes");
+    data
+}
+
+fn assert_bytes(got: &[u8], want: &[u8], row_bytes: usize, label: &str) {
+    assert_eq!(got.len(), want.len(), "{label}: byte extent");
+    if let Some(i) = got.iter().zip(want).position(|(a, b)| a != b) {
+        panic!(
+            "{label}: row={} word={} byte={} got={:#04x} want={:#04x} extent={}",
+            i / row_bytes,
+            (i % row_bytes) / 4,
+            i,
+            got[i],
+            want[i],
+            got.len()
+        );
+    }
+}
+
+fn guarded_bytes(gpu: &Gpu, out: &GpuTensor, live: usize, label: &str) -> Vec<u8> {
+    let mut bytes = device_bytes(gpu, out, out.numel() * 4);
+    let poison = SENTINEL.to_le_bytes();
+    assert!(
+        bytes[live * 4..]
+            .iter()
+            .enumerate()
+            .all(|(i, byte)| *byte == poison[i % 4]),
+        "{label}: output guard/inactive tail overwritten (live={}B total={}B)",
+        live * 4,
+        bytes.len()
+    );
+    bytes.truncate(live * 4);
+    bytes
+}
+
+fn guarded_download(gpu: &Gpu, out: &GpuTensor, live: usize, label: &str) -> Vec<f32> {
+    guarded_bytes(gpu, out, live, label)
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     rows: usize,
@@ -308,7 +334,7 @@ fn launch(
     };
     // A verify forward of two or more rows runs row-exact to the widest rows;
     // a one-row launch is the decode itself.
-    gpu.set_wide_verify_rows(if sh.rows >= 2 {
+    let previous_rows = gpu.set_wide_verify_rows(if sh.rows >= 2 {
         WIDE_VERIFY_MAX_ROWS
     } else {
         0
@@ -320,7 +346,7 @@ fn launch(
             indexed_attention_attention_splitk_for_test(gpu, &p, splits, layout)
         }
     };
-    gpu.set_wide_verify_rows(0);
+    gpu.set_wide_verify_rows(previous_rows);
     if let Err(e) = result {
         panic!("{kind:?} failed for {sh:?}: {e:?}");
     }
@@ -613,7 +639,7 @@ struct BatchCfg {
     capacity: usize,
 }
 
-/// `MAX_BATCH_ROWS`-row windows (`rows` 1..=32 take the prefix) with heterogeneous
+/// `MAX_BATCH_ROWS`-row windows (`rows` 1..=64 take the prefix) with heterogeneous
 /// `selected_len`: S > len, budget at the block boundary (selected_len drops when a
 /// block completes), empty slices, capacity clamp, and the long contexts.
 const BATCH_CFGS: [BatchCfg; 9] = [
@@ -695,7 +721,7 @@ fn row_mode(r: usize, force: Option<Mode>) -> Mode {
     }
 }
 
-/// Host data of a config's eight rows.
+/// Host data of a config's full physical row capacity.
 fn batch_host(cfg: &BatchCfg, force: Option<Mode>) -> (Vec<f32>, Vec<Vec<i32>>, Vec<usize>) {
     let mut rng = Rng(0x2000_0000
         + (cfg.position_start * 13 + cfg.compress) as u64 * 7919
@@ -848,13 +874,13 @@ fn qsa_splitk_all_invalid_zero() {
 }
 
 // ---------------------------------------------------------------------------
-// Wide verify: production geometry, n = 1..=32 rows, 8K..256K end depths
+// Wide verify: production geometry, n = 1..=64 rows, 8K..256K end depths
 // ---------------------------------------------------------------------------
 
 const PROD_COMPRESS: usize = 4;
 const PROD_BUDGET: usize = 512;
 const PROD_CAPACITY: usize = 2051;
-const WIDE_ROWS_RAGGED: [usize; 12] = [1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 31, 32];
+const WIDE_SEEDS: [u64; 2] = [0x3000_0001, 0x9e37_79b9_7f4a_7c15];
 /// (splits, layout) compared bitwise batched vs single-row: the production
 /// S32/layout 2, lab S16/S48 of layout 2 and the per-head layouts 0/1 at S8.
 const WIDE_COMBOS: [(usize, usize); 5] = [(32, 2), (16, 2), (48, 2), (8, 0), (8, 1)];
@@ -938,9 +964,13 @@ fn gen_wide_row(rng: &mut Rng, kind: WideRow, visible: usize, full_cap: usize) -
 
 /// K and V of `full_cap` rows, uploaded in chunks (no host copy of the cache).
 fn make_dev_long(gpu: &mut Gpu, full_cap: usize) -> Dev {
+    make_dev_long_seeded(gpu, full_cap, 0x5a5a_1001)
+}
+
+fn make_dev_long_seeded(gpu: &mut Gpu, full_cap: usize, seed: u64) -> Dev {
     const CHUNK_ROWS: usize = 8192;
     let row = NKV * HD;
-    let mut rng = Rng(0x5a5a_1001 ^ full_cap as u64);
+    let mut rng = Rng(seed ^ full_cap as u64);
     let mut tensors = Vec::new();
     for _ in 0..2 {
         let t = gpu
@@ -966,6 +996,32 @@ fn make_dev_long(gpu: &mut Gpu, full_cap: usize) -> Dev {
         keys,
         values,
         full_cap,
+    }
+}
+
+/// Recreate the uploaded finite cache stream, comparing exact bytes in chunks.
+/// This also checks future/inactive cache rows without retaining a GB host copy.
+fn assert_dev_unchanged(gpu: &Gpu, dev: &Dev, seed: u64) {
+    let row_elements = NKV * HD;
+    let mut rng = Rng(seed ^ dev.full_cap as u64);
+    for (name, tensor) in [("keys", &dev.keys), ("values", &dev.values)] {
+        for first in (0..dev.full_cap).step_by(8192) {
+            let rows = 8192.min(dev.full_cap - first);
+            let want: Vec<u8> = fill(&mut rng, rows * row_elements, 1.0)
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            let mut got = vec![0u8; want.len()];
+            gpu.hip
+                .memcpy_dtoh_at(&mut got, &tensor.buf, first * row_elements * 4)
+                .expect("read immutable cache chunk");
+            assert_bytes(
+                &got,
+                &want,
+                row_elements * 4,
+                &format!("{name} immutable seed={seed:#x} first={first}"),
+            );
+        }
     }
 }
 
@@ -1005,6 +1061,7 @@ fn wide_splitk_window(
     dev: &Dev,
     e_end: usize,
     n: usize,
+    seed: u64,
     fails: &mut Vec<String>,
 ) -> usize {
     let ps = e_end - n;
@@ -1015,7 +1072,7 @@ fn wide_splitk_window(
         compress: PROD_COMPRESS,
         capacity: PROD_CAPACITY,
     };
-    let mut rng = Rng(0x3000_0000 + (e_end * 131 + n) as u64 * 7919);
+    let mut rng = Rng(seed ^ ((e_end * 131 + n) as u64).wrapping_mul(7919));
     let q = make_q(&mut rng, n);
     let sel: Vec<Vec<i32>> = (0..n)
         .map(|r| gen_wide_row(&mut rng, wide_row_kind(r), ps + r + 1, dev.full_cap))
@@ -1024,6 +1081,12 @@ fn wide_splitk_window(
     let row_len = NH * HD;
     let q_t = upload_q(gpu, &q);
     let sel_t = upload_selected(gpu, &sel);
+    let q_bytes: Vec<u8> = q.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let selected_bytes: Vec<u8> = sel
+        .iter()
+        .flatten()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
     let singles: Vec<(GpuTensor, GpuTensor)> = (0..n)
         .map(|r| {
             (
@@ -1032,18 +1095,17 @@ fn wide_splitk_window(
             )
         })
         .collect();
-    let mut kinds: Vec<Kind> = WIDE_COMBOS
+    let kinds: Vec<Kind> = WIDE_COMBOS
         .iter()
         .map(|&(s, l)| Kind::Split(s, l))
         .collect();
-    kinds.push(Kind::Production);
     let mut cases = 0usize;
     let mut base_out: Option<Vec<f32>> = None;
     for kind in kinds {
-        let label = format!("wide E={e_end} n={n} {kind:?}");
-        let out = sentinel(gpu, n * row_len);
+        let label = format!("wide seed={seed:#x} E={e_end} n={n} {kind:?}");
+        let out = sentinel(gpu, (WIDE_VERIFY_MAX_ROWS + 1) * row_len);
         launch(gpu, kind, dev, &q_t, &sel_t, &out, &sh);
-        let got = download(gpu, &out);
+        let got = guarded_download(gpu, &out, n * row_len, &label);
         gpu.free_tensor(out).expect("free out");
         for r in 0..n {
             let single = Shape {
@@ -1051,9 +1113,9 @@ fn wide_splitk_window(
                 position_start: ps + r,
                 ..sh
             };
-            let o1 = sentinel(gpu, row_len);
+            let o1 = sentinel(gpu, 2 * row_len);
             launch(gpu, kind, dev, &singles[r].0, &singles[r].1, &o1, &single);
-            let alone = download(gpu, &o1);
+            let alone = guarded_download(gpu, &o1, row_len, &label);
             gpu.free_tensor(o1).expect("free single out");
             let batched = &got[r * row_len..(r + 1) * row_len];
             if let Some(i) = (0..row_len).find(|&i| alone[i].to_bits() != batched[i].to_bits()) {
@@ -1082,9 +1144,9 @@ fn wide_splitk_window(
         let k = n / 2;
         let first = ps + k;
         let saved = perturb_rows(gpu, dev, first, e_end - first);
-        let out = sentinel(gpu, n * row_len);
+        let out = sentinel(gpu, (WIDE_VERIFY_MAX_ROWS + 1) * row_len);
         launch(gpu, Kind::Split(32, 2), dev, &q_t, &sel_t, &out, &sh);
-        let perturbed = download(gpu, &out);
+        let perturbed = guarded_download(gpu, &out, n * row_len, "wide future-cache");
         gpu.free_tensor(out).expect("free out");
         restore_rows(gpu, dev, first, &saved);
         let base = base_out.expect("production split combo ran");
@@ -1102,9 +1164,33 @@ fn wide_splitk_window(
         }
         cases += 1;
     }
+    assert_bytes(
+        &device_bytes(gpu, &q_t, q_bytes.len()),
+        &q_bytes,
+        q_row * 4,
+        "direct wide q immutable",
+    );
+    assert_bytes(
+        &device_bytes(gpu, &sel_t, selected_bytes.len()),
+        &selected_bytes,
+        PROD_CAPACITY * 4,
+        "direct wide selected immutable",
+    );
     gpu.free_tensor(q_t).expect("free q");
     gpu.free_tensor(sel_t).expect("free selected");
-    for (a, b) in singles {
+    for (row, (a, b)) in singles.into_iter().enumerate() {
+        assert_bytes(
+            &device_bytes(gpu, &a, q_row * 4),
+            &q_bytes[row * q_row * 4..(row + 1) * q_row * 4],
+            q_row * 4,
+            "direct singleton q immutable",
+        );
+        assert_bytes(
+            &device_bytes(gpu, &b, PROD_CAPACITY * 4),
+            &selected_bytes[row * PROD_CAPACITY * 4..(row + 1) * PROD_CAPACITY * 4],
+            PROD_CAPACITY * 4,
+            "direct singleton selected immutable",
+        );
         gpu.free_tensor(a).expect("free single q");
         gpu.free_tensor(b).expect("free single selected");
     }
@@ -1113,22 +1199,25 @@ fn wide_splitk_window(
 
 fn wide_splitk_depth(depth: usize) {
     let mut gpu = Gpu::init().expect("gpu init");
+    assert!(
+        matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201" | "gfx1100"),
+        "wide direct gate unsupported architecture: {}",
+        gpu.arch
+    );
     println!("arch={} depth={depth}", gpu.arch);
     let dev = make_dev_long(&mut gpu, depth);
     let mut fails = Vec::new();
     let (mut windows, mut cases) = (0usize, 0usize);
-    for disp in 0..PROD_COMPRESS {
-        let e_end = depth - disp;
-        let ns: Vec<usize> = if disp == 0 {
-            (1..=WIDE_VERIFY_MAX_ROWS).collect()
-        } else {
-            WIDE_ROWS_RAGGED.to_vec()
-        };
-        for n in ns {
-            cases += wide_splitk_window(&mut gpu, &dev, e_end, n, &mut fails);
-            windows += 1;
+    for seed in WIDE_SEEDS {
+        for disp in 0..PROD_COMPRESS {
+            let e_end = depth - disp;
+            for n in 1..=WIDE_VERIFY_MAX_ROWS {
+                cases += wide_splitk_window(&mut gpu, &dev, e_end, n, seed, &mut fails);
+                windows += 1;
+            }
         }
     }
+    assert_dev_unchanged(&gpu, &dev, 0x5a5a_1001);
     println!("depth {depth}: {windows} windows, {cases} combo cases");
     if !fails.is_empty() {
         let shown: Vec<&str> = fails.iter().take(40).map(String::as_str).collect();
@@ -1324,4 +1413,449 @@ fn modelled_kv_bytes(layout: usize, len: usize) -> (usize, usize) {
     let heads = if layout == 2 { NKV } else { NH };
     let each = heads * len * HD * std::mem::size_of::<f32>();
     (each, each)
+}
+
+// ---------------------------------------------------------------------------
+// G1: actual dispatcher, enum-bound singleton arithmetic, strict output bytes
+// ---------------------------------------------------------------------------
+
+const PER_HEAD_LDS_MAX_SELECTED: usize = (64 * 1024 - 32) / 8;
+
+/// Independent transcription of the production LDS contract, not a byte oracle.
+fn split_lds_max_selected() -> usize {
+    let entry_bytes = if QSA_DECODE_SPLITK_SCORING_LAYOUT == 2 {
+        52
+    } else {
+        8
+    };
+    (64 * 1024 - 416) / entry_bytes * QSA_DECODE_SPLITK_SPLITS
+}
+
+/// Restore both host scopes before returning success OR any dispatcher refusal.
+/// No recorder/capture is armed: Recorded binds arithmetic while launching eagerly.
+#[allow(clippy::too_many_arguments)]
+fn production_bound(
+    gpu: &mut Gpu,
+    dev: &Dev,
+    q: &GpuTensor,
+    selected: &GpuTensor,
+    out: &GpuTensor,
+    sh: &Shape,
+    mode: Qwen4VerifyReference,
+    receipt: bool,
+) -> Result<(Vec<QsaDecodeAttentionPolicy>, String), String> {
+    let p = IndexedAttentionAttentionBatch {
+        q_with_gate: q,
+        full_keys: &dev.keys,
+        full_values: &dev.values,
+        selected,
+        output: out,
+        rows: sh.rows,
+        position_start: sh.position_start,
+        n_heads: NH,
+        n_kv_heads: NKV,
+        head_dim: HD,
+        budget_blocks: sh.budget,
+        compress: sh.compress,
+        capacity: sh.capacity,
+        full_capacity: dev.full_cap,
+        format: QsaKvFormat::F32,
+        shape_selected: sh.capacity,
+    };
+    let previous_rows =
+        gpu.set_wide_verify_rows(if sh.rows > 1 { WIDE_VERIFY_MAX_ROWS } else { 0 });
+    let previous_reference = gpu.set_qwen4_verify_reference(Some(mode));
+    let policies: Option<Vec<_>> = (0..sh.rows)
+        .map(|row| qsa_decode_attention_policy_for_row_for_test(gpu, &p, row))
+        .collect();
+    let result = if policies.is_some() {
+        indexed_attention_attention_batch(gpu, &p).map_err(|error| error.to_string())
+    } else {
+        Err(format!("unadmitted production candidate: {mode:?} {sh:?}"))
+    };
+    let terminal = gpu.last_launched_kernel().map(str::to_owned);
+    gpu.set_qwen4_verify_reference(previous_reference);
+    gpu.set_wide_verify_rows(previous_rows);
+    assert_eq!(gpu.qwen4_verify_reference(), previous_reference);
+    // Observe the restored row scope via the setter's previous-value contract.
+    assert_eq!(gpu.set_wide_verify_rows(previous_rows), previous_rows);
+    result?;
+    let policies = policies.ok_or("missing admitted per-row policies")?;
+    for (row, &policy) in policies.iter().enumerate() {
+        // This is the dispatch upper bound, NOT the possibly shorter selected_len
+        // at a complete compression block. Keep both laws independently tested.
+        let bound = (sh.position_start + row + 1)
+            .min(sh.capacity)
+            .min(sh.budget * sh.compress + sh.compress - 1);
+        let expected = if mode == Qwen4VerifyReference::Eager
+            && gpu.arch == "gfx1151"
+            && bound <= split_lds_max_selected()
+        {
+            QsaDecodeAttentionPolicy::SplitK {
+                splits: QSA_DECODE_SPLITK_SPLITS,
+                layout: QSA_DECODE_SPLITK_SCORING_LAYOUT,
+            }
+        } else {
+            QsaDecodeAttentionPolicy::PerHead
+        };
+        assert_eq!(
+            policy, expected,
+            "mode={mode:?} {sh:?} row={row} selected_bound={bound}: reached policy"
+        );
+    }
+    let terminal = terminal.ok_or("dispatcher did not report a terminal launch")?;
+    let last_policy = policies.last().ok_or("empty policy sequence")?;
+    let expected_terminal = match last_policy {
+        QsaDecodeAttentionPolicy::SplitK { .. } => "qsa_decode_splitk_combine_f32",
+        QsaDecodeAttentionPolicy::PerHead => {
+            let bound = if mode == Qwen4VerifyReference::Recorded {
+                sh.capacity
+            } else {
+                (sh.position_start + sh.rows)
+                    .min(sh.capacity)
+                    .min(sh.budget * sh.compress + sh.compress - 1)
+            };
+            if gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
+                && bound > 0
+                && bound <= PER_HEAD_LDS_MAX_SELECTED
+            {
+                "indexed_attention_attention_f32_batched"
+            } else {
+                "indexed_attention_attention_f32_batched_serial"
+            }
+        }
+        QsaDecodeAttentionPolicy::SplitKvQ8 { .. } => {
+            return Err("F32 candidate unexpectedly selected Q8 split-KV".into());
+        }
+    };
+    assert_eq!(
+        terminal, expected_terminal,
+        "mode={mode:?} {sh:?}: terminal launch differs from last row's singleton recipe"
+    );
+    if receipt {
+        let (module, container_sha, sha) = gpu
+            .lab_kernel_device_identity(&terminal)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            !module.is_empty() && !sha.is_empty(),
+            "missing bound object identity"
+        );
+        println!(
+            "G1 attention arch={} mode={mode:?} R={} ps={} compress={} budget={} capacity={} \
+             policies={policies:?} terminal={terminal} module={module} container_sha256={container_sha} object_sha256={sha} \
+             q_bytes={} selected_bytes={} output_live_bytes={} output_total_bytes={} kv_bytes_each={}",
+            gpu.arch, sh.rows, sh.position_start, sh.compress, sh.budget, sh.capacity,
+            q.numel() * 4, selected.numel(), sh.rows * NH * HD * 4,
+            out.numel() * 4, dev.full_cap * NKV * HD * 4
+        );
+    }
+    Ok((policies, terminal))
+}
+
+fn strict_selected(rng: &mut Rng, sh: &Shape, full_cap: usize) -> Vec<Vec<i32>> {
+    (0..WIDE_VERIFY_MAX_ROWS)
+        .map(|row| {
+            let visible = sh.position_start + row + 1;
+            let ell = selected_len(visible, sh.budget, sh.compress, sh.capacity);
+            let mut selected = vec![-1; sh.capacity];
+            for (i, token) in selected.iter_mut().enumerate() {
+                *token = if row % 11 == 10 {
+                    wide_invalid_token(rng, visible, full_cap)
+                } else if i >= ell {
+                    if row % 2 == 0 {
+                        valid_token(rng, visible)
+                    } else {
+                        -1
+                    }
+                } else if row % 3 == 2 && i % 7 == 0 {
+                    wide_invalid_token(rng, visible, full_cap)
+                } else {
+                    valid_token(rng, visible)
+                };
+            }
+            if ell > 0 && row % 11 != 10 {
+                selected[0] = valid_token(rng, visible);
+            }
+            selected
+        })
+        .collect()
+}
+
+fn assert_strict_row(bytes: &[u8], selected: &[i32], sh: &Shape, row: usize, label: &str) {
+    let visible = sh.position_start + row + 1;
+    let ell = selected_len(visible, sh.budget, sh.compress, sh.capacity);
+    let has_valid = selected
+        .iter()
+        .take(ell)
+        .any(|&token| token >= 0 && (token as usize) < visible);
+    if !has_valid {
+        assert!(
+            bytes.iter().all(|&byte| byte == 0),
+            "{label}: row={row} expected +0"
+        );
+    } else {
+        assert!(
+            bytes
+                .chunks_exact(4)
+                .all(|word| f32::from_le_bytes(word.try_into().unwrap()).is_finite()),
+            "{label}: row={row} nonfinite/unwritten output"
+        );
+        assert!(
+            bytes.iter().any(|&byte| byte != 0),
+            "{label}: row={row} unexpectedly all +0"
+        );
+    }
+}
+
+fn strict_production_window(gpu: &mut Gpu, dev: &Dev, sh: Shape, seed: u64, label: &str) {
+    assert_eq!(sh.rows, WIDE_VERIFY_MAX_ROWS);
+    assert!(sh.position_start > 0 && sh.position_start + sh.rows < dev.full_cap);
+    let q_row = 2 * NH * HD;
+    let output_row = NH * HD;
+    let row_bytes = output_row * 4;
+    let mut rng = Rng(seed ^ sh.position_start as u64 ^ sh.budget as u64);
+    let mut q = make_q(&mut rng, WIDE_VERIFY_MAX_ROWS);
+    q[0] = -0.0;
+    q[1] = 0.0;
+    q.extend(std::iter::repeat_n(f32::from_bits(SENTINEL), q_row));
+    let mut selected = strict_selected(&mut rng, &sh, dev.full_cap);
+    selected.push(vec![i32::MIN; sh.capacity]);
+    let q_t = upload_q(gpu, &q);
+    let selected_t = upload_selected(gpu, &selected);
+    let q_bytes: Vec<u8> = q.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let selected_bytes: Vec<u8> = selected
+        .iter()
+        .flatten()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    for mode in [Qwen4VerifyReference::Eager, Qwen4VerifyReference::Recorded] {
+        // Deliberately nest the binding under a different, nonempty host scope.
+        let previous_rows = gpu.set_wide_verify_rows(17);
+        let previous_reference = gpu.set_qwen4_verify_reference(Some(match mode {
+            Qwen4VerifyReference::Eager => Qwen4VerifyReference::Recorded,
+            Qwen4VerifyReference::Recorded => Qwen4VerifyReference::Eager,
+        }));
+        let mut want = Vec::with_capacity(WIDE_VERIFY_MAX_ROWS * row_bytes);
+        let mut singleton_policies = Vec::with_capacity(WIDE_VERIFY_MAX_ROWS);
+        let mut singleton_symbols = Vec::with_capacity(WIDE_VERIFY_MAX_ROWS);
+        // Same nonzero cache S0, monotonically advanced absolute visibility.
+        // No append is performed: prepopulated suffix rows are invisible until
+        // their singleton position, just as in the multi-row attention call.
+        for row in 0..WIDE_VERIFY_MAX_ROWS {
+            let single = Shape {
+                rows: 1,
+                position_start: sh.position_start + row,
+                ..sh
+            };
+            let mut single_q = q[row * q_row..(row + 1) * q_row].to_vec();
+            single_q.extend(std::iter::repeat_n(f32::from_bits(SENTINEL), q_row));
+            let q1 = upload_q(gpu, &single_q);
+            let s1 = upload_selected(gpu, &[selected[row].clone(), vec![i32::MIN; sh.capacity]]);
+            let before_q = device_bytes(gpu, &q1, q1.numel() * 4);
+            let before_s = device_bytes(gpu, &s1, s1.numel());
+            let out = sentinel(gpu, 2 * output_row);
+            if row == 0 {
+                let invalid = Shape {
+                    capacity: 0,
+                    ..single
+                };
+                assert!(
+                    production_bound(gpu, dev, &q1, &s1, &out, &invalid, mode, false).is_err(),
+                    "invalid capacity must refuse, not pass the candidate"
+                );
+                assert_eq!(
+                    gpu.qwen4_verify_reference(),
+                    Some(match mode {
+                        Qwen4VerifyReference::Eager => Qwen4VerifyReference::Recorded,
+                        Qwen4VerifyReference::Recorded => Qwen4VerifyReference::Eager,
+                    }),
+                    "reference scope not restored after refusal"
+                );
+                assert_eq!(gpu.set_wide_verify_rows(17), 17, "row scope after refusal");
+            }
+            let (policies, symbol) = production_bound(
+                gpu, dev, &q1, &s1, &out, &single, mode, false,
+            )
+            .unwrap_or_else(|error| panic!("{label} seed={seed:#x} singleton row={row}: {error}"));
+            singleton_policies.push(policies[0]);
+            singleton_symbols.push(symbol);
+            let bytes = guarded_bytes(gpu, &out, output_row, label);
+            assert_strict_row(&bytes, &selected[row], &sh, row, label);
+            want.extend(bytes);
+            assert_bytes(
+                &device_bytes(gpu, &q1, before_q.len()),
+                &before_q,
+                q_row * 4,
+                "singleton q immutable",
+            );
+            assert_bytes(
+                &device_bytes(gpu, &s1, before_s.len()),
+                &before_s,
+                sh.capacity * 4,
+                "singleton selected immutable",
+            );
+            gpu.free_tensor(out).expect("free singleton output");
+            gpu.free_tensor(q1).expect("free singleton q");
+            gpu.free_tensor(s1).expect("free singleton selected");
+        }
+        if label == "split-policy-crossing"
+            && mode == Qwen4VerifyReference::Eager
+            && gpu.arch == "gfx1151"
+        {
+            assert!(singleton_policies
+                .iter()
+                .any(|p| matches!(p, QsaDecodeAttentionPolicy::SplitK { .. })));
+            assert!(singleton_policies.contains(&QsaDecodeAttentionPolicy::PerHead));
+        }
+        if label == "perhead-lds-crossing"
+            && mode == Qwen4VerifyReference::Eager
+            && gpu.arch != "gfx1151"
+        {
+            assert!(singleton_symbols
+                .iter()
+                .any(|s| s == "indexed_attention_attention_f32_batched"));
+            assert!(singleton_symbols
+                .iter()
+                .any(|s| s == "indexed_attention_attention_f32_batched_serial"));
+        }
+        for rows in 1..=WIDE_VERIFY_MAX_ROWS {
+            let batch = Shape { rows, ..sh };
+            let case = format!("{label} seed={seed:#x} mode={mode:?} {batch:?}");
+            let out = sentinel(gpu, (WIDE_VERIFY_MAX_ROWS + 1) * output_row);
+            let (policies, terminal) =
+                production_bound(gpu, dev, &q_t, &selected_t, &out, &batch, mode, true)
+                    .unwrap_or_else(|error| panic!("{case}: fatal candidate refusal: {error}"));
+            assert_eq!(
+                policies,
+                singleton_policies[..rows],
+                "{case}: per-row policy parity"
+            );
+            assert_eq!(
+                terminal,
+                singleton_symbols[rows - 1],
+                "{case}: terminal singleton recipe"
+            );
+            let got = guarded_bytes(gpu, &out, rows * output_row, &case);
+            assert_bytes(&got, &want[..rows * row_bytes], row_bytes, &case);
+            gpu.free_tensor(out).expect("free candidate output");
+            if rows >= 2 {
+                let keep = rows / 2;
+                let first = sh.position_start + keep;
+                let saved = perturb_rows(gpu, dev, first, rows - keep);
+                let out = sentinel(gpu, (WIDE_VERIFY_MAX_ROWS + 1) * output_row);
+                let changed =
+                    production_bound(gpu, dev, &q_t, &selected_t, &out, &batch, mode, false)
+                        .map(|_| guarded_bytes(gpu, &out, rows * output_row, &case));
+                // Download (and synchronize) before restoring the fixture; also
+                // restore it on dispatcher refusal before reporting the error.
+                restore_rows(gpu, dev, first, &saved);
+                let changed = changed
+                    .unwrap_or_else(|error| panic!("{case}: perturbed candidate refused: {error}"));
+                assert_bytes(
+                    &changed[..keep * row_bytes],
+                    &got[..keep * row_bytes],
+                    row_bytes,
+                    &format!("{case}: future-cache invisibility"),
+                );
+                gpu.free_tensor(out).expect("free perturbed output");
+            }
+            assert_bytes(
+                &device_bytes(gpu, &q_t, q_bytes.len()),
+                &q_bytes,
+                q_row * 4,
+                &format!("{case}: q immutable"),
+            );
+            assert_bytes(
+                &device_bytes(gpu, &selected_t, selected_bytes.len()),
+                &selected_bytes,
+                sh.capacity * 4,
+                &format!("{case}: selected immutable"),
+            );
+        }
+        assert_dev_unchanged(gpu, dev, seed);
+        gpu.set_qwen4_verify_reference(previous_reference);
+        assert_eq!(
+            gpu.set_wide_verify_rows(previous_rows),
+            17,
+            "nested row scope lost"
+        );
+    }
+    gpu.free_tensor(q_t).expect("free candidate q");
+    gpu.free_tensor(selected_t)
+        .expect("free candidate selected");
+}
+
+#[test]
+#[ignore = "strict G1: requires admitted HIP hardware; device/route refusal is fatal"]
+fn qsa_splitk_wide_production_reference_bytes() {
+    assert_eq!(
+        WIDE_VERIFY_MAX_ROWS, 64,
+        "physical row capacity, not certified table8"
+    );
+    let mut gpu = Gpu::init().expect("strict G1 requires a HIP device");
+    assert!(
+        matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201" | "gfx1100"),
+        "strict G1 unsupported architecture: {}",
+        gpu.arch
+    );
+    assert!(
+        gpu.arch != "gfx1151" || gpu.flags.qwen4_qsa_decode_splitk_enabled(),
+        "strict Halo G1 requires production split-K enabled; use HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1"
+    );
+    let split_limit = split_lds_max_selected();
+    let full_cap = split_limit.max(PER_HEAD_LDS_MAX_SELECTED) + 256;
+    for seed in WIDE_SEEDS {
+        println!("G1 finite attention seed={seed:#x} full_capacity={full_cap}");
+        let dev = make_dev_long_seeded(&mut gpu, full_cap, seed);
+        for compress in [4usize, 8] {
+            for residue in 0..compress {
+                for (label, position_start, budget, capacity) in [
+                    ("empty-and-short", 32 + residue, 0, 16),
+                    ("short-budget", 32 + residue, 1, 2 * compress - 1),
+                    (
+                        "maximum-selection",
+                        4096 + residue,
+                        PROD_BUDGET,
+                        PROD_BUDGET * compress + compress - 1,
+                    ),
+                ] {
+                    assert_eq!(position_start % compress, residue);
+                    strict_production_window(
+                        &mut gpu,
+                        &dev,
+                        Shape {
+                            rows: WIDE_VERIFY_MAX_ROWS,
+                            position_start,
+                            budget,
+                            compress,
+                            capacity,
+                        },
+                        seed,
+                        label,
+                    );
+                }
+            }
+        }
+        for (label, boundary) in [
+            ("perhead-lds-crossing", PER_HEAD_LDS_MAX_SELECTED),
+            ("split-policy-crossing", split_limit),
+        ] {
+            strict_production_window(
+                &mut gpu,
+                &dev,
+                Shape {
+                    rows: WIDE_VERIFY_MAX_ROWS,
+                    position_start: boundary - WIDE_VERIFY_MAX_ROWS / 2,
+                    budget: HUGE,
+                    compress: 1,
+                    capacity: boundary + WIDE_VERIFY_MAX_ROWS,
+                },
+                seed,
+                label,
+            );
+        }
+        assert_dev_unchanged(&gpu, &dev, seed);
+        gpu.free_tensor(dev.keys).expect("free strict keys");
+        gpu.free_tensor(dev.values).expect("free strict values");
+    }
 }

@@ -2,59 +2,44 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Column-identity oracle of `Gpu::gemv_mq4g256v2_rows_x4` (MTP / exact-wide
-//! verify, 1..=32 activation rows of MQ4G256V2 projections).
+//! Finite-input MQ4G256V2 raw-byte oracle: direct tile R=1..=64 versus the
+//! actual production `Gpu::gemv_mq4g256v2` singleton, with loaded-object receipts.
+//! No CPU, performance, or retained-certificate claim is made.
 //!
-//! Every output element of the few-row launch must be bitwise the AR decode
-//! GEMV `Gpu::gemv_mq4g256v2` run on that activation row alone (R independent
-//! single-row launches of the actual decode-selected object). Weights are
-//! random valid MQ4G256V2 (finite normal f16 scale/zero per half group, random
-//! nibbles). Activation rows differ wildly: ordinary rows, rows scaled by
-//! 2^-60..2^60, alternating-sign cancellation rows, +0/-0/zero rows and
-//! subnormal rows. For seeds 1..=3 and rows 1..=32 (every count):
+//! Qualification requires `--capture DIR` (repeatable), in addition to all
+//! three seeded synthetic sweeps. `--synthetic-only` and `--diagnostic-product`
+//! are explicitly nonqualifying; only the latter runs product/graph diagnostics.
+//! Unknown options, missing routes/metadata, mutation, and byte mismatches fail.
 //!
-//!  (a) the Qwen3.8-Flash-Next trunk shapes (M, K), each alone in slot 0: GDN
-//!      qkv (10240, 2560), z (6144, 2560), a (48, 2560), b (48, 2560), out
-//!      (2560, 6144); QSA q (12288, 2560), k (512, 2560), v (512, 2560), indexer
-//!      (640, 2560), o (2560, 6144);
-//!  (b) the real x4 groupings in one launch: GDN qkv|z|a|b and QSA
-//!      q|k|v|indexer (K = 2560), out|o (K = 6144);
-//!  (c) synthetic single matrices with M in {1,2,3,7,8,9,15,17,33} (odd and
-//!      block-straddling M exposes matrix-local parity mistakes) at K in
-//!      {256,512,768,1024,1280,2560,6144} (every four-stream tail length);
-//!  (d) synthetic x4 groupings with odd matrix boundaries and zero-M parts in
-//!      any slot (K = 256, 1280, 2560);
-//!  (e) the same launches with the activation rows permuted (reversed) and
-//!      taken from a sub-view at row offset 3.
+//! DIR/meta.json schema:
+//! `{"schema":"mq4_rows_oracle.capture.v1","arch":"gfx1201","M":3,"K":256,
+//! "rows":64,"weights":{"path":"weights.bin","sha256":"<64 hex>"},
+//! "activations":{"path":"x.bin","sha256":"<64 hex>"},
+//! "provenance":{"source":"source-index.json",
+//! "source_sha256":"<64 hex>"}}`.
+//! Weights are exact packed `[M][K/256]` 136-byte groups; activations are exact
+//! little-endian f32 `[rows][K]`. At least 64 genuine captured rows are required;
+//! naturally repeated values/rows are legal. The first 64 are tested without
+//! manufacturing additional captured rows. Candidate activation backing has
+//! NaN prefix/suffix guards and at least eight poisoned tail rows, even at R=64.
+//! All packed f16 headers and f32 activations must be finite. All three files
+//! (including the source provenance artifact) are required and SHA256-verified.
+//! Capturing code remains responsible for the stated source/operand relationship.
 //!
-//! Even and odd output columns (matrix-local) are tallied separately, and the
-//! NaN guards on both sides of every y plus the zero-M slots' y are checked.
-//! Each eager launch asserts the actual launched symbol
-//! (`Gpu::last_launched_kernel`): the narrow `gemv_mq4g256v2_rows_x4_pm` for
-//! 1..=8 rows, `..._wide_r16_pm` for 9..=16, `..._wide_r32_pm` for 17..=32
-//! when the MQ4 wide twins are on (default here: this oracle sets
-//! `HIPFIRE_QWEN4_WIDE_TWIN_MQ4=1` when it is unset; `=0` exercises the exact
-//! 8-row group loops instead). Every case runs eagerly and (rows <= 8 and a
-//! sample of wider counts, which capture the 8-row group loops: wide verify is
-//! eager-only) from an instantiated HIP graph into freshly NaN-filled buffers;
-//! a graph replay is also repeated after the activation is overwritten at the
-//! same address. Comparison is `to_bits()`. Negative controls (perturbed
-//! activation, swapped matrices, even/odd column swap) must disagree, so a
-//! vacuous pass is impossible.
-//!
-//! `HIPFIRE_QWEN4_WIDE_TWIN_MQ4=1 cargo run --release -p rdna-compute --features lab --example mq4_rows_oracle`
-//! Exits nonzero on any mismatch.
+//! Example: `cargo run --release -p rdna-compute --features lab
+//! --example mq4_rows_oracle -- --capture /path/to/capture`.
 
-use rdna_compute::gemv::WideTwinFamily;
 use rdna_compute::{Gpu, GpuTensor};
-use std::collections::BTreeMap;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 
 const GUARD: usize = 64;
-const MAX_ROWS: usize = 32;
+const MAX_ROWS: usize = 64;
 const NAN_BITS: u32 = 0x7fc0_0000;
-/// Row counts that also replay from a HIP graph (all of 1..=8 plus samples
-/// around the wide boundaries).
-const GRAPH_ROWS: [usize; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32];
+/// Graphs are diagnostic only, never evidence for the direct tile.
+const GRAPH_ROWS: [usize; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64];
 
 struct Rng(u64);
 
@@ -129,6 +114,7 @@ struct Mat {
     /// Singleton reference, `[MAX_ROWS][m]` result bits; row r is
     /// `gemv_mq4g256v2` on activation row r. Rows `..R` are the reference of R rows.
     reference: Vec<u32>,
+    reference_receipts: Vec<Value>,
 }
 
 const SHAPES: [(&str, usize, usize); 10] = [
@@ -144,7 +130,7 @@ const SHAPES: [(&str, usize, usize); 10] = [
     ("qsa.o", 2560, 6144),
 ];
 
-/// The real groupings, by index into `SHAPES`.
+/// Declared projection groupings, not a claim of captured model census coverage.
 const GROUPS: [(&str, &[usize]); 3] = [
     ("group gdn qkv|z|a|b K=2560", &[0, 1, 2, 3]),
     ("group qsa q|k|v|indexer K=2560", &[5, 6, 7, 8]),
@@ -152,7 +138,7 @@ const GROUPS: [(&str, &[usize]); 3] = [
 ];
 
 /// Synthetic single-matrix grid.
-const SYN_M: [usize; 9] = [1, 2, 3, 7, 8, 9, 15, 17, 33];
+const SYN_M: [usize; 12] = [1, 2, 3, 7, 8, 9, 15, 17, 33, 63, 64, 65];
 const SYN_K: [usize; 7] = [256, 512, 768, 1024, 1280, 2560, 6144];
 /// Synthetic x4 groupings: M per slot (0 = zero-M part, any slot), at these K.
 const SYN_GROUPS: [[usize; 4]; 8] = [
@@ -165,7 +151,7 @@ const SYN_GROUPS: [[usize; 4]; 8] = [
     [0, 0, 0, 9],
     [7, 3, 5, 11],
 ];
-const SYN_GROUP_K: [usize; 3] = [256, 1280, 2560];
+const SYN_GROUP_K: [usize; 7] = SYN_K;
 
 type Slots<'a> = [Option<&'a Mat>; 4];
 
@@ -181,11 +167,15 @@ fn fill_nan(gpu: &Gpu, t: &GpuTensor) {
 }
 
 fn fetch(gpu: &Gpu, t: &GpuTensor) -> Vec<u32> {
-    gpu.hip.device_synchronize().expect("sync before download");
-    gpu.download_f32(t)
-        .expect("download")
-        .iter()
-        .map(|v| v.to_bits())
+    let bytes = snapshot(gpu, t);
+    assert_eq!(
+        bytes.len(),
+        t.numel() * 4,
+        "fetch requires a complete f32 allocation"
+    );
+    bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("raw output word")))
         .collect()
 }
 
@@ -228,7 +218,90 @@ fn upload_x(gpu: &mut Gpu, k: usize, rng: &mut Rng) -> GpuTensor {
     gpu.upload_f32(&x, &[x.len()]).expect("upload x")
 }
 
-/// The AR singleton on every activation row of `x` into its own buffer.
+fn valid_sha(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn identity(gpu: &Gpu, symbol: &str) -> Value {
+    assert!(!symbol.is_empty(), "missing launched symbol");
+    let (module, container_sha, sha) = gpu
+        .lab_kernel_device_identity(symbol)
+        .expect("actual loaded kernel identity");
+    assert!(
+        !module.is_empty() && valid_sha(&sha) && valid_sha(&container_sha),
+        "missing/invalid loaded object metadata"
+    );
+    json!({"symbol": symbol, "module": module, "object_sha256": sha, "container_sha256": container_sha})
+}
+
+/// Snapshot the whole allocation, including bytes outside a tensor subview.
+fn snapshot(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
+    gpu.hip
+        .device_synchronize()
+        .expect("sync before backing snapshot");
+    let mut bytes = vec![0; t.buf.size()];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &t.buf)
+        .expect("snapshot backing bytes");
+    bytes
+}
+
+fn unchanged(gpu: &Gpu, t: &GpuTensor, before: &[u8], label: &str) {
+    assert_eq!(snapshot(gpu, t), before, "mutated input backing: {label}");
+}
+
+/// The actual AR singleton, never a substitute PM C1 or CPU arithmetic.
+fn singleton_recorded(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> (Vec<u32>, Vec<Value>) {
+    let n = 2 * GUARD + MAX_ROWS * m;
+    let y = gpu
+        .upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n])
+        .expect("alloc ref");
+    let wb = snapshot(gpu, w);
+    let xb = snapshot(gpu, x);
+    let mut routes = Vec::with_capacity(MAX_ROWS);
+    let mut completed = Vec::with_capacity(MAX_ROWS * m);
+    for r in 0..MAX_ROWS {
+        gpu.gemv_mq4g256v2(
+            w,
+            &x.sub_offset(r * k, k),
+            &y.sub_offset(GUARD + r * m, m),
+            m,
+            k,
+        )
+        .expect("production singleton gemv_mq4g256v2");
+        let symbol = gpu
+            .last_launched_kernel()
+            .expect("singleton missing route")
+            .to_owned();
+        let route = identity(gpu, &symbol);
+        let bits = fetch(gpu, &y);
+        assert_eq!(
+            &bits[GUARD..GUARD + r * m],
+            completed.as_slice(),
+            "singleton overwrote a preceding reference row"
+        );
+        completed.extend_from_slice(&bits[GUARD + r * m..GUARD + (r + 1) * m]);
+        assert!(
+            bits[..GUARD]
+                .iter()
+                .chain(&bits[GUARD + (r + 1) * m..])
+                .all(|&b| b == NAN_BITS),
+            "singleton wrote guards/inactive rows"
+        );
+        unchanged(gpu, w, &wb, "singleton weights");
+        unchanged(gpu, x, &xb, "singleton x");
+        routes.push(json!({"row": r, "M": m, "K": k, "route": route}));
+    }
+    gpu.free_tensor(y).expect("free ref");
+    (completed, routes)
+}
+
 fn singleton_reference(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -236,21 +309,10 @@ fn singleton_reference(
     m: usize,
     k: usize,
 ) -> Vec<u32> {
-    let y = gpu
-        .upload_f32(
-            &vec![f32::from_bits(NAN_BITS); MAX_ROWS * m],
-            &[MAX_ROWS * m],
-        )
-        .expect("alloc ref");
-    for r in 0..MAX_ROWS {
-        gpu.gemv_mq4g256v2(w, &x.sub_offset(r * k, k), &y.sub_offset(r * m, m), m, k)
-            .expect("singleton gemv_mq4g256v2");
-    }
-    let bits = fetch(gpu, &y);
-    gpu.free_tensor(y).expect("free ref");
-    assert!(
-        bits.iter().all(|&b| f32::from_bits(b).is_finite()),
-        "singleton reference is not finite: the random weights/activations are invalid"
+    let (bits, routes) = singleton_recorded(gpu, w, x, m, k);
+    println!(
+        "{}",
+        json!({"kind":"diagnostic_singleton_reference","routes":routes})
     );
     bits
 }
@@ -260,27 +322,27 @@ fn make_mat(gpu: &mut Gpu, name: String, m: usize, k: usize, x: &GpuTensor, rng:
     let w = gpu
         .upload_raw(&bytes, &[bytes.len()])
         .expect("upload weights");
-    let reference = singleton_reference(gpu, &w, x, m, k);
+    let (reference, reference_receipts) = singleton_recorded(gpu, &w, x, m, k);
     Mat {
         name,
         m,
         k,
         w,
         reference,
+        reference_receipts,
     }
 }
 
-/// `[GUARD NaN][expected][GUARD NaN]` split into (even-column, odd-column,
-/// guard) mismatching word counts. Column = index % m (matrix-local).
+/// Prefix/suffix guards AND every inactive capacity word must retain poison.
 fn tally(got: &[u32], want: &[u32], m: usize) -> (usize, usize, usize) {
-    assert_eq!(got.len(), want.len() + 2 * GUARD);
+    assert!(got.len() >= want.len() + 2 * GUARD);
     let guard = got[..GUARD]
         .iter()
-        .chain(&got[got.len() - GUARD..])
+        .chain(&got[GUARD + want.len()..])
         .filter(|&&b| b != NAN_BITS)
         .count();
     let (mut even, mut odd) = (0, 0);
-    for (i, (&g, &w)) in got[GUARD..got.len() - GUARD].iter().zip(want).enumerate() {
+    for (i, (&g, &w)) in got[GUARD..GUARD + want.len()].iter().zip(want).enumerate() {
         if g != w {
             if (i % m) % 2 == 0 {
                 even += 1;
@@ -293,59 +355,130 @@ fn tally(got: &[u32], want: &[u32], m: usize) -> (usize, usize, usize) {
 }
 
 struct Launched {
-    /// Full guarded y bits per present slot, in slot order.
+    /// All four independently guarded allocations, including empty slots.
     bits: Vec<Vec<u32>>,
-    /// `Gpu::last_launched_kernel` after an eager launch.
-    symbol: Option<String>,
+    route: Value,
+    symbol: String,
+    refusal: Option<String>,
 }
 
 fn present<'a>(slots: &Slots<'a>) -> Vec<&'a Mat> {
     slots.iter().flatten().copied().collect()
 }
+/// Copy only live operands. Inactive rows (including the next physical tile)
+/// are poison, so an accidental overread cannot consume plausible finite data.
+fn poisoned_x_host(source: &[f32], k: usize, rows: usize, subview_rows: usize) -> Vec<f32> {
+    let live = rows * k;
+    assert!(source.len() >= live, "short activation source");
+    assert!(
+        source[..live].iter().all(|v| v.is_finite()),
+        "nonfinite live activation"
+    );
+    let prefix = GUARD + subview_rows * k;
+    let mut out = vec![f32::from_bits(NAN_BITS); prefix + (MAX_ROWS + 8) * k + GUARD];
+    out[prefix..prefix + live].copy_from_slice(&source[..live]);
+    out
+}
 
-/// One few-row launch of `slots` (zero-M parts for `None`, in any slot) over
-/// `rows` activation rows of `x` into NaN-prefilled guarded outputs.
-/// `verify_rows`: the admitted verify width (`Gpu::wide_verify_rows`) of an
-/// eager launch. `graph`: capture the launch into a HIP graph, refill NaN, and
-/// replay it (capture keeps the few-row limit at 8).
-fn launch(gpu: &mut Gpu, slots: &Slots, x: &GpuTensor, rows: usize, graph: bool) -> Launched {
-    let mats = present(slots);
-    let k = mats[0].k;
-    let outs: Vec<GpuTensor> = mats
+fn launch(
+    gpu: &mut Gpu,
+    slots: &Slots,
+    x: &GpuTensor,
+    rows: usize,
+    graph: bool,
+    diagnostic_product: bool,
+    x_subview_rows: usize,
+) -> Launched {
+    assert!((1..=MAX_ROWS).contains(&rows));
+    assert!(
+        !graph || diagnostic_product,
+        "graphs cannot qualify a direct tile"
+    );
+    let k = slots
         .iter()
-        .map(|mat| {
-            let n = GUARD + rows * mat.m + GUARD;
+        .flatten()
+        .next()
+        .map_or(x.numel() / MAX_ROWS, |m| m.k);
+    assert!(k > 0 && k % 256 == 0);
+    assert!(slots.iter().flatten().all(|m| m.k == k));
+    let xb = snapshot(gpu, x);
+    let source = gpu
+        .download_f32(x)
+        .expect("download live activation operands");
+    let poison_host = poisoned_x_host(&source, k, rows, x_subview_rows);
+    let poisoned = gpu
+        .upload_f32(&poison_host, &[poison_host.len()])
+        .expect("upload poisoned x backing");
+    let candidate_x = poisoned.sub_offset(GUARD + x_subview_rows * k, rows * k);
+    let poisoned_before = snapshot(gpu, &poisoned);
+    let wb: Vec<Option<Vec<u8>>> = slots
+        .iter()
+        .map(|m| m.map(|m| snapshot(gpu, &m.w)))
+        .collect();
+    let dummy = gpu
+        .upload_raw(&[0u8; 136], &[136])
+        .expect("empty weight allocation");
+    let dummy_before = snapshot(gpu, &dummy);
+    let outs: Vec<GpuTensor> = slots
+        .iter()
+        .map(|slot| {
+            let cap = slot.map_or(1, |m| MAX_ROWS * m.m);
+            let n = 2 * GUARD + cap;
             gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n])
-                .expect("alloc y")
+                .expect("alloc poisoned y")
         })
         .collect();
-    let views: Vec<GpuTensor> = mats
+    let views: Vec<GpuTensor> = slots
         .iter()
         .zip(&outs)
-        .map(|(mat, y)| y.sub_offset(GUARD, rows * mat.m))
+        .map(|(slot, y)| y.sub_offset(GUARD, slot.map_or(0, |m| rows * m.m)))
         .collect();
-    let mut next = 0usize;
-    let parts: Vec<(&GpuTensor, &GpuTensor, usize)> = slots
-        .iter()
-        .map(|slot| match slot {
-            Some(mat) => {
-                let p = (&mat.w, &views[next], mat.m);
-                next += 1;
-                p
-            }
-            None => (&mats[0].w, &views[0], 0),
-        })
-        .collect();
-    let parts: [(&GpuTensor, &GpuTensor, usize); 4] = parts.try_into().ok().expect("four parts");
-    let mut symbol = None;
+    let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|s| match slots[s] {
+        Some(m) => (&m.w, &views[s], m.m),
+        None => (&dummy, &views[s], 0),
+    });
+    if slots.iter().all(Option::is_none) {
+        let previous_symbol = gpu.last_launched_kernel().map(str::to_owned);
+        let refusal = gpu
+            .lab_gemv_mq4g256v2_rows_x4_t8(parts, &candidate_x, k, rows)
+            .expect_err("all-empty invalid grid unexpectedly accepted");
+        assert_eq!(
+            gpu.last_launched_kernel(),
+            previous_symbol.as_deref(),
+            "invalid-grid refusal changed launched-route marker"
+        );
+        let bits = outs.iter().map(|y| fetch(gpu, y)).collect();
+        unchanged(gpu, x, &xb, "all-empty x");
+        unchanged(
+            gpu,
+            &poisoned,
+            &poisoned_before,
+            "all-empty poisoned activation backing",
+        );
+        unchanged(gpu, &dummy, &dummy_before, "all-empty weights");
+        for y in outs {
+            gpu.free_tensor(y).expect("free empty output");
+        }
+        gpu.free_tensor(dummy).expect("free empty weights");
+        gpu.free_tensor(poisoned)
+            .expect("free all-empty poisoned x");
+        return Launched {
+            bits,
+            route: Value::Null,
+            symbol: String::new(),
+            refusal: Some(refusal.to_string()),
+        };
+    }
+    let symbol;
     if graph {
         gpu.wide_verify_rows = 0;
         gpu.ensure_capture_stream().expect("capture stream");
         gpu.hip.device_synchronize().expect("sync");
         gpu.begin_stream_capture().expect("begin capture");
-        let captured = gpu.gemv_mq4g256v2_rows_x4(parts, x, k, rows);
+        let captured = gpu.gemv_mq4g256v2_rows_x4(parts, &candidate_x, k, rows);
+        symbol = gpu.last_launched_kernel().map(str::to_owned);
         let g = gpu.end_stream_capture().expect("end capture");
-        captured.expect("captured launch");
+        captured.expect("captured product launch");
         let exec = gpu.hip.graph_instantiate(&g).expect("instantiate");
         for y in &outs {
             fill_nan(gpu, y);
@@ -355,42 +488,57 @@ fn launch(gpu: &mut Gpu, slots: &Slots, x: &GpuTensor, rows: usize, graph: bool)
         gpu.hip.graph_exec_destroy(exec).expect("destroy exec");
         gpu.hip.graph_destroy(g).expect("destroy graph");
     } else {
-        gpu.wide_verify_rows = rows;
-        let result = gpu.gemv_mq4g256v2_rows_x4(parts, x, k, rows);
-        gpu.wide_verify_rows = 0;
-        result.expect("rows x4 launch");
+        if diagnostic_product {
+            gpu.wide_verify_rows = rows;
+            let result = gpu.gemv_mq4g256v2_rows_x4(parts, &candidate_x, k, rows);
+            gpu.wide_verify_rows = 0;
+            result.expect("diagnostic product rows launch");
+        } else {
+            gpu.lab_gemv_mq4g256v2_rows_x4_t8(parts, &candidate_x, k, rows)
+                .expect("required direct tile unsupported/missing");
+        }
         symbol = gpu.last_launched_kernel().map(str::to_owned);
     }
+    let symbol = symbol.expect("candidate missing actual launched route");
+    let route = identity(gpu, &symbol);
     let bits = outs.iter().map(|y| fetch(gpu, y)).collect();
+    unchanged(gpu, x, &xb, "tile x (whole backing)");
+    unchanged(
+        gpu,
+        &poisoned,
+        &poisoned_before,
+        "poisoned live/tail/prefix activation backing",
+    );
+    for (m, before) in slots.iter().zip(&wb) {
+        if let (Some(m), Some(before)) = (m, before) {
+            unchanged(gpu, &m.w, before, &m.name);
+        }
+    }
+    unchanged(gpu, &dummy, &dummy_before, "empty weights");
     for y in outs {
         gpu.free_tensor(y).expect("free y");
     }
-    Launched { bits, symbol }
+    gpu.free_tensor(dummy).expect("free empty weights");
+    gpu.free_tensor(poisoned).expect("free poisoned x backing");
+    Launched {
+        bits,
+        route,
+        symbol,
+        refusal: None,
+    }
 }
 
-/// Expected y rows (`ids[i]` = the reference row serving launch row i) of
-/// every present slot.
 fn expected_rows(slots: &Slots, ids: &[usize]) -> Vec<Vec<u32>> {
-    present(slots)
+    slots
         .iter()
-        .map(|m| {
-            ids.iter()
+        .map(|slot| match slot {
+            Some(m) => ids
+                .iter()
                 .flat_map(|&r| m.reference[r * m.m..(r + 1) * m.m].iter().copied())
-                .collect()
+                .collect(),
+            None => Vec::new(),
         })
         .collect()
-}
-
-/// The symbol the launcher must run for `rows` on this arch.
-fn expected_symbol(gpu: &mut Gpu, arch: &str, rows: usize, pm: bool) -> Option<String> {
-    gpu.wide_verify_rows = rows;
-    let cap = gpu.wide_twin_cap(WideTwinFamily::Mq4, rows);
-    gpu.wide_verify_rows = 0;
-    match cap {
-        Some(cap) => Some(format!("gemv_mq4g256v2_rows_x4_wide_r{cap}_pm_{arch}")),
-        None if pm => Some(format!("gemv_mq4g256v2_rows_x4_pm_{arch}")),
-        None => None,
-    }
 }
 
 #[derive(Default)]
@@ -404,8 +552,12 @@ struct Tally {
 
 struct Ctx {
     arch: String,
-    pm: bool,
+    diagnostic_product: bool,
+    synthetic_only: bool,
+    seed: u64,
     cases: usize,
+    captured: usize,
+    reached: BTreeSet<usize>,
     tallies: BTreeMap<String, Tally>,
 }
 
@@ -417,7 +569,6 @@ impl Ctx {
             .sum()
     }
 
-    /// Compare one launch against the reference rows `ids`.
     fn check(
         &mut self,
         gpu: &mut Gpu,
@@ -429,58 +580,122 @@ impl Ctx {
         graph: bool,
     ) {
         let rows = ids.len();
-        let launched = launch(gpu, slots, x, rows, graph);
+        let empty_refusal = slots.iter().all(Option::is_none);
+        let k = slots
+            .iter()
+            .flatten()
+            .next()
+            .map_or(x.numel() / MAX_ROWS, |m| m.k);
+        let mask = slots.iter().enumerate().fold(0usize, |mask, (s, m)| {
+            mask | (usize::from(m.is_some()) << s)
+        });
+        let x_subview_rows = if tag == "subview+3" { 3 } else { 0 };
+        let launched = launch(
+            gpu,
+            slots,
+            x,
+            rows,
+            graph,
+            self.diagnostic_product,
+            x_subview_rows,
+        );
+        let activation_backing = json!({"live_rows":rows,"capacity_rows":MAX_ROWS+8,
+            "poison_tail_rows":MAX_ROWS+8-rows,"guard_words_each":GUARD,
+            "subview_offset_rows":x_subview_rows,"prefix_words":GUARD+x_subview_rows*k,
+            "original_and_candidate_backing_unchanged":true});
         let want = expected_rows(slots, ids);
-        let (mut even, mut odd, mut guard, mut symbol) = (0, 0, 0, 0);
-        for ((got, want), mat) in launched.bits.iter().zip(&want).zip(present(slots)) {
-            let (e, o, g) = tally(got, want, mat.m);
+        let (mut even, mut odd, mut guard) = (0, 0, 0);
+        let mut first = Value::Null;
+        let mut matrices = Vec::new();
+        for s in 0..4 {
+            let m = slots[s].map_or(0, |m| m.m);
+            let got = &launched.bits[s];
+            let (e, o, g) = tally(got, &want[s], m);
             even += e;
             odd += o;
             guard += g;
-        }
-        if !graph {
-            if let Some(want_symbol) = expected_symbol(gpu, &self.arch, rows, self.pm) {
-                if launched.symbol.as_deref() != Some(want_symbol.as_str()) {
-                    eprintln!(
-                        "SYMBOL {label} rows={rows} {tag}: launched {:?}, expected {want_symbol}",
-                        launched.symbol
-                    );
-                    symbol = 1;
+            for (i, &actual) in got.iter().enumerate() {
+                let active = i >= GUARD && i < GUARD + want[s].len();
+                let expected = if active { want[s][i - GUARD] } else { NAN_BITS };
+                if actual != expected && first.is_null() {
+                    let logical = i.saturating_sub(GUARD);
+                    first = json!({"slot":s,"allocation_word":i,
+                        "region":if active {"live"} else {"guard_or_inactive"},
+                        "row":if active {Some(logical / m)} else {None},
+                        "column":if active {Some(logical % m)} else {None},
+                        "parity":if active {Some((logical % m) % 2)} else {None},
+                        "actual_bits":format!("0x{actual:08x}"),
+                        "expected_bits":format!("0x{expected:08x}")});
                 }
             }
+            matrices.push(match slots[s] {
+                Some(mat) => json!({"slot":s,"name":mat.name,"M":m,"K":mat.k,
+                    "live_words":rows*m,"capacity_words":MAX_ROWS*m,
+                    "guard_words_each":GUARD,
+                    "references":ids.iter().map(|&r| &mat.reference_receipts[r]).collect::<Vec<_>>()}),
+                None => json!({"slot":s,"M":0,"live_words":0,"capacity_words":1,"guard_words_each":GUARD}),
+            });
         }
-        if even + odd + guard + symbol != 0 {
-            eprintln!(
-                "MISMATCH {label} rows={rows} {tag} {}: even-column words {even}, odd-column words {odd}, guard words {guard}",
-                if graph { "graph" } else { "eager" }
-            );
-        }
+        let expected = format!("gemv_mq4g256v2_rows_x4_t8_pm_{}", self.arch);
+        let symbol_bad =
+            usize::from(!empty_refusal && !self.diagnostic_product && launched.symbol != expected);
+        let bad = even + odd + guard + symbol_bad;
+        println!(
+            "{}",
+            json!({"kind":"cell","arch":self.arch,"seed":self.seed,
+            "label":label,"tag":tag,"mode":if empty_refusal {"invalid_grid_refusal_control"} else if graph {"diagnostic_product_graph_last_route"} else if self.diagnostic_product {"diagnostic_product"} else {"direct_tile"},
+            "expected_refusal":empty_refusal,"qualifies_component_cell":!empty_refusal && !self.diagnostic_product && !self.synthetic_only,
+            "source_kind":if self.seed == 0 {"captured"} else {"seeded_synthetic"},
+            "K":k,"live_slot_mask":mask,"refusal":launched.refusal,
+            "symbol":launched.route["symbol"],"module":launched.route["module"],
+            "object_sha256":launched.route["object_sha256"],
+            "container_sha256":launched.route["container_sha256"],
+            "rows":rows,"candidate":launched.route,"expected_symbol":if self.diagnostic_product || empty_refusal {None} else {Some(expected)},
+            "activation_backing":activation_backing,
+            "matrices":matrices,"first_mismatch":first,"even_mismatch_words":even,
+            "odd_mismatch_words":odd,"guard_or_inactive_words":guard,"symbol_errors":symbol_bad,
+            "raw_bytes_equal":bad == 0})
+        );
         let entry = self.tallies.entry(label.to_string()).or_default();
         entry.runs += 1;
         entry.even += even;
         entry.odd += odd;
         entry.guard += guard;
-        entry.symbol += symbol;
+        entry.symbol += symbol_bad;
         self.cases += 1;
+        assert_eq!(
+            bad, 0,
+            "strict raw-byte/route mismatch: {label} rows={rows} {tag}"
+        );
+        if !graph && !empty_refusal {
+            self.reached.insert(rows);
+        }
     }
 
-    /// Every row count 1..=32 eagerly; graph replay for `GRAPH_ROWS`; for the
-    /// view cases (`views`) permuted rows and a sub-view at row offset 3.
     fn run(&mut self, gpu: &mut Gpu, label: &str, slots: &Slots, x: &GpuTensor, views: bool) {
+        let empty_refusal = slots.iter().all(Option::is_none);
+        let mut reached = BTreeSet::new();
         for rows in 1..=MAX_ROWS {
             let ids: Vec<usize> = (0..rows).collect();
             self.check(gpu, label, "", slots, x, &ids, false);
-            if GRAPH_ROWS.contains(&rows) {
+            if !empty_refusal {
+                reached.insert(rows);
+            }
+            if self.diagnostic_product && !empty_refusal && GRAPH_ROWS.contains(&rows) {
                 self.check(gpu, label, "", slots, x, &ids, true);
             }
         }
-        if !views {
+        assert_eq!(
+            reached.len(),
+            if empty_refusal { 0 } else { MAX_ROWS },
+            "unreached width in cell {label}"
+        );
+        if !views || slots.iter().all(Option::is_none) {
             return;
         }
         let k = present(slots)[0].k;
         let host = gpu.download_f32(x).expect("download x");
-        for rows in [2usize, 9, 15, 16, 17, 31, 32] {
-            // Reversed rows: launch row i is reference row rows-1-i.
+        for rows in [2usize, 9, 15, 16, 17, 31, 32, 33, 63, 64] {
             let mut permuted = host.clone();
             for i in 0..rows {
                 permuted[i * k..(i + 1) * k]
@@ -492,12 +707,16 @@ impl Ctx {
             let ids: Vec<usize> = (0..rows).rev().collect();
             self.check(gpu, label, "permuted", slots, &xp, &ids, false);
             gpu.free_tensor(xp).expect("free permuted x");
-            // Sub-view at row offset 3.
-            if rows + 3 <= MAX_ROWS {
-                let xv = x.sub_offset(3 * k, (MAX_ROWS - 3) * k);
-                let ids: Vec<usize> = (3..3 + rows).collect();
-                self.check(gpu, label, "subview+3", slots, &xv, &ids, false);
-            }
+            // Padding keeps offset-three probes legal even at R=63/64.
+            let mut padded = vec![f32::from_bits(NAN_BITS); 3 * k];
+            padded.extend_from_slice(&host);
+            let backing = gpu
+                .upload_f32(&padded, &[padded.len()])
+                .expect("upload x subview backing");
+            let xv = backing.sub_offset(3 * k, MAX_ROWS * k);
+            let ids: Vec<usize> = (0..rows).collect();
+            self.check(gpu, label, "subview+3", slots, &xv, &ids, false);
+            gpu.free_tensor(backing).expect("free x subview backing");
         }
     }
 }
@@ -512,81 +731,119 @@ fn graph_changed_x(
     seed: u64,
     ctx: &mut Ctx,
 ) {
-    let mats = present(slots);
-    let k = mats[0].k;
+    assert!(
+        ctx.diagnostic_product,
+        "changed-x graphs are diagnostic only"
+    );
+    let k = present(slots)[0].k;
     let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
     let first = host_x(k, &mut rng);
     let x = gpu
         .upload_f32(&first, &[first.len()])
         .expect("upload stable x");
-    // References of the first activation (a fresh singleton pass per matrix).
-    let mut refs: Vec<Vec<u32>> = mats
+    let initial_poison = poisoned_x_host(&first, k, rows, 0);
+    let poisoned = gpu
+        .upload_f32(&initial_poison, &[initial_poison.len()])
+        .expect("graph poisoned x");
+    let candidate_x = poisoned.sub_offset(GUARD, rows * k);
+    let wb: Vec<Option<Vec<u8>>> = slots
         .iter()
-        .map(|m| singleton_reference(gpu, &m.w, &x, m.m, m.k))
+        .map(|m| m.map(|m| snapshot(gpu, &m.w)))
         .collect();
-    let outs: Vec<GpuTensor> = mats
+    let dummy = gpu
+        .upload_raw(&[0u8; 136], &[136])
+        .expect("empty graph weights");
+    let db = snapshot(gpu, &dummy);
+    let outs: Vec<GpuTensor> = slots
         .iter()
-        .map(|mat| {
-            let n = GUARD + rows * mat.m + GUARD;
+        .map(|m| {
+            let n = 2 * GUARD + m.map_or(1, |m| MAX_ROWS * m.m);
             gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n])
-                .expect("alloc y")
+                .expect("graph y")
         })
         .collect();
-    let views: Vec<GpuTensor> = mats
+    let views: Vec<GpuTensor> = slots
         .iter()
         .zip(&outs)
-        .map(|(mat, y)| y.sub_offset(GUARD, rows * mat.m))
+        .map(|(m, y)| y.sub_offset(GUARD, m.map_or(0, |m| rows * m.m)))
         .collect();
-    let mut next = 0usize;
-    let parts: Vec<(&GpuTensor, &GpuTensor, usize)> = slots
-        .iter()
-        .map(|slot| match slot {
-            Some(mat) => {
-                let p = (&mat.w, &views[next], mat.m);
-                next += 1;
-                p
-            }
-            None => (&mats[0].w, &views[0], 0),
-        })
-        .collect();
-    let parts: [(&GpuTensor, &GpuTensor, usize); 4] = parts.try_into().ok().expect("four parts");
+    let parts = std::array::from_fn(|s| match slots[s] {
+        Some(m) => (&m.w, &views[s], m.m),
+        None => (&dummy, &views[s], 0),
+    });
     gpu.wide_verify_rows = 0;
     gpu.ensure_capture_stream().expect("capture stream");
     gpu.hip.device_synchronize().expect("sync");
     gpu.begin_stream_capture().expect("begin capture");
-    let captured = gpu.gemv_mq4g256v2_rows_x4(parts, &x, k, rows);
+    let captured = gpu.gemv_mq4g256v2_rows_x4(parts, &candidate_x, k, rows);
+    let symbol = gpu
+        .last_launched_kernel()
+        .expect("graph missing captured route")
+        .to_owned();
     let g = gpu.end_stream_capture().expect("end capture");
-    captured.expect("captured launch");
+    captured.expect("capture product launch");
+    let route = identity(gpu, &symbol);
     let exec = gpu.hip.graph_instantiate(&g).expect("instantiate");
     for round in 0..2 {
         if round == 1 {
             let second = host_x(k, &mut rng);
-            gpu.hip.device_synchronize().expect("sync");
+            gpu.hip
+                .device_synchronize()
+                .expect("sync before overwriting stable x");
             let bytes: Vec<u8> = second.iter().flat_map(|v| v.to_le_bytes()).collect();
             gpu.hip
                 .memcpy_htod(&x.buf, &bytes)
-                .expect("overwrite x in place");
-            refs = mats
-                .iter()
-                .map(|m| singleton_reference(gpu, &m.w, &x, m.m, m.k))
-                .collect();
+                .expect("overwrite stable x");
+            let poison_host = poisoned_x_host(&second, k, rows, 0);
+            let poison_bytes: Vec<u8> = poison_host.iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu.hip
+                .memcpy_htod(&poisoned.buf, &poison_bytes)
+                .expect("overwrite stable poisoned graph x");
         }
+        let refs: Vec<Option<(Vec<u32>, Vec<Value>)>> = slots
+            .iter()
+            .map(|m| m.map(|m| singleton_recorded(gpu, &m.w, &x, m.m, m.k)))
+            .collect();
+        let xb = snapshot(gpu, &x);
+        let poisoned_before = snapshot(gpu, &poisoned);
         for y in &outs {
             fill_nan(gpu, y);
         }
         gpu.launch_graph(&exec).expect("graph replay");
-        gpu.hip.device_synchronize().expect("sync");
         let (mut even, mut odd, mut guard) = (0, 0, 0);
-        for ((y, reference), mat) in outs.iter().zip(&refs).zip(&mats) {
-            let got = fetch(gpu, y);
-            let (e, o, g) = tally(&got, &reference[..rows * mat.m], mat.m);
+        for s in 0..4 {
+            let got = fetch(gpu, &outs[s]);
+            let m = slots[s].map_or(0, |m| m.m);
+            let want = refs[s]
+                .as_ref()
+                .map_or(&[][..], |(bits, _)| &bits[..rows * m]);
+            let (e, o, g) = tally(&got, want, m);
             even += e;
             odd += o;
             guard += g;
+            if let (Some(mat), Some(before)) = (slots[s], &wb[s]) {
+                unchanged(gpu, &mat.w, before, "changed-x graph weights");
+            }
         }
-        if even + odd + guard != 0 {
-            eprintln!("MISMATCH {label} rows={rows} graph round {round} (changed x): even {even} odd {odd} guard {guard}");
-        }
+        unchanged(gpu, &x, &xb, "changed-x graph x");
+        unchanged(
+            gpu,
+            &poisoned,
+            &poisoned_before,
+            "changed-x poisoned graph activation backing",
+        );
+        unchanged(gpu, &dummy, &db, "changed-x graph empty weights");
+        println!(
+            "{}",
+            json!({"kind":"diagnostic_changed_x","mode":"diagnostic_product_graph_last_route",
+            "qualifies_component_cell":false,"arch":ctx.arch,"seed":seed,"label":label,
+            "rows":rows,"round":round,"candidate":route,
+            "activation_backing":{"live_rows":rows,"capacity_rows":MAX_ROWS+8,
+                "poison_tail_rows":MAX_ROWS+8-rows,"guard_words_each":GUARD,
+                "original_and_candidate_backing_unchanged":true},
+            "references":refs.iter().map(|r|r.as_ref().map(|(_,routes)|&routes[..rows])).collect::<Vec<_>>(),
+            "even_mismatch_words":even,"odd_mismatch_words":odd,"guard_or_inactive_words":guard})
+        );
         let entry = ctx
             .tallies
             .entry(format!("{label} graph changed-x"))
@@ -596,47 +853,193 @@ fn graph_changed_x(
         entry.odd += odd;
         entry.guard += guard;
         ctx.cases += 1;
+        assert_eq!(even + odd + guard, 0, "diagnostic changed-x byte mismatch");
     }
     gpu.hip.graph_exec_destroy(exec).expect("destroy exec");
     gpu.hip.graph_destroy(g).expect("destroy graph");
     for y in outs {
-        gpu.free_tensor(y).expect("free y");
+        gpu.free_tensor(y).expect("free graph y");
     }
-    gpu.free_tensor(x).expect("free x");
+    gpu.free_tensor(dummy).expect("free empty graph weights");
+    gpu.free_tensor(x).expect("free stable graph x");
+    gpu.free_tensor(poisoned)
+        .expect("free stable poisoned graph x");
+}
+
+fn manifest_usize(meta: &Value, key: &str) -> usize {
+    usize::try_from(
+        meta[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("missing integer {key}")),
+    )
+    .expect("manifest dimension overflows usize")
+}
+
+fn capture_file(dir: &Path, entry: &Value) -> Vec<u8> {
+    let relative = entry["path"].as_str().expect("capture file path");
+    let path = Path::new(relative);
+    assert!(
+        !relative.is_empty() && path.components().all(|c| matches!(c, Component::Normal(_))),
+        "capture path must be relative without traversal"
+    );
+    let root = dir.canonicalize().expect("capture directory");
+    let file = dir.join(path).canonicalize().expect("capture file");
+    assert!(file.starts_with(&root), "capture symlink escapes directory");
+    let expected = entry["sha256"].as_str().expect("capture file SHA256");
+    assert!(valid_sha(expected), "invalid capture SHA256");
+    let bytes = std::fs::read(file).expect("read captured bytes");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        expected.to_ascii_lowercase(),
+        "capture file SHA256 mismatch"
+    );
+    bytes
+}
+
+fn run_capture(gpu: &mut Gpu, ctx: &mut Ctx, dir: &Path) {
+    let raw = std::fs::read(dir.join("meta.json")).expect("capture meta.json");
+    let meta: Value = serde_json::from_slice(&raw).expect("parse capture metadata");
+    assert_eq!(
+        meta["schema"].as_str(),
+        Some("mq4_rows_oracle.capture.v1"),
+        "capture schema"
+    );
+    assert_eq!(
+        meta["arch"].as_str(),
+        Some(ctx.arch.as_str()),
+        "capture arch mismatch"
+    );
+    let (m, k, rows) = (
+        manifest_usize(&meta, "M"),
+        manifest_usize(&meta, "K"),
+        manifest_usize(&meta, "rows"),
+    );
+    assert!(
+        m > 0 && k > 0 && k % 256 == 0 && rows >= MAX_ROWS,
+        "capture extents"
+    );
+    let provenance = &meta["provenance"];
+    let source = provenance["source"]
+        .as_str()
+        .expect("capture source artifact path");
+    assert!(!source.is_empty(), "capture source provenance missing");
+    let source_entry = json!({"path":source,"sha256":provenance["source_sha256"]});
+    drop(capture_file(dir, &source_entry));
+    let weights = capture_file(dir, &meta["weights"]);
+    let activations = capture_file(dir, &meta["activations"]);
+    let weight_bytes = m
+        .checked_mul(k / 256)
+        .and_then(|n| n.checked_mul(136))
+        .expect("weight extent overflow");
+    let x_bytes = rows
+        .checked_mul(k)
+        .and_then(|n| n.checked_mul(4))
+        .expect("activation extent overflow");
+    assert_eq!(weights.len(), weight_bytes, "packed capture weight extents");
+    assert_eq!(activations.len(), x_bytes, "capture activation extents");
+    for group in weights.chunks_exact(136) {
+        for h in group[..8].chunks_exact(2) {
+            assert_ne!(
+                u16::from_le_bytes([h[0], h[1]]) & 0x7c00,
+                0x7c00,
+                "nonfinite packed f16"
+            );
+        }
+    }
+    let all_x: Vec<f32> = activations
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("f32 bytes")))
+        .collect();
+    assert!(
+        all_x.iter().all(|v| v.is_finite()),
+        "nonfinite captured activation"
+    );
+    // Equal genuinely captured rows are legal; provenance, not uniqueness, is required.
+    println!(
+        "{}",
+        json!({"kind":"capture_source","arch":ctx.arch,"directory":dir,
+        "manifest_sha256":format!("{:x}",Sha256::digest(&raw)),"manifest":meta,
+        "captured_rows":rows,"tested_rows":MAX_ROWS,"finite_only":true})
+    );
+    let w = gpu
+        .upload_raw(&weights, &[weights.len()])
+        .expect("upload captured weights");
+    let x = gpu
+        .upload_f32(&all_x[..MAX_ROWS * k], &[MAX_ROWS * k])
+        .expect("upload captured x");
+    let (reference, reference_receipts) = singleton_recorded(gpu, &w, &x, m, k);
+    let mat = Mat {
+        name: format!("captured {}", dir.display()),
+        m,
+        k,
+        w,
+        reference,
+        reference_receipts,
+    };
+    ctx.seed = 0;
+    ctx.run(gpu, &mat.name, &[Some(&mat), None, None, None], &x, true);
+    ctx.captured += 1;
+    gpu.free_tensor(mat.w).expect("free captured weights");
+    gpu.free_tensor(x).expect("free captured x");
 }
 
 fn main() {
-    if std::env::var_os("HIPFIRE_QWEN4_WIDE_TWIN_MQ4").is_none() {
-        std::env::set_var("HIPFIRE_QWEN4_WIDE_TWIN_MQ4", "1");
+    let mut diagnostic_product = false;
+    let mut synthetic_only = false;
+    let mut captures: Vec<PathBuf> = Vec::new();
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str().expect("CLI must be UTF-8") {
+            "--diagnostic-product" => diagnostic_product = true,
+            "--synthetic-only" => synthetic_only = true,
+            "--capture" => {
+                captures.push(PathBuf::from(args.next().expect("--capture requires DIR")))
+            }
+            other => panic!("unknown option: {other}"),
+        }
     }
+    assert!(
+        synthetic_only || diagnostic_product || !captures.is_empty(),
+        "qualification requires --capture DIR; use --synthetic-only for nonqualifying diagnostics"
+    );
+    assert!(
+        !synthetic_only || captures.is_empty(),
+        "--synthetic-only contradicts --capture"
+    );
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
-    let flag = hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ4_ROWS_PM", true);
-    let pm = flag && matches!(arch.as_str(), "gfx1151" | "gfx1201");
-    let wide_on = WideTwinFamily::Mq4.enabled() && matches!(arch.as_str(), "gfx1151" | "gfx1201");
-    println!("mq4_rows_oracle: arch={arch}");
+    assert!(
+        matches!(arch.as_str(), "gfx1151" | "gfx1201" | "gfx1100"),
+        "unsupported architecture"
+    );
+    let env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("HIPFIRE_"))
+        .collect();
     println!(
-        "mq4_rows_oracle: route={} (HIPFIRE_QWEN4_MQ4_ROWS_PM {}); rows 9..=32 {}",
-        if pm {
-            "embedded PM image mq4_rows_x4_pm"
-        } else {
-            "per-row gemv_mq4g256v2 fallback"
-        },
-        if flag { "on" } else { "0" },
-        if wide_on {
-            "-> wide twins r16/r32 (HIPFIRE_QWEN4_WIDE_TWIN_MQ4)"
-        } else {
-            "-> exact 8-row group loops (wide twins OFF)"
-        },
+        "{}",
+        json!({"kind":"header","arch":arch,"environment":env,
+        "mode":if diagnostic_product {"diagnostic_product"} else {"direct_tile"},
+        "qualification_candidate":!diagnostic_product && !synthetic_only,
+        "finite_only":true,"max_rows":MAX_ROWS,
+        "shape_grid":"declared projection dimensions, not a captured model census",
+        "no_cpu_or_performance_or_retained_certificate_claim":true})
     );
     let mut ctx = Ctx {
         arch: arch.clone(),
-        pm,
+        diagnostic_product,
+        synthetic_only,
+        seed: 0,
         cases: 0,
+        captured: 0,
+        reached: BTreeSet::new(),
         tallies: BTreeMap::new(),
     };
+    for dir in &captures {
+        run_capture(&mut gpu, &mut ctx, dir);
+    }
 
     for seed in 1..=3u64 {
+        ctx.seed = seed;
         let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407));
         let mut xs: BTreeMap<usize, GpuTensor> = BTreeMap::new();
         for k in [256usize, 512, 768, 1024, 1280, 2560, 6144] {
@@ -644,7 +1047,7 @@ fn main() {
             xs.insert(k, x);
         }
 
-        // (a) trunk shapes, one per launch; (b) the real groupings.
+        // (a) Declared projection dimensions; (b) their declared x4 groupings.
         let mut trunk: Vec<Mat> = Vec::new();
         for &(name, m, k) in &SHAPES {
             trunk.push(make_mat(
@@ -657,7 +1060,7 @@ fn main() {
             ));
         }
         for (i, mat) in trunk.iter().enumerate() {
-            let label = format!("single {} M={} K={}", mat.name, mat.m, mat.k);
+            let label = format!("declared projection {} M={} K={}", mat.name, mat.m, mat.k);
             ctx.run(
                 &mut gpu,
                 &label,
@@ -673,16 +1076,14 @@ fn main() {
             }
             let k = trunk[idx[0]].k;
             ctx.run(&mut gpu, name, &slots, &xs[&k], true);
-            if seed == 1 {
+            if diagnostic_product && seed == 1 {
                 graph_changed_x(&mut gpu, name, &slots, 5, seed, &mut ctx);
                 graph_changed_x(&mut gpu, name, &slots, 24, seed, &mut ctx);
             }
         }
 
-        // Negative controls on the GDN grouping at 3 rows (narrow) and 20 rows (wide):
-        // a launch must disagree with a reference computed from a perturbed
-        // activation, and gdn.a's output must disagree with gdn.b's reference
-        // (swapped matrices).
+        // Negative controls: wrong activation, swapped matrices, and parity.
+        // These must disagree, including the new 33/63/64 boundaries.
         if seed == 1 {
             let slots: Slots = [
                 Some(&trunk[0]),
@@ -690,15 +1091,24 @@ fn main() {
                 Some(&trunk[2]),
                 Some(&trunk[3]),
             ];
-            for rows in [3usize, 20] {
-                let got = launch(&mut gpu, &slots, &xs[&2560], rows, false).bits;
+            for rows in [3usize, 20, 33, 63, 64] {
+                let launched = launch(
+                    &mut gpu,
+                    &slots,
+                    &xs[&2560],
+                    rows,
+                    false,
+                    diagnostic_product,
+                    0,
+                );
+                let got = &launched.bits;
                 let mut host = gpu.download_f32(&xs[&2560]).expect("download x");
                 host[0] += 1.0;
                 let x_perturbed = gpu.upload_f32(&host, &[host.len()]).expect("upload x'");
                 let perturbed_bad: Vec<usize> = slots
                     .iter()
                     .flatten()
-                    .zip(&got)
+                    .zip(got)
                     .map(|(mat, g)| {
                         let want =
                             &singleton_reference(&mut gpu, &mat.w, &x_perturbed, mat.m, mat.k)
@@ -726,7 +1136,12 @@ fn main() {
                     }
                 }
                 println!(
-                    "mq4_rows_oracle: negative control rows={rows}: perturbed-x mismatch words per output {perturbed_bad:?}, swapped a/b {swapped_bad}, even/odd-swapped columns agreeing {parity_agree}/{parity_total}"
+                    "{}",
+                    json!({"kind":"negative_control","arch":arch,"seed":seed,
+                    "mode":if diagnostic_product {"diagnostic_product"} else {"direct_tile"},
+                    "rows":rows,"candidate":launched.route,
+                    "perturbed_x_mismatch_words":perturbed_bad,"swapped_mismatch_words":swapped_bad,
+                    "parity_swapped_agree":parity_agree,"parity_total":parity_total})
                 );
                 if perturbed_bad.iter().any(|&n| n == 0)
                     || swapped_bad == 0
@@ -755,7 +1170,7 @@ fn main() {
                     &mut rng,
                 );
                 let label = format!("synthetic single M={m} K={k}");
-                // The full 1..=32 sweep for every (M, K); views and graph sample on the small ones.
+                // Every R=1..=64; graph samples only in explicit diagnostic mode.
                 ctx.run(
                     &mut gpu,
                     &label,
@@ -769,7 +1184,17 @@ fn main() {
 
         // (d) synthetic x4 groupings: odd boundaries, zero-M parts in any slot.
         for &k in &SYN_GROUP_K {
-            for ms in &SYN_GROUPS {
+            let mut groups = SYN_GROUPS.to_vec();
+            groups.extend((0..16usize).map(|mask| {
+                std::array::from_fn(|s| {
+                    if mask & (1 << s) != 0 {
+                        [1, 7, 33, 64][s]
+                    } else {
+                        0
+                    }
+                })
+            }));
+            for ms in &groups {
                 let mats: Vec<Option<Mat>> = ms
                     .iter()
                     .enumerate()
@@ -794,7 +1219,7 @@ fn main() {
                 ];
                 let label = format!("synthetic x4 M={ms:?} K={k}");
                 ctx.run(&mut gpu, &label, &slots, &xs[&k], true);
-                if seed == 1 && k == 1280 {
+                if diagnostic_product && seed == 1 && k == 1280 && ms.iter().any(|&m| m > 0) {
                     graph_changed_x(&mut gpu, &label, &slots, 17, seed, &mut ctx);
                 }
                 for mat in mats.into_iter().flatten() {
@@ -808,33 +1233,24 @@ fn main() {
         }
     }
 
-    println!("mq4_rows_oracle: per-case summary (runs = seeds 1..=3 x rows 1..=32 eager + graph samples + views)");
-    let mut worst_label = 0;
-    for label in ctx.tallies.keys() {
-        worst_label = worst_label.max(label.len());
-    }
-    for (label, t) in &ctx.tallies {
-        println!(
-            "  {label:<worst_label$} runs={:<4} even_mismatch_words={} odd_mismatch_words={} guard_words={} symbol_errors={}",
-            t.runs, t.even, t.odd, t.guard, t.symbol
-        );
-    }
-    let bad = ctx.bad_total();
-    if bad != 0 {
-        println!(
-            "mq4_rows_oracle: FAIL cases={} mismatch_bytes={}",
-            ctx.cases,
-            bad * 4
-        );
-        std::process::exit(1);
-    }
+    assert_eq!(ctx.bad_total(), 0, "strict mismatches");
+    assert_eq!(
+        ctx.reached,
+        (1..=MAX_ROWS).collect(),
+        "unreached direct/product widths"
+    );
+    let qualifies = !diagnostic_product && !synthetic_only;
+    assert!(
+        !qualifies || ctx.captured > 0,
+        "missing real captured operands"
+    );
     println!(
-        "mq4_rows_oracle: PASS cases={} mismatch_bytes=0 ({})",
-        ctx.cases,
-        if wide_on {
-            "wide twins r16/r32 exercised for rows 9..=32"
-        } else {
-            "wide twins OFF: exact 8-row group loops"
-        }
+        "{}",
+        json!({"kind":"summary","arch":arch,
+        "result":if qualifies {"PASS"} else {"DIAGNOSTIC_COMPLETE"},
+        "qualifies_G1_component":qualifies,"cases":ctx.cases,"captured_sources":ctx.captured,
+        "seeds":[1,2,3],"reached_rows":ctx.reached,"mismatch_bytes":0,
+        "all_empty_mask":"expected invalid-grid refusal, no claimed launched route",
+        "finite_only":true,"no_cpu_or_performance_or_retained_certificate_claim":true})
     );
 }

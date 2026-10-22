@@ -1509,6 +1509,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-loader",
  "hipfire-runtime",
  "memmap2",
  "peacemaker-npu",

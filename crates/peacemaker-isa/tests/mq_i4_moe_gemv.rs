@@ -2,15 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The gfx1151 and gfx1201 pointer-addressed F4 read-once lane-union decode GEMV modules
-//! `mq_i4_moe_gemv_pm_<arch>`: the four C8 symbols `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}` and
-//! their eight wide twins with the suffix `_c16` / `_c32`: symbols, the frozen 96-byte kernarg ABI and its typed
-//! ownership, exact-arch gating (gfx1100 is refused), the instruction census of the frozen numerical tree, the
-//! read-once structure (no weight load inside any slot branch; for the wide twins none inside any tile or slot
-//! branch, and no barrier inside a divergent region), the unchanged narrow emission, the derived shape contract, native
-//! assembly, the per-architecture workgroup-id, wait and barrier spellings, and (feature `toolchain`) wait replay, M7,
-//! certification and the native code object / bundle identity against the ROCm oracle for every entry
-//! and the module of each architecture.
+//! Common K1 diagnostics retain four narrow C8 entries and eight C16/C32 twins per architecture:
+//! frozen arithmetic, instruction/resource census, 96-byte ABI, native assembly, replay and M7.
+//! These diagnostic modules are not the production export list. The gfx1201 product image contains
+//! four narrow entries followed by four fixed-eight-row `_t8` entries. The committed common gfx1151
+//! image remains a twelve-entry diagnostic/reference image; Halo production tiles live in the Cn
+//! image, covered by `mq_i4_moe_gemv_cn.rs`. No product path requires C16/C32 exports.
 use peacemaker_isa::kernels::mq_i4_moe_gemv::{self, Cap, Codec, Kind, Spec};
 use peacemaker_isa::Arch;
 #[cfg(feature = "toolchain")]
@@ -31,7 +28,7 @@ fn all_specs() -> Vec<Spec> {
         .flat_map(mq_i4_moe_gemv::narrow_specs)
         .collect()
 }
-/// The eight wide twins (C16 then C32) of every supported architecture.
+/// The eight diagnostic wide twins (C16 then C32) of every supported architecture.
 fn wide_specs() -> Vec<Spec> {
     ARCHES
         .into_iter()
@@ -39,12 +36,29 @@ fn wide_specs() -> Vec<Spec> {
         .filter(|s| s.cap != Cap::C8)
         .collect()
 }
-/// All twelve entries of every architecture's module.
+/// All twelve entries of every architecture's diagnostic module.
 fn module_entries() -> Vec<Spec> {
     ARCHES
         .into_iter()
         .flat_map(mq_i4_moe_gemv::module_specs)
         .collect()
+}
+
+/// Match the CLI's gfx1201 product composition, independently of diagnostic `emit_module`.
+fn gfx1201_product_image() -> (Vec<peacemaker_isa::Emitted>, String) {
+    let specs = mq_i4_moe_gemv::narrow_specs(Arch::Gfx1201);
+    let mut emitted: Vec<_> = specs
+        .iter()
+        .map(|&s| mq_i4_moe_gemv::emit(s).unwrap())
+        .collect();
+    emitted.extend(
+        specs
+            .into_iter()
+            .map(|s| mq_i4_moe_gemv::emit_rowtiles(s).unwrap()),
+    );
+    let (text, _) =
+        peacemaker_isa::kernels::iu4_gemm::module(&emitted, &module(Arch::Gfx1201)).unwrap();
+    (emitted, text)
 }
 const SYMBOLS: [&str; 4] = [
     "mq_i4_moe_gemv_mq3i4_r256_gate_up",
@@ -159,7 +173,7 @@ fn vreg(token: &str) -> u32 {
 }
 
 #[test]
-fn module_exports_are_the_twelve_frozen_symbols_in_order() {
+fn diagnostic_module_exports_are_the_twelve_frozen_symbols_in_order() {
     for arch in ARCHES {
         let specs = mq_i4_moe_gemv::module_specs(arch);
         assert_eq!(
@@ -209,6 +223,131 @@ fn module_exports_are_the_twelve_frozen_symbols_in_order() {
                 "{arch:?} {symbol}: missing from module metadata"
             );
         }
+    }
+}
+
+#[test]
+fn gfx1201_product_exports_are_narrow_then_fixed_eight_row_tiles() {
+    let (emitted, text) = gfx1201_product_image();
+    let expected: Vec<_> = SYMBOLS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(SYMBOLS.iter().map(|s| format!("{s}_t8")))
+        .collect();
+    assert_eq!(emitted.len(), expected.len());
+    assert_eq!(text.matches(".amdhsa_kernel ").count(), expected.len());
+    let actual: Vec<_> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(".amdhsa_kernel "))
+        .collect();
+    assert_eq!(actual, expected);
+    for symbol in &expected {
+        assert!(text.contains(&format!(".globl {symbol}\n")), "{symbol}");
+        assert!(text.contains(&format!(".name: {symbol}\n")), "{symbol}");
+    }
+    for symbol in WIDE_SYMBOLS {
+        assert!(
+            !text.contains(&format!(".amdhsa_kernel {symbol}\n")),
+            "{symbol}"
+        );
+    }
+}
+
+/// Tile entries keep the frozen ABI but declare the architecture-local fixed-eight schedule.
+#[test]
+fn rowtiles_keep_the_96_byte_abi_and_bounded_resources() {
+    for spec in all_specs() {
+        let e = mq_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+        let c = mq_i4_moe_gemv::contract_rowtiles(spec, &e);
+        let symbol = if spec.arch == Arch::Gfx1151 {
+            format!(
+                "mq_i4_moe_gemv_cn_{}_{}_t8",
+                spec.codec.tag(),
+                spec.kind.tag()
+            )
+        } else {
+            format!("{}_t8", spec.symbol())
+        };
+        assert_eq!(c["symbol"], symbol);
+        assert!(e.s_text.contains(&format!(".amdhsa_kernel {symbol}\n")));
+        assert!(e.s_text.contains(".amdhsa_kernarg_size 96\n"));
+        assert_eq!(field(&e.s_text, ".kernarg_segment_size:"), [96]);
+        assert_eq!(field(&e.s_text, ".offset:"), ARGS.map(|a| a.0));
+        assert_eq!(field(&e.s_text, ".size:"), ARGS.map(|a| a.1));
+        let names: Vec<_> = e
+            .s_text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(".name: "))
+            .take(ARGS.len())
+            .collect();
+        assert_eq!(names, ARGS.map(|a| a.2));
+        assert_eq!(field(&e.s_text, ".max_flat_workgroup_size:"), [256]);
+        assert!(e.s_text.contains(".amdhsa_wavefront_size32 1"));
+        assert!(e.s_text.contains(".amdhsa_system_sgpr_workgroup_id_z 1"));
+        for key in [
+            ".private_segment_fixed_size:",
+            ".sgpr_spill_count:",
+            ".vgpr_spill_count:",
+        ] {
+            assert_eq!(field(&e.s_text, key), [0], "{symbol}: {key}");
+        }
+        let lds = if spec.arch == Arch::Gfx1151 {
+            if spec.kind == Kind::GateUp {
+                40_960
+            } else {
+                20_480
+            }
+        } else {
+            8 * 32 * 4 * u32::from(spec.lane_elems())
+        };
+        assert_eq!(field(&e.s_text, ".group_segment_fixed_size:"), [lds]);
+        assert_eq!(c["group_segment_fixed_bytes"], lds);
+        assert_eq!(c["launch_dynamic_lds_bytes"], 0);
+        assert_eq!(c["require_wave32"], true);
+        assert_eq!(c["require_zero_spills"], true);
+        assert_eq!(c["require_zero_private"], true);
+        assert_eq!(c["vgpr_max"], e.shape.next_free_vgpr);
+        assert_eq!(c["sgpr_max"], e.shape.next_free_sgpr);
+        assert_eq!(
+            field(&e.s_text, ".vgpr_count:"),
+            [u32::from(e.shape.next_free_vgpr)]
+        );
+        assert_eq!(
+            field(&e.s_text, ".amdhsa_next_free_vgpr "),
+            [u32::from(e.shape.next_free_vgpr)]
+        );
+        // emit::kernel_assembly includes reserved VCC in metadata, not in
+        // the logical SGPR high-water mark or .amdhsa_next_free_sgpr.
+        let sgpr_count = field(&e.s_text, ".sgpr_count:");
+        let reserve_vcc = field(&e.s_text, ".amdhsa_reserve_vcc ");
+        assert!(matches!(reserve_vcc.as_slice(), [0] | [1]));
+        let vcc_sgprs = 2 * reserve_vcc[0];
+        assert_eq!(
+            field(&e.s_text, ".amdhsa_next_free_sgpr "),
+            [u32::from(e.shape.next_free_sgpr)]
+        );
+        assert_eq!(sgpr_count, [u32::from(e.shape.next_free_sgpr) + vcc_sgprs]);
+        // next_free_vgpr is the logical high-water mark; native::descriptor::encode
+        // rounds it up to eight-VGPR blocks for GRANULATED_WORKITEM_VGPR_COUNT.
+        assert!(e.shape.next_free_vgpr > 0 && e.shape.next_free_vgpr <= 256);
+        assert!(e.shape.next_free_sgpr > 0 && e.shape.next_free_sgpr <= 106);
+        assert!(
+            !e.s_text.lines().any(|l| {
+                let m = mnemonic(l);
+                m.starts_with("scratch_") || m.starts_with("flat_")
+            }),
+            "{symbol}: scratch/flat"
+        );
+        // The obsolete diagnostic cap must not enlarge the tile's physical slot bank.
+        for cap in Cap::ALL {
+            let alternate = Spec { cap, ..spec };
+            let same = mq_i4_moe_gemv::emit_rowtiles(alternate).unwrap();
+            assert_eq!(e.s_text, same.s_text, "{symbol}: cap {cap:?}");
+            assert_eq!(c, mq_i4_moe_gemv::contract_rowtiles(alternate, &same));
+        }
+    }
+    for spec in mq_i4_moe_gemv::narrow_specs(Arch::Gfx1100) {
+        assert!(mq_i4_moe_gemv::emit_rowtiles(spec).is_err());
     }
 }
 
@@ -302,9 +441,9 @@ fn workgroup_ids_and_waits_follow_the_architecture() {
     }
 }
 
-/// Every symbol is wave32, one wave per workgroup, without scratch, spills, LDS or barriers.
+/// Every narrow diagnostic entry is wave32, one wave per workgroup, with no scratch, spills, LDS or barriers.
 #[test]
-fn every_export_is_wave32_without_scratch_or_lds() {
+fn every_narrow_entry_is_wave32_without_scratch_or_lds() {
     for arch in ARCHES {
         let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
         for (e, symbol) in emitted.iter().zip(SYMBOLS) {
@@ -964,9 +1103,9 @@ fn codec_and_kind_constants_match_the_frozen_format() {
     }
 }
 
-/// The module and every entry assemble with the native writer (no ROCm), and the bundle wraps the object.
+/// Every diagnostic entry and the diagnostic module assemble independently of committed artifacts.
 #[test]
-fn native_writer_assembles_every_entry_and_the_module() {
+fn native_writer_assembles_every_diagnostic_entry_and_module() {
     for arch in ARCHES {
         let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
         for e in &emitted {
@@ -981,28 +1120,52 @@ fn native_writer_assembles_every_entry_and_the_module() {
     }
 }
 
-/// The shipped `kernels/mq_i4_moe_gemv_pm_<arch>.hxaco` (both architectures) must be exactly what the builder emits
-/// today: the whole offload bundle, byte for byte (native writer, no ROCm; host entry
-/// `host-x86_64-unknown-linux-gnu`, device `hipv4-amdgcn-amd-amdhsa--<arch>`, `.comment`
-/// `hipfire peacemaker native-emit 0.4.1`).
+/// Fresh source/native identity of the production image, not the twelve-entry diagnostic module.
 #[test]
-fn committed_bundles_equal_fresh_emission() {
-    for arch in ARCHES {
-        let module = module(arch);
-        let path = format!(
-            "{}/../../kernels/{module}.hxaco",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_moe_gemv --arch {} ... --bundle)", arch.name()));
-        let (_, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
-        let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
-        let fresh =
-            peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
-        assert!(
-            committed == fresh,
-            "{module}: fresh emission differs from the committed bundle {path}"
-        );
+fn committed_gfx1201_product_bundle_equals_narrow_plus_tiles() {
+    let (_, text) = gfx1201_product_image();
+    assert_committed_bundle(Arch::Gfx1201, &text);
+}
+
+/// The common Halo artifact is deliberately retained as a diagnostic/reference image.
+/// Halo's production narrow-plus-tiles artifact belongs to the Cn test suite.
+#[test]
+fn committed_gfx1151_diagnostic_bundle_equals_legacy_module() {
+    let (_, text, _) = mq_i4_moe_gemv::emit_module(Arch::Gfx1151).unwrap();
+    assert_committed_bundle(Arch::Gfx1151, &text);
+}
+
+fn assert_committed_bundle(arch: Arch, text: &str) {
+    let module = module(arch);
+    let path = format!(
+        "{}/../../kernels/{module}.hxaco",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_moe_gemv --arch {} ... --bundle)", arch.name()));
+    let elf = peacemaker_isa::native::assemble(text, arch).unwrap();
+    let fresh =
+        peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
+    assert!(
+        committed == fresh,
+        "{module}: fresh emission differs from the committed bundle {path}"
+    );
+}
+
+#[test]
+fn native_writer_assembles_gfx1201_product_entries_and_image() {
+    let (emitted, text) = gfx1201_product_image();
+    for e in emitted {
+        let elf = peacemaker_isa::native::assemble(&e.s_text, Arch::Gfx1201)
+            .unwrap_or_else(|err| panic!("{}: {err}", e.proof.variant));
+        assert!(elf.starts_with(b"\x7fELF"));
     }
+    let elf = peacemaker_isa::native::assemble(&text, Arch::Gfx1201).unwrap();
+    let bundle = peacemaker_isa::native::bundle(
+        &elf,
+        Arch::Gfx1201,
+        peacemaker_isa::native::DEFAULT_HOST_TARGET,
+    );
+    assert!(bundle.len() > elf.len());
 }
 
 /// The wide twins' interface: the narrow 96-byte kernarg ABI field for field, block 256, the static X tile as the only
@@ -1629,12 +1792,10 @@ mod toolchain {
 
     const HOST: &str = "host-x86_64-unknown-linux-gnu-";
 
-    /// Every symbol's waits and hazards replay independently of the builder's ledger (source and
-    /// module text), the retained-replay dependency audit holds, the ABI is unchanged under
-    /// replay, and M7 lifts the natively linked object byte-exactly with no outstanding
-    /// obligations (no ROCm tools).
+    /// Every diagnostic symbol's waits and hazards replay independently of the builder's ledger.
+    /// M7 lifts all twelve entries, including retained C16/C32 diagnostics, without committed fixtures.
     #[test]
-    fn every_export_passes_wait_hazard_replay_and_m7() {
+    fn every_diagnostic_export_passes_wait_hazard_replay_and_m7() {
         for arch in ARCHES {
             let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
             for e in &emitted {
@@ -1665,12 +1826,39 @@ mod toolchain {
         }
     }
 
-    /// Native code object and offload bundle against the ROCm oracle (`llvm-mc` + `ld.lld -shared`,
-    /// `clang-offload-bundler`) for each of the four entries alone and for the module: field-by-field and
-    /// byte-for-byte equal in everything except the intentionally different `.comment` stamp (the same
-    /// comparison as `native_identity`, restricted to this family).
+    /// Fixed-eight production entries also owe replay and M7; legacy diagnostics above remain separate.
     #[test]
-    fn native_code_objects_and_bundles_equal_the_rocm_oracle_for_all_entries_and_the_module() {
+    fn rowtiles_pass_wait_replay_and_m7() {
+        for spec in all_specs() {
+            let e = mq_i4_moe_gemv::emit_rowtiles(spec).unwrap();
+            ledger_replay::replay_waits(&e.s_text, spec.arch)
+                .unwrap_or_else(|err| panic!("{spec:?}: {err}"));
+            let contract = mq_i4_moe_gemv::contract_rowtiles(spec, &e);
+            let symbol = contract["symbol"].as_str().unwrap();
+            let dir = std::env::temp_dir().join(format!(
+                "peacemaker-isa-mqi4moe-rowtiles-m7-{}-{}-{}",
+                spec.arch.name(),
+                spec.tag(),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let co = dir.join("tile.co");
+            std::fs::write(&co, native::assemble(&e.s_text, spec.arch).unwrap()).unwrap();
+            let m7 = pm_check::m7(&co, spec.arch.name(), symbol)
+                .unwrap_or_else(|err| panic!("{spec:?} {symbol}: {err}"));
+            assert_eq!(
+                (m7["lift"].as_str(), &m7["obligations"]),
+                (Some("byte-exact"), &serde_json::json!({})),
+                "{spec:?} {symbol}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Native objects/bundles against ROCm for all diagnostic entries/modules and the actual
+    /// gfx1201 narrow-plus-tiles production entries/image. Only the `.comment` stamp may differ.
+    #[test]
+    fn native_diagnostics_and_gfx1201_product_equal_the_rocm_oracle() {
         let _ = require_rocm_tool!("llvm-mc");
         let _ = require_rocm_tool!("ld.lld");
         let _ = require_rocm_tool!("clang-offload-bundler");
@@ -1695,7 +1883,17 @@ mod toolchain {
                 .zip(mq_i4_moe_gemv::module_specs(arch))
                 .map(|(e, s)| (format!("{} {}", arch.name(), s.symbol()), e.s_text.clone()))
                 .collect();
-            units.push((format!("{} (module)", module(arch)), module_text));
+            units.push((format!("{} (diagnostic module)", module(arch)), module_text));
+            if arch == Arch::Gfx1201 {
+                let (product, product_text) = gfx1201_product_image();
+                units.extend(product.into_iter().map(|e| {
+                    (
+                        format!("{} {} (product)", arch.name(), e.proof.variant),
+                        e.s_text,
+                    )
+                }));
+                units.push((format!("{} (product image)", module(arch)), product_text));
+            }
             total += units.len();
             for (i, (name, text)) in units.iter().enumerate() {
                 let s = dir.join(format!("u{i}.s"));
@@ -1736,10 +1934,10 @@ mod toolchain {
         );
     }
 
-    /// Every symbol certifies against the ROCm oracle build: parse-back, independent wait replay,
-    /// its shape contract (derived from the same fresh emission), and M7 of the linked ELF, obligation-free.
+    /// Diagnostic certification stays source-derived for all twelve symbols; no obsolete
+    /// production C16/C32 contract artifact is required.
     #[test]
-    fn module_passes_certification_for_every_symbol() {
+    fn diagnostic_module_passes_certification_for_every_symbol() {
         let _ = require_rocm_tool!("llvm-mc");
         let _ = require_rocm_tool!("ld.lld");
         let _ = require_rocm_tool!("clang-offload-bundler");

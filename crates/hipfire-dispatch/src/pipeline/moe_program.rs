@@ -15,8 +15,9 @@ use crate::context::DispatchCtx;
 use crate::cpu_exec;
 use crate::cpu_split::CpuSplitExecutor;
 use crate::families::moe::{
-    MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability, MOE_BIASED_SIGMOID_MAX_K, NARROW_VERIFY_MAX_ROWS,
+    CpuWideVerifyScope, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution,
+    MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability, MOE_BIASED_SIGMOID_MAX_K,
+    NARROW_VERIFY_MAX_ROWS,
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
@@ -1805,7 +1806,12 @@ impl<'a> SealedMoeOp<'a> {
                         "PrepareSplit lowered without the split selection",
                     ));
                 }
-                validate_split_prefill(gpu, params, selection)?;
+                validate_split_prefill_exec(
+                    gpu,
+                    params,
+                    selection,
+                    self.state.dispatch_ctx().cpu_wide_verify(),
+                )?;
                 let executor = prefill_split_executor(params)?;
                 executor.prepare(
                     &*gpu,
@@ -3086,6 +3092,35 @@ pub(super) fn select_decode(
         !params.routed_experts.is_empty(),
     )?;
     if params.cpu_deferred_experts {
+        // Width gate (D1, whole-window, no chunking): the legacy `<= 4`-row
+        // windows always qualify; a wider window qualifies only inside an
+        // explicit lab-wide scope with actual prewarmed host scratch.
+        // Unqualified wide windows refuse here — never a silent GPU fallback.
+        {
+            // Decode protocol is one row: the ctx flag is the eager-verify
+            // scope carrier (a plain decode keeps it false and the legacy gate).
+            let scope = CpuWideVerifyScope::from_lab_presence(
+                ctx.cpu_wide_verify() && cpu_lab_override_present_for_arch(ctx.arch.arch()),
+                rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(ctx.arch.arch()),
+            );
+            // Decode protocol is one row; route rows are trivially whole.
+            if !crate::families::moe::cpu_d1_wide_window_qualified(
+                true,
+                params.batch_size,
+                params.batch_size,
+                scope,
+                crate::families::moe::cpu_d1_prewarmed_scratch_rows(
+                    params.hidden,
+                    params.mi,
+                    params.k,
+                    ctx.device_id(),
+                ),
+            ) {
+                return Err(DispatchError::Hip(
+                    "sealed moe: CPU-deferred routed experts: the window exceeds the qualified CPU window for this scope (wider windows keep the GPU route)".into(),
+                ));
+            }
+        }
         // The arch's CPU splice consumes the GPU-produced route and the rotated
         // input, then accumulates the routed FFN into `x_residual` after this
         // program. It therefore needs the GPU top-K path (never the per-expert
@@ -3412,11 +3447,20 @@ fn decode_split_executor<'p>(
 }
 
 /// The executor sealed into a prefill call (the same predicate that sealed it).
+/// Wide-qualified calls (sealed with an explicit lab-wide scope) resolve
+/// through the storage gate; default-route calls keep the 4-row gate. Both
+/// read the executor's allocated capacity, never a constant.
 fn prefill_split_executor<'p>(
     params: &MoePrefillParams<'p>,
 ) -> Result<&'p CpuSplitExecutor, DispatchError> {
     let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
-    crate::families::moe::cpu_split_executor(experts, params.batch_size)
+    // Default-4 gate first (back-compatible with executors that predate the
+    // storage widening): `cpu_split_executor` already checks allocated
+    // capacity. The wide storage gate below admits qualified 5..64-row windows.
+    if let Some(executor) = crate::families::moe::cpu_split_executor(experts, params.batch_size) {
+        return Ok(executor);
+    }
+    crate::families::moe::cpu_split_executor_wide(experts, params.batch_size)
         .ok_or_else(|| split_error("the executor sealed into this call is no longer attached"))
 }
 
@@ -3509,15 +3553,89 @@ pub(super) fn cpu_split_decode_conflict(
     })
 }
 
-/// Prefill counterpart of [`cpu_split_decode_conflict`] for a window of one to
-/// [`NARROW_VERIFY_MAX_ROWS`] rows. Wider windows never reach it.
+/// Existing-oracle-override presence on an exact oracle arch: the canonical
+/// [`rdna_compute::prefill_invariant::qwen4_wide_verify_override_present`]
+/// signal (runtime override — including the `Some(8)` baseline — or the parsed
+/// developer var). Pure presence signal, never a capacity value.
+fn cpu_lab_override_present_for_arch(arch: &str) -> bool {
+    rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(arch)
+}
+
+/// Executor lookup for the sealed join mode: the default-4 gate first, then
+/// the lab-wide storage gate. Both read allocated capacity, never a constant.
+fn cpu_split_executor_for_join(
+    experts: &dyn crate::families::moe::RoutedExpertWeights,
+    rows: usize,
+    scope: CpuWideVerifyScope,
+) -> Option<&CpuSplitExecutor> {
+    if let Some(executor) = crate::families::moe::cpu_split_executor(experts, rows) {
+        return Some(executor);
+    }
+    let capacity = experts
+        .cpu_split()
+        .map(|executor| executor.capacity_rows())
+        .unwrap_or(0);
+    if !crate::families::moe::cpu_wide_window_qualified(true, rows, rows, scope, capacity) {
+        return None;
+    }
+    crate::families::moe::cpu_split_executor_wide(experts, rows)
+}
+
+/// Pure width truth of [`cpu_split_prefill_conflict`] for tests: the
+/// structural refusal for a `rows`-row window given an allocated `capacity`,
+/// without params or an executor. Wiring only, not numeric proof.
+#[cfg(test)]
+pub(super) fn cpu_split_prefill_conflict_width(
+    rows: usize,
+    capacity: usize,
+) -> Option<&'static str> {
+    let structural =
+        NARROW_VERIFY_MAX_ROWS.max(capacity.min(crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS));
+    if rows == 0 || rows > structural {
+        if rows > NARROW_VERIFY_MAX_ROWS {
+            return Some(
+                "the window exceeds the executor's allocated CPU window (wider windows are ordinary wide prefill)",
+            );
+        }
+        return Some(
+            "the window exceeds the four-row cap (wider windows are ordinary wide prefill)",
+        );
+    }
+    None
+}
+
+/// Prefill counterpart of [`cpu_split_decode_conflict`]: the default route
+/// admits a window of one to [`NARROW_VERIFY_MAX_ROWS`] rows; an explicit
+/// lab-wide scope admits a whole logical window of one to
+/// [`crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS`] rows when the
+/// executor's allocated capacity covers it. Unqualified wider windows never
+/// reach it (they stay ordinary wide prefill).
 pub(super) fn cpu_split_prefill_conflict(
     params: &MoePrefillParams<'_>,
     route: Option<MoeRouteCapability>,
     cpu_deferred_experts: bool,
     executor: Option<&CpuSplitExecutor>,
 ) -> Option<&'static str> {
-    if params.batch_size == 0 || params.batch_size > crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+    // Structural width check only (storage, not scope): the call fits when it
+    // is inside the default 4-row window or inside the executor's allocated
+    // capacity (up to 64). The lab-wide SCOPE check (default vs explicit
+    // verify width) lives at seal (`select_prefill`, which measures the frozen
+    // row-exact rows from the arch) and at execution (`validate_split_prefill`,
+    // which measures them from the GPU): this predicate stays a pure function
+    // of the call for the lowering seam, which has no device or arch handle.
+    // Ordinary prefill keeps its refusal: without an admitted executor the
+    // seal never reaches this predicate with a wide window.
+    let capacity = executor
+        .map(|executor| executor.capacity_rows())
+        .unwrap_or(0);
+    let structural =
+        NARROW_VERIFY_MAX_ROWS.max(capacity.min(crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS));
+    if params.batch_size == 0 || params.batch_size > structural {
+        if params.batch_size > NARROW_VERIFY_MAX_ROWS {
+            return Some(
+                "the window exceeds the executor's allocated CPU window (wider windows are ordinary wide prefill)",
+            );
+        }
         return Some(
             "the window exceeds the four-row cap (wider windows are ordinary wide prefill)",
         );
@@ -3658,6 +3776,28 @@ pub(super) fn validate_split_prefill(
     params: &MoePrefillParams<'_>,
     selection: &MoePrefillSelection,
 ) -> Result<(), DispatchError> {
+    // Execution recheck reads the sealed call's per-call ctx flag via the
+    // `cpu_wide_verify_exec` out-param pattern below: the sealed_moe caller
+    // passes `self.dispatch_ctx.cpu_wide_verify` through. Until that call
+    // site threads it, default-false (fail-closed for wide).
+    return validate_split_prefill_inner(gpu, params, selection, false);
+}
+
+pub(super) fn validate_split_prefill_exec(
+    gpu: &Gpu,
+    params: &MoePrefillParams<'_>,
+    selection: &MoePrefillSelection,
+    cpu_wide_verify: bool,
+) -> Result<(), DispatchError> {
+    validate_split_prefill_inner(gpu, params, selection, cpu_wide_verify)
+}
+
+fn validate_split_prefill_inner(
+    gpu: &Gpu,
+    params: &MoePrefillParams<'_>,
+    selection: &MoePrefillSelection,
+    cpu_wide_verify: bool,
+) -> Result<(), DispatchError> {
     split_run_gate(gpu)?;
     let executor = prefill_split_executor(params)?;
     if let Some(reason) = cpu_split_prefill_conflict(
@@ -3667,6 +3807,29 @@ pub(super) fn validate_split_prefill(
         Some(executor),
     ) {
         return Err(split_error(reason));
+    }
+    // Execution-time lab-wide scope check: a wide (> 4-row) window runs only
+    // inside the sealed call's per-call eager-verify scope (`cpu_wide_verify`
+    // ctx flag) with the canonical override present and allocated capacity.
+    // A whole 64-row ordinary prefill refuses here even if a wide executor is
+    // attached — `rows == route_rows` alone never implies verify. No hidden
+    // fallback, no clamp.
+    if params.batch_size > NARROW_VERIFY_MAX_ROWS {
+        let scope = CpuWideVerifyScope::from_lab_presence(
+            cpu_wide_verify && cpu_lab_override_present_for_arch(&gpu.arch),
+            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&gpu.arch),
+        );
+        if !crate::families::moe::cpu_wide_window_qualified(
+            true,
+            params.batch_size,
+            params.batch_size,
+            scope,
+            executor.capacity_rows(),
+        ) {
+            return Err(split_error(
+                "the window exceeds the qualified CPU window for this scope (wider windows are ordinary wide prefill)",
+            ));
+        }
     }
     if gpu.route_rows(params.batch_size) != params.batch_size {
         return Err(split_error(
@@ -3903,26 +4066,111 @@ pub(super) fn select_prefill(
             });
         }
     }
-    // The distinct CPU-cold/GPU-hot split: a window of at most four rows over
-    // an attached executor. Wider windows are ordinary wide prefill. Every
-    // admission refusal is raised here, before the call is published.
-    let cpu_split =
-        match crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size) {
-            Some(executor) => {
-                if let Some(reason) = cpu_split_prefill_conflict(
-                    params,
-                    route,
-                    params.cpu_deferred_experts,
-                    Some(executor),
-                ) {
-                    return Err(DispatchError::Hip(format!(
-                        "sealed moe: CPU tier split: {reason}"
-                    )));
-                }
-                true
+    // The distinct CPU-cold/GPU-hot split. Default route: a window of at most
+    // four rows over an attached executor with allocated capacity; wider
+    // windows are ordinary wide prefill. Inside an explicit lab-wide
+    // eager-verify scope (`cpu_wide_verify_rows > 8`, the frozen oracle
+    // override) a whole logical 1..64-row window qualifies when the executor's
+    // allocated capacity covers it — one forward, full-window state/capture,
+    // never chunked. Every admission refusal is raised here, before the call
+    // is published; a refused wide window falls back to ordinary wide prefill
+    // only when no executor was bound (the `None` arm), never silently after
+    // an executor was admitted.
+    // This call's lab-wide scope (G2/G4 presence gate): the existing oracle
+    // override must be PRESENT (env var on an exact oracle arch — never the
+    // `few_row_limit` value, which is a GPU projection-route limit, not CPU
+    // storage) and this must be an eager verify call (verify workload, known
+    // whole-window route rows). `verify_rows` below is informational only
+    // (GPU arm width), never a clamp: allocated executor capacity binds. Route rows come
+    // from the dispatch context's batch width (0 = unknown = default route):
+    // the forward loop threads the canonical `route_rows` there, so a short
+    // tail of a long prefill keeps `rows != route_rows` and the GPU route.
+    // Eager scope here is NOT `ctx.workload` (the FN forward seals with a
+    // `Standard` context; only qwen35 sets `SpeculativeVerify`): it is the
+    // forward threading real canonical route rows (`ctx.batch_size ==
+    // params.batch_size`, non-decode width) with the override present. A short
+    // tail of a long prefill keeps `rows != route_rows` and the GPU route.
+    let cpu_wide_scope = CpuWideVerifyScope::from_lab_presence(
+        ctx.cpu_wide_verify()
+            && cpu_lab_override_present_for_arch(ctx.arch.arch())
+            && ctx.batch_size == params.batch_size
+            && params.batch_size >= 2,
+        rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(ctx.arch.arch()),
+    );
+    let cpu_split = match crate::families::moe::cpu_split_executor(
+        params.routed_experts,
+        params.batch_size,
+    ) {
+        Some(executor) => {
+            if let Some(reason) = cpu_split_prefill_conflict(
+                params,
+                route,
+                params.cpu_deferred_experts,
+                Some(executor),
+            ) {
+                return Err(DispatchError::Hip(format!(
+                    "sealed moe: CPU tier split: {reason}"
+                )));
             }
-            None => false,
-        };
+            true
+        }
+        None => {
+            // Storage-plus-scope gate for the actual CPU-owned expert window:
+            // armed whole-routing-window calls only (tails keep the GPU route),
+            // qualified width only, allocated capacity only. Ordinary prefill
+            // and lanes observe the default scope (`<= 8`) and stay `None`
+            // here, exactly as before.
+            let capacity = params
+                .routed_experts
+                .cpu_split()
+                .map(|executor| executor.capacity_rows())
+                .unwrap_or(0);
+            // `ctx.batch_size == 0` (unknown: lanes, S1, tests, non-FN seals)
+            // never qualifies wide: only the FN forward loop threads real
+            // route rows. `route_rows` below falls back to `params.batch_size`
+            // only to keep the whole-window predicate total; an unknown route
+            // with a default scope still refuses via the scope gate.
+            let route_rows = if ctx.batch_size == 0 {
+                usize::MAX
+            } else {
+                ctx.batch_size
+            };
+            if !crate::families::moe::cpu_wide_window_qualified(
+                true,
+                params.batch_size,
+                route_rows,
+                cpu_wide_scope,
+                capacity,
+            ) {
+                false
+            } else {
+                match crate::families::moe::cpu_split_executor_wide(
+                    params.routed_experts,
+                    params.batch_size,
+                ) {
+                    Some(executor) => {
+                        if let Some(reason) = cpu_split_prefill_conflict(
+                            params,
+                            route,
+                            params.cpu_deferred_experts,
+                            Some(executor),
+                        ) {
+                            return Err(DispatchError::Hip(format!(
+                                "sealed moe: CPU tier split: {reason}"
+                            )));
+                        }
+                        if ctx.batch_size != params.batch_size {
+                            return Err(DispatchError::Hip(
+                                "sealed moe: CPU tier split: requires route rows equal to the window rows (prefill-invariant scope is refused)".into(),
+                            ));
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    };
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
@@ -3952,6 +4200,41 @@ pub(super) fn select_prefill(
         ));
     }
     if params.cpu_deferred_experts {
+        // Width gate (D1 prefill twin of the decode gate above): `ctx.batch_size`
+        // carries the canonical route rows (0 = unknown = default route, which
+        // refuses wide). Whole logical 1..64-row windows qualify only with an
+        // explicit lab-wide scope plus prewarmed scratch; tails keep the GPU
+        // route via the seal, and unknown-route wide windows refuse here.
+        {
+            let scope = CpuWideVerifyScope::from_lab_presence(
+                ctx.cpu_wide_verify()
+                    && cpu_lab_override_present_for_arch(ctx.arch.arch())
+                    && ctx.batch_size == params.batch_size
+                    && params.batch_size >= 2,
+                rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(ctx.arch.arch()),
+            );
+            let route_rows = if ctx.batch_size == 0 {
+                usize::MAX
+            } else {
+                ctx.batch_size
+            };
+            if !crate::families::moe::cpu_d1_wide_window_qualified(
+                true,
+                params.batch_size,
+                route_rows,
+                scope,
+                crate::families::moe::cpu_d1_prewarmed_scratch_rows(
+                    params.down_m,
+                    params.mi,
+                    params.k_top,
+                    ctx.device_id(),
+                ),
+            ) {
+                return Err(DispatchError::Hip(
+                    "sealed moe: CPU-deferred routed experts: the window exceeds the qualified CPU window for this scope (wider windows keep the GPU route)".into(),
+                ));
+            }
+        }
         // A CPU-deferred narrow window keeps the GPU router/shared stages and
         // the arch's CPU splice; it must not be an EP partial (the routed
         // contribution would be folded twice) and must not rely on the grouped
@@ -3985,8 +4268,12 @@ pub(super) fn select_prefill(
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
         cpwait: cpu_split
-            && crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
-                .is_some_and(CpuSplitExecutor::cpwait_active),
+            && cpu_split_executor_for_join(
+                params.routed_experts,
+                params.batch_size,
+                cpu_wide_scope,
+            )
+            .is_some_and(CpuSplitExecutor::cpwait_active),
     })
 }
 

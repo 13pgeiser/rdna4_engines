@@ -913,11 +913,17 @@ fn tensor_extent(q: CpuQuant, m: usize, k: usize) -> Option<usize> {
     hipfire_cpu::gemv::tensor_bytes(q, 1, k).checked_mul(m)
 }
 
-/// Cap on the slots (`rows × top_k`) [`moe_cpu_experts`] resolves into a stack
-/// array instead of a heap `Vec`. Decode (1 row) and the ≤4-row verify window
-/// keep `rows × top_k` far below this for every real `num_experts_per_tok`; a
-/// wider window still works through the `Vec` fallback.
-const MOE_STACK_SLOTS: usize = 256;
+/// Staging for [`moe_cpu_experts`]' borrowed-expert window: one preallocated
+/// stack of `64 * 10 = 640` slots (the full FN logical window at top_k 10),
+/// written exactly once per slot with no 640-zeroing and no per-window heap for
+/// 1..=640 slots. Resolver passes fill it in physical tiles of at most
+/// [`MOE_PHYS_TILE`] slots (4 rows × top_k 10), but the whole logical window's
+/// slots resolve in this single staging so the proven arithmetic sites run
+/// unchanged; the single window-wide `MoeScratch` reservation still covers the
+/// full logical window. Wider non-FN windows (>640) keep the heap fallback.
+const MOE_PHYS_SLOTS: usize = 64 * 10;
+/// Physical tile width (slots) one resolver pass fills: 4 rows × top_k 10.
+const MOE_PHYS_TILE: usize = 4 * 10;
 
 /// CPU FFN for a window of `rows` tokens' routed experts: recompute every
 /// selected expert (gate_up GEMV + SiLU + hidden-rotate + down GEMV) on the CPU
@@ -1068,21 +1074,38 @@ pub fn moe_cpu_experts<'a>(
             let (tw, acc) = rest.split_at_mut(slots);
             // Resolve every selected slot up front: a bad id or a short span is
             // an error before arithmetic. Warm decode/verify resolves into a
-            // fixed stack array; wider windows retain the heap fallback.
+            // fixed stack array; the FN 5..64-row lab window resolves into one
+            // preallocated stack staging of 640 borrowed slots, written exactly
+            // once per slot (no 640-zeroing for row 1, no per-window heap), in
+            // physical <=40-slot tiles that reuse the proven numerical sites.
+            // Wider non-FN windows retain the heap fallback.
             let t_setup = Instant::now();
-            let dummy: CpuMoeExpert<'a> = CpuMoeExpert {
-                gate_up_quant: CpuQuant::F32,
-                gate_up: &[],
-                down_quant: CpuQuant::F32,
-                down: &[],
-            };
-            let mut stack = [dummy; MOE_STACK_SLOTS];
+            let mut stack: [std::mem::MaybeUninit<CpuMoeExpert<'a>>; MOE_PHYS_SLOTS] =
+                [const { std::mem::MaybeUninit::uninit() }; MOE_PHYS_SLOTS];
             let heap: Vec<CpuMoeExpert<'a>>;
-            let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_STACK_SLOTS {
-                for s in 0..slots {
-                    stack[s] = resolve(expert_id(ti[s]))?;
+            let experts: &[CpuMoeExpert<'a>] = if slots <= MOE_PHYS_TILE {
+                for (dst, s) in stack[..slots].iter_mut().zip(0..slots) {
+                    dst.write(resolve(expert_id(ti[s]))?);
                 }
-                &stack[..slots]
+                // SAFETY: every element 0..slots was just written exactly once.
+                unsafe {
+                    std::slice::from_raw_parts(stack.as_ptr() as *const CpuMoeExpert<'a>, slots)
+                }
+            } else if slots <= MOE_PHYS_SLOTS {
+                // Tile the resolve over physical <=40-slot passes; the staging
+                // lifetime is the whole call, not the tile loop.
+                let mut done = 0usize;
+                while done < slots {
+                    let n = (slots - done).min(MOE_PHYS_TILE);
+                    for (dst, s) in stack[done..done + n].iter_mut().zip(done..done + n) {
+                        dst.write(resolve(expert_id(ti[s]))?);
+                    }
+                    done += n;
+                }
+                // SAFETY: every element 0..slots was written exactly once above.
+                unsafe {
+                    std::slice::from_raw_parts(stack.as_ptr() as *const CpuMoeExpert<'a>, slots)
+                }
             } else {
                 heap = (0..slots)
                     .map(|s| resolve(expert_id(ti[s])))
@@ -1709,7 +1732,9 @@ fn reserve_to<T>(v: &mut Vec<T>, n: usize) {
 /// Pre-grow the calling thread's host-slot scratch for up to `max_slots`
 /// computed slots so a later [`moe_cpu_host_slot_outputs`] on the SAME thread
 /// grows nothing. (The GEMV's own per-thread activation-sum cache lives in
-/// `hipfire_cpu` and is not reserved here.)
+/// `hipfire_cpu` and is not reserved here.) The D2 executor prewarms this once
+/// per layer at `prepare` time for its full allocated capacity (64 rows × 10 =
+/// 640 slots), so no logical 1..64 window regrows it on the hot path.
 pub fn reserve_moe_cpu_host_slot_scratch(
     dim: usize,
     mi: usize,
@@ -1733,6 +1758,59 @@ pub fn reserve_moe_cpu_host_slot_scratch(
         reserve_to(&mut s.group_off, max_slots + 1);
     });
     Ok(())
+}
+
+/// Real host-slot scratch capacity (logical ROWS) of THIS thread for geometry
+/// `(dim, mi, top_k)`: `min_slots / top_k` where `min_slots` is the minimum
+/// over every reserved `MOE_SCRATCH` vector of `capacity /
+/// per-slot-component-stride` — i.e. the largest row count the current
+/// reservation can serve without any `Vec` growth on the hot path. Units are
+/// rows, not slots: a 640-slot reserve at top_k 10 reports 64, and the legacy
+/// 40-slot reserve reports 4. `moe_cpu_host_slot_outputs` needs per computed
+/// slot: `2*mi` gu + `mi` hidden + `dim` dn elements, one
+/// `order`/`group_id`/`slot_group`/`slot_si` entry each, one
+/// `group_start`/`group_off` entry each (the `+1` trailing offset is covered
+/// by the same reservation), and a `2*mi`-element `gather` shared across slots.
+/// Pure reader: no allocation, no growth, no mutation; `0` when `dim/mi/top_k`
+/// is zero, when any stride divides nothing, when `top_k` exceeds the slot
+/// minimum, or when the thread holds no reservation yet; `usize::MAX` is never
+/// returned (every quotient is bounded by a real `Vec::capacity`). Callers
+/// MUST NOT clamp a slots-scale value into this rows-scale result.
+pub fn moe_cpu_host_slot_scratch_capacity_rows(dim: usize, mi: usize, top_k: usize) -> usize {
+    if dim == 0 || mi == 0 || top_k == 0 {
+        return 0;
+    }
+    let stride_2mi = match (2usize).checked_mul(mi) {
+        Some(v) if v > 0 => v,
+        _ => return 0,
+    };
+    MOE_SCRATCH.with(|cell| {
+        let s = cell.borrow();
+        let mut slots = usize::MAX;
+        // f32 arithmetic buffers: capacity elements / per-slot elements.
+        slots = slots.min(s.gu.capacity() / stride_2mi);
+        slots = slots.min(s.hidden.capacity() / mi);
+        slots = slots.min(s.dn.capacity() / dim);
+        // Shared gather: must hold one full 2*mi row to run at all.
+        if s.gather.capacity() < stride_2mi {
+            return 0;
+        }
+        // Per-slot index metadata: one entry per computed slot.
+        slots = slots.min(s.order.capacity());
+        slots = slots.min(s.group_id.capacity());
+        slots = slots.min(s.slot_group.capacity());
+        slots = slots.min(s.slot_si.capacity());
+        // group_start/group_off reserve max_slots+1 entries (groups+1 offsets);
+        // the trailing offset consumes one, the rest cover one group each, and
+        // one group always covers >=1 slot, so capacity-1 bounds the slots.
+        slots = slots.min(s.group_start.capacity().saturating_sub(1));
+        slots = slots.min(s.group_off.capacity().saturating_sub(1));
+        if slots == usize::MAX {
+            0
+        } else {
+            slots / top_k
+        }
+    })
 }
 
 /// Host-only per-slot expert outputs for a split (CPU cold / GPU hot) MoE
@@ -2640,6 +2718,32 @@ fn with_cpu_transfer<R>(
             std::mem::forget(owner.take());
         }
         result
+    })
+}
+
+/// Prewarm the calling thread's owned pinned transfer stage for `values` f32
+/// elements (checked `values*4` bytes) on `gpu`'s device, reusing the existing
+/// [`with_cpu_transfer`] allocation/reuse/drain lifecycle without running any
+/// math: growth or a device transition drops an owner that drains pending
+/// accesses; the warm same-device path keeps the existing owner untouched (no
+/// hot allocation). Admission calls this at load/prewarm after memory
+/// admission; refuses capture/retained-recording like every other transfer use.
+pub fn reserve_cpu_transfer_values(gpu: &Gpu, values: usize) -> Result<(), DispatchError> {
+    with_cpu_transfer(gpu, values, |_| Ok(()))
+}
+
+/// Real pinned-transfer capacity (bytes) of the calling thread's stage for
+/// `device_id`: `0` when no stage exists, when it belongs to another device,
+/// or while it is pending (an in-flight transfer the caller must not reuse),
+/// otherwise its actual [`hip_bridge::PinnedTransferBuffer::size`]. Pure
+/// reader: no allocation, no growth, no mutation.
+pub fn cpu_transfer_capacity_bytes(device_id: i32) -> usize {
+    CPU_TRANSFER.with(|cell| {
+        let owner = cell.borrow();
+        match owner.as_ref() {
+            Some(b) if b.device() == device_id && !b.is_pending() => b.size(),
+            _ => 0,
+        }
     })
 }
 
@@ -3991,7 +4095,7 @@ mod moe_splice_tests {
         masks: &[u64],
     ) -> bool {
         let (slots, n_exp) = (rows * top_k, 12usize);
-        assert!(slots <= 64 && ids.len() == slots && w.len() == slots && x.len() == rows * HS_DIM);
+        assert!(slots <= 640 && ids.len() == slots && w.len() == slots && x.len() == rows * HS_DIM);
         let fx = host_fixture(n_exp);
         let valid = |s: usize| route_id_valid(ids[s], n_exp);
         let range = |s: usize| s * HS_DIM..(s + 1) * HS_DIM;
@@ -4177,9 +4281,186 @@ mod moe_splice_tests {
         run_mask_case_rows(1, 10, &ids, &w, &x_of(HS_DIM), &masks)
     }
 
-    /// Deterministic LCG masks for windows too wide to enumerate; the all-cold,
+    /// Wide oracle: `masks` are bit-vectors over slots (1 = cold/host), one
+    /// `u64` word per 64 slots, so the full 640-slot logical window is covered
+    /// without enumerating 2^640 subsets. Same invariant as
+    /// [`run_mask_case_rows`]: every row's joined bytes equal the one-row AR of
+    /// that token.
+    fn run_mask_case_rows_wide(
+        rows: usize,
+        top_k: usize,
+        ids: &[i32],
+        w: &[f32],
+        x: &[f32],
+        masks: &[Vec<u64>],
+    ) {
+        let (slots, n_exp) = (rows * top_k, 12usize);
+        assert!(slots <= 640 && ids.len() == slots && w.len() == slots && x.len() == rows * HS_DIM);
+        let fx = host_fixture(n_exp);
+        let valid = |s: usize| route_id_valid(ids[s], n_exp);
+        let is_host = |mask: &[u64], s: usize| (mask[s / 64] >> (s % 64)) & 1 == 1;
+        let range = |s: usize| s * HS_DIM..(s + 1) * HS_DIM;
+        let every: Vec<u32> = (0..slots as u32).filter(|&s| valid(s as usize)).collect();
+        let mut full = stale(slots * HS_DIM);
+        let full_route = masked_route(ids, &every);
+        hs_run(
+            None,
+            rows,
+            top_k,
+            n_exp,
+            ids,
+            Some(&full_route),
+            &every,
+            &fx.spans(ids, &every),
+            x,
+            &mut full,
+        )
+        .unwrap();
+        // Every slot equals the scalar per-slot reference; invalid slots stay stale.
+        for s in 0..slots {
+            if valid(s) {
+                let row = s / top_k;
+                assert_eq!(
+                    bits(&full[range(s)]),
+                    bits(&slot_reference(
+                        &fx,
+                        ids[s],
+                        &x[row * HS_DIM..(row + 1) * HS_DIM]
+                    )),
+                    "wide slot {s} != scalar reference"
+                );
+            } else {
+                assert!(
+                    all_stale(&full[range(s)]),
+                    "wide invalid slot {s} was written"
+                );
+            }
+        }
+        let residual0: Vec<f32> = (0..HS_DIM).map(|c| 1.0 + 0.013 * c as f32).collect();
+        let mut reference = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            reference[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+        }
+        moe_canonical_combine_reference(HS_DIM, rows, top_k, n_exp, ids, w, &full, &mut reference);
+        // One-row AR per token: its own host-slot run and its own combine.
+        let mut ar = vec![0.0f32; rows * HS_DIM];
+        for t in 0..rows {
+            let r_ids = &ids[t * top_k..(t + 1) * top_k];
+            let r_host: Vec<u32> = (0..top_k as u32)
+                .filter(|&s| route_id_valid(r_ids[s as usize], n_exp))
+                .collect();
+            let mut r_full = stale(top_k * HS_DIM);
+            hs_run(
+                None,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                None,
+                &r_host,
+                &fx.spans(r_ids, &r_host),
+                &x[t * HS_DIM..(t + 1) * HS_DIM],
+                &mut r_full,
+            )
+            .unwrap();
+            for &s in &r_host {
+                assert_eq!(
+                    bits(&r_full[s as usize * HS_DIM..(s as usize + 1) * HS_DIM]),
+                    bits(&full[range(t * top_k + s as usize)]),
+                    "wide row {t} slot {s}: window host value != one-row AR"
+                );
+            }
+            let mut row = residual0.clone();
+            moe_canonical_combine_reference(
+                HS_DIM,
+                1,
+                top_k,
+                n_exp,
+                r_ids,
+                &w[t * top_k..(t + 1) * top_k],
+                &r_full,
+                &mut row,
+            );
+            ar[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&row);
+            assert_eq!(
+                bits(&row),
+                bits(&reference[t * HS_DIM..(t + 1) * HS_DIM]),
+                "wide row {t}: one-row AR combine != window combine of the unsplit values"
+            );
+        }
+        // Split join under every wide mask: host slots installed into the GPU
+        // expanded layout, invalid slots NaN-poisoned, joined once over the
+        // window; must equal BOTH the unsplit combine and the per-row AR.
+        for mask in masks {
+            let host: Vec<u32> = (0..slots as u32)
+                .filter(|&s| is_host(mask, s as usize) && valid(s as usize))
+                .collect();
+            let gpu_route = masked_route(ids, &host);
+            let mut host_out = stale(slots * HS_DIM);
+            hs_run(
+                None,
+                rows,
+                top_k,
+                n_exp,
+                ids,
+                Some(&gpu_route),
+                &host,
+                &fx.spans(ids, &host),
+                x,
+                &mut host_out,
+            )
+            .unwrap();
+            let mut expanded = vec![0.0f32; slots * HS_DIM];
+            for s in 0..slots {
+                if valid(s) && !host.contains(&(s as u32)) {
+                    expanded[range(s)].copy_from_slice(&full[range(s)]);
+                }
+            }
+            for s in 0..slots {
+                if host.contains(&(s as u32)) {
+                    assert_eq!(
+                        bits(&host_out[range(s)]),
+                        bits(&full[range(s)]),
+                        "wide mask: host slot {s} differs from its unsplit value"
+                    );
+                    expanded[range(s)].copy_from_slice(&host_out[range(s)]);
+                } else {
+                    assert!(
+                        all_stale(&host_out[range(s)]),
+                        "wide mask: non-host slot {s} was written"
+                    );
+                }
+            }
+            for s in 0..slots {
+                if !valid(s) {
+                    expanded[range(s)].fill(f32::NAN);
+                }
+            }
+            let mut got = vec![0.0f32; rows * HS_DIM];
+            for t in 0..rows {
+                got[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
+            }
+            moe_canonical_combine_reference(
+                HS_DIM, rows, top_k, n_exp, ids, w, &expanded, &mut got,
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&reference),
+                "wide mask: split join != unsplit"
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&ar),
+                "wide mask: split join != per-row one-row AR"
+            );
+        }
+    }
+
+    /// Deterministic masks for windows too wide to enumerate; the all-cold,
     /// all-hot and per-row-only / per-row-excluded masks are always included.
+    /// Narrow windows (<=64 slots) keep the exact legacy `u64` cover.
     fn sampled_masks(slots: usize, top_k: usize, n: usize) -> Vec<u64> {
+        assert!(slots <= 64, "narrow masks cover at most 64 slots");
         let all = if slots == 64 {
             u64::MAX
         } else {
@@ -4200,6 +4481,56 @@ mod moe_splice_tests {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             masks.push((state >> 7) & all);
+        }
+        masks
+    }
+
+    /// Wide deterministic masks: one `u64` word per 64 slots (10 words for the
+    /// full 640-slot logical window). The all-cold, all-hot and strided
+    /// per-row masks are always included, then the LCG fills to `n` masks;
+    /// every mask word beyond `slots` stays zero.
+    fn sampled_masks_wide(slots: usize, top_k: usize, n: usize) -> Vec<Vec<u64>> {
+        assert!(slots <= 640, "logical window is at most 640 slots");
+        let words = slots.div_ceil(64);
+        let mut set = |mask: &mut Vec<u64>, s: usize| {
+            mask[s / 64] |= 1 << (s % 64);
+        };
+        let mut full = vec![0u64; words];
+        for s in 0..slots {
+            set(&mut full, s);
+        }
+        let rows = slots / top_k;
+        // All single-row masks only for narrow windows; wide windows sample a
+        // strided subset (row 0, middle, last) to keep the mask count bounded.
+        let stride = (rows / 8).max(1);
+        let mut masks = vec![vec![0u64; words], full.clone()];
+        let mut t = 0usize;
+        while t < rows {
+            let mut row = vec![0u64; words];
+            for s in 0..top_k {
+                set(&mut row, (t * top_k + s) % slots);
+            }
+            let mut excl = full.clone();
+            for (e, r) in excl.iter_mut().zip(&row) {
+                *e &= !r;
+            }
+            masks.push(row);
+            masks.push(excl);
+            t += stride;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        while masks.len() < n {
+            let mut mask = vec![0u64; words];
+            for w in 0..words {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                mask[w] = (state >> 7) | (state << 57);
+            }
+            for s in slots..words * 64 {
+                mask[s / 64] &= !(1 << (s % 64));
+            }
+            masks.push(mask);
         }
         masks
     }
@@ -4265,6 +4596,7 @@ mod moe_splice_tests {
             ],
             [0.45, 0.35, 0.2, -0.0, 0.0, 0.33, 0.66, -0.5, 1.0e-30, 2.0],
         ];
+        assert!(rows >= 1 && rows <= 4, "narrow harness covers 1..4 rows");
         let mut ids = Vec::new();
         let mut w = Vec::new();
         for t in 0..rows {
@@ -4304,6 +4636,76 @@ mod moe_splice_tests {
             for identical in [false, true] {
                 for invalid in [false, true] {
                     multirow_join(rows, 1024, identical, invalid);
+                }
+            }
+        }
+    }
+
+    /// Wide row builder behind [`multirow_join_wide`]: the same interleaved /
+    /// repeated / sentinel / extreme-weight fixture, row `t` cycling the four
+    /// proven narrow rows so every 1..64 width repeats established cover.
+    fn multirow_join_wide(rows: usize, n_masks: usize, identical_tokens: bool, with_invalid: bool) {
+        let top_k = 10;
+        let base_ids: [[i32; 10]; 4] = [
+            [7, 2, 9, 2, 8, 5, 0, 5, 3, 4],
+            [2, 7, 5, 9, 0, 8, 3, 4, 5, 2],
+            [9, 9, 1, 11, 6, 6, 10, 2, 7, 0],
+            [4, 3, 5, 0, 8, 9, 2, 7, 2, 5],
+        ];
+        let base_w: [[f32; 10]; 4] = [
+            [
+                0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0,
+            ],
+            [
+                0.25, -1.0e30, 0.4, 1.0e30, 0.15, -1.0e37, 3.0e-39, 1.0e37, 0.7, 0.01,
+            ],
+            [
+                0.125, 0.3, -0.2, 0.9, 1.0e30, -1.0e30, 0.6, 0.05, 1.0e37, -1.0e37,
+            ],
+            [0.45, 0.35, 0.2, -0.0, 0.0, 0.33, 0.66, -0.5, 1.0e-30, 2.0],
+        ];
+        assert!(rows >= 1 && rows <= 64, "logical window is 1..64 rows");
+        let mut ids = Vec::new();
+        let mut w = Vec::new();
+        for t in 0..rows {
+            let mut row = base_ids[t % 4];
+            let mut wr = base_w[t % 4];
+            if with_invalid {
+                row[(1 + 3 * t) % 10] = -1;
+                wr[(1 + 3 * t) % 10] = f32::NAN;
+                row[(4 + 5 * t) % 10] = 40;
+                wr[(4 + 5 * t) % 10] = f32::INFINITY;
+            }
+            ids.extend_from_slice(&row);
+            w.extend_from_slice(&wr);
+        }
+        let mut x = x_of(rows * HS_DIM);
+        if identical_tokens {
+            for t in 1..rows {
+                let (head, tail) = x.split_at_mut(t * HS_DIM);
+                tail[..HS_DIM].copy_from_slice(&head[..HS_DIM]);
+            }
+        }
+        let masks = sampled_masks_wide(rows * top_k, top_k, n_masks);
+        run_mask_case_rows_wide(rows, top_k, &ids, &w, &x, &masks);
+    }
+
+    /// Logical window 1..64: every width's rows are byte-identical to the
+    /// one-row AR of each token (distinct and identical tokens, with and
+    /// without invalid slots), over sampled host/GPU masks including the
+    /// all-cold, all-hot and per-row masks. Widths 2..=4 repeat the proven
+    /// legacy cover; 5..=64 are the new lab-wide storage widths (no device
+    /// needed: the same device-free host-slot entry the D2 join runs).
+    #[test]
+    fn logical_window_1_to_64_matches_one_row_ar() {
+        for rows in 1..=64usize {
+            // Narrow widths keep the legacy 256-mask density; wide widths use
+            // 40 masks (all-cold, all-hot, strided per-row, LCG) — every one of
+            // the 64 widths still runs the full three-way byte check.
+            let n_masks = if rows <= 8 { 256 } else { 40 };
+            for identical in [false, true] {
+                for invalid in [false, true] {
+                    multirow_join_wide(rows, n_masks, identical, invalid);
                 }
             }
         }
@@ -4496,24 +4898,35 @@ mod moe_splice_tests {
                                 (host, out)
                             })
                             .collect();
+                        // Narrow widths keep the proven legacy cover; 5..8 extend
+                        // it one row at a time and 64 is the full logical window
+                        // (same row-cycled scenario rows, same one-row AR oracle).
                         let mut window_outs: Vec<(usize, Vec<f32>)> = Vec::new();
-                        for width in [2usize, 3, 4, 3, 2] {
-                            let ids: Vec<i32> =
-                                scenario[..width].iter().flatten().copied().collect();
+                        for width in [2usize, 3, 4, 3, 2, 5, 6, 7, 8, 64] {
+                            let ids: Vec<i32> = (0..width)
+                                .flat_map(|t| scenario[t % 4].iter().copied())
+                                .collect();
                             let host: Vec<u32> = (0..(width * top_k) as u32)
                                 .filter(|&s| is_host(ids[s as usize]))
                                 .collect();
+                            let xw: Vec<f32> = (0..width)
+                                .flat_map(|t| x[t % 4 * dim..(t % 4 + 1) * dim].to_vec())
+                                .collect();
                             let mut out = stale(width * top_k * dim);
-                            fx.run(width, top_k, &ids, &host, &x[..width * dim], &mut out);
+                            fx.run(width, top_k, &ids, &host, &xw, &mut out);
                             let ctx = format!(
                                 "{gq:?}/{dq:?} scenario {si} identical={identical} cold={cold:#04x} width={width}"
                             );
                             for t in 0..width {
+                                // Row `t` cycles the 4 proven scenario rows; the
+                                // one-row AR oracle (`ar`) and scalar reference
+                                // index the same cycled row.
+                                let cyc = t % 4;
                                 for j in 0..top_k {
                                     let s = t * top_k + j;
                                     let range = s * dim..(s + 1) * dim;
                                     if host.contains(&(s as u32)) {
-                                        let one = &ar[t].1[j * dim..(j + 1) * dim];
+                                        let one = &ar[cyc].1[j * dim..(j + 1) * dim];
                                         assert_eq!(
                                             bits(&out[range.clone()]),
                                             bits(one),
@@ -4521,7 +4934,9 @@ mod moe_splice_tests {
                                         );
                                         assert_eq!(
                                             bits(&out[range]),
-                                            bits(&fx.reference(ids[s], &x[t * dim..(t + 1) * dim])),
+                                            bits(
+                                                &fx.reference(ids[s], &xw[t * dim..(t + 1) * dim])
+                                            ),
                                             "{ctx}: row {t} rank {j} != scalar reference"
                                         );
                                     } else {
@@ -4530,8 +4945,13 @@ mod moe_splice_tests {
                                 }
                             }
                             // Accepted-prefix replay: a narrower window over the
-                            // same leading rows reproduces the wider one's bytes.
+                            // same leading rows reproduces the wider one's bytes,
+                            // restricted to widths the legacy harness recorded
+                            // (2..4 over the first 4 scenario rows).
                             for (pw, pout) in &window_outs {
+                                if width > 4 || *pw > 4 {
+                                    continue;
+                                }
                                 let n = (*pw).min(width) * top_k * dim;
                                 assert_eq!(
                                     bits(&out[..n]),
@@ -4544,7 +4964,8 @@ mod moe_splice_tests {
                             // Canonical join: GPU arm values for non-host valid
                             // slots (scalar reference), host slots from the
                             // window, invalid slots NaN; combined over the
-                            // window vs per-row one-row AR joins.
+                            // window vs per-row one-row AR joins. Weights cycle
+                            // with the rows (`wts` covers the 4-row harness).
                             let residual: Vec<f32> =
                                 (0..dim).map(|c| 1.0 + 0.013 * c as f32).collect();
                             let mut expanded = vec![0.0f32; width * top_k * dim];
@@ -4561,9 +4982,9 @@ mod moe_splice_tests {
                                     } else if is_host(id) {
                                         expanded[dst.clone()].copy_from_slice(&out[dst]);
                                         ar_expanded[t][r_dst.clone()]
-                                            .copy_from_slice(&ar[t].1[r_dst]);
+                                            .copy_from_slice(&ar[t % 4].1[r_dst]);
                                     } else {
-                                        let v = fx.reference(id, &x[t * dim..(t + 1) * dim]);
+                                        let v = fx.reference(id, &xw[t * dim..(t + 1) * dim]);
                                         expanded[dst].copy_from_slice(&v);
                                         ar_expanded[t][r_dst].copy_from_slice(&v);
                                     }
@@ -4573,25 +4994,33 @@ mod moe_splice_tests {
                             for t in 0..width {
                                 joined[t * dim..(t + 1) * dim].copy_from_slice(&residual);
                             }
+                            // Row-cycled weights for the wide combine.
+                            let wts_wide: Vec<f32> = (0..width)
+                                .flat_map(|t| {
+                                    let cyc = t % 4;
+                                    wts[cyc * top_k..(cyc + 1) * top_k].to_vec()
+                                })
+                                .collect();
                             moe_canonical_combine_reference(
                                 dim,
                                 width,
                                 top_k,
                                 n_exp,
                                 &ids,
-                                &wts,
+                                &wts_wide,
                                 &expanded,
                                 &mut joined,
                             );
                             for t in 0..width {
+                                let cyc = t % 4;
                                 let mut row = residual.clone();
                                 moe_canonical_combine_reference(
                                     dim,
                                     1,
                                     top_k,
                                     n_exp,
-                                    &scenario[t],
-                                    &wts[t * top_k..(t + 1) * top_k],
+                                    &scenario[cyc],
+                                    &wts[cyc * top_k..(cyc + 1) * top_k],
                                     &ar_expanded[t],
                                     &mut row,
                                 );
@@ -4907,11 +5336,27 @@ mod moe_splice_tests {
     }
 
     /// After `reserve_moe_cpu_host_slot_scratch`, a call within that slot count
-    /// grows no scratch buffer.
+    /// grows no scratch buffer, and the capacity getter reports rows, not slots.
     #[test]
     fn reserved_scratch_is_not_regrown_by_the_host_slot_call() {
-        let (rows, top_k, n_exp) = (4usize, 3usize, 5usize);
+        reserved_scratch_holds(4, 3);
+        // Full logical-window prewarm: one 640-slot reserve, then a 64-row call
+        // covering the whole window grows nothing.
+        reserved_scratch_holds(64, 10);
+    }
+
+    fn reserved_scratch_holds(rows: usize, top_k: usize) {
+        let n_exp = 5usize;
         reserve_moe_cpu_host_slot_scratch(HS_DIM, HS_MI, rows * top_k).unwrap();
+        // Row units, not slots: legacy 40-slot reserve reports 4 rows at
+        // top_k 10; the 640-slot prewarm reports 64.
+        assert_eq!(
+            moe_cpu_host_slot_scratch_capacity_rows(HS_DIM, HS_MI, top_k),
+            rows
+        );
+        assert_eq!(moe_cpu_host_slot_scratch_capacity_rows(0, HS_MI, top_k), 0);
+        assert_eq!(moe_cpu_host_slot_scratch_capacity_rows(HS_DIM, 0, top_k), 0);
+        assert_eq!(moe_cpu_host_slot_scratch_capacity_rows(HS_DIM, HS_MI, 0), 0);
         let caps = || {
             MOE_SCRATCH.with(|c| {
                 let s = c.borrow();
@@ -4931,10 +5376,11 @@ mod moe_splice_tests {
         };
         let before = caps();
         let fx = host_fixture(n_exp);
-        let ids: Vec<i32> = vec![4, 1, 3, 1, 1, 0, 3, 2, 4, 0, 2, 1];
-        let host: Vec<u32> = (0..12).collect();
+        let slots = rows * top_k;
+        let ids: Vec<i32> = (0..slots).map(|s| (s % n_exp) as i32).collect();
+        let host: Vec<u32> = (0..slots as u32).collect();
         let x = x_of(rows * HS_DIM);
-        let mut out = stale(12 * HS_DIM);
+        let mut out = stale(slots * HS_DIM);
         hs_run(
             None,
             rows,

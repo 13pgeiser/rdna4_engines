@@ -42,6 +42,38 @@ use std::time::Instant;
 
 pub const CPU_SPLIT_MAX_ROWS: usize = 4;
 
+/// Actual allocated storage bound (rows) of a [`CpuSplitExecutor`]: 64, the
+/// same value as `hipfire_config::QWEN4_VERIFY_MAX_ROWS`. Storage only, NOT a
+/// qualification or a default: the legacy default route still admits at most
+/// [`CPU_SPLIT_MAX_ROWS`] rows (see [`cpu_splice_window`]), and a 5..64-row call
+/// additionally needs an explicit lab-wide qualification (verify scope) from the
+/// routing/admission owners. Never metadata-bump [`CPU_SPLIT_MAX_ROWS`].
+pub const CPU_SPLIT_STORAGE_MAX_ROWS: usize = 64;
+
+const _: () = assert!(CPU_SPLIT_STORAGE_MAX_ROWS == hipfire_config::QWEN4_VERIFY_MAX_ROWS);
+const _: () = assert!(CPU_SPLIT_STORAGE_MAX_ROWS == 64);
+
+/// Whether a call of `rows` real rows over `route_rows` routing rows takes the
+/// CPU routed-expert window on a layer that is `armed`, under an explicit
+/// `qualified_max_rows` cap: decode and a verify window of at most that many
+/// rows, and only when the real rows are the whole routing window. A call over
+/// a wider routing window (a short tail of a long prefill whose `route_rows` is
+/// the canonical chunk) takes the GPU route.
+///
+/// `qualified_max_rows` is the routing/admission owner's qualified width for
+/// this call (4 on the default route; up to [`CPU_SPLIT_STORAGE_MAX_ROWS`] only
+/// under an explicit lab-wide verify scope). Callers MUST clamp it to
+/// [`CPU_SPLIT_STORAGE_MAX_ROWS`]; the executor independently refuses any `rows`
+/// beyond its allocated [`CpuSplitExecutor::capacity_rows`].
+pub const fn cpu_splice_window_qualified(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    qualified_max_rows: usize,
+) -> bool {
+    armed && rows != 0 && rows == route_rows && rows <= qualified_max_rows
+}
+
 /// Whether a call of `rows` real rows over `route_rows` routing rows takes the
 /// CPU routed-expert window on a layer that is `armed`: decode and a verify
 /// window of at most [`CPU_SPLIT_MAX_ROWS`] rows, and only when the real rows
@@ -53,10 +85,10 @@ pub const CPU_SPLIT_MAX_ROWS: usize = 4;
 /// the qwen4 prefill seal binds an executor-less view of the layer's weights
 /// (`Qwen4MoeLayerRuntime::routed_view`) for every call this rejects.
 pub const fn cpu_splice_window(armed: bool, rows: usize, route_rows: usize) -> bool {
-    armed && rows != 0 && rows == route_rows && rows <= CPU_SPLIT_MAX_ROWS
+    cpu_splice_window_qualified(armed, rows, route_rows, CPU_SPLIT_MAX_ROWS)
 }
 
-const MAX_SLOTS: usize = CPU_SPLIT_MAX_ROWS * 10;
+const MAX_SLOTS: usize = CPU_SPLIT_STORAGE_MAX_ROWS * 10;
 
 fn err(message: impl std::fmt::Display) -> DispatchError {
     DispatchError::Hip(format!("CPU tier split: {message}"))
@@ -746,6 +778,35 @@ fn cpu_split_trace_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_CPU_SPLIT_TRACE").is_ok_and(|v| v == "1")
 }
 
+/// Allocated slot/element extents of a `max_rows`-row [`CpuSplitExecutor`]:
+/// `(slots, input_values, mask_values, output_values)` with `slots = max_rows
+/// * top_k` (at most 640 = [`CPU_SPLIT_STORAGE_MAX_ROWS`] × 10), `input_values
+/// = max_rows * dim + 2 * slots` (original x, then ids, then weights — f32
+/// each), `mask_values = slots` and `output_values = slots * dim`. Checked:
+/// `0` or more than [`CPU_SPLIT_STORAGE_MAX_ROWS`] rows, and any overflowing
+/// extent, is an error before any device allocation exists, so a malformed
+/// request can never partially mutate an executor.
+pub fn cpu_split_storage_extents(
+    max_rows: usize,
+    dim: usize,
+    top_k: usize,
+) -> Result<(usize, usize, usize, usize), DispatchError> {
+    if max_rows == 0 || max_rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+        return Err(err("unsupported row cap"));
+    }
+    let slots = max_rows
+        .checked_mul(top_k)
+        .ok_or_else(|| err("slot overflow"))?;
+    let input_values = max_rows
+        .checked_mul(dim)
+        .and_then(|v| slots.checked_mul(2).and_then(|t| v.checked_add(t)))
+        .ok_or_else(|| err("input overflow"))?;
+    let output_values = slots
+        .checked_mul(dim)
+        .ok_or_else(|| err("output overflow"))?;
+    Ok((slots, input_values, slots, output_values))
+}
+
 impl CpuSplitExecutor {
     pub fn new(
         gpu: &Gpu,
@@ -760,24 +821,17 @@ impl CpuSplitExecutor {
             || mi == 0
             || mi % 128 != 0
             || top_k != 10
-            || max_rows != CPU_SPLIT_MAX_ROWS
             || placement.is_empty()
             || placement.len() > i32::MAX as usize
             || placement.iter().any(|&v| v > 1)
         {
-            return Err(err("unsupported shape, row cap or ownership plan"));
+            return Err(err("unsupported shape or ownership plan"));
         }
-        gpu.bind_thread().map_err(err)?;
-        let slots = max_rows
-            .checked_mul(top_k)
-            .ok_or_else(|| err("slot overflow"))?;
-        let input_values = max_rows
-            .checked_mul(dim)
-            .and_then(|v| slots.checked_mul(2).and_then(|t| v.checked_add(t)))
-            .ok_or_else(|| err("input overflow"))?;
-        let output_values = slots
-            .checked_mul(dim)
-            .ok_or_else(|| err("output overflow"))?;
+        if max_rows == 0 || max_rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+            return Err(err("unsupported row cap"));
+        }
+        let (slots, input_values, _, output_values) =
+            cpu_split_storage_extents(max_rows, dim, top_k)?;
         let input_bytes = input_values
             .checked_mul(4)
             .ok_or_else(|| err("input byte overflow"))?;
@@ -856,6 +910,14 @@ impl CpuSplitExecutor {
         &self.placement
     }
     pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+    /// Actually allocated row capacity of this executor (the `max_rows` it was
+    /// built with, 1..=[`CPU_SPLIT_STORAGE_MAX_ROWS`]): the truthful bound the
+    /// routing predicate clamps a qualified width against. Not a constant, not a
+    /// default, not a qualification: a 64-capacity executor still routes 4-wide
+    /// by default until a lab-wide verify scope qualifies wider.
+    pub fn capacity_rows(&self) -> usize {
         self.max_rows
     }
     pub fn dim(&self) -> usize {
@@ -1058,13 +1120,18 @@ impl CpuSplitExecutor {
             return Ok(D2ReturnMode::Copy);
         }
         gpu.bind_thread().map_err(err)?;
-        let values = self.max_rows * self.top_k * self.dim;
-        let buffer = match gpu.hip.mapped_host_buffer(values * 4) {
+        let (_, _, _, output_values) =
+            cpu_split_storage_extents(self.max_rows, self.dim, self.top_k)
+                .map_err(|e| err(format!("{e:?}")))?;
+        let values = output_values;
+        let bytes = values
+            .checked_mul(4)
+            .ok_or_else(|| err("mapped byte overflow"))?;
+        let buffer = match gpu.hip.mapped_host_buffer(bytes) {
             Ok(buffer) => buffer,
             Err(error) => {
                 self.return_refusal = Some(format!(
-                    "mapped host allocation of {} bytes failed: {error}",
-                    values * 4
+                    "mapped host allocation of {bytes} bytes failed: {error}"
                 ));
                 return Ok(D2ReturnMode::Copy);
             }
@@ -1574,18 +1641,26 @@ impl CpuSplitExecutor {
         let diag = self.diag_on.get();
         let t0 = diag.then(Instant::now);
         self.gate(gpu, rows)?;
-        let slots = rows * self.top_k;
-        let nx = rows * self.dim;
-        if x_rot.buf.size() < nx * 4
-            || ids.buf.size() < slots * 4
-            || weights.buf.size() < slots * 4
+        let rows_x = rows
+            .checked_mul(self.dim)
+            .ok_or_else(|| err("input overflow"))?;
+        let slots_x = (rows
+            .checked_mul(self.top_k)
+            .ok_or_else(|| err("slot overflow")))?;
+        if x_rot.buf.size() < rows_x * 4
+            || ids.buf.size() < slots_x * 4
+            || weights.buf.size() < slots_x * 4
             || experts.len() != self.placement.len()
         {
             return Err(err("input extent or expert plan mismatch"));
         }
         // Admission may run on a different thread than orchestration. Reserve
         // its reusable CPU scratch here, before the parallel GPU/CPU phase.
-        cpu_exec::reserve_moe_cpu_host_slot_scratch(self.dim, self.mi, self.max_rows * self.top_k)?;
+        let capacity_slots = self
+            .max_rows
+            .checked_mul(self.top_k)
+            .ok_or_else(|| err("slot overflow"))?;
+        cpu_exec::reserve_moe_cpu_host_slot_scratch(self.dim, self.mi, capacity_slots)?;
         let (endpoint, shadow) = if diag {
             // A record left open by an aborted caller never leaks into this call.
             self.close_open();
@@ -1622,14 +1697,20 @@ impl CpuSplitExecutor {
                 false
             };
             st.input
-                .download_async(&gpu.hip, &x_rot.buf, 0, nx * 4, gpu.active_stream.as_ref())
+                .download_async(
+                    &gpu.hip,
+                    &x_rot.buf,
+                    0,
+                    rows_x * 4,
+                    gpu.active_stream.as_ref(),
+                )
                 .map_err(err)?;
             st.input
                 .download_async(
                     &gpu.hip,
                     &ids.buf,
-                    nx * 4,
-                    slots * 4,
+                    rows_x * 4,
+                    slots_x * 4,
                     gpu.active_stream.as_ref(),
                 )
                 .map_err(err)?;
@@ -1637,8 +1718,8 @@ impl CpuSplitExecutor {
                 .download_async(
                     &gpu.hip,
                     &weights.buf,
-                    (nx + slots) * 4,
-                    slots * 4,
+                    (rows_x + slots_x) * 4,
+                    slots_x * 4,
                     gpu.active_stream.as_ref(),
                 )
                 .map_err(err)?;
@@ -1659,15 +1740,15 @@ impl CpuSplitExecutor {
                 self.prove_retired(gpu, &mut buf)?;
                 st.ret.retired();
             }
-            for s in 0..slots {
-                let at = (nx + s) * 4;
+            for s in 0..slots_x {
+                let at = (rows_x + s) * 4;
                 let id =
                     i32::from_ne_bytes(st.input.as_bytes_mut()[at..at + 4].try_into().unwrap());
                 st.ids[s] = id;
                 st.gpu_ids[s] = -1;
             }
             st.host_count = 0;
-            for s in 0..slots {
+            for s in 0..slots_x {
                 let id = st.ids[s];
                 // Invalid original slots belong to neither arm; preserve them
                 // for the existing router-fault reporting/canonical reducer.
@@ -1688,7 +1769,7 @@ impl CpuSplitExecutor {
                 }
             }
             self.validate_payloads(gpu, &st, rows, experts, shadow.as_deref())?;
-            for s in 0..slots {
+            for s in 0..slots_x {
                 let bytes = st.gpu_ids[s].to_ne_bytes();
                 st.mask.as_bytes_mut()[s * 4..s * 4 + 4].copy_from_slice(&bytes);
             }
@@ -1697,7 +1778,7 @@ impl CpuSplitExecutor {
                     &gpu.hip,
                     &self.masked_indices.buf,
                     0,
-                    slots * 4,
+                    slots_x * 4,
                     gpu.active_stream.as_ref(),
                 )
                 .map_err(err)?;
@@ -1726,8 +1807,12 @@ impl CpuSplitExecutor {
     /// Lab only: open the parity record for a successfully prepared call.
     fn open_record(&self, st: &mut Transaction, t0: Instant, rows: usize, endpoint: SplitEndpoint) {
         let prepare_ns = ns(t0, Instant::now());
-        let slots = rows * self.top_k;
-        let nx = rows * self.dim;
+        let slots = rows
+            .checked_mul(self.top_k)
+            .expect("open record after checked prepare");
+        let nx = rows
+            .checked_mul(self.dim)
+            .expect("open record after checked prepare");
         let mut p = self.parity.borrow_mut();
         if p.records.len() >= p.max_records {
             return;
@@ -1800,6 +1885,8 @@ impl CpuSplitExecutor {
             down_quant: CpuQuant::F32,
             down: &[],
         };
+        // `resolved` is preallocated executor-width staging (640 slots): filled
+        // once per call, no per-window heap growth beyond this fixed array.
         let mut resolved = [dummy; MAX_SLOTS];
         for (j, &slot) in st.host_slots[..st.host_count].iter().enumerate() {
             let id = st.ids[slot as usize] as usize;
@@ -1845,8 +1932,13 @@ impl CpuSplitExecutor {
         let trace_on = self.cpu_trace && self.cpwait.is_some();
         let trace_entry = trace_on.then(Instant::now);
         self.gate(gpu, rows)?;
-        let slots = rows * self.top_k;
-        if expanded.buf.size() < slots * self.dim * 4 {
+        let slots = rows
+            .checked_mul(self.top_k)
+            .ok_or_else(|| err("slot overflow"))?;
+        let out_values = slots
+            .checked_mul(self.dim)
+            .ok_or_else(|| err("output overflow"))?;
+        if expanded.buf.size() < out_values * 4 {
             return Err(err("short expanded output"));
         }
         let mut st = self.state.borrow_mut();
@@ -1897,10 +1989,10 @@ impl CpuSplitExecutor {
             // Input completion and previous output retirement happened BEFORE
             // the GPU tail; neither buffer has been submitted since then.
             let x = unsafe {
-                std::slice::from_raw_parts(
-                    input.as_bytes_mut().as_ptr().cast::<f32>(),
-                    rows * self.dim,
-                )
+                let n_x = rows
+                    .checked_mul(self.dim)
+                    .ok_or_else(|| err("input overflow"))?;
+                std::slice::from_raw_parts(input.as_bytes_mut().as_ptr().cast::<f32>(), n_x)
             };
             if *mapped_call {
                 // Mapped return: the cold slots go straight into the mapped
@@ -1928,7 +2020,7 @@ impl CpuSplitExecutor {
                 let prove_ns = t_prove.map_or(0, |t| ns(t, Instant::now()));
                 let mut write = buf.begin_write().map_err(err)?;
                 let all = write.f32_mut().map_err(err)?;
-                let rows_out = &mut all[..slots * self.dim];
+                let rows_out = &mut all[..out_values];
                 let t_cpu = (diag || trace_on).then(Instant::now);
                 let arm = if trace_on {
                     Some(cpu_exec::moe_cpu_host_slot_outputs_traced(
@@ -2030,7 +2122,7 @@ impl CpuSplitExecutor {
             let out = unsafe {
                 std::slice::from_raw_parts_mut(
                     output.as_bytes_mut().as_mut_ptr().cast::<f32>(),
-                    slots * self.dim,
+                    out_values,
                 )
             };
             let t_cpu = diag.then(Instant::now);
@@ -2173,27 +2265,78 @@ impl CpuSplitExecutor {
     /// download, masked ids upload, and on the copy transport just the cold F32
     /// expanded slot returns (H2D). On the mapped transport no cold slot is
     /// copied: that return is [`Self::mapped_return_bytes`]. No residual.
+    /// Checked: overflow reports `(usize::MAX, usize::MAX)` (a malformed width
+    /// the executor itself would refuse) so byte census can never wrap.
     pub fn transfer_bytes(&self, rows: usize, cold_slots: usize) -> (usize, usize) {
-        let returned = if self.mapped.is_some() {
-            0
-        } else {
-            4 * cold_slots * self.dim
-        };
-        (
-            4 * rows * (self.dim + 2 * self.top_k),
-            4 * rows * self.top_k + returned,
+        Self::transfer_bytes_for(
+            self.dim,
+            self.top_k,
+            self.mapped.is_some(),
+            rows,
+            cold_slots,
         )
+    }
+
+    /// Device-free transfer census behind [`Self::transfer_bytes`]: the same
+    /// checked byte formula over explicit geometry, so lab tests can pin the
+    /// 64-row numbers without a device.
+    pub fn transfer_bytes_for(
+        dim: usize,
+        top_k: usize,
+        mapped: bool,
+        rows: usize,
+        cold_slots: usize,
+    ) -> (usize, usize) {
+        let up: Option<usize> = (|| {
+            4usize
+                .checked_mul(rows)?
+                .checked_mul(dim.checked_add(2 * top_k)?)
+        })();
+        let returned = if mapped {
+            Some(0)
+        } else {
+            (|| 4usize.checked_mul(cold_slots)?.checked_mul(dim))()
+        };
+        let down: Option<usize> = (|| {
+            4usize
+                .checked_mul(rows)?
+                .checked_mul(top_k)?
+                .checked_add(returned?)
+        })();
+        match (up, down) {
+            (Some(up), Some(down)) => (up, down),
+            _ => (usize::MAX, usize::MAX),
+        }
     }
 
     /// Bytes the canonical combine reads remotely from the mapped allocation
     /// for `cold_slots` cold slot rows (PCIe reads, not H2D copies); 0 on the
-    /// copy transport.
+    /// copy transport. Checked: overflow reports `usize::MAX`.
     pub fn mapped_return_bytes(&self, cold_slots: usize) -> usize {
         if self.mapped.is_some() {
-            4 * cold_slots * self.dim
+            4usize
+                .checked_mul(cold_slots)
+                .and_then(|v| v.checked_mul(self.dim))
+                .unwrap_or(usize::MAX)
         } else {
             0
         }
+    }
+
+    /// Storage byte census of a `max_rows`-row executor: `(input, mask,
+    /// output)` live pinned/device bytes (f32 elements × 4).
+    /// Checked: overflow reports `(usize::MAX, usize::MAX, usize::MAX)`.
+    pub fn storage_bytes(max_rows: usize, dim: usize, top_k: usize) -> (usize, usize, usize) {
+        let bytes: Option<(usize, usize, usize)> = (|| {
+            let (_slots, input_values, mask_values, output_values) =
+                cpu_split_storage_extents(max_rows, dim, top_k).ok()?;
+            Some((
+                input_values.checked_mul(4)?,
+                mask_values.checked_mul(4)?,
+                output_values.checked_mul(4)?,
+            ))
+        })();
+        bytes.unwrap_or((usize::MAX, usize::MAX, usize::MAX))
     }
 
     pub fn free_gpu(self, gpu: &Gpu) -> Result<(), HipError> {
@@ -2240,6 +2383,89 @@ mod return_tests {
         p.published();
         assert_eq!(p.lend(), Ok(CombineSource::Mapped));
         assert_eq!(p.enqueued(), Ok(true));
+    }
+
+    #[test]
+    fn legacy_default_scope_stays_four_wide() {
+        assert_eq!(CPU_SPLIT_MAX_ROWS, 4);
+        assert_eq!(CPU_SPLIT_STORAGE_MAX_ROWS, 64);
+        assert_eq!(
+            CPU_SPLIT_STORAGE_MAX_ROWS,
+            hipfire_config::QWEN4_VERIFY_MAX_ROWS
+        );
+        assert_eq!(MAX_SLOTS, 640);
+        // Default route: decode + the proven 2..4 verify widths, whole window only.
+        for rows in 1..=4usize {
+            assert!(cpu_splice_window(true, rows, rows));
+            assert!(cpu_splice_window_qualified(
+                true,
+                rows,
+                rows,
+                CPU_SPLIT_MAX_ROWS
+            ));
+        }
+        for rows in [0usize, 5, 8, 64] {
+            assert!(!cpu_splice_window(true, rows, rows));
+        }
+        // A short tail of a long prefill is never the whole routing window.
+        assert!(!cpu_splice_window(true, 4, 8));
+        assert!(!cpu_splice_window_qualified(true, 4, 8, 64));
+        // Qualified lab-wide scope admits the full 1..64 window; unqualified stays 4.
+        for rows in [5usize, 8, 33, 64] {
+            assert!(cpu_splice_window_qualified(
+                true,
+                rows,
+                rows,
+                CPU_SPLIT_STORAGE_MAX_ROWS
+            ));
+            assert!(cpu_splice_window_qualified(true, rows, rows, 64));
+        }
+        assert!(!cpu_splice_window_qualified(
+            true,
+            65,
+            65,
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        ));
+        assert!(!cpu_splice_window_qualified(
+            true,
+            64,
+            32,
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        ));
+        assert!(!cpu_splice_window_qualified(
+            false,
+            1,
+            1,
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        ));
+    }
+
+    #[test]
+    fn storage_extents_cover_64_rows_at_top_k_10() {
+        let (slots, input, mask, output) = cpu_split_storage_extents(64, 256, 10).unwrap();
+        assert_eq!(slots, 640);
+        assert_eq!(input, 64 * 256 + 2 * 640);
+        assert_eq!(mask, 640);
+        assert_eq!(output, 640 * 256);
+        let (in_b, mask_b, out_b) = CpuSplitExecutor::storage_bytes(64, 256, 10);
+        assert_eq!(in_b, input * 4);
+        assert_eq!(mask_b, mask * 4);
+        assert_eq!(out_b, output * 4);
+        // Transport census for the worst-case all-cold copy call: x/ids/weights
+        // down the input side, masked ids + every cold slot back. Device-free
+        // formula pins the exact 64-row numbers (dim 256, top_k 10).
+        let (up, down) = CpuSplitExecutor::transfer_bytes_for(256, 10, false, 64, 640);
+        assert_eq!(up, 4 * 64 * (256 + 20));
+        assert_eq!(down, 4 * 64 * 10 + 4 * 640 * 256);
+        let (mup, mdown) = CpuSplitExecutor::transfer_bytes_for(256, 10, true, 64, 640);
+        assert_eq!((mup, mdown), (up, 4 * 64 * 10));
+        // Malformed widths refuse before any device allocation exists.
+        assert!(cpu_split_storage_extents(0, 256, 10).is_err());
+        assert!(cpu_split_storage_extents(65, 256, 10).is_err());
+        assert_eq!(
+            CpuSplitExecutor::storage_bytes(65, 256, 10),
+            (usize::MAX, usize::MAX, usize::MAX)
+        );
     }
 
     #[test]

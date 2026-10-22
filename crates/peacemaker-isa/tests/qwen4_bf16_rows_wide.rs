@@ -2,20 +2,26 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Structural tests of the BF16 wide verify GEMV twins, module `bf16_rows_wide_pm_gfx1151` (gfx1151 only):
-//! the ordinary x4 entries `gemv_bf16_xf32_x4_rows_wide_r{16,32}_pm_gfx1151` and the k4 HC entries
-//! `gemv_bf16_xf32_k4_rows_wide_r{16,32}_pm_gfx1151`. Emitter metadata, ABI, resources, proof obligations
-//! (barrier/EXEC discipline, row masking, early returns), the per-row source DAG, instruction counts, weight-load
-//! reuse, and the committed contracts / bundle.
+//! Structural and row-exact CPU tests of the BF16 fixed-eight rowtile twins,
+//! module `bf16_rows_wide_pm_gfx1151` (gfx1151 only): the ordinary x4 entry
+//! `gemv_bf16_xf32_rows_x4_t8_pm_gfx1151` and the k4 HC entry
+//! `gemv_bf16_xf32_k4_rows_t8_pm_gfx1151`. Emitter metadata, ABI, resources,
+//! proof obligations (barrier/EXEC discipline, row masking, early returns),
+//! the per-row source DAG, instruction counts, weight-load reuse, the
+//! committed bundle, and the `rowtiles` CPU oracles at every R=1..64.
 //!
-//! These tests establish structure only. Nothing here certifies numerical equality with R independent
-//! single-row launches; that is the GPU row oracle's job.
-use peacemaker_isa::kernels::qwen4_bf16_rows_wide::{self, Spec};
+//! The `rowtiles` tests execute the entries against independent finite-input
+//! DAG transcriptions; they are not an actual-singleton-object certificate.
+//! HC's explicit refusal and structural/ownership tests are not HC numerical
+//! proof; raw/activated HC bytes, extreme inputs and actual-singleton parity
+//! remain mandatory hardware gates.
+use peacemaker_isa::kernels::qwen4_bf16_rows_wide;
 use peacemaker_isa::Arch;
 
 const ARCH: Arch = Arch::Gfx1151;
-const CAPS: [u8; 2] = [16, 32];
 const MODULE: &str = "bf16_rows_wide_pm_gfx1151";
+const ORDINARY: &str = "gemv_bf16_xf32_rows_x4_t8_pm_gfx1151";
+const HC: &str = "gemv_bf16_xf32_k4_rows_t8_pm_gfx1151";
 
 /// Ordinary ABI: `A0..A3 x y0..y3` pointers, then `M0 M1 M2 M3 K R` i32.
 const X4_ARGS: &[(u32, u32)] = &[
@@ -47,25 +53,6 @@ const K4_ARGS: &[(u32, u32)] = &[
     (40, 4),
 ];
 
-fn spec(cap: u8) -> Spec {
-    Spec { arch: ARCH, cap }
-}
-fn x4(cap: u8) -> peacemaker_isa::Emitted {
-    qwen4_bf16_rows_wide::emit(spec(cap)).unwrap()
-}
-fn k4(cap: u8) -> peacemaker_isa::Emitted {
-    qwen4_bf16_rows_wide::emit_hc(spec(cap)).unwrap()
-}
-/// Row tiles of eight rows (ordinary) per capacity.
-fn tiles(cap: u8) -> usize {
-    usize::from(cap) / 8
-}
-/// Four-row stages (HC) per capacity.
-fn stages(cap: u8) -> usize {
-    usize::from(cap) / 4
-}
-
-/// Instruction lines of the emitted assembly (everything before the `.rodata`), labels and directives removed.
 fn instructions(text: &str) -> Vec<&str> {
     let body = &text[..text.find(".section .rodata").unwrap()];
     body.lines()
@@ -136,71 +123,6 @@ fn fmacs(lines: &[&str]) -> Vec<(usize, [u32; 3])> {
         .collect()
 }
 
-/// The ABI/geometry fields every entry's descriptor and metadata carry.
-fn check_abi(
-    t: &str,
-    what: &str,
-    args: &[(u32, u32)],
-    kernarg: u32,
-    reads: usize,
-    writes: usize,
-    lds: u32,
-) {
-    assert!(
-        t.contains(&format!(".kernarg_segment_size: {kernarg}\n"))
-            && t.contains(&format!(".amdhsa_kernarg_size {kernarg}\n")),
-        "{what}: kernarg size"
-    );
-    assert_eq!(
-        kernel_field(t, ".offset:"),
-        args.iter().map(|a| a.0).collect::<Vec<_>>(),
-        "{what}: offsets"
-    );
-    assert_eq!(
-        kernel_field(t, ".size:"),
-        args.iter().map(|a| a.1).collect::<Vec<_>>(),
-        "{what}: sizes"
-    );
-    assert_eq!(
-        t.matches(".actual_access: read_only\n").count(),
-        reads,
-        "{what}: read-only pointers"
-    );
-    assert_eq!(
-        t.matches(".actual_access: write_only\n").count(),
-        writes,
-        "{what}: write-only pointers"
-    );
-    assert!(
-        t.contains(".max_flat_workgroup_size: 256\n"),
-        "{what}: block 256"
-    );
-    assert!(
-        t.contains(&format!(".group_segment_fixed_size: {lds}\n"))
-            && t.contains(&format!(".amdhsa_group_segment_fixed_size {lds}\n")),
-        "{what}: LDS {lds}"
-    );
-    assert!(
-        t.contains(".workgroup_processor_mode: 1\n"),
-        "{what}: WGP mode (cu_mode false)"
-    );
-    assert!(
-        t.contains(".wavefront_size: 32\n") && t.contains(".amdhsa_wavefront_size32 1\n"),
-        "{what}: wave32"
-    );
-    assert!(
-        t.contains(".private_segment_fixed_size: 0\n")
-            && t.contains(".vgpr_spill_count: 0\n")
-            && t.contains(".sgpr_spill_count: 0\n"),
-        "{what}: no scratch"
-    );
-    assert!(
-        t.contains(".amdhsa_system_sgpr_workgroup_id_x 1\n")
-            && t.contains(".amdhsa_system_sgpr_workgroup_id_y 0\n"),
-        "{what}: 1-D grid"
-    );
-}
-
 /// Mnemonic families no entry of the module may contain.
 const FORBIDDEN: [&str; 11] = [
     "scratch_",
@@ -235,1107 +157,6 @@ fn assert_barriers_run_with_full_exec(lines: &[&str], what: &str, want: usize) {
     assert_eq!(barriers, want, "{what}: barrier count");
 }
 
-/// Every vector load is drained with `vmcnt(0)` before the next barrier.
-fn assert_x_loads_drain_before_barriers(lines: &[&str], what: &str) {
-    for (i, _) in lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| mnemonic(l) == "global_load_b128" || mnemonic(l) == "global_load_b32")
-    {
-        let wait = lines
-            .iter()
-            .enumerate()
-            .skip(i + 1)
-            .find(|(_, w)| w.starts_with("s_waitcnt") && w.contains("vmcnt(0)"))
-            .map(|(j, _)| j)
-            .expect("vmcnt(0) after the X load");
-        let next_barrier = lines
-            .iter()
-            .enumerate()
-            .skip(i + 1)
-            .find(|(_, b)| mnemonic(b) == "s_barrier")
-            .map(|(j, _)| j)
-            .unwrap();
-        assert!(
-            wait < next_barrier,
-            "{what}: X load not drained before the barrier"
-        );
-    }
-}
-
-#[test]
-fn names_modules_and_gating() {
-    assert_eq!(qwen4_bf16_rows_wide::CAPS, CAPS);
-    for cap in CAPS {
-        assert_eq!(
-            spec(cap).symbol(),
-            format!("gemv_bf16_xf32_x4_rows_wide_r{cap}_pm_gfx1151")
-        );
-        assert_eq!(
-            spec(cap).symbol_hc(),
-            format!("gemv_bf16_xf32_k4_rows_wide_r{cap}_pm_gfx1151")
-        );
-    }
-    assert_eq!(Spec::module(ARCH), MODULE);
-
-    // The module holds exactly the four entries, ordinary r16, r32 then k4 r16, r32.
-    let (emitted, text, proof) = qwen4_bf16_rows_wide::emit_module(ARCH).unwrap();
-    assert_eq!(proof.module, MODULE);
-    assert_eq!((emitted.len(), proof.kernels.len()), (4, 4));
-    let symbols: Vec<String> = CAPS
-        .iter()
-        .map(|&c| spec(c).symbol())
-        .chain(CAPS.iter().map(|&c| spec(c).symbol_hc()))
-        .collect();
-    let mut at = 0;
-    for symbol in &symbols {
-        assert!(
-            text.contains(&format!(".amdhsa_kernel {symbol}\n")),
-            "{symbol}"
-        );
-        assert_eq!(
-            text.matches(&format!("{symbol}:\n")).count(),
-            1,
-            "{symbol}: symbol label"
-        );
-        let here = text.find(&format!("{symbol}:\n")).unwrap();
-        assert!(here >= at, "{symbol}: module order");
-        at = here;
-    }
-    assert_eq!(text.matches(".amdhsa_kernel ").count(), 4);
-    assert_eq!(
-        text.matches(".amdgpu_metadata\n").count(),
-        1,
-        "one metadata document"
-    );
-    // Single entries are the module's kernels, byte for byte.
-    for (e, symbol) in emitted.iter().zip(&symbols) {
-        assert!(e.s_text.contains(&format!("{symbol}:\n")), "{symbol}");
-    }
-    assert_eq!(emitted[0].s_text, x4(16).s_text);
-    assert_eq!(emitted[1].s_text, x4(32).s_text);
-    assert_eq!(emitted[2].s_text, k4(16).s_text);
-    assert_eq!(emitted[3].s_text, k4(32).s_text);
-
-    // Exact-gfx1151 only, and only the two compiled capacities exist.
-    for arch in [Arch::Gfx1100, Arch::Gfx1201] {
-        for cap in CAPS {
-            assert!(
-                qwen4_bf16_rows_wide::emit(Spec { arch, cap }).is_err(),
-                "{arch:?} x4 r{cap}"
-            );
-            assert!(
-                qwen4_bf16_rows_wide::emit_hc(Spec { arch, cap }).is_err(),
-                "{arch:?} k4 r{cap}"
-            );
-        }
-        assert!(qwen4_bf16_rows_wide::emit_module(arch).is_err(), "{arch:?}");
-    }
-    for cap in [0u8, 8, 24, 48, 64] {
-        assert!(
-            qwen4_bf16_rows_wide::emit(spec(cap)).is_err(),
-            "x4 cap {cap}"
-        );
-        assert!(
-            qwen4_bf16_rows_wide::emit_hc(spec(cap)).is_err(),
-            "k4 cap {cap}"
-        );
-    }
-}
-
-#[test]
-fn emission_is_deterministic() {
-    for cap in CAPS {
-        for (name, a, b) in [("x4", x4(cap), x4(cap)), ("k4", k4(cap), k4(cap))] {
-            assert_eq!(a.s_text, b.s_text, "{name} r{cap}");
-            assert_eq!(
-                a.proof.s_text_sha256, b.proof.s_text_sha256,
-                "{name} r{cap}"
-            );
-            assert_eq!(
-                serde_json::to_value(&a.proof).unwrap(),
-                serde_json::to_value(&b.proof).unwrap(),
-                "{name} r{cap}"
-            );
-        }
-    }
-    let (ea, ta, pa) = qwen4_bf16_rows_wide::emit_module(ARCH).unwrap();
-    let (eb, tb, pb) = qwen4_bf16_rows_wide::emit_module(ARCH).unwrap();
-    assert_eq!((ea.len(), &ta), (eb.len(), &tb));
-    assert_eq!(
-        serde_json::to_value(&pa).unwrap(),
-        serde_json::to_value(&pb).unwrap(),
-        "ModuleProof"
-    );
-}
-
-/// Ordinary entries: the frozen 96-byte ABI of the narrow PM entry. HC entries: `W X Y M K scale hc_act R`, 48 bytes.
-#[test]
-fn kernarg_abi_and_launch_geometry() {
-    assert_eq!(
-        (
-            qwen4_bf16_rows_wide::KERNARG_BYTES,
-            qwen4_bf16_rows_wide::HC_KERNARG_BYTES
-        ),
-        (96, 48)
-    );
-    assert_eq!(
-        (qwen4_bf16_rows_wide::M_BLOCK, qwen4_bf16_rows_wide::BLOCK),
-        (8, 256)
-    );
-    assert_eq!(
-        (
-            qwen4_bf16_rows_wide::LDS_BYTES,
-            qwen4_bf16_rows_wide::HC_LDS_BYTES
-        ),
-        (8192, 16384)
-    );
-    for cap in CAPS {
-        check_abi(
-            &x4(cap).s_text,
-            &format!("x4 r{cap}"),
-            X4_ARGS,
-            96,
-            5,
-            4,
-            8192,
-        );
-        check_abi(
-            &k4(cap).s_text,
-            &format!("k4 r{cap}"),
-            K4_ARGS,
-            48,
-            2,
-            1,
-            16384,
-        );
-    }
-}
-
-/// Declared resource ceilings: 4 streams x cap accumulators past the working set, 128 / 192 VGPR budgets;
-/// the ordinary entries use 64 SGPRs, the HC entries all 80.
-#[test]
-fn resources_stay_inside_the_budgets() {
-    for (cap, budget) in [(16u8, 128u16), (32, 192)] {
-        assert_eq!(spec(cap).vgpr_budget(), budget);
-        let high_water = 40 + 4 * u16::from(cap);
-        for (name, e, sgpr) in [("x4", x4(cap), 64u16), ("k4", k4(cap), 80)] {
-            assert!(
-                e.shape.next_free_vgpr >= high_water && e.shape.next_free_vgpr <= budget,
-                "{name} r{cap}: vgpr {}",
-                e.shape.next_free_vgpr
-            );
-            assert_eq!(e.shape.next_free_sgpr, sgpr, "{name} r{cap}: sgpr");
-            assert_eq!(
-                (e.proof.next_free_vgpr, e.proof.next_free_sgpr),
-                (e.shape.next_free_vgpr, e.shape.next_free_sgpr)
-            );
-            assert!(e
-                .s_text
-                .contains(&format!(".vgpr_count: {}\n", e.shape.next_free_vgpr)));
-            assert!(e.s_text.contains(&format!(
-                ".amdhsa_next_free_vgpr {}\n",
-                e.shape.next_free_vgpr
-            )));
-        }
-    }
-}
-
-/// Exact instruction counts of the ordinary entries. `T` = row tiles of eight (`cap / 8`) and `C` = `cap`:
-/// the 8-term vector chain runs once per row per K256 slot (4 unrolled slots) and the scalar K32 step once per
-/// row; fold is 3 adds per row, plus a 5-level own+other tree per row.
-#[test]
-fn x4_instruction_counts() {
-    for cap in CAPS {
-        let (t, c) = (tiles(cap), usize::from(cap));
-        let e = x4(cap);
-        let lines = instructions(&e.s_text);
-        let case = |what: &str, got: usize, want: usize| assert_eq!(got, want, "x4 r{cap}: {what}");
-        case("v_fmac_f32_e32", count(&lines, "v_fmac_f32_e32"), 264 * t);
-        case("ds_load_b32", count(&lines, "ds_load_b32"), 264 * t);
-        case("ds_store_b32", count(&lines, "ds_store_b32"), 33 * t);
-        case(
-            "global_load_b128 (X, two per slot tile)",
-            count(&lines, "global_load_b128"),
-            8 * t,
-        );
-        case(
-            "global_load_b32 (X, scalar step)",
-            count(&lines, "global_load_b32"),
-            t,
-        );
-        case(
-            "buffer_load_b128 (weights, one per slot)",
-            count(&lines, "buffer_load_b128"),
-            4,
-        );
-        case(
-            "buffer_load_u16 (weights, scalar step)",
-            count(&lines, "buffer_load_u16"),
-            1,
-        );
-        case(
-            "s_barrier (two per tile)",
-            count(&lines, "s_barrier"),
-            10 * t,
-        );
-        case("shape.barriers", e.shape.barriers, 10 * t);
-        case("ds_swizzle_b32", count(&lines, "ds_swizzle_b32"), c);
-        case("ds_bpermute_b32", count(&lines, "ds_bpermute_b32"), 4 * c);
-        case(
-            "v_add_f32_e32 (fold + tree)",
-            count(&lines, "v_add_f32_e32"),
-            8 * c,
-        );
-        case("global_store_b32", count(&lines, "global_store_b32"), c);
-        case("v_cmpx_eq_u32_e32", count(&lines, "v_cmpx_eq_u32_e32"), 1);
-        case("s_endpgm", count(&lines, "s_endpgm"), 1);
-        // Weight widening is bitwise: four `& 0xffff0000` and four `<< 16` per slot, one `<< 16` in the scalar step.
-        case(
-            "high-half widen",
-            lines
-                .iter()
-                .filter(|l| mnemonic(l) == "v_and_b32_e32" && l.contains("0xffff0000"))
-                .count(),
-            16,
-        );
-        case(
-            "low-half widen",
-            lines
-                .iter()
-                .filter(|l| mnemonic(l) == "v_lshlrev_b32_e32" && operands(l)[1] == "16")
-                .count(),
-            17,
-        );
-        // One +0 initialization per accumulator, 4 streams per row.
-        case(
-            "accumulator zeroing",
-            lines
-                .iter()
-                .filter(|l| mnemonic(l) == "v_mov_b32_e32" && operands(l)[1] == "0")
-                .count(),
-            4 * c,
-        );
-        // EXEC is narrowed and restored symmetrically (weights of 5 slots + fill + consume of 5*T tile calls).
-        case(
-            "exec restores",
-            count_exact(&lines, "s_mov_b32 exec_lo, -1"),
-            5 + 10 * t,
-        );
-        case(
-            "exec narrows",
-            lines
-                .iter()
-                .filter(|l| l.starts_with("s_mov_b32 exec_lo, s"))
-                .count(),
-            5 + 10 * t,
-        );
-        case(
-            "active-lane masks (-1 << n, not)",
-            count(&lines, "s_not_b32"),
-            5,
-        );
-        for forbidden in FORBIDDEN
-            .iter()
-            .chain(["v_mul_f", "v_fma_f", "v_div_", "v_exp_", "v_rcp_"].iter())
-        {
-            assert!(
-                !lines.iter().any(|l| l.starts_with(forbidden)),
-                "x4 r{cap}: forbidden {forbidden}*"
-            );
-        }
-        assert!(
-            !lines
-                .iter()
-                .any(|l| mnemonic(l).starts_with("s_") && mnemonic(l).ends_with("_f32")),
-            "x4 r{cap}: no scalar FP"
-        );
-    }
-}
-
-/// Exact instruction counts of the HC entries. `S` = four-row stages (`cap / 4`), `C` = `cap`; one local K256
-/// tile body (not unrolled), so the 8-term chain runs once per row; then `S` epilogue items, each the decoded
-/// `hc_act` sequence (fold, 3 BF16 round trips, `exp`, the full division expansion).
-#[test]
-fn k4_instruction_counts() {
-    for cap in CAPS {
-        let (s, c) = (stages(cap), usize::from(cap));
-        let e = k4(cap);
-        let lines = instructions(&e.s_text);
-        let case = |what: &str, got: usize, want: usize| assert_eq!(got, want, "k4 r{cap}: {what}");
-        case(
-            "v_fmac_f32_e32 (8C chain + 3 per item)",
-            count(&lines, "v_fmac_f32_e32"),
-            8 * c + 3 * s,
-        );
-        case("ds_load_b32", count(&lines, "ds_load_b32"), 32 * s);
-        case(
-            "ds_load_b128 (item partials)",
-            count(&lines, "ds_load_b128"),
-            s,
-        );
-        case(
-            "ds_store_b32 (X stage + partials)",
-            count(&lines, "ds_store_b32"),
-            16 * s + c,
-        );
-        case("global_load_b128", count(&lines, "global_load_b128"), 4 * s);
-        case("global_load_b32", count(&lines, "global_load_b32"), 0);
-        case(
-            "buffer_load_b128 (weights, one per tile)",
-            count(&lines, "buffer_load_b128"),
-            1,
-        );
-        case("buffer_load_u16", count(&lines, "buffer_load_u16"), 0);
-        case(
-            "s_barrier (2 per stage, partials, retire)",
-            count(&lines, "s_barrier"),
-            2 * s + 2,
-        );
-        case("shape.barriers", e.shape.barriers, 2 * s + 2);
-        case("ds_swizzle_b32", count(&lines, "ds_swizzle_b32"), c);
-        case("ds_bpermute_b32", count(&lines, "ds_bpermute_b32"), 4 * c);
-        case(
-            "v_add_f32_e32 (fold + tree + 1 + e per item)",
-            count(&lines, "v_add_f32_e32"),
-            8 * c + s,
-        );
-        case(
-            "global_store_b32 (one per item)",
-            count(&lines, "global_store_b32"),
-            s,
-        );
-        case("v_cmpx_eq_u32_e32", count(&lines, "v_cmpx_eq_u32_e32"), 1);
-        case("s_endpgm", count(&lines, "s_endpgm"), 1);
-        case(
-            "high-half widen",
-            lines
-                .iter()
-                .filter(|l| mnemonic(l) == "v_and_b32_e32" && l.contains("0xffff0000"))
-                .count(),
-            4,
-        );
-        case(
-            "low-half widen",
-            lines
-                .iter()
-                .filter(|l| mnemonic(l) == "v_lshlrev_b32_e32" && operands(l)[1] == "16")
-                .count(),
-            4,
-        );
-        case(
-            "accumulator zeroing",
-            lines
-                .iter()
-                .filter(|l| mnemonic(l) == "v_mov_b32_e32" && operands(l)[1] == "0")
-                .count(),
-            4 * c,
-        );
-        case(
-            "exec narrows",
-            lines
-                .iter()
-                .filter(|l| l.starts_with("s_mov_b32 exec_lo, s"))
-                .count(),
-            3 * s + 1,
-        );
-        case(
-            "exec restores",
-            count_exact(&lines, "s_mov_b32 exec_lo, -1"),
-            4 * s + 2,
-        );
-        case(
-            "lane-0 exec (item stores)",
-            count_exact(&lines, "s_mov_b32 exec_lo, 1"),
-            s,
-        );
-        case(
-            "active-lane masks (-1 << n, not)",
-            count(&lines, "s_not_b32"),
-            1,
-        );
-        // The decoded activation, per item: scalar FP, exp, and the full division expansion.
-        for (m, per_item) in [
-            ("s_add_f32", 4),
-            ("s_mul_f32", 2),
-            ("s_sub_f32", 1),
-            ("s_rndne_f32", 1),
-            ("s_fmamk_f32", 2),
-            ("s_cmp_ngt_f32", 1),
-            ("s_cmp_nlt_f32", 1),
-            ("s_cvt_i32_f32", 1),
-            ("v_exp_f32_e32", 1),
-            ("v_ldexp_f32", 1),
-            ("v_rcp_f32_e32", 1),
-            ("v_div_scale_f32", 2),
-            ("v_div_fmas_f32", 1),
-            ("v_div_fixup_f32", 1),
-            ("v_fma_f32", 2),
-            ("v_mul_f32_e32", 1),
-            ("v_cndmask_b32_e32", 2),
-        ] {
-            case(m, count(&lines, m), per_item * s);
-        }
-        // Three BF16 round trips (x, scale*x, result) per item.
-        case("round-trip bfe", count(&lines, "s_bfe_u32"), 3 * s);
-        case("round-trip addk", count(&lines, "s_addk_i32"), 3 * s);
-        for forbidden in FORBIDDEN {
-            assert!(
-                !lines.iter().any(|l| l.starts_with(forbidden)),
-                "k4 r{cap}: forbidden {forbidden}*"
-            );
-        }
-    }
-}
-
-/// The wide entries double the arithmetic and X traffic when `cap` doubles and never touch the weights again:
-/// weight loads are per K group, not per row tile.
-#[test]
-fn x4_weight_loads_are_independent_of_rows() {
-    let (a, b) = (x4(16), x4(32));
-    let (la, lb) = (instructions(&a.s_text), instructions(&b.s_text));
-    for m in ["buffer_load_b128", "buffer_load_u16"] {
-        assert_eq!(
-            count(&la, m),
-            count(&lb, m),
-            "{m}: the weight loads do not scale with the row capacity"
-        );
-    }
-    assert_eq!(
-        2 * count(&la, "v_fmac_f32_e32"),
-        count(&lb, "v_fmac_f32_e32")
-    );
-    assert_eq!(
-        2 * count(&la, "global_load_b128"),
-        count(&lb, "global_load_b128")
-    );
-
-    for cap in CAPS {
-        let t = tiles(cap);
-        let e = x4(cap);
-        let lines = instructions(&e.s_text);
-        let loads: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| mnemonic(l) == "buffer_load_b128")
-            .map(|(i, _)| i)
-            .collect();
-        let u16_load = position(&lines, |l| mnemonic(l) == "buffer_load_u16");
-        assert_eq!(loads.len(), 4);
-        // Between consecutive weight loads every row tile of the previous slot is consumed once: T tiles x 8 rows
-        // x 8 terms, two barriers per tile, two b128 X loads per tile, the weights untouched meanwhile.
-        let mut bounds = loads.clone();
-        bounds.push(u16_load);
-        for w in bounds.windows(2) {
-            let span = &lines[w[0] + 1..w[1]];
-            assert_eq!(
-                count(span, "v_fmac_f32_e32"),
-                64 * t,
-                "r{cap}: fmac between weight loads"
-            );
-            assert_eq!(
-                count(span, "s_barrier"),
-                2 * t,
-                "r{cap}: barriers between weight loads"
-            );
-            assert_eq!(
-                count(span, "global_load_b128"),
-                2 * t,
-                "r{cap}: X loads between weight loads"
-            );
-            assert_eq!(
-                count(span, "ds_load_b32"),
-                64 * t,
-                "r{cap}: LDS reads between weight loads"
-            );
-            assert_eq!(
-                count(span, "buffer_load_b128") + count(span, "buffer_load_u16"),
-                0,
-                "r{cap}: weights reloaded"
-            );
-        }
-        // The scalar step's single weight load feeds the last T tiles: 8 rows x 1 term per tile.
-        let tail = &lines[u16_load + 1..];
-        assert_eq!(
-            count(tail, "v_fmac_f32_e32"),
-            8 * t,
-            "r{cap}: scalar-step fmac"
-        );
-        assert_eq!(
-            count(tail, "s_barrier"),
-            2 * t,
-            "r{cap}: scalar-step barriers"
-        );
-        // Each weight load retires (vmcnt(0)) before the widening that consumes it.
-        for &load in loads.iter().chain([&u16_load]) {
-            let wait = lines
-                .iter()
-                .enumerate()
-                .skip(load + 1)
-                .find(|(_, l)| l.starts_with("s_waitcnt") && l.contains("vmcnt(0)"))
-                .map(|(i, _)| i)
-                .expect("vmcnt(0) after weight load");
-            let widen = lines
-                .iter()
-                .enumerate()
-                .skip(load + 1)
-                .find(|(_, l)| {
-                    (mnemonic(l) == "v_and_b32_e32" && l.contains("0xffff0000"))
-                        || (mnemonic(l) == "v_lshlrev_b32_e32" && operands(l)[1] == "16")
-                })
-                .map(|(i, _)| i)
-                .unwrap();
-            assert!(
-                wait < widen,
-                "r{cap}: widening before the weight load retires"
-            );
-        }
-    }
-}
-
-/// HC: one weight load per local K256 tile, regardless of `cap`; all `4 cap/4 = cap` rows' chains consume it.
-#[test]
-fn k4_weight_load_is_independent_of_rows() {
-    let (a, b) = (k4(16), k4(32));
-    let (la, lb) = (instructions(&a.s_text), instructions(&b.s_text));
-    assert_eq!(
-        (
-            count(&la, "buffer_load_b128"),
-            count(&lb, "buffer_load_b128")
-        ),
-        (1, 1)
-    );
-    for cap in CAPS {
-        let (s, c) = (stages(cap), usize::from(cap));
-        let emitted = k4(cap);
-        let lines = instructions(&emitted.s_text);
-        let load = position(&lines, |l| mnemonic(l) == "buffer_load_b128");
-        let first_swizzle = position(&lines, |l| mnemonic(l) == "ds_swizzle_b32");
-        let span = &lines[load + 1..first_swizzle];
-        assert_eq!(
-            count(span, "v_fmac_f32_e32"),
-            8 * c,
-            "r{cap}: every row's 8-term chain between the weight load and the reduction"
-        );
-        assert_eq!(count(span, "global_load_b128"), 4 * s, "r{cap}: X traffic");
-        assert_eq!(count(span, "s_barrier"), 2 * s, "r{cap}: stage barriers");
-        assert_eq!(count(span, "ds_load_b32"), 32 * s, "r{cap}: LDS reads");
-        assert_eq!(
-            count(span, "buffer_load_b128"),
-            0,
-            "r{cap}: weights reloaded"
-        );
-        let wait = lines
-            .iter()
-            .enumerate()
-            .skip(load + 1)
-            .find(|(_, l)| l.starts_with("s_waitcnt") && l.contains("vmcnt(0)"))
-            .map(|(i, _)| i)
-            .expect("vmcnt(0) after the weight load");
-        let widen = position(&lines, |l| {
-            mnemonic(l) == "v_and_b32_e32" && l.contains("0xffff0000")
-        });
-        assert!(
-            load < wait && wait < widen,
-            "r{cap}: widening before the weight load retires"
-        );
-    }
-}
-
-/// The per-row source DAG of the ordinary entries: row `8t + r` of slot `s` accumulates `a[j & 3] =
-/// fma(X_j, W_j, a[j & 3])` for `j = 0..7` ascending (`v_fmac_f32 acc, X, W`), rows' accumulators disjoint; the
-/// scalar step is one chain `a0`. Then fold `a1 += a0`, `a3 += a2`, `a3 += a1` and a 5-level tree, lane 0 stores
-/// stream 3 of each row.
-#[test]
-fn x4_per_row_dag_orientation_and_fold() {
-    for cap in CAPS {
-        let (t, c) = (tiles(cap), usize::from(cap));
-        let e = x4(cap);
-        let lines = instructions(&e.s_text);
-        let fm = fmacs(&lines);
-        assert_eq!(fm.len(), 264 * t);
-        let [acc0, x0, w0] = fm[0].1;
-        // Accumulators sit above the working set; X (first source) and weight (second source) slots are two
-        // disjoint eight-register windows below them.
-        assert!(acc0 >= 32 && x0 + 8 <= acc0 && w0 + 8 <= acc0 && (x0 + 8 <= w0 || w0 + 8 <= x0));
-        for slot in 0..4 {
-            for tile in 0..t {
-                for r in 0..8 {
-                    for j in 0..8 {
-                        let at = slot * 64 * t + tile * 64 + r * 8 + j;
-                        let row = (8 * tile + r) as u32;
-                        assert_eq!(
-                            fm[at].1,
-                            [
-                                acc0 + 4 * row + (j as u32 % 4),
-                                x0 + j as u32,
-                                w0 + j as u32
-                            ],
-                            "r{cap}: slot {slot} tile {tile} row {r} term {j}"
-                        );
-                    }
-                }
-            }
-        }
-        for tile in 0..t {
-            for r in 0..8 {
-                let row = (8 * tile + r) as u32;
-                assert_eq!(
-                    fm[256 * t + tile * 8 + r].1,
-                    [acc0 + 4 * row, x0, w0],
-                    "r{cap}: scalar step tile {tile} row {r}"
-                );
-            }
-        }
-        // All 4*cap accumulators are used, none outside.
-        let mut dests: Vec<u32> = fm.iter().map(|f| f.1[0]).collect();
-        dests.sort_unstable();
-        dests.dedup();
-        assert_eq!(
-            dests,
-            (acc0..acc0 + 4 * c as u32).collect::<Vec<_>>(),
-            "r{cap}: accumulator set"
-        );
-
-        // Fold, in the extracted decode object's source order, row 0 first; no row is skipped.
-        let last_fmac = fm.last().unwrap().0;
-        let adds: Vec<[u32; 3]> = lines[last_fmac + 1..]
-            .iter()
-            .filter(|l| mnemonic(l) == "v_add_f32_e32")
-            .take(3 * c)
-            .map(|l| {
-                let o = operands(l);
-                [vreg(o[0]), vreg(o[1]), vreg(o[2])]
-            })
-            .collect();
-        for r in 0..c as u32 {
-            let a = acc0 + 4 * r;
-            assert_eq!(
-                adds[3 * r as usize..3 * r as usize + 3],
-                [
-                    [a + 1, a + 1, a],
-                    [a + 3, a + 3, a + 2],
-                    [a + 3, a + 3, a + 1]
-                ],
-                "r{cap}: fold of row {r}"
-            );
-        }
-        // Stores: lane 0 only, stream 3 of each row in ascending row order, after the last barrier.
-        let last_barrier = lines
-            .iter()
-            .rposition(|l| mnemonic(l) == "s_barrier")
-            .unwrap();
-        let cmpx = position(&lines, |l| mnemonic(l) == "v_cmpx_eq_u32_e32");
-        assert_eq!(operands(lines[cmpx])[0], "0", "r{cap}: lane == 0 mask");
-        let stores: Vec<(usize, u32)> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| mnemonic(l) == "global_store_b32")
-            .map(|(i, l)| (i, vreg(operands(l)[1])))
-            .collect();
-        assert_eq!(stores.len(), c);
-        assert!(
-            last_barrier < cmpx && cmpx < stores[0].0,
-            "r{cap}: lane-0 store mask after the last barrier"
-        );
-        assert_eq!(
-            stores.iter().map(|s| s.1).collect::<Vec<_>>(),
-            (0..c as u32).map(|r| acc0 + 4 * r + 3).collect::<Vec<_>>(),
-            "r{cap}: stored streams"
-        );
-    }
-}
-
-/// The HC per-(row, quarter) chain is the ordinary chain on the quarter: row `r` consumes `a[j & 3] =
-/// fma(X_j, W_j, a[j & 3])`, `j = 0..7`, one tile body, stages of four rows in ascending row order; fold and tree
-/// are the ordinary ones; lane 0 writes each row's quarter sum to LDS `partial[mloc][r][q]`; the item epilogue folds
-/// `(q0 + q1) + (q2 + q3)` in the decoded order and branches over the activation on `hc_act == 0`.
-#[test]
-fn k4_per_row_dag_partials_and_item_fold() {
-    for cap in CAPS {
-        let (s, c) = (stages(cap), usize::from(cap));
-        let e = k4(cap);
-        let lines = instructions(&e.s_text);
-        let fm = fmacs(&lines);
-        assert_eq!(fm.len(), 8 * c + 3 * s);
-        let [acc0, x0, w0] = fm[0].1;
-        assert!(acc0 >= 32 && x0 + 8 <= acc0 && w0 + 8 <= acc0 && (x0 + 8 <= w0 || w0 + 8 <= x0));
-        for row in 0..c {
-            for j in 0..8 {
-                assert_eq!(
-                    fm[row * 8 + j].1,
-                    [
-                        acc0 + 4 * row as u32 + (j as u32 % 4),
-                        x0 + j as u32,
-                        w0 + j as u32
-                    ],
-                    "r{cap}: row {row} term {j}"
-                );
-            }
-        }
-        // The DAG's accumulators are exactly 4*cap, disjoint per row.
-        let mut dests: Vec<u32> = fm[..8 * c].iter().map(|f| f.1[0]).collect();
-        dests.sort_unstable();
-        dests.dedup();
-        assert_eq!(
-            dests,
-            (acc0..acc0 + 4 * c as u32).collect::<Vec<_>>(),
-            "r{cap}: accumulator set"
-        );
-
-        let last_chain = fm[8 * c - 1].0;
-        let adds: Vec<[u32; 3]> = lines[last_chain + 1..]
-            .iter()
-            .filter(|l| mnemonic(l) == "v_add_f32_e32")
-            .take(3 * c)
-            .map(|l| {
-                let o = operands(l);
-                [vreg(o[0]), vreg(o[1]), vreg(o[2])]
-            })
-            .collect();
-        for r in 0..c as u32 {
-            let a = acc0 + 4 * r;
-            assert_eq!(
-                adds[3 * r as usize..3 * r as usize + 3],
-                [
-                    [a + 1, a + 1, a],
-                    [a + 3, a + 3, a + 2],
-                    [a + 3, a + 3, a + 1]
-                ],
-                "r{cap}: fold of row {r}"
-            );
-        }
-
-        // Barrier layout: 2 per stage, then the partials barrier, then the final retire barrier.
-        let barriers: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| mnemonic(l) == "s_barrier")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(barriers.len(), 2 * s + 2);
-        let (partials_barrier, retire_barrier) = (barriers[2 * s], barriers[2 * s + 1]);
-        assert!(
-            last_chain < barriers[2 * s - 1],
-            "r{cap}: the chains end before the last stage barrier"
-        );
-        // Partial stores: ds_store_b32 whose data is a row's stream 3, at LDS offset 16 r, lane 0 only, before the
-        // partials barrier and after the last stage barrier.
-        let cmpx = position(&lines, |l| mnemonic(l) == "v_cmpx_eq_u32_e32");
-        assert_eq!(operands(lines[cmpx])[0], "0", "r{cap}: lane == 0 mask");
-        let partial_stores: Vec<(usize, u32, u32)> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| mnemonic(l) == "ds_store_b32" && vreg(operands(l)[1]) >= acc0)
-            .map(|(i, l)| {
-                (
-                    i,
-                    vreg(operands(l)[1]),
-                    l.split("offset:")
-                        .nth(1)
-                        .map_or(0, |o| o.trim().parse().unwrap()),
-                )
-            })
-            .collect();
-        assert_eq!(partial_stores.len(), c);
-        for (r, st) in partial_stores.iter().enumerate() {
-            assert_eq!(
-                (st.1, st.2),
-                (acc0 + 4 * r as u32 + 3, 16 * r as u32),
-                "r{cap}: partial store of row {r}"
-            );
-            assert!(
-                barriers[2 * s - 1] < cmpx && cmpx < st.0 && st.0 < partials_barrier,
-                "r{cap}: partial store {r} placement"
-            );
-        }
-        // Items: one ds_load_b128 of the four quarters each, after the partials barrier and before the retire barrier.
-        let item_loads: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| mnemonic(l) == "ds_load_b128")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(item_loads.len(), s);
-        assert!(
-            item_loads
-                .iter()
-                .all(|&i| partials_barrier < i && i < retire_barrier),
-            "r{cap}: items between the partials and retire barriers"
-        );
-        for &i in &item_loads {
-            // Four v_readfirstlane (the quarters), consecutive SGPRs.
-            let reads: Vec<u32> = lines[i + 1..]
-                .iter()
-                .filter(|l| mnemonic(l) == "v_readfirstlane_b32")
-                .take(4)
-                .map(|l| operands(l)[0].strip_prefix('s').unwrap().parse().unwrap())
-                .collect();
-            assert_eq!(
-                reads,
-                (reads[0]..reads[0] + 4).collect::<Vec<_>>(),
-                "r{cap}: quarters read into consecutive SGPRs"
-            );
-            // Fold (q0 + q1) + (q2 + q3): the first three scalar adds after the reads.
-            let first_add = lines[i + 1..]
-                .iter()
-                .position(|l| mnemonic(l) == "s_add_f32")
-                .unwrap()
-                + i
-                + 1;
-            let adds: Vec<usize> = (first_add..lines.len())
-                .filter(|&j| mnemonic(lines[j]) == "s_add_f32")
-                .take(3)
-                .collect();
-            let fold: Vec<Vec<u32>> = adds
-                .iter()
-                .map(|&j| {
-                    operands(lines[j])
-                        .iter()
-                        .map(|o| o.strip_prefix('s').unwrap().parse().unwrap())
-                        .collect()
-                })
-                .collect();
-            let q = reads[0];
-            assert_eq!(fold[0][1..], [q, q + 1], "r{cap}: q0 + q1");
-            assert_eq!(fold[1][1..], [q + 2, q + 3], "r{cap}: q2 + q3");
-            assert_eq!(
-                fold[2][1..],
-                [fold[0][0], fold[1][0]],
-                "r{cap}: (q0+q1) + (q2+q3)"
-            );
-            // `hc_act == 0` leaves the raw fold: the compare and branch directly follow the final add.
-            let cmp = adds[2]
-                + 1
-                + lines[adds[2] + 1..]
-                    .iter()
-                    .position(|l| mnemonic(l) == "s_cmp_eq_u32")
-                    .unwrap();
-            assert_eq!(operands(lines[cmp])[1], "0", "r{cap}: act compare");
-            let branch = after(&lines, cmp);
-            assert!(
-                branch.starts_with("s_cbranch_scc1 .Lbf16hc") && branch.ends_with("_done"),
-                "r{cap}: act branch"
-            );
-        }
-        // Every item stores from lane 0 only: the last EXEC write before each global store is `exec_lo = 1`.
-        let mut last_exec = "";
-        let mut stores = 0;
-        for &l in &lines {
-            if mnemonic(l) == "global_store_b32" {
-                assert_eq!(last_exec, "s_mov_b32 exec_lo, 1", "r{cap}: item store mask");
-                stores += 1;
-            } else if l.contains("exec_lo") || mnemonic(l) == "v_cmpx_eq_u32_e32" {
-                last_exec = l;
-            }
-        }
-        assert_eq!(stores, s);
-    }
-}
-
-/// Row masking (ordinary): `R` outside `1..=cap` returns before any barrier or store; a tile wholly past `R` is
-/// skipped by every wave; each row's consumption and its store are guarded by `R > row`.
-#[test]
-fn x4_row_masking_and_early_returns() {
-    for cap in CAPS {
-        let e = x4(cap);
-        let lines = instructions(&e.s_text);
-        let end = format!("s_cbranch_scc1 .Lbf16w{cap}_end");
-        let first_barrier = position(&lines, |l| mnemonic(l) == "s_barrier");
-        let gt = position(&lines, |l| {
-            l.starts_with("s_cmp_gt_u32 ") && l.ends_with(&format!(", {cap}"))
-        });
-        let rr = operands(lines[gt])[0].to_owned(); // the R SGPR
-        let eq0 = position(&lines, |l| l == format!("s_cmp_eq_u32 {rr}, 0"));
-        assert!(
-            gt < first_barrier && eq0 < first_barrier,
-            "r{cap}: R guards precede every barrier"
-        );
-        assert_eq!(
-            (after(&lines, gt), after(&lines, eq0)),
-            (end.as_str(), end.as_str()),
-            "r{cap}: R guards leave the kernel"
-        );
-        assert_eq!(count_exact(&lines, &format!("s_cmp_eq_u32 {rr}, 0")), 1);
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("s_cmp_gt_u32 ") && l.contains(&format!("{rr},")))
-                .count(),
-            1
-        );
-        assert!(position(&lines, |l| mnemonic(l) == "global_store_b32") > first_barrier);
-        assert!(position(&lines, |l| mnemonic(l) == "global_load_b128") > gt);
-        assert!(position(&lines, |l| mnemonic(l) == "buffer_load_b128") > gt);
-
-        // Every row's store is guarded, after the last barrier, in ascending row order: the guard precedes its own
-        // store and its branch follows it.
-        let last_barrier = lines
-            .iter()
-            .rposition(|l| mnemonic(l) == "s_barrier")
-            .unwrap();
-        let stores: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| mnemonic(l) == "global_store_b32")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(stores.len(), usize::from(cap));
-        let mut from = last_barrier;
-        for r in 0..u32::from(cap) {
-            let guard_line = format!("s_cmp_le_u32 {rr}, {r}");
-            let exit = format!("s_cbranch_scc1 .Lbf16w{cap}_stored{}", r / 16);
-            let at = lines
-                .iter()
-                .enumerate()
-                .skip(from)
-                .find(|(i, l)| **l == guard_line && after(&lines, *i) == exit)
-                .map(|(i, _)| i)
-                .unwrap_or_else(|| panic!("r{cap}: no store guard for row {r}"));
-            let store = stores[r as usize];
-            assert!(at < store, "r{cap}: row {r} guard precedes its store");
-            from = store;
-        }
-        // Tiles past R are skipped: tile guards `R <= 8t` for t = 1..T in every slot and the scalar step.
-        for tile in 1..tiles(cap) {
-            let n = count_exact(&lines, &format!("s_cmp_le_u32 {rr}, {}", 8 * tile));
-            assert!(n >= 5, "r{cap}: tile {tile} skip guards ({n})");
-        }
-        // Producers: wave + 8t >= R skips the fill, once per tile call.
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("s_cmp_ge_u32 ") && l.ends_with(&format!(", {rr}")))
-                .count(),
-            5 * tiles(cap),
-            "r{cap}: producer guards"
-        );
-        // Consume guards: rows 1..7 of every tile.
-        for row in 1..8u32 {
-            assert!(
-                count_exact(&lines, &format!("s_cmp_le_u32 {rr}, {row}")) >= 5,
-                "r{cap}: consume guard of row {row}"
-            );
-        }
-        // No guard exists for rows beyond the capacity.
-        assert_eq!(
-            count_exact(&lines, &format!("s_cmp_le_u32 {rr}, {}", 8 * tiles(cap))),
-            0,
-            "r{cap}: guard past cap"
-        );
-    }
-}
-
-/// Row masking (HC): the uniform early returns (`2*wg >= M`, `R` outside `1..=cap`, `K % 32 != 0`) precede every
-/// barrier and store; stage, consume, partial and item guards follow `R`.
-#[test]
-fn k4_row_masking_and_early_returns() {
-    for cap in CAPS {
-        let (s, c) = (stages(cap), usize::from(cap));
-        let emitted = k4(cap);
-        let lines = instructions(&emitted.s_text);
-        let end = format!("s_cbranch_scc1 .Lbf16hc{cap}_end");
-        let first_barrier = position(&lines, |l| mnemonic(l) == "s_barrier");
-        let gt = position(&lines, |l| {
-            l.starts_with("s_cmp_gt_u32 ") && l.ends_with(&format!(", {cap}"))
-        });
-        let rr = operands(lines[gt])[0].to_owned();
-        let eq0 = position(&lines, |l| l == format!("s_cmp_eq_u32 {rr}, 0"));
-        let kmask = position(&lines, |l| {
-            l.starts_with("s_and_b32 ") && l.ends_with(", 31")
-        });
-        let kcmp = position(&lines, |l| {
-            l.starts_with("s_cmp_lg_u32 ") && l.ends_with(", 0")
-        });
-        let mguard = position(&lines, |l| {
-            l.starts_with("s_cmp_ge_u32 ") && !l.ends_with(&format!(", {rr}"))
-        });
-        for at in [gt, eq0, kcmp, mguard] {
-            assert!(
-                at < first_barrier,
-                "r{cap}: early return {at} before the first barrier"
-            );
-            assert_eq!(
-                after(&lines, at),
-                end,
-                "r{cap}: early return leaves the kernel"
-            );
-        }
-        assert!(kmask < kcmp, "r{cap}: K % 32 test");
-        assert!(position(&lines, |l| mnemonic(l) == "global_store_b32") > first_barrier);
-        assert!(
-            position(&lines, |l| mnemonic(l) == "buffer_load_b128")
-                > gt.max(eq0).max(kcmp).max(mguard)
-        );
-        assert!(
-            position(&lines, |l| mnemonic(l) == "global_load_b128")
-                > gt.max(eq0).max(kcmp).max(mguard)
-        );
-        assert_eq!(count_exact(&lines, &format!("s_cmp_eq_u32 {rr}, 0")), 1);
-        // `R <= n` guards, rows 1..cap: the consume chain and the partial store of every row, plus the stage guard
-        // when `n` starts a stage; none for row 0 or for rows past the capacity.
-        assert_eq!(count_exact(&lines, &format!("s_cmp_le_u32 {rr}, 0")), 0);
-        for n in 1..c {
-            let want = if n % 4 == 0 { 3 } else { 2 };
-            assert_eq!(
-                count_exact(&lines, &format!("s_cmp_le_u32 {rr}, {n}")),
-                want,
-                "r{cap}: guards of row {n}"
-            );
-        }
-        assert_eq!(
-            count_exact(&lines, &format!("s_cmp_le_u32 {rr}, {c}")),
-            0,
-            "r{cap}: guard past cap"
-        );
-        // Producers (two vectors per wave per stage) and items skip on `row >= R`.
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("s_cmp_ge_u32 ") && l.ends_with(&format!(", {rr}")))
-                .count(),
-            3 * s,
-            "r{cap}: producer and item guards"
-        );
-    }
-}
-
-/// Barrier and EXEC discipline: the full mask is restored before every barrier (the last EXEC write before each
-/// `s_barrier` in program order is the all-ones restore), X loads are drained before barriers, and the barrier
-/// proofs list every barrier.
-#[test]
-fn barriers_run_with_full_exec() {
-    for cap in CAPS {
-        let e = x4(cap);
-        let lines = instructions(&e.s_text);
-        assert_barriers_run_with_full_exec(&lines, &format!("x4 r{cap}"), 10 * tiles(cap));
-        assert_x_loads_drain_before_barriers(&lines, &format!("x4 r{cap}"));
-        assert_eq!(
-            e.proof.barriers.len(),
-            10 * tiles(cap),
-            "x4 r{cap}: barrier proofs"
-        );
-        assert!(
-            e.proof.barriers.iter().all(|b| !b.transitions.is_empty()),
-            "x4 r{cap}: every barrier carries LDS transitions"
-        );
-
-        let e = k4(cap);
-        let lines = instructions(&e.s_text);
-        assert_barriers_run_with_full_exec(&lines, &format!("k4 r{cap}"), 2 * stages(cap) + 2);
-        assert_x_loads_drain_before_barriers(&lines, &format!("k4 r{cap}"));
-        assert_eq!(
-            e.proof.barriers.len(),
-            2 * stages(cap) + 2,
-            "k4 r{cap}: barrier proofs"
-        );
-        assert!(
-            e.proof.barriers.iter().all(|b| !b.transitions.is_empty()),
-            "k4 r{cap}: every barrier carries LDS transitions"
-        );
-    }
-}
-
 fn offsets(lines: &[&str], m: &str, keep: impl Fn(&str) -> bool) -> Vec<u32> {
     lines
         .iter()
@@ -1346,167 +167,6 @@ fn offsets(lines: &[&str], m: &str, keep: impl Fn(&str) -> bool) -> Vec<u32> {
                 .map_or(0, |o| o.trim().parse().unwrap())
         })
         .collect()
-}
-
-/// The ordinary LDS tile: eight producer rows x K256 f32. Producers store `128 j` apart, consumers read
-/// `1024 r + 128 j` for `r, j < 8`, so every access stays under the 8192-byte slot.
-#[test]
-fn x4_lds_offsets_stay_inside_the_tile() {
-    for cap in CAPS {
-        let emitted = x4(cap);
-        let lines = instructions(&emitted.s_text);
-        let (stores, loads) = (
-            offsets(&lines, "ds_store_b32", |_| true),
-            offsets(&lines, "ds_load_b32", |_| true),
-        );
-        let mut s = stores.clone();
-        s.sort_unstable();
-        s.dedup();
-        assert_eq!(
-            s,
-            (0..8).map(|j| 128 * j).collect::<Vec<_>>(),
-            "r{cap}: producer word offsets"
-        );
-        let mut l = loads.clone();
-        l.sort_unstable();
-        l.dedup();
-        assert_eq!(
-            l,
-            (0..8)
-                .flat_map(|r| (0..8).map(move |j| 1024 * r + 128 * j))
-                .collect::<Vec<_>>(),
-            "r{cap}: consumer offsets"
-        );
-        // Highest byte touched: max offset + 31 lanes * 4 B + 4, producer base (wave * 1024) included.
-        assert!(loads.iter().max().unwrap() + 31 * 4 + 4 <= 8192);
-        assert!(7 * 1024 + stores.iter().max().unwrap() + 31 * 4 + 4 <= 8192);
-    }
-}
-
-/// The HC LDS: 4 rows x 4 quarters x K256 f32 per stage (16 KiB), then the partial slots. Producers store at
-/// `8192 h + 128 j` (two vectors per wave), consumers read `4096 rl + 128 j` from their quarter's base, the
-/// partials land at `16 r` inside the first `2 cap * 16` bytes.
-#[test]
-fn k4_lds_offsets_stay_inside_the_tile() {
-    for cap in CAPS {
-        let c = u32::from(cap);
-        let emitted = k4(cap);
-        let lines = instructions(&emitted.s_text);
-        let first_acc = fmacs(&lines)[0].1[0];
-        let is_partial = |l: &str| vreg(operands(l)[1]) >= first_acc;
-        let producer = offsets(&lines, "ds_store_b32", |l| !is_partial(l));
-        let mut p = producer.clone();
-        p.sort_unstable();
-        p.dedup();
-        assert_eq!(
-            p,
-            [0u32, 8192]
-                .iter()
-                .flat_map(|h| (0..8).map(move |j| h + 128 * j))
-                .collect::<Vec<_>>(),
-            "r{cap}: producer word offsets"
-        );
-        let consumer = offsets(&lines, "ds_load_b32", |_| true);
-        let mut l = consumer.clone();
-        l.sort_unstable();
-        l.dedup();
-        assert_eq!(
-            l,
-            (0..4)
-                .flat_map(|rl| (0..8).map(move |j| 4096 * rl + 128 * j))
-                .collect::<Vec<_>>(),
-            "r{cap}: consumer offsets"
-        );
-        let partials = offsets(&lines, "ds_store_b32", is_partial);
-        assert_eq!(
-            partials,
-            (0..c).map(|r| 16 * r).collect::<Vec<_>>(),
-            "r{cap}: partial slots"
-        );
-        // Highest byte: producer wave base 7*1024 + 8192 + 7*128 + 31*4 + 4; consumer quarter base 3*1024 + 3*4096 + ...
-        assert!(7 * 1024 + producer.iter().max().unwrap() + 31 * 4 + 4 <= 16384);
-        assert!(3 * 1024 + consumer.iter().max().unwrap() + 31 * 4 + 4 <= 16384);
-        // Partials (mloc*cap + r)*16 + 4q plus the item loads' 16-byte quarters stay in the tile.
-        assert!((2 * c) * 16 <= 16384);
-    }
-}
-
-/// The committed shape contracts describe the fresh emission: symbol, resource ceilings, forbidden families,
-/// every counted mnemonic.
-#[test]
-fn committed_contracts_match_fresh_emission() {
-    for (tag, e, lds) in [
-        ("r16", x4(16), 8192u64),
-        ("r32", x4(32), 8192),
-        ("k4_r16", k4(16), 16384),
-        ("k4_r32", k4(32), 16384),
-    ] {
-        let path = format!(
-            "{}/kernels/qwen4_bf16_rows_wide.gfx1151.{tag}.contract.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let contract: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}")))
-                .unwrap();
-        let cap: u8 = tag
-            .trim_start_matches("k4_r")
-            .trim_start_matches('r')
-            .parse()
-            .unwrap();
-        let symbol = if tag.starts_with("k4") {
-            spec(cap).symbol_hc()
-        } else {
-            spec(cap).symbol()
-        };
-        let lines = instructions(&e.s_text);
-        assert_eq!(contract["symbol"], symbol.as_str(), "{path}");
-        for (name, want) in contract["counts"].as_object().unwrap() {
-            assert_eq!(
-                count(&lines, name) as u64,
-                want.as_u64().unwrap(),
-                "{path}: {name}"
-            );
-        }
-        for pattern in contract["forbidden"].as_array().unwrap() {
-            let prefix = pattern.as_str().unwrap().trim_end_matches('*');
-            assert!(
-                !lines.iter().any(|l| mnemonic(l).starts_with(prefix)),
-                "{path}: emission contains forbidden {prefix}*"
-            );
-        }
-        assert!(
-            u64::from(e.shape.next_free_vgpr) <= contract["vgpr_max"].as_u64().unwrap(),
-            "{path}: vgpr_max"
-        );
-        assert!(
-            u64::from(e.shape.next_free_sgpr) <= contract["sgpr_max"].as_u64().unwrap(),
-            "{path}: sgpr_max"
-        );
-        assert_eq!(contract["group_segment_fixed_bytes"], lds, "{path}");
-        assert_eq!(contract["launch_dynamic_lds_bytes"], 0, "{path}");
-        for flag in [
-            "require_wave32",
-            "require_zero_spills",
-            "require_zero_private",
-        ] {
-            assert_eq!(contract[flag], true, "{path}: {flag}");
-        }
-    }
-}
-
-/// The runtime embeds one certified module: its `.text` must be exactly what the builder emits today
-/// (`peacemaker-isa emit --kernel qwen4_bf16_rows_wide --epi all --arch gfx1151 ... --bundle`).
-#[test]
-fn committed_bundle_equals_native_emission() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
-    let path = format!("{root}/{MODULE}.hxaco");
-    let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let text = qwen4_bf16_rows_wide::emit_module(ARCH).unwrap().1;
-    let elf = peacemaker_isa::native::assemble(&text, ARCH).unwrap();
-    assert!(
-        text_section(&elf) == text_section(&committed),
-        "{MODULE}: native emission differs from the committed bundle"
-    );
 }
 
 /// `.text` of an ELF, or of the device ELF inside a clang offload bundle.
@@ -1526,4 +186,711 @@ fn text_section(bytes: &[u8]) -> Vec<u8> {
                 .then(|| e[u64_(sh(i) + 24)..u64_(sh(i) + 24) + u64_(sh(i) + 32)].to_vec())
         })
         .unwrap()
+}
+
+fn t8(hc: bool) -> peacemaker_isa::Emitted {
+    qwen4_bf16_rows_wide::emit_rowtiles(ARCH, hc).unwrap()
+}
+
+#[test]
+fn t8_names_module_and_entry_symbols() {
+    assert_eq!(qwen4_bf16_rows_wide::module(ARCH), MODULE);
+    let (emitted, text, proof) = qwen4_bf16_rows_wide::emit_module(ARCH).unwrap();
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(proof.module, MODULE);
+    assert_eq!(proof.kernels.len(), 2);
+    assert_eq!(text.matches(".amdhsa_kernel ").count(), 2);
+    for symbol in [ORDINARY, HC] {
+        assert!(
+            text.contains(&format!(".globl {symbol}\n")),
+            "{symbol}: missing from module source"
+        );
+        assert!(
+            text.contains(&format!(".name: {symbol}\n")),
+            "{symbol}: missing from module metadata"
+        );
+    }
+    assert!(!text.contains("rows_wide_r16"));
+    assert!(!text.contains("rows_wide_r32"));
+}
+
+#[test]
+fn t8_emission_is_deterministic_and_refuses_other_arches() {
+    for hc in [false, true] {
+        let (ea, ta, pa) = (
+            t8(hc),
+            t8(hc).s_text.clone(),
+            t8(hc).proof.s_text_sha256.clone(),
+        );
+        let eb = t8(hc);
+        assert_eq!(
+            (ea.s_text.len(), ta.len()),
+            (eb.s_text.len(), eb.s_text.len())
+        );
+        assert_eq!(ea.s_text, eb.s_text);
+        assert_eq!(pa, eb.proof.s_text_sha256);
+        for arch in [Arch::Gfx1100, Arch::Gfx1201] {
+            assert!(
+                qwen4_bf16_rows_wide::emit_rowtiles(arch, hc).is_err(),
+                "{arch:?}: cannot borrow Halo singleton-object proof"
+            );
+            assert!(
+                qwen4_bf16_rows_wide::emit_module(arch).is_err(),
+                "{arch:?}: module is exact-gfx1151 only"
+            );
+        }
+    }
+}
+
+#[test]
+fn t8_kernarg_abi_and_launch_geometry() {
+    for (hc, args, bytes, block, lds, reads, writes) in [
+        (false, X4_ARGS, 96u32, 32u16, 0u32, 5usize, 4usize),
+        (true, K4_ARGS, 48u32, 128u16, 128u32, 2usize, 1usize),
+    ] {
+        let e = t8(hc);
+        let t = &e.s_text;
+        assert_eq!(
+            kernel_field(t, ".offset:"),
+            args.iter().map(|a| a.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            kernel_field(t, ".size:"),
+            args.iter().map(|a| a.1).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            args.last().map(|&(o, n)| o + n),
+            Some(if hc { 44 } else { 96 })
+        );
+        assert!(t.contains(&format!(".max_flat_workgroup_size: {block}\n")));
+        assert!(t.contains(&format!(".group_segment_fixed_size: {lds}\n")));
+        assert!(t.contains(&format!(".amdhsa_group_segment_fixed_size {lds}\n")));
+        assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_x 1\n"));
+        assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_y 1\n"));
+        assert!(t.contains(".amdhsa_wavefront_size32 1\n"));
+        assert_eq!(t.matches(".actual_access: read_only\n").count(), reads);
+        assert_eq!(t.matches(".actual_access: write_only\n").count(), writes);
+        assert_eq!((e.shape.next_free_vgpr, e.shape.next_free_sgpr), (80, 80));
+        assert_eq!((e.proof.next_free_vgpr, e.proof.next_free_sgpr), (80, 80));
+        for field in [
+            ".private_segment_fixed_size: 0\n",
+            ".vgpr_spill_count: 0\n",
+            ".sgpr_spill_count: 0\n",
+        ] {
+            assert!(t.contains(field), "{field}");
+        }
+    }
+}
+
+#[test]
+fn t8_entries_hold_forbidden_mnemonic_and_spill_contract() {
+    for hc in [false, true] {
+        let e = t8(hc);
+        let what = if hc { HC } else { ORDINARY };
+        let lines = instructions(&e.s_text);
+        for pattern in FORBIDDEN {
+            let prefix = pattern.trim_end_matches('*');
+            assert!(
+                !lines.iter().any(|l| mnemonic(l).starts_with(prefix)),
+                "{what}: emission contains forbidden {prefix}*"
+            );
+        }
+        assert_eq!(e.shape.next_free_vgpr, 80, "{what}: vgpr high-water");
+        assert_eq!(e.shape.next_free_sgpr, 80, "{what}: sgpr high-water");
+        assert!(e.s_text.contains(".wavefront_size: 32\n"), "{what}");
+        assert_eq!(e.proof.next_free_vgpr, 80, "{what}: proof vgpr");
+        assert_eq!(e.proof.next_free_sgpr, 80, "{what}: proof sgpr");
+    }
+}
+
+/// The runtime embeds one certified module: its `.text` must be exactly what the builder emits today
+/// (`peacemaker-isa emit --kernel qwen4_bf16_rows_wide --epi all --arch gfx1151 ... --bundle`).
+#[test]
+fn t8_committed_bundle_equals_native_emission() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let path = format!("{root}/{MODULE}.hxaco");
+    let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let text = qwen4_bf16_rows_wide::emit_module(ARCH).unwrap().1;
+    let elf = peacemaker_isa::native::assemble(&text, ARCH).unwrap();
+    assert!(
+        text_section(&elf) == text_section(&committed),
+        "{MODULE}: native emission differs from the committed bundle"
+    );
+}
+
+mod rowtiles {
+    use super::*;
+    use peacemaker_ir::emu::{Emulator, Launch, Memory};
+    use peacemaker_ir::inst::Frontend;
+    use peacemaker_ir::Program;
+
+    const ORDINARY: &str = "gemv_bf16_xf32_rows_x4_t8_pm_gfx1151";
+    const HC: &str = "gemv_bf16_xf32_k4_rows_t8_pm_gfx1151";
+    const KARG: u64 = 0x1_0000;
+    const X: u64 = 0x1_0000_0000;
+    const GUARD: usize = 64;
+    const POISON: u32 = 0x7fc0_a5a5;
+
+    fn emit(hc: bool) -> peacemaker_isa::Emitted {
+        qwen4_bf16_rows_wide::emit_rowtiles(ARCH, hc).unwrap()
+    }
+
+    fn program(hc: bool) -> Program {
+        let elf = peacemaker_isa::native::assemble(&emit(hc).s_text, ARCH).unwrap();
+        peacemaker_lift::lift_object(
+            &elf,
+            peacemaker_lift::Options {
+                frontend: Frontend::Builder,
+            },
+        )
+        .unwrap()
+        .program
+    }
+
+    #[test]
+    fn frozen_symbols_abi_resources_and_arch_refusal() {
+        for hc in [false, true] {
+            let e = emit(hc);
+            let t = &e.s_text;
+            let symbol = if hc { HC } else { ORDINARY };
+            let (args, bytes, block, lds, reads, writes) = if hc {
+                (K4_ARGS, 48, 128, 128, 2, 1)
+            } else {
+                (X4_ARGS, 96, 32, 0, 5, 4)
+            };
+            assert_eq!(t.matches(&format!("{symbol}:\n")).count(), 1);
+            assert_eq!(t.matches(".amdhsa_kernel ").count(), 1);
+            assert!(t.contains(&format!(".amdhsa_kernel {symbol}\n")));
+            assert!(t.contains(&format!(".amdhsa_kernarg_size {bytes}\n")));
+            assert!(t.contains(&format!(".kernarg_segment_size: {bytes}\n")));
+            assert_eq!(
+                kernel_field(t, ".offset:"),
+                args.iter().map(|a| a.0).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                kernel_field(t, ".size:"),
+                args.iter().map(|a| a.1).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                args.last().map(|&(o, n)| o + n),
+                Some(if hc { 44 } else { 96 })
+            );
+            assert!(t.contains(&format!(".max_flat_workgroup_size: {block}\n")));
+            assert!(t.contains(&format!(".group_segment_fixed_size: {lds}\n")));
+            assert!(t.contains(&format!(".amdhsa_group_segment_fixed_size {lds}\n")));
+            assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_x 1\n"));
+            assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_y 1\n"));
+            assert!(t.contains(".amdhsa_wavefront_size32 1\n"));
+            assert!(t.contains(".wavefront_size: 32\n"));
+            assert!(t.contains(".workgroup_processor_mode: 1\n"));
+            assert_eq!(t.matches(".actual_access: read_only\n").count(), reads);
+            assert_eq!(t.matches(".actual_access: write_only\n").count(), writes);
+            assert_eq!((e.shape.next_free_vgpr, e.shape.next_free_sgpr), (80, 80));
+            assert_eq!((e.proof.next_free_vgpr, e.proof.next_free_sgpr), (80, 80));
+            for field in [
+                ".private_segment_fixed_size: 0\n",
+                ".vgpr_spill_count: 0\n",
+                ".sgpr_spill_count: 0\n",
+            ] {
+                assert!(t.contains(field), "{symbol}: {field}");
+            }
+            let again = emit(hc);
+            assert_eq!(t, &again.s_text);
+            assert_eq!(e.proof.s_text_sha256, again.proof.s_text_sha256);
+            for arch in [Arch::Gfx1100, Arch::Gfx1201] {
+                assert!(
+                    qwen4_bf16_rows_wide::emit_rowtiles(arch, hc).is_err(),
+                    "{arch:?}: cannot borrow Halo singleton-object proof"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_eight_row_dag_direct_loads_and_hc_quarters() {
+        for hc in [false, true] {
+            let e = emit(hc);
+            let lines = instructions(&e.s_text);
+            let fm = fmacs(&lines);
+            // Fast and scalar paths both exist, independent of total R.
+            for r in 0..8u32 {
+                for j in 0..8u32 {
+                    assert_eq!(
+                        fm[(8 * r + j) as usize].1,
+                        [40 + 4 * r + (j & 3), 24 + j, 16 + j]
+                    );
+                }
+                assert_eq!(fm[64 + r as usize].1, [40 + 4 * r, 24, 16]);
+            }
+            assert_eq!(count(&lines, "buffer_load_b128"), 1);
+            assert_eq!(count(&lines, "buffer_load_u16"), 1);
+            assert_eq!(count(&lines, "global_load_b32"), 72);
+            assert_eq!(count(&lines, "global_load_b128"), 0);
+            assert_eq!(count(&lines, "ds_swizzle_b32"), 8);
+            assert_eq!(count(&lines, "ds_bpermute_b32"), 32);
+            assert_eq!(count(&lines, "ds_load_b32"), 0, "X is direct-global S1");
+            assert_eq!(count(&lines, "global_store_b32"), 8);
+            for forbidden in FORBIDDEN {
+                assert!(
+                    !lines.iter().any(|l| l.starts_with(forbidden)),
+                    "{forbidden}"
+                );
+            }
+            assert!(lines.contains(&"s_lshl_b32 s41, s3, 3"));
+            assert!(lines.contains(&"s_cmp_gt_u32 s31, 64"));
+            assert!(lines.contains(&"s_sub_u32 s45, s31, s41"));
+            assert!(lines.contains(&"s_min_u32 s40, s45, 8"));
+            // COUNT (s40) keeps exactly ONE definition: the domain min above.
+            assert_eq!(count_exact(&lines, "s_min_u32 s40, s45, 8"), 1);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| {
+                        let m = mnemonic(l);
+                        !(m.starts_with("s_cmp")
+                            || m.starts_with("s_cbranch")
+                            || m.starts_with("s_branch"))
+                            && matches!(operands(l).first().map(|s| s.trim()), Some("s40"))
+                    })
+                    .count(),
+                1,
+                "COUNT s40 must have exactly one definition",
+            );
+            // All dead-tile / row-base guards retained.
+            assert!(lines.contains(&"s_cmp_ge_u32 s60, s34"));
+            assert!(lines.contains(&"s_cmp_eq_u32 s31, 0"));
+            assert!(lines.contains(&"s_cmp_le_i32 s30, 0"));
+            assert!(lines.contains(&"s_cmp_ge_u32 s41, s31"));
+            // Three fold operations per physical row, with the singleton's operand orientation.
+            let reduce = fm[71].0;
+            // Later adds (e.g. the activation's `1.0 + x`) take literal operands, so only the
+            // fold entries are parsed as VGPR triples.
+            let adds: Vec<_> = lines[reduce + 1..]
+                .iter()
+                .filter(|l| mnemonic(l) == "v_add_f32_e32")
+                .collect();
+            for r in 0..8 {
+                let a = 40 + 4 * r as u32;
+                let folds: Vec<Vec<u32>> = adds[8 * r..8 * r + 3]
+                    .iter()
+                    .map(|l| operands(l).iter().map(|o| vreg(o)).collect())
+                    .collect();
+                assert_eq!(
+                    folds,
+                    &[
+                        vec![a + 1, a + 1, a],
+                        vec![a + 3, a + 3, a + 2],
+                        vec![a + 3, a + 3, a + 1]
+                    ]
+                );
+            }
+            if !hc {
+                assert_eq!(count(&lines, "s_barrier"), 0);
+                assert_eq!(count(&lines, "ds_store_b32"), 0);
+                assert_eq!(count(&lines, "ds_load_b128"), 0);
+                assert_eq!(e.shape.barriers, 0);
+                continue;
+            }
+            assert!(lines.contains(&"s_and_b32 s45, s30, 31"));
+            assert!(lines.contains(&"s_lshr_b32 s42, s30, 2"));
+            assert!(lines.contains(&"s_mul_i32 s57, s43, s42"));
+            assert!(lines.contains(&"s_lshl_b32 s45, s43, 2"));
+            assert_eq!(
+                offsets(&lines, "ds_store_b32", |_| true),
+                (0..8).map(|r| 16 * r).collect::<Vec<_>>()
+            );
+            assert_eq!(count(&lines, "ds_load_b128"), 8);
+            assert_eq!(e.shape.barriers, 1);
+            assert_eq!(e.proof.barriers.len(), 1);
+            assert_barriers_run_with_full_exec(&lines, "HC t8 quarter publication", 1);
+            let barrier = position(&lines, |l| mnemonic(l) == "s_barrier");
+            assert!(lines[..barrier]
+                .iter()
+                .all(|l| mnemonic(l) != "ds_load_b128"));
+            assert!(lines[barrier + 1..]
+                .iter()
+                .all(|l| mnemonic(l) != "ds_store_b32"));
+            assert!(lines[barrier + 1..].contains(&"s_cmp_lg_u32 s43, 0"));
+            for fold in [
+                "s_add_f32 s69, s64, s65",
+                "s_add_f32 s70, s66, s67",
+                "s_add_f32 s68, s69, s70",
+                "s_cmp_eq_u32 s61, 0",
+                "s_mul_f32 s68, s44, s68",
+            ] {
+                assert_eq!(count_exact(&lines, fold), 8, "{fold}");
+            }
+            for (op, per_row) in [
+                ("s_bfe_u32", 3),
+                ("s_addk_i32", 3),
+                ("s_rndne_f32", 1),
+                ("s_fmamk_f32", 2),
+                ("v_exp_f32_e32", 1),
+                ("v_ldexp_f32", 1),
+                ("v_rcp_f32_e32", 1),
+                ("v_div_scale_f32", 2),
+                ("v_div_fmas_f32", 1),
+                ("v_div_fixup_f32", 1),
+                ("v_fma_f32", 2),
+            ] {
+                assert_eq!(count(&lines, op), 8 * per_row, "{op}: full HC expansion");
+            }
+        }
+    }
+
+    #[test]
+    fn hc_raw_and_activated_cpu_bytes_are_explicitly_unsupported() {
+        // Emulator::new validates the whole kernel, not just the selected branch.
+        // Even hc_act=0 requires three unsupported s_add_f32 instructions.
+        // Never replace SALU with VALU, skip on arbitrary errors, or call this numerical PASS.
+        let p = program(true);
+        let err = match Emulator::new(&p, HC) {
+            Ok(_) => panic!("HC semantics changed: replace this gap assertion with actual raw/activated byte oracles"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "no semantics for s_add_f32");
+        eprintln!(
+            "HC RAW/ACTIVATED CPU BYTE COVERAGE: UNSUPPORTED ({err}); \
+             all R=1..64 require actual-singleton hardware byte gates, including HC extremes"
+        );
+    }
+
+    #[test]
+    fn hc_quarter_diagnostic_assembles_and_lifts() {
+        let symbol = format!("gemv_bf16_xf32_k4_rows_t8_quarters_pm_{}", ARCH.name());
+        let emitted = qwen4_bf16_rows_wide::emit_hc_quarter_diagnostic(ARCH).unwrap();
+        assert!(emitted.s_text.contains(&format!("{symbol}:\n")));
+        let elf = peacemaker_isa::native::assemble(&emitted.s_text, ARCH).unwrap();
+        assert!(!text_section(&elf).is_empty(), "diagnostic .text is empty");
+        let program = peacemaker_lift::lift_object(
+            &elf,
+            peacemaker_lift::Options {
+                frontend: Frontend::Builder,
+            },
+        )
+        .unwrap()
+        .program;
+        assert!(
+            program.kernels.iter().any(|k| k.symbol.0 == symbol),
+            "lifted program is missing {symbol}"
+        );
+        #[cfg(feature = "toolchain")]
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "peacemaker-isa-qwen4-bf16-rows-wide-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let co = dir.join("hc_quarter_diagnostic.co");
+            std::fs::write(&co, &elf).unwrap();
+            let m7 = peacemaker_isa::pm_check::m7(&co, ARCH.name(), &symbol)
+                .unwrap_or_else(|e| panic!("{symbol}: {e}"));
+            assert_eq!(
+                (m7["lift"].as_str(), &m7["obligations"]),
+                (Some("byte-exact"), &serde_json::json!({})),
+                "{symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_width_has_unique_rows_outputs_and_hc_partial_owners() {
+        for rows in 1usize..=64 {
+            for ms in [[1, 2, 3, 9], [0, 7, 0, 8], [0, 0, 0, 1], [0; 4]] {
+                let mut output = [
+                    vec![0u8; rows * ms[0]],
+                    vec![0u8; rows * ms[1]],
+                    vec![0u8; rows * ms[2]],
+                    vec![0u8; rows * ms[3]],
+                ];
+                for gy in 0..rows.div_ceil(8) {
+                    let base = 8 * gy;
+                    let count = (rows - base).min(8);
+                    for gx in 0..ms.iter().sum::<usize>() {
+                        let mut col = gx;
+                        let matrix = (0..4)
+                            .find(|&i| {
+                                if col < ms[i] {
+                                    true
+                                } else {
+                                    col -= ms[i];
+                                    false
+                                }
+                            })
+                            .unwrap();
+                        for local in 0..count {
+                            output[matrix][(base + local) * ms[matrix] + col] += 1;
+                        }
+                    }
+                    // HC quarter slots are row-local and shared only by the four K owners.
+                    let mut partials = [0u8; 128];
+                    for q in 0..4 {
+                        for local in 0..count {
+                            let offset = 16 * local + 4 * q;
+                            for byte in &mut partials[offset..offset + 4] {
+                                *byte += 1;
+                            }
+                        }
+                    }
+                    assert!(partials[..16 * count].iter().all(|&n| n == 1));
+                    assert!(partials[16 * count..].iter().all(|&n| n == 0));
+                }
+                assert!(
+                    output.iter().flatten().all(|&n| n == 1),
+                    "R={rows} M={ms:?}"
+                );
+                assert!(8 * rows.div_ceil(8) >= rows, "first dead y tile");
+            }
+            for k in [32usize, 96, 1024, 1056] {
+                let mut terms = vec![0u8; k];
+                for q in 0..4 {
+                    for term in &mut terms[q * (k / 4)..(q + 1) * (k / 4)] {
+                        *term += 1;
+                    }
+                }
+                assert!(terms.iter().all(|&n| n == 1), "four fixed K quarters");
+            }
+        }
+    }
+
+    // Finite normal operands, plus both signed zero encodings. Exponents and mantissas
+    // vary by row/column/K so a wrong stride, term order or chain fold cannot hide in all-ones data.
+    fn sample(index: usize, salt: u32) -> f32 {
+        let mut x = (index as u32).wrapping_add(salt).wrapping_mul(0x9e37_79b9);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x85eb_ca6b);
+        x ^= x >> 13;
+        if index % 29 == 0 {
+            return f32::from_bits(x & 0x8000_0000);
+        }
+        f32::from_bits((x & 0x807f_ffff) | ((119 + (x >> 25) % 12) << 23))
+    }
+
+    /// Independent transcription of the documented Halo singleton DAG, not its emitter helpers.
+    /// Deliberately finite-input only: host arithmetic does not certify GPU NaN/denormal rules.
+    fn dot(x: &[f32], weights: &[u16]) -> u32 {
+        assert_eq!(x.len(), weights.len());
+        let mut lane = [0.0f32; 32];
+        for (l, result) in lane.iter_mut().enumerate() {
+            let mut a = [0.0f32; 4];
+            if x.len() % 8 == 0 {
+                for group in (0..x.len()).step_by(256) {
+                    for j in 0..8 {
+                        let k = group + 8 * l + j;
+                        if k < x.len() {
+                            let w = f32::from_bits(u32::from(weights[k]) << 16);
+                            a[j & 3] = x[k].mul_add(w, a[j & 3]);
+                        }
+                    }
+                }
+            } else {
+                for k in (l..x.len()).step_by(32) {
+                    let w = f32::from_bits(u32::from(weights[k]) << 16);
+                    a[0] = x[k].mul_add(w, a[0]);
+                }
+            }
+            a[1] += a[0];
+            a[3] += a[2];
+            a[3] += a[1];
+            *result = a[3];
+        }
+        let before = lane;
+        for l in 0..32 {
+            lane[l] += before[l | 16];
+        }
+        for distance in [8, 4, 2, 1] {
+            let before = lane;
+            for l in 0..32 {
+                lane[l] += before[if l + distance < 32 { l + distance } else { l }];
+            }
+        }
+        lane[0].to_bits()
+    }
+
+    fn put32(args: &mut [u8], offset: usize, value: u32) {
+        args[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put64(args: &mut [u8], offset: usize, value: u64) {
+        args[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn wbase(i: usize) -> u64 {
+        0x2_0000_0000 + i as u64 * 0x100_0000
+    }
+    fn ybase(i: usize) -> u64 {
+        0x3_0000_0000 + i as u64 * 0x100_0000
+    }
+
+    fn run(emu: &Emulator<'_>, rows: usize, k: usize, ms: [usize; 4], salt: u32) {
+        let mut mem = Memory::default();
+        let mut args = vec![0u8; 96];
+        let x: Vec<_> = (0..rows * k).map(|i| sample(i, salt)).collect();
+        // Exact input extents, no mapped tail: inactive-row/element loads are errors.
+        mem.map(
+            "x".into(),
+            X,
+            x.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+        .unwrap();
+        put64(&mut args, 32, X);
+        let mut expected: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::new());
+        for i in 0..4 {
+            put32(&mut args, 72 + 4 * i, ms[i] as u32);
+            if ms[i] == 0 {
+                continue;
+            } // Null pointers for every empty x4 position.
+            let w: Vec<u16> = (0..ms[i] * k)
+                .map(|j| (sample(j, salt.wrapping_add(17 + i as u32 * 97)).to_bits() >> 16) as u16)
+                .collect();
+            mem.map(
+                format!("w{i}"),
+                wbase(i),
+                w.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+            .unwrap();
+            let padded_rows = rows.div_ceil(8) * 8 + 8;
+            let output: Vec<u8> = (0..(2 * GUARD / 4 + padded_rows * ms[i]))
+                .flat_map(|_| POISON.to_le_bytes())
+                .collect();
+            mem.map(format!("y{i}"), ybase(i), output).unwrap();
+            put64(&mut args, 8 * i, wbase(i));
+            put64(&mut args, 40 + 8 * i, ybase(i) + GUARD as u64);
+            for row in 0..rows {
+                for col in 0..ms[i] {
+                    expected[i].push(dot(&x[row * k..(row + 1) * k], &w[col * k..(col + 1) * k]));
+                }
+            }
+        }
+        put32(&mut args, 88, k as u32);
+        put32(&mut args, 92, rows as u32);
+        mem.map("kernarg".into(), KARG, args).unwrap();
+        let before: Vec<_> = mem.regions.iter().map(|r| r.bytes.clone()).collect();
+        // Overlaunch both axes by one to exercise uniform dead-workgroup refusal.
+        for gy in 0..=rows.div_ceil(8) as u32 {
+            for gx in 0..=ms.iter().sum::<usize>() as u32 {
+                emu.run_workgroup(
+                    &Launch {
+                        kernarg_ptr: KARG,
+                        workgroup: [gx, gy, 0],
+                        block: [32, 1, 1],
+                        dynamic_lds: 0,
+                    },
+                    &mut mem,
+                )
+                .unwrap_or_else(|err| panic!("R={rows} K={k} M={ms:?} wg=({gx},{gy}): {err}"));
+            }
+        }
+        for (region, original) in mem.regions.iter().zip(before) {
+            if !region.name.starts_with('y') {
+                assert_eq!(region.bytes, original, "{} mutated", region.name);
+                assert_eq!(region.written.count(), 0, "{} was written", region.name);
+                continue;
+            }
+            let i: usize = region.name[1..].parse().unwrap();
+            let end = GUARD + 4 * rows * ms[i];
+            assert_eq!(region.written.count(), 4 * rows * ms[i]);
+            for b in 0..region.bytes.len() {
+                assert_eq!(
+                    region.written.contains(b),
+                    (GUARD..end).contains(&b),
+                    "R={rows} K={k} M={ms:?} {} byte {b}: write ownership",
+                    region.name
+                );
+                if !(GUARD..end).contains(&b) {
+                    assert_eq!(
+                        region.bytes[b], original[b],
+                        "{} guard/inactive row",
+                        region.name
+                    );
+                }
+            }
+            for (word, (&want, got)) in expected[i]
+                .iter()
+                .zip(region.bytes[GUARD..end].chunks_exact(4))
+                .enumerate()
+            {
+                assert_eq!(
+                    u32::from_le_bytes(got.try_into().unwrap()),
+                    want,
+                    "R={rows} K={k} M={ms:?} matrix={i} row={} col={}",
+                    word / ms[i],
+                    word % ms[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_every_width_scalar_k_and_every_divisible8_lane_tail() {
+        let p = program(false);
+        let emu = Emulator::new(&p, ORDINARY).unwrap();
+        for rows in 1..=64 {
+            for k in [
+                1, 2, 3, 7, 9, 17, 31, 33, 63, 65, 127, 129, 255, 257, 511, 513,
+            ] {
+                run(&emu, rows, k, [1, 0, 0, 0], 0x53a9);
+            }
+            // Every legal partial K256 lane mask, both before and after a full group.
+            for tail in 1..=32 {
+                for full in [0, 256] {
+                    run(&emu, rows, full + 8 * tail, [0, 1, 0, 0], 0x7bd3);
+                }
+            }
+            for k in [768, 1024, 1032] {
+                run(&emu, rows, k, [0, 0, 1, 0], 0xb517);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_every_width_x4_differing_heights_and_all_empty_live_masks() {
+        let p = program(false);
+        let emu = Emulator::new(&p, ORDINARY).unwrap();
+        for rows in 1..=64 {
+            for mask in 0..16 {
+                let ms = std::array::from_fn(|i| {
+                    if mask & (1 << i) != 0 {
+                        [1, 3, 7, 9][i]
+                    } else {
+                        0
+                    }
+                });
+                for k in [33, 264] {
+                    run(&emu, rows, k, ms, 0x1d35 + mask);
+                }
+            }
+            // Include M=2 and M=8 as well as ragged heights and all four differing strides.
+            run(&emu, rows, 520, [2, 8, 3, 1], 0x2a79);
+        }
+    }
+
+    #[test]
+    fn ordinary_invalid_domains_return_without_touching_unmapped_tensors() {
+        let p = program(false);
+        let emu = Emulator::new(&p, ORDINARY).unwrap();
+        for (rows, k) in [(0, 33), (65, 33), (u32::MAX, 33), (1, 0), (64, u32::MAX)] {
+            let mut args = vec![0u8; 96];
+            put32(&mut args, 72, 1);
+            put32(&mut args, 88, k);
+            put32(&mut args, 92, rows);
+            let original = args.clone();
+            let mut mem = Memory::default();
+            mem.map("kernarg".into(), KARG, args).unwrap();
+            for gy in [0, 1, 8] {
+                emu.run_workgroup(
+                    &Launch {
+                        kernarg_ptr: KARG,
+                        workgroup: [0, gy, 0],
+                        block: [32, 1, 1],
+                        dynamic_lds: 0,
+                    },
+                    &mut mem,
+                )
+                .unwrap();
+            }
+            assert_eq!(mem.regions[0].bytes, original);
+            assert_eq!(mem.regions[0].written.count(), 0);
+        }
+    }
 }

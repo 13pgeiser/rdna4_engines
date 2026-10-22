@@ -77,6 +77,17 @@
 //! phase's stores, which publish it again; the down projection has the single publish barrier. Slot-state is tracked by the
 //! builder linearly; every X read of a slot gate is closed (explicit `lgkmcnt(0)`) before the gated compute, so skipped slots
 //! never leave the builder's wait ledger out of step with the executed stream.
+//!
+//! # Fixed eight-row unions
+//! `emit_rowtiles` adds `_t8` entries without changing `emit` or its narrow ABI/bytes.
+//! Launch grid `[ceil(M/8), 80, ceil(C/8)]`, block256, with `1 <= C <= 64` and `U = 80`.
+//! Workgroup z adds `z * 1928` bytes to each of expert_ids, expert_offsets and slot_ids only.
+//! The descriptor's slots are absolute (`slot < 10*C`), so X/Y keep their full-window bases.
+//! Both offsets must be at most80, the expert must be in range and its count must be1..8;
+//! every loaded slot is checked uniformly before any barrier or X access. A dead tile/group
+//! exits uniformly. A tail output wave still stages its slot's X and reaches every barrier,
+//! but skips row weights, dot arithmetic and output stores. The register bank stays at8 slots
+//! and the gate four-chain/down one-chain DAG, operand orientation and M/2 gate split are unchanged.
 
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{
@@ -260,6 +271,7 @@ pub fn module_specs() -> Vec<Spec> {
 const KARG: u8 = 0;
 const WGX: u8 = 2;
 const WGY: u8 = 3;
+const WGZ: u8 = 4;
 /// Kernargs: `s_load_b256 s[8:15]` (@0), `s_load_b256 s[16:23]` (@0x20), `s_load_b128 s[24:27]` (@0x40), `s_load_b64 s[28:29]` (@0x50), `s_load_b32 s100` (@0x58).
 const WPTRS: u8 = 8;
 const EIDS: u8 = 10;
@@ -286,6 +298,8 @@ const WAVE: u8 = 40;
 const TMP: u8 = 41;
 const TMP2: u8 = 42;
 const NSM1: u8 = 43;
+/// Tiled entry only: whether this wave owns a valid output row.
+const OUTPUT_LIVE: u8 = 44;
 const ROWPTR: u8 = 48;
 const SPTR: u8 = 50;
 const YSEL: u8 = 52;
@@ -473,15 +487,25 @@ struct Ctx {
     spec: Spec,
     l: Lay,
     vgprs: u16,
+    tiled: bool,
 }
 impl Ctx {
     fn new(spec: Spec) -> Self {
         let l = Lay::new(spec);
         let vgprs = u16::from(l.end).div_ceil(8) * 8;
-        Self { spec, l, vgprs }
+        Self {
+            spec,
+            l,
+            vgprs,
+            tiled: false,
+        }
     }
     fn lbl(&self, name: &str) -> String {
-        format!(".Lcn_{}_{name}", self.spec.tag())
+        if self.tiled {
+            format!(".Lcn_{}_t8_{name}", self.spec.tag())
+        } else {
+            format!(".Lcn_{}_{name}", self.spec.tag())
+        }
     }
 }
 
@@ -496,6 +520,10 @@ fn plan(c: &Ctx) -> Result<RegPlan, String> {
     let whole = Live::Whole;
     for (name, base) in [("workgroup_id_x", WGX), ("workgroup_id_y", WGY)] {
         decl(&mut regs, name, RKind::S, base, 1, &whole)?
+    }
+    if c.tiled {
+        decl(&mut regs, "workgroup_id_z", RKind::S, WGZ, 1, &whole)?;
+        decl(&mut regs, "output_live", RKind::S, OUTPUT_LIVE, 1, &whole)?;
     }
     for (name, base, len) in [
         ("kernarg", KARG, 2),
@@ -669,8 +697,21 @@ fn plan(c: &Ctx) -> Result<RegPlan, String> {
 
 /// Production entry.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
+    emit_impl(spec, false)
+}
+
+/// Emit the gfx1151 fixed-eight-row descriptor entry (`<narrow symbol>_t8`).
+///
+/// Uses the same96-byte kernargs, cap8 register bank and exact arithmetic as `emit`.
+/// `C` is the full1..64 row count; only descriptor pointers receive the grid-z offset.
+pub fn emit_rowtiles(spec: Spec) -> Result<Emitted, String> {
+    emit_impl(spec, true)
+}
+
+fn emit_impl(spec: Spec, tiled: bool) -> Result<Emitted, String> {
     spec.validate()?;
-    let c = Ctx::new(spec);
+    let mut c = Ctx::new(spec);
+    c.tiled = tiled;
     let kernargs = KernargLayout::new(KERNARG_BYTES)
         .pointer_access("expert_weight_ptrs", 0, Access::ReadOnly)
         .pointer_access("expert_ids", 8, Access::ReadOnly)
@@ -691,9 +732,17 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         .hidden("reserved", 92, 4, "by_value");
     let kspec = KernelSpec {
         kernel_id: "mq_i4_moe_gemv_cn".into(),
-        variant: spec.tag(),
+        variant: if tiled {
+            format!("{}_t8", spec.tag())
+        } else {
+            spec.tag()
+        },
         arch: spec.arch,
-        symbol: spec.symbol(),
+        symbol: if tiled {
+            format!("{}_t8", spec.symbol())
+        } else {
+            spec.symbol()
+        },
         kernargs,
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: true,
@@ -703,6 +752,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         cu_mode: false,
     };
     let mut b = Builder::new(kspec, plan(&c)?);
+    if tiled {
+        b.enable_workgroup_id_z();
+    }
     b.enable_delay_alu();
     let slot = b.lds_slot("x", 0, spec.kind.lds_bytes())?;
     prologue(&mut b, &c)?;
@@ -874,6 +926,27 @@ fn prologue(b: &mut Builder, c: &Ctx) -> R {
         &[TMP],
     )?;
     // Guards (workgroup-uniform, before any barrier).
+    if c.tiled {
+        sop(b, format!("s_cmp_eq_u32 s{SC}, 0"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_gt_u32 s{SC}, 64"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_lg_u32 s{SU}, {}", lit(80)), &[], &[SU])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_sub_i32 s{TMP}, s{SC}, 1"), &[TMP], &[SC])?;
+        sop(b, format!("s_lshr_b32 s{TMP}, s{TMP}, 3"), &[TMP], &[TMP])?;
+        sop(b, format!("s_cmp_gt_u32 s{WGZ}, s{TMP}"), &[], &[WGZ, TMP])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(
+            b,
+            format!("s_mul_i32 s{TMP}, s{WGZ}, {}", lit(1928)),
+            &[TMP],
+            &[WGZ],
+        )?;
+        for ptr in [EIDS, OFFS, SLOTS] {
+            add64(b, ptr, ptr, TMP)?;
+        }
+    }
     sop(b, format!("s_lshl_b32 s{ROW}, s{WGX}, 3"), &[ROW], &[WGX])?;
     sop(b, format!("s_cmp_ge_u32 s{WGY}, s{SU}"), &[], &[WGY, SU])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
@@ -898,6 +971,24 @@ fn prologue(b: &mut Builder, c: &Ctx) -> R {
         &[ROW],
         &[ROW, WAVE],
     )?;
+    if c.tiled {
+        sop(b, format!("s_cmp_lt_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
+        sop(
+            b,
+            format!("s_cselect_b32 s{OUTPUT_LIVE}, 1, 0"),
+            &[OUTPUT_LIVE],
+            &[],
+        )?;
+        for offset in [OFF0, OFF0 + 1] {
+            sop(
+                b,
+                format!("s_cmp_gt_u32 s{offset}, {}", lit(80)),
+                &[],
+                &[offset],
+            )?;
+            branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        }
+    }
     sop(
         b,
         format!("{} s{NS}, s{}, s{OFF0}", s_sub_i32(), OFF0 + 1),
@@ -926,9 +1017,11 @@ fn prologue(b: &mut Builder, c: &Ctx) -> R {
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     // base = expert_weight_ptrs[eid].
-    sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
-    add64(b, TPTR, WPTRS, TMP)?;
-    smem(b, BASE, 2, TPTR, 0)?;
+    if !c.tiled {
+        sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
+        add64(b, TPTR, WPTRS, TMP)?;
+        smem(b, BASE, 2, TPTR, 0)?;
+    }
     // The eight slot ids (position clamped to n - 1) and the wave's own staging slot.
     sop(
         b,
@@ -952,6 +1045,21 @@ fn prologue(b: &mut Builder, c: &Ctx) -> R {
         &[NSM1, WAVE],
     )?;
     slot_id_load(b, WSID)?;
+    if c.tiled {
+        sop(b, format!("s_mul_i32 s{TMP2}, s{SC}, 10"), &[TMP2], &[SC])?;
+        for i in 0..MAX_SLOTS as u8 {
+            sop(
+                b,
+                format!("s_cmp_ge_u32 s{}, s{TMP2}", SID + i),
+                &[],
+                &[SID + i, TMP2],
+            )?;
+            branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        }
+        sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
+        add64(b, TPTR, WPTRS, TMP)?;
+        smem(b, BASE, 2, TPTR, 0)?;
+    }
     // The wave's X row = slot / x_row_div (K1's f32-reciprocal quotient), its byte offset and the LDS-staging X offsets.
     valu(
         b,
@@ -1106,6 +1214,9 @@ fn body(b: &mut Builder, c: &Ctx, slot: usize) -> R {
     let arch = b.spec.arch;
     let (spec, l) = (c.spec, &c.l);
     let (kind, gate) = (spec.kind, spec.kind == Kind::GateUp);
+    if c.tiled {
+        output_gate(b, &c.lbl("rowptr_done"))?;
+    }
     match spec.codec {
         Codec::Mq3I4 => {
             let r = kind.k() * 3 / 8;
@@ -1152,8 +1263,14 @@ fn body(b: &mut Builder, c: &Ctx, slot: usize) -> R {
             add64(b, ROWPTR, BASE, TMP)?;
         }
     }
+    if c.tiled {
+        b.label(&c.lbl("rowptr_done"))?;
+    }
     // Phase-0 X loads, then every weight load of the row (in group order), all before the first wait.
     stage_loads(b, c, 0)?;
+    if c.tiled {
+        output_gate(b, &c.lbl("weights_done"))?;
+    }
     let weight_loads = emit_weight_loads(b, c)?;
     for k in 0..MAX_SLOTS as u8 * kind.chains() {
         valu(
@@ -1164,11 +1281,19 @@ fn body(b: &mut Builder, c: &Ctx, slot: usize) -> R {
             &[],
         )?
     }
+    if c.tiled {
+        b.label(&c.lbl("weights_done"))?;
+    }
     // The X loads retire (global loads return in issue order), then the stores and the publish barrier.
-    b.wait(Counter::Vm, weight_loads)?;
+    // Tail waves skipped weight loads, so their X loads cannot use the live waves'
+    // vmcnt(weight_loads) threshold. Drain all loads before publishing the staged X.
+    b.wait(Counter::Vm, if c.tiled { 0 } else { weight_loads })?;
     stage_stores(b, c, slot)?;
     b.barrier(&[Transition::Ready(slot)])?;
     b.label(&c.lbl("c0"))?;
+    if c.tiled {
+        output_gate(b, &c.lbl(if gate { "s1" } else { "epi" }))?;
+    }
     for gl in 0..spec.groups_per_phase() {
         group(b, c, slot, gl, gl)?
     }
@@ -1202,12 +1327,29 @@ fn body(b: &mut Builder, c: &Ctx, slot: usize) -> R {
         stage_stores(b, c, slot)?;
         b.barrier(&[Transition::Ready(slot)])?;
         b.label(&c.lbl("c1"))?;
+        if c.tiled {
+            output_gate(b, &c.lbl("epi"))?;
+        }
         for gl in 0..spec.groups_per_phase() {
             group(b, c, slot, spec.groups_per_phase() + gl, gl)?
         }
     }
     b.label(&c.lbl("epi"))?;
+    if c.tiled {
+        output_gate(b, &c.lbl("exit"))?;
+    }
     epilogue(b, c)
+}
+
+/// Skip output-only work for a tail wave; never place a workgroup barrier in the skipped region.
+fn output_gate(b: &mut Builder, target: &str) -> R {
+    sop(
+        b,
+        format!("s_cmp_eq_u32 s{OUTPUT_LIVE}, 0"),
+        &[],
+        &[OUTPUT_LIVE],
+    )?;
+    branch(b, &format!("s_cbranch_scc1 {target}"))
 }
 
 /// The wave's `x_loads` `global_load_b128` of its staging slot's current phase (`float4 = lane + 32 j`, base `Xrot`, per-lane
@@ -1738,6 +1880,15 @@ fn epilogue(b: &mut Builder, c: &Ctx) -> R {
 /// register ceilings, wave32, no spills, no private memory, and the fixed LDS. Committed as
 /// `crates/peacemaker-isa/kernels/mq_i4_moe_gemv_cn.gfx1151.<tag>.contract.json`.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
+    contract_impl(spec, e, false)
+}
+
+/// Shape contract for the fixed-eight-row descriptor entry, including its `_t8` symbol.
+pub fn contract_rowtiles(spec: Spec, e: &Emitted) -> serde_json::Value {
+    contract_impl(spec, e, true)
+}
+
+fn contract_impl(spec: Spec, e: &Emitted, tiled: bool) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
     for name in COUNTED {
         let n = e
@@ -1767,7 +1918,7 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         "s_swappc*",
     ];
     serde_json::json!({
-        "symbol": spec.symbol(), "counts": counts,
+        "symbol": if tiled { format!("{}_t8", spec.symbol()) } else { spec.symbol() }, "counts": counts,
         "forbidden": forbidden,
         "vgpr_max": e.shape.next_free_vgpr, "sgpr_max": e.shape.next_free_sgpr,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,

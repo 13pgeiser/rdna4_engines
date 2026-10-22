@@ -2152,6 +2152,46 @@ pub(crate) fn ninepath_d3_family(gate: DType, down: DType) -> Option<&'static st
         _ => None,
     }
 }
+/// Bind the current G1 window seal (`#[cfg(lab)]` only) from the stage's
+/// existing immutable-identity proof. Fails closed when the routed set
+/// offers no immutability proof or no experts resolve: a merely
+/// same-pointer-but-mutable cache bank must never pass as the ORIGINAL
+/// aggregate owner. Non-lab builds pay nothing (no hook, no seal).
+#[cfg(feature = "test-utils")]
+pub(crate) fn bind_g1_window(
+    gpu: &mut Gpu,
+    experts: &dyn crate::families::moe::RoutedExpertWeights,
+    n_exp: usize,
+    probabilities: &GpuTensor,
+    bf16_round_trip: bool,
+) -> Result<(), DispatchError> {
+    if !gpu.lab_g1_observer_active() {
+        return Ok(());
+    }
+    let view = slice_moe_f32_view(probabilities, 0, 10);
+    let values = gpu
+        .download_f32(&view)
+        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+    let router_probability_words = std::array::from_fn(|i| values[i].to_bits());
+    let Some(identity) = experts.immutable_identity() else {
+        return Err(DispatchError::Hip(
+            "g1 window: routed expert set has no immutable identity".into(),
+        ));
+    };
+    if experts.len() != n_exp || experts.is_empty() {
+        return Err(DispatchError::Hip(
+            "g1 window: routed expert count mismatch".into(),
+        ));
+    }
+    gpu.set_lab_g1_window(Some(rdna_compute::LabG1WindowSeal {
+        expert_set_identity: identity,
+        n_exp,
+        experts_host_mapped: experts.host_mapped(),
+        router_probability_words,
+        bf16_round_trip,
+    }));
+    Ok(())
+}
 
 /// True when per-expert gate_up dtypes contain >1 distinct DType (exact equality,
 /// not family). Used to decide mixed gate precedence: whenever gate_up exact
@@ -5681,6 +5721,14 @@ fn decode_gate_up_stage(
             )?;
             return Ok(());
         }
+        #[cfg(feature = "test-utils")]
+        bind_g1_window(
+            gpu,
+            p.routed_experts,
+            p.n_exp,
+            p.topk_weights,
+            p.recipe.bf16_round_trip(),
+        )?;
         hip!(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
             p.expert_gate_up_ptrs,
             p.topk_indices,
@@ -6116,6 +6164,8 @@ fn decode_down_stage(
             }
             return Ok(());
         }
+        #[cfg(feature = "lab")]
+        bind_g1_window(gpu, p.routed_experts, p.n_exp)?;
         hip!(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
             p.expert_down_ptrs,
             p.topk_indices,

@@ -889,12 +889,63 @@ pub fn seal_moe_for_layer<'a>(
     }
     let bound = BoundMoeExperts::from_cache(moe.table, moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
+    // Frozen per-call lab-wide verify width: the row-exact rows this GPU runs
+    // (the existing `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` developer / runtime oracle
+    // override, clamped `8..=64`). `8` (or below) is the default product route;
+    // above 8 is an explicit lab-wide eager-verify scope that may ask for the
+    // actual CPU-owned expert window. Ordinary prefill, lanes and the default
+    // route never observe wider here: their `route_rows` is the canonical chunk
+    // (a short tail keeps `rows != route_rows`) or their width exceeds the
+    // qualified capacity below.
+    let cpu_wide_verify_rows =
+        rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.arch.arch());
+    // Per-call actual eager-verify scope: the forward's `cpu_wide_verify`
+    // ctx flag (real verify call) AND the canonical override presence.
+    // Global presence alone never arms: a whole 64-row ordinary prefill has
+    // `rows == route_rows` too but its ctx flag stays false.
+    let cpu_lab_present = ctx.cpu_wide_verify()
+        && rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&ctx.arch.arch());
+    let cpu_wide_scope = hipfire_dispatch::families::moe::CpuWideVerifyScope::from_lab_presence(
+        cpu_lab_present,
+        cpu_wide_verify_rows,
+    );
     // An armed layer splices only a window whose routing rows are its real rows
     // (the invariant prefill profile pins `route_rows` to the canonical chunk, so
     // a short prefill there keeps the PCIe grouped read) and which is at most
-    // the narrow verify width; every wider window is unchanged.
-    let cpu_deferred =
-        hipfire_dispatch::cpu_split::cpu_splice_window(moe.cpu_deferred_experts, rows, route_rows);
+    // the qualified width: the legacy 4-row gate by default, or the whole
+    // logical 1..64-row window inside an explicit lab-wide eager-verify scope
+    // with actual prewarmed host scratch (the admission owner's 64-row
+    // reservation; `cpu_d1_prewarmed_scratch_rows` reports `0` until that
+    // lands, so wide D1 stays refused — fail-closed, never a fake admission).
+    // Every wider/unqualified window is unchanged (PCIe grouped read).
+    let cpu_deferred = {
+        let legacy = hipfire_dispatch::cpu_split::cpu_splice_window(
+            moe.cpu_deferred_experts,
+            rows,
+            route_rows,
+        );
+        // Geometry-aware D1 capacity: this layer's expert dims + sealing
+        // device; the source reads actual prewarmed rows (host scratch bound
+        // by pinned-transfer stage rows), 0 until admission prewarms.
+        let d1_geo = moe_dims(dims).ok();
+        let (d1_mi, d1_top_k) = d1_geo
+            .map(|m| (m.intermediate, m.experts_per_token))
+            .unwrap_or((0, 0));
+        let d1_rows = hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows(
+            dims.hidden,
+            d1_mi,
+            d1_top_k,
+            ctx.device_id(),
+        );
+        legacy
+            || hipfire_dispatch::families::moe::cpu_d1_wide_window_qualified(
+                moe.cpu_deferred_experts,
+                rows,
+                route_rows,
+                cpu_wide_scope,
+                d1_rows,
+            )
+    };
     if cpu_deferred
         && (moe.route_policy.capability.is_fp8_grouped()
             || moe.row_gather.is_some()
@@ -919,6 +970,14 @@ pub fn seal_moe_for_layer<'a>(
             rows,
             cpu_deferred,
         )?;
+        // D2 wide qualification happens inside `select_prefill` (seal): the
+        // forward loop threads this call's canonical route rows through the
+        // dispatch context (`batch_size = route_rows`, so a short tail of a
+        // long prefill keeps `rows != route_rows` and the GPU route) while
+        // `params.batch_size` sizes the call. The frozen lab-wide scope is
+        // measured there from the arch. No whole-forward chunking: one logical
+        // 1..64-row window seals one forward with full-window state/capture.
+        let _ = cpu_wide_scope;
         seal_prefill(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 prefill MoE: {error:?}")))
     }

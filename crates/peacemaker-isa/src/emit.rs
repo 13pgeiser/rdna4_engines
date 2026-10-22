@@ -59,12 +59,52 @@ fn scalar_high_water(text: &str) -> u16 {
 pub const CODE_END_TAIL: &str = ".text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n";
 
 pub fn assembly(spec: &KernelSpec, regs: &RegPlan, program: &Program) -> Result<String, String> {
-    let mut s = kernel_assembly(spec, regs, program)?;
+    let ns = sgpr_high_water(spec, regs, program, false);
+    assembly_with_workgroup_id_z(spec, regs, program, false, ns)
+}
+
+pub(crate) fn assembly_with_workgroup_id_z(
+    spec: &KernelSpec,
+    regs: &RegPlan,
+    program: &Program,
+    workgroup_id_z: bool,
+    next_free_sgpr: u16,
+) -> Result<String, String> {
+    let mut s = kernel_assembly(spec, regs, program, workgroup_id_z, next_free_sgpr)?;
     s.push_str(CODE_END_TAIL);
     Ok(s)
 }
 
-fn kernel_assembly(spec: &KernelSpec, regs: &RegPlan, program: &Program) -> Result<String, String> {
+pub(crate) fn sgpr_high_water(
+    spec: &KernelSpec,
+    regs: &RegPlan,
+    program: &Program,
+    workgroup_id_z: bool,
+) -> u16 {
+    let ns = program
+        .instructions
+        .iter()
+        .map(|i| scalar_high_water(&i.text))
+        .max()
+        .unwrap_or(0)
+        .max(regs.next_free_sgpr());
+    // gfx11 appends enabled system SGPRs after the user inputs. gfx12
+    // delivers workgroup IDs in TTMPs instead. Keep legacy images unchanged
+    // when the opt-in is unused, including their original SGPR metadata.
+    if workgroup_id_z && !spec.arch.gfx12() {
+        ns.max(u16::from(spec.user_sgpr_count) + 2 + u16::from(spec.system_sgpr_workgroup_id_y))
+    } else {
+        ns
+    }
+}
+
+fn kernel_assembly(
+    spec: &KernelSpec,
+    regs: &RegPlan,
+    program: &Program,
+    workgroup_id_z: bool,
+    next_free_sgpr: u16,
+) -> Result<String, String> {
     spec.kernargs.validate()?;
     if spec.arch != program.arch {
         return Err("program architecture differs from kernel spec".into());
@@ -75,13 +115,7 @@ fn kernel_assembly(spec: &KernelSpec, regs: &RegPlan, program: &Program) -> Resu
     let arch = spec.arch;
     let symbol = &spec.symbol;
     let nv = regs.next_free_vgpr();
-    let ns = program
-        .instructions
-        .iter()
-        .map(|i| scalar_high_water(&i.text))
-        .max()
-        .unwrap_or(0)
-        .max(regs.next_free_sgpr());
+    let ns = next_free_sgpr;
     // Kernels using VCC reserve it and include its two SGPRs in metadata,
     // matching hipcc accounting on gfx11 and gfx12.
     let vcc = program.instructions.iter().any(|i| i.text.contains("vcc"));
@@ -111,7 +145,7 @@ fn kernel_assembly(spec: &KernelSpec, regs: &RegPlan, program: &Program) -> Resu
             "system_sgpr_workgroup_id_y",
             spec.system_sgpr_workgroup_id_y as u32,
         ),
-        ("system_sgpr_workgroup_id_z", 0),
+        ("system_sgpr_workgroup_id_z", u32::from(workgroup_id_z)),
         ("system_sgpr_workgroup_info", 0),
         ("system_vgpr_workitem_id", 0),
         ("next_free_vgpr", nv as u32),

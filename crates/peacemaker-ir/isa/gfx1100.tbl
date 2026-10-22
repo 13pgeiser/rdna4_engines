@@ -117,6 +117,7 @@ v_cmp_ge_u32_e32	vopc	0x4e	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	vcc:w	-	v_cmp_ge
 v_cmpx_gt_f32_e32	vopc	0x94	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_f32_e32 v173, v174	7D295DAD	-
 v_cmpx_neq_f32_e32	vopc	0x9d	SRC0:32,VSRC1:32,literal@last	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_neq_f32_e32 0xff800000, v173	7D3B5AFF FF800000	-
 v_cmpx_eq_u32_e32	vopc	0xca	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u32_e32 0, v0	7D940080	-
+v_cmpx_ge_i32_e32	vopc	0xc6	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ge_i32_e32 v1, v2	7D8C0501	-
 v_dual_fmac_f32	vopd	0x0	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1,VDSTX	-	-	v_dual_fmac_f32 v172, v210, v170 :: v_dual_mul_f32 v105, v131, v105	C80755D2 AC68D383	-
 v_dual_mul_f32	vopd	0x3	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_mul_f32 v0, v2, v4 :: v_dual_mul_f32 v1, v3, v5	C8C60902 00000B03	-
 v_dual_add_f32	vopd	0x4	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_add_f32 v0, v2, v4 :: v_dual_mul_f32 v1, v3, v5	C9060902 00000B03	-
@@ -127,6 +128,7 @@ v_dual_add_nc_u32	vopd	0x10	VDSTY:32,SRCY0:32,VSRCY1:32	VDSTY	SRCY0,VSRCY1	-	-	v
 v_dual_lshlrev_b32	vopd	0x11	VDSTY:32,SRCY0:32,VSRCY1:32,literal@last	VDSTY	SRCY0,VSRCY1	-	-	v_dual_mov_b32 v0, 0 :: v_dual_lshlrev_b32 v1, v3, v5	CA220080 00000B03	-
 v_dual_and_b32	vopd	0x12	VDSTY:32,SRCY0:32,VSRCY1:32	VDSTY	SRCY0,VSRCY1	-	-	v_dual_mov_b32 v0, 0 :: v_dual_and_b32 v1, v3, v5	CA240080 00000B03	-
 v_add_nc_u32_e64	vop3	0x125	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_add_nc_u32_e64 v1, v2, v3	D5250001 02020702	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_min_u32_e64	vop3	0x113	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_min_u32_e64 v72, s92, v24	D5130048 0202305C	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 buffer_load_b128	buffer	0x17	VDATA:128,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Vm:1	buffer_load_b128 v[128:131], v176, s[32:35], s90 offen	E05C0000 5A4880B0	-
 buffer_load_b32	buffer	0x14	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Vm:1	buffer_load_b32 v184, v182, s[40:43], s92 offen	E0500000 5C4AB8B6	-
 buffer_store_b128	buffer	0x1d	VDATA:128,VADDR:64,RSRC:128,SOFFSET:32	-	VDATA,VADDR,RSRC,SOFFSET	-	Vs:1	buffer_store_b128 v[0:3], v185, s[52:55], null offen	E0740000 7C4D00B9	-

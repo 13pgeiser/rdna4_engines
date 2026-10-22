@@ -92,6 +92,12 @@
 //! Read-once C8 structure is unchanged: weights are loaded and dequantized once per group, then
 //! the up-to-eight slots run their own chains on the shared weights, skipped by scalar branches
 //! (`i >= n`), never by re-reading weights.
+//!
+//! The `_t8` entries retain this gfx1100 arithmetic and its eight-slot register
+//! state. Launch `[ceil(M/8),80,ceil(C/8)]`, block256: each wave owns one output
+//! row. `U=80`, `C=1..64`; grid.z selects a 1928-byte descriptor. Descriptor
+//! slots are absolute window slots; X/Y are never rebased. There is no LDS or
+//! workgroup barrier, so dead output waves can exit without staging obligations.
 
 use crate::arch::WgIdSource;
 use crate::insn::{Instruction, MemoryClass};
@@ -217,6 +223,11 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 const KARG: u8 = 0;
 const WGX: u8 = USER_SGPRS;
 const WGY: u8 = USER_SGPRS + 1;
+const WGZ: u8 = USER_SGPRS + 2;
+const TILE_SNEXP: u8 = 5;
+const TILE_WORKGROUP_SIZE: u32 = 256;
+const TILE_DESCRIPTOR_BYTES: u32 = 1928;
+const TILE_CAPACITY: u32 = 80;
 /// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50).
 const WPTRS: u8 = 8;
 const EIDS: u8 = 10;
@@ -365,8 +376,8 @@ impl Lay {
     }
 }
 
-fn lbl(spec: Spec, name: &str) -> String {
-    format!(".Lmqi4moe_{}_{name}", spec.tag())
+fn lbl(tag: &str, name: &str) -> String {
+    format!(".Lmqi4moe_{tag}_{name}")
 }
 
 /// Declare `len` registers from `base` as the legal ranges the plan allows (widths 1, 2, 4 or 8, SGPR
@@ -384,7 +395,7 @@ fn declare(regs: &mut RegPlan, name: &str, kind: RKind, base: u8, len: u8) -> R 
     }
     Ok(())
 }
-fn plan(l: &Lay) -> Result<RegPlan, String> {
+fn plan(l: &Lay, rowtiles: bool) -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(u16::from(l.end), u16::from(SGPRS))?;
     for (name, base, len) in [
         ("kernarg", KARG, 2),
@@ -394,7 +405,11 @@ fn plan(l: &Lay) -> Result<RegPlan, String> {
         ("kernel_arguments_x_y_m_k", XROT, 8),
         ("kernel_arguments_u_c_div_src", SU, 4),
         ("kernel_arguments_strides", SXSTR, 2),
-        ("kernel_arguments_n_experts", SNEXP, 1),
+        (
+            "kernel_arguments_n_experts",
+            if rowtiles { TILE_SNEXP } else { SNEXP },
+            1,
+        ),
         ("row", ROW, 1),
         ("expert_index", UIDX, 1),
         ("expert_offsets_pair", OFF0, 2),
@@ -430,6 +445,9 @@ fn plan(l: &Lay) -> Result<RegPlan, String> {
     ] {
         declare(&mut regs, name, RKind::S, base, len)?;
     }
+    if rowtiles {
+        declare(&mut regs, "workgroup_id_z", RKind::S, WGZ, 1)?;
+    }
     for (name, base, len) in [
         ("lane", LANE, 1),
         ("code_address", l.caddr, 1),
@@ -462,6 +480,21 @@ fn plan(l: &Lay) -> Result<RegPlan, String> {
 
 /// Emit one entry: a complete single-kernel `.s` with its builder proof.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
+    emit_impl(spec, false)
+}
+
+/// Fixed eight-row descriptor tiles, with total logical C in 1..=64.
+/// The singleton arithmetic is shared verbatim; only ownership/addressing differs.
+pub fn emit_rowtiles(spec: Spec) -> Result<Emitted, String> {
+    emit_impl(spec, true)
+}
+
+fn emit_impl(spec: Spec, rowtiles: bool) -> Result<Emitted, String> {
+    let tag = if rowtiles {
+        format!("{}_t8", spec.tag())
+    } else {
+        spec.tag()
+    };
     spec.validate()?;
     let l = Lay::new(spec);
     let kernargs = KernargLayout::new(KERNARG_BYTES)
@@ -484,20 +517,31 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         .hidden("reserved", 92, 4, "by_value");
     let kspec = KernelSpec {
         kernel_id: "mq_i4_moe_gemv".into(),
-        variant: spec.tag(),
+        variant: tag.clone(),
         arch: spec.arch,
-        symbol: spec.symbol(),
+        symbol: if rowtiles {
+            format!("{}_t8", spec.symbol())
+        } else {
+            spec.symbol()
+        },
         kernargs,
         user_sgpr_count: USER_SGPRS,
         system_sgpr_workgroup_id_y: true,
-        workgroup_size: WORKGROUP_SIZE as u16,
+        workgroup_size: if rowtiles {
+            TILE_WORKGROUP_SIZE
+        } else {
+            WORKGROUP_SIZE
+        } as u16,
         group_segment_fixed_size: 0,
         wave32: true,
         cu_mode: false,
     };
-    let mut b = Builder::new(kspec, plan(&l)?);
+    let mut b = Builder::new(kspec, plan(&l, rowtiles)?);
+    if rowtiles {
+        b.enable_workgroup_id_z();
+    }
     b.enable_delay_alu();
-    prologue(&mut b, spec, &l)?;
+    prologue(&mut b, spec, &l, rowtiles)?;
     b.wait_all()?;
     match spec.kind {
         Kind::GateUp => {
@@ -510,8 +554,8 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                 &[GROUPS],
             )?;
             sop(&mut b, format!("s_cmp_eq_u32 s{QUADS}, 0"), &[], &[QUADS])?;
-            branch(&mut b, &format!("s_cbranch_scc1 {}", lbl(spec, "tail")))?;
-            b.loop_(&lbl(spec, "quad"), |b| {
+            branch(&mut b, &format!("s_cbranch_scc1 {}", lbl(&tag, "tail")))?;
+            b.loop_(&lbl(&tag, "quad"), |b| {
                 for chain in 0..4 {
                     group(b, spec, &l, chain, &format!("q{chain}"))?;
                 }
@@ -521,9 +565,9 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                     &[],
                     &[GI, QUADS],
                 )?;
-                branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "quad")))
+                branch(b, &format!("s_cbranch_scc1 {}", lbl(&tag, "quad")))
             })?;
-            b.label(&lbl(spec, "tail"))?;
+            b.label(&lbl(&tag, "tail"))?;
             for chain in 0..3 {
                 sop(
                     &mut b,
@@ -531,14 +575,14 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                     &[],
                     &[GI, GROUPS],
                 )?;
-                branch(&mut b, &format!("s_cbranch_scc0 {}", lbl(spec, "reduce")))?;
+                branch(&mut b, &format!("s_cbranch_scc0 {}", lbl(&tag, "reduce")))?;
                 group(&mut b, spec, &l, chain, &format!("t{chain}"))?;
             }
         }
         Kind::Down => {
             sop(&mut b, format!("s_cmp_eq_u32 s{GROUPS}, 0"), &[], &[GROUPS])?;
-            branch(&mut b, &format!("s_cbranch_scc1 {}", lbl(spec, "reduce")))?;
-            b.loop_(&lbl(spec, "group"), |b| {
+            branch(&mut b, &format!("s_cbranch_scc1 {}", lbl(&tag, "reduce")))?;
+            b.loop_(&lbl(&tag, "group"), |b| {
                 group(b, spec, &l, 0, "g")?;
                 sop(
                     b,
@@ -546,11 +590,11 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
                     &[],
                     &[GI, GROUPS],
                 )?;
-                branch(b, &format!("s_cbranch_scc1 {}", lbl(spec, "group")))
+                branch(b, &format!("s_cbranch_scc1 {}", lbl(&tag, "group")))
             })?;
         }
     }
-    b.label(&lbl(spec, "reduce"))?;
+    b.label(&lbl(&tag, "reduce"))?;
     epilogue(&mut b, spec, &l)?;
     b.finish()
 }
@@ -569,20 +613,82 @@ pub fn emit_module(
 
 /// Kernarg loads, the guards, the expert's pointer and the row/slot bookkeeping, per-lane
 /// address constants, zeroed accumulators and the per-slot X offsets / Y addresses.
-fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
+fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
+    let tag = b.spec.variant.clone();
     let a = b.spec.arch;
-    let exit = lbl(spec, "exit");
+    let exit = lbl(&tag, "exit");
     smem(b, WPTRS, 8, KARG, 0)?;
     smem(b, XROT, 8, KARG, 0x20)?;
     smem(b, SU, 4, KARG, 0x40)?;
     smem(b, SXSTR, 2, KARG, 0x50)?;
-    smem(b, SNEXP, 1, KARG, 0x58)?;
+    let snexp = if rowtiles { TILE_SNEXP } else { SNEXP };
+    smem(b, snexp, 1, KARG, 0x58)?;
     // gfx11 workgroup ids are system SGPRs (after the user SGPRs), not ttmp registers.
     let ids = a.workgroup_ids(USER_SGPRS)?;
     if (ids.x, ids.y) != (WgIdSource::Sgpr(WGX), WgIdSource::Sgpr(WGY)) {
         return Err(format!("unexpected workgroup id ABI {ids:?}"));
     }
-    sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+    if rowtiles {
+        // v0 is the linear workitem id. Scalar registers are wave-private;
+        // each wave runs the original complete K sweep for one output row.
+        valu(
+            b,
+            &format!("v_lshrrev_b32_e32 v{}, 5, v{LANE}", l.exch),
+            &[l.exch],
+            &[LANE],
+            &[],
+        )?;
+        op(
+            b,
+            format!("v_readfirstlane_b32 s{TMP}, v{}", l.exch),
+            &[s(TMP)],
+            &[v(l.exch)],
+        )?;
+        sop(b, format!("s_lshl_b32 s{ROW}, s{WGX}, 3"), &[ROW], &[WGX])?;
+        sop(
+            b,
+            format!("s_add_u32 s{ROW}, s{ROW}, s{TMP}"),
+            &[ROW],
+            &[ROW, TMP],
+        )?;
+        valu(
+            b,
+            &format!("v_and_b32_e32 v{LANE}, 31, v{LANE}"),
+            &[LANE],
+            &[LANE],
+            &[],
+        )?;
+        // Validate the whole tile before touching any descriptor.
+        sop(
+            b,
+            format!("s_cmp_eq_u32 s{SU}, {}", lit(TILE_CAPACITY)),
+            &[],
+            &[SU],
+        )?;
+        branch(b, &format!("s_cbranch_scc0 {exit}"))?;
+        sop(b, format!("s_cmp_eq_u32 s{SC}, 0"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_gt_u32 s{SC}, 64"), &[], &[SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_ge_u32 s{WGZ}, 8"), &[], &[WGZ])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_lshl_b32 s{TMP}, s{WGZ}, 3"), &[TMP], &[WGZ])?;
+        sop(b, format!("s_cmp_ge_u32 s{TMP}, s{SC}"), &[], &[TMP, SC])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(b, format!("s_cmp_eq_u32 s{SDIV}, 0"), &[], &[SDIV])?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(
+            b,
+            format!("s_mul_i32 s{TMP}, s{WGZ}, {}", lit(TILE_DESCRIPTOR_BYTES)),
+            &[TMP],
+            &[WGZ],
+        )?;
+        for ptr in [EIDS, OFFS, SLOTS] {
+            add64(b, ptr, ptr, TMP)?;
+        }
+    } else {
+        sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+    }
     sop(b, format!("s_mov_b32 s{UIDX}, s{WGY}"), &[UIDX], &[WGY])?;
     sop(b, format!("s_cmp_ge_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
@@ -604,21 +710,37 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_cmp_gt_u32 s{NS}, {MAX_SLOTS}"), &[], &[NS])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-    sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
-    sop(
-        b,
-        format!("s_cmp_gt_u32 s{OFF1}, s{TMP}"),
-        &[],
-        &[OFF1, TMP],
-    )?;
+    if rowtiles {
+        sop(
+            b,
+            format!("s_cmp_gt_u32 s{OFF0}, {}", lit(TILE_CAPACITY)),
+            &[],
+            &[OFF0],
+        )?;
+        branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        sop(
+            b,
+            format!("s_cmp_gt_u32 s{OFF1}, {}", lit(TILE_CAPACITY)),
+            &[],
+            &[OFF1],
+        )?;
+    } else {
+        sop(b, format!("s_mul_i32 s{TMP}, s{SC}, 10"), &[TMP], &[SC])?;
+        sop(
+            b,
+            format!("s_cmp_gt_u32 s{OFF1}, s{TMP}"),
+            &[],
+            &[OFF1, TMP],
+        )?;
+    }
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     // Expert id range check before the table index (and before the expert pointer lookup): an id at or past
     // `n_experts` (unsigned, so a negative id too) exits without a table load or a store.
     sop(
         b,
-        format!("s_cmp_ge_u32 s{EID}, s{SNEXP}"),
+        format!("s_cmp_ge_u32 s{EID}, s{snexp}"),
         &[],
-        &[EID, SNEXP],
+        &[EID, snexp],
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;
@@ -871,6 +993,27 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         &[],
     )?;
     gload(b, "global_load_b32", sid, p, SLOTS, "")?;
+    if rowtiles {
+        // All lanes loaded a clamped live slot. Reject the expert uniformly
+        // if any live absolute slot escapes the logical window; no X or Y
+        // access has occurred yet. The descriptor itself remains immutable.
+        sop(b, format!("s_mul_i32 s{TMP2}, s{SC}, 10"), &[TMP2], &[SC])?;
+        for i in 0..MAX_SLOTS {
+            op(
+                b,
+                format!("v_readlane_b32 s{TMP}, v{sid}, {i}"),
+                &[s(TMP)],
+                &[v(sid)],
+            )?;
+            sop(
+                b,
+                format!("s_cmp_ge_u32 s{TMP}, s{TMP2}"),
+                &[],
+                &[TMP, TMP2],
+            )?;
+            branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+        }
+    }
     gather_offset(
         b,
         xq,
@@ -945,6 +1088,7 @@ fn slot_gate(b: &mut Builder, i: u32, target: &str) -> R {
 /// One group of the row, loaded and dequantized once, then applied to every live slot.
 /// Chain `chain` (always 0 for down) takes the group partial of every slot.
 fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
+    let tag = b.spec.variant.clone();
     let arch = b.spec.arch;
     let wide = l.nw == 8;
     // Scalar group offsets, then the lane addresses, then the weight loads (all before
@@ -1036,7 +1180,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
         }
     }
     // X loads of the live slots (slot 0 always: n >= 1), each slot's own X row.
-    let xdone = lbl(spec, &format!("{inst}_xdone"));
+    let xdone = lbl(&tag, &format!("{inst}_xdone"));
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &xdone)?
@@ -1057,7 +1201,7 @@ fn group(b: &mut Builder, spec: Spec, l: &Lay, chain: u8, inst: &str) -> R {
     b.wait_all()?;
     unpack(b, spec, l)?;
     // Per-slot chains on the shared weights.
-    let done = lbl(spec, &format!("{inst}_done"));
+    let done = lbl(&tag, &format!("{inst}_done"));
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &done)?
@@ -1205,6 +1349,7 @@ fn unpack(b: &mut Builder, spec: Spec, l: &Lay) -> R {
 
 /// Shuffle tables, the per-slot fold + snapshot shuffle-down tree, then the lane-0 stores.
 fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
+    let tag = b.spec.variant.clone();
     // Shuffle step k (offset 16 >> k): mask lane < 32 - off, address (lane + off or lane) * 4.
     let offsets = [16u32, 8, 4, 2, 1];
     for (k, off) in offsets.into_iter().enumerate() {
@@ -1230,7 +1375,7 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
             &[],
         )?;
     }
-    let red_done = lbl(spec, "red_done");
+    let red_done = lbl(&tag, "red_done");
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &red_done)?
@@ -1296,7 +1441,7 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
         &[LANE],
         &[],
     )?;
-    let st_done = lbl(spec, "st_done");
+    let st_done = lbl(&tag, "st_done");
     for i in 0..MAX_SLOTS {
         if i > 0 {
             slot_gate(b, i, &st_done)?
@@ -1313,7 +1458,7 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     }
     b.label(&st_done)?;
     b.wait_all()?;
-    b.label(&lbl(spec, "exit"))?;
+    b.label(&lbl(&tag, "exit"))?;
     branch(b, "s_endpgm")
 }
 
@@ -1328,6 +1473,11 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
 /// counters are `s_waitcnt vmcnt/lgkmcnt` and every load needs one. Committed (by the parent) as
 /// `kernels/mq_i4_moe_gemv.gfx1100.<tag>.contract.json`.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
+    let symbol = if e.proof.variant == format!("{}_t8", spec.tag()) {
+        format!("{}_t8", spec.symbol())
+    } else {
+        spec.symbol()
+    };
     let mut counts = serde_json::Map::new();
     for name in COUNTED {
         let n = e
@@ -1340,7 +1490,7 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         }
     }
     serde_json::json!({
-        "symbol": spec.symbol(), "counts": counts,
+        "symbol": symbol, "counts": counts,
         "forbidden": ["scratch_*", "flat_*", "ds_load*", "ds_store*", "ds_swizzle*", "ds_read*", "ds_write*", "s_barrier*",
                       "v_writelane*", "v_wmma*", "v_swmmac*", "v_fma_mix*", "s_setpc*", "s_swappc*",
                       "s_wait_loadcnt*", "s_wait_dscnt*", "s_wait_storecnt*", "s_wait_kmcnt*", "s_wait_alu",
@@ -1422,4 +1572,144 @@ fn gload(b: &mut Builder, mnemonic: &str, dst: u8, voff: u8, base: u8, suffix: &
 }
 fn branch(b: &mut Builder, text: &str) -> R {
     b.control(Instruction::new(text, vec![], vec![]))
+}
+
+#[cfg(test)]
+mod rowtile_tests {
+    use super::*;
+
+    fn instructions(text: &str) -> Vec<&str> {
+        text.lines().map(str::trim).collect()
+    }
+
+    fn arithmetic(text: &str) -> Vec<&str> {
+        instructions(text)
+            .into_iter()
+            .filter(|line| {
+                [
+                    "v_mul_f32",
+                    "v_fma_f32",
+                    "v_fmac_f32",
+                    "v_add_f32",
+                    "v_cvt_",
+                    "ds_bpermute_b32",
+                    "buffer_load_b128",
+                    "global_store_b32",
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rowtiles_keep_the_gfx1100_singleton_dag_and_resources() {
+        for spec in module_specs(Arch::Gfx1100) {
+            let singleton = emit(spec).unwrap();
+            let tiled = emit_rowtiles(spec).unwrap();
+            assert_eq!(arithmetic(&tiled.s_text), arithmetic(&singleton.s_text));
+            assert_eq!(tiled.shape.next_free_vgpr, singleton.shape.next_free_vgpr);
+            assert_eq!(tiled.shape.next_free_sgpr, singleton.shape.next_free_sgpr);
+            assert_eq!(tiled.shape.barriers, 0);
+            assert!(tiled.proof.lds_slots.is_empty());
+            assert_eq!(tiled.proof.variant, format!("{}_t8", spec.tag()));
+            assert_eq!(
+                contract(spec, &tiled)["symbol"],
+                format!("{}_t8", spec.symbol())
+            );
+            for owner in [
+                "weights",
+                "x_values",
+                "accumulators",
+                "slot_x_offsets",
+                "slot_y_addresses",
+            ] {
+                let ranges = |e: &Emitted| {
+                    e.proof
+                        .reg_plan
+                        .iter()
+                        .filter(|r| r.name.as_ref() == owner)
+                        .map(|r| (r.base, r.len))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(ranges(&tiled), ranges(&singleton), "{owner}");
+            }
+        }
+    }
+
+    #[test]
+    fn rowtile_descriptor_abi_uses_z_and_full_window_bases() {
+        for spec in module_specs(Arch::Gfx1100) {
+            let e = emit_rowtiles(spec).unwrap();
+            let t = &e.s_text;
+            assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_z 1"));
+            assert!(t.contains("s_load_b32 s5, s[0:1], 0x58"));
+            assert!(t.contains(&format!(
+                "s_mul_i32 s{TMP}, s{WGZ}, {}",
+                lit(TILE_DESCRIPTOR_BYTES)
+            )));
+            assert!(t.contains(&format!("s_cmp_eq_u32 s{SU}, {}", lit(TILE_CAPACITY))));
+            assert!(t.contains(&format!("s_cmp_gt_u32 s{SC}, 64")));
+            assert!(t.contains(&format!("s_cmp_gt_u32 s{OFF0}, {}", lit(TILE_CAPACITY))));
+            assert!(t.contains(&format!("s_cmp_gt_u32 s{OFF1}, {}", lit(TILE_CAPACITY))));
+            assert!(t.contains(&format!("s_cmp_ge_u32 s{EID}, s{TILE_SNEXP}")));
+            assert!(t.contains(&format!("v_and_b32_e32 v{LANE}, 31, v{LANE}")));
+            assert!(t.contains(&format!("s_lshl_b32 s{ROW}, s{WGX}, 3")));
+            assert!(e
+                .proof
+                .reg_plan
+                .iter()
+                .any(|r| r.name.as_ref() == "workgroup_id_z" && r.base == WGZ));
+            // Singleton and tile local labels must coexist in the same image.
+            assert!(!t.contains(&format!(".Lmqi4moe_{}_exit:", spec.tag())));
+            assert!(t.contains(&format!(".Lmqi4moe_{}_t8_exit:", spec.tag())));
+            // The kernel never writes a descriptor, input, or expert tensor.
+            for line in instructions(t)
+                .into_iter()
+                .filter(|s| s.starts_with("global_store"))
+            {
+                assert!(line.ends_with(&format!("s[{YSEL}:{}]", YSEL + 1)));
+            }
+        }
+    }
+
+    #[test]
+    fn every_width_tail_and_absolute_slot_keeps_original_coordinates() {
+        for rows in 1usize..=64 {
+            let mut seen = vec![false; rows * 10];
+            for tile in 0..rows.div_ceil(8) {
+                assert_eq!(tile * TILE_DESCRIPTOR_BYTES as usize, tile * 482 * 4);
+                for local in 0usize..80 {
+                    let slot = tile * 80 + local;
+                    if slot >= rows * 10 {
+                        continue;
+                    }
+                    assert!(!seen[slot]);
+                    seen[slot] = true;
+                    // Gate/up reads token rows; down reads absolute slot rows.
+                    assert_eq!(slot / 10, tile * 8 + local / 10);
+                    for stride in [1usize, 640, 2560] {
+                        assert_eq!(slot * stride + 7, (tile * 80 + local) * stride + 7);
+                    }
+                }
+            }
+            assert!(seen.into_iter().all(|v| v));
+        }
+        for outputs in [1u32, 7, 8, 9, 63, 64, 65, 128, 640] {
+            let live: Vec<_> = (0..outputs.div_ceil(8))
+                .flat_map(|x| (0..8).map(move |wave| 8 * x + wave))
+                .filter(|&row| row < outputs)
+                .collect();
+            assert_eq!(live, (0..outputs).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn gfx1100_tiles_do_not_retag_another_architecture() {
+        for arch in [Arch::Gfx1151, Arch::Gfx1201] {
+            for spec in module_specs(arch) {
+                assert!(emit_rowtiles(spec).is_err());
+            }
+        }
+    }
 }

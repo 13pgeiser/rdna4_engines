@@ -11,9 +11,10 @@
 //! Nothing here uses GPU, hipcc or the runtime.
 //!
 //! Coverage is closed: every function that mentions a changed kernel must be a
-//! checked launcher, an explicitly classified non-launcher (verified to have no
-//! launch site), an inert `#[cfg(any())]` copy, or test code; every changed
-//! symbol must be reached by a checked launcher or be listed as unlaunched in
+//! checked launcher, a source-checked delegation to ABI-checked sites, an explicitly
+//! classified non-launcher (verified to have no launch site), an inert
+//! `#[cfg(any())]` copy, or test code; every changed symbol must be reached by a
+//! checked launcher or be listed as unlaunched in
 //! `fixtures/all-launcher-abi/inventory.json`. Unknown syntax fails closed.
 
 mod check;
@@ -78,6 +79,151 @@ fn string_map(v: &Value, key: &str) -> BTreeMap<String, String> {
             (k.clone(), reason.to_string())
         })
         .collect()
+}
+
+/// Validate complete ownership before any emitter-specific metadata filtering.
+fn image_symbol_owners(
+    inv: &Value,
+    images: &[String],
+    syms: &Symbols,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
+    let emitters: BTreeSet<String> = strings(inv, "pm_emitters").into_iter().collect();
+    let owned = inv["emitter_images"]
+        .as_object()
+        .ok_or("emitter_images must be an object")?;
+    if owned.keys().cloned().collect::<BTreeSet<_>>() != emitters {
+        return Err("emitter_images must list exactly the changed PM emitters".into());
+    }
+    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (emitter, list) in owned {
+        for image in list
+            .as_array()
+            .ok_or("emitter image list must be an array")?
+        {
+            let image = image.as_str().ok_or("emitter image must be a string")?;
+            if !owners
+                .entry(image.into())
+                .or_default()
+                .insert(emitter.clone())
+            {
+                return Err(format!("{image}: duplicate emitter image entry"));
+            }
+        }
+    }
+    let image_set: BTreeSet<String> = images.iter().cloned().collect();
+    if owners.keys().cloned().collect::<BTreeSet<_>>() != image_set {
+        return Err("every changed/related image must be owned".into());
+    }
+    let mut partitions = BTreeMap::new();
+    if let Some(value) = inv.get("image_symbol_owners") {
+        for (image, value) in value
+            .as_object()
+            .ok_or("image_symbol_owners must be an object")?
+        {
+            let listed = owners
+                .get(image)
+                .ok_or_else(|| format!("{image}: partition for unknown image"))?;
+            let entries = value
+                .as_object()
+                .ok_or("image symbol partition must be an object")?;
+            let origin = format!("image:{image}");
+            let names = syms
+                .origin_symbols
+                .get(&origin)
+                .ok_or_else(|| format!("{image}: missing metadata exports"))?;
+            let exports: BTreeSet<String> = names.iter().cloned().collect();
+            if exports.is_empty()
+                || exports.len() != names.len()
+                || entries.keys().cloned().collect::<BTreeSet<_>>() != exports
+            {
+                return Err(format!(
+                    "{image}: partition must exactly match distinct metadata exports"
+                ));
+            }
+            let mut partition = BTreeMap::new();
+            let mut assigned = BTreeSet::new();
+            for (name, owner) in entries {
+                let owner = owner.as_str().ok_or("symbol owner must be a string")?;
+                if !emitters.contains(owner) || !listed.contains(owner) {
+                    return Err(format!("{image}:{name}: unknown or unlisted owner {owner}"));
+                }
+                if inv["emitter_abi"][owner].as_str() != Some("const:KERNARG_BYTES") {
+                    return Err(format!(
+                        "{image}:{name}: partition owner requires const:KERNARG_BYTES"
+                    ));
+                }
+                if !syms.decls(name).iter().any(|(o, _)| o == &origin) {
+                    return Err(format!("{image}:{name}: missing metadata layout"));
+                }
+                assigned.insert(owner.to_string());
+                partition.insert(name.clone(), owner.to_string());
+            }
+            if &assigned != listed {
+                return Err(format!("{image}: every listed owner must own an export"));
+            }
+            partitions.insert(image.clone(), partition);
+        }
+    }
+    for (image, listed) in owners {
+        if listed.len() > 1 && !partitions.contains_key(&image) {
+            return Err(format!(
+                "{image}: owned by two emitters without an explicit partition"
+            ));
+        }
+    }
+    Ok(partitions)
+}
+
+#[test]
+fn image_symbol_partition_controls() {
+    let inv = serde_json::json!({
+        "pm_emitters": ["gate_up.rs", "down.rs"],
+        "emitter_images": {"gate_up.rs": ["mixed.hxaco"], "down.rs": ["mixed.hxaco"]},
+        "emitter_abi": {"gate_up.rs": "const:KERNARG_BYTES", "down.rs": "const:KERNARG_BYTES"},
+        "image_symbol_owners": {"mixed.hxaco": {"gu": "gate_up.rs", "down": "down.rs"}}
+    });
+    let images = vec!["mixed.hxaco".to_string()];
+    let mut syms = Symbols::default();
+    let origin = "image:mixed.hxaco".to_string();
+    syms.origin_symbols
+        .insert(origin.clone(), vec!["gu".into(), "down".into()]);
+    for (name, end) in [("gu", 56), ("down", 52)] {
+        syms.pm.insert(
+            name.into(),
+            vec![(origin.clone(), Decl { args: vec![], end })],
+        );
+    }
+    let valid = image_symbol_owners(&inv, &images, &syms).unwrap();
+    assert_eq!(valid["mixed.hxaco"]["gu"], "gate_up.rs");
+    assert_eq!(valid["mixed.hxaco"]["down"], "down.rs");
+    let reject = |bad: &Value| assert!(image_symbol_owners(bad, &images, &syms).is_err());
+    let mut bad = inv.clone();
+    bad["image_symbol_owners"]["mixed.hxaco"]
+        .as_object_mut()
+        .unwrap()
+        .remove("gu");
+    reject(&bad);
+    let mut bad = inv.clone();
+    bad["image_symbol_owners"]["mixed.hxaco"]["unknown"] = "gate_up.rs".into();
+    reject(&bad);
+    let mut bad = inv.clone();
+    bad["image_symbol_owners"]["mixed.hxaco"]["gu"] = "unknown.rs".into();
+    reject(&bad);
+    let mut bad = inv.clone();
+    bad["image_symbol_owners"]["mixed.hxaco"]["down"] = "gate_up.rs".into();
+    reject(&bad);
+    let mut bad = inv.clone();
+    let partition = bad["image_symbol_owners"]["mixed.hxaco"].clone();
+    bad["image_symbol_owners"]["unknown.hxaco"] = partition;
+    reject(&bad);
+    let mut bad = inv.clone();
+    bad.as_object_mut().unwrap().remove("image_symbol_owners");
+    reject(&bad);
+    let mut bad = inv.clone();
+    bad["emitter_abi"]["down.rs"] = "image-metadata".into();
+    reject(&bad);
+    syms.pm.remove("gu");
+    assert!(image_symbol_owners(&inv, &images, &syms).is_err());
 }
 
 // ---- source discovery ---------------------------------------------------------
@@ -237,17 +383,37 @@ fn build_fixture() -> Fixture {
 
 fn policy(inv: &Value) -> Policy {
     let mut forwarders = BTreeMap::new();
+    let mut checked_delegations = BTreeMap::new();
     for (k, v) in inv["forwarders"]
         .as_object()
         .expect("inventory key `forwarders` must be an object")
     {
-        let to = v["to"]
-            .as_str()
-            .unwrap_or_else(|| panic!("forwarders.{k}.to"));
         let reason = v["reason"]
             .as_str()
             .unwrap_or_else(|| panic!("forwarders.{k}.reason"));
         assert!(!reason.trim().is_empty(), "forwarders.{k} needs a reason");
+        if v.get("checked_chain").is_some() {
+            assert!(
+                v.get("to").is_none(),
+                "forwarders.{k}: choose to or checked_chain"
+            );
+            let returns = match v["flow"].as_str() {
+                Some("calls") => false,
+                Some("returns") => true,
+                _ => panic!("forwarders.{k}.flow must be calls or returns"),
+            };
+            checked_delegations.insert(
+                k.clone(),
+                CheckedDelegation {
+                    chain: strings(v, "checked_chain"),
+                    returns,
+                },
+            );
+            continue;
+        }
+        let to = v["to"]
+            .as_str()
+            .unwrap_or_else(|| panic!("forwarders.{k}.to"));
         forwarders.insert(k.clone(), (to.to_string(), reason.to_string()));
     }
     let mut probe_candidates = BTreeMap::new();
@@ -348,6 +514,7 @@ fn policy(inv: &Value) -> Policy {
         non_launching: string_map(inv, "non_launching"),
         inert: string_map(inv, "inert"),
         forwarders,
+        checked_delegations,
         old_variants: string_map(inv, "old_variants"),
         probe_candidates,
         old_helpers: string_map(inv, "old_helpers"),
@@ -431,30 +598,10 @@ fn inventory_matches_the_changed_kernel_catalogue() {
         assert!(root.join(i).is_file(), "{i}: missing PM image");
     }
     images.extend(related);
-    // Every changed emitter owns images; every image has exactly one emitter.
-    let owned = inv["emitter_images"].as_object().expect("emitter_images");
-    let owner_keys: BTreeSet<String> = owned.keys().cloned().collect();
-    let emitter_set: BTreeSet<String> = emitters.iter().cloned().collect();
-    assert_eq!(
-        owner_keys, emitter_set,
-        "emitter_images must list exactly the changed PM emitters"
-    );
-    let mut seen: BTreeMap<String, String> = BTreeMap::new();
-    for (e, list) in owned {
-        for i in list.as_array().expect("emitter image list") {
-            let i = i.as_str().unwrap().to_string();
-            assert!(
-                seen.insert(i.clone(), e.clone()).is_none(),
-                "{i}: owned by two emitters"
-            );
-        }
-    }
-    let image_set: BTreeSet<String> = images.iter().cloned().collect();
-    let owned_set: BTreeSet<String> = seen.keys().cloned().collect();
-    assert_eq!(
-        image_set, owned_set,
-        "every changed/related image must be owned by exactly one emitter"
-    );
+    // Shared physical images require a complete, metadata-validated partition.
+    let mut syms = Symbols::default();
+    build_pm(&root, &images, &mut syms).unwrap_or_else(|e| panic!("pm: {e}"));
+    image_symbol_owners(&inv, &images, &syms).unwrap_or_else(|e| panic!("{e}"));
     // Closed MoE family: every moe-family HIP source (recursive under kernels/src) is
     // either changed or reviewed-unchanged.
     let subs = strings(&inv["family"], "substrings");
@@ -602,6 +749,8 @@ fn pm_emitter_kernarg_constants_agree_with_image_extents_and_the_hip_twin() {
     let mut images = strings(&inv, "pm_images");
     images.extend(strings(&inv, "pm_related_images"));
     build_pm(&root, &images, &mut syms).unwrap_or_else(|e| panic!("pm: {e}"));
+    let partitions = image_symbol_owners(&inv, &images, &syms)
+        .unwrap_or_else(|e| panic!("image ownership: {e}"));
     let owned = inv["emitter_images"].as_object().expect("emitter_images");
     let abi = string_map(&inv, "emitter_abi");
     let mut problems = Vec::new();
@@ -640,6 +789,12 @@ fn pm_emitter_kernarg_constants_agree_with_image_extents_and_the_hip_twin() {
             }
             let mut ends: BTreeSet<u32> = BTreeSet::new();
             for n in &names {
+                if partitions
+                    .get(img)
+                    .is_some_and(|owners| owners.get(n) != Some(emitter))
+                {
+                    continue;
+                }
                 for (o, d) in syms.decls(n) {
                     if o == origin {
                         ends.insert(d.end);
@@ -1135,6 +1290,131 @@ fn negative_forwarded_kernel_names_extend_the_launcher_and_fail_closed_when_unli
     // The forwarded symbol declares an extra argument the launcher does not pass.
     let (abi, _) = run_synth(src, &[("base_symbol", two), ("extra_symbol", three)], &pol);
     assert!(abi.iter().any(|p| p.contains("extra_symbol")), "{abi:?}");
+
+    // Explicit call/returned-descriptor chains never add candidates or exempt
+    // a terminal ABI. Broken edges, missing symbols and bad blobs fail closed.
+    for returns in [false, true] {
+        let source = if returns {
+            "fn descriptor() -> &'static str { \"chain_symbol\" }\nfn launch() { let _ = descriptor();"
+        } else {
+            "fn descriptor() { let _ = \"chain_symbol\"; launch(); }\nfn launch() {"
+        };
+        let source = format!("{source}\nlet wp = t.buf.as_ptr();\nlet nv = n as i32;\nlet mut params = [&wp as *const _ as *mut c_void, &nv as *const _ as *mut c_void];\nself.launch_maybe_blob(\"chain_symbol\", g, b, 0, &mut params, || {{ let mut x = hip_bridge::KernargBlob::new(); x.push_ptr(wp); x.push_i32(nv); x }});\n}}");
+        let mut policy = Policy::default();
+        policy.checked_delegations.insert(
+            "synthetic.rs::descriptor".into(),
+            CheckedDelegation {
+                chain: vec![
+                    "synthetic.rs::descriptor".into(),
+                    "synthetic.rs::launch".into(),
+                ],
+                returns,
+            },
+        );
+        let symbols = [("chain_symbol", Decl::from_scalars(&[(8, 'p'), (4, 'i')]))];
+        let (abi, coverage) = run_synth(&source, &symbols, &policy);
+        assert!(
+            abi.is_empty() && coverage.is_empty(),
+            "{abi:?} {coverage:?}"
+        );
+        let broken = source.replace(
+            if returns {
+                "descriptor();"
+            } else {
+                "launch();"
+            },
+            "unrelated();",
+        );
+        let (_, coverage) = run_synth(&broken, &symbols, &policy);
+        assert!(
+            coverage.iter().any(|e| e.contains("no longer calls")),
+            "{coverage:?}"
+        );
+        let bad_blob = source.replace("x.push_i32(nv);", "");
+        let (abi, coverage) = run_synth(&bad_blob, &symbols, &policy);
+        assert!(
+            !abi.is_empty() && coverage.iter().any(|e| e.contains("terminal launch")),
+            "{abi:?} {coverage:?}"
+        );
+        let missing = source.replacen("\"chain_symbol\"", "\"other_symbol\"", 1);
+        let mut symbols = symbols.to_vec();
+        symbols.push(("other_symbol", Decl::from_scalars(&[(8, 'p'), (4, 'i')])));
+        let (_, coverage) = run_synth(&missing, &symbols, &policy);
+        assert!(
+            coverage.iter().any(|e| e.contains("every origin symbol")),
+            "{coverage:?}"
+        );
+    }
+
+    // The slab shape returns two nested descriptors before the real 17-arg
+    // launch. Field initializers must retain their constructing function's
+    // local bindings, including tuple-bound branch results.
+    let descriptors = r#"
+fn descriptor(which: bool) -> Option<Descriptor> {
+    let (module, symbols) = if which {
+        ("module_a", ["k1_symbol", "second_symbol"])
+    } else {
+        ("module_b", ["second_symbol", "k1_symbol"])
+    };
+    Some(Descriptor { module, symbols })
+}
+fn pick(which: bool, down: usize) -> Option<Pick> {
+    let tile = descriptor(which)?;
+    Some(Pick { symbol: tile.symbols[down] })
+}
+"#;
+    let mut policy = Policy::default();
+    policy.checked_delegations.insert(
+        "synthetic.rs::descriptor".into(),
+        CheckedDelegation {
+            chain: vec![
+                "synthetic.rs::descriptor".into(),
+                "synthetic.rs::pick".into(),
+                "synthetic.rs::k1".into(),
+            ],
+            returns: true,
+        },
+    );
+    let symbols = [("k1_symbol", k1_decl()), ("second_symbol", k1_decl())];
+    let nested = |drop_params, drop_blob, swap| {
+        let launcher = k1_source(drop_params, drop_blob, swap)
+            .replace("\"k1_symbol\"", "func")
+            .replace(
+                "        let wp",
+                "        let pick = pick(which, down).expect(\"selected\");\n        let func = pick.symbol;\n        let wp",
+            );
+        format!("{descriptors}\n{launcher}")
+    };
+    let good = nested(false, false, false);
+    let (abi, coverage) = run_synth(&good, &symbols, &policy);
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    for bad in [
+        nested(true, false, false),
+        nested(false, true, false),
+        nested(false, false, true),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &policy);
+        assert!(
+            !abi.is_empty() && coverage.iter().any(|e| e.contains("terminal launch")),
+            "{abi:?} {coverage:?}"
+        );
+    }
+    for bad in [
+        good.replace("descriptor(which)?", "unrelated(which)?"),
+        good.replace("let func = pick.symbol;", "let func = \"untracked\";"),
+        good.replace("symbol: tile.symbols[down]", "symbol: \"untracked\""),
+        good.replace(
+            "    Some(Pick { symbol: tile.symbols[down] })",
+            "    let discarded = Pick { symbol: tile.symbols[down] };\n    Some(Pick { symbol: \"untracked\" })",
+        ),
+        format!("{good}\nfn descriptor(which: bool) -> Option<Descriptor> {{ None }}"),
+    ] {
+        let (_, coverage) = run_synth(&bad, &symbols, &policy);
+        assert!(!coverage.is_empty(), "{coverage:?}");
+    }
 }
 
 #[test]

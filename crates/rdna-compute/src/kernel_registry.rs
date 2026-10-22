@@ -2300,10 +2300,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq6g256v2_f32_rows_x4_r6",
                 "gemm_mq6g256v2_f32_rows_x4_r7",
                 "gemm_mq6g256v2_f32_rows_x4_r8",
-                "gemm_mq6g256v2_f32_rows_wide_r16",
-                "gemm_mq6g256v2_f32_rows_wide_r32",
-                "gemm_mq6g256v2_f32_rows_x4_wide_r16",
-                "gemm_mq6g256v2_f32_rows_x4_wide_r32",
             ]
         );
         add!(
@@ -2443,10 +2439,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_bf16_xf32_x4_rows_r6",
                 "gemv_bf16_xf32_x4_rows_r7",
                 "gemv_bf16_xf32_x4_rows_r8",
-                "gemv_bf16_xf32_x4_rows_wide_r16",
-                "gemv_bf16_xf32_x4_rows_wide_r32",
-                "gemv_bf16_xf32_k4_rows_wide_r16",
-                "gemv_bf16_xf32_k4_rows_wide_r32",
                 "hyper_write_norm_f32",
             ]
         );
@@ -2486,14 +2478,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "quantize_bf16_q8_0",
                 "topk8_partial_f32",
                 "topk8_rescore_q8_0_k2560",
-                "gemv_q8_0_k2560_staged_rows_wide_r16",
-                "gemv_q8_0_k2560_staged_rows_wide_r32",
-                "gemv_q8_0_k320_staged_rows_wide_r16",
-                "gemv_q8_0_k320_staged_rows_wide_r32",
-                "gemv_q8_0_k2560_staged_rows_x2_wide_r16",
-                "gemv_q8_0_k2560_staged_rows_x2_wide_r32",
-                "gemv_q8_0_k8_rows_wide_r16",
-                "gemv_q8_0_k8_rows_wide_r32",
             ]
         );
         add!(
@@ -2800,8 +2784,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1201" {
-        // S2 exact-wide verify twins: the Q8 small-K recipe's wide entries run on
-        // gfx1201 too (raw Q8 oracle; production Q8 copies stay gfx1151-only).
+        // Keep the actual Q8 singleton and narrow-row HIP oracle exports.
         add!(
             "qwen4_gemv_q8_0_wide",
             kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
@@ -3434,10 +3417,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_bf16_xf32_x4_rows_r6",
                 "gemv_bf16_xf32_x4_rows_r7",
                 "gemv_bf16_xf32_x4_rows_r8",
-                "gemv_bf16_xf32_x4_rows_wide_r16",
-                "gemv_bf16_xf32_x4_rows_wide_r32",
-                "gemv_bf16_xf32_k4_rows_wide_r16",
-                "gemv_bf16_xf32_k4_rows_wide_r32",
                 "hyper_write_norm_f32",
             ]
         );
@@ -5710,12 +5689,29 @@ pub fn lookup(arch: &str, module: &str, extra_flags: &str) -> Result<KernelEntry
 static SLAB_GFX1100_K3_SYMBOLS: [&str; 1] = [crate::slab_moe::MQ_I4_A4_GFX1100_SYMBOL];
 static SLAB_GFX1100_MASK_SYMBOLS: [&str; 1] = [crate::slab_moe::EP_TILE_MASK_GFX1100_MODULE];
 
+/// Narrow and t8 exports share the admitted gfx1100 K1 images.
+static SLAB_GFX1100_K1_SYMBOLS: std::sync::LazyLock<Vec<&str>> = std::sync::LazyLock::new(|| {
+    let k1 = &crate::slab_moe::slab_arch_kernels("gfx1100")
+        .unwrap()
+        .mq4_k1;
+    let tiled = crate::slab_moe::slab_rowtile_k1(k1).unwrap();
+    k1.symbols.into_iter().chain(tiled.symbols).collect()
+});
+static SLAB_GFX1100_E8P_K1_SYMBOLS: std::sync::LazyLock<Vec<&str>> =
+    std::sync::LazyLock::new(|| {
+        let k1 = &crate::slab_moe::slab_cold_k1_metadata("gfx1100", 3)
+            .unwrap()
+            .k1;
+        let tiled = crate::slab_moe::slab_rowtile_k1(k1).unwrap();
+        k1.symbols.into_iter().chain(tiled.symbols).collect()
+    });
+
 /// Embedded certified-builder images of the sealed expert-slab serving route on `arch` for a
 /// layer whose cold bucket is codec `cold_codec` (K1 decode GEMVs, K2 NT1 grouped GEMMs, K3 down
 /// A4 producer and the codec tile mask), as closed-route [`PlannedKernel::Embedded`] entries that
-/// [`validate_route_plan`] accepts. Only gfx1100 carries them here: the gfx1201 slab images are
-/// untouched, and every other supported arch has none. The `_acc` qualification twins are never
-/// listed. Unknown arches are refused.
+/// [`validate_route_plan`] accepts. gfx1100 includes narrow/t8 K1 exports in
+/// each admitted image; gfx1201/gfx1151 keep their runtime-managed preload.
+/// Qualification twins are never listed. Unknown arches are refused.
 ///
 /// gfx1100 `cold_codec == 0` (no cold bucket, MQ4-only) lists the hot K1, the MQ4 K2, K3 and the
 /// mask only: no E8P module. `cold_codec == 3` (E8P) additionally lists the cold K1 and the E8P
@@ -5752,7 +5748,11 @@ pub fn slab_embedded_entries(
                 panic!("gfx1100 embedded tile mask");
             };
             let mut plan = vec![
-                embedded(slab.mq4_k1.module, slab.mq4_k1.image, &slab.mq4_k1.symbols),
+                embedded(
+                    slab.mq4_k1.module,
+                    slab.mq4_k1.image,
+                    &SLAB_GFX1100_K1_SYMBOLS,
+                ),
                 embedded(k2_mq4.module, k2_mq4.image, &k2_mq4.entries),
                 embedded(k3_module, k3_image, &SLAB_GFX1100_K3_SYMBOLS),
                 embedded(mask_module, mask_image, &SLAB_GFX1100_MASK_SYMBOLS),
@@ -5766,8 +5766,15 @@ pub fn slab_embedded_entries(
                 let cold =
                     crate::slab_moe::slab_cold_kernels(arch, cold_codec).ok_or_else(refused)?;
                 let k2_cold = crate::gemm::slab_k2_entry(arch, cold_codec).ok_or_else(refused)?;
-                plan.push(embedded(cold.k1.module, cold.k1.image, &cold.k1.symbols));
+                plan.push(embedded(
+                    cold.k1.module,
+                    cold.k1.image,
+                    &SLAB_GFX1100_E8P_K1_SYMBOLS,
+                ));
                 plan.push(embedded(k2_cold.module, k2_cold.image, &k2_cold.entries));
+            }
+            if WideTwinFamily::K1.enabled() {
+                plan.push(rowtile_planner_entry(arch).expect("gfx1100 rowtile planner"));
             }
             Ok(plan)
         }
@@ -7412,6 +7419,47 @@ fn walked_embedded_image(
     module: &'static str,
     sha256: &str,
 ) -> Option<(&'static str, &'static [u8], Option<&'static str>)> {
+    if let Some((_, name, image, _, _)) = legacy_mq4_rowtile_image(arch) {
+        if name == module {
+            return Some((name, image, None));
+        }
+    }
+    if let Some((name, image)) = crate::slab_moe::slab_rowtile_planner(arch) {
+        if name == module {
+            return Some((name, image, None));
+        }
+    }
+    if arch == "gfx1151" {
+        for (name, image) in [
+            ("qwen4_lane_rows_pm", kernels::QWEN4_LANE_ROWS_PM_GFX1151),
+            (
+                crate::gemv::BF16_ROWS_WIDE_PM_MODULE,
+                kernels::BF16_ROWS_WIDE_PM_GFX1151,
+            ),
+            ("mq4_rows_x4_pm_gfx1151", kernels::MQ4_ROWS_X4_PM_GFX1151),
+        ] {
+            if name == module {
+                return Some((name, image, None));
+            }
+        }
+    }
+    if arch == "gfx1100" {
+        for (name, image) in [
+            ("mq4_rows_x4_pm_gfx1100", kernels::MQ4_ROWS_X4_PM_GFX1100),
+            (
+                "bf16_rows_wide_pm_gfx1100",
+                kernels::BF16_ROWS_WIDE_PM_GFX1100,
+            ),
+            (
+                "qwen4_lane_rows_pm_gfx1100",
+                kernels::QWEN4_LANE_ROWS_PM_GFX1100,
+            ),
+        ] {
+            if name == module {
+                return Some((name, image, None));
+            }
+        }
+    }
     if arch == "gfx1201" {
         if let Some(twin) = crate::pm_decode_twins::GFX1201_TWINS
             .iter()
@@ -7443,6 +7491,14 @@ fn walked_embedded_image(
             ),
             ("qsa_gather_pm_gfx1201", kernels::QSA_GATHER_PM_GFX1201),
             ("mq4_rows_x4_pm_gfx1201", kernels::MQ4_ROWS_X4_PM_GFX1201),
+            (
+                "lane_rows_mq6_pm_gfx1201",
+                kernels::LANE_ROWS_MQ6_PM_GFX1201,
+            ),
+            (
+                "lane_rows_bf16_pm_gfx1201",
+                kernels::LANE_ROWS_BF16_PM_GFX1201,
+            ),
         ];
         if let Some(&(name, image)) = QWEN4_GFX1201.iter().find(|(name, _)| *name == module) {
             return Some((name, image, None));
@@ -7605,7 +7661,7 @@ fn walked_route_entries_in(
             scheduler_profile: found.scheduler_profile.clone(),
         }));
     }
-    add_wide_twin_entries(input.arch, &inventory, &mut planned)?;
+    add_wide_twin_entries(input.arch, &mut planned);
     let seal = if plan
         .sealed
         .contains(&if native_mtp { "native_mtp" } else { "ar" })
@@ -7617,62 +7673,36 @@ fn walked_route_entries_in(
     Ok(Some((RouteKernelPlan { entries: planned }, seal)))
 }
 
-// ── S2 exact-wide verify twins ──────────────────────────────────────────
+// ── Exact-wide fixed-eight-row PM tiles ─────────────────────────────────
 //
-// The walked plan above is generated with every `gemv::WideTwinFamily`
-// switch off. With a family's developer switch on (default off, read once)
-// the wide entries its launchers bind are added to the closed route here, so
-// a sealed route never refuses them: the HIP modules gain the wide symbols
-// (or the module joins the route from the installer inventory when the walk
-// never bound it) and the MQ4 PM image gains its `_wide_r{16,32}` symbols.
-// K1 (`mq_i4_moe_gemv_pm_<arch>` `_c16/_c32`) is planned by `slab_moe.rs`.
+// Walks record the narrow route. Developer-family switches add only the
+// fixed-t8 PM exports below; singleton and narrow HIP recipes stay intact.
+// K1 tiles are projected by `slab_embedded_entries` and `slab_moe.rs`.
 
 use crate::gemv::WideTwinFamily;
 
-/// HIP modules that carry wide twins, with the symbols their launchers bind.
-const WIDE_TWIN_HIP: &[(WideTwinFamily, &str, &[&str])] = &[
-    (
-        WideTwinFamily::Mq6,
-        "gemm_mq6g256v2_f32_rows",
-        &[
-            "gemm_mq6g256v2_f32_rows_wide_r16",
-            "gemm_mq6g256v2_f32_rows_wide_r32",
-            "gemm_mq6g256v2_f32_rows_x4_wide_r16",
-            "gemm_mq6g256v2_f32_rows_x4_wide_r32",
-        ],
-    ),
-    (
-        WideTwinFamily::Bf16,
-        "qwen4_gemv_bf16_xf32",
-        &[
-            "gemv_bf16_xf32_x4_rows_wide_r16",
-            "gemv_bf16_xf32_x4_rows_wide_r32",
-            "gemv_bf16_xf32_k4_rows_wide_r16",
-            "gemv_bf16_xf32_k4_rows_wide_r32",
-        ],
-    ),
-    (
-        WideTwinFamily::Q8,
-        "qwen4_gemv_q8_0",
-        &[
-            "gemv_q8_0_k2560_staged_rows_wide_r16",
-            "gemv_q8_0_k2560_staged_rows_wide_r32",
-            "gemv_q8_0_k320_staged_rows_wide_r16",
-            "gemv_q8_0_k320_staged_rows_wide_r32",
-            "gemv_q8_0_k2560_staged_rows_x2_wide_r16",
-            "gemv_q8_0_k2560_staged_rows_x2_wide_r32",
-            "gemv_q8_0_k8_rows_wide_r16",
-            "gemv_q8_0_k8_rows_wide_r32",
-        ],
-    ),
-    (
-        WideTwinFamily::Q8,
-        "qwen4_gemv_q8_0_wide",
-        &[
-            "gemv_q8_0_wide_rows_wide_r16",
-            "gemv_q8_0_wide_rows_wide_r32",
-        ],
-    ),
+const MQ6_GFX1201_ROWTILE_SYMBOLS: [&str; 2] = [
+    "gemv_mq6g256v2_rows_t8_pm_gfx1201",
+    "gemv_mq6g256v2_rows_x4_t8_pm_gfx1201",
+];
+const BF16_GFX1201_ROWTILE_SYMBOLS: [&str; 2] = [
+    "gemv_bf16_xf32_rows_x4_t8_pm_gfx1201",
+    "gemv_bf16_xf32_k4_rows_t8_pm_gfx1201",
+];
+const MQ6_GFX1100_ROWTILE_SYMBOLS: [&str; 2] = [
+    "gemv_mq6g256v2_rows_t8_pm_gfx1100",
+    "gemv_mq6g256v2_rows_x4_t8_pm_gfx1100",
+];
+const BF16_GFX1100_ROWTILE_SYMBOLS: [&str; 2] = [
+    "gemv_bf16_xf32_rows_x4_t8_pm_gfx1100",
+    "gemv_bf16_xf32_k4_rows_t8_pm_gfx1100",
+];
+const Q8_GFX1100_ROWTILE_SYMBOLS: [&str; 5] = [
+    "gemv_q8_0_k8_rows_t8_pm_gfx1100",
+    "gemv_q8_0_k320_rows_t8_pm_gfx1100",
+    "gemv_q8_0_k2560_rows_t8_pm_gfx1100",
+    "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1100",
+    "gemv_q8_0_wide_rows_t8_pm_gfx1100",
 ];
 
 /// The MQ4 PM image of `arch`: merge-cell slot, module, image and wide symbols.
@@ -7684,18 +7714,54 @@ fn wide_twin_mq4_image(
             0,
             "mq4_rows_x4_pm_gfx1151",
             kernels::MQ4_ROWS_X4_PM_GFX1151,
-            &[
-                "gemv_mq4g256v2_rows_x4_wide_r16_pm_gfx1151",
-                "gemv_mq4g256v2_rows_x4_wide_r32_pm_gfx1151",
-            ],
+            &["gemv_mq4g256v2_rows_x4_t8_pm_gfx1151"],
         )),
         "gfx1201" => Some((
             1,
             "mq4_rows_x4_pm_gfx1201",
             kernels::MQ4_ROWS_X4_PM_GFX1201,
+            &["gemv_mq4g256v2_rows_x4_t8_pm_gfx1201"],
+        )),
+        "gfx1100" => Some((
+            2,
+            "mq4_rows_x4_pm_gfx1100",
+            kernels::MQ4_ROWS_X4_PM_GFX1100,
+            &["gemv_mq4g256v2_rows_x4_t8_pm_gfx1100"],
+        )),
+        _ => None,
+    }
+}
+
+/// The representation-specific legacy GU/Down image and its actual exports.
+/// This does not admit a shape, change AR, or grant a qualified width.
+pub(crate) fn legacy_mq4_rowtile_image(
+    arch: &str,
+) -> Option<(
+    usize,
+    &'static str,
+    &'static [u8],
+    &'static str,
+    &'static [&'static str],
+)> {
+    match arch {
+        "gfx1151" => Some((
+            0,
+            "legacy_mq4_rowtiles_pm_gfx1151",
+            kernels::LEGACY_MQ4_ROWTILES_PM_GFX1151,
+            kernels::LEGACY_MQ4_ROWTILES_PM_GFX1151_SHA256,
             &[
-                "gemv_mq4g256v2_rows_x4_wide_r16_pm_gfx1201",
-                "gemv_mq4g256v2_rows_x4_wide_r32_pm_gfx1201",
+                "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched_t8_pm_gfx1151",
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1151",
+            ],
+        )),
+        "gfx1201" => Some((
+            1,
+            "legacy_mq4_rowtiles_pm_gfx1201",
+            kernels::LEGACY_MQ4_ROWTILES_PM_GFX1201,
+            kernels::LEGACY_MQ4_ROWTILES_PM_GFX1201_SHA256,
+            &[
+                "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched_t8_pm_gfx1201",
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1201",
             ],
         )),
         _ => None,
@@ -7721,27 +7787,15 @@ fn with_wide_twin_symbols(
     })
 }
 
-/// Merged symbol lists of [`add_wide_twin_entries`]: one cell per
-/// [`WIDE_TWIN_HIP`] row and one per MQ4 image arch.
-static WIDE_TWIN_HIP_MERGED: [std::sync::OnceLock<Vec<&'static str>>; WIDE_TWIN_HIP.len()] =
-    [const { std::sync::OnceLock::new() }; WIDE_TWIN_HIP.len()];
-static WIDE_TWIN_MQ4_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 2] =
+/// Merged symbols retain every narrow export already selected by the walk.
+static WIDE_TWIN_MQ4_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 3] =
+    [const { std::sync::OnceLock::new() }; 3];
+/// gfx1151 lane/BF16, gfx1201 MQ6/BF16 and gfx1100 lane/BF16 PM modules.
+static WIDE_TWIN_PM_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 6] =
+    [const { std::sync::OnceLock::new() }; 6];
+/// Initialization merges the runtime walked symbol list, not a fixed list.
+static LEGACY_MQ4_ROWTILE_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 2] =
     [const { std::sync::OnceLock::new() }; 2];
-/// Merged lists of the gfx1151 PM modules: `qwen4_lane_rows_pm`, `bf16_rows_wide_pm_gfx1151`.
-static WIDE_TWIN_PM_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 2] =
-    [const { std::sync::OnceLock::new() }; 2];
-/// The `qwen4_lane_rows_pm` wide exports of the switched-on MQ6 / Q8 families.
-static LANE_ROWS_WIDE_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
-    std::sync::LazyLock::new(|| {
-        let mut symbols = Vec::new();
-        if WideTwinFamily::Mq6.enabled() {
-            symbols.extend(crate::lane_rows_pm::MQ6_WIDE_SYMBOLS);
-        }
-        if WideTwinFamily::Q8.enabled() {
-            symbols.extend(crate::lane_rows_pm::Q8_WIDE_SYMBOLS);
-        }
-        symbols
-    });
 
 /// Add `extra` to the embedded `module`'s planned symbols, or plan the module.
 fn plan_wide_embedded(
@@ -7769,63 +7823,56 @@ fn plan_wide_embedded(
     }
 }
 
-/// Add the wide-twin entries of every switched-on family to a walked route.
-fn add_wide_twin_entries(
+/// Add the PM row tiles of every switched-on family to a walked route.
+fn add_wide_twin_entries(arch: &str, planned: &mut Vec<PlannedKernel>) {
+    add_rowtile_entries(arch, planned, |family| family.enabled());
+}
+
+fn add_rowtile_entries(
     arch: &str,
-    inventory: &[KernelEntry],
     planned: &mut Vec<PlannedKernel>,
-) -> Result<(), RegistryError> {
-    if !matches!(arch, "gfx1151" | "gfx1201") {
-        return Ok(());
-    }
-    for (slot, &(family, module, extra)) in WIDE_TWIN_HIP.iter().enumerate() {
-        if !family.enabled() {
-            continue;
-        }
-        let present = planned
-            .iter()
-            .position(|entry| matches!(entry, PlannedKernel::Hip(hip) if hip.module == module));
-        if let Some(index) = present {
-            if let PlannedKernel::Hip(hip) = &mut planned[index] {
-                hip.symbols =
-                    with_wide_twin_symbols(&WIDE_TWIN_HIP_MERGED[slot], hip.symbols, extra);
+    enabled: impl Fn(WideTwinFamily) -> bool,
+) {
+    if enabled(WideTwinFamily::K1) {
+        if let Some(entry) = rowtile_planner_entry(arch) {
+            if !planned
+                .iter()
+                .any(|existing| existing.module() == entry.module())
+            {
+                planned.push(entry);
             }
-            continue;
         }
-        let mut matches = inventory.iter().filter(|entry| entry.module == module);
-        let found = matches
-            .next()
-            .ok_or_else(|| RegistryError::UnsupportedModule {
-                arch: arch.to_owned(),
-                module: module.to_owned(),
-            })?;
-        if matches.next().is_some() {
-            return Err(RegistryError::ConflictingPlan(format!(
-                "module {module} has two registry recipes"
-            )));
-        }
-        if let Some(symbol) = extra.iter().find(|symbol| !found.symbols.contains(symbol)) {
-            return Err(RegistryError::ConflictingPlan(format!(
-                "packaged {module} does not export wide symbol {symbol}"
-            )));
-        }
-        planned.push(PlannedKernel::Hip(KernelEntry {
-            arch: found.arch,
-            module: found.module,
-            symbols: extra,
-            source: found.source.clone(),
-            flags: found.flags.clone(),
-            scheduler_profile: found.scheduler_profile.clone(),
-        }));
     }
-    if WideTwinFamily::Mq4.enabled() {
+    if enabled(WideTwinFamily::Mq4) {
         if let Some((slot, module, image, extra)) = wide_twin_mq4_image(arch) {
             plan_wide_embedded(planned, &WIDE_TWIN_MQ4_MERGED[slot], module, image, extra);
         }
+        if let Some((slot, module, image, _, symbols)) = legacy_mq4_rowtile_image(arch) {
+            plan_wide_embedded(
+                planned,
+                &LEGACY_MQ4_ROWTILE_MERGED[slot],
+                module,
+                image,
+                symbols,
+            );
+        }
     }
     if arch == "gfx1151" {
-        // PM primary on gfx1151: the lane-rows module (MQ6, Q8) and the BF16 wide module.
-        let lane = std::sync::LazyLock::force(&LANE_ROWS_WIDE_SYMBOLS).as_slice();
+        // The two families share one image; cache each enabled combination.
+        static LANE_SYMBOLS: std::sync::LazyLock<[Vec<&str>; 4]> = std::sync::LazyLock::new(|| {
+            [
+                Vec::new(),
+                crate::lane_rows_pm::MQ6_WIDE_SYMBOLS.to_vec(),
+                crate::lane_rows_pm::Q8_WIDE_SYMBOLS.to_vec(),
+                crate::lane_rows_pm::MQ6_WIDE_SYMBOLS
+                    .into_iter()
+                    .chain(crate::lane_rows_pm::Q8_WIDE_SYMBOLS)
+                    .collect(),
+            ]
+        });
+        let mq6 = enabled(WideTwinFamily::Mq6);
+        let q8 = enabled(WideTwinFamily::Q8);
+        let lane = LANE_SYMBOLS[usize::from(mq6) | (usize::from(q8) << 1)].as_slice();
         if !lane.is_empty() {
             plan_wide_embedded(
                 planned,
@@ -7835,7 +7882,7 @@ fn add_wide_twin_entries(
                 lane,
             );
         }
-        if WideTwinFamily::Bf16.enabled() {
+        if enabled(WideTwinFamily::Bf16) {
             plan_wide_embedded(
                 planned,
                 &WIDE_TWIN_PM_MERGED[1],
@@ -7844,8 +7891,82 @@ fn add_wide_twin_entries(
                 &crate::gemv::BF16_ROWS_WIDE_PM_SYMBOLS,
             );
         }
+    } else if arch == "gfx1201" {
+        for (family, slot, module, image, symbols) in [
+            (
+                WideTwinFamily::Mq6,
+                2,
+                "lane_rows_mq6_pm_gfx1201",
+                kernels::LANE_ROWS_MQ6_PM_GFX1201,
+                MQ6_GFX1201_ROWTILE_SYMBOLS.as_slice(),
+            ),
+            (
+                WideTwinFamily::Bf16,
+                3,
+                "lane_rows_bf16_pm_gfx1201",
+                kernels::LANE_ROWS_BF16_PM_GFX1201,
+                BF16_GFX1201_ROWTILE_SYMBOLS.as_slice(),
+            ),
+        ] {
+            if enabled(family) {
+                plan_wide_embedded(planned, &WIDE_TWIN_PM_MERGED[slot], module, image, symbols);
+            }
+        }
+    } else if arch == "gfx1100" {
+        static LANE_SYMBOLS: std::sync::LazyLock<[Vec<&str>; 4]> = std::sync::LazyLock::new(|| {
+            [
+                Vec::new(),
+                MQ6_GFX1100_ROWTILE_SYMBOLS.to_vec(),
+                Q8_GFX1100_ROWTILE_SYMBOLS.to_vec(),
+                MQ6_GFX1100_ROWTILE_SYMBOLS
+                    .into_iter()
+                    .chain(Q8_GFX1100_ROWTILE_SYMBOLS)
+                    .collect(),
+            ]
+        });
+        let mq6 = enabled(WideTwinFamily::Mq6);
+        let q8 = enabled(WideTwinFamily::Q8);
+        let lane = LANE_SYMBOLS[usize::from(mq6) | (usize::from(q8) << 1)].as_slice();
+        if !lane.is_empty() {
+            plan_wide_embedded(
+                planned,
+                &WIDE_TWIN_PM_MERGED[4],
+                "qwen4_lane_rows_pm_gfx1100",
+                kernels::QWEN4_LANE_ROWS_PM_GFX1100,
+                lane,
+            );
+        }
+        if enabled(WideTwinFamily::Bf16) {
+            plan_wide_embedded(
+                planned,
+                &WIDE_TWIN_PM_MERGED[5],
+                "bf16_rows_wide_pm_gfx1100",
+                kernels::BF16_ROWS_WIDE_PM_GFX1100,
+                &BF16_GFX1100_ROWTILE_SYMBOLS,
+            );
+        }
     }
-    Ok(())
+}
+
+fn rowtile_planner_entry(arch: &str) -> Option<PlannedKernel> {
+    static SYMBOLS: [&[&str]; 3] = [
+        &["qwen4_slab_union_plan_t8_pm_gfx1151"],
+        &["qwen4_slab_union_plan_t8_pm_gfx1201"],
+        &["qwen4_slab_union_plan_t8_pm_gfx1100"],
+    ];
+    let slot = match arch {
+        "gfx1151" => 0,
+        "gfx1201" => 1,
+        "gfx1100" => 2,
+        _ => return None,
+    };
+    let (module, image) = crate::slab_moe::slab_rowtile_planner(arch)?;
+    Some(PlannedKernel::Embedded {
+        module,
+        image,
+        radiowave_json: None,
+        symbols: SYMBOLS[slot],
+    })
 }
 
 #[cfg(test)]
@@ -8123,25 +8244,34 @@ mod tests {
         let e8p = RouteKernelPlan {
             entries: slab_embedded_entries("gfx1100", 3).unwrap(),
         };
-        let mq4_modules = [
+        let mut mq4_modules = vec![
             "mq_i4_moe_gemv_mq4only_pm_gfx1100",
             "qwen4_moe_iu4_sym_pm_gfx1100",
             "mq_i4_a4_pm_gfx1100",
             "ep_tile_mask_pm_gfx1100",
         ];
+        let planner_count = usize::from(WideTwinFamily::K1.enabled());
+        if planner_count != 0 {
+            mq4_modules.push("qwen4_slab_union_plan_t8_pm_gfx1100");
+        }
         for (plan, expected, expected_symbols) in [
-            (&mq4_only, mq4_modules.to_vec(), 2 + 2 + 1 + 1),
+            (
+                &mq4_only,
+                mq4_modules.clone(),
+                4 + 2 + 1 + 1 + planner_count,
+            ),
             (
                 &e8p,
                 [
-                    mq4_modules.as_slice(),
+                    &mq4_modules[..4],
                     &[
                         "e8p_i4_moe_gemv_pm_gfx1100",
                         "qwen4_moe_iu4_sym_e8p_pm_gfx1100",
                     ],
+                    &mq4_modules[4..],
                 ]
                 .concat(),
-                2 + 2 + 1 + 1 + 2 + 2,
+                4 + 2 + 1 + 1 + 4 + 2 + planner_count,
             ),
         ] {
             validate_route_plan(plan).unwrap();
@@ -8194,6 +8324,7 @@ mod tests {
         // The E8P layer's exact cold entries: K1 (R256 gate/up, R128 down) and the K2 NT1 pair.
         let cold_symbols: Vec<_> = e8p.entries[4..]
             .iter()
+            .take(2)
             .flat_map(|p| p.symbols().iter().copied())
             .collect();
         assert_eq!(
@@ -8201,6 +8332,8 @@ mod tests {
             [
                 "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100",
                 "e8p_i4_moe_gemv_r128_down_pm_gfx1100",
+                "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100_t8",
+                "e8p_i4_moe_gemv_r128_down_pm_gfx1100_t8",
                 "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1100",
                 "qwen4_moe_down_iu4_sym_e8p_pm_gfx1100",
             ]
@@ -8430,6 +8563,8 @@ mod tests {
         group: u32,
         private: u32,
         kernarg: u32,
+        block: u32,
+        wave: u32,
         args: Vec<(String, u64, u64, String)>,
     }
 
@@ -8446,6 +8581,8 @@ mod tests {
                     group: k.get(".group_segment_fixed_size").uint() as u32,
                     private: k.get(".private_segment_fixed_size").uint() as u32,
                     kernarg: k.get(".kernarg_segment_size").uint() as u32,
+                    block: k.get(".max_flat_workgroup_size").uint() as u32,
+                    wave: k.get(".wavefront_size").uint() as u32,
                     args: k
                         .get(".args")
                         .arr()
@@ -8542,67 +8679,691 @@ mod tests {
         sorted(abis.iter().map(|(name, _)| name.clone()))
     }
 
+    const ROWTILE_X4_KERNARG: [(&str, u64, u64, &str); 15] = [
+        ("A0", 0, 8, "global_buffer"),
+        ("A1", 8, 8, "global_buffer"),
+        ("A2", 16, 8, "global_buffer"),
+        ("A3", 24, 8, "global_buffer"),
+        ("x", 32, 8, "global_buffer"),
+        ("y0", 40, 8, "global_buffer"),
+        ("y1", 48, 8, "global_buffer"),
+        ("y2", 56, 8, "global_buffer"),
+        ("y3", 64, 8, "global_buffer"),
+        ("M0", 72, 4, "by_value"),
+        ("M1", 76, 4, "by_value"),
+        ("M2", 80, 4, "by_value"),
+        ("M3", 84, 4, "by_value"),
+        ("K", 88, 4, "by_value"),
+        ("R", 92, 4, "by_value"),
+    ];
+    const ROWTILE_SINGLE_KERNARG: [(&str, u64, u64, &str); 6] = [
+        ("A", 0, 8, "global_buffer"),
+        ("x", 8, 8, "global_buffer"),
+        ("y", 16, 8, "global_buffer"),
+        ("M", 24, 4, "by_value"),
+        ("K", 28, 4, "by_value"),
+        ("R", 32, 4, "by_value"),
+    ];
+    const ROWTILE_HC_KERNARG: [(&str, u64, u64, &str); 8] = [
+        ("W", 0, 8, "global_buffer"),
+        ("X", 8, 8, "global_buffer"),
+        ("Y", 16, 8, "global_buffer"),
+        ("M", 24, 4, "by_value"),
+        ("K", 28, 4, "by_value"),
+        ("scale", 32, 4, "by_value"),
+        ("hc_act", 36, 4, "by_value"),
+        ("R", 40, 4, "by_value"),
+    ];
+
+    fn assert_rowtile_abi(
+        image: &[u8],
+        symbol: &str,
+        bytes: u32,
+        expected: &[(&str, u64, u64, &str)],
+        block: u32,
+        lds: u32,
+    ) {
+        let abis = image_kernel_abis(image);
+        let (_, abi) = abis
+            .iter()
+            .find(|(name, _)| name == symbol)
+            .unwrap_or_else(|| panic!("{symbol}: missing PM export"));
+        assert_eq!(
+            (abi.kernarg, abi.private, abi.block, abi.wave, abi.group),
+            (bytes, 0, block, 32, lds),
+            "{symbol}: ABI/launch geometry"
+        );
+        let got: Vec<_> = abi
+            .args
+            .iter()
+            .map(|(n, o, s, k)| (n.as_str(), *o, *s, k.as_str()))
+            .collect();
+        assert_eq!(got, expected, "{symbol}: exact kernarg layout");
+    }
+
+    #[test]
+    fn rowtile_projection_images_pin_abi_exports_and_physical_geometry() {
+        for (arch, mq6, mq6_symbols, bf16, bf16_symbols, mq4) in [
+            (
+                "gfx1151",
+                kernels::QWEN4_LANE_ROWS_PM_GFX1151,
+                &crate::lane_rows_pm::MQ6_WIDE_SYMBOLS,
+                kernels::BF16_ROWS_WIDE_PM_GFX1151,
+                &crate::gemv::BF16_ROWS_WIDE_PM_SYMBOLS,
+                kernels::MQ4_ROWS_X4_PM_GFX1151,
+            ),
+            (
+                "gfx1201",
+                kernels::LANE_ROWS_MQ6_PM_GFX1201,
+                &MQ6_GFX1201_ROWTILE_SYMBOLS,
+                kernels::LANE_ROWS_BF16_PM_GFX1201,
+                &BF16_GFX1201_ROWTILE_SYMBOLS,
+                kernels::MQ4_ROWS_X4_PM_GFX1201,
+            ),
+        ] {
+            // The runtime count's metadata name is historically C on gfx1201.
+            let mut single = ROWTILE_SINGLE_KERNARG;
+            let mut x4 = ROWTILE_X4_KERNARG;
+            let mut hc = ROWTILE_HC_KERNARG;
+            if arch == "gfx1201" {
+                single[5].0 = "C";
+                x4[14].0 = "C";
+                hc[7].0 = "C";
+            }
+            assert_rowtile_abi(mq6, mq6_symbols[0], 36, &single, 256, 8192);
+            assert_rowtile_abi(mq6, mq6_symbols[1], 96, &x4, 256, 8192);
+            assert_rowtile_abi(bf16, bf16_symbols[0], 96, &x4, 32, 0);
+            assert_rowtile_abi(bf16, bf16_symbols[1], 48, &hc, 128, 128);
+            let (_, _, _, symbols) = wide_twin_mq4_image(arch).unwrap();
+            assert_eq!(symbols.len(), 1);
+            assert_rowtile_abi(mq4, symbols[0], 96, &ROWTILE_X4_KERNARG, 32, 0);
+            let mq4_names = kernel_names(&image_kernel_abis(mq4));
+            assert_eq!(
+                mq4_names,
+                sorted([
+                    format!("gemv_mq4g256v2_rows_x4_pm_{arch}"),
+                    format!("gemv_mq4g256v2_rows_x4_t8_pm_{arch}"),
+                ])
+            );
+            for image in [mq6, bf16, mq4] {
+                let meta = amdgpu_metadata(amdgcn_elf(image));
+                assert!(meta.get("amdhsa.target").str().ends_with(arch));
+                assert!(image_kernel_abis(image)
+                    .iter()
+                    .all(|(name, _)| !name.contains("wide_r16") && !name.contains("wide_r32")));
+            }
+        }
+        // Narrow PM entries remain available alongside Halo's fixed tiles.
+        let halo = kernel_names(&image_kernel_abis(kernels::QWEN4_LANE_ROWS_PM_GFX1151));
+        for narrow in [
+            "gemv_mq6g256v2_xbatch_pm",
+            "gemv_mq6g256v2_x4_xbatch_pm",
+            "gemv_q8_0_k8_xbatch_pm",
+            "gemv_q8_0_k320_xbatch_pm",
+        ] {
+            assert!(
+                halo.iter().any(|name| name == narrow),
+                "{narrow}: narrow export lost"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_mq4_rowtile_images_pin_each_projection_abi() {
+        let gu = [
+            ("expert_ptrs", 0, 8, "global_buffer"),
+            ("topk_indices", 8, 8, "global_buffer"),
+            ("x", 16, 8, "global_buffer"),
+            ("y_gate", 24, 8, "global_buffer"),
+            ("y_up", 32, 8, "global_buffer"),
+            ("M", 40, 4, "by_value"),
+            ("K_TOP", 44, 4, "by_value"),
+            ("n_experts", 48, 4, "by_value"),
+            ("R", 52, 4, "by_value"),
+        ];
+        let down = [
+            ("expert_ptrs", 0, 8, "global_buffer"),
+            ("topk_indices", 8, 8, "global_buffer"),
+            ("hidden_batch", 16, 8, "global_buffer"),
+            ("expert_outputs", 24, 8, "global_buffer"),
+            ("M", 32, 4, "by_value"),
+            ("K", 36, 4, "by_value"),
+            ("N", 40, 4, "by_value"),
+            ("n_exp", 44, 4, "by_value"),
+            ("k_top", 48, 4, "by_value"),
+        ];
+        for arch in ["gfx1151", "gfx1201"] {
+            let (_, _, image, _, symbols) = legacy_mq4_rowtile_image(arch).unwrap();
+            assert_eq!(symbols.len(), 2);
+            assert_rowtile_abi(image, symbols[0], 56, &gu, 256, 10240);
+            assert_rowtile_abi(image, symbols[1], 52, &down, 32, 0);
+            assert_eq!(
+                kernel_names(&image_kernel_abis(image)),
+                sorted(symbols.iter().map(|symbol| symbol.to_string()))
+            );
+            assert!(amdgpu_metadata(amdgcn_elf(image))
+                .get("amdhsa.target")
+                .str()
+                .ends_with(arch));
+        }
+    }
+
+    #[test]
+    fn gfx1100_mq4_rowtile_image_is_the_scalar_only_recipe() {
+        let (_, module, image, symbols) = wide_twin_mq4_image("gfx1100").unwrap();
+        assert_eq!(module, "mq4_rows_x4_pm_gfx1100");
+        assert_eq!(symbols, ["gemv_mq4g256v2_rows_x4_t8_pm_gfx1100"]);
+        assert_eq!(
+            kernel_names(&image_kernel_abis(image)),
+            symbols
+                .iter()
+                .map(|symbol| symbol.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_rowtile_abi(image, symbols[0], 96, &ROWTILE_X4_KERNARG, 32, 0);
+        assert!(amdgpu_metadata(amdgcn_elf(image))
+            .get("amdhsa.target")
+            .str()
+            .ends_with("gfx1100"));
+    }
+
+    #[test]
+    fn gfx1100_mq6_and_bf16_rowtile_images_pin_their_actual_abis() {
+        let mq6 = kernels::QWEN4_LANE_ROWS_PM_GFX1100;
+        assert_rowtile_abi(
+            mq6,
+            MQ6_GFX1100_ROWTILE_SYMBOLS[0],
+            36,
+            &ROWTILE_SINGLE_KERNARG,
+            256,
+            8192,
+        );
+        assert_rowtile_abi(
+            mq6,
+            MQ6_GFX1100_ROWTILE_SYMBOLS[1],
+            96,
+            &ROWTILE_X4_KERNARG,
+            256,
+            8192,
+        );
+        let bf16 = kernels::BF16_ROWS_WIDE_PM_GFX1100;
+        assert_rowtile_abi(
+            bf16,
+            BF16_GFX1100_ROWTILE_SYMBOLS[0],
+            96,
+            &ROWTILE_X4_KERNARG,
+            32,
+            0,
+        );
+        assert_rowtile_abi(
+            bf16,
+            BF16_GFX1100_ROWTILE_SYMBOLS[1],
+            48,
+            &ROWTILE_HC_KERNARG,
+            128,
+            128,
+        );
+        assert_eq!(
+            kernel_names(&image_kernel_abis(bf16)),
+            sorted(BF16_GFX1100_ROWTILE_SYMBOLS.into_iter().map(str::to_owned))
+        );
+        for image in [mq6, bf16] {
+            assert!(amdgpu_metadata(amdgcn_elf(image))
+                .get("amdhsa.target")
+                .str()
+                .ends_with("gfx1100"));
+            assert!(image_kernel_abis(image)
+                .iter()
+                .all(|(name, _)| !name.contains("wide_r16") && !name.contains("wide_r32")));
+        }
+        assert_ne!(mq6, kernels::QWEN4_LANE_ROWS_PM_GFX1151);
+        assert_ne!(bf16, kernels::BF16_ROWS_WIDE_PM_GFX1151);
+    }
+
+    #[test]
+    fn q8_rowtile_images_preserve_all_five_recipe_abis() {
+        let halo_symbols = [
+            crate::lane_rows_pm::Q8_K8_ROWTILE,
+            crate::lane_rows_pm::Q8_K320_ROWTILE,
+            crate::lane_rows_pm::Q8_K2560_ROWTILE,
+            crate::lane_rows_pm::Q8_K2560_X2_ROWTILE,
+            crate::lane_rows_pm::Q8_SMALL_ROWTILE,
+        ];
+        assert_eq!(crate::lane_rows_pm::Q8_WIDE_SYMBOLS.len(), 5);
+        let mut k8 = ROWTILE_SINGLE_KERNARG.to_vec();
+        k8.extend([("scale", 36, 4, "by_value"), ("hc_act", 40, 4, "by_value")]);
+        let x2 = [
+            ("A0", 0, 8, "global_buffer"),
+            ("A1", 8, 8, "global_buffer"),
+            ("x", 16, 8, "global_buffer"),
+            ("y0", 24, 8, "global_buffer"),
+            ("y1", 32, 8, "global_buffer"),
+            ("M0", 40, 4, "by_value"),
+            ("M1", 44, 4, "by_value"),
+            ("K", 48, 4, "by_value"),
+            ("R", 52, 4, "by_value"),
+        ];
+        for (arch, image, symbols) in [
+            ("gfx1151", kernels::QWEN4_LANE_ROWS_PM_GFX1151, halo_symbols),
+            (
+                "gfx1100",
+                kernels::QWEN4_LANE_ROWS_PM_GFX1100,
+                Q8_GFX1100_ROWTILE_SYMBOLS,
+            ),
+        ] {
+            assert_rowtile_abi(image, symbols[0], 44, &k8, 512, 16384);
+            for symbol in [symbols[1], symbols[2], symbols[4]] {
+                assert_rowtile_abi(image, symbol, 36, &ROWTILE_SINGLE_KERNARG, 256, 8192);
+            }
+            assert_rowtile_abi(image, symbols[3], 56, &x2, 256, 8192);
+            if arch == "gfx1100" {
+                // The supplemental image contains only genuine tile exports.
+                assert_eq!(
+                    kernel_names(&image_kernel_abis(image)),
+                    sorted(
+                        MQ6_GFX1100_ROWTILE_SYMBOLS
+                            .into_iter()
+                            .chain(Q8_GFX1100_ROWTILE_SYMBOLS)
+                            .map(str::to_owned)
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rowtile_planner_images_pin_logical36_segment40_and_geometry() {
+        let args = [
+            ("topk", 0, 8, "global_buffer"),
+            ("codec", 8, 8, "global_buffer"),
+            ("out", 16, 8, "global_buffer"),
+            ("rows", 24, 4, "by_value"),
+            ("uniform_bucket", 28, 4, "by_value"),
+            ("n_experts", 32, 4, "by_value"),
+        ];
+        let mut images = Vec::new();
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            let PlannedKernel::Embedded {
+                module,
+                image,
+                symbols,
+                ..
+            } = rowtile_planner_entry(arch).unwrap()
+            else {
+                panic!("HIP planner")
+            };
+            assert_eq!(symbols, [module]);
+            assert_eq!(module, format!("qwen4_slab_union_plan_t8_pm_{arch}"));
+            let abis = assert_kernarg_abi(module, image, 40, &args);
+            assert_eq!(kernel_names(&abis), [module.to_owned()]);
+            assert_rowtile_abi(image, module, 40, &args, 128, 1280);
+            let last = abis[0].1.args.last().unwrap();
+            assert_eq!(last.1 + last.2, 36, "{arch}: logical kernarg size");
+            assert!(amdgpu_metadata(amdgcn_elf(image))
+                .get("amdhsa.target")
+                .str()
+                .ends_with(arch));
+            assert_eq!(walked_embedded_image(arch, module, "").unwrap().1, image);
+            assert!(
+                images.iter().all(|prior| *prior != image),
+                "retagged planner on {arch}"
+            );
+            images.push(image);
+        }
+        for arch in ["gfx906", "gfx942"] {
+            assert!(rowtile_planner_entry(arch).is_none());
+        }
+    }
+
+    #[test]
+    fn rowtile_images_match_bare_sha256_sidecars() {
+        for (image, expected) in [
+            (
+                kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151,
+                kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201,
+                kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1201_SHA256,
+            ),
+            (
+                kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100,
+                kernels::QWEN4_SLAB_UNION_PLAN_T8_PM_GFX1100_SHA256,
+            ),
+            (
+                kernels::MQ4_ROWS_X4_PM_GFX1151,
+                kernels::MQ4_ROWS_X4_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::MQ4_ROWS_X4_PM_GFX1201,
+                kernels::MQ4_ROWS_X4_PM_GFX1201_SHA256,
+            ),
+            (
+                kernels::MQ4_ROWS_X4_PM_GFX1100,
+                kernels::MQ4_ROWS_X4_PM_GFX1100_SHA256,
+            ),
+            (
+                kernels::QWEN4_LANE_ROWS_PM_GFX1151,
+                kernels::QWEN4_LANE_ROWS_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::BF16_ROWS_WIDE_PM_GFX1151,
+                kernels::QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::QWEN4_LANE_ROWS_PM_GFX1100,
+                kernels::QWEN4_LANE_ROWS_PM_GFX1100_SHA256,
+            ),
+            (
+                kernels::BF16_ROWS_WIDE_PM_GFX1100,
+                kernels::BF16_ROWS_WIDE_PM_GFX1100_SHA256,
+            ),
+            (
+                kernels::MQ_I4_MOE_GEMV_PM_GFX1201,
+                kernels::MQ_I4_MOE_GEMV_PM_GFX1201_SHA256,
+            ),
+            (
+                kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+                kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100,
+                kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100_SHA256,
+            ),
+            (
+                kernels::E8P_I4_MOE_GEMV_PM_GFX1100,
+                kernels::E8P_I4_MOE_GEMV_PM_GFX1100_SHA256,
+            ),
+            (
+                kernels::E8P_I4_MOE_GEMV_PM_GFX1151,
+                kernels::E8P_I4_MOE_GEMV_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::E8P_I4_MOE_GEMV_PM_GFX1201,
+                kernels::E8P_I4_MOE_GEMV_PM_GFX1201_SHA256,
+            ),
+            (
+                kernels::LANE_ROWS_MQ6_PM_GFX1201,
+                kernels::LANE_ROWS_MQ6_PM_GFX1201_SHA256,
+            ),
+            (
+                kernels::LANE_ROWS_BF16_PM_GFX1201,
+                kernels::LANE_ROWS_BF16_PM_GFX1201_SHA256,
+            ),
+            (
+                kernels::LEGACY_MQ4_ROWTILES_PM_GFX1151,
+                kernels::LEGACY_MQ4_ROWTILES_PM_GFX1151_SHA256,
+            ),
+            (
+                kernels::LEGACY_MQ4_ROWTILES_PM_GFX1201,
+                kernels::LEGACY_MQ4_ROWTILES_PM_GFX1201_SHA256,
+            ),
+        ] {
+            assert_eq!(expected.len(), 64);
+            assert!(expected
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert_eq!(format!("{:x}", Sha256::digest(image)), expected);
+        }
+        assert_ne!(
+            kernels::LANE_ROWS_MQ6_PM_GFX1201,
+            kernels::QWEN4_LANE_ROWS_PM_GFX1151
+        );
+        assert_ne!(
+            kernels::LANE_ROWS_BF16_PM_GFX1201,
+            kernels::BF16_ROWS_WIDE_PM_GFX1151
+        );
+    }
+
+    #[test]
+    fn rowtile_route_prewarm_is_pm_only_closed_and_idempotent() {
+        for (arch, expected_modules, expected_symbols) in
+            [("gfx1151", 5, 13), ("gfx1201", 5, 8), ("gfx1100", 4, 11)]
+        {
+            let mut entries = Vec::new();
+            add_rowtile_entries(arch, &mut entries, |_| true);
+            add_rowtile_entries(arch, &mut entries, |_| true);
+            let plan = RouteKernelPlan { entries };
+            validate_route_plan(&plan).unwrap();
+            assert_eq!(plan.entries.len(), expected_modules, "{arch}");
+            assert_eq!(
+                plan.entries
+                    .iter()
+                    .map(|entry| entry.symbols().len())
+                    .sum::<usize>(),
+                expected_symbols,
+                "{arch}: all fixed-t8 exports"
+            );
+            for entry in &plan.entries {
+                let PlannedKernel::Embedded {
+                    module,
+                    image,
+                    symbols,
+                    ..
+                } = entry
+                else {
+                    panic!("{arch}: obsolete HIP wide registration")
+                };
+                assert_eq!(walked_embedded_image(arch, module, "").unwrap().1, *image);
+                let exports = kernel_names(&image_kernel_abis(image));
+                for symbol in *symbols {
+                    assert!(symbol.contains("t8"), "{symbol}: non-tiled wide export");
+                    assert!(
+                        exports.iter().any(|name| name == symbol),
+                        "{symbol}: missing export"
+                    );
+                }
+            }
+            let mut disabled = Vec::new();
+            add_rowtile_entries(arch, &mut disabled, |_| false);
+            assert!(disabled.is_empty());
+        }
+        for arch in ["gfx1151", "gfx1201"] {
+            let inventory = entries(arch, "").unwrap();
+            assert!(inventory
+                .iter()
+                .flat_map(|entry| entry.symbols)
+                .all(|symbol| !symbol.contains("wide_r16") && !symbol.contains("wide_r32")));
+            let bf16 = lookup(arch, "qwen4_gemv_bf16_xf32", "").unwrap();
+            assert!(bf16.symbols.contains(&"gemv_bf16_xf32_x4"));
+            assert!(bf16.symbols.contains(&"gemv_bf16_xf32_x4_rows_r8"));
+            let q8 = lookup(arch, "qwen4_gemv_q8_0_wide", "").unwrap();
+            assert!(q8.symbols.contains(&"gemv_q8_0_wide_k640_staged"));
+            assert!(q8.symbols.contains(&"gemv_q8_0_wide_rows"));
+        }
+    }
+
+    #[test]
+    fn rowtile_symbol_merge_preserves_narrow_exports() {
+        static MERGED: std::sync::OnceLock<Vec<&str>> = std::sync::OnceLock::new();
+        let mut planned = vec![PlannedKernel::Embedded {
+            module: "mq4_rows_x4_pm_gfx1201",
+            image: kernels::MQ4_ROWS_X4_PM_GFX1201,
+            radiowave_json: None,
+            symbols: &["gemv_mq4g256v2_rows_x4_pm_gfx1201"],
+        }];
+        let (_, module, image, tiles) = wide_twin_mq4_image("gfx1201").unwrap();
+        plan_wide_embedded(&mut planned, &MERGED, module, image, tiles);
+        plan_wide_embedded(&mut planned, &MERGED, module, image, tiles);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].symbols(),
+            [
+                "gemv_mq4g256v2_rows_x4_pm_gfx1201",
+                "gemv_mq4g256v2_rows_x4_t8_pm_gfx1201",
+            ]
+        );
+        validate_route_plan(&RouteKernelPlan { entries: planned }).unwrap();
+    }
+
+    #[test]
+    fn rowtile_family_prewarm_keeps_arch_and_family_boundaries() {
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            let mut mq4 = Vec::new();
+            add_rowtile_entries(arch, &mut mq4, |family| {
+                matches!(family, WideTwinFamily::Mq4)
+            });
+            assert_eq!(mq4.len(), if arch == "gfx1100" { 1 } else { 2 });
+            if let Some((_, module, image, _, symbols)) = legacy_mq4_rowtile_image(arch) {
+                let legacy = mq4.iter().find(|entry| entry.module() == module).unwrap();
+                assert_eq!(legacy.symbols(), symbols);
+                assert_eq!(walked_embedded_image(arch, module, "").unwrap().1, image);
+            } else {
+                assert!(mq4
+                    .iter()
+                    .all(|entry| !entry.module().starts_with("legacy_mq4")));
+            }
+            let mut mq6 = Vec::new();
+            add_rowtile_entries(arch, &mut mq6, |family| {
+                matches!(family, WideTwinFamily::Mq6)
+            });
+            assert_eq!(mq6.len(), 1);
+            assert_eq!(mq6[0].symbols().len(), 2);
+            assert!(mq6[0]
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.starts_with("gemv_mq6")));
+            let mut q8 = Vec::new();
+            add_rowtile_entries(arch, &mut q8, |family| matches!(family, WideTwinFamily::Q8));
+            if arch == "gfx1151" {
+                assert_eq!(q8.len(), 1);
+                assert_eq!(q8[0].symbols(), crate::lane_rows_pm::Q8_WIDE_SYMBOLS);
+            } else if arch == "gfx1100" {
+                assert_eq!(q8.len(), 1);
+                assert_eq!(q8[0].symbols(), Q8_GFX1100_ROWTILE_SYMBOLS);
+            } else {
+                // gfx1201 has no admitted Q8 PM object; never revive HIP twins.
+                assert!(q8.is_empty());
+            }
+        }
+        for arch in ["gfx906", "gfx942"] {
+            let mut entries = Vec::new();
+            add_rowtile_entries(arch, &mut entries, |_| true);
+            assert!(entries.is_empty());
+        }
+    }
+
     #[test]
     fn slab_k1_images_carry_the_96_byte_n_experts_kernarg() {
         use crate::slab_moe::{
-            slab_arch_kernels, slab_cold_k1_metadata, E8P_I4_MOE_GEMV_GFX1100_SYMBOLS,
-            MQ_I4_MOE_GEMV_GFX1100_MQ4_SYMBOLS, MQ_I4_MOE_GEMV_SYMBOLS,
-            MQ_I4_MOE_GEMV_WIDE_SYMBOLS,
+            slab_arch_kernels, slab_cold_k1_metadata, slab_rowtile_k1,
+            MQ_I4_MOE_GEMV_CN_ROWTILE_SYMBOLS, MQ_I4_MOE_GEMV_CN_SYMBOLS,
+            MQ_I4_MOE_GEMV_ROWTILE_SYMBOLS, MQ_I4_MOE_GEMV_SYMBOLS,
         };
-        // Beta's shared gfx1151 / gfx1201 image: the four narrow entries plus the eight `_c16` / `_c32` wide
-        // twins, unchanged in count and names, no qualification twin.
-        let shared = sorted(
+        let narrow = sorted(
             MQ_I4_MOE_GEMV_SYMBOLS
                 .iter()
                 .flatten()
-                .chain(MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten())
                 .map(|s| s.to_string()),
         );
-        assert_eq!(shared.len(), 12);
         for (arch, image) in [
             ("gfx1201", kernels::MQ_I4_MOE_GEMV_PM_GFX1201),
             ("gfx1151", kernels::MQ_I4_MOE_GEMV_PM_GFX1151),
         ] {
-            assert_eq!(
-                slab_arch_kernels(arch).unwrap().mq4_k1.image,
-                image,
-                "{arch}: shared K1 embedded image"
-            );
-            let abis = assert_kernarg_abi(&format!("{arch} shared K1"), image, 96, &K1_KERNARG);
-            assert_eq!(kernel_names(&abis), shared, "{arch}: shared K1 symbols");
+            assert_eq!(slab_arch_kernels(arch).unwrap().mq4_k1.image, image);
+            let abis = assert_kernarg_abi(arch, image, 96, &K1_KERNARG);
+            let mut expected = narrow.clone();
+            if arch == "gfx1201" {
+                expected.extend(
+                    MQ_I4_MOE_GEMV_ROWTILE_SYMBOLS
+                        .iter()
+                        .flatten()
+                        .map(|s| s.to_string()),
+                );
+                for (bucket, symbols) in MQ_I4_MOE_GEMV_ROWTILE_SYMBOLS.iter().enumerate() {
+                    for (kind, symbol) in symbols.iter().enumerate() {
+                        let lds = if bucket == 1 && kind == 0 { 8192 } else { 4096 };
+                        assert_rowtile_abi(image, symbol, 96, &K1_KERNARG, 256, lds);
+                    }
+                }
+                assert!(abis
+                    .iter()
+                    .all(|(n, _)| !n.contains("_c16") && !n.contains("_c32")));
+            } else {
+                // The unchanged Halo reference image keeps genuine legacy
+                // diagnostics, but production rowtiles live only in Cn.
+                expected.extend(
+                    narrow
+                        .iter()
+                        .flat_map(|name| [format!("{name}_c16"), format!("{name}_c32")]),
+                );
+                assert_eq!(expected.len(), 12);
+                assert!(abis.iter().all(|(name, _)| !name.ends_with("_t8")));
+            }
+            assert_eq!(kernel_names(&abis), sorted(expected), "{arch}: K1 exports");
         }
-        // gfx1100 MQ4-only hot K1: its two served symbols, no W2 / `_acc` entry, no LDS.
+        let cn = assert_kernarg_abi(
+            "gfx1151 Cn",
+            kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+            96,
+            &K1_KERNARG,
+        );
+        assert_eq!(
+            kernel_names(&cn),
+            sorted(
+                MQ_I4_MOE_GEMV_CN_SYMBOLS
+                    .iter()
+                    .flatten()
+                    .chain(MQ_I4_MOE_GEMV_CN_ROWTILE_SYMBOLS.iter().flatten())
+                    .map(|s| s.to_string())
+            ),
+        );
+        for symbols in MQ_I4_MOE_GEMV_CN_ROWTILE_SYMBOLS {
+            for (kind, symbol) in symbols.into_iter().enumerate() {
+                assert_rowtile_abi(
+                    kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+                    symbol,
+                    96,
+                    &K1_KERNARG,
+                    256,
+                    if kind == 0 { 40960 } else { 20480 },
+                );
+            }
+        }
         let hot = &slab_arch_kernels("gfx1100").unwrap().mq4_k1;
+        let tiled = slab_rowtile_k1(hot).unwrap();
+        for (narrow, symbol) in hot.symbols.into_iter().zip(tiled.symbols) {
+            assert_eq!(symbol, format!("{narrow}_t8"));
+        }
         let abis = assert_kernarg_abi("gfx1100 MQ4 K1", hot.image, 96, &K1_KERNARG);
         assert_eq!(
             kernel_names(&abis),
             sorted(
-                MQ_I4_MOE_GEMV_GFX1100_MQ4_SYMBOLS
-                    .iter()
-                    .map(|s| s.to_string())
-            )
+                hot.symbols
+                    .into_iter()
+                    .chain(tiled.symbols)
+                    .map(str::to_owned)
+            ),
         );
         assert!(abis
             .iter()
             .all(|(n, abi)| abi.group == 0 && !n.ends_with("_acc") && !n.contains("mq2i4")));
-        // Both E8P K1 images (gfx1100 custom, gfx1201 builder): the two served symbols at 96 bytes, 1,536 B static LDS.
-        for (arch, symbols) in [
-            ("gfx1100", E8P_I4_MOE_GEMV_GFX1100_SYMBOLS),
-            ("gfx1201", crate::e8p_moe_decode::E8P_I4_MOE_GEMV_SYMBOLS),
-        ] {
+        for symbol in tiled.symbols {
+            assert_rowtile_abi(tiled.image, symbol, 96, &K1_KERNARG, 256, 0);
+        }
+        // Inventory includes all arch-specific E8P images, without changing admission.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let e8p = slab_cold_k1_metadata(arch, 3).unwrap();
-            assert_eq!(e8p.k1.symbols, symbols);
-            let abis = assert_kernarg_abi(&format!("{arch} E8P K1"), e8p.k1.image, 96, &K1_KERNARG);
+            let tiled = slab_rowtile_k1(&e8p.k1).unwrap();
+            assert_eq!((tiled.module, tiled.image), (e8p.k1.module, e8p.k1.image));
+            let abis = assert_kernarg_abi(arch, e8p.k1.image, 96, &K1_KERNARG);
             assert_eq!(
                 kernel_names(&abis),
-                sorted(symbols.iter().map(|s| s.to_string())),
-                "{arch}: E8P K1 symbols"
+                sorted(
+                    e8p.k1
+                        .symbols
+                        .into_iter()
+                        .chain(tiled.symbols)
+                        .map(str::to_owned)
+                ),
             );
-            assert!(
-                abis.iter()
-                    .all(|(n, abi)| abi.group == 1536 && !n.ends_with("_acc")),
-                "{arch}: E8P K1 LDS / twins"
-            );
+            assert!(abis
+                .iter()
+                .all(|(n, abi)| abi.group == 1536 && !n.ends_with("_acc")));
+            for (narrow, symbol) in e8p.k1.symbols.into_iter().zip(tiled.symbols) {
+                assert_eq!(symbol, format!("{narrow}_t8"));
+                assert_rowtile_abi(tiled.image, symbol, 96, &K1_KERNARG, 256, 1536);
+            }
         }
     }
 

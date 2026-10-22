@@ -3448,39 +3448,39 @@ mod tests {
     /// fixture: the frontier the product and primitive tiles were chosen on
     /// (1536, 1280, 1024, 768, 512).
     const J1778_RUNG_BASE: [u64; 5] = [
-        3_536_035_244,
-        3_251_920_428,
-        2_967_805_612,
-        2_683_690_796,
-        2_399_575_980,
+        3_536_042_980,
+        3_251_928_164,
+        2_967_813_348,
+        2_683_698_532,
+        2_399_583_716,
     ];
     const J1778_AGG_PRODUCT_SLACK: [i128; 5] = [
-        -711_505_388,
-        -422_147_692,
-        -132_789_996,
-        156_567_700,
-        445_925_396,
+        -711_513_124,
+        -422_155_428,
+        -132_797_732,
+        156_559_964,
+        445_917_660,
     ];
     const J1778_AGG_PRIMITIVE_SLACK: [i128; 5] = [
-        -929_326_572,
-        -639_968_876,
-        -350_611_180,
-        -61_253_484,
-        228_104_212,
+        -929_334_308,
+        -639_976_612,
+        -350_618_916,
+        -61_261_220,
+        228_096_476,
     ];
     const J1778_SLAB_PRODUCT_SLACK: [i128; 5] = [
-        -709_961_196,
-        -420_603_500,
-        -131_245_804,
-        158_111_892,
-        447_469_588,
+        -709_968_932,
+        -420_611_236,
+        -131_253_540,
+        158_104_156,
+        447_461_852,
     ];
     const J1778_SLAB_PRIMITIVE_SLACK: [i128; 5] = [
-        -927_782_380,
-        -638_424_684,
-        -349_066_988,
-        -59_709_292,
-        229_648_404,
+        -927_790_116,
+        -638_432_420,
+        -349_074_724,
+        -59_717_028,
+        229_640_668,
     ];
     /// The N=10 slack of each rung on the opt-in symmetric IU4 aggregate route: the F16
     /// aggregate slack less the route's own census delta (both A4 sidecars charged,
@@ -3490,24 +3490,27 @@ mod tests {
     /// is the aggregate route's byte for byte, so the delta is rung- and purpose-independent.
     /// Pinned by `slowlink_residency_sym_iu4_route_adapts_before_declining_on_a_base_miss`.
     const J1778_SYM_PRODUCT_SLACK: [i128; 5] = [
-        -710_186_476,
-        -420_828_780,
-        -131_471_084,
-        157_886_612,
-        447_244_308,
+        -710_194_212,
+        -420_836_516,
+        -131_478_820,
+        157_878_876,
+        447_236_572,
     ];
     const J1778_SYM_PRIMITIVE_SLACK: [i128; 5] = [
-        -928_007_660,
-        -638_649_964,
-        -349_292_268,
-        -59_934_572,
-        229_423_124,
+        -928_015_396,
+        -638_657_700,
+        -349_300_004,
+        -59_942_308,
+        229_415_388,
     ];
 
     /// The HISTORICAL 1,536-row COUNTERFACTUAL on the real 24 GiB XTX fixture
     /// with the CORRECTED source census (admitted through [`admit_at_tile`],
     /// never by production [`admit`]): the base reserve at the 1,536-row tile is
-    /// the measured 2,237,111,724 B census PLUS the 1,298,923,520 B F16 weight
+    /// the 2,237,119,460 B source census (the 2,237,111,724 B first measured
+    /// with the 32-lane slab union descriptor, plus the 7,736 B by which the
+    /// 64-lane native row-tile descriptor, 8 tiles x 1,928 B = 15,424 B, exceeds
+    /// that 7,688 B) PLUS the 1,298,923,520 B F16 weight
     /// shadow cold bound of the real artifact (the gfx1100 runtime predicate
     /// holds there), so the PREFERRED ten layers no longer fit beside the S1
     /// terms, the 1 GiB runtime budget and the 512 MiB safety margin: the
@@ -3520,8 +3523,8 @@ mod tests {
     {
         let reserve = j1778_reserve_at(S1_TILE_ROWS);
         assert_eq!(reserve.census.f16_shadows, J1778_SHADOWS);
-        assert_eq!(reserve.census_total, 2_237_111_724 + J1778_SHADOWS);
-        assert_eq!(reserve.placement_bytes(true), 3_536_035_244);
+        assert_eq!(reserve.census_total, 2_237_119_460 + J1778_SHADOWS);
+        assert_eq!(reserve.placement_bytes(true), 3_536_042_980);
         // Incumbent policy untouched: `max(historical floor, census)` for every
         // load that is not an admitted S1 profile; S1 reads the census alone.
         let historical = reserve
@@ -3550,8 +3553,8 @@ mod tests {
             J1778_MARGIN
         );
         // Census base + S1 owned + 1 GiB runtime + 512 MiB safety, on top.
-        let charged = 3_536_035_244 + 2_543_094_592 + S1_RUNTIME_OVERHEAD_BYTES + J1778_MARGIN;
-        assert_eq!(charged, 7_689_742_572);
+        let charged = 3_536_042_980 + 2_543_094_592 + S1_RUNTIME_OVERHEAD_BYTES + J1778_MARGIN;
+        assert_eq!(charged, 7_689_750_308);
         let nine = admit_at_tile(&inputs, S1_TILE_ROWS)
             .expect("nine layers fit: the preferred ten are information, not a gate");
         assert_eq!(nine.resident_layers, 9);
@@ -3560,12 +3563,12 @@ mod tests {
             nine.placement.preferred_deficit_bytes(),
             10 * LAYER + J1778_NON_EXPERT + charged - J1778_PRELOAD_FREE
         );
-        assert_eq!(nine.placement.preferred_deficit_bytes(), 709_961_196);
+        assert_eq!(nine.placement.preferred_deficit_bytes(), 709_968_932);
         assert!(nine.placement.fits(9) && !nine.placement.fits(10));
         // The retired source omission, as a counterfactual: without the shadow
         // cold bound ten layers fit, so the shadows alone cost the tenth layer.
         let omitted = AdmissionInputs {
-            base_reserve: 2_237_111_724,
+            base_reserve: 2_237_119_460,
             ..inputs
         };
         assert_eq!(
@@ -3763,8 +3766,8 @@ mod tests {
             ),
         ];
         // The two actual real-artifact (aggregate) slacks Main chose on.
-        assert_eq!(J1778_AGG_PRODUCT_SLACK[3], 156_567_700);
-        assert_eq!(J1778_AGG_PRIMITIVE_SLACK[4], 228_104_212);
+        assert_eq!(J1778_AGG_PRODUCT_SLACK[3], 156_559_964);
+        assert_eq!(J1778_AGG_PRIMITIVE_SLACK[4], 228_096_476);
         for (route, purpose, tile, slack) in cases {
             let label = format!("{route:?} {purpose:?}");
             let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
@@ -3828,7 +3831,7 @@ mod tests {
         assert_eq!(kept.resident_layers, 9);
         assert_eq!(
             kept.placement.preferred_deficit_bytes(),
-            200_000_000 - 156_567_700
+            200_000_000 - 156_559_964
         );
         let points = tile_frontier(&product, |tile| {
             Ok((
@@ -3863,7 +3866,7 @@ mod tests {
         );
         let kept = admit_at_tile(&primitive, 768).expect("nine layers fit at 768");
         assert_eq!(kept.resident_layers, 9);
-        assert_eq!(kept.placement.preferred_deficit_bytes(), 61_253_484);
+        assert_eq!(kept.placement.preferred_deficit_bytes(), 61_261_220);
     }
 
     fn frontier_json(points: &[FrontierPoint]) -> serde_json::Value {
@@ -6427,13 +6430,13 @@ mod tests {
                 (
                     AdmissionPurpose::Product,
                     768usize,
-                    48_509_588i128,
+                    48_501_852i128,
                     J1778_AGG_PRODUCT_SLACK[3],
                 ),
                 (
                     AdmissionPurpose::PrimitiveSelftest,
                     512usize,
-                    113_608_212i128,
+                    113_600_476i128,
                     J1778_AGG_PRIMITIVE_SLACK[4],
                 ),
             ] {
@@ -6581,14 +6584,14 @@ mod tests {
                 (
                     AdmissionPurpose::Product,
                     768usize,
-                    48_509_588i128,
-                    -104_582_508i128,
+                    48_501_852i128,
+                    -104_590_244i128,
                 ),
                 (
                     AdmissionPurpose::PrimitiveSelftest,
                     512usize,
-                    113_608_212i128,
-                    -39_483_884i128,
+                    113_600_476i128,
+                    -39_491_620i128,
                 ),
             ] {
                 assert_eq!(purpose_tile_rows(purpose), tile);
