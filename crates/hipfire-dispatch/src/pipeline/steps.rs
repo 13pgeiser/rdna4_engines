@@ -828,6 +828,13 @@ pub trait MoeStepHooks {
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
     /// Right after the call's last launch.
     fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+    /// At the top of the interpreter's loop, before `step` is dispatched by
+    /// whatever route takes it (fused, CPU or plain): every earlier step has
+    /// run, `step` has not. A step consumed inside an earlier step's fused
+    /// launch is never announced. Default: nothing (no fusion changes).
+    fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
+        Ok(())
+    }
 }
 
 struct NoMoeHooks;
@@ -932,6 +939,7 @@ fn execute_window<'a>(
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < end {
+        hooks.before_step(gpu, &steps[i])?;
         if hc_fuse {
             use crate::pipeline::layer_ops::{
                 execute_gated_delta_net_hc, execute_hyper_read_paired,

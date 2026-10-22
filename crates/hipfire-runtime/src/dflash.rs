@@ -3253,6 +3253,42 @@ pub fn draft_forward_opts(
     scratch: &mut DflashScratch,
     graph_ffn: bool,
 ) -> HipResult<()> {
+    draft_forward_based(
+        gpu,
+        weights,
+        cfg,
+        noise_embedding,
+        target_hidden,
+        0,
+        positions_q,
+        positions_k,
+        block_size,
+        ctx_len,
+        scratch,
+        graph_ffn,
+    )
+}
+
+/// [`draft_forward`] whose host `target_hidden` holds only rows
+/// `target_hidden_base..ctx_len` (a caller that keeps the draft's window, not
+/// the whole context). Windowed scratch only, and `target_hidden_base` must
+/// not pass `ctx_len - W`: every row the forward can upload is still held.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_forward_based(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    target_hidden_base: usize,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    graph_ffn: bool,
+) -> HipResult<()> {
+    let base = target_hidden_base;
     let b = block_size;
     let l = ctx_len;
     let tot = l + b;
@@ -3269,7 +3305,18 @@ pub fn draft_forward_opts(
         assert_eq!(ne_slice.len(), b * h, "noise_embedding size");
     }
     if let Some(th_slice) = target_hidden {
-        assert_eq!(th_slice.len(), l * ne * h, "target_hidden size");
+        assert_eq!(th_slice.len(), (l - base) * ne * h, "target_hidden size");
+    }
+    match scratch.ctx_mode {
+        DraftCtxMode::Legacy => {
+            assert_eq!(base, 0, "a based target_hidden needs a windowed scratch")
+        }
+        DraftCtxMode::Windowed { w, .. } => {
+            assert!(
+                base <= l.saturating_sub(w),
+                "target_hidden base past the window"
+            )
+        }
     }
     assert_eq!(positions_q.len(), b, "positions_q size");
     assert_eq!(positions_k.len(), tot, "positions_k size");
@@ -3340,7 +3387,7 @@ pub fn draft_forward_opts(
         // at the ring boundary. Out-of-window rows are never read (fc is the
         // only consumer and its fill is span-limited too).
         let row_f32 = ne * h;
-        let expected_full_len = l * row_f32;
+        let expected_full_len = (l - base) * row_f32;
         let prev = scratch.thlog.uploaded_rows();
         // Full-upload conditions: first call, reset flagged, caller shrank
         // the context, or the slice length suggests ctx_slice (unusual l).
@@ -3348,7 +3395,7 @@ pub fn draft_forward_opts(
             if windowed {
                 let up_start = l.saturating_sub(swa_w);
                 for (row0, slot0, len) in ring_segments(up_start, l, swa_w) {
-                    let seg = &th_slice[row0 * row_f32..(row0 + len) * row_f32];
+                    let seg = &th_slice[(row0 - base) * row_f32..(row0 - base + len) * row_f32];
                     let dst_byte_off = slot0 * row_f32 * 4;
                     let src_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
@@ -3369,7 +3416,7 @@ pub fn draft_forward_opts(
             if windowed {
                 let up_start = prev.max(l.saturating_sub(swa_w));
                 for (row0, slot0, len) in ring_segments(up_start, l, swa_w) {
-                    let seg = &th_slice[row0 * row_f32..(row0 + len) * row_f32];
+                    let seg = &th_slice[(row0 - base) * row_f32..(row0 - base + len) * row_f32];
                     let dst_byte_off = slot0 * row_f32 * 4;
                     let src_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
