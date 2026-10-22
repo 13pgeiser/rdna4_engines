@@ -508,7 +508,9 @@ fn mq6_i8_gemm(epi: &str, tile: Option<&str>, arch: Arch) -> Result<(String, Vec
     let tile: Tile = tile.unwrap_or("128x128").parse()?;
     if epi == "all" {
         if tile != Tile::T128x128 {
-            return Err("mq6_i8_gemm --tile: the product module holds both tiles; name one --epi".into());
+            return Err(
+                "mq6_i8_gemm --tile: the product module holds both tiles; name one --epi".into(),
+            );
         }
         let (_, text, proof) = mq6_i8_gemm::emit_module(arch)?;
         return Ok((
