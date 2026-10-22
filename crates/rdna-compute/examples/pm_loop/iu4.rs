@@ -403,7 +403,7 @@ struct RipSource {
 /// ABI of a kernel in an assembled object: everything the launcher and the
 /// kernarg packer depend on (symbol, kernarg layout, workgroup size, LDS,
 /// wave mode). Code, VGPR/SGPR counts and the like may differ.
-fn abi_signature(elf: &[u8], symbol: &str) -> Result<String> {
+pub fn abi_signature(elf: &[u8], symbol: &str) -> Result<String> {
     use peacemaker_ir::inst::Abi;
     let program = peacemaker_lift::lift_object(
         elf,
@@ -754,7 +754,7 @@ impl Iu4 {
     }
 }
 
-fn max_diff(a: &[u8], b: &[u8], width: usize) -> f64 {
+pub fn max_diff(a: &[u8], b: &[u8], width: usize) -> f64 {
     let val = |c: &[u8]| -> f32 {
         if width == 2 {
             f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)

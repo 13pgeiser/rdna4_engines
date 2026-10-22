@@ -130,6 +130,12 @@ pub trait Workload {
     /// NaN-ness. 0.0 iff element-wise equal.
     fn max_abs_diff(&self, a: &[u8], b: &[u8]) -> Result<f64>;
 
+    /// `true` when correctness requires the candidate's output to be bitwise
+    /// equal to the shipped baseline in addition to passing the CPU reference.
+    fn requires_baseline_identity(&self) -> bool {
+        false
+    }
+
     /// `--emu`: run the candidate on the peacemaker emulator at a small
     /// shape if every instruction is qualified; otherwise
     /// `Value::String("refused (<reason>)")`. Never fabricate a result.

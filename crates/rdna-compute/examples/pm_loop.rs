@@ -6,8 +6,9 @@
 //! kernel (gfx1201). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
+//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--time N] [--rounds R] [--emu] [--out DIR]
+//!         [--rip FILE.rip]   (iu4_gemm, mq6_i8_gemm)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -45,7 +46,8 @@
 //! error); 2 usage error.
 //!
 //! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
-//! (`--kernel iu4_gemm`) and `pm_loop/moe.rs` (`--kernel qwen4_moe_sym`).
+//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`) and `pm_loop/moe.rs`
+//! (`--kernel qwen4_moe_sym`).
 //!
 //! Use (build once, then take a gfx1201 card through the fabric; check
 //! `fabric-run.sh --status` first and pick an idle hiptrx card A/B/C/E):
@@ -65,6 +67,8 @@ mod abba;
 mod iu4;
 #[path = "pm_loop/moe.rs"]
 mod moe;
+#[path = "pm_loop/mq6.rs"]
+mod mq6;
 #[path = "pm_loop/workload.rs"]
 mod workload;
 
@@ -152,9 +156,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
-    if o.rip.is_some() && o.kernel != "iu4_gemm" {
+    if o.rip.is_some() && !matches!(o.kernel.as_str(), "iu4_gemm" | "mq6_i8_gemm") {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm: only iu4_gemm blocks are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm or mq6_i8_gemm: only iu4_gemm and mq6_i8_gemm blocks are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -167,8 +171,13 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
     let mut knobs = std::mem::take(&mut o.knobs);
     let w = match o.kernel.as_str() {
         "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
         "qwen4_moe_sym" => moe::new(&shape, &mut knobs)?,
-        other => return Err(format!("unknown --kernel {other} (iu4_gemm|qwen4_moe_sym)")),
+        other => {
+            return Err(format!(
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|qwen4_moe_sym)"
+            ))
+        }
     };
     knobs.finish()?;
     Ok(w)
@@ -574,7 +583,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     // reproducible) bit identity with the shipped baseline is the only
     // admissible evidence: `pass` is then `identical_to_baseline`.
     let pass = match &reference {
-        Ok(r) => r.pass,
+        Ok(r) => r.pass && (identical || !w.requires_baseline_identity()),
         Err(_) => identical,
     };
     rec["correctness"] = json!({
@@ -583,7 +592,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         "max_abs_err": reference.as_ref().ok().map(|r| r.max_abs_err),
         "tolerance": reference.as_ref().ok().map(|r| r.tolerance),
         "pass": pass,
-        "pass_basis": if reference.is_ok() { "cpu_reference" } else { "identical_to_baseline (no CPU reference)" },
+        "pass_basis": if reference.is_ok() && w.requires_baseline_identity() { "cpu_reference and identical_to_baseline" } else if reference.is_ok() { "cpu_reference" } else { "identical_to_baseline (no CPU reference)" },
         "baseline_max_abs_err": base_report.as_ref().ok().map(|r| r.max_abs_err),
         "baseline_pass": base_report.as_ref().ok().map(|r| r.pass),
         "baseline_reference_error": base_report.as_ref().err(),
