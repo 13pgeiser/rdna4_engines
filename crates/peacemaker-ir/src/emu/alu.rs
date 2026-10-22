@@ -66,8 +66,14 @@
 //! * OMOD results that would flush a non-zero denormal (sign of the flushed zero).
 //! * DPP with FI=1 and an out-of-range source (the BC/FI table disagrees with its prose).
 //!
-//! Not qualified on any arch: `v_med3_num_f32` (not modeled), the `v_div_scale_f32` exponent domains the sweeps leave
-//! open, BF16/FP8 encoders. Finite operands of `v_div_fmas_f32` under VCC are unqualified on every arch but gfx1201.
+//! Not qualified on any arch: `v_med3_num_f32` (not modeled), the gfx1151 `v_div_scale_f32` exponent domains its sweep
+//! leaves open (gfx1201 has the full exponent-field receipt, see [`div_scale_chain`]), BF16/FP8 encoders. Finite
+//! operands of `v_div_fmas_f32` under VCC are unqualified on every arch but gfx1201.
+//!
+//! Scalar unsigned-division expansion (gfx1201 only; `s_cvt_f32_u32`, `v_s_rcp_f32`, `s_mul_f32`, `s_cvt_u32_f32`,
+//! used by the builder GEMM prologues' tile arithmetic): hardware receipt `gfx1201-div-r1` suite `scalar_udiv`, stage by
+//! stage for every denominator `1..=2^24`; see [`udiv_scalar_float`] and [`udiv_scalar_rcp`]. Anything outside that
+//! domain is a hard error.
 //!
 //! Descriptor float mode must be round to nearest even, allow input/output denormals,
 //! use FP16_OVFL=0, and on gfx1151 use IEEE_MODE=1/DX10_CLAMP=1; `State::new` checks it.
@@ -242,6 +248,9 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         let y = y_op.name(arch).ok_or("unknown VOPD Y opcode")?;
         return vopd(arch, name, y, usize::from(x_operands), i, s);
     }
+    if matches!(name, "s_cvt_f32_u32" | "s_cvt_u32_f32" | "s_mul_f32") {
+        return udiv_scalar_float(arch, name, i, s);
+    }
     if name.starts_with("s_") {
         return scalar(name, i, s);
     }
@@ -257,6 +266,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         _ if super::wide::handles(name) => super::wide::execute(arch, name, i, s),
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
+        "v_s_rcp_f32" => udiv_scalar_rcp(arch, i, s),
         "v_add_co_u32" | "v_add_co_ci_u32_e64" => add_carry(name, i, s),
         "v_cvt_pk_f32_fp8_e32" | "v_cvt_pk_f32_fp8_e64" => cvt_pk_f32_fp8(arch, i, s),
         _ if name.starts_with("v_cmp") => compare(name, i, s),
@@ -1327,7 +1337,9 @@ fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
 }
 
 /// `v_div_scale_f32` on gfx1151 and gfx1201, from the hardware sweeps (spec gids 29/30/31, all 262144 operand tuples
-/// of the 64-member f32 set including zeros, denormals, infinities and NaNs, all 4 VCC/SCC states). Operands are
+/// of the 64-member f32 set including zeros, denormals, infinities and NaNs, all 4 VCC/SCC states; gfx1201 further
+/// receipt `gfx1201-div-r1`: 12,582,912 tuples, every denominator exponent field x every numerator exponent field x
+/// mantissa classes x 16 S0 shapes, 0 mismatches). Operands are
 /// `S0` (the value to scale), `S1` (denominator), `S2` (numerator), post-modifier words; everything is decided
 /// by the raw biased exponent fields (`e1`, `e2`, so NaN/infinity count as 255), `d = e2 - e1`:
 ///
@@ -1336,20 +1348,23 @@ fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
 /// * `S1 == 0 || S2 == 0`: `D = 0xffc00000` (S0 ignored, even a NaN).
 /// * `d >= 96`: `D = S0 == S1 ? S0 * 2^64 : S0`.
 /// * `e1 == 0` (denormal denominator): `D = S0 * 2^64`.
-/// * `e1 >= 254` (reciprocal denormal): `D = S0 * 2^-64`, except `D = S0` when the predicate is set and
-///   `S0 != S1`. The hardware subtracts 64 from the exponent field: `S0` with exponent field <= 63 (denormals
-///   included, zero excluded) gives `+-inf`, exponent fields >= 91 are exact.
+/// * `e1 >= 253` on gfx1201 (`e1 >= 254` on gfx1151, whose sweep has no exponent field 253): `D = S0 * 2^-64`, except
+///   `D = S0` when the predicate is set and `S0 != S1`. `S0` with exponent field <= 63 (denormals included, zero
+///   excluded) gives `+-inf`; larger fields give the exactly rounded product (field 64 rounds to a denormal, ties to
+///   even).
 /// * `d <= -96`: `D = S0 == S1 ? S0 : S0 * 2^64` (the numerator is scaled).
-/// * `e2 <= 23`: `D = S0 * 2^64`; otherwise `D = S0`.
+/// * `e2 <= 24` on gfx1201 (`e2 <= 23` on gfx1151): `D = S0 * 2^64`; otherwise `D = S0`.
 ///
 /// `S0 * 2^64` leaves NaN and infinity untouched (a signalling NaN stays signalling); `S0 == S1` is a bitwise
-/// comparison. Domains the sweep leaves open (`e1` 228..=253, `d == -96` with `e1 != 254`, `e2` 24..=26 where the
-/// scale decision is reached, the `2^-64` of exponent fields 64..=90) are errors.
-fn div_scale_chain(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
+/// comparison. Domains only the gfx1151 sweep leaves open (`e1` 228..=253, `d == -96` with `e1 != 254`, `e2` 24..=26
+/// where the scale decision is reached, the `2^-64` of exponent fields 64..=90) are errors there; the gfx1201 receipt
+/// closes them all.
+fn div_scale_chain(arch: Arch, s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
+    let wide = arch == Arch::Gfx1201;
     let exp = |x: u32| (x >> 23 & 255) as i32;
     let (e0, e1, e2) = (exp(s0), exp(s1), exp(s2));
     let d = e2 - e1;
-    if d == -96 && e1 != 254 {
+    if !wide && d == -96 && e1 != 254 {
         return Err("v_div_scale_f32: exponent difference -96 is measured only for denominator exponent 254".into());
     }
     let flag = d >= 96 || d <= -96;
@@ -1368,7 +1383,7 @@ fn div_scale_chain(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
             255 => s0,
             _ if is_zero(s0) => s0,
             0..=63 => (s0 & SIGN) | INF,
-            64..=90 => {
+            64..=90 if !wide => {
                 return Err(
                     "v_div_scale_f32: S0 * 2^-64 with exponent field 64..=90 is not measured"
                         .into(),
@@ -1385,9 +1400,9 @@ fn div_scale_chain(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
         }
     } else if e1 == 0 {
         up(s0)
-    } else if (228..=253).contains(&e1) {
+    } else if !wide && (228..=253).contains(&e1) {
         return Err("v_div_scale_f32: denominator exponent 228..=253 is not measured".into());
-    } else if e1 >= 254 {
+    } else if e1 >= if wide { 253 } else { 254 } {
         if flag && s0 != s1 {
             s0
         } else {
@@ -1399,9 +1414,9 @@ fn div_scale_chain(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
         } else {
             up(s0)
         }
-    } else if e2 <= 23 {
+    } else if e2 <= if wide { 24 } else { 23 } {
         up(s0)
-    } else if e2 <= 26 {
+    } else if !wide && e2 <= 26 {
         return Err("v_div_scale_f32: numerator exponent 24..=26 is not measured".into());
     } else {
         s0
@@ -1412,7 +1427,7 @@ fn div_scale_chain(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
 /// Qualified-arch `v_div_scale_f32`: [`div_scale_chain`], plus gfx1201 quieting every signalling NaN it would
 /// return as `D` (30752 of the 262144 tuples, none left unquieted); gfx1151 returns it untouched.
 fn div_scale_edge(arch: Arch, s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
-    let (d, flag) = div_scale_chain(s0, s1, s2)?;
+    let (d, flag) = div_scale_chain(arch, s0, s1, s2)?;
     Ok((
         if arch == Arch::Gfx1201 && is_snan(d) {
             d | QUIET
@@ -1850,6 +1865,88 @@ fn scalar_compare_pred(name: &str, p: &str) -> Result<Pred> {
         "le" => Pred::Le,
         _ => return Err(format!("unsupported scalar compare {name}")),
     })
+}
+
+/// Largest denominator of the AMDGPU unsigned-division expansion (`s_cvt_f32_u32; v_s_rcp_f32; s_mul_f32;
+/// s_cvt_u32_f32`, the raster/tile arithmetic of the builder GEMM prologues) that is hardware qualified: every
+/// denominator `1..=2^24` converts to an exactly representable float.
+const UDIV_MAX: u32 = 1 << 24;
+
+fn normal(bits: u32) -> bool {
+    matches!(bits >> 23 & 255, 1..=254)
+}
+
+/// The scalar float instructions of the unsigned-division expansion on gfx1201, qualified on hardware for every
+/// denominator `1..=2^24` stage by stage (`numerics_probe` suite `scalar_udiv`, receipt in `isa/emu/float_edges.md`):
+/// * `s_cvt_f32_u32`: exact for `1..=2^24` (larger sources round per MODE and are not measured).
+/// * `s_mul_f32`: IEEE single multiply, round to nearest even; both operands and the product must be finite
+///   normals (zero, denormal, NaN, infinity and overflow behavior is not measured).
+/// * `s_cvt_u32_f32`: truncation toward zero of a finite normal `0 < x < 2^32`; negative, NaN, infinite, denormal,
+///   zero and out-of-range sources (clamping) are not measured.
+fn udiv_scalar_float(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
+    if arch != Arch::Gfx1201 {
+        return Err(format!("{name} is measured on gfx1201 only, not {arch:?}"));
+    }
+    let o = &i.operands;
+    let rd = |s: &State, n: usize| -> Result<u32> {
+        s.read(o.get(n).ok_or("missing scalar operand")?, 0, 0)
+    };
+    let value = match name {
+        "s_cvt_f32_u32" => {
+            let a = rd(s, 1)?;
+            if !(1..=UDIV_MAX).contains(&a) {
+                return Err(format!(
+                    "{name}: source {a} is outside 1..=2^24, the measured domain"
+                ));
+            }
+            (a as f32).to_bits()
+        }
+        "s_mul_f32" => {
+            let (a, b) = (rd(s, 1)?, rd(s, 2)?);
+            let p = (f32::from_bits(a) * f32::from_bits(b)).to_bits();
+            if !normal(a) || !normal(b) || !normal(p) {
+                return Err(format!(
+                    "{name}: {a:#x} * {b:#x} needs a zero, denormal, NaN, infinite or overflowing value; not measured"
+                ));
+            }
+            p
+        }
+        _ => {
+            let a = rd(s, 1)?;
+            if a >> 31 != 0 || !normal(a) || a >= 0x4f80_0000 {
+                return Err(format!(
+                    "{name}: source {a:#x} is not a finite normal in (0, 2^32); conversion clamping is not measured"
+                ));
+            }
+            f32::from_bits(a) as u32
+        }
+    };
+    s.put(&o[0], 0, 0, value)
+}
+
+/// `v_s_rcp_f32 SDST, SSRC` (VOP3 with a scalar destination) on gfx1201: [`super::trans::rcp_f32`] for a source that
+/// is an integer in `1..=2^24`, exhaustively compared with hardware (`numerics_probe` suite `scalar_udiv`). The
+/// instruction executes once with a full EXEC; other sources and a partial EXEC are not measured.
+fn udiv_scalar_rcp(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
+    if arch != Arch::Gfx1201 {
+        return Err(format!("v_s_rcp_f32 is measured on gfx1201 only, not {arch:?}"));
+    }
+    let m = &i.mods;
+    if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.clamp {
+        return Err("v_s_rcp_f32: neg/abs/omod/clamp are not measured".into());
+    }
+    if s.exec != u32::MAX {
+        return Err("v_s_rcp_f32 with a partial EXEC is not measured".into());
+    }
+    let o = &i.operands;
+    let a = s.read(o.get(1).ok_or("missing v_s_rcp_f32 source")?, 0, 0)?;
+    let x = f32::from_bits(a);
+    if !(a >> 31 == 0 && (1.0..=UDIV_MAX as f32).contains(&x) && x.fract() == 0.0) {
+        return Err(format!(
+            "v_s_rcp_f32: source {a:#x} is not an integer in 1..=2^24, the measured domain"
+        ));
+    }
+    s.put(&o[0], 0, 0, super::trans::rcp_f32(arch, a))
 }
 
 fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
@@ -3850,23 +3947,30 @@ mod tests {
             st.vcc = 0xa5a5_5a5a;
             execute(arch, "v_div_scale_f32", &i, &mut st).unwrap();
             assert_eq!((st.s[10], st.vcc), (mask, 0xa5a5_5a5a), "{arch:?}");
-            // Domains the sweep leaves open stay errors: e1 228..=253, d = -96 with e1 != 254, e2 24..=26, S0 * 2^-64 with
-            // exponent field 64..=90.
-            for src in [
-                [one, 0x7800_0000, one],
-                [one, 0x3200_0000, 0x0200_0000],
-                [one, 0x0c80_0000, 0x0c80_0000],
-                [0x2300_0000, 0x7f00_0000, 0x7f00_0000],
+            // Domains only the gfx1151 sweep leaves open: e1 228..=253, d = -96 with e1 != 254, e2 24..=26, S0 * 2^-64
+            // with exponent field 64..=90. gfx1151 keeps the errors (and an error must not write); gfx1201's
+            // exponent-field receipt `gfx1201-div-r1` closes them: (S0, S1, S2) -> D.
+            for (src, want) in [
+                ([one, 0x7800_0000, one], 0x5f80_0000), // e1 = 240, d = -113: the numerator is scaled
+                ([one, 0x3200_0000, 0x0200_0000], 0x5f80_0000), // d = -96 with e1 = 100
+                ([one, 0x0c80_0000, 0x0c80_0000], one), // e2 = 25: the scale decision stops at e2 <= 24
+                ([one, 0x0c00_0000, 0x0c00_0000], 0x5f80_0000), // e2 = 24 is scaled (gfx1151 threshold: 23)
+                ([0x2300_0000, 0x7f00_0000, 0x7f00_0000], 0x0300_0000), // exponent field 70, e1 = 254: 2^-64
+                ([0x2000_0001, 0x7e80_0000, 0x7e80_0000], 0x0040_0000), // e1 = 253 acts like 254; field 64 gives the denormal tie, to even
+                ([one, 0x7e80_0000, 0x0080_0000], one), // e1 = 253, flagged and S0 != S1: unscaled
             ] {
                 let mut st = state();
                 st.exec = 1;
                 (st.v[1][0], st.v[2][0], st.v[3][0]) = (src[0], src[1], src[2]);
                 st.v[0][0] = 7;
-                assert!(
-                    execute(arch, "v_div_scale_f32", &i, &mut st).is_err(),
-                    "{arch:?} {src:x?}"
-                );
-                assert_eq!(st.v[0][0], 7, "an error must not write");
+                let r = execute(arch, "v_div_scale_f32", &i, &mut st);
+                if arch == Arch::Gfx1201 {
+                    r.unwrap_or_else(|e| panic!("{src:x?}: {e}"));
+                    assert_eq!(st.v[0][0], want, "{src:x?}");
+                } else {
+                    assert!(r.is_err(), "{arch:?} {src:x?}");
+                    assert_eq!(st.v[0][0], 7, "an error must not write");
+                }
             }
             // A NaN operand with abs/neg is not measured.
             let mut st = state();
@@ -5313,5 +5417,134 @@ mod tests {
         );
         assert_eq!(int(Arch::Gfx1100, "v_cmpx_eq_u32_e64", 5, 5, vec![]), Ok(1));
         assert_eq!(int(Arch::Gfx1100, "v_cmpx_eq_u32_e64", 5, 6, vec![]), Ok(0));
+    }
+
+    // The scalar unsigned-division expansion (gfx1201): the four float instructions chained exactly as the builder
+    // prologues use them, then the integer refinement and the two quotient corrections. The quotient and remainder must
+    // equal integer division for every sampled numerator and denominator.
+    fn udiv_float(name: &str, src: u32) -> std::result::Result<u32, String> {
+        let arch = Arch::Gfx1201;
+        let ops = if name == "v_s_rcp_f32" {
+            vec![sreg(0), sreg(1)]
+        } else {
+            vec![sreg(0), sreg(1), Operand::Literal(0x4f7f_fffe)]
+        };
+        let ops = if name == "s_mul_f32" { ops } else { ops[..2].to_vec() };
+        let i = insn_on(arch, name, ops);
+        let mut st = state();
+        st.exec = u32::MAX;
+        st.s[1] = src;
+        execute(arch, name, &i, &mut st).map(|_| st.s[0])
+    }
+
+    fn udiv_expansion(num: u32, den: u32) -> std::result::Result<(u32, u32), String> {
+        let x = udiv_float("s_cvt_f32_u32", den)?;
+        let x = udiv_float("v_s_rcp_f32", x)?;
+        let x = udiv_float("s_mul_f32", x)?;
+        let mut x = udiv_float("s_cvt_u32_f32", x)?;
+        let y = 0u32.wrapping_sub(den).wrapping_mul(x);
+        x = x.wrapping_add(((u64::from(x) * u64::from(y)) >> 32) as u32);
+        let mut q = ((u64::from(num) * u64::from(x)) >> 32) as u32;
+        let mut r = num.wrapping_sub(q.wrapping_mul(den));
+        for _ in 0..2 {
+            if r >= den {
+                q += 1;
+                r -= den;
+            }
+        }
+        Ok((q, r))
+    }
+
+    #[test]
+    fn scalar_udiv_expansion_is_exact_integer_division() {
+        let dens = (1u32..=300)
+            .chain([1000, 4095, 4096, 65535, 65536, 65537, 1 << 20, (1 << 24) - 1, 1 << 24]);
+        for den in dens {
+            for num in [0u32, 1, den - 1, den, den + 1, 7 * den + 3, 12345, u32::MAX, u32::MAX - den] {
+                assert_eq!(
+                    udiv_expansion(num, den),
+                    Ok((num / den, num % den)),
+                    "{num} / {den}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_udiv_float_ops_refuse_everything_outside_their_measured_domain() {
+        let f = f32::to_bits;
+        // s_cvt_f32_u32: only 1..=2^24.
+        assert_eq!(udiv_float("s_cvt_f32_u32", 3), Ok(f(3.0)));
+        assert!(udiv_float("s_cvt_f32_u32", 0).is_err());
+        assert!(udiv_float("s_cvt_f32_u32", (1 << 24) + 1).is_err());
+        // v_s_rcp_f32: only integers in [1, 2^24]; 1/3 is the model's, not exact.
+        assert!(udiv_float("v_s_rcp_f32", f(0.5)).is_err());
+        assert!(udiv_float("v_s_rcp_f32", f(-2.0)).is_err());
+        assert!(udiv_float("v_s_rcp_f32", f(0.0)).is_err());
+        assert!(udiv_float("v_s_rcp_f32", f(16777218.0)).is_err());
+        assert_eq!(udiv_float("v_s_rcp_f32", f(4.0)), Ok(f(0.25)));
+        // s_mul_f32: normals only, finite normal product.
+        assert_eq!(udiv_float("s_mul_f32", f(0.5)), Ok(f(0.5 * f32::from_bits(0x4f7f_fffe))));
+        for bad in [0, 0x8000_0000, 1, 0x7f80_0000, 0x7fc0_0000, 0x7f7f_ffff] {
+            assert!(udiv_float("s_mul_f32", bad).is_err(), "{bad:#x}");
+        }
+        // s_cvt_u32_f32: truncation of a positive normal below 2^32.
+        assert_eq!(udiv_float("s_cvt_u32_f32", f(3.99)), Ok(3));
+        assert_eq!(udiv_float("s_cvt_u32_f32", 0x4f7f_ffff), Ok(0xffff_ff00));
+        for bad in [0, f(-1.0), f(4294967296.0), 0x7f80_0000, 0x7fc0_0000, 1] {
+            assert!(udiv_float("s_cvt_u32_f32", bad).is_err(), "{bad:#x}");
+        }
+        // gfx1201 only, and v_s_rcp_f32 executes with a full EXEC only.
+        let i = insn_on(Arch::Gfx1201, "v_s_rcp_f32", vec![sreg(0), sreg(1)]);
+        let mut st = state();
+        st.s[1] = f(2.0);
+        st.exec = 1;
+        assert!(execute(Arch::Gfx1201, "v_s_rcp_f32", &i, &mut st).is_err());
+        let j = insn_on(Arch::Gfx1151, "s_mul_f32", vec![sreg(0), sreg(1), Operand::Literal(0x4f7f_fffe)]);
+        assert!(execute(Arch::Gfx1151, "s_mul_f32", &j, &mut state()).is_err());
+    }
+
+    /// Receipt replay (opt-in): `PM_RECEIPT_DIR=<rcpt>/gfx1201-div-r1 cargo test -p peacemaker-ir --lib
+    /// numerics_receipt_replay -- --ignored`. Every v_div_scale_f32 tuple (D and the lane predicate) and every
+    /// scalar-udiv denominator (reciprocal stage against `trans::rcp_f32`) of the hardware receipt.
+    #[test]
+    #[ignore]
+    fn numerics_receipt_replay() {
+        let dir = std::env::var("PM_RECEIPT_DIR").expect("PM_RECEIPT_DIR");
+        let words = |name: &str| -> Vec<u32> {
+            std::fs::read(format!("{dir}/{name}"))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (ins, out) = (words("div_scale.in.bin"), words("div_scale.out.bin"));
+        let mut bad = 0usize;
+        for (n, (t, o)) in ins.chunks_exact(3).zip(out.chunks_exact(2)).enumerate() {
+            let got = div_scale_edge(Arch::Gfx1201, t[0], t[1], t[2]);
+            if got != Ok((o[0], o[1] != 0)) {
+                bad += 1;
+                if bad <= 8 {
+                    eprintln!("div_scale tuple {n} {t:x?}: model {got:x?}, hardware {:#x} flag {}", o[0], o[1]);
+                }
+            }
+        }
+        assert_eq!(bad, 0, "div_scale mismatches over {} tuples", ins.len() / 3);
+        let rec = words("scalar_udiv.out.bin");
+        let mut bad = 0usize;
+        for (n, r) in rec.chunks_exact(4).enumerate() {
+            let den = n as u32 + 1;
+            let x = (den as f32).to_bits();
+            let rcp = super::super::trans::rcp_f32(Arch::Gfx1201, x);
+            let m = (f32::from_bits(rcp) * f32::from_bits(0x4f7f_fffe)).to_bits();
+            let u = f32::from_bits(m) as u32;
+            if r != [x, rcp, m, u] {
+                bad += 1;
+                if bad <= 8 {
+                    eprintln!("scalar_udiv den {den}: model {:x?}, hardware {r:x?}", [x, rcp, m, u]);
+                }
+            }
+        }
+        assert_eq!(bad, 0, "scalar udiv mismatches over {} denominators", rec.len() / 4);
     }
 }

@@ -11,7 +11,7 @@
 //
 // Build (CPU only, no GPU launch):  build.sh <gfx1151|gfx1201> [outdir]
 // Run (inside a bounded fabric hold):  numerics_probe <outdir> <suite[,suite...]|all>
-//   suites: identity dot wmma iu8 swmmac_map swmmac_num
+//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv
 // Output per test: <name>.json (schema/meta, mode request + MODE readback) and <name>.out.bin / <name>.in.bin.
 #include <hip/hip_runtime.h>
 #include <cstdarg>
@@ -946,6 +946,91 @@ static void suite_swmmac_valid() {
 #endif
 }
 
+// ============================================================================================== DIV_SCALE (gfx11 + gfx12)
+// v_div_scale_f32 D, SDST(wave32 lane mask), S0, S1, S2 over an exponent-field Cartesian set (not a 64-member
+// value set): every denominator exponent field e1 (0..255) x every numerator exponent field e2 (0..255) x S1/S2
+// mantissa classes x a fixed list of S0 shapes (including S0 == S1 and S0 == S2 bitwise). Records D and the lane's
+// SDST bit. Opt-in suite (`div_scale`): not part of `all`, so the older receipts stay reproducible.
+__global__ void divscale_k(const uint32_t* in, uint32_t* out, uint32_t n) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t a = in[3 * size_t(i)], b = in[3 * size_t(i) + 1], c = in[3 * size_t(i) + 2], d, m;
+  asm volatile("v_div_scale_f32 %0, %1, %2, %3, %4" : "=v"(d), "=s"(m) : "v"(a), "v"(b), "v"(c));
+  out[2 * size_t(i)] = d;
+  out[2 * size_t(i) + 1] = (m >> (threadIdx.x & 31)) & 1u;
+}
+static std::vector<uint32_t> divscale_set() {
+  std::vector<uint32_t> v;
+  static const uint32_t M1[4] = {0x000000, 0x000001, 0x400000, 0x7fffff};
+  static const uint32_t M2[3] = {0x000000, 0x555555, 0x7fffff};
+  // S0 shapes: kind 0 = S1 bits, 1 = S2 bits, otherwise a fixed word.
+  static const uint32_t S0W[12] = {0, 0, 0x00800000, 0x1fffffff, 0x20000000, 0x2dffffff, 0x2e800000, 0x3fc00000, 0xe4123456, 0x7f7fffff, 0x00000001, 0x80000000};
+  static const uint32_t S0S[4] = {0x7fc00000, 0x7f800001, 0x7f800000, 0xff800000};
+  for (uint32_t e1 = 0; e1 < 256; e1++)
+    for (uint32_t e2 = 0; e2 < 256; e2++)
+      for (uint32_t i1 = 0; i1 < 4; i1++)
+        for (uint32_t i2 = 0; i2 < 3; i2++) {
+          uint32_t sg1 = (e1 + i1 + e2) & 1u, sg2 = (e2 + i2 + (e1 >> 1)) & 1u;
+          uint32_t s1 = (sg1 << 31) | (e1 << 23) | M1[i1], s2 = (sg2 << 31) | (e2 << 23) | M2[i2];
+          for (int k = 0; k < 12 + 4; k++) {
+            uint32_t s0 = k == 0 ? s1 : k == 1 ? s2 : k < 12 ? S0W[k] : S0S[k - 12];
+            v.push_back(s0); v.push_back(s1); v.push_back(s2);
+          }
+        }
+  return v;
+}
+static void suite_div_scale() {
+  std::vector<uint32_t> in = divscale_set();
+  while ((in.size() / 3) % 256) { in.push_back(0x3f800000); in.push_back(0x3f800000); in.push_back(0x3f800000); }
+  uint32_t n = in.size() / 3;
+  write_file(OUT + "/div_scale.in.bin", in.data(), in.size() * 4);
+  record("div_scale.in", fmt("{\"kind\":\"div_scale_inputs\",\"arch\":\"%s\",\"cases\":%u,\"record\":\"u32 s0,s1,s2\"}", ARCH, n));
+  DevBuf<uint32_t> din(in), dout(size_t(2) * n);
+  divscale_k<<<n / 256, 256>>>(din.p, dout.p, n);
+  HIP(hipGetLastError());
+  HIP(hipDeviceSynchronize());
+  auto res = dout.get();
+  write_file(OUT + "/div_scale.out.bin", res.data(), res.size() * 4);
+  record("div_scale.out", fmt("{\"kind\":\"div_scale_result\",\"arch\":\"%s\",\"cases\":%u,\"record\":\"u32 d, u32 sdst_bit\",\"inputs\":\"div_scale.in\"}", ARCH, n));
+}
+
+// ============================================================================================== SCALAR UDIV CHAIN (gfx12)
+// The four scalar float instructions of the LLVM AMDGPU udiv expansion, one wave per denominator, stage by stage:
+//   x = s_cvt_f32_u32(den); r = v_s_rcp_f32(x); m = s_mul_f32(r, 0x4f7ffffe); u = s_cvt_u32_f32(m)
+// for every den in 1..=2^24 (den and the f32 it converts to are exact integers there). Records x, r, m, u.
+// Opt-in suite (`scalar_udiv`).
+#if NP_GFX12
+__global__ void sudiv_k(uint32_t* out, uint32_t base, uint32_t n) {
+  uint32_t i = base + blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (i >= n) return;
+  uint32_t den = __builtin_amdgcn_readfirstlane(i + 1);
+  uint32_t x, r, m, u;
+  asm volatile("s_cvt_f32_u32 %0, %1" : "=s"(x) : "s"(den));
+  asm volatile("v_s_rcp_f32 %0, %1\n\ts_wait_alu depctr_va_sdst(0)" : "=s"(r) : "s"(x));
+  asm volatile("s_mul_f32 %0, %1, 0x4f7ffffe" : "=s"(m) : "s"(r));
+  asm volatile("s_cvt_u32_f32 %0, %1" : "=s"(u) : "s"(m));
+  if ((threadIdx.x & 31) == 0) {
+    out[4 * size_t(i)] = x;
+    out[4 * size_t(i) + 1] = r;
+    out[4 * size_t(i) + 2] = m;
+    out[4 * size_t(i) + 3] = u;
+  }
+}
+static void suite_scalar_udiv() {
+  const uint32_t n = 1u << 24;
+  DevBuf<uint32_t> dout(size_t(4) * n);
+  for (uint32_t base = 0; base < n; base += 1u << 22) {
+    sudiv_k<<<((1u << 22) + 7) / 8, 256>>>(dout.p, base, n);
+    HIP(hipGetLastError());
+  }
+  HIP(hipDeviceSynchronize());
+  auto res = dout.get();
+  write_file(OUT + "/scalar_udiv.out.bin", res.data(), res.size() * 4);
+  record("scalar_udiv.out", fmt("{\"kind\":\"scalar_udiv_result\",\"arch\":\"%s\",\"dens\":%u,\"record\":\"u32 x,r,m,u for den = index + 1\"}", ARCH, n));
+}
+#else
+static void suite_scalar_udiv() {}
+#endif
+
 // ============================================================================================== identity + main
 static void suite_identity() {
   int cnt = 0;
@@ -976,6 +1061,10 @@ int main(int argc, char** argv) {
   if (want("swmmac_map")) suite_swmmac_map();
   if (want("swmmac_num")) suite_swmmac_num();
   if (want("swmmac_valid")) suite_swmmac_valid();
+  // opt-in only (`all` does not include them)
+  auto exact = [&](const char* s) { return suites.find(std::string(",") + s + ",") != std::string::npos; };
+  if (exact("div_scale")) suite_div_scale();
+  if (exact("scalar_udiv")) suite_scalar_udiv();
   std::string idx;
   for (auto& n : INDEX) idx += n + "\n";
   write_text(OUT + "/INDEX.txt", idx);
