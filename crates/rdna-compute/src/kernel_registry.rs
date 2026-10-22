@@ -3032,6 +3032,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "hyper_read_up_wmma_bf16_gfx1201",
                 "hyper_read_up_wmma_bf16_gfx1201_t128",
+                "hyper_read_up_wmma_bf16_gfx1201_v2",
             ]
         );
         add!(
