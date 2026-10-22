@@ -1471,6 +1471,19 @@ pub const MQ_ROTATE_X_I4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// Qwen4 MoE front producer (gfx1201 sealed grouped prefill, symmetric IU4 route): the plain
+/// FWHT rotate + in-register `block_i4_128` emit of [`MQ_ROTATE_X_I4_SRC`] (the F32 rotated
+/// row is not stored: the symmetric gate/up reads only the sidecar) that also stores the RNE
+/// F16 cast of the raw row (`convert_f32_to_f16`'s bytes) from the registers it loaded: the F16
+/// X of the router / shared-expert WMMA GEMMs in the same launch. Gated by
+/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`.
+pub const MQ_ROTATE_X_I4_F16OUT_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_F16_OUT 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_f16out\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),

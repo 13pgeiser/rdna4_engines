@@ -278,6 +278,16 @@ pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
     });
+/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE` (default on, `0` restores the unfused chain): the
+/// sealed grouped MoE prefill on exact gfx1201's symmetric IU4 route reads the HC `mixed`
+/// rows once in `mq_rotate_x_i4_f16out`, which emits both the router / shared-expert F16 X
+/// (the bytes of `convert_f32_to_f16`) and the routed gate/up IU4 sidecar (the bytes of
+/// `mq_rotate_x_i4`), and skips the F32 `mq_rotate_x` whose output no reader on that route
+/// consumes. Byte-identical to the chain it replaces. Read once.
+pub(crate) static QWEN4_MOE_FRONT_FUSE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_FRONT_FUSE", true)
+    });
 /// `HIPFIRE_QWEN4_MOE_X_LDS` (`auto` | `1` | `0`, default `auto`): on exact
 /// gfx1151 the F16 WMMA grouped MoE gate/up SiLU and down GEMMs take the
 /// entries whose row-tile waves share each expert run's X through LDS
@@ -29888,6 +29898,23 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
+        self.gemm_bf16_xf32_f16_wmma_qwen4_groups_x16(groups, x, None, k, batch_size)
+    }
+
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_groups`] with `x16`, when given, being the F16
+    /// conversion of `x` already in place (the fused MoE front,
+    /// [`Gpu::qwen4_moe_front_producer`]): no `convert_f32_to_f16` is launched and every GEMM
+    /// reads `x16` exactly as it reads the conversion's output (the short M < 16 projections
+    /// still read the F32 `x`). Nothing may have converted into the F16 scratch since `x16`
+    /// was produced.
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_groups_x16(
+        &mut self,
+        groups: &[&[(&GpuTensor, &GpuTensor, usize)]],
+        x: &GpuTensor,
+        x16: Option<&GpuTensor>,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
         if groups.iter().any(|g| g.is_empty())
             || !groups
                 .iter()
@@ -29899,7 +29926,15 @@ impl Gpu {
         self.bind_thread()?;
         let gfx1201 = self.arch_caps.is_gfx1201();
         let short = move |m: usize| m < 16 && gfx1201;
-        let mut x_view: Option<GpuTensor> = None;
+        if let Some(t) = x16 {
+            if t.dtype != DType::F16 || t.numel() < batch_size * k {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "gemm_bf16_xf32_f16_wmma_qwen4_groups_x16: x16 must be F16 with batch * k elements",
+                ));
+            }
+        }
+        let mut x_view: Option<GpuTensor> = x16.map(GpuTensor::shallow_clone);
         for projections in groups {
             for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
                 self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
@@ -50920,6 +50955,63 @@ impl Gpu {
         let prepared = self.rotate_x_mq_i4_batched(x, None, None, reservation, k, rows)?;
         self.moe_route_census.a4_gate_producer += 1;
         Ok(prepared)
+    }
+
+    /// Whether the Qwen4 MoE front producer ([`Gpu::qwen4_moe_front_producer`]) may replace
+    /// the sealed grouped prefill's `convert_f32_to_f16` + `mq_rotate_x_i4` (and the dead
+    /// F32 `mq_rotate_x`): exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE` not `0`, the
+    /// aggregate symmetric IU4 descriptor present, and no recorder or graph capture (the F16
+    /// scratch is written by a fresh producer launch, not a recorded conversion).
+    pub fn qwen4_moe_front_fuse_applies(&self) -> bool {
+        *QWEN4_MOE_FRONT_FUSE
+            && self.arch_caps.is_gfx1201()
+            && self.qwen4_moe_sym_kernel().is_some()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// Gate/up A4 producer fused with the router / shared-expert F16 X conversion: one
+    /// read of F32 `x` `[rows, k]` yields the [`Gpu::qwen4_moe_rotate256_i4`] sidecar (bytes
+    /// of `mq_rotate_x_i4`) and the shared F16 X scratch holding the bytes of
+    /// [`Gpu::qwen4_convert_f16_x`] (`convert_f32_to_f16`), returned as an F16 view. The F16
+    /// view is valid until the next FP16 conversion; the sidecar until the next
+    /// `reserve_int4_mmq`. Callers gate with [`Gpu::qwen4_moe_front_fuse_applies`].
+    pub fn qwen4_moe_front_producer(
+        &mut self,
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<(crate::scratch::Int4MmqPrepared, GpuTensor)> {
+        if !self.qwen4_moe_front_fuse_applies() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_front_producer: the fused front does not apply on this device/mode",
+            ));
+        }
+        let kernel = self.qwen4_moe_sym_require("qwen4_moe_front_producer")?;
+        if kernel.gate_producer.require_c2
+            && !iu4_a4_candidates_c2_only(&self.flags.hipcc_extra_flags)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "qwen4_moe_front_producer: the {} route needs the C2 A4 candidate set (-DIU4_A4_CANDIDATES=2)",
+                    kernel.arch
+                ),
+            ));
+        }
+        if x.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_front_producer: F32 input only",
+            ));
+        }
+        crate::moe::require_span(x, &[rows, k, 4], "qwen4_moe_front_producer activations")?;
+        let x16 = self.qwen4_f16_x_scratch(rows * k)?;
+        let reservation = self.reserve_int4_mmq(k, rows)?;
+        let prepared = self.rotate_x_mq_i4_f16out_batched(x, &x16, reservation, k, rows)?;
+        self.moe_route_census.a4_gate_producer += 1;
+        Ok((prepared, x16))
     }
 
     /// Sealed-slab gate/up A4 producer: [`Gpu::qwen4_moe_rotate256_i4`] on gfx1201 and gfx1151 (unchanged),
