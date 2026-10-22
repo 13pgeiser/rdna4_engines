@@ -1121,6 +1121,7 @@ module	mq_rotate_x_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or
 module	mq_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	mq_rotate_x_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	mq8_rotate_quantize_x	codec-outside-core-rungs	MQ8G256 route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/steps.rs:1638
+module	mq_rotate_x_i8_gfx11	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (one-pass rotate + A8 producer of the exact-INT8 MQ6 prefill); rdna-compute/src/gemv.rs:6666
 module	pack_f32_to_fp8_gfx12	codec-outside-core-rungs	HFP4G32/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/dispatch.rs:4358
 module	pack_fp8_verify_rows_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_CB_VERIFY_FP8; rdna-compute/src/gemm_fp8_verify.rs:400-440
 module	pflash_score_fwht2_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18932

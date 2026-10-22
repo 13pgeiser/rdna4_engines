@@ -49,13 +49,7 @@ pub(crate) fn emit_msn(b: &mut Builder, g: &Gen, nb: usize) -> Result<(), String
 
 /// One fragment's 20 packets. `S` / `Z` / `T` octets are fixed (see the constants), the
 /// accumulators `cacc[k]`, `acc[k]` come from `g`.
-pub(crate) fn fragment(
-    b: &mut Builder,
-    g: &Gen,
-    k: usize,
-    sc: u8,
-    zp: u8,
-) -> Result<(), String> {
+pub(crate) fn fragment(b: &mut Builder, g: &Gen, k: usize, sc: u8, zp: u8) -> Result<(), String> {
     let nb = k / 2;
     let (dd, sp) = (g.tok + 2 * nb as u8, g.tok + 2 * nb as u8 + 1);
     let c = g.cacc + 8 * k as u8;

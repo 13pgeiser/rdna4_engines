@@ -16,13 +16,13 @@
 #![cfg(feature = "toolchain")]
 use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, MmaIu4, Workgroup};
 use peacemaker_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
+use peacemaker_isa::kernels::mq6_i8_gemm;
 use peacemaker_isa::kernels::{
     e8p_i4_moe_gemv, fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4,
     mq_i4_a4, mq_i4_moe_gemv, mq_i4_moe_gemv_c1, mq_i4_moe_gemv_cn, mq_i4_rows,
     mtp_dense_det_gfx11, mtp_q8_det_gfx11, qsa_gather, qwen4_moe_sym, qwen4_mq4_x4_gfx11,
     qwen4_mq6_x4, qwen4_mq6_x4_gfx11,
 };
-use peacemaker_isa::kernels::mq6_i8_gemm;
 use peacemaker_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use peacemaker_isa::{
     native, reg::Live, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,

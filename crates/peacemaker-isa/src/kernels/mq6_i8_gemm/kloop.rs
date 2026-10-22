@@ -405,12 +405,7 @@ fn block_with(
     if fetch_next {
         // Next block's token word and packed row header (header word of the next half; across a
         // group boundary the group stride, since `goff` has not advanced).
-        publish::fetch_meta(
-            wg.isa(),
-            g,
-            h,
-            if h == 0 { 4 } else { spec::GROUP_BYTES },
-        )?;
+        publish::fetch_meta(wg.isa(), g, h, if h == 0 { 4 } else { spec::GROUP_BYTES })?;
     }
     // B1 is split: the next block's raw slab-0 fetch (VMEM, its registers are free once the
     // stores drained) overlaps the rendezvous.
@@ -420,7 +415,15 @@ fn block_with(
     if fetch_next {
         let b = wg.isa();
         publish::fetch_a(b, g, 0, 0, g.srd_a[h ^ 1])?;
-        publish::fetch_w(b, g, if h == 0 { 8 + 96 } else { spec::GROUP_BYTES + 8 })?;
+        publish::fetch_w(
+            b,
+            g,
+            if h == 0 {
+                8 + 96
+            } else {
+                spec::GROUP_BYTES + 8
+            },
+        )?;
     }
     let (ra, rw) = wg.wait_arrived(b1)?;
     st.a = Pr::Free(ra);
@@ -456,7 +459,12 @@ fn block_with(
     // from `sc_addr`.
     crate::kernels::common::op(
         b,
-        format!("v_add_nc_u32_e32 v{}, {}, v{}", g.msn, crate::kernels::common::lit(l.ds[h]), g.d_addr),
+        format!(
+            "v_add_nc_u32_e32 v{}, {}, v{}",
+            g.msn,
+            crate::kernels::common::lit(l.ds[h]),
+            g.d_addr
+        ),
         &[crate::kernels::common::v(g.msn)],
         &[crate::kernels::common::v(g.d_addr)],
     )?;
@@ -562,7 +570,11 @@ pub(crate) fn seed_fill(b: &mut Builder, g: &Gen) -> Result<(), String> {
     for i in 0..8u8 {
         crate::kernels::common::op(
             b,
-            format!("v_mov_b32_e32 v{}, {}", g.scratch + i, crate::kernels::common::lit(0x4b40_0000)),
+            format!(
+                "v_mov_b32_e32 v{}, {}",
+                g.scratch + i,
+                crate::kernels::common::lit(0x4b40_0000)
+            ),
             &[crate::kernels::common::v(g.scratch + i)],
             &[],
         )?;

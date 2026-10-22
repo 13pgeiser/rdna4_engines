@@ -76,13 +76,7 @@ pub(crate) fn ds_load(text: String, dst: RegRef, addr: u8) -> Instruction {
 
 /// Raw activation chunks of K32 half `sb` of slab `slab` of the block whose descriptor is
 /// `srd`: one b64 per staging round into `a_pf[r]`.
-pub(crate) fn fetch_a(
-    b: &mut Builder,
-    g: &Gen,
-    slab: u32,
-    sb: u32,
-    srd: u8,
-) -> Result<(), String> {
+pub(crate) fn fetch_a(b: &mut Builder, g: &Gen, slab: u32, sb: u32, srd: u8) -> Result<(), String> {
     b.clause(|b| {
         for r in 0..2u32 {
             vload(
@@ -107,7 +101,15 @@ pub(crate) fn fetch_w(b: &mut Builder, g: &Gen, base: u32) -> Result<(), String>
         for r in 0..2usize {
             let soff = if r == 0 { g.goff } else { g.goff1 };
             for i in 0..3u32 {
-                vload(b, g.w_pf[r] + i as u8, 1, g.st_w, g.srd_w, Some(soff), base + 4 * i)?;
+                vload(
+                    b,
+                    g.w_pf[r] + i as u8,
+                    1,
+                    g.st_w,
+                    g.srd_w,
+                    Some(soff),
+                    base + 4 * i,
+                )?;
             }
         }
         Ok(())
@@ -157,12 +159,37 @@ fn vop<S: Sink>(b: &mut S, text: String, defs: &[u8], uses: &[RegRef]) -> Result
 /// `sp4` in place on `f`, `y` scratch: the four 6-bit codes of the 24-bit field `f` spread into the
 /// four bytes of the dword (byte i = code i).
 fn sp4<S: Sink>(b: &mut S, f: u8, y: u8) -> Result<(), String> {
-    vop(b, format!("v_and_b32_e32 v{y}, 0xfff000, v{f}"), &[y], &[v(f)])?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{y}, 0xfff000, v{f}"),
+        &[y],
+        &[v(f)],
+    )?;
     vop(b, format!("v_and_b32_e32 v{f}, 0xfff, v{f}"), &[f], &[v(f)])?;
-    vop(b, format!("v_lshl_or_b32 v{f}, v{y}, 4, v{f}"), &[f], &[v(y), v(f)])?;
-    vop(b, format!("v_and_b32_e32 v{y}, 0xfc00fc0, v{f}"), &[y], &[v(f)])?;
-    vop(b, format!("v_and_b32_e32 v{f}, 0x3f003f, v{f}"), &[f], &[v(f)])?;
-    vop(b, format!("v_lshl_or_b32 v{f}, v{y}, 2, v{f}"), &[f], &[v(y), v(f)])
+    vop(
+        b,
+        format!("v_lshl_or_b32 v{f}, v{y}, 4, v{f}"),
+        &[f],
+        &[v(y), v(f)],
+    )?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{y}, 0xfc00fc0, v{f}"),
+        &[y],
+        &[v(f)],
+    )?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{f}, 0x3f003f, v{f}"),
+        &[f],
+        &[v(f)],
+    )?;
+    vop(
+        b,
+        format!("v_lshl_or_b32 v{f}, v{y}, 2, v{f}"),
+        &[f],
+        &[v(y), v(f)],
+    )
 }
 
 /// Decode the weight round `r` raw dwords (16 six-bit codes in `w0 | w1 << 32 | w2 << 64`, code i
@@ -232,7 +259,13 @@ pub(crate) fn store_w_round<C: State>(
     let sw = w.ds_store(
         sw,
         ds_store(
-            format!("ds_store_b64 v{}, v[{}:{}]{}", g.st_wlds, o, o + 1, ds_offset(base)),
+            format!(
+                "ds_store_b64 v{}, v[{}:{}]{}",
+                g.st_wlds,
+                o,
+                o + 1,
+                ds_offset(base)
+            ),
             vec![v(g.st_wlds), vr(o, 2)],
         ),
     )?;
@@ -278,7 +311,6 @@ pub(crate) fn store_a_half<C: State>(
     Ok(sa)
 }
 
-
 /// The VALU part of [`publish_meta`]: `x` (scratch+6) receives the token-plane word, `wr`
 /// (scratch+7) the row-plane word.
 pub(crate) fn meta_insns<S: Sink>(b: &mut S, g: &Gen) -> Result<(), String> {
@@ -309,12 +341,7 @@ pub(crate) fn meta_insns<S: Sink>(b: &mut S, g: &Gen) -> Result<(), String> {
         &[z],
         &[v(g.sz_nx)],
     )?;
-    vop(
-        b,
-        format!("v_cvt_f32_f16_e64 v{z}, v{z}.l"),
-        &[z],
-        &[v(z)],
-    )?;
+    vop(b, format!("v_cvt_f32_f16_e64 v{z}, v{z}.l"), &[z], &[v(z)])?;
     vop(
         b,
         format!("v_fma_f32 v{z}, v{wr}, {}, v{z}", lit(0x4200_0000)),
@@ -348,14 +375,22 @@ pub(crate) fn publish_meta<C: State>(
     let sd = w.ds_store(
         sd,
         ds_store(
-            format!("ds_store_b32 v{}, v{x}{}", g.meta_lds, ds_offset(l.ds[plane])),
+            format!(
+                "ds_store_b32 v{}, v{x}{}",
+                g.meta_lds,
+                ds_offset(l.ds[plane])
+            ),
             vec![v(g.meta_lds), v(x)],
         ),
     )?;
     let sz = w.ds_store(
         sz,
         ds_store(
-            format!("ds_store_b32 v{}, v{wr}{}", g.meta_lds, ds_offset(l.sz[plane])),
+            format!(
+                "ds_store_b32 v{}, v{wr}{}",
+                g.meta_lds,
+                ds_offset(l.sz[plane])
+            ),
             vec![v(g.meta_lds), v(wr)],
         ),
     )?;

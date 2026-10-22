@@ -61,7 +61,6 @@ fn udiv(b: &mut Builder, num: u8, den: u8, q: u8, r: u8, x: u8, y: u8) -> Result
     Ok(())
 }
 
-
 /// VALU helper: `vdst` defined, `vuse`/`suse` read.
 fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Result<(), String> {
     let uses = vuse
@@ -104,7 +103,12 @@ pub(crate) fn emit(
         Raster::Banded => {
             // Banded raster: lin = y * gridDim.x + x; bands of 8 row tiles, rows fastest within
             // a band, then token tiles (bijective, partial last band).
-            sop(b, format!("s_and_b32 s{}, ttmp7, 0xffff", t[0]), &[t[0]], &[])?;
+            sop(
+                b,
+                format!("s_and_b32 s{}, ttmp7, 0xffff", t[0]),
+                &[t[0]],
+                &[],
+            )?;
             sop(
                 b,
                 format!("s_mul_i32 s{}, s{}, s{}", t[1], t[0], a.bcx),
@@ -164,7 +168,12 @@ pub(crate) fn emit(
         }
         Raster::Linear => {
             sop(b, "s_lshl_b32 s48, ttmp9, 7".to_string(), &[g.rs], &[])?;
-            sop(b, format!("s_and_b32 s{}, ttmp7, 0xffff", t[0]), &[t[0]], &[])?;
+            sop(
+                b,
+                format!("s_and_b32 s{}, ttmp7, 0xffff", t[0]),
+                &[t[0]],
+                &[],
+            )?;
             sop(
                 b,
                 format!("s_lshl_b32 s{}, s{}, 7", g.bs, t[0]),
@@ -365,25 +374,85 @@ pub(crate) fn emit(
         &[x],
     )?;
     // Staging coordinates.
-    vop(b, format!("v_lshrrev_b32_e32 v{tt0}, 2, v0"), tt0, &[0], &[])?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{tt0}, 2, v0"),
+        tt0,
+        &[0],
+        &[],
+    )?;
     vop(b, format!("v_and_b32_e32 v{c}, 3, v0"), c, &[0], &[])?;
     vop(b, format!("v_and_b32_e32 v{c0}, 1, v{c}"), c0, &[c], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{c1}, 1, v{c}"), c1, &[c], &[])?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{c1}, 1, v{c}"),
+        c1,
+        &[c],
+        &[],
+    )?;
     vop(b, format!("v_and_b32_e32 v{m}, 15, v{tt0}"), m, &[tt0], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{half}, 6, v0"), half, &[0], &[])?;
-    vop(b, format!("v_and_b32_e32 v{half}, 1, v{half}"), half, &[half], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{gp0}, 7, v0"), gp0, &[0], &[])?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{half}, 6, v0"),
+        half,
+        &[0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{half}, 1, v{half}"),
+        half,
+        &[half],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{gp0}, 7, v0"),
+        gp0,
+        &[0],
+        &[],
+    )?;
     // Activation slot: gp0*2048 + c0*512 + p_s*16 + 8*(half ^ c0), p_s = (m | c1<<4) ^ (c1<<2).
     for (pos, sel, dst, base) in [(c1, c0, g.st_alds, 9u32), (c0, c1, g.st_wlds, 10)] {
         // `pos` is the lane-half bit (kg), `sel` the slot-select / plane bit.
-        vop(b, format!("v_lshlrev_b32_e32 v{p}, 4, v{pos}"), p, &[pos], &[])?;
+        vop(
+            b,
+            format!("v_lshlrev_b32_e32 v{p}, 4, v{pos}"),
+            p,
+            &[pos],
+            &[],
+        )?;
         vop(b, format!("v_or_b32_e32 v{p}, v{p}, v{m}"), p, &[p, m], &[])?;
-        vop(b, format!("v_lshlrev_b32_e32 v{q}, 2, v{pos}"), q, &[pos], &[])?;
-        vop(b, format!("v_xor_b32_e32 v{p}, v{p}, v{q}"), p, &[p, q], &[])?;
+        vop(
+            b,
+            format!("v_lshlrev_b32_e32 v{q}, 2, v{pos}"),
+            q,
+            &[pos],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_xor_b32_e32 v{p}, v{p}, v{q}"),
+            p,
+            &[p, q],
+            &[],
+        )?;
         vop(b, format!("v_lshlrev_b32_e32 v{p}, 4, v{p}"), p, &[p], &[])?;
-        vop(b, format!("v_xor_b32_e32 v{q}, v{half}, v{sel}"), q, &[half, sel], &[])?;
+        vop(
+            b,
+            format!("v_xor_b32_e32 v{q}, v{half}, v{sel}"),
+            q,
+            &[half, sel],
+            &[],
+        )?;
         vop(b, format!("v_lshlrev_b32_e32 v{q}, 3, v{q}"), q, &[q], &[])?;
-        vop(b, format!("v_add_nc_u32_e32 v{p}, v{p}, v{q}"), p, &[p, q], &[])?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{p}, v{p}, v{q}"),
+            p,
+            &[p, q],
+            &[],
+        )?;
         // plane term: A: e*512 (c0 << 9); W: sb*1024 (c1 << 10)
         vop(
             b,
@@ -392,9 +461,27 @@ pub(crate) fn emit(
             &[sel],
             &[],
         )?;
-        vop(b, format!("v_add_nc_u32_e32 v{p}, v{p}, v{q}"), p, &[p, q], &[])?;
-        vop(b, format!("v_lshlrev_b32_e32 v{q}, 11, v{gp0}"), q, &[gp0], &[])?;
-        vop(b, format!("v_add_nc_u32_e32 v{dst}, v{p}, v{q}"), dst, &[p, q], &[])?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{p}, v{p}, v{q}"),
+            p,
+            &[p, q],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_lshlrev_b32_e32 v{q}, 11, v{gp0}"),
+            q,
+            &[gp0],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{dst}, v{p}, v{q}"),
+            dst,
+            &[p, q],
+            &[],
+        )?;
     }
     // Global offsets: activation token (bs + R) * 136 + c * 8; weight row (rs + R) * gpr200 + c * 12.
     vop(b, format!("v_lshlrev_b32_e32 v{r}, 3, v{c}"), r, &[c], &[])?;
@@ -435,9 +522,21 @@ pub(crate) fn emit(
     )?;
     // Metadata lanes: slot tok = tid >> 1 of plane w = tid & 1.
     let (tok, wl) = (15u8, 16u8);
-    vop(b, format!("v_lshrrev_b32_e32 v{tok}, 1, v0"), tok, &[0], &[])?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{tok}, 1, v0"),
+        tok,
+        &[0],
+        &[],
+    )?;
     vop(b, format!("v_and_b32_e32 v{wl}, 1, v0"), wl, &[0], &[])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{q}, 9, v{wl}"), q, &[wl], &[])?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{q}, 9, v{wl}"),
+        q,
+        &[wl],
+        &[],
+    )?;
     vop(
         b,
         format!("v_lshl_add_u32 v{}, v{tok}, 2, v{q}", g.meta_lds),
@@ -492,7 +591,13 @@ pub(crate) fn emit(
         &[q],
         &[x],
     )?;
-    vop(b, format!("v_lshlrev_b32_e32 v{q}, 2, v{ml}"), q, &[ml], &[])?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{q}, 2, v{ml}"),
+        q,
+        &[ml],
+        &[],
+    )?;
     sop(b, format!("s_lshl_b32 s{x}, s{th}, 8"), &[x], &[th])?;
     vop(
         b,

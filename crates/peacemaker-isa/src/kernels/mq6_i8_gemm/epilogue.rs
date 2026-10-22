@@ -44,7 +44,12 @@ fn layout(g: &Gen) -> Epilogue {
     }
 }
 
-fn vop(b: &mut Builder, text: String, defs: &[u8], uses: &[crate::reg::RegRef]) -> Result<(), String> {
+fn vop(
+    b: &mut Builder,
+    text: String,
+    defs: &[u8],
+    uses: &[crate::reg::RegRef],
+) -> Result<(), String> {
     op(
         b,
         text,
@@ -65,7 +70,7 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, _end: &End) -> Result<(), String> {
     let e = layout(g);
     let y = g.srd_y;
     let eb = if bf16 { 1 } else { 2 }; // log2(element bytes)
-    // Tile-relative descriptor: Y + (bs * M + first row) * element size.
+                                       // Tile-relative descriptor: Y + (bs * M + first row) * element size.
     sop(
         b,
         format!("s_mul_i32 s{y}, s{}, s{}", g.bs, a.m),
@@ -96,7 +101,12 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, _end: &End) -> Result<(), String> {
         &[sr(y, 2)],
         &[sr(y, 2)],
     )?;
-    sop(b, format!("s_add_co_u32 s{y}, s{y}, s{}", a.y), &[y], &[y, a.y])?;
+    sop(
+        b,
+        format!("s_add_co_u32 s{y}, s{y}, s{}", a.y),
+        &[y],
+        &[y, a.y],
+    )?;
     sop(
         b,
         format!("s_add_co_ci_u32 s{0}, s{0}, s{1}", y + 1, a.y + 1),
@@ -265,7 +275,10 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, _end: &End) -> Result<(), String> {
                     let q = (nb * 2 + rg) * 2 + c;
                     let out = [g.cacc + 2 * q as u8, g.cacc + 2 * q as u8 + 1];
                     for p in 0..2usize {
-                        let (lo, hi) = (acc(nb, rg, c) + 2 * p as u8, acc(nb, rg, c) + 2 * p as u8 + 1);
+                        let (lo, hi) = (
+                            acc(nb, rg, c) + 2 * p as u8,
+                            acc(nb, rg, c) + 2 * p as u8 + 1,
+                        );
                         bf16_pair(b, &e, g, lo, hi, out[p])?;
                     }
                     for p in 0..2usize {
@@ -311,13 +324,38 @@ fn bf16_pair(
     // Two values, each into (r = t, t + 1 for lo / hi): u, r, hi16, m.
     let mut res = [0u8; 2];
     for (i, x) in [lo, hi].into_iter().enumerate() {
-        let (u, r, h16, m) = (t + 4 * i as u8, t + 4 * i as u8 + 1, t + 4 * i as u8 + 2, t + 4 * i as u8 + 3);
+        let (u, r, h16, m) = (
+            t + 4 * i as u8,
+            t + 4 * i as u8 + 1,
+            t + 4 * i as u8 + 2,
+            t + 4 * i as u8 + 3,
+        );
         vop(b, format!("v_add_f32_e32 v{u}, 0, v{x}"), &[u], &[v(x)])?;
         vop(b, format!("v_bfe_u32 v{r}, v{u}, 16, 1"), &[r], &[v(u)])?;
-        vop(b, format!("v_add3_u32 v{r}, v{u}, 0x7fff, v{r}"), &[r], &[v(u), v(r)])?;
-        vop(b, format!("v_lshrrev_b32_e32 v{r}, 16, v{r}"), &[r], &[v(r)])?;
-        vop(b, format!("v_lshrrev_b32_e32 v{h16}, 16, v{u}"), &[h16], &[v(u)])?;
-        vop(b, format!("v_and_b32_e32 v{m}, 0x7f800000, v{u}"), &[m], &[v(u)])?;
+        vop(
+            b,
+            format!("v_add3_u32 v{r}, v{u}, 0x7fff, v{r}"),
+            &[r],
+            &[v(u), v(r)],
+        )?;
+        vop(
+            b,
+            format!("v_lshrrev_b32_e32 v{r}, 16, v{r}"),
+            &[r],
+            &[v(r)],
+        )?;
+        vop(
+            b,
+            format!("v_lshrrev_b32_e32 v{h16}, 16, v{u}"),
+            &[h16],
+            &[v(u)],
+        )?;
+        vop(
+            b,
+            format!("v_and_b32_e32 v{m}, 0x7f800000, v{u}"),
+            &[m],
+            &[v(u)],
+        )?;
         op(
             b,
             format!("v_cmp_ne_u32_e64 s{}, 0x7f800000, v{m}", e.fin),

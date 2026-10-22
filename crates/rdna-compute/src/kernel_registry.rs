@@ -2880,6 +2880,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "quantize_int8_mmq_ds128"
             ]
         );
+        // One-pass plain rotate + A8 `block_i8_128` producer of the same route
+        // (`Gpu::rotate_x_mq_i8_batched`, `Gpu::mq6_i8_prepare_x`).
+        add!(
+            "mq_rotate_x_i8_gfx12",
+            kernels::MQ_ROTATE_X_I8_GFX12_SRC,
+            ["mq_rotate_x_i8_gfx12"]
+        );
         add!(
             "qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
             kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
@@ -7359,6 +7366,7 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
             kernels::SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1201,
             kernels::SPEC_ACCEPT_ORDERED_PM_GFX1201,
             kernels::QWEN4_MQ6_X4_PM_GFX1201,
+            kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201,
             kernels::MQ4_ROWS_X4_PM_GFX1201,
             kernels::MQ_I4_MOE_GEMV_PM_GFX1201,
             kernels::E8P_I4_MOE_GEMV_PM_GFX1201,
@@ -9011,11 +9019,12 @@ mod tests {
         // tape/lane copies, the storage-boundary round trip and 116 discovery
         // and static-coverage modules. Keep the later beta cohorts above.
         const FIRST_REQUEST_JIT_ADDED_MODULES: usize = 119;
-        // The exact-INT8 MQ6 prefill default adds its GEMM module and the A8
-        // `block_i8_128` quantizer module it consumes.
-        const MQ6_I8_ADDED_MODULES: [&str; 2] = [
+        // The exact-INT8 MQ6 prefill default adds its GEMM module, the A8
+        // `block_i8_128` quantizer module and the one-pass rotate producer.
+        const MQ6_I8_ADDED_MODULES: [&str; 3] = [
             "gemm_mq6g256v2_mmq_i8_gfx12",
             "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            "mq_rotate_x_i8_gfx12",
         ];
         for module in MQ6_I8_ADDED_MODULES {
             assert!(

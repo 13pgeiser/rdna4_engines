@@ -35,14 +35,20 @@ impl Rng {
 }
 
 fn f16_to_f32(h: u16) -> f32 {
-    let (s, e, m) = (u32::from(h >> 15), u32::from((h >> 10) & 31), u32::from(h & 0x3ff));
+    let (s, e, m) = (
+        u32::from(h >> 15),
+        u32::from((h >> 10) & 31),
+        u32::from(h & 0x3ff),
+    );
     assert!(e != 0 && e != 31, "test data uses normal halves only");
     f32::from_bits((s << 31) | ((e + 112) << 23) | (m << 13))
 }
 
 /// Normal f16 with exponent field `lo..lo+span`.
 fn half(rng: &mut Rng, lo: usize, span: usize) -> u16 {
-    (((rng.next() & 1) as u16) << 15) | (((lo + rng.below(span)) as u16) << 10) | (rng.next() as u16 & 0x3ff)
+    (((rng.next() & 1) as u16) << 15)
+        | (((lo + rng.below(span)) as u16) << 10)
+        | (rng.next() as u16 & 0x3ff)
 }
 
 /// Activation fill: full-range random, all `-1` (a negative chain sum: the seed must stay centred), or a
@@ -114,7 +120,9 @@ fn make(rng: &mut Rng, c: &Case) -> Data {
                 sum += q;
                 x[base + 8 + j] = q as i8 as u8;
             }
-            let d = f32::from_bits((((110 + rng.below(18)) as u32) << 23) | (rng.next() as u32 & 0x7f_ffff));
+            let d = f32::from_bits(
+                (((110 + rng.below(18)) as u32) << 23) | (rng.next() as u32 & 0x7f_ffff),
+            );
             x[base..base + 4].copy_from_slice(&d.to_le_bytes());
             x[base + 4..base + 8].copy_from_slice(&sum.to_le_bytes());
         }
@@ -147,8 +155,12 @@ fn reference(c: &Case, d: &Data, epi: Epi) -> Vec<u8> {
                     cq += code(grp, h, nat(j)) as i32 * i32::from(xb[8 + j] as i8);
                 }
                 let fc = (cq - 32 * s) as f32;
-                let sh = f16_to_f32(u16::from_le_bytes(grp[4 * h..4 * h + 2].try_into().unwrap()));
-                let zh = f16_to_f32(u16::from_le_bytes(grp[4 * h + 2..4 * h + 4].try_into().unwrap()));
+                let sh = f16_to_f32(u16::from_le_bytes(
+                    grp[4 * h..4 * h + 2].try_into().unwrap(),
+                ));
+                let zh = f16_to_f32(u16::from_le_bytes(
+                    grp[4 * h + 2..4 * h + 4].try_into().unwrap(),
+                ));
                 let zp = 32.0f32.mul_add(sh, zh);
                 acc = (sh * dd).mul_add(fc, acc);
                 acc = (zp * dd).mul_add(s as f32, acc);
@@ -201,12 +213,8 @@ fn run(c: &Case, epi: Epi, seed: u64) {
     mem.map("karg".into(), KERNARG, karg).unwrap();
     mem.map("a".into(), A_BASE, data.a.clone()).unwrap();
     mem.map("x".into(), X_BASE, data.x.clone()).unwrap();
-    mem.map(
-        "y".into(),
-        Y_BASE,
-        vec![SENTINEL; want.len() + 2 * GUARD],
-    )
-    .unwrap();
+    mem.map("y".into(), Y_BASE, vec![SENTINEL; want.len() + 2 * GUARD])
+        .unwrap();
     for gy_i in 0..gy {
         for gx_i in 0..gx {
             emu.run_workgroup(
@@ -222,7 +230,10 @@ fn run(c: &Case, epi: Epi, seed: u64) {
         }
     }
     let y = &mem.regions.iter().find(|r| r.name == "y").unwrap().bytes;
-    assert!(y[..GUARD].iter().all(|&b| b == SENTINEL), "guard before Y clobbered");
+    assert!(
+        y[..GUARD].iter().all(|&b| b == SENTINEL),
+        "guard before Y clobbered"
+    );
     assert!(
         y[GUARD + want.len()..].iter().all(|&b| b == SENTINEL),
         "guard after Y clobbered"
@@ -245,38 +256,110 @@ fn run(c: &Case, epi: Epi, seed: u64) {
 
 #[test]
 fn single_group_tails_f32() {
-    run(&Case { m: 48, k: 256, n: 40, fill: Fill::Random }, Epi::Set, 1);
+    run(
+        &Case {
+            m: 48,
+            k: 256,
+            n: 40,
+            fill: Fill::Random,
+        },
+        Epi::Set,
+        1,
+    );
 }
 #[test]
 fn single_group_tails_bf16() {
-    run(&Case { m: 52, k: 256, n: 24, fill: Fill::Random }, Epi::SetBf16, 2);
+    run(
+        &Case {
+            m: 52,
+            k: 256,
+            n: 24,
+            fill: Fill::Random,
+        },
+        Epi::SetBf16,
+        2,
+    );
 }
 #[test]
 fn loop_and_peel_f32() {
-    run(&Case { m: 132, k: 512, n: 130, fill: Fill::Random }, Epi::Set, 3);
+    run(
+        &Case {
+            m: 132,
+            k: 512,
+            n: 130,
+            fill: Fill::Random,
+        },
+        Epi::Set,
+        3,
+    );
 }
 #[test]
 fn loop_and_peel_bf16() {
-    run(&Case { m: 128, k: 768, n: 128, fill: Fill::Random }, Epi::SetBf16, 4);
+    run(
+        &Case {
+            m: 128,
+            k: 768,
+            n: 128,
+            fill: Fill::Random,
+        },
+        Epi::SetBf16,
+        4,
+    );
 }
 
 #[test]
 fn negative_chain_sums_f32() {
-    run(&Case { m: 8, k: 256, n: 16, fill: Fill::NegOnes }, Epi::Set, 5);
+    run(
+        &Case {
+            m: 8,
+            k: 256,
+            n: 16,
+            fill: Fill::NegOnes,
+        },
+        Epi::Set,
+        5,
+    );
 }
 #[test]
 fn every_code_position_is_paired_with_its_activation_byte() {
     for j in [0, 1, 3, 4, 7, 8, 31, 32, 63, 64, 95, 127] {
-        run(&Case { m: 8, k: 256, n: 16, fill: Fill::OneHot(j) }, Epi::Set, 6);
+        run(
+            &Case {
+                m: 8,
+                k: 256,
+                n: 16,
+                fill: Fill::OneHot(j),
+            },
+            Epi::Set,
+            6,
+        );
     }
 }
 #[test]
 fn multi_tile_grid_with_three_loop_trips() {
-    run(&Case { m: 260, k: 1024, n: 200, fill: Fill::Random }, Epi::Set, 8);
+    run(
+        &Case {
+            m: 260,
+            k: 1024,
+            n: 200,
+            fill: Fill::Random,
+        },
+        Epi::Set,
+        8,
+    );
 }
 #[test]
 fn multi_tile_grid_bf16() {
-    run(&Case { m: 136, k: 512, n: 136, fill: Fill::Random }, Epi::SetBf16, 9);
+    run(
+        &Case {
+            m: 136,
+            k: 512,
+            n: 136,
+            fill: Fill::Random,
+        },
+        Epi::SetBf16,
+        9,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -327,7 +410,10 @@ fn register_plan_keeps_the_occupancy_ceiling_and_lds_fits_two_workgroups() {
     for epi in [Epi::Set, Epi::SetBf16] {
         let e = mq6_i8_gemm::emit(Spec::product(epi)).unwrap();
         assert!(e.shape.next_free_vgpr <= spec::VGPR_CEILING, "{epi:?}");
-        assert_eq!(e.shape.wmma, 256, "{epi:?}: 64 WMMAs x 4 blocks (2 loop + 2 peeled)");
+        assert_eq!(
+            e.shape.wmma, 256,
+            "{epi:?}: 64 WMMAs x 4 blocks (2 loop + 2 peeled)"
+        );
     }
     assert_eq!(spec::LAUNCH_LDS_BYTES, spec::LAYOUT.launch);
     // Two workgroups per WGP (128 KiB of LDS).
