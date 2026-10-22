@@ -38,8 +38,9 @@
 //! `identical_to_baseline` stays required.
 //!
 //! # Baseline
-//! The shipped PM object with the entry the runtime selects when the PM route is
-//! admitted: `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) or
+//! The shipped PM object's 128x128 entry (the pre-128x256 kernel, byte for byte; the
+//! runtime now takes the `_t128x256` entries of the same object for wide launches,
+//! `gemm_mq6_i8.rs` `mq6_i8_pm_token_tile`): `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) or
 //! `..._pm_set_bf16_gfx1201` (BF16) (`gemm_mq6_i8.rs` `MQ6_I8_PM_ENTRY_*`; the
 //! hipcc entry `mq6_i8_entry` is the non-admitted fallback and is not in this
 //! object). Selection file:line and the object sha256 go in
@@ -719,9 +720,9 @@ impl Workload for Mq6 {
             exports: vec![symbol.to_owned()],
             desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded"}}),
             source: json!({
-                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs:58-60 MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16; \
-                           entry choice :321-330 and embedded-module load :331-338 (gemm_mq6g256v2_i8_prequant), \
-                           admission :65-89 (mq6_i8_pm_admits), launch :362-366 (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
+                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries); \
+                           entry choice mq6_i8_pm_launch / mq6_i8_pm_token_tile and embedded-module load (gemm_mq6g256v2_i8_prequant), \
+                           admission mq6_i8_pm_admits, 128x128 launch (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
                 "artifact": OBJECT,
                 "kernels_const": "crates/rdna-compute/src/kernels.rs:4434 GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201",
                 "sha256": sha256_hex(bytes),
