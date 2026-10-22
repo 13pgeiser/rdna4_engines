@@ -14404,6 +14404,7 @@ fn batch_chunk_delta_net_moe(
             n,
             dim,
             paro_wqkv.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -14426,6 +14427,7 @@ fn batch_chunk_delta_net_moe(
             n,
             dim,
             paro_wz.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -14678,6 +14680,37 @@ fn batch_chunk_delta_net_moe(
             n_v_heads,
             n,
         )?;
+        // The tape forces this arm (the fused preamble and chunk scan refuse
+        // it), so the DFlash/MTP rollback replays exactly these rows.
+        if let Some(tape) = gdn_tape.as_ref() {
+            let qkv_row_bytes = tape.qkv_dim * 4;
+            let alpha_row_bytes = n_v_heads * 4;
+            let off_qkv = tape_offset * qkv_row_bytes;
+            let off_a = tape_offset * alpha_row_bytes;
+            let copy_qkv = n * qkv_row_bytes;
+            let copy_a = n * alpha_row_bytes;
+            gpu.memcpy_dtod_at_auto(
+                &tape.qkv_bufs[delta_layer_idx].buf,
+                off_qkv,
+                &pbs.dn_qkv_batch.buf,
+                0,
+                copy_qkv,
+            )?;
+            gpu.memcpy_dtod_at_auto(
+                &tape.alpha_bufs[delta_layer_idx].buf,
+                off_a,
+                &pbs.dn_alpha_batch.buf,
+                0,
+                copy_a,
+            )?;
+            gpu.memcpy_dtod_at_auto(
+                &tape.beta_bufs[delta_layer_idx].buf,
+                off_a,
+                &pbs.dn_beta_batch.buf,
+                0,
+                copy_a,
+            )?;
+        }
         // Same tree-aware dispatch gate as dense LA branch above.
         if let Some(parents) = tree_parents {
             gpu.conv1d_silu_split_tree_f32_n(
@@ -15132,6 +15165,7 @@ fn batch_chunk_delta_net_moe_output(
             n,
             layer.wo.k,
             paro_wo.krot as usize,
+            128,
         )?;
         &pbs.dn_normed_rot_batch
     } else {
@@ -15557,6 +15591,7 @@ fn batch_chunk_full_attn_moe_prep(
             n,
             dim,
             paro_wq.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15579,6 +15614,7 @@ fn batch_chunk_full_attn_moe_prep(
             n,
             dim,
             paro_wk.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15601,6 +15637,7 @@ fn batch_chunk_full_attn_moe_prep(
             n,
             dim,
             paro_wv.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15928,6 +15965,7 @@ fn batch_chunk_full_attn_moe_finish(
             n,
             layer.wo.k,
             paro_wo.krot as usize,
+            128,
         )?;
         &pbs.fa_attn_out_rot_batch
     } else {
