@@ -43,6 +43,8 @@ pub struct Int4MmqReservation {
     k: usize,
     n: usize,
     generation: u64,
+    /// Grouped-position down plane: records per K128 group (`m_total`); 0 = flat-slot sidecar.
+    plane_rows: usize,
 }
 
 impl Int4MmqReservation {
@@ -77,6 +79,8 @@ pub struct Int4MmqPrepared {
     k: usize,
     n: usize,
     generation: u64,
+    /// Grouped-position down plane (record `g * plane_rows + position`); 0 = flat-slot sidecar.
+    plane_rows: usize,
 }
 
 impl Int4MmqPrepared {
@@ -88,6 +92,7 @@ impl Int4MmqPrepared {
             k: res.k,
             n: res.n,
             generation: res.generation,
+            plane_rows: res.plane_rows,
         }
     }
 
@@ -127,7 +132,15 @@ impl Int4MmqPrepared {
             k,
             n,
             generation,
+            plane_rows: 0,
         }
+    }
+
+    /// Records per K128 group when this is a grouped-position down plane, `None` for the flat-slot sidecar
+    /// (consumed only by the position-indexed `..._gp` down entries).
+    #[inline]
+    pub fn grouped_plane_rows(&self) -> Option<usize> {
+        (self.plane_rows != 0).then_some(self.plane_rows)
     }
 
     #[inline]
@@ -143,6 +156,12 @@ impl Int4MmqPrepared {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Records per K128 group of a grouped-position down plane (`m_total`), 0 for the flat-slot layout.
+    #[inline]
+    pub fn plane_rows(&self) -> usize {
+        self.plane_rows
     }
 }
 
@@ -3046,6 +3065,7 @@ impl ScratchState {
             k,
             n,
             generation: self.int4_mmq_generation,
+            plane_rows: 0,
         })
     }
 
@@ -3141,15 +3161,29 @@ impl ScratchState {
         k: usize,
         n: usize,
     ) -> HipResult<Int4MmqReservation> {
+        self.reserve_qwen4_moe_down_i4_plane(hip, k, n, 0)
+    }
+
+    /// [`Self::reserve_qwen4_moe_down_i4`] for either layout: `plane_rows == 0` is the flat-slot
+    /// sidecar `[k/128, n]`; otherwise the grouped-position plane `[k/128, plane_rows]` (`plane_rows`
+    /// = the grouped row count), whose handle still reports `n` real slots.
+    pub fn reserve_qwen4_moe_down_i4_plane(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+        plane_rows: usize,
+    ) -> HipResult<Int4MmqReservation> {
         if k == 0 || n == 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "reserve_qwen4_moe_down_i4: need k%128==0 and n>0",
             ));
         }
-        let needed = qwen4_moe_down_i4_bytes(k, n).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "reserve_qwen4_moe_down_i4: extent overflow")
-        })?;
+        let needed = qwen4_moe_down_i4_bytes(k, if plane_rows == 0 { n } else { plane_rows })
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "reserve_qwen4_moe_down_i4: extent overflow")
+            })?;
         grow_scratch_buffer(
             hip,
             &mut self.qwen4_moe_down_i4_scratch,
@@ -3162,6 +3196,7 @@ impl ScratchState {
             k,
             n,
             generation: self.qwen4_moe_down_i4_generation,
+            plane_rows,
         })
     }
 

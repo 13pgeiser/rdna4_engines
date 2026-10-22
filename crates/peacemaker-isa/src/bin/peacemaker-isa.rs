@@ -123,22 +123,15 @@ fn iu4_gemm(
     arch: Arch,
 ) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::iu4_gemm::{self, Spec};
-    let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
     if epi == "all" {
+        let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
         let (_, text, proof) = iu4_gemm::emit_module(fold, tile, cacc, act, arch)?;
         return Ok((
             text,
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let emitted = iu4_gemm::emit(Spec {
-        fold,
-        tile,
-        cacc,
-        epi: epi.parse()?,
-        act,
-        arch,
-    })?;
+    let emitted = iu4_gemm::emit(Spec::from_knobs(fold, tile, cacc, epi, act, arch)?)?;
     Ok((
         emitted.s_text,
         serde_json::to_vec_pretty(&emitted.proof).map_err(|e| e.to_string())?,
@@ -215,30 +208,7 @@ fn qwen4_moe_sym(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let (kind, tile) = match epi.rsplit_once("_nt") {
-        Some((k, n)) => (k, Some(n)),
-        None => (epi, None),
-    };
-    let (nt, rr) = match tile {
-        Some(t) => {
-            let (n, r) = t.split_once('r').map_or((t, None), |(n, r)| (n, Some(r)));
-            (
-                n.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
-                match r {
-                    Some(r) => r.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
-                    None => 1,
-                },
-            )
-        }
-        None => (1, 1),
-    };
-    let e = qwen4_moe_sym::emit(Spec {
-        arch,
-        kind: kind.parse()?,
-        nt,
-        rr,
-        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
-    })?;
+    let e = qwen4_moe_sym::emit(Spec::from_epi(epi, arch)?)?;
     Ok((
         e.s_text,
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
@@ -463,6 +433,14 @@ fn ep_tile_pull(
 /// The ordered BF16 grouped expert combine twin (gfx1201 only).
 fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::moe_slot_ops::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// Grouped-position down plane (gfx1201): the grouped producer plus the down NT4/NT8 twins as one module.
+fn qwen4_moe_down_gp(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module(arch)?;
     Ok((
         text,
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
@@ -1406,6 +1384,7 @@ fn run() -> Result<(), String> {
         "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
         "ep_tile_mask_pm" => ep_tile_mask(arch)?,
         "moe_slot_ops_pm" => moe_slot_ops(arch)?,
+        "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
         "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
         "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
             peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,

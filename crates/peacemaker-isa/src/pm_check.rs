@@ -37,17 +37,48 @@ fn ir_arch(arch: &str) -> Result<peacemaker_ir::Arch> {
 /// and the running checker's identity. See `cert_cache` for configuration and
 /// integrity rules. Cache failures never change certification's outcome.
 pub fn m7(elf: &Path, arch: &str, symbol: &str) -> Result<Value> {
+    m7_status(elf, arch, symbol).map(|(receipt, _)| receipt)
+}
+
+/// How [`m7_status`] obtained its receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum M7Cache {
+    /// A stored success receipt for exactly these inputs was returned; M7 did not run.
+    Hit,
+    /// The cache was consulted, M7 ran and its success receipt was stored.
+    Miss,
+    /// No cache applies (disabled or no executable identity): M7 ran uncached.
+    Disabled,
+}
+
+impl M7Cache {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// [`m7`] reporting whether the receipt came from the certification cache.
+pub fn m7_status(elf: &Path, arch: &str, symbol: &str) -> Result<(Value, M7Cache)> {
     let target = ir_arch(arch)?;
     let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
     let cache = crate::cert_cache::Cache::for_request(&bytes, arch, symbol);
     if let Some(receipt) = cache.as_ref().and_then(crate::cert_cache::Cache::load) {
-        return Ok(receipt);
+        return Ok((receipt, M7Cache::Hit));
     }
     let receipt = m7_uncached(elf, &bytes, arch, symbol, target)?;
+    let status = if cache.is_some() {
+        M7Cache::Miss
+    } else {
+        M7Cache::Disabled
+    };
     if let Some(cache) = cache {
         cache.store(&receipt);
     }
-    Ok(receipt)
+    Ok((receipt, status))
 }
 
 fn m7_uncached(

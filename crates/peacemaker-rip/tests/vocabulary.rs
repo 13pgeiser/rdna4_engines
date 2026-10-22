@@ -8,7 +8,9 @@
 //! `lds_relayout`, `ds_store`, `ds_load`, `loop_`, `barrier_signal`, `barrier_wait`
 //! and `barrier_with_scope`; runtime `VopdOp { op, dst, src0, src1 }` construction
 //! for `Builder::vopd` (including `v`/`s`/`lit`/`inline` `src0` forms and pair
-//! validation); and the runtime `Wmma::iu4`/`fp8` constructors.
+//! validation); the runtime `Wmma::iu4`/`fp8` constructors; and the runtime
+//! `Wmma::swmmac(arch, Swmmac::<kind>, d, a, b, index, SwmmacMods { .. })`
+//! constructor (all eleven `Swmmac` kinds, with the accumulator read declared).
 //!
 //! Still unreachable: borrowed `Builder::program`
 //! and `Builder::ledger` inspection; untyped `Builder::label` (labels live on typed
@@ -23,10 +25,6 @@
 //! checks); and integer `rotate`/`prime`/`retire_cur` (driver ring transitions
 //! need private runtime slot mapping, so they are refused at construction —
 //! use `Workgroup::barrier`).
-//!
-//! `Wmma::swmmac` remains unbound because its constructor omits the implicit
-//! destination accumulator read from `uses`: a core defect found by this coverage
-//! work, not a front-end limitation. A 1:1 binding is rejected by the IR validator.
 //!
 //! `control` deliberately bypasses the frontend `validate::instruction` check:
 //! branch labels are symbolic (`.Ldone`) and cannot round-trip through the
@@ -723,11 +721,212 @@ fn wmma_runtime_constructors_emit_checked_instructions() {
             "WMMA opcode requires gfx1201",
         );
     }
-    refuses(
-        &kernel("Wmma::swmmac(spec.arch, vr(0, 8), vr(8, 2), vr(12, 4), v(24))?;"),
-        Arch::Gfx1201,
-        "cannot find `Wmma::swmmac`",
+}
+
+/// SWMMAC kernel: D at v0, A at v8, B at v16, index at v24; v0..=v24 are
+/// defined first (SWMMAC reads D in place as the accumulator).
+fn swmmac_source(call: &str) -> String {
+    let plan = r#"
+        let mut p = RegPlan::new(32, 16)?;
+        for i in 0..4u8 { p.v::<8>("vectors", 8 * i, Live::Whole)?; }
+        p.s::<8>("scalars", 0, Live::Whole)?;
+    "#;
+    let init: String = (0..25u8)
+        .map(|i| format!("wg.isa().push(Instruction::new(\"v_mov_b32_e32 v{i}, {i}\", vec![v({i})], vec![]))?;"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    source(
+        "KernargLayout::new(0)",
+        plan,
+        &format!("{init}\n                {call}"),
+        true,
+    )
+}
+
+const SWMMAC_NO_MODS: &str = "SwmmacMods { index_key: 0, neg_lo: 0, neg_hi: 0, clamp: false }";
+
+#[test]
+fn swmmac_every_kind_emits_its_checked_instruction() {
+    for (kind, mnemonic, d, a, b) in [
+        ("F32F16", "v_swmmac_f32_16x16x32_f16", 8, 4, 8),
+        ("F32Bf16", "v_swmmac_f32_16x16x32_bf16", 8, 4, 8),
+        ("F16F16", "v_swmmac_f16_16x16x32_f16", 4, 4, 8),
+        ("Bf16Bf16", "v_swmmac_bf16_16x16x32_bf16", 4, 4, 8),
+        ("I32Iu8", "v_swmmac_i32_16x16x32_iu8", 8, 2, 4),
+        ("I32Iu4", "v_swmmac_i32_16x16x32_iu4", 8, 1, 2),
+        ("I32Iu4X64", "v_swmmac_i32_16x16x64_iu4", 8, 2, 4),
+        ("F32Fp8Fp8", "v_swmmac_f32_16x16x32_fp8_fp8", 8, 2, 4),
+        ("F32Fp8Bf8", "v_swmmac_f32_16x16x32_fp8_bf8", 8, 2, 4),
+        ("F32Bf8Fp8", "v_swmmac_f32_16x16x32_bf8_fp8", 8, 2, 4),
+        ("F32Bf8Bf8", "v_swmmac_f32_16x16x32_bf8_bf8", 8, 2, 4),
+    ] {
+        let range = |base: u8, n: u8| {
+            if n == 1 {
+                format!("v{base}")
+            } else {
+                format!("v[{base}:{}]", base + n - 1)
+            }
+        };
+        let src = swmmac_source(&format!(
+            "wg.isa().push(Wmma::swmmac(spec.arch, Swmmac::{kind}, vr(0, {d}), vr(8, {a}), vr(16, {b}), v(24), {SWMMAC_NO_MODS})?)?;"
+        ));
+        let emitted = compile(&src, Arch::Gfx1201);
+        let expected = format!(
+            "{mnemonic} {}, {}, {}, v24\n",
+            range(0, d),
+            range(8, a),
+            range(16, b)
+        );
+        assert!(emitted.s_text.contains(&expected), "{kind}: {expected}");
+        refuses(&src, Arch::Gfx1151, "SWMMAC requires gfx12");
+        refuses(&src, Arch::Gfx1100, "SWMMAC requires gfx12");
+    }
+}
+
+#[test]
+fn swmmac_modifiers_render_in_llvm_mc_order() {
+    let src = swmmac_source(
+        "wg.isa().push(Wmma::swmmac(spec.arch, Swmmac::I32Iu8, vr(0, 8), vr(8, 2), vr(16, 4), v(24), SwmmacMods { index_key: 1, neg_lo: 3, neg_hi: 0, clamp: true })?)?;",
     );
+    assert!(compile(&src, Arch::Gfx1201).s_text.contains(
+        "v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[16:19], v24 index_key:1 neg_lo:[1,1,0] clamp\n"
+    ));
+    let src = swmmac_source(
+        "wg.isa().push(Wmma::swmmac(spec.arch, Swmmac::F32F16, vr(0, 8), vr(8, 4), vr(16, 8), v(24), SwmmacMods { index_key: 1, neg_lo: 3, neg_hi: 3, clamp: false })?)?;",
+    );
+    assert!(compile(&src, Arch::Gfx1201).s_text.contains(
+        "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[16:23], v24 index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]\n"
+    ));
+}
+
+#[test]
+fn swmmac_refusals_carry_the_rust_error_text() {
+    let call = |kind: &str, d: &str, a: &str, b: &str, idx: &str, mods: &str| {
+        swmmac_source(&format!(
+            "wg.isa().push(Wmma::swmmac(spec.arch, Swmmac::{kind}, {d}, {a}, {b}, {idx}, {mods})?)?;"
+        ))
+    };
+    refuses(
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 3)",
+            "vr(16, 8)",
+            "v(24)",
+            SWMMAC_NO_MODS,
+        ),
+        Arch::Gfx1201,
+        "v_swmmac_f32_16x16x32_f16: A requires 4 VGPRs, found v[8:10]",
+    );
+    refuses(
+        &call(
+            "F16F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "v(24)",
+            SWMMAC_NO_MODS,
+        ),
+        Arch::Gfx1201,
+        "v_swmmac_f16_16x16x32_f16: D requires 4 VGPRs, found v[0:7]",
+    );
+    refuses(
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "vr(24, 2)",
+            SWMMAC_NO_MODS,
+        ),
+        Arch::Gfx1201,
+        "WMMA operand requires 1 VGPRs, found v[24:25]",
+    );
+    refuses(
+        &call(
+            "F32Fp8Fp8",
+            "vr(0, 8)",
+            "vr(8, 2)",
+            "vr(16, 4)",
+            "v(24)",
+            "SwmmacMods { index_key: 0, neg_lo: 1, neg_hi: 0, clamp: false }",
+        ),
+        Arch::Gfx1201,
+        "v_swmmac_f32_16x16x32_fp8_fp8 does not accept neg_lo",
+    );
+    refuses(
+        &call(
+            "I32Iu4X64",
+            "vr(0, 8)",
+            "vr(8, 2)",
+            "vr(16, 4)",
+            "v(24)",
+            "SwmmacMods { index_key: 1, neg_lo: 0, neg_hi: 0, clamp: false }",
+        ),
+        Arch::Gfx1201,
+        "v_swmmac_i32_16x16x64_iu4 has no index_key",
+    );
+    refuses(
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "v(24)",
+            "SwmmacMods { index_key: 0, neg_lo: 0, neg_hi: 0, clamp: true }",
+        ),
+        Arch::Gfx1201,
+        "v_swmmac_f32_16x16x32_f16 does not accept clamp",
+    );
+    refuses(
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "v(24)",
+            "SwmmacMods { index_key: 0, neg_lo: 4, neg_hi: 0, clamp: false }",
+        ),
+        Arch::Gfx1201,
+        "v_swmmac_f32_16x16x32_f16: neg_lo/neg_hi bit 2 (C) is not encodable",
+    );
+    refuses(
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "v(24)",
+            "SwmmacMods { index_key: 0, neg_lo: 0, neg_hi: 0 }",
+        ),
+        Arch::Gfx1201,
+        "SwmmacMods is missing `clamp`",
+    );
+}
+
+/// The original SWMMAC defect, caught by the front end's effect check: text
+/// that reads the destination accumulator in place but declares only A, B and
+/// the index is refused (the corrected `Wmma::swmmac` declares D in `uses`).
+#[test]
+fn swmmac_text_without_the_accumulator_read_is_refused() {
+    let text = "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[16:23], v24";
+    refuses(
+        &swmmac_source(&format!(
+            "wg.isa().push(Instruction::new(\"{text}\", vec![vr(0, 8)], vec![vr(8, 4), vr(16, 8), v(24)]))?;"
+        )),
+        Arch::Gfx1201,
+        &format!(
+            "op declares defs [v[0:7]] and uses [v[8:11], v[16:23], v24] but `{text}` also reads v[0:7]: write &[vr(0, 8)], &[vr(8, 4), vr(16, 8), v(24), vr(0, 8)]"
+        ),
+    );
+    // Declaring D as an accumulator read makes the same text acceptable.
+    let emitted = compile(
+        &swmmac_source(&format!(
+            "wg.isa().push(Instruction::new(\"{text}\", vec![vr(0, 8)], vec![vr(8, 4), vr(16, 8), v(24), vr(0, 8)]))?;"
+        )),
+        Arch::Gfx1201,
+    );
+    assert!(emitted.s_text.contains(text));
 }
 
 #[test]
@@ -828,7 +1027,6 @@ pub const STILL_UNREACHABLE: &[(&str, &str)] = &[
     ("RegPlan::temp_v", "Requires a Rust Scope and const-generic typed register result; no native Scope value exists."),
     ("RegPlan::verify_access", "Requires Rust register-label order inspection; Builder emission already performs this check."),
     ("RegPlan::verify_lifetimes", "Requires Rust label-order inspection; Builder::finish already performs this check."),
-    ("Wmma::swmmac", "the constructor's `uses` omits the implicit destination accumulator that SWMMAC reads, so a 1:1 binding is rejected by the IR validator; fixing it belongs in `crates/peacemaker-isa/src/insn.rs:333` with the author side updated to declare the accumulator read."),
     ("raw barriers: rotate", "Driver ring transitions require private runtime slot mapping; use Workgroup::barrier."),
     ("raw barriers: prime", "Driver ring transitions require private runtime slot mapping; use Workgroup::barrier."),
     ("raw barriers: retire_cur", "Driver ring transitions require private runtime slot mapping; use Workgroup::barrier."),

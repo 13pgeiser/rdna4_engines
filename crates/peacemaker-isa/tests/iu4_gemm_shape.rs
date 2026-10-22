@@ -229,6 +229,43 @@ fn module_waits_pass_independent_replay() {
 }
 
 #[test]
+fn knob_strings_parse_to_the_spec_the_cli_emits() {
+    let got = Spec::from_knobs("k128", "256x128x16", "1", "silu", "token", Arch::Gfx1201).unwrap();
+    assert_eq!(
+        got,
+        Spec {
+            tile: Tile::T256x128x16,
+            epi: Epi::GateUpSilu,
+            ..Spec::control(Epi::Set)
+        }
+    );
+    let slab = Spec::from_knobs("k128", "128x128x8", "1", "silu-bf16", "slab", Arch::Gfx1201);
+    assert_eq!(slab.unwrap().act, ALayout::Slab);
+    // Long fold names are aliases; the closed axes parse but `emit` refuses them.
+    for (name, fold) in [
+        ("k256shared", Fold::K256Shared),
+        ("k256pow2", Fold::K256Pow2),
+    ] {
+        let spec = Spec::from_knobs(name, "128x128x8", "1", "set", "token", Arch::Gfx1201);
+        assert_eq!(spec.unwrap().fold, fold);
+        assert_eq!(name.parse::<Fold>(), Ok(fold));
+    }
+    for bad in [
+        ("k999", "128x128x8", "1", "set", "token"),
+        ("k128", "64x64", "1", "set", "token"),
+        ("k128", "128x128x8", "3", "set", "token"),
+        ("k128", "128x128x8", "1", "all", "token"),
+        ("k128", "128x128x8", "1", "set", "tile"),
+    ] {
+        let (f, t, c, e, a) = bad;
+        assert!(
+            Spec::from_knobs(f, t, c, e, a, Arch::Gfx1201).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
 fn closed_and_dropped_axes_are_rejected() {
     for spec in [
         Spec {

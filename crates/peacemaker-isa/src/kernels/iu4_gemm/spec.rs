@@ -190,6 +190,28 @@ impl Epi {
 }
 
 impl Spec {
+    /// The CLI knob strings (`--fold --tile --cacc --epi --alayout`) as a
+    /// `Spec`, parsed in that order through the axis `FromStr` impls. The
+    /// result is not validated (`emit` validates). `fold` additionally accepts
+    /// the long names `k256shared` / `k256pow2`.
+    pub fn from_knobs(
+        fold: &str,
+        tile: &str,
+        cacc: &str,
+        epi: &str,
+        act: &str,
+        arch: Arch,
+    ) -> Result<Self, String> {
+        let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
+        Ok(Self {
+            fold,
+            tile,
+            cacc,
+            epi: epi.parse()?,
+            act,
+            arch,
+        })
+    }
     pub fn control(epi: Epi) -> Self {
         Self {
             fold: Fold::K128,
@@ -365,8 +387,8 @@ impl std::str::FromStr for Fold {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "k128" => Ok(Self::K128),
-            "k256s" => Ok(Self::K256Shared),
-            "k256p" => Ok(Self::K256Pow2),
+            "k256s" | "k256shared" => Ok(Self::K256Shared),
+            "k256p" | "k256pow2" => Ok(Self::K256Pow2),
             _ => Err(format!("unknown fold {s}")),
         }
     }
