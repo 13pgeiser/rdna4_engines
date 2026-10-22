@@ -34,24 +34,23 @@ pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
+pub mod gated_mlp;
 pub(crate) mod layer_ops;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
 pub use layer_ops::{
-    execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
-    execute_final_hyper, execute_gated_delta_net, execute_gated_delta_net_arena,
-    execute_gated_delta_net_core_rows, execute_gated_delta_net_uncovered,
-    execute_grouped_depthwise, execute_grouped_depthwise_rows, execute_hyper_norm,
-    execute_hyper_read, execute_hyper_write, execute_indexed_attention,
+    execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
+    execute_gated_delta_net, execute_gated_delta_net_arena, execute_gated_delta_net_core_rows,
+    execute_gated_delta_net_uncovered, execute_grouped_depthwise, execute_grouped_depthwise_rows,
+    execute_hyper_norm, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
     execute_indexed_attention_arena, execute_indexed_attention_core_rows,
     execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
     project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
-    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, DenseFfnOp,
-    DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas,
-    GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
-    QsaTrunkArenas,
+    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp,
+    GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
+    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
