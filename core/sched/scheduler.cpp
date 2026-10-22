@@ -751,7 +751,14 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     if (geo_.checkpoints()) {
         const int64_t I = geo_.checkpoint_interval;
         int64_t next = ((n_computed / I) + 1) * I;      /* strictly after n_computed */
-        if (geo_.window_ckpt) next = INT64_MAX;          /* a window snapshot: the tail only */
+        if (geo_.window_ckpt) {
+            /* A tail-only window snapshot is unreachable after a prompt edit.
+             * Keep interval checkpoints too; the ordinary retention policy bounds
+             * their storage. Preserve the tail before the template's changed suffix,
+             * even when the prompt ends exactly on an interval boundary. */
+            const int64_t tail = tail_checkpoint(n_target);
+            if (tail > n_computed) next = std::min(next, tail);
+        }
         /* A span (ChunkGeometry::span) starts only on an interval boundary past the first
          * interval, and its chunk is the span's intervals in a row, each the piece a span of 1
          * makes a chunk of its own. Not from a prompt's start: the first interval may be served on
@@ -765,7 +772,8 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
             want = far - n_computed;
         else if (n_computed + want > next && n_computed + want < n_target)
             want = (n_computed + want) / I * I - n_computed;
-        if (!geo_.window_ckpt && (n_computed + want) % I == 0) {
+        if ((geo_.window_ckpt && n_computed + want == next) ||
+            (!geo_.window_ckpt && (n_computed + want) % I == 0)) {
             if (checkpoint_pos) *checkpoint_pos = n_computed + want;
         } else if (n_computed + want == n_target) {
             /* Also one at the prompt's tail. The next turn resumes from the deepest snapshot

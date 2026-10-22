@@ -1104,6 +1104,29 @@ TEST(kv_window_snapshot_only_where_a_hit_resumes_from_it) {
     }
 }
 
+TEST(window_prefix_tail_edit_resumes_at_an_earlier_interval_snapshot) {
+    Fixture f;
+    f.cfg.checkpoint_interval = 256;
+    f.cfg.checkpoint_slots = 8;
+    auto groups = hybrid_groups(/*with_linear=*/false);
+    groups.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 2 }, 64));
+    REQUIRE_EQ(f.build_groups(groups), RAD_OK);
+    CHECK(f.kv.has_window_snapshot());
+    auto tokens = tok_run(1000, 1100);
+    publish(f, 1, tokens, 1100);
+    const auto hashes = chain_of(tokens);
+    for (int64_t p : { 256, 512, 768, 1024, 1072 }) ckpt_at(f, 1, hashes, p);
+    f.pc.retain(1);
+
+    /* Replacing the final 123 tokens invalidates both the tail and 1024 snapshot,
+     * but the unchanged prefix still reaches the snapshot at 768. */
+    for (size_t i = 977; i < tokens.size(); ++i) tokens[i] += 10000;
+    const CacheHit hit = f.pc.lookup(tokens, {});
+    CHECK_EQ(hit.n_attn_tokens, 976);
+    CHECK_EQ(hit.n_linear_tokens, 768);
+    CHECK(hit.checkpoint_slot >= 0);
+}
+
 TEST(kv_window_group_recycles_below_the_window) {
     std::vector<KVGroupInfo> g;
     g.push_back(null_group());

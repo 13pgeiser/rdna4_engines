@@ -343,6 +343,47 @@ TEST(chunk_geometry_refuses_a_budget_it_cannot_serve) {
     CHECK_EQ(f.start(), RAD_E_INVAL);
 }
 
+/* Gemma-like FULL + WINDOW, with no recurrent state. A prompt-tail snapshot alone
+ * cannot serve a request whose last few hundred tokens changed: it is past the
+ * divergence. Keep periodic snapshots as well, so lookup can resume below it. */
+TEST(window_prefill_writes_interval_snapshots_before_the_tail) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+    f.prog.ops.resize(1);             /* remove the recurrent scan and its chunk constraint */
+    f.prog.buffers.resize(1);         /* its derived conv/state indices do not apply either */
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK(f.sch.geometry().window_ckpt);
+
+    int64_t pos = 0;
+    std::vector<int64_t> snapshots;
+    while (pos < 1100) {
+        int64_t ckpt = -1;
+        const int64_t n = f.sch.plan_chunk(pos, 1100, 512, &ckpt);
+        REQUIRE(n > 0);
+        pos += n;
+        if (ckpt > 0) {
+            CHECK_EQ(ckpt, pos);
+            snapshots.push_back(ckpt);
+        }
+    }
+    const std::vector<int64_t> expected = { 256, 512, 768, 1024, 1072 };
+    CHECK(snapshots == expected);
+
+    /* An aligned prompt must still snapshot before its last block: that block's
+     * generation marker changes when the client replays the assistant reply. */
+    int64_t ckpt = -1;
+    CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 240ll);
+    CHECK_EQ(ckpt, 1008ll);
+    /* A shared step may end before the boundary; the next chunk must reach it. */
+    CHECK_EQ(f.sch.plan_chunk(0, 1100, 160, &ckpt), 160ll);
+    CHECK_EQ(ckpt, -1ll);
+    CHECK_EQ(f.sch.plan_chunk(160, 1100, 160, &ckpt), 96ll);
+    CHECK_EQ(ckpt, 256ll);
+}
+
 TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     Fixture f;
     f.build();
@@ -609,8 +650,8 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     CHECK(plans[0] == plans[1]);
 }
 
-/* No interval grid, no span: a window snapshot splits no chunk, and a model without checkpoints
- * has no interval. The shared budget still follows the flag, as the engine states it to the plugin
+/* Window snapshots do not support spans, and a model without checkpoints has no interval.
+ * The shared budget still follows the flag, as the engine states it to the plugin
  * (RadBuildCtx::max_mixed_tok), and steps that share it admit as before. */
 TEST(a_span_needs_an_interval_grid) {
     Program prog;

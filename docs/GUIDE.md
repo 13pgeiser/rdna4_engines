@@ -1037,9 +1037,11 @@ What it costs:
   are read from host memory, and the arena a spanned step takes is room they lose for it
   ```
 
-A model without an interval grid (no linear state, or window snapshots at a prompt's end, as on
-Gemma 4) spans nothing; there the flag only plans every step but a lone prefill at the shared
-budget, and startup warns.
+A model without checkpoints, or one whose checkpoints hold sliding windows (as on Gemma 4),
+does not support spans; there the flag only plans every step but a lone prefill at the shared
+budget, and startup warns. Window snapshots are written at `--checkpoint-interval` boundaries
+as well as just before the prompt's end. The intermediate snapshots let an edited prompt resume
+below its first changed token; `--checkpoint-policy` bounds the snapshots kept.
 
 **Sharing a step** (`--busy-prefill-chunk`, default `auto`). When other work is pending, a prefill
 chunk leaves room for one row plus the draft window per decode row behind it, and a share of the
