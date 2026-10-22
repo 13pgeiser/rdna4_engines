@@ -239,7 +239,8 @@ pub(crate) const WORKGROUP_METHODS: &[&str] = &[
 ];
 
 pub fn is_fn(name: &str) -> bool {
-    if COMMON_FNS.contains(&name) || ASSOC_FNS.contains(&name)
+    if COMMON_FNS.contains(&name)
+        || ASSOC_FNS.contains(&name)
         || native_gen::is_fn(name)
         || native_mq6::is_fn(name)
     {
