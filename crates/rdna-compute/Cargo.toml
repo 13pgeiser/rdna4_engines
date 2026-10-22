@@ -155,6 +155,10 @@ name = "bench_argmax_vs_download_gfx1201"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_hc_row_fold_gfx1201"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_attention_vision"
 required-features = ["lab"]
 
