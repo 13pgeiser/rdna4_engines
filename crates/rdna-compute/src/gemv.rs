@@ -15949,7 +15949,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.launch_moe_topk_renorm_k8_batched(
-            probs, topk_idx, topk_w, n_exp, norm_topk, batch_size, false, 256, 1,
+            probs, topk_idx, topk_w, n_exp, norm_topk, batch_size, false, 256,
         )
     }
 
@@ -16026,26 +16026,19 @@ impl Gpu {
             ));
         }
         self.launch_moe_topk_renorm_k8_batched(
-            logits, topk_idx, topk_w, n_exp, norm_topk, batch_size, true, lanes, 1,
+            logits, topk_idx, topk_w, n_exp, norm_topk, batch_size, true, lanes,
         )
     }
 
-    /// Physical lanes per row of the two-row fused prefill router
-    /// ([`Self::moe_router_softmax_topk_k8_multirow_prefill`]): the same 128
-    /// lanes per row as [`Self::MOE_ROUTER_FUSED_PREFILL_LANES`], so every
-    /// virtual thread keeps its original lane assignment.
-    pub const MOE_ROUTER_TOPK_MULTIROW_LANES: usize = 128;
+    /// Rows per workgroup of the wave-per-row fused prefill router
+    /// (`blockDim = 8 * 32`: one wave32 per row, no barriers).
+    pub const MOE_ROUTER_TOPK_MULTIROW_ROWS: usize = 8;
 
-    /// Rows per workgroup of the two-row fused prefill router
-    /// (`blockDim = (MOE_ROUTER_TOPK_MULTIROW_LANES, 2)`, 256 threads).
-    pub const MOE_ROUTER_TOPK_MULTIROW_ROWS: usize = 2;
-
-    /// Pure admission rule for the two-row fused prefill router
+    /// Pure admission rule for the wave-per-row fused prefill router
     /// (`moe_router_softmax_topk_k8_multirow_prefill`): the route flag resolves on, the
-    /// route is top-8 over exactly 256 experts, the device is wave32, and the
-    /// batch is a positive even row count (every row slot of the last block is
-    /// then a real row, so no partial-block barrier hazard). Callers also
-    /// require the fused-prefill route to be enabled and admitted.
+    /// route is top-8 over exactly 256 experts, the device is wave32 and the batch
+    /// is non-empty (waves past the last row exit, so any row count is valid).
+    /// Callers also require the fused-prefill route to be enabled and admitted.
     pub fn moe_router_topk_multirow_admitted(
         enabled: bool,
         k: usize,
@@ -16053,50 +16046,37 @@ impl Gpu {
         batch_size: usize,
         has_wave32: bool,
     ) -> bool {
-        enabled
-            && k == 8
-            && n_exp == 256
-            && has_wave32
-            && batch_size >= Self::MOE_ROUTER_TOPK_MULTIROW_ROWS
-            && batch_size.is_multiple_of(Self::MOE_ROUTER_TOPK_MULTIROW_ROWS)
+        enabled && k == 8 && n_exp == 256 && has_wave32 && batch_size >= 1
     }
 
-    /// Launch geometry `(grid, block, dynamic shared bytes)` of the two-row
-    /// route for an admitted `n_exp` / `batch_size`. The dynamic bytes hold the
-    /// second row slot's `smem_v[n_exp]`, `reduce_v[256]`, `reduce_i[256]`,
-    /// `picked_idx[8]`, `picked_w[8]` (4 * (n_exp + 528) = 3136 at 256 experts);
-    /// slot zero reuses the kernel's static arrays.
-    fn moe_router_topk_multirow_geometry(
-        n_exp: usize,
-        batch_size: usize,
-    ) -> ([u32; 3], [u32; 3], u32) {
+    /// Launch geometry `(grid, block)` of the wave-per-row route:
+    /// `ceil(batch_size / 8)` blocks of 256 threads (8 waves, one row each).
+    fn moe_router_topk_multirow_geometry(batch_size: usize) -> ([u32; 3], [u32; 3]) {
         (
             [
-                (batch_size / Self::MOE_ROUTER_TOPK_MULTIROW_ROWS) as u32,
+                batch_size.div_ceil(Self::MOE_ROUTER_TOPK_MULTIROW_ROWS) as u32,
                 1,
                 1,
             ],
-            [
-                Self::MOE_ROUTER_TOPK_MULTIROW_LANES as u32,
-                Self::MOE_ROUTER_TOPK_MULTIROW_ROWS as u32,
-                1,
-            ],
-            (4 * (n_exp + 2 * 256 + 2 * 8)) as u32,
+            [(Self::MOE_ROUTER_TOPK_MULTIROW_ROWS * 32) as u32, 1, 1],
         )
     }
 
-    /// Two-row fused prefill router: the same per-row softmax + top-8 +
-    /// renorm as [`Self::moe_router_softmax_topk_k8_prefill`], with two rows per
-    /// workgroup (128 lanes x 2 rows, one launch of the shared
-    /// `moe_topk_renorm_k8_batched` symbol with `rows_per_block = 2` and 3136
-    /// dynamic shared bytes). Each row keeps its original lane assignment,
-    /// virtual trees and operation order, so the output is byte-identical to
-    /// the one-row fused launch.
+    /// Wave-per-row fused prefill router: the same per-row softmax + top-8 +
+    /// renorm as [`Self::moe_router_softmax_topk_k8_prefill`], one wave32 per
+    /// row and 8 rows per workgroup (`moe_router_softmax_topk_k8_wave`, same
+    /// module as the shared symbol). The kernel keeps every float operation,
+    /// operand order and tie resolution of the one-row fused launch, so the
+    /// output is byte-identical to it (and to `softmax_f32` +
+    /// [`Self::moe_topk_renorm_k8_batched`]). `logits` is left untouched and
+    /// must be 16-byte aligned (two float4 loads per lane).
     ///
     /// Rejects shapes/devices outside
     /// [`Self::moe_router_topk_multirow_admitted`] (top-8, 256 experts, wave32,
-    /// positive even `batch_size`) before any launch. The route flag
+    /// non-empty batch) before any launch. The route flag
     /// (`HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`) is the caller's concern and is deliberately not consulted here.
+    /// Kernarg ABI: 3 pointers (offsets 0/8/16: logits read, idx write,
+    /// weights write) + `n_rows`, `norm_topk` (i32 at 24/28) = 32 bytes.
     pub fn moe_router_softmax_topk_k8_multirow_prefill(
         &mut self,
         logits: &GpuTensor,
@@ -16115,33 +16095,68 @@ impl Gpu {
         ) {
             return Err(hip_bridge::HipError::new(
                 0,
-                "moe_router_softmax_topk_k8_multirow_prefill: requires a wave32 device, n_exp = 256 and a positive even batch_size",
+                "moe_router_softmax_topk_k8_multirow_prefill: requires a wave32 device, n_exp = 256 and a non-empty batch_size",
             ));
         }
-        self.launch_moe_topk_renorm_k8_batched(
-            logits,
-            topk_idx,
-            topk_w,
-            n_exp,
-            norm_topk,
-            batch_size,
-            true,
-            Self::MOE_ROUTER_TOPK_MULTIROW_LANES,
-            Self::MOE_ROUTER_TOPK_MULTIROW_ROWS,
-        )
+        if !(logits.buf.as_ptr() as usize).is_multiple_of(16) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_router_softmax_topk_k8_multirow_prefill: logits must be 16-byte aligned",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_topk_renorm_k8_batched",
+            kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
+            "moe_router_softmax_topk_k8_wave",
+        )?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n = batch_size as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 8 * 8) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_router_softmax_topk_k8_multirow_prefill",
+            bytes,
+        );
+        let (grid, block) = Self::moe_router_topk_multirow_geometry(batch_size);
+        let result = self.launch_maybe_blob(
+            "moe_router_softmax_topk_k8_wave",
+            grid,
+            block,
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(n);
+                b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Shared launcher for `moe_topk_renorm_k8_batched`. `lanes` is the block
-    /// x size (fused mode only) and `rows_per_block` the row slots per
-    /// workgroup (block y). Every existing caller passes `rows_per_block = 1`:
-    /// grid `batch_size`, block `[lanes | 256, 1, 1]`, no dynamic shared
-    /// memory. `rows_per_block = 2` (fused only, even `batch_size`, 256
-    /// experts) launches grid `batch_size / 2`, block `[lanes, 2, 1]` and the
-    /// dynamic shared bytes of [`Self::moe_router_topk_multirow_geometry`];
-    /// recorded launches carry that block and dynamic shared size. Kernarg ABI:
-    /// 3 pointers (offsets 0/8/16: input read, idx write, weights write) +
-    /// `n_exp`, `norm_topk`, `fuse_softmax`, `rows_per_block` (i32 at
-    /// 24/28/32/36) = 40 explicit bytes; recorded launches pad to 16 B (48).
+    /// x size (fused mode only): grid `batch_size`, block `[lanes | 256, 1, 1]`,
+    /// no dynamic shared memory. Kernarg ABI: 3 pointers (offsets 0/8/16: input
+    /// read, idx write, weights write) + `n_exp`, `norm_topk`, `fuse_softmax`
+    /// (i32 at 24/28/32) = 36 explicit bytes; recorded launches pad to 16 B (48).
     #[allow(clippy::too_many_arguments)]
     fn launch_moe_topk_renorm_k8_batched(
         &mut self,
@@ -16153,9 +16168,7 @@ impl Gpu {
         batch_size: usize,
         fuse_softmax: bool,
         lanes: usize,
-        rows_per_block: usize,
     ) -> HipResult<()> {
-        debug_assert!(rows_per_block == 1 || (fuse_softmax && rows_per_block == 2));
         self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8_batched",
@@ -16168,7 +16181,6 @@ impl Gpu {
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
         let fuse = if fuse_softmax { 1i32 } else { 0i32 };
-        let rows = rows_per_block as i32;
         let mut params: Vec<*mut c_void> = vec![
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16176,15 +16188,12 @@ impl Gpu {
             &n as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
             &fuse as *const _ as *mut c_void,
-            &rows as *const _ as *mut c_void,
         ];
         let bytes = (n_exp * 4 + 8 * 8) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "elementwise",
-            if rows_per_block > 1 {
-                "moe_router_softmax_topk_k8_multirow_prefill"
-            } else if fuse_softmax {
+            if fuse_softmax {
                 "moe_router_softmax_topk_k8_prefill"
             } else {
                 "moe_topk_renorm_k8_batched"
@@ -16193,20 +16202,13 @@ impl Gpu {
         );
         // Mode 0 keeps the original 256-thread block (`lanes` is ignored); mode 1
         // runs `lanes` threads per row slot.
-        let (grid, block, shared_mem) = if rows_per_block > 1 {
-            Self::moe_router_topk_multirow_geometry(n_exp, batch_size)
-        } else {
-            (
-                [batch_size as u32, 1, 1],
-                [if fuse_softmax { lanes as u32 } else { 256u32 }, 1, 1],
-                0u32,
-            )
-        };
+        let grid = [batch_size as u32, 1, 1];
+        let block = [if fuse_softmax { lanes as u32 } else { 256u32 }, 1, 1];
         let result = self.launch_maybe_blob(
             "moe_topk_renorm_k8_batched",
             grid,
             block,
-            shared_mem,
+            0,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -16216,7 +16218,6 @@ impl Gpu {
                 b.push_i32(n);
                 b.push_i32(nr);
                 b.push_i32(fuse);
-                b.push_i32(rows);
                 b
             },
         );
@@ -24112,12 +24113,8 @@ mod moe_router_topk_multirow_admission_tests {
                 for has_wave32 in [false, true] {
                     for n_exp in experts {
                         for batch in batches {
-                            let expect = enabled
-                                && k == 8
-                                && has_wave32
-                                && n_exp == 256
-                                && batch >= 2
-                                && batch % 2 == 0;
+                            let expect =
+                                enabled && k == 8 && has_wave32 && n_exp == 256 && batch >= 1;
                             assert_eq!(
                                 Gpu::moe_router_topk_multirow_admitted(
                                     enabled, k, n_exp, batch, has_wave32
@@ -24134,16 +24131,23 @@ mod moe_router_topk_multirow_admission_tests {
 
     #[test]
     fn invalid_shapes_are_never_admitted() {
-        // The one admitted combination: flag on, top-8, 256 experts, wave32, even batch.
+        // The one admitted combination: flag on, top-8, 256 experts, wave32, non-empty
+        // batch (any row count: waves past the last row exit).
+        assert!(Gpu::moe_router_topk_multirow_admitted(
+            true, 8, 256, 1, true
+        ));
         assert!(Gpu::moe_router_topk_multirow_admitted(
             true, 8, 256, 2, true
         ));
         assert!(Gpu::moe_router_topk_multirow_admitted(
             true, 8, 256, 4096, true
         ));
-        // Odd, zero and single-row batches would leave a row slot without a row.
-        for batch in [0usize, 1, 3, 4095, 8191, usize::MAX] {
-            assert!(!Gpu::moe_router_topk_multirow_admitted(
+        // An empty batch has nothing to route.
+        assert!(!Gpu::moe_router_topk_multirow_admitted(
+            true, 8, 256, 0, true
+        ));
+        for batch in [1usize, 3, 4095, 8191] {
+            assert!(Gpu::moe_router_topk_multirow_admitted(
                 true, 8, 256, batch, true
             ));
         }
@@ -24176,46 +24180,18 @@ mod moe_router_topk_multirow_admission_tests {
     }
 
     #[test]
-    fn geometry_is_two_rows_of_128_lanes_with_3136_dynamic_bytes() {
-        assert_eq!(Gpu::MOE_ROUTER_TOPK_MULTIROW_LANES, 128);
-        assert_eq!(Gpu::MOE_ROUTER_TOPK_MULTIROW_ROWS, 2);
-        // Same lanes per row as the one-row fused route, and an admitted lane count.
-        assert_eq!(
-            Gpu::MOE_ROUTER_TOPK_MULTIROW_LANES,
-            Gpu::MOE_ROUTER_FUSED_PREFILL_LANES
-        );
-        assert!(Gpu::moe_router_fused_prefill_lanes_admitted(
-            Gpu::MOE_ROUTER_TOPK_MULTIROW_LANES
-        ));
-        for batch in [2usize, 4, 6, 256, 4096, 8192] {
+    fn geometry_is_eight_single_wave_rows_per_block() {
+        assert_eq!(Gpu::MOE_ROUTER_TOPK_MULTIROW_ROWS, 8);
+        for batch in [1usize, 2, 7, 8, 9, 256, 4095, 4096, 7808, 8192] {
             assert!(Gpu::moe_router_topk_multirow_admitted(
                 true, 8, 256, batch, true
             ));
-            let (grid, block, shared) = Gpu::moe_router_topk_multirow_geometry(256, batch);
-            assert_eq!(grid, [(batch / 2) as u32, 1, 1], "batch={batch}");
-            assert_eq!(block, [128, 2, 1], "batch={batch}");
-            assert_eq!(shared, 3136, "batch={batch}");
-            // Every row is covered exactly once: grid * rows_per_block == batch.
-            assert_eq!(grid[0] as usize * Gpu::MOE_ROUTER_TOPK_MULTIROW_ROWS, batch);
-            // 256 threads per block: the kernel's `__launch_bounds__(256, 2)`.
-            assert_eq!(block[0] * block[1] * block[2], 256);
+            let (grid, block) = Gpu::moe_router_topk_multirow_geometry(batch);
+            assert_eq!(grid, [batch.div_ceil(8) as u32, 1, 1], "batch={batch}");
+            assert_eq!(block, [256, 1, 1], "batch={batch}");
+            // Every row is covered, and at most the last block is partial.
+            assert!(grid[0] as usize * 8 >= batch);
+            assert!((grid[0] as usize - 1) * 8 < batch);
         }
-    }
-
-    #[test]
-    fn dynamic_bytes_hold_exactly_the_second_row_slot_and_total_13440() {
-        // Kernel static LDS (slot zero + mode-0 index array), in bytes:
-        // smem_v[1024] f32, smem_i[1024] i32, reduce_v[256] f32, reduce_i[256] i32,
-        // picked_idx[8] i32, picked_w[8] f32.
-        let static_bytes = 4 * (1024 + 1024 + 256 + 256 + 8 + 8);
-        assert_eq!(static_bytes, 10304);
-        // Slot one: smem_v[n_exp], reduce_v[256], reduce_i[256], picked_idx[8], picked_w[8].
-        let slot_bytes = 4 * (256 + 256 + 256 + 8 + 8);
-        let (_, _, shared) = Gpu::moe_router_topk_multirow_geometry(256, 4096);
-        assert_eq!(shared as usize, slot_bytes);
-        assert_eq!(static_bytes + shared as usize, 13440);
-        // Linear in n_exp (only the score row scales).
-        let (_, _, wide) = Gpu::moe_router_topk_multirow_geometry(1024, 4096);
-        assert_eq!(wide, shared + 4 * (1024 - 256));
     }
 }

@@ -3338,6 +3338,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::moe_scatter_fused_k8_src(arch == "gfx1151"),
             ["moe_scatter_fused_k8"]
         );
+        if arch == "gfx1201" {
+            add!(
+                "moe_scatter_stable_k8",
+                kernels::MOE_SCATTER_STABLE_K8_SRC,
+                [
+                    "moe_scatter_stable_hist_k8",
+                    "moe_scatter_stable_inverse_k8",
+                    "moe_scatter_stable_place_k8"
+                ]
+            );
+        }
         add!(
             "moe_topk_renorm_k8",
             kernels::MOE_TOPK_RENORM_K8_SRC,
@@ -3346,7 +3357,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
-            ["moe_topk_renorm_k8_batched"]
+            [
+                "moe_router_softmax_topk_k8_wave",
+                "moe_topk_renorm_k8_batched"
+            ]
         );
         add!(
             "scaled_add_inplace",
@@ -6891,8 +6905,11 @@ mod tests {
         }
         // The native A3B port is a new module, not a historical P0 or S1 row.
         // Keep the earlier inventory cohorts and their membership guards intact.
-        const NATIVE_A3B_ADDED_MODULES: [&str; 1] =
-            ["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201"];
+        // The exact-gfx1201 multi-workgroup MoE scatter is likewise its own module.
+        const NATIVE_A3B_ADDED_MODULES: [&str; 2] = [
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+            "moe_scatter_stable_k8",
+        ];
         for module in NATIVE_A3B_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),

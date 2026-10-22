@@ -4713,6 +4713,11 @@ pub const MOE_DOWN_UNSCATTER_K8_SRC: &str =
 /// 2 kernel launches per MoE layer (~75µs each).
 pub const MOE_SCATTER_FUSED_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
+/// Multi-workgroup stable twin of [`MOE_SCATTER_FUSED_K8_SRC`] (three launches:
+/// per-chunk histogram, offsets + stable placement, inverse permutation); the
+/// exact-gfx1201 `moe_scatter_fused_k8` launcher selects it for large slot counts.
+pub const MOE_SCATTER_STABLE_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_stable_k8.hip");
 /// `moe_scatter_fused_k8.hip` as #774 left it (block-wide scan on gfx1151).
 /// The shipped k8 module compiles it on gfx1151 only
 /// ([`moe_scatter_fused_k8_src`]); Qwen4's top-10 alias always does.
