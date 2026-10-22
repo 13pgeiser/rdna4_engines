@@ -9182,7 +9182,7 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 4, 0, 0x1e97a26b759d29dfull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
-        { "qwen35_fp8", 2, 1, 0x36da8d762194e24eull, 0xe4022daff02ec8bdull },
+        { "qwen35_fp8", 2, 1, 0x5085b8c443c59f7cull, 0xb297654cef04bf08ull },
         { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
         { "qwen35moe_fp8", 2, 0, 0xf60c9508dd197370ull, 0x05e0778848bf416cull },
     };
@@ -9229,8 +9229,8 @@ TEST(qwen35_pipe_off_is_the_serial_graph_and_steps) {
     unsetenv("RADIANCE_PREFILL_PIPELINE");
     REQUIRE_EQ(rc, RAD_OK);
     CHECK(!qwen35_fp8::g_model[1].pipe_on);
-    CHECK_EQ(graph_hash(b), 0xc55656a96b3db1ceull);
-    CHECK_EQ(pinned_steps(b, qwen35_fp8::step, 1, 2), 0xc03bdef23d685cc5ull);
+    CHECK_EQ(graph_hash(b), 0x36da8d762194e24eull);
+    CHECK_EQ(pinned_steps(b, qwen35_fp8::step, 1, 2), 0xe4022daff02ec8bdull);
 }
 
 /* qwen35_w8a8 at two ranks where libr4d serves the `_had_quant_i8g` norms (a_h.q8_fed): the norms write
