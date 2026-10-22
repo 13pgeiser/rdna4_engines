@@ -15,7 +15,8 @@ use super::batch::PrefillBatchScratch;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::weights::{
-    DeltaNetLayerWeights, DeltaNetState, FullAttnLayerWeights, LayerWeights, StateQuant,
+    DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, FullAttnLayerWeights,
+    FullAttnMoeLayerWeights, LayerWeights, StateQuant,
 };
 use crate::speculative::GdnTape;
 use hip_bridge::HipResult;
@@ -27,13 +28,14 @@ use hipfire_dispatch::pipeline::batched_attention::{
 use hipfire_dispatch::pipeline::batched_deltanet::{
     DeltaNetLayerView, DeltaNetStateView, GdnTapeView,
 };
+use hipfire_dispatch::pipeline::batched_moe::{AttentionMoeLayerView, DeltaNetMoeLayerView};
 use hipfire_dispatch::pipeline::gated_mlp::{
     execute_product_rows, Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput,
     MlpStorage, ProductRows, RmsNorm,
 };
 use hipfire_dispatch::pipeline::hybrid::{
     AttentionKv, AttentionRow, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState,
-    HybridDims, MixerOutput,
+    HybridDims, MixerOutput, MropeRope,
 };
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::WeightTensor;
@@ -117,6 +119,8 @@ pub(crate) struct DecodeBinding<'a> {
     pub kv_cache: &'a llama::KvCache,
     pub dn_state: &'a DeltaNetState,
     pub position: usize,
+    /// Vision-language step: (t, h, w) RoPE sections read from `s.pos_buf3`.
+    pub mrope_section: Option<[usize; 3]>,
 }
 
 impl<'a> DecodeBinding<'a> {
@@ -236,6 +240,10 @@ impl<'a> DecodeBinding<'a> {
                     q_gate: &s.fa_q_full,
                     tap,
                     output,
+                    mrope: self.mrope_section.map(|section| MropeRope {
+                        positions: &s.pos_buf3,
+                        section,
+                    }),
                 })
             }
         }
@@ -292,6 +300,7 @@ impl PrefillBatchScratch {
         BatchScratch {
             lean: self.lean,
             x_batch: &self.x_batch,
+            x_norm_batch: &self.x_norm_batch,
             x_rot_batch: &self.x_rot_batch,
             x_rot_f16_batch: &self.x_rot_f16_batch,
             gate_ffn_batch: &self.gate_ffn_batch,
@@ -456,6 +465,36 @@ fn dense_ffn_rows(
     execute_product_rows(gpu, &op, rows)
 }
 
+impl DeltaNetMoeLayerWeights {
+    pub(crate) fn mixer_view(&self) -> DeltaNetMoeLayerView<'_> {
+        DeltaNetMoeLayerView {
+            attn_norm: &self.attn_norm,
+            wqkv: self.wqkv.dispatch_ref(),
+            wz: self.wz.dispatch_ref(),
+            w_alpha: self.w_alpha.dispatch_ref(),
+            w_beta: self.w_beta.dispatch_ref(),
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            conv_weight: &self.conv_weight,
+            norm_weight: &self.norm_weight,
+            wo: self.wo.dispatch_ref(),
+        }
+    }
+}
+
+impl FullAttnMoeLayerWeights {
+    pub(crate) fn mixer_view(&self) -> AttentionMoeLayerView<'_> {
+        AttentionMoeLayerView {
+            attn_norm: &self.attn_norm,
+            wq: self.wq.dispatch_ref(),
+            wk: self.wk.dispatch_ref(),
+            wv: self.wv.dispatch_ref(),
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            wo: self.wo.dispatch_ref(),
+        }
+    }
+}
 /// The batched executors' view of the KV cache.
 pub(crate) fn kv_view(kv: &llama::KvCache) -> KvView<'_> {
     KvView {

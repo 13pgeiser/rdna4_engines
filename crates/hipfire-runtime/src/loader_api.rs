@@ -259,6 +259,10 @@ pub struct SpecLoadCfg {
     /// [`crate::dflash::DFLASH_BLOCK_UNBATCHED`]. Legacy DFlash drafts keep
     /// their declared width.
     pub dflash_block: Option<usize>,
+    /// `speculation.dflash_block` was `auto` (the default): a producer with
+    /// its own measured default width may use it instead of `dflash_block`
+    /// (Qwen4 DFlash2). `false` = an explicit width, or no daemon resolution.
+    pub dflash_block_auto: bool,
 }
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
