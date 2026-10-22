@@ -626,7 +626,8 @@ typedef struct RadDrafterDecl {
 
     /* Where a pass leaves its proposal. 0 = the sampler's token buffer. */
     rad_buf     proposal;
-    int64_t     proposal_pitch;  /* elements a row in `proposal`; 0 means 1 */
+    int64_t     proposal_pitch;  /* elements a row in `proposal`; 0 means 1, and for a BLOCK
+                                      * drafter `depth` (less is refused) */
 
     /* BLOCK only. `mask_token` is the id every unfilled block position embeds; a block drafter
      * without one cannot run. `window` is the drafter's own sliding window over its own cache, 0
