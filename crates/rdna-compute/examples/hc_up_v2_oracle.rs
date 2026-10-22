@@ -66,7 +66,7 @@ impl Rng {
     }
     /// True with probability ~ 1/period.
     fn hit(&mut self, period: u64) -> bool {
-        self.next() % period == 0
+        self.next().is_multiple_of(period)
     }
 }
 
@@ -225,8 +225,10 @@ fn git_sha() -> String {
 
 fn le_u32(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
