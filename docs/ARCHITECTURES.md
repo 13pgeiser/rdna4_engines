@@ -1038,11 +1038,20 @@ above), which matters little for translation prompts, whose shared prefix is a l
 A linear reading the same activation as the one before it (k and v after q, up after gate) reuses
 its codes. On every trunk the q and k norms and both rotaries are one `qkv_norm_rope` at `v_norm` 0.
 On an MXFP4 trunk each junction (the branch's post-norm, the residual add, the next norm and the
-next linear's E4M3 quantiser) is one `ar_rmsnorm_post_quant_fp8` at two ranks on the exact wire,
-the branch's all-reduce in the same launch, or a post-norm and `rmsnorm_quant_fp8` otherwise; a
-w4a8 / w8a8 trunk takes `gemma4_bf16`'s fused junctions; an i8a8 or asymmetric-int4 trunk runs the
-chain. Where a row is missing the plugin declares the chain, and the startup notes say which form
-each took. Under calibration no junction is fused (below).
+next linear's E4M3 quantiser) is one `ar_rmsnorm_post_quant_fp8` at two ranks, the branch's
+all-reduce in the same launch, or a post-norm and `rmsnorm_quant_fp8` otherwise; a w4a8 / w8a8
+trunk takes `gemma4_bf16`'s fused junctions; an i8a8 or asymmetric-int4 trunk runs the chain.
+Where a row is missing the plugin declares the chain, and the startup notes say which form each
+took. Under calibration no junction is fused (below).
+
+The two fused all-reduce junctions (`ar_rmsnorm_post_quant_fp8`, and `ar_rmsnorm_quant_i8` on a
+w4a8 / w8a8 trunk's int8 junction) send the exact wire only, and are byte-identical to
+`all_reduce` followed by the chain. Under `--tp-wire wht6` they are declared all the same and taken
+per step where the message goes out exact anyway (`ar_wire_is_exact`: a decode step of a few rows,
+under `--tp-wire-min-kb`); a wider step keeps the lossy all-reduce, unfused. Declared on the exact
+wire only, they left a lossy-wire deployment's decode at three launches a junction (all-reduce,
+post-norm, junction) though its messages went out exact. A fused step is the unfused exact step bit
+for bit.
 
 **Calibration.** Serve a calibration container (int8, `translategemma-27b-i8a8.recipe`: KL 0.003
 against bf16, and it fits two 32 GB cards) with `RADIANCE_CALIB_DIR` set, push a corpus of the
