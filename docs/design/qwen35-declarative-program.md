@@ -306,3 +306,19 @@ sidecar, A3B KV q8/fwht2/fwht4/asym3 and the captured proposal graph); 9B and
 `memory.offload_exec=cpu` greedy rows on 9B, A3B and 27B-xt. Not on hardware:
 gfx1100/gfx1201 (including the gfx1100 27B fused FA prep / epilogue the MTP
 head may now take, covered only by the parity tests) and qt53 MTP heads.
+
+## Dense tensor parallelism on the generic engine (#927 item 4, HIPF-142)
+
+`qwen35::mesh_tp` declares one step program for prefill and decode: per layer
+the mixer (replicated, `Opaque`), `GatedMlp` (`SplitRule::GatedMlp`, `Product`
+ladder, gate/up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }` in
+whole G256 groups) writing `ffn_out`, and the residual `Accumulate`
+(`OpKind::ResidualAdd`). On a pure TP mesh the splitter turns each
+`Accumulate` into one rank-ordered `AllReduceAdd` into `x`, so a rank runs
+`[embed, mixer, ffn] AllReduceAdd [mixer, ffn] AllReduceAdd … [head]`. A
+decode epoch binds it to the decode scratch; a prefill epoch to the rank's
+batch scratch (batched mixers, `Product` rows with the TP `Partial`
+epilogue, last-row logits). Each rank holds every attention and DeltaNet head
+and its even block of the FFN intermediate (`ffn_rank_layout`).
+`Qwen35TpBindings` is tied to the plan of exactly those shards and refuses a
+prefill past the batch scratch, sessions, checkpoints and prefix repair.
