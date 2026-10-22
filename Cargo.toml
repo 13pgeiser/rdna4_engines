@@ -93,3 +93,21 @@ serde = "1"
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+
+# The PeaceMaker CPU emulator and the exhaustive row-tile oracles in
+# peacemaker-isa's tests run hours unoptimized. Optimize these crates in dev
+# and test builds; debug assertions and overflow checks stay on.
+[profile.dev.package.peacemaker-isa]
+opt-level = 3
+
+[profile.dev.package.peacemaker-ir]
+opt-level = 3
+
+[profile.dev.package.peacemaker-cdna]
+opt-level = 3
+
+[profile.dev.package.peacemaker-author]
+opt-level = 3
+
+[profile.dev.package.peacemaker-lift]
+opt-level = 3

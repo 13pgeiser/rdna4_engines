@@ -553,7 +553,11 @@ fn every_r_1_through_64_matches_pm_c1_scheduling_and_independent_raw_dags() {
             Entry::K320 => vec![[1, 0], [2, 0], [3, 0], [7, 0], [8, 0], [9, 0]],
             _ => vec![[3, 0], [9, 0]],
         };
-        for k in ks {
+        // Ks are independent: run them concurrently; any panic fails the scope.
+        std::thread::scope(|s| {
+            for k in ks {
+                let (emu, shapes) = (&emu, &shapes);
+                s.spawn(move || {
             let x = inputs(k);
             for ms in shapes.iter().copied() {
                 let a = std::array::from_fn(|i| weights(ms[i], k, i + 1));
@@ -604,7 +608,9 @@ fn every_r_1_through_64_matches_pm_c1_scheduling_and_independent_raw_dags() {
                     }
                 }
             }
-        }
+            });
+            }
+        });
     }
 }
 
