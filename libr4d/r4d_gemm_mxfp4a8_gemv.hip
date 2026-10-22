@@ -520,7 +520,10 @@ unsigned* mxgg_out_ctr(const void* out) {
   if (auto it = blocks.find(key); it != blocks.end()) return it->second;
   unsigned* p = nullptr;
   if (hipMalloc((void**)&p, R4D_MXGG_MAX_GROUPS * sizeof(unsigned)) != hipSuccess) return nullptr;
-  if (hipMemset(p, 0, R4D_MXGG_MAX_GROUPS * sizeof(unsigned)) != hipSuccess) {
+  // Zero before any launch reads it: the memset is on the null stream, which the engine's streams
+  // need not wait for, so wait here (as mxd_out_ctr and r4d_moe.hip's router counters do).
+  if (hipMemset(p, 0, R4D_MXGG_MAX_GROUPS * sizeof(unsigned)) != hipSuccess ||
+      hipDeviceSynchronize() != hipSuccess) {
     (void)hipFree(p);
     return nullptr;
   }
@@ -569,7 +572,10 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, MXGG_S);
     const RadTensor* y  = r4d_opt(a, MXGG_Y);
     if (!x || !xs || !w || !ws || !wr || !q || !sc) return R4D_NO(RAD_E_INVAL);
-    if (q->rank != 2 || sc->rank != 2 || x->rank < 2) return R4D_NO(RAD_E_SHAPE);
+    if (x->dtype != RAD_F8E4M3 || xs->dtype != RAD_F32 || q->dtype != RAD_F8E4M3 ||
+        sc->dtype != RAD_F32 || (y && y->dtype != RAD_BF16))
+        return R4D_NO(RAD_E_DTYPE);
+    if (q->rank != 2 || sc->rank != 2 || x->rank != 2) return R4D_NO(RAD_E_SHAPE);
     if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
     if (r4d_geti_or(a, "group", 32) != 32) return R4D_NO(RAD_E_SHAPE);
     /* silu (the SwiGLU MLP) or gelu_tanh (GeGLU, gelu_mul's). The GeGLU chain's bf16 plane is
@@ -590,21 +596,20 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
     if (x->shape[0] != M || r4d_numel(x) != M * K) return R4D_NO(RAD_E_SHAPE);
     if (sc->shape[0] != M || sc->shape[1] != nout / 128) return R4D_NO(RAD_E_SHAPE);
     if (y && (y->shape[0] != M || y->shape[1] != nout)) return R4D_NO(RAD_E_SHAPE);
-    /* The activation scale per (row, 128 of K), or per row. */
-    bool ablk;
-    long long as_rs;
-    if (xs->rank == 2 && xs->shape[0] == M && xs->shape[1] == K / 128) {
-        ablk = true;
-        as_rs = r4d_row_pitch(xs);
-    } else if (xs->rank == 1 && xs->shape[0] == M) {
-        ablk = false;
-        as_rs = 1;
-    } else {
-        return R4D_NO(RAD_E_SHAPE);
-    }
+    /* The activation scale grid as the gemm_nt_q rows read it (mx_ascale_grid), so the fold and the
+     * GEMM it replaces take every scale plane the same way. */
+    GemmOps go{};
+    go.ascale = xs; go.M = M; go.K = K;
+    int as_group = 0, as_rs_i = 1;
+    if (mx_ascale_grid(go, &as_group, &as_rs_i) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    const bool ablk = as_group == 128;
+    const long long as_rs = as_rs_i;
+    /* Row pitches; r4d_row_pitch is -1 for a tensor not contiguous past its leading axis. A is read
+     * a dword at a time. */
     const long long lda = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     const long long yp = y ? r4d_row_pitch(y) : 0;
-    if (lda < 0 || as_rs < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
+    if (lda < K || lda % 4 || qp < nout || sp < nout / 128 || (y && yp < nout))
+        return R4D_NO(RAD_E_STRIDE);
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16) || !r4d_aligned(q->data, 4) ||
         !r4d_aligned(ws->data, 4) || !r4d_aligned(wr->data, 4) || qp % 4)
         return R4D_NO(RAD_E_ALIGN);

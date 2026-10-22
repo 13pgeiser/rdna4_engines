@@ -743,7 +743,7 @@ The `--perf*` modes time rows at one shape on a card. Two that cover the dense G
 | | |
 |---|---|
 | `--perf N K M [iters]` | the fp8 decode GEMMs, and the fp8 head (`logits_gemm_fp8`) |
-| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches |
+| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches; at a gate_up shape (N a multiple of 256, K of 128) also `gated_quant_fp8` and the fold that replaces the pair, `gemm_mxfp4a8_gated_gemv` |
 
 `--perfmx` is the MXFP4 expert GEMM (`M`, experts, `top_k`, skew), not the dense rows. `--cold MIB`
 times each launch alone behind a cache flush instead of back to back.

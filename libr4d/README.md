@@ -54,6 +54,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gemm_mxfp4a8_nt_m64` | OCP-MXFP4 weight, fp8 activation, skinny |
 | `gemm_mxfp4a8_gemv` | the same operands for one to eight rows: the weight streamed straight to registers, no LDS staging; WMMA when K is a multiple of 128, `v_dot4` otherwise, chosen from K alone so a row's bits do not depend on M |
 | `gemm_mxfp4a8_gemv_wide` | its WMMA form at 9..64 rows: up to four 16-row tiles a wave over each weight word, two 16-column tiles a block on wide, deep weights |
+| `gemm_mxfp4a8_gated_gemv` | `gemm_nt_q_gated_mx`: the gemv WMMA form over a gate_up weight with `gated_quant_fp8`'s pass (or GeGLU's `gelu_mul` and `quant_act_fp8`) in its epilogue, M ≤ 8; the [M, 2n] product is never written |
 | `gemm_mxfp4a8_decode` | the same operands for the decode band (M ≤ 128): split-K across workgroups with a last-arriver reduction, the partial in the op's scratch |
 | `gemm_mxfp4a8_decode_shortk` | the decode kernel at 33..64 rows of a wide, short weight (N ≥ 8192, K ≤ 2560), above `gemm_mxfp4a8_gemv_wide`, which loses there |
 | `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
@@ -197,8 +198,21 @@ rows their outputs differ from the decode row's in the last bf16 place on a few 
 thousand (within the selftest's bound). A greedy text can therefore differ from one produced
 with the decode row at those rows. Within the family a row's bits do not depend on M, as above.
 
-**Tunables.** `gemv` and `gemv_wide` have none, so a `RADIANCE_TUNE` pin on `gemm_nt_q` passes
-them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the rule), so a pin of
+**`gemm_mxfp4a8_gated_gemv`** (`gemm_nt_q_gated_mx`, M ≤ 8, K a multiple of 128, N of 256, `act`
+`silu`, or `gelu_tanh` without `out_bf16`). The `gemv` WMMA form over a gate_up weight, a block per
+16-column tile pair of the gated output (eight K waves on the gate tile, eight on the up tile, in
+`gemv`'s K order), the bf16 product and row amaxes in the op's scratch; the last of a 128-column
+group's blocks to arrive (a counter keyed on the output) writes the group's codes and scales. Byte
+for byte `gemm_mxfp4a8_gemv` followed by `gated_quant_fp8`, or by `gelu_mul` and `quant_act_fp8`
+(`r4d_selftest`, M = 1..8, Qwen's and TranslateGemma's gate_up). A decode step of Qwen3.8-27B
+at TP2 issues 631 kernels a card, and a dependent kernel costs 3.5-6.4 µs in a replayed graph on
+gfx1201 however little it does, so the launch it saves is the point. TranslateGemma 27B alone,
+one stream at speculation 7: 144.5 / 144.9 → 151.5 / 150.5 tok/s, measured with the first form of
+this row (a block per 128-column group, the same bytes); the tile-pair form, Qwen3.8-27B without
+speculation x1 / x4 / x8 +1.4 / +1.8 / +1.5 %.
+
+**Tunables.** `gemv`, `gemv_wide` and `gated_gemv` have none, so a `RADIANCE_TUNE` pin on
+`gemm_nt_q` passes them by. `decode_shortk` shares the decode row's axes (`ks`, `bk`, `nt`; 0 the rule), so a pin of
 those reaches both. A pin applies to every row serving the op, and an axis a serving row lacks
 stops startup by name.
 

@@ -733,6 +733,7 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
     // Not under calibration either: the down tap reads the bf16 product, which the fold never writes.
     {
         const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
+        // G3Linear's mx is linear_is_mxfp4, never a rotated (ParoQuant) weight, so one part.
         if (ln_gu.mx && ln_down.mx && !ln_down.shared_in && !calib_dir() && hi > 0 &&
             ln_gu.N % 256 == 0 && ln_gu.K % RAD_FP8_BLOCK == 0 &&
             rad_op_declared(b, "gemm_nt_q_gated_mx")) {

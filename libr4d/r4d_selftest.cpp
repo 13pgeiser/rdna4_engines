@@ -6121,6 +6121,16 @@ static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K
         ok(nm, false, "relayout refused");
         return;
     }
+    /* The reference plane through the gemv row's own hook (its operand 6) must be the same bytes:
+     * a remap that handed the gated row's b_ref another form would otherwise pass, both kernels
+     * reading the same wrong plane. */
+    {
+        std::vector<uint8_t> wr_gemv;
+        if (stored(rv, lp, 6, p, { "scale" }, &wr_gemv) != RAD_OK || wr_gemv != wr) {
+            ok(nm, false, "b_ref stored differently by the gated and gemv rows");
+            return;
+        }
+    }
     const int64_t nkb = K / 128, n = N / 2, gkb = n / 128;
     std::vector<uint8_t> ha((size_t)(M * K));
     std::vector<float> as((size_t)(M * (ablk ? nkb : 1)));
@@ -27388,10 +27398,10 @@ static void device_phase(const Plugin& pl) {
          * K, and the per-row activation scale. */
         for (const int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8 }) mxfp4a8_gated_case(pl, m, 17408, 5120, true);
         mxfp4a8_gated_case(pl, 8, 21504, 5376, true);
-        mxfp4a8_gated_case(pl, 3, 256, 128, true);
+        mxfp4a8_gated_case(pl, 3, 256, 256, true);
         mxfp4a8_gated_case(pl, 5, 1024, 640, false);
         for (const int64_t m : { 1, 4, 8 }) mxfp4a8_gated_case(pl, m, 21504, 5376, true, true);
-        mxfp4a8_gated_case(pl, 3, 256, 128, true, true);
+        mxfp4a8_gated_case(pl, 3, 256, 256, true, true);
         mxfp4a8_gated_case(pl, 2, 1024, 640, false, true);
         /* Parts (ParoQuant): each weight part against its own activation copy, with bounds off any
          * kernel's tile, two and three parts, at every band. */

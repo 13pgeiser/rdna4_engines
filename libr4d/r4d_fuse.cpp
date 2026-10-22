@@ -531,6 +531,9 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_mx(const RadParam* p, int n_p, uint64_t 
     if (!dt || std::strcmp(dt, "mxfp4a8")) return RAD_E_UNSUPPORTED;
     const bool gelu = act_is(p, n_p, "silu", "gelu_tanh");
     if (!gelu && !act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
+    /* The GeGLU chain leaves its bf16 plane in a temporary, so a caller asking for out_bf16 there
+     * has no chain (the shim refuses the operand too). */
+    if (gelu && RAD_FUSE_HAS(present, 7)) return RAD_E_UNSUPPORTED;
 
     if (step == 0) {
         Step s(out, "gemm_nt_q");

@@ -4827,7 +4827,8 @@ static const RadConstraint cGemmNtQGatedFp8[] = {
     C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8"), C_IN("act", "silu"),
 };
 /* r4d_gemm_mxfp4a8_gated_gemv: the gemv row's WMMA form (K a multiple of 128, M <= 8) with a block
- * per 128-column group of the gated output (N/2 a multiple of 128). */
+ * per 16-column tile pair of the gated output; N/2 a multiple of 128, so each 128-column group's eight
+ * blocks meet at its last arriver, which quantises the group. */
 static const RadConstraint cGemmNtQGatedMx[] = {
     C_LE("M", 8), C_DIV("K", 128), C_DIV("N", 256), C_EQ("group", 32), C_IN("dtype", "mxfp4a8"),
     C_IN("act", "silu gelu_tanh"),
