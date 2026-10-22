@@ -415,6 +415,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-runtime`
 - `hsa-bridge`
 - `peacemaker-isa`
+- `peacemaker-rip`
 - `railgun`
 - `rdna-compute`
 - `saddle-core`

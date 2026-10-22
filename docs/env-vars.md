@@ -82,6 +82,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DAEMON_BIN` | Daemon binary override | |
 | `HIPFIRE_LOCK_DIR` | Shared per-GPU lock directory | Absolute writable path; daemon and `gpu-lock.sh` must use the same setting to contend. Default on Linux/WSL `/run/lock/hipfire` if writable, otherwise `/tmp/hipfire-locks`; on native Windows `%ProgramData%\hipfire\locks`, otherwise `%TEMP%\hipfire-locks` (`LockFileEx`, same file names and holder-PID reporting). Different directories do not see each other's locks. Files are `gpu-GPU-<uuid>.lock`, or `gpu-pci-<dddd:bb:dd.f>.lock` for cards without a UUID. |
 | `HIPFIRE_TUI_BIN` | TUI binary | |
+| `HIPFIRE_CERT_CACHE` | PeaceMaker M7 certification receipt cache (developer tool) | A directory selects the cache root; default `$XDG_CACHE_HOME/hipfire/pm-m7`, else `~/.cache/hipfire/pm-m7`; exactly `0` disables the cache. Read by `peacemaker-isa` `cert_cache.rs`, which has no `hipfire-config` dependency (peacemaker builds standalone), so it is an ambient developer read. A hit is a byte-identical receipt keyed by the exact code-object bytes, arch, symbol, checker schema and the SHA-256 of the running executable image (which covers the checker, lift/IR tables, analyses and compiler version); truncated, edited, oversize or key-mismatched entries are deleted and recomputed; an unwritable root warns once and continues uncached. No effect on kernel bytes or serving behavior. |
+| `HIPFIRE_M7_TEST_CASE` / `HIPFIRE_M7_TEST_ROOT` | M7 cache test harness (harness; test-only) | Read only by the isolated `#[cfg(test)]` child of `pm_check`'s cache cases: the case name and the fixture root. Never read by runtime code. |
 | `HIPFIRE_ROCM_PATH` | hipfire-specific ROCm SDK root override | Highest priority (`HIPFIRE_ROCM_PATH` > `ROCM_PATH` > `HIP_PATH`). Must provide the runtime, headers, and `hipcc`. Authoritative: no fallback to another install or bare soname. |
 | `ROCM_PATH` / `HIP_PATH` | ROCm/HIP compatibility root overrides | Used only when `HIPFIRE_ROCM_PATH` is unset (`ROCM_PATH` before `HIP_PATH`). `HIP_PATH=<root>/hip` normalizes to `<root>`. Multiple equally eligible roots without an override are refused — set `HIPFIRE_ROCM_PATH`. |
 | `HIPFIRE_TEST_REQUIRE_ROCM` | ROCm oracle test availability | Defaults to required: ISA/PeaceMaker oracle tests use `ROCM_PATH`, else `/opt/rocm`, and fail on missing tools. Set exactly `0` only for explicitly no-ROCm hosts (GPU-free CI). This does not change runtime SDK discovery. |
@@ -848,7 +850,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1701
+**Count:** 1712
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -968,6 +970,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CB_VERIFY_FP8` | crates/hipfire-arch-qwen35/examples/pm_fp8_verify_kld.rs, crates/hipfire-arch-qwen35/examples/pm_fp8_verify_oracle.rs | developer |
 | `HIPFIRE_CB_VERIFY_IU4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
 | `HIPFIRE_CB_VERIFY_PM` | crates/hipfire-arch-qwen35/examples/cb_verify_gemm_oracle.rs, crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs | developer |
+| `HIPFIRE_CERT_CACHE` | crates/peacemaker-isa/src/cert_cache.rs, crates/peacemaker-isa/src/pm_check.rs | developer |
 | `HIPFIRE_CHATML` | crates/saddle-lab/examples/probe_argmax_agreement.rs | harness |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-arch-qwen4/examples/qwen4_greedy_ids.rs, crates/hipfire-arch-qwen4/examples/qwen4_slowlink_quality.rs | developer |
 | `HIPFIRE_CHAT_TEMPLATE_FILE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/dump_embedded_template.rs | stable |
@@ -1347,7 +1350,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh | harness |
 | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs | developer |
 | `HIPFIRE_FORCE_UNFUSED` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
-| `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs | developer |
+| `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_FORWARD_ORACLE` | crates/hipfire-dispatch/src/pipeline/superop.rs | developer |
 | `HIPFIRE_FP16` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | stable |
 | `HIPFIRE_FP16_LAYER_MAX` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
@@ -1746,6 +1749,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LOG` | crates/hipfire-daemon/src/process_init.rs | developer |
 | `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/process_init.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_LOWBIT_WMMA_WAVES` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_M7_TEST_CASE` | crates/peacemaker-isa/src/pm_check.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_M7_TEST_ROOT` | crates/peacemaker-isa/src/pm_check.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_MAGIC` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | harness |
 | `HIPFIRE_MAPLE_DOWN` | crates/hipfire-arch-maple/src/forward.rs | developer |
 | `HIPFIRE_MAPLE_DUMP_HIDDEN` | crates/hipfire-arch-maple/src/forward.rs, tools/models/maple/compare_hidden.py | developer |
