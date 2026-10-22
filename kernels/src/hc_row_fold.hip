@@ -15,6 +15,10 @@
 //
 // Grid [tokens], block 256, dynamic LDS (hidden * 8 + 4 * 256 * 4 + hidden * 2 + 16)
 // bytes.  `streams` is rewritten in place (a token's block only touches its row).
+//
+// hc_row_fold_norm_gate is the gfx1151 entry (its text, and so its code object, is
+// frozen).  The gfx12 entries `hc_row_fold_moe_gfx1201` / `hc_row_write_norm_gate_gfx1201`
+// at the end of the file are the same fold for the gfx1201 default chain.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
@@ -269,3 +273,268 @@ extern "C" __global__ __launch_bounds__(256) void hc_row_fold_norm_gate(
     const float sum = hc_lane0_tree_sum(hcw_add(hcw_add(a3, a2), hcw_add(a1, a0)));
     if (lane == 0) next_gates[(size_t)row * branches + wave] = sum;
 }
+
+#if defined(__GFX12__)
+// ---------------------------------------------------------------------------------------
+// gfx1201 row folds: bytewise the gfx1201 default prefill chain (the hcw / hcsd epilogues
+// stay off on gfx1201), expressions copied as SOURCE TEXT from the replaced kernels --
+// no pinned asm: which NaN a mixed-NaN row propagates follows the compiled operand order
+// of the unfused kernels, which the byte oracles in rdna-compute/src/tensor_ops.rs
+// (hc_row_fold_gfx1201_*) gate against the unfused launches, NaN payloads included.
+//
+//   hc_row_fold_moe_gfx1201 (MOE = true), the MoE sublayer tail:
+//     moe_down_combine_grouped_top10_bf16in_zinit   routed rows (F32, never stored)
+//     bf16_scaled_add_batched_f32                   + sigmoid-selector * shared down (F32 rows)
+//     hyper_write_bf16x8_gfx1201                    streams += gate * mixed
+//     hyper_norm_gate_outputs                       next read's norm, F16 row, next gates
+//   hc_row_write_norm_gate_gfx1201 (MOE = false), the mixer tail:
+//     hyper_write_bf16x8_gfx1201 of the out projection's F32 `mixed`, then
+//     hyper_norm_gate_outputs
+//
+// Grid [tokens], block 256, dynamic LDS (hidden * 8 + 4 * 256 * 4 + hidden * 2 + 16)
+// bytes; four branches, hidden % 256 == 0, hidden <= 2560.  `streams` is rewritten in place.
+template <bool MOE>
+static __device__ __forceinline__ void hc_row_fold_gfx12_body(
+    const unsigned short* __restrict__ grouped_down,  // MOE: [grouped_rows, hidden] BF16 bits
+    const int2* __restrict__ order,                    // MOE: [tokens * 10] moe_combine_order_top10
+    const float* __restrict__ shared_or_mixed,         // MOE: shared down F32 / else mixed F32 [tokens, hidden]
+    const float* __restrict__ selector,                // MOE: [tokens]
+    unsigned short* streams,                           // [tokens, 4 * hidden] BF16 bits, in place
+    const float* __restrict__ gates,                   // [tokens, 4] this write's gate logits
+    const __hip_bfloat16* __restrict__ norm_weight,   // next read's norm weight [4 * hidden]
+    const unsigned short* __restrict__ gate_weight,   // next write's BF16 gate weight [4, 4 * hidden]
+    float* __restrict__ next_gates,                    // [tokens, 4]
+    _Float16* __restrict__ normalized16,               // [tokens, 4 * hidden] F16
+    int hidden) {
+    constexpr int branches = 4;
+    constexpr int U = 10;
+    extern __shared__ float hc_lds[];
+    const int wide = branches * hidden;
+    const int per = hidden / 256;
+    unsigned short* xsb = (unsigned short*)hc_lds;
+    float* rms_sum = hc_lds + wide / 2;
+    unsigned int* mixed_lds = (unsigned int*)(rms_sum + branches * 256);  // hidden / 2 words
+    float* gate_lds = (float*)(mixed_lds + hidden / 2);                   // 4 floats
+    const int row = (int)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const size_t in = (size_t)row * wide;
+
+    // --- mixed: MOE, combine (initial_zero) + bf16_scaled_add; else the F32 input -----
+    // Staged as BF16 words: the HC write below rounds `mixed` to BF16 first, and the
+    // scaled add's result is already BF16-valued, so staging then re-rounding is the
+    // identity on both.
+    if constexpr (MOE) {
+        const size_t route_base = (size_t)row * 10;
+        int rowidx[10];
+        float wts[10];
+#pragma unroll
+        for (int c = 0; c < 10; ++c) {
+            const int2 o = order[route_base + c];
+            rowidx[c] = o.x;
+            wts[c] = __int_as_float(o.y);
+        }
+        const __hip_bfloat16 gate = bf16_round(selector[row]);
+        for (int p = tid; p < hidden / 2; p += 256) {
+            unsigned int w[10];
+#pragma unroll
+            for (int c = 0; c < 10; ++c)
+                w[c] = rowidx[c] >= 0
+                    ? *(const unsigned int*)(grouped_down + (size_t)rowidx[c] * hidden + 2 * p)
+                    : 0u;
+            const float2 sv = *(const float2*)(shared_or_mixed + (size_t)row * hidden + 2 * p);
+            const float shared_value[2] = {sv.x, sv.y};
+            unsigned int packed[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                __hip_bfloat16 accumulated = bf16_round(0.0f);
+#pragma unroll
+                for (int c = 0; c < 10; ++c) {
+                    const float raw_output = __uint_as_float((e & 1) ? (w[c] & 0xFFFF0000u) : (w[c] << 16));
+                    const __hip_bfloat16 output = bf16_round(raw_output);
+                    const __hip_bfloat16 weighted = bf16_round(hcw_mul(wts[c], bf16_to_f32(output)));
+                    accumulated = bf16_round(hcw_add(bf16_to_f32(accumulated), bf16_to_f32(weighted)));
+                }
+                const float routed = bf16_to_f32(accumulated);
+                // bf16_scaled_add_batched_f32: residual = the combine's F32 output.
+                const __hip_bfloat16 lhs = bf16_round(routed);
+                const __hip_bfloat16 rhs = bf16_round(shared_value[e]);
+                const __hip_bfloat16 product = bf16_round(hcw_mul(bf16_to_f32(rhs), bf16_to_f32(gate)));
+                packed[e] = (unsigned int)bf16_round(
+                    hcw_add(bf16_to_f32(lhs), bf16_to_f32(product))).data;
+            }
+            mixed_lds[p] = packed[0] | (packed[1] << 16);
+        }
+    } else {
+        const float* mixed = shared_or_mixed + (size_t)row * hidden;
+        for (int p = tid; p < hidden / 2; p += 256) {
+            const float2 m = *(const float2*)(mixed + 2 * p);
+            mixed_lds[p] = (unsigned int)bf16_round(m.x).data
+                | ((unsigned int)bf16_round(m.y).data << 16);
+        }
+    }
+    if (tid < branches) gate_lds[tid] = hcw_gate(gates[(size_t)row * branches + tid]);
+    __syncthreads();
+
+    // --- hyper_write_bf16x8_gfx1201: stream += gate * mixed, 8 columns per unit -------
+    {
+        const int chunks = hidden / 8;
+        for (int u8 = tid; u8 < branches * chunks; u8 += 256) {
+            const int br = u8 / chunks;
+            const int c0 = (u8 - br * chunks) * 8;
+            const uint4 mq = *(const uint4*)((const unsigned short*)mixed_lds + c0);
+            const uint4 sw = *(const uint4*)(streams + in + (size_t)br * hidden + c0);
+            const unsigned int mw[4] = {mq.x, mq.y, mq.z, mq.w};
+            const unsigned int sin[4] = {sw.x, sw.y, sw.z, sw.w};
+            const float gate = gate_lds[br];
+            unsigned int out[4];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const float m0 = __uint_as_float(mw[p] << 16);
+                const float m1 = __uint_as_float(mw[p] & 0xFFFF0000u);
+                // The compiled kernel adds stream + injection (src0 = the stream word).
+                const float lo = hcw_add(
+                    __uint_as_float(sin[p] << 16),
+                    bf16_to_f32(bf16_round(hcw_mul(gate, bf16_to_f32(bf16_round(m0))))));
+                const float hi = hcw_add(
+                    __uint_as_float(sin[p] & 0xFFFF0000u),
+                    bf16_to_f32(bf16_round(hcw_mul(gate, bf16_to_f32(bf16_round(m1))))));
+                out[p] = (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+            }
+            const uint4 ov = make_uint4(out[0], out[1], out[2], out[3]);
+            *(uint4*)(streams + in + (size_t)br * hidden + c0) = ov;
+            *(uint4*)(xsb + (size_t)br * hidden + c0) = ov;
+        }
+    }
+    __syncthreads();
+
+    // --- next read: hyper_norm_gate_outputs_body (state_bf16, normalized16 only) ------
+    float raw[branches][U];
+#pragma unroll
+    for (int b = 0; b < branches; ++b)
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+            raw[b][u] = u < per
+                ? __uint_as_float((unsigned int)xsb[b * hidden + tid + 256 * u] << 16)
+                : 0.0f;
+#pragma unroll
+    for (int b = 0; b < branches; ++b) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            raw[b][u] = bf16_to_f32(bf16_round(raw[b][u]));
+            if (u < per) partial += raw[b][u] * raw[b][u];
+        }
+        rms_sum[b * 256 + tid] = partial;
+    }
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int b = 0; b < branches; ++b)
+                rms_sum[b * 256 + tid] += rms_sum[b * 256 + tid + stride];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int b = 0; b < branches; ++b) {
+        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = b * hidden + tid + 256 * u;
+            if (u < per)
+                xsb[j] = (unsigned short)(__float_as_uint(bf16_to_f32(bf16_round(
+                    raw[b][u] * inv * (1.0f + bf16_to_f32(norm_weight[j]))))) >> 16);
+        }
+    }
+    __syncthreads();
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    if (wave >= branches) {
+        const int t2 = tid - branches * 32;
+        for (int v = t2; v < wide / 8; v += 4 * 32) {
+            const uint4 xv = ((const uint4*)xsb)[v];
+            typedef _Float16 half8v __attribute__((ext_vector_type(8)));
+            half8v h;
+            h[0] = (_Float16)__uint_as_float(xv.x << 16);
+            h[1] = (_Float16)__uint_as_float(xv.x & 0xFFFF0000u);
+            h[2] = (_Float16)__uint_as_float(xv.y << 16);
+            h[3] = (_Float16)__uint_as_float(xv.y & 0xFFFF0000u);
+            h[4] = (_Float16)__uint_as_float(xv.z << 16);
+            h[5] = (_Float16)__uint_as_float(xv.z & 0xFFFF0000u);
+            h[6] = (_Float16)__uint_as_float(xv.w << 16);
+            h[7] = (_Float16)__uint_as_float(xv.w & 0xFFFF0000u);
+            ((half8v*)(normalized16 + in))[v] = h;
+        }
+        return;
+    }
+    const unsigned short* w_row = gate_weight + (size_t)wave * wide;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    constexpr int BATCH = 10;
+    int i = lane * 8;
+    for (; i + 8 + (BATCH - 1) * 256 <= wide; i += BATCH * 256) {
+        uint4 wb[BATCH];
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) wb[u] = *(const uint4*)(w_row + i + u * 256);
+#pragma unroll
+        for (int u = 0; u < BATCH; ++u) {
+            const uint4 wv = wb[u];
+            const uint4 xv = *(const uint4*)(xsb + i + u * 256);
+            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+            a0 = hcw_fma(__uint_as_float(wv.x << 16), xa.x, a0);
+            a1 = hcw_fma(__uint_as_float(wv.x & 0xFFFF0000u), xa.y, a1);
+            a2 = hcw_fma(__uint_as_float(wv.y << 16), xa.z, a2);
+            a3 = hcw_fma(__uint_as_float(wv.y & 0xFFFF0000u), xa.w, a3);
+            a0 = hcw_fma(__uint_as_float(wv.z << 16), xb.x, a0);
+            a1 = hcw_fma(__uint_as_float(wv.z & 0xFFFF0000u), xb.y, a1);
+            a2 = hcw_fma(__uint_as_float(wv.w << 16), xb.z, a2);
+            a3 = hcw_fma(__uint_as_float(wv.w & 0xFFFF0000u), xb.w, a3);
+        }
+    }
+    for (; i + 8 <= wide; i += 32 * 8) {
+        const uint4 wv = *(const uint4*)(w_row + i);
+        const uint4 xv = *(const uint4*)(xsb + i);
+        const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+        const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+        a0 = hcw_fma(__uint_as_float(wv.x << 16), xa.x, a0);
+        a1 = hcw_fma(__uint_as_float(wv.x & 0xFFFF0000u), xa.y, a1);
+        a2 = hcw_fma(__uint_as_float(wv.y << 16), xa.z, a2);
+        a3 = hcw_fma(__uint_as_float(wv.y & 0xFFFF0000u), xa.w, a3);
+        a0 = hcw_fma(__uint_as_float(wv.z << 16), xb.x, a0);
+        a1 = hcw_fma(__uint_as_float(wv.z & 0xFFFF0000u), xb.y, a1);
+        a2 = hcw_fma(__uint_as_float(wv.w << 16), xb.z, a2);
+        a3 = hcw_fma(__uint_as_float(wv.w & 0xFFFF0000u), xb.w, a3);
+    }
+    const float sum = hc_lane0_tree_sum(hcw_add(hcw_add(a3, a2), hcw_add(a1, a0)));
+    if (lane == 0) next_gates[(size_t)row * branches + wave] = sum;
+}
+
+extern "C" __global__ __launch_bounds__(256) void hc_row_fold_moe_gfx1201(
+    const unsigned short* __restrict__ grouped_down,  // [grouped_rows, hidden] BF16 bits
+    const int2* __restrict__ order,                    // [tokens * 10] moe_combine_order_top10
+    const float* __restrict__ shared_f32,              // [tokens, hidden] F32 (shared down)
+    const float* __restrict__ selector,                // [tokens]
+    unsigned short* streams,                           // [tokens, 4 * hidden] BF16 bits, in place
+    const float* __restrict__ gates,                   // [tokens, 4] this write's gate logits
+    const __hip_bfloat16* __restrict__ norm_weight,   // next read's norm weight [4 * hidden]
+    const unsigned short* __restrict__ gate_weight,   // next write's BF16 gate weight [4, 4 * hidden]
+    float* __restrict__ next_gates,                    // [tokens, 4]
+    _Float16* __restrict__ normalized16,               // [tokens, 4 * hidden] F16
+    int hidden) {
+    hc_row_fold_gfx12_body<true>(grouped_down, order, shared_f32, selector, streams, gates,
+                                 norm_weight, gate_weight, next_gates, normalized16, hidden);
+}
+
+extern "C" __global__ __launch_bounds__(256) void hc_row_write_norm_gate_gfx1201(
+    const float* __restrict__ mixed,                   // [tokens, hidden] F32
+    unsigned short* streams,                           // [tokens, 4 * hidden] BF16 bits, in place
+    const float* __restrict__ gates,                   // [tokens, 4] this write's gate logits
+    const __hip_bfloat16* __restrict__ norm_weight,   // next read's norm weight [4 * hidden]
+    const unsigned short* __restrict__ gate_weight,   // next write's BF16 gate weight [4, 4 * hidden]
+    float* __restrict__ next_gates,                    // [tokens, 4]
+    _Float16* __restrict__ normalized16,               // [tokens, 4 * hidden] F16
+    int hidden) {
+    hc_row_fold_gfx12_body<false>(nullptr, nullptr, mixed, nullptr, streams, gates, norm_weight,
+                                  gate_weight, next_gates, normalized16, hidden);
+}
+#endif
