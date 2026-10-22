@@ -71,7 +71,11 @@ fn problem(k: usize, p: usize, seed: u64) -> Problem {
 }
 
 fn run(spec: Spec, gp: bool, pr: &Problem) -> Result<Vec<u8>, String> {
-    let emitted = if gp { mr::emit_gp(spec) } else { mr::emit(spec) }?;
+    let emitted = if gp {
+        mr::emit_gp(spec)
+    } else {
+        mr::emit(spec)
+    }?;
     let elf = native::assemble(&emitted.s_text, ARCH)?;
     let program = peacemaker_lift::lift_object(
         &elf,
@@ -148,7 +152,10 @@ fn check(gp: bool, pr: &Problem, got: &[u8]) {
             } else {
                 g * pr.l + slot as usize
             };
-            assert!(expect[idx].replace(rec).is_none(), "record {idx} named twice");
+            assert!(
+                expect[idx].replace(rec).is_none(),
+                "record {idx} named twice"
+            );
         }
     }
     let mut written = 0;
@@ -173,7 +180,8 @@ fn sorted_slot_producer_matches_the_reference_on_the_interpreter() {
     require_rocm_tool!("llvm-mc");
     for (k, p, seed) in [(128usize, 7usize, 3u64), (256, 12, 5), (512, 9, 7)] {
         let pr = problem(k, p, seed);
-        let got = run(Spec { arch: ARCH }, false, &pr).unwrap_or_else(|e| panic!("K={k} P={p}: {e}"));
+        let got =
+            run(Spec { arch: ARCH }, false, &pr).unwrap_or_else(|e| panic!("K={k} P={p}: {e}"));
         check(false, &pr, &got);
     }
 }
@@ -183,7 +191,8 @@ fn grouped_position_twin_matches_the_reference_on_the_interpreter() {
     require_rocm_tool!("llvm-mc");
     for (k, p, seed) in [(128usize, 7usize, 3u64), (256, 12, 5), (512, 9, 7)] {
         let pr = problem(k, p, seed);
-        let got = run(Spec { arch: ARCH }, true, &pr).unwrap_or_else(|e| panic!("K={k} P={p}: {e}"));
+        let got =
+            run(Spec { arch: ARCH }, true, &pr).unwrap_or_else(|e| panic!("K={k} P={p}: {e}"));
         check(true, &pr, &got);
     }
 }

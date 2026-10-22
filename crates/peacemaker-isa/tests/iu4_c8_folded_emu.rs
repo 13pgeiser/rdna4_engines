@@ -116,7 +116,8 @@ impl Rig {
         let mut mem = Memory::default();
         mem.map("karg".into(), KARG, karg).unwrap();
         mem.map("x".into(), XB, bytes(x)).unwrap();
-        mem.map("rot".into(), ROTB, vec![0xa5; rows * K * 4]).unwrap();
+        mem.map("rot".into(), ROTB, vec![0xa5; rows * K * 4])
+            .unwrap();
         mem.map("sc".into(), SCB, vec![0xa5; (K / 128) * rows * 72])
             .unwrap();
         mem.map("s1".into(), S1B, bytes(signs.0)).unwrap();
@@ -136,7 +137,11 @@ impl Rig {
                 .unwrap(),
             _ => {}
         }
-        let grid = if export.is_norm() { rows } else { rows * K / 256 };
+        let grid = if export.is_norm() {
+            rows
+        } else {
+            rows * K / 256
+        };
         for wg in 0..grid {
             emu.run_workgroup(
                 &Launch {
@@ -151,18 +156,30 @@ impl Rig {
         }
         let region = |n: &str| mem.regions.iter().find(|r| r.name == n).unwrap();
         for n in ["rot", "sc"] {
-            assert_eq!(region(n).written.count(), region(n).bytes.len(), "{export:?}: {n} not fully written");
+            assert_eq!(
+                region(n).written.count(),
+                region(n).bytes.len(),
+                "{export:?}: {n} not fully written"
+            );
         }
         let mut inputs = vec!["x", "s1", "s2", "karg"];
         if export == Export::SigmoidRotate {
             inputs.push("gate");
         }
         for n in inputs {
-            assert_eq!(region(n).written.count(), 0, "{export:?}: input {n} was written");
+            assert_eq!(
+                region(n).written.count(),
+                0,
+                "{export:?}: input {n} was written"
+            );
         }
         let ext_bytes = if export == Export::NormOut {
             let r = region("norm_out");
-            assert_eq!(r.written.count(), r.bytes.len(), "norm_out not fully written");
+            assert_eq!(
+                r.written.count(),
+                r.bytes.len(),
+                "norm_out not fully written"
+            );
             r.bytes.clone()
         } else {
             Vec::new()
@@ -191,7 +208,11 @@ fn expf_neg(x: f32) -> f32 {
     let r = (prod - n) + lo;
     let e = ldexp(exp2_hw(r), n as i32);
     // `v_cmp_ngt / nlt` are true on NaN: no NaN reaches here.
-    let e = if !(f32::from_bits(0x42ce8ed0) < x) { e } else { 0.0 };
+    let e = if !(f32::from_bits(0x42ce8ed0) < x) {
+        e
+    } else {
+        0.0
+    };
     if !(f32::from_bits(0xc2b17218) > x) {
         e
     } else {
@@ -239,9 +260,25 @@ fn sigmoid_rotate_equals_the_unfused_gate_then_rotate_chain() {
             (&s1, &s2),
             0.0,
         );
-        let gated: Vec<f32> = attn.iter().zip(&gate).map(|(&a, &g)| sigmoid_mul(a, g)).collect();
-        let unfused = rig.run(Export::Rotate, rows, &gated, None, &weight, awq, (&s1, &s2), 0.0);
-        assert_eq!(folded.rot, unfused.rot, "rows={rows} awq={with_awq}: rotated plane");
+        let gated: Vec<f32> = attn
+            .iter()
+            .zip(&gate)
+            .map(|(&a, &g)| sigmoid_mul(a, g))
+            .collect();
+        let unfused = rig.run(
+            Export::Rotate,
+            rows,
+            &gated,
+            None,
+            &weight,
+            awq,
+            (&s1, &s2),
+            0.0,
+        );
+        assert_eq!(
+            folded.rot, unfused.rot,
+            "rows={rows} awq={with_awq}: rotated plane"
+        );
         assert_eq!(folded.sc, unfused.sc, "rows={rows} awq={with_awq}: sidecar");
     }
 }
@@ -283,7 +320,16 @@ fn rmsnorm_out_rotate_stores_the_normalized_row_and_rotates_it() {
         let (x, _, weight, s1, s2, awq) = setup(rows, seed);
         let awq = with_awq.then_some(awq.as_slice());
         let eps = 1.0e-6f32;
-        let folded = rig.run(Export::NormOut, rows, &x, None, &weight, awq, (&s1, &s2), eps);
+        let folded = rig.run(
+            Export::NormOut,
+            rows,
+            &x,
+            None,
+            &weight,
+            awq,
+            (&s1, &s2),
+            eps,
+        );
         let mut y = vec![0f32; rows * K];
         for r in 0..rows {
             let rms = rms_of(&x[r * K..][..K], eps);
@@ -297,10 +343,28 @@ fn rmsnorm_out_rotate_stores_the_normalized_row_and_rotates_it() {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         for (idx, (&g, w)) in got.iter().zip(&y).enumerate() {
-            assert_eq!(g, w.to_bits(), "rows={rows} norm_out[{idx}] (row {}, col {})", idx / K, idx % K);
+            assert_eq!(
+                g,
+                w.to_bits(),
+                "rows={rows} norm_out[{idx}] (row {}, col {})",
+                idx / K,
+                idx % K
+            );
         }
-        let unfused = rig.run(Export::Rotate, rows, &y, None, &weight, awq, (&s1, &s2), eps);
-        assert_eq!(folded.rot, unfused.rot, "rows={rows} awq={with_awq}: rotated plane");
+        let unfused = rig.run(
+            Export::Rotate,
+            rows,
+            &y,
+            None,
+            &weight,
+            awq,
+            (&s1, &s2),
+            eps,
+        );
+        assert_eq!(
+            folded.rot, unfused.rot,
+            "rows={rows} awq={with_awq}: rotated plane"
+        );
         assert_eq!(folded.sc, unfused.sc, "rows={rows} awq={with_awq}: sidecar");
     }
 }

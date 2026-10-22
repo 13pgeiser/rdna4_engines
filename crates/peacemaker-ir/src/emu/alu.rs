@@ -5644,7 +5644,13 @@ mod tests {
         let arch = Arch::Gfx1201;
         let f = f32::to_bits;
         assert_eq!(
-            lane_on(arch, "v_and_or_b32", &[0xf0f0_ffff, 0x0000_f000, 0x0000_000f], 0, |_| {}),
+            lane_on(
+                arch,
+                "v_and_or_b32",
+                &[0xf0f0_ffff, 0x0000_f000, 0x0000_000f],
+                0,
+                |_| {}
+            ),
             Ok(0x0000_f00f)
         );
         // clamp(x, lo, hi) = min(max(x, lo), hi)
@@ -5652,35 +5658,75 @@ mod tests {
         assert_eq!(clamp(f(5.0)), Ok(f(5.0)));
         assert_eq!(clamp(f(-100.0)), Ok(f(-8.0)));
         assert_eq!(clamp(f(100.0)), Ok(f(7.0)));
-        assert_eq!(clamp(0x7fc0_0000), Ok(f(-8.0)), "a NaN loses to the number: max_num(NaN, lo) = lo");
+        assert_eq!(
+            clamp(0x7fc0_0000),
+            Ok(f(-8.0)),
+            "a NaN loses to the number: max_num(NaN, lo) = lo"
+        );
         // No source modifier, omod or clamp is measured.
-        assert!(lane_on(arch, "v_maxmin_num_f32", &[f(1.0), f(2.0), f(3.0)], 0, |i| i.mods.abs = 1).is_err());
-        assert!(lane_on(arch, "v_maxmin_num_f32", &[f(1.0), f(2.0), f(3.0)], 0, |i| i.mods.clamp = true).is_err());
+        assert!(lane_on(
+            arch,
+            "v_maxmin_num_f32",
+            &[f(1.0), f(2.0), f(3.0)],
+            0,
+            |i| i.mods.abs = 1
+        )
+        .is_err());
+        assert!(lane_on(
+            arch,
+            "v_maxmin_num_f32",
+            &[f(1.0), f(2.0), f(3.0)],
+            0,
+            |i| i.mods.clamp = true
+        )
+        .is_err());
         // `v_max_num_f32_e64 |a|, |b|`
         assert_eq!(
-            lane_on(arch, "v_max_num_f32_e64", &[f(-2.0), f(1.0)], 0, |i| i.mods.abs = 0b11),
+            lane_on(arch, "v_max_num_f32_e64", &[f(-2.0), f(1.0)], 0, |i| i
+                .mods
+                .abs =
+                0b11),
             Ok(f(2.0))
         );
         assert_eq!(
-            lane_on(arch, "v_max_num_f32_e64", &[f(-0.5), f(-4.0)], 0, |i| i.mods.abs = 0b11),
+            lane_on(arch, "v_max_num_f32_e64", &[f(-0.5), f(-4.0)], 0, |i| i
+                .mods
+                .abs =
+                0b11),
             Ok(f(4.0))
         );
         // v_cmp_gt_f32_e32 vcc_lo, 0x800000, vN: smallest normal > x (true for denormals and zero, false otherwise).
         let i = insn_on(
             arch,
             "v_cmp_gt_f32_e32",
-            vec![Operand::Special(Special::VccLo), Operand::Literal(0x0080_0000), v(1)],
+            vec![
+                Operand::Special(Special::VccLo),
+                Operand::Literal(0x0080_0000),
+                v(1),
+            ],
         );
         let mut st = state();
         st.exec = 0xff;
-        for (lane, x) in [0u32, 1, 0x007f_ffff, 0x0080_0000, 0x0080_0001, f(1.0), 0x7fc0_0000, 0x8000_0001]
-            .into_iter()
-            .enumerate()
+        for (lane, x) in [
+            0u32,
+            1,
+            0x007f_ffff,
+            0x0080_0000,
+            0x0080_0001,
+            f(1.0),
+            0x7fc0_0000,
+            0x8000_0001,
+        ]
+        .into_iter()
+        .enumerate()
         {
             st.v[1][lane] = x;
         }
         st.vcc = u32::MAX;
         execute(arch, "v_cmp_gt_f32_e32", &i, &mut st).unwrap();
-        assert_eq!(st.vcc, 0b1000_0111, "lanes 0,1,2 and the negative denormal 7; inactive lanes clear");
+        assert_eq!(
+            st.vcc, 0b1000_0111,
+            "lanes 0,1,2 and the negative denormal 7; inactive lanes clear"
+        );
     }
 }

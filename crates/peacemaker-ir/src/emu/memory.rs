@@ -1114,7 +1114,10 @@ mod tests {
         st.s[8] = 0x1000;
         st.s[9] = 0;
         st.v[2][0] = 4;
-        for (n, w) in [0x0403_0201u32, 0x0807_0605, 0x0c0b_0a09, 0x100f_0e0d].into_iter().enumerate() {
+        for (n, w) in [0x0403_0201u32, 0x0807_0605, 0x0c0b_0a09, 0x100f_0e0d]
+            .into_iter()
+            .enumerate()
+        {
             st.v[4 + n][0] = w;
         }
         let mut mem = Memory::default();
@@ -1126,15 +1129,43 @@ mod tests {
             }
             execute(name, &insn(name, ops), st, mem, &mut [])
         };
-        run(&mut st, &mut mem, "global_store_b128", reg(Kind::V, 4, 4), 16).unwrap();
-        assert_eq!(mem.read(0x1000 + 20, 16).unwrap(), (1..=16u8).collect::<Vec<_>>());
+        run(
+            &mut st,
+            &mut mem,
+            "global_store_b128",
+            reg(Kind::V, 4, 4),
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            mem.read(0x1000 + 20, 16).unwrap(),
+            (1..=16u8).collect::<Vec<_>>()
+        );
         run(&mut st, &mut mem, "global_store_b64", reg(Kind::V, 4, 2), 0).unwrap();
         assert_eq!(mem.read(0x1004, 8).unwrap(), (1..=8u8).collect::<Vec<_>>());
-        run(&mut st, &mut mem, "global_store_b16", reg(Kind::V, 7, 1), 40).unwrap();
+        run(
+            &mut st,
+            &mut mem,
+            "global_store_b16",
+            reg(Kind::V, 7, 1),
+            40,
+        )
+        .unwrap();
         assert_eq!(mem.read(0x1000 + 44, 4).unwrap(), [0x0d, 0x0e, 0xee, 0xee]);
         let written: usize = mem.regions[0].written.count();
-        assert_eq!(written, 16 + 8 + 2, "only the stored bytes are marked written");
+        assert_eq!(
+            written,
+            16 + 8 + 2,
+            "only the stored bytes are marked written"
+        );
         st.v[2][0] = 0x2000;
-        assert!(run(&mut st, &mut mem, "global_store_b128", reg(Kind::V, 4, 4), 0).is_err());
+        assert!(run(
+            &mut st,
+            &mut mem,
+            "global_store_b128",
+            reg(Kind::V, 4, 4),
+            0
+        )
+        .is_err());
     }
 }

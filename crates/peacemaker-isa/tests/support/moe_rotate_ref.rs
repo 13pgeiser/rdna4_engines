@@ -130,4 +130,3 @@ pub fn quantize(x: &[f32; 128]) -> [u8; 72] {
 pub fn record(h_group: &[u16], s1: &[f32; 128], s2: &[f32; 128]) -> [u8; 72] {
     quantize(&rotate(h_group, s1, s2))
 }
-
