@@ -50,14 +50,14 @@
 //! Use (build once, then take a gfx1201 card through the fabric; check
 //! `fabric-run.sh --status` first and pick an idle hiptrx card A/B/C/E):
 //! ```text
-//! cargo build --release -p rdna-compute --example pm_loop
+//! cargo build --release -p rdna-compute --features lab --example pm_loop
 //! /home/kaden/qcal/locks/fabric/fabric-run.sh --class timing --card B --mem-gb 4 \
 //!   --max-secs 900 --owner PmLoop -- target/release/examples/pm_loop \
 //!   --kernel iu4_gemm --fold k128 --tile 256x128x16 --epi set \
 //!   --shape M=17408,N=512,K=5120 --time 30 --rounds 5
 //! ```
 //! The fabric exports `ROCR_VISIBLE_DEVICES`/`FABRIC_CARDS`, recorded under
-//! `device`. GPU-free tests: `cargo test -p rdna-compute --example pm_loop`.
+//! `device`. GPU-free tests: `cargo test -p rdna-compute --features lab --example pm_loop`.
 
 #[path = "support/abba.rs"]
 mod abba;
