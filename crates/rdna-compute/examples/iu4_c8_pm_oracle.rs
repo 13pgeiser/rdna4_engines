@@ -35,10 +35,10 @@
 //!
 //! The PM exports are launched explicitly through the low-level PM launchers,
 //! independent of the production route: the oracle never reads the
-//! `PrefillIu4C8Pm` capability / `HIPFIRE_PREFILL_IU4_C8_PM` /
-//! `developer.prefill_iu4_c8_pm`, and refuses to run with
-//! `HIPFIRE_PREFILL_IU4_C8_PM=1` so the HIP incumbent arm can never be
-//! silently re-routed to PM.
+//! `PrefillIu4C8Pm` capability / `developer.prefill_iu4_c8_pm`. The route is
+//! qualified on exact gfx1201, so an unset flag would let the HIP incumbent
+//! arm (`*_exact_batched`) take the PM twin; the oracle therefore requires the
+//! explicit kill `HIPFIRE_PREFILL_IU4_C8_PM=0` and refuses to run otherwise.
 //!
 //! CPU diagnostic (never contributes to `all_byte_identical`): the first 64
 //! rows of the incumbent's rotated f32 are quantized by the CPU C8 model in
@@ -620,10 +620,10 @@ fn cpu_model_vs_sidecar(
 }
 
 /// Flag expectation for `HIPFIRE_PREFILL_IU4_C8_PM`: explicit 1 opts in,
-/// 0 kills, unset is off.
+/// 0 kills, unset follows the exact-gfx1201 qualification (on there).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FlagState {
-    Off,
+    Default,
     On,
     Killed,
 }
@@ -632,13 +632,14 @@ fn flag_state(env: Option<&str>) -> FlagState {
     match env {
         Some("1") => FlagState::On,
         Some("0") => FlagState::Killed,
-        _ => FlagState::Off,
+        _ => FlagState::Default,
     }
 }
 
-/// The oracle's HIP incumbent must not be re-routed to PM.
+/// The oracle's HIP incumbent must not be re-routed to PM: only the explicit
+/// kill keeps the `*_exact_batched` methods on the HIP export.
 fn env_isolated(env: Option<&str>) -> bool {
-    flag_state(env) != FlagState::On
+    flag_state(env) == FlagState::Killed
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,7 +1090,7 @@ fn run_case(gpu: &mut Gpu, case: &Case, g: &Group, a: &Args, deadline: Instant) 
 fn prerequisites() -> Vec<String> {
     vec![
         "exact gfx1201 (the oracle refuses any other arch with exit 2)".to_string(),
-        format!("{FLAG_ENV} must not be 1: the oracle launches the PM launchers explicitly and the HIP incumbent through the *_exact_batched methods; exit 2 otherwise"),
+        format!("{FLAG_ENV}=0 is required: the route is qualified on exact gfx1201, the oracle launches the PM launchers explicitly and the HIP incumbent through the *_exact_batched methods; exit 2 otherwise"),
         format!("module {PM_MODULE} is embedded in the build (kernels/{PM_MODULE}.hxaco, include_bytes! in rdna-compute src/iu4_c8_pm.rs)"),
         "one GPU, single process, watchdog <= 120 s".to_string(),
     ]
@@ -1282,13 +1283,19 @@ fn self_check() {
     }
 
     // ---- Flag expectations -------------------------------------------
-    check!(flag_state(None) == FlagState::Off, "unset is off");
+    check!(
+        flag_state(None) == FlagState::Default,
+        "unset follows qualification"
+    );
     check!(flag_state(Some("1")) == FlagState::On, "1 opts in");
     check!(flag_state(Some("0")) == FlagState::Killed, "0 kills");
-    check!(flag_state(Some("")) == FlagState::Off, "empty is off");
     check!(
-        env_isolated(None) && env_isolated(Some("0")) && !env_isolated(Some("1")),
-        "oracle refuses only the opted-in flag"
+        flag_state(Some("")) == FlagState::Default,
+        "empty is the default"
+    );
+    check!(
+        !env_isolated(None) && env_isolated(Some("0")) && !env_isolated(Some("1")),
+        "oracle runs only with the explicit kill"
     );
     check!(
         FLAG_ENV == "HIPFIRE_PREFILL_IU4_C8_PM" && FLAG_TYPED_KEY == "developer.prefill_iu4_c8_pm",
@@ -1764,8 +1771,8 @@ fn run(a: &Args) {
     let env = std::env::var(FLAG_ENV).ok();
     if !env_isolated(env.as_deref()) {
         eprintln!(
-            "iu4_c8_pm_oracle: {FLAG_ENV}=1 would let the HIP incumbent route to PM; \
-             unset it (the oracle launches PM explicitly)"
+            "iu4_c8_pm_oracle: {FLAG_ENV} must be 0 (the route is qualified on exact gfx1201, \
+             so unset or 1 lets the HIP incumbent route to PM; the oracle launches PM explicitly)"
         );
         std::process::exit(2);
     }

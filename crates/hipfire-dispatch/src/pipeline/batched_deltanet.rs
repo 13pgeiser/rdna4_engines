@@ -1226,8 +1226,8 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
     // semantics, no tree parents, no DFlash tape (tape writes stay on the old
     // path), the GQA interleave branch with exact head division, HD 128, and
     // n >= 1 (ragged tails run with a short last group). The MoE sibling
-    // (`batch_chunk_delta_net_moe`) keeps the 3-launch sequence. q_raw/k_raw
-    // stores are kept by the fused kernel (v1).
+    // (`batched_moe::execute_deltanet_moe_layer_batched`) keeps the 3-launch
+    // sequence. q_raw/k_raw stores are kept by the fused kernel (v1).
     {
         let no_tree_parents = tree_verify
             .as_ref()

@@ -8724,8 +8724,9 @@ pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
 /// `rope_partial_halfsplit_f32_headgrid` on gfx1201) compiles to:
 /// `fma(x0, cos, -(x1 * sin))`, `fma(x0, sin, x1 * cos)`. Left to the
 /// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)` on
-/// both archs and differs from the unfused chain in the last bit, so the
-/// lowered decode diverged from the hand decode (`HIPFIRE_FORWARD_LOWERED=0`).
+/// both archs and differs from the unfused chain in the last bit, so decode
+/// diverged between the fused route and the unfused one (which still runs
+/// where the fusion gate is off: TriAttention tap, VL mrope, the opt-out).
 fn qwen36_27b_fa_prep_body(entry: &str) -> String {
     let body =
         QWEN35_FA_PREP_GFX1100_SRC.replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");

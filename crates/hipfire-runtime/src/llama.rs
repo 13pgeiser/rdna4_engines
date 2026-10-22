@@ -1582,6 +1582,13 @@ pub fn weight_gemv_residual(
 ///   gemv_hfq4g256_residual(w_down, mq_x_rot, x)    // fused residual add
 /// so the entire w_down epilogue is two launches instead of four
 /// (silu_mul + rotate + gemv + add_inplace → fused_silu_rotate + gemv_residual).
+///
+/// Twin of `hipfire_dispatch::pipeline::hybrid::swiglu_down_residual`, which
+/// the Qwen3.5 decode step program and MTP head run. The two differ only in
+/// the rotated-format fallback (here `weight_gemv_residual`, there
+/// `GemvFamily::run_auto` + add). The remaining callers are the Qwen3.5 PP
+/// decode loop (`forward_scratch_layers_multi`) and the per-token FA prefill
+/// fallback (`run_fa_layer_body`); see `docs/design/qwen35-declarative-program.md`.
 pub fn weight_gemv_swiglu_residual(
     gpu: &mut Gpu,
     w_down: &WeightTensor,
@@ -4097,8 +4104,7 @@ pub fn forward_scratch_embed(
 /// Cached `HIPFIRE_FORWARD_LOWERED` toggle for the llama-family decode path
 /// (N5 Phase A). Default ON; `HIPFIRE_FORWARD_LOWERED=0` forces the legacy
 /// hand-rolled [`forward_scratch_layers`] body as a byte-exact reference +
-/// escape hatch. Mirrors qwen2's `qwen2_forward_lowered_enabled` and qwen35's
-/// `forward_lowered_enabled`.
+/// escape hatch. Mirrors qwen2's `qwen2_forward_lowered_enabled`.
 fn llama_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
