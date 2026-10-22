@@ -1279,3 +1279,54 @@ own VAE latent renders fried** — the sampler barely touched that latent, so wh
 video ENCODER itself hid two real bugs: the norm1/norm3 swap and the shortcut-after-norm1 ordering).
 Next: **video VAE decoder value parity** (new build: R4D_DEC_SEL shadows + AST-extracted comfy decoder
 forward, mirroring `tests/data/ref2va/ref_venc_parity.py`).
+
+### cont.25 (2026-10-22) — #63 CLOSED, the fried look ROOT-CAUSED AND FIXED: the container stored every SwiGLU FFN gate-second
+The decoder-parity build (R4D_DIT_SEL-gated shadows `dbg_vd_lat/x0/blk/n/pix` in
+RadVideoGenDecl + driver readback to R4D_ENC_DUMPDIR, kept) measured block 0 of the video VAE
+decoder straight off the device: **attn cos 0.999990 and to_out cos 0.999994 (bf16 floor) but the
+FFN down-projection window cos 0.49** — and cos 0.999989 the moment it was compared against
+`silu(gu[:, :ff]) * gu[:, ff:]` instead of `silu(gu[:, ff:]) * gu[:, :ff]`. One op had its two
+halves swapped.
+
+The swap lived in the CONTAINER, baked by three `map_rows` sites that reordered `ff.net.0.proj`
+rows gate-second before `silu_mul`/`gated_quant_fp8` (which gate with the FIRST half) read them:
+`vae.blk.*.ffn_up` (+bias), `dit.blk.*.ffn_gate_up`, `ref.blk.*.ffn_gate_up`. The reference
+(comfy `_swiglu_eager`) gates FIRST, so checkpoint order is the right order — the maps are now
+identity at all three sites (int8 DiT, fp8 refiner, bf16 VAE; the two DiT/refiner quantisers
+follow because scales are quantised from the MAPPED rows; `ff.net.2` columns inherit the act
+column order and stay aligned). The old comment claimed diffusers "value-first" — the checkpoint is
+gate-first and comfy proves it. TE blocks were never affected (they concatenate separate
+`mlp.gate_proj|up_proj` gate-first).
+
+Byte proof (both containers, `build/tmp/look/vdharness/verify_gatefix_bytes.py`):
+GATEFIX: vae identity relFro 1.7e-3 vs swapped 1.24; vae bias identity exact; dit sign-match 0.989
+vs 0.484; ref fp8 identity 2.6e-2 vs 1.37. OLD: the exact mirror. Reconvert:
+`./build/bin/rad-convert …/MiniMax-H3-dasiwa-src --home build/radiance_home --recipe
+data/recipes/minimax-h3-dasiwa-w8a8.recipe --reuse …/minimax-h3-dasiwa-w8a8.rad --changed
+convert-ref2va/changed-gatefix.txt -o …/minimax-h3-dasiwa-w8a8-gatefix.rad` (707 tensors / 803
+weights; `--home` is REQUIRED or rad-convert dies on /usr/local/share/kernels; old container kept).
+
+End-to-end device A/B (512² 6s seed 1234 res_multistep 25 shift12/3, `serve_gatefix.sh` +
+`render_flair512.sh`, cmp45/): mid-frame luma 136.2→81.3, clipHi(V≥250) 37.8%→0.1%, clipLo 21.4%→
+0.1%, sat>200 6.8%→4.7% — against the reference clip's 86.4 / 0.0 / 0.0 / 3.6. **The fried look is
+gone**; the T2VA control arm is clean too (80.8 / 0.2%). Full-video means match.
+
+DiT value parity at the same dump (this time with gate-first): block-0 window cos 0.99778 gain
+1.068 (pairing rule: `dev_blk[l]` is AFTER block l, pair with `ref_block{l}`), and the step-0
+velocity vs the full CPU reference (19.31B, curve form: `run_reference.py --ckpt …/MiniMax-H3-
+dasiwa-src/transformer --td 8`): **cos 0.9886, std ratio 1.071, affine 1.06·ref+0.007** — the W8A8
+quant-noise floor, versus 7.6× std gap under the swapped container. This SUPERSEDES cont.24's
+block-window table: the 0.98→0.78 "decay" was measuring a DiT whose FFNs all computed
+silu(up)*gate; the win64std curve is now flat 0.85–1.07 with no drift.
+
+Two host tests were red on the way and are green now:
+* `engine_e2e_test`: `e28cf86` grew `timestep_embed`'s schema to 3 operands (optional `table`) but
+  the runtime's arity check demanded exact equality, so every SINUSOID issuer (qwenimage21,
+  minimaxh3 full-form) died at step 0. The check now accepts stopping after the last REQUIRED
+  operand and nulls the dropped trailing slots — matching rad_abi.h ("an absent optional operand
+  is a null RadTensor.data") and what every shim already did (r4d_opt / rad_args_have / libref
+  finish all branch on presence; the curve branch still requires the table).
+* `abi_layout_test`: red since `9d67df3` bumped RAD_ABI_VERSION to 24 without regenerating
+  `tests/abi_layout_table.h`; `abi_layout_rows.h` also never listed Batch.sampler or any trailing
+  dbg_* field (dbg_ve_*, dbg_dit_*, dbg_vd_* — 61 rows). Regenerated from the printout, verified
+  purely additive (no listed field moved), kTableAbi 24.
