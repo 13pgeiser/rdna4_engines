@@ -3446,12 +3446,17 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // The pre-repair registry is exactly the sealed index.
+                // Keep the sealed inventory unchanged; beta later added the
+                // HC-write widening to the shared source on every arch.
                 assert_eq!(
                     old.iter()
                         .copied()
                         .collect::<std::collections::BTreeSet<_>>(),
                     sealed
+                        .iter()
+                        .copied()
+                        .chain(["hyper_write_bf16x8_gfx1201"])
+                        .collect::<std::collections::BTreeSet<_>>()
                 );
             }
             let mut compiler = test_compiler("", "hipcc 7.16");
