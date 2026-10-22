@@ -21,6 +21,7 @@ use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{KvMode, VMode};
+pub use hipfire_runtime::loader_api::BatchLoadRequest;
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 use hipfire_runtime::mesh_placement::{
     pp_rank_order, resolve_edge_transports, AdmittedMesh, AdmittedRank, BandPlacement,
@@ -1057,6 +1058,11 @@ pub struct SourceAdmission {
     /// free-VRAM delta gate); `Some` = `Gpus::init_layers`. Carriers consume
     /// this value and never reread the environment.
     pub pp_layer_counts: Option<Vec<usize>>,
+    /// The continuous-batch request of this load (default off). Admission
+    /// never sets it; the caller that will stage lanes after the load sets it
+    /// on the admitted handle before the load, and the carrier forwards it
+    /// through `LoadCtx::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -1446,6 +1452,20 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
         format!(
             "image generation (arch 40/45) needs an RDNA3/3.5 GPU (gfx11 wave32 WMMA); \
              detected {gpu_arch}. See docs/IMAGEGEN.md §1."
+        )
+    })
+}
+
+/// #666 G11: Muse Glimmer (arch 14) is served on one device only until the
+/// G13 dense axes give it a pipeline/tensor placement. Any parallel degree
+/// (`pp`, `tp`, `topology.ep`) is refused here, before teardown or
+/// allocation, instead of reaching a generic EP or carrier refusal or being
+/// ignored (`topology.ep`).
+fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) -> Option<String> {
+    (arch_id == 14 && (pp > 1 || tp > 1 || ep > 1)).then(|| {
+        format!(
+            "muse_glimmer: single-device only; pp={pp}, tp={tp}, topology.ep={ep} requested \
+             (no pipeline, tensor or expert parallel placement exists for arch 14)"
         )
     })
 }
@@ -2340,6 +2360,12 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    if arch_id == 14 {
+        let ep = hipfire_config::topology::ep()?;
+        if let Some(refusal) = muse_glimmer_topology_refusal(arch_id, pp, tp, ep) {
+            return Err(refusal);
+        }
+    }
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
@@ -2953,6 +2979,7 @@ pub fn admit_source_with_options(
         mesh,
         pp_bands,
         pp_layer_counts,
+        batch_request: BatchLoadRequest::default(),
     })
 }
 
@@ -4159,6 +4186,18 @@ mod tests {
         // Non-diffusion archs never hit this gate, on any arch string.
         assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    #[test]
+    fn muse_glimmer_refuses_every_parallel_axis() {
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (1, 4, 1), (1, 1, 2), (1, 1, 4)] {
+            let err = muse_glimmer_topology_refusal(14, pp, tp, ep)
+                .unwrap_or_else(|| panic!("pp={pp} tp={tp} ep={ep} must refuse"));
+            assert!(err.contains("single-device only"), "{err}");
+        }
+        assert_eq!(muse_glimmer_topology_refusal(14, 1, 1, 1), None);
+        // Other architectures keep their own topology gates.
+        assert_eq!(muse_glimmer_topology_refusal(5, 2, 2, 2), None);
     }
 
     /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`

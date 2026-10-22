@@ -6820,7 +6820,8 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
             Ok(mut d) => {
                 let field = |key: &str| loaded.get(key).cloned().unwrap_or_default();
                 eprintln!(
-                    "  batch backend up (VMM route, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    "  batch backend up (route={}, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    field("continuous_batch_route"),
                     field("continuous_batch_exact"),
                     field("continuous_batch_spec_mode"),
                     field("continuous_batch_row_budget"),

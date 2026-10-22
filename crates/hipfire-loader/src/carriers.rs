@@ -692,14 +692,28 @@ impl Carrier for Qwen4Carrier {
         options: crate::admission::SourceAdmissionOptions,
     ) -> Result<(), String> {
         let spec = options.spec;
+        // DFlash2 runs only when explicitly requested, with its draft; native
+        // MTP stays the default speculator.
+        let dflash = spec.dflash == Some(true);
+        if dflash && draft_path.is_none() {
+            return Err(
+                "qwen4: DFlash (speculation.dflash = on) needs a DFlash2 draft \
+                 (--model-draft / params.draft)"
+                    .into(),
+            );
+        }
+        if dflash && spec.mtp == Some(true) {
+            return Err(
+                "qwen4: DFlash and native MTP are both requested; pick one speculator".into(),
+            );
+        }
         let unsupported = [
-            (draft_path.is_some(), "draft model (draft_path)"),
+            (
+                draft_path.is_some() && !dflash,
+                "draft model (draft_path; --spec dflash runs a DFlash2 draft)",
+            ),
             (options.eagle_drafter, "EAGLE drafter"),
             (options.kv_adaptive, "adaptive KV"),
-            (
-                spec.dflash.is_some_and(|enabled| enabled),
-                "DFlash (speculation.dflash)",
-            ),
             (
                 spec.dspark.is_some_and(|enabled| enabled),
                 "DSpark (speculation.dspark)",
@@ -808,6 +822,9 @@ impl Carrier for Qwen4Carrier {
         };
         qwen4_ep_option_refusal(ep, ctx.draft_path, &options)?;
         self.admit_options(ctx.draft_path, options)?;
+        // Admission checked the draft is present; DFlash2 replaces native MTP.
+        let dflash_draft = ctx.draft_path.filter(|_| ctx.spec.dflash == Some(true));
+        let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
         let shared = Qwen4RankShared {
             path: ctx.path.to_string(),
@@ -830,8 +847,15 @@ impl Carrier for Qwen4Carrier {
         if let Some(plan) = ep_plan.as_mut() {
             let devices = plan.seal.physical_devices();
             let free = qwen4_ep_free_vram(ctx.gpu, devices)?;
-            plan.expert_vram_layers =
-                qwen4_ep_vram_layers(ctx.gpu, &shared, plan.seal.ranks(), &free, &src)?;
+            let split = qwen4_ep_vram_layers(
+                ctx.gpu,
+                &shared,
+                plan.seal.ranks(),
+                &free,
+                &src,
+                &ctx.batch_request,
+            )?;
+            plan.expert_vram_layers = split.layers;
             eprintln!(
                 "qwen4 EP plan: {} ranks on devices {:?} (mesh epoch {}, {} sealed expert groups), free VRAM per rank {:?} MiB, expert VRAM split {} MoE layers on every rank",
                 plan.seal.ranks(),
@@ -841,6 +865,14 @@ impl Carrier for Qwen4Carrier {
                 free.iter().map(|bytes| bytes >> 20).collect::<Vec<_>>(),
                 plan.expert_vram_layers
             );
+            // One trade line per load (not per rank), only when this load
+            // asked for lanes.
+            if let Some(line) = hipfire_arch_qwen4::expert_residency::ep_lane_reservation_line(
+                shared.max_seq,
+                &split,
+            ) {
+                eprintln!("{line}");
+            }
         }
         let mut loaded = load_qwen4_rank(
             ctx.gpu,
@@ -885,18 +917,35 @@ impl Carrier for Qwen4Carrier {
         } else {
             max_k
         };
-        let speculator = native_mtp.then(|| {
-            qwen4_native_mtp_speculator(
-                max_k,
+        let speculator = match dflash_draft {
+            Some(draft) => match qwen4_dflash2_speculator(
+                ctx.gpu,
+                draft,
+                &mut loaded.bundle,
                 max_seq,
-                &ctx.gpu.arch,
-                meta.tokenizer.special_token_id("<|im_end|>"),
-                meta.tokenizer.special_token_id("</think>"),
-                true,
+                cpu_splice,
+                qwen4_dflash2_block(ctx.spec, verify_rows),
                 verify_rows,
-                loaded.bundle.state_format().gdn,
-            )
-        });
+            ) {
+                Ok(speculator) => Some(speculator),
+                Err(error) => {
+                    let _ = loaded.bundle.free_gpu(ctx.gpu);
+                    return Err(error);
+                }
+            },
+            None => native_mtp.then(|| {
+                qwen4_native_mtp_speculator(
+                    max_k,
+                    max_seq,
+                    &ctx.gpu.arch,
+                    meta.tokenizer.special_token_id("<|im_end|>"),
+                    meta.tokenizer.special_token_id("</think>"),
+                    true,
+                    verify_rows,
+                    loaded.bundle.state_format().gdn,
+                )
+            }),
+        };
 
         let mut model = LoadedModel {
             state: Some(Box::new(loaded.bundle)),
@@ -1075,6 +1124,66 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
     qwen4_explicit_mtp_k(spec)
         .map(|k| k.clamp(1, 10))
         .unwrap_or_else(|| qwen4_auto_mtp_k(gpu_arch, None))
+}
+
+/// Qwen4 DFlash2 width under `speculation.dflash_block = auto`: B=8 (seven
+/// drafts, of which the confidence cut verifies a prefix) is the fastest
+/// measured width on gfx1151 (HIPF-135: 52.0 tok/s vs B=4 48.6).
+const QWEN4_DFLASH2_AUTO_BLOCK: usize = 8;
+
+/// The proposal width of a Qwen4 DFlash2 load: an explicit
+/// `speculation.dflash_block`, else [`QWEN4_DFLASH2_AUTO_BLOCK`], clamped to
+/// the rows a verify runs row-exact (`verify_rows`: 8 on gfx1151) so greedy
+/// output stays the AR stream.
+fn qwen4_dflash2_block(spec: SpecLoadCfg, verify_rows: usize) -> usize {
+    match spec.dflash_block {
+        Some(block) if !spec.dflash_block_auto => block,
+        _ => QWEN4_DFLASH2_AUTO_BLOCK,
+    }
+    .min(verify_rows)
+}
+
+/// The shared DFlash2 speculator (`--spec dflash --model-draft <draft>`) on
+/// a single-card Qwen4 bundle at proposal width `block`
+/// ([`qwen4_dflash2_block`]). CPU-hosted routed experts (a 4-row verify
+/// window) are refused rather than guessed at.
+fn qwen4_dflash2_speculator(
+    gpu: &mut rdna_compute::Gpu,
+    draft: &str,
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    max_seq: usize,
+    cpu_splice: bool,
+    block: usize,
+    verify_rows: usize,
+) -> Result<Box<dyn hipfire_runtime::spec::Speculator>, String> {
+    if cpu_splice {
+        return Err(
+            "qwen4: DFlash2 is not supported with CPU-hosted routed experts; \
+             load the experts on the GPU or use native MTP (--spec mtp)"
+                .into(),
+        );
+    }
+    let draft_hfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(draft))
+        .map_err(|error| format!("qwen4: DFlash2 draft '{draft}': {error}"))?;
+    let config = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq).ok_or_else(|| {
+        format!("qwen4: '{draft}' is not a DFlash draft (missing `dflash` metadata)")
+    })?;
+    drop(draft_hfq);
+    if config.hidden != bundle.config.hidden_size || config.vocab_size != bundle.config.vocab_size {
+        return Err(format!(
+            "qwen4: DFlash2 draft '{draft}' (hidden {}, vocab {}) was not made for this model \
+             (hidden {}, vocab {})",
+            config.hidden, config.vocab_size, bundle.config.hidden_size, bundle.config.vocab_size
+        ));
+    }
+    let speculator =
+        hipfire_runtime::dflash2_spec::build_dflash2_speculator(gpu, draft, bundle, max_seq, block)
+            .map_err(|error| format!("qwen4: DFlash2 speculator: {error}"))?;
+    eprintln!(
+        "  qwen4 DFlash2 speculator: {draft} (block {block}, target layers {:?}, verify rows {verify_rows})",
+        config.target_layer_ids
+    );
+    Ok(speculator)
 }
 
 /// The generic speculator around the native Qwen4 MTP head, with the load log
@@ -1642,14 +1751,20 @@ pub fn qwen4_ep_alias_free(devices: &[i32], free: &[u64]) -> Vec<u64> {
 /// result as `expert_vram_layers` to **every** [`load_qwen4_rank`] (rank 0
 /// included) so each layer is resident on all ranks or on none. `gpu` is any
 /// rank's device (rank 0), `src` an opened source with its PLE rows resolved
-/// ([`open_qwen4_rank_source`]); nothing is allocated.
+/// ([`open_qwen4_rank_source`]); nothing is allocated. The plan's `layers` is
+/// that split. With `batch` asking for lanes (VMM batch, more than one lane)
+/// the AR lane store's per-rank device bytes are reserved first (resident
+/// layers can only shrink), see
+/// [`hipfire_arch_qwen4::expert_residency::ep_vram_plan`]; a default `batch`
+/// returns exactly the baseline split.
 pub fn qwen4_ep_vram_layers(
     gpu: &rdna_compute::Gpu,
     shared: &Qwen4RankShared,
     ranks: usize,
     free_per_rank: &[u64],
     src: &ModelSource,
-) -> Result<usize, String> {
+    batch: &hipfire_runtime::loader_api::BatchLoadRequest,
+) -> Result<hipfire_arch_qwen4::expert_residency::EpVramPlan, String> {
     let ModelSource::Hfq(hfq) = src else {
         return Err(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
@@ -1684,6 +1799,8 @@ pub fn qwen4_ep_vram_layers(
                 .map(|(_, bytes)| bytes.len() as u64)
         })
     };
+    let chunk_rows =
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, shared.max_seq);
     let (non_expert, layer_experts, reserve, ..) = qwen4_placement_inputs(
         gpu,
         &config,
@@ -1700,7 +1817,7 @@ pub fn qwen4_ep_vram_layers(
         state_format,
         scratch_mode,
         ranks,
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, shared.max_seq),
+        chunk_rows,
     )?;
     // Same charges as each rank's load applies to an expert-parallel split
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
@@ -1708,13 +1825,57 @@ pub fn qwen4_ep_vram_layers(
     let reserve = hipfire_arch_qwen4::expert_residency::PlacementCharges::new(layer_experts, false)
         .and_then(|charges| charges.reserve(reserve.bytes()))
         .map_err(|error| format!("qwen4: {error}"))?;
-    Ok(hipfire_arch_qwen4::expert_residency::ep_vram_layers(
+    // The lane store the stage after this load commits on every rank, from
+    // the same bytes helper `stage_rank_lanes` uses (same context commit:
+    // backend, `max_seq`, requested chunk and VMM granularity).
+    let lane = qwen4_ep_lane_request(batch, shared.backend, |lanes, row_budget| {
+        hipfire_arch_qwen4::ep::ep_lane_store_device_bytes(
+            &config,
+            state_format,
+            shared.backend,
+            shared.max_seq,
+            chunk_rows,
+            shared.vmm_granularity,
+            lanes,
+            row_budget,
+            None,
+        )
+    });
+    Ok(hipfire_arch_qwen4::expert_residency::ep_vram_plan(
         &config,
         free_per_rank,
         non_expert,
         layer_experts,
         reserve,
+        lane,
     ))
+}
+
+/// The AR-lane reservation a load's [`BatchLoadRequest`] asks of an
+/// expert-parallel split, resolved to one rank's lane-store bytes
+/// (`lane_bytes(lanes, row_budget)`, `None` on overflow). `None` when the
+/// request is off (no VMM batch, or fewer than two lanes): the split is then
+/// the baseline. A KV backend other than VMM keeps the request but with no
+/// bytes, because the lane staging refuses that backend whatever is reserved.
+/// The staged row budget is [`hipfire_arch_qwen4::ep::ep_lane_row_budget`],
+/// the rule the batch staging applies.
+fn qwen4_ep_lane_request(
+    batch: &hipfire_runtime::loader_api::BatchLoadRequest,
+    backend: hipfire_arch_qwen4::Qwen4KvBackend,
+    lane_bytes: impl FnOnce(usize, usize) -> Option<u64>,
+) -> Option<hipfire_arch_qwen4::expert_residency::EpLaneRequest> {
+    let lanes = batch.lanes()?;
+    let row_budget = hipfire_arch_qwen4::ep::ep_lane_row_budget(batch.row_budget, lanes);
+    let bytes = if backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm {
+        lane_bytes(lanes, row_budget).ok_or_else(|| "lane store device bytes overflow".to_string())
+    } else {
+        Err("the QSA context backend is not VMM, so lane staging refuses".to_string())
+    };
+    Some(hipfire_arch_qwen4::expert_residency::EpLaneRequest {
+        lanes,
+        row_budget,
+        bytes,
+    })
 }
 
 /// The per-rank view the rank body reads (field names match
@@ -7523,6 +7684,55 @@ mod qwen4_admission_tests {
     }
 
     #[test]
+    fn qwen4_dflash2_width_is_eight_under_auto_and_explicit_otherwise_within_exact_rows() {
+        let width = |dflash_block, dflash_block_auto, rows| {
+            super::qwen4_dflash2_block(
+                SpecLoadCfg {
+                    dflash_block,
+                    dflash_block_auto,
+                    ..SpecLoadCfg::default()
+                },
+                rows,
+            )
+        };
+        // The daemon resolves `auto` to 16 (8 batched); Qwen4 keeps its 8.
+        assert_eq!(width(Some(16), true, 8), 8);
+        assert_eq!(width(Some(4), true, 8), 8);
+        assert_eq!(width(None, false, 8), 8);
+        assert_eq!(width(Some(6), false, 8), 6);
+        // Never past the row-exact verify rows.
+        assert_eq!(width(Some(16), false, 8), 8);
+        assert_eq!(width(None, false, 3), 3);
+    }
+
+    #[test]
+    fn dflash_needs_an_explicit_request_its_draft_and_no_forced_mtp() {
+        let dflash = SourceAdmissionOptions {
+            spec: SpecLoadCfg {
+                dflash: Some(true),
+                ..resolved_ar_spec()
+            },
+            ..Default::default()
+        };
+        assert!(Qwen4Carrier
+            .admit_options(Some("draft.hfq"), dflash)
+            .is_ok());
+        let error = Qwen4Carrier.admit_options(None, dflash).unwrap_err();
+        assert!(error.contains("needs a DFlash2 draft"), "{error}");
+        let both = SourceAdmissionOptions {
+            spec: SpecLoadCfg {
+                mtp: Some(true),
+                ..dflash.spec
+            },
+            ..dflash
+        };
+        let error = Qwen4Carrier
+            .admit_options(Some("draft.hfq"), both)
+            .unwrap_err();
+        assert!(error.contains("pick one"), "{error}");
+    }
+
+    #[test]
     fn pflash_alone_refusal_names_only_pflash() {
         let options = SourceAdmissionOptions {
             spec: resolved_ar_spec(),
@@ -8563,5 +8773,68 @@ mod qwen4_slowlink_tests {
             1 << 40,
         );
         assert_eq!((builds, outcome), (1, Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod ep_lane_reservation_tests {
+    use super::qwen4_ep_lane_request;
+    use hipfire_arch_qwen4::Qwen4KvBackend;
+    use hipfire_runtime::loader_api::BatchLoadRequest;
+
+    fn request(vmm_batch: bool, lanes: usize, row_budget: usize) -> BatchLoadRequest {
+        BatchLoadRequest {
+            vmm_batch,
+            continuous_batch_size: lanes,
+            row_budget,
+        }
+    }
+
+    #[test]
+    fn ep_lane_reservation_off_and_single_lane_request_nothing() {
+        let never = |_: usize, _: usize| -> Option<u64> { panic!("no bytes without a request") };
+        for batch in [
+            BatchLoadRequest::default(),
+            request(true, 1, 4096),
+            request(false, 8, 4096),
+        ] {
+            assert_eq!(
+                qwen4_ep_lane_request(&batch, Qwen4KvBackend::Vmm, never),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ep_lane_reservation_request_uses_lanes_and_the_staged_row_budget() {
+        let seen = std::cell::Cell::new((0, 0));
+        let lane = qwen4_ep_lane_request(&request(true, 8, 4), Qwen4KvBackend::Vmm, |l, r| {
+            seen.set((l, r));
+            Some(123)
+        })
+        .unwrap();
+        // Row budget below the lane count is raised to it, as the staging does.
+        assert_eq!(seen.get(), (8, 8));
+        assert_eq!((lane.lanes, lane.row_budget, lane.bytes), (8, 8, Ok(123)));
+        let lane = qwen4_ep_lane_request(&request(true, 4, 4096), Qwen4KvBackend::Vmm, |l, r| {
+            seen.set((l, r));
+            Some(7)
+        })
+        .unwrap();
+        assert_eq!(seen.get(), (4, 4096));
+        assert_eq!(lane.bytes, Ok(7));
+    }
+
+    #[test]
+    fn ep_lane_reservation_request_reports_overflow_and_non_vmm_backend() {
+        let lane = qwen4_ep_lane_request(&request(true, 4, 4096), Qwen4KvBackend::Vmm, |_, _| None)
+            .unwrap();
+        assert!(lane.bytes.unwrap_err().contains("overflow"));
+        let lane =
+            qwen4_ep_lane_request(&request(true, 4, 4096), Qwen4KvBackend::Legacy, |_, _| {
+                panic!("legacy QSA never stages lanes")
+            })
+            .unwrap();
+        assert!(lane.bytes.unwrap_err().contains("not VMM"));
     }
 }

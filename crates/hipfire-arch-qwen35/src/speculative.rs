@@ -25,10 +25,11 @@ use crate::dflash_verify_pm4::{
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
-use crate::qwen35::prefill::{fp8_verify_target, verify_dense_math, DenseBatchMath};
+use crate::qwen35::prefill::fp8_verify_target;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
+use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};

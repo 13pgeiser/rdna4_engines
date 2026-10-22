@@ -166,6 +166,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                 k: layer.qkv_k,
                 eps: k.norm_eps,
                 rotation: qkv_rot,
+                rows: 1,
             },
             Step::Gemv {
                 w: &layer.wq,
@@ -276,6 +277,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                     k: layer.ffn_k,
                     eps: k.norm_eps,
                     rotation: ffn_rot,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &layer.w_gate,

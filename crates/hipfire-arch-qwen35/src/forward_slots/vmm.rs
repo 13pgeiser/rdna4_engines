@@ -28,7 +28,7 @@
 // every other KV mode is refused rather than routed to a legacy arena.
 
 use super::{
-    embed_lookup_slots, final_logits_per_slot, lm_head_slots_admissible, q8_prefill_wmma_enabled,
+    embed_lookup_slots, final_logits_per_slot, lm_head_slots_admissible,
     require_batchable_deltanet_layer, require_batchable_deltanet_moe_layer,
     require_batchable_fullattn_layer, require_batchable_fullattn_moe_layer,
     require_batchable_moe_ffn, run_layers_slots, slots_embed_format_admitted, LayerKvAddr,
@@ -40,6 +40,7 @@ use crate::qwen35::{
     DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights,
 };
 use hip_bridge::{HipError, HipResult};
+use hipfire_dispatch::pipeline::batched::q8_prefill_wmma_enabled;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{EmbeddingFormat, KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};

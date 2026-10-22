@@ -1295,17 +1295,20 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         });
     // :1809-1895: process defaults for mtp/ngram are normalized by caller;
     // all fields otherwise retain exactly the daemon's typed per-load values.
-    let dflash_block =
+    let (dflash_block, dflash_block_auto) =
         hipfire_runtime::dflash::DflashBlockPolicy::from_param(params.get("dflash_block"))
             .map(|p| {
-                p.resolve(
-                    params.get("serve_vmm_batch").is_some(),
-                    usize_param(params, "continuous_batch_size").unwrap_or(1),
+                (
+                    p.resolve(
+                        params.get("serve_vmm_batch").is_some(),
+                        usize_param(params, "continuous_batch_size").unwrap_or(1),
+                    ),
+                    p == hipfire_runtime::dflash::DflashBlockPolicy::Auto,
                 )
             })
             .unwrap_or_else(|e| {
                 error.get_or_insert(e);
-                0
+                (0, false)
             });
     let spec = SpecLoadCfg {
         ngram_draft: params["ngram_draft"].as_bool(),
@@ -1322,6 +1325,7 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         mtp_k: usize_param(params, "mtp_k"),
         dflash_adaptive_b: Some(params["dflash_adaptive_b"].as_bool().unwrap_or(false)),
         dflash_block: Some(dflash_block),
+        dflash_block_auto,
     };
     // :1906-1972: keep a CaskConfig even when eviction is off, exactly as
     // admission's hints do; cask option below is SIDECAR presence, not enabled.
