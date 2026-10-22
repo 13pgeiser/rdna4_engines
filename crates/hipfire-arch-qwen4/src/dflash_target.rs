@@ -295,7 +295,9 @@ impl Qwen4Bundle {
         let rotation = forward.scratch.rotation.sub_offset(0, rows * width);
         let lm_head = dense_ref(&self.weights, &self.weights.root.lm_head)
             .map_err(|error| forward_error(error.to_string()))?;
-        crate::program::execute_lm_head(
+        // The draft rows take the gfx1151 PM row kernels like a verify forward.
+        let rows_scope = std::mem::replace(&mut gpu.lane_rows_scope, true);
+        let result = crate::program::execute_lm_head(
             gpu,
             &lm_head,
             &hidden.sub_offset(0, rows * width),
@@ -303,8 +305,9 @@ impl Qwen4Bundle {
             rows,
             rows,
             Some(&rotation),
-        )
-        .map_err(|error| forward_error(format!("DFlash2 head: {error:?}")))?;
+        );
+        gpu.lane_rows_scope = rows_scope;
+        result.map_err(|error| forward_error(format!("DFlash2 head: {error:?}")))?;
         Ok(logits)
     }
 }

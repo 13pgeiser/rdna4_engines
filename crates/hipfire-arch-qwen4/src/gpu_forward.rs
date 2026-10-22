@@ -10079,6 +10079,11 @@ impl Qwen4GpuForward {
             0
         };
         let prior_wide_verify = gpu.set_wide_verify_rows(wide_verify);
+        // A verify forward's rows launchers may take the gfx1151 PM row kernels
+        // (`HIPFIRE_FN_LANE_PM_ROWS`, each column byte-identical to the 1-row
+        // incumbent), as the lane step does.
+        let prior_rows_scope = gpu.lane_rows_scope;
+        gpu.lane_rows_scope |= wide_verify > 0;
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -10091,6 +10096,7 @@ impl Qwen4GpuForward {
         );
         Self::leave_tile_scopes(gpu, scopes);
         gpu.set_wide_verify_rows(prior_wide_verify);
+        gpu.lane_rows_scope = prior_rows_scope;
         result
     }
 

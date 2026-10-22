@@ -704,7 +704,8 @@ pub struct FeatureFlags {
     /// Flash-Next lane-step PeaceMaker row kernels (`HIPFIRE_FN_LANE_PM_ROWS`):
     /// multi-column GEMVs that keep every column byte-identical to the 1-row
     /// incumbent while sharing activation loads across weight rows. Default on
-    /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
+    /// for gfx1151 (`0` is the kill switch); exact gfx1151, the lane step and
+    /// the Qwen4 speculative verify only.
     pub fn_lane_pm_rows: bool,
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
     /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
