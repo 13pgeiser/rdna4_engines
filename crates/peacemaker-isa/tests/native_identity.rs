@@ -210,6 +210,7 @@ fn corpus() -> Vec<Unit> {
             if let Ok(e) = mq6_i8_gemm::emit(mq6_i8_gemm::Spec {
                 epi,
                 raster: mq6_i8_gemm::Raster::Banded,
+                tile: mq6_i8_gemm::Tile::T128x128,
                 arch,
             }) {
                 single(&mut units, e)
