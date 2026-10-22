@@ -21,13 +21,13 @@ use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan}
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "native_fp8.rs"]
+mod native_fp8;
 /// The production generators (`iu4_gemm`, `qwen4_moe_sym`) as natives.
 #[path = "native_gen.rs"]
 mod native_gen;
 #[path = "native_mq6.rs"]
 mod native_mq6;
-#[path = "native_fp8.rs"]
-mod native_fp8;
 
 #[derive(Clone)]
 pub struct Chain {
