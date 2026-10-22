@@ -549,13 +549,23 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         return abort_step_msg(h, RAD_E_INVAL,
                               fmt("issued with %d operands; the runtime carries at most %d",
                                   n_opd, MAX_OPERANDS));
-    if (p.n_opd_schema >= 0 && n_opd != p.n_opd_schema)
+    /* A count below the schema is legal only when every dropped slot is a *trailing optional*
+     * operand (rad_abi.h: "an absent optional operand is a null RadTensor.data" -- the shims
+     * branch on exactly that: r4d_opt(), rad_args_have(), libref's finish()). A count below the
+     * required floor shifts positions or drops a required operand, and operands are positional,
+     * so a miscount is silent numerical garbage. */
+    if (p.n_opd_schema >= 0 && (n_opd > p.n_opd_schema || n_opd < p.n_opd_required))
         return abort_step_msg(h, RAD_E_SCHEMA,
-                              fmt("issued with %d operands; the op's schema declares %d. Operands "
-                                  "are positional, so a miscount is silent numerical garbage",
-                                  n_opd, (int)p.n_opd_schema));
+                              fmt("issued with %d operands; the op's schema declares %d "
+                                  "(%d required, only trailing optional operands may be omitted). "
+                                  "Operands are positional, so a miscount is silent numerical "
+                                  "garbage",
+                                  n_opd, (int)p.n_opd_schema, (int)p.n_opd_required));
 
     RadTensor* t = tbuf_;
+    /* The schema slots the issue stopped short of: null tensors, never stale ones. Nothing is
+     * supposed to read past args.n_t -- this keeps a stray read a null deref, not old bytes. */
+    for (int i = n_opd; i < p.n_opd_schema; ++i) t[i] = RadTensor{};
     bool touches_host = false;   /* a host-domain buffer among the operands; see host_touch_ev_ */
 
     for (int i = 0; i < n_opd; ++i) {

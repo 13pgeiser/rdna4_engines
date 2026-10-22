@@ -76,8 +76,14 @@ struct OpPlan {
     int32_t       n_bands  = 0;
     int32_t       plan_off = 0;      /* into Ctx::issue_table_, band * RAD_N_DOMAINS + domain */
     /* The schema's operand count, cached so the arity check avoids a cold OpInfo. -1 when the op
-     * has no schema. */
-    int32_t       n_opd_schema = -1;
+     * has no schema. The arity check also stores here the count with the schema's *trailing*
+     * optional operands dropped (rad_abi.h: "an absent optional operand is a null
+     * RadTensor.data"): an issue may stop at n_opd_required and the shims -- r4d_opt(),
+     * rad_args_have(), libref's finish() -- already branch on exactly that. Only trailing
+     * optionals; an omitted optional before a required operand shifts positions and is the
+     * miscount the check exists to catch. */
+    int32_t       n_opd_schema   = -1;
+    int32_t       n_opd_required = -1;
     bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump) */
     /* Whether issuing it puts bytes on the interconnect. Set at bind from the resolved rows
      * (rad_kernel_collective) and the conventional all_reduce. The weight stager's copies share

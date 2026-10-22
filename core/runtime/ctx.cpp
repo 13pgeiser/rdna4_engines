@@ -313,6 +313,15 @@ int Ctx::bind_ops() {
         p.n_bands  = (int32_t)oi.bands.size();
         p.plan_off = (int32_t)issue_table_.size();
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
+        p.n_opd_required = -1;
+        if (oi.schema) {
+            /* One past the last required operand: everything after it is optional and may be
+             * omitted at issue. An optional operand before a required one is not omittable --
+             * that would shift positions, which is what the arity check guards. */
+            for (int o = 0; o < oi.schema->n_operands; ++o)
+                if (!oi.schema->operands[o].optional) p.n_opd_required = o + 1;
+            if (p.n_opd_required < 0) p.n_opd_required = 0;   /* an all-optional schema */
+        }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
