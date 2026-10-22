@@ -997,6 +997,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             gs.out      = nm.ckpt("%s.%lld.linear_attn.out_proj.weight",      pre, (long long)l);
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_state));
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_conv));
+            /* This model's second lane is free (no lane-1 collectives): the delta net's small a|b
+             * projection overlaps the in-projection there at decode sizes (rad_block_gdn_fp8.h). */
+            lay.gdn.ab_lane = true;
             RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, gc, (int)l, m.kv_state, m.kv_conv, gw, gs,
                                          f.mix_fold, false, f.mix_ar_in, f.mix_ar_out));
         }

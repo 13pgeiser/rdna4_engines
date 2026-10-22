@@ -109,6 +109,12 @@ struct GdnFP8 {
     rad_weight w_norm = 0, w_ab = 0, w_conv = 0;
     /* The input was normed and quantised by the caller; this block declares no norm. */
     bool       ext_in = false;
+    /* Set by the architecture before declare: run the a|b projection on the second lane beside the
+     * in-projection at decode and verify sizes. Off where the second lane carries collectives (the
+     * projection would queue behind them). It costs memory: naming buffers concurrent gives the
+     * arena a second scratch region and the bring-up a third queue (Qwen3.8-27B at TP2: arena 534 ->
+     * 604 MiB, queues 67 -> 100 MiB a card, KV 752k -> 746k tokens), for +1.1 % one stream. */
+    bool       ab_lane = false;
     rad_weight w_a_log = 0, w_dt_bias = 0, w_out_norm = 0;
     LinearFP8  in{}, out{};
     NormQuantFP8 nq_h{};
@@ -271,6 +277,10 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", ab_dim),
                               RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
                    RAD_WEIGHTS(w_ab)), {w.h.x}, {w.ab});
+    if (ab_lane) {
+        RAD_ARCH_TRY(rad_buf_concurrent(b, w.h.x));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, w.ab));
+    }
 
     /* ---- the chunked path. As in the bf16 block, except `a` and `b_gate` are views of `ab`. */
     op_conv_prep = rw(b, RAD_OP(b, "gdn_conv_prep",
@@ -436,8 +446,20 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     }
 
     if (!ext_in) nq_h.step(c, T);
-    in.step(c, w.h, w.in.x, T);
-    RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
+    /* At decode and verify sizes the a|b projection is nearly all launch cost and reads only the
+     * norm's output, as the in-projection does: it runs on the second lane beside it and is joined
+     * back before the convolution reads `ab` (both named to rad_buf_concurrent at declare). A
+     * prefill chunk keeps one lane: there the projection is real work, and the lanes would split
+     * the bandwidth the in-projection uses. */
+    if (ab_lane && T <= 64 && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK) {
+        RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
+        rad_lane(c, 0);
+        in.step(c, w.h, w.in.x, T);
+        rad_lane_join(c, 1, 0);
+    } else {
+        in.step(c, w.h, w.in.x, T);
+        RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
+    }
 
     /* Each path runs over its own run of sequences. The step is sorted decode-first: decode rows
      * are sequences [0, D) with tokens [0, DT), prefill chunks are [D, S) with the rest. A pure
