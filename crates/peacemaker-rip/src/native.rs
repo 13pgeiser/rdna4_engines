@@ -21,6 +21,8 @@ use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan}
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "native_fa.rs"]
+mod native_fa;
 #[path = "native_fp8.rs"]
 mod native_fp8;
 /// The production generators (`iu4_gemm`, `qwen4_moe_sym`) as natives.
@@ -84,6 +86,8 @@ pub enum Nat {
     MoeNtGen(Rc<peacemaker_isa::kernels::qwen4_moe_sym::blocks::Gen>),
     /// A `qwen4_moe_sym` NT1 entry generator (`MoeNt1Gen::new(kind, arch)`).
     MoeNt1Gen(Rc<peacemaker_isa::kernels::qwen4_moe_sym::nt1_blocks::Gen>),
+    /// A `fa_prefill` generator (`FaGen::new(arch, spec)`): the validated spec every `fa::*` block reads.
+    FaGen(Rc<peacemaker_isa::kernels::fa_prefill::blocks::Gen>),
 }
 
 impl Nat {
@@ -120,6 +124,7 @@ impl Nat {
             Nat::Fp8Gen(_) => "Fp8Gen",
             Nat::MoeNtGen(_) => "MoeNtGen",
             Nat::MoeNt1Gen(_) => "MoeNt1Gen",
+            Nat::FaGen(_) => "FaGen",
         }
     }
     pub fn equals(&self, o: &Nat) -> bool {
@@ -258,6 +263,7 @@ pub fn is_fn(name: &str) -> bool {
         || native_mq6::is_fn(name)
         || native_fp8::is_fn(name)
         || native_qmoe::is_fn(name)
+        || native_fa::is_fn(name)
     {
         return true;
     }
@@ -297,6 +303,7 @@ pub fn is_type(n: &str) -> bool {
         || native_mq6::is_type(n)
         || native_fp8::is_type(n)
         || native_qmoe::is_type(n)
+        || native_fa::is_type(n)
 }
 
 pub fn is_struct(n: &str) -> bool {
@@ -304,6 +311,7 @@ pub fn is_struct(n: &str) -> bool {
         || native_gen::is_struct(n)
         || native_mq6::is_struct(n)
         || native_fp8::is_struct(n)
+        || native_fa::is_struct(n)
 }
 
 pub fn global_const<'a>(n: &str) -> Option<Value<'a>> {
@@ -323,6 +331,9 @@ pub fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
         return Some(v);
     }
     if let Some(v) = native_fp8::assoc_const(ty, item) {
+        return Some(v);
+    }
+    if let Some(v) = native_fa::assoc_const(ty, item) {
         return Some(v);
     }
     let nat = |n: Nat| Some(Value::Nat(n));
@@ -1159,6 +1170,9 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             if let Some(r) = native_qmoe::call_fn(it, n, a, cx) {
                 return r;
             }
+            if let Some(r) = native_fa::call_fn(it, n, a, cx) {
+                return r;
+            }
             if let Some((t, f)) = n.split_once("::") {
                 if let Some(ty) = IntTy::parse(t) {
                     need(1)?;
@@ -1277,6 +1291,7 @@ pub fn method<'a>(
         Nat::Fp8Gen(g) => native_fp8::method(it, g, name, a)?,
         Nat::MoeNtGen(g) => native_qmoe::nt_method(it, g, name, a)?,
         Nat::MoeNt1Gen(g) => native_qmoe::nt1_method(it, g, name, a)?,
+        Nat::FaGen(g) => native_fa::method(it, g, name, a)?,
         Nat::Arch(arch) => match name {
             "gfx12" => Some(Value::Bool(arch.gfx12())),
             "name" => Some(Value::str(arch.name())),

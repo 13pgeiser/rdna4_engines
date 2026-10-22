@@ -72,11 +72,12 @@ use crate::insn::{Instruction, MemoryClass, Sop};
 use crate::kernels::common::{lit, op, s, sop, sr, v, vr};
 use crate::lds::Transition;
 use crate::ledger::Counter;
-use crate::plan::Access;
 use crate::reg::{Live, RegRef};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 
 type R = Result<(), String>;
+
+pub mod blocks;
 
 /// CLI kernel id.
 pub const KERNEL_ID: &str = "fa_prefill_pm";
@@ -2006,53 +2007,46 @@ fn softmax_sub(b: &mut Builder, sub: u8, fp8: bool) -> R {
     Ok(())
 }
 
-fn body(b: &mut Builder, fp8: bool) -> R {
-    tile_setup(b, fp8)?;
-    if !fp8 {
-        fill(b, fp8)?;
-        b.label(D_FILL_DONE)?;
-        b.barrier(&[Transition::Ready(L_K), Transition::Ready(L_V)])?;
-        b.label(D_QK)?;
-        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
-        op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
-        qk(b, fp8)?;
+fn body(b: &mut Builder, g: &blocks::Gen) -> R {
+    use blocks as bl;
+    bl::tile_setup(b, g)?;
+    if !g.fp8() {
+        bl::fill(b, g)?;
+        b.label(bl::FILL_DONE)?;
+        b.barrier(&[Transition::Ready(bl::SLOT_K), Transition::Ready(bl::SLOT_V)])?;
+        b.label(bl::QK)?;
+        bl::skip_if_helper(b, bl::TURN)?;
+        bl::qk(b, g)?;
         for sub in 0..4u8 {
-            softmax_sub(b, sub, fp8)?;
+            bl::softmax_sub(b, g, sub)?;
         }
-        b.label(D_TURN)?;
-        b.barrier(&[Transition::Retire(L_K), Transition::Retire(L_V)])?;
-        sop(b, format!("s_add_co_i32 s{KT}, s{KT}, 64"), &[KT], &[KT])?;
+        b.label(bl::TURN)?;
+        b.barrier(&[Transition::Retire(bl::SLOT_K), Transition::Retire(bl::SLOT_V)])?;
         // Continue while ktile <= gmax (`s_cmp_gt_i32` + scc0: the compare the emulator models).
-        sop(b, format!("s_cmp_gt_i32 s{KT}, s{GMAX}"), &[], &[KT, GMAX])?;
-        op(b, format!("s_cbranch_scc0 {D_LOOP}"), &[], &[])
+        bl::next_tile(b)
     } else {
         // Sequential single-stage schedule: K-fill, QK, V-fill, softmax/PV.
-        // All five waves join every barrier; causal exits target D_TURN,
+        // All five waves join every barrier; causal exits target TURN,
         // which retires the stage after the final tile's V use.
-        fill_k_fp8(b)?;
-        b.label(D_KFILL_DONE)?;
-        b.barrier(&[Transition::Ready(L_STAGE)])?;
-        b.label(D_KREADY)?;
-        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
-        op(b, format!("s_cbranch_scc1 {D_QK_DONE}"), &[], &[])?;
-        qk(b, fp8)?;
-        b.label(D_QK_DONE)?;
-        b.barrier(&[Transition::Retire(L_STAGE)])?;
-        fill_v_fp8(b)?;
-        b.label(D_VFILL_DONE)?;
-        b.barrier(&[Transition::Ready(L_STAGE)])?;
-        b.label(D_VREADY)?;
-        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
-        op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
+        bl::fill_k(b, g)?;
+        b.label(bl::KFILL_DONE)?;
+        b.barrier(&[Transition::Ready(bl::SLOT_STAGE)])?;
+        b.label(bl::KREADY)?;
+        bl::skip_if_helper(b, bl::QK_DONE)?;
+        bl::qk(b, g)?;
+        b.label(bl::QK_DONE)?;
+        b.barrier(&[Transition::Retire(bl::SLOT_STAGE)])?;
+        bl::fill_v(b, g)?;
+        b.label(bl::VFILL_DONE)?;
+        b.barrier(&[Transition::Ready(bl::SLOT_STAGE)])?;
+        b.label(bl::VREADY)?;
+        bl::skip_if_helper(b, bl::TURN)?;
         for sub in 0..4u8 {
-            softmax_sub(b, sub, fp8)?;
+            bl::softmax_sub(b, g, sub)?;
         }
-        b.label(D_TURN)?;
-        b.barrier(&[Transition::Retire(L_STAGE)])?;
-        sop(b, format!("s_add_co_i32 s{KT}, s{KT}, 64"), &[KT], &[KT])?;
-        // Continue while ktile <= gmax (`s_cmp_gt_i32` + scc0: the compare the emulator models).
-        sop(b, format!("s_cmp_gt_i32 s{KT}, s{GMAX}"), &[], &[KT, GMAX])?;
-        op(b, format!("s_cbranch_scc0 {D_LOOP}"), &[], &[])
+        b.label(bl::TURN)?;
+        b.barrier(&[Transition::Retire(bl::SLOT_STAGE)])?;
+        bl::next_tile(b)
     }
 }
 /// Compute waves: out = O * (l > 0 ? 1/l : 0) for live queries only.
@@ -2106,57 +2100,17 @@ fn epilogue(b: &mut Builder, fp8: bool) -> R {
 /// `attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201` for [`FaKvCodec::Fp8E4M3`]. The codec selects only the prologue's
 /// global offsets, the tile base stride and the fill; QK, softmax, PV and the epilogue are shared.
 pub fn emit(arch: Arch, spec: &FaPrefillSpec) -> Result<Emitted, String> {
-    let fp8 = spec.kv == FaKvCodec::Fp8E4M3;
-    admit(arch, spec)?;
-    let kernargs = KernargLayout::new(DIRECT_KERNARG_BYTES)
-        .pointer_access("q16", 0, Access::ReadOnly)
-        .pointer_access("k_cache", 8, Access::ReadOnly)
-        .pointer_access("v_cache", 16, Access::ReadOnly)
-        .pointer_access("out", 24, Access::WriteOnly)
-        .pointer_access("positions", 32, Access::ReadOnly)
-        .hidden("n_heads", 40, 4, "by_value")
-        .hidden("n_kv_heads", 44, 4, "by_value")
-        .hidden("head_dim", 48, 4, "by_value")
-        .hidden("batch_size", 52, 4, "by_value")
-        .hidden("scale_attn", 56, 4, "by_value");
-    let kspec = KernelSpec {
-        kernel_id: (if fp8 { KERNEL_ID_FP8 } else { KERNEL_ID }).into(),
-        variant: "direct".into(),
-        arch,
-        symbol: (if fp8 {
-            SYMBOL_FP8_DIRECT
-        } else {
-            SYMBOL_DIRECT
-        })
-        .into(),
-        kernargs,
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: DIRECT_BLOCK as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, plan_direct(fp8)?);
+    let g = blocks::Gen::new(arch, *spec)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     b.enable_delay_alu();
-    if fp8 {
-        // One 32-KiB stage reused sequentially for K then V.
-        if b.lds_slot("stage", 0, 32_768)? != L_STAGE {
+    for (id, (name, base, bytes)) in g.lds_slots().into_iter().enumerate() {
+        if b.lds_slot(name, base, bytes)? != id {
             return Err("LDS slot order".into());
         }
-    } else {
-        for (id, (name, base)) in [("k_plane", 0u32), ("v_plane", 32_768)]
-            .into_iter()
-            .enumerate()
-        {
-            if b.lds_slot(name, base, 32_768)? != id {
-                return Err("LDS slot order".into());
-            }
-        }
     }
-    prologue(&mut b, fp8)?;
-    b.loop_(D_LOOP, |b| body(b, fp8))?;
-    epilogue(&mut b, fp8)?;
+    blocks::prologue(&mut b, &g)?;
+    b.loop_(blocks::LOOP, |b| body(b, &g))?;
+    blocks::epilogue(&mut b, &g)?;
     b.finish()
 }
 
@@ -2313,30 +2267,10 @@ fn preconvert_body(b: &mut Builder) -> R {
 /// The Q preconvert entry `attention_fa2_q_preconvert_pm_gfx1201`. `signs1`,
 /// `signs2` and `do_rotate` keep the oracle ABI and are never read.
 pub fn emit_preconvert(arch: Arch, spec: &FaPrefillSpec) -> Result<Emitted, String> {
-    admit(arch, spec)?;
-    let kernargs = KernargLayout::new(PRECONVERT_KERNARG_BYTES)
-        .pointer_access("q", 0, Access::ReadOnly)
-        .pointer_access("q16", 8, Access::WriteOnly)
-        .pointer_access("signs1", 16, Access::ReadOnly)
-        .pointer_access("signs2", 24, Access::ReadOnly)
-        .hidden("batch_size", 32, 4, "by_value")
-        .hidden("do_rotate", 36, 4, "by_value");
-    let kspec = KernelSpec {
-        kernel_id: KERNEL_ID.into(),
-        variant: "preconvert".into(),
-        arch,
-        symbol: SYMBOL_PRECONVERT.into(),
-        kernargs,
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: false,
-        workgroup_size: PRECONVERT_BLOCK as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, plan_preconvert()?);
+    let g = blocks::Gen::new(arch, *spec)?;
+    let mut b = Builder::new(g.preconvert_kernel_spec(), g.preconvert_plan()?);
     b.enable_delay_alu();
-    preconvert_body(&mut b)?;
+    blocks::preconvert(&mut b, &g)?;
     b.finish()
 }
 
