@@ -100,6 +100,42 @@ pub enum OpKind {
     /// [`Step::SandwichMlp`] (#666 G11, Glimmer's pre-norm / sandwich MLP).
     /// Appended: `20` stays retired.
     SandwichMlp = 31,
+    /// [`Step::HcPre`] (#666 G9, DeepSeek4).
+    HcPre = 32,
+    /// [`Step::HcPost`] (#666 G9, DeepSeek4).
+    HcPost = 33,
+    /// [`Step::HcHead`] (#666 G9, DeepSeek4).
+    HcHead = 34,
+    /// [`Step::QLoraPrepare`] (#666 G9, DeepSeek4).
+    QLoraPrepare = 35,
+    /// [`Step::PackedProjections`] (#666 G9, DeepSeek4).
+    PackedProjections = 36,
+    /// [`Step::QLoraProject`] (#666 G9, DeepSeek4).
+    QLoraProject = 37,
+    /// [`Step::KvJoint`] (#666 G9, DeepSeek4).
+    KvJoint = 38,
+    /// [`Step::ApplyTailRope`] (#666 G9, DeepSeek4).
+    ApplyTailRope = 39,
+    /// [`Step::ExpertFfn`] (#666 G9, DeepSeek4).
+    ExpertFfn = 40,
+    /// [`Step::SparseIndex`] (#666 G9, DeepSeek4).
+    SparseIndex = 41,
+    /// [`Step::KvCompress`] (#666 G9, DeepSeek4).
+    KvCompress = 42,
+    /// [`Step::PreparedProjection`] (#666 G9, DeepSeek4).
+    PreparedProjection = 43,
+    /// [`Step::SwaRingWrite`] (#666 G9, DeepSeek4).
+    SwaRingWrite = 44,
+    /// [`Step::IdentityGather`] (#666 G9, DeepSeek4).
+    IdentityGather = 45,
+    /// [`Step::SwaAttention`] (#666 G9, DeepSeek4).
+    SwaAttention = 46,
+    /// [`Step::SparseAttention`] (#666 G9, DeepSeek4).
+    SparseAttention = 47,
+    /// [`Step::OLora`] (#666 G9, DeepSeek4).
+    OLora = 48,
+    /// [`Step::CompressorProject`] (#666 G9, DeepSeek4).
+    CompressorProject = 49,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -144,6 +180,24 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::GatedAttention(..) => OpKind::GatedAttention,
         Step::SandwichMlp(..) => OpKind::SandwichMlp,
         Step::SiluMul { .. } => OpKind::SiluMul,
+        Step::HcPre(..) => OpKind::HcPre,
+        Step::HcPost(..) => OpKind::HcPost,
+        Step::HcHead(..) => OpKind::HcHead,
+        Step::QLoraPrepare(..) => OpKind::QLoraPrepare,
+        Step::PackedProjections(..) => OpKind::PackedProjections,
+        Step::QLoraProject(..) => OpKind::QLoraProject,
+        Step::KvJoint(..) => OpKind::KvJoint,
+        Step::ApplyTailRope(..) => OpKind::ApplyTailRope,
+        Step::ExpertFfn(..) => OpKind::ExpertFfn,
+        Step::SparseIndex(..) => OpKind::SparseIndex,
+        Step::KvCompress(..) => OpKind::KvCompress,
+        Step::PreparedProjection(..) => OpKind::PreparedProjection,
+        Step::SwaRingWrite(..) => OpKind::SwaRingWrite,
+        Step::IdentityGather(..) => OpKind::IdentityGather,
+        Step::SwaAttention(..) => OpKind::SwaAttention,
+        Step::SparseAttention(..) => OpKind::SparseAttention,
+        Step::OLora(..) => OpKind::OLora,
+        Step::CompressorProject(..) => OpKind::CompressorProject,
     }
 }
 
@@ -556,6 +610,24 @@ mod tests {
             (OpKind::DeltaNetMixer, 29),
             (OpKind::GatedAttention, 30),
             (OpKind::SandwichMlp, 31),
+            (OpKind::HcPre, 32),
+            (OpKind::HcPost, 33),
+            (OpKind::HcHead, 34),
+            (OpKind::QLoraPrepare, 35),
+            (OpKind::PackedProjections, 36),
+            (OpKind::QLoraProject, 37),
+            (OpKind::KvJoint, 38),
+            (OpKind::ApplyTailRope, 39),
+            (OpKind::ExpertFfn, 40),
+            (OpKind::SparseIndex, 41),
+            (OpKind::KvCompress, 42),
+            (OpKind::PreparedProjection, 43),
+            (OpKind::SwaRingWrite, 44),
+            (OpKind::IdentityGather, 45),
+            (OpKind::SwaAttention, 46),
+            (OpKind::SparseAttention, 47),
+            (OpKind::OLora, 48),
+            (OpKind::CompressorProject, 49),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),

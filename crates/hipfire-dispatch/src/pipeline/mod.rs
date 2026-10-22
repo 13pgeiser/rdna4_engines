@@ -43,6 +43,7 @@ pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod layer_ops;
+pub mod mla;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
