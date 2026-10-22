@@ -82,6 +82,13 @@ pub struct FeatureFlags {
     /// `mq_rotate_x_i8_gfx12` launch disappear. Bytes identical to the two-launch
     /// pair. Exact gfx1201 only, where it defaults on; `0` is the kill switch.
     pub qwen4_gdn_i8_fuse: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_CHAIN_FUSE`): the dense-GDN chain
+    /// reads the qkv projection as BF16 bits (the exact-INT8 MQ6 GEMM stores BF16 where
+    /// the producer only ever consumes its BF16 rounding) and runs the load-batched
+    /// `fn_gdn_dense_producer_v2_{f32,bf16}` entries. Bytes identical to the F32
+    /// projection and the v1 producer. Exact gfx1201 only, where it defaults on; `0` is
+    /// the kill switch.
+    pub qwen4_gdn_chain_fuse: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -937,6 +944,7 @@ impl FeatureFlags {
                 .unwrap_or(halo_hyper_default),
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
             qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
+            qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -1442,6 +1450,11 @@ impl FeatureFlags {
         self.qwen4_gdn_i8_fuse && self.arch == "gfx1201"
     }
 
+    /// Dense-GDN chain: BF16 qkv projection + load-batched producer. Exact gfx1201 only.
+    pub fn qwen4_gdn_chain_fuse_enabled(&self) -> bool {
+        self.qwen4_gdn_chain_fuse && self.arch == "gfx1201"
+    }
+
     /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
     /// (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151: on unless `0`). Exact gfx1151 only; the
     /// runtime additionally requires the lane-step scope
@@ -1694,6 +1707,7 @@ impl FeatureFlags {
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
             qwen4_gdn_i8_fuse: false,
+            qwen4_gdn_chain_fuse: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_moe_combine_zinit: false,
@@ -2685,6 +2699,34 @@ mod tests {
             assert_eq!(one.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_i8_fuse_enabled());
+    }
+
+    /// The dense-GDN chain fusion: default on for exact gfx1201 only, `0` is the kill
+    /// switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_gdn_chain_fuse_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_GDN_CHAIN_FUSE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_gdn_chain_fuse_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_gdn_chain_fuse_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_gdn_chain_fuse_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_chain_fuse_enabled());
     }
 
     #[test]
