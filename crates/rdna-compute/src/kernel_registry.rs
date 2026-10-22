@@ -2792,8 +2792,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_q8_0_wide_k640_staged",
                 "gemv_q8_0_wide_k640_staged_bf16_scaled_add",
                 "gemv_q8_0_wide_rows",
-                "gemv_q8_0_wide_rows_wide_r16",
-                "gemv_q8_0_wide_rows_wide_r32",
             ]
         );
         add!(
@@ -3432,8 +3430,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_q8_0_wide_k640_staged",
                 "gemv_q8_0_wide_k640_staged_bf16_scaled_add",
                 "gemv_q8_0_wide_rows",
-                "gemv_q8_0_wide_rows_wide_r16",
-                "gemv_q8_0_wide_rows_wide_r32",
             ]
         );
         add!(

@@ -1091,9 +1091,16 @@ fn hc_valu_partition_fold_scale_order_and_divide_carry_are_row_local() {
 #[test]
 fn source_pair_provenance_remains_the_recorded_gfx1100_reference() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/src");
+    // The recorded gfx1100 fixture was built from source 995b0bb6… (FIXTURES[1].4). The
+    // PM row-tile kernels then replaced the HIP `gemv_bf16_xf32_{x4,k4}_rows_wide_r{16,32}`
+    // twins, whose definitions were deleted from the tail of qwen4_gemv_bf16_xf32.hip
+    // (nothing before that tail changed, so the gfx1100 singleton exports are unchanged);
+    // the current file is pinned to its post-removal digest.
+    const QWEN4_SRC_WITHOUT_WIDE_TWINS: &str =
+        "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b";
     for (source, expected) in [
         ("gemv_bf16_xf32.hip", FIXTURES[0].4),
-        ("qwen4_gemv_bf16_xf32.hip", FIXTURES[1].4),
+        ("qwen4_gemv_bf16_xf32.hip", QWEN4_SRC_WITHOUT_WIDE_TWINS),
     ] {
         let bytes = std::fs::read(root.join(source)).unwrap();
         assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected,

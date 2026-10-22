@@ -1344,7 +1344,7 @@ impl HcDiagnostic {
         const FOLD: &str =
             "    float value = (quarter[0] + quarter[1]) + (quarter[2] + quarter[3]);";
         if diagnostic_sha(SOURCE.as_bytes())
-            != "995b0bb6355dedc7edca0660c95cf9a39ede8441d2d31855f39f5a7614faed25"
+            != "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b"
         {
             return Err(
                 "actual C1 diagnostic source hash changed; re-anchor instrumentation".into(),

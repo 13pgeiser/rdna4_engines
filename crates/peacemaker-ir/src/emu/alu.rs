@@ -1168,6 +1168,17 @@ fn vector(
             let value = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
             (Class::Own, u32::from(value >> (shift & 15)))
         }
+        // D.u16 = S0.u16 & S1.u16; true16 writes preserve the other half.
+        "v_and_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            if m.clamp {
+                return Err("clamp on v_and_b16 is not modeled".into());
+            }
+            let a = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
+            let b = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
+            (Class::Own, u32::from(a & b))
+        }
         // 16-bit integer: D.u16 = S0.u16 - S1.u16 / S0.u16 * S1.u16 (low bits); CLAMP saturates in the unsigned domain.
         "v_sub_nc_u16" | "v_mul_lo_u16" => {
             half_dst(o)?;
@@ -1828,6 +1839,19 @@ fn f32_class(a: u32) -> u32 {
     }
 }
 
+/// Predicate of a scalar compare (`s_cmp_<p>_*`, `s_cmpk_<p>_*`).
+fn scalar_compare_pred(name: &str, p: &str) -> Result<Pred> {
+    Ok(match p {
+        "eq" => Pred::Eq,
+        "lg" => Pred::Ne,
+        "gt" => Pred::Gt,
+        "ge" => Pred::Ge,
+        "lt" => Pred::Lt,
+        "le" => Pred::Le,
+        _ => return Err(format!("unsupported scalar compare {name}")),
+    })
+}
+
 fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let rd = |s: &State, idx: usize| -> Result<u32> {
@@ -1878,19 +1902,27 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.scc = s.exec != 0;
         return Ok(());
     }
+    // SOPK compares: SCC = S0 <pred> SIMM16. State::read sign-extends every
+    // SOPK immediate; the `_u32` rows compare the zero-extended 16 bits.
+    if let Some(rest) = name.strip_prefix("s_cmpk_") {
+        let (p, ty) = rest
+            .split_once('_')
+            .ok_or_else(|| format!("unsupported scalar compare {name}"))?;
+        let p = scalar_compare_pred(name, p)?;
+        let (a, k) = (rd(s, 0)?, rd(s, 1)?);
+        s.scc = match ty {
+            "i32" => ord_test(p, a as i32, k as i32),
+            "u32" => ord_test(p, a, k & 0xffff),
+            _ => return Err(format!("unsupported scalar compare {name}")),
+        }
+        .ok_or_else(|| format!("unsupported scalar compare {name}"))?;
+        return Ok(());
+    }
     if let Some(rest) = name.strip_prefix("s_cmp_") {
         let (p, ty) = rest
             .split_once('_')
             .ok_or_else(|| format!("unsupported scalar compare {name}"))?;
-        let p = match p {
-            "eq" => Pred::Eq,
-            "lg" => Pred::Ne,
-            "gt" => Pred::Gt,
-            "ge" => Pred::Ge,
-            "lt" => Pred::Lt,
-            "le" => Pred::Le,
-            _ => return Err(format!("unsupported scalar compare {name}")),
-        };
+        let p = scalar_compare_pred(name, p)?;
         s.scc = match ty {
             "u32" => {
                 let (a, b) = (rd(s, 0)?, rd(s, 1)?);
@@ -2302,6 +2334,28 @@ mod tests {
     }
 
     #[test]
+    fn v_and_b16_masks_the_selected_halves_and_preserves_the_other_half() {
+        for (dst, src, initial, mask, want) in [
+            (Half::Lo, Half::Lo, 0xabcd_ff8f, 0xff, 0xabcd_0080),
+            (Half::Lo, Half::Hi, 0x1234_ffff, 15, 0x1234_0004),
+            (Half::Hi, Half::Lo, 0xabcd_ff8b, 0xf0, 0x0080_ff8b),
+            (Half::Hi, Half::Hi, 0x9bcd_ffff, 0xffff, 0x1234_ffff),
+        ] {
+            let i = insn("v_and_b16", vec![half(11, dst), half(12, src), lit(mask)]);
+            let mut st = state();
+            st.exec = 1;
+            st.vcc = 0xa5a5_5a5a;
+            st.scc = true;
+            st.v[11][0] = initial;
+            st.v[12][0] = 0x1234_ff80;
+            run("v_and_b16", &i, &mut st).unwrap();
+            assert_eq!(st.v[11][0], want, "{dst:?} <- {src:?} & {mask:#x}");
+            assert_eq!(st.v[12][0], 0x1234_ff80);
+            assert_eq!((st.exec, st.vcc, st.scc), (1, 0xa5a5_5a5a, true));
+        }
+    }
+
+    #[test]
     fn current_c1_carry_add_masks_inactive_lanes_and_reads_old_carry() {
         for arch in [Arch::Gfx1151, Arch::Gfx1201] {
             for name in ["v_add_co_u32", "v_add_co_ci_u32_e64"] {
@@ -2519,6 +2573,42 @@ mod tests {
                     assert_eq!(st.s[2], count);
                     assert_eq!((st.exec, st.vcc, st.scc), (0, 0xa5a5_5a5a, want != 0));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn sopk_compares_extend_the_immediate_by_signedness_and_only_write_scc() {
+        // (name, S0, SIMM16, SCC). The `_i32` rows sign-extend SIMM16 and
+        // compare signed; the `_u32` rows zero-extend it and compare unsigned.
+        for (name, a, k, want) in [
+            ("s_cmpk_lg_i32", 0x280u32, 0x280i16, false),
+            ("s_cmpk_lg_i32", 0x281, 0x280, true),
+            ("s_cmpk_lg_i32", 0xffff_ffff, -1, false),
+            ("s_cmpk_lg_i32", 0x0000_ffff, -1, true),
+            ("s_cmpk_eq_i32", 0xffff_8000, -32768, true),
+            ("s_cmpk_eq_i32", 0x0000_8000, -32768, false),
+            ("s_cmpk_lt_i32", 0xffff_ff9c, 0, true),
+            ("s_cmpk_gt_i32", 0xffff_ff9c, 0, false),
+            ("s_cmpk_gt_u32", 0xffff_ff9c, 0, true),
+            ("s_cmpk_lt_u32", 0x0000_fffe, -1, true),
+            ("s_cmpk_lt_u32", 0x0000_ffff, -1, false),
+            ("s_cmpk_lt_u32", 0x0001_0000, -1, false),
+        ] {
+            for scc in [false, true] {
+                let i = insn_on(
+                    Arch::Gfx1100,
+                    name,
+                    vec![sreg(2), Operand::Imm(crate::operand::ImmField::Sopk(k))],
+                );
+                let mut st = state();
+                st.s[2] = a;
+                st.exec = 0;
+                st.vcc = 0x1234_5678;
+                st.scc = scc;
+                execute(Arch::Gfx1100, name, &i, &mut st).unwrap();
+                assert_eq!(st.scc, want, "{name} {a:#x} vs {k:#x}");
+                assert_eq!((st.s[2], st.exec, st.vcc), (a, 0, 0x1234_5678));
             }
         }
     }

@@ -43,14 +43,10 @@
 //!   `qwen4_scope = true` and `lane_rows_scope = true` as the lane step does, then leaves both alone. What
 //!   the launcher selects depends on the arch, the gate, `lane_rows_scope`,
 //!   `HIPFIRE_FN_LANE_PM_ROWS` and `HIPFIRE_QWEN4_WIDE_TWIN_MQ6` (below).
-//! * `direct_r16` (`R <= 16`) and `direct_r32`: the HIP kernels
-//!   `gemm_mq6g256v2_f32_rows_wide_r16` / `_wide_r32` launched by name through
-//!   `ensure_kernel_public` + `launch_kernel_blob` (kernargs `A@0 x@8 y@16 M@24
-//!   K@28 R@32`, grid `ceil(M/8)`, block 256), independent of the switches.
 //! * `pm_wide`: exact gfx1151 only: the `qwen4_lane_rows_pm` export
 //!   `gemv_mq6g256v2_xbatch_wide_r16_pm` (`R <= 16`) or `..._r32_pm` (the exports
 //!   take any `R` in `1..=cap`), loaded with `Gpu::ensure_lane_rows_pm_entry` and
-//!   launched by name with the same ABI and grid as the HIP twins, independent of
+//!   launched by name (kernargs `A@0 x@8 y@16 M@24 K@28 R@32`, grid `ceil(M/8)`, block 256), independent of
 //!   `HIPFIRE_FN_LANE_PM_ROWS`, `lane_rows_scope` and the wide-twin switch. Any
 //!   other arch, or a shape the PM kernels' 32-bit byte offsets refuse, is
 //!   reported as an explicit `skipped` reason, never silently dropped.
@@ -58,8 +54,8 @@
 //! # Switches
 //!
 //! `HIPFIRE_QWEN4_WIDE_TWIN_MQ6` (default off) decides whether `route` at
-//! `R in 9..=32` takes a wide twin (gfx1151: the PM export, otherwise the HIP
-//! twin) or the exact 8-row group loop. The raw environment value and the
+//! `R in 9..=32` takes the PM wide export (gfx1151; no HIP twin remains) or the
+//! exact 8-row group loop. The raw environment value and the
 //! effective `WideTwinFamily::Mq6.enabled()` are printed and put in the JSON; this
 //! tool never calls `set_var`. Run it twice, with and without the switch, to time
 //! both routes.
@@ -109,7 +105,7 @@
 use hip_bridge::KernargBlob;
 use rdna_compute::gemv::WideTwinFamily;
 use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
-use rdna_compute::{kernels, DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::time::Instant;
@@ -123,7 +119,6 @@ const GUARD: usize = 64;
 const SENTINEL: u8 = 0xff;
 /// NaN activation rows before and after the `[MAXR, K]` X view.
 const PRE_ROWS: usize = 3;
-const MODULE: &str = "gemm_mq6g256v2_f32_rows";
 const GROUP_BYTES: usize = 200;
 const ENV_SWITCH: &str = "HIPFIRE_QWEN4_WIDE_TWIN_MQ6";
 const DEFAULT_OUT: &str = "mq6_lm_head_rows.json";
@@ -131,10 +126,6 @@ const DEFAULT_SEED: u64 = 0x6d71_366c_6d68_6431;
 const DEFAULT_ROWS: [usize; 10] = [1, 2, 4, 8, 9, 12, 16, 17, 24, 32];
 /// Per-row magnitudes cycle; `0.0` is the all-zero (+-0) row.
 const AMPS: [f32; 8] = [1.0, 1.0 / 1024.0, 1.0 / 16.0, 4.0, 64.0, 0.5, 0.0, 1024.0];
-const HIP_WIDE: [&str; 2] = [
-    "gemm_mq6g256v2_f32_rows_wide_r16",
-    "gemm_mq6g256v2_f32_rows_wide_r32",
-];
 const PM_WIDE: [&str; 2] = [
     "gemv_mq6g256v2_xbatch_wide_r16_pm",
     "gemv_mq6g256v2_xbatch_wide_r32_pm",
@@ -513,9 +504,7 @@ fn compare(out: &Out, got: &[u8], want: &[u8]) -> Check {
 enum Arm {
     Ar = 0,
     Route = 1,
-    DirectR16 = 2,
-    DirectR32 = 3,
-    PmWide = 4,
+    PmWide = 2,
 }
 
 impl Arm {
@@ -523,16 +512,12 @@ impl Arm {
         match self {
             Arm::Ar => "ar",
             Arm::Route => "route",
-            Arm::DirectR16 => "direct_r16",
-            Arm::DirectR32 => "direct_r32",
             Arm::PmWide => "pm_wide",
         }
     }
     /// The kernel a by-name arm launches at `rows`.
     fn named_symbol(self, rows: usize) -> Option<&'static str> {
         match self {
-            Arm::DirectR16 => Some(HIP_WIDE[0]),
-            Arm::DirectR32 => Some(HIP_WIDE[1]),
             Arm::PmWide => Some(PM_WIDE[usize::from(rows > 16)]),
             Arm::Ar | Arm::Route => None,
         }
@@ -614,7 +599,7 @@ fn call(gpu: &mut Gpu, fx: &Fixture, arm: Arm, prep: &Prep, rows: usize) -> Resu
         Arm::Route => gpu
             .gemm_mq6g256v2_f32_rows(&fx.w, &prep.x, &prep.y, fx.m, fx.k, rows)
             .map_err(err),
-        Arm::DirectR16 | Arm::DirectR32 | Arm::PmWide => {
+        Arm::PmWide => {
             let name = arm
                 .named_symbol(rows)
                 .ok_or("by-name arm without a symbol")?;
@@ -783,7 +768,7 @@ fn run() -> Result<bool> {
     let fx = Fixture { m, k, w, x_full };
     let ref_out = Out::new(&mut gpu, m)?;
     let mut outs = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..3 {
         outs.push(Out::new(&mut gpu, m)?);
     }
 
@@ -805,10 +790,6 @@ fn run() -> Result<bool> {
         let ref_check = compare(&ref_out, &ref_bytes, &expected);
 
         let mut arms = vec![Arm::Ar, Arm::Route];
-        if rows <= 16 {
-            arms.push(Arm::DirectR16);
-        }
-        arms.push(Arm::DirectR32);
         match pm_wide_skip(&gpu, &geo, &fx, rows) {
             None => arms.push(Arm::PmWide),
             Some(reason) => {
@@ -823,12 +804,7 @@ fn run() -> Result<bool> {
             let out = &outs[arm as usize];
             let prep = Prep::new(&fx, out, arm, rows);
             if let Some(name) = arm.named_symbol(rows) {
-                if arm == Arm::PmWide {
-                    gpu.ensure_lane_rows_pm_entry(name).map_err(err)?;
-                } else {
-                    gpu.ensure_kernel_public(MODULE, kernels::GEMM_MQ6G256V2_F32_ROWS_SRC, name)
-                        .map_err(err)?;
-                }
+                gpu.ensure_lane_rows_pm_entry(name).map_err(err)?;
             }
             out.reset(&gpu)?;
             call(&mut gpu, &fx, arm, &prep, rows)?;

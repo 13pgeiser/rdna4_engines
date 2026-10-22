@@ -66,6 +66,12 @@ s_cmp_lg_u32	alu
 s_cmp_lg_u64	alu
 s_cmp_lt_i32	alu
 s_cmp_lt_u32	alu
+s_cmpk_eq_i32	alu
+s_cmpk_gt_i32	alu
+s_cmpk_gt_u32	alu
+s_cmpk_lg_i32	alu
+s_cmpk_lt_i32	alu
+s_cmpk_lt_u32	alu
 s_cselect_b32	alu
 s_cselect_b64	alu
 s_ctz_i32_b32	alu
@@ -180,6 +186,7 @@ v_lshlrev_b32_e32	alu
 v_lshlrev_b32_e64	alu
 v_lshlrev_b64_e32	alu
 v_lshrrev_b16	alu
+v_and_b16	alu
 v_lshrrev_b32_e32	alu
 v_mad_u32_u24	alu
 v_max3_f32	alu

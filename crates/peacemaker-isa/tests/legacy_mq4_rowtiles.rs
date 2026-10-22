@@ -20,10 +20,13 @@
 //! C1 ELF per arch (`tests/fixtures/legacy_mq4_down/gfx1201-8ec3f2d2.elf`
 //! and `gfx1151-a3fb11b0.elf`), SHA-pinned and lifted with `Frontend::Hipcc`,
 //! relocating each live position to singleton token 0 with identical inputs.
-//! A separate current-source test runs the identical exercise against the
+//! Two separate current-source tests run the identical exercise against the
 //! gfx1151 object compiled from the current singleton source and JIT flags
-//! (`gfx1151-current-a8f8-0d86c0a7.elf`); hardware must separately bind its
-//! actual loaded object. The historical fixtures remain regression anchors.
+//! (`gfx1151-current-d9e0-05e096e0.elf`, which holds BOTH the one-row
+//! singleton and the K=640 four-row twin `..._k640_r4` that rdna-compute
+//! `moe.rs` launches for eager gfx1151 K=640 decode); hardware must
+//! separately bind its actual loaded object. The historical fixtures remain
+//! regression anchors.
 //! Its independent AR transcription preserves the singleton's first-pair
 //! FMA contraction and reduction order.
 //!
@@ -1258,15 +1261,52 @@ fn down_expected(tensor: &[u8], x: &[f32], token: usize, rank: usize, row: usize
 
 const DOWN_ROWS: [usize; 8] = [0, 1, 639, 640, 1279, 1280, 2558, 2559];
 
+/// One actual AR singleton the tile is compared against: its symbol and the
+/// number of output rows one workgroup produces (grid x = ceil(M / rows)).
+#[derive(Clone, Copy)]
+struct DownSingleton {
+    symbol: &'static str,
+    rows_per_wg: usize,
+}
+
+/// The one-row singleton (`blockIdx.x` = output row): every historical
+/// fixture, and recorded/captured decode on gfx1151.
+const DOWN_SINGLETON_ONE_ROW: DownSingleton = DownSingleton {
+    symbol: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+    rows_per_wg: 1,
+};
+
+/// The K=640 four-row twin (`blockIdx.x` = row / 4): what eager gfx1151 K=640
+/// AR decode launches (`HIPFIRE_QWEN4_MOE_DOWN_R4`, default on).
+const DOWN_SINGLETON_K640_R4: DownSingleton = DownSingleton {
+    symbol: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+    rows_per_wg: 4,
+};
+
 /// Full per-arch down numerical exercise shared by the historical regression
-/// test and the current-source gfx1151 test below: every logical R 1..=64
+/// test and the current-source gfx1151 tests below: every logical R 1..=64
 /// through the real engine, comparing the emitted tile entry against BOTH
 /// the independent R1 prewarm golden, the faithful AR transcription, and the
 /// given same-arch actual-C1 singleton (each live position relocated to
 /// singleton token 0 with identical inputs). Every case, sample row/rank/
 /// tile selection, math, assertion, and extent check is preserved verbatim;
-/// only the actual-C1 `Program` source differs per caller.
-fn down_exercise_all_r(arch: Arch, actual_prog: Program) {
+/// only the actual-C1 `Program` and the singleton kernel/geometry differ per
+/// caller.
+fn down_exercise_all_r(arch: Arch, actual_prog: Program, singleton_kernel: DownSingleton) {
+    // Every lane of a multi-row singleton workgroup must be among the
+    // compared rows, or a per-lane divergence could hide.
+    let mut lanes: Vec<usize> = DOWN_ROWS
+        .iter()
+        .map(|row| row % singleton_kernel.rows_per_wg)
+        .collect();
+    lanes.sort_unstable();
+    lanes.dedup();
+    assert_eq!(
+        lanes.len(),
+        singleton_kernel.rows_per_wg,
+        "{arch:?}: DOWN_ROWS must cover every row lane of {}",
+        singleton_kernel.symbol
+    );
     let sym = format!(
         "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_{}",
         arch.name()
@@ -1278,9 +1318,8 @@ fn down_exercise_all_r(arch: Arch, actual_prog: Program) {
     );
     let emu = Emulator::new(&prog, &sym).unwrap_or_else(|e| panic!("{arch:?}: {e}"));
     // Same-arch actual singleton, not another launch of the tile body.
-    let actual_sym = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
-    let actual = Emulator::new(&actual_prog, actual_sym)
-        .unwrap_or_else(|e| panic!("{arch:?} actual C1: {e}"));
+    let actual = Emulator::new(&actual_prog, singleton_kernel.symbol)
+        .unwrap_or_else(|e| panic!("{arch:?} actual C1 {}: {e}", singleton_kernel.symbol));
     let mut rng = Rng(0xd09d_09d0_9d09_d09 ^ 0x54321);
     let tensor = down_expert_tensor(&mut rng);
     // Independent R1 prewarm, double-run identity (not a batch-input golden).
@@ -1348,9 +1387,12 @@ fn down_exercise_all_r(arch: Arch, actual_prog: Program) {
                         run_wg(
                             &actual,
                             &mut singleton,
-                            [row as u32, rank, 0],
+                            [(row / singleton_kernel.rows_per_wg) as u32, rank, 0],
                             32,
-                            &format!("{arch:?} R{r} token {token} actual C1"),
+                            &format!(
+                                "{arch:?} R{r} token {token} actual {}",
+                                singleton_kernel.symbol
+                            ),
                         );
                         let got = read_f32(&singleton, "yg", rank as usize * DOWN_M + row);
                         singleton_golden.insert((token, row, rank), got.to_bits());
@@ -1444,35 +1486,58 @@ fn down_exercise_all_r(arch: Arch, actual_prog: Program) {
 #[test]
 fn down_all_logical_r_match_r1_and_ar_reference() {
     for arch in [Arch::Gfx1201, Arch::Gfx1151] {
-        down_exercise_all_r(arch, lift_actual_down(arch));
+        down_exercise_all_r(arch, lift_actual_down(arch), DOWN_SINGLETON_ONE_ROW);
     }
 }
 
-/// Current-source gfx1151: the identical full all-R exercise against the
-/// object compiled from current singleton source and JIT flags
-/// (`fixtures/legacy_mq4_down/gfx1151-current-a8f8-0d86c0a7.elf`,
-/// raw `0d86c0a773908e4a42434a6d720c50e2eaa0babef5ab7890abaf55a7c3146f96`,
-/// N-shared HIP source `a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203`),
-/// SHA-pinned and lifted with `Frontend::Hipcc` through the same byte-exact
-/// roundtrip helper on `Arch::Gfx1151`. The historical fixtures above stay
-/// pinned as the regression anchors.
-#[test]
-fn current_source_gfx1151_down_all_logical_r_match_r1_and_ar_reference() {
+/// Current-source gfx1151 fixture: the object compiled from the current
+/// singleton source and JIT flags
+/// (`fixtures/legacy_mq4_down/gfx1151-current-d9e0-05e096e0.elf`, raw
+/// `05e096e066a9c503e3d762584bb3a21a50d95f45785f22a31764b5500947be8b`, HIP
+/// source `d9e092ea9131e5bbf4c14aa53b3e9a891552aa6b8d741e1e71d9f6b86afd51f8`:
+/// the unchanged one-row body from the previously pinned `a8f8c821...` source
+/// plus the PR #909 K=640 four-row twin), SHA-pinned and lifted with
+/// `Frontend::Hipcc` through the same byte-exact roundtrip helper on
+/// `Arch::Gfx1151`. Both singletons live in this one object.
+fn lift_current_source_gfx1151_down() -> Program {
     use sha2::{Digest, Sha256};
     let source = include_bytes!(
         "../../../kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip"
     );
     assert_eq!(
         format!("{:x}", Sha256::digest(source)),
-        "a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203",
+        "d9e092ea9131e5bbf4c14aa53b3e9a891552aa6b8d741e1e71d9f6b86afd51f8",
         "current-source gfx1151 down reference no longer matches the singleton HIP source"
     );
-    let actual_prog = lift_checked_actual(
+    lift_checked_actual(
         Arch::Gfx1151,
-        include_bytes!("fixtures/legacy_mq4_down/gfx1151-current-a8f8-0d86c0a7.elf"),
-        "0d86c0a773908e4a42434a6d720c50e2eaa0babef5ab7890abaf55a7c3146f96",
+        include_bytes!("fixtures/legacy_mq4_down/gfx1151-current-d9e0-05e096e0.elf"),
+        "05e096e066a9c503e3d762584bb3a21a50d95f45785f22a31764b5500947be8b",
+    )
+}
+
+/// Current-source gfx1151, one-row singleton: recorded/captured AR decode and
+/// eager decode with `HIPFIRE_QWEN4_MOE_DOWN_R4=0`.
+#[test]
+fn current_source_gfx1151_down_all_logical_r_match_r1_and_ar_reference() {
+    down_exercise_all_r(
+        Arch::Gfx1151,
+        lift_current_source_gfx1151_down(),
+        DOWN_SINGLETON_ONE_ROW,
     );
-    down_exercise_all_r(Arch::Gfx1151, actual_prog);
+}
+
+/// Current-source gfx1151, K=640 four-row twin: the singleton eager AR decode
+/// launches (`moe.rs`: K == 640, `qwen4_moe_down_r4_enabled`, not recording,
+/// not capturing). The tile must be bitwise this kernel's per-row result for
+/// every logical R, exactly as it is for the one-row singleton.
+#[test]
+fn current_source_gfx1151_down_k640_r4_all_logical_r_match_r1_and_ar_reference() {
+    down_exercise_all_r(
+        Arch::Gfx1151,
+        lift_current_source_gfx1151_down(),
+        DOWN_SINGLETON_K640_R4,
+    );
 }
 
 /// Down on gfx1100 (admitted arch): boundary widths plus the +0 store law for
