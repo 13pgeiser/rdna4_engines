@@ -70,8 +70,8 @@ pub enum PrefillRoute {
     /// `HIPFIRE_FA_PREFILL_PM`: A3B H16/KV2/D256 Q8_0 prefill with the
     /// packet-minimal gfx1201 body. Unset follows its exact-gfx1201 qualification.
     FaPrefillPm,
-    /// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`: the fused router runs two rows per workgroup
-    /// (`moe_topk_renorm_k8_batched`, fused-softmax mode, `rows_per_block = 2`). Nested
+    /// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`: the fused router runs one wave32 per row, eight rows
+    /// per workgroup (`moe_router_softmax_topk_k8_wave`, same registry module). Nested
     /// beneath [`PrefillRoute::MoeRouterFusedPrefill`]. Unset follows its exact-gfx1201
     /// qualification.
     MoeRouterTopkMultirow,
@@ -247,8 +247,8 @@ pub const QUALIFIED: [QualifiedCell; 15] = [
 /// * [`PrefillRoute::FaPrefillPm`]: the exact-gfx1201 embedded PM images selected
 ///   by `Gpu::attention_q8_0_fa_prefill_pm_gfx1201` (outside the HIP source registry).
 /// * [`PrefillRoute::MoeRouterTopkMultirow`]: the same `moe_topk_renorm_k8_batched` registry
-///   module and wave32 architectures as [`PrefillRoute::MoeRouterFusedPrefill`] (the two-row
-///   launch reuses the symbol); `Gpu::moe_router_topk_multirow_admitted` adds the shape.
+///   module and wave32 architectures as [`PrefillRoute::MoeRouterFusedPrefill`] (the wave-per-row
+///   symbol `moe_router_softmax_topk_k8_wave` lives in that module); `Gpu::moe_router_topk_multirow_admitted` adds the shape.
 /// * [`PrefillRoute::MoeCombineV2`]: the exact-gfx1201 embedded v2 combine bundle
 ///   `kernels::MOE_SLOT_OPS_V2_PM_GFX1201` (symbol `moe_down_combine_grouped_bf16in_v2_pm_gfx1201`)
 ///   selected by `moe_slot_ops::moe_slot_ops_v2_kernel` (outside the HIP source registry); a test
