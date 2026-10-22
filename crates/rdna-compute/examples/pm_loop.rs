@@ -7,8 +7,9 @@
 //!
 //! ```text
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
-//!         [--base-<knob> V ...] [--time N] [--rounds R] [--emu] [--out DIR]
-//!         [--rip FILE.rip]   (iu4_gemm, mq6_i8_gemm)
+//!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
+//!         [--max-rounds R] [--time-budget-s S] [--emu] [--out DIR]
+//!         (--rip: iu4_gemm, mq6_i8_gemm)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -32,13 +33,23 @@
 //!    silu) reports `reference: "none"` and `pass` is then
 //!    `identical_to_baseline` (`pass_basis` says which). `--emu` runs the candidate on the peacemaker emulator
 //!    when every instruction is qualified, else `refused (<reason>)`.
-//! 4. Timing, exactly `pm_decode_twins time`: A = baseline, B = candidate; one
-//!    checked warm launch per arm, then `--rounds R` (default 5) ABBA rounds of
-//!    `--time N` (default 30) launches per block, per-launch hipEvents on the
-//!    default stream, accumulating output state restored outside the event
-//!    interval. `separable` is true only if the median separation exceeds the
-//!    larger sample spread AND the sample ranges are disjoint (the twins rule);
-//!    otherwise read the ratio as "not separable at this N". Sampling is
+//! 4. Timing: ABBA, A = baseline, B = candidate, like `pm_decode_twins time`:
+//!    one checked warm launch per arm, then `--rounds R` (default 6) ABBA
+//!    rounds of `--time N` (default 50) launches per block, per-launch
+//!    hipEvents on the default stream, accumulating output state restored
+//!    outside the event interval. Each block of N launches has a block median;
+//!    `separable` is true iff every candidate block median is below every
+//!    baseline block median, or every one is above (one hiccup launch cannot
+//!    veto it, unlike the twins' full-range rule, which stays in the record as
+//!    `separable_full_range`). `block_ratio` = median(candidate block medians)
+//!    / median(baseline block medians); `round_ratio_min/max` are the extreme
+//!    per-round paired ratios and `rounds_candidate_faster` counts the rounds
+//!    with ratio < 1 (informational only; `round_sign_test_p` is the exact
+//!    two-sided sign-test p-value of that count, the paired view that block-to-block
+//!    clock drift does not hide). Not separable: ABBA rounds keep being added
+//!    (doubling) until separable, `--max-rounds` (default 64) or
+//!    `--time-budget-s` (default 240, under the fabric's timing cap) is
+//!    reached; `rounds_run`, `extended` and `stop` report it. Sampling is
 //!    refused when the candidate fails correctness.
 //!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
@@ -56,7 +67,13 @@
 //! /home/kaden/qcal/locks/fabric/fabric-run.sh --class timing --card B --mem-gb 4 \
 //!   --max-secs 900 --owner PmLoop -- target/release/examples/pm_loop \
 //!   --kernel iu4_gemm --fold k128 --tile 256x128x16 --epi set \
-//!   --shape M=17408,N=512,K=5120 --time 30 --rounds 5
+//!   --shape M=17408,N=512,K=5120 --time 50 --rounds 6
+//! ```
+//! 2:4-sparse candidate vs the shipped dense kernel (pruned weights), and a `.rip` candidate:
+//! ```text
+//! pm_loop --kernel iu4_gemm --mma s24x64 --epi set --shape M=17408,N=512,K=5120 --emu
+//! pm_loop --kernel iu4_gemm --mma s24x32 --epi add --shape M=5120,N=512,K=17408
+//! pm_loop --kernel iu4_gemm --rip my_twin.rip --mma s24x64 --shape M=17408,N=512,K=5120
 //! ```
 //! The fabric exports `ROCR_VISIBLE_DEVICES`/`FABRIC_CARDS`, recorded under
 //! `device`. GPU-free tests: `cargo test -p rdna-compute --features lab --example pm_loop`.
@@ -81,8 +98,11 @@ use workload::{Arm, Knobs, Object, Result, Workload};
 
 const SCHEMA: u32 = 1;
 const ARCH: &str = "gfx1201";
-const DEFAULT_TIME: usize = 30;
-const DEFAULT_ROUNDS: usize = 5;
+const DEFAULT_TIME: usize = 50;
+const DEFAULT_ROUNDS: usize = 6;
+const DEFAULT_MAX_ROUNDS: usize = 64;
+/// Below the fabric timing cap (1800 s) and the usual `--max-secs 900`.
+const DEFAULT_TIME_BUDGET_S: f64 = 240.0;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -104,6 +124,10 @@ struct Opts {
     shape: Option<String>,
     time: usize,
     rounds: usize,
+    /// Auto-extension ceiling for the total ABBA rounds.
+    max_rounds: usize,
+    /// Wall-clock budget of the sampling phase, seconds.
+    time_budget_s: f64,
     emu: bool,
     out: Option<PathBuf>,
     /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
@@ -112,7 +136,7 @@ struct Opts {
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--time N] [--rounds R] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -120,6 +144,8 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         shape: None,
         time: DEFAULT_TIME,
         rounds: DEFAULT_ROUNDS,
+        max_rounds: DEFAULT_MAX_ROUNDS,
+        time_budget_s: DEFAULT_TIME_BUDGET_S,
         emu: false,
         out: None,
         rip: None,
@@ -144,6 +170,17 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             "rounds" => {
                 o.rounds = abba::positive_count(&value).map_err(|e| format!("--rounds: {e}"))?
             }
+            "max-rounds" => {
+                o.max_rounds =
+                    abba::positive_count(&value).map_err(|e| format!("--max-rounds: {e}"))?
+            }
+            "time-budget-s" => {
+                o.time_budget_s = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .ok_or_else(|| format!("--time-budget-s {value}: expected seconds > 0"))?
+            }
             "out" => o.out = Some(PathBuf::from(value)),
             "rip" => o.rip = Some(PathBuf::from(value)),
             _ => {
@@ -162,7 +199,13 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             o.kernel
         ));
     }
-    abba::timing_counts(o.time, o.rounds)?;
+    if o.max_rounds < o.rounds {
+        return Err(format!(
+            "--max-rounds {} is below --rounds {}",
+            o.max_rounds, o.rounds
+        ));
+    }
+    abba::timing_counts(o.time, o.max_rounds)?;
     Ok(o)
 }
 
@@ -347,19 +390,43 @@ fn arm_json(s: &TimingStats) -> Value {
         "p90": us(s.p90), "mean": us(s.mean)})
 }
 
-/// Pure timing record from the two sample sets (nanoseconds), with the twins'
-/// separability rule. `ratio` = candidate/baseline median.
-fn timing_record(base_ns: &[f64], cand_ns: &[f64], n: usize, rounds: usize) -> Result<Value> {
-    let a = timing_stats(base_ns)?;
-    let b = timing_stats(cand_ns)?;
-    let (ratio, spread, delta, separable) = timing_relation(&a, &b);
+const RULE: &str = "separable = every candidate block median is below every baseline block \
+    median, or every one is above (block = n consecutive launches of one ABBA block); \
+    separable_full_range = the pm_decode_twins rule: |median delta| > larger full spread AND \
+    ranges disjoint";
+
+/// Pure timing record from the two arms' samples (nanoseconds, in schedule
+/// order, whole ABBA rounds): the block-median rule is `separable`, the
+/// twins' full-range rule is kept as `separable_full_range`. `ratio` is the
+/// candidate/baseline ratio of the full-sample medians.
+fn timing_record(
+    s: &Sampled,
+    n: usize,
+    rounds: usize,
+    stop: abba::ExtendStop,
+    sampling_s: f64,
+) -> Result<Value> {
+    let a = timing_stats(&s.base_ns)?;
+    let b = timing_stats(&s.cand_ns)?;
+    let (ratio, spread, delta, full_range) = timing_relation(&a, &b);
+    let r = abba::block_rule(&s.base_ns, &s.cand_ns, n)?;
+    let rounds_run = s.base_ns.len() / (2 * n);
+    let us_vec = |v: &[f64]| v.iter().map(|x| us(*x)).collect::<Vec<_>>();
     Ok(json!({
-        "n": n, "rounds": rounds, "calls_per_arm": a.count,
+        "n": n, "rounds": rounds, "rounds_run": rounds_run, "extended": rounds_run > rounds,
+        "stop": stop.as_str(), "sampling_s": sampling_s, "calls_per_arm": a.count,
         "baseline_us": arm_json(&a), "candidate_us": arm_json(&b),
-        "ratio": ratio, "separable": separable,
+        "ratio": ratio, "separable": r.separable,
+        "block_ratio": r.block_ratio,
+        "round_ratio_min": r.round_ratio_min, "round_ratio_max": r.round_ratio_max,
+        "rounds_candidate_faster": r.rounds_candidate_faster,
+        "round_sign_test_p": abba::sign_test_p(r.rounds_candidate_faster, rounds_run),
+        "baseline_block_median_us": us_vec(&r.baseline_block_medians),
+        "candidate_block_median_us": us_vec(&r.candidate_block_medians),
+        "separable_full_range": full_range,
         "observed_spread_us": us(spread), "median_delta_us": us(delta),
         "unit": "us per launch (hipEvent, default stream)",
-        "rule": "separable = |median delta| > larger full spread AND ranges disjoint",
+        "rule": RULE,
     }))
 }
 
@@ -375,25 +442,25 @@ fn tidy_emu(v: Value) -> Value {
     }
 }
 
+#[derive(Default)]
 struct Sampled {
     base_ns: Vec<f64>,
     cand_ns: Vec<f64>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sample(
+/// Append `rounds` whole ABBA rounds of `n` launches per block to `s`.
+fn sample_rounds(
     gpu: &Gpu,
     w: &dyn Workload,
     base: &Loaded,
     cand: &Loaded,
     n: usize,
     rounds: usize,
-) -> Result<Sampled> {
+    s: &mut Sampled,
+) -> Result<()> {
     let (calls, _) = abba::timing_counts(n, rounds)?;
-    let mut s = Sampled {
-        base_ns: Vec::with_capacity(calls),
-        cand_ns: Vec::with_capacity(calls),
-    };
+    s.base_ns.reserve(calls);
+    s.cand_ns.reserve(calls);
     let start = gpu.hip.event_create().map_err(err)?;
     let stop = match gpu.hip.event_create() {
         Ok(e) => e,
@@ -425,8 +492,52 @@ fn sample(
     let d2 = gpu.hip.event_destroy(stop).map_err(err);
     measured?;
     d1?;
-    d2?;
-    Ok(s)
+    d2
+}
+
+/// Sampling plan: `rounds` initial ABBA rounds of `n` launches per block,
+/// then doubling until the block-median rule separates, `max_rounds` or
+/// `budget_s` (seconds of `clock`) is reached. `run(extra, s)` appends `extra`
+/// whole rounds. Returns the samples, why it stopped and the elapsed time.
+fn drive_sampling(
+    n: usize,
+    rounds: usize,
+    max_rounds: usize,
+    budget_s: f64,
+    clock: &mut dyn FnMut() -> f64,
+    run: &mut dyn FnMut(usize, &mut Sampled) -> Result<()>,
+) -> Result<(Sampled, abba::ExtendStop, f64)> {
+    let t0 = clock();
+    let mut s = Sampled::default();
+    let mut extra = rounds;
+    loop {
+        run(extra, &mut s)?;
+        let done = s.base_ns.len() / (2 * n);
+        let separable = abba::block_rule(&s.base_ns, &s.cand_ns, n)?.separable;
+        let elapsed = clock() - t0;
+        match abba::extend_rounds(done, max_rounds, elapsed, budget_s, separable) {
+            Ok(more) => extra = more,
+            Err(stop) => return Ok((s, stop, elapsed)),
+        }
+    }
+}
+
+fn sample(
+    gpu: &Gpu,
+    w: &dyn Workload,
+    base: &Loaded,
+    cand: &Loaded,
+    o: &Opts,
+) -> Result<(Sampled, abba::ExtendStop, f64)> {
+    let start = std::time::Instant::now();
+    drive_sampling(
+        o.time,
+        o.rounds,
+        o.max_rounds,
+        o.time_budget_s,
+        &mut || start.elapsed().as_secs_f64(),
+        &mut |extra, s| sample_rounds(gpu, w, base, cand, o.time, extra, s),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +576,9 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Err(e) => return fail(rec, "args", e),
     };
     rec["shape"] = w.shape_json();
+    for (key, value) in w.record_extra() {
+        rec[key] = value;
+    }
     rec["candidate"] = json!({"knobs": w.candidate_knobs()});
     let out_dir = o
         .out
@@ -607,7 +721,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     }
 
     // 4. ABBA timing
-    let sampled = sample(&gpu, &*w, &bf, &cf, o.time, o.rounds);
+    let sampled = sample(&gpu, &*w, &bf, &cf, o);
     let post = (|| -> Result<bool> {
         // The last timed launch of each arm must still equal its warm output.
         gpu.hip.device_synchronize().map_err(err)?;
@@ -615,7 +729,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             && w.output(&gpu, Arm::Candidate)? == cand_out)
     })();
     match (sampled, post) {
-        (Ok(s), Ok(true)) => match timing_record(&s.base_ns, &s.cand_ns, o.time, o.rounds) {
+        (Ok((s, stop, secs)), Ok(true)) => match timing_record(&s, o.time, o.rounds, stop, secs) {
             Ok(mut t) => {
                 t["post_outputs_unchanged"] = json!(true);
                 rec["timing"] = t;
@@ -649,11 +763,17 @@ fn main() {
     if let Some(ts) = rec.get("timing").filter(|t| t["ratio"].is_number()) {
         let verdict = if ts["separable"] == true {
             format!(
-                "candidate/baseline median ratio {:.6}",
-                ts["ratio"].as_f64().unwrap_or(f64::NAN)
+                "separable after {} rounds: candidate/baseline block ratio {:.6}",
+                ts["rounds_run"],
+                ts["block_ratio"].as_f64().unwrap_or(f64::NAN)
             )
         } else {
-            "not separable at this N".to_owned()
+            format!(
+                "not separable after {} rounds ({}); block ratio {:.6}",
+                ts["rounds_run"],
+                ts["stop"],
+                ts["block_ratio"].as_f64().unwrap_or(f64::NAN)
+            )
         };
         eprintln!("pm_loop: {verdict}");
     }
@@ -771,20 +891,137 @@ mod tests {
         );
     }
 
+    fn samples(base: &[f64], cand: &[f64]) -> Sampled {
+        Sampled {
+            base_ns: base.to_vec(),
+            cand_ns: cand.to_vec(),
+        }
+    }
+
     #[test]
     fn timing_record_units_ratio_and_separability() {
+        use abba::ExtendStop::Separable;
+        // n = 2, one round: 4 launches per arm.
         let base = [100_000.0, 101_000.0, 102_000.0, 100_500.0];
         let slow = [200_000.0, 201_000.0, 202_000.0, 200_500.0];
-        let t = timing_record(&base, &slow, 2, 1).unwrap();
+        let t = timing_record(&samples(&base, &slow), 2, 1, Separable, 1.5).unwrap();
         assert_eq!(t["separable"], true);
+        assert_eq!(t["separable_full_range"], true);
         assert_eq!(t["baseline_us"]["median"], 100.75);
         assert_eq!(t["candidate_us"]["min"], 200.0);
         let ratio = t["ratio"].as_f64().unwrap();
         assert!((ratio - 200.75 / 100.75).abs() < 1e-12);
-        let same = timing_record(&base, &base, 2, 1).unwrap();
+        assert_eq!(
+            (t["rounds_run"].as_u64(), t["extended"].as_bool()),
+            (Some(1), Some(false))
+        );
+        assert_eq!(t["stop"], "separable");
+        assert_eq!(t["baseline_block_median_us"], json!([100.5, 101.25]));
+        assert_eq!(t["candidate_block_median_us"], json!([200.5, 201.25]));
+        assert!(t["round_ratio_min"].as_f64().unwrap() > 1.9);
+        let same = timing_record(
+            &samples(&base, &base),
+            2,
+            1,
+            abba::ExtendStop::MaxRounds,
+            1.0,
+        )
+        .unwrap();
         assert_eq!(same["separable"], false);
         assert_eq!(same["ratio"], 1.0);
-        assert!(timing_record(&[], &base, 1, 1).is_err());
+        assert_eq!(same["block_ratio"], 1.0);
+        assert!(timing_record(&samples(&[], &base), 1, 1, Separable, 0.0).is_err());
+    }
+
+    /// The 7 ms hiccup of the noprio record: block rule separates, the twins'
+    /// full-range rule (kept as `separable_full_range`) does not.
+    #[test]
+    fn one_hiccup_vetoes_only_the_full_range_rule() {
+        let mut base: Vec<f64> = (0..8).map(|i| 330_000.0 + f64::from(i) * 100.0).collect();
+        let cand: Vec<f64> = (0..8).map(|i| 320_000.0 + f64::from(i) * 100.0).collect();
+        base[3] = 7_003_000.0;
+        let t = timing_record(
+            &samples(&base, &cand),
+            2,
+            1,
+            abba::ExtendStop::Separable,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(t["separable"], true);
+        assert_eq!(t["separable_full_range"], false);
+        assert!(t["block_ratio"].as_f64().unwrap() < 1.0);
+    }
+
+    /// Fake sampler: `gap` ns between the arms, 1 s per round, `noise` makes
+    /// the arms overlap until it is zero.
+    fn fake_run(
+        gap: f64,
+        per_round_s: f64,
+        now: &std::cell::Cell<f64>,
+    ) -> impl FnMut(usize, &mut Sampled) -> Result<()> + '_ {
+        move |extra, s| {
+            for r in 0..extra {
+                for _ in 0..4 {
+                    let j = f64::from((s.base_ns.len() + r) as u32 % 7);
+                    s.base_ns.push(300_000.0 + j * 1_000.0);
+                    s.cand_ns.push(300_000.0 + j * 1_000.0 - gap);
+                }
+            }
+            now.set(now.get() + per_round_s * extra as f64);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sampling_extends_by_doubling_until_a_stop() {
+        use abba::ExtendStop::{MaxRounds, Separable, TimeBudget};
+        let now = std::cell::Cell::new(0.0);
+        let clock = &mut || now.get();
+        // Identical arms never separate: 2 -> 4 -> 8 -> 16 -> 20 (max_rounds).
+        let mut run = fake_run(0.0, 1.0, &now);
+        let (s, stop, secs) = drive_sampling(2, 2, 20, 1e9, clock, &mut run).unwrap();
+        assert_eq!((s.base_ns.len() / 4, stop, secs), (20, MaxRounds, 20.0));
+        // A clear gap separates after the initial rounds: no extension.
+        now.set(0.0);
+        let clock = &mut || now.get();
+        let mut run = fake_run(50_000.0, 1.0, &now);
+        let (s, stop, _) = drive_sampling(2, 2, 64, 1e9, clock, &mut run).unwrap();
+        assert_eq!((s.base_ns.len() / 4, stop), (2, Separable));
+        // Time budget: 1 s/round, 10 s budget, never separable: 2, 4, 8 (6+2...) then stop.
+        now.set(0.0);
+        let clock = &mut || now.get();
+        let mut run = fake_run(0.0, 1.0, &now);
+        let (s, stop, secs) = drive_sampling(2, 2, 64, 10.0, clock, &mut run).unwrap();
+        assert_eq!(stop, TimeBudget);
+        assert!(
+            secs <= 10.0 && s.base_ns.len() / 4 == 10,
+            "{secs} {}",
+            s.base_ns.len()
+        );
+    }
+
+    #[test]
+    fn extension_flags_parse() {
+        let o = parse_args(args("--kernel iu4_gemm")).unwrap();
+        assert_eq!((o.time, o.rounds, o.max_rounds), (50, 6, 64));
+        assert_eq!(o.time_budget_s, 240.0);
+        let o = parse_args(args(
+            "--kernel iu4_gemm --rounds 3 --max-rounds 9 --time-budget-s 12.5",
+        ))
+        .unwrap();
+        assert_eq!((o.rounds, o.max_rounds, o.time_budget_s), (3, 9, 12.5));
+        assert!(o.knobs.0.is_empty());
+        for bad in [
+            "--kernel k --max-rounds 0",
+            "--kernel k --rounds 8 --max-rounds 4",
+            "--kernel k --time-budget-s 0",
+            "--kernel k --time-budget-s -3",
+            "--kernel k --time-budget-s nan",
+            "--kernel k --time-budget-s x",
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

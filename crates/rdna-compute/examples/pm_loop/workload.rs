@@ -105,6 +105,10 @@ pub trait Workload {
     fn shape_json(&self) -> Value;
     /// Candidate knobs as JSON (the resolved Spec axes).
     fn candidate_knobs(&self) -> Value;
+    /// Extra top-level record fields (e.g. `sparse`), merged by the driver.
+    fn record_extra(&self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
 
     /// Emit + link the candidate with the native writer (the path of
     /// `peacemaker-isa emit --co`). Errors (e.g. a closed fold axis) are
