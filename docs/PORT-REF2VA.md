@@ -1371,3 +1371,91 @@ the arity fix and the ABI table stay. The GOOD container remains
 `minimax-h3-dasiwa-w8a8.rad`; `minimax-h3-dasiwa-w8a8-gatefix.rad` is kept only as the
 documented bad artifact. The fried look is NOT an FFN half-order issue and stays OPEN
 (#54/#45): the coherent-but-bright OLD_* renders are the standing artifact to explain.
+
+## cont.27 — #54 value-parity audit: EVERY pipeline stage exonerated; quantization scheme is the only remaining axis
+
+The full numerical audit of the fried look (blown highlights / crushed blacks vs the GOLD flair
+reference) is COMPLETE, and no Radiance convention bug remains anywhere in the chain. Verdicts,
+each device-anchored:
+
+* **TE + token_refiner (cond1→cond2).** cond1's rowcos 0.966 with its positional ramp (rows 0-63 →
+  0.853) was cond1's OWN bug: it replayed the refiner with a causal mask. The reference refiner is
+  full-bidirectional (`model.py` Attention `mask=None`) and so is the device (`causal 0`); the TE is
+  causal on BOTH sides (`llama.py BaseLlama` builds the causal mask when `seq_len > 1`).
+  `MASK=tecausal` replay (`teharness/cond2.py`): **rowcos mean 0.998379, min 0.8927, std-ratio
+  1.0003, no positional structure** (rows 0-63 now 0.9994) — TE/ctx/refiner EXONERATED; the residual
+  is the fp8-vs-exact activation floor on long rows.
+* **temb derivation (curve form) — BIT-EXACT.** The curve table is `tmb.table` [1025, **8**] (the
+  curve-form checkpoint replaces the time MLP AND the 2688-input adaln linears: per-block
+  `Linear(8 → 6·5376·3)`; container meta `time_embed_dim 8`, `adaln_curve_grid 1025`). Device
+  `dit_temb.f32` rows [0,S)|[S,2S)|[2S,3S)|[3S,4S) (S = the REQUEST's steps, 23 — NOT m.S) compared
+  vs torch lerp of the ckpt table at `t_v = 1−sigma_v`, `t_a = 1−shift₃(shift₁₂⁻¹(sigma_v))`:
+  **ALL FOUR BLOCKS × 23 STEPS maxdiff 0.000e+00** — driver schedule, audio-shift algebra, pins
+  (0.999/1.0) and the kernel lerp all verified to the bit. Curve-form ada weights stay plain bf16
+  ([96768,8], arch 1180-1191) = lossless vs reference.
+* **Everything else was already closed:** per-block DiT + final layer (fork4, vs the DEQUANT
+  ckpt `transformer_dasiwa`, rowcos ≥0.99965 all blocks), sampler chain slope 1.0 (chain1),
+  decoder REAL-ckpt parity (#66 vdec fork: device decode ≡ torch decode on the device latent ⇒
+  the fried lives in the latent, decoder exonerated), denorm constants byte-identical three-way,
+  writer neutral, CFG absent = reference's BasicGuider 1, seed noise std 1.0022 ✓.
+* **Latent trajectory healthy:** std 1.0022 (σ=1.0) → 0.9181 (σ=0.9167) tracks theory (0.9205);
+  no contrast pump through step 12; mean +0.002 → +0.006.
+
+**Provenance facts mined this pass:** `MiniMax-H3-dasiwa-src` = the GOLD UNet
+(`DasiwaMinimaxH3_dasiwaHybridV4_int8` dequanted by overlay-dasiwa.py's convrot math, "the
+identical math the reference clips were rendered with") + its `text_encoder/` is BYTE-IDENTICAL to
+`MiniMax-H3-heretic-src` = GOLD's `qwen3vl_32b_h3_ultra_uncensored_heretic` CLIP. So the served
+`minimax-h3-dasiwa-w8a8.rad` carries BOTH of GOLD's models; model identity is NOT the delta.
+
+**What remains:** the quantization scheme. GOLD (comfy) runs convrot-int8 weights with bf16
+activations; the device runs `dit_i8` W8A8 — the convrot int8 RE-QUANTIZED to int8 group-128 plus
+int8 per-token ACTIVATIONS (arch 1325-1387). fork4's relFro growth 0.0026→0.026 through the trunk
+IS that noise vs the exact math. A bf16-activation DiT trunk does not exist in the arch (the trunk
+is always quantized: fp8 or int8 per `declare_qs(..., dit_i8, !dit_i8)`). The decisive experiment
+is a same-weights A/B: re-run GOLD's own workflow JSON locally in ComfyUI (all assets are present:
+diffusion_models/civitai-minimax/DasiwaMinimaxH3_dasiwaHybridV4_int8.safetensors,
+text_encoders/civitai-minimax/qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors,
+the FL2VA workflow JSONs in radiance-fl2va-examples) against the radiance render at matched
+settings — but ComfyUI is disabled by standing rule and MUST NOT be relaunched without the user's
+explicit OK. BB seed battery measured while waiting: luma 109-185 by content, clipHi 10-22% —
+birdbike stays a style-confound, the flair pair remains the fried exemplar.
+
+**#54 CLOSED — THE FRIED LOOK WAS THE VELOCITY-HEAD MODULATION TABLE ZEROED AT EVERY STEP
+t > 0. Fixed + device-verified by VISION (2026-10-22).**
+
+* **Root cause (one line of semantics):** the runtime strides a buffer operand by its **DECLARED
+  row width** (`r4d_rows_pitch`, r4d_args.h; `bcol_at`'s pitch argument is only a base multiplier,
+  rad_arch.h:1018). `b_nout` is declared `{L*S, kMaxSegs*2*D}` (row width 86016 elems), but the
+  cond pass staged it with a **narrower pitch argument** `ncell*2*D` (32256) and the step pass read
+  row `(lane,step)` with multiplier `ng*2*D`. Staging rows therefore landed at stride 86016 while
+  the consumer's window for step k>0 (32256·k + cell·10752) fell on **unwritten bytes: all zeros**.
+  Step 0 aligned by coincidence (row #0 of staging == cell starts), which is exactly why step 0
+  always looked perfect and hid this for so long. The rms_mod kernel then computed
+  `rms(h)*w*(1+0)+0` = **un-modulated velocity head for the video AND audio heads at every denoise
+  step after the first** — scale std ≈0.295 silently dropped ⇒ systematic per-step velocity
+  inflation (measured device vel std 2.90 vs reference-math 2.05 at step 1) ⇒ the global fried look.
+* **How it was caught:** the old `dit.noutdbg` shadow read `brow_slice(b_nout, row)` — sampling the
+  buffer at its DECLARED pitch, which is NOT the pointer op_nout receives — so it showed a
+  byte-correct table while the kernel read zeros (the shadow lied; this was the "nout cos 1.0 at
+  both steps" false exoneration). The shadow was rewritten to cast **the kernel's own pointer**
+  (`RAD_P_T2(nout, …)`, b_noutd re-declared `{kMaxSegs, 2D}` same bytes) and step-1 zero_frac went
+  1.000 → 0.000 after the fix; post-fix cells match `emb(t)@W+b` to 0.0013-0.0019 relFro per cell,
+  per-modality-correct (video cells↔tvid, audio↔tarr). Probe: `build/tmp/look/loopharness/nout_probe.py`.
+* **Fix (arch/minimaxh3/minimaxh3.cpp):** staging `bcol_at(m.b_nout, base, kMaxSegs*2*D, e*2*D, 2D, S)`
+  and consumer row multiplier `kMaxSegs*2*D` — both now the DECLARED width, exactly the pattern
+  `b_ada`/`b_modg` already use (which is why block modulation was always correct). Op-ordering,
+  kernels, arena, ABI: untouched. The avx host path shares this issue-path so it is fixed too.
+* **Replay parity (torch, device stream anchored):** step 1 video VEL cos 0.9698→**0.9975**, device
+  std 2.901→**2.065** vs reference-math 2.051 (was +41% inflated). Step 0 unchanged (0.9994).
+* **Render + VISION verification (device, `minimax-h3-dasiwa-w8a8.rad`, 512² 6s seed 1234
+  res_multistep 25, workflow prompt with `<d>`, output `build/tmp/look/fixed512/`):** FL2VA f0/mid/
+  end + T2VA control mid — **fried look GONE on every arm**: wood-chip ground resolves naturally
+  (was posterized crosshatch), skin natural, flare soft, shadows deep with detail, and the fire jet
+  at the pinned endpoint has internal yellow→orange gradient instead of a blown white blob. mp4
+  bitrate dropped 6.75 MB→1.88 MB at identical settings = the high-frequency noise-bake is gone.
+  Pins still force (f0 standing/pointing, last frame fire-breathing). Audio streams present (aac).
+  Side effect for #35-followups: the audio head was un-modulated too — worth a re-listen.
+* **Debug machinery kept (all gated on R4D_DIT_SEL, zero production cost):** per-step dump tagging
+  (`dit_s{K}_*` files, `R4D_DIT_SEL=K` also dumps step K, steps 0–1 always), the kernel-pointer
+  nout shadow (the lesson above), tvid/tarr schedule dumps. The TP2 dual-window blk hack was
+  diagnostic-only and was reverted before the fix commit.

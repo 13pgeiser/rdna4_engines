@@ -588,6 +588,8 @@ struct Model {
     /* ---- the DiT step dump (R4D_DIT_SEL): the f32 shadows that let a step be replayed on the CPU
      * reference DiT. All declared only when the env is set, so a production run pays nothing. */
     bool dit_dbg = false;
+    /* #54 debug: the step whose shadows the driver reads back (R4D_DIT_SEL's value; 0 = step 0). */
+    int64_t dit_step = 0;
     /* b_h right after the input projections -- the stream entering block 0 -- cast to f32 before the
      * block loop recycles the bf16 scratch. [cap, D] f32 PERSIST (capped: see declare_dit). */
     int64_t dit_h0cap = 0;
@@ -1260,6 +1262,8 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
      * environment -- so a production run reserves nothing. All bf16→f32 casts (no f32→f32 cast
      * row exists), hence the temb shadow is curve-form only, where b_temb is bf16. */
     m.dit_dbg = std::getenv("R4D_DIT_SEL") != nullptr;
+    if (const char* sel = std::getenv("R4D_DIT_SEL"))
+        m.dit_step = std::strtol(sel, nullptr, 10);
     if (m.dit_dbg) {
         /* The h0 shadow is capped: max_tok is the whole batch ceiling (a video serve runs past a
          * hundred thousand rows), and a full [max_tok, D] f32 twin is gigabytes the arena has no
@@ -1307,9 +1311,13 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
          * replaying the heads over it and over b_hnd (declared with b_hn below) -- checkpoint
          * weights, exact math -- either reproduces the step's velocity or convicts the head's
          * modulation itself. */
-        m.b_noutd = decl_b(b, nm.f("dit.noutdbg"), RAD_F32, { 1, (int64_t)kMaxSegs * 2 * D }, RAD_BUF_PERSIST);
+        /* The row pitch here MUST match the pointer step_dit hands op_nout (ng * 2 * D cells),
+         * not the buffer's declared width -- brow_slice(b_nout, row) samples at the declared
+         * kMaxSegs pitch, which is NOT what the kernel reads; that mismatch made an earlier
+         * shadow look byte-correct while the kernel actually saw zeros. */
+        m.b_noutd = decl_b(b, nm.f("dit.noutdbg"), RAD_F32, { (int64_t)kMaxSegs, 2 * D }, RAD_BUF_PERSIST);
         m.op_noutd = rw(b, RAD_OP(b, "cast",
-                                  RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", (int64_t)kMaxSegs * 2 * D),
+                                  RAD_PARAMS(RAD_RANGE("M", 1, kMaxSegs), RAD_INT("n", 2 * D),
                                              RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
                                   RAD_NOWEIGHTS),
                          { m.b_nout }, { m.b_noutd });
@@ -3620,8 +3628,13 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     }
     for (int64_t e = 0; e < ncell; ++e) {
         const int64_t r0 = cell[(size_t)e].second;
+        /* The pitch is the buffer's declared row width (kMaxSegs * 2 * D), exactly as b_ada's
+         * staging: the runtime strides a buffer operand by its DECLARED row width -- bcol_at's
+         * pitch argument is only a base multiplier -- so a pitch argument narrower than the
+         * declared width lands every row past the consumer's view of it, and every denoise step
+         * after the first read zeros: the velocity head ran un-modulated for all t > 0. */
         RAD_ISSUE_N(c, m.op_no, S, brow_slice(m.a_temb.x, r0, S, td), RAD_W(m.w_no), RAD_W(m.b_no),
-                    RAD_NONE, bcol_at(m.b_nout, base, ncell * 2 * D, e * 2 * D, 2 * D, S));
+                    RAD_NONE, bcol_at(m.b_nout, base, (int64_t)kMaxSegs * 2 * D, e * 2 * D, 2 * D, S));
     }
 }
 
@@ -3690,7 +3703,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
     /* The dump's modulation shadow (R4D_DIT_SEL): the gathered table -- every block's and merged
      * cell's vectors, both ranks' column halves -- widened to f32 into a PERSIST buffer. The step
      * the driver readbacks on is the dump's step (0); the blocks below never touch b_modd. */
-    if (m.dit_dbg && V->step == 0)
+    if (m.dit_dbg && (V->step == m.dit_step || V->step < 2))
         RAD_ISSUE_N(c, m.op_modd, (int64_t)g.world * L * kMaxSegs,
                     brows(m.b_modg, (int64_t)g.world * L * kMaxSegs),
                     brows(m.b_modd, (int64_t)g.world * L * kMaxSegs));
@@ -3746,7 +3759,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
      * it -- the stream entering block 0 -- widened to f32 before the first block recycles the
      * bf16 scratch. Plain requests only: the harness replays the fixed [text | audio | video]
      * order, and the driver readbacks only plain step-0 requests (R4D_DIT_SEL). */
-    if (m.dit_dbg && V->step == 0 && !refc) {
+    if (m.dit_dbg && (V->step == m.dit_step || V->step < 2) && !refc) {
         if (R > m.dit_h0cap) {
             rad_step_fail(c, "minimaxh3: the DiT dump request packs more rows than the h0 shadow "
                              "holds (8192) -- render the dump smaller");
@@ -3821,7 +3834,7 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
              * after its issue b_h equals the stream the reference holds after block l-1. Rows
              * [0, kDbgL) belong to half 0, whose op_mq1 this follows; the deferred stream orders
              * the cast after the fold it reads. */
-            if (m.dit_dbg && V->step == 0 && l > 0 && h == 0 && R >= kDbgL)
+            if (m.dit_dbg && (V->step == m.dit_step || V->step < 2) && l > 0 && h == 0 && R >= kDbgL)
                 RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_h, 0, kDbgL, D),
                             brow_slice(m.b_dbgl, (l - 1) * kDbgL, kDbgL, D));
             B.qkv.step(c, m.a_hm, m.b_qkv, R, r0, n);
@@ -3866,25 +3879,29 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         }
     }
     wait_ar();
+    /* Row (lane, step) at the declared row width kMaxSegs * 2 * D -- the same pitch the staging
+     * wrote; the kernel strides cells by 2D inside it. */
     const char* nout = (const char*)rad_buf_ptr(c, m.b_nout) +
-                       (lane * m.S + V->step) * ng * 2 * D * (int64_t)sizeof(uint16_t);
+                       (lane * m.S + V->step) * (int64_t)kMaxSegs * 2 * D * (int64_t)sizeof(uint16_t);
     RAD_ISSUE_N(c, m.op_nout, R, brows(m.b_ao, R), mod(L - 1, 5, 1),
                 RAD_P_T2(nout, RAD_BF16, ng, 2 * D), RAD_W(m.w_no_n), mod_segs, brows(m.b_h, R),
                 brows(m.b_hn, R));
     /* Block 49's stream, slot L-1: only op_nout folds the last MLP delta into b_h (the reference
      * FinalLayer norms the same post-fold stream), so this follows it. Nothing between here and
      * the pass' end writes b_h. */
-    if (m.dit_dbg && V->step == 0 && R >= kDbgL)
+    if (m.dit_dbg && (V->step == m.dit_step || V->step < 2) && R >= kDbgL)
         RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_h, 0, kDbgL, D),
                     brow_slice(m.b_dbgl, (L - 1) * kDbgL, kDbgL, D));
     /* The velocity-head isolation: the head's own operands -- norm_out's stream over the video
      * rows this request's heads run on, and this step's shift/scale table row -- so the CPU
      * replay can apply the checkpoint head to them and say whether it reproduces b_vel. */
-    if (m.dit_dbg && V->step == 0 && vrows >= kVidDbgL) {
+    if (m.dit_dbg && (V->step == m.dit_step || V->step < 2) && vrows >= kVidDbgL) {
         RAD_ISSUE_N(c, m.op_hnd, kVidDbgL, brow_slice(m.b_hn, vseg, kVidDbgL, D),
                     brows(m.b_hnd, kVidDbgL));
-        RAD_ISSUE_N(c, m.op_noutd, 1, brow_slice(m.b_nout, lane * m.S + V->step, 1, (int64_t)kMaxSegs * 2 * D),
-                    brows(m.b_noutd, 1));
+        /* The kernel's OWN pointer -- the ng cells at pitch ng * 2 * D step_dit computed just
+         * above -- not a brow_slice of b_nout at the declared kMaxSegs pitch. */
+        RAD_ISSUE_N(c, m.op_noutd, ng, RAD_P_T2(nout, RAD_BF16, ng, 2 * D),
+                    brows(m.b_noutd, ng));
     }
 
     /* The heads, in f32 over parts of the rows. */

@@ -236,6 +236,8 @@ private:
     int64_t               dit_h0_b_ = 0, dit_vel_b_ = 0, dit_temb_b_ = 0, dit_mod_b_ = 0,
                           dit_blk_b_ = 0, dit_hn_b_ = 0, dit_nout_b_ = 0;
     bool                  dit_used_ = false;    /* the running pass staged a dump */
+    int                   dit_sel_ = 0;         /* #54 debug: also dump step dit_sel_ (>0) */
+    int                   dit_step_ = 0;        /* step of the pass the staged dump belongs to */
     int64_t               dit_rows_ = 0;        /* packed rows R of the dumped step */
 
     /* Debug-only (#63, same env): the video-decoder parity chain (lat | x0 | blk | n | pix),

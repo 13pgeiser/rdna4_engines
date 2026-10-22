@@ -315,9 +315,9 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
      * shadows carry) is honoured, anything else warns and stays off. */
     if (const char* sel = std::getenv("R4D_DIT_SEL")) {
         const long want = std::strtol(sel, nullptr, 10);
-        if (want != 0)
-            RAD_ERR("video generator: R4D_DIT_SEL=%s: only step 0 is dumped (the shadows are "
-                    "issued at step 0); ignoring", sel);
+        dit_sel_ = want > 0 ? (int)want : 0;   /* #54 debug: also dump this step, dit_sK_* files */
+        if (want < 0)
+            RAD_ERR("video generator: R4D_DIT_SEL=%s: negative step; ignoring", sel);
         else if (decl_.dbg_dit_h0 && decl_.dbg_dit_vel) {
             dit_h0_b_ = decl_.dbg_dit_h0_bytes;
             dit_vel_b_ = decl_.dbg_dit_vel_bytes;
@@ -1032,6 +1032,10 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     reg_[R_CU].used = 2 * 4;
     reg_[R_TV].used = j.sched.steps * 4;
     reg_[R_TA].used = j.sched.steps * 4;
+    if (dit_dbg_)
+        std::fprintf(stderr, "dit_dbg: t arrays staged: tv[0]=%.4f tv[%d]=%.4f ta[0]=%.4f ta[%d]=%.4f\n",
+                     tv[0], (int)j.sched.steps - 1, tv[j.sched.steps - 1],
+                     ta[0], (int)j.sched.steps - 1, ta[j.sched.steps - 1]);
     const RadVideoGeom& g = small_now(j) ? j.geom_small : j.geom;
     stage_geom(j, g, small_now(j) ? j.rows_small : j.rows, 0);
 
@@ -1212,7 +1216,9 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
      * Plain step 0 only: the harness replays the fixed [text | audio | video] layout and the full
      * grid, and the arch issues the shadows only under the same conditions. */
     dit_used_ = false;
-    if (dit_dbg_ && j.step == 0 && !small && !j.ref_wide && j.ref_tab.empty()) {
+    if (dit_dbg_ && (j.step == 0 || j.step == 1 || j.step == dit_sel_) && !small &&
+        !j.ref_wide && j.ref_tab.empty()) {
+        dit_step_ = j.step;   /* namespaced dump: step 0 -> dit_*, step K>0 -> dit_sK_* */
         char* p = dit_host_;
         int64_t off = 0;
         const rad_buf hh[7] = { decl_.dbg_dit_h0, decl_.dbg_dit_temb, decl_.dbg_dit_mod,
@@ -1227,8 +1233,11 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
             }
         dit_used_ = true;
         dit_rows_ = rows;
-        dit_dump_file("dit_pos.f32", pos.data(), (size_t)pos.size() * 4);
-        dit_dump_file("dit_seg_cu.i32", hptr<int32_t>(R_SEG), (size_t)reg_[R_SEG].used);
+        const std::string tag = dit_step_ ? "dit_s" + std::to_string(dit_step_) + "_" : "dit_";
+        dit_dump_file(tag + "pos.f32", pos.data(), (size_t)pos.size() * 4);
+        dit_dump_file(tag + "seg_cu.i32", hptr<int32_t>(R_SEG), (size_t)reg_[R_SEG].used);
+        dit_dump_file(tag + "tvid.f32", hptr<float>(R_TV), (size_t)j.sched.steps * 4);
+        dit_dump_file(tag + "tarr.f32", hptr<float>(R_TA), (size_t)j.sched.steps * 4);
     }
     pass_.kind = RAD_GEN_PASS_VSTEP;
     pass_.job = j.id;
@@ -1539,23 +1548,24 @@ int VideoDriver::done() {
             /* The step-0 dump landed: slab (h0 | temb | mod | blk | hn | nout | vel) to raw
              * files, plus the few facts the driver knows (R4D_ENC_DUMPDIR; the prep script
              * supplies D=5376 and the harness .meta files). */
+            const std::string tag = dit_step_ ? "dit_s" + std::to_string(dit_step_) + "_" : "dit_";
             char* p = dit_host_;
-            dit_dump_file("dit_h0.f32", p, (size_t)dit_h0_b_);
+            dit_dump_file(tag + "h0.f32", p, (size_t)dit_h0_b_);
             p += dit_h0_b_;
-            dit_dump_file("dit_temb.f32", p, (size_t)dit_temb_b_);
+            dit_dump_file(tag + "temb.f32", p, (size_t)dit_temb_b_);
             p += dit_temb_b_;
-            dit_dump_file("dit_mod.f32", p, (size_t)dit_mod_b_);
+            dit_dump_file(tag + "mod.f32", p, (size_t)dit_mod_b_);
             p += dit_mod_b_;
-            dit_dump_file("dit_blk.f32", p, (size_t)dit_blk_b_);
+            dit_dump_file(tag + "blk.f32", p, (size_t)dit_blk_b_);
             p += dit_blk_b_;
-            dit_dump_file("dit_hn.f32", p, (size_t)dit_hn_b_);
+            dit_dump_file(tag + "hn.f32", p, (size_t)dit_hn_b_);
             p += dit_hn_b_;
-            dit_dump_file("dit_nout.f32", p, (size_t)dit_nout_b_);
+            dit_dump_file(tag + "nout.f32", p, (size_t)dit_nout_b_);
             p += dit_nout_b_;
-            dit_dump_file("dit_vel.f32", p, (size_t)dit_vel_b_);
+            dit_dump_file(tag + "vel.f32", p, (size_t)dit_vel_b_);
             if (std::getenv("R4D_ENC_DUMPDIR")) {
-                const std::string path =
-                    std::string(std::getenv("R4D_ENC_DUMPDIR")) + "/dit_info.txt";
+                const std::string path = std::string(std::getenv("R4D_ENC_DUMPDIR")) + "/" +
+                                         tag + "info.txt";
                 if (std::FILE* f = std::fopen(path.c_str(), "w")) {
                     std::fprintf(f, "rows %lld\nn_text %lld\nn_audio %lld\nsteps %d\nseed %llu\n",
                                  (long long)dit_rows_, (long long)j->geom.n_text,
