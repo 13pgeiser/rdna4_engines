@@ -109,8 +109,9 @@ pub enum PrefillRoute {
     /// Unset follows its exact-gfx1201 qualification.
     GdnChunkPrepPm,
     /// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`: the A3B shared-expert MQ4G256V2 down GEMM folds
-    /// `residual += sigmoid(gate) * down` into the gfx12 V3 IU4 ADD epilogue (`add == 2` of
-    /// `gemm_mq4g256v2_residual_mmq_iu4_full_add_v3`), with no intermediate temp, no output
+    /// `residual += sigmoid(gate) * down` into a gfx12 IU4 ADD epilogue (the builder `_b1` entry
+    /// `gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1` when eligible, else `add == 2` of the
+    /// hipcc `gemm_mq4g256v2_residual_mmq_iu4_full_add_v3`), with no intermediate temp, no output
     /// memset and no separate gated residual add. Unset follows its exact-gfx1201 qualification.
     MoeSharedDownSigmoidEpi,
 }
@@ -287,7 +288,9 @@ pub const QUALIFIED: [QualifiedCell; 15] = [
 ///   the standard HIP source registry (JIT on demand, no registry module):
 ///   `kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC`, entry
 ///   `gemm_mq4g256v2_residual_mmq_iu4_full_add_v3` (runtime `add == 2` with the trailing
-///   `shared_gate` pointer), launched by `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi`,
+///   `shared_gate` pointer; the same fold's `_b1` bundle twin `..._full_add_sigmoid_b1` is the
+///   default launch target when the builder bundle is eligible), launched by
+///   `Gpu::try_gemm_mq4g256v2_shared_down_sigmoid_epi`,
 ///   whose consumer `Gpu::mq4g256v2_shared_iu4_supported` requires exact gfx1201. A test pins
 ///   the source digest and the symbol.
 pub fn raw_inventory(arch: &str, route: PrefillRoute) -> bool {

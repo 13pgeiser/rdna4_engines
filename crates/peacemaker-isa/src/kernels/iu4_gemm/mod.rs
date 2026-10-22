@@ -93,6 +93,8 @@ pub(crate) struct Args {
     pub m: u8,
     pub k: u8,
     pub n: u8,
+    /// `Epi::AddSigmoid` only: the `shared_gate` pointer (SGPR pair).
+    pub gate: Option<u8>,
     pub bcx: u8,
     pub bcy: u8,
 }
@@ -166,6 +168,7 @@ impl Gen {
                 m: 16,
                 k: 17,
                 n: 18,
+                gate: None,
                 bcx: 20,
                 bcy: 21,
             }
@@ -180,8 +183,24 @@ impl Gen {
                 m: 30,
                 k: 22,
                 n: 23,
+                gate: None,
                 bcx: 28,
                 bcy: 29,
+            }
+        } else if spec.epi == Epi::AddSigmoid {
+            // The ADD arguments, then `shared_gate` at offset 40 (s[18:19]);
+            // the hidden block counts follow at offset 48.
+            Args {
+                a: 8,
+                u: None,
+                xq: 10,
+                y: 12,
+                m: 14,
+                k: 15,
+                n: 16,
+                gate: Some(18),
+                bcx: 20,
+                bcy: 21,
             }
         } else {
             Args {
@@ -192,6 +211,7 @@ impl Gen {
                 m: 14,
                 k: 15,
                 n: 16,
+                gate: None,
                 bcx: 18,
                 bcy: 19,
             }
@@ -386,6 +406,9 @@ impl Gen {
         for i in 0..EPI_S {
             p.s::<1>("epi_s", self.epi_s + i, shared())?;
         }
+        if self.spec.epi == Epi::AddSigmoid {
+            epilogue::plan_sigmoid(&mut p)?;
+        }
         if gdn {
             gdn_epilogue::plan(&mut p)?;
         }
@@ -579,6 +602,10 @@ pub fn emit_module(
     if tile == Tile::T128x128x8 {
         epis.push(Epi::GateUpSiluBf16);
         epis.push(Epi::QkvzaGdn);
+        // The sigmoid residual ADD reads token-layout activations only.
+        if act == ALayout::Token {
+            epis.push(Epi::AddSigmoid);
+        }
     }
     let emitted = epis
         .into_iter()
