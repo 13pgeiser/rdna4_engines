@@ -6,10 +6,10 @@
 //! kernel (gfx1201). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
+//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
-//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, qwen4_moe_sym)
+//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -67,7 +67,8 @@
 //!
 //! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
 //! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
-//! (`--kernel fp8_gemm`) and `pm_loop/moe.rs` (`--kernel qwen4_moe_sym`).
+//! (`--kernel fp8_gemm`), `pm_loop/fa.rs` (`--kernel fa_prefill`) and `pm_loop/moe.rs`
+//! (`--kernel qwen4_moe_sym`).
 //!
 //! Use (build once, then take a gfx1201 card through the fabric; check
 //! `fabric-run.sh --status` first and pick an idle hiptrx card A/B/C/E):
@@ -93,6 +94,8 @@ mod abba;
 mod c8;
 #[path = "pm_loop/common.rs"]
 mod common;
+#[path = "pm_loop/fa.rs"]
+mod fa;
 #[path = "pm_loop/fp8.rs"]
 mod fp8;
 #[path = "pm_loop/gdn.rs"]
@@ -231,11 +234,11 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.rip.is_some()
         && !matches!(
             o.kernel.as_str(),
-            "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm" | "qwen4_moe_sym"
+            "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm" | "fa_prefill" | "qwen4_moe_sym"
         )
     {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm or qwen4_moe_sym: only iu4_gemm, mq6_i8_gemm, fp8_gemm and qwen4_moe_sym are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill or qwen4_moe_sym: only iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill and qwen4_moe_sym are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -256,13 +259,14 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
+        "fa_prefill" => fa::new(&shape, &mut knobs, o.rip.as_deref())?,
         "qwen4_moe_sym" => moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "iu4_c8_producer_pm" => c8::new(&shape, &mut knobs)?,
         "moe_rotate_i4_pm" => rotate::new(&shape, &mut knobs)?,
         "gdn_chunk_prep_pm" => gdn::new(&shape, &mut knobs)?,
         other => {
             return Err(format!(
-                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
             ))
         }
     };

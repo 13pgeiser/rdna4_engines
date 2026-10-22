@@ -235,6 +235,20 @@ fn main() {
                 .expect("moe fold")
             }};
         }
+        macro_rules! order_only {
+            ($gpu:expr) => {
+                $gpu.moe_combine_order_top10(
+                    &inverse,
+                    &experts,
+                    &weights,
+                    &order,
+                    grouped_rows,
+                    rows,
+                    64,
+                )
+                .expect("order")
+            };
+        }
         macro_rules! mixer_fold {
             ($gpu:expr) => {
                 $gpu.hc_row_write_norm_gate_gfx1201(&HcRowWriteNormGateGfx1201 {
@@ -264,7 +278,7 @@ fn main() {
 
         let (mut combine_us, mut add_us, mut write_us, mut norm_us) =
             (vec![], vec![], vec![], vec![]);
-        let (mut moe_unfused, mut moe_fused) = (vec![], vec![]);
+        let (mut moe_unfused, mut moe_fused, mut order_us) = (vec![], vec![], vec![]);
         let (mut mixer_write_us, mut mixer_unfused, mut mixer_fused) = (vec![], vec![], vec![]);
         for block in 0..BLOCKS {
             // Alternate the order so neither side owns the cold/hot half.
@@ -276,6 +290,7 @@ fn main() {
                 mixer_fused.push(mixer_fused_us(&mut gpu));
             }
             let c = time_us(&mut gpu, |gpu| combine!(gpu));
+            order_us.push(time_us(&mut gpu, |gpu| order_only!(gpu)));
             let a = time_us(&mut gpu, |gpu| scaled_add!(gpu));
             let w = time_us(&mut gpu, |gpu| write!(gpu, &routed));
             let n = time_us(&mut gpu, |gpu| norm_gate!(gpu));
@@ -300,10 +315,12 @@ fn main() {
         );
         let (mw, mu) = (median(&mut mixer_write_us), median(&mut mixer_unfused));
         let (mf, uf) = (median(&mut moe_fused), median(&mut moe_unfused));
+        let ord = median(&mut order_us);
         let xf = median(&mut mixer_fused);
         println!(
             "RESULT moe rows={rows} combine={c:.1}us scaled_add={a:.1}us hyper_write={w:.1}us norm_gate={n:.1}us \
-             unfused_sum={uf:.1}us fused={mf:.1}us saved={:.1}us ({:.1}%)",
+             unfused_sum={uf:.1}us fused={mf:.1}us (order={ord:.1}us fold_only={:.1}us) saved={:.1}us ({:.1}%)",
+            mf - ord,
             uf - mf,
             100.0 * (uf - mf) / uf
         );
