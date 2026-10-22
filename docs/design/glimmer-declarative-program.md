@@ -108,7 +108,10 @@ variant.
   stream extents, are checked. Unit tests pin the decode-route, cache-bound
   and steps-route refusals (`sandwich::validation_tests`).
 - StepGraph: `Step::SiluMul` takes the reserved hand-route ID `OpKind::SiluMul
-  = 1001`; #877's `GatedShortConv` is 27. Glimmer adds no `OpKind`.
+  = 1001`; #877's `GatedShortConv` is 27. Beta folded the Gemma 4 sandwich MLP
+  into `GatedMlp` (28) and retired `SandwichMlp` (20, never reused), so Glimmer's
+  `Step::SandwichMlp` (its steps/rows ladders, not yet expressed as a
+  `GatedMlp` ladder) takes the appended `OpKind::SandwichMlp = 31`.
 
 ## Numerics contract
 

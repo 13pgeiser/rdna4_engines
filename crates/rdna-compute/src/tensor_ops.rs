@@ -35,7 +35,7 @@ pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
 
 pub(crate) const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
-const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
+pub(crate) const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
@@ -1707,6 +1707,67 @@ pub fn hc_state_bf16_add_f32(
     n: usize,
 ) -> HipResult<()> {
     hc_state_bf16_elementwise(gpu, "hc_state_bf16_add_f32", state, addend, n)
+}
+
+const HC_MEAN_CAPTURE_SRC: &str = include_str!("../../../kernels/src/hc_mean_capture.hip");
+
+/// DFlash2 target features on Qwen4: the mean over the `hc` hyper-connection
+/// streams of `rows` rows of HC state (`[row, stream, hidden]`, F32, or
+/// BF16-stored when `bf16`), written as F32 to
+/// `out[row * out_stride + out_offset ..][..hidden]`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_mean_capture_f32(
+    gpu: &mut Gpu,
+    streams: &GpuTensor,
+    out: &GpuTensor,
+    rows: usize,
+    hc: usize,
+    hidden: usize,
+    out_stride: usize,
+    out_offset: usize,
+    bf16: bool,
+) -> HipResult<()> {
+    ensure_f32(streams)?;
+    ensure_f32(out)?;
+    let elements = checked_product3(rows, hc, hidden, "HC mean capture streams")?;
+    let stream_f32 = if bf16 { elements.div_ceil(2) } else { elements };
+    let out_end = checked_add(
+        checked_product(rows.saturating_sub(1), out_stride, "HC mean capture rows")?,
+        checked_add(out_offset, hidden, "HC mean capture slot")?,
+        "HC mean capture rows",
+    )?;
+    if rows == 0
+        || hc == 0
+        || out_offset + hidden > out_stride
+        || streams.numel() < stream_f32
+        || out.numel() < out_end
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let threads = checked_product(rows, hidden, "HC mean capture threads")?;
+    gpu.ensure_kernel_public(
+        "hc_mean_capture",
+        HC_MEAN_CAPTURE_SRC,
+        "hc_mean_capture_f32",
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(streams.buf.as_ptr());
+    args.push_ptr(out.buf.as_ptr());
+    args.push_i32(checked_i32(rows, "HC mean capture rows")?);
+    args.push_i32(checked_i32(hc, "HC mean capture streams")?);
+    args.push_i32(checked_i32(hidden, "HC mean capture hidden")?);
+    args.push_i32(checked_i32(out_stride, "HC mean capture stride")?);
+    args.push_i32(checked_i32(out_offset, "HC mean capture offset")?);
+    args.push_i32(i32::from(bf16));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hc_mean_capture_f32",
+        [blocks(threads)?, 1, 1],
+        [KERNEL_BLOCK as u32, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
 }
 
 fn hc_state_bf16_elementwise(

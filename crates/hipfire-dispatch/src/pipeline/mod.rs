@@ -34,24 +34,30 @@ pub use moe_program::{MoeStage, SealedMoeOp};
 pub(crate) mod draft_head;
 pub mod moe_dump;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
+pub mod batched;
+#[cfg(feature = "deltanet")]
+pub mod batched_attention;
+#[cfg(feature = "deltanet")]
+pub mod batched_deltanet;
+pub mod gated_mlp;
+#[cfg(feature = "deltanet")]
+pub mod hybrid;
 pub(crate) mod layer_ops;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
 pub use layer_ops::{
-    execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
-    execute_final_hyper, execute_gated_delta_net, execute_gated_delta_net_arena,
-    execute_gated_delta_net_core_rows, execute_gated_delta_net_uncovered,
-    execute_grouped_depthwise, execute_grouped_depthwise_rows, execute_hyper_norm,
-    execute_hyper_read, execute_hyper_write, execute_indexed_attention,
+    execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
+    execute_gated_delta_net, execute_gated_delta_net_arena, execute_gated_delta_net_core_rows,
+    execute_gated_delta_net_uncovered, execute_grouped_depthwise, execute_grouped_depthwise_rows,
+    execute_hyper_norm, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
     execute_indexed_attention_arena, execute_indexed_attention_core_rows,
     execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
     project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
-    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, DenseFfnOp,
-    DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas,
-    GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
-    QsaTrunkArenas,
+    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp,
+    GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
+    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
@@ -1875,6 +1881,7 @@ pub fn execute_pipeline(
                         givens_theta: None,
                         givens_scales: None,
                         givens_krot: None,
+                        givens_group_size: None,
                     },
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -4161,6 +4168,7 @@ pub(super) fn prefill_shared_gate_up_stage(
                 n,
                 gate.k,
                 gate_rot.krot,
+                128,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
             let gate_key = prefill_shared_gemm_key(gate.dtype)
@@ -4185,6 +4193,7 @@ pub(super) fn prefill_shared_gate_up_stage(
                 n,
                 up.k,
                 up_rot.krot,
+                128,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
             gemm.run_key(
@@ -6391,6 +6400,7 @@ fn decode_input_basis_stage(
                 1,
                 p.hidden,
                 paro.krot,
+                128,
             ))?;
         } else if res.gate_side_mq4 {
             if let Some(awq) = p.router.awq_scale {
@@ -6760,6 +6770,7 @@ fn prefill_input_basis_stage(
         p.batch_size,
         p.gate_up_k,
         paro.krot,
+        128,
     ))?;
     Ok(())
 }
