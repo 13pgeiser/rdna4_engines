@@ -318,6 +318,14 @@ name = "bench_qwen4_hc_wmma"
 required-features = ["lab"]
 
 [[example]]
+name = "hc_down_fused_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_down_fused_bench"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_mq2g256_lloyd_grouped_gfx12"
 required-features = ["lab"]
 
