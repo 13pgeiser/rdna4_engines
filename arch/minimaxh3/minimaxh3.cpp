@@ -174,6 +174,9 @@ enum { kDbgL = 64 };
 /* Rows of the velocity-head isolation shadow (b_hnd): norm_out's stream over the first video
  * rows, enough to tell a faithful head from one fed the wrong modulation. */
 enum { kVidDbgL = 256 };
+/* #63 decoder parity shadow windows (see b_vdl/b_vdblk/b_vdn/b_vdpix): latent source rows, norm
+ * rows per block, and final-norm rows. kPeriod tile rows of pixels are dumped whole (one tile). */
+enum { kVdLat = 2048, kVdWin = 64, kVdN = 256 };
 
 /* ================================================================== geometry, on the host */
 /* diffusers' AutoencoderKLMiniMaxH3._split_tiles in latents: the first latent of each tile across
@@ -494,6 +497,10 @@ struct Model {
     rad_buf b_vqkv = 0, b_vattn = 0, b_vo = 0, b_vt = 0, b_vup = 0, b_vact = 0;
     rad_buf b_vpix = 0, b_vpix_all = 0, b_frames = 0;
     std::vector<VitBlock> vit;
+    /* #63 decoder parity shadows (R4D_DIT_SEL, see RadVideoGenDecl): bf16 twins of the chain --
+     * bf16 sources copy-cast, f32 sources (lat, x0) narrow-cast. */
+    rad_op  op_vdl = 0, op_vdx0 = 0, op_vdblk = 0, op_vdn = 0, op_vdpix = 0;
+    rad_buf b_vdl = 0, b_vdx0 = 0, b_vdblk = 0, b_vdn = 0, b_vdpix = 0;
 
     /* ---- the latent upscaler, when the container carries one */
     bool    ups = false;
@@ -922,8 +929,11 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 /* ================================================================== the token refiner */
 /* `context_embedder` (5120 -> 5376, bf16, replicated), two plain blocks with full attention over
  * the prompt and no rotary, and the final RMSNorm into the lane's prompt rows. The feed-forward is
- * diffusers' SwiGLU, `value * silu(gate)` with the value first in the checkpoint; the gate half is
- * moved first at convert, which is the order `silu_mul` reads. */
+ * SwiGLU over `ff.net.0.proj`, gated with the FIRST half -- comfy's `_swiglu_eager` (the reference
+ * that produced the ground-truth clips) chunks gate-first, and `silu_mul` reads gate-first, so the
+ * rows are stored in checkpoint order. (An earlier convert moved the gate half second-hand --
+ * swapping the halves -- which made every block's FFN compute `silu(up) * gate`; see the
+ * `ffn_gate_up` map_rows below and #63's container byte inspection.) */
 static int declare_refiner(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gr;
     Names& nm = m.nm;
@@ -1002,7 +1012,11 @@ static int declare_refiner(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         RAD_ARCH_TRY(R.q_h2.declare(b, g, m.a_rh, D));
         const char* fw = nm.f("%s.ffn_gate_up.weight", dn);
         const char* fsrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
-        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, (int)ff_all, ff_all }, { fsrc, 0, ff_all } }));
+        /* Gate-first, matching the reference `swiglu` (gate = first half of ff.net.0.proj) and
+         * `silu_mul`'s first-half gate. The checkpoint stores the gate half first -- the container
+         * bytes for the old swapped map (row 0 == ckpt row n_ff, verified byte-identical after
+         * dequantising the int8 codes) made every DiT FFN compute silu(up)*gate. */
+        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, 0, ff_all }, { fsrc, (int)ff_all, ff_all } }));
         R.gate_up.mapped = true;
         R.gate_up.access = acc;
         RAD_ARCH_TRY(R.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
@@ -1487,7 +1501,10 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         B.op_mq2 = mod_q(B.w_n2, true);
         const char* fw = nm.f("%s.ffn_gate_up.weight", dn);
         const char* fsrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
-        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, (int)ff_all, ff_all }, { fsrc, 0, ff_all } }));
+        /* Same gate-first identity as the fp8 builder above -- the two sites must agree or the
+         * int8 and bf16 paths disagree (the likelier culprit for the old "swap removal -> noise"
+         * experiment). Row group=128 scales are quantised from the mapped rows, so they follow. */
+        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, 0, ff_all }, { fsrc, (int)ff_all, ff_all } }));
         B.gate_up.mapped = true;
         RAD_ARCH_TRY(B.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
                                        RAD_SHARD_ROW, grp_layer(grp), { fsrc }, m.a_hm, m.b_gu, 0,
@@ -1877,8 +1894,15 @@ static int declare_video(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         const char* ub = nm.f("%s.ffn_up.bias", dn);
         const char* usrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
         const char* ubsrc = nm.ckpt("%s.ff.net.0.proj.bias", pre);
-        RAD_ARCH_TRY(map_rows(b, un, { { usrc, (int)ff, ff }, { usrc, 0, ff } }));
-        RAD_ARCH_TRY(map_rows(b, ub, { { ubsrc, (int)ff, ff }, { ubsrc, 0, ff } }));
+        /* #63 value-parity: the VAE's FeedForward is `linear(w2, swiglu(linear(w1, x)))` and
+         * comfy's `_swiglu_eager` gates with the FIRST half of `ff.net.0.proj` -- so the rows must
+         * stay in checkpoint order for `silu_mul` (which also gates with its first half) to
+         * reproduce the reference. The block-0 internals dump (dn window) measured the swapped map
+         * below computing silu(up_half)*gate_half -- cos 0.49 against the reference -- while attn
+         * and to_out matched at the bf16 floor. Identity rows fix the FFN exactly (`ff.net.2`'s
+         * columns stay aligned because the act columns inherit the checkpoint's row order). */
+        RAD_ARCH_TRY(map_rows(b, un, { { usrc, 0, ff }, { usrc, (int)ff, ff } }));
+        RAD_ARCH_TRY(map_rows(b, ub, { { ubsrc, 0, ff }, { ubsrc, (int)ff, ff } }));
         V.w_up = decl_w(b, un, RAD_BF16, { 2 * ff, dim }, acc, RAD_SHARD_NONE, grp_layer(gv));
         V.b_up = decl_w(b, ub, RAD_F32, { 2 * ff }, acc, RAD_SHARD_NONE, grp_layer(gv));
         V.w_down = wcopy(b, nm.f("%s.ffn_down.weight", dn), nm.ckpt("%s.ff.net.2.weight", pre),
@@ -1973,6 +1997,47 @@ static int declare_video(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_STR("mean", kPixMean), RAD_STR("std", kPixStd)),
                                RAD_NOWEIGHTS),
                      { m.W > 1 ? m.b_vpix_all : m.b_vpix, m.b_prev }, { m.b_prev, m.b_frames });
+    /* #63 decoder parity shadows, gated by the DiT dump's env (see RadVideoGenDecl): a fingerprint
+     * chain -- the latent rows patch_unfold reads, the gathered stream before block 0, the norm1
+     * output window entering every block, the final layernorm head, and tile 0's pixels -- wide
+     * enough to say WHICH stage of this decoder first diverges from the checkpoint and narrow
+     * enough for the pinned readback. The bf16 sources widen into f32 twins; the two f32 sources
+     * (the latent state and the stream) shadow through the f32-to-bf16 narrowing cast, the only
+     * cast row that reads f32 -- a few mantissa bits, far under the bf16 chain's own noise. */
+    if (m.dit_dbg) {
+        m.b_vdl = decl_b(b, nm.f("vae.dbg.lat"), RAD_BF16, { kVdLat, kPatchVals }, RAD_BUF_PERSIST);
+        m.op_vdl = rw(b, RAD_OP(b, "cast",
+                                RAD_PARAMS(RAD_RANGE("M", 1, kVdLat), RAD_INT("n", kPatchVals),
+                                           RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
+                                RAD_NOWEIGHTS),
+                      { m.b_vstate }, { m.b_vdl });
+        m.b_vdx0 = decl_b(b, nm.f("vae.dbg.x0"), RAD_BF16, { kVdWin, dim }, RAD_BUF_PERSIST);
+        m.op_vdx0 = rw(b, RAD_OP(b, "cast",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, kVdWin), RAD_INT("n", dim),
+                                            RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
+                                 RAD_NOWEIGHTS),
+                       { m.b_vx }, { m.b_vdx0 });
+        m.b_vdblk = decl_b(b, nm.f("vae.dbg.blk"), RAD_F32, { nl * kVdWin, dim }, RAD_BUF_PERSIST);
+        m.op_vdblk = rw(b, RAD_OP(b, "cast",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, kVdWin), RAD_INT("n", dim),
+                                             RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                  RAD_NOWEIGHTS),
+                        { m.b_vn }, { m.b_vdblk });
+        m.b_vdn = decl_b(b, nm.f("vae.dbg.n"), RAD_F32, { kVdN, dim }, RAD_BUF_PERSIST);
+        m.op_vdn = rw(b, RAD_OP(b, "cast",
+                                RAD_PARAMS(RAD_RANGE("M", 1, kVdN), RAD_INT("n", dim),
+                                           RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                RAD_NOWEIGHTS),
+                      { m.b_vn }, { m.b_vdn });
+        m.b_vdpix = decl_b(b, nm.f("vae.dbg.pix"), RAD_F32, { kPeriod, px }, RAD_BUF_PERSIST);
+        m.op_vdpix = rw(b, RAD_OP(b, "cast",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, kPeriod), RAD_INT("n", px),
+                                             RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                  RAD_NOWEIGHTS),
+                        { m.b_vpix }, { m.b_vdpix });
+        if (!m.op_vdl || !m.op_vdx0 || !m.op_vdblk || !m.op_vdn || !m.op_vdpix)
+            return RAD_E_INVAL;
+    }
     return m.op_stitch ? RAD_OK : RAD_E_INVAL;
 }
 
@@ -3290,6 +3355,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.dbg_dit_hn_bytes = m.b_hnd ? kVidDbgL * m.D * 4 : 0;
             d.dbg_dit_nout = m.b_noutd;
             d.dbg_dit_nout_bytes = m.b_noutd ? (int64_t)kMaxSegs * 2 * m.D * 4 : 0;
+            /* #63 decoder parity windows (declare_video); D of the decoder is its own 2048.
+             * lat/x0 are bf16 shadows, blk/n/pix f32. */
+            const int64_t vdim = 2048, vpx = 3 * 4 * kScale * kScale;
+            d.dbg_vd_lat = m.b_vdl;
+            d.dbg_vd_lat_bytes = m.b_vdl ? (int64_t)kVdLat * kPatchVals * 2 : 0;
+            d.dbg_vd_x0 = m.b_vdx0;
+            d.dbg_vd_x0_bytes = m.b_vdx0 ? (int64_t)kVdWin * vdim * 2 : 0;
+            d.dbg_vd_blk = m.b_vdblk;
+            d.dbg_vd_blk_bytes = m.b_vdblk ? (int64_t)m.vit.size() * kVdWin * vdim * 4 : 0;
+            d.dbg_vd_n = m.b_vdn;
+            d.dbg_vd_n_bytes = m.b_vdn ? (int64_t)kVdN * vdim * 4 : 0;
+            d.dbg_vd_pix = m.b_vdpix;
+            d.dbg_vd_pix_bytes = m.b_vdpix ? (int64_t)kPeriod * vpx * 4 : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3907,6 +3985,15 @@ static void step_video(RadCtx* c, const RadBatch* batch, const Model& m) {
                 praw(V->geom_d + RAD_VGEOM_PATCH_FRAMES, RAD_I32, 3), brows(m.b_vox, vox));
     RAD_ISSUE_N(c, m.op_pqc, vox, brows(m.b_vox, vox), RAD_W(m.w_pqc), RAD_W(m.b_pqc), RAD_NONE,
                 brows(m.b_vox2, vox));
+    /* #63 parity: the latent rows unfold consumes (the decoder's whole input), cast into the pinned
+     * shadow before anything touches them. Row i of the slice is one patch of one decode frame. */
+    if (m.dit_dbg && V->chunk == 0) {
+        const int64_t ln = std::min((int64_t)kDecLat * ppf, (int64_t)kVdLat);
+        RAD_ISSUE_N(c, m.op_vdl, ln,
+                    brow_slice(m.b_vstate, lane * m.maxV + (int64_t)V->chunk * kLpc * ppf,
+                               ln, kPatchVals),
+                    brows(m.b_vdl, ln));
+    }
     RAD_ISSUE_N(c, m.op_vpin, vox, brows(m.b_vox2, vox), RAD_W(m.w_vpin2), RAD_W(m.b_vpin2),
                 RAD_NONE, brows(m.b_vpin, vox));
     RAD_ISSUE_N(c, m.op_tiles, nt * kPeriod, brows(m.b_vpin, vox), RAD_W(m.w_reg),
@@ -3917,8 +4004,17 @@ static void step_video(RadCtx* c, const RadBatch* batch, const Model& m) {
         const RadOperand pos = bcol(m.b_dpos, 0, R, 3);
         RAD_ISSUE_N(c, m.op_dpos, R, pos);
         RAD_ISSUE_N(c, m.op_dcu, mine + 1, brows(m.b_dcu, mine + 1));
+        const bool vdbg = m.dit_dbg && V->chunk == 0 && R >= kVdWin;
+        size_t vbl = 0;
+        if (vdbg)
+            RAD_ISSUE_N(c, m.op_vdx0, kVdWin, brow_slice(m.b_vx, a, kVdWin, dim),
+                        brows(m.b_vdx0, kVdWin));
         for (const VitBlock& B : m.vit) {
             RAD_ISSUE_N(c, B.op_n1, R, x, RAD_W(B.w_n1), brows(m.b_vn, R));
+            if (vdbg)
+                RAD_ISSUE_N(c, m.op_vdblk, kVdWin, brows(m.b_vn, kVdWin),
+                            brow_slice(m.b_vdblk, (int64_t)vbl * kVdWin, kVdWin, dim));
+            ++vbl;
             RAD_ISSUE_N(c, B.op_qkv, R, brows(m.b_vn, R), RAD_W(B.w_qkv), RAD_W(B.b_qkv), RAD_NONE,
                         brows(m.b_vqkv, R));
             RAD_ISSUE_N(c, B.op_qkr, R, brows(m.b_vqkv, R), pos, RAD_NONE, RAD_NONE);
@@ -3939,8 +4035,15 @@ static void step_video(RadCtx* c, const RadBatch* batch, const Model& m) {
             RAD_ISSUE_N(c, B.op_r2, R, x, brows(m.b_vt, R), x);
         }
         RAD_ISSUE_N(c, m.op_vnorm, R, x, RAD_W(m.w_vno), RAD_W(m.b_vno), brows(m.b_vn, R));
+        if (m.dit_dbg && V->chunk == 0 && R >= kVdN)
+            RAD_ISSUE_N(c, m.op_vdn, kVdN, brows(m.b_vn, kVdN), brows(m.b_vdn, kVdN));
         RAD_ISSUE_N(c, m.op_vproj, R, brows(m.b_vn, R), RAD_W(m.w_vpo), RAD_W(m.b_vpo), RAD_NONE,
                     brows(m.b_vpix, R));
+        /* Tile 0's pixels: on both TP ranks tile 0 is rank 0's first block, so the shadow's rows
+         * match the harness's tile-0 replay regardless of how the tiles split. */
+        if (m.dit_dbg && V->chunk == 0 && a == 0 && R >= kPeriod)
+            RAD_ISSUE_N(c, m.op_vdpix, kPeriod, brows(m.b_vpix, kPeriod),
+                        brows(m.b_vdpix, kPeriod));
     }
     rad_buf pix = m.b_vpix;
     if (m.W > 1) {

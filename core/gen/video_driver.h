@@ -238,6 +238,13 @@ private:
     bool                  dit_used_ = false;    /* the running pass staged a dump */
     int64_t               dit_rows_ = 0;        /* packed rows R of the dumped step */
 
+    /* Debug-only (#63, same env): the video-decoder parity chain (lat | x0 | blk | n | pix),
+     * appended to the same slab and read back on chunk 0's decode pass. Staged once per request. */
+    int64_t               dec_lat_b_ = 0, dec_x0_b_ = 0, dec_blk_b_ = 0, dec_n_b_ = 0,
+                          dec_pix_b_ = 0;
+    bool                  dec_used_ = false;
+    int64_t               dec_geom_[4] = {0, 0, 0, 0};  /* lat_h, lat_w, tiles, n_frames_out */
+
     std::vector<RadBatch>         out_;      /* one per rank */
     std::vector<RadVideoGenBatch> vout_;
     Pass                          pass_;

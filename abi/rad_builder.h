@@ -1059,6 +1059,27 @@ typedef struct RadVideoGenDecl {
     int64_t       dbg_dit_hn_bytes;
     rad_buf       dbg_dit_nout;    /* [1, 3 * 2 * D] f32: this step's norm_out shift/scale row */
     int64_t       dbg_dit_nout_bytes;
+    /* #63 video-decoder value parity: f32 PERSIST windows of the ViT decoder's chain, read with the
+     * same R4D_DIT_SEL as the DiT dump (the decoder has no step; chunk 0 of one request carries it).
+     * The decoder is the one stage never parity-harnessed, and a pinned keyframe frame renders fried,
+     * which convicts decode, not denoise. blk/n/pix are PERSIST f32 twins of bf16 sources (the
+     * widening cast); lat/x0 shadow f32 sources through the f32-bf16 narrowing cast (the only cast
+     * row that reads f32), so those two files are raw bf16 (read as uint16, viewed as bfloat16) --
+     * a few mantissa bits lost, far under the bf16 chain's own noise. lat is the latent window
+     * exactly as patch_unfold reads it, x0 the gathered stream before block 0, blk the norm1 output
+     * entering every block, n the final layernorm, pix tile 0's proj_out rows. The replay
+     * recomputes unfold / post_quant_conv / proj_in / the tile gather from the checkpoint before
+     * comparing block windows. */
+    rad_buf       dbg_vd_lat;      /* [2048, 96] bf16: latent source rows (2x2x4-frame each) */
+    int64_t       dbg_vd_lat_bytes;
+    rad_buf       dbg_vd_x0;       /* [64, 2048] bf16: gathered stream before block 0, this rank */
+    int64_t       dbg_vd_x0_bytes;
+    rad_buf       dbg_vd_blk;      /* [36, 64, 2048] bf16: norm1 output window entering every block */
+    int64_t       dbg_vd_blk_bytes;
+    rad_buf       dbg_vd_n;        /* [256, 2048] bf16: final layernorm output head */
+    int64_t       dbg_vd_n_bytes;
+    rad_buf       dbg_vd_pix;      /* [1797, 3072] bf16: proj_out pixels of the first tile */
+    int64_t       dbg_vd_pix_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

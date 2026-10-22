@@ -326,8 +326,16 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
             dit_blk_b_ = decl_.dbg_dit_blk_bytes;
             dit_hn_b_ = decl_.dbg_dit_hn_bytes;
             dit_nout_b_ = decl_.dbg_dit_nout_bytes;
+            /* #63: the decoder parity chain rides the same slab, appended after the DiT buffers.
+             * It lags none of them -- the decode pass readback happens in its own pass. */
+            dec_lat_b_ = decl_.dbg_vd_lat_bytes;
+            dec_x0_b_ = decl_.dbg_vd_x0_bytes;
+            dec_blk_b_ = decl_.dbg_vd_blk_bytes;
+            dec_n_b_ = decl_.dbg_vd_n_bytes;
+            dec_pix_b_ = decl_.dbg_vd_pix_bytes;
             const int64_t sum = dit_h0_b_ + dit_vel_b_ + dit_temb_b_ + dit_mod_b_ + dit_blk_b_
-                              + dit_hn_b_ + dit_nout_b_;
+                              + dit_hn_b_ + dit_nout_b_ + dec_lat_b_ + dec_x0_b_ + dec_blk_b_
+                              + dec_n_b_ + dec_pix_b_;
             dit_host_ = static_cast<char*>(rad_dev_alloc(sum, RAD_MEM_HOST_PINNED));
             dit_dbg_ = dit_host_ != nullptr;
             if (!dit_dbg_)
@@ -1269,6 +1277,24 @@ const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
     }
     const int64_t bytes = (int64_t)n * j.req->height * j.req->width * 3;
     rb_.assign(1, Readback{ decl_.frames_out, bytes, frames_host_ });
+    /* #63: the decoder fingerprint chain, staged once (chunk 0) after the frames readback. */
+    if (dit_dbg_ && dec_lat_b_ > 0 && j.chunk == 0) {
+        char* p = dit_host_ + dit_h0_b_ + dit_vel_b_ + dit_temb_b_ + dit_mod_b_ + dit_blk_b_
+                  + dit_hn_b_ + dit_nout_b_;
+        rb_.push_back(Readback{ decl_.dbg_vd_lat, dec_lat_b_, p });
+        p += dec_lat_b_;
+        rb_.push_back(Readback{ decl_.dbg_vd_x0, dec_x0_b_, p });
+        p += dec_x0_b_;
+        rb_.push_back(Readback{ decl_.dbg_vd_blk, dec_blk_b_, p });
+        p += dec_blk_b_;
+        rb_.push_back(Readback{ decl_.dbg_vd_n, dec_n_b_, p });
+        p += dec_n_b_;
+        rb_.push_back(Readback{ decl_.dbg_vd_pix, dec_pix_b_, p });
+        dec_geom_[0] = j.geom.lat_h;
+        dec_geom_[1] = j.geom.lat_w;
+        dec_geom_[2] = n;
+        dec_used_ = true;
+    }
     pass_.kind = RAD_GEN_PASS_VDECODE;
     pass_.job = j.id;
     pass_.n_frames = n;
@@ -1566,6 +1592,35 @@ int VideoDriver::done() {
         break;
     }
     case RAD_GEN_PASS_VDECODE: {
+        if (dec_used_) {
+            /* The chunk-0 decoder fingerprint (lat | x0 | blk | n | pix) to raw files for the CPU
+             * replay of comfy's ViT3DDecoder (R4D_ENC_DUMPDIR; #63). */
+            char* p = dit_host_ + dit_h0_b_ + dit_vel_b_ + dit_temb_b_ + dit_mod_b_ + dit_blk_b_
+                      + dit_hn_b_ + dit_nout_b_;
+            dit_dump_file("vdec_lat.bf16", p, (size_t)dec_lat_b_);
+            p += dec_lat_b_;
+            dit_dump_file("vdec_x0.bf16", p, (size_t)dec_x0_b_);
+            p += dec_x0_b_;
+            dit_dump_file("vdec_blk.f32", p, (size_t)dec_blk_b_);
+            p += dec_blk_b_;
+            dit_dump_file("vdec_n.f32", p, (size_t)dec_n_b_);
+            p += dec_n_b_;
+            dit_dump_file("vdec_pix.f32", p, (size_t)dec_pix_b_);
+            if (std::getenv("R4D_ENC_DUMPDIR")) {
+                const std::string path =
+                    std::string(std::getenv("R4D_ENC_DUMPDIR")) + "/vdec_info.txt";
+                if (std::FILE* f = std::fopen(path.c_str(), "w")) {
+                    std::fprintf(f, "lat_h %lld\nlat_w %lld\nn_frames %lld\nseed %llu\n",
+                                 (long long)dec_geom_[0], (long long)dec_geom_[1],
+                                 (long long)dec_geom_[2], (unsigned long long)j->req->seed);
+                    std::fclose(f);
+                }
+            }
+            RAD_ERR("vd_dbg: dumped decode of chunk 0 -- lat %lld x0 %lld blk %lld n %lld pix %lld",
+                    (long long)dec_lat_b_, (long long)dec_x0_b_, (long long)dec_blk_b_,
+                    (long long)dec_n_b_, (long long)dec_pix_b_);
+            dec_used_ = false;
+        }
         VideoEvent e;
         e.kind = VideoEvent::FRAMES;
         e.first = j->frames_out;
