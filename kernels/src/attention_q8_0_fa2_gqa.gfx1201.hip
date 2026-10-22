@@ -3381,6 +3381,9 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const int gmin = bounds[1];
     const int seq_len = gmax + 1;
     const bool qok_all = row_base + 383 < QR_GQA * run_rows;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    const bool wave_live = row_base + 16 * wave < QR_GQA * run_rows;
+#endif
 
     // Fill roles (dense H24; the A3B fill below has its own roles): waves
     // 0..11 load K (4 b64 wave-loads each), waves 12..23 load pre-transposed
@@ -3666,8 +3669,15 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
 #pragma unroll 1
         for (int sub = 0; sub < 3; ++sub) {
             const int kt_sub = ktile + sub * 16;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+            // A wave whose 16 rows all lie past the run's last query computes
+            // nothing that is stored; it still fills and joins the barriers.
+            if (kt_sub > gmax || !wave_live)
+                break;
+#else
             if (kt_sub > gmax)
                 break;
+#endif
             float8_t sacc =
                 (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             FA2_QR2_PRIO(3);
