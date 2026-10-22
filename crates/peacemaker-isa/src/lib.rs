@@ -80,6 +80,7 @@ pub mod kernels {
     pub mod qwen4_lane_rows;
     pub mod qwen4_lane_rows_mq6;
     pub mod qwen4_lane_rows_q8;
+    pub mod qwen4_moe_down_gp;
     pub mod qwen4_moe_sym;
     /// gfx11 (gfx1100, gfx1151) NT1 grouped symmetric IU4 MoE GEMMs; the E8P-I4 module is the gfx1151 Halo port (`--kernel qwen4_moe_sym_gfx11_e8p`).
     #[allow(dead_code, unused_imports)]

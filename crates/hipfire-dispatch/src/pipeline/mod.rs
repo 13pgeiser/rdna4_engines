@@ -7531,7 +7531,8 @@ fn prefill_expert_iu4_gate_up_stage(
 }
 
 /// BF16 grouped SwiGLU rows -> FWHT128/C2 A4 (compact flat-slot record) ->
-/// symmetric down into BF16 `y_down_grouped [grouped_rows, H]`.
+/// symmetric down into BF16 `y_down_grouped [grouped_rows, H]`. The PM producer writes the grouped-position plane the
+/// byte-identical `..._gp` down entry reads (`Gpu::qwen4_moe_rotate128_i4_gp`).
 fn prefill_expert_iu4_down_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
@@ -7550,7 +7551,7 @@ fn prefill_expert_iu4_down_stage(
         plan.hidden,
         "down rows",
     )?;
-    let xq = hip!(gpu.qwen4_moe_rotate128_i4(
+    let xq = hip!(gpu.qwen4_moe_rotate128_i4_gp(
         &h,
         p.sorted_slot_index,
         plan.intermediate,

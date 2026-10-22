@@ -10319,6 +10319,15 @@ pub const MOE_SLOT_OPS_V2_PM_GFX1201: &[u8] =
 pub const MOE_ROTATE_I4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/moe_rotate_i4_pm_gfx1201.hxaco");
 
+/// Certified PeaceMaker grouped-position down plane, gfx1201 (module `qwen4_moe_down_gp_pm_gfx1201`,
+/// `peacemaker-isa emit --kernel qwen4_moe_down_gp_pm --arch gfx1201`): the byte-identical twins
+/// `moe_rotate_i4_gp_pm_gfx1201` (the down A4 producer storing record `g * P + row`) and
+/// `qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4` / `_nt8` (the down entries reading record
+/// `g * m_total + 16 * tile + lane`). The incumbent bundles `moe_rotate_i4_pm_gfx1201` and
+/// `qwen4_moe_iu4_sym_pm_gfx1201` are untouched and remain the oracle anchors.
+pub const QWEN4_MOE_DOWN_GP_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco");
+
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
 /// Replaces the per-row `copy_d2d` loop in the FLUX.1 MMDiT single block's

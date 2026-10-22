@@ -468,6 +468,14 @@ fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// Grouped-position down plane (gfx1201): the grouped producer plus the down NT4/NT8 twins as one module.
+fn qwen4_moe_down_gp(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// The eight-columns-per-lane ordered BF16 grouped expert combine (gfx1201 only), a separate module from v1.
 fn moe_slot_ops_v2(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::moe_slot_ops::emit_module_v2(arch)?;
@@ -1382,6 +1390,7 @@ fn run() -> Result<(), String> {
         "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
         "ep_tile_mask_pm" => ep_tile_mask(arch)?,
         "moe_slot_ops_pm" => moe_slot_ops(arch)?,
+        "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
         "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
         "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
             peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,

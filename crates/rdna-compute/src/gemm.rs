@@ -48708,6 +48708,40 @@ const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
 const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
+/// Module key of the grouped-position down twins (`kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201`: the grouped
+/// producer `moe_rotate_i4_gp_pm_gfx1201` plus `qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt{4,8}`).
+pub(crate) const QWEN4_MOE_DOWN_GP_PM_MODULE: &str = "qwen4_moe_down_gp_pm_gfx1201";
+/// The entry a down launch runs: `func` itself, or with a grouped-position plane its `..._gp` twin
+/// (NT8 for the host-mapped width, NT4 otherwise).
+fn qwen4_moe_down_gp_entry(func: &'static str, grouped_plane: bool) -> &'static str {
+    match (grouped_plane, func.ends_with("_nt8")) {
+        (false, _) => func,
+        (true, true) => QWEN4_MOE_DOWN_GP_PM_ENTRIES[1],
+        (true, false) => QWEN4_MOE_DOWN_GP_PM_ENTRIES[0],
+    }
+}
+
+/// Module key and image holding the entry a down launch runs: the descriptor's own, or the
+/// grouped-position bundle for a grouped plane.
+fn qwen4_moe_down_gp_image(
+    kernel: &MoeSymIu4Kernel,
+    grouped_plane: bool,
+) -> (&'static str, &'static [u8]) {
+    if grouped_plane {
+        (
+            QWEN4_MOE_DOWN_GP_PM_MODULE,
+            kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
+        )
+    } else {
+        (kernel.module, kernel.image)
+    }
+}
+
+/// The grouped-position down entries `[nt4, nt8]` of [`QWEN4_MOE_DOWN_GP_PM_MODULE`].
+pub(crate) const QWEN4_MOE_DOWN_GP_PM_ENTRIES: [&str; 2] = [
+    "qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4",
+    "qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt8",
+];
 const QWEN4_MOE_SYM_CHECK_GFX1201_MODULE: &str = "qwen4_moe_sym_check_gfx1201";
 const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = [
     "qwen4_moe_iu4_sym_pm_gfx1151",
@@ -50240,6 +50274,18 @@ impl Gpu {
         })
     }
 
+    /// Whether the grouped-position down plane can be consumed here: exact gfx1201 with the builder
+    /// MQ4 descriptor's NT4/NT8 down entries selected (the `..._gp` twins are of those entries).
+    pub fn qwen4_moe_down_gp_available(&self) -> bool {
+        self.arch == "gfx1201"
+            && self.qwen4_moe_sym_kernel().is_some_and(|kernel| {
+                kernel.arch == "gfx1201"
+                    && kernel.tiles_per_cta[0] != 1
+                    && kernel.tiles_per_cta[1] != 1
+                    && moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM)
+            })
+    }
+
     /// Loads entry `func` of this arch's embedded builder module (the route's
     /// GEMMs and their 16-slot anchors, the descriptor's own image), for
     /// launch by name.
@@ -50436,7 +50482,13 @@ impl Gpu {
     ) -> HipResult<()> {
         let slots = max_rows.saturating_mul(k_top);
         let group = crate::scratch::qwen4_moe_group_layout(slots, experts).bytes;
-        let down = intermediate / 128 * slots * 72;
+        // The down sidecar holds either the flat-slot layout (`slots` records per K128 group) or the
+        // grouped-position plane (`grouped_rows` = slots + per-expert 16-row pad): size for the larger so
+        // the grouped producer never grows the scratch (and so never invalidates a capture) mid-prefill.
+        let plane_rows = crate::scratch::qwen4_grouped_rows_bound(slots, experts)
+            .unwrap_or(slots)
+            .max(slots);
+        let down = intermediate / 128 * plane_rows * 72;
         let gate = crate::scratch::int4_mmq_reserve_needed(hidden, max_rows);
         let scratch = &self.scratch;
         if crate::scratch::scratch_will_grow(
@@ -50458,7 +50510,7 @@ impl Gpu {
         self.scratch
             .reserve_qwen4_moe_group(&self.hip, slots, experts)?;
         self.scratch
-            .reserve_qwen4_moe_down_i4(&self.hip, intermediate, slots)?;
+            .reserve_qwen4_moe_down_i4_plane(&self.hip, intermediate, slots, plane_rows)?;
         self.scratch.reserve_int4_mmq(&self.hip, hidden, max_rows)?;
         Ok(())
     }
@@ -50928,7 +50980,24 @@ impl Gpu {
         k: usize,
         total_slots: usize,
     ) -> HipResult<crate::scratch::Int4MmqReservation> {
-        let needed = k / 128 * total_slots * 72;
+        self.reserve_qwen4_moe_down_i4_plane(k, total_slots, 0)
+    }
+
+    /// [`Self::reserve_qwen4_moe_down_i4_sidecar`] for the grouped-position plane
+    /// `[k/128, plane_rows]` (`plane_rows != 0`): the same scratch, grown through the same path.
+    pub(crate) fn reserve_qwen4_moe_down_i4_plane(
+        &mut self,
+        k: usize,
+        total_slots: usize,
+        plane_rows: usize,
+    ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        let needed = k / 128
+            * if plane_rows == 0 {
+                total_slots
+            } else {
+                plane_rows
+            }
+            * 72;
         if crate::scratch::scratch_will_grow(
             self.scratch.qwen4_moe_down_i4_scratch_bytes,
             self.scratch.qwen4_moe_down_i4_scratch.is_some(),
@@ -50937,7 +51006,7 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch
-            .reserve_qwen4_moe_down_i4(&self.hip, k, total_slots)
+            .reserve_qwen4_moe_down_i4_plane(&self.hip, k, total_slots, plane_rows)
     }
     /// The HIP incumbent of [`Gpu::qwen4_moe_rotate128_i4`] (`qwen4_moe_rotate128_i4` module,
     /// grid `[k/128 * grouped_rows, 1, 1]`): never selects the PM twin. The control of the
@@ -51077,6 +51146,7 @@ impl Gpu {
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
         self.qwen4_moe_sym_gemm(
             [false, host_mapped],
+            false,
             grouped_rows.div_ceil(16) as u32,
             [ptrs, tiles, sorted, y],
             xp,
@@ -51122,8 +51192,23 @@ impl Gpu {
         )?;
         let (generation, live) = self.scratch.qwen4_moe_down_i4_live();
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        // A grouped-position plane (written by `qwen4_moe_rotate128_i4_gp`) runs the byte-identical
+        // `..._gp` twin of the NT4/NT8 entry; its stride is the launch's own `grouped_rows`.
+        let grouped_plane = match xq.grouped_plane_rows() {
+            Some(rows) if rows == grouped_rows => true,
+            Some(rows) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "gemm_qwen4_moe_down_iu4_sym: grouped plane of {rows} rows, launch has {grouped_rows}"
+                    ),
+                ))
+            }
+            None => false,
+        };
         self.qwen4_moe_sym_gemm(
             [true, host_mapped],
+            grouped_plane,
             grouped_rows.div_ceil(16) as u32,
             [ptrs, tiles, sorted, y],
             xp,
@@ -51573,6 +51658,7 @@ impl Gpu {
     fn qwen4_moe_sym_gemm(
         &mut self,
         [down, host_mapped]: [bool; 2],
+        grouped_plane: bool,
         tiles_y: u32,
         [ptrs, tiles, sorted, y]: [&GpuTensor; 4],
         xp: *mut c_void,
@@ -51585,6 +51671,17 @@ impl Gpu {
         };
         let kernel = self.qwen4_moe_sym_require(what)?;
         let h = usize::from(host_mapped);
+        if grouped_plane
+            && (!down
+                || self.arch != "gfx1201"
+                || kernel.tiles_per_cta[h] == 1
+                || !moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM))
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_sym_gemm: the grouped-position plane needs the exact-gfx1201 PM NT4/NT8 down entry",
+            ));
+        }
         if kernel.tiles_per_cta[h] == 1 {
             self.qwen4_moe_sym_nt1_gemm(
                 [kernel.module, kernel.entries[h][usize::from(down)]],
@@ -51619,15 +51716,18 @@ impl Gpu {
                 moe_sym_iu4_symbols(kernel, *QWEN4_MOE_SYM_PM, rr, host_mapped)[usize::from(down)]
             });
         let block = kernel.block_threads[usize::from(down)];
+        // The grouped-position twin of the selected NT entry: same grid, ABI and bytes, its own bundle.
+        let func = qwen4_moe_down_gp_entry(func, grouped_plane);
         // The slot and Y-byte bounds belong to the builder entries; the incumbent hipcc entry
         // (pm == false) is not bound.
         let [mv, kv, dv, gv, sv] =
             moe_sym_iu4_extents(func, down, rr, pm.then_some(kernel.max_slots), dims)?;
         let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
         self.bind_thread()?;
+        let (module, image) = qwen4_moe_down_gp_image(kernel, grouped_plane);
         match (pm, kernel.hipcc_twin.as_ref()) {
             (false, Some(twin)) => self.ensure_kernel(twin.module, (twin.source)(), func)?,
-            _ => self.ensure_embedded_kernel(kernel.module, kernel.image, func)?,
+            _ => self.ensure_embedded_kernel(module, image, func)?,
         }
         let pp = ptrs.buf.as_ptr();
         let tp = tiles.buf.as_ptr();
