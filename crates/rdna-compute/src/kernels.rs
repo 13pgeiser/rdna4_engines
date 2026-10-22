@@ -4423,13 +4423,16 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// `_set_bf16_gfx12` in `kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip`, with that
 /// kernel's arguments `(A, Xq, Y, M, K, N)` (K1's hidden block counts follow).
 /// Entries `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) and
-/// `gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201` (BF16 bits), grid
-/// `[ceil(M/128), ceil(N/128), 1]`, block 256, dynamic LDS 36864 B. Preconditions:
+/// `gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201` (BF16 bits) on the 128x128 tile,
+/// grid `[ceil(M/128), ceil(N/128), 1]`, block 256, dynamic LDS 36864 B; and the
+/// 128x256 tile (the default launch) `..._set_gfx1201_t128x256` /
+/// `..._set_bf16_gfx1201_t128x256`, grid `[ceil(M/128), ceil(N/256), 1]`,
+/// block 512, dynamic LDS 55296 B (`gemm_mq6_i8::mq6_i8_pm_launch` picks). Preconditions:
 /// `K % 256 == 0`, `M % 4 == 0`, output and weight extents under 2^31 bytes
 /// (`gemm_mq6_i8::mq6_i8_pm_admits`).
 /// Default on exact gfx1201 where the launch meets those preconditions
 /// (`HIPFIRE_MQ6_I8_PM=0` keeps the hipcc kernel).
-/// SHA-256 4b505aac8c1380e99ead254cdc8ff48a71206fffd354a8265655c7c83bb0c3ab
+/// SHA-256 f1bb1300944f2410f8af0e02b71db7f2af3925438326e992f6897cb88fd45f27
 /// (`sha256sum kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco`).
 pub const GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco");

@@ -67,8 +67,9 @@ const PINNED_TILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// sha256 of the `emit_module` text (both banded product symbols).
-const PINNED_MODULE: &str = "ee29f4a2b680749d24e3552ba1613cd8445f6c5bec2158830fcc647705106d1c";
+/// sha256 of the `emit_module` text (the four banded product symbols: both epilogues on the
+/// shipped 128x128 tile, whose entry bytes are `PINNED`, and on 128x256, `PINNED_TILES`).
+const PINNED_MODULE: &str = "78a994bbe6362388ac98163ff4985c342fbda4adeeff75e677bc272ad2b0cc20";
 
 fn sha(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))

@@ -501,14 +501,14 @@ fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
     ))
 }
 /// gfx1201 exact-INT8 MQ6G256V2 prefill GEMM twin of the hipcc `gemm_mq6g256v2_mmq_i8` route:
-/// `--epi set|set_bf16` one entry, `all` (default) the two-entry module; `--tile
+/// `--epi set|set_bf16` one entry, `all` (default) the four-entry module (both epilogues on 128x128 and 128x256); `--tile
 /// 128x128|256x128|128x256` (default the shipped 128x128; a single entry only).
 fn mq6_i8_gemm(epi: &str, tile: Option<&str>, arch: Arch) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, Spec, Tile};
     let tile: Tile = tile.unwrap_or("128x128").parse()?;
     if epi == "all" {
         if tile != Tile::T128x128 {
-            return Err("mq6_i8_gemm --tile: the product module is the shipped 128x128 tile; name one --epi".into());
+            return Err("mq6_i8_gemm --tile: the product module holds both tiles; name one --epi".into());
         }
         let (_, text, proof) = mq6_i8_gemm::emit_module(arch)?;
         return Ok((

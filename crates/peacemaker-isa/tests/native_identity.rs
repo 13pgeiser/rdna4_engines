@@ -205,15 +205,17 @@ fn corpus() -> Vec<Unit> {
         if let Ok((_, text, proof)) = qwen4_mq6_x4::emit_module(arch) {
             module(&mut units, proof.module, arch, text)
         }
-        // Exact-INT8 MQ6 prefill GEMM (gfx1201 only): the two entries and their module.
-        for epi in [mq6_i8_gemm::Epi::Set, mq6_i8_gemm::Epi::SetBf16] {
-            if let Ok(e) = mq6_i8_gemm::emit(mq6_i8_gemm::Spec {
-                epi,
-                raster: mq6_i8_gemm::Raster::Banded,
-                tile: mq6_i8_gemm::Tile::T128x128,
-                arch,
-            }) {
-                single(&mut units, e)
+        // Exact-INT8 MQ6 prefill GEMM (gfx1201 only): the four entries and their module.
+        for tile in [mq6_i8_gemm::Tile::T128x128, mq6_i8_gemm::Tile::T128x256] {
+            for epi in [mq6_i8_gemm::Epi::Set, mq6_i8_gemm::Epi::SetBf16] {
+                if let Ok(e) = mq6_i8_gemm::emit(mq6_i8_gemm::Spec {
+                    epi,
+                    raster: mq6_i8_gemm::Raster::Banded,
+                    tile,
+                    arch,
+                }) {
+                    single(&mut units, e)
+                }
             }
         }
         if let Ok((_, text, proof)) = mq6_i8_gemm::emit_module(arch) {
@@ -290,7 +292,7 @@ fn corpus() -> Vec<Unit> {
                 module(&mut units, proof.module, arch, text)
             }
         }
-        // E8P-I4 pointer-addressed F4 read-once C8 lane-union decode GEMV (gfx1201, gfx1100, gfx1151): the two entries and their module.
+        // E8P-I4 pointer-addressed F4 read-once C8 lane-union decode GEMV (gfx1201, gfx1100, gfx1151): the four entries and their module.
         for spec in e8p_i4_moe_gemv::module_specs(arch) {
             if let Ok(e) = e8p_i4_moe_gemv::emit(spec) {
                 single(&mut units, e)

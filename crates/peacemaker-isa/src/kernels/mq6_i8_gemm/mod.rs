@@ -539,7 +539,13 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
             return Err("kernels disagree on target header".into());
         }
         bodies.push_str(".text\n");
-        let tag = e.proof.variant.rsplit('-').next().unwrap_or("k");
+        // The shipped tile keeps its historical label tag (`set` / `set_bf16`), so its bytes do
+        // not move; other tiles are tagged with the whole variant name.
+        let tag = if e.proof.variant.starts_with("128x128x8-") {
+            e.proof.variant.rsplit('-').next().unwrap_or("k").to_owned()
+        } else {
+            e.proof.variant.replace('-', "_")
+        };
         bodies.push_str(&body.replace(".Lmq6i8_", &format!(".Lmq6i8_{tag}_")));
         let (_, list) = meta
             .split_once("amdhsa.kernels:\n")
@@ -562,15 +568,17 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
     Ok((text, proof))
 }
 
-/// The product module: both epilogue symbols (banded raster).
+/// The product module: both epilogue symbols (banded raster) on the shipped 128x128 tile (the
+/// unsuffixed symbols) and on the 128x256 tile (`_t128x256`, the host's default for wide N).
 pub fn emit_module(arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
-    let emitted = [Epi::Set, Epi::SetBf16]
+    let emitted = [spec::Tile::T128x128, spec::Tile::T128x256]
         .into_iter()
-        .map(|epi| {
+        .flat_map(|tile| [Epi::Set, Epi::SetBf16].map(|epi| (tile, epi)))
+        .map(|(tile, epi)| {
             emit(Spec {
                 epi,
                 raster: Raster::Banded,
-                tile: spec::Tile::T128x128,
+                tile,
                 arch,
             })
         })
