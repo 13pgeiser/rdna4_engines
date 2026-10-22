@@ -530,6 +530,7 @@
 - **Developer tooling: `scripts/qwen2-reset-gate.sh` now drives the daemon attempt/commit protocol, so every reset+generate cycle is a committed turn.** Each reset and generate carries a distinct nonzero `attempt_id`, each turn answers the daemon's `commit_ready` with the matching `commit` before `done`, and the gate requires all cycles committed: a rolled-back turn rewinds `next_pos` by itself and would hide a reset no-op as a false pass. Developer regression gate only; engine behavior and defaults are unchanged.
 
 - **Fixed:** fused SwiGLU IU4 launchers now honor explicit reference-eight candidate selection, including AWQ. The compiled quantization mode remains the default.
+- The CPU interpreter registers the existing gfx12 E32 unsigned-equality, unordered float-comparison and conditional-mask forms with their established handlers, preserving VCC, operand ordering and NaN behavior. This repairs the actual BF16 C1 oracle-constructor refusal without changing opcode arithmetic, reference values or hardware qualification.
 
 ## v0.4.2 — 2026-10-14
 
