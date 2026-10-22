@@ -1755,6 +1755,190 @@ pub(crate) fn bind_routed_view<'a, R>(
     selected.map_or(bound, view)
 }
 
+/// The runtime one gathered EP lane MoE invocation binds: exactly the
+/// singleton's selection for a 1..=[`QWEN4_EP_GATHER_MAX_ROWS`]-row gathered
+/// forward (`full_chunk = false`, no tile route): the layer's balanced live
+/// runtime, else the static runtime; never the EP full table. Outside EP
+/// (`balanced_live` and `ep_full` absent) it is the static runtime.
+pub(crate) fn select_ep_lane_moe<'a, R>(
+    balanced_live: Option<&'a R>,
+    ep_full: Option<Option<&'a R>>,
+    static_moe: Option<&'a R>,
+) -> Option<&'a R> {
+    select_layer_moe(balanced_live, ep_full, false, false, static_moe)
+}
+
+/// Whether a gathered EP MoE call of `rows` rows binds a separate
+/// shared-down output: the singleton's few-row forward (`rows >= 2`) does, its
+/// one-row decode does not.
+pub(crate) const fn ep_lane_shared_down(rows: usize) -> bool {
+    rows >= 2
+}
+
+/// A lane MoE invocation under EP runs the singleton's gathered forward: its
+/// real rows are its routing rows, at most [`QWEN4_EP_GATHER_MAX_ROWS`]. Wider
+/// or re-routed calls would be the full-table chunk route, which a lane step
+/// does not run.
+pub(crate) fn ep_lane_moe_rows(rows: usize, route_rows: usize) -> Result<(), Qwen4GpuForwardError> {
+    if rows == 0 {
+        return Err(invalid(
+            "an EP lane MoE invocation carries at least one row",
+        ));
+    }
+    if rows > QWEN4_EP_GATHER_MAX_ROWS {
+        return Err(invalid(format!(
+            "an EP lane MoE invocation of {rows} rows exceeds the {QWEN4_EP_GATHER_MAX_ROWS}-row gather cap"
+        )));
+    }
+    if route_rows != rows {
+        return Err(invalid(format!(
+            "an EP lane MoE invocation of {rows} rows routes {route_rows} rows; the gathered forward needs them equal"
+        )));
+    }
+    Ok(())
+}
+
+/// The gather buffer (`0` or `1`, the trunk buffers) of the `ordinal`-th MoE
+/// invocation of a lane step, counted over the whole step in emission order.
+/// Consecutive invocations never share a buffer (`ep_row_gather` hazard rule),
+/// whatever the lane/layer interleaving.
+pub(crate) const fn ep_lane_buffer(ordinal: usize) -> usize {
+    ordinal % 2
+}
+
+/// A step's MoE invocation count must be even so the next step's first
+/// invocation (ordinal 0, buffer 0) never repeats this step's last buffer.
+pub(crate) fn ep_lane_check_invocations(invocations: usize) -> Result<(), Qwen4GpuForwardError> {
+    if invocations % 2 != 0 {
+        return Err(invalid(format!(
+            "an EP lane step emitted {invocations} MoE invocations; an odd count would reuse a gather buffer across consecutive steps"
+        )));
+    }
+    Ok(())
+}
+
+/// Install the singleton's gathered-forward EP binding on one lane MoE
+/// binding: the row gather, and for `rows >= 2` the singleton scratch's
+/// `moe_down_expanded` as the unfused shared-down output.
+pub(crate) fn bind_ep_lane_gather<'a>(
+    binding: &mut Qwen4MoeBinding<'a>,
+    rows: usize,
+    gather: &'a dyn MoeRowGather,
+    shared_down: &'a GpuTensor,
+) {
+    binding.row_gather = Some(gather);
+    if ep_lane_shared_down(rows) {
+        binding.shared_down_out = Some(shared_down);
+    }
+}
+
+/// What a lane step borrows from an EP forward: the installed row gather, the
+/// two trunk gather buffers the step alternates over, and the singleton
+/// scratch's `moe_down_expanded` (the shared-down output of few-row calls).
+pub(crate) struct Qwen4EpLane<'a> {
+    pub(crate) gather: &'a dyn MoeRowGather,
+    pub(crate) buffers: [&'a GpuTensor; 2],
+    pub(crate) shared_down: &'a GpuTensor,
+}
+
+/// The runtime a lane MoE invocation of `layer` binds (see
+/// [`select_ep_lane_moe`]); the static runtime outside EP. Takes the forward's
+/// `ep` and `moe` fields (`fwd.ep.as_ref()`, `&fwd.moe`) rather than the whole
+/// forward, so the lane step can keep the result alive while it mutably uses
+/// other fields.
+pub(crate) fn lane_layer_moe<'a>(
+    ep: Option<&'a Qwen4ForwardEp>,
+    moe: &'a [Option<Qwen4MoeLayerRuntime>],
+    layer: usize,
+) -> Option<&'a Qwen4MoeLayerRuntime> {
+    let balanced_live = ep
+        .and_then(|ep| ep.balanced.get(layer))
+        .and_then(Option::as_ref)
+        .map(|balanced| &balanced.live);
+    select_ep_lane_moe(
+        balanced_live,
+        ep.map(|ep| ep.moe_full.get(layer)),
+        moe.get(layer).and_then(Option::as_ref),
+    )
+}
+
+/// How an EP lane step binds one layer's routed experts (see
+/// [`Qwen4GpuForward::lane_ep_expert_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpLaneExpertKind {
+    /// The static EP decode runtime over a fully resident packed aggregate.
+    StaticResidentPacked,
+    /// The live balanced-ownership runtime over a host-mapped packed aggregate.
+    BalancedHostMappedPacked,
+}
+
+/// What [`classify_ep_lane_expert`] needs of one layer's [`Qwen4MoeLayerRuntime`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpLaneRuntimeFacts {
+    /// The runtime's layer label.
+    label: usize,
+    host_mapped: bool,
+    /// Non-empty expert views, every one QT44 gate/up + QT53 down.
+    packed_mq4: bool,
+    /// No CPU-deferred/split/cold owner, tier, slab, stock FP8 or keep mask.
+    plain: bool,
+}
+
+/// Classify one EP layer's lane expert binding from plain facts: the row gather
+/// is installed, `selected` (what [`lane_layer_moe`] picked; `balanced_selected`
+/// when that is the layer's live balanced runtime) and the layer's `static_moe`
+/// runtime are both labelled for `layer` and plain packed QT44/QT53, and the
+/// residency agrees with the selection: a live balanced runtime over a
+/// host-mapped layer, else the static runtime over a resident layer. Anything
+/// else (a host-mapped layer without a live balanced runtime, a balanced
+/// selection over a resident layer, a missing runtime) is `None`.
+fn classify_ep_lane_expert(
+    layer: usize,
+    gather_installed: bool,
+    balanced_selected: bool,
+    selected: Option<EpLaneRuntimeFacts>,
+    static_moe: Option<EpLaneRuntimeFacts>,
+) -> Option<EpLaneExpertKind> {
+    if !gather_installed {
+        return None;
+    }
+    let (selected, static_moe) = (selected?, static_moe?);
+    for runtime in [selected, static_moe] {
+        if runtime.label != layer || !runtime.packed_mq4 || !runtime.plain {
+            return None;
+        }
+    }
+    match (
+        balanced_selected,
+        selected.host_mapped,
+        static_moe.host_mapped,
+    ) {
+        (true, true, true) => Some(EpLaneExpertKind::BalancedHostMappedPacked),
+        (false, false, false) => Some(EpLaneExpertKind::StaticResidentPacked),
+        _ => None,
+    }
+}
+
+/// The EP lane resources from the forward's `ep` and `scratch` fields
+/// (`fwd.ep.as_ref()`, `&fwd.scratch`): `None` outside EP, an error under EP
+/// before `attach_ep` installed the row gather.
+pub(crate) fn ep_lane<'a>(
+    ep: Option<&'a Qwen4ForwardEp>,
+    scratch: &'a Qwen4GpuForwardScratch,
+) -> Result<Option<Qwen4EpLane<'a>>, Qwen4GpuForwardError> {
+    let Some(ep) = ep else {
+        return Ok(None);
+    };
+    let gather = ep
+        .gather
+        .as_deref()
+        .ok_or_else(|| invalid("EP lane step before attach_ep: the row gather is not installed"))?;
+    Ok(Some(Qwen4EpLane {
+        gather: gather as &dyn MoeRowGather,
+        buffers: [&ep.buffers[0], &ep.buffers[1]],
+        shared_down: &scratch.moe_down_expanded,
+    }))
+}
 /// Whether a layer's D2 executor is bound for one MoE call: always when no
 /// executor is attached (nothing to withhold), otherwise only in a non-prefill
 /// phase (decode, verify; `d2_phase`) **and** for a window of at most the
@@ -2551,7 +2735,7 @@ pub(crate) struct Qwen4BalancedPlan {
 
 /// Expert-parallel state of one rank's forward (present iff the bundle's
 /// weights carry an EP placement).
-struct Qwen4ForwardEp {
+pub(crate) struct Qwen4ForwardEp {
     placement: Qwen4EpPlacement,
     dummy: Qwen4EpDummyExpert,
     /// Per-layer full (P2P) tables for chunk forwards; empty until
@@ -4164,6 +4348,24 @@ impl Qwen4MoeLayerRuntime {
                 Qwen4GpuForwardError::Dispatch(format!("retained route identity: {error:?}"))
             })?;
         Ok(self)
+    }
+
+    /// The plain facts [`classify_ep_lane_expert`] reads of this runtime.
+    fn ep_lane_facts(&self) -> EpLaneRuntimeFacts {
+        EpLaneRuntimeFacts {
+            label: self.label,
+            host_mapped: self.host_mapped,
+            packed_mq4: !self.experts.is_empty() && self.qt44_qt53_formats(),
+            plain: !self.cpu_deferred_experts
+                && self.cpu_expert_owners.is_none()
+                && self.cpu_cold_owners.is_none()
+                && self.cpu_split.is_none()
+                && self.tier.is_none()
+                && self.tier_identity.is_none()
+                && self.slab.is_none()
+                && !self.fp8
+                && self.expert_keep_mask.is_none(),
+        }
     }
 
     /// Every routed expert is the QT44 gate/up + QT53 down pair (`MQ4G256V2`/`MQ4G128V2`) the
@@ -5936,18 +6138,20 @@ impl Qwen4GpuForwardScratch {
                 }
                 Ok(())
             };
-            bind(
-                F::Projection,
-                Some(max_projection),
-                max_projection,
-                &[F::HcNormalized, F::PleQuery],
-            )?;
-            bind(
-                F::Projection2,
-                Some(max_projection),
-                max_projection,
-                &[F::HcUp, F::PleKey],
-            )?;
+            // The grouped GDN producers write `rows * gdn_qkv` packed values
+            // while the per-lane cores address `begin * pitch`, so the owner
+            // pitch must equal the actual qkv width.  Only the equal-width
+            // geometry is bound (capacity stays `max_projection`); any other
+            // leaves both sets dedicated.
+            if gdn_qkv == wide {
+                bind(
+                    F::Projection,
+                    Some(wide),
+                    wide,
+                    &[F::HcNormalized, F::PleQuery],
+                )?;
+                bind(F::Projection2, Some(wide), wide, &[F::HcUp, F::PleKey])?;
+            }
             bind(
                 F::Rotation,
                 Some(max_rotation),
@@ -6308,9 +6512,10 @@ impl Qwen4GpuForwardScratch {
         logical_width: usize,
     ) -> Result<GpuTensor, Qwen4GpuForwardError> {
         let tensor = self.field_tensor(field);
-        let numel = tensor.numel();
-        match self.slots[field as usize].pitch {
+        let slot = self.slots[field as usize];
+        match slot.pitch {
             None => {
+                let numel = tensor.numel();
                 let offset = scratch_mul(begin, logical_width)?;
                 if offset > numel {
                     return Err(invalid("lane row view starts past its scratch tensor"));
@@ -6318,8 +6523,13 @@ impl Qwen4GpuForwardScratch {
                 Ok(tensor.sub_offset(offset, numel - offset))
             }
             Some(pitch) => {
-                let (offset, len) = owner_pitch_extent(pitch, numel, begin, rows, logical_width)?;
-                Ok(tensor.sub_offset(offset, len))
+                // The pitched reservation is bounded by the allocation that
+                // actually holds it: a borrowed view's own logical element
+                // count can be narrower than `rows * pitch`.
+                let storage = self.field_tensor(slot.owner.unwrap_or(field));
+                let (offset, len) =
+                    owner_pitch_extent(pitch, storage.numel(), begin, rows, logical_width)?;
+                Ok(storage.sub_offset(offset, len))
             }
         }
     }
@@ -7060,7 +7270,7 @@ pub struct Qwen4GpuForward {
     /// forwards, the row-gather buffers and the installed gather. Under EP
     /// `moe` holds the per-layer decode tables, there is no G2 expert stage,
     /// and no forward records or replays a retained body.
-    ep: Option<Qwen4ForwardEp>,
+    pub(crate) ep: Option<Qwen4ForwardEp>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
     /// single-token forwards (gfx1151). Batch-1 decode streams every weight
@@ -7112,6 +7322,9 @@ pub struct Qwen4GpuForward {
     mesh_next_op: Option<u32>,
     /// Fenced async upload of a mesh input band's token ids.
     mesh_tokens: PleHostStage,
+    /// Pinned, fenced ring for the lane forward's token ids (the active-stream
+    /// asynchronous upload; capture keeps the blocking `host_token_bytes` copy).
+    pub(crate) lane_tokens: crate::lane_token_ring::LaneTokenRing,
     /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
     mesh_trunk_ops: std::ops::Range<u32>,
     /// S1 slow-link layer-major prefill state: the admitted profile and, once
@@ -8451,6 +8664,9 @@ impl Qwen4GpuForward {
             mesh_segment: None,
             mesh_next_op: None,
             mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
+            lane_tokens: crate::lane_token_ring::LaneTokenRing::new(
+                max_chunk * std::mem::size_of::<i32>(),
+            ),
             mesh_trunk_ops,
             slowlink: Default::default(),
             #[cfg(target_os = "linux")]
@@ -8608,6 +8824,28 @@ impl Qwen4GpuForward {
     /// This rank's expert-parallel placement, `None` on the single-device route.
     pub(crate) fn ep_placement(&self) -> Option<Qwen4EpPlacement> {
         self.ep.as_ref().map(|ep| ep.placement)
+    }
+
+    /// How `layer`'s routed experts are bound by an EP lane step, `None` unless
+    /// positively one of the two proven packed MQ4 (QT44/QT53) kinds: the
+    /// layer's static resident runtime, or its live balanced runtime over a
+    /// host-mapped trunk layer. Read-only and allocation-free: it inspects the
+    /// runtime [`lane_layer_moe`] selects (the one selector the lane step
+    /// binds), the installed row gather and the runtimes' plain flags.
+    pub(crate) fn lane_ep_expert_kind(&self, layer: usize) -> Option<EpLaneExpertKind> {
+        let ep = self.ep.as_ref()?;
+        let selected = lane_layer_moe(Some(ep), &self.moe, layer)?;
+        let balanced_selected = ep.balanced.get(layer).and_then(Option::as_ref).is_some();
+        classify_ep_lane_expert(
+            layer,
+            ep.gather.is_some(),
+            balanced_selected,
+            Some(selected.ep_lane_facts()),
+            self.moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .map(Qwen4MoeLayerRuntime::ep_lane_facts),
+        )
     }
 
     /// Device pointers of this rank's compact routed-expert tensors, one per
@@ -9099,6 +9337,7 @@ impl Qwen4GpuForward {
             scratch,
             host_ple,
             mesh_tokens,
+            lane_tokens,
             moe,
             expert_stage,
             ep,
@@ -9131,6 +9370,9 @@ impl Qwen4GpuForward {
             ));
         }
         if let Some(error) = mesh_tokens.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        if let Some(error) = lane_tokens.free_gpu(gpu) {
             first.get_or_insert(error);
         }
         #[cfg(target_os = "linux")]
@@ -12120,6 +12362,68 @@ mod ep_table_tests {
         }
     }
 
+    fn ep_runtime(label: usize, host_mapped: bool) -> super::EpLaneRuntimeFacts {
+        super::EpLaneRuntimeFacts {
+            label,
+            host_mapped,
+            packed_mq4: true,
+            plain: true,
+        }
+    }
+
+    #[test]
+    fn ep_lane_expert_kind_is_static_or_balanced_from_the_selected_runtime() {
+        use super::EpLaneExpertKind::{BalancedHostMappedPacked, StaticResidentPacked};
+        let kind = super::classify_ep_lane_expert;
+        // Resident trunk layer: the static runtime, no balanced live runtime.
+        let resident = Some(ep_runtime(3, false));
+        assert_eq!(
+            kind(3, true, false, resident, resident),
+            Some(StaticResidentPacked)
+        );
+        // Host-mapped trunk layer with its live balanced runtime selected.
+        let mapped = Some(ep_runtime(3, true));
+        assert_eq!(
+            kind(3, true, true, mapped, mapped),
+            Some(BalancedHostMappedPacked)
+        );
+    }
+
+    #[test]
+    fn ep_lane_expert_kind_refuses_every_unproven_binding() {
+        let kind = super::classify_ep_lane_expert;
+        let resident = Some(ep_runtime(3, false));
+        let mapped = Some(ep_runtime(3, true));
+        // The row gather is not installed.
+        assert_eq!(kind(3, false, false, resident, resident), None);
+        assert_eq!(kind(3, false, true, mapped, mapped), None);
+        // No selected or no static runtime.
+        assert_eq!(kind(3, true, false, None, resident), None);
+        assert_eq!(kind(3, true, false, resident, None), None);
+        // A balanced selection must be a host-mapped layer, and a host-mapped
+        // layer without a live balanced runtime is not static-resident.
+        assert_eq!(kind(3, true, true, resident, resident), None);
+        assert_eq!(kind(3, true, false, mapped, mapped), None);
+        // The balanced layer's static runtime must be the host-mapped one.
+        assert_eq!(kind(3, true, true, mapped, resident), None);
+        // A runtime labelled for another layer (a balanced table indexed by
+        // MoE ordinal selects a neighbour's live runtime).
+        let other = Some(ep_runtime(4, false));
+        assert_eq!(kind(3, true, false, other, other), None);
+        assert_eq!(kind(3, true, false, other, resident), None);
+        // Not QT44/QT53 for every expert view, or any CPU/tier/slab/FP8/keep-mask state.
+        for (packed_mq4, plain) in [(false, true), (true, false), (false, false)] {
+            let bad = Some(super::EpLaneRuntimeFacts {
+                packed_mq4,
+                plain,
+                ..ep_runtime(3, false)
+            });
+            assert_eq!(kind(3, true, false, bad, bad), None);
+            assert_eq!(kind(3, true, false, bad, resident), None);
+            assert_eq!(kind(3, true, false, resident, bad), None);
+        }
+    }
+
     fn peers(ranks: usize) -> Vec<Qwen4PeerExpertSource> {
         (0..ranks)
             .map(|rank| {
@@ -13164,11 +13468,15 @@ mod tests {
         }
         // Alias-set members share the owner's row pitch.
         let pitch = |field: F| compact[field as usize].pitch;
-        for field in [F::Projection, F::HcNormalized, F::PleQuery] {
-            assert_eq!(pitch(field), Some(12_288), "{field:?}");
-        }
-        for field in [F::Projection2, F::HcUp, F::PleKey] {
-            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        for field in [
+            F::Projection,
+            F::HcNormalized,
+            F::PleQuery,
+            F::Projection2,
+            F::HcUp,
+            F::PleKey,
+        ] {
+            assert_eq!(pitch(field), Some(10_240), "{field:?}");
         }
         for field in [F::QsaQgate, F::GdnRecurrentOutput] {
             assert_eq!(pitch(field), Some(12_288), "{field:?}");
@@ -13181,6 +13489,196 @@ mod tests {
         }
         assert_eq!(pitch(F::MoeYDownGrouped), None);
         assert_eq!(pitch(F::PleNormed), None);
+    }
+
+    /// One grouped-GDN invocation set, host-simulated: the grouped producers
+    /// write `group` packed rows of `qkv` elements into the segment view of
+    /// an alias-set owner (`pitch` per owner row), then the per-lane core
+    /// reads row `begin + i` through the per-lane view (`begin + i` at the
+    /// owner pitch) and continues with an aliased `wide`-wide write of its
+    /// own row (the HC normalise / up-projection).  `Err(i)` is the first
+    /// group-relative row whose packed qkv values were not where the lane
+    /// read them.  Two microbatches are produced before either is consumed
+    /// so a continuation write that strays into a later row is observed.
+    fn simulate_grouped_gdn_rows(
+        pitch: usize,
+        qkv: usize,
+        wide: usize,
+        begin: usize,
+        group: usize,
+    ) -> Result<(), usize> {
+        let numel = 64 * pitch;
+        let mut owner = vec![0u32; numel];
+        let tag = |row: usize, col: usize| 0x1000_0000u32 | ((row as u32) << 14) | col as u32;
+        let microbatches = [begin, begin + group];
+        // Producers: packed contiguous rows at the segment base.
+        for &first in &microbatches {
+            let (offset, _) = owner_pitch_extent(pitch, numel, first, group, qkv).unwrap();
+            for i in 0..group {
+                for c in 0..qkv {
+                    owner[offset + i * qkv + c] = tag(first + i, c);
+                }
+            }
+        }
+        // Consumers: per-lane core read, then the aliased HC continuation.
+        for &first in &microbatches {
+            let (group_base, _) = owner_pitch_extent(pitch, numel, first, group, qkv).unwrap();
+            for i in 0..group {
+                let (lane_base, _) = owner_pitch_extent(pitch, numel, first + i, 1, qkv).unwrap();
+                if lane_base != group_base + i * qkv
+                    || (0..qkv).any(|c| owner[lane_base + c] != tag(first + i, c))
+                {
+                    return Err(i);
+                }
+                let (hc_base, _) = owner_pitch_extent(pitch, numel, first + i, 1, wide).unwrap();
+                for c in 0..wide {
+                    owner[hc_base + c] = 0xF000_0000u32 | ((first + i) as u32);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_gdn_qkv_rows_survive_the_compact_row_pitch() {
+        let config = fn_config();
+        let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let wide = config.hidden_size * config.hc_count;
+        assert_eq!(qkv, wide);
+        let compact = plan(32, Mode::FnSymGfx1201);
+        for (owner, views) in [
+            (F::Projection, [F::HcNormalized, F::PleQuery]),
+            (F::Projection2, [F::HcUp, F::PleKey]),
+        ] {
+            let pitch = compact[owner as usize].pitch.expect("owner pitch");
+            assert_eq!(pitch, qkv);
+            for view in views {
+                assert_eq!(compact[view as usize].owner, Some(owner));
+                assert_eq!(compact[view as usize].pitch, Some(pitch));
+            }
+            for group in 1..=8usize {
+                for begin in [0usize, 1, 3, 9] {
+                    assert_eq!(
+                        simulate_grouped_gdn_rows(pitch, qkv, wide, begin, group),
+                        Ok(()),
+                        "{owner:?} group {group} begin {begin}"
+                    );
+                }
+            }
+        }
+        // Negative control: the retired owner pitch (the capacity's maximum
+        // width, 12288) strands every row after the first of a group, so the
+        // odd group row is the first the lane fails to find.
+        for group in 1..=8usize {
+            for begin in [0usize, 1, 3, 9] {
+                let result = simulate_grouped_gdn_rows(12_288, qkv, wide, begin, group);
+                if group == 1 {
+                    assert_eq!(result, Ok(()), "group 1 begin {begin}");
+                } else {
+                    assert_eq!(result, Err(1), "group {group} begin {begin}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unequal_gdn_width_leaves_the_projection_alias_sets_dedicated() {
+        let mut config = fn_config();
+        config.linear_num_key_heads = 12;
+        let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        assert_ne!(qkv, config.hidden_size * config.hc_count);
+        let rows = 32usize;
+        let full = Scratch::plan(&config, rows, Mode::Full).unwrap().0;
+        let compact = Scratch::plan(&config, rows, Mode::FnSymGfx1201).unwrap().0;
+        for field in [
+            F::Projection,
+            F::HcNormalized,
+            F::PleQuery,
+            F::Projection2,
+            F::HcUp,
+            F::PleKey,
+        ] {
+            let slot = compact[field as usize];
+            assert_eq!(slot.owner, None, "{field:?}");
+            assert_eq!(slot.pitch, None, "{field:?}");
+            assert_eq!(slot.elements, full[field as usize].elements, "{field:?}");
+        }
+        // The other compact alias sets are unchanged.
+        let pitch = |field: F| compact[field as usize].pitch;
+        let owner = |field: F| compact[field as usize].owner;
+        assert_eq!(owner(F::PleGated), Some(F::Rotation));
+        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
+        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
+        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
+        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::Rotation, F::PleGated, F::PleOutput] {
+            assert_eq!(pitch(field), Some(10_240), "{field:?}");
+        }
+        for field in [F::MoeSharedOutput, F::PleValue] {
+            assert_eq!(pitch(field), Some(2_560), "{field:?}");
+        }
+        assert_eq!(pitch(F::MoeYDownGrouped), None);
+        assert_eq!(
+            compact.iter().filter(|slot| slot.owner.is_some()).count(),
+            4
+        );
+        // Accounting: only owners are charged, every view still fits inside
+        // its owner, and the estimator agrees with the plan.
+        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
+            let owner = compact[slot.owner.unwrap() as usize];
+            assert!(owner.owner.is_none());
+            assert_eq!(owner.dtype, slot.dtype);
+            assert!(slot.elements <= owner.elements);
+        }
+        assert_eq!(
+            owned_bytes(&compact),
+            Scratch::device_bytes(&config, rows, Mode::FnSymGfx1201).unwrap()
+        );
+        assert!(owned_bytes(&compact) < owned_bytes(&full));
+    }
+
+    #[test]
+    fn pitched_segments_are_bounded_by_the_actual_owner_allocation() {
+        // `segment_view` resolves a view's storage to its owner: a view whose
+        // logical element count is narrower than `rows * pitch` (the 6144-wide
+        // GDN recurrent output at pitch 12288) still fits whole and at its
+        // last lane inside the owner's allocation.
+        let rows = 8usize;
+        let config = fn_config();
+        let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let compact = plan(rows, Mode::FnSymGfx1201);
+        let mut checked = 0;
+        for (index, slot) in compact.iter().enumerate() {
+            let Some(pitch) = slot.pitch else { continue };
+            let storage = slot.owner.map_or(*slot, |owner| compact[owner as usize]);
+            assert!(storage.owner.is_none(), "field {index}");
+            assert!(storage.elements >= rows * pitch, "field {index}");
+            // The live row width: the Projection owners are allocated at the
+            // `max_projection` capacity (12288) but carry GDN qkv rows; every
+            // other field's capacity is its logical width.
+            let width = match F::ALL[index] {
+                F::Projection | F::Projection2 => qkv,
+                _ => slot.elements / rows,
+            };
+            assert!(width <= pitch, "field {index}");
+            let whole = owner_pitch_extent(pitch, storage.elements, 0, rows, width).unwrap();
+            assert_eq!(whole, (0, rows * pitch), "field {index}");
+            let last = owner_pitch_extent(pitch, storage.elements, rows - 1, 1, width).unwrap();
+            assert_eq!(last, ((rows - 1) * pitch, pitch), "field {index}");
+            checked += 1;
+        }
+        assert!(checked >= 8);
+        // Negative control: bounding by the 6144-wide view's own allocation
+        // refuses the whole reservation that the owner holds.
+        let recurrent = compact[F::GdnRecurrentOutput as usize];
+        assert_eq!(recurrent.owner, Some(F::QsaQgate));
+        assert!(recurrent.elements < rows * 12_288);
+        assert!(owner_pitch_extent(12_288, recurrent.elements, 0, rows, 6_144).is_err());
     }
 
     #[test]
@@ -14317,5 +14815,125 @@ mod seal_view_identity_tests {
         let view =
             bind_routed_view::<FakeRuntime>(None, &described, |runtime| runtime.view(true, 1, 1));
         assert_eq!(address(view), address(&described));
+    }
+
+    /// A lane MoE invocation binds exactly what the singleton's gathered
+    /// forward (1 row decode, 2..=8 row few-row) selects and views, balanced
+    /// or not, D2 armed or not; never the EP full runtime.
+    #[test]
+    fn ep_lane_moe_selects_and_views_the_singleton_gathered_runtime() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for balanced in [false, true] {
+                for rows in 1..=QWEN4_EP_GATHER_MAX_ROWS {
+                    let (singleton, singleton_view) =
+                        rt.bind(true, balanced, false, false, true, rows, rows);
+                    let lane = select_ep_lane_moe(
+                        balanced.then_some(&rt.live),
+                        Some(Some(&rt.full)),
+                        Some(&rt.static_moe),
+                    )
+                    .expect("a runtime is selected");
+                    assert!(std::ptr::eq(lane, singleton));
+                    assert_ne!(lane.id, FULL_ID);
+                    assert_eq!(lane.id, if balanced { LIVE_ID } else { STATIC_ID });
+                    let described: &dyn RoutedExpertWeights = lane;
+                    let view = bind_routed_view(Some(lane), described, |runtime| {
+                        runtime.view(true, rows, rows)
+                    });
+                    assert_eq!(address(view), address(singleton_view));
+                    assert_eq!(view.immutable_identity(), Some(lane.id));
+                }
+            }
+        }
+    }
+
+    /// Outside EP the lane selection is the static runtime (unchanged).
+    #[test]
+    fn lane_moe_outside_ep_is_the_static_runtime() {
+        let rt = Runtimes::new(false);
+        let lane = select_ep_lane_moe(None, None, Some(&rt.static_moe)).unwrap();
+        assert!(std::ptr::eq(lane, &rt.static_moe));
+        assert!(select_ep_lane_moe::<FakeRuntime>(None, None, None).is_none());
+    }
+
+    /// Rows 1..=8 with equal routing rows pass; over the cap, zero or a
+    /// re-routed count refuse.
+    #[test]
+    fn ep_lane_rows_refuse_over_cap_and_rerouted() {
+        for rows in 1..=QWEN4_EP_GATHER_MAX_ROWS {
+            assert!(ep_lane_moe_rows(rows, rows).is_ok());
+            assert_eq!(ep_lane_shared_down(rows), rows >= 2);
+        }
+        assert!(ep_lane_moe_rows(0, 0).is_err());
+        assert!(
+            ep_lane_moe_rows(QWEN4_EP_GATHER_MAX_ROWS + 1, QWEN4_EP_GATHER_MAX_ROWS + 1).is_err()
+        );
+        assert!(ep_lane_moe_rows(1, 2).is_err());
+        assert!(ep_lane_moe_rows(4, 1).is_err());
+    }
+
+    /// The buffer sequence of the emitted MoE invocations: lane-major (every
+    /// layer of lane 0, then lane 1, ...; the whole program one per-lane run)
+    /// and layer-major (every segment of layer 0, then layer 1, ...; grouped
+    /// or mixed shares), over 1..=8 lanes and 48 layers, only ever 0/1,
+    /// alternating (never the same index twice in a row), also across two
+    /// consecutive steps.
+    #[test]
+    fn ep_lane_buffers_alternate_over_every_emission_order() {
+        const LAYERS: usize = 48;
+        for lanes in 1..=8usize {
+            for lane_major in [true, false] {
+                let invocations = LAYERS * lanes;
+                assert!(ep_lane_check_invocations(invocations).is_ok());
+                let mut last: Option<usize> = None;
+                for _step in 0..2 {
+                    let mut ordinal = 0usize;
+                    for layer_or_lane in 0..invocations {
+                        // Emission order only decides which (lane, layer) owns
+                        // an ordinal; the buffer depends on the ordinal alone.
+                        let _owner = if lane_major {
+                            (layer_or_lane / LAYERS, layer_or_lane % LAYERS)
+                        } else {
+                            (layer_or_lane % lanes, layer_or_lane / lanes)
+                        };
+                        let buffer = ep_lane_buffer(ordinal);
+                        ordinal += 1;
+                        assert!(buffer < 2);
+                        assert_ne!(last, Some(buffer), "lanes={lanes} lane_major={lane_major}");
+                        last = Some(buffer);
+                    }
+                    assert_eq!(ordinal, invocations);
+                    assert_eq!(last, Some(1));
+                }
+            }
+        }
+        // Grouped stages emit fewer, wider invocations per layer.
+        for groups in 1..=8usize {
+            assert!(ep_lane_check_invocations(LAYERS * groups).is_ok());
+        }
+        assert!(ep_lane_check_invocations(LAYERS * 3 + 1).is_err());
+    }
+
+    /// The lane buffer is not the singleton's layer parity once a layer
+    /// repeats (lane-major second lane starts at layer 0 again).
+    #[test]
+    fn ep_lane_buffer_differs_from_layer_parity_across_lanes() {
+        // Lane 0 ends at layer 47 (buffer 1 by ordinal 47); lane 1 layer 0 is
+        // ordinal 48 -> buffer 0 = qwen4_ep_buffer_index(0, 48) here, but
+        // lane 1 layer 47 (ordinal 95) -> 1, and lane 2 layer 0 (ordinal 96)
+        // -> 0; with an odd layer count layer parity would repeat a buffer.
+        for layers in [47usize, 48] {
+            let mut repeats = 0;
+            let mut last = None;
+            for ordinal in 0..layers * 2 {
+                let layer_parity = qwen4_ep_buffer_index(ordinal % layers, 48);
+                if last == Some(layer_parity) {
+                    repeats += 1;
+                }
+                last = Some(layer_parity);
+            }
+            assert_eq!(repeats > 0, layers % 2 == 1);
+        }
     }
 }

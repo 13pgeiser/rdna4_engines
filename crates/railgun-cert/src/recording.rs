@@ -1331,6 +1331,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-lane-token-ids-async",
+        predicates: &[CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): on the input band the lane step's token ids are staged in the pinned, fenced lane token ring (`fwd.lane_tokens.stage` / `.upload`) and enqueued on the active stream without a host wait only when no graph capture is open (`band_scope.input && !gpu.graphs.capture_mode`); under capture the blocking `memcpy_htod_auto` copy from `host_token_bytes` runs",
+        effect: LaunchMechanism,
+        switches: "an asynchronous host-to-device copy from a pinned ring slot fenced by a hip event vs the blocking or capture-aware upload; same i32 ids to the same `token_ids` device buffer",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "same ids in lane order, same destination and stream order before the unchanged embedding launch; a ring slot is rewritten only after its own earlier copy's fence completes; PP2 mq2-xts hold j1574 (ids and every logits row byte-identical to the serialized PP singleton at K=1..8 under adaptive, 1 and 4 micro-batches and overlap off) ran with the ring",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-wide-verify-eager-only",
         predicates: &[IsRecording, CaptureMode],
         condition: "Gpu::few_row_limit (prefill_invariant.rs): inside a qwen4 verify forward the few-row (decode-exact, `route_rows <= 8`) routes serve up to `wide_verify_rows` (qwen4_row_exact_verify_rows, the arch's proven row-exact verify rows; 8 on every arch at default) only while `!(is_recording() || capture_mode)`; recorded or captured, the limit stays FEW_ROW_ROUTE_ROWS (8)",
@@ -1930,8 +1941,8 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
         function: "forward_lanes_scoped",
-        occurrences: 1,
-        decisions: &["qwen4-ple-async-upload"],
+        occurrences: 2,
+        decisions: &["qwen4-ple-async-upload", "qwen4-lane-token-ids-async"],
     },
     Site {
         file: "hipfire-arch-qwen4/src/ple_stage.rs",

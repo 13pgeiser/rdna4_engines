@@ -21,6 +21,7 @@ use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{KvMode, VMode};
+pub use hipfire_runtime::loader_api::BatchLoadRequest;
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 use hipfire_runtime::mesh_placement::{
     pp_rank_order, resolve_edge_transports, AdmittedMesh, AdmittedRank, BandPlacement,
@@ -1051,6 +1052,11 @@ pub struct SourceAdmission {
     /// free-VRAM delta gate); `Some` = `Gpus::init_layers`. Carriers consume
     /// this value and never reread the environment.
     pub pp_layer_counts: Option<Vec<usize>>,
+    /// The continuous-batch request of this load (default off). Admission
+    /// never sets it; the caller that will stage lanes after the load sets it
+    /// on the admitted handle before the load, and the carrier forwards it
+    /// through `LoadCtx::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -2967,6 +2973,7 @@ pub fn admit_source_with_options(
         mesh,
         pp_bands,
         pp_layer_counts,
+        batch_request: BatchLoadRequest::default(),
     })
 }
 
