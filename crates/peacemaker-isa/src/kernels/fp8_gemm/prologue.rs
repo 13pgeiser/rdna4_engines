@@ -65,7 +65,9 @@ fn descriptor(b: &mut Builder, dst: u8, src: u8, records: Option<u8>) -> Result<
     )
 }
 
-pub(super) fn emit(b: &mut Builder, spec: Spec) -> Result<(), String> {
+/// Kernel arguments, the banded CTA raster, tile origin and trip scalars, ending with the compare
+/// whose SCC the caller branches on to the kernel exit (the tile starts at or past `M`).
+pub(super) fn front(b: &mut Builder, spec: Spec) -> Result<(), String> {
     for i in 0..3 {
         let a = 8 + i * 8;
         let off = i * 32;
@@ -109,7 +111,12 @@ pub(super) fn emit(b: &mut Builder, spec: Spec) -> Result<(), String> {
     // The launch grid itself guarantees valid tiles. This guard still makes
     // accidental oversubscription harmless without indexing outside the ABI.
     sop(b, "s_cmp_ge_u32 s82, s31", &[], &[82, 31])?;
-    op(b, format!("s_cbranch_scc1 {END}"), &[], &[])?;
+    Ok(())
+}
+
+/// Hoisted lane addresses, the scalar block offsets and the weight/ratio bases, after the
+/// tile-outside exit.
+pub(super) fn lanes(b: &mut Builder) -> Result<(), String> {
     sop(b, "s_mov_b32 s94, s83", &[94], &[83])?;
     sop(b, "s_mul_i32 s94, s94, s84", &[94], &[94, 84])?;
     op(b, "v_readfirstlane_b32 s87, v0", &[s(87)], &[v(0)])?;
@@ -184,6 +191,13 @@ pub(super) fn emit(b: &mut Builder, spec: Spec) -> Result<(), String> {
     sop(b, "s_lshl_b32 s72, s89, 8", &[72], &[89])?;
     vo(b, "v_add_nc_u32_e32 v181, s72, v181", &[181], &[181], &[72])?;
     sop(b, "s_lshl_b32 s95, s88, 13", &[95], &[88])?;
+    Ok(())
+}
+
+pub(super) fn emit(b: &mut Builder, spec: Spec) -> Result<(), String> {
+    front(b, spec)?;
+    op(b, format!("s_cbranch_scc1 {END}"), &[], &[])?;
+    lanes(b)?;
     // First slab A0: all 8192 bytes are published once, including masked
     // token lanes, whose raw-buffer out-of-range reads return zero.
     publish::stage_a(b, 0, 0)?;
