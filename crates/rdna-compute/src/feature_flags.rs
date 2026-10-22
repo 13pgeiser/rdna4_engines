@@ -227,6 +227,13 @@ pub struct FeatureFlags {
     /// (`crate::gemm_mq6_i8::MQ6_I8_DEFAULT_ARCHS`, qwen4 scope)
     /// (`Gpu::gemm_mq6g256v2_i8_applies`).
     pub mq6_i8: Option<bool>,
+    /// Certified-builder (PeaceMaker) twin of the exact-INT8 MQ6G256V2 GEMM on
+    /// exact gfx1201 (`HIPFIRE_MQ6_I8_PM`, developer): `Some(false)` (`0`) keeps
+    /// the hipcc kernel; `Some(true)` (`1`) and unset (default) run
+    /// `kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201` whenever the INT8 route is
+    /// admitted and the launch meets its preconditions, else hipcc
+    /// (`Gpu::gemm_mq6g256v2_i8_prequant`).
+    pub mq6_i8_pm: Option<bool>,
     /// Calibration-only override keeping native-BF16 teachers in BF16
     /// (`HIPFIRE_CALIB_BF16=1`). Mirrors the `calib_force_bf16` snapshot
     /// read so fresh `Gpu` code can take the flag from `self.flags`
@@ -1041,6 +1048,7 @@ impl FeatureFlags {
             },
             gfx12_mq6_fp8_db: value("HIPFIRE_GFX12_MQ6_FP8_DB").as_deref() == Ok("1"),
             mq6_i8: parse_bool("HIPFIRE_MQ6_I8"),
+            mq6_i8_pm: parse_bool("HIPFIRE_MQ6_I8_PM"),
             calib_force_bf16: value("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"),
 
             // MMQ screening
@@ -1707,6 +1715,7 @@ impl FeatureFlags {
             gfx12_mq6_fp8_arm: crate::gemm_mq6_fp8::Mq6Fp8Arm::Split,
             gfx12_mq6_fp8_db: false,
             mq6_i8: None,
+            mq6_i8_pm: None,
             calib_force_bf16: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
@@ -2718,6 +2727,22 @@ mod tests {
         assert_eq!(flag(Some("auto")), None);
         assert_eq!(FeatureFlags::for_test("gfx1201").mq6_i8, None);
         assert_eq!(FeatureFlags::for_test("gfx1151").mq6_i8, None);
+    }
+
+    #[test]
+    fn mq6_i8_pm_is_tri_state_and_unset_is_the_default() {
+        let flag = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_MQ6_I8_PM", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+            .mq6_i8_pm
+        };
+        assert_eq!(flag(None), None);
+        assert_eq!(flag(Some("1")), Some(true));
+        assert_eq!(flag(Some("0")), Some(false));
+        assert_eq!(flag(Some("auto")), None);
+        assert_eq!(FeatureFlags::for_test("gfx1201").mq6_i8_pm, None);
     }
 
     #[test]

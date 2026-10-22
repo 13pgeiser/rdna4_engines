@@ -6876,6 +6876,95 @@ impl Gpu {
         ))
     }
 
+    /// One-pass A8 producer of the exact-INT8 MQ6G256V2 route: plain FWHT rotate (the
+    /// `mq_rotate_x` body, no gate, no AWQ) emitting `block_i8_128` straight into
+    /// `reservation` (`_gfx12` / `_gfx11` symbol by arch). The blocks are byte-identical to
+    /// [`Self::rotate_x_mq_batched`] followed by [`Self::ensure_int8_mmq_x`]. `x_out = Some`
+    /// also stores the rotated f32 row. Seals `reservation` into a prepared handle after a
+    /// successful launch; never calls `ensure_int8_mmq_x`.
+    pub fn rotate_x_mq_i8_batched(
+        &mut self,
+        x: &GpuTensor,
+        x_out: Option<&GpuTensor>,
+        reservation: crate::scratch::Int8MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int8MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i8_batched: reservation (k,n) mismatch",
+            ));
+        }
+        if x.dtype != DType::F32 || x.numel() < k * batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i8_batched: x must be F32 with at least k * batch elements",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (source, kernel) = if self.arch == "gfx1201" {
+            (kernels::MQ_ROTATE_X_I8_GFX12_SRC, "mq_rotate_x_i8_gfx12")
+        } else {
+            (kernels::MQ_ROTATE_X_I8_GFX11_SRC, "mq_rotate_x_i8_gfx11")
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
+        let mut xp = x.buf.as_ptr();
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut i8p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut i8p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 + (k / 128) * 136 + 2 * 256 * 4) * batch_size
+            + if x_out.is_some() {
+                k * 4 * batch_size
+            } else {
+                0
+            };
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [((k / 256) * batch_size) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i8p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
+    }
+
     /// gfx1201 slices-3 IU4 producer: standalone FWHT rotate + in-register
     /// `block_i4_128` emit for the attention out-proj input under the
     /// `_gfx12` entry symbols. `awq = Some` selects the AWQ twin. The f32

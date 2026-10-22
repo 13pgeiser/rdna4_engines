@@ -34,6 +34,7 @@ peacemaker-npu = { path = "../peacemaker-npu" }
 peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
 peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
+peacemaker-rip = { path = "../peacemaker-rip" }
 [[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
@@ -971,6 +972,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "pm_decode_twins"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_loop"
 required-features = ["lab"]
 
 [[example]]

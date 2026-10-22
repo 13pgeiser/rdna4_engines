@@ -4417,6 +4417,22 @@ pub const SPEC_ACCEPT_ORDERED_PM_GFX1201: &[u8] =
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
+/// Certified builder module of gfx1201's exact-INT8 MQ6G256V2 prefill GEMM
+/// (`peacemaker-isa emit --kernel mq6_i8_gemm --epi all --arch gfx1201`): the
+/// bit-exact twin of hipcc `gemm_mq6g256v2_mmq_i8_set_gfx12` /
+/// `_set_bf16_gfx12` in `kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip`, with that
+/// kernel's arguments `(A, Xq, Y, M, K, N)` (K1's hidden block counts follow).
+/// Entries `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) and
+/// `gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201` (BF16 bits), grid
+/// `[ceil(M/128), ceil(N/128), 1]`, block 256, dynamic LDS 36864 B. Preconditions:
+/// `K % 256 == 0`, `M % 4 == 0`, output and weight extents under 2^31 bytes
+/// (`gemm_mq6_i8::mq6_i8_pm_admits`).
+/// Default on exact gfx1201 where the launch meets those preconditions
+/// (`HIPFIRE_MQ6_I8_PM=0` keeps the hipcc kernel).
+/// SHA-256 4b505aac8c1380e99ead254cdc8ff48a71206fffd354a8265655c7c83bb0c3ab
+/// (`sha256sum kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco`).
+pub const GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco");
 /// Certified builder module of gfx1151's MQ6 trunk GEMM
 /// (`peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 --arch gfx1151`, M7
 /// obligation-free): the exact twin of the U3 `resid_bt_xlds<6, 8, 8, true, ..>`
@@ -5426,6 +5442,30 @@ pub const GEMM_MQ6G256V2_MMQ_I8_GFX11_T256_SRC: &str = concat!(
     "#define I8_TILE 256\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx11.hip")
+);
+/// One-pass plain FWHT rotate + `block_i8_128` producer of the exact-INT8 MQ6G256V2 route
+/// (`Gpu::rotate_x_mq_i8_batched`, entry `mq_rotate_x_i8_gfx12`): the A8 producers' shared
+/// source recipe (`block_i8_128_quant.hip` without its standalone quantizer,
+/// `block_i8_128_emit.hip`, then the unmodified `mq_rotate_x_i4.hip` body) with neither the
+/// sigmoid gate nor AWQ. Blocks are byte-identical to `mq_rotate_x` + `quantize_int8_mmq_ds128`
+/// (the emit's documented bit identity); the gfx11 twin is
+/// [`MQ_ROTATE_X_I8_GFX11_SRC`]. Grid `[(k/256) * n, 1, 1]`, block 32.
+pub const MQ_ROTATE_X_I8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i8_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+/// gfx1100/gfx1151 twin of [`MQ_ROTATE_X_I8_GFX12_SRC`] (entry `mq_rotate_x_i8_gfx11`); the gfx11
+/// IU4 rotate producer defines nothing beyond the entry name for the plain rotate, so only the
+/// symbol differs.
+pub const MQ_ROTATE_X_I8_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i8_gfx11\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
@@ -10461,6 +10501,15 @@ pub const MOE_SLOT_OPS_V2_PM_GFX1201: &[u8] =
 /// (`PrefillRoute::MoeRotateI4Pm`).
 pub const MOE_ROTATE_I4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/moe_rotate_i4_pm_gfx1201.hxaco");
+
+/// Certified PeaceMaker grouped-position down plane, gfx1201 (module `qwen4_moe_down_gp_pm_gfx1201`,
+/// `peacemaker-isa emit --kernel qwen4_moe_down_gp_pm --arch gfx1201`): the byte-identical twins
+/// `moe_rotate_i4_gp_pm_gfx1201` (the down A4 producer storing record `g * P + row`) and
+/// `qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4` / `_nt8` (the down entries reading record
+/// `g * m_total + 16 * tile + lane`). The incumbent bundles `moe_rotate_i4_pm_gfx1201` and
+/// `qwen4_moe_iu4_sym_pm_gfx1201` are untouched and remain the oracle anchors.
+pub const QWEN4_MOE_DOWN_GP_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco");
 
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.

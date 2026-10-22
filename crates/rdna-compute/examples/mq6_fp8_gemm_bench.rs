@@ -13,6 +13,9 @@
 //!     false; the launched kernel name is recorded in `--json`),
 //!   * `i8`    `Gpu::mq6_i8_prepare_x` (FWHT into F32 scratch + A8
 //!     `block_i8_128` quantization) then `Gpu::gemm_mq6g256v2_i8_prequant`,
+//!   * `i8pm`  the same prep then the certified-builder (PeaceMaker) twin of the
+//!     i8 GEMM (`HIPFIRE_MQ6_I8_PM=1`, the product default: `gemm_mq6g256v2_mmq_i8_pm_{set,set_bf16}_gfx1201`;
+//!     gfx1201 only; the `i8` arm is pinned to hipcc so the pair is always HIP vs PM),
 //!   * `fp8_<arm>[_db]` `Gpu::mq6_fp8_prepare_x` then
 //!     `Gpu::gemm_mq6g256v2_fp8_prepared` (gfx1201 only).
 //! Times are GPU event times of one launch (median of `--iters`, after
@@ -45,16 +48,26 @@
 //!     rel-L2(incumbent F32, SPLIT) is reported (expected ~1e-2: E4M3
 //!     activations vs F16); on (10240, 2560) the SPLIT BF16 variant must equal
 //!     bf16_rne(0.0 + SPLIT F32) bit for bit.
-//! Exit status 1 on any i8, SPLIT or BF16 failure.
+//!   * i8 producer: for every shape at N in {512, 4000} the blocks of the timed
+//!     one-pass producer (`mq6_i8_prepare_x` = `rotate_x_mq_i8_batched`) must equal,
+//!     byte for byte over the whole `[K/128][N]` block array, the former two-pass
+//!     chain (`rotate_x_mq_batched` into an F32 scratch, then `ensure_int8_mmq_x`);
+//!     the producer's launched kernel name is printed and recorded in `--json`;
+//!   * i8pm: for every shape at N in {512, 4000} the PM twin's F32 and BF16
+//!     outputs (NaN-prefilled, same producer blocks) must equal the hipcc
+//!     kernel's byte for byte over the WHOLE output, and the kernel the PM
+//!     launch recorded must be the `_pm_` entry (a silent hipcc fallback
+//!     fails); both launched kernel names are printed and recorded in `--json`.
+//! Exit status 1 on any i8, i8 producer, i8pm, SPLIT or BF16 failure.
 //!
 //! Run: `cargo run --release -p rdna-compute --features lab --example
 //! mq6_fp8_gemm_bench` (gated behind `lab`, like the other developer probes,
 //! so the default build does not pay for it).
 //!
 //! CLI: `[--shapes fn] [--shape M,K]...` (a `--shape` replaces the FN list)
-//! `[--n 64,128,...] [--iters 20] [--warmup 3] [--arm i8|split|round|both|all]`
-//! (default: `i8` plus `split` and `round` on gfx1201; `both` = split+round,
-//! `all` = i8+split+round; FP8 arms are refused on gfx1151)
+//! `[--n 64,128,...] [--iters 20] [--warmup 3] [--arm i8|i8pm|split|round|both|all]`
+//! (default: `i8`, `i8pm`, `split` and `round` on gfx1201; `both` = split+round,
+//! `all` = i8+i8pm+split+round; FP8 arms are refused on gfx1151)
 //! `[--db 0|1|both]` (default both: every FP8 (arm, db) combination is timed as
 //! `fp8_<arm>` / `fp8_<arm>_db`, and the SPLIT exactness + BF16
 //! checks run for the DB variant too) `[--json PATH] [--no-check] [--seed N]`.
@@ -256,6 +269,14 @@ fn set_var(gpu: &mut Gpu, (arm, db): Var) {
     let mut f = (*gpu.flags).clone();
     f.gfx12_mq6_fp8_arm = arm;
     f.gfx12_mq6_fp8_db = db;
+    gpu.flags = Arc::new(f);
+}
+
+/// Pin `HIPFIRE_MQ6_I8_PM` for the launches that follow (`Some(true)`: PM twin,
+/// `Some(false)`: hipcc), whatever the process environment says.
+fn set_i8_pm(gpu: &mut Gpu, pm: bool) {
+    let mut f = (*gpu.flags).clone();
+    f.mq6_i8_pm = Some(pm);
     gpu.flags = Arc::new(f);
 }
 
@@ -651,11 +672,101 @@ fn check_i8_case(
     })
 }
 
+/// Result of the one-pass vs two-pass producer gate of one (K, N).
+struct ProdCheck {
+    /// Differing bytes over the whole `block_i8_128` array.
+    diff_bytes: usize,
+    bytes: usize,
+    /// The one-pass launch ran the `mq_rotate_x_i8_*` entry.
+    kernel: String,
+}
+
+/// The `block_i8_128` blocks of `mq6_i8_prepare_x` (one pass) against the two-pass
+/// chain they replace, whole array, same F32 input.
+fn check_producer_case(gpu: &mut Gpu, xf: &[f32], k: usize, n: usize) -> Res<ProdCheck> {
+    let xt = gpu.upload_f32(&xf[..n * k], &[n * k])?;
+    let bytes = (k / 128) * n * 136;
+    // Both producers write the shared A8 scratch: copy the one-pass blocks out first.
+    let one = gpu.mq6_i8_prepare_x(&xt, k, n)?;
+    let kernel = gpu.last_launched_kernel().unwrap_or("?").to_owned();
+    let one = dtoh(gpu, one, bytes)?;
+    let x_rot = gpu.zeros(&[n * k], DType::F32)?;
+    gpu.rotate_x_mq_batched(&xt, &x_rot, k, n)?;
+    let two = gpu.ensure_int8_mmq_x(&x_rot, n, k)?;
+    let two = dtoh(gpu, two, bytes)?;
+    gpu.free_tensor(x_rot)?;
+    gpu.free_tensor(xt)?;
+    let diff_bytes = one.iter().zip(&two).filter(|(a, b)| a != b).count();
+    Ok(ProdCheck {
+        diff_bytes,
+        bytes,
+        kernel,
+    })
+}
+
+/// Result of the PM-vs-hipcc bitwise gate of one (shape, N).
+struct I8PmCheck {
+    /// Differing bytes of the F32 entries over the whole output.
+    f32_bad: usize,
+    /// Differing bytes of the BF16 entries over the whole output.
+    bf16_bad: usize,
+    hip_kernels: [String; 2],
+    pm_kernels: [String; 2],
+    /// Both PM launches ran a `_pm_` entry (no silent hipcc fallback).
+    pm_ran: bool,
+}
+
+impl I8PmCheck {
+    fn pass(&self) -> bool {
+        self.f32_bad == 0 && self.bf16_bad == 0 && self.pm_ran
+    }
+}
+
+/// Bitwise equality of the PM twin and the hipcc kernel on the same producer
+/// blocks, both output dtypes, NaN-prefilled outputs, the whole `n * m` extent.
+fn check_i8pm_case(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    xf: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Res<I8PmCheck> {
+    let xt = gpu.upload_f32(&xf[..n * k], &[n * k])?;
+    let xq = gpu.mq6_i8_prepare_x(&xt, k, n)?;
+    let mut raw: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+    let mut names: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    for (side, pm) in [false, true].into_iter().enumerate() {
+        set_i8_pm(gpu, pm);
+        for dtype in [DType::F32, DType::BF16] {
+            let y = nan_filled(gpu, n * m, dtype)?;
+            gpu.gemm_mq6g256v2_i8_prequant(w, xq, &y, m, k, n)?;
+            names[side].push(gpu.last_launched_kernel().unwrap_or("?").to_owned());
+            raw[side].push(gpu.download_raw_bytes(&y)?);
+            gpu.free_tensor(y)?;
+        }
+    }
+    set_i8_pm(gpu, false);
+    gpu.free_tensor(xt)?;
+    let diff = |a: &[u8], b: &[u8]| -> usize {
+        a.len().abs_diff(b.len()) + a.iter().zip(b).filter(|(x, y)| x != y).count()
+    };
+    let pm_ran = names[1].iter().all(|n| n.contains("_pm_"));
+    Ok(I8PmCheck {
+        f32_bad: diff(&raw[0][0], &raw[1][0]),
+        bf16_bad: diff(&raw[0][1], &raw[1][1]),
+        hip_kernels: [names[0][0].clone(), names[0][1].clone()],
+        pm_kernels: [names[1][0].clone(), names[1][1].clone()],
+        pm_ran,
+    })
+}
+
 // ---------------------------------------------------------------------- cli
 
 /// Arms selected by `--arm`: the exact-INT8 route and/or the FP8 weight-plane arms.
 struct ArmSel {
     i8: bool,
+    i8pm: bool,
     fp8: Vec<Mq6Fp8Arm>,
 }
 
@@ -673,16 +784,16 @@ struct Args {
 }
 
 impl Args {
-    /// `(run the i8 arm, FP8 weight-plane arms)` for `arch`; FP8 arms exist on
-    /// gfx1201 only.
-    fn resolve_arms(&self, arch: &str) -> Res<(bool, Vec<Mq6Fp8Arm>)> {
+    /// `(run the i8 arm, run the i8pm arm, FP8 weight-plane arms)` for `arch`;
+    /// the FP8 and i8pm arms exist on gfx1201 only.
+    fn resolve_arms(&self, arch: &str) -> Res<(bool, bool, Vec<Mq6Fp8Arm>)> {
         match &self.arms {
-            None if arch == "gfx1201" => Ok((true, vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round])),
-            None => Ok((true, vec![])),
-            Some(sel) if arch != "gfx1201" && !sel.fp8.is_empty() => {
-                Err(format!("FP8 arms need exact gfx1201, device is {arch}").into())
+            None if arch == "gfx1201" => Ok((true, true, vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round])),
+            None => Ok((true, false, vec![])),
+            Some(sel) if arch != "gfx1201" && (!sel.fp8.is_empty() || sel.i8pm) => {
+                Err(format!("FP8 and i8pm arms need exact gfx1201, device is {arch}").into())
             }
-            Some(sel) => Ok((sel.i8, sel.fp8.clone())),
+            Some(sel) => Ok((sel.i8, sel.i8pm, sel.fp8.clone())),
         }
     }
 
@@ -734,22 +845,32 @@ fn parse_args() -> Res<Args> {
                 a.arms = Some(match val("--arm")?.as_str() {
                     "i8" => ArmSel {
                         i8: true,
+                        i8pm: false,
+                        fp8: vec![],
+                    },
+                    "i8pm" => ArmSel {
+                        i8: false,
+                        i8pm: true,
                         fp8: vec![],
                     },
                     "split" => ArmSel {
                         i8: false,
+                        i8pm: false,
                         fp8: vec![Mq6Fp8Arm::Split],
                     },
                     "round" => ArmSel {
                         i8: false,
+                        i8pm: false,
                         fp8: vec![Mq6Fp8Arm::Round],
                     },
                     "both" => ArmSel {
                         i8: false,
+                        i8pm: false,
                         fp8: vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round],
                     },
                     "all" => ArmSel {
                         i8: true,
+                        i8pm: true,
                         fp8: vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round],
                     },
                     other => return Err(format!("unknown --arm {other}").into()),
@@ -808,7 +929,7 @@ fn main() -> Res<()> {
         .into());
     }
     gpu.qwen4_scope = true;
-    let (run_i8, fp8_arms) = args.resolve_arms(&gpu.arch)?;
+    let (run_i8, run_i8pm, fp8_arms) = args.resolve_arms(&gpu.arch)?;
     let fp8_on = !fp8_arms.is_empty();
 
     // Largest N needed per K (activations are generated once, prefixes reused).
@@ -826,6 +947,7 @@ fn main() -> Res<()> {
     let arm_names: Vec<String> = run_i8
         .then(|| "i8".to_owned())
         .into_iter()
+        .chain(run_i8pm.then(|| "i8pm".to_owned()))
         .chain(vars.iter().map(|v| format!("fp8_{}", var_name(*v))))
         .collect();
     println!(
@@ -889,7 +1011,14 @@ fn main() -> Res<()> {
 
             // (name, prep samples, prep bytes, gemm samples, act bytes, kernel)
             let mut rows_out: Vec<ArmRow> = Vec::new();
-            if run_i8 {
+            for (name, pm) in [("i8", false), ("i8pm", true)] {
+                if !(if pm { run_i8pm } else { run_i8 }) {
+                    continue;
+                }
+                // `i8` is always hipcc, `i8pm` always the PM twin, whatever the environment says.
+                if gpu.arch == "gfx1201" {
+                    set_i8_pm(&mut gpu, pm);
+                }
                 let prep = time_ms(&mut gpu, args.warmup, args.iters, |g| {
                     g.mq6_i8_prepare_x(&xt, k, n)?;
                     Ok(())
@@ -899,14 +1028,24 @@ fn main() -> Res<()> {
                     g.gemm_mq6g256v2_i8_prequant(&w, xq, &y_new, m, k, n)?;
                     Ok(())
                 })?;
+                let kernel = gpu.last_launched_kernel().map(str::to_owned);
+                if pm && !kernel.as_deref().is_some_and(|k| k.contains("_pm_")) {
+                    println!(
+                        "WARNING i8pm M={m} K={k} N={n} ran {kernel:?}, not a PM entry (fell back)"
+                    );
+                    failed = true;
+                }
                 rows_out.push(ArmRow {
-                    name: "i8".into(),
+                    name: name.into(),
                     prep,
                     prep_bytes: i8_prep_bytes(n, k),
                     gemm: s,
                     act_bytes: i8_act_bytes(n, k),
-                    kernel: gpu.last_launched_kernel().map(str::to_owned),
+                    kernel,
                 });
+            }
+            if gpu.arch == "gfx1201" {
+                set_i8_pm(&mut gpu, false);
             }
             if fp8_on {
                 let prep = time_ms(&mut gpu, args.warmup, args.iters, |g| {
@@ -1015,7 +1154,48 @@ fn main() -> Res<()> {
 
         if args.check {
             for &n in &CHECK_NS {
+                if run_i8 || run_i8pm {
+                    let c = check_producer_case(&mut gpu, xfull, k, n)?;
+                    let ran = c.kernel.contains("mq_rotate_x_i8");
+                    println!(
+                        "check i8 producer M={m} K={k} N={n} one-pass==two-pass blocks={} (diff bytes {} of {}) kernel={}",
+                        if c.diff_bytes == 0 && ran { "PASS" } else { "FAIL" },
+                        c.diff_bytes,
+                        c.bytes,
+                        c.kernel,
+                    );
+                    if c.diff_bytes != 0 || !ran {
+                        failed = true;
+                    }
+                    checks.push(json!({
+                        "arm": "i8_producer", "m": m, "k": k, "n": n,
+                        "pass": c.diff_bytes == 0 && ran,
+                        "diff_bytes": c.diff_bytes, "bytes": c.bytes, "kernel": c.kernel,
+                    }));
+                }
+                if run_i8pm {
+                    let c = check_i8pm_case(&mut gpu, &w, xfull, m, k, n)?;
+                    println!(
+                        "check i8pm M={m} K={k} N={n} bitwise PM==HIP f32={} (diff bytes {}) bf16={} (diff bytes {}) kernels hip={:?} pm={:?}",
+                        if c.f32_bad == 0 { "PASS" } else { "FAIL" },
+                        c.f32_bad,
+                        if c.bf16_bad == 0 { "PASS" } else { "FAIL" },
+                        c.bf16_bad,
+                        c.hip_kernels,
+                        c.pm_kernels,
+                    );
+                    if !c.pass() {
+                        failed = true;
+                    }
+                    checks.push(json!({
+                        "arm": "i8pm", "m": m, "k": k, "n": n,
+                        "pass": c.pass(), "f32_diff_bytes": c.f32_bad,
+                        "bf16_diff_bytes": c.bf16_bad, "pm_ran": c.pm_ran,
+                        "hip_kernels": c.hip_kernels, "pm_kernels": c.pm_kernels,
+                    }));
+                }
                 if run_i8 {
+                    set_i8_pm(&mut gpu, false);
                     let c = check_i8_case(&mut gpu, &w, &wbytes, xfull, m, k, n, args.seed)?;
                     let bf16_ok = c.bf16_bad == 0;
                     println!(

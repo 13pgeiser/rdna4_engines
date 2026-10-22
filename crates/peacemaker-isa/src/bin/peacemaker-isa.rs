@@ -119,6 +119,7 @@ const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx12
        peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
+       peacemaker-isa emit --kernel mq6_i8_gemm [--epi set|set_bf16|all] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
 const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]]
          (native assembly/link/bundle needs no ROCm tools; --bundle also writes FILE.sha256, bare lowercase SHA256)
@@ -177,22 +178,15 @@ fn iu4_gemm(
     arch: Arch,
 ) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::iu4_gemm::{self, Spec};
-    let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
     if epi == "all" {
+        let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
         let (_, text, proof) = iu4_gemm::emit_module(fold, tile, cacc, act, arch)?;
         return Ok((
             text,
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let emitted = iu4_gemm::emit(Spec {
-        fold,
-        tile,
-        cacc,
-        epi: epi.parse()?,
-        act,
-        arch,
-    })?;
+    let emitted = iu4_gemm::emit(Spec::from_knobs(fold, tile, cacc, epi, act, arch)?)?;
     Ok((
         emitted.s_text,
         serde_json::to_vec_pretty(&emitted.proof).map_err(|e| e.to_string())?,
@@ -269,30 +263,7 @@ fn qwen4_moe_sym(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let (kind, tile) = match epi.rsplit_once("_nt") {
-        Some((k, n)) => (k, Some(n)),
-        None => (epi, None),
-    };
-    let (nt, rr) = match tile {
-        Some(t) => {
-            let (n, r) = t.split_once('r').map_or((t, None), |(n, r)| (n, Some(r)));
-            (
-                n.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
-                match r {
-                    Some(r) => r.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
-                    None => 1,
-                },
-            )
-        }
-        None => (1, 1),
-    };
-    let e = qwen4_moe_sym::emit(Spec {
-        arch,
-        kind: kind.parse()?,
-        nt,
-        rr,
-        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
-    })?;
+    let e = qwen4_moe_sym::emit(Spec::from_epi(epi, arch)?)?;
     Ok((
         e.s_text,
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
@@ -517,6 +488,38 @@ fn ep_tile_pull(
 /// The ordered BF16 grouped expert combine twin (gfx1201 only).
 fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::moe_slot_ops::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// gfx1201 exact-INT8 MQ6G256V2 prefill GEMM twin of the hipcc `gemm_mq6g256v2_mmq_i8` route:
+/// `--epi set|set_bf16` one entry, `all` (default) the two-entry module.
+fn mq6_i8_gemm(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, Spec};
+    if epi == "all" {
+        let (_, text, proof) = mq6_i8_gemm::emit_module(arch)?;
+        return Ok((
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        ));
+    }
+    let epi: Epi = epi
+        .parse()
+        .map_err(|_| format!("mq6_i8_gemm --epi {epi} (set|set_bf16|all)"))?;
+    let e = mq6_i8_gemm::emit(Spec {
+        epi,
+        raster: Raster::Banded,
+        arch,
+    })?;
+    Ok((
+        e.s_text,
+        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// Grouped-position down plane (gfx1201): the grouped producer plus the down NT4/NT8 twins as one module.
+fn qwen4_moe_down_gp(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module(arch)?;
     Ok((
         text,
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
@@ -1759,6 +1762,7 @@ fn run() -> Result<(), String> {
             "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
             "ep_tile_mask_pm" => ep_tile_mask(arch)?,
             "moe_slot_ops_pm" => moe_slot_ops(arch)?,
+            "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
             "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
             "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
                 peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,
@@ -1792,6 +1796,7 @@ fn run() -> Result<(), String> {
             }
             "qwen4_lane_rows" => qwen4_lane_rows(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_mq4_x4_gfx11" => qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
+            "mq6_i8_gemm" => mq6_i8_gemm(epi.as_deref().unwrap_or("all"), arch)?,
             "mq_i4_rows" => mq_i4_rows(epi.as_deref().unwrap_or("all"), arch)?,
             "mq_i4_a4" => mq_i4_a4(epi.as_deref().unwrap_or("all"), arch)?,
             "moe_rotate_i4_pm" => moe_rotate_i4_pm(epi.as_deref().unwrap_or("all"), arch)?,

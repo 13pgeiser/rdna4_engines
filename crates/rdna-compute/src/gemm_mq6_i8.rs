@@ -14,10 +14,11 @@
 //! `fma(RN(z'_h*d), s, acc)`, `z'_h = z_h + 32*s_h`. Output F32 or BF16 bits
 //! (RNE, the incumbent's formula), overwrite (SET).
 //!
-//! Producer chain ([`Gpu::mq6_i8_prepare_x`]): `rotate_x_mq_batched` into the
-//! shared MQ6 F32 rotation scratch (the one [`Gpu::mq6_fp8_prepare_x`] uses,
-//! through [`Gpu::take_mq6_x_rot`]), then `ensure_int8_mmq_x`: the same FWHT as
-//! the F16 route, the 128-K blocks coinciding with the MQ6 128-halves.
+//! Producer ([`Gpu::mq6_i8_prepare_x`]): one pass, [`Gpu::rotate_x_mq_i8_batched`]
+//! (`mq_rotate_x_i8_gfx12` / `_gfx11`): the same FWHT as the F16 route emitting the
+//! A8 blocks in registers, the 128-K blocks coinciding with the MQ6 128-halves.
+//! The blocks are byte-identical to the former two-pass chain
+//! (`rotate_x_mq_batched` into an F32 scratch, then `ensure_int8_mmq_x`).
 //!
 //! Admission: default on for exact gfx1201 inside the Qwen4 forward at
 //! `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS` (the F16 PM route it replaces);
@@ -25,7 +26,11 @@
 //! (`release-0.4.3/fp8-lean/RESULTS.md`). gfx1151 is opt-in only: there the
 //! iu8 rate equals F16 and the route measured 0.79-0.95x of the incumbent GEMM.
 //! Env (developer): `HIPFIRE_MQ6_I8` (`1` on for any scope, `0` off, unset =
-//! the default above).
+//! the default above); `HIPFIRE_MQ6_I8_PM` (the GEMM itself runs the certified
+//! builder (PeaceMaker) twin `kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201` on exact
+//! gfx1201 whenever [`mq6_i8_pm_admits`] holds, else the hipcc kernel; `0` = hipcc
+//! always, `1` and unset = the twin where admitted). The twin's output is
+//! bit-identical to the hipcc kernel's.
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
@@ -48,6 +53,43 @@ const MQ6_I8_GFX12_LDS_BYTES: u32 = 36864;
 const MQ6_I8_GFX11_LDS_BYTES: u32 = 32768;
 /// Dynamic LDS of the gfx11 256-token build (1024 threads, `_t256` entries).
 const MQ6_I8_GFX11_T256_LDS_BYTES: u32 = 65536;
+
+/// Embedded module of the PeaceMaker twin (gfx1201) and its entries.
+const MQ6_I8_PM_MODULE: &str = "gemm_mq6g256v2_mmq_i8_pm_gfx1201";
+const MQ6_I8_PM_ENTRY_F32: &str = "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201";
+const MQ6_I8_PM_ENTRY_BF16: &str = "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201";
+/// The twin's CTA tile (128 rows x 128 tokens, 256 threads) and dynamic LDS
+/// (the same figures as the hipcc kernel).
+const MQ6_I8_PM_TILE: usize = 128;
+
+/// Whether the PeaceMaker twin runs one launch (`flag` = `HIPFIRE_MQ6_I8_PM`): not
+/// switched off (`0`; unset and `1` both admit), exact gfx1201, `k % 256 == 0`, `m % 4 == 0` (its row quads are stored
+/// whole), a 4-byte aligned `y`, and the 32-bit address contract (`m`, `k`, `n`
+/// and the output and weight extents under 2^31 bytes). Anything else keeps the
+/// hipcc kernel.
+fn mq6_i8_pm_admits(
+    flag: Option<bool>,
+    arch: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    out_elem_bytes: usize,
+    y_ptr: usize,
+) -> bool {
+    flag != Some(false)
+        && arch == "gfx1201"
+        && k > 0
+        && k % 256 == 0
+        && m > 0
+        && m % 4 == 0
+        && n > 0
+        && y_ptr % 4 == 0
+        && m.max(k).max(n) <= i32::MAX as usize
+        && crate::gemm::pm_output_extent_bytes(n, m, out_elem_bytes).is_some()
+        && m.checked_mul(k / 256)
+            .and_then(|g| g.checked_mul(MQ6_GROUP_BYTES))
+            .is_some_and(|w| w <= crate::gemm::PM_OUTPUT_EXTENT_LIMIT_BYTES)
+}
 
 /// Scope decision of the MQ6 INT8 route past the device/shape preconditions:
 /// `Some(false)` off, `Some(true)` on for any scope, unset on in qwen4 scope
@@ -140,9 +182,41 @@ impl Gpu {
             )
     }
 
+    /// Name of the kernel [`Gpu::gemm_mq6g256v2_i8_prequant`] launches for these
+    /// arguments (the PeaceMaker twin entry or the hipcc one); `None` off gfx1201 /
+    /// gfx1151.
+    pub fn gemm_mq6g256v2_i8_kernel_name(
+        &self,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        y: &GpuTensor,
+    ) -> Option<&'static str> {
+        let bf16 = y.dtype == DType::BF16;
+        if mq6_i8_pm_admits(
+            self.flags.mq6_i8_pm,
+            &self.arch,
+            m,
+            k,
+            batch_size,
+            if bf16 { 2 } else { 4 },
+            y.buf.as_ptr() as usize,
+        ) {
+            return Some(if bf16 {
+                MQ6_I8_PM_ENTRY_BF16
+            } else {
+                MQ6_I8_PM_ENTRY_F32
+            });
+        }
+        let (_, _, _, _, tile) =
+            mq6_i8_launch(&self.arch, m, batch_size, self.cu_count_or_default())?;
+        Some(mq6_i8_entry(&self.arch, tile, bf16))
+    }
+
     /// Rotate F32 `x` (`[batch_size x k]`) with the MQ FWHT (same signs as
-    /// [`Gpu::rotate_x_mq_batched_f16`]) into the shared F32 rotation scratch,
-    /// then quantize it into A8 `block_i8_128` blocks (`[k/128][batch_size]`).
+    /// [`Gpu::rotate_x_mq_batched_f16`]) and quantize it into A8 `block_i8_128`
+    /// blocks (`[k/128][batch_size]`) in one fused launch
+    /// ([`Gpu::rotate_x_mq_i8_batched`]).
     ///
     /// The returned pointer belongs to this `Gpu` and stays valid until the
     /// next INT8 activation producer call.
@@ -177,12 +251,10 @@ impl Gpu {
         }
         // `x` may be a residual owed an add (the deferred fold): read it flushed.
         self.flush_residual_fold()?;
-        let x_rot = self.take_mq6_x_rot(elems)?;
-        let result = self
-            .rotate_x_mq_batched(x, &x_rot, k, batch_size)
-            .and_then(|()| self.ensure_int8_mmq_x(&x_rot, batch_size, k));
-        self.put_mq6_x_rot(x_rot);
-        result
+        // One pass: FWHT rotate straight into the A8 blocks (no F32 round trip).
+        let reservation = self.reserve_int8_mmq(k, batch_size)?;
+        let prepared = self.rotate_x_mq_i8_batched(x, None, reservation, k, batch_size)?;
+        self.int8_mmq_prepared_ptr(&prepared, k, batch_size)
     }
 
     /// Overwrite `y` (`[batch_size x m]`, F32, or BF16 bits when
@@ -237,8 +309,34 @@ impl Gpu {
                 "gemm_mq6g256v2_i8: exact gfx1201 or gfx1151 required",
             ));
         };
-        let kernel = mq6_i8_entry(&self.arch, tile, bf16);
-        self.ensure_kernel(module, source, kernel)?;
+        let pm = mq6_i8_pm_admits(
+            self.flags.mq6_i8_pm,
+            &self.arch,
+            m,
+            k,
+            batch_size,
+            if bf16 { 2 } else { 4 },
+            y.buf.as_ptr() as usize,
+        );
+        let kernel = if pm {
+            if bf16 {
+                MQ6_I8_PM_ENTRY_BF16
+            } else {
+                MQ6_I8_PM_ENTRY_F32
+            }
+        } else {
+            mq6_i8_entry(&self.arch, tile, bf16)
+        };
+        let tile = if pm { MQ6_I8_PM_TILE } else { tile };
+        if pm {
+            self.ensure_embedded_kernel(
+                MQ6_I8_PM_MODULE,
+                kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201,
+                kernel,
+            )?;
+        } else {
+            self.ensure_kernel(module, source, kernel)?;
+        }
         let mut ap = a.buf.as_ptr();
         let mut xp = xq;
         let mut yp = y.buf.as_ptr();
@@ -253,6 +351,12 @@ impl Gpu {
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ];
+        // The PM image keeps K1's FullSet kernarg layout: a seventh explicit
+        // by-value word (`unused`, offset 36) precedes the hidden block counts.
+        let mut unused = 0i32;
+        if pm {
+            params.push(&mut unused as *mut _ as *mut c_void);
+        }
         let bytes = weight_bytes + batch_size * (k / 128) * BLOCK_I8_128_BYTES + out_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
         let result = self.launch_maybe_blob(
@@ -269,6 +373,9 @@ impl Gpu {
                 b.push_i32(mv);
                 b.push_i32(kv);
                 b.push_i32(nv);
+                if pm {
+                    b.push_i32(unused);
+                }
                 b
             },
         );
@@ -348,6 +455,43 @@ mod tests {
     }
 
     #[test]
+    fn pm_twin_is_the_gfx1201_default_with_the_32_bit_address_contract() {
+        let ok = |flag, arch, m, k, n, eb, y| mq6_i8_pm_admits(flag, arch, m, k, n, eb, y);
+        assert!(ok(Some(true), "gfx1201", 2560, 5120, 4000, 4, 256));
+        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 2, 4));
+        // FN's largest M at a vocabulary-sized token count stays inside 2^31 bytes.
+        assert!(ok(Some(true), "gfx1201", 248_320, 5120, 2162, 4, 256));
+        assert!(!ok(Some(true), "gfx1201", 248_320, 5120, 4000, 4, 256));
+        // Unset is the default: PM wherever admitted, hipcc where not; `0` keeps hipcc.
+        assert!(ok(None, "gfx1201", 2560, 5120, 4000, 4, 256));
+        assert!(!ok(None, "gfx1201", 248_320, 5120, 4000, 4, 256));
+        assert!(!ok(Some(false), "gfx1201", 2560, 5120, 4000, 4, 256));
+        assert!(!ok(Some(false), "gfx1201", 48, 256, 1, 2, 4));
+        // Other archs, K % 256, M % 4, an unaligned Y and empty dims fall back.
+        assert!(!ok(Some(true), "gfx1151", 2560, 5120, 4000, 4, 256));
+        assert!(!ok(Some(true), "gfx1201", 2560, 5000, 4000, 4, 256));
+        assert!(!ok(Some(true), "gfx1201", 2562, 5120, 4000, 4, 256));
+        assert!(!ok(Some(true), "gfx1201", 2560, 5120, 4000, 4, 258));
+        assert!(!ok(Some(true), "gfx1201", 0, 5120, 4000, 4, 256));
+        assert!(!ok(Some(true), "gfx1201", 2560, 5120, 0, 4, 256));
+        // The embedded image carries both entries.
+        for entry in [MQ6_I8_PM_ENTRY_F32, MQ6_I8_PM_ENTRY_BF16] {
+            assert!(
+                kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201
+                    .windows(entry.len())
+                    .any(|w| w == entry.as_bytes()),
+                "image lacks {entry}"
+            );
+        }
+        // The twin's tile and LDS are the hipcc gfx12 build's.
+        let (_, _, threads, lds, tile) = mq6_i8_launch("gfx1201", 2560, 512, 48).unwrap();
+        assert_eq!(
+            (threads, lds, tile),
+            (256, MQ6_I8_GFX12_LDS_BYTES, MQ6_I8_PM_TILE)
+        );
+    }
+
+    #[test]
     fn entries_follow_arch_tile_and_output() {
         assert_eq!(
             mq6_i8_entry("gfx1201", 128, false),
@@ -423,6 +567,33 @@ mod tests {
             kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC.contains(&gfx12),
             "gfx12 LDS contract drifted from the kernel header"
         );
+    }
+
+    /// The one-pass producer is the plain A8 rotate recipe: quantizer prelude without its
+    /// standalone kernel, the emit aliases, the entry define, then the unmodified rotate body
+    /// with neither the sigmoid gate nor AWQ.
+    #[test]
+    fn one_pass_producer_sources_are_the_plain_a8_rotate_recipe() {
+        for (src, entry) in [
+            (kernels::MQ_ROTATE_X_I8_GFX12_SRC, "mq_rotate_x_i8_gfx12"),
+            (kernels::MQ_ROTATE_X_I8_GFX11_SRC, "mq_rotate_x_i8_gfx11"),
+        ] {
+            assert!(src.starts_with("#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n"));
+            assert!(src.contains(&format!("#define HIPFIRE_ROTATE_KERNEL {entry}\n")));
+            assert!(src.contains(
+                "#define emit_iu4_sidecar_from_producer8 emit_i8_sidecar_from_producer8"
+            ));
+            for gate in [
+                "#define HIPFIRE_ROTATE_SIGMOID_GATE",
+                "#define HIPFIRE_ROTATE_AWQ",
+                "#define HIPFIRE_IU4_RUNTIME_CAND",
+            ] {
+                assert!(!src.contains(gate), "{entry}: unexpected {gate}");
+            }
+            let emit = src.find("emit_i8_sidecar_from_producer8(").unwrap();
+            let body = src.find("HIPFIRE_ROTATE_KERNEL(").unwrap();
+            assert!(emit < body, "{entry}: emit must precede the rotate body");
+        }
     }
 
     #[test]
