@@ -461,11 +461,11 @@ pub struct FeatureFlags {
     /// The same `HIPFIRE_FA_PREFILL_PM_QPREP` key resolved for the native fp8-E4M3 KV codec;
     /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (on only on exact gfx1201 when unset).
     pub fa_prefill_pm_qprep_fp8_kv: bool,
-    /// `HIPFIRE_MOE_ROTATE_I4_PM` (`developer.moe_rotate_i4_pm`): typed opt-in for the exact
-    /// PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`. The route has raw
-    /// inventory (exact gfx1201) but no qualification row: unset is off everywhere, explicit 1
-    /// opts in (raw inventory, the requested symmetric IU4 route, the C2 candidate set and the
-    /// launch shape are all applied at selection), 0 kills.
+    /// `HIPFIRE_MOE_ROTATE_I4_PM` (`developer.moe_rotate_i4_pm`): typed flag for the exact
+    /// PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`, resolved through its
+    /// qualification (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills). Raw
+    /// inventory, the requested symmetric IU4 route, the C2 candidate set and the launch shape
+    /// are applied at selection.
     pub moe_rotate_i4_pm: bool,
     /// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (`developer.prefill_iu4_producer_fused`): typed
     /// flag for the exact IU4 producer fusion, resolved through its qualification (on only on
@@ -473,15 +473,15 @@ pub struct FeatureFlags {
     /// conjunct at the callers. Read here only so the exact C8 PM wrappers can nest beneath it.
     pub prefill_iu4_producer_fused: bool,
     /// `HIPFIRE_PREFILL_IU4_C8_PM` (`developer.prefill_iu4_c8_pm`): typed flag for the
-    /// PeaceMaker C8 rotate / RMSNorm-rotate producer twins. Raw inventory only (no qualified
-    /// row): unset is off, explicit 1 opts in (raw inventory is applied at admission), 0 kills.
-    /// Nests beneath the resolved `prefill_iu4_producer_fused` flag.
+    /// PeaceMaker C8 rotate / RMSNorm-rotate producer twins, resolved through its qualification
+    /// (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills; raw inventory is
+    /// applied at admission). Nests beneath the resolved `prefill_iu4_producer_fused` flag.
     pub prefill_iu4_c8_pm: bool,
-    /// `HIPFIRE_GDN_CHUNK_PREP_PM` (`developer.gdn_chunk_prep_pm`): typed opt-in for the PM
-    /// twin of `gdn_chunk_prep` (A3B 16/32-head GDN chunk-scan preamble). The route has raw
-    /// exact-gfx1201 inventory and no `QUALIFIED` row, so unset is off everywhere, explicit 1
-    /// opts in and 0 kills. Independent of the chunk-scan flag as a flag; the MoE chunk-scan
-    /// layer admission still applies in `hipfire-arch-qwen35`.
+    /// `HIPFIRE_GDN_CHUNK_PREP_PM` (`developer.gdn_chunk_prep_pm`): typed flag for the PM
+    /// twin of `gdn_chunk_prep` (A3B 16/32-head GDN chunk-scan preamble), resolved through its
+    /// qualification (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills).
+    /// Independent of the chunk-scan flag as a flag; the MoE chunk-scan layer admission still
+    /// applies in `hipfire-arch-qwen35`.
     pub gdn_chunk_prep_pm: bool,
     /// gfx1201 packet-minimal Q128 FA2 body (`HIPFIRE_GFX12_FA_PACKET`,
     /// `kernel.gfx12_fa_packet`). Default ON on exact gfx1201; `=0` opts out
@@ -2916,7 +2916,7 @@ mod tests {
         }
     }
     #[test]
-    fn prefill_iu4_c8_pm_is_opt_in_beside_the_resolved_f3_flag() {
+    fn prefill_iu4_c8_pm_follows_its_qualification_beside_the_resolved_f3_flag() {
         use crate::prefill_route_capabilities::{qualified, PrefillRoute};
         let with = |arch: &str, f3: Option<&'static str>, c8: Option<&'static str>| {
             FeatureFlags::from_lookup(arch, |name| match name {
@@ -2930,14 +2930,19 @@ mod tests {
         ] {
             let gfx1201 = arch == "gfx1201";
             let unset = with(arch, None, None);
-            // F3 follows its qualification; the C8 PM route has no qualified row: off.
+            // F3 and the C8 PM route both follow their exact-gfx1201 qualification.
             assert_eq!(
                 unset.prefill_iu4_producer_fused,
                 qualified(arch, PrefillRoute::PrefillIu4ProducerFused),
                 "{arch}"
             );
             assert_eq!(unset.prefill_iu4_producer_fused, gfx1201, "{arch}");
-            assert!(!unset.prefill_iu4_c8_pm, "{arch}: unset is off");
+            assert_eq!(
+                unset.prefill_iu4_c8_pm,
+                qualified(arch, PrefillRoute::PrefillIu4C8Pm),
+                "{arch}"
+            );
+            assert_eq!(unset.prefill_iu4_c8_pm, gfx1201, "{arch}");
             assert!(!FeatureFlags::for_test(arch).prefill_iu4_c8_pm, "{arch}");
             assert!(
                 !FeatureFlags::for_test(arch).prefill_iu4_producer_fused,
@@ -2957,14 +2962,18 @@ mod tests {
     }
 
     #[test]
-    fn moe_rotate_i4_pm_is_off_unless_explicitly_enabled() {
+    fn moe_rotate_i4_pm_follows_its_qualification_and_explicit_overrides() {
         use crate::prefill_route_capabilities::{qualified, PrefillRoute};
         for arch in [
             "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
         ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert!(!qualified(arch, PrefillRoute::MoeRotateI4Pm), "{arch}");
-            assert!(!unset.moe_rotate_i4_pm, "{arch}: unset is off");
+            assert_eq!(
+                qualified(arch, PrefillRoute::MoeRotateI4Pm),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert_eq!(unset.moe_rotate_i4_pm, arch == "gfx1201", "{arch}");
             assert!(!FeatureFlags::for_test(arch).moe_rotate_i4_pm, "{arch}");
             for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 let flags = FeatureFlags::from_lookup(arch, |name| {
@@ -2999,7 +3008,7 @@ mod tests {
     }
 
     #[test]
-    fn gdn_chunk_prep_pm_is_opt_in_with_explicit_override() {
+    fn gdn_chunk_prep_pm_follows_its_qualification_with_explicit_override() {
         use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
         for arch in [
             "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
@@ -3009,10 +3018,7 @@ mod tests {
                 unset.gdn_chunk_prep_pm,
                 qualified(arch, PrefillRoute::GdnChunkPrepPm)
             );
-            assert!(
-                !unset.gdn_chunk_prep_pm,
-                "{arch}: no QUALIFIED row, unset is off"
-            );
+            assert_eq!(unset.gdn_chunk_prep_pm, arch == "gfx1201", "{arch}");
             assert!(!FeatureFlags::for_test(arch).gdn_chunk_prep_pm);
             for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 let flags = FeatureFlags::from_lookup(arch, |name| {

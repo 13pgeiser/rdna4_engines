@@ -4425,9 +4425,9 @@ fn prefill_shared_down_producer_fused_admitted(
 }
 
 /// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` (`developer.moe_shared_down_sigmoid_epi`, a
-/// typed boolean): the explicit value, read once. The route has NO qualified row, so
-/// unset is off on every architecture, `0` is off, and only `1` opts in (where the
-/// raw exact-gfx1201 inventory and the admission below hold).
+/// typed boolean): the explicit value, read once. Unset follows the route's exact-gfx1201
+/// qualification, `0` is off and `1` opts in (where the raw exact-gfx1201 inventory and the
+/// admission below hold).
 static SHARED_DOWN_SIGMOID_EPI: LazyLock<Option<bool>> =
     LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI"));
 

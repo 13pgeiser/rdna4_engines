@@ -1493,12 +1493,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "iu4-c8-pm-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::iu4_c8_pm_eager is !(replay.is_recording() || graphs.capture_mode) (rdna-compute/src/iu4_c8_pm.rs); the standalone PM C8 launchers refuse when false before loading or launching, and Gpu::iu4_c8_pm_admitted (the gate of the production exact F3 wrappers) forwards it into pure c8_pm_admission together with the RESOLVED HIPFIRE_PREFILL_IU4_C8_PM flag (raw inventory only, no qualified row: unset is off, explicit 0 kills), the RESOLVED HIPFIRE_PREFILL_IU4_PRODUCER_FUSED flag, raw exact-gfx1201 inventory of both routes, rotate K 2048/4096 or norm K 2048, rows 1..8192 and valid F32 operands",
+        condition: "Gpu::iu4_c8_pm_eager is !(replay.is_recording() || graphs.capture_mode) (rdna-compute/src/iu4_c8_pm.rs); the standalone PM C8 launchers refuse when false before loading or launching, and Gpu::iu4_c8_pm_admitted (the gate of the production exact F3 wrappers) forwards it into pure c8_pm_admission together with the RESOLVED HIPFIRE_PREFILL_IU4_C8_PM flag (qualified on exact gfx1201: unset follows the qualification, explicit 0 kills), the RESOLVED HIPFIRE_PREFILL_IU4_PRODUCER_FUSED flag, raw exact-gfx1201 inventory of both routes, rotate K 2048/4096 or norm K 2048, rows 1..8192 and valid F32 operands",
         effect: KernelSelection,
-        switches: "admitted eager (opt-in only): the byte-oracle-certified PeaceMaker C8 rotate / RMSNorm-rotate twin replaces the HIP exact (cand_mode 8) producer in the F3 route; recorded/captured, unset/0 or refused: the unchanged HIP exact producer, with its own recorder/capture funnel; enabled refusals log once per typed reason",
+        switches: "admitted eager (default on exact gfx1201): the byte-oracle-certified PeaceMaker C8 rotate / RMSNorm-rotate twin replaces the HIP exact (cand_mode 8) producer in the F3 route; recorded/captured, 0 or refused: the unchanged HIP exact producer, with its own recorder/capture funnel; enabled refusals log once per typed reason",
         kernels: &["iu4_c8_rotate_pm_gfx1201", "iu4_c8_rmsnorm_rotate_pm_gfx1201"],
         verdict: NotEquivalent,
-        evidence: "opt-in kernel/launch selection, not a claim of byte equivalence to the incumbent launch (the iu4_c8_pm_oracle GPU byte oracle compares payload, scales, integer sums and the f32 rotated output against the HIP exact C8 producer). The route has no qualified row, so no default program or unset configuration reaches it; recording and all hipGraph captures keep the incumbent",
+        evidence: "kernel/launch selection, not a claim of byte equivalence to the incumbent launch (the iu4_c8_pm_oracle GPU byte oracle compares payload, scales, integer sums and the f32 rotated output against the HIP exact C8 producer). Unset configurations reach it only in eager prefill on exact gfx1201; recording and all hipGraph captures keep the incumbent, so no recorded program reaches it",
         reaches: &[],
     },
     Decision {
