@@ -171,6 +171,9 @@ enum { kMaxSegs = 8 };
 static const int kRefConsume = 1;
 /* Rows captured after every DiT block by the R4D_DIT_SEL window shadow (see b_dbgl). */
 enum { kDbgL = 64 };
+/* Rows of the velocity-head isolation shadow (b_hnd): norm_out's stream over the first video
+ * rows, enough to tell a faithful head from one fed the wrong modulation. */
+enum { kVidDbgL = 256 };
 
 /* ================================================================== geometry, on the host */
 /* diffusers' AutoencoderKLMiniMaxH3._split_tiles in latents: the first latent of each tile across
@@ -593,6 +596,12 @@ struct Model {
      * diverges first. [L * kDbgL, D] f32 PERSIST. */
     rad_buf b_dbgl = 0;
     rad_op  op_dbgl = 0;
+    /* Velocity-head isolation (#62): norm_out's stream over the first kVidDbgL video rows, and
+     * this step's norm_out shift/scale table row (3 segments x 2 vectors of D). */
+    rad_buf b_hnd = 0;
+    rad_op  op_hnd = 0;
+    rad_buf b_noutd = 0;
+    rad_op  op_noutd = 0;
     /* The step's gathered modulation table (b_modg) cast to f32: every block's and segment's cell,
      * both ranks' column halves, the exact vectors the norms consume. PERSIST f32 twin of a bf16
      * scratch (the b_ax2 lesson). [world * L * kMaxSegs, Ws] f32. */
@@ -1274,16 +1283,29 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                       RAD_NOWEIGHTS),
                              { m.b_temb }, { m.b_tembd });
         }
-        /* The per-block window shadow: the stream's first kDbgL rows after every block. Full-width
-         * per-block capture is gigabytes; a 64-row fingerprint tells whose forward diverges first. */
+        /* The per-block window shadow: the stream's first kDbgL rows after every block (issued off
+         * b_h after the fold -- see step_dit). Full-width per-block capture is gigabytes; a 64-row
+         * fingerprint tells whose forward diverges first. */
         m.b_dbgl = decl_b(b, nm.f("dit.blkdbg"), RAD_F32,
                           { (int64_t)L * kDbgL, D }, RAD_BUF_PERSIST);
         m.op_dbgl = rw(b, RAD_OP(b, "cast",
                                  RAD_PARAMS(RAD_RANGE("M", 1, kDbgL), RAD_INT("n", D),
                                             RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
                                  RAD_NOWEIGHTS),
-                        { m.b_ao }, { m.b_dbgl });
-        if (!m.op_dh0 || !m.op_modd || !m.op_dbgl || (m.curve > 0 && !m.op_tembd))
+                       { m.b_h }, { m.b_dbgl });
+        /* The velocity-head isolation: this step's norm_out shift/scale table row (three
+         * segments, two D-vectors each). The RMS norm makes the output heads scale-invariant, so
+         * replaying the heads over it and over b_hnd (declared with b_hn below) -- checkpoint
+         * weights, exact math -- either reproduces the step's velocity or convicts the head's
+         * modulation itself. */
+        m.b_noutd = decl_b(b, nm.f("dit.noutdbg"), RAD_F32, { 1, (int64_t)kMaxSegs * 2 * D }, RAD_BUF_PERSIST);
+        m.op_noutd = rw(b, RAD_OP(b, "cast",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", (int64_t)kMaxSegs * 2 * D),
+                                             RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                  RAD_NOWEIGHTS),
+                         { m.b_nout }, { m.b_noutd });
+        if (!m.op_dh0 || !m.op_modd || !m.op_dbgl || !m.op_noutd ||
+            (m.curve > 0 && !m.op_tembd))
             return RAD_E_INVAL;
     }
     /* Learn the trunk's weight format from one linear before declaring the activation code planes.
@@ -1482,6 +1504,17 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the output: norm_out's modulated norm (the last block's branch gated in), the heads in
      * f32 over parts of the rows, and the two Euler steps into the lane */
     m.b_hn = decl_b(b, nm.f("dit.hn"), RAD_BF16, { T, D });
+    /* The velocity-head isolation shadow over b_hn (see b_noutd above): the head's normalised
+     * input, first kVidDbgL video rows. Declared here because it reads b_hn. */
+    if (m.dit_dbg) {
+        m.b_hnd = decl_b(b, nm.f("dit.hndbg"), RAD_F32, { kVidDbgL, D }, RAD_BUF_PERSIST);
+        m.op_hnd = rw(b, RAD_OP(b, "cast",
+                                RAD_PARAMS(RAD_RANGE("M", 1, kVidDbgL), RAD_INT("n", D),
+                                           RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                RAD_NOWEIGHTS),
+                       { m.b_hn }, { m.b_hnd });
+        if (!m.op_hnd) return RAD_E_INVAL;
+    }
     m.w_no_n = wcopy(b, nm.f("dit.nout.norm.weight"), nm.ckpt("transformer.norm_out.norm.weight"),
                      RAD_BF16, { D }, RAD_ACCESS_PER_TOKEN, gx);
     if (!m.w_no_n) return RAD_E_INVAL;
@@ -3253,6 +3286,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 m.b_modd ? (int64_t)gd.world * gd.n_layer * kMaxSegs * m.Ws * 4 : 0;
             d.dbg_dit_blk = m.b_dbgl;
             d.dbg_dit_blk_bytes = m.b_dbgl ? gd.n_layer * kDbgL * m.D * 4 : 0;
+            d.dbg_dit_hn = m.b_hnd;
+            d.dbg_dit_hn_bytes = m.b_hnd ? kVidDbgL * m.D * 4 : 0;
+            d.dbg_dit_nout = m.b_noutd;
+            d.dbg_dit_nout_bytes = m.b_noutd ? (int64_t)kMaxSegs * 2 * m.D * 4 : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3689,17 +3726,20 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         for (int h = 0; h < nh; ++h) {
             const int64_t r0 = hr0[h], n = hn[h];
             if (h > 0 && l > 0) wait_ar();
-            /* The dump's per-block window (R4D_DIT_SEL): block l-1's output rows [0, kDbgL) --
-             * exactly the rows and the ordering point this block's own norm reads them at, so no
-             * extra lane dance is needed. */
-            if (m.dit_dbg && V->step == 0 && l > 0 && h == 0 && R >= kDbgL)
-                RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_ao, 0, kDbgL, D),
-                            brow_slice(m.b_dbgl, (l - 1) * kDbgL, kDbgL, D));
             RAD_ISSUE_N(c, B.op_mq1, n, l > 0 ? brow_slice(m.b_ao, r0, n, D) : RAD_NONE,
                         l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2),
                         RAD_W(B.w_n1), segh[h], brow_slice(m.b_h, r0, n, D),
                         brow_slice(m.a_hm.cq(), r0, n, D), brow_slice(m.a_hm.cs(), r0, n, nD),
                         RAD_NONE);
+            /* The dump's per-block window (R4D_DIT_SEL): block l-1's residual STREAM rows
+             * [0, kDbgL). b_ao is not the stream -- it holds block l-1's raw MLP delta until this
+             * block's norm folds it -- but op_mq1 writes the folded stream back to b_h, so right
+             * after its issue b_h equals the stream the reference holds after block l-1. Rows
+             * [0, kDbgL) belong to half 0, whose op_mq1 this follows; the deferred stream orders
+             * the cast after the fold it reads. */
+            if (m.dit_dbg && V->step == 0 && l > 0 && h == 0 && R >= kDbgL)
+                RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_h, 0, kDbgL, D),
+                            brow_slice(m.b_dbgl, (l - 1) * kDbgL, kDbgL, D));
             B.qkv.step(c, m.a_hm, m.b_qkv, R, r0, n);
         }
         RAD_ISSUE_N(c, B.op_qkr, R, bcol(m.b_qkv, 0, 3 * qd, R), pos, RAD_W(B.w_qn),
@@ -3742,14 +3782,26 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         }
     }
     wait_ar();
-    if (m.dit_dbg && V->step == 0 && R >= kDbgL)
-        RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_ao, 0, kDbgL, D),
-                    brow_slice(m.b_dbgl, (L - 1) * kDbgL, kDbgL, D));
     const char* nout = (const char*)rad_buf_ptr(c, m.b_nout) +
                        (lane * m.S + V->step) * ng * 2 * D * (int64_t)sizeof(uint16_t);
     RAD_ISSUE_N(c, m.op_nout, R, brows(m.b_ao, R), mod(L - 1, 5, 1),
                 RAD_P_T2(nout, RAD_BF16, ng, 2 * D), RAD_W(m.w_no_n), mod_segs, brows(m.b_h, R),
                 brows(m.b_hn, R));
+    /* Block 49's stream, slot L-1: only op_nout folds the last MLP delta into b_h (the reference
+     * FinalLayer norms the same post-fold stream), so this follows it. Nothing between here and
+     * the pass' end writes b_h. */
+    if (m.dit_dbg && V->step == 0 && R >= kDbgL)
+        RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_h, 0, kDbgL, D),
+                    brow_slice(m.b_dbgl, (L - 1) * kDbgL, kDbgL, D));
+    /* The velocity-head isolation: the head's own operands -- norm_out's stream over the video
+     * rows this request's heads run on, and this step's shift/scale table row -- so the CPU
+     * replay can apply the checkpoint head to them and say whether it reproduces b_vel. */
+    if (m.dit_dbg && V->step == 0 && vrows >= kVidDbgL) {
+        RAD_ISSUE_N(c, m.op_hnd, kVidDbgL, brow_slice(m.b_hn, vseg, kVidDbgL, D),
+                    brows(m.b_hnd, kVidDbgL));
+        RAD_ISSUE_N(c, m.op_noutd, 1, brow_slice(m.b_nout, lane * m.S + V->step, 1, (int64_t)kMaxSegs * 2 * D),
+                    brows(m.b_noutd, 1));
+    }
 
     /* The heads, in f32 over parts of the rows. */
     auto heads = [&](rad_op op, rad_weight w, rad_weight bias, int64_t first, int64_t n, int64_t nout_c,

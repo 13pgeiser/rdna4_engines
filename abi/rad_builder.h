@@ -1055,6 +1055,10 @@ typedef struct RadVideoGenDecl {
     int64_t       dbg_dit_mod_bytes;
     rad_buf       dbg_dit_blk;     /* [n_layer, DBG_ROWS, D] f32: a row window after every block */
     int64_t       dbg_dit_blk_bytes;
+    rad_buf       dbg_dit_hn;      /* [DBG_VID_ROWS, D] f32: norm_out's stream, video rows head */
+    int64_t       dbg_dit_hn_bytes;
+    rad_buf       dbg_dit_nout;    /* [1, 3 * 2 * D] f32: this step's norm_out shift/scale row */
+    int64_t       dbg_dit_nout_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
