@@ -1031,7 +1031,7 @@ mod tests {
             lds.fill(0);
             let mut st = state();
             st.v[2][0] = 8; // ADDR
-            // DATA0 = v4.. (1, 2), DATA1 = v8.. (3, 4): the two data operands are not adjacent.
+                            // DATA0 = v4.. (1, 2), DATA1 = v8.. (3, 4): the two data operands are not adjacent.
             for w in 0..2 {
                 st.v[4 + w][0] = 0x1111_1111 * (w as u32 + 1);
                 st.v[8 + w][0] = 0x1111_1111 * (w as u32 + 3);
@@ -1061,7 +1061,10 @@ mod tests {
                     "{name} byte {byte}"
                 );
             };
-            let (a0, a1) = (8 + usize::from(off0) * 64 * size, 8 + usize::from(off1) * 64 * size);
+            let (a0, a1) = (
+                8 + usize::from(off0) * 64 * size,
+                8 + usize::from(off1) * 64 * size,
+            );
             at(a0, 1);
             at(a1, 3);
             if words == 2 {
@@ -1069,7 +1072,11 @@ mod tests {
                 at(a1 + 4, 4);
             }
             let nonzero = lds.iter().filter(|&&b| b != 0).count();
-            assert_eq!(nonzero, 2 * size, "{name}: only the two elements are written");
+            assert_eq!(
+                nonzero,
+                2 * size,
+                "{name}: only the two elements are written"
+            );
         }
         // Load: dwords come back from the same two scaled addresses.
         let mut st = state();
@@ -1093,6 +1100,9 @@ mod tests {
             &mut lds,
         )
         .unwrap();
-        assert_eq!([st.v[4][0], st.v[5][0], st.v[6][0], st.v[7][0]], [1, 2, 3, 4]);
+        assert_eq!(
+            [st.v[4][0], st.v[5][0], st.v[6][0], st.v[7][0]],
+            [1, 2, 3, 4]
+        );
     }
 }

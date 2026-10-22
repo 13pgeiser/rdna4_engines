@@ -1929,7 +1929,9 @@ fn udiv_scalar_float(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<
 /// instruction executes once with a full EXEC; other sources and a partial EXEC are not measured.
 fn udiv_scalar_rcp(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     if arch != Arch::Gfx1201 {
-        return Err(format!("v_s_rcp_f32 is measured on gfx1201 only, not {arch:?}"));
+        return Err(format!(
+            "v_s_rcp_f32 is measured on gfx1201 only, not {arch:?}"
+        ));
     }
     let m = &i.mods;
     if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.clamp {
@@ -5429,7 +5431,11 @@ mod tests {
         } else {
             vec![sreg(0), sreg(1), Operand::Literal(0x4f7f_fffe)]
         };
-        let ops = if name == "s_mul_f32" { ops } else { ops[..2].to_vec() };
+        let ops = if name == "s_mul_f32" {
+            ops
+        } else {
+            ops[..2].to_vec()
+        };
         let i = insn_on(arch, name, ops);
         let mut st = state();
         st.exec = u32::MAX;
@@ -5457,10 +5463,29 @@ mod tests {
 
     #[test]
     fn scalar_udiv_expansion_is_exact_integer_division() {
-        let dens = (1u32..=300)
-            .chain([1000, 4095, 4096, 65535, 65536, 65537, 1 << 20, (1 << 24) - 1, 1 << 24]);
+        let dens = (1u32..=300).chain([
+            1000,
+            4095,
+            4096,
+            65535,
+            65536,
+            65537,
+            1 << 20,
+            (1 << 24) - 1,
+            1 << 24,
+        ]);
         for den in dens {
-            for num in [0u32, 1, den - 1, den, den + 1, 7 * den + 3, 12345, u32::MAX, u32::MAX - den] {
+            for num in [
+                0u32,
+                1,
+                den - 1,
+                den,
+                den + 1,
+                7 * den + 3,
+                12345,
+                u32::MAX,
+                u32::MAX - den,
+            ] {
                 assert_eq!(
                     udiv_expansion(num, den),
                     Ok((num / den, num % den)),
@@ -5484,7 +5509,10 @@ mod tests {
         assert!(udiv_float("v_s_rcp_f32", f(16777218.0)).is_err());
         assert_eq!(udiv_float("v_s_rcp_f32", f(4.0)), Ok(f(0.25)));
         // s_mul_f32: normals only, finite normal product.
-        assert_eq!(udiv_float("s_mul_f32", f(0.5)), Ok(f(0.5 * f32::from_bits(0x4f7f_fffe))));
+        assert_eq!(
+            udiv_float("s_mul_f32", f(0.5)),
+            Ok(f(0.5 * f32::from_bits(0x4f7f_fffe)))
+        );
         for bad in [0, 0x8000_0000, 1, 0x7f80_0000, 0x7fc0_0000, 0x7f7f_ffff] {
             assert!(udiv_float("s_mul_f32", bad).is_err(), "{bad:#x}");
         }
@@ -5500,7 +5528,11 @@ mod tests {
         st.s[1] = f(2.0);
         st.exec = 1;
         assert!(execute(Arch::Gfx1201, "v_s_rcp_f32", &i, &mut st).is_err());
-        let j = insn_on(Arch::Gfx1151, "s_mul_f32", vec![sreg(0), sreg(1), Operand::Literal(0x4f7f_fffe)]);
+        let j = insn_on(
+            Arch::Gfx1151,
+            "s_mul_f32",
+            vec![sreg(0), sreg(1), Operand::Literal(0x4f7f_fffe)],
+        );
         assert!(execute(Arch::Gfx1151, "s_mul_f32", &j, &mut state()).is_err());
     }
 
@@ -5525,7 +5557,10 @@ mod tests {
             if got != Ok((o[0], o[1] != 0)) {
                 bad += 1;
                 if bad <= 8 {
-                    eprintln!("div_scale tuple {n} {t:x?}: model {got:x?}, hardware {:#x} flag {}", o[0], o[1]);
+                    eprintln!(
+                        "div_scale tuple {n} {t:x?}: model {got:x?}, hardware {:#x} flag {}",
+                        o[0], o[1]
+                    );
                 }
             }
         }
@@ -5541,10 +5576,18 @@ mod tests {
             if r != [x, rcp, m, u] {
                 bad += 1;
                 if bad <= 8 {
-                    eprintln!("scalar_udiv den {den}: model {:x?}, hardware {r:x?}", [x, rcp, m, u]);
+                    eprintln!(
+                        "scalar_udiv den {den}: model {:x?}, hardware {r:x?}",
+                        [x, rcp, m, u]
+                    );
                 }
             }
         }
-        assert_eq!(bad, 0, "scalar udiv mismatches over {} denominators", rec.len() / 4);
+        assert_eq!(
+            bad,
+            0,
+            "scalar udiv mismatches over {} denominators",
+            rec.len() / 4
+        );
     }
 }
