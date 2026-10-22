@@ -988,6 +988,25 @@ mod tests {
         assert_eq!(a.x.len(), 2 * 4 * XBLK_BYTES);
     }
 
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip");
+
+    #[test]
+    fn rip_twin_is_identical_to_generator() {
+        for (epi, raster) in [
+            ("set", "banded"),
+            ("set_bf16", "banded"),
+            ("set", "linear"),
+            ("set_bf16", "linear"),
+        ] {
+            let spec = parse_spec(epi, raster).unwrap();
+            let (_, symbol, info) = compile_rip(TWIN, spec).unwrap();
+            assert_eq!(symbol, spec.symbol());
+            assert_eq!(info["identical_to_generator"], true, "{epi} {raster}");
+            assert_eq!(info["variant"], spec.variant_name());
+            assert_eq!(info["sha256"], sha256_hex(TWIN.as_bytes()));
+        }
+    }
+
     #[test]
     fn rip_garbage_is_refused() {
         let spec = parse_spec("set", "banded").unwrap();
