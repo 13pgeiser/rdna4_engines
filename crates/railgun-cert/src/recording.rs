@@ -1074,7 +1074,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "ds4-gfx942-compressor-sentinel-gate",
         predicates: &[CaptureMode],
-        condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs:2236-2250)",
+        condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs compressor_op)",
         effect: KernelSelection,
         switches: "eager: compressor kernels skipped on non-boundary tokens; captured: launched and sentinel-early-returned",
         kernels: &["compressor_*"],
@@ -1085,7 +1085,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "ds4-gfx942-ffn-overlap",
         predicates: &[CaptureMode],
-        condition: "gfx942_ffn_overlap_on && !capture_mode (forward.rs:4390-4391)",
+        condition: "gfx942_ffn_overlap_on && !capture_mode (forward.rs expert_ffn_schedule)",
         effect: KernelSelection,
         switches: "eager: shared/routed FFN on two streams; captured: serial FFN",
         kernels: &[],
@@ -1578,7 +1578,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-deepseek4/src/forward.rs",
-        function: "compressor_forward_impl",
+        function: "compressor_op",
         occurrences: 1,
         decisions: &["ds4-gfx942-compressor-sentinel-gate"],
     },
@@ -1596,7 +1596,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-deepseek4/src/forward.rs",
-        function: "ds4_moe_block_core",
+        function: "expert_ffn_schedule",
         occurrences: 2,
         decisions: &["ds4-gfx942-ffn-overlap", "replay-enabled-process-route"],
     },
