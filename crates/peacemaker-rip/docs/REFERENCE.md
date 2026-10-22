@@ -465,7 +465,7 @@ The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, 
 fn emit(spec: Spec) -> Result<Emitted, String> {
     Iu4Gemm::emit(Iu4Spec {
         fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch,
+        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch, mma: Mma::Dense,
     })
 }
 ```

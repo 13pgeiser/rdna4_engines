@@ -28,8 +28,8 @@ use crate::value::Value;
 use peacemaker_author::runtime::{Exit, Lend, RingId};
 use peacemaker_author::{Free, Published};
 use peacemaker_isa::kernels::iu4_gemm::{
-    self as iu4, blocks, ALayout, Cacc, Epi, Fold, FreeRings, Gen, Lds, MetaD, MetaS, PayA, PayW,
-    Tile, Wg,
+    self as iu4, blocks, ALayout, Cacc, Epi, Fold, FreeRings, Gen, Lds, MetaD, MetaS, Mma, PayA,
+    PayW, Tile, Wg,
 };
 use peacemaker_isa::kernels::qwen4_moe_sym as moe;
 use peacemaker_isa::Emitted;
@@ -50,6 +50,8 @@ const FNS: &[&str] = &[
     "iu4::kloop",
     "iu4::block",
     "iu4::block_stepping",
+    "iu4::sparse_block",
+    "iu4::sparse_block_stepping",
     "iu4::step_descriptor",
     "iu4::trip_end",
     "iu4::trips_cmp",
@@ -71,6 +73,7 @@ pub(super) fn is_type(n: &str) -> bool {
             | "Cacc"
             | "Epi"
             | "ALayout"
+            | "Mma"
             | "MoeKind"
             | "WeightCodec"
             | "Iu4Spec"
@@ -103,6 +106,7 @@ const ENUMS: &[(&str, &[&str])] = &[
         ],
     ),
     ("ALayout", &["Token", "Slab"]),
+    ("Mma", &["Dense", "S24X64", "S24X32"]),
     ("MoeKind", &["GateUp", "Down"]),
     ("WeightCodec", &["Mq4Sym", "Mq3I4", "E8pI4"]),
 ];
@@ -180,6 +184,14 @@ fn layout_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<ALayout> {
         o => Err(unknown("ALayout", o)),
     }
 }
+fn mma_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Mma> {
+    match variant_of(it, v, "Mma")?.as_str() {
+        "Dense" => Ok(Mma::Dense),
+        "S24X64" => Ok(Mma::S24X64),
+        "S24X32" => Ok(Mma::S24X32),
+        o => Err(unknown("Mma", o)),
+    }
+}
 fn kind_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<moe::Kind> {
     match variant_of(it, v, "MoeKind")?.as_str() {
         "GateUp" => Ok(moe::Kind::GateUp),
@@ -231,6 +243,7 @@ fn iu4_spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<iu4::Spec> {
         epi: epi_of(it, &field(&mut fs, n, "epi")?)?,
         act: layout_of(it, &field(&mut fs, n, "act")?)?,
         arch: arch_of(it, &field(&mut fs, n, "arch")?)?,
+        mma: mma_of(it, &field(&mut fs, n, "mma")?)?,
     };
     no_more(&fs, n)?;
     Ok(spec)
@@ -251,6 +264,7 @@ fn iu4_spec_value<'a>(s: iu4::Spec) -> Value<'a> {
             f("epi", enum_val("Epi", &format!("{:?}", s.epi))),
             f("act", enum_val("ALayout", &format!("{:?}", s.act))),
             f("arch", nat(Nat::Arch(s.arch))),
+            f("mma", enum_val("Mma", &format!("{:?}", s.mma))),
         ],
     )
 }
@@ -468,8 +482,12 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
             })?;
             Ok(done_with(ids, lds_val))
         }
-        "iu4::block" | "iu4::block_stepping" => {
-            let stepping = name == "iu4::block_stepping";
+        "iu4::block"
+        | "iu4::block_stepping"
+        | "iu4::sparse_block"
+        | "iu4::sparse_block_stepping" => {
+            let sparse = name.starts_with("iu4::sparse_");
+            let stepping = name.ends_with("_stepping");
             need(if stepping { 9 } else { 8 })?;
             wg_arg(it, &a[0])?;
             let g = gen_of(it, &a[1])?;
@@ -486,21 +504,21 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
             let ids = lds_of(it, &a[last])?;
             let ids = typed(cx, |wg, lend| {
                 let lds = take_lds(lend, ids)?;
+                let block = if sparse {
+                    blocks::sparse_block
+                } else {
+                    blocks::block
+                };
+                let block_stepping = if sparse {
+                    blocks::sparse_block_stepping
+                } else {
+                    blocks::block_stepping
+                };
                 let lds = match step {
-                    None => {
-                        blocks::block(wg, &g, &tag, h, fetch_next, &end_label, entry_label, lds)
+                    None => block(wg, &g, &tag, h, fetch_next, &end_label, entry_label, lds),
+                    Some(s) => {
+                        block_stepping(wg, &g, &tag, h, fetch_next, &end_label, entry_label, s, lds)
                     }
-                    Some(s) => blocks::block_stepping(
-                        wg,
-                        &g,
-                        &tag,
-                        h,
-                        fetch_next,
-                        &end_label,
-                        entry_label,
-                        s,
-                        lds,
-                    ),
                 }?;
                 give_lds(lend, ids, lds)?;
                 Ok(ids)

@@ -8,7 +8,7 @@
 //! `.rip` composition honest; the coarse natives (`Iu4Gemm::emit`,
 //! `MoeSym::emit`) return the Rust functions' values.
 
-use peacemaker_isa::kernels::iu4_gemm::{self, ALayout, Cacc, Epi, Fold, Spec, Tile};
+use peacemaker_isa::kernels::iu4_gemm::{self, ALayout, Cacc, Epi, Fold, Mma, Spec, Tile};
 use peacemaker_isa::kernels::qwen4_moe_sym as moe;
 use peacemaker_isa::Arch;
 
@@ -28,14 +28,17 @@ fn every_spec() -> Vec<Spec> {
                     Epi::QkvzaGdn,
                 ] {
                     for act in [ALayout::Token, ALayout::Slab] {
-                        out.push(Spec {
-                            fold,
-                            tile,
-                            cacc,
-                            epi,
-                            act,
-                            arch: Arch::Gfx1201,
-                        });
+                        for mma in [Mma::Dense, Mma::S24X64, Mma::S24X32] {
+                            out.push(Spec {
+                                fold,
+                                tile,
+                                cacc,
+                                epi,
+                                act,
+                                arch: Arch::Gfx1201,
+                                mma,
+                            });
+                        }
                     }
                 }
             }
@@ -91,7 +94,7 @@ fn iu4_gemm_twin_matches_the_rust_emit() {
         );
     }
     assert_eq!(
-        valid, 14,
+        valid, 18,
         "the number of valid specs changed: update VARIANTS"
     );
 }
@@ -148,7 +151,7 @@ const COARSE: &str = r#"
 fn emit(spec: Spec) -> Result<Emitted, String> {
     let s = Iu4Spec {
         fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch,
+        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch, mma: Mma::Dense,
     };
     Iu4Gemm::emit(s)
 }
@@ -163,6 +166,7 @@ fn iu4_gemm_emit_native_returns_the_rust_emitted() {
         epi: Epi::GateUpSilu,
         act: ALayout::Slab,
         arch: Arch::Gfx1201,
+        mma: Mma::Dense,
     })
     .unwrap();
     let got = peacemaker_rip::compile(COARSE, Arch::Gfx1201, "default").unwrap();
@@ -177,7 +181,7 @@ fn iu4_gemm_emit_native_returns_the_rust_emitted() {
 const COARSE_FIELDS: &str = r#"
 fn emit(spec: Spec) -> Result<Emitted, String> {
     Iu4Gemm::emit(Iu4Spec { fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::Set, arch: spec.arch })
+        epi: Epi::Set, arch: spec.arch, mma: Mma::Dense })
 }
 "#;
 

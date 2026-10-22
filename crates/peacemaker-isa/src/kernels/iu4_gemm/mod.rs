@@ -24,6 +24,7 @@ pub mod kloop;
 pub mod prologue;
 pub mod publish;
 pub mod region;
+pub mod sparse24;
 pub mod spec;
 
 use crate::kernels::common::op;
@@ -33,7 +34,7 @@ use peacemaker_author::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-pub use spec::{ALayout, Cacc, Epi, Fold, Spec, Tile};
+pub use spec::{ALayout, Cacc, Epi, Fold, Mma, Spec, Tile};
 
 /// The program's first label (the kernel entry); `Live` ranges start here.
 pub const ENTRY: &str = "entry";
@@ -701,6 +702,7 @@ pub fn emit_module(
                 epi,
                 act,
                 arch,
+                mma: Mma::Dense,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -713,6 +715,7 @@ pub fn emit_module(
             epi: Epi::Set,
             act,
             arch,
+            mma: Mma::Dense,
         }
         .module(),
     )?;
@@ -741,7 +744,8 @@ pub fn hot_loop_census(s_text: &str) -> std::collections::BTreeMap<String, u32> 
         if name.starts_with("v_dual_") {
             *counts.entry("vopd_packets".into()).or_insert(0) += 1
         }
-        if name.starts_with("v_") && !name.starts_with("v_wmma_") {
+        if name.starts_with("v_") && !name.starts_with("v_wmma_") && !name.starts_with("v_swmmac_")
+        {
             *counts.entry("valu_slots".into()).or_insert(0) += 1
         }
     }

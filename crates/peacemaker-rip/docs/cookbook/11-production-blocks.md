@@ -43,7 +43,7 @@ A kernel that only ever runs `K == 256` has no full trip. Drop the trip compare,
 fn emit(spec: Spec) -> Result<Emitted, String> {
     let g = Iu4Gen::new(Iu4Spec {
         fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::Set, act: ALayout::Token, arch: spec.arch,
+        epi: Epi::Set, act: ALayout::Token, arch: spec.arch, mma: Mma::Dense,
     })?;
     let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     let mut wg = Workgroup::new(&mut b, spec.arch)?;

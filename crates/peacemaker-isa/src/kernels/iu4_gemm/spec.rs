@@ -52,6 +52,43 @@ pub enum ALayout {
     Slab,
 }
 
+/// The matrix instruction of the K-loop. `Dense` is the shipped
+/// `v_wmma_i32_16x16x32_iu4`. `S24X64` / `S24X32` run the weights through
+/// SWMMAC (`v_swmmac_i32_16x16x64_iu4` / `v_swmmac_i32_16x16x32_iu4`): the
+/// weights are the 2:4-sparse operand A, packed by [`super::sparse24`] into
+/// the same MQ4V2 blocks, so staging, LDS layout, fold and epilogue do not
+/// change (the format saves no weight bytes: it measures the MMA-issue
+/// saving inside the production pipeline).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mma {
+    Dense,
+    S24X64,
+    S24X32,
+}
+impl Mma {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::S24X64 => "s24x64",
+            Self::S24X32 => "s24x32",
+        }
+    }
+    pub fn is_sparse(self) -> bool {
+        self != Self::Dense
+    }
+}
+impl std::str::FromStr for Mma {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "dense" => Ok(Self::Dense),
+            "s24x64" => Ok(Self::S24X64),
+            "s24x32" => Ok(Self::S24X32),
+            _ => Err(format!("unknown mma {s} (dense|s24x64|s24x32)")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Spec {
     pub fold: Fold,
@@ -60,6 +97,7 @@ pub struct Spec {
     pub epi: Epi,
     pub act: ALayout,
     pub arch: Arch,
+    pub mma: Mma,
 }
 
 /// Every variant keeps occupancy only at or below this many VGPRs (G0g:
@@ -193,7 +231,8 @@ impl Spec {
     /// The CLI knob strings (`--fold --tile --cacc --epi --alayout`) as a
     /// `Spec`, parsed in that order through the axis `FromStr` impls. The
     /// result is not validated (`emit` validates). `fold` additionally accepts
-    /// the long names `k256shared` / `k256pow2`.
+    /// the long names `k256shared` / `k256pow2`. `mma` is `Dense`: set
+    /// `spec.mma` afterwards for a sparse kernel (`--mma`).
     pub fn from_knobs(
         fold: &str,
         tile: &str,
@@ -210,6 +249,7 @@ impl Spec {
             epi: epi.parse()?,
             act,
             arch,
+            mma: Mma::Dense,
         })
     }
     pub fn control(epi: Epi) -> Self {
@@ -220,6 +260,7 @@ impl Spec {
             epi,
             act: ALayout::Token,
             arch: Arch::Gfx1201,
+            mma: Mma::Dense,
         }
     }
     /// Product symbol suffix. The control keeps the plan's `_b1`; the 16-wave
@@ -244,12 +285,17 @@ impl Spec {
             Epi::QkvzaGdn => "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn",
         };
         format!(
-            "{stem}{}{}",
+            "{stem}{}{}{}",
             self.suffix(),
             if self.epi == Epi::GateUpSiluBf16 {
                 "_bf16"
             } else {
                 ""
+            },
+            if self.mma.is_sparse() {
+                format!("_{}", self.mma.name())
+            } else {
+                String::new()
             }
         )
     }
@@ -322,7 +368,7 @@ impl Spec {
     }
     pub fn variant_name(self) -> String {
         format!(
-            "{}-{}-{}{}-{}",
+            "{}-{}-{}{}-{}{}",
             match self.fold {
                 Fold::K128 => "k128",
                 Fold::K256Shared => "k256s",
@@ -340,7 +386,12 @@ impl Spec {
                 ALayout::Token => "",
                 ALayout::Slab => "-slab",
             },
-            self.epi.name()
+            self.epi.name(),
+            if self.mma.is_sparse() {
+                format!("-{}", self.mma.name())
+            } else {
+                String::new()
+            }
         )
     }
     /// Reject combinations that have no generator: closed fold tracks, the
@@ -348,6 +399,39 @@ impl Spec {
     pub fn validate(self) -> Result<(), String> {
         if self.arch != Arch::Gfx1201 {
             return Err("iu4_gemm targets gfx1201 only".into());
+        }
+        if self.mma.is_sparse() {
+            let m = self.mma.name();
+            if self.fold != Fold::K128 {
+                return Err(format!(
+                    "sparse mma {m} needs Fold::K128 (fold axis is {:?})",
+                    self.fold
+                ));
+            }
+            if self.tile != Tile::T128x128x8 {
+                return Err(format!(
+                    "sparse mma {m} needs Tile::T128x128x8 (tile axis is {:?})",
+                    self.tile
+                ));
+            }
+            if self.cacc != Cacc::One {
+                return Err(format!(
+                    "sparse mma {m} needs Cacc::One (cacc axis is {:?})",
+                    self.cacc
+                ));
+            }
+            if self.act != ALayout::Token {
+                return Err(format!(
+                    "sparse mma {m} needs ALayout::Token (activation layout axis is {:?})",
+                    self.act
+                ));
+            }
+            if !matches!(self.epi, Epi::Set | Epi::Add) {
+                return Err(format!(
+                    "sparse mma {m} supports Epi::Set and Epi::Add only (epilogue axis is {:?})",
+                    self.epi
+                ));
+            }
         }
         if self.fold != Fold::K128 {
             return Err("K256 folds are closed at Q0 (plan §5); no product generator".into());
