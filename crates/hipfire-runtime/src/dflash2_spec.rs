@@ -19,6 +19,10 @@
 //!   `draft_indices`), with `p` the AR sampler's own truncated distribution
 //!   ([`SparseDist::build_from_logits`]), so emitted tokens are distributed
 //!   as AR's.
+//! - Verify depth: a window verifies only the draft prefix whose running
+//!   product of selector confidences stays at or above
+//!   [`VERIFY_CONFIDENCE`] (at least one draft); the draft forward still
+//!   proposes the whole block.
 //!
 //! The target is reached only through [`SpecTarget`]: it captures the feature
 //! rows (`dflash_extract_layers`), embeds the noise block and applies its head
@@ -338,10 +342,14 @@ impl Speculator for Dflash2Speculator {
             sampled.then_some(uniforms.as_slice()),
         )
         .map_err(|e| format!("Dflash2Speculator selector: {e}"))?;
-        let drafts = proposal.tokens.clone();
-        let mut block = Vec::with_capacity(b);
+        // Verify only the confident prefix of the drafts: an unconfident draft
+        // rarely survives the verify but still costs its target row. The cut is
+        // draft-side only, so greedy output stays AR's and sampled acceptance
+        // keeps AR's law.
+        let drafts = &proposal.tokens[..verify_depth(&proposal.confidence)];
+        let mut block = Vec::with_capacity(drafts.len() + 1);
         block.push(seed);
-        block.extend_from_slice(&drafts);
+        block.extend_from_slice(drafts);
         let result = self.verify_window(gpu, target, position, &block, &proposal, max_emit);
         self.settle(gpu, target, result)
     }
@@ -512,9 +520,9 @@ impl Dflash2Speculator {
     }
 }
 
-/// The selector's per-row draft distributions: row `r` puts its softmax
-/// probability on each of its top-K candidates (`draft_indices` of the
-/// reference `_rejection_sample`).
+/// The selector's per-row draft distributions of the first `rows` rows: row
+/// `r` puts its softmax probability on each of its top-K candidates
+/// (`draft_indices` of the reference `_rejection_sample`).
 fn selector_q(
     proposal: &crate::dflash::DflashCandidateProposal,
     rows: usize,
@@ -524,7 +532,7 @@ fn selector_q(
         .probabilities
         .as_ref()
         .ok_or("Dflash2Speculator: sampled selector returned no q")?;
-    if proposal.candidates.len() != rows * k || probs.len() != rows * k {
+    if proposal.candidates.len() < rows * k || probs.len() < rows * k {
         return Err("Dflash2Speculator: selector q shape mismatch".into());
     }
     Ok((0..rows)
@@ -539,6 +547,26 @@ fn selector_q(
             q
         })
         .collect())
+}
+
+/// Selector-confidence product below which a window stops verifying drafts.
+/// HIPF-135, Flash-Next on gfx1151 (verify ~36 ms + ~6 ms per row): over 6122
+/// block-8 windows, products 0.3-0.5 maximize the simulated tok/s (+18% over
+/// the best fixed depth).
+const VERIFY_CONFIDENCE: f32 = 0.5;
+
+/// Drafts a window verifies: the longest prefix whose running product of
+/// selector confidences stays at or above [`VERIFY_CONFIDENCE`], at least one.
+fn verify_depth(confidence: &[f32]) -> usize {
+    let mut product = 1.0;
+    let confident = confidence
+        .iter()
+        .take_while(|&&c| {
+            product *= c;
+            product >= VERIFY_CONFIDENCE
+        })
+        .count();
+    confident.max(1).min(confidence.len())
 }
 
 /// Build a DFlash2 speculator for `target` from a converted draft HFQ
@@ -651,6 +679,7 @@ mod tests {
             candidates: vec![1, 2, 4, 5],
             probabilities: Some(vec![0.5, 0.2, 0.2, 0.1]),
             selected_probabilities: None,
+            confidence: vec![0.5],
             top_k: 4,
         };
         let q = selector_q(&proposal, 1).unwrap();
@@ -708,6 +737,7 @@ mod tests {
             candidates: vec![3, 4, 9, 8],
             probabilities: Some(vec![0.75, 0.25, 0.6, 0.4]),
             selected_probabilities: None,
+            confidence: vec![0.75, 0.6],
             top_k: 2,
         };
         let q = selector_q(&proposal, 2).unwrap();
@@ -716,6 +746,11 @@ mod tests {
             (0.75, 0.25, 0.0)
         );
         assert_eq!((q[1].prob(9), q[1].prob(8), q[1].prob(3)), (0.6, 0.4, 0.0));
+        assert_eq!(
+            selector_q(&proposal, 1).unwrap().len(),
+            1,
+            "a verified prefix"
+        );
         assert!(selector_q(&proposal, 3).is_err(), "shape is checked");
     }
 
@@ -741,5 +776,16 @@ mod tests {
             0,
             "keep 0 never trims"
         );
+    }
+
+    #[test]
+    fn verify_depth_keeps_the_confident_prefix() {
+        // Running products 0.9, 0.72, 0.504 | 0.25: three drafts.
+        assert_eq!(verify_depth(&[0.9, 0.8, 0.7, 0.5, 1.0]), 3);
+        // A product exactly at the threshold is kept.
+        assert_eq!(verify_depth(&[1.0, VERIFY_CONFIDENCE, 0.99]), 2);
+        // An unconfident first draft is still verified, a later rise never revives the chain.
+        assert_eq!(verify_depth(&[0.1, 1.0, 1.0]), 1);
+        assert_eq!(verify_depth(&[1.0; 7]), 7);
     }
 }

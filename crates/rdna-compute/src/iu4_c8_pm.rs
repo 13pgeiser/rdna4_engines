@@ -4,8 +4,8 @@
 
 //! PeaceMaker twins of the exact (`cand_mode = 8`) gfx1201 IU4 C8 producers that feed the A3B
 //! F3 prefill route (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`), behind
-//! `HIPFIRE_PREFILL_IU4_C8_PM` ([`PrefillRoute::PrefillIu4C8Pm`], raw inventory only, no
-//! qualified row: unset is off, `1` opts in, `0` kills).
+//! `HIPFIRE_PREFILL_IU4_C8_PM` ([`PrefillRoute::PrefillIu4C8Pm`], qualified on exact gfx1201:
+//! unset follows the qualification, `1` opts in, `0` kills).
 //!
 //! * [`Gpu::mq_rotate_x_i4_c8_pm`]: twin of `Gpu::rotate_x_mq_i4_gfx12_exact_batched`
 //!   (`iu4_c8_rotate_pm_gfx1201`, block 32, grid `rows * K / 256`, K 2048 or 4096).
@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn route_is_off_unless_explicit_and_nests_beneath_f3() {
+    fn route_follows_its_qualification_and_nests_beneath_f3() {
         use crate::prefill_route_capabilities::enabled;
         // Resolve both flags exactly as `FeatureFlags` does, then admit.
         let admit = |arch: &str, f3: Option<bool>, c8: Option<bool>| {
@@ -564,9 +564,10 @@ mod tests {
         use C8PmRefusal as R;
         for arch in ARCHES {
             let gfx1201 = arch == "gfx1201";
-            // Unset: the route has no qualified row, so it is off wherever F3 is on.
-            assert_eq!(admit(arch, None, None), Err(R::Disabled), "{arch}");
-            assert_eq!(admit(arch, Some(true), None), Err(R::Disabled), "{arch}");
+            // Unset: the route follows its exact-gfx1201 qualification beneath the resolved F3.
+            let unset = if gfx1201 { Ok(()) } else { Err(R::Disabled) };
+            assert_eq!(admit(arch, None, None), unset, "{arch}");
+            assert_eq!(admit(arch, Some(true), None), unset, "{arch}");
             // Explicit 0 kills.
             assert_eq!(admit(arch, None, Some(false)), Err(R::Disabled), "{arch}");
             assert_eq!(

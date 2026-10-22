@@ -39,6 +39,8 @@ pub mod batched;
 pub mod batched_attention;
 #[cfg(feature = "deltanet")]
 pub mod batched_deltanet;
+#[cfg(feature = "deltanet")]
+pub mod batched_moe;
 pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
@@ -4456,9 +4458,9 @@ fn prefill_shared_down_producer_fused_admitted(
 }
 
 /// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` (`developer.moe_shared_down_sigmoid_epi`, a
-/// typed boolean): the explicit value, read once. The route has NO qualified row, so
-/// unset is off on every architecture, `0` is off, and only `1` opts in (where the
-/// raw exact-gfx1201 inventory and the admission below hold).
+/// typed boolean): the explicit value, read once. Unset follows the route's exact-gfx1201
+/// qualification, `0` is off and `1` opts in (where the raw exact-gfx1201 inventory and the
+/// admission below hold).
 static SHARED_DOWN_SIGMOID_EPI: LazyLock<Option<bool>> =
     LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI"));
 
@@ -5422,6 +5424,23 @@ fn decode_shared_down_stage(
                     shared_down_w.m,
                     shared_down_w.k,
                 ))?;
+                return Ok(());
+            }
+            // Q8_0 K=640 shared down with the same BF16 fold in its epilogue
+            // (exact gfx1151, eager; bitwise the GEMV + scaled-add launches).
+            if p.recipe.bf16_round_trip()
+                && shared_down_w.dtype == DType::Q8_0
+                && shared_down_w.awq_scale.is_none()
+                && hip!(gpu.gemv_q8_0_k640_bf16_scaled_add(
+                    shared_down_w.buf,
+                    &shared_hid,
+                    p.ffn_out,
+                    out_target,
+                    scalar_buf,
+                    shared_down_w.m,
+                    shared_down_w.k,
+                ))?
+            {
                 return Ok(());
             }
             if shared_down_w.dtype == DType::MQ4G128V2 {

@@ -417,6 +417,83 @@ fn gated_mlp_admission(
     Ok(())
 }
 
+/// `HeadMixer` admission: either every placed weight of the op is
+/// `Replicate` (the op stays whole), or `out_proj` is `RowShard { axis: 1 }`
+/// and every other placed weight of the op is a head split
+/// (`HeadSharded`, `FusedQkv`, `ColumnShard { axis: 0 }`); then `heads` and
+/// `kv_heads` must split evenly over `parts` and every split weight passes
+/// [`weight_geometry`]. Every weight the op reads (including `out_proj`) must
+/// be planned, else `UnknownWeight`.
+#[allow(clippy::too_many_arguments)]
+fn head_mixer_admission(
+    graph: &StepGraph,
+    plan: &ManifestPlan,
+    parts: usize,
+    op: OpId,
+    decl: &OpDecl,
+    out_proj: ResourceId,
+    heads: usize,
+    kv_heads: usize,
+) -> Result<(), SplitError> {
+    let resource = |w: ResourceId| graph.resources().get(w.0 as usize);
+    let placement = |w: ResourceId| resource(w).and_then(|r| find_weight(plan, &r.class));
+    // A split rank would otherwise run a head projection it holds no slice of.
+    for &w in decl.reads.iter().chain([&out_proj]) {
+        let weight = resource(w).is_some_and(|r| matches!(r.class, ResourceClass::Weight { .. }));
+        if weight && placement(w).is_none() {
+            return Err(SplitError::UnknownWeight { op, resource: w });
+        }
+    }
+    let Some(out) = placement(out_proj) else {
+        return Ok(());
+    };
+    let weights = || {
+        decl.reads
+            .iter()
+            .copied()
+            .filter(|&w| w != out_proj)
+            .filter_map(|w| placement(w).map(|p| (w, p)))
+    };
+    if out.policy == ShardPolicy::Replicate {
+        return match weights().find(|(_, p)| p.policy != ShardPolicy::Replicate) {
+            Some((resource, _)) => Err(SplitError::UnsupportedPolicy { op, resource }),
+            None => Ok(()),
+        };
+    }
+    if out.policy != (ShardPolicy::RowShard { axis: 1 }) {
+        return Err(SplitError::UnsupportedPolicy {
+            op,
+            resource: out_proj,
+        });
+    }
+    for (resource, p) in weights() {
+        let head_split = matches!(
+            p.policy,
+            ShardPolicy::HeadSharded { .. }
+                | ShardPolicy::FusedQkv { .. }
+                | ShardPolicy::ColumnShard { axis: 0 }
+        );
+        if !head_split {
+            return Err(SplitError::UnsupportedPolicy { op, resource });
+        }
+    }
+    for extent in [heads, kv_heads] {
+        if extent == 0 || extent % parts != 0 {
+            return Err(SplitError::Geometry {
+                resource: out_proj,
+                extent,
+                parts,
+                align: 1,
+            });
+        }
+    }
+    weight_geometry(graph, plan, parts, out_proj)?;
+    for (resource, _) in weights() {
+        weight_geometry(graph, plan, parts, resource)?;
+    }
+    Ok(())
+}
+
 fn admit(graph: &StepGraph, plan: &ManifestPlan, mesh: &DeviceMesh) -> Result<(), SplitError> {
     if plan.mesh_epoch != mesh.epoch() {
         return Err(SplitError::EpochMismatch {
@@ -468,6 +545,21 @@ fn admit(graph: &StepGraph, plan: &ManifestPlan, mesh: &DeviceMesh) -> Result<()
                 OpId(index as u32),
                 [gate, up, down],
                 ladder,
+            )?,
+            SplitRule::HeadMixer {
+                out_proj,
+                heads,
+                kv_heads,
+                ..
+            } => head_mixer_admission(
+                graph,
+                plan,
+                parts,
+                OpId(index as u32),
+                op,
+                out_proj,
+                heads,
+                kv_heads,
             )?,
             SplitRule::HeadLocal { heads, kv_heads } => {
                 let resource = op
@@ -568,7 +660,9 @@ fn state_matches(kind: &StateKind, class: StateClass) -> bool {
 fn reads_of(op: &OpDecl) -> impl Iterator<Item = ResourceId> + '_ {
     let extra: [Option<ResourceId>; 2] = match op.rule {
         SplitRule::Accumulate { dst, src } => [Some(dst), Some(src)],
-        SplitRule::Project { input, .. } | SplitRule::GatedMlp { input, .. } => [Some(input), None],
+        SplitRule::Project { input, .. }
+        | SplitRule::GatedMlp { input, .. }
+        | SplitRule::HeadMixer { input, .. } => [Some(input), None],
         _ => [None, None],
     };
     op.reads
@@ -1244,6 +1338,50 @@ impl<'a> Walk<'a> {
                         ShardSpec::Partial { kind: DimKind::Tp },
                         stage,
                     )?;
+                    self.partial[output.0 as usize] = Some(PartialInfo { sched });
+                } else {
+                    self.write_res(opid, output, out_whole(run), stage)?;
+                }
+                self.emit(opid, stage, run);
+            }
+            SplitRule::HeadMixer {
+                input,
+                out_proj,
+                output,
+                ..
+            } => {
+                let out = self.weight_of(out_proj).ok_or(SplitError::UnknownWeight {
+                    op: opid,
+                    resource: out_proj,
+                })?;
+                // The pre-norm reads complete rows.
+                self.require_input_whole(opid, input, run)?;
+                let split = self.tp > 1 && matches!(out.policy, ShardPolicy::RowShard { .. });
+                // Each rank keeps the state of exactly its heads.
+                let state = if split {
+                    tp_split(self.tp)
+                } else {
+                    ShardSpec::Whole
+                };
+                for resource in operands_of(op) {
+                    if self.kind_of(resource) != Kind::State {
+                        continue;
+                    }
+                    match self.cur[resource.0 as usize] {
+                        None => self.adopt(resource, state),
+                        Some(c) if c != state => {
+                            return Err(SplitError::LayoutMismatch { op: opid, resource })
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if split {
+                    let sched = self.sched_entry(out);
+                    if let Some(entry) = sched {
+                        self.sched_used[entry] = true;
+                    }
+                    let partial = ShardSpec::Partial { kind: DimKind::Tp };
+                    self.write_res(opid, output, partial, stage)?;
                     self.partial[output.0 as usize] = Some(PartialInfo { sched });
                 } else {
                     self.write_res(opid, output, out_whole(run), stage)?;
@@ -2434,5 +2572,179 @@ mod tests {
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::UnknownWeight { op, resource: down }
         );
+    }
+
+    const MIX_HEADS: usize = 4;
+    const MIX_KV: usize = 2;
+    const MIX_HD: usize = 8;
+
+    /// `out = HeadMixer(input)` in `layer`: a fused qkv projection with
+    /// `qkv_policy` and an output projection with `out_policy`, over
+    /// `MIX_HEADS` query / `kv` KV heads; returns the op, its output and the
+    /// two weights.
+    fn head_mixer(
+        b: &mut B,
+        layer: usize,
+        input: ResourceId,
+        qkv_policy: ShardPolicy,
+        out_policy: ShardPolicy,
+        kv: usize,
+    ) -> (OpId, ResourceId, ResourceId, ResourceId) {
+        let rows = (MIX_HEADS + 2 * kv) * MIX_HD;
+        let qkv = b.weight("qkv", layer, vec![rows, MLP_H], qkv_policy);
+        let wo = b.weight("wo", layer, vec![MLP_H, MIX_HEADS * MIX_HD], out_policy);
+        let output = b.act(MLP_H);
+        let op = b.op(
+            OpKind::GatedAttention,
+            Some(layer),
+            SplitRule::HeadMixer {
+                input,
+                out_proj: wo,
+                output,
+                heads: MIX_HEADS,
+                kv_heads: kv,
+            },
+            &[input, qkv, wo],
+            &[output],
+        );
+        (op, output, qkv, wo)
+    }
+
+    fn qkv_heads(kv: usize) -> ShardPolicy {
+        ShardPolicy::FusedQkv {
+            q_heads: MIX_HEADS,
+            kv_heads: kv,
+            head_dim: MIX_HD,
+            layout: crate::weight_manifest::FusedQkvLayout::Qkv,
+        }
+    }
+
+    #[test]
+    fn head_mixer_partial_fuses_into_one_all_reduce_add() {
+        for ranks in [2, 4] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Tp, ranks)]).unwrap();
+            let mut b = B::new();
+            let x = b.act(MLP_H);
+            let (mix, p, _, wo) =
+                head_mixer(&mut b, 0, x, qkv_heads(MIX_HEADS), row_policy(), MIX_HEADS);
+            let add = b.accumulate(Some(0), x, p);
+            let plan = b.plan(&mesh, 1);
+            let sp = split_program(&b.g, &plan, &mesh).unwrap();
+            let entry = plan
+                .collective_schedule
+                .iter()
+                .position(|e| e.name == "wo" && e.layer == 0)
+                .unwrap();
+            assert_eq!(
+                sp.collectives,
+                vec![PlannedCollective {
+                    id: CollectiveId(0),
+                    kind: CollectiveKind::AllReduceAdd {
+                        into: x,
+                        replaces: add
+                    },
+                    operand: p,
+                    producer: mix,
+                    group: (0..ranks).collect(),
+                    fulfils: ScheduleRef::Collective(entry),
+                }]
+            );
+            assert_eq!(sp.resources[wo.0 as usize].exit, tp_split(ranks));
+            assert_eq!(sp.resources[x.0 as usize].exit, ShardSpec::Whole);
+        }
+    }
+
+    #[test]
+    fn head_mixer_stays_whole_replicated() {
+        let mesh = tp2();
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let rep = ShardPolicy::Replicate;
+        let (_, p, _, _) = head_mixer(&mut b, 0, x, rep.clone(), rep, MIX_KV);
+        b.accumulate(Some(0), x, p);
+        let plan = b.plan(&mesh, 1);
+        let sp = split_program(&b.g, &plan, &mesh).unwrap();
+        assert!(sp.collectives.is_empty());
+        assert_eq!(sp.resources[p.0 as usize].exit, ShardSpec::Whole);
+    }
+
+    #[test]
+    fn head_mixer_refusals() {
+        let mesh = tp2();
+        // Heads split on the input side only, the output projection
+        // replicated: the split head projection is refused.
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let (op, _, qkv, _) = head_mixer(
+            &mut b,
+            0,
+            x,
+            qkv_heads(MIX_KV),
+            ShardPolicy::Replicate,
+            MIX_KV,
+        );
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::UnsupportedPolicy { op, resource: qkv }
+        );
+        // Output projection split, input projection replicated.
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let (op, _, qkv, _) =
+            head_mixer(&mut b, 0, x, ShardPolicy::Replicate, row_policy(), MIX_KV);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::UnsupportedPolicy { op, resource: qkv }
+        );
+        // One KV head cannot split two ways (no KV replication in the plan).
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let one_kv = ShardPolicy::HeadSharded {
+            n_heads: MIX_HEADS + 2,
+            head_dim: MIX_HD,
+        };
+        let (_, _, _, wo) = head_mixer(&mut b, 0, x, one_kv, row_policy(), 1);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::Geometry {
+                resource: wo,
+                extent: 1,
+                parts: 2,
+                align: 1
+            }
+        );
+        // The pre-norm needs whole rows.
+        let mut b = B::new();
+        let (_, a) = split_prelude(&mut b);
+        let (op, _, _, _) = head_mixer(&mut b, 0, a, qkv_heads(MIX_KV), row_policy(), MIX_KV);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::NeedsGather { op, resource: a }
+        );
+        // Every weight the op reads must be planned, split or replicated.
+        for missing in ["qkv", "wo"] {
+            for split in [true, false] {
+                let (qkv_policy, out_policy) = if split {
+                    (qkv_heads(MIX_KV), row_policy())
+                } else {
+                    (ShardPolicy::Replicate, ShardPolicy::Replicate)
+                };
+                let mut b = B::new();
+                let x = b.act(MLP_H);
+                let (op, _, qkv, wo) = head_mixer(&mut b, 0, x, qkv_policy, out_policy, MIX_KV);
+                b.ws.retain(|entry| entry.name != missing);
+                let plan = b.plan(&mesh, 1);
+                let resource = if missing == "qkv" { qkv } else { wo };
+                assert_eq!(
+                    split_program(&b.g, &plan, &mesh).unwrap_err(),
+                    SplitError::UnknownWeight { op, resource },
+                    "{missing} missing, split {split}"
+                );
+            }
+        }
     }
 }

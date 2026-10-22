@@ -856,7 +856,11 @@ pub trait MoeStepHooks {
     /// At the top of the interpreter's loop, before `step` is dispatched by
     /// whatever route takes it (fused, CPU or plain): every earlier step has
     /// run, `step` has not. A step consumed inside an earlier step's fused
-    /// launch is never announced. Default: nothing (no fusion changes).
+    /// launch is never announced, except the members of a multi-lane GDN Core
+    /// group (fn-lanes): each is announced exactly once, in program order,
+    /// right before the group's launches (its members write only per-lane
+    /// scratch, so the state seen is the one sequential dispatch would show).
+    /// Default: nothing (no fusion changes).
     fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
         Ok(())
     }
@@ -964,6 +968,41 @@ fn execute_window<'a>(
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < end {
+        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
+        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // group's steps are announced here, once each in program order, after
+        // every refusal check and before the grouped launch; a refused group
+        // announced nothing and each step is announced by the plain path below.
+        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+            && !cpu_exec::cpu_exec_enabled()
+        {
+            let ops: Vec<_> = steps[i..end]
+                .iter()
+                .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
+                .map_while(|s| match s {
+                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
+                        Some(op)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let group = ops.len();
+            if group >= 2
+                && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(
+                    gpu,
+                    &ops,
+                    |gpu| {
+                        for step in &steps[i..i + group] {
+                            hooks.before_step(gpu, step)?;
+                        }
+                        Ok(())
+                    },
+                )?
+            {
+                i += group;
+                continue;
+            }
+        }
         hooks.before_step(gpu, &steps[i])?;
         if hc_fuse {
             use crate::pipeline::layer_ops::{
