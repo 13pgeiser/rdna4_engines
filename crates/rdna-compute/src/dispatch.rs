@@ -9462,6 +9462,62 @@ mod tests {
         gpu.free_tensor(dev).ok();
     }
 
+    /// A kernel launched past the replay recorder (a raw `hip.launch_kernel`)
+    /// inside an automatic capture window runs once but is missing from the
+    /// tape, so every replay would skip it. Prepare must refuse that tape
+    /// (sticky HIP fallback) and accept the same window without the stray
+    /// launch (HIPF-121: legacy MQ5G256 decoded garbage under Redline).
+    #[test]
+    fn retained_prepare_refuses_a_window_with_an_unrecorded_launch() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let a = gpu.upload_f32(&[1.0; 256], &[256]).expect("upload");
+        let b = gpu.zeros(&[256], super::DType::F32).expect("zeros");
+        for stray in [false, true] {
+            if !gpu.replay.configure_model_default(true) {
+                eprintln!("skip: an explicit replay backend disables the automatic lifecycle");
+                return;
+            }
+            gpu.replay.set_forward_eligible(true);
+            gpu.replay
+                .begin_auto_capture_if_armed()
+                .expect("begin capture");
+            assert!(gpu.replay.is_recording());
+            gpu.copy_f32_buffer(&b, &a, 256).expect("recorded copy");
+            gpu.copy_f32_buffer(&a, &b, 256).expect("recorded copy");
+            if stray {
+                let (dp, sp, n) = (b.buf.as_ptr(), a.buf.as_ptr(), 256i32);
+                let mut params: [*mut std::ffi::c_void; 3] = [
+                    &dp as *const _ as *mut _,
+                    &sp as *const _ as *mut _,
+                    &n as *const _ as *mut _,
+                ];
+                // SAFETY: the params match copy_f32_buffer(dst, src, n), loaded above.
+                unsafe {
+                    gpu.hip.launch_kernel(
+                        &gpu.functions["copy_f32_buffer"],
+                        [1, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        gpu.active_stream.as_ref(),
+                        &mut params,
+                    )
+                }
+                .expect("stray launch");
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            gpu.replay.finish_capture().expect("finish capture");
+            let prepared = gpu.replay.prepare_pm4_prefix(gpu.device_id as usize, 2);
+            let refused = prepared
+                .as_ref()
+                .is_err_and(|reason| reason.contains("unrecorded launch"));
+            assert_eq!(refused, stray, "{prepared:?}");
+        }
+        gpu.replay.configure_model_default(false);
+    }
+
     /// The row-chunked requant (and its reordered ranges) packs every row
     /// byte-identically to the one-shot whole-weight requant: unpack, rotate
     /// and pack are all row-local.
