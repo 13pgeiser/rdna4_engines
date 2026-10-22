@@ -9,6 +9,10 @@
 # rows v_swmmac_f16_16x16x32_f16, v_swmmac_bf16_16x16x32_bf16 and v_swmmac_f32_16x16x32_{fp8,bf8}_{fp8,bf8} execute
 # ONLY in an exact domain (finite normal/zero inputs, |C|+sum|products| <= 2^P q, P = 24/11/8; no rounding,
 # NaN, infinity or denormal model) and hard-error on everything else.
+# s_setprio is an ISA-defined scheduling hint (wave priority; no architectural state), a no-op like s_nop.
+# The AMDGPU unsigned-division expansion of the builder GEMM prologues (s_cvt_f32_u32, v_s_rcp_f32, s_mul_f32,
+# s_cvt_u32_f32) executes on gfx1201 only, for denominators 1..=2^24 (hardware-measured stage by stage); v_div_scale_f32
+# follows the measured exponent-field chain of emu/alu.rs. See float_edges.md.
 # NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16 and every FP8/BF8 WMMA.
 # See isa/emu/float_edges.md "Opcode-fill qualification (pending)".
 # v_log_f32_e32, v_rsq_f32_e32 and v_sqrt_f32_e32 are outside that gate;
@@ -22,9 +26,12 @@ buffer_store_b128	memory
 buffer_store_b16	memory
 buffer_store_b32	memory
 ds_load_2addr_b32	memory
+ds_load_2addr_stride64_b64	memory
 ds_load_b128	memory
 ds_load_b32	memory
 ds_load_b64	memory
+ds_store_2addr_stride64_b32	memory
+ds_store_2addr_stride64_b64	memory
 ds_store_b128	memory
 ds_store_b16	memory
 ds_store_b16_d16_hi	memory
@@ -75,6 +82,8 @@ s_cmpk_lt_u32	alu
 s_cselect_b32	alu
 s_cselect_b64	alu
 s_ctz_i32_b32	alu
+s_cvt_f32_u32	alu
+s_cvt_u32_f32	alu
 s_delay_alu	wait
 s_endpgm	control
 s_load_b512	memory
@@ -92,6 +101,7 @@ s_min_u32	alu
 s_mov_b32	alu
 s_mov_b64	alu
 s_movk_i32	alu
+s_mul_f32	alu
 s_mul_hi_i32	alu
 s_mul_hi_u32	alu
 s_mul_i32	alu
@@ -99,6 +109,7 @@ s_mulk_i32	alu
 s_mul_u64	alu
 s_not_b32	alu
 s_or_b32	alu
+s_setprio	wait
 s_sub_co_ci_u32	alu
 s_sub_co_i32	alu
 s_sub_co_u32	alu
@@ -207,6 +218,7 @@ v_perm_b32	alu
 v_permlanex16_b32	alu
 v_rcp_f32_e32	alu
 v_rcp_iflag_f32_e32	alu
+v_s_rcp_f32	alu
 v_readfirstlane_b32	alu
 v_rndne_f32_e32	alu
 v_sub_f32_e32	alu

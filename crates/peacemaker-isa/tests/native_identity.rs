@@ -141,6 +141,7 @@ fn corpus() -> Vec<Unit> {
                                 epi,
                                 act,
                                 arch,
+                                mma: iu4_gemm::Mma::Dense,
                             }) {
                                 single(&mut units, e)
                             }

@@ -349,13 +349,21 @@ pub(super) fn execute(
             &ops[1]
         };
         let count = if two { 2 } else { 1 };
+        // `*_stride64`: the two element offsets scale by 64 elements instead of 1 (OFFSETn * 64 * size).
+        let stride = if name.contains("stride64") { 64 } else { 1 };
         for part in 0..count {
             let cur = if two {
-                addr + if part == 0 { off0 } else { off1 } as u64 * n as u64
+                addr + (if part == 0 { off0 } else { off1 } * stride * n) as u64
             } else {
                 addr
             };
-            let data_word = part * n.div_ceil(4);
+            // A 2addr load returns both elements packed in one VDST; a 2addr store reads DATA0 / DATA1 from their own
+            // (not necessarily adjacent) operands.
+            let (data, data_word) = if two && !load {
+                (&ops[1 + part], 0)
+            } else {
+                (data, part * n.div_ceil(4))
+            };
             if load {
                 let mut bytes = [0u8; 16];
                 for offset in (0..n).step_by(4) {
@@ -1011,5 +1019,90 @@ mod tests {
             assert_eq!(st.v[0][1], 0xdead_beef, "{arch:?}");
             assert_eq!(st.v[1][1], 0xdead_beef, "{arch:?}");
         }
+    }
+    // ds_{load,store}_2addr_stride64: element offsets are multiplied by 64 elements; the plain 2addr forms by 1.
+    #[test]
+    fn ds_2addr_stride64_scales_both_offsets_by_64_elements() {
+        let mut lds = vec![0u8; 2048];
+        for (name, size, off0, off1) in [
+            ("ds_store_2addr_stride64_b32", 4usize, 1u8, 3u8),
+            ("ds_store_2addr_stride64_b64", 8, 1, 3),
+        ] {
+            lds.fill(0);
+            let mut st = state();
+            st.v[2][0] = 8; // ADDR
+                            // DATA0 = v4.. (1, 2), DATA1 = v8.. (3, 4): the two data operands are not adjacent.
+            for w in 0..2 {
+                st.v[4 + w][0] = 0x1111_1111 * (w as u32 + 1);
+                st.v[8 + w][0] = 0x1111_1111 * (w as u32 + 3);
+            }
+            let words = size / 4;
+            execute(
+                name,
+                &insn(
+                    name,
+                    vec![
+                        reg(Kind::V, 2, 1),
+                        reg(Kind::V, 4, words as u8),
+                        reg(Kind::V, 8, words as u8),
+                        Operand::Imm(ImmField::DsOffset0(off0)),
+                        Operand::Imm(ImmField::DsOffset1(off1)),
+                    ],
+                ),
+                &mut st,
+                &mut Memory::default(),
+                &mut lds,
+            )
+            .unwrap();
+            let at = |byte: usize, w: u32| {
+                assert_eq!(
+                    u32::from_le_bytes(lds[byte..byte + 4].try_into().unwrap()),
+                    0x1111_1111 * w,
+                    "{name} byte {byte}"
+                );
+            };
+            let (a0, a1) = (
+                8 + usize::from(off0) * 64 * size,
+                8 + usize::from(off1) * 64 * size,
+            );
+            at(a0, 1);
+            at(a1, 3);
+            if words == 2 {
+                at(a0 + 4, 2);
+                at(a1 + 4, 4);
+            }
+            let nonzero = lds.iter().filter(|&&b| b != 0).count();
+            assert_eq!(
+                nonzero,
+                2 * size,
+                "{name}: only the two elements are written"
+            );
+        }
+        // Load: dwords come back from the same two scaled addresses.
+        let mut st = state();
+        st.v[2][0] = 8;
+        lds.fill(0);
+        lds[8 + 512..8 + 512 + 8].copy_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
+        lds[8 + 3 * 512..8 + 3 * 512 + 8].copy_from_slice(&[3, 0, 0, 0, 4, 0, 0, 0]);
+        execute(
+            "ds_load_2addr_stride64_b64",
+            &insn(
+                "ds_load_2addr_stride64_b64",
+                vec![
+                    reg(Kind::V, 4, 4),
+                    reg(Kind::V, 2, 1),
+                    Operand::Imm(ImmField::DsOffset0(1)),
+                    Operand::Imm(ImmField::DsOffset1(3)),
+                ],
+            ),
+            &mut st,
+            &mut Memory::default(),
+            &mut lds,
+        )
+        .unwrap();
+        assert_eq!(
+            [st.v[4][0], st.v[5][0], st.v[6][0], st.v[7][0]],
+            [1, 2, 3, 4]
+        );
     }
 }

@@ -19,50 +19,28 @@
 //!   waited at the block end, overlapping the fold's remaining packets. The block's last
 //!   instructions refill the scratch with the next block's WMMA seed.
 use super::{
-    fold, publish, publish::ds_load, spec, Gen, Lds, MetaD, MetaS, PayA, PayW, Staged, Wg, EPI,
-    K_LOOP, K_LOOP_END,
+    blocks, fold, publish, spec, Gen, Lds, MetaD, MetaS, PayA, PayW, Staged, Wg, EPI, K_LOOP,
+    K_LOOP_END,
 };
-use crate::kernels::common::{op, s, sr, vr};
-use crate::{insn::Instruction, reg::Live, Builder, V};
+use crate::{insn::Instruction, Builder};
 use peacemaker_author::{rotate, Free, Published, Ring, Scc, WgUniform};
 use std::collections::VecDeque;
 
-fn between(a: &str, b: &str) -> Live {
-    Live::Between(a.into(), b.into())
-}
-fn label(tag: &str) -> String {
+pub(crate) fn label(tag: &str) -> String {
     format!(".Lmq6i8_{tag}")
 }
-fn tail_label(h: usize) -> String {
+pub(crate) fn tail_label(h: usize) -> String {
     label(&format!("t{h}"))
 }
 
-fn trips_cmp(wg: &mut Wg, g: &Gen, cmp: &str) -> Result<WgUniform<Scc>, String> {
-    wg.scmp_wg_uniform(Instruction::new(
-        format!("{cmp} s{}, 0", g.trips),
-        vec![],
-        vec![s(g.trips)],
-    ))
+pub(crate) fn trips_cmp(wg: &mut Wg, g: &Gen, cmp: &str) -> Result<WgUniform<Scc>, String> {
+    wg.scmp_wg_uniform(blocks::trips_cmp_insn(g, cmp)?)
 }
 
 pub(crate) fn emit(wg: &mut Wg, g: &Gen, lds: Lds) -> Result<Lds, String> {
     wg.label(super::K_BEGIN)?;
     // K == 256: no full trip; go straight to the peeled group.
     let no_trip = trips_cmp(wg, g, "s_cmp_eq_u32")?;
-    let step = |b: &mut Builder, srd: u8| {
-        op(
-            b,
-            format!(
-                "s_add_nc_u64 s[{0}:{1}], s[{0}:{1}], s[{2}:{3}]",
-                srd,
-                srd + 1,
-                g.step2,
-                g.step2 + 1
-            ),
-            &[sr(srd, 2)],
-            &[sr(srd, 2), sr(g.step2, 2)],
-        )
-    };
     let lds = wg.wg_skip_if(no_trip, &tail_label(0), lds, |wg, lds| {
         let lds = wg.loop_carried(K_LOOP, lds, |wg, lds| {
             let lds = block_with(wg, g, "m0", 0, true, &label("m1"), true, |_| Ok(()), lds)?;
@@ -76,27 +54,12 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, lds: Lds) -> Result<Lds, String> {
                 true,
                 K_LOOP_END,
                 true,
-                |b| step(b, g.srd_a[0]),
+                |b| blocks::step_descriptor(b, g, 0),
                 lds,
             )?;
             // Trip end: the odd-block descriptor and the group offsets move on after every read of
             // them in this trip.
-            let b = wg.isa();
-            step(b, g.srd_a[1])?;
-            for r in [g.goff, g.goff1] {
-                op(
-                    b,
-                    format!("s_add_co_i32 s{0}, s{0}, 0xc8", r),
-                    &[s(r)],
-                    &[s(r)],
-                )?;
-            }
-            op(
-                b,
-                format!("s_add_co_i32 s{0}, s{0}, -1", g.trips),
-                &[s(g.trips)],
-                &[s(g.trips)],
-            )?;
+            blocks::trip_end(wg.isa(), g)?;
             Ok((lds, trips_cmp(wg, g, "s_cmp_lg_u32")?))
         })?;
         wg.label(K_LOOP_END)?;
@@ -184,7 +147,7 @@ impl Stage {
                 }
                 Work::FetchA { slab, sb, srd } => {
                     // The raw staging registers are still sources of the previous half's stores.
-                    wg.isa().wait_all()?;
+                    blocks::wait_all(wg.isa())?;
                     publish::fetch_a(wg.isa(), g, slab, sb, srd)?
                 }
                 Work::Meta => {
@@ -212,41 +175,10 @@ impl Stage {
         step: u32,
         set: usize,
     ) -> Result<(), String> {
-        let f = g.f[set];
-        let l = spec::LAYOUT;
-        let o = 512 * step;
-        self.w.ds_load(
-            wg,
-            ds_load(
-                format!(
-                    "ds_load_b128 v[{}:{}], v{}{}",
-                    f,
-                    f + 3,
-                    g.fr_w,
-                    super::ds_offset(l.w[slot] + o)
-                ),
-                vr(f, 4),
-                g.fr_w,
-            ),
-        )?;
-        for half in 0..2u32 {
-            let dst = f + 4 + 4 * half as u8;
-            self.a.ds_load(
-                wg,
-                ds_load(
-                    format!(
-                        "ds_load_b128 v[{}:{}], v{}{}",
-                        dst,
-                        dst + 3,
-                        g.fr_a,
-                        super::ds_offset(l.a[slot] + o + 2048 * half)
-                    ),
-                    vr(dst, 4),
-                    g.fr_a,
-                ),
-            )?;
-        }
-        Ok(())
+        let [w, a0, a1] = blocks::step_load_insns(g, slot, step, set)?;
+        self.w.ds_load(wg, w)?;
+        self.a.ds_load(wg, a0)?;
+        self.a.ds_load(wg, a1)
     }
 
     /// Four K16 steps from `slot`; after the `n`-th WMMA (`n >= start`) `per` work units run.
@@ -288,44 +220,8 @@ fn mma_step(
     first: bool,
     after: &mut dyn FnMut(&mut Wg, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    let f = g.f[set];
-    let (sb, e) = (step >> 1, step & 1);
-    for (i, &k) in fold::BUNDLE_ORDER.iter().enumerate() {
-        let (nb, rg) = (k / 2, k % 2);
-        let dst = V::<8>(g.cacc + 8 * k as u8);
-        // Weight operand: data half `rg` sits in slot `rg ^ sb`; token operand: nb pair
-        // `nb >> 1`, data half `nb & 1` in slot `(nb & 1) ^ e`.
-        let wop = V::<2>(f + 2 * (rg as u8 ^ sb as u8));
-        let xop = V::<2>(f + 4 + 4 * (nb as u8 >> 1) + 2 * ((nb as u8 & 1) ^ e as u8));
-        let insn = if first {
-            // Seed: the octet of `0x4B400000` words the previous block's tail (or the prologue)
-            // left in the decode scratch.
-            let seed = V::<8>(g.scratch);
-            Instruction::new(
-                format!(
-                    "v_wmma_i32_16x16x16_iu8 {}, {}, {}, {} neg_lo:[0,1,0]",
-                    dst.reg(),
-                    wop.reg(),
-                    xop.reg(),
-                    seed.reg()
-                ),
-                vec![dst.reg()],
-                vec![wop.reg(), xop.reg(), seed.reg()],
-            )
-        } else {
-            Instruction::new(
-                format!(
-                    "v_wmma_i32_16x16x16_iu8 {}, {}, {}, {} neg_lo:[0,1,0]",
-                    dst.reg(),
-                    wop.reg(),
-                    xop.reg(),
-                    dst.reg()
-                ),
-                vec![dst.reg()],
-                vec![wop.reg(), xop.reg(), dst.reg()],
-            )
-        };
-        wg.isa().push(insn)?;
+    for i in 0..fold::BUNDLE_ORDER.len() {
+        blocks::mma(wg.isa(), g, step, set, first, i)?;
         after(wg, i)?;
     }
     Ok(())
@@ -353,23 +249,9 @@ fn block_with(
     if entry_label {
         b.label(&x)?;
     }
-    for (set, f) in g.f.into_iter().enumerate() {
-        let names: [&'static str; 3] = if set == 0 {
-            ["f0_w", "f0_a0", "f0_a1"]
-        } else {
-            ["f1_w", "f1_a0", "f1_a1"]
-        };
-        for (part, name) in names.into_iter().enumerate() {
-            b.regs.v::<4>(name, f + 4 * part as u8, between(&x, &xf))?;
-        }
-    }
-    // Fold registers: row group 0's sc / z' octets and the products, over the fragment sets.
-    b.regs.v::<8>("fold_sc", fold::SC, between(&xf, end))?;
-    b.regs.v::<8>("fold_zp", fold::ZP, between(&xf, end))?;
-    b.regs.v::<8>("fold_t", fold::T, between(&xf, end))?;
+    blocks::declare_block_regs(b, g, &x, &xf, end)?;
     after_slab1_fetch(b)?;
 
-    let l = spec::LAYOUT;
     let mut st = Stage {
         slot: 0,
         work: VecDeque::new(),
@@ -454,72 +336,33 @@ fn block_with(
     // ------------------------------------------------------------------ fold
     wg.label(&xf)?;
     let scratch = g.scratch;
-    let b = wg.isa();
     // Plane `h` addresses: token (d, float(s)) pairs via `msn` as the address temporary, rows' sc / z'
     // from `sc_addr`.
-    crate::kernels::common::op(
-        b,
-        format!(
-            "v_add_nc_u32_e32 v{}, {}, v{}",
-            g.msn,
-            crate::kernels::common::lit(l.ds[h]),
-            g.d_addr
-        ),
-        &[crate::kernels::common::v(g.msn)],
-        &[crate::kernels::common::v(g.d_addr)],
-    )?;
-    let sz_load = |wg: &mut Wg, st: &Stage, dst: u8, off: u32| -> Result<(), String> {
-        st.s.ds_load(
-            wg,
-            ds_load(
-                format!(
-                    "ds_load_b128 v[{}:{}], v{}{}",
-                    dst,
-                    dst + 3,
-                    g.sc_addr,
-                    super::ds_offset(off)
-                ),
-                vr(dst, 4),
-                g.sc_addr,
-            ),
-        )
+    blocks::fold_addr(wg.isa(), g, h)?;
+    let sz_load = |wg: &mut Wg, st: &Stage, dst: u8, rel: u32| -> Result<(), String> {
+        st.s.ds_load(wg, blocks::fold_sz_load_insn(g, h, dst, rel)?)
     };
-    for nb in 0..4u32 {
-        let dst = g.tok + 2 * nb as u8;
-        st.d.ds_load(
-            wg,
-            ds_load(
-                format!(
-                    "ds_load_2addr_b32 v[{}:{}], v{}{}",
-                    dst,
-                    dst + 1,
-                    g.msn,
-                    super::ds_offsets(16 * nb, 128 + 16 * nb)
-                ),
-                vr(dst, 2),
-                g.msn,
-            ),
-        )?;
+    for nb in 0..4usize {
+        st.d.ds_load(wg, blocks::fold_token_load_insn(g, nb)?)?;
     }
-    let sz = l.sz[h];
     // Row group 0: sc octet then z' octet (planar, 8 rows of this lane's row half).
-    sz_load(wg, &st, fold::SC, sz)?;
-    sz_load(wg, &st, fold::SC + 4, sz + 16)?;
-    sz_load(wg, &st, fold::ZP, sz + 512)?;
-    sz_load(wg, &st, fold::ZP + 4, sz + 512 + 16)?;
+    sz_load(wg, &st, fold::SC, 0)?;
+    sz_load(wg, &st, fold::SC + 4, 16)?;
+    sz_load(wg, &st, fold::ZP, 512)?;
+    sz_load(wg, &st, fold::ZP + 4, 512 + 16)?;
     // Row group 1's z' into the decode scratch (free until the next block's decode).
-    sz_load(wg, &st, scratch, sz + 64 + 512)?;
-    sz_load(wg, &st, scratch + 4, sz + 64 + 512 + 16)?;
+    sz_load(wg, &st, scratch, 64 + 512)?;
+    sz_load(wg, &st, scratch + 4, 64 + 512 + 16)?;
 
     let frag = |wg: &mut Wg, nb: usize, rg: usize, sc: u8, zp: u8| -> Result<(), String> {
         let b = wg.isa();
-        fold::emit_msn(b, g, nb)?;
-        fold::fragment(b, g, nb * 2 + rg, sc, zp)
+        blocks::emit_msn(b, g, nb)?;
+        blocks::fold_fragment(b, g, nb * 2 + rg, sc, zp)
     };
     frag(wg, 0, 0, fold::SC, fold::ZP)?;
     // Fragment k = 0 is folded: its int32 registers now hold row group 1's sc.
-    sz_load(wg, &st, g.cacc, sz + 64)?;
-    sz_load(wg, &st, g.cacc + 4, sz + 64 + 16)?;
+    sz_load(wg, &st, g.cacc, 64)?;
+    sz_load(wg, &st, g.cacc + 4, 64 + 16)?;
     frag(wg, 1, 0, fold::SC, fold::ZP)?;
 
     let arrived = if fetch_next {

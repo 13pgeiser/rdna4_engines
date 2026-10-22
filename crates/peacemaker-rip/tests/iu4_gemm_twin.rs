@@ -8,7 +8,7 @@
 //! `.rip` composition honest; the coarse natives (`Iu4Gemm::emit`,
 //! `MoeSym::emit`) return the Rust functions' values.
 
-use peacemaker_isa::kernels::iu4_gemm::{self, ALayout, Cacc, Epi, Fold, Spec, Tile};
+use peacemaker_isa::kernels::iu4_gemm::{self, ALayout, Cacc, Epi, Fold, Mma, Spec, Tile};
 use peacemaker_isa::kernels::qwen4_moe_sym as moe;
 use peacemaker_isa::Arch;
 
@@ -28,14 +28,17 @@ fn every_spec() -> Vec<Spec> {
                     Epi::QkvzaGdn,
                 ] {
                     for act in [ALayout::Token, ALayout::Slab] {
-                        out.push(Spec {
-                            fold,
-                            tile,
-                            cacc,
-                            epi,
-                            act,
-                            arch: Arch::Gfx1201,
-                        });
+                        for mma in [Mma::Dense, Mma::S24X64, Mma::S24X32] {
+                            out.push(Spec {
+                                fold,
+                                tile,
+                                cacc,
+                                epi,
+                                act,
+                                arch: Arch::Gfx1201,
+                                mma,
+                            });
+                        }
                     }
                 }
             }
@@ -91,7 +94,7 @@ fn iu4_gemm_twin_matches_the_rust_emit() {
         );
     }
     assert_eq!(
-        valid, 14,
+        valid, 18,
         "the number of valid specs changed: update VARIANTS"
     );
 }
@@ -148,7 +151,7 @@ const COARSE: &str = r#"
 fn emit(spec: Spec) -> Result<Emitted, String> {
     let s = Iu4Spec {
         fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch,
+        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch, mma: Mma::Dense,
     };
     Iu4Gemm::emit(s)
 }
@@ -163,6 +166,7 @@ fn iu4_gemm_emit_native_returns_the_rust_emitted() {
         epi: Epi::GateUpSilu,
         act: ALayout::Slab,
         arch: Arch::Gfx1201,
+        mma: Mma::Dense,
     })
     .unwrap();
     let got = peacemaker_rip::compile(COARSE, Arch::Gfx1201, "default").unwrap();
@@ -177,7 +181,7 @@ fn iu4_gemm_emit_native_returns_the_rust_emitted() {
 const COARSE_FIELDS: &str = r#"
 fn emit(spec: Spec) -> Result<Emitted, String> {
     Iu4Gemm::emit(Iu4Spec { fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::Set, arch: spec.arch })
+        epi: Epi::Set, arch: spec.arch, mma: Mma::Dense })
 }
 "#;
 
@@ -365,4 +369,81 @@ fn a_block_must_run_on_the_plane_the_rings_are_on() {
     let src = edit("\"m0\", 0, true", "\"m0\", 1, true");
     let e = build(&src, SET).expect_err("an out-of-phase block must be refused");
     assert!(e.contains("rings out of phase with plane 1"), "{e}");
+}
+
+// ---- the sparse blocks -------------------------------------------------------------
+
+const SPARSE_SET: &str = "k128-128x128x8-cacc1-set-s24x64";
+
+/// The block family follows the generator's spec: the dense `iu4::block` on a sparse generator, and the sparse block
+/// on a dense one, are refused with the family named.
+#[test]
+fn a_block_family_that_does_not_match_the_spec_is_refused() {
+    let dense_on_sparse = edit(
+        "    if g.spec().mma == Mma::Dense {\n        iu4::block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)",
+        "    if true {\n        iu4::block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)",
+    );
+    let e = build(&dense_on_sparse, SPARSE_SET).expect_err("a dense block on a sparse spec");
+    assert!(e.contains("use the sparse blocks"), "{e}");
+    build(&dense_on_sparse, SET).unwrap();
+
+    let sparse_on_dense = edit(
+        "    if g.spec().mma == Mma::Dense {\n        iu4::block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)",
+        "    if false {\n        iu4::block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)",
+    );
+    let e = build(&sparse_on_dense, SET).expect_err("a sparse block on a dense spec");
+    assert!(e.contains("use the dense blocks"), "{e}");
+    build(&sparse_on_dense, SPARSE_SET).unwrap();
+}
+
+#[test]
+fn a_sparse_variant_the_generator_does_not_build_is_refused_with_its_axis() {
+    for (v, want) in [
+        ("k128-256x128x16-cacc1-set-s24x64", "needs Tile::T128x128x8"),
+        (
+            "k128-128x128x8-cacc1-slab-set-s24x32",
+            "needs ALayout::Token",
+        ),
+        (
+            "k128-128x128x8-cacc1-silu-s24x64",
+            "supports Epi::Set and Epi::Add only",
+        ),
+        ("k256s-128x128x8-cacc1-set-s24x32", "needs Fold::K128"),
+    ] {
+        let e = build(TWIN, v).expect_err(v);
+        assert!(e.contains(want), "{v}: {e}");
+    }
+}
+
+const SPARSE_FIELDS: &str = r#"
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    Iu4Gemm::emit(Iu4Spec { fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
+        epi: Epi::Set, act: ALayout::Token, arch: spec.arch })
+}
+"#;
+
+#[test]
+fn iu4_spec_needs_mma() {
+    let e = peacemaker_rip::compile(SPARSE_FIELDS, Arch::Gfx1201, "default").expect_err("no mma");
+    assert!(e.contains("missing the field `mma`"), "{e}");
+}
+
+const SPARSE_COARSE: &str = r#"
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    Iu4Gemm::emit(Iu4Spec { fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
+        epi: Epi::Add, act: ALayout::Token, arch: spec.arch, mma: Mma::S24X32 })
+}
+"#;
+
+#[test]
+fn iu4_gemm_emit_native_takes_the_sparse_mma() {
+    let want = iu4_gemm::emit(Spec {
+        epi: Epi::Add,
+        mma: Mma::S24X32,
+        ..Spec::control(Epi::Add)
+    })
+    .unwrap();
+    let got = peacemaker_rip::compile(SPARSE_COARSE, Arch::Gfx1201, "default").unwrap();
+    assert_eq!(want.s_text, got.s_text);
+    assert!(got.s_text.contains("v_swmmac_i32_16x16x32_iu4"));
 }

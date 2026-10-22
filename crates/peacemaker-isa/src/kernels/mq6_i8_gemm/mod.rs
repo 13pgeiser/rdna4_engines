@@ -48,6 +48,7 @@
 //! timing, no bank conflicts, and lacks the SALU float ops of the banded raster, so the
 //! banded product symbols differ from the tested `_linear` twins only in that prologue
 //! fragment (copied verbatim from `iu4_gemm`) and the omitted `s_setprio`.
+pub mod blocks;
 pub mod epilogue;
 pub mod fold;
 pub mod kloop;
@@ -64,12 +65,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 pub use spec::{Epi, Raster, Spec};
 
-pub(crate) const ENTRY: &str = "entry";
-pub(crate) const K_BEGIN: &str = ".Lmq6i8_k_begin";
-pub(crate) const K_LOOP: &str = ".Lmq6i8_k_loop";
-pub(crate) const K_LOOP_END: &str = ".Lmq6i8_k_loop_end";
-pub(crate) const EPI: &str = ".Lmq6i8_epilogue";
-pub(crate) const END: &str = ".Lmq6i8_end";
+pub const ENTRY: &str = "entry";
+pub const K_BEGIN: &str = ".Lmq6i8_k_begin";
+pub const K_LOOP: &str = ".Lmq6i8_k_loop";
+pub const K_LOOP_END: &str = ".Lmq6i8_k_loop_end";
+pub const EPI: &str = ".Lmq6i8_epilogue";
+pub const END: &str = ".Lmq6i8_end";
 
 pub(crate) fn ds_offsets(o0: u32, o1: u32) -> String {
     let mut t = String::new();
@@ -130,48 +131,48 @@ pub(crate) struct Args {
 /// and the products `t v[144:151]`), per-token `(d, float(s))` pairs `v[152:159]`, `msn`, the raw
 /// prefetch payload, then hoisted addresses and decode scratch.
 #[derive(Clone, Debug)]
-pub(crate) struct Gen {
-    pub spec: Spec,
-    pub args: Args,
-    pub cacc: u8,
-    pub acc: u8,
-    pub f: [u8; 2],
+pub struct Gen {
+    pub(crate) spec: Spec,
+    pub(crate) args: Args,
+    pub(crate) cacc: u8,
+    pub(crate) acc: u8,
+    pub(crate) f: [u8; 2],
     /// `(d, float(s))` of token column block `nb` at `tok + 2 * nb` (`d`) and `+ 1` (`s`).
-    pub tok: u8,
-    pub msn: u8,
-    pub a_pf: [u8; 2],
-    pub w_pf: [u8; 2],
-    pub ds_nx: u8,
-    pub sz_nx: u8,
-    pub fr_a: u8,
-    pub fr_w: u8,
-    pub st_alds: u8,
-    pub st_wlds: u8,
-    pub st_a: u8,
-    pub st_w: u8,
-    pub meta_lds: u8,
-    pub ds_voff: u8,
-    pub sz_voff: u8,
-    pub sc_addr: u8,
-    pub d_addr: u8,
+    pub(crate) tok: u8,
+    pub(crate) msn: u8,
+    pub(crate) a_pf: [u8; 2],
+    pub(crate) w_pf: [u8; 2],
+    pub(crate) ds_nx: u8,
+    pub(crate) sz_nx: u8,
+    pub(crate) fr_a: u8,
+    pub(crate) fr_w: u8,
+    pub(crate) st_alds: u8,
+    pub(crate) st_wlds: u8,
+    pub(crate) st_a: u8,
+    pub(crate) st_w: u8,
+    pub(crate) meta_lds: u8,
+    pub(crate) ds_voff: u8,
+    pub(crate) sz_voff: u8,
+    pub(crate) sc_addr: u8,
+    pub(crate) d_addr: u8,
     /// Decode / epilogue scratch (8 VGPRs).
-    pub scratch: u8,
+    pub(crate) scratch: u8,
     // SGPRs
-    pub karg: u8,
-    pub srd_w: u8,
-    pub srd_a: [u8; 2],
-    pub srd_y: u8,
-    pub step2: u8,
-    pub goff: u8,
-    pub goff1: u8,
-    pub trips: u8,
-    pub rs: u8,
-    pub bs: u8,
-    pub wave: u8,
-    pub gpr200: u8,
-    pub omask: u8,
-    pub tmp: u8,
-    pub epi_s: u8,
+    pub(crate) karg: u8,
+    pub(crate) srd_w: u8,
+    pub(crate) srd_a: [u8; 2],
+    pub(crate) srd_y: u8,
+    pub(crate) step2: u8,
+    pub(crate) goff: u8,
+    pub(crate) goff1: u8,
+    pub(crate) trips: u8,
+    pub(crate) rs: u8,
+    pub(crate) bs: u8,
+    pub(crate) wave: u8,
+    pub(crate) gpr200: u8,
+    pub(crate) omask: u8,
+    pub(crate) tmp: u8,
+    pub(crate) epi_s: u8,
 }
 
 pub(crate) const PRO_TEMPS: u8 = 24;
@@ -179,7 +180,112 @@ pub(crate) const S_TEMPS: u8 = 8;
 pub(crate) const EPI_S: u8 = 24;
 
 impl Gen {
-    fn new(spec: Spec) -> Self {
+    /// The generator for `spec`: the register assignment and geometry every block of [`blocks`]
+    /// reads. `Err` when `spec` has no generator ([`Spec::validate`]).
+    pub fn new(spec: Spec) -> Result<Self, String> {
+        spec.validate()?;
+        Ok(Self::build(spec))
+    }
+    /// The spec this generator was built for.
+    pub fn spec(&self) -> Spec {
+        self.spec
+    }
+    /// The kernel header (symbol, kernargs, workgroup size) of this spec.
+    pub fn kernel_spec(&self) -> KernelSpec {
+        let spec = self.spec;
+        KernelSpec {
+            kernel_id: "mq6_i8_gemm".into(),
+            variant: spec.variant_name(),
+            arch: spec.arch,
+            symbol: spec.symbol(),
+            kernargs: spec.kernargs(),
+            user_sgpr_count: 2,
+            system_sgpr_workgroup_id_y: true,
+            workgroup_size: spec::THREADS as u16,
+            group_segment_fixed_size: 0,
+            wave32: true,
+            cu_mode: false,
+        }
+    }
+    /// A physical register base of this assignment by name (read-only): VGPRs `cacc acc f0 f1 tok
+    /// msn a_pf0 a_pf1 w_pf0 w_pf1 ds_nx sz_nx fr_a fr_w st_alds st_wlds st_a st_w meta_lds ds_voff
+    /// sz_voff sc_addr d_addr scratch` and the fold octets `fold_sc fold_zp fold_t`; SGPRs `karg
+    /// srd_w srd_a0 srd_a1 srd_y step2 goff goff1 trips rs bs wave gpr200 omask tmp epi_s`; kernel
+    /// arguments `arg_a arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None` for an unknown name.
+    pub fn reg(&self, name: &str) -> Option<u8> {
+        let a = &self.args;
+        Some(match name {
+            "cacc" => self.cacc,
+            "acc" => self.acc,
+            "f0" => self.f[0],
+            "f1" => self.f[1],
+            "tok" => self.tok,
+            "msn" => self.msn,
+            "a_pf0" => self.a_pf[0],
+            "a_pf1" => self.a_pf[1],
+            "w_pf0" => self.w_pf[0],
+            "w_pf1" => self.w_pf[1],
+            "ds_nx" => self.ds_nx,
+            "sz_nx" => self.sz_nx,
+            "fr_a" => self.fr_a,
+            "fr_w" => self.fr_w,
+            "st_alds" => self.st_alds,
+            "st_wlds" => self.st_wlds,
+            "st_a" => self.st_a,
+            "st_w" => self.st_w,
+            "meta_lds" => self.meta_lds,
+            "ds_voff" => self.ds_voff,
+            "sz_voff" => self.sz_voff,
+            "sc_addr" => self.sc_addr,
+            "d_addr" => self.d_addr,
+            "scratch" => self.scratch,
+            "fold_sc" => fold::SC,
+            "fold_zp" => fold::ZP,
+            "fold_t" => fold::T,
+            "karg" => self.karg,
+            "srd_w" => self.srd_w,
+            "srd_a0" => self.srd_a[0],
+            "srd_a1" => self.srd_a[1],
+            "srd_y" => self.srd_y,
+            "step2" => self.step2,
+            "goff" => self.goff,
+            "goff1" => self.goff1,
+            "trips" => self.trips,
+            "rs" => self.rs,
+            "bs" => self.bs,
+            "wave" => self.wave,
+            "gpr200" => self.gpr200,
+            "omask" => self.omask,
+            "tmp" => self.tmp,
+            "epi_s" => self.epi_s,
+            "arg_a" => a.a,
+            "arg_xq" => a.xq,
+            "arg_y" => a.y,
+            "arg_m" => a.m,
+            "arg_k" => a.k,
+            "arg_n" => a.n,
+            "arg_bcx" => a.bcx,
+            "arg_bcy" => a.bcy,
+            _ => return None,
+        })
+    }
+    /// An LDS slot of [`spec::LAYOUT`] by name (`A0 W0 A1 W1 DS0 DS1 SZ0 SZ1`) as `(base, bytes)`.
+    pub fn slot(&self, name: &str) -> Option<(u32, u32)> {
+        let l = spec::LAYOUT;
+        Some(match name {
+            "A0" => (l.a[0], l.a_bytes),
+            "A1" => (l.a[1], l.a_bytes),
+            "W0" => (l.w[0], l.w_bytes),
+            "W1" => (l.w[1], l.w_bytes),
+            "DS0" => (l.ds[0], l.meta_bytes),
+            "DS1" => (l.ds[1], l.meta_bytes),
+            "SZ0" => (l.sz[0], l.meta_bytes),
+            "SZ1" => (l.sz[1], l.meta_bytes),
+            _ => return None,
+        })
+    }
+
+    fn build(spec: Spec) -> Self {
         Self {
             spec,
             args: Args {
@@ -231,7 +337,8 @@ impl Gen {
         }
     }
 
-    fn plan(&self) -> Result<RegPlan, String> {
+    /// The register plan of this assignment (a script may add ranges before building).
+    pub fn plan(&self) -> Result<RegPlan, String> {
         let mut p = RegPlan::new(spec::VGPR_CEILING, 104)?;
         let pro = || Live::Between(ENTRY.into(), K_BEGIN.into());
         let kl = || Live::Between(K_BEGIN.into(), EPI.into());
@@ -372,21 +479,8 @@ pub(crate) type Staged<R, C> = (Ring<R, C, Writing>, Pending<Gfx12Waits, LdsWrit
 /// Emit one kernel symbol. The result is a complete single-kernel `.s`.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
-    let g = Gen::new(spec);
-    let kspec = KernelSpec {
-        kernel_id: "mq6_i8_gemm".into(),
-        variant: spec.variant_name(),
-        arch: spec.arch,
-        symbol: spec.symbol(),
-        kernargs: spec.kernargs(),
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: spec::THREADS as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, g.plan()?);
+    let g = Gen::new(spec)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     let mut wg = Wg::new(&mut b)?;
     let lds = g.declare_lds(&mut wg)?;
     let end = wg.exit(END)?;

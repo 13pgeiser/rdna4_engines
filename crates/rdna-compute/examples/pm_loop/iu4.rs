@@ -23,6 +23,20 @@
 //! production bundle for the candidate's activation layout, otherwise it is
 //! emitted from the knobs with unspecified ones inherited.
 //!
+//! # `--mma dense|s24x64|s24x32` (2:4 sparse weights)
+//! `mma` selects the K-loop MMA of the candidate (`base-mma` of an emitted
+//! baseline, which otherwise inherits the candidate's). A sparse kind is
+//! `v_swmmac_i32_16x16x64_iu4` (`s24x64`) or `..x32_iu4` (`s24x32`) over
+//! 2:4-pruned weights: with any sparse arm the generated weights are pruned
+//! deterministically (`sparse-seed`): within every sparse group of 4 K
+//! (`sparse24::group_of`, 32 groups per K128 row block) two pseudo-randomly
+//! chosen K are kept and the pruned K get code 8 (signed zero). The candidate
+//! reads those weights packed by `sparse24::pack_block` (same 136-byte MQ4V2
+//! container, same buffer size); the CPU reference and the shipped dense
+//! baseline read the PRUNED DENSE weights, so `identical_to_baseline` is
+//! expected to be true. The record gains `sparse: {mma, base_mma,
+//! groups_per_block, kept_per_group, seed}`.
+//!
 //! # Extra knobs
 //! `ref-rows`: `full` (default while `M*N*K <= 2e9` MACs) or `sample:<n>`
 //! (default `sample:192` beyond that): rows `0..64`, the last 64, and `n`
@@ -41,8 +55,9 @@
 //! hipcc DAG. Output `Y[col * M + row]`, f32; ADD is `RN(Y0 + sum)`.
 
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
-use peacemaker_isa::kernels::iu4_gemm::{self, ALayout, Epi, Spec};
+use peacemaker_isa::kernels::iu4_gemm::{self, sparse24, ALayout, Epi, Mma, Spec};
 use peacemaker_isa::Arch;
+use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -52,6 +67,10 @@ use std::path::Path;
 const GROUP_BYTES: usize = 136;
 const REC: usize = 72;
 const FULL_REF_MACS: u128 = 2_000_000_000;
+/// 2:4 sparse groups per K128 row block, and K kept per group.
+const SPARSE_GROUPS: usize = 32;
+const SPARSE_KEPT: usize = 2;
+const DEFAULT_SPARSE_SEED: u64 = 0x5eed_2404_a5a5_c3c3;
 
 fn sha256_hex(b: &[u8]) -> String {
     Sha256::digest(b)
@@ -175,6 +194,87 @@ impl Host {
         let y0 = (0..n * m).map(|_| 0.25 + rng.unit()).collect();
         Self { w, w_up, recs, y0 }
     }
+}
+
+/// The kept pair (indices into a group's 4 dense K, ascending) of `pick` in `0..6`.
+fn kept_pair(pick: u64) -> (usize, usize) {
+    [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)][pick as usize % 6]
+}
+
+/// Prune one row's K128 half-block in place: per sparse group keep a
+/// pseudo-random pair of its 4 K (stream seeded from `seed`, row, block), set
+/// the other codes to 8, and return the kept mask. `codes[k]` natural dense K
+/// order; the group of K comes from `sparse24::group_of(mma, k)`.
+fn prune_block(codes: &mut [u8; 128], mma: Mma, seed: u64) -> [bool; 128] {
+    let mut rng = Rng::new(seed);
+    let mut groups = vec![Vec::with_capacity(4); SPARSE_GROUPS];
+    for k in 0..128 {
+        groups[sparse24::group_of(mma, k)].push(k);
+    }
+    let mut kept = [false; 128];
+    for members in &groups {
+        debug_assert_eq!(members.len(), 4);
+        let (a, b) = kept_pair(rng.next() >> 33);
+        kept[members[a]] = true;
+        kept[members[b]] = true;
+    }
+    for k in 0..128 {
+        if !kept[k] {
+            codes[k] = 8;
+        }
+    }
+    kept
+}
+
+/// Prune the MQ4G256V2 weights `w` (`[m x k/256 x 136]`) to 2:4 in place and
+/// return, per requested `pack_for` kind, a copy with every K128 block's 64
+/// code bytes replaced by `sparse24::pack_block` (headers unchanged). The
+/// pruning numbering uses `prune_mma`; every packer re-validates 2-of-4 under
+/// its own numbering.
+fn prune_and_pack(
+    w: &mut [u8],
+    k: usize,
+    prune_mma: Mma,
+    seed: u64,
+    pack_for: &[Mma],
+) -> Result<Vec<Vec<u8>>> {
+    let row_bytes = k / 256 * GROUP_BYTES;
+    let mut packed: Vec<Vec<u8>> = pack_for.iter().map(|_| w.to_vec()).collect();
+    let mut iters: Vec<_> = packed.iter_mut().map(|p| p.chunks_mut(row_bytes)).collect();
+    let mut rows: Vec<(&mut [u8], Vec<&mut [u8]>)> = Vec::new();
+    for dense in w.chunks_mut(row_bytes) {
+        let outs = iters
+            .iter_mut()
+            .map(|it| it.next().expect("packed image has the dense row count"))
+            .collect();
+        rows.push((dense, outs));
+    }
+    rows.par_iter_mut()
+        .enumerate()
+        .try_for_each(|(r, (dense, outs))| -> Result<()> {
+            for kb in 0..k / 128 {
+                let (g, h) = (kb / 2, kb % 2);
+                let at = g * GROUP_BYTES + 8 + 64 * h;
+                let mut codes = [0u8; 128];
+                for (j, &byte) in dense[at..at + 64].iter().enumerate() {
+                    codes[2 * j] = byte & 0xf;
+                    codes[2 * j + 1] = byte >> 4;
+                }
+                let mix = ((r * (k / 128) + kb) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let kept = prune_block(&mut codes, prune_mma, seed ^ mix);
+                for j in 0..64 {
+                    dense[at + j] = codes[2 * j] | (codes[2 * j + 1] << 4);
+                }
+                for (mma, out) in pack_for.iter().zip(outs.iter_mut()) {
+                    let bytes = sparse24::pack_block(*mma, &codes, &kept).map_err(|e| {
+                        format!("pack_block({}) row {r} block {kb}: {e}", mma.name())
+                    })?;
+                    out[at..at + 64].copy_from_slice(&bytes);
+                }
+            }
+            Ok(())
+        })?;
+    Ok(packed)
 }
 
 /// Token-layout records to the slab planes `[d:4N][s:4N][qs0..32:32N][qs32..64:32N]` per K128 block.
@@ -339,27 +439,33 @@ struct Strs {
     cacc: String,
     epi: String,
     alayout: String,
+    mma: String,
 }
 
 impl Strs {
     fn json(&self) -> Value {
         json!({"fold": self.fold, "tile": self.tile, "cacc": self.cacc,
-               "epi": self.epi, "alayout": self.alayout})
+               "epi": self.epi, "alayout": self.alayout, "mma": self.mma})
     }
     fn spec(&self) -> Result<Spec> {
-        Spec::from_knobs(
+        let mut spec = Spec::from_knobs(
             &self.fold,
             &self.tile,
             &self.cacc,
             &self.epi,
             &self.alayout,
             Arch::Gfx1201,
-        )
+        )?;
+        spec.mma = self.mma.parse()?;
+        Ok(spec)
     }
 }
 
 struct Dev {
+    /// Dense weights (pruned when any arm is sparse): the baseline and the reference read these.
     w: hip_bridge::DeviceBuffer,
+    /// Per arm ([`arm_index`]): the `pack_block` image a sparse arm reads instead of `w`.
+    w_packed: [Option<hip_bridge::DeviceBuffer>; 2],
     w_up: Option<hip_bridge::DeviceBuffer>,
     xq_token: hip_bridge::DeviceBuffer,
     xq_slab: hip_bridge::DeviceBuffer,
@@ -391,6 +497,8 @@ pub struct Iu4 {
     host: Option<Host>,
     dev: Option<Dev>,
     reference: OnceCell<Vec<f32>>,
+    /// Seed of the 2:4 pruning (`sparse-seed`).
+    sparse_seed: u64,
     /// `--rip`: the candidate arm is this source, not `iu4_gemm::emit`.
     rip: Option<RipSource>,
 }
@@ -403,7 +511,7 @@ struct RipSource {
 /// ABI of a kernel in an assembled object: everything the launcher and the
 /// kernarg packer depend on (symbol, kernarg layout, workgroup size, LDS,
 /// wave mode). Code, VGPR/SGPR counts and the like may differ.
-fn abi_signature(elf: &[u8], symbol: &str) -> Result<String> {
+pub fn abi_signature(elf: &[u8], symbol: &str) -> Result<String> {
     use peacemaker_ir::inst::Abi;
     let program = peacemaker_lift::lift_object(
         elf,
@@ -499,6 +607,7 @@ pub fn new_with_rip(
         cacc: knobs.take_or("cacc", "1"),
         epi: knobs.take_or("epi", "set"),
         alayout: knobs.take_or("alayout", "token"),
+        mma: knobs.take_or("mma", "dense"),
     };
     let cand = cand_strs.spec()?;
     if cand.epi == Epi::QkvzaGdn {
@@ -517,6 +626,7 @@ pub fn new_with_rip(
         ("base-tile", &mut base_strs.tile),
         ("base-cacc", &mut base_strs.cacc),
         ("base-alayout", &mut base_strs.alayout),
+        ("base-mma", &mut base_strs.mma),
     ] {
         if let Some(v) = knobs.take(key) {
             *slot = v;
@@ -531,12 +641,19 @@ pub fn new_with_rip(
             fold: "k128".into(),
             tile: "128x128x8".into(),
             cacc: "1".into(),
+            mma: "dense".into(),
             ..cand_strs.clone()
         };
         Spec {
             act: cand.act,
             ..Spec::control(cand.epi)
         }
+    };
+    let sparse_seed = match knobs.take("sparse-seed") {
+        Some(v) => v
+            .parse::<u64>()
+            .map_err(|e| format!("--sparse-seed {v}: {e}"))?,
+        None => DEFAULT_SPARSE_SEED,
     };
     let ref_fold = match knobs.take_or("ref-fold", "fma").as_str() {
         "fma" => RefFold::Fma,
@@ -575,6 +692,7 @@ pub fn new_with_rip(
         host: None,
         dev: None,
         reference: OnceCell::new(),
+        sparse_seed,
         rip,
     }))
 }
@@ -593,6 +711,11 @@ impl Iu4 {
             Arm::Baseline => self.base,
             Arm::Candidate => self.cand,
         }
+    }
+
+    /// Either arm runs a 2:4 sparse MMA, so the generated weights are pruned.
+    fn sparse_active(&self) -> bool {
+        self.cand.mma != Mma::Dense || self.base.mma != Mma::Dense
     }
 
     fn out_bytes(&self) -> usize {
@@ -677,7 +800,9 @@ impl Iu4 {
     /// SET/ADD GEMM (M=128, N=128, K=256) and compare against the CPU reference.
     fn run_emu(&self) -> Result<Value> {
         use peacemaker_ir::emu::{Emulator, Launch as ELaunch, Memory};
-        let (elf, symbol) = emit_elf(self.cand)?;
+        // The candidate object itself (the generator's, or `--rip`'s).
+        let obj = self.candidate()?;
+        let (elf, symbol) = (obj.bytes, obj.launch_symbol);
         let lifted = peacemaker_lift::lift_object(
             &elf,
             peacemaker_lift::Options {
@@ -694,7 +819,14 @@ impl Iu4 {
         }
         let (m, n, k) = (128usize, 128usize, 256usize);
         let add = self.cand.epi == Epi::Add;
-        let host = Host::synth(m, n, k, false);
+        let mut host = Host::synth(m, n, k, false);
+        // A sparse candidate reads the packed image; the reference reads the pruned dense weights.
+        let w_image = if self.cand.mma == Mma::Dense {
+            host.w.clone()
+        } else {
+            let mma = self.cand.mma;
+            prune_and_pack(&mut host.w, k, mma, self.sparse_seed, &[mma])?.remove(0)
+        };
         let (kva, ava, xva, yva) = (
             0x1000_0000u64,
             0x2000_0000u64,
@@ -707,6 +839,21 @@ impl Iu4 {
         };
         let mut kern = pack_set_add(ava, xva, yva, m, k, n, add);
         kern.resize(self.cand.kernargs().size as usize, 0);
+        // ROCm fills the hidden block counts (grid size in workgroups) at launch; the
+        // banded raster of the prologue divides by them.
+        let tile = self.cand.tile;
+        let grid = [
+            m.div_ceil(tile.rows() as usize) as u32,
+            n.div_ceil(128) as u32,
+        ];
+        for a in self.cand.kernargs().args {
+            let g = match a.name.as_str() {
+                "hidden_block_count_x" => grid[0],
+                "hidden_block_count_y" => grid[1],
+                _ => continue,
+            };
+            kern[a.offset as usize..a.offset as usize + 4].copy_from_slice(&g.to_le_bytes());
+        }
         let y0: Vec<u8> = if add {
             host.y0.iter().flat_map(|v| v.to_le_bytes()).collect()
         } else {
@@ -714,12 +861,11 @@ impl Iu4 {
         };
         let mut mem = Memory::default();
         mem.map("kernarg".into(), kva, kern)?;
-        for (name, va, bytes) in [("a", ava, host.w.clone()), ("xq", xva, xq), ("y", yva, y0)] {
+        for (name, va, bytes) in [("a", ava, w_image), ("xq", xva, xq), ("y", yva, y0)] {
             let len = bytes.len() as u64;
             mem.map(name.into(), va, bytes)?;
             mem.map(format!("{name}_tail"), va + len, vec![0; 4096])?;
         }
-        let tile = self.cand.tile;
         for y in 0..n.div_ceil(128) {
             for x in 0..m.div_ceil(tile.rows() as usize) {
                 emu.run_workgroup(
@@ -731,6 +877,12 @@ impl Iu4 {
                     },
                     &mut mem,
                 )?;
+            }
+        }
+        for name in ["a_tail", "xq_tail", "y_tail"] {
+            let r = mem.regions.iter().find(|r| r.name == name);
+            if r.is_some_and(|r| r.bytes.iter().any(|&b| b != 0)) {
+                return Err(format!("kernel wrote past the end of the {name} buffer"));
             }
         }
         let got = mem.read(yva, n * m * 4)?;
@@ -748,13 +900,14 @@ impl Iu4 {
             "shape": {"M": m, "N": n, "K": k},
             "symbol": symbol,
             "reference": "cpu_iu4_symfold_rn",
+            "mma": self.cand.mma.name(),
             "mismatching_elements": mismatches,
             "bit_exact": mismatches == 0,
         }))
     }
 }
 
-fn max_diff(a: &[u8], b: &[u8], width: usize) -> f64 {
+pub fn max_diff(a: &[u8], b: &[u8], width: usize) -> f64 {
     let val = |c: &[u8]| -> f32 {
         if width == 2 {
             f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)
@@ -789,6 +942,21 @@ impl Workload for Iu4 {
         json!({"M": self.m, "N": self.n, "K": self.k,
                "launch_rows": if self.cand.epi.is_silu() { 2 * self.m } else { self.m }})
     }
+    fn record_extra(&self) -> Vec<(String, Value)> {
+        if !self.sparse_active() {
+            return Vec::new();
+        }
+        vec![(
+            "sparse".into(),
+            json!({
+                "mma": self.cand.mma.name(), "base_mma": self.base.mma.name(),
+                "groups_per_block": SPARSE_GROUPS, "kept_per_group": SPARSE_KEPT,
+                "seed": self.sparse_seed,
+                "weights": "generated MQ4V2 codes pruned 2-of-4 per sparse group, pruned code = 8; \
+                    dense arms and the CPU reference read the pruned dense weights, sparse arms the pack_block image",
+            }),
+        )]
+    }
     fn candidate_knobs(&self) -> Value {
         let mut v = self.cand_strs.json();
         v["variant"] = json!(self.cand.variant_name());
@@ -812,7 +980,19 @@ impl Workload for Iu4 {
 
     fn setup(&mut self, gpu: &Gpu) -> Result<()> {
         let silu = self.cand.epi.is_silu();
-        let host = Host::synth(self.m, self.n, self.k, silu);
+        let mut host = Host::synth(self.m, self.n, self.k, silu);
+        // Any sparse arm: prune the generated weights to 2:4 (in `host.w`, which
+        // the dense baseline and the CPU reference read) and pack one image per
+        // sparse arm.
+        let sparse: Vec<(usize, Mma)> = [(0, self.base.mma), (1, self.cand.mma)]
+            .into_iter()
+            .filter(|(_, mma)| *mma != Mma::Dense)
+            .collect();
+        let mut images = Vec::new();
+        if let Some(&(_, prune_mma)) = sparse.first() {
+            let kinds: Vec<Mma> = sparse.iter().map(|(_, mma)| *mma).collect();
+            images = prune_and_pack(&mut host.w, self.k, prune_mma, self.sparse_seed, &kinds)?;
+        }
         let up = |b: &[u8]| -> Result<hip_bridge::DeviceBuffer> {
             let d = gpu.hip.malloc(b.len().max(16)).map_err(dev_err)?;
             if !b.is_empty() {
@@ -821,8 +1001,13 @@ impl Workload for Iu4 {
             Ok(d)
         };
         let out = self.out_bytes().max(16);
+        let mut w_packed = [None, None];
+        for ((arm, _), image) in sparse.iter().zip(&images) {
+            w_packed[*arm] = Some(up(image)?);
+        }
         let dev = Dev {
             w: up(&host.w)?,
+            w_packed,
             w_up: if silu { Some(up(&host.w_up)?) } else { None },
             xq_token: up(&host.recs)?,
             xq_slab: up(&to_slab(&host.recs, self.n))?,
@@ -853,17 +1038,11 @@ impl Workload for Iu4 {
         } else {
             self.m
         };
+        // A sparse arm reads its packed image, every other arm the (pruned) dense weights.
+        let w = dev.w_packed[arm_index(arm)].as_ref().unwrap_or(&dev.w);
         let kernarg = match &dev.w_up {
-            Some(up) => pack_silu(ptr(&dev.w), ptr(up), xq, y, self.m, self.k, self.n),
-            None => pack_set_add(
-                ptr(&dev.w),
-                xq,
-                y,
-                self.m,
-                self.k,
-                self.n,
-                spec.epi == Epi::Add,
-            ),
+            Some(up) => pack_silu(ptr(w), ptr(up), xq, y, self.m, self.k, self.n),
+            None => pack_set_add(ptr(w), xq, y, self.m, self.k, self.n, spec.epi == Epi::Add),
         };
         Launch {
             kernarg,
@@ -931,11 +1110,16 @@ impl Workload for Iu4 {
         }
         Ok(RefReport {
             reference: format!(
-                "cpu_iu4_symfold_rn(rows={},fold={},mismatching_elements={mismatches})",
+                "cpu_iu4_symfold_rn(rows={},fold={}{},mismatching_elements={mismatches})",
                 self.rows_desc,
                 match self.ref_fold {
                     RefFold::Fma => "fma",
                     RefFold::MulAdd => "muladd",
+                },
+                if self.sparse_active() {
+                    ",weights=pruned_2of4"
+                } else {
+                    ""
                 }
             ),
             max_abs_err: worst,
@@ -1181,5 +1365,181 @@ mod tests {
             max_diff(&1.0f32.to_le_bytes(), &3.0f32.to_le_bytes(), 4),
             2.0
         );
+    }
+    const SPARSE: [Mma; 2] = [Mma::S24X64, Mma::S24X32];
+
+    fn nibbles(blk: &[u8]) -> [u8; 128] {
+        std::array::from_fn(|k| (blk[k / 2] >> (4 * (k % 2))) & 0xf)
+    }
+
+    #[test]
+    fn prune_block_keeps_two_per_group_and_zeroes_the_rest() {
+        for mma in SPARSE {
+            let orig: [u8; 128] = std::array::from_fn(|k| ((k * 7 + 3) % 16) as u8);
+            let mut codes = orig;
+            let kept = prune_block(&mut codes, mma, 42);
+            for g in 0..SPARSE_GROUPS {
+                let members: Vec<usize> = (0..128)
+                    .filter(|&k| sparse24::group_of(mma, k) == g)
+                    .collect();
+                assert_eq!(members.len(), 4, "{mma:?} group {g}");
+                assert_eq!(
+                    members.iter().filter(|&&k| kept[k]).count(),
+                    SPARSE_KEPT,
+                    "{mma:?} group {g}"
+                );
+                for &k in &members {
+                    assert_eq!(codes[k], if kept[k] { orig[k] } else { 8 }, "{mma:?} k={k}");
+                }
+            }
+            let mut again = orig;
+            assert_eq!(prune_block(&mut again, mma, 42), kept, "deterministic");
+            assert_eq!(again, codes);
+            let mut other = orig;
+            assert_ne!(
+                prune_block(&mut other, mma, 43),
+                kept,
+                "seed changes the mask"
+            );
+        }
+    }
+
+    /// Both packers' groups are the same dense-K sets, so one pruning serves both.
+    #[test]
+    fn x64_and_x32_groups_are_the_same_sets() {
+        let part = |mma| {
+            let mut sets: Vec<Vec<usize>> = (0..SPARSE_GROUPS)
+                .map(|g| {
+                    (0..128)
+                        .filter(|&k| sparse24::group_of(mma, k) == g)
+                        .collect()
+                })
+                .collect();
+            sets.sort();
+            sets
+        };
+        assert_eq!(part(Mma::S24X64), part(Mma::S24X32));
+    }
+
+    #[test]
+    fn prune_and_pack_prunes_dense_and_replaces_only_code_bytes() {
+        let (m, k) = (6usize, 512usize);
+        let dense = Host::synth(m, 1, k, false).w;
+        let mut pruned = dense.clone();
+        let packed = prune_and_pack(&mut pruned, k, Mma::S24X64, 7, &SPARSE).unwrap();
+        assert_eq!(packed.len(), 2);
+        for image in &packed {
+            assert_eq!(image.len(), dense.len());
+            for (b, blk) in image.chunks_exact(GROUP_BYTES).enumerate() {
+                assert_eq!(&blk[..8], &dense[b * GROUP_BYTES..][..8], "header {b}");
+            }
+        }
+        for (r, row) in pruned.chunks_exact(k / 256 * GROUP_BYTES).enumerate() {
+            for (g, blk) in row.chunks_exact(GROUP_BYTES).enumerate() {
+                assert_eq!(&blk[..8], &dense[(r * (k / 256) + g) * GROUP_BYTES..][..8]);
+                for h in 0..2 {
+                    let codes = nibbles(&blk[8 + 64 * h..][..64]);
+                    for grp in 0..SPARSE_GROUPS {
+                        let zeros = (0..128)
+                            .filter(|&kk| sparse24::group_of(Mma::S24X64, kk) == grp)
+                            .filter(|&kk| codes[kk] == 8)
+                            .count();
+                        assert!(
+                            zeros >= 2,
+                            "row {r} g {g} h {h} group {grp}: pruned dense keeps <=2"
+                        );
+                    }
+                }
+            }
+        }
+        assert_ne!(packed[0], pruned, "x64 image is not the dense layout");
+        // Deterministic for a fixed seed, different for another.
+        let mut again = dense.clone();
+        assert_eq!(
+            prune_and_pack(&mut again, k, Mma::S24X64, 7, &SPARSE).unwrap(),
+            packed
+        );
+        assert_eq!(again, pruned);
+        let mut other = dense.clone();
+        prune_and_pack(&mut other, k, Mma::S24X64, 8, &SPARSE).unwrap();
+        assert_ne!(other, pruned);
+    }
+
+    #[test]
+    fn mma_knobs_reach_the_spec_and_the_record() {
+        let w = new("M=128,N=64,K=256", &mut knobs(&[("mma", "s24x64")])).unwrap();
+        assert_eq!(w.candidate_knobs()["mma"], "s24x64");
+        assert!(w.candidate_knobs()["variant"]
+            .as_str()
+            .unwrap()
+            .ends_with("-s24x64"));
+        let extra = w.record_extra();
+        assert_eq!(extra.len(), 1);
+        let (key, v) = &extra[0];
+        assert_eq!(key, "sparse");
+        assert_eq!(
+            (v["mma"].as_str(), v["base_mma"].as_str()),
+            (Some("s24x64"), Some("dense"))
+        );
+        assert_eq!(
+            (v["groups_per_block"].as_u64(), v["kept_per_group"].as_u64()),
+            (Some(32), Some(2))
+        );
+        assert_eq!(v["seed"].as_u64(), Some(DEFAULT_SPARSE_SEED));
+        // Dense candidate vs sparse emitted baseline is also a sparse run.
+        let mut k = knobs(&[("base-mma", "s24x32"), ("sparse-seed", "9")]);
+        let w = new("M=128,N=64,K=256", &mut k).unwrap();
+        assert!(k.0.is_empty());
+        let v = &w.record_extra()[0].1;
+        assert_eq!(
+            (
+                v["mma"].as_str(),
+                v["base_mma"].as_str(),
+                v["seed"].as_u64()
+            ),
+            (Some("dense"), Some("s24x32"), Some(9))
+        );
+        // Dense runs carry no sparse block.
+        assert!(new("M=128,N=64,K=256", &mut knobs(&[]))
+            .unwrap()
+            .record_extra()
+            .is_empty());
+        assert!(new("M=128,N=64,K=256", &mut knobs(&[("mma", "bogus")])).is_err());
+        assert!(new("M=128,N=64,K=256", &mut knobs(&[("sparse-seed", "x")])).is_err());
+    }
+
+    #[test]
+    fn sparse_axes_the_generator_refuses_surface_its_error() {
+        let w = new(
+            "M=128,N=64,K=256",
+            &mut knobs(&[("mma", "s24x64"), ("tile", "256x128x16")]),
+        )
+        .unwrap();
+        assert!(w.candidate().unwrap_err().to_lowercase().contains("tile"));
+        let w = new(
+            "M=128,N=64,K=256",
+            &mut knobs(&[("mma", "s24x32"), ("alayout", "slab")]),
+        )
+        .unwrap();
+        assert!(w.candidate().is_err());
+    }
+
+    /// The emulator runs the dense and both sparse kernels to completion at
+    /// M=128, N=128, K=256 and matches the CPU reference bit for bit (SET and ADD).
+    #[test]
+    fn emu_runs_dense_and_sparse_bit_exact() {
+        for epi in ["set", "add"] {
+            for mma in ["dense", "s24x64", "s24x32"] {
+                let w = new(
+                    "M=128,N=128,K=256",
+                    &mut knobs(&[("mma", mma), ("epi", epi)]),
+                )
+                .unwrap();
+                let v = w.emu();
+                assert_eq!(v["ran"], true, "{epi} {mma}: {v}");
+                assert_eq!(v["bit_exact"], true, "{epi} {mma}: {v}");
+                assert_eq!(v["mma"], mma);
+            }
+        }
     }
 }
