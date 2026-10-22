@@ -57,8 +57,8 @@ pub(crate) use session_pair::{PairSessionStage, PromptTxn, SlowlinkOwner, Slowli
 #[path = "bundle/pp.rs"]
 mod pp;
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
-pub use pp::Qwen4PpWindow;
 use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
+pub use pp::{Qwen4PpLaneExecutor, Qwen4PpWindow};
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3728,6 +3728,10 @@ impl Qwen4Bundle {
     /// admission into a slot. With `spec` every lane is an MTP lane (native
     /// MTP windows of at most `spec.k` drafts); refused when the bundle has
     /// no MTP head or `k + 1` verify rows exceed `LANE_MAX_ROWS`.
+    ///
+    /// Under an attached EP mesh the store is staged on every rank (AR lanes
+    /// only; each rank checks its own free device memory) and rolled back on
+    /// every rank if any rank fails ([`Self::ep_stage_lanes`]).
     pub fn stage_lanes(
         &mut self,
         gpu: &mut Gpu,
@@ -3735,7 +3739,10 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
-        self.ep_refuse("continuous-batch lanes")?;
+        self.pp_refuse("continuous-batch lanes")?;
+        if self.ep.is_some() {
+            return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);
+        }
         if self.lanes.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 lanes are already staged".to_string(),
@@ -3818,6 +3825,9 @@ impl Qwen4Bundle {
         epoch: hipfire_runtime::slot_batch::RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, BundleError> {
+        if self.ep.is_some() {
+            return self.ep_admit_lane(gpu, epoch, prompt);
+        }
         self.with_lanes(|store, bundle| store.admit(gpu, bundle, epoch, prompt))
     }
 
@@ -3826,11 +3836,18 @@ impl Qwen4Bundle {
         &mut self,
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_release_lane(epoch);
+        }
         self.with_lanes(|store, _| store.release(epoch))
     }
 
     /// Mark `epoch`'s lane untrusted: it runs no further step.
     pub fn poison_lane(&mut self, epoch: &hipfire_runtime::slot_batch::RequestEpoch) {
+        if self.ep.is_some() {
+            self.ep_poison_lane(epoch);
+            return;
+        }
         if let Some(store) = self.lanes.as_mut() {
             store.poison(epoch);
         }
@@ -3843,7 +3860,79 @@ impl Qwen4Bundle {
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
         token: u32,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_force_lane_seed(epoch, token);
+        }
         self.with_lanes(|store, _| store.force_seed(epoch, token))
+    }
+
+    /// Developer / oracle entry (the serve path never calls it): replace the
+    /// row-local stage share policy of EVERY lane store of this load, so a
+    /// measurement can compare shared and per-lane stage execution on the
+    /// topology itself (the default policy is resolved per stage from the
+    /// `LANE_ROW_TWIN_PROOFS` rows by each store's actually bound weight
+    /// routes: a stage is shared only if every owned instance route matches a
+    /// proof row, so a stage with an unproved instance stays per lane: for
+    /// example a MoE layer outside the EP packed static-or-balanced class
+    /// (`LaneExpertRoute::EpPackedStaticOrBalanced`), or any route outside the
+    /// proof rows).
+    ///
+    /// - single: this bundle's store;
+    /// - EP: every rank's store, replicated through the soft lane fan-out
+    ///   (ranks must agree; a refusal all ranks report identically leaves the
+    ///   mesh usable);
+    /// - PP: every band's store, root included (host only; `gpus` is the mesh
+    ///   owner the other PP lane calls require and is mandatory under PP).
+    ///
+    /// Refused, with no store changed: lanes not staged on every store, a
+    /// step in flight, or a policy that fails
+    /// [`crate::gpu_forward_lanes::LaneStagePolicy::validate`]. Stateful
+    /// stages stay per lane (the policy type cannot say otherwise).
+    pub fn set_lane_stage_policy(
+        &mut self,
+        gpus: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), BundleError> {
+        policy.validate().map_err(BundleError::Forward)?;
+        if self.pp.is_some() {
+            let gpus = gpus.ok_or_else(|| {
+                BundleError::Forward(
+                    "qwen4 topology.pp: set_lane_stage_policy needs the mesh's Gpus".to_string(),
+                )
+            })?;
+            return self.pp_set_lane_stage_policy(gpus, policy);
+        }
+        if self.ep.is_some() {
+            return self.ep_set_lane_stage_policy(policy);
+        }
+        self.set_lane_stage_policy_local(policy)
+            .map_err(BundleError::Forward)
+    }
+
+    /// Check this bundle's own store can take a policy change.
+    pub(crate) fn lane_stage_policy_ready(&self) -> Result<(), String> {
+        let store = self
+            .lanes
+            .as_ref()
+            .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+        if store.phase != crate::lane_exec::LanePhase::Idle {
+            return Err("set_lane_stage_policy: a step is in flight".to_string());
+        }
+        Ok(())
+    }
+
+    /// This bundle's store only (no mesh fan-out).
+    pub(crate) fn set_lane_stage_policy_local(
+        &mut self,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        self.lane_stage_policy_ready()?;
+        self.lanes
+            .as_mut()
+            .expect("checked by lane_stage_policy_ready")
+            .set_stage_policy(policy);
+        Ok(())
     }
 
     /// The resident owners must be at a clean window boundary to move into a
@@ -3890,6 +3979,11 @@ impl Qwen4Bundle {
         position: usize,
         parts: Option<crate::mtp_spec::Qwen4PromotionParts<'_>>,
     ) -> Result<usize, BundleError> {
+        if self.ep.is_some() {
+            return Err(crate::ep::ep_err(
+                "promotion into lanes is not supported yet",
+            ));
+        }
         let spec = self
             .lanes
             .as_ref()
@@ -3944,6 +4038,9 @@ impl Qwen4Bundle {
         &mut self,
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_abort_promotion(epoch);
+        }
         self.with_lanes(|store, _| store.release(epoch))
     }
 
@@ -3959,6 +4056,9 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_commit_promotion(gpu, epoch);
+        }
         self.with_lanes(|store, bundle| {
             if store.phase != crate::lane_exec::LanePhase::Idle {
                 return Err("promotion: a lane step is in flight".to_string());
@@ -4002,15 +4102,22 @@ impl Qwen4Bundle {
     }
 
     /// A fresh lane trunk state: the resident state's formats, QSA backend
-    /// and context bound, allocated through the same constructor.
+    /// and context bound, allocated through the same constructor over this
+    /// bundle's band (the whole model under the single scope; a PP band's
+    /// layers and endpoint state otherwise).
     pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
-        self.ep_refuse("continuous-batch lane/wave states")?;
-        Qwen4State::new_with_backend(
+        // Attached roots need the mesh owner; detached band/rank calls
+        // allocate the state local to their weight scope.
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
+        Qwen4State::new_with_backend_scoped(
             gpu,
             &self.config,
             self.state.max_seq_len,
             self.state_format,
             self.state.qsa_backend(),
+            self.weights.band_scope(),
         )
         .map_err(BundleError::State)
     }
@@ -4140,7 +4247,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         final_logits: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
-        self.ep_refuse("continuous-batch lane prefill")?;
+        self.pp_refuse("continuous-batch lane prefill")?;
         self.with_lane(state, None, |bundle| {
             let mut forward = bundle.execution.take().ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
