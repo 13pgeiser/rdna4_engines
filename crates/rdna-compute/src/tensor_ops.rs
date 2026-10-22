@@ -1720,7 +1720,8 @@ pub fn hc_state_bf16_add_f32(
     hc_state_bf16_elementwise(gpu, "hc_state_bf16_add_f32", state, addend, n)
 }
 
-const HC_MEAN_CAPTURE_SRC: &str = include_str!("../../../kernels/src/hc_mean_capture.hip");
+pub(crate) const HC_MEAN_CAPTURE_SRC: &str =
+    include_str!("../../../kernels/src/hc_mean_capture.hip");
 
 /// DFlash2 target features on Qwen4: the mean over the `hc` hyper-connection
 /// streams of `rows` rows of HC state (`[row, stream, hidden]`, F32, or
