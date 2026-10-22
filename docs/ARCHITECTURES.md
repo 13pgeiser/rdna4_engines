@@ -1094,6 +1094,13 @@ w4a8 / w8a8 trunk takes `gemma4_bf16`'s fused junctions; an i8a8 or asymmetric-i
 chain. Where a row is missing the plugin declares the chain, and the startup notes say which form
 each took. Under calibration no junction is fused (below).
 
+**Pipelined prefill.** At two ranks an MXFP4 trunk with the fused fp8 junctions prefills a prompt
+of 1024 tokens or more in two pieces, the junctions and all-reduces of one beside the other's
+compute (GUIDE §4.5, `RADIANCE_PREFILL_PIPELINE`). The window KV group's `seqused` counts from its
+rebased first block, so the first piece's bound is computed on the card (`sub_i32`: the group's
+`seqused` less the second piece's rows), not taken from its position. The gain needs 1024-row
+pieces: serve at `--max-num-batched-tokens 2048`.
+
 **Calibration.** Serve a calibration container (int8, `translategemma-27b-i8a8.recipe`: KL 0.003
 against bf16, and it fits two 32 GB cards) with `RADIANCE_CALIB_DIR` set, push a corpus of the
 prompts you will serve through prefill, and each linear's input Gram is written once

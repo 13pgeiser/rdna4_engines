@@ -2160,7 +2160,11 @@ start above 524288 elements (8192 at eight ranks), a band edge of the ranged `nu
 all-reduce kernel serves `y` absent, in place. `overlap` 1 says the caller issues the collective on
 its second lane, beside compute; libr4d then picks rows with a narrow launch (8 blocks of 256
 threads at two ranks, 4 of 1024 for the four-rank two-shots, exact and tiered-int8) that compute the
-same bits and leave the CUs to the kernels running beside them. libref ignores it.
+same bits and leave the CUs to the kernels running beside them. At three and eight ranks the lane
+rows (exact at both, tiered-int8 at three) launch as the wide rows unless `R4D_AR_LANE_3_8=1` gives
+them the four-rank launch, unmeasured there (GUIDE §4.7); the eight-rank one starts above 524288
+elements, so an `overlap` 1 message of 8193..524288 elements keeps the wide two-shot there. libref
+ignores it.
 
 libr4d serves these at 2, 3, 4 and 8 ranks:
 

@@ -1049,6 +1049,62 @@ avoids the extra copies, at the cost of full re-prefill if an edit precedes the 
 Recurrent-state models still checkpoint at intervals under `tip-only`; their
 existing scheduling is unchanged.
 
+**One prefill sequence in two pieces** (`RADIANCE_PREFILL_PIPELINE`). On `qwen35_fp8` (and
+`qwen35_w8a8`, built from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk, a step of at least 1024 tokens that
+carries one prefill sequence and nothing else runs in two pieces of about half, the first rounded up
+to 64 rows so both sit in the whole step's kernel band. Every block runs a piece at a time; the work
+between two blocks (the block's all-reduce, the next norm, and after a feed-forward the add) runs a
+piece at a time on the second lane, beside the other piece's compute. The all-reduce there is the
+narrow `overlap` launch ([OPS.md](OPS.md#collectives)): the fused all-reduce and norm holds its
+blocks while it waits on the link and slowed the GEMM beside it by a third, and a wide launch slows
+it 1.45-2.1x; either ate the whole gain at two ranks. A piece computes what a narrower chunk
+computes, so a pipelined step is the serial step bit for bit: Qwen3.8-27B's KL recordings (`k6_v4`,
+`--tp-wire wht6`) and TranslateGemma's compare equal with it on and off. One setting makes a piece
+differ from the whole step: a lossy `--tp-wire` whose `--tp-wire-min-kb` a piece's message falls
+under while the whole step's does not (that piece goes out exact).
+
+| `RADIANCE_PREFILL_PIPELINE` | |
+|---|---|
+| `auto`, or unset | pipelined at two ranks |
+| `on` (`1`, `true`) | also at three, four and eight ranks; startup notes that it is not measured there |
+| `off` (`0`, `false`) | never |
+
+Another value is noted at startup and taken as `auto`. On two R9700s (PCIe Gen5 x8, 265 W):
+
+| model, chunk | prompt | serial | pipelined |
+|---|---|---|---|
+| Qwen3.8-27B MXFP4, 2048 | 41k tokens | 9.00 s | 8.41 s |
+| TranslateGemma 27B MXFP4, 2048 | 6k | 1.27 s | 1.21 s |
+| | 12k | 2.48 s | 2.42 s |
+
+The Qwen figure includes the tiled GEMM's TN=4 crossover at 1024 rows, which the 1024-row pieces
+need. At a 1024-token chunk TranslateGemma's pieces are 512 rows and gain nothing, so serve it at
+2048 (against 1024: -9% at 6k, -7% at 12k). Decode steps are unchanged.
+
+- **Above two ranks it is not measured.** `on` lets it run at three, four and eight ranks. At four
+  libr4d's `overlap` all-reduce rows take a narrow launch that leaves the CUs to compute
+  ([TP4.md](TP4.md)); at three and eight they launch wide unless `R4D_AR_LANE_3_8=1` (§4.7), and a
+  wide all-reduce beside the other piece's GEMM is what ate the whole gain at two ranks, so try the
+  pipeline there with the variable set too. Compare a long prompt's prefill with `on` and `off` at
+  the chunk you serve before keeping it. On the exact wire only the two-shot band above 524288
+  elements has a lane row: a smaller piece (512 rows of a model 1024 wide) keeps the wide launch,
+  the one-shot at three and four ranks, the one-shot or the wide two-shot at eight. The
+  tiered-int8 lane rows at three and four ranks have no such floor. Eight ranks have no
+  lossy wire, so `on` there pipelines on the exact wire only. Qwen3.8-27B (4 KV heads) and
+  TranslateGemma (16) do not serve at three ranks.
+- **Measured on MXFP4 containers.** `qwen35_w8a8` prefills serially where libr4d serves its
+  rotated int8 norms (the boundary norms would need the int8 codes on the second lane; startup says
+  so). Without them it builds the same code, not checked bit for bit on its int8 trunk.
+- **Which steps.** A prefill step with more than one sequence, decode rows beside it, or media rows
+  (an image's tokens) runs serially; the first wide step that does says why, once, on rank 0
+  (`radiance: qwen35: a 2048-row prefill step runs serially: more than one sequence`). `gemma3`
+  needs the fused fp8 junctions, a library that serves `sub_i32`, and no calibration tap
+  (`RADIANCE_CALIB_DIR`); without them a startup note says the pipeline is off.
+- **Memory.** The buffers the second lane touches leave the arena's sharing pool across the
+  architecture's second-lane window ([PLUGIN.md](PLUGIN.md) §11). On Qwen3.8-27B with its DFlash2
+  drafter at 64 sequences and speculation 7 the activation arena is 526.32 MiB a card, as without
+  a second lane; the second lane's third hardware queue (33 MiB, §4.3) remains.
+
 **Sharing a step** (`--busy-prefill-chunk`, default `auto`). When other work is pending, a prefill
 chunk leaves room for one row plus the draft window per decode row behind it, and a share of the
 budget (an eighth, at least one quantum) for each prefill behind it and for the next request waiting
@@ -1238,6 +1294,17 @@ weights' (a Gen4 x8 link gets 0). The
 engine does not use it: on this board those weights lost their lead within a timing run and
 served no faster. `r4d_selftest --perfar8 --ar8-weights W0,..,W7` times other weights on another
 board (`off` for even shards).
+
+**An all-reduce beside compute at three and eight ranks** (`R4D_AR_LANE_3_8`). An all-reduce a
+plugin issues on its second lane (`overlap` 1: a pipelined prefill, §4.5; qwen4exp's
+`--prefill-span`; gemma4's prefill trunk overlap; the image and video plugins' second-lane
+collectives) takes a narrow launch at two and four ranks, measured there: a wide all-reduce's
+blocks spin on peer flags on the CUs the GEMM beside it needs, and at two ranks slowed it
+1.45-2.1x. At three and eight ranks `ar_twoshot_3rank_exact_lane`, `ar_twoshot_3rank_ti8_lane` and
+`ar_twoshot_8rank_exact_lane` take those collectives, but by default they launch exactly as the
+wide rows do, so nothing changes against a build without them. With `R4D_AR_LANE_3_8=1` they take
+the four-rank launch, 4 blocks of 1024 threads. The bits are the same either way; only the time
+moves:
 
 ### 4.8 Host tier for finished conversations
 
@@ -3288,6 +3355,8 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
+| `R4D_AR_LANE_3_8` | `1`: at three and eight ranks an all-reduce beside compute (`overlap` 1) takes the narrow four-rank launch instead of the wide one. Same bits; faster where the all-reduce is the shorter of the two, slower where it is the longer; not measured on such machines. Unset or `0`: the wide launch, as without the lane rows (§4.7) |
+| `RADIANCE_PREFILL_PIPELINE` | a prefill step of one sequence and 1024 tokens or more in two pieces, the work between blocks of one piece on the second lane beside the other's compute (§4.5): unset or `auto` at two ranks, `on` also at three, four and eight ranks (not measured there), `off` never. The bits are the serial step's |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

@@ -361,6 +361,31 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   (`rad_op_resolved`) and is an error only if issued. The in-tree blocks do this for
   `qk_norm_rope_gate`.
 - **Read §8** if the model has a linear or recurrent block.
+- **Declare the second lane's window.** Work issued on the second lane (`rad_lane`,
+  `abi/rad_runtime.h`) runs beside lane 0 in time, so every buffer it touches is named to
+  `rad_buf_concurrent`, which keeps it live for the whole program: the planner cannot tell when
+  lane 1 runs. An architecture whose lane-1 work lies in one stretch of its declared ops says so,
+  calling `rad_lane1_window_begin(b)` before the first op of the stretch and
+  `rad_lane1_window_end(b)` after the last, once each and in that order, at declare. A concurrent
+  buffer is then live across the window and over its own declared uses only, so buffers used only
+  outside the window (a drafter's, the heads') share its bytes again. What the plugin promises:
+  it issues nothing on lane 1 outside the window. What the runtime does (`Ctx::issue`): an op
+  issued on lane 1 outside the window fails the step, naming the window's op range and the op's
+  position; the first op issued on lane 0 past the window joins lane 1 first when lane 1 has work
+  pending, so the plugin need not join before the window ends; an op the core appends behind a
+  declared one (runtime LoRA) counts at that op's position. The builder refuses a second `begin`,
+  an `end` without a `begin`, twice or around no op, a `begin` never closed, and either call after
+  declare. `qwen35_fp8` (with the plugins built from it) and `gemma3` declare one from the
+  embedding's all-reduce to the final norm. On Qwen3.8-27B with its DFlash2 drafter at 64 sequences
+  and speculation 7, on two R9700s, the activation arena went from 633.99 to 526.32 MiB a card, as
+  without a second lane, and with the second lane's own scratch region
+  ([IMPLEMENTATION.md](IMPLEMENTATION.md)) the KV pool from 86 208 to 93 856 tokens.
+  `tests/arch_test.cpp`'s builder applies the window to liveness as the core does, so the pinned
+  graphs and steps are the ones the core plans; the runtime (`Ctx::issue`) is what refuses a lane-1
+  op outside the window. The join is at the window's end only: an op declared before the window must
+  not be issued again while lane 1 has work pending. Both calls are additive exports:
+  `RAD_ABI_VERSION` (26) does not move, and a plugin that does not call them is unaffected. A plugin that calls them needs an engine that exports them; an older engine fails
+  to load it (`dlopen` with `RTLD_NOW`: an undefined symbol).
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
   expansion and positions, in five processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
   GLM-5.3) chosen by the container's `vision_config.model_type` (Unlimited-OCR's by its

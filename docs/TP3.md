@@ -137,6 +137,21 @@ fold in fp32 in ascending rank order, so the switch between them changes no bits
 at three ranks is the tiered-int8 wire over the same uneven two-shot for messages from
 `--tp-wire-min-kb` up, and the exact one-shot below.
 
+An all-reduce a plugin issues on its second lane beside compute (`overlap` 1, [OPS.md](OPS.md)
+Collectives) takes `ar_twoshot_3rank_exact_lane` or `ar_twoshot_3rank_ti8_lane`, the exact and
+tiered-int8 two-shots' entry points one priority above the wide rows: qwen4exp's pipelined prefill
+under `--prefill-span` ([GUIDE.md](GUIDE.md) §4.5), gemma4's prefill trunk overlap and the image and
+video plugins' second-lane collectives among them. By default they launch exactly as the wide rows
+(`tArTs38Lane` holds `tAr`'s defaults), so a three-rank deployment runs as it did before them.
+`R4D_AR_LANE_3_8=1` gives them the four-rank lane rows' launch, 4 blocks of 1024 threads; the
+arithmetic is the wide rows' either way, bit for bit. At two ranks a wide all-reduce beside a GEMM
+slowed it 1.45-2.1x on R9700s, which the narrow launch avoids; at three it may pay the same way,
+or cost where the all-reduce outlasts the compute beside it. Not measured: no three-card machine
+was available, and the launch is untuned there. GUIDE §4.7 has how to compare the two.
+`RADIANCE_PREFILL_PIPELINE=on` also allows `qwen35_fp8`'s and `gemma3`'s pipelined prefill at three
+ranks, but neither model this tree serves with them splits its KV heads three ways (Qwen3.8-27B has
+4, TranslateGemma 16), so it has nothing to run there yet.
+
 Startup logs the geometry:
 
 ```

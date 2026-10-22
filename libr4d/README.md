@@ -71,6 +71,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gdn_gated_norm_had_quant_i8` | the GDN gated norm with the rotation and quantiser fused onto it |
 | `qk_norm_rope_gate` | q/k RMS norm, rope and the attention gate in one kernel |
 | `ar_oneshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4}rank_ti8`, `ar_gather_3rank` | the wider-world collectives (TP3/TP4/TP8), exact and int8-wire |
+| `ar_twoshot_{3,4,8}rank_exact_lane`, `ar_twoshot_{3,4}rank_ti8_lane` | the same two-shots at `overlap` 1, beside compute: the wide rows' entry points, the same bits; at four ranks a narrow launch (4 blocks of 1024 threads), at three and eight the wide launch unless `R4D_AR_LANE_3_8=1` gives them the narrow one (unmeasured on such cards) |
 | `p2p_copy2d`, `p2p_copy2d_kernel`, `p2p_fence` | strided peer device-to-device copy, through the copy engines or a kernel |
 
 ## Constraints as data
