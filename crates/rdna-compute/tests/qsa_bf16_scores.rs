@@ -188,9 +188,14 @@ fn bf16_bits(x: f32) -> u16 {
     (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
-fn poisoned(gpu: &Gpu, len: usize) -> GpuTensor {
-    gpu.upload_raw(&vec![POISON; len], &[len])
-        .expect("poisoned upload")
+fn poisoned(gpu: &mut Gpu, len: usize) -> GpuTensor {
+    // Match free_tensor's pool ownership: upload_raw mallocs afresh and cannot
+    // reuse the guarded outputs returned by the preceding case.
+    let t = gpu
+        .alloc_tensor(&[len], DType::Raw)
+        .expect("alloc poisoned output");
+    poison(gpu, &t);
+    t
 }
 
 fn poison(gpu: &Gpu, t: &GpuTensor) {
@@ -467,7 +472,7 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
                         };
                         let stride = live + 7;
                         let bytes = rows * stride * 4 + CANARY;
-                        let scores = poisoned(&gpu, bytes);
+                        let scores = poisoned(&mut gpu, bytes);
                         let ints = [
                             rows as i32,
                             qstride as i32,
@@ -568,8 +573,8 @@ impl Fixture {
             query: gpu
                 .upload_f32(&query, &[query.len()])
                 .expect("query upload"),
-            selected: poisoned(gpu, max_rows * geo.capacity * 4 + CANARY),
-            mirror: poisoned(gpu, geo.capacity * 4 + CANARY),
+            selected: poisoned(&mut *gpu, max_rows * geo.capacity * 4 + CANARY),
+            mirror: poisoned(&mut *gpu, geo.capacity * 4 + CANARY),
             geo,
         }
     }
