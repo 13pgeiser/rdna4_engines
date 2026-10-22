@@ -2114,11 +2114,17 @@ fn rowtiles_single_every_width_1_to_64_equals_actual_object_and_pm_c1() {
         (6144, 3),
     ] {
         let case = strict_rowtile_case(0x7438 + k as u64, k, [m, 0, 0, 0], &singleton, None, &c1);
-        for rows in 1..=64 {
-            for poison in [false, true] {
-                run_rowtile_width(&emu, &case, rows, false, poison);
+        // Widths are independent: run them concurrently; any panic fails the scope.
+        std::thread::scope(|s| {
+            for rows in 1..=64 {
+                let (emu, case) = (&emu, &case);
+                s.spawn(move || {
+                    for poison in [false, true] {
+                        run_rowtile_width(emu, case, rows, false, poison);
+                    }
+                });
             }
-        }
+        });
     }
 }
 
@@ -2148,11 +2154,17 @@ fn rowtiles_x4_every_width_and_all_empty_live_masks_equal_actual_objects_and_pm_
             Some(&x4_singleton),
             &c1,
         );
-        for rows in 1..=64 {
-            for poison in [false, true] {
-                run_rowtile_width(&emu, &case, rows, true, poison);
+        // Widths are independent: run them concurrently; any panic fails the scope.
+        std::thread::scope(|s| {
+            for rows in 1..=64 {
+                let (emu, case) = (&emu, &case);
+                s.spawn(move || {
+                    for poison in [false, true] {
+                        run_rowtile_width(emu, case, rows, true, poison);
+                    }
+                });
             }
-        }
+        });
     }
 }
 

@@ -117,6 +117,64 @@ pub fn block_stepping(
     )
 }
 
+/// [`block`] for a sparse spec (`Mma::S24X64` / `Mma::S24X32`): the same
+/// arguments, ring transitions, publication, next-block fetches and fold, with
+/// SWMMAC in place of WMMA. The weights must be 2:4-packed
+/// (`sparse24::pack_block`). Refuses a dense spec.
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_block(
+    wg: &mut Wg,
+    g: &Gen,
+    tag: &str,
+    h: usize,
+    fetch_next: bool,
+    end_label: &str,
+    entry_label: bool,
+    lds: Lds,
+) -> Result<Lds, String> {
+    kloop::sparse_block_with(
+        wg,
+        g,
+        tag,
+        h,
+        fetch_next,
+        end_label,
+        entry_label,
+        |_| Ok(()),
+        lds,
+    )
+}
+
+/// [`sparse_block`] that also advances descriptor `step` after the block's
+/// slab-1 fetch, as [`block_stepping`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_block_stepping(
+    wg: &mut Wg,
+    g: &Gen,
+    tag: &str,
+    h: usize,
+    fetch_next: bool,
+    end_label: &str,
+    entry_label: bool,
+    step: usize,
+    lds: Lds,
+) -> Result<Lds, String> {
+    if step > 1 {
+        return Err(format!("block {tag}: descriptor {step} is not 0 or 1"));
+    }
+    kloop::sparse_block_with(
+        wg,
+        g,
+        tag,
+        h,
+        fetch_next,
+        end_label,
+        entry_label,
+        |b| kloop::step_descriptor(b, g, step),
+        lds,
+    )
+}
+
 /// `s_add_nc_u64` of the K-group stride onto activation descriptor `which`
 /// (`0` even block, `1` odd block).
 pub fn step_descriptor(b: &mut Builder, g: &Gen, which: usize) -> Result<(), String> {

@@ -14,13 +14,15 @@
 //
 // Variant grammar: the shipped variant name, `Spec::variant_name()`:
 //
-//     FOLD-TILE-CACC[-slab]-EPI
+//     FOLD-TILE-CACC[-slab]-EPI[-s24x64|-s24x32]
 //
 //     FOLD  k128 | k256s | k256p              (fold granularity; only k128 builds)
 //     TILE  128x128x8 | 256x128x16            (rows x tokens x waves)
 //     CACC  cacc1 | cacc2                     (int32 accumulator sets; only cacc1 builds)
 //     slab  optional: the slab activation layout (default: token layout)
 //     EPI   set | add | addsigmoid | silu | silu-bf16 | qkvzagdn
+//     MMA   optional: s24x64 | s24x32 = the 2:4-sparse SWMMAC K-loop (set/add on the
+//           128x128x8 token-layout tile only; default: the dense WMMA K-loop)
 //
 // e.g. `k128-128x128x8-cacc1-set`, `k128-128x128x8-cacc1-slab-silu-bf16`,
 // `k128-256x128x16-cacc1-add`. A combination without a generator is refused by
@@ -48,6 +50,10 @@ const VARIANTS: &[&str] = &[
     "k128-256x128x16-cacc1-set",
     "k128-256x128x16-cacc1-add",
     "k128-256x128x16-cacc1-silu",
+    "k128-128x128x8-cacc1-set-s24x64",
+    "k128-128x128x8-cacc1-set-s24x32",
+    "k128-128x128x8-cacc1-add-s24x64",
+    "k128-128x128x8-cacc1-add-s24x32",
 ];
 
 fn emit(spec: Spec) -> Result<Emitted, String> {
@@ -60,9 +66,19 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
 
 // The variant name as the `Iu4Spec` it names.
 fn iu4_spec(variant: &str, arch: Arch) -> Result<Iu4Spec, String> {
-    let parts: Vec<&str> = variant.split('-').collect();
+    let mut parts: Vec<&str> = variant.split('-').collect();
+    // An optional trailing `-s24x64` / `-s24x32`: the 2:4-sparse SWMMAC K-loop.
+    let mut mma = Mma::Dense;
+    let last = parts[parts.len() - 1];
+    if last == "s24x64" {
+        mma = Mma::S24X64;
+        parts.pop();
+    } else if last == "s24x32" {
+        mma = Mma::S24X32;
+        parts.pop();
+    }
     if parts.len() < 4 {
-        return Err(format!("variant `{variant}`: expected FOLD-TILE-CACC[-slab]-EPI"));
+        return Err(format!("variant `{variant}`: expected FOLD-TILE-CACC[-slab]-EPI[-s24x64|-s24x32]"));
     }
     let fold = match parts[0] {
         "k128" => Fold::K128,
@@ -96,7 +112,7 @@ fn iu4_spec(variant: &str, arch: Arch) -> Result<Iu4Spec, String> {
         "qkvzagdn" => Epi::QkvzaGdn,
         e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, addsigmoid, silu, silu-bf16, qkvzagdn)")),
     };
-    Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch })
+    Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch, mma: mma })
 }
 
 // The Workgroup scope lives here, not in emit(): emit() mentions `b` again at
@@ -130,11 +146,11 @@ fn kloop<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String>
     let no_trip = iu4::trips_cmp(wg, g, "s_cmp_eq_u32")?;
     let lds = wg.wg_skip_if(no_trip, iu4::tail_label(0), lds, |wg, lds| {
         let lds = wg.loop_carried(iu4::K_LOOP, lds, |wg, lds| {
-            let lds = iu4::block(wg, g, "m0", 0, true, iu4::label("m1"), true, lds)?;
+            let lds = mma_block(wg, g, "m0", 0, true, iu4::label("m1"), true, lds)?;
             // The even-block descriptor was last read by block 0's slab-1 fetch;
             // block 1 moves it to block 2g+2 before its own next-block fetch
             // reads it (a step inside the block, after its slab-1 fetch).
-            let lds = iu4::block_stepping(wg, g, "m1", 1, true, iu4::K_LOOP_END, true, 0, lds)?;
+            let lds = mma_block_stepping(wg, g, "m1", 1, true, iu4::K_LOOP_END, true, 0, lds)?;
             // Trip end: the odd-block descriptor and the group offset move on
             // after every read of them in this trip.
             iu4::trip_end(wg, g)?;
@@ -146,6 +162,27 @@ fn kloop<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String>
     })?;
     // The skip target is the peeled group's first block label, which this
     // block's `entry_label = false` leaves for the `wg_skip_if` above to place.
-    let lds = iu4::block(wg, g, "t0", 0, true, iu4::label("t1"), false, lds)?;
-    iu4::block(wg, g, "t1", 1, false, iu4::EPI, true, lds)
+    let lds = mma_block(wg, g, "t0", 0, true, iu4::label("t1"), false, lds)?;
+    mma_block(wg, g, "t1", 1, false, iu4::EPI, true, lds)
+}
+
+// The block of the spec's matrix instruction: the dense WMMA block, or the
+// 2:4-sparse SWMMAC block (the weights must be packed by
+// `iu4_gemm::sparse24::pack_block`; same arguments, same ring transitions).
+fn mma_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, lds: Lds) -> Result<Lds, String> {
+    if g.spec().mma == Mma::Dense {
+        iu4::block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)
+    } else {
+        iu4::sparse_block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)
+    }
+}
+
+fn mma_block_stepping<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, step: usize, lds: Lds) -> Result<Lds, String> {
+    if g.spec().mma == Mma::Dense {
+        iu4::block_stepping(wg, g, tag, h, fetch_next, end_label, entry_label, step, lds)
+    } else {
+        iu4::sparse_block_stepping(wg, g, tag, h, fetch_next, end_label, entry_label, step, lds)
+    }
 }

@@ -71,18 +71,9 @@ fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Res
     op(b, text, &[v(vdst)], &uses)
 }
 
-pub(crate) fn emit(
-    wg: &mut Wg,
-    g: &Gen,
-    end: &End,
-    (ra, rw, rd, rs): (
-        Ring<PayA, Free, Free>,
-        Ring<PayW, Free, Free>,
-        Ring<MetaD, Free, Free>,
-        Ring<MetaS, Free, Free>,
-    ),
-) -> Result<Lds, String> {
-    let b = wg.isa();
+/// Kernel arguments (`s_load_b256` x2) and the CTA raster: the tile origin `rs` (weight rows) and
+/// `bs` (tokens). Ends before the out-of-range exits ([`outside_insn`]).
+pub(crate) fn front(b: &mut Builder, g: &Gen) -> Result<(), String> {
     let a = g.args;
     let t: [u8; 8] = std::array::from_fn(|i| g.tmp + i as u8);
     mem(
@@ -182,21 +173,35 @@ pub(crate) fn emit(
             )?;
         }
     }
-    // Tiles past the problem exit (none for the host grid; kept for safety).
-    let outside = wg.scmp_wg_uniform(Instruction::new(
-        format!("s_cmp_ge_u32 s{}, s{}", g.rs, a.m),
-        vec![],
-        vec![s(g.rs), s(a.m)],
-    ))?;
-    wg.exit_if(outside, end)?;
-    let outside = wg.scmp_wg_uniform(Instruction::new(
-        format!("s_cmp_ge_u32 s{}, s{}", g.bs, a.n),
-        vec![],
-        vec![s(g.bs), s(a.n)],
-    ))?;
-    wg.exit_if(outside, end)?;
-    let b = wg.isa();
+    Ok(())
+}
 
+/// The scalar compare of the tile-outside exits: `0` tile rows start at/past `M`, `1` tile tokens
+/// start at/past `N` (none for the host grid; kept for safety).
+pub(crate) fn outside_insn(g: &Gen, which: usize) -> Result<Instruction, String> {
+    let a = g.args;
+    match which {
+        0 => Ok(Instruction::new(
+            format!("s_cmp_ge_u32 s{}, s{}", g.rs, a.m),
+            vec![],
+            vec![s(g.rs), s(a.m)],
+        )),
+        1 => Ok(Instruction::new(
+            format!("s_cmp_ge_u32 s{}, s{}", g.bs, a.n),
+            vec![],
+            vec![s(g.bs), s(a.n)],
+        )),
+        _ => Err(format!(
+            "outside_insn: {which} is not 0 (rows) or 1 (tokens)"
+        )),
+    }
+}
+
+/// Scalars (200 * K/256 row stride, loop trips, group offsets, wave index, odd-lane mask) and the
+/// buffer descriptors.
+pub(crate) fn scalars(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let a = g.args;
+    let t: [u8; 8] = std::array::from_fn(|i| g.tmp + i as u8);
     // Scalars: 200 * K/256 (row stride), loop trips, group offsets, wave index, odd-lane mask.
     sop(
         b,
@@ -320,7 +325,12 @@ pub(crate) fn emit(
         &[w + 3],
         &[],
     )?;
+    Ok(())
+}
 
+/// Hoisted lane offsets and fold addresses (`v0` = tid).
+pub(crate) fn lanes(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let t: [u8; 8] = std::array::from_fn(|i| g.tmp + i as u8);
     // Hoisted lane offsets (v0 = tid). Temporaries live in v1.. until K_BEGIN.
     let (ml, lane, x4, tt0, c, c0, c1, m, half, gp0) =
         (1u8, 2u8, 3u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8);
@@ -606,17 +616,23 @@ pub(crate) fn emit(
         &[q],
         &[x],
     )?;
+    Ok(())
+}
 
-    // Block 0: slab 0 (K32 half 0 now, half 1 after half 0 is published), token plane 0, row plane 0.
-    let (a0r, a1r) = (g.srd_a[0], g.srd_a[1]);
-    let _ = a1r;
+/// Block 0's raw fetches: slab 0 K32 half 0, the weight dwords, the token word and row header.
+pub(crate) fn fetch0(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let a0r = g.srd_a[0];
     publish::fetch_a(b, g, 0, 0, a0r)?;
     publish::fetch_w(b, g, 8)?;
     b.clause(|b| {
         publish::vload(b, g.ds_nx, 1, g.ds_voff, a0r, None, 0)?;
         publish::vload(b, g.sz_nx, 1, g.sz_voff, g.srd_w, Some(g.goff), 0)
     })
-    .map_err(|e| format!("prologue meta clause: {e}"))?;
+    .map_err(|e| format!("prologue meta clause: {e}"))
+}
+
+/// The float accumulators to zero (32 dual moves).
+pub(crate) fn zero_acc(b: &mut Builder, g: &Gen) -> Result<(), String> {
     for i in (0..64u8).step_by(2) {
         let r = g.acc + i;
         op(
@@ -626,6 +642,33 @@ pub(crate) fn emit(
             &[],
         )?;
     }
+    Ok(())
+}
+
+pub(crate) fn emit(
+    wg: &mut Wg,
+    g: &Gen,
+    end: &End,
+    (ra, rw, rd, rs): (
+        Ring<PayA, Free, Free>,
+        Ring<PayW, Free, Free>,
+        Ring<MetaD, Free, Free>,
+        Ring<MetaS, Free, Free>,
+    ),
+) -> Result<Lds, String> {
+    front(wg.isa(), g)?;
+    // Tiles past the problem exit (none for the host grid; kept for safety).
+    let outside = wg.scmp_wg_uniform(outside_insn(g, 0)?)?;
+    wg.exit_if(outside, end)?;
+    let outside = wg.scmp_wg_uniform(outside_insn(g, 1)?)?;
+    wg.exit_if(outside, end)?;
+    scalars(wg.isa(), g)?;
+    lanes(wg.isa(), g)?;
+
+    // Block 0: slab 0 (K32 half 0 now, half 1 after half 0 is published), token plane 0, row plane 0.
+    let a0r = g.srd_a[0];
+    fetch0(wg.isa(), g)?;
+    zero_acc(wg.isa(), g)?;
     let (mut sa, mut sw) = (wg.begin_write(ra), wg.begin_write(rw));
     for rnd in 0..2usize {
         publish::decode_round(wg.isa(), g, rnd)?;

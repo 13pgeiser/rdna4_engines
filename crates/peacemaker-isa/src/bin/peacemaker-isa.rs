@@ -110,7 +110,7 @@ const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx12
        peacemaker-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE
        peacemaker-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE
-       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] [--mma dense|s24x64|s24x32] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE
@@ -175,10 +175,15 @@ fn iu4_gemm(
     cacc: &str,
     epi: &str,
     act: &str,
+    mma: &str,
     arch: Arch,
 ) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::iu4_gemm::{self, Spec};
+    let mma: iu4_gemm::Mma = mma.parse()?;
     if epi == "all" {
+        if mma != iu4_gemm::Mma::Dense {
+            return Err("--epi all emits the dense module: --mma needs a single --epi".into());
+        }
         let (fold, tile, cacc, act) = (fold.parse()?, tile.parse()?, cacc.parse()?, act.parse()?);
         let (_, text, proof) = iu4_gemm::emit_module(fold, tile, cacc, act, arch)?;
         return Ok((
@@ -186,7 +191,9 @@ fn iu4_gemm(
             serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
         ));
     }
-    let emitted = iu4_gemm::emit(Spec::from_knobs(fold, tile, cacc, epi, act, arch)?)?;
+    let mut spec = Spec::from_knobs(fold, tile, cacc, epi, act, arch)?;
+    spec.mma = mma;
+    let emitted = iu4_gemm::emit(spec)?;
     Ok((
         emitted.s_text,
         serde_json::to_vec_pretty(&emitted.proof).map_err(|e| e.to_string())?,
@@ -1675,6 +1682,7 @@ fn run() -> Result<(), String> {
     let mut variant = None;
     let (mut fold, mut tile, mut cacc, mut epi, mut scale, mut alayout) =
         (None, None, None, None, None, None);
+    let mut mma = None::<String>;
     let (mut co, mut bundle, mut host) = (
         None,
         None,
@@ -1697,6 +1705,7 @@ fn run() -> Result<(), String> {
             "--epi" => epi = Some(value),
             "--scale" => scale = Some(value),
             "--alayout" => alayout = Some(value),
+            "--mma" => mma = Some(value),
             "--co" => co = Some(value),
             "--bundle" => bundle = Some(value),
             "--host-target" => host = value,
@@ -1735,6 +1744,7 @@ fn run() -> Result<(), String> {
                 cacc.as_deref().unwrap_or("1"),
                 epi.as_deref().ok_or("missing --epi")?,
                 alayout.as_deref().unwrap_or("token"),
+                mma.as_deref().unwrap_or("dense"),
                 arch,
             )?,
             "gdn_scan" => {

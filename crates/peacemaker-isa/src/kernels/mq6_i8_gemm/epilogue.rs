@@ -60,7 +60,12 @@ fn vop(
 
 pub(crate) fn emit(wg: &mut Wg, g: &Gen, _end: &End) -> Result<(), String> {
     wg.label(EPI)?;
-    let b = wg.isa();
+    body(wg.isa(), g)
+}
+
+/// Everything after the [`EPI`] label: the tile-relative output descriptor, the lane masks and the
+/// masked stores.
+pub(crate) fn body(b: &mut Builder, g: &Gen) -> Result<(), String> {
     // Below the K-loop's priority 1: co-resident K-loops issue first.
     if g.spec.raster == Raster::Banded {
         op(b, "s_setprio 0", &[], &[])?;

@@ -107,6 +107,7 @@ fn sigmoid_add_shares_the_add_hot_loop() {
             epi,
             act,
             arch: Arch::Gfx1201,
+            mma: iu4_gemm::Mma::Dense,
         })
     };
     let add = emit(Epi::Add, ALayout::Token).unwrap();
@@ -141,6 +142,7 @@ fn hot_loop_meets_shape_contract_for_every_product_symbol() {
                 epi,
                 act,
                 arch: Arch::Gfx1201,
+                mma: iu4_gemm::Mma::Dense,
             })
             .unwrap();
             let census = iu4_gemm::hot_loop_census(&e.s_text);
@@ -178,6 +180,7 @@ fn register_plans_keep_occupancy_ceiling() {
                 epi,
                 act,
                 arch: Arch::Gfx1201,
+                mma: iu4_gemm::Mma::Dense,
             })
             .unwrap();
             assert_eq!(e.shape.next_free_vgpr, vgprs, "{tile:?} {act:?} {epi:?}");

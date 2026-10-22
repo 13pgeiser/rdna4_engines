@@ -2523,22 +2523,29 @@ mod rowtiles {
                 let program = lift(&peacemaker_isa::native::assemble(&e.s_text, arch).unwrap());
                 let candidate = Emulator::new(&program, &format!("{}_t8", spec.symbol())).unwrap();
                 let singleton = Emulator::new(&incumbent, &spec.symbol()).unwrap();
-                for c in 1usize..=64 {
-                    let m = if gate(spec) {
-                        [2, 6, 14, 16, 18][c % 5]
-                    } else {
-                        [1, 3, 7, 8, 9][c % 5]
-                    };
-                    let groups = if gate(spec) {
-                        [2, 4, 6, 8, 10][c % 5]
-                    } else {
-                        [1, 2, 3, 4, 5, 7, 8, 9][c % 8]
-                    };
-                    let f = Fixture::new(spec, c, m, 128 * groups, c);
-                    let got = f.run(&candidate, f.xsrc);
-                    let want = f.singleton(&singleton, f.xsrc);
-                    f.compare(&got, &want, f.xsrc);
-                }
+                // Widths are independent: sweep them concurrently (a panic in any
+                // width fails the scope, so coverage and failure reporting are unchanged).
+                std::thread::scope(|s| {
+                    for c in 1usize..=64 {
+                        let (candidate, singleton) = (&candidate, &singleton);
+                        s.spawn(move || {
+                            let m = if gate(spec) {
+                                [2, 6, 14, 16, 18][c % 5]
+                            } else {
+                                [1, 3, 7, 8, 9][c % 5]
+                            };
+                            let groups = if gate(spec) {
+                                [2, 4, 6, 8, 10][c % 5]
+                            } else {
+                                [1, 2, 3, 4, 5, 7, 8, 9][c % 8]
+                            };
+                            let f = Fixture::new(spec, c, m, 128 * groups, c);
+                            let got = f.run(candidate, f.xsrc);
+                            let want = f.singleton(singleton, f.xsrc);
+                            f.compare(&got, &want, f.xsrc);
+                        });
+                    }
+                });
                 // Buffer-descriptor OOB rows must read zero, not poisoned stride padding.
                 let f = Fixture::new(spec, 9, if gate(spec) { 18 } else { 9 }, 256, 0);
                 let xsrc = if gate(spec) { 4 } else { 40 };

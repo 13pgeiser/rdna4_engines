@@ -47,6 +47,8 @@ mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
+#[cfg(test)]
+mod gpu_test;
 pub mod graph;
 pub mod grouped_ops;
 pub mod hc_row_fold;

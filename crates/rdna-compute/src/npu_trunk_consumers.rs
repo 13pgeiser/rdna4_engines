@@ -1416,7 +1416,7 @@ mod tests {
     /// unscaled and under YaRN (factor 4 over 262,144) past the native window.
     #[test]
     fn qsa_norm_rope_arena_matches_incumbent_with_and_without_yarn() {
-        let Ok(mut gpu) = Gpu::init() else {
+        let Ok(mut gpu) = crate::gpu_test::init() else {
             eprintln!("skip: no GPU");
             return;
         };

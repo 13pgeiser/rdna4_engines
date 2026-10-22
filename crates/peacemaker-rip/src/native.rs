@@ -24,6 +24,8 @@ use std::rc::Rc;
 /// The production generators (`iu4_gemm`, `qwen4_moe_sym`) as natives.
 #[path = "native_gen.rs"]
 mod native_gen;
+#[path = "native_mq6.rs"]
+mod native_mq6;
 
 #[derive(Clone)]
 pub struct Chain {
@@ -70,6 +72,8 @@ pub enum Nat {
     /// An `iu4_gemm` generator (`Iu4Gen::new(spec)`): register assignment and
     /// geometry of one valid spec, read by the `iu4::*` blocks.
     Iu4Gen(Rc<peacemaker_isa::kernels::iu4_gemm::Gen>),
+    /// An `mq6_i8_gemm` generator (`Mq6Gen::new(spec)`): register assignment and geometry.
+    Mq6Gen(Rc<peacemaker_isa::kernels::mq6_i8_gemm::Gen>),
 }
 
 impl Nat {
@@ -102,6 +106,7 @@ impl Nat {
             Nat::Phase(_) => "Phase",
             Nat::Swmmac(_) => "Swmmac",
             Nat::Iu4Gen(_) => "Iu4Gen",
+            Nat::Mq6Gen(_) => "Mq6Gen",
         }
     }
     pub fn equals(&self, o: &Nat) -> bool {
@@ -234,7 +239,11 @@ pub(crate) const WORKGROUP_METHODS: &[&str] = &[
 ];
 
 pub fn is_fn(name: &str) -> bool {
-    if COMMON_FNS.contains(&name) || ASSOC_FNS.contains(&name) || native_gen::is_fn(name) {
+    if COMMON_FNS.contains(&name)
+        || ASSOC_FNS.contains(&name)
+        || native_gen::is_fn(name)
+        || native_mq6::is_fn(name)
+    {
         return true;
     }
     matches!(name.split_once("::"), Some((t, "from" | "try_from" | "max" | "min")) if IntTy::parse(t).is_some())
@@ -270,10 +279,14 @@ pub fn is_type(n: &str) -> bool {
             | "str"
     ) || IntTy::parse(n).is_some()
         || native_gen::is_type(n)
+        || native_mq6::is_type(n)
 }
 
 pub fn is_struct(n: &str) -> bool {
-    matches!(n, "KernelSpec" | "GatherTemps" | "VopdOp" | "SwmmacMods") || native_gen::is_struct(n)
+    matches!(n, "KernelSpec" | "GatherTemps" | "VopdOp" | "SwmmacMods")
+        || native_gen::is_struct(n)
+        || native_mq6::is_struct(n)
+        || native_mq6::is_struct(n)
 }
 
 pub fn global_const<'a>(n: &str) -> Option<Value<'a>> {
@@ -287,6 +300,9 @@ pub fn global_const<'a>(n: &str) -> Option<Value<'a>> {
 
 pub fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
     if let Some(v) = native_gen::assoc_const(ty, item) {
+        return Some(v);
+    }
+    if let Some(v) = native_mq6::assoc_const(ty, item) {
         return Some(v);
     }
     let nat = |n: Nat| Some(Value::Nat(n));
@@ -1114,6 +1130,9 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             if let Some(r) = native_gen::call_fn(it, n, a, cx) {
                 return r;
             }
+            if let Some(r) = native_mq6::call_fn(it, n, a, cx) {
+                return r;
+            }
             if let Some((t, f)) = n.split_once("::") {
                 if let Some(ty) = IntTy::parse(t) {
                     need(1)?;
@@ -1228,6 +1247,7 @@ pub fn method<'a>(
     let need = |k: usize| check_args(name, a, k);
     Ok(match n {
         Nat::Iu4Gen(g) => native_gen::method(it, g, name, a)?,
+        Nat::Mq6Gen(g) => native_mq6::method(it, g, name, a)?,
         Nat::Arch(arch) => match name {
             "gfx12" => Some(Value::Bool(arch.gfx12())),
             "name" => Some(Value::str(arch.name())),

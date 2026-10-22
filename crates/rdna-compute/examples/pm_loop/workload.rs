@@ -105,6 +105,10 @@ pub trait Workload {
     fn shape_json(&self) -> Value;
     /// Candidate knobs as JSON (the resolved Spec axes).
     fn candidate_knobs(&self) -> Value;
+    /// Extra top-level record fields (e.g. `sparse`), merged by the driver.
+    fn record_extra(&self) -> Vec<(String, Value)> {
+        Vec::new()
+    }
 
     /// Emit + link the candidate with the native writer (the path of
     /// `peacemaker-isa emit --co`). Errors (e.g. a closed fold axis) are
@@ -129,6 +133,12 @@ pub trait Workload {
     /// bytes in the kernel's output dtype); `inf` if any element differs in
     /// NaN-ness. 0.0 iff element-wise equal.
     fn max_abs_diff(&self, a: &[u8], b: &[u8]) -> Result<f64>;
+
+    /// `true` when correctness requires the candidate's output to be bitwise
+    /// equal to the shipped baseline in addition to passing the CPU reference.
+    fn requires_baseline_identity(&self) -> bool {
+        false
+    }
 
     /// `--emu`: run the candidate on the peacemaker emulator at a small
     /// shape if every instruction is qualified; otherwise

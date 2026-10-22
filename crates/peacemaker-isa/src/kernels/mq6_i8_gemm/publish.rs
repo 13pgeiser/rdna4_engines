@@ -245,19 +245,17 @@ pub(crate) fn decode_round<S: Sink>(b: &mut S, g: &Gen, r: usize) -> Result<(), 
     Ok(())
 }
 
-/// The two decoded operands of round `r` to LDS slot `slot`: `e0` (data in `o`) at `+0`, `e1`
-/// (data in `p`) at `+512`.
-pub(crate) fn store_w_round<C: State>(
-    w: &mut Wv,
-    g: &Gen,
-    sw: Staged<PayW, C>,
-    slot: usize,
-    r: usize,
-) -> Result<Staged<PayW, C>, String> {
+/// The two LDS stores of the decoded operands of weight round `r` into slot `slot`: `e0` (data
+/// in `o`) at `+0`, `e1` (data in `p`) at `+512`.
+pub(crate) fn store_w_insns(g: &Gen, slot: usize, r: usize) -> Result<[Instruction; 2], String> {
+    if slot > 1 || r > 1 {
+        return Err(format!(
+            "store_w: slot {slot} / round {r} out of range (0..2)"
+        ));
+    }
     let base = spec::LAYOUT.w[slot] + 4096 * r as u32;
     let (o, p) = (g.scratch + 4, g.scratch + 2);
-    let sw = w.ds_store(
-        sw,
+    Ok([
         ds_store(
             format!(
                 "ds_store_b64 v{}, v[{}:{}]{}",
@@ -268,9 +266,6 @@ pub(crate) fn store_w_round<C: State>(
             ),
             vec![v(g.st_wlds), vr(o, 2)],
         ),
-    )?;
-    w.ds_store(
-        sw,
         ds_store(
             format!(
                 "ds_store_b64 v{}, v[{}:{}]{}",
@@ -281,7 +276,43 @@ pub(crate) fn store_w_round<C: State>(
             ),
             vec![v(g.st_wlds), vr(p, 2)],
         ),
-    )
+    ])
+}
+
+/// The two decoded operands of round `r` to LDS slot `slot`.
+pub(crate) fn store_w_round<C: State>(
+    w: &mut Wv,
+    g: &Gen,
+    sw: Staged<PayW, C>,
+    slot: usize,
+    r: usize,
+) -> Result<Staged<PayW, C>, String> {
+    let [e0, e1] = store_w_insns(g, slot, r)?;
+    let sw = w.ds_store(sw, e0)?;
+    w.ds_store(sw, e1)
+}
+
+/// The two LDS stores of the raw activation chunks of K32 half `sb` into slot `slot`.
+pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<[Instruction; 2], String> {
+    if slot > 1 || sb > 1 {
+        return Err(format!(
+            "store_a: slot {slot} / half {sb} out of range (0..2)"
+        ));
+    }
+    let one = |r: u32| {
+        let ar = g.a_pf[r as usize];
+        ds_store(
+            format!(
+                "ds_store_b64 v{}, v[{}:{}]{}",
+                g.st_alds,
+                ar,
+                ar + 1,
+                ds_offset(spec::LAYOUT.a[slot] + 4096 * r + 1024 * sb)
+            ),
+            vec![v(g.st_alds), vr(ar, 2)],
+        )
+    };
+    Ok([one(0), one(1)])
 }
 
 /// The raw activation chunks of K32 half `sb` to LDS slot `slot`.
@@ -292,21 +323,8 @@ pub(crate) fn store_a_half<C: State>(
     slot: usize,
     sb: u32,
 ) -> Result<Staged<PayA, C>, String> {
-    for r in 0..2u32 {
-        let ar = g.a_pf[r as usize];
-        sa = w.ds_store(
-            sa,
-            ds_store(
-                format!(
-                    "ds_store_b64 v{}, v[{}:{}]{}",
-                    g.st_alds,
-                    ar,
-                    ar + 1,
-                    ds_offset(spec::LAYOUT.a[slot] + 4096 * r + 1024 * sb)
-                ),
-                vec![v(g.st_alds), vr(ar, 2)],
-            ),
-        )?;
+    for insn in store_a_insns(g, slot, sb)? {
+        sa = w.ds_store(sa, insn)?;
     }
     Ok(sa)
 }
@@ -357,6 +375,34 @@ pub(crate) fn meta_insns<S: Sink>(b: &mut S, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
+/// The two LDS stores of [`meta_insns`]' words into plane `plane`: the token word (`x`) into the
+/// `DS` plane, the row word (`wr`) into the `SZ` plane.
+pub(crate) fn meta_store_insns(g: &Gen, plane: usize) -> Result<[Instruction; 2], String> {
+    if plane > 1 {
+        return Err(format!("meta plane {plane} out of range (0..2)"));
+    }
+    let l = spec::LAYOUT;
+    let (x, wr) = (g.scratch + 6, g.scratch + 7);
+    Ok([
+        ds_store(
+            format!(
+                "ds_store_b32 v{}, v{x}{}",
+                g.meta_lds,
+                ds_offset(l.ds[plane])
+            ),
+            vec![v(g.meta_lds), v(x)],
+        ),
+        ds_store(
+            format!(
+                "ds_store_b32 v{}, v{wr}{}",
+                g.meta_lds,
+                ds_offset(l.sz[plane])
+            ),
+            vec![v(g.meta_lds), v(wr)],
+        ),
+    ])
+}
+
 /// Publish the next block's `d` / `float(s)` token plane and the `sc` / `z' =
 /// z + 32 s` row planes (planar: `sc` / `d` at `+0`, `z'` / `float(s)` at `+512`; lane `tid`
 /// writes slot `tid >> 1` of plane `tid & 1`). Rows past `M` and tokens past `N` read 0 through
@@ -368,31 +414,10 @@ pub(crate) fn publish_meta<C: State>(
     rs: peacemaker_author::Ring<MetaS, C, peacemaker_author::Free>,
 ) -> Result<(Staged<MetaD, C>, Staged<MetaS, C>), String> {
     let plane = rd.next_index();
-    let l = spec::LAYOUT;
-    let (x, wr) = (g.scratch + 6, g.scratch + 7);
     meta_insns(w.isa(), g)?;
+    let [td, tz] = meta_store_insns(g, plane)?;
     let (sd, sz) = (w.begin_write(rd), w.begin_write(rs));
-    let sd = w.ds_store(
-        sd,
-        ds_store(
-            format!(
-                "ds_store_b32 v{}, v{x}{}",
-                g.meta_lds,
-                ds_offset(l.ds[plane])
-            ),
-            vec![v(g.meta_lds), v(x)],
-        ),
-    )?;
-    let sz = w.ds_store(
-        sz,
-        ds_store(
-            format!(
-                "ds_store_b32 v{}, v{wr}{}",
-                g.meta_lds,
-                ds_offset(l.sz[plane])
-            ),
-            vec![v(g.meta_lds), v(wr)],
-        ),
-    )?;
+    let sd = w.ds_store(sd, td)?;
+    let sz = w.ds_store(sz, tz)?;
     Ok((sd, sz))
 }

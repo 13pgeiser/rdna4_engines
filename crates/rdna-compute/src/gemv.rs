@@ -25170,7 +25170,7 @@ mod mq4v2_multirow_r2_x3_tests {
     fn x3_is_bit_identical_to_three_r2_launches() {
         const K: usize = 2560;
         const MS: [usize; 3] = [48, 48, 6144];
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(e) => {
                 eprintln!("skip: no usable GPU ({e:?})");

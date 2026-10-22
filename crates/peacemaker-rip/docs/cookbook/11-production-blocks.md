@@ -43,7 +43,7 @@ A kernel that only ever runs `K == 256` has no full trip. Drop the trip compare,
 fn emit(spec: Spec) -> Result<Emitted, String> {
     let g = Iu4Gen::new(Iu4Spec {
         fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
-        epi: Epi::Set, act: ALayout::Token, arch: spec.arch,
+        epi: Epi::Set, act: ALayout::Token, arch: spec.arch, mma: Mma::Dense,
     })?;
     let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     let mut wg = Workgroup::new(&mut b, spec.arch)?;
@@ -80,6 +80,10 @@ Results are unchanged; only scheduling moves.
 ## Variation 3: a hand-written epilogue
 
 `iu4::epilogue(wg, g, end)` places `iu4::EPI` and writes the store path of the spec's epilogue family. A script may place `iu4::EPI` itself and write its own stores with the generic helpers (`mem`, `bstore_b128`, `gather_offset`, ...) and the registers the generator assigned (`g.reg("acc")` is the base of the 64 accumulator VGPRs, `g.reg("arg_y")` the output pointer's SGPR pair). A hand-written epilogue is raw instructions on the builder (`wg.isa()`), so it gets the builder's ledger and the instruction validator, and the final object is certified like any `.rip`; it does not get a typed ring check, because it touches no LDS ring.
+
+## Variation 4: the 2:4-sparse K-loop
+
+The twin's variants carry an optional `-s24x64` / `-s24x32` suffix: `k128-128x128x8-cacc1-set-s24x64` is the same composition with `iu4::sparse_block` / `iu4::sparse_block_stepping` in place of the dense blocks (`mma_block` in the twin picks by `g.spec().mma`). The weights must be packed with `iu4_gemm::sparse24::pack_block`; the staging, trips, descriptor steps and epilogue are the dense script's. To try a different block order for the sparse kernel, edit `kloop` in the copy of the twin exactly as above; a sparse block refuses a dense generator and a dense block refuses a sparse one, so a mixed-up composition fails at build, not on the GPU.
 
 ## Timing a variation
 

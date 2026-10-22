@@ -1164,8 +1164,8 @@ pub fn grouped_ple_fused_bf16s(gpu: &mut Gpu, p: &GroupedPleFused<'_>) -> HipRes
 mod tests {
     use super::*;
 
-    fn try_gpu() -> Option<Gpu> {
-        Gpu::init().ok()
+    fn try_gpu() -> Option<crate::gpu_test::TestGpu> {
+        crate::gpu_test::init().ok()
     }
 
     fn null_tensor(shape: &[usize], dtype: DType) -> GpuTensor {

@@ -52243,7 +52243,7 @@ mod tests {
     #[ignore = "requires GPU, HIPFIRE_QWEN4_SHARED_DOWN_EPI=1 and the F16 WMMA route"]
     fn qwen4_shared_down_epi_matches_separate_bf16_add() {
         use crate::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
-        let mut gpu = Gpu::init().expect("GPU");
+        let mut gpu = crate::gpu_test::init().expect("GPU");
         let (m, k) = (2560, 640);
         let wb: Vec<u8> = (0..m * k)
             .flat_map(|i| {
@@ -52331,7 +52331,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and working HIP toolchain"]
     fn qwen4_bf16_f16_wmma_route_matches_multirow() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(error) => {
                 eprintln!("skip: no GPU ({error:?})");
@@ -52403,7 +52403,7 @@ mod tests {
         const M: usize = 17;
         const K: usize = 512;
         const BATCH: usize = 3;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(error) => {
                 eprintln!("skip: no GPU ({error:?})");
@@ -52504,7 +52504,7 @@ mod tests {
         const K: usize = 1792;
         // More than one four-row x-batch chunk.
         const BATCH: usize = 6;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(error) => {
                 eprintln!("skip: no GPU ({error:?})");
@@ -52598,7 +52598,7 @@ mod tests {
         const K: usize = 768;
         // More than one four-row x-batch chunk; K=768 exercises the tail groups.
         const BATCH: usize = 6;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(error) => {
                 eprintln!("skip: no GPU ({error:?})");
@@ -52737,7 +52737,7 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx11/gfx12 GPU and working HIP toolchain"]
     fn bf16_multirow_routes_are_bit_identical_to_gemv() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_gfx11_plus_simt() => gpu,
             _ => {
                 eprintln!("skip: needs a gfx11/gfx12 GPU");
@@ -52813,7 +52813,7 @@ mod tests {
         const K: usize = 2560;
         const GROUPED: usize = 330;
         const TOKENS: usize = 40;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_gfx11_plus_simt() => gpu,
             _ => {
                 eprintln!("skip: needs a gfx11/gfx12 GPU");
@@ -52912,7 +52912,7 @@ mod tests {
     fn rotate_128_f16_matches_rotate_then_convert() {
         const K: usize = 640;
         const ROWS: usize = 11310;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_wmma_w32() => gpu,
             _ => {
                 eprintln!("skip: needs gfx11 WMMA");
@@ -52953,7 +52953,7 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx11/gfx1201 WMMA GPU and working HIP toolchain"]
     fn mq6_xf16_matches_f32_rotation_path() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() => gpu,
             _ => {
                 eprintln!("skip: needs gfx11/gfx1201 WMMA");
@@ -53048,7 +53048,7 @@ mod tests {
         const M: usize = 200;
         const K: usize = 512;
         const N: usize = 131;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_wmma_w32() => gpu,
             _ => {
                 eprintln!("skip: needs gfx11 WMMA");
@@ -53107,7 +53107,7 @@ mod tests {
     fn mq6_gfx12_residual_tiles_match_base_kernel() {
         const M: usize = 200;
         const K: usize = 512;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_wmma_w32_gfx12() => gpu,
             _ => {
                 eprintln!("skip: needs gfx12 WMMA");
@@ -53174,7 +53174,7 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
     fn mq6_x4_pm_matches_hipcc_bytes() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
             _ => {
                 eprintln!("skip: needs exact gfx1201");
@@ -53341,7 +53341,7 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
     fn mq6_x4_pm_gfx1151_matches_hipcc_bytes() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch.as_str() == "gfx1151" => gpu,
             _ => {
                 eprintln!("skip: needs exact gfx1151");
@@ -53486,7 +53486,7 @@ mod tests {
     #[test]
     #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
     fn hc_down_tile_gfx1201_matches_p_s4_bytes() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
             _ => {
                 eprintln!("skip: needs exact gfx1201");
