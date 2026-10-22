@@ -2619,15 +2619,100 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 /// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
 /// unchanged.
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
-    let tiled = gpu.flags.qwen4_hc_up_tile_enabled();
-    hyper_read_up_wmma_tiled(gpu, p, tiled)
+    let select = HcUpSelect::Auto {
+        tiled: gpu.flags.qwen4_hc_up_tile_enabled(),
+        v2: gpu.flags.qwen4_hc_up_v2_enabled(),
+    };
+    hyper_read_up_wmma_launch(gpu, p, select)
+}
+
+/// Which launch of the gfx1201 HC read tail ([`hyper_read_up_wmma_route`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HcUpRoute {
+    /// `hyper_read_up_wmma_bf16_gfx1201`: 512 rows per block, dynamic LDS.
+    Baseline,
+    /// `hyper_read_up_wmma_bf16_gfx1201_t128`: retiled, 128 rows per block
+    /// (`low_rank % 64 == 0`).
+    T128,
+    /// `hyper_read_up_wmma_bf16_gfx1201_v2`: persistent W-stationary
+    /// (`low_rank == 320`), bytewise `T128`'s output.
+    V2,
+}
+
+/// Smallest row count the persistent `_v2` HC up+mix entry takes in
+/// [`hyper_read_up_wmma`]; below it the retiled `_t128` entry runs.
+pub const HC_UP_V2_MIN_ROWS: usize = 128;
+
+/// Row groups (grid y) of one `_v2` launch: one per 8192 rows, 1 to 4.
+pub fn hc_up_v2_groups(rows: usize) -> usize {
+    rows.div_ceil(8192).clamp(1, 4)
+}
+
+/// Dynamic LDS of the `_v2` entry: the 64 x (320 + 8) BF16 weight tile and the
+/// 2 x 2048-entry gate table.
+const HC_UP_V2_LDS_BYTES: u32 = 64 * (320 + 8) * 2 + 16384;
+
+/// Whether [`hyper_read_up_wmma`] takes the persistent `_v2` entry: exact
+/// gfx1201 with the retiled `_t128` path admitted (`tile_1201`),
+/// `HIPFIRE_QWEN4_HC_UP_V2` on, `low_rank == 320`, `hidden % 16 == 0`, at least
+/// [`HC_UP_V2_MIN_ROWS`] rows, not recording and not capturing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hc_up_v2_selected(
+    arch: &str,
+    enabled: bool,
+    tile_1201: bool,
+    low_rank: usize,
+    hidden: usize,
+    rows: usize,
+    recording: bool,
+    capturing: bool,
+) -> bool {
+    enabled
+        && arch == "gfx1201"
+        && tile_1201
+        && low_rank == 320
+        && hidden != 0
+        && hidden % 16 == 0
+        && rows >= HC_UP_V2_MIN_ROWS
+        && !recording
+        && !capturing
+}
+
+/// [`hyper_read_up_wmma`] forced onto one gfx1201 launch. Never falls back:
+/// an error when the arch is not gfx1201 on its F16 WMMA arm or the route's
+/// shape does not hold (`T128`: `low_rank % 64 == 0`; `V2`: `low_rank == 320`).
+/// `V2` skips the flag, minimum-rows, recording and capture gates of the
+/// normal route, so any `rows >= 1` runs.
+pub fn hyper_read_up_wmma_route(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    route: HcUpRoute,
+) -> HipResult<()> {
+    hyper_read_up_wmma_launch(gpu, p, HcUpSelect::Forced(route))
 }
 
 /// [`hyper_read_up_wmma`] on its baseline entries (`tiled == false`) or the
-/// retiled operand-swapped ones (`tiled == true`, bytewise the baseline's).
+/// retiled operand-swapped ones (`tiled == true`, bytewise the baseline's);
+/// never the `_v2` entry.
+#[cfg(test)]
 fn hyper_read_up_wmma_tiled(gpu: &mut Gpu, p: &HyperReadUpFused<'_>, tiled: bool) -> HipResult<()> {
+    hyper_read_up_wmma_launch(gpu, p, HcUpSelect::Auto { tiled, v2: false })
+}
+
+#[derive(Clone, Copy)]
+enum HcUpSelect {
+    Auto { tiled: bool, v2: bool },
+    Forced(HcUpRoute),
+}
+
+fn hyper_read_up_wmma_launch(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    select: HcUpSelect,
+) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
+    let wrong_shape = || HipError::new(0, &ComputeError::WrongShape.to_string());
     let (module, source, entry) = if gpu.arch_caps.has_wmma_w32() {
         (
             "hyper_read_up_wmma",
@@ -2641,8 +2726,12 @@ fn hyper_read_up_wmma_tiled(gpu: &mut Gpu, p: &HyperReadUpFused<'_>, tiled: bool
             "hyper_read_up_wmma_bf16_gfx1201",
         )
     } else {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        return Err(wrong_shape());
     };
+    let is_1201 = entry == "hyper_read_up_wmma_bf16_gfx1201";
+    if matches!(select, HcUpSelect::Forced(_)) && !is_1201 {
+        return Err(wrong_shape());
+    }
     if p.low.dtype != DType::BF16
         || p.normalized.dtype != DType::F16
         || p.up_weight.dtype != DType::BF16
@@ -2655,7 +2744,7 @@ fn hyper_read_up_wmma_tiled(gpu: &mut Gpu, p: &HyperReadUpFused<'_>, tiled: bool
         || p.normalized.numel() < p.rows * wide
         || p.mixed.numel() < p.rows * p.hidden
     {
-        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        return Err(wrong_shape());
     }
     let hidden = checked_i32(p.hidden, "HC read hidden width")?;
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
@@ -2664,22 +2753,48 @@ fn hyper_read_up_wmma_tiled(gpu: &mut Gpu, p: &HyperReadUpFused<'_>, tiled: bool
     // H3 (`HIPFIRE_QWEN4_HC_UP_TILE`, exact gfx1151 / gfx1201): the retiled
     // operand-swapped entries.  gfx1151 keeps the baseline launch geometry;
     // gfx1201's takes 128 rows per block, static LDS only, `low_rank % 64 == 0`.
-    let tile_1201 = tiled && entry == "hyper_read_up_wmma_bf16_gfx1201" && p.low_rank % 64 == 0;
+    let tiled = match select {
+        HcUpSelect::Auto { tiled, .. } => tiled,
+        HcUpSelect::Forced(route) => route == HcUpRoute::T128,
+    };
+    let tile_1201 = tiled && is_1201 && p.low_rank % 64 == 0;
+    // `_v2` (`HIPFIRE_QWEN4_HC_UP_V2`): persistent W-stationary entry, bytewise `_t128`'s.
+    let v2 = match select {
+        HcUpSelect::Auto { v2, .. } => hc_up_v2_selected(
+            gpu.arch.as_str(),
+            v2,
+            tile_1201,
+            p.low_rank,
+            p.hidden,
+            p.rows,
+            gpu.replay.is_recording(),
+            gpu.graphs.capture_mode,
+        ),
+        HcUpSelect::Forced(route) => route == HcUpRoute::V2,
+    };
+    match select {
+        HcUpSelect::Forced(HcUpRoute::T128) if !tile_1201 => return Err(wrong_shape()),
+        HcUpSelect::Forced(HcUpRoute::V2) if p.low_rank != 320 => return Err(wrong_shape()),
+        _ => {}
+    }
     let entry = match (tiled, entry) {
+        _ if v2 => "hyper_read_up_wmma_bf16_gfx1201_v2",
         (true, "hyper_read_up_wmma_bf16") => "hyper_read_up_wmma_bf16_swap",
         (true, "hyper_read_up_wmma_bf16_gfx1201") if tile_1201 => {
             "hyper_read_up_wmma_bf16_gfx1201_t128"
         }
         (_, entry) => entry,
     };
-    let row_grid = checked_u32(
-        p.rows.div_ceil(if tile_1201 { 128 } else { 512 }),
-        "HC read row grid",
-    )?;
-    let lds_bytes = if tile_1201 {
-        0
+    let (grid, block, lds_bytes) = if v2 {
+        let groups = checked_u32(hc_up_v2_groups(p.rows), "HC read row groups")?;
+        ([column_grid, groups, 1], [512, 1, 1], HC_UP_V2_LDS_BYTES)
+    } else if tile_1201 {
+        let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
+        ([column_grid, row_grid, 1], [256, 1, 1], 0)
     } else {
-        checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?
+        let row_grid = checked_u32(p.rows.div_ceil(512), "HC read row grid")?;
+        let lds = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
+        ([column_grid, row_grid, 1], [256, 1, 1], lds)
     };
     gpu.ensure_kernel_public(module, source, entry)?;
     let mut args = KernargBlob::new();
@@ -2693,8 +2808,8 @@ fn hyper_read_up_wmma_tiled(gpu: &mut Gpu, p: &HyperReadUpFused<'_>, tiled: bool
     args.pad_to(16);
     gpu.launch_blob_recorded(
         entry,
-        [column_grid, row_grid, 1],
-        [256, 1, 1],
+        grid,
+        block,
         lds_bytes,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -12531,6 +12646,141 @@ mod tests {
             norm_weight,
         ] {
             gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    #[test]
+    fn hc_up_v2_predicate_covers_arch_shape_flags_and_boundaries() {
+        let ok = |arch, en, tile, k, hidden, rows, rec, cap| {
+            hc_up_v2_selected(arch, en, tile, k, hidden, rows, rec, cap)
+        };
+        let min = HC_UP_V2_MIN_ROWS;
+        assert!(ok("gfx1201", true, true, 320, 2560, min, false, false));
+        assert!(ok("gfx1201", true, true, 320, 2560, 16384, false, false));
+        assert!(!ok("gfx1201", true, true, 320, 2560, min - 1, false, false));
+        assert!(!ok("gfx1201", true, true, 320, 2560, 0, false, false));
+        assert!(!ok("gfx1201", false, true, 320, 2560, 4096, false, false));
+        assert!(!ok("gfx1201", true, false, 320, 2560, 4096, false, false));
+        assert!(!ok("gfx1201", true, true, 320, 2560, 4096, true, false));
+        assert!(!ok("gfx1201", true, true, 320, 2560, 4096, false, true));
+        assert!(!ok("gfx1201", true, true, 256, 2560, 4096, false, false));
+        assert!(!ok("gfx1201", true, true, 384, 2560, 4096, false, false));
+        assert!(!ok("gfx1201", true, true, 320, 2568, 4096, false, false));
+        assert!(!ok("gfx1201", true, true, 320, 0, 4096, false, false));
+        for arch in ["gfx1151", "gfx1200", "gfx1100", "gfx1030", "gfx1201x", ""] {
+            assert!(
+                !ok(arch, true, true, 320, 2560, 4096, false, false),
+                "{arch}"
+            );
+        }
+        assert_eq!(hc_up_v2_groups(0), 1);
+        assert_eq!(hc_up_v2_groups(1), 1);
+        assert_eq!(hc_up_v2_groups(8192), 1);
+        assert_eq!(hc_up_v2_groups(8193), 2);
+        assert_eq!(hc_up_v2_groups(16384), 2);
+        assert_eq!(hc_up_v2_groups(32768), 4);
+        assert_eq!(hc_up_v2_groups(1 << 20), 4);
+    }
+
+    /// The persistent `_v2` HC read tail is bytewise the retiled `_t128` entry's,
+    /// on random and on special (NaN, inf, zero, subnormal) operand bits.
+    #[test]
+    fn hyper_read_up_v2_is_bytewise_t128() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !(gpu.arch == "gfx1201" && gpu.qwen4_f16_wmma_gfx1201()) {
+            eprintln!("skip: needs gfx1201 on the F16 WMMA route");
+            return;
+        }
+        let (hidden, low_rank) = (2560usize, 320usize);
+        let wide = 4 * hidden;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const BF16_SPECIAL: [u16; 8] = [
+            0x7fc0, 0xff80, 0x7f80, 0x0000, 0x8000, 0x0001, 0x807f, 0x7f7f,
+        ];
+        const F16_SPECIAL: [u16; 8] = [
+            0x7e00, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x03ff, 0xfbff,
+        ];
+        let bf16 = |next: &mut dyn FnMut() -> u64, special: bool| -> u16 {
+            let r = next();
+            if special && r % 97 == 0 {
+                return BF16_SPECIAL[(r >> 20) as usize % BF16_SPECIAL.len()];
+            }
+            let sign = ((r >> 8) & 1) as u16;
+            let exp = 120 + ((r >> 9) % 8) as u16;
+            (sign << 15) | (exp << 7) | ((r >> 16) & 0x7f) as u16
+        };
+        let f16 = |next: &mut dyn FnMut() -> u64, special: bool| -> u16 {
+            let r = next();
+            if special && r % 53 == 0 {
+                return F16_SPECIAL[(r >> 20) as usize % F16_SPECIAL.len()];
+            }
+            let sign = ((r >> 8) & 1) as u16;
+            let exp = 12 + ((r >> 9) % 6) as u16;
+            (sign << 15) | (exp << 10) | ((r >> 16) & 0x3ff) as u16
+        };
+        let upload = |gpu: &Gpu, bits: &[u16], dtype: DType| -> GpuTensor {
+            let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+            let mut t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload");
+            t.dtype = dtype;
+            t.shape = vec![bits.len()];
+            t
+        };
+        for special in [false, true] {
+            let w: Vec<u16> = (0..wide * low_rank)
+                .map(|_| bf16(&mut next, special))
+                .collect();
+            let up_weight = upload(&gpu, &w, DType::BF16);
+            for rows in [1usize, 16, 129, 4099] {
+                let l: Vec<u16> = (0..rows * low_rank)
+                    .map(|_| bf16(&mut next, special))
+                    .collect();
+                let n: Vec<u16> = (0..rows * wide).map(|_| f16(&mut next, special)).collect();
+                let low = upload(&gpu, &l, DType::BF16);
+                let normalized = upload(&gpu, &n, DType::F16);
+                let mut outs = Vec::new();
+                for route in [HcUpRoute::T128, HcUpRoute::V2] {
+                    let mixed = gpu.zeros(&[rows * hidden], DType::F32).expect("mixed");
+                    hyper_read_up_wmma_route(
+                        &mut gpu,
+                        &HyperReadUpFused {
+                            up_weight: &up_weight,
+                            low: &low,
+                            normalized: &normalized,
+                            mixed: &mixed,
+                            rows,
+                            hidden,
+                            low_rank,
+                            normalized_bf16: true,
+                        },
+                        route,
+                    )
+                    .expect("route launch");
+                    let bits: Vec<u32> = gpu
+                        .download_f32(&mixed)
+                        .expect("download")
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    gpu.free_tensor(mixed).expect("free");
+                    outs.push(bits);
+                }
+                assert!(
+                    outs[0] == outs[1],
+                    "v2 differs from t128 (rows {rows}, special {special})"
+                );
+                gpu.free_tensor(low).expect("free");
+                gpu.free_tensor(normalized).expect("free");
+            }
+            gpu.free_tensor(up_weight).expect("free");
         }
     }
 

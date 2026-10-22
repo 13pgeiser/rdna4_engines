@@ -326,6 +326,14 @@ name = "hc_down_fused_bench"
 required-features = ["lab"]
 
 [[example]]
+name = "hc_up_v2_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_up_v2_bench"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_mq2g256_lloyd_grouped_gfx12"
 required-features = ["lab"]
 

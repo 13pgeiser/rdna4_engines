@@ -89,6 +89,11 @@ pub struct FeatureFlags {
     /// Retiled HC up+mix read tail (`HIPFIRE_QWEN4_HC_UP_TILE`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_hc_up_tile: bool,
+    /// Persistent W-stationary HC up+mix read tail (`HIPFIRE_QWEN4_HC_UP_V2`):
+    /// `hyper_read_up_wmma_bf16_gfx1201_v2`, bytewise the retiled `_t128` entry.
+    /// Exact gfx1201 only (with the retiled read admitted), default on; `0` is
+    /// the kill switch.
+    pub qwen4_hc_up_v2: bool,
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
@@ -949,6 +954,7 @@ impl FeatureFlags {
                 }),
             qwen4_hc_up_tile: parse_bool("HIPFIRE_QWEN4_HC_UP_TILE")
                 .unwrap_or(halo_hyper_default || is_gfx1201),
+            qwen4_hc_up_v2: parse_bool("HIPFIRE_QWEN4_HC_UP_V2").unwrap_or(is_gfx1201),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(exact_unit_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD")
@@ -1490,6 +1496,12 @@ impl FeatureFlags {
         self.qwen4_hc_up_tile && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    /// The persistent W-stationary HC up+mix entry (`HIPFIRE_QWEN4_HC_UP_V2`).
+    /// Exact gfx1201 only.
+    pub fn qwen4_hc_up_v2_enabled(&self) -> bool {
+        self.qwen4_hc_up_v2 && self.arch == "gfx1201"
+    }
+
     /// H8a: the MoE combine zero-initializes its own output instead of
     /// accumulating into a cleared tensor (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`).
     /// Exact gfx1151 / gfx1201.
@@ -1696,6 +1708,7 @@ impl FeatureFlags {
             qwen4_gdn_i8_fuse: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
+            qwen4_hc_up_v2: false,
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
@@ -2685,6 +2698,34 @@ mod tests {
             assert_eq!(one.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_i8_fuse_enabled());
+    }
+
+    /// The persistent HC up+mix entry: default on for exact gfx1201 only, `0` is
+    /// the kill switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_hc_up_v2_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_HC_UP_V2" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_hc_up_v2_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_hc_up_v2_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_hc_up_v2_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_up_v2_enabled());
     }
 
     #[test]
