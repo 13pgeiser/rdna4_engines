@@ -66,7 +66,7 @@ use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::moe::Qwen4EpOwnerTables;
-use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
+use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
@@ -10806,11 +10806,9 @@ impl Qwen4GpuForward {
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
         // Boundary samples, hoisted so the post-body finalize outside this closure
-        // can report them: they are taken where the window opens, which is what
-        // makes the census an exact bracket of one recorded body.
+        // can report them: they are taken where the window opens.
         let mut device_read: Option<u32> = None;
         let mut diagnostic_capture = false;
-        let mut launched_before = 0u64;
         let mut traced = false;
         let attempt = (|| -> Result<
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
@@ -11005,7 +11003,6 @@ impl Qwen4GpuForward {
                         // on first use; materialize them before the window opens so
                         // that memset is not state the tape would have to replay.
                         rdna_compute::tensor_ops::ensure_gdn_pair_counters(gpu)?;
-                        launched_before = hip_bridge::launch_counters::launch_kernel::count();
                         gpu.replay
                             .begin_auto_capture_if_armed()
                             .map_err(|reason| invalid(reason))?;
@@ -11433,7 +11430,7 @@ impl Qwen4GpuForward {
                 // that knows both ends of one recorded body, so the window can never
                 // outlive the forward that opened it.
                 if gpu.replay.should_auto_finalize_capture() {
-                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before);
+                    finish_qwen4_capture(gpu, diagnostic_capture);
                 }
                 if traced {
                     self.write_route_trace(gpu, next_position)?;
@@ -11476,67 +11473,24 @@ impl Qwen4GpuForward {
     }
 }
 
-/// A recorded capture body that cannot become a prepared tape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureCensusError {
-    /// The recorder saw a different number of launches than the body issued
-    /// (#397-style truncated tape).
-    LaunchMismatch { launched: usize, recorded: usize },
-}
-
-impl fmt::Display for CaptureCensusError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LaunchMismatch { launched, recorded } => write!(
-                f,
-                "qwen4 capture census mismatch: {launched} launched, {recorded} recorded \
-                 (truncated tape refused)"
-            ),
-        }
-    }
-}
-
-/// Fail closed on a census mismatch: poison the retained route (sticky HIP
-/// fallback) so the tape is never closed, prepared or installed.
-fn gate_capture_census(
-    replay: &mut ReplayController,
-    launched: usize,
-    recorded: usize,
-) -> Result<(), CaptureCensusError> {
-    if launched == recorded {
-        return Ok(());
-    }
-    let error = CaptureCensusError::LaunchMismatch { launched, recorded };
-    replay.poison(error.to_string());
-    Err(error)
-}
-
 /// Close a recorded Qwen4 body: census, then install the prepared plan, or refuse
 /// it for a measurement-only capture.
 ///
 /// Prepare failure after a successful HIP warmup poisons the route (sticky
-/// fallback) rather than failing the request that already produced output.
-fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before: u64) {
-    let launched = hip_bridge::launch_counters::launch_kernel::count();
+/// fallback) rather than failing the request that already produced output; a
+/// window that launched more kernels than it recorded is one such failure.
+fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
     let effects = gpu.replay.capture_window_effects();
     let summary = gpu.replay.capture_summary();
-    let recorded = summary.launch_count;
-    let computed = launched.saturating_sub(launched_before) as usize;
     eprintln!(
-        "[redline] qwen4 capture census: computed={computed} recorded={recorded} \
+        "[redline] qwen4 capture census: computed={} recorded={} \
          unique_kernels={} sequence_hash={:016x}",
-        summary.unique_kernel_count, summary.sequence_hash
+        effects.launches, summary.launch_count, summary.unique_kernel_count, summary.sequence_hash
     );
     eprintln!(
         "[redline] qwen4 capture census: effects inside window — htod={} dtod={} dtoh={} memset={}",
         effects.htod, effects.dtod, effects.dtoh, effects.memset
     );
-    if computed != recorded {
-        eprintln!(
-            "[redline] qwen4 capture census: MISMATCH — {computed} launched, {recorded} recorded \
-             (#397-style truncated tape)"
-        );
-    }
     if !effects.replayable() {
         eprintln!(
             "[redline] qwen4 capture census: effect-incomplete — {} device copy(ies), {} readback(s) \
@@ -11550,12 +11504,6 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
                       HIP)";
         gpu.replay.poison(reason);
         eprintln!("[redline] qwen4: {reason}");
-        return;
-    }
-    // A truncated tape must never be prepared: refuse before the sync, close
-    // and prepare below so no plan can be installed from it.
-    if let Err(error) = gate_capture_census(&mut gpu.replay, computed, recorded) {
-        eprintln!("[redline] falling back to HIP: {error}");
         return;
     }
     if let Err(reason) = gpu.hip.device_synchronize() {
@@ -11589,48 +11537,6 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
             gpu.replay.poison(reason.clone());
             eprintln!("[redline] falling back to HIP: {reason}");
         }
-    }
-}
-
-#[cfg(test)]
-mod capture_census_tests {
-    use super::{gate_capture_census, CaptureCensusError};
-    use rdna_compute::replay::{ReplayBackendRequest, ReplayController, ReplayState};
-
-    #[test]
-    fn census_mismatch_poisons_route_and_refuses_tape() {
-        let mut replay = ReplayController::new(ReplayBackendRequest::Auto);
-        assert_eq!(replay.state(), ReplayState::RecordingWarmup);
-        let error = gate_capture_census(&mut replay, 7, 5).unwrap_err();
-        assert_eq!(
-            error,
-            CaptureCensusError::LaunchMismatch {
-                launched: 7,
-                recorded: 5
-            }
-        );
-        let text = error.to_string();
-        assert!(
-            text.contains("7 launched") && text.contains("5 recorded"),
-            "{text}"
-        );
-        // Poisoned: the route is on HIP, the capture can no longer be closed
-        // into a tape, and the reason carries both counts.
-        assert_eq!(replay.state(), ReplayState::Fallback);
-        assert!(replay.finish_capture().is_err());
-        let reason = replay.fallback_reason().expect("fallback reason");
-        assert!(
-            reason.contains("7 launched") && reason.contains("5 recorded"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn census_equal_is_accepted_without_touching_route() {
-        let mut replay = ReplayController::new(ReplayBackendRequest::Auto);
-        assert_eq!(gate_capture_census(&mut replay, 5, 5), Ok(()));
-        assert_eq!(replay.state(), ReplayState::RecordingWarmup);
-        assert!(replay.fallback_reason().is_none());
     }
 }
 

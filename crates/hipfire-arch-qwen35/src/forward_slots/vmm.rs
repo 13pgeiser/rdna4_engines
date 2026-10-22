@@ -804,6 +804,7 @@ impl Qwen35VmmStore {
             VmmRoute::Exact => max_slots,
             VmmRoute::Nonexact => row_budget,
         };
+        let singleton_rows = route == VmmRoute::Exact && gpu.arch_caps.is_gfx1100();
         let result =
             (|| -> HipResult<(Vec<GpuTensor>, GpuTensor, GpuTensor, GpuTensor, GpuTensor)> {
                 let mut descs = Vec::with_capacity(kv_layer_ids.len());
@@ -814,9 +815,15 @@ impl Qwen35VmmStore {
                 let row_slot = gpu.zeros(&[trunk_rows], DType::F32)?;
                 // Fixed partials budget, never rows × context: the attention runs
                 // in row groups that fit it. At least one row at the bound.
-                let floats = (VMM_FLASH_PARTIALS_BYTES / 4)
-                    .min(trunk_rows * worst.partial_floats_per_row)
-                    .max(worst.partial_floats_per_row);
+                // gfx1100 Exact attends through each lane's singleton scratch.
+                // Keep only a placeholder for this unused batched-attention owner.
+                let floats = if singleton_rows {
+                    1
+                } else {
+                    (VMM_FLASH_PARTIALS_BYTES / 4)
+                        .min(trunk_rows * worst.partial_floats_per_row)
+                        .max(worst.partial_floats_per_row)
+                };
                 let partials = gpu.zeros(&[floats], DType::F32)?;
                 let logits = gpu.zeros(&[max_slots * config.vocab_size], DType::F32)?;
                 let hidden_out = gpu.zeros(&[trunk_rows * config.dim], DType::F32)?;
@@ -847,7 +854,7 @@ impl Qwen35VmmStore {
         // and FA prep (40 B) rows are layer-independent.
         let table_bytes = max_slots * (n_dn * (72 + 40) + 24 + 40);
         let rows_tables = match route {
-            VmmRoute::Exact => match gpu.zeros(&[table_bytes / 4], DType::F32) {
+            VmmRoute::Exact if !singleton_rows => match gpu.zeros(&[table_bytes / 4], DType::F32) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     let _ = pbs.free_gpu(gpu);
@@ -861,7 +868,7 @@ impl Qwen35VmmStore {
                     return Err(format!("VMM executor rows tables: {e}"));
                 }
             },
-            VmmRoute::Nonexact => None,
+            VmmRoute::Exact | VmmRoute::Nonexact => None,
         };
         let n_kv = kv_layer_ids.len();
         Ok(Self {

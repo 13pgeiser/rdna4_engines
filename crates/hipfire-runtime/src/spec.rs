@@ -819,6 +819,29 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Whether [`Self::ar_step`] is implemented. The spec-retire policy
+    /// ([`crate::spec_retire`]) only arms for speculators that can continue a
+    /// request as plain AR.
+    fn supports_ar_step(&self) -> bool {
+        false
+    }
+
+    /// One greedy target-only token for a request the spec-retire policy
+    /// retired: feed `seed` at absolute `position` through the target, keep
+    /// drafter-local per-position state in sync (a later request that hits
+    /// this prompt cache drafts from those rows), and return the target's
+    /// argmax next token. No draft runs.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        let _ = (gpu, target, position, seed);
+        Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
     /// Repair a terminal that consumed only a strict prefix of the most recent
     /// speculative window. Implementations with a retained pre-window snapshot
     /// restore it and replay only the state-committable prefix, leaving the last
@@ -967,6 +990,16 @@ pub trait Speculator {
     fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+
+    /// The raw target logit row (full vocabulary, before penalties and
+    /// truncation) that produced token `index` of the most recent emission:
+    /// index 0 is the prefill's first token right after [`Self::prefill`],
+    /// otherwise `index` indexes the last [`Self::step`]'s `emit`. Rows are
+    /// kept only for a request configured with
+    /// [`SpecRequestConfig::logprobs`]. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
@@ -1025,6 +1058,10 @@ pub struct SpecRequestConfig {
     /// regardless. A caller sets it from `!stop.is_empty()`; the default is
     /// `false`, which keeps those windows snapshot-free.
     pub stop_sequences: bool,
+    /// The request asked for logprobs: a speculator that implements
+    /// [`Speculator::token_logits`] keeps the target logit row behind each
+    /// emitted token. Default `false`, which keeps no rows.
+    pub logprobs: bool,
 }
 
 impl Default for SpecRequestConfig {
@@ -1044,6 +1081,7 @@ impl Default for SpecRequestConfig {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             stop_sequences: false,
+            logprobs: false,
         }
     }
 }
@@ -1303,6 +1341,11 @@ pub trait MtpDrafter {
     fn request_stats(&self) -> MtpRequestStats {
         MtpRequestStats::default()
     }
+
+    /// [`Speculator::token_logits`] of this drafter. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
@@ -1505,6 +1548,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn request_stats(&self) -> MtpRequestStats {
         self.arch.request_stats()
+    }
+
+    fn token_logits(&self, index: usize) -> Option<&[f32]> {
+        self.arch.token_logits(index)
     }
 }
 
