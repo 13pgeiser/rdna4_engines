@@ -6876,6 +6876,90 @@ impl Gpu {
         ))
     }
 
+    /// [`Self::rotate_x_mq_i4_batched`] (plain, no AWQ, no F32 store) that also stores the
+    /// RNE F16 cast of the raw `x_in` rows into `x_f16` (`[batch_size, k]` F16) from the
+    /// registers the rotate already loaded: the `convert_f32_to_f16` bytes and the `block_i4_128`
+    /// sidecar of the standalone kernels, from one read of `x_in`. Seals `reservation` after a
+    /// successful launch.
+    pub fn rotate_x_mq_i4_f16out_batched(
+        &mut self,
+        x_in: &GpuTensor,
+        x_f16: &GpuTensor,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i4_f16out_batched: reservation (k,n) mismatch",
+            ));
+        }
+        if x_in.dtype != DType::F32
+            || x_f16.dtype != DType::F16
+            || x_in.numel() < k * batch_size
+            || x_f16.numel() < k * batch_size
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i4_f16out_batched: F32 input and F16 output of at least k * batch elements",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let kernel = "mq_rotate_x_i4_f16out";
+        self.ensure_kernel(kernel, kernels::MQ_ROTATE_X_I4_F16OUT_SRC, kernel)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x_in.buf.as_ptr();
+        let mut xrp: *mut c_void = std::ptr::null_mut();
+        let mut x16p = x_f16.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut x16p as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let blocks_k = k / 128;
+        let bytes = (k * 4 + k * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_i4_f16out", bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [((k / 256) * batch_size) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(x16p);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
+    }
+
     /// One-pass A8 producer of the exact-INT8 MQ6G256V2 route: plain FWHT rotate (the
     /// `mq_rotate_x` body, no gate, no AWQ) emitting `block_i8_128` straight into
     /// `reservation` (`_gfx12` / `_gfx11` symbol by arch). The blocks are byte-identical to

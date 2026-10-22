@@ -465,6 +465,51 @@ pub(crate) fn input_basis(
     hip(gpu.rotate_x_mq_batched(p.x_norm_batch, p.x_rot_batch, p.gate_up_k, p.batch_size))
 }
 
+/// What the fused MoE front ([`front_applies`], [`input_basis_front`]) hands to the later
+/// stages of one sealed grouped prefill call: the routed gate/up IU4 sidecar for
+/// [`gate_up_front`] and the F16 conversion of `x_norm_batch` (in the shared F16 scratch)
+/// for [`shared_gate_up_front`]'s router / shared-expert WMMA GEMMs.
+pub(crate) struct MoeFront {
+    xq: rdna_compute::scratch::Int4MmqPrepared,
+    x16: GpuTensor,
+}
+
+/// Whether the symmetric IU4 route (exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
+/// `x_norm_batch` once in one producer instead of the chain's `mq_rotate_x` (whose F32 output
+/// nothing on this route reads: the symmetric gate/up consumes only the IU4 sidecar, and the
+/// router and shared projections are BF16 on the natural activation),
+/// `convert_f32_to_f16` (inside the router + shared F16 WMMA group launch) and the gate/up
+/// stage's `mq_rotate_x_i4`. The producer feeds exactly those three consumers, so it applies
+/// only where the router stage defers to the shared group's launch ([`router_shares_f16`]:
+/// the stages between the producer and that launch convert nothing and reserve no IU4
+/// scratch), the fused shared gate/up PM route is not taken, and the symmetric arm is the
+/// gate/up that runs ([`sym_iu4`], not the slab or FP8 routes). The caller adds the
+/// per-invocation conditions (plain program, no CPU split / deferral).
+pub(crate) fn front_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    let use_path2 = grouped_path(gpu, p, use_path2);
+    gpu.qwen4_moe_front_fuse_applies()
+        && !is_fp8(p)
+        && !is_slab(p)
+        && use_path2
+        && grouped_geometry(p)
+        && p.x_norm_batch.dtype == DType::F32
+        && p.gate_up_k == p.prelude.router.k
+        && sym_iu4(gpu, p, use_path2)
+        && router_shares_f16(gpu, p)
+        && !shared_gu_pm(gpu, p, use_path2)
+}
+
+/// The fused input-basis stage: one launch writes the IU4 sidecar and the F16 X. The F32
+/// rotated basis `x_rot_batch` is not written: no reader exists on this route.
+pub(crate) fn input_basis_front(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+) -> Result<MoeFront, DispatchError> {
+    require_geometry(p)?;
+    let (xq, x16) = hip(gpu.qwen4_moe_front_producer(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+    Ok(MoeFront { xq, x16 })
+}
+
 /// Whether the path-2 F16 WMMA gate/up rotates the activation straight to
 /// F16 itself (the bytes the F32 rotation + conversion produce): only when no
 /// shared projection reads the F32 basis `x_rot_batch`.
@@ -674,11 +719,22 @@ fn shared_down_input(
 /// BF16 XF32 GEMM launcher.
 /// qt=55 FP8: the shared selector/gate/up through `project_weights` (gfx942
 /// BF16 MFMA, all row counts); the router is projected by its own stage.
-pub(crate) fn shared_gate_up(
+///
+/// `front`: the F16 X the fused front already left in the shared F16 scratch
+/// ([`input_basis_front`]); the router + shared WMMA group launch then skips its own
+/// `convert_f32_to_f16` of `x_norm_batch`.
+pub(crate) fn shared_gate_up_front(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
+    front: Option<&MoeFront>,
 ) -> Result<(), DispatchError> {
+    if front.is_some() && !(router_shares_f16(gpu, p) && !shared_gu_pm(gpu, p, use_path2)) {
+        // The fused producer fed exactly the router + shared F16 group launch.
+        return Err(DispatchError::Hip(
+            "qt44/qt53 fused MoE front: the F16 X has no consumer on this route".into(),
+        ));
+    }
     if is_fp8(p) {
         return fp8_shared_gate_up(gpu, p);
     }
@@ -733,7 +789,7 @@ pub(crate) fn shared_gate_up(
         }
         // The router group first (its own launches, as `router_projection`
         // would issue them), then the shared group, off one F16 conversion.
-        let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_groups(
+        let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_groups_x16(
             &[
                 &[(router.buf, p.prelude.router_logits, router.m)],
                 &[
@@ -743,6 +799,7 @@ pub(crate) fn shared_gate_up(
                 ],
             ],
             p.x_norm_batch,
+            front.map(|f| &f.x16),
             router.k,
             p.batch_size,
         ))?;
@@ -1496,6 +1553,20 @@ pub(crate) fn gate_up(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    gate_up_front(gpu, p, use_path2, grouped_rows, None)
+}
+
+/// [`gate_up`] consuming the IU4 sidecar the fused front already produced
+/// ([`input_basis_front`]) instead of running `mq_rotate_x_i4`. A sidecar that is no longer
+/// the live scratch (generation, shape or pointer mismatch) is never read: the producer
+/// runs again, as the unfused chain would.
+pub(crate) fn gate_up_front(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    grouped_rows: usize,
+    front: Option<MoeFront>,
+) -> Result<(), DispatchError> {
     if is_fp8(p) {
         return fp8_gate_up(gpu, p, grouped_rows);
     }
@@ -1509,7 +1580,16 @@ pub(crate) fn gate_up(
         return slab_gate_up(gpu, p, grouped_rows);
     }
     if sym_iu4(gpu, p, use_path2) {
-        let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+        let xq = match front {
+            Some(front)
+                if gpu
+                    .int4_mmq_prepared_ptr(&front.xq, p.gate_up_k, p.batch_size)
+                    .is_ok() =>
+            {
+                front.xq
+            }
+            _ => hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?,
+        };
         return hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
             gate_up_ptrs,
             gemm_tile_ids(p),

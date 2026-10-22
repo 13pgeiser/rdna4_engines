@@ -299,6 +299,14 @@ pub(super) struct MoeStepState<'a> {
     /// ([`SealedMoeOp::fold_prefill_norm_into_input_basis`]); the input-basis stage has nothing
     /// left to produce.
     norm_basis_folded: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`: the plain (`execute`) program may run the fused MoE
+    /// front producer; every other lowering (the S1 layer-major prepare, the slowlink
+    /// tiles, ...) leaves this false and runs the unfused producers.
+    front_allowed: Cell<bool>,
+    /// What the fused front producer left for the shared gate/up and routed gate/up stages
+    /// ([`super::qt44_qt53_prefill::input_basis_front`]): written by the input-basis stage,
+    /// borrowed by the shared gate/up, taken by the routed gate/up of the same invocation.
+    front: RefCell<Option<super::qt44_qt53_prefill::MoeFront>>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -377,6 +385,8 @@ impl<'a> MoeStepState<'a> {
             split_reference: Cell::new(false),
             expert_iu4: OnceCell::new(),
             norm_basis_folded: Cell::new(false),
+            front_allowed: Cell::new(false),
+            front: RefCell::new(None),
         }
     }
 
@@ -834,6 +844,21 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            if self.state.front_allowed.get()
+                && !selection.cpu_deferred_experts
+                && super::qt44_qt53_prefill::front_applies(
+                    gpu,
+                    params,
+                    selection.uses_grouped_rows(),
+                )
+            {
+                // One read of `mixed`: the routed IU4 sidecar and the F16 X of the
+                // router / shared projections, bytes of the unfused producers; the dead
+                // F32 rotation is not run.
+                let front = super::qt44_qt53_prefill::input_basis_front(gpu, params)?;
+                *self.state.front.borrow_mut() = Some(front);
+                return Ok(());
+            }
             return super::qt44_qt53_prefill::input_basis(
                 gpu,
                 params,
@@ -1251,10 +1276,12 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
-            return super::qt44_qt53_prefill::shared_gate_up(
+            let front = self.state.front.borrow();
+            return super::qt44_qt53_prefill::shared_gate_up_front(
                 gpu,
                 params,
                 selection.uses_grouped_rows(),
+                front.as_ref(),
             );
         }
         // The router stage's IU4 token (if any) is consumed by exactly this
@@ -1423,11 +1450,13 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
-            return super::qt44_qt53_prefill::gate_up(
+            let front = self.state.front.borrow_mut().take();
+            return super::qt44_qt53_prefill::gate_up_front(
                 gpu,
                 params,
                 selection.uses_grouped_rows(),
                 selection.path2_m_total,
+                front,
             );
         }
         if let ExpertIu4Decision::Admitted(plan) =
@@ -2642,6 +2671,7 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     // Reborrow the call at the execution lifetime. The state and every Step
     // borrow only this invocation and are dropped before the call returns.
     let state = MoeStepState::new(call);
+    state.front_allowed.set(true);
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
@@ -2915,6 +2945,7 @@ pub(super) fn execute_after_clear(
     )>,
 ) -> Result<AfterClear, DispatchError> {
     let state = MoeStepState::new(call);
+    state.front_allowed.set(true);
     let absorbed = state.absorbs_clear(gpu, clear);
     if !absorbed {
         super::layer_ops::execute_clear(gpu, clear)?;

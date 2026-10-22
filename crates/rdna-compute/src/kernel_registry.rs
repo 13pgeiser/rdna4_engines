@@ -3034,6 +3034,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["mq_rotate_x_i4"]
         );
         add!(
+            "mq_rotate_x_i4_f16out",
+            kernels::MQ_ROTATE_X_I4_F16OUT_SRC,
+            ["mq_rotate_x_i4_f16out"]
+        );
+        add!(
             "qwen4_moe_rotate128_i4",
             kernels::QWEN4_MOE_ROTATE128_I4_SRC,
             ["qwen4_moe_rotate128_i4"]
@@ -9814,6 +9819,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The Qwen4 MoE front producer (`HIPFIRE_QWEN4_MOE_FRONT_FUSE`) adds the
+        // `mq_rotate_x_i4` source's F16-output twin.
+        const MOE_FRONT_ADDED_MODULES: [&str; 1] = ["mq_rotate_x_i4_f16out"];
+        for module in MOE_FRONT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MoE front module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -9822,7 +9842,8 @@ mod tests {
                 + NATIVE_A3B_ADDED_MODULES.len()
                 + FIRST_REQUEST_JIT_ADDED_MODULES
                 + MQ6_I8_ADDED_MODULES.len()
-                + G64_AND_HC_CAPTURE_ADDED_MODULES.len(),
+                + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
+                + MOE_FRONT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
