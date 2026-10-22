@@ -2392,10 +2392,14 @@ pub(crate) struct Qwen4Boundary<'a> {
     pub tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
     pub started_in_think: bool,
     pub prompt_tokens: &'a [u32],
-    /// Every committed token, ending with the pending seed.
+    /// Every streamed token; ends with the pending seed when `seed_emitted`.
     pub emitted: &'a [u32],
     pub position: usize,
     pub seed_token: u32,
+    /// The singleton already streamed the seed (spec windows). An AR
+    /// singleton's seed is picked but neither fed nor streamed; the lane
+    /// streams it after its first forward, like any lane pick.
+    pub seed_emitted: bool,
     pub max_tokens: usize,
     pub created_at: Instant,
     pub prefill_done_at: Instant,
@@ -2415,8 +2419,13 @@ pub(crate) fn promote_qwen4_singleton(
     drafter: Option<&hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>,
     b: Qwen4Boundary<'_>,
 ) -> Result<Qwen4PromotedRequest, String> {
-    if b.emitted.last() != Some(&b.seed_token) {
+    if b.seed_emitted && b.emitted.last() != Some(&b.seed_token) {
         return Err("pending seed is not the last committed token".into());
+    }
+    // The lane's committed picks end with its pending seed either way.
+    let mut generated = b.emitted.to_vec();
+    if !b.seed_emitted {
+        generated.push(b.seed_token);
     }
     let spec_store = bundle
         .lanes()
@@ -2438,7 +2447,7 @@ pub(crate) fn promote_qwen4_singleton(
             gpu,
             epoch,
             b.prompt_tokens.to_vec(),
-            b.emitted.to_vec(),
+            generated,
             b.seed_token,
             b.position,
             parts,
@@ -2495,7 +2504,7 @@ pub(crate) fn promote_qwen4_singleton(
         bytes_fed_to_filter: bytes_fed,
         created_at: b.created_at,
         prefill_done_at: Some(b.prefill_done_at),
-        first_token_at: Some(b.prefill_done_at),
+        first_token_at: (!b.emitted.is_empty()).then_some(b.prefill_done_at),
         max_active_lanes: 1,
     };
     Ok(Qwen4PromotedRequest {
@@ -2504,7 +2513,7 @@ pub(crate) fn promote_qwen4_singleton(
         producer,
         epoch,
         slot,
-        seed_emitted: true,
+        seed_emitted: b.seed_emitted,
         max_tokens: b.max_tokens,
     })
 }
