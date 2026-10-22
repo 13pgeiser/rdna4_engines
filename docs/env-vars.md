@@ -504,7 +504,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_MTP_TRACE=1` | Per-cycle MTP draft/verify trace on stderr. |
 | `HIPFIRE_DEBUG_POOL_INVARIANTS=1` | Multi-slot engine: assert page-pool / slot-lease invariants after every scheduler tick (debug; slow). |
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
-| `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): one `HIPFIRE_MODULE_LOAD_AUDIT` stderr line per HIP module load (module, symbol, source SHA-256, recipe flags), per `hipModuleLoad`/`hipModuleLoadData` (handle, path or image FNV-1a; embedded PeaceMaker images included) and per resolved symbol, for offline route-closure audits of `kernel_registry::route_entries` and of the load-time barrier (a closed route shows every load before `loaded` and none after). Never set in production or timing runs. |
+| `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): records HIP recipes, module handles/images and resolved symbols for offline route-closure audits. Qwen3.5-family loads also print `route plan axes:` with the resolved architecture, heads, speculation route, context ceiling, KV/state formats, backend and prefill chunk, including when `HIPFIRE_ROUTE_PLAN=0` is used. A sealed route has every planned module bound before `loaded` and no unplanned loads afterwards. Never set in production or timing runs. |
 
 Flash-Next/Qwen4 PP native MTP is greedy-only; sampled/penalized requests
 decode AR through the same PP mesh instead of failing the request. The route
@@ -591,7 +591,8 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
 | `HIPFIRE_PACK_JOBS` | Kernel-pack builder only: positive worker count, bounded by CPU affinity and available RAM (~1.5 GiB/job). Defaults to `available_parallelism()` minus a reserve of at least one core (one per eight cores). `build-kernel-pack.sh` treats this as the total budget shared by concurrent architectures. |
 | `HIPFIRE_JIT_JOBS` | Load-time JIT and synchronous batch compiles: positive worker count. Default `available_parallelism()` minus one core per eight (at least one); always clamped to CPU affinity and to `(MemAvailable − CMA − reserve) / 1.5 GiB`, honoring a tighter cgroup limit; unknown RAM admits one job. Reserve is 1 GiB, plus 2 GiB of loader staging headroom while compiles overlap the weight load. `1` disables concurrency but keeps the pre-ready barrier (it never restores post-ready lazy JIT). `0` or a non-integer fails the load before any GPU allocation. Not read by the pack builder (`HIPFIRE_PACK_JOBS`). |
-| `HIPFIRE_ROUTE_PLAN=0` | Developer kill switch for the load-time kernel barrier: every load keeps lazy per-kernel loading (`kernels: … [no closed route plan: HIPFIRE_ROUTE_PLAN=0]`). `scripts/route_plan_walk.py` sets it so a walk observes the route's whole lazy closure, not a checked-in plan's preload. Unset or `1` uses closed plans. |
+| `HIPFIRE_ROUTE_PLAN=0` | Developer kill switch for load-time kernel preparation: every load keeps lazy per-kernel loading. `scripts/route_plan_walk.py` sets it to observe actual dispatch rather than preload. Unset or `1` enables exact plans and open-route predictive preparation. Never set in production. |
+| `HIPFIRE_ROUTE_PLAN_SEAL=1` | Developer-only strict replay of an exact route plan, without predictive extras. `scripts/route_plan_walk.py --sealed` sets it to prove every replayed request uses only planned kernels. A refused, open, mismatched or incomplete replay cannot certify a `#! sealed` plan. Never set in production. |
 | `HIPFIRE_NO_DEVICE_COMPILER=1` | Require verified installed kernel objects instead of JIT; a missing/stale index, wrong symbol/source/flags/profile/ABI/toolchain identity or object SHA-256 fails before HIP loads it. Hot JIT keys remain toolchain-specific. |
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
@@ -609,42 +610,55 @@ For release tarballs, `scripts/build-kernel-pack.sh --tag TAG --jobs 3
 gfx1201 gfx1100 gfx1151` builds up to three architectures concurrently, splitting
 the total CPU/RAM budget between them rather than launching three full pools.
 
-**Load-time kernel barrier (limited routes).** For a load whose kernel route
-is closed by `kernel_registry::route_entries` — Qwen3.6-27B MQ4G256V2 XTS on
-exact gfx1201 (single GPU, native fp8 K/V, Q8 DeltaNet state, AR or native
-MTP), and Qwen3.8-Flash-Next on exact gfx1201 (the canonical GPTQ3 header
-layout, single GPU, the walked QSA/GDN/KV-backend axes, default MTP K,
-`max_seq` up to the walked 131072, AR or native MTP with n-gram), both with
-default feature flags — the common loader starts the
-route's missing hipcc compiles during the weight load (`HIPFIRE_JIT_JOBS`
-workers), then, before the first model or load-transform dispatch, loads every
-planned HIP and embedded PeaceMaker module and binds every planned symbol. The
-`loaded` acknowledgment waits for weights and kernels; afterwards an unplanned
-kernel request fails instead of compiling or loading between dispatches (27B),
-or, on the open Flash-Next plan, loads lazily with one
-`kernels: WARNING unplanned kernel …` line and a count. If
-no worker fits alongside the weight load but one fits before it, the whole
-plan is compiled and loaded before weights; if none fits, the load fails
-before any allocation. Verified installed packs still satisfy the plan with
-zero compiler processes. Every other route (other models/arches, DFlash,
-DDTree, DSpark, n-gram, CASK, adaptive KV, vision, non-default flags, pp>1,
-EP, a Flash-Next trunk overlay or retained Redline route) logs `kernels: no
-closed route plan (...)` and keeps lazy per-kernel JIT; staging Flash-Next
-fn-lanes (`serve.vmm_batch`) returns a planned load to lazy loading.
-This is a cold-start/readiness change, not a steady-state speedup.
+**Load-time kernel barrier.** The common loader prepares predictable kernels
+before acknowledging `loaded`. Exact routes selected by
+`kernel_registry::route_entries` use their header, architecture, policy and
+walked-context gates; a sealed route rejects an unplanned kernel after ready.
+Every open or unsupported route prepares the architecture's entire exact HIP
+registry inventory, excluding modules already in its plan and HIP modules
+replaced by accepted native twins. A family trace never limits this compile
+set: newly registered predictable kernels must not fall through to a request.
+For an exact plan, family traces and matching walked rows prove which
+unambiguous, route-compatible symbols may bind eagerly. Unproven exports stay
+compile-only until selected. Predictions are not closure proofs; genuinely
+unpredicted kernels remain lazy and identify their phase in the log.
 
-The Flash-Next plan is generated, not written by hand:
-`scripts/route_plan_walk.py` drives the real dispatch through the route's
-request axes (every prompt row count to 300 and the chunk/staging tails,
-decode contexts to 120K, greedy and nine sampling variants, n-gram copies,
-session resumes, long-context QSA) under `HIPFIRE_MODULE_LOAD_AUDIT=1`, and
-`scripts/route_plan_build.py` turns the walks into
-`crates/rdna-compute/src/route_plans/<family>.<arch>.tsv`. Each row records
-the effective source or image SHA-256; a row that no longer matches the
-registry refuses the plan (lazy loading) and fails
-`cargo test -p rdna-compute --test fn_route_plan`, which also checks that
-every planned HIP module is a release-pack entry. Regenerate the plan after a
-change to the Flash-Next dispatch or its kernel sources.
+Missing compiles overlap the weight sweep using the bounded
+`HIPFIRE_JIT_JOBS` budget. If no worker fits alongside weights but one fits
+before them, preparation runs before weights. If neither budget fits, or a
+predicted compile fails, the load fails instead of deferring that work to the
+first request. Verified installed packs satisfy matching recipes without
+compiler processes. Readiness logs identify the prediction basis, modules
+prepared before ready, eager bindings and compile-only modules. A
+`<module>: hipcc compiled (<arch>, key <effective-key>)` line records an actual
+cache-miss compiler run; cache hits and embedded-image loads never emit it.
+Unplanned-request counters include binds and image loads, not just compiles.
+`HIPFIRE_ROUTE_PLAN=0` remains the explicit developer route-walking opt-out,
+not a product cold-start policy.
+
+See [the artifact inventory](first-request-jit-inventory.md) for exact shipped
+identities and plan coverage. A pack's module inventory is not proof that a
+model's route is closed. This is a cold-start/readiness change, not a
+steady-state speedup.
+
+Walked plans are generated, not written by hand:
+`scripts/route_plan_walk.py` drives real dispatch through the route's request
+axes under `HIPFIRE_MODULE_LOAD_AUDIT=1`, and
+`scripts/route_plan_build.py` records the exact header layout, architecture,
+resolved policy axes, walked context ceiling and source/image identities in
+`crates/rdna-compute/src/route_plans/<family>.<arch>.tsv`. Flash-Next records
+its QSA/GDN axes; dense 27B and A3B additionally pin head geometry, expert
+geometry/placement, KV formats, state format, backend and prefill chunk.
+Native-MTP head metadata is fingerprinted separately where needed.
+
+An initial walk produces an open plan. Replay it with
+`route_plan_walk.py --sealed`, then pass the successful replay to
+`route_plan_build.py --sealed-replay ROUTE=DIR` to certify `#! sealed` for
+that route. A predicted, mismatched or unplanned replay cannot certify closure.
+Stale source/image identities refuse the exact plan and use open predictive
+preparation instead; the route-plan CPU tests reject stale checked-in rows.
+Regenerate after changing dispatch or kernel sources. Pack membership and
+real route closure are separate requirements.
 
 To build a compiler-free `gfx1201` RMSNorm package for the production
 `Gpu::rmsnorm_f32` route, run
@@ -658,6 +672,9 @@ A compiler-free `daemon --precompile --module rmsnorm_f32` probes the real
 `Gpu::rmsnorm_f32` kernel load and verifies numerical output. The installed
 objects must be beside the actual daemon executable, not merely in the CWD;
 the cache override controls only writable hot JIT entries.
+The runtime never writes under the installed pack: a rejected or stale packaged
+object is rebuilt into the hot cache only, so repair an install by re-running the
+installer (or `hipfire kernel-pack install`), not by relying on a runtime refresh.
 Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
 `HIPFIRE_MOE_*` levers are **research/power-user**. Centralized
 `FeatureFlags` controls now have typed TOML keys under `kernel` or
@@ -2309,6 +2326,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROUTE_ORACLE_KV_B` | crates/hipfire-arch-qwen35/tests/route_oracle_single.rs | harness |
 | `HIPFIRE_ROUTE_PLAN` | crates/hipfire-loader/src/lib.rs, scripts/route_plan_walk.py | developer |
+| `HIPFIRE_ROUTE_PLAN_SEAL` | crates/hipfire-loader/src/lib.rs, scripts/route_plan_walk.py | developer |
 | `HIPFIRE_ROWS_CQN` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_ROWS_FA_PREP` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_ROWS_GATED_NORM` | crates/rdna-compute/src/rows_batched.rs | developer |

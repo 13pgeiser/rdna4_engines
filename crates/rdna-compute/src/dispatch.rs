@@ -3850,9 +3850,11 @@ impl Gpu {
                 .check_function_image(func_name, image.as_bytes())
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
-        self.scratch
-            .route_load
-            .admit_unplanned(module_name, func_name)?;
+        self.scratch.route_load.admit_unplanned(
+            module_name,
+            func_name,
+            crate::scratch::LazyKind::EmbeddedImage,
+        )?;
         if !self.modules.contains_key(module_name) {
             if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
                 // Developer-only route-closure audit, as `scratch::load_embedded_module`.
@@ -3919,33 +3921,47 @@ impl Gpu {
         jobs: usize,
         open: Option<String>,
     ) -> HipResult<()> {
+        self.begin_route_kernel_load_predicted(plan, None, jobs, open)
+    }
+
+    /// [`Self::begin_route_kernel_load`] plus a predicted family set: its
+    /// exact registry recipes compile in the same bounded batch as `plan`
+    /// (an empty `plan` is a pure fallback route), and at the first dispatch
+    /// barrier only their proven conflict-free symbols bind. Predicted
+    /// modules are speculative coverage, so a route carrying any must have
+    /// an `open` label (it can never seal); their compile or bind failure
+    /// fails the load like a planned module's, since a known predicted
+    /// module is predictable work, not a lazy miss.
+    pub fn begin_route_kernel_load_predicted(
+        &mut self,
+        plan: crate::kernel_registry::RouteKernelPlan,
+        predicted: Option<crate::kernel_registry::PredictedKernels>,
+        jobs: usize,
+        open: Option<String>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.abort_route_kernel_load()?;
         crate::kernel_registry::validate_route_plan(&plan)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("route plan: {e:?}")))?;
-        let hip_entries: Vec<crate::kernel_registry::KernelEntry> = plan
+        let predicted = predicted.map(|p| p.modules).unwrap_or_default();
+        if !predicted.is_empty() && open.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "predicted kernels need an open route (a predicted fallback can never be sealed)",
+            ));
+        }
+        let mut batch_entries: Vec<crate::kernel_registry::KernelEntry> = plan
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                crate::kernel_registry::PlannedKernel::Hip(entry) => {
-                    Some(crate::kernel_registry::KernelEntry {
-                        arch: entry.arch,
-                        module: entry.module,
-                        symbols: entry.symbols,
-                        source: entry.source.clone(),
-                        flags: entry.flags.clone(),
-                        scheduler_profile: entry.scheduler_profile.clone(),
-                    })
-                }
+                crate::kernel_registry::PlannedKernel::Hip(entry) => Some(entry.clone()),
                 crate::kernel_registry::PlannedKernel::Embedded { .. } => None,
             })
             .collect();
-        let batch = self.compiler.begin_batch(hip_entries, jobs)?;
-        self.scratch.route_load = crate::scratch::RouteLoad::Pending {
-            plan,
-            batch: Some(batch),
-            open,
-        };
+        batch_entries.extend(predicted.iter().map(|m| m.entry.clone()));
+        let batch = self.compiler.begin_batch(batch_entries, jobs)?;
+        self.scratch.route_load =
+            crate::scratch::RouteLoad::pending_route(plan, Some(batch), predicted, open)?;
         Ok(())
     }
 
@@ -3984,13 +4000,26 @@ impl Gpu {
             return Ok(());
         }
         self.ensure_route_modules_preloaded()?;
-        self.scratch.route_load = match std::mem::take(&mut self.scratch.route_load) {
-            RouteLoad::Prepared { open: Some(route) } => RouteLoad::Open {
-                route,
-                unplanned: 0,
-            },
-            _ => RouteLoad::Sealed,
-        };
+        self.scratch.route_load = std::mem::take(&mut self.scratch.route_load).finished();
+        Ok(())
+    }
+
+    /// [`Self::finish_route_kernel_load`] for a model that left its closed
+    /// plan: the pending compile still completes (every planned and
+    /// predicted module compiled and bound, counters kept) and the route
+    /// finishes `Open` under `route`, never sealed. No-op when no route was
+    /// begun or it already finished.
+    pub fn finish_route_kernel_load_open(&mut self, route: String) -> HipResult<()> {
+        self.bind_thread()?;
+        use crate::scratch::RouteLoad;
+        if matches!(
+            self.scratch.route_load,
+            RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }
+        ) {
+            return Ok(());
+        }
+        self.ensure_route_modules_preloaded()?;
+        self.scratch.route_load = std::mem::take(&mut self.scratch.route_load).finished_open(route);
         Ok(())
     }
 
@@ -4004,6 +4033,14 @@ impl Gpu {
             } => self.compiler.finish_batch(batch),
             _ => Ok(()),
         }
+    }
+
+    /// Preload counters of the begun route: predicted modules compiled,
+    /// bound and failed, and unplanned kernels loaded lazily during load.
+    /// Zero when no route was begun.
+    pub fn route_kernel_stats(&self) -> crate::scratch::RouteKernelStats {
+        // bind_thread: skip — pure state query.
+        self.scratch.route_load.stats()
     }
 
     /// True while a begun route's modules are not yet on the GPU.
