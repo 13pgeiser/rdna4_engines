@@ -3758,7 +3758,7 @@ mod ple_rows_tests {
         let err = out.unwrap_err();
         assert!(err.starts_with("qwen4 PLE rows:"), "{err}");
         assert!(
-            err.contains("missing and derivation was not requested"),
+            err.contains("sidecar is missing") && err.contains("derivation was not requested"),
             "{err}"
         );
         assert!(!attached);
