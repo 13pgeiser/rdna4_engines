@@ -121,6 +121,50 @@ pub fn bf16_val(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
+/// OCP E4M3 (finite, bias 7) code of `x`, round-to-nearest-even, saturating at 448 (NaN and zero are 0).
+pub fn e4m3(x: f32) -> u8 {
+    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
+    let a = x.abs();
+    if a.is_nan() || a == 0.0 {
+        return 0;
+    }
+    let code = if a < 2f32.powi(-6) {
+        // Subnormal: value = m * 2^-9 (m == 8 rounds up into the smallest normal, 0x08).
+        (a * 512.0).round_ties_even() as u32
+    } else {
+        let mut e = (a.to_bits() >> 23) as i32 - 127;
+        let mut m = ((a / 2f32.powi(e) - 1.0) * 8.0).round_ties_even() as i32;
+        if m == 8 {
+            e += 1;
+            m = 0;
+        }
+        let biased = e + 7;
+        if biased > 15 || (biased == 15 && m > 6) {
+            0x7e
+        } else {
+            ((biased as u32) << 3) | m as u32
+        }
+    };
+    sign | code as u8
+}
+
+/// The f32 value of an OCP E4M3FN code (`0x7f`/`0xff` are NaN).
+pub fn e4m3_val(c: u8) -> f32 {
+    let (s, e, m) = (c >> 7, i32::from((c >> 3) & 15), f32::from(c & 7));
+    let v = if e == 0 {
+        m * 2f32.powi(-9)
+    } else if e == 15 && c & 7 == 7 {
+        f32::NAN
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    };
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
+}
+
 /// One `block_i4_128` record (72 B: f32 d, i32 sum(q), 64 nibble bytes, low
 /// nibble = even K) from 128 signed codes.
 pub fn i4_record(d: f32, q: &[i32; 128]) -> [u8; 72] {

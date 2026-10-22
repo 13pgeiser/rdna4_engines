@@ -648,3 +648,48 @@ Nothing here lends a typed region or opens a typed scope: **every block is a str
 Every native refuses a tile index at or past `g.nt()` and a parity above 1 before emitting. `pm_loop --kernel qwen4_moe_sym --epi <variant> --rip crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rip [--shape fn:<preset>]` times a script against the shipped entry through the card (cookbook 14); the twin's record says `identical_to_generator: true`.
 
 Out of scope: the MQ3-I4 and E8P-I4 NT1 generators (`qwen4_moe_sym_w3`, `qwen4_moe_sym_e8p`), the gfx1151 entries (including the row-repeat NT4 `rr > 1` family and its `transition`) and the grouped-position rotate producer have no twin.
+
+## 17. Production generator on the raw `Builder`: `fa_prefill`
+
+The gfx1201 GQA-fused FA2 prefill attention for the A3B head geometry (H16 / KV2 / D256; `peacemaker_isa::kernels::fa_prefill`) is composable from `.rip`. Like `fp8_gemm` (§15) it is an untyped-`Builder` kernel (a tile loop with `loop_`, `control` branches, raw barriers), so its twins are written on the raw `Builder` surface, not on `Workgroup`: no typestate and no sealed ring apply, and the checks are the Builder's (LDS slot machine, wait ledger, hazard guards, loop fixpoint). Three exports are covered, in two twin files:
+
+- [`fa_prefill.rip`](../../peacemaker-isa/src/kernels/fa_prefill.rip) (Q8_0 K/V): variants `direct` (`attention_q8_0_fa2_gqa_pm_gfx1201`) and `preconvert` (`attention_fa2_q_preconvert_pm_gfx1201`);
+- [`fa_prefill_fp8.rip`](../../peacemaker-isa/src/kernels/fa_prefill_fp8.rip) (native fp8 E4M3 K/V): variant `direct` (`attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201`).
+
+`fa_qprep` is not composed: it is a separate generator with its own module and no shared blocks.
+
+The script declares the LDS slots (`b.lds_slot`, from `g.lds_slots()`: `k_plane` + `v_plane`, or the single reused `stage`), places every label (`fa::label`), issues every barrier (`b.barrier_with_scope(.., "lds_only")`) and the tile loop (`b.loop_(fa::LOOP, ..)`). The natives emit straight into the builder passed as their first argument. Geometry (four compute waves + one helper, KT64 tiles, the register map) is fixed by the Rust generator.
+
+### Coarse natives and the generator
+
+| call | meaning |
+|---|---|
+| `FaPrefill::emit(arch, spec)?`, `FaPrefill::emit_preconvert(arch, spec)?` | what `fa_prefill::emit` / `emit_preconvert` return (`Emitted`) |
+| `FaPrefill::emit_module(arch, spec)?`, `FaPrefill::emit_fp8_module(arch, spec)?` | `(Vec<Emitted>, text, proof_json)` of the Q8_0 module (preconvert, direct) / the one-export fp8 module |
+| `FaKv::{Q8_0, Fp8E4M3}`, `FaSpec { heads, kv_heads, head_dim, kv }` | the codec enum and the spec literal; the Rust gate (gfx1201, exactly 16 / 2 / 256) stays in force and every field is required |
+| `FaGen::new(arch, spec)?` | the generator of one valid spec: an opaque value |
+| `g.plan()?`, `g.kernel_spec()` | the direct export's `RegPlan` and `KernelSpec` |
+| `g.preconvert_plan()?`, `g.preconvert_kernel_spec()` | the preconvert export's |
+| `g.lds_slots()` | `Vec<(name, base, bytes)>`, in slot-id order |
+| `g.spec()` | the `FaSpec` |
+| `fa::LOOP FILL_DONE KFILL_DONE KREADY QK QK_DONE VFILL_DONE VREADY TURN EPI END PRECONVERT_END` | the label constants (strings) |
+
+### Blocks
+
+`b` is the `Builder` of `Builder::new(g.kernel_spec(), g.plan()?)`; `g` an `FaGen`.
+
+| call | what it does |
+|---|---|
+| `fa::label(b, name)?` | place a label |
+| `fa::prologue(b, g)?` | entry block: guards (branch to `fa::END`), scalar state, query row / head, group bounds, Q fragments, online state; branches to `fa::EPI` when no tile is live |
+| `fa::tile_setup(b, g)?` | per-tile counts and the K/V tile bases (`ktile * 544` Q8_0, `ktile * 516` fp8) |
+| `fa::fill(b, g)?` | Q8_0: the joint K and V fill; the helper wave branches to `fa::FILL_DONE`. Refuses an fp8 generator |
+| `fa::fill_k(b, g)?`, `fa::fill_v(b, g)?` | fp8: the K fill, then (after the stage is retired) the V fill. Refuse a Q8_0 generator |
+| `fa::skip_if_helper(b, label)?` | the helper wave (wave 4) skips to `label` |
+| `fa::qk(b, g)?` | the QK product of the tile |
+| `fa::softmax_sub(b, g, sub)?` | one key subtile's softmax and PV, `sub` in `0..4` |
+| `fa::next_tile(b)?` | `ktile += 64` and the back edge to `fa::LOOP` while `ktile <= gmax` |
+| `fa::epilogue(b, g)?` | label `fa::EPI` through `fa::END` and `s_endpgm`: `out = O * (l > 0 ? 1/l : 0)` and the stores |
+| `fa::preconvert(b, g)?` | the whole preconvert body through `s_endpgm` |
+
+The Q8_0 tile is `tile_setup`, `fill`, label `FILL_DONE`, `[ready(0), ready(1)]`, label `QK`, `skip_if_helper(TURN)`, `qk`, four `softmax_sub`, label `TURN`, `[retire(0), retire(1)]`, `next_tile`. The fp8 tile reuses one 32-KiB stage sequentially: `fill_k`, `[ready(0)]`, `qk` (helper skips to `QK_DONE`), `[retire(0)]`, `fill_v`, `[ready(0)]`, four `softmax_sub` (helper skips to `TURN`), `[retire(0)]`, `next_tile`. `fa_prefill::emit` is written over the same blocks and is pinned to the digests recorded before they existed for both modules, every export and the three shape contracts (`peacemaker-isa/tests/fa_prefill_digests.rs`); the twins re-emit the bytes and the proof of every export (`tests/fa_prefill_twin.rs`). `pm_loop --kernel fa_prefill --rip fa_prefill.rip` times them ([cookbook 15](cookbook/15-fa-prefill-blocks.md)).
