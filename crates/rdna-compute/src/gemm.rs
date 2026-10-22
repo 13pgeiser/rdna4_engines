@@ -53690,6 +53690,96 @@ mod tests {
             gpu.free_tensor(a).expect("free a");
         }
     }
+
+    /// The fused HC-down + activation launch (`HIPFIRE_QWEN4_HC_DOWN_FUSED`) must write the
+    /// chain's packed BF16 bytes: the production split-K GEMM + reducer followed by
+    /// `hc_activation_fused_f32` with `bf16_out`, on the real 320 x 10240 shape, with a ragged
+    /// last 64-row block, NaN/inf/zero/subnormal-F16 operands and a guard region past the output.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn hc_down_fused_matches_chain_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1201");
+                return;
+            }
+        };
+        let (m, k) = (320usize, 10240usize);
+        let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // BF16 weights |w| in [2^-9, 2^-6) and F16 inputs |x| in [0.25, 1), mixed signs;
+        // some rows carry NaN / inf / +-0 / F16 subnormal inputs.
+        let w_bits: Vec<u16> = (0..m * k)
+            .map(|i| 0x3b00 | ((i * 7919 + 5) % 0x300) as u16 | if i % 3 == 0 { 0x8000 } else { 0 })
+            .collect();
+        let mut weight = gpu
+            .upload_raw(&bytes(&w_bits), &[m * k])
+            .expect("weight upload");
+        weight.dtype = DType::BF16;
+        let specials = [0x7e00u16, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x83ff];
+        for rows in [HC_DOWN_FUSED_MIN_ROWS, 4099usize] {
+            let x_bits: Vec<u16> = (0..rows * k)
+                .map(|i| {
+                    let row = i / k;
+                    if row % 37 == 5 && (i % k) % 101 == (row % 7) {
+                        specials[(i / 3) % specials.len()]
+                    } else {
+                        0x3400
+                            | ((i * 104729 + 11) % 0x0b00) as u16
+                            | if i % 5 < 2 { 0x8000 } else { 0 }
+                    }
+                })
+                .collect();
+            let mut x = gpu
+                .upload_raw(&bytes(&x_bits), &[rows * k])
+                .expect("x upload");
+            x.dtype = DType::F16;
+            let n = rows * m;
+            let fill = vec![0xABu8; (n + 4096) * 2];
+            let mut want_t = gpu
+                .upload_raw(&fill, &[n + 4096])
+                .expect("chain out upload");
+            want_t.dtype = DType::BF16;
+            let mut got_t = gpu
+                .upload_raw(&fill, &[n + 4096])
+                .expect("fused out upload");
+            got_t.dtype = DType::BF16;
+            let y = gpu.zeros(&[n], DType::F32).expect("y alloc");
+            gpu.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, m, k, rows)
+                .expect("chain GEMM");
+            crate::tensor_ops::hc_activation_fused_f32(
+                &mut gpu,
+                &crate::tensor_ops::HcActivationFused {
+                    values: &y,
+                    scale: 0.25,
+                    bf16_out: Some(&want_t),
+                },
+            )
+            .expect("chain activation");
+            assert!(gpu.qwen4_hc_down_fused_applies(m, k, rows));
+            gpu.gemm_bf16_xf16_hc_down_fused(&weight, &x, &got_t, m, k, rows, 0.25)
+                .expect("fused launch");
+            let want = gpu.download_raw_bytes(&want_t).expect("download chain");
+            let got = gpu.download_raw_bytes(&got_t).expect("download fused");
+            let differing = want[..n * 2]
+                .iter()
+                .zip(&got[..n * 2])
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "fused HC-down differs in {differing} bytes at rows={rows}"
+            );
+            assert!(
+                got[n * 2..].iter().all(|&b| b == 0xAB),
+                "fused HC-down wrote past its output at rows={rows}"
+            );
+            for t in [x, y, want_t, got_t] {
+                gpu.free_tensor(t).expect("free");
+            }
+        }
+        gpu.free_tensor(weight).expect("free weight");
+    }
     #[test]
     fn moe_route_launch_census_default_and_since() {
         let zero = MoeRouteLaunchCensus::default();
