@@ -16,6 +16,7 @@
 //! Default on for admitted steps; `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
 
 use std::cell::RefCell;
+use std::ffi::c_void;
 
 use hip_bridge::{DeviceBuffer, HipResult, KernargBlob};
 
@@ -340,6 +341,55 @@ pub fn gate(
             &mut args,
         )
     }
+}
+
+/// Whether [`gate_i8`] replaces the gate + the MQ6 out projection's A8 producer
+/// (`HIPFIRE_QWEN4_GDN_I8_FUSE`, default on for exact gfx1201): the 48 x 128 FN
+/// value geometry, whose 6144 columns are 24 whole 256-wide rotation groups of
+/// two heads, with the recurrent plane, `z` and `norm` 16-byte aligned (the kernel
+/// loads eight elements per lane). The caller has checked [`applies`] and the out
+/// projection's INT8 route ([`Gpu::gemm_mq6g256v2_i8_applies`], eager only), so no
+/// recorder or capture state is consulted here.
+pub fn gate_i8_applies(gpu: &Gpu, p: &GatedDeltaGateBatched<'_>) -> bool {
+    gpu.flags.qwen4_gdn_i8_fuse_enabled()
+        && p.rows > 0
+        && p.value_heads == 48
+        && p.value_dim == 128
+        && [p.recurrent_output, p.z, p.norm]
+            .iter()
+            .all(|t| (t.buf.as_ptr() as usize).is_multiple_of(16))
+}
+
+/// Gated RMSNorm of the packed BF16 scan output fused with the out
+/// projection's rotation and A8 quantization: one launch writes the
+/// `block_i8_128` blocks (`[K/128][rows]`, K = `value_heads * value_dim`) that
+/// `mq_rotate_x_i8_gfx12` would emit from the F32 gate output, bytewise, and
+/// nothing else (`p.output` is not written). Returns the blocks' device pointer for
+/// [`Gpu::gemm_mq6g256v2_i8_prequant`]; valid until the next A8 producer.
+pub fn gate_i8(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<*mut c_void> {
+    let k = p.value_heads * p.value_dim;
+    // The unfused producer flushes a deferred residual add before reading.
+    gpu.flush_residual_fold()?;
+    gpu.ensure_mq_signs()?;
+    let reservation = gpu.reserve_int8_mmq(k, p.rows)?;
+    let mut args = KernargBlob::new();
+    for t in [p.recurrent_output, p.z, p.norm] {
+        args.push_ptr(t.buf.as_ptr());
+    }
+    args.push_ptr(reservation.ptr());
+    args.push_ptr(gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr());
+    args.push_ptr(gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr());
+    args.push_i32(p.rows as i32);
+    launch(
+        gpu,
+        "fn_gdn_dense_gate_i8",
+        // One wave per 256-wide group, two groups per workgroup (rows * 24 is even).
+        [(p.rows * (k / 256) / 2) as u32, 1, 1],
+        64,
+        &mut args,
+    )?;
+    let prepared = crate::scratch::Int8MmqPrepared::from_reservation(reservation);
+    gpu.int8_mmq_prepared_ptr(&prepared, k, p.rows)
 }
 
 #[cfg(test)]
