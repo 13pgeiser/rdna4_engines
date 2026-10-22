@@ -912,6 +912,10 @@ pub enum DType {
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
+    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
+    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
+    // reverse); `paro_group_size` is the one place either width is read from.
     /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
     /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
     /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
@@ -1001,6 +1005,7 @@ impl DType {
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
             | DType::ParoQ4G128
+            | DType::ParoQ4G64
             | DType::Raw
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
@@ -1040,6 +1045,7 @@ impl DType {
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.
             DType::ParoQ4G128 => grouped(128, 72),
+            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -1058,6 +1064,17 @@ impl DType {
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128 => None,
+            _ => None,
+        }
+    }
+
+    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
+    /// block of its activation rotation (the two are the same in ParoQuant).
+    /// `None` for every non-Paro dtype.
+    pub fn paro_group_size(self) -> Option<usize> {
+        match self {
+            DType::ParoQ4G128 => Some(128),
+            DType::ParoQ4G64 => Some(64),
             _ => None,
         }
     }
@@ -9147,6 +9164,9 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
         assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
+        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
+        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
@@ -9477,6 +9497,62 @@ mod tests {
 
         gpu.free_tensor(t).ok();
         gpu.free_tensor(dev).ok();
+    }
+
+    /// A kernel launched past the replay recorder (a raw `hip.launch_kernel`)
+    /// inside an automatic capture window runs once but is missing from the
+    /// tape, so every replay would skip it. Prepare must refuse that tape
+    /// (sticky HIP fallback) and accept the same window without the stray
+    /// launch (HIPF-121: legacy MQ5G256 decoded garbage under Redline).
+    #[test]
+    fn retained_prepare_refuses_a_window_with_an_unrecorded_launch() {
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let a = gpu.upload_f32(&[1.0; 256], &[256]).expect("upload");
+        let b = gpu.zeros(&[256], super::DType::F32).expect("zeros");
+        for stray in [false, true] {
+            if !gpu.replay.configure_model_default(true) {
+                eprintln!("skip: an explicit replay backend disables the automatic lifecycle");
+                return;
+            }
+            gpu.replay.set_forward_eligible(true);
+            gpu.replay
+                .begin_auto_capture_if_armed()
+                .expect("begin capture");
+            assert!(gpu.replay.is_recording());
+            gpu.copy_f32_buffer(&b, &a, 256).expect("recorded copy");
+            gpu.copy_f32_buffer(&a, &b, 256).expect("recorded copy");
+            if stray {
+                let (dp, sp, n) = (b.buf.as_ptr(), a.buf.as_ptr(), 256i32);
+                let mut params: [*mut std::ffi::c_void; 3] = [
+                    &dp as *const _ as *mut _,
+                    &sp as *const _ as *mut _,
+                    &n as *const _ as *mut _,
+                ];
+                // SAFETY: the params match copy_f32_buffer(dst, src, n), loaded above.
+                unsafe {
+                    gpu.hip.launch_kernel(
+                        &gpu.functions["copy_f32_buffer"],
+                        [1, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        gpu.active_stream.as_ref(),
+                        &mut params,
+                    )
+                }
+                .expect("stray launch");
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            gpu.replay.finish_capture().expect("finish capture");
+            let prepared = gpu.replay.prepare_pm4_prefix(gpu.device_id as usize, 2);
+            let refused = prepared
+                .as_ref()
+                .is_err_and(|reason| reason.contains("unrecorded launch"));
+            assert_eq!(refused, stray, "{prepared:?}");
+        }
+        gpu.replay.configure_model_default(false);
     }
 
     /// The row-chunked requant (and its reordered ranges) packs every row

@@ -924,10 +924,22 @@ impl ArmSet {
         let head = format!("match {scrutinee} {{");
         let m = body
             .iter()
-            .position(|l| l.trim() == head && l.len() - l.trim_start().len() == fn_indent + 4)
+            .position(|l| {
+                let trimmed = l.trim();
+                (trimmed == head || trimmed.strip_prefix("Ok(") == Some(head.as_str()))
+                    && l.len() - l.trim_start().len() == fn_indent + 4
+            })
             .unwrap_or_else(|| panic!("{label}: no `{head}` at the fn-body indent"));
         let arm_indent = fn_indent + 8;
-        let match_close = format!("{}}}", " ".repeat(fn_indent + 4));
+        let match_close = format!(
+            "{}{}",
+            " ".repeat(fn_indent + 4),
+            if body[m].trim_start().starts_with("Ok(") {
+                "})"
+            } else {
+                "}"
+            }
+        );
         let end = (m + 1..body.len())
             .find(|&i| body[i] == match_close)
             .unwrap_or(body.len());
@@ -991,8 +1003,8 @@ fn arm_failure(admitted_by: &str, name: &str, dispatch: &ArmSet) -> String {
 ///
 /// 1. `for_gemv(dtype, Plain)`            -> `launch` key arms (families/gemv.rs)
 /// 2. `for_gemv_prerotated(dtype)`        -> `launch` key arms
-/// 3. `for_gemv_residual(dtype)`          -> `dispatch_residual` dtype arms
-/// 4. `for_gemv_swiglu_residual(dtype)`   -> `dispatch_swiglu_residual` dtype arms
+/// 3. `for_gemv_residual(dtype)`          -> shared `residual_kernel` dtype arms
+/// 4. `for_gemv_swiglu_residual(dtype)`   -> shared `residual_kernel` dtype arms
 /// 5. GemvFamily registry (tables/gemv_table.rs `register_*`) -> `launch` key arms
 ///    (residual/swiglu keys are covered by 3/4; `GemvMfp4G32Fused` by `run`)
 /// 6. FusedQkvFamily registry (tables/fused_qkv_table.rs) -> `dispatch_fused_qkv`
@@ -1030,18 +1042,34 @@ fn every_admitted_dtype_or_key_has_a_dispatch_arm() {
         "key",
         35,
     );
+    // Beta uses one dtype table for both residual variants. Pin the forwarding
+    // edges as well as the table, so a wrapper cannot bypass the checked arms.
+    for sig in ["fn dispatch_residual(", "fn dispatch_swiglu_residual("] {
+        assert!(
+            item_lines(gemv_src, sig, "}")
+                .iter()
+                .any(|line| line.trim_start().starts_with("launch_residual(")),
+            "{sig} no longer forwards to the shared residual launcher"
+        );
+    }
+    assert!(
+        item_lines(gemv_src, "fn launch_residual(", "}")
+            .iter()
+            .any(|line| line.trim() == "match residual_kernel(w.dtype, variant)? {"),
+        "the shared residual launcher no longer consumes the checked dtype table"
+    );
     let residual = ArmSet::parse(
-        "families/gemv.rs::dispatch_residual",
+        "families/gemv.rs::residual_kernel (residual)",
         gemv_src,
-        "fn dispatch_residual(",
-        "w.dtype",
+        "fn residual_kernel(",
+        "dtype",
         15,
     );
     let swiglu = ArmSet::parse(
-        "families/gemv.rs::dispatch_swiglu_residual",
+        "families/gemv.rs::residual_kernel (swiglu_residual)",
         gemv_src,
-        "fn dispatch_swiglu_residual(",
-        "w.dtype",
+        "fn residual_kernel(",
+        "dtype",
         15,
     );
     let fused = ArmSet::parse(
