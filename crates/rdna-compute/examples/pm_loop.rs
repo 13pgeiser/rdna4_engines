@@ -9,7 +9,7 @@
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
-//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, qwen4_moe_sym down entries)
+//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, qwen4_moe_sym)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -235,7 +235,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         )
     {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm or qwen4_moe_sym (down entries): only iu4_gemm, mq6_i8_gemm, fp8_gemm and the qwen4_moe_sym down blocks are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm or qwen4_moe_sym: only iu4_gemm, mq6_i8_gemm, fp8_gemm and qwen4_moe_sym are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -904,7 +904,7 @@ mod tests {
         assert!(parse_args(args("--kernel iu4_gemm")).unwrap().rip.is_none());
         let e = parse_args(args("--kernel nope --rip /tmp/a.rip")).unwrap_err();
         assert!(e.contains("only iu4_gemm"), "{e}");
-        // qwen4_moe_sym takes --rip (down entries; the entry check is the workload's).
+        // qwen4_moe_sym takes --rip (every MQ4 entry; the entry check is the workload's).
         let o = parse_args(args(
             "--kernel qwen4_moe_sym --rip /tmp/a.rip --epi down_gp_nt4",
         ))
