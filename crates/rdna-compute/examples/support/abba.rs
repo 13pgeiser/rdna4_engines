@@ -143,14 +143,14 @@ fn min_max(v: &[f64]) -> (f64, f64) {
     )
 }
 
-/// Exact two-sided sign-test p-value of `k` "candidate faster" rounds out of
-/// `n` under the null that either arm is equally likely to win a round.
-pub fn sign_test_p(k: usize, n: usize) -> f64 {
-    if n == 0 {
+/// Two-sided sign-test p-value of a `majority` count out of `n` rounds where
+/// every round that is not in the majority (the other sign AND ties) counts
+/// against: `min(1, 2 * P(X <= n - majority))`, X ~ Binomial(n, 1/2).
+pub fn majority_sign_p(majority: usize, n: usize) -> f64 {
+    if n == 0 || majority > n {
         return 1.0;
     }
-    let tail = k.min(n - k);
-    // P(X <= tail), X ~ Binomial(n, 1/2), built from C(n, i) / 2^n iteratively in f64.
+    let tail = n - majority;
     let mut term = 0.5f64.powi(n as i32);
     let mut sum = term;
     for i in 0..tail {
@@ -160,28 +160,39 @@ pub fn sign_test_p(k: usize, n: usize) -> f64 {
     (2.0 * sum).min(1.0)
 }
 
+/// `separable` of [`block_rule`]: the sign-test p must be at most this.
+pub const PAIRED_P_MAX: f64 = 1e-3;
+
 /// Outcome of [`block_rule`]. Ratios are candidate / baseline.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockRule {
-    /// Every candidate block median is below every baseline block median, or
-    /// every one is above.
+    /// PRIMARY rule: exact two-sided sign test over the per-round paired
+    /// ratios (each ABBA round compares the candidate's and the baseline's
+    /// block medians of that same round) has `sign_p <= PAIRED_P_MAX`; ties
+    /// count against it.
     pub separable: bool,
+    /// `"faster"` / `"slower"` from the majority sign of the rounds, `"tie"`
+    /// when the signs are equal in number.
+    pub direction: &'static str,
+    pub sign_p: f64,
+    pub rounds_faster: usize,
+    pub rounds_slower: usize,
+    pub rounds_tied: usize,
+    /// Every candidate block median is below every baseline block median, or
+    /// every one is above (secondary rule; between-block clock drift defeats it).
+    pub block_disjoint: bool,
     /// `median(candidate block medians) / median(baseline block medians)`.
     pub block_ratio: f64,
-    /// Per ABBA round, the candidate round median over the baseline round
-    /// median (a round is the 2n launches each arm ran in one ABBA cycle);
-    /// min and max over rounds.
+    /// Per ABBA round, the mean of the candidate's two block medians over the
+    /// mean of the baseline's; min and max over rounds.
     pub round_ratio_min: f64,
     pub round_ratio_max: f64,
-    /// Rounds in which the candidate round median beat the baseline's (ratio < 1).
-    /// Informational only: it does not enter `separable`.
-    pub rounds_candidate_faster: usize,
     pub baseline_block_medians: Vec<f64>,
     pub candidate_block_medians: Vec<f64>,
 }
 
-/// Block-median separability of two arms' samples (nanoseconds) taken with
-/// `n`-launch ABBA blocks: whole rounds only (`2n` samples per arm per round).
+/// Separability of two arms' samples (nanoseconds) taken with `n`-launch ABBA
+/// blocks: whole rounds only (`2n` samples per arm per round, two blocks each).
 pub fn block_rule(base: &[f64], cand: &[f64], n: usize) -> Result<BlockRule> {
     if base.len() != cand.len() || base.len() % (2 * n.max(1)) != 0 {
         return Err("block rule needs equal whole ABBA rounds of both arms".into());
@@ -191,17 +202,31 @@ pub fn block_rule(base: &[f64], cand: &[f64], n: usize) -> Result<BlockRule> {
     let med = |v: &[f64]| timing_stats(v).map(|s| s.median);
     let (lo, hi) = min_max(&bm);
     let (clo, chi) = min_max(&cm);
-    let separable = chi < lo || clo > hi;
-    let mut rr = Vec::new();
-    for (b, c) in base.chunks_exact(2 * n).zip(cand.chunks_exact(2 * n)) {
-        rr.push(med(c)? / med(b)?);
+    let block_disjoint = chi < lo || clo > hi;
+    let mut rr = Vec::with_capacity(bm.len() / 2);
+    for (b, c) in bm.chunks_exact(2).zip(cm.chunks_exact(2)) {
+        rr.push((c[0] + c[1]) / (b[0] + b[1]));
     }
+    let faster = rr.iter().filter(|r| **r < 1.0).count();
+    let slower = rr.iter().filter(|r| **r > 1.0).count();
+    let tied = rr.len() - faster - slower;
+    let majority = faster.max(slower);
+    let sign_p = majority_sign_p(majority, rr.len());
     Ok(BlockRule {
-        separable,
+        separable: sign_p <= PAIRED_P_MAX,
+        direction: match faster.cmp(&slower) {
+            std::cmp::Ordering::Greater => "faster",
+            std::cmp::Ordering::Less => "slower",
+            std::cmp::Ordering::Equal => "tie",
+        },
+        sign_p,
+        rounds_faster: faster,
+        rounds_slower: slower,
+        rounds_tied: tied,
+        block_disjoint,
         block_ratio: med(&cm)? / med(&bm)?,
         round_ratio_min: min_max(&rr).0,
         round_ratio_max: min_max(&rr).1,
-        rounds_candidate_faster: rr.iter().filter(|r| **r < 1.0).count(),
         baseline_block_medians: bm,
         candidate_block_medians: cm,
     })
@@ -322,38 +347,127 @@ mod tests {
         assert!(block_medians(&[], 1).is_err());
     }
 
+    /// Samples of `n`-launch blocks, one `[baseline, candidate]` value pair per
+    /// block in ABBA order: blocks A B B A of each round give the baseline
+    /// blocks 0 and 3 and the candidate blocks 1 and 2.
+    fn arms(n: usize, rounds: &[[f64; 4]]) -> (Vec<f64>, Vec<f64>) {
+        let (mut base, mut cand) = (Vec::new(), Vec::new());
+        for r in rounds {
+            base.extend(std::iter::repeat(r[0]).take(n));
+            cand.extend(std::iter::repeat(r[1]).take(n));
+            cand.extend(std::iter::repeat(r[2]).take(n));
+            base.extend(std::iter::repeat(r[3]).take(n));
+        }
+        (base, cand)
+    }
+
     /// One 7 ms hiccup among ~300 us samples: the legacy full-range rule is
-    /// vetoed, the block-median rule is not.
+    /// vetoed, the paired-round rule is not.
     #[test]
-    fn block_rule_survives_one_outlier_legacy_rule_does_not() {
+    fn one_hiccup_does_not_flip_the_paired_rule() {
         let n = 4;
-        let mut base: Vec<f64> = (0..16).map(|i| 300.0 + f64::from(i % 3)).collect();
-        let cand: Vec<f64> = (0..16).map(|i| 290.0 + f64::from(i % 3)).collect();
+        let mut base: Vec<f64> = (0..8 * 12).map(|i| 300.0 + f64::from(i % 3)).collect();
+        let cand: Vec<f64> = (0..8 * 12).map(|i| 290.0 + f64::from(i % 3)).collect();
         base[5] = 7003.0;
         let r = block_rule(&base, &cand, n).unwrap();
         assert!(r.separable, "{r:?}");
-        assert!(r.block_ratio < 1.0 && r.round_ratio_max < 1.0);
+        assert_eq!(r.direction, "faster");
+        assert_eq!(
+            (r.rounds_faster, r.rounds_slower, r.rounds_tied),
+            (12, 0, 0)
+        );
+        assert!(r.sign_p <= PAIRED_P_MAX && r.block_ratio < 1.0 && r.round_ratio_max < 1.0);
         let (a, b) = (timing_stats(&base).unwrap(), timing_stats(&cand).unwrap());
         assert!(!timing_relation(&a, &b).3, "legacy rule sees the hiccup");
+        // ... and a hiccup in a candidate block does not flip it either.
+        let mut slow = cand.clone();
+        slow[2] = 9000.0;
+        let r = block_rule(&base, &slow, n).unwrap();
+        assert!(r.separable && r.direction == "faster", "{r:?}");
+    }
+
+    /// Between-round clock drift (+-8%) larger than the effect (3%): the
+    /// block-disjoint rule fails, the within-round pairing sees every round.
+    #[test]
+    fn drift_defeats_block_disjoint_but_not_the_paired_rule() {
+        let rounds: Vec<[f64; 4]> = (0..16)
+            .map(|r| {
+                let drift = 1.0 + 0.08 * if r % 2 == 0 { 1.0 } else { -1.0 };
+                [300.0 * drift, 291.0 * drift, 291.0 * drift, 300.0 * drift]
+            })
+            .collect();
+        let (base, cand) = arms(3, &rounds);
+        let r = block_rule(&base, &cand, 3).unwrap();
+        assert!(!r.block_disjoint);
+        assert!(r.separable && r.direction == "faster", "{r:?}");
+        assert!(
+            (r.round_ratio_min - 0.97).abs() < 1e-12 && (r.round_ratio_max - 0.97).abs() < 1e-12
+        );
     }
 
     #[test]
-    fn block_rule_needs_every_block_on_one_side() {
+    fn slower_candidate_reports_slower() {
+        let rounds = vec![[100.0, 120.0, 118.0, 101.0]; 12];
+        let (base, cand) = arms(2, &rounds);
+        let r = block_rule(&base, &cand, 2).unwrap();
+        assert!(
+            r.separable && r.direction == "slower" && r.block_disjoint,
+            "{r:?}"
+        );
+        assert_eq!(r.rounds_slower, 12);
+    }
+
+    /// Dense-vs-dense control: equal arms tie every round, and arms that win
+    /// alternate rounds split the signs; neither is ever separable.
+    #[test]
+    fn controls_stay_non_separable() {
+        let (base, cand) = arms(2, &vec![[100.0, 100.0, 100.0, 100.0]; 64]);
+        let r = block_rule(&base, &cand, 2).unwrap();
+        assert!(!r.separable && !r.block_disjoint);
+        assert_eq!((r.rounds_tied, r.direction, r.sign_p), (64, "tie", 1.0));
+        let rounds: Vec<[f64; 4]> = (0..64)
+            .map(|r| {
+                let c = if r % 2 == 0 { 99.0 } else { 101.0 };
+                [100.0, c, c, 100.0]
+            })
+            .collect();
+        let (base, cand) = arms(2, &rounds);
+        let r = block_rule(&base, &cand, 2).unwrap();
+        assert!(!r.separable, "{r:?}");
+        assert_eq!((r.rounds_faster, r.rounds_slower), (32, 32));
+        assert_eq!(r.sign_p, 1.0);
+    }
+
+    /// Ties count against separability: needs 11 clean rounds, and a tie
+    /// among 12 faster-or-tied rounds costs it.
+    #[test]
+    fn ties_count_against_and_eleven_rounds_is_the_minimum() {
+        let faster = [100.0, 99.0, 99.0, 100.0];
+        let tie = [100.0; 4];
+        for (rounds, want) in [(10, false), (11, true), (12, true)] {
+            let (b, c) = arms(1, &vec![faster; rounds]);
+            assert_eq!(block_rule(&b, &c, 1).unwrap().separable, want, "{rounds}");
+        }
+        let mut mixed = vec![faster; 11];
+        mixed.push(tie);
+        let (b, c) = arms(1, &mixed);
+        let r = block_rule(&b, &c, 1).unwrap();
+        assert_eq!((r.rounds_faster, r.rounds_tied), (11, 1));
+        assert!(!r.separable && r.sign_p > PAIRED_P_MAX, "{r:?}");
+    }
+
+    #[test]
+    fn block_disjoint_rule_is_kept_and_strict() {
         let n = 2;
-        // Candidate blocks (rounds 1: B B = 2 blocks) 100/110 vs baseline blocks 105/115: overlap.
-        let base = [105.0, 105.0, 115.0, 115.0];
-        let cand = [100.0, 100.0, 110.0, 110.0];
+        let (base, cand) = arms(n, &[[105.0, 100.0, 100.0, 115.0]]);
+        // candidate blocks 100/100 vs baseline blocks 105/115: disjoint.
+        assert!(block_rule(&base, &cand, n).unwrap().block_disjoint);
+        let (base, cand) = arms(n, &[[105.0, 100.0, 110.0, 115.0]]);
         let r = block_rule(&base, &cand, n).unwrap();
-        assert!(!r.separable);
+        assert!(!r.block_disjoint);
         assert_eq!(r.baseline_block_medians, vec![105.0, 115.0]);
         assert_eq!(r.candidate_block_medians, vec![100.0, 110.0]);
         assert!((r.block_ratio - 105.0 / 110.0).abs() < 1e-12);
-        // Strictly above every baseline block: separable (slower candidate).
-        let slow = [200.0, 200.0, 210.0, 210.0];
-        let r = block_rule(&base, &slow, n).unwrap();
-        assert!(r.separable && r.round_ratio_min > 1.0);
-        // Equal arms are never separable (strict inequality).
-        assert!(!block_rule(&base, &base, n).unwrap().separable);
     }
 
     #[test]
@@ -364,28 +478,27 @@ mod tests {
 
     #[test]
     fn round_ratios_are_paired_per_round() {
-        let n = 1;
-        // round 1: base 10,10 cand 5,5 -> 0.5; round 2: base 10,10 cand 20,20 -> 2.0
-        let base = [10.0, 10.0, 10.0, 10.0];
-        let cand = [5.0, 5.0, 20.0, 20.0];
-        let r = block_rule(&base, &cand, n).unwrap();
+        // round 1: cand blocks (5, 5) over base (10, 10) -> 0.5; round 2: 20s -> 2.0.
+        let (base, cand) = arms(1, &[[10.0, 5.0, 5.0, 10.0], [10.0, 20.0, 20.0, 10.0]]);
+        let r = block_rule(&base, &cand, 1).unwrap();
         assert_eq!((r.round_ratio_min, r.round_ratio_max), (0.5, 2.0));
-        assert_eq!(r.rounds_candidate_faster, 1);
+        assert_eq!((r.rounds_faster, r.rounds_slower), (1, 1));
         assert!(!r.separable);
     }
 
     #[test]
-    fn sign_test_matches_exact_binomial() {
-        assert_eq!(sign_test_p(0, 0), 1.0);
-        assert_eq!(sign_test_p(3, 6), 1.0);
+    fn majority_sign_p_matches_exact_binomial() {
+        assert_eq!(majority_sign_p(0, 0), 1.0);
+        assert_eq!(majority_sign_p(3, 6), 1.0);
         // 6/6: 2 * (1/64).
-        assert!((sign_test_p(6, 6) - 2.0 / 64.0).abs() < 1e-15);
-        assert!((sign_test_p(0, 6) - 2.0 / 64.0).abs() < 1e-15);
-        // 1/6 or 5/6: 2 * (1 + 6) / 64.
-        assert!((sign_test_p(5, 6) - 14.0 / 64.0).abs() < 1e-15);
-        assert!((sign_test_p(1, 6) - 14.0 / 64.0).abs() < 1e-15);
-        assert!(sign_test_p(63, 64) < 1e-15);
-        assert!(sign_test_p(34, 64) > 0.5);
+        assert!((majority_sign_p(6, 6) - 2.0 / 64.0).abs() < 1e-15);
+        // 5/6: 2 * (1 + 6) / 64.
+        assert!((majority_sign_p(5, 6) - 14.0 / 64.0).abs() < 1e-15);
+        assert!(majority_sign_p(64, 64) < 1e-18);
+        assert!(majority_sign_p(34, 64) > 0.5);
+        // A majority below n/2 (ties dominating) is never evidence.
+        assert_eq!(majority_sign_p(2, 10), 1.0);
+        assert!(majority_sign_p(11, 11) <= PAIRED_P_MAX && majority_sign_p(10, 10) > PAIRED_P_MAX);
     }
 
     #[test]
