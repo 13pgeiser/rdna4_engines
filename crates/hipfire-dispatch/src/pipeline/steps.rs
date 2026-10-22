@@ -53,6 +53,10 @@ pub enum Step<'a> {
         k: usize,
         eps: f32,
         rotation: RotationPlan, // FwhtG256 for MQ dtypes, None for HFQ4/others
+        /// Row-major rows of width `k`. `1` is the single-row route (the
+        /// fusion table's producer); more rows take the batched kernels and
+        /// are a fusion barrier. A row norm is row-complete, never head-split.
+        rows: usize,
     },
     /// Paired KV-write + flash-attention (Phase 0.3). Consumes a KvTierPlan
     /// (derived once per attention step) and AttnParams (tensor borrows).
@@ -120,6 +124,9 @@ pub enum Step<'a> {
     /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC
     /// read/write pairing or epilogue fold crosses it.
     GatedMlp(crate::pipeline::gated_mlp::GatedMlpOp<'a>),
+    /// Glimmer's MLP sublayer on the sandwich stream (pre-norm or sandwich
+    /// norms, SwiGLU, steps/rows ladders).
+    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
     /// Sandwich-norm attention sublayer.
     SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
     /// Parallel dense + routed-expert MLP sublayer.
@@ -151,7 +158,8 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
     match step {
         Step::Gemv { .. } => Some(PipelineOp::Gemv),
         Step::GemvResidual { .. } => Some(PipelineOp::GemvResidual),
-        Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { rows: 1, .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { .. } => None,
         Step::Attend { .. } => Some(PipelineOp::Attend),
         Step::Rope { .. } => Some(PipelineOp::Rope),
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
@@ -170,6 +178,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
         | Step::GatedMlp(_)
+        | Step::SandwichMlp(_)
         | Step::MoeStage(..)
         | Step::SandwichAttention(_)
         | Step::ParallelMoeMlp(_)
@@ -803,7 +812,23 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
             Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
+            // One row keeps the single-row route's contract (`x` may be a wider
+            // buffer whose shape the kernel reads); a batch must hold its rows.
+            Step::RmsnormAutomatic {
+                x, out, k, rows, ..
+            } if *rows != 1 => {
+                let need = rows * k;
+                if *rows == 0 || x.numel() < need || out.numel() < need {
+                    return Err(DispatchError::Hip(format!(
+                        "rmsnorm: {rows} rows of {k} need {need} elements, x has {}, out {}",
+                        x.numel(),
+                        out.numel()
+                    )));
+                }
+            }
             _ => {}
         }
     }
@@ -831,7 +856,11 @@ pub trait MoeStepHooks {
     /// At the top of the interpreter's loop, before `step` is dispatched by
     /// whatever route takes it (fused, CPU or plain): every earlier step has
     /// run, `step` has not. A step consumed inside an earlier step's fused
-    /// launch is never announced. Default: nothing (no fusion changes).
+    /// launch is never announced, except the members of a multi-lane GDN Core
+    /// group (fn-lanes): each is announced exactly once, in program order,
+    /// right before the group's launches (its members write only per-lane
+    /// scratch, so the state seen is the one sequential dispatch would show).
+    /// Default: nothing (no fusion changes).
     fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
         Ok(())
     }
@@ -939,6 +968,41 @@ fn execute_window<'a>(
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < end {
+        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
+        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // group's steps are announced here, once each in program order, after
+        // every refusal check and before the grouped launch; a refused group
+        // announced nothing and each step is announced by the plain path below.
+        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+            && !cpu_exec::cpu_exec_enabled()
+        {
+            let ops: Vec<_> = steps[i..end]
+                .iter()
+                .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
+                .map_while(|s| match s {
+                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
+                        Some(op)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let group = ops.len();
+            if group >= 2
+                && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(
+                    gpu,
+                    &ops,
+                    |gpu| {
+                        for step in &steps[i..i + group] {
+                            hooks.before_step(gpu, step)?;
+                        }
+                        Ok(())
+                    },
+                )?
+            {
+                i += group;
+                continue;
+            }
+        }
         hooks.before_step(gpu, &steps[i])?;
         if hc_fuse {
             use crate::pipeline::layer_ops::{
@@ -1638,8 +1702,16 @@ pub(crate) fn launch_op_rows(
             k,
             eps,
             rotation,
+            rows,
         } => {
-            if *rotation == RotationPlan::None {
+            if *rows > 1 && *rotation == RotationPlan::None {
+                gpu.rmsnorm_batched(x, norm_weight, out, *rows, *k, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else if *rows > 1 && *rotation == RotationPlan::Mq8Internal {
+                Err(DispatchError::Hip(
+                    "rmsnorm: MQ8 internal rotation is single-row only".into(),
+                ))
+            } else if *rotation == RotationPlan::None {
                 // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
                 // x_plain is not written in this path (scratch only for FWHT path).
                 gpu.rmsnorm_f32(x, norm_weight, out, *eps)
@@ -1669,7 +1741,7 @@ pub(crate) fn launch_op_rows(
                             awq_scale: *awq_scale,
                             k: *k,
                             eps: *eps,
-                            batch_size: 1,
+                            batch_size: *rows,
                             variant: RotationVariant::WithRmsnorm,
                             givens_pairs: None,
                             givens_theta: None,
@@ -1727,6 +1799,7 @@ pub(crate) fn launch_op_rows(
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
         Step::GatedMlp(op) => crate::pipeline::gated_mlp::execute_gated_mlp(gpu, ctx, op),
+        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
         Step::SandwichAttention(op) => {
@@ -2266,6 +2339,7 @@ mod tests {
                     k: 128,
                     eps: 1e-6,
                     rotation: RotationPlan::None,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &w,
@@ -2427,6 +2501,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2457,6 +2532,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2482,6 +2558,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,

@@ -1342,6 +1342,63 @@ for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN4_DEV_ARTIFACT=<tiny-dense-
   <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
 ```
 
+The second use is Qwen3.5/3.6/3.8 dense prefill and decode (`qwen35::mesh_tp`,
+#927 item 4), with the hand dense-TP route's work split. Each rank holds an
+even contiguous block of the query, KV, DeltaNet key and value heads and of
+the FFN intermediate (`tp_rank_layouts`, loaded through
+`load_weights_dense_tp_rank`; uneven TP3/TP5 layouts are refused). Each
+layer's mixer (`SplitRule::HeadMixer`: whole input, head-split input
+projections and state, `RowShard { axis: 1 }` output projection) and its
+`GatedMlp` each write the rank's partial, and the residual `Accumulate` after
+each becomes one rank-ordered `AllReduceAdd` into `x`: two reductions per
+layer, as in the hand route. A decode epoch is one token; a prefill epoch is
+up to the rank's batch-scratch rows (the provisioned `max_bytes` must hold
+`rows * dim * 4`). `Qwen35TpBindings` is checked against the plan of exactly
+its shards (ranks come only from `Qwen35TpRank::load`, which loads each
+rank's slice with the layout it records); a prefill past the batch scratch,
+sessions, checkpoints and prefix repair are refused before any launch.
+Prefix repair is refused through the host-only
+`MeshStepBindings::admits_prefix_repair` capability, checked before the
+first callback, so the mesh stays healthy. The loader has no generic
+Qwen3.5 TP route; product dense TP stays on the hand route (see
+`docs/design/qwen35-declarative-program.md`, "What stays on the hand route").
+Oracle (`HIPFIRE_QWEN35_TP_ROWS` prompt rows, default 16, as prefill epochs
+of at most `HIPFIRE_QWEN35_TP_CHUNK` rows, default 16; then 16 tokens
+teacher-forced to the plain card's greedy tokens, the first and the ninth as
+1-row Prefill epochs; byte identity against the hand dense-TP route over the
+same shards and epochs, reported against the plain card). The 1-row rows are
+`ROWS=1025 CHUNK=64` and `ROWS=577 CHUNK=96`, which end the prompt in a
+1-row epoch:
+
+```sh
+cargo test --release -p hipfire-arch-qwen35 --lib --no-run
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN35_TP_MODEL=<dense .mq4> \
+  <binary> qwen35::mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
+```
+
+Physical TP2 runbook (gfx1201, e.g. hiptrx; not runnable on a one-card box).
+Fixtures: `qwen3.5-9b.mq4` (sha256 `ba83acf5…28ad`, 5313750016 B) and
+`qwen3.8-27b.mq4-xt` (`9f91556f…eeb7`, 14980361216 B). Without
+`HIPFIRE_EMULATE_GPUS`, the rank count comes from `HIPFIRE_QWEN35_TP_PARTS`
+and rank `i` runs on visible device `i` for both the hand route and the
+generic route; the plain card runs on device 0.
+
+```sh
+for model in qwen3.5-9b.mq4 qwen3.8-27b.mq4-xt; do
+  HIP_VISIBLE_DEVICES=0,1 HIPFIRE_QWEN35_TP_PARTS=2 HIPFIRE_QWEN35_TP_MODEL=<models>/$model \
+    <binary> qwen35::mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+done
+```
+
+Pass: each `TP2 <model>` line shows the hand and TP FNV-64 equal (the test
+asserts it) on the transport `provision_mesh_edges` chose (Peer on
+peer-qualified cards, else Host). The hand route reduces through its own
+peer-rooted or host-staged route; a mismatch here that the emulated arm does
+not show localizes to the two transports. Record per model the two `TP2` lines, the
+binary MD5, `HIP_VISIBLE_DEVICES`, the ROCm version and, from the gfx1201
+emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card), the same lines for a
+same-box reference. Repeat with `0,1,2,3` and `HIPFIRE_QWEN35_TP_PARTS=4`.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).

@@ -20,10 +20,12 @@ use super::layer_ops::{
     view,
 };
 use super::sandwich::{
-    calibrating, fused_projection, gemm_rows, gemv, hip, q8_fused_prefill, rms_norm, SandwichStream,
+    calibrating, fused_projection, gemm_rows_wide, gemv, hip, q8_fused_prefill, rms_norm,
+    SandwichRoute, SandwichStream,
 };
 use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
+use crate::pipeline::RowsRoute;
 use crate::types::{DispatchError, KernelKey};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -365,9 +367,18 @@ fn sandwich_wide(
                 rows,
                 hidden,
                 eps,
+                post_eps: eps,
                 x: op.x,
                 residual,
                 normed: norm.normed,
+                out: None,
+                route: if rows == 1 {
+                    RowsRoute::Decode
+                } else {
+                    RowsRoute::Prefill
+                },
+                kernels: SandwichRoute::Wide,
+                bf16: None,
             };
             stream.save_residual(gpu)?;
             (out, Some((stream, post_norm)))
@@ -386,8 +397,8 @@ fn sandwich_wide(
                 rows,
             )?;
         } else {
-            gemm_rows(gpu, ctx, &op.gate, norm.normed, sc.gate, sc.x_rot, rows)?;
-            gemm_rows(gpu, ctx, &op.up, norm.normed, sc.up, sc.x_rot, rows)?;
+            gemm_rows_wide(gpu, ctx, &op.gate, norm.normed, sc.gate, sc.x_rot, rows)?;
+            gemm_rows_wide(gpu, ctx, &op.up, norm.normed, sc.up, sc.x_rot, rows)?;
         }
     } else if op.gate.dtype == DType::MQ4G256 && op.up.dtype == DType::MQ4G256 && !calibrating(gpu)
     {
@@ -415,10 +426,10 @@ fn sandwich_wide(
     if rows == 1 {
         gemv(gpu, ctx, &op.down, sc.act, out)?;
     } else {
-        gemm_rows(gpu, ctx, &op.down, sc.act, out, sc.x_rot, rows)?;
+        gemm_rows_wide(gpu, ctx, &op.down, sc.act, out, sc.x_rot, rows)?;
     }
     match post {
-        Some((stream, post_norm)) => stream.post_norm_residual(gpu, out, post_norm),
+        Some((stream, post_norm)) => stream.post_norm_residual(gpu, out, Some(post_norm)),
         None => Ok(()),
     }
 }

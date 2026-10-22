@@ -22,10 +22,11 @@ use hipfire_dispatch::pipeline::gated_mlp::{
     Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage, RmsNorm,
 };
 use hipfire_dispatch::pipeline::sandwich::{
-    KvProjection, ParallelMoeMlpOp, PerLayerInputOp, Rope, RopeKind, RoutedExperts, RoutedScratch,
-    SandwichAttentionOp, SandwichKv, SandwichStream, ScaleOp, SoftcapOp,
+    KvProjection, KvRoute, ParallelMoeMlpOp, PerLayerInputOp, Rope, RopeKind, RoutedExperts,
+    RoutedScratch, SandwichAttentionOp, SandwichKv, SandwichRoute, SandwichStream, ScaleOp,
+    SoftcapOp,
 };
-use hipfire_dispatch::pipeline::{GemvInput, Step};
+use hipfire_dispatch::pipeline::{GemvInput, RowsRoute, Step};
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_runtime::llama::{KvCache, KvCacheExt, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -533,9 +534,20 @@ impl<'a> ProgramBinding<'a> {
             rows: self.rows,
             hidden: self.geo.dim,
             eps: self.geo.eps,
+            post_eps: self.geo.eps,
             x: self.scratch.x,
             residual: self.scratch.residual,
             normed: self.scratch.normed,
+            out: None,
+            // One row decodes. A batch (prefill or verify share one body)
+            // takes the Wide ladder, which does not tell the two apart.
+            route: if self.rows == 1 {
+                RowsRoute::Decode
+            } else {
+                RowsRoute::Prefill
+            },
+            kernels: SandwichRoute::Wide,
+            bf16: None,
         }
     }
 
@@ -574,24 +586,27 @@ impl<'a> ProgramBinding<'a> {
             q_scale: (attn.head_dim as f32).sqrt(),
             rope: attn.rope,
             kv: SandwichKv {
-                tier: kv.tier_inputs(),
                 k_cache: &kv.k_gpu[kv_slot.slot],
                 v_cache: &kv.v_gpu[kv_slot.slot],
                 physical_cap: kv.physical_cap,
-                givens_cos: kv.givens_cos.as_ref(),
-                givens_sin: kv.givens_sin.as_ref(),
                 window: attn.window,
+                route: KvRoute::Tier {
+                    tier: kv.tier_inputs(),
+                    givens_cos: kv.givens_cos.as_ref(),
+                    givens_sin: kv.givens_sin.as_ref(),
+                    flash_partials: r.flash_partials,
+                },
             },
             pos_buf: r.pos_buf,
             positions: self.positions,
+            gate: None,
             wo: w.o.dispatch_ref(),
-            post_norm: w.post_attn_norm,
+            post_norm: Some(w.post_attn_norm),
             x_rot: sc.attn_rot,
             q: sc.q,
             k: sc.k,
             v: sc.v,
             attn_out: sc.attn_out,
-            flash_partials: r.flash_partials,
         }));
         let mlp = |output| GatedMlpOp {
             rows: self.rows,
@@ -723,6 +738,7 @@ pub(crate) fn head<'a>(
         k: geo.dim,
         eps: geo.eps,
         rotation: RotationPlan::None,
+        rows: 1,
     });
     steps.push(Step::Gemv {
         w: lm_head,

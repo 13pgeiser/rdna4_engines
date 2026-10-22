@@ -97,6 +97,9 @@ pub enum OpKind {
     DeltaNetMixer = 29,
     /// [`Step::GatedAttention`] (hybrid decoder full attention).
     GatedAttention = 30,
+    /// [`Step::SandwichMlp`] (#666 G11, Glimmer's pre-norm / sandwich MLP).
+    /// Appended: `20` stays retired.
+    SandwichMlp = 31,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -139,6 +142,7 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::DeltaNetMixer(..) => OpKind::DeltaNetMixer,
         #[cfg(feature = "deltanet")]
         Step::GatedAttention(..) => OpKind::GatedAttention,
+        Step::SandwichMlp(..) => OpKind::SandwichMlp,
         Step::SiluMul { .. } => OpKind::SiluMul,
     }
 }
@@ -262,6 +266,29 @@ pub enum SplitRule {
         /// The kernel ladder the op runs; only a shard-safe ladder may split.
         ladder: MlpLadder,
     },
+    /// Head-parallel mixer (gated attention, gated DeltaNet): the op norms
+    /// `input`, projects it per head, mixes each head against its own state
+    /// (KV cache, recurrent and conv state) and projects the heads back with
+    /// `out_proj`. `input` must be Whole (the pre-norm needs complete rows).
+    /// The op's other weight reads are its per-head input projections; with
+    /// those head-split (`HeadSharded`, `FusedQkv`, `ColumnShard { axis: 0 }`)
+    /// and `out_proj` `RowShard { axis: 1 }` over the same heads, every rank
+    /// mixes `heads / parts` heads (`kv_heads / parts` KV or key heads) and
+    /// `output` is a Partial, reduced by its consumer as `GatedMlp`'s is.
+    /// State operands take the head layout. All-`Replicate` weights, or a
+    /// single TP part, keep the op whole and local.
+    HeadMixer {
+        /// Mixer input (pre-norm input).
+        input: ResourceId,
+        /// `[hidden, heads * head_dim]` output projection.
+        out_proj: ResourceId,
+        /// Output-projection result.
+        output: ResourceId,
+        /// Query heads (attention) or value heads (DeltaNet).
+        heads: usize,
+        /// KV heads (attention) or key heads (DeltaNet).
+        kv_heads: usize,
+    },
     /// No declared split point (compound sandwich/MoE): every operand must be
     /// Whole.
     Opaque,
@@ -306,7 +333,7 @@ pub enum StepGraphError {
         /// The undeclared operand.
         operand: ResourceId,
     },
-    /// A `Project.weight` or `GatedMlp` weight is not a
+    /// A `Project.weight`, `GatedMlp` weight or `HeadMixer.out_proj` is not a
     /// [`ResourceClass::Weight`] resource.
     NotAWeight(ResourceId),
     /// A rule that writes one declared operand (`GatedMlp.output`) lists
@@ -393,7 +420,8 @@ impl StepGraph {
 
     /// Append an op in issue order; its id is its index. Every referenced
     /// resource must exist, rule operands must be a subset of `reads ∪ writes`,
-    /// and `Project.weight` and the `GatedMlp` weights must be Weight resources.
+    /// and `Project.weight`, the `GatedMlp` weights and `HeadMixer.out_proj`
+    /// must be Weight resources.
     pub fn add_op(&mut self, decl: OpDecl) -> Result<OpId, StepGraphError> {
         let id = OpId(u32::try_from(self.ops.len()).map_err(|_| StepGraphError::TooMany)?);
         let n = self.resources.len();
@@ -450,6 +478,16 @@ impl StepGraph {
                 if let Some(&extra) = decl.writes.iter().find(|&&w| w != output) {
                     return Err(StepGraphError::UndeclaredWrite(extra));
                 }
+            }
+            SplitRule::HeadMixer {
+                input,
+                out_proj,
+                output,
+                ..
+            } => {
+                check_operand(input)?;
+                check_operand(output)?;
+                check_weight(out_proj)?;
             }
             SplitRule::Accumulate { dst, src } => {
                 check_operand(dst)?;
@@ -551,6 +589,7 @@ mod tests {
             (OpKind::GatedMlp, 28),
             (OpKind::DeltaNetMixer, 29),
             (OpKind::GatedAttention, 30),
+            (OpKind::SandwichMlp, 31),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),
