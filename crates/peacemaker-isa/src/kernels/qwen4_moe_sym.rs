@@ -1980,7 +1980,12 @@ mod nt {
     fn x_descriptors(b: &mut Builder, gpos: bool) -> Result<(), String> {
         // Epoch plane records: x_src_rows (flat slots), or m_total (positions).
         let records = if gpos { 21 } else { 22 };
-        sop(b, format!("s_mul_i32 s4, s{records}, 0x48"), &[4], &[records])?;
+        sop(
+            b,
+            format!("s_mul_i32 s4, s{records}, 0x48"),
+            &[4],
+            &[records],
+        )?;
         sop(
             b,
             format!("s_mov_b32 s{}, s14", SRD_X[0]),
@@ -2055,7 +2060,10 @@ mod nt {
         }
         op(
             b,
-            format!("v_mul_u32_u24_e32 v{q}, {}, v{q}", lit(iu4_fold::XBLK_BYTES)),
+            format!(
+                "v_mul_u32_u24_e32 v{q}, {}, v{q}",
+                lit(iu4_fold::XBLK_BYTES)
+            ),
             &[v(q)],
             &[v(q)],
         )?;
@@ -3309,7 +3317,11 @@ mod nt {
         }
         let kspec = KernelSpec {
             kernel_id: "qwen4_moe_sym".into(),
-            variant: format!("{}{suffix}{}", spec.variant(), if gpos { "_gp" } else { "" }),
+            variant: format!(
+                "{}{suffix}{}",
+                spec.variant(),
+                if gpos { "_gp" } else { "" }
+            ),
             arch: spec.arch,
             symbol: if gpos {
                 spec.symbol().replacen("_sym_pm_", "_sym_gp_pm_", 1)

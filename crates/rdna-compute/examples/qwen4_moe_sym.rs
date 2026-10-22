@@ -655,7 +655,8 @@ fn cand_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
         // The route's producer: the grouped-position plane where the PM twins apply (the dispatch call),
         // else the flat-slot sidecar. The anchors below always rebuild the flat sidecar.
         3 => {
-            h.down = Some(gpu.qwen4_moe_rotate128_i4_gp(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?)
+            h.down =
+                Some(gpu.qwen4_moe_rotate128_i4_gp(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?)
         }
         _ => gpu.gemm_qwen4_moe_down_iu4_sym(
             &c.dn_ptrs,
@@ -2653,7 +2654,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .qwen4_moe_down_i4_scratch
                         .as_ref()
                         .ok_or("no down sidecar")?;
-                    gpu.hip.memset(ds, v, (geo().mi / 128) * c.pmax.max(c.l) * BLK)?;
+                    gpu.hip
+                        .memset(ds, v, (geo().mi / 128) * c.pmax.max(c.l) * BLK)?;
                     gpu.hip.device_synchronize()?;
                     Ok(())
                 };
