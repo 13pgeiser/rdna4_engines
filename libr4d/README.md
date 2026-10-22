@@ -110,6 +110,16 @@ diverge by about 1 ULP.
 6. Add a case to `libr4d/r4d_selftest.cpp` so the row is called at least once; a row without one
    reports `no smoke case`.
 
+## The fp8 and int8 heads past 64 rows
+
+**`logits_gemm_fp8`, `logits_gemm_i8`** took passes of 64 rows and read the head again for each.
+With `MH` = 2 a workgroup's eight waves split into two M halves of four 16-row tiles over 64 weight
+rows that share one staged tile, so a pass takes 128 rows and reads the head once. Qwen3.8's
+per-rank head (124160 × 5120) at 128 rows 3059 → 1984 µs, TranslateGemma's (131072 × 5376) 3242 →
+2036; 65..128 rows -33..-39 %, 160..256 -26..-37 %, 64 and fewer unchanged; about 1 ms a step at 16
+streams with speculation. Same scale blocks, WMMAs and K order per output: the same bytes (the
+numeric cases at 65..150 rows for the fp8 head, 100 for the int8 head).
+
 ## Notes on the kernels
 
 Three properties of the architecture are assumed throughout and not restated per kernel:
