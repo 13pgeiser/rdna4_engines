@@ -1412,6 +1412,98 @@ pub fn attach_qwen4_ep_peers(
         .map_err(|error| format!("qwen4: expert parallelism mesh setup failed: {error}"))
 }
 
+/// One union for the tier lease OR whole-layer tables (aliases), the distinct
+/// stage tables, and optional kept-expert masks, each exactly once. Native
+/// MTP owns its own table.
+fn qwen4_expert_table_bytes(
+    stage_possible: bool,
+    (layers, experts, expert_keep): (usize, usize, bool),
+) -> Result<u64, String> {
+    use hipfire_arch_qwen4::expert_residency as residency;
+    // The base owns the gate/up and down pointer tables (16 bytes per expert)
+    // plus the 1-byte-per-expert codec (`EXPERT_TIER_TABLE_BYTES`). The stage
+    // allocates two F32 address tables per staged layer (gate/up and down, 16
+    // bytes per expert) and borrows the codec, so it adds 16 — never a second
+    // copy of the owned 17.
+    let stage = if stage_possible {
+        (layers as u64)
+            .checked_mul(experts as u64)
+            .and_then(|entries| entries.checked_mul(2 * 8))
+            .ok_or("stage-table component union overflows")?
+    } else {
+        0
+    };
+    let mask = if expert_keep {
+        (layers as u64)
+            .checked_add(1)
+            .and_then(|owners| owners.checked_mul(experts as u64))
+            .ok_or("keep-mask component union overflows")?
+    } else {
+        0
+    };
+    residency::EXPERT_TIER_TABLE_BYTES
+        .checked_add(stage)
+        .and_then(|bytes| bytes.checked_add(mask))
+        .ok_or_else(|| "table/mask component union overflows".into())
+}
+
+/// The production hotset/stage fixed point, without I/O or admission effects.
+fn qwen4_plan_hotset_placement(
+    slabs: &[hipfire_arch_qwen4::expert_slab_table::ExpertSlab],
+    rank: &[u32],
+    hotset_budget: hipfire_arch_qwen4::expert_hotset::HotsetBudget,
+    total: u64,
+    stage_enabled: bool,
+    table_geometry: (usize, usize, bool),
+) -> Result<
+    (
+        hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
+        u64,
+        u64,
+    ),
+    String,
+> {
+    use hipfire_arch_qwen4::expert_hotset as hotsets;
+    use hipfire_arch_qwen4::expert_residency as residency;
+    const MIB: u64 = 1 << 20;
+    let mut stage = 0u64;
+    // The base tier table is already charged by expert_hotset_budget. The
+    // separate stage tables and optional masks must share its fixed point.
+    let mut extra_tables =
+        qwen4_expert_table_bytes(false, table_geometry)? - residency::EXPERT_TIER_TABLE_BYTES;
+    loop {
+        let available = hotsets::require_budget(total.checked_sub(stage)
+            .and_then(|bytes| bytes.checked_sub(extra_tables)).ok_or_else(|| {
+            format!(
+                "the {} MiB expert budget cannot hold the {} MiB of long-prefill stage buffers; free GPU memory or lower the expert placement",
+                total / MIB,
+                stage / MIB
+            )
+        })).map_err(|skip| skip.to_string())?;
+        let budget = hotset_budget.select(available)?;
+        let plan =
+            hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(slabs, rank, budget)
+                .map_err(|error| error.to_string())?;
+        hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
+        // new_tier allocates no stage without a host owner; the byte helper
+        // alone still includes both tail pads for an empty host tier.
+        let stage_possible = stage_enabled
+            && plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped) > 0;
+        let need = if stage_possible {
+            residency::expert_tier_stage_bytes(&plan)
+        } else {
+            0
+        };
+        let need_tables = qwen4_expert_table_bytes(stage_possible, table_geometry)?
+            - residency::EXPERT_TIER_TABLE_BYTES;
+        if need <= stage && need_tables <= extra_tables {
+            return Ok((plan, budget, stage));
+        }
+        stage = stage.max(need);
+        extra_tables = extra_tables.max(need_tables);
+    }
+}
+
 /// What the expert placement is sized from, for one rank of a `ranks`-way
 /// load: the replicated non-expert bytes, one MoE layer's routed-expert bytes
 /// on this rank, the `auto` reserve ([`residency::AutoReserve`]: the larger
@@ -2383,34 +2475,27 @@ fn load_qwen4_rank_scoped(
             // Retain the automatic fixed point for stage buffers. Under a
             // pin, reserve those buffers alongside the unchanged hot budget.
             let stage_enabled = residency::expert_stage_placement_enabled(&ctx.gpu.arch);
-            let mut stage = 0u64;
-            let (plan, budget) = loop {
-                let available = hotsets::require_budget(total.checked_sub(stage).ok_or_else(|| {
-                    format!(
-                        "the {} MiB expert budget cannot hold the {} MiB of long-prefill stage buffers; free GPU memory or lower the expert placement",
-                        total / MIB,
-                        stage / MIB
-                    )
-                }))
-                .map_err(|skip| skip.to_string())?;
-                let budget = hotset_budget.select(available)?;
-                let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
-                    &slabs,
-                    sidecar.rank(),
-                    budget,
-                )
-                .map_err(|error| error.to_string())?;
-                hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
-                let need = if stage_enabled {
-                    residency::expert_tier_stage_bytes(&plan)
-                } else {
-                    0
-                };
-                if need <= stage {
-                    break (plan, budget);
-                }
-                stage = need;
-            };
+            let table_geometry = (
+                config.num_hidden_layers,
+                config.num_experts,
+                config.expert_keep.is_some(),
+            );
+            let (plan, budget, stage) = qwen4_plan_hotset_placement(
+                &slabs,
+                sidecar.rank(),
+                hotset_budget,
+                total,
+                stage_enabled,
+                table_geometry,
+            )?;
+            // The base tier table was already subtracted by expert_hotset_budget.
+            let extra_tables = qwen4_expert_table_bytes(
+                stage_enabled
+                    && plan
+                        .owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
+                        > 0,
+                table_geometry,
+            )? - residency::EXPERT_TIER_TABLE_BYTES;
             plan.check_executable(&ctx.gpu.arch)
                 .map_err(|error| error.to_string())?;
             let host_bytes = plan
@@ -2439,7 +2524,10 @@ fn load_qwen4_rank_scoped(
                     |bytes| {
                         bytes
                             .checked_sub(stage)
-                            .ok_or_else(|| "no budget after long-prefill stage buffers".to_string())
+                            .and_then(|bytes| bytes.checked_sub(extra_tables))
+                            .ok_or_else(|| {
+                                "no budget after long-prefill stage/table owners".to_string()
+                            })
                     },
                 ),
             )
@@ -2456,11 +2544,11 @@ fn load_qwen4_rank_scoped(
                 ));
             }
             eprintln!(
-                "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({reserve_note}; {} MiB native MTP, {} MiB QSA gather) - {} bytes tier tables - {} MiB safety margin - {} MiB long-prefill stage buffers = {} MiB",
+                "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({reserve_note}; {} MiB native MTP, {} MiB QSA gather) - {} bytes base tier tables - {} MiB safety margin - {} MiB long-prefill stage buffers - {} bytes extra stage tables/masks = {} MiB",
                 free / MIB, non_expert / MIB, reserve / MIB,
                 mtp_bytes.unwrap_or(0) / MIB, gather_bytes.unwrap_or(0) / MIB,
                 residency::EXPERT_TIER_TABLE_BYTES,
-                residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES / MIB, stage / MIB, (total - stage) / MIB,
+                residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES / MIB, stage / MIB, extra_tables, (total - stage - extra_tables) / MIB,
             );
             if hotset_budget.is_fixed() {
                 eprintln!(
@@ -2569,9 +2657,25 @@ fn load_qwen4_rank_scoped(
             // safety margin is charged exactly as `auto` charges it. The
             // decision is `residency::resident_fit`, the one the shared lab
             // loader and gates resolve with (`incumbent_placement_layers`).
-            let fit =
-                residency::resident_fit(free, non_expert, experts, layer_experts, base_reserve)
-                    .map_err(|error| format!("qwen4: {error}"))?;
+            let tables = qwen4_expert_table_bytes(
+                false,
+                (
+                    config.num_hidden_layers,
+                    config.num_experts,
+                    config.expert_keep.is_some(),
+                ),
+            )?;
+            let available = free
+                .checked_sub(tables)
+                .ok_or("qwen4: no device budget after expert tables")?;
+            let fit = residency::resident_fit(
+                available,
+                non_expert,
+                experts,
+                layer_experts,
+                base_reserve,
+            )
+            .map_err(|error| format!("qwen4: {error}"))?;
             let (charges, reserve, fits) = (fit.charges, fit.reserve, fit.fits);
             unset_note = format!(
                     " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve (base {}; plus {}) {} {} MiB free VRAM)",
@@ -2729,33 +2833,101 @@ fn load_qwen4_rank_scoped(
                 // With every routed expert in host RAM the load would
                 // still leave less than the reserve, and fail later at
                 // the first request (e.g. beside another process's
-                // model): refuse before allocating instead.
-                if whole_first == hotsets::WholeFirstDecision::Active {
-                    let plan = residency::WholeFirstPlan::auto(
-                        free,
-                        non_expert,
-                        placement_layer_bytes,
-                        config.num_hidden_layers,
-                        moe_layers,
-                        auto.placement_bytes(slowlink_profile.is_some()),
-                        &charges,
-                        borrowed_stage_donors,
-                    )
-                    .map_err(|error| format!("qwen4: {error}"))?;
-                    let layers = plan.whole_layers;
-                    whole_first_plan = Some(plan);
-                    layers
+                // model): refuse before allocating instead. Tables ride
+                // the existing conditional stage-payload policy: solve
+                // without EXTRA stage tables first, and only when the
+                // actual placement needs a stage re-solve with the real
+                // extra owned stage charge.
+                let table_geometry = (
+                    config.num_hidden_layers,
+                    config.num_experts,
+                    config.expert_keep.is_some(),
+                );
+                let qwen4_solve_whole = |free: u64,
+                                         non_expert: u64,
+                                         placement_layer_bytes: u64,
+                                         table_stage: bool,
+                                         whole_first: &hotsets::WholeFirstDecision|
+                 -> Result<
+                    (usize, Option<residency::WholeFirstPlan>),
+                    String,
+                > {
+                    let tables = qwen4_expert_table_bytes(table_stage, table_geometry)?;
+                    let available = free
+                        .checked_sub(tables)
+                        .ok_or("qwen4: no device budget after expert tables")?;
+                    if *whole_first == hotsets::WholeFirstDecision::Active {
+                        let plan = residency::WholeFirstPlan::auto(
+                            available,
+                            non_expert,
+                            placement_layer_bytes,
+                            config.num_hidden_layers,
+                            moe_layers,
+                            auto.placement_bytes(slowlink_profile.is_some()),
+                            &charges,
+                            borrowed_stage_donors,
+                        )
+                        .map_err(|error| format!("qwen4: {error}"))?;
+                        let layers = plan.whole_layers;
+                        Ok((layers, Some(plan)))
+                    } else {
+                        let layers = residency::auto_placement_layers(
+                            available,
+                            non_expert,
+                            placement_layer_bytes,
+                            config.num_hidden_layers,
+                            auto.placement_bytes(slowlink_profile.is_some()),
+                            &charges,
+                        )
+                        .map_err(|error| format!("qwen4: {error}"))?;
+                        Ok((layers, None))
+                    }
+                };
+                // First solve carries only the base tables (the OR of the
+                // lease/whole aliases, already the single backend table) and
+                // the masks, with the actual `charges` stage payload; no
+                // EXTRA stage tables yet. Its layers fix the layers any stage
+                // re-solve must then fit exactly, so the resident ordering and
+                // every threshold/fixed-N/UMA/S1/margin/native-MTP/K policy
+                // stays the actual solver's.
+                let (base_layers, base_plan) = qwen4_solve_whole(
+                    free,
+                    non_expert,
+                    placement_layer_bytes,
+                    false,
+                    &whole_first,
+                )?;
+                // Exactly the distinct stage pointer tables (16/expert): the
+                // base solve already counts the base tables and the masks
+                // once, so the difference never double-charges the mask.
+                let stage_extra = qwen4_expert_table_bytes(true, table_geometry)?
+                    - qwen4_expert_table_bytes(false, table_geometry)?;
+                // A fully resident hot set builds no stage at all, so it pays
+                // no EXTRA stage charge; only an actual host/spill placement
+                // re-solves with the real extra owned stage tables.
+                let (layers, staged_plan) = if base_layers >= moe_layers
+                    || !residency::expert_stage_placement_enabled(&ctx.gpu.arch)
+                    || !slab_stage
+                {
+                    (base_layers, base_plan)
                 } else {
-                    residency::auto_placement_layers(
-                        free,
+                    // At most one EXTRA stage charge: size it from the actual
+                    // needs-stage solve and keep the same layers the base
+                    // solve placed, exactly as the shipped policy resolves.
+                    let (staged_layers, staged_plan) = qwen4_solve_whole(
+                        free.checked_sub(stage_extra)
+                            .ok_or("qwen4: no device budget after expert tables".to_string())?,
                         non_expert,
                         placement_layer_bytes,
-                        config.num_hidden_layers,
-                        auto.placement_bytes(slowlink_profile.is_some()),
-                        &charges,
-                    )
-                    .map_err(|error| format!("qwen4: {error}"))?
+                        false,
+                        &whole_first,
+                    )?;
+                    (staged_layers.min(base_layers), staged_plan)
+                };
+                if whole_first == hotsets::WholeFirstDecision::Active {
+                    whole_first_plan = staged_plan;
                 }
+                layers
             }
         };
         // The default stays on the incumbent prefix path without allocating
@@ -7514,6 +7686,130 @@ mod qwen4_admission_tests {
             vec![12 * gib; 8]
         );
         assert_eq!(qwen4_ep_emulation_map(&[0, 1, 0]), "0->0, 1->1, 2->0");
+    }
+    #[test]
+    fn expert_placement_budgets_disjoint_tables_and_stage() {
+        use hipfire_arch_qwen4::{
+            expert_hotset::HotsetBudget,
+            expert_residency as residency,
+            expert_slab_table::{ExpertSlab, ExpertSlabSpan},
+            expert_slabs::ExpertFormat,
+            expert_tier_plan::{plan_expert_tiers_from_slabs, Placement},
+        };
+        // Pure metadata, with the nonaligned spans used by the tier planner's
+        // CPU fixtures. The actual planner owns payload packing and tail pads.
+        let slabs: Vec<_> = (0..48 * 512)
+            .map(|id| ExpertSlab {
+                format: ExpertFormat::Mq4Xts,
+                gate_up: ExpertSlabSpan {
+                    offset: id * 1500,
+                    len: 1000,
+                },
+                down: ExpertSlabSpan {
+                    offset: id * 1500 + 1000,
+                    len: 500,
+                },
+            })
+            .collect();
+        let rank: Vec<u32> = (0..48 * 512).collect();
+        for (stage_enabled, keep, payload_room) in [
+            (false, false, 16u64 << 20),
+            (true, false, 16 << 20),
+            (true, true, 16 << 20),
+            (true, false, 64 << 20),
+        ] {
+            let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + payload_room;
+            let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+            let (plan, budget, stage) = super::qwen4_plan_hotset_placement(
+                &slabs,
+                &rank,
+                HotsetBudget::parse(None).unwrap(),
+                total,
+                stage_enabled,
+                (48, 512, keep),
+            )
+            .unwrap();
+            let host = plan.owner_bytes(Placement::HostMapped) > 0;
+            let staged = stage_enabled && host;
+            // Base owns the pointer tables plus the codec (17 per expert);
+            // the stage adds only its own pointer tables (16 per expert);
+            // optional masks ride once alongside.
+            let tables = (48 * 512 * (2 * 8 + 1)) as u64
+                + if staged {
+                    (48 * 512 * (2 * 8)) as u64
+                } else {
+                    0
+                }
+                + if keep { 49 * 512 } else { 0 };
+            assert!(
+                plan.owner_bytes(Placement::Device)
+                    + stage
+                    + tables
+                    + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES
+                    <= free
+            );
+            // Equality rejects duplicate table/payload charges as well as
+            // omissions: the selected budget contains every remaining byte.
+            assert_eq!(
+                budget + stage + tables + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+                free
+            );
+            assert_eq!(
+                tables,
+                super::qwen4_expert_table_bytes(staged, (48, 512, keep)).unwrap()
+            );
+            assert_eq!(stage > 0, staged);
+            assert_eq!(host, payload_room == 16 << 20);
+            if staged && !keep {
+                // Counterfactual shipped solve misses the distinct stage
+                // tables, and the actual packed owner crosses capacity.
+                let old = plan_expert_tiers_from_slabs(&slabs, &rank, total - stage).unwrap();
+                assert!(
+                    old.owner_bytes(Placement::Device)
+                        + stage
+                        + tables
+                        + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES
+                        > free
+                );
+            }
+        }
+        // Whole-layer AUTO cedes a layer only at the genuine byte boundary.
+        let layer = 2u64 << 30;
+        let base = 1u64 << 30;
+        let charges = residency::PlacementCharges::new(layer, true).unwrap();
+        let tables = super::qwen4_expert_table_bytes(true, (48, 512, true)).unwrap();
+        let free = charges.reserve(base).unwrap() + tables + 3 * layer;
+        for (capacity, expected) in [(free, 3), (free - 1, 2)] {
+            let available = capacity.checked_sub(tables).unwrap();
+            assert_eq!(
+                residency::auto_placement_layers(available, 0, layer, 48, base, &charges,).unwrap(),
+                expected
+            );
+        }
+        // Preserve the existing reserve, including its historical stage term.
+        // At the real full-residency boundary the plan creates no stage, so
+        // charging the EXTRA pointer tables must not spill a whole layer.
+        let base_tables = super::qwen4_expert_table_bytes(false, (48, 512, true)).unwrap();
+        let stage_extra =
+            super::qwen4_expert_table_bytes(true, (48, 512, true)).unwrap() - base_tables;
+        let full_capacity = charges.reserve(base).unwrap() + base_tables + 48 * layer;
+        let solve_whole = |capacity: u64| {
+            residency::WholeFirstPlan::auto(
+                capacity.checked_sub(base_tables).unwrap(),
+                0,
+                layer,
+                48,
+                48,
+                base,
+                &charges,
+                false,
+            )
+            .unwrap()
+        };
+        let whole = solve_whole(full_capacity);
+        assert_eq!(whole.whole_layers, 48);
+        assert!(matches!(whole.stage, residency::WholeFirstStage::None));
+        assert!(solve_whole(full_capacity - stage_extra).whole_layers < 48);
     }
 }
 
