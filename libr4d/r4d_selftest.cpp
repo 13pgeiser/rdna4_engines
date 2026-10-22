@@ -564,6 +564,7 @@ static double st_time_us(F&& launch, int iters, hipStream_t s) {
     if (g_cold <= 0) {
         hipEvent_t e0, e1;
         st_ev_create(&e0); st_ev_create(&e1);
+        for (int i = 0; i < iters; ++i) launch(i);   /* untimed: the clocks ramp up from idle */
         st_ev_record(e0, s);
         for (int i = 0; i < iters; ++i) launch(i);
         st_ev_record(e1, s);
@@ -26932,6 +26933,10 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 17, 1072, 2560, 0, false);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 32, 17408, 5120, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 40, 5376, 10752, 0, true);
+        /* Two column tiles a block (N >= 4096, K >= 3072, past 24 rows) at four row tiles and on the
+         * per-row activation scale. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 64, 12288, 5120, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 49, 5376, 10752, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 64, 10288, 640, 0, false);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 33, 16, 256, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 56, 1072, 5120, 0, true);
