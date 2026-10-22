@@ -354,6 +354,12 @@ pub const QWEN4_COMPACT_FALLBACK_ROWS: usize = 512;
 /// keeps the full allocation plan (the IU4 math stays enabled either way).
 pub const QWEN4_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_QWEN4_COMPACT_SCRATCH";
 
+/// Developer knob: make the compact-scratch acceptance check in
+/// `Qwen4GpuForward::new_inner` fail as if one routed layer were unverified
+/// (default off).  Per-layer verification and routes are unchanged, so the
+/// Full fallback computes exactly what a Full-mode run computes.
+pub const QWEN4_COMPACT_FORCE_UNVERIFIED_ENV: &str = "HIPFIRE_QWEN4_COMPACT_FORCE_UNVERIFIED";
+
 /// Pure predicate of [`qwen4_forward_scratch_mode`]: every term must hold
 /// for the compact plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,6 +804,13 @@ pub enum Qwen4GpuForwardError {
     Hip(hip_bridge::HipError),
     Weights(WeightError),
     Invalid(String),
+    /// The compact scratch plan was selected before the payload was proven
+    /// symmetric and the GPU check verified fewer routed layers than it needs.
+    /// Everything `new_inner` allocated was released before this was returned.
+    CompactUnverified {
+        verified: usize,
+        total: usize,
+    },
     Dispatch(String),
     Ple(String),
 }
@@ -808,6 +821,11 @@ impl fmt::Display for Qwen4GpuForwardError {
             Self::Hip(error) => write!(f, "Qwen4 GPU forward HIP error: {error}"),
             Self::Weights(error) => write!(f, "Qwen4 GPU forward weights error: {error}"),
             Self::Invalid(error) => write!(f, "Qwen4 GPU forward invalid input: {error}"),
+            Self::CompactUnverified { verified, total } => write!(
+                f,
+                "Qwen4 GPU forward: compact scratch was selected, but the GPU symmetry check \
+                 verified only {verified}/{total} layers symmetric"
+            ),
             Self::Dispatch(error) => write!(f, "Qwen4 GPU forward dispatch error: {error}"),
             Self::Ple(error) => write!(f, "Qwen4 GPU forward PLE error: {error}"),
         }
@@ -8827,12 +8845,19 @@ impl Qwen4GpuForward {
                 // all-slab load is not on the symmetric route (its K2 GEMMs
                 // write the same grouped-row buffers, K1 stays inside the
                 // 512-row F32 fallback), so it has no symmetric count to meet.
-                if compact && !all_slab && verified != moe_count {
-                    return Err(invalid(format!(
-                        "compact scratch was selected from the artifact's source headers, but \
-                         the GPU check verified only {verified}/{} layers symmetric",
-                        moe_count
-                    )));
+                // Developer knob: refuse the compact plan as if one layer were
+                // unverified, without altering any layer's verdict or route.
+                let accepted =
+                    if hipfire_config::developer_bool(QWEN4_COMPACT_FORCE_UNVERIFIED_ENV, false) {
+                        verified.saturating_sub(1)
+                    } else {
+                        verified
+                    };
+                if compact && !all_slab && accepted != moe_count {
+                    return Err(Qwen4GpuForwardError::CompactUnverified {
+                        verified: accepted,
+                        total: moe_count,
+                    });
                 }
                 if verified > 0 {
                     gpu.reserve_qwen4_moe_sym(

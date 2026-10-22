@@ -14,8 +14,8 @@ use crate::config::{Qwen4Config, Qwen4PleConfig};
 use crate::ep::{Qwen4EpMesh, ReplicaFingerprint};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
-    qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4OutputRows,
-    QWEN4_FORWARD_HEADROOM_BYTES,
+    qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4GpuForwardError,
+    Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
@@ -1530,15 +1530,42 @@ impl Qwen4Bundle {
                 .unwrap_or_else(|| requested.min(1536)),
         };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
-        let mut forward = Qwen4GpuForward::new_inner(
+        let attempt = Qwen4GpuForward::new_inner(
             gpu,
             self,
             max_chunk,
             mode,
             #[cfg(target_os = "linux")]
             Some(npu_prepared),
-        )
-        .map_err(|error| BundleError::Forward(error.to_string()))?;
+        );
+        let (mut forward, max_chunk) = match attempt {
+            Ok(forward) => (forward, max_chunk),
+            // The compact plan was chosen before the payload was proven; the
+            // GPU symmetry check refused it and `new_inner` released all it
+            // allocated. Re-plan Full against the memory now free. The NPU
+            // trunk (gfx1151) never coexists with the gfx1201-only compact
+            // plan, so nothing prepared is lost. S1 keeps its charged tile.
+            Err(Qwen4GpuForwardError::CompactUnverified { verified, total })
+                if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
+            {
+                let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+                let rows = full_fallback_rows(&self.config, requested, free as u64);
+                eprintln!(
+                    "  qwen4 forward scratch: compact plan refused by the GPU symmetry check ({verified}/{total} layers verified); re-planned Full at {rows} rows"
+                );
+                let forward = Qwen4GpuForward::new_inner(
+                    gpu,
+                    self,
+                    rows,
+                    Qwen4ForwardScratchMode::Full,
+                    #[cfg(target_os = "linux")]
+                    Some(None),
+                )
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+                (forward, rows)
+            }
+            Err(error) => return Err(BundleError::Forward(error.to_string())),
+        };
         if let Some(profile) = self.slowlink.profile {
             forward.set_slowlink_profile(profile);
         }
@@ -1746,6 +1773,13 @@ impl Qwen4Bundle {
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
             .or_else(|| self.pp_band.as_ref().map(|band| band.chunk()))
+    }
+
+    /// The scratch plan the attached forward actually allocated: differs from
+    /// the plan `attach_forward` was given when a compact plan was refused by
+    /// the GPU symmetry check and re-planned Full.
+    pub fn forward_scratch_mode(&self) -> Option<Qwen4ForwardScratchMode> {
+        self.execution.as_ref().map(|forward| forward.scratch.mode)
     }
 
     pub(crate) fn npu_trunk_pipelined(&self) -> bool {
@@ -5949,10 +5983,52 @@ impl fmt::Display for BundleError {
 
 impl std::error::Error for BundleError {}
 
+/// The chunk rows of the Full-plan re-attach after the GPU symmetry check
+/// refused the compact plan: the largest rung of
+/// [`qwen4_prefill_chunk_rungs`]`(requested)` whose Full forward bytes plus the
+/// headroom fit `free` device bytes. When none fits, `requested.min(1536)` is
+/// attempted regardless and fails at allocation if it must, as in the first
+/// attach.
+fn full_fallback_rows(config: &Qwen4Config, requested: usize, free: u64) -> usize {
+    qwen4_prefill_chunk_rungs(requested)
+        .find(|&rows| {
+            qwen4_forward_device_bytes(config, rows, Qwen4ForwardScratchMode::Full)
+                .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                .is_some_and(|bytes| bytes <= free)
+        })
+        .unwrap_or_else(|| requested.min(1536))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ple::PLE_HEAD_COUNT;
+
+    #[test]
+    fn full_fallback_rows_picks_the_largest_fitting_rung() {
+        let config = crate::config::compact_test_config();
+        let need = |rows: usize| {
+            qwen4_forward_device_bytes(&config, rows, Qwen4ForwardScratchMode::Full)
+                .unwrap()
+                .checked_add(QWEN4_FORWARD_HEADROOM_BYTES)
+                .unwrap()
+        };
+        // Plenty of memory: the requested rows, even above the default rungs.
+        assert_eq!(full_fallback_rows(&config, 8192, u64::MAX), 8192);
+        assert_eq!(full_fallback_rows(&config, 8192, need(8192)), 8192);
+        // One byte short of a rung steps down to the next one.
+        assert_eq!(full_fallback_rows(&config, 8192, need(8192) - 1), 4096);
+        assert_eq!(full_fallback_rows(&config, 8192, need(4096)), 4096);
+        assert_eq!(full_fallback_rows(&config, 8192, need(4096) - 1), 2048);
+        assert_eq!(full_fallback_rows(&config, 8192, need(2048)), 2048);
+        assert_eq!(full_fallback_rows(&config, 8192, need(1536)), 1536);
+        // Nothing fits: the smallest rung is attempted regardless.
+        assert_eq!(full_fallback_rows(&config, 8192, need(1536) - 1), 1536);
+        assert_eq!(full_fallback_rows(&config, 8192, 0), 1536);
+        // A request below the smallest rung is attempted as asked.
+        assert_eq!(full_fallback_rows(&config, 1024, 0), 1024);
+        assert_eq!(full_fallback_rows(&config, 1024, u64::MAX), 1024);
+    }
 
     /// The 128 canonical shard layouts of `encoding`, laid back to back from
     /// `base` (a sidecar's data section).
