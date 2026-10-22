@@ -7,6 +7,7 @@
   analyze.py <receipt-dir> swmmac
   analyze.py <receipt-dir> div_scale   (suite div_scale: v_div_scale_f32 against the exponent-field chain)
   analyze.py <receipt-dir> scalar_udiv (suite scalar_udiv: s_cvt_f32_u32 / v_s_rcp_f32 / s_mul_f32 / s_cvt_u32_f32)
+  analyze.py <receipt-dir> maxmin      (suite maxmin: v_maxmin_num_f32 / v_minmax_num_f32 against the num_select composition)
 
 Each command prints a concise report and writes <receipt-dir>/analysis/<command>.json. The analysis never edits the
 receipts. Models are the scalar references in models.py; a mismatch count of 0 over the stated number of words is the
@@ -628,15 +629,52 @@ def cmd_scalar_udiv(r, args):
     return rep
 
 
+def _is_nan(x):
+    return (x & 0x7FFFFFFF) > INF_BITS
+
+
+def num_select(a, b, is_max):
+    """maxNum/minNum on raw f32 bits: a NaN loses to a number, two NaNs give the first, quieted; -0 < +0."""
+    a, b = np.asarray(a, dtype=np.uint32), np.asarray(b, dtype=np.uint32)
+    fa, fb = a.view(np.float32), b.view(np.float32)
+    with np.errstate(invalid="ignore"):
+        zero_tie = (fa == 0) & (fb == 0)
+        if is_max:
+            take_a = (fa > fb) | (zero_tie & ((a & SIGN_BITS) == 0) & ((b & SIGN_BITS) != 0))
+        else:
+            take_a = (fa < fb) | (zero_tie & ((a & SIGN_BITS) != 0) & ((b & SIGN_BITS) == 0))
+    na, nb = _is_nan(a), _is_nan(b)
+    out = np.where(take_a, a, b)
+    out = np.where(na & ~nb, b, np.where(nb & ~na, a, out))
+    return np.where(na & nb, a | QUIET_BITS, out).astype(np.uint32)
+
+
+def cmd_maxmin(r, args):
+    ins = r.bin("maxmin.in").reshape(-1, 3)
+    s0, s1, s2 = ins[:, 0], ins[:, 1], ins[:, 2]
+    rep = {"cases": int(len(ins)), "arch": r.arch}
+    for name, hw_name, outer, inner in [("v_maxmin_num_f32", "maxmin.maxmin.out", False, True),
+                                        ("v_minmax_num_f32", "maxmin.minmax.out", True, False)]:
+        hw = r.bin(hw_name)
+        model = num_select(num_select(s0, s1, inner), s2, outer)
+        bad = np.flatnonzero(hw != model)
+        rep[name] = {"mismatches": int(len(bad)), "first": [
+            {"s0": hex(int(s0[i])), "s1": hex(int(s1[i])), "s2": hex(int(s2[i])), "hw": hex(int(hw[i])), "model": hex(int(model[i]))}
+            for i in bad[:12]]}
+    write_json(r, "maxmin", rep)
+    print(json.dumps(rep, indent=1))
+    return rep
+
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("receipt")
-    ap.add_argument("cmd", choices=["identity", "dot", "wmma", "swmmac", "div_scale", "scalar_udiv"])
+    ap.add_argument("cmd", choices=["identity", "dot", "wmma", "swmmac", "div_scale", "scalar_udiv", "maxmin"])
     ap.add_argument("--jobs", type=int, default=12)
     args = ap.parse_args()
     r = Receipt(args.receipt)
-    {"identity": cmd_identity, "dot": cmd_dot, "wmma": cmd_wmma, "swmmac": cmd_swmmac, "div_scale": cmd_div_scale, "scalar_udiv": cmd_scalar_udiv}[args.cmd](r, args)
+    {"identity": cmd_identity, "dot": cmd_dot, "wmma": cmd_wmma, "swmmac": cmd_swmmac, "div_scale": cmd_div_scale, "scalar_udiv": cmd_scalar_udiv, "maxmin": cmd_maxmin}[args.cmd](r, args)
 
 
 if __name__ == "__main__":

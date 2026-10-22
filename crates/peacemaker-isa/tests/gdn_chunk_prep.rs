@@ -15,9 +15,8 @@
 //!     incumbent's arithmetic (separate multiplies and adds, explicit `fma` only where the source has `fmaf`, the
 //!     incumbent's `expf` / `logf` / `rsqrtf` / full-division operand graphs over the interpreter's transcendental
 //!     primitives, the pair-prefix shuffle-up scan with its `(pair - g0) - g1` subtract / re-add, the XOR
-//!     butterfly). The interpreter's semantic table lacks six spellings the export uses (wide global stores, `_e32`
-//!     compare / select, the negated-operand multiply), so the interpreter runs a one-for-one respelling, audited
-//!     line for line by [`emulation_rewrite_is_the_audited_one_for_one_set`]; peacemaker-ir is not edited. The
+//!     butterfly). The interpreter runs the emission itself, unmodified: wide global stores, the `_e32` compare / select
+//!     and the negated-operand multiply all have modeled semantics. The
 //!     model has teeth: the serial scan, the conventional inclusive prefix, the unfused convolution and the
 //!     other in-lane norm order each change bits on the same inputs.
 //!  2. The per-token value graphs of the three region loops (conv -> SiLU -> q/k norm -> q-scale -> f16) are
@@ -784,78 +783,10 @@ const POISON: u16 = 0xbeef;
 struct Rig {
     program: peacemaker_ir::Program,
 }
-/// The emitted module with the instruction spellings the interpreter's semantic table does not list rewritten to
-/// the one-for-one equivalents it does (the table is peacemaker-ir's and is not edited here): wide global stores
-/// become dword stores of the same registers at the same addresses, the VOPC / VOP2 `_e32` compare and select become
-/// their `_e64` forms with the same operands (`vcc_lo`), and the negated-operand multiply becomes the multiply
-/// followed by a sign flip (`a * -b == -(a * b)` under round-to-nearest). Returns the text and the number of rewritten
-/// lines per rule, which [`emulation_rewrite_is_the_audited_one_for_one_set`] pins.
-fn emulation_text(text: &str) -> (String, [usize; 5]) {
-    let mut out = String::new();
-    let mut n = [0usize; 5];
-    for line in text.lines() {
-        let t = line.trim();
-        let (m, rest) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
-        let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
-        match m {
-            "global_store_b64" | "global_store_b128" => {
-                // `vOFF, v[lo:hi], s[a:b] [offset:N]`
-                let (width, idx) = if m == "global_store_b64" {
-                    (2usize, 0)
-                } else {
-                    (4, 1)
-                };
-                n[idx] += 1;
-                let lo: u32 = ops[1]
-                    .trim_start_matches("v[")
-                    .split(':')
-                    .next()
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                let mut tail = ops[2].split_whitespace();
-                let saddr = tail.next().unwrap();
-                let imm = tail.next().map_or(0, |o| {
-                    o.trim_start_matches("offset:").parse::<u32>().unwrap()
-                });
-                for w in 0..width as u32 {
-                    out += &format!(
-                        "\tglobal_store_b32 {}, v{}, {saddr} offset:{}\n",
-                        ops[0],
-                        lo + w,
-                        imm + 4 * w
-                    );
-                }
-            }
-            "v_cmp_gt_f32_e32" => {
-                n[2] += 1;
-                out += &format!("\tv_cmp_gt_f32_e64 {rest}\n");
-            }
-            "v_cndmask_b32_e32" => {
-                n[3] += 1;
-                out += &format!("\tv_cndmask_b32_e64 {rest}\n");
-            }
-            "v_mul_f32_e64" => {
-                n[4] += 1;
-                let b = ops[2].strip_prefix('-').expect("negated source");
-                out += &format!(
-                    "\tv_mul_f32_e32 {}, {}, {b}\n\tv_xor_b32_e32 {}, 0x80000000, {}\n",
-                    ops[0], ops[1], ops[0], ops[0]
-                );
-            }
-            _ => {
-                out += line;
-                out.push('\n');
-            }
-        }
-    }
-    (out, n)
-}
-
 impl Rig {
     fn pm() -> Self {
         let (_, text, _) = gdn_chunk_prep::emit_module(ARCH, &spec()).unwrap();
-        Self::lift(&native::assemble(&emulation_text(&text).0, ARCH).unwrap())
+        Self::lift(&native::assemble(&text, ARCH).unwrap())
     }
     fn lift(object: &[u8]) -> Self {
         let lifted = peacemaker_lift::lift_object(
@@ -1009,46 +940,6 @@ fn assert_written(name: &str, c: &Case, r: &Run) {
         r.written, want,
         "{name}: exactly the live output bytes are written (q, k, v, a, b, conv_state)"
     );
-}
-
-/// The interpreter-only respelling touches exactly the audited lines (3 `b64` and 3 `b128` stores, 4 compares, 4
-/// selects, 2 negated multiplies) and nothing else: every other instruction line is byte for byte the emitted one.
-#[test]
-fn emulation_rewrite_is_the_audited_one_for_one_set() {
-    let (_, text, _) = gdn_chunk_prep::emit_module(ARCH, &spec()).unwrap();
-    let (rewritten, n) = emulation_text(&text);
-    assert_eq!(n, [3, 3, 4, 4, 2]);
-    let census = |m: &str| count(&text, m);
-    assert_eq!(
-        [
-            census("global_store_b64"),
-            census("global_store_b128"),
-            census("v_cmp_gt_f32_e32"),
-            census("v_cndmask_b32_e32"),
-            census("v_mul_f32_e64")
-        ],
-        [3, 3, 4, 4, 2]
-    );
-    let is_rewritten = |l: &str| {
-        matches!(
-            mnemonic(l.trim()),
-            "global_store_b64"
-                | "global_store_b128"
-                | "v_cmp_gt_f32_e32"
-                | "v_cndmask_b32_e32"
-                | "v_mul_f32_e64"
-        )
-    };
-    let kept: Vec<&str> = text.lines().filter(|l| !is_rewritten(l)).collect();
-    let kept_back: Vec<&str> = rewritten.lines().filter(|l| kept.contains(l)).collect();
-    assert_eq!(kept, kept_back, "an untouched line changed or moved");
-    // Wide stores become dword stores of consecutive registers at consecutive addresses; the negation is a sign flip.
-    assert!(rewritten.contains("\tglobal_store_b32 v36, v116, s[68:69] offset:0\n\tglobal_store_b32 v36, v117, s[68:69] offset:4\n"));
-    assert!(rewritten.contains("\tglobal_store_b32 v34, v59, s[60:61] offset:12\n"));
-    assert!(
-        rewritten.contains("\tv_mul_f32_e32 v9, v32, v23\n\tv_xor_b32_e32 v9, 0x80000000, v9\n")
-    );
-    assert!(rewritten.contains("\tv_cmp_gt_f32_e64 vcc_lo, 0x800000, v17\n"));
 }
 
 /// Row counts that cover single-row, two-row, three-row (ring) and chunk-edge shapes plus a multi-chunk tail.

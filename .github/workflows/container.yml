@@ -7,24 +7,19 @@ name: container-image
 # gfx1100, gfx1151 and gfx1201, then runs two GPU-free smoke checks: the
 # CLI answers --version, and the baked arch directories exist.
 #
-# STATUS: DISABLED FOR PUBLISHING. The only trigger is a manual
-# workflow_dispatch, and the push steps below are guarded off, so nothing is
-# ever sent to ghcr.io/warpfront/hipfire as written. It is a draft pending
-# Kaden's approval to publish images.
+# Publishing is enabled (Kaden, decision ede09c6dce74): pushing a `v*` tag
+# builds the `full` image and pushes ghcr.io/warpfront/hipfire:<version> and
+# :latest. A manual workflow_dispatch builds an existing tag's `full` or
+# `runtime` image (the slim `runtime` image is dispatch-only) and pushes it
+# the same way.
 #
 # GPU validation stays manual: a hosted runner has no AMD GPU, so serving,
 # model loading and the compose stack are checked by hand on real hardware
 # (docs/CONTAINER.md).
-#
-# To enable publishing, all three are required:
-#   1. Add the release-tag trigger (kept here as a comment until approved):
-#        # push:
-#        #   tags: ['v*']
-#      and fall back to github.ref_name where this file reads inputs.tag.
-#   2. Grant `packages: write` on the `image` job (see the comment there).
-#   3. Flip the `if: ${{ false }}` guards on the login and push steps.
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
@@ -44,25 +39,25 @@ permissions:
   contents: read
 
 concurrency:
-  group: container-image-${{ inputs.tag }}-${{ inputs.target }}
+  group: container-image-${{ inputs.tag || github.ref_name }}-${{ inputs.target || 'full' }}
   cancel-in-progress: false
 
 jobs:
   image:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    # permissions:
-    #   contents: read
-    #   packages: write   # only once publishing is approved and enabled
+    permissions:
+      contents: read
+      packages: write
     env:
-      TAG: ${{ inputs.tag }}
-      TARGET: ${{ inputs.target }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+      TARGET: ${{ inputs.target || 'full' }}
       IMAGE: ghcr.io/warpfront/hipfire
       GPU_ARCHES: gfx1100 gfx1151 gfx1201
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
 
       # The ROCm layers unpack to tens of GB, more than a hosted runner's root
       # volume has free, so Docker stores images on the /mnt scratch disk.
@@ -117,19 +112,15 @@ jobs:
           docker run --rm --entrypoint sh "$VERSION_TAG" \
             -c 'ls /opt/hipfire/bin/kernels/compiled'
 
-      # Publishing is disabled until Kaden approves it. Enabling needs the
-      # tag trigger, `packages: write` on this job, and these guards flipped.
       # The repository's Actions allowlist admits only GitHub-owned and a few
       # named third-party actions, so login and build use the runner's docker
       # CLI (buildx ships with it) instead of docker/* actions.
       - name: Log in to ghcr.io
-        if: ${{ false }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push image tags
-        if: ${{ false }}
         run: |
           docker push "$VERSION_TAG"
           docker push "$MOVING_TAG"
