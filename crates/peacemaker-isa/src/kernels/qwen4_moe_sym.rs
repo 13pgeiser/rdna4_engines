@@ -235,6 +235,36 @@ pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
 }
 
 impl Spec {
+    /// One MQ4 entry from its CLI `--epi` spelling: `gate_up`/`down` (the
+    /// 16-slot NT1 entry), `gate_up_ntN`/`down_ntN` (expert-run tile width
+    /// `N`) or `down_nt4rR` (`R` contiguous 64-row blocks per CTA). The result
+    /// is not validated (`emit` validates).
+    pub fn from_epi(epi: &str, arch: Arch) -> Result<Self, String> {
+        let (kind, tile) = match epi.rsplit_once("_nt") {
+            Some((k, n)) => (k, Some(n)),
+            None => (epi, None),
+        };
+        let (nt, rr) = match tile {
+            Some(t) => {
+                let (n, r) = t.split_once('r').map_or((t, None), |(n, r)| (n, Some(r)));
+                (
+                    n.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
+                    match r {
+                        Some(r) => r.parse::<u8>().map_err(|e| format!("--epi {epi}: {e}"))?,
+                        None => 1,
+                    },
+                )
+            }
+            None => (1, 1),
+        };
+        Ok(Self {
+            arch,
+            kind: kind.parse()?,
+            nt,
+            rr,
+            codec: WeightCodec::Mq4Sym,
+        })
+    }
     pub fn symbol(self) -> String {
         let infix = match self.codec {
             WeightCodec::Mq4Sym => "",
