@@ -65,6 +65,7 @@ struct ImgReq {
     std::string background = "auto", format = "png", quality = "auto";
     int32_t     compression = -1;
     bool        stream = false;
+    bool        rebalance = false;
     std::vector<mm::FrameRGBA> images;
     bool        has_mask = false;
     mm::FrameRGBA mask;
@@ -87,7 +88,7 @@ json form_value(const std::string& key, const std::string& v) {
         if (e && *e == 0 && !v.empty()) return json(x);
         return json(v);
     }
-    if (key == "stream") {
+    if (key == "stream" || key == "rebalance") {
         if (v == "true" || v == "1") return json(true);
         if (v == "false" || v == "0") return json(false);
     }
@@ -243,6 +244,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         "style", "user", "input_fidelity", "seed", "negative_prompt", "true_cfg_scale",
         "guidance_scale",
         "num_inference_steps", "width", "height", "loras", "lora", "sampler", "scheduler",
+        "rebalance",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -395,6 +397,13 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         r.seed = (uint64_t)body["seed"].get<int64_t>();
         r.seed_given = body["seed"].is_number_unsigned() || body["seed"].get<int64_t>() != -1;
     }
+    /* Krea 2's fixed tap gains (ConditioningKrea2Rebalance's defaults, arch/krea2); other models
+     * ignore it. */
+    if (body.contains("rebalance") && !body["rebalance"].is_null()) {
+        if (!body["rebalance"].is_boolean())
+            return error_response(err_bad("rebalance", "expected true or false"), req.peer);
+        r.rebalance = body["rebalance"].get<bool>();
+    }
     if (str("negative_prompt", &r.negative) < 0)
         return error_response(err_bad("negative_prompt", "expected a string"), req.peer);
     /* The scale in the model card's terms: off at 0 for a card that states it as
@@ -527,6 +536,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     g->scheduler = r.scheduler;
     g->seed = r.seed;
     g->previews = r.previews;
+    g->cond_opts = r.rebalance ? RAD_GEN_COND_REBALANCE : 0;
     /* The driver guides as uncond + cfg (cond - uncond); a card's cond + s (cond - uncond) is
      * that at s + 1. */
     g->cfg = (float)(info.cfg_original ? r.cfg + 1.0 : r.cfg);

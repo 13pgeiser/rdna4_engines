@@ -118,6 +118,8 @@ struct Request {
      * for none, and the hold that keeps the slot's adapters in it until the request is done. */
     int32_t              lora_slot = -1;
     std::shared_ptr<void> lora_hold;
+    /* RAD_GEN_COND_* for the plugin's COND passes (`rebalance`: Krea 2's tap gains). */
+    int32_t              cond_opts = 0;
     std::shared_ptr<Ticket> ticket;
 };
 

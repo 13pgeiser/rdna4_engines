@@ -816,6 +816,7 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
         G.aux_cu = n_aux ? dptr<int32_t>(ri, R_AUX) : nullptr;
         G.aux_ids = n_aux ? dptr<int32_t>(ri, R_AUX) + 2 : nullptr;
         G.tokens_h = hptr<int32_t>(R_TOK);
+        G.cond_opts = j.req->cond_opts;
         if (joint()) {
             B.n_kv_groups = 0;
             B.kv = nullptr;

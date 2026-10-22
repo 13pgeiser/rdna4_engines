@@ -378,7 +378,15 @@ typedef struct RadGenBatch {
     /* COND: the pass's token ids on the host ([n_tok]), for a plugin whose issue depends on
      * where a window's end-of-text marker sits. */
     const int32_t* tokens_h;
+    /* ---- appended in ABI 26 (Krea 2's rebalance) */
+    /* COND: the request's RAD_GEN_COND_* options, 0 for none. */
+    int32_t        cond_opts;
 } RadGenBatch;
+
+/* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
+enum {
+    RAD_GEN_COND_REBALANCE = 1   /* Krea 2: the text taps at the plugin's fixed rebalance gains */
+};
 
 /* An entry's flags on a DENOISE pass. */
 enum {

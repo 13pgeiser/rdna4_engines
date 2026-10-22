@@ -2066,7 +2066,9 @@ under Qwen's research license, non-commercial.
 (`background: transparent` is a 400), 1024x1024 by default, sides rounded down to multiples of 16,
 up to 2048x2048 (16384 latent tokens). Krea 2 Raw runs 28 steps at guidance 4.5 against an empty
 negative prompt and Turbo 8 steps unguided; Krea 2 reads only text, so `/v1/images/edits` answers
-501. FLUX.3 [klein] runs 16 steps unguided and its base 50 at guidance 3.5; both edit from up to ten
+501. `rebalance: true` multiplies Krea 2's twelve text taps by
+fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults
+(4, 4, 4, 4, 4, 4, 4, 10, 20, 4.4, 16, 4); other models ignore the field. FLUX.3 [klein] runs 16 steps unguided and its base 50 at guidance 3.5; both edit from up to ten
 pictures, each shrunk to 1024x1024 of area when larger. The guidance scale is `guidance_scale` or
 `true_cfg_scale` (one of them), in the model card's terms. FLUX.3's pipeline can rewrite a prompt
 with a separate language model first; radiance reads the prompt as given.
