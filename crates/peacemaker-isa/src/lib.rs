@@ -102,6 +102,8 @@ pub mod kernels {
 #[cfg(feature = "toolchain")]
 pub mod audit;
 #[cfg(feature = "toolchain")]
+mod cert_cache;
+#[cfg(feature = "toolchain")]
 pub mod cost_lint;
 #[cfg(feature = "toolchain")]
 pub mod ledger_replay;

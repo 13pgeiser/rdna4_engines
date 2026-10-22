@@ -33,6 +33,10 @@ pub enum Cacc {
 pub enum Epi {
     Set,
     Add,
+    /// ADD with the shared-expert sigmoid residual store, hipcc `full_add_v3`
+    /// `add == 2`: `Y = fma(sigmoid(gate[token]), 0.0f + acc, Y)`. Emitted for the
+    /// token-layout `_b1` module only.
+    AddSigmoid,
     GateUpSilu,
     GateUpSiluBf16,
     QkvzaGdn,
@@ -166,6 +170,7 @@ impl Epi {
         match self {
             Self::Set | Self::QkvzaGdn => Variant::FullSet,
             Self::Add => Variant::FullAdd,
+            Self::AddSigmoid => Variant::FullAddSigmoid,
             Self::GateUpSilu | Self::GateUpSiluBf16 => Variant::GateUpSilu,
         }
     }
@@ -173,6 +178,7 @@ impl Epi {
         match self {
             Self::Set => "set",
             Self::Add => "add",
+            Self::AddSigmoid => "addsigmoid",
             Self::GateUpSilu => "silu",
             Self::GateUpSiluBf16 => "silu-bf16",
             Self::QkvzaGdn => "qkvzagdn",
@@ -211,6 +217,7 @@ impl Spec {
         let stem = match self.epi {
             Epi::Set => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             Epi::Add => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+            Epi::AddSigmoid => "gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid",
             Epi::GateUpSilu | Epi::GateUpSiluBf16 => "gemm_mq4g256v2_gate_up_silu_mmq_iu4",
             Epi::QkvzaGdn => "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn",
         };
@@ -336,6 +343,14 @@ impl Spec {
                 "the slab activation layout is emitted only for the production _b1 tile".into(),
             );
         }
+        if self.epi == Epi::AddSigmoid
+            && (self.tile != Tile::T128x128x8 || self.act != ALayout::Token)
+        {
+            return Err(
+                "the sigmoid residual ADD is emitted only for the token-layout production _b1 tile"
+                    .into(),
+            );
+        }
         if self.epi == Epi::QkvzaGdn && self.tile != Tile::T128x128x8 {
             return Err(
                 "the fused GDN projection needs the 128-row tile (one head per tile)".into(),
@@ -382,6 +397,7 @@ impl std::str::FromStr for Epi {
         match s {
             "set" => Ok(Self::Set),
             "add" => Ok(Self::Add),
+            "addsigmoid" => Ok(Self::AddSigmoid),
             "silu" => Ok(Self::GateUpSilu),
             "silu-bf16" => Ok(Self::GateUpSiluBf16),
             "qkvzagdn" => Ok(Self::QkvzaGdn),

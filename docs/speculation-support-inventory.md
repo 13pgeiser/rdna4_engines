@@ -120,8 +120,8 @@ a new arm.
   averaged over the 4 hyper-connection streams (`hc_mean_capture_f32`, run between interpreter steps
   so the verify program is unchanged) in prefill and every verify; a capturing prefill is planned
   GPU-only (the NPU trunk pair executor and the S1 layer-major prefill build their own steps, so
-  they are bypassed). Block width: `speculation.dflash_block`, Qwen4 `auto` = 4 (the card's width
-  and the fastest measured on gfx1151), an explicit width clamped to the GPU's row-exact verify rows
+  they are bypassed). Block width: `speculation.dflash_block`, Qwen4 `auto` = 8 (with the confidence
+  cut that verifies only the draft's confident prefix, the fastest measured on gfx1151), an explicit width clamped to the GPU's row-exact verify rows
   (8 on gfx1151). The host keeps only the draft's 2048-row window of feature rows (≤ 2 × 2048 ×
   51,200 B). Chain only: greedy is the selector's argmax walk (output = AR); sampled draws from the
   selector's softmax over its top-16 and accepts with sparse-q rejection sampling against the AR

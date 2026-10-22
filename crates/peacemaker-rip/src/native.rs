@@ -11,10 +11,12 @@ use crate::value::*;
 use peacemaker_author::runtime::{
     Arrived, Cond, Exit, Phase, Place, RegionId, RingId, Transition, WgCond,
 };
-use peacemaker_isa::insn::{Instruction, MemoryClass};
+use peacemaker_isa::insn::{Instruction, MemoryClass, Wmma};
 use peacemaker_isa::kernels::common;
 use peacemaker_isa::ledger::Counter;
-use peacemaker_isa::reg::{Kind as RegKind, Live, RegRef};
+use peacemaker_isa::plan::{Access, MemoryScope};
+use peacemaker_isa::reg::{Kind as RegKind, Live, RegRef, V};
+use peacemaker_isa::vopd::{Operand, VopdF32, VopdOp};
 use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -173,6 +175,8 @@ pub(crate) const ASSOC_FNS: &[&str] = &[
     "cmp::max",
     "cmp::min",
     "mem::swap",
+    "Wmma::iu4",
+    "Wmma::fp8",
 ];
 /// Method names `wg_method` implements on `Workgroup` / `Wave`.
 pub(crate) const WORKGROUP_METHODS: &[&str] = &[
@@ -235,6 +239,8 @@ pub fn is_type(n: &str) -> bool {
             | "Builder"
             | "Instruction"
             | "Chain"
+            | "Wmma"
+            | "VopdOp"
             | "Ring"
             | "Workgroup"
             | "Option"
@@ -251,7 +257,7 @@ pub fn is_type(n: &str) -> bool {
 }
 
 pub fn is_struct(n: &str) -> bool {
-    matches!(n, "KernelSpec" | "GatherTemps")
+    matches!(n, "KernelSpec" | "GatherTemps" | "VopdOp")
 }
 
 pub fn global_const<'a>(n: &str) -> Option<Value<'a>> {
@@ -378,6 +384,86 @@ fn insn_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Instruction> {
         Some(Nat::Insn(i)) => Ok((*i).clone()),
         _ => Err("expected an Instruction".into()),
     }
+}
+
+fn vgpr_of<'a, const N: u8>(it: &Interp<'a>, v: &Value<'a>) -> Res<V<N>> {
+    let r = reg_of(it, v, "WMMA operand")?;
+    if r.kind != RegKind::V || r.len != N {
+        return Err(format!("WMMA operand requires {N} VGPRs, found {r}"));
+    }
+    Ok(V::<N>(r.base))
+}
+
+fn wmma_acc_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Option<V<8>>> {
+    match it.deref(v.clone()) {
+        Value::Enum(t, var, p) if &*t == "Option" => match (&*var, p.as_slice()) {
+            ("Some", [v]) => Ok(Some(vgpr_of(it, v)?)),
+            ("None", []) => Ok(None),
+            _ => Err("WMMA accumulator requires Some(vr(base, 8)) or None".into()),
+        },
+        _ => Err("WMMA accumulator requires Some(vr(base, 8)) or None".into()),
+    }
+}
+
+fn vopd_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<VopdOp> {
+    let Value::Struct(ty, fields) = it.deref(v.clone()) else {
+        return Err("vopd requires VopdOp { op, dst, src0, src1 }".into());
+    };
+    if &*ty != "VopdOp" {
+        return Err("vopd requires VopdOp { op, dst, src0, src1 }".into());
+    }
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| &**n == name)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("VopdOp is missing `{name}`"))
+    };
+    let op = str_of(it, &get("op")?, "VopdOp.op")?;
+    let op = match op.as_str() {
+        "add" => VopdF32::Add,
+        "sub" => VopdF32::Sub,
+        "subrev" => VopdF32::Subrev,
+        "mul" => VopdF32::Mul,
+        "fmac" => VopdF32::Fmac,
+        _ => {
+            return Err(format!(
+                "VopdOp: unknown operation `{op}` (expected add, sub, subrev, mul, fmac)"
+            ))
+        }
+    };
+    let src0 = match it.deref(get("src0")?) {
+        Value::Nat(Nat::Reg(r)) if r.len == 1 => match r.kind {
+            RegKind::V => Operand::V(r.base),
+            RegKind::S => Operand::S(r.base),
+        },
+        Value::Tuple(xs) if xs.len() == 2 => {
+            match str_of(it, &xs[0], "VopdOp.src0 kind")?.as_str() {
+                "lit" => Operand::Lit(u32_of(it, &xs[1], "VopdOp literal")?),
+                "inline" => Operand::Inline(
+                    i8::try_from(int(it, &xs[1], "VopdOp inline")?)
+                        .map_err(|_| "VopdOp inline: value does not fit i8".to_string())?,
+                ),
+                _ => {
+                    return Err(
+                        "VopdOp.src0 requires v(n), s(n), (\"lit\", u32) or (\"inline\", i8)"
+                            .into(),
+                    )
+                }
+            }
+        }
+        _ => {
+            return Err(
+                "VopdOp.src0 requires v(n), s(n), (\"lit\", u32) or (\"inline\", i8)".into(),
+            )
+        }
+    };
+    Ok(VopdOp {
+        op,
+        dst: u8_of(it, &get("dst")?, "VopdOp.dst")?,
+        src0,
+        src1: u8_of(it, &get("src1")?, "VopdOp.src1")?,
+    })
 }
 /// An `Instruction` consumed by the active driver, validated against the
 /// driver's arch before the driver sees it.
@@ -702,6 +788,28 @@ fn trans_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Vec<Transition>> {
         })
         .collect()
 }
+
+/// Raw builders name backend slots, not the driver's opaque region/ring ids.
+fn slot_trans_of<'a>(
+    it: &Interp<'a>,
+    v: &Value<'a>,
+) -> Res<Vec<peacemaker_author::SlotTransition>> {
+    handles(it, v)
+        .iter()
+        .map(|t| match it.deref(t.clone()) {
+            Value::Enum(ty, variant, fields) if &*ty == "SlotTransition" && fields.len() == 1 => {
+                let slot = usize_of(it, &fields[0], "LDS slot")?;
+                match &*variant {
+                    "Ready" => Ok(peacemaker_author::SlotTransition::Ready(slot)),
+                    "Retire" => Ok(peacemaker_author::SlotTransition::Retire(slot)),
+                    _ => Err("unknown raw LDS slot transition".into()),
+                }
+            }
+            Value::Nat(Nat::Trans(_)) => Err("raw Builder barriers require ready(slot)/retire(slot) with integer LDS slot ids; driver region/ring transitions must use Workgroup barriers".into()),
+            o => Err(format!("raw Builder barrier carries ready(slot)/retire(slot), found {}", o.type_name())),
+        })
+        .collect()
+}
 fn pend<'a>(p: Place) -> Value<'a> {
     nat(Nat::Pend(p))
 }
@@ -832,6 +940,18 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             let i = Instruction::new(str_of(it, &a[0], "Instruction::new text")?, regs_of(it, &a[1], "Instruction::new defs")?, regs_of(it, &a[2], "Instruction::new uses")?);
             Ok(nat(Nat::Insn(Rc::new(i))))
         }
+        "Wmma::iu4" | "Wmma::fp8" => {
+            need(5)?;
+            let arch = arch_of(it, &a[0])?;
+            let dst = vgpr_of(it, &a[1])?;
+            let x = vgpr_of(it, &a[2])?;
+            let insn = |i| nat(Nat::Insn(Rc::new(i)));
+            if name == "Wmma::iu4" {
+                Ok(insn(Wmma::iu4(arch, dst, x, vgpr_of(it, &a[3])?, wmma_acc_of(it, &a[4])?)))
+            } else {
+                Ok(done_with(Wmma::fp8(arch, dst, x, vgpr_of(it, &a[3])?, wmma_acc_of(it, &a[4])?), insn))
+            }
+        }
         "KernargLayout::new" => {
             need(1)?;
             Ok(nat(Nat::Kernargs(KernargLayout::new(u32_of(it, &a[0], "KernargLayout::new")?))))
@@ -879,12 +999,24 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             if a.is_empty() || a.len() > 2 {
                 return Err(format!("`{name}` takes a region (and its Drained token)").into());
             }
+            if matches!(it.deref(a[0].clone()), Value::Int(_, _)) {
+                need(1)?;
+                let slot = usize_of(it, &a[0], "LDS slot")?;
+                return Ok(Value::Enum(
+                    "SlotTransition".into(),
+                    if name == "ready" { "Ready" } else { "Retire" }.into(),
+                    vec![Value::usize(slot)],
+                ));
+            }
             let r = region_of(it, &a[0])?;
             Ok(nat(Nat::Trans(if name == "ready" { Transition::Ready(r) } else { Transition::Retire(r) })))
         }
         "rotate" | "prime" | "retire_cur" => {
             if a.is_empty() || a.len() > 2 {
                 return Err(format!("`{name}` takes a ring (and its Drained token)").into());
+            }
+            if matches!(it.deref(a[0].clone()), Value::Int(_, _)) {
+                return Err(format!("{name} is a driver-only ring transition; raw Builder barriers accept only ready(slot)/retire(slot) with integer LDS slot ids").into());
             }
             let g = ring_of(it, &a[0])?;
             Ok(nat(Nat::Trans(match name {
@@ -976,6 +1108,38 @@ fn finish_cb<'a>(cb: Cb<'a>, r: Res<()>, v: Value<'a>) -> R<'a> {
     Ok(done_with(r, |()| v))
 }
 
+/// Bridge a script closure onto a builder draft without aliasing its mutable borrow.
+fn run_builder_cb<'a>(
+    it: &Interp<'a>,
+    f: &Value<'a>,
+    draft: &mut Builder,
+    cb: &mut Cb<'a>,
+) -> Res<()> {
+    let cell = Rc::new(RefCell::new(Some(draft.clone())));
+    let mut cx = Cx {
+        d: None,
+        fwd: None,
+        brk: None,
+    };
+    let v = match it.call_value(f, vec![nat(Nat::Builder(cell.clone()))], &mut cx) {
+        Ok(v) | Err(Ctl::Return(v)) => v,
+        Err(other) => {
+            cb.fail = Some(other);
+            return Err("script fault".into());
+        }
+    };
+    if let Value::Enum(t, var, mut p) = it.deref(v) {
+        if &*t == "Result" && &*var != "Ok" {
+            return Err(crate::fmt::display(&p.pop().unwrap_or(Value::Unit)).unwrap_or_else(|e| e));
+        }
+    }
+    *draft = cell
+        .borrow_mut()
+        .take()
+        .ok_or("the callback builder was already finished")?;
+    Ok(())
+}
+
 pub fn method<'a>(
     it: &Interp<'a>,
     n: &Nat,
@@ -1011,6 +1175,21 @@ pub fn method<'a>(
                     u32_of(it, &a[1], "pointer")?,
                 ))))
             }
+            "pointer_access" => {
+                need(3)?;
+                let access = str_of(it, &a[2], "pointer_access")?;
+                let access = match access.as_str() {
+                    "read_only" => Access::ReadOnly,
+                    "write_only" => Access::WriteOnly,
+                    "read_write" => Access::ReadWrite,
+                    _ => return Err(format!("pointer_access: unknown access `{access}` (expected read_only, write_only, read_write)").into()),
+                };
+                Some(nat(Nat::Kernargs(k.clone().pointer_access(
+                    &str_of(it, &a[0], "pointer_access")?,
+                    u32_of(it, &a[1], "pointer_access")?,
+                    access,
+                ))))
+            }
             "hidden" => {
                 need(4)?;
                 Some(nat(Nat::Kernargs(k.clone().hidden(
@@ -1024,6 +1203,30 @@ pub fn method<'a>(
             _ => None,
         },
         Nat::Plan(p) => match name {
+            "add_range" => {
+                need(5)?;
+                let kind = str_of(it, &a[1], "add_range kind")?;
+                let kind = match kind.as_str() {
+                    "v" => RegKind::V,
+                    "s" => RegKind::S,
+                    _ => {
+                        return Err(format!(
+                            "add_range: unknown register kind `{kind}` (expected v, s)"
+                        )
+                        .into())
+                    }
+                };
+                let Some(Nat::Live(live)) = nat_of(it, &a[4]) else {
+                    return Err("the last argument is a Live range".into());
+                };
+                Some(done(p.borrow_mut().add_range(
+                    &str_of(it, &a[0], "register name")?,
+                    kind,
+                    u8_of(it, &a[2], "register base")?,
+                    u8_of(it, &a[3], "register length")?,
+                    live,
+                )))
+            }
             "s" | "v" => {
                 need(3)?;
                 let width = match targs.first() {
@@ -1069,6 +1272,107 @@ pub fn method<'a>(
             _ => None,
         },
         Nat::Builder(_) | Nat::Isa => match name {
+            "release_store_sources" | "lds_relayout" | "barrier_wait" => {
+                need(0)?;
+                Some(done(with_b(
+                    it,
+                    &Value::Nat(n.clone()),
+                    cx,
+                    |b| match name {
+                        "release_store_sources" => b.release_store_sources(),
+                        "lds_relayout" => b.lds_relayout(),
+                        _ => b.barrier_wait(),
+                    },
+                )?))
+            }
+            "push" | "ds_crosslane" => {
+                need(1)?;
+                let insn = insn_of(it, &a[0])?;
+                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    if name == "push" {
+                        insn.check_raw()?;
+                    }
+                    crate::validate::instruction(b.spec.arch, &insn.text, &insn.defs, &insn.uses)?;
+                    if name == "push" {
+                        b.push(insn)
+                    } else {
+                        b.ds_crosslane(insn)
+                    }
+                })?))
+            }
+            "control" => {
+                need(1)?;
+                let insn = insn_of(it, &a[0])?;
+                // Symbolic branch labels cannot round-trip through the frontend validator.
+                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    b.control(insn)
+                })?))
+            }
+            "lds_slot" => {
+                need(3)?;
+                let name = str_of(it, &a[0], "LDS slot name")?;
+                let base = u32_of(it, &a[1], "LDS slot base")?;
+                let len = u32_of(it, &a[2], "LDS slot length")?;
+                Some(done_with(
+                    with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                        b.lds_slot(&name, base, len)
+                    })?,
+                    Value::usize,
+                ))
+            }
+            "ds_store" | "ds_load" => {
+                need(2)?;
+                let slot = usize_of(it, &a[0], "LDS slot")?;
+                let insn = insn_of(it, &a[1])?;
+                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    crate::validate::instruction(b.spec.arch, &insn.text, &insn.defs, &insn.uses)?;
+                    if name == "ds_store" {
+                        b.ds_store(slot, insn)
+                    } else {
+                        b.ds_load(slot, insn)
+                    }
+                })?))
+            }
+            "barrier_signal" | "barrier_with_scope" => {
+                need(if name == "barrier_signal" { 1 } else { 2 })?;
+                let transitions = slot_trans_of(it, &a[0])?;
+                let scope = if name == "barrier_with_scope" {
+                    let scope = str_of(it, &a[1], "barrier scope")?;
+                    match scope.as_str() {
+                        "lds_only" => MemoryScope::LdsOnly,
+                        "workgroup" => MemoryScope::Workgroup,
+                        _ => return Err(format!("barrier_with_scope: unknown scope `{scope}` (expected lds_only, workgroup)").into()),
+                    }
+                } else {
+                    MemoryScope::LdsOnly
+                };
+                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    if name == "barrier_signal" {
+                        b.barrier_signal(&transitions)
+                    } else {
+                        b.barrier_with_scope(&transitions, scope)
+                    }
+                })?))
+            }
+            "loop_" => {
+                need(2)?;
+                let head = str_of(it, &a[0], "loop head")?;
+                let cb = RefCell::new(Cb { fail: None });
+                let r = with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    b.loop_(&head, |draft| {
+                        run_builder_cb(it, &a[1], draft, &mut cb.borrow_mut())
+                    })
+                })?;
+                return finish_cb(cb.into_inner(), r, Value::Unit).map(Some);
+            }
+            "vopd" => {
+                need(2)?;
+                let x = vopd_of(it, &a[0])?;
+                let y = vopd_of(it, &a[1])?;
+                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    b.vopd(x, y)
+                })?))
+            }
             "enable_delay_alu" => {
                 with_b(it, &Value::Nat(n.clone()), cx, |b| b.enable_delay_alu())?;
                 Some(unit())

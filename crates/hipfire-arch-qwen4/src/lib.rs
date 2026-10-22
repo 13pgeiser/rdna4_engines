@@ -55,6 +55,7 @@ pub mod kv_backend;
 pub mod lab_window;
 pub mod lane;
 pub mod lane_exec;
+pub(crate) mod lane_token_ring;
 pub mod mesh_bindings;
 pub mod mesh_tp;
 pub mod mtp_gpu;

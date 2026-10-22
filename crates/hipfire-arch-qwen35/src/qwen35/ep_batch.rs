@@ -2771,7 +2771,7 @@ impl Qwen35DecodeBatchEpState {
 /// Every rank holds **full replicated** weights / scratch / KV / DeltaNet
 /// state EXCEPT the MoE routed experts, which were sharded per rank at load by
 /// [`shard_moe_experts`]. Behaviorally this mirrors the single-GPU
-/// [`forward_scratch`] → [`forward_scratch_layers_lowered`] pipeline (embed →
+/// [`forward_scratch`] → `forward_scratch_layers` pipeline (embed →
 /// per-layer `LayerProgram` → final norm + lm_head), but runs each layer's
 /// program through the EP executor ([`hipfire_runtime::ep::run_layer_program_ep`]):
 /// the `Moe` super-op is all-reduce-EP'd across ranks (each rank computes only

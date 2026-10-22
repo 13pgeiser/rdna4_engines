@@ -4730,6 +4730,11 @@ pub const MOE_DOWN_UNSCATTER_K8_SRC: &str =
 /// 2 kernel launches per MoE layer (~75µs each).
 pub const MOE_SCATTER_FUSED_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
+/// Multi-workgroup stable twin of [`MOE_SCATTER_FUSED_K8_SRC`] (three launches:
+/// per-chunk histogram, offsets + stable placement, inverse permutation); the
+/// exact-gfx1201 `moe_scatter_fused_k8` launcher selects it for large slot counts.
+pub const MOE_SCATTER_STABLE_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_stable_k8.hip");
 /// `moe_scatter_fused_k8.hip` as #774 left it (block-wide scan on gfx1151).
 /// The shipped k8 module compiles it on gfx1151 only
 /// ([`moe_scatter_fused_k8_src`]); Qwen4's top-10 alias always does.
@@ -5176,9 +5181,16 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
-/// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 5cf347e7f66c82bcc0f836b6c6b1030946ee9e6a6a23c4df32a2ee33021521c8
-/// (8edd7565 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
+/// Certified gfx1201 K128/T128 builder code object, all three epilogues plus the
+/// shared-expert sigmoid residual ADD `gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1`
+/// (`peacemaker-isa emit --kernel iu4_gemm --epi addsigmoid`: `Y = fma(sigmoid(gate[token]),
+/// 0.0f + acc, Y)` with hipcc `full_add_v3` `add == 2`'s sigmoid DAG imported as
+/// `iu4_gemm.sigmoid.region.s`; kernargs A, Xq, Y, M, K, N, add, shared_gate@40; appended after
+/// `qkvzagdn`, every earlier symbol's code unchanged, certified with
+/// `kernels/iu4_gemm.k128-128x128x8-cacc1.addsigmoid.contract.json`).
+/// SHA-256 49cc18eedd9507b868ecce6b05bd2993688354ed4180e1df456cafe45f34c297
+/// (previously 5cf347e7f66c82bcc0f836b6c6b1030946ee9e6a6a23c4df32a2ee33021521c8 without that symbol;
+/// 8edd7565 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
 /// 875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical; f166cf72 with the
 /// emitter's code-end tail fill appended to `.text`):
 /// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1;
@@ -8791,8 +8803,9 @@ pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
 /// `rope_partial_halfsplit_f32_headgrid` on gfx1201) compiles to:
 /// `fma(x0, cos, -(x1 * sin))`, `fma(x0, sin, x1 * cos)`. Left to the
 /// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)` on
-/// both archs and differs from the unfused chain in the last bit, so the
-/// lowered decode diverged from the hand decode (`HIPFIRE_FORWARD_LOWERED=0`).
+/// both archs and differs from the unfused chain in the last bit, so decode
+/// diverged between the fused route and the unfused one (which still runs
+/// where the fusion gate is off: TriAttention tap, VL mrope, the opt-out).
 fn qwen36_27b_fa_prep_body(entry: &str) -> String {
     let body =
         QWEN35_FA_PREP_GFX1100_SRC.replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");

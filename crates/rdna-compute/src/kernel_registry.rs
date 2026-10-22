@@ -2090,6 +2090,100 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC,
             ["rope_partial_halfsplit_f32_headgrid"]
         );
+        // Exact-gfx1151 multi-lane fn-lanes GDN decode core (default on; =0 kill switch HIPFIRE_QWEN4_GDN_LANES; tensor_ops.rs gated_delta_core_lanes).
+        add!(
+            "gdn_lanes",
+            crate::tensor_ops::GDN_LANES_SRC,
+            [
+                // GDN_LANES_SRC also compiles the complete tensor_ops translation unit.
+                "argmax_f32",
+                "bf16_roundtrip_f32",
+                "bf16_scaled_add_batched_f32",
+                "bf16_scaled_add_f32",
+                "copy_regions_u32",
+                "gated_delta_conv_bf16_f32",
+                "gated_delta_conv_bf16_f32_batched_k4",
+                "gated_delta_conv_params_bf16_f32",
+                "gated_delta_conv_qknorm_bf16_f32_batched_k4",
+                "gated_delta_gate_bf16_f32",
+                "gated_delta_gate_bf16_f32_batched",
+                "gated_delta_gate_rotate_bf16_f32_batched",
+                "gated_delta_params_bf16_f32",
+                "gated_delta_params_bf16_f32_batched",
+                "gated_delta_params_f32",
+                "gated_delta_qk_norm_bf16_batched",
+                "gated_delta_rollback_layers_f32",
+                "gated_delta_rollback_layers_q8",
+                "gated_delta_step_f32",
+                "gated_delta_step_gate_norm128_gfx1151",
+                "gated_delta_step_gate_norm128_q8",
+                "gated_delta_step_gate_norm128_q8ef",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                "gated_delta_step_halves_state128_persistent256_capture_f32",
+                "gated_delta_step_halves_state128_persistent256_capture_q8",
+                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
+                "gated_delta_step_halves_state128_persistent256_f32",
+                "gated_delta_step_halves_state128_persistent256_q8",
+                "gated_delta_step_halves_state128_persistent256_q8ef",
+                "gated_delta_step_norm128_q8",
+                "gated_delta_step_norm128_q8ef",
+                "gated_delta_step_shared_norm128_gfx1151",
+                "gdn_q8ef_residual_zero",
+                "gdn_state_f32_to_q8",
+                "gdn_state_f32_to_q8ef",
+                "gdn_state_q8_to_f32",
+                "gdn_state_q8ef_to_f32",
+                "hc_activation_fused_f32",
+                "hc_state_bf16_add_f32",
+                "hc_state_bf16_to_f32",
+                "hyper_norm_f32",
+                "hyper_norm_gate_f32",
+                "hyper_norm_gate_outputs",
+                "hyper_norm_gate_outputs_f32",
+                "hyper_read_f32",
+                "hyper_read_projected_f32",
+                "hyper_read_up_fused_f32",
+                "hyper_write_bf16x2",
+                "hyper_write_bf16x8_gfx1201",
+                "hyper_write_f32",
+                "indexed_attention_attention_f32",
+                "indexed_attention_attention_f32_batched",
+                "indexed_attention_attention_f32_batched_hg12",
+                "indexed_attention_attention_f32_batched_hg4",
+                "indexed_attention_attention_f32_batched_serial",
+                "indexed_attention_attention_f32_serial",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
+                "indexed_attention_cache_append_f32",
+                "indexed_attention_cache_append_f32_batched",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_f32",
+                "indexed_attention_decode_prologue_q8",
+                "indexed_attention_index_key_append_bf16_batched",
+                "indexed_attention_norm_rope_f32",
+                "indexed_attention_norm_rope_f32_batched",
+                "indexed_attention_pool_rope_bf16",
+                "indexed_attention_pool_rope_f32",
+                "indexed_attention_reuse_selection",
+                "indexed_attention_select_bf16_batched",
+                "indexed_attention_select_bf16_batched_serial",
+                "indexed_attention_select_f32",
+                "indexed_attention_select_f32_batched",
+                "indexed_attention_select_f32_batched_serial",
+                "indexed_attention_select_f32_serial",
+                "indexed_attention_select_from_scores",
+                "indexed_attention_select_scores_rows16_f32",
+                "indexed_attention_select_scores_rows32_f32",
+                "indexed_attention_select_scores_rows8_f32",
+                "scale_f32",
+                "gated_delta_conv_params_bf16_f32_lanes",
+                "gated_delta_step_gate_norm128_q8_lanes"
+            ]
+        );
     }
     // Qwen3.8-Flash-Next (Qwen4) load, AR prefill/decode and native MTP:
     // every module a kernel-load trace (tests/fixtures/kernel-trace-qwen4-
@@ -2215,7 +2309,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
             kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
-            ["gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",]
+            [
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+            ]
         );
         add!(
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
@@ -2710,6 +2807,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
             [
                 "gemv_q8_0_wide_k640_staged",
+                "gemv_q8_0_wide_k640_staged_bf16_scaled_add",
                 "gemv_q8_0_wide_rows",
                 "gemv_q8_0_wide_rows_wide_r16",
                 "gemv_q8_0_wide_rows_wide_r32",
@@ -3353,6 +3451,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
             [
                 "gemv_q8_0_wide_k640_staged",
+                "gemv_q8_0_wide_k640_staged_bf16_scaled_add",
                 "gemv_q8_0_wide_rows",
                 "gemv_q8_0_wide_rows_wide_r16",
                 "gemv_q8_0_wide_rows_wide_r32",
@@ -3460,6 +3559,17 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::moe_scatter_fused_k8_src(arch == "gfx1151"),
             ["moe_scatter_fused_k8"]
         );
+        if arch == "gfx1201" {
+            add!(
+                "moe_scatter_stable_k8",
+                kernels::MOE_SCATTER_STABLE_K8_SRC,
+                [
+                    "moe_scatter_stable_hist_k8",
+                    "moe_scatter_stable_inverse_k8",
+                    "moe_scatter_stable_place_k8"
+                ]
+            );
+        }
         add!(
             "moe_topk_renorm_k8",
             kernels::MOE_TOPK_RENORM_K8_SRC,
@@ -3468,7 +3578,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
-            ["moe_topk_renorm_k8_batched"]
+            [
+                "moe_router_softmax_topk_k8_wave",
+                "moe_topk_renorm_k8_batched"
+            ]
         );
         add!(
             "scaled_add_inplace",
@@ -7776,10 +7889,10 @@ mod tests {
             "v2i_t Qfr[16]",
             "constexpr int TK = 48",
             "LDS + 49920",
-            "const uint32_t* p32 = (const uint32_t*)p",
-            "kg * 8 + j, seq_len - 1",
-            "dc * 16 + (ml & ~3)",
-            "word >> (8 * (ml & 3))",
+            "const uint32_t* p = (const uint32_t*)(k_cache",
+            "min(kb + r, seq_len - 1)",
+            "vp + (unsigned long long)key * QR_KV_STRIDE",
+            "__builtin_amdgcn_perm(w1, w0, 0x05010400u)",
         ] {
             assert!(
                 body.contains(contract),
@@ -8862,8 +8975,11 @@ mod tests {
         }
         // The native A3B port is a new module, not a historical P0 or S1 row.
         // Keep the earlier inventory cohorts and their membership guards intact.
-        const NATIVE_A3B_ADDED_MODULES: [&str; 1] =
-            ["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201"];
+        // The exact-gfx1201 multi-workgroup MoE scatter is likewise its own module.
+        const NATIVE_A3B_ADDED_MODULES: [&str; 2] = [
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+            "moe_scatter_stable_k8",
+        ];
         for module in NATIVE_A3B_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),

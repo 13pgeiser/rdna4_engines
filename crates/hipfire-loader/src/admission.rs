@@ -21,6 +21,7 @@ use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{KvMode, VMode};
+pub use hipfire_runtime::loader_api::BatchLoadRequest;
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 use hipfire_runtime::mesh_placement::{
     pp_rank_order, resolve_edge_transports, AdmittedMesh, AdmittedRank, BandPlacement,
@@ -401,6 +402,12 @@ pub(crate) fn partial_offload_refusal(
         let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
             .map_err(|e| format!("qwen35 config: {e}"))?;
         (config.paged_experts, config.reap_keep.is_some())
+    } else if arch_id == 11 {
+        // LFM2.5 parses its own REAP keep-map inside `Lfm2MoeConfig::from_hfq`
+        // (`apply_reap_plan`). It has no paged-expert route.
+        let config = hipfire_arch_lfm2moe::Lfm2MoeConfig::from_hfq(hfq)
+            .map_err(|e| format!("lfm2moe config: {e}"))?;
+        (false, config.reap_keep.is_some())
     } else {
         (false, false)
     };
@@ -416,13 +423,13 @@ pub(crate) fn partial_offload_refusal(
 fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
     use hipfire_config::memory::SpillRefusal::*;
     match refusal {
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
-        // RAM. Qwen4 has its own expert-residency route and the other arches have
-        // none, so either knob is a request this loader cannot honour.
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
         Arch(arch_id) => format!(
-            "load refused: partial GPU offload ({keys}) only works for Qwen3.5 dense and MoE \
-             models; this model is a different architecture (arch id {arch_id}). Unset both keys \
-             for this model"
+            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
+             and LFM2.5 only; this source is arch id {arch_id}. Unset both keys for this model"
         ),
         Tp(tp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
@@ -1051,6 +1058,11 @@ pub struct SourceAdmission {
     /// free-VRAM delta gate); `Some` = `Gpus::init_layers`. Carriers consume
     /// this value and never reread the environment.
     pub pp_layer_counts: Option<Vec<usize>>,
+    /// The continuous-batch request of this load (default off). Admission
+    /// never sets it; the caller that will stage lanes after the load sets it
+    /// on the admitted handle before the load, and the carrier forwards it
+    /// through `LoadCtx::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -1440,6 +1452,20 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
         format!(
             "image generation (arch 40/45) needs an RDNA3/3.5 GPU (gfx11 wave32 WMMA); \
              detected {gpu_arch}. See docs/IMAGEGEN.md §1."
+        )
+    })
+}
+
+/// #666 G11: Muse Glimmer (arch 14) is served on one device only until the
+/// G13 dense axes give it a pipeline/tensor placement. Any parallel degree
+/// (`pp`, `tp`, `topology.ep`) is refused here, before teardown or
+/// allocation, instead of reaching a generic EP or carrier refusal or being
+/// ignored (`topology.ep`).
+fn muse_glimmer_topology_refusal(arch_id: u32, pp: usize, tp: usize, ep: usize) -> Option<String> {
+    (arch_id == 14 && (pp > 1 || tp > 1 || ep > 1)).then(|| {
+        format!(
+            "muse_glimmer: single-device only; pp={pp}, tp={tp}, topology.ep={ep} requested \
+             (no pipeline, tensor or expert parallel placement exists for arch 14)"
         )
     })
 }
@@ -2334,6 +2360,12 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    if arch_id == 14 {
+        let ep = hipfire_config::topology::ep()?;
+        if let Some(refusal) = muse_glimmer_topology_refusal(arch_id, pp, tp, ep) {
+            return Err(refusal);
+        }
+    }
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
@@ -2947,6 +2979,7 @@ pub fn admit_source_with_options(
         mesh,
         pp_bands,
         pp_layer_counts,
+        batch_request: BatchLoadRequest::default(),
     })
 }
 
@@ -4153,6 +4186,18 @@ mod tests {
         // Non-diffusion archs never hit this gate, on any arch string.
         assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    #[test]
+    fn muse_glimmer_refuses_every_parallel_axis() {
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (1, 4, 1), (1, 1, 2), (1, 1, 4)] {
+            let err = muse_glimmer_topology_refusal(14, pp, tp, ep)
+                .unwrap_or_else(|| panic!("pp={pp} tp={tp} ep={ep} must refuse"));
+            assert!(err.contains("single-device only"), "{err}");
+        }
+        assert_eq!(muse_glimmer_topology_refusal(14, 1, 1, 1), None);
+        // Other architectures keep their own topology gates.
+        assert_eq!(muse_glimmer_topology_refusal(5, 2, 2, 2), None);
     }
 
     /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`

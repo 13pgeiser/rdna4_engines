@@ -1304,6 +1304,7 @@ dependencies = [
  "saddle-core",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -2708,6 +2709,7 @@ version = "0.4.3"
 name = "peacemaker-rip"
 version = "0.4.3"
 dependencies = [
+ "hip-bridge",
  "peacemaker-author",
  "peacemaker-ir",
  "peacemaker-isa",
