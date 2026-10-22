@@ -112,7 +112,11 @@ fn gen_inputs(rows: usize, seed: u64) -> (Vec<u16>, Vec<f32>) {
                 }
                 3 => {
                     // Huge magnitudes: the square-sum overflows to +inf.
-                    a = if r.below(4) == 0 { 0x7f00 | (r.below(0x7f) as u16) } else { a };
+                    a = if r.below(4) == 0 {
+                        0x7f00 | (r.below(0x7f) as u16)
+                    } else {
+                        a
+                    };
                 }
                 _ => {}
             }
@@ -121,8 +125,15 @@ fn gen_inputs(rows: usize, seed: u64) -> (Vec<u16>, Vec<f32>) {
             }
             if class >= 4 && r.below(300) == 0 {
                 b = f32::from_bits(
-                    [0x7fc0_0000u32, 0x7f80_0000, 0xff80_0000, 0, 0x8000_0000, 1, 0x7f7f_ffff]
-                        [r.below(7) as usize],
+                    [
+                        0x7fc0_0000u32,
+                        0x7f80_0000,
+                        0xff80_0000,
+                        0,
+                        0x8000_0000,
+                        1,
+                        0x7f7f_ffff,
+                    ][r.below(7) as usize],
                 );
             }
             rec[row * K + i] = a;
@@ -134,7 +145,9 @@ fn gen_inputs(rows: usize, seed: u64) -> (Vec<u16>, Vec<f32>) {
 
 fn norm_bits(seed: u64) -> Vec<u16> {
     let mut r = Rng(seed | 1);
-    (0..DIM).map(|_| bf16_bits(0.25 + 1.5 * (r.unit() * 0.5 + 0.5))).collect()
+    (0..DIM)
+        .map(|_| bf16_bits(0.25 + 1.5 * (r.unit() * 0.5 + 0.5)))
+        .collect()
 }
 
 fn dtoh(gpu: &Gpu, ptr: *mut c_void, bytes: usize) -> Vec<u8> {
@@ -164,14 +177,28 @@ struct Operands {
 fn operands(gpu: &mut Gpu, rows: usize, seed: u64) -> Operands {
     let (rec, z) = gen_inputs(rows, seed);
     let rec_bytes: Vec<u8> = rec.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let norm_bytes: Vec<u8> = norm_bits(seed ^ 0x9e37).iter().flat_map(|v| v.to_le_bytes()).collect();
+    let norm_bytes: Vec<u8> = norm_bits(seed ^ 0x9e37)
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
     let rec = gpu.upload_raw(&rec_bytes, &[rows * K * 2]).expect("rec");
     let norm = gpu.upload_raw(&norm_bytes, &[DIM * 2]).expect("norm");
-    let norm = GpuTensor { dtype: DType::BF16, shape: vec![DIM], ..norm };
+    let norm = GpuTensor {
+        dtype: DType::BF16,
+        shape: vec![DIM],
+        ..norm
+    };
     let z = gpu.upload_f32(&z, &[rows * K]).expect("z");
     let out = gpu.zeros(&[rows * K], DType::F32).expect("out");
     let rotated = gpu.zeros(&[rows * K], DType::F32).expect("rotated");
-    Operands { rec, z, norm, out, rotated, rows }
+    Operands {
+        rec,
+        z,
+        norm,
+        out,
+        rotated,
+        rows,
+    }
 }
 
 impl Operands {
@@ -210,7 +237,9 @@ fn compare_blocks(gpu: &mut Gpu, o: &Operands) -> (Vec<u8>, Vec<u8>) {
     let bytes = (K / 128) * rows * BLOCK_BYTES;
     let args = o.gate_args();
     fn_gdn_dense::gate(gpu, &args, None).expect("reference gate");
-    let ref_ptr = gpu.mq6_i8_prepare_x(&o.out, K, rows).expect("reference producer");
+    let ref_ptr = gpu
+        .mq6_i8_prepare_x(&o.out, K, rows)
+        .expect("reference producer");
     assert_eq!(gpu.last_launched_kernel(), Some("mq_rotate_x_i8_gfx12"));
     let reference = dtoh(gpu, ref_ptr, bytes);
     poison(gpu, ref_ptr, bytes);
@@ -232,18 +261,25 @@ fn compare_blocks(gpu: &mut Gpu, o: &Operands) -> (Vec<u8>, Vec<u8>) {
 #[test]
 #[ignore = "needs an exact gfx1201"]
 fn blocks_are_bytewise_the_two_launch_chain() {
-    let Some(mut gpu) = require_gfx1201() else { return };
+    let Some(mut gpu) = require_gfx1201() else {
+        return;
+    };
     for (n, rows) in [1usize, 16, 777, 4093, 4096, 16384].into_iter().enumerate() {
         let o = operands(&mut gpu, rows, 0x1234_5678 + n as u64);
         let (reference, fused) = compare_blocks(&mut gpu, &o);
         // Not vacuous: real blocks (non-zero scales) were produced and compared.
         let nonzero_d = reference
-            .chunks_exact(BLOCK_BYTES)
+            .as_chunks::<BLOCK_BYTES>()
+            .0
+            .iter()
             .filter(|b| b[..4] != [0; 4])
             .count();
         assert!(nonzero_d > 0, "rows {rows}: no block has a scale");
         if rows >= 16 {
-            assert!(nonzero_d < reference.len() / BLOCK_BYTES, "rows {rows}: no all-zero block");
+            assert!(
+                nonzero_d < reference.len() / BLOCK_BYTES,
+                "rows {rows}: no all-zero block"
+            );
         }
         assert_eq!(reference.len(), fused.len());
         eprintln!(
@@ -258,7 +294,7 @@ fn blocks_are_bytewise_the_two_launch_chain() {
 fn gen_weights(m: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed | 1);
     let mut w = vec![0u8; m * (K / 256) * GROUP_BYTES];
-    for g in w.chunks_exact_mut(GROUP_BYTES) {
+    for g in w.as_chunks_mut::<GROUP_BYTES>().0 {
         for h in 0..2 {
             let s = f16::from_f32(1e-4 + r.unit().abs() * 1e-3);
             let z = f16::from_f32(-32.0 * s.to_f32() + r.unit() * s.to_f32());
@@ -276,9 +312,13 @@ fn gen_weights(m: usize, seed: u64) -> Vec<u8> {
 #[test]
 #[ignore = "needs an exact gfx1201"]
 fn out_projection_gemm_bytes_are_unchanged() {
-    let Some(mut gpu) = require_gfx1201() else { return };
+    let Some(mut gpu) = require_gfx1201() else {
+        return;
+    };
     let m = 2560;
-    let w = gpu.upload_raw(&gen_weights(m, 0x77), &[m * (K / 256) * GROUP_BYTES]).expect("w");
+    let w = gpu
+        .upload_raw(&gen_weights(m, 0x77), &[m * (K / 256) * GROUP_BYTES])
+        .expect("w");
     for (n, rows) in [4096usize, 777].into_iter().enumerate() {
         let o = operands(&mut gpu, rows, 0xabcd_0000 + n as u64);
         let args = o.gate_args();
@@ -288,16 +328,31 @@ fn out_projection_gemm_bytes_are_unchanged() {
         let y_fused16 = gpu.zeros(&[rows * m], DType::BF16).expect("y_fused16");
         fn_gdn_dense::gate(&mut gpu, &args, None).expect("gate");
         let xq = gpu.mq6_i8_prepare_x(&o.out, K, rows).expect("producer");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref, m, K, rows).expect("gemm ref");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref16, m, K, rows).expect("gemm ref bf16");
+        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref, m, K, rows)
+            .expect("gemm ref");
+        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_ref16, m, K, rows)
+            .expect("gemm ref bf16");
         let xq = fn_gdn_dense::gate_i8(&mut gpu, &args).expect("fused");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused, m, K, rows).expect("gemm fused");
-        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused16, m, K, rows).expect("gemm fused bf16");
+        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused, m, K, rows)
+            .expect("gemm fused");
+        gpu.gemm_mq6g256v2_i8_prequant(&w, xq, &y_fused16, m, K, rows)
+            .expect("gemm fused bf16");
         for (a, b, what) in [(&y_ref, &y_fused, "F32"), (&y_ref16, &y_fused16, "BF16")] {
-            let (a, b) = (gpu.download_raw_bytes(a).unwrap(), gpu.download_raw_bytes(b).unwrap());
+            let (a, b) = (
+                gpu.download_raw_bytes(a).unwrap(),
+                gpu.download_raw_bytes(b).unwrap(),
+            );
             let bad = a.iter().zip(&b).filter(|(x, y)| x != y).count();
-            assert_eq!(bad, 0, "rows {rows} {what}: {bad} of {} output bytes differ", a.len());
-            eprintln!("rows {rows:>5} M={m} {what}: {} GEMM output bytes identical", a.len());
+            assert_eq!(
+                bad,
+                0,
+                "rows {rows} {what}: {bad} of {} output bytes differ",
+                a.len()
+            );
+            eprintln!(
+                "rows {rows:>5} M={m} {what}: {} GEMM output bytes identical",
+                a.len()
+            );
         }
         for t in [y_ref, y_fused, y_ref16, y_fused16] {
             gpu.free_tensor(t).unwrap();
@@ -306,11 +361,7 @@ fn out_projection_gemm_bytes_are_unchanged() {
     }
 }
 
-fn median_us(
-    gpu: &mut Gpu,
-    iters: usize,
-    mut f: impl FnMut(&mut Gpu),
-) -> f64 {
+fn median_us(gpu: &mut Gpu, iters: usize, mut f: impl FnMut(&mut Gpu)) -> f64 {
     for _ in 0..5 {
         f(gpu);
     }
@@ -334,7 +385,9 @@ fn median_us(
 #[test]
 #[ignore = "needs an exact gfx1201; timing"]
 fn microbench() {
-    let Some(mut gpu) = require_gfx1201() else { return };
+    let Some(mut gpu) = require_gfx1201() else {
+        return;
+    };
     for rows in [4096usize, 16384] {
         let o = operands(&mut gpu, rows, 0x5eed);
         let args = o.gate_args();

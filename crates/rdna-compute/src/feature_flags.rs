@@ -2566,6 +2566,34 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_gdn_q8_inline_enabled());
     }
 
+    /// The dense-GDN gate + out-projection A8 producer fusion: default on for
+    /// exact gfx1201 only, `0` is the kill switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_gdn_i8_fuse_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_GDN_I8_FUSE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_gdn_i8_fuse_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_i8_fuse_enabled());
+    }
+
     #[test]
     fn gfx12_mq4v2_fp8_defaults_on_gfx1201_with_opt_out() {
         // Default process policy: all four FP8 prefill flags admit on exact

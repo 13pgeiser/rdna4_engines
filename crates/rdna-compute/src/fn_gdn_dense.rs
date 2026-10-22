@@ -357,7 +357,7 @@ pub fn gate_i8_applies(gpu: &Gpu, p: &GatedDeltaGateBatched<'_>) -> bool {
         && p.value_dim == 128
         && [p.recurrent_output, p.z, p.norm]
             .iter()
-            .all(|t| t.buf.as_ptr() as usize % 16 == 0)
+            .all(|t| (t.buf.as_ptr() as usize).is_multiple_of(16))
 }
 
 /// Gated RMSNorm of the packed BF16 scan output fused with the out
