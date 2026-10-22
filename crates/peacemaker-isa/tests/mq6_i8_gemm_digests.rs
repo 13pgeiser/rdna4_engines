@@ -32,8 +32,7 @@ const PINNED: &[(&str, &str)] = &[
 ];
 
 /// sha256 of the `emit_module` text (both banded product symbols).
-const PINNED_MODULE: &str =
-    "ee29f4a2b680749d24e3552ba1613cd8445f6c5bec2158830fcc647705106d1c";
+const PINNED_MODULE: &str = "ee29f4a2b680749d24e3552ba1613cd8445f6c5bec2158830fcc647705106d1c";
 
 fn sha(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))

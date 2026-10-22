@@ -221,7 +221,7 @@ These signatures describe script values, which sometimes differ from the Rust ru
 | `join((r,s,...)) -> Result<Region>` | free-function spelling; `let rs = join((r,s))?;` |
 | `wg.split(r,first:usize) -> Result<(Region,Region)>` | split Free joined region at slot count, not byte offset; `let (r,s) = wg.split(rs,1)?;` |
 | `wg.ring(name,x,y) -> Result<Ring>` | consume distinct Free regions; `let g = wg.ring("pingpong",x,y)?;` |
-| `Ring::new(x,y) -> Result<Ring>` | unnamed ring construction; `let g = Ring::new(x,y)?;` |
+| `Ring::new(x,y) -> Ring` | ring construction over two Free regions (a bad region still errors, but the call returns the Ring itself: no `?`); `let g = Ring::new(x,y);` |
 | `g.into_steady() -> Result<Ring>` | mark current buffer vacant for steady rotation; `let g = g.into_steady()?;` |
 | `wg.ring_steady(g) -> Result<Ring>` | same steady-ring operation; `let g = wg.ring_steady(g)?;` |
 | `g.cur_index(), g.next_index() -> usize` | current/next backing indices; `let i = g.cur_index();` |
@@ -507,3 +507,57 @@ Each block is one checked `Driver::typed` call. The native takes the four rings 
 The fused per-WMMA fold stage stays inside `block`: it is interleaved within one instruction bundle. Exposing `fragments` / `bundle` / `publish_*` as separate natives is the next step if an experiment needs to change a block's inside; it uses the same bridge.
 
 The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.
+
+## 14. Production generator with fine blocks: `mq6_i8_gemm`
+
+The MQ6G256V2 x `block_i8_128` exact-INT8 GEMM (`peacemaker_isa::kernels::mq6_i8_gemm`, gfx1201) is composable from `.rip` at a finer grain than `iu4_gemm`: its natives own no LDS ring. The split:
+
+- **LDS ring operations are script statements.** The script makes the eight LDS slots and the four two-buffer rings itself (`wg.lds`, `Ring::new`), and issues every `wg.begin_write`, `wg.ds_store`, `wg.ds_load_cur`, `wg.wait_all`, `wg.signal(rotate(..))` / `wg.wait_arrived`, `loop_carried` and skip. The checked driver refuses a wrong one (a read of a buffer that is not published, a rotate over an undrained store, a signalled barrier never waited, a loop body that leaves the rings in another state). No `Driver::typed`, no `Lend`: the typed core stays sealed.
+- **Natives that touch LDS return `Instruction`s** (`mq6::store_w_insns`, `mq6::step_load_insns`, ...): the script hands them to `wg.ds_store` / `wg.ds_load_cur`.
+- **Every other native emits straight into `wg.isa()`**: fetches, decode, WMMA steps, the fold, the seed fill, the prologue's scalar and lane set-up, the epilogue.
+
+Geometry (128 rows x 128 tokens x 8 waves), the LDS layout, the register map and the two buffers per ring are a spec axis of the Rust generator and need a rebuild to change.
+
+### Coarse natives and the generator
+
+| call | meaning |
+|---|---|
+| `Mq6Gemm::emit(Mq6Spec { epi, raster, arch })?` | what `mq6_i8_gemm::emit` returns (`Emitted`); `Spec::validate` stays the gate (gfx1201 only) |
+| `Mq6Gemm::emit_module(arch)?` | `(Vec<Emitted>, text, proof_json)` of the product module (both epilogue symbols, banded raster) |
+| `Mq6Epi::{Set, SetBf16}`, `Raster::{Banded, Linear}` | the spec enums (script enum values). `Linear` is the CPU-interpreter twin's raster |
+| `Mq6Gen::new(Mq6Spec { .. })?` | the generator of one valid spec: an opaque value with read-only accessors |
+| `gen.plan()?`, `gen.kernel_spec()`, `gen.spec()` | the `RegPlan`, the `KernelSpec`, the `Mq6Spec` |
+| `gen.reg("name")` | `Option<u8>`, a physical register base by name: VGPRs `cacc acc f0 f1 tok msn a_pf0 a_pf1 w_pf0 w_pf1 ds_nx sz_nx fr_a fr_w st_alds st_wlds st_a st_w meta_lds ds_voff sz_voff sc_addr d_addr scratch fold_sc fold_zp fold_t`, SGPRs `karg srd_w srd_a0 srd_a1 srd_y step2 goff goff1 trips rs bs wave gpr200 omask tmp epi_s`, kernel arguments `arg_a arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy` |
+| `gen.slot("A0")` | `Option<(base, bytes)>` of an LDS slot: `A0 W0 A1 W1 DS0 DS1 SZ0 SZ1` |
+| `mq6::ENTRY K_BEGIN K_LOOP K_LOOP_END EPI END`, `mq6::GROUP_BYTES` | the label constants (strings) and the MQ6G256V2 group size (200) |
+| `mq6::label(tag)`, `mq6::tail_label(h)` | `.Lmq6i8_<tag>`, `.Lmq6i8_t<h>` |
+
+### Blocks
+
+`wg` is the workgroup scope of a `Workgroup::new` let initializer; `g` an `Mq6Gen`; `h` the K128 plane parity (0 or 1). Indices are checked: an out-of-range step, set, round, slot or plane is a refusal naming the native.
+
+| call | what it does |
+|---|---|
+| `mq6::prologue_front(wg, g)?` | kernel arguments (`s_load_b256` x2) and the CTA raster: the tile origin `rs`, `bs` |
+| `mq6::tile_outside_insn(g, which)?` | `Instruction`: `0` rows start at/past `M`, `1` tokens at/past `N`; consume with `wg.scmp_wg_uniform` and `wg.exit_if` |
+| `mq6::prologue_scalars(wg, g)?`, `mq6::prologue_lanes(wg, g)?` | scalars and buffer descriptors; hoisted lane offsets and fold addresses |
+| `mq6::prologue_fetch(wg, g)?`, `mq6::zero_acc(wg, g)?` | block 0's raw fetches; zero the float accumulators |
+| `mq6::fetch_a(wg, g, slab, sb, srd)?` | raw activation chunks of K32 half `sb` of slab `slab` of the block whose descriptor SGPR is `srd` (`g.reg("srd_a0")` / `srd_a1`) |
+| `mq6::fetch_w(wg, g, base)?` | raw weight dwords (both rounds) at group-relative byte offset `base` |
+| `mq6::fetch_meta(wg, g, h, hdr)?` | the next block's token word and packed row header |
+| `mq6::wait_all(wg)?` | the builder's ledger-wide wait (the staging registers are still sources of the previous stores until it) |
+| `mq6::decode_insns(g, r)?` | `Vec<Instruction>`: weight round `r`'s decode (VALU), for the script to push, spread between WMMAs |
+| `mq6::store_w_insns(g, slot, r)?`, `mq6::store_a_insns(g, slot, sb)?` | `[Instruction; 2]` LDS stores of a decoded weight round / a raw activation half into slot `slot`; issue with `wg.ds_store(ring, insn)` on the W / A ring |
+| `mq6::meta_valu(wg, g)?`, `mq6::meta_store_insns(g, plane)?` | the metadata VALU words (before the DS / SZ rings begin their write), then `[Instruction; 2]` stores into plane `plane` (the DS ring's `next_index()`) |
+| `mq6::mma(wg, g, step, set, first, i)?` | the `i`-th (0..8) `v_wmma_i32_16x16x16_iu8` of K16 step `step` (0..4) on fragment set `set`; `first` seeds from the decode scratch's `0x4B400000` octet |
+| `mq6::step_load_insns(g, slot, step, set)?` | `[Instruction; 3]`: the weight pair (W ring) and two token pairs (A ring) `ds_load_b128`s of a K16 step; issue with `wg.ds_load_cur` |
+| `mq6::seed_fill(wg, g)?` | refill the scratch with the next block's WMMA seed |
+| `mq6::fold_addr(wg, g, h)?`, `mq6::fold_token_load_insn(g, nb)?`, `mq6::fold_sz_load_insn(g, h, dst, rel)?` | fold addresses and the DS-ring / SZ-ring loads (`Instruction`s) |
+| `mq6::emit_msn(wg, g, nb)?` | `msn = -(12582912.0 + 32 s)` for token block `nb` |
+| `mq6::fold_stage(wg, g, k, stage, sc, zp)?`, `mq6::fold_fragment(wg, g, k, sc, zp)?` | fragment `k = nb * 2 + rg`'s VOPD fold: stage `0..4` (8 `mul`/`add` packets, then 4 `fmac`, 4 `mul`, 4 `fmac` pairs), or all four; `sc` / `zp` the base registers of the `sc` / `z'` octets |
+| `mq6::step_descriptor(wg, g, which)?`, `mq6::trip_end(wg, g)?` | the K-group descriptor step; the odd descriptor, group offsets and trip counter advance |
+| `mq6::trips_cmp_insn(g, "s_cmp_lg_u32")?` | `Instruction` compare of the trip counter with zero (`s_cmp_{eq,lg,lt,le,gt,ge}_{u32,i32}` only); consume with `wg.scmp_wg_uniform` |
+| `mq6::declare_block_regs(wg, g, entry, fold, end)?` | the register lifetimes of one block: fragment sets from label `entry` to `fold`, fold registers from `fold` to `end` |
+| `mq6::epilogue(wg, g)?` | everything after the `mq6::EPI` label (the script places it with `wg.label`): output descriptor, lane masks, masked stores |
+
+The committed twin [`mq6_i8_gemm.rip`](../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip) writes the whole composition: ring declaration, the prologue's staging of block 0, the K-loop (`wg_skip_if` + `loop_carried` + `block` + trip end, then the peeled pair) and the block body (queued decode / store / fetch work interleaved between WMMAs, B1 and B2 split barriers, the fold), then the epilogue. Its variants are the shipped variant names (`128x128x8-set`, `128x128x8-set_bf16`, plus `-linear`; the grammar is in the file header). `tests/mq6_i8_gemm_twin.rs` requires its `s_text` and proof to be identical to `mq6_i8_gemm::emit` for every valid spec, and `peacemaker-isa/tests/mq6_i8_gemm_digests.rs` pins `emit` itself to the digests recorded before the blocks were factored out. [Cookbook 12](cookbook/12-mq6-blocks.md) shows what to move.
