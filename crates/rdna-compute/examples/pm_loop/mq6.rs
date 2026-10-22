@@ -73,13 +73,13 @@
 //! float-reciprocal semantics, so the banded raster is refused with the
 //! emulator's own message: use `--raster linear`.
 
+use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
 use crate::iu4::{abi_signature, max_diff, sample_rows};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Raster, Spec, Tile};
 use peacemaker_isa::Arch;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::cell::OnceCell;
 use std::path::Path;
 
@@ -108,21 +108,6 @@ fn fn_presets() -> Vec<(String, (usize, usize, usize))> {
                 .map(move |&n| (format!("{name}-n{n}"), (m, n, k)))
         })
         .collect()
-}
-
-fn sha256_hex(b: &[u8]) -> String {
-    Sha256::digest(b)
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect()
-}
-
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
-}
-
-fn dev_err<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
 }
 
 fn parse_shape(s: &str) -> Result<(usize, usize, usize)> {
@@ -354,14 +339,6 @@ fn reference(
         }
     });
     out
-}
-
-fn put_ptr(b: &mut Vec<u8>, p: u64) {
-    b.extend_from_slice(&p.to_le_bytes());
-}
-
-fn put_i32(b: &mut Vec<u8>, v: i32) {
-    b.extend_from_slice(&v.to_le_bytes());
 }
 
 /// Explicit kernarg: `A Xq Y` at 0/8/16, `M K N` at 24/28/32 and the PM image's

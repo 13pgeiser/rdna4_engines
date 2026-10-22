@@ -145,6 +145,7 @@
 //! reference; if the emulator cannot lift/decode/execute some instruction it refuses with its
 //! own message verbatim.
 
+use crate::common::sha256_hex;
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use half::f16;
 use hip_bridge::DeviceBuffer;
@@ -156,7 +157,6 @@ use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 const ARCH: Arch = Arch::Gfx1201;
@@ -170,13 +170,6 @@ const DEFAULT_SAMPLE: usize = 128;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------

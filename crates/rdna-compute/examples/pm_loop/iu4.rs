@@ -54,13 +54,13 @@
 //! The default follows the builder code (`fma`); `ref-fold=muladd` selects the
 //! hipcc DAG. Output `Y[col * M + row]`, f32; ADD is `RN(Y0 + sum)`.
 
+use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use peacemaker_isa::kernels::iu4_gemm::{self, sparse24, ALayout, Epi, Mma, Spec};
 use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::cell::OnceCell;
 use std::path::Path;
 
@@ -71,17 +71,6 @@ const FULL_REF_MACS: u128 = 2_000_000_000;
 const SPARSE_GROUPS: usize = 32;
 const SPARSE_KEPT: usize = 2;
 const DEFAULT_SPARSE_SEED: u64 = 0x5eed_2404_a5a5_c3c3;
-
-fn sha256_hex(b: &[u8]) -> String {
-    Sha256::digest(b)
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect()
-}
-
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
-}
 
 /// xorshift64*.
 struct Rng(u64);
@@ -400,14 +389,6 @@ fn parse_shape(s: &str) -> Result<(usize, usize, usize)> {
     }
 }
 
-fn put_ptr(b: &mut Vec<u8>, p: u64) {
-    b.extend_from_slice(&p.to_le_bytes());
-}
-
-fn put_i32(b: &mut Vec<u8>, v: i32) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-
 /// SET/ADD explicit kernarg: `A Xq Y` at 0/8/16, `M K N add` at 24/28/32/36.
 fn pack_set_add(a: u64, xq: u64, y: u64, m: usize, k: usize, n: usize, add: bool) -> Vec<u8> {
     let mut b = Vec::with_capacity(40);
@@ -571,10 +552,6 @@ fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
         "identical_to_generator": compiled.s_text == generator.s_text,
     });
     Ok((elf, symbol, info))
-}
-
-fn dev_err<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
 }
 
 #[cfg(test)]
