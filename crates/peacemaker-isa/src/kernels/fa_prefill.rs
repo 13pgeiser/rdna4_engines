@@ -2021,7 +2021,10 @@ fn body(b: &mut Builder, g: &blocks::Gen) -> R {
             bl::softmax_sub(b, g, sub)?;
         }
         b.label(bl::TURN)?;
-        b.barrier(&[Transition::Retire(bl::SLOT_K), Transition::Retire(bl::SLOT_V)])?;
+        b.barrier(&[
+            Transition::Retire(bl::SLOT_K),
+            Transition::Retire(bl::SLOT_V),
+        ])?;
         // Continue while ktile <= gmax (`s_cmp_gt_i32` + scc0: the compare the emulator models).
         bl::next_tile(b)
     } else {
