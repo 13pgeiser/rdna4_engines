@@ -3481,6 +3481,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["hc_row_fold_norm_gate"]
         );
     }
+    // Default-on `HIPFIRE_QWEN4_HC_ROW_FOLD` on gfx1201: the MoE-tail and mixer-tail row
+    // folds, in the same module (the `__GFX12__` entries are compiled for gfx12 only).
+    if arch == "gfx1201" {
+        add!(
+            "hc_row_fold",
+            crate::hc_row_fold::SRC,
+            [
+                "hc_row_fold_norm_gate",
+                "hc_row_fold_moe_gfx1201",
+                "hc_row_write_norm_gate_gfx1201",
+            ]
+        );
+    }
     // Qwen3.5-MoE (ornith-1.5-35b-a3b) load, AR prefill/decode and native MTP,
     // plus Qwen3.5 dense (H2): every module a kernel-load trace
     // (tests/fixtures/kernel-trace-qwen35.tsv) JIT-compiled on gfx1100,
@@ -9814,6 +9827,28 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The gfx1201 HC row folds (`HIPFIRE_QWEN4_HC_ROW_FOLD`) live in `hc_row_fold`,
+        // which gfx1201 lists with its three entries (the gfx1151 module has one).
+        const HC_ROW_FOLD_ADDED_MODULES: [&str; 1] = ["hc_row_fold"];
+        for module in HC_ROW_FOLD_ADDED_MODULES {
+            let entry = by_name.get(module).unwrap_or_else(|| {
+                panic!("missing gfx1201 HC row fold module {module}");
+            });
+            assert_eq!(
+                entry.symbols,
+                [
+                    "hc_row_fold_norm_gate",
+                    "hc_row_fold_moe_gfx1201",
+                    "hc_row_write_norm_gate_gfx1201"
+                ]
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -9822,7 +9857,8 @@ mod tests {
                 + NATIVE_A3B_ADDED_MODULES.len()
                 + FIRST_REQUEST_JIT_ADDED_MODULES
                 + MQ6_I8_ADDED_MODULES.len()
-                + G64_AND_HC_CAPTURE_ADDED_MODULES.len(),
+                + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
+                + HC_ROW_FOLD_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

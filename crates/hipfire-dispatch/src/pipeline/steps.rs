@@ -1068,6 +1068,14 @@ fn execute_window<'a>(
     };
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
+    // gfx1201 row folds (`HIPFIRE_QWEN4_HC_ROW_FOLD`): the sealed MoE call takes its paired
+    // HC write and the next read's norm (any `HIPFIRE_QWEN4_HC_FUSE` level >= 1); a
+    // pregated mixer write takes the next read's norm.  Both fail closed to the
+    // unfused chain.
+    let row_fold_moe_1201 =
+        !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_hc_row_fold_moe_gfx1201_enabled();
+    let row_fold_mixer_1201 =
+        !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_hc_row_fold_mixer_gfx1201_enabled();
     while i < end {
         // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
         // as one multi-lane launch per kernel; otherwise one by one below. The
@@ -1113,6 +1121,36 @@ fn execute_window<'a>(
             };
             match &steps[i] {
                 Step::HyperWrite(write) if *pregated == Some(i) => {
+                    // gfx1201 mixer tail: this write and the next read's norm/gates in
+                    // one row kernel when the read right after it (same streams, with
+                    // its own paired write) takes the prenormed route.
+                    if row_fold_mixer_1201 {
+                        if let Some(Step::HyperRead(read)) = steps[..end].get(i + 1) {
+                            if read.input.buf.as_ptr() == write.output.buf.as_ptr()
+                                && read.rows == write.rows
+                            {
+                                if let Some((_, next_write)) = paired_hyper_write(
+                                    steps,
+                                    i + 2,
+                                    read,
+                                )
+                                .filter(|(j, next_write)| *j < end || next_write.state_bf16)
+                                .filter(|(_, next_write)| {
+                                    crate::pipeline::layer_ops::hyper_write_read_fold_applies(
+                                        gpu, write, read, next_write,
+                                    )
+                                }) {
+                                    *pregated = None;
+                                    crate::pipeline::layer_ops::execute_hyper_write_read_fold(
+                                        gpu, write, read, next_write,
+                                    )?;
+                                    *prenormed = Some(i + 1);
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     *pregated = None;
                     execute_hyper_write_pregated(gpu, write)?;
                     i += 1;
@@ -1183,12 +1221,14 @@ fn execute_window<'a>(
         // inside the call.  H4 level 3 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): when the
         // hyper write that closes the block already has its gates, the shared
         // down may carry it; a write so carried is skipped.
-        if moe_zinit || hc_level >= 3 {
+        if moe_zinit || hc_level >= 3 || row_fold_moe_1201 {
             if let (Step::Clear(clear), Some(Step::Moe(call))) =
                 (&steps[i], steps[..end].get(i + 1))
             {
                 let write = match steps[..end].get(i + 2) {
-                    Some(Step::HyperWrite(write)) if hc_level >= 3 && *pregated == Some(i + 2) => {
+                    Some(Step::HyperWrite(write))
+                        if (hc_level >= 3 || row_fold_moe_1201) && *pregated == Some(i + 2) =>
+                    {
                         Some(write)
                     }
                     _ => None,
@@ -1199,7 +1239,7 @@ fn execute_window<'a>(
                 // read may open the caller's next window of this program.
                 let next = match (write, steps.get(i + 3)) {
                     (Some(write), Some(Step::HyperRead(read)))
-                        if gpu.flags.qwen4_hc_row_fold_enabled()
+                        if (gpu.flags.qwen4_hc_row_fold_enabled() || row_fold_moe_1201)
                             && read.input.buf.as_ptr() == write.output.buf.as_ptr()
                             && read.rows == write.rows =>
                     {
@@ -1207,7 +1247,10 @@ fn execute_window<'a>(
                             .filter(|(_, next_write)| {
                                 crate::pipeline::layer_ops::hyper_read_prenorm_applies(
                                     gpu, read, next_write,
-                                )
+                                ) && (gpu.flags.qwen4_hc_row_fold_enabled()
+                                    || crate::pipeline::layer_ops::hc_row_fold_next_gfx1201_ok(
+                                        read, next_write,
+                                    ))
                             })
                             .map(|(j, next_write)| (j, read, next_write))
                     }

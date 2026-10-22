@@ -29944,6 +29944,12 @@ impl Gpu {
         }
         Ok(true)
     }
+    /// Whether `HIPFIRE_QWEN4_SHARED_DOWN_EPI` (developer, default off) lets
+    /// [`Gpu::qwen4_shared_down_bf16_epi`] take the shared down: the gfx1201 HC row
+    /// fold reproduces the generic shared down + scaled add and declines when it is on.
+    pub fn qwen4_shared_down_epi_enabled(&self) -> bool {
+        *QWEN4_SHARED_DOWN_EPI
+    }
     /// Opt-in shared-down fusion; retains the incumbent WMMA accumulation order.
     /// Returns false without launching when the existing F16 route is unavailable.
     pub fn qwen4_shared_down_bf16_epi(

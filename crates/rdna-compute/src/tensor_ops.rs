@@ -18219,6 +18219,728 @@ mod tests {
         }
     }
 
+    // ── gfx1201 HC row folds: byte oracles ──────────────────────────────────────────────
+
+    /// xorshift64* generator for the gfx1201 row-fold oracles (deterministic, no deps).
+    struct FoldRng(u64);
+
+    impl FoldRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        /// Uniform in [-1, 1).
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / 8_388_608.0 - 1.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// BF16 bit patterns a row fold must treat exactly like the unfused kernels: NaNs of
+    /// both signs and distinct payloads (quiet and signaling), +-inf, +-0, subnormals,
+    /// the largest and smallest normals, and exact 1.0.
+    const FOLD_BF16_SPECIALS: [u16; 22] = [
+        0x7fc0, 0xffc0, 0x7f81, 0xff81, 0x7fff, 0xffff, 0x7fc5, 0xffd3, 0x7f80, 0xff80, 0x0000,
+        0x8000, 0x0001, 0x8001, 0x007f, 0x807f, 0x7f7f, 0xff7f, 0x0080, 0x8080, 0x3f80, 0xbf80,
+    ];
+
+    /// The same as F32 bit patterns (payload bits below the BF16 mantissa included).
+    const FOLD_F32_SPECIALS: [u32; 26] = [
+        0x7fc0_0000,
+        0xffc0_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fc1_2345,
+        0xffc5_4321,
+        0x7fff_ffff,
+        0xffff_ffff,
+        0x7f80_0000,
+        0xff80_0000,
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x8000_0001,
+        0x007f_ffff,
+        0x807f_ffff,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x0080_0000,
+        0x8080_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x7fbf_ffff,
+        0xffa0_0001,
+        0x7f7f_0000,
+        0x0000_8000,
+    ];
+
+    /// How a row of the adversarial data behaves (`row * 7 + 3` mod 13): rows of only
+    /// specials, sparse specials, a single NaN, huge and subnormal-range magnitudes
+    /// among clean rows.
+    fn fold_row_kind(row: usize) -> usize {
+        (row * 7 + 3) % 13
+    }
+
+    fn fold_value(rng: &mut FoldRng, kind: usize, adversarial: bool, scale: f32) -> f32 {
+        let v = rng.unit();
+        if !adversarial {
+            return v * scale;
+        }
+        match kind {
+            3 => v * 1.0e30,
+            4 => v * 1.0e-39,
+            5 => v * 3.0e38,
+            _ => v * scale,
+        }
+    }
+
+    fn fold_special_f32(rng: &mut FoldRng) -> f32 {
+        match rng.below(8) {
+            0 => f32::from_bits(
+                0x7fc0_0000 | (rng.next() as u32 & 0x003f_ffff) | ((rng.next() as u32 & 1) << 31),
+            ),
+            1 => f32::from_bits(
+                0x7f80_0000
+                    | (1 + (rng.next() as u32 % 0x003f_fffe))
+                    | ((rng.next() as u32 & 1) << 31),
+            ),
+            _ => f32::from_bits(FOLD_F32_SPECIALS[rng.below(FOLD_F32_SPECIALS.len())]),
+        }
+    }
+
+    /// F32 data `[rows, width]` (per-row kinds as above when `adversarial`).
+    fn fold_f32_rows(
+        rng: &mut FoldRng,
+        rows: usize,
+        width: usize,
+        adversarial: bool,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut data = Vec::with_capacity(rows * width);
+        for row in 0..rows {
+            let kind = fold_row_kind(row);
+            for _ in 0..width {
+                data.push(if adversarial && kind == 0 {
+                    fold_special_f32(rng)
+                } else if adversarial && kind == 1 && rng.below(64) == 0 {
+                    fold_special_f32(rng)
+                } else {
+                    fold_value(rng, kind, adversarial, scale)
+                });
+            }
+            if adversarial && kind == 2 {
+                data[row * width + rng.below(width)] = fold_special_f32(rng);
+            }
+        }
+        data
+    }
+
+    /// BF16 bits `[rows, width]`, the BF16 round-to-nearest-even of F32 data with the
+    /// specials spliced in as raw bit patterns.
+    fn fold_bf16_rows(
+        rng: &mut FoldRng,
+        rows: usize,
+        width: usize,
+        adversarial: bool,
+        scale: f32,
+    ) -> Vec<u16> {
+        let mut data = Vec::with_capacity(rows * width);
+        let special = |rng: &mut FoldRng| FOLD_BF16_SPECIALS[rng.below(FOLD_BF16_SPECIALS.len())];
+        let rne = |v: f32| {
+            let u = v.to_bits();
+            ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
+        };
+        for row in 0..rows {
+            let kind = fold_row_kind(row);
+            for _ in 0..width {
+                data.push(if adversarial && kind == 0 {
+                    special(rng)
+                } else if adversarial && kind == 1 && rng.below(64) == 0 {
+                    special(rng)
+                } else {
+                    rne(fold_value(rng, kind, adversarial, scale))
+                });
+            }
+            if adversarial && kind == 2 {
+                data[row * width + rng.below(width)] = special(rng);
+            }
+        }
+        data
+    }
+
+    /// Oracle data of `variant`: 0 clean; 1 / 2 row-adversarial ([`fold_row_kind`]);
+    /// 3 clean with isolated specials (one lane in 32768, so about a quarter of the HC
+    /// rows hold one and the rest stay finite, with finite gate logits).
+    fn fold_f32_data(
+        rng: &mut FoldRng,
+        rows: usize,
+        width: usize,
+        variant: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut data = fold_f32_rows(rng, rows, width, variant == 1 || variant == 2, scale);
+        if variant == 3 {
+            for v in data.iter_mut() {
+                if rng.below(32768) == 0 {
+                    *v = fold_special_f32(rng);
+                }
+            }
+        }
+        data
+    }
+
+    fn fold_bf16_data(
+        rng: &mut FoldRng,
+        rows: usize,
+        width: usize,
+        variant: usize,
+        scale: f32,
+    ) -> Vec<u16> {
+        let mut data = fold_bf16_rows(rng, rows, width, variant == 1 || variant == 2, scale);
+        if variant == 3 {
+            for v in data.iter_mut() {
+                if rng.below(32768) == 0 {
+                    *v = FOLD_BF16_SPECIALS[rng.below(FOLD_BF16_SPECIALS.len())];
+                }
+            }
+        }
+        data
+    }
+
+    fn fold_bf16_tensor(gpu: &mut Gpu, bits: &[u16]) -> GpuTensor {
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let mut t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("bf16 upload");
+        t.dtype = DType::BF16;
+        t.shape = vec![bits.len()];
+        t
+    }
+
+    /// BF16 HC streams as the prefill holds them: BF16 bits in an F32-typed tensor of
+    /// `rows * wide` elements (twice the bytes the bits need).
+    fn fold_streams_tensor(gpu: &mut Gpu, bits: &[u16]) -> GpuTensor {
+        let mut bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        bytes.resize(bits.len() * 4, 0);
+        let mut t = gpu
+            .upload_raw(&bytes, &[bytes.len()])
+            .expect("streams upload");
+        t.dtype = DType::F32;
+        t.shape = vec![bits.len()];
+        t
+    }
+
+    /// Appends a line to `$ROWFOLD_RECEIPT` (when set) and stderr.
+    fn fold_receipt(line: &str) {
+        eprintln!("{line}");
+        if let Ok(path) = std::env::var("ROWFOLD_RECEIPT") {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("open receipt");
+            writeln!(file, "{line}").expect("write receipt");
+        }
+    }
+
+    /// Byte-compares `want` / `got` and returns the number of differing bytes.
+    fn fold_byte_diff(want: &[u8], got: &[u8]) -> usize {
+        assert_eq!(want.len(), got.len());
+        want.iter().zip(got).filter(|(a, b)| a != b).count()
+    }
+
+    fn fold_nan_words(bytes: &[u8], width: usize) -> usize {
+        match width {
+            2 => bytes
+                .chunks_exact(2)
+                .filter(|w| {
+                    let u = u16::from_le_bytes([w[0], w[1]]);
+                    (u & 0x7f80) == 0x7f80 && (u & 0x7f) != 0
+                })
+                .count(),
+            _ => bytes
+                .chunks_exact(4)
+                .filter(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]).is_nan())
+                .count(),
+        }
+    }
+
+    /// The weights of the next read's norm and its paired write's gate projection:
+    /// clean, or with NaN / inf / zero / subnormal entries spliced in.
+    fn fold_norm_gate_weights(
+        gpu: &mut Gpu,
+        rng: &mut FoldRng,
+        wide: usize,
+        adversarial: bool,
+    ) -> (GpuTensor, GpuTensor) {
+        let mut norm = fold_bf16_rows(rng, 1, wide, false, 0.3);
+        let mut gate = fold_bf16_rows(rng, 4, wide, false, 0.05);
+        if adversarial {
+            for _ in 0..6 {
+                let i = rng.below(norm.len());
+                norm[i] = FOLD_BF16_SPECIALS[rng.below(FOLD_BF16_SPECIALS.len())];
+            }
+            for _ in 0..10 {
+                let i = rng.below(gate.len());
+                gate[i] = FOLD_BF16_SPECIALS[rng.below(FOLD_BF16_SPECIALS.len())];
+            }
+        }
+        (fold_bf16_tensor(gpu, &norm), fold_bf16_tensor(gpu, &gate))
+    }
+
+    /// The unfused tail after the mixed rows: `hyper_write` (BF16 streams, in place)
+    /// then `hyper_norm_gate_outputs`.  Returns (gates, F16 row) tensors.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_reference_write_norm(
+        gpu: &mut Gpu,
+        streams: &GpuTensor,
+        mixed: &GpuTensor,
+        gates: &GpuTensor,
+        norm_weight: &GpuTensor,
+        gate_weight: &GpuTensor,
+        rows: usize,
+        m: usize,
+    ) -> (GpuTensor, GpuTensor) {
+        let wide = 4 * m;
+        let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+        hyper_write(
+            gpu,
+            &HyperWrite {
+                input: streams,
+                normalized: &normalized,
+                mixed,
+                gates,
+                output: streams,
+                branches: 4,
+                hidden: m,
+                state_bf16: true,
+            },
+        )
+        .expect("reference hyper_write");
+        let ref_gates = gpu.zeros(&[rows * 4], DType::F32).expect("ref gates");
+        let ref_row = gpu.zeros(&[rows * wide], DType::F16).expect("ref row");
+        hyper_norm_gate_outputs(
+            gpu,
+            &HyperNormGateOutputs {
+                input: streams,
+                norm_weight,
+                gate_weight,
+                gates: &ref_gates,
+                normalized_f16: &ref_row,
+                rows,
+                branches: 4,
+                hidden: m,
+                state_bf16: true,
+            },
+        )
+        .expect("reference norm gate");
+        gpu.free_tensor(normalized).expect("free");
+        (ref_gates, ref_row)
+    }
+
+    /// gfx1201 MoE-tail row fold: `hc_row_fold_moe_gfx1201` leaves the HC streams, the
+    /// next read's F16 normalized row and its paired write's gate logits bytewise as the
+    /// default chain does: zero-initialized combine -> `bf16_scaled_add_batched` (shared
+    /// down F32 rows) -> `hyper_write` (the x8 gfx1201 kernel) -> `hyper_norm_gate_outputs`.
+    /// Four data variants (0 clean; 1 row-adversarial: NaN payloads of both signs, inf,
+    /// +-0, subnormals, huge rows; 2 the same with NaN / inf / zero entries in the next
+    /// read's norm and gate weights; 3 clean with isolated specials), dead -1 routes and
+    /// unrouted experts, at 16, 17, 4096 and 4097 rows.  Set `ROWFOLD_RECEIPT`
+    /// to append one result line per case to a file.
+    #[test]
+    fn hc_row_fold_moe_gfx1201_is_bytewise_the_default_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1201() {
+            eprintln!("skip: needs gfx1201");
+            return;
+        }
+        let m = 2560usize;
+        let wide = 4 * m;
+        let ints = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for variant in 0..4usize {
+            let adversarial_data = variant >= 1;
+            let adversarial_weights = variant == 2;
+            for rows in [16usize, 17, 4096, 4097] {
+                let mut rng =
+                    FoldRng(0x9e37_79b9_7f4a_7c15 ^ ((variant as u64) << 32) ^ rows as u64);
+                let grouped_rows = (rows * 10 + 16).min(6000);
+                let (norm_weight, gate_weight) =
+                    fold_norm_gate_weights(&mut gpu, &mut rng, wide, adversarial_weights);
+                let grouped_bits = fold_bf16_data(&mut rng, grouped_rows, m, variant, 2.0);
+                let grouped = fold_bf16_tensor(&mut gpu, &grouped_bits);
+                let inverse: Vec<i32> = (0..rows * 10)
+                    .map(|i| {
+                        if i % 13 == 5 {
+                            -1
+                        } else {
+                            ((i * 7919 + variant) % grouped_rows) as i32
+                        }
+                    })
+                    .collect();
+                // Tied experts, and ids outside [0, 64) (unrouted: the order slot stays dead).
+                let experts: Vec<i32> = (0..rows * 10)
+                    .map(|i| match i % 29 {
+                        7 => -1,
+                        19 => 64 + (i % 5) as i32,
+                        _ => ((i * 37) % 64) as i32,
+                    })
+                    .collect();
+                let inverse = gpu
+                    .upload_raw(&ints(&inverse), &[rows * 40])
+                    .expect("inverse");
+                let experts = gpu
+                    .upload_raw(&ints(&experts), &[rows * 40])
+                    .expect("experts");
+                let mut weights = fold_f32_rows(&mut rng, rows, 10, false, 1.0);
+                for w in weights.iter_mut() {
+                    *w = w.abs() / 3.0;
+                }
+                if adversarial_data {
+                    let dirty = if variant == 3 {
+                        (rows / 64).max(1)
+                    } else {
+                        (rows / 4).max(1)
+                    };
+                    for _ in 0..dirty {
+                        let i = rng.below(rows * 10);
+                        weights[i] = fold_special_f32(&mut rng);
+                    }
+                }
+                let route_weights = gpu.upload_f32(&weights, &[rows * 10]).expect("weights");
+                let shared_values = fold_f32_data(&mut rng, rows, m, variant, 2.0);
+                let shared = gpu.upload_f32(&shared_values, &[rows * m]).expect("shared");
+                let selector_values = fold_f32_data(&mut rng, rows, 1, variant, 1.0);
+                let selector = gpu.upload_f32(&selector_values, &[rows]).expect("selector");
+                let gate_values = fold_f32_data(&mut rng, rows, 4, variant, 3.0);
+                let gates = gpu.upload_f32(&gate_values, &[rows * 4]).expect("gates");
+                let stream_bits = fold_bf16_data(&mut rng, rows, wide, variant, 3.0);
+                let order = gpu.zeros(&[rows * 20], DType::F32).expect("order");
+
+                // Reference: the default gfx1201 chain.
+                let routed = gpu.zeros(&[rows * m], DType::F32).expect("routed");
+                gpu.moe_down_combine_grouped_top10_bf16in(
+                    &grouped,
+                    &inverse,
+                    &experts,
+                    &route_weights,
+                    &routed,
+                    &order,
+                    m,
+                    grouped_rows,
+                    rows,
+                    true,
+                    64,
+                )
+                .expect("combine");
+                bf16_scaled_add_batched(
+                    &mut gpu,
+                    &Bf16ScaledAddBatched {
+                        residual: &routed,
+                        value: &shared,
+                        scalar: &selector,
+                        rows,
+                        elements: m,
+                    },
+                )
+                .expect("scaled add");
+                let ref_streams = fold_streams_tensor(&mut gpu, &stream_bits);
+                let (ref_gates, ref_row) = fold_reference_write_norm(
+                    &mut gpu,
+                    &ref_streams,
+                    &routed,
+                    &gates,
+                    &norm_weight,
+                    &gate_weight,
+                    rows,
+                    m,
+                );
+
+                // Fold: rank order + one row kernel (the combine output never exists).
+                let new_streams = fold_streams_tensor(&mut gpu, &stream_bits);
+                let new_gates = gpu.zeros(&[rows * 4], DType::F32).expect("new gates");
+                let new_row = gpu.zeros(&[rows * wide], DType::F16).expect("new row");
+                gpu.moe_combine_order_top10(
+                    &inverse,
+                    &experts,
+                    &route_weights,
+                    &order,
+                    grouped_rows,
+                    rows,
+                    64,
+                )
+                .expect("order");
+                gpu.hc_row_fold_moe_gfx1201(&crate::hc_row_fold::HcRowFoldMoeGfx1201 {
+                    grouped_down: &grouped,
+                    order: &order,
+                    shared_f32: &shared,
+                    selector: &selector,
+                    streams: &new_streams,
+                    gates: &gates,
+                    norm_weight: &norm_weight,
+                    gate_weight: &gate_weight,
+                    next_gates: &new_gates,
+                    normalized_f16: &new_row,
+                    rows,
+                    hidden: m,
+                })
+                .expect("moe row fold");
+
+                let words = |gpu: &Gpu, t: &GpuTensor| gpu.download_raw_bytes(t).expect("download");
+                let mut report = String::new();
+                let mut bad = 0usize;
+                for (name, want, got, width) in [
+                    (
+                        "streams",
+                        words(&gpu, &ref_streams),
+                        words(&gpu, &new_streams),
+                        2usize,
+                    ),
+                    (
+                        "gate_logits",
+                        words(&gpu, &ref_gates),
+                        words(&gpu, &new_gates),
+                        4,
+                    ),
+                    ("f16_row", words(&gpu, &ref_row), words(&gpu, &new_row), 2),
+                ] {
+                    assert_ne!(want.len(), 0);
+                    let diff = fold_byte_diff(&want, &got);
+                    bad += diff;
+                    report.push_str(&format!(
+                        " {name}:bytes={} diff={diff} nan_words={}",
+                        want.len(),
+                        if name == "f16_row" {
+                            0
+                        } else {
+                            fold_nan_words(&want, width)
+                        }
+                    ));
+                }
+                if bad != 0 {
+                    // Where the fold and the chain part: the stream word, its row / column,
+                    // the HC write's inputs there and the BF16 scaled add's.
+                    let want = words(&gpu, &ref_streams);
+                    let got = words(&gpu, &new_streams);
+                    let routed_bytes = words(&gpu, &routed);
+                    let mut shown = 0;
+                    for i in 0..rows * wide {
+                        let (w, g) = (
+                            u16::from_le_bytes([want[2 * i], want[2 * i + 1]]),
+                            u16::from_le_bytes([got[2 * i], got[2 * i + 1]]),
+                        );
+                        if w != g && shown < 8 {
+                            shown += 1;
+                            let (row, col) = (i / wide, (i % wide) % m);
+                            let mixed_bits = u32::from_le_bytes(
+                                routed_bytes[4 * (row * m + col)..4 * (row * m + col) + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            fold_receipt(&format!(
+                                "  diff row={row} branch={} col={col}: want={w:04x} got={g:04x} stream_in={:04x} \
+                                 ref_mixed={mixed_bits:08x} shared={:08x} selector={:08x} gate_logit={:08x}",
+                                (i % wide) / m,
+                                stream_bits[i],
+                                shared_values[row * m + col].to_bits(),
+                                selector_values[row].to_bits(),
+                                gate_values[row * 4 + (i % wide) / m].to_bits(),
+                            ));
+                        }
+                    }
+                }
+                fold_receipt(&format!(
+                    "hc_row_fold_moe_gfx1201 variant={variant} rows={rows}{report} {}",
+                    if bad == 0 { "BYTE-EQUAL" } else { "MISMATCH" }
+                ));
+                assert_eq!(bad, 0, "moe fold differs: variant={variant} rows={rows}");
+                for t in [
+                    norm_weight,
+                    gate_weight,
+                    grouped,
+                    inverse,
+                    experts,
+                    route_weights,
+                    shared,
+                    selector,
+                    gates,
+                    order,
+                    routed,
+                    ref_streams,
+                    ref_gates,
+                    ref_row,
+                    new_streams,
+                    new_gates,
+                    new_row,
+                ] {
+                    gpu.free_tensor(t).expect("free");
+                }
+            }
+        }
+    }
+
+    /// gfx1201 mixer-tail row fold: `hc_row_write_norm_gate_gfx1201` leaves the HC
+    /// streams, the next read's F16 row and its paired write's gates bytewise as
+    /// `hyper_write` (the x8 gfx1201 kernel, F32 `mixed` of the out projection) followed
+    /// by `hyper_norm_gate_outputs` do; rows below 16 and other widths fail closed.
+    #[test]
+    fn hc_row_write_norm_gate_gfx1201_is_bytewise_the_default_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1201() {
+            eprintln!("skip: needs gfx1201");
+            return;
+        }
+        let m = 2560usize;
+        let wide = 4 * m;
+        for variant in 0..4usize {
+            let adversarial_weights = variant == 2;
+            for rows in [1usize, 15, 16, 17, 4096, 4097] {
+                let mut rng =
+                    FoldRng(0x1234_5678_9abc_def1 ^ ((variant as u64) << 32) ^ rows as u64);
+                let (norm_weight, gate_weight) =
+                    fold_norm_gate_weights(&mut gpu, &mut rng, wide, adversarial_weights);
+                let mixed_values = fold_f32_data(&mut rng, rows, m, variant, 2.0);
+                let mixed = gpu.upload_f32(&mixed_values, &[rows * m]).expect("mixed");
+                let gate_values = fold_f32_data(&mut rng, rows, 4, variant, 3.0);
+                let gates = gpu.upload_f32(&gate_values, &[rows * 4]).expect("gates");
+                let stream_bits = fold_bf16_data(&mut rng, rows, wide, variant, 3.0);
+                let new_streams = fold_streams_tensor(&mut gpu, &stream_bits);
+                let new_gates = gpu.zeros(&[rows * 4], DType::F32).expect("new gates");
+                let new_row = gpu.zeros(&[rows * wide], DType::F16).expect("new row");
+                let fold = crate::hc_row_fold::HcRowWriteNormGateGfx1201 {
+                    mixed: &mixed,
+                    streams: &new_streams,
+                    gates: &gates,
+                    norm_weight: &norm_weight,
+                    gate_weight: &gate_weight,
+                    next_gates: &new_gates,
+                    normalized_f16: &new_row,
+                    rows,
+                    hidden: m,
+                };
+                if rows < 16 {
+                    assert!(
+                        gpu.hc_row_write_norm_gate_gfx1201(&fold).is_err(),
+                        "rows={rows} must fail closed (hyper_write takes the x2 kernel there)"
+                    );
+                    fold_receipt(&format!(
+                        "hc_row_write_norm_gate_gfx1201 variant={variant} rows={rows} FAIL-CLOSED (rows < 16)"
+                    ));
+                    for t in [
+                        norm_weight,
+                        gate_weight,
+                        mixed,
+                        gates,
+                        new_streams,
+                        new_gates,
+                        new_row,
+                    ] {
+                        gpu.free_tensor(t).expect("free");
+                    }
+                    continue;
+                }
+                let ref_streams = fold_streams_tensor(&mut gpu, &stream_bits);
+                let (ref_gates, ref_row) = fold_reference_write_norm(
+                    &mut gpu,
+                    &ref_streams,
+                    &mixed,
+                    &gates,
+                    &norm_weight,
+                    &gate_weight,
+                    rows,
+                    m,
+                );
+                gpu.hc_row_write_norm_gate_gfx1201(&fold)
+                    .expect("mixer row fold");
+
+                let words = |gpu: &Gpu, t: &GpuTensor| gpu.download_raw_bytes(t).expect("download");
+                let mut report = String::new();
+                let mut bad = 0usize;
+                for (name, want, got, width) in [
+                    (
+                        "streams",
+                        words(&gpu, &ref_streams),
+                        words(&gpu, &new_streams),
+                        2usize,
+                    ),
+                    (
+                        "gate_logits",
+                        words(&gpu, &ref_gates),
+                        words(&gpu, &new_gates),
+                        4,
+                    ),
+                    ("f16_row", words(&gpu, &ref_row), words(&gpu, &new_row), 2),
+                ] {
+                    assert_ne!(want.len(), 0);
+                    let diff = fold_byte_diff(&want, &got);
+                    bad += diff;
+                    report.push_str(&format!(
+                        " {name}:bytes={} diff={diff} nan_words={}",
+                        want.len(),
+                        if name == "f16_row" {
+                            0
+                        } else {
+                            fold_nan_words(&want, width)
+                        }
+                    ));
+                }
+                fold_receipt(&format!(
+                    "hc_row_write_norm_gate_gfx1201 variant={variant} rows={rows}{report} {}",
+                    if bad == 0 { "BYTE-EQUAL" } else { "MISMATCH" }
+                ));
+                assert_eq!(bad, 0, "mixer fold differs: variant={variant} rows={rows}");
+                for t in [
+                    norm_weight,
+                    gate_weight,
+                    mixed,
+                    gates,
+                    new_streams,
+                    new_gates,
+                    new_row,
+                    ref_streams,
+                    ref_gates,
+                    ref_row,
+                ] {
+                    gpu.free_tensor(t).expect("free");
+                }
+            }
+        }
+        // Another width never takes the kernel.
+        let wide_bad = 4 * 2048;
+        let mixed = gpu.zeros(&[32 * 2048], DType::F32).expect("mixed");
+        let gates = gpu.zeros(&[32 * 4], DType::F32).expect("gates");
+        let streams = gpu.zeros(&[32 * wide_bad], DType::F32).expect("streams");
+        let gate_logits = gpu.zeros(&[32 * 4], DType::F32).expect("gate logits");
+        let row = gpu.zeros(&[32 * wide_bad], DType::F16).expect("row");
+        let mut norm = gpu.zeros(&[wide_bad], DType::F32).expect("norm");
+        norm.dtype = DType::BF16;
+        let mut gate = gpu.zeros(&[4 * wide_bad], DType::F32).expect("gate");
+        gate.dtype = DType::BF16;
+        assert!(gpu
+            .hc_row_write_norm_gate_gfx1201(&crate::hc_row_fold::HcRowWriteNormGateGfx1201 {
+                mixed: &mixed,
+                streams: &streams,
+                gates: &gates,
+                norm_weight: &norm,
+                gate_weight: &gate,
+                next_gates: &gate_logits,
+                normalized_f16: &row,
+                rows: 32,
+                hidden: 2048,
+            })
+            .is_err());
+    }
+
     const BF16_PM_ROWS: usize = 600;
     const BF16_PM_BLOCKS: usize = 2000;
     const BF16_PM_COMPRESS: usize = 4;

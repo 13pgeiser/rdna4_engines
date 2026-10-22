@@ -970,36 +970,7 @@ pub(crate) fn shared_down(
         0,
         p.batch_size * p.down_m,
     );
-    match down.dtype {
-        DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
-            // The shared activation is already in the basis consumed by this
-            // projection (G128 for QT53); the BF16 storage boundary, if any,
-            // was applied by the recipe before this launch.
-            if hidden.dtype == DType::F16 {
-                // The fused F16 hidden (BF16 down on the F16 WMMA route, see
-                // `shared_gu_pm`): the GEMM `batch_projection` would launch off
-                // the F32 activation's conversion, minus the conversion.
-                hip(gpu.gemm_bf16_xf16_f16_wmma(
-                    down.buf,
-                    &hidden,
-                    &out,
-                    down.m,
-                    down.k,
-                    p.batch_size,
-                ))?;
-            } else {
-                batch_projection(gpu, down, &hidden, &out, p.batch_size)?;
-            }
-        }
-        _ => {
-            return Err(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "qt44-qt53-shared-down-dtype",
-                arch: "",
-                quant: "unsupported",
-            })
-        }
-    }
+    shared_down_gemm(gpu, p, down, &hidden, &out)?;
     if p.recipe.bf16_round_trip() {
         // The scaled add rounds `out`, the scalar and the residual to BF16
         // itself and stores a BF16 value, so no round trip brackets it.
@@ -1024,6 +995,47 @@ pub(crate) fn shared_down(
         ))?;
     }
     Ok(())
+}
+
+/// The shared-down projection of `hidden` (F32 or the fused F16 hidden) into the F32
+/// rows `out` (`[batch_size, down_m]`): the launch [`shared_down`] runs before its
+/// scaled add, and the gfx1201 row fold's (its rows land in the routed target instead).
+fn shared_down_gemm(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    down: &WeightRef<'_>,
+    hidden: &GpuTensor,
+    out: &GpuTensor,
+) -> Result<(), DispatchError> {
+    match down.dtype {
+        DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
+            // The shared activation is already in the basis consumed by this
+            // projection (G128 for QT53); the BF16 storage boundary, if any,
+            // was applied by the recipe before this launch.
+            if hidden.dtype == DType::F16 {
+                // The fused F16 hidden (BF16 down on the F16 WMMA route, see
+                // `shared_gu_pm`): the GEMM `batch_projection` would launch off
+                // the F32 activation's conversion, minus the conversion.
+                hip(gpu.gemm_bf16_xf16_f16_wmma(
+                    down.buf,
+                    hidden,
+                    out,
+                    down.m,
+                    down.k,
+                    p.batch_size,
+                ))?;
+            } else {
+                batch_projection(gpu, down, hidden, out, p.batch_size)?;
+            }
+            Ok(())
+        }
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "qt44-qt53-shared-down-dtype",
+            arch: "",
+            quant: "unsupported",
+        }),
+    }
 }
 
 /// The HC write that follows a sealed MoE call and may ride the shared down's
@@ -1115,6 +1127,19 @@ pub(crate) fn shared_down_hc(
     };
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    // gfx1201: the row fold replaces the generic shared down's scaled add + the HC write
+    // + the next read's norm (its GEMM epilogue levels stay off there); no fold planned
+    // means the unfused chain, never the hcsd epilogue.
+    if let (true, Some(next)) = (gpu.arch_caps.is_gfx1201(), hc.row_fold.as_ref()) {
+        if !row_fold_gfx1201_applies(gpu, p, use_path2, hc) {
+            return Err(DispatchError::Hip(
+                "qt44 shared down: the gfx1201 HC row fold was planned but its route no longer applies"
+                    .into(),
+            ));
+        }
+        shared_down_row_fold_gfx1201(gpu, p, hc, next, use_path2)?;
+        return Ok(true);
+    }
     if !hc_shared_down_admits(gpu, p, hc) {
         if hc.row_fold.is_some() {
             return Err(DispatchError::Hip(
@@ -1185,6 +1210,9 @@ pub(crate) fn row_fold_applies(
     if is_fp8(p) {
         return false;
     }
+    if gpu.arch_caps.is_gfx1201() {
+        return row_fold_gfx1201_applies(gpu, p, use_path2, hc);
+    }
     let target = p.routed_out.unwrap_or(p.x_batch);
     gpu.flags.qwen4_hc_row_fold_enabled()
         && hc.state_bf16
@@ -1194,6 +1222,52 @@ pub(crate) fn row_fold_applies(
         && p.k_top == 10
         && p.down_expanded.buf.size() >= p.batch_size * 10 * 8
         && target.buf.size() >= p.batch_size * p.down_m * 2
+}
+
+/// [`row_fold_applies`] on gfx1201 (`HIPFIRE_QWEN4_HC_ROW_FOLD`, independent of
+/// `HIPFIRE_QWEN4_HC_FUSE` >= 2/3): the zero-initialized BF16-row combine of path 2,
+/// then the GENERIC shared down (`HIPFIRE_QWEN4_SHARED_DOWN_EPI` off: BF16 weight,
+/// F32 rows, no EP row gather reading them) + `bf16_scaled_add_batched`, then the HC
+/// write `hc` on BF16 streams -- the launches whose bytes the fold reproduces, with
+/// the shared-down rows landing in the (dead) routed target instead of
+/// `down_expanded`, which holds the rank order.  Never on the qt=55 FP8 route.
+fn row_fold_gfx1201_applies(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    hc: &HcSharedDown,
+) -> bool {
+    if is_fp8(p) {
+        return false;
+    }
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return false;
+    };
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    gpu.flags.qwen4_hc_row_fold_moe_gfx1201_enabled()
+        && hc.state_bf16
+        && combine_initial_zero_applies(gpu, p, use_path2)
+        && !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && !gpu.qwen4_shared_down_epi_enabled()
+        && p.shared_down_out.is_none()
+        && down.dtype == DType::BF16
+        && down.rotation.is_none()
+        && down.awq_scale.is_none()
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && down.m == p.down_m
+        && down.k == shared.intermediate
+        && hc.rows == p.batch_size
+        && hc.hidden == p.down_m
+        && hc.mixed == target.buf.as_ptr()
+        && target.dtype == DType::F32
+        && target.numel() >= p.batch_size * p.down_m
+        && shared.scalar.dtype == DType::F32
+        && shared.scalar.numel() >= p.batch_size
+        && p.k_top == 10
+        && p.down_expanded.buf.size() >= p.batch_size * 10 * 8
+        && gpu.hc_row_fold_gfx1201_applies(hc.rows, hc.hidden, &hc.streams, target)
 }
 
 /// The row-folded combine stage: only the rank order (the row kernel reads the
@@ -1254,6 +1328,50 @@ fn shared_down_row_fold(
             grouped_down: p.y_down_grouped,
             order: p.down_expanded,
             shared_bf16: target,
+            selector: shared.scalar,
+            streams: &hc.streams,
+            gates: &hc.gates,
+            norm_weight: &next.norm_weight,
+            gate_weight: &next.gate_weight,
+            next_gates: &next.next_gates,
+            normalized_f16: &x16,
+            rows: hc.rows,
+            hidden: hc.hidden,
+        }),
+    )
+}
+
+/// The gfx1201 row-folded shared down: the generic shared-down projection, unchanged,
+/// into the routed target as F32 rows, then one row kernel per token combines the ten
+/// expert rows, applies the BF16 scaled add, writes the HC streams and runs the next
+/// read's norm + gate projection.  Bytewise [`combine`] (`initial_zero`) +
+/// [`shared_down`] + the HC write + the next read's `hyper_norm_gate_outputs`.
+fn shared_down_row_fold_gfx1201(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    hc: &HcSharedDown,
+    next: &HcRowFoldNext,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .prelude
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
+    // The next read's F16 row lives in the shared F16 scratch, which the shared-down
+    // GEMM's own F16 input also uses (dead once the GEMM ran): size it first so
+    // nothing reallocates under the GEMM.
+    let x16 = hip(gpu.qwen4_f16_x_scratch(hc.rows * 4 * hc.hidden))?;
+    let rows = f32_view(target, 0, p.batch_size * p.down_m);
+    shared_down_gemm(gpu, p, down, &hidden, &rows)?;
+    hip(
+        gpu.hc_row_fold_moe_gfx1201(&rdna_compute::hc_row_fold::HcRowFoldMoeGfx1201 {
+            grouped_down: p.y_down_grouped,
+            order: p.down_expanded,
+            shared_f32: &rows,
             selector: shared.scalar,
             streams: &hc.streams,
             gates: &hc.gates,
