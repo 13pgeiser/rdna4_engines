@@ -151,7 +151,11 @@ fn gen_weight(adversarial: bool) -> Vec<u16> {
 /// count is a prefix of a larger one): 0-3 clean with `kind` sprinkled specials, 4 dense
 /// subnormal, 5 dense huge, 6 dense +-0, 7 NaN/inf sprinkle.
 fn gen_x(rows: usize, adversarial: bool) -> Vec<u16> {
-    let mut rng = Rng(if adversarial { 0xFEED_u64 } else { 0xC0FFEE_u64 });
+    let mut rng = Rng(if adversarial {
+        0xFEED_u64
+    } else {
+        0xC0FFEE_u64
+    });
     let mut x = vec![0u16; rows * K];
     for b in 0..rows {
         let row = &mut x[b * K..(b + 1) * K];
@@ -209,7 +213,11 @@ fn git_sha() -> String {
     };
     let sha = run(&["rev-parse", "HEAD"]);
     let dirty = !run(&["status", "--porcelain", "--untracked-files=no"]).is_empty();
-    format!("{}{}", if sha.is_empty() { "unknown" } else { &sha }, if dirty { "+dirty" } else { "" })
+    format!(
+        "{}{}",
+        if sha.is_empty() { "unknown" } else { &sha },
+        if dirty { "+dirty" } else { "" }
+    )
 }
 
 fn le_u16(bytes: &[u8]) -> Vec<u16> {
@@ -236,7 +244,12 @@ fn main() {
 
     let rows_list: Vec<usize> = std::env::var("ROWS")
         .ok()
-        .map(|s| s.split(',').filter(|t| !t.is_empty()).map(|t| t.parse().unwrap()).collect())
+        .map(|s| {
+            s.split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse().unwrap())
+                .collect()
+        })
         .unwrap_or_else(|| vec![1, 16, 4096, 16384, 4099, 4097, 1537]);
     let max_rows = *rows_list.iter().max().unwrap();
 
@@ -254,7 +267,11 @@ fn main() {
     writeln!(receipt, "git {}", git_sha()).unwrap();
     writeln!(receipt, "arch {arch}").unwrap();
     writeln!(receipt, "kernel qwen4_hc_down_fused_b64_k32 vs chain gemm_bf16_xf16_f16_wmma + hc_activation_fused_f32(bf16_out)").unwrap();
-    writeln!(receipt, "switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} scale={SCALE} m={M} k={K}").unwrap();
+    writeln!(
+        receipt,
+        "switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} scale={SCALE} m={M} k={K}"
+    )
+    .unwrap();
 
     let mut failures = 0usize;
     let mut cases = 0usize;
@@ -273,15 +290,21 @@ fn main() {
             let f = upload_u16(&mut gpu, &fill, DType::BF16);
 
             // chain
-            gpu.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows).unwrap();
+            gpu.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows)
+                .unwrap();
             hc_activation_fused_f32(
                 &mut gpu,
-                &HcActivationFused { values: &y, scale: SCALE, bf16_out: Some(&r) },
+                &HcActivationFused {
+                    values: &y,
+                    scale: SCALE,
+                    bf16_out: Some(&r),
+                },
             )
             .unwrap();
             // fused
             let case_applies = gpu.qwen4_hc_down_fused_applies(M, K, rows);
-            gpu.gemm_bf16_xf16_hc_down_fused(&weight, &x, &f, M, K, rows, SCALE).unwrap();
+            gpu.gemm_bf16_xf16_hc_down_fused(&weight, &x, &f, M, K, rows, SCALE)
+                .unwrap();
             gpu.hip.device_synchronize().unwrap();
             let rb = le_u16(&gpu.download_raw_bytes(&r).unwrap());
             let fb = le_u16(&gpu.download_raw_bytes(&f).unwrap());
@@ -331,7 +354,11 @@ fn main() {
     }
     let summary = format!(
         "SUMMARY cases={cases} failures={failures} {}",
-        if failures == 0 { "ALL BYTE-IDENTICAL" } else { "MISMATCH" }
+        if failures == 0 {
+            "ALL BYTE-IDENTICAL"
+        } else {
+            "MISMATCH"
+        }
     );
     println!("{summary}");
     writeln!(receipt, "{summary}").unwrap();

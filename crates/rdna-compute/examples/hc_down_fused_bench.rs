@@ -137,7 +137,12 @@ fn main() {
 
     let rows_list: Vec<usize> = std::env::var("ROWS")
         .ok()
-        .map(|s| s.split(',').filter(|t| !t.is_empty()).map(|t| t.parse().unwrap()).collect())
+        .map(|s| {
+            s.split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse().unwrap())
+                .collect()
+        })
         .unwrap_or_else(|| vec![512, 1024, 1536, 2048, 3072, 4096, 8192, 16384]);
     let max_rows = *rows_list.iter().max().unwrap();
 
@@ -150,7 +155,18 @@ fn main() {
 
     println!(
         "{:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9}",
-        "rows", "chn_min", "chn_med", "gemm", "act", "fus_min", "fus_med", "fus1", "applies", "speedup", "B/row_bef", "B/row_aft"
+        "rows",
+        "chn_min",
+        "chn_med",
+        "gemm",
+        "act",
+        "fus_min",
+        "fus_med",
+        "fus1",
+        "applies",
+        "speedup",
+        "B/row_bef",
+        "B/row_aft"
     );
     for &rows in &rows_list {
         let n = rows * M;
@@ -161,20 +177,30 @@ fn main() {
         let applies = gpu.qwen4_hc_down_fused_applies(M, K, rows);
 
         let (cmin, cmed) = batched(&mut gpu, |g| {
-            g.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows).unwrap();
+            g.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows)
+                .unwrap();
             hc_activation_fused_f32(
                 g,
-                &HcActivationFused { values: &y, scale: SCALE, bf16_out: Some(&low) },
+                &HcActivationFused {
+                    values: &y,
+                    scale: SCALE,
+                    bf16_out: Some(&low),
+                },
             )
             .unwrap();
         });
         let gemm = single(&mut gpu, |g| {
-            g.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows).unwrap();
+            g.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows)
+                .unwrap();
         });
         let act = single(&mut gpu, |g| {
             hc_activation_fused_f32(
                 g,
-                &HcActivationFused { values: &y, scale: SCALE, bf16_out: Some(&low) },
+                &HcActivationFused {
+                    values: &y,
+                    scale: SCALE,
+                    bf16_out: Some(&low),
+                },
             )
             .unwrap();
         });
@@ -183,10 +209,12 @@ fn main() {
             .is_ok();
         let (fmin, fmed, f1) = if fused_ok {
             let (a, b) = batched(&mut gpu, |g| {
-                g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE).unwrap();
+                g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
+                    .unwrap();
             });
             let s = single(&mut gpu, |g| {
-                g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE).unwrap();
+                g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
+                    .unwrap();
             });
             (a, b, s)
         } else {

@@ -542,8 +542,9 @@ pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true));
 /// Fused HC-down + activation (gfx1201), default on, `0` restores the three-launch chain.
-static QWEN4_HC_DOWN_FUSED: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_FUSED", true));
+static QWEN4_HC_DOWN_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_FUSED", true)
+});
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
@@ -52062,9 +52063,8 @@ mod tests {
 
     #[test]
     fn hc_down_fused_predicate_covers_arch_shape_flags_and_boundaries() {
-        let ok = |arch, en, m, k, rows, rec, cap| {
-            hc_down_fused_selected(arch, en, m, k, rows, rec, cap)
-        };
+        let ok =
+            |arch, en, m, k, rows, rec, cap| hc_down_fused_selected(arch, en, m, k, rows, rec, cap);
         let min = HC_DOWN_FUSED_MIN_ROWS;
         assert!(ok("gfx1201", true, 320, 10240, min, false, false));
         assert!(ok("gfx1201", true, 320, 10240, 4096, false, false));
