@@ -9233,6 +9233,39 @@ TEST(qwen35_pipe_off_is_the_serial_graph_and_steps) {
     CHECK_EQ(pinned_steps(b, qwen35_fp8::step, 1, 2), 0xc03bdef23d685cc5ull);
 }
 
+/* qwen35_w8a8 at two ranks where libr4d serves the `_had_quant_i8g` norms (a_h.q8_fed): the norms write
+ * rotated int8 codes, which the pipelined prefill's boundary norms (NormQuantFP8::step_plain) do not issue,
+ * so the prefill stays serial there: the step whole, nothing on the second lane, no step failure. Where
+ * the forms are not served each projection quantises its own input and the pipeline runs as on
+ * qwen35_fp8. (Before the fix the pipeline ran with q8_fed and libr4d refused the boundary norm's E4M3
+ * codes for the int8 op, failing every one-sequence prefill step of 1024 rows or more.) */
+TEST(qwen35_w8a8_with_int8_codes_from_the_norms_prefills_serially) {
+    MetaKV mk = with_dflash2(q35w8a8_meta());
+    for (bool fused : { true, false })
+        for (int rank = 0; rank < 2; ++rank) {
+            RadBuilder b;
+            if (!fused)
+                for (const char* op : kW8a8Fused) b.undeclared.insert(op);
+            w8a8_encs(&b);
+            RadBuildCtx ctx = spec_ctx(rank, 2, 7);
+            ctx.max_tok = 2048;
+            REQUIRE_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); }),
+                       RAD_OK);
+            const qwen35_w8a8::Model& m = qwen35_w8a8::g_model[rank];
+            CHECK_EQ(m.a_h.q8_fed, fused);
+            CHECK_EQ(m.pipe_on, !fused);
+            const auto pf = kit(b, {}, { 2048 }, 0);
+            const auto v = run_passes(b, qwen35_w8a8::step, { pf.get() }, rank, 2);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            CHECK(c.step_fail.empty());
+            int lane1 = 0;
+            for (const RecIssue& i : c.issues) lane1 += i.lane == 1;
+            if (fused) CHECK_EQ(lane1, 0);
+            else CHECK(lane1 > 0);
+        }
+}
+
 /* A Qwen3.5/3.8 prefill step of one sequence at two ranks runs in two pieces of 1024 rows
  * (step_pipelined): every collective is on the second lane, the layers' all-reduces a piece at a
  * time at `overlap` 1, the embedding's whole (standalone, or folded into layer 0's norm where the

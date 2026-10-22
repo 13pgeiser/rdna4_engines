@@ -878,9 +878,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * min_bytes stays 0 for the same reason.
      *
      * The second lane's window opens here and closes after the final norm (rad_lane1_window_begin):
-     * the embedding's reduction, the pipelined prefill's boundaries, the GDN a|b lane and the MoE
-     * shared arm are all declared inside it, so the concurrent buffers stay live only there and the
-     * drafter and the heads can share their bytes. */
+     * the embedding's reduction and the pipelined prefill's boundaries are declared inside it, so
+     * the concurrent buffers stay live only there and the drafter and the heads can share their
+     * bytes. */
     RAD_ARCH_TRY(rad_lane1_window_begin(b));
     if (g.world > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
@@ -896,7 +896,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * leave the sharing pool (the drafter taps are copied on the first lane: pipe_taps)
      * (Ctx::lane1_); the bounds also because no declared op reads them, which would leave a
      * transient dead before the kernels that take them raw. */
-    {
+    /* Not on a trunk whose norms write rotated int8 codes (qwen35_w8a8 where libr4d serves the
+     * `_had_quant_i8g` forms, a_h.q8_fed): the boundary norms on the second lane
+     * (NormQuantFP8::step_plain) issue the E4M3 pair only, and that int8 path is unmeasured, so such a
+     * trunk prefills serially, as before this pipeline. */
+    if (m.a_h.q8_fed) {
+        if (g.world > 1 && g.max_tok >= kPipeMinRows && ctx->rank == 0)
+            fprintf(stderr, "radiance: qwen35: the pipelined prefill stays off on this trunk: its norms "
+                            "write rotated int8 codes, which the pipeline's boundary norms do not\n");
+    } else {
         m.pipe_on = g.max_tok >= kPipeMinRows && rad::arch::prefill_pipeline(b, (int)g.world, "qwen35");
     }
     if (m.pipe_on) {
@@ -1317,7 +1325,13 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, boo
     if (rope_mixed(batch) || batch->n_mm_rows > 0) return serial("media rows in the step");
     if (dbg_resid_on()) return serial("residual debugging is on");
     int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
-    if (!d) return nullptr;
+    if (!d) {
+        /* Not a rank-local fallback to the serial step: the other rank would pipeline, and the two
+         * would issue different collectives. Fail the step, as gemma3 does. */
+        rad_step_fail(c, "qwen35: the pipelined prefill's bounds have no storage");
+        *failed = true;
+        return nullptr;
+    }
     const int64_t R = pipe_rows(T);
     ArPieces pc{};
     pc.rows = R; pc.done = pipe_hand; pc.cu = d; pc.in_ready = true;

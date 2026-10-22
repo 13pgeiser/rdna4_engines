@@ -453,7 +453,10 @@ int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
  * (a drafter's, the heads') can share its bytes. The runtime holds the architecture to it: an op
  * issued on lane 1 outside the window fails the step by name, and the first op past the window
  * issued on lane 0 joins lane 1 first when lane 1 has work pending. Optional, one window a program;
- * call both at declare, in order. Additive export; RAD_ABI_VERSION does not move. */
+ * call both at declare, in order. The runtime joins lane 1 into lane 0 at the window's end only, so an
+ * op declared before the window must not be issued again while lane 1 has work pending (a transient
+ * it uses may share bytes with a concurrent buffer the window keeps live). Additive export;
+ * RAD_ABI_VERSION does not move. */
 int rad_lane1_window_begin(RadBuilder* b);
 int rad_lane1_window_end(RadBuilder* b);
 

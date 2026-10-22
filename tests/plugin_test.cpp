@@ -901,7 +901,8 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
              "41943040:ar_twoshot_3rank_exact ");
 
     /* At `overlap` 1 (a pipelined prefill's all-reduce beside compute) the two-shot band takes the
-     * narrow lane row at three, four and eight ranks, exact and, where it exists, lossy; the
+     * lane row at three, four and eight ranks, exact and, where it exists, lossy (at three and
+     * eight launched as the wide rows unless R4D_AR_LANE_3_8=1); the
      * one-shot band has no lane row past two ranks. The lists split at the eight-rank one-shot edge
      * as above; at eight ranks the band between it and the wide one-shot bound stays on the plain
      * two-shot. */

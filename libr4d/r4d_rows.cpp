@@ -5057,10 +5057,11 @@ static int64_t ar_lane38_nblocks() {
   return e && e[0] == '1' && !e[1] ? 4 : 0;
 }
 static const RadTunable tArTs38Lane[] = {
-  { "nblocks",  kArNblocksLane4, NELEM(kArNblocksLane4), ar_lane38_nblocks(), "blocks in the grid. 0 = scale with the message and clamp (the wide rows' launch, the default); 4 under R4D_AR_LANE_3_8=1" },
+  { "nblocks",  kArNblocks,  NELEM(kArNblocks),  ar_lane38_nblocks(), "blocks in the grid. 0 = scale with the message and clamp (the wide rows' launch, the default); 4 under R4D_AR_LANE_3_8=1" },
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
 };
 /* The same axes with narrow defaults, for a collective issued beside compute (`overlap` 1). The
  * wide launch (up to 24 blocks of 1024 threads spinning on peer flags) suits an all-reduce that has

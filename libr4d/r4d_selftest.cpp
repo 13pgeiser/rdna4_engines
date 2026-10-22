@@ -439,6 +439,33 @@ static void cross_check(const Plugin& pl) {
         ok(narrow ? "the 3/8-rank overlap rows take the narrow launch (R4D_AR_LANE_3_8=1)"
                   : "the 3/8-rank overlap rows launch as their wide rows (R4D_AR_LANE_3_8 unset)",
            bad == 0, detail);
+        /* And they accept every pin their wide rows accept: a RADIANCE_TUNE all_reduce pin is applied
+         * to every row serving the op, and a key or value a serving row lacks fails the selection. */
+        int bad_axis = 0;
+        std::string axis_detail;
+        for (const auto& pr : pairs) {
+            const RadKernelInfo* l = row(pr[0]);
+            const RadKernelInfo* w = row(pr[1]);
+            if (!l || !w) continue;
+            for (int v = 0; v < w->n_tunables; ++v) {
+                const RadTunable& wt = w->tunables[v];
+                const RadTunable* lt = nullptr;
+                for (int u = 0; u < l->n_tunables; ++u)
+                    if (!std::strcmp(l->tunables[u].key, wt.key)) lt = &l->tunables[u];
+                if (!lt) { ++bad_axis; axis_detail += std::string(pr[0]) + " lacks " + wt.key + "; "; continue; }
+                for (int i = 0; i < wt.n_values; ++i) {
+                    bool has = false;
+                    for (int j = 0; j < lt->n_values; ++j) has = has || lt->values[j] == wt.values[i];
+                    if (!has) {
+                        ++bad_axis;
+                        axis_detail += std::string(pr[0]) + ":" + wt.key + " lacks " +
+                                       std::to_string((long long)wt.values[i]) + "; ";
+                    }
+                }
+            }
+        }
+        ok("the 3/8-rank overlap rows accept every tunable pin of their wide rows", bad_axis == 0,
+           axis_detail);
     }
 
     /* The libr4d orderings the integer priority has to preserve. */
