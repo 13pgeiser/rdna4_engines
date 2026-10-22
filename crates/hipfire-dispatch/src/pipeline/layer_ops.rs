@@ -2925,6 +2925,9 @@ fn execute_gated_delta_net_hc_impl(
         return Ok(());
     }
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
+    // The out projection's A8 blocks, when the dense gate produced them.
+    #[cfg_attr(not(feature = "deltanet"), allow(unused_mut))]
+    let mut fused_xq: Option<*mut std::ffi::c_void> = None;
     if phase == MixerPhase::OutProj {
         // The core ran in an earlier call; only the dtype decision it made for
         // its output is owed here.
@@ -3068,12 +3071,28 @@ fn execute_gated_delta_net_hc_impl(
                 // `recurrent_output` is scratch with no reader after the gate.
                 #[cfg(feature = "deltanet")]
                 if rotate {
-                    let rotated = view(op.rotation, lo * value, rows * value);
-                    hip(rdna_compute::fn_gdn_dense::gate(
-                        gpu,
-                        &gated,
-                        Some(&rotated),
-                    ))?;
+                    // `HIPFIRE_QWEN4_GDN_I8_FUSE`: the out projection's INT8 route
+                    // (a lone MQ6 weight: its F32 activation is this gate output)
+                    // reads the gate's own rotated A8 blocks, so neither the F32
+                    // gate output nor the separate producer launch exists. Any
+                    // other shape of the call (split core / out-projection phases,
+                    // a row window, an HC-write epilogue that would read the F32
+                    // output) keeps the F32 gate output and the unfused chain.
+                    if phase == MixerPhase::Whole
+                        && window.is_none()
+                        && !(hc.is_some() && gpu.flags.qwen4_hc_fuse_level() >= 2)
+                        && mq6_i8_route(gpu, &op.output, op.rows)
+                        && rdna_compute::fn_gdn_dense::gate_i8_applies(gpu, &gated)
+                    {
+                        fused_xq = Some(hip(rdna_compute::fn_gdn_dense::gate_i8(gpu, &gated))?);
+                    } else {
+                        let rotated = view(op.rotation, lo * value, rows * value);
+                        hip(rdna_compute::fn_gdn_dense::gate(
+                            gpu,
+                            &gated,
+                            Some(&rotated),
+                        ))?;
+                    }
                 } else {
                     hip(rdna_compute::fn_gdn_dense::gate(gpu, &gated, None))?;
                 }
@@ -3179,6 +3198,18 @@ fn execute_gated_delta_net_hc_impl(
     }
     if phase == MixerPhase::Core {
         return Ok(());
+    }
+    if let Some(xq) = fused_xq {
+        // The gate emitted the A8 blocks: the INT8 route's GEMM, minus its producer.
+        let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
+        return hip(gpu.gemm_mq6g256v2_i8_prequant(
+            op.output.buf,
+            xq,
+            &output_batch,
+            op.output.m,
+            op.output.k,
+            op.rows,
+        ));
     }
     // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the paired HC write rides the output
     // projection's epilogue; the projection then never lands in `output_tensor`.
