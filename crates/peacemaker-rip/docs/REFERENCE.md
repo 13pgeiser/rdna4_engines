@@ -439,4 +439,71 @@ The [diagnostic reference](ERRORS.md) explains each stable code. R01xx is parsin
 
 ### Source map
 
-Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs`. Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs`. Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
+Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs` (production generators: `src/native_gen.rs`). Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs`. Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
+
+## 13. Production generators: `iu4_gemm` and `qwen4_moe_sym`
+
+The fast kernels are Rust generators. A script reaches them in two layers, neither of which adds typestate surface: whole-kernel natives that take the generator's `Spec`, and (for `iu4_gemm`) its phase blocks, which a script composes under the same checks as its own code. Production output does not change: a composition that mirrors `iu4_gemm::emit` re-emits its bytes.
+
+### Coarse natives
+
+The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, K256Shared, K256Pow2}`, `Tile::{T128x128x8, T256x128x16}`, `Cacc::{One, Two}`, `Epi::{Set, Add, GateUpSilu, GateUpSiluBf16, QkvzaGdn}`, `ALayout::{Token, Slab}` (`iu4_gemm`) and `MoeKind::{GateUp, Down}`, `WeightCodec::{Mq4Sym, Mq3I4, E8pI4}` (`qwen4_moe_sym`; `MoeKind` is the Rust `qwen4_moe_sym::Kind`, renamed so it cannot clash with the `enum Kind` a script declares for its own variants). A script's own `enum Fold` (or any of these names) wins over the native one. `Arch` is the existing `Arch::Gfx1201`. The struct literals map one to one onto the Rust `Spec`; every field is required, and an unknown field is an error.
+
+| native | Rust | result |
+|---|---|---|
+| `Iu4Spec { fold, tile, cacc, epi, act, arch }` | `iu4_gemm::Spec` | a spec value |
+| `Iu4Gemm::emit(spec)` | `iu4_gemm::emit` | `Result<Emitted, String>` |
+| `Iu4Gemm::emit_module(fold, tile, cacc, act, arch)` | `iu4_gemm::emit_module` | `Result<(Vec<Emitted>, String, String), String>`: the symbols, the module text and its proof as JSON |
+| `MoeSymSpec { arch, kind, nt, rr, codec }` | `qwen4_moe_sym::Spec` | a spec value |
+| `MoeSym::emit(spec)` | `qwen4_moe_sym::emit` | `Result<Emitted, String>` |
+| `MoeSym::emit_module(arch)` | `qwen4_moe_sym::emit_module` | as `Iu4Gemm::emit_module` |
+| `MoeSym::emit_module_codec(arch, codec)` | `qwen4_moe_sym::emit_module_codec` | as `Iu4Gemm::emit_module` |
+
+`Spec::validate` stays the gate: a combination without a generator returns the Rust refusal (`iu4_gemm targets gfx1201 only`, ...).
+
+```rip arch=gfx1201
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    Iu4Gemm::emit(Iu4Spec {
+        fold: Fold::K128, tile: Tile::T128x128x8, cacc: Cacc::One,
+        epi: Epi::GateUpSilu, act: ALayout::Slab, arch: spec.arch,
+    })
+}
+```
+
+### `iu4_gemm` phase blocks
+
+`Iu4Gen::new(Iu4Spec { .. })?` builds the generator of one valid spec (`Spec::validate`, gfx1201 only): the register assignment and geometry every block reads. It is an opaque value with read-only accessors.
+
+| call | meaning |
+|---|---|
+| `gen.plan()?` | the kernel's `RegPlan` (a script may add ranges) |
+| `gen.kernel_spec()` | the kernel's `KernelSpec` (symbol, kernargs, workgroup size) |
+| `gen.spec()` | the `Iu4Spec` |
+| `gen.reg("name")` | `Option<u8>`, the base of a physical register by name: `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i> st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips rs bs wave gpr136 mm1 hs tmp epi_s a_slab1`, kernel arguments `arg_a arg_u arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`; `None` for an unknown name or an absent optional register |
+
+The blocks run inside a `Workgroup::new` scope. `lds` is the array of the four LDS rings (A, W, DS, SZ); `end` is a kernel exit from `wg.exit(..)`.
+
+| call | Rust (`iu4_gemm::blocks`) | rings |
+|---|---|---|
+| `iu4::declare_lds(wg, gen)?` | `declare_lds` | declares them, every buffer `Free`; returns `lds` |
+| `iu4::prologue(wg, gen, end, lds)?` | `prologue` | `Free`/`Free` in, `Published`/`Free` out (the block boundary); returns `lds` |
+| `iu4::kloop(wg, gen, lds)?` | `kloop` | the whole rolled K-loop with its peeled group; returns `lds` |
+| `iu4::block(wg, gen, tag, h, fetch_next, end_label, entry_label, lds)?` | `block` | one K128 block on plane `h` (0 or 1); `tag` names its labels, `end_label` closes its register lifetimes, `entry_label = false` leaves the block's own label to a `wg_skip_if` target; returns `lds` |
+| `iu4::block_stepping(.., entry_label, step, lds)?` | `block_stepping` | `block` that also advances descriptor `step` (0 or 1) right after its slab-1 fetch: the production odd block does this for descriptor 0, inside one block, so it cannot sit between two `block` calls |
+| `iu4::step_descriptor(wg, gen, which)?` | `step_descriptor` | `s_add_nc_u64` of the group stride onto descriptor 0 or 1 |
+| `iu4::trip_end(wg, gen)?` | `trip_end` | odd descriptor, group offset and trip counter advance |
+| `iu4::trips_cmp(wg, gen, "s_cmp_lg_u32")?` | `trips_cmp` | a `WgCond` for `wg_skip_if` / `loop_carried` (`s_cmp_{eq,lg,lt,le,gt,ge}_{u32,i32}` only) |
+| `iu4::epilogue(wg, gen, end)?` | `epilogue` | the store path; places `iu4::EPI` |
+| `iu4::gdn_epilogue(wg, gen, lds)?` | `gdn_epilogue` | the fused projection's GDN preparation; consumes `lds` (`Epi::QkvzaGdn` only) |
+| `iu4::label(tag)`, `iu4::tail_label(h)` | `label`, `tail_label` | `.Liu4_<tag>`, `.Liu4_t<h>` |
+| `iu4::ENTRY K_BEGIN K_LOOP K_LOOP_END EPI END GDN` | the label constants | strings |
+
+Each block is one checked `Driver::typed` call. The native takes the four rings from the driver, runs the Rust block on the typed `Workgroup`, and gives the rings back to the same driver slots, so a block cannot read a `Free` buffer, and a script loop (`loop_carried`) or branch (`wg_skip_if`) around blocks is checked by the driver's ordinary rule that a body leaves every ring in the state it found it. What the bridge refuses:
+
+- a ring of the wrong kind (the W ring where the A ring is expected: the tag differs), a ring in another phase, a ring with an undrained store, a ring the script made with `Ring::new` (only rings a typed block gave can be lent);
+- any typed call under wave-uniform control (`skip_if`, `exec_if`, `if_else`, `forward`, `loop_until`), after a wave-uniform kernel exit, or on a target other than gfx1201 (the blocks are gfx1201-typed);
+- a typed body that leaves a taken ring out. After any `Err` from a typed call the lowering is dead, like any backend `Err`: stop at the first one.
+
+The fused per-WMMA fold stage stays inside `block`: it is interleaved within one instruction bundle. Exposing `fragments` / `bundle` / `publish_*` as separate natives is the next step if an experiment needs to change a block's inside; it uses the same bridge.
+
+The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.
