@@ -401,6 +401,12 @@ pub(crate) fn partial_offload_refusal(
         let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
             .map_err(|e| format!("qwen35 config: {e}"))?;
         (config.paged_experts, config.reap_keep.is_some())
+    } else if arch_id == 11 {
+        // LFM2.5 parses its own REAP keep-map inside `Lfm2MoeConfig::from_hfq`
+        // (`apply_reap_plan`). It has no paged-expert route.
+        let config = hipfire_arch_lfm2moe::Lfm2MoeConfig::from_hfq(hfq)
+            .map_err(|e| format!("lfm2moe config: {e}"))?;
+        (false, config.reap_keep.is_some())
     } else {
         (false, false)
     };
@@ -416,13 +422,13 @@ pub(crate) fn partial_offload_refusal(
 fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
     use hipfire_config::memory::SpillRefusal::*;
     match refusal {
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
-        // RAM. Qwen4 has its own expert-residency route and the other arches have
-        // none, so either knob is a request this loader cannot honour.
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
         Arch(arch_id) => format!(
-            "load refused: partial GPU offload ({keys}) only works for Qwen3.5 dense and MoE \
-             models; this model is a different architecture (arch id {arch_id}). Unset both keys \
-             for this model"
+            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
+             and LFM2.5 only; this source is arch id {arch_id}. Unset both keys for this model"
         ),
         Tp(tp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \

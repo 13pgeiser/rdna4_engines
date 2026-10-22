@@ -10209,7 +10209,8 @@ pub mod memory {
     /// same reason in their fail-closed refusal).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum SpillRefusal {
-        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        /// Neither Qwen3.5 dense (5) / MoE (6) nor LFM2.5 (11); carries the
+        /// arch id.
         Arch(u32),
         /// Tensor-parallel ranks each load every layer; carries tp.
         Tp(usize),
@@ -10238,10 +10239,11 @@ pub mod memory {
         is_vl: bool,
     ) -> SpillSupport {
         use SpillRefusal::*;
-        // Only the Qwen3.5 storage seam places a layer or a routed expert in
-        // host RAM. Qwen4 has its own expert-residency route and the other
-        // arches have none, so either knob is a request this loader cannot honour.
-        if !matches!(arch_id, 5 | 6) {
+        // Only the Qwen3.5 (dense 5 / MoE 6) and LFM2.5 (11) storage seams
+        // place a layer or a routed expert in host RAM. Qwen4 has its own
+        // expert-residency route and the other arches have none, so either
+        // knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6 | 11) {
             return SpillSupport::Refused(Arch(arch_id));
         }
         if tp > 1 {
@@ -11111,7 +11113,7 @@ pub mod memory {
             use SpillSupport::{Refused, Supported};
             // Clean single-GPU non-VL non-paged non-REAP MoE: the only
             // supported shape (dense included — the policy is MoE-blind).
-            for arch_id in [5u32, 6] {
+            for arch_id in [5u32, 6, 11] {
                 assert_eq!(
                     spill_support(arch_id, 1, 1, None, false, false, false),
                     Supported,

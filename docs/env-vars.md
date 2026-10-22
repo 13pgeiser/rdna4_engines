@@ -1639,7 +1639,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GPTQ_DAMPING` | crates/hipfire-quantize/src/quant_mq.rs | developer |
 | `HIPFIRE_GPUS` | scripts/ab-dispatch-validation.sh | harness |
 | `HIPFIRE_GPU_0_BIG` | scripts/ab-dispatch-validation.sh | harness |
-| `HIPFIRE_GPU_LAYER_BUDGET` | crates/hipfire-arch-qwen35-embed/src/vision.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_GPU_LAYER_BUDGET` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | stable |
 | `HIPFIRE_GPU_LOCKFILE` | autoresearch/ar/swarm.py, scripts/container-gate.sh | harness |
 | `HIPFIRE_GPU_LOCK_OWNER` | scripts/gpu-lock.sh, scripts/pp-gate.sh | harness |
 | `HIPFIRE_GPU_LOCK_PATH` | scripts/gpu-lock.sh | harness |
@@ -1729,6 +1729,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LDS_EPI_DIRECT` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs, crates/hipfire-arch-lfm2moe/src/forward.rs | developer |
 | `HIPFIRE_LFM2_GRAPH` | crates/hipfire-arch-lfm2moe/examples/graph_parity_lfm2moe.rs, crates/hipfire-arch-lfm2moe/src/forward.rs | developer |
+| `HIPFIRE_LFM2_LOAD_TRACE` | crates/hipfire-arch-lfm2moe/src/lfm2moe.rs | developer |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_BASELINE` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_DEEP` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_LAYERS` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_MODEL` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_PLACEMENT` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_RECORD` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_STEPS` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs | experimental |
 | `HIPFIRE_LLOYD_K3` | crates/hipfire-quantize/src/pipeline.rs, crates/hipfire-quantize/src/quant_mq.rs | developer |
 | `HIPFIRE_LLOYD_MB4` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs | experimental |
@@ -1810,7 +1818,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MOE_DUMP_DIR` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |
 | `HIPFIRE_MOE_EXPERTS_MQ5` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MOE_EXPERTS_MQ6` | crates/hipfire-quantize/src/pipeline.rs | developer |
-| `HIPFIRE_MOE_EXPERT_BUDGET` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_MOE_EXPERT_BUDGET` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MOE_EXPERT_STATS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_MOE_EXPERT_STATS_OUT` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/examples/eval_hipfire.rs | developer |
 | `HIPFIRE_MOE_GATE_UP_CPOL` | crates/rdna-compute/src/gemv.rs | developer |
@@ -2600,3 +2608,5 @@ When adding a user-facing knob:
 | `HIPFIRE_CPU_EXPERT_PIN` | crates/hipfire-dispatch/src/cpu_exec.rs |
 | `HIPFIRE_OOM_GUARD` | `auto` | Typed key `memory.oom_guard`. Gates **only** the host-memory headroom half of `kv_slots::preflight_alloc` / `SlotPool` / CLI bench-sweep preflight (Linux `MemAvailable` minus the CMA region (the larger of `CmaFree` and the CMA pageblocks: `CmaTotal` or `/proc/zoneinfo` `cma`, which includes KHO scratch), since only movable allocations can use them, not pinned GTT or kernel memory; in a unified-memory process the TTM page-pool estimate is added on top, unchanged; CLI on Windows uses available physical memory). The R9700 deployment-target VRAM-budget check **always runs**. `auto`: on for unified-memory APU archs (gfx1035/1036/1103/1150/1151/1152), off for recognized discrete GPUs, and for processes with no known GPU arch by host swap state (Linux `SwapTotal`; Windows pagefile approximation: commit limit minus physical total, saturating). Zero or unavailable swap/pagefile → on; positive → off. `1`/`true`/`0`/`false` force either way. The auto decision is logged once to stderr with its reason. `scripts/run-bounded.sh` remains the hard backstop. Full write-up: [`CONFIG.md`](CONFIG.md#memoryoom_guard). |
 | `HIPFIRE_MEM_CAP` | `24G` | Read by `scripts/run-bounded.sh`, not by the binaries: cgroup `MemoryMax` for a gated run. Exit 137 means the cap fired — shrink the configuration rather than raising it. |
+
+LFM2.5 text trunks (arch 11) also support the layer and routed-expert budgets above on a single GPU. This carrier supports only `memory.offload_exec=pcie`; CPU/passback execution and VL, paged-expert, REAP keep-map, or multi-GPU spills are refused. Its packed expert owners remain live for the sealed MoE executor.
