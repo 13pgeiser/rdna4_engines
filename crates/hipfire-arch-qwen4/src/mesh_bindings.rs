@@ -515,7 +515,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
             self.head.is_some(),
             self.head.as_ref().is_some_and(|head| head.top1.is_some()),
         );
-        if self.ran[owner] || !ops.iter().map(|id| id.0).eq(expected) {
+        if self.ran[owner] || !ops.iter().map(|id| id.0).eq(expected.clone()) {
             return Err(
                 "Qwen4 mesh band must run exactly once with its full declared op range".into(),
             );
@@ -541,6 +541,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
                 epoch.route,
                 head,
                 wide,
+                expected,
             )
             .map_err(|error| error.to_string())?;
         self.ran[owner] = true;
