@@ -692,14 +692,28 @@ impl Carrier for Qwen4Carrier {
         options: crate::admission::SourceAdmissionOptions,
     ) -> Result<(), String> {
         let spec = options.spec;
+        // DFlash2 runs only when explicitly requested, with its draft; native
+        // MTP stays the default speculator.
+        let dflash = spec.dflash == Some(true);
+        if dflash && draft_path.is_none() {
+            return Err(
+                "qwen4: DFlash (speculation.dflash = on) needs a DFlash2 draft \
+                 (--model-draft / params.draft)"
+                    .into(),
+            );
+        }
+        if dflash && spec.mtp == Some(true) {
+            return Err(
+                "qwen4: DFlash and native MTP are both requested; pick one speculator".into(),
+            );
+        }
         let unsupported = [
-            (draft_path.is_some(), "draft model (draft_path)"),
+            (
+                draft_path.is_some() && !dflash,
+                "draft model (draft_path; --spec dflash runs a DFlash2 draft)",
+            ),
             (options.eagle_drafter, "EAGLE drafter"),
             (options.kv_adaptive, "adaptive KV"),
-            (
-                spec.dflash.is_some_and(|enabled| enabled),
-                "DFlash (speculation.dflash)",
-            ),
             (
                 spec.dspark.is_some_and(|enabled| enabled),
                 "DSpark (speculation.dspark)",
@@ -808,6 +822,9 @@ impl Carrier for Qwen4Carrier {
         };
         qwen4_ep_option_refusal(ep, ctx.draft_path, &options)?;
         self.admit_options(ctx.draft_path, options)?;
+        // Admission checked the draft is present; DFlash2 replaces native MTP.
+        let dflash_draft = ctx.draft_path.filter(|_| ctx.spec.dflash == Some(true));
+        let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
         let shared = Qwen4RankShared {
             path: ctx.path.to_string(),
@@ -885,18 +902,35 @@ impl Carrier for Qwen4Carrier {
         } else {
             max_k
         };
-        let speculator = native_mtp.then(|| {
-            qwen4_native_mtp_speculator(
-                max_k,
+        let speculator = match dflash_draft {
+            Some(draft) => match qwen4_dflash2_speculator(
+                ctx.gpu,
+                draft,
+                &mut loaded.bundle,
                 max_seq,
-                &ctx.gpu.arch,
-                meta.tokenizer.special_token_id("<|im_end|>"),
-                meta.tokenizer.special_token_id("</think>"),
-                true,
+                cpu_splice,
+                qwen4_dflash2_block(ctx.spec, verify_rows),
                 verify_rows,
-                loaded.bundle.state_format().gdn,
-            )
-        });
+            ) {
+                Ok(speculator) => Some(speculator),
+                Err(error) => {
+                    let _ = loaded.bundle.free_gpu(ctx.gpu);
+                    return Err(error);
+                }
+            },
+            None => native_mtp.then(|| {
+                qwen4_native_mtp_speculator(
+                    max_k,
+                    max_seq,
+                    &ctx.gpu.arch,
+                    meta.tokenizer.special_token_id("<|im_end|>"),
+                    meta.tokenizer.special_token_id("</think>"),
+                    true,
+                    verify_rows,
+                    loaded.bundle.state_format().gdn,
+                )
+            }),
+        };
 
         let mut model = LoadedModel {
             state: Some(Box::new(loaded.bundle)),
@@ -1075,6 +1109,65 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
     qwen4_explicit_mtp_k(spec)
         .map(|k| k.clamp(1, 10))
         .unwrap_or_else(|| qwen4_auto_mtp_k(gpu_arch, None))
+}
+
+/// Qwen4 DFlash2 width under `speculation.dflash_block = auto`: B=4 (three
+/// drafts) is the fastest measured width on gfx1151 and the model card's.
+const QWEN4_DFLASH2_AUTO_BLOCK: usize = 4;
+
+/// The proposal width of a Qwen4 DFlash2 load: an explicit
+/// `speculation.dflash_block`, else [`QWEN4_DFLASH2_AUTO_BLOCK`], clamped to
+/// the rows a verify runs row-exact (`verify_rows`: 8 on gfx1151) so greedy
+/// output stays the AR stream.
+fn qwen4_dflash2_block(spec: SpecLoadCfg, verify_rows: usize) -> usize {
+    match spec.dflash_block {
+        Some(block) if !spec.dflash_block_auto => block,
+        _ => QWEN4_DFLASH2_AUTO_BLOCK,
+    }
+    .min(verify_rows)
+}
+
+/// The shared DFlash2 speculator (`--spec dflash --model-draft <draft>`) on
+/// a single-card Qwen4 bundle at proposal width `block`
+/// ([`qwen4_dflash2_block`]). CPU-hosted routed experts (a 4-row verify
+/// window) are refused rather than guessed at.
+fn qwen4_dflash2_speculator(
+    gpu: &mut rdna_compute::Gpu,
+    draft: &str,
+    bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
+    max_seq: usize,
+    cpu_splice: bool,
+    block: usize,
+    verify_rows: usize,
+) -> Result<Box<dyn hipfire_runtime::spec::Speculator>, String> {
+    if cpu_splice {
+        return Err(
+            "qwen4: DFlash2 is not supported with CPU-hosted routed experts; \
+             load the experts on the GPU or use native MTP (--spec mtp)"
+                .into(),
+        );
+    }
+    let draft_hfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(draft))
+        .map_err(|error| format!("qwen4: DFlash2 draft '{draft}': {error}"))?;
+    let config = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq).ok_or_else(|| {
+        format!("qwen4: '{draft}' is not a DFlash draft (missing `dflash` metadata)")
+    })?;
+    drop(draft_hfq);
+    if config.hidden != bundle.config.hidden_size || config.vocab_size != bundle.config.vocab_size {
+        return Err(format!(
+            "qwen4: DFlash2 draft '{draft}' (hidden {}, vocab {}) was not made for this model \
+             (hidden {}, vocab {})",
+            config.hidden, config.vocab_size, bundle.config.hidden_size, bundle.config.vocab_size
+        ));
+    }
+    let speculator =
+        hipfire_runtime::dflash2_spec::build_dflash2_speculator(gpu, draft, bundle, max_seq, block)
+            .map_err(|error| format!("qwen4: DFlash2 speculator: {error}"))?;
+    eprintln!(
+        "  qwen4 DFlash2 speculator: {draft} (block {block}, target layers {:?}, verify rows {verify_rows})",
+        config.target_layer_ids
+    );
+    Ok(speculator)
 }
 
 /// The generic speculator around the native Qwen4 MTP head, with the load log
@@ -7520,6 +7613,54 @@ mod qwen4_admission_tests {
         assert!(Qwen4Carrier
             .admit_options(Some("draft.hfq"), defaults)
             .is_err());
+    }
+
+    #[test]
+    fn qwen4_dflash2_width_is_four_under_auto_and_explicit_otherwise_within_exact_rows() {
+        let width = |dflash_block, dflash_block_auto, rows| {
+            super::qwen4_dflash2_block(
+                SpecLoadCfg {
+                    dflash_block,
+                    dflash_block_auto,
+                    ..SpecLoadCfg::default()
+                },
+                rows,
+            )
+        };
+        // The daemon resolves `auto` to 16 (8 batched); Qwen4 keeps its 4.
+        assert_eq!(width(Some(16), true, 8), 4);
+        assert_eq!(width(None, false, 8), 4);
+        assert_eq!(width(Some(6), false, 8), 6);
+        // Never past the row-exact verify rows.
+        assert_eq!(width(Some(16), false, 8), 8);
+        assert_eq!(width(None, false, 3), 3);
+    }
+
+    #[test]
+    fn dflash_needs_an_explicit_request_its_draft_and_no_forced_mtp() {
+        let dflash = SourceAdmissionOptions {
+            spec: SpecLoadCfg {
+                dflash: Some(true),
+                ..resolved_ar_spec()
+            },
+            ..Default::default()
+        };
+        assert!(Qwen4Carrier
+            .admit_options(Some("draft.hfq"), dflash)
+            .is_ok());
+        let error = Qwen4Carrier.admit_options(None, dflash).unwrap_err();
+        assert!(error.contains("needs a DFlash2 draft"), "{error}");
+        let both = SourceAdmissionOptions {
+            spec: SpecLoadCfg {
+                mtp: Some(true),
+                ..dflash.spec
+            },
+            ..dflash
+        };
+        let error = Qwen4Carrier
+            .admit_options(Some("draft.hfq"), both)
+            .unwrap_err();
+        assert!(error.contains("pick one"), "{error}");
     }
 
     #[test]
