@@ -8,19 +8,53 @@
 //!
 //! Included by the driver with `#[path = "pm_loop/moe.rs"] mod moe;`.
 //!
-//! # Knobs
+//! # Knobs (what exists today)
 //!
-//! * `--epi gate_up|down|gate_up_ntN|down_ntN|down_nt4rR` (default `gate_up`):
-//!   the candidate entry, parsed by `Spec::from_epi(epi, Gfx1201)` and emitted
-//!   with `qwen4_moe_sym::emit`; `validate` errors (e.g. a row repeat, which is
-//!   gfx1151-only) are returned verbatim by `candidate()`.
-//! * `--base-epi <epi>`: emit the baseline from that entry instead of using the
-//!   shipped one (must be the same kind as the candidate: gate/up and down
-//!   outputs are not comparable).
-//! * `--ref-rows full|sample:<n>` (default `sample:128`): how many live grouped
-//!   rows the CPU reference computes (all output columns of each). `sample` rows
-//!   are spaced evenly through the grouped order (first and last included), so
-//!   they span experts, tiles, tile positions and the ragged last tile.
+//! * `--epi gate_up|down|gate_up_ntN|down_ntN|down_nt4rR|down_gp_nt4|down_gp_nt8` (default
+//!   `gate_up`): the candidate entry. Everything but `down_gp_*` is parsed by
+//!   `Spec::from_epi(epi, Gfx1201)` and emitted with `qwen4_moe_sym::emit`. **`N` is the tile
+//!   width** (16-slot tiles per weight stream: NT1/NT4/NT8 for gate/up, NT1/NT4/NT8 for down) and
+//!   `R` repeats a 64-row block per CTA (gfx1151-only, refused by `validate` on gfx1201).
+//!   `down_gp_nt4|nt8` is the grouped-position twin of the down NT4/NT8 entry
+//!   (`qwen4_moe_sym::emit_down_gp`, bundle `qwen4_moe_down_gp_pm_gfx1201`): same 64-byte ABI,
+//!   grid and output bytes; the activation plane is `[K/128][m_total]` records in grouped
+//!   order (`g * m_total + row`) instead of `[K/128][x_src_rows]` flat slots, so each tile reads
+//!   its 16 records contiguously. `validate` errors are returned verbatim by `candidate()`.
+//! * `--base-epi <epi>`: emit the baseline from that entry instead of the shipped one (same kind
+//!   as the candidate; a `down_gp_*` or flat `down_*` baseline each get their own plane).
+//! * `--ref-rows full|sample:<n>` (default `sample:128`): how many live grouped rows the CPU
+//!   reference computes (all output columns of each); `sample` rows are spaced evenly through the
+//!   grouped order (first and last included), so they span experts, tiles, tile positions and the
+//!   ragged last tile.
+//!
+//! The tile width and the `gp` plane are the only entry-level knobs. **Ring depth, wait
+//! placement, K-loop prefetch order and the LDS hand-off are not script- or flag-level**: they are
+//! fixed inside `qwen4_moe_sym::nt` (`kloop` / `compute` / `epilogue`; the chains/prefetch axes of
+//! `R4Spec` are private and experimental). `--rip` is not accepted for this kernel
+//! (`--kernel iu4_gemm` and `mq6_i8_gemm` only); see `release-0.4.3/pm-loop/DESIGN.md`
+//! ("qwen4_moe_sym / down_gp in `.rip`") for the plan.
+//!
+//! Correctness requires the candidate to be bitwise equal to the shipped baseline (every NT and
+//! `gp` entry is byte-identical to the others on the same activations) AND to pass the CPU
+//! reference below.
+//!
+//! # Presets
+//!
+//! `--shape fn:<name>` (plus any further `key=value` items) = Flash-Next `E=512,TOP=10,H=2560,
+//! I=640` (`crates/hipfire-arch-qwen4/src/artifact.rs:1833-1843`: 512 experts, top-10;
+//! `admission.rs:1019-1022`: `hidden_size 2560`, `moe_intermediate_size 640`) at the named token
+//! count, with the named entry as the default `--epi`:
+//!
+//! | preset                    | entry         | T     | shipped baseline at this shape            |
+//! |---------------------------|---------------|-------|-------------------------------------------|
+//! | `fn:gate_up_nt4-t4096`    | `gate_up_nt4` | 4096  | gate/up NT4 (40960 slots < 128 * 512)     |
+//! | `fn:gate_up_nt4-t16384`   | `gate_up_nt4` | 16384 | gate/up NT8 (163840 slots >= 128 * 512)   |
+//! | `fn:down_gp_nt4-t4096`    | `down_gp_nt4` | 4096  | shipped gp down NT4                       |
+//! | `fn:down_gp_nt4-t16384`   | `down_gp_nt4` | 16384 | shipped gp down NT4                       |
+//!
+//! The Flash-Next route plan `route_plans/qwen3.8-flash-next.gfx1201.tsv` walks AR decode only: it
+//! lists the `qwen4_moe_iu4_sym_pm_gfx1201` bundle, not `qwen4_moe_down_gp_pm_gfx1201` (prefill's
+//! grouped plane is selected by `qwen4_moe_rotate128_i4_gp_selected`, `moe_rotate_i4_pm.rs`).
 //!
 //! # Shape grammar (`--shape`)
 //!
@@ -114,6 +148,7 @@
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use half::f16;
 use hip_bridge::DeviceBuffer;
+use peacemaker_isa::kernels::qwen4_moe_down_gp;
 use peacemaker_isa::kernels::qwen4_moe_sym::{
     self, ExpertGeometry, Kind, Spec, WeightCodec, KERNARG_BYTES, MAX_SLOTS,
 };
@@ -714,7 +749,12 @@ impl Problem {
     }
 
     fn device_bytes(&self) -> u64 {
+        self.device_bytes_with(false)
+    }
+
+    fn device_bytes_with(&self, gp: bool) -> u64 {
         (self.geo.distinct * self.stride
+            + if gp { self.xq_gp_bytes() } else { 0 }
             + 2 * self.y_bytes()
             + self.xq_bytes()
             + self.geo.experts * 8
@@ -764,6 +804,34 @@ impl Problem {
 
     fn xq(&self) -> &[u8] {
         self.xq.get_or_init(|| self.make_xq())
+    }
+
+    /// Bytes of the grouped-position plane `[epochs][m_total]` (down only).
+    fn xq_gp_bytes(&self) -> usize {
+        self.epochs * self.pmax * XBLK
+    }
+
+    /// The grouped-position plane of the down A4 records: record `g * m_total + p` is the
+    /// flat record `g * x_src_rows + sorted[p] / x_row_div` for every live grouped row `p`;
+    /// padding and sentinel rows stay zero (the `gp` entries never read them: a padding
+    /// lane takes the out-of-range offset). Bytes equal what `moe_rotate_i4_gp_pm` writes
+    /// for the same activations (`moe_rotate_i4_pm::emit_gp`: same record, other index).
+    fn make_xq_gp(&self) -> Vec<u8> {
+        let xq = self.xq();
+        let mut out = vec![0u8; self.xq_gp_bytes()];
+        out.par_chunks_mut(self.pmax * XBLK)
+            .enumerate()
+            .for_each(|(h, plane)| {
+                for p in 0..self.pmax {
+                    if self.tiles[p / 16] < 0 || self.sorted[p] < 0 {
+                        continue;
+                    }
+                    let r = self.sorted[p] as usize / self.x_row_div;
+                    let src = (h * self.x_src_rows + r) * XBLK;
+                    plane[p * XBLK..(p + 1) * XBLK].copy_from_slice(&xq[src..src + XBLK]);
+                }
+            });
+        out
     }
 
     fn x_row(&self, r: usize) -> XRow {
@@ -1008,15 +1076,15 @@ fn shipped_nt(kind: Kind, total_slots: usize, experts: usize) -> u8 {
 #[derive(Clone, Copy, Debug)]
 enum Baseline {
     /// The embedded `qwen4_moe_iu4_sym_pm_gfx1201` bundle, this entry.
-    Shipped(Spec),
+    Shipped(Entry),
     /// Emitted from `--base-epi`.
-    Emitted(Spec),
+    Emitted(Entry),
 }
 
 impl Baseline {
-    fn spec(self) -> Spec {
+    fn entry(self) -> Entry {
         match self {
-            Baseline::Shipped(s) | Baseline::Emitted(s) => s,
+            Baseline::Shipped(e) | Baseline::Emitted(e) => e,
         }
     }
 }
@@ -1027,6 +1095,8 @@ struct Dev {
     tiles: DeviceBuffer,
     sorted: DeviceBuffer,
     xq: DeviceBuffer,
+    /// The grouped-position down plane (`[epochs][m_total]` records), when an arm is `gp`.
+    xq_gp: Option<DeviceBuffer>,
     /// Per-arm output: `[Baseline, Candidate]`.
     y: [DeviceBuffer; 2],
 }
@@ -1034,10 +1104,12 @@ struct Dev {
 struct Moe {
     problem: Problem,
     sample: Sample,
-    cand: Spec,
+    cand: Entry,
     base: Baseline,
     dev: Option<Dev>,
     reference: OnceLock<Vec<(usize, Vec<u16>)>>,
+    /// `--rip`: source path and text of the candidate script.
+    rip: Option<(String, String)>,
 }
 
 fn arm_index(arm: Arm) -> usize {
@@ -1047,57 +1119,225 @@ fn arm_index(arm: Arm) -> usize {
     }
 }
 
-fn spec_json(spec: Spec) -> Value {
+/// One kernel entry: a `qwen4_moe_sym` spec, or (`gp`) the grouped-position twin of
+/// the gfx1201 MQ4 down NT4/NT8 entry (`qwen4_moe_down_gp`), which reads the down A4
+/// plane in grouped-position order (record `g * m_total + row`) instead of gathering
+/// `sorted[row]`-indexed flat-slot records. Same 64-byte ABI, grid and output bytes.
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    spec: Spec,
+    gp: bool,
+}
+
+impl Entry {
+    /// `--epi` grammar: the `Spec::from_epi` names plus `down_gp_nt4|down_gp_nt8`.
+    fn parse(epi: &str) -> Result<Entry> {
+        if let Some(tail) = epi.strip_prefix("down_gp") {
+            if !tail.starts_with("_nt") {
+                return Err(format!(
+                    "--epi {epi}: the grouped-position twin needs a tile width (down_gp_nt4|down_gp_nt8)"
+                ));
+            }
+            return Ok(Entry {
+                spec: Spec::from_epi(&format!("down{tail}"), ARCH)?,
+                gp: true,
+            });
+        }
+        if epi.contains("_gp") {
+            return Err(format!(
+                "--epi {epi}: only the down entry has a grouped-position twin (down_gp_nt4|down_gp_nt8)"
+            ));
+        }
+        Ok(Entry {
+            spec: Spec::from_epi(epi, ARCH)?,
+            gp: false,
+        })
+    }
+
+    fn symbol(self) -> String {
+        if self.gp {
+            self.spec.symbol().replacen("_sym_pm_", "_sym_gp_pm_", 1)
+        } else {
+            self.spec.symbol()
+        }
+    }
+
+    fn variant(self) -> String {
+        if self.gp {
+            self.spec.variant().replacen("down_nt", "down_gp_nt", 1)
+        } else {
+            self.spec.variant()
+        }
+    }
+
+    fn emit(self) -> Result<peacemaker_isa::Emitted> {
+        if self.gp {
+            qwen4_moe_sym::emit_down_gp(self.spec)
+        } else {
+            qwen4_moe_sym::emit(self.spec)
+        }
+    }
+}
+
+fn spec_json(e: Entry) -> Value {
+    let spec = e.spec;
     json!({
-        "epi": spec.variant(), "kind": spec.kind.tag(), "nt": spec.nt, "rr": spec.rr,
-        "codec": format!("{:?}", spec.codec), "arch": spec.arch.name(),
-        "symbol": spec.symbol(), "threads": spec.threads(), "lds_bytes": spec.lds_bytes(),
+        "epi": e.variant(), "kind": spec.kind.tag(), "nt": spec.nt, "rr": spec.rr,
+        "gp": e.gp, "codec": format!("{:?}", spec.codec), "arch": spec.arch.name(),
+        "symbol": e.symbol(), "threads": spec.threads(), "lds_bytes": spec.lds_bytes(),
     })
 }
 
 /// Emit and link exactly like `peacemaker-isa emit --kernel qwen4_moe_sym --co`
 /// (`peacemaker-isa.rs:202-216` and the `native::assemble` block at `:1547`).
-fn emit_object(spec: Spec, source: Value) -> Result<Object> {
-    let e = qwen4_moe_sym::emit(spec)?;
-    let bytes = peacemaker_isa::native::assemble(&e.s_text, spec.arch)?;
-    let symbol = spec.symbol();
+fn emit_object(entry: Entry, source: Value) -> Result<Object> {
+    let e = entry.emit()?;
+    let bytes = peacemaker_isa::native::assemble(&e.s_text, entry.spec.arch)?;
+    let symbol = entry.symbol();
     Ok(Object {
         bytes,
         launch_symbol: symbol.clone(),
         exports: vec![symbol],
-        desc: json!({"knobs": spec_json(spec)}),
+        desc: json!({"knobs": spec_json(entry)}),
         source,
     })
 }
 
-/// Constructor for `--kernel qwen4_moe_sym`.
+/// Flash-Next prefill presets: `fn:<entry>-t<tokens>` = the Flash-Next geometry
+/// (`E=512,TOP=10,H=2560,I=640`) at `T` prefill tokens with that entry as the default
+/// `--epi` (an explicit `--epi` wins). `(name, epi, tokens)`.
+const FN_PRESETS: [(&str, &str, usize); 4] = [
+    ("gate_up_nt4-t4096", "gate_up_nt4", 4096),
+    ("gate_up_nt4-t16384", "gate_up_nt4", 16384),
+    ("down_gp_nt4-t4096", "down_gp_nt4", 4096),
+    ("down_gp_nt4-t16384", "down_gp_nt4", 16384),
+];
+
+/// Rewrite `fn:<name>` shape items to `fn,T=<tokens>`; returns the preset's default epi.
+fn expand_presets(shape: &str) -> Result<(String, Option<&'static str>)> {
+    let mut epi = None;
+    let mut items = Vec::new();
+    for item in shape.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(name) = item.strip_prefix("fn:") {
+            let &(_, e, t) = FN_PRESETS.iter().find(|p| p.0 == name).ok_or_else(|| {
+                format!(
+                    "unknown preset fn:{name} (one of {})",
+                    FN_PRESETS
+                        .iter()
+                        .map(|p| format!("fn:{}", p.0))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            if epi.replace(e).is_some() {
+                return Err("--shape: more than one fn:<name> preset".into());
+            }
+            items.push("fn".to_owned());
+            items.push(format!("T={t}"));
+        } else {
+            items.push(item.to_owned());
+        }
+    }
+    Ok((items.join(","), epi))
+}
+
+/// Compile `.rip` source for `entry` (variant = `Entry::variant()`, e.g. `down_gp_nt4`), refuse
+/// unless its ABI equals that of the Rust emit of the same entry, and link it with the native
+/// writer. The record's `candidate.rip` = `{path, sha256, variant, identical_to_generator}`.
+fn rip_object(entry: Entry, path: &str, source: &str) -> Result<Object> {
+    let variant = entry.variant();
+    let compiled = peacemaker_rip::compile(source, entry.spec.arch, &variant)?;
+    let generator = entry.emit()?;
+    let symbol = entry.symbol();
+    let elf = peacemaker_isa::native::assemble(&compiled.s_text, entry.spec.arch)?;
+    let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, entry.spec.arch)?;
+    let got = crate::iu4::abi_signature(&elf, &symbol)
+        .map_err(|e| format!("compiled kernel does not expose {symbol}: {e}"))?;
+    let want = crate::iu4::abi_signature(&gen_elf, &symbol)?;
+    if got != want {
+        return Err(format!(
+            "ABI mismatch with the Rust emit of {variant}:\n  .rip:      {got}\n  generator: {want}"
+        ));
+    }
+    Ok(Object {
+        source: json!({
+            "source": format!("peacemaker_rip::compile({path}) + native::assemble"),
+            "variant": variant,
+            "sha256": sha256_hex(&elf),
+        }),
+        desc: json!({
+            "knobs": spec_json(entry),
+            "rip": {
+                "path": path,
+                "sha256": sha256_hex(source.as_bytes()),
+                "variant": variant,
+                "identical_to_generator": compiled.s_text == generator.s_text,
+            },
+        }),
+        exports: vec![symbol.clone()],
+        launch_symbol: symbol,
+        bytes: elf,
+    })
+}
+
+/// Constructor for `--kernel qwen4_moe_sym` without `--rip`.
+#[cfg(test)]
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
-    let epi = knobs.take_or("epi", "gate_up");
+    new_with_rip(shape, knobs, None)
+}
+
+/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (down NT4/NT8 entries).
+pub fn new_with_rip(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
+    let rip = match rip {
+        Some(p) => Some((
+            p.display().to_string(),
+            std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        )),
+        None => None,
+    };
+    let (shape, preset_epi) = expand_presets(shape)?;
+    let epi = knobs.take_or("epi", preset_epi.unwrap_or("gate_up"));
     let base_epi = knobs.take("base-epi");
     let sample = Sample::parse(&knobs.take_or("ref-rows", &format!("sample:{DEFAULT_SAMPLE}")))?;
-    let geo = Geo::parse(shape)?;
-    let cand = Spec::from_epi(&epi, ARCH)?;
-    let problem = Problem::new(&geo, cand.kind)?;
+    let geo = Geo::parse(&shape)?;
+    let cand = Entry::parse(&epi)?;
+    let problem = Problem::new(&geo, cand.spec.kind)?;
     let base = match base_epi {
         Some(b) => {
-            let spec = Spec::from_epi(&b, ARCH).map_err(|e| format!("--base-epi: {e}"))?;
-            if spec.kind != cand.kind {
+            let entry = Entry::parse(&b).map_err(|e| format!("--base-epi: {e}"))?;
+            if entry.spec.kind != cand.spec.kind {
                 return Err(format!(
                     "--base-epi {b}: kind {} differs from the candidate's {} (outputs are not comparable)",
-                    spec.kind.tag(),
-                    cand.kind.tag()
+                    entry.spec.kind.tag(),
+                    cand.spec.kind.tag()
                 ));
             }
-            Baseline::Emitted(spec)
+            Baseline::Emitted(entry)
         }
-        None => Baseline::Shipped(Spec {
-            arch: ARCH,
-            kind: cand.kind,
-            nt: shipped_nt(cand.kind, problem.total_slots(), geo.experts),
-            rr: 1,
-            codec: WeightCodec::Mq4Sym,
+        // A gp candidate times against the shipped gp entry (production runs the grouped
+        // plane whenever the PM rotate twin is selected), a flat one against the flat entry.
+        None => Baseline::Shipped(Entry {
+            spec: Spec {
+                arch: ARCH,
+                kind: cand.spec.kind,
+                nt: shipped_nt(cand.spec.kind, problem.total_slots(), geo.experts),
+                rr: 1,
+                codec: WeightCodec::Mq4Sym,
+            },
+            gp: cand.gp,
         }),
     };
+    let any_gp = cand.gp || base.entry().gp;
+    if any_gp && problem.device_bytes_with(true) > DEVICE_CAP {
+        return Err(format!(
+            "shape needs {} B of device memory with the grouped plane (> {DEVICE_CAP} B cap): lower T, E or D",
+            problem.device_bytes_with(true)
+        ));
+    }
     Ok(Box::new(Moe {
         problem,
         sample,
@@ -1105,6 +1345,7 @@ pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
         base,
         dev: None,
         reference: OnceLock::new(),
+        rip,
     }))
 }
 
@@ -1116,15 +1357,17 @@ impl Moe {
     }
 
     fn baseline_object(&self) -> Result<Object> {
-        let spec = self.base.spec();
+        let entry = self.base.entry();
+        let spec = entry.spec;
         match self.base {
             Baseline::Emitted(_) => emit_object(
-                spec,
+                entry,
                 json!({
                     "source": "emitted from --base-epi: peacemaker_isa::kernels::qwen4_moe_sym::emit \
                                + native::assemble (peacemaker-isa.rs:202-216, :1547)",
                 }),
             ),
+            Baseline::Shipped(_) if entry.gp => self.shipped_gp(entry),
             Baseline::Shipped(_) => {
                 let bytes = rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201.to_vec();
                 let symbol = spec.symbol();
@@ -1145,7 +1388,7 @@ impl Moe {
                     exports,
                     desc: json!({
                         "artifact": "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-                        "knobs": spec_json(spec),
+                        "knobs": spec_json(entry),
                     }),
                     source: json!({
                         "source": "crates/rdna-compute/src/gemm.rs:48775 qwen4_moe_sym_nt8_selected \
@@ -1178,6 +1421,54 @@ impl Moe {
         }
     }
 
+    /// The shipped grouped-position down entry: `QWEN4_MOE_DOWN_GP_PM_GFX1201`, the NT4
+    /// twin (resident experts; the host-mapped NT8 twin is not modelled).
+    fn shipped_gp(&self, entry: Entry) -> Result<Object> {
+        let bytes = rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201.to_vec();
+        let symbol = entry.symbol();
+        let mut needle = symbol.clone().into_bytes();
+        needle.push(0);
+        if !bytes.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            return Err(format!(
+                "shipped bundle QWEN4_MOE_DOWN_GP_PM_GFX1201 does not export {symbol}"
+            ));
+        }
+        let p = &self.problem;
+        Ok(Object {
+            launch_symbol: symbol.clone(),
+            exports: qwen4_moe_down_gp::symbols(ARCH).to_vec(),
+            desc: json!({
+                "artifact": "kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco",
+                "knobs": spec_json(entry),
+            }),
+            source: json!({
+                "source": "crates/rdna-compute/src/gemm.rs:51304-51318 gemm_qwen4_moe_down_iu4_sym \
+                           (grouped plane -> `..._gp` twin), :48818-48851 entries/image \
+                           (qwen4_moe_down_gp_entry, qwen4_moe_down_gp_image, QWEN4_MOE_DOWN_GP_PM_ENTRIES), \
+                           :51867-51874 launcher; down width is NT4 resident (:48775 rule); \
+                           plane writer crates/rdna-compute/src/moe_rotate_i4_pm.rs:218-245 \
+                           (qwen4_moe_rotate128_i4_gp_selected / qwen4_moe_rotate128_i4_gp)",
+                "const": "rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201 \
+                          (crates/rdna-compute/src/kernels.rs:10511)",
+                "artifact": "kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco",
+                "sha256": sha256_hex(&bytes),
+                "symbol": symbol,
+                "nt": entry.spec.nt,
+                "selection": {
+                    "residency": "vram (host-mapped experts take the NT8 twin)",
+                    "rule": "down: NT4 always (resident); grouped plane whenever the PM rotate twin is selected (HIPFIRE_MOE_ROTATE_I4_PM) on exact gfx1201",
+                    "total_slots": p.total_slots(),
+                    "n_experts": p.geo.experts,
+                },
+                "plane": "record g * m_total + row (72 B); built host-side from the same flat A4 records \
+                          the flat entry reads (byte-identical to moe_rotate_i4_gp_pm_gfx1201 output)",
+                "route_plan": "crates/rdna-compute/src/route_plans/qwen3.8-flash-next.gfx1201.tsv walks AR decode \
+                               only: it lists qwen4_moe_iu4_sym_pm_gfx1201 but not qwen4_moe_down_gp_pm_gfx1201",
+            }),
+            bytes,
+        })
+    }
+
     fn reference(&self) -> &[(usize, Vec<u16>)] {
         self.reference
             .get_or_init(|| self.problem.reference(self.sample))
@@ -1208,7 +1499,7 @@ impl Moe {
             route: Route::Uniform,
             seed: 7,
         };
-        let p = Problem::new(&geo, self.cand.kind)?;
+        let p = Problem::new(&geo, self.cand.spec.kind)?;
         let object = self.candidate()?;
         let program = peacemaker_lift::lift_object(
             &object.bytes,
@@ -1233,7 +1524,11 @@ impl Moe {
         mem.map("table".into(), TABLE, table)?;
         mem.map("tiles".into(), TILES, Problem::i32_bytes(&p.tiles))?;
         mem.map("sorted".into(), SORTED, Problem::i32_bytes(&p.sorted))?;
-        let mut xq = p.xq().to_vec();
+        let mut xq = if self.cand.gp {
+            p.make_xq_gp()
+        } else {
+            p.xq().to_vec()
+        };
         xq.resize(xq.len() + SLACK, 0);
         mem.map("xq".into(), XQ, xq)?;
         mem.map("y".into(), Y, vec![0u8; p.y_bytes()])?;
@@ -1242,7 +1537,7 @@ impl Moe {
             KERNARG,
             p.kernarg([TABLE, TILES, SORTED, XQ, Y]),
         )?;
-        let launch = p.launch_for(self.cand, [TABLE, TILES, SORTED, XQ, Y]);
+        let launch = p.launch_for(self.cand.spec, [TABLE, TILES, SORTED, XQ, Y]);
         for gy in 0..launch.grid[1] {
             for gx in 0..launch.grid[0] {
                 emu.run_workgroup(
@@ -1296,11 +1591,19 @@ impl Workload for Moe {
         spec_json(self.cand)
     }
 
+    fn requires_baseline_identity(&self) -> bool {
+        // Every NT / gp entry is documented byte-identical to the shipped one.
+        true
+    }
+
     fn candidate(&self) -> Result<Object> {
+        if let Some((path, text)) = &self.rip {
+            return rip_object(self.cand, path, text);
+        }
         emit_object(
             self.cand,
             json!({
-                "source": "peacemaker_isa::kernels::qwen4_moe_sym::emit via Spec::from_epi + \
+                "source": "peacemaker_isa::kernels::qwen4_moe_sym::emit (emit_down_gp for down_gp_*) via Spec::from_epi + \
                            native::assemble (the `peacemaker-isa emit --kernel qwen4_moe_sym --co` \
                            path: crates/peacemaker-isa/src/bin/peacemaker-isa.rs:202-216, :1547)",
             }),
@@ -1334,11 +1637,17 @@ impl Workload for Moe {
             gpu.hip.memset(&d, 0, d.size()).map_err(err)?;
             Ok(d)
         };
+        let xq_gp = if self.cand.gp || self.base.entry().gp {
+            Some(upload(&p.make_xq_gp())?)
+        } else {
+            None
+        };
         let dev = Dev {
             ptrs: upload(&table)?,
             tiles: upload(&Problem::i32_bytes(&p.tiles))?,
             sorted: upload(&Problem::i32_bytes(&p.sorted))?,
             xq: upload(p.xq())?,
+            xq_gp,
             y: [y()?, y()?],
             _weights: weights,
         };
@@ -1350,18 +1659,22 @@ impl Workload for Moe {
         let dev = self
             .dev()
             .expect("Workload::setup must run before Workload::launch");
-        let spec = match arm {
-            Arm::Baseline => self.base.spec(),
+        let entry = match arm {
+            Arm::Baseline => self.base.entry(),
             Arm::Candidate => self.cand,
         };
         let ptr = |b: &DeviceBuffer| b.as_ptr() as u64;
+        let xq = match (&dev.xq_gp, entry.gp) {
+            (Some(gp), true) => gp,
+            _ => &dev.xq,
+        };
         self.problem.launch_for(
-            spec,
+            entry.spec,
             [
                 ptr(&dev.ptrs),
                 ptr(&dev.tiles),
                 ptr(&dev.sorted),
-                ptr(&dev.xq),
+                ptr(xq),
                 ptr(&dev.y[arm_index(arm)]),
             ],
         )
@@ -1922,8 +2235,164 @@ mod tests {
     }
 
     #[test]
+    fn fn_presets_set_geometry_and_default_entry() {
+        for (name, epi, t) in FN_PRESETS {
+            let w = new(&format!("fn:{name}"), &mut knobs(&[])).unwrap();
+            let sh = w.shape_json();
+            assert_eq!(
+                (
+                    sh["experts"].as_u64(),
+                    sh["top_k"].as_u64(),
+                    sh["hidden"].as_u64(),
+                    sh["intermediate"].as_u64(),
+                    sh["tokens"].as_u64()
+                ),
+                (Some(512), Some(10), Some(2560), Some(640), Some(t as u64)),
+                "{name}"
+            );
+            assert_eq!(w.candidate_knobs()["epi"], epi, "{name}");
+        }
+        // An explicit --epi wins; unknown presets and doubled presets are refused.
+        let w = new("fn:down_gp_nt4-t4096", &mut knobs(&[("epi", "down_nt4")])).unwrap();
+        assert_eq!(w.candidate_knobs()["epi"], "down_nt4");
+        assert!(new("fn:nope", &mut knobs(&[])).is_err());
+        assert!(new("fn:down_gp_nt4-t4096,fn:gate_up_nt4-t4096", &mut knobs(&[])).is_err());
+        // Gate/up T=16384 is wide in production: the shipped baseline is NT8, the candidate NT4.
+        let w = new("fn:gate_up_nt4-t16384", &mut knobs(&[])).unwrap();
+        assert_eq!(
+            w.baseline().unwrap().launch_symbol,
+            "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8"
+        );
+        let w = new("fn:gate_up_nt4-t4096", &mut knobs(&[])).unwrap();
+        assert_eq!(
+            w.baseline().unwrap().launch_symbol,
+            "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"
+        );
+        assert!(w.requires_baseline_identity());
+    }
+
+    #[test]
+    fn down_gp_entry_grammar_and_symbols() {
+        let w = new("T=64", &mut knobs(&[("epi", "down_gp_nt4")])).unwrap();
+        let k = w.candidate_knobs();
+        assert_eq!(k["epi"], "down_gp_nt4");
+        assert_eq!(k["gp"], true);
+        assert_eq!(k["symbol"], "qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4");
+        let w = new("T=64", &mut knobs(&[("epi", "down_gp_nt8")])).unwrap();
+        assert_eq!(
+            w.candidate_knobs()["symbol"],
+            "qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt8"
+        );
+        for bad in ["down_gp", "gate_up_gp_nt4", "down_gp_nt4x"] {
+            assert!(new("T=64", &mut knobs(&[("epi", bad)])).is_err(), "{bad}");
+        }
+        // Only NT4/NT8 have a twin: the refusal is emit_down_gp's, surfaced by candidate().
+        let w = new("T=64", &mut knobs(&[("epi", "down_gp_nt1")])).unwrap();
+        assert!(w.candidate().is_err());
+        // The candidate is the native-writer link of emit_down_gp.
+        let w = new("T=64", &mut knobs(&[("epi", "down_gp_nt4")])).unwrap();
+        let c = w.candidate().unwrap();
+        let spec = Spec::from_epi("down_nt4", ARCH).unwrap();
+        let e = qwen4_moe_sym::emit_down_gp(spec).unwrap();
+        assert_eq!(
+            c.bytes,
+            peacemaker_isa::native::assemble(&e.s_text, ARCH).unwrap()
+        );
+        assert_eq!(c.exports, ["qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4"]);
+    }
+
+    #[test]
+    fn down_gp_baseline_is_the_shipped_gp_bundle() {
+        let w = new("fn:down_gp_nt4-t4096", &mut knobs(&[])).unwrap();
+        let b = w.baseline().unwrap();
+        assert_eq!(b.launch_symbol, "qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4");
+        assert_eq!(b.bytes, rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201);
+        assert_eq!(
+            b.source["sha256"],
+            sha256_hex(rdna_compute::kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201)
+        );
+        assert_eq!(b.exports, qwen4_moe_down_gp::symbols(ARCH));
+        assert_eq!(
+            b.desc["artifact"],
+            "kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco"
+        );
+        // An nt8 gp candidate still times against the resident NT4 twin.
+        let w = new("T=64", &mut knobs(&[("epi", "down_gp_nt8")])).unwrap();
+        assert_eq!(
+            w.baseline().unwrap().launch_symbol,
+            "qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt4"
+        );
+        // A flat --base-epi against a gp candidate is an emitted flat entry.
+        let w = new(
+            "T=64",
+            &mut knobs(&[("epi", "down_gp_nt4"), ("base-epi", "down_nt4")]),
+        )
+        .unwrap();
+        assert_eq!(
+            w.baseline().unwrap().launch_symbol,
+            "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4"
+        );
+    }
+
+    #[test]
+    fn grouped_plane_holds_the_flat_records_at_their_positions() {
+        let p = tiny(Kind::Down);
+        let (flat, gp) = (p.xq(), p.make_xq_gp());
+        assert_eq!(gp.len(), p.epochs * p.pmax * XBLK);
+        let mut live = 0;
+        for h in 0..p.epochs {
+            for pos in 0..p.pmax {
+                let got = &gp[(h * p.pmax + pos) * XBLK..][..XBLK];
+                if p.tiles[pos / 16] >= 0 && p.sorted[pos] >= 0 {
+                    let src = (h * p.x_src_rows + p.sorted[pos] as usize / p.x_row_div) * XBLK;
+                    assert_eq!(got, &flat[src..src + XBLK]);
+                    live += 1;
+                } else {
+                    assert!(got.iter().all(|&b| b == 0), "padding position stays zero");
+                }
+            }
+        }
+        assert_eq!(live, p.epochs * p.geo.slots());
+    }
+
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/qwen4_moe_down_gp.rip");
+
+    #[test]
+    fn rip_twin_is_identical_to_generator_for_every_down_entry() {
+        for epi in ["down_nt4", "down_nt8", "down_gp_nt4", "down_gp_nt8"] {
+            let e = Entry::parse(epi).unwrap();
+            let o = rip_object(e, "twin.rip", TWIN).unwrap();
+            assert_eq!(o.launch_symbol, e.symbol(), "{epi}");
+            assert_eq!(o.desc["rip"]["identical_to_generator"], true, "{epi}");
+            assert_eq!(o.desc["rip"]["variant"], epi);
+            assert_eq!(o.desc["rip"]["sha256"], sha256_hex(TWIN.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn rip_reordered_kloop_keeps_the_abi_and_never_claims_identity() {
+        let edited = TWIN.replace(
+            "            qdown::advance(wg)?;\n            qdown::load_w(wg, g, 0)?;\n",
+            "            qdown::load_w(wg, g, 0)?;\n            qdown::advance(wg)?;\n",
+        );
+        assert_ne!(edited, TWIN);
+        let e = Entry::parse("down_gp_nt4").unwrap();
+        if let Ok(o) = rip_object(e, "edited.rip", &edited) {
+            assert_eq!(o.desc["rip"]["identical_to_generator"], false);
+        }
+    }
+
+    #[test]
+    fn rip_is_refused_for_entries_without_a_twin() {
+        for epi in ["gate_up_nt4", "down", "down_nt1"] {
+            let e = Entry::parse(epi).unwrap();
+            assert!(rip_object(e, "twin.rip", TWIN).is_err(), "{epi}");
+        }
+    }
+
+    #[test]
     fn emu_never_fabricates() {
-        for epi in ["down", "gate_up_nt4"] {
+        for epi in ["down", "gate_up_nt4", "down_gp_nt4"] {
             let w = new("T=64", &mut knobs(&[("epi", epi)])).unwrap();
             match w.emu() {
                 Value::String(s) => assert!(s.starts_with("refused ("), "{s}"),

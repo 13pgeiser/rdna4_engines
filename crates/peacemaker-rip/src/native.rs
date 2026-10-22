@@ -28,6 +28,8 @@ mod native_fp8;
 mod native_gen;
 #[path = "native_mq6.rs"]
 mod native_mq6;
+#[path = "native_qdown.rs"]
+mod native_qdown;
 
 #[derive(Clone)]
 pub struct Chain {
@@ -78,6 +80,8 @@ pub enum Nat {
     Mq6Gen(Rc<peacemaker_isa::kernels::mq6_i8_gemm::Gen>),
     /// An `fp8_gemm` generator (`Fp8Gen::new(spec)`): the validated spec every `fp8::*` block reads.
     Fp8Gen(Rc<peacemaker_isa::kernels::fp8_gemm::blocks::Gen>),
+    /// A `qwen4_moe_sym` down-entry generator (`QDownGen::new(nt, gp, arch)`): registers, labels, launch contract.
+    QDownGen(Rc<peacemaker_isa::kernels::qwen4_moe_sym::down_blocks::Gen>),
 }
 
 impl Nat {
@@ -112,6 +116,7 @@ impl Nat {
             Nat::Iu4Gen(_) => "Iu4Gen",
             Nat::Mq6Gen(_) => "Mq6Gen",
             Nat::Fp8Gen(_) => "Fp8Gen",
+            Nat::QDownGen(_) => "QDownGen",
         }
     }
     pub fn equals(&self, o: &Nat) -> bool {
@@ -249,6 +254,7 @@ pub fn is_fn(name: &str) -> bool {
         || native_gen::is_fn(name)
         || native_mq6::is_fn(name)
         || native_fp8::is_fn(name)
+        || native_qdown::is_fn(name)
     {
         return true;
     }
@@ -287,6 +293,7 @@ pub fn is_type(n: &str) -> bool {
         || native_gen::is_type(n)
         || native_mq6::is_type(n)
         || native_fp8::is_type(n)
+        || native_qdown::is_type(n)
 }
 
 pub fn is_struct(n: &str) -> bool {
@@ -1146,6 +1153,9 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             if let Some(r) = native_fp8::call_fn(it, n, a, cx) {
                 return r;
             }
+            if let Some(r) = native_qdown::call_fn(it, n, a, cx) {
+                return r;
+            }
             if let Some((t, f)) = n.split_once("::") {
                 if let Some(ty) = IntTy::parse(t) {
                     need(1)?;
@@ -1262,6 +1272,7 @@ pub fn method<'a>(
         Nat::Iu4Gen(g) => native_gen::method(it, g, name, a)?,
         Nat::Mq6Gen(g) => native_mq6::method(it, g, name, a)?,
         Nat::Fp8Gen(g) => native_fp8::method(it, g, name, a)?,
+        Nat::QDownGen(g) => native_qdown::method(it, g, name, a)?,
         Nat::Arch(arch) => match name {
             "gfx12" => Some(Value::Bool(arch.gfx12())),
             "name" => Some(Value::str(arch.name())),

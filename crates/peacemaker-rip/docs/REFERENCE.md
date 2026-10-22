@@ -617,3 +617,21 @@ Geometry (256 rows x 128 tokens x 8 waves), the six LDS slots (`A0 A1 R0 R1 D0 D
 | `fp8::epilogue(b, g)?` | everything after the `fp8::EPILOGUE` label: the output jump network (and the GDN preparation for `qkvzagdn`) |
 
 The committed twin [`fp8_gemm.rip`](../../peacemaker-isa/src/kernels/fp8_gemm.rip) writes the whole composition, down to the barrier lists: `declare_lds`, `prologue`, `kloop` (first block, loop of two blocks per trip, peeled last block), `block` (A1 fetched before slab 0, a uniform B1 barrier that retires A0 and publishes the next ratio planes, the next A0 payload, the fold, a split B2 barrier), `fold`, then `fp8::epilogue`. `fp8_gemm::emit` is written over the same blocks and is pinned to the digests recorded before they existed (`peacemaker-isa/tests/fp8_gemm_digests.rs`). It re-emits the bytes and the proof of every one of the twelve valid specs (`tests/fp8_gemm_twin.rs`). `pm_loop --kernel fp8_gemm --rip fp8_gemm.rip` times it ([cookbook 13](cookbook/13-fp8-blocks.md)).
+
+## 16. `qwen4_moe_sym` down entries: `QDownGen` and `qdown::*`
+
+The gfx1201 MQ4 down NT4/NT8 entries of `qwen4_moe_sym`, flat-slot (`down_ntN`) and grouped-position (`down_gp_ntN`), as phase blocks over `qwen4_moe_sym::down_blocks`. The committed twin is `peacemaker-isa/src/kernels/qwen4_moe_down_gp.rip`; `tests/qwen4_moe_down_twin.rs` requires `s_text` and proof identity with `qwen4_moe_sym::emit` / `emit_down_gp` for all four variants. `MoeSym::emit(..)` (section 13) is the coarse native.
+
+The down entries have no LDS and no ring, so there is nothing to lend: the blocks that need the typed core run in one `Driver::typed` call each (like `iu4::*`); the others emit straight into `wg.isa()`. The script owns the exit, the K-loop's trip structure, the order of weight loads and epoch folds in a trip, the descriptor step, the trip counter and prefetch distance (which descriptor each fold re-issues its activations through). The prologue, a fold, the tail and the store epilogue are single blocks (each interleaves emission with per-tile or wave-scope branches, which a typed block cannot sit under). Tile width `nt` is a spec axis (`QDownGen::new(nt, gp, arch)`, `nt` 4 or 8).
+
+| call | meaning |
+|---|---|
+| `QDownGen::new(nt, gp, arch)?` | the generator of one valid entry (the Rust `emit` refusals). `gen.plan()?`, `gen.kernel_spec()`, `gen.nt()`, `gen.gp()`, `gen.label(name)`, `gen.exit_label()` |
+| `qdown::prologue(wg, g, end)?` | kernel arguments, tile ids, descriptors, lane offsets, the first epoch's loads (typed) |
+| `qdown::trips_cmp(wg, "s_cmp_eq_u32" \| "s_cmp_lg_u32")?` | the trip counter against zero, a workgroup-uniform `WgCond` (typed) |
+| `qdown::trips_dec(wg)?` | one trip done |
+| `qdown::load_w(wg, g, p)?` | issue the weight loads of epoch parity `p` |
+| `qdown::compute(wg, g, p, site)?`, `qdown::compute_reload(wg, g, p, site, srd)?` | fold epoch parity `p`; the second form re-issues each tile's next-epoch activations through descriptor `srd` (`qdown::srd_x(0 \| 1)?`) right after its fold (typed) |
+| `qdown::advance(wg)?` | step the weight and activation descriptors one trip on |
+| `qdown::tail(wg, g)?` | the tail after the trips: one pair (even K/128) or one epoch (odd), one block |
+| `qdown::epilogue(wg, g, end)?` | the epilogue label and the tile stores; the script places the exit with `wg.end(end)` |

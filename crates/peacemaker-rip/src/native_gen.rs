@@ -307,13 +307,13 @@ fn gen_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Rc<Gen>> {
         _ => Err("expected an Iu4Gen (`Iu4Gen::new(Iu4Spec { .. })?`)".into()),
     }
 }
-fn wg_arg<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<()> {
+pub(super) fn wg_arg<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<()> {
     match nat_of(it, v) {
         Some(Nat::Wg) => Ok(()),
         _ => Err("the first argument is the workgroup scope `wg`".into()),
     }
 }
-fn exit_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Exit> {
+pub(super) fn exit_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Exit> {
     match nat_of(it, v) {
         Some(Nat::Exit(e)) => Ok(e),
         _ => Err("expected a kernel Exit from `wg.exit(..)`".into()),
@@ -362,7 +362,7 @@ fn give_lds(lend: &mut Lend<'_>, ids: [RingId; 4], (a, w, d, s): Lds) -> Res<()>
 }
 
 /// Run `body` as one `Driver::typed` call on the current driver.
-fn typed<'a, T>(
+pub(super) fn typed<'a, T>(
     cx: &mut Cx<'_>,
     body: impl FnOnce(&mut Wg<'_>, &mut Lend<'_>) -> Res<T>,
 ) -> R<'a, Res<T>> {

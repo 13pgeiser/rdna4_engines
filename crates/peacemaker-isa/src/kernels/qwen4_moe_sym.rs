@@ -1603,6 +1603,8 @@ pub const NT_GATE_BYTES: u32 = 2048;
 /// until the reload. Pending stores are drained (`vscnt`) before the K loop
 /// so its entry and exit ledgers agree. The register plan gives every block
 /// its own adjacent body/epilogue intervals on the aliased registers.
+pub use nt::down_blocks;
+
 mod nt {
     use super::*;
     use peacemaker_author::{End, Free, LdsRegion, StoreTarget, Wave};
@@ -3329,6 +3331,15 @@ mod nt {
             grouped: r4.grouped,
             gpos,
         };
+        let mut b = Builder::new(kernel_spec_of(&g), g.plan()?);
+        b.enable_delay_alu();
+        on_target!(spec.arch, &mut b, body(&g))?;
+        b.finish()
+    }
+
+    /// The entry's launch contract: symbol, variant, kernargs, workgroup and LDS size.
+    fn kernel_spec_of(g: &G) -> KernelSpec {
+        let spec = g.spec;
         let experimental = g.experimental();
         let suffix = if experimental {
             format!(
@@ -3345,15 +3356,15 @@ mod nt {
             kernargs.size = 72;
             kernargs = kernargs.pointer("tile_leaders", 64);
         }
-        let kspec = KernelSpec {
+        KernelSpec {
             kernel_id: "qwen4_moe_sym".into(),
             variant: format!(
                 "{}{suffix}{}",
                 spec.variant(),
-                if gpos { "_gp" } else { "" }
+                if g.gpos { "_gp" } else { "" }
             ),
             arch: spec.arch,
-            symbol: if gpos {
+            symbol: if g.gpos {
                 spec.symbol().replacen("_sym_pm_", "_sym_gp_pm_", 1)
             } else {
                 format!("{}{suffix}", spec.symbol())
@@ -3365,11 +3376,7 @@ mod nt {
             group_segment_fixed_size: spec.lds_bytes(),
             wave32: true,
             cu_mode: false,
-        };
-        let mut b = Builder::new(kspec, g.plan()?);
-        b.enable_delay_alu();
-        on_target!(spec.arch, &mut b, body(&g))?;
-        b.finish()
+        }
     }
 
     fn body<T: Target + peacemaker_author::MmaIu4>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
@@ -3388,5 +3395,148 @@ mod nt {
         let last = g.at(g.rr() - 1);
         kloop(wg, &last)?;
         epilogue(wg, &last, end, gate)
+    }
+
+    /// The gfx1201 MQ4 down NT4 / NT8 entries (flat-slot and grouped-position) as phase blocks, so a
+    /// `.rip` script (`qwen4_moe_down_gp.rip`) owns the kernel's structure: the K-loop's trip
+    /// structure, the order of weight loads and epoch folds inside a trip, the descriptor steps, the
+    /// tail and the exit. The prologue, one epoch's fold (`compute`), the odd/even tail pair and the
+    /// store epilogue stay Rust blocks: they interleave instruction emission with per-tile liveness
+    /// branches, so each is one block. The down entries have no LDS and no ring, so there is no
+    /// ring state to lend. [`emit`] / [`emit_gp`] are the oracle: the twin is byte-identical to them
+    /// for every valid entry.
+    pub mod down_blocks {
+        use super::*;
+
+        /// Register assignment, labels and launch contract of one down entry.
+        pub struct Gen {
+            g: G,
+        }
+
+        impl Gen {
+            /// The down NT4 / NT8 entry `spec` (`gp`: the grouped-position twin). The same
+            /// refusals as `emit` / `emit_down_gp`.
+            pub fn new(spec: Spec, gp: bool) -> Result<Gen, String> {
+                spec.validate()?;
+                if spec.arch != Arch::Gfx1201
+                    || spec.kind != Kind::Down
+                    || spec.codec != WeightCodec::Mq4Sym
+                    || spec.rr != 1
+                    || !matches!(spec.nt, 4 | 8)
+                {
+                    return Err(
+                        "qwen4_moe_down blocks: the gfx1201 MQ4 down NT4/NT8 entries only".into(),
+                    );
+                }
+                Ok(Gen {
+                    g: G {
+                        spec,
+                        blk: 0,
+                        chains: 1,
+                        prefetch: true,
+                        grouped: false,
+                        gpos: gp,
+                    },
+                })
+            }
+            pub fn spec(&self) -> Spec {
+                self.g.spec
+            }
+            pub fn gp(&self) -> bool {
+                self.g.gpos
+            }
+            pub fn kernel_spec(&self) -> KernelSpec {
+                kernel_spec_of(&self.g)
+            }
+            pub fn plan(&self) -> Result<RegPlan, String> {
+                self.g.plan()
+            }
+            /// A block label of this entry (`k_begin`, `k_loop`, `k_loop_end`, `tail_odd`,
+            /// `epilogue`, `end`, ...).
+            pub fn label(&self, name: &str) -> String {
+                self.g.label(name)
+            }
+            /// The kernel exit's label.
+            pub fn exit_label(&self) -> String {
+                self.g.exit_label()
+            }
+        }
+
+        /// Activation descriptor SGPR base of epoch parity `p` (the `reload` operand of [`compute`]).
+        pub fn srd_x(p: usize) -> Result<u8, String> {
+            SRD_X
+                .get(p)
+                .copied()
+                .ok_or_else(|| format!("activation descriptor {p}: expected 0 or 1"))
+        }
+
+        /// Kernel arguments, workgroup/tile ids, descriptors, lane offsets, the first epoch's loads.
+        pub fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String> {
+            super::prologue(wg, &g.g, end)
+        }
+
+        /// `cmp s{TRIPS}, 0`: the K trip counter against zero (workgroup-uniform).
+        pub fn trips_cmp<T: Target>(wg: &mut Wg<T>, cmp: &str) -> Result<WgUniform<Scc>, String> {
+            super::super::trips_cmp(wg, cmp, TRIPS)
+        }
+
+        /// One trip done: `s_add_i32 s{TRIPS}, s{TRIPS}, -1`.
+        pub fn trips_dec(b: &mut Builder) -> Result<(), String> {
+            op(
+                b,
+                format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)),
+                &[s(TRIPS)],
+                &[s(TRIPS)],
+            )
+        }
+
+        /// Issue the weight loads of epoch parity `p`.
+        pub fn load_w(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
+            super::load_w(b, &g.g, p)
+        }
+
+        /// Fold epoch parity `p` into the sums; `reload` = the descriptor to issue the tile's
+        /// next-epoch activations through right after its fold ([`srd_x`]).
+        pub fn compute<T: Target + peacemaker_author::MmaIu4>(
+            w: &mut Wave<'_, T, Builder>,
+            g: &Gen,
+            p: usize,
+            site: &str,
+            reload: Option<u8>,
+        ) -> Result<(), String> {
+            super::compute(w, &g.g, p, site, reload)
+        }
+
+        /// Step the weight descriptor and both activation descriptors one trip's epoch pair on.
+        pub fn advance(b: &mut Builder) -> Result<(), String> {
+            super::advance(b)
+        }
+
+        /// The tail after the trips, one block: two epochs left (even K/128: [`tail_pair`]) or
+        /// one (odd: a single fold), chosen by `s_bitcmp1_b32 s19, 7` in a wave-scope
+        /// `if_else`, which a typed block cannot sit under, so the branch is part of the block.
+        pub fn tail<T: Target + peacemaker_author::MmaIu4>(
+            wg: &mut Wg<T>,
+            g: &Gen,
+        ) -> Result<(), String> {
+            let odd = wg.scmp(Instruction::new(
+                "s_bitcmp1_b32 s19, 7",
+                vec![],
+                vec![s(19)],
+            ))?;
+            wg.if_else(
+                odd,
+                &g.g.label("tail_odd"),
+                &g.g.label("epilogue"),
+                |w| super::tail_pair(w, &g.g),
+                |w| super::compute(w, &g.g, 0, "t2", None),
+            )
+        }
+
+        /// The epilogue label and the tile stores. The caller places the kernel exit after it.
+        pub fn epilogue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String> {
+            wg.isa().label(&g.g.label("epilogue"))?;
+            store_tiles(wg, &g.g, end, |_, j| Ok(g.g.sum(j)))
+        }
     }
 }

@@ -199,9 +199,14 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
-    if o.rip.is_some() && !matches!(o.kernel.as_str(), "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm") {
+    if o.rip.is_some()
+        && !matches!(
+            o.kernel.as_str(),
+            "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm" | "qwen4_moe_sym"
+        )
+    {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm or fp8_gemm: only iu4_gemm, mq6_i8_gemm and fp8_gemm blocks are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm or qwen4_moe_sym (down entries): only iu4_gemm, mq6_i8_gemm, fp8_gemm and the qwen4_moe_sym down blocks are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -222,7 +227,7 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
-        "qwen4_moe_sym" => moe::new(&shape, &mut knobs)?,
+        "qwen4_moe_sym" => moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         other => {
             return Err(format!(
                 "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym)"
@@ -843,8 +848,14 @@ mod tests {
         assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
         assert_eq!(o.knobs.0.len(), 1, "--rip is not a knob");
         assert!(parse_args(args("--kernel iu4_gemm")).unwrap().rip.is_none());
-        let e = parse_args(args("--kernel qwen4_moe_sym --rip /tmp/a.rip")).unwrap_err();
+        let e = parse_args(args("--kernel nope --rip /tmp/a.rip")).unwrap_err();
         assert!(e.contains("only iu4_gemm"), "{e}");
+        // qwen4_moe_sym takes --rip (down entries; the entry check is the workload's).
+        let o = parse_args(args(
+            "--kernel qwen4_moe_sym --rip /tmp/a.rip --epi down_gp_nt4",
+        ))
+        .unwrap();
+        assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
         assert!(parse_args(args("--kernel iu4_gemm --rip")).is_err());
     }
 
