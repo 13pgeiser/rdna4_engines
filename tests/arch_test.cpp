@@ -8626,22 +8626,22 @@ struct ArchCases {
             qwen35_bf16::step, 0, {}, 0xf82117051023e608ull);
         add("qwen35_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            qwen35_fp8::step, 3, {}, 0x74fd4495028c1525ull);
+            qwen35_fp8::step, 3, {}, 0x128edc7bb7b10a25ull);
         add("qwen35_fp8 + MTP, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 3); return qwen35_fp8::declare(b, q35.meta(), &c); },
-            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x1c28909125c12f52ull);
+            nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x5047ef4a2a636cd2ull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0x5eaef1ee37575caeull);
+            qwen35_fp8::step, 7, {}, 0xf163dcc4b907bc2eull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x5a4f256c6fda0e87ull);
+            qwen35_w8a8::step, 7, {}, 0x2645ee9e994bb087ull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xb825b9d264795b8eull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xc77133547cb7080eull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
-            qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
+            qwen35moe_fp8::step, 3, {}, 0x1b577dc9149afa6eull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
             qwen4exp_fp8::step, 3, {}, 0xbe74d476c7fd04b8ull);
@@ -9338,10 +9338,10 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 2, 1, 0x8b2f1786a4ac12b8ull, 0x959ef6b7c6f57d8bull },
         { "qwen4exp_fp8", 4, 0, 0x1e97a26b759d29dfull, 0xfbe74f2b9d7020bfull },
         { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
-        { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
-        { "qwen35_fp8", 2, 1, 0x5085b8c443c59f7cull, 0xb297654cef04bf08ull },
-        { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
-        { "qwen35moe_fp8", 2, 0, 0xf60c9508dd197370ull, 0x05e0778848bf416cull },
+        { "qwen35_fp8", 1, 0, 0xf1d4d353778c659dull, 0x2d8b75328831fc4full },
+        { "qwen35_fp8", 2, 1, 0xae74425d0da27efcull, 0x248bdf66adce6078ull },
+        { "qwen35moe_fp8", 1, 0, 0x2ef73da6f8762373ull, 0xa4d9660595aedca1ull },
+        { "qwen35moe_fp8", 2, 0, 0x7f34dd5d9046ccf0ull, 0x4e4ba7f4eff2137cull },
     };
     for (const Case& cs : cases) {
         RadBuilder b;
