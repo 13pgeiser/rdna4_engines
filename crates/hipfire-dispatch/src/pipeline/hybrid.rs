@@ -963,6 +963,17 @@ pub struct GatedAttentionOp<'a> {
     /// Interleaved Q and gate, `[n_heads, 2 * head_dim]`.
     pub q_gate: &'a GpuTensor,
     pub tap: Option<AttentionTap<'a>>,
+    /// Multimodal (t, h, w) RoPE; `None` rotates at `row.pos_buf`.
+    pub mrope: Option<MropeRope<'a>>,
+}
+
+/// Three-section RoPE positions of one token (vision-language prompts).
+#[derive(Clone, Copy)]
+pub struct MropeRope<'a> {
+    /// `[3]` i32 (t, h, w) rotary phases, already offset by KV compaction.
+    pub positions: &'a DeviceBuffer,
+    /// Frequency counts of the t, h and w sections.
+    pub section: [usize; 3],
 }
 
 impl GatedAttentionOp<'_> {
@@ -993,7 +1004,8 @@ impl GatedAttentionOp<'_> {
     pub fn attend(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> Result<bool, DispatchError> {
         let dims = &self.dims;
         let row = &self.row;
-        let fused_prep = fused_attention_prep(gpu, dims) && self.tap.is_none();
+        let fused_prep =
+            fused_attention_prep(gpu, dims) && self.tap.is_none() && self.mrope.is_none();
         // Fold the Q8_0 KV write into the prep epilogue. Requires the
         // non-compact decode route: pos_buf must hold the physical position
         // when the folded writer reads it.
@@ -1035,7 +1047,19 @@ impl GatedAttentionOp<'_> {
             gpu.memcpy_htod_auto(row.pos_buf, &logical.to_ne_bytes())
                 .map_err(hip)?;
         }
-        if fused_prep && kv_write_fold {
+        if let Some(mrope) = self.mrope {
+            gpu.rope_mrope_halfsplit_f32(
+                row.q,
+                row.k,
+                mrope.positions,
+                dims.n_heads,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.n_rot,
+                dims.rope_theta,
+                mrope.section,
+            )
+        } else if fused_prep && kv_write_fold {
             gpu.qwen35_fa_prep_kvwrite_gfx1100(
                 self.q_gate,
                 row.q,
