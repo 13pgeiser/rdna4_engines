@@ -30,7 +30,7 @@ use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::gated_mlp::{GatedMlpOp, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid;
-use hipfire_dispatch::pipeline::hybrid::AttentionTap;
+use hipfire_dispatch::pipeline::hybrid::{AttentionTap, MixerOutput};
 use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
 use hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall;
 use hipfire_dispatch::pipeline::superop;
@@ -4128,222 +4128,6 @@ fn deltanet_qk_l2_norm_scale(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dense_tp_deltanet_partial(
-    gpu: &mut Gpu,
-    layer: &super::weights::DeltaNetLayerWeights,
-    config: &Qwen35Config,
-    delta_layer_idx: usize,
-    dn_state: &mut DeltaNetState,
-    s: &Qwen35Scratch,
-) -> HipResult<()> {
-    let ctx = DispatchCtx::new(gpu);
-    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
-    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-    let n_v_heads = config.linear_num_value_heads;
-    let hd = config.linear_key_head_dim;
-    qkvza_via_execute_steps(
-        gpu,
-        &ctx,
-        &layer.wqkv,
-        &layer.wz,
-        &layer.w_beta,
-        &layer.w_alpha,
-        &layer.attn_norm,
-        &s.x,
-        &s.tmp,
-        &s.x_rot,
-        &s.dn_qkv,
-        &s.dn_z,
-        &s.dn_beta,
-        &s.dn_alpha,
-        config.norm_eps,
-    )?;
-    deltanet_sigmoid_alpha_gate(
-        gpu,
-        &s.dn_beta,
-        &s.dn_alpha,
-        &layer.dt_bias,
-        &layer.a_log,
-        n_v_heads,
-    )?;
-    gpu.conv1d_silu_split_f32(
-        &s.dn_q_raw,
-        &s.dn_k_raw,
-        &s.dn_v,
-        &s.dn_qkv,
-        &layer.conv_weight,
-        &dn_state.conv_states[delta_layer_idx],
-        k_dim,
-        v_dim,
-    )?;
-    deltanet_qk_l2_norm_scale(
-        gpu,
-        &s.dn_q_raw,
-        &s.dn_k_raw,
-        config.linear_num_key_heads,
-        hd,
-        config.norm_eps,
-    )?;
-    if config.linear_num_key_heads < n_v_heads {
-        gpu.repeat_interleave_qk_f32(
-            &s.dn_q_raw,
-            &s.dn_k_raw,
-            &s.dn_q,
-            &s.dn_k,
-            config.linear_num_key_heads,
-            n_v_heads / config.linear_num_key_heads,
-            hd,
-        )?;
-    } else {
-        gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
-        gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
-    }
-    match dn_state.quant {
-        StateQuant::FP32 => gpu.gated_delta_net_f32(
-            &s.dn_q,
-            &s.dn_k,
-            &s.dn_v,
-            &s.dn_alpha,
-            &s.dn_beta,
-            &dn_state.s_matrices[delta_layer_idx],
-            &s.dn_attn_out,
-            1,
-            n_v_heads,
-            config.linear_value_head_dim,
-        )?,
-        StateQuant::Q8 => gpu.gated_delta_net_q8(
-            &s.dn_q,
-            &s.dn_k,
-            &s.dn_v,
-            &s.dn_alpha,
-            &s.dn_beta,
-            &dn_state.s_matrices[delta_layer_idx],
-            &dn_state.s_scales[delta_layer_idx],
-            &s.dn_attn_out,
-            1,
-            n_v_heads,
-            config.linear_value_head_dim,
-            dn_state.ef_residual(delta_layer_idx),
-        )?,
-        StateQuant::Q4 => gpu.gated_delta_net_q4(
-            &s.dn_q,
-            &s.dn_k,
-            &s.dn_v,
-            &s.dn_alpha,
-            &s.dn_beta,
-            &dn_state.s_matrices[delta_layer_idx],
-            &dn_state.s_scales[delta_layer_idx],
-            &s.dn_attn_out,
-            1,
-            n_v_heads,
-            config.linear_value_head_dim,
-        )?,
-    }
-    gpu.gated_norm_f32(
-        &s.dn_attn_out,
-        &s.dn_z,
-        &layer.norm_weight,
-        &s.dn_normed,
-        n_v_heads,
-        config.linear_value_head_dim,
-        config.norm_eps,
-    )?;
-    let wr = layer.wo.dispatch_ref();
-    execute_steps(
-        gpu,
-        &ctx,
-        &[Step::Gemv {
-            w: &wr,
-            input: GemvInput::Raw(&s.dn_normed),
-            out: &s.o,
-        }],
-    )
-    .map_err(|e| HipError::new(0, &e.to_string()))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dense_tp_attention_partial(
-    gpu: &mut Gpu,
-    layer: &super::weights::FullAttnLayerWeights,
-    config: &Qwen35Config,
-    kv_layer_idx: usize,
-    pos: usize,
-    kv_cache: &mut llama::KvCache,
-    s: &Qwen35Scratch,
-) -> HipResult<()> {
-    let ctx = DispatchCtx::new(gpu);
-    qkv_via_execute_steps(
-        gpu,
-        &ctx,
-        &layer.wq,
-        &layer.wk,
-        &layer.wv,
-        &layer.attn_norm,
-        &s.x,
-        &s.tmp,
-        &s.x_rot,
-        &s.fa_q_full,
-        &s.fa_k,
-        &s.fa_v,
-        config.norm_eps,
-    )?;
-    gpu.deinterleave_f32(
-        &s.fa_q_full,
-        &s.fa_q,
-        &s.fa_gate,
-        config.n_heads,
-        config.head_dim,
-    )?;
-    gpu.rmsnorm_batched(
-        &s.fa_q,
-        &layer.q_norm,
-        &s.fa_q,
-        config.n_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-    gpu.rmsnorm_batched(
-        &s.fa_k,
-        &layer.k_norm,
-        &s.fa_k,
-        config.n_kv_heads,
-        config.head_dim,
-        config.norm_eps,
-    )?;
-    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32(
-        &s.fa_q,
-        &s.fa_k,
-        &s.pos_buf,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-    )?;
-    let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, kv_layer_idx, pos)?;
-    if !fused_epilogue {
-        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-    }
-    let wr = layer.wo.dispatch_ref();
-    execute_steps(
-        gpu,
-        &ctx,
-        &[Step::Gemv {
-            w: &wr,
-            input: if fused_epilogue {
-                GemvInput::Prerotated(&s.fa_attn_out)
-            } else {
-                GemvInput::Raw(&s.fa_attn_out)
-            },
-            out: &s.o,
-        }],
-    )
-    .map_err(|e| HipError::new(0, &e.to_string()))
-}
-
 // ROCm 10 RCCL SHM and inaccessible cross-device copy failures require
 // CPU-staged deterministic reduction on mixed topology.
 fn dense_tp_all_reduce_sum_f32(
@@ -4442,26 +4226,23 @@ fn dense_tp_local_attention(
     scratches: &[Qwen35Scratch],
 ) -> HipResult<()> {
     for rank in 0..gpus.devices.len() {
-        match &weights[rank].layers[layer_idx] {
-            LayerWeights::DeltaNet(layer) => dense_tp_deltanet_partial(
-                &mut gpus.devices[rank],
-                layer,
-                &configs[rank],
-                delta_layer_idx,
-                &mut dn_states[rank],
-                &scratches[rank],
-            )?,
-            LayerWeights::FullAttn(layer) => dense_tp_attention_partial(
-                &mut gpus.devices[rank],
-                layer,
-                &configs[rank],
-                layer_idx,
-                pos,
-                &mut kv_caches[rank],
-                &scratches[rank],
-            )?,
-            _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
+        let layer = &weights[rank].layers[layer_idx];
+        if !matches!(layer, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_)) {
+            return Err(HipError::new(0, "dense TP received a MoE/mismatched layer"));
         }
+        let s = &scratches[rank];
+        let binding = super::program::DecodeBinding {
+            dims: super::program::hybrid_dims(&configs[rank]),
+            s,
+            kv_cache: &kv_caches[rank],
+            dn_state: &dn_states[rank],
+            position: pos,
+        };
+        let output = MixerOutput::Write(&s.o);
+        let mixer = binding.mixer(layer, layer_idx, delta_layer_idx, false, None, output);
+        let gpu = &mut gpus.devices[rank];
+        let ctx = DispatchCtx::new(gpu);
+        execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
     }
     Ok(())
 }
@@ -5834,6 +5615,7 @@ impl Qwen35Bindings<'_> {
             self.delta_layer_idx,
             self.precomputed_attn_x_rot,
             tap,
+            MixerOutput::Residual,
         )
     }
 
@@ -6413,6 +6195,7 @@ fn forward_scratch_layers_lowered(
             delta_layer_idx,
             fused_transition && reuse_fused_rotation,
             tap,
+            MixerOutput::Residual,
         );
         execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
         match super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual) {

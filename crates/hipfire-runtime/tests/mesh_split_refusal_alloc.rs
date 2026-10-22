@@ -427,6 +427,61 @@ fn split_program_refuses_without_allocating() {
         }
     }
 
+    // 7. HeadMixer admission: an input projection the manifest does not plan
+    //    (only `wo` is planned, row-split) is refused as `UnknownWeight`.
+    {
+        const HIDDEN: usize = 256;
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 64;
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]).unwrap();
+        let entries = [WeightEntry::layer(
+            "wo",
+            0,
+            vec![HIDDEN, HEADS * HEAD_DIM],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        )];
+        let plan = expect_plan(&entries, &mesh, 1);
+        let mut graph = StepGraph::new();
+        let mut add = |class, shape: &[usize]| {
+            graph
+                .add_resource(ResourceDecl {
+                    class,
+                    shape: shape.to_vec(),
+                    alias: None,
+                })
+                .unwrap()
+        };
+        let input = add(ResourceClass::Activation, &[HIDDEN]);
+        let output = add(ResourceClass::Activation, &[HIDDEN]);
+        let weight = |name: &str| ResourceClass::Weight {
+            name: name.to_string(),
+            layer: Some(0),
+            group: 1,
+        };
+        let qkv = add(weight("qkv"), &[3 * HEADS * HEAD_DIM, HIDDEN]);
+        let wo = add(weight("wo"), &[HIDDEN, HEADS * HEAD_DIM]);
+        let op = graph
+            .add_op(OpDecl {
+                kind: OpKind::GatedAttention,
+                layer: Some(0),
+                rule: SplitRule::HeadMixer {
+                    input,
+                    out_proj: wo,
+                    output,
+                    heads: HEADS,
+                    kv_heads: HEADS,
+                },
+                reads: vec![input, qkv, wo],
+                writes: vec![output],
+            })
+            .unwrap();
+        assert_eq!(
+            refusal("head mixer unknown weight", &graph, &plan, &mesh),
+            SplitError::UnknownWeight { op, resource: qkv }
+        );
+    }
+
     // Keep the success type referenced so a future signature drift fails here.
     let _: Option<SplitPlan> = None;
 }

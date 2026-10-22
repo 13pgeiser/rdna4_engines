@@ -465,11 +465,26 @@ pub fn normed_projection<const N: usize>(
     execute_steps(gpu, ctx, &steps[..=N])
 }
 
+// ── Mixer output ──────────────────────────────────────────────────────────
+
+/// Where a mixer's output projection lands.
+#[derive(Clone, Copy)]
+pub enum MixerOutput<'a> {
+    /// `x += W_o · mix(x)` through the fused single-device decode body.
+    Residual,
+    /// `out = W_o · mix(x)` over this rank's heads: the tensor-parallel
+    /// shard body (`SplitRule::HeadMixer`), whose caller reduces `out` across
+    /// ranks. It runs the plain chain (no arch fusions, no compacted KV), so
+    /// a rank's partial does not depend on which decode fusions its shard
+    /// geometry would admit.
+    Write(&'a GpuTensor),
+}
+
 // ── Gated DeltaNet mixer ──────────────────────────────────────────────────
 
 /// Linear-attention sublayer: norm → fused qkv/z/beta/alpha projection →
 /// causal conv + QK norm + gates → gated delta recurrence → gated norm →
-/// output projection added into `x`.
+/// output projection, added into `x` or written ([`MixerOutput`]).
 pub struct DeltaNetMixerOp<'a> {
     pub dims: HybridDims,
     /// Residual stream; the output projection accumulates into it.
@@ -502,6 +517,7 @@ pub struct DeltaNetMixerOp<'a> {
     pub k: &'a GpuTensor,
     pub recurrent_out: &'a GpuTensor,
     pub normed: &'a GpuTensor,
+    pub output: MixerOutput<'a>,
 }
 
 impl DeltaNetMixerOp<'_> {
@@ -825,11 +841,154 @@ pub fn execute_deltanet_mixer(
     ctx: &DispatchCtx,
     op: &DeltaNetMixerOp<'_>,
 ) -> Result<(), DispatchError> {
+    if let MixerOutput::Write(out) = op.output {
+        return deltanet_shard(gpu, ctx, op, out);
+    }
     op.project(gpu, ctx)?;
     op.prepare(gpu)?;
     op.recur(gpu)?;
     op.gated_norm(gpu)?;
     op.output(gpu, ctx)
+}
+
+/// [`MixerOutput::Write`]: the dense tensor-parallel shard body over this
+/// rank's key/value heads, its output projection written to `out`.
+fn deltanet_shard(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &DeltaNetMixerOp<'_>,
+    out: &GpuTensor,
+) -> Result<(), DispatchError> {
+    if op.prerotated_input {
+        return Err(DispatchError::Hip(
+            "deltanet shard: a prerotated input is not admitted".into(),
+        ));
+    }
+    let dims = &op.dims;
+    let (k_dim, v_dim) = (dims.key_width(), dims.value_width());
+    let n_v_heads = dims.linear_value_heads;
+    let hd = dims.linear_key_dim;
+    normed_projection(
+        gpu,
+        ctx,
+        op.x,
+        op.attn_norm,
+        op.plain,
+        op.x_rot,
+        dims.norm_eps,
+        [
+            (op.wqkv, op.qkv),
+            (op.wz, op.z),
+            (op.w_beta, op.beta),
+            (op.w_alpha, op.alpha),
+        ],
+    )?;
+    gpu.fused_sigmoid_alpha_gate_f32(op.beta, op.alpha, op.dt_bias, op.a_log, n_v_heads)
+        .map_err(hip)?;
+    gpu.conv1d_silu_split_f32(
+        op.q_raw,
+        op.k_raw,
+        op.v,
+        op.qkv,
+        op.conv_weight,
+        op.conv_state,
+        k_dim,
+        v_dim,
+    )
+    .map_err(hip)?;
+    let scale = 1.0 / (hd as f32).sqrt();
+    gpu.fused_qk_l2_norm_scale_f32(
+        op.q_raw,
+        op.k_raw,
+        dims.linear_key_heads,
+        hd,
+        scale,
+        dims.norm_eps,
+    )
+    .map_err(hip)?;
+    if dims.linear_key_heads < n_v_heads {
+        gpu.repeat_interleave_qk_f32(
+            op.q_raw,
+            op.k_raw,
+            op.q,
+            op.k,
+            dims.linear_key_heads,
+            n_v_heads / dims.linear_key_heads,
+            hd,
+        )
+        .map_err(hip)?;
+    } else {
+        gpu.memcpy_dtod_auto(&op.q.buf, &op.q_raw.buf, k_dim * 4)
+            .map_err(hip)?;
+        gpu.memcpy_dtod_auto(&op.k.buf, &op.k_raw.buf, k_dim * 4)
+            .map_err(hip)?;
+    }
+    let vd = dims.linear_value_dim;
+    match op.state {
+        GdnState::F32 { state } => gpu.gated_delta_net_f32(
+            op.q,
+            op.k,
+            op.v,
+            op.alpha,
+            op.beta,
+            state,
+            op.recurrent_out,
+            1,
+            n_v_heads,
+            vd,
+        ),
+        GdnState::Q8 {
+            state,
+            scales,
+            error_feedback,
+        } => gpu.gated_delta_net_q8(
+            op.q,
+            op.k,
+            op.v,
+            op.alpha,
+            op.beta,
+            state,
+            scales,
+            op.recurrent_out,
+            1,
+            n_v_heads,
+            vd,
+            error_feedback,
+        ),
+        GdnState::Q4 { state, scales } => gpu.gated_delta_net_q4(
+            op.q,
+            op.k,
+            op.v,
+            op.alpha,
+            op.beta,
+            state,
+            scales,
+            op.recurrent_out,
+            1,
+            n_v_heads,
+            vd,
+        ),
+    }
+    .map_err(hip)?;
+    gpu.gated_norm_f32(
+        op.recurrent_out,
+        op.z,
+        op.norm_weight,
+        op.normed,
+        n_v_heads,
+        vd,
+        dims.norm_eps,
+    )
+    .map_err(hip)?;
+    execute_steps(
+        gpu,
+        ctx,
+        &[Step::Gemv {
+            w: &op.wo,
+            input: GemvInput::Raw(op.normed),
+            out,
+        }],
+    )
 }
 
 // ── Gated full-attention mixer ────────────────────────────────────────────
@@ -963,6 +1122,7 @@ pub struct GatedAttentionOp<'a> {
     /// Interleaved Q and gate, `[n_heads, 2 * head_dim]`.
     pub q_gate: &'a GpuTensor,
     pub tap: Option<AttentionTap<'a>>,
+    pub output: MixerOutput<'a>,
 }
 
 impl GatedAttentionOp<'_> {
@@ -1122,9 +1282,77 @@ pub fn execute_gated_attention(
     ctx: &DispatchCtx,
     op: &GatedAttentionOp<'_>,
 ) -> Result<(), DispatchError> {
+    if let MixerOutput::Write(out) = op.output {
+        return attention_shard(gpu, ctx, op, out);
+    }
     op.project(gpu, ctx)?;
     let prerotated = op.attend(gpu, ctx)?;
     op.output(gpu, ctx, prerotated)
+}
+
+/// [`MixerOutput::Write`]: the dense tensor-parallel shard body over this
+/// rank's query/KV heads, its output projection written to `out`.
+fn attention_shard(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &GatedAttentionOp<'_>,
+    out: &GpuTensor,
+) -> Result<(), DispatchError> {
+    if op.kv.compact_offset > 0 || op.prerotated_input {
+        return Err(DispatchError::Hip(
+            "gated attention shard: compacted KV and a prerotated input are not admitted".into(),
+        ));
+    }
+    let (dims, row) = (&op.dims, &op.row);
+    normed_projection(
+        gpu,
+        ctx,
+        op.x,
+        op.attn_norm,
+        op.plain,
+        op.x_rot,
+        dims.norm_eps,
+        [(op.wq, op.q_gate), (op.wk, row.k), (op.wv, row.v)],
+    )?;
+    gpu.deinterleave_f32(op.q_gate, row.q, row.gate, dims.n_heads, dims.head_dim)
+        .map_err(hip)?;
+    let eps = dims.norm_eps;
+    gpu.rmsnorm_batched(row.q, op.q_norm, row.q, dims.n_heads, dims.head_dim, eps)
+        .map_err(hip)?;
+    gpu.rmsnorm_batched(row.k, op.k_norm, row.k, dims.n_kv_heads, dims.head_dim, eps)
+        .map_err(hip)?;
+    if let Some(tap) = op.tap {
+        tap(gpu)?;
+    }
+    gpu.rope_partial_interleaved_f32(
+        row.q,
+        row.k,
+        row.pos_buf,
+        dims.n_heads,
+        dims.n_kv_heads,
+        dims.head_dim,
+        dims.n_rot,
+        dims.rope_theta,
+    )
+    .map_err(hip)?;
+    let fused_epilogue = kv_attention(gpu, ctx, dims, &op.kv, row, &op.wo, false)?;
+    if !fused_epilogue {
+        gpu.sigmoid_mul_f32(row.out, row.gate).map_err(hip)?;
+    }
+    let input = if fused_epilogue {
+        GemvInput::Prerotated(row.out)
+    } else {
+        GemvInput::Raw(row.out)
+    };
+    execute_steps(
+        gpu,
+        ctx,
+        &[Step::Gemv {
+            w: &op.wo,
+            input,
+            out,
+        }],
+    )
 }
 
 #[cfg(test)]
