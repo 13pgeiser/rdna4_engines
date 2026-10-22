@@ -110,6 +110,28 @@ diverge by about 1 ULP.
 6. Add a case to `libr4d/r4d_selftest.cpp` so the row is called at least once; a row without one
    reports `no smoke case`.
 
+## The OCP-MXFP4 tiled GEMM (prefill)
+
+**`gemm_mxfp4a8_tiled`** (`gemm_nt_q` at `mxfp4a8`, the rows past the decode band). TN = 4 (256 ×
+128 blocks) from 1024 rows (it was 2048), unless its blocks would number under 128: at the
+crossover Qwen3.8-27B's gate_up -2 %, down -3 %, TranslateGemma 27B's gate_up -9 %, its down +1 %,
+and at 1536 rows all four better; TranslateGemma's 1024-row chunks run there. The weight words a
+thread stages are loaded into registers a slab ahead, right after the staging barrier, so their
+DRAM round trip runs under the slab's WMMAs (+1 VGPR at TN = 4, no spills). At 1024 rows Qwen
+gate_up 804 → 768 µs, down 443 → 417, ssm_in 396 → 384, ssm_out 249 → 231, q|gate 306 → 318;
+TranslateGemma gate_up 1063 → 1029, down 651 → 617; at 2048 rows 0..-4 %; a 41k-token Qwen3.8-27B
+prefill on two cards 8.57 → 8.28 s. A thin last row of blocks (1..160 rows, M under 1024) runs a
+second kernel whose blocks of that row skip the WMMAs of fragments past M, where the plain kernel
+computes them on clamped copies (half the only block's math at 129 rows); every other M runs the
+plain kernel, whose code is instruction for instruction the single kernel's from before the split
+(a guard inside the one kernel cost full blocks 1..15 %). Same-session A/B over 12 shapes: M
+129..160 -8..-20 %, 320..384 -2..-16 % (Qwen gate_up at 320 rows 402 → 339 µs, TranslateGemma's 513
+→ 441). Each of the three keeps the fold, the WMMAs and their order per output byte. Times are one
+rank's weight at TP2 on an R9700, the row alone, clocks warmed; over 20 shapes, M 129..2048: median
+-7.4 % over 140 cells, none slower beyond run-to-run noise.
+
+`tn` (0 the rule, 2, 4) pins the TN choice through `RADIANCE_TUNE`.
+
 ## Notes on the kernels
 
 Three properties of the architecture are assumed throughout and not restated per kernel:

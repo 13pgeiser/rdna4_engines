@@ -25992,6 +25992,12 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 640, 2, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true);
+        /* The plain kernel at a whole row of blocks (not the part kernel, which takes a last row of
+         * 1..160 under 1024 rows): TN=4 forced and by the rule from 1024 rows, and TN=2 at the
+         * 64-wide slab (K not a multiple of 128). */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 256, 400, 640, 4, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 1024, 4096, 640, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 512, 272, 576, 2, true);
         /* K not a multiple of 128: the TN=2 kernel takes the 64-wide slab. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 272, 576, 2, true);

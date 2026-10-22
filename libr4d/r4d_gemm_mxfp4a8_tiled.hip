@@ -34,7 +34,7 @@
 //
 // The weight words and exponents a thread stages are loaded a slab ahead, into registers, right
 // after the staging barrier, so their DRAM round trip runs under the slab's WMMAs instead of in
-// front of the next unpack (+1 VGPR at TN=4; r4d_selftest --perfmx, warmed: Qwen3.8 gate_up at
+// front of the next unpack (+1 VGPR at TN=4; the row alone, clocks warmed: Qwen3.8 gate_up at
 // 1024 rows 804 -> 768 us, down 443 -> 417, TranslateGemma down 651 -> 617, attention q|gate
 // 6144 x 5120 306 -> 318; at 2048 rows 0..-4 %). Loading the A fragments a slab ahead too (+38
 // VGPRs) is slower everywhere.
@@ -323,7 +323,8 @@ __device__ __forceinline__ void r4d_gemm_mxfp4a8_tiled_body(
   }
 }
 
-// The plain kernel: every block the unguarded body, over the body's own LDS (the kernel as it always was).
+// The plain kernel: every block the unguarded body, over the body's own LDS (the single kernel's code
+// from before the part kernel split off).
 template <int TN, int LBK, bool ABLK>
 __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
     const unsigned char* __restrict__ AT, const float* __restrict__ As,
