@@ -19,6 +19,9 @@ The architecture crate binds resident weights, per-layer caches and scratch;
 | FFN sublayer | `HcPre` → `ExpertFfn` (or `Clear` under `HIPFIRE_DEEPSEEK4_SKIP_FFN`) → `HcPost` |
 | Head | `HcHead` → `PreparedProjection` (lm_head) |
 
+The integrated StepGraph IDs for these operations are 32–49 (`HcPre`
+through `CompressorProject`); beta's existing IDs 28–31 remain unchanged.
+
 `PackedProjections` appear only on the exact-gfx1201 MQ2R route, where the
 projections that share the attention input run as one mixed-row launch and
 their own steps skip the projection.

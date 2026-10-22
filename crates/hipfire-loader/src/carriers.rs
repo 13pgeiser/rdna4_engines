@@ -1111,9 +1111,10 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
         .unwrap_or_else(|| qwen4_auto_mtp_k(gpu_arch, None))
 }
 
-/// Qwen4 DFlash2 width under `speculation.dflash_block = auto`: B=4 (three
-/// drafts) is the fastest measured width on gfx1151 and the model card's.
-const QWEN4_DFLASH2_AUTO_BLOCK: usize = 4;
+/// Qwen4 DFlash2 width under `speculation.dflash_block = auto`: B=8 (seven
+/// drafts, of which the confidence cut verifies a prefix) is the fastest
+/// measured width on gfx1151 (HIPF-135: 52.0 tok/s vs B=4 48.6).
+const QWEN4_DFLASH2_AUTO_BLOCK: usize = 8;
 
 /// The proposal width of a Qwen4 DFlash2 load: an explicit
 /// `speculation.dflash_block`, else [`QWEN4_DFLASH2_AUTO_BLOCK`], clamped to
@@ -7616,7 +7617,7 @@ mod qwen4_admission_tests {
     }
 
     #[test]
-    fn qwen4_dflash2_width_is_four_under_auto_and_explicit_otherwise_within_exact_rows() {
+    fn qwen4_dflash2_width_is_eight_under_auto_and_explicit_otherwise_within_exact_rows() {
         let width = |dflash_block, dflash_block_auto, rows| {
             super::qwen4_dflash2_block(
                 SpecLoadCfg {
@@ -7627,9 +7628,10 @@ mod qwen4_admission_tests {
                 rows,
             )
         };
-        // The daemon resolves `auto` to 16 (8 batched); Qwen4 keeps its 4.
-        assert_eq!(width(Some(16), true, 8), 4);
-        assert_eq!(width(None, false, 8), 4);
+        // The daemon resolves `auto` to 16 (8 batched); Qwen4 keeps its 8.
+        assert_eq!(width(Some(16), true, 8), 8);
+        assert_eq!(width(Some(4), true, 8), 8);
+        assert_eq!(width(None, false, 8), 8);
         assert_eq!(width(Some(6), false, 8), 6);
         // Never past the row-exact verify rows.
         assert_eq!(width(Some(16), false, 8), 8);

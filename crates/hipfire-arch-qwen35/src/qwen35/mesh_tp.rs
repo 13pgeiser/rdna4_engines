@@ -5,14 +5,18 @@
 //! Qwen3.5/3.6/3.8 dense tensor parallelism on the generic mesh executor
 //! (#927 item 4).
 //!
-//! Every TP rank holds the whole model except the dense FFN, which it holds
-//! sharded along the intermediate in even whole-G256 blocks
-//! ([`ffn_rank_layout`]). The split plan ([`qwen35_tp_plan`]) runs the
-//! embedding, every mixer (attention and DeltaNet) and the head replicated.
-//! Each layer's `GatedMlp` (`Product` ladder) writes this rank's partial into
-//! [`QWEN35_FFN_OUT_RESOURCE`], and the residual `Accumulate` that follows it
-//! becomes one rank-ordered `AllReduceAdd` into `x`, so a rank's program runs
-//! in one segment per collective ([`Qwen35TpBindings::run_ops`]).
+//! Each TP rank holds an even contiguous block of every head set (query, KV,
+//! DeltaNet key and value heads) and of the FFN intermediate
+//! ([`tp_rank_layouts`], the hand route's `dense_tp_rank_layouts` restricted
+//! to even splits). The split plan ([`qwen35_tp_plan`]) runs the embedding
+//! and the head replicated. Per layer the mixer (`SplitRule::HeadMixer`)
+//! writes this rank's output-projection partial into
+//! [`QWEN35_MIX_OUT_RESOURCE`] and the FFN (`SplitRule::GatedMlp`, `Product`
+//! ladder) into [`QWEN35_FFN_OUT_RESOURCE`]; the residual `Accumulate` after
+//! each becomes one rank-ordered `AllReduceAdd` into `x`, so a rank's program
+//! runs in one segment per collective ([`Qwen35TpBindings::run_ops`]). The
+//! mixers run their `MixerOutput::Write` (decode) and batched
+//! `BatchEpilogue::Partial` (prefill) bodies, the hand dense-TP route's.
 //!
 //! One program serves both routes: a decode epoch runs it over one token on
 //! the decode scratch, a prefill epoch over up to `max_batch` tokens on the
@@ -20,7 +24,7 @@
 //! checkpoints and prefix repair are refused until they are implemented.
 
 use super::batch::PrefillBatchScratch;
-use super::config::{DenseTpRankLayout, LayerType, Qwen35Config};
+use super::config::{dense_tp_rank_layouts, DenseTpRankLayout, LayerType, Qwen35Config};
 use super::forward::{prepare_scratch_inputs, Qwen35Scratch};
 use super::prefill::{batch_chunk_embed_tokens, batch_chunk_upload_positions};
 use super::program;
@@ -32,6 +36,7 @@ use hipfire_dispatch::pipeline::batched::{
 use hipfire_dispatch::pipeline::batched_attention::batch_chunk_full_attn_attn;
 use hipfire_dispatch::pipeline::batched_deltanet::batch_chunk_delta_net_attn;
 use hipfire_dispatch::pipeline::gated_mlp::{MlpLadder, MlpOutput};
+use hipfire_dispatch::pipeline::hybrid::MixerOutput;
 use hipfire_dispatch::pipeline::step_graph::{
     OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule, StepGraph,
 };
@@ -46,6 +51,7 @@ use hipfire_runtime::multi_gpu::executor::{
     BoundaryIo, ForwardEpoch, MeshCheckpointId, MeshCheckpointKey, MeshRoute, MeshStepBindings,
 };
 use hipfire_runtime::multi_gpu::transport::EdgeDescriptor;
+use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use hipfire_runtime::weight_manifest::{plan_manifest, ShardPolicy, WeightEntry};
 use rdna_compute::{DType, Gpu};
 
@@ -55,41 +61,103 @@ type Result<T, E = String> = std::result::Result<T, E>;
 const X_RESOURCE: ResourceId = ResourceId(1);
 /// The dense FFN output: a per-rank partial on a TP mesh.
 pub const QWEN35_FFN_OUT_RESOURCE: ResourceId = ResourceId(2);
-/// FFN split granularity: whole G256 groups, as in the hand dense-TP route.
-const FFN_GROUP: usize = 256;
-/// Manifest names of the dense FFN weights, `[gate, up, down]`.
-const FFN_WEIGHTS: [&str; 3] = ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"];
+/// The mixer output projection: a per-rank partial on a TP mesh.
+pub const QWEN35_MIX_OUT_RESOURCE: ResourceId = ResourceId(3);
+/// Packed-quant block along a row-sharded (input) axis: whole G256 groups, as
+/// in the hand dense-TP route.
+const ROW_GROUP: usize = 256;
 
 /// What one op of the program runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TpOp {
     /// Token embedding and positions into the scratch.
     Embed,
-    /// The layer's gated DeltaNet or gated attention mixer; `index` is the
-    /// layer's DeltaNet state index or KV layer index.
+    /// The layer's gated DeltaNet or gated attention mixer over this rank's
+    /// heads, written to `mix_out`; `index` is the layer's DeltaNet state
+    /// index or KV layer index.
     Mixer { layer: usize, index: usize },
     /// The layer's dense `GatedMlp`, written to `ffn_out`.
     Ffn { layer: usize },
-    /// `x += ffn_out`; replaced by the `AllReduceAdd` on a TP mesh.
+    /// `x += mix_out` or `x += ffn_out`; replaced by the `AllReduceAdd` on a
+    /// TP mesh.
     Residual,
     /// Final norm and LM head into the logits.
     Head,
 }
 
+/// One declared weight: manifest name, logical shape, policy, row group.
+type WeightDecl = (&'static str, [usize; 2], ShardPolicy, usize);
+
+/// The mixer projections of `kind`, input projections first, output
+/// projection last: heads split by `HeadSharded`, the output projection by
+/// `RowShard { axis: 1 }` over the same heads.
+fn mixer_weights(config: &Qwen35Config, kind: LayerType) -> (Vec<WeightDecl>, usize, usize) {
+    let dim = config.dim;
+    let heads = |n_heads, head_dim| ShardPolicy::HeadSharded { n_heads, head_dim };
+    let row = ShardPolicy::RowShard { axis: 1 };
+    match kind {
+        LayerType::LinearAttention => {
+            let (k, v) = (config.linear_num_key_heads, config.linear_num_value_heads);
+            let (kd, vd) = (config.linear_key_head_dim, config.linear_value_head_dim);
+            let qkv = 2 * k * kd + v * vd;
+            let decls = vec![
+                (
+                    "linear_attn.in_proj_qkv",
+                    [qkv, dim],
+                    heads(k, qkv / k.max(1)),
+                    1,
+                ),
+                ("linear_attn.in_proj_z", [v * vd, dim], heads(v, vd), 1),
+                ("linear_attn.in_proj_b", [v, dim], heads(v, 1), 1),
+                ("linear_attn.in_proj_a", [v, dim], heads(v, 1), 1),
+                ("linear_attn.out_proj", [dim, v * vd], row, ROW_GROUP),
+            ];
+            (decls, v, k)
+        }
+        LayerType::FullAttention => {
+            let (h, kvh, hd) = (config.n_heads, config.n_kv_heads, config.head_dim);
+            let decls = vec![
+                ("self_attn.q_proj", [2 * h * hd, dim], heads(h, 2 * hd), 1),
+                ("self_attn.k_proj", [kvh * hd, dim], heads(kvh, hd), 1),
+                ("self_attn.v_proj", [kvh * hd, dim], heads(kvh, hd), 1),
+                ("self_attn.o_proj", [dim, h * hd], row, ROW_GROUP),
+            ];
+            (decls, h, kvh)
+        }
+    }
+}
+
+/// The dense FFN projections, `[gate, up, down]`.
+fn ffn_weights(config: &Qwen35Config) -> [WeightDecl; 3] {
+    let (dim, inner) = (config.dim, config.hidden_dim);
+    let column = ShardPolicy::ColumnShard { axis: 0 };
+    [
+        ("mlp.gate_proj", [inner, dim], column.clone(), 1),
+        ("mlp.up_proj", [inner, dim], column, 1),
+        (
+            "mlp.down_proj",
+            [dim, inner],
+            ShardPolicy::RowShard { axis: 1 },
+            ROW_GROUP,
+        ),
+    ]
+}
+
 /// The program of a dense model: the step graph and, per op, what it runs.
-/// `ffn_dtypes[layer]` are the `[gate, up, down]` payload dtypes the
-/// manifest entries carry. Built together so the two cannot drift.
+/// `dtypes[layer]` are the payload dtypes of the layer's declared weights
+/// (mixer projections, then gate/up/down) that the manifest entries carry.
+/// Built together so the two cannot drift.
 fn tp_program(
     config: &Qwen35Config,
-    ffn_dtypes: &[[DType; 3]],
+    dtypes: &[Vec<DType>],
 ) -> Result<(StepGraph, Vec<TpOp>, Vec<WeightEntry>)> {
-    let (dim, inner) = (config.dim, config.hidden_dim);
+    let dim = config.dim;
     if config.num_experts != 0 {
         return Err("Qwen3.5 TP admits dense models only (MoE uses the EP route)".into());
     }
     if config.n_layers == 0
         || config.layer_types.len() != config.n_layers
-        || ffn_dtypes.len() != config.n_layers
+        || dtypes.len() != config.n_layers
     {
         return Err("Qwen3.5 TP program: layer count disagrees".into());
     }
@@ -107,11 +175,15 @@ fn tp_program(
     let token = resource(&mut graph, ResourceClass::Input, &[1])?;
     let x = resource(&mut graph, ResourceClass::Activation, &[dim])?;
     let ffn_out = resource(&mut graph, ResourceClass::Activation, &[dim])?;
-    debug_assert_eq!((x, ffn_out), (X_RESOURCE, QWEN35_FFN_OUT_RESOURCE));
+    let mix_out = resource(&mut graph, ResourceClass::Activation, &[dim])?;
+    debug_assert_eq!(
+        (x, ffn_out, mix_out),
+        (X_RESOURCE, QWEN35_FFN_OUT_RESOURCE, QWEN35_MIX_OUT_RESOURCE)
+    );
     let logits = resource(&mut graph, ResourceClass::Output, &[config.vocab_size])?;
 
-    let mut ops = Vec::with_capacity(3 * config.n_layers + 2);
-    let mut entries = Vec::with_capacity(3 * config.n_layers);
+    let mut ops = Vec::with_capacity(4 * config.n_layers + 2);
+    let mut entries = Vec::with_capacity(8 * config.n_layers);
     let op = |graph: &mut StepGraph,
               ops: &mut Vec<TpOp>,
               what: TpOp,
@@ -144,54 +216,72 @@ fn tp_program(
         &[x],
     )?;
     let (mut delta, mut kv) = (0, 0);
-    for (layer, (kind, dtypes)) in config.layer_types.iter().zip(ffn_dtypes).enumerate() {
-        let (counter, kind) = match kind {
-            LayerType::LinearAttention => (&mut delta, OpKind::DeltaNetMixer),
-            LayerType::FullAttention => (&mut kv, OpKind::GatedAttention),
-        };
-        let mixer = TpOp::Mixer {
-            layer,
-            index: *counter,
-        };
-        *counter += 1;
-        op(
-            &mut graph,
-            &mut ops,
-            mixer,
-            kind,
-            Some(layer),
-            opaque,
-            &[x],
-            &[x],
-        )?;
-        let mut weight = [ResourceId(0); 3];
-        for (slot, ((name, dtype), shape)) in FFN_WEIGHTS
-            .iter()
-            .zip(dtypes)
-            .zip([[inner, dim], [inner, dim], [dim, inner]])
-            .enumerate()
-        {
-            // gate/up split rows of the intermediate; down splits its columns
-            // in whole G256 groups.
-            let (policy, group) = match slot {
-                2 => (ShardPolicy::RowShard { axis: 1 }, FFN_GROUP),
-                _ => (ShardPolicy::ColumnShard { axis: 0 }, 1),
-            };
+    for (layer, (&kind, dtypes)) in config.layer_types.iter().zip(dtypes).enumerate() {
+        let (mixer, heads, kv_heads) = mixer_weights(config, kind);
+        let n_mixer = mixer.len();
+        let ffn = ffn_weights(config);
+        let decls: Vec<&WeightDecl> = mixer.iter().chain(&ffn).collect();
+        if dtypes.len() != decls.len() {
+            return Err(format!(
+                "Qwen3.5 TP program: layer {layer} weight dtypes disagree"
+            ));
+        }
+        let mut weight = Vec::with_capacity(decls.len());
+        for (&&(name, shape, ref policy, group), &dtype) in decls.iter().zip(dtypes) {
             let class = ResourceClass::Weight {
-                name: (*name).to_string(),
+                name: name.to_string(),
                 layer: Some(layer),
                 group,
             };
-            weight[slot] = resource(&mut graph, class, &shape)?;
+            weight.push(resource(&mut graph, class, &shape)?);
             entries.push(WeightEntry::layer(
-                *name,
+                name,
                 layer,
                 shape.to_vec(),
-                *dtype,
-                policy,
+                dtype,
+                policy.clone(),
             ));
         }
-        let [gate, up, down] = weight;
+        let (mixer_w, ffn_w) = weight.split_at(n_mixer);
+        let (counter, op_kind) = match kind {
+            LayerType::LinearAttention => (&mut delta, OpKind::DeltaNetMixer),
+            LayerType::FullAttention => (&mut kv, OpKind::GatedAttention),
+        };
+        let index = *counter;
+        *counter += 1;
+        let rule = SplitRule::HeadMixer {
+            input: x,
+            out_proj: mixer_w[n_mixer - 1],
+            output: mix_out,
+            heads,
+            kv_heads,
+        };
+        let reads: Vec<_> = std::iter::once(x).chain(mixer_w.iter().copied()).collect();
+        let what = TpOp::Mixer { layer, index };
+        op(
+            &mut graph,
+            &mut ops,
+            what,
+            op_kind,
+            Some(layer),
+            rule,
+            &reads,
+            &[mix_out],
+        )?;
+        let residual = |src| SplitRule::Accumulate { dst: x, src };
+        let what = TpOp::Residual;
+        let kind = OpKind::ResidualAdd;
+        op(
+            &mut graph,
+            &mut ops,
+            what,
+            kind,
+            Some(layer),
+            residual(mix_out),
+            &[x, mix_out],
+            &[x],
+        )?;
+        let [gate, up, down] = [ffn_w[0], ffn_w[1], ffn_w[2]];
         let rule = SplitRule::GatedMlp {
             input: x,
             gate,
@@ -200,28 +290,24 @@ fn tp_program(
             output: ffn_out,
             ladder: MlpLadder::Product,
         };
-        let ffn = TpOp::Ffn { layer };
+        let what = TpOp::Ffn { layer };
         op(
             &mut graph,
             &mut ops,
-            ffn,
+            what,
             OpKind::GatedMlp,
             Some(layer),
             rule,
             &[x, gate, up, down],
             &[ffn_out],
         )?;
-        let rule = SplitRule::Accumulate {
-            dst: x,
-            src: ffn_out,
-        };
         op(
             &mut graph,
             &mut ops,
             TpOp::Residual,
-            OpKind::ResidualAdd,
+            kind,
             Some(layer),
-            rule,
+            residual(ffn_out),
             &[x, ffn_out],
             &[x],
         )?;
@@ -239,57 +325,70 @@ fn tp_program(
     Ok((graph, ops, entries))
 }
 
-/// Rank `rank` of `parts`: every attention and DeltaNet head, and the
-/// `rank`-th even block of the FFN intermediate (whole G256 groups).
-pub fn ffn_rank_layout(
-    config: &Qwen35Config,
-    rank: usize,
-    parts: usize,
-) -> Result<DenseTpRankLayout> {
-    let block = config.hidden_dim / parts.max(1);
-    if parts < 2 || rank >= parts || config.hidden_dim % (parts * FFN_GROUP) != 0 {
-        return Err(format!(
-            "Qwen3.5 TP: intermediate {} does not split into {parts} even G256 blocks (rank {rank})",
-            config.hidden_dim
-        ));
+/// Rank layouts of a `parts`-way dense TP mesh: the hand route's static
+/// layouts (`dense_tp_rank_layouts`), admitted only when every split is an
+/// even contiguous block (the splitter's `Split` layout): query, KV, key and
+/// value heads and the FFN intermediate each divide by `parts`.
+pub fn tp_rank_layouts(config: &Qwen35Config, parts: usize) -> Result<Vec<DenseTpRankLayout>> {
+    let shard =
+        ShardConfig::new(parts, false, 0, ExpertAssign::Stride).map_err(|e| format!("{e:?}"))?;
+    let layouts = dense_tp_rank_layouts(config, &shard)?;
+    let even = |range: &std::ops::Range<usize>, total: usize, rank: usize| {
+        total % parts == 0 && *range == (rank * total / parts..(rank + 1) * total / parts)
+    };
+    for (rank, l) in layouts.iter().enumerate() {
+        if !(even(&l.q_head_range, config.n_heads, rank)
+            && even(&l.kv_head_range, config.n_kv_heads, rank)
+            && even(&l.delta_key_head_range, config.linear_num_key_heads, rank)
+            && even(
+                &l.delta_value_head_range,
+                config.linear_num_value_heads,
+                rank,
+            )
+            && even(&l.ffn_hidden_range, config.hidden_dim, rank))
+        {
+            return Err(format!(
+                "Qwen3.5 TP{parts}: rank {rank} layout {l:?} is not an even head/FFN split"
+            ));
+        }
     }
-    Ok(DenseTpRankLayout {
-        rank,
-        q_head_range: 0..config.n_heads,
-        kv_head_range: 0..config.n_kv_heads,
-        delta_key_head_range: 0..config.linear_num_key_heads,
-        delta_value_head_range: 0..config.linear_num_value_heads,
-        ffn_hidden_range: rank * block..(rank + 1) * block,
-    })
+    Ok(layouts)
 }
 
-/// The TP split plan of the decode program on a pure TP `mesh`.
-/// `ffn_dtypes[layer]` are the `[gate, up, down]` payload dtypes.
+/// The TP split plan of the program on a pure TP `mesh`; `dtypes` as
+/// [`layer_dtypes`].
 pub fn qwen35_tp_plan(
     config: &Qwen35Config,
-    ffn_dtypes: &[[DType; 3]],
+    dtypes: &[Vec<DType>],
     mesh: &DeviceMesh,
 ) -> Result<SplitPlan> {
     if mesh.n_devices() < 2 || mesh.size_of(DimKind::Tp) != mesh.n_devices() {
         return Err("Qwen3.5 TP plan needs a pure TP mesh of two or more devices".into());
     }
-    let (graph, _, entries) = tp_program(config, ffn_dtypes)?;
+    let (graph, _, entries) = tp_program(config, dtypes)?;
     let placement = BandPlacement::uniform(mesh, config.n_layers)?;
     let plan = plan_manifest(&entries, &[], mesh, config.n_layers, &placement)?;
     split_program(&graph, &plan, mesh).map_err(|error| format!("Qwen3.5 TP split: {error}"))
 }
 
-/// Per-layer `[gate, up, down]` dtypes of a dense model's FFN.
-pub fn ffn_dtypes(weights: &Qwen35Weights) -> Result<Vec<[DType; 3]>> {
+/// Per layer, the payload dtypes of the declared weights in [`tp_program`]
+/// order: the mixer projections, then gate/up/down.
+pub fn layer_dtypes(weights: &Qwen35Weights) -> Result<Vec<Vec<DType>>> {
     weights
         .layers
         .iter()
         .map(|layer| match layer {
-            LayerWeights::DeltaNet(l) => {
-                Ok([l.w_gate.gpu_dtype, l.w_up.gpu_dtype, l.w_down.gpu_dtype])
-            }
+            LayerWeights::DeltaNet(l) => Ok([
+                &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.wo, &l.w_gate, &l.w_up, &l.w_down,
+            ]
+            .iter()
+            .map(|w| w.gpu_dtype)
+            .collect()),
             LayerWeights::FullAttn(l) => {
-                Ok([l.w_gate.gpu_dtype, l.w_up.gpu_dtype, l.w_down.gpu_dtype])
+                Ok([&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down]
+                    .iter()
+                    .map(|w| w.gpu_dtype)
+                    .collect())
             }
             _ => Err("Qwen3.5 TP admits dense layers only".to_string()),
         })
@@ -301,7 +400,8 @@ pub fn ffn_dtypes(weights: &Qwen35Weights) -> Result<Vec<[DType; 3]>> {
 /// weights with exactly that layout, so the layout [`Qwen35TpBindings::new`]
 /// checks is the slice the rank holds.
 pub struct Qwen35TpRank {
-    /// Rank-local config: the global one with the FFN intermediate of the shard.
+    /// Rank-local config (`local_dense_tp_config` of `layout`): this rank's
+    /// heads and FFN block.
     config: Qwen35Config,
     layout: DenseTpRankLayout,
     weights: Qwen35Weights,
@@ -311,7 +411,7 @@ pub struct Qwen35TpRank {
     scratch: Qwen35Scratch,
     /// Prefill rows (`max_batch` bounds a prefill epoch).
     pbs: PrefillBatchScratch,
-    /// F32 `[pbs.max_batch, dim]`: a prefill epoch's FFN partial.
+    /// F32 `[pbs.max_batch, dim]`: a prefill epoch's mixer and FFN partial.
     partial: rdna_compute::GpuTensor,
     /// Tokens committed so far.
     position: usize,
@@ -338,7 +438,11 @@ impl Qwen35TpRank {
         use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
         let hip = |e: hip_bridge::HipError| e.to_string();
         gpu.bind_thread().map_err(hip)?;
-        let layout = ffn_rank_layout(global, rank, parts)?;
+        let mut layouts = tp_rank_layouts(global, parts)?;
+        if rank >= layouts.len() {
+            return Err(format!("Qwen3.5 TP rank {rank} is outside {parts} parts"));
+        }
+        let layout = layouts.swap_remove(rank);
         let config = super::config::local_dense_tp_config(global, &layout);
         let weights =
             super::load::load_weights_dense_tp_rank(hfq, global, gpu, &layout).map_err(hip)?;
@@ -445,9 +549,9 @@ pub struct Qwen35TpBindings<'a> {
 
 impl<'a> Qwen35TpBindings<'a> {
     /// Validate before any submission: two or more ranks of one global config,
-    /// rank `i` loaded (by [`Qwen35TpRank::load`]) as rank `i` of
-    /// `ranks.len()`, one weight dtype set, and `plan` the TP plan of exactly
-    /// these shards. `tp_epoch` is
+    /// rank `i` loaded (by [`Qwen35TpRank::load`]) as the `i`-th even head
+    /// and FFN block ([`tp_rank_layouts`]), one weight dtype set, and `plan`
+    /// the TP plan of exactly these shards. `tp_epoch` is
     /// `Gpus::mesh_tp_epoch()`.
     pub fn new(
         global: &Qwen35Config,
@@ -459,12 +563,11 @@ impl<'a> Qwen35TpBindings<'a> {
         if parts < 2 || tp_epoch == 0 {
             return Err("Qwen3.5 TP needs two or more ranks and a provisioned TP group".into());
         }
-        let dtypes = ffn_dtypes(&ranks[0].weights)?;
-        for (index, rank) in ranks.iter().enumerate() {
+        let dtypes = layer_dtypes(&ranks[0].weights)?;
+        let layouts = tp_rank_layouts(global, parts)?;
+        for (index, (rank, layout)) in ranks.iter().zip(&layouts).enumerate() {
             // The layout is the one the rank's weights were loaded with.
-            if rank.layout != ffn_rank_layout(global, index, parts)?
-                || ffn_dtypes(&rank.weights)? != dtypes
-            {
+            if rank.layout != *layout || layer_dtypes(&rank.weights)? != dtypes {
                 return Err(format!(
                     "Qwen3.5 TP rank {index} was not loaded as rank {index} of {parts}"
                 ));
@@ -590,12 +693,15 @@ impl<'a> Qwen35TpBindings<'a> {
                     kv_cache: &rank.kv,
                     dn_state: &rank.dn,
                     position: start,
+                    mrope_section: None,
                 };
-                let step = binding.mixer(&rank.weights.layers[layer], layer, index, false, None);
+                let output = MixerOutput::Write(&s.o);
+                let layer_weights = &rank.weights.layers[layer];
+                let step = binding.mixer(layer_weights, layer, index, false, None, output);
                 execute_steps(gpu, &ctx, &[step]).map_err(dispatch)
             }
-            // The batched mixers of the hand dense-TP prefill, over every
-            // head, adding into the residual rows.
+            // The batched mixers of the hand dense-TP prefill over this rank's
+            // heads, their output projection written to the partial rows.
             (TpOp::Mixer { layer, index }, true) => match &rank.weights.layers[layer] {
                 LayerWeights::DeltaNet(l) => {
                     let cfg = &rank.config;
@@ -620,7 +726,7 @@ impl<'a> Qwen35TpBindings<'a> {
                         index,
                         q8,
                         q8,
-                        BatchEpilogue::Residual,
+                        BatchEpilogue::Partial(&rank.partial),
                         DflashFusionCtx::Off,
                         None,
                         false,
@@ -648,7 +754,7 @@ impl<'a> Qwen35TpBindings<'a> {
                         q8,
                         index,
                         layer,
-                        BatchEpilogue::Residual,
+                        BatchEpilogue::Partial(&rank.partial),
                         DflashFusionCtx::Off,
                         None,
                         tap_fn.get(),
@@ -767,17 +873,21 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
     ) -> Result<BoundaryIo<'_>> {
         self.require_prepared(epoch)?;
         if !matches!(collective.kind, CollectiveKind::AllReduceAdd { into, .. } if into == X_RESOURCE)
-            || collective.operand != QWEN35_FFN_OUT_RESOURCE
             || !self.plan.collectives.contains(collective)
         {
-            return Err("Qwen3.5 TP only adds the dense FFN partials into the residual".into());
+            return Err("Qwen3.5 TP only adds mixer and FFN partials into the residual".into());
         }
         let rank = self.ranks.get(owner).ok_or("unknown Qwen3.5 TP rank")?;
         let rows = epoch.actual_rows;
         let bytes = rows * rank.config.dim * std::mem::size_of::<f32>();
-        let (view, into) = match epoch.route {
-            MeshRoute::Decode => (&rank.scratch.ffn_out, &rank.scratch.x),
-            _ => (&rank.partial, &rank.pbs.x_batch),
+        let s = &rank.scratch;
+        let (view, into) = match (epoch.route, collective.operand) {
+            (MeshRoute::Decode, QWEN35_MIX_OUT_RESOURCE) => (&s.o, &s.x),
+            (MeshRoute::Decode, QWEN35_FFN_OUT_RESOURCE) => (&s.ffn_out, &s.x),
+            (MeshRoute::Prefill, QWEN35_MIX_OUT_RESOURCE | QWEN35_FFN_OUT_RESOURCE) => {
+                (&rank.partial, &rank.pbs.x_batch)
+            }
+            _ => return Err("Qwen3.5 TP collective operand is not a mixer or FFN partial".into()),
         };
         Ok(BoundaryIo {
             view,
@@ -894,95 +1004,105 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
 mod tests {
     use super::*;
 
-    /// A small hybrid: three DeltaNet layers then one full-attention layer,
-    /// FFN intermediate of four G256 groups.
+    /// A small hybrid: three DeltaNet layers then one full-attention layer;
+    /// heads 8, KV heads 4, key heads 4, value heads 8 (G256 value width per
+    /// TP4 rank) and an FFN intermediate of four G256 groups.
     fn dense_config(experts: usize) -> Qwen35Config {
         let linear = "linear_attention";
         let inner = serde_json::json!({ "config": {
             "hidden_size": 256,
             "intermediate_size": 1024,
             "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 64,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
             "vocab_size": 512,
-            "linear_num_key_heads": 2,
-            "linear_num_value_heads": 4,
-            "linear_key_head_dim": 64,
-            "linear_value_head_dim": 64,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
             "num_experts": experts,
             "layer_types": [linear, linear, linear, "full_attention"],
         }});
         super::super::config::config_from_metadata_json(&inner.to_string()).unwrap()
     }
 
-    fn dtypes(config: &Qwen35Config) -> Vec<[DType; 3]> {
-        vec![[DType::MQ4G256; 3]; config.n_layers]
+    fn dtypes(config: &Qwen35Config) -> Vec<Vec<DType>> {
+        config
+            .layer_types
+            .iter()
+            .map(|kind| match kind {
+                LayerType::LinearAttention => vec![DType::MQ4G256; 8],
+                LayerType::FullAttention => vec![DType::MQ4G256; 7],
+            })
+            .collect()
     }
 
     /// Every rank runs the whole program except the residual adds; each
-    /// layer's FFN partial is added into `x` once, by one rank-ordered
-    /// `AllReduceAdd` that replaces the layer's residual op, right after its
-    /// `GatedMlp`.
+    /// layer's mixer partial and then its FFN partial are added into `x` by
+    /// one rank-ordered `AllReduceAdd` each, replacing the residual op that
+    /// follows the producer.
     #[test]
-    fn tp_plan_adds_each_ffn_partial_into_the_residual() {
+    fn tp_plan_adds_each_mixer_and_ffn_partial_into_the_residual() {
         let config = dense_config(0);
         let (graph, ops, _) = tp_program(&config, &dtypes(&config)).unwrap();
         for parts in [2, 4] {
             let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).unwrap();
             let plan = qwen35_tp_plan(&config, &dtypes(&config), &mesh).unwrap();
-            assert_eq!(plan.collectives.len(), config.n_layers);
+            assert_eq!(plan.collectives.len(), 2 * config.n_layers);
             let mut expected = Vec::new();
-            let mut layer = 0;
+            let mut next = 0;
             for (index, op) in ops.iter().enumerate() {
                 let id = OpId(index as u32);
-                match op {
-                    TpOp::Residual => {
-                        let c = &plan.collectives[layer];
-                        assert_eq!(
-                            c.kind,
-                            CollectiveKind::AllReduceAdd {
-                                into: X_RESOURCE,
-                                replaces: id
-                            }
-                        );
-                        assert_eq!(c.operand, QWEN35_FFN_OUT_RESOURCE);
-                        assert_eq!(c.group, (0..parts).collect::<Vec<_>>());
-                        let producer = &graph.ops()[c.producer.0 as usize];
-                        assert_eq!(
-                            (producer.kind, producer.layer),
-                            (OpKind::GatedMlp, Some(layer))
-                        );
-                        expected.push(RankItem::Collective(c.id));
-                        layer += 1;
-                    }
-                    _ => expected.push(RankItem::Op(id)),
+                if *op != TpOp::Residual {
+                    expected.push(RankItem::Op(id));
+                    continue;
                 }
+                let c = &plan.collectives[next];
+                let layer = next / 2;
+                let (operand, kind) = match (next % 2, config.layer_types[layer]) {
+                    (0, LayerType::LinearAttention) => {
+                        (QWEN35_MIX_OUT_RESOURCE, OpKind::DeltaNetMixer)
+                    }
+                    (0, LayerType::FullAttention) => {
+                        (QWEN35_MIX_OUT_RESOURCE, OpKind::GatedAttention)
+                    }
+                    _ => (QWEN35_FFN_OUT_RESOURCE, OpKind::GatedMlp),
+                };
+                let add = CollectiveKind::AllReduceAdd {
+                    into: X_RESOURCE,
+                    replaces: id,
+                };
+                assert_eq!((c.kind, c.operand), (add, operand));
+                assert_eq!(c.group, (0..parts).collect::<Vec<_>>());
+                let producer = &graph.ops()[c.producer.0 as usize];
+                assert_eq!((producer.kind, producer.layer), (kind, Some(layer)));
+                expected.push(RankItem::Collective(c.id));
+                next += 1;
             }
             for rank in &plan.ranks {
                 assert_eq!(rank.items, expected, "rank {}", rank.device);
             }
+            for (rank, layout) in tp_rank_layouts(&config, parts).unwrap().iter().enumerate() {
+                let block = |n: usize| rank * n / parts..(rank + 1) * n / parts;
+                assert_eq!(layout.q_head_range, block(8));
+                assert_eq!(layout.kv_head_range, block(4));
+                assert_eq!(layout.delta_value_head_range, block(8));
+                assert_eq!(layout.ffn_hidden_range, block(1024));
+            }
         }
     }
 
-    /// Four G256 groups split two and four ways; three ways leaves a
-    /// remainder and is refused by the splitter and by the rank layout.
-    /// MoE models are refused before planning.
+    /// Three parts split no head count evenly: the rank layout and the
+    /// splitter refuse them. MoE models and a one-device mesh are refused.
     #[test]
     fn tp_plan_refusals() {
         let config = dense_config(0);
         let mesh = DeviceMesh::rect(&[(DimKind::Tp, 3)]).unwrap();
         let error = qwen35_tp_plan(&config, &dtypes(&config), &mesh).unwrap_err();
         assert!(error.contains("not divisible by Tp=3"), "{error}");
-        assert!(ffn_rank_layout(&config, 0, 3).is_err());
-        assert!(ffn_rank_layout(&config, 2, 2).is_err());
-        let layout = ffn_rank_layout(&config, 1, 4).unwrap();
-        assert_eq!(layout.ffn_hidden_range, 256..512);
-        assert_eq!(layout.q_head_range, 0..config.n_heads);
-        assert_eq!(
-            layout.delta_value_head_range,
-            0..config.linear_num_value_heads
-        );
+        let error = tp_rank_layouts(&config, 3).unwrap_err();
+        assert!(error.contains("not an even head/FFN split"), "{error}");
 
         let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]).unwrap();
         let moe = dense_config(8);
@@ -994,16 +1114,16 @@ mod tests {
 }
 
 /// Emulated TP prefill + decode of a dense checkpoint through the generic
-/// executor, against a single-device run of the same rank shards that adds
-/// their FFN partials in rank order, and against the plain single card. Every
-/// arm prefills the same prompt and is teacher-forced to the plain card's
-/// greedy tokens.
+/// executor, against the hand dense-TP route over the same shards (byte
+/// identity) and against the plain single card (reported). Every arm runs
+/// the same prompt and the plain card's greedy tokens (teacher-forced).
 #[cfg(test)]
 mod hw_tests {
     use super::*;
     use crate::qwen35::{
-        config_from_hfq, forward_prefill_batch, forward_scratch, load_weights, HfqSource, Layout,
-        StateQuant,
+        config_from_hfq, forward_prefill_batch, forward_prefill_dense_tp, forward_scratch,
+        forward_scratch_dense_tp, load_weights, load_weights_dense_tp_rank, local_dense_tp_config,
+        HfqSource, Layout, StateQuant,
     };
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv_mode::KvMode;
@@ -1139,7 +1259,7 @@ mod hw_tests {
     /// epochs (after the prompt and after decode).
     #[test]
     #[ignore = "GPU: HIPFIRE_QWEN35_TP_MODEL=<dense .mq4> with HIPFIRE_EMULATE_GPUS=N (one card) or HIPFIRE_QWEN35_TP_PARTS=N (N cards)"]
-    fn tp_prefill_decode_matches_rank_order_oracle() {
+    fn tp_prefill_decode_matches_hand_route() {
         let parts = std::env::var("HIPFIRE_QWEN35_TP_PARTS")
             .ok()
             .and_then(|parts| parts.parse().ok())
@@ -1209,71 +1329,57 @@ mod hw_tests {
         weights.free_gpu(&mut gpu);
         gpu.drain_pool();
 
-        // The rank shards on one device, FFN partials added in rank order.
-        let mut oracle: Vec<_> = (0..parts)
-            .map(|r| load_rank(&mut hfq, &global, &mut gpu, r, parts, shape))
-            .collect();
-        let dtypes = ffn_dtypes(&oracle[0].weights).unwrap();
-        let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).unwrap();
-        let plan = qwen35_tp_plan(&global, &dtypes, &mesh).unwrap();
-        let (_, ops, _) = tp_program(&global, &dtypes).unwrap();
-        let acc = gpu.zeros(&[chunk * dim], DType::F32).unwrap();
-        let oracle_rows = rows_of(&prompt, chunk, &forced, |tokens, route, start| {
-            let e = epoch(&mesh, 1, route, start, tokens.len());
-            let count = tokens.len() * dim;
-            let acc = acc.sub_offset(0, count);
-            for item in &plan.ranks[0].items {
-                match *item {
-                    RankItem::Op(op) => {
-                        for rank in oracle.iter_mut() {
-                            let op = ops[op.0 as usize];
-                            Qwen35TpBindings::run_op(rank, &mut gpu, op, &e, tokens).unwrap();
-                        }
-                    }
-                    RankItem::Collective(_) => {
-                        let io = |rank: &Qwen35TpRank| match route {
-                            MeshRoute::Decode => (
-                                rank.scratch.ffn_out.sub_offset(0, count),
-                                rank.scratch.x.sub_offset(0, count),
-                            ),
-                            _ => (
-                                rank.partial.sub_offset(0, count),
-                                rank.pbs.x_batch.sub_offset(0, count),
-                            ),
-                        };
-                        let stream = gpu.active_stream.as_ref().unwrap();
-                        let (p0, _) = io(&oracle[0]);
-                        gpu.hip
-                            .memcpy_dtod_async_at(&acc.buf, 0, &p0.buf, 0, count * 4, stream)
-                            .unwrap();
-                        for rank in &oracle[1..] {
-                            gpu.add_f32(&acc, &io(rank).0, &acc).unwrap();
-                        }
-                        for rank in &oracle {
-                            let (_, x) = io(rank);
-                            gpu.add_f32(&x, &acc, &x).unwrap();
-                        }
-                    }
-                }
-            }
-            let rows: Vec<_> = oracle
-                .iter()
-                .map(|r| download(&gpu, &r.scratch.logits, vocab))
-                .collect();
-            assert!(
-                rows.iter().all(|row| row == &rows[0]),
-                "oracle ranks disagree"
-            );
-            for rank in oracle.iter_mut() {
-                rank.position += tokens.len();
-            }
-            rows[0].clone()
-        });
-        let _ = gpu.free_tensor(acc);
-        for rank in oracle {
-            free_rank(rank, &mut gpu);
-        }
+        // The hand dense-TP route (`forward_prefill_dense_tp`,
+        // `forward_scratch_dense_tp`) over the same shards on its own mesh.
         drop(gpu);
+        let hand_rows = {
+            let shard = ShardConfig::new(parts, false, 0, ExpertAssign::Stride).unwrap();
+            let layouts = tp_rank_layouts(&global, parts).unwrap();
+            let configs: Vec<_> = layouts
+                .iter()
+                .map(|l| local_dense_tp_config(&global, l))
+                .collect();
+            let mut gpus = Gpus::init_tp(parts, global.n_layers).unwrap();
+            let (mut weights, mut scratches, mut kvs, mut dns) = (vec![], vec![], vec![], vec![]);
+            for (rank, gpu) in gpus.devices.iter_mut().enumerate() {
+                gpu.bind_thread().unwrap();
+                gpu.active_stream = Some(gpu.hip.stream_create().unwrap());
+                let config = &configs[rank];
+                let w = load_weights_dense_tp_rank(&mut hfq, &global, gpu, &layouts[rank]).unwrap();
+                weights.push(w);
+                scratches.push(Qwen35Scratch::new_with_kv_max(gpu, config, 64, max_seq).unwrap());
+                kvs.push(kv(gpu, config, max_seq));
+                dns.push(DeltaNetState::new_with_quant(gpu, config, StateQuant::Q8).unwrap());
+            }
+            if gpus.can_access_peer_all().unwrap() {
+                assert!(gpus.enable_peer_all().unwrap());
+            }
+            let (w, c, sc) = (&weights, &configs, &scratches);
+            let rows = rows_of(&prompt, chunk, &forced, |tokens, route, start| {
+                match route {
+                    MeshRoute::Decode => forward_scratch_dense_tp(
+                        &mut gpus, &shard, w, c, tokens[0], start, &mut kvs, &mut dns, sc,
+                    ),
+                    _ => forward_prefill_dense_tp(
+                        &mut gpus, &shard, w, c, tokens, start, &mut kvs, &mut dns, sc,
+                    ),
+                }
+                .unwrap();
+                download(&gpus.devices[0], &scratches[0].logits, vocab)
+            });
+            gpus.free_peer_reduce_scratch().unwrap();
+            let parts = weights.into_iter().zip(scratches).zip(kvs).zip(dns);
+            for (rank, (((w, s), kv), dn)) in parts.enumerate() {
+                let gpu = &mut gpus.devices[rank];
+                gpu.bind_thread().unwrap();
+                let _ = s.free_gpu(gpu);
+                dn.free_gpu(gpu);
+                let _ = kv.free_gpu(gpu);
+                w.free_gpu(gpu);
+                gpu.drain_pool();
+            }
+            rows
+        };
 
         // The same shards, one per emulated device, through the executor.
         let mut gpus = Gpus::init_tp(parts, 1).unwrap();
@@ -1305,6 +1411,7 @@ mod hw_tests {
         let mut ranks: Vec<_> = (0..parts)
             .map(|r| load_rank(&mut hfq, &global, &mut gpus.devices[r], r, parts, shape))
             .collect();
+        let dtypes = layer_dtypes(&ranks[0].weights).unwrap();
         let tp_plan = qwen35_tp_plan(&global, &dtypes, &tp_mesh).unwrap();
         let tp_epoch = gpus.mesh_tp_epoch().unwrap();
         // Refusals before any launch, leaving every rank at position 0 and
@@ -1381,11 +1488,11 @@ mod hw_tests {
             .filter(|(a, b)| **a == *b)
             .count();
         eprintln!(
-            "TP{parts} {} rows={rows} chunk={chunk}: {} collectives/epoch; oracle fnv64 {:016x}, tp fnv64 {:016x}, plain fnv64 {:016x}; \
+            "TP{parts} {} rows={rows} chunk={chunk}: {} collectives/epoch; hand fnv64 {:016x}, tp fnv64 {:016x}, plain fnv64 {:016x}; \
              tp argmax {:?}; plain argmax {:?} ({same}/{} equal); max |logit diff| vs plain {max_diff:e}",
             std::path::Path::new(&path).file_name().unwrap().to_string_lossy(),
             tp_plan.collectives.len(),
-            fnv(&oracle_rows),
+            fnv(&hand_rows),
             fnv(&tp_rows),
             fnv(&plain_rows),
             ids(&tp_rows),
@@ -1404,8 +1511,8 @@ mod hw_tests {
         };
         assert_eq!(
             bits(&tp_rows),
-            bits(&oracle_rows),
-            "TP{parts} vs rank-order oracle"
+            bits(&hand_rows),
+            "TP{parts} generic vs hand dense-TP route"
         );
     }
 }
