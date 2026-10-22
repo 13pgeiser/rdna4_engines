@@ -571,6 +571,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
         let bytes = layout.stream_bytes;
         Ok(BoundaryIo {
             view: streams,
+            into: None,
             descriptor: EdgeDescriptor {
                 epoch: *self
                     .edge_epochs
