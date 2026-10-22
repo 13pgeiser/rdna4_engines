@@ -781,21 +781,7 @@ impl MmqScreenable for LlamaWeights {
 
 #[inline]
 fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
-    if dtype == DType::MQ4G128V2 {
-        Err(hip_bridge::HipError::new(
-            0,
-            "this model uses the MQ4G128V2 weight format (qt=53), which only Qwen4 (Flash-Next) models can run; load a Qwen4 model or re-quantize this one to a different format",
-        ))
-    } else if let Some(name) = dtype.mq_i4_name() {
-        Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "this model uses the {name} weight format (MQ-I4 / E8P-I4, qt=131..=136), an expert-slab format only Qwen4 (Flash-Next) models can run, and it has no generic GPU kernel; re-quantize it to a different format"
-            ),
-        ))
-    } else {
-        Ok(())
-    }
+    hipfire_dispatch::pipeline::batched::reject_typed_only_format(dtype)
 }
 
 /// Dispatch GEMV for a weight tensor (quantized or F32).
@@ -1021,12 +1007,16 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
     eps: f32,
     batch_size: usize,
 ) -> HipResult<()> {
-    reject_mq4g128v2(next_linear.gpu_dtype)?;
-    if let Some(awq) = next_linear.awq_scale.as_ref() {
-        gpu.fused_rmsnorm_rotate_mq_awq_batched(x, norm_weight, awq, x_rot, k, eps, batch_size)
-    } else {
-        gpu.fused_rmsnorm_rotate_mq_batched(x, norm_weight, x_rot, k, eps, batch_size)
-    }
+    hipfire_dispatch::pipeline::batched::fused_rmsnorm_rotate_mq_batched_for(
+        gpu,
+        x,
+        norm_weight,
+        &next_linear.dispatch_ref(),
+        x_rot,
+        k,
+        eps,
+        batch_size,
+    )
 }
 
 pub fn fused_rmsnorm_rotate_for_mq<'a>(
@@ -1211,12 +1201,14 @@ pub fn rotate_x_mq_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
-    reject_mq4g128v2(next_linear.gpu_dtype)?;
-    if let Some(awq) = next_linear.awq_scale.as_ref() {
-        gpu.rotate_x_mq_awq_batched(x, awq, x_rot, k, batch_size)
-    } else {
-        gpu.rotate_x_mq_batched(x, x_rot, k, batch_size)
-    }
+    hipfire_dispatch::pipeline::batched::rotate_x_mq_batched_for(
+        gpu,
+        &next_linear.dispatch_ref(),
+        x,
+        x_rot,
+        k,
+        batch_size,
+    )
 }
 
 /// S3-f16-projection-inputs: AWQ-aware batched RMSNorm+FWHT rotation writing
@@ -1239,20 +1231,16 @@ pub fn fused_rmsnorm_rotate_mq_f16_batched_for(
     eps: f32,
     batch_size: usize,
 ) -> HipResult<()> {
-    reject_mq4g128v2(next_linear.gpu_dtype)?;
-    if let Some(awq) = next_linear.awq_scale.as_ref() {
-        gpu.fused_rmsnorm_rotate_mq_awq_f16_batched(
-            x,
-            norm_weight,
-            awq,
-            x_rot_f16,
-            k,
-            eps,
-            batch_size,
-        )
-    } else {
-        gpu.fused_rmsnorm_rotate_mq_f16_batched(x, norm_weight, x_rot_f16, k, eps, batch_size)
-    }
+    hipfire_dispatch::pipeline::batched::fused_rmsnorm_rotate_mq_f16_batched_for(
+        gpu,
+        x,
+        norm_weight,
+        &next_linear.dispatch_ref(),
+        x_rot_f16,
+        k,
+        eps,
+        batch_size,
+    )
 }
 
 /// Phase A Stage A — F2: standalone AWQ-aware variant of
@@ -1290,12 +1278,15 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
-    reject_mq4g128v2(down_proj_weight.gpu_dtype)?;
-    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
-        gpu.fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, x_rot, k, batch_size)
-    } else {
-        gpu.fused_silu_mul_rotate_mq_batched(gate, up, x_rot, k, batch_size)
-    }
+    hipfire_dispatch::pipeline::batched::fused_silu_mul_rotate_mq_batched_for(
+        gpu,
+        &down_proj_weight.dispatch_ref(),
+        gate,
+        up,
+        x_rot,
+        k,
+        batch_size,
+    )
 }
 
 /// S4-f16-residual-inputs: batched AWQ-aware `fused_silu_mul_rotate_mq`
@@ -1313,12 +1304,15 @@ pub fn fused_silu_mul_rotate_mq_f16_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
-    reject_mq4g128v2(down_proj_weight.gpu_dtype)?;
-    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
-        gpu.fused_silu_mul_rotate_mq_awq_f16_batched(gate, up, awq, x_rot_f16, k, batch_size)
-    } else {
-        gpu.fused_silu_mul_rotate_mq_f16_batched(gate, up, x_rot_f16, k, batch_size)
-    }
+    hipfire_dispatch::pipeline::batched::fused_silu_mul_rotate_mq_f16_batched_for(
+        gpu,
+        &down_proj_weight.dispatch_ref(),
+        gate,
+        up,
+        x_rot_f16,
+        k,
+        batch_size,
+    )
 }
 
 /// GEMV with optional pre-rotated x for MagnumQuant weights.

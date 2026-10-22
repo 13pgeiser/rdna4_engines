@@ -3238,7 +3238,7 @@ fn weight_gemm_batched(
         DType::MQ4G256V2 => {
             let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            crate::qwen35::prefill::run_plain_gemm_key(
+            hipfire_dispatch::pipeline::batched::run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
                 &w.buf,
@@ -3263,7 +3263,7 @@ fn weight_gemm_batched(
         DType::MQ6G256V2 => {
             let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            crate::qwen35::prefill::run_plain_gemm_key(
+            hipfire_dispatch::pipeline::batched::run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmMq6G256V2,
                 &w.buf,
@@ -3603,7 +3603,7 @@ pub fn mtp_head_forward_block_batched(
                     gpu, &w.wv.buf, rot, &v_view, w.wv.m, w.wv.k, n, true,
                 )?;
             } else {
-                crate::qwen35::prefill::run_plain_gemm_key(
+                hipfire_dispatch::pipeline::batched::run_plain_gemm_key(
                     gpu,
                     hipfire_dispatch::types::KernelKey::GemmHfq4G256,
                     &w.wv.buf,

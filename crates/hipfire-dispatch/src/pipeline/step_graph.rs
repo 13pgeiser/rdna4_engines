@@ -93,6 +93,10 @@ pub enum OpKind {
     GatedShortConv = 27,
     /// [`Step::GatedMlp`].
     GatedMlp = 28,
+    /// [`Step::DeltaNetMixer`] (hybrid decoder linear attention).
+    DeltaNetMixer = 29,
+    /// [`Step::GatedAttention`] (hybrid decoder full attention).
+    GatedAttention = 30,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -131,6 +135,10 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::Moe(..) => OpKind::Moe,
         Step::MoeStage(..) => OpKind::MoeStage,
         Step::GatedShortConv(..) => OpKind::GatedShortConv,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(..) => OpKind::DeltaNetMixer,
+        #[cfg(feature = "deltanet")]
+        Step::GatedAttention(..) => OpKind::GatedAttention,
         Step::SiluMul { .. } => OpKind::SiluMul,
     }
 }
@@ -541,6 +549,8 @@ mod tests {
             (OpKind::MoeStage, 26),
             (OpKind::GatedShortConv, 27),
             (OpKind::GatedMlp, 28),
+            (OpKind::DeltaNetMixer, 29),
+            (OpKind::GatedAttention, 30),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),
