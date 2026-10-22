@@ -76,6 +76,12 @@ pub struct FeatureFlags {
     /// Bytes identical. Opt-in, default off (the kill switch for the new
     /// module); exact gfx1151 only.
     pub qwen4_gdn_q8_inline: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_I8_FUSE`): the dense GDN gate
+    /// also rotates and quantizes the MQ6 out projection's A8 activation
+    /// (`fn_gdn_dense_gate_i8`), so the F32 gate output and the separate
+    /// `mq_rotate_x_i8_gfx12` launch disappear. Bytes identical to the two-launch
+    /// pair. Exact gfx1201 only, where it defaults on; `0` is the kill switch.
+    pub qwen4_gdn_i8_fuse: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -927,6 +933,7 @@ impl FeatureFlags {
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
                 .unwrap_or(halo_hyper_default),
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
+            qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -1427,6 +1434,11 @@ impl FeatureFlags {
         self.qwen4_gdn_q8_inline && self.arch == "gfx1151"
     }
 
+    /// Dense GDN gate + out-projection A8 producer fusion. Exact gfx1201 only.
+    pub fn qwen4_gdn_i8_fuse_enabled(&self) -> bool {
+        self.qwen4_gdn_i8_fuse && self.arch == "gfx1201"
+    }
+
     /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
     /// (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151: on unless `0`). Exact gfx1151 only; the
     /// runtime additionally requires the lane-step scope
@@ -1660,6 +1672,7 @@ impl FeatureFlags {
             a8_fused_prod: false,
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
+            qwen4_gdn_i8_fuse: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_moe_combine_zinit: false,
