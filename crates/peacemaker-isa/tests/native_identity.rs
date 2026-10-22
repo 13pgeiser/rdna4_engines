@@ -22,6 +22,7 @@ use peacemaker_isa::kernels::{
     mtp_dense_det_gfx11, mtp_q8_det_gfx11, qsa_gather, qwen4_moe_sym, qwen4_mq4_x4_gfx11,
     qwen4_mq6_x4, qwen4_mq6_x4_gfx11,
 };
+use peacemaker_isa::kernels::mq6_i8_gemm;
 use peacemaker_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use peacemaker_isa::{
     native, reg::Live, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V,
@@ -201,6 +202,19 @@ fn corpus() -> Vec<Unit> {
             }
         }
         if let Ok((_, text, proof)) = qwen4_mq6_x4::emit_module(arch) {
+            module(&mut units, proof.module, arch, text)
+        }
+        // Exact-INT8 MQ6 prefill GEMM (gfx1201 only): the two entries and their module.
+        for epi in [mq6_i8_gemm::Epi::Set, mq6_i8_gemm::Epi::SetBf16] {
+            if let Ok(e) = mq6_i8_gemm::emit(mq6_i8_gemm::Spec {
+                epi,
+                raster: mq6_i8_gemm::Raster::Banded,
+                arch,
+            }) {
+                single(&mut units, e)
+            }
+        }
+        if let Ok((_, text, proof)) = mq6_i8_gemm::emit_module(arch) {
             module(&mut units, proof.module, arch, text)
         }
         // Qwen4 MQ6 trunk GEMM U3 twin (gfx1151 only): the six entries and their module.

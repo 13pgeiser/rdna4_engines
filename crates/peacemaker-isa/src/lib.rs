@@ -56,6 +56,7 @@ pub mod kernels {
     pub mod moe_slot_ops;
     pub mod mq4_fp8_verify;
     pub mod mq4_rows_x4;
+    pub mod mq6_i8_gemm;
     pub mod mq4_verify;
     pub mod mq_i4_a4;
     pub mod mq_i4_moe_gemv;
