@@ -207,20 +207,36 @@ impl Dtype {
     }
 }
 
-struct Buffer {
-    name: String,
+/// A validated buffer; dtype, expectations and tolerance remain case-owned.
+pub struct Buffer {
+    pub name: String,
     dtype: Dtype,
     initial: Vec<u8>,
     expect: Option<Vec<u8>>,
     tolerance: Option<f64>,
 }
-struct Case {
+impl Buffer {
+    /// Initial contents, including the 256-byte 0xAA guard for outputs.
+    pub fn initial_bytes(&self) -> Vec<u8> {
+        let guard = if self.expect.is_some() { GUARD } else { 0 };
+        let mut bytes = Vec::with_capacity(self.initial.len() + guard);
+        bytes.extend_from_slice(&self.initial);
+        if self.expect.is_some() {
+            bytes.extend_from_slice(&[0xAA; GUARD]);
+        }
+        bytes
+    }
+}
+
+/// The strict `run` case, shared with the hardware differential example.
+pub struct Case {
     name: String,
-    block: [u32; 3],
-    grid: [u32; 3],
-    dynamic_lds: u32,
-    buffers: Vec<Buffer>,
+    pub block: [u32; 3],
+    pub grid: [u32; 3],
+    pub dynamic_lds: u32,
+    pub buffers: Vec<Buffer>,
     kernarg: Vec<u8>,
+    pointers: Vec<(usize, usize)>,
     document: Value,
 }
 
@@ -303,7 +319,8 @@ fn base_of(index: usize) -> Result<u64, String> {
 }
 
 impl Case {
-    fn parse(document: Value) -> Result<Self, String> {
+    /// Validate and encode a case using the same schema as `run`.
+    pub fn parse(document: Value) -> Result<Self, String> {
         let root = object(
             &document,
             &[
@@ -393,6 +410,7 @@ impl Case {
         let arg_size = size(required(args, "size")?)?;
         // Validate every field before allocating or copying the argument block.
         let mut fields: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut pointers = Vec::new();
         for entry in array(required(args, "fields")?)? {
             let m = object(
                 entry,
@@ -411,6 +429,7 @@ impl Case {
                     .iter()
                     .position(|b| b.name == target)
                     .ok_or_else(|| format!("unknown ptr target `{target}`"))?;
+                pointers.push((offset, index));
                 base_of(index)?.to_le_bytes().to_vec()
             } else if kind == "bytes" {
                 unhex(v)?
@@ -444,14 +463,120 @@ impl Case {
             dynamic_lds,
             buffers,
             kernarg,
+            pointers,
             document,
         })
+    }
+    /// Relocate declared pointer fields only; scalar bytes and gaps are retained.
+    /// Addresses are in `buffers` order, including buffers without a pointer field.
+    pub fn kernarg_with_addresses(&self, addresses: &[u64]) -> Result<Vec<u8>, String> {
+        if addresses.len() != self.buffers.len() {
+            return Err("device address count must equal buffer count".into());
+        }
+        let mut blob = self.kernarg.clone();
+        for &(offset, index) in &self.pointers {
+            blob[offset..offset + 8].copy_from_slice(&addresses[index].to_le_bytes());
+        }
+        Ok(blob)
+    }
+
+    /// Execute with exactly `run`'s memory layout and workgroup order.
+    /// Returned buffers retain output guards and are in case order.
+    pub fn emulate(&self, emulator: &Emulator<'_>) -> Result<Vec<Vec<u8>>, String> {
+        let memory = self
+            .execute_memory(emulator, self.kernarg.clone())
+            .map_err(|(_, message)| message)?;
+        Ok(memory
+            .regions
+            .into_iter()
+            .take(self.buffers.len())
+            .map(|region| region.bytes)
+            .collect())
+    }
+
+    fn execute_memory(
+        &self,
+        emulator: &Emulator<'_>,
+        kernarg: Vec<u8>,
+    ) -> Result<Memory, (&'static str, String)> {
+        let mut memory = Memory::default();
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            let base = base_of(index).map_err(|e| ("memory", e))?;
+            memory
+                .map(buffer.name.clone(), base, buffer.initial_bytes())
+                .map_err(|e| ("memory", e))?;
+        }
+        memory
+            .map("__rip_kernarg".into(), KERNARG_BASE, kernarg)
+            .map_err(|e| ("memory", e))?;
+        for z in 0..self.grid[2] {
+            for y in 0..self.grid[1] {
+                for x in 0..self.grid[0] {
+                    let launch = Launch {
+                        kernarg_ptr: KERNARG_BASE,
+                        workgroup: [x, y, z],
+                        block: self.block,
+                        dynamic_lds: self.dynamic_lds,
+                    };
+                    emulator
+                        .run_workgroup(&launch, &mut memory)
+                        .map_err(|e| ("emulator", format!("workgroup [{x},{y},{z}]: {e}")))?;
+                }
+            }
+        }
+        Ok(memory)
+    }
+
+    /// Compare an execution's buffers against case expectations and guards.
+    pub fn compare(&self, actual: &[Vec<u8>]) -> Value {
+        let mut ok = actual.len() == self.buffers.len();
+        let mut reports = Map::new();
+        for (buffer, bytes) in self.buffers.iter().zip(actual) {
+            let (passes, mut report) = compare(buffer, bytes);
+            ok &= passes;
+            let fields = report.as_object_mut().unwrap();
+            fields.entry("first_mismatch").or_insert(Value::Null);
+            fields.entry("max_abs_diff").or_insert(Value::Null);
+            fields.entry("guard_ok").or_insert(json!(true));
+            reports.insert(buffer.name.clone(), report);
+        }
+        json!({"ok":ok,"buffers":reports})
+    }
+
+    /// Compare two executions directly using each output's case tolerance.
+    /// Integer/byte buffers and inputs are exact; output guards must be intact.
+    pub fn agrees(&self, emulator: &[Vec<u8>], hardware: &[Vec<u8>]) -> bool {
+        emulator.len() == self.buffers.len()
+            && hardware.len() == self.buffers.len()
+            && self.buffers.iter().zip(emulator).zip(hardware).all(
+                |((buffer, emulated), actual)| {
+                    if buffer.expect.is_none() {
+                        return emulated == actual && actual.len() == buffer.initial.len();
+                    }
+                    let size = buffer.initial.len();
+                    emulated.len() == size + GUARD
+                        && actual.len() == size + GUARD
+                        && emulated[size..].iter().all(|b| *b == 0xAA)
+                        && compare_expected(buffer, actual, Some(&emulated[..size])).0
+                },
+            )
     }
 }
 
 fn compare(buffer: &Buffer, actual: &[u8]) -> (bool, Value) {
-    let Some(expected) = &buffer.expect else {
-        let first = actual.iter().zip(&buffer.initial).position(|(a, b)| a != b);
+    compare_expected(buffer, actual, buffer.expect.as_deref())
+}
+
+fn compare_expected(buffer: &Buffer, actual: &[u8], expected: Option<&[u8]>) -> (bool, Value) {
+    let Some(expected) = expected else {
+        let first = actual
+            .iter()
+            .zip(&buffer.initial)
+            .position(|(a, b)| a != b)
+            .or_else(|| {
+                (actual.len() != buffer.initial.len())
+                    .then_some(actual.len().min(buffer.initial.len()))
+            });
         let mut report = json!({"kind":"input", "changed":first.is_some()});
         if let Some(offset) = first {
             report["first_mismatch"] = json!(offset);
@@ -460,10 +585,10 @@ fn compare(buffer: &Buffer, actual: &[u8]) -> (bool, Value) {
     };
     let guard_ok = actual.len() == expected.len() + GUARD
         && actual[expected.len()..].iter().all(|b| *b == 0xAA);
-    let mut first = None;
+    let mut first = (actual.len() < expected.len()).then_some(actual.len() / buffer.dtype.width());
     let mut max_diff = 0.0f64;
     let mut finite = true;
-    for (i, (a, b)) in actual[..expected.len()]
+    for (i, (a, b)) in actual[..actual.len().min(expected.len())]
         .chunks_exact(buffer.dtype.width())
         .zip(expected.chunks_exact(buffer.dtype.width()))
         .enumerate()
@@ -508,7 +633,7 @@ pub fn execute(
     let parsed = serde_json::from_str::<Value>(case_json)
         .map_err(|e| e.to_string())
         .and_then(Case::parse);
-    let case = match parsed {
+    let mut case = match parsed {
         Ok(case) => case,
         Err(message) => {
             return Outcome {
@@ -560,40 +685,11 @@ pub fn execute(
         Ok(v) => v,
         Err(e) => return failed("emulator", e),
     };
-    let mut memory = Memory::default();
-    for (index, buffer) in case.buffers.iter().enumerate() {
-        let base = match base_of(index) {
-            Ok(v) => v,
-            Err(e) => return failed("memory", e),
-        };
-        let guard_size = if buffer.expect.is_some() { GUARD } else { 0 };
-        let mut bytes = Vec::with_capacity(buffer.initial.len() + guard_size);
-        bytes.extend_from_slice(&buffer.initial);
-        if buffer.expect.is_some() {
-            bytes.extend_from_slice(&[0xAA; GUARD]);
-        }
-        if let Err(e) = memory.map(buffer.name.clone(), base, bytes) {
-            return failed("memory", e);
-        }
-    }
-    if let Err(e) = memory.map("__rip_kernarg".into(), KERNARG_BASE, case.kernarg) {
-        return failed("memory", e);
-    }
-    for z in 0..case.grid[2] {
-        for y in 0..case.grid[1] {
-            for x in 0..case.grid[0] {
-                let launch = Launch {
-                    kernarg_ptr: KERNARG_BASE,
-                    workgroup: [x, y, z],
-                    block: case.block,
-                    dynamic_lds: case.dynamic_lds,
-                };
-                if let Err(e) = emulator.run_workgroup(&launch, &mut memory) {
-                    return failed("emulator", format!("workgroup [{x},{y},{z}]: {e}"));
-                }
-            }
-        }
-    }
+    let kernarg = std::mem::take(&mut case.kernarg);
+    let memory = match case.execute_memory(&emulator, kernarg) {
+        Ok(memory) => memory,
+        Err((stage, message)) => return failed(stage, message),
+    };
     let mut ok = true;
     let mut reports = Map::new();
     let mut dump = capture_dump.then_some(case.document);
