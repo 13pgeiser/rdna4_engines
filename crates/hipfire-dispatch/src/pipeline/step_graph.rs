@@ -136,6 +136,16 @@ pub enum OpKind {
     OLora = 48,
     /// [`Step::CompressorProject`] (#666 G9, DeepSeek4).
     CompressorProject = 49,
+    /// [`Step::EmbedStreams`] (#666 G9 slice 2, DeepSeek4 rows).
+    EmbedStreams = 50,
+    /// [`Step::StreamMeanCapture`] (#666 G9 slice 2, DeepSeek4 rows).
+    StreamMeanCapture = 51,
+    /// [`Step::RingKv`] (#666 G9 slice 2, DeepSeek4 rows).
+    RingKv = 52,
+    /// [`Step::BlockStage`] (#666 G9 slice 2, DeepSeek4 rows).
+    BlockStage = 53,
+    /// [`Step::SwaStage`] (#666 G9 slice 2, DeepSeek4 rows).
+    SwaStage = 54,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -197,6 +207,11 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::SwaAttention(..) => OpKind::SwaAttention,
         Step::SparseAttention(..) => OpKind::SparseAttention,
         Step::OLora(..) => OpKind::OLora,
+        Step::EmbedStreams(..) => OpKind::EmbedStreams,
+        Step::StreamMeanCapture(..) => OpKind::StreamMeanCapture,
+        Step::RingKv(..) => OpKind::RingKv,
+        Step::BlockStage(..) => OpKind::BlockStage,
+        Step::SwaStage(..) => OpKind::SwaStage,
         Step::CompressorProject(..) => OpKind::CompressorProject,
     }
 }
@@ -662,6 +677,11 @@ mod tests {
             (OpKind::SparseAttention, 47),
             (OpKind::OLora, 48),
             (OpKind::CompressorProject, 49),
+            (OpKind::EmbedStreams, 50),
+            (OpKind::StreamMeanCapture, 51),
+            (OpKind::RingKv, 52),
+            (OpKind::BlockStage, 53),
+            (OpKind::SwaStage, 54),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),

@@ -1107,7 +1107,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "dspark-capture-safe-verify-body",
         predicates: &[DeclaredCaptureBody, IsRecording, CaptureMode],
-        condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230, forward.rs:9242-10952, 12511-12690) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs:9056-9058)",
+        condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230; forward.rs forward_prefill_batch_chunk_impl, carried by rows_program.rs RowsWindow into push_attention / compressed_attention_rows and the hipfire-dispatch pipeline/mla/{rows,attention}.rs operations) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs)",
         effect: KernelSelection,
         switches: "capture_safe: fixed-node body (host-sized compressed/top-k grids at max, typed device copies); ordinary: host-sized grids, direct top-k",
         kernels: &[],
@@ -1555,18 +1555,6 @@ pub const DECISIONS: &[Decision] = &[
 pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-deepseek4/src/forward.rs",
-        function: "attention_block_batched_mixed",
-        occurrences: 16,
-        decisions: &["dspark-capture-safe-verify-body"],
-    },
-    Site {
-        file: "hipfire-arch-deepseek4/src/forward.rs",
-        function: "attention_block_batched_swa_only",
-        occurrences: 3,
-        decisions: &["dspark-capture-safe-verify-body"],
-    },
-    Site {
-        file: "hipfire-arch-deepseek4/src/forward.rs",
         function: "compressor_op",
         occurrences: 1,
         decisions: &["ds4-gfx942-compressor-sentinel-gate"],
@@ -1598,7 +1586,73 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-deepseek4/src/forward.rs",
         function: "forward_prefill_batch_chunk_impl",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "compressed_attention_rows",
+        occurrences: 9,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "new",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "push_attention",
         occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "<item>",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "batched_indexer_scores",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "execute_batched_indexer",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "execute_sparse_attention",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "execute_swa_ring_write",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/rows.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/rows.rs",
+        function: "execute_swa_stage",
+        occurrences: 1,
         decisions: &["dspark-capture-safe-verify-body"],
     },
     Site {

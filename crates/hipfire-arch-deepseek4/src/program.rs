@@ -299,7 +299,7 @@ fn push_compressor<'a>(
     }
     let op = compressor_op(
         cfg, weights, state, gpu, layer_idx, position, is_indexer, None,
-        /*state_buffer_driven=*/ true,
+        /*state_buffer_driven=*/ true, None,
     )?
     .ok_or_else(missing)?;
     program.push(Stage::Other, Step::KvCompress(op));

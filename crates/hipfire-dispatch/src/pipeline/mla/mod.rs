@@ -15,5 +15,6 @@ pub mod expert_ffn;
 pub mod hc;
 pub mod project;
 pub mod query_kv;
+pub mod rows;
 
-pub use project::{project_prepared, E8SoaKernel};
+pub use project::{project_prepared, project_prepared_rows, E8SoaKernel, RowsProjection};
