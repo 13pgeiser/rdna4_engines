@@ -196,3 +196,247 @@ impl Gpu {
         )
     }
 }
+
+const ENTRY_MOE_GFX1201: &str = "hc_row_fold_moe_gfx1201";
+const ENTRY_MIXER_GFX1201: &str = "hc_row_write_norm_gate_gfx1201";
+
+/// Operands of [`Gpu::hc_row_fold_moe_gfx1201`]: the MoE sublayer tail of the
+/// gfx1201 prefill chain as one row kernel.  Bytewise `moe_down_combine_grouped_top10_bf16in_zinit`
+/// -> `bf16_scaled_add_batched_f32` (the shared down's F32 rows) ->
+/// `hyper_write_bf16x8_gfx1201` -> `hyper_norm_gate_outputs`.
+pub struct HcRowFoldMoeGfx1201<'a> {
+    /// Grouped expert-down rows, BF16 bits `[grouped_rows, hidden]`.
+    pub grouped_down: &'a GpuTensor,
+    /// `moe_combine_order_top10` output, `rows * 10` `(row, weight)` pairs.
+    pub order: &'a GpuTensor,
+    /// The shared-down GEMM's F32 output `[rows, hidden]`.
+    pub shared_f32: &'a GpuTensor,
+    /// Per-token shared selector `[rows]` (F32).
+    pub selector: &'a GpuTensor,
+    /// HC streams, BF16 bits `[rows, 4 * hidden]`, rewritten in place.
+    pub streams: &'a GpuTensor,
+    /// This block's HC write gate logits `[rows, 4]` (F32), from its paired read.
+    pub gates: &'a GpuTensor,
+    /// The next HC read's norm weight (BF16 `[4 * hidden]`).
+    pub norm_weight: &'a GpuTensor,
+    /// The next HC read's paired write's gate weight (BF16 `[4, 4 * hidden]`).
+    pub gate_weight: &'a GpuTensor,
+    /// Receives that next write's gate logits `[rows, 4]` (F32).
+    pub next_gates: &'a GpuTensor,
+    /// Receives the next read's F16 normalized row `[rows, 4 * hidden]`.
+    pub normalized_f16: &'a GpuTensor,
+    pub rows: usize,
+    pub hidden: usize,
+}
+
+/// Operands of [`Gpu::hc_row_write_norm_gate_gfx1201`]: a mixer's HC write and
+/// the next read's norm / gates.  Bytewise `hyper_write_bf16x8_gfx1201` of
+/// `mixed` followed by `hyper_norm_gate_outputs`.
+pub struct HcRowWriteNormGateGfx1201<'a> {
+    /// The mixer output projection's F32 output `[rows, hidden]`.
+    pub mixed: &'a GpuTensor,
+    /// HC streams, BF16 bits `[rows, 4 * hidden]`, rewritten in place.
+    pub streams: &'a GpuTensor,
+    /// This write's gate logits `[rows, 4]` (F32), from its paired read.
+    pub gates: &'a GpuTensor,
+    /// The next HC read's norm weight (BF16 `[4 * hidden]`).
+    pub norm_weight: &'a GpuTensor,
+    /// The next HC read's paired write's gate weight (BF16 `[4, 4 * hidden]`).
+    pub gate_weight: &'a GpuTensor,
+    /// Receives that next write's gate logits `[rows, 4]` (F32).
+    pub next_gates: &'a GpuTensor,
+    /// Receives the next read's F16 normalized row `[rows, 4 * hidden]`.
+    pub normalized_f16: &'a GpuTensor,
+    pub rows: usize,
+    pub hidden: usize,
+}
+
+impl Gpu {
+    /// Whether the gfx1201 row folds ([`Gpu::hc_row_fold_moe_gfx1201`],
+    /// [`Gpu::hc_row_write_norm_gate_gfx1201`]) take this launch: exact gfx1201,
+    /// four branches of `hidden == 2560`, and exactly the launches
+    /// `hyper_write` gives `hyper_write_bf16x8_gfx1201` (`rows >= 16`, 16-byte
+    /// aligned streams and `mixed`), so the fold replaces the same kernel the
+    /// default chain runs.  `mixed` is the HC write's `mixed` tensor (for the
+    /// MoE fold, the tensor the shared-down rows land in).  Never inside a
+    /// recording or graph capture.
+    pub fn hc_row_fold_gfx1201_applies(
+        &self,
+        rows: usize,
+        hidden: usize,
+        streams: &GpuTensor,
+        mixed: &GpuTensor,
+    ) -> bool {
+        self.arch_caps.is_gfx1201()
+            && hidden == 2560
+            && rows >= 16
+            && (streams.buf.as_ptr() as usize) % 16 == 0
+            && (mixed.buf.as_ptr() as usize) % 16 == 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// The shared tail of both gfx1201 launches' operand checks.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_row_fold_gfx1201_tail_ok(
+        &self,
+        rows: usize,
+        hidden: usize,
+        streams: &GpuTensor,
+        gates: &GpuTensor,
+        norm_weight: &GpuTensor,
+        gate_weight: &GpuTensor,
+        next_gates: &GpuTensor,
+        normalized_f16: &GpuTensor,
+    ) -> bool {
+        let wide = 4 * hidden;
+        norm_weight.dtype == DType::BF16
+            && gate_weight.dtype == DType::BF16
+            && norm_weight.numel() == wide
+            && gate_weight.numel() >= 4 * wide
+            && streams.buf.size() >= rows * wide * 2
+            && gates.numel() >= rows * 4
+            && next_gates.numel() >= rows * 4
+            && normalized_f16.buf.size() >= rows * wide * 2
+    }
+
+    /// The gfx1201 MoE tail row kernel (see [`HcRowFoldMoeGfx1201`]).
+    pub fn hc_row_fold_moe_gfx1201(&mut self, p: &HcRowFoldMoeGfx1201<'_>) -> HipResult<()> {
+        if !self.hc_row_fold_gfx1201_applies(p.rows, p.hidden, p.streams, p.shared_f32)
+            || p.shared_f32.dtype != DType::F32
+            || p.shared_f32.numel() < p.rows * p.hidden
+            || p.order.buf.size() < p.rows * 10 * 8
+            || p.selector.numel() < p.rows
+            || !self.hc_row_fold_gfx1201_tail_ok(
+                p.rows,
+                p.hidden,
+                p.streams,
+                p.gates,
+                p.norm_weight,
+                p.gate_weight,
+                p.next_gates,
+                p.normalized_f16,
+            )
+        {
+            return Err(HipError::new(
+                0,
+                "hc_row_fold_moe_gfx1201: route does not apply",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("hc_row_fold", SRC, ENTRY_MOE_GFX1201)?;
+        let gp = p.grouped_down.buf.as_ptr();
+        let op = p.order.buf.as_ptr();
+        let sp = p.shared_f32.buf.as_ptr();
+        let selp = p.selector.buf.as_ptr();
+        let stp = p.streams.buf.as_ptr();
+        let gtp = p.gates.buf.as_ptr();
+        let nwp = p.norm_weight.buf.as_ptr();
+        let gwp = p.gate_weight.buf.as_ptr();
+        let ngp = p.next_gates.buf.as_ptr();
+        let nop = p.normalized_f16.buf.as_ptr();
+        let hv = p.hidden as i32;
+        let lds = (p.hidden * 8 + 4 * 256 * 4 + p.hidden * 2 + 16) as u32;
+        let mut params = [
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &selp as *const _ as *mut c_void,
+            &stp as *const _ as *mut c_void,
+            &gtp as *const _ as *mut c_void,
+            &nwp as *const _ as *mut c_void,
+            &gwp as *const _ as *mut c_void,
+            &ngp as *const _ as *mut c_void,
+            &nop as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            ENTRY_MOE_GFX1201,
+            [p.rows as u32, 1, 1],
+            [256, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(selp);
+                b.push_ptr(stp);
+                b.push_ptr(gtp);
+                b.push_ptr(nwp);
+                b.push_ptr(gwp);
+                b.push_ptr(ngp);
+                b.push_ptr(nop);
+                b.push_i32(hv);
+                b
+            },
+        )
+    }
+
+    /// The gfx1201 mixer tail row kernel (see [`HcRowWriteNormGateGfx1201`]).
+    pub fn hc_row_write_norm_gate_gfx1201(
+        &mut self,
+        p: &HcRowWriteNormGateGfx1201<'_>,
+    ) -> HipResult<()> {
+        if !self.hc_row_fold_gfx1201_applies(p.rows, p.hidden, p.streams, p.mixed)
+            || p.mixed.dtype != DType::F32
+            || p.mixed.numel() < p.rows * p.hidden
+            || !self.hc_row_fold_gfx1201_tail_ok(
+                p.rows,
+                p.hidden,
+                p.streams,
+                p.gates,
+                p.norm_weight,
+                p.gate_weight,
+                p.next_gates,
+                p.normalized_f16,
+            )
+        {
+            return Err(HipError::new(
+                0,
+                "hc_row_write_norm_gate_gfx1201: route does not apply",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("hc_row_fold", SRC, ENTRY_MIXER_GFX1201)?;
+        let mp = p.mixed.buf.as_ptr();
+        let stp = p.streams.buf.as_ptr();
+        let gtp = p.gates.buf.as_ptr();
+        let nwp = p.norm_weight.buf.as_ptr();
+        let gwp = p.gate_weight.buf.as_ptr();
+        let ngp = p.next_gates.buf.as_ptr();
+        let nop = p.normalized_f16.buf.as_ptr();
+        let hv = p.hidden as i32;
+        let lds = (p.hidden * 8 + 4 * 256 * 4 + p.hidden * 2 + 16) as u32;
+        let mut params = [
+            &mp as *const _ as *mut c_void,
+            &stp as *const _ as *mut c_void,
+            &gtp as *const _ as *mut c_void,
+            &nwp as *const _ as *mut c_void,
+            &gwp as *const _ as *mut c_void,
+            &ngp as *const _ as *mut c_void,
+            &nop as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            ENTRY_MIXER_GFX1201,
+            [p.rows as u32, 1, 1],
+            [256, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(mp);
+                b.push_ptr(stp);
+                b.push_ptr(gtp);
+                b.push_ptr(nwp);
+                b.push_ptr(gwp);
+                b.push_ptr(ngp);
+                b.push_ptr(nop);
+                b.push_i32(hv);
+                b
+            },
+        )
+    }
+}
