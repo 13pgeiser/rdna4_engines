@@ -1,6 +1,6 @@
 # P3/P4 port note — the exact Ref2VA packing, from ComfyUI source
 
-Read directly from `/home/dustin/AI/ComfyUI/comfy/ldm/minimax/model.py` (2026-10 install) so the
+Read directly from `/home/main/AI/ComfyUI/comfy/ldm/minimax/model.py` (2026-10 install) so the
 Radiance port is source-faithful rather than doc-derived. Line numbers below are that file's.
 Everything here is **pure host arithmetic** — the port is a new TU (proposed
 `arch/minimaxh3/rad_ref2va_pack.{h,cpp}`, device-free, unit-testable) that emits the segment

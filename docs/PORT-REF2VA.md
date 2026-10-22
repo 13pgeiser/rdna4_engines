@@ -1,7 +1,7 @@
 # PORT-REF2VA — reference-media conditioning for MiniMax-H3 (working brief, community PR)
 
 > Scratch planning doc (untracked). Started 2026-10-18 from a ComfyUI-side analysis session
-> (`/home/dustin/AI/ComfyUI`). Owner: community contributor on dual Radeon AI PRO R9700
+> (`/home/main/AI/ComfyUI`). Owner: community contributor on dual Radeon AI PRO R9700
 > (RDNA4, gfx1201, 32 GB each). Per the author's call for community PRs, this is the
 > implement/test/PR plan. Nothing here is committed yet.
 
@@ -228,7 +228,7 @@ preferred (quality at 12–15 s), not the turbo path.
   release if wanted; LoRA as a MERGED container via `rad-convert --lora` (§5.8 — the
   runtime `core/lora` path is text-generation-only by design; the workflow's ref2va LoRA
   @1.0 is active and ships as `...-tower-lora.rad`).
-  **P5 CONVERTED 2026-10-18: `/home/dustin/AI/models/MiniMaxAI/minimax-h3-ref2va-fp8.rad`**
+  **P5 CONVERTED 2026-10-18: `/home/main/AI/models/MiniMaxAI/minimax-h3-ref2va-fp8.rad`**
   (60.53 GiB, 2677 tensors — verified a name- and dtype/shape-identical superset of
   `minimax-h3-fp8.rad` except dit.* VALUES now come from `transformer_ref` (zero drift
   elsewhere; the finetune is key-identical as §5.1 predicted)). Gotcha found: the author's
@@ -281,7 +281,7 @@ preferred (quality at 12–15 s), not the turbo path.
 execution (§4).**
 
 Follow-ups created by the resolutions: (a) HF `transformer_ref/` download — **DONE +
-VERIFIED 2026-10-18**: `/home/dustin/AI/models/MiniMaxAI/MiniMax-H3/transformer_ref`,
+VERIFIED 2026-10-18**: `/home/main/AI/models/MiniMaxAI/MiniMax-H3/transformer_ref`,
 14 shards + index + config, 62 GiB on disk; index holds exactly the 638 base keys
 (0 diff both directions), shard headers bf16+f32 with the full `[96768,2688]` adaLN
 Linear, config carries no vsa/gate key. **P5 convert input is ready**; (b) deepstack
@@ -328,7 +328,7 @@ timing above 106,016 DiT rows on Radiance's fixed buffers is UNTESTED (§5.3).
 - Fallback single-file: `Comfy-Org/MiniMax-H3` `minimax_h3_ref2va_bf16.safetensors`
   (66.28 GB, header-verified) — ComfyUI-flattened names would need the §rename-table;
   not recommended.
-- **Local pre-converted containers** (`/home/dustin/AI/models/StillDeadcode/`, user's
+- **Local pre-converted containers** (`/home/main/AI/models/StillDeadcode/`, user's
   HF pull 2026-10-18): `minimax-h3-fp8/minimax-h3-fp8.rad` (60.5 GiB — this IS the
   `--reuse` base above) and `fasth3-8-step-v2-fp8/fasth3-8-step-v2-fp8.rad` (62.3 GiB,
   FastVideo 8-step distilled path). Name-table string-scan of both (2393 tensors each):
@@ -361,7 +361,7 @@ ComfyUI side confirmed: audios **never** enter the TE as tokens (label-only
 workflows run `qwen3vl_32b_h3_ultra_uncensored_heretic` (llmfan46 fine-tune of
 Qwen3-VL-32B-Instruct). The int8-convrot copy CANNOT be ingested (rad-convert refuses
 convrot, `docs/TOOLS.md:183`), but the **bf16 source is already on local disk**:
-`/home/dustin/AI/ComfyUI/models/text_encoders/civitai-minimax/qwen3vl_32b_h3_ultra_uncensored_heretic_bf16.safetensors`
+`/home/main/AI/ComfyUI/models/text_encoders/civitai-minimax/qwen3vl_32b_h3_ultra_uncensored_heretic_bf16.safetensors`
 (48.0 GiB, 902 bf16 tensors, header-verified): `model.embed_tokens` (5120-dim = H3
 `text_dim`), exactly 50 language layers, **no `lm_head`, no final norm** (`__metadata__`
 documents `minimax_h3_language_layers: 50` / `minimax_h3_final_norm: false` — same
@@ -994,7 +994,7 @@ VAE/TP; decoders `:1226-1328,1344-1539`, `map_wnorm :1172`), `libr4d/r4d_vsa.hip
 `vtile_gather/stitch`), `docs/TP3.md`/`TP4.md`, `spec.md:523,552-553,635-637` (quant
 grammar), `engine_bringup.cpp:920-960` (build-time `max_tok`).
 
-ComfyUI (`/home/dustin/AI/ComfyUI`): `comfy_extras/nodes_minimax_h3.py:243-364` (the
+ComfyUI (`/home/main/AI/ComfyUI`): `comfy_extras/nodes_minimax_h3.py:243-364` (the
 port spec), `comfy/ldm/minimax/model.py:406-434,463,596-599,680-681,711` (pack/segments/
 seg_tag/timesteps), `comfy/model_detection.py:415` (gate_compress detection),
 `comfy_extras/nodes_sparse_attention.py` (sink rules, `minimax_h3_layout`,

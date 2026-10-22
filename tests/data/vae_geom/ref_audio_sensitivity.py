@@ -42,9 +42,9 @@ import torch.nn.functional as F
 torch.manual_seed(0)
 
 VAE_PY = sys.argv[1] if len(sys.argv) > 1 else \
-    "/home/dustin/AI/ComfyUI/comfy/ldm/minimax/audio_vae.py"
+    "/home/main/AI/ComfyUI/comfy/ldm/minimax/audio_vae.py"
 WEIGHTS = sys.argv[2] if len(sys.argv) > 2 else \
-    "/home/dustin/AI/models/MiniMaxAI/MiniMax-H3/audio_vae/diffusion_pytorch_model.safetensors"
+    "/home/main/AI/models/MiniMaxAI/MiniMax-H3/audio_vae/diffusion_pytorch_model.safetensors"
 
 
 # ---- minimal comfy.ops shim (same discipline as gen_golden.py: CPU path only) ----

@@ -1,6 +1,6 @@
 # P2 port note — the VAE encode, from ComfyUI source
 
-Read directly from `/home/dustin/AI/ComfyUI/comfy/ldm/minimax/vae.py` and `audio_vae.py`
+Read directly from `/home/main/AI/ComfyUI/comfy/ldm/minimax/vae.py` and `audio_vae.py`
 (2026-10 install) so the Radiance port is source-faithful rather than doc-derived. Line numbers
 below are those files'. §5.5 of `PORT-REF2VA.md` scoped the whole of P2 (kernels, graphs,
 declare, re-convert); this note is the extraction underneath it, and the **host half has

@@ -37,7 +37,7 @@ Layout it relies on (from arch/minimaxh3/minimaxh3.cpp + rad_vae_geom.h, keep in
     enc_geom (25 i32) : g0=(clipT,H,W) -> gd[1]=H, gd[2]=W ; gd[18]=short_last ; gd[22]=n_clips ; gd[23]=T_pad.
 
 Run under the ComfyUI torch venv (only for numpy/torch/safetensors — no comfy import):
-    COMFYUI_HOME=/home/dustin/AI/ComfyUI /home/dustin/AI/ComfyUI/.venv/bin/python \
+    COMFYUI_HOME=/home/main/AI/ComfyUI /home/main/AI/ComfyUI/.venv/bin/python \
         ref_venc_parity.py --evc evc.f32 --encpx encpx_1_1.f32 --encg encg_1_1.f32 --slot 1
     # or validate the harness itself with no device at all:
     ref_venc_parity.py --selftest
@@ -54,7 +54,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-COMFYUI = os.environ.get("COMFYUI_HOME", "/home/dustin/AI/ComfyUI")
+COMFYUI = os.environ.get("COMFYUI_HOME", "/home/main/AI/ComfyUI")
 VAE_PY = os.path.join(COMFYUI, "comfy/ldm/minimax/vae.py")
 VAE_SAFETENSORS = os.path.join(COMFYUI, "models/vae/minimax_h3_video_vae_fp16.safetensors")
 

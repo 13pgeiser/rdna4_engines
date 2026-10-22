@@ -36,7 +36,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.environ.get("COMFYUI_HOME", "/home/dustin/AI/ComfyUI"))
+sys.path.insert(0, os.environ.get("COMFYUI_HOME", "/home/main/AI/ComfyUI"))
 
 # Force ComfyUI's import-time device probe onto the CPU branch WITHOUT opening a ROCm context
 # (the running TP2 server owns both GPUs). comfy.cli_args exposes a module-level `args`;
@@ -57,7 +57,7 @@ ENC_MAX_SAMPLES = 500000
 SLOT_ROWS_A = AUDIO_CH * (ENC_MAX_SAMPLES // AUDIO_HOP)   # 1250
 MAXA = SLOT_ROWS_A // AUDIO_CH                            # per-channel row stride within a slot (625)
 VAE_SAFETENSORS = os.path.join(
-    os.environ.get("COMFYUI_HOME", "/home/dustin/AI/ComfyUI"),
+    os.environ.get("COMFYUI_HOME", "/home/main/AI/ComfyUI"),
     "models/vae/minimax_h3_audio_vae_fp32.safetensors")
 
 
