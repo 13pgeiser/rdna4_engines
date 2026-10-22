@@ -591,7 +591,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_q4lut", kernels::GEMV_Q4LUT_SRC, "gemv_q4lut")?;
-        let func = &self.functions["gemv_q4lut"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -609,16 +608,22 @@ impl Gpu {
 
         // LDS: 8 codebooks × 16 entries × 2 bytes = 256 bytes
         let shared_mem = 256u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                shared_mem,
-                None,
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q4lut",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// Wave-cooperative Q4 GEMV (Q4_F16_G32 format, 0.625 B/w). Shuffle-based nibble distribution.
@@ -632,7 +637,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_q4wave", kernels::GEMV_Q4WAVE_SRC, "gemv_q4wave")?;
-        let func = &self.functions["gemv_q4wave"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -645,10 +649,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip
-                .launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, None, &mut params)
-        }
+        self.launch_maybe_blob(
+            "gemv_q4wave",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// Q4-as-Q8 GEMV: 4-bit precision stored in Q8_0 format (1.0625 B/w). Gets Q8 occupancy.
@@ -662,7 +678,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_q4as8", kernels::GEMV_Q4AS8_SRC, "gemv_q4as8")?;
-        let func = &self.functions["gemv_q4as8"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -675,17 +690,28 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip
-                .launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, None, &mut params)
-        }
+        self.launch_maybe_blob(
+            "gemv_q4as8",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M])
     pub fn gemv_f32(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv", kernels::GEMV_SRC, "gemv_f32")?;
-        let func = &self.functions["gemv_f32"];
 
         let m = a.shape[0] as i32;
         let k = a.shape[1] as i32;
@@ -715,16 +741,24 @@ impl Gpu {
         let shared_mem = block_size * 4; // one float per thread
         let bytes = (m as usize) * (k as usize) * 4 + (k as usize) * 4 + (m as usize) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "gemv_f32",
+            [m as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(alpha_val);
+                b.push_f32(beta_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -744,7 +778,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_q4k", kernels::GEMV_Q4K_SRC, "gemv_q4k")?;
-        let func = &self.functions["gemv_q4k"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -761,16 +794,22 @@ impl Gpu {
         ];
 
         let block_size = 32u32; // single warp — no shared memory needed
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q4k",
+            [m as u32, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ4-G128 GEMV: flat 4-bit with 128-weight groups.
@@ -818,6 +857,49 @@ impl Gpu {
                 b
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// HFQ4-G64 GEMV (ParoQ4G64): flat 4-bit with 64-weight, 40-byte groups.
+    pub fn gemv_hfq4g64(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_hfq4g64";
+        self.ensure_kernel(FUNC, kernels::GEMV_HFQ4G64_SRC, FUNC)?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g64_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let result =
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -953,6 +1035,9 @@ impl Gpu {
     /// activations to `x_out`. Replaces the
     /// `copy_d2d + givens_rotate` pair used by `rotate_x_paro_for` —
     /// one graph node + one inter-node dependency removed.
+    ///
+    /// `group_size` is the Paro rotation block (= the weight's quant group,
+    /// `DType::paro_group_size`): 128 or 64; any other width is refused.
     #[allow(clippy::too_many_arguments)]
     pub fn givens_rotate_to(
         &mut self,
@@ -964,16 +1049,26 @@ impl Gpu {
         seq_len: usize,
         hidden_dim: usize,
         krot: usize,
+        group_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "givens_rotate_to_f32",
-            kernels::GIVENS_ROTATE_TO_SRC,
-            "givens_rotate_to_f32",
-        )?;
+        let (func, src) = match group_size {
+            128 => ("givens_rotate_to_f32", kernels::GIVENS_ROTATE_TO_SRC),
+            64 => (
+                "givens_rotate_to_g64_f32",
+                kernels::GIVENS_ROTATE_TO_G64_SRC,
+            ),
+            g => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("givens_rotate_to: no kernel for Paro group size {g} (64 or 128)"),
+                ))
+            }
+        };
+        self.ensure_kernel(func, src, func)?;
 
         let cta_m: u32 = 4;
-        let group_size: u32 = 128;
+        let group_size = group_size as u32;
         let groups_per_row = (hidden_dim as u32 + group_size - 1) / group_size;
         let grid_x = ((seq_len as u32) + cta_m - 1) / cta_m;
 
@@ -1002,9 +1097,9 @@ impl Gpu {
         // Bytes: read x_in (seq × dim × 4) + write x_out (seq × dim × 4)
         // + read pairs/theta/scales (krot × dim × 2 + dim × 2).
         let bytes = seq_len * hidden_dim * 4 * 2 + krot * hidden_dim * 2 + hidden_dim * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "rotate", "givens_rotate_to_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rotate", func, bytes);
         let result = self.launch_maybe_blob(
-            "givens_rotate_to_f32",
+            func,
             [grid_x, groups_per_row, 1],
             [group_size / 2, 1, 1],
             smem,
@@ -1492,7 +1587,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq2g256", kernels::GEMV_HFQ2G256_SRC, "gemv_hfq2g256")?;
-        let func = &self.functions["gemv_hfq2g256"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -1505,16 +1599,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq2g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// MQ2-Lloyd GEMV (2-bit + per-block 4-entry fp16 codebook). K must be a
@@ -2622,7 +2722,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "gemv_mq4g256")?;
-        let func = &self.functions["gemv_mq4g256"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -2636,16 +2735,22 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
         // LDS for rotated x: 256 floats = 1024 bytes
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                1024,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_mq4g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            1024,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
@@ -2698,7 +2803,6 @@ impl Gpu {
         self.bind_thread()?;
         let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfp4g32")?;
-        let func = &self.functions["gemv_hfp4g32"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -2712,16 +2816,22 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
         // LDS: 16-entry FP16 LUT = 32 bytes.
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                32,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfp4g32",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// gfx12 FP8-dot4 decode-path GEMV for HFP4G32. Uses
@@ -7987,16 +8097,22 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemv_mfp4g32_lloyd"],
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_lloyd",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// MFP4G32-Lloyd prerotated (x already FWHT-rotated by caller).
@@ -8042,16 +8158,22 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemv_mfp4g32_p"],
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_p",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// mfp4+P prerotated (x already FWHT-rotated by caller).
@@ -8107,16 +8229,22 @@ impl Gpu {
                 ];
                 let grid_x = ((m + 3) / 4) as u32;
                 let lds_bytes = (k * 4) as u32;
-                return unsafe {
-                    self.hip.launch_kernel(
-                        &self.functions["gemv_mfp4g32_e8_ldsx_gfx1151"],
-                        [grid_x, 1, 1],
-                        [128, 1, 1],
-                        lds_bytes,
-                        self.stream_ref(),
-                        &mut params,
-                    )
-                };
+                return self.launch_maybe_blob(
+                    "gemv_mfp4g32_e8_ldsx_gfx1151",
+                    [grid_x, 1, 1],
+                    [128, 1, 1],
+                    lds_bytes,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr);
+                        b.push_ptr(x_ptr);
+                        b.push_ptr(y_ptr);
+                        b.push_i32(m_val);
+                        b.push_i32(k_val);
+                        b
+                    },
+                );
             }
             // DIAGNOSTIC (HIPFIRE_E8_STRIP=1): swap in the compute-stripped kernel
             // (same memory access, gutted decode) to measure the compute ceiling.
@@ -8146,16 +8274,22 @@ impl Gpu {
                 &k_val as *const _ as *mut c_void,
             ];
             let grid_x = m as u32;
-            return unsafe {
-                self.hip.launch_kernel(
-                    &self.functions[kname],
-                    [grid_x, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )
-            };
+            return self.launch_maybe_blob(
+                kname,
+                [grid_x, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                },
+            );
         }
 
         self.ensure_kernel(
@@ -8175,16 +8309,22 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemv_mfp4g32_e8"],
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// mfp4-E8 prerotated (x already FWHT-rotated by caller).
@@ -8349,16 +8489,25 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
         ];
         let total = (gate_m + up_m) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions["fused_gate_up_mfp4g32_e8_gfx1151"],
-                [total, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "fused_gate_up_mfp4g32_e8_gfx1151",
+            [total, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag);
+                b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg);
+                b.push_ptr(yu);
+                b.push_i32(gm);
+                b.push_i32(um);
+                b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// Fused QKVZA mfp4-E8 decode GEMV — gfx1151 ONLY (Strix Halo).
@@ -8428,16 +8577,31 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
         ];
         let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions["fused_qkvza_mfp4g32_e8_gfx1151"],
-                [total, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "fused_qkvza_mfp4g32_e8_gfx1151",
+            [total, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(mqkv);
+                b.push_i32(mz);
+                b.push_i32(mb);
+                b.push_i32(ma);
+                b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// mfp4-E8 SoA GEMV. Same E8 data as AoS but in structure-of-arrays layout
@@ -8538,16 +8702,22 @@ impl Gpu {
                 &m_val as *const _ as *mut c_void,
                 &k_val as *const _ as *mut c_void,
             ];
-            return unsafe {
-                self.hip.launch_kernel(
-                    &self.functions[KERNEL],
-                    [m as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )
-            };
+            return self.launch_maybe_blob(
+                KERNEL,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                },
+            );
         }
 
         // Generic fallback for non-gfx1151
@@ -8568,16 +8738,22 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemv_mfp4g32_e8_soa"],
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_mfp4g32_e8_soa",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// Experimental gfx942 two-wave workgroup E8-SoA GEMV.
@@ -9936,7 +10112,6 @@ impl Gpu {
             kernels::GEMV_HFP4G32_DOT2_GFX11_SRC,
             "gemv_hfp4g32_dot2_gfx11",
         )?;
-        let func = &self.functions["gemv_hfp4g32_dot2_gfx11"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -9949,16 +10124,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                32,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfp4g32_dot2_gfx11",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// FP8-dot4 GEMV variant that takes an FP8 device pointer directly
@@ -9983,7 +10164,6 @@ impl Gpu {
             kernels::GEMV_HFP4G32_FP8_GFX12_SRC,
             "gemv_hfp4g32_fp8_gfx12",
         )?;
-        let func = &self.functions["gemv_hfp4g32_fp8_gfx12"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_fp8_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -9996,16 +10176,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                32,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfp4g32_fp8_gfx12",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// Output-tile geometry of the low-bit prefill GEMMs. Must stay in step
@@ -10097,7 +10283,6 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_kernel(name, src, name)?;
-        let func = &self.functions[name];
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -10114,16 +10299,23 @@ impl Gpu {
         ];
         let tm = Self::LOWBIT_PREFILL_TILE_M as u32;
         let tn = Self::LOWBIT_PREFILL_TILE_N as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [(m as u32).div_ceil(tm), (n_tokens as u32).div_ceil(tn), 1],
-                [Self::LOWBIT_PREFILL_THREADS as u32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            name,
+            [(m as u32).div_ceil(tm), (n_tokens as u32).div_ceil(tn), 1],
+            [Self::LOWBIT_PREFILL_THREADS as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )
     }
 
     /// Largest `batch` the low-bit x-batch GEMVs accept. Must stay in step
@@ -10204,7 +10396,6 @@ impl Gpu {
         assert_eq!(k % 128, 0, "{name}: k must be a multiple of 128, got {k}");
         self.bind_thread()?;
         self.ensure_kernel(name, src, name)?;
-        let func = &self.functions[name];
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -10219,16 +10410,16 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(name, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(b_val);
+            b
+        })
     }
 
     /// TQ2-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
@@ -10251,7 +10442,6 @@ impl Gpu {
         );
         self.bind_thread()?;
         self.ensure_kernel("gemv_tq2g128", kernels::GEMV_TQ2G128_SRC, "gemv_tq2g128")?;
-        let func = &self.functions["gemv_tq2g128"];
         let mut ap = a_raw.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -10264,16 +10454,22 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_tq2g128",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// BQ1-G128 GEMV. K must be multiple of 128. Binary sibling of TQ2-G128.
@@ -10294,7 +10490,6 @@ impl Gpu {
         );
         self.bind_thread()?;
         self.ensure_kernel("gemv_bq1g128", kernels::GEMV_BQ1G128_SRC, "gemv_bq1g128")?;
-        let func = &self.functions["gemv_bq1g128"];
         let mut ap = a_raw.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -10307,16 +10502,22 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_bq1g128",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// MagnumQuant MQ3: rotate x once, then HFQ3-G256 GEMV against rotated x.
@@ -10476,7 +10677,6 @@ impl Gpu {
         let xq_ptr = self.scratch.mq_x_q8.as_ref().unwrap().as_ptr();
         let xs_ptr = self.scratch.mq_x_scales.as_ref().unwrap().as_ptr();
 
-        let func = &self.functions["gemv_mq8g256"];
         let mut ap = a_raw.buf.as_ptr();
         let mut xq = xq_ptr;
         let mut xs = xs_ptr;
@@ -10491,16 +10691,23 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_mq8g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xq);
+                b.push_ptr(xs);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// MagnumQuant MQ8: FWHT rotate + INT8 quantize x, then dp4a GEMV.
@@ -10640,7 +10847,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq3g128", kernels::GEMV_HFQ3G128_SRC, "gemv_hfq3g128")?;
-        let func = &self.functions["gemv_hfq3g128"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -10653,16 +10859,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq3g128",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ2-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
@@ -10676,7 +10888,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq2g128", kernels::GEMV_HFQ2G128_SRC, "gemv_hfq2g128")?;
-        let func = &self.functions["gemv_hfq2g128"];
         let mut ap = a_raw.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -10689,16 +10900,22 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq2g128",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b
+            },
+        )
     }
 
     /// HFQ6-G256 GEMV with fused residual add: y[row] += A[row] . x.
@@ -10785,18 +11002,27 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
+        let blob = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
 
         // Wave64-native fast path (gfx906/908/94x): 2 rows per block, halves
         // grid.x. Mirrors the HFQ4 sibling at line ~5378. Plan §3.1.1 item 2
@@ -10817,18 +11043,8 @@ impl Gpu {
                 )
             };
             self.ensure_kernel(kname, ksrc, kname)?;
-            let func = &self.functions[kname];
             let grid = ((m as u32) + 1) / 2;
-            return unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [grid, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )
-            };
+            return self.launch_maybe_blob(kname, [grid, 1, 1], [32, 1, 1], 0, &mut params, blob);
         }
 
         self.ensure_kernel(
@@ -10836,17 +11052,14 @@ impl Gpu {
             kernels::GEMV_HFQ5G256_RESIDUAL_SRC,
             "gemv_hfq5g256_residual",
         )?;
-        let func = &self.functions["gemv_hfq5g256_residual"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq5g256_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob,
+        )
     }
 
     /// HFQ6-G256 GEMV. K must be multiple of 256.
@@ -10900,7 +11113,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq5g256", kernels::GEMV_HFQ5G256_SRC, "gemv_hfq5g256")?;
-        let func = &self.functions["gemv_hfq5g256"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -10913,16 +11125,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq5g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ8-G256 GEMV. K must be multiple of 256.
@@ -10936,7 +11154,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq8g256", kernels::GEMV_HFQ8G256_SRC, "gemv_hfq8g256")?;
-        let func = &self.functions["gemv_hfq8g256"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -10949,16 +11166,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq8g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ4-G512 GEMV. K must be multiple of 512.
@@ -10972,7 +11195,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq4g512", kernels::GEMV_HFQ4G512_SRC, "gemv_hfq4g512")?;
-        let func = &self.functions["gemv_hfq4g512"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -10985,16 +11207,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq4g512",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ4-G1024 GEMV. K must be multiple of 1024.
@@ -11012,7 +11240,6 @@ impl Gpu {
             kernels::GEMV_HFQ4G1024_SRC,
             "gemv_hfq4g1024",
         )?;
-        let func = &self.functions["gemv_hfq4g1024"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -11025,16 +11252,22 @@ impl Gpu {
             &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq4g1024",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// Largest `batch` `gemv_hfq4g256_xbatch` accepts. Must stay in step with
@@ -11088,7 +11321,6 @@ impl Gpu {
             )?;
             "gemv_hfq4g256_xbatch_gen"
         };
-        let func = &self.functions[name];
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x_rot.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -11103,16 +11335,16 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(name, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(b_val);
+            b
+        })
     }
 
     /// HFQ4-G256 GEMV: flat 4-bit with 256-weight groups. K must be multiple of 256.
@@ -19275,21 +19507,45 @@ impl Gpu {
                 kernels::GEMV_Q8HFQ_WIDE_SRC,
                 "gemv_q8hfq_wide",
             )?;
-            let func = &self.functions["gemv_q8hfq_wide"];
             let block_size = 64u32;
             let grid = ((m + 1) / 2) as u32;
-            return unsafe {
-                self.hip
-                    .launch_kernel(func, [grid, 1, 1], [block_size, 1, 1], 0, None, &mut params)
-            };
+            return self.launch_maybe_blob(
+                "gemv_q8hfq_wide",
+                [grid, 1, 1],
+                [block_size, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(rs_val);
+                    b
+                },
+            );
         }
 
         self.ensure_kernel("gemv_q8hfq", kernels::GEMV_Q8HFQ_SRC, "gemv_q8hfq")?;
-        let func = &self.functions["gemv_q8hfq"];
-        unsafe {
-            self.hip
-                .launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, None, &mut params)
-        }
+        self.launch_maybe_blob(
+            "gemv_q8hfq",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(rs_val);
+                b
+            },
+        )
     }
 
     /// y = A_q6k * x (quantized GEMV for Q6_K)
@@ -19303,7 +19559,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_q6k", kernels::GEMV_Q6K_SRC, "gemv_q6k")?;
-        let func = &self.functions["gemv_q6k"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -19321,16 +19576,22 @@ impl Gpu {
 
         let block_size = 256u32;
         let shared_mem = block_size * 4;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q6k",
+            [m as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// y = A_q4f16 * x (RDNA-native Q4_F16 GEMV, group size 64)
@@ -19351,7 +19612,6 @@ impl Gpu {
             kernels::GEMV_Q4F16_G64_SRC,
             "gemv_q4f16_g64",
         )?;
-        let func = &self.functions["gemv_q4f16_g64"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -19368,16 +19628,22 @@ impl Gpu {
         ];
 
         let block_size = 32u32; // single warp — no shared memory
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q4f16_g64",
+            [m as u32, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// y = A_q4f16 * x (256-thread wide variant for occupancy testing)
@@ -19396,7 +19662,6 @@ impl Gpu {
             kernels::GEMV_Q4F16_G64_WIDE_SRC,
             "gemv_q4f16_g64_wide",
         )?;
-        let func = &self.functions["gemv_q4f16_g64_wide"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -19414,16 +19679,22 @@ impl Gpu {
 
         let block_size = 256u32;
         let shared_mem = block_size * 4; // one float per thread
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q4f16_g64_wide",
+            [m as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// y = A_q4f16 * x (RDNA-native Q4_F16 GEMV, group size 32)
@@ -19442,7 +19713,6 @@ impl Gpu {
             kernels::GEMV_Q4F16_G32_SRC,
             "gemv_q4f16_g32",
         )?;
-        let func = &self.functions["gemv_q4f16_g32"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -19459,16 +19729,22 @@ impl Gpu {
         ];
 
         let block_size = 32u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q4f16_g32",
+            [m as u32, 1, 1],
+            [block_size, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     pub fn gemv_f16_xf32(
@@ -22831,33 +23107,40 @@ impl Gpu {
             kernels::WO_PER_GROUP_BATCHED_F32_SRC,
             "wo_per_group_batched_f32",
         )?;
-        let func = &self.functions["wo_per_group_batched_f32"];
         let wp = wo_a.buf.as_ptr();
         let xp = x_in.buf.as_ptr();
         let yp = y_out.buf.as_ptr();
-        let mut g_i = g;
-        let mut m_i = m;
-        let mut k_i = k;
-        let mut bs = batch_size;
+        let g_i = g;
+        let m_i = m;
+        let k_i = k;
+        let bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
-            &mut g_i as *mut _ as *mut c_void,
-            &mut m_i as *mut _ as *mut c_void,
-            &mut k_i as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
+            &g_i as *const _ as *mut c_void,
+            &m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_size as u32, g as u32],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "wo_per_group_batched_f32",
+            [m as u32, batch_size as u32, g as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(g_i);
+                b.push_i32(m_i);
+                b.push_i32(k_i);
+                b.push_i32(bs);
+                b
+            },
+        )
     }
     pub fn wo_per_group_batched_hfq4g256(
         &mut self,
@@ -22948,22 +23231,21 @@ impl Gpu {
             kernels::WO_PER_GROUP_BATCHED_Q8_0_SRC,
             "wo_per_group_batched_q8_0",
         )?;
-        let func = &self.functions["wo_per_group_batched_q8_0"];
         let wp = wo_a.buf.as_ptr();
         let xp = x_in.buf.as_ptr();
         let yp = y_out.buf.as_ptr();
-        let mut g_i = g;
-        let mut m_i = m;
-        let mut k_i = k;
-        let mut bs = batch_size;
+        let g_i = g;
+        let m_i = m;
+        let k_i = k;
+        let bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
-            &mut g_i as *mut _ as *mut c_void,
-            &mut m_i as *mut _ as *mut c_void,
-            &mut k_i as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
+            &g_i as *const _ as *mut c_void,
+            &m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
         ];
         // Untimed until now, like `gemm_q8_0_batched`: on CDNA3 the O-LoRA
         // Q8_0 tier lands here (the WMMA variant is gfx1151-gated), so
@@ -22980,16 +23262,24 @@ impl Gpu {
                 * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemv", "wo_per_group_batched_q8_0_1w", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_size as u32, g as u32],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "wo_per_group_batched_q8_0",
+            [m as u32, batch_size as u32, g as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(g_i);
+                b.push_i32(m_i);
+                b.push_i32(k_i);
+                b.push_i32(bs);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -23024,33 +23314,40 @@ impl Gpu {
             }
         };
         self.ensure_kernel(name, kernels::WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC, name)?;
-        let func = &self.functions[name];
         let wp = wo_a.buf.as_ptr();
         let xp = x_in.buf.as_ptr();
         let yp = y_out.buf.as_ptr();
-        let mut g_i = g;
-        let mut m_i = m;
-        let mut k_i = k;
-        let mut bs = batch_size;
+        let g_i = g;
+        let m_i = m;
+        let k_i = k;
+        let bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
-            &mut g_i as *mut _ as *mut c_void,
-            &mut m_i as *mut _ as *mut c_void,
-            &mut k_i as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
+            &g_i as *const _ as *mut c_void,
+            &m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_size as u32, g as u32],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            name,
+            [grid_x, batch_size as u32, g as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(g_i);
+                b.push_i32(m_i);
+                b.push_i32(k_i);
+                b.push_i32(bs);
+                b
+            },
+        )
     }
     pub fn wo_per_group_batched_q8_0_wmma_4w(
         &mut self,
@@ -23074,7 +23371,7 @@ impl Gpu {
             "wo_per_group_batched_q8_0_wmma_4w",
         )?;
         let xp_owned = x_in.buf.as_ptr();
-        let mut xp = if matches!(x_in.dtype, DType::F16) {
+        let xp = if matches!(x_in.dtype, DType::F16) {
             xp_owned
         } else {
             // Production prefill reuses the same x_in tensor pointer every
@@ -23082,36 +23379,43 @@ impl Gpu {
             // would read stale FP16 here.
             self.convert_fp16_x_uncached(x_in, batch_size as usize * g as usize * k as usize)?
         };
-        let func = &self.functions["wo_per_group_batched_q8_0_wmma_4w"];
-        let mut wp = wo_a.buf.as_ptr();
-        let mut yp = y_out.buf.as_ptr();
-        let mut g_i = g;
-        let mut m_i = m;
-        let mut k_i = k;
-        let mut bs = batch_size;
+        let wp = wo_a.buf.as_ptr();
+        let yp = y_out.buf.as_ptr();
+        let g_i = g;
+        let m_i = m;
+        let k_i = k;
+        let bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
-            &mut wp as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut g_i as *mut _ as *mut c_void,
-            &mut m_i as *mut _ as *mut c_void,
-            &mut k_i as *mut _ as *mut c_void,
-            &mut bs as *mut _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &g_i as *const _ as *mut c_void,
+            &m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [
-                    ((m + 63) / 64) as u32,
-                    ((batch_size + 63) / 64) as u32,
-                    g as u32,
-                ],
-                [128, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "wo_per_group_batched_q8_0_wmma_4w",
+            [
+                ((m + 63) / 64) as u32,
+                ((batch_size + 63) / 64) as u32,
+                g as u32,
+            ],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(g_i);
+                b.push_i32(m_i);
+                b.push_i32(k_i);
+                b.push_i32(bs);
+                b
+            },
+        )
     }
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
         &mut self,

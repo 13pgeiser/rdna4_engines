@@ -35,7 +35,7 @@ pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
 
 pub(crate) const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
-const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
+pub(crate) const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
@@ -1720,6 +1720,67 @@ pub fn hc_state_bf16_add_f32(
     hc_state_bf16_elementwise(gpu, "hc_state_bf16_add_f32", state, addend, n)
 }
 
+const HC_MEAN_CAPTURE_SRC: &str = include_str!("../../../kernels/src/hc_mean_capture.hip");
+
+/// DFlash2 target features on Qwen4: the mean over the `hc` hyper-connection
+/// streams of `rows` rows of HC state (`[row, stream, hidden]`, F32, or
+/// BF16-stored when `bf16`), written as F32 to
+/// `out[row * out_stride + out_offset ..][..hidden]`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_mean_capture_f32(
+    gpu: &mut Gpu,
+    streams: &GpuTensor,
+    out: &GpuTensor,
+    rows: usize,
+    hc: usize,
+    hidden: usize,
+    out_stride: usize,
+    out_offset: usize,
+    bf16: bool,
+) -> HipResult<()> {
+    ensure_f32(streams)?;
+    ensure_f32(out)?;
+    let elements = checked_product3(rows, hc, hidden, "HC mean capture streams")?;
+    let stream_f32 = if bf16 { elements.div_ceil(2) } else { elements };
+    let out_end = checked_add(
+        checked_product(rows.saturating_sub(1), out_stride, "HC mean capture rows")?,
+        checked_add(out_offset, hidden, "HC mean capture slot")?,
+        "HC mean capture rows",
+    )?;
+    if rows == 0
+        || hc == 0
+        || out_offset + hidden > out_stride
+        || streams.numel() < stream_f32
+        || out.numel() < out_end
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let threads = checked_product(rows, hidden, "HC mean capture threads")?;
+    gpu.ensure_kernel_public(
+        "hc_mean_capture",
+        HC_MEAN_CAPTURE_SRC,
+        "hc_mean_capture_f32",
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(streams.buf.as_ptr());
+    args.push_ptr(out.buf.as_ptr());
+    args.push_i32(checked_i32(rows, "HC mean capture rows")?);
+    args.push_i32(checked_i32(hc, "HC mean capture streams")?);
+    args.push_i32(checked_i32(hidden, "HC mean capture hidden")?);
+    args.push_i32(checked_i32(out_stride, "HC mean capture stride")?);
+    args.push_i32(checked_i32(out_offset, "HC mean capture offset")?);
+    args.push_i32(i32::from(bf16));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hc_mean_capture_f32",
+        [blocks(threads)?, 1, 1],
+        [KERNEL_BLOCK as u32, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 fn hc_state_bf16_elementwise(
     gpu: &mut Gpu,
     kernel: &str,
@@ -2798,29 +2859,42 @@ pub struct GdnCoreLane<'a> {
     pub gate: GatedDeltaGate<'a>,
 }
 
-/// The per-lane [`gated_delta_conv_params`] + unrotated
-/// [`gated_delta_step_gated`] calls of 2..=[`GDN_CORE_LANES_MAX`] lanes as two
-/// launches: each lane's blocks run the same bodies on its own pointers, so
-/// every output and state byte equals the per-lane calls'. Lanes share the
-/// weights and shapes, hold Q8 state slots on the gfx11+ 128x128 route, and
-/// each step reads q | k | v contiguously from its convolution output.
-/// `Ok(false)`: the set does not take this route (nothing launched; run the
-/// lanes one by one). Never while a replay tape records: the per-lane cursor
-/// and Q8 frame are not declared to the recorder.
-pub fn gated_delta_core_lanes(
-    gpu: &mut Gpu,
-    lanes: &[GdnCoreLane<'_>],
+/// A validated, admitted set of 2..=[`GDN_CORE_LANES_MAX`] lanes, ready for
+/// [`GdnCoreLanesPlan::launch`]; produced only by [`gated_delta_core_lanes`].
+pub struct GdnCoreLanesPlan<'a, 'l> {
+    lanes: &'a [GdnCoreLane<'l>],
     heads: usize,
-) -> HipResult<bool> {
+    /// `[channels, history_rows, kernel_size]` of the shared convolution.
+    conv: [i32; 3],
+    /// `[key_heads, value_heads, key_dim, value_dim]` of the shared step.
+    step: [i32; 4],
+}
+
+/// Admission of the per-lane [`gated_delta_conv_params`] + unrotated
+/// [`gated_delta_step_gated`] calls of 2..=[`GDN_CORE_LANES_MAX`] lanes as two
+/// launches (see [`GdnCoreLanesPlan::launch`]). Lanes share the weights and
+/// shapes, hold Q8 state slots on the gfx11+ 128x128 route, and each step reads
+/// q | k | v contiguously from its convolution output. Every shape,
+/// route and flag refusal happens here, before anything launches: `Ok(None)`
+/// means the set does not take this route (nothing launched; run the lanes one
+/// by one), so a caller that must act exactly once before the launch (the
+/// interpreter's per-step hooks) does so only when a plan comes back. Never
+/// while a replay tape records: the per-lane cursor and Q8 frame are not
+/// declared to the recorder.
+pub fn gated_delta_core_lanes<'a, 'l>(
+    gpu: &Gpu,
+    lanes: &'a [GdnCoreLane<'l>],
+    heads: usize,
+) -> HipResult<Option<GdnCoreLanesPlan<'a, 'l>>> {
     let Some(first) = lanes.first() else {
-        return Ok(false);
+        return Ok(None);
     };
     if lanes.len() < 2
         || lanes.len() > GDN_CORE_LANES_MAX
         || gpu.replay.is_recording()
         || !gpu.flags.qwen4_gdn_lanes_enabled()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let (s0, c0, p0, g0) = (&first.step, &first.conv, &first.params, &first.gate);
     let qk = s0.key_heads * s0.key_dim;
@@ -2852,123 +2926,145 @@ pub fn gated_delta_core_lanes(
             && g.norm.buf.as_ptr() == g0.norm.buf.as_ptr();
         let lane_shape = ([channels, history_rows, kernel_size], step_args);
         if !fits || *shape.get_or_insert(lane_shape) != lane_shape {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    let Some(([channels, history_rows, kernel_size], [key_heads, value_heads, key_dim, value_dim])) =
-        shape
-    else {
-        return Ok(false);
+    let Some((conv, step)) = shape else {
+        return Ok(None);
     };
-    let n = lanes.len();
-    let pad = |args: &mut KernargBlob, filled: usize, ptr: bool| {
-        for _ in filled..GDN_CORE_LANES_MAX {
-            if ptr {
-                args.push_ptr(std::ptr::null());
-            } else {
-                args.push_u32(0);
-            }
-        }
-    };
-
-    let conv_blocks = blocks(c0.channels)?;
-    gpu.ensure_kernel_public(
-        "gdn_lanes",
-        GDN_LANES_SRC,
-        "gated_delta_conv_params_bf16_f32_lanes",
-    )?;
-    let mut args = KernargBlob::new();
-    for tensor in [c0.kernel, p0.a_log, p0.dt_bias] {
-        args.push_ptr(tensor.buf.as_ptr());
-    }
-    for v in [
-        channels,
-        history_rows,
-        kernel_size,
-        checked_i32(heads, "GDN lane heads")?,
-    ] {
-        args.push_i32(v);
-    }
-    args.push_i32(checked_i32(
-        conv_blocks as usize,
-        "GDN lane convolution blocks",
-    )?);
-    // GdnConvLanes: seven pointer arrays, then the cursors.
-    let conv_fields: [fn(&GdnCoreLane<'_>) -> *mut std::ffi::c_void; 7] = [
-        |l| l.conv.input.buf.as_ptr(),
-        |l| l.conv.output.buf.as_ptr(),
-        |l| l.conv.history.buf.as_ptr(),
-        |l| l.params.a.buf.as_ptr(),
-        |l| l.params.b.buf.as_ptr(),
-        |l| l.params.gate.buf.as_ptr(),
-        |l| l.params.beta.buf.as_ptr(),
-    ];
-    for field in conv_fields {
-        for lane in lanes {
-            args.push_ptr(field(lane));
-        }
-        pad(&mut args, n, true);
-    }
-    for lane in lanes {
-        args.push_i32(checked_i32(lane.conv.cursor, "GDN lane cursor")?);
-    }
-    pad(&mut args, n, false);
-    args.pad_to(16);
-    gpu.launch_blob_recorded(
-        "gated_delta_conv_params_bf16_f32_lanes",
-        [conv_blocks + 1, n as u32, 1],
-        [256, 1, 1],
-        0,
-        args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
-    )?;
-
-    gpu.ensure_kernel_public(
-        "gdn_lanes",
-        GDN_LANES_SRC,
-        "gated_delta_step_gate_norm128_q8_lanes",
-    )?;
-    let mut args = KernargBlob::new();
-    args.push_ptr(g0.norm.buf.as_ptr());
-    for v in [key_heads, value_heads, key_dim, value_dim] {
-        args.push_i32(v);
-    }
-    args.push_f32((s0.key_dim as f32).sqrt().recip());
-    args.push_i32(checked_i32(qk, "GDN lane q width")?);
-    // GdnStepLanes: six pointer arrays, then the Q8 frames.
-    let step_fields: [fn(&GdnCoreLane<'_>) -> *mut std::ffi::c_void; 6] = [
-        |l| l.step.q.buf.as_ptr(),
-        |l| l.step.gate.buf.as_ptr(),
-        |l| l.step.beta.buf.as_ptr(),
-        |l| l.step.state.buf.as_ptr(),
-        |l| l.gate.z.buf.as_ptr(),
-        |l| l.gate.output.buf.as_ptr(),
-    ];
-    for field in step_fields {
-        for lane in lanes {
-            args.push_ptr(field(lane));
-        }
-        pad(&mut args, n, true);
-    }
-    for lane in lanes {
-        args.push_u32(checked_u32(lane.step.position, "GDN lane Q8 frame")?);
-    }
-    pad(&mut args, n, false);
-    args.pad_to(16);
-    gpu.launch_blob_recorded(
-        "gated_delta_step_gate_norm128_q8_lanes",
-        [
-            checked_u32(s0.value_heads, "GDN lane value-head grid")?,
-            1,
-            n as u32,
-        ],
-        [128, 1, 1],
-        0,
-        args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
-    )?;
-    Ok(true)
+    Ok(Some(GdnCoreLanesPlan {
+        lanes,
+        heads,
+        conv,
+        step,
+    }))
 }
+
+impl GdnCoreLanesPlan<'_, '_> {
+    /// The admitted lanes as two launches (convolution + gate parameters, then
+    /// step + gated norm): each lane's blocks run the same bodies on its own
+    /// pointers, so every output and state byte equals the per-lane calls'.
+    pub fn launch(self, gpu: &mut Gpu) -> HipResult<()> {
+        let Self {
+            lanes,
+            heads,
+            conv: [channels, history_rows, kernel_size],
+            step: [key_heads, value_heads, key_dim, value_dim],
+        } = self;
+        let first = &lanes[0];
+        let (s0, c0, p0, g0) = (&first.step, &first.conv, &first.params, &first.gate);
+        let qk = s0.key_heads * s0.key_dim;
+        let n = lanes.len();
+        let pad = |args: &mut KernargBlob, filled: usize, ptr: bool| {
+            for _ in filled..GDN_CORE_LANES_MAX {
+                if ptr {
+                    args.push_ptr(std::ptr::null());
+                } else {
+                    args.push_u32(0);
+                }
+            }
+        };
+
+        let conv_blocks = blocks(c0.channels)?;
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_conv_params_bf16_f32_lanes",
+        )?;
+        let mut args = KernargBlob::new();
+        for tensor in [c0.kernel, p0.a_log, p0.dt_bias] {
+            args.push_ptr(tensor.buf.as_ptr());
+        }
+        for v in [
+            channels,
+            history_rows,
+            kernel_size,
+            checked_i32(heads, "GDN lane heads")?,
+        ] {
+            args.push_i32(v);
+        }
+        args.push_i32(checked_i32(
+            conv_blocks as usize,
+            "GDN lane convolution blocks",
+        )?);
+        // GdnConvLanes: seven pointer arrays, then the cursors.
+        let conv_fields: [fn(&GdnCoreLane<'_>) -> *mut std::ffi::c_void; 7] = [
+            |l| l.conv.input.buf.as_ptr(),
+            |l| l.conv.output.buf.as_ptr(),
+            |l| l.conv.history.buf.as_ptr(),
+            |l| l.params.a.buf.as_ptr(),
+            |l| l.params.b.buf.as_ptr(),
+            |l| l.params.gate.buf.as_ptr(),
+            |l| l.params.beta.buf.as_ptr(),
+        ];
+        for field in conv_fields {
+            for lane in lanes {
+                args.push_ptr(field(lane));
+            }
+            pad(&mut args, n, true);
+        }
+        for lane in lanes {
+            args.push_i32(checked_i32(lane.conv.cursor, "GDN lane cursor")?);
+        }
+        pad(&mut args, n, false);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "gated_delta_conv_params_bf16_f32_lanes",
+            [conv_blocks + 1, n as u32, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_step_gate_norm128_q8_lanes",
+        )?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(g0.norm.buf.as_ptr());
+        for v in [key_heads, value_heads, key_dim, value_dim] {
+            args.push_i32(v);
+        }
+        args.push_f32((s0.key_dim as f32).sqrt().recip());
+        args.push_i32(checked_i32(qk, "GDN lane q width")?);
+        // GdnStepLanes: six pointer arrays, then the Q8 frames.
+        let step_fields: [fn(&GdnCoreLane<'_>) -> *mut std::ffi::c_void; 6] = [
+            |l| l.step.q.buf.as_ptr(),
+            |l| l.step.gate.buf.as_ptr(),
+            |l| l.step.beta.buf.as_ptr(),
+            |l| l.step.state.buf.as_ptr(),
+            |l| l.gate.z.buf.as_ptr(),
+            |l| l.gate.output.buf.as_ptr(),
+        ];
+        for field in step_fields {
+            for lane in lanes {
+                args.push_ptr(field(lane));
+            }
+            pad(&mut args, n, true);
+        }
+        for lane in lanes {
+            args.push_u32(checked_u32(lane.step.position, "GDN lane Q8 frame")?);
+        }
+        pad(&mut args, n, false);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "gated_delta_step_gate_norm128_q8_lanes",
+            [
+                checked_u32(s0.value_heads, "GDN lane value-head grid")?,
+                1,
+                n as u32,
+            ],
+            [128, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        Ok(())
+    }
+}
+
 /// Ordered K=4 causal convolution over row-major `[rows, channels]` input.
 /// Each channel keeps its BF16-rounded history ring across the whole batch.
 /// A BF16-typed `output` receives the (BF16-rounded) values as packed BF16.

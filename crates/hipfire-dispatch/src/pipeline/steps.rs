@@ -116,14 +116,12 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
-    /// Dense gated feed-forward block (gate/up projections, SiLU product,
-    /// down projection) with the source's BF16 storage boundaries.  Opaque to
-    /// fusion: no HC read/write pairing or epilogue fold crosses it.
-    DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
+    /// Dense gated MLP (optional pre-norm, gate/up, activation, down, output
+    /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC
+    /// read/write pairing or epilogue fold crosses it.
+    GatedMlp(crate::pipeline::gated_mlp::GatedMlpOp<'a>),
     /// Sandwich-norm attention sublayer.
     SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
-    /// Sandwich-norm gated MLP sublayer.
-    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
     /// Parallel dense + routed-expert MLP sublayer.
     ParallelMoeMlp(crate::pipeline::sandwich::ParallelMoeMlpOp<'a>),
     /// Sandwich-norm per-layer-input branch.
@@ -132,6 +130,12 @@ pub enum Step<'a> {
     Scale(crate::pipeline::sandwich::ScaleOp<'a>),
     /// In-place final-logit soft cap.
     Softcap(crate::pipeline::sandwich::SoftcapOp<'a>),
+    /// Hybrid decoder gated-DeltaNet linear-attention sublayer.
+    #[cfg(feature = "deltanet")]
+    DeltaNetMixer(crate::pipeline::hybrid::DeltaNetMixerOp<'a>),
+    /// Hybrid decoder gated full-attention sublayer.
+    #[cfg(feature = "deltanet")]
+    GatedAttention(crate::pipeline::hybrid::GatedAttentionOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -165,14 +169,15 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
-        | Step::DenseFfn(_)
+        | Step::GatedMlp(_)
         | Step::MoeStage(..)
         | Step::SandwichAttention(_)
-        | Step::SandwichMlp(_)
         | Step::ParallelMoeMlp(_)
         | Step::PerLayerInput(_)
         | Step::Scale(_)
         | Step::Softcap(_) => None,
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(_) | Step::GatedAttention(_) => None,
     }
 }
 
@@ -536,8 +541,11 @@ pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> boo
     };
     dt == DType::ParoQ4G128
         && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
+        // The pack4 kernel reads the native PARO4-G128 tensor, whose rotation is
+        // embedded in the weight bytes. A safetensors-Dir weight (HFQ4-G128 repack
+        // + sidecar `rotation`) has the same dtype but not that layout.
         && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
+            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0 && w.rotation.is_none(),
             _ => false,
         })
         // Gate and up must have equal m — the fused kernel takes a single m.
@@ -794,7 +802,8 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
-            Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -819,6 +828,17 @@ pub trait MoeStepHooks {
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
     /// Right after the call's last launch.
     fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+    /// At the top of the interpreter's loop, before `step` is dispatched by
+    /// whatever route takes it (fused, CPU or plain): every earlier step has
+    /// run, `step` has not. A step consumed inside an earlier step's fused
+    /// launch is never announced, except the members of a multi-lane GDN Core
+    /// group (fn-lanes): each is announced exactly once, in program order,
+    /// right before the group's launches (its members write only per-lane
+    /// scratch, so the state seen is the one sequential dispatch would show).
+    /// Default: nothing (no fusion changes).
+    fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
+        Ok(())
+    }
 }
 
 struct NoMoeHooks;
@@ -924,7 +944,10 @@ fn execute_window<'a>(
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
     while i < end {
         // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
-        // as one multi-lane launch per kernel; otherwise one by one below.
+        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // group's steps are announced here, once each in program order, after
+        // every refusal check and before the grouped launch; a refused group
+        // announced nothing and each step is announced by the plain path below.
         if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
             && !cpu_exec::cpu_exec_enabled()
         {
@@ -938,13 +961,24 @@ fn execute_window<'a>(
                     _ => None,
                 })
                 .collect();
-            if ops.len() >= 2
-                && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(gpu, &ops)?
+            let group = ops.len();
+            if group >= 2
+                && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(
+                    gpu,
+                    &ops,
+                    |gpu| {
+                        for step in &steps[i..i + group] {
+                            hooks.before_step(gpu, step)?;
+                        }
+                        Ok(())
+                    },
+                )?
             {
-                i += ops.len();
+                i += group;
                 continue;
             }
         }
+        hooks.before_step(gpu, &steps[i])?;
         if hc_fuse {
             use crate::pipeline::layer_ops::{
                 execute_gated_delta_net_hc, execute_hyper_read_paired,
@@ -1680,6 +1714,7 @@ pub(crate) fn launch_op_rows(
                             givens_theta: None,
                             givens_scales: None,
                             givens_krot: None,
+                            givens_group_size: None,
                         },
                     )
                     .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -1730,19 +1765,22 @@ pub(crate) fn launch_op_rows(
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
-        Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
+        Step::GatedMlp(op) => crate::pipeline::gated_mlp::execute_gated_mlp(gpu, ctx, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
         Step::SandwichAttention(op) => {
             crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
         }
-        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
         Step::ParallelMoeMlp(op) => {
             crate::pipeline::sandwich::execute_parallel_moe_mlp(gpu, ctx, op)
         }
         Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
         Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
         Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
+        #[cfg(feature = "deltanet")]
+        Step::DeltaNetMixer(op) => crate::pipeline::hybrid::execute_deltanet_mixer(gpu, ctx, op),
+        #[cfg(feature = "deltanet")]
+        Step::GatedAttention(op) => crate::pipeline::hybrid::execute_gated_attention(gpu, ctx, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
@@ -2222,6 +2260,78 @@ mod tests {
         assert!(!guard_gate_up_paro4g128t(empty, &ctx));
         assert!(!guard_qkvza_paro4g128t(empty, &ctx));
         assert!(!guard_qkv_paro4g128t(empty, &ctx));
+    }
+
+    /// The pack4 kernel behind `FusedGateUpParo4G128T` reads the rotation from
+    /// native PARO4-G128 weight bytes. A safetensors-Dir weight of the same
+    /// dtype carries a sidecar rotation instead, and a G64 weight has neither
+    /// layout: both must stay on the per-projection Givens + GEMV path.
+    #[test]
+    fn paro_gate_up_fusion_admits_only_native_g128() {
+        use crate::families::gemv::GivensRef;
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let t = || GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) },
+            shape: vec![1024],
+            dtype: DType::F32,
+        };
+        let (x, norm, act, pairs, theta, scales) = (t(), t(), t(), t(), t(), t());
+        let sidecar = GivensRef {
+            pairs: &pairs,
+            theta: &theta,
+            scales: &scales,
+            krot: 8,
+        };
+        let admits = |dtype: DType, rotation: Option<GivensRef>| {
+            let w = WeightRef {
+                buf: &x,
+                dtype,
+                m: 16,
+                k: 128,
+                row_stride: 0,
+                rotation,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            };
+            let steps = [
+                Step::RmsnormAutomatic {
+                    x: &x,
+                    norm_weight: &norm,
+                    x_plain: &act,
+                    out: &act,
+                    awq_scale: None,
+                    k: 128,
+                    eps: 1e-6,
+                    rotation: RotationPlan::None,
+                },
+                Step::Gemv {
+                    w: &w,
+                    input: GemvInput::Raw(&act),
+                    out: &act,
+                },
+                Step::Gemv {
+                    w: &w,
+                    input: GemvInput::Raw(&act),
+                    out: &act,
+                },
+            ];
+            guard_gate_up_paro4g128t(&steps, &ctx)
+        };
+        assert!(
+            admits(DType::ParoQ4G128, None),
+            "native PARO4-G128 window must fuse"
+        );
+        assert!(
+            !admits(DType::ParoQ4G128, Some(sidecar)),
+            "sidecar G128 must not fuse"
+        );
+        assert!(
+            !admits(DType::ParoQ4G64, Some(sidecar)),
+            "G64 must not fuse"
+        );
+        assert!(!admits(DType::ParoQ4G64, None), "G64 must not fuse");
     }
 
     #[test]

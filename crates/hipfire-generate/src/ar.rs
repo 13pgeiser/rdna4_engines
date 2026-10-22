@@ -1688,6 +1688,9 @@ pub struct GenerationRouteInputs {
     pub pp: usize,
     pub has_speculator: bool,
     pub speculator_is_mtp: bool,
+    /// The loaded speculator is the shared DFlash2 drafter (`name() ==
+    /// "dflash2"`), the one non-MTP speculator a Qwen4 load admits.
+    pub speculator_is_dflash2: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
@@ -1760,11 +1763,21 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // Qwen4 PP uses the same native driver for greedy, unpenalized
             // requests. Sampled or penalized requests explicitly keep the PP
             // AR producer; they never enter the Qwen3.5-only PP route.
-            let spec_ok = (i.pp <= 1 || (i.temp <= 1e-6 && !i.nonneutral_penalties))
-                && i.has_speculator
+            let mtp_ok = (i.pp <= 1 || (i.temp <= 1e-6 && !i.nonneutral_penalties))
                 && i.speculator_is_mtp
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
-                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor))
+                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor));
+            // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
+            // card): it verifies greedy picks, or sampled rows with the AR
+            // sampler's law (temperature, top_k, top_p, min_p), and applies
+            // no token penalties, so a penalized request keeps the AR
+            // producer. Any other speculator stays on AR.
+            let dflash2_ok = i.speculator_is_dflash2
+                && i.pp <= 1
+                && !i.nonneutral_penalties
+                && (i.temp <= 1e-6 || i.supports_temp_swor);
+            let spec_ok = i.has_speculator
+                && (mtp_ok || dflash2_ok)
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off
                 && !i.kv_adaptive;
@@ -2526,6 +2539,7 @@ pub fn generate(
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
@@ -7006,6 +7020,7 @@ mod qwen4_pp_route_tests {
             pp,
             has_speculator: false,
             speculator_is_mtp: false,
+            speculator_is_dflash2: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 0.0,

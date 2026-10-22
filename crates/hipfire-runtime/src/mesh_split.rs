@@ -36,6 +36,11 @@
 //! * **N=1** (`mesh.n_devices() == 1`): the full admission pre-pass (epoch, `Ep`,
 //!   aliases, geometry) runs first even for N=1, then the identity plan is
 //!   returned without walking the graph.
+//! * **`GatedMlp`** splits the intermediate only when gate/up are
+//!   `ColumnShard { axis: 0 }` and down is `RowShard { axis: 1 }`, on more
+//!   than one TP part: the output is then `Partial` and binds the down
+//!   weight's schedule entry. With one TP part (a PP stage) the op is local
+//!   and its output Whole, so no one-device reduction is emitted.
 
 use crate::device_mesh::{CollectiveHint, DeviceMesh, DimKind, MeshEpoch};
 use crate::weight_manifest::{ManifestPlan, ShardPolicy, StateKind, WeightPlacement};
@@ -154,6 +159,11 @@ pub enum SplitError {
         op: OpId,
         kind: OpKind,
     },
+    /// The op's weights are sharded but its kernels cannot run on a shard.
+    UnshardableOp {
+        op: OpId,
+        kind: OpKind,
+    },
     LayoutMismatch {
         op: OpId,
         resource: ResourceId,
@@ -215,6 +225,11 @@ impl fmt::Display for SplitError {
             Self::UnsupportedOp { op, kind } => write!(
                 f,
                 "op {} ({kind:?}) has no declared split point and a non-whole operand",
+                op.0
+            ),
+            Self::UnshardableOp { op, kind } => write!(
+                f,
+                "op {} ({kind:?}) has sharded weights but its kernel ladder cannot run on a shard",
                 op.0
             ),
             Self::LayoutMismatch { op, resource } => write!(
@@ -340,6 +355,68 @@ fn weight_geometry(
     Ok(())
 }
 
+/// `GatedMlp` admission: the three weights split the intermediate together
+/// (gate/up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }`) or not at
+/// all (all `Replicate`), over one intermediate extent, on a shard-safe
+/// ladder, and every split weight passes [`weight_geometry`]
+/// (`intermediate % (parts * group)` for down). A weight missing from the plan
+/// is left to the walk (`UnknownWeight`).
+fn gated_mlp_admission(
+    graph: &StepGraph,
+    plan: &ManifestPlan,
+    parts: usize,
+    op: OpId,
+    weights: [ResourceId; 3],
+    ladder: hipfire_dispatch::pipeline::gated_mlp::MlpLadder,
+) -> Result<(), SplitError> {
+    let placement = |w: ResourceId| {
+        graph
+            .resources()
+            .get(w.0 as usize)
+            .and_then(|decl| find_weight(plan, &decl.class))
+    };
+    let [Some(gate), Some(up), Some(down)] = weights.map(placement) else {
+        return Ok(());
+    };
+    let placed = [gate, up, down];
+    if placed.iter().all(|w| w.policy == ShardPolicy::Replicate) {
+        return Ok(());
+    }
+    let split = [
+        ShardPolicy::ColumnShard { axis: 0 },
+        ShardPolicy::ColumnShard { axis: 0 },
+        ShardPolicy::RowShard { axis: 1 },
+    ];
+    for ((w, placement), want) in weights.iter().zip(placed).zip(&split) {
+        if placement.policy != *want {
+            return Err(SplitError::UnsupportedPolicy { op, resource: *w });
+        }
+    }
+    let intermediate = gate.logical_shape.first();
+    if up.logical_shape.first() != intermediate {
+        return Err(SplitError::LayoutMismatch {
+            op,
+            resource: weights[1],
+        });
+    }
+    if down.logical_shape.get(1) != intermediate {
+        return Err(SplitError::LayoutMismatch {
+            op,
+            resource: weights[2],
+        });
+    }
+    if parts > 1 && !ladder.tp_shardable() {
+        return Err(SplitError::UnshardableOp {
+            op,
+            kind: OpKind::GatedMlp,
+        });
+    }
+    for w in weights {
+        weight_geometry(graph, plan, parts, w)?;
+    }
+    Ok(())
+}
+
 fn admit(graph: &StepGraph, plan: &ManifestPlan, mesh: &DeviceMesh) -> Result<(), SplitError> {
     if plan.mesh_epoch != mesh.epoch() {
         return Err(SplitError::EpochMismatch {
@@ -375,9 +452,23 @@ fn admit(graph: &StepGraph, plan: &ManifestPlan, mesh: &DeviceMesh) -> Result<()
     }
 
     let parts = mesh.size_of(DimKind::Tp);
-    for op in graph.ops() {
+    for (index, op) in graph.ops().iter().enumerate() {
         match op.rule {
             SplitRule::Project { weight, .. } => weight_geometry(graph, plan, parts, weight)?,
+            SplitRule::GatedMlp {
+                gate,
+                up,
+                down,
+                ladder,
+                ..
+            } => gated_mlp_admission(
+                graph,
+                plan,
+                parts,
+                OpId(index as u32),
+                [gate, up, down],
+                ladder,
+            )?,
             SplitRule::HeadLocal { heads, kv_heads } => {
                 let resource = op
                     .reads
@@ -477,7 +568,7 @@ fn state_matches(kind: &StateKind, class: StateClass) -> bool {
 fn reads_of(op: &OpDecl) -> impl Iterator<Item = ResourceId> + '_ {
     let extra: [Option<ResourceId>; 2] = match op.rule {
         SplitRule::Accumulate { dst, src } => [Some(dst), Some(src)],
-        SplitRule::Project { input, .. } => [Some(input), None],
+        SplitRule::Project { input, .. } | SplitRule::GatedMlp { input, .. } => [Some(input), None],
         _ => [None, None],
     };
     op.reads
@@ -1123,6 +1214,42 @@ impl<'a> Walk<'a> {
                 }
                 self.emit(opid, stage, run);
             }
+            SplitRule::GatedMlp {
+                input,
+                gate,
+                up,
+                down,
+                output,
+                ..
+            } => {
+                let placed = |weight: ResourceId| {
+                    self.weight_of(weight).ok_or(SplitError::UnknownWeight {
+                        op: opid,
+                        resource: weight,
+                    })
+                };
+                placed(gate)?;
+                placed(up)?;
+                let down = placed(down)?;
+                // The pre-norm (or the gate/up projections) read complete rows.
+                self.require_input_whole(opid, input, run)?;
+                if self.tp > 1 && matches!(down.policy, ShardPolicy::RowShard { .. }) {
+                    let sched = self.sched_entry(down);
+                    if let Some(entry) = sched {
+                        self.sched_used[entry] = true;
+                    }
+                    self.write_res(
+                        opid,
+                        output,
+                        ShardSpec::Partial { kind: DimKind::Tp },
+                        stage,
+                    )?;
+                    self.partial[output.0 as usize] = Some(PartialInfo { sched });
+                } else {
+                    self.write_res(opid, output, out_whole(run), stage)?;
+                }
+                self.emit(opid, stage, run);
+            }
             SplitRule::Opaque => {
                 for resource in operands_of(op) {
                     if self.kind_of(resource) == Kind::Input {
@@ -1240,6 +1367,7 @@ mod tests {
     use crate::weight_manifest::{
         plan_manifest, FusedQkvLayout, PinTarget, PlacementHint, StateEntry, WeightEntry,
     };
+    use hipfire_dispatch::pipeline::gated_mlp::MlpLadder;
     use hipfire_dispatch::pipeline::step_graph::{Alias, ResourceDecl};
     use rdna_compute::DType;
 
@@ -1826,13 +1954,13 @@ mod tests {
         let x = b.act(4);
         let w = b.weight("gate", 0, vec![8, 4], ShardPolicy::ColumnShard { axis: 0 });
         let y = b.act(4);
-        let op = b.op(OpKind::DenseFfn, Some(0), SplitRule::Opaque, &[x, w], &[y]);
+        let op = b.op(OpKind::GatedMlp, Some(0), SplitRule::Opaque, &[x, w], &[y]);
         let plan = b.plan(&mesh, 1);
         assert_eq!(
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::UnsupportedOp {
                 op,
-                kind: OpKind::DenseFfn
+                kind: OpKind::GatedMlp
             }
         );
     }
@@ -2094,6 +2222,217 @@ mod tests {
         assert_eq!(
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::UnreducedPartial { resource: p }
+        );
+    }
+
+    const MLP_H: usize = 16;
+    const MLP_I: usize = 32;
+
+    fn mlp_split() -> [ShardPolicy; 3] {
+        [
+            ShardPolicy::ColumnShard { axis: 0 },
+            ShardPolicy::ColumnShard { axis: 0 },
+            row_policy(),
+        ]
+    }
+
+    /// `out = GatedMlp(input)` in `layer` over weights of `policies`, gate/up
+    /// `[inter, MLP_H]` and down `[MLP_H, down_inter]`; returns the op, its
+    /// output and the down weight.
+    fn gated_mlp(
+        b: &mut B,
+        layer: usize,
+        input: ResourceId,
+        policies: [ShardPolicy; 3],
+        (inter, down_inter): (usize, usize),
+        ladder: MlpLadder,
+    ) -> (OpId, ResourceId, ResourceId) {
+        let [gp, upp, dp] = policies;
+        let gate = b.weight("gate", layer, vec![inter, MLP_H], gp);
+        let up = b.weight("up", layer, vec![inter, MLP_H], upp);
+        let down = b.weight("down", layer, vec![MLP_H, down_inter], dp);
+        let output = b.act(MLP_H);
+        let op = b.op(
+            OpKind::GatedMlp,
+            Some(layer),
+            SplitRule::GatedMlp {
+                input,
+                gate,
+                up,
+                down,
+                output,
+                ladder,
+            },
+            &[input, gate, up, down],
+            &[output],
+        );
+        (op, output, down)
+    }
+
+    /// Schedule entry of layer `layer`'s down weight.
+    fn down_entry(plan: &ManifestPlan, layer: usize) -> ScheduleRef {
+        ScheduleRef::Collective(
+            plan.collective_schedule
+                .iter()
+                .position(|e| e.name == "down" && e.layer == layer)
+                .unwrap(),
+        )
+    }
+
+    const MLP_INTER: (usize, usize) = (MLP_I, MLP_I);
+
+    #[test]
+    fn gated_mlp_partial_fuses_into_one_all_reduce_add() {
+        for ranks in [2, 4] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Tp, ranks)]).unwrap();
+            let mut b = B::new();
+            let x = b.act(MLP_H);
+            let (mlp, p, _) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, MlpLadder::Trunk);
+            let add = b.accumulate(Some(0), x, p);
+            let plan = b.plan(&mesh, 1);
+            let sp = split_program(&b.g, &plan, &mesh).unwrap();
+            assert_eq!(
+                sp.collectives,
+                vec![PlannedCollective {
+                    id: CollectiveId(0),
+                    kind: CollectiveKind::AllReduceAdd {
+                        into: x,
+                        replaces: add
+                    },
+                    operand: p,
+                    producer: mlp,
+                    group: (0..ranks).collect(),
+                    fulfils: down_entry(&plan, 0),
+                }]
+            );
+            for rank in &sp.ranks {
+                assert_eq!(
+                    rank.items,
+                    [RankItem::Op(mlp), RankItem::Collective(CollectiveId(0))]
+                );
+            }
+            assert_eq!(sp.resources[x.0 as usize].exit, ShardSpec::Whole);
+        }
+    }
+
+    #[test]
+    fn gated_mlp_partial_reduces_before_a_whole_reader() {
+        let mesh = tp2();
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let (mlp, p, _) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, MlpLadder::Trunk);
+        let n = b.act(MLP_H);
+        let read = b.row_complete(Some(0), p, n);
+        let plan = b.plan(&mesh, 1);
+        let sp = split_program(&b.g, &plan, &mesh).unwrap();
+        assert_eq!(sp.collectives.len(), 1);
+        let c = &sp.collectives[0];
+        assert_eq!(
+            (c.kind, c.operand, c.producer, c.fulfils),
+            (CollectiveKind::AllReduce, p, mlp, down_entry(&plan, 0))
+        );
+        for rank in &sp.ranks {
+            assert_eq!(
+                rank.items,
+                [
+                    RankItem::Op(mlp),
+                    RankItem::Collective(CollectiveId(0)),
+                    RankItem::Op(read)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn gated_mlp_stays_whole_replicated_or_on_one_tp_part() {
+        // Replicated weights on TP2: every rank runs the whole op, any ladder.
+        let mesh = tp2();
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let replicate = [(); 3].map(|_| ShardPolicy::Replicate);
+        let ladder = MlpLadder::SandwichWide;
+        let (_, p, _) = gated_mlp(&mut b, 0, x, replicate, MLP_INTER, ladder);
+        let n = b.act(MLP_H);
+        b.row_complete(Some(0), p, n);
+        let plan = b.plan(&mesh, 1);
+        let sp = split_program(&b.g, &plan, &mesh).unwrap();
+        assert!(sp.collectives.is_empty());
+        assert_eq!(sp.resources[p.0 as usize].exit, ShardSpec::Whole);
+
+        // A PP stage is one TP part: split policies run locally, so only the
+        // band transfer is planned (no one-device reduction).
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        for layer in 0..2 {
+            let ladder = MlpLadder::Trunk;
+            let (_, p, _) = gated_mlp(&mut b, layer, x, mlp_split(), MLP_INTER, ladder);
+            b.accumulate(Some(layer), x, p);
+        }
+        let plan = b.plan(&mesh, 2);
+        let sp = split_program(&b.g, &plan, &mesh).unwrap();
+        assert_eq!(
+            sp.collectives.iter().map(|c| c.kind).collect::<Vec<_>>(),
+            [CollectiveKind::BandXfer { src: 0, dst: 1 }]
+        );
+    }
+
+    #[test]
+    fn gated_mlp_refusals() {
+        let mesh = tp2();
+        let trunk = MlpLadder::Trunk;
+        // gate and up split, down replicated.
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let mut mixed = mlp_split();
+        mixed[2] = ShardPolicy::Replicate;
+        let (op, _, down) = gated_mlp(&mut b, 0, x, mixed, MLP_INTER, trunk);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::UnsupportedPolicy { op, resource: down }
+        );
+        // down splits a different intermediate than gate/up.
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let skew = (MLP_I, 2 * MLP_I);
+        let (op, _, down) = gated_mlp(&mut b, 0, x, mlp_split(), skew, trunk);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::LayoutMismatch { op, resource: down }
+        );
+        // The sandwich ladder has no shard-safe form.
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let sandwich = MlpLadder::SandwichWide;
+        let (op, _, _) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, sandwich);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::UnshardableOp {
+                op,
+                kind: OpKind::GatedMlp
+            }
+        );
+        // The pre-norm needs whole rows: a split input is refused.
+        let mut b = B::new();
+        let (_, a) = split_prelude(&mut b);
+        let (op, _, _) = gated_mlp(&mut b, 0, a, mlp_split(), MLP_INTER, trunk);
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::NeedsGather { op, resource: a }
+        );
+        // A weight the manifest does not plan.
+        let mut b = B::new();
+        let x = b.act(MLP_H);
+        let (op, _, down) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, trunk);
+        b.ws.retain(|entry| entry.name != "down");
+        let plan = b.plan(&mesh, 1);
+        assert_eq!(
+            split_program(&b.g, &plan, &mesh).unwrap_err(),
+            SplitError::UnknownWeight { op, resource: down }
         );
     }
 }

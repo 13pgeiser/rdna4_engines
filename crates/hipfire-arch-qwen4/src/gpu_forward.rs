@@ -46,16 +46,19 @@ use hipfire_dispatch::families::moe::{
     MoeSharedDtypes, MoeSharedWeights, MoeStageTables, MoeTileExchange, MoeTileExchangeParams,
     RoutedExpertWeights, MOE_GROUPED_BLOCK_M,
 };
+use hipfire_dispatch::pipeline::gated_mlp::{
+    Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
+};
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
     SealedMoeCall,
 };
 use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
-    seal_decode, validate_steps, BoundMoeExperts, ClearOp, DenseFfnOp, DenseFfnRecipe, EmbeddingOp,
-    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
-    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, MoeStepHooks, Step,
+    seal_decode, validate_steps, BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache,
+    ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, GatedDeltaNetOp,
+    GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MixerPhase, MoeStepHooks, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
@@ -63,7 +66,7 @@ use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::moe::Qwen4EpOwnerTables;
-use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
+use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
@@ -695,6 +698,18 @@ pub struct Qwen4MeshLayout {
     pub route_rows: usize,
     pub bf16_streams: bool,
     pub stream_bytes: usize,
+}
+
+/// The steps one mesh call runs of its band program (`mesh_op_range`). A TP
+/// rank stops at every collective, so its program runs in segments: only the
+/// `first` uploads and embeds the tokens and stages the PLE rows, only the
+/// `last` runs the head and the wide capture and commits the state. A PP band
+/// runs its whole program as one segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MeshSegment {
+    steps: std::ops::Range<usize>,
+    first: bool,
+    last: bool,
 }
 
 /// Host-side forward phases timed when profiling is enabled.
@@ -4947,7 +4962,7 @@ impl Qwen4ExpertStage {
 /// the step interpreter (so the whole layer program stays one interpreter
 /// call): a host layer's compute waits for its staged experts, and after the
 /// call the stage is freed / refilled ([`Qwen4ExpertStage::after_moe`]).
-struct StagedMoeHooks<'s> {
+struct StagedMoeHooks<'s, 'c> {
     stage: &'s Qwen4ExpertStage,
     bundle: &'s Qwen4Bundle,
     moe: &'s [Option<Qwen4MoeLayerRuntime>],
@@ -4956,9 +4971,11 @@ struct StagedMoeHooks<'s> {
     /// The stage error behind a hook failure, returned instead of the
     /// interpreter's stringified one.
     error: Option<Qwen4GpuForwardError>,
+    /// The forward's DFlash2 layer capture, announced every step.
+    capture: Option<&'c mut (dyn MoeStepHooks + 'c)>,
 }
 
-impl StagedMoeHooks<'_> {
+impl StagedMoeHooks<'_, '_> {
     fn fail(&mut self, result: Result<(), Qwen4GpuForwardError>) -> Result<(), DispatchError> {
         result.map_err(|error| {
             let message = error.to_string();
@@ -4968,7 +4985,14 @@ impl StagedMoeHooks<'_> {
     }
 }
 
-impl MoeStepHooks for StagedMoeHooks<'_> {
+impl MoeStepHooks for StagedMoeHooks<'_, '_> {
+    fn before_step(&mut self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), DispatchError> {
+        match self.capture.as_deref_mut() {
+            Some(capture) => capture.before_step(gpu, step),
+            None => Ok(()),
+        }
+    }
+
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let result = match self.moe.get(self.layer) {
             None => Err(invalid("G2 staged forward ran more MoE calls than layers")),
@@ -5786,7 +5810,7 @@ impl Qwen4GpuForwardScratch {
             alloc(F::MoeSharedOutput, rows(hidden)?, DType::F32)?;
             // Batched gate/up rows: routed slots * routed intermediate for a
             // MoE profile, rows * intermediate for a dense FFN (exactly one of
-            // the two extents is nonzero); `Step::DenseFfn` borrows both.
+            // the two extents is nonzero); `Step::GatedMlp` borrows both.
             alloc(F::MoeGateBatch, ffn_batch_rows, DType::F32)?;
             alloc(F::MoeUpBatch, ffn_batch_rows, DType::F32)?;
             alloc(F::MoeRotBatch, rows(routed_width)?, DType::F32)?;
@@ -6857,22 +6881,32 @@ impl<'a> LayerPhaseEnv<'a> {
     }
 
     /// The dense FFN step (a non-MoE layer): reads `scratch.hc_mixed`, writes
-    /// `scratch.ffn_output`.
+    /// `scratch.ffn_output`. A TP rank's sharded FFN writes its F32 partial
+    /// (`Bf16SourcePartial`): the reduction's consumer rounds the sum once.
     pub(crate) fn dense_step(&self, dense: &Qwen4DenseBinding<'a>) -> Step<'a> {
         let scratch = self.scratch;
-        Step::DenseFfn(DenseFfnOp {
-            recipe: DenseFfnRecipe::SiluBf16Source,
-            gate: dense.gate,
-            up: dense.up,
-            down: dense.down,
-            input: &scratch.hc_mixed,
-            gate_scratch: &scratch.moe_gate_batch,
-            up_scratch: &scratch.moe_up_batch,
-            output: &scratch.ffn_output,
-            rotation: &scratch.rotation,
+        Step::GatedMlp(GatedMlpOp {
             rows: self.rows,
             hidden: self.bundle.config.hidden_size,
             intermediate: dense.intermediate,
+            x: &scratch.hc_mixed,
+            pre_norm: None,
+            gate: dense.gate,
+            up: dense.up,
+            down: dense.down,
+            activation: Activation::Silu,
+            storage: match self.bundle.weights.tp_shard() {
+                Some(_) => MlpStorage::Bf16SourcePartial,
+                None => MlpStorage::Bf16Source,
+            },
+            output: MlpOutput::Write(&scratch.ffn_output),
+            ladder: crate::program::QWEN4_DENSE_LADDER,
+            scratch: GatedMlpScratch {
+                gate: &scratch.moe_gate_batch,
+                up: &scratch.moe_up_batch,
+                act: &scratch.moe_gate_batch,
+                x_rot: &scratch.rotation,
+            },
         })
     }
 
@@ -6909,6 +6943,77 @@ impl<'a> LayerPhaseEnv<'a> {
 /// a forward with a tap never records or replays a retained body.
 pub type Qwen4QsaTap =
     Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String> + Send>;
+
+/// DFlash2 target features of the forwards that run while it is set
+/// ([`Qwen4Bundle`]'s capturing spec entries arm and clear it): the completed
+/// output of each listed trunk layer, averaged over its hyper-connection
+/// streams, into that layer's slot of `rows[row..]` (F32, `layers.len() *
+/// hidden` per row). Captured eagerly between the interpreter's steps, so the
+/// step program and its fusions are the ones the forward runs without it.
+pub(crate) struct Qwen4LayerCapture {
+    /// Zero-based trunk layers, ascending; `layer + 1` is never the PLE layer.
+    pub(crate) layers: SmallVec<[usize; 8]>,
+    /// F32 rows of the whole forward request (a non-owning view).
+    pub(crate) rows: GpuTensor,
+    /// Request row the running tile starts at (the tile loops set it).
+    pub(crate) row: usize,
+}
+
+/// The interpreter hook of a [`Qwen4LayerCapture`] forward: right before
+/// each target step (the mixer of the layer after a captured one) the
+/// streams hold the captured layer's completed output.
+struct LayerCaptureHooks<'h> {
+    targets: SmallVec<[(*const (), usize); 8]>,
+    fired: u32,
+    streams: &'h GpuTensor,
+    rows: GpuTensor,
+    n: usize,
+    hc: usize,
+    hidden: usize,
+    slots: usize,
+    bf16: bool,
+}
+
+impl LayerCaptureHooks<'_> {
+    fn capture(&self, gpu: &mut Gpu, slot: usize) -> Result<(), DispatchError> {
+        rdna_compute::tensor_ops::hc_mean_capture_f32(
+            gpu,
+            self.streams,
+            &self.rows,
+            self.n,
+            self.hc,
+            self.hidden,
+            self.slots * self.hidden,
+            slot * self.hidden,
+            self.bf16,
+        )
+        .map_err(|error| DispatchError::Hip(format!("Qwen4 layer capture: {error}")))
+    }
+
+    fn missed(&self) -> bool {
+        self.fired != (1u32 << self.targets.len()) - 1
+    }
+}
+
+impl MoeStepHooks for LayerCaptureHooks<'_> {
+    fn before_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn after_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn before_step(&mut self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), DispatchError> {
+        let at = step as *const Step<'_> as *const ();
+        for index in 0..self.targets.len() {
+            let (target, slot) = self.targets[index];
+            if target == at {
+                self.capture(gpu, slot)?;
+                self.fired |= 1 << index;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
@@ -6968,6 +7073,9 @@ pub struct Qwen4GpuForward {
     /// single-token HIP forward, for expert-cache sizing. `None` when unset.
     route_trace: Option<RouteTrace>,
     pub(crate) qsa_tap: Option<Qwen4QsaTap>,
+    /// DFlash2 target-feature capture of the forwards that run while it is
+    /// set; `None` everywhere else (see [`Qwen4LayerCapture`]).
+    pub(crate) layer_capture: Option<Qwen4LayerCapture>,
     /// `HIPFIRE_QWEN4_CUT_LAYERS`, read once at construction: when set, the
     /// program runs as separate interpreter runs split at these layers (eager
     /// only; no retained replay).
@@ -6997,6 +7105,11 @@ pub struct Qwen4GpuForward {
     /// canonical routing rows. Mesh forwards are enqueue-only: no retained
     /// body, no blocking token or PLE upload, no context growth.
     mesh_route_rows: Option<usize>,
+    /// `Some` only inside [`Self::forward_mesh_chunk`]: the segment it runs.
+    mesh_segment: Option<MeshSegment>,
+    /// The first op of the next segment while a mesh band program is part
+    /// way through; `None` between programs.
+    mesh_next_op: Option<u32>,
     /// Fenced async upload of a mesh input band's token ids.
     mesh_tokens: PleHostStage,
     /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
@@ -8330,10 +8443,13 @@ impl Qwen4GpuForward {
             trunk_zba,
             trunk_a4,
             qsa_tap: None,
+            layer_capture: None,
             lane_scope: false,
             prefill_scope: false,
             scope,
             mesh_route_rows: None,
+            mesh_segment: None,
+            mesh_next_op: None,
             mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
             mesh_trunk_ops,
             slowlink: Default::default(),
@@ -8392,6 +8508,34 @@ impl Qwen4GpuForward {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = gpu;
+        Ok(())
+    }
+
+    /// [`Self::begin_npu_trunk_request`]'s request runs the GPU-only
+    /// schedule: no NPU pair is planned or selected for it.
+    pub(crate) fn npu_trunk_request_gpu_only(&mut self, why: &str) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = &mut self.npu_trunk {
+            npu.force_gpu_request(why);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = why;
+    }
+
+    /// The modes the NPU trunk pair executor (layer-major, outside the step
+    /// interpreter) cannot run, checked before a selected pair runs.
+    fn refuse_npu_pair(&self) -> Result<(), Qwen4GpuForwardError> {
+        if self.cut_layers.is_some() {
+            return Err(invalid(format!(
+                "{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route"
+            )));
+        }
+        if self.layer_capture.is_some() {
+            return Err(invalid(
+                "the DFlash2 layer capture cannot run with the NPU trunk pair route \
+                 (its prefill must be planned GPU-only)",
+            ));
+        }
         Ok(())
     }
 
@@ -9318,11 +9462,7 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
-                if self.cut_layers.is_some() {
-                    return Err(invalid(format!(
-                        "{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route"
-                    )));
-                }
+                self.refuse_npu_pair()?;
                 let rows = banks[0] + banks[1];
                 self.note_npu_trunk_pair(banks, bundle.state.position);
                 let final_pair =
@@ -9388,6 +9528,9 @@ impl Qwen4GpuForward {
                     Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
                 })
                 .transpose()?;
+            if let Some(layer_capture) = self.layer_capture.as_mut() {
+                layer_capture.row = offset;
+            }
             let output_policy = if output_rows == Qwen4OutputRows::All || final_chunk {
                 Qwen4OutputPolicy::Rows(output_rows)
             } else {
@@ -9449,11 +9592,7 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
-                if self.cut_layers.is_some() {
-                    return Err(invalid(format!(
-                        "{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route"
-                    )));
-                }
+                self.refuse_npu_pair()?;
                 let rows = banks[0] + banks[1];
                 self.note_npu_trunk_pair(banks, bundle.state.position);
                 self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
@@ -9486,6 +9625,9 @@ impl Qwen4GpuForward {
                     Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
                 })
                 .transpose()?;
+            if let Some(layer_capture) = self.layer_capture.as_mut() {
+                layer_capture.row = offset;
+            }
             self.forward_chunk_inner(
                 bundle,
                 gpu,
@@ -9812,6 +9954,11 @@ impl Qwen4GpuForward {
     /// the epoch's actual rows as its routing rows, exactly like Decode but
     /// for `1..=max_chunk` rows. The output band must carry a head
     /// (verify logits); non-output bands carry none.
+    ///
+    /// `ops` is the segment of the band program (`mesh_op_range` of `head`)
+    /// this call runs: the whole range for a PP band, the ops between two
+    /// collectives for a TP rank. The head ops run with the last segment, so
+    /// no segment may end inside them.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_mesh_chunk(
         &mut self,
@@ -9822,8 +9969,37 @@ impl Qwen4GpuForward {
         route: MeshRoute,
         head: Option<Qwen4MeshHead<'_>>,
         wide_hidden_capture: Option<&GpuTensor>,
+        ops: std::ops::Range<u32>,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.check_mesh_admission(bundle, gpu)?;
+        let full = self.mesh_op_range(head.is_some(), head.is_some_and(|head| head.top1.is_some()));
+        let trunk = self.mesh_trunk_ops.clone();
+        if ops.is_empty()
+            || ops.start < full.start
+            || ops.start > trunk.end
+            || ops.end > full.end
+            || (ops.end > trunk.end && ops.end != full.end)
+        {
+            return Err(invalid(format!(
+                "mesh op range {ops:?} is not a segment of the band program {full:?}"
+            )));
+        }
+        // Segments run in order, each once: a program starts at `full.start`
+        // and continues where the previous segment ended.
+        let expected = self.mesh_next_op.unwrap_or(full.start);
+        if ops.start != expected {
+            return Err(invalid(format!(
+                "mesh op range {ops:?} does not continue the band program at op {expected}"
+            )));
+        }
+        // Op ids map onto the trunk steps after the input band's `Embed`.
+        let first_step = trunk.start + u32::from(self.scope.input);
+        let step = |op: u32| (op.clamp(first_step, trunk.end) - first_step) as usize;
+        let segment = MeshSegment {
+            steps: step(ops.start)..step(ops.end),
+            first: ops.start == full.start,
+            last: ops.end == full.end,
+        };
         let rows = tokens.len();
         if route == MeshRoute::Decode && rows != 1 {
             return Err(invalid("a mesh Decode forward carries exactly one row"));
@@ -9874,6 +10050,7 @@ impl Qwen4GpuForward {
         let prior = (self.prefill_scope, self.mesh_route_rows);
         self.prefill_scope = route == MeshRoute::Prefill;
         self.mesh_route_rows = Some(route_rows);
+        self.mesh_segment = Some(segment);
         let result = self.forward_chunk_inner(
             bundle,
             gpu,
@@ -9885,7 +10062,16 @@ impl Qwen4GpuForward {
             output_policy,
         );
         (self.prefill_scope, self.mesh_route_rows) = prior;
+        self.mesh_segment = None;
+        // A failed segment abandons the program (nothing was committed).
+        self.mesh_next_op = (result.is_ok() && ops.end != full.end).then_some(ops.end);
         result
+    }
+
+    /// Forget a band program left part way through (a reset after a failed
+    /// epoch): the next mesh call starts a new program.
+    pub(crate) fn abandon_mesh_program(&mut self) {
+        self.mesh_next_op = None;
     }
 
     /// Set the Gpu routing scopes one forward of `rows` rows runs under and
@@ -10008,7 +10194,15 @@ impl Qwen4GpuForward {
         );
         self.ensure_cpu_splice_eager(gpu, host_arith_call)?;
         let cpu_deferred_experts = host_arith_call;
-        let ple_lookahead = std::mem::take(&mut self.ple_lookahead);
+        // A mesh segment runs part of the program (see `MeshSegment`); every
+        // other forward is one whole segment.
+        let segment = self.mesh_segment.clone();
+        let (first, last) = segment.as_ref().map_or((true, true), |s| (s.first, s.last));
+        let ple_lookahead = if last {
+            std::mem::take(&mut self.ple_lookahead)
+        } else {
+            Vec::new()
+        };
         if argmax_of.is_some() && tokens.len() != 1 {
             return Err(invalid("an argmax-token Qwen4 forward carries one token"));
         }
@@ -10030,9 +10224,15 @@ impl Qwen4GpuForward {
         }
         let config = bundle.config.clone();
         let band = self.scope.band.clone();
-        let (input, output) = (self.scope.input, self.scope.output);
+        // Only the first segment uploads and embeds the tokens and stages PLE.
+        let (input, output) = (self.scope.input && first, self.scope.output);
         let mesh_route_rows = self.mesh_route_rows;
         let mesh_run = mesh_route_rows.is_some();
+        if self.layer_capture.is_some() && (mesh_run || !input || !output) {
+            return Err(invalid(
+                "the DFlash2 layer capture runs on a whole single-card trunk only",
+            ));
+        }
         if (!input && argmax_of.is_some())
             || (!output
                 && (output_policy.requested_rows(n).is_some() || wide_hidden_capture.is_some()))
@@ -10218,7 +10418,7 @@ impl Qwen4GpuForward {
 
         // The PLE row fetch runs on the row store's worker while the step
         // program is built below; a matching retained lookahead is adopted.
-        let retained = self.ple_ahead.take();
+        let retained = if input { self.ple_ahead.take() } else { None };
         let mut ple = match bundle.ple.as_ref().filter(|_| input) {
             None => {
                 drop(retained);
@@ -10363,7 +10563,8 @@ impl Qwen4GpuForward {
         {
             Some(stage)
                 if n >= stage.min_rows
-                    && (stage.capture || wide_hidden_capture.is_none())
+                    && (stage.capture
+                        || (wide_hidden_capture.is_none() && self.layer_capture.is_none()))
                     && self.qsa_tap.is_none() =>
             {
                 let capturing = match gpu.active_stream.as_ref() {
@@ -10414,6 +10615,16 @@ impl Qwen4GpuForward {
             streams: &self.scratch.streams,
             gates: &self.scratch.hc_gates,
         };
+        // DFlash2 layer capture: each captured layer's slot, keyed by the
+        // step (the next layer's mixer) before which the streams hold its
+        // completed output; the trunk's last layer is captured after the
+        // program instead.
+        let capture_layers: SmallVec<[usize; 8]> = self
+            .layer_capture
+            .as_ref()
+            .map(|capture| capture.layers.clone())
+            .unwrap_or_default();
+        let mut capture_at: SmallVec<[(usize, usize); 8]> = SmallVec::new();
         for layer_index in band.clone() {
             if let Some(cuts) = cut_layers.as_ref() {
                 if cuts.contains(layer_index) {
@@ -10491,6 +10702,20 @@ impl Qwen4GpuForward {
                     });
                 }
             }
+            // DFlash2 layer capture of the previous layer: keyed by this
+            // layer's mixer, the step after `push_mixer_prefix`'s HC read.
+            let captured_slot = layer_index
+                .checked_sub(1)
+                .and_then(|previous| capture_layers.iter().position(|&l| l == previous));
+            if let Some(slot) = captured_slot {
+                if ple_layer_index == Some(layer_index) {
+                    return Err(invalid(format!(
+                        "DFlash2 layer capture of layer {} would include the PLE layer",
+                        layer_index - 1
+                    )));
+                }
+                capture_at.push((steps.len() + 1, slot));
+            }
             layer_env.push_mixer_prefix(&mut steps, layer_index, layer, &description)?;
 
             match &description.ffn {
@@ -10529,6 +10754,17 @@ impl Qwen4GpuForward {
                 dump_ends.push((layer_index, steps.len(), bf16_grouped));
             }
         }
+        let capture_last = capture_layers
+            .iter()
+            .position(|&layer| layer + 1 == band.end);
+        if capture_at.len() + usize::from(capture_last.is_some()) != capture_layers.len()
+            || capture_layers.len() > 32
+        {
+            return Err(invalid(format!(
+                "DFlash2 layer capture {capture_layers:?} is outside trunk layers {}..{}",
+                band.start, band.end
+            )));
+        }
         validate_steps(gpu, &steps).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("preflight Qwen4 typed program: {error:?}"))
         })?;
@@ -10555,6 +10791,25 @@ impl Qwen4GpuForward {
                     position,
                 ));
             }
+        }
+        // A mesh segment executes only its steps; the QSA commit above is of
+        // the whole program and lands with the last segment.
+        if let Some(segment) = segment.as_ref().filter(|s| !(s.first && s.last)) {
+            if segment.steps.end > steps.len() || (segment.last && segment.steps.end != steps.len())
+            {
+                return Err(invalid(format!(
+                    "mesh segment steps {:?} do not fit the {}-step band program",
+                    segment.steps,
+                    steps.len()
+                )));
+            }
+            if !dump_ends.is_empty() {
+                return Err(invalid(
+                    "the chunk dump (HIPFIRE_CHUNK_DUMP_DIR) cannot run a mesh segment",
+                ));
+            }
+            steps.truncate(segment.steps.end);
+            steps.drain(..segment.steps.start);
         }
         // A HIP body: no retained tape records or routes this forward.
         let hip_body = n == 1
@@ -10702,11 +10957,9 @@ impl Qwen4GpuForward {
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
         // Boundary samples, hoisted so the post-body finalize outside this closure
-        // can report them: they are taken where the window opens, which is what
-        // makes the census an exact bracket of one recorded body.
+        // can report them: they are taken where the window opens.
         let mut device_read: Option<u32> = None;
         let mut diagnostic_capture = false;
-        let mut launched_before = 0u64;
         let mut traced = false;
         let attempt = (|| -> Result<
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
@@ -10849,6 +11102,7 @@ impl Qwen4GpuForward {
                 && self.qsa_tap.is_none()
                 && !mesh_run
                 && self.cut_layers.is_none()
+                && self.layer_capture.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
             // `HIPFIRE_QWEN4_CUT_LAYERS` is the cut-safe eager schedule: refuse
             // every route that would execute the program some other way.
@@ -10901,7 +11155,6 @@ impl Qwen4GpuForward {
                         // on first use; materialize them before the window opens so
                         // that memset is not state the tape would have to replay.
                         rdna_compute::tensor_ops::ensure_gdn_pair_counters(gpu)?;
-                        launched_before = hip_bridge::launch_counters::launch_kernel::count();
                         gpu.replay
                             .begin_auto_capture_if_armed()
                             .map_err(|reason| invalid(reason))?;
@@ -10995,8 +11248,32 @@ impl Qwen4GpuForward {
                 // Parity harness only: a QSA projection hook counts slots from
                 // each forward's first QSA step (no-op with no hook installed).
                 hipfire_dispatch::pipeline::reset_qsa_projection_slot();
-                let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
-                    execute_validated_steps(gpu, &ctx, steps).map_err(|error| {
+                let mut capture_hooks =
+                    self.layer_capture.as_ref().map(|capture| LayerCaptureHooks {
+                        targets: capture_at
+                            .iter()
+                            .map(|&(at, slot)| (&steps[at] as *const Step<'_> as *const (), slot))
+                            .collect(),
+                        fired: 0,
+                        streams: &self.scratch.streams,
+                        rows: capture.rows.sub_offset(
+                            capture.row * capture_layers.len() * config.hidden_size,
+                            n * capture_layers.len() * config.hidden_size,
+                        ),
+                        n,
+                        hc: dims.hc_count,
+                        hidden: config.hidden_size,
+                        slots: capture_layers.len(),
+                        bf16: bf16_state,
+                    });
+                let mut execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
+                    match capture_hooks.as_mut() {
+                        Some(hooks) => {
+                            execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, hooks)
+                        }
+                        None => execute_validated_steps(gpu, &ctx, steps),
+                    }
+                    .map_err(|error| {
                         Qwen4GpuForwardError::Dispatch(format!(
                             "execute Qwen4 layer program: {error:?}"
                         ))
@@ -11061,6 +11338,9 @@ impl Qwen4GpuForward {
                         moe: &self.moe,
                         layer: 0,
                         error: None,
+                        capture: capture_hooks
+                            .as_mut()
+                            .map(|hooks| hooks as &mut dyn MoeStepHooks),
                     };
                     let mut run = |gpu: &mut Gpu, steps: &[Step<'_>]| {
                         execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
@@ -11178,9 +11458,21 @@ impl Qwen4GpuForward {
                         (None, None) => execute(gpu, &steps)?,
                     }
                 }
+                if let Some(hooks) = capture_hooks.as_ref() {
+                    if hooks.missed() {
+                        return Err(invalid(
+                            "DFlash2 layer capture: a capture boundary ran inside a fused step",
+                        ));
+                    }
+                    if let Some(slot) = capture_last {
+                        hooks.capture(gpu, slot).map_err(|error| {
+                            Qwen4GpuForwardError::Dispatch(format!("{error:?}"))
+                        })?;
+                    }
+                }
             }
 
-            if let Some(capture) = wide_hidden_capture.as_ref() {
+            if let Some(capture) = wide_hidden_capture.as_ref().filter(|_| last) {
                 let wide_elements = n * wide;
                 let source = view(&self.scratch.streams, 0, wide_elements);
                 let destination = f32_view(capture, 0, wide_elements);
@@ -11196,7 +11488,7 @@ impl Qwen4GpuForward {
                 }
             }
 
-            if let Some(requested_rows) = requested_rows {
+            if let Some(requested_rows) = requested_rows.filter(|_| last) {
                 let final_hyper = final_hyper
                     .as_ref()
                     .ok_or_else(|| invalid("Qwen4 final hyper disappeared before execution"))?;
@@ -11281,6 +11573,11 @@ impl Qwen4GpuForward {
                 if let Some(ple) = ple.as_mut() {
                     ple.complete();
                 }
+                if !last {
+                    // Positions, QSA marks and PLE history commit once, with
+                    // the last segment.
+                    return Ok(());
+                }
                 for (slot, full_len, raw_len, pooled_len, selected_len, position) in qsa_commits {
                     let state = bundle
                         .state
@@ -11324,7 +11621,7 @@ impl Qwen4GpuForward {
                 // that knows both ends of one recorded body, so the window can never
                 // outlive the forward that opened it.
                 if gpu.replay.should_auto_finalize_capture() {
-                    finish_qwen4_capture(gpu, diagnostic_capture, launched_before);
+                    finish_qwen4_capture(gpu, diagnostic_capture);
                 }
                 if traced {
                     self.write_route_trace(gpu, next_position)?;
@@ -11367,67 +11664,24 @@ impl Qwen4GpuForward {
     }
 }
 
-/// A recorded capture body that cannot become a prepared tape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureCensusError {
-    /// The recorder saw a different number of launches than the body issued
-    /// (#397-style truncated tape).
-    LaunchMismatch { launched: usize, recorded: usize },
-}
-
-impl fmt::Display for CaptureCensusError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LaunchMismatch { launched, recorded } => write!(
-                f,
-                "qwen4 capture census mismatch: {launched} launched, {recorded} recorded \
-                 (truncated tape refused)"
-            ),
-        }
-    }
-}
-
-/// Fail closed on a census mismatch: poison the retained route (sticky HIP
-/// fallback) so the tape is never closed, prepared or installed.
-fn gate_capture_census(
-    replay: &mut ReplayController,
-    launched: usize,
-    recorded: usize,
-) -> Result<(), CaptureCensusError> {
-    if launched == recorded {
-        return Ok(());
-    }
-    let error = CaptureCensusError::LaunchMismatch { launched, recorded };
-    replay.poison(error.to_string());
-    Err(error)
-}
-
 /// Close a recorded Qwen4 body: census, then install the prepared plan, or refuse
 /// it for a measurement-only capture.
 ///
 /// Prepare failure after a successful HIP warmup poisons the route (sticky
-/// fallback) rather than failing the request that already produced output.
-fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before: u64) {
-    let launched = hip_bridge::launch_counters::launch_kernel::count();
+/// fallback) rather than failing the request that already produced output; a
+/// window that launched more kernels than it recorded is one such failure.
+fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
     let effects = gpu.replay.capture_window_effects();
     let summary = gpu.replay.capture_summary();
-    let recorded = summary.launch_count;
-    let computed = launched.saturating_sub(launched_before) as usize;
     eprintln!(
-        "[redline] qwen4 capture census: computed={computed} recorded={recorded} \
+        "[redline] qwen4 capture census: computed={} recorded={} \
          unique_kernels={} sequence_hash={:016x}",
-        summary.unique_kernel_count, summary.sequence_hash
+        effects.launches, summary.launch_count, summary.unique_kernel_count, summary.sequence_hash
     );
     eprintln!(
         "[redline] qwen4 capture census: effects inside window — htod={} dtod={} dtoh={} memset={}",
         effects.htod, effects.dtod, effects.dtoh, effects.memset
     );
-    if computed != recorded {
-        eprintln!(
-            "[redline] qwen4 capture census: MISMATCH — {computed} launched, {recorded} recorded \
-             (#397-style truncated tape)"
-        );
-    }
     if !effects.replayable() {
         eprintln!(
             "[redline] qwen4 capture census: effect-incomplete — {} device copy(ies), {} readback(s) \
@@ -11441,12 +11695,6 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
                       HIP)";
         gpu.replay.poison(reason);
         eprintln!("[redline] qwen4: {reason}");
-        return;
-    }
-    // A truncated tape must never be prepared: refuse before the sync, close
-    // and prepare below so no plan can be installed from it.
-    if let Err(error) = gate_capture_census(&mut gpu.replay, computed, recorded) {
-        eprintln!("[redline] falling back to HIP: {error}");
         return;
     }
     if let Err(reason) = gpu.hip.device_synchronize() {
@@ -11480,48 +11728,6 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool, launched_before
             gpu.replay.poison(reason.clone());
             eprintln!("[redline] falling back to HIP: {reason}");
         }
-    }
-}
-
-#[cfg(test)]
-mod capture_census_tests {
-    use super::{gate_capture_census, CaptureCensusError};
-    use rdna_compute::replay::{ReplayBackendRequest, ReplayController, ReplayState};
-
-    #[test]
-    fn census_mismatch_poisons_route_and_refuses_tape() {
-        let mut replay = ReplayController::new(ReplayBackendRequest::Auto);
-        assert_eq!(replay.state(), ReplayState::RecordingWarmup);
-        let error = gate_capture_census(&mut replay, 7, 5).unwrap_err();
-        assert_eq!(
-            error,
-            CaptureCensusError::LaunchMismatch {
-                launched: 7,
-                recorded: 5
-            }
-        );
-        let text = error.to_string();
-        assert!(
-            text.contains("7 launched") && text.contains("5 recorded"),
-            "{text}"
-        );
-        // Poisoned: the route is on HIP, the capture can no longer be closed
-        // into a tape, and the reason carries both counts.
-        assert_eq!(replay.state(), ReplayState::Fallback);
-        assert!(replay.finish_capture().is_err());
-        let reason = replay.fallback_reason().expect("fallback reason");
-        assert!(
-            reason.contains("7 launched") && reason.contains("5 recorded"),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn census_equal_is_accepted_without_touching_route() {
-        let mut replay = ReplayController::new(ReplayBackendRequest::Auto);
-        assert_eq!(gate_capture_census(&mut replay, 5, 5), Ok(()));
-        assert_eq!(replay.state(), ReplayState::RecordingWarmup);
-        assert!(replay.fallback_reason().is_none());
     }
 }
 
