@@ -125,12 +125,16 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`**; Qwen3.8-27B tiers with a registry-declared draft resolve `auto` through the registry layer; `off` beats it | Schema alias of `speculation.dflash` ([`CONFIG.md`](CONFIG.md#qwen38-27b-paired-dflash-default)). `on` requires a DFlash draft and refuses without one; it never aliases to native MTP. Use `--spec mtp` / `speculation.mtp=on` for native MTP. |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | **kill switch**; `=0` forces the fixed full block, any other value or unset defers to the setting | Read through the `[developer]` namespace (lifecycle `developer`; it is **not** a schema alias — the schema key is `speculation.dflash_adaptive_b`, stable, default `false` = fixed block, listed in the [`CONFIG.md`](CONFIG.md#lifecycle-status) table with no env column). `=0` overrides an enabled `dflash_adaptive_b` load param/setting; it cannot turn adaptive on. Adaptive is also auto-suppressed on retained-PM4 verify loads (replay needs the fixed B=16 shape). |
+| `HIPFIRE_DFLASH_CYCLE_TRACE` | **unset / off**; `<path>` appends per-cycle JSONL (developer) | Diagnostic only, read through the `[developer]` namespace. `DflashSpeculator` (qwen35) appends one JSON line per `prefill` / chain `step` cycle / forced advance / `reset` (seed, position, drafted, accepted, committed, host `step_us`; the prefill line carries the full prompt ids). Unset: one lazy read, no allocation or behaviour change; an unopenable path logs once and disables tracing. |
 | `HIPFIRE_DFLASH_BLOCK` | **`auto`**; `auto` or `4`–`16`; **`16` is the kill switch** (previous fixed width) | Schema alias of `speculation.dflash_block` ([`CONFIG.md`](CONFIG.md#mechanism-knobs)): the DFlash2 proposal width L of one load, chosen per serving configuration and never per live batch, so batched VMM lanes and singletons of the same load run the same L and stay byte-identical. `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` ≥ 4, else 16 (resolved by the daemon from the staged route). Legacy DFlash drafts keep their declared width; the retained-PM4 verify route and dense TP2 need 16; experimental multi-slot admits only 16. |
+| `HIPFIRE_DFLASH_LOOKUP` | **auto** (on); `on`/`1` arms, `off`/`0` disables | `speculation.dflash_lookup` (`on`/`off`/`auto`, also `1`/`0`; env beats TOML beats default; [`CONFIG.md`](CONFIG.md#mechanism-knobs)): request-local verbatim-copy lookup (`MtpCopyContext`, triple 5/1/63) composed into the dense Qwen3.5-class DFlash2 singleton verify window — a Copy window (lookup candidates replace the learned ones) or a Tail window (first K learned candidates plus a lookup tail, K+L ≤ 15, ≤ 16 rows), chosen per window by `hipfire_runtime::spec_lookup` only when measured acceptance per measured window price pays. No lookup proposal ⇒ the incumbent window byte-for-byte. Armed only on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no VMM/CB lane, no dense-TP mesh, no CACTUS); one load line `[dflash] lookup: armed (copy+tail, rows<=16)` / `[dflash] lookup: off (<reason>)`. |
+| `HIPFIRE_SPEC_LOOKUP_TAIL` | **on** when lookup is armed; `=0` disables only the Tail windows (Copy windows stay) | Developer kill switch read through the `[developer]` namespace (`hipfire_config::dflash_lookup_tail_enabled`); no effect unless `speculation.dflash_lookup` is on. |
 | `HIPFIRE_DFLASH_ONLINE_TUNE` | **unset / off**; `stats` or `on` | Developer-only online draft tuning (`crates/hipfire-runtime/src/dflash_online.rs`). Covers Qwen3.5 chain DFlash on the greedy batched LM-head path, and the generic (llama-family) DFlash chain at greedy and temp>0. Takes the draft's top-16 per row on device and re-ranks it on the host with a per-request model trained from tokens the target already verified. Features: chain n-grams, suffix match, stutter, neighbour-row tokens. Verify is unchanged. `stats` keeps argmax proposals and prints acceptance-ceiling stats. `sweep` drafts a token the target never picks, so a dump records the draft's top-K at every position for `--simulate`. Learner weights carry across requests; session text statistics reset per request. `HIPFIRE_DFLASH_ONLINE_HP=lr=..,acc0=..,margin=..,inject=..,carry=0|1` overrides learner settings. `HIPFIRE_DFLASH_ONLINE_DUMP=<file>` writes records for `examples/dflash_online_replay.rs`. |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash and MTP divergent-render resume |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
+| `HIPFIRE_SPEC_RETIRE` | **unset → `1.5`**; `off`/`0` disables; `<base>[,<per_1k_ctx>]` sets the break-even line | Per-request spec → AR retirement (`crates/hipfire-runtime/src/spec_retire.rs`) for greedy requests on Qwen3.5-family DFlash and generic (llama-family) DFlash. Every 16 spec cycles the request's mean committed tokens per cycle is compared with `base + per_1k_ctx × position / 1024`; two failing windows in a row switch the rest of the request to target-only AR tokens (draft context kept in sync). Token counts only, so a greedy request retires at the same cycle on every run. The default retires drafters that commit under 1.5 tokens per cycle, below the smallest measured cycle/AR cost ratio (gfx1151 Qwen3.8-27B: 1.53–1.73 up to 32K). `done` carries `spec_retired`, `spec_retired_at` and `ar_tokens` when a request retired; serve exports `hipfire_spec_retired_total`. Malformed values turn retirement off with a log line. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
-| `HIPFIRE_GFX1151_XLDS` | **on** for exact gfx1151; `0` opts out (developer) | Exact-gfx1151 1..=16-row MQ4G256V2 WMMA GEMMs (gate_up, qkvza, qkv, residual, including the verify lm_head; K % 256 == 0) launch `gemm_*_mq4g256v2_wmma_gfx1151_xlds` (4 waves x 16 rows per block, X slab staged in LDS once per block) instead of the one-wave base kernels. Per-output WMMA chain, K order, dequant values and epilogue are the base kernels', so outputs are byte-identical. Eager and HipGraph capture (DFlash verify graph) take the route; Redline replay recording keeps the base kernels. Other arches are unchanged. `0` restores the base kernels. Oracle: `rdna-compute/examples/test_mq4v2_xlds_gfx1151` (`--features lab`). |
+| `HIPFIRE_GFX1151_XLDS` | **on** for exact gfx1151; `0` opts out (developer) | Exact-gfx1151 1..=16-row MQ4G256V2 WMMA GEMMs (gate_up, qkvza, qkv, residual, including the verify lm_head; K % 256 == 0) launch `gemm_*_mq4g256v2_wmma_gfx1151_xlds` (4 waves x 16 rows per block, X slab staged in LDS once per block) instead of the one-wave base kernels; the Q8_0 `gemm_q8_0_wmma` (DFlash draft/verify lm_head of Q8-head models such as `qwen3.8-27b.mq4`; 16 B aligned weights) likewise launches `gemm_q8_0_wmma_gfx1151_xlds`. Per-output WMMA chain, K order, dequant values and epilogue are the base kernels', so outputs are byte-identical. Eager and HipGraph capture (DFlash verify graph) take the route; Redline replay recording keeps the base kernels. Other arches are unchanged. `0` restores the base kernels. Oracles: `rdna-compute/examples/test_mq4v2_xlds_gfx1151` and `bench_q8_lmhead_rows` (`--features lab`). |
 | `HIPFIRE_CB_VERIFY_CHUNK128` | **unset / off**; `1` opts in (developer) | VMM continuous-batching DFlash verify only (not MTP): admits exact 64..=128-row aggregated verify chunks on exact gfx1201, dense MQ4G256V2 targets, through the explicit `gemm_*_verify_exact` kernels (128 rows per chunk instead of 63). Needs `HIPFIRE_WMMA_BATCH_TILES`. Byte-identical to the 63-row route. Unset/`0` keeps every existing route. Oracles: `cb_verify_gemm_oracle` (kernel bytes) and `cb_vmm_state_oracle` (state). |
 | `HIPFIRE_CB_VERIFY_PM` | **on** inside `HIPFIRE_CB_VERIFY_CHUNK128`; `0` opts out (developer) | Selects the embedded PeaceMaker twins for the 64..=128-row exact verify kernels; `0` runs the byte-identical hipcc `_k32` twins. No effect unless the wide verify route is on. Never selects IU4/FP8; a missing PM image is a load error, not a fallback. |
 | `HIPFIRE_CB_VERIFY_FP8` | **unset / off**; `1` opts in (developer) | 27B Qwen3.5-hybrid target verify on exact gfx1201 with symmetric MQ4G256V2 weights (DFlash and MTP; singleton = 16 rows, continuous batching = up to 128 rows), including the verify lm_head: the dense verify GEMMs run the embedded PeaceMaker FP8 family (`mq4_fp8_verify_*_pm_gfx1201_bt{BT}w{W}`: weights dequantized exactly to E4M3, per-row E4M3 activations, `v_wmma_f32_16x16x16_fp8_fp8`) whose per-output reduction order is fixed for every row count 1..=128, so batched rows are byte-identical to singleton rows by construction. Not byte-identical to the F16 verify routes (FP8 activation rounding). Fails closed: the scope refuses off-arch / asymmetric artifacts, a missing bundle or symbol is an error, and F16-input GEMM entries error inside the scope. `HIPFIRE_CB_VERIFY_PM` does not apply. Unset/`0` keeps every existing route. Route receipt: `Gpu::fp8_verify_receipt` and one stderr line `[cb-verify-fp8] FP8 verify GEMM route active`. |
@@ -480,7 +484,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_IDLE_TIMEOUT` | Serve idle unload seconds |
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
-| `HIPFIRE_SERVE_VMM_BATCH` | Compatibility spelling of `serve.vmm_batch` (default off, experimental): the VMM continuous-batching route for concurrent requests. Also gates the Flash-Next (qwen4, arch 16) exact AR fn-lanes route, which additionally needs `serve.continuous_batch_size >= 2` (greedy text chat only; see [SERVE.md](SERVE.md#flash-next-exact-lane-batching-qwen4-arch-16)). `0` stages no lane store and keeps the serial singleton route. |
+| `HIPFIRE_SERVE_VMM_BATCH` | Compatibility spelling of `serve.vmm_batch` (default off, experimental): the VMM continuous-batching route for concurrent requests. Qwen dense uniform MQ4G256V2 also admits exact gfx1100 with Q8 VMM KV: complete singleton target layers run per lane, with no cross-request DFlash/MTP verification installed; Q8 recurrent state requires error feedback, otherwise serve staging keeps the singleton route. Also gates the Flash-Next (qwen4, arch 16) exact AR fn-lanes route, which additionally needs `serve.continuous_batch_size >= 2` (greedy text chat only; see [SERVE.md](SERVE.md#flash-next-exact-lane-batching-qwen4-arch-16)). `0` stages no lane store and keeps the serial singleton route. |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
 | `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100, exact-gfx1201 or (opt-in) exact-gfx1151 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, HIP graph capture off, retained replay recording off) attend step leaves the batched flash kernel for the multi-row tile; default `4096` on gfx1100/gfx1201, unset on gfx1151 (setting any value > 0 opts gfx1151 in), `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
@@ -504,7 +508,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_MTP_TRACE=1` | Per-cycle MTP draft/verify trace on stderr. |
 | `HIPFIRE_DEBUG_POOL_INVARIANTS=1` | Multi-slot engine: assert page-pool / slot-lease invariants after every scheduler tick (debug; slow). |
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
-| `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): one `HIPFIRE_MODULE_LOAD_AUDIT` stderr line per HIP module load (module, symbol, source SHA-256, recipe flags), per `hipModuleLoad`/`hipModuleLoadData` (handle, path or image FNV-1a; embedded PeaceMaker images included) and per resolved symbol, for offline route-closure audits of `kernel_registry::route_entries` and of the load-time barrier (a closed route shows every load before `loaded` and none after). Never set in production or timing runs. |
+| `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): records HIP recipes, module handles/images and resolved symbols for offline route-closure audits. Qwen3.5-family loads also print `route plan axes:` with the resolved architecture, heads, speculation route, context ceiling, KV/state formats, backend and prefill chunk, including when `HIPFIRE_ROUTE_PLAN=0` is used. A sealed route has every planned module bound before `loaded` and no unplanned loads afterwards. Never set in production or timing runs. |
 
 Flash-Next/Qwen4 PP native MTP is greedy-only; sampled/penalized requests
 decode AR through the same PP mesh instead of failing the request. The route
@@ -591,7 +595,8 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_KERNEL_CACHE` | Kernel cache dir (`var_os`) |
 | `HIPFIRE_PACK_JOBS` | Kernel-pack builder only: positive worker count, bounded by CPU affinity and available RAM (~1.5 GiB/job). Defaults to `available_parallelism()` minus a reserve of at least one core (one per eight cores). `build-kernel-pack.sh` treats this as the total budget shared by concurrent architectures. |
 | `HIPFIRE_JIT_JOBS` | Load-time JIT and synchronous batch compiles: positive worker count. Default `available_parallelism()` minus one core per eight (at least one); always clamped to CPU affinity and to `(MemAvailable − CMA − reserve) / 1.5 GiB`, honoring a tighter cgroup limit; unknown RAM admits one job. Reserve is 1 GiB, plus 2 GiB of loader staging headroom while compiles overlap the weight load. `1` disables concurrency but keeps the pre-ready barrier (it never restores post-ready lazy JIT). `0` or a non-integer fails the load before any GPU allocation. Not read by the pack builder (`HIPFIRE_PACK_JOBS`). |
-| `HIPFIRE_ROUTE_PLAN=0` | Developer kill switch for the load-time kernel barrier: every load keeps lazy per-kernel loading (`kernels: … [no closed route plan: HIPFIRE_ROUTE_PLAN=0]`). `scripts/route_plan_walk.py` sets it so a walk observes the route's whole lazy closure, not a checked-in plan's preload. Unset or `1` uses closed plans. |
+| `HIPFIRE_ROUTE_PLAN=0` | Developer kill switch for load-time kernel preparation: every load keeps lazy per-kernel loading. `scripts/route_plan_walk.py` sets it to observe actual dispatch rather than preload. Unset or `1` enables exact plans and open-route predictive preparation. Never set in production. |
+| `HIPFIRE_ROUTE_PLAN_SEAL=1` | Developer-only strict replay of an exact route plan, without predictive extras. `scripts/route_plan_walk.py --sealed` sets it to prove every replayed request uses only planned kernels. A refused, open, mismatched or incomplete replay cannot certify a `#! sealed` plan. Never set in production. |
 | `HIPFIRE_NO_DEVICE_COMPILER=1` | Require verified installed kernel objects instead of JIT; a missing/stale index, wrong symbol/source/flags/profile/ABI/toolchain identity or object SHA-256 fails before HIP loads it. Hot JIT keys remain toolchain-specific. |
 | `HIPFIRE_*_DUMP` / `*_TRACE` / `*_PROFILE` | Diagnostic families — see inventory |
 
@@ -609,42 +614,55 @@ For release tarballs, `scripts/build-kernel-pack.sh --tag TAG --jobs 3
 gfx1201 gfx1100 gfx1151` builds up to three architectures concurrently, splitting
 the total CPU/RAM budget between them rather than launching three full pools.
 
-**Load-time kernel barrier (limited routes).** For a load whose kernel route
-is closed by `kernel_registry::route_entries` — Qwen3.6-27B MQ4G256V2 XTS on
-exact gfx1201 (single GPU, native fp8 K/V, Q8 DeltaNet state, AR or native
-MTP), and Qwen3.8-Flash-Next on exact gfx1201 (the canonical GPTQ3 header
-layout, single GPU, the walked QSA/GDN/KV-backend axes, default MTP K,
-`max_seq` up to the walked 131072, AR or native MTP with n-gram), both with
-default feature flags — the common loader starts the
-route's missing hipcc compiles during the weight load (`HIPFIRE_JIT_JOBS`
-workers), then, before the first model or load-transform dispatch, loads every
-planned HIP and embedded PeaceMaker module and binds every planned symbol. The
-`loaded` acknowledgment waits for weights and kernels; afterwards an unplanned
-kernel request fails instead of compiling or loading between dispatches (27B),
-or, on the open Flash-Next plan, loads lazily with one
-`kernels: WARNING unplanned kernel …` line and a count. If
-no worker fits alongside the weight load but one fits before it, the whole
-plan is compiled and loaded before weights; if none fits, the load fails
-before any allocation. Verified installed packs still satisfy the plan with
-zero compiler processes. Every other route (other models/arches, DFlash,
-DDTree, DSpark, n-gram, CASK, adaptive KV, vision, non-default flags, pp>1,
-EP, a Flash-Next trunk overlay or retained Redline route) logs `kernels: no
-closed route plan (...)` and keeps lazy per-kernel JIT; staging Flash-Next
-fn-lanes (`serve.vmm_batch`) returns a planned load to lazy loading.
-This is a cold-start/readiness change, not a steady-state speedup.
+**Load-time kernel barrier.** The common loader prepares predictable kernels
+before acknowledging `loaded`. Exact routes selected by
+`kernel_registry::route_entries` use their header, architecture, policy and
+walked-context gates; a sealed route rejects an unplanned kernel after ready.
+Every open or unsupported route prepares the architecture's entire exact HIP
+registry inventory, excluding modules already in its plan and HIP modules
+replaced by accepted native twins. A family trace never limits this compile
+set: newly registered predictable kernels must not fall through to a request.
+For an exact plan, family traces and matching walked rows prove which
+unambiguous, route-compatible symbols may bind eagerly. Unproven exports stay
+compile-only until selected. Predictions are not closure proofs; genuinely
+unpredicted kernels remain lazy and identify their phase in the log.
 
-The Flash-Next plan is generated, not written by hand:
-`scripts/route_plan_walk.py` drives the real dispatch through the route's
-request axes (every prompt row count to 300 and the chunk/staging tails,
-decode contexts to 120K, greedy and nine sampling variants, n-gram copies,
-session resumes, long-context QSA) under `HIPFIRE_MODULE_LOAD_AUDIT=1`, and
-`scripts/route_plan_build.py` turns the walks into
-`crates/rdna-compute/src/route_plans/<family>.<arch>.tsv`. Each row records
-the effective source or image SHA-256; a row that no longer matches the
-registry refuses the plan (lazy loading) and fails
-`cargo test -p rdna-compute --test fn_route_plan`, which also checks that
-every planned HIP module is a release-pack entry. Regenerate the plan after a
-change to the Flash-Next dispatch or its kernel sources.
+Missing compiles overlap the weight sweep using the bounded
+`HIPFIRE_JIT_JOBS` budget. If no worker fits alongside weights but one fits
+before them, preparation runs before weights. If neither budget fits, or a
+predicted compile fails, the load fails instead of deferring that work to the
+first request. Verified installed packs satisfy matching recipes without
+compiler processes. Readiness logs identify the prediction basis, modules
+prepared before ready, eager bindings and compile-only modules. A
+`<module>: hipcc compiled (<arch>, key <effective-key>)` line records an actual
+cache-miss compiler run; cache hits and embedded-image loads never emit it.
+Unplanned-request counters include binds and image loads, not just compiles.
+`HIPFIRE_ROUTE_PLAN=0` remains the explicit developer route-walking opt-out,
+not a product cold-start policy.
+
+See [the artifact inventory](first-request-jit-inventory.md) for exact shipped
+identities and plan coverage. A pack's module inventory is not proof that a
+model's route is closed. This is a cold-start/readiness change, not a
+steady-state speedup.
+
+Walked plans are generated, not written by hand:
+`scripts/route_plan_walk.py` drives real dispatch through the route's request
+axes under `HIPFIRE_MODULE_LOAD_AUDIT=1`, and
+`scripts/route_plan_build.py` records the exact header layout, architecture,
+resolved policy axes, walked context ceiling and source/image identities in
+`crates/rdna-compute/src/route_plans/<family>.<arch>.tsv`. Flash-Next records
+its QSA/GDN axes; dense 27B and A3B additionally pin head geometry, expert
+geometry/placement, KV formats, state format, backend and prefill chunk.
+Native-MTP head metadata is fingerprinted separately where needed.
+
+An initial walk produces an open plan. Replay it with
+`route_plan_walk.py --sealed`, then pass the successful replay to
+`route_plan_build.py --sealed-replay ROUTE=DIR` to certify `#! sealed` for
+that route. A predicted, mismatched or unplanned replay cannot certify closure.
+Stale source/image identities refuse the exact plan and use open predictive
+preparation instead; the route-plan CPU tests reject stale checked-in rows.
+Regenerate after changing dispatch or kernel sources. Pack membership and
+real route closure are separate requirements.
 
 To build a compiler-free `gfx1201` RMSNorm package for the production
 `Gpu::rmsnorm_f32` route, run
@@ -658,6 +676,9 @@ A compiler-free `daemon --precompile --module rmsnorm_f32` probes the real
 `Gpu::rmsnorm_f32` kernel load and verifies numerical output. The installed
 objects must be beside the actual daemon executable, not merely in the CWD;
 the cache override controls only writable hot JIT entries.
+The runtime never writes under the installed pack: a rejected or stale packaged
+object is rebuilt into the hot cache only, so repair an install by re-running the
+installer (or `hipfire kernel-pack install`), not by relying on a runtime refresh.
 Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
 `HIPFIRE_MOE_*` levers are **research/power-user**. Centralized
 `FeatureFlags` controls now have typed TOML keys under `kernel` or
@@ -822,7 +843,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1699
+**Count:** 1707
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1126,11 +1147,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_slot.rs | deprecated |
+| `HIPFIRE_DFLASH_CYCLE_TRACE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_DEVICE_ACCEPT` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-arch-qwen35/tests/sampled_dflash_device_accept_hw.rs | developer |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_DFLASH_LEGACY_PREFILL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs | developer |
+| `HIPFIRE_DFLASH_LOOKUP` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DFLASH_LOOP_BREAK` | crates/hipfire-runtime/examples/dflash_spec_demo.rs | harness |
 | `HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS` | crates/hipfire-runtime/examples/dflash_spec_demo.rs | harness |
 | `HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY` | crates/hipfire-runtime/examples/dflash_spec_demo.rs | harness |
@@ -1145,7 +1168,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DFLASH_OFF` | scripts/serve-loop-gate.sh | harness |
 | `HIPFIRE_DFLASH_ONLINE_DUMP` | crates/hipfire-runtime/examples/dflash_online_replay.rs, crates/hipfire-runtime/src/dflash_online.rs | developer |
 | `HIPFIRE_DFLASH_ONLINE_HP` | crates/hipfire-runtime/src/dflash_online.rs, scripts/dflash_online_tune/online_ab.sh | developer |
-| `HIPFIRE_DFLASH_ONLINE_TUNE` | crates/hipfire-runtime/examples/dflash_online_replay.rs, crates/hipfire-runtime/src/dflash.rs | developer |
+| `HIPFIRE_DFLASH_ONLINE_TUNE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/dflash_online_replay.rs | developer |
 | `HIPFIRE_DFLASH_ORDERED_DRAFT` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/examples/dflash_draft_graph_replay.rs | developer |
 | `HIPFIRE_DFLASH_PREFILL_DEVICE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/tests/dflash_prefill_scatter.rs | developer |
 | `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-arch-qwen35/tests/dflash_prefill_scatter.rs | developer |
@@ -2309,6 +2332,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ROUTER_SHARED_SILU_MQ_ROTATE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROUTE_ORACLE_KV_B` | crates/hipfire-arch-qwen35/tests/route_oracle_single.rs | harness |
 | `HIPFIRE_ROUTE_PLAN` | crates/hipfire-loader/src/lib.rs, scripts/route_plan_walk.py | developer |
+| `HIPFIRE_ROUTE_PLAN_SEAL` | crates/hipfire-loader/src/lib.rs, scripts/route_plan_walk.py | developer |
 | `HIPFIRE_ROWS_CQN` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_ROWS_FA_PREP` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_ROWS_GATED_NORM` | crates/rdna-compute/src/rows_batched.rs | developer |
@@ -2406,7 +2430,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SMOKE_PROMPT` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/saddle-lab/examples/a3b_smoke_forward.rs | developer |
 | `HIPFIRE_SMOKE_STEPS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/saddle-lab/examples/a3b_smoke_forward.rs | developer |
 | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | stable |
+| `HIPFIRE_SPEC_LOOKUP_TAIL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
+| `HIPFIRE_SPEC_RETIRE` | crates/hipfire-generate/src/qwen.rs | developer |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
@@ -2418,9 +2444,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_T5_GPU` | crates/hipfire-arch-diffusion/examples/gpu_pipeline_parity.rs, crates/hipfire-arch-diffusion/src/pipeline.rs | developer |
 | `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs, scripts/kernel_atlas.py | developer |
 | `HIPFIRE_TEMP` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
+| `HIPFIRE_TEST_DRAFT` | crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
 | `HIPFIRE_TEST_MODEL` | scripts/test-ds4-heterogeneous-abort-resume.sh, scripts/test-qwen35-abort-resume.sh | harness |
 | `HIPFIRE_TEST_REAL_HIPCC` | crates/rdna-compute/src/compiler.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_TEST_REQUIRE_ROCM` | crates/peacemaker-cdna/src/oracle.rs, crates/peacemaker-cdna/tests/enc_sop.rs | developer |
+| `HIPFIRE_TEST_TARGET` | crates/hipfire-arch-qwen35/tests/dflash_lookup_state_oracle.rs | harness |
 | `HIPFIRE_TEXT_OUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs | developer |
 | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/cli.rs | developer |

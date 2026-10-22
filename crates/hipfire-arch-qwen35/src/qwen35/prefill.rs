@@ -5821,6 +5821,7 @@ fn batch_chunk_full_attn_fallback(
 }
 
 #[allow(clippy::too_many_arguments)]
+
 fn batch_chunk_final_logits(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -6775,6 +6776,7 @@ fn forward_prefill_chunk_pair(
                         BatchSemantics::Sequential,
                         None,
                         None,
+                        0,
                         delta_layer_idx,
                         half_start,
                         layer_idx,
@@ -7443,6 +7445,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     batch_semantics,
                     tree_verify,
                     gdn_tape.as_deref().map(gdn_tape_view).as_ref(),
+                    tape_offset,
                     delta_layer_idx,
                     start_pos,
                     layer_idx,

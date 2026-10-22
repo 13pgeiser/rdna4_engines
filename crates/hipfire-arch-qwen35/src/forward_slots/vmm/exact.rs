@@ -4,6 +4,9 @@
 // Exact VMM batched step: byte-identical, per request, to the default
 // singleton route.
 //
+// On gfx1100 the complete singleton layer program runs per request;
+// the batched projection details below describe the gfx1201 route only.
+//
 // Decode rows run the singleton's own layer program through its super-op
 // form (`qwen35::forward::{lower_variant, variant_of}` + `Qwen35Bindings`). The
 // projection super-ops are batched across requests, each column
@@ -33,7 +36,7 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::RotateInputs;
 use hipfire_dispatch::ops::{delta_net, pm_xbatch};
 use hipfire_dispatch::pipeline::hybrid;
-use hipfire_dispatch::pipeline::superop::{dispatch_super_op, SuperOpKind};
+use hipfire_dispatch::pipeline::superop::{dispatch_super_op, run_layer_program, SuperOpKind};
 use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, WeightTensor,
 };
@@ -44,10 +47,12 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// The exact route reproduces the default singleton route only where its
 /// batched projection super-ops are the singleton's norm+GEMV: dense
 /// DeltaNet/FullAttention layers, uniform MQ4G256V2 projections, gfx1201.
+/// gfx1100 executes the complete singleton layer program per row instead:
+/// its fused projection/prep/residual stages share binding-local state.
 pub(super) fn supports(gpu: &Gpu, weights: &Qwen35Weights) -> Result<(), String> {
-    if !gpu.arch_caps.is_gfx1201() {
+    if !gpu.arch_caps.is_gfx1201() && !gpu.arch_caps.is_gfx1100() {
         return Err(format!(
-            "exact VMM route: arch {} not admitted (gfx1201 only)",
+            "exact VMM route: arch {} not admitted (gfx1100/gfx1201 only)",
             gpu.arch
         ));
     }
@@ -597,6 +602,49 @@ pub(super) fn decode(
     let mut delta_layer_idx = 0usize;
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let program = lower_variant(variant_of(layer));
+        // gfx1100's fused projections and FA epilogue have not been replaced
+        // by row-batched twins. Keep one binding alive for the entire layer:
+        // in particular, Attend can mark FA output as already rotated for
+        // ResidualGemv. Splitting that binding loses the marker and rotates
+        // the output twice. The request scheduler and KV ownership are still
+        // shared; these layer launches deliberately remain per request.
+        if gpu.arch_caps.is_gfx1100() {
+            for (r, &(slot, pos)) in rows.iter().enumerate() {
+                let req = st.slots[slot].as_mut().expect("provisioned slot");
+                let frame = req.dn.s_ef_residual.is_empty().then(|| {
+                    let g = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(req.gdn_frame);
+                    g
+                });
+                let result = {
+                    let ctx = DispatchCtx::new(gpu);
+                    let mut bind = Qwen35Bindings {
+                        layer,
+                        s: &row_scratch[r],
+                        config,
+                        kv_cache: &mut req.kv,
+                        dn_state: &req.dn,
+                        pos,
+                        layer_idx,
+                        delta_layer_idx,
+                        precomputed_attn_x_rot: false,
+                        fa_output_prerotated: false,
+                        defer_routed_combine: false,
+                    };
+                    run_layer_program(gpu, &ctx, &program, &mut bind)
+                        .map_err(|e| HipError::new(0, &e.to_string()))
+                };
+                if let Some(g) = frame {
+                    req.gdn_frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
+                }
+                result?;
+            }
+            if matches!(layer, LayerWeights::DeltaNet(_)) {
+                delta_layer_idx += 1;
+            }
+            continue;
+        }
         let mut proj_ordinal = 0usize;
         let mut last_proj: Option<usize> = None;
         // Whether the run just executed staged the next residual's inputs.
@@ -999,7 +1047,7 @@ pub(super) fn prefill(
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(req.gdn_frame);
             g
         });
-        crate::qwen35::forward_prefill_batch(
+        let result = crate::qwen35::forward_prefill_batch(
             gpu,
             weights,
             config,
@@ -1012,11 +1060,12 @@ pub(super) fn prefill(
             None,
             None,
             None,
-        )?;
+        );
         if let Some(g) = frame {
             req.gdn_frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
             rdna_compute::norm::restore_gdn_requant_frame_checkpoint(g);
         }
+        result?;
     }
     if head {
         let view = st

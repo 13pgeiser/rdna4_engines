@@ -1903,9 +1903,6 @@ pub fn forward_scratch(
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
     gpu.replay.set_forward_eligible(graph_eligible);
-    gpu.replay
-        .begin_auto_capture_if_armed()
-        .map_err(|reason| HipError::new(0, reason))?;
     if ar_graph_test && !graph_eligible {
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
@@ -1952,6 +1949,12 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
     rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::Embed, embed_started);
+    // The retained window opens after the embedding: the token row is a
+    // per-replay input staged outside the tape, and a launch inside the window
+    // that the tape lacks makes prepare refuse it.
+    gpu.replay
+        .begin_auto_capture_if_armed()
+        .map_err(|reason| HipError::new(0, reason))?;
 
     let pos_i32 = pos as i32;
     if gpu.replay.should_route_aql() {

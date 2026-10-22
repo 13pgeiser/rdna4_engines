@@ -136,6 +136,11 @@ The batched mixers of the MoE layers moved from `qwen35/prefill.rs` into
 | `attention_moe_finish_batched` | KV write + attend (or the F5 PM direct attend), sigmoid gate, always-residual output projection (incl. the exact gfx1201 rotate producer); then the MoE FFN |
 | `execute_attention_moe_layer_batched` | FP8 Q-prep and F5 admission (FP8 wins), prep, finish, per-layer MoE trace span |
 
+Current-beta integration carries #913's explicit 128-channel Paro rotation
+arguments into the moved MoE executors. It also preserves #935's post-gate
+QKV/alpha/beta tape copies: the DeltaNet-MoE binding forwards `tape_offset`
+to dispatch so DFlash/MTP rollback reads the same rows.
+
 The MoE-only route gates moved with them and exist once:
 `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (exact IU4 producers),
 `HIPFIRE_GDN_MOE_PRE_FUSED`, `HIPFIRE_GDN_QK_INDEXED`, the MoE GDN route
