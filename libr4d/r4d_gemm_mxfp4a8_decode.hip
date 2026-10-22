@@ -29,7 +29,7 @@
 //   - past 64 rows, re-tuned for the register kernel (r4d_selftest --perfmxd, warmed, every split
 //     1..8 at both slabs on the 27B's and TranslateGemma's per-rank shapes at 96 and 128 rows): the
 //     128-wide slab always (it never lost to 64), and a split only while every split keeps 16 slabs,
-//     towards a 48-block grid or, at K >= 8192, regardless, up to ks*M = 512 split rows. Against the
+//     towards a 48-block grid or, at K >= 8192, regardless, up to ks*M = 1024 split rows. Against the
 //     old rule at 96 / 128 rows: 5120 x 8704 116 / 160 -> 116 / 149 us (a split of 4), 6144 x 5120
 //     97 / 105 -> 87 / 109, 5120 x 3072 79 / 67 -> 60 / 69 (none), 17408 x 5120 187 / 215 -> 175 / 197
 //     (the wide slab). A different split changes a split row's summation order, so bits move here.
@@ -526,7 +526,6 @@ MxdPlan mxd_plan(int M, int K, int N, int KS, int BK, int NT) {
   const int tm = (M + R4D_MXD_MTILE - 1) / R4D_MXD_MTILE;
   MxdPlan p;
   int ks = 1;
-  bool slab64 = false;
   if (tm > 4) {
     // Past 64 rows (the register kernel; see the header): split only while every split keeps 16
     // 128-wide slabs, towards a 48-block grid, or at a deep K regardless.
@@ -539,11 +538,12 @@ MxdPlan mxd_plan(int M, int K, int N, int KS, int BK, int NT) {
     while (ks < R4D_MXD_MAX_KS && nblk * ks < fill && 2 * ks * M <= 512) ks <<= 1;
     if (K >= 8192)                     // a deep K: a split of 24 or more slabs still waits on them
       while (ks < R4D_MXD_MAX_KS && (K / 128) / ks >= 24 && 2 * ks * M <= 512) ks <<= 1;
-    // 64-wide slabs where LDS per block would cost resident blocks: DTM 4 unsplit on 110+ column
-    // blocks.
-    slab64 = tm == 4 && ks == 1 && nblk >= 110;
   }
   p.ks = KS > 0 ? KS : ks;
+  // 64-wide slabs where LDS per block would cost resident blocks: DTM 4 unsplit on 110+ column
+  // blocks, by the split the launch runs (a pin or a tuned point included), as before the register
+  // kernel; past 64 rows the 128-wide slab always.
+  const bool slab64 = tm == 4 && p.ks == 1 && nblk >= 110;
   p.bk = BK > 0 ? BK : (slab64 ? 64 : 128);
   p.nt = NT == 1 || (NT == 0 && (long)N * K / 2 >= (4l << 20));
   if (K % p.bk) {                      // a slab may not run past K

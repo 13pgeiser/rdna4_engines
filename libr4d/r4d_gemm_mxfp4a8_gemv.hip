@@ -13,7 +13,8 @@
 // Two forms, chosen from K alone so that a row's output bits do not depend on how many rows the
 // step carries (a verify step's first row is bit-identical to a plain decode of it):
 //
-// - K a multiple of 128: the WMMA form. One 16-column tile a block (two from 25 rows), eight waves on
+// - K a multiple of 128: the WMMA form. One 16-column tile a block (two from 25 rows where N >= 4096,
+//   K >= 3072 and the tile count is even), eight waves on
 //   its K in chunks of one 128 block, and up to four 16-row tiles (M <= 64), each weight word
 //   multiplied with every row tile's fragment once it is loaded. A lane loads its own B-fragment word of each k-step straight
 //   from the fragment-order weight (the order is the fragment's), the rows sit in the A fragments

@@ -468,6 +468,19 @@ static void cross_check(const Plugin& pl) {
            drain(1 << 22, 2, true) == 3 && drain(1 << 22, 2, false) == 3 &&
            drain(1 << 22, 8, true) == 3 && drain(1 << 22, 3, true) == 3);
     }
+    /* The OCP-MXFP4 rows by row count: the bands overlap, and the priority picks. */
+    {
+        auto prio = [&](const char* n) {
+            for (int k = 0; k < nk; ++k)
+                if (!std::strcmp(pl.kernel_at(k)->name, n)) return pl.kernel_at(k)->priority;
+            return -1;
+        };
+        const int gv = prio("gemm_mxfp4a8_gemv"), gw = prio("gemm_mxfp4a8_gemv_wide");
+        const int dc = prio("gemm_mxfp4a8_decode"), sk = prio("gemm_mxfp4a8_decode_shortk");
+        const int tl = prio("gemm_mxfp4a8_tiled");
+        ok("the MXFP4 rows rank gemv / gemv_wide over decode, decode_shortk over gemv_wide, decode over tiled",
+           gv > 0 && gw > 0 && dc > 0 && sk > 0 && tl > 0 && gv > dc && gw > dc && sk > gw && dc > tl);
+    }
     std::printf("\n");
 }
 
@@ -4395,7 +4408,8 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
 
 /* A row's output bits must not depend on how many rows ride with it: a verify step's first row
  * then decodes exactly as the plain step would, and greedy text does not change with the draft
- * depth. The first row of M = 1..8 (identical inputs, mxfp4a8_numeric's activations depend on the
+ * depth. (This checks the named row; on N >= 8192, K <= 2560 the selection hands 33..64 rows to
+ * gemm_mxfp4a8_decode_shortk, whose order differs.) The first row of M = 1..8 (identical inputs, mxfp4a8_numeric's activations depend on the
  * row index only) compared bit for bit. */
 static void mxfp4a8_m_invariant(const Plugin& pl, const char* row, int64_t N, int64_t K, bool ablk) {
     if (!sel(row)) return;
@@ -26919,7 +26933,8 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 32, 17408, 5120, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 40, 5376, 10752, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 64, 10288, 640, 0, false);
-        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 33, 16, 128, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 33, 16, 256, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 56, 1072, 5120, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 24, 34816, 5120, 0, true, {}, 17408);
         /* decode_shortk: the decode kernel over its corner, both activation grids, a tile partly
          * live, and parts. */

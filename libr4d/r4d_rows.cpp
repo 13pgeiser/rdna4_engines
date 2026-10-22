@@ -4812,7 +4812,8 @@ static const RadConstraint cGemmMxfp4A8Gemv[] = {
 /* gemm_mxfp4a8_gemv_wide: the same entry at 9..64 rows, where only the WMMA form serves (K % 128).
  * The form's sum order for a row is its 16-row tile's chain alone, so a row's bits are the same in
  * both rows at every M. Several streams with speculation (4 x 1 + 7 drafts = 32) land here, except
- * the decode kernel's short-K corner below. */
+ * in the decode kernel's short-K corner below, which sums 33..64 rows in the decode kernel's order (a
+ * row's bits there change at M = 33). */
 static const RadConstraint cGemmMxfp4A8GemvWide[] = {
     C_GE("M", 9), C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
@@ -9453,10 +9454,11 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  *   every collective    the peer flags and exchange buffers the all-reduces own
  *
  * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream and the output;
- * gemm_mxfp4a8_decode's split partial is the op's scratch and its arrival counters are keyed on the
- * output alone; router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance (taken
- * at init, one per declared op and band). Concurrent launches never share these, so those three
- * rows are concurrent. A new row with stream-ordered state belongs in the list above.
+ * gemm_mxfp4a8_decode's (and gemm_mxfp4a8_decode_shortk's, the same entry) split partial is the
+ * op's scratch and its arrival counters are keyed on the output alone;
+ * router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance (taken at init, one
+ * per declared op and band). Concurrent launches never share these, so those four rows are
+ * concurrent. A new row with stream-ordered state belongs in the list above.
  *
  *   lora_*              ordered on purpose: the core appends them behind the GEMM whose `y` they
  *                       update and refills the pools they read between steps with its own copies,
