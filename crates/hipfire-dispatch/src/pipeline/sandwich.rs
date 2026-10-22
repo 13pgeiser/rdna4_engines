@@ -22,12 +22,13 @@ use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
+use crate::pipeline::gated_mlp::{execute_gated_mlp, GatedMlpOp, MlpOutput};
 use crate::types::{DispatchError, GemvVariant, KernelKey};
 use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
 
-fn hip(e: impl std::fmt::Display) -> DispatchError {
+pub(super) fn hip(e: impl std::fmt::Display) -> DispatchError {
     DispatchError::Hip(e.to_string())
 }
 
@@ -60,13 +61,13 @@ fn batched_fusion_arch(arch: &str) -> bool {
 /// True while a calibration collector is armed. Routes that never
 /// materialize a projection's unrotated input (fused norm+FWHT) step aside so
 /// every projection reaches its `maybe_capture_activation` tap.
-fn calibrating(gpu: &Gpu) -> bool {
+pub(super) fn calibrating(gpu: &Gpu) -> bool {
     gpu.active_capture.is_some()
 }
 
 /// `y = W x` for one row. Taps the calibration collector with the unrotated
 /// input.
-fn gemv(
+pub(super) fn gemv(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     w: &WeightRef,
@@ -228,7 +229,7 @@ pub fn supports_batched_projection(dtype: DType) -> bool {
     )
 }
 
-fn fused_projection(
+pub(super) fn fused_projection(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     key: KernelKey,
@@ -256,7 +257,7 @@ fn fused_projection(
 }
 
 /// gfx1100 opt-in: Q8 projections sharing one input run as one fused WMMA GEMM.
-fn q8_fused_prefill(gpu: &Gpu, weights: &[&WeightRef]) -> bool {
+pub(super) fn q8_fused_prefill(gpu: &Gpu, weights: &[&WeightRef]) -> bool {
     gpu.arch == "gfx1100"
         && gpu.flags.gemma4_q8_fused_prefill
         && weights
@@ -298,7 +299,7 @@ impl SandwichStream<'_> {
 
     /// Copies are kernel launches so hipGraph capture and the retained-replay
     /// recorder both see them (a D2D memcpy is invisible to Redline PM4).
-    fn save_residual(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+    pub(super) fn save_residual(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         gpu.copy_f32_buffer(self.residual, self.x, self.len())
             .map_err(hip)
     }
@@ -315,16 +316,11 @@ impl SandwichStream<'_> {
         w: &GpuTensor,
         out: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        if self.rows == 1 {
-            gpu.rmsnorm_f32(x, w, out, self.eps)
-        } else {
-            gpu.rmsnorm_batched(x, w, out, self.rows, self.hidden, self.eps)
-        }
-        .map_err(hip)
+        rms_norm(gpu, self.rows, self.hidden, self.eps, x, w, out)
     }
 
     /// `x = residual + post_norm(out)`; `out` may alias `normed`.
-    fn post_norm_residual(
+    pub(super) fn post_norm_residual(
         &self,
         gpu: &mut Gpu,
         out: &GpuTensor,
@@ -339,6 +335,25 @@ impl SandwichStream<'_> {
         self.restore_residual(gpu)?;
         gpu.add_inplace_f32(self.x, self.normed).map_err(hip)
     }
+}
+
+/// RMS norm of `rows` rows of `hidden`: the one-row kernel for decode, the
+/// batched kernel otherwise.
+pub(super) fn rms_norm(
+    gpu: &mut Gpu,
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+    x: &GpuTensor,
+    w: &GpuTensor,
+    out: &GpuTensor,
+) -> Result<(), DispatchError> {
+    if rows == 1 {
+        gpu.rmsnorm_f32(x, w, out, eps)
+    } else {
+        gpu.rmsnorm_batched(x, w, out, rows, hidden, eps)
+    }
+    .map_err(hip)
 }
 
 /// Rotary position embedding applied to Q and K.
@@ -837,103 +852,6 @@ pub fn execute_sandwich_attention(
     s.post_norm_residual(gpu, s.normed, op.post_norm)
 }
 
-/// Gated MLP activation.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Activation {
-    /// `gelu_pytorch_tanh(gate) * up`.
-    GeluTanh,
-}
-
-/// MLP sublayer: `x = residual + post_norm(down(act(gate(n)) * up(n)))`,
-/// `n = pre_norm(x)`.
-pub struct SandwichMlpOp<'a> {
-    pub stream: SandwichStream<'a>,
-    pub pre_norm: &'a GpuTensor,
-    pub w_gate: WeightRef<'a>,
-    pub w_up: WeightRef<'a>,
-    pub w_down: WeightRef<'a>,
-    pub activation: Activation,
-    pub hidden_dim: usize,
-    pub post_norm: &'a GpuTensor,
-    /// FWHT rotation scratch, `[rows, max(hidden, hidden_dim)]`.
-    pub x_rot: &'a GpuTensor,
-    pub gate: &'a GpuTensor,
-    pub up: &'a GpuTensor,
-    pub act: &'a GpuTensor,
-    pub out: &'a GpuTensor,
-}
-
-pub fn execute_sandwich_mlp(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    op: &SandwichMlpOp<'_>,
-) -> Result<(), DispatchError> {
-    dense_mlp(gpu, ctx, op)?;
-    op.stream.post_norm_residual(gpu, op.out, op.post_norm)
-}
-
-/// Residual save, then `out = down(act(gate(n)) * up(n))`, `n = pre_norm(x)`.
-fn dense_mlp(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    op: &SandwichMlpOp<'_>,
-) -> Result<(), DispatchError> {
-    let s = op.stream;
-    let rows = s.rows;
-    s.save_residual(gpu)?;
-    if rows > 1 {
-        s.norm(gpu, s.x, op.pre_norm, s.normed)?;
-        if q8_fused_prefill(gpu, &[&op.w_gate, &op.w_up]) {
-            fused_projection(
-                gpu,
-                ctx,
-                KernelKey::FusedGateUpQ8_0,
-                &[&op.w_gate, &op.w_up],
-                s.normed,
-                &[op.gate, op.up],
-                rows,
-            )?;
-        } else {
-            gemm_rows(gpu, ctx, &op.w_gate, s.normed, op.gate, op.x_rot, rows)?;
-            gemm_rows(gpu, ctx, &op.w_up, s.normed, op.up, op.x_rot, rows)?;
-        }
-    } else if op.w_gate.dtype == DType::MQ4G256
-        && op.w_up.dtype == DType::MQ4G256
-        && !calibrating(gpu)
-    {
-        gpu.fused_rmsnorm_rotate_mq(s.x, op.pre_norm, op.x_rot, s.hidden, s.eps)
-            .map_err(hip)?;
-        gpu.fused_gate_up_hfq4g256(
-            op.w_gate.buf,
-            op.w_up.buf,
-            op.x_rot,
-            op.gate,
-            op.up,
-            op.w_gate.m,
-            op.w_up.m,
-            op.w_gate.k,
-        )
-        .map_err(hip)?;
-    } else {
-        s.norm(gpu, s.x, op.pre_norm, s.normed)?;
-        gemv(gpu, ctx, &op.w_gate, s.normed, op.gate)?;
-        gemv(gpu, ctx, &op.w_up, s.normed, op.up)?;
-    }
-    match op.activation {
-        Activation::GeluTanh => {
-            gpu.gelu_tanh_f32(op.gate, op.act, rows * op.hidden_dim)
-                .map_err(hip)?;
-            gpu.mul_f32(op.act, op.up, op.act).map_err(hip)?;
-        }
-    }
-    if rows == 1 {
-        gemv(gpu, ctx, &op.w_down, op.act, op.out)?;
-    } else {
-        gemm_rows(gpu, ctx, &op.w_down, op.act, op.out, op.x_rot, rows)?;
-    }
-    Ok(())
-}
-
 /// Routed-expert half of a parallel dense+MoE block.
 pub struct RoutedExperts<'a> {
     /// Norm of the residual stream feeding the experts.
@@ -1045,15 +963,63 @@ pub struct RoutedScratch<'a> {
 }
 
 /// Parallel dense+MoE MLP sublayer:
-/// `x = residual + post_norm(dense_post_norm(mlp(n)) + experts.post_norm(moe(r)))`
-/// with `n = mlp.pre_norm(x)` and `r = experts.pre_norm(x)`; the router reads
-/// `router_norm(x) * router_input_scale`. `mlp.post_norm` is the block's final
-/// post-norm.
+/// `x = residual + post_norm(dense_post_norm(mlp(x)) + experts.post_norm(moe(r)))`
+/// with `r = experts.pre_norm(x)`; the router reads
+/// `router_norm(x) * router_input_scale`. `mlp` is the dense half: it reads
+/// the block's residual stream (`mlp.x` is `stream.x`, its pre-norm writes
+/// `stream.normed`) and writes its own output (`MlpOutput::Write`).
 pub struct ParallelMoeMlpOp<'a> {
-    pub mlp: SandwichMlpOp<'a>,
+    pub stream: SandwichStream<'a>,
+    pub mlp: GatedMlpOp<'a>,
     pub dense_post_norm: &'a GpuTensor,
+    /// The block's final post-norm.
+    pub post_norm: &'a GpuTensor,
     pub experts: RoutedExperts<'a>,
     pub scratch: RoutedScratch<'a>,
+}
+
+impl ParallelMoeMlpOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    /// Everything the block refuses, checked before its first launch.
+    fn validate_layout(&self) -> Result<(), DispatchError> {
+        let (s, mlp, e) = (&self.stream, &self.mlp, &self.experts);
+        if !matches!(mlp.output, MlpOutput::Write(_)) {
+            return Err(DispatchError::Hip(
+                "parallel MoE MLP: the dense half must write its own output".into(),
+            ));
+        }
+        // One residual stream, described twice: the dense half must read the
+        // tensor the experts read through `stream.residual`.
+        let same = |a: &GpuTensor, b: &GpuTensor| {
+            a.buf.as_ptr() == b.buf.as_ptr() && a.numel() == b.numel()
+        };
+        if mlp.rows != s.rows
+            || mlp.hidden != s.hidden
+            || !same(mlp.x, s.x)
+            || !mlp.pre_norm.is_some_and(|n| same(n.normed, s.normed))
+        {
+            return Err(DispatchError::Hip(
+                "parallel MoE MLP: the dense half must read the block's stream (x, normed, rows, hidden)"
+                    .into(),
+            ));
+        }
+        if e.top_k != 8 {
+            return Err(DispatchError::Hip(format!(
+                "parallel MoE MLP: top_k={} unsupported (indexed kernels are k=8)",
+                e.top_k
+            )));
+        }
+        if !RoutedExperts::supports(e.gate_up_dtype, e.down_dtype) {
+            return Err(DispatchError::Hip(format!(
+                "parallel MoE MLP: expert formats gate_up={:?} down={:?} have no indexed kernel",
+                e.gate_up_dtype, e.down_dtype
+            )));
+        }
+        mlp.validate_layout()
+    }
 }
 
 pub fn execute_parallel_moe_mlp(
@@ -1061,36 +1027,28 @@ pub fn execute_parallel_moe_mlp(
     ctx: &DispatchCtx,
     op: &ParallelMoeMlpOp<'_>,
 ) -> Result<(), DispatchError> {
-    let mlp = &op.mlp;
-    let s = mlp.stream;
+    let s = op.stream;
     let e = &op.experts;
     let r = &op.scratch;
-    if e.top_k != 8 {
-        return Err(DispatchError::Hip(format!(
-            "parallel MoE MLP: top_k={} unsupported (indexed kernels are k=8)",
-            e.top_k
-        )));
-    }
-    if !RoutedExperts::supports(e.gate_up_dtype, e.down_dtype) {
-        return Err(DispatchError::Hip(format!(
-            "parallel MoE MLP: expert formats gate_up={:?} down={:?} have no indexed kernel",
-            e.gate_up_dtype, e.down_dtype
-        )));
-    }
-    dense_mlp(gpu, ctx, mlp)?;
+    op.validate_layout()?;
+    let MlpOutput::Write(dense_out) = op.mlp.output else {
+        unreachable!("validate_layout admits only a written dense output")
+    };
+    s.save_residual(gpu)?;
+    execute_gated_mlp(gpu, ctx, &op.mlp)?;
     if s.rows == 1 {
-        s.norm(gpu, mlp.out, op.dense_post_norm, r.dense_normed)?;
+        s.norm(gpu, dense_out, op.dense_post_norm, r.dense_normed)?;
         routed_row(gpu, ctx, e, r, s.residual, s.hidden, s.eps)?;
         gpu.add_f32(r.dense_normed, r.out, s.normed).map_err(hip)?;
-        s.norm(gpu, s.normed, mlp.post_norm, s.normed)?;
+        s.norm(gpu, s.normed, op.post_norm, s.normed)?;
     } else {
-        s.norm(gpu, mlp.out, op.dense_post_norm, mlp.out)?;
+        s.norm(gpu, dense_out, op.dense_post_norm, dense_out)?;
         match r.batch.filter(|_| {
             gpu.arch_caps.is_gfx1151() && RoutedExperts::grouped_rows(e.gate_up_dtype, e.down_dtype)
         }) {
             Some(b) => {
                 routed_rows_grouped(gpu, ctx, e, &b, s)?;
-                gpu.add_inplace_f32(mlp.out, b.out).map_err(hip)?;
+                gpu.add_inplace_f32(dense_out, b.out).map_err(hip)?;
             }
             // The indexed expert kernels are single-row: route row by row
             // and accumulate into the normed dense output.
@@ -1098,12 +1056,12 @@ pub fn execute_parallel_moe_mlp(
                 for row in 0..s.rows {
                     let residual = s.residual.sub_offset(row * s.hidden, s.hidden);
                     routed_row(gpu, ctx, e, r, &residual, s.hidden, s.eps)?;
-                    let out = mlp.out.sub_offset(row * s.hidden, s.hidden);
+                    let out = dense_out.sub_offset(row * s.hidden, s.hidden);
                     gpu.add_inplace_f32(&out, r.out).map_err(hip)?;
                 }
             }
         }
-        s.norm(gpu, mlp.out, mlp.post_norm, s.normed)?;
+        s.norm(gpu, dense_out, op.post_norm, s.normed)?;
     }
     s.restore_residual(gpu)?;
     gpu.add_inplace_f32(s.x, s.normed).map_err(hip)
@@ -1462,8 +1420,167 @@ pub fn execute_softcap(gpu: &mut Gpu, op: &SoftcapOp<'_>) -> Result<(), Dispatch
 
 #[cfg(test)]
 mod tests {
-    use super::{exact_wide_q8_gemm, supports_batched_projection};
-    use rdna_compute::DType;
+    use super::*;
+    use crate::pipeline::gated_mlp::{Activation, GatedMlpScratch, MlpLadder, MlpStorage, RmsNorm};
+
+    /// A launch-free F32 tensor of `elements` at `addr` (never dereferenced).
+    fn tensor(elements: usize, addr: usize) -> GpuTensor {
+        let mut t = GpuTensor::null_for_test();
+        t.buf = unsafe { DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, elements * 4) };
+        t.shape = vec![elements];
+        t
+    }
+
+    fn weight(buf: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
+        WeightRef {
+            buf,
+            dtype: DType::Q8_0,
+            m,
+            k,
+            row_stride: k,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    /// The Gemma 26B-A4B binding shape: every operand is `t` except the
+    /// stream `x` and `normed`, which the dense half shares with the block.
+    fn op<'a>(t: &'a GpuTensor, x: &'a GpuTensor, normed: &'a GpuTensor) -> ParallelMoeMlpOp<'a> {
+        ParallelMoeMlpOp {
+            stream: SandwichStream {
+                rows: 2,
+                hidden: 16,
+                eps: 1e-6,
+                x,
+                residual: t,
+                normed,
+            },
+            mlp: GatedMlpOp {
+                rows: 2,
+                hidden: 16,
+                intermediate: 8,
+                x,
+                pre_norm: Some(RmsNorm {
+                    weight: t,
+                    eps: 1e-6,
+                    normed,
+                }),
+                gate: weight(t, 8, 16),
+                up: weight(t, 8, 16),
+                down: weight(t, 16, 8),
+                activation: Activation::GeluTanh,
+                storage: MlpStorage::F32,
+                output: MlpOutput::Write(t),
+                ladder: MlpLadder::SandwichWide,
+                scratch: GatedMlpScratch {
+                    gate: t,
+                    up: t,
+                    act: t,
+                    x_rot: t,
+                },
+            },
+            dense_post_norm: t,
+            post_norm: t,
+            experts: RoutedExperts {
+                pre_norm: t,
+                router_norm: t,
+                router_input_scale: 1.0,
+                router: weight(t, 4, 16),
+                n_experts: 4,
+                top_k: 8,
+                hidden_dim: 8,
+                gate_up_dtype: DType::Q8_0,
+                down_dtype: DType::Q8_0,
+                gate_up_ptrs: t,
+                down_ptrs: t,
+                per_expert_scale: t,
+                post_norm: t,
+            },
+            scratch: RoutedScratch {
+                input: t,
+                input_rot: t,
+                router_in: t,
+                router_logits: t,
+                topk_indices: t,
+                topk_weights: t,
+                gate: t,
+                up: t,
+                act: t,
+                out: t,
+                dense_normed: t,
+                batch: None,
+            },
+        }
+    }
+
+    #[test]
+    fn parallel_moe_preflight_covers_the_dense_half() {
+        let (t, x, normed) = (tensor(1024, 0x1000), tensor(32, 0x2000), tensor(32, 0x3000));
+        assert!(op(&t, &x, &normed).validate_layout().is_ok());
+        let refusal = |o: &ParallelMoeMlpOp<'_>| o.validate_layout().unwrap_err().to_string();
+
+        // A dense half the GatedMlp preflight refuses is refused by the block,
+        // before `execute_parallel_moe_mlp` saves the residual.
+        let mut bad = op(&t, &x, &normed);
+        bad.mlp.down = weight(&t, 17, 8);
+        assert!(
+            refusal(&bad).contains("gated MLP down"),
+            "{}",
+            refusal(&bad)
+        );
+
+        // The dense half must read the block's own stream.
+        let other = tensor(32, 0x4000);
+        let short = tensor(31, 0x2000);
+        let other_norm = Some(RmsNorm {
+            weight: &t,
+            eps: 1e-6,
+            normed: &other,
+        });
+        let base = || op(&t, &x, &normed);
+        let cases = [
+            GatedMlpOp {
+                x: &other,
+                ..base().mlp
+            },
+            GatedMlpOp {
+                x: &short,
+                ..base().mlp
+            },
+            GatedMlpOp {
+                pre_norm: other_norm,
+                ..base().mlp
+            },
+            GatedMlpOp {
+                pre_norm: None,
+                ..base().mlp
+            },
+            GatedMlpOp {
+                rows: 1,
+                ..base().mlp
+            },
+            GatedMlpOp {
+                hidden: 8,
+                ..base().mlp
+            },
+        ];
+        for mlp in cases {
+            let message = refusal(&ParallelMoeMlpOp { mlp, ..base() });
+            assert!(message.contains("block's stream"), "{message}");
+        }
+
+        let mut bad = op(&t, &x, &normed);
+        bad.mlp.output = MlpOutput::PostNorm {
+            norm: &t,
+            eps: 1e-6,
+            out: &t,
+            residual: &t,
+        };
+        assert!(refusal(&bad).contains("write its own output"));
+    }
 
     #[test]
     fn batched_projection_formats_are_explicit() {

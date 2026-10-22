@@ -23,6 +23,7 @@
 //! fields.
 
 use crate::LoadedModel;
+use hipfire_arch_qwen35::qwen35::StateQuant;
 use rdna_compute::Gpu;
 
 /// What the load handler needs to know after staging.
@@ -701,6 +702,10 @@ fn stage_qwen4_lanes(
     }
 }
 
+fn stochastic_q8_state_without_ef(quant: StateQuant, has_state: bool, has_ef: bool) -> bool {
+    quant == StateQuant::Q8 && has_state && !has_ef
+}
+
 /// Stage the VMM continuous-batching store beside the resident Qwen35
 /// bundle. No fixed-lane KV is allocated: request owners are created lazily
 /// at admission, shaped like the resident (VMM) singleton KV. Any failure
@@ -719,6 +724,19 @@ fn stage_qwen_vmm_batch(
         );
         return out;
     };
+    if gpu.arch_caps.is_gfx1100()
+        && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        && stochastic_q8_state_without_ef(
+            b.dn_state.quant,
+            !b.dn_state.s_scales.is_empty(),
+            !b.dn_state.s_ef_residual.is_empty(),
+        )
+    {
+        // Legacy stochastic Q8 state is not singleton-exact under hipGraph:
+        // replay freezes the captured requant frame, unlike eager AR lanes.
+        eprintln!("[daemon] gfx1100 Exact VMM requires Q8 error feedback (HIPFIRE_DN_STATE_EF=1); stochastic EF-off singleton graph parity is unproven — existing route");
+        return out;
+    }
     // The executor's own coverage predicate (embedding/lm_head dtypes,
     // slots-body layer coverage, VMM KV route and flash plan) — not the
     // fixed-lane `qwen_batch_weight_formats_supported` gate.
@@ -783,7 +801,15 @@ fn stage_qwen_vmm_batch(
         }
     }
     if out.vmm && req.spec {
-        stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        if gpu.arch_caps.is_gfx1100()
+            && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        {
+            // gfx1100 exact AR uses singleton layers per request. Shared
+            // speculative verify has a separate numerical/state contract.
+            eprintln!("[daemon] gfx1100 Exact VMM: AR lanes only; batched speculative verification is not admitted");
+        } else {
+            stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        }
     }
     out
 }
@@ -910,13 +936,14 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
     let receipt = engine.receipt();
     let (lane_bytes, snapshot_bytes) = (engine.lane_bytes(), engine.snapshot_bytes());
     let store = b.vmm_store.as_mut().expect("route checked above");
-    match store.install_dflash(engine) {
+    let installed = match store.install_dflash(engine) {
         Ok(()) => {
             eprintln!(
                 "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
                 receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
             );
             eprintln!("[daemon] VMM DFlash lane footprint: lane_state={lane_bytes} B dn_snapshot={snapshot_bytes} B");
+            true
         }
         Err(engine) => {
             eprintln!(
@@ -925,6 +952,43 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
                 receipt.block_size
             );
             engine.free_gpu(gpu);
+            false
+        }
+    };
+    // Lanes never run the verbatim-copy lookup: with lanes staged the
+    // singleton must not either, or a request's text would depend on whether
+    // it was promoted to a lane.
+    if installed {
+        if let Some(df) = m
+            .speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+        {
+            df.disarm_lookup("VMM DFlash lanes staged; lanes never run lookup");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stochastic_q8_state_without_ef, StateQuant};
+
+    #[test]
+    fn exact_ef_guard_only_rejects_live_stochastic_q8_state() {
+        assert!(stochastic_q8_state_without_ef(StateQuant::Q8, true, false));
+        assert!(!stochastic_q8_state_without_ef(StateQuant::Q8, true, true));
+        assert!(!stochastic_q8_state_without_ef(
+            StateQuant::Q8,
+            false,
+            false
+        ));
+        for quant in [StateQuant::FP32, StateQuant::Q4] {
+            for has_state in [false, true] {
+                for has_ef in [false, true] {
+                    assert!(!stochastic_q8_state_without_ef(quant, has_state, has_ef));
+                }
+            }
         }
     }
 }

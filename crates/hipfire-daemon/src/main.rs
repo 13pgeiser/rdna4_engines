@@ -1851,7 +1851,7 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let Some(dflash_block) = request_guards::dflash_block(
+                let Some((dflash_block, dflash_block_auto)) = request_guards::dflash_block(
                     &mut stdout,
                     &msg,
                     parsed_vmm_batch.is_some(),
@@ -1913,6 +1913,7 @@ fn main() {
                     mtp_k,
                     dflash_adaptive_b: Some(adaptive_b),
                     dflash_block: Some(dflash_block),
+                    dflash_block_auto,
                 };
 
                 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
