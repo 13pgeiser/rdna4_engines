@@ -1063,6 +1063,32 @@ pub struct SequenceResolution {
     pub model_ctx: usize,
     pub card_cap: usize,
     pub kv_mode: &'static str,
+    /// The pre-teardown capacity projection this resolution was admitted
+    /// against ([`qwen35_card_projection`]); `None` where no projection runs
+    /// (Qwen4 on unified memory measures after load).
+    pub projection: Option<Qwen35CardProjection>,
+}
+
+/// The pre-teardown context-capacity projection of a single-card Qwen3.5
+/// VMM load ([`qwen35_card_projection`]), itemised so `hipfire fit` reports
+/// the same numbers admission refuses on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35CardProjection {
+    /// Free device bytes before the load (`KvBackendHints::free_vram_bytes`).
+    pub free: usize,
+    /// Projected resident weights: the HFQ file plus 12.5% and 512 MiB.
+    pub weights: usize,
+    /// The minimum viable prefill scratch reservation.
+    pub scratch: usize,
+    /// VMM page rounding across the K/V owners.
+    pub page_rounding: usize,
+    /// Selected K+V bytes per token over the full-attention layers.
+    pub bytes_per_token: usize,
+    /// Largest context the remaining free memory holds.
+    pub card_cap: usize,
+    /// The checkpoint's trained window (`max_position_embeddings`).
+    pub model_ctx: usize,
+    pub kv_mode: &'static str,
 }
 
 /// The context a Qwen4 admission works from: an omitted `max_seq` on a
@@ -1093,6 +1119,7 @@ fn qwen4_context_sequence(
         model_ctx,
         card_cap: 0,
         kv_mode,
+        projection: None,
     })
 }
 
@@ -1485,18 +1512,29 @@ fn trained_context(source: &ModelSource) -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
+/// Smallest projected context an automatic single-card Qwen VMM load accepts
+/// ([`resolve_sequence`]); below it the load is refused before teardown.
+pub const QWEN35_MIN_AUTO_CONTEXT: usize = 512;
+
+/// VMM page rounding reserved across the K/V owners in the projection.
+const QWEN35_VMM_PAGE_ROUNDING_BYTES: usize = 128 << 20;
+
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The HFQ file is a lower bound on loaded weights; include 12.5% for
 /// expanded raw tensors/runtime state and 512 MiB for allocator/transients.
 /// Reserve only the minimum 512-row PBS plus the widened guard's existing
 /// 1 GiB headroom and 128 MiB for VMM page rounding across K/V owners.
 /// Per-request prefill selects wider scratch from then-current mapped-KV free VRAM.
-fn resolve_sequence(
+///
+/// The one projection admission refuses on ([`resolve_sequence`]); `hipfire
+/// fit` reads the same value. It is a pre-teardown fit check, never the
+/// effective bound: the Qwen carrier remeasures free VRAM after the weights
+/// upload, immediately before KV reservation.
+pub fn qwen35_card_projection(
     source: &ModelSource,
-    requested: usize,
     gpu_arch: &str,
     hints: KvBackendHints<'_>,
-) -> Result<SequenceResolution, String> {
+) -> Result<Qwen35CardProjection, String> {
     use hipfire_runtime::kv_mode;
     let ModelSource::Hfq(hfq) = source else {
         return Err("automatic Qwen VMM context sizing requires an HFQ weight manifest".into());
@@ -1546,29 +1584,48 @@ fn resolve_sequence(
     let scratch =
         hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(&config, gpu_arch)
             .ok_or("Qwen minimum prefill scratch sizing overflow")?;
-    let projected_card_cap = free
+    let card_cap = free
         .saturating_sub(weights)
         .saturating_sub(scratch)
-        .saturating_sub(128 << 20)
+        .saturating_sub(QWEN35_VMM_PAGE_ROUNDING_BYTES)
         / bytes_per_token;
+    Ok(Qwen35CardProjection {
+        free,
+        weights,
+        scratch,
+        page_rounding: QWEN35_VMM_PAGE_ROUNDING_BYTES,
+        bytes_per_token,
+        card_cap,
+        model_ctx,
+        kv_mode: kv_mode::qwen_k_display_name(pair.k()),
+    })
+}
+
+fn resolve_sequence(
+    source: &ModelSource,
+    requested: usize,
+    gpu_arch: &str,
+    hints: KvBackendHints<'_>,
+) -> Result<SequenceResolution, String> {
+    let projection = qwen35_card_projection(source, gpu_arch, hints)?;
     // Projection is a pre-teardown fit refusal, never the effective bound.
     // Weight upload changes free VRAM; the Qwen carrier remeasures that
     // *after* weights and immediately before KV reservation.
-    if projected_card_cap < 512 && requested == 0 {
+    if projection.card_cap < QWEN35_MIN_AUTO_CONTEXT && requested == 0 {
         return Err("Qwen VMM load refused: the model weights, the minimum prefill scratch and the KV cache do not fit in free VRAM. Free GPU memory, set a smaller memory.max_seq, or use a smaller quantization of this model".into());
     }
     let (max_seq, bound) = if requested != 0 {
         (requested, "user")
     } else {
-        (model_ctx, "pending")
+        (projection.model_ctx, "pending")
     };
-    let kv_mode = kv_mode::qwen_k_display_name(pair.k());
     Ok(SequenceResolution {
         max_seq,
         bound,
-        model_ctx,
+        model_ctx: projection.model_ctx,
         card_cap: 0,
-        kv_mode,
+        kv_mode: projection.kv_mode,
+        projection: Some(projection),
     })
 }
 

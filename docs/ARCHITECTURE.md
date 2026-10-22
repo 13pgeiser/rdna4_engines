@@ -482,6 +482,11 @@ The runtime verifies the installed index and object SHA-256 before loading,
 even with hipcc present. A missing or stale index falls back to JIT only when
 hipcc is available; compiler-free loads fail closed. Packaged module names
 come from the exact Rust registry, never HIP source basenames.
+The installed pack is read-only to the runtime: a missing, stale or rejected
+packaged object is recompiled into the hot JIT cache only and is never rewritten
+under `kernels/compiled/<arch>`. Only the packaging tools (`hipfire-kernel-pack`
+and `daemon --precompile`, which publish to an explicit output directory) write
+a pack.
 
 JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`, then the
