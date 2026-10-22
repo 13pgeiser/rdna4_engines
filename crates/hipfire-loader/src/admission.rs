@@ -508,8 +508,13 @@ pub fn qwen4_request_admission(
 /// (R9700). Every rank must be the SAME one of them (homogeneous).
 pub const QWEN4_EP_ARCHS: [&str; 2] = ["gfx1100", "gfx1201"];
 
-fn qwen4_ep_arch_admitted(arch: &str) -> bool {
-    QWEN4_EP_ARCHS.contains(&arch)
+/// Under the developer-only logical emulation (`HIPFIRE_EMULATE_GPUS`) the
+/// ranks also run aliased on gfx1151 (Strix Halo has one GPU): that proves
+/// byte parity and lifecycle on one device, never a physical EP admission.
+const QWEN4_EP_EMULATED_ARCHS: [&str; 1] = ["gfx1151"];
+
+fn qwen4_ep_arch_admitted(arch: &str, emulated: bool) -> bool {
+    QWEN4_EP_ARCHS.contains(&arch) || (emulated && QWEN4_EP_EMULATED_ARCHS.contains(&arch))
 }
 
 /// Qwen4 expert parallelism needs `ep` ranks of one exact, homogeneous
@@ -537,9 +542,10 @@ pub(crate) fn qwen4_ep_geometry_refusal(
             "qwen4: expert parallelism (topology.ep = {ep}) cannot combine with pipeline/tensor parallelism (pp={pp}, tp={tp})"
         ));
     }
-    if !qwen4_ep_arch_admitted(gpu_arch) {
+    if !qwen4_ep_arch_admitted(gpu_arch, emulated) {
         return Some(format!(
-            "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1100 or gfx1201 on every rank; device 0 is {gpu_arch}"
+            "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1100 or gfx1201 on every rank \
+             (gfx1151 only under HIPFIRE_EMULATE_GPUS); device 0 is {gpu_arch}"
         ));
     }
     let needed = if emulated { 1 } else { ep };
@@ -591,13 +597,15 @@ pub fn qwen4_ep_rank_devices(
 /// Pure core of [`qwen4_ep_preflight`]: `devices[r]` is rank `r`'s physical
 /// device (see [`qwen4_ep_rank_devices`]), `archs[d]` is physical device `d`'s
 /// architecture; `peer(a, b)` is whether device `a` can access device `b`.
-/// Every rank's device must be the same exact gfx1100 or gfx1201 arch as
-/// rank 0's, and every directed pair of DISTINCT physical devices must be
-/// accessible (ranks aliased onto one device need no peer access).
+/// Every rank's device must be the same exact gfx1100 or gfx1201 arch (or,
+/// with `emulated`, gfx1151) as rank 0's, and every directed pair of DISTINCT
+/// physical devices must be accessible (ranks aliased onto one device need no
+/// peer access).
 pub fn qwen4_ep_device_refusal(
     ep: usize,
     devices: &[i32],
     archs: &[String],
+    emulated: bool,
     mut peer: impl FnMut(usize, usize) -> Result<bool, String>,
 ) -> Result<(), String> {
     if devices.len() < ep {
@@ -620,9 +628,10 @@ pub fn qwen4_ep_device_refusal(
     }
     let first = arch_of[0];
     for (rank, arch) in arch_of.iter().enumerate() {
-        if !qwen4_ep_arch_admitted(arch) {
+        if !qwen4_ep_arch_admitted(arch, emulated) {
             return Err(format!(
-                "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1100 or gfx1201 on every rank; rank {rank} is {arch}"
+                "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1100 or gfx1201 on every rank \
+                 (gfx1151 only under HIPFIRE_EMULATE_GPUS); rank {rank} is {arch}"
             ));
         }
         if *arch != first {
@@ -670,7 +679,7 @@ pub fn qwen4_ep_preflight(hip: &hip_bridge::HipRuntime, ep: usize) -> Result<Vec
                 .map_err(|error| format!("qwen4: EP device {device} arch: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    qwen4_ep_device_refusal(ep, &devices, &archs, |from, to| {
+    qwen4_ep_device_refusal(ep, &devices, &archs, emulated, |from, to| {
         hip.can_access_peer(from as i32, to as i32)
             .map_err(|error| format!("qwen4: EP peer query {from}->{to}: {error}"))
     })?;
@@ -2069,7 +2078,7 @@ pub(crate) fn qwen4_pp_rank_refusal(
                 rank.logical, rank.device_ordinal
             ));
         }
-        if !qwen4_ep_arch_admitted(&rank.arch) {
+        if !qwen4_ep_arch_admitted(&rank.arch, false) {
             return Err(format!(
                 "{prefix} requires gfx1100 or gfx1201 on every rank; rank {} is {}",
                 rank.logical, rank.arch
@@ -3590,6 +3599,11 @@ mod tests {
         );
         assert!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1100", Some(0), true).is_some());
         assert!(qwen4_ep_geometry_refusal(6, 1, 1, "gfx1030", Some(1), true).is_some());
+        // gfx1151 runs logical ranks under emulation only.
+        assert_eq!(
+            qwen4_ep_geometry_refusal(4, 1, 1, "gfx1151", Some(1), true),
+            None
+        );
     }
 
     #[test]
@@ -3626,26 +3640,32 @@ mod tests {
         for arch in ["gfx1201", "gfx1100"] {
             for ep in 2..=8usize {
                 assert_eq!(
-                    qwen4_ep_device_refusal(ep, &ranks(ep as i32), &homogeneous(arch, ep), all),
+                    qwen4_ep_device_refusal(
+                        ep,
+                        &ranks(ep as i32),
+                        &homogeneous(arch, ep),
+                        false,
+                        all
+                    ),
                     Ok(()),
                     "{arch} ep {ep}"
                 );
             }
         }
         assert_eq!(
-            qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), all),
+            qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), false, all),
             Ok(())
         );
         // Too few devices.
         assert!(
-            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), all)
+            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), false, all)
                 .unwrap_err()
                 .contains("3 visible")
         );
         // A different admitted arch on rank 2 refuses (mixed) and names the ranks.
         let mut mixed = homogeneous("gfx1201", 4);
         mixed[2] = "gfx1100".to_string();
-        let error = qwen4_ep_device_refusal(4, &ranks(4), &mixed, all).unwrap_err();
+        let error = qwen4_ep_device_refusal(4, &ranks(4), &mixed, false, all).unwrap_err();
         assert!(
             error.contains("same architecture")
                 && error.contains("rank 2")
@@ -3654,42 +3674,48 @@ mod tests {
         );
         // An unadmitted arch refuses even when homogeneous.
         for arch in ["gfx1151", "gfx1030", "gfx942", ""] {
-            let error =
-                qwen4_ep_device_refusal(2, &ranks(2), &homogeneous(arch, 2), all).unwrap_err();
+            let error = qwen4_ep_device_refusal(2, &ranks(2), &homogeneous(arch, 2), false, all)
+                .unwrap_err();
             assert!(
                 error.contains("gfx1100 or gfx1201") && error.contains("rank 0"),
                 "{arch}: {error}"
             );
         }
         // An arch beyond the rank count is not part of the mesh.
-        assert_eq!(qwen4_ep_device_refusal(2, &ranks(2), &mixed, all), Ok(()));
+        assert_eq!(
+            qwen4_ep_device_refusal(2, &ranks(2), &mixed, false, all),
+            Ok(())
+        );
         // Every directed pair is probed; one missing direction refuses.
         let mut probed = Vec::new();
-        qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 4), |a, b| {
+        qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 4), false, |a, b| {
             probed.push((a, b));
             Ok(true)
         })
         .unwrap();
         assert_eq!(probed.len(), 12);
-        let error = qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 4), |a, b| {
-            Ok(!(a == 3 && b == 1))
-        })
-        .unwrap_err();
+        let error =
+            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 4), false, |a, b| {
+                Ok(!(a == 3 && b == 1))
+            })
+            .unwrap_err();
         assert!(error.contains("device 3 cannot access device 1"), "{error}");
         // A failed query is an error, not "no peer".
-        assert!(
-            qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 2), |_, _| Err(
-                "hip".to_string()
-            ))
-            .unwrap_err()
-            .contains("hip")
-        );
+        assert!(qwen4_ep_device_refusal(
+            2,
+            &ranks(2),
+            &homogeneous("gfx1201", 2),
+            false,
+            |_, _| Err("hip".to_string())
+        )
+        .unwrap_err()
+        .contains("hip"));
         // Aliased ranks (emulation): same-device pairs are never probed and a
         // single physical device needs no peer access at all.
         let one = homogeneous("gfx1100", 1);
         let mut probes = 0;
         assert_eq!(
-            qwen4_ep_device_refusal(6, &[0; 6], &one, |_, _| {
+            qwen4_ep_device_refusal(6, &[0; 6], &one, true, |_, _| {
                 probes += 1;
                 Ok(false)
             }),
@@ -3703,6 +3729,7 @@ mod tests {
             6,
             &[0, 1, 2, 3, 0, 1],
             &homogeneous("gfx1100", 4),
+            true,
             |a, b| {
                 pairs.push((a, b));
                 Ok(true)
@@ -3710,8 +3737,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pairs.len(), 12);
-        // Aliased devices are still arch-checked.
-        assert!(qwen4_ep_device_refusal(6, &[0; 6], &homogeneous("gfx1151", 1), all).is_err());
+        // Aliased devices are still arch-checked; gfx1151 is admitted only aliased.
+        assert!(
+            qwen4_ep_device_refusal(6, &[0; 6], &homogeneous("gfx1030", 1), true, all).is_err()
+        );
+        assert_eq!(
+            qwen4_ep_device_refusal(6, &[0; 6], &homogeneous("gfx1151", 1), true, all),
+            Ok(())
+        );
     }
 
     #[test]

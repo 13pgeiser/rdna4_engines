@@ -499,7 +499,7 @@ fn check_file_range(
 }
 
 /// Capture the cheap, immutable file identity used by source readers.
-pub(crate) fn capture_file_identity(path: &Path) -> Result<SourceFileIdentity, SourceError> {
+pub fn capture_file_identity(path: &Path) -> Result<SourceFileIdentity, SourceError> {
     let canonical_path =
         std::fs::canonicalize(path).map_err(|source| SourceError::Io { offset: 0, source })?;
     let metadata = std::fs::metadata(&canonical_path)
