@@ -13,6 +13,7 @@ pub mod config;
 pub mod ep_batch;
 pub mod forward;
 pub mod load;
+pub mod mesh_tp;
 #[cfg(feature = "moe-oracle")]
 pub mod oracle;
 pub mod prefill;

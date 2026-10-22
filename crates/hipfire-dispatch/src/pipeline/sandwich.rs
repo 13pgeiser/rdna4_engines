@@ -24,8 +24,8 @@ use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
 use crate::families::rotation::{RotationFamily, RotationParams};
-use crate::pipeline::steps::{execute_steps, GemvInput, Step};
 use crate::pipeline::gated_mlp::{execute_gated_mlp, GatedMlpOp, MlpOutput};
+use crate::pipeline::steps::{execute_steps, GemvInput, Step};
 use crate::pipeline::RowsRoute;
 use crate::types::{
     dtype_rotation_plan, DispatchError, GemvVariant, KernelKey, RotationPlan, RotationVariant,
