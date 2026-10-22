@@ -1280,7 +1280,7 @@ video ENCODER itself hid two real bugs: the norm1/norm3 swap and the shortcut-af
 Next: **video VAE decoder value parity** (new build: R4D_DEC_SEL shadows + AST-extracted comfy decoder
 forward, mirroring `tests/data/ref2va/ref_venc_parity.py`).
 
-### cont.25 (2026-10-22) — #63 CLOSED, the fried look ROOT-CAUSED AND FIXED: the container stored every SwiGLU FFN gate-second
+### cont.25 (2026-10-22) — [SUPERSEDED by cont.26: the "fixed" verdict below is WRONG — the gatefix container renders tile-scrambled garbage; keep reading] — #63 CLOSED, the fried look ROOT-CAUSED AND FIXED: the container stored every SwiGLU FFN gate-second
 The decoder-parity build (R4D_DIT_SEL-gated shadows `dbg_vd_lat/x0/blk/n/pix` in
 RadVideoGenDecl + driver readback to R4D_ENC_DUMPDIR, kept) measured block 0 of the video VAE
 decoder straight off the device: **attn cos 0.999990 and to_out cos 0.999994 (bf16 floor) but the
@@ -1330,3 +1330,44 @@ Two host tests were red on the way and are green now:
   `tests/abi_layout_table.h`; `abi_layout_rows.h` also never listed Batch.sampler or any trailing
   dbg_* field (dbg_ve_*, dbg_dit_*, dbg_vd_* — 61 rows). Regenerated from the printout, verified
   purely additive (no listed field moved), kTableAbi 24.
+
+### cont.26 (2026-10-22) — cont.25 REVERSED: the gatefix container is TILE-SCRAMBLED GARBAGE; the original row-swap was load-bearing after all; the fried look is still OPEN
+The user opened the cmp45 mp4s in VLC: both gatefix renders — INCLUDING the pinned FL2VA
+frame-0 — are a full-frame grid of ~16px colour tiles, whole video. Aggregate metrics (luma
+81, clipHi 0.1%, sat) were perfectly normal on scrambled pixels: the exact failure mode
+memory warned about ("judge on actual frames, not luma/clip numbers"). cont.25's "device-
+verified, fried look gone" was never looked at by eye — RETRACTED.
+
+**Decisive control (task #64).** Old container `minimax-h3-dasiwa-w8a8.rad` served on the
+CURRENT binary (`serve_old.sh`, port 8135): T2VA and FL2VA both render COHERENT video
+(`cmp45/OLD_t2va512.mp4`, `OLD_fl2va512.mp4`; frames read: f0 standing pose, mid, f157 =
+exact fire-breath endpoint — pins force, spatial structure intact, fried/bright look
+present). The binary since `e28cf86` is exonerated for the scramble; the gatefix CONTAINER
+is the cause.
+
+**The half order, settled from the ckpt's own library — cont.25's error.** The source
+tensor is `ff.net.0.proj` = diffusers' `SwiGLU` (`diffusers/models/activations.py`, verified
+in the installed 0.36 tree; `transformer_minimax_h3.py` and `autoencoder_kl_minimax_h3.py`
+both build FFNs from `..attention.FeedForward` with this activation):
+`hidden, gate = proj(x).chunk(2, -1); return hidden * silu(gate)` — **value FIRST, gate
+SECOND**, transformer AND VAE. `silu_mul`/`gated_quant_fp8` gate with the FIRST half ⇒ the
+convert MUST swap. The original three `map_rows` sites did exactly that; `77ef8f0`'s
+identity maps made every DiT/refiner/VAE FFN compute `silu(value)*gate` ⇒ global FFN
+garbage ⇒ tile-scrambled latents (and they explain the pinned frame-0: the scramble comes
+from the DiT's velocity stream and the decoder FFNs both being mis-paired). comfy's
+`_swiglu_eager` (gate-first) is NOT an anchor — how comfy's loader maps `ff.net.0.proj`
+into its `mlp.fc1` was never located (no remap found in comfy's tree), and every harness
+number quoted in cont.25 — the "cos 0.49 vs 0.999989" dn windows, the velocity cos 0.9886 /
+ratio 1.071 — came from a CPU reference that reads CONTAINER rows through gate-first
+chunking: self-consistent with whichever container was served, circular, unable to
+adjudicate. Only the ckpt convention + real pixels can. (cont.25's "the checkpoint stores
+the gate half first" was an assertion, not a measurement; `verify_gatefix_bytes.py`'s
+"identity relFro 1.7e-3" only proves the new rows EQUAL the ckpt rows — which is exactly
+the wrong thing to prove for a value-first tensor.)
+
+**Revert.** The three map_rows sites are back to the swap (`{fsrc, ff, ff}, {fsrc, 0, ff}`
+× weight/bias), with a proof comment at the DiT site; the cont.25 shadows/driver readback,
+the arity fix and the ABI table stay. The GOOD container remains
+`minimax-h3-dasiwa-w8a8.rad`; `minimax-h3-dasiwa-w8a8-gatefix.rad` is kept only as the
+documented bad artifact. The fried look is NOT an FFN half-order issue and stays OPEN
+(#54/#45): the coherent-but-bright OLD_* renders are the standing artifact to explain.

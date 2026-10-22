@@ -929,11 +929,9 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
 /* ================================================================== the token refiner */
 /* `context_embedder` (5120 -> 5376, bf16, replicated), two plain blocks with full attention over
  * the prompt and no rotary, and the final RMSNorm into the lane's prompt rows. The feed-forward is
- * SwiGLU over `ff.net.0.proj`, gated with the FIRST half -- comfy's `_swiglu_eager` (the reference
- * that produced the ground-truth clips) chunks gate-first, and `silu_mul` reads gate-first, so the
- * rows are stored in checkpoint order. (An earlier convert moved the gate half second-hand --
- * swapping the halves -- which made every block's FFN compute `silu(up) * gate`; see the
- * `ffn_gate_up` map_rows below and #63's container byte inspection.) */
+ * diffusers' SwiGLU, `value * silu(gate)` with the value first in the checkpoint; the gate half is
+ * moved first at convert, which is the order `silu_mul` reads (see the `ffn_gate_up` map_rows in
+ * declare_dit -- the proof comment lives there). */
 static int declare_refiner(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gr;
     Names& nm = m.nm;
@@ -1012,11 +1010,8 @@ static int declare_refiner(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         RAD_ARCH_TRY(R.q_h2.declare(b, g, m.a_rh, D));
         const char* fw = nm.f("%s.ffn_gate_up.weight", dn);
         const char* fsrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
-        /* Gate-first, matching the reference `swiglu` (gate = first half of ff.net.0.proj) and
-         * `silu_mul`'s first-half gate. The checkpoint stores the gate half first -- the container
-         * bytes for the old swapped map (row 0 == ckpt row n_ff, verified byte-identical after
-         * dequantising the int8 codes) made every DiT FFN compute silu(up)*gate. */
-        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, 0, ff_all }, { fsrc, (int)ff_all, ff_all } }));
+        /* Gate-first: swap the halves, the checkpoint's are value-first (see declare_dit). */
+        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, (int)ff_all, ff_all }, { fsrc, 0, ff_all } }));
         R.gate_up.mapped = true;
         R.gate_up.access = acc;
         RAD_ARCH_TRY(R.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
@@ -1501,10 +1496,23 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         B.op_mq2 = mod_q(B.w_n2, true);
         const char* fw = nm.f("%s.ffn_gate_up.weight", dn);
         const char* fsrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
-        /* Same gate-first identity as the fp8 builder above -- the two sites must agree or the
-         * int8 and bf16 paths disagree (the likelier culprit for the old "swap removal -> noise"
-         * experiment). Row group=128 scales are quantised from the mapped rows, so they follow. */
-        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, 0, ff_all }, { fsrc, (int)ff_all, ff_all } }));
+        /* Gate-first: swap the halves, exactly as the fp8 builder above -- the two sites must
+         * agree or the int8 and bf16 paths disagree. THIS SWAP IS LOAD-BEARING; it has now been
+         * "fixed" (removed) twice and reverted twice, so settle it here with the proof:
+         * `ff.net.0.proj` is diffusers' SwiGLU (diffusers/models/activations.py):
+         * `value, gate = chunk(2); value * silu(gate)` -- the checkpoint stores the gate HALF
+         * SECOND. `silu_mul` / `gated_quant_fp8` gate with the FIRST half, so the halves must be
+         * swapped at convert for the device to compute the reference's silu(gate)*value. The
+         * decisive experiment (task #64, 2026-10-22): the identity map -- "gate already first,
+         * keep checkpoint order" -- was converted to minimax-h3-dasiwa-w8a8-gatefix.rad and
+         * served on this same binary: EVERY render, including the pinned FL2VA frame-0, came out
+         * as a grid of tile-scrambled colour squares, while the swapped (original) container on
+         * the same binary renders coherent video. A harness agreement between the device and a
+         * CPU reference that reads CONTAINER rows through comfy's gate-first `_swiglu_eager` is
+         * circular and cannot adjudicate the half order -- only the ckpt convention can, and it
+         * says value-first. Row group=128 scales are quantised from the mapped rows, so they
+         * follow. */
+        RAD_ARCH_TRY(map_rows(b, fw, { { fsrc, (int)ff_all, ff_all }, { fsrc, 0, ff_all } }));
         B.gate_up.mapped = true;
         RAD_ARCH_TRY(B.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
                                        RAD_SHARD_ROW, grp_layer(grp), { fsrc }, m.a_hm, m.b_gu, 0,
@@ -1894,15 +1902,13 @@ static int declare_video(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         const char* ub = nm.f("%s.ffn_up.bias", dn);
         const char* usrc = nm.ckpt("%s.ff.net.0.proj.weight", pre);
         const char* ubsrc = nm.ckpt("%s.ff.net.0.proj.bias", pre);
-        /* #63 value-parity: the VAE's FeedForward is `linear(w2, swiglu(linear(w1, x)))` and
-         * comfy's `_swiglu_eager` gates with the FIRST half of `ff.net.0.proj` -- so the rows must
-         * stay in checkpoint order for `silu_mul` (which also gates with its first half) to
-         * reproduce the reference. The block-0 internals dump (dn window) measured the swapped map
-         * below computing silu(up_half)*gate_half -- cos 0.49 against the reference -- while attn
-         * and to_out matched at the bf16 floor. Identity rows fix the FFN exactly (`ff.net.2`'s
-         * columns stay aligned because the act columns inherit the checkpoint's row order). */
-        RAD_ARCH_TRY(map_rows(b, un, { { usrc, 0, ff }, { usrc, (int)ff, ff } }));
-        RAD_ARCH_TRY(map_rows(b, ub, { { ubsrc, 0, ff }, { ubsrc, (int)ff, ff } }));
+        /* Gate-first: swap the halves. The VAE is diffusers' AutoencoderKLMiniMaxH3, whose
+         * `ff.net.0.proj` is the same value-first SwiGLU as the transformer's -- see the proof
+         * comment at the `ffn_gate_up` map_rows in declare_dit. The act columns inherit the
+         * swapped row order and `ff.net.2`'s columns follow it, so the swap is self-consistent
+         * end to end (and the swapped container is the one that decodes coherently). */
+        RAD_ARCH_TRY(map_rows(b, un, { { usrc, (int)ff, ff }, { usrc, 0, ff } }));
+        RAD_ARCH_TRY(map_rows(b, ub, { { ubsrc, (int)ff, ff }, { ubsrc, 0, ff } }));
         V.w_up = decl_w(b, un, RAD_BF16, { 2 * ff, dim }, acc, RAD_SHARD_NONE, grp_layer(gv));
         V.b_up = decl_w(b, ub, RAD_F32, { 2 * ff }, acc, RAD_SHARD_NONE, grp_layer(gv));
         V.w_down = wcopy(b, nm.f("%s.ffn_down.weight", dn), nm.ckpt("%s.ff.net.2.weight", pre),
