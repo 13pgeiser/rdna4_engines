@@ -119,7 +119,7 @@ const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx12
        peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
-       peacemaker-isa emit --kernel mq6_i8_gemm [--epi set|set_bf16|all] --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel mq6_i8_gemm [--epi set|set_bf16|all] [--tile 128x128|256x128|128x256] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
 const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]]
          (native assembly/link/bundle needs no ROCm tools; --bundle also writes FILE.sha256, bare lowercase SHA256)
@@ -501,10 +501,15 @@ fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
     ))
 }
 /// gfx1201 exact-INT8 MQ6G256V2 prefill GEMM twin of the hipcc `gemm_mq6g256v2_mmq_i8` route:
-/// `--epi set|set_bf16` one entry, `all` (default) the two-entry module.
-fn mq6_i8_gemm(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
-    use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, Spec};
+/// `--epi set|set_bf16` one entry, `all` (default) the two-entry module; `--tile
+/// 128x128|256x128|128x256` (default the shipped 128x128; a single entry only).
+fn mq6_i8_gemm(epi: &str, tile: Option<&str>, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, Spec, Tile};
+    let tile: Tile = tile.unwrap_or("128x128").parse()?;
     if epi == "all" {
+        if tile != Tile::T128x128 {
+            return Err("mq6_i8_gemm --tile: the product module is the shipped 128x128 tile; name one --epi".into());
+        }
         let (_, text, proof) = mq6_i8_gemm::emit_module(arch)?;
         return Ok((
             text,
@@ -517,6 +522,7 @@ fn mq6_i8_gemm(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
     let e = mq6_i8_gemm::emit(Spec {
         epi,
         raster: Raster::Banded,
+        tile,
         arch,
     })?;
     Ok((
@@ -1806,7 +1812,7 @@ fn run() -> Result<(), String> {
             }
             "qwen4_lane_rows" => qwen4_lane_rows(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_mq4_x4_gfx11" => qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
-            "mq6_i8_gemm" => mq6_i8_gemm(epi.as_deref().unwrap_or("all"), arch)?,
+            "mq6_i8_gemm" => mq6_i8_gemm(epi.as_deref().unwrap_or("all"), tile.as_deref(), arch)?,
             "mq_i4_rows" => mq_i4_rows(epi.as_deref().unwrap_or("all"), arch)?,
             "mq_i4_a4" => mq_i4_a4(epi.as_deref().unwrap_or("all"), arch)?,
             "moe_rotate_i4_pm" => moe_rotate_i4_pm(epi.as_deref().unwrap_or("all"), arch)?,

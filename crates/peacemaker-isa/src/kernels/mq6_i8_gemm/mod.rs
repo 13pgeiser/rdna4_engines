@@ -63,7 +63,7 @@ use peacemaker_author::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-pub use spec::{Epi, Raster, Spec};
+pub use spec::{Epi, Raster, Spec, Tile};
 
 pub const ENTRY: &str = "entry";
 pub const K_BEGIN: &str = ".Lmq6i8_k_begin";
@@ -140,8 +140,10 @@ pub struct Gen {
     /// `(d, float(s))` of token column block `nb` at `tok + 2 * nb` (`d`) and `+ 1` (`s`).
     pub(crate) tok: u8,
     pub(crate) msn: u8,
-    pub(crate) a_pf: [u8; 2],
-    pub(crate) w_pf: [u8; 2],
+    /// Raw prefetch payload per staging round: one b64 pair per activation round, one dword
+    /// triple per weight round (`Tile::a_rounds` / `w_rounds` of them).
+    pub(crate) a_pf: Vec<u8>,
+    pub(crate) w_pf: Vec<u8>,
     pub(crate) ds_nx: u8,
     pub(crate) sz_nx: u8,
     pub(crate) fr_a: u8,
@@ -150,7 +152,10 @@ pub struct Gen {
     pub(crate) st_wlds: u8,
     pub(crate) st_a: u8,
     pub(crate) st_w: u8,
+    /// LDS store address of the token-plane word, and of the row-plane word (the same register
+    /// on the shipped tile, whose two planes have the same extent).
     pub(crate) meta_lds: u8,
+    pub(crate) meta_lds_sz: u8,
     pub(crate) ds_voff: u8,
     pub(crate) sz_voff: u8,
     pub(crate) sc_addr: u8,
@@ -201,14 +206,14 @@ impl Gen {
             kernargs: spec.kernargs(),
             user_sgpr_count: 2,
             system_sgpr_workgroup_id_y: true,
-            workgroup_size: spec::THREADS as u16,
+            workgroup_size: self.spec.tile.threads() as u16,
             group_segment_fixed_size: 0,
             wave32: true,
             cu_mode: false,
         }
     }
     /// A physical register base of this assignment by name (read-only): VGPRs `cacc acc f0 f1 tok
-    /// msn a_pf0 a_pf1 w_pf0 w_pf1 ds_nx sz_nx fr_a fr_w st_alds st_wlds st_a st_w meta_lds ds_voff
+    /// msn a_pf0 a_pf1 w_pf0 w_pf1 ds_nx sz_nx fr_a fr_w st_alds st_wlds st_a st_w meta_lds meta_lds_sz ds_voff
     /// sz_voff sc_addr d_addr scratch` and the fold octets `fold_sc fold_zp fold_t`; SGPRs `karg
     /// srd_w srd_a0 srd_a1 srd_y step2 goff goff1 trips rs bs wave gpr200 omask tmp epi_s`; kernel
     /// arguments `arg_a arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None` for an unknown name.
@@ -222,9 +227,9 @@ impl Gen {
             "tok" => self.tok,
             "msn" => self.msn,
             "a_pf0" => self.a_pf[0],
-            "a_pf1" => self.a_pf[1],
+            "a_pf1" => return self.a_pf.get(1).copied(),
             "w_pf0" => self.w_pf[0],
-            "w_pf1" => self.w_pf[1],
+            "w_pf1" => return self.w_pf.get(1).copied(),
             "ds_nx" => self.ds_nx,
             "sz_nx" => self.sz_nx,
             "fr_a" => self.fr_a,
@@ -234,6 +239,7 @@ impl Gen {
             "st_a" => self.st_a,
             "st_w" => self.st_w,
             "meta_lds" => self.meta_lds,
+            "meta_lds_sz" => self.meta_lds_sz,
             "ds_voff" => self.ds_voff,
             "sz_voff" => self.sz_voff,
             "sc_addr" => self.sc_addr,
@@ -269,18 +275,18 @@ impl Gen {
             _ => return None,
         })
     }
-    /// An LDS slot of [`spec::LAYOUT`] by name (`A0 W0 A1 W1 DS0 DS1 SZ0 SZ1`) as `(base, bytes)`.
+    /// An LDS slot of the tile's [`spec::Tile::layout`] by name (`A0 W0 A1 W1 DS0 DS1 SZ0 SZ1`) as `(base, bytes)`.
     pub fn slot(&self, name: &str) -> Option<(u32, u32)> {
-        let l = spec::LAYOUT;
+        let l = self.spec.tile.layout();
         Some(match name {
             "A0" => (l.a[0], l.a_bytes),
             "A1" => (l.a[1], l.a_bytes),
             "W0" => (l.w[0], l.w_bytes),
             "W1" => (l.w[1], l.w_bytes),
-            "DS0" => (l.ds[0], l.meta_bytes),
-            "DS1" => (l.ds[1], l.meta_bytes),
-            "SZ0" => (l.sz[0], l.meta_bytes),
-            "SZ1" => (l.sz[1], l.meta_bytes),
+            "DS0" => (l.ds[0], l.ds_bytes),
+            "DS1" => (l.ds[1], l.ds_bytes),
+            "SZ0" => (l.sz[0], l.sz_bytes),
+            "SZ1" => (l.sz[1], l.sz_bytes),
             _ => return None,
         })
     }
@@ -303,8 +309,8 @@ impl Gen {
             f: [128, 140],
             tok: 152,
             msn: 161,
-            a_pf: [164, 166],
-            w_pf: [168, 171],
+            a_pf: [164, 166][..spec.tile.a_rounds() as usize].to_vec(),
+            w_pf: [168, 171][..spec.tile.w_rounds() as usize].to_vec(),
             ds_nx: 160,
             sz_nx: 162,
             fr_a: 163,
@@ -314,6 +320,13 @@ impl Gen {
             st_a: 177,
             st_w: 178,
             meta_lds: 179,
+            // The shipped tile's planes have the same extent, so one address serves both stores;
+            // the others take a prefetch register their single staging round leaves free.
+            meta_lds_sz: match spec.tile {
+                spec::Tile::T128x128 => 179,
+                spec::Tile::T256x128 => 166,
+                spec::Tile::T128x256 => 171,
+            },
             ds_voff: 180,
             sz_voff: 181,
             sc_addr: 182,
@@ -380,6 +393,9 @@ impl Gen {
         ] {
             p.v::<1>(name, r, kernel())?;
         }
+        if self.meta_lds_sz != self.meta_lds {
+            p.v::<1>("meta_lds_sz", self.meta_lds_sz, kernel())?;
+        }
         // The epilogue derives the lane's row and token from these.
         p.v::<1>("sc_addr", self.sc_addr, Live::Whole)?;
         p.v::<1>("d_addr", self.d_addr, Live::Whole)?;
@@ -436,7 +452,7 @@ impl Gen {
         ),
         String,
     > {
-        let l = spec::LAYOUT;
+        let l = self.spec.tile.layout();
         let (a0, w0) = (
             wg.lds("A0", l.a[0], l.a_bytes)?,
             wg.lds("W0", l.w[0], l.w_bytes)?,
@@ -446,12 +462,12 @@ impl Gen {
             wg.lds("W1", l.w[1], l.w_bytes)?,
         );
         let (d0, d1) = (
-            wg.lds("DS0", l.ds[0], l.meta_bytes)?,
-            wg.lds("DS1", l.ds[1], l.meta_bytes)?,
+            wg.lds("DS0", l.ds[0], l.ds_bytes)?,
+            wg.lds("DS1", l.ds[1], l.ds_bytes)?,
         );
         let (s0, s1) = (
-            wg.lds("SZ0", l.sz[0], l.meta_bytes)?,
-            wg.lds("SZ1", l.sz[1], l.meta_bytes)?,
+            wg.lds("SZ0", l.sz[0], l.sz_bytes)?,
+            wg.lds("SZ1", l.sz[1], l.sz_bytes)?,
         );
         Ok((
             Ring::new(a0, a1),
@@ -554,6 +570,7 @@ pub fn emit_module(arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModulePro
             emit(Spec {
                 epi,
                 raster: Raster::Banded,
+                tile: spec::Tile::T128x128,
                 arch,
             })
         })

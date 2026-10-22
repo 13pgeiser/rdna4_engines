@@ -77,8 +77,9 @@ pub(crate) fn ds_load(text: String, dst: RegRef, addr: u8) -> Instruction {
 /// Raw activation chunks of K32 half `sb` of slab `slab` of the block whose descriptor is
 /// `srd`: one b64 per staging round into `a_pf[r]`.
 pub(crate) fn fetch_a(b: &mut Builder, g: &Gen, slab: u32, sb: u32, srd: u8) -> Result<(), String> {
-    b.clause(|b| {
-        for r in 0..2u32 {
+    let round_rows = g.spec.tile.round_rows();
+    let mut load = |b: &mut Builder| {
+        for r in 0..g.a_pf.len() as u32 {
             vload(
                 b,
                 g.a_pf[r as usize],
@@ -86,11 +87,17 @@ pub(crate) fn fetch_a(b: &mut Builder, g: &Gen, slab: u32, sb: u32, srd: u8) -> 
                 g.st_a,
                 srd,
                 None,
-                8 + 64 * slab + 32 * sb + r * 64 * spec::XBLK_BYTES,
+                8 + 64 * slab + 32 * sb + r * round_rows * spec::XBLK_BYTES,
             )?;
         }
         Ok(())
-    })
+    };
+    // A clause needs two loads; a tile with one activation round has one.
+    if g.a_pf.len() == 1 {
+        load(b)
+    } else {
+        b.clause(load)
+    }
     .map_err(|e| format!("fetch_a(slab {slab}, sb {sb}): {e}"))
 }
 
@@ -98,7 +105,7 @@ pub(crate) fn fetch_a(b: &mut Builder, g: &Gen, slab: u32, sb: u32, srd: u8) -> 
 /// (`8 + 96 h + 48 slab`, plus the group stride when fetching across a group boundary).
 pub(crate) fn fetch_w(b: &mut Builder, g: &Gen, base: u32) -> Result<(), String> {
     b.clause(|b| {
-        for r in 0..2usize {
+        for r in 0..g.w_pf.len() {
             let soff = if r == 0 { g.goff } else { g.goff1 };
             for i in 0..3u32 {
                 vload(
@@ -248,12 +255,14 @@ pub(crate) fn decode_round<S: Sink>(b: &mut S, g: &Gen, r: usize) -> Result<(), 
 /// The two LDS stores of the decoded operands of weight round `r` into slot `slot`: `e0` (data
 /// in `o`) at `+0`, `e1` (data in `p`) at `+512`.
 pub(crate) fn store_w_insns(g: &Gen, slot: usize, r: usize) -> Result<[Instruction; 2], String> {
-    if slot > 1 || r > 1 {
+    if slot > 1 || r >= g.w_pf.len() {
         return Err(format!(
-            "store_w: slot {slot} / round {r} out of range (0..2)"
+            "store_w: slot {slot} / round {r} out of range (2 / {})",
+            g.w_pf.len()
         ));
     }
-    let base = spec::LAYOUT.w[slot] + 4096 * r as u32;
+    let tile = g.spec.tile;
+    let base = tile.layout().w[slot] + tile.round_lds_stride() * r as u32;
     let (o, p) = (g.scratch + 4, g.scratch + 2);
     Ok([
         ds_store(
@@ -293,12 +302,13 @@ pub(crate) fn store_w_round<C: State>(
 }
 
 /// The two LDS stores of the raw activation chunks of K32 half `sb` into slot `slot`.
-pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<[Instruction; 2], String> {
+pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<Vec<Instruction>, String> {
     if slot > 1 || sb > 1 {
         return Err(format!(
             "store_a: slot {slot} / half {sb} out of range (0..2)"
         ));
     }
+    let tile = g.spec.tile;
     let one = |r: u32| {
         let ar = g.a_pf[r as usize];
         ds_store(
@@ -307,12 +317,12 @@ pub(crate) fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<[Instructio
                 g.st_alds,
                 ar,
                 ar + 1,
-                ds_offset(spec::LAYOUT.a[slot] + 4096 * r + 1024 * sb)
+                ds_offset(tile.layout().a[slot] + tile.round_lds_stride() * r + 1024 * sb)
             ),
             vec![v(g.st_alds), vr(ar, 2)],
         )
     };
-    Ok([one(0), one(1)])
+    Ok((0..g.a_pf.len() as u32).map(one).collect())
 }
 
 /// The raw activation chunks of K32 half `sb` to LDS slot `slot`.
@@ -381,7 +391,7 @@ pub(crate) fn meta_store_insns(g: &Gen, plane: usize) -> Result<[Instruction; 2]
     if plane > 1 {
         return Err(format!("meta plane {plane} out of range (0..2)"));
     }
-    let l = spec::LAYOUT;
+    let l = g.spec.tile.layout();
     let (x, wr) = (g.scratch + 6, g.scratch + 7);
     Ok([
         ds_store(
@@ -395,17 +405,18 @@ pub(crate) fn meta_store_insns(g: &Gen, plane: usize) -> Result<[Instruction; 2]
         ds_store(
             format!(
                 "ds_store_b32 v{}, v{wr}{}",
-                g.meta_lds,
+                g.meta_lds_sz,
                 ds_offset(l.sz[plane])
             ),
-            vec![v(g.meta_lds), v(wr)],
+            vec![v(g.meta_lds_sz), v(wr)],
         ),
     ])
 }
 
 /// Publish the next block's `d` / `float(s)` token plane and the `sc` / `z' =
-/// z + 32 s` row planes (planar: `sc` / `d` at `+0`, `z'` / `float(s)` at `+512`; lane `tid`
-/// writes slot `tid >> 1` of plane `tid & 1`). Rows past `M` and tokens past `N` read 0 through
+/// z + 32 s` row planes (planar per chunk of 128: `sc` / `d` at `+0`, `z'` / `float(s)` at
+/// `+512`; lane `tid` writes slot `tid >> 1` of plane `tid & 1`; on the 512-thread tiles the
+/// lanes past the shorter plane's extent store its words a second time, the same values). Rows past `M` and tokens past `N` read 0 through
 /// the descriptors.
 pub(crate) fn publish_meta<C: State>(
     w: &mut Wv,

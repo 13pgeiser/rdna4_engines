@@ -11,7 +11,7 @@
 //! out-of-tile word is checked against a sentinel.
 use peacemaker_ir::emu::{Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;
-use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Spec};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Spec, Tile};
 use peacemaker_isa::Arch;
 
 const KERNARG: u64 = 0x1_0000;
@@ -183,10 +183,17 @@ fn reference(c: &Case, d: &Data, epi: Epi) -> Vec<u8> {
 }
 
 fn run(c: &Case, epi: Epi, seed: u64) {
+    run_tile(c, epi, Tile::T128x128, seed);
+}
+
+/// Run `tile`'s kernel (linear raster) on the interpreter over the whole grid, require the exact
+/// CPU reference bit for bit, and return the output bytes.
+fn run_tile(c: &Case, epi: Epi, tile: Tile, seed: u64) -> Vec<u8> {
     let rng = &mut Rng(seed);
     let data = make(rng, c);
     let want = reference(c, &data, epi);
-    let emitted = mq6_i8_gemm::emit(Spec::emulation(epi)).unwrap();
+    let spec = Spec::emulation(epi).with_tile(tile);
+    let emitted = mq6_i8_gemm::emit(spec).unwrap();
     let elf = peacemaker_isa::native::assemble(&emitted.s_text, Arch::Gfx1201).unwrap();
     let program = peacemaker_lift::lift_object(
         &elf,
@@ -196,7 +203,7 @@ fn run(c: &Case, epi: Epi, seed: u64) {
     )
     .unwrap()
     .program;
-    let emu = Emulator::new(&program, &Spec::emulation(epi).symbol()).unwrap();
+    let emu = Emulator::new(&program, &spec.symbol()).unwrap();
 
     let mut mem = Memory::default();
     let mut karg = vec![0u8; 296];
@@ -206,7 +213,10 @@ fn run(c: &Case, epi: Epi, seed: u64) {
     karg[24..28].copy_from_slice(&(c.m as u32).to_le_bytes());
     karg[28..32].copy_from_slice(&(c.k as u32).to_le_bytes());
     karg[32..36].copy_from_slice(&(c.n as u32).to_le_bytes());
-    let (gx, gy) = (c.m.div_ceil(128) as u32, c.n.div_ceil(128) as u32);
+    let (gx, gy) = (
+        c.m.div_ceil(tile.rows() as usize) as u32,
+        c.n.div_ceil(tile.tokens() as usize) as u32,
+    );
     karg[40..44].copy_from_slice(&gx.to_le_bytes());
     karg[44..48].copy_from_slice(&gy.to_le_bytes());
     karg[48..52].copy_from_slice(&1u32.to_le_bytes());
@@ -221,8 +231,8 @@ fn run(c: &Case, epi: Epi, seed: u64) {
                 &Launch {
                     kernarg_ptr: KERNARG,
                     workgroup: [gx_i, gy_i, 0],
-                    block: [spec::THREADS, 1, 1],
-                    dynamic_lds: spec::LAUNCH_LDS_BYTES,
+                    block: [tile.threads(), 1, 1],
+                    dynamic_lds: tile.layout().launch,
                 },
                 &mut mem,
             )
@@ -244,7 +254,7 @@ fn run(c: &Case, epi: Epi, seed: u64) {
         assert_eq!(
             g,
             e,
-            "M={} K={} N={} {epi:?}: token {} row {}",
+            "M={} K={} N={} {epi:?} {tile:?}: token {} row {}",
             c.m,
             c.k,
             c.n,
@@ -252,6 +262,7 @@ fn run(c: &Case, epi: Epi, seed: u64) {
             i % c.m
         );
     }
+    got.to_vec()
 }
 
 #[test]
@@ -363,6 +374,74 @@ fn multi_tile_grid_bf16() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Tiles: every tile computes the same exact math (integer dot, the same per-element fold order), so
+// each is bit-equal to the CPU reference and therefore to the shipped 128x128 tile. The shapes make
+// edge tiles of every kind: M and N that are not multiples of the tile in either direction, grids
+// of several tiles, one-trip and looped K.
+
+fn tile_cases() -> Vec<Case> {
+    let case = |m, k, n, fill| Case { m, k, n, fill };
+    vec![
+        // One ragged tile per direction of every tile size.
+        case(48, 256, 40, Fill::Random),
+        // Ragged in M past the 256-row tile and in N past the 256-token tile; K looped.
+        case(300, 512, 150, Fill::Random),
+        case(132, 512, 300, Fill::Random),
+        // Whole tiles, looped K with three trips, and a negative chain.
+        case(256, 1024, 256, Fill::Random),
+        case(260, 768, 132, Fill::NegOnes),
+    ]
+}
+
+fn tiles_agree(epi: Epi) {
+    for (i, c) in tile_cases().into_iter().enumerate() {
+        let seed = 100 + i as u64;
+        let base = run_tile(&c, epi, Tile::T128x128, seed);
+        for tile in [Tile::T256x128, Tile::T128x256] {
+            let got = run_tile(&c, epi, tile, seed);
+            assert!(
+                got == base,
+                "{tile:?} differs from T128x128 at M={} K={} N={}",
+                c.m,
+                c.k,
+                c.n
+            );
+        }
+    }
+}
+
+#[test]
+fn every_tile_is_bit_equal_to_the_reference_and_the_shipped_tile_f32() {
+    tiles_agree(Epi::Set);
+}
+
+#[test]
+fn every_tile_is_bit_equal_to_the_reference_and_the_shipped_tile_bf16() {
+    tiles_agree(Epi::SetBf16);
+}
+
+#[test]
+fn one_hot_activations_pair_every_code_position_on_every_tile() {
+    // A single +1 at qs byte j of every block isolates one weight code: a wrong lane or LDS slot in
+    // a tile's staging shows as a wrong code at that position.
+    for tile in [Tile::T256x128, Tile::T128x256] {
+        for j in [0usize, 7, 8, 63, 64, 127] {
+            run_tile(
+                &Case {
+                    m: 260,
+                    k: 256,
+                    n: 132,
+                    fill: Fill::OneHot(j),
+                },
+                Epi::Set,
+                tile,
+                50 + j as u64,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Offline gates: hot-loop shape contract, occupancy ceiling, determinism, assembly of the product module.
 
 fn contract() -> serde_json::Value {
@@ -420,6 +499,74 @@ fn register_plan_keeps_the_occupancy_ceiling_and_lds_fits_two_workgroups() {
     assert!(2 * spec::LAUNCH_LDS_BYTES <= 128 * 1024);
 }
 
+/// The occupancy the tile docs state: 192 VGPRs allow 8 waves per SIMD32 (32 per WGP), and the
+/// launch LDS of every tile fits at least two workgroups into the WGP's 128 KiB.
+#[test]
+fn every_tile_keeps_the_register_ceiling_and_the_documented_occupancy() {
+    for tile in Tile::ALL {
+        for epi in [Epi::Set, Epi::SetBf16] {
+            let e = mq6_i8_gemm::emit(Spec::product(epi).with_tile(tile)).unwrap();
+            assert!(
+                e.shape.next_free_vgpr <= spec::VGPR_CEILING,
+                "{tile:?} {epi:?}: {} VGPRs",
+                e.shape.next_free_vgpr
+            );
+            assert_eq!(e.shape.wmma, 256, "{tile:?} {epi:?}");
+            assert!(e
+                .s_text
+                .contains(&format!(".amdhsa_group_segment_fixed_size {}", 0)));
+        }
+        let (waves, lds) = (tile.waves(), tile.layout().launch);
+        let by_vgpr = 32 / waves;
+        let by_lds = 128 * 1024 / lds;
+        assert!(by_vgpr >= 2 && by_lds >= 2, "{tile:?}");
+        let resident = by_vgpr.min(by_lds) * waves;
+        assert_eq!(
+            resident,
+            match tile {
+                Tile::T128x128 => 24,
+                _ => 32,
+            },
+            "{tile:?}"
+        );
+        // The layout stays inside its launch bytes and every plane is disjoint.
+        let l = tile.layout();
+        let mut planes = vec![];
+        for s in 0..2 {
+            planes.push((l.a[s], l.a_bytes));
+            planes.push((l.w[s], l.w_bytes));
+            planes.push((l.ds[s], l.ds_bytes));
+            planes.push((l.sz[s], l.sz_bytes));
+        }
+        planes.sort();
+        for w in planes.windows(2) {
+            assert!(w[0].0 + w[0].1 <= w[1].0, "{tile:?}: planes overlap");
+        }
+        let last = planes.last().unwrap();
+        assert_eq!(last.0 + last.1, l.launch, "{tile:?}");
+        assert_eq!(l.a_bytes, tile.tokens() * 64);
+        assert_eq!(l.w_bytes, tile.rows() * 64);
+        assert_eq!(l.ds_bytes, tile.tokens() * 8);
+        assert_eq!(l.sz_bytes, tile.rows() * 8);
+    }
+}
+
+#[test]
+fn tiles_have_their_own_variant_names_and_symbols() {
+    let p = Spec::product(Epi::Set);
+    assert_eq!(p.variant_name(), "128x128x8-set");
+    assert_eq!(p.symbol(), "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201");
+    let t = p.with_tile(Tile::T256x128);
+    assert_eq!(t.variant_name(), "256x128x16-set");
+    assert_eq!(t.symbol(), "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t256x128");
+    let t = Spec::emulation(Epi::SetBf16).with_tile(Tile::T128x256);
+    assert_eq!(t.variant_name(), "128x256x16-set_bf16-linear");
+    assert_eq!(
+        t.symbol(),
+        "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201_t128x256_linear"
+    );
+}
+
 #[test]
 fn emission_is_deterministic_and_the_module_assembles() {
     let (a, text_a, proof_a) = mq6_i8_gemm::emit_module(Arch::Gfx1201).unwrap();
@@ -443,6 +590,7 @@ fn gfx1201_only() {
         assert!(mq6_i8_gemm::emit(Spec {
             epi: Epi::Set,
             raster: mq6_i8_gemm::Raster::Banded,
+            tile: Tile::T128x128,
             arch
         })
         .is_err());

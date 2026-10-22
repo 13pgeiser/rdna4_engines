@@ -21,14 +21,17 @@
 //
 // Variant grammar: the shipped variant name, `Spec::variant_name()`:
 //
-//     128x128x8-EPI[-linear]
+//     TILE-EPI[-linear]
 //
+//     TILE    128x128x8 | 256x128x16 | 128x256x16   (rows x tokens x waves per workgroup; the
+//             first is the shipped tile, the others run 16 waves of the same 32 x 64 per-wave tile)
 //     EPI     set | set_bf16        (F32 overwrite | BF16 bits)
 //     linear  optional: the linear CTA raster (the CPU interpreter twin); default: banded (product)
 //
-// e.g. `128x128x8-set`, `128x128x8-set_bf16`, `128x128x8-set-linear`. `VARIANTS` lists every one.
-// gfx1201 only. Geometry (128 rows x 128 tokens x 8 waves, the LDS layout, two buffers per ring)
-// is a spec axis of the Rust generator and needs a rebuild to change.
+// e.g. `128x128x8-set`, `256x128x16-set_bf16`, `128x256x16-set-linear`. `VARIANTS` lists every one.
+// gfx1201 only. The tile changes how many staging rounds a slab takes (`g.a_rounds()` /
+// `g.w_rounds()`), which this script reads; the per-tile geometry (waves, LDS layout, register
+// map, two buffers per ring) is the Rust generator's and needs a rebuild to change.
 
 const ARCHES: &[&str] = &["gfx1201"];
 
@@ -37,6 +40,14 @@ const VARIANTS: &[&str] = &[
     "128x128x8-set-linear",
     "128x128x8-set_bf16",
     "128x128x8-set_bf16-linear",
+    "256x128x16-set",
+    "256x128x16-set-linear",
+    "256x128x16-set_bf16",
+    "256x128x16-set_bf16-linear",
+    "128x256x16-set",
+    "128x256x16-set-linear",
+    "128x256x16-set_bf16",
+    "128x256x16-set_bf16-linear",
 ];
 
 region PayA, PayW, MetaD, MetaS;
@@ -53,11 +64,14 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
 fn mq6_spec(variant: &str, arch: Arch) -> Result<Mq6Spec, String> {
     let parts: Vec<&str> = variant.split('-').collect();
     if parts.len() < 2 || parts.len() > 3 {
-        return Err(format!("variant `{variant}`: expected 128x128x8-EPI[-linear]"));
+        return Err(format!("variant `{variant}`: expected TILE-EPI[-linear]"));
     }
-    if parts[0] != "128x128x8" {
-        return Err(format!("variant `{variant}`: unknown tile `{}` (128x128x8)", parts[0]));
-    }
+    let tile = match parts[0] {
+        "128x128x8" => Mq6Tile::T128x128,
+        "256x128x16" => Mq6Tile::T256x128,
+        "128x256x16" => Mq6Tile::T128x256,
+        t => return Err(format!("variant `{variant}`: unknown tile `{t}` (128x128x8, 256x128x16, 128x256x16)")),
+    };
     let epi = match parts[1] {
         "set" => Mq6Epi::Set,
         "set_bf16" => Mq6Epi::SetBf16,
@@ -71,7 +85,7 @@ fn mq6_spec(variant: &str, arch: Arch) -> Result<Mq6Spec, String> {
     } else {
         Raster::Banded
     };
-    Ok(Mq6Spec { epi: epi, raster: raster, arch: arch })
+    Ok(Mq6Spec { epi: epi, raster: raster, tile: tile, arch: arch })
 }
 
 // The Workgroup scope lives here, not in emit(): emit() mentions `b` again at finish(), which
@@ -140,7 +154,7 @@ fn prologue<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, end: Exit, lds: [Ring; 4]) ->
     mq6::zero_acc(wg, g)?;
     let _ = wg.begin_write(ra);
     let _ = wg.begin_write(rw);
-    for rnd in 0..2usize {
+    for rnd in 0..g.w_rounds() {
         push_all(wg, mq6::decode_insns(g, rnd)?)?;
         for insn in mq6::store_w_insns(g, 0, rnd)? {
             wg.ds_store(rw, insn)?;
@@ -370,8 +384,11 @@ fn block<T: Target>(
     queue_decode(&mut st, mq6::decode_insns(g, 0)?);
     st.work.push(Work::FetchA(1, 1, srd_a[h]));
     st.work.push(Work::StoreW(0));
-    queue_decode(&mut st, mq6::decode_insns(g, 1)?);
-    st.work.push(Work::StoreW(1));
+    // A tile with one weight round (128 rows on 512 threads) has no second round to decode.
+    if g.w_rounds() > 1 {
+        queue_decode(&mut st, mq6::decode_insns(g, 1)?);
+        st.work.push(Work::StoreW(1));
+    }
     st.work.push(Work::StoreA(1));
     // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
     phase(wg, g, &mut st, 0, true, 8, 3)?;
@@ -400,8 +417,10 @@ fn block<T: Target>(
         st.work.push(Work::StoreW(0));
         st.work.push(Work::StoreA(0));
         st.work.push(Work::FetchA(0, 1, srd_a[h ^ 1]));
-        queue_decode(&mut st, mq6::decode_insns(g, 1)?);
-        st.work.push(Work::StoreW(1));
+        if g.w_rounds() > 1 {
+            queue_decode(&mut st, mq6::decode_insns(g, 1)?);
+            st.work.push(Work::StoreW(1));
+        }
         st.work.push(Work::StoreA(1));
         st.work.push(Work::Meta);
     }

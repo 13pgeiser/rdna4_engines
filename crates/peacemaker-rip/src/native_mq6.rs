@@ -2,9 +2,9 @@
 //!
 //! Two layers over `peacemaker_isa::kernels::mq6_i8_gemm`, adding no typestate surface:
 //!
-//! - Coarse: `Mq6Gemm::emit(Mq6Spec { epi, raster, arch })` and `Mq6Gemm::emit_module(arch)` return
-//!   what the Rust functions return; `Spec::validate` stays the gate. `Mq6Epi::{Set, SetBf16}` and
-//!   `Raster::{Banded, Linear}` are enum values.
+//! - Coarse: `Mq6Gemm::emit(Mq6Spec { epi, raster, tile, arch })` and `Mq6Gemm::emit_module(arch)` return
+//!   what the Rust functions return; `Spec::validate` stays the gate. `Mq6Epi::{Set, SetBf16}`,
+//!   `Raster::{Banded, Linear}` and `Mq6Tile::{T128x128, T256x128, T128x256}` are enum values.
 //! - Blocks: `Mq6Gen::new(spec)` and the `mq6::*` natives of `mq6_i8_gemm::blocks`. Unlike the
 //!   `iu4::*` blocks these own no ring and never enter the typed core (no `Driver::typed`, no
 //!   `Lend`): the natives that touch LDS **return `Instruction`s** (`mq6::store_w_insns`,
@@ -21,7 +21,7 @@ use super::{
 use crate::interp::{Cx, Interp, R};
 use crate::value::Value;
 use peacemaker_isa::insn::Instruction;
-use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, blocks, Epi, Gen, Raster, Spec};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, blocks, Epi, Gen, Raster, Spec, Tile};
 use peacemaker_isa::Emitted;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -70,7 +70,10 @@ pub(super) fn is_fn(name: &str) -> bool {
 }
 
 pub(super) fn is_type(n: &str) -> bool {
-    matches!(n, "Mq6Epi" | "Raster" | "Mq6Spec" | "Mq6Gemm" | "Mq6Gen")
+    matches!(
+        n,
+        "Mq6Epi" | "Raster" | "Mq6Tile" | "Mq6Spec" | "Mq6Gemm" | "Mq6Gen"
+    )
 }
 
 pub(super) fn is_struct(n: &str) -> bool {
@@ -80,6 +83,7 @@ pub(super) fn is_struct(n: &str) -> bool {
 const ENUMS: &[(&str, &[&str])] = &[
     ("Mq6Epi", &["Set", "SetBf16"]),
     ("Raster", &["Banded", "Linear"]),
+    ("Mq6Tile", &["T128x128", "T256x128", "T128x256"]),
 ];
 
 pub(super) fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
@@ -129,6 +133,15 @@ fn raster_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Raster> {
     }
 }
 
+fn tile_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Tile> {
+    match variant_of(it, v, "Mq6Tile")?.as_str() {
+        "T128x128" => Ok(Tile::T128x128),
+        "T256x128" => Ok(Tile::T256x128),
+        "T128x256" => Ok(Tile::T128x256),
+        o => Err(format!("`Mq6Tile::{o}` is not a variant of Mq6Tile")),
+    }
+}
+
 fn enum_val<'a>(ty: &str, var: &str) -> Value<'a> {
     Value::Enum(Rc::from(ty), Rc::from(var), vec![])
 }
@@ -158,6 +171,7 @@ fn spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Spec> {
     let spec = Spec {
         epi: epi_of(it, &field(&mut fs, n, "epi")?)?,
         raster: raster_of(it, &field(&mut fs, n, "raster")?)?,
+        tile: tile_of(it, &field(&mut fs, n, "tile")?)?,
         arch: arch_of(it, &field(&mut fs, n, "arch")?)?,
     };
     if let Some((k, _)) = fs.first() {
@@ -173,6 +187,7 @@ fn spec_val<'a>(s: Spec) -> Value<'a> {
         vec![
             f("epi", enum_val("Mq6Epi", &format!("{:?}", s.epi))),
             f("raster", enum_val("Raster", &format!("{:?}", s.raster))),
+            f("tile", enum_val("Mq6Tile", &format!("{:?}", s.tile))),
             f("arch", nat(Nat::Arch(s.arch))),
         ],
     )
@@ -465,7 +480,8 @@ fn call<'a>(it: &Interp<'a>, name: &str, a: &[Value<'a>], cx: &mut Cx<'_>) -> R<
     }
 }
 
-/// Methods of an `Mq6Gen`: `plan()`, `kernel_spec()`, `spec()`, `reg(name)`, `slot(name)`.
+/// Methods of an `Mq6Gen`: `plan()`, `kernel_spec()`, `spec()`, `reg(name)`, `slot(name)`,
+/// `a_rounds()`, `w_rounds()` (staging rounds per slab of the tile's activations / weights).
 pub(super) fn method<'a>(
     it: &Interp<'a>,
     g: &Rc<Gen>,
@@ -493,6 +509,14 @@ pub(super) fn method<'a>(
             Some(Value::option(
                 g.reg(&str_of(it, &a[0], "reg")?).map(Value::u8),
             ))
+        }
+        "a_rounds" => {
+            need(0)?;
+            Some(Value::usize(g.spec().tile.a_rounds() as usize))
+        }
+        "w_rounds" => {
+            need(0)?;
+            Some(Value::usize(g.spec().tile.w_rounds() as usize))
         }
         "slot" => {
             need(1)?;

@@ -22,6 +22,12 @@
 //! - **Everything else emits straight into the builder** (fetches, decode, WMMA steps, the fold,
 //!   the seed fill, the prologue's scalar and lane set-up, the epilogue).
 //!
+//! The blocks follow the spec's [`Tile`](super::Tile): the staging rounds (`a_rounds` / `w_rounds`
+//! instructions of [`store_a_insns`], one decode of [`decode_insns`] and one weight store per
+//! weight round), the LDS layout behind every offset, the raster shifts of the prologue and the
+//! epilogue's coordinates. A composition reads `Tile::w_rounds` (the `.rip` twin: `g.w_rounds()`)
+//! to queue the second decode / store only on the tiles that have a second weight round.
+//!
 //! The kernel order, as `emit` composes it:
 //!
 //! ```text
@@ -33,7 +39,7 @@
 //!         peeled blocks t0, t1   (block = phase A, B1 split barrier, phase B, fold, B2 split barrier)
 //! label EPI; epilogue; wg.end(end)
 //! ```
-use super::{fold, prologue, publish, spec};
+use super::{fold, prologue, publish};
 use crate::kernels::common::{op, s, sr, vr};
 use crate::{insn::Instruction, reg::Live, Builder, V};
 
@@ -184,7 +190,12 @@ pub fn wait_all(b: &mut Builder) -> Result<(), String> {
 /// dwords spread into the two iu8 operands, left in the decode scratch (`e0` in the `o` pair, `e1`
 /// in the `p` pair). The caller pushes them (the K-loop spreads them between WMMAs).
 pub fn decode_insns(g: &Gen, r: usize) -> Result<Vec<Instruction>, String> {
-    plane("decode_round", r)?;
+    if r >= g.w_pf.len() {
+        return Err(format!(
+            "decode_round: round {r} out of range (0..{})",
+            g.w_pf.len()
+        ));
+    }
     let mut insns = Vec::new();
     publish::decode_round(&mut insns, g, r)?;
     Ok(insns)
@@ -276,7 +287,7 @@ pub fn step_load_insns(
         ));
     }
     let f = g.f[set];
-    let l = spec::LAYOUT;
+    let l = g.spec.tile.layout();
     let o = 512 * step;
     let w = publish::ds_load(
         format!(
@@ -312,9 +323,9 @@ pub fn store_w_insns(g: &Gen, slot: usize, r: usize) -> Result<[Instruction; 2],
     publish::store_w_insns(g, slot, r)
 }
 
-/// The two LDS stores of the raw activation chunks (from [`fetch_a`]) of K32 half `sb` into slot
-/// `slot` of the `A` ring.
-pub fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<[Instruction; 2], String> {
+/// The LDS stores of the raw activation chunks (from [`fetch_a`]) of K32 half `sb` into slot
+/// `slot` of the `A` ring, one per activation round (`Tile::a_rounds`).
+pub fn store_a_insns(g: &Gen, slot: usize, sb: u32) -> Result<Vec<Instruction>, String> {
     publish::store_a_insns(g, slot, sb)
 }
 
@@ -340,7 +351,7 @@ pub fn fold_addr(b: &mut Builder, g: &Gen, h: usize) -> Result<(), String> {
         format!(
             "v_add_nc_u32_e32 v{}, {}, v{}",
             g.msn,
-            lit(spec::LAYOUT.ds[h]),
+            lit(g.spec.tile.layout().ds[h]),
             g.d_addr
         ),
         &[v(g.msn)],
@@ -380,7 +391,7 @@ pub fn fold_sz_load_insn(g: &Gen, h: usize, dst: u8, rel: u32) -> Result<Instruc
             dst,
             dst + 3,
             g.sc_addr,
-            super::ds_offset(spec::LAYOUT.sz[h] + rel)
+            super::ds_offset(g.spec.tile.layout().sz[h] + rel)
         ),
         vr(dst, 4),
         g.sc_addr,

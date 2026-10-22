@@ -528,11 +528,12 @@ Geometry (128 rows x 128 tokens x 8 waves), the LDS layout, the register map and
 
 | call | meaning |
 |---|---|
-| `Mq6Gemm::emit(Mq6Spec { epi, raster, arch })?` | what `mq6_i8_gemm::emit` returns (`Emitted`); `Spec::validate` stays the gate (gfx1201 only) |
+| `Mq6Gemm::emit(Mq6Spec { epi, raster, tile, arch })?` | what `mq6_i8_gemm::emit` returns (`Emitted`); `Spec::validate` stays the gate (gfx1201 only) |
 | `Mq6Gemm::emit_module(arch)?` | `(Vec<Emitted>, text, proof_json)` of the product module (both epilogue symbols, banded raster) |
-| `Mq6Epi::{Set, SetBf16}`, `Raster::{Banded, Linear}` | the spec enums (script enum values). `Linear` is the CPU-interpreter twin's raster |
+| `Mq6Epi::{Set, SetBf16}`, `Raster::{Banded, Linear}`, `Mq6Tile::{T128x128, T256x128, T128x256}` | the spec enums (script enum values). `Linear` is the CPU-interpreter twin's raster. The tile is the CTA's weight rows x tokens: `T128x128` is the shipped 8-wave tile (256 threads, 36864 B LDS); the other two run 16 waves (512 threads, 55296 B LDS) of the same 32 x 64 per-wave tile, so they stay at the 192-VGPR ceiling |
 | `Mq6Gen::new(Mq6Spec { .. })?` | the generator of one valid spec: an opaque value with read-only accessors |
 | `gen.plan()?`, `gen.kernel_spec()`, `gen.spec()` | the `RegPlan`, the `KernelSpec`, the `Mq6Spec` |
+| `gen.a_rounds()`, `gen.w_rounds()` | staging rounds per 64-K slab of the tile's activations / weights: 2 / 2 on `T128x128`, 1 / 2 on `T256x128`, 2 / 1 on `T128x256`. A tile with one weight round has no second decode / store; `gen.reg("a_pf1")` / `reg("w_pf1")` are `None` for the round it lacks |
 | `gen.reg("name")` | `Option<u8>`, a physical register base by name: VGPRs `cacc acc f0 f1 tok msn a_pf0 a_pf1 w_pf0 w_pf1 ds_nx sz_nx fr_a fr_w st_alds st_wlds st_a st_w meta_lds ds_voff sz_voff sc_addr d_addr scratch fold_sc fold_zp fold_t`, SGPRs `karg srd_w srd_a0 srd_a1 srd_y step2 goff goff1 trips rs bs wave gpr200 omask tmp epi_s`, kernel arguments `arg_a arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy` |
 | `gen.slot("A0")` | `Option<(base, bytes)>` of an LDS slot: `A0 W0 A1 W1 DS0 DS1 SZ0 SZ1` |
 | `mq6::ENTRY K_BEGIN K_LOOP K_LOOP_END EPI END`, `mq6::GROUP_BYTES` | the label constants (strings) and the MQ6G256V2 group size (200) |
@@ -552,8 +553,8 @@ Geometry (128 rows x 128 tokens x 8 waves), the LDS layout, the register map and
 | `mq6::fetch_w(wg, g, base)?` | raw weight dwords (both rounds) at group-relative byte offset `base` |
 | `mq6::fetch_meta(wg, g, h, hdr)?` | the next block's token word and packed row header |
 | `mq6::wait_all(wg)?` | the builder's ledger-wide wait (the staging registers are still sources of the previous stores until it) |
-| `mq6::decode_insns(g, r)?` | `Vec<Instruction>`: weight round `r`'s decode (VALU), for the script to push, spread between WMMAs |
-| `mq6::store_w_insns(g, slot, r)?`, `mq6::store_a_insns(g, slot, sb)?` | `[Instruction; 2]` LDS stores of a decoded weight round / a raw activation half into slot `slot`; issue with `wg.ds_store(ring, insn)` on the W / A ring |
+| `mq6::decode_insns(g, r)?` | `Vec<Instruction>`: weight round `r`'s (`0..gen.w_rounds()`) decode (VALU), for the script to push, spread between WMMAs |
+| `mq6::store_w_insns(g, slot, r)?`, `mq6::store_a_insns(g, slot, sb)?` | `[Instruction; 2]` LDS stores of a decoded weight round / `Vec<Instruction>` (one per activation round) of a raw activation half into slot `slot`; issue with `wg.ds_store(ring, insn)` on the W / A ring |
 | `mq6::meta_valu(wg, g)?`, `mq6::meta_store_insns(g, plane)?` | the metadata VALU words (before the DS / SZ rings begin their write), then `[Instruction; 2]` stores into plane `plane` (the DS ring's `next_index()`) |
 | `mq6::mma(wg, g, step, set, first, i)?` | the `i`-th (0..8) `v_wmma_i32_16x16x16_iu8` of K16 step `step` (0..4) on fragment set `set`; `first` seeds from the decode scratch's `0x4B400000` octet |
 | `mq6::step_load_insns(g, slot, step, set)?` | `[Instruction; 3]`: the weight pair (W ring) and two token pairs (A ring) `ds_load_b128`s of a K16 step; issue with `wg.ds_load_cur` |
@@ -566,4 +567,4 @@ Geometry (128 rows x 128 tokens x 8 waves), the LDS layout, the register map and
 | `mq6::declare_block_regs(wg, g, entry, fold, end)?` | the register lifetimes of one block: fragment sets from label `entry` to `fold`, fold registers from `fold` to `end` |
 | `mq6::epilogue(wg, g)?` | everything after the `mq6::EPI` label (the script places it with `wg.label`): output descriptor, lane masks, masked stores |
 
-The committed twin [`mq6_i8_gemm.rip`](../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip) writes the whole composition: ring declaration, the prologue's staging of block 0, the K-loop (`wg_skip_if` + `loop_carried` + `block` + trip end, then the peeled pair) and the block body (queued decode / store / fetch work interleaved between WMMAs, B1 and B2 split barriers, the fold), then the epilogue. Its variants are the shipped variant names (`128x128x8-set`, `128x128x8-set_bf16`, plus `-linear`; the grammar is in the file header). `tests/mq6_i8_gemm_twin.rs` requires its `s_text` and proof to be identical to `mq6_i8_gemm::emit` for every valid spec, and `peacemaker-isa/tests/mq6_i8_gemm_digests.rs` pins `emit` itself to the digests recorded before the blocks were factored out. [Cookbook 12](cookbook/12-mq6-blocks.md) shows what to move.
+The committed twin [`mq6_i8_gemm.rip`](../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip) writes the whole composition: ring declaration, the prologue's staging of block 0, the K-loop (`wg_skip_if` + `loop_carried` + `block` + trip end, then the peeled pair) and the block body (queued decode / store / fetch work interleaved between WMMAs, B1 and B2 split barriers, the fold), then the epilogue. Its variants are the shipped variant names (`128x128x8-set`, `256x128x16-set_bf16-linear`, ...: `TILE-EPI[-linear]`, twelve of them; the grammar is in the file header). `tests/mq6_i8_gemm_twin.rs` requires its `s_text` and proof to be identical to `mq6_i8_gemm::emit` for every valid spec, and `peacemaker-isa/tests/mq6_i8_gemm_digests.rs` pins `emit` itself to the digests recorded before the blocks were factored out. [Cookbook 12](cookbook/12-mq6-blocks.md) shows what to move.

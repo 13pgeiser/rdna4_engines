@@ -277,9 +277,12 @@ fn block_with(
         srd: g.srd_a[h],
     });
     st.work.push_back(Work::StoreW(0));
-    publish::decode_round(&mut insns, g, 1)?;
-    st.push_insns(std::mem::take(&mut insns));
-    st.work.push_back(Work::StoreW(1));
+    // A tile with one weight round (128 rows on 512 threads) has no second round to decode.
+    if g.w_pf.len() > 1 {
+        publish::decode_round(&mut insns, g, 1)?;
+        st.push_insns(std::mem::take(&mut insns));
+        st.work.push_back(Work::StoreW(1));
+    }
     st.work.push_back(Work::StoreA(1));
     // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
     st.phase(wg, g, 0, true, 8, 3)?;
@@ -324,9 +327,11 @@ fn block_with(
             sb: 1,
             srd: g.srd_a[h ^ 1],
         });
-        publish::decode_round(&mut insns, g, 1)?;
-        st.push_insns(insns);
-        st.work.push_back(Work::StoreW(1));
+        if g.w_pf.len() > 1 {
+            publish::decode_round(&mut insns, g, 1)?;
+            st.push_insns(insns);
+            st.work.push_back(Work::StoreW(1));
+        }
         st.work.push_back(Work::StoreA(1));
         st.work.push_back(Work::Meta);
     }

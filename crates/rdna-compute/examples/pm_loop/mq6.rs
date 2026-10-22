@@ -24,10 +24,18 @@
 //!
 //! # Knobs (candidate; names as `peacemaker-isa emit --kernel mq6_i8_gemm`)
 //! `epi` (`set` F32 | `set_bf16` BF16 bits), `raster` (`banded`, the product,
-//! default | `linear`, the CPU-interpreter raster). The launch is exactly the
-//! runtime's (`gemm_mq6g256v2_i8_prequant`, `mq6_i8_launch`): grid
+//! default | `linear`, the CPU-interpreter raster), `tile` (`128x128`, the
+//! shipped tile, default | `256x128` | `128x256`: weight rows x tokens per
+//! workgroup; the two wide tiles run 16 waves of the same 32 x 64 per-wave tile,
+//! 55296 B of LDS). The launch of the `128x128` tile is exactly the runtime's
+//! (`gemm_mq6g256v2_i8_prequant`, `mq6_i8_launch`): grid
 //! `[ceil(M/128), ceil(N/128), 1]`, 256 threads, 36864 B dynamic LDS, kernarg
-//! `A, Xq, Y` pointers then `M, K, N` and the PM image's seventh word (`0`).
+//! `A, Xq, Y` pointers then `M, K, N` and the PM image's seventh word (`0`); the
+//! other tiles' grid, block and LDS follow the spec (`Tile::{rows, tokens,
+//! threads, layout}`). The baseline is always the shipped `128x128` object and
+//! launches with its own geometry; the output is the same bits for every tile
+//! (exact integer dot, the same per-element fold order), so
+//! `identical_to_baseline` stays required.
 //!
 //! # Baseline
 //! The shipped PM object with the entry the runtime selects when the PM route is
@@ -67,7 +75,7 @@
 
 use crate::iu4::{abi_signature, max_diff, sample_rows};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
-use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Raster, Spec};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Raster, Spec, Tile};
 use peacemaker_isa::Arch;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
@@ -403,8 +411,9 @@ pub struct Mq6 {
     reference: OnceCell<Vec<u32>>,
 }
 
-fn parse_spec(epi: &str, raster: &str) -> Result<Spec> {
+fn parse_spec(epi: &str, raster: &str, tile: &str) -> Result<Spec> {
     let epi: Epi = epi.parse()?;
+    let tile: Tile = tile.parse().map_err(|e| format!("--tile: {e}"))?;
     let raster = match raster {
         "banded" => Raster::Banded,
         "linear" => Raster::Linear,
@@ -413,6 +422,7 @@ fn parse_spec(epi: &str, raster: &str) -> Result<Spec> {
     let spec = Spec {
         epi,
         raster,
+        tile,
         arch: Arch::Gfx1201,
     };
     spec.validate()?;
@@ -429,6 +439,7 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
     let cand = parse_spec(
         &knobs.take_or("epi", "set"),
         &knobs.take_or("raster", "banded"),
+        &knobs.take_or("tile", "128x128"),
     )?;
     let macs = (m as u128) * (n as u128) * (k as u128);
     let default = if macs <= FULL_REF_MACS {
@@ -487,6 +498,19 @@ fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
     Ok((elf, symbol, info))
 }
 
+/// `(grid, threads, dynamic LDS)` of `tile`'s launch at `M` rows and `N` tokens.
+fn geometry(m: usize, n: usize, tile: Tile) -> ([u32; 3], u32, u32) {
+    (
+        [
+            m.div_ceil(tile.rows() as usize) as u32,
+            n.div_ceil(tile.tokens() as usize) as u32,
+            1,
+        ],
+        tile.threads(),
+        tile.layout().launch,
+    )
+}
+
 impl Mq6 {
     fn bf16(&self) -> bool {
         self.cand.epi == Epi::SetBf16
@@ -541,7 +565,7 @@ impl Mq6 {
         json!({"epi": self.cand.epi.name(), "raster": match self.cand.raster {
             Raster::Banded => "banded",
             Raster::Linear => "linear",
-        }})
+        }, "tile": self.cand.tile.name()})
     }
 
     /// Run the candidate object on the emulator at a small shape and compare
@@ -565,9 +589,10 @@ impl Mq6 {
             0x3000_0000u64,
             0x4000_0000u64,
         );
+        let tile = self.cand.tile;
         let (gx, gy) = (
-            m.div_ceil(spec::TILE_ROWS as usize),
-            n.div_ceil(spec::TILE_TOKENS as usize),
+            m.div_ceil(tile.rows() as usize),
+            n.div_ceil(tile.tokens() as usize),
         );
         let mut kern = pack(ava, xva, yva, m, k, n);
         kern.resize(self.cand.kernargs().size as usize, 0);
@@ -592,8 +617,8 @@ impl Mq6 {
                     &ELaunch {
                         kernarg_ptr: kva,
                         workgroup: [x as u32, y as u32, 0],
-                        block: [spec::THREADS, 1, 1],
-                        dynamic_lds: spec::LAUNCH_LDS_BYTES,
+                        block: [tile.threads(), 1, 1],
+                        dynamic_lds: tile.layout().launch,
                     },
                     &mut mem,
                 )?;
@@ -711,15 +736,18 @@ impl Workload for Mq6 {
             Arm::Baseline => &dev.y[0],
             Arm::Candidate => &dev.y[1],
         };
+        // The baseline is the shipped 128x128 kernel whatever the candidate's tile is; each
+        // arm's grid, block and LDS follow its own tile.
+        let tile = match arm {
+            Arm::Baseline => Tile::T128x128,
+            Arm::Candidate => self.cand.tile,
+        };
+        let (grid, threads, lds) = geometry(self.m, self.n, tile);
         Launch {
             kernarg: pack(ptr(&dev.w), ptr(&dev.x), ptr(y), self.m, self.k, self.n),
-            grid: [
-                self.m.div_ceil(spec::TILE_ROWS as usize) as u32,
-                self.n.div_ceil(spec::TILE_TOKENS as usize) as u32,
-                1,
-            ],
-            block: [spec::THREADS, 1, 1],
-            lds: spec::LAUNCH_LDS_BYTES,
+            grid,
+            block: [threads, 1, 1],
+            lds,
         }
     }
 
@@ -893,6 +921,34 @@ mod tests {
     }
 
     #[test]
+    fn tile_knob_selects_the_tile_and_the_launch_follows_it() {
+        for (knob, variant, grid, block, lds) in [
+            ("128x128", "128x128x8-set", [3u32, 2, 1], 256u32, 36864u32),
+            ("256x128", "256x128x16-set", [2, 2, 1], 512, 55296),
+            ("128x256", "128x256x16-set", [3, 1, 1], 512, 55296),
+        ] {
+            let w = new("M=260,N=130,K=256", &mut knobs(&[("tile", knob)]), None).unwrap();
+            assert_eq!(w.candidate_knobs()["variant"], variant);
+            assert_eq!(
+                w.candidate_knobs()["tile"],
+                variant.split('-').next().unwrap()
+            );
+            let c = w.candidate().unwrap();
+            assert!(c
+                .launch_symbol
+                .starts_with("gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"));
+            // The baseline is the shipped object whatever the tile.
+            assert_eq!(
+                w.baseline().unwrap().launch_symbol,
+                "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"
+            );
+            let tile: Tile = knob.parse().unwrap();
+            assert_eq!(geometry(260, 130, tile), (grid, block, lds), "{knob}");
+        }
+        assert!(new("M=128,N=128,K=256", &mut knobs(&[("tile", "64x64")]), None).is_err());
+    }
+
+    #[test]
     fn baseline_is_the_shipped_pm_entry() {
         for (epi, sym) in [
             ("set", "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"),
@@ -992,16 +1048,23 @@ mod tests {
 
     #[test]
     fn rip_twin_is_identical_to_generator() {
-        for (epi, raster) in [
-            ("set", "banded"),
-            ("set_bf16", "banded"),
-            ("set", "linear"),
-            ("set_bf16", "linear"),
+        for (epi, raster, tile) in [
+            ("set", "banded", "128x128"),
+            ("set_bf16", "banded", "128x128"),
+            ("set", "linear", "128x128"),
+            ("set_bf16", "linear", "128x128"),
+            ("set", "banded", "256x128"),
+            ("set_bf16", "linear", "256x128"),
+            ("set", "banded", "128x256"),
+            ("set_bf16", "linear", "128x256"),
         ] {
-            let spec = parse_spec(epi, raster).unwrap();
+            let spec = parse_spec(epi, raster, tile).unwrap();
             let (_, symbol, info) = compile_rip(TWIN, spec).unwrap();
             assert_eq!(symbol, spec.symbol());
-            assert_eq!(info["identical_to_generator"], true, "{epi} {raster}");
+            assert_eq!(
+                info["identical_to_generator"], true,
+                "{epi} {raster} {tile}"
+            );
             assert_eq!(info["variant"], spec.variant_name());
             assert_eq!(info["sha256"], sha256_hex(TWIN.as_bytes()));
         }
@@ -1009,7 +1072,7 @@ mod tests {
 
     #[test]
     fn rip_garbage_is_refused() {
-        let spec = parse_spec("set", "banded").unwrap();
+        let spec = parse_spec("set", "banded", "128x128").unwrap();
         assert!(compile_rip("fn emit(", spec).is_err());
     }
 }

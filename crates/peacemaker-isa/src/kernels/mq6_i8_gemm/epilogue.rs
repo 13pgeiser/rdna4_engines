@@ -144,6 +144,33 @@ pub(crate) fn body(b: &mut Builder, g: &Gen) -> Result<(), String> {
         &[v(e.row)],
         &[v(g.sc_addr)],
     )?;
+    // A 256-wide plane is chunked per 128 (1024 bytes): drop the 128 slots the chunk gap adds.
+    let t = g.f[0] + 3;
+    for (reg, addr, wide) in [
+        (e.tok, g.d_addr, g.spec.tile.tokens() == 256),
+        (e.row, g.sc_addr, g.spec.tile.rows() == 256),
+    ] {
+        if wide {
+            op(
+                b,
+                format!("v_lshrrev_b32_e32 v{t}, 10, v{addr}"),
+                &[v(t)],
+                &[v(addr)],
+            )?;
+            op(
+                b,
+                format!("v_lshlrev_b32_e32 v{t}, 7, v{t}"),
+                &[v(t)],
+                &[v(t)],
+            )?;
+            op(
+                b,
+                format!("v_sub_nc_u32_e32 v{reg}, v{reg}, v{t}"),
+                &[v(reg)],
+                &[v(reg), v(t)],
+            )?;
+        }
+    }
     op(
         b,
         format!("v_mul_lo_u32 v{}, v{}, s{}", e.off, e.tok, a.m),

@@ -6,20 +6,23 @@
 //! `mq6::*` natives and the checked driver's rings) re-emits the production kernel's bytes for every
 //! valid `Spec` on gfx1201, and the coarse natives return the Rust functions' values.
 
-use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, Epi, Raster, Spec};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self as mq6, Epi, Raster, Spec, Tile};
 use peacemaker_isa::Arch;
 
 const TWIN: &str = include_str!("../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip");
 
 fn every_spec() -> Vec<Spec> {
     let mut out = Vec::new();
-    for epi in [Epi::Set, Epi::SetBf16] {
-        for raster in [Raster::Banded, Raster::Linear] {
-            out.push(Spec {
-                epi,
-                raster,
-                arch: Arch::Gfx1201,
-            });
+    for tile in Tile::ALL {
+        for epi in [Epi::Set, Epi::SetBf16] {
+            for raster in [Raster::Banded, Raster::Linear] {
+                out.push(Spec {
+                    epi,
+                    raster,
+                    tile,
+                    arch: Arch::Gfx1201,
+                });
+            }
         }
     }
     out
@@ -65,7 +68,7 @@ fn mq6_i8_gemm_twin_matches_the_rust_emit() {
         );
     }
     assert_eq!(
-        valid, 4,
+        valid, 12,
         "the number of valid specs changed: update VARIANTS"
     );
 }
@@ -86,8 +89,9 @@ fn the_twin_declares_exactly_the_valid_variants() {
 #[test]
 fn a_malformed_variant_is_refused_with_its_grammar() {
     for (v, want) in [
-        ("128x128x8", "expected 128x128x8-EPI[-linear]"),
+        ("128x128x8", "expected TILE-EPI[-linear]"),
         ("64x64x4-set", "unknown tile `64x64x4`"),
+        ("512x128x32-set", "unknown tile `512x128x32`"),
         ("128x128x8-mul", "unknown epilogue `mul`"),
         ("128x128x8-set-banded", "unknown raster `banded`"),
     ] {
@@ -109,7 +113,7 @@ fn the_twin_builds_on_gfx1201_only() {
 
 const COARSE: &str = r#"
 fn emit(spec: Spec) -> Result<Emitted, String> {
-    Mq6Gemm::emit(Mq6Spec { epi: Mq6Epi::SetBf16, raster: Raster::Linear, arch: spec.arch })
+    Mq6Gemm::emit(Mq6Spec { epi: Mq6Epi::SetBf16, raster: Raster::Linear, tile: Mq6Tile::T256x128, arch: spec.arch })
 }
 "#;
 
@@ -118,6 +122,7 @@ fn mq6_emit_native_returns_the_rust_emitted() {
     let want = mq6::emit(Spec {
         epi: Epi::SetBf16,
         raster: Raster::Linear,
+        tile: Tile::T256x128,
         arch: Arch::Gfx1201,
     })
     .unwrap();
@@ -132,7 +137,7 @@ fn mq6_emit_native_returns_the_rust_emitted() {
 
 const COARSE_FIELDS: &str = r#"
 fn emit(spec: Spec) -> Result<Emitted, String> {
-    Mq6Gemm::emit(Mq6Spec { epi: Mq6Epi::Set, arch: spec.arch })
+    Mq6Gemm::emit(Mq6Spec { epi: Mq6Epi::Set, raster: Raster::Banded, arch: spec.arch })
 }
 "#;
 
@@ -141,7 +146,7 @@ fn mq6_spec_requires_every_field() {
     let e = peacemaker_rip::compile(COARSE_FIELDS, Arch::Gfx1201, "default")
         .err()
         .unwrap();
-    assert!(e.contains("missing the field `raster`"), "{e}");
+    assert!(e.contains("missing the field `tile`"), "{e}");
 }
 
 const MODULE: &str = r#"
@@ -334,7 +339,7 @@ fn a_block_native_refuses_out_of_range_indices() {
         (
             "mq6::decode_insns(g, 0)?);\n    st.work.push(Work::FetchA(1, 1",
             "mq6::decode_insns(g, 2)?);\n    st.work.push(Work::FetchA(1, 1",
-            "decode_round: plane 2",
+            "decode_round: round 2 out of range",
         ),
         (
             "mq6::fold_addr(wg, g, h)?;",
@@ -357,7 +362,7 @@ fn a_block_native_refuses_out_of_range_indices() {
 mod interpreter {
     use peacemaker_ir::emu::{Emulator, Launch, Memory};
     use peacemaker_ir::inst::Frontend;
-    use peacemaker_isa::kernels::mq6_i8_gemm::spec;
+    use peacemaker_isa::kernels::mq6_i8_gemm::Tile;
     use peacemaker_isa::{Arch, Emitted};
 
     struct Rng(u64);
@@ -415,11 +420,16 @@ mod interpreter {
     /// Run the emitted kernel on `M = 128, K = 512, N = 128` (one tile, one full trip plus the peeled
     /// group) and return `Y` (`[N][M]` f32 bytes).
     pub fn run(e: &Emitted, symbol: &str) -> Vec<u8> {
+        run_tile(e, symbol, Tile::T128x128)
+    }
+
+    /// [`run`] on `tile`: one tile of `tile.rows() x tile.tokens()` outputs.
+    pub fn run_tile(e: &Emitted, symbol: &str, tile: Tile) -> Vec<u8> {
         const KERNARG: u64 = 0x1_0000;
         const A_BASE: u64 = 0x100_0000;
         const X_BASE: u64 = 0x1000_0000;
         const Y_BASE: u64 = 0x2000_0000;
-        let (m, k, n) = (128usize, 512usize, 128usize);
+        let (m, k, n) = (tile.rows() as usize, 512usize, tile.tokens() as usize);
         let (a, x) = data(m, k, n, 7);
         let elf = peacemaker_isa::native::assemble(&e.s_text, Arch::Gfx1201).unwrap();
         let program = peacemaker_lift::lift_object(
@@ -450,8 +460,8 @@ mod interpreter {
             &Launch {
                 kernarg_ptr: KERNARG,
                 workgroup: [0, 0, 0],
-                block: [spec::THREADS, 1, 1],
-                dynamic_lds: spec::LAUNCH_LDS_BYTES,
+                block: [tile.threads(), 1, 1],
+                dynamic_lds: tile.layout().launch,
             },
             &mut mem,
         )
@@ -632,4 +642,30 @@ fn a_wave32_lane_mask_is_defined_by_its_low_register() {
     let e = peacemaker_rip::compile(&mask_kernel(false), Arch::Gfx1201, "default")
         .expect_err("an undefined mask must be refused");
     assert!(e.contains("register read before it is defined: s12"), "{e}");
+}
+
+/// The other tiles: the same moves keep each tile's output bit-identical (a tile's script differs
+/// from the shipped one only by `g.w_rounds()` in the decode queue and the prologue).
+#[test]
+fn moves_keep_the_output_on_the_wide_tiles() {
+    for (tile, variant) in [
+        (Tile::T256x128, "256x128x16-set-linear"),
+        (Tile::T128x256, "128x256x16-set-linear"),
+    ] {
+        let run = |src: &str| {
+            let e = build(src, variant).unwrap();
+            interpreter::run_tile(&e, &peacemaker_rip::symbol_of(&e).unwrap(), tile)
+        };
+        let want = run(TWIN);
+        assert!(want.iter().any(|&b| b != 0xa5), "{variant}: no output");
+        for src in [
+            edit("phase(wg, g, &mut st, 0, true, 8, 3)?;", "phase(wg, g, &mut st, 0, true, 12, 3)?;"),
+            edit(
+                "    for nb in 0..4usize {\n        frag(wg, g, nb, 1, cacc, scratch)?;\n    }\n",
+                "    for nb in [3usize, 2, 1, 0] {\n        frag(wg, g, nb, 1, cacc, scratch)?;\n    }\n",
+            ),
+        ] {
+            assert!(run(&src) == want, "{variant}: the output changed");
+        }
+    }
 }

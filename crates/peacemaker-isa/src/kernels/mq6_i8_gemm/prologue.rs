@@ -5,7 +5,7 @@
 //! Prologue: kernel arguments, CTA raster, buffer descriptors, hoisted lane offsets, block-0
 //! staging (decode, publish) and the first rendezvous. Workgroup ids on gfx1201 are `ttmp9` (x)
 //! and `ttmp7[15:0]` (y).
-use super::{publish, Gen, Lds, MetaD, MetaS, PayA, PayW, Raster, Wg};
+use super::{publish, Gen, Lds, MetaD, MetaS, PayA, PayW, Raster, Tile, Wg};
 use crate::kernels::common::{mem, op, s, sop, sr, v};
 use crate::{
     insn::{Instruction, MemoryClass},
@@ -75,6 +75,11 @@ fn vop(b: &mut Builder, text: String, vdst: u8, vuse: &[u8], suse: &[u8]) -> Res
 /// `bs` (tokens). Ends before the out-of-range exits ([`outside_insn`]).
 pub(crate) fn front(b: &mut Builder, g: &Gen) -> Result<(), String> {
     let a = g.args;
+    // The tile origin is the tile index times the tile's rows / tokens.
+    let (row_shift, tok_shift) = (
+        g.spec.tile.rows().trailing_zeros(),
+        g.spec.tile.tokens().trailing_zeros(),
+    );
     let t: [u8; 8] = std::array::from_fn(|i| g.tmp + i as u8);
     mem(
         b,
@@ -146,19 +151,24 @@ pub(crate) fn front(b: &mut Builder, g: &Gen) -> Result<(), String> {
             )?;
             sop(
                 b,
-                format!("s_lshl_b32 s{}, s{}, 7", g.rs, t[0]),
+                format!("s_lshl_b32 s{}, s{}, {}", g.rs, t[0], row_shift),
                 &[g.rs],
                 &[t[0]],
             )?;
             sop(
                 b,
-                format!("s_lshl_b32 s{}, s{}, 7", g.bs, t[7]),
+                format!("s_lshl_b32 s{}, s{}, {}", g.bs, t[7], tok_shift),
                 &[g.bs],
                 &[t[7]],
             )?;
         }
         Raster::Linear => {
-            sop(b, "s_lshl_b32 s48, ttmp9, 7".to_string(), &[g.rs], &[])?;
+            sop(
+                b,
+                format!("s_lshl_b32 s48, ttmp9, {row_shift}"),
+                &[g.rs],
+                &[],
+            )?;
             sop(
                 b,
                 format!("s_and_b32 s{}, ttmp7, 0xffff", t[0]),
@@ -167,7 +177,7 @@ pub(crate) fn front(b: &mut Builder, g: &Gen) -> Result<(), String> {
             )?;
             sop(
                 b,
-                format!("s_lshl_b32 s{}, s{}, 7", g.bs, t[0]),
+                format!("s_lshl_b32 s{}, s{}, {}", g.bs, t[0], tok_shift),
                 &[g.bs],
                 &[t[0]],
             )?;
@@ -224,7 +234,12 @@ pub(crate) fn scalars(b: &mut Builder, g: &Gen) -> Result<(), String> {
     sop(b, format!("s_mov_b32 s{}, 0", g.goff), &[g.goff], &[])?;
     sop(
         b,
-        format!("s_lshl_b32 s{}, s{}, 6", g.goff1, g.gpr200),
+        format!(
+            "s_lshl_b32 s{}, s{}, {}",
+            g.goff1,
+            g.gpr200,
+            g.spec.tile.round_rows().trailing_zeros()
+        ),
         &[g.goff1],
         &[g.gpr200],
     )?;
@@ -354,16 +369,23 @@ pub(crate) fn lanes(b: &mut Builder, g: &Gen) -> Result<(), String> {
         &[lane],
         &[],
     )?;
+    let tile = g.spec.tile;
     let (th, wp, x) = (t[0], t[1], t[2]);
+    // Wave `w` owns token half `w % tok_halves` and row pair `w / tok_halves`.
+    let tok_halves = tile.tok_halves();
     sop(
         b,
-        format!("s_and_b32 s{th}, s{}, 1", g.wave),
+        format!("s_and_b32 s{th}, s{}, {}", g.wave, tok_halves - 1),
         &[th],
         &[g.wave],
     )?;
     sop(
         b,
-        format!("s_lshr_b32 s{wp}, s{}, 1", g.wave),
+        format!(
+            "s_lshr_b32 s{wp}, s{}, {}",
+            g.wave,
+            tok_halves.trailing_zeros()
+        ),
         &[wp],
         &[g.wave],
     )?;
@@ -547,53 +569,155 @@ pub(crate) fn lanes(b: &mut Builder, g: &Gen) -> Result<(), String> {
         &[wl],
         &[],
     )?;
-    vop(
-        b,
-        format!("v_lshl_add_u32 v{}, v{tok}, 2, v{q}", g.meta_lds),
-        g.meta_lds,
-        &[tok, q],
-        &[],
-    )?;
-    vop(
-        b,
-        format!("v_add_nc_u32_e32 v{q}, s{}, v{tok}", g.bs),
-        q,
-        &[tok],
-        &[g.bs],
-    )?;
-    vop(
-        b,
-        format!("v_mul_u32_u24_e32 v{q}, 0x88, v{q}"),
-        q,
-        &[q],
-        &[],
-    )?;
-    vop(
-        b,
-        format!("v_lshl_add_u32 v{}, v{wl}, 2, v{q}", g.ds_voff),
-        g.ds_voff,
-        &[wl, q],
-        &[],
-    )?;
-    vop(
-        b,
-        format!("v_add_nc_u32_e32 v{q}, s{}, v{tok}", g.rs),
-        q,
-        &[tok],
-        &[g.rs],
-    )?;
-    vop(
-        b,
-        format!("v_mul_lo_u32 v{}, v{q}, s{}", g.sz_voff, g.gpr200),
-        g.sz_voff,
-        &[q],
-        &[g.gpr200],
-    )?;
-    // Fold addresses: row planes wt_pair*128 + kg*32, token planes tok_half*256 + m_lane*4.
+    if tile == Tile::T128x128 {
+        vop(
+            b,
+            format!("v_lshl_add_u32 v{}, v{tok}, 2, v{q}", g.meta_lds),
+            g.meta_lds,
+            &[tok, q],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{q}, s{}, v{tok}", g.bs),
+            q,
+            &[tok],
+            &[g.bs],
+        )?;
+        vop(
+            b,
+            format!("v_mul_u32_u24_e32 v{q}, 0x88, v{q}"),
+            q,
+            &[q],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_lshl_add_u32 v{}, v{wl}, 2, v{q}", g.ds_voff),
+            g.ds_voff,
+            &[wl, q],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{q}, s{}, v{tok}", g.rs),
+            q,
+            &[tok],
+            &[g.rs],
+        )?;
+        vop(
+            b,
+            format!("v_mul_lo_u32 v{}, v{q}, s{}", g.sz_voff, g.gpr200),
+            g.sz_voff,
+            &[q],
+            &[g.gpr200],
+        )?;
+    } else {
+        // 512 threads: lane `tid` serves slot `tok = tid >> 1` (0..256) of plane `wl`. A plane of
+        // 256 slots is chunked per 128 (`1024 * chunk` bytes; `d` / `sc` then `float(s)` / `z'`
+        // 512 bytes on); a plane of 128 slots is served twice, by `tok` and `tok + 128`, which
+        // store the same words to the same addresses.
+        let (tm, ch) = (17u8, 18u8);
+        vop(
+            b,
+            format!("v_and_b32_e32 v{tm}, 0x7f, v{tok}"),
+            tm,
+            &[tok],
+            &[],
+        )?;
+        let mut plane_addr = |dst: u8, slots: u32| -> Result<(), String> {
+            if slots == 256 {
+                vop(
+                    b,
+                    format!("v_lshrrev_b32_e32 v{ch}, 7, v{tok}"),
+                    ch,
+                    &[tok],
+                    &[],
+                )?;
+                vop(
+                    b,
+                    format!("v_lshlrev_b32_e32 v{ch}, 10, v{ch}"),
+                    ch,
+                    &[ch],
+                    &[],
+                )?;
+                vop(
+                    b,
+                    format!("v_add_nc_u32_e32 v{ch}, v{ch}, v{q}"),
+                    ch,
+                    &[ch, q],
+                    &[],
+                )?;
+                vop(
+                    b,
+                    format!("v_lshl_add_u32 v{dst}, v{tm}, 2, v{ch}"),
+                    dst,
+                    &[tm, ch],
+                    &[],
+                )
+            } else {
+                vop(
+                    b,
+                    format!("v_lshl_add_u32 v{dst}, v{tm}, 2, v{q}"),
+                    dst,
+                    &[tm, q],
+                    &[],
+                )
+            }
+        };
+        plane_addr(g.meta_lds, tile.tokens())?;
+        plane_addr(g.meta_lds_sz, tile.rows())?;
+        let tok_idx = if tile.tokens() == 256 { tok } else { tm };
+        let row_idx = if tile.rows() == 256 { tok } else { tm };
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{q}, s{}, v{tok_idx}", g.bs),
+            q,
+            &[tok_idx],
+            &[g.bs],
+        )?;
+        vop(
+            b,
+            format!("v_mul_u32_u24_e32 v{q}, 0x88, v{q}"),
+            q,
+            &[q],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_lshl_add_u32 v{}, v{wl}, 2, v{q}", g.ds_voff),
+            g.ds_voff,
+            &[wl, q],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{q}, s{}, v{row_idx}", g.rs),
+            q,
+            &[row_idx],
+            &[g.rs],
+        )?;
+        vop(
+            b,
+            format!("v_mul_lo_u32 v{}, v{q}, s{}", g.sz_voff, g.gpr200),
+            g.sz_voff,
+            &[q],
+            &[g.gpr200],
+        )?;
+    }
+    // Fold addresses: row planes wt_pair*128 + kg*32, token planes tok_half*256 + m_lane*4 (plus
+    // the 128-chunk term of the 256-wide planes).
     vop(b, format!("v_lshrrev_b32_e32 v{q}, 4, v0"), q, &[0], &[])?;
     vop(b, format!("v_and_b32_e32 v{q}, 1, v{q}"), q, &[q], &[])?;
     vop(b, format!("v_lshlrev_b32_e32 v{q}, 5, v{q}"), q, &[q], &[])?;
     sop(b, format!("s_lshl_b32 s{x}, s{wp}, 7"), &[x], &[wp])?;
+    if tile.rows() == 256 {
+        // Row pairs 4..8 sit in the second 128-row chunk of the plane (1024 bytes on).
+        let y = t[3];
+        sop(b, format!("s_lshr_b32 s{y}, s{wp}, 2"), &[y], &[wp])?;
+        sop(b, format!("s_lshl_b32 s{y}, s{y}, 9"), &[y], &[y])?;
+        sop(b, format!("s_add_co_i32 s{x}, s{x}, s{y}"), &[x], &[x, y])?;
+    }
     vop(
         b,
         format!("v_add_nc_u32_e32 v{}, s{x}, v{q}", g.sc_addr),
@@ -609,6 +733,13 @@ pub(crate) fn lanes(b: &mut Builder, g: &Gen) -> Result<(), String> {
         &[],
     )?;
     sop(b, format!("s_lshl_b32 s{x}, s{th}, 8"), &[x], &[th])?;
+    if tile.tokens() == 256 {
+        // Token halves 2..4 sit in the second 128-token chunk of the plane (1024 bytes on).
+        let y = t[3];
+        sop(b, format!("s_lshr_b32 s{y}, s{th}, 1"), &[y], &[th])?;
+        sop(b, format!("s_lshl_b32 s{y}, s{y}, 9"), &[y], &[y])?;
+        sop(b, format!("s_add_co_i32 s{x}, s{x}, s{y}"), &[x], &[x, y])?;
+    }
     vop(
         b,
         format!("v_add_nc_u32_e32 v{}, s{x}, v{q}", g.d_addr),
@@ -670,7 +801,7 @@ pub(crate) fn emit(
     fetch0(wg.isa(), g)?;
     zero_acc(wg.isa(), g)?;
     let (mut sa, mut sw) = (wg.begin_write(ra), wg.begin_write(rw));
-    for rnd in 0..2usize {
+    for rnd in 0..g.w_pf.len() {
         publish::decode_round(wg.isa(), g, rnd)?;
         sw = publish::store_w_round(wg, g, sw, 0, rnd)?;
     }
