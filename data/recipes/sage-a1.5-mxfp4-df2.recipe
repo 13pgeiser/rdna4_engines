@@ -1,0 +1,35 @@
+# sage-a1.5-mxfp4-df2.recipe -- Sage-A1.5 at MXFP4 with incoai's Qwen3.6-35B-A3B DFlash2 drafter
+# merged in place of the MTP head. The trunk and the drafter's linears are rounded to MXFP4
+# (`fp4_e2m1`, an e8m0 exponent per 32 of K, the OCP rule), everything else as the checkpoint holds
+# it. Trained from bf16 ideally: the source here is Sage-A1.5-FP8's per-row FP8 release, which
+# carries one rounding already, so this is a second quantisation of the same weights.
+#
+#   rad-convert InternScience/Sage-A1.5-FP8 --draft-model incoai/Qwen3.6-35B-A3B-DFlash2 \
+#       --recipe data/recipes/sage-a1.5-mxfp4-df2.recipe -o sage-a1.5-mxfp4-df2.rad
+#
+# The trunk's rule set is sage-a1.5-fp8.recipe's, with `codes=fp4_e2m1 group=32 scale=e8m0` in
+# place of block fp8 (the OCP rule needs no second level: `mx` is the default for e8m0). The
+# DFlash2 drafter uses the same rules as the trunk's linears, and its draft head stays the 2-bit
+# copy.
+
+blk.*.attn_qg.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_k.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_v.weight                  rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_output.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_inz.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_out.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_gate_up_exps.*.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down_exps.*.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down_shexp.weight          rtn  codes=fp4_e2m1 group=32 scale=e8m0
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
