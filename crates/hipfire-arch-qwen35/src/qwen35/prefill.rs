@@ -14404,6 +14404,7 @@ fn batch_chunk_delta_net_moe(
             n,
             dim,
             paro_wqkv.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -14426,6 +14427,7 @@ fn batch_chunk_delta_net_moe(
             n,
             dim,
             paro_wz.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15163,6 +15165,7 @@ fn batch_chunk_delta_net_moe_output(
             n,
             layer.wo.k,
             paro_wo.krot as usize,
+            128,
         )?;
         &pbs.dn_normed_rot_batch
     } else {
@@ -15588,6 +15591,7 @@ fn batch_chunk_full_attn_moe_prep(
             n,
             dim,
             paro_wq.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15610,6 +15614,7 @@ fn batch_chunk_full_attn_moe_prep(
             n,
             dim,
             paro_wk.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15632,6 +15637,7 @@ fn batch_chunk_full_attn_moe_prep(
             n,
             dim,
             paro_wv.krot as usize,
+            128,
         )?;
         run_plain_gemm_key(
             gpu,
@@ -15959,6 +15965,7 @@ fn batch_chunk_full_attn_moe_finish(
             n,
             layer.wo.k,
             paro_wo.krot as usize,
+            128,
         )?;
         &pbs.fa_attn_out_rot_batch
     } else {
