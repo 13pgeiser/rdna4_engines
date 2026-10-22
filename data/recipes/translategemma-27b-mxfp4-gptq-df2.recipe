@@ -1,0 +1,25 @@
+# translategemma-27b-mxfp4-gptq-df2.recipe -- translategemma-27b-mxfp4-gptq.recipe with a DFlash2
+# drafter (rad-convert --draft-model). The drafter's linears are MXFP4 (read whole every draft pass;
+# drafts are verified, so this changes only what is proposed) and its head a 2-bit copy of the tied
+# embedding, rescored against output.weight, as q38-27b-quark-mxfp4-df2.recipe makes Qwen's.
+# `--reuse` of a container made by the recipe above copies its trunk.
+#
+#   CALIB=<dir> rad-convert <translategemma-27b-it> --draft-model <drafter> \
+#       --recipe data/recipes/translategemma-27b-mxfp4-gptq-df2.recipe -o translategemma-27b-mxfp4-gptq-df2.rad
+
+blk.*.attn_q.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.attn_k.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.attn_v.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.attn_o.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.ffn_down.weight     gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.ffn_gate_up.weight  gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+output.weight             rtn   codes=i8 group=128 scale=bf16 clamp=sym
+
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0

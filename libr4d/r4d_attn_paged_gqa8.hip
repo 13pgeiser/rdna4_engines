@@ -54,6 +54,12 @@ using std::max;
 #ifndef R4D_ATTN_H256
 #define R4D_ATTN_H256 1
 #endif
+/* The fp8_v4 and k6_v4 caches at head_dim 256 (RadBuildCtx::kv_quant), off unless the including
+ * unit serves a model whose plugin offers them: Qwen3.8-Flash-Next's QSA layers (gqa12, and gqa6
+ * at four ranks). The kernels are the h256/gqa6 templates' O_V4 / O_K6 forms. */
+#ifndef R4D_ATTN_V4
+#define R4D_ATTN_V4 0
+#endif
 #define GQ_JOIN_(a, b, c) a##b##c
 #define GQ_JOIN(a, b, c)  GQ_JOIN_(a, b, c)
 #define GQ_SYM(pre, suf)  GQ_JOIN(pre, R4D_ATTN_GQA, suf)
@@ -99,10 +105,11 @@ extern "C" long GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(const R4DArgs* a) {
     return r4d_decode_scratch(a, r4d_decode_splits(a, G8_D_TILE), G8_D_OPT);
 }
 
-template <int HEAD_DIM, int KVP>
-/* Two dispatches: the attention kernel and the split-KV combine. R4DArgs is passed by value (168
+template <int HEAD_DIM, int KVP, int XOPT = 0>
+/* Two dispatches: the attention kernel and the split-KV combine. R4DArgs is passed by value (184
  * bytes) like any other kernel argument. Non-null `gq` adds the output gate and quantiser to the
- * combine (attn_paged_gate_quant; R4DGateQuant in r4d_attn_decode_h256_gqa6.hip). */
+ * combine (attn_paged_gate_quant; R4DGateQuant in r4d_attn_decode_h256_gqa6.hip). `XOPT` adds
+ * option bits to the attention kernel's (O_V4, O_K6: the cache layout). */
 static int g8_decode_launch(const R4DArgs* a, RadStream stream,
                             const R4DGateQuant* gq = nullptr) {
     int emit_rc = RAD_OK;
@@ -115,12 +122,14 @@ static int g8_decode_launch(const R4DArgs* a, RadStream stream,
 
 #define G8_LAUNCH(NW)                                                                          \
     emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<NW, G8_D_TILE, HEAD_DIM, G8_GQA,        \
-                                                   G8_BLOCK_SIZE, KVP, G8_D_OPT>),             \
+                                                   G8_BLOCK_SIZE, KVP, G8_D_OPT | XOPT>),      \
                        dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, *a, splits)
-    /* One-wave workgroups stage V as codes (O_V8): same conversion count, half the LDS. */
+    /* One-wave workgroups stage V as codes (O_V8): same conversion count, half the LDS. A v4
+     * cache stages V widened (the kernel drops O_V8 under O_V4). */
     if      (nw == 1)
         emit_rc = R4D_EMIT(stream, (r4d_attn_decode_kernel<1, G8_D_TILE, HEAD_DIM, G8_GQA,
-                                                       G8_BLOCK_SIZE, KVP, G8_D_OPT | O_V8>),
+                                                       G8_BLOCK_SIZE, KVP,
+                                                       G8_D_OPT | O_V8 | XOPT>),
                            dim3(splits, a->kv_heads, a->num_seqs), dim3(32), 0, *a, splits);
     else if (nw == 2) G8_LAUNCH(2);
     else if (nw == 3) G8_LAUNCH(3);
@@ -227,7 +236,9 @@ extern "C" int GQ_SYM(r4d_rad_attn_prefill_h64_gqa, _bf16)(const RadArgs* a, Rad
  * parameters and no tensors, so parameters come first and tensors are the fallback (see the
  * h256/gqa6 dispatch). The size is the maximum over every sequence count up to max_seqs, because
  * S * floor(128 / (kv_heads * S)) is not monotone in S. */
-static int64_t g8_decode_scratch(const RadArgs* a, int head_dim) {
+/* `row` is a token's bytes in a (block, head) page, 0 for the 16-bit and E4M3 caches' 2 * head_dim
+ * (fill_paged_row). */
+static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row = 0) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
 
@@ -254,7 +265,7 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim) {
         }
         return worst;
     }
-    const int rc = fill_paged(a, &r, head_dim);
+    const int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r.splits = sp;
     return GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
@@ -271,10 +282,10 @@ extern "C" int64_t GQ_SYM(r4d_rad_attn_decode_h128_gqa, _scratch)(const RadArgs*
 }
 #endif
 
-static int g8_decode_common(const RadArgs* a, R4DArgs* r, int head_dim) {
+static int g8_decode_common(const RadArgs* a, R4DArgs* r, int head_dim, long long row = 0) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
-    const int rc = fill_paged(a, r, head_dim);
+    const int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r->splits = sp;
     const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
@@ -379,4 +390,40 @@ extern "C" int GQ_SYM(r4d_rad_attn_decode_h128_gqa, _bf16)(const RadArgs* a, Rad
     if (rc != RAD_OK) return rc;
     return g8_decode_launch<128, 1>(&r, s);
 }
+#endif
+
+#if R4D_ATTN_H256 && R4D_ATTN_V4
+/* ---- the fp8_v4 cache (a token's row 25 * 256 / 16 = 400 bytes: E4M3 K, int4 V, f16 scales) and
+ * the k6_v4 cache (352 bytes: int6 K, int4 V), prefill, decode and decode with the gate and
+ * quantiser in the merge. */
+#define G8_V4_ENTRIES(TAG, ROWB, XOPT)                                                        \
+extern "C" int GQ_SYM(r4d_rad_attn_prefill_h256_gqa, _##TAG)(const RadArgs* a, RadStream s) { \
+    R4DArgs r;                                                                                 \
+    const int rc = fill_paged_row(a, &r, 256, ROWB);                                           \
+    if (rc != RAD_OK) return rc;                                                               \
+    return g8_prefill_launch<256, G8_P_OPT_256 | (XOPT), 0>(&r, (hipStream_t)s);               \
+}                                                                                              \
+extern "C" int64_t GQ_SYM(r4d_rad_attn_decode_h256_gqa, _##TAG##_scratch)(const RadArgs* a) {  \
+    return g8_decode_scratch(a, 256, ROWB);                                                    \
+}                                                                                              \
+extern "C" int GQ_SYM(r4d_rad_attn_decode_h256_gqa, _##TAG)(const RadArgs* a,                  \
+                                                            RadStream stream) {                \
+    R4DArgs r;                                                                                 \
+    const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
+    if (rc != RAD_OK) return rc;                                                               \
+    return g8_decode_launch<256, 0, (XOPT)>(&r, stream);                                       \
+}                                                                                              \
+extern "C" int GQ_SYM(r4d_rad_attn_decode_gq_h256_gqa, _##TAG)(const RadArgs* a,               \
+                                                               RadStream stream) {             \
+    R4DArgs r;                                                                                 \
+    const int rc = g8_decode_common(a, &r, 256, ROWB);                                         \
+    if (rc != RAD_OK) return rc;                                                               \
+    R4DGateQuant gq{};                                                                         \
+    const int gc = g8_gate_quant_args(a, r, &gq);                                              \
+    if (gc != RAD_OK) return gc;                                                               \
+    return g8_decode_launch<256, 0, (XOPT)>(&r, stream, &gq);                                  \
+}
+G8_V4_ENTRIES(fp8v4, 400, O_V4)
+G8_V4_ENTRIES(k6v4, 352, O_V4 | O_K6)
+#undef G8_V4_ENTRIES
 #endif

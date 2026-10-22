@@ -43,6 +43,8 @@ int Engine::gen_loop() {
         return fail_loop(st);
     };
     while (!stopping_.load(std::memory_order_acquire)) {
+        /* A round of the loop, idle or not: what lets a freed adapter slot cool (lora/slots.h). */
+        lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         const RadBatch* b = gen_->next(step);
         if (!b) {
             step_batch_.store(nullptr, std::memory_order_release);
@@ -52,6 +54,7 @@ int Engine::gen_loop() {
         }
         idle = 0;
         if (const int ps = prepare_release(b); ps < 0) return stop(ps);
+        for (auto& rk : ranks_) rk->ctx.set_gen_lora_slot(gen_->lora_slot());
         issue_what_.store(kIssueModel, std::memory_order_release);
         step_batch_.store(b, std::memory_order_release);
         barrier_->arrive_and_wait();      /* release the ranks */

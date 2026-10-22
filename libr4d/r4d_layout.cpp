@@ -1197,6 +1197,23 @@ extern "C" int r4d_rad_unrelayout_moe_w4_mod4(const RadParam* p, int n_p, int op
     return moew4_unrelayout_by(moe_view_mod4, p, n_p, operand, enc, sel, src, src_bytes, pl, n);
 }
 
+extern "C" int r4d_rad_layout_moe_mxfp4(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout*) {
+    if (operand != 2 && operand != 3 && operand != 6 && operand != 7) return RAD_E_UNSUPPORTED;
+    if (!r4d_enc::affine(enc, RAD_FP4E2M1, RAD_E8M0, 1, 32)) return RAD_E_DTYPE;
+    MoeView v;
+    const int rc = moe_view(p, n_p, operand, &v);
+    if (rc != RAD_OK) return rc;
+    const long long N = r4d_pgeti_or(v.p, v.n, "N", 0), K = r4d_pgeti_or(v.p, v.n, "K", 0);
+    const bool scale = operand == 3 || operand == 7;
+    if (n != 1 || !pl || !sel || !selects(enc, sel, n, scale ? "scale" : "codes") ||
+        !dims(pl[0], N, scale ? K / 32 : K) || K % 128) return RAD_E_SHAPE;
+    /* The exact selected canonical plane, not a relayout: it remains readable in place
+     * from the container or a mapped host pool. Unsupported is the ABI spelling for that. */
+    return RAD_E_UNSUPPORTED;
+}
+
 extern "C" int r4d_rad_layout_moe_fp8(const RadParam* p, int n_p, int operand,
                                           const RadEncoding* enc, const int* sel,
                                           const RadTensor* pl, int n, RadLayout* out) {

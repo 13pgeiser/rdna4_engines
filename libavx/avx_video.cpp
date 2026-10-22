@@ -468,21 +468,33 @@ AVX_KERNEL(conv3d_ndhwc) {
     const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *G = &a->t[3];
     const RadTensor *R = rad_arg_in(a, 4), *Y = &a->t[5];
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
-    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
-    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(G) < 3)
+    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0), tpre = p_int(a, "tpre", 0);
+    /* The frames' padding (libref's): zero, the edge frame repeated, or causal with `tpre` more
+     * copies of the first frame in front (T + tpre frames out). */
+    const char* tps = p_str(a, "tpad", "zero");
+    const int tpad = !std::strcmp(tps, "zero") ? 0 : !std::strcmp(tps, "replicate") ? 1
+                   : !std::strcmp(tps, "causal") ? 2 : -1;
+    if (tpad < 0 || (tpre && tpad != 2)) return RAD_E_INVAL;
+    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || tpre < 0 ||
+        numel(G) < 3)
         return RAD_E_SHAPE;
     const int64_t sp = p_int(a, "stride", 1), st = p_int(a, "stride_t", 1);
     const int64_t causal = p_int(a, "causal", 0), reflect = p_int(a, "reflect", 0);
     const char* pads = p_str(a, "pad", "same");
     const bool down = pads && !std::strcmp(pads, "down");
     if (sp <= 0 || st <= 0 || (causal && causal != 1) || (reflect && reflect != 1) ||
+        (causal && tpad) /* zero-causal and replicated-causal contradict */ ||
         !(!pads || !std::strcmp(pads, "same") || down))
         return RAD_E_SHAPE;
     const bool gen = sp != 1 || st != 1 || causal || down || reflect;
     if (gen && (k != 3 || kt != 3)) return RAD_E_SHAPE;
     const int64_t T = at(G, 0), H = at(G, 1), Wd = at(G, 2);
     if (T <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
-    const int64_t ft = causal ? kt - 1 : kt / 2, bk = causal ? 0 : kt / 2;
+    /* `tpad` folds into the front pad: replicate centres as `zero` does and clamps the reads to
+     * the volume; causal-`tpre` front-pads kt - 1 + `tpre` replicated first frames, which is
+     * T + `tpre` frames out -- libref's form, the same grid math as `causal`. */
+    const int64_t ft = causal ? kt - 1 : tpad == 2 ? kt - 1 + tpre : kt / 2;
+    const int64_t bk = (causal || tpad == 2) ? 0 : kt / 2;
     const int64_t pt = down ? 0 : k / 2, pb = down ? 1 : k / 2;
     const int64_t pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
     if (reflect && (std::max(pt, pb) >= H || std::max(pl, pr) >= Wd)) return RAD_E_SHAPE;
@@ -531,7 +543,9 @@ AVX_KERNEL(conv3d_ndhwc) {
             for (int64_t dz = 0; dz < kt; ++dz)
                 for (int64_t kh = 0; kh < k; ++kh)
                     for (int64_t kw = 0; kw < k; ++kw, d += (size_t)cin * ael) {
-                        const int64_t tz = t * st + dz - ft;
+                        int64_t tz = t * st + dz - ft;
+                        if (tpad)   /* replicate and causal-tpre clamp; `zero`/`causal` pad */
+                            tz = std::min<int64_t>(std::max<int64_t>(tz, 0), T - 1);
                         int64_t iy = i * sp + kh - pt;
                         int64_t ix = j * sp + kw - pl;
                         if (reflect) {   /* torch's mirror, no repeated edge, then the bounds */

@@ -36,6 +36,14 @@ extern "C" int r4d_attn_decode_h256_gqa2_fp8kv(const R4DArgs* a, hipStream_t s) 
 extern "C" int r4d_attn_decode_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT, 1>(a, s);
 }
+// The same with q at R4DArgs::q_ld (O_QLD), for attn_paged_qrow; its own instances, so the dense
+// ones above keep their registers.
+extern "C" int r4d_attn_decode_h256_gqa2_qld_fp8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD, 0>(a, s);
+}
+extern "C" int r4d_attn_decode_h256_gqa2_qld_bf16kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD, 1>(a, s);
+}
 
 // ---- prefill ---------------------------------------------------------------------------------
 // The h256/gqa6 prefill option set but at K prefetch 4 (P_OPT there is 3954187); O_KWIDE is valid

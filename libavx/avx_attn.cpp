@@ -1646,3 +1646,181 @@ AVX_KERNEL(qsa_block_key) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ attn_cross */
+/* attn_dense with each entry's keys a run of their own (`cu_k`), libref's attn_cross: causal
+ * counts from each run's start, and a query that sees no key is zero. The same tiled online
+ * softmax as attn_dense's portable path. */
+AVX_KERNEL(attn_cross) {
+    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[3], *cuk = &a->t[4];
+    const RadTensor *o = &a->t[5];
+    const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
+    const int64_t gqa = p_int(a, "gqa", 1);
+    const int causal = (int)p_int(a, "causal", 0);
+    if (head_dim <= 0 || gqa <= 0) return RAD_E_SHAPE;
+    if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t q_heads = q->rank >= 3 ? q->shape[q->rank - 2]
+                          : (q->rank == 2 ? q->shape[1] / head_dim : 1);
+    const int64_t kv_heads = q_heads / gqa;
+    if (kv_heads <= 0 || q_heads % gqa != 0) return RAD_E_SHAPE;
+    const int64_t n_seq = numel(cu) - 1;
+    if (n_seq <= 0 || numel(cuk) < n_seq + 1) return RAD_E_SHAPE;
+    const int64_t total_q = numel(q) / (q_heads * head_dim);
+    const int64_t total_k = numel(k) / (kv_heads * head_dim);
+    if (total_q <= 0 || ldi(cu, offlin(cu, n_seq)) <= ldi(cu, offlin(cu, 0))) return RAD_E_SHAPE;   /* zero rows */
+    if (numel(o) < total_q * q_heads * head_dim) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (ldi(cu, offlin(cu, s + 1)) < ldi(cu, offlin(cu, s)) ||
+            ldi(cuk, offlin(cuk, s + 1)) < ldi(cuk, offlin(cuk, s)) ||
+            ldi(cu, offlin(cu, s + 1)) > total_q || ldi(cuk, offlin(cuk, s + 1)) > total_k)
+            return RAD_E_SHAPE;
+
+    const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
+    const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim);
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1;
+    const int64_t k_hs = k->rank >= 3 ? k->stride[k->rank - 2] : head_dim * k_ds;
+    const int64_t k_rs = row_stride(k, kv_heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1;
+    const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
+    const int64_t v_rs = row_stride(v, kv_heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1;
+    const int64_t o_hs = o->rank >= 3 ? o->stride[o->rank - 2] : head_dim * o_ds;
+    const int64_t o_rs = row_stride(o, q_heads * head_dim);
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+
+    AVX_PARALLEL_FOR_IF(n_seq * q_heads >= 2)
+    for (int64_t sh = 0; sh < n_seq * q_heads; ++sh) {
+        const int64_t s = sh / q_heads, h = sh % q_heads, kh = h / gqa;
+        const int64_t b0 = ldi(cu, offlin(cu, s)), b1 = ldi(cu, offlin(cu, s + 1));
+        const int64_t k0 = ldi(cuk, offlin(cuk, s)), k1 = ldi(cuk, offlin(cuk, s + 1));
+        float* frame = (float*)scratch_f32((size_t)(4 * head_dim + AVX_KV_TILE) + 16);
+        float* qbuf = frame;
+        float* kbuf = frame + head_dim;
+        float* vbuf = frame + 2 * head_dim;
+        float* acc  = frame + 3 * head_dim;
+        float* sbuf = frame + 4 * head_dim;
+        int64_t vbase[AVX_KV_TILE];
+        for (int64_t i = b0; i < b1; ++i) {
+            const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
+            const int64_t jend = causal ? std::min<int64_t>(k1, k0 + (i - b0) + 1) : k1;
+            const float* qv = head_f32(q, qb, q_ds, head_dim, 1.0f, qbuf);
+            for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+            float m = -INFINITY, l = 0.0f;
+            int ntile = 0;
+            auto flush = [&]() {
+                if (ntile == 0) return;
+                float tmax = sbuf[0];
+                for (int t = 1; t < ntile; ++t) if (sbuf[t] > tmax) tmax = sbuf[t];
+                if (tmax > m) {
+                    const float r = (m == -INFINITY) ? 0.0f : sc_exp(m - tmax);
+                    if (r != 1.0f) {
+                        for (int64_t d = 0; d < head_dim; ++d) acc[d] *= r;
+                        l *= r;
+                    }
+                    m = tmax;
+                }
+                for (int t = 0; t < ntile; ++t) sbuf[t] = sc_exp(sbuf[t] - m);
+                for (int t = 0; t < ntile; ++t) {
+                    const float w = sbuf[t];
+                    l += w;
+                    axpy(acc, head_f32(v, vbase[t], v_ds, head_dim, 1.0f, vbuf), w, head_dim);
+                }
+                ntile = 0;
+            };
+            for (int64_t j = k0; j < jend; ++j) {
+                const float* kvr = head_f32(k, j * k_rs + kh * k_hs, k_ds, head_dim, 1.0f, kbuf);
+                sbuf[ntile] = dotf(qv, kvr, head_dim) * scale;
+                vbase[ntile] = j * v_rs + kh * v_hs;
+                if (++ntile == AVX_KV_TILE) flush();
+            }
+            flush();
+            if (m == -INFINITY) {
+                for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+                continue;
+            }
+            const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+        }
+    }
+    return RAD_OK;
+}
+
+/* attn_na3d: libref's neighborhood attention (libref/ref_attn.cpp), the window's keys through
+ * attn_cross's online softmax. */
+AVX_KERNEL(attn_na3d) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *G = &a->t[3], *o = &a->t[4];
+    const int64_t head_dim = p_int(a, "head_dim", 0);
+    const int64_t kt = p_int(a, "kt", 0), kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
+    if (head_dim <= 0 || kt <= 0 || kh <= 0 || kw <= 0 || numel(G) < 3 || q->rank != 2)
+        return RAD_E_SHAPE;
+    if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t heads = q->shape[1] / head_dim;
+    const int64_t T = ldi(G, offlin(G, 0)), H = ldi(G, offlin(G, 1)), W = ldi(G, offlin(G, 2));
+    if (heads <= 0 || q->shape[1] % head_dim || T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
+    const int64_t N = std::min(q->shape[0], T * H * W);
+    if (N <= 0 || numel(k) < N * heads * head_dim || numel(v) < N * heads * head_dim ||
+        numel(o) < N * heads * head_dim)
+        return RAD_E_SHAPE;
+    const int64_t nt = std::min(kt, T), nh = std::min(kh, H), nw = std::min(kw, W);
+    const int64_t q_ds = q->stride[1], q_rs = row_stride(q, heads * head_dim);
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1, k_rs = row_stride(k, heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1, v_rs = row_stride(v, heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1, o_rs = row_stride(o, heads * head_dim);
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+    auto start = [](int64_t c, int64_t n, int64_t L) {
+        return std::min(std::max<int64_t>(c - n / 2, 0), L - n);
+    };
+    AVX_PARALLEL_FOR_IF(N * heads >= 2)
+    for (int64_t rh = 0; rh < N * heads; ++rh) {
+        const int64_t r = rh / heads, h = rh % heads;
+        const int64_t t = r / (H * W), i = (r / W) % H, j = r % W;
+        const int64_t t0 = start(t, nt, T), i0 = start(i, nh, H), j0 = start(j, nw, W);
+        float* frame = (float*)scratch_f32((size_t)(4 * head_dim + AVX_KV_TILE) + 16);
+        float* qbuf = frame;
+        float* kbuf = frame + head_dim;
+        float* vbuf = frame + 2 * head_dim;
+        float* acc  = frame + 3 * head_dim;
+        float* sbuf = frame + 4 * head_dim;
+        int64_t vbase[AVX_KV_TILE];
+        const int64_t ob = r * o_rs + h * head_dim * o_ds;
+        const float* qv = head_f32(q, r * q_rs + h * head_dim * q_ds, q_ds, head_dim, 1.0f, qbuf);
+        for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+        float m = -INFINITY, l = 0.0f;
+        int ntile = 0;
+        auto flush = [&]() {
+            if (ntile == 0) return;
+            float tmax = sbuf[0];
+            for (int u = 1; u < ntile; ++u) if (sbuf[u] > tmax) tmax = sbuf[u];
+            if (tmax > m) {
+                const float rr = (m == -INFINITY) ? 0.0f : sc_exp(m - tmax);
+                if (rr != 1.0f) {
+                    for (int64_t d = 0; d < head_dim; ++d) acc[d] *= rr;
+                    l *= rr;
+                }
+                m = tmax;
+            }
+            for (int u = 0; u < ntile; ++u) sbuf[u] = sc_exp(sbuf[u] - m);
+            for (int u = 0; u < ntile; ++u) {
+                l += sbuf[u];
+                axpy(acc, head_f32(v, vbase[u], v_ds, head_dim, 1.0f, vbuf), sbuf[u], head_dim);
+            }
+            ntile = 0;
+        };
+        for (int64_t a1 = t0; a1 < t0 + nt; ++a1)
+            for (int64_t b1 = i0; b1 < i0 + nh; ++b1)
+                for (int64_t c1 = j0; c1 < j0 + nw; ++c1) {
+                    const int64_t key = (a1 * H + b1) * W + c1;
+                    const float* kr = head_f32(k, key * k_rs + h * head_dim * k_ds, k_ds, head_dim, 1.0f, kbuf);
+                    sbuf[ntile] = dotf(qv, kr, head_dim) * scale;
+                    vbase[ntile] = key * v_rs + h * head_dim * v_ds;
+                    if (++ntile == AVX_KV_TILE) flush();
+                }
+        flush();
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+    }
+    return RAD_OK;
+}

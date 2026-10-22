@@ -33,17 +33,21 @@
 
 // Sets `s_seq` to this block's handshake value and `s_slot` to the launch's scratch slot (0 or 1),
 // then barriers so every thread can read both. `nbw` is the capacity the counters were allocated
-// for, and gridDim.x must not exceed it.
+// for, and gridDim.x must not exceed it. `steps` handshake values are taken at once (s_seq is the
+// first): a kernel that handshakes more than twice per launch reserves the flag values it
+// publishes, so every kernel on the instance stays in the same monotone flag space. All ranks must
+// take the same number for the same block.
 //
 // The barrier fences LDS only, since it publishes just the two LDS words. A full __syncthreads
 // would wait for the outstanding parity atomics and invalidate the vector caches, putting that
 // traffic on the path to the first push.
 __device__ __forceinline__ void r4d_ar_seq_take(unsigned int* __restrict__ ctrs, unsigned int nbw,
-                                                unsigned int& s_seq, unsigned int& s_slot) {
+                                                unsigned int& s_seq, unsigned int& s_slot,
+                                                unsigned int steps = 1u) {
   const unsigned int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   unsigned int* const par = ctrs + nbw;
   const unsigned int pt = nt > 32u ? 32u : 0u;   // first lane of the second wave, if there is one
-  if (tid == 0) s_seq = atomicAdd(&ctrs[b], 1u) + 1u;
+  if (tid == 0) s_seq = atomicAdd(&ctrs[b], steps) + 1u;
   if (tid == pt) s_slot = (atomicAdd(&par[b], 1u) + 1u) & 1u;
   for (unsigned int j = b + (tid + 1u) * nb; j < nbw; j += nt * nb) atomicAdd(&par[j], 1u);
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");

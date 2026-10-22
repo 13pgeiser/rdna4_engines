@@ -16,6 +16,7 @@
 #include "rad_philox.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -972,6 +973,17 @@ __global__ __launch_bounds__(kT) void iota_kernel(int* __restrict__ y, int n, in
     if (i < n) y[i] = start + (period > 0 ? i % period : i) * step;
 }
 
+// y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j], the lists by value.
+constexpr int kAffMax = 16;
+struct IntAffine { int src[kAffMax], mul[kAffMax], add[kAffMax]; };
+
+__global__ __launch_bounds__(kAffMax) void int_affine_kernel(const int* __restrict__ x,
+                                                             int* __restrict__ y, IntAffine p,
+                                                             int n) {
+    const int j = threadIdx.x;
+    if (j < n) y[j] = (p.src[j] < 0 ? 0 : x[p.src[j]]) * p.mul[j] + p.add[j];
+}
+
 __global__ __launch_bounds__(kT) void cu_repeat_kernel(const int* __restrict__ len,
                                                        int* __restrict__ y, int n, int mult) {
     const int j = blockIdx.x * kT + threadIdx.x;
@@ -1616,6 +1628,38 @@ extern "C" int r4d_rad_iota(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL(iota_kernel, dim3(blocks_for(n)), dim3(kT), 0, (hipStream_t)s, (int*)y->data,
                        (int)n, (int)r4d_geti_or(a, "start", 0), (int)r4d_geti_or(a, "step", 1),
                        (int)period);
+    return st_of(hipGetLastError());
+}
+
+namespace {
+int parse_ints(const char* s, int* v, int cap) {
+    int n = 0;
+    while (s && *s) {
+        char* e = nullptr;
+        const long x = std::strtol(s, &e, 10);
+        if (e == s) break;
+        if (n == cap) return -1;
+        v[n++] = (int)x;
+        s = e;
+    }
+    return n;
+}
+}  // namespace
+
+extern "C" int r4d_rad_int_affine(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_i32(x) || !is_i32(y)) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(x) || !r4d_contig(y)) return R4D_NO(RAD_E_STRIDE);
+    IntAffine p{};
+    const int n = parse_ints(r4d_gets(a, "src"), p.src, kAffMax);
+    if (n <= 0 || parse_ints(r4d_gets(a, "mul"), p.mul, kAffMax) != n ||
+        parse_ints(r4d_gets(a, "add"), p.add, kAffMax) != n || r4d_numel(y) < n)
+        return R4D_NO(RAD_E_SHAPE);
+    for (int j = 0; j < n; ++j)
+        if (p.src[j] >= r4d_numel(x)) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(int_affine_kernel, dim3(1), dim3(kAffMax), 0, (hipStream_t)s,
+                       (const int*)x->data, (int*)y->data, p, n);
     return st_of(hipGetLastError());
 }
 

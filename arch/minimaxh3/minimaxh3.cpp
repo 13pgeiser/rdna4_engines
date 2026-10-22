@@ -928,6 +928,41 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     return m.op_embed ? RAD_OK : RAD_E_INVAL;
 }
 
+/* ================================================================== adapter key names */
+/* LoRA files for H3 name the DiT by ComfyUI's modules (comfy/ldm/minimax): one fused
+ * `attn.qkv_proj` (q, k, v), `attn.out_proj`, and `mlp.fc1` with the SwiGLU's gate half first,
+ * where the checkpoint keeps the value half first in `ff.net.0.proj`. */
+static int declare_lora_names(RadBuilder* b, const Model& m) {
+    std::vector<LoraName> n;
+    const int64_t Q = m.gd.n_head_all * m.gd.head_dim, KV = m.gd.n_head_kv_all * m.gd.head_dim;
+    const int64_t F = m.gd.n_ff_all;
+    static const char* const kBlocks[][2] = {
+        { "blocks.#.", "transformer_blocks.#." },
+        { "token_refiner.blocks.#.", "token_refiner.refiner_blocks.#." },
+    };
+    for (const auto& bl : kBlocks) {
+        const std::string f = bl[0], t = bl[1];
+        n.push_back({ f + "attn.qkv_proj", t + "attn.to_q", 0, Q, 0 });
+        n.push_back({ f + "attn.qkv_proj", t + "attn.to_k", Q, Q + KV, 0 });
+        n.push_back({ f + "attn.qkv_proj", t + "attn.to_v", Q + KV, Q + 2 * KV, 0 });
+        n.push_back({ f + "attn.out_proj", t + "attn.to_out.0" });
+        n.push_back({ f + "attn.to_gate_compress", t + "attn.to_gate_compress" });
+        n.push_back({ f + "mlp.fc1", t + "ff.net.0.proj", 0, F, F });
+        n.push_back({ f + "mlp.fc1", t + "ff.net.0.proj", F, 2 * F, 0 });
+        n.push_back({ f + "mlp.fc2", t + "ff.net.2" });
+    }
+    n.push_back({ "blocks.#.adaln_proj.linear", "transformer_blocks.#.adaln_proj.linear" });
+    n.push_back({ "video_patch_proj", "proj_in" });
+    n.push_back({ "audio_patch_proj", "audio_proj_in" });
+    n.push_back({ "condition_proj", "context_embedder" });
+    n.push_back({ "time_embedder.proj_in", "time_embedder.linear_1" });
+    n.push_back({ "time_embedder.proj_out", "time_embedder.linear_2" });
+    n.push_back({ "final_layer.video_out", "proj_out" });
+    n.push_back({ "final_layer.audio_out", "audio_proj_out" });
+    n.push_back({ "final_layer.adaln_proj.linear", "norm_out.linear" });
+    return lora_names(b, "transformer.", kLoraDiffusionSpellings, n);
+}
+
 /* ================================================================== the token refiner */
 /* `context_embedder` (5120 -> 5376, bf16, replicated), two plain blocks with full attention over
  * the prompt and no rotary, and the final RMSNorm into the lane's prompt rows. The feed-forward is
@@ -3201,6 +3236,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- in issue order: the conditioning pass, the step, the soundtrack, the frames */
     m.b_text = decl_b(b, nm.f("lane.text"), RAD_BF16, { (int64_t)kMaxLanes * kMaxText, m.D },
                       RAD_BUF_PERSIST);
+    RAD_ARCH_TRY(declare_lora_names(b, m));
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_refiner(b, meta, m));
     RAD_ARCH_TRY(declare_tables(b, meta, m));

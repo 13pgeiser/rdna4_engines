@@ -23,19 +23,37 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.8-27B FP8, DFlash2 drafter, vision | `qwen3.8-27b-fp8.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-fp8) | `qwen3.8-27b-fp8.yaml` |
 | Qwen3.8-27B MXFP4 (AMD Quark AWQ), DFlash2 drafter, vision | `qwen3.8-27b-mxfp4.rad` (19 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-mxfp4) | `qwen3.8-27b-mxfp4.yaml` |
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
+| Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
+| Ornith-1.5-35B-A3B w4a8: 4-bit experts (GPTQ), MTP, vision, fits one card | `ornith-1.5-35b-a3b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-w4a8) | `ornith-1.5-35b-a3b-w4a8.yaml` |
+| Sage-A1.5 FP8, MTP, vision | `sage-a1.5-fp8.rad` (35 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8) | `sage-a1.5.yaml`, `sage-a1.5-tp1.yaml` |
+| Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
+| Gemma 4 31B: int4 trunk, int8 activations and lm_head, DFlash drafter, vision | `gemma4-31b-dense-w4a8-df.rad` (22 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash) | `gemma4-31b-w4a8-df.yaml` |
+| Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
+| Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
+| Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
+| Krea 2 Raw FP8: the same, undistilled | `krea-2-raw-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-raw-radiance-fp8) | `krea-2-raw.yaml` |
+| FLUX.3 [klein] FP8: text to image and edits from up to ten pictures, one card | `flux-3-klein-fp8.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-fp8) | `flux-3-klein.yaml` |
+| FLUX.3 [klein] base FP8 | `flux-3-klein-base-fp8.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-base-fp8) | `flux-3-klein.yaml` |
+| LTX-2.5 distilled FP8: video with its stereo soundtrack from text or a first frame, one card | `ltx-2.5-distilled-fp8.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-fp8) | `ltx-2.5.yaml` |
+| LTX-2.5 base FP8 | `ltx-2.5-fp8.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-fp8) | `ltx-2.5.yaml` |
 | MiniMax-H3 FP8: video with its stereo soundtrack from text | `minimax-h3-fp8.rad` (60 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-h3-fp8) | `minimax-h3.yaml` |
 | FastH3 8-Step V2 FP8: the same in eight steps | `fasth3-8-step-v2-fp8.rad` (62 GiB) | [download](https://huggingface.co/StillDeadcode/fasth3-8-step-v2-fp8) | `fasth3.yaml` |
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
+| TranslateGemma 27B MXFP4 (GPTQ), translation; optional DFlash2 drafter | `translategemma-27b-mxfp4-gptq.rad` (17 GiB) | [convert](#convert-a-checkpoint) | `translategemma-27b.yaml` |
+| GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, vision, eight cards | `glm53-flash-mxfp4.rad` (172 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
+| Stable Diffusion XL bf16 and its finetunes (Illustrious, NoobAI, Pony): text to image, one card | `illustrious-xl-v2.0-bf16.rad` (6.4 GiB), from any single-file SDXL checkpoint | [convert](#convert-a-checkpoint) | `sdxl.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
+| Anima Aesthetic FP8: anime and illustration, text to image, one card (Base and Turbo convert the same way) | `anima-aesthetic-fp8.rad` (3.0 GiB) | [convert](#convert-a-checkpoint) | `anima.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | — |
 
 A container holds everything the server needs: the weights, the tokeniser, the chat template and
@@ -53,6 +71,26 @@ repository has the recipe and the calibration step. To convert Google's bf16 che
 with a scale search, bf16 lm_head); see [Convert a checkpoint](#convert-a-checkpoint). On two R9700s
 that container decodes at 103 tok/s on prose and 141 on code, against 112 and 150 for keptn42's,
 and accepts 0.46 of its drafts on prose against 0.50.
+
+TranslateGemma 27B is converted from Google's bf16 checkpoint in three steps: an int8 container to
+calibrate in, its Gram matrices over translation prompts, then MXFP4 with GPTQ
+(`data/recipes/translategemma-27b-*.recipe`, the steps in docs/ARCHITECTURES.md). On two R9700s it
+decodes 56 tok/s a stream (205 at four) and scores mean KL 0.042 against the bf16 model on held-out
+translations; with a DFlash2 drafter, 152 a stream. Its chat template takes structured turns
+naming the two languages and refuses the plain turn the server renders at startup, so
+`translategemma-27b.yaml` serves a plain Gemma 3 template (`deploy/compose/gemma3.jinja`) and a
+client sends on `/v1/completions` the prompt the checkpoint's template renders.
+
+GLM-5.3-Flash is converted from AMD's Quark export (`amd/GLM-5.3-Flash-Quark-MXFP4`) with
+`data/recipes/glm53-mxfp4.recipe`, which keeps every weight as stored except the latent
+attention's small kv_b, decoded to bf16. At 172 GiB it takes eight R9700s (`--tp 8`), every expert
+resident, and its own MTP layer drafts. On eight R9700s it prefills 3958 tok/s at 6k tokens,
+decodes 166 tok/s on one stream and 426 over eight, and 506 under eight streams of agent turns.
+Pictures go through its own vision tower, up to 4096 tokens an image at the default encoder pass
+(`--mm-max-patches 32000` serves the checkpoint's 8000); the KV cache is bf16. Its template knows
+the reasoning efforts `low` and
+`high` and renders any other as its maximum, so `glm53-flash.yaml` maps `medium` and `xhigh`
+to `high`.
 
 The ParoQuant containers keep the trunk exactly as the ParoQuant releases ship it, with the learned
 Givens rotations it was trained in. Convert int4 from `z-lab/Qwen3.8-27B-PARO`, int5 from
@@ -85,7 +123,9 @@ only.
 ## Run with Docker
 
 The host needs Docker and an `amdgpu` driver that supports ROCm 10.1; it does not need ROCm. The
-card needs Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The image
+card works best with Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup);
+without it the engine keeps kernel arguments in pinned host memory, and every dispatch reads them
+over the link. The image
 is [`stilldeadcode/radiance`](https://hub.docker.com/r/stilldeadcode/radiance), with its kernels
 built for `gfx1201`. Pull it, clone this repository for its compose files, then start a model from
 one of them:
@@ -223,11 +263,24 @@ build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-w4a8.ra
     --recipe data/recipes/gemma4-31b-dense-bf16-w4a8.recipe \
     --set quantization_config.quant_method=compressed-tensors \
     --draft-model /srv/models/hf/google/gemma-4-31B-it-assistant
+build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-dense-w4a8-df.rad \
+    --recipe data/recipes/gemma4-31b-dense-bf16-w4a8-df.recipe \
+    --set quantization_config.quant_method=compressed-tensors \
+    --draft-model /srv/models/hf/z-lab/gemma-4-31B-it-DFlash
+build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-dense-q8-df.rad \
+    --recipe data/recipes/gemma4-31b-dense-bf16-q8-df.recipe \
+    --set quantization_config.quant_method=compressed-tensors \
+    --draft-model /srv/models/hf/z-lab/gemma-4-31B-it-DFlash
 build/bin/rad-convert /srv/models/hf/z-lab/Qwen3.8-27B-PARO -o qwen3.8-27b-paro-int4.rad \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe \
     --draft-model /srv/models/hf/z-lab/Qwen3.8-27B-DFlash2
 build/bin/rad-convert /srv/models/hf/ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ -o swift15-27b-w4a16.rad \
     --recipe data/recipes/q38-27b-w4a16.recipe
+# Any single-file SDXL checkpoint (SDXL 1.0, Illustrious, NoobAI, Pony, a civitai finetune), with
+# CLIP's tokenizer.json from openai/clip-vit-large-patch14
+build/bin/rad-convert /srv/models/hf/OnomaAIResearch/Illustrious-XL-v2.0/Illustrious-XL-v2.0.safetensors \
+    -o illustrious-xl-v2.0-bf16.rad --recipe data/recipes/sdxl-bf16.recipe \
+    --tokenizer /srv/models/hf/openai/clip-vit-large-patch14/tokenizer.json
 ```
 
 With Docker, use `docker run --rm -v /srv/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`.
@@ -252,6 +305,27 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 
 `CMakePresets.json` names the same runs (`ctest --preset fast`, `host`, `gpu`, `full`, `asan`), and
 [`docs/GUIDE.md`](docs/GUIDE.md) §1.3 describes the tiers and the test binaries' options.
+
+## Draft acceptance
+
+Speculative decoding drafts up to `--num-speculative-tokens` tokens a step; the target model
+verifies them in one pass, and a draft survives only if it matches what the target would have
+produced. A position is verified only when every earlier position survived, so the same events
+admit two ratios, and they differ only in the denominator:
+
+- **Conditional** -- accepted / *reached*: of the drafts actually verified at a position, how
+  many passed. The dashboard's live "conditionally accepted" figure and the per-position bars are
+  conditional. Always the higher number, and it moves with the workload.
+- **Marginal** -- accepted / *drafted*: of everything the drafter proposed, how much survived.
+  The engine's `draft_accept` (/stats, and `radiance:draft_acceptance_ratio` on /metrics) is
+  marginal, cumulative over the life of the process. Lower by construction, and slow to move.
+
+They cannot agree, and neither is the other one broken. At depth 3 a step drafts three tokens
+but reaches position 3 only when 1 and 2 both passed, so marginal is roughly the product of the
+conditionals: bars reading 56/75/77% give (0.56 + 0.56x0.75 + 0.56x0.75x0.77) / 3 = 43%. A live
+63% beside a lifetime 43% is one lane, two questions. Quote the conditional when asking "how
+good is the drafter right now"; quote the marginal when asking "what fraction of draft work
+became text." Never compare the two across that boundary.
 
 ## Documentation
 

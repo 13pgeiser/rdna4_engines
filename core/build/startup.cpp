@@ -173,11 +173,13 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
         }
     }
 
-    /* An imported quantisation is served by the family's quantised plugin (startup.h). */
+    /* An imported quantisation is served by the family's quantised plugin (startup.h). A plugin
+     * that declines imports (rad_arch_serves_imports) is left out of the family here: neither
+     * counted as a second quantised plugin nor picked as the only one. */
     if (imported && !arch_id.empty() && out->arch_plugin.empty()) {
         std::vector<const Plugin*> fam, quantised;
         for (const Plugin& p : r.plugins())
-            if (p.kind == RAD_PLUGIN_ARCH && p.arch_id == arch_id) {
+            if (p.kind == RAD_PLUGIN_ARCH && p.arch_id == arch_id && p.arch_serves_imports) {
                 fam.push_back(&p);
                 if (!p.arch_quant.empty()) quantised.push_back(&p);
             }

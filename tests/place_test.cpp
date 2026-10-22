@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace rad;
@@ -3829,53 +3830,82 @@ int process_vram(int64_t* out) {
     return RAD_OK;
 }
 
+/* process_vram once it holds still. A stream is a hardware queue, and KFD gives each queue a
+ * context save area (the topology's cwsr_size + ctl_stack_size: 29.3 MiB on a 64-CU RDNA4 card)
+ * that can be released a few milliseconds after the queue is destroyed, so a reading straight
+ * after a stream's destruction may still include it (#124). Reads every 10 ms until 100 ms pass
+ * without a change, for at most 2 s. */
+int settled_vram(int64_t* out) {
+    int64_t v = 0;
+    RAD_TRY(process_vram(&v));
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (int still = 0; still < 10 && std::chrono::steady_clock::now() < end;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        int64_t w = 0;
+        RAD_TRY(process_vram(&w));
+        still = w == v ? still + 1 : 0;
+        v = w;
+    }
+    *out = v;
+    return RAD_OK;
+}
+
 }  /* namespace */
 
 /* Tools and tests build and tear down movers repeatedly, and on a card every event or stream is
  * a hardware queue and VRAM. A mover that staged, promoted and filled a loan gives back every
  * event and every byte of device memory it took. */
+/* The runtime and the driver keep some memory for the life of the process once a path is first
+ * used: page tables for address ranges first mapped (a page, or a page and a 2 MiB directory). So
+ * the work runs once before the count is taken, and the count after a second run may differ by a
+ * page and a directory, never by a buffer. Both counts are taken once the figure holds still: a
+ * destroyed stream's queue save area can outlive it by a few milliseconds (settled_vram, #124). */
 TEST(a_mover_gives_back_every_event_and_device_byte) {
-    const int64_t events0 = rad_dev_live_events();
-    int64_t vram0 = 0, vram1 = 0;
-    CHECK_OK(process_vram(&vram0));
-    {
-        Fixture f;
-        build_dense(f, 8, 1 * MiB, /*host_kernel=*/false);
-        Config c = base_config();
-        c.placement = "layer_offload";
-        c.vram_weights_mib = 5;
-        c.host_pool_mib = 64;
-        PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
-        Plan p;
-        REQUIRE_EQ(Planner(in).plan(&p), RAD_OK);
-        Mover m;
-        MoverConfig mc;
-        REQUIRE_EQ(m.init(f.prog, p, mc), RAD_OK);
-        RadStream compute = nullptr;
-        REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
-        CHECK_OK(m.bind_compute_stream(compute));
-        CHECK(rad_dev_live_events() > events0);
-        ComputeWork work;
-        for (int d = 0; d < 20; ++d) {
-            CHECK_OK(m.begin_dispatch(d, nullptr));
-            work.run(compute);
-            CHECK_OK(m.prefetch_to_op(p.prefetch[(size_t)d % p.prefetch.size()].at_op));
+    auto run = [&]() {
+        const int64_t events0 = rad_dev_live_events();
+        {
+            Fixture f;
+            build_dense(f, 8, 1 * MiB, /*host_kernel=*/false);
+            Config c = base_config();
+            c.placement = "layer_offload";
+            c.vram_weights_mib = 5;
+            c.host_pool_mib = 64;
+            PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+            Plan p;
+            REQUIRE_EQ(Planner(in).plan(&p), RAD_OK);
+            Mover m;
+            MoverConfig mc;
+            REQUIRE_EQ(m.init(f.prog, p, mc), RAD_OK);
+            RadStream compute = nullptr;
+            REQUIRE_EQ(rad_stream_create(&compute, 0), RAD_OK);
+            CHECK_OK(m.bind_compute_stream(compute));
+            CHECK(rad_dev_live_events() > events0);
+            ComputeWork work;
+            for (int d = 0; d < 20; ++d) {
+                CHECK_OK(m.begin_dispatch(d, nullptr));
+                work.run(compute);
+                CHECK_OK(m.prefetch_to_op(p.prefetch[(size_t)d % p.prefetch.size()].at_op));
+            }
+            CHECK(m.stats().prefetched > 0);
+            CHECK_OK(rad_stream_sync(compute));
+            rad_stream_destroy(compute);
         }
-        CHECK(m.stats().prefetched > 0);
-        CHECK_OK(rad_stream_sync(compute));
-        rad_stream_destroy(compute);
-    }
-    {
-        LoanRig r;
-        REQUIRE_EQ(r.build(), RAD_OK);
-        CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
-        for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
-            CHECK_OK(r.dispatch());
-        CHECK(r.m.stats().promotions > 0);
-    }
-    CHECK_EQ(rad_dev_live_events(), events0);
-    CHECK_OK(process_vram(&vram1));
-    CHECK_EQ(vram1, vram0);
+        {
+            LoanRig r;
+            REQUIRE_EQ(r.build(), RAD_OK);
+            CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+            for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+                CHECK_OK(r.dispatch());
+            CHECK(r.m.stats().promotions > 0);
+        }
+        CHECK_EQ(rad_dev_live_events(), events0);
+    };
+    run();
+    int64_t vram0 = 0, vram1 = 0;
+    CHECK_OK(settled_vram(&vram0));
+    run();
+    CHECK_OK(settled_vram(&vram1));
+    CHECK(vram1 - vram0 <= 2 * MiB + 4096);
 }
 
 RAD_TEST_MAIN()

@@ -45,9 +45,30 @@
  * and includes this file. Every difference is behind `#if QWEN35_MOE`: the expert-count check, the
  * routing geometry read from metadata, the block's buffers, the per-layer source names, the MTP
  * head's feed-forward, and the plugin identity. */
+/* ============================== AND A THIRD: qwen35_w8a8 ==============================
+ *
+ * `qwen35_w8a8` is the dense build with an int8 trunk: every large linear `i8*bf16[1x128]/fwht128`,
+ * rotated by a 128-wide Hadamard and served at i8a8h, each quantising its own input from the bf16
+ * plane (LinearFP8's int8 branch). The producers already write that plane, as they do for a rotated
+ * MXFP4 linear, so the graph is this one. It is a plugin of its own because the quantisation
+ * descriptor is half of the selection key: `w8a8_fwht128`, which names the rotation, so a plain
+ * int8 trunk is refused.
+ *
+ * Its differences are behind `#if QWEN35_W8A8`: check_format's method, the probe that learns the
+ * trunk is int8 before the activations are declared (and refuses one that is not), and the plugin
+ * identity. The int8 activation pairs follow from the probe. */
 #ifndef QWEN35_MOE
 #define QWEN35_MOE 0
 #endif
+#ifndef QWEN35_W8A8
+#define QWEN35_W8A8 0
+#endif
+#if QWEN35_MOE && QWEN35_W8A8
+#error "qwen35_w8a8 is the dense build; a routed int8 trunk is not a format this file serves"
+#endif
+/* The plugin's name for a message, expanded once more so it is QWEN35_NS's value. */
+#define QWEN35_STR_X(x) #x
+#define QWEN35_STR(x)   QWEN35_STR_X(x)
 #ifndef QWEN35_NS
 #define QWEN35_NS qwen35_fp8
 #endif
@@ -101,6 +122,10 @@ struct Model {
 
     rad_kvgroup kv_full = 0, kv_state = 0, kv_conv = 0;
 
+    /* The trunk's linears are int8 (LinearFP8::i8), learned before the activations are declared
+     * because it decides whether they carry an int8 code pair. Only qwen35_w8a8 sets it. */
+    bool trunk_i8 = false;
+
     /* the residual stream and the two vocabulary edges */
     rad_buf b_x = 0, b_hout = 0, b_logits = 0;
     ActFP8  a_h{};
@@ -126,6 +151,8 @@ struct Model {
     ActFP8  a_eff{};
     rad_buf b_sgu = 0, b_sout = 0, b_sgate = 0;
     ActFP8  a_sff{};
+    /* Rotated codes of the expert input, for rotated four-bit experts (MoeFP8::Config::expert_rot). */
+    ActFP8  a_hr{};
 #endif
 
     /* The DFlash2 drafter, declared only when the container carries one and the deployment
@@ -178,6 +205,18 @@ static Model g_model[MAX_RANKS];
 static int check_format(const RadModelMeta* meta) {
     const char* method = rad_meta_gets(meta, "quantization_config.quant_method", nullptr);
     const char* fmt    = rad_meta_gets(meta, "quantization_config.fmt", nullptr);
+#if QWEN35_W8A8
+    /* The format the convert stated (the recipe's --set keys); the trunk probe in declare() holds
+     * the weights to it. */
+    if (!method || std::strcmp(method, "w8a8") != 0 || !fmt || std::strcmp(fmt, "fwht128") != 0) {
+        fprintf(stderr, "radiance: qwen35_w8a8 serves a container converted for an int8 trunk "
+                        "(quant_method 'w8a8', fmt 'fwht128': data/recipes/"
+                        "q38-27b-w8a8-df2.recipe's --set keys); this one says '%s' / '%s'.\n",
+                method ? method : "(none)", fmt ? fmt : "(none)");
+        return RAD_E_UNSUPPORTED;
+    }
+    return RAD_OK;
+#else
     const char* block  = rad_meta_gets(meta, "quantization_config.weight_block_size", nullptr);
 
     if (method && std::strcmp(method, "fp8") != 0) {
@@ -204,6 +243,7 @@ static int check_format(const RadModelMeta* meta) {
         }
     }
     return RAD_OK;
+#endif
 }
 
 /* The DFlash2 drafter: its geometry, KV group, buffers and block.
@@ -406,8 +446,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 #else
     if (meta->n_expert > 0) {
-        fprintf(stderr, "radiance: qwen35_fp8 refuses a checkpoint with %lld experts; that is "
-                        "qwen35moe\n", (long long)meta->n_expert);
+        fprintf(stderr, "radiance: " QWEN35_STR(QWEN35_NS) " refuses a checkpoint with %lld "
+                        "experts; that is qwen35moe\n", (long long)meta->n_expert);
         return RAD_E_UNSUPPORTED;
     }
 #endif
@@ -516,9 +556,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
     fd.n_head_kv = g.n_head_kv;
     fd.head_dim  = g.head_dim;
+    /* --kv-cache-dtype fp8_v4 / k6_v4 (RadBuildCtx::kv_quant): V as int4 in groups of 32 with f16
+     * scales, K E4M3 as above or int6 the same way (libr4d's fp8_v4 / k6_v4 rows). A token's row
+     * is 25 or 22 * head_dim / 16 bytes instead of 2 * head_dim, so the group is declared at half
+     * that and the core sizes pages from it; only those kernels read the layout. The drafter's
+     * group stays E4M3 (declare_dflash2). The engine asks only for a layout probe() offered. */
+    const int kvq = fd.dtype == RAD_F8E4M3 ? ctx->kv_quant : RAD_KVQ_NONE;
+    const char* kvq_name = kvq == RAD_KVQ_V4 ? "fp8_v4" : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+    if (kvq != RAD_KVQ_NONE && !kvq_name) {
+        fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n", kvq);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (kvq_name && !(g.head_dim == 256 && g.n_head == 6 * g.n_head_kv)) {
+        fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim 256, gqa 6 "
+                        "only; this model is head_dim %lld, gqa %lld\n", kvq_name,
+                (long long)g.head_dim, (long long)(g.n_head_kv ? g.n_head / g.n_head_kv : 0));
+        return RAD_E_UNSUPPORTED;
+    }
+    const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
+    fd.head_dim = g.head_dim * row16 / 32;
     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
     /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
-    g.kv_dtype = rad_dtype_name(fd.dtype);
+    g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
+    if (kvq_name)
+        rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a token "
+                    "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
+                 (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
 
     /* The SSM state cache is f32.
      *
@@ -544,13 +607,41 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     cd.conv_width = gc.conv_width;
     m.kv_conv = rad_decl_kv_group(b, nm.f("kv_gdn_conv"), &cd);
 
+#if QWEN35_W8A8
+    /* ---- the trunk's stored format, read from the first delta-net layer's input projection as
+     * qwen4exp_fp8 reads its own: the activations below carry an int8 code pair only for an int8
+     * trunk, and this build serves only the rotated one its descriptor names. The probe maps the
+     * weight through the layer's own LinearFP8, which then does not map it again; the resize
+     * before the layer loop keeps the layers sized here. */
+    m.layers.resize((size_t)m.n_main);
+    for (int64_t l = 0; l < m.n_main; ++l) {
+        if (is_full_attention(l, interval)) continue;
+        const char* pre = "model.language_model.layers";
+        RAD_ARCH_TRY(m.layers[(size_t)l].gdn.in.probe(
+            b, nm, g, nm.f("blk.%lld.ssm_inz", (long long)l),
+            { nm.ckpt("%s.%lld.linear_attn.in_proj_qkv.weight", pre, (long long)l),
+              nm.ckpt("%s.%lld.linear_attn.in_proj_z.weight", pre, (long long)l) }));
+        RadEncoding enc{};
+        m.trunk_i8 = weight_enc(b, nm.f("blk.%lld.ssm_inz.weight", (long long)l), &enc) &&
+                     linear_is_w8h(enc);
+        break;
+    }
+    if (!m.trunk_i8) {
+        fprintf(stderr, "radiance: qwen35_w8a8 serves a rotated int8 trunk (i8 codes with a bf16 "
+                        "scale a [1 x 128], /fwht128), and this container's first delta-net input "
+                        "projection is not one; convert with "
+                        "data/recipes/q38-27b-w8a8-df2.recipe\n");
+        return RAD_E_DTYPE;
+    }
+#endif
+
     /* ---- activation buffers. Every activation that feeds a GEMM has an fp8 copy: an E4M3 plane
      * of the same shape and an f32 scale plane with one column per 128. They are transients that
      * liveness analysis can share, but not free: the largest, `ffn`'s, is 8192 x 17408 bytes
      * (143 MiB) beside its 285 MiB bf16 buffer. */
     m.b_x       = decl_b(b, nm.f("x"),        g.act_dtype, {g.max_tok, g.n_embd});
     m.a_h.x     = decl_b(b, nm.f("h"),        g.act_dtype, {g.max_tok, g.n_embd});
-    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd));
+    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.trunk_i8));
 
     m.b_qg      = decl_b(b, nm.f("attn_qg"),  g.act_dtype, {g.max_tok, g.n_head, 2 * g.head_dim});
     m.b_k       = decl_b(b, nm.f("attn_k"),   g.act_dtype, {g.max_tok, kv_dim});
@@ -566,7 +657,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * it must not share storage with transients. */
     m.b_rope_cs = decl_b(b, nm.f("rope_cs"), RAD_F32, {rope_table_rows(g), m.n_rot},
                          RAD_BUF_PERSIST);
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim, 0, m.trunk_i8));
 
     /* `gdn_in` is conv_dim + v_dim, not in_dim: a and b have their own buffer because the
      * checkpoint keeps them bf16, while the fp8 output gate is the tail of this one
@@ -586,7 +677,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Rank 3, as libr4d's scan and recurrent kernels require; the quantiser reads dim 0 as the
      * row. */
     m.a_go.x    = decl_b(b, nm.f("gdn_o"),    g.act_dtype, {g.max_tok, gc.n_head_v, gc.head_v});
-    RAD_ARCH_TRY(m.a_go.declare_qs(b, nm, g, "gdn_o", v_dim));
+    RAD_ARCH_TRY(m.a_go.declare_qs(b, nm, g, "gdn_o", v_dim, 0, m.trunk_i8));
 
 #if QWEN35_MOE
     /* ---- the routing geometry, read here so a refusal names the container's key. `n_ff` is
@@ -624,6 +715,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     (long long)mc.top_k, (long long)mc.n_expert);
             return RAD_E_INVAL;
         }
+        /* GPTQ calibration run (MoeFP8::Config::calib), on when the output directory is set. */
+        mc.calib = calib_dir() != nullptr ? 1 : 0;
+        /* The experts' stored format, read from layer 0's first expert as qwen4exp does, so a
+         * container with four-bit experts is served in that format. */
+        {
+            MoeFP8::Src ps{};
+            RAD_ARCH_TRY(moe_expert_sources(b, nm, "format",
+                                            "model.language_model.layers.0.mlp.experts", &ps));
+            RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ps, &mc));
+        }
+        if (mc.expert_bf16) {
+            fprintf(stderr, "radiance: qwen35moe: plain bf16 experts are not served by this "
+                            "plugin; convert with a quantising recipe\n");
+            return RAD_E_UNSUPPORTED;
+        }
     }
     {
         /* The step's height for everything with one row per token, and a pass's height only for
@@ -654,11 +760,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.b_sout  = decl_b(b, nm.f("shexp_out"),     g.act_dtype, {R, g.n_embd});
             m.b_sgate = decl_b(b, nm.f("shexp_gate"),    g.act_dtype, {R, 1});
         }
+        if (mc.expert_rot) RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
     }
 #else
     m.b_gate_up = decl_b(b, nm.f("gate_up"),  g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.a_ffn.x   = decl_b(b, nm.f("ffn"),      g.act_dtype, {g.max_tok, g.n_ff});
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.trunk_i8));
+#endif
+
+#if QWEN35_W8A8
+    /* ---- the rotated trunk's quantisers in their producers. Every reader of `h`'s codes is a
+     * rotated int8 projection (q, k, v; the delta net's qkv|z; gate_up), and of `ffn`'s the down
+     * projection, so where libr4d serves the `_had_quant_i8g` forms the norms and the gated
+     * product write had_quant_act_i8g's codes themselves (ActFP8::q8_rot) and those projections
+     * declare no quantiser: one launch for q, k and v instead of three, and none before down. The
+     * codes are the same bytes. Where the forms are not declared (the CPU kernels), each
+     * projection quantises its own input from the bf16 plane, as before. */
+    if (rad_op_declared(b, "rmsnorm_had_quant_i8g") &&
+        (g.world != 2 || rad_op_declared(b, "ar_rmsnorm_had_quant_i8g")))
+        m.a_h.q8_fed = m.a_h.q8_rot = true;
+    if (rad_op_declared(b, "gated_had_quant_i8g")) m.a_ffn.q8_fed = m.a_ffn.q8_rot = true;
 #endif
 
     m.b_hout    = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
@@ -762,6 +883,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
     mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
+    mw.hr = m.a_hr;
 #else
     mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
 #endif
@@ -813,7 +935,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.cfg         = m.moecfg;
         ms.norm        = nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l);
         ms.router      = nm.ckpt("%s.%lld.mlp.gate.weight",                 pre, (long long)l);
-        ms.experts     = nm.ckpt("%s.%lld.mlp.experts",                     pre, (long long)l);
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
+                                        nm.ckpt("%s.%lld.mlp.experts", pre, (long long)l), &ms));
         if (m.moecfg.n_ff_shared > 0) {
             ms.shared      = nm.ckpt("%s.%lld.mlp.shared_expert",              pre, (long long)l);
             ms.shared_gate = nm.ckpt("%s.%lld.mlp.shared_expert_gate.weight",  pre, (long long)l);
@@ -916,7 +1039,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * MtpBlockFP8 is a template over the feed-forward. */
         ts.mlp.cfg     = m.moecfg;
         ts.mlp.router  = nm.ckpt("mtp.layers.0.mlp.gate.weight");
-        ts.mlp.experts = nm.ckpt("mtp.layers.0.mlp.experts");
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "mtp", nm.ckpt("mtp.layers.0.mlp.experts"),
+                                        &ts.mlp));
         if (m.moecfg.n_ff_shared > 0) {
             ts.mlp.shared      = nm.ckpt("mtp.layers.0.mlp.shared_expert");
             ts.mlp.shared_gate = nm.ckpt("mtp.layers.0.mlp.shared_expert_gate.weight");
@@ -1109,6 +1233,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * 0 when the container carries no drafter. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* --kv-cache-dtype fp8_v4 / k6_v4: libr4d's rows for them are the h256/gqa6 attention
+     * family's (Qwen3.8-27B), so other geometries are refused at startup rather than in declare. */
+    {
+        const long long hd  = meta->head_dim ? meta->head_dim
+                                             : (meta->n_head ? meta->n_embd / meta->n_head : 0);
+        const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
+        if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
+            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
+    }
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "DFlash2")) {
         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);
@@ -1137,6 +1270,14 @@ QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "fp8_e4m3", "0.1.0",
                 "dense graph with a routed feed-forward (256 experts, 8 a token, and a shared "
                 "expert), gated attention over paged KV every fourth layer and gated delta net "
                 "between")
+#elif QWEN35_W8A8
+QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "w8a8_fwht128", "0.1.0",
+                "Qwen3.5 / 3.6 / 3.8 dense (0.8B..27B), an int8 trunk: i8 weights with a bf16 "
+                "scale a 128 of K, rotated by a 128-wide Hadamard, against int8 activations the "
+                "same rotation quantises; gated attention over paged KV every fourth layer and "
+                "gated delta net between")
+/* An imported checkpoint is never a rotated int8 trunk: qwen35_fp8 serves those. */
+RAD_ARCH_SERVES_IMPORTS(0)
 #else
 QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "fp8_e4m3", "0.1.0",
                 "Qwen3.5 / 3.6 / 3.8 dense (0.8B..27B), block-scaled fp8 weights and fp8 "

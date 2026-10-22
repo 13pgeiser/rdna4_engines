@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -927,7 +928,35 @@ int Builder::kv_group_zero(rad_kvgroup h) {
             prog_.kv_groups[h].name.c_str());
         return RAD_E_INVAL;
     }
+    if (prog_.kv_groups[h].replicated) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_zero on a group declared replicated; a "
+            "replicated group is held whole on every rank", prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
     prog_.kv_groups[h].zero = true;
+    return RAD_OK;
+}
+
+int Builder::kv_group_replicated(rad_kvgroup h) {
+    if (finished_) {
+        err(RAD_E_STATE, "kv_group_replicated after declare finished");
+        return RAD_E_STATE;
+    }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    /* Paged groups only: the tiers move blocks. A linear or conv group's state travels in the
+     * checkpoint store, which has no such window. */
+    const int kind = prog_.kv_groups[h].decl.kind;
+    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_replicated on a group that is not paged",
+            prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    if (prog_.kv_groups[h].zero) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_replicated on a group declared zero; a zero "
+            "rank holds none of it", prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].replicated = true;
     return RAD_OK;
 }
 
@@ -940,7 +969,8 @@ int Builder::decl_name_map(const RadNameMap* m) {
         return RAD_E_INVAL;
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
-        m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA) {
+        m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -951,9 +981,11 @@ int Builder::decl_name_map(const RadNameMap* m) {
                                    : "the magnitude and the direction", m->n_src);
         return RAD_E_INVAL;
     }
-    if (m->mode == RAD_MAP_TRANSPOSE && m->n_src != 1) {
-        err(RAD_E_INVAL, "name map for '%s': a transpose map names one source, not %d",
-            m->declared, m->n_src);
+    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&
+        m->n_src != 1) {
+        err(RAD_E_INVAL, "name map for '%s': a %s map names one source, not %d", m->declared,
+            m->mode == RAD_MAP_TAP ? "tap" : m->mode == RAD_MAP_COLS ? "column" : "transpose",
+            m->n_src);
         return RAD_E_INVAL;
     }
 
@@ -982,14 +1014,20 @@ int Builder::decl_name_map(const RadNameMap* m) {
                     m->declared, i, m->src_index[i], (long long)m->src_rows[i]);
                 return RAD_E_INVAL;
             }
+    if (m->mode == RAD_MAP_COLS && (m->src_index[0] < 0 || m->src_rows[0] <= 0)) {
+        err(RAD_E_INVAL, "name map for '%s': the column range starts at %d and holds %lld columns",
+            m->declared, m->src_index[0], (long long)m->src_rows[0]);
+        return RAD_E_INVAL;
+    }
 
-    /* A CONCAT map may be declared in pieces; any other repeat is an error.
+    /* A CONCAT, ROWS or EMA map may be declared in pieces; any other repeat is an error.
      *
      * `src[8]` is the ABI's cap, and a sharded checkpoint exceeds it: Qwen3.8-Flash-Next stores
      * its n-gram embedding as 128 tensors `...ngram_embedding.shard_K.weight`. Growing the array
      * would cost ~80 MB of Program (one map per declared weight, ~50K weights). So successive
      * CONCAT maps for one name extend it in call order, and rad-convert joins their sources end
-     * to end (map_concat_shards() in arch/common/rad_arch.h).
+     * to end (map_concat_shards() in arch/common/rad_arch.h). ROWS maps extend the same way (a
+     * row permutation is one piece a row).
      *
      * Other repeats are refused: a lookup built with std::map::emplace would silently keep the
      * first, so a copy-paste mistake would convert weights from the wrong tensors. */
@@ -997,11 +1035,12 @@ int Builder::decl_name_map(const RadNameMap* m) {
     if (seen != name_map_first_.end()) {
         const RadNameMap& first = prog_.name_map[seen->second];
         const bool joins = (c.mode == RAD_MAP_CONCAT && first.mode == RAD_MAP_CONCAT) ||
-                           (c.mode == RAD_MAP_EMA && first.mode == RAD_MAP_EMA);
+                           (c.mode == RAD_MAP_EMA && first.mode == RAD_MAP_EMA) ||
+                           (c.mode == RAD_MAP_ROWS && first.mode == RAD_MAP_ROWS);
         if (!joins) {
-            err(RAD_E_INVAL, "name map for '%s': declared twice, and only a CONCAT or EMA map may "
-                             "be extended -- a repeated COPY map means two sources for one weight, "
-                             "and which one wins is not something a declaration can express",
+            err(RAD_E_INVAL, "name map for '%s': declared twice, and only a CONCAT, ROWS or EMA "
+                             "map may be extended -- a repeated COPY map means two sources for one "
+                             "weight, and which one wins is not something a declaration can express",
                 c.declared);
             return RAD_E_INVAL;
         }
@@ -1192,16 +1231,27 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
                 : prog_.is_audio_generator() ? "an audio generator" : "a video generator");
         return RAD_E_STATE;
     }
-    if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID) {
+    if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID && d->layout != RAD_GEN_LAYOUT_JOINT_STEP) {
         err(RAD_E_INVAL, "declare_generator '%s': layout %d is not one this engine builds", nm,
             (int)d->layout);
         return RAD_E_INVAL;
     }
+    const bool joint = d->layout == RAD_GEN_LAYOUT_JOINT_STEP;
     auto has = [](const char* t, const char* what) { return t && std::strstr(t, what); };
-    if (!has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}") ||
-        !has(d->tmpl_edit, "{images}") || !has(d->tmpl_image, "{image}")) {
-        err(RAD_E_INVAL, "declare_generator '%s': tmpl_text needs {prompt}, tmpl_edit {images} and "
-                         "{prompt}, and tmpl_image {image}, where the picture's tokens go", nm);
+    if (joint ? !has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}")
+              : !has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}") ||
+                    !has(d->tmpl_edit, "{images}") || !has(d->tmpl_image, "{image}")) {
+        err(RAD_E_INVAL, "declare_generator '%s': tmpl_text and tmpl_edit need {prompt}, and "
+                         "with the pictures in the prompt tmpl_edit needs {images} and tmpl_image "
+                         "{image}, where the picture's tokens go", nm);
+        return RAD_E_INVAL;
+    }
+    if (joint && (d->cond_rows <= 0 || !(d->rope_hw_scale > 0) || d->pad_multiple < 0 ||
+                  (d->pad_multiple > 0 && d->pad_token < 0))) {
+        err(RAD_E_INVAL, "declare_generator '%s': the joint layout needs cond_rows, a positive "
+                         "rope_hw_scale and, with padding, a pad token (cond_rows %lld, scale %g, "
+                         "pad %d to a multiple of %d)", nm, (long long)d->cond_rows,
+            d->rope_hw_scale, (int)d->pad_token, (int)d->pad_multiple);
         return RAD_E_INVAL;
     }
     if (d->latent_channels <= 0 || d->latent_scale <= 0 || d->size_multiple <= 0 ||
@@ -1219,8 +1269,34 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
             (long long)d->default_height, (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    if (d->n_sigmas < 0 || (d->n_sigmas > 0 && !d->sigmas) ||
-        (d->n_sigmas == 0 && d->default_steps <= 0) || !(d->default_cfg >= 1.0) ||
+    if (d->train_steps < 0) {
+        err(RAD_E_INVAL, "declare_generator '%s': train_steps %d is negative", nm,
+            (int)d->train_steps);
+        return RAD_E_INVAL;
+    }
+    if (d->train_steps > 0) {
+        /* A discrete-time denoiser: its own schedule, a sampler it serves by default. */
+        const uint32_t all = (1u << RAD_GEN_SAMPLER_COUNT) - 1;
+        if (d->train_steps < 2 || !(d->beta_start > 0) || !(d->beta_end > d->beta_start) ||
+            !(d->beta_end < 1) ||
+            (d->beta_schedule != RAD_GEN_BETAS_SCALED_LINEAR &&
+             d->beta_schedule != RAD_GEN_BETAS_LINEAR) ||
+            d->n_sigmas != 0 || d->default_steps <= 0 || (d->samplers & ~all) || !d->samplers ||
+            d->default_sampler < 0 || d->default_sampler >= RAD_GEN_SAMPLER_COUNT ||
+            !(d->samplers & (1u << d->default_sampler)) || d->default_scheduler < 0 ||
+            d->default_scheduler >= RAD_GEN_SCHED_COUNT ||
+            !(d->default_cfg >= (d->cfg_original ? 0.0 : 1.0))) {
+            err(RAD_E_INVAL, "declare_generator '%s': the discrete-time sampler is incomplete (%d "
+                             "timesteps, betas %g..%g kind %d, %lld default steps, samplers 0x%x "
+                             "default %d, scheduler %d, %d fixed sigmas, guidance %g)", nm,
+                (int)d->train_steps, d->beta_start, d->beta_end, (int)d->beta_schedule,
+                (long long)d->default_steps, (unsigned)d->samplers, (int)d->default_sampler,
+                (int)d->default_scheduler, (int)d->n_sigmas, d->default_cfg);
+            return RAD_E_INVAL;
+        }
+    } else if (d->n_sigmas < 0 || (d->n_sigmas > 0 && !d->sigmas) ||
+        (d->n_sigmas == 0 && d->default_steps <= 0) ||
+        !(d->default_cfg >= (d->cfg_original ? 0.0 : 1.0)) ||
         (d->dyn_shift && (d->max_seq <= d->base_seq || d->base_seq <= 0)) ||
         (!d->dyn_shift && !(d->shift > 0)) || d->shift_terminal < 0 || d->shift_terminal >= 1) {
         err(RAD_E_INVAL, "declare_generator '%s': the sampler is incomplete (%d fixed sigmas, %lld "
@@ -1228,6 +1304,23 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
                          "guidance %g)", nm, (int)d->n_sigmas, (long long)d->default_steps,
             d->shift, (int)d->dyn_shift, (long long)d->base_seq, (long long)d->max_seq,
             d->shift_terminal, d->default_cfg);
+        return RAD_E_INVAL;
+    }
+    if (d->sigma_grid < 0 || d->min_tokens < 0 || (d->aux_tokens && d->aux_max_tokens <= 0)) {
+        err(RAD_E_INVAL, "declare_generator '%s': sigma_grid %d, min_tokens %d and a second "
+                         "tokenizer of at most %lld tokens are not a schedule and a prompt it can "
+                         "read", nm, (int)d->sigma_grid, (int)d->min_tokens,
+            (long long)d->aux_max_tokens);
+        return RAD_E_INVAL;
+    }
+    if (d->chunk_tokens < 0 ||
+        (d->chunk_tokens > 0 &&
+         (!joint || d->pad_multiple != 0 || d->pad_token < 0 || d->chunk_bos < 0 ||
+          d->chunk_eos < 0 || d->cond_rows % (d->chunk_tokens + 2) != 0))) {
+        err(RAD_E_INVAL, "declare_generator '%s': a prompt in windows of %d tokens needs the joint "
+                         "layout without pad_multiple, bos, eos and pad tokens, and cond_rows a "
+                         "whole number of windows (cond_rows %lld)", nm, (int)d->chunk_tokens,
+            (long long)d->cond_rows);
         return RAD_E_INVAL;
     }
     for (int i = 0; i < d->n_sigmas; ++i)
@@ -1255,17 +1348,19 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
     g.name             = nm;
     g.tmpl_text        = d->tmpl_text;
     g.tmpl_edit        = d->tmpl_edit;
-    g.tmpl_image       = d->tmpl_image;
+    g.tmpl_image       = d->tmpl_image ? d->tmpl_image : "";
     g.tmpl_image_sep   = d->tmpl_image_sep ? d->tmpl_image_sep : "";
     g.drop_prefix      = d->drop_prefix ? d->drop_prefix : "";
     g.tmpl_transparent = d->tmpl_transparent ? d->tmpl_transparent : "";
+    g.has_default_negative = d->default_negative != nullptr;
+    g.default_negative = d->default_negative ? d->default_negative : "";
     g.sigmas.assign(d->sigmas, d->sigmas + d->n_sigmas);
     prog_.generator = *d;
     /* The Program is moved after declare, which would invalidate pointers into gen_str, so the
      * decl's string fields are cleared; read them only through gen_str. */
     RadGeneratorDecl& c = prog_.generator;
     c.name = c.tmpl_text = c.tmpl_edit = c.tmpl_image = c.tmpl_image_sep = nullptr;
-    c.drop_prefix = c.tmpl_transparent = nullptr;
+    c.drop_prefix = c.tmpl_transparent = c.default_negative = nullptr;
     c.sigmas = nullptr;
     return RAD_OK;
 }
@@ -1461,22 +1556,78 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->audio_latent_channels);
         return RAD_E_INVAL;
     }
-    if (d->default_steps <= 0 || d->max_steps < d->default_steps || !(d->shift_video > 0.0) ||
-        !(d->shift_audio > 0.0) || d->max_lanes <= 0) {
+    /* Form 1 (LTX-2's FlowMatchEulerDiscrete) steps both modalities the same sigmas and reads
+     * no per-modality shift. */
+    const bool shifts = d->sched_kind == 1 || (d->shift_video > 0.0 && d->shift_audio > 0.0);
+    if (d->default_steps <= 0 || d->max_steps < d->default_steps || !shifts || d->max_lanes <= 0) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the sampler is incomplete (%lld steps by "
                          "default, %lld at most, shifts %g and %g, %lld lanes)", nm,
             (long long)d->default_steps, (long long)d->max_steps, d->shift_video, d->shift_audio,
             (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    if (d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
-        (d->n_rungs > 0 && (d->default_steps != d->n_rungs + 1 || d->max_steps != d->n_rungs + 1))) {
-        err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %d grid "
-                         "points, which default_steps and max_steps must both be (%lld, %lld)", nm,
-            (int)d->n_rungs, (int)d->n_rungs + 1, (long long)d->default_steps,
+    /* Form 0 counts grid points, form 1 evaluations. */
+    const int64_t rung_steps = d->sched_kind == 1 ? d->n_rungs : d->n_rungs + 1;
+    if (d->sched_kind < 0 || d->sched_kind > 1 || d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
+        (d->n_rungs > 0 && (d->default_steps != rung_steps || d->max_steps != rung_steps))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %lld "
+                         "steps, which default_steps and max_steps must both be (%lld, %lld)", nm,
+            (int)d->n_rungs, (long long)rung_steps, (long long)d->default_steps,
             (long long)d->max_steps);
         return RAD_E_INVAL;
     }
+    if (d->sched_kind == 1 && d->dyn_shift &&
+        (!(d->max_seq > d->base_seq) || !std::isfinite(d->base_shift) ||
+         !std::isfinite(d->max_shift))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': the dynamic shift runs from %lld tokens "
+                         "(%g) to %lld (%g); the second length must be the larger", nm,
+            (long long)d->base_seq, d->base_shift, (long long)d->max_seq, d->max_shift);
+        return RAD_E_INVAL;
+    }
+    if (!(d->shift_terminal >= 0.0 && d->shift_terminal < 1.0)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': shift_terminal %g is outside [0, 1)", nm,
+            d->shift_terminal);
+        return RAD_E_INVAL;
+    }
+    if (d->n_refine_rungs < 0 || (d->n_refine_rungs > 0 && (!d->refine_rungs ||
+        d->sched_kind != 1 || d->n_rungs == 0 || !(d->upscale_max > 1.0)))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': refinement rungs need a trained schedule of "
+                         "form 1 and a latent upscaler", nm);
+        return RAD_E_INVAL;
+    }
+    for (int i = 0; i < d->n_refine_rungs; ++i)
+        if (!(d->refine_rungs[i] > 0.0 && d->refine_rungs[i] <= 1.0) ||
+            (i > 0 && !(d->refine_rungs[i] < d->refine_rungs[i - 1]))) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': refinement rung %d (%g) is outside "
+                             "(0, 1] or not below the one before it", nm, i, d->refine_rungs[i]);
+            return RAD_E_INVAL;
+        }
+    if (d->step_text_rows < 0 || d->step_text_rows > d->max_text * 64 || d->image_crf < 0 ||
+        d->image_crf > 51 || (d->image_cond != 0 && d->image_cond != 1) ||
+        (d->guidance != 0 && d->guidance != 1)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': step_text_rows %lld, image_cond %d, "
+                         "image_crf %d (0..51) or guidance %d is out of range", nm,
+            (long long)d->step_text_rows, (int)d->image_cond, (int)d->image_crf, (int)d->guidance);
+        return RAD_E_INVAL;
+    }
+    if (d->text_left_pad < 0 || (d->text_left_pad > 0 && d->text_left_pad < d->max_text) ||
+        d->audio_streams < 0 ||
+        (d->upscale_exact && (!(d->upscale_max > 1.0) ||
+                              d->upscale_max != std::floor(d->upscale_max)))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': text_left_pad %lld must hold the longest "
+                         "prompt (%lld), audio_streams %d may not be negative, and an exact "
+                         "upscaler's factor (%g) is a whole number above 1", nm,
+            (long long)d->text_left_pad, (long long)d->max_text, (int)d->audio_streams,
+            d->upscale_max);
+        return RAD_E_INVAL;
+    }
+    if (d->guidance)
+        for (int i = 0; i < 8; ++i)
+            if (!std::isfinite(d->guidance_default[i]) || d->guidance_default[i] < 0.0) {
+                err(RAD_E_INVAL, "declare_video_generator '%s': default guidance term %d (%g) must "
+                                 "be finite and not negative", nm, i, d->guidance_default[i]);
+                return RAD_E_INVAL;
+            }
     for (int i = 0; i < d->n_rungs; ++i)
         if (!(d->rungs[i] > 0.0 && d->rungs[i] <= 1.0) ||
             (i > 0 && !(d->rungs[i] < d->rungs[i - 1]))) {
@@ -1486,9 +1637,13 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
     /* An upscaler needs a schedule it can split: one evaluation at the small size at least, and
      * `upscale_refine` of them after it by default. */
-    const int64_t def_evals = d->n_rungs > 0 ? d->n_rungs : d->default_steps - 1;
+    const int64_t def_evals = d->n_rungs > 0 ? d->n_rungs
+                            : d->sched_kind == 1 ? d->default_steps : d->default_steps - 1;
+    const bool own_refine = d->n_refine_rungs > 0;
     if (d->upscale_max != 0.0 &&
-        (!(d->upscale_max > 1.0) || d->upscale_refine < 1 || d->upscale_refine >= def_evals)) {
+        (!(d->upscale_max > 1.0) ||
+         (!own_refine && (d->upscale_refine < 1 || d->upscale_refine >= def_evals)) ||
+         (own_refine && d->upscale_refine != d->n_refine_rungs))) {
         err(RAD_E_INVAL, "declare_video_generator '%s': a latent upscaler of factor %g at most, "
                          "refining %d evaluations of %lld by default; the factor must be above 1 "
                          "and the refinement 1 to %lld", nm, d->upscale_max, (int)d->upscale_refine,
@@ -1521,15 +1676,52 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out") ||
         !buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
         return RAD_E_INVAL;
+    if (d->duration_out != RAD_NULL_HANDLE) {
+        if (!buf_ok(d->duration_out, RAD_F32, 1, "duration_out")) return RAD_E_INVAL;
+        if (!(d->duration_min > 0.0 && d->duration_max > d->duration_min) ||
+            !std::isfinite(d->duration_max) ||
+            (d->duration_dtype != RAD_F32 && d->duration_dtype != RAD_BF16)) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': a length head clamps to "
+                             "[%g, %g] seconds in dtype %u; the bounds must be positive, finite "
+                             "and in order, the dtype f32 or bf16", nm, d->duration_min,
+                d->duration_max, (unsigned)d->duration_dtype);
+            return RAD_E_INVAL;
+        }
+    }
     prog_.vgen_str.name = nm;
     prog_.vgen_str.tmpl = d->tmpl;
     prog_.vgen_str.rungs.assign(d->rungs, d->rungs + d->n_rungs);
+    prog_.vgen_str.refine_rungs.assign(d->refine_rungs, d->refine_rungs + d->n_refine_rungs);
+    prog_.vgen_str.default_negative = d->default_negative ? d->default_negative : "";
+    prog_.vgen_str.decoders.clear();
+    prog_.vgen_str.decoder_max_area.clear();
+    for (const char* s = d->decoders; s && *s;) {
+        while (*s == ' ') ++s;
+        const char* e = s;
+        while (*e && *e != ' ') ++e;
+        if (e > s) prog_.vgen_str.decoders.emplace_back(s, e);
+        s = e;
+    }
+    for (size_t i = 0; i < prog_.vgen_str.decoders.size(); ++i) {
+        const int64_t a = d->decoder_max_area ? d->decoder_max_area[i] : 0;
+        if (a < 0 || a > d->max_area) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': decoder '%s' makes frames of %lld pixels "
+                             "at most, outside 0..max_area", nm,
+                prog_.vgen_str.decoders[i].c_str(), (long long)a);
+            return RAD_E_INVAL;
+        }
+        prog_.vgen_str.decoder_max_area.push_back(a > 0 ? a : d->max_area);
+    }
     prog_.video_gen = *d;
     /* As for the other generators: the Program is moved after declare; strings and the rungs live
      * in vgen_str. */
     prog_.video_gen.name = nullptr;
     prog_.video_gen.tmpl = nullptr;
     prog_.video_gen.rungs = nullptr;
+    prog_.video_gen.refine_rungs = nullptr;
+    prog_.video_gen.default_negative = nullptr;
+    prog_.video_gen.decoders = nullptr;
+    prog_.video_gen.decoder_max_area = nullptr;
     return RAD_OK;
 }
 
@@ -1651,6 +1843,69 @@ int Builder::drafter_shared_kv(int pos_offset) {
     return RAD_OK;
 }
 
+int Builder::lora_root(const char* native, const char* spellings) {
+    if (finished_) {
+        err(RAD_E_STATE, "lora_root after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!native || !*native) {
+        err(RAD_E_INVAL, "lora_root: an empty checkpoint prefix would put every tensor in one "
+                         "network; name the prefix the network's tensors share");
+        return RAD_E_INVAL;
+    }
+    for (const LoraRoot& r : prog_.lora_roots)
+        if (r.native == native) {
+            err(RAD_E_INVAL, "lora_root '%s' declared twice", native);
+            return RAD_E_INVAL;
+        }
+    LoraRoot r;
+    r.native = native;
+    std::string cur;
+    for (const char* p = spellings ? spellings : "";; ++p) {
+        if (*p && *p != ' ') { cur += *p; continue; }
+        if (!cur.empty()) r.spellings.push_back(cur == "-" ? std::string() : cur);
+        cur.clear();
+        if (!*p) break;
+    }
+    prog_.lora_roots.push_back(std::move(r));
+    return RAD_OK;
+}
+
+int Builder::lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
+                        int64_t from_hi, int64_t to_lo) {
+    if (finished_) {
+        err(RAD_E_STATE, "lora_alias after declare finished");
+        return RAD_E_STATE;
+    }
+    bool root = false;
+    for (const LoraRoot& r : prog_.lora_roots) root = root || (native && r.native == native);
+    if (!root) {
+        err(RAD_E_INVAL, "lora_alias '%s': its root '%s' is not declared (rad_lora_root first)",
+            from ? from : "", native ? native : "");
+        return RAD_E_INVAL;
+    }
+    if (!from || !*from || !to || !*to) {
+        err(RAD_E_INVAL, "lora_alias under '%s': an empty module path", native);
+        return RAD_E_INVAL;
+    }
+    auto hashes = [](const char* s) { int n = 0; for (; *s; ++s) n += *s == '#'; return n; };
+    if (hashes(from) != hashes(to)) {
+        err(RAD_E_INVAL, "lora_alias '%s' -> '%s': %d index placeholders against %d", from, to,
+            hashes(from), hashes(to));
+        return RAD_E_INVAL;
+    }
+    if (from_lo < 0 || to_lo < 0 || (from_hi != 0 && from_hi <= from_lo)) {
+        err(RAD_E_INVAL, "lora_alias '%s' -> '%s': rows [%lld, %lld) to %lld", from, to,
+            (long long)from_lo, (long long)from_hi, (long long)to_lo);
+        return RAD_E_INVAL;
+    }
+    LoraAlias a;
+    a.root = native; a.from = from; a.to = to;
+    a.from_lo = from_lo; a.from_hi = from_hi; a.to_lo = to_lo;
+    prog_.lora_aliases.push_back(std::move(a));
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -1739,6 +1994,8 @@ void Builder::finish_layouts() {
                     const int st = ki->layout ? ki->layout(r.geom.params(), r.geom.n_params(),
                                                            operand, &w.enc, w.sel, t, w.n_sel, &L)
                                               : RAD_E_UNSUPPORTED;
+                    /* Reads the bytes uninterpreted (a prefetch): no claim (rad_abi.h). */
+                    if (st == RAD_LAYOUT_ANY) continue;
                     char enc[256];
                     rad_enc_format(&w.enc, enc, sizeof enc);
                     if (st == RAD_E_DTYPE) {
@@ -2090,6 +2347,11 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     return B(b)->kv_group_zero(g);
 }
 
+int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_replicated(g);
+}
+
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
     if (!b) return RAD_E_INVAL;
     return B(b)->decl_name_map(m);
@@ -2114,6 +2376,19 @@ int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_shared_kv(pos_offset);
 }
+
+int rad_lora_root(RadBuilder* b, const char* native, const char* spellings) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lora_root(native, spellings);
+}
+
+int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
+                   int64_t from_lo, int64_t from_hi, int64_t to_lo) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lora_alias(native, from, to, from_lo, from_hi, to_lo);
+}
+
+int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;

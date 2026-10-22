@@ -1,0 +1,14 @@
+# Gemma 4 31B-it heretic-ara (Gemma 4 with its refusals removed by Heretic's ARA): the same container
+# as gemma4-31b-w4a8.yaml, built from that checkpoint. The vision tower stays in host memory, so its
+# VRAM goes to the KV cache. For the full 262,144-token context use --max-model-len 262144
+# --max-num-seqs 2.
+name: radiance-gemma4-31b-heretic-ara-w4a8
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-gemma4-31b-heretic-ara-w4a8
+    command: >
+      --model /models/gemma4-31b-heretic-ara-w4a8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --max-num-seqs 8 --max-model-len 65536 --kv-cache-dtype fp8 --vision-tower-placement ram
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048 --temp 1.0 --top-p 0.95 --top-k 64

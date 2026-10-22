@@ -162,6 +162,10 @@ static bool dump_at(Ctx& ctx, int step, const char* phase, const std::string& na
     return true;
 }
 
+/* A buffer is read where it lives after the pass, and the arena shares a transient's bytes with
+ * every buffer whose lifetime does not overlap it. So a dump after a drafter's context pass shows
+ * a tap buffer (dflash_src) already overwritten by a later one in that pass (df_c), and only the
+ * step loop's dump, after the trunk, shows the taps as written. A PERSIST buffer is never shared. */
 void dump_buffers(Ctx& ctx, int step, const char* phase) {
     if ((int)log_level() < (int)Log::Trace) return;
     static const char* const names = std::getenv("RADIANCE_DUMP_BUF");

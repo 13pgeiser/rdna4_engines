@@ -526,6 +526,126 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", BAND).pi("heads", 4).pi("ngram", 3).pi("eos", 5);
         hs.push_back(std::move(n));
     }
+    /* GLM's two-copy speculative state, including a nonempty previous replay window. */
+    for (const char* mode : { "prefill", "verify" })
+        for (int accepted : { 1, 2, 3 })
+            for (int cold : { 0, 1 }) {
+                constexpr int64_t D = 128;
+                Hand h("KDA anchor accepted-prefix replay", "kda_update", 0.01);
+                h.dense(RAD_BF16, { 2, 1, D }, hfill(201, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, D }, hfill(202, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, D }, hfill(203, 0.25f))
+                    .dense(RAD_BF16, { 2, 1, D }, hfill(204, 0.25f))
+                    .dense(RAD_BF16, { 2, 1 }, hfill(205, 0.25f))
+                    .dense(RAD_F32, { 1 }, [](int64_t) { return 0.0f; })
+                    .dense(RAD_F32, { D }, [](int64_t) { return -1.0f; })
+                    .dense(
+                        RAD_F32, { 2, 1, D, D },
+                        [](int64_t i) {
+                            if (i < D * D) return 0.125f;
+                            i -= D * D;
+                            if (!i) return 3.0f;
+                            if (i > 3 * 385) return 0.0f;
+                            const int at = (int)((i - 1) % 385);
+                            return at < 128 ? 0.01f : at < 256 ? 0.125f : at < 384 ? 0.75f : 0.5f;
+                        },
+                        true)
+                    .dense(RAD_I32, { 1, 6 }, [](int64_t i) { return i < 3 ? 0.0f : 1.0f; })
+                    .idx({ 0, 2 })
+                    .idx({ accepted })
+                    .idx({ cold ? 0 : 1 })
+                    .dense(RAD_BF16, { 2, 1, D }, hfill(206), true)
+                    .pi("M", 2)
+                    .pi("heads", 1)
+                    .pi("head_k", D)
+                    .pi("head_v", D)
+                    .pf("lower_bound", -5)
+                    .pf("scale", 1.0 / std::sqrt(128.0))
+                    .pf("l2_eps", 1e-6)
+                    .ps("mode", mode)
+                    .ps("dtype", "bf16")
+                    .ps("state_form", "anchor");
+                hs.push_back(std::move(h));
+            }
+    for (const char* mode : { "absorb", "expand" }) {
+        const bool absorb = !std::strcmp(mode, "absorb");
+        const int64_t in = absorb ? 17 : 31, out = absorb ? 31 : 17;
+        Hand h("MLA flattened linear inputs and outputs", "mla_project", 0.01);
+        h.view(RAD_BF16, { 3, 2 * in }, { 2 * in + 7, 1 }, 3 * (2 * in + 7), hfill(215, 0.25f))
+            .dense(RAD_BF16, { 68, 31 }, hfill(216, 0.25f))
+            .view(RAD_BF16, { 3, 2 * out }, { 2 * out + 9, 1 }, 3 * (2 * out + 9), hfill(217), true)
+            .pi("M", 3)
+            .pi("heads", 2)
+            .pi("head_dim", 17)
+            .pi("latent_dim", 31)
+            .ps("mode", mode)
+            .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("MoE preserves F32 probabilities with BF16 experts", "moe_gather", 1e-5);
+        h.dense(RAD_BF16, { 2, 1 }, [](int64_t i) { return i ? -1024.0f : 1024.0f; })
+            .dense(RAD_F32, { 1, 2 }, [](int64_t i) { return i ? 1.0f : 1.0f + 1.0f / 8192; })
+            .idx({ 0, 1 })
+            .none()
+            .none()
+            .dense(
+                RAD_BF16, { 1, 1 }, [](int64_t) { return 0.0f; }, true)
+            .pi("M", 1)
+            .pi("n", 1)
+            .pi("top_k", 2)
+            .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    /* Packed index pages share code and scale storage, including pitched cache pages. */
+    {
+        Hand h("DSA pool writes pitched managed pages", "dsa_pool", 0.001);
+        h.dense(RAD_BF16, { 28, 256 }, hfill(211, 0.25f))
+            .dense(RAD_F32, { 4, 128 }, hfill(212, 0.125f))
+            .dense(
+                RAD_F8E4M3, { 7, 128 }, [](int64_t) { return 0.0f; }, true)
+            .dense(
+                RAD_F32, { 7, 1 }, [](int64_t) { return 0.0f; }, true)
+            .idx({ 4, -1, 2, 99, 1, 0, 3 })
+            .view(
+                RAD_U8, { 5, 1, 4, 34 }, { 160, 136, 34, 1 }, 5 * 160,
+                [](int64_t) { return 165.0f; }, true)
+            .pi("M", 7)
+            .pi("n", 128)
+            .pi("ratio", 4)
+            .ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+        Hand s("DSA scorer reads embedded scales", "dsa_score", 1e-5);
+        s.dense(RAD_F8E4M3, { 64, 128 }, hfill(213, 0.25f))
+            .dense(RAD_F32, { 64, 1 }, [](int64_t) { return 0.5f; })
+            .dense(RAD_F32, { 2, 32 }, hfill(214))
+            .view(RAD_U8, { 5, 1, 4, 34 }, { 160, 136, 34, 1 }, 5 * 160,
+                  [](int64_t i) {
+                      const int d = (int)(i % 160);
+                      if (d < 128) return (float)(48 + i % 9);
+                      // Little-endian F32 scale 0.5; all padding stays poisoned.
+                      return d == 128 || d == 129 ? 0.0f
+                             : d == 130           ? 0.0f
+                             : d == 131           ? 63.0f
+                                                  : 165.0f;
+                  })
+            .none()
+            .dense(RAD_I32, { 1, 4 },
+                   [](int64_t i) {
+                       return (float)(i == 1 ? -1 : i == 3 ? 99 : i);
+                   })
+            .idx({ 0, 2 })
+            .idx({ 4 })
+            .dense(
+                RAD_F32, { 2, 4 }, [](int64_t) { return 0.0f; }, true)
+            .pi("M", 2)
+            .pi("n", 128)
+            .pi("heads", 32)
+            .pi("blocks", 4)
+            .pi("seqs", 1)
+            .ps("dtype", "fp8_e4m3");
+        hs.push_back(std::move(s));
+    }
     /* ---- packed weight codes at odd element offsets ------------------------------------------ */
     {
         const int64_t M = 2, N = 4, K = 33;
@@ -1794,6 +1914,51 @@ void gen_cases(std::vector<Hand>& hs) {
             hs.push_back(std::move(h));
         }
         {
+            /* The k-diffusion input: entry 0 a first step guided against entry 1 (pair -2, which
+             * only its positive entry writes), entry 2 a later step, unguided, in lane 3. */
+            static const uint32_t kSeeds[6] = { 11u, 0u, 0u, 0u, 0xfeedbeefu, 3u };
+            Hand h(("first, parked, later, n 4" + sfx).c_str(), "kd_input", 0.0);
+            h.dense(RAD_F32, { 3 }, [](int64_t i) { return 14.6f - 6.0f * (float)i; })
+             .idx({ 1, -2, -1 })
+             .idx({ 0, 1, 3 })
+             .idx({ 1, 0, 0 })
+             .raw(RAD_U32, { 6 }, kSeeds)
+             .idx({ 0, 5, 10, 13 })
+             .dense(RAD_F32, { 24, 4 }, hfill(227), true)
+             .dense(dt, { 13, 4 }, zero, true)
+             .pi("M", 13).pi("n", 4).pi("stride", 6).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (const char* pred : { "eps", "v" }) {
+            /* Every sampler: entry 0 Euler guided against entry 1 with a preview, entry 2 Euler
+             * ancestral at step 7, entry 3 DPM++ 2M past its first step, entry 4 DPM++ 2M's first
+             * step, entry 5 Euler ancestral to sigma 0, entry 6 DPM++ 2M to sigma 0. */
+            static const uint32_t kSeeds[14] = { 3u, 0u, 4u, 0u, 5u, 9u, 6u, 1u, 7u, 0u, 8u, 0u,
+                                                 9u, 2u };
+            Hand h(("seven entries, every sampler, " + std::string(pred) + sfx).c_str(), "kd_step",
+                   0.0);
+            static const float kS[7]  = { 6.0f, 6.0f, 3.5f, 1.25f, 9.0f, 0.4f, 0.3f };
+            static const float kSn[7] = { 4.5f, 4.5f, 2.0f, 0.7f, 6.5f, 0.0f, 0.0f };
+            static const float kSp[7] = { 0.0f, 0.0f, 5.0f, 2.0f, 0.0f, 0.9f, 0.6f };
+            h.dense(dt, { 21, 5 }, hfill(228))
+             .dense(RAD_F32, { 7 }, [](int64_t i) { return kS[i]; })
+             .dense(RAD_F32, { 7 }, [](int64_t i) { return kSn[i]; })
+             .dense(RAD_F32, { 7 }, [](int64_t i) { return kSp[i]; })
+             .dense(RAD_F32, { 7 }, [](int64_t) { return 6.5f; })
+             .idx({ 1, -2, -1, -1, -1, -1, -1 })
+             .idx({ 0, 1, 2, 3, 4, 5, 6 })
+             .idx({ 4, 0, 0, 0, 1, 0, 0 })
+             .raw(RAD_U32, { 14 }, kSeeds)
+             .idx({ 0, 0, 1, 2, 2, 1, 2 })
+             .idx({ 0, 0, 7, 4, 0, 20, 21 })
+             .idx({ 0, 3, 6, 9, 12, 15, 18, 21 })
+             .dense(RAD_F32, { 28, 5 }, hfill(229, 3.0f), true)
+             .dense(RAD_F32, { 28, 5 }, hfill(230), true)
+             .dense(RAD_F32, { 28, 5 }, zero, true)
+             .pi("M", 21).pi("n", 5).pi("stride", 4).ps("pred", pred).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
             Hand h(("a mask column into three lanes" + sfx).c_str(), "lane_store", 0.0);
             h.dense(dt, { 9, 1 }, hfill(225))
              .idx({ 3, 0, 1 })
@@ -2823,6 +2988,69 @@ void qsa_cases(std::vector<Hand>& hs) {
          .dense(RAD_I32, { M }, sent, true)
          .dense(RAD_I32, { M }, sent, true)
          .pi("M", M).pi("blocks", nb).pi("topk", topk).pi("ratio", ratio).pi("seqs", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* The signed order, against the rule: row 0 ranks 2 over the tie of -0 and +0 (NaN dead,
+         * -1e31 live), row 1 is all negative with -inf dead and -1e30 live. Under the unsigned
+         * order both rows would rank as zeros. */
+        static const float v[2][8] = {
+            { -3.0f, -1.0f, -0.0f, 2.0f, -1.0f, 0.0f, NAN, -1e31f },
+            { -5.0f, -2e30f, -7.0f, -6.0f, -INFINITY, -9.0f, -1e30f, -8.0f } };
+        Hand h("signed: negative scores, -0 tying +0, NaN and -inf dead", "qsa_select", 0.0);
+        h.dense(RAD_F32, { 2, 8 }, [](int64_t i) { return v[i / 8][i % 8]; })
+         .dense(RAD_I32, { 2, 8 }, [](int64_t i) { return (float)(100 + 10 * (i / 8) + i % 8); })
+         .idx({ 8, 8 })
+         .idx({ 31, 31 })
+         .idx({ 0, 1, 2 })
+         .dense(RAD_I32, { 2, 4 }, sent, true)
+         .dense(RAD_I32, { 2 }, sent, true)
+         .dense(RAD_I32, { 2 }, sent, true)
+         .pi("M", 2).pi("blocks", 8).pi("topk", 3).pi("ratio", 4).pi("seqs", 2).pi("signed", 1)
+         .expect(5, { 103, 102, 105, -1, 110, 113, 112, -1 });
+        hs.push_back(std::move(h));
+    }
+    {
+        /* The column-slice case's scores, shifted to straddle zero, under the signed order. */
+        const int64_t S = 2, M = 6, live = 40, pitch = 56, W = 48, topk = 8, ratio = 4;
+        Hand h("signed: cu from 1, unheld rows, a column slice, ties across zero", "qsa_select",
+               0.0);
+        h.view(RAD_F32, { M, live }, { pitch, 1 }, M * pitch, [=](int64_t i) {
+             switch ((i % pitch + i / pitch) % 9) {
+                 case 0: case 1: case 7: return -1.0f;
+                 case 2: return NAN;
+                 case 3: return INFINITY;
+                 case 4: return -0.0f;
+                 case 5: return -INFINITY;
+                 case 6: return -1.5f;
+                 default: return 0.25f * (float)(i % 5) - 0.5f;
+             }
+         })
+         .dense(RAD_I32, { S, W }, [](int64_t i) {
+             return i % 11 == 4 ? -1.0f : (float)((i * 13 + 3) % 500);
+         })
+         .idx({ 40, 25 })
+         .idx({ 160, 98, 99, 161, 40, 7 })
+         .idx({ 1, 3, 5 })
+         .dense(RAD_I32, { M, topk + 1 }, sent, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .dense(RAD_I32, { M }, sent, true)
+         .pi("M", M).pi("blocks", W).pi("topk", topk).pi("ratio", ratio).pi("seqs", S)
+         .pi("signed", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a `signed` other than 0 or 1 is refused before any write", "qsa_select", 0.0);
+        h.dense(RAD_F32, { 1, 4 }, hfill(208))
+         .dense(RAD_I32, { 1, 4 }, [](int64_t i) { return (float)i; })
+         .idx({ 4 })
+         .idx({ 15 })
+         .idx({ 0, 1 })
+         .dense(RAD_I32, { 1, 3 }, sent, true)
+         .dense(RAD_I32, { 1 }, sent, true)
+         .dense(RAD_I32, { 1 }, sent, true)
+         .pi("M", 1).pi("blocks", 4).pi("topk", 2).pi("ratio", 4).pi("seqs", 1).pi("signed", 2)
+         .refuses(RAD_E_INVAL);
         hs.push_back(std::move(h));
     }
     {

@@ -1032,8 +1032,9 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
     CHECK(has(lora::explain_module(b.program(), t, "model.layers.0.self_attn.q_proj"), "perm"));
 }
 
-/* Adapters serve the token steps of a model that writes logits: declare refuses a generator, an
- * embedding model and a program with no logits by name, and lets a text model through. */
+/* Adapters serve the token steps of a model that writes logits, or a generator that names its
+ * adapter keys: declare refuses a generator that names none, an embedding model and a program with
+ * no logits by name, and lets a text model through. */
 TEST(declare_refuses_a_model_that_does_not_generate_text) {
     const RadModelMeta meta = llama_meta();
     const RadBuildCtx ctx = ctx_for(0, 1);
@@ -1044,7 +1045,7 @@ TEST(declare_refuses_a_model_that_does_not_generate_text) {
     d.cfg = &cfg;
     d.targets = { "q_proj" };
     const struct { const char* what; void (*set)(Program&); } kinds[] = {
-        { "is an image, audio or video generator",
+        { "declares no adapter key names",
           [](Program& p) { p.logits_buf = 1; p.generator.layout = 1; } },
         { "makes embeddings", [](Program& p) { p.pooled_buf = 1; } },
         { "declares no logits", [](Program&) {} },

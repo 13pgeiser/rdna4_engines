@@ -150,8 +150,8 @@ AVX_KERNEL(lora_shrink) {
     return RAD_OK;
 }
 
-/* operands: t, slot, lora_b, scale, y (inout) */
-AVX_KERNEL(lora_expand) {
+/* operands: t, slot, lora_b, scale, y (inout). `bf16_t`: lora_expand_mm, t rounded to bf16. */
+static int expand_impl(const RadArgs* a, bool bf16_t) {
     if (!rad_args_have(a, 5)) return RAD_E_INVAL;
     const RadTensor *T = &a->t[0], *SL = &a->t[1], *LB = &a->t[2], *SC = &a->t[3], *Y = &a->t[4];
     const int64_t N = p_int(a, "N", 0), R = p_int(a, "R", 0), S = p_int(a, "S", 0);
@@ -176,6 +176,12 @@ AVX_KERNEL(lora_expand) {
         const int64_t s = row_slot(SL, m, S);
         if (s < 0) continue;                             /* a base row: not read, not written */
         const float* tv = in_row(T, m * mt.rs, R, scratch_f32((size_t)R));
+        if (bf16_t) {
+            float* tr = scratch_f32((size_t)R);
+            if (tr != tv) for (int64_t j = 0; j < R; ++j) tr[j] = tv[j];
+            for (int64_t j = 0; j < R; ++j) tr[j] = rad_bf16_to_f32(rad_f32_to_bf16(tr[j]));
+            tv = tr;
+        }
         const float* bv = in_row(LB, s * pb.s0 + n * pb.s1, R, scratch_f32_b((size_t)R));
         const float d = scd[s * sc_r + n * sc_c] * dotf(tv, bv, R);
         const int64_t o = m * ys_r + n * ys_c;
@@ -183,3 +189,8 @@ AVX_KERNEL(lora_expand) {
     }
     return RAD_OK;
 }
+
+AVX_KERNEL(lora_expand) { return expand_impl(a, false); }
+
+/* lora_expand with t rounded to bf16 (docs/OPS.md). */
+AVX_KERNEL(lora_expand_mm) { return expand_impl(a, true); }

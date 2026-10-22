@@ -46,6 +46,8 @@ int decode_video(const uint8_t*, size_t, SampleFn, const void*, int64_t, Video*,
                  std::string* why) {
     return no_decoder(why);
 }
+int h264_roundtrip(const Frame&, int32_t, Frame*, std::string* why) { return no_decoder(why); }
+bool h264_roundtrip_available() { return false; }
 int decode_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>*,
                  std::string* why) {
     return no_decoder(why);
@@ -675,6 +677,113 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
     if (st < 0) return st;
     if (out->empty()) { *why = "the audio decoded to no samples"; return RAD_E_INVAL; }
     return RAD_OK;
+}
+
+bool h264_roundtrip_available() {
+    return avcodec_find_encoder_by_name("libx264") && avcodec_find_decoder(AV_CODEC_ID_H264);
+}
+
+/* PyAV's single-frame round trip: VideoFrame.from_ndarray(rgb24).reformat("yuv420p") (plain
+ * SWS_BILINEAR, BT.601 coefficients, limited-range output), libx264 with the given crf, then the
+ * decoded frame's to_ndarray("rgb24"), which to_rgb reproduces. */
+int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why) {
+    std::string w;
+    if (!why) why = &w;
+    const int W = in.w & ~1, H = in.h & ~1;
+    if (W <= 0 || H <= 0) { *why = "the picture is smaller than 2x2"; return RAD_E_INVAL; }
+    const AVCodec* enc = avcodec_find_encoder_by_name("libx264");
+    const AVCodec* dcd = avcodec_find_decoder(AV_CODEC_ID_H264);
+    if (!enc || !dcd) { *why = "this libavcodec has no libx264 encoder or H.264 decoder"; return RAD_E_UNSUPPORTED; }
+    AVCodecContext* ec = avcodec_alloc_context3(enc);
+    AVCodecContext* dc = avcodec_alloc_context3(dcd);
+    AVFrame* yuv = av_frame_alloc();
+    AVFrame* dec = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    SwsContext* sws = nullptr;
+    int st = RAD_OK;
+    auto fail = [&](const char* what, int e) {
+        *why = std::string(what) + (e < 0 ? " (" + averr(e) + ")" : std::string());
+        st = e == AVERROR(ENOMEM) ? RAD_E_NOMEM : RAD_E_INVAL;
+    };
+    bool got = false;
+    if (!ec || !dc || !yuv || !dec || !pkt) {
+        *why = "out of memory";
+        st = RAD_E_NOMEM;
+    } else {
+        ec->width = W;
+        ec->height = H;
+        ec->pix_fmt = AV_PIX_FMT_YUV420P;
+        ec->time_base = AVRational{ 1, 1 };
+        ec->framerate = AVRational{ 1, 1 };
+        /* PyAV's codec defaults: as many threads as the machine has, splitting each frame into
+         * that many slices, which shapes the bitstream. */
+        ec->thread_count = 0;
+        ec->thread_type = FF_THREAD_SLICE;
+        av_opt_set(ec->priv_data, "preset", "veryfast", 0);
+        av_opt_set(ec->priv_data, "crf", std::to_string(crf).c_str(), 0);
+        int e = avcodec_open2(ec, enc, nullptr);
+        if (e < 0) fail("opening libx264", e);
+        if (st == RAD_OK && (e = avcodec_open2(dc, dcd, nullptr)) < 0) fail("opening the H.264 decoder", e);
+        if (st == RAD_OK) {
+            yuv->format = AV_PIX_FMT_YUV420P;
+            yuv->width = W;
+            yuv->height = H;
+            if ((e = av_frame_get_buffer(yuv, 0)) < 0) fail("allocating a frame", e);
+        }
+        if (st == RAD_OK) {
+            sws = sws_getContext(W, H, AV_PIX_FMT_RGB24, W, H, AV_PIX_FMT_YUV420P, SWS_BILINEAR,
+                                 nullptr, nullptr, nullptr);
+            if (!sws) fail("no RGB to yuv420p conversion", 0);
+        }
+        if (st == RAD_OK) {
+            /* The source rows into a padded RGB frame: the scaler reads whole vectors past a tight
+             * row's end. */
+            AVFrame* rgb = av_frame_alloc();
+            if (!rgb) fail("out of memory", AVERROR(ENOMEM));
+            else {
+                rgb->format = AV_PIX_FMT_RGB24;
+                rgb->width = W;
+                rgb->height = H;
+                if ((e = av_frame_get_buffer(rgb, 0)) < 0) fail("allocating a frame", e);
+                else {
+                    for (int y = 0; y < H; ++y)
+                        std::memcpy(rgb->data[0] + (ptrdiff_t)y * rgb->linesize[0],
+                                    in.rgb.data() + (size_t)y * in.w * 3, (size_t)W * 3);
+                    if (sws_scale(sws, rgb->data, rgb->linesize, 0, H, yuv->data, yuv->linesize) != H)
+                        fail("colour conversion failed", 0);
+                }
+                av_frame_free(&rgb);
+            }
+        }
+        /* Encode the frame and flush; every packet goes straight to the decoder. */
+        for (int pass = 0; st == RAD_OK && pass < 2; ++pass) {
+            yuv->pts = 0;
+            if ((e = avcodec_send_frame(ec, pass == 0 ? yuv : nullptr)) < 0) { fail("encoding", e); break; }
+            while (st == RAD_OK && (e = avcodec_receive_packet(ec, pkt)) >= 0) {
+                if ((e = avcodec_send_packet(dc, pkt)) < 0) fail("decoding", e);
+                av_packet_unref(pkt);
+            }
+            if (st == RAD_OK && e != AVERROR(EAGAIN) && e != AVERROR_EOF) fail("encoding", e);
+        }
+        if (st == RAD_OK) avcodec_send_packet(dc, nullptr);
+        while (st == RAD_OK && (e = avcodec_receive_frame(dc, dec)) >= 0) {
+            if (!got) {
+                SwsContext* back = nullptr;
+                st = to_rgb(dec, &back, out, why);
+                sws_freeContext(back);
+                got = st == RAD_OK;
+            }
+            av_frame_unref(dec);
+        }
+        if (st == RAD_OK && !got) fail("the round trip decoded to no frame", 0);
+    }
+    sws_freeContext(sws);
+    av_packet_free(&pkt);
+    av_frame_free(&yuv);
+    av_frame_free(&dec);
+    avcodec_free_context(&ec);
+    avcodec_free_context(&dc);
+    return st;
 }
 
 #endif  /* RAD_HAVE_FFMPEG */

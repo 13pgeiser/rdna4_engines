@@ -22,6 +22,8 @@ void resize_lanczos_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* 
  * channels are exactly PIL's LANCZOS on the RGB image (premultiply and its inverse are the
  * identity at full alpha). The video VAE's reference preprocessing resizes RGB this way. */
 void resize_lanczos_rgb(const Frame& src, int32_t w, int32_t h, Frame* out);
+/* The same with PIL's BILINEAR filter (a triangle of support 1, widened when shrinking). */
+void resize_bilinear_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out);
 /* `src` over an opaque white ground. */
 void composite_white(const FrameRGBA& src, Frame* out);
 

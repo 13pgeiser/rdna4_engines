@@ -13,6 +13,7 @@
 #include <ctime>
 #include <limits>
 #include <random>
+#include <set>
 #include <type_traits>
 
 namespace rad {
@@ -239,6 +240,7 @@ const char* kAcceptedCommon[] = {
     "dry_sequence_breakers", "samplers",
     "grammar", "json_schema", "priority", "logprobs", "ignore_eos",
     "timings_per_token", "return_progress", "session_id", "n_probs",
+    "control_vector", "experimental_speed_projection",
 };
 
 const char* kAcceptedChat[] = {
@@ -840,6 +842,21 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
 
     /* ignore_eos: generate to max_tokens whatever the model emits. See Request::ignore_eos. */
     if (!get_bool(b, "ignore_eos", &r->ignore_eos, err)) return RAD_E_INVAL;
+
+    /* The control vector (core/cvec.h): an opt-in per request, and the only place an API client
+     * turns it on when the deployment's default is off. `control_vector` is the field's name;
+     * `experimental_speed_projection` is Strata's spelling of the same switch, kept as an alias so
+     * a client written against that reports what it means -- and read only when the request did not
+     * send the field itself, so the field wins when a body carries both. A JSON null is "not sent",
+     * as everywhere else in this parser. */
+    for (const char* key : { "control_vector", "experimental_speed_projection" }) {
+        const auto it = b.find(key);
+        if (it == b.end() || it->is_null()) continue;
+        bool on = false;
+        if (!get_bool(b, key, &on, err)) return RAD_E_INVAL;
+        r->control_vector = on ? 1 : 0;
+        break;
+    }
 
     /* stop: a string or an array of strings. Bounded in count and length because every stop
      * string is searched in each piece of generated text (by the decoder and the server's scan),
@@ -3854,9 +3871,17 @@ json message_item(const std::string& id, const std::string& text, const char* st
                  { "content", text.empty() && std::strcmp(status, "in_progress") == 0
                                   ? json::array() : json::array({ text_part(text) }) } };
 }
-json call_item(const ToolCall& tc, const char* status) {
-    return json{ { "id", fc_id(tc.id) }, { "type", "function_call" }, { "call_id", tc.id },
-                 { "name", tc.name }, { "arguments", tc.arguments }, { "status", status } };
+/* A call to a flattened namespace tool reports its namespace and its own name apart, as the
+ * Responses API's function_call item does. */
+json call_item(const OaiRequest& r, const ToolCall& tc, const char* status) {
+    json it = { { "id", fc_id(tc.id) }, { "type", "function_call" }, { "call_id", tc.id },
+                { "name", tc.name }, { "arguments", tc.arguments }, { "status", status } };
+    auto ns = r.tool_namespace.find(tc.name);
+    if (ns != r.tool_namespace.end()) {
+        it["namespace"] = ns->second.first;
+        it["name"] = ns->second.second;
+    }
+    return it;
 }
 
 /* The response object, around its output items, with the request fields it echoes. */
@@ -3880,7 +3905,8 @@ json response_object(const OaiRequest& r, const char* status, const json& output
 }  /* namespace */
 
 int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string* chat,
-                      std::string* echo, ApiError* err) {
+                      std::string* echo, ApiError* err,
+                      std::map<std::string, std::pair<std::string, std::string>>* ns) {
     json b;
     RAD_TRY(parse_request_object(body, lim, &b, err));
     auto prev = b.find("previous_response_id");
@@ -3983,11 +4009,14 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
                 }
                 msgs.push_back(json{ { "role", role }, { "content", parts } });
             } else if (type == "function_call") {
-                std::string id, name, args = "{}";
+                std::string id, name, args = "{}", space;
                 if (!member_str(item, "call_id", "input[].call_id", &id, err) ||
                     !member_str(item, "name", "input[].name", &name, err) ||
-                    !member_str(item, "arguments", "input[].arguments", &args, err))
+                    !member_str(item, "arguments", "input[].arguments", &args, err) ||
+                    !member_str(item, "namespace", "input[].namespace", &space, err))
                     return RAD_E_INVAL;
+                /* A namespaced call, under the name its tool was flattened to below. */
+                if (!space.empty()) name = space + "__" + name;
                 json call = { { "id", id }, { "type", "function" },
                               { "function", { { "name", name }, { "arguments", args } } } };
                 json* prev = last_assistant();
@@ -4040,34 +4069,78 @@ int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string
     }
     o["messages"] = std::move(msgs);
 
-    /* Function tools only. Built-in tools (web search, file search, computer use) and freeform
-     * custom tools have no chat-completions counterpart and are left out. */
+    /* Function tools, and the function tools a namespace groups (Codex sends every MCP server's
+     * tools that way), flattened to "<namespace>__<name>": the chat path has one flat list, and
+     * the reply's function_call items report the two apart again (OaiRequest::tool_namespace).
+     * Built-in tools (web search, file search, computer use) and freeform custom tools have no
+     * chat-completions counterpart and are left out. */
     json echo_tools = json::array();
     auto tit = b.find("tools");
     if (tit != b.end() && tit->is_array()) {
         json tools = json::array();
+        std::set<std::string> names;
+        auto add = [&](const json& t, const std::string& space) -> int {
+            std::string name;
+            if (!member_str(t, "name", space.empty() ? "tools[].name" : "tools[].tools[].name",
+                            &name, err))
+                return RAD_E_INVAL;
+            const std::string flat = space.empty() ? name : space + "__" + name;
+            if (!names.insert(flat).second) {
+                *err = err_bad("tools", "two tools are named \"" + flat + "\" (a namespace's tools "
+                               "are offered to the model as <namespace>__<name>)");
+                return RAD_E_INVAL;
+            }
+            json fn = { { "name", flat },
+                        { "parameters", t.contains("parameters") ? t.at("parameters") : json::object() } };
+            if (t.contains("description")) fn["description"] = t.at("description");
+            tools.push_back(json{ { "type", "function" }, { "function", fn } });
+            if (!space.empty() && ns) (*ns)[flat] = { space, name };
+            return RAD_OK;
+        };
         for (const json& t : *tit) {
-            if (str_or(t, "type") != "function") {
+            const std::string type = str_or(t, "type");
+            if (type == "namespace") {
+                std::string space;
+                if (!member_str(t, "name", "tools[].name", &space, err)) return RAD_E_INVAL;
+                if (space.empty()) {
+                    *err = err_bad("tools[].name", "a namespace needs a name");
+                    return RAD_E_INVAL;
+                }
+                auto inner = t.find("tools");
+                if (inner == t.end() || !inner->is_array()) {
+                    *err = err_bad("tools[].tools", "a namespace holds an array of tools");
+                    return RAD_E_INVAL;
+                }
+                for (const json& f : *inner) {
+                    if (str_or(f, "type") != "function") {
+                        RAD_DEBUG("responses: tool of type \"%s\" in namespace \"%s\" left out: "
+                                  "no chat equivalent", str_or(f, "type", "?").c_str(),
+                                  space.c_str());
+                        continue;
+                    }
+                    RAD_TRY(add(f, space));
+                }
+                echo_tools.push_back(t);
+                continue;
+            }
+            if (type != "function") {
                 RAD_DEBUG("responses: tool of type \"%s\" left out: no chat equivalent",
                           str_or(t, "type", "?").c_str());
                 continue;
             }
-            std::string name;
-            if (!member_str(t, "name", "tools[].name", &name, err)) return RAD_E_INVAL;
-            json fn = { { "name", name },
-                        { "parameters", t.contains("parameters") ? t.at("parameters") : json::object() } };
-            if (t.contains("description")) fn["description"] = t.at("description");
-            tools.push_back(json{ { "type", "function" }, { "function", fn } });
+            RAD_TRY(add(t, ""));
             echo_tools.push_back(t);
         }
         if (!tools.empty()) o["tools"] = std::move(tools);
     }
     auto tc = b.find("tool_choice");
     if (tc != b.end() && !tc->is_null()) {
-        std::string type = "auto", name;
+        std::string type = "auto", name, space;
         if (tc->is_object() && (!member_str(*tc, "type", "tool_choice.type", &type, err) ||
-                                !member_str(*tc, "name", "tool_choice.name", &name, err)))
+                                !member_str(*tc, "name", "tool_choice.name", &name, err) ||
+                                !member_str(*tc, "namespace", "tool_choice.namespace", &space, err)))
             return RAD_E_INVAL;
+        if (!space.empty()) name = space + "__" + name;
         if (!tc->is_object()) o["tool_choice"] = *tc;
         else if (type == "function")
             o["tool_choice"] = json{ { "type", "function" }, { "function", { { "name", name } } } };
@@ -4119,7 +4192,7 @@ std::string responses_body(const OaiRequest& r, const ChoiceOut& c, const UsageO
         out.push_back(reasoning_item(random_id("rs_"), c.msg.reasoning, "completed"));
     if (!c.msg.content.empty())
         out.push_back(message_item(random_id("msg_"), c.msg.content, "completed"));
-    for (const ToolCall& tc : c.msg.tool_calls) out.push_back(call_item(tc, "completed"));
+    for (const ToolCall& tc : c.msg.tool_calls) out.push_back(call_item(r, tc, "completed"));
     const bool cut = c.finish == Finish::Length;
     return response_object(r, cut ? "incomplete" : "completed", out, &u,
                            cut ? "max_output_tokens" : nullptr).dump();
@@ -4175,7 +4248,7 @@ void ResponsesStream::open(std::string& out, Item k, size_t call) {
         const ToolCall& tc = last_.tool_calls[call];
         item_id_ = fc_id(tc.id);
         event(out, "response.output_item.added",
-              json{ { "output_index", at }, { "item", call_item(tc, "in_progress") } });
+              json{ { "output_index", at }, { "item", call_item(*r_, tc, "in_progress") } });
     }
 }
 
@@ -4207,7 +4280,7 @@ void ResponsesStream::close(std::string& out) {
         const bool cut = finished_ && last_.open_call && call_ + 1 == last_.tool_calls.size();
         event(out, "response.function_call_arguments.done",
               json{ { "item_id", item_id_ }, { "output_index", at }, { "arguments", tc.arguments } });
-        item = call_item(tc, cut ? "incomplete" : "completed");
+        item = call_item(*r_, tc, cut ? "incomplete" : "completed");
     }
     event(out, "response.output_item.done", json{ { "output_index", at }, { "item", item } });
     items_.push_back(std::move(item));

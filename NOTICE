@@ -15,7 +15,8 @@ Written by Deadcode, with contributions from:
   adaptive draft window, the MoE prefill forms, the sorted operand's decode kernel, two K blocks a
   pass for up to 80 routed rows, --prefill-span, the towers' lookup tables counted once, and for
   Gemma 4 its assistant head as a drafter that reads the trunk's cache, bf16 checkpoints, the fused
-  w4a8 decode step, the vision tower and window snapshots that let a prefix hit resume
+  w4a8 decode step, the vision tower and window snapshots that let a prefix hit resume, and the
+  Gemma 4 31B heretic-ara and Ornith-1.5-35B-A3B compose files
 - mechkbfan: the token embedding in the pinned host pool
 - Code000: the n-gram gather on the card and the MTP head's history-pass skip
 - baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
@@ -23,7 +24,8 @@ Written by Deadcode, with contributions from:
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
   wire, the diagnosis of the three-rank lossy-wire crash, cardclock.py, --busy-prefill-chunk, curl,
   jq and a CA bundle in the image with hfget.sh under its busybox, rad-export, --prefill-interleave,
-  and runtime LoRA adapters served beside the base model and picked per request
+  runtime LoRA adapters served beside the base model and picked per request, and the prefix cache's
+  reserved snapshots held until their save lands
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
@@ -37,9 +39,27 @@ Written by Deadcode, with contributions from:
 - gearwave00001: /v1/messages as Claude Code sends it
 - devmilan: the NVFP4 and FP8 compressed-tensors imports
 - sfjes: Gemma 4 31B dense -- its plugin, its two attention classes and their kernels, and prefix
-  reuse that leaves a windowed group alone
+  reuse that leaves a windowed group alone -- and --host-headroom-mib
 - zivius: LiquidAI's LFM2 and LFM2-VL and d1's /v1/systemone, after the design of their Codeberg
   PR 50, and Qwen3-ASR with /v1/audio/transcriptions and /v1/realtime
+- mici81: Gemma 3 dense (TranslateGemma 27B) -- its plugin, the windowed h128 attention, the
+  sandwich junction's all-reduce and its DFlash2 drafter -- the fp8_v4 and k6_v4 KV caches, GPTQ's
+  factorisations through LAPACK and a column-split linear's Hessian from per-rank parts,
+  R4D_AR_MAX_BLOCKS for two engines on one set of cards, and added tokens decoded as HuggingFace
+  decodes them
+- eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
+  out-of-tree test at the tree's VOPD setting
+- davetha: JSON Schema patterns read unanchored, with their shorthand classes and escapes
+- Nunze: the eight-rank all-reduce's bands, weighted shards from the PCIe links and pieces, the
+  sampler's candidate width at eight ranks, the image test stage's parallelism, budgets and
+  exclusions, jinja's dotted integer index, GLM-5.3-Flash's kernels in libr4d and tool calls whose
+  name the opener opens
+- John McDonough: GLM-5.3-Flash -- its plugin, its blocks (mHC streams, KDA, the DSA indexer and
+  sparse latent attention, f32-scaled FP8 and MXFP4 experts under sigmoid routing) and their
+  reference and AVX ops -- a Quark export's block-FP8 layers, the signed QSA ranking, the
+  one-sequence KV floor over the live plan, and prefill staging paid by expert residency
+- Memoria: the dashboard's decode floor and recent window, the sparklines' percentile range, and
+  the bringup time in /stats
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.
@@ -56,3 +76,12 @@ LiquidAI/d1-3B repository): the prompt it renders, its question blocks, the opti
 fallback codebook and the answer spellings, unchanged, in code rewritten in C++. That text is Liquid
 AI, Inc.'s, under the LFM Open License v1.0, whose terms -- including its limit on commercial use --
 apply to it; the license is in core/server/LICENSE.lfm.
+
+data/vectors/qwen4exp-control-vector.gguf and data/vectors/qwen4exp-control-vector.json are the
+published refusal-direction vector for Qwen3.8-Flash-Next, by Cudecnik
+(huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection), copied unchanged. The directions
+were measured out of Qwen3.8-Flash-Next's own residual stream, so they are Qwen's, under the Qwen
+Community License 1.0 -- data/vectors/LICENSE.qwen-community-1.0.txt -- which carries the file and
+every copy of it, including its condition that a Model-as-a-Service or AI-work-assistant business
+needs a separate license from Qwen to use it commercially. radiance's Apache-2.0 grant covers the
+code that loads and applies the file; it does not cover the file or its directions.

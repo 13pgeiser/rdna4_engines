@@ -370,8 +370,18 @@ int ref_vtile_stitch(const RadArgs* a, RadStream) {
  *   ((W + pl + pr - k) / stride + 1)                                   (floor divisions)
  *
  * with ft / bk and pt / pb / pl / pr the front / back and top / bottom / left / right pads. The
- * time axis is always zero-padded; `reflect` mirrors each spatial axis once, torch's `reflect`
- * (x[-n] = x[n], x[D + n] = x[D - 2 - n]), so each pad must be below the axis it pads. */
+ * time axis is zero-padded unless `tpad` says otherwise (below); `reflect` mirrors each spatial
+ * axis once, torch's `reflect` (x[-n] = x[n], x[D + n] = x[D - 2 - n]), so each pad must be below
+ * the axis it pads.
+ *
+ * `tpad` sets the frames' padding (rows and columns stay zero-padded): `zero` (the default),
+ * `replicate` (the edge frame repeated, kt/2 a side: LTX-2's decoder) or `causal` (the first
+ * frame repeated kt - 1 times in front, nothing after: LTX-2's encoder). With `causal`, `tpre`
+ * more copies of the first frame stand in front of those, and y has T + tpre frames (LTX-2's
+ * temporal downsampler, which prepends its first frame before its convolution). It folds into
+ * the same grid math: replicate keeps ft = kt / 2 and clamps the time reads to the volume;
+ * causal-`tpre` takes ft = kt - 1 + tpre and bk = 0, clamping below. `tpad` `causal` repeats
+ * where `causal` 1 zeroes, and the two are refused together. */
 static int64_t idiv_floor(int64_t a, int64_t b) {
     const int64_t q = a / b;
     return (a % b && (a < 0) != (b < 0)) ? q - 1 : q;
@@ -382,21 +392,27 @@ int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
     const RadTensor *x = &a->t[0], *w = &a->t[1], *b = &a->t[2], *geom = &a->t[3];
     const RadTensor *res = t_in(a, 4), *y = &a->t[5];
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
-    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
-    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(geom) < 3)
+    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0), tpre = p_int(a, "tpre", 0);
+    static const char* const kPads[] = { "zero", "replicate", "causal" };
+    const int tpad = p_enum(a, "tpad", kPads, 3, 0);
+    if (tpad < 0 || (tpre && tpad != 2)) return RAD_E_INVAL;
+    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || tpre < 0 ||
+        numel(geom) < 3)
         return RAD_E_SHAPE;
     const int64_t sp = p_int(a, "stride", 1), st = p_int(a, "stride_t", 1);
     const int64_t causal = p_int(a, "causal", 0), reflect = p_int(a, "reflect", 0);
     const char* pads = p_str(a, "pad", "same");
     const bool down = pads && !std::strcmp(pads, "down");
     if (sp <= 0 || st <= 0 || (causal && causal != 1) || (reflect && reflect != 1) ||
+        (causal && tpad) /* zero-causal and replicated-causal contradict */ ||
         !(!pads || !std::strcmp(pads, "same") || down))
         return RAD_E_SHAPE;
     const bool gen = sp != 1 || st != 1 || causal || down || reflect;
     if (gen && (k != 3 || kt != 3)) return RAD_E_SHAPE;
     const int64_t T = ldi(geom, 0), H = ldi(geom, 1), W = ldi(geom, 2);
     if (T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
-    const int64_t ft = causal ? kt - 1 : kt / 2, bk = causal ? 0 : kt / 2;
+    const int64_t ft = causal ? kt - 1 : tpad == 2 ? kt - 1 + tpre : kt / 2;
+    const int64_t bk = (causal || tpad == 2) ? 0 : kt / 2;
     const int64_t pt = down ? 0 : k / 2, pb = down ? 1 : k / 2;
     const int64_t pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
     if (reflect && (std::max(pt, pb) >= H || std::max(pl, pr) >= W)) return RAD_E_SHAPE;
@@ -418,7 +434,9 @@ int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
         for (int64_t o = 0; o < cout; ++o) {
             float acc = 0.0f;
             for (int64_t dz = 0; dz < kt; ++dz) {
-                const int64_t tz = t * st + dz - ft;
+                int64_t tz = t * st + dz - ft;
+                if (tpad)   /* replicate and causal-tpre clamp; `zero`/`causal` pad */
+                    tz = std::min<int64_t>(std::max<int64_t>(tz, 0), T - 1);
                 if (tz < 0 || tz >= T) continue;
                 for (int64_t kh = 0; kh < k; ++kh) {
                     int64_t iy = i * sp + kh - pt;

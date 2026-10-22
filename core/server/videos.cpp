@@ -16,11 +16,24 @@
  * (`w:h`) instead lays the model's own canvas over that ratio: the short edge (the model's, or
  * `short_edge`), the area capped at the model's largest, both sides rounded to the multiple.
  * A video's length is a whole number of the model's chunks: `seconds` is rounded up to the next.
- * A model that takes reference media (VideoGenInfo) also serves SGLang's `task` value `ref2va`:
+* A model that takes reference media (VideoGenInfo) also serves SGLang's `task` value `ref2va`:
  * the media are form file parts named `ref_image_N` (at most 9), `ref_video_N` (3), a video's
  * soundtrack as `ref_video_audio_N` and standalone audios as `ref_audio_N` (3), N 1-based and
  * contiguous within each kind. `input_reference` and non-empty `conditions` are still refused:
  * the parts carry the bytes, so no JSON array of media is read.
+ * A model with a length head (LTX-2.5's duration head) chooses the length of a request that names
+ * none, or says `"seconds": "auto"`; the video object reports it once chosen. A model with more
+ * than one decoder takes `decoder`, one of their names (LTX-2.5: `vae`, the default, or
+ * `diffusion`).
+ * A model that can start from a picture takes OpenAI's `input_reference`, a file in the form or a
+ * data URL (a string or {image_url}) in JSON, as the video's first frame, prepared as the model's
+ * pipeline prepares it: an H.264 round trip at the model's quality, then a bilinear resize to the
+ * size the first steps run at. Non-empty `conditions` are refused.
+ *
+ * A guided model takes `negative_prompt` and its guidance terms, each the model's default when
+ * absent: `guidance_scale`, `stg_scale`, `modality_scale` and `guidance_rescale` for the video,
+ * the same with `audio_` in front for the soundtrack. A scale of 1 turns that modality's
+ * unconditional branch off; the negative prompt is the model's own unless named.
  *
  * A model with a latent upscaler also takes `latent_upscale`, a factor from 1 to its largest: the
  * first steps run at `size` divided by it and the latent is enlarged to `size` for the last
@@ -32,9 +45,11 @@
  * special tokens and the prompt without, so a caller cannot write control tokens into it.
  */
 #include "server.h"
+#include "loras.h"
 #include "oai.h"
 
 #include "gen/video.h"
+#include "mm/imaging.h"
 #include "mm/media.h"
 #include "mm/video_out.h"
 #include "rad_internal.h"
@@ -80,11 +95,23 @@ struct Server::VideoJob {
     double      upscale = 0.0;
     int32_t     refine = 0;
     std::string upscale_from;
+    /* A guided model's terms as resolved against its defaults, the negative prompt when a scale
+     * used it, and whether the video started from a picture. */
+    bool        guided = false;
+    double      guidance[8] = {};
+    std::string negative;
+    bool        has_negative = false;
+    bool        from_image = false;
+    std::string decoder;          /* a decoder the request named other than the default */
     int32_t     w = 0, h = 0;
     bool        worker_done = false;   /* its thread has nothing left to do but return */
 };
 
 namespace {
+
+/* The largest picture `input_reference` may decode to, which bounds the memory a request can make
+ * the server allocate before the resize. */
+constexpr int64_t kMaxRefPixels = (int64_t)1 << 26;
 
 std::string new_video_id() {
     static const char* hex = "0123456789abcdef";
@@ -300,14 +327,15 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * alone they are I2VA (first) or L2VA (last). */
     std::vector<gen::VideoRefMedia> keys;
     json body = json::object();
+    std::vector<uint8_t> ref_bytes;
+    bool has_ref = false;
     if (!req.form.empty()) {
         for (const FormPart& p : req.form) {
-            if (p.name == "input_reference")
-                return error_response(err_unsupported("input_reference", takes_refs
-                                                      ? "this server reads reference media as "
-                                                        "ref_image_N file parts"
-                                                      : "this server makes video from text "
-                                                        "only"), req.peer);
+            if (p.name == "input_reference" && !p.filename.empty()) {
+                ref_bytes.assign(p.data.begin(), p.data.end());
+                has_ref = true;
+                continue;
+            }
             if (p.name == "first_frame" || p.name == "last_frame") {
                 if (p.filename.empty())
                     return error_response(err_bad(p.name, "'" + p.name + "' must carry an image "
@@ -340,7 +368,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 continue;
             }
             json v = p.data;
-            if (p.name == "target" || p.name == "conditions") {
+            if (p.name == "target" || p.name == "conditions" ||
+                ((p.name == "loras" || p.name == "lora") && !p.data.empty() &&
+                 (p.data[0] == '[' || p.data[0] == '{'))) {
                 v = json::parse(p.data, nullptr, false);
                 if (v.is_discarded())
                     return error_response(err_bad(p.name, "expected JSON"), req.peer);
@@ -356,6 +386,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps", "format",
         "sampler", "shift", "audio_shift",
+        "negative_prompt", "decoder", "loras", "lora",
+        /* RadVideoGenBatch::guidance_h's order */
+        "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
+        "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale", "audio_guidance_rescale",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -379,35 +413,75 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     if (!has(body, "prompt") || !body["prompt"].is_string() ||
         body["prompt"].get<std::string>().find_first_not_of(" \t\r\n") == std::string::npos)
         return bad("prompt", "the prompt is required, as a non-empty string");
-    const std::string prompt = body["prompt"].get<std::string>();
-    if (has(body, "input_reference"))
+    std::string prompt = body["prompt"].get<std::string>();
+    /* Runtime LoRA adapters: `loras` and <lora:...> tags, which leave the prompt. */
+    std::vector<std::pair<std::string, double>> loras;
+    {
+        std::string field, why;
+        if (parse_loras(body, &prompt, &loras, &field, &why) < 0) return bad(field.c_str(), why);
+        if (!loras.empty() && !opt_.gen_lora_acquire)
+            return error_response(err_unsupported(field.c_str(), "this server was started without "
+                                                                 "adapters (--lora, --lora-dir)"),
+                                  req.peer);
+    }
+    if (has(body, "input_reference")) {
+        /* JSON: a data URL, as a string or an image_url object. */
+        const json& v = body["input_reference"];
+        std::string u;
+        if (v.is_string()) u = v.get<std::string>();
+        else if (v.is_object() && v.contains("image_url") && v["image_url"].is_string())
+            u = v["image_url"].get<std::string>();
+        else if (v.is_object() && v.contains("image_url") && v["image_url"].is_object() &&
+                 v["image_url"].contains("url") && v["image_url"]["url"].is_string())
+            u = v["image_url"]["url"].get<std::string>();
+        else
+            return bad("input_reference", "a picture is a file, a data: URL, or an object with an "
+                                          "image_url");
+        ApiError err;
+        if (decode_media_url(u, "input_reference", &ref_bytes, &err) < 0)
+            return error_response(err, req.peer);
+        has_ref = true;
+    }
+    if (has_ref && !info.image_cond)
         return error_response(err_unsupported("input_reference", takes_refs
                                               ? "this server reads reference media as ref_image_N "
                                                 "file parts"
-                                              : "this server makes video from text only"),
-                              req.peer);
-    /* The task: text always; reference conditioning for a model that takes reference media. */
+                                              : "this model makes video from text only"), req.peer);
+    /* With a picture the task is upstream's: t2va names none, i2va names the one. */
+    if (has_ref && has(body, "task") && (!body["task"].is_string() ||
+                                         body["task"].get<std::string>() != "i2va")) {
+        ApiError e = err_unsupported("task", "a video from a picture is i2va");
+        e.supported = { "i2va" };
+        return error_response(e, req.peer);
+    }
+    /* The task without a picture: text always; reference conditioning for a model that takes
+     * reference media; keyframe completion on a model with a video encoder. */
     bool ref2va = false;
     std::string kf_task;   /* an explicitly named keyframe task (i2va / l2va / fl2va), if any */
-    if (has(body, "task")) {
+    if (!has_ref && has(body, "task")) {
         const std::string task = body["task"].is_string() ? body["task"].get<std::string>() : "";
         if (task == "ref2va" && takes_refs) ref2va = true;
-        /* The keyframe-completion tasks: a first and/or last frame pinned at the output's ends.
-         * They are recognised whatever a model declares (any model with a video encoder can pin a
-         * keyframe); which frames are actually present is decided by the file parts, cross-checked
-         * against this name below. t2va with a first_frame part is I2VA; a named task missing its
-         * frame is refused there. */
-        else if (task == "i2va" || task == "l2va" || task == "fl2va") kf_task = task;
+        /* The keyframe-completion tasks: a first and/or last frame pinned at the output's ends,
+         * which only a model with a video encoder can pin. Which frames are actually present is
+         * decided by the file parts, cross-checked against this name below. t2va with a
+         * first_frame part is I2VA; a named task missing its frame is refused there. */
+        else if (info.encodes && (task == "i2va" || task == "l2va" || task == "fl2va"))
+            kf_task = task;
         else if (task != "t2va") {
-            ApiError e = err_unsupported("task", takes_refs
-                                         ? "this server makes video from text, from reference "
-                                           "media, or between keyframes: t2va, ref2va, i2va, l2va, "
-                                           "fl2va"
-                                         : "this server makes video from text or between keyframes: "
-                                           "t2va, i2va, l2va, fl2va");
-            e.supported = takes_refs
-                ? std::vector<std::string>{ "t2va", "ref2va", "i2va", "l2va", "fl2va" }
-                : std::vector<std::string>{ "t2va", "i2va", "l2va", "fl2va" };
+            std::string what = "this server makes video from text";
+            std::vector<std::string> sup{ "t2va" };
+            if (info.image_cond) { what += ", from a picture"; sup.push_back("i2va"); }
+            if (info.encodes) {
+                what += ", or between keyframes";
+                for (const char* k : { "i2va", "l2va", "fl2va" })
+                    if (std::find(sup.begin(), sup.end(), std::string(k)) == sup.end())
+                        sup.push_back(k);
+            }
+            if (takes_refs) { what += ", from reference media"; sup.push_back("ref2va"); }
+            what += ": ";
+            for (size_t i = 0; i < sup.size(); ++i) what += (i ? ", " : "") + sup[i];
+            ApiError e = err_unsupported("task", what);
+            e.supported = sup;
             return error_response(e, req.peer);
         }
     }
@@ -533,7 +607,13 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     const bool has_sec = has(body, "seconds"), has_dur = has(target, "duration_seconds");
     if (has_sec && has_dur)
         return bad("seconds", "give seconds or target's duration_seconds, not both");
-    if (has_sec || has_dur) {
+    /* A model with a length head chooses the length of a request that names none, or `auto`. */
+    const bool auto_len = info.length_head &&
+        (!(has_sec || has_dur) ||
+         (has_sec && body["seconds"].is_string() && body["seconds"].get<std::string>() == "auto"));
+    if (auto_len) {
+        chunks = 0;
+    } else if (has_sec || has_dur) {
         double sec = 0;
         if (!number(has_sec ? body["seconds"] : target["duration_seconds"], &sec) || !(sec > 0))
             return bad(has_sec ? "seconds" : "target", "the length is a positive number of seconds");
@@ -546,24 +626,52 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                        "this model makes " + rad::fmt("%.2f", min_s) + " to " +
                            rad::fmt("%.2f", max_s) + " seconds");
     }
-    const int64_t frames = info.frames_per_chunk * chunks + info.frames_tail;
+    /* The length the job reports until the model has chosen one. */
+    const int64_t frames =
+        info.frames_per_chunk * (chunks > 0 ? chunks : info.default_chunks) + info.frames_tail;
 
     std::unique_ptr<gen::VideoRequest> r = std::make_unique<gen::VideoRequest>();
     r->width = (int32_t)W;
     r->height = (int32_t)H;
     r->chunks = (int32_t)chunks;
+    /* ---- the decoder, by name, the model's first when absent */
+    std::string decoder;
+    if (has(body, "decoder")) {
+        if (!body["decoder"].is_string())
+            return bad("decoder", "the decoder is a name");
+        decoder = body["decoder"].get<std::string>();
+        std::string names;
+        int32_t idx = -1;
+        for (size_t i = 0; i < info.decoders.size(); ++i) {
+            names += (i ? ", " : "") + info.decoders[i];
+            if (info.decoders[i] == decoder) idx = (int32_t)i;
+        }
+        if (idx < 0)
+            return bad("decoder", info.decoders.empty()
+                                      ? std::string("this model has one decoder and takes no name")
+                                      : "this model decodes with " + names);
+        if (W * H > info.decoder_max_area[(size_t)idx])
+            return bad("decoder", "the " + decoder + " decoder makes frames of " +
+                                      std::to_string(info.decoder_max_area[(size_t)idx]) +
+                                      " pixels at most");
+        r->decoder = idx;
+        if (idx == 0) decoder.clear();
+    }
     if (has(body, "num_inference_steps")) {
         double v = 0;
+        const char* unit = info.step_evals ? " model evaluations"
+                                           : " sigma grid points, the last one 0";
+        const int64_t lo = info.step_evals ? 1 : 2;
         if (info.fixed_steps && (!number(body["num_inference_steps"], &v) ||
                                  v != (double)info.max_steps))
             return bad("num_inference_steps",
                        "this model runs the schedule it was trained on: " +
-                           std::to_string(info.max_steps) + " sigma grid points, the last one 0");
-        if (!number(body["num_inference_steps"], &v) || v != std::floor(v) || v < 2 ||
+                           std::to_string(info.max_steps) + unit);
+        if (!number(body["num_inference_steps"], &v) || v != std::floor(v) || v < lo ||
             v > (double)info.max_steps)
-            return bad("num_inference_steps", "expected an integer in 2.." +
-                                                  std::to_string(info.max_steps) +
-                                                  " (sigma grid points, the last one 0)");
+            return bad("num_inference_steps", "expected an integer in " + std::to_string(lo) +
+                                                  ".." + std::to_string(info.max_steps) + " (" +
+                                                  (unit + 1) + ")");
         r->steps = (int32_t)v;
     }
     if (has(body, "sampler")) {
@@ -595,6 +703,33 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                       "omit it to run the model's trained shift " +
                                       rad::fmt("%g", info.shift_audio));
         r->shift_audio = v;
+    }
+    /* ---- guidance */
+    static const char* kGuide[8] = {
+        "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
+        "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale", "audio_guidance_rescale",
+    };
+    for (int i = 0; i < 8; ++i) {
+        if (!has(body, kGuide[i])) continue;
+        if (!info.guidance)
+            return error_response(err_unsupported(kGuide[i], "this model takes no guidance"),
+                                  req.peer);
+        double v = 0;
+        const bool rescale = i % 4 == 3;
+        if (!number(body[kGuide[i]], &v) || !(v >= 0.0) || v > (rescale ? 1.0 : 100.0))
+            return bad(kGuide[i], rescale ? "expected a number from 0 to 1"
+                                          : "expected a number from 0 to 100");
+        r->guidance[i] = v;
+    }
+    std::string negative = info.default_negative;
+    if (has(body, "negative_prompt")) {
+        if (!info.guidance)
+            return error_response(err_unsupported("negative_prompt", "this model takes no "
+                                                  "guidance"), req.peer);
+        if (!body["negative_prompt"].is_string())
+            return bad("negative_prompt", "expected a string");
+        negative = body["negative_prompt"].get<std::string>();
+        r->has_neg = true;
     }
     if (has(body, "latent_upscale")) {
         double v = 0;
@@ -649,10 +784,15 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         static const std::string kSlot = "{prompt}";
         const std::string& t = info.tmpl;
         const size_t p = t.find(kSlot);
-        auto put = [&](const std::string& s, bool special) {
+        auto put = [&](std::vector<int32_t>* out, const std::string& s, bool special) {
             if (s.empty()) return;
             const auto ids = deps_.tok->encode(s, false, special);
-            r->tokens.insert(r->tokens.end(), ids.begin(), ids.end());
+            out->insert(out->end(), ids.begin(), ids.end());
+        };
+        auto render = [&](const std::string& text, std::vector<int32_t>* out) {
+            put(out, t.substr(0, p), true);
+            put(out, text, false);
+            put(out, t.substr(p + kSlot.size()), true);
         };
         /* The reference media are presented between the template's head and the prompt. Only the
          * images reach the language model as soft-token rows, so only they are decoded and placed
@@ -700,13 +840,13 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                     if (m.kind == gen::VideoRefMedia::VIDEO_AUDIO && m.index == idx) return true;
                 return false;
             };
-            put(t.substr(0, p), true);
+            put(&r->tokens, t.substr(0, p), true);
             std::shared_ptr<mm::PromptMedia> media;
             if (!pics.empty()) media = std::make_shared<mm::PromptMedia>();
             size_t i = 0;
             for (const gen::VideoRefMedia& m : r->refs) {   /* sorted by (kind, index): images first */
                 if (!anchor(m)) continue;
-                put("<Picture " + std::to_string(m.index) + ">: ", false);
+                put(&r->tokens, "<Picture " + std::to_string(m.index) + ">: ", false);
                 mm::Placed pl;
                 pl.item = pics[i++];
                 pl.tok = (int32_t)r->tokens.size();
@@ -718,20 +858,18 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             for (const gen::VideoRefMedia& m : r->refs) {
                 if (m.kind != gen::VideoRefMedia::VIDEO) continue;
                 if (has_soundtrack(m.index))
-                    put("<Audio " + std::to_string(++audio_ord) + ">: ", false);
-                put("<Video " + std::to_string(m.index) + ">: ", false);
+                    put(&r->tokens, "<Audio " + std::to_string(++audio_ord) + ">: ", false);
+                put(&r->tokens, "<Video " + std::to_string(m.index) + ">: ", false);
             }
             for (const gen::VideoRefMedia& m : r->refs) {
                 if (m.kind != gen::VideoRefMedia::AUDIO) continue;
-                put("<Audio " + std::to_string(++audio_ord) + ">: ", false);
+                put(&r->tokens, "<Audio " + std::to_string(++audio_ord) + ">: ", false);
             }
             if (media) { media->layout(); r->media = std::move(media); }
-            put(prompt, false);
-            put(t.substr(p + kSlot.size()), true);
+            put(&r->tokens, prompt, false);
+            put(&r->tokens, t.substr(p + kSlot.size()), true);
         } else {
-            put(t.substr(0, p), true);
-            put(prompt, false);
-            put(t.substr(p + kSlot.size()), true);
+            render(prompt, &r->tokens);
         }
         if ((int64_t)r->tokens.size() > info.max_text)
             return bad("prompt", "the prompt" + std::string((ref2va || has_keys)
@@ -739,6 +877,50 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                      " is " + std::to_string(r->tokens.size()) +
                                      " tokens; this model takes at most " +
                                      std::to_string(info.max_text));
+        if (info.guidance) {
+            render(negative, &r->neg_tokens);
+            if ((int64_t)r->neg_tokens.size() > info.max_text)
+                return bad("negative_prompt", "the negative prompt is " +
+                                                  std::to_string(r->neg_tokens.size()) +
+                                                  " tokens; this model takes at most " +
+                                                  std::to_string(info.max_text));
+        }
+    }
+
+    /* ---- the first frame, at the size the first steps run at */
+    if (has_ref) {
+        int32_t fw = r->width, fh = r->height;
+        if (r->upscale > 1.0) {
+            RadVideoGenDecl geo{};   /* video_small_size reads the size multiple only */
+            geo.size_multiple = info.size_multiple;
+            gen::video_small_size(geo, r->width, r->height, r->upscale, &fw, &fh);
+        }
+        mm::Frame f;
+        std::string why;
+        if (mm::decode_image(ref_bytes.data(), ref_bytes.size(), kMaxRefPixels, &f, &why) < 0)
+            return bad("input_reference", "the picture could not be read: " + why);
+        if (info.image_crf > 0) {
+            mm::Frame rt;
+            const int e = mm::h264_roundtrip(f, info.image_crf, &rt, &why);
+            if (e < 0) {
+                ApiError err = err_bad("input_reference", "the picture could not be prepared: " + why);
+                if (e != RAD_E_INVAL) { err.status = 503; err.type = "server_error"; }
+                return error_response(err, req.peer);
+            }
+            f = std::move(rt);
+        }
+        mm::FrameRGBA a, sized;
+        a.w = f.w;
+        a.h = f.h;
+        a.rgba.resize((size_t)f.w * f.h * 4);
+        for (size_t i = 0, n = (size_t)f.w * f.h; i < n; ++i) {
+            std::memcpy(&a.rgba[4 * i], &f.rgb[3 * i], 3);
+            a.rgba[4 * i + 3] = 255;
+        }
+        mm::resize_bilinear_rgba(a, fw, fh, &sized);
+        r->image.resize((size_t)fw * fh * 3);
+        for (size_t i = 0, n = (size_t)fw * fh; i < n; ++i)
+            std::memcpy(&r->image[3 * i], &sized.rgba[4 * i], 3);
     }
 
     /* ---- the encoder's own view of every reference the VAEs consume: pictures and videos through
@@ -820,12 +1002,22 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
 
     /* ---- admitted and queued: the job holds its place until its file is written */
+    if (!loras.empty()) {
+        std::string why, note;
+        const int s = opt_.gen_lora_acquire(loras, &r->lora_slot, &r->lora_hold, &note, &why);
+        if (s < 0) {
+            ApiError e = err_bad("loras", why);
+            if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
+            else if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
+            return error_response(e, req.peer);
+        }
+    }
     if (auto no = admit(1, req.peer)) return *no;
     auto j = std::make_shared<VideoJob>();
     j->id = new_video_id();
     j->model = opt_.model_id;
     j->prompt = prompt;
-    j->seconds = rad::fmt("%.2f", (double)frames / fps);
+    j->seconds = auto_len ? std::string("auto") : rad::fmt("%.2f", (double)frames / fps);
     j->size = std::to_string(W) + "x" + std::to_string(H);
     j->created_at = unix_now();
     j->seed = r->seed;
@@ -838,6 +1030,13 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     r->ticket = j->ticket;
     const int64_t n_tok = (int64_t)r->tokens.size();
     const int32_t steps = r->steps;
+    j->guided = info.guidance;
+    for (int i = 0; i < 8; ++i)
+        j->guidance[i] = std::isnan(r->guidance[i]) ? info.guidance_default[i] : r->guidance[i];
+    j->has_negative = info.guidance && (j->guidance[0] != 1.0 || j->guidance[4] != 1.0);
+    if (j->has_negative) j->negative = negative;
+    j->from_image = !r->image.empty();
+    j->decoder = decoder;
     const double upscale = r->upscale;
     {
         std::string w;
@@ -855,8 +1054,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         j->refine = tk.refine;
         j->upscale_from = std::to_string(tk.small_width) + "x" + std::to_string(tk.small_height);
     }
-    RAD_INFO("video %s: %s, %lld frames (%s s), %lld prompt tokens, %d steps%s%s, seed=%llu",
-             j->id.c_str(), j->size.c_str(), (long long)frames, j->seconds.c_str(),
+    RAD_INFO("video %s: %s, %s, %lld prompt tokens, %d steps%s%s, seed=%llu",
+             j->id.c_str(), j->size.c_str(),
+             auto_len ? "the length the model chooses"
+                      : rad::fmt("%lld frames (%s s)", (long long)frames, j->seconds.c_str()).c_str(),
              (long long)n_tok, steps > 0 ? steps : (int)tk.steps,
              tk.refine > 0 ? rad::fmt(" (the first %d at %dx%d, upscaled for the last %d)",
                                       (int)(tk.steps - tk.refine), (int)tk.small_width,
@@ -897,6 +1098,9 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
             std::lock_guard<std::mutex> lk(videos_m_);
             j->status = "in_progress";
             j->progress = t.steps > 0 ? (int)(90LL * e.steps_done / t.steps) : 0;
+        } else if (e.kind == gen::VideoEvent::LENGTH) {
+            std::lock_guard<std::mutex> lk(videos_m_);
+            j->seconds = rad::fmt("%.2f", (double)e.n * info.fps_den / info.fps_num);
         } else if (e.kind == gen::VideoEvent::AUDIO) {
             if (t.channels > 0)
                 st = vw.add_audio(e.samples.data(), (int64_t)e.samples.size() / t.channels, &why);
@@ -1029,6 +1233,17 @@ json Server::video_json(const VideoJob& j) {
         o["task"] = "ref2va";
         o["refs"] = j.refs;   /* the reference parts, in conditioning order */
     }
+    if (j.guided) {
+        static const char* kGuide[8] = {
+            "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
+            "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale",
+            "audio_guidance_rescale",
+        };
+        for (int i = 0; i < 8; ++i) o[kGuide[i]] = j.guidance[i];
+        if (j.has_negative) o["negative_prompt"] = j.negative;
+    }
+    if (j.from_image) o["input_reference"] = true;
+    if (!j.decoder.empty()) o["decoder"] = j.decoder;
     o["remixed_from_video_id"] = nullptr;
     if (j.failed) {
         json e;

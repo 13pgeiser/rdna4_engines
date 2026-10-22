@@ -1,0 +1,19 @@
+# LTX-2.5 (Lightricks/LTX-2.5-Diffusers), distilled, as block fp8: video with its stereo soundtrack
+# from text or from text and a first frame, on OpenAI's /v1/videos, on one card, RADIANCE_GPU in
+# .env (default 0). The text encoder is read from pinned host memory (--vision-tower-placement ram).
+# For the base model, point --model at ltx-2.5-fp8.rad. The LTX-2.x Community License applies.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/ltx2 and add `--lora-dir /models/loras/ltx2` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
+# At one card the adapter slots fit at `--max-lora-rank 16 --max-loras 1` (433 MiB).
+name: radiance-ltx-2.5
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-ltx-2.5
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/ltx-2.5-distilled-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --vision-tower-placement ram

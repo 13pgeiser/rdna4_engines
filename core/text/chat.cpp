@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 namespace rad {
@@ -130,6 +131,54 @@ static size_t json_depth(const ojson& root) {
     return deepest;
 }
 
+/* The conversation with every system message merged, in order, into one at its head, or false
+ * when that is the conversation already (none, or one leading) or a system message carries more
+ * than text. The Chat Completions API places no constraint on system messages, while many
+ * templates raise unless there is exactly one, first (#137). */
+static bool lead_system(const ojson& messages, ojson* out) {
+    if (!messages.is_array()) return false;
+    std::string text;
+    size_t n_sys = 0;
+    bool first = false;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const ojson& m = messages[i];
+        if (!m.is_object() || m.value("role", "") != "system") continue;
+        if (i == 0) first = true;
+        std::string t;
+        const auto c = m.find("content");
+        if (c != m.end() && c->is_string()) {
+            t = c->get<std::string>();
+        } else if (c != m.end() && c->is_array()) {
+            for (const ojson& part : *c) {
+                if (!part.is_object() || part.value("type", "") != "text" ||
+                    !part.contains("text") || !part.at("text").is_string())
+                    return false;
+                t += part.at("text").get<std::string>();
+            }
+        } else if (c != m.end() && !c->is_null()) {
+            return false;
+        }
+        if (n_sys++ && !text.empty() && !t.empty()) text += "\n\n";
+        text += t;
+    }
+    if (n_sys == 0 || (n_sys == 1 && first)) return false;
+    *out = ojson::array();
+    out->push_back(ojson{ { "role", "system" }, { "content", text } });
+    for (const ojson& m : messages)
+        if (!m.is_object() || m.value("role", "") != "system") out->push_back(m);
+    return true;
+}
+
+/* The template's own words: the lifted autoparser wraps whatever the render threw in a sentence
+ * about parser generation, which the render's failure is not. */
+static std::string template_words(const char* what) {
+    static const char kWrap[] = "Unable to generate parser for this template. Automatic parser "
+                                "generation failed: ";
+    std::string w = what ? what : "";
+    if (w.compare(0, sizeof kWrap - 1, kWrap) == 0) w.erase(0, sizeof kWrap - 1);
+    return w;
+}
+
 int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOptions& opt,
                         ChatPrompt* out) const {
     if (!ready()) {
@@ -190,9 +239,32 @@ int ChatTemplate::apply(const ojson& messages, const ojson& tools, const ChatOpt
     try {
         p = common_chat_templates_apply(impl_->tmpls.get(), in);
     } catch (const std::exception& e) {
-        if (!opt.quiet) RAD_ERR("chat: template refused the request: %s", e.what());
-        out->error = e.what();
-        return RAD_E_UNSUPPORTED;
+        /* A template that takes one system message, first, refuses a conversation that has
+         * another or has it later, which the API allows: it is rendered once more with them
+         * merged into one at the head. Anything else the template refuses is the request's. */
+        ojson merged;
+        bool served = false;
+        if (lead_system(messages, &merged)) {
+            try {
+                in.messages = common_chat_msgs_parse_oaicompat(merged);
+                p = common_chat_templates_apply(impl_->tmpls.get(), in);
+                served = true;
+                static std::atomic<bool> said{ false };
+                if (!opt.quiet && !said.exchange(true))
+                    RAD_WARN("chat: the model's chat template refuses system messages after the "
+                             "first (%s); such a conversation is rendered with its system "
+                             "messages merged, in order, into one at the head. Said once.",
+                             template_words(e.what()).c_str());
+            } catch (const std::exception&) {
+            }
+        }
+        if (!served) {
+            const std::string w = template_words(e.what());
+            if (!opt.quiet) RAD_WARN("chat: the model's chat template refused the request: %s",
+                                     w.c_str());
+            out->error = "the model's chat template refused this conversation: " + w;
+            return RAD_E_INVAL;
+        }
     }
 
     out->prompt            = std::move(p.prompt);

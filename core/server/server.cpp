@@ -132,6 +132,7 @@ void Server::register_routes() {
         return r;
     });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
+    router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
     router_.post("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
     router_.post("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
@@ -170,7 +171,12 @@ void Server::register_routes() {
     router_.post("/v1/responses",        [this](const HttpRequest& q) { return handle_responses(q); });
     router_.post("/responses",           [this](const HttpRequest& q) { return handle_responses(q); });
     auto responses_tokens = [this](const HttpRequest& q) {
-        return count_tokens(q, responses_to_chat, ApiShape::OpenAI, "response.input_tokens");
+        return count_tokens(q,
+                            [](const std::string& b, const OaiLimits& l, std::string* c,
+                               std::string* ec, ApiError* e) {
+                                return responses_to_chat(b, l, c, ec, e);
+                            },
+                            ApiShape::OpenAI, "response.input_tokens");
     };
     router_.post("/v1/responses/input_tokens", responses_tokens);
     router_.post("/responses/input_tokens", responses_tokens);
@@ -198,6 +204,12 @@ void Server::register_routes() {
     router_.get ("/stats",               [this](const HttpRequest& q) { return handle_stats(q); });
     router_.get ("/graph",               [this](const HttpRequest& q) { return handle_graph(q); });
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
+    /* The control vector's switch, for the dashboard's Model view and for automation: a
+     * deployment with no vector found answers 404 here. */
+    router_.get ("/admin/control-vector",
+                 [this](const HttpRequest& q) { return handle_control_vector(q); });
+    router_.post("/admin/control-vector",
+                 [this](const HttpRequest& q) { return handle_control_vector(q); });
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole
@@ -206,6 +218,14 @@ void Server::register_routes() {
  * keeps probes, the dashboard, 429 answers and idle keep-alive connections serviceable. The same
  * number bounds the connections that may wait once the reserve is busy too. */
 static const int64_t kSpareWorkers = 64;
+
+void Server::note_ready(uint64_t begin_ns) {
+    if (begin_ns == 0) return;
+    const uint64_t now = rad_mono_ns();
+    /* A stamp that is not in the past leaves the figure unset rather than writing a zero. */
+    if (now <= begin_ns) return;
+    startup_s_ = (int64_t)((now - begin_ns) / 1000000000ull);
+}
 
 int Server::run() {
     TransportOptions t;
@@ -254,20 +274,32 @@ std::vector<std::string> Server::probe_reasoning_efforts() {
     l.default_reasoning_effort.clear();
     l.reasoning_effort_map.clear();
     l.probe = true;
-    auto takes = [&](const std::string& effort) {
+    template_default_effort_.clear();
+    auto render = [&](const std::string& effort, std::string* text) {
         std::string body = R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1)";
         if (!effort.empty()) body += R"(,"reasoning_effort":)" + json(effort).dump();
         body += "}";
         OaiRequest r;
         ApiError e;
-        return parse_chat_request(body, odeps_, l, &r, &e) >= 0;
+        if (parse_chat_request(body, odeps_, l, &r, &e) < 0) return false;
+        if (text) *text = r.prompts.empty() ? std::string() : r.prompts[0].text;
+        return true;
     };
     /* A render that fails without an effort says nothing about efforts; one that takes a
      * nonsense word takes every word. */
-    if (!takes("") || takes("radiance-probe-not-a-level")) return {};
-    std::vector<std::string> set;
-    for (const char* w : { "low", "medium", "high", "xhigh", "max" })
-        if (takes(w)) set.push_back(w);
+    std::string plain;
+    if (!render("", &plain) || render("radiance-probe-not-a-level", nullptr)) return {};
+    std::vector<std::string> set, same;
+    for (const char* w : { "low", "medium", "high", "xhigh", "max" }) {
+        std::string text;
+        if (!render(w, &text)) continue;
+        set.push_back(w);
+        if (text == plain) same.push_back(w);
+    }
+    /* The level a request naming none gets: the one level whose render is the same. A template may
+     * spend it in a system prompt the client never sees (#113: Qwen3.8's is xhigh). Several, or
+     * none, say nothing. */
+    if (same.size() == 1) template_default_effort_ = same[0];
     lim_.reasoning_efforts = set;
     return set;
 }
@@ -434,6 +466,25 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* The control vector: the request's own choice, else the deployment's runtime default. A
+     * deployment with no vector refuses the on state by name -- serving the stock model while the
+     * client believes it asked for the vector would be a silent lie about what produced the text.
+     * (Naming: `control_vector` is the field, `experimental_speed_projection` its alias.) */
+    bool projection_on = false;
+    {
+        const bool named = r.control_vector >= 0;
+        projection_on = named
+            ? (r.control_vector == 1)
+            : (deps_.control_vector.get_default && deps_.control_vector.get_default());
+        if (projection_on &&
+            !(deps_.control_vector.available && deps_.control_vector.available())) {
+            *err = err_bad("control_vector",
+                           "this deployment found no control vector for its model; the stock model "
+                           "is what it serves");
+            return RAD_E_INVAL;
+        }
+    }
+
     int idx = 0;
     std::vector<Request> rqs;
     rqs.reserve(r.prompts.size() * (size_t)r.n);
@@ -456,6 +507,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             Request rq;
             rq.prompt = r.prompts[p].tokens;
             rq.sp = r.sp;
+            rq.sp.use_control_vector = projection_on;
             /* Distinct seeds per choice, or `n` identical completions. An offset suffices: the
              * sampler's stream is seeded, not chained. */
             rq.sp.seed = r.sp.seed + (uint64_t)k;
@@ -1538,10 +1590,12 @@ HttpResponse Server::handle_responses(const HttpRequest& req) {
     std::string chat, echo;
     ApiError err;
     OaiRequest r;
-    if (responses_to_chat(req.body, lim_, &chat, &echo, &err) < 0 ||
+    std::map<std::string, std::pair<std::string, std::string>> ns;
+    if (responses_to_chat(req.body, lim_, &chat, &echo, &err, &ns) < 0 ||
         parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer);
     r.shape = ApiShape::Responses;
+    r.tool_namespace = std::move(ns);
     r.id = random_id("resp_");
     r.echo_json = std::move(echo);
     return serve(req, r);
@@ -1837,6 +1891,22 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
 /* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
  * to unload. The path is read on this machine, so without --api-key only a loopback client may
  * ask, the rule /diagnostics follows. */
+/* A generator's adapter files: what `loras` and <lora:...> tags may name. */
+HttpResponse Server::handle_loras(const HttpRequest& req) {
+    using json = nlohmann::json;
+    if (!opt_.gen_lora_names) {
+        ApiError e;
+        e.status = 404;
+        e.type = "not_found_error";
+        e.message = "this server takes no adapters in image or video requests (--lora, --lora-dir)";
+        return error_response(e, req.peer);
+    }
+    json data = json::array();
+    for (const std::string& n : opt_.gen_lora_names()) data.push_back({ { "id", n }, { "object", "lora" } });
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{ { "object", "list" }, { "data", std::move(data) } }));
+}
+
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     using json = nlohmann::json;
     auto fail = [&](int status, const char* type, const std::string& msg) {

@@ -25,6 +25,7 @@
 #include "r4d_fp8_args.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_fwht.h"
+#include "r4d_chain.h"
 
 namespace {
 
@@ -43,10 +44,14 @@ constexpr uint32_t kGroup = 128;
 //
 // I8 is the same quantiser at int8 codes (quant_act_i8g, had_quant_act_i8g): scale amax/127,
 // round-to-nearest-even into -127..127, same row-major layout and per-(row, 128) scales.
-template <bool ROT, bool I8 = false>
-__global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(
+//
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); no block returns
+// early. quant_act_fp8_kernel and r4dchain_quant_act_fp8 below are the plain and chained forms.
+template <bool ROT, bool I8 = false, bool CHAIN = false>
+__device__ __forceinline__ void quant_act_fp8_body(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
     uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld) {
+    if (CHAIN) r4d_chain_wait();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
     const size_t xrow = (size_t)row * x_ld;
@@ -92,7 +97,20 @@ __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(
         // of the accumulators. The caller must own K rounded up to 4 bytes of `q`.
         if (c0 < K) *(uint32_t*)(q + qrow + c0) = (uint32_t)pk;
     }
+    if (CHAIN) r4d_chain_done();
 }
+
+#define R4D_QAF_PARAMS const uint16_t* __restrict__ x, uint8_t* __restrict__ q,                  \
+    float* __restrict__ s, uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld
+template <bool ROT, bool I8 = false>
+__global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(R4D_QAF_PARAMS) {
+    quant_act_fp8_body<ROT, I8, false>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+}
+template <bool ROT, bool I8 = false>
+__global__ __launch_bounds__(kThreads) void r4dchain_quant_act_fp8(R4D_QAF_PARAMS) {
+    quant_act_fp8_body<ROT, I8, true>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+}
+#undef R4D_QAF_PARAMS
 
 }  // namespace
 
@@ -105,7 +123,7 @@ extern "C" int r4d_quant_act_fp8_group(void) { return (int)kGroup; }
 // `rot` runs the 128-wide Hadamard first and additionally requires K % 128 == 0 (see the kernel).
 static int quant_act_fp8_launch(long a, long q, long s, int M, int K,
                                 int x_ld, int q_ld, int s_ld, RadStream stream, bool rot,
-                                bool i8 = false) {
+                                bool i8 = false, bool chain = false) {
     int emit_rc = RAD_OK;
     if (!a || !q || !s) return -1;
     if (M <= 0 || K <= 0) return -2;
@@ -115,10 +133,15 @@ static int quant_act_fp8_launch(long a, long q, long s, int M, int K,
     if (!q_ld) q_ld = K;
     const int nkb = (K + (int)kGroup - 1) / (int)kGroup;
     if (!s_ld) s_ld = nkb;
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = chain && M <= 64;
 #define R4D_QA(ROT_, I8_)                                                                     \
-    R4D_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_>), dim3((uint32_t)M), dim3(kThreads), 0,   \
-             (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, (uint32_t)nkb,             \
-             (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld)
+    (ch ? R4D_EMIT(stream, (r4dchain_quant_act_fp8<ROT_, I8_>), dim3((uint32_t)M),             \
+                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
+                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld)               \
+        : R4D_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_>), dim3((uint32_t)M),               \
+                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
+                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld))
     if (i8) emit_rc = rot ? R4D_QA(true, true) : R4D_QA(false, true);
     else    emit_rc = rot ? R4D_QA(true, false) : R4D_QA(false, false);
 #undef R4D_QA
@@ -163,7 +186,8 @@ static int rad_quant_act_fp8(const RadArgs* a, RadStream stream, bool rot, bool 
     const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     if (xp < 0 || qp < 0 || sp < 0) return R4D_NO(RAD_E_STRIDE);
     const int e = quant_act_fp8_launch(r4d_addr(x), r4d_addr(q), r4d_addr(sc), (int)M, (int)K,
-                                       (int)xp, (int)qp, (int)sp, stream, rot, i8);
+                                       (int)xp, (int)qp, (int)sp, stream, rot, i8,
+                                       r4d_geti_or(a, "chain", 0) != 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

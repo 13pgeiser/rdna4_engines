@@ -1,0 +1,4 @@
+# Decode only the small combined MLA projection, which the absorbed attention reads in bf16.
+# Unmatched weights keep their stored encoding, including MXFP4 routed/shared experts
+# and the mixed FP8/BF16 trunk and MTP weights. Covers trunk and draft scope names.
+*attn_kv_b.weight                   cast dtype=bf16

@@ -36,6 +36,15 @@ extern "C" int rad_event_create_as(RadEvent* out, unsigned flags);
 /* The host has just written memory that a kernel issued after this call reads, with no host wait
  * in between (e.g. a host-site op's output read over the link by the next device op). */
 extern "C" void rad_dev_host_wrote(void);
+/* Chained launches: chainable rows run their chained forms (RadKernelChainFn), and the backend
+ * lets a chained kernel (named r4dchain*) wait in its prologue instead of behind the barrier bit.
+ * Only on the AQL backend, whose queues keep the completion counter. On by default where the
+ * model's plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays: the
+ * Gemma 4 31B and 26B) and that drafter decodes speculatively (rad_dev_chain_infer, from the
+ * engine before any row resolves). RADIANCE_CHAIN=0 turns them off and =1 on wherever the backend
+ * chains; `auto` is the default. */
+extern "C" int  rad_dev_chain_enabled(void);
+extern "C" void rad_dev_chain_infer(int pays);
 
 /* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all
  * three multiples of four. */

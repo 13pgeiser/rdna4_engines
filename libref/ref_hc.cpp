@@ -252,6 +252,59 @@ int ref_hc_write(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ hc_project */
+/* The control vector's projection: h[row, s*n + i] -= scale * (h . v) * v, for each of the hc
+ * streams s, on the rows whose `on` flag is 1.
+ *
+ * `v` is one layer's unit direction (the engine normalises the file's rows when it uploads them)
+ * and `scale` is the norm the file stored for that layer, so this is exactly llama.cpp's
+ * `--cvec-mode project` with its `llama_adapter_cvec` (the package's 02-cvec-projection-mode
+ * patch): the dot is taken per hyper-connection stream, as `mul_mat` over a [n, hc, tokens] view
+ * gives it, and not on the stream mean.
+ *
+ * A row whose flag is 0 is not touched: no read, no write, so an unprojected request's activations
+ * are the stock model's. (A deployment that merely *has* the table loaded is not bit-identical to
+ * one without it -- the table's VRAM moves the expert/KV plan -- but that is placement, not this
+ * op.)
+ *
+ * `on` is an int32 per row (core derive.cpp's `projection_on_rows`); the direction is f32. */
+int ref_hc_project(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor* h  = &a->t[0];
+    const RadTensor* v  = &a->t[1];
+    const RadTensor* on = &a->t[2];
+
+    const int64_t n  = p_int(a, "n", 0);
+    const int64_t hc = p_int(a, "hc", 0);
+    const float   sc = p_f32(a, "scale", 1.0f);
+    if (n <= 0 || hc <= 1) return RAD_E_SHAPE;
+    if (numel(v) < n) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+
+    const int64_t rows = rows_of(h, hn);
+    if (rows <= 0 || numel(on) < rows) return RAD_E_SHAPE;
+
+    /* Rows are independent: each dot is over one row's own streams. The parallel index is the
+     * (row, stream) pair, so one row's hc streams may run on different threads without sharing an
+     * accumulator. */
+    REF_PAR_FOR(rows * hc)
+    for (int64_t k = 0; k < rows * hc; ++k) {
+        const int64_t r = k / hc, c = k % hc;
+        if (ld_int(on->dtype, on->data, offlin(on, r)) == 0) continue;
+        const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
+        const int64_t vb = rowoff(v, 0, n), vl = laststride(v);
+        double acc = 0.0;
+        for (int64_t i = 0; i < n; ++i)
+            acc += (double) ldt(h, hb + (c * n + i) * hs) * (double) ldt(v, vb + i * vl);
+        const float g = (float) (acc * (double) sc);
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t j = hb + (c * n + i) * hs;
+            stt(h, j, ldt(h, j) - g * ldt(v, vb + i * vl));
+        }
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== mtp_enter
  *
  * The multi-token-prediction head's entry for a model whose residual stream is `hc` wide.

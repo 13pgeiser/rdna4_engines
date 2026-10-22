@@ -48,6 +48,19 @@ struct Deps {
      * (liveview.h), so the terminal and the web page agree. Absent, the dashboard shows only the
      * scheduler's metrics and omits the cards. */
     LiveView::Source  live;
+
+    /* The control vector (core/cvec.h), as the server sees it: whether the engine found one for
+     * this container, the runtime default for requests that name no choice, and the switch the
+     * admin endpoint flips. Absent (the function members null) means the feature does not exist on
+     * this deployment: a request that asks for it is refused by name, and the dashboard shows no
+     * control. Nothing here reloads the model. */
+    struct ControlVectorSwitch {
+        std::function<bool()>        available;
+        std::function<bool()>        get_default;
+        std::function<void(bool)>    set_default;
+        std::function<std::string()> json;
+    };
+    ControlVectorSwitch control_vector;
 };
 
 struct ServerOptions {
@@ -141,6 +154,12 @@ struct ServerOptions {
      * of an adapter requests still use drains it: RAD_OK with *in_flight > 0 (Engine::lora_unload). */
     std::function<int(const std::string&, const std::string&, std::string*)> lora_load;
     std::function<int(const std::string&, std::string*, int*)>              lora_unload;
+    /* A generator's adapters (Engine::gen_lora_acquire): the images and videos endpoints' `loras`
+     * and <lora:...> tags get a slot holding that combination, a hold on it and a note on what was
+     * left out; `gen_lora_names` is GET /v1/loras. Unset without adapters. */
+    std::function<int(const std::vector<std::pair<std::string, double>>&, int32_t*,
+                      std::shared_ptr<void>*, std::string*, std::string*)> gen_lora_acquire;
+    std::function<std::vector<std::string>()>                                gen_lora_names;
 
     std::string api_key;
     bool        cors = true;
@@ -181,6 +200,9 @@ public:
      * also takes a nonsense word it takes any word, and the result is empty. Used to refuse words
      * outside the set and for /server_info; called once, before run(). */
     std::vector<std::string> probe_reasoning_efforts();
+    /* The effort the template applies to a request that names none, found by the probe above as
+     * the one whose render is the same; "" when none matches or the probe found no set. */
+    const std::string& template_default_effort() const { return template_default_effort_; }
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
@@ -191,7 +213,14 @@ public:
     /* The admission ceiling as resolved: ServerOptions::queue_depth, or 8 x max_seqs for 0. */
     int64_t  queue_cap() const { return queue_depth_; }
 
+    /* Records how long bringup took, called by Engine::serve just before it starts listening
+     * (the same moment the startup watch ends). `begin_ns` is rad_mono_ns from the top of
+     * Engine::start(); 0 leaves the figure unset. run() blocks serving forever, so the value is
+     * handed in rather than taken inside it. */
+    void note_ready(uint64_t begin_ns);
+
 private:
+    std::string template_default_effort_;
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */
     struct RealtimeSession;    /* realtime.cpp */
@@ -230,6 +259,7 @@ private:
     void realtime_run(RealtimeSession& s, WsConn& ws);
     bool realtime_loop(RealtimeSession& s, WsConn& ws);
     HttpResponse handle_models(const HttpRequest& req);
+    HttpResponse handle_loras(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
     std::optional<HttpResponse> refuse_text(const std::string& peer,
                                             ApiShape shape = ApiShape::OpenAI);
@@ -299,6 +329,10 @@ private:
     HttpResponse handle_stats(const HttpRequest& req);
     HttpResponse handle_graph(const HttpRequest& req);
     HttpResponse handle_sessions(const HttpRequest& req);
+    /* The control vector's runtime switch (dashboard.cpp): GET reports the state, POST
+     * {"enabled": bool} sets the default for requests that name no choice. Guarded by the API key
+     * like every other route but the health probes and the page. */
+    HttpResponse handle_control_vector(const HttpRequest& req);
 
     HttpResponse error_response(const ApiError& e, const std::string& peer,
                                 ApiShape shape = ApiShape::OpenAI);
@@ -355,6 +389,9 @@ private:
     std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
     int64_t              started_at_ = 0;
+    /* Seconds from the top of Engine::start() to the moment the server began listening; 0 until
+     * note_ready(). */
+    int64_t              startup_s_ = 0;
 
     /* Sinks whose HTTP side is gone but whose engine side may still be mid-step. Held until the
      * scheduler reports the request terminal, because Request::sink is a raw pointer and freeing

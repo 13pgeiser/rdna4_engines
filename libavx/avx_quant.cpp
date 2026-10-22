@@ -537,8 +537,10 @@ AVX_KERNEL(gated_quant_fp8) {
  * is scaled by.
  *
  * Unlike had_quant_act_i8, 1/sqrt(g) is not applied here. <Hw, Ha> = g <w, a>, and the whole g is
- * divided out of the weight scale instead, where dividing a bf16 by a power of two is exact. */
-AVX_KERNEL(had_quant_act_fp8) {
+ * divided out of the weight scale instead, where dividing a bf16 by a power of two is exact.
+ *
+ * had_quant_act_i8g is the same at int8 codes (`top` 127), for the i8a8h weight. */
+static int had_quant_q8(const RadArgs* a, float top) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *q = &a->t[1], *s = &a->t[2];
     const int64_t n = p_int(a, "n", 0);
@@ -561,12 +563,20 @@ AVX_KERNEL(had_quant_act_fp8) {
         fwht_row(buf, n, g);
         for (int64_t gi = 0; gi < ngrp; ++gi) {
             float sc;
-            fp8_group(buf, out, gi * g, gi * g + g, &sc);
+            fp8_group(buf, out, gi * g, gi * g + g, &sc, top);
             stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
         }
         out_row(q, rowoff(q, r, n), n, out);
     }
     return RAD_OK;
+}
+
+AVX_KERNEL(had_quant_act_fp8) {
+    return had_quant_q8(a, 448.0f);
+}
+
+AVX_KERNEL(had_quant_act_i8g) {
+    return had_quant_q8(a, 127.0f);
 }
 
 /* ------------------------------------------------------------- givens_rotate */

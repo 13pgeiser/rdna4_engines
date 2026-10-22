@@ -315,7 +315,78 @@ typedef struct RadGenBatch {
     int32_t        dec_lane;
     int32_t        dec_height, dec_width;    /* pixels */
     int32_t        dec_preview;              /* the lane's preview latent, not its state */
+
+    /* ---- the joint layout (RAD_GEN_LAYOUT_JOINT_STEP)
+     * COND: `branch` is 0 for the prompt and 1 for the negative prompt, and `n_lane` / `lane_h` /
+     * `lane` name every lane the conditioning's images run in; the plugin keeps the
+     * conditioning's row r for lane l at its own row (2 l + branch) cond_rows + r. The prompt's
+     * last `n_pad` tokens are the padding, and `valid_cu` is {0, the tokens before it}. `rope_f`
+     * is the conditioning's positions, [4, rows] f32 component-major.
+     * DENOISE: each entry's rows are its conditioning and then its image's latent tokens, so
+     * `cu_seqlens` bounds both together. `src` [n_tok] names a row's source: >= 0 the plugin's
+     * conditioning row (as above), < 0 the image row -(1 + k) of the compact image order, in
+     * which `img_cu` [n_seq + 1] bounds each entry's image and `img_rows` [n_img] is each image
+     * row's place in the pass. `mode_cu` [3 n_seq + 1] cuts each entry into its text (padding
+     * included), its reference pictures and its image: entry e's text is rows [mode_cu[3e],
+     * mode_cu[3e + 1]), its pictures [mode_cu[3e + 1], mode_cu[3e + 2]), its image up to
+     * mode_cu[3e + 3]. `rope_f` is [4, n_tok]. Everything sigma, cfg, pair, lane, flags and seed
+     * say is per entry as for JOINT_GRID, and the lane ops read `img_cu`. */
+    int32_t        branch;
+    int32_t        n_pad;
+    const int32_t* valid_cu;
+    int64_t        n_img;
+    const int32_t* img_cu;
+    const int32_t* img_rows;
+    const int32_t* mode_cu;
+    const float*   rope_f;
+    /* DENOISE: the rows again in mode-major order -- every entry's text, then every entry's
+     * pictures, then every entry's image (the compact image order) -- for a model whose early
+     * blocks run each mode on its own. `mode_rows` [n_tok] is each one's place in the pass,
+     * `mode_src` [n_tok] its source as `src` names it, and `mode_rope_f` holds the positions mode
+     * by mode, mode m's a dense [4, n_m] block at 4 times its start;
+     * `n_mode_h` [3] counts each mode's rows, so mode m starts at the sum of the counts before
+     * it, and `mode_ccu` [3, n_seq + 1] bounds each entry's rows of each mode from that start
+     * (mode m's cu_seqlens at mode_ccu + m (n_seq + 1), each beginning at 0). */
+    const int32_t* mode_rows;
+    const int32_t* mode_src;
+    const int32_t* mode_ccu;
+    const int64_t* n_mode_h;
+    const float*   mode_rope_f;
+
+    /* ---- appended in ABI 25 (Anima, SDXL) */
+    /* COND, for a generator that reads its prompt through a second tokenizer
+     * (RadGeneratorDecl::aux_tokens): the user's prompt as that tokenizer encodes it, `n_aux` ids
+     * on the device, and `aux_cu` {0, n_aux} on the device. 0 and null otherwise. */
+    int64_t        n_aux;
+    const int32_t* aux_ids;
+    const int32_t* aux_cu;
+    /* ---- a discrete-time denoiser (RadGeneratorDecl::train_steps), DENOISE, one value per
+     * entry: the schedule's sigma before `sigma` (0 on an image's first step), `sigma` on the
+     * model's trained clock (the nearest of its timesteps, as ComfyUI conditions it), the
+     * request's sampler (RAD_GEN_SAMPLER_*) and the image's step, from 0. */
+    const float*   sigma_prev;
+    const float*   timestep;
+    const int32_t* sampler;
+    const int32_t* step;
+    /* DENOISE: [n_seq, 2] each entry's image height and width in pixels, f32 (a model
+     * conditioned on its size); `entry_h` [n_seq, 4] the same entries on the host: the
+     * conditioning's rows (JOINT_STEP), the height and width in pixels, and the branch (0 the
+     * prompt, 1 the negative prompt), for a plugin whose ops take an image's geometry from their
+     * operands and so issue each entry on its own. */
+    const float*   size_px;
+    const int32_t* entry_h;
+    /* COND: the pass's token ids on the host ([n_tok]), for a plugin whose issue depends on
+     * where a window's end-of-text marker sits. */
+    const int32_t* tokens_h;
+    /* ---- appended in ABI 26 (Krea 2's rebalance) */
+    /* COND: the request's RAD_GEN_COND_* options, 0 for none. */
+    int32_t        cond_opts;
 } RadGenBatch;
+
+/* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
+enum {
+    RAD_GEN_COND_REBALANCE = 1   /* Krea 2: the text taps at the plugin's fixed rebalance gains */
+};
 
 /* An entry's flags on a DENOISE pass. */
 enum {
@@ -461,7 +532,8 @@ typedef struct RadVideoGenBatch {
     /* f32 [6]: the video's timestep, sigma and next sigma, then the soundtrack's. */
     const float*    sched;
     const float*    pos;           /* f32 [3, n_tok]: RAD_VPOS_STEP */
-    /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first. */
+    /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first (VSTEP, VUPSCALE and
+     * VDECODE passes; a decoder that denoises draws from it). */
     const uint32_t* seed;
 
     /* ---- VDECODE */
@@ -530,6 +602,23 @@ typedef struct RadVideoGenBatch {
 
     /* ---- The sampler that advances the latents: RAD_SAMPLER_* above. Trailing since ABI 24. */
     int32_t         sampler;
+    /* ---- appended in ABI 24 */
+    /* VCOND with a negative prompt: `n_neg` of the pass's tokens, after the prompt's. */
+    int32_t         n_neg;
+    /* The request's guidance, f32 [8] host: the video's scale, its spatio-temporal scale, its
+     * modality scale and its rescale, then the soundtrack's four; a model's own defaults where
+     * the request named none. */
+    const float*    guidance_h;
+    /* VCOND with a first frame (RadVideoGenDecl::image_cond): `image` [height, width, 3] bf16 in
+     * [-1, 1], device; null without one. Every later pass carries `has_image` 1 for such a
+     * request. */
+    const uint16_t* image;
+    int32_t         has_image;
+    /* guidance_h on the device, f32 [8], for ops that read the terms. */
+    const float*    guidance;
+    /* VDECODE: the decoder the request named (RadVideoGenDecl::decoders), its index; 0 the
+     * default. */
+    int32_t         decoder;
 } RadVideoGenBatch;
 
 /* RadVideoGenBatch::enc_kind: which reference media an encode pass carries. A plugin's latent
@@ -556,7 +645,11 @@ enum {
      * first three are also the source volume; (frames, H, W) the target volume; then both in
      * patches, (frames, h / patch, w / patch) and (frames, H / patch, W / patch). */
     RAD_VGEOM_UP_SRC = 16, RAD_VGEOM_UP_DST = 21, RAD_VGEOM_UP_PSRC = 24, RAD_VGEOM_UP_PDST = 27,
-    RAD_VGEOM_N = 32
+    /* The soundtrack's latents as a volume of single latents, (n_audio, 1, 1); and the video's
+     * rows cut at its first latent frame, {0, that frame's patches, every patch} (a first frame
+     * a model conditions on at its own timestep). */
+    RAD_VGEOM_AUDIO_VOL = 32, RAD_VGEOM_FIRST_CU = 35,
+    RAD_VGEOM_N = 40
 };
 
 /* ================================================================== operands */

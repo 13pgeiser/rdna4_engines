@@ -42,6 +42,7 @@
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -95,12 +96,15 @@ __device__ __forceinline__ v8i mmai(v2i a, v2i b, v8i c) {
 // limit, so the host checks WV*SK against the same expression.
 #define R4D_W4A8_BOUNDS(NPW) ((NPW) >= 8 ? 256 : ((NPW) >= 4 ? 512 : 1024))
 
-template <int MT, int NPW, bool NT, bool ASYM>
-__global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_kernel(
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); every block runs
+// to the end. The two kernels below are the plain form and the chained one (r4dchain*).
+template <int MT, int NPW, bool NT, bool ASYM, bool CHAIN>
+__device__ __forceinline__ void r4d_gemm_w4a8_nt_m64_body(
     const signed char* __restrict__ A, const float* __restrict__ Ascale,
     const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
     const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C,
     int M, int K, int N, int WV, int SK) {
+  if (CHAIN) r4d_chain_wait();
   extern __shared__ float red[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -252,11 +256,25 @@ __global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_ker
       if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)(v * Ascale[m] * 0.0625f);
     }
   }
+  if (CHAIN) r4d_chain_done();
 }
+
+#define R4D_W4A8_PARAMS const signed char* __restrict__ A, const float* __restrict__ Ascale, \
+    const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,                        \
+    const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK
+template <int MT, int NPW, bool NT, bool ASYM>
+__global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_kernel(R4D_W4A8_PARAMS) {
+  r4d_gemm_w4a8_nt_m64_body<MT, NPW, NT, ASYM, false>(A, Ascale, Wq, Ws, Asum, C, M, K, N, WV, SK);
+}
+template <int MT, int NPW, bool NT, bool ASYM>
+__global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4dchain_gemm_w4a8_nt_m64(R4D_W4A8_PARAMS) {
+  r4d_gemm_w4a8_nt_m64_body<MT, NPW, NT, ASYM, true>(A, Ascale, Wq, Ws, Asum, C, M, K, N, WV, SK);
+}
+#undef R4D_W4A8_PARAMS
 
 static void r4d_gemm_w4a8_impl(long a, long ascale, long wq, long ws, long asum, long c,
                                int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
-                               bool asym, long stream) {
+                               bool asym, long stream, bool chain = false) {
   if (M < 1 || M > R4D_GEMM_W4A8_MAX_M)
     throw std::runtime_error("r4d gemm_w4a8_nt_m64: M out of range");
   if (N % 16) throw std::runtime_error("r4d gemm_w4a8_nt_m64: N must be a multiple of 16");
@@ -279,8 +297,11 @@ static void r4d_gemm_w4a8_impl(long a, long ascale, long wq, long ws, long asum,
   auto Up = (const float*)asum;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(MT, NP, TT, AS) hipLaunchKernelGGL((r4d_gemm_w4a8_nt_m64_kernel<MT, NP, TT, AS>), \
-    grid, block, smem, st, Ap, Sp, Wp, Zp, Up, Cp, M, K, N, WV, SK)
+#define LAUNCH(MT, NP, TT, AS) do { if (chain) \
+    hipLaunchKernelGGL((r4dchain_gemm_w4a8_nt_m64<MT, NP, TT, AS>), \
+    grid, block, smem, st, Ap, Sp, Wp, Zp, Up, Cp, M, K, N, WV, SK); else \
+    hipLaunchKernelGGL((r4d_gemm_w4a8_nt_m64_kernel<MT, NP, TT, AS>), \
+    grid, block, smem, st, Ap, Sp, Wp, Zp, Up, Cp, M, K, N, WV, SK); } while (0)
 #define LAUNCH_MB(NP, TT, AS) switch (MB) { \
     case 1: LAUNCH(1, NP, TT, AS); break; \
     case 2: LAUNCH(2, NP, TT, AS); break; \
@@ -326,6 +347,41 @@ int r4d_gemm_w4a8_nt_m64_group(void) { return R4D_GEMM_W4A8_GROUP; }
 // The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 /* ------------------------------------------------------------------ int8-activation grids */
 
+/* The multi-user verify heights (33 to 64 rows: five to eight users of a DFlash2 verify, 8 rows a
+ * user). The law's point there covers every row tile in one block at one N tile a wave (mb = all,
+ * npw = 1), which re-reads the activation once a 16-column tile and holds MT accumulators a wave;
+ * on 4x R9700 (one card, the 31B's per-card trunk shapes, every point byte-identical to the law's)
+ * it ran a layer's four GEMMs in 259 us at 64 rows against 157 us here:
+ *
+ *                 q|k|v 3584x5376   o_proj 5376x2048   gate_up 10752x5376   down 5376x5376
+ *   40 rows  law  46.4              27.4               67.1                 36.4
+ *            here 22.0 (mb1 npw2)   21.1 (mb1 npw2)    58.8 (mb1 npw4)      30.8 (mb1 npw2)
+ *   48 rows  law  31.4              30.4               71.9                 42.4
+ *            here 22.2              21.2               58.9                 31.6
+ *   56 rows  law  56.8              35.0               94.2                 62.4
+ *            here 24.0 (mb1 npw2)   22.3 (mb2 npw1)    69.0 (mb2 npw4)      43.0 (mb1 npw2)
+ *   64 rows  law  58.6              37.3               97.6                 65.2
+ *            here 24.7              22.7               69.6                 44.0
+ *
+ * Neither axis moves a byte: the split stays the law's (a point whose wider block cannot hold it
+ * is not taken, since a smaller split would regroup the K partials), and every output element
+ * keeps its accumulation order. Only where neither `mb` nor `npw` was tuned. */
+static void multi_user_point(const RadArgs* a, long long M, long long N, long long K, Cfg* c) {
+    if (M <= 32 || M > 64) return;
+    R4dGemmCfg cv;
+    r4d_cfg_gemm(a, &cv);
+    if (cv.mb > 0 || cv.npw > 1) return;
+    int mb, npw;
+    if (M <= 48)          { mb = 1; npw = N >= 8192 ? 4 : 2; }
+    else if (N >= 8192)   { mb = 2; npw = 4; }
+    else if (K <= 2048)   { mb = 2; npw = 1; }
+    else                  { mb = 1; npw = 2; }
+    if (c->wv * c->sk * WAVE32 > block_bound(BR_NPW, mb, npw)) return;
+    if ((size_t)c->wv * npw * c->sk * 256 * sizeof(float) > 64 * 1024) return;
+    c->mb = mb;
+    c->npw = npw;
+}
+
 /* The asymmetric grid is selected by `dtype`, not by the presence of a_sum (see is_asym). */
 
 extern "C" int r4d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s) {
@@ -339,21 +395,24 @@ extern "C" int r4d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s) {
     Cfg c;
     rc = cfg_for(a, g.K, g.M, group, BR_NPW, &c);
     if (rc != RAD_OK) return rc;
+    multi_user_point(a, g.M, g.N, g.K, &c);
 
+    /* the engine's chained launch (RadKernelChainFn), at decode heights only */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && g.M <= 64;
     if (is_asym(a)) {
         if (!g.asum) return R4D_NO(RAD_E_INVAL);      /* the entry point throws "asum is required" */
         R4D_TRY("gemm_w4a8_asym_nt_m64",
-            r4d_gemm_w4a8_asym_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                                      r4d_addr(g.bscale), r4d_addr(g.asum), r4d_addr(g.y),
-                                      (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
-                                      c.nt, (long)(uintptr_t)s));
+            r4d_gemm_w4a8_impl(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
+                               r4d_addr(g.bscale), r4d_addr(g.asum), r4d_addr(g.y),
+                               (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
+                               c.nt, true, (long)(uintptr_t)s, chain));
         return RAD_OK;
     }
     R4D_TRY("gemm_w4a8_nt_m64",
-        r4d_gemm_w4a8_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                             r4d_addr(g.bscale), r4d_addr(g.y),
-                             (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
-                             (long)(uintptr_t)s));
+        r4d_gemm_w4a8_impl(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
+                           r4d_addr(g.bscale), 0, r4d_addr(g.y),
+                           (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
+                           false, (long)(uintptr_t)s, chain));
     return RAD_OK;
 }
 

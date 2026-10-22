@@ -492,7 +492,8 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
             if (ts && cb_joined(wse[(size_t)e])) return RAD_E_DTYPE;
         }
         mw[(size_t)e] = as_mat(&we[(size_t)e], k);
-        SW[(size_t)e] = make_scales(quant && ts ? &wse[(size_t)e] : nullptr, n, k, false);
+        SW[(size_t)e] = make_scales(quant && ts ? &wse[(size_t)e] : nullptr, n, k,
+                                    we[(size_t)e].dtype == RAD_FP4E2M1);
     }
 
     const int64_t fy = N / parts;

@@ -107,6 +107,12 @@ rad-convert [options] <input> -o <model.rad>
                        else every library found
       --tokenizer F    tokenizer.json; its declared chain is baked instead of being
                        reconstructed from a pre-tokenizer name
+      --tokenizer2 F   a second tokenizer.json, baked as the container's second vocab: a
+                       generator that reads its prompt through two tokenizers
+      --add FILE       one more .safetensors file merged in, its tensor names kept (a release
+                       shipped as separate single files). Repeatable
+      --config DIR     config.json, generation_config.json and tokenizer.json from DIR, for a
+                       single-file checkpoint that ships none
       --imatrix F      llama.cpp imatrix: expert profile, column importances, error weighting
       --set K=V        a metadata key, seen by declare and written into the container. Repeatable
       --max-tok N      the max_tok declare is run at (default 8192)
@@ -204,11 +210,11 @@ group=32 scale=u6 scale2=f16 group2=256`; a ternary BitNet weight is `table=tern
 A container can hold only what some kernel reads. The converter checks every planned encoding
 against the layout hooks of the kernels declare resolved and refuses one that no kernel accepts,
 so a grid libquant can write is usable only once a kernel library takes it. libr4d reads the plain
-floats; block-scaled fp8 and fp8 rows; int8 block rows (the W8A8 trunk and lm_head); the routed
-experts as fp8, int4 (`i4*bf16[1x128]/fwht128`) or the `w4nl`/`w5nl` codebooks under E4M3 scales
-([MOE-W4.md](MOE-W4.md)); the dense w4, w8 and mxfp4 GEMM rows; and the 2-bit draft head. Every
-encoding also decodes through the core, which the converter's error report, the oracle and the
-quantisers' tests use.
+floats; block-scaled fp8 and fp8 rows; int8 block rows (the W8A8 trunk and lm_head), plain or
+rotated (`i8*bf16[1x128]/fwht128`); the routed experts as fp8, int4 (`i4*bf16[1x128]/fwht128`) or
+the `w4nl`/`w5nl` codebooks under E4M3 scales ([MOE-W4.md](MOE-W4.md)); the dense w4, w8 and mxfp4
+GEMM rows; and the 2-bit draft head. Every encoding also decodes through the core, which the
+converter's error report, the oracle and the quantisers' tests use.
 
 The recipes for the containers this tree serves are in `data/recipes/`. `scripts/convfn.sh` and
 `scripts/convdspark.sh` are the reference conversions.
@@ -268,6 +274,12 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   refuses a `--max-tok` and context pair whose score plane would pass 2 GiB.
 - `--max-spec`: a container carries what the model can serve, so a draft head is written even when
   this run would not draft. `0` leaves it out.
+- `--add`, `--config` and `--tokenizer2` read a release that ships as ComfyUI's single files
+  (Anima: a diffusion model, a text encoder and a VAE in `split_files/`): the files merge into one
+  namespace with their own tensor names (a name in two files is refused), the text encoder's
+  repository supplies the config and tokenizer the plugin is sized by, and a second tokenizer.json
+  (with its `tokenizer_config.json` beside it) becomes the container's second vocab section, which
+  a generator declaring `aux_tokens` reads its prompt through. GUIDE §3.2 has the Anima command.
 - `--draft-model` merges a drafter here; the engine refuses the flag. The drafter's tensors go in
   under a `draft.` prefix and its config under `draft.` keys. It has no embedding and no `lm_head`
   of its own; it uses the target's.
@@ -278,7 +290,11 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   it in. A container that stores a weight rotated records the rotated input, and a recipe that
   rotates the same weight reads it as it is. A weight with no file there is quantised uncalibrated,
   and the converter says so; `awq`, `autoround` and `paroquant` use the imatrix's diagonal instead
-  when `--imatrix` gives one. The three-step calibrated conversion is in [MOE-W4.md](MOE-W4.md).
+  when `--imatrix` gives one. Under tensor parallelism a column-split linear (an attention output or
+  down projection) sees only its rank's columns, so a tap may write each rank's Gram as
+  `gram.r<rank>.<stem>.part.bin`: with no whole file, libquant places the parts on the diagonal in
+  rank order (the cross-rank products, never formed, left zero). They must cover K and be in the
+  model's own domain. The three-step calibrated conversion is in [MOE-W4.md](MOE-W4.md).
 - `autoround` and `paroquant` are slow. AutoRound's 200 default steps each cost N·K² multiply-adds;
   on a 16-core Zen 5 at about 2.5 TFLOP/s that is minutes for a 17408-wide down projection and
   most of a working day for a 27B dense model. `iters=50` takes a quarter of the time.
@@ -777,6 +793,10 @@ The mode changes these settings itself:
 
 Everything else comes from the command line: run every candidate with the same flags, and the
 reference with the exact wire and a bf16 KV cache.
+
+The control vector's switch is per request, and KLD mode serves none, so a deployment that has one
+loaded is scored with it **off**. `--control-vector on` starts the deployment default on, which is how
+the projection itself is scored (the switch still decides per request, and a request's false wins).
 
 `--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be

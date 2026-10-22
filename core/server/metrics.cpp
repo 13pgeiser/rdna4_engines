@@ -140,6 +140,10 @@ void Metrics::sample(const SchedMetrics& m) {
     g_prefill_tps_.set(m.prefill_tps);
     g_decode_tps_.set(m.decode_tps);
     g_draft_accept_.set(m.draft_acceptance);
+    /* Nanoseconds in the scheduler, seconds on the wire: the base unit Prometheus expects, and
+     * what radiance:engine_step_seconds_* already use. */
+    g_step_best_.set((double)m.step_ns_decode_best / 1e9);
+    g_step_recent_.set((double)m.step_ns_decode_recent / 1e9);
     const int seen = std::max(0, std::min(m.draft_depth_seen, (int)MAX_DRAFT_POS));
     for (int j = 0; j < seen; ++j) {
         const int64_t r = m.draft_pos_reached[j];
@@ -192,6 +196,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_cut_no_snapshot_.advance_to(m.hit_cut_no_snapshot);
     c_cut_window_.advance_to(m.hit_cut_window);
     c_cut_adopt_.advance_to(m.hit_cut_adopt);
+    c_cut_resumed_below_.advance_to(m.hit_cut_resumed_below);
+    c_restore_cuts_.advance_to(m.prefix_restore_cuts);
     c_cut_tokens_.advance_to(m.hit_cut_tokens);
     g_linear_hit_.set(m.linear_hit_rate);
 }
@@ -324,6 +330,26 @@ std::string Metrics::render() const {
             "Prefill throughput over the scheduler's recent window.", L, g_prefill_tps_.get());
     w.gauge("radiance:decode_tokens_per_second",
             "Decode throughput over the scheduler's recent window.", L, g_decode_tps_.get());
+    /* THE DECODE FLOOR, the two figures the dashboard's Decode Step tile shows. They were on
+     * /stats only, and /stats is documented as not a stable API -- so the one figure worth
+     * comparing across restarts was reachable only from the surface automation is told not to
+     * use. Omitted until measured: a floor of 0 seconds is not an unmeasured floor, it is an
+     * infinitely fast one, and a scrape would plot it as a record. Both reset on restart, so a
+     * freshly started server simply has no floor to report yet. */
+    if (g_step_best_.get() > 0)
+        w.gauge("radiance:decode_step_seconds_best",
+                "Fastest single-sequence decode step window this process has run, in seconds "
+                "PER STEP. A mean over 32 consecutive single-stream steps, not a stopwatch "
+                "reading. Not seconds per token: with speculation a step can emit several "
+                "tokens, so per-token time is this divided by (1 + accepted per step), "
+                "not by the accepted figure alone. Resets on restart.", L, g_step_best_.get());
+    if (g_step_recent_.get() > 0)
+        w.gauge("radiance:decode_step_seconds_recent",
+                "Most recent single-sequence decode step window, in seconds PER STEP (see "
+                "_best: not a token rate). The gap "
+                "to _best tracks what else the machine is doing, not wear; see docs/GUIDE.md. "
+                "Freezes while the lane is idle, because no window is completing.",
+                L, g_step_recent_.get());
     w.counter("radiance:engine_steps_total",
               "Scheduler steps executed. One forward pass of the model, plus whatever draft "
               "rounds followed it; with speculation a step emits more than one token.",
@@ -425,13 +451,20 @@ std::string Metrics::render() const {
                   "Checkpoints not written because every snapshot slot was in use by a restore "
                   "in the same step.", L, c_ckpt_refused_.get());
         w.help("radiance:prefix_hit_cuts_total",
-               "Admissions whose prefix hit reused nothing, by reason: no snapshot at or below "
-               "the hit, a windowed group no window snapshot covers, or blocks that could not be "
-               "adopted.", "counter");
+               "Admissions whose prefix hit was cut, by reason: reused nothing for want of a "
+               "snapshot at or below the hit, for a windowed group no window snapshot covers, or "
+               "for blocks that could not be adopted; or resumed at a snapshot more than one "
+               "checkpoint interval below the hit.", "counter");
         labelled("radiance:prefix_hit_cuts_total", "reason", "no_snapshot",
                  c_cut_no_snapshot_.get());
         labelled("radiance:prefix_hit_cuts_total", "reason", "windowed_group", c_cut_window_.get());
         labelled("radiance:prefix_hit_cuts_total", "reason", "adopt_failed", c_cut_adopt_.get());
+        labelled("radiance:prefix_hit_cuts_total", "reason", "resumed_below",
+                 c_cut_resumed_below_.get());
+        w.counter("radiance:prefix_restore_cuts_total",
+                  "Restores from the host tier the pool could not hold whole, even after giving "
+                  "up the VRAM copies of other stored conversations; each came back to a "
+                  "snapshot short of its end.", L, c_restore_cuts_.get());
         w.counter("radiance:prefix_hit_cut_tokens_total",
                   "Prompt tokens the attention cache held and admission computed again, because "
                   "the hit resumed at a snapshot below it or reused nothing.", L,

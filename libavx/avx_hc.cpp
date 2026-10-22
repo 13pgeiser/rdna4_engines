@@ -331,6 +331,64 @@ AVX_KERNEL(hc_write) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ hc_project */
+/* The control vector's projection (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the
+ * hc streams of a row whose switch is on. v is f32, the stream may be bf16/f16/f32; a row with a
+ * zero switch is skipped without a read, so an unprojected request is byte-identical to one on a
+ * deployment with no vector. */
+AVX_KERNEL(hc_project) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor* h  = &a->t[0];
+    const RadTensor* v  = &a->t[1];
+    const RadTensor* on = &a->t[2];
+
+    const int64_t n  = p_int(a, "n", 0);
+    const int64_t hc = p_int(a, "hc", 0);
+    const float   sc = p_f32(a, "scale", 1.0f);
+    if (n <= 0 || hc <= 1 || numel(v) < n) return RAD_E_SHAPE;
+    const int64_t hn = hc * n;
+    const int64_t rows = numel(h) / hn;
+    if (rows <= 0 || numel(on) < rows) return RAD_E_SHAPE;
+
+    const int64_t vb = rowoff(v, 0, n);
+    float* vbuf = scratch_f32_c((size_t) n);
+    const float* vec = in_row(v, vb, n, vbuf);
+
+    AVX_PARALLEL_FOR_IF(rows * hn >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows * hc; ++k) {
+        const int64_t r = k / hc, c = k % hc;
+        if (ldi(on, offlin(on, r)) == 0) continue;
+        const int64_t hb = rowoff(h, r, hn), hs = laststride(h);
+        const int64_t base = hb + c * n;
+        float* hv = scratch_f32((size_t) n);
+        const float* row = in_row(h, base, n, hv);
+        if (hs != 1) {
+            float dot = 0.0f;
+            for (int64_t i = 0; i < n; ++i) dot += row[i] * vec[i];
+            const float g = dot * sc;
+            for (int64_t i = 0; i < n; ++i)
+                stt(h, base + i * hs, row[i] - g * vec[i]);
+            continue;
+        }
+        if (row != hv) std::memcpy(hv, row, (size_t) n * sizeof(float));
+        /* The dot reads the row and the direction; the update then rewrites the same elements, so
+         * the direction's own copy is not needed (it is never written). */
+        vf acc = vf_zero();
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N)
+            acc = vf_fma(vf_loadu(hv + i), vf_loadu(vec + i), acc);
+        float dot = vf_hsum(acc);
+        for (; i < n; ++i) dot += hv[i] * vec[i];
+        const vf vg = vf_set1(dot * sc);
+        i = 0;
+        for (; i + VF_N <= n; i += VF_N)
+            vf_storeu(hv + i, vf_sub(vf_loadu(hv + i), vf_mul(vg, vf_loadu(vec + i))));
+        for (; i < n; ++i) hv[i] -= (dot * sc) * vec[i];
+        out_row(h, base, n, hv);
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== mtp_enter
  *
  * Entry of the multi-token-prediction head for a model with an `hc`-wide residual stream.

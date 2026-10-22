@@ -113,8 +113,15 @@ int Ctx::prepare() {
     RAD_TRY(bind_routing());
     RAD_TRY(bind_profiling());
     /* Recorded passes need a recording backend, and are off whenever every issue must be seen:
-     * per-op profile, oracle. */
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_;
+     * per-op profile, oracle, and a calibration tap. A `gram_accum` sums across passes while its
+     * plugin counts the rows it has summed in step and writes the Grams once a token target is
+     * reached; a played pass reissues the accumulation without calling step, so the files would
+     * hold more rows than their header says and be written late. */
+    const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
+                                  [](const OpInfo& o) { return o.op == "gram_accum"; });
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps;
+    if (taps && record_passes_ && tape_supported() && rank_ == 0)
+        RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;
 }
 
@@ -264,7 +271,7 @@ int Ctx::bind_weights() {
     Program& P = *program_;
     w_tmpl_.assign(P.weights.size(), RadTensor{});
     w_bits_.assign(P.weights.size(), 0);
-    waited_gen_.assign(P.weights.size(), UINT32_MAX);
+    for (auto& g : waited_gen_) g.assign(P.weights.size(), UINT32_MAX);
     w_direct_.assign(P.weights.size(), 0);
 
     for (size_t i = 1; i < P.weights.size(); ++i) {
@@ -457,6 +464,7 @@ int Ctx::check_domain_layout(rad_op h, int domain, std::string* why) const {
             const int st = ki->layout ? ki->layout(ip.args.p, ip.args.n_p, opd, &w.enc, w.sel, t,
                                                    w.n_sel, &L)
                                       : RAD_E_UNSUPPORTED;
+            if (st == RAD_LAYOUT_ANY) continue;   /* reads the bytes as they lie (rad_abi.h) */
             const std::string tag = st == RAD_OK ? (L.tag && *L.tag ? L.tag : ki->name)
                                                  : std::string();
             if (st >= 0 || st == RAD_E_UNSUPPORTED) {

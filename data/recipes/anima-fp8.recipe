@@ -1,0 +1,31 @@
+# anima-fp8.recipe -- Anima (Base, Aesthetic or Turbo) with block-scaled fp8 linears.
+#
+#   rad-convert <Anima>/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors \
+#       --add <Anima>/split_files/text_encoders/qwen_3_06b_base.safetensors \
+#       --add <Anima>/split_files/vae/qwen_image_vae.safetensors \
+#       --config <Qwen/Qwen3-0.6B-Base> --tokenizer2 <ComfyUI>/comfy/text_encoders/t5_tokenizer/tokenizer.json \
+#       --arch anima --set anima.variant=aesthetic \
+#       --recipe data/recipes/anima-fp8.recipe -o anima-aesthetic-fp8.rad
+#
+# Every linear of the text encoder and of the DiT's 28 blocks (self- and cross-attention, MLP)
+# becomes E4M3 codes with a bf16 scale a 128 x 128 block, read by the fp8a8 GEMMs over activations
+# quantised the same way. The LLM adapter, the embeddings, the modulation linears, the final layer
+# and the VAE stay bf16. The patch embedding (without its padding-mask columns) and the VAE's causal
+# convolutions (at their last temporal tap) are computed at convert and stored bf16.
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.cross_q.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.cross_k.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.cross_v.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.cross_output.weight        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.mlp_layer1.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.mlp_layer2.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+dit.x_embed.weight                   cast dtype=bf16
+decoder.*                            cast dtype=bf16
+conv2.*                              cast dtype=bf16

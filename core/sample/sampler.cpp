@@ -145,6 +145,14 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     const int64_t rows = rows_for(cfg_);
     const int64_t nv   = cfg_.n_vocab_local;
+    if (vocab_parallel() && cfg_.max_candidates * cfg_.world_size > kSampleMergeCandidates) {
+        const int64_t cap = kSampleMergeCandidates / cfg_.world_size;
+        RAD_INFO("sampler: candidate width %lld a rank -> %lld: the merge of %d ranks' candidate "
+                 "sets holds %lld pairs at most (top_k above %lld is refused per request)",
+                 (long long)cfg_.max_candidates, (long long)cap, cfg_.world_size,
+                 (long long)kSampleMergeCandidates, (long long)cap);
+        cfg_.max_candidates = cap;
+    }
     const int64_t ncand = cfg_.max_candidates;
 
     /* ---------------------------------------------------------- buffers */
@@ -430,8 +438,8 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     };
     /* Under a split vocabulary, or when it asks for logprobs, a greedy request is staged as a
      * top-1 chain row (see build_step), so it needs the chain ops (temperature, top-k, pick)
-     * rather than the argmax. run() issues the temperature stage for any chain row, even though
-     * it leaves a temperature-0 row unchanged. */
+     * rather than the argmax. run() issues the temperature stage only when some chain row has a
+     * temperature other than 0 or 1, the two the stage leaves as they are. */
     const bool lp = sp.n_probs >= 0;
     const bool greedy_chain = sp.greedy() && (vocab_parallel() || lp);
     const char* missing = nullptr;
@@ -897,7 +905,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
 
     bool any_mask = false, any_greedy = false, any_chain = false;
     bool any_penalty = false, any_dry = false, any_xtc = false;
-    bool any_topp = false, any_minp = false, any_typ = false;
+    bool any_topp = false, any_minp = false, any_typ = false, any_temp = false;
     for (int64_t i = 0; i < n_seq_; ++i) {
         const DeviceSampleParams& p = cur_stage_[i];
         any_mask    |= (p.flags & RAD_SP_MASK)    != 0;
@@ -907,6 +915,8 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         if (p.flags & RAD_SP_GREEDY) any_greedy = true;
         else {
             any_chain = true;
+            /* sample_temp leaves a row at temperature <= 0 or exactly 1 as it is */
+            any_temp |= p.temp > 0.0f && p.temp != 1.0f;
             any_topp |= p.top_p < 1.0f;
             any_minp |= p.min_p > 0.0f;
             any_typ  |= p.typical_p < 1.0f;
@@ -985,7 +995,10 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
 
     if (!any_chain) return RAD_OK;
 
-    RAD_TRY(issue(op_temp_, { o_logits, o_params }));
+    /* Only where some row is scaled: a greedy request under a split vocabulary (temperature 0)
+     * and a plain T=1 one are left alone, and the launch over the whole vocabulary still costs
+     * ~10 us a step (4x R9700). */
+    if (any_temp) RAD_TRY(issue(op_temp_, { o_logits, o_params }));
     if (any_mask && !any_greedy)
         RAD_TRY(issue(op_mask_, { o_logits, o_params, o_mask }));
 

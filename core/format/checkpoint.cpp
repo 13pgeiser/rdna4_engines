@@ -56,10 +56,36 @@ void MetaOwn::finish() {
  * path, and typed fields are read from `text_config.X`, falling back to `X`, so a plugin finds
  * `vision_config.depth` under that name either way.
  */
+/* An array's scalars appended to `s` space-separated, nested arrays flattened row-major (a
+ * vocoder's per-resnet dilations, [[1, 3, 5], [1, 3, 5]], read as "1 3 5 1 3 5"); false for an
+ * array holding an object or a null. */
+static bool join_scalars(const nlohmann::json& v, std::string* s) {
+    for (const auto& e : v) {
+        if (e.is_array()) {
+            if (!join_scalars(e, s)) return false;
+            continue;
+        }
+        if (!s->empty()) *s += ' ';
+        if (e.is_number_integer()) *s += fmt("%lld", (long long)e.get<int64_t>());
+        else if (e.is_number())    *s += fmt("%.17g", e.get<double>());
+        else if (e.is_string())    *s += e.get<std::string>();
+        else if (e.is_boolean())   *s += e.get<bool>() ? "1" : "0";
+        else return false;
+    }
+    return true;
+}
+
 static void flatten_json(const nlohmann::json& j, const std::string& prefix, MetaOwn* out) {
     for (auto it = j.begin(); it != j.end(); ++it) {
         const std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
         const nlohmann::json& v = it.value();
+        /* Retain otherwise invisible Quark weight overrides so import validation can reject
+         * null/empty schemes instead of accidentally inheriting global MXFP4 packing. */
+        if (key.rfind("quantization_config.layer_quant_config.", 0) == 0 &&
+            it.key() == "weight" && (v.is_null() || (v.is_object() && v.empty()))) {
+            out->kv(key, v.is_null() ? "null" : "{}");
+            continue;
+        }
         if (v.is_object())            flatten_json(v, key, out);
         else if (v.is_boolean())      out->kv(key, v.get<bool>() ? "1" : "0");
         else if (v.is_number_integer()) out->kv(key, fmt("%lld", (long long)v.get<int64_t>()));
@@ -67,19 +93,10 @@ static void flatten_json(const nlohmann::json& j, const std::string& prefix, Met
         else if (v.is_string())       out->kv(key, v.get<std::string>());
         else if (v.is_array()) {
             /* An array of scalars becomes a space-separated string (mrope_section "11 11 10",
-             * layer_types "linear_attention full_attention ..."). Arrays of objects are
-             * skipped. */
+             * layer_types "linear_attention full_attention ..."), nested arrays row-major.
+             * Arrays of objects are skipped. */
             std::string s;
-            bool ok = true;
-            for (const auto& e : v) {
-                if (!s.empty()) s += ' ';
-                if (e.is_number_integer()) s += fmt("%lld", (long long)e.get<int64_t>());
-                else if (e.is_number())    s += fmt("%.17g", e.get<double>());
-                else if (e.is_string())    s += e.get<std::string>();
-                else if (e.is_boolean())   s += e.get<bool>() ? "1" : "0";
-                else { ok = false; break; }
-            }
-            if (ok) out->kv(key, s);
+            if (join_scalars(v, &s)) out->kv(key, s);
         }
     }
 }
@@ -230,9 +247,10 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", 0));
     m.n_vocab     = gi("vocab_size", 0);
     m.n_ctx_train = gi("max_position_embeddings", 0);
-    m.n_expert        = gi("num_experts", gi("num_local_experts", 0));
+    m.n_expert        = gi("num_experts", gi("num_local_experts", gi("n_routed_experts", 0)));
     m.n_expert_used   = gi("num_experts_per_tok", 0);
-    m.n_expert_shared = gi("shared_expert_intermediate_size", 0) ? 1 : 0;
+    m.n_expert_shared = gi("n_shared_experts", gi("num_shared_experts",
+                           gi("shared_expert_intermediate_size", 0) ? 1 : 0));
     m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", 1e-6));   /* LFM2: norm_eps */
     m.rope_theta  = (float)gf("rope_parameters.rope_theta", gf("rope_theta", 10000.0));
     /* Rotary scaling stays in the free-form keys with its type (arch/common/rad_arch.h,
@@ -582,7 +600,9 @@ int Checkpoint::open_diffusers() {
             RAD_TRY(meta_merge_json_file(dir_ + "/" + sc + "/scheduler_config.json", sc, true,
                                          &meta_));
     }
-    for (const char* sub : { "processor", "tokenizer" }) {
+    /* The tokenizer's own folder, or the text encoder's when the release keeps it there (FLUX.3
+     * [klein]'s modular pipeline points its tokenizer at text_encoder/). */
+    for (const char* sub : { "processor", "tokenizer", "text_encoder" }) {
         const std::string d = dir_ + "/" + sub;
         if (!path_exists(d + "/tokenizer.json")) continue;
         tok_dir_ = d;
@@ -608,6 +628,191 @@ int Checkpoint::open_diffusers() {
     return RAD_OK;
 }
 
+/* A single-file Stable Diffusion XL checkpoint in Stability's (sgm) layout, the form SDXL and its
+ * finetunes (Illustrious, NoobAI, Pony and the rest) are published in: one safetensors holding
+ *
+ *   model.diffusion_model.*                the UNet, under the names it is trained and adapted
+ *                                          (LoRA) under, kept as they are;
+ *   conditioner.embedders.0.transformer.*  CLIP ViT-L's text model, already in transformers'
+ *                                          CLIPTextModel names, kept;
+ *   conditioner.embedders.1.model.*        OpenCLIP ViT-bigG's text tower in open_clip's names,
+ *                                          read as transformers' CLIPTextModelWithProjection
+ *                                          under conditioner.embedders.1.transformer.: each
+ *                                          block's fused in_proj split into q/k/v_proj (row
+ *                                          views, nothing copied), c_fc / c_proj as fc1 / fc2,
+ *                                          ln_1 / ln_2 / ln_final as layer_norm1 / layer_norm2 /
+ *                                          final_layer_norm, and the (in, out) text_projection
+ *                                          transposed into a linear's (out, in)
+ *                                          `text_projection.weight`;
+ *   first_stage_model.*                    the VAE, its decoder read in diffusers' AutoencoderKL
+ *                                          names under vae. (its 1 x 1 attention convolutions
+ *                                          keep their rank-4 shape).
+ *
+ * A `v_pred` tensor marks a v-prediction model and `ztsnr` one trained to a zero terminal SNR
+ * (ComfyUI's convention): they become the `sdxl.prediction` and `sdxl.zero_snr` keys. The
+ * architecture is `sdxl`. The checkpoint holds no tokenizer; rad-convert takes CLIP's with
+ * --tokenizer. */
+int Checkpoint::open_sgm() {
+    kind_ = SafeT;
+    RAD_TRY(add_shard(path_));
+    bool vpred = false, zsnr = false;
+    std::vector<SrcTensor> add;
+    std::vector<std::string> drop;
+    auto rename = [&](const SrcTensor& t, const std::string& name) {
+        SrcTensor v = t;
+        v.name = name;
+        add.push_back(std::move(v));
+        drop.push_back(t.name);
+    };
+    const std::string g_old = "conditioner.embedders.1.model.";
+    const std::string g_new = "conditioner.embedders.1.transformer.";
+    const std::string tm = g_new + "text_model.";
+    const std::string v_old = "first_stage_model.";
+    for (const SrcTensor& t : tensors_) {
+        const std::string& n = t.name;
+        if (n == "v_pred") { vpred = true; continue; }
+        if (n == "ztsnr") { zsnr = true; continue; }
+        if (n.rfind(g_old, 0) == 0) {
+            const std::string r = n.substr(g_old.size());
+            if (r == "token_embedding.weight") {
+                rename(t, tm + "embeddings.token_embedding.weight");
+            } else if (r == "positional_embedding") {
+                rename(t, tm + "embeddings.position_embedding.weight");
+            } else if (r.rfind("ln_final.", 0) == 0) {
+                rename(t, tm + "final_layer_norm." + r.substr(std::strlen("ln_final.")));
+            } else if (r == "text_projection") {
+                /* x @ P in open_clip; a linear's weight is P^T. */
+                if (t.shape.size() != 2 || !t.data ||
+                    (t.rad_dtype != RAD_F16 && t.rad_dtype != RAD_BF16 && t.rad_dtype != RAD_F32)) {
+                    RAD_ERR("%s: '%s' is not a 2-D float matrix", path_.c_str(), n.c_str());
+                    return RAD_E_FORMAT;
+                }
+                const int64_t a = t.shape[0], b = t.shape[1];
+                const int64_t es = rad_dtype_bytes(t.rad_dtype, 1);
+                owned_.push_back(std::make_unique<uint8_t[]>((size_t)(a * b * es)));
+                uint8_t* dst = owned_.back().get();
+                const uint8_t* src = (const uint8_t*)t.data;
+                for (int64_t i = 0; i < a; ++i)
+                    for (int64_t j = 0; j < b; ++j)
+                        std::memcpy(dst + (size_t)((j * a + i) * es),
+                                    src + (size_t)((i * b + j) * es), (size_t)es);
+                SrcTensor v = t;
+                v.name = g_new + "text_projection.weight";
+                v.shape = { b, a };
+                v.data = dst;
+                add.push_back(std::move(v));
+                drop.push_back(n);
+            } else if (r.rfind("transformer.resblocks.", 0) == 0) {
+                /* transformer.resblocks.N.<rest> */
+                const size_t p0 = std::strlen("transformer.resblocks.");
+                const size_t dot = r.find('.', p0);
+                if (dot == std::string::npos) continue;
+                const std::string layer = tm + "encoder.layers." + r.substr(p0, dot - p0) + ".";
+                const std::string rest = r.substr(dot + 1);
+                if (rest == "attn.in_proj_weight" || rest == "attn.in_proj_bias") {
+                    const bool w = rest == "attn.in_proj_weight";
+                    if (t.shape.empty() || t.shape[0] % 3 || !t.data) {
+                        RAD_ERR("%s: '%s' does not split into q, k and v", path_.c_str(),
+                                n.c_str());
+                        return RAD_E_FORMAT;
+                    }
+                    const int64_t d = t.shape[0] / 3, rb = t.bytes / t.shape[0];
+                    const char* part[3] = { "q_proj", "k_proj", "v_proj" };
+                    for (int k = 0; k < 3; ++k) {
+                        SrcTensor v = t;
+                        v.name = layer + "self_attn." + part[k] + (w ? ".weight" : ".bias");
+                        v.shape[0] = d;
+                        v.bytes = rb * d;
+                        v.data = (const uint8_t*)t.data + (size_t)(k * d * rb);
+                        add.push_back(std::move(v));
+                    }
+                    drop.push_back(n);
+                } else {
+                    static const std::pair<const char*, const char*> kMap[] = {
+                        { "attn.out_proj.", "self_attn.out_proj." }, { "ln_1.", "layer_norm1." },
+                        { "ln_2.", "layer_norm2." }, { "mlp.c_fc.", "mlp.fc1." },
+                        { "mlp.c_proj.", "mlp.fc2." } };
+                    for (const auto& [from, to] : kMap)
+                        if (rest.rfind(from, 0) == 0) {
+                            rename(t, layer + to + rest.substr(std::strlen(from)));
+                            break;
+                        }
+                }
+            }
+            continue;
+        }
+        if (n.rfind(v_old + "decoder.", 0) == 0 || n.rfind(v_old + "post_quant_conv.", 0) == 0) {
+            /* diffusers' convert_ldm_vae_checkpoint, the decoder's half. */
+            std::string r = n.substr(v_old.size());
+            auto sub = [&](const std::string& from, const std::string& to) {
+                const size_t at = r.find(from);
+                if (at != std::string::npos) r.replace(at, from.size(), to);
+            };
+            sub("decoder.mid.block_1.", "decoder.mid_block.resnets.0.");
+            sub("decoder.mid.block_2.", "decoder.mid_block.resnets.1.");
+            sub("decoder.mid.attn_1.norm.", "decoder.mid_block.attentions.0.group_norm.");
+            sub("decoder.mid.attn_1.q.", "decoder.mid_block.attentions.0.to_q.");
+            sub("decoder.mid.attn_1.k.", "decoder.mid_block.attentions.0.to_k.");
+            sub("decoder.mid.attn_1.v.", "decoder.mid_block.attentions.0.to_v.");
+            sub("decoder.mid.attn_1.proj_out.", "decoder.mid_block.attentions.0.to_out.0.");
+            sub("decoder.norm_out.", "decoder.conv_norm_out.");
+            if (r.rfind("decoder.up.", 0) == 0) {
+                /* up.i runs at the i-th resolution from the bottom of the encoder's pyramid;
+                 * up_blocks count in the order the decoder runs them. */
+                const size_t p0 = std::strlen("decoder.up."), dot = r.find('.', p0);
+                if (dot == std::string::npos) continue;
+                const int i = std::atoi(r.substr(p0, dot - p0).c_str());
+                std::string rest = r.substr(dot + 1);
+                if (rest.rfind("block.", 0) == 0) rest = "resnets." + rest.substr(6);
+                else if (rest.rfind("upsample.", 0) == 0) rest = "upsamplers.0." + rest.substr(9);
+                r = "decoder.up_blocks." + std::to_string(3 - i) + "." + rest;
+            }
+            sub(".nin_shortcut.", ".conv_shortcut.");
+            rename(t, "vae." + r);
+        }
+    }
+    for (const std::string& n : drop) index_.erase(n);
+    for (SrcTensor& v : add) {
+        if (index_.count(v.name)) {
+            RAD_ERR("%s: '%s' is read from two tensors", path_.c_str(), v.name.c_str());
+            return RAD_E_FORMAT;
+        }
+        index_.emplace(v.name, tensors_.size());
+        tensors_.push_back(std::move(v));
+    }
+    meta_.arch = "sdxl";
+    const size_t slash = path_.find_last_of('/');
+    meta_.name = slash == std::string::npos ? path_ : path_.substr(slash + 1);
+    meta_.kv("sdxl.prediction", vpred ? "v" : "eps");
+    meta_.kv("sdxl.zero_snr", zsnr ? "1" : "0");
+    /* The typed dimensions are the conditioning network's, OpenCLIP bigG's text tower (as a
+     * diffusers pipeline's are its text encoder's), read off its tensors. */
+    {
+        RadModelMeta& m = meta_.m;
+        const SrcTensor* tok = find(tm + "embeddings.token_embedding.weight");
+        const SrcTensor* fc1 = find(tm + "encoder.layers.0.mlp.fc1.weight");
+        int64_t layers = 0;
+        while (find(tm + "encoder.layers." + std::to_string(layers) + ".layer_norm1.weight"))
+            ++layers;
+        if (!tok || tok->shape.size() != 2 || !fc1 || fc1->shape.size() != 2 || !layers) {
+            RAD_ERR("%s: OpenCLIP bigG's text tower is incomplete", path_.c_str());
+            return RAD_E_FORMAT;
+        }
+        m.n_layers = layers;
+        m.n_embd = tok->shape[1];
+        m.head_dim = 64;
+        m.n_head = m.n_head_kv = m.n_embd / 64;
+        m.n_ff = fc1->shape[0];
+        m.n_vocab = tok->shape[0];
+        m.n_ctx_train = 77;
+        m.rms_eps = 1e-5f;
+        m.rope_theta = 10000.0f;
+        m.rope_scale = 1.0f;
+    }
+    meta_.finish();
+    return RAD_OK;
+}
+
 int Checkpoint::open_safetensors(const std::string& path) {
     kind_ = SafeT;
     /* One shard, an index, or the directory holding either, as one namespace. */
@@ -624,15 +829,29 @@ int Checkpoint::open_safetensors(const std::string& path) {
         return open_diffusers();
     if (is_file) {
         shards.push_back(path);
+        /* A single-file Stable Diffusion XL checkpoint, as Stability and every SDXL finetune
+         * ship one: read by its own importer. */
+        SafeTensorsFile probe;
+        if (probe.open(path) == RAD_OK) {
+            bool unet = false, bigg = false;
+            for (const auto& t : probe.tensors()) {
+                unet = unet || t.name == "model.diffusion_model.label_emb.0.0.weight";
+                bigg = bigg ||
+                       t.name.rfind("conditioner.embedders.1.model.transformer.resblocks.", 0) == 0;
+            }
+            if (unet && bigg) return open_sgm();
+        }
     } else {
         RAD_TRY(shard_list(dir_, is_index ? path : dir_ + "/model.safetensors.index.json",
                            is_index, &shards, &owner));
     }
     for (const auto& sh : shards) RAD_TRY(add_shard(sh, "", owner.empty() ? nullptr : &owner));
 
-    RAD_TRY(meta_from_config_json(dir_, &meta_));
-    RAD_TRY(meta_merge_generation_config(dir_, &meta_));
-    RAD_TRY(meta_merge_preprocessor_configs(dir_, &meta_));
+    const std::string& md = meta_dir_.empty() ? dir_ : meta_dir_;
+    RAD_TRY(meta_from_config_json(md, &meta_));
+    RAD_TRY(meta_merge_generation_config(md, &meta_));
+    RAD_TRY(meta_merge_preprocessor_configs(md, &meta_));
+    if (!meta_dir_.empty() && !path_exists(dir_ + "/tokenizer.json")) tok_dir_ = meta_dir_;
     if (!is_file && !is_index) RAD_TRY(add_companions());
     /* FP8's block, where the checkpoint states one. */
     if (const char* bs = meta_.get("quantization_config.weight_block_size")) {
@@ -703,13 +922,45 @@ void Checkpoint::detect_import() {
         else import_why_ = "GPTQ's checkpoint_format '" + cf + "' is not one this reads; 'gptq' is";
     } else if (qm == "quark") {
         const std::string w = "global_quant_config.weight.";
+        /* Quark can retain block-FP8 attention/MTP weights alongside MXFP4 experts.
+         * Validate every override rather than rejecting every nonempty override map.
+         * Keep a lookup here: large exports have tens of thousands of flattened fields. */
+        std::map<std::string, std::string> fields;
+        for (size_t i = 0; i < meta_.keys.size(); ++i) fields.emplace(meta_.keys[i], meta_.vals[i]);
+        const std::string lp = "quantization_config.layer_quant_config.";
+        const std::string suffix = ".weight.dtype";
+        std::map<std::string, bool> layers;
+        for (const auto& [k, v] : fields)
+            if (k.rfind(lp, 0) == 0 && k.size() > lp.size() + suffix.size() &&
+                k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0)
+                layers.emplace(k.substr(0, k.size() - suffix.size()) + ".", true);
+        bool overrides_ok = true;
+        for (const auto& [layer, unused] : layers) {
+            auto f = [&](const char* key) {
+                auto it = fields.find(layer + "weight." + key);
+                return it == fields.end() ? std::string() : it->second;
+            };
+            const bool mx = f("dtype") == "fp4" && f("qscheme") == "per_group" &&
+                            f("group_size") == "32" && f("scale_format") == "e8m0";
+            const bool fp8 = f("dtype") == "fp8_e4m3" && f("qscheme") == "per_block" &&
+                             f("block_size") == "128 128";
+            overrides_ok = overrides_ok && (mx || fp8);
+        }
+        /* A partial/null weight override must not disappear merely because it has no dtype. */
+        for (const auto& [k, v] : fields) if (k.rfind(lp, 0) == 0) {
+            bool covered = false;
+            for (size_t dot = k.rfind('.'); dot != std::string::npos;
+                 dot = dot ? k.rfind('.', dot - 1) : std::string::npos)
+                if (layers.count(k.substr(0, dot + 1))) { covered = true; break; }
+            overrides_ok = overrides_ok && covered;
+        }
         if (qc(w + "dtype") == "fp4" && qc(w + "qscheme") == "per_group" &&
             qc(w + "group_size") == "32" && qc(w + "scale_format") == "e8m0" &&
-            !any_under("layer_quant_config.") && !any_under("layer_type_quant_config."))
+            overrides_ok && !any_under("layer_type_quant_config."))
             import_ = Import::QuarkMx;
         else
-            import_why_ = "Quark's weight scheme here is not MXFP4 (fp4, per_group 32, e8m0 scales) "
-                          "throughout, which is the one this reads";
+            import_why_ = "Quark requires global MXFP4 (fp4, per_group 32, e8m0 scales), with "
+                          "only MXFP4 or 128x128 E4M3 block-FP8 layer overrides";
     } else if (qm == "compressed-tensors") {
         /* compressed-tensors states each scheme as a config group with a format. Three are read:
          *   pack-quantized        grouped int4, symmetric (e.g. Google's Gemma 4 QAT w4a16-ct)
@@ -1534,6 +1785,17 @@ int Checkpoint::add_lora(const std::string& path, double strength,
     return RAD_OK;
 }
 
+int Checkpoint::add_file(const std::string& path) {
+    if (kind_ != SafeT) {
+        RAD_ERR("%s is merged into a safetensors checkpoint's namespace; %s is not one",
+                path.c_str(), path_.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
+    RAD_TRY(add_shard(path));
+    meta_.finish();
+    return RAD_OK;
+}
+
 const SrcTensor* Checkpoint::find(const std::string& n) const {
     auto it = index_.find(n);
     return it == index_.end() ? nullptr : &tensors_[it->second];
@@ -1797,8 +2059,9 @@ static int resolve_wnorm(Checkpoint& ck, const RadNameMap& m, bool optional, Ckp
     return RAD_OK;
 }
 
-/* RAD_MAP_TRANSPOSE (src[0] [.., a, b] read as [.., b, a]) and RAD_MAP_EMA (src[0] the embedding
- * sums [bins, ...], src[1] the cluster usage [bins]; each row over max(usage, 1e-5)), computed in
+/* RAD_MAP_TRANSPOSE (src[0] [.., a, b] read as [.., b, a]), RAD_MAP_EMA (src[0] the embedding
+ * sums [bins, ...], src[1] the cluster usage [bins]; each row over max(usage, 1e-5)), RAD_MAP_TAP
+ * (one index of one dimension of src[0]) and RAD_MAP_COLS (one column range of src[0]), computed in
  * f32 into `derived`. */
 static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>& maps,
                            bool optional, CkptWeight* out, std::string* why) {
@@ -1863,7 +2126,44 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
         return refuse(RAD_E_FORMAT, "'" + a->name + "' cannot be read as f32");
     out->rank = (uint32_t)rank;
     for (size_t i = 0; i < rank; ++i) out->shape[i] = a->shape[i];
-    if (ema) {
+    if (m.mode == RAD_MAP_COLS) {
+        const int64_t cb = a->shape[rank - 1], c0 = m.src_index[0], nc = m.src_rows[0];
+        if (c0 < 0 || nc <= 0 || c0 + nc > cb)
+            return refuse(RAD_E_SHAPE, "columns [" + std::to_string(c0) + ", " +
+                                       std::to_string(c0 + nc) + ") of '" + a->name + "', which "
+                                       "has " + std::to_string(cb));
+        const int64_t outer = n / cb;
+        out->derived.resize((size_t)(outer * nc));
+        for (int64_t o = 0; o < outer; ++o)
+            std::memcpy(&out->derived[(size_t)(o * nc)], &src[(size_t)(o * cb + c0)],
+                        (size_t)nc * sizeof(float));
+        out->shape[rank - 1] = nc;
+        out->why = "it is columns [" + std::to_string(c0) + ", " + std::to_string(c0 + nc) +
+                   ") of '" + a->name + "', at convert -- a recipe rule stores it";
+    } else if (m.mode == RAD_MAP_TAP) {
+        const int d = m.concat_dim;
+        if (d < 0 || (size_t)d >= rank || rank < 3)
+            return refuse(RAD_E_SHAPE, "'" + a->name + "' has rank " + std::to_string(rank) +
+                                       "; a tap of dimension " + std::to_string(d) +
+                                       " leaves no matrix");
+        const int64_t k = a->shape[(size_t)d];
+        const int64_t t = m.src_index[0] < 0 ? k + m.src_index[0] : m.src_index[0];
+        if (t < 0 || t >= k)
+            return refuse(RAD_E_SHAPE, "tap " + std::to_string(m.src_index[0]) + " of '" +
+                                       a->name + "' dimension " + std::to_string(d) + " of " +
+                                       std::to_string(k));
+        int64_t outer = 1, inner = 1;
+        for (int i = 0; i < d; ++i) outer *= a->shape[(size_t)i];
+        for (size_t i = (size_t)d + 1; i < rank; ++i) inner *= a->shape[i];
+        out->derived.resize((size_t)(outer * inner));
+        for (int64_t o = 0; o < outer; ++o)
+            std::memcpy(&out->derived[(size_t)(o * inner)], &src[(size_t)((o * k + t) * inner)],
+                        (size_t)inner * sizeof(float));
+        out->rank = (uint32_t)(rank - 1);
+        for (size_t i = (size_t)d; i + 1 < rank; ++i) out->shape[i] = a->shape[i + 1];
+        out->why = "it is tap " + std::to_string(t) + " of '" + a->name + "' dimension " +
+                   std::to_string(d) + ", at convert -- a recipe rule stores it";
+    } else if (ema) {
         const int64_t bins = a->shape[0], per = n / bins;
         int64_t un = 1;
         for (int64_t x : u->shape) un *= x;
@@ -1918,7 +2218,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.empty()) return refuse(RAD_E_NOTFOUND, "the name map has no entry for it");
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
-    if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA)
+    if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
+        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS)
         return resolve_derived(ck, maps, optional, out, why);
     struct Src1 { const char* name; int index; int64_t rows; };
     std::vector<Src1> srcs;

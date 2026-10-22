@@ -1,0 +1,45 @@
+# krea-2-fp8-unscaled.recipe -- a Krea 2 finetune shipped as plain fp8 (every tensor E4M3 with no
+# scale, as ComfyUI's fp8 checkpoints and most civitai Krea 2 files store it), with block-scaled fp8
+# linears.
+#
+#   rad-convert <pipeline directory: Krea-2-Turbo's (or -Raw's) model_index, scheduler, text encoder,
+#       tokenizer and VAE, with the finetune's DiT as transformer/> \
+#       --recipe data/recipes/krea-2-fp8-unscaled.recipe -o finetune-fp8.rad
+#
+# The DiT's and the text fusion's linears keep the checkpoint's codes: every value is already on the
+# E4M3 grid, so a block scale of exactly 1 (rule=fixed) holds each one as the code it was shipped
+# as, where an absmax scale would round it a second time. The text encoder is the release's bf16 and
+# is rounded as krea-2-fp8.recipe rounds it. The norms, tables and embedders the finetune stores as
+# E4M3 are widened exactly to the dtypes krea-2-fp8.recipe gives them. A Turbo finetune takes
+# Turbo's model_index.json (`is_distilled`: 8 steps, no guidance), a Raw one Raw's.
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+fuse.*.attn_qkv.weight               rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+fuse.*.attn_gate.weight              rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+fuse.*.attn_output.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+fuse.*.ffn_gate_up.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+fuse.*.ffn_down.weight               rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+dit.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+dit.blk.*.attn_gate.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+dit.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+dit.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+dit.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16 rule=fixed scale_value=1
+
+# The release stores its norms, modulation tables, embedders, projector and output layer f32.
+# diffusers keeps every norm f32 and runs the rest bf16. Here the text fusion's norms, the q/k norms
+# and txt_in's norm stay f32; the DiT's norm1, norm2 and final norm are bf16, the fused modulation
+# kernel's operand, with the rest.
+fuse.*.norm1.weight                  cast dtype=f32
+fuse.*.norm2.weight                  cast dtype=f32
+fuse.*.q_norm.weight                 cast dtype=f32
+fuse.*.k_norm.weight                 cast dtype=f32
+dit.blk.*.q_norm.weight              cast dtype=f32
+dit.blk.*.k_norm.weight              cast dtype=f32
+txt.norm.weight                      cast dtype=f32
+fuse.*                               cast dtype=bf16
+txt.*                                cast dtype=bf16
+dit.*                                cast dtype=bf16
+vae.*                                cast dtype=bf16

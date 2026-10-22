@@ -70,7 +70,17 @@ int         avx_par_force(int threads);
 #define AVX_OP_LIST(X)                                                                            \
     /* ---- elementwise and norms */                                                              \
     X(rmsnorm)              X(rmsnorm_p)            X(rmsnorm_add)          X(hc_enter)           \
-    X(hc_read)              X(hc_write)             X(mtp_enter)            X(layernorm)          \
+    X(hc_read)              X(hc_write)             X(hc_project)           X(mtp_enter)          \
+    X(layernorm)            X(mhc_pre)              X(mhc_post)             X(mhc_contract)       \
+    X(kda_update)           X(mhc_pre_partial)      X(mhc_pre_finish)                             \
+    X(swiglu_clamped)                                                                             \
+    X(router_sigmoid_topk)                                                                        \
+    X(dsa_pool)                                                                                   \
+    X(dsa_query)                                                                                  \
+    X(gemm_nt_f32)                                                                                \
+    X(mla_project)                                                                                \
+    X(dsa_score)                                                                                  \
+    X(mla_attn)                                                                                   \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
@@ -84,14 +94,14 @@ int         avx_par_force(int threads);
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
     X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
-    X(dequant)              X(quant_cols_fp8)                                                     \
+    X(dequant)              X(quant_cols_fp8)       X(had_quant_act_i8g)                          \
     X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      X(givens_rotate)        X(givens_dense_quant) \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
-    X(lora_shrink)          X(lora_expand)                                                        \
+    X(lora_shrink)          X(lora_expand)          X(lora_expand_mm)                             \
     /* ---- attention */                                                                          \
-    X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
+    X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
     /* ---- mixture of experts */                                                                 \
@@ -108,19 +118,25 @@ int         avx_par_force(int threads);
     X(gather_rows2)         X(lane_gather)          X(lane_store)           X(randn_lanes)        \
     X(flow_euler)           X(chan_affine)          X(conv2d_nhwc)          X(l2norm_chan)        \
     X(d2s_add)              X(s2d_avg_add)          X(to_rgba8)             X(gelu_tanh)          \
-    X(scatter_add_rows)     X(attn_prefix_self)                                                   \
+    X(scatter_add_rows)     X(attn_prefix_self)     X(kd_input)             X(kd_step)            \
+    X(gelu_quick)           X(im2col_nhwc)                                                        \
     /* ---- video generation */                                                                   \
     X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
     X(flow_res_multistep)                                                                           \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)                               \
+    /* ---- LTX-2 */                                                                              \
+    X(rope_split)           X(head_gate)            X(ltx_guide)            X(pixel_norm)         \
+    X(d2s3d)                X(s2d3d)                X(pix_patch)            X(patch_pix8)         \
+    X(stft_logmel)          X(bwe_up)               X(tile_grid)            X(tile_crop)          \
+    X(tile_stitch)          X(vol_index)                                                          \
     /* ---- audio generation */                                                                   \
     X(conv1d)               X(conv_t1d)             X(snake)                X(cfg_topk_sample)    \
     X(rvq_embed)            X(frame_mix_store)      X(end_status)           X(frame_store)        \
     X(resample_nearest)     X(fourier_embed)        X(win_input)            X(win_prep)           \
     X(win_finish)           X(chan_split)           X(interleave2)          X(iota)               \
-    X(cu_repeat)            X(snake_aa)                                                           \
+    X(cu_repeat)            X(snake_aa)             X(int_affine)                                 \
     /* ---- sampling, and the drafter's token walk */                                             \
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \

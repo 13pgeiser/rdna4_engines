@@ -60,6 +60,7 @@ uint64_t SlotTable::publish(int slot, const std::string& name, const std::string
     s.uid = next_uid_++;
     s.used = true;
     s.draining = false;
+    s.last_use = ++uses_;
     return s.uid;
 }
 
@@ -69,10 +70,11 @@ int SlotTable::acquire(const std::string& name, int32_t* slot, uint64_t* uid,
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (size_t i = 0; i < slots_.size() && !u; ++i) {
-            const Slot& x = slots_[i];
+            Slot& x = slots_[i];
             if (x.uid == 0 || x.draining || x.name != name) continue;
             u = x.uid;
             *slot = (int32_t)i;
+            x.last_use = ++uses_;
             ++refs_[u];
         }
     }
@@ -123,6 +125,19 @@ int SlotTable::unload(const std::string& name, int* in_flight, std::string* err)
     }
     *err = "no adapter named '" + name + "' is loaded";
     return RAD_E_NOTFOUND;
+}
+
+int SlotTable::evict_idle(std::string* evicted) {
+    std::lock_guard<std::mutex> lk(mu_);
+    Slot* best = nullptr;
+    for (Slot& x : slots_) {
+        if (x.uid == 0 || x.draining || refs_.count(x.uid)) continue;
+        if (!best || x.last_use < best->last_use) best = &x;
+    }
+    if (!best) return RAD_E_FULL;
+    if (evicted) *evicted = best->name;
+    free_slot(*best, " to make room");
+    return RAD_OK;
 }
 
 std::vector<std::string> SlotTable::names() const {

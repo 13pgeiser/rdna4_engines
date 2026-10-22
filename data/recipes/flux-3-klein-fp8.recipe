@@ -1,0 +1,24 @@
+# flux-3-klein-fp8.recipe -- FLUX.3 [klein] (or its base) with block-scaled fp8 linears.
+#
+#   rad-convert <flux-3-image-klein pipeline directory> --recipe data/recipes/flux-3-klein-fp8.recipe \
+#       -o flux-3-klein-fp8.rad
+#
+# Every linear of the text encoder's language model and of the DiT's early and joint blocks
+# becomes E4M3 codes with a bf16 scale a 128 x 128 block, read by the fp8a8 GEMMs over activations
+# quantised the same way. What stays bf16 is read once a pass or less: the embedding table, the
+# embedders, the timestep MLPs, the modulations, the output layer and the VAE. The language
+# model's layers past its last tap (32 of 36) are not carried.
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.mode.*.attn_qkv.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.mode.*.attn_output.weight        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.mode.*.ffn_in.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.mode.*.ffn_out.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.single.*.attn_qkv.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.single.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.single.*.ffn_in.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.single.*.ffn_out.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+vae.*                                cast dtype=bf16

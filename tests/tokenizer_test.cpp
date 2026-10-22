@@ -1020,4 +1020,35 @@ TEST(the_token_view_gives_grammars_the_decoded_bytes) {
     CHECK_EQ(tv.token_piece(world[0])[0], ' ');
 }
 
+/* Gemma's tokenizer.json: whitespace runs are added tokens, not special, spelled in U+2581, and
+ * the decoder replaces U+2581 with a space. HuggingFace decodes them to spaces; returned literally,
+ * an indented line came out as "▁▁- web-a" (TranslateGemma, 18. 10. 2026). */
+TEST(an_added_whitespace_run_decodes_to_spaces_as_huggingface_does) {
+    auto v = from_json(R"JSON({
+      "normalizer": { "type": "Replace", "pattern": { "String": " " }, "content": "▁" },
+      "decoder": { "type": "Sequence", "decoders": [
+          { "type": "Replace", "pattern": { "String": "▁" }, "content": " " },
+          { "type": "ByteFallback" }, { "type": "Fuse" } ] },
+      "model": { "type": "BPE", "byte_fallback": true,
+        "vocab": {"<unk>": 0, "▁": 1, "-": 2, "▁▁": 3, "<eot>": 4, "▁▁▁▁": 5},
+        "merges": ["▁ ▁", "▁▁ ▁▁"] },
+      "added_tokens": [
+        {"id": 3, "content": "▁▁", "special": false, "normalized": false},
+        {"id": 5, "content": "▁▁▁▁", "special": false, "normalized": false},
+        {"id": 4, "content": "<eot>", "special": true} ]
+    })JSON");
+    REQUIRE(v != nullptr);
+    Tokenizer t;
+    CHECK_OK(t.init(v));
+    CHECK_EQ(t.piece(3, false), std::string("  "));
+    CHECK_EQ(t.piece(5, false), std::string("    "));
+    CHECK_EQ(t.decode({ 3, 2, 5, 2 }, false), std::string("  -    -"));
+    /* A control token still renders as written. */
+    CHECK_EQ(t.piece(4, true), std::string("<eot>"));
+
+    TokenView tv;
+    CHECK_OK(tv.init(v));
+    CHECK_EQ(tv.token_piece(3), std::string("  "));
+}
+
 RAD_TEST_MAIN()

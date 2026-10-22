@@ -1,0 +1,39 @@
+# sage-a1.5-fp8.recipe -- Sage-A1.5, InternScience's post-train of Qwen3.5-35B-A3B-VL, as the
+# qwen35moe_fp8 plugin serves it (256 experts of 512, top 8, a routed MTP head, the Qwen3.5
+# vision tower).
+#
+#   rad-convert InternScience/Sage-A1.5-FP8 --recipe data/recipes/sage-a1.5-fp8.recipe \
+#       -o sage-a1.5-fp8.rad
+#
+# The published FP8 release is compressed-tensors with one scale an output row, and it leaves
+# the vision tower, the routers and the whole MTP head bf16. The engine's expert kernels read
+# block-scaled fp8 only (a scale a 128x128 block) and its plugin refuses bf16 experts, so this
+# re-expresses every linear into Qwen's own block form, the same weights in the same form as
+# qwen3.6-35b-a3b-fp8.rad. From the bf16 release instead, the same recipe applies and the format
+# has to be stated too:
+#
+#   rad-convert InternScience/Sage-A1.5 --recipe data/recipes/sage-a1.5-fp8.recipe \
+#       --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
+#       --set "quantization_config.weight_block_size=128 128" \
+#       --set quantization_config.activation_scheme=dynamic -o sage-a1.5-fp8.rad
+#
+# The linears -- attention q/gate, k, v and output, the delta net's qkv/z and output
+# projections, the routed and shared experts of all 40 blocks, and the MTP layer's, which the
+# blk.* patterns reach at its own index 40 -- as E4M3 with one bf16 scale a 128x128 block. The
+# lm_head likewise, and the MTP head's 2-bit copy of it, which the draft rounds read in place of
+# the full head. The routers, the shared-expert gates, the delta net's a/b projection, its conv
+# and decay parameters, the norms, the embedding and the vision tower stay as the checkpoint
+# holds them.
+
+blk.*.attn_qg.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_k.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_v.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_inz.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up_exps.*.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_exps.*.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16

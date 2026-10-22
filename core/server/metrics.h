@@ -113,6 +113,10 @@ private:
     Gauge   g_running_, g_waiting_, g_kv_util_, g_prefix_hit_;
     Gauge   g_kv_max_tokens_, g_kv_max_bytes_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
+    /* The decode floor, in seconds: the fastest single-sequence window this process has run,
+     * and the most recent one. Both stay 0 until a window of 32 single-stream steps completes,
+     * and both reset on restart -- the render omits them rather than expose an unmeasured 0. */
+    Gauge   g_step_best_, g_step_recent_;
     Gauge   queue_depth_;
     /* Per-position conditional draft acceptance (see render() and core/sched/draft.h). */
     enum { MAX_DRAFT_POS = 64 };
@@ -149,7 +153,8 @@ private:
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;
     Counter c_ckpt_retired_, c_ckpt_lru_, c_ckpt_refused_;
-    Counter c_cut_no_snapshot_, c_cut_window_, c_cut_adopt_, c_cut_tokens_;
+    Counter c_cut_no_snapshot_, c_cut_window_, c_cut_adopt_, c_cut_resumed_below_, c_cut_tokens_;
+    Counter c_restore_cuts_;
     Gauge   g_linear_hit_;
     Counter c_success_[(size_t)SuccessReason::N_];
     Counter c_rejected_, c_disconnect_, c_overflow_;

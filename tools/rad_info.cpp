@@ -65,6 +65,8 @@ const char* step_name(uint32_t k) {
         case RAD_PRE_PUNCTUATION: return "pre.Punctuation";
         case RAD_PRE_DIGITS:      return "pre.Digits";
         case RAD_PRE_BYTE_FALLBACK: return "pre.ByteFallback";
+        case RAD_PRE_END_OF_WORD:   return "pre.EndOfWordSuffix";
+        case RAD_PRE_ADDED_NORMALIZED: return "pre.AddedNormalized";
         case RAD_DEC_BYTELEVEL:   return "dec.ByteLevel";
         case RAD_DEC_METASPACE:   return "dec.Metaspace";
         case RAD_DEC_REPLACE:     return "dec.Replace";

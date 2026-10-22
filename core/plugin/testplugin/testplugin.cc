@@ -346,8 +346,8 @@ extern "C" int rad_plugin_reference(void) { return 1; }
 
 /* ================================================================== radtest_extra */
 /* Rows for rules the base plugin's ops do not reach: a constraint on the ranged key that is not an
- * interval, a tunable axis with a cross-axis test, a kernel that relayouts its weight, and a
- * capacity parameter. In testkernels/extra, so loading testkernels/ alone is unchanged. */
+ * interval, a tunable axis with a cross-axis test, a kernel that relayouts its weight, a kernel
+ * that reads any stored form, and a capacity parameter. In testkernels/extra, so loading testkernels/ alone is unchanged. */
 #elif defined(RADTEST_EXTRA)
 
 static const RadOperandSpec kOpdCap[] = {
@@ -368,6 +368,8 @@ static const RadOpSchema kSchemas[] = {
       "a kernel that stores its weight in its own layout" },
     { "t_join", kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm),
       "a weight of several planes: a device kernel's own form, a host kernel's joined one" },
+    { "t_any",  kPGemm, NELEM(kPGemm), kOpdGemm, NELEM(kOpdGemm),
+      "a kernel that reads its weight's stored bytes uninterpreted (a prefetch)" },
     { "t_cap",  kPCap,  NELEM(kPCap),  kOpdCap,  NELEM(kOpdCap),
       "a capacity a sizing declare may shrink" },
 };
@@ -417,6 +419,12 @@ static int t_join_host_layout(const RadParam* p, int n_p, int operand, const Rad
     return rad_planes_layout(enc, sel, planes, n_planes, out);
 }
 
+/* Reads the stored bytes without interpreting them: any form, and claims none. */
+static int t_any_layout(const RadParam*, int, int, const RadEncoding*, const int*,
+                        const RadTensor*, int, RadLayout*) {
+    return RAD_LAYOUT_ANY;
+}
+
 static const RadConstraint kCLayTiled[] = { RAD_CLE("M", 16) };
 static const RadConstraint kCLayPlain[] = { RAD_CLE("M", 4096) };
 
@@ -461,6 +469,11 @@ static const RadKernelInfo kKernels[] = {
       .computes = "nothing; a registry row", .shape = "any", .dtypes = "planes joined",
       .domain = RAD_DOMAIN_HOST, .priority = 10, .launch = t_launch,
       .layout = t_join_host_layout },
+
+    { .name = "t_any_read", .op = "t_any", .family = "misc",
+      .computes = "nothing; a registry row", .shape = "any", .dtypes = "any stored form",
+      .domain = RAD_DOMAIN_DEVICE, .priority = 10, .launch = t_launch,
+      .layout = t_any_layout },
 
     { .name = "t_cap_any", .op = "t_cap", .family = "norm",
       .computes = "nothing; a registry row", .shape = "any", .dtypes = "any",
@@ -623,6 +636,10 @@ const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 const char* rad_arch_id(void) { return RADTEST_ARCH_ID; }
 /* The other half of the selection key (spec §2.4); "" is an unquantised container. */
 const char* rad_arch_quant(void) { return RADTEST_ARCH_QUANT; }
+#if defined(RADTEST_ARCHQ_NO_IMPORTS)
+/* Quantised, but never the plugin an imported checkpoint is handed to. */
+int rad_arch_serves_imports(void) { return 0; }
+#endif
 /* The core loads and identifies architecture plugins; the build component drives them. Neither
  * hook is called by anything this test exercises, and declare refuses rather than pretending. */
 int  rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {

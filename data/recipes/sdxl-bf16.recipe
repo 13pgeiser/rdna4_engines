@@ -1,0 +1,9 @@
+# sdxl-bf16.recipe -- Stable Diffusion XL (and its finetunes: Illustrious, NoobAI, Pony, ...) at bf16.
+#
+#   rad-convert <checkpoint>.safetensors --tokenizer <CLIP tokenizer.json> \
+#       --recipe data/recipes/sdxl-bf16.recipe -o sdxl.rad
+#
+# A single-file SDXL checkpoint (Stability's layout) ships its weights f16, some finetunes partly
+# bf16 or f32; every weight the model reads is served bf16. The VAE's encoder, the text encoders'
+# unused tails and the checkpoint's bookkeeping tensors are not carried.
+*                                    cast dtype=bf16

@@ -1,0 +1,20 @@
+# Sage-A1.5 on one card: the same block-fp8 container, its experts partly in a pinned host pool
+# because 34.5 GiB of weights do not fit 31.9 GiB of VRAM. Measured on a R9700 (warm, 3 runs,
+# --max-model-len 131072): 168 tok/s decode and ~11,000 tok/s prefill, against 282 tok/s decode
+# and ~11,000 tok/s prefill at --tp 2. Prefill is bandwidth-bound and one card does it; the
+# second card buys decode only. This profile: 25.12 GiB of experts in VRAM, 5.79 GiB in the 8
+# GiB pool (about 1.5 GiB more than the measured run), the cache holding one full 262,144-token
+# session. For two short sessions instead use --max-num-seqs 2 --max-model-len 32768
+# --host-pool-mib 6144 (3.80 GiB of experts in the pool). Sampling is the model card's.
+name: radiance-sage-a1.5-tp1
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-sage-a1.5-tp1
+    command: >
+      --model /models/sage-a1.5-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 1 --max-model-len 262144 --kv-cache-dtype fp8
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048
+      --placement expert_tiered --host-pool-mib 8192
+      --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5

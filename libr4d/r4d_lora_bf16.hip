@@ -252,6 +252,11 @@ enum {
     kExThreads = 256,
     kZMax = 16,            /* the passes of one tile spread over at most this many blocks */
     kZGrid = 256,          /* ... and only while the grid is smaller than this */
+    kMmMT = 128,           /* expand_mm: rows a tile, 32 a wave */
+    kMmNT = 256,           /* expand_mm: columns a tile, 128 a wave */
+    kMmJC = 32,            /* expand_mm: j a staged step */
+    kMmWaves = 8,          /* 4 (rows) x 2 (columns) over the tile */
+    kMmThreads = kMmWaves * 32,
 };
 
 struct ShrinkTArgs {
@@ -590,6 +595,119 @@ __global__ __launch_bounds__(kExThreads) void lora_expand_tiled_kernel(ExpandTAr
     }
 }
 
+/* lora_expand_mm: the same delta on the WMMA, t rounded to bf16, for the passes whose rows are
+ * many and mostly of one slot (an image or video generator's). One block a (256 columns, 128 rows),
+ * eight waves, wave w the 32 rows at 32 (w >> 1) and the 128 columns at 128 (w & 1): 2 x 8 WMMA
+ * tiles. Each 32-wide j step stages t's [128 rows][32 j] (rounded to bf16) and B[s]'s [256 columns]
+ * [32 j] in LDS, read by every wave; B's fragment is the WMMA's A operand (16 n x 16 j) and t's its
+ * B (16 j x 16 m), so lane l's eight outputs are row l % 16 of its m tile at columns 8 (l / 16) ..
+ * +7 -- eight neighbours in y. Rows of a slot not in the pass are staged as zeros and not stored. */
+template <int YDT, bool V>
+__global__ __launch_bounds__(kMmThreads) void lora_expand_mm_kernel(ExpandTArgs T) {
+    __shared__ uint16_t ts[kMmMT][kMmJC + 8];          /* +8: rows land on different banks */
+    __shared__ uint16_t bs[kMmNT][kMmJC + 8];
+    __shared__ int mm_slot[kMmMT], mm_list[kMmMT];
+    __shared__ int mm_n;
+    const ExpandArgs& A = T.b;
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int col = lane & 15, half = lane >> 4;
+    const long long nb = (long long)blockIdx.x * kMmNT;
+    const int mb = (int)blockIdx.y * kMmMT;
+    const int wm = 32 * (wave >> 1), wn = 128 * (wave & 1);
+
+    for (int i = tid; i < kMmMT; i += kMmThreads) {
+        int s = -1;
+        if (mb + i < T.M) {
+            s = A.slot[(long long)(mb + i) * A.slot_st];
+            if (s < 0 || s >= A.S) s = -1;
+        }
+        mm_slot[i] = s;
+    }
+    __syncthreads();
+    if (tid == 0) mm_n = distinct_slots(mm_slot, mm_list, kMmMT);
+    __syncthreads();
+    const int npass = mm_n;
+
+    for (int p = 0; p < npass; ++p) {
+        const int s = mm_list[p];
+        const uint16_t* bp = A.lb + (long long)s * A.lb_s0;
+        lr_v8f acc[2][8];
+        for (int b = 0; b < 2; ++b)
+            for (int a = 0; a < 8; ++a) acc[b][a] = (lr_v8f)(0.0f);
+        for (int j0 = 0; j0 < A.R; j0 += kMmJC) {
+            __syncthreads();                           /* the last step's readers are done */
+            /* t: 128 rows x 32 j, one row's 32 a pair of lanes */
+            for (int i = tid; i < kMmMT * 2; i += kMmThreads) {
+                const int r = i >> 1, h = (i & 1) * 16;
+                const bool on = mm_slot[r] == s;
+                const long long row = (long long)(mb + r) * A.t_rs;
+                for (int e = 0; e < 16; ++e) {
+                    const int j = j0 + h + e;
+                    ts[r][h + e] = on && j < A.R ? f2bf(A.t[row + (long long)j * A.t_cs]) : (uint16_t)0;
+                }
+            }
+            /* B[s]: 256 columns x 32 j, one column's 32 a pair of lanes */
+            for (int i = tid; i < kMmNT * 2; i += kMmThreads) {
+                const int c = i >> 1, h = (i & 1) * 16;
+                const long long n = nb + c;
+                lr_v8s f[2];
+                ld_pool16<V>(bp + (n < A.N ? n : 0) * A.lb_s1, j0 + h, A.R, A.lb_s2, n < A.N, f);
+                for (int e = 0; e < 16; ++e) bs[c][h + e] = (uint16_t)f[e >> 3][e & 7];
+            }
+            __syncthreads();
+            lr_v8s tf[2][2];
+            for (int b = 0; b < 2; ++b)
+                for (int q = 0; q < 2; ++q)
+                    for (int e = 0; e < 8; ++e)
+                        tf[b][q][e] = (short)ts[wm + 16 * b + col][16 * half + 8 * q + e];
+            for (int a = 0; a < 8; ++a) {
+                lr_v8s bf[2];
+                for (int q = 0; q < 2; ++q)
+                    for (int e = 0; e < 8; ++e)
+                        bf[q][e] = (short)bs[wn + 16 * a + col][16 * half + 8 * q + e];
+                for (int b = 0; b < 2; ++b) {
+                    acc[b][a] = wmma_bf16(bf[0], tf[b][0], acc[b][a]);
+                    acc[b][a] = wmma_bf16(bf[1], tf[b][1], acc[b][a]);
+                }
+            }
+        }
+        for (int b = 0; b < 2; ++b) {
+            const int ml = wm + 16 * b + col;
+            if (mm_slot[ml] != s) continue;
+            const long long m = mb + ml;
+            for (int a = 0; a < 8; ++a) {
+                const long long n0 = nb + wn + 16 * a + 8 * half;
+                const long long o = m * A.y_rs + n0 * A.y_cs;
+                const float* scp = A.sc + (long long)s * A.sc_rs;
+                if (YDT == kBF16 && A.y_cs == 1 && n0 + 8 <= A.N && (((uintptr_t)A.y + 2 * o) & 15) == 0) {
+                    lr_v8s* yp = (lr_v8s*)((uint16_t*)A.y + o);
+                    lr_v8s yv = *yp;
+                    for (int e = 0; e < 8; ++e)
+                        yv[e] = (short)f2bf(bf2f((uint16_t)yv[e]) + scp[(n0 + e) * A.sc_cs] * acc[b][a][e]);
+                    *yp = yv;
+                    continue;
+                }
+                for (int e = 0; e < 8; ++e) {
+                    const long long n = n0 + e;
+                    if (n >= A.N) continue;
+                    const float d = scp[n * A.sc_cs] * acc[b][a][e];
+                    const long long oe = m * A.y_rs + n * A.y_cs;
+                    if (YDT == kBF16) {
+                        uint16_t* y = (uint16_t*)A.y + oe;
+                        *y = f2bf(bf2f(*y) + d);
+                    } else if (YDT == kF16) {
+                        uint16_t* y = (uint16_t*)A.y + oe;
+                        *y = f32_to_f16(f16_to_f32(*y) + d);
+                    } else {
+                        float* y = (float*)A.y + oe;
+                        *y = *y + d;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* ---------------------------------------------------------------- operand reading (host) */
 
 /* `t` read as [rows, cols]: the trailing axes that span `cols` must be one dense run, the leading
@@ -885,6 +1003,13 @@ static void launch_expand_tiled(const ExpandTArgs& P, dim3 grid, RadStream strea
                 (hipStream_t)stream, P);
 }
 
+template <int YDT, bool V>
+static void launch_expand_mm(const ExpandTArgs& P, dim3 grid, RadStream stream) {
+    (void)stream;
+    R4D_KLAUNCH(R4D_KNAME(lora_expand_mm_kernel<YDT, V>), grid, dim3(kMmThreads),
+                (hipStream_t)stream, P);
+}
+
 }  /* namespace r4d_lora */
 
 extern "C" {
@@ -999,6 +1124,34 @@ int r4d_rad_lora_expand_tiled(const RadArgs* a, RadStream stream) {
                       : launch_expand_tiled<kF16, false>(T, grid, stream);  break;
         default:    v ? launch_expand_tiled<kF32, true>(T, grid, stream)
                       : launch_expand_tiled<kF32, false>(T, grid, stream);  break;
+    }
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* lora_expand_mm: one block a (256 columns, 128 rows); expand_operands reads the same operands. */
+int r4d_rad_lora_expand_mm(const RadArgs* a, RadStream stream) {
+    using namespace r4d_lora;
+    ExpandArgs P{};
+    int ydt = 0;
+    int64_t M = 0;
+    const int rc = expand_operands(a, &P, &ydt, &M);
+    if (rc != RAD_OK || M <= 0) return rc;
+    const int64_t rt = (M + kMmMT - 1) / kMmMT, nt = (P.N + kMmNT - 1) / kMmNT;
+    if (rt > 65535 || nt > 0x7fffffff) return RAD_E_SHAPE;
+    ExpandTArgs T{};
+    T.b = P;
+    T.M = (int)M;
+    T.Z = 1;
+    const bool v = P.lb_s2 == 1 && (uintptr_t)P.lb % 16 == 0 && P.lb_s1 % 8 == 0 &&
+                   P.lb_s0 % 8 == 0;
+    const dim3 grid((unsigned)nt, (unsigned)rt, 1u);
+    switch (ydt) {
+        case kBF16: v ? launch_expand_mm<kBF16, true>(T, grid, stream)
+                      : launch_expand_mm<kBF16, false>(T, grid, stream); break;
+        case kF16:  v ? launch_expand_mm<kF16, true>(T, grid, stream)
+                      : launch_expand_mm<kF16, false>(T, grid, stream);  break;
+        default:    v ? launch_expand_mm<kF32, true>(T, grid, stream)
+                      : launch_expand_mm<kF32, false>(T, grid, stream);  break;
     }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

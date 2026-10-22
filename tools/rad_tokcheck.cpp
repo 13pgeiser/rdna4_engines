@@ -94,9 +94,11 @@ bool report_diff(const Tokenizer& tok, const char* what, const std::vector<int32
     };
     show("tokenizer", a);
     show(what, b);
-    const size_t t0 = byte > 60 ? byte - 60 : 0;
+    /* The pieces' bytes overshoot the text where a piece spells more than it covers (an
+     * end-of-word suffix), so the window is clamped to the text. */
+    const size_t t0 = std::min(text.size(), byte > 60 ? byte - 60 : 0);
     std::printf("      text      '%s'\n",
-                printable(text.substr(t0, std::min<size_t>(120, text.size() - std::min(t0, text.size())))).c_str());
+                printable(text.substr(t0, std::min<size_t>(120, text.size() - t0))).c_str());
     return true;
 }
 

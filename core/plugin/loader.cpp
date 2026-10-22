@@ -208,6 +208,9 @@ int Registry::commit_(Staged& s, int order) {
          * container, which "" means. */
         if (auto q_fn = dl_fn<const char* (*)(void)>(s.handle, "rad_arch_quant"))
             p.arch_quant = or_empty(q_fn());
+        /* Optional: absent means the plugin may serve an imported quantisation (startup.h). */
+        if (auto i_fn = dl_fn<int (*)(void)>(s.handle, "rad_arch_serves_imports"))
+            p.arch_serves_imports = i_fn() != 0;
 
         /* Optional: answers what the core needs before it builds the RadBuildCtx for declare.
          * Absent means every answer is zero (rad_builder.h). */
@@ -457,6 +460,7 @@ int Registry::commit_(Staged& s, int order) {
     }
     const auto concurrent = dl_fn<RadKernelConcurrentFn>(s.handle, "rad_kernel_concurrent");
     const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
+    const auto chainable  = dl_fn<RadKernelChainFn>(s.handle, "rad_kernel_chain");
     for (const auto& sr : staged_rows) {
         KernelRow row;
         row.info         = sr.first;
@@ -468,6 +472,7 @@ int Registry::commit_(Staged& s, int order) {
         row.collective   = coll != 0;
         row.releases_link = coll == 2;
         row.reference    = p.reference;
+        row.chain        = chainable && chainable(sr.second) != 0;
         rows_.push_back(row);
     }
 

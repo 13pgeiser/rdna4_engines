@@ -48,6 +48,9 @@ struct Branch {
     std::vector<int32_t>             tokens;
     std::shared_ptr<mm::PromptMedia> media;    /* null for a prompt with no pictures */
     int32_t                          n_drop = 0;
+    /* The user's prompt through the model's second tokenizer (RadGeneratorDecl::aux_tokens);
+     * empty otherwise. */
+    std::vector<int32_t>             aux;
 };
 
 /* One finished image, or a preview of one. */
@@ -99,6 +102,8 @@ struct Request {
     float    cfg = 1.0f;
     int32_t  width = 0, height = 0;     /* pixels, whole multiples of the declared multiple */
     int32_t  steps = 0;                 /* 0: the model's default (or its fixed schedule) */
+    /* A discrete-time model's sampler and scheduler (RAD_GEN_SAMPLER_*, RAD_GEN_SCHED_*). */
+    int32_t  sampler = 0, scheduler = 0;
     int32_t  n = 1;
     uint64_t seed = 0;                  /* image i draws its noise from seed + i */
     int32_t  previews = 0;              /* partial images per image, 0..3 */
@@ -109,6 +114,12 @@ struct Request {
     bool                 inpaint = false;
     Pixels               inp_src;
     std::vector<float>   inp_mask;
+    /* The runtime LoRA slot every pass of the request runs with (Engine::gen_lora_acquire), -1
+     * for none, and the hold that keeps the slot's adapters in it until the request is done. */
+    int32_t              lora_slot = -1;
+    std::shared_ptr<void> lora_hold;
+    /* RAD_GEN_COND_* for the plugin's COND passes (`rebalance`: Krea 2's tap gains). */
+    int32_t              cond_opts = 0;
     std::shared_ptr<Ticket> ticket;
 };
 
@@ -118,6 +129,31 @@ struct Request {
  * dynamic shift. f32, matching the reference. */
 std::vector<float> schedule(const RadGeneratorDecl& d, const std::vector<double>& fixed,
                             int32_t steps, int64_t tokens);
+
+/* ================================================================== a discrete-time schedule */
+/* The sigma table of a model trained on discrete timesteps (RadGeneratorDecl::train_steps), as
+ * ComfyUI's ModelSamplingDiscrete builds it: betas in f64, their cumulative product, sigma_t =
+ * sqrt((1 - abar_t) / abar_t), then f32, and the f32 logs. */
+struct DiscreteTable {
+    std::vector<float> sigmas;      /* [train_steps], ascending: sigmas[t] is timestep t's */
+    std::vector<float> log_sigmas;
+    float sigma_min() const { return sigmas.front(); }
+    float sigma_max() const { return sigmas.back(); }
+    /* sigma at a fractional timestep: the logs interpolated linearly, t clamped to the table. */
+    float sigma_at(double t) const;
+    /* The timestep a sigma is conditioned at: the table's nearest in log sigma. */
+    int32_t timestep(float sigma) const;
+};
+/* RAD_E_INVAL with `why` for a declaration whose schedule cannot be built. */
+int discrete_table(const RadGeneratorDecl& d, DiscreteTable* out, std::string* why);
+/* The n + 1 sigmas `scheduler` places for `steps` (0: the default) steps, the last 0. */
+std::vector<float> schedule_discrete(const RadGeneratorDecl& d, const DiscreteTable& t,
+                                     int32_t scheduler, int32_t steps);
+/* The names a request spells samplers and schedulers by, and their ids (-1: none). */
+const char* sampler_name(int32_t id);
+const char* scheduler_name(int32_t id);
+int32_t     sampler_id(const std::string& name);
+int32_t     scheduler_id(const std::string& name);
 
 /* ================================================================== the generator's sequence */
 /* One conditioning sequence as the generator sees it (RadGeneratorDecl::layout): the prompt row or
@@ -129,6 +165,11 @@ struct Layout {
     std::vector<int32_t> seg;          /* [n_seg + 1] */
     std::vector<int32_t> bidi;         /* [n_seg] */
     int32_t              next_pos = 0; /* the rotary count after the last row: the image's frame */
+    /* JOINT_STEP only: the text's rows (padding included), the padding rows among them, and the
+     * f32 positions, [4, rows] component-major (`rope` is then empty). */
+    int64_t              text = 0;
+    int32_t              n_pad = 0;
+    std::vector<float>   rope_f;
 };
 /* `ref_hw` is each reference's latent grid (h, w), in media order. RAD_E_INVAL with `why` when the
  * prompt does not start with its drop prefix or a picture's slots do not tile its latent grid. */
@@ -136,6 +177,17 @@ int build_layout(const Branch& b, int64_t slot_rows, const std::vector<std::pair
                  Layout* out, std::string* why);
 /* The rotary positions of an h x w image at frame `pos`: [3, h * w] component-major. */
 void image_rope(int32_t pos, int32_t h, int32_t w, int32_t* planes, int64_t n_total);
+
+/* A conditioning in the JOINT_STEP layout (RadGeneratorDecl): the prompt's rows after its drop
+ * prefix, padding to a multiple of `pad_multiple` (0: none), then each reference picture's latent
+ * tokens. `src` is the prompt row behind a text row -- a padding row's is past the prompt's last,
+ * where the COND pass appends the padding tokens -- or -(1 + i) for reference latent row i. One
+ * text segment (causal) and a segment per picture (bidirectional). */
+int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
+                       const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
+                       std::string* why);
+/* The f32 positions (0, s h, s w, l) of an h x w grid: [4, h * w] component-major. */
+void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, int64_t n_total);
 
 }  /* namespace gen */
 }  /* namespace rad */

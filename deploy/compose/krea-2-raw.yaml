@@ -1,0 +1,17 @@
+# Krea 2 Raw (krea/Krea-2-Raw) as block fp8: text to image on OpenAI's /v1/images/generations, on one
+# card, RADIANCE_GPU in .env (default 0). The Krea 2 Community License and Krea's acceptable use
+# policy apply.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/krea2 and add `--lora-dir /models/loras/krea2` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
+name: radiance-krea-2-raw
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-krea-2-raw
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/krea-2-raw-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1

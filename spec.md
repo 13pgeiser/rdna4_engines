@@ -894,6 +894,7 @@ utilisation fraction:
 |---|---|
 | `--gpu-headroom-mib` | VRAM left unclaimed on every card (default 96) |
 | `--host-pool-mib` | the pinned host tier |
+| `--host-headroom-mib` | host RAM left free for the system at startup (default 4096) |
 | `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
 | `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
 
@@ -1081,6 +1082,18 @@ moving blocks one at a time would be all dispatch cost. Within a layer blocks ar
 packing a set is `gather_rows` and restoring is `scatter_rows` (`docs/OPS.md`): one launch per
 (group, layer) for a whole batch.
 
+**Under tensor parallelism** the policy describes conversations, which are not sharded, and the
+transfer is per rank. One host slot holds the whole engine's entry: a group every rank holds whole
+(`rad_kv_group_replicated`, an MLA latent cache) once, in one window at the slot's front that rank
+0 writes and every rank reads back; then each rank's own shard of the sharded groups, one window
+per rank, which can differ in width (uneven heads, `rad_kv_group_zero`). `TierExec::slot_layout`
+is the one place the arithmetic lives, and bringup refuses a group replicated on one rank but zero,
+unflagged or another width on another. The leader plans and reports; a follower moves only its own
+window and, under `RADIANCE_DEBUG_TIER_VERIFY`, also gathers the replicated groups so the leader
+can compare its window with every follower's hash once the batch has landed everywhere, which is
+how the plugin's claim is checked. On GLM-5.3-Flash at eight ranks, whose two cached groups are
+both replicated, a slot is 49.59 KiB rather than 396.75 KiB.
+
 **Recurrent state.** On a hybrid model a session is blocks plus recurrent state. The state lives in
 a slot of the snapshot store (pinned host memory, `--checkpoint-slots`), copied off the card after
 the step that produced it and back before the step that resumes from it, so it never holds VRAM.
@@ -1142,7 +1155,10 @@ shows every collective where the plugin put it.
 
 The residual stream is replicated: every rank holds the whole hidden state between blocks. Weights
 that act only on the stream, such as hyper-connection mixing (`arch/common/rad_block_hc.h`), are
-replicated too, since sharding them would add a collective at each use.
+replicated too, since sharding them would add a collective at each use. A KV group every rank
+holds whole, such as an MLA latent cache computed from a replicated projection, is declared
+`rad_kv_group_replicated`, and the idle session tiers (§7.3) then keep it once a host slot instead
+of once a rank; the core cannot tell from the graph, so the plugin says it.
 
 `lm_head` is vocabulary-sharded like any column-parallel weight, so the sampler (§13) runs a
 distributed top-k: each rank reduces its own shard and only the candidate sets are combined. Full
@@ -1182,7 +1198,9 @@ core.
 **Kind is a shape, not a model.** `RAD_DRAFT_SERIAL` runs `depth` dependent passes, each embedding
 what the last proposed. `RAD_DRAFT_BLOCK` runs a context pass, then one pass that fills every
 drafted position. MTP and EAGLE-style heads are serial; block-diffusion drafters (DFlash2, DSpark)
-are block.
+are block. Both run on the card's acceptance (`core/sched/advance.h`): the verify's acceptance, the
+positions of every pass after it and the proposals stay on the card, so a step's passes and the
+next step are issued before the step is read back, and the host's commit runs beside the card.
 
 Separate draft models are not supported; a drafter is part of the model's source.
 `rad-convert --draft-model` merges a drafter that ships as its own repository into the container
@@ -1245,7 +1263,8 @@ of a linear-attention kernel pair's schema (`docs/OPS.md`).
 
 **Coverage.** Pictures and video on every Qwen container that carries the vision tower
 (Qwen3.8-27B in bf16 and fp8, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next) and on Gemma 4 31B
-(`gemma4_bf16`); pictures on LFM2-VL; pictures, video and audio as EmbeddingGemma 2 input. Media
+(`gemma4_bf16`); pictures on LFM2-VL and GLM-5.3-Flash; pictures, video and audio as EmbeddingGemma
+2 input. Media
 arrive as `image_url` / `video_url` chat parts (`input_image` / `input_video` in the Responses
 API) and audio as `input_audio` / `audio_url`, as `data:` URLs only: fetching a caller's URL would
 make the server an SSRF proxy.
@@ -1263,6 +1282,9 @@ colour matrix and range. The family comes from the container (`core/mm/processor
   1120); a video is frames at `fps`, each its own segment at the per-frame budget.
 - **LFM2-VL.** A picture within its token budget is resized whole; a larger one is cut into tiles
   followed by a thumbnail. Images only.
+- **GLM-5.3.** A canvas of whole merged patches within a token budget; the picture keeps its aspect
+  ratio, is resized only past the budget or under its floor, and is padded black to the canvas.
+  Images only, the tokens at their positions (the language model has no rotary).
 
 `tests/mm_test.cpp` checks the processor against goldens generated by `tests/mkgolden.py` from
 transformers' own functions. A media part reaches the chat template as a marker that the part join
@@ -1270,7 +1292,8 @@ leaves unpadded, so an image prompt tokenises to the reference's ids.
 
 **The encoder is the language model's plugin.** The tower is declared last by the language model's
 plugin (for Qwen, `arch/common/rad_block_vit.h` in `qwen35_bf16`, `qwen35_fp8`, `qwen35moe_fp8` and
-`qwen4exp_fp8`) when the container carries its weights and the deployment asks for an encoder
+`qwen4exp_fp8`; for GLM-5.3, `arch/common/rad_block_glm_vision.h` in `glm5next`) when the container
+carries its weights and the deployment asks for an encoder
 (`--mm-max-patches`; `auto` is 16384 patches a pass when the container has a tower, a 2048 x 2048
 picture at 16x16 patches; a larger picture is resized to fit, since a segment is never split). Its
 weights are `RAD_ACCESS_PER_REQUEST` in groups past every text layer, declared with one

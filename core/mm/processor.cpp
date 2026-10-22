@@ -91,6 +91,65 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         return RAD_OK;
     }
     const char* mt = rad_meta_gets(&m, "vision_config.model_type", "");
+    /* GLM-5.3 states its processor only in processor_config.json's image_processor, with a token
+     * budget and no pixel band; the tower's geometry is the fallback, as the processor class
+     * defaults to it. */
+    if (mt && !std::strcmp(mt, "glm5_next_vision")) {
+        family = Family::Glm5Next;
+        auto geti = [&](const char* k, const char* tower, int64_t dflt) {
+            const std::string key = std::string("processor.image_processor.") + k;
+            return rad_meta_geti(&m, key.c_str(), rad_meta_geti(&m, tower, dflt));
+        };
+        patch    = (int32_t)geti("patch_size", "vision_config.patch_size", 0);
+        temporal = (int32_t)geti("temporal_patch_size", "vision_config.temporal_patch_size", 0);
+        merge    = (int32_t)geti("merge_size", "vision_config.spatial_merge_size", 0);
+        if (patch <= 0 || temporal <= 0 || merge <= 0) {
+            if (why) *why = "the container states no vision tower geometry (vision_config."
+                            "patch_size, temporal_patch_size, spatial_merge_size)";
+            return RAD_E_NOTFOUND;
+        }
+        /* The expand factor multiplies the canvas's alignment without changing the patches; the
+         * checkpoints ship 1, and another one is a canvas this processor does not make. */
+        const int64_t expand =
+            rad_meta_geti(&m, "processor.image_processor.patch_expand_factor", 1);
+        if (expand != 1) {
+            if (why) *why = "processor.image_processor.patch_expand_factor is " +
+                            std::to_string(expand) + "; this processor serves 1";
+            return RAD_E_UNSUPPORTED;
+        }
+        tok_image = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        tok_video = (int32_t)rad_meta_geti(&m, "video_token_id", -1);
+        tok_start = (int32_t)rad_meta_geti(&m, "image_start_token_id", -1);
+        tok_end   = (int32_t)rad_meta_geti(&m, "image_end_token_id", -1);
+        if (tok_image < 0 || tok_start < 0 || tok_end < 0) {
+            if (why) *why = "the container states no media token ids (image_token_id, "
+                            "image_start_token_id, image_end_token_id)";
+            return RAD_E_NOTFOUND;
+        }
+        min_image_tokens = (int32_t)rad_meta_geti(&m, "processor.image_processor.min_image_tokens",
+                                                  16);
+        max_image_tokens = (int32_t)rad_meta_geti(&m, "processor.image_processor.max_image_tokens",
+                                                  8000);
+        /* OpenAI CLIP's, the processor class's default. */
+        const float clip_mean[3] = { 0.48145466f, 0.4578275f, 0.40821073f };
+        const float clip_std[3]  = { 0.26862954f, 0.26130258f, 0.27577711f };
+        std::copy(clip_mean, clip_mean + 3, mean);
+        std::copy(clip_std, clip_std + 3, stdv);
+        read_triple(m, "processor.image_processor.image_mean", mean);
+        read_triple(m, "processor.image_processor.image_std", stdv);
+        /* The pixel bands are QwenVL's; here they only have to be consistent for check(). */
+        const int64_t f2 = (int64_t)factor() * factor();
+        image_min_pixels = video_min_pixels = std::max<int64_t>(1, min_image_tokens) * f2;
+        image_max_pixels = video_max_pixels =
+            std::max<int64_t>(image_min_pixels, (int64_t)max_image_tokens * f2);
+        std::string bad;
+        if (check(&bad) < 0) {
+            if (why)
+                *why = "the container's GLM-5.3 processor configuration is inconsistent: " + bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     if (mt && !std::strcmp(mt, "gemma4_vision")) {
         family   = Family::Gemma4;
         patch    = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
@@ -201,6 +260,9 @@ int VisionConfig::check(std::string* why) const {
         if (!(max_pixels_tolerance > 0.0) || max_segment_patches <= 0)
             return no("max_pixels_tolerance and max_num_patches must be positive");
     }
+    if (family == Family::Glm5Next && (min_image_tokens < 1 || max_image_tokens < min_image_tokens))
+        return no("the image token band [" + std::to_string(min_image_tokens) + ", " +
+                  std::to_string(max_image_tokens) + "] is empty");
     if (family == Family::Gemma4) {
         if (!soft_budget_ok(image_soft_tokens))
             return no("the image soft-token budget " + std::to_string(image_soft_tokens) +
@@ -321,6 +383,51 @@ int gemma4_size(int64_t h, int64_t w, int32_t patch, int32_t pool, int64_t max_p
     }
     *oh = th;
     *ow = tw;
+    return RAD_OK;
+}
+
+/* Glm5NextImageProcessor's smart_resize and the size its resize() gives the picture, in Python's
+ * doubles. A token is `temporal` frames of factor x factor pixels, and a picture counts as
+ * `temporal` frames. The canvas's sides are rounded up to whole factors; under the floor the
+ * picture is scaled up by the area ratio and rounded up again; over the budget a binary search over
+ * the picture's height finds the largest canvas inside it. The picture then scales by the smaller
+ * side ratio, never up while it reaches the floor, truncated. */
+int glm5next_size(int64_t h, int64_t w, int32_t temporal, int32_t factor, int64_t min_tok,
+                  int64_t max_tok, int64_t* oh, int64_t* ow, int64_t* ch, int64_t* cw,
+                  std::string* why) {
+    if (h <= 0 || w <= 0) { if (why) *why = "the picture has no size"; return RAD_E_INVAL; }
+    const int64_t per_tok = (int64_t)temporal * factor * factor;
+    const int64_t min_px = min_tok * per_tok, max_px = max_tok * per_tok;
+    if (max_px < per_tok) {
+        if (why) *why = "the token budget is less than one merged patch";
+        return RAD_E_INVAL;
+    }
+    auto align = [factor](int64_t v) { return (v + factor - 1) / factor * factor; };
+    int64_t ah = align(h), aw = align(w);
+    if (temporal * ah * aw < min_px) {
+        const double scale = std::sqrt((double)min_px / ((double)temporal * (double)h * (double)w));
+        ah = align(std::max<int64_t>(1, (int64_t)std::ceil((double)h * scale)));
+        aw = align(std::max<int64_t>(1, (int64_t)std::ceil((double)w * scale)));
+    }
+    if (temporal * ah * aw > max_px) {
+        int64_t lo = 1, hi = h, bh = factor, bw = factor;
+        while (lo <= hi) {
+            const int64_t mid = (lo + hi) / 2;
+            const int64_t wid = std::max<int64_t>(1, (int64_t)std::floor((double)(w * mid) /
+                                                                         (double)h));
+            const int64_t th = align(mid), tw = align(wid);
+            if (temporal * th * tw <= max_px) { bh = th; bw = tw; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        ah = bh;
+        aw = bw;
+    }
+    double scale = std::min((double)ah / (double)h, (double)aw / (double)w);
+    if (temporal * h * w >= per_tok * min_tok) scale = std::min(1.0, scale);
+    *oh = ah;
+    *ow = aw;
+    *ch = std::max<int64_t>(1, std::min<int64_t>(ah, (int64_t)std::floor((double)h * scale)));
+    *cw = std::max<int64_t>(1, std::min<int64_t>(aw, (int64_t)std::floor((double)w * scale)));
     return RAD_OK;
 }
 
@@ -671,6 +778,15 @@ int Processor::init(const VisionConfig& cfg,
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
+    if (cfg.family == Family::Glm5Next) {
+        /* A token is merge^2 patches and an image is one segment of one pass, so the budget is
+         * lowered to what a pass holds. */
+        const int64_t pass_tok = cfg.max_patches / ((int64_t)cfg.merge * cfg.merge);
+        if (pass_tok < cfg.min_image_tokens) return RAD_E_INVAL;
+        if (cfg_.max_image_tokens > pass_tok) cfg_.max_image_tokens = (int32_t)pass_tok;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
     if (cfg.family == Family::Gemma4) {
         /* A budget is a patch count, and an image is one segment of one pass. */
         if ((int64_t)cfg.image_soft_tokens * cfg.merge * cfg.merge > cfg.max_patches ||
@@ -805,10 +921,50 @@ int Processor::image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::strin
     return RAD_OK;
 }
 
+/* GLM-5.3's image processor (transformers' Glm5NextImageProcessor, torchvision backend): the
+ * picture, resized only when its size changes, in the top left of a canvas of zero bytes, which
+ * the normalisation turns into each channel's -mean / std as it does the reference's padding. */
+int Processor::image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    int64_t h = 0, w = 0, ch = 0, cw = 0;
+    RAD_TRY(glm5next_size(f.h, f.w, c.temporal, c.factor(), c.min_image_tokens,
+                          c.max_image_tokens, &h, &w, &ch, &cw, why));
+    Frame r;
+    const Frame* src = &f;
+    if (ch != f.h || cw != f.w) {
+        resize_bicubic_torch(f, (int32_t)cw, (int32_t)ch, &r);
+        src = &r;
+    }
+    Frame canvas;
+    canvas.w = (int32_t)w;
+    canvas.h = (int32_t)h;
+    canvas.rgb.assign((size_t)w * h * 3, 0);
+    for (int64_t y = 0; y < ch; ++y)
+        std::memcpy(canvas.rgb.data() + (size_t)y * w * 3, src->rgb.data() + (size_t)y * cw * 3,
+                    (size_t)cw * 3);
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)(h / c.patch);
+    it->grid_w = (int32_t)(w / c.patch);
+    it->rope_1d = true;
+    finish_item(c, it.get());
+    if (it->n_patch > c.max_patches) {
+        if (why) *why = "the image resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    std::vector<const Frame*> frames((size_t)c.temporal, &canvas);
+    patchify(c, frames, it.get());
+    one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return image_gemma4(f, c.image_soft_tokens, out, why);
     if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
+    if (c.family == Family::Glm5Next) return image_glm5next(f, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
                                &h, &w, why));
@@ -901,6 +1057,10 @@ int Processor::video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::str
 int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return video_gemma4(v, out, why);
+    if (c.family == Family::Glm5Next) {
+        if (why) *why = "this model's processor takes pictures, not video";
+        return RAD_E_UNSUPPORTED;
+    }
     if (v.frames.empty()) { if (why) *why = "the video decoded to no frames"; return RAD_E_INVAL; }
     /* Pad the frames and their indices to whole temporal groups by repeating the last; a clip
      * shorter than one group becomes one group. */
@@ -982,6 +1142,11 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
 int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
                      std::shared_ptr<Item>* out, std::string* why, int64_t max_pixels) const {
     if (image_tokens != 0) {
+        if (cfg_.family == Family::Glm5Next) {
+            if (why) *why = "this model's image token budget is the server's (--image-tokens), "
+                            "not a request's";
+            return RAD_E_UNSUPPORTED;
+        }
         if (cfg_.family != Family::Gemma4) {
             if (why) *why = "this model's processor sizes an image by its pixels, not by a token "
                             "budget";
@@ -1153,7 +1318,7 @@ std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
 
 int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
                      std::string* why) const {
-    if (cfg_.family == Family::Lfm2) {
+    if (cfg_.family == Family::Lfm2 || cfg_.family == Family::Glm5Next) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
     }

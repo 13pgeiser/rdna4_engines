@@ -3,6 +3,7 @@
 #include "build/rad_build.h"
 #include "rad_internal.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <string>
@@ -73,23 +74,36 @@ rad_buf decl_persist(Builder& b, const std::string& name, uint32_t dtype, uint32
 
 }  /* namespace */
 
+/* A generator pass's adapter ops run over at most this many rows at a time: large enough that the
+ * kernels' row tiles are all busy, small enough that `t` for the largest rank is a few MiB. */
+constexpr int64_t kGenChunk = 8192;
+
 int lora_declare(Builder& b, const LoraDeclare& d) {
     if (!d.cfg || !d.cfg->enabled()) return RAD_OK;
     Program& P = b.program();
     /* Adapters are chosen per request and applied on the token steps of a model that writes
-     * logits; a generator's passes and an embedding model's requests carry no adapter. */
-    if (P.is_pass_driven() || P.pooled_buf != RAD_NULL_HANDLE ||
-        P.logits_buf == RAD_NULL_HANDLE) {
-        RAD_ERR("lora: runtime LoRA adapters serve a model that generates text, and this one %s",
-                P.is_pass_driven()                  ? "is an image, audio or video generator"
+     * logits, or on every pass of a generator that names its adapter keys (rad_lora_root); an
+     * embedding model's requests carry no adapter. */
+    const bool gen = P.is_pass_driven();
+    if (gen ? P.lora_roots.empty()
+            : (P.pooled_buf != RAD_NULL_HANDLE || P.logits_buf == RAD_NULL_HANDLE)) {
+        RAD_ERR("lora: runtime LoRA adapters serve a model that generates text, or a generator "
+                "that declares how adapter files name its modules, and this one %s",
+                gen                                 ? "is a generator that declares no adapter "
+                                                      "key names (rad_lora_root)"
                 : P.pooled_buf != RAD_NULL_HANDLE ? "makes embeddings"
                                                     : "declares no logits");
         return RAD_E_UNSUPPORTED;
     }
+    if (!gen && d.targets.count("*")) {
+        RAD_ERR("lora: an adapter without adapter_config.json names no target modules, and a "
+                "text model has no default set; give them with --lora-target-modules");
+        return RAD_E_UNSUPPORTED;
+    }
     const int     S = d.cfg->slots();
-    const int     max_rank = d.cfg->max_rank;
+    const int     max_rank = d.cfg->rank(gen);
     const int64_t max_tok = P.ctx.max_tok;
-    if (S <= 0 || max_rank <= 0 || max_tok <= 0) {
+    if (S <= 0 || max_rank <= 0 || (!gen && max_tok <= 0)) {
         RAD_ERR("lora: %d slots of rank %d over steps of %lld tokens is not a configuration", S,
                 max_rank, (long long)max_tok);
         return RAD_E_INVAL;
@@ -150,6 +164,26 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         }
     }
 
+    /* ---- a token step's rows are its tokens; a generator pass's are each GEMM's own, issued in
+     * chunks of at most kGenChunk rows (Ctx::issue_lora), so `t` holds one chunk. */
+    int64_t rows = max_tok;
+    if (gen) {
+        rows = 0;
+        for (const lora::Site& x : sites)
+            if (x.gemm > 0 && x.gemm < P.ops.size()) rows = std::max(rows, P.ops[x.gemm].range_hi);
+        rows = std::min<int64_t>(rows, kGenChunk);
+    }
+
+    /* On the real declare, what the adapters cost: the pools are persistent buffers, so the
+     * arena plan (and with it what is left for weights and the KV cache) holds them. */
+    if (d.sites_out) {
+        int64_t slot_bytes = 0;
+        for (const LoraPool& p : P.lora_pools) slot_bytes += 2 * p.R * p.K + 2 * p.N * p.R + 4 * p.N;
+        RAD_INFO("lora: %zu weights carry adapters, %d slots of rank %d, %s a slot on this rank, "
+                 "%s in all (--max-loras, --max-lora-rank)", P.lora_pools.size(), S, max_rank,
+                 humanb(slot_bytes).c_str(), humanb(slot_bytes * S).c_str());
+    }
+
     /* ---- t = A.x, one f32 plane per capacity R and lane. Persistent, not transient: the ops that
      * use it run at the GEMM's position, but the buffer plan would place a transient at the
      * appended ops' own position, the end of the program, and share its bytes with buffers live
@@ -160,7 +194,7 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         if (t_by_r.count(x.R)) continue;
         LoraScratch sc;
         sc.R = x.R;
-        const int64_t sh[2] = { max_tok, x.R };
+        const int64_t sh[2] = { rows, x.R };
         for (int l = 0; l < 2; ++l) {
             sc.lane[l] = decl_persist(b, fmt("lora.t.r%lld.lane%d", (long long)x.R, l), RAD_F32, 2, sh);
             if (!sc.lane[l]) return RAD_E_STATE;
@@ -169,9 +203,21 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         P.lora_t.push_back(sc);
     }
 
+    /* ---- a generator pass's slot operand: elements [s rows, (s + 1) rows) of an [S rows] i32
+     * buffer, every one s (filled when the engine starts adapters) */
+    P.lora_rows = 0;
+    P.lora_rows_n = 0;
+    if (gen && rows > 0) {
+        const int64_t sh[1] = { S * rows };
+        P.lora_rows = decl_persist(b, "lora.slot_rows", RAD_I32, 1, sh);
+        if (!P.lora_rows) return RAD_E_STATE;
+        P.lora_rows_n = rows;
+    }
+
     /* ---- the two ops behind each targeted GEMM */
     P.lora_sites.clear();
     int n_refused = 0;
+    std::vector<char> dropped(sites.size(), 0);
     for (lora::Site& x : sites) {
         const uint32_t gh = x.gemm;
         if (gh == 0 || gh >= P.ops.size()) return RAD_E_STATE;
@@ -186,7 +232,15 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         const int      oa = opd_index(g, "a"), oas = opd_index(g, "a_scale"), oy = opd_index(g, "y");
         const std::vector<rad_buf> reads = b.op_read_set(gh), writes = b.op_write_set(gh);
 
+        /* A text model's targeted GEMM that cannot carry the ops is refused; a generator's, whose
+         * every plain GEMM is a candidate, stays the base and its modules are reported unplaced. */
         auto refuse = [&](const std::string& why) {
+            if (gen) {
+                RAD_WARN("lora: op %u '%s' over '%s' carries no adapter: %s", gh, gop.c_str(),
+                         x.weight.c_str(), why.c_str());
+                dropped[(size_t)(&x - sites.data())] = 1;
+                return;
+            }
             RAD_ERR("lora: op %u '%s' over '%s': %s", gh, gop.c_str(), x.weight.c_str(), why.c_str());
             ++n_refused;
         };
@@ -223,9 +277,14 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         sp[n_sp++] = RAD_STR("dtype", rad_dtype_name(a_dt));
         const rad_op hs = b.decl_op("lora_shrink", sp, n_sp, nullptr, 0);
 
-        const RadParam ep[5] = { RAD_RANGE("M", lo, hi), RAD_INT("N", x.N_r), RAD_INT("R", x.R),
-                                 RAD_INT("S", S), RAD_STR("dtype", rad_dtype_name(y_dt)) };
-        const rad_op he = b.decl_op("lora_expand", ep, 5, nullptr, 0);
+        RadParam ep[5] = { RAD_RANGE("M", lo, hi), RAD_INT("N", x.N_r), RAD_INT("R", x.R),
+                           RAD_INT("S", S), RAD_STR("dtype", rad_dtype_name(y_dt)) };
+        /* A generator's passes are many rows of one adapter: its expand runs on the WMMA
+         * (lora_expand_mm) where a library has it. A token step keeps the exact row, whose bytes
+         * do not depend on the batch. */
+        const char* expand_op = gen && b.op_declared("lora_expand_mm") ? "lora_expand_mm"
+                                                                        : "lora_expand";
+        const rad_op he = b.decl_op(expand_op, ep, 5, nullptr, 0);
         if (!hs || !he) {
             refuse(fmt("no kernel resolves lora_%s for an activation of %s and an output of %s",
                        !hs ? "shrink" : "expand", rad_dtype_name(a_dt), rad_dtype_name(y_dt)));
@@ -233,6 +292,28 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         }
 
         LoraIssueSite is;
+        /* A generator's slot packs its ranks from 0 (lora::pack_modules, compact): pairs that read
+         * the first half and quarter of R, so a rank-16 adapter in a slot sized 64 a module costs
+         * a quarter. Multiples of 16, the WMMA's step. */
+        if (gen) {
+            int64_t prev = x.R;
+            for (int v = 0; v < 2; ++v) {
+                const int64_t rv = ((x.R >> (v + 1)) + 15) / 16 * 16;
+                if (rv < 16 || rv >= prev) break;
+                RadParam vs[6];
+                for (int i = 0; i < n_sp; ++i) vs[i] = sp[i];
+                vs[2] = RAD_INT("R", rv);
+                ep[2] = RAD_INT("R", rv);
+                const rad_op vs_op = b.decl_op("lora_shrink", vs, n_sp, nullptr, 0);
+                const rad_op ve_op = b.decl_op(expand_op, ep, 5, nullptr, 0);
+                if (!vs_op || !ve_op) break;
+                P.ops[vs_op].anchor = (int32_t)gh;
+                P.ops[ve_op].anchor = (int32_t)gh;
+                is.shrink_v[v] = vs_op; is.expand_v[v] = ve_op; is.R_v[v] = rv;
+                is.n_v = (int8_t)(v + 1);
+                prev = rv;
+            }
+        }
         is.gemm = gh; is.shrink = hs; is.expand = he;
         is.opd_a = (int8_t)oa;
         is.opd_a_scale = (int8_t)(coded ? oas : -1);
@@ -248,7 +329,13 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
     }
     if (n_refused) return RAD_E_UNSUPPORTED;
 
-    if (d.sites_out) *d.sites_out = std::move(sites);
+    if (gen) P.lora_rused.assign(P.lora_pools.size() * (size_t)S, 0);
+    if (d.sites_out) {
+        std::vector<lora::Site> kept;
+        for (size_t i = 0; i < sites.size(); ++i)
+            if (!dropped[i]) kept.push_back(std::move(sites[i]));
+        *d.sites_out = std::move(kept);
+    }
     return RAD_OK;
 }
 

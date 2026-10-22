@@ -38,11 +38,20 @@ __device__ __forceinline__ unsigned int r4d_g_load_acq(const unsigned int* p) {
 //
 // The vocab-parallel sampler's merge reads one row of gathered candidates per position at a single
 // row stride, which the concatenated form cannot express. Interleaving costs one division per word
-// and saves a transpose launch.
-__device__ __forceinline__ int r4d_g_dst(int k, int row16, int n16, int who) {
+// and saves a transpose launch. `dp16` is the output's row pitch in words: 2 * row16 for a tight
+// [rows][2][row16], more when the gathered rows are the leading columns of a wider buffer.
+__device__ __forceinline__ int r4d_g_dst(int k, int row16, int n16, int who, int dp16) {
   if (row16 <= 0 || row16 >= n16) return who * n16 + k;
   const int m = k / row16, c = k - m * row16;
-  return m * (2 * row16) + who * row16 + c;
+  return m * dp16 + who * row16 + c;
+}
+
+// Where word k of this rank's contribution is read: `sp16` is the input's row pitch in words,
+// row16 when its rows are tight, more when they are a window of a wider row.
+__device__ __forceinline__ int r4d_g_src(int k, int row16, int n16, int sp16) {
+  if (row16 <= 0 || row16 >= n16 || sp16 == row16) return k;
+  const int m = k / row16, c = k - m * row16;
+  return m * sp16 + c;
 }
 
 // Block b owns words [start,end) of the 16B-word space and drives its own flag handshake; no
@@ -50,7 +59,8 @@ __device__ __forceinline__ int r4d_g_dst(int k, int row16, int n16, int who) {
 __global__ void r4d_ar_gather_2rank_kernel(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
-    int n16, int slot_stride16, int rank, int row16, int drain, int acq, unsigned int nbw) {
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    unsigned int nbw) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   // device-resident, replay-safe
@@ -68,14 +78,20 @@ __global__ void r4d_ar_gather_2rank_kernel(
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
-      int4 v0 = in4[k], v1 = in4[k + nt], v2 = in4[k + 2 * nt], v3 = in4[k + 3 * nt];
+      int4 v0 = in4[r4d_g_src(k, row16, n16, sp16)], v1 = in4[r4d_g_src(k + nt, row16, n16, sp16)],
+           v2 = in4[r4d_g_src(k + 2 * nt, row16, n16, sp16)],
+           v3 = in4[r4d_g_src(k + 3 * nt, row16, n16, sp16)];
       ps[k] = v0; ps[k + nt] = v1; ps[k + 2 * nt] = v2; ps[k + 3 * nt] = v3;
-      out4[r4d_g_dst(k,          row16, n16, rank)] = v0;
-      out4[r4d_g_dst(k + nt,     row16, n16, rank)] = v1;
-      out4[r4d_g_dst(k + 2 * nt, row16, n16, rank)] = v2;
-      out4[r4d_g_dst(k + 3 * nt, row16, n16, rank)] = v3;
+      out4[r4d_g_dst(k,          row16, n16, rank, dp16)] = v0;
+      out4[r4d_g_dst(k + nt,     row16, n16, rank, dp16)] = v1;
+      out4[r4d_g_dst(k + 2 * nt, row16, n16, rank, dp16)] = v2;
+      out4[r4d_g_dst(k + 3 * nt, row16, n16, rank, dp16)] = v3;
     }
-    for (; k < end; k += nt) { int4 v = in4[k]; ps[k] = v; out4[r4d_g_dst(k, row16, n16, rank)] = v; }
+    for (; k < end; k += nt) {
+      int4 v = in4[r4d_g_src(k, row16, n16, sp16)];
+      ps[k] = v;
+      out4[r4d_g_dst(k, row16, n16, rank, dp16)] = v;
+    }
   }
   // Drain modes, as in the all-reduce: order the pushes before the release flag so the peer cannot
   // see the flag before the data.
@@ -100,19 +116,19 @@ __global__ void r4d_ar_gather_2rank_kernel(
     const int who = 1 - rank;
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
-      out4[r4d_g_dst(k,          row16, n16, who)] = ms[k];
-      out4[r4d_g_dst(k + nt,     row16, n16, who)] = ms[k + nt];
-      out4[r4d_g_dst(k + 2 * nt, row16, n16, who)] = ms[k + 2 * nt];
-      out4[r4d_g_dst(k + 3 * nt, row16, n16, who)] = ms[k + 3 * nt];
+      out4[r4d_g_dst(k,          row16, n16, who, dp16)] = ms[k];
+      out4[r4d_g_dst(k + nt,     row16, n16, who, dp16)] = ms[k + nt];
+      out4[r4d_g_dst(k + 2 * nt, row16, n16, who, dp16)] = ms[k + 2 * nt];
+      out4[r4d_g_dst(k + 3 * nt, row16, n16, who, dp16)] = ms[k + 3 * nt];
     }
-    for (; k < end; k += nt) out4[r4d_g_dst(k, row16, n16, who)] = ms[k];
+    for (; k < end; k += nt) out4[r4d_g_dst(k, row16, n16, who, dp16)] = ms[k];
   }
 }
 
 void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream_i, long nblocks,
-                         long nthreads, long drain, long acq) {
+                         long nthreads, long drain, long acq, long dpitch, long spitch) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long nbytes = (long)n_elem * esize;
@@ -126,6 +142,19 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   if (row_elems > 0 && (rowb % 16 != 0 || nbytes % rowb != 0))
     throw std::runtime_error("all_gather: row is not a whole number of 16B words");
   const int row16 = row_elems > 0 ? (int)(rowb / 16) : 0;
+  // The output's row pitch in elements, 0 for a tight [rows][2][row]: whole words, at least the
+  // two ranks' row.
+  const long dpb = (long)dpitch * esize;
+  if (dpitch > 0 && (row16 <= 0 || dpb % 16 != 0 || dpitch < 2 * row_elems))
+    throw std::runtime_error("all_gather: the output pitch is not a whole number of 16B words "
+                             "at least two rows wide");
+  const int dp16 = dpitch > 0 ? (int)(dpb / 16) : 2 * row16;
+  // The input's row pitch in elements, 0 for tight rows: whole words, at least a row.
+  const long spb = (long)spitch * esize;
+  if (spitch > 0 && (row16 <= 0 || spb % 16 != 0 || spitch < row_elems))
+    throw std::runtime_error("all_gather: the input pitch is not a whole number of 16B words "
+                             "at least a row wide");
+  const int sp16 = spitch > 0 ? (int)(spb / 16) : row16;
   int nb = (int)nblocks;
   if (nb < 1) nb = 1;
   if (nb > n16) nb = n16;
@@ -139,5 +168,5 @@ void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, lo
   r4d_ar_gather_2rank_kernel<<<nb, nt, 0, st>>>(
       (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,
       (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,
-      (int)slot_stride16, (int)rank, row16, (int)drain, (int)acq, nbw);
+      (int)slot_stride16, (int)rank, row16, dp16, sp16, (int)drain, (int)acq, nbw);
 }

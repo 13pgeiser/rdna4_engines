@@ -17,7 +17,7 @@ extern "C" {
  * kind of plugin reports it, and a plugin that does not report exactly this version is refused at
  * load with both versions printed. A new optional export (e.g. rad_plugin_reference) is not a
  * change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 24u
+#define RAD_ABI_VERSION 26u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -135,7 +135,13 @@ typedef struct RadLayout {
  *   RAD_E_DTYPE        the kernel does not read this encoding (an fp8 GEMM handed int4, a rotated
  *                      weight to a kernel that does not rotate its activation). A declare-time
  *                      error naming the weight, the encoding and the kernel.
- *   RAD_E_SHAPE        the selected planes, or their extents, are not what the kernel reads. */
+ *   RAD_E_SHAPE        the selected planes, or their extents, are not what the kernel reads.
+ *   RAD_LAYOUT_ANY     the kernel reads the stored bytes without interpreting them (a prefetch
+ *                      into the cache), so it takes whatever form another reader chose and claims
+ *                      none: the builder does not count it when settling the stored form, and the
+ *                      runtime's layout check accepts it. A weight only such kernels read is
+ *                      stored as it is. */
+#define RAD_LAYOUT_ANY 1
 typedef int (*RadLayoutFn)(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                            const int* sel, const RadTensor* planes, int n_planes,
                            RadLayout* out);
@@ -497,6 +503,24 @@ typedef void (*RadPluginCloseFn)(void);
  * queue finish. Without the symbol, or with 0, every launch is ordered behind everything before
  * it, which is always correct. Symbol name: `rad_kernel_concurrent`. */
 typedef int  (*RadKernelConcurrentFn)(int i);
+
+/* Optional promise about kernel `i` of rad_kernel_at: nonzero means it can chain. Chaining replaces
+ * the packet processor's ordering between dependent launches (the AQL barrier bit) with a wait in
+ * the kernel. Where chaining is on the engine resolves the row with the parameter `chain` = 1, and
+ * the launch may then emit chained forms of its kernels, recognised by "r4dchain" in the kernel's
+ * name; only those get a record and lose the bit. A chained form, before its first read of an
+ * operand, one lane a block waits until the 64-bit word at the record's `ctr` reaches `target`,
+ * then the block barriers and acquires at agent scope; after its last write the block releases at
+ * agent scope, barriers, and one lane adds 1 to `ctr`. Every block, including one with nothing to
+ * do, adds exactly once. The record is RAD_CHAIN_REC_BYTES at byte RAD_CHAIN_KARG_OFF of the
+ * kernel's argument segment: { magic, target, ctr, check }, with check = magic ^ target ^ ctr ^
+ * RAD_CHAIN_CHECK. A record whose magic or check does not match means: run without waiting and do
+ * not add. Without the symbol, or with 0, the engine never asks. Symbol name: `rad_kernel_chain`. */
+typedef int  (*RadKernelChainFn)(int i);
+#define RAD_CHAIN_KARG_OFF  992
+#define RAD_CHAIN_REC_BYTES 32
+#define RAD_CHAIN_MAGIC     0x3130434e48434452ull   /* "RDCHCN01" */
+#define RAD_CHAIN_CHECK     0x9e3779b97f4a7c15ull
 
 /* Optional promise about kernel `i` of rad_kernel_at: nonzero means it is a collective. Its
  * launches exchange data with the other ranks' cards, so the interconnect carries their bytes

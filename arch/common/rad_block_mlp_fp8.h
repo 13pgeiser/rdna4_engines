@@ -60,13 +60,16 @@ struct MlpFP8 {
     /* The next block absorbs this block's closing all-reduce, so this one must not issue it.
      * Counterpart of `ar_in`; both sides ask ar_fused_ok(g, T), so they agree. */
     bool ar_out = false;
+    /* Set before declare: a clamped product (`swiglu_limit`) and its quantiser as one launch
+     * (GateQuantFP8::fuse_clamped). */
+    bool swiglu_quant = false;
 
     /* `fold`: a predecessor's delta is still in `w.h.x` and this norm does its residual add
      * (false for the first block of a chain). `add_out`: issue the trailing add here. See
      * rad_fp8.h. */
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
                  const Src& src, bool fold = false, bool add_out = true,
-                 int ar_in = kArNone, bool ar_out_ = false);
+                 int ar_in = kArNone, bool ar_out_ = false, double swiglu_limit = 0);
     void step(RadCtx* c, const RadBatch* batch) const;
     /* The block over the first `T` rows of its buffers (see MoeFP8::step_rows). */
     void step_rows(RadCtx* c, int64_t T) const { slice(c, T, 0, T); }
@@ -76,7 +79,7 @@ struct MlpFP8 {
 
 inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
                            const Src& src, bool fold, bool add_out,
-                           int ar_in, bool ar_out_) {
+                           int ar_in, bool ar_out_, double swiglu_limit) {
     g = geom; w = wire; layer = l;
     ar_out = ar_out_;
 
@@ -93,14 +96,21 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                  { src.gate, src.up }, w.h, w.gate_up, 0, { g.n_ff, g.n_ff }));
 
     /* The bf16 silu product is written only if the down projection reads the bf16 plane
-     * (LinearFP8::reads_x); a block-fp8 down_proj reads only codes and scales. */
+     * (LinearFP8::reads_x); a block-fp8 down_proj reads only codes and scales, and so does an
+     * int8 one fed its codes (ActFP8::q8_fed). */
     const char* down_base = nm.f("blk.%d.ffn_down", l);
     RAD_ARCH_TRY(down.probe(b, nm, g, down_base, { src.down }));
-    RAD_ARCH_TRY(gq_ffn.declare(b, g, w.gate_up, w.ffn, g.n_ff, "silu", 0, down.reads_x));
+    gq_ffn.fuse_clamped = swiglu_quant;
+    RAD_ARCH_TRY(gq_ffn.declare(b, g, w.gate_up, w.ffn, g.n_ff, "silu", 0,
+                               down.reads_x && !(w.ffn.q8_fed && down.probed_i8), false, false,
+                               swiglu_limit));
 
-    /* The fold (decl_gated_fold), an fp8a8 tile, so bf16, MXFP4, rotated 5-bit and 4-bit gate_up
-     * weights take the pair. */
-    if (!gate_up.bf16 && !gate_up.mx && !gate_up.paro5 && !gate_up.w4)
+    /* The fold (decl_gated_fold), an fp8a8 tile, so bf16, f32-scaled, MXFP4, rotated 5-bit, 4-bit
+     * and int8 gate_up weights take the pair, and so does a clamped (swiglu_limit) product.
+     * Declared over int8 codes, only a host kernel would take it, and that would pin the layer's
+     * weights to the host. */
+    if (swiglu_limit <= 0 && !gate_up.bf16 && !gate_up.f32_scale && !gate_up.mx &&
+        !gate_up.paro5 && !gate_up.w4 && !gate_up.i8)
         op_gated = decl_gated_fold(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
                                    { w.h.q, w.h.s },
                                    gq_ffn.want_x

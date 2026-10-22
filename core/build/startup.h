@@ -67,7 +67,8 @@ std::string rad_home_file(const std::string& home, const std::string& rel);
  * `imported`: the checkpoint's quantisation is imported weight by weight (Checkpoint::imports), so
  * its descriptor names the producing tool and no plugin claims it. The family's quantised plugin
  * serves it: the one plugin claiming a descriptor, or the only plugin if none does. Two quantised
- * plugins are refused by name. `out->arch_quant` is the chosen descriptor, which a container
+ * plugins are refused by name. A plugin whose rad_arch_serves_imports returns 0 is left out of
+ * both counts. `out->arch_quant` is the chosen descriptor, which a container
  * converted from it records. */
 int rad_tools_load_plugins(const std::string& radiance_home,
                            const std::vector<std::string>& hierarchy,

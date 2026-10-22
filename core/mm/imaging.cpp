@@ -22,6 +22,12 @@ double sinc(double x) {
 
 double lanczos(double x) { return (-3.0 <= x && x < 3.0) ? sinc(x) * sinc(x / 3.0) : 0.0; }
 
+/* PIL's BILINEAR filter: a triangle of support 1. */
+double triangle(double x) {
+    if (x < 0.0) x = -x;
+    return x < 1.0 ? 1.0 - x : 0.0;
+}
+
 /* One axis: for each output index its first input index, its tap count, and `ksize` fixed-point
  * coefficients. */
 struct Axis {
@@ -30,11 +36,11 @@ struct Axis {
     std::vector<int> kk;       /* [out, ksize] */
 };
 
-Axis coeffs(int in_size, int out_size) {
+Axis coeffs(int in_size, int out_size, bool bilinear) {
     Axis a;
     const double scale = (double)in_size / (double)out_size;
     double filterscale = scale < 1.0 ? 1.0 : scale;
-    const double support = 3.0 * filterscale;
+    const double support = (bilinear ? 1.0 : 3.0) * filterscale;
     a.ksize = (int)std::ceil(support) * 2 + 1;
     a.bounds.assign((size_t)out_size * 2, 0);
     a.kk.assign((size_t)out_size * a.ksize, 0);
@@ -50,7 +56,8 @@ Axis coeffs(int in_size, int out_size) {
         xmax -= xmin;
         int x = 0;
         for (; x < xmax; ++x) {
-            const double w = lanczos((x + xmin - center + 0.5) * ss);
+            const double t = (x + xmin - center + 0.5) * ss;
+            const double w = bilinear ? triangle(t) : lanczos(t);
             k[(size_t)x] = w;
             ww += w;
         }
@@ -80,7 +87,17 @@ inline unsigned muldiv255(unsigned a, unsigned b) {
 
 }  /* namespace */
 
+static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinear, FrameRGBA* out);
+
 void resize_lanczos_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out) {
+    resize_rgba(src, w, h, false, out);
+}
+
+void resize_bilinear_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out) {
+    resize_rgba(src, w, h, true, out);
+}
+
+static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinear, FrameRGBA* out) {
     const int iw = src.w, ih = src.h;
     /* Image.resize returns a copy at the same size. The premultiplied round trip below is not
      * lossless where alpha is below 255. */
@@ -96,7 +113,7 @@ void resize_lanczos_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* 
         pre[i * 4 + 3] = (uint8_t)al;
     }
     const bool horiz = w != iw, vert = h != ih;
-    const Axis ax = coeffs(iw, w), ay = coeffs(ih, h);
+    const Axis ax = coeffs(iw, w, bilinear), ay = coeffs(ih, h, bilinear);
     /* the rows the vertical pass reads */
     const int y_first = ay.bounds[0];
     const int y_last = ay.bounds[(size_t)(h - 1) * 2] + ay.bounds[(size_t)(h - 1) * 2 + 1];

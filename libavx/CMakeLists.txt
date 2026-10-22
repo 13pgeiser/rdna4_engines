@@ -37,6 +37,9 @@ set(AVX_KERNEL_SRC
   avx_elementwise.cpp
   avx_norm.cpp
   avx_hc.cpp
+  avx_glm.cpp
+  avx_dsa.cpp
+  avx_mla.cpp
   avx_quant.cpp
   avx_gemm.cpp
   avx_gemm_tile.cpp
@@ -51,6 +54,7 @@ set(AVX_KERNEL_SRC
   avx_gen.cpp
   avx_gen_attn.cpp
   avx_video.cpp
+  avx_ltx.cpp
   avx_vsa.cpp
   avx_audio.cpp
 )

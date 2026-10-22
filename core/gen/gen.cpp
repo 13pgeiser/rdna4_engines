@@ -67,6 +67,16 @@ std::vector<float> schedule(const RadGeneratorDecl& d, const std::vector<double>
     std::vector<float> s;
     if (!fixed.empty()) {
         for (double v : fixed) s.push_back((float)v);
+    } else if (d.sigma_grid > 0) {
+        /* ComfyUI's `simple` scheduler: the model's table holds t = k / N for k = 1..N (an f32
+         * quotient), and step i reads entry N - 1 - floor(i N / n), the floor of a Python float. */
+        const int32_t n = steps > 0 ? steps : (int32_t)d.default_steps;
+        const int64_t N = d.sigma_grid;
+        const double ss = (double)N / (double)n;
+        for (int32_t i = 0; i < n; ++i) {
+            const int64_t k = N - (int64_t)((double)i * ss);
+            s.push_back((float)k / (float)N);
+        }
     } else {
         const int32_t n = steps > 0 ? steps : (int32_t)d.default_steps;
         /* np.linspace(1.0, 1 / n, n) in f64, then astype(f32). */
@@ -94,6 +104,127 @@ std::vector<float> schedule(const RadGeneratorDecl& d, const std::vector<double>
     return s;
 }
 
+/* ================================================================== a discrete-time schedule */
+float DiscreteTable::sigma_at(double t) const {
+    const double hi = (double)(log_sigmas.size() - 1);
+    t = t < 0.0 ? 0.0 : t > hi ? hi : t;
+    const size_t lo = (size_t)std::floor(t), up = (size_t)std::ceil(t);
+    const float w = (float)(t - std::floor(t));
+    return std::exp((1.0f - w) * log_sigmas[lo] + w * log_sigmas[up]);
+}
+
+int32_t DiscreteTable::timestep(float sigma) const {
+    const float l = std::log(sigma);
+    int32_t best = 0;
+    float bd = std::fabs(l - log_sigmas[0]);
+    for (size_t i = 1; i < log_sigmas.size(); ++i) {
+        const float d = std::fabs(l - log_sigmas[i]);
+        if (d < bd) { bd = d; best = (int32_t)i; }
+    }
+    return best;
+}
+
+int discrete_table(const RadGeneratorDecl& d, DiscreteTable* out, std::string* why) {
+    const int32_t n = d.train_steps;
+    if (n < 2 || !(d.beta_start > 0) || !(d.beta_end > d.beta_start) || d.beta_end >= 1 ||
+        (d.beta_schedule != RAD_GEN_BETAS_SCALED_LINEAR && d.beta_schedule != RAD_GEN_BETAS_LINEAR)) {
+        if (why) *why = "the discrete schedule needs two or more timesteps and betas rising in (0, 1)";
+        return RAD_E_INVAL;
+    }
+    std::vector<double> sig((size_t)n);
+    double abar = 1.0;
+    const bool sq = d.beta_schedule == RAD_GEN_BETAS_SCALED_LINEAR;
+    const double a = sq ? std::sqrt(d.beta_start) : d.beta_start;
+    const double b = sq ? std::sqrt(d.beta_end) : d.beta_end;
+    for (int32_t i = 0; i < n; ++i) {
+        const double v = a + (b - a) * (double)i / (double)(n - 1);
+        abar *= 1.0 - (sq ? v * v : v);
+        sig[(size_t)i] = std::sqrt((1.0 - abar) / abar);
+    }
+    if (d.zero_snr) {
+        /* ComfyUI's rescale_zero_terminal_snr_sigmas: sqrt(abar) shifted to end at 0 and scaled
+         * to keep its start, the last abar then set to a small positive value. */
+        std::vector<double> s((size_t)n);
+        for (int32_t i = 0; i < n; ++i) s[(size_t)i] = std::sqrt(1.0 / (sig[(size_t)i] * sig[(size_t)i] + 1.0));
+        const double s0 = s.front(), sT = s.back();
+        for (int32_t i = 0; i < n; ++i) {
+            double v = (s[(size_t)i] - sT) * (s0 / (s0 - sT));
+            double ab = v * v;
+            if (i == n - 1) ab = 4.8973451890853435e-08;
+            sig[(size_t)i] = std::sqrt((1.0 - ab) / ab);
+        }
+    }
+    out->sigmas.resize((size_t)n);
+    out->log_sigmas.resize((size_t)n);
+    for (int32_t i = 0; i < n; ++i) {
+        out->sigmas[(size_t)i] = (float)sig[(size_t)i];
+        out->log_sigmas[(size_t)i] = (float)std::log(sig[(size_t)i]);
+    }
+    return RAD_OK;
+}
+
+std::vector<float> schedule_discrete(const RadGeneratorDecl& d, const DiscreteTable& t,
+                                     int32_t scheduler, int32_t steps) {
+    const int32_t n = steps > 0 ? steps : (int32_t)d.default_steps;
+    std::vector<float> s;
+    const double smin = t.sigma_min(), smax = t.sigma_max();
+    /* A point i of n evenly spaced from `a` to `b`, both ends included. */
+    auto lin = [](double a, double b, int32_t i, int32_t cnt) {
+        return cnt <= 1 ? a : a + (b - a) * (double)i / (double)(cnt - 1);
+    };
+    switch (scheduler) {
+    case RAD_GEN_SCHED_KARRAS: {
+        const double rho = 7.0, lo = std::pow(smin, 1.0 / rho), hi = std::pow(smax, 1.0 / rho);
+        for (int32_t i = 0; i < n; ++i) s.push_back((float)std::pow(lin(hi, lo, i, n), rho));
+        break;
+    }
+    case RAD_GEN_SCHED_EXPONENTIAL:
+        for (int32_t i = 0; i < n; ++i)
+            s.push_back((float)std::exp(lin(std::log(smax), std::log(smin), i, n)));
+        break;
+    case RAD_GEN_SCHED_SIMPLE: {
+        const double stride = (double)t.sigmas.size() / (double)n;
+        for (int32_t i = 0; i < n; ++i)
+            s.push_back(t.sigmas[t.sigmas.size() - 1 - (size_t)((double)i * stride)]);
+        break;
+    }
+    case RAD_GEN_SCHED_SGM_UNIFORM:
+    case RAD_GEN_SCHED_NORMAL:
+    default: {
+        /* Timesteps from the largest sigma's to the smallest's, evenly spaced; sgm_uniform
+         * spaces n + 1 and drops the last. The model's clock ends at 0. */
+        const double a = (double)t.timestep(t.sigma_max()), b = (double)t.timestep(t.sigma_min());
+        const bool sgm = scheduler == RAD_GEN_SCHED_SGM_UNIFORM;
+        const int32_t cnt = sgm ? n + 1 : n;
+        for (int32_t i = 0; i < n; ++i) s.push_back(t.sigma_at(lin(a, b, i, cnt)));
+        break;
+    }
+    }
+    s.push_back(0.0f);
+    return s;
+}
+
+namespace {
+const char* const kSamplers[RAD_GEN_SAMPLER_COUNT] = { "euler", "euler_ancestral", "dpmpp_2m" };
+const char* const kScheds[RAD_GEN_SCHED_COUNT] = { "normal", "karras", "exponential",
+                                                   "sgm_uniform", "simple" };
+}  /* namespace */
+
+const char* sampler_name(int32_t id) {
+    return id >= 0 && id < RAD_GEN_SAMPLER_COUNT ? kSamplers[id] : "";
+}
+const char* scheduler_name(int32_t id) {
+    return id >= 0 && id < RAD_GEN_SCHED_COUNT ? kScheds[id] : "";
+}
+int32_t sampler_id(const std::string& name) {
+    for (int32_t i = 0; i < RAD_GEN_SAMPLER_COUNT; ++i) if (name == kSamplers[i]) return i;
+    return -1;
+}
+int32_t scheduler_id(const std::string& name) {
+    for (int32_t i = 0; i < RAD_GEN_SCHED_COUNT; ++i) if (name == kScheds[i]) return i;
+    return -1;
+}
+
 /* ================================================================== the sequence */
 void image_rope(int32_t pos, int32_t h, int32_t w, int32_t* planes, int64_t n_total) {
     const int32_t h0 = -(h - h / 2), w0 = -(w - w / 2);
@@ -104,6 +235,67 @@ void image_rope(int32_t pos, int32_t h, int32_t w, int32_t* planes, int64_t n_to
             planes[n_total + k] = h0 + r;
             planes[2 * n_total + k] = w0 + c;
         }
+}
+
+void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, int64_t n_total) {
+    const float s = (float)hw_scale;
+    int64_t k = 0;
+    for (int32_t r = 0; r < h; ++r)
+        for (int32_t c = 0; c < w; ++c, ++k) {
+            planes[k] = 0.0f;
+            planes[n_total + k] = s * (float)r;
+            planes[2 * n_total + k] = s * (float)c;
+            planes[3 * n_total + k] = l;
+        }
+}
+
+int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
+                       const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
+                       std::string* why) {
+    *out = Layout{};
+    const int64_t T = (int64_t)b.tokens.size();
+    if (b.n_drop < 0 || b.n_drop >= T) {
+        if (why) *why = "the conditioning prompt is no longer than its fixed prefix";
+        return RAD_E_INVAL;
+    }
+    if (b.media) {
+        if (why) *why = "the joint layout reads no pictures in the prompt";
+        return RAD_E_INVAL;
+    }
+    const int64_t text = T - b.n_drop;
+    const int64_t padded = pad_multiple > 0 ? (text + pad_multiple - 1) / pad_multiple * pad_multiple
+                                            : text;
+    int64_t refs = 0;
+    for (const auto& hw : ref_hw) refs += (int64_t)hw.first * hw.second;
+    const int64_t rows = padded + refs;
+    out->rows = rows;
+    out->text = padded;
+    out->n_pad = (int32_t)(padded - text);
+    out->src.resize((size_t)rows);
+    out->rope_f.assign((size_t)(4 * rows), 0.0f);
+    for (int64_t i = 0; i < padded; ++i) {
+        out->src[(size_t)i] = (int32_t)(b.n_drop + i);
+        if (text_l) out->rope_f[(size_t)(3 * rows + i)] = (float)i;
+    }
+    out->seg.push_back(0);
+    out->bidi.push_back(0);
+    int64_t row = padded, lat = 0;
+    for (size_t k = 0; k < ref_hw.size(); ++k) {
+        const int32_t h = ref_hw[k].first, w = ref_hw[k].second;
+        const int64_t n = (int64_t)h * w;
+        std::vector<float> pl((size_t)(4 * n));
+        grid_rope_f(hw_scale, -(float)(1 + k), h, w, pl.data(), n);
+        for (int cc = 0; cc < 4; ++cc)
+            std::memcpy(&out->rope_f[(size_t)(cc * rows + row)], &pl[(size_t)(cc * n)],
+                        (size_t)n * sizeof(float));
+        for (int64_t i = 0; i < n; ++i) out->src[(size_t)(row + i)] = (int32_t)(-(1 + lat + i));
+        out->seg.push_back((int32_t)row);
+        out->bidi.push_back(1);
+        row += n;
+        lat += n;
+    }
+    out->seg.push_back((int32_t)rows);
+    return RAD_OK;
 }
 
 int build_layout(const Branch& b, int64_t slot_rows,

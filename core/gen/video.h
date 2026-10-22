@@ -11,6 +11,7 @@
 #include "mm/processor.h"
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -23,12 +24,13 @@ namespace gen {
 
 /* One thing a request has made. */
 struct VideoEvent {
-    enum Kind { STEP = 1, AUDIO = 2, FRAMES = 3 };
+    enum Kind { STEP = 1, AUDIO = 2, FRAMES = 3, LENGTH = 4 };
     int                  kind = 0;
     int32_t              steps_done = 0;   /* STEP: denoising steps finished */
     /* AUDIO: the whole soundtrack, interleaved, in [-1, 1]. */
     std::vector<float>   samples;
-    /* FRAMES: frames [first, first + n) of the video, each [height, width, 3] u8 RGB. */
+    /* FRAMES: frames [first, first + n) of the video, each [height, width, 3] u8 RGB. LENGTH:
+     * the `n` frames the model chose for a request that named no length, before any step. */
     int32_t              first = 0, n = 0;
     std::vector<uint8_t> rgb;
 };
@@ -50,7 +52,8 @@ public:
     std::atomic<bool> cancel{false};
 
     /* What the request makes, written by the driver at submit: the frames and their size, the
-     * steps, and the soundtrack's rate and channels. */
+     * steps, and the soundtrack's rate and channels. A request whose length the model predicts
+     * has its `frames`, `steps` and `rows` rewritten once, before its LENGTH event. */
     int32_t frames = 0, width = 0, height = 0, steps = 0;
     int64_t sample_rate = 0, channels = 0;
     double  fps = 0.0;
@@ -153,6 +156,22 @@ struct VideoRequest {
      * image generator's driver does. Null for a request whose references carry nothing the TE
      * sees — audios are label-only, and a text-only request has none. */
     std::shared_ptr<mm::PromptMedia> media;
+    /* Guidance (RadVideoGenDecl::guidance): the eight terms, NaN for the model's default, and the
+     * negative prompt, rendered and tokenised; `has_neg` false for the model's default. */
+    double   guidance[8] = { NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN };
+    std::vector<int32_t> neg_tokens;
+    bool     has_neg = false;
+    /* A first frame (RadVideoGenDecl::image_cond): [height, width, 3] u8 RGB at the size the
+     * first evaluations run at (video_small_size under upscaling, else the video's), already
+     * prepared as the model's pipeline prepares it; empty for none. */
+    std::vector<uint8_t> image;
+    /* The decoder (RadVideoGenDecl::decoders) by its index; 0 the model's default. */
+    int32_t  decoder = 0;
+    /* The runtime LoRA slot the request's conditioning and denoising passes run with
+     * (Engine::gen_lora_acquire), -1 for none, and the hold that keeps it until the request is
+     * done. */
+    int32_t  lora_slot = -1;
+    std::shared_ptr<void> lora_hold;
     std::shared_ptr<VideoTicket> ticket;
 };
 
@@ -170,17 +189,21 @@ VideoShape video_shape(const RadVideoGenDecl& d, int32_t width, int32_t height, 
 void video_small_size(const RadVideoGenDecl& d, int32_t width, int32_t height, double factor,
                       int32_t* small_w, int32_t* small_h);
 
-/* The two schedules a request of `steps` grid points runs (RadVideoGenDecl, "The sampler"): each
- * the f32 sigmas, last 0, and the model evaluations it takes, the shorter of the two. With a
- * trained schedule any other step count than n_rungs + 1 gives no steps. `shift_video`/`shift_audio`
- * above 0 override the declaration's per-stream shift for the exponential sigma shift; 0 keeps the
- * declaration's. The shift only re-shapes the staged sigmas, so it reaches the plugin through the
- * schedule region, not the batch. */
+/* The two schedules a request of `steps` runs (RadVideoGenDecl, "The sampler": grid points under
+ * form 0, evaluations under form 1): each the f32 sigmas, last 0, and the model evaluations it
+ * takes, the shorter of the two. With a trained schedule any other step count than the declared
+ * one gives no steps. `video_tokens` are the video's latent tokens, which form 1's dynamic shift
+ * reads. With `refine` (form 1 and refinement rungs) the rungs are followed by the refinement
+ * rungs instead of a 0, the evaluations their sum. `shift_video`/`shift_audio` above 0 override
+ * the declaration's per-stream shift for the exponential sigma shift; 0 keeps the declaration's.
+ * The shift only re-shapes the staged sigmas, so it reaches the plugin through the schedule
+ * region, not the batch. */
 struct VideoSchedule {
     std::vector<float> sig_v, sig_a;
     int32_t            steps = 0;
 };
-VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, double shift_video = 0.0,
+VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t video_tokens = 0,
+                             bool refine = false, double shift_video = 0.0,
                              double shift_audio = 0.0);
 
 }  /* namespace gen */

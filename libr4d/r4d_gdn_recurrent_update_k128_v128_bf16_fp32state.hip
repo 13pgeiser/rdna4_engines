@@ -850,7 +850,10 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
   if (auto it = blocks.find(key); it != blocks.end()) return it->second;
   void* p = nullptr;
   if (hipMalloc(&p, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
-  if (hipMemset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) {
+  // Zero before any launch reads it: the memset is on the null stream, which the engine's streams
+  // need not wait for, so wait here (as r4d_moe.hip's router counters do).
+  if (hipMemset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess ||
+      hipDeviceSynchronize() != hipSuccess) {
     (void)hipFree(p);
     return nullptr;
   }

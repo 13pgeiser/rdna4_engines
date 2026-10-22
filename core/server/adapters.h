@@ -102,6 +102,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.hit_cut_no_snapshot = m.hit_cut_no_snapshot;
     o.hit_cut_window = m.hit_cut_window;
     o.hit_cut_adopt = m.hit_cut_adopt;
+    o.hit_cut_resumed_below = m.hit_cut_resumed_below;
+    o.prefix_restore_cuts = m.prefix_restore_cuts;
     o.hit_cut_tokens = m.hit_cut_tokens;
     o.prefix_expired = m.prefix_expired;
     o.prefix_ckpt_expired = m.prefix_ckpt_expired;
@@ -138,6 +140,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.steps_held = m.steps_held;
     o.decode_rows_unspeculated = m.decode_rows_unspeculated;
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
+    o.step_ns_decode_best = m.step_ns_decode_best;
+    o.step_ns_decode_recent = m.step_ns_decode_recent;
     return o;
 }
 

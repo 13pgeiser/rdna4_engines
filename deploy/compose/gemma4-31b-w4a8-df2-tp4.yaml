@@ -1,0 +1,33 @@
+# Gemma 4 31B-it on four cards: int4 trunk (round-to-nearest with a scale search, from the bf16
+# checkpoint; q, k and v as one linear) with int8 activations and lm_head, RedHatAI's DFlash2
+# speculator merged in (gemma-4-31B-it-speculator.dflash2: block 8, 7 drafts a pass, int8 head), and
+# the vision tower. Converted with data/recipes/gemma4-31b-dense-bf16-w4a8-df2.recipe, or downloaded
+# from https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2. The drafter
+# serves the depth it was trained at (`auto`). Sampling defaults are the checkpoint's
+# generation_config; thinking is switched per request (chat_template_kwargs).
+#
+# --tp 4 over four cards; chained launches, the weight reads beside the collectives and the prefill
+# overlap turn themselves on there (each has its RADIANCE_* override for an A/B, none needed here).
+# A prompt alone takes 8192-token prefill chunks; beside other users a chunk takes at most 512
+# tokens of a step, with one decode-only step after it, so a long prompt holds the others up by a
+# fraction of a chunk rather than all of it. 16 sequences, as measured below.
+#
+# On 4x R9700 (PCIe 4.0 x16), 2026-10-20: one user 390 code / 288 prose / 208 story tok/s, and
+# 590 after a 6442-token prompt (prefill 5962 tok/s); 302 / 512 / 658 / 835 / 981 tok/s aggregate
+# at 1 / 2 / 4 / 8 / 16 users (BetterBench, thinking off).
+#
+# Measured with the host CPU's performance governor and its idle states past C1 off. The cards'
+# peer-to-peer traffic crosses the root complex, so the host's power state shows in every step, and
+# a compose file can't set it.
+name: radiance-gemma4-31b-w4a8-df2-tp4
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-gemma4-31b-w4a8-df2-tp4
+    command: >
+      --model /models/gemma4-31b-dense-w4a8-df2-qkv.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 4 --max-num-seqs 16 --max-model-len 65536 --kv-cache-dtype fp8
+      --num-speculative-tokens auto --max-num-batched-tokens 8192
+      --busy-prefill-chunk 512 --prefill-interleave 1
+      --temp 1.0 --top-p 0.95 --top-k 64

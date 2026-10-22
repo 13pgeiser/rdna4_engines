@@ -44,6 +44,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rad {
@@ -253,9 +254,24 @@ public:
     /* The off-device entries this prompt's chain would hit if restored, in order, from where
      * lookup stopped. The caller promotes them and looks up again; empty means the prefix ended
      * on a miss or token mismatch. Separate from lookup because lookup is const and has no
-     * device; a promotion allocates blocks and runs a scatter between steps. */
+     * device; a promotion allocates blocks and runs a scatter between steps.
+     *
+     * `fit` is how many entries the pool can take. A longer chain is cut, and counted
+     * (Stats::restore_cuts): with recurrent state at the deepest snapshot the shorter prefix
+     * reaches, since the hit resumes there and blocks past it would come back for nothing;
+     * without, at `fit`. */
     std::vector<BlockHash> restorable_from(const std::vector<int32_t>& tokens,
-                                           const std::vector<MMContentKey>& mm) const;
+                                           const std::vector<MMContentKey>& mm,
+                                           int64_t fit = INT64_MAX) const;
+    /* Entries a restore can place now: free blocks against the carve, the least over the cached
+     * groups. Lent blocks count, since KVManager::reserve_blocks recalls the loan for them. */
+    int64_t restore_room() const;
+    /* Room for a restore of this prompt's chain: trim(), sparing the chain itself (its blocks
+     * would only have to come back too) and every chain a waiting request holds (hold()), whose
+     * next attempt would restore it again. Nothing is lost; the reserve's trim after the next
+     * publish puts the pool's free quarter back. */
+    int64_t trim_for(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                     int64_t n_blocks);
 
     /* The tiers lost the bytes. Erases the entry without releasing blocks: an off-device entry
      * owns none, and its recorded ids now belong to other sequences. Installed as
@@ -284,9 +300,10 @@ public:
     void hold(uint64_t req, const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm);
     void release(uint64_t req);
     /* Start of a step's admissions. Snapshots the previous step's lookups handed out have been
-     * read by its forward by now; until this call they keep their slots against retention,
-     * reserve_checkpoint's eviction and expiry. */
-    void begin_step() { handed_.clear(); }
+     * read by its forward by now, and the ones it reserved have been saved into (the engine
+     * issues the save before the next step is planned); until this call they keep their slots
+     * against retention, reserve_checkpoint's eviction and expiry. */
+    void begin_step() { handed_.clear(); reserved_.clear(); }
 
     /* ---------------- expiry ----------------
      *
@@ -307,8 +324,11 @@ public:
     /* Reserve a snapshot slot for `session` at `pos`. When the store is full, applies the
      * retention policy, then evicts the least recently used snapshot (a use is its reservation or
      * a lookup resuming from it), a tip like any other. A snapshot handed out this step is never
-     * evicted: its admission restores from the slot ahead of the step. RAD_E_FULL when nothing
-     * can be given up. */
+     * released, by retention or eviction: its admission restores from the slot ahead of the step.
+     * Nor is one this call reserved and commit_checkpoint has not yet committed: the engine saves
+     * into the slot after the step, and a later reservation in the same step must not run
+     * retention over a save target (a second request reserving a snapshot a first session holds
+     * below its tip). RAD_E_FULL when nothing can be given up. */
     int  reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
                             int32_t* slot_out);
     /* The state for `prefix` is now in its slot; lookup() offers it only after this (Ckpt::valid). */
@@ -337,6 +357,8 @@ public:
         int64_t drops = 0;
         /* Entries and snapshots removed by --prefix-cache-ttl, from any tier. */
         int64_t expired = 0, ckpt_expired = 0;
+        /* Restores from the host tier cut short because the pool could not hold the chain. */
+        int64_t restore_cuts = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -372,6 +394,9 @@ private:
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
+    /* trim(), leaving the entries in `spare` (when given) where they are. */
+    int64_t trim_sparing(int64_t n_blocks,
+                         const std::unordered_set<BlockHash, BlockHashHash>* spare);
     /* A live sequence also holds one of this entry's blocks, so releasing it frees nothing. */
     bool shared_with_live(const Entry& e) const;
     /* Whether `e` holds the block_size_ token ids at `src`, so a hash collision is a miss. */
@@ -392,6 +417,11 @@ private:
     /* For the debug lines: whether `c` is its session's deepest snapshot, and seconds since a
      * monotonic stamp. */
     bool is_tip(const Ckpt& c) const;
+    /* The deepest valid snapshot on the chain `hs` at or below `limit` tokens; end() if none.
+     * Checkpoints sit on any block boundary (the interval or a prompt's tail), so this walks the
+     * snapshots, a few hundred, rather than the chain's blocks. */
+    std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
+    deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const;
     static double idle_s(uint64_t used_ns);
 
     KVManager*  kv_ = nullptr;
@@ -420,6 +450,13 @@ private:
     mutable std::vector<BlockHash> handed_;
     bool handed(const BlockHash& h) const {
         return std::find(handed_.begin(), handed_.end(), h) != handed_.end();
+    }
+    /* Snapshots reserve_checkpoint reserved and commit_checkpoint has not committed: the step's
+     * save targets, kept in their slots until the commit, or until the next step begins when the
+     * save was skipped (its request gone). */
+    mutable std::vector<BlockHash> reserved_;
+    bool reserved(const BlockHash& h) const {
+        return std::find(reserved_.begin(), reserved_.end(), h) != reserved_.end();
     }
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;

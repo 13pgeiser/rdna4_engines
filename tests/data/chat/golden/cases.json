@@ -4,7 +4,8 @@
     "qwen3.8":  { "bos": "",    "eos": "<|im_end|>", "media": "<|vision_start|><|image_pad|><|vision_end|>" },
     "qwen3.6":  { "bos": "",    "eos": "<|im_end|>", "media": "<|vision_start|><|image_pad|><|vision_end|>" },
     "minicpm5": { "bos": "<s>", "eos": "</s>",       "media": "" },
-    "gemma4":   { "bos": "<bos>", "eos": "<eos>",    "media": "<|image|>" }
+    "gemma4":   { "bos": "<bos>", "eos": "<eos>",    "media": "<|image|>" },
+    "glm53":    { "bos": "",    "eos": "<|endoftext|>", "media": "<|begin_of_image|><|image|><|end_of_image|>" }
   },
   "tools": [
     { "type": "function", "function": { "name": "read", "description": "Read a file.",
@@ -58,6 +59,7 @@
         { "role": "assistant", "reasoning_content": "Thinking about the first.", "content": "First answer." },
         { "role": "user", "content": "Second question." } ] },
     { "name": "tool_call_then_result",
+      "models": ["qwen3.8", "qwen3.6", "minicpm5", "gemma4"],
       "tools": true,
       "messages": [
         { "role": "user", "content": "Fix /work/a.py." },
@@ -66,6 +68,7 @@
             "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\", \"limit\": 40}" } } ] },
         { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" } ] },
     { "name": "tool_call_answered_then_user",
+      "models": ["qwen3.8", "qwen3.6", "minicpm5", "gemma4"],
       "tools": true,
       "messages": [
         { "role": "user", "content": "Fix /work/a.py." },
@@ -114,7 +117,7 @@
       "kwargs": { "reasoning_effort": "high" },
       "messages": [ { "role": "user", "content": "Hi." } ] },
     { "name": "a_picture_between_text",
-      "models": ["qwen3.8", "qwen3.6", "gemma4"],
+      "models": ["qwen3.8", "qwen3.6", "gemma4", "glm53"],
       "messages": [
         { "role": "user", "content": [
           { "type": "text", "text": "Describe" },

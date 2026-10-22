@@ -1,0 +1,48 @@
+# q38-27b-w8a8-df2.recipe -- Qwen3.8-27B from its bf16 release with an int8 trunk rotated by a
+# 128-wide Hadamard, and the DFlash2 drafter, served by qwen35_w8a8.
+#
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-w8a8-df2.recipe \
+#       --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+#       -o q38-27b-w8a8-df2.rad
+#
+# The --set keys make the container's descriptor `w8a8_fwht128`, which selects qwen35_w8a8 (a bf16
+# checkpoint alone selects qwen35_bf16).
+#
+#   - The trunk's linears (attention q/gate, k, v and output, the delta net's qkv/z and output, the
+#     MLP's gate/up and down: the set Qwen's FP8 release quantises) as int8 with a bf16 scale per
+#     (row, 128 of K), each 128 of K rotated by the unnormalised Hadamard before rounding and the
+#     1/128 kept in the scale (`transform=fwht128`). gemm_nt_q reads them at i8a8h, each linear
+#     quantising its own input under the same rotation (had_quant_act_i8g). `clamp=sym` keeps the
+#     codes in -127..127, the range the int8 kernels are written for. Weight error 6.3e-3 relative.
+#   - The delta net's a/b projections, the norms, the embedding and the vision tower stay bf16, as
+#     in Qwen's FP8 release.
+#   - The lm_head int8 too, unrotated (logits_gemm_i8): weight error 6.8e-3 against block fp8's
+#     2.6e-2. Against the bf16 model over 45K mostly-Go positions it halves the container's mean KL
+#     (0.00051 against 0.00090 with a block-fp8 head; Qwen's FP8 release 0.00404) and takes top-1
+#     agreement from 98.83% to 99.25%. A block-fp8 head is one override away:
+#         --quant 'output.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16'
+#
+# The drafter as q38-27b-fp8-df2.recipe makes it: its linears at MXFP4, and a 2-bit copy of the
+# target's head (u2 with a u8 zero, least-squares clip search) whose top 32 the engine rescores
+# against the target's head.
+
+blk.*.attn_qg.weight                 rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_k.weight                  rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_v.weight                  rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ssm_inz.weight                 rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ssm_out.weight                 rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0

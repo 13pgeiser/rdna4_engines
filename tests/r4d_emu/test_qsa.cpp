@@ -12,7 +12,11 @@
  * seeded sweep of small odd shapes (NaN, +-inf, -0.0, denormal and -1e30 scores, pitches, a table
  * narrower than the scores, rows no sequence holds, topk 1, ratio 1). Which branch a row takes
  * inside the kernels is predicted from their constants, restated in `Path`; the run fails when the
- * fixtures stop reaching one of them. `sweep N` runs N seeded fixtures at serving sizes instead. */
+ * fixtures stop reaching one of them. `sweep N` runs N seeded fixtures at serving sizes instead.
+ *
+ * Fixtures marked signed run with the op's `signed` parameter: the kernels' signed key order,
+ * against the port's signed ranking, over negative, mixed and the sweep's odd scores. The unsigned
+ * fixtures are the same as without the parameter. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -42,6 +46,7 @@ struct Fix {
     int S = 1, M = 1, nb_s = 1, nb_t = 1;   /* sequences, query rows, score and table widths */
     int s_ld = 0, t_ld = 0, o_ld = 0;       /* row pitches; 0 = tight */
     int topk = 1, ratio = 1;
+    bool sgn = false;                       /* the op's `signed` parameter */
     std::vector<float> sc;                  /* [M][s_ld] */
     std::vector<int32_t> bt;                /* [S][t_ld] */
     std::vector<int32_t> nc, pos, cu;       /* [S], [M], [S + 1] */
@@ -66,7 +71,7 @@ struct Fix {
 };
 
 /* ---- libref's ref_qsa_select (libref/ref_qsa.cpp), restated over the fixture's arrays: the same
- * steps in the same order. */
+ * steps in the same order, both rankings. */
 void ref_select(const Fix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns, std::vector<int32_t>& su) {
     const int64_t topk = f.topk, ratio = f.ratio;
     se.assign((size_t)f.M * (topk + 1), 0); ns.assign((size_t)f.M, 0); su.assign((size_t)f.M, 0);
@@ -77,8 +82,9 @@ void ref_select(const Fix& f, std::vector<int32_t>& se, std::vector<int32_t>& ns
         std::vector<int64_t> live;
         for (int64_t b = 0; b < n; ++b) {
             const float v = f.sc[(size_t)(m * f.s_ld + b)];
-            if (f.bt[(size_t)(s * f.t_ld + b)] < 0 || !(v > -1e30f)) continue;
-            val[(size_t)b] = v > 0.0f ? v : 0.0f;
+            if (f.bt[(size_t)(s * f.t_ld + b)] < 0) continue;
+            if (f.sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+            val[(size_t)b] = f.sgn ? v : v > 0.0f ? v : 0.0f;
             live.push_back(b);
         }
         std::vector<int64_t> take;
@@ -114,6 +120,8 @@ namespace Path {
 constexpr int kCacheCap = 8192, kCacheMaxM = 64;                    /* the key cache */
 constexpr int kSamp = 2048, kSampRun = 32, kSampRuns = 64, kSampMinN = 3 * kSamp, kSampCap = 1920;
 constexpr int kWideShift = 19, kWideCand = 3840, kMergeAbove = 512, kMergeCand = 1664;
+constexpr int kWideShiftSigned = 20;                                /* the signed key's 32 bits */
+int wide_shift(bool sgn) { return sgn ? kWideShiftSigned : kWideShift; }
 constexpr int kParM = 32, kParWMax = 16, kParCap = 8192;            /* the split path */
 int par_chunks(int nb) { return std::max(1, std::min(kParWMax, (nb + 4095) / 4096)); }
 }
@@ -124,6 +132,14 @@ uint32_t keyof(float v, int32_t page) {
     uint32_t u;
     std::memcpy(&u, &c, 4);
     return u + 1u;
+}
+
+/* The signed order: the float's total order over 32 bits, -0 keyed as +0, nonfinite dead. */
+uint32_t keyof_signed(float v, int32_t page) {
+    if (page < 0 || !std::isfinite(v)) return 0u;
+    uint32_t u = 0;
+    if (v != 0.0f) std::memcpy(&u, &v, 4);
+    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
 }
 
 enum Form { kSingle, kWide, kAuto };
@@ -140,7 +156,11 @@ std::map<std::string, int> g_paths;
 void note_paths(const Fix& f, int m, Form form, bool split) {
     const int s = f.seq_of(m), n = f.n_of(m), topk = f.topk;
     std::vector<uint32_t> k((size_t)std::max(n, 0));
-    for (int b = 0; b < n; ++b) k[(size_t)b] = keyof(f.sc[(size_t)m * f.s_ld + b], f.bt[(size_t)s * f.t_ld + b]);
+    for (int b = 0; b < n; ++b) {
+        const float v = f.sc[(size_t)m * f.s_ld + b];
+        const int32_t pg = f.bt[(size_t)s * f.t_ld + b];
+        k[(size_t)b] = f.sgn ? keyof_signed(v, pg) : keyof(v, pg);
+    }
     std::vector<uint32_t> live;
     for (uint32_t x : k) if (x) live.push_back(x);
     std::sort(live.begin(), live.end(), std::greater<uint32_t>());
@@ -155,6 +175,7 @@ void note_paths(const Fix& f, int m, Form form, bool split) {
         int above = 0, eq = 0;
         for (uint32_t x : live) { above += x > T; eq += x == T; }
         if (eq > topk - above) hit("a threshold whose ties are cut short");
+        if (f.sgn && T < 0x80000000u) hit("signed: a negative threshold");
     }
     if (split) {
         const int nch = Path::par_chunks(f.nb()), chunk = (f.nb() + nch - 1) / nch;
@@ -200,9 +221,10 @@ void note_paths(const Fix& f, int m, Form form, bool split) {
         hit("wide: a sample that fell back");
     }
     if (L <= topk) return;
-    const uint32_t B = live[(size_t)topk - 1] >> Path::kWideShift;
+    const int shift = Path::wide_shift(f.sgn);
+    const uint32_t B = live[(size_t)topk - 1] >> shift;
     int in = 0;
-    for (uint32_t x : live) in += (x >> Path::kWideShift) == B;
+    for (uint32_t x : live) in += (x >> shift) == B;
     hit(in <= Path::kMergeCand && topk <= Path::kMergeAbove ? "wide: merged lists"
         : in <= Path::kWideCand ? "wide: the threshold's bin in LDS" : "wide: the threshold's bin over global memory");
 }
@@ -227,10 +249,10 @@ int run(Fix& f, Form form) {
         tens(f.cu.data(), RAD_I32, {f.S + 1}),         tens(se.data(), RAD_I32, {M, W}, f.o_ld),
         tens(ns.data(), RAD_I32, {M}),                 tens(su.data(), RAD_I32, {M}),
     };
-    RadParam p[5]{};
+    RadParam p[6]{};
     p[0] = {"M", RAD_P_INT, M}; p[1] = {"blocks", RAD_P_INT, f.nb()}; p[2] = {"topk", RAD_P_INT, f.topk};
-    p[3] = {"ratio", RAD_P_INT, f.ratio}; p[4] = {"seqs", RAD_P_INT, f.S};
-    RadArgs a{}; a.t = t; a.n_t = 8; a.p = p; a.n_p = 5;
+    p[3] = {"ratio", RAD_P_INT, f.ratio}; p[4] = {"seqs", RAD_P_INT, f.S}; p[5] = {"signed", RAD_P_INT, 1};
+    RadArgs a{}; a.t = t; a.n_t = 8; a.p = p; a.n_p = f.sgn ? 6 : 5;
     const int64_t need = r4d_rad_qsa_select_scratch(&a);
     std::vector<uint32_t> scratch((size_t)(need / 4 + 1), 0xA5A5A5A5u);
     if (form == kAuto) { a.scratch = scratch.data(); a.scratch_bytes = need; }
@@ -245,7 +267,9 @@ int run(Fix& f, Form form) {
                        : "qsa_select_kernel";
     const char* fn = kFormName[form];
     if (rc != RAD_OK) { std::printf("FAIL %-48s %-6s launch returned %d\n", f.name.c_str(), fn, rc); return 1; }
-    if (std::strcmp(emu_last_kernel, expect) != 0 || grids != (split ? 2 : 1)) {
+    /* The launch site names the template, `kernel<Signed>`: the name is what precedes it. */
+    const std::string ran(emu_last_kernel, std::strcspn(emu_last_kernel, "<"));
+    if (ran != expect || grids != (split ? 2 : 1)) {
         std::printf("FAIL %-48s %-6s ran %s in %d grid(s), expected %s in %d\n", f.name.c_str(), fn,
                     emu_last_kernel, grids, expect, split ? 2 : 1);
         return 1;
@@ -324,8 +348,11 @@ Fix fix_prefill() {
  * score distributions. Over 4096 blocks at six rows, the automatic choice is the split path. */
 Fix fix_wide(int dist) {
     static const char* const kDist[] = { "continuous", "coarse, heavy ties", "an eighth in one first-digit bin",
-                                         "all in one first-digit bin", "fine ties at the threshold" };
+                                         "all in one first-digit bin", "fine ties at the threshold",
+                                         "signed, heavy ties", "signed, all negative, heavy ties",
+                                         "signed, continuous across zero" };
     Fix f; f.name = std::string("wide: ") + kDist[dist];
+    f.sgn = dist >= 5;
     const int S = 2, nb = 9000, topk = 512, ratio = 4, pages = 1 << 20;
     f.shape(S, 6, nb, nb, topk, ratio);
     f.cu = { 0, 4, 6 };
@@ -341,6 +368,9 @@ Fix fix_wide(int dist) {
             case 1: v = (float)(u % 23) * 0.25f; break;
             case 2: v = u % 8 == 0 ? 1.0f + (float)(u % 60000) * 1e-6f : (float)(u % 1000) / 2000.0f; break;
             case 3: v = 1.0f + (float)(u % 60000) * 1e-6f; break;
+            case 5: v = (float)(u % 23) * 0.25f - 3.0f; break;
+            case 6: v = -(float)(u % 23) * 0.25f - 1.0f; break;
+            case 7: v = (float)(u % 1000003) / 1000.0f - 500.0f; break;
             default: v = (float)(u % 4999) * 0.01f; break;
         }
     }
@@ -551,6 +581,22 @@ Fix fix_random(int it) {
     return f;
 }
 
+/* A fixture under the signed order, its finite scores negated on odd rows when `flip` and moved
+ * by `shift`, so live scores straddle zero or fall below it. */
+Fix as_signed(Fix f, float shift, bool flip = false) {
+    f.sgn = true;
+    f.name = "signed " + f.name;
+    if (shift == 0.0f && !flip) return f;          /* as built: keeps -0 apart from +0 */
+    for (int m = 0; m < f.M; ++m)
+        for (int b = 0; b < f.nb_s; ++b) {
+            float& v = f.score(m, b);
+            if (!std::isfinite(v)) continue;
+            if (flip && m % 2) v = -v;
+            v += shift;
+        }
+    return f;
+}
+
 }  // namespace
 
 /* No argument: the fixtures above and the branch check. `sweep N`: N fix_random fixtures, about
@@ -562,12 +608,20 @@ int main(int argc, char** argv) {
     if (sweep) {
         const int n = argc > 2 ? std::atoi(argv[2]) : 100;
         for (int i = 0; i < n; ++i) fixtures.push_back([i] { return fix_random(i); });
+        for (int i = 0; i < n; ++i) fixtures.push_back([i] { return as_signed(fix_random(i), -1.0f, true); });
     } else {
         fixtures = { fix_decode, fix_prefill, fix_few_live, fix_wide_launch,
                      [] { return fix_split(1, 4); }, [] { return fix_split(2, 4); }, fix_split_sparse, fix_big_topk,
                      [] { return fix_no_split(true); }, [] { return fix_no_split(false); } };
         for (int d = 0; d < 5; ++d) fixtures.push_back([d] { return fix_wide(d); });
         for (int i = 0; i < 150; ++i) fixtures.push_back([i] { return fix_sweep(i); });
+        fixtures.push_back([] { return as_signed(fix_decode(), -5.0f); });
+        fixtures.push_back([] { return as_signed(fix_decode(), -20.0f); });
+        fixtures.push_back([] { return as_signed(fix_few_live(), 0.0f); });
+        fixtures.push_back([] { return as_signed(fix_split(2, 4), -6.0f); });
+        fixtures.push_back([] { return as_signed(fix_wide_launch(), -1.0f, true); });
+        for (int d = 5; d < 8; ++d) fixtures.push_back([d] { return fix_wide(d); });
+        for (int i = 0; i < 150; ++i) fixtures.push_back([i] { return as_signed(fix_sweep(i), 0.0f); });
     }
     int fails = 0, launches = 0;
     for (auto& make : fixtures) {
@@ -592,6 +646,7 @@ int main(int argc, char** argv) {
         "wide: the threshold's bin in LDS", "wide: the threshold's bin over global memory",
         "split: topk or fewer live, every one taken", "split: no chunk over topk, more than topk live",
         "split: a chunk over topk", "split: exactly topk candidates, from a chunk over topk",
+        "signed: a negative threshold",
     };
     int missing = 0;
     for (const char* p : kRequired)

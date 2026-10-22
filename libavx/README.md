@@ -78,7 +78,7 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 | `rope` | YaRN with `axial` or a position scale | the same |
 | `rope` | Llama 3 scaling beside YaRN, with `axial`, or over multi-component positions | the same |
 | `rope` | a rotary half-width over 1024 | the same |
-| `had_quant_act_i8`, `had_quant_act_fp8`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
+| `had_quant_act_i8`, `had_quant_act_fp8`, `had_quant_act_i8g`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
 | `gdn_conv_prep`, `gdn_conv_update` | a convolution history over 16 | the same |
 | `gdn_recurrent_update` | a `state_form` other than `per_candidate` or `anchor` | the same |
 | `ple_conv`, `causal_conv1d` | a history over 64 | the same |
@@ -123,11 +123,11 @@ engine would load. It checks, in order: schema agreement (a copy of the loader's
 before any arithmetic, because the loader refuses the whole plugin on one disagreement), coverage,
 the numbers, and every ISA level. Each level prints:
 
-    522 checked, 522 passed, 0 failed, 0 declined, 0 skipped, 0 missing.  worst rel_l2 = 3.556e-04
+    924 checked, 924 passed, 0 failed, 0 declined, 0 skipped, 0 missing.  worst rel_l2 = 3.556e-04
     worst case: rmsnorm M=3 n=645 eps=1e-05 dtype=bf16 wadd=1
-    522 rerun on 4 threads, byte for byte
-    hand-built: 198 checked, 0 failed
-    zero rows: 116 ops checked, 0 failed
+    924 rerun on 4 threads, byte for byte
+    hand-built: 449 checked, 0 failed
+    zero rows: 188 ops checked, 0 failed, 2 not reducible to zero rows
 
 against `rad-kbench`'s tolerance table, ids (i32, u32, i64 outputs) exactly; the worst case differs
 per level. Every conversion is also checked exhaustively: all 256 or 65536 bit patterns of each

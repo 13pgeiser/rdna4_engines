@@ -146,7 +146,11 @@ void apply_norm(std::string& text, const VocabStep& s) {
             std::vector<uint32_t> cpts = unicode_cpts_from_utf8(text);
             std::string out;
             out.reserve(text.size());
-            for (uint32_t c : cpts) out += unicode_cpt_to_utf8(unicode_tolower(c));
+            /* Rust's char::to_lowercase, as HuggingFace runs it: U+0130 is "i" U+0307. */
+            for (uint32_t c : cpts) {
+                if (c == 0x130) out += "i\xcc\x87";
+                else out += unicode_cpt_to_utf8(unicode_tolower(c));
+            }
             text.swap(out);
             break;
         }

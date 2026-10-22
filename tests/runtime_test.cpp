@@ -229,7 +229,7 @@ struct Fixture {
         return (rad_op)(P.ops.size() - 1);
     }
 
-    int start(rad::ResidencyTable* res = nullptr, bool profile = false) {
+    int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false) {
         CtxDesc d;
         d.program     = &P;
         d.rank        = 1;
@@ -241,8 +241,8 @@ struct Fixture {
         d.registry    = registry;
         /* The arch bodies here issue whatever a case asks, which the batch does not describe, so
          * no pass may be recorded and replayed under the batch's key (a card records passes; the
-         * host backend cannot). */
-        d.record_passes = false;
+         * host backend cannot). A case about the recording decision itself asks for it. */
+        d.record_passes = record;
         return ctx.init(d);
     }
 
@@ -918,7 +918,7 @@ TEST(raw_operand_carries_the_pointer_and_refuses_an_offset) {
  * lora_shrink and lora_expand over its own activation, output and rows, but only on a step that
  * has an adapter row (RadBatch::lora_slot non-null). A step without one, or a draft pass, issues
  * the gemm alone, the pass an engine without adapters runs; an encoder pass reaching a site is
- * refused by name. */
+ * refused by name; a generator pass runs its one slot in every row. */
 static int k_gemm  (const RadArgs* a, RadStream s) { return record("gemm",   a, s); }
 static int k_shrink(const RadArgs* a, RadStream s) { return record("shrink", a, s); }
 static int k_expand(const RadArgs* a, RadStream s) { return record("expand", a, s); }
@@ -933,6 +933,7 @@ TEST(adapter_ops_follow_a_lora_site_only_on_a_step_with_an_adapter_row) {
     const rad_buf ps = f.add_buffer("lora.scale", RAD_F32, 2, 8, 1536);
     const rad_buf t0 = f.add_buffer("lora.t0", RAD_F32, 16, 4, 2048);
     const rad_buf t1 = f.add_buffer("lora.t1", RAD_F32, 16, 4, 2304);
+    const rad_buf rows = f.add_buffer("lora.rows", RAD_I32, 32, 1, 2560);   /* [S * 16] */
     const rad_op g  = f.add_op("gemm_nt", "M", { 64 }, { k_gemm }, { "gemm" }, &g_gemm_schema, { w });
     const rad_op sh = f.add_op("lora_shrink", "M", { 64 }, { k_shrink }, { "shrink" }, nullptr, {});
     const rad_op ex = f.add_op("lora_expand", "M", { 64 }, { k_expand }, { "expand" }, nullptr, {});
@@ -955,6 +956,8 @@ TEST(adapter_ops_follow_a_lora_site_only_on_a_step_with_an_adapter_row) {
     scr.R = 4;
     scr.lane[0] = t0; scr.lane[1] = t1;
     f.P.lora_t.push_back(scr);
+    f.P.lora_rows = rows;
+    f.P.lora_rows_n = 16;
     CHECK_OK(f.start());
 
     auto body = [&](Ctx& c) {
@@ -1002,8 +1005,38 @@ TEST(adapter_ops_follow_a_lora_site_only_on_a_step_with_an_adapter_row) {
         c.issue(g, opd, 3, RAD_N_BATCH);
     });
     CHECK_EQ(s, RAD_E_UNSUPPORTED);
-    CHECK(std::strstr(f.ctx.step_error(), "encoder or generator pass") != nullptr);
+    CHECK(std::strstr(f.ctx.step_error(), "encoder pass") != nullptr);
     CHECK_EQ(names(), std::string("gemm"));
+
+    /* A generator pass runs one slot in every row, whatever the gemm's rows are: its slot operand
+     * is that slot's run of the slot-row table; with no slot, the gemm alone. */
+    f.batch.enc = 0;
+    f.batch.gen = RAD_GEN_PASS_DENOISE;
+    f.batch.lora_slot = nullptr;
+    f.ctx.set_gen_lora_slot(-1);
+    g_rec.clear();
+    CHECK_OK(f.step(4, 4, body));
+    CHECK_EQ(names(), std::string("gemm"));
+    f.ctx.set_gen_lora_slot(1);
+    g_rec.clear();
+    CHECK_OK(f.step(4, 5, body));
+    REQUIRE_EQ(names(), std::string("gemm shrink expand"));
+    CHECK(g_rec[1].t[2].data == (void*)((char*)f.ctx.buf_ptr(rows) + 1 * 16 * 4));
+    CHECK_EQ(g_rec[1].t[2].shape[0], (int64_t)4);
+    CHECK(g_rec[2].t[1].data == g_rec[1].t[2].data);
+    /* Rows past the slot table's run are issued in chunks of it, each over its own rows. */
+    f.P.lora_rows_n = 3;
+    g_rec.clear();
+    CHECK_OK(f.step(4, 6, body));
+    REQUIRE_EQ(names(), std::string("gemm shrink expand shrink expand"));
+    CHECK_EQ(g_rec[1].t[0].shape[0], (int64_t)3);
+    CHECK_EQ(g_rec[3].t[0].shape[0], (int64_t)1);
+    CHECK(g_rec[3].t[0].data == (void*)((char*)g_rec[1].t[0].data + 3 * 4 * 2));   /* x row 3 */
+    CHECK(g_rec[4].t[4].data == (void*)((char*)g_rec[2].t[4].data + 3 * 8 * 2));   /* y row 3 */
+    CHECK(g_rec[3].t[2].data == (void*)((char*)f.ctx.buf_ptr(rows) + 1 * 3 * 4));
+    f.P.lora_rows_n = 16;
+    f.ctx.set_gen_lora_slot(-1);
+    f.batch.gen = 0;
 }
 
 /* Site is a property of the weights (spec §5.1). A domain with no kernel in some band is refused,
@@ -1867,6 +1900,25 @@ TEST(a_lane_built_mid_step_starts_behind_lane_zero) {
         CHECK_OK(c.set_lane(0));
     }));
     CHECK_EQ(dev_get(f, f.ctx.buf_ptr(y)), 4242);
+}
+
+/* A calibration tap's gram_accum sums across passes while its plugin counts the summed rows in
+ * step; a played pass reissues the sum without calling step (#122). A program holding one records
+ * no passes; one without records them wherever the backend can. */
+TEST(a_program_with_a_calibration_tap_records_no_passes) {
+    {
+        Fixture f;
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        loose_op(f);
+        CHECK_OK(f.start(nullptr, false, /*record=*/true));
+        CHECK_EQ(f.ctx.records_passes(), rad::tape_supported());
+    }
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    loose_op(f);
+    loose_op(f, "gram_accum");
+    CHECK_OK(f.start(nullptr, false, /*record=*/true));
+    CHECK(!f.ctx.records_passes());
 }
 
 /* ================================================================== the pass key */

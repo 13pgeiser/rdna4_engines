@@ -27,3 +27,11 @@ if(OpenMP_CXX_FOUND)
 else()
   message(STATUS "libquant: no OpenMP -- quantisers will run single-threaded")
 endif()
+
+# GPTQ's Hessian factorisations through LAPACK where OpenBLAS is installed (lq_gptq.cpp): the
+# built-in loops are single-threaded and take hours on a 21504-wide down projection.
+find_library(LQ_OPENBLAS openblas)
+if(LQ_OPENBLAS)
+  target_compile_definitions(libquant PRIVATE RAD_LQ_LAPACK=1)
+  target_link_libraries(libquant PRIVATE ${LQ_OPENBLAS})
+endif()

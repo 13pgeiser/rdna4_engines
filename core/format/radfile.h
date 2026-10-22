@@ -141,6 +141,8 @@ public:
 
     /* ------------------------------------------------------------ vocab and profile */
     VocabSection              vocab() const { return vocab_; }
+    /* The second vocab section, or an empty one (RAD_HDR_AUX_VOCAB_OFF in rad_format.h). */
+    VocabSection              aux_vocab() const { return aux_vocab_; }
     int64_t                   profile_count() const { return (int64_t)hdr_->prof_count; }
     const RadFileProfile*     profile() const { return prof_; }
 
@@ -161,7 +163,7 @@ private:
     const RadFileProfile* prof_ = nullptr;
     uint64_t              str_bytes_ = 1;
 
-    VocabSection                                  vocab_;
+    VocabSection                                  vocab_, aux_vocab_;
     std::vector<ExpertGroup>                      groups_;
     std::unordered_map<std::string_view, int64_t> by_name_;
 };
@@ -244,6 +246,8 @@ public:
     /* The serialised vocab section. Its internal offsets must be section-relative (serialise with
      * section_file_off 0); finish() rebases them, as it does the directory. */
     int  set_vocab_section(const void* blob, int64_t bytes);
+    /* The second vocab section (RAD_HDR_AUX_VOCAB_OFF), serialised the same way. */
+    int  set_aux_vocab_section(const void* blob, int64_t bytes);
 
     void add_profile(int32_t layer, int32_t expert, float share);
 
@@ -301,6 +305,8 @@ private:
     /* The vocab section, assembled in memory and appended verbatim. */
     std::vector<uint8_t> vocab_blob_;
     bool                 have_vocab_ = false;
+    std::vector<uint8_t> aux_vocab_blob_;
+    bool                 have_aux_vocab_ = false;
 
     int64_t blob_bytes_ = 0;    /* the blob's reserved length */
 

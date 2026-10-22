@@ -1,5 +1,6 @@
 #include "text/tokenizer.h"
 #include "text/tokenizer_bpe.h"
+#include "text/tokenizer_grapheme.h"
 #include "text/tokenizer_nfc.h"
 #include "text/tokenizer_regex.h"
 #include "text/unicode_norm.h"
@@ -388,6 +389,8 @@ struct TokEncoder {
         /* Split, a regex Replace, ByteLevel with use_regex, and the character-class
          * pre-tokenisers; `re2` is BertPreTokenizer's punctuation after its whitespace split. */
         std::unique_ptr<TokRegex> re, re2;
+        /* Precompiled: the decoded character map. */
+        std::unique_ptr<PrecompiledMap> pmap;
     };
     std::vector<Step> norm, pre;
     uint32_t kind = RAD_TOK_BPE;
@@ -403,6 +406,12 @@ struct TokEncoder {
     TokTable   text;                         /* token text -> lowest id */
     TokTable   raw;                          /* raw bytes a byte-level token stands for -> id */
     int32_t    byte_sym[256];                /* raw byte -> id of its byte-level character */
+    /* BPE's end-of-word suffix (RAD_PRE_END_OF_WORD), empty without one. A word's last symbol
+     * is its text with the suffix: `raw_eow` holds the tokens ending in it by the raw bytes
+     * before it, and `byte_sym_eow` a byte's character with it. */
+    std::string eow;
+    TokTable   raw_eow;
+    int32_t    byte_sym_eow[256];
     int32_t    byte_tok[256];                /* raw byte -> id of "<0xNN>" */
     MergeTable merges;
     std::vector<uint8_t> types;
@@ -419,6 +428,10 @@ struct TokEncoder {
     std::unique_ptr<std::atomic<uint8_t>[]> self_merges;
 
     SpecialMatcher       specials;
+    /* The added tokens matched in the normalised text (RAD_PRE_ADDED_NORMALIZED); `specials`
+     * holds the rest. */
+    SpecialMatcher       nspecials;
+    bool                 has_nspecials = false;
     mutable SegmentCache cache;
 
     int build(const VocabBuild& b, const std::vector<int32_t>& special);
@@ -443,11 +456,19 @@ int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) 
 
     for (const VocabStep& s : b.steps) {
         if (step_is_norm(s.kind)) {
-            Step st{ s, nullptr, nullptr };
+            Step st{ s, nullptr, nullptr, nullptr };
             if (s.kind == RAD_NORM_REPLACE && (s.flags & 1)) RAD_TRY(compile(s.arg0, "Replace", &st.re));
+            if (s.kind == RAD_NORM_PRECOMPILED) {
+                st.pmap = std::make_unique<PrecompiledMap>();
+                std::string why;
+                if (st.pmap->load(s.arg0, &why) < 0) {
+                    RAD_ERR("vocab: the Precompiled normaliser's map: %s", why.c_str());
+                    return RAD_E_FORMAT;
+                }
+            }
             norm.push_back(std::move(st));
         } else if (step_is_pre(s.kind)) {
-            Step st{ s, nullptr, nullptr };
+            Step st{ s, nullptr, nullptr, nullptr };
             if (s.kind == RAD_PRE_SPLIT) RAD_TRY(compile(s.arg0, "Split", &st.re));
             if (s.kind == RAD_PRE_WHITESPACE) {
                 RAD_TRY(compile(s.flags == kPreWhitespace ? k_word_runs : k_space_runs,
@@ -462,6 +483,7 @@ int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) 
                 if (s.flags & 2) RAD_TRY(compile(k_gpt2_pattern, "ByteLevel", &st.re));
             }
             if (s.kind == RAD_PRE_BYTE_FALLBACK) byte_fallback = true;
+            if (s.kind == RAD_PRE_END_OF_WORD) eow = s.arg0;
             if (s.kind == RAD_PRE_METASPACE && s.iarg == 1) prepend_first = true;
             pre.push_back(std::move(st));
         }
@@ -469,7 +491,7 @@ int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) 
     if (kind == RAD_TOK_BPE) {
         for (size_t k = pre.size(); k-- > 0; ) {
             const uint32_t sk = pre[k].step.kind;
-            if (sk == RAD_PRE_BYTE_FALLBACK) continue;
+            if (sk == RAD_PRE_BYTE_FALLBACK || sk == RAD_PRE_END_OF_WORD) continue;
             if (sk == RAD_PRE_BYTELEVEL) defer_bytelevel = (int)k;
             break;
         }
@@ -490,12 +512,20 @@ int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) 
         const char buf[7] = { '<', '0', 'x', hex[c >> 4], hex[c & 15], '>', 0 };
         byte_tok[c] = text.find(buf);
         byte_sym[c] = text.find(a.to_utf8[c]);
+        byte_sym_eow[c] = eow.empty() ? -1 : text.find(a.to_utf8[c] + eow);
     }
     if (defer_bytelevel >= 0) {
         raw.reserve(n);
         std::string r;
-        for (size_t i = 0; i < n; ++i)
-            if (!b.tokens[i].empty() && byte_decode_strict(b.tokens[i], &r)) raw.insert(r, (int32_t)i);
+        for (size_t i = 0; i < n; ++i) {
+            const std::string& t = b.tokens[i];
+            if (t.empty()) continue;
+            if (!eow.empty() && t.size() > eow.size() &&
+                t.compare(t.size() - eow.size(), eow.size(), eow) == 0 &&
+                byte_decode_strict(t.substr(0, t.size() - eow.size()), &r))
+                raw_eow.insert(r, (int32_t)i);
+            if (byte_decode_strict(t, &r)) raw.insert(r, (int32_t)i);
+        }
     }
 
     /* Keyed by the pair as the vocab lists it; the lowest rank wins a duplicate. A symbol's id is
@@ -511,7 +541,17 @@ int TokEncoder::build(const VocabBuild& b, const std::vector<int32_t>& special) 
         merges.insert((int32_t)l, (int32_t)rr, (uint32_t)r, text.find(cat));
     }
 
-    specials.build(special, b.tokens, b.types);
+    /* Each matcher keeps the priority order of `special` (longest first). */
+    std::vector<int32_t> raw_special, norm_special;
+    for (int32_t id : special) {
+        bool normalized = false;
+        for (const VocabStep& s : b.steps)
+            normalized |= s.kind == RAD_PRE_ADDED_NORMALIZED && s.iarg == id;
+        (normalized ? norm_special : raw_special).push_back(id);
+    }
+    specials.build(raw_special, b.tokens, b.types);
+    nspecials.build(norm_special, b.tokens, b.types);
+    has_nspecials = !norm_special.empty();
     self_merges.reset(new std::atomic<uint8_t>[n]());
     /* A byte-level BPE never looks text up by its mapped spelling once `raw` exists. */
     if (defer_bytelevel >= 0) text = TokTable();
@@ -541,8 +581,8 @@ int Vocab::load(VocabBuild b) {
      * so a vocabulary that declares one does not load. */
     for (const VocabStep& s : b_.steps) {
         const uint32_t k = s.kind;
-        if ((k >= RAD_NORM_NFC && k <= RAD_NORM_PREPEND) ||
-            (k >= RAD_PRE_BYTELEVEL && k <= RAD_PRE_BYTE_FALLBACK) ||
+        if ((k >= RAD_NORM_NFC && k <= RAD_NORM_PRECOMPILED) ||
+            (k >= RAD_PRE_BYTELEVEL && k <= RAD_PRE_ADDED_NORMALIZED) ||
             (k >= RAD_DEC_BYTELEVEL && k <= RAD_DEC_BYTE_FALLBACK))
             continue;
         RAD_ERR("vocab: %s is not implemented", step_describe(s).c_str());
@@ -568,6 +608,19 @@ int Vocab::load(VocabBuild b) {
             }
             if (s.kind == RAD_DEC_FUSE) fused = true;
             if (s.kind == RAD_DEC_STRIP && fused) fused_strip = true;
+        }
+    }
+    /* A token matched in the normalised text is one of the vocabulary's added tokens, spelt as
+     * the step says. */
+    for (const VocabStep& s : b_.steps) {
+        if (s.kind != RAD_PRE_ADDED_NORMALIZED) continue;
+        const int32_t id = (int32_t)s.iarg;
+        if (s.iarg < 0 || s.iarg >= (int64_t)b_.tokens.size() || s.arg0.empty() ||
+            b_.tokens[(size_t)id] != s.arg0 ||
+            (!b_.types.empty() && b_.types[(size_t)id] != RAD_TT_CONTROL &&
+             b_.types[(size_t)id] != RAD_TT_USER_DEFINED)) {
+            RAD_ERR("vocab: %s names no added token of that spelling", step_describe(s).c_str());
+            return RAD_E_FORMAT;
         }
     }
     if (b_.types.empty()) b_.types.assign(b_.tokens.size(), (uint8_t)RAD_TT_NORMAL);
@@ -781,6 +834,8 @@ std::string step_describe(const VocabStep& s) {
             return fmt("Replace(%s '%s' -> '%s')", (s.flags & 1) ? "regex" : "literal",
                        s.arg0.c_str(), s.arg1.c_str());
         case RAD_NORM_PREPEND: return fmt("Prepend('%s')", s.arg0.c_str());
+        case RAD_NORM_PRECOMPILED:
+            return fmt("Precompiled(%zu base64 bytes)", s.arg0.size());
         case RAD_PRE_BYTELEVEL:
             return fmt("ByteLevel(add_prefix_space=%d use_regex=%d)",
                        (s.flags & 1) ? 1 : 0, (s.flags & 2) ? 1 : 0);
@@ -806,6 +861,9 @@ std::string step_describe(const VocabStep& s) {
         case RAD_PRE_DIGITS:
             return fmt("Digits(individual=%d)", (s.flags & 1) ? 1 : 0);
         case RAD_PRE_BYTE_FALLBACK: return "ByteFallback";
+        case RAD_PRE_END_OF_WORD:   return fmt("EndOfWordSuffix('%s')", s.arg0.c_str());
+        case RAD_PRE_ADDED_NORMALIZED:
+            return fmt("AddedNormalized('%s' = %lld)", s.arg0.c_str(), (long long)s.iarg);
         case RAD_DEC_BYTELEVEL:     return "decode ByteLevel";
         case RAD_DEC_METASPACE:
             return fmt("decode Metaspace('%s' prepend=%lld)", s.arg0.c_str(), (long long)s.iarg);
@@ -839,7 +897,13 @@ void apply_norm(std::string& text, const TokEncoder::Step& st) {
             std::vector<uint32_t> cpts = unicode_cpts_from_utf8(text);
             std::string out;
             out.reserve(text.size());
-            for (uint32_t c : cpts) out += unicode_cpt_to_utf8(unicode_tolower(c));
+            /* HuggingFace lowercases a character at a time with Rust's char::to_lowercase, whose
+             * one unconditional mapping to two characters is U+0130 (I with dot above) to
+             * "i" U+0307; every other character maps to one. */
+            for (uint32_t c : cpts) {
+                if (c == 0x130) out += "i\xcc\x87";
+                else out += unicode_cpt_to_utf8(unicode_tolower(c));
+            }
             text.swap(out);
             break;
         }
@@ -868,6 +932,7 @@ void apply_norm(std::string& text, const TokEncoder::Step& st) {
             }
             break;
         case RAD_NORM_PREPEND: text = s.arg0 + text; break;
+        case RAD_NORM_PRECOMPILED: text = st.pmap->normalize(text); break;
     }
 }
 
@@ -1055,7 +1120,8 @@ private:
 void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out,
               EncodeScratch& sc) {
     const bool raw = e.defer_bytelevel >= 0;
-    const TokTable& table = raw ? e.raw : e.text;
+    const bool eow = !e.eow.empty();
+    const TokTable& table = raw ? (eow ? e.raw_eow : e.raw) : e.text;
 
     /* A user-defined token is taken whole: added tokens must round-trip, and the merge table was
      * never fitted over them, so re-merging can give a different sequence.
@@ -1065,7 +1131,9 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
      * different split of a rare word). The raw-byte table finds the same entry by its byte
      * spelling. A control entry is never taken whole: reaching here means the caller asked for
      * it to be read as text. */
-    const int32_t whole = table.find(w);
+    /* With an end-of-word suffix the whole word is its text and the suffix: `raw_eow` is keyed
+     * without it, the text table with it. */
+    const int32_t whole = eow && !raw ? table.find(std::string(w) + e.eow) : table.find(w);
     if (whole >= 0 && (e.types[whole] == RAD_TT_USER_DEFINED ||
                        (e.ignore_merges && e.types[whole] != RAD_TT_CONTROL))) {
         out.push_back(whole);
@@ -1083,10 +1151,13 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
     if (raw) {
         for (size_t i = 0; i < n; ++i)
             syms.push_back({ (uint32_t)i, 1, e.byte_sym[(unsigned char)w[i]] });
+        if (eow) syms.back().id = e.byte_sym_eow[(unsigned char)w[n - 1]];
     } else {
         for (size_t i = 0; i < n; ) {
             const size_t len = std::min(unicode_len_utf8(w[i]), n - i);
-            syms.push_back({ (uint32_t)i, (uint32_t)len, table.find(w.substr(i, len)) });
+            syms.push_back({ (uint32_t)i, (uint32_t)len,
+                             eow && i + len == n ? table.find(std::string(w.substr(i, len)) + e.eow)
+                                                 : table.find(w.substr(i, len)) });
             i += len;
         }
     }
@@ -1103,9 +1174,12 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
         /* Miss: decompose into byte tokens, spelt per the chain. Under ByteLevel each byte is its
          * own mapped codepoint, so the piece splits at codepoint boundaries; under byte fallback
          * a byte is "<0xNN>". */
+        const bool last = s.start + s.len == n;
         if (raw) {
-            for (unsigned char c : str) {
-                const int32_t b = e.byte_sym[c];
+            for (size_t k = 0; k < str.size(); ++k) {
+                const unsigned char c = (unsigned char)str[k];
+                const int32_t b = eow && last && k + 1 == str.size() ? e.byte_sym_eow[c]
+                                                                    : e.byte_sym[c];
                 if (b >= 0) out.push_back(b);
                 else RAD_WARN("tokenizer: no token for byte-level piece '%s'",
                               alphabet().to_utf8[c].c_str());
@@ -1113,7 +1187,9 @@ void bpe_word(const TokEncoder& e, std::string_view w, std::vector<int32_t>& out
         } else if (e.bytelevel) {
             for (size_t k = 0; k < str.size(); ) {
                 const size_t m = std::min(unicode_len_utf8(str[k]), str.size() - k);
-                const int32_t b = e.text.find(str.substr(k, m));
+                const int32_t b = eow && last && k + m == str.size()
+                                      ? e.text.find(std::string(str.substr(k, m)) + e.eow)
+                                      : e.text.find(str.substr(k, m));
                 if (b >= 0) out.push_back(b);
                 else RAD_WARN("tokenizer: no token for byte-level piece '%s'",
                               std::string(str.substr(k, m)).c_str());
@@ -1142,9 +1218,13 @@ void bpe(const TokEncoder& e, const Pieces& p, std::vector<int32_t>& out, Encode
         if (w.empty()) continue;
         /* A one-byte word of a byte-level vocab is that byte's token; the lookup and the merge
          * would both land on byte_sym. A missing one takes the warning path in bpe_word. */
-        if (raw && w.size() == 1 && e.byte_sym[(unsigned char)w[0]] >= 0) {
-            out.push_back(e.byte_sym[(unsigned char)w[0]]);
-            continue;
+        if (raw && w.size() == 1) {
+            const int32_t b = e.eow.empty() ? e.byte_sym[(unsigned char)w[0]]
+                                            : e.byte_sym_eow[(unsigned char)w[0]];
+            if (b >= 0) {
+                out.push_back(b);
+                continue;
+            }
         }
         if (w.size() > WordCache::kMaxKey) { bpe_word(e, w, out, sc); continue; }
         const uint64_t h = tok_hash(w);
@@ -1259,13 +1339,10 @@ void wordpiece(const Vocab& v, const TokEncoder& e, const Pieces& p, std::vector
     }
 }
 
-/* One segment -- the text between two special tokens -- through the whole chain. `at_start`:
- * the segment begins the text (see apply_metaspace). */
-int encode_segment(const Vocab& v, const TokEncoder& e, std::string_view seg,
-                   std::vector<int32_t>& out, EncodeScratch& sc, WordCache& words, bool at_start) {
+/* Normalised text in `sc.p.buf` through the pre-tokenisers and the model. */
+int encode_normalized(const Vocab& v, const TokEncoder& e, std::vector<int32_t>& out,
+                      EncodeScratch& sc, WordCache& words, bool at_start) {
     Pieces& p = sc.p;
-    p.buf.assign(seg.data(), seg.size());
-    for (const TokEncoder::Step& st : e.norm) apply_norm(p.buf, st);
     if (p.buf.size() > (size_t)(UINT32_MAX / 8)) {
         RAD_ERR("tokenizer: a %zu-byte segment is past what one encode can index", p.buf.size());
         return RAD_E_INVAL;
@@ -1302,6 +1379,12 @@ int encode_segment(const Vocab& v, const TokEncoder& e, std::string_view seg,
             case RAD_PRE_BYTE_FALLBACK:
                 /* Declares how an unknown piece is encoded, not a split; bpe_word handles it. */
                 break;
+            case RAD_PRE_END_OF_WORD:
+                /* Declares how a word's last symbol is spelt, not a split; bpe_word handles it. */
+                break;
+            case RAD_PRE_ADDED_NORMALIZED:
+                /* Cut out by encode_segment before the pre-tokenisers run. */
+                break;
         }
     }
 
@@ -1323,7 +1406,44 @@ int encode_segment(const Vocab& v, const TokEncoder& e, std::string_view seg,
     return RAD_OK;
 }
 
+/* One segment -- the text between two special tokens -- through the whole chain. `at_start`:
+ * the segment begins the text (see apply_metaspace). The added tokens matched in the normalised
+ * text are cut out of it after the normalisers, under the same `parse_special` rule as the raw
+ * ones, and each piece between them goes through the rest of the chain on its own. */
+int encode_segment(const Vocab& v, const TokEncoder& e, std::string_view seg,
+                   std::vector<int32_t>& out, EncodeScratch& sc, WordCache& words, bool at_start,
+                   bool parse_special) {
+    Pieces& p = sc.p;
+    p.buf.assign(seg.data(), seg.size());
+    for (const TokEncoder::Step& st : e.norm) apply_norm(p.buf, st);
+    if (!e.has_nspecials) return encode_normalized(v, e, out, sc, words, at_start);
+
+    const std::string norm = p.buf;
+    std::vector<SpecialFrag> frags;
+    e.nspecials.split(norm, parse_special, frags);
+    for (const SpecialFrag& f : frags) {
+        if (f.id >= 0) { out.push_back(f.id); continue; }
+        if (f.len == 0) continue;
+        p.buf.assign(norm, f.off, f.len);
+        RAD_TRY(encode_normalized(v, e, out, sc, words, at_start && f.off == 0));
+    }
+    return RAD_OK;
+}
+
 }  /* namespace */
+
+int vocab_normalize(const std::vector<VocabStep>& steps, std::string* text) {
+    for (const VocabStep& s : steps) {
+        if (!step_is_norm(s.kind)) continue;
+        TokEncoder::Step st{ s, nullptr, nullptr };
+        if (s.kind == RAD_NORM_REPLACE && (s.flags & 1)) {
+            std::string why;
+            if (TokRegex::compile(s.arg0, &st.re, &why) < 0) return RAD_E_UNSUPPORTED;
+        }
+        apply_norm(*text, st);
+    }
+    return RAD_OK;
+}
 
 /* ================================================================== encode */
 
@@ -1372,14 +1492,17 @@ int Tokenizer::encode(std::string_view text, std::vector<int32_t>& out,
         /* The cache is keyed on the segment's bytes, so a segment whose ids also depend on
          * starting the text bypasses it. */
         const bool at_start = f.off == 0;
-        if (!use_cache_ || seg.size() < kSegmentCacheMin || (at_start && e.prepend_first)) {
-            RAD_TRY(encode_segment(*v_, e, seg, out, sc, words, at_start));
+        /* A segment's ids also depend on parse_special when added tokens are matched in its
+         * normalised text; the cache holds only the parse_special form. */
+        if (!use_cache_ || seg.size() < kSegmentCacheMin || (at_start && e.prepend_first) ||
+            (e.has_nspecials && !parse_special)) {
+            RAD_TRY(encode_segment(*v_, e, seg, out, sc, words, at_start, parse_special));
             continue;
         }
         const uint64_t h = tok_hash(seg);
         if (e.cache.lookup(seg, h, out)) continue;
         const size_t start = out.size();
-        RAD_TRY(encode_segment(*v_, e, seg, out, sc, words, at_start));
+        RAD_TRY(encode_segment(*v_, e, seg, out, sc, words, at_start, parse_special));
         e.cache.insert(seg, h, out.data() + start, out.size() - start);
     }
 
@@ -1470,9 +1593,10 @@ std::string Tokenizer::piece_at(int32_t id, bool render_special, At at) const {
     if (b >= 0) return std::string(1, (char)b);
 
     std::string s = v_->text(id);
-    /* User-defined and control tokens are stored as literal text; only normal tokens are in the
-     * vocab's own encoding and need the decoder chain. */
-    if (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN || t == RAD_TT_USER_DEFINED) return s;
+    /* Control tokens are stored as literal text. A user-defined (added, non-special) token goes
+     * through the decoder chain like a normal one, as HuggingFace decodes every token it keeps:
+     * Gemma's whitespace runs are added tokens spelled in U+2581 ("\u2581\u2581" is two spaces). */
+    if (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN) return s;
 
     /* No declared decoder means the tokens are already text (true for unigram and wordpiece, not
      * byte-level BPE). rad-convert emits the chain it read, so the absence is declared. */

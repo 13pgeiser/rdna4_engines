@@ -1108,6 +1108,37 @@ AVX_KERNEL(iota) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ int_affine */
+/* y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j] over three integer lists. */
+static int avx_parse_ints(const char* s, int64_t* v, int cap) {
+    int n = 0;
+    while (s && *s) {
+        char* e = nullptr;
+        const long long x = std::strtoll(s, &e, 10);
+        if (e == s) break;
+        if (n == cap) return -1;
+        v[n++] = x;
+        s = e;
+    }
+    return n;
+}
+
+AVX_KERNEL(int_affine) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    int64_t src[16], mul[16], add[16];
+    const int n = avx_parse_ints(p_str(a, "src", ""), src, 16);
+    if (n <= 0 || avx_parse_ints(p_str(a, "mul", ""), mul, 16) != n ||
+        avx_parse_ints(p_str(a, "add", ""), add, 16) != n || numel(Y) < n)
+        return RAD_E_SHAPE;
+    for (int j = 0; j < n; ++j) {
+        if (src[j] >= numel(X)) return RAD_E_SHAPE;
+        const int64_t v = src[j] < 0 ? 0 : at(X, src[j]);
+        st_int_dt(Y->dtype, Y->data, offlin(Y, j), v * mul[j] + add[j]);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ cu_repeat */
 /* y[j] = j * len[0] * mult over y's elements: the bounds of equal sequences. */
 AVX_KERNEL(cu_repeat) {

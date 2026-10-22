@@ -1694,6 +1694,59 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
         { R"({"type":"string","pattern":"^[a-z]{2,5}-[0-9]+$"})",
           { R"("ab-1")", R"("abcde-123")" },
           { R"("a-1")", R"("ab-")", R"("abcdef-1")", R"("AB-1")", R"("ab1")" } },
+        /* A pattern without ^ or $ searches, as JSON Schema says: the missing side is any text.
+         * Tool schemas send them bare; on array items a tool call's JSON arguments reach this
+         * converter, so one bare pattern there failed the whole request. */
+        { R"({"type":"string","pattern":"[0-9]+"})",
+          { R"("7")", R"("ab12c")" }, { R"("abc")", R"("")" } },
+        { R"({"type":"string","pattern":"^ab"})", { R"("ab")", R"("abz")" }, { R"("zab")" } },
+        { R"({"type":"string","pattern":"ab$"})", { R"("ab")", R"("zab")" }, { R"("abz")" } },
+        { R"({"type":"string","pattern":"a\\$"})", { R"("a$")", R"("za$z")" }, { R"("a")" } },
+        { R"({"type":"string","pattern":"x|yz"})", { R"("x")", R"("ayzb")" }, { R"("y")" } },
+        { R"({"type":"array","items":{"type":"string","pattern":"[0-9]+"}})",
+          { R"(["1","x2"])", R"(["x\"1"])", "[]" }, { R"(["x"])", R"(["1","x"])" } },
+        /* \d \w \s and their negations (0018), as tool schemas send them: oh-my-pi's workpool tool
+         * carries "\S" thirteen times. A negated class must not cross the closing quote. */
+        { R"({"type":"string","pattern":"\\S"})", { R"("a")", R"(" a ")" }, { R"("")", R"("   ")" } },
+        { R"({"type":"array","items":{"type":"string","pattern":"\\S"}})",
+          { R"(["a"," b"])" }, { R"(["  "])", R"(["a","  "])" } },
+        { R"({"type":"string","pattern":"^\\d{4}-\\d{2}-\\d{2}$"})",
+          { R"("2026-10-19")" }, { R"("2026-1-19")", R"("20x6-10-19")" } },
+        { R"({"type":"string","pattern":"^[\\w-]+$"})", { R"("a_b-1")" }, { R"("a b")", R"("")" } },
+        { R"({"type":"string","pattern":"^-?\\d+(?:\\.\\d+)?$"})",
+          { R"("3")", R"("-3.14")" }, { R"("3.")", R"("x")" } },
+        { R"({"type":"string","pattern":"^a\\sb$"})", { R"("a b")", R"("a\tb")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^[\\s\\S]{2}$"})", { R"("ab")", R"("a ")" }, { R"("a")" } },
+        { R"({"type":"string","pattern":"^\\D$"})", { R"("x")" }, { R"("7")" } },
+        /* identity escapes of punctuation (0019): zod's email pattern sends "\-" inside a class, and
+         * JavaScript-written patterns escape "/". An escaped '-' in a class is not a range. */
+        { R"({"type":"string","pattern":"^a\\/b$"})", { R"("a/b")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^a\\-b$"})", { R"("a-b")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^[a\\-z]$"})", { R"("a")", R"("-")", R"("z")" }, { R"("b")" } },
+        { R"({"type":"string","pattern":"^[a\\^]$"})", { R"("^")", R"("a")" }, { R"("b")" } },
+        { R"({"type":"string","pattern":"^[\\^a]$"})", { R"("^")", R"("a")" }, { R"("b")" } },
+        { R"({"type":"string","pattern":"^[\\--z]$"})", { R"("-")", R"("a")" }, { R"("+")" } },
+        { R"({"type":"string","pattern":"^[\\.]$"})", { R"(".")" }, { R"("a")" } },
+        { R"({"type":"string","pattern":"a\\-b"})", { R"("xa-by")" }, { R"("ab")" } },
+        /* control-character escapes (0020): a JSON string holds a tab or a backspace only as an
+         * escape, so [\t] [\b] [\f] [\v] [\0] and \t outside a class match the escape, and an
+         * escaped space or non-ASCII character is itself. */
+        { R"({"type":"string","pattern":"^[\\b]$"})", { R"("\b")" }, { R"("b")", R"("\\")" } },
+        { R"({"type":"string","pattern":"^[a\\t]+$"})", { R"("a\ta")", R"("a")" }, { R"("t")", R"("a b")" } },
+        { R"({"type":"string","pattern":"^[\\f\\v]$"})", { R"("\f")", R"("\u000b")", R"("\u000B")" }, { R"("f")", R"("v")" } },
+        { R"({"type":"string","pattern":"^[\\0]$"})", { R"("\u0000")" }, { R"("0")" } },
+        { R"({"type":"string","pattern":"^a\\tb$"})", { R"("a\tb")" }, { R"("atb")" } },
+        { R"({"type":"string","pattern":"^[a\\ ]+$"})", { R"("a a")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^a\\ b$"})", { R"("a b")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^[\\s]$"})", { R"(" ")", R"("\n")" }, { R"("n")" } },
+        { R"({"type":"string","pattern":"^[^\\t]$"})", { R"("a")" }, { R"("")" } },
+        { R"({"type":"string","pattern":"^a\\t+b$"})", { R"("a\t\tb")" }, { R"("a\tttb")", R"("ab")" } },
+        { R"({"type":"string","pattern":"^x\\v{2}$"})", { R"("x\u000b\u000B")" }, { R"("x\u000b")" } },
+        { R"({"type":"string","pattern":"^[\\t]{2}$"})", { R"("\t\t")" }, { R"("\t")" } },
+        { R"({"type":"string","pattern":"^[^\\n]+$"})", { R"("ab")", R"("a\tb")" }, { R"("a\nb")" } },
+        { R"({"type":"string","pattern":"^[^\\s]+$"})", { R"("ab")" }, { R"("\t")", R"("a b")" } },
+        { R"({"type":"string","pattern":"^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"})",
+          { R"("a.b@c.io")", R"("x-y@d-e.org")" }, { R"("a@b")", R"("a b@c.io")" } },
         { R"({"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":3})",
           { "[1]", "[1,2,3]", "[-4,0]" }, { "[]", "[1,2,3,4]", R"(["a"])" } },
         { R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"string"}},)"
@@ -1713,6 +1766,18 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
     if (schema_admits(bv->v, R"({"type":"number","minimum":0.5})", "-1"))
         fprintf(stderr, "    SKIP number bounds: the converter does not enforce minimum/maximum "
                         "on \"number\"\n");
+    for (const char* schema : { R"({"type":"string","pattern":"^a|b"})",
+                                R"({"type":"string","pattern":"a|b$"})",
+                                R"({"type":"string","pattern":"^[a\\S]$"})",
+                                R"({"type":"string","pattern":"^[\\p{L}]$"})",
+                                R"({"type":"string","pattern":"^[\\cA]$"})",
+                                R"({"type":"string","pattern":"^[a\\1]$"})",
+                                R"({"type":"string","pattern":"^[\\01]$"})",
+                                R"({"type":"string","pattern":"^[\\xZ]$"})",
+                                R"({"type":"string","pattern":"^[\\u{41}]$"})" }) {
+        std::string gbnf, err;
+        CHECK(grammar_from_json_schema(schema, "root", &gbnf, &err) < 0);
+    }
     for (const Case& c : cases) {
         for (const char* y : c.yes) {
             const bool ok = schema_admits(bv->v, c.schema, y);

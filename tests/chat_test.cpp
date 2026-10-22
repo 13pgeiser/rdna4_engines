@@ -288,8 +288,8 @@ TEST(every_shipped_template_renders_as_reference_jinja_does) {
                                 "reference render " + first_difference(ref, got));
         }
     }
-    /* Four templates, every case each one renders. */
-    CHECK(compared >= 60);
+    /* Five templates, every case each one renders. */
+    CHECK(compared >= 74);
 }
 
 /* ------------------------------------------------------------------ reading the reply back */
@@ -1014,6 +1014,66 @@ TEST(the_capability_probe_reads_what_the_template_actually_does) {
     /* It reads string content and renders any role. */
     CHECK(c.string_content);
     CHECK(c.system_role);
+}
+
+/* jinja2 reads `obj.0` as `obj[0]`, and GLM-5's template tests a tool result with
+ * `m.content.0.type`. The engine threw on it, and the probe, which swallows a throw, reported a
+ * template that renders tools as one that cannot: every request with `tools` was refused. */
+TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
+    ChatTemplate glm;
+    CHECK_OK(glm.load(
+        "{%- if tools %}<tools>{% for t in tools %}{{ t.function.name }};{% endfor %}</tools>{% endif %}"
+        "{%- for m in messages %}"
+        "{%- if m.role == 'tool' and m.content is not mapping and m.content.0.type == 'tool_reference' %}<ref/>"
+        "{%- else %}<{{ m.role }}>{{ m.content }}"
+        "{%- if m.tool_calls %}{% for c in m.tool_calls %}<call>{{ c.function.name }}</call>{% endfor %}{% endif %}"
+        "</{{ m.role }}>{%- endif %}"
+        "{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(glm.caps().tools);
+    CHECK(glm.caps().tool_calls);
+    /* The string-content probe hands the template an empty tools array, not [null]: this
+     * template iterates `tools`, threw on the null, and lost string content. */
+    CHECK(glm.caps().string_content);
+
+    ChatTemplate first;
+    CHECK_OK(first.load("{{ messages.0.content }}|{{ messages.1.role }}", "", ""));
+    json msgs = json::array();
+    msgs.push_back({{"role", "user"}, {"content", "hi"}});
+    msgs.push_back({{"role", "assistant"}, {"content", "hello"}});
+    ChatPrompt p;
+    CHECK_OK(first.apply(msgs, json(), ChatOptions{}, &p));
+    CHECK_EQ(p.prompt, std::string("hi|assistant"));
+}
+
+/* A template that takes one system message, first, as many do, against conversations the Chat
+ * Completions API allows: a system message after a user turn, and two at the head. They are
+ * rendered with the system messages merged, in order, into one at the head (#137). Any other
+ * refusal comes back in the template's own words, without the parser-generation wrapper. */
+TEST(system_messages_a_template_takes_only_first_are_merged_at_the_head) {
+    ChatTemplate t;
+    CHECK_OK(t.load(
+        "{%- for m in messages %}"
+        "{%- if m.role == 'system' and not loop.first %}"
+        "{{- raise_exception('System message must be at the beginning.') }}{%- endif %}"
+        "{%- if m.role == 'user' and m.content == 'boom' %}{{- raise_exception('no boom') }}{%- endif %}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endfor %}{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    ChatOptions opt;
+    opt.quiet = true;
+    auto render = [&](const json& msgs, ChatPrompt* p) { return t.apply(msgs, json(), opt, p); };
+    ChatPrompt a, b, c, d;
+    CHECK_OK(render(json::parse(R"([{"role":"system","content":"s"},{"role":"user","content":"hi"}])"), &a));
+    CHECK_EQ(a.prompt, std::string("<system>s</system><user>hi</user><assistant>"));
+    CHECK_OK(render(json::parse(R"([{"role":"user","content":"hi"},{"role":"system","content":"s"}])"), &b));
+    CHECK_EQ(b.prompt, std::string("<system>s</system><user>hi</user><assistant>"));
+    CHECK_OK(render(json::parse(R"([{"role":"system","content":"s1"},{"role":"system",
+        "content":[{"type":"text","text":"s2"}]},{"role":"user","content":"hi"}])"), &c));
+    CHECK_EQ(c.prompt, std::string("<system>s1\n\ns2</system><user>hi</user><assistant>"));
+    CHECK(render(json::parse(R"([{"role":"system","content":"s"},{"role":"user","content":"boom"}])"),
+                 &d) < 0);
+    CHECK(d.error.find("no boom") != std::string::npos);
+    CHECK(d.error.find("Unable to generate parser") == std::string::npos);
 }
 
 /* Unparseable Jinja (common in hand-built containers) is reported at load time as an error value;

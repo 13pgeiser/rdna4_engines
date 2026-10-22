@@ -128,6 +128,20 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
     CHECK_EQ(ck.dir(), dir);
 }
 
+TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
+    const std::string dir = write_checkpoint({ bf16("x", {2, 2}, 0) },
+        "{\"model_type\":\"glm5_next\",\"text_config\":{\"hidden_size\":4096,"
+        "\"num_attention_heads\":64,\"head_dim\":0,\"n_routed_experts\":288,"
+        "\"n_shared_experts\":1,\"num_experts_per_tok\":8}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("glm5next"));
+    CHECK_EQ(ck.meta().m.n_expert, (int64_t)288);
+    CHECK_EQ(ck.meta().m.n_expert_shared, (int64_t)1);
+    CHECK_EQ(ck.meta().m.n_expert_used, (int64_t)8);
+    CHECK_EQ(ck.meta().m.head_dim, (int64_t)0);
+}
+
 /* The descriptor derives from quant_method and fmt whoever set them, including rad-convert's
  * --set: a bf16 checkpoint converted to block fp8 states that format and selects the fp8 plugin,
  * so the container never names one format and selects another's plugin. */
@@ -164,6 +178,78 @@ TEST(a_plain_tensor_is_its_own_encoding_and_reads_back_as_itself) {
     std::vector<uint8_t> raw(8 * 2);
     REQUIRE_EQ(ckpt_plane_rows(w, 0, 2, 1, raw.data(), &why), RAD_OK);
     CHECK_EQ(std::memcmp(raw.data(), (const uint8_t*)ck.find("a.weight")->data + 32, 16), 0);
+}
+
+/* A single-file SDXL checkpoint (Stability's sgm layout) is read under the names its adapters use:
+ * the UNet and CLIP ViT-L as they are, OpenCLIP bigG in transformers' names with its fused
+ * in_proj split into q/k/v rows and its (in, out) text_projection transposed, the VAE decoder in
+ * diffusers' names with up blocks counted the other way, a v_pred marker as the prediction type,
+ * and bigG's dimensions as the model's. */
+TEST(a_single_file_sdxl_checkpoint_is_read_in_its_adapters_names) {
+    const std::string g = "conditioner.embedders.1.model.";
+    T proj{ g + "text_projection", "F32", { 2, 3 }, {} };
+    proj.bytes.resize(6 * 4);
+    for (int i = 0; i < 6; ++i) rad_store_f32(proj.bytes.data(), RAD_F32, i, (float)i);
+    const std::string dir = fresh_dir();
+    const std::string file = dir + "/sdxl.safetensors";
+    write_shard(file, {
+        bf16("model.diffusion_model.label_emb.0.0.weight", { 2, 4 }, 1.0f),
+        bf16("conditioner.embedders.0.transformer.text_model.final_layer_norm.weight", { 4 }, 2.0f),
+        bf16(g + "transformer.resblocks.3.attn.in_proj_weight", { 6, 4 }, 0.0f),
+        bf16(g + "transformer.resblocks.3.attn.in_proj_bias", { 6 }, 0.0f),
+        bf16(g + "transformer.resblocks.3.mlp.c_fc.weight", { 8, 4 }, 3.0f),
+        bf16(g + "transformer.resblocks.3.ln_2.bias", { 4 }, 4.0f),
+        bf16(g + "ln_final.weight", { 4 }, 5.0f),
+        bf16(g + "token_embedding.weight", { 16, 4 }, 0.0f),
+        bf16(g + "transformer.resblocks.0.ln_1.weight", { 4 }, 0.0f),
+        bf16(g + "transformer.resblocks.0.mlp.c_fc.weight", { 8, 4 }, 0.0f),
+        bf16(g + "positional_embedding", { 77, 4 }, 6.0f),
+        proj,
+        bf16("first_stage_model.decoder.up.0.block.2.nin_shortcut.weight", { 4, 8, 1, 1 }, 7.0f),
+        bf16("first_stage_model.decoder.up.3.upsample.conv.bias", { 4 }, 8.0f),
+        bf16("first_stage_model.decoder.mid.attn_1.proj_out.weight", { 4, 4, 1, 1 }, 9.0f),
+        bf16("first_stage_model.encoder.conv_in.weight", { 4, 3, 3, 3 }, 10.0f),
+        T{ "v_pred", "F32", { 0 }, {} },
+    });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(file), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("sdxl"));
+    REQUIRE(ck.meta().get("sdxl.prediction") != nullptr);
+    CHECK_EQ(std::string(ck.meta().get("sdxl.prediction")), std::string("v"));
+    /* The typed dimensions are bigG's: its width, vocabulary and feed-forward off its tensors,
+     * its layers counted from 0 while they run on. */
+    CHECK_EQ(ck.meta().m.n_embd, (int64_t)4);
+    CHECK_EQ(ck.meta().m.n_vocab, (int64_t)16);
+    CHECK_EQ(ck.meta().m.n_ff, (int64_t)8);
+    CHECK_EQ(ck.meta().m.n_layers, (int64_t)1);
+    CHECK(ck.find("model.diffusion_model.label_emb.0.0.weight") != nullptr);
+    CHECK(ck.find("conditioner.embedders.0.transformer.text_model.final_layer_norm.weight") != nullptr);
+    const std::string t = "conditioner.embedders.1.transformer.";
+    const std::string l = t + "text_model.encoder.layers.3.";
+    const SrcTensor* q = ck.find(l + "self_attn.q_proj.weight");
+    const SrcTensor* v = ck.find(l + "self_attn.v_proj.weight");
+    const SrcTensor* vb = ck.find(l + "self_attn.v_proj.bias");
+    REQUIRE(q && v && vb);
+    CHECK(q->shape == std::vector<int64_t>({ 2, 4 }));
+    /* v is rows 4..5 of in_proj: elements 16..23, each its index (mod 64) in bf16. */
+    CHECK_EQ(rad_load_f32(v->data, RAD_BF16, 0), 16.0f);
+    CHECK_EQ(rad_load_f32(vb->data, RAD_BF16, 1), 5.0f);
+    CHECK(ck.find(g + "transformer.resblocks.3.attn.in_proj_weight") == nullptr);
+    CHECK(ck.find(l + "mlp.fc1.weight") != nullptr);
+    CHECK(ck.find(l + "layer_norm2.bias") != nullptr);
+    CHECK(ck.find(t + "text_model.final_layer_norm.weight") != nullptr);
+    CHECK(ck.find(t + "text_model.embeddings.position_embedding.weight") != nullptr);
+    const SrcTensor* p = ck.find(t + "text_projection.weight");
+    REQUIRE(p != nullptr);
+    CHECK(p->shape == std::vector<int64_t>({ 3, 2 }));
+    /* P^T: element (j, i) is P(i, j) = 3 i + j. */
+    for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 2; ++i)
+            CHECK_EQ(rad_load_f32(p->data, RAD_F32, j * 2 + i), (float)(3 * i + j));
+    CHECK(ck.find("vae.decoder.up_blocks.3.resnets.2.conv_shortcut.weight") != nullptr);
+    CHECK(ck.find("vae.decoder.up_blocks.0.upsamplers.0.conv.bias") != nullptr);
+    CHECK(ck.find("vae.decoder.mid_block.attentions.0.to_out.0.weight") != nullptr);
+    CHECK(ck.find("first_stage_model.encoder.conv_in.weight") != nullptr);
 }
 
 /* Block-scaled FP8 is one weight of two planes; each value is its code times the scale of the
@@ -610,6 +696,75 @@ TEST(a_quark_mxfp4_weight_is_its_codes_and_exponents) {
     CHECK_EQ(bad, 0);
     /* an excluded layer is a plain tensor */
     REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
+}
+
+/* GLM-5.3-Flash's Quark export keeps excluded attention and MTP weights block-FP8, with F32
+ * `_scale` companions. They multiply the codes; reading the global MXFP4 scheme into these
+ * weights, or overlooking the scale because it is not called `_scale_inv`, corrupts the model. */
+TEST(quark_refuses_unsupported_or_incomplete_layer_weight_overrides) {
+    for (const char* override_config : {
+        "{\"p\":{\"weight\":{\"dtype\":\"fp8_e4m3\",\"qscheme\":\"per_block\",\"block_size\":[64,128]}}}",
+        "{\"p\":{\"weight\":{\"dtype\":\"int8\",\"qscheme\":\"per_block\",\"block_size\":[128,128]}}}",
+        "{\"p\":{\"weight\":null}}",
+        "{\"p\":{\"weight\":{\"dtype\":\"fp8_e4m3\",\"qscheme\":\"per_block\",\"block_size\":[128,128]}},"
+        "\"other\":{\"weight\":{\"qscheme\":\"per_block\"}}}" }) {
+        const std::string config = std::string("{\"quantization_config\":{\"quant_method\":\"quark\","
+            "\"global_quant_config\":{\"weight\":{\"dtype\":\"fp4\",\"qscheme\":\"per_group\","
+            "\"group_size\":32,\"scale_format\":\"e8m0\"}},\"layer_quant_config\":") +
+            override_config + "}}";
+        const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, config.c_str());
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() != Checkpoint::Import::QuarkMx);
+        CHECK(!ck.import_refusal().empty());
+    }
+}
+
+TEST(a_quark_checkpoint_preserves_excluded_block_fp8_weights) {
+    T s{ "p.weight_scale", "F32", { 2, 2 }, std::vector<uint8_t>(4 * sizeof(float)) };
+    for (int i = 0; i < 4; ++i) rad_store_f32(s.bytes.data(), RAD_F32, i, 0.25f * (i + 1));
+    T bad = s;
+    bad.name = "bad.weight_scale";
+    bad.shape = { 1, 4 };  /* same number of scales, wrong block geometry */
+    const std::string dir = write_checkpoint(
+        { fp8("p.weight", { 256, 256 }), s, fp8("bad.weight", { 256, 256 }), bad,
+          bf16("norm.weight", { 4 }, 1.0f) },
+        "{\"model_type\":\"glm5_next\",\"quantization_config\":{\"quant_method\":\"quark\","
+        "\"global_quant_config\":{\"weight\":{\"dtype\":\"fp4\",\"qscheme\":\"per_group\","
+        "\"group_size\":32,\"scale_format\":\"e8m0\"}},"
+        "\"layer_quant_config\":{\"p\":{\"weight\":{\"dtype\":\"fp8_e4m3\","
+        "\"qscheme\":\"per_block\",\"block_size\":[128,128]}}}}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    REQUIRE(ck.imports() == Checkpoint::Import::QuarkMx);
+    Program prog;
+    prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+    prog.name_map.push_back(map("bad", RAD_MAP_COPY, { "bad.weight" }));
+    prog.name_map.push_back(map("norm", RAD_MAP_COPY, { "norm.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)128);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)128);
+    std::vector<float> f(256);
+    for (int64_t r : { (int64_t)0, (int64_t)129 }) {
+        REQUIRE_EQ(ckpt_rows_f32(w, r, 1, f.data(), &why), RAD_OK);
+        for (int64_t c : { (int64_t)0, (int64_t)127, (int64_t)128, (int64_t)255 })
+            CHECK_EQ(f[(size_t)c], ((float)((r * 256 + c) % 7) - 3.0f) *
+                                   (0.25f * (float)(r / 128 * 2 + c / 128 + 1)));
+    }
+    std::vector<uint8_t> scales(s.bytes.size());
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 2, scales.data(), &why), RAD_OK);
+    CHECK_EQ(std::memcmp(scales.data(), s.bytes.data(), scales.size()), 0);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "bad", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    CHECK(w.why.find("scale plane") != std::string::npos);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "norm", false, &w, &why), RAD_OK);
     CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
 }
 
@@ -2650,6 +2805,84 @@ TEST(a_companion_folder_is_read_under_its_name) {
     };
     CHECK_EQ(mget("codec.model_type"), std::string("tok"));
     CHECK_EQ(mget("codec.decoder_config.dim"), std::string("7"));
+}
+
+namespace {
+
+/* A RAD_MAP_ROWS or RAD_MAP_COLS map: source k starts at index[k] and spans rows[k]. */
+RadNameMap ranged(const char* declared, int mode, std::vector<const char*> src,
+                  std::vector<int> index, std::vector<int64_t> rows) {
+    RadNameMap m = map(declared, mode, std::move(src), std::move(index));
+    for (size_t i = 0; i < rows.size(); ++i) m.src_rows[i] = rows[i];
+    return m;
+}
+
+}  /* namespace */
+
+/* A column range of the last dimension, in every leading slice; a range past the end is
+ * refused. */
+TEST(a_column_range_is_those_columns_of_every_row) {
+    const std::string dir = write_checkpoint({ bf16("x.weight", { 3, 5 }, 0.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(ranged("xc", RAD_MAP_COLS, { "x.weight" }, { 1 }, { 3 }));
+    prog.name_map.push_back(ranged("far", RAD_MAP_COLS, { "x.weight" }, { 3 }, { 3 }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "xc", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    REQUIRE_EQ(w.rank, (uint32_t)2);
+    CHECK_EQ(w.shape[0], (int64_t)3);
+    CHECK_EQ(w.shape[1], (int64_t)3);
+    std::vector<float> f(9);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 3, f.data(), &why), RAD_OK);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) CHECK_EQ(f[(size_t)(r * 3 + c)], (float)(r * 5 + 1 + c));
+    CHECK_EQ(ckpt_resolve(ck, prog, "far", false, &w, &why), (int)RAD_E_SHAPE);
+}
+
+/* Row pieces declared over several maps of one name join in declaration order, so a permutation
+ * of a weight's rows can be stated one row at a time. */
+TEST(row_pieces_over_several_maps_join_in_order) {
+    const std::string dir = write_checkpoint({ bf16("w", { 4, 3 }, 0.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(ranged("p", RAD_MAP_ROWS, { "w" }, { 2 }, { 1 }));
+    prog.name_map.push_back(ranged("p", RAD_MAP_ROWS, { "w", "w" }, { 0, 3 }, { 1, 1 }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    CHECK_EQ(w.shape[0], (int64_t)3);
+    CHECK_EQ(w.shape[1], (int64_t)3);
+    std::vector<float> f(9);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 3, f.data(), &why), RAD_OK);
+    const int order[3] = { 2, 0, 3 };
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) CHECK_EQ(f[(size_t)(r * 3 + c)], (float)(order[r] * 3 + c));
+}
+
+/* A release split into single files merges them under their own names; a name two files share
+ * is refused. The metadata and tokenizer come from the directory set before open(). */
+TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
+    const std::string dir = fresh_dir();
+    write_shard(dir + "/dit.safetensors", { bf16("net.a", { 2, 2 }, 1.0f) });
+    write_shard(dir + "/te.safetensors", { bf16("model.b", { 2, 2 }, 2.0f) });
+    write_shard(dir + "/dup.safetensors", { bf16("net.a", { 2, 2 }, 3.0f) });
+    const std::string meta = fresh_dir();
+    write_file(meta + "/config.json", "{\"model_type\":\"qwen3\",\"hidden_size\":64}");
+    write_file(meta + "/tokenizer.json", "{}");
+    Checkpoint ck;
+    ck.set_meta_dir(meta);
+    REQUIRE_EQ(ck.open(dir + "/dit.safetensors"), RAD_OK);
+    REQUIRE_EQ(ck.add_file(dir + "/te.safetensors"), RAD_OK);
+    CHECK(ck.find("net.a") != nullptr);
+    CHECK(ck.find("model.b") != nullptr);
+    CHECK(ck.add_file(dir + "/dup.safetensors") < 0);
+    const char* mt = ck.meta().get("model_type");
+    CHECK_EQ(std::string(mt ? mt : ""), std::string("qwen3"));
+    CHECK_EQ(ck.tok_dir(), meta);
 }
 
 RAD_TEST_MAIN()

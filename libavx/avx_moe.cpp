@@ -1098,7 +1098,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
             if (jc > 0 || (ts && cb_joined(wse[e]))) return RAD_E_DTYPE;
         }
         mw[e] = as_mat(&we[e], k);
-        SW[e] = make_scales(quant && ts ? &wse[e] : nullptr, n, k, false);
+        SW[e] = make_scales(quant && ts ? &wse[e] : nullptr, n, k, we[e].dtype == RAD_FP4E2M1);
         /* An activation scale grid finer than an expert's cannot be hoisted out of the group. No
          * supported format has one, but libref answers it by scaling each element, so the panel
          * below is scaled as it is packed and the dot reads no activation scale (`SAg`). */
@@ -1218,7 +1218,7 @@ AVX_KERNEL(moe_gemm_q_mod4) { return moe_gemm_impl(a, true, 4); }
 /* y[t] = sum over the token's slots of expert_w[t, j] * y_expert[position of (t, j)], summed in
  * ascending slot j (see the file header). The inverse permutation is built once per batch. */
 AVX_KERNEL(moe_gather) {
-    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    if (!a || !a->t || a->n_t < 6 || !rad_args_have(a, 3) || !rad_arg_in(a, 5)) return RAD_E_INVAL;
     const RadTensor *ye = &a->t[0], *ew = &a->t[1], *sorted = &a->t[2], *Y = &a->t[5];
     /* Optional shared-expert fold: y = narrow(shared * act(gate)) + narrow(gathered). Both
      * operands or neither, as in libref. */

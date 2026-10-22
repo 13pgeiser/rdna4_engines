@@ -1,0 +1,23 @@
+# GLM-5.3-Flash from AMD's Quark export (data/recipes/glm53-mxfp4.recipe): MXFP4 experts,
+# block-FP8 attention, the native MTP layer as the drafter. It takes eight 32 GB cards with the
+# whole expert plane in VRAM; a container with the vision tower serves pictures too, at the
+# default encoder pass. The KV cache is bf16, the only one the plugin declares.
+#
+# A hybrid reuses a cached prefix only from a recurrent-state checkpoint at or below it, so the
+# interval is 1024, which keeps a 1.5k-token system prompt's first 1024 tokens; --prefill-span 4
+# lets a lone prefill take four intervals a step. The template knows the reasoning efforts low
+# and high and renders any other word as its maximum, hence the map.
+name: radiance-glm53-flash
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-glm53-flash
+    command: >
+      --model /models/glm53-flash-mxfp4.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 8 --placement all_vram --gpu-headroom-mib 1024 --embedding-placement vram
+      --max-num-seqs 8 --max-model-len 32768
+      --max-num-batched-tokens 4096 --prefill-span 4
+      --checkpoint-interval 1024 --checkpoint-slots 64 --prefix-cache-mib 4096
+      --num-speculative-tokens 5 --draft-window adaptive
+      --reasoning-effort low --reasoning-effort-map medium=high,xhigh=high

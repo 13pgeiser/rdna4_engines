@@ -15,6 +15,7 @@
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
+#include "r4d_chain.h"
 #include <algorithm>
 #include <type_traits>
 
@@ -52,6 +53,17 @@
 // fragment for fp8, 16 for bf16), costing 2 or 4 x HEAD_DIM/16 VGPRs; PF = HEAD_DIM/16 would hold
 // converted fragments and cost occupancy. Results are unchanged.
 #define O_KRAW  16777216
+// O_V4: the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale), and with O_K6 the
+// k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
+#define O_V4    33554432
+#define O_K6    67108864
+// The two views of R4DArgs (r4d.h), compiled in only where a row asks for them, since the h256
+// instances sit at the 256-VGPR bound and a runtime pitch and head map spill there:
+//   QLD    q rows at R4DArgs::q_ld (attn_paged_qrow), not dense.
+//   KVREP  query group g reads cache head g / R4DArgs::kv_rep, descales per cache head.
+// Neither changes the arithmetic.
+#define O_QLD   134217728
+#define O_KVREP 268435456
 __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
 __host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
     int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
@@ -69,10 +81,12 @@ __host__ __device__ __forceinline__ int r4d_attn_used(int ctx, int tile, int spl
 
 // WIN enables a sliding window (a.window positions ending at each row's causal limit). As a
 // template parameter defaulting to 0, full attention compiles with no window code.
+// The body: its blocks return early (empty slots, tiles past the window), so the chained form
+// (r4d_chain.h) wraps it below rather than bracketing it in place.
 template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
          int WIN = 0>
-__global__ __launch_bounds__(NWARPS * 32)
-void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+__device__ __forceinline__
+void r4d_attn_decode_body(const R4DArgs& a, int splits)
 {
     constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
     constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
@@ -85,10 +99,22 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16)) ? 1 : 0;
     constexpr int BTS   = (OPT & O_BTS)  ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB) ? 1 : 0;
-    constexpr int V8    = ((OPT & O_V8) && !KVP) ? 1 : 0;
+    constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
+    constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int V8    = ((OPT & O_V8) && !KVP && !V4) ? 1 : 0;
     static_assert(!V8 || (OPT & O_CONTIG), "the code tile is read in the contiguous layout");
     constexpr int KRAW  = ((OPT & O_KRAW) && !KLDS) ? 1 : 0;
     static_assert(!KRAW || (OPT & O_CONTIG), "the raw K round reads the contiguous layout");
+    static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
+                  "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
+    static_assert(!V4 || (OPT & O_F16), "fp8_v4 widens to f16");
+    constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
+    constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
 
@@ -104,7 +130,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     // Up to three uint4 it fits in 255 VGPRs without spilling (two: +6-8% at depth; three, the
     // 48-row shape q_len 8 x gqa 6 at NWARPS 3: a further 2-15%). At four or more (NWARPS 1-2, or a
     // bf16 cache) it spills and loses ~10%, so the geometry gates it, not just the flag.
-    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= 3) ? 1 : 0;
+    constexpr int GPREV = ((OPT & O_GPREV) && VREGS <= 3 && !V4) ? 1 : 0;
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = D::GROW;
 
@@ -119,6 +145,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const int c = lane & 15, h = lane >> 4;
 
     const int sp = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    // kvh is the query group; under KVREP the cache head it reads is kvh / kv_rep
+    const int kvc = KVREP ? kvh / a.kv_rep : kvh;
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
@@ -147,13 +175,17 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const int qhead = kvh * GQA + hi;
 
     const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
-    const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
+    const float kdesc = a.k_descale
+                      ? a.k_descale[seq * (KVREP ? a.kv_heads / a.kv_rep : a.kv_heads) + kvc]
+                      : 1.0f;
     const float mul   = a.scale * kdesc * 1.44269504089f;
 
     frag16 qf[NKS];
     {
-        const uint16_t* qp = (const uint16_t*)a.q
-                           + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
+        const uint16_t* qp = QLD ? (const uint16_t*)a.q + (size_t)(qoff + qrow) * a.q_ld
+                                                        + (size_t)qhead * HEAD_DIM
+                                 : (const uint16_t*)a.q
+                                   + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
         #pragma unroll
         for (int t = 0; t < NKS; ++t) {
             const uint2 l0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h : 4 * h));
@@ -185,6 +217,62 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const int vg = lane >> 3, vj = lane & 7;
     uint4 vreg[VREGS];
 
+    // ---- fp8_v4 / k6_v4: V's int4 codes into sV16 ([dim][key]) as the prefill kernel stages them
+    // (r4d_attn_prefill_h256_gqa6.hip: a key pair's 8 dims a thread, two code words and the pair's
+    // scale, widened with packed f16 into one dword a dim), fetched in the tile: no prefetch.
+    constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
+    constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
+    uint32_t v4c[U4][2], v4s[U4];
+    auto fetchV4 = [&](int k0, const int* blks) {
+        #pragma unroll
+        for (int r = 0; r < U4; ++r) {
+            const int u = tid + r * NTHR;
+            if (NP4 % NTHR == 0 || u < NP4) {
+                const int kp = u % (TILE / 2), o = u / (TILE / 2);
+                uint32_t sc[2];
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    int kk = min(k0 + 2 * kp + j, ctx - 1);
+                    if (WIN && kk < wlo0) kk = wlo0;
+                    const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                    const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
+                                        + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                }
+                v4s[r] = sc[0] | (sc[1] << 16);
+            }
+        }
+    };
+    auto storeV4 = [&]() {
+        typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+        #pragma unroll
+        for (int r = 0; r < U4; ++r) {
+            const int u = tid + r * NTHR;
+            if (NP4 % NTHR == 0 || u < NP4) {
+                const int kp = u % (TILE / 2), o = u / (TILE / 2);
+                // Two's complement nibbles; ^ 8 makes them offset binary (value + 8).
+                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const h2 s2 = __builtin_bit_cast(h2, v4s[r]);
+                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
+                #pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
+                    const uint32_t lo = __builtin_amdgcn_perm(n1, n0, sel) | 0x64006400u;
+                    const uint32_t hi = __builtin_amdgcn_perm(m1, m0, sel) | 0x64006400u;
+                    const h2 vl = (__builtin_bit_cast(h2, lo) - bias) * s2;
+                    const h2 vh = (__builtin_bit_cast(h2, hi) - bias) * s2;
+                    *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
+                    *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
+                }
+            }
+        }
+    };
+
     auto fetchV = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < VREGS; ++r) {
@@ -197,8 +285,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)blk * a.kv_block_stride
-                               + (size_t)kvh * a.kv_head_stride
-                               + (size_t)(kk % BS) * (2 * HEAD_DIM) + HEAD_DIM + d0;
+                               + (size_t)kvc * a.kv_head_stride
+                               + (size_t)(kk % BS) * ROWB + HEAD_DIM + d0;
                 const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
                                     : (const void*)((const uint8_t*)a.kv + o);
                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
@@ -275,7 +363,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 if (WIN && kk < wlo0) kk = wlo0;
                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)kb * a.kv_block_stride
-                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM);
+                               + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
                 uint16_t* kd = &sK[key * KSTR];
                 uint32_t w4[4];
                 if (KVP) {
@@ -289,8 +377,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 *(uint2*)(kd + ch * 8 + 4) = make_uint2(w4[2], w4[3]);
             }
         }
-        if (!GPREV) fetchV(k0, blk);
-        storeV();
+        if constexpr (V4) { fetchV4(k0, blk); storeV4(); }
+        else { if (!GPREV) fetchV(k0, blk); storeV(); }
         if (LDSB) lds_barrier(); else __syncthreads();
         if (GPREV && ti + 1 < t_hi) fetchV(k0 + TILE, blkn);
 
@@ -302,7 +390,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 if (WIN && kk < wlo0) kk = wlo0;
                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
                 grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
-                     + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM))
+                     + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB)
                      * (KVP ? 2 : 1);
             }
             // A fragment's raw K: 8 elements of 1 byte (fp8) or 2 (bf16).
@@ -341,6 +429,15 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                         }
                         kb[j] = D::mk(make_uint2(D::from_bf16w(l0.x), D::from_bf16w(l0.y)),
                                       make_uint2(D::from_bf16w(h0.x), D::from_bf16w(h0.y)));
+                    } else if constexpr (K6) {
+                        // k6_v4: this lane's eight dims (16t + 8h ..) from their low nibbles, the
+                        // chunk's high-bit word and the group's scale.
+                        uint32_t w4[4];
+                        const uint32_t sb = *(const uint16_t*)(grow + KSOFF + (t >> 1) * 2);
+                        k6x8_to_f16x4w(*(const uint32_t*)(grow + 8 * t + 4 * h),
+                                       *(const uint32_t*)(grow + HEAD_DIM / 2 + 4 * t), h,
+                                       sb | (sb << 16), w4);
+                        kb[j] = D::mk(make_uint2(w4[0], w4[1]), make_uint2(w4[2], w4[3]));
                     } else {
                         const uint8_t* kp = grow + 16 * t;
                         uint32_t w4[4];
@@ -504,6 +601,24 @@ __device__ __forceinline__ uint16_t r4d_gq_gate(uint16_t gb, uint16_t xb) {
 }
 __device__ __forceinline__ float r4d_gq_clamp(float v) { return fminf(fmaxf(v, -448.0f), 448.0f); }
 
+// The plain decode kernel, and the chained one (r4dchain*, r4d_chain.h) over the same body.
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
+         int WIN = 0>
+__global__ __launch_bounds__(NWARPS * 32)
+void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+{
+    r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
+}
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
+         int WIN = 0>
+__global__ __launch_bounds__(NWARPS * 32)
+void r4dchain_attn_decode(const R4DArgs a, int splits)
+{
+    r4d_chain_wait();
+    r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
+    r4d_chain_done();
+}
+
 // Vectorised merge, used by the h256 launcher whenever the split count fits a wave. Bit-identical
 // to splitkv_combine_body below; only the thread map differs. One wave owns one output row and
 // each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
@@ -651,8 +766,9 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
         }
     }
 
-    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);
-    const float vd = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
+    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);   /* the query group */
+    const int krep = a.kv_rep > 1 ? a.kv_rep : 1;                    /* its cache head: kvh / krep */
+    const float vd = a.v_descale ? a.v_descale[seq * (a.kv_heads / krep) + kvh / krep] : 1.0f;
     uint16_t ob[DPL];
     #pragma unroll
     for (int j = 0; j < DPL; ++j) {
@@ -671,6 +787,15 @@ void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
 {
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
                                                                    R4DGateQuant{});
+}
+template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
+__global__ __launch_bounds__(32 * JPB)
+void r4dchain_attn_splitkv_combine_vec(const R4DArgs a, int splits, int tile)
+{
+    r4d_chain_wait();
+    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
+                                                                   R4DGateQuant{});
+    r4d_chain_done();
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(32 * JPB)
@@ -794,8 +919,9 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     #pragma unroll
     for (int i = 0; i < CHAINS; ++i) av += ch[i];
 
-    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);
-    const float vd = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
+    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);   /* the query group */
+    const int krep = a.kv_rep > 1 ? a.kv_rep : 1;                    /* its cache head: kvh / krep */
+    const float vd = a.v_descale ? a.v_descale[seq * (a.kv_heads / krep) + kvh / krep] : 1.0f;
     finish(f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f));
 }
 
@@ -804,6 +930,14 @@ __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
 {
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
+}
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
+__global__ __launch_bounds__(HEAD_DIM)
+void r4dchain_attn_splitkv_combine(const R4DArgs a, int splits, int tile)
+{
+    r4d_chain_wait();
+    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
+    r4d_chain_done();
 }
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(HEAD_DIM)
@@ -882,9 +1016,13 @@ static int r4d_decode_launch_win(const R4DArgs* a, hipStream_t s) {
     if (rows > 64) return -4;
     const int nw = (rows + 15) / 16;
     const int splits = r4d_decode_splits_win(a, TILE);
-#define R4D_WIN_LAUNCH(NW)                                                                     \
+#define R4D_WIN_LAUNCH(NW) do { if (a->chain)                                                  \
+    hipLaunchKernelGGL((r4dchain_attn_decode<NW, TILE, HEAD_DIM, GQA, BS, KVP, OPT, 1>),        \
+                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits); \
+    else                                                                                      \
     hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, TILE, HEAD_DIM, GQA, BS, KVP, OPT, 1>),      \
-                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
+                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits); \
+    } while (0)
     if      (nw == 1) R4D_WIN_LAUNCH(1);
     else if (nw == 2) R4D_WIN_LAUNCH(2);
     else if (nw == 3) R4D_WIN_LAUNCH(3);
@@ -894,9 +1032,15 @@ static int r4d_decode_launch_win(const R4DArgs* a, hipStream_t s) {
     if (e != hipSuccess) return -100 - (int)e;
 
     const int jobs3 = r4d_q_total(*a) * a->q_heads;
-    if (splits <= 64 && jobs3 >= VECMIN)
+    if (splits <= 64 && jobs3 >= VECMIN && a->chain)
+        hipLaunchKernelGGL((r4dchain_attn_splitkv_combine_vec<HEAD_DIM, 4, PF16, JPB, 1>),
+                           dim3((jobs3 + JPB - 1) / JPB), dim3(32 * JPB), 0, s, *a, splits, TILE);
+    else if (splits <= 64 && jobs3 >= VECMIN)
         hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<HEAD_DIM, 4, PF16, JPB, 1>),
                            dim3((jobs3 + JPB - 1) / JPB), dim3(32 * JPB), 0, s, *a, splits, TILE);
+    else if (a->chain)
+        hipLaunchKernelGGL((r4dchain_attn_splitkv_combine<HEAD_DIM, 4, PF16, 1>), dim3(jobs3),
+                           dim3(HEAD_DIM), splits * sizeof(float), s, *a, splits, TILE);
     else
         hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<HEAD_DIM, 4, PF16, 1>), dim3(jobs3),
                            dim3(HEAD_DIM), splits * sizeof(float), s, *a, splits, TILE);
