@@ -9751,13 +9751,24 @@ MetaKV krea2_meta() {
 
 }  /* namespace */
 
-/* `rebalance` (RAD_GEN_COND_REBALANCE, declared in the generator's cond_opts): each of the twelve
- * taps is scaled into te.h2 by its gain (ComfyUI's ConditioningKrea2Rebalance at its defaults,
- * multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1), f32 and rounded once, and the
- * tap's scatter reads te.h2. Without it the pass issues no scale and scatters te.x. */
+/* `rebalance` (RAD_GEN_COND_REBALANCE, declared in the generator's cond_opts with its presets):
+ * each of the twelve taps is scaled into te.h2 by its preset's gain (row 0 ComfyUI's
+ * ConditioningKrea2Rebalance at its defaults, multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1,
+ * 4, 1; rows 1 to 3 balanced, detail, subtle), f32 and rounded once, and the tap's scatter reads
+ * te.h2. Without it, or with a preset row the plugin does not know, the pass issues no scale and
+ * scatters te.x. */
 TEST(krea2_rebalance_scales_each_tap_and_is_off_without_the_option) {
     MetaKV mk = krea2_meta();
-    const double gains[12] = { 4, 4, 4, 4, 4, 4, 4, 10, 20, 4.4, 16, 4 };
+    /* RAD_GEN_COND_REBALANCE_PRESET rows 0 (the default), 1 balanced, 2 detail, 3 subtle */
+    const double gains[4][12] = {
+        { 4, 4, 4, 4, 4, 4, 4, 10, 20, 4.4, 16, 4 },
+        { 0.44109, 0.44109, 0.44109, 0.44109, 0.44109, 0.44109, 0.44109, 1.1027, 2.2055, 0.4852,
+          1.7644, 0.44109 },
+        { 0.28562, 0.28562, 0.32132, 0.32132, 0.35702, 0.35702, 0.42842, 1.0711, 2.1421, 0.53553,
+          1.7851, 0.42842 },
+        { 0.84759, 0.84759, 0.84759, 0.84759, 0.84759, 0.84759, 0.84759, 1.2714, 1.6952, 0.84759,
+          1.2714, 0.84759 },
+    };
     RadArchProbe probe{};
     REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
     CHECK_EQ(probe.gen_rows, (int64_t)2 * (16384 + 512));
@@ -9766,7 +9777,8 @@ TEST(krea2_rebalance_scales_each_tap_and_is_off_without_the_option) {
             RadBuilder b;
             RadBuildCtx ctx = qimg_ctx(rank, world);
             REQUIRE_EQ(stderr_of_rc([&] { return krea2::declare(&b, mk.meta(), &ctx); }), RAD_OK);
-            CHECK_EQ(b.generator.cond_opts, (uint32_t)RAD_GEN_COND_REBALANCE);
+            CHECK_EQ(b.generator.cond_opts,
+                     (uint32_t)(RAD_GEN_COND_REBALANCE | RAD_GEN_COND_REBALANCE_PRESET));
             const RecBuf* bx = find_b(b, "te.x");
             const RecBuf* bh = find_b(b, "te.h2");
             const RecBuf* bt = find_b(b, "te.taps");
@@ -9774,9 +9786,13 @@ TEST(krea2_rebalance_scales_each_tap_and_is_off_without_the_option) {
             const rad_buf x = (rad_buf)(bx - b.bufs.data() + 1);
             const rad_buf h2 = (rad_buf)(bh - b.bufs.data() + 1);
             const rad_buf taps = (rad_buf)(bt - b.bufs.data() + 1);
-            for (bool rebalance : { false, true }) {
+            /* -1: no option; 0 to 3 the presets; 4 a row the plugin does not know */
+            for (int preset : { -1, 0, 1, 2, 3, 4 }) {
+                const bool rebalance = preset >= 0 && preset < 4;
                 auto k = gen_pass(b, RAD_GEN_PASS_COND, 12);
-                k->g.cond_opts = rebalance ? RAD_GEN_COND_REBALANCE : 0;
+                k->g.cond_opts = preset >= 0 ? RAD_GEN_COND_REBALANCE |
+                                                   (preset << RAD_GEN_COND_REBALANCE_PRESET_SHIFT)
+                                             : 0;
                 RadCtx c{ .b = &b, .batch = &k->b, .rank = rank, .world = world };
                 krea2::step(&c, &k->b);
                 CHECK(c.step_fail.empty());
@@ -9809,7 +9825,7 @@ TEST(krea2_rebalance_scales_each_tap_and_is_off_without_the_option) {
                         const std::vector<double> mul = list(pstr(g, "mul")), add = list(pstr(g, "add"));
                         CHECK_EQ(mul.size(), (size_t)64);
                         CHECK_EQ(add.size(), (size_t)64);
-                        for (double v : mul) CHECK_EQ(v, gains[tap]);
+                        for (double v : mul) CHECK_EQ(v, gains[preset][tap]);
                         for (double v : add) CHECK_EQ(v, 0.0);
                     }
                     ++tap;

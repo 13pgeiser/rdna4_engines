@@ -2255,7 +2255,7 @@ more field:
 
 | field | |
 |---|---|
-| `rebalance` | `true` multiplies the twelve text taps by fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults (multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1); it applies to the negative prompt's conditioning too. `false` (the default) is the plain model. A boolean, or `true`/`false`/`1`/`0` in a form; a model without it refuses `true` with a 400 |
+| `rebalance` | `true` (or `"legacy"`) multiplies the twelve text taps by fixed gains before the text fusion, as ComfyUI's ConditioningKrea2Rebalance at its defaults (multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1), about nine times the taps' RMS; it applies to the negative prompt's conditioning too. `"balanced"`, `"detail"` and `"subtle"` are comfyui-krea2-conditioning's presets (renormalize on, multiplier 1): their per-layer weights times a constant that keeps the taps' RMS, measured over twenty prompts through Krea 2 Turbo's text encoder (`scripts/krea2_rebalance_calib.py`; the node's per-prompt factor stayed within 1.7 % of it), so they shift the balance between layers without the default's overall gain. `false` (the default) is the plain model. A boolean or a preset's name, also in a form (`true`/`false`/`1`/`0` or the name); a model without it refuses anything but `false` with a 400 |
 
 **Anima** makes RGB pictures, 1024x1024 by default, sides rounded down to multiples of 16, up to
 1536x1536 (9216 latent tokens; the card's range is 512x512 to 1536x1536). Base and Aesthetic run 30

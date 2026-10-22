@@ -277,6 +277,44 @@ TEST(rebalance_reaches_a_model_that_declares_it_and_is_refused_by_one_that_does_
     CHECK_EQ(s.f->srv->router().dispatch(q).status, 400);
 }
 
+/* `rebalance` also names a preset: "legacy" is `true`, "balanced", "detail" and "subtle" set
+ * RAD_GEN_COND_REBALANCE with the preset's row in RAD_GEN_COND_REBALANCE_PRESET, in JSON and in a
+ * form. A model whose rebalance declares no presets takes `true` and "legacy" and refuses the
+ * others with a 400 naming the field; an unknown name is a 400 everywhere. */
+TEST(rebalance_presets_reach_a_model_that_declares_them) {
+    Images s;
+    const int32_t R = RAD_GEN_COND_REBALANCE, sh = RAD_GEN_COND_REBALANCE_PRESET_SHIFT;
+    s.img.inf.cond_opts = RAD_GEN_COND_REBALANCE;
+    s.gen({ { "prompt", "x" }, { "rebalance", "legacy" } });
+    CHECK_EQ(s.last().cond_opts, R);
+    for (const char* p : { "balanced", "detail", "subtle" }) {
+        const json e = s.gen({ { "prompt", "x" }, { "rebalance", p } }, 400);
+        CHECK_EQ(str_at(e["error"], "param"), std::string("rebalance"));
+    }
+    s.img.inf.cond_opts = RAD_GEN_COND_REBALANCE | RAD_GEN_COND_REBALANCE_PRESET;
+    const struct { const char* name; int32_t opts; } kWant[] = {
+        { "legacy", R }, { "balanced", R | 1 << sh }, { "detail", R | 2 << sh }, { "subtle", R | 3 << sh },
+    };
+    for (const auto& w : kWant) {
+        s.gen({ { "prompt", "x" }, { "rebalance", w.name } });
+        CHECK_EQ(s.last().cond_opts, w.opts);
+    }
+    s.gen({ { "prompt", "x" }, { "rebalance", true } });
+    CHECK_EQ(s.last().cond_opts, R);
+    for (const json& bad : { json("Balanced"), json("strong"), json("") }) {
+        const json e = s.gen({ { "prompt", "x" }, { "rebalance", bad } }, 400);
+        CHECK_EQ(str_at(e["error"], "param"), std::string("rebalance"));
+    }
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/images/generations";
+    q.form = { FormPart{ "prompt", "", "", "a cat" }, FormPart{ "rebalance", "", "", "detail" } };
+    CHECK_EQ(s.f->srv->router().dispatch(q).status, 200);
+    CHECK_EQ(s.last().cond_opts, R | 2 << sh);
+    q.form[1].data = "nope";
+    CHECK_EQ(s.f->srv->router().dispatch(q).status, 400);
+}
+
 /* `background: auto` keeps an edited picture's transparency and is opaque otherwise; a mask must
  * be the first picture's size. */
 /* A model whose card states guidance as cond + s (cond - uncond) and guides by default (Krea 2):
