@@ -4,7 +4,7 @@
 
 //! Masked store path. Lane (m_lane, k_grp) of wave (wt_pair, tok_half) owns, for token block `nb`
 //! and row group `rg`, rows `wt_pair*32 + rg*16 + 8*k_grp + j` (j = 0..7) of token
-//! `tok_half*64 + nb*16 + m_lane`: two b128 stores for F32, or per 4-row quad two b32 stores of
+//! `tok_half*64 + nb*16 + m_lane`: two b128 stores for F32, or per 4-row quad one b64 store of
 //! packed BF16 (`isfinite(v) ? RNE : u >> 16`, `v = 0 + y`). EXEC selects quads with row < M
 //! (`M % 4 == 0`) and tokens < N.
 use super::{Epi, Gen, Raster, Wg, EPI};
@@ -313,27 +313,27 @@ pub(crate) fn body(b: &mut Builder, g: &Gen) -> Result<(), String> {
                         );
                         bf16_pair(b, &e, g, lo, hi, out[p])?;
                     }
-                    for p in 0..2usize {
-                        let imm = (32 * rg + 8 * c + 4 * p) as u32;
-                        mem(
-                            b,
-                            format!(
-                                "buffer_store_b32 v{}, v{}, s[{y}:{}], s{} offen{}",
-                                out[p],
-                                e.off,
-                                y + 3,
-                                e.nbo[nb],
-                                if imm == 0 {
-                                    String::new()
-                                } else {
-                                    format!(" offset:{imm}")
-                                }
-                            ),
-                            &[],
-                            &[v(e.off), sr(y, 4), s(e.nbo[nb]), v(out[p])],
-                            MemoryClass::VmemStore,
-                        )?;
-                    }
+                    // One 8-byte store per quad (`y` 8-byte aligned, `M % 4 == 0`).
+                    let imm = (32 * rg + 8 * c) as u32;
+                    mem(
+                        b,
+                        format!(
+                            "buffer_store_b64 v[{}:{}], v{}, s[{y}:{}], s{} offen{}",
+                            out[0],
+                            out[1],
+                            e.off,
+                            y + 3,
+                            e.nbo[nb],
+                            if imm == 0 {
+                                String::new()
+                            } else {
+                                format!(" offset:{imm}")
+                            }
+                        ),
+                        &[],
+                        &[v(e.off), sr(y, 4), s(e.nbo[nb]), vr(out[0], 2)],
+                        MemoryClass::VmemStore,
+                    )?;
                 }
             }
         }

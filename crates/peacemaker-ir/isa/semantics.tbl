@@ -27,6 +27,7 @@ buffer_load_u8	memory
 buffer_store_b128	memory
 buffer_store_b16	memory
 buffer_store_b32	memory
+buffer_store_b64	memory
 ds_load_2addr_b32	memory
 ds_load_2addr_stride64_b64	memory
 ds_load_b128	memory

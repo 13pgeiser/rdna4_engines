@@ -38,8 +38,9 @@
 //! `identical_to_baseline` stays required.
 //!
 //! # Baseline
-//! The shipped PM object with the entry the runtime selects when the PM route is
-//! admitted: `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) or
+//! The shipped PM object's 128x128 entry (the pre-128x256 kernel, byte for byte; the
+//! runtime now takes the `_t128x256` entries of the same object for wide launches,
+//! `gemm_mq6_i8.rs` `mq6_i8_pm_token_tile`): `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) or
 //! `..._pm_set_bf16_gfx1201` (BF16) (`gemm_mq6_i8.rs` `MQ6_I8_PM_ENTRY_*`; the
 //! hipcc entry `mq6_i8_entry` is the non-admitted fallback and is not in this
 //! object). Selection file:line and the object sha256 go in
@@ -379,6 +380,9 @@ pub struct Mq6 {
     cand: Spec,
     /// `--rip`: source path and text of the candidate script.
     rip: Option<(String, String)>,
+    /// `--base-tile` / `--base-rip`: the baseline is an emitted (or scripted) variant of this spec
+    /// instead of the shipped object (hill-climbing against a tile's generator output).
+    base: Option<(Spec, Option<(String, String)>)>,
     rows: Vec<usize>,
     rows_desc: String,
     cols: Vec<usize>,
@@ -413,11 +417,26 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
             "shape M={m},N={n},K={k}: need M%4==0, K%256==0, N>=1"
         ));
     }
-    let cand = parse_spec(
-        &knobs.take_or("epi", "set"),
-        &knobs.take_or("raster", "banded"),
-        &knobs.take_or("tile", "128x128"),
-    )?;
+    let (epi_k, raster_k, tile_k) = (
+        knobs.take_or("epi", "set"),
+        knobs.take_or("raster", "banded"),
+        knobs.take_or("tile", "128x128"),
+    );
+    let cand = parse_spec(&epi_k, &raster_k, &tile_k)?;
+    let (base_tile, base_rip) = (knobs.take("base-tile"), knobs.take("base-rip"));
+    let base = if base_tile.is_some() || base_rip.is_some() {
+        let spec = parse_spec(&epi_k, &raster_k, base_tile.as_deref().unwrap_or(&tile_k))?;
+        let rip = match &base_rip {
+            Some(p) => Some((
+                p.clone(),
+                std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?,
+            )),
+            None => None,
+        };
+        Some((spec, rip))
+    } else {
+        None
+    };
     let macs = (m as u128) * (n as u128) * (k as u128);
     let default = if macs <= FULL_REF_MACS {
         "full"
@@ -439,6 +458,7 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
         k,
         cand,
         rip,
+        base,
         rows,
         rows_desc,
         cols,
@@ -656,6 +676,34 @@ impl Workload for Mq6 {
     }
 
     fn baseline(&self) -> Result<Object> {
+        if let Some((spec, rip)) = &self.base {
+            let (elf, symbol) = match rip {
+                Some((path, text)) => {
+                    let (elf, symbol, _) = compile_rip(text, *spec)?;
+                    let _ = path;
+                    (elf, symbol)
+                }
+                None => {
+                    let e = mq6_i8_gemm::emit(*spec)?;
+                    (
+                        peacemaker_isa::native::assemble(&e.s_text, spec.arch)?,
+                        spec.symbol(),
+                    )
+                }
+            };
+            return Ok(Object {
+                source: json!({
+                    "source": "--base-tile/--base-rip: second emitted (or scripted) variant, not the shipped object",
+                    "variant": spec.variant_name(),
+                    "base_rip": rip.as_ref().map(|(p, _)| p.clone()),
+                    "sha256": sha256_hex(&elf),
+                }),
+                desc: json!({"variant": spec.variant_name()}),
+                exports: vec![symbol.clone()],
+                launch_symbol: symbol,
+                bytes: elf,
+            });
+        }
         let bytes = rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201;
         let symbol = match self.cand.epi {
             Epi::Set => "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
@@ -672,9 +720,9 @@ impl Workload for Mq6 {
             exports: vec![symbol.to_owned()],
             desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded"}}),
             source: json!({
-                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs:58-60 MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16; \
-                           entry choice :321-330 and embedded-module load :331-338 (gemm_mq6g256v2_i8_prequant), \
-                           admission :65-89 (mq6_i8_pm_admits), launch :362-366 (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
+                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries); \
+                           entry choice mq6_i8_pm_launch / mq6_i8_pm_token_tile and embedded-module load (gemm_mq6g256v2_i8_prequant), \
+                           admission mq6_i8_pm_admits, 128x128 launch (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
                 "artifact": OBJECT,
                 "kernels_const": "crates/rdna-compute/src/kernels.rs:4434 GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201",
                 "sha256": sha256_hex(bytes),
@@ -716,7 +764,7 @@ impl Workload for Mq6 {
         // The baseline is the shipped 128x128 kernel whatever the candidate's tile is; each
         // arm's grid, block and LDS follow its own tile.
         let tile = match arm {
-            Arm::Baseline => Tile::T128x128,
+            Arm::Baseline => self.base.as_ref().map_or(Tile::T128x128, |(s, _)| s.tile),
             Arm::Candidate => self.cand.tile,
         };
         let (grid, threads, lds) = geometry(self.m, self.n, tile);
