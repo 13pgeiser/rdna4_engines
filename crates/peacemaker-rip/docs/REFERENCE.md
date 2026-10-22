@@ -447,11 +447,11 @@ The fast kernels are Rust generators. A script reaches them in two layers, neith
 
 ### Coarse natives
 
-The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, K256Shared, K256Pow2}`, `Tile::{T128x128x8, T256x128x16}`, `Cacc::{One, Two}`, `Epi::{Set, Add, AddSigmoid, GateUpSilu, GateUpSiluBf16, QkvzaGdn}`, `ALayout::{Token, Slab}` (`iu4_gemm`) and `MoeKind::{GateUp, Down}`, `WeightCodec::{Mq4Sym, Mq3I4, E8pI4}` (`qwen4_moe_sym`; `MoeKind` is the Rust `qwen4_moe_sym::Kind`, renamed so it cannot clash with the `enum Kind` a script declares for its own variants). A script's own `enum Fold` (or any of these names) wins over the native one. `Arch` is the existing `Arch::Gfx1201`. The struct literals map one to one onto the Rust `Spec`; every field is required, and an unknown field is an error.
+The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, K256Shared, K256Pow2}`, `Tile::{T128x128x8, T256x128x16}`, `Cacc::{One, Two}`, `Epi::{Set, Add, AddSigmoid, GateUpSilu, GateUpSiluBf16, QkvzaGdn}`, `ALayout::{Token, Slab}`, `Mma::{Dense, S24X64, S24X32}` (`iu4_gemm`) and `MoeKind::{GateUp, Down}`, `WeightCodec::{Mq4Sym, Mq3I4, E8pI4}` (`qwen4_moe_sym`; `MoeKind` is the Rust `qwen4_moe_sym::Kind`, renamed so it cannot clash with the `enum Kind` a script declares for its own variants). A script's own `enum Fold` (or any of these names) wins over the native one. `Arch` is the existing `Arch::Gfx1201`. The struct literals map one to one onto the Rust `Spec`; every field is required, and an unknown field is an error.
 
 | native | Rust | result |
 |---|---|---|
-| `Iu4Spec { fold, tile, cacc, epi, act, arch }` | `iu4_gemm::Spec` | a spec value |
+| `Iu4Spec { fold, tile, cacc, epi, act, arch, mma }` | `iu4_gemm::Spec` | a spec value (`mma: Mma::Dense` is the shipped WMMA K-loop; `S24X64` / `S24X32` the 2:4-sparse SWMMAC K-loops) |
 | `Iu4Gemm::emit(spec)` | `iu4_gemm::emit` | `Result<Emitted, String>` |
 | `Iu4Gemm::emit_module(fold, tile, cacc, act, arch)` | `iu4_gemm::emit_module` | `Result<(Vec<Emitted>, String, String), String>`: the symbols, the module text and its proof as JSON |
 | `MoeSymSpec { arch, kind, nt, rr, codec }` | `qwen4_moe_sym::Spec` | a spec value |
@@ -490,6 +490,8 @@ The blocks run inside a `Workgroup::new` scope. `lds` is the array of the four L
 | `iu4::kloop(wg, gen, lds)?` | `kloop` | the whole rolled K-loop with its peeled group; returns `lds` |
 | `iu4::block(wg, gen, tag, h, fetch_next, end_label, entry_label, lds)?` | `block` | one K128 block on plane `h` (0 or 1); `tag` names its labels, `end_label` closes its register lifetimes, `entry_label = false` leaves the block's own label to a `wg_skip_if` target; returns `lds` |
 | `iu4::block_stepping(.., entry_label, step, lds)?` | `block_stepping` | `block` that also advances descriptor `step` (0 or 1) right after its slab-1 fetch: the production odd block does this for descriptor 0, inside one block, so it cannot sit between two `block` calls |
+| `iu4::sparse_block(wg, gen, tag, h, fetch_next, end_label, entry_label, lds)?` | `sparse_block` | `block` for a sparse spec (`gen.spec().mma` is `S24X64` or `S24X32`): same arguments, ring transitions, publication and fold, SWMMAC in place of WMMA; refuses a dense spec, and `iu4::block` refuses a sparse one |
+| `iu4::sparse_block_stepping(.., entry_label, step, lds)?` | `sparse_block_stepping` | `block_stepping` for a sparse spec |
 | `iu4::step_descriptor(wg, gen, which)?` | `step_descriptor` | `s_add_nc_u64` of the group stride onto descriptor 0 or 1 |
 | `iu4::trip_end(wg, gen)?` | `trip_end` | odd descriptor, group offset and trip counter advance |
 | `iu4::trips_cmp(wg, gen, "s_cmp_lg_u32")?` | `trips_cmp` | a `WgCond` for `wg_skip_if` / `loop_carried` (`s_cmp_{eq,lg,lt,le,gt,ge}_{u32,i32}` only) |
@@ -506,7 +508,11 @@ Each block is one checked `Driver::typed` call. The native takes the four rings 
 
 The fused per-WMMA fold stage stays inside `block`: it is interleaved within one instruction bundle. Exposing `fragments` / `bundle` / `publish_*` as separate natives is the next step if an experiment needs to change a block's inside; it uses the same bridge.
 
-The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.
+The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). The sparse variants carry a trailing `-s24x64` / `-s24x32` (`k128-128x128x8-cacc1-set-s24x64`) and take the sparse blocks. A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec, sparse included; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.
+
+### 2:4-sparse weights (`Mma::S24X64`, `Mma::S24X32`)
+
+The weights are WMMA operand A, so they are the sparse side of SWMMAC. The staging (prologue, publish, the LDS layout, the `0x88888888` sign flip), the fold and the epilogue only move bytes or consume accumulators, so a sparse K128 row block lives in the dense 64 code bytes: `iu4_gemm::sparse24::pack_block(mma, codes, kept)` puts the compressed codes and the index words where the dense staging routes them into the registers the SWMMAC reads. The format saves no weight bytes; it measures SWMMAC's MMA-issue saving inside the production pipeline. A 2:4 group is four aligned consecutive natural K (`group_of(_, k) = k / 4`, 32 per K128 block); exactly two K per group are kept and every pruned code is 8 (zero). `S24X64` issues one `v_swmmac_i32_16x16x64_iu4` per accumulator per 64-K slab (the activation fragments of both sub-blocks are one four-VGPR B operand); `S24X32` one `v_swmmac_i32_16x16x32_iu4` per sub-block with `index_key` 0 / 1. SWMMAC has no C operand, so each accumulator is first seeded with `magic8` (`v_mov_b32`) where dense passes it as C. Valid only with `Fold::K128`, `Tile::T128x128x8`, `Cacc::One`, `ALayout::Token` and `Epi::Set | Epi::Add`; anything else is refused with the axis named. The correctness oracle is an emulator run of the whole kernel against the dense kernel on the pruned dense weights (`peacemaker-isa/tests/iu4_gemm_sparse_emu.rs`): bitwise equal.
 
 ## 14. Production generator with fine blocks: `mq6_i8_gemm`
 
