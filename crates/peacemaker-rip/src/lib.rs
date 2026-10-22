@@ -59,6 +59,13 @@
 //! receipts identify the inputs. Optional `--routes FILE` supplies the original
 //! cost-lint routes JSON; unavailable route-dependent facts remain null, and
 //! compile, link, lift, or routes errors are structured per-target failures.
+//!
+//! # Offline execution
+//!
+//! [`run`] implements `peacemaker-rip run FILE --case FILE.json`: compile,
+//! assemble natively, lift, execute the declared grid on the CPU emulator and
+//! check every buffer, including input immutability and output guards. See its
+//! module documentation for the strict case schema, reports and behavior dumps.
 
 pub mod builtin;
 pub mod diag;
@@ -70,6 +77,7 @@ pub mod interp;
 pub mod native;
 pub mod ops;
 pub mod preprocess;
+pub mod run;
 pub mod srcfmt;
 pub mod validate;
 pub mod value;
