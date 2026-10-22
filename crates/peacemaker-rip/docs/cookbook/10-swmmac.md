@@ -192,6 +192,19 @@ Wmma::swmmac(arch, kind: Swmmac, dst, a, b, index, mods: SwmmacMods) -> Result<I
 
 `Swmmac::{F32F16, F32Bf16, F16F16, Bf16Bf16, I32Iu8, I32Iu4, I32Iu4X64, F32Fp8Fp8, F32Fp8Bf8, F32Bf8Fp8, F32Bf8Bf8}`; the widths are in VGPRs, the index is always one VGPR. See `REFERENCE.md` section 10 for the table and the legal modifier sets.
 
+## Hardware check
+
+`hw_diff` runs the same ELF on the emulator and then on a gfx1201 card, and compares both against the case's CPU-reference `expect`. Extract the `rip` block above to `swmmac.rip`, then:
+
+```text
+cargo build --release -p peacemaker-rip --features hw-diff --example hw_diff
+fabric-run.sh --class correct --card B --mem-gb 1 --max-secs 300 -- \
+  target/release/examples/hw_diff swmmac.rip --case crates/peacemaker-rip/tests/cases/10_swmmac_fp8_sparse24.json \
+    --variant sparse_fp8 --arch gfx1201 --device 0 --json
+```
+
+Both variants passed on 2026-10-22 (card B, `agree: true`, 0 mismatches over 256 words). The receipt is in `peacemaker-ir/isa/emu/float_edges.md`.
+
 ## Variations
 
 - **bf16 or f16 accumulators.** `Swmmac::F32Bf16` takes bf16 bits in the same fragments; `F16F16` / `Bf16Bf16` accumulate into a 4-VGPR `dst` whose lane layout packs two rows per register (`row r`, VGPR `(r&7)>>1`, bits `16*(r&1)`).
