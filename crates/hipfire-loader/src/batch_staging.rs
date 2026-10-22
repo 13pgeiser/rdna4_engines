@@ -875,13 +875,14 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
     let receipt = engine.receipt();
     let (lane_bytes, snapshot_bytes) = (engine.lane_bytes(), engine.snapshot_bytes());
     let store = b.vmm_store.as_mut().expect("route checked above");
-    match store.install_dflash(engine) {
+    let installed = match store.install_dflash(engine) {
         Ok(()) => {
             eprintln!(
                 "[daemon] VMM DFlash lanes staged: block={} chunk_row_limit={} ctx_capacity={} (shared draft weights)",
                 receipt.block_size, receipt.chunk_row_limit, receipt.ctx_capacity
             );
             eprintln!("[daemon] VMM DFlash lane footprint: lane_state={lane_bytes} B dn_snapshot={snapshot_bytes} B");
+            true
         }
         Err(engine) => {
             eprintln!(
@@ -890,6 +891,20 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
                 receipt.block_size
             );
             engine.free_gpu(gpu);
+            false
+        }
+    };
+    // Lanes never run the verbatim-copy lookup: with lanes staged the
+    // singleton must not either, or a request's text would depend on whether
+    // it was promoted to a lane.
+    if installed {
+        if let Some(df) = m
+            .speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
+        {
+            df.disarm_lookup("VMM DFlash lanes staged; lanes never run lookup");
         }
     }
 }

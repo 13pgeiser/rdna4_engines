@@ -104,6 +104,7 @@ pub mod spec;
 
 pub mod ngram_mod;
 pub mod offload;
+pub mod spec_lookup;
 pub mod spec_ngram;
 /// Per-request spec → AR retirement policy. Pure math, no GPU types.
 pub mod spec_retire;
