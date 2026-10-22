@@ -175,7 +175,8 @@ fn try_gfx12_sigmoid_rotate_exact_prepared_no_epilogue(
         return Ok(None);
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
-    let prep = gpu.mq_sigmoid_rotate_x_i4_c8_pm(attn, gate, wo.awq_scale, Some(x_rot), res, k, n)?;
+    let prep =
+        gpu.mq_sigmoid_rotate_x_i4_c8_pm(attn, gate, wo.awq_scale, Some(x_rot), res, k, n)?;
     gpu.maybe_capture_activation(wo.buf, x_rot, n, k);
     gpu.iu4_verify_note_f16();
     Ok(Some(prep))
