@@ -76,6 +76,12 @@ pub struct FeatureFlags {
     /// Bytes identical. Opt-in, default off (the kill switch for the new
     /// module); exact gfx1151 only.
     pub qwen4_gdn_q8_inline: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_I8_FUSE`): the dense GDN gate
+    /// also rotates and quantizes the MQ6 out projection's A8 activation
+    /// (`fn_gdn_dense_gate_i8`), so the F32 gate output and the separate
+    /// `mq_rotate_x_i8_gfx12` launch disappear. Bytes identical to the two-launch
+    /// pair. Exact gfx1201 only, where it defaults on; `0` is the kill switch.
+    pub qwen4_gdn_i8_fuse: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -86,9 +92,12 @@ pub struct FeatureFlags {
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
-    /// MoE row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): combine + shared fold + HC
-    /// write + the next HC read's norm/gate in one row kernel; default on
-    /// for gfx1151, off elsewhere.
+    /// HC row folds (`HIPFIRE_QWEN4_HC_ROW_FOLD`), default on for gfx1151 and
+    /// gfx1201, off elsewhere.  gfx1151: combine + shared fold + HC write + the
+    /// next HC read's norm/gate in one MoE row kernel.  gfx1201: the same for
+    /// the MoE tail (its scaled-add + HC write + norm chain) and for the mixer
+    /// tail (HC write + the next read's norm/gate); `=0` restores the unfused
+    /// launches on both.
     pub qwen4_hc_row_fold: bool,
     /// Wave-per-token Qwen4 E512/top-10 prefill router
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
@@ -927,6 +936,7 @@ impl FeatureFlags {
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
                 .unwrap_or(halo_hyper_default),
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
+            qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -942,7 +952,7 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(exact_unit_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD")
-                .unwrap_or(halo_hyper_default),
+                .unwrap_or(halo_hyper_default || is_gfx1201),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST")
                 .unwrap_or(exact_unit_default),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(arch == "gfx1151"),
@@ -1427,6 +1437,11 @@ impl FeatureFlags {
         self.qwen4_gdn_q8_inline && self.arch == "gfx1151"
     }
 
+    /// Dense GDN gate + out-projection A8 producer fusion. Exact gfx1201 only.
+    pub fn qwen4_gdn_i8_fuse_enabled(&self) -> bool {
+        self.qwen4_gdn_i8_fuse && self.arch == "gfx1201"
+    }
+
     /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
     /// (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151: on unless `0`). Exact gfx1151 only; the
     /// runtime additionally requires the lane-step scope
@@ -1484,12 +1499,30 @@ impl FeatureFlags {
 
     /// Row fold of the MoE tail (`HIPFIRE_QWEN4_HC_ROW_FOLD`): exact gfx1151,
     /// on top of the `HIPFIRE_QWEN4_HC_FUSE` >= 3 shared-down route and the
-    /// zero-initialized combine.
+    /// zero-initialized combine.  gfx1201 has its own accessors
+    /// ([`Self::qwen4_hc_row_fold_moe_gfx1201_enabled`],
+    /// [`Self::qwen4_hc_row_fold_mixer_gfx1201_enabled`]); this one stays false there.
     pub fn qwen4_hc_row_fold_enabled(&self) -> bool {
         self.qwen4_hc_row_fold
             && self.arch == "gfx1151"
             && self.qwen4_hc_fuse_level() >= 3
             && self.qwen4_moe_combine_zinit_enabled()
+    }
+
+    /// gfx1201 mixer-tail row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`, default on, `=0`
+    /// off): a paired HC write and the next HC read's norm/gate in one row
+    /// kernel.  Needs the read-side pairing (`HIPFIRE_QWEN4_HC_FUSE` >= 1) that
+    /// hands the write its gates; the out-projection epilogue levels (>= 2) are
+    /// NOT required and stay off by default on gfx1201.
+    pub fn qwen4_hc_row_fold_mixer_gfx1201_enabled(&self) -> bool {
+        self.qwen4_hc_row_fold && self.arch == "gfx1201" && self.qwen4_hc_fuse_level() >= 1
+    }
+
+    /// gfx1201 MoE-tail row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`, default on, `=0`
+    /// off): the mixer fold's conditions plus the zero-initialized combine
+    /// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`).
+    pub fn qwen4_hc_row_fold_moe_gfx1201_enabled(&self) -> bool {
+        self.qwen4_hc_row_fold_mixer_gfx1201_enabled() && self.qwen4_moe_combine_zinit_enabled()
     }
 
     /// Wave-per-token E512/top-10 router for batched prefill
@@ -1660,6 +1693,7 @@ impl FeatureFlags {
             a8_fused_prod: false,
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
+            qwen4_gdn_i8_fuse: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_moe_combine_zinit: false,
@@ -2392,6 +2426,78 @@ mod tests {
         }
     }
 
+    /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the gfx1151 accessor is unchanged (gfx1151
+    /// only, needs level 3 + zinit); gfx1201 takes its own two accessors, default
+    /// on at the gfx1201 default level 1, independent of levels >= 2/3, killed by
+    /// `=0`; the mixer fold needs the read-side pairing (level >= 1), the MoE fold
+    /// also the zero-initialized combine.
+    #[test]
+    fn qwen4_hc_row_fold_flag_gfx1151_unchanged_gfx1201_default_on() {
+        let with = |entries: &'static [(&'static str, &'static str)]| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                entries
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+                    .ok_or(())
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1030", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let (halo, rdna4) = (arch == "gfx1151", arch == "gfx1201");
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_hc_row_fold_enabled(), halo, "{arch}");
+            assert_eq!(
+                unset.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            assert_eq!(
+                unset.qwen4_hc_row_fold_moe_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            let killed =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_ROW_FOLD", "0")]));
+            assert!(!killed.qwen4_hc_row_fold_enabled(), "{arch}");
+            assert!(!killed.qwen4_hc_row_fold_mixer_gfx1201_enabled(), "{arch}");
+            assert!(!killed.qwen4_hc_row_fold_moe_gfx1201_enabled(), "{arch}");
+            let no_pairing =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_FUSE", "0")]));
+            assert!(
+                !no_pairing.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                "{arch}"
+            );
+            assert!(
+                !no_pairing.qwen4_hc_row_fold_moe_gfx1201_enabled(),
+                "{arch}"
+            );
+            assert!(!no_pairing.qwen4_hc_row_fold_enabled(), "{arch}");
+            let no_zinit =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT", "0")]));
+            assert_eq!(
+                no_zinit.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            assert!(!no_zinit.qwen4_hc_row_fold_moe_gfx1201_enabled(), "{arch}");
+            assert!(!no_zinit.qwen4_hc_row_fold_enabled(), "{arch}");
+            // An explicit `=1` enables nothing off gfx1151 / gfx1201.
+            let forced =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_ROW_FOLD", "1")]));
+            assert_eq!(
+                forced.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            assert_eq!(forced.qwen4_hc_row_fold_enabled(), halo, "{arch}");
+            // Level 3 on gfx1201 does not change which fold runs.
+            let level3 = FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_FUSE", "3")]));
+            assert!(!level3.qwen4_hc_row_fold_enabled() || halo, "{arch}");
+        }
+    }
+
     /// The fused PLE tail defaults on for exact gfx1151 / gfx1201; `0` turns it off.
     #[test]
     fn qwen4_ple_fuse_flag_defaults_on_exact_gfx1151_gfx1201() {
@@ -2551,6 +2657,34 @@ mod tests {
         }
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_gdn_conv_qknorm_enabled());
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_gdn_q8_inline_enabled());
+    }
+
+    /// The dense-GDN gate + out-projection A8 producer fusion: default on for
+    /// exact gfx1201 only, `0` is the kill switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_gdn_i8_fuse_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_GDN_I8_FUSE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_gdn_i8_fuse_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_i8_fuse_enabled());
     }
 
     #[test]

@@ -1448,6 +1448,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "fn_gdn_dense_producer",
                 "fn_gdn_dense_gate_bf16in",
+                "fn_gdn_dense_gate_i8",
                 "fn_gdn_dense_gate_rotate_bf16in"
             ]
         );
@@ -3021,6 +3022,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!(
+            "qwen4_hc_down_fused",
+            kernels::QWEN4_HC_DOWN_FUSED_SRC,
+            ["qwen4_hc_down_fused_b64_k32"]
+        );
+        add!(
             "hyper_read_up_wmma_gfx1201",
             crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1201_SRC,
             [
@@ -3032,6 +3038,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "mq_rotate_x_i4",
             kernels::MQ_ROTATE_X_I4_SRC,
             ["mq_rotate_x_i4"]
+        );
+        add!(
+            "mq_rotate_x_i4_f16out",
+            kernels::MQ_ROTATE_X_I4_F16OUT_SRC,
+            ["mq_rotate_x_i4_f16out"]
         );
         add!(
             "qwen4_moe_rotate128_i4",
@@ -3479,6 +3490,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "hc_row_fold",
             crate::hc_row_fold::SRC,
             ["hc_row_fold_norm_gate"]
+        );
+    }
+    // Default-on `HIPFIRE_QWEN4_HC_ROW_FOLD` on gfx1201: the MoE-tail and mixer-tail row
+    // folds, in the same module (the `__GFX12__` entries are compiled for gfx12 only).
+    if arch == "gfx1201" {
+        add!(
+            "hc_row_fold",
+            crate::hc_row_fold::SRC,
+            [
+                "hc_row_fold_norm_gate",
+                "hc_row_fold_moe_gfx1201",
+                "hc_row_write_norm_gate_gfx1201",
+            ]
         );
     }
     // Qwen3.5-MoE (ornith-1.5-35b-a3b) load, AR prefill/decode and native MTP,
@@ -9783,6 +9807,20 @@ mod tests {
             "gemm_mq4g256v2_residual_mmq_i8_gfx12",
             "mq_rotate_x_i8_gfx12",
         ];
+        // The fused HC-down + activation kernel (`Gpu::gemm_bf16_xf16_hc_down_fused`).
+        const HC_DOWN_FUSED_ADDED_MODULES: [&str; 1] = ["qwen4_hc_down_fused"];
+        for module in HC_DOWN_FUSED_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing HC-down fused module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         for module in MQ6_I8_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
@@ -9814,6 +9852,43 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The gfx1201 HC row folds (`HIPFIRE_QWEN4_HC_ROW_FOLD`) live in `hc_row_fold`,
+        // which gfx1201 lists with its three entries (the gfx1151 module has one).
+        const HC_ROW_FOLD_ADDED_MODULES: [&str; 1] = ["hc_row_fold"];
+        for module in HC_ROW_FOLD_ADDED_MODULES {
+            let entry = by_name.get(module).unwrap_or_else(|| {
+                panic!("missing gfx1201 HC row fold module {module}");
+            });
+            assert_eq!(
+                entry.symbols,
+                [
+                    "hc_row_fold_norm_gate",
+                    "hc_row_fold_moe_gfx1201",
+                    "hc_row_write_norm_gate_gfx1201"
+                ]
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // The Qwen4 MoE front producer (`HIPFIRE_QWEN4_MOE_FRONT_FUSE`) adds the
+        // `mq_rotate_x_i4` source's F16-output twin.
+        const MOE_FRONT_ADDED_MODULES: [&str; 1] = ["mq_rotate_x_i4_f16out"];
+        for module in MOE_FRONT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MoE front module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -9822,7 +9897,10 @@ mod tests {
                 + NATIVE_A3B_ADDED_MODULES.len()
                 + FIRST_REQUEST_JIT_ADDED_MODULES
                 + MQ6_I8_ADDED_MODULES.len()
-                + G64_AND_HC_CAPTURE_ADDED_MODULES.len(),
+                + HC_DOWN_FUSED_ADDED_MODULES.len()
+                + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
+                + HC_ROW_FOLD_ADDED_MODULES.len()
+                + MOE_FRONT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

@@ -1471,6 +1471,19 @@ pub const MQ_ROTATE_X_I4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// Qwen4 MoE front producer (gfx1201 sealed grouped prefill, symmetric IU4 route): the plain
+/// FWHT rotate + in-register `block_i4_128` emit of [`MQ_ROTATE_X_I4_SRC`] (the F32 rotated
+/// row is not stored: the symmetric gate/up reads only the sidecar) that also stores the RNE
+/// F16 cast of the raw row (`convert_f32_to_f16`'s bytes) from the registers it loaded: the F16
+/// X of the router / shared-expert WMMA GEMMs in the same launch. Gated by
+/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`.
+pub const MQ_ROTATE_X_I4_F16OUT_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_F16_OUT 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_f16out\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -9298,9 +9311,13 @@ pub const GDN_CHUNK_SCAN_BF16_MSEG_SRC: &str = concat!(
 /// gfx1201 FN dense GDN scan adapter (`fn_gdn_dense_producer`: convolution +
 /// gate params + Q/K norm + F16 packing + chunk cumsum + EF zero in one
 /// launch; `fn_gdn_dense_gate_bf16in` / `fn_gdn_dense_gate_rotate_bf16in`: the
-/// gated RMSNorm [+ rotation] reading the scan's BF16 plane). Default compile
-/// flags, like tensor_ops, whose expressions it copies bit for bit.
+/// gated RMSNorm [+ rotation] reading the scan's BF16 plane; `fn_gdn_dense_gate_i8`:
+/// that gate + the out projection's A8 `block_i8_128` producer in one launch). Default
+/// compile flags, like tensor_ops, whose expressions it copies bit for bit.
 pub const FN_GDN_DENSE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/fn_gdn_dense.gfx1201.hip")
 );
@@ -10642,6 +10659,13 @@ pub const GEMM_F16_X_F16_WMMA_GFX12_SRC: &str =
 /// gfx1151 compile or load it.
 pub const GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma_lds_splitk.hip");
+
+/// gfx1201 Qwen4 HC input_mix_down (BF16 weight on its F16 shadow, M = 320,
+/// K = 10240) + `hc_activation_fused_f32` in one launch: the split-K=4 160 x 80
+/// / k32 WMMA tile, its reduction and the BF16-bit activation, byte-identical
+/// to that chain (`Gpu::gemm_bf16_xf16_hc_down_fused`). Exact-arch gfx1201.
+pub const QWEN4_HC_DOWN_FUSED_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_hc_down_fused.hip");
 
 /// LDS-staged 128×128 macro-tile sibling of `GEMM_F16_X_F16_WMMA_SRC`, with
 /// the bias fused into the epilogue. Raises arithmetic intensity from

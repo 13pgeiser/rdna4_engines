@@ -6,7 +6,8 @@
 // 16 q/k heads + 48 v heads, 128 dims, conv channels 10240 = q 2048 | k 2048 |
 // v 6144, K=4 convolution with a 3-row history ring, 48 gate heads).  Compiled
 // with default flags (no -ffp-contract=off), exactly like tensor_ops, whose
-// expressions are copied here; kernels.rs prepends mq_fwht256.h.
+// expressions are copied here; kernels.rs prepends block_i8_128_quant.hip (no
+// standalone quantizer), block_i8_128_emit.hip and mq_fwht256.h.
 //
 // fn_gdn_dense_producer = gated_delta_conv_bf16_f32_batched_k4 (+ its params
 //   blocks) + the dense adapter's BF16 Q/K l2 norm (serial 128-channel sums,
@@ -18,6 +19,9 @@
 //   reading the chunk scan's packed BF16 output plane directly (the widening
 //   hc_state_bf16_to_f32 and the in-place bf16 rounding of the recurrent
 //   plane are exact no-ops on those bits).
+// fn_gdn_dense_gate_i8 = fn_gdn_dense_gate_bf16in followed by mq_rotate_x_i8_gfx12 on its
+//   output in one launch (the out projection's `block_i8_128` blocks; the F32 gate
+//   output never reaches memory).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -247,6 +251,29 @@ extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_producer(
     }
 }
 
+// The gated RMSNorm scale of one 128-wide head from its F32 values in LDS: the
+// serial sum of squares in channel order (every lane reads the same values and
+// walks the same chain) and gated_delta_gate_head128's rsqrt expression.
+static __device__ __forceinline__ float fn_gdn_dense_gate_inv128(const float* rounded) {
+    float sum = 0.0f;
+    for (int i = 0; i < 128; i += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(rounded + i);
+        sum += v.x * v.x;
+        sum += v.y * v.y;
+        sum += v.z * v.z;
+        sum += v.w * v.w;
+    }
+    return rsqrtf(sum / 128.0f + 1.0e-6f);
+}
+
+// One gated output element: BF16-rounded norm product, BF16-rounded sigmoid gate.
+static __device__ __forceinline__ float fn_gdn_dense_gate_elem(
+    float in, float inv, float norm_w, float z) {
+    const float normalized = bf16_to_f32(bf16_round(in * inv * norm_w));
+    const float gate = bf16_to_f32(bf16_round(z));
+    return bf16_to_f32(bf16_round(normalized / (1.0f + expf(-gate))));
+}
+
 // gated_delta_gate_head128 with `recurrent` the packed BF16 bits plane.
 static __device__ __forceinline__ float4 fn_gdn_dense_gate_head128(
     const unsigned short* recurrent,
@@ -263,27 +290,14 @@ static __device__ __forceinline__ float4 fn_gdn_dense_gate_head128(
     *reinterpret_cast<float4*>(rounded + lane * 4) = value;
     __syncthreads();
 
-    float sum = 0.0f;
-    for (int i = 0; i < 128; i += 4) {
-        const float4 v = *reinterpret_cast<const float4*>(rounded + i);
-        sum += v.x * v.x;
-        sum += v.y * v.y;
-        sum += v.z * v.z;
-        sum += v.w * v.w;
-    }
-    const float inv = rsqrtf(sum / 128.0f + 1.0e-6f);
+    const float inv = fn_gdn_dense_gate_inv128(rounded);
     const float4 zv = *reinterpret_cast<const float4*>(z + start + lane * 4);
     const float in[4] = {value.x, value.y, value.z, value.w};
     const float zs[4] = {zv.x, zv.y, zv.z, zv.w};
     float out[4];
 #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int channel = lane * 4 + e;
-        const float normalized = bf16_to_f32(bf16_round(
-            in[e] * inv * bf16_to_f32(norm[channel])));
-        const float gate = bf16_to_f32(bf16_round(zs[e]));
-        out[e] = bf16_to_f32(bf16_round(normalized / (1.0f + expf(-gate))));
-    }
+    for (int e = 0; e < 4; ++e)
+        out[e] = fn_gdn_dense_gate_elem(in[e], inv, bf16_to_f32(norm[lane * 4 + e]), zs[e]);
     const float4 result = make_float4(out[0], out[1], out[2], out[3]);
     *reinterpret_cast<float4*>(output + start + lane * 4) = result;
     return result;
@@ -331,4 +345,76 @@ extern "C" __global__ __launch_bounds__(64) void fn_gdn_dense_gate_rotate_bf16in
 #pragma unroll
     for (int e = 0; e < 8; ++e)
         rotated[(int)blockIdx.x * 256 + d0 + e] = values[e] * 0.0625f * signs2[d0 + e];
+}
+
+// Grid [rows * 12], block 64: gated norm + the out projection's A8 producer in
+// one launch, one wave per head pair. Pair g = row * 24 + p (p = 0..23) is one
+// 256-wide FWHT rotation group of the MQ6G256V2 out projection (K = 6144 = 24
+// pairs); lane L owns pair elements 8L..8L+7, i.e. head L >> 4, channels
+// (L & 15) * 8.., which is exactly the register layout of `mq_rotate_x`'s FWHT:
+// the gate math (the rotate kernel's, one shared chain per head) feeds the
+// rotation (`mq_fwht256_lane`, `mq_rotate_x`'s signs and scale) in registers, and
+// the group's two `block_i8_128` blocks go out through the same register emit
+// `mq_rotate_x_i8_gfx12` uses (block_i8_128_emit.hip), at block index
+// (2 * p + half) * rows + row. The F32 gate output and the F32 rotation never reach
+// memory; the blocks are bytewise `mq_rotate_x_i8_gfx12` applied to
+// `fn_gdn_dense_gate_bf16in`'s output. The recurrent plane, z, norm and the
+// sign tables must be 16-byte aligned (host checked).
+extern "C" __global__ __launch_bounds__(64) void fn_gdn_dense_gate_i8(
+    const unsigned short* recurrent,
+    const float* z,
+    const __hip_bfloat16* norm,
+    block_i8_128* y,
+    const float* signs1,
+    const float* signs2,
+    int rows) {
+    const int wave = (int)threadIdx.x >> 5;
+    const int lane = (int)threadIdx.x & 31;
+    // Per wave: head 0 at [0, 128), head 1 at [132, 260) (4 floats of pad keep
+    // the two heads' chain reads off the same banks).
+    __shared__ float rounded[2][264];
+    const int g = (int)blockIdx.x * 2 + wave;
+    const long long start = (long long)g * 256 + lane * 8;
+    const int d0 = lane * 8;
+    const int c0 = (lane & 15) * 8;
+
+    const uint4 raw = *reinterpret_cast<const uint4*>(recurrent + start);
+    const float4 z0 = *reinterpret_cast<const float4*>(z + start);
+    const float4 z1 = *reinterpret_cast<const float4*>(z + start + 4);
+    float nw[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) nw[e] = bf16_to_f32(norm[c0 + e]);
+    const float4 s1a = *reinterpret_cast<const float4*>(signs1 + d0);
+    const float4 s1b = *reinterpret_cast<const float4*>(signs1 + d0 + 4);
+    const float4 s2a = *reinterpret_cast<const float4*>(signs2 + d0);
+    const float4 s2b = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
+
+    const float in[8] = {
+        __uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
+        __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u),
+        __uint_as_float(raw.z << 16), __uint_as_float(raw.z & 0xffff0000u),
+        __uint_as_float(raw.w << 16), __uint_as_float(raw.w & 0xffff0000u)};
+    float* head = rounded[wave] + (lane >> 4) * 132;
+    *reinterpret_cast<float4*>(head + c0) = make_float4(in[0], in[1], in[2], in[3]);
+    *reinterpret_cast<float4*>(head + c0 + 4) = make_float4(in[4], in[5], in[6], in[7]);
+    // One wave owns `rounded[wave]`: keep the compiler from moving the chain's
+    // reads above the stores (LDS ops of a wave execute in order).
+    __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+
+    const float inv = fn_gdn_dense_gate_inv128(head);
+    const float zs[8] = {z0.x, z0.y, z0.z, z0.w, z1.x, z1.y, z1.z, z1.w};
+    const float sg1[8] = {s1a.x, s1a.y, s1a.z, s1a.w, s1b.x, s1b.y, s1b.z, s1b.w};
+    const float sg2[8] = {s2a.x, s2a.y, s2a.z, s2a.w, s2b.x, s2b.y, s2b.z, s2b.w};
+    float values[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+        values[e] = fn_gdn_dense_gate_elem(in[e], inv, nw[e], zs[e]) * sg1[e];
+    mq_fwht256_lane(values, lane);
+    float f[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) f[e] = values[e] * 0.0625f * sg2[e];
+    const int token = g / 24;
+    emit_i8_sidecar_from_producer8(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], y,
+                                   g - token * 24, token, rows, lane);
 }

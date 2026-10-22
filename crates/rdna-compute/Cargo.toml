@@ -41,6 +41,9 @@ required-features = ["lab"]
 [[example]]
 name = "npu_trunk_consumers_check"
 required-features = ["lab"]
+[[example]]
+name = "qwen4_moe_front_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "pm_moe_cn_tiled_numeric_oracle"
@@ -152,6 +155,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_argmax_vs_download_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hc_row_fold_gfx1201"
 required-features = ["lab"]
 
 [[example]]
@@ -308,6 +315,14 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_qwen4_hc_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_down_fused_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_down_fused_bench"
 required-features = ["lab"]
 
 [[example]]

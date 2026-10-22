@@ -1276,6 +1276,13 @@ fn execute_hyper_read_inner(
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
     let mut activated = false;
+    // The WMMA read takes `low` as packed BF16, staged in `up` (which that
+    // route does not otherwise use).
+    let low_bf16 = wmma_read.then(|| {
+        let mut packed = view(op.up, 0, op.rows * op.low_rank);
+        packed.dtype = DType::BF16;
+        packed
+    });
     if f16 {
         if prenormed && !(wmma_read && paired.is_some()) {
             return Err(DispatchError::Hip(
@@ -1309,14 +1316,39 @@ fn execute_hyper_read_inner(
             }
             None => hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?,
         }
-        hip(gpu.gemm_bf16_xf16_f16_wmma(
-            op.input_mix_down.buf,
-            &x16,
-            &low,
-            op.input_mix_down.m,
-            op.input_mix_down.k,
-            op.rows,
-        ))?;
+        // gfx1201 HC-down + activation as one launch (byte-identical to the
+        // F16 WMMA GEMM + `hc_activation_fused_f32` chain): the packed BF16
+        // `low_bf16` is the only output the WMMA read consumes.
+        match low_bf16.as_ref().filter(|_| {
+            wmma_read
+                && op.low_rank == op.input_mix_down.m
+                && gpu.qwen4_hc_down_fused_applies(
+                    op.input_mix_down.m,
+                    op.input_mix_down.k,
+                    op.rows,
+                )
+        }) {
+            Some(packed) => {
+                hip(gpu.gemm_bf16_xf16_hc_down_fused(
+                    op.input_mix_down.buf,
+                    &x16,
+                    packed,
+                    op.input_mix_down.m,
+                    op.input_mix_down.k,
+                    op.rows,
+                    1.0 / op.branches as f32,
+                ))?;
+                activated = true;
+            }
+            None => hip(gpu.gemm_bf16_xf16_f16_wmma(
+                op.input_mix_down.buf,
+                &x16,
+                &low,
+                op.input_mix_down.m,
+                op.input_mix_down.k,
+                op.rows,
+            ))?,
+        }
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
         && hc_decode_partitions(
@@ -1354,13 +1386,6 @@ fn execute_hyper_read_inner(
             Some(op.rotation),
         )?;
     }
-    // The WMMA read takes `low` as packed BF16, staged in `up` (which that
-    // route does not otherwise use).
-    let low_bf16 = wmma_read.then(|| {
-        let mut packed = view(op.up, 0, op.rows * op.low_rank);
-        packed.dtype = DType::BF16;
-        packed
-    });
     // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
         if !activated {
@@ -1528,6 +1553,94 @@ pub fn execute_hyper_write_pregated(
     op: &HyperWriteOp<'_>,
 ) -> Result<(), DispatchError> {
     execute_hyper_write_inner(gpu, op, true)
+}
+
+/// Whether the pregated HC write `write` and the HC read `read` right after it (whose
+/// own paired write is `next_write`) run as the gfx1201 mixer-tail row fold
+/// (`HIPFIRE_QWEN4_HC_ROW_FOLD`): exactly the BF16-stream write `hyper_write` gives
+/// `hyper_write_bf16x8_gfx1201` (see [`Gpu::hc_row_fold_gfx1201_applies`]) and a read
+/// that takes [`execute_hyper_read_prenormed`] ([`hyper_read_prenorm_applies`]).
+pub fn hyper_write_read_fold_applies(
+    gpu: &Gpu,
+    write: &HyperWriteOp<'_>,
+    read: &HyperReadOp<'_>,
+    next_write: &HyperWriteOp<'_>,
+) -> bool {
+    let Some(wide) = write.branches.checked_mul(write.hidden) else {
+        return false;
+    };
+    let Some(streams_len) = write.rows.checked_mul(wide) else {
+        return false;
+    };
+    gpu.flags.qwen4_hc_row_fold_mixer_gfx1201_enabled()
+        && write.state_bf16
+        && write.branches == 4
+        && write.input.buf.as_ptr() == write.output.buf.as_ptr()
+        && read.input.buf.as_ptr() == write.output.buf.as_ptr()
+        && read.rows == write.rows
+        && read.hidden == write.hidden
+        && write.input.dtype == DType::F32
+        && write.input.numel() >= streams_len
+        && write.mixed.dtype == DType::F32
+        && write.mixed.numel() >= write.rows * write.hidden
+        && write.gates.dtype == DType::F32
+        && write.gates.numel() >= write.rows * write.branches
+        && gpu.hc_row_fold_gfx1201_applies(write.rows, write.hidden, write.input, write.mixed)
+        && hyper_read_prenorm_applies(gpu, read, next_write)
+        && hc_row_fold_next_gfx1201_ok(read, next_write)
+}
+
+/// The operand shapes the gfx1201 row folds need of the next HC read and its paired
+/// write (the launch's own checks), so a mismatch plans no fold instead of failing the
+/// launch.
+pub fn hc_row_fold_next_gfx1201_ok(read: &HyperReadOp<'_>, next_write: &HyperWriteOp<'_>) -> bool {
+    let Some(wide) = read.branches.checked_mul(read.hidden) else {
+        return false;
+    };
+    read.norm_weight.dtype == DType::BF16
+        && read.norm_weight.numel() == wide
+        && next_write.block_inject.buf.dtype == DType::BF16
+        && next_write.block_inject.buf.numel() >= 4 * wide
+        && next_write.gates.dtype == DType::F32
+        && next_write.gates.numel() >= read.rows * 4
+}
+
+/// [`execute_hyper_write_pregated`] of `write` followed by the norm + gate projection
+/// of `read`'s [`execute_hyper_read_prenormed`] input, in one launch (the gfx1201
+/// mixer-tail row fold; bytewise `hyper_write_bf16x8_gfx1201` then
+/// `hyper_norm_gate_outputs`).  The read must then run
+/// [`execute_hyper_read_prenormed`].  Requires [`hyper_write_read_fold_applies`].
+pub fn execute_hyper_write_read_fold(
+    gpu: &mut Gpu,
+    write: &HyperWriteOp<'_>,
+    read: &HyperReadOp<'_>,
+    next_write: &HyperWriteOp<'_>,
+) -> Result<(), DispatchError> {
+    if !hyper_write_read_fold_applies(gpu, write, read, next_write) {
+        return Err(DispatchError::Hip(
+            "hyper write: the gfx1201 row fold was planned but its route no longer applies".into(),
+        ));
+    }
+    let wide = checked_mul(write.branches, write.hidden, "hyper write wide")?;
+    let streams = view(write.input, 0, write.rows * wide);
+    let mixed = view(write.mixed, 0, write.rows * write.hidden);
+    let gates = view(write.gates, 0, write.rows * write.branches);
+    let next_gates = view(next_write.gates, 0, read.rows * next_write.branches);
+    // The read's F16 row lives in the shared F16 scratch it takes it from.
+    let x16 = hip(gpu.qwen4_f16_x_scratch(read.rows * wide))?;
+    hip(
+        gpu.hc_row_write_norm_gate_gfx1201(&rdna_compute::hc_row_fold::HcRowWriteNormGateGfx1201 {
+            mixed: &mixed,
+            streams: &streams,
+            gates: &gates,
+            norm_weight: read.norm_weight,
+            gate_weight: next_write.block_inject.buf,
+            next_gates: &next_gates,
+            normalized_f16: &x16,
+            rows: write.rows,
+            hidden: write.hidden,
+        }),
+    )
 }
 
 /// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 (or, on the
@@ -2837,6 +2950,9 @@ fn execute_gated_delta_net_hc_impl(
         return Ok(());
     }
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
+    // The out projection's A8 blocks, when the dense gate produced them.
+    #[cfg_attr(not(feature = "deltanet"), allow(unused_mut))]
+    let mut fused_xq: Option<*mut std::ffi::c_void> = None;
     if phase == MixerPhase::OutProj {
         // The core ran in an earlier call; only the dtype decision it made for
         // its output is owed here.
@@ -2980,12 +3096,28 @@ fn execute_gated_delta_net_hc_impl(
                 // `recurrent_output` is scratch with no reader after the gate.
                 #[cfg(feature = "deltanet")]
                 if rotate {
-                    let rotated = view(op.rotation, lo * value, rows * value);
-                    hip(rdna_compute::fn_gdn_dense::gate(
-                        gpu,
-                        &gated,
-                        Some(&rotated),
-                    ))?;
+                    // `HIPFIRE_QWEN4_GDN_I8_FUSE`: the out projection's INT8 route
+                    // (a lone MQ6 weight: its F32 activation is this gate output)
+                    // reads the gate's own rotated A8 blocks, so neither the F32
+                    // gate output nor the separate producer launch exists. Any
+                    // other shape of the call (split core / out-projection phases,
+                    // a row window, an HC-write epilogue that would read the F32
+                    // output) keeps the F32 gate output and the unfused chain.
+                    if phase == MixerPhase::Whole
+                        && window.is_none()
+                        && !(hc.is_some() && gpu.flags.qwen4_hc_fuse_level() >= 2)
+                        && mq6_i8_route(gpu, &op.output, op.rows)
+                        && rdna_compute::fn_gdn_dense::gate_i8_applies(gpu, &gated)
+                    {
+                        fused_xq = Some(hip(rdna_compute::fn_gdn_dense::gate_i8(gpu, &gated))?);
+                    } else {
+                        let rotated = view(op.rotation, lo * value, rows * value);
+                        hip(rdna_compute::fn_gdn_dense::gate(
+                            gpu,
+                            &gated,
+                            Some(&rotated),
+                        ))?;
+                    }
                 } else {
                     hip(rdna_compute::fn_gdn_dense::gate(gpu, &gated, None))?;
                 }
@@ -3091,6 +3223,18 @@ fn execute_gated_delta_net_hc_impl(
     }
     if phase == MixerPhase::Core {
         return Ok(());
+    }
+    if let Some(xq) = fused_xq {
+        // The gate emitted the A8 blocks: the INT8 route's GEMM, minus its producer.
+        let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
+        return hip(gpu.gemm_mq6g256v2_i8_prequant(
+            op.output.buf,
+            xq,
+            &output_batch,
+            op.output.m,
+            op.output.k,
+            op.rows,
+        ));
     }
     // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the paired HC write rides the output
     // projection's epilogue; the projection then never lands in `output_tensor`.

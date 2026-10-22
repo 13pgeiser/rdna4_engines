@@ -45,6 +45,16 @@
 // same lane remap, then `quantize_block_i4_128_wave<false>`, the 8-candidate
 // strict-`<` MSE → rintf/clamp → exact int sum) matches the standalone
 // quantizer's bytes.
+//
+// -DHIPFIRE_ROTATE_F16_OUT=1 (plain rotate only) adds an `x_f16` output: the
+// RNE F16 cast of the raw, UNROTATED input row (the bytes `convert_f32_to_f16`
+// leaves for the BF16 router / shared-expert F16 WMMA GEMMs), stored from the
+// registers the lane already loaded. One launch then emits both the F16 X and
+// the IU4 sidecar of a row read once (`mq_rotate_x_i4_f16out`).
+#if defined(HIPFIRE_ROTATE_F16_OUT) && \
+    (defined(HIPFIRE_ROTATE_AWQ) || defined(HIPFIRE_ROTATE_SIGMOID_GATE))
+#error "HIPFIRE_ROTATE_F16_OUT is the plain-rotate twin only"
+#endif
 
 #ifdef HIPFIRE_ROTATE_KERNEL
 /* caller (host JIT concat) already named the symbol */
@@ -64,6 +74,9 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     const float* __restrict__ awq_scale,   // [K], FP32
 #endif
     float* __restrict__ x_out,             // nullable when emit_f32=false
+#ifdef HIPFIRE_ROTATE_F16_OUT
+    _Float16* __restrict__ x_f16,          // [N, K] F16 = (_Float16) of the UNROTATED x_in
+#endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
@@ -105,6 +118,17 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     float x5 = x_in_b[base + 5];
     float x6 = x_in_b[base + 6];
     float x7 = x_in_b[base + 7];
+#ifdef HIPFIRE_ROTATE_F16_OUT
+    // `convert_f32_to_f16` of the raw (unrotated) row, from the registers this lane
+    // already holds: one 16-byte store per lane, no extra DRAM read. The cast is
+    // the same RNE `(_Float16)` the standalone conversion applies per element.
+    {
+        typedef _Float16 hipfire_h8 __attribute__((ext_vector_type(8)));
+        hipfire_h8 h = {(_Float16)x0, (_Float16)x1, (_Float16)x2, (_Float16)x3,
+                        (_Float16)x4, (_Float16)x5, (_Float16)x6, (_Float16)x7};
+        *reinterpret_cast<hipfire_h8*>(x_f16 + batch_off + base) = h;
+    }
+#endif
 #ifdef HIPFIRE_ROTATE_SIGMOID_GATE
     // Exact `sigmoid_mul_f32` expression and operation order. The old global
     // store/reload is lossless for f32, so these registers are identical.
