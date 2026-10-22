@@ -35,9 +35,11 @@
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_mxfp4.h"
+#include "r4d_q8.h"
 
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #define R4D_MXG_MAX_M 8
@@ -344,5 +346,193 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs* a, RadStream s) {
                        (int)g.M, (int)g.K, (int)np, as_group, as_rs, (long)(uintptr_t)s,
                        (int)(mp.lda ? mp.lda : g.K), (int)g.N, (int)g.N));
     }
+    return RAD_OK;
+}
+
+// ============================================================== the gated form (gemm_nt_q_gated_mx)
+//
+// The gate_up GEMM with gated_quant_fp8's pass in its epilogue, so the [M, 2n] bf16 product is never
+// written and the quantiser is not a launch of its own. One block a 128-column group of the gated
+// output (one activation scale group of the down projection's input): sixteen waves, one 16-column
+// weight tile each -- the group's eight gate tiles (weight rows 128 g ..) and its eight up tiles (rows
+// n + 128 g ..).
+//
+// Byte-identical to the WMMA form above followed by gated_quant_fp8. A wave runs, for its tile, what
+// all R4D_MXG_KW waves of that kernel run: partial v sums chunks v, v + KW, .. in order, and the
+// partials are added v = 0, 1, .. from zero, as that kernel's epilogue adds its waves' rows of sP.
+// Only one partial is live at a time, which is why the chunks are taken in that order rather than
+// in K order. The scaled sum is rounded to bf16 by the same conversion, and from there the arithmetic
+// is r4d_fused_quant_fp8.hip's gated_quant_fp8_kernel: silu(gate) * up rounded to bf16, the group's
+// amax, scale amax / 448, codes through q8_pack4.
+namespace {
+__device__ __forceinline__ float mxg_bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
+__device__ __forceinline__ uint16_t mxg_f2bf(float f) {   // as r4d_fused_quant_fp8.hip's f2bf
+  const uint32_t u = __float_as_uint(f);
+  return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+}  // namespace
+
+template <bool ABLK>
+__global__ __launch_bounds__(16 * 32)
+void r4d_gemm_mxfp4a8_gated_kernel(
+    const unsigned char* __restrict__ A, const float* __restrict__ As,
+    const unsigned char* __restrict__ W, const unsigned char* __restrict__ Ws,
+    const unsigned char* __restrict__ Wref, uint8_t* __restrict__ Q, float* __restrict__ S,
+    uint16_t* __restrict__ Y, int M, int K, int n, int as_rs, int lda, int ldws, int q_ld, int s_ld,
+    int y_ld) {
+  constexpr int KW = R4D_MXG_KW;
+  __shared__ uint16_t sG[16][R4D_MXG_MAX_M][16];   // bf16 gate (waves 0..7) and up (8..15)
+  const int lane = threadIdx.x & 31;
+  const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+  const int nt = (wave >> 3) * (n >> 4) + blockIdx.x * 8 + (wave & 7);   // this wave's weight tile
+  const int col = lane & 15, khalf = lane >> 4;
+  const int row = col;
+  const bool live = row < M;
+  const int ksteps = K >> 4, chunks = K >> 7;
+  const unsigned* __restrict__ Wp = (const unsigned*)W;
+  const int ref = (int)Wref[nt * 16 + col];
+  mxg_v8f sum = (mxg_v8f)(0.f);
+  for (int v = 0; v < KW; ++v) {
+    mxg_v8f tot = (mxg_v8f)(0.f);
+    for (int ch = v; ch < chunks; ch += KW) {
+      unsigned wv[8];
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
+        wv[s] = __builtin_nontemporal_load(&Wp[((size_t)nt * ksteps + ch * 8 + s) * 32 + lane]);
+      int e8[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) e8[q] = (int)Ws[(size_t)(ch * 4 + q) * ldws + nt * 16 + col];
+      mxg_v2i af[8];
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        if (live) {
+          const unsigned* pa = (const unsigned*)(A + (size_t)row * lda + (ch * 8 + s) * 16 + khalf * 8);
+          af[s][0] = (int)pa[0]; af[s][1] = (int)pa[1];
+        } else {
+          af[s][0] = 0; af[s][1] = 0;
+        }
+      }
+      mxg_v8f acc = (mxg_v8f)(0.f);
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        unsigned lo, hi;
+        r4d_mxfp4_unpack8(wv[s], r4d_mxfp4_fold_d(ref, e8[s >> 1]), &lo, &hi);
+        mxg_v2i wf;
+        wf[0] = (int)lo; wf[1] = (int)hi;
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf, af[s], acc);
+      }
+      const float sc = ABLK ? (live ? As[(size_t)row * as_rs + ch] : 0.f) : 1.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) tot[e] = fmaf(acc[e], sc, tot[e]);
+    }
+#pragma unroll
+    for (int e = 0; e < 8; ++e) sum[e] += tot[e];
+  }
+  // acc[e] (and so sum[e]): row (lane & 15), column khalf * 8 + e of the tile.
+  if (live) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int c = khalf * 8 + e;
+      const float rf = __int_as_float((int)Wref[nt * 16 + c] << 23);
+      const __hip_bfloat16 h = (__hip_bfloat16)(ABLK ? sum[e] * rf : sum[e] * rf * As[(size_t)row * as_rs]);
+      sG[wave][row][c] = *(const uint16_t*)&h;
+    }
+  }
+  __syncthreads();
+  // gated_quant_fp8: one wave a row, a lane four consecutive columns of the group.
+  if (wave < M) {
+    const int m = wave, c0 = lane * 4, t = c0 >> 4, cc = c0 & 15;
+    const size_t gcol = (size_t)blockIdx.x * 128 + c0;
+    float vq[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float g = mxg_bf2f(sG[t][m][cc + j]);
+      const float a = g / (1.0f + expf(-g));
+      const uint16_t h = mxg_f2bf(a * mxg_bf2f(sG[8 + t][m][cc + j]));
+      if (Y) Y[(size_t)m * y_ld + gcol + j] = h;
+      vq[j] = mxg_bf2f(h);
+    }
+    float mx = fmaxf(fmaxf(fabsf(vq[0]), fabsf(vq[1])), fmaxf(fabsf(vq[2]), fabsf(vq[3])));
+    mx = r4d_wave_max(mx);
+    const float sc = mx > 0.0f ? mx * (1.0f / q8_top<false>()) : 1.0f;
+    if (lane == 0) S[(size_t)m * s_ld + blockIdx.x] = sc;
+    const float inv = 1.0f / sc;
+    *(uint32_t*)(Q + (size_t)m * q_ld + gcol) = q8_pack4<false>(vq[0], vq[1], vq[2], vq[3], inv);
+  }
+}
+
+namespace {
+void mxgg_launch(bool ablk, const void* a, const void* as, const void* w, const void* ws,
+                 const void* wr, void* q, void* s, void* y, int M, int K, int n, int as_rs, int lda,
+                 int ldws, int q_ld, int s_ld, int y_ld, RadStream stream) {
+  const dim3 grid((uint32_t)(n / 128)), block(16 * 32);
+  hipStream_t st = (hipStream_t)stream;
+  if (ablk)
+    hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gated_kernel<true>), grid, block, 0, st,
+                       (const unsigned char*)a, (const float*)as, (const unsigned char*)w,
+                       (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,
+                       (uint16_t*)y, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld);
+  else
+    hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gated_kernel<false>), grid, block, 0, st,
+                       (const unsigned char*)a, (const float*)as, (const unsigned char*)w,
+                       (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,
+                       (uint16_t*)y, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld);
+}
+}  // namespace
+
+/* The gated GEMM's shim. Operand indices are `gemm_nt_q_gated_mx`'s (oGemmNtQGatedMx in
+ * r4d_rows.cpp): gemm_nt_q_gated's with the per-row reference `b_ref` after `b_scale`. The weight
+ * is one [N, K] plane, gate rows then up rows, N = 2 * the gated width; no parts. */
+enum { MXGG_A = 0, MXGG_AS = 1, MXGG_B = 2, MXGG_BS = 3, MXGG_BR = 4, MXGG_Q = 5, MXGG_S = 6,
+       MXGG_Y = 7 };
+
+extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
+    const RadTensor* x  = r4d_opt(a, MXGG_A);
+    const RadTensor* xs = r4d_opt(a, MXGG_AS);
+    const RadTensor* w  = r4d_opt(a, MXGG_B);
+    const RadTensor* ws = r4d_opt(a, MXGG_BS);
+    const RadTensor* wr = r4d_opt(a, MXGG_BR);
+    const RadTensor* q  = r4d_opt(a, MXGG_Q);
+    const RadTensor* sc = r4d_opt(a, MXGG_S);
+    const RadTensor* y  = r4d_opt(a, MXGG_Y);
+    if (!x || !xs || !w || !ws || !wr || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (q->rank != 2 || sc->rank != 2 || x->rank < 2) return R4D_NO(RAD_E_SHAPE);
+    if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_geti_or(a, "group", 32) != 32) return R4D_NO(RAD_E_SHAPE);
+    const char* act = r4d_gets(a, "act");
+    if (!act || std::strcmp(act, "silu")) return R4D_NO(RAD_E_UNSUPPORTED);
+
+    /* The gated width from `q`, the buffer written; N and K from the op's parameters, since the
+     * weight operands are packed bytes. */
+    const long long M = q->shape[0], nout = q->shape[1];
+    const long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
+    if (M < 1 || M > R4D_MXG_MAX_M || nout < 128 || nout % 128) return R4D_NO(RAD_E_SHAPE);
+    if (N != 2 * nout || K < 128 || K % 128) return R4D_NO(RAD_E_SHAPE);
+    if (x->shape[0] != M || r4d_numel(x) != M * K) return R4D_NO(RAD_E_SHAPE);
+    if (sc->shape[0] != M || sc->shape[1] != nout / 128) return R4D_NO(RAD_E_SHAPE);
+    if (y && (y->shape[0] != M || y->shape[1] != nout)) return R4D_NO(RAD_E_SHAPE);
+    /* The activation scale per (row, 128 of K), or per row. */
+    bool ablk;
+    long long as_rs;
+    if (xs->rank == 2 && xs->shape[0] == M && xs->shape[1] == K / 128) {
+        ablk = true;
+        as_rs = r4d_row_pitch(xs);
+    } else if (xs->rank == 1 && xs->shape[0] == M) {
+        ablk = false;
+        as_rs = 1;
+    } else {
+        return R4D_NO(RAD_E_SHAPE);
+    }
+    const long long lda = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
+    const long long yp = y ? r4d_row_pitch(y) : 0;
+    if (lda < 0 || as_rs < 0 || qp < 0 || sp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16) || !r4d_aligned(q->data, 4) ||
+        !r4d_aligned(ws->data, 4) || !r4d_aligned(wr->data, 4) || qp % 4)
+        return R4D_NO(RAD_E_ALIGN);
+
+    R4D_TRY("gemm_mxfp4a8_gated",
+        mxgg_launch(ablk, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
+                    y ? y->data : nullptr, (int)M, (int)K, (int)nout, (int)as_rs, (int)lda, (int)N,
+                    (int)qp, (int)sp, (int)yp, s));
     return RAD_OK;
 }

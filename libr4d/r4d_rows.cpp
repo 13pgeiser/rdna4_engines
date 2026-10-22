@@ -1627,6 +1627,20 @@ static const RadOperandSpec oGemmNtQGated[] = {
     { "scale",    RAD_OPD_OUT,    0 },
     { "out_bf16", RAD_OPD_OUT,    1 },
 };
+/* The same fold over an OCP-MXFP4 gate_up weight, which gemm_nt_q reads with a per-row reference
+ * exponent (`b_ref`) beside its scale plane. A schema of its own rather than an optional operand on
+ * gemm_nt_q_gated: an op's operand count is part of its contract with the plugins already built
+ * against it. */
+static const RadOperandSpec oGemmNtQGatedMx[] = {
+    { "a",        RAD_OPD_IN,     0 },
+    { "a_scale",  RAD_OPD_IN,     0 },
+    { "b",        RAD_OPD_WEIGHT, 0 },
+    { "b_scale",  RAD_OPD_WEIGHT, 0 },
+    { "b_ref",    RAD_OPD_WEIGHT, 0 },
+    { "q",        RAD_OPD_OUT,    0 },
+    { "scale",    RAD_OPD_OUT,    0 },
+    { "out_bf16", RAD_OPD_OUT,    1 },
+};
 
 /* The gate in a separate operand, as in a gated attention: the gate is a column slice of the
  * [q|gate] projection and `x` the attention output, two buffers with different pitches. A row is a
@@ -3363,6 +3377,10 @@ static const RadOpSchema kSchemas[] = {
            "columns) and optionally the bf16 product, and no [M, 2n] tensor is ever written. "
            "Byte-identical to the two ops it replaces, which is what makes it substitutable "
            "rather than a second numerical path."),
+    SCHEMA("gemm_nt_q_gated_mx", pGemmNtQGated, oGemmNtQGatedMx,
+           "gemm_nt_q_gated over an OCP-MXFP4 [2n, K] gate_up weight: gemm_nt_q at dtype mxfp4a8 "
+           "(`b_ref` the per-row reference exponent) with gated_quant_fp8's pass folded into the "
+           "epilogue, byte-identical to the two ops it replaces."),
     SCHEMA("gate_quant_fp8", pGateQuantFp8, oGateQuantFp8,
            "the same, with the gate in its own operand rather than packed beside x."),
     SCHEMA("quant_act_fp8", pQuantActFp8, oQuantActFp8,
@@ -4807,6 +4825,12 @@ static const RadConstraint cGatedHadQuantFp8[] = {
 static const RadConstraint cGemmNtQGatedFp8[] = {
     C_LE("M", 64), C_DIV("K", 256), C_DIV("N", 256), C_GE("N", 2048),
     C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "fp8a8"), C_IN("act", "silu"),
+};
+/* r4d_gemm_mxfp4a8_gated_gemv: the gemv row's WMMA form (K a multiple of 128, M <= 8) with a block
+ * per 128-column group of the gated output (N/2 a multiple of 128). */
+static const RadConstraint cGemmNtQGatedMx[] = {
+    C_LE("M", 8), C_DIV("K", 128), C_DIV("N", 256), C_EQ("group", 32), C_IN("dtype", "mxfp4a8"),
+    C_IN("act", "silu"),
 };
 static const RadConstraint cGateQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -7741,6 +7765,23 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGemmMxfp4A8GemvWide), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gemv, nullptr,
   r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
+
+{ "gemm_mxfp4a8_gated_gemv", "gemm_nt_q_gated_mx", "gemm",
+  "the gemv row's WMMA form over a gate_up weight with gated_quant_fp8's pass in its epilogue: a "
+  "block per 128-column group of the gated output, a wave per gate or up tile running all of that "
+  "form's K partials in its order, so the [M, 2n] bf16 product is never written",
+  "M <= 8; K a multiple of 128; N a multiple of 256 (the gated width a multiple of the 128-column "
+  "scale group); act silu only; the skinny kernel's fragment-order weight, [K/32][N] E8M0 "
+  "exponents and per-row reference exponent, gate rows then up rows",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K, and the "
+  "QUANTISER's outputs: E4M3 codes, an f32 scale per (row, 128 columns) and an optional bf16 "
+  "product. Byte-identical to gemm_mxfp4a8_gemv followed by gated_quant_fp8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQGatedMx), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated, nullptr,
+  r4d_rad_layout_mxfp4_gated, r4d_rad_relayout_mxfp4_gated, nullptr, nullptr,
+  /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
+  r4d_fuse_gemm_nt_q_gated_mx },
 
 { "gemm_mxfp4a8_decode", "gemm_nt_q", "gemm",
   "the OCP-MXFP4 GEMM for the DECODE band: split-K across workgroups with a fused last-arriver "

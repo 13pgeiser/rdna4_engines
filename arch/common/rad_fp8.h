@@ -1692,6 +1692,28 @@ inline rad_op decl_gated_fold(RadBuilder* b, int64_t rows, int64_t N, int64_t K,
     return op;
 }
 
+/* The same fold over an OCP-MXFP4 [2n, K] gate_up weight (`gemm_nt_q_gated_mx`: codes, the E8M0
+ * plane and that plane again as the per-row reference), declared for M up to min(rows, 8), the band
+ * of libr4d's one-to-eight-row GEMM it is built on. Optional like decl_gated_fold, and asked for
+ * only when a loaded library declares the op: libref does not, so a CPU-only engine takes the pair
+ * without ever naming it. */
+inline rad_op decl_gated_fold_mx(RadBuilder* b, int64_t rows, int64_t N, int64_t K, rad_weight w,
+                                 rad_weight ws, rad_weight wref,
+                                 std::initializer_list<rad_buf> reads,
+                                 std::initializer_list<rad_buf> writes, int64_t* gated_rows) {
+    const int64_t hi = rows < 8 ? rows : 8;
+    if (hi <= 0 || N % 256 || K % RAD_FP8_BLOCK) return 0;
+    if (!rad_op_declared(b, "gemm_nt_q_gated_mx")) return 0;
+    const rad_op op = rw(b, RAD_OP(b, "gemm_nt_q_gated_mx",
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                        RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8"),
+                                        RAD_STR("act", "silu")),
+                             RAD_WEIGHTS(w, ws, wref)),
+                         reads, writes);
+    if (op) *gated_rows = hi;
+    return op;
+}
+
 }  /* namespace arch */
 }  /* namespace rad */
 

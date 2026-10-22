@@ -591,6 +591,7 @@ and is optional.
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `swiglu_clamped_quant_fp8` | `M`(range) `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_gated_mx` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w, `b_ref`w → `q`, `scale`, `out_bf16`? |
 
 `quant_cols_fp8` is the same E4M3 quantiser with one scale per column over all `M` rows,
 `scale[c] = amax_r |x[r, c]| * (1/448)` (1 for an all-zero column), `scale` `[n]` f32: an
@@ -603,6 +604,10 @@ tensor between them is never written. It is a separate schema, not a flag on `ge
 it does not produce that op's `y`. `act` is required here, unlike on the quantiser: an
 implementation may compile one gate only, and an optional parameter would let it resolve for
 another.
+
+`gemm_nt_q_gated_mx` is the same fold over an OCP-MXFP4 weight (`dtype` `mxfp4a8`, `group` 32), which
+`gemm_nt_q` reads with the per-row reference exponent `b_ref` after `b_scale`. A schema of its own
+because an op's operand count is fixed for the plugins built against it.
 
 `swiglu_clamped_quant_fp8` (device-only) is `swiglu_clamped` then `quant_act_fp8` over its
 product in one pass. The product is rounded to bf16 before the quantiser reads it, as the pair
