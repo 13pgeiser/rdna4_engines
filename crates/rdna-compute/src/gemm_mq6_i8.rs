@@ -132,7 +132,7 @@ fn mq6_i8_pm_launch(
 
 /// Whether the PeaceMaker twin runs one launch (`flag` = `HIPFIRE_MQ6_I8_PM`): not
 /// switched off (`0`; unset and `1` both admit), exact gfx1201, `k % 256 == 0`, `m % 4 == 0` (its row quads are stored
-/// whole), a 4-byte aligned `y`, and the 32-bit address contract (`m`, `k`, `n`
+/// whole), a `y` aligned to 4 bytes (F32) or 8 bytes (BF16: its quad stores are `buffer_store_b64`), and the 32-bit address contract (`m`, `k`, `n`
 /// and the output and weight extents under 2^31 bytes). Anything else keeps the
 /// hipcc kernel.
 fn mq6_i8_pm_admits(
@@ -151,7 +151,7 @@ fn mq6_i8_pm_admits(
         && m > 0
         && m % 4 == 0
         && n > 0
-        && y_ptr % 4 == 0
+        && y_ptr % if out_elem_bytes == 2 { 8 } else { 4 } == 0
         && m.max(k).max(n) <= i32::MAX as usize
         && crate::gemm::pm_output_extent_bytes(n, m, out_elem_bytes).is_some()
         && m.checked_mul(k / 256)
@@ -532,7 +532,9 @@ mod tests {
     fn pm_twin_is_the_gfx1201_default_with_the_32_bit_address_contract() {
         let ok = |flag, arch, m, k, n, eb, y| mq6_i8_pm_admits(flag, arch, m, k, n, eb, y);
         assert!(ok(Some(true), "gfx1201", 2560, 5120, 4000, 4, 256));
-        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 2, 4));
+        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 2, 8));
+        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 4, 4));
+        assert!(!ok(Some(true), "gfx1201", 48, 256, 1, 2, 4));
         // FN's largest M at a vocabulary-sized token count stays inside 2^31 bytes.
         assert!(ok(Some(true), "gfx1201", 248_320, 5120, 2162, 4, 256));
         assert!(!ok(Some(true), "gfx1201", 248_320, 5120, 4000, 4, 256));
@@ -540,7 +542,7 @@ mod tests {
         assert!(ok(None, "gfx1201", 2560, 5120, 4000, 4, 256));
         assert!(!ok(None, "gfx1201", 248_320, 5120, 4000, 4, 256));
         assert!(!ok(Some(false), "gfx1201", 2560, 5120, 4000, 4, 256));
-        assert!(!ok(Some(false), "gfx1201", 48, 256, 1, 2, 4));
+        assert!(!ok(Some(false), "gfx1201", 48, 256, 1, 2, 8));
         // Other archs, K % 256, M % 4, an unaligned Y and empty dims fall back.
         assert!(!ok(Some(true), "gfx1151", 2560, 5120, 4000, 4, 256));
         assert!(!ok(Some(true), "gfx1201", 2560, 5000, 4000, 4, 256));

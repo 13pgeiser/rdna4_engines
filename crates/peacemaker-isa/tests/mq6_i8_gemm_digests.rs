@@ -23,11 +23,11 @@ const PINNED: &[(&str, &str)] = &[
     ),
     (
         "128x128x8-set_bf16",
-        "4602e51634daec1f60fdb3ae820b6e1f80d86788f1646a141fc8820d84a2ae29",
+        "d5278e048899516f522152eba9ec1f6cb349b3cc93e96f4ac2aeaff2a03b6e95",
     ),
     (
         "128x128x8-set_bf16-linear",
-        "1fef4d95fa27fac5c4b646d3677a31d545b63edde4a16652b6079bd8385de4a6",
+        "302b9caafd3351d24b077ef53268f73b676920d6dea8595d4c9844a3c11d6afa",
     ),
 ];
 
@@ -43,11 +43,11 @@ const PINNED_TILES: &[(&str, &str)] = &[
     ),
     (
         "256x128x16-set_bf16",
-        "35206e7cc71638fde065846d8fa7925f1f3e2492ad77f1704d650943fc98ef63",
+        "47a5b9da3fd080aaacd1e77a2bab1b8971a1faf34c4858d3c9ebd2d8857b7380",
     ),
     (
         "256x128x16-set_bf16-linear",
-        "9873fca002dfb5014cc2fd89ed27b296d8f38f685d039730401bdbe290694165",
+        "24976b03a0cb7543664849043bb533121e582c8cb69608f9a60fe2b3528ab853",
     ),
     (
         "128x256x16-set",
@@ -59,17 +59,17 @@ const PINNED_TILES: &[(&str, &str)] = &[
     ),
     (
         "128x256x16-set_bf16",
-        "ee5ff709200f36f4ad91d583e7c44ed28d15649743542d4c6b3a24ccdf07d0be",
+        "af3239dc13f8fba0fd1052e56a4790afc5dc3013810478cff954f88308220371",
     ),
     (
         "128x256x16-set_bf16-linear",
-        "498262d4189185a10683d1797f8c73cd5a114c2470ab5f7d3a96b610cab26acc",
+        "78edab2a02e3fd650866d7310301c9a314d60db3b6736cd9d230767cb7861f31",
     ),
 ];
 
 /// sha256 of the `emit_module` text (the four banded product symbols: both epilogues on the
-/// shipped 128x128 tile, whose entry bytes are `PINNED`, and on 128x256, `PINNED_TILES`).
-const PINNED_MODULE: &str = "78a994bbe6362388ac98163ff4985c342fbda4adeeff75e677bc272ad2b0cc20";
+/// shipped 128x128 tile, whose entries are `PINNED`, and on 128x256, `PINNED_TILES`).
+const PINNED_MODULE: &str = "c434cfe36914155c09097d5b3ff85b1d15d42f183cf9da1f5ca14e2befeb3aca";
 
 fn sha(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))

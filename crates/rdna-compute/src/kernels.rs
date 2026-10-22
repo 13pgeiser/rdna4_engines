@@ -4432,7 +4432,7 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// (`gemm_mq6_i8::mq6_i8_pm_admits`).
 /// Default on exact gfx1201 where the launch meets those preconditions
 /// (`HIPFIRE_MQ6_I8_PM=0` keeps the hipcc kernel).
-/// SHA-256 f1bb1300944f2410f8af0e02b71db7f2af3925438326e992f6897cb88fd45f27
+/// SHA-256 af4142cabd70f923125fea1610223f370aaf088ebf27096a9b660f373d764e49
 /// (`sha256sum kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco`).
 pub const GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco");
