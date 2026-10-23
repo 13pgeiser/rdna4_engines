@@ -1898,7 +1898,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_norm_rope_batch_arena",
                 "gated_delta_gate_batched_rotate_arena",
                 "indexed_attention_cache_append_q8_batch_arena",
-                "hyper_write_bf16x8_gfx1201",
             ]
         );
         add!(

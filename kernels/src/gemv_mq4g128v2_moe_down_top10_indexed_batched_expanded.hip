@@ -165,6 +165,7 @@ static __device__ __forceinline__ void mq4g128v2_down_k640_rows(
     }
 }
 
+#ifndef QT53_DOWN_K640
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4(
     const unsigned long long* __restrict__ expert_ptrs, const int* __restrict__ topk_indices,
@@ -172,3 +173,4 @@ extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expande
     int k_top) {
     mq4g128v2_down_k640_rows<4>(expert_ptrs, topk_indices, rot_batch, expert_outputs, M, K, N, n_exp, k_top);
 }
+#endif
