@@ -22,7 +22,8 @@
       },
       "deadline_s": 280,
       "stderr_require": [
-        "kernels: Ar route preloaded",
+        "kernels: Ar route plan \\(\\d+ modules\\)",
+        "kernels: Ar route ready, open \\(never sealed\\): \\d+/\\d+ predicted .* compiled before ready .*; 0 unplanned kernel requests during load",
         "drafter=off"
       ],
       "loaded_expect": {
@@ -58,7 +59,8 @@
       },
       "deadline_s": 280,
       "stderr_require": [
-        "kernels: NativeMtp route preloaded",
+        "kernels: NativeMtp route plan \\(\\d+ modules\\)",
+        "kernels: NativeMtp route ready, open \\(never sealed\\): \\d+/\\d+ predicted .* compiled before ready .*; 0 unplanned kernel requests during load",
         "qwen4 native MTP speculator enabled",
         "drafter=mtp"
       ],

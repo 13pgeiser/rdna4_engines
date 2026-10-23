@@ -1604,6 +1604,14 @@ pub struct SlowlinkProfile {
     /// The quote this profile was admitted on. `placement.slack_bytes_at(resident_layers)`
     /// is [`Self::device_snapshot_budget_bytes`].
     pub placement: PlacementBudget,
+    /// The placement charges this profile was admitted under, exactly the
+    /// [`PlacementProjection::charges`] its joint reserve was quoted with: the
+    /// 512 MiB safety margin, NO dedicated long-prefill stage (an S1 load
+    /// charges its own page ring instead and creates no donor or slab stage),
+    /// and [`Self::reserve_bytes`] as the S1 census. The profile owns the
+    /// settled placement's charges; a loader that places exactly
+    /// [`Self::resident_layers`] records these, never a recomputation.
+    pub charges: crate::expert_residency::PlacementCharges,
     /// Device bytes the placement leaves free beyond every owned and budget
     /// charge AND the 512 MiB safety margin, at the admitted resident layers:
     /// exactly `placement.slack_bytes_at(resident_layers)` (actual free less
@@ -1941,6 +1949,7 @@ pub(crate) fn admit_at_tile(
         census: projection.census,
         granule: projection.granule,
         placement: projection.budget,
+        charges: projection.charges,
         device_snapshot_budget_bytes,
         resident_layers,
         baseline_layers: inputs.baseline_layers,
@@ -4783,6 +4792,39 @@ mod tests {
                 )
                 .unwrap() as u64,
                 layers
+            );
+        }
+    }
+
+    /// The profile OWNS the settled placement's charges: the margin (512 MiB),
+    /// no dedicated stage, and the S1 census as `slowlink`, the very charges its
+    /// joint reserve was quoted with. A loader that places the profile's
+    /// resident layers records `profile.charges` (never a recomputation, never
+    /// zero), and base + charges is exactly the admitted reserve.
+    #[test]
+    fn slowlink_profile_owns_its_settled_placement_charges() {
+        let probe = inputs(0);
+        for layers in [0u64, 8, 10, 12] {
+            let inputs = inputs(free_for(&probe, layers));
+            let profile = admit(&inputs).unwrap();
+            let charges = profile.charges;
+            assert_eq!(
+                charges.margin,
+                crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES
+            );
+            assert_eq!(charges.stage, 0, "an S1 load charges no dedicated stage");
+            assert_eq!(charges.slowlink, profile.reserve_bytes().unwrap());
+            assert_ne!(charges.slowlink, 0);
+            assert_eq!(
+                charges.reserve(inputs.base_reserve).unwrap(),
+                profile.placement.reserve_bytes,
+                "base + owned charges is the reserve the layers were quoted against"
+            );
+            assert_eq!(
+                charges,
+                PlacementCharges::new(LAYER, false)
+                    .unwrap()
+                    .with_slowlink(profile.reserve_bytes().unwrap())
             );
         }
     }
