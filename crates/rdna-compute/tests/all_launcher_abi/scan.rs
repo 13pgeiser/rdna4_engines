@@ -332,6 +332,28 @@ impl World {
                     continue;
                 }
             }
+            if callees && ts[k].is_id("match") {
+                if let Some(j) = (k + 1..ts.len()).find(|j| ts[*j].is_g('{')) {
+                    let arms = ts[j].group().unwrap();
+                    let nonempty = || arms.split(|t| t.is_p(',')).filter(|a| !a.is_empty());
+                    // Only discard selectors/patterns when they bind no values. Matches
+                    // such as `Some(entry) => entry` retain the conservative origin walk.
+                    if !arms.is_empty() && nonempty().all(|a| match_arm_value(a).is_some()) {
+                        for arm in nonempty() {
+                            self.resolve_go(
+                                match_arm_value(arm).unwrap(),
+                                ctx,
+                                sloc,
+                                depth,
+                                callees,
+                                res,
+                            );
+                        }
+                        skip_to = j + 1;
+                        continue;
+                    }
+                }
+            }
             match &ts[k] {
                 Tt::S(s, _) => {
                     res.lits.insert(s.clone());
@@ -756,6 +778,37 @@ pub fn unescape(s: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+// A binding-free pattern selects an arm, but cannot supply its kernel-name value.
+// Unrecognised patterns/guards fall back to the original conservative resolver.
+fn binding_free_pattern(pat: &[Tt]) -> bool {
+    if pat.len() == 1 {
+        return match &pat[0] {
+            Tt::Id(s, _) => matches!(s.as_str(), "_" | "true" | "false"),
+            Tt::N(_, _) | Tt::S(_, _) => true,
+            Tt::G('(', inner, _) => inner
+                .split(|t| t.is_p(','))
+                .filter(|p| !p.is_empty())
+                .all(binding_free_pattern),
+            _ => false,
+        };
+    }
+    // Qualified unit variants/constants, e.g. `DType::BF16`, introduce no binding.
+    pat.len() >= 4
+        && (pat.len() - 1) % 3 == 0
+        && pat[0].id().is_some()
+        && pat[1..]
+            .chunks_exact(3)
+            .all(|p| p[0].is_p(':') && p[1].is_p(':') && p[2].id().is_some())
+}
+
+fn match_arm_value(arm: &[Tt]) -> Option<&[Tt]> {
+    let arrow = arm
+        .windows(2)
+        .position(|p| p[0].is_p('=') && p[1].is_p('>'))?;
+    let value = &arm[arrow + 2..];
+    (binding_free_pattern(&arm[..arrow]) && !value.is_empty()).then_some(value)
 }
 
 fn is_skip_word(w: &str) -> bool {
