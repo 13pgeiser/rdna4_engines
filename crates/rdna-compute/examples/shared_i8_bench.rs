@@ -202,6 +202,19 @@ fn main() {
             gpu.qwen4_shared_i8_down(&w, &blocks, &out, n).unwrap();
         });
 
+        // The fused MoE front: its F16-X + IU4 producer with and without the A8 third output.
+        let front = if gpu.qwen4_moe_front_fuse_applies() {
+            let f0 = time_us(&mut gpu, |gpu| {
+                gpu.qwen4_moe_front_producer(&x, H, n).unwrap();
+            });
+            let f1 = time_us(&mut gpu, |gpu| {
+                gpu.qwen4_moe_front_producer_i8(&x, H, n).unwrap();
+            });
+            Some((f0, f1))
+        } else {
+            None
+        };
+
         // Analytic DRAM-ideal bytes per pass (weights excluded: 3.3 + 1.6 MB int8 vs 9.8 MB
         // F16 shadows, identical order on both sides and L2-resident).
         let f16_bytes = n * H * 2 // x16 read (gate/up)
@@ -226,11 +239,21 @@ fn main() {
             "  int8 chain {:7.1} / {:8.1}   (gate_up {:7.1}/{:7.1} [of which A8 producer {:6.1}/{:6.1}]  hidden {:6.1}/{:6.1}  down {:7.1}/{:7.1})",
             i8_chain.0, i8_chain.1, i8_gu.0, i8_gu.1, i8_prep.0, i8_prep.1, i8_hidden.0, i8_hidden.1, i8_down.0, i8_down.1
         );
+        if let Some((f0, f1)) = front {
+            let fused_chain = i8_chain.0 - i8_prep.0 + (f1.0 - f0.0);
+            println!(
+                "  front producer f16out {:7.1}/{:7.1}  f16out+A8 {:7.1}/{:7.1}  (+{:.1} us); int8 chain with the A8 riding the front: {:.1} us (min), speedup {:.3}x, saved {:.1} us/layer = {:.1} ms/48 layers",
+                f0.0, f0.1, f1.0, f1.1, f1.0 - f0.0, fused_chain,
+                f16_chain.0 / fused_chain,
+                f16_chain.0 - fused_chain,
+                (f16_chain.0 - fused_chain) * 48.0 / 1000.0,
+            );
+        }
         println!(
-            "  speedup (min) {:.3}x  saved {:.1} us/layer = {:.1} ms/40 layers   bytes f16 {:.1} MB int8 {:.1} MB (-{:.1} MB/layer)",
+            "  speedup (min) {:.3}x  saved {:.1} us/layer = {:.1} ms/48 layers   bytes f16 {:.1} MB int8 {:.1} MB (-{:.1} MB/layer)",
             f16_chain.0 / i8_chain.0,
             f16_chain.0 - i8_chain.0,
-            (f16_chain.0 - i8_chain.0) * 40.0 / 1000.0,
+            (f16_chain.0 - i8_chain.0) * 48.0 / 1000.0,
             f16_bytes as f64 / 1e6,
             i8_bytes as f64 / 1e6,
             (f16_bytes - i8_bytes) as f64 / 1e6,

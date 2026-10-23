@@ -560,6 +560,54 @@ fn main() {
                 maxt = maxt.max(o.abs());
             }
         }
+        // Stage attribution: INT8 gate/up + F16 down (hidden from the INT8 GEMM), and F16 gate/up +
+        // INT8 down (the F16 hidden through the INT8 hidden producer and down GEMM).
+        let mut hid_i8_f32 = gpu.zeros(&[n * I], DType::F32).unwrap();
+        {
+            let v: Vec<f32> = hid_bits.iter().map(|&b| bf16_f32(b)).collect();
+            hid_i8_f32 = gpu.upload_f32(&v, &[n * I]).unwrap();
+        }
+        let outa = gpu.zeros(&[n * H], DType::F32).unwrap();
+        gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&down, &outa, H)], &hid_i8_f32, I, n)
+            .unwrap();
+        let outa_f = le_f32(&download_raw(&gpu, outa.buf.as_ptr(), n * H * 4));
+        let h16_f = le_f32(&download_raw(&gpu, h16.buf.as_ptr(), n * I * 4));
+        let h16_bits: Vec<u16> = h16_f.iter().map(|&v| (v.to_bits() >> 16) as u16).collect();
+        let h16_bf = upload_bf16(&mut gpu, &h16_bits);
+        let blocks_b = gpu.zeros(&[n * I], DType::F32).unwrap();
+        let selb = gpu.upload_f32(&sel_host[..n], &[n]).unwrap();
+        gpu.qwen4_shared_i8_hidden(&w, &h16_bf, &blocks_b, &selb, n)
+            .unwrap();
+        let outb = gpu.zeros(&[n * H], DType::F32).unwrap();
+        gpu.qwen4_shared_i8_down(&w, &blocks_b, &outb, n).unwrap();
+        let outb_f = le_f32(&download_raw(&gpu, outb.buf.as_ptr(), n * H * 4));
+        let (mut numa, mut numb) = (0f64, 0f64);
+        for &t in toks.iter().take(ntr) {
+            let xr = &x_host[t * H..(t + 1) * H];
+            let mut hid_t = vec![0f64; I];
+            for c in 0..I {
+                let (mut g, mut u) = (0f64, 0f64);
+                for k in 0..H {
+                    g += wg[c * H + k] as f64 * xr[k] as f64;
+                    u += wu[c * H + k] as f64 * xr[k] as f64;
+                }
+                let (g, u) = (bf16_rt(g as f32) as f64, bf16_rt(u as f32) as f64);
+                hid_t[c] = bf16_rt(((g / (1.0 + (-g).exp())) * u) as f32) as f64;
+            }
+            for r in 0..H {
+                let mut o = 0f64;
+                for c in 0..I {
+                    o += wd[r * I + c] as f64 * hid_t[c];
+                }
+                numa += (outa_f[t * H + r] as f64 - o).powi(2);
+                numb += (outb_f[t * H + r] as f64 - o).powi(2);
+            }
+        }
+        println!(
+            "NUMERIC-STAGES rows={n} rel_rms int8 gate/up + f16 down={:.3e}  f16 gate/up + int8 down={:.3e}",
+            (numa / den).sqrt(),
+            (numb / den).sqrt()
+        );
         let line = format!(
             "NUMERIC rows={n} tokens={ntr} rel_rms int8={:.3e} f16={:.3e} int8_vs_f16={:.3e} | max_abs/max|ref| int8={:.3e} f16={:.3e}",
             (num8 / den).sqrt(),
