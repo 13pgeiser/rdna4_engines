@@ -52,6 +52,7 @@ pub mod blocks;
 pub mod epilogue;
 pub mod fold;
 pub mod kloop;
+pub mod nr_epilogue;
 pub mod prologue;
 pub mod publish;
 pub mod spec;
@@ -402,11 +403,15 @@ impl Gen {
         // Decode / meta scratch: y, z singles, the (p0, p1) pair, the o0 pair, x, w singles.
         p.v::<8>("scratch", self.scratch, kernel())?;
         // Epilogue: temporaries over the dead int32 accumulators and F0/F1.
-        for i in 0..16u8 {
-            p.v::<4>("epi_quad", self.cacc + 4 * i, epi())?;
-        }
-        for i in 0..24u8 {
-            p.v::<1>("epi_tmp", self.f[0] + i, epi())?;
+        if self.spec.epi == Epi::SetNr {
+            nr_epilogue::plan(&mut p, self)?;
+        } else {
+            for i in 0..16u8 {
+                p.v::<4>("epi_quad", self.cacc + 4 * i, epi())?;
+            }
+            for i in 0..24u8 {
+                p.v::<1>("epi_tmp", self.f[0] + i, epi())?;
+            }
         }
         // SGPRs.
         p.s::<2>("kernarg_ptr", self.karg, Live::Whole)?;
@@ -504,8 +509,12 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         op(wg.isa(), "s_setprio 1", &[], &[])?;
     }
     let lds = prologue::emit(&mut wg, &g, &end, lds)?;
-    let _lds = kloop::emit(&mut wg, &g, lds)?;
-    epilogue::emit(&mut wg, &g, &end)?;
+    let lds = kloop::emit(&mut wg, &g, lds)?;
+    if spec.epi == Epi::SetNr {
+        nr_epilogue::emit(&mut wg, &g, lds)?;
+    } else {
+        epilogue::emit(&mut wg, &g, &end)?;
+    }
     wg.end(end)?;
     b.finish()
 }
@@ -569,11 +578,13 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
 }
 
 /// The product module: both epilogue symbols (banded raster) on the shipped 128x128 tile (the
-/// unsuffixed symbols) and on the 128x256 tile (`_t128x256`, the host's default for wide N).
+/// unsuffixed symbols) and on the 128x256 tile (`_t128x256`, the host's default for wide N), then
+/// the QSA norm+RoPE entry (`set_nr`, 256x128 tile).
 pub fn emit_module(arch: crate::Arch) -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let emitted = [spec::Tile::T128x128, spec::Tile::T128x256]
         .into_iter()
         .flat_map(|tile| [Epi::Set, Epi::SetBf16].map(|epi| (tile, epi)))
+        .chain([(spec::Tile::T256x128, Epi::SetNr)])
         .map(|(tile, epi)| {
             emit(Spec {
                 epi,
