@@ -368,7 +368,10 @@ int PrefixCache::insert(uint64_t session,
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
-        if (it != map_.end() && it->second.in_lru) continue;     /* touched below */
+        /* A snapshot-backed prefix keeps its first bytes even in the host tier: a short
+         * recompute can round the KV differently, while older conversations' recurrent snapshots
+         * still depend on the original attention KV. Non-stateful caches may rebind below. */
+        if (it != map_.end() && (it->second.in_lru || has_linear_)) continue; /* touched below */
         if (it != map_.end()) {
             /* An off-device entry this request recomputed (a restore that did not fit, or a chain
              * cut short). Its blocks become the entry's device copy and the tier copy goes

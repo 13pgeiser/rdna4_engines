@@ -3358,6 +3358,48 @@ TEST(dropping_a_clean_entry_gives_its_vram_back_and_keeps_it_restorable) {
     CHECK_EQ(x.f.pc.drop_clean(), 0);               /* nothing left to drop */
 }
 
+TEST(a_recomputed_shared_prefix_keeps_its_original_host_copy_and_snapshot) {
+    /* A short request shares less than one checkpoint with an off-device conversation, so it
+     * recomputes instead of adopting that prefix. Its different prefill shape can round the KV
+     * differently. Publishing it must not replace the original bytes underneath the longer
+     * conversation's still-valid recurrent snapshot. Device-resident entries already keep the
+     * first copy; host-resident entries must obey the same rule. */
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto prompt = tok_run(7600, 336);
+    const auto keys = chain_of(prompt);
+    publish(x.f, 1, prompt, 320);
+    const int32_t snapshot = ckpt_at(x.f, 1, keys, 320);
+    x.f.kv.free_sequence(1);
+
+    const auto copied = copy_now(x.t);
+    REQUIRE_EQ(copied.size(), 20u);
+    const int32_t host_slot = copied[0].host_slot;
+    REQUIRE(host_slot >= 0);
+    std::memset(x.t.arena().at(host_slot), 0x5a, 1024);
+    CHECK_EQ(x.f.pc.drop_clean(), 20);
+    CHECK_EQ(x.t.arena().used_slots(), 20ll);
+
+    std::vector<int32_t> short_prompt(prompt.begin(), prompt.begin() + 32);
+    const auto tail = tok_run(9600, 32);
+    short_prompt.insert(short_prompt.end(), tail.begin(), tail.end());
+    CHECK_EQ(x.f.pc.lookup(short_prompt, {}).n_linear_tokens, 0);
+    publish(x.f, 2, short_prompt, 64);
+    x.f.kv.free_sequence(2);
+
+    CHECK(x.t.resident_off_device(keys[0]));
+    CHECK(x.t.resident_off_device(keys[1]));
+    CHECK_EQ(x.t.arena().used_slots(), 20ll);
+    CHECK_EQ(x.f.pc.restorable_from(prompt, {}).size(), 20u);
+    CHECK(x.f.kv.checkpoint_held(snapshot));
+    const auto* bytes = static_cast<const unsigned char*>(x.t.arena().at(host_slot));
+    for (int i = 0; i < 1024; ++i) CHECK_EQ(bytes[i], 0x5a);
+    TierJob restore;
+    CHECK(x.t.plan_promote(keys[0], &restore));
+    CHECK_EQ(restore.host_slot, host_slot);
+    x.t.report(restore, false);                  /* leave the unstarted restore in host memory */
+}
+
 TEST(an_entry_a_running_sequence_reads_is_dropped_once_the_sequence_lets_go) {
     /* Dropping a block a sequence also holds would free nothing while the entry read off-device,
      * so the next lookup would restore a second copy beside it. */
