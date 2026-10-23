@@ -19,6 +19,15 @@
  *   replace the image's placeholder embeddings (which the text model scales by sqrt(n_embd); the
  *   image rows are not scaled).
  *
+ * Clipped linears (vision_config.use_clipped_linears, Gemma 4 E2B/E4B): every projection clamps its
+ * input and its output to bounds the checkpoint stores (`<proj>.input_min/max`, `output_min/max`;
+ * transformers' Gemma4ClippableLinear). The tower keeps its fused q|k|v and gate|up GEMMs, so it
+ * takes the input bounds of q_proj (and of gate_proj) for the fused input, q_proj's output bounds for
+ * q's columns, k_proj's for k's and v's, and gate_proj's output bounds for gate|up. That is exact
+ * where the fused parts share their bounds, as NVIDIA's E4B does in all 16 layers (k and v share the
+ * input bounds of q and their output bounds, up shares gate's). The bound weights are one bf16
+ * element each, read by `clamp`.
+ *
  * One encoder pass carries RadBuildCtx::max_enc_patches patches over any number of segments (an
  * image, or one frame of a video). Every rank runs the whole tower (engine_mm.cpp), so its weights
  * are replicated (RAD_SHARD_NONE) and each rank writes the rows into its own copy of the embedding
@@ -41,8 +50,12 @@ struct Gemma4Vision {
         rad_weight pre_ff = 0, gate_up = 0, down = 0, post_ff = 0;
         rad_op op_in = 0, op_qkv = 0, op_qk = 0, op_attn = 0, op_o = 0, op_pa = 0, op_add1 = 0;
         rad_op op_pf = 0, op_gu = 0, op_act = 0, op_down = 0, op_pff = 0, op_add2 = 0;
+        /* clipped linears: the bounds (lo, hi) of the nine clamps, and the clamps */
+        enum { C_QKV_IN, C_Q_OUT, C_KV_OUT, C_O_IN, C_O_OUT, C_GU_IN, C_GU_OUT, C_DN_IN, C_DN_OUT, C_N };
+        rad_weight lo[C_N] = {}, hi[C_N] = {};
+        rad_op     op_c[C_N] = {};
     };
-    bool on = false, standardize = false;
+    bool on = false, standardize = false, clip = false;
     int64_t P = 0, R = 0, width = 0, heads = 0, hd = 0, ff = 0, patch_dim = 0, pool = 0;
     int64_t npos = 0, n_embd = 0;
     rad_weight w_in = 0, w_px = 0, w_py = 0, w_proj = 0, w_sbias = 0, w_sscale = 0;
@@ -88,15 +101,14 @@ struct Gemma4Vision {
                     (long long)pool, (long long)depth);
             return RAD_E_INVAL;
         }
-        /* Clipped linears (their bounds are buffers the vision checkpoint states as infinite) and
-         * any rotary or activation other than the 2-D one and gelu-tanh are refused by name. */
-        if (rad_meta_geti(m, "vision_config.use_clipped_linears", 0) ||
-            (std::strcmp(rt, "default") && std::strcmp(rt, "axial")) ||
+        /* Any rotary or activation other than the 2-D one and gelu-tanh is refused by name. */
+        if ((std::strcmp(rt, "default") && std::strcmp(rt, "axial")) ||
             std::strcmp(act, "gelu_pytorch_tanh")) {
-            fprintf(stderr, "radiance: %s: this vision tower uses clipped linears, a '%s' rotary or "
-                            "a '%s' activation, which it does not serve\n", who, rt, act);
+            fprintf(stderr, "radiance: %s: this vision tower uses a '%s' rotary or a '%s' "
+                            "activation, which it does not serve\n", who, rt, act);
             return RAD_E_UNSUPPORTED;
         }
+        clip = rad_meta_geti(m, "vision_config.use_clipped_linears", 0) != 0;
         n_embd = model_embd;
         patch_dim = 3 * patch * patch;
         const int64_t kk = pool * pool;
@@ -154,6 +166,27 @@ struct Gemma4Vision {
             l.gate_up   = decl_w(b, nm.f("v.blk.%lld.gate_up", li),   RAD_BF16, {2 * ff, width}, A, N, g);
             l.down      = decl_w(b, nm.f("v.blk.%lld.down", li),      RAD_BF16, {width, ff}, A, N, g);
             l.post_ff   = decl_w(b, nm.f("v.blk.%lld.post_ff", li),   RAD_BF16, {width}, A, N, g);
+            if (clip) {
+                /* clamp k -> the checkpoint projection whose bound it takes, and which bound */
+                static const char* const proj[Layer::C_N] = {
+                    "self_attn.q_proj", "self_attn.q_proj", "self_attn.k_proj", "self_attn.o_proj",
+                    "self_attn.o_proj", "mlp.gate_proj", "mlp.gate_proj", "mlp.down_proj",
+                    "mlp.down_proj" };
+                static const bool in_side[Layer::C_N] = { true, false, false, true, false, true,
+                                                          false, true, false };
+                for (int k = 0; k < Layer::C_N; ++k) {
+                    const char* side = in_side[k] ? "input" : "output";
+                    const char* lo_n = nm.f("v.blk.%lld.clip%d.lo", li, k);
+                    const char* hi_n = nm.f("v.blk.%lld.clip%d.hi", li, k);
+                    RAD_ARCH_TRY(map_copy(b, lo_n, nm.ckpt("%s.encoder.layers.%lld.%s.%s_min", V, li,
+                                                           proj[k], side)));
+                    RAD_ARCH_TRY(map_copy(b, hi_n, nm.ckpt("%s.encoder.layers.%lld.%s.%s_max", V, li,
+                                                           proj[k], side)));
+                    l.lo[k] = decl_w(b, lo_n, RAD_BF16, {1}, A, N, g);
+                    l.hi[k] = decl_w(b, hi_n, RAD_BF16, {1}, A, N, g);
+                    if (!l.lo[k] || !l.hi[k]) return RAD_E_INVAL;
+                }
+            }
         }
 
         b_x    = decl_b(b, nm.f("v.x"),    RAD_BF16, {P, width});
@@ -198,6 +231,11 @@ struct Gemma4Vision {
                                      RAD_INT("vocab_offset", 0), RAD_F64("mult", 1.0)),
                           RAD_WEIGHTS(w));
         };
+        auto clamp = [&](int64_t n, rad_weight lo, rad_weight hi) {
+            return RAD_OP(b, "clamp", RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", n),
+                                                 RAD_STR("dtype", "bf16")),
+                          RAD_WEIGHTS(lo, hi));
+        };
         auto gain = [&](rad_weight w) {
             return RAD_OP(b, "mul_weight", RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", width),
                                                       RAD_STR("dtype", "bf16"), RAD_INT("scalar", 0)),
@@ -212,6 +250,19 @@ struct Gemma4Vision {
         char sec[48];
         std::snprintf(sec, sizeof sec, "%lld %lld", (long long)(hd / 4), (long long)(hd / 4));
         for (Layer& l : L) {
+            /* the clamps, each in place on the one buffer its linear reads or writes (each of those
+             * is read by that linear alone, or by what follows it) */
+            if (clip) {
+                using C = Layer;
+                const struct { int k; int64_t n; rad_buf buf; } cl[C::C_N] = {
+                    { C::C_QKV_IN, width, b_h }, { C::C_Q_OUT, width, b_qkv },
+                    { C::C_KV_OUT, 2 * width, b_qkv }, { C::C_O_IN, width, b_att },
+                    { C::C_O_OUT, width, b_o }, { C::C_GU_IN, width, b_h },
+                    { C::C_GU_OUT, 2 * ff, b_gu }, { C::C_DN_IN, ff, b_ff },
+                    { C::C_DN_OUT, width, b_o } };
+                for (const auto& e : cl)
+                    l.op_c[e.k] = rw(b, clamp(e.n, l.lo[e.k], l.hi[e.k]), {e.buf}, {e.buf});
+            }
             l.op_in   = rw(b, rms(P, l.in_norm), {b_x}, {b_h});
             l.op_qkv  = rw(b, gemm(P, 3 * width, width, l.qkv), {b_h}, {b_qkv});
             l.op_qk   = rw(b, RAD_OP(b, "qk_norm_rope",
@@ -272,10 +323,11 @@ struct Gemma4Vision {
         e.out         = b_out;
         RAD_ARCH_TRY(rad_declare_encoder(b, &e));
         rad_note(b, "vision tower: %lld layers of %lld (%lld heads x %lld), ff %lld, patch %lld, "
-                    "pooled %lldx%lld%s; %lld patches a pass -> %lld rows of %lld",
+                    "pooled %lldx%lld%s%s; %lld patches a pass -> %lld rows of %lld",
                  (long long)depth, (long long)width, (long long)heads, (long long)hd, (long long)ff,
                  (long long)patch, (long long)pool, (long long)pool,
-                 standardize ? ", standardised" : "", (long long)P, (long long)R,
+                 standardize ? ", standardised" : "", clip ? ", clipped linears" : "",
+                 (long long)P, (long long)R,
                  (long long)n_embd);
         on = true;
         return RAD_OK;
@@ -299,20 +351,33 @@ struct Gemma4Vision {
         RAD_ISSUE_N(c, op_py, Pn, praw(crd, RAD_I32, Pn), RAD_W(w_py), brows(b_py, Pn));
         RAD_ISSUE_N(c, op_padd, Pn, brows(b_px, Pn), brows(b_py, Pn), brows(b_px, Pn));
         RAD_ISSUE_N(c, op_add, Pn, brows(b_x, Pn), brows(b_px, Pn), brows(b_x, Pn));
+        /* a clamp of operand `x` in place, when the tower clips */
+        auto cl = [&](const Layer& l, int k, RadOperand x) {
+            if (clip) RAD_ISSUE_N(c, l.op_c[k], Pn, x, RAD_W(l.lo[k]), RAD_W(l.hi[k]), x);
+        };
         for (const Layer& l : L) {
             RAD_ISSUE_N(c, l.op_in, Pn, brows(b_x, Pn), RAD_W(l.in_norm), brows(b_h, Pn));
+            cl(l, Layer::C_QKV_IN, brows(b_h, Pn));
             RAD_ISSUE_N(c, l.op_qkv, Pn, brows(b_h, Pn), RAD_W(l.qkv), brows(b_qkv, Pn));
+            cl(l, Layer::C_Q_OUT, bcol(b_qkv, 0, width, Pn));
+            cl(l, Layer::C_KV_OUT, bcol(b_qkv, width, 2 * width, Pn));
             RAD_ISSUE_N(c, l.op_qk, Pn, brows(b_qkv, Pn), rc, RAD_W(l.q_norm), RAD_W(l.k_norm));
             RAD_ISSUE_N(c, l.op_attn, Pn, bcol(b_qkv, 0, width, Pn), bcol(b_qkv, width, width, Pn),
                         bcol(b_qkv, 2 * width, width, Pn), cu, brows(b_att, Pn));
+            cl(l, Layer::C_O_IN, brows(b_att, Pn));
             RAD_ISSUE_N(c, l.op_o, Pn, brows(b_att, Pn), RAD_W(l.o), brows(b_o, Pn));
+            cl(l, Layer::C_O_OUT, brows(b_o, Pn));
             RAD_ISSUE_N(c, l.op_pa, Pn, brows(b_o, Pn), RAD_W(l.post_attn), brows(b_o, Pn));
             RAD_ISSUE_N(c, l.op_add1, Pn, brows(b_x, Pn), brows(b_o, Pn), brows(b_x, Pn));
             RAD_ISSUE_N(c, l.op_pf, Pn, brows(b_x, Pn), RAD_W(l.pre_ff), brows(b_h, Pn));
+            cl(l, Layer::C_GU_IN, brows(b_h, Pn));
             RAD_ISSUE_N(c, l.op_gu, Pn, brows(b_h, Pn), RAD_W(l.gate_up), brows(b_gu, Pn));
+            cl(l, Layer::C_GU_OUT, brows(b_gu, Pn));
             RAD_ISSUE_N(c, l.op_act, Pn, bcol(b_gu, 0, ff, Pn), bcol(b_gu, ff, ff, Pn),
                         brows(b_ff, Pn));
+            cl(l, Layer::C_DN_IN, brows(b_ff, Pn));
             RAD_ISSUE_N(c, l.op_down, Pn, brows(b_ff, Pn), RAD_W(l.down), brows(b_o, Pn));
+            cl(l, Layer::C_DN_OUT, brows(b_o, Pn));
             RAD_ISSUE_N(c, l.op_pff, Pn, brows(b_o, Pn), RAD_W(l.post_ff), brows(b_o, Pn));
             RAD_ISSUE_N(c, l.op_add2, Pn, brows(b_x, Pn), brows(b_o, Pn), brows(b_x, Pn));
         }
