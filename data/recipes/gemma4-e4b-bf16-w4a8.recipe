@@ -1,0 +1,47 @@
+# gemma4-e4b-bf16-w4a8.recipe -- Gemma 4 E4B (text) from a bf16 checkpoint, e.g. NVIDIA's
+# Nemotron-3.5-Bolt-E4B: int4 codes with an f16 scale per 128 columns (w4a8) on the feed-forward,
+# int8 on the same grid (w8a8) for attention and for layers 19-23, an int8 lm_head. One card.
+#
+#   rad-convert <checkpoint> --recipe data/recipes/gemma4-e4b-bf16-w4a8.recipe \
+#       --set quantization_config.quant_method=compressed-tensors -o gemma4-e4b-w4a8.rad
+#
+# blk.N.attn_qkv is q|k|v of the 24 layers that keep a cache; the 18 KV-shared layers have q only
+# (blk.N.attn_q). The per-layer-embedding linears (ple_gate 256x2560, ple_proj 2560x256, the
+# 10752x2560 context projection) and the two embedding tables stay bf16: they are small, or read a
+# row a token from host memory. The lm_head (262144 x 2560, the largest read at decode) is int8.
+#
+# Why the int8 parts (wikitext-2 KL against the bf16 original, 25500 positions, KV bf16):
+#   everything int4                      0.612      everything int8          0.076
+#   attention int8, FFN int4             0.327      layers 19-23 int8        0.339
+#   attention + layers 19-23 int8        0.242   <- this recipe (3.16 GiB on the card)
+# Layers 19-22 amplify rounding at single tokens even in bf16; int4 there costs as much as int4 on
+# every attention linear.
+
+blk.19.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16
+blk.19.attn_o.weight       rtn  codes=i8 group=128 scale=f16
+blk.19.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=f16
+blk.19.ffn_down.weight     rtn  codes=i8 group=128 scale=f16
+blk.20.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16
+blk.20.attn_o.weight       rtn  codes=i8 group=128 scale=f16
+blk.20.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=f16
+blk.20.ffn_down.weight     rtn  codes=i8 group=128 scale=f16
+blk.21.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16
+blk.21.attn_o.weight       rtn  codes=i8 group=128 scale=f16
+blk.21.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=f16
+blk.21.ffn_down.weight     rtn  codes=i8 group=128 scale=f16
+blk.22.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16
+blk.22.attn_o.weight       rtn  codes=i8 group=128 scale=f16
+blk.22.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=f16
+blk.22.ffn_down.weight     rtn  codes=i8 group=128 scale=f16
+blk.23.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16
+blk.23.attn_o.weight       rtn  codes=i8 group=128 scale=f16
+blk.23.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=f16
+blk.23.ffn_down.weight     rtn  codes=i8 group=128 scale=f16
+
+blk.*.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16
+blk.*.attn_q.weight       rtn  codes=i8 group=128 scale=f16
+blk.*.attn_o.weight       rtn  codes=i8 group=128 scale=f16
+blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search
+
+output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
