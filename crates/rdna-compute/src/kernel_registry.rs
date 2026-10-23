@@ -7517,6 +7517,10 @@ fn walked_embedded_image(
                 "qwen4_moe_iu4_sym_w3_pm_gfx1201",
                 kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201,
             ),
+            (
+                "qwen4_moe_down_gp_pm_gfx1201",
+                kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
+            ),
             ("qsa_gather_pm_gfx1201", kernels::QSA_GATHER_PM_GFX1201),
             ("mq4_rows_x4_pm_gfx1201", kernels::MQ4_ROWS_X4_PM_GFX1201),
             (
