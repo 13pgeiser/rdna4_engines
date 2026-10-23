@@ -1447,6 +1447,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::FN_GDN_DENSE_SRC,
             [
                 "fn_gdn_dense_producer",
+                "fn_gdn_dense_producer_v2_f32",
+                "fn_gdn_dense_producer_v2_bf16",
                 "fn_gdn_dense_gate_bf16in",
                 "fn_gdn_dense_gate_i8",
                 "fn_gdn_dense_gate_rotate_bf16in"
@@ -3035,6 +3037,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "hyper_read_up_wmma_bf16_gfx1201",
                 "hyper_read_up_wmma_bf16_gfx1201_t128",
+                "hyper_read_up_wmma_bf16_gfx1201_v2",
             ]
         );
         add!(
@@ -7523,6 +7526,10 @@ fn walked_embedded_image(
             (
                 "qwen4_moe_down_gp_pm_gfx1201",
                 kernels::QWEN4_MOE_DOWN_GP_PM_GFX1201,
+            ),
+            (
+                "moe_rotate_i4_pm_gfx1201",
+                kernels::MOE_ROTATE_I4_PM_GFX1201,
             ),
             ("qsa_gather_pm_gfx1201", kernels::QSA_GATHER_PM_GFX1201),
             ("mq4_rows_x4_pm_gfx1201", kernels::MQ4_ROWS_X4_PM_GFX1201),

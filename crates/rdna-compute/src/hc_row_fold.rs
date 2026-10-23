@@ -305,6 +305,7 @@ impl Gpu {
         if !self.hc_row_fold_gfx1201_applies(p.rows, p.hidden, p.streams, p.shared_f32)
             || p.shared_f32.dtype != DType::F32
             || p.shared_f32.numel() < p.rows * p.hidden
+            || (p.grouped_down.buf.as_ptr() as usize) % 16 != 0
             || p.order.buf.size() < p.rows * 10 * 8
             || p.selector.numel() < p.rows
             || !self.hc_row_fold_gfx1201_tail_ok(
@@ -336,7 +337,7 @@ impl Gpu {
         let ngp = p.next_gates.buf.as_ptr();
         let nop = p.normalized_f16.buf.as_ptr();
         let hv = p.hidden as i32;
-        let lds = (p.hidden * 8 + 4 * 256 * 4 + p.hidden * 2 + 16) as u32;
+        let lds = (p.hidden * 8 + 4 * 256 * 4 + 16) as u32;
         let mut params = [
             &gp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
@@ -353,7 +354,7 @@ impl Gpu {
         self.launch_maybe_blob(
             ENTRY_MOE_GFX1201,
             [p.rows as u32, 1, 1],
-            [256, 1, 1],
+            [320, 1, 1],
             lds,
             &mut params,
             || {
@@ -408,7 +409,7 @@ impl Gpu {
         let ngp = p.next_gates.buf.as_ptr();
         let nop = p.normalized_f16.buf.as_ptr();
         let hv = p.hidden as i32;
-        let lds = (p.hidden * 8 + 4 * 256 * 4 + p.hidden * 2 + 16) as u32;
+        let lds = (p.hidden * 8 + 4 * 256 * 4 + 16) as u32;
         let mut params = [
             &mp as *const _ as *mut c_void,
             &stp as *const _ as *mut c_void,
@@ -422,7 +423,7 @@ impl Gpu {
         self.launch_maybe_blob(
             ENTRY_MIXER_GFX1201,
             [p.rows as u32, 1, 1],
-            [256, 1, 1],
+            [320, 1, 1],
             lds,
             &mut params,
             || {
