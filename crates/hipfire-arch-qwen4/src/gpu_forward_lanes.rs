@@ -1104,6 +1104,7 @@ impl SegViews {
         seg: Segment,
         ple_embed_dim: usize,
         bf16_streams: bool,
+        ple_normed_field: ScratchField,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let b = seg.begin;
         let wide = dims.wide();
@@ -1157,7 +1158,7 @@ impl SegViews {
             ple_key: rows(F::PleKey, wide)?,
             ple_value: rows(F::PleValue, hidden)?,
             ple_gated: rows(F::PleGated, wide)?,
-            ple_normed: rows(F::PleNormed, wide)?,
+            ple_normed: rows(ple_normed_field, wide)?,
             ple_output: rows(F::PleOutput, wide)?,
             embeddings: seg_flat(scratch, &scratch.embeddings, b * hidden, seg.rows * hidden),
             embedding_rot: seg_flat(
@@ -1627,6 +1628,7 @@ fn forward_lanes_scoped(
             fwd.scratch.max_chunk
         )));
     }
+    fwd.scratch.note_forward_rows(n);
     match out {
         StepOutputs::Ar(out) => {
             if out.logits.dtype != DType::F32 || out.logits.numel() < n * vocab {
@@ -1872,6 +1874,9 @@ fn forward_lanes_scoped(
                 // PP edges require packed BF16 rows; preserve the original
                 // single-scope scratch addressing without changing its ops.
                 bf16_state && !(band_scope.input && band_scope.output),
+                // Every segment of the step addresses the one field its
+                // total row count selects.
+                scratch.ple_normed_field(n),
             )?);
         }
         let seg_scratch: Vec<Qwen4LayerScratch<'_>> = views

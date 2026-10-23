@@ -12,14 +12,15 @@
 //!   and the barrier LDS-drain rule (`passes::barriers`), `s_clause` /
 //!   `s_delay_alu` windows and register resources. Every obligation fails
 //!   certification.
-//! - `lds_bounds`: every DS address register is evaluated for every lane of
-//!   every wave of the workgroup by executing the straight-line entry block
-//!   (up to the first label or branch) that derives it from the work-item id (kernel arguments and workgroup ids are
-//!   unknown and must not reach an address), and every DS access must end
-//!   inside the launch allocation.
+//! - `lds_bounds`: every DS address is evaluated for every lane of every
+//!   wave from the entry path, or independently rederived in its access's
+//!   block from the unchanged work-item id. Conditional branches directly
+//!   to `s_endpgm` do not bypass any continuing path's definitions. Unknown
+//!   inputs are refused unless an immediate mask bounds the address, and
+//!   every DS access must end inside the launch allocation.
 use crate::toolchain::Result;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 fn ir_arch(arch: &str) -> Result<peacemaker_ir::Arch> {
@@ -338,10 +339,11 @@ fn ds_ranges(name: &str, ops: &str) -> Option<Vec<(u32, u32)>> {
 }
 
 /// Every DS access of every lane of `waves` waves of `symbol` ends at or
-/// before `limit` bytes. Its address VGPR is either one the entry block (the
-/// straight-line code before the first label or branch) derives from the
-/// work-item id and which nothing after it redefines, or a masked address:
-/// in the access's own straight-line block its last definition is
+/// before `limit` bytes. Its address VGPR is either one the entry path (before
+/// the first label or branch, except conditional exits directly to `s_endpgm`)
+/// derives from the work-item id and which nothing after it redefines, one
+/// rederived in the access's block from the unchanged work-item id, or a
+/// masked address: in the access's own straight-line block its last definition is
 /// `v_and_b32_e32 vR, M, vX` with an immediate `M`, and nothing between them
 /// names `vR` except DS accesses addressed by it, so every lane's address is
 /// a submask of `M` (at most `M`, aligned to `M`'s trailing zeros). Returns
@@ -392,12 +394,31 @@ pub fn lds_bounds_host(
             Some((name, ops, rest))
         })
         .collect();
+    // An early refusal that only terminates the wave cannot bypass a
+    // definition on any path reaching LDS. All other branches still end
+    // entry evaluation, including forward branches that rejoin and back-edges.
+    let exits: BTreeSet<_> = lines
+        .windows(2)
+        .filter(|pair| pair[1].0 == "s_endpgm")
+        .filter_map(|pair| pair[0].0.strip_suffix(':'))
+        .collect();
     let head = lines
         .iter()
-        .position(|(n, _, _)| {
-            n.ends_with(':') || n.starts_with("s_branch") || n.starts_with("s_cbranch")
+        .position(|(n, _, rest)| {
+            n.ends_with(':')
+                || n.starts_with("s_branch")
+                || n.starts_with("s_cbranch") && !exits.contains(rest)
         })
         .ok_or("kernel has no block boundary")?;
+    // Conservatively refuse the work-item-id seed if any instruction could
+    // overwrite v0, including range and dual destinations.
+    let tid_immutable = lines.iter().all(|(name, ops, rest)| {
+        if name.starts_with("v_dual_") {
+            !names_vgpr(rest, 0)
+        } else {
+            !ops.first().is_some_and(|o| names_vgpr(o, 0))
+        }
+    });
     let mut end = 0u32;
     let mut checked = 0usize;
     let mut hosted = 0usize;
@@ -474,11 +495,26 @@ pub fn lds_bounds_host(
                 }
                 continue;
             }
-            if i > head
+            let redefined = i > head
                 && lines[head + 1..].iter().any(|(n2, o2, _)| {
                     n2.starts_with('v') && o2.first().and_then(|o| dst(o)) == Some(('v', reg))
+                });
+            let local = redefined
+                .then(|| {
+                    local_address(
+                        &lines,
+                        i,
+                        reg,
+                        if tid_immutable {
+                            std::array::from_fn(|l| Some(wave * 32 + l as u32))
+                        } else {
+                            [None; 32]
+                        },
+                        &exits,
+                    )
                 })
-            {
+                .flatten();
+            if redefined && local.is_none() {
                 let mask = masked_address(&lines, head, i, reg)
                     .ok_or_else(|| format!("LDS address v{reg} is redefined inside the K loop"))?;
                 for &(offset, width) in &ranges {
@@ -500,7 +536,7 @@ pub fn lds_bounds_host(
                 checked += 1;
                 continue;
             }
-            let addr = w.v.get(&reg).copied().unwrap_or([None; 32]);
+            let addr = local.unwrap_or_else(|| w.v.get(&reg).copied().unwrap_or([None; 32]));
             for (lane, value) in addr.iter().enumerate() {
                 let base = value.ok_or_else(|| format!("{name} {rest}: lane {lane} of wave {wave} has an address the prologue cannot derive"))?;
                 for &(offset, width) in &ranges {
@@ -531,6 +567,50 @@ pub fn lds_bounds_host(
     Ok((end, hosted))
 }
 
+fn names_vgpr(text: &str, reg: u16) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '[' || c == ']' || c == ':'))
+        .any(|t| {
+            t.strip_prefix('v').and_then(|n| n.parse::<u16>().ok()) == Some(reg)
+                || t.strip_prefix("v[")
+                    .and_then(|r| r.strip_suffix(']'))
+                    .and_then(|r| r.split_once(':'))
+                    .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
+                    .is_some_and(|(a, b)| a <= reg && reg <= b)
+        })
+}
+
+/// Replay only the access's block, with no values carried across its entry
+/// except an immutable work-item id. A fresh local definition may reuse a
+/// register that held an unrelated (e.g. global-memory) address in the K loop.
+fn local_address(
+    lines: &[(&str, Vec<&str>, &str)],
+    at: usize,
+    reg: u16,
+    tid: Lanes,
+    exits: &BTreeSet<&str>,
+) -> Option<Lanes> {
+    let start = lines[..at].iter().rposition(|(name, _, rest)| {
+        name.ends_with(':')
+            || name.starts_with("s_branch")
+            || name.starts_with("s_cbranch") && !exits.contains(rest)
+            || name.starts_with("s_setpc")
+            || name.starts_with("s_swappc")
+    })? + 1;
+    let mut w = Wave {
+        v: BTreeMap::from([(0, tid)]),
+        s: BTreeMap::new(),
+    };
+    for (name, ops, _) in &lines[start..at] {
+        if name.starts_with("v_dual_") {
+            w.v.clear();
+        } else {
+            step(&mut w, name, ops);
+        }
+    }
+    let addr = w.v.get(&reg).copied()?;
+    addr.iter().all(Option::is_some).then_some(addr)
+}
+
 /// The immediate mask `M` of the `v_and_b32_e32 vR, M, vX` that is the last
 /// definition of `vR` before line `at`, in the same straight-line block
 /// (after the entry block), when nothing between them names `vR` except DS
@@ -541,17 +621,7 @@ fn masked_address(
     at: usize,
     reg: u16,
 ) -> Option<u32> {
-    let names = |text: &str| {
-        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '[' || c == ']' || c == ':'))
-            .any(|t| {
-                t.strip_prefix('v').and_then(|n| n.parse::<u16>().ok()) == Some(reg)
-                    || t.strip_prefix("v[")
-                        .and_then(|r| r.strip_suffix(']'))
-                        .and_then(|r| r.split_once(':'))
-                        .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
-                        .is_some_and(|(a, b)| a <= reg && reg <= b)
-            })
-    };
+    let names = |text: &str| names_vgpr(text, reg);
     for j in (head + 1..at).rev() {
         let (name, ops, rest) = &lines[j];
         if name.ends_with(':')
@@ -606,6 +676,81 @@ mod tests {
         assert!(lds_bounds(&unknown, "k", 1, 1 << 20).is_err());
         let redefined = K.replace(".Lk_end:", "\tv_add_nc_u32_e32 v2, 8, v2\n.Lk_end:");
         assert!(lds_bounds(&redefined, "k", 1, 1 << 20).is_err());
+    }
+    /// Conditional refusals may precede the address setup: only their
+    /// fallthrough reaches LDS, so they do not end entry evaluation.
+    #[test]
+    fn early_exits_preserve_entry_address_proof() {
+        let guarded = K
+            .replace(
+                "\tv_and_b32_e32 v1",
+                "\ts_cmp_eq_u32 s8, 0\n\ts_cbranch_scc1 .Lexit\n\tv_and_b32_e32 v1",
+            )
+            .replace(
+                "\tv_readfirstlane_b32 s4",
+                "\ts_cmp_eq_u32 s9, 0\n\ts_cbranch_scc0 .Lexit\n\tv_readfirstlane_b32 s4",
+            )
+            .replace(".Lk_end:", ".Lexit:\n\ts_endpgm\n.Lk_end:");
+        assert_eq!(
+            lds_bounds(&guarded, "k", 2, 1024).unwrap(),
+            256 + 248 + 256 + 8
+        );
+        assert!(lds_bounds(&guarded, "k", 4, 1024).is_err());
+        // A rejoining branch may skip setup; a nonterminal target may still
+        // access LDS. Neither is an early exit. Real loop redefinitions,
+        // unknown inputs and out-of-bounds addresses must still fail.
+        for bad in [
+            guarded.replace("s_cbranch_scc1 .Lexit", "s_cbranch_scc1 .Lloop"),
+            guarded.replace(
+                ".Lexit:\n\ts_endpgm",
+                ".Lexit:\n\tds_load_b32 v9, v2\n\ts_endpgm",
+            ),
+            guarded.replace(
+                ".Lexit:",
+                "\tv_add_nc_u32_e32 v2, 8, v2\n\ts_branch .Lloop\n.Lexit:",
+            ),
+            guarded.replace(
+                "v_lshl_add_u32 v2, s4, 8, v1",
+                "v_lshl_add_u32 v2, s9, 8, v1",
+            ),
+            guarded.replace(
+                "v_lshl_add_u32 v2, s4, 8, v1",
+                "v_lshl_add_u32 v2, s4, 8, 0x100000",
+            ),
+        ] {
+            assert!(lds_bounds(&bad, "k", 2, 1024).is_err(), "{bad}");
+        }
+    }
+    /// A reused register can be independently rederived in a later block,
+    /// as in the HC partial-read epilogue. No unknown loop state is carried.
+    #[test]
+    fn local_addresses_are_rederived_from_immutable_thread_ids() {
+        let local = K.replace(
+            ".Lk_end:",
+            "\tv_add_nc_u32_e32 v9, s9, v1\n.Lepilogue:\n\tv_lshlrev_b32_e32 v9, 5, v0\n\ts_cbranch_execz .Lexit\n\tds_load_b128 v[16:19], v9\n\tds_load_b128 v[20:23], v9 offset:16\n.Lexit:\n\ts_endpgm\n.Lk_end:",
+        );
+        assert_eq!(lds_bounds(&local, "k", 2, 2048).unwrap(), 2048);
+        assert!(lds_bounds(&local, "k", 2, 2047).is_err());
+        for bad in [
+            local.replace("v9, 5, v0", "v9, 5, v8"),
+            local.replace("v9, 5, v0", "v9, 5, v9"),
+            local.replace("v9, 5, v0", "v9, 5, v0\n\tv_add_nc_u32_e32 v9, s9, v9"),
+            local.replace("v9, 5, v0", "v9, 5, v0\n.Ljoin:"),
+            local.replace("v9, 5, v0", "v9, 5, v0\n\ts_cbranch_scc1 .Lloop"),
+            local.replace(".Lepilogue:", "\tv_mov_b32_e32 v0, s9\n.Lepilogue:"),
+            local.replace(".Lepilogue:", "\tds_load_b64 v[0:1], v2\n.Lepilogue:"),
+            local.replace(
+                ".Lepilogue:",
+                "\tv_dual_mov_b32 v0, v8 :: v_dual_mov_b32 v9, v8\n.Lepilogue:",
+            ),
+            local.replace(
+                "\tds_load_b128 v[16:19], v9",
+                "\tv_dual_mov_b32 v9, v8 :: v_dual_mov_b32 v10, v8\n\tds_load_b128 v[16:19], v9",
+            ),
+            local.replace("v[16:19], v9", "v[8:11], v9"),
+        ] {
+            assert!(lds_bounds(&bad, "k", 2, 2048).is_err(), "{bad}");
+        }
     }
     /// ds_swizzle_b32 touches no LDS memory: its operand is lane data that
     /// the loop may redefine, and it adds nothing to the access bound.

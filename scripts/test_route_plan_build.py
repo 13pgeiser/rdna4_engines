@@ -237,6 +237,21 @@ class FlashNextBuilder(unittest.TestCase):
             self.assertFalse([l for l in plan if l.startswith(("#! heads", "#! mtp_layout", "#! sealed"))])
             self.assertIn("#! model_arch 16", plan)
 
+    def test_walk_receipts_keep_route_env_and_drop_host_run_noise(self):
+        env = {"HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_FABRIC_ADMISSION": "/state/card.json#7",
+               "HIPFIRE_TORCH_" + "PYTHON": "/env/bin/python", "HIPFIRE_HOME": "/run/home", "HIPFIRE_DEVICES": "GPU-x"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            model = root / "fn.hfq"
+            write_hfqm(model, 16, TRUNK)
+            lines = ["  qwen4 state: QSA fp8 K/V (vmm context storage), GDN q8 recurrent",
+                     *audit("gfx1201", [("add", "add_f32")], [])]
+            walk = make_walk(root, "fn", "ar", model, lines, env=env, max_seq=131072)
+            text = run_build(root / "plan.tsv", "--model", str(model), "--walk", f"ar={walk}")
+            receipt = [l for l in text.splitlines() if l.startswith("# walk ar fn ")]
+            self.assertEqual(len(receipt), 1)
+            self.assertIn('env={"HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_ROUTE_PLAN": "0"}', receipt[0])
+
 
 if __name__ == "__main__":
     unittest.main()

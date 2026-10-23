@@ -91,8 +91,8 @@
 //! is reported as `refused (...)`.
 
 use crate::common::{
-    emitted_object, emu_run, i4_record, no_leftover, put_f32, put_i32, put_ptr, put_u32, refused,
-    shipped_object, take_dim, Elem, EmuBuf, ShapeSpec, Xs64,
+    emitted_object, emu_run, i4_record, no_leftover, put_f32, put_i32, put_ptr, put_u32, read_rip,
+    refused, rip_object, shipped_object, take_dim, Elem, EmuBuf, RipSource, ShapeSpec, Xs64,
 };
 use crate::prod::{boxed, buffers_json, Covered, Expect, OutBuf, Producer, Ptrs};
 use crate::workload::{Knobs, Launch, Object, Result, Workload};
@@ -255,11 +255,24 @@ struct C8 {
     export: Export,
     shape: Shape,
     ref_rows: RefRows,
+    /// `--rip`: the candidate is this script's export, not the Rust emit.
+    rip: RipSource,
 }
 
-/// `--kernel iu4_c8_producer_pm`.
+/// `--kernel iu4_c8_producer_pm` (`rip` = `--rip FILE.rip`: the export's twin).
+#[cfg(test)]
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
-    Ok(boxed(C8::build(shape, knobs)?))
+    new_with_rip(shape, knobs, None)
+}
+
+pub fn new_with_rip(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
+    let mut c8 = C8::build(shape, knobs)?;
+    c8.rip = read_rip(rip)?;
+    Ok(boxed(c8))
 }
 
 impl C8 {
@@ -276,6 +289,7 @@ impl C8 {
             export,
             shape: parse_shape(export, shape)?,
             ref_rows,
+            rip: None,
         })
     }
 
@@ -329,6 +343,7 @@ impl C8 {
                 preset: "emu".into(),
             },
             ref_rows: RefRows::Full,
+            rip: self.rip.clone(),
         }
     }
 
@@ -444,6 +459,16 @@ impl Producer for C8 {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some(rip) = &self.rip {
+            return rip_object(
+                rip,
+                ARCH,
+                self.export.tag(),
+                self.export.symbol(),
+                &c8gen::emit(ARCH, self.export)?.s_text,
+                self.knobs_json(),
+            );
+        }
         let (_, text, _) = c8gen::emit_module(ARCH)?;
         let exports: Vec<String> = c8gen::module_exports()
             .iter()
@@ -1335,6 +1360,38 @@ mod tests {
         let want: Vec<usize> = (0..=16).chain([32]).chain(48..64).collect();
         assert_eq!(sample_rows(64, 4), want);
         assert_eq!(sample_rows(5, 2), [0, 1, 2, 3, 4]);
+    }
+
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/iu4_c8_producer.rip");
+
+    fn with_rip(export: &str, text: &str) -> C8 {
+        let mut w = c8(export, "");
+        w.rip = Some(("twin.rip".into(), text.into()));
+        w
+    }
+
+    #[test]
+    fn rip_twin_is_the_candidate_of_every_export_and_identical_to_the_generator() {
+        for export in ["rotate", "norm", "sigmoid_rotate", "norm_out"] {
+            let o = with_rip(export, TWIN).candidate().unwrap();
+            assert_eq!(o.exports, vec![o.launch_symbol.clone()], "{export}");
+            assert_eq!(o.desc["rip"]["identical_to_generator"], true, "{export}");
+            assert_eq!(o.desc["rip"]["variant"], export);
+            assert_eq!(&o.bytes[..4], b"\x7fELF");
+        }
+    }
+
+    #[test]
+    fn rip_moving_the_prefetch_keeps_the_abi_and_never_claims_identity() {
+        let edited = TWIN.replace(
+            "    c8::norm_prefetch(b)?;\n    c8::norm_sumsq(b)?;\n",
+            "    c8::norm_sumsq(b)?;\n    c8::norm_prefetch(b)?;\n",
+        );
+        assert_ne!(edited, TWIN);
+        let o = with_rip("norm", &edited).candidate().unwrap();
+        assert_eq!(o.desc["rip"]["identical_to_generator"], false);
+        let e = with_rip("norm", "fn emit(").candidate().unwrap_err();
+        assert!(!e.is_empty());
     }
 
     #[test]

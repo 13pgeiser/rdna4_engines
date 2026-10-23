@@ -315,6 +315,65 @@ pub fn emitted_object(
     })
 }
 
+/// `--rip FILE`: the script's path and text.
+pub type RipSource = Option<(String, String)>;
+
+/// Read the `--rip` script, if any.
+pub fn read_rip(rip: Option<&std::path::Path>) -> Result<RipSource> {
+    match rip {
+        Some(p) => Ok(Some((
+            p.display().to_string(),
+            std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// The candidate of a producer workload compiled from a `.rip` script: `peacemaker_rip::compile(source, arch,
+/// variant)`, refused (exit 3, stage `rip`) unless its kernel `symbol` and ABI (kernarg layout, workgroup size,
+/// LDS) equal those of the Rust emit of the same entry (`generator_s_text`), then linked with the native writer.
+/// `desc.rip` = `{path, sha256, variant, identical_to_generator}`.
+pub fn rip_object(
+    rip: &(String, String),
+    arch: peacemaker_isa::Arch,
+    variant: &str,
+    symbol: &str,
+    generator_s_text: &str,
+    knobs: Value,
+) -> Result<Object> {
+    let (path, source) = rip;
+    let compiled = peacemaker_rip::compile(source, arch, variant)?;
+    let elf = peacemaker_isa::native::assemble(&compiled.s_text, arch)?;
+    let gen_elf = peacemaker_isa::native::assemble(generator_s_text, arch)?;
+    let got = crate::iu4::abi_signature(&elf, symbol)
+        .map_err(|e| format!("compiled kernel does not expose {symbol}: {e}"))?;
+    let want = crate::iu4::abi_signature(&gen_elf, symbol)?;
+    if got != want {
+        return Err(format!(
+            "ABI mismatch with the Rust emit of {variant}:\n  .rip:      {got}\n  generator: {want}"
+        ));
+    }
+    Ok(Object {
+        source: json!({
+            "source": format!("peacemaker_rip::compile({path}) + native::assemble"),
+            "variant": variant,
+            "sha256": sha256_hex(&elf),
+        }),
+        desc: json!({
+            "knobs": knobs,
+            "rip": {
+                "path": path,
+                "sha256": sha256_hex(source.as_bytes()),
+                "variant": variant,
+                "identical_to_generator": compiled.s_text == generator_s_text,
+            },
+        }),
+        exports: vec![symbol.to_owned()],
+        launch_symbol: symbol.to_owned(),
+        bytes: elf,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Comparison
 

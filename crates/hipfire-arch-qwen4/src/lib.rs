@@ -83,6 +83,7 @@ mod slowlink_prefill;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
+pub mod sym_verdict_cache;
 pub mod trunk_overlay;
 pub mod weights;
 #[cfg(feature = "reference-parity")]

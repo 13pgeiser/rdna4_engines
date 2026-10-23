@@ -252,6 +252,7 @@ fn bind_bank_rows(
             &mut s.ple_query,
             &mut s.ple_gated,
             &mut s.ple_normed,
+            &mut s.ple_normed_wide,
             &mut s.ple_output,
             &mut s.router_logits,
             &mut s.moe_x_rot,

@@ -26,6 +26,7 @@ use hipfire_runtime::model_source::{SourceFormat, SourceIdentity, SourceRangeDes
 use hipfire_runtime::ple_hot_pack::PackOrder;
 use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
+use hipfire_runtime::verified_cache::StatKey;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::external_row_stride;
 use rdna_compute::{DType, Gpu};
@@ -1681,7 +1682,13 @@ pub fn routed_headers_symmetric(
     hfq: &HfqFile,
     manifest: &Qwen4Manifest,
 ) -> Result<bool, Qwen4ArtifactError> {
-    let names = manifest
+    routed_tensors_symmetric(hfq, &routed_scan_names(manifest))
+}
+
+/// The routed trunk gate/up and down tensor names [`routed_headers_symmetric`]
+/// scans, in manifest order.
+fn routed_scan_names(manifest: &Qwen4Manifest) -> Vec<&str> {
+    manifest
         .weights
         .iter()
         .filter(|entry| {
@@ -1690,8 +1697,103 @@ pub fn routed_headers_symmetric(
                     || entry.name.ends_with(ROUTED_DOWN_SUFFIX))
         })
         .map(|entry| entry.name.as_str())
-        .collect::<Vec<_>>();
-    routed_tensors_symmetric(hfq, &names)
+        .collect()
+}
+
+/// Lowercase hex SHA-256 over the sorted names, quant types, shapes and
+/// payload byte ranges of the tensors the scan reads; `None` when a name is
+/// missing from the container (the scan itself reports that error).
+fn routed_names_digest(hfq: &HfqFile, names: &[&str]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut sorted = names.to_vec();
+    sorted.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update((sorted.len() as u64).to_le_bytes());
+    for name in sorted {
+        let info = hfq.find_tensor_info(name)?;
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update([info.quant_type]);
+        digest.update((info.shape.len() as u64).to_le_bytes());
+        for dim in &info.shape {
+            digest.update(dim.to_le_bytes());
+        }
+        digest.update((info.data_offset as u64).to_le_bytes());
+        digest.update((info.data_size as u64).to_le_bytes());
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+/// [`routed_headers_symmetric`] with its verdict cached per model file (see
+/// [`crate::sym_verdict_cache`]): an in-process memo, and, when `home` is the
+/// hipfire home, the verdict file under it. A hit needs the same canonical
+/// `path`, stat key, scan version and routed tensor layout. An artifact with an
+/// overlay, or a path that cannot be canonicalized or stat'ed, scans every
+/// time. Logs one stderr line per file hit or scan; a memo hit is silent.
+pub fn routed_headers_symmetric_cached(
+    hfq: &HfqFile,
+    manifest: &Qwen4Manifest,
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Result<bool, Qwen4ArtifactError> {
+    use crate::sym_verdict_cache::{self as cache, Identity, Origin};
+    let names = routed_scan_names(manifest);
+    let identity = (!hfq.has_overlay())
+        .then(|| {
+            let path = std::fs::canonicalize(path).ok()?;
+            let stat = StatKey::of(&std::fs::metadata(&path).ok()?);
+            let names_digest = routed_names_digest(hfq, &names)?;
+            Some(Identity {
+                path,
+                stat,
+                names_digest,
+            })
+        })
+        .flatten();
+    let Some(identity) = identity else {
+        return routed_tensors_symmetric(hfq, &names);
+    };
+    let file = home.map(cache::cache_file_in_home);
+    let (symmetric, origin) = cache::verdict(
+        file.as_deref(),
+        Some(&cache::PROCESS_MEMO),
+        &identity,
+        || routed_tensors_symmetric(hfq, &names),
+    )?;
+    let shown = identity.path.display();
+    match origin {
+        Origin::Memo => {}
+        Origin::File => eprintln!("  qwen4 symmetric IU4 verdict: cached ({shown})"),
+        Origin::Scanned {
+            seconds,
+            stored: true,
+        } => {
+            eprintln!("  qwen4 symmetric IU4 verdict: scanned in {seconds:.1} s, cached ({shown})")
+        }
+        Origin::Scanned {
+            seconds,
+            stored: false,
+        } => eprintln!(
+            "  qwen4 symmetric IU4 verdict: scanned in {seconds:.1} s, not cached ({shown})"
+        ),
+    }
+    Ok(symmetric)
+}
+
+/// [`routed_headers_symmetric_cached`] for the artifact's own path and the
+/// hipfire home ([`hipfire_config::hipfire_home`]: `HIPFIRE_HOME`, else
+/// `$HOME/.hipfire`). The one entry every scan site calls.
+/// `HIPFIRE_QWEN4_SYM_VERDICT_CACHE=0` disables the file and the memo: every
+/// call scans.
+pub fn routed_headers_symmetric_verdict(
+    hfq: &HfqFile,
+    manifest: &Qwen4Manifest,
+) -> Result<bool, Qwen4ArtifactError> {
+    if !hipfire_config::developer_bool(crate::sym_verdict_cache::VERDICT_CACHE_ENV, true) {
+        return routed_headers_symmetric(hfq, manifest);
+    }
+    let home = hipfire_config::hipfire_home().ok();
+    routed_headers_symmetric_cached(hfq, manifest, hfq.path(), home.as_deref())
 }
 
 fn hotset_refusal(reason: impl fmt::Display) -> String {
@@ -1956,11 +2058,13 @@ pub fn ple_key_value_bf16(manifest: &Qwen4Manifest) -> bool {
     seen
 }
 
-/// The forward scratch plan one artifact is admitted to, decided from the
-/// actual source payload before any placement or allocation: the selector's
-/// cheap arch/flag checks run first, and the routed-header scan only when
-/// they could select the compact plan on the symmetric route.  A manifest
-/// whose recipe is `FlashNextSlab` is an expert-slab artifact with no scan:
+/// The forward scratch plan one artifact is first admitted to, decided before
+/// any placement or allocation and without touching the payload: the aggregate
+/// (non-slab) route is optimistic (the artifact is assumed symmetric IU4), so
+/// the plan is compact exactly when the device, flag and profile terms allow
+/// it.  The proof is the GPU symmetry check in `Qwen4GpuForward::new_inner`;
+/// a compact attach it refuses is re-planned Full by `attach_forward`.  A
+/// manifest whose recipe is `FlashNextSlab` is an expert-slab artifact:
 /// [`crate::weights`] replaces every trunk routed aggregate by its layer's
 /// arena or refuses the manifest, so every routed trunk layer is a slab arena
 /// (the MTP head's experts live in the separate MTP forward).  Every
@@ -1968,7 +2072,7 @@ pub fn ple_key_value_bf16(manifest: &Qwen4Manifest) -> bool {
 /// exactly this mode.
 pub fn source_forward_scratch_mode(
     gpu: &Gpu,
-    hfq: &HfqFile,
+    _hfq: &HfqFile,
     config: &Qwen4Config,
     manifest: &Qwen4Manifest,
 ) -> Result<Qwen4ForwardScratchMode, Qwen4ArtifactError> {
@@ -1977,25 +2081,9 @@ pub fn source_forward_scratch_mode(
         manifest.identity.recipe,
         crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }
     );
-    select_source_scratch_mode(
-        slab,
-        |symmetric| qwen4_forward_scratch_mode(gpu, config, symmetric, slab, ple_bf16),
-        || routed_headers_symmetric(hfq, manifest),
-    )
-}
-
-// Only a potentially compact aggregate route needs payload proof. Keep the
-// selector injected so the scan boundary can be exercised without a GPU.
-fn select_source_scratch_mode<E>(
-    slab: bool,
-    select: impl Fn(bool) -> Qwen4ForwardScratchMode,
-    scan: impl FnOnce() -> Result<bool, E>,
-) -> Result<Qwen4ForwardScratchMode, E> {
-    let possible = select(true);
-    if possible == Qwen4ForwardScratchMode::Full || slab {
-        return Ok(possible);
-    }
-    Ok(select(scan()?))
+    Ok(qwen4_forward_scratch_mode(
+        gpu, config, true, slab, ple_bf16,
+    ))
 }
 
 /// The geometry facts of a PLE table header that admission checks against the
@@ -2351,13 +2439,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn source_scratch_scan_matches_beta_for_every_route() {
+    fn source_scratch_selection_is_optimistic_for_every_route() {
         use crate::gpu_forward::CompactScratchTerms;
-        use std::cell::Cell;
 
         let mut cases = 0;
         for knob in [None, Some(false), Some(true)] {
-            for bits in 0..128 {
+            for bits in 0..64 {
                 let terms = CompactScratchTerms {
                     knob,
                     exact_gfx1201: bits & 1 != 0,
@@ -2366,55 +2453,25 @@ mod tests {
                     source_slab: bits & 8 != 0,
                     ple_key_value_bf16: bits & 16 != 0,
                     flash_next_profile: bits & 32 != 0,
-                    source_symmetric: bits & 64 != 0,
-                };
-                let select = |source_symmetric| {
-                    CompactScratchTerms {
-                        source_symmetric,
-                        ..terms
-                    }
-                    .mode()
-                };
-                // Beta first assumed slab + BF16 PLE, then used the real route.
-                let cheap_beta = CompactScratchTerms {
                     source_symmetric: true,
-                    source_slab: true,
-                    ple_key_value_bf16: true,
+                };
+                // The aggregate path selects with the artifact assumed
+                // symmetric; the slab path ignores symmetry entirely.
+                let optimistic = terms.mode();
+                let pessimistic = CompactScratchTerms {
+                    source_symmetric: false,
                     ..terms
                 }
                 .mode();
-                let beta = if cheap_beta == Qwen4ForwardScratchMode::Full {
-                    cheap_beta
-                } else {
-                    select(terms.ple_key_value_bf16 && !terms.source_slab && terms.source_symmetric)
-                };
-                let scans = Cell::new(0);
-                let actual = select_source_scratch_mode(terms.source_slab, select, || {
-                    scans.set(scans.get() + 1);
-                    Ok::<_, ()>(terms.source_symmetric)
-                })
-                .unwrap();
-                assert_eq!(actual, beta, "{terms:?}");
-                let needs_proof =
-                    !terms.source_slab && select(true) != Qwen4ForwardScratchMode::Full;
-                assert_eq!(scans.get(), usize::from(needs_proof), "{terms:?}");
-
-                // Unreadable payloads matter only when aggregate proof is needed.
-                let errors = Cell::new(0);
-                let result = select_source_scratch_mode(terms.source_slab, select, || {
-                    errors.set(errors.get() + 1);
-                    Err("unreadable payload")
-                });
-                assert_eq!(errors.get(), usize::from(needs_proof), "{terms:?}");
-                if needs_proof {
-                    assert_eq!(result, Err("unreadable payload"));
-                } else {
-                    assert_eq!(result, Ok(beta), "{terms:?}");
+                if terms.source_slab {
+                    assert_eq!(optimistic, pessimistic, "{terms:?}");
+                } else if optimistic != Qwen4ForwardScratchMode::Full {
+                    assert_eq!(pessimistic, Qwen4ForwardScratchMode::Full, "{terms:?}");
                 }
                 cases += 1;
             }
         }
-        assert_eq!(cases, 384);
+        assert_eq!(cases, 192);
     }
 
     fn slab_metadata() -> String {

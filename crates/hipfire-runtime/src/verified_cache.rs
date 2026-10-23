@@ -172,7 +172,7 @@ impl VerifiedCache {
                     .map_or(0, |elapsed| elapsed.as_secs()),
             },
         );
-        let _ = write_atomically(
+        let _ = write_json_atomically(
             file,
             &CacheFile {
                 version: CACHE_VERSION,
@@ -186,7 +186,10 @@ fn key_of(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn write_atomically(file: &Path, cache: &CacheFile) -> std::io::Result<()> {
+/// Serialize `cache` as pretty JSON to `file` atomically: parent directories
+/// are created, the bytes go to a process-unique temporary file beside `file`,
+/// and a rename publishes them. A failure removes the temporary file.
+pub fn write_json_atomically<T: Serialize>(file: &Path, cache: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(cache).map_err(std::io::Error::other)?;
     if let Some(parent) = file.parent() {
         fs::create_dir_all(parent)?;
