@@ -61,7 +61,7 @@ pub(crate) mod groups;
 use groups::GroupPlanner;
 
 /// Most lanes one store holds.
-const MAX_LANES: usize = 64;
+pub(crate) const MAX_LANES: usize = 64;
 
 /// Topology of THIS rank's bundle. Expert parallelism is read from the
 /// rank's own weights (peers hold no root `bundle.ep`); a band that is not the

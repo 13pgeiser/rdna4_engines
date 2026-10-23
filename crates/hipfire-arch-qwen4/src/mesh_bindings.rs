@@ -654,14 +654,13 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
         // history and QSA marks from its own ticket and captured rows, and (on
         // the input band, the only one with a PLE history) the PLE
         // convolution input rows its own forward normalized for the block.
+        let ple_normed = rank
+            .forward
+            .scratch
+            .ple_normed_for_rollback()
+            .map_err(|error| format!("Qwen4 band {owner} row repair: {error}"))?;
         rank.bundle
-            .rollback_verify_rows_retain_with(
-                gpu,
-                local,
-                keep,
-                tokens,
-                &rank.forward.scratch.ple_normed,
-            )
+            .rollback_verify_rows_retain_with(gpu, local, keep, tokens, ple_normed)
             .map_err(|error| format!("Qwen4 band {owner} row repair: {error}"))
     }
     fn capture_session_rank(

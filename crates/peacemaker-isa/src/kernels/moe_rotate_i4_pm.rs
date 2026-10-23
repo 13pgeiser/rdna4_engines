@@ -120,43 +120,91 @@ pub fn symbol_gp(arch: Arch) -> String {
 }
 
 fn emit_impl(spec: Spec, gp: bool) -> Result<Emitted, String> {
-    let kernargs = KernargLayout::new(KERNARG_BYTES)
-        .pointer_access("h", 0, Access::ReadOnly)
-        .pointer_access("sorted", 8, Access::ReadOnly)
-        .pointer_access("xq", 16, Access::WriteOnly)
-        .pointer_access("signs1", 24, Access::ReadOnly)
-        .pointer_access("signs2", 32, Access::ReadOnly)
-        .hidden("K", 40, 4, "by_value")
-        .hidden("P", 44, 4, "by_value")
-        .hidden("L", 48, 4, "by_value");
-    let kspec = KernelSpec {
-        kernel_id: "moe_rotate_i4_pm".into(),
-        variant: if gp {
-            format!("{}_gp", spec.tag())
-        } else {
-            spec.tag().into()
-        },
-        arch: spec.arch,
-        symbol: if gp {
-            symbol_gp(spec.arch)
-        } else {
-            spec.symbol()
-        },
-        kernargs,
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: WORKGROUP_SIZE as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, plan()?);
+    let g = blocks::Gen::new(spec, gp)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     b.enable_delay_alu();
-    prologue(&mut b, gp)?;
-    let e = a4::rotate(&mut b)?;
-    a4::quantize(&mut b, e)?;
-    a4::store(&mut b)?;
+    blocks::prologue(&mut b, &g)?;
+    let e = blocks::rotate(&mut b)?;
+    blocks::quantize(&mut b, e)?;
+    blocks::store(&mut b)?;
     b.finish()
+}
+
+/// The emit's phases as public blocks: the sequence in [`emit_impl`] is the sequence the `.rip` twin
+/// (`moe_rotate_i4_pm.rip`) writes, call for call, over the `rot::*` natives. `rotate`, `quantize` and `store`
+/// are `mq_i4_a4`'s (the file this kernel shares its arithmetic with); only the prologue is this kernel's.
+pub mod blocks {
+    use super::*;
+
+    /// One entry: the flat-slot producer (`gp = false`) or its grouped-position twin.
+    pub struct Gen {
+        spec: Spec,
+        gp: bool,
+    }
+
+    impl Gen {
+        pub fn new(spec: Spec, gp: bool) -> Result<Gen, String> {
+            spec.validate()?;
+            Ok(Gen { spec, gp })
+        }
+        pub fn gp(&self) -> bool {
+            self.gp
+        }
+        pub fn plan(&self) -> Result<crate::RegPlan, String> {
+            super::plan()
+        }
+        pub fn kernel_spec(&self) -> KernelSpec {
+            let spec = self.spec;
+            let kernargs = KernargLayout::new(KERNARG_BYTES)
+                .pointer_access("h", 0, Access::ReadOnly)
+                .pointer_access("sorted", 8, Access::ReadOnly)
+                .pointer_access("xq", 16, Access::WriteOnly)
+                .pointer_access("signs1", 24, Access::ReadOnly)
+                .pointer_access("signs2", 32, Access::ReadOnly)
+                .hidden("K", 40, 4, "by_value")
+                .hidden("P", 44, 4, "by_value")
+                .hidden("L", 48, 4, "by_value");
+            KernelSpec {
+                kernel_id: "moe_rotate_i4_pm".into(),
+                variant: if self.gp {
+                    format!("{}_gp", spec.tag())
+                } else {
+                    spec.tag().into()
+                },
+                arch: spec.arch,
+                symbol: if self.gp {
+                    symbol_gp(spec.arch)
+                } else {
+                    spec.symbol()
+                },
+                kernargs,
+                user_sgpr_count: 2,
+                system_sgpr_workgroup_id_y: true,
+                workgroup_size: WORKGROUP_SIZE as u16,
+                group_segment_fixed_size: 0,
+                wave32: true,
+                cu_mode: false,
+            }
+        }
+    }
+
+    /// Kernel arguments, the (row, group) of the workgroup and its exits, the row's slot, the h / xq pointers and
+    /// the lane setup and loads.
+    pub fn prologue(b: &mut Builder, g: &Gen) -> R {
+        super::prologue(b, g.gp)
+    }
+    /// The FWHT128 rotation (`mq_i4_a4::rotate`); returns the four registers `quantize` reads.
+    pub fn rotate(b: &mut Builder) -> Result<[u8; 4], String> {
+        a4::rotate(b)
+    }
+    /// The `{5,7}` two-candidate quantizer.
+    pub fn quantize(b: &mut Builder, e: [u8; 4]) -> R {
+        a4::quantize(b, e)
+    }
+    /// The record store (and the exit).
+    pub fn store(b: &mut Builder) -> R {
+        a4::store(b)
+    }
 }
 
 /// The module as one code object (`Spec::module`).

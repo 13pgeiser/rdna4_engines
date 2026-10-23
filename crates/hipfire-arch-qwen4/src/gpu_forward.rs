@@ -287,8 +287,9 @@ fn qwen4_scoped_verify_rows(
 /// `FnSymGfx1201` is the proven-route plan of a gfx1201 Flash-Next artifact
 /// whose routed headers are all symmetric: the MoE buffers are sized for the
 /// symmetric IU4 prefill route plus a [`QWEN4_COMPACT_FALLBACK_ROWS`]-row F32
-/// fallback, and eight phase-disjoint fields borrow their storage from an
-/// owner (see [`Qwen4GpuForwardScratch::plan`]).  Both modes run identical
+/// fallback, and the step-local fields of the GDN, QSA, HC, PLE, MoE and
+/// embedding steps share one phase arena (see
+/// [`Qwen4GpuForwardScratch::plan`]).  Both modes run identical
 /// arithmetic; the mode only changes where intermediates live, so it must be
 /// decided before expert placement and frozen for the forward's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,6 +353,12 @@ pub const QWEN4_COMPACT_FALLBACK_ROWS: usize = 512;
 /// for symmetric-IU4 ones), `1` forces it on where the route is eligible, `0`
 /// keeps the full allocation plan (the IU4 math stays enabled either way).
 pub const QWEN4_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_QWEN4_COMPACT_SCRATCH";
+
+/// Developer knob: make the compact-scratch acceptance check in
+/// `Qwen4GpuForward::new_inner` fail as if one routed layer were unverified
+/// (default off).  Per-layer verification and routes are unchanged, so the
+/// Full fallback computes exactly what a Full-mode run computes.
+pub const QWEN4_COMPACT_FORCE_UNVERIFIED_ENV: &str = "HIPFIRE_QWEN4_COMPACT_FORCE_UNVERIFIED";
 
 /// Pure predicate of [`qwen4_forward_scratch_mode`]: every term must hold
 /// for the compact plan.
@@ -797,6 +804,13 @@ pub enum Qwen4GpuForwardError {
     Hip(hip_bridge::HipError),
     Weights(WeightError),
     Invalid(String),
+    /// The compact scratch plan was selected before the payload was proven
+    /// symmetric and the GPU check verified fewer routed layers than it needs.
+    /// Everything `new_inner` allocated was released before this was returned.
+    CompactUnverified {
+        verified: usize,
+        total: usize,
+    },
     Dispatch(String),
     Ple(String),
 }
@@ -807,6 +821,11 @@ impl fmt::Display for Qwen4GpuForwardError {
             Self::Hip(error) => write!(f, "Qwen4 GPU forward HIP error: {error}"),
             Self::Weights(error) => write!(f, "Qwen4 GPU forward weights error: {error}"),
             Self::Invalid(error) => write!(f, "Qwen4 GPU forward invalid input: {error}"),
+            Self::CompactUnverified { verified, total } => write!(
+                f,
+                "Qwen4 GPU forward: compact scratch was selected, but the GPU symmetry check \
+                 verified only {verified}/{total} layers symmetric"
+            ),
             Self::Dispatch(error) => write!(f, "Qwen4 GPU forward dispatch error: {error}"),
             Self::Ple(error) => write!(f, "Qwen4 GPU forward PLE error: {error}"),
         }
@@ -5580,6 +5599,7 @@ pub(crate) enum ScratchField {
     PleQuery,
     PleGated,
     PleNormed,
+    PleNormedWide,
     PleOutput,
     RouterLogits,
     MoeXRot,
@@ -5643,6 +5663,7 @@ impl ScratchField {
         Self::PleQuery,
         Self::PleGated,
         Self::PleNormed,
+        Self::PleNormedWide,
         Self::PleOutput,
         Self::RouterLogits,
         Self::MoeXRot,
@@ -5693,6 +5714,7 @@ impl ScratchField {
             | Self::PleQuery
             | Self::PleGated
             | Self::PleNormed
+            | Self::PleNormedWide
             | Self::PleOutput => L::PrepareAndFragment,
             Self::Projection
             | Self::Projection2
@@ -5806,6 +5828,9 @@ pub(crate) struct ScratchSlot {
     pub dtype: DType,
     pub owner: Option<ScratchField>,
     pub pitch: Option<usize>,
+    /// Elements into the owner's allocation where this view starts; zero for
+    /// owners and every `Full`-mode slot.
+    pub offset: usize,
 }
 
 impl ScratchSlot {
@@ -5819,6 +5844,130 @@ impl ScratchSlot {
 fn scratch_mul(a: usize, b: usize) -> Result<usize, Qwen4GpuForwardError> {
     a.checked_mul(b)
         .ok_or_else(|| invalid("scratch size arithmetic overflows"))
+}
+
+/// Rows of PLE convolution input the compact scratch keeps after a forward:
+/// the widest forward whose normed rows are read after it returns, for a
+/// verify rollback.  A verify window is at most
+/// `QWEN4_VERIFY_MAX_ROWS` rows (the row capture refuses more, `state.rs`
+/// `row_capture_allocation_sizes_scoped`; the n-gram lane's block is
+/// `NGRAM_DEPTHS + 1` of them; a mesh row repair's tokens equal its verify
+/// epoch's rows).  A lane step (`forward_lanes`) is `lanes * rows` with at
+/// most `lane::MAX_LANES` lanes of one store and a verify lane at most
+/// `LANE_MAX_ROWS` rows (`forward_lanes` refuses more; an AR lane is one), and
+/// a lane reads its window at its first row of the step.
+pub(crate) const QWEN4_PLE_NORMED_KEEP_ROWS: usize = {
+    let lanes = crate::lane::MAX_LANES * crate::gpu_forward_lanes::LANE_MAX_ROWS;
+    if lanes > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+        lanes
+    } else {
+        hipfire_config::QWEN4_VERIFY_MAX_ROWS
+    }
+};
+
+/// Elements (256 bytes of F32) every phase-arena field start is rounded up to.
+const COMPACT_ARENA_ALIGN: usize = 64;
+
+fn round_up_arena(elements: usize) -> Result<usize, Qwen4GpuForwardError> {
+    elements
+        .checked_add(COMPACT_ARENA_ALIGN - 1)
+        .map(|sum| sum / COMPACT_ARENA_ALIGN * COMPACT_ARENA_ALIGN)
+        .ok_or_else(|| invalid("compact scratch arena overflows"))
+}
+
+/// The step-local field groups of the `FnSymGfx1201` phase arena, each as
+/// `(field, elements, pitch)` in layout order: GDN, QSA, HC, PLE, MoE,
+/// embedding.  Groups never run at once, so each lays out from element 0 of
+/// the shared allocation.  `slots` supplies the MoE element counts, which the
+/// plan sizes for the symmetric IU4 route.  The first GDN entry,
+/// `Projection`, is the arena owner.
+pub(crate) fn compact_arena_groups(
+    config: &Qwen4Config,
+    max_chunk: usize,
+    slots: &[ScratchSlot],
+) -> Result<Vec<Vec<(ScratchField, usize, Option<usize>)>>, Qwen4GpuForwardError> {
+    use ScratchField as F;
+    let layout = Qwen4ScratchLayout::for_rows(program_dims(config), max_chunk)
+        .map_err(|error| invalid(error.to_string()))?;
+    let n = max_chunk;
+    let heads = config.linear_num_value_heads;
+    let kv_width = scratch_mul(config.num_key_value_heads, config.head_dim)?;
+    let mut groups = Vec::with_capacity(6);
+    let sized = |fields: &[(F, usize)]| -> Result<_, Qwen4GpuForwardError> {
+        fields
+            .iter()
+            .map(|&(field, width)| Ok((field, scratch_mul(n, width)?, Some(width))))
+            .collect::<Result<Vec<_>, Qwen4GpuForwardError>>()
+    };
+    groups.push(sized(&[
+        (F::Projection, layout.gdn_qkv),
+        (F::Projection2, layout.gdn_qkv),
+        (F::GdnRecurrentOutput, layout.gdn_value),
+        (F::GdnZ, layout.gdn_value),
+        (F::GdnOutput, layout.gdn_value),
+        (F::GdnA, heads),
+        (F::GdnB, heads),
+        (F::GdnGate, heads),
+        (F::GdnBeta, heads),
+    ])?);
+    let mut qsa = sized(&[
+        (F::QsaQgate, 2 * layout.q_width),
+        (F::QsaOutput, layout.q_width),
+        (F::QsaIndex, layout.index_width),
+        (F::QsaK, kv_width),
+        (F::QsaV, kv_width),
+    ])?;
+    // The per-row selections live only inside the indexed-attention launch
+    // (selection kernel then the attention kernels over it; never across a
+    // step boundary): the last QSA member, a Raw byte slot viewed as the F32
+    // elements that cover it.
+    qsa.push((
+        F::QsaSelected,
+        slots[F::QsaSelected as usize]
+            .elements
+            .div_ceil(std::mem::size_of::<f32>()),
+        None,
+    ));
+    groups.push(qsa);
+    groups.push(sized(&[
+        (F::HcNormalized, layout.wide),
+        (F::HcLow, config.hc_lowrank),
+        (F::HcUp, layout.wide),
+    ])?);
+    groups.push(sized(&[
+        (F::PleQuery, layout.wide),
+        (F::PleKey, layout.wide),
+        (F::PleOutput, layout.wide),
+        (F::PleValue, layout.hidden),
+        (F::PleNormedWide, layout.wide),
+    ])?);
+    groups.push(
+        [
+            F::MoeYDownGrouped,
+            F::MoeYGateUpGrouped,
+            F::MoeDownExpanded,
+            F::MoeXRot,
+            F::MoeSharedOutput,
+            F::MoeGateUp,
+            F::MoeGate,
+            F::MoeUp,
+            F::MoeHidden,
+            F::MoeScalar,
+            F::MoeGateBatch,
+            F::MoeUpBatch,
+            F::MoeRotBatch,
+        ]
+        .iter()
+        .map(|&field| (field, slots[field as usize].elements, None))
+        .collect(),
+    );
+    groups.push(
+        [F::Embeddings, F::EmbeddingRot]
+            .iter()
+            .map(|&field| (field, slots[field as usize].elements, None))
+            .collect(),
+    );
+    Ok(groups)
 }
 
 /// `(offset, len)` in elements of lane segment `[begin, begin + rows)` of an
@@ -5857,9 +6006,10 @@ pub(crate) fn owner_pitch_extent(
 /// Device buffers shared by one forward object.  All allocations happen in
 /// `new`/`new_npu_bank`; token/chunk execution only creates borrowed subviews.
 ///
-/// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] eight fields are borrowed
-/// views of another field's allocation (see [`Self::plan`]); only owners are
-/// allocated, charged by [`Self::device_bytes`] and freed.
+/// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] the step-local fields of the
+/// GDN, QSA, HC, PLE, MoE and embedding steps are views of the `Projection`
+/// arena (see [`Self::plan`]) and `PleGated` views `Rotation`; only owners
+/// are allocated, charged by [`Self::device_bytes`] and freed.
 pub struct Qwen4GpuForwardScratch {
     pub max_chunk: usize,
     pub mode: Qwen4ForwardScratchMode,
@@ -5903,7 +6053,17 @@ pub struct Qwen4GpuForwardScratch {
     pub ple_value: GpuTensor,
     pub ple_query: GpuTensor,
     pub ple_gated: GpuTensor,
+    /// The PLE convolution input rows a partial verify rollback reads after
+    /// the forward: the whole `max_chunk` in `Full`, the first
+    /// [`QWEN4_PLE_NORMED_KEEP_ROWS`] rows in the compact plan.
     pub ple_normed: GpuTensor,
+    /// Compact plan, `max_chunk > QWEN4_PLE_NORMED_KEEP_ROWS`: the normed rows
+    /// of a forward wider than the kept rows (a view of the phase arena).
+    /// Never read after the forward.
+    pub ple_normed_wide: GpuTensor,
+    /// Whether the last forward wrote its normed rows to
+    /// [`Self::ple_normed_wide`], so [`Self::ple_normed_for_rollback`] refuses.
+    ple_normed_in_wide: std::sync::atomic::AtomicBool,
     pub ple_output: GpuTensor,
     pub router_logits: GpuTensor,
     pub moe_x_rot: GpuTensor,
@@ -5968,12 +6128,15 @@ impl Qwen4GpuForwardScratch {
     ///   down `max(G(c)*hidden*4, G(n)*hidden*2)` bytes, kept as F32-typed
     ///   facades of `bytes / 4` elements (the IU4 kernels read the pointers as
     ///   BF16 storage);
-    /// - phase aliases: `hc_normalized`, `ple_query` -> `projection`;
-    ///   `hc_up`, `ple_key` -> `projection2`; `ple_gated` -> `rotation`;
-    ///   `ple_output` -> `moe_y_down_grouped`; `ple_value` ->
-    ///   `moe_shared_output`; `gdn_recurrent_output` -> `qsa_qgate`.
-    ///   `ple_normed` stays dedicated: partial verify rollback reads it after
-    ///   the forward.
+    /// - phase arena: `projection` owns one allocation; the step-local fields
+    ///   of the GDN, QSA, HC, PLE, MoE and embedding steps (see
+    ///   [`compact_arena_groups`]) are views of it, each group laid out from
+    ///   element 0 with every field start rounded up to 256 bytes, and the
+    ///   arena is the largest group.  `ple_gated` -> `rotation`.
+    ///   `ple_normed` stays dedicated but holds only
+    ///   [`QWEN4_PLE_NORMED_KEEP_ROWS`] rows (partial verify rollback reads it
+    ///   after the forward); a wider forward writes `ple_normed_wide`, a PLE
+    ///   group member, and every post-forward reader then refuses.
     fn plan_scoped(
         config: &Qwen4Config,
         max_chunk: usize,
@@ -6012,12 +6175,6 @@ impl Qwen4GpuForwardScratch {
             has(LayerType::LinearAttention),
             has(LayerType::FullAttention),
         );
-        if mode == Qwen4ForwardScratchMode::FnSymGfx1201 && has_gdn && !has_qsa {
-            return Err(invalid(
-                "compact forward scratch aliases the GDN output onto QSA scratch, which a band \
-                 without QSA layers does not own",
-            ));
-        }
         let max_projection = wide
             .max(hidden)
             .max(if has_qsa { qsa_qgate } else { 0 })
@@ -6075,6 +6232,11 @@ impl Qwen4GpuForwardScratch {
             | F::PleGated
             | F::PleNormed
             | F::PleOutput => scope.input,
+            F::PleNormedWide => {
+                scope.input
+                    && mode == Qwen4ForwardScratchMode::FnSymGfx1201
+                    && max_chunk > QWEN4_PLE_NORMED_KEEP_ROWS
+            }
             F::GdnA
             | F::GdnB
             | F::GdnGate
@@ -6105,6 +6267,7 @@ impl Qwen4GpuForwardScratch {
                 dtype,
                 owner: None,
                 pitch: None,
+                offset: 0,
             });
             Ok(())
         };
@@ -6156,7 +6319,19 @@ impl Qwen4GpuForwardScratch {
             alloc(F::PleValue, rows(hidden)?, DType::F32)?;
             alloc(F::PleQuery, rows(ple_channels)?, DType::F32)?;
             alloc(F::PleGated, rows(ple_channels)?, DType::F32)?;
-            alloc(F::PleNormed, rows(ple_channels)?, DType::F32)?;
+            // Full keeps every row of the forward; the compact plan keeps the
+            // rows a verify rollback can read after the forward and routes a
+            // wider forward's normed rows through `PleNormedWide`.
+            alloc(
+                F::PleNormed,
+                if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
+                    scratch_mul(max_chunk.min(QWEN4_PLE_NORMED_KEEP_ROWS), ple_channels)?
+                } else {
+                    rows(ple_channels)?
+                },
+                DType::F32,
+            )?;
+            alloc(F::PleNormedWide, rows(ple_channels)?, DType::F32)?;
             alloc(F::PleOutput, rows(ple_channels)?, DType::F32)?;
             // Viewed as `[rows, router_columns]` by every forward (one
             // placeholder column for a dense FFN).
@@ -6262,84 +6437,105 @@ impl Qwen4GpuForwardScratch {
             let down_bf16 = scratch_mul(grouped_bound, scratch_mul(hidden, bf16_bytes)?)?;
             slots[F::MoeYDownGrouped as usize].elements = facade(down_f32.max(down_bf16));
 
-            // `owner_pitch`: row pitch of the owner's lane segments (`None`
-            // for a pure-capacity owner); `view_pitch`: the views' pitch.
-            let mut bind = |owner: F,
-                            owner_pitch: Option<usize>,
-                            view_pitch: usize,
-                            views: &[F]|
-             -> Result<(), Qwen4GpuForwardError> {
-                if !present(owner) {
-                    return Ok(());
-                }
-                let owner_slot = slots[owner as usize];
-                if owner_slot.owner.is_some() {
-                    return Err(invalid(format!(
-                        "scratch alias owner {owner:?} is itself a view"
-                    )));
-                }
-                if let Some(pitch) = owner_pitch {
-                    if owner_slot.elements < scratch_mul(max_chunk, pitch)? {
-                        return Err(invalid(format!(
-                            "scratch alias owner {owner:?} is smaller than {max_chunk} rows of pitch {pitch}"
-                        )));
-                    }
-                    slots[owner as usize].pitch = Some(pitch);
-                }
-                for &view in views {
-                    if !present(view) {
+            // Phase arena: `Projection` owns one allocation; every field of
+            // a step-local group is a view of it at a 64-element-aligned
+            // offset.  Groups never run at once, so they overlap.
+            let groups = compact_arena_groups(config, max_chunk, &slots)?;
+            let mut arena = 0usize;
+            let mut placed: Vec<(F, usize, Option<usize>)> = Vec::new();
+            for group in &groups {
+                let mut cursor = 0usize;
+                for &(field, elements, pitch) in group {
+                    if slots[field as usize].elements == 0 || (field == F::Projection && !has_gdn) {
                         continue;
                     }
-                    let slot = slots[view as usize];
-                    if slot.owner.is_some() || slot.dtype != owner_slot.dtype {
-                        return Err(invalid(format!(
-                            "scratch field {view:?} cannot alias {owner:?}"
-                        )));
+                    let offset = round_up_arena(cursor)?;
+                    let extent = elements.max(match pitch {
+                        Some(pitch) => scratch_mul(max_chunk, pitch)?,
+                        None => 0,
+                    });
+                    cursor = offset
+                        .checked_add(extent)
+                        .ok_or_else(|| invalid("compact scratch arena overflows"))?;
+                    placed.push((field, offset, pitch));
+                    // `QsaSelected` keeps its byte `elements` (Raw); the group
+                    // entry is the F32 cover of those bytes.
+                    if field != F::Projection && field != F::QsaSelected {
+                        slots[field as usize].elements = elements;
                     }
-                    if slot.elements > owner_slot.elements {
-                        return Err(invalid(format!(
-                            "scratch field {view:?} ({} elements) exceeds its owner {owner:?} ({} elements)",
-                            slot.elements, owner_slot.elements
-                        )));
-                    }
-                    if slot.elements > scratch_mul(max_chunk, view_pitch)? {
-                        return Err(invalid(format!(
-                            "scratch field {view:?} is wider than its owner pitch {view_pitch}"
-                        )));
-                    }
-                    slots[view as usize].owner = Some(owner);
-                    slots[view as usize].pitch = Some(view_pitch);
                 }
-                Ok(())
-            };
-            // The grouped GDN producers write `rows * gdn_qkv` packed values
-            // while the per-lane cores address `begin * pitch`, so the owner
-            // pitch must equal the actual qkv width.  Only the equal-width
-            // geometry is bound (capacity stays `max_projection`); any other
-            // leaves both sets dedicated.
-            if gdn_qkv == wide {
-                bind(
-                    F::Projection,
-                    Some(wide),
-                    wide,
-                    &[F::HcNormalized, F::PleQuery],
-                )?;
-                bind(F::Projection2, Some(wide), wide, &[F::HcUp, F::PleKey])?;
+                arena = arena.max(round_up_arena(cursor)?);
             }
-            bind(
-                F::Rotation,
-                Some(max_rotation),
-                max_rotation,
-                &[F::PleGated],
-            )?;
-            bind(F::MoeYDownGrouped, None, ple_channels, &[F::PleOutput])?;
-            bind(F::MoeSharedOutput, Some(hidden), hidden, &[F::PleValue])?;
-            bind(
-                F::QsaQgate,
-                Some(qsa_qgate),
-                qsa_qgate,
-                &[F::GdnRecurrentOutput],
-            )?;
+            let owner_elements = arena.max(1);
+            for &(field, offset, pitch) in &placed {
+                if field == F::Projection {
+                    continue;
+                }
+                let slot = &mut slots[field as usize];
+                // Only `QsaSelected` is a Raw member; its arena extent is the
+                // F32 cover of its bytes.
+                let raw_member = field == F::QsaSelected && slot.dtype == DType::Raw;
+                if slot.dtype != DType::F32 && !raw_member {
+                    return Err(invalid(format!(
+                        "scratch field {field:?} cannot alias {:?}",
+                        F::Projection
+                    )));
+                }
+                let slot_elements = if raw_member {
+                    slot.elements.div_ceil(std::mem::size_of::<f32>())
+                } else {
+                    slot.elements
+                };
+                if offset % COMPACT_ARENA_ALIGN != 0 {
+                    return Err(invalid(format!(
+                        "scratch field {field:?} offset {offset} is not 256-byte aligned"
+                    )));
+                }
+                if offset
+                    .checked_add(slot_elements)
+                    .is_none_or(|end| end > owner_elements)
+                {
+                    return Err(invalid(format!(
+                        "scratch field {field:?} ({slot_elements} elements at {offset}) exceeds \
+                         the {owner_elements}-element arena"
+                    )));
+                }
+                if let Some(pitch) = pitch {
+                    let reserved = scratch_mul(max_chunk, pitch)?;
+                    if slot_elements > reserved
+                        || offset
+                            .checked_add(reserved)
+                            .is_none_or(|end| end > owner_elements)
+                    {
+                        return Err(invalid(format!(
+                            "scratch field {field:?} is wider than its pitch {pitch} or leaves \
+                             the arena"
+                        )));
+                    }
+                }
+                slot.owner = Some(F::Projection);
+                slot.offset = offset;
+                slot.pitch = pitch;
+            }
+            if present(F::Projection) {
+                slots[F::Projection as usize].elements = owner_elements;
+                slots[F::Projection as usize].pitch = has_gdn.then_some(gdn_qkv);
+            }
+            // `PleGated` stays a view of `Rotation`.
+            if present(F::PleGated) {
+                let owner_slot = slots[F::Rotation as usize];
+                let slot = &mut slots[F::PleGated as usize];
+                if slot.dtype != owner_slot.dtype
+                    || slot.elements > owner_slot.elements
+                    || slot.elements > scratch_mul(max_chunk, max_rotation)?
+                    || owner_slot.elements < scratch_mul(max_chunk, max_rotation)?
+                {
+                    return Err(invalid("scratch field PleGated cannot alias Rotation"));
+                }
+                slot.owner = Some(F::Rotation);
+                slot.pitch = Some(max_rotation);
+                slots[F::Rotation as usize].pitch = Some(max_rotation);
+            }
         }
         Ok((slots, max_ple_bytes))
     }
@@ -6352,6 +6548,23 @@ impl Qwen4GpuForwardScratch {
         mode: Qwen4ForwardScratchMode,
     ) -> Result<u64, Qwen4GpuForwardError> {
         Self::device_bytes_scoped(config, max_chunk, mode, &Qwen4BandScope::single(config))
+    }
+
+    /// Elements of the `FnSymGfx1201` phase arena (the `Projection` owner) a
+    /// band of `scope` plans for `max_chunk` rows; an error is a geometry the
+    /// compact plan refuses.
+    pub(crate) fn compact_arena_elements(
+        config: &Qwen4Config,
+        max_chunk: usize,
+        scope: &Qwen4BandScope,
+    ) -> Result<usize, Qwen4GpuForwardError> {
+        let (slots, _) = Self::plan_scoped(
+            config,
+            max_chunk,
+            Qwen4ForwardScratchMode::FnSymGfx1201,
+            scope,
+        )?;
+        Ok(slots[ScratchField::Projection as usize].elements)
     }
 
     /// [`Self::device_bytes`] for one band: only the fields it plans.
@@ -6500,10 +6713,22 @@ impl Qwen4GpuForwardScratch {
         }
         for (index, slot) in slots.iter().enumerate() {
             if let Some(owner) = slot.owner {
-                let view = tensors[owner as usize]
+                let owner_tensor = tensors[owner as usize]
                     .as_ref()
-                    .expect("plan validated that a view's owner owns its allocation")
-                    .sub_offset(0, slot.elements);
+                    .expect("plan validated that a view's owner owns its allocation");
+                let view = if slot.dtype == owner_tensor.dtype {
+                    owner_tensor.sub_offset(slot.offset, slot.elements)
+                } else {
+                    // A Raw member (`QsaSelected`): an F32-covered region
+                    // retyped to its byte length.
+                    let mut view = owner_tensor.sub_offset(
+                        slot.offset,
+                        slot.elements.div_ceil(owner_tensor.dtype.size()),
+                    );
+                    view.shape = vec![slot.elements];
+                    view.dtype = slot.dtype;
+                    view
+                };
                 tensors[index] = Some(view);
             }
         }
@@ -6571,6 +6796,8 @@ impl Qwen4GpuForwardScratch {
             ple_query: take(F::PleQuery),
             ple_gated: take(F::PleGated),
             ple_normed: take(F::PleNormed),
+            ple_normed_wide: take(F::PleNormedWide),
+            ple_normed_in_wide: std::sync::atomic::AtomicBool::new(false),
             ple_output: take(F::PleOutput),
             router_logits: take(F::RouterLogits),
             moe_x_rot: take(F::MoeXRot),
@@ -6642,6 +6869,7 @@ impl Qwen4GpuForwardScratch {
             F::PleQuery => &self.ple_query,
             F::PleGated => &self.ple_gated,
             F::PleNormed => &self.ple_normed,
+            F::PleNormedWide => &self.ple_normed_wide,
             F::PleOutput => &self.ple_output,
             F::RouterLogits => &self.router_logits,
             F::MoeXRot => &self.moe_x_rot,
@@ -6700,12 +6928,64 @@ impl Qwen4GpuForwardScratch {
                 // The pitched reservation is bounded by the allocation that
                 // actually holds it: a borrowed view's own logical element
                 // count can be narrower than `rows * pitch`.
-                let storage = self.field_tensor(slot.owner.unwrap_or(field));
+                let region = scratch_mul(self.max_chunk, pitch)?;
+                let storage = self
+                    .field_tensor(slot.owner.unwrap_or(field))
+                    .sub_offset(slot.offset, region);
                 let (offset, len) =
                     owner_pitch_extent(pitch, storage.numel(), begin, rows, logical_width)?;
                 Ok(storage.sub_offset(offset, len))
             }
         }
+    }
+
+    /// The field a `rows`-row forward writes its PLE normed rows to, and
+    /// whether that is the wide arena view.
+    pub(crate) fn ple_normed_field(&self, rows: usize) -> ScratchField {
+        if self.slots[ScratchField::PleNormedWide as usize].elements != 0
+            && rows > QWEN4_PLE_NORMED_KEEP_ROWS
+        {
+            ScratchField::PleNormedWide
+        } else {
+            ScratchField::PleNormed
+        }
+    }
+
+    /// The tensor a `rows`-row PLE step writes its normed rows to; a row count
+    /// past [`QWEN4_PLE_NORMED_KEEP_ROWS`] takes the arena view and marks the
+    /// kept rows stale.
+    pub(crate) fn ple_normed_for(&self, rows: usize) -> &GpuTensor {
+        let field = self.ple_normed_field(rows);
+        if field == ScratchField::PleNormedWide {
+            self.ple_normed_in_wide
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.field_tensor(field)
+    }
+
+    /// A forward of `rows` rows begins: the kept normed rows are valid again
+    /// unless this forward is wider than them.
+    pub(crate) fn note_forward_rows(&self, rows: usize) {
+        self.ple_normed_in_wide.store(
+            self.ple_normed_field(rows) == ScratchField::PleNormedWide,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The kept PLE normed rows for a verify rollback; an error when the last
+    /// forward was wider than [`QWEN4_PLE_NORMED_KEEP_ROWS`] and wrote its
+    /// normed rows elsewhere.
+    pub(crate) fn ple_normed_for_rollback(&self) -> Result<&GpuTensor, Qwen4GpuForwardError> {
+        if self
+            .ple_normed_in_wide
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(invalid(format!(
+                "the last forward was wider than {QWEN4_PLE_NORMED_KEEP_ROWS} rows: its PLE \
+                 convolution input rows are not kept for a verify rollback"
+            )));
+        }
+        Ok(&self.ple_normed)
     }
 
     /// Free the owners.  Borrowed views are never freed: their allocation is
@@ -6748,6 +7028,7 @@ impl Qwen4GpuForwardScratch {
             self.ple_query,
             self.ple_gated,
             self.ple_normed,
+            self.ple_normed_wide,
             self.ple_output,
             self.router_logits,
             self.moe_x_rot,
@@ -6997,7 +7278,7 @@ impl<'a> LayerPhaseEnv<'a> {
             key_scratch: &scratch.ple_key,
             value_scratch: &scratch.ple_value,
             gated: &scratch.ple_gated,
-            normed: &scratch.ple_normed,
+            normed: scratch.ple_normed_for(self.rows),
             output: &scratch.ple_output,
             rows: self.rows,
             branches: self.dims.hc_count,
@@ -8702,12 +8983,19 @@ impl Qwen4GpuForward {
                 // all-slab load is not on the symmetric route (its K2 GEMMs
                 // write the same grouped-row buffers, K1 stays inside the
                 // 512-row F32 fallback), so it has no symmetric count to meet.
-                if compact && !all_slab && verified != moe_count {
-                    return Err(invalid(format!(
-                        "compact scratch was selected from the artifact's source headers, but \
-                         the GPU check verified only {verified}/{} layers symmetric",
-                        moe_count
-                    )));
+                // Developer knob: refuse the compact plan as if one layer were
+                // unverified, without altering any layer's verdict or route.
+                let accepted =
+                    if hipfire_config::developer_bool(QWEN4_COMPACT_FORCE_UNVERIFIED_ENV, false) {
+                        verified.saturating_sub(1)
+                    } else {
+                        verified
+                    };
+                if compact && !all_slab && accepted != moe_count {
+                    return Err(Qwen4GpuForwardError::CompactUnverified {
+                        verified: accepted,
+                        total: moe_count,
+                    });
                 }
                 if verified > 0 {
                     gpu.reserve_qwen4_moe_sym(
@@ -10762,6 +11050,7 @@ impl Qwen4GpuForward {
                 self.scratch.max_chunk
             )));
         }
+        self.scratch.note_forward_rows(n);
         // The router fault row is the absolute token position for a prefill / verify
         // chunk. A one-token decode forward may be captured or retained, which bakes
         // the launch's row base in, so it reports row 0 (position = decode step).
@@ -13456,10 +13745,10 @@ mod tests {
     }
 
     use super::{
-        owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows,
-        slab_codec_tag_bytes, uploaded_ids_range, CompactScratchTerms,
+        compact_arena_groups, owner_pitch_extent, qwen4_forward_device_bytes,
+        qwen4_spec_logit_rows, slab_codec_tag_bytes, uploaded_ids_range, CompactScratchTerms,
         Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch, ScratchField as F,
-        ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
+        ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS, QWEN4_PLE_NORMED_KEEP_ROWS,
     };
     use crate::config::{compact_test_config, Qwen4Config};
 
@@ -13554,6 +13843,7 @@ mod tests {
                     F::PleQuery,
                     F::PleGated,
                     F::PleNormed,
+                    F::PleNormedWide,
                     F::PleOutput,
                 ],
                 &prepare_and_fragment,
@@ -13653,25 +13943,40 @@ mod tests {
         assert_eq!(scratch_bytes(8192, Mode::Full) - private, 8_454_551_428);
     }
 
+    /// The kept normed rows cover the widest post-forward reader: a lane step
+    /// of 64 lanes of 8 verify rows (a singleton verify window is at most 64).
+    #[test]
+    fn ple_normed_keep_rows_cover_the_widest_post_forward_reader() {
+        assert_eq!(QWEN4_PLE_NORMED_KEEP_ROWS, 512);
+        assert!(QWEN4_PLE_NORMED_KEEP_ROWS >= hipfire_config::QWEN4_VERIFY_MAX_ROWS);
+        assert!(
+            QWEN4_PLE_NORMED_KEEP_ROWS
+                >= crate::lane::MAX_LANES * crate::gpu_forward_lanes::LANE_MAX_ROWS
+        );
+    }
+
     #[test]
     fn fn_scratch_bytes_are_pinned() {
         assert_eq!(scratch_bytes(4096, Mode::Full), 4_538_503_044);
         assert_eq!(scratch_bytes(8192, Mode::Full), 8_957_998_980);
-        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 2_314_473_348);
-        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 4_511_905_668);
+        assert_eq!(scratch_bytes(256, Mode::FnSymGfx1201), 257_203_716);
+        assert_eq!(scratch_bytes(512, Mode::FnSymGfx1201), 395_400_324);
+        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 1_268_469_636);
+        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 2_514_925_444);
+        assert_eq!(scratch_bytes(16384, Mode::FnSymGfx1201), 5_007_837_060);
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(4096, Mode::FnSymGfx1201),
-            2_224_029_696
+            3_270_033_408
         );
         assert_eq!(
             scratch_bytes(8192, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            4_446_093_312
+            6_443_073_536
         );
-        // The 8192-row compact scratch is smaller than today's 4096-row one.
+        // The 8192-row compact scratch is smaller than the 4096-row full one.
         assert!(scratch_bytes(8192, Mode::FnSymGfx1201) <= scratch_bytes(4096, Mode::Full));
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            26_597_376
+            2_023_577_600
         );
         // The estimator adds the same 64-row speculative logits to either plan.
         let config = fn_config();
@@ -13815,64 +14120,141 @@ mod tests {
         assert_eq!(field_bytes(&full, F::MoeYDownGrouped), 917_504_000);
     }
 
+    /// Every field of every arena group lies inside the `Projection` arena at
+    /// a 256-byte aligned offset, and the regions of one group are disjoint.
+    fn assert_arena_groups_disjoint(config: &Qwen4Config, rows: usize, slots: &[ScratchSlot]) {
+        let arena = slots[F::Projection as usize].elements;
+        let groups = compact_arena_groups(config, rows, slots).unwrap();
+        for group in &groups {
+            let mut regions: Vec<(usize, usize, F)> = Vec::new();
+            for &(field, elements, pitch) in group {
+                let slot = slots[field as usize];
+                if slot.elements == 0 {
+                    continue;
+                }
+                if field != F::Projection {
+                    assert_eq!(slot.owner, Some(F::Projection), "{field:?} at {rows}");
+                    assert_eq!(slot.pitch, pitch, "{field:?} at {rows}");
+                }
+                assert_eq!(slot.offset % 64, 0, "{field:?} at {rows}");
+                let extent = elements.max(pitch.map_or(0, |pitch| rows * pitch));
+                assert!(slot.offset + extent <= arena, "{field:?} at {rows}");
+                regions.push((slot.offset, slot.offset + extent, field));
+            }
+            regions.sort_by_key(|region| (region.0, region.1));
+            for pair in regions.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "{:?} overlaps {:?} at {rows}",
+                    pair[0].2,
+                    pair[1].2
+                );
+            }
+        }
+    }
+
     #[test]
-    fn compact_aliases_borrow_one_owner_each_and_ple_normed_stays_dedicated() {
+    fn compact_arena_groups_are_disjoint_and_everything_else_owns_its_allocation() {
+        let config = fn_config();
         let full = plan(8192, Mode::Full);
         assert_eq!(full.len(), F::COUNT);
         assert!(full
             .iter()
-            .all(|slot| slot.owner.is_none() && slot.pitch.is_none()));
-        let compact = plan(8192, Mode::FnSymGfx1201);
-        let owner = |field: F| compact[field as usize].owner;
-        assert_eq!(owner(F::HcNormalized), Some(F::Projection));
-        assert_eq!(owner(F::PleQuery), Some(F::Projection));
-        assert_eq!(owner(F::HcUp), Some(F::Projection2));
-        assert_eq!(owner(F::PleKey), Some(F::Projection2));
-        assert_eq!(owner(F::PleGated), Some(F::Rotation));
-        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
-        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
-        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
-        assert_eq!(owner(F::PleNormed), None);
-        assert_eq!(
-            compact.iter().filter(|slot| slot.owner.is_some()).count(),
-            8
-        );
-        // Only owners are charged; no view's owner is itself a view and every
-        // view fits inside its owner.
-        assert_eq!(
-            owned_bytes(&compact),
-            scratch_bytes(8192, Mode::FnSymGfx1201)
-        );
+            .all(|slot| slot.owner.is_none() && slot.pitch.is_none() && slot.offset == 0));
+        for rows in [1usize, 7, 256, 512, 4096, 16384] {
+            let compact = plan(rows, Mode::FnSymGfx1201);
+            assert_arena_groups_disjoint(&config, rows, &compact);
+            let grouped: Vec<F> = compact_arena_groups(&config, rows, &compact)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|(field, _, _)| field)
+                .collect();
+            for (index, slot) in compact.iter().enumerate() {
+                let field = F::ALL[index];
+                match field {
+                    F::PleGated => assert_eq!(slot.owner, Some(F::Rotation)),
+                    _ if grouped.contains(&field)
+                        && field != F::Projection
+                        && slot.elements != 0 =>
+                    {
+                        assert_eq!(slot.owner, Some(F::Projection), "{field:?} at {rows}");
+                    }
+                    _ => {
+                        assert_eq!(slot.owner, None, "{field:?} at {rows}");
+                        assert_eq!(slot.offset, 0, "{field:?} at {rows}");
+                    }
+                }
+            }
+            // The kept normed rows are dedicated; a forward wider than them
+            // writes the arena view, which exists only then.
+            assert_eq!(
+                compact[F::PleNormed as usize].elements,
+                rows.min(QWEN4_PLE_NORMED_KEEP_ROWS) * 10_240,
+                "{rows}"
+            );
+            let wide = compact[F::PleNormedWide as usize];
+            if rows > QWEN4_PLE_NORMED_KEEP_ROWS {
+                assert_eq!(wide.owner, Some(F::Projection), "{rows}");
+                assert_eq!(wide.pitch, Some(10_240), "{rows}");
+                assert_eq!(wide.elements, rows * 10_240, "{rows}");
+            } else {
+                assert_eq!(wide.elements, 0, "{rows}");
+            }
+            for field in [
+                F::Streams,
+                F::HcMixed,
+                F::HcGates,
+                F::AttentionOutput,
+                F::FfnOutput,
+                F::Rotation,
+                F::PleRows,
+                F::PleStaged,
+                F::PleNormed,
+                F::TokenIds,
+                F::Logits,
+                F::GdnBf16,
+                F::MoeTopkIndices,
+                F::MoeTopkWeights,
+                F::MoeExpertTokenCounts,
+                F::MoeExpertOffsets,
+                F::MoeExpertTileIds,
+                F::MoeSortedSlotIndex,
+                F::MoeInversePerm,
+                F::RouterLogits,
+            ] {
+                assert!(!grouped.contains(&field), "{field:?}");
+                assert_eq!(compact[field as usize].owner, None, "{field:?} at {rows}");
+            }
+            assert_eq!(
+                owned_bytes(&compact),
+                scratch_bytes(rows, Mode::FnSymGfx1201)
+            );
+            for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
+                let owner = compact[slot.owner.unwrap() as usize];
+                assert!(owner.owner.is_none());
+                if slot.dtype == rdna_compute::DType::Raw {
+                    // `QsaSelected`: byte elements over an F32-covered region.
+                    assert_eq!(owner.dtype, rdna_compute::DType::F32);
+                    assert!(slot.offset + slot.elements.div_ceil(4) <= owner.elements);
+                } else {
+                    assert_eq!(owner.dtype, slot.dtype);
+                    assert!(slot.offset + slot.elements <= owner.elements);
+                }
+            }
+        }
         assert_eq!(owned_bytes(&full), scratch_bytes(8192, Mode::Full));
-        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
-            let owner = compact[slot.owner.unwrap() as usize];
-            assert!(owner.owner.is_none());
-            assert_eq!(owner.dtype, slot.dtype);
-            assert!(slot.elements <= owner.elements);
-        }
-        // Alias-set members share the owner's row pitch.
-        let pitch = |field: F| compact[field as usize].pitch;
-        for field in [
-            F::Projection,
-            F::HcNormalized,
-            F::PleQuery,
-            F::Projection2,
-            F::HcUp,
-            F::PleKey,
-        ] {
-            assert_eq!(pitch(field), Some(10_240), "{field:?}");
-        }
-        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
-            assert_eq!(pitch(field), Some(12_288), "{field:?}");
-        }
-        for field in [F::Rotation, F::PleGated, F::PleOutput] {
-            assert_eq!(pitch(field), Some(10_240), "{field:?}");
-        }
-        for field in [F::MoeSharedOutput, F::PleValue] {
-            assert_eq!(pitch(field), Some(2_560), "{field:?}");
-        }
-        assert_eq!(pitch(F::MoeYDownGrouped), None);
-        assert_eq!(pitch(F::PleNormed), None);
+        let compact = plan(8192, Mode::FnSymGfx1201);
+        assert_eq!(compact[F::Rotation as usize].pitch, Some(10_240));
+        assert_eq!(compact[F::PleGated as usize].pitch, Some(10_240));
+        assert_eq!(compact[F::Projection as usize].pitch, Some(10_240));
+        assert_eq!(compact[F::PleNormed as usize].owner, None);
+        // The selections are the last QSA member: a Raw byte slot.
+        let selected = compact[F::QsaSelected as usize];
+        assert_eq!(selected.owner, Some(F::Projection));
+        assert_eq!(selected.dtype, rdna_compute::DType::Raw);
+        assert_eq!(selected.pitch, None);
+        assert_eq!(selected.elements, 8192 * config.qsa_selected_capacity() * 4);
     }
 
     /// One grouped-GDN invocation set, host-simulated: the grouped producers
@@ -13931,29 +14313,22 @@ mod tests {
         let wide = config.hidden_size * config.hc_count;
         assert_eq!(qkv, wide);
         let compact = plan(32, Mode::FnSymGfx1201);
-        for (owner, views) in [
-            (F::Projection, [F::HcNormalized, F::PleQuery]),
-            (F::Projection2, [F::HcUp, F::PleKey]),
-        ] {
-            let pitch = compact[owner as usize].pitch.expect("owner pitch");
+        for field in [F::Projection, F::Projection2] {
+            let pitch = compact[field as usize].pitch.expect("owner pitch");
             assert_eq!(pitch, qkv);
-            for view in views {
-                assert_eq!(compact[view as usize].owner, Some(owner));
-                assert_eq!(compact[view as usize].pitch, Some(pitch));
-            }
             for group in 1..=8usize {
                 for begin in [0usize, 1, 3, 9] {
                     assert_eq!(
                         simulate_grouped_gdn_rows(pitch, qkv, wide, begin, group),
                         Ok(()),
-                        "{owner:?} group {group} begin {begin}"
+                        "{field:?} group {group} begin {begin}"
                     );
                 }
             }
         }
-        // Negative control: the retired owner pitch (the capacity's maximum
-        // width, 12288) strands every row after the first of a group, so the
-        // odd group row is the first the lane fails to find.
+        // Negative control: a pitch wider than the actual qkv width (12288)
+        // strands every row after the first of a group, so the odd group row
+        // is the first the lane fails to find.
         for group in 1..=8usize {
             for begin in [0usize, 1, 3, 9] {
                 let result = simulate_grouped_gdn_rows(12_288, qkv, wide, begin, group);
@@ -13967,70 +14342,30 @@ mod tests {
     }
 
     #[test]
-    fn unequal_gdn_width_leaves_the_projection_alias_sets_dedicated() {
+    fn unequal_gdn_width_keeps_the_arena_at_the_qkv_pitch() {
         let mut config = fn_config();
         config.linear_num_key_heads = 12;
         let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
             + config.linear_num_value_heads * config.linear_value_head_dim;
         assert_ne!(qkv, config.hidden_size * config.hc_count);
         let rows = 32usize;
-        let full = Scratch::plan(&config, rows, Mode::Full).unwrap().0;
         let compact = Scratch::plan(&config, rows, Mode::FnSymGfx1201).unwrap().0;
-        for field in [
-            F::Projection,
-            F::HcNormalized,
-            F::PleQuery,
-            F::Projection2,
-            F::HcUp,
-            F::PleKey,
-        ] {
-            let slot = compact[field as usize];
-            assert_eq!(slot.owner, None, "{field:?}");
-            assert_eq!(slot.pitch, None, "{field:?}");
-            assert_eq!(slot.elements, full[field as usize].elements, "{field:?}");
+        for field in [F::Projection, F::Projection2] {
+            assert_eq!(compact[field as usize].pitch, Some(qkv), "{field:?}");
         }
-        // The other compact alias sets are unchanged.
-        let pitch = |field: F| compact[field as usize].pitch;
-        let owner = |field: F| compact[field as usize].owner;
-        assert_eq!(owner(F::PleGated), Some(F::Rotation));
-        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
-        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
-        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
-        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
-            assert_eq!(pitch(field), Some(12_288), "{field:?}");
-        }
-        for field in [F::Rotation, F::PleGated, F::PleOutput] {
-            assert_eq!(pitch(field), Some(10_240), "{field:?}");
-        }
-        for field in [F::MoeSharedOutput, F::PleValue] {
-            assert_eq!(pitch(field), Some(2_560), "{field:?}");
-        }
-        assert_eq!(pitch(F::MoeYDownGrouped), None);
-        assert_eq!(
-            compact.iter().filter(|slot| slot.owner.is_some()).count(),
-            4
-        );
-        // Accounting: only owners are charged, every view still fits inside
-        // its owner, and the estimator agrees with the plan.
-        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
-            let owner = compact[slot.owner.unwrap() as usize];
-            assert!(owner.owner.is_none());
-            assert_eq!(owner.dtype, slot.dtype);
-            assert!(slot.elements <= owner.elements);
-        }
+        assert_eq!(compact[F::Projection2 as usize].owner, Some(F::Projection));
+        assert_eq!(compact[F::HcNormalized as usize].owner, Some(F::Projection));
         assert_eq!(
             owned_bytes(&compact),
             Scratch::device_bytes(&config, rows, Mode::FnSymGfx1201).unwrap()
         );
-        assert!(owned_bytes(&compact) < owned_bytes(&full));
+        assert_arena_groups_disjoint(&config, rows, &compact);
     }
 
     #[test]
-    fn pitched_segments_are_bounded_by_the_actual_owner_allocation() {
-        // `segment_view` resolves a view's storage to its owner: a view whose
-        // logical element count is narrower than `rows * pitch` (the 6144-wide
-        // GDN recurrent output at pitch 12288) still fits whole and at its
-        // last lane inside the owner's allocation.
+    fn pitched_segments_are_bounded_by_the_arena_region_of_the_field() {
+        // `segment_view` bounds a pitched field by its own `max_chunk * pitch`
+        // region of the owner's allocation, which sits at the field's offset.
         let rows = 8usize;
         let config = fn_config();
         let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
@@ -14041,28 +14376,24 @@ mod tests {
             let Some(pitch) = slot.pitch else { continue };
             let storage = slot.owner.map_or(*slot, |owner| compact[owner as usize]);
             assert!(storage.owner.is_none(), "field {index}");
-            assert!(storage.elements >= rows * pitch, "field {index}");
-            // The live row width: the Projection owners are allocated at the
-            // `max_projection` capacity (12288) but carry GDN qkv rows; every
-            // other field's capacity is its logical width.
+            assert!(
+                slot.offset + rows * pitch <= storage.elements,
+                "field {index}"
+            );
             let width = match F::ALL[index] {
                 F::Projection | F::Projection2 => qkv,
                 _ => slot.elements / rows,
             };
             assert!(width <= pitch, "field {index}");
-            let whole = owner_pitch_extent(pitch, storage.elements, 0, rows, width).unwrap();
+            let region = rows * pitch;
+            let whole = owner_pitch_extent(pitch, region, 0, rows, width).unwrap();
             assert_eq!(whole, (0, rows * pitch), "field {index}");
-            let last = owner_pitch_extent(pitch, storage.elements, rows - 1, 1, width).unwrap();
+            let last = owner_pitch_extent(pitch, region, rows - 1, 1, width).unwrap();
             assert_eq!(last, ((rows - 1) * pitch, pitch), "field {index}");
+            assert!(owner_pitch_extent(pitch, region - 1, 0, rows, width).is_err());
             checked += 1;
         }
-        assert!(checked >= 8);
-        // Negative control: bounding by the 6144-wide view's own allocation
-        // refuses the whole reservation that the owner holds.
-        let recurrent = compact[F::GdnRecurrentOutput as usize];
-        assert_eq!(recurrent.owner, Some(F::QsaQgate));
-        assert!(recurrent.elements < rows * 12_288);
-        assert!(owner_pitch_extent(12_288, recurrent.elements, 0, rows, 6_144).is_err());
+        assert!(checked >= 20);
     }
 
     #[test]
@@ -14479,7 +14810,11 @@ mod tests {
             super::Qwen4ForwardScratchMode::Full,
         )
         .unwrap();
-        assert!(plan.iter().all(|slot| slot.elements >= 1));
+        // `Full` plans no compact-only `PleNormedWide`.
+        assert!(plan.iter().enumerate().all(|(index, slot)| {
+            slot.elements >= 1
+                || super::ScratchField::ALL[index] == super::ScratchField::PleNormedWide
+        }));
         let ple = config.ple.as_ref().unwrap();
         let embed = ple.head_count * ple.row_width;
         assert_eq!(ple_bytes, rows * embed * 2);
@@ -14525,7 +14860,11 @@ mod tests {
             super::Qwen4GpuForwardScratch::plan(&config, 4, super::Qwen4ForwardScratchMode::Full)
                 .unwrap();
         assert_eq!(ple_bytes, 0);
-        assert!(plan.iter().all(|slot| slot.elements >= 1));
+        // `Full` plans no compact-only `PleNormedWide`.
+        assert!(plan.iter().enumerate().all(|(index, slot)| {
+            slot.elements >= 1
+                || super::ScratchField::ALL[index] == super::ScratchField::PleNormedWide
+        }));
     }
 
     #[test]

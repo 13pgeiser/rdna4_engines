@@ -55,6 +55,11 @@ QWEN35_FACTS = ("arch", "model_arch", "spec", "heads", "max_seq")
 AXES_LINE = re.compile(r"^  route plan axes: (.+)$")
 SPEC_OF_ROUTE = {"ar": "Ar", "native_mtp": "NativeMtp"}
 WALK_ROUTE_OF = {"ar": "ar", "native_mtp": "mtp"}
+# Host-run noise in a walk's inherited HIPFIRE_* environment: per-run paths, the fabric admission token and
+# the torch toolchain locations steer no kernel, so they stay out of the plan's receipts.
+RECEIPT_ENV_SKIP = ("HIPFIRE_HOME", "HIPFIRE_LOCK_DIR", "HIPFIRE_KERNEL_CACHE", "HIPFIRE_DEVICES",
+                    "HIPFIRE_MODULE_LOAD_AUDIT", "HIPFIRE_FABRIC_ADMISSION")
+RECEIPT_ENV_SKIP_PREFIX = ("HIPFIRE_TORCH_",)
 
 
 def header_tensors(model, offset=0):
@@ -325,8 +330,7 @@ def main():
             axes.setdefault(name, set()).add(value)
         direct_total += len(direct)
         env = {k: v for k, v in command["env"].items()
-               if k.startswith("HIPFIRE_") and k not in ("HIPFIRE_HOME", "HIPFIRE_LOCK_DIR", "HIPFIRE_KERNEL_CACHE",
-                                                        "HIPFIRE_DEVICES", "HIPFIRE_MODULE_LOAD_AUDIT")}
+               if k.startswith("HIPFIRE_") and k not in RECEIPT_ENV_SKIP and not k.startswith(RECEIPT_ENV_SKIP_PREFIX)}
         receipts.append(f"# walk {route} {walk.name} daemon_sha256={command['daemon_sha256'][:16]} "
                         f"model={command['load']['model']} requests={command['requests']} env={json.dumps(env, sort_keys=True)}"
                         f" direct_loads={len(direct)}")

@@ -4325,7 +4325,7 @@ fn load_qwen4_rank_scoped(
         ) {
             "every routed trunk layer is an expert-slab arena; HIPFIRE_QWEN4_COMPACT_SCRATCH=0 keeps the full plan"
         } else {
-            "symmetric routed experts proven from the payload headers"
+            "symmetric routed experts assumed; the GPU symmetry check at attach confirms or re-plans Full"
         };
         eprintln!("  qwen4 forward scratch: {scratch_mode:?} plan ({reason})");
     }
@@ -4647,7 +4647,7 @@ fn load_qwen4_rank_scoped(
         // The symmetric IU4 window route's one source-byte scan of every routed trunk layer
         // (run only when its device terms hold, `HIPFIRE_QWEN4_MOE_SYM_IU4=1`).
         let routed_source_symmetric = || {
-            hipfire_arch_qwen4::artifact::routed_headers_symmetric(&hfq, &manifest)
+            hipfire_arch_qwen4::artifact::routed_headers_symmetric_verdict(&hfq, &manifest)
                 .map_err(|error| error.to_string())
         };
         s1::select_load_profile(
@@ -6660,7 +6660,7 @@ fn load_qwen4_rank_scoped(
             &bundle.config,
             state_format.gdn,
             bundle.state.qsa_backend().name(),
-            scratch_mode,
+            bundle.forward_scratch_mode().unwrap_or(scratch_mode),
         )
     } else {
         eprintln!("  qwen4 measured resources: unavailable (single-rank settled identity or placement evidence unavailable)");

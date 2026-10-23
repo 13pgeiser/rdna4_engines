@@ -60,6 +60,7 @@
 //! shape. Dense FP8 WMMA is unqualified in the emulator, so this reports the
 //! emulator's own refusal; the instruction is not modelled.
 
+use crate::common::e4m3;
 use crate::iu4::{abi_signature, max_diff};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
 use peacemaker_isa::kernels::fp8_gemm::spec::LDS_BYTES;
@@ -217,33 +218,6 @@ fn synth_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
         }
     }
     w
-}
-
-/// OCP E4M3 (finite, bias 7) code of `x`, round-to-nearest-even, saturating at 448.
-fn e4m3(x: f32) -> u8 {
-    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
-    let a = x.abs();
-    if a.is_nan() || a == 0.0 {
-        return 0;
-    }
-    let code = if a < 2f32.powi(-6) {
-        // Subnormal: value = m * 2^-9 (m == 8 rounds up into the smallest normal, 0x08).
-        (a * 512.0).round_ties_even() as u32
-    } else {
-        let mut e = (a.to_bits() >> 23) as i32 - 127;
-        let mut m = ((a / 2f32.powi(e) - 1.0) * 8.0).round_ties_even() as i32;
-        if m == 8 {
-            e += 1;
-            m = 0;
-        }
-        let biased = e + 7;
-        if biased > 15 || (biased == 15 && m > 6) {
-            0x7e
-        } else {
-            ((biased as u32) << 3) | m as u32
-        }
-    };
-    sign | code as u8
 }
 
 /// The production pre-pass scale: `2^ceil(log2(amax / 224))` from the f32 bit
