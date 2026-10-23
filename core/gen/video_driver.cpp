@@ -515,6 +515,16 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
             return d.enc_ratio < 1 || m.enc_h < d.enc_ratio || m.enc_w < d.enc_ratio ||
                    m.enc_h % d.enc_ratio || m.enc_w % d.enc_ratio;
         };
+        /* A picture or an endpoint keyframe folds through the VAE as a ONE-frame clip, which is
+         * why it rides at a far larger side than a video can -- but "larger" is not "unbounded":
+         * the encoder's per-level buffers hold a full clip's worth of the DEEPEST temporal stage,
+         * so one frame cannot exceed a fifth of the pixels budget no matter how few frames it
+         * has. The geometry call answers that; asking it here refuses an over-cap media at
+         * accept, where a step-time refusal would stop the whole engine. */
+        auto one_frame = [&](const VideoRefMedia& m) {
+            const int64_t in[4] = { 1, m.enc_h, m.enc_w, 3 };
+            return !enc_geom_ || enc_geom_(RAD_GEN_PASS_VENCODE, in, eg, 25) >= 0;
+        };
         for (size_t i = 0; i < r.refs.size(); ++i) {
             const VideoRefMedia& m = r.refs[i];
             if (m.kind == VideoRefMedia::IMAGE) {
@@ -526,6 +536,10 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
                     return no("'" + m.name + "' has encoder sides (" + std::to_string(m.enc_h) +
                               "x" + std::to_string(m.enc_w) + ") the VAE grid of " +
                               std::to_string(d.enc_ratio) + " does not divide");
+                if (!one_frame(m))
+                    return no("'" + m.name + "' is " + std::to_string(m.enc_h) + "x" +
+                              std::to_string(m.enc_w) +
+                              ", a single frame larger than the video encoder's capacity");
                 j.enc_q.push_back({RAD_ENC_IMAGE, m.index, (int32_t)i});
                 if (j.ref_tab.empty()) j.ref_tab.assign(2, 0);   /* [n_refs, n_keys] */
                 ++j.ref_tab[0];
@@ -602,6 +616,11 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
                 return no("'" + m.name + "' has encoder sides (" + std::to_string(m.enc_h) +
                           "x" + std::to_string(m.enc_w) + ") the VAE grid of " +
                           std::to_string(d.enc_ratio) + " does not divide");
+            if (!one_frame(m))
+                return no("'" + m.name + "' is " + std::to_string(m.enc_h) + "x" +
+                          std::to_string(m.enc_w) +
+                          ", a single frame larger than the video encoder's capacity; a keyframe "
+                          "encodes at the output resolution, so ask for a smaller size");
             if (j.ref_tab.empty()) j.ref_tab.assign(2, 0);   /* [n_refs, n_keys] */
             const int32_t slot = ++j.ref_tab[1];              /* keyframe order -> image slot 1, 2 */
             j.enc_q.push_back({RAD_ENC_IMAGE, slot, (int32_t)i});

@@ -2360,6 +2360,7 @@ static bool venc_geom(int64_t frames, int64_t h, int64_t w, int32_t* out) {
         return false;
     const int64_t clip = frames == 1 ? 1 : kVaeClipLength;
     const int64_t n_clips = frames == 1 ? 1 : (frames + kVaeClipLength - 1) / kVaeClipLength;
+    const int64_t t1 = (clip + 1) / 2, t2 = (t1 + 1) / 2;
     /* The side the buffers set the ceiling on, not a flat number: they hold ONE clip's pixels at
      * a time, sized for a full kVaeClipLength-frame clip at kEncMaxSide, so a media fits while
      * clip * h * w stays within that volume. A multi-frame reference video is unchanged -- clip
@@ -2369,14 +2370,29 @@ static bool venc_geom(int64_t frames, int64_t h, int64_t w, int32_t* out) {
      * across the TARGET grid (they are resized to the target canvas before the VAE, rad_ref2va_pack
      * ref2va_build), so an endpoint pin at output resolution is what the DiT attends to; the flat
      * kEncMaxSide cap used to refuse them at any output above 256. The slot-latent check below and
-     * step_venc's own overflow check bound the result; nothing here enlarges a buffer. */
-    if (clip * h * w > (int64_t)kVaeClipLength * kEncMaxSide * kEncMaxSide) return false;
+     * step_venc's own overflow check bound the result; nothing here enlarges a buffer.
+     *
+     * The cap is per VOLUME, not just the pixels volume: the temporal downsamplers shrink a full
+     * clip 17 -> 17 -> 9 -> 5 but a one-frame clip only 1 -> 1 -> 1 -> 1, so the deep buffers --
+     * 5 frames' worth at their side -- bind a single frame at h * w <= 5 * kEncMaxSide^2 (a
+     * ~572-sided square), not the 17-frame budget's 17 * kEncMaxSide^2. A 544x736 keyframe proved
+     * it: it
+     * passed the volume check, then the engine died on `venc.l3.in` 6256 > 5120 rows. The spatial
+     * divisor is the same on both sides of each comparison, so it cancels and only the temporal
+     * factors remain. */
+    {
+        const int64_t tv[5] = { clip, clip, t1, t2, t2 };
+        const int64_t fv[5] = { kVaeClipLength, kVaeClipLength, (kVaeClipLength + 1) / 2,
+                                ((kVaeClipLength + 1) / 2 + 1) / 2,
+                                ((kVaeClipLength + 1) / 2 + 1) / 2 };
+        for (int i = 0; i < 5; ++i)
+            if (tv[i] * h * w > fv[i] * (int64_t)kEncMaxSide * kEncMaxSide) return false;
+    }
     const int64_t lat = vae_latent_frames(frames);
     const int64_t full = vae_clip_latents(clip);
     const int64_t last = lat - full * (n_clips - 1);
     if (lat < 1 || full < 1 || last < 1 || last > full) return false;
     if (!out) return true;   /* the export's validation call, which wants only the answer */
-    const int64_t t1 = (clip + 1) / 2, t2 = (t1 + 1) / 2;
     const int64_t g[5][3] = { { clip, h, w }, { clip, h / 2, w / 2 }, { t1, h / 4, w / 4 },
                               { t2, h / 8, w / 8 }, { t2, h / 16, w / 16 } };
     int32_t* o = out;
