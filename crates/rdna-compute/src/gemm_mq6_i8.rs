@@ -71,6 +71,9 @@ const MQ6_I8_PM_NR_TOKENS: usize = 128;
 /// Kernarg byte offsets of the entry's `norm` and `rope` pointers; the 40-byte
 /// explicit prefix is the other entries', the hidden block fills 40..296.
 const MQ6_I8_PM_NR_NORM_OFFSET: usize = 296;
+/// `HIPFIRE_QWEN4_QSA_NORM_EPI` (developer, kill switch): on unless `0`; acted on for exact gfx1201 only.
+static QWEN4_QSA_NORM_EPI: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_NORM_EPI", true));
 /// Head width and RoPE width the entry is built for.
 pub const QSA_NORM_EPI_HEAD_DIM: usize = 256;
 pub const QSA_NORM_EPI_ROTARY_DIM: usize = 64;
@@ -488,7 +491,7 @@ impl Gpu {
         y: &GpuTensor,
         head_stride_rows: usize,
     ) -> bool {
-        self.flags.qwen4_qsa_norm_epi_enabled()
+        (self.arch == "gfx1201" && *QWEN4_QSA_NORM_EPI)
             && y.dtype == DType::F32
             && matches!(head_stride_rows, 256 | 512)
             && m % head_stride_rows == 0
