@@ -65,8 +65,9 @@ echo "serving $MODEL_FILE with EXTRA_FLAGS=$EXTRA_FLAGS"
 IMAGE="local/radiance"
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     # The in-image host test suite has tight CPU budgets that this machine runs over: relax
-    # tokenizer_test 20 -> 25 s, give the gbnf_test shards 15 s (default 10 s), and give the
-    # upgraded arch_test 20 s (it spends ~11 s of CPU here, over the 10 s default) for the build.
+    # tokenizer_test 20 -> 25 s, give the gbnf_test shards and glm5next_test 15 s (default 10 s),
+    # and give the upgraded arch_test 20 s (it spends ~11 s of CPU here, over the 10 s default)
+    # for the build.
     # Budgets are looked up by binary name, so gbnf_test covers all four shards. Revert on a
     # successful build to keep the subtree clean; a failed build leaves the edits in place.
     cmake="$CURDIR/radiance/tests/CMakeLists.txt"
@@ -75,6 +76,8 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 	sed -i '/^set(RAD_TEST_CPU_BUDGET_tokenizer_test 25)/a set(RAD_TEST_CPU_BUDGET_gbnf_test 15)' "$cmake"
     grep -q '^set(RAD_TEST_CPU_BUDGET_arch_test 20)$' "$cmake" || \
 	sed -i '/^set(RAD_TEST_CPU_BUDGET_gbnf_test 15)/a set(RAD_TEST_CPU_BUDGET_arch_test 20)' "$cmake"
+    grep -q '^set(RAD_TEST_CPU_BUDGET_glm5next_test 15)$' "$cmake" || \
+	sed -i '/^set(RAD_TEST_CPU_BUDGET_arch_test 20)/a set(RAD_TEST_CPU_BUDGET_glm5next_test 15)' "$cmake"
     (
 	cd "$CURDIR/radiance" || exit
 	docker build --progress=plain -t "$IMAGE" --build-arg GPU_TARGETS=gfx1201 .
