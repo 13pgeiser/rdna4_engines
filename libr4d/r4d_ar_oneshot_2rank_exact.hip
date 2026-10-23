@@ -18,6 +18,7 @@
 //  * Fine-grained memory (hipDeviceMallocFinegrained) is uncached and posted straight to the
 //    fabric, so system-scope release/acquire skip the L2 writeback. The drain/acq fences are
 //    selectable (default drain=1/acq=0 on fine-grained).
+#include <cstdlib>
 #include "r4d.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
@@ -78,6 +79,14 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   int end = start + w; if (end > n16) end = n16;
   unsigned int hck = 0u;   // the push check (r4d_ar_seq.h)
 
+  // drain 4, tests only (R4D_AR_TEST_LATE_PUSH, r4d_selftest): the flag goes out before the push
+  // and the push ~20 us after it, so the peer sees a flag whose bytes have not landed -- what a
+  // push over PCIe P2P now and then does on its own -- on every launch.
+  if (drain == 4) {
+    if (tid == 0) store_sys_rel(&peer_flags[b], s);
+    const unsigned long long t0 = wall_clock64();
+    while (wall_clock64() - t0 < 2000ull) __builtin_amdgcn_s_sleep(8);   // 100 MHz: 20 us
+  }
   // Push the chunk to the peer slot, 4x unrolled for memory-level parallelism.
   {
     int k = start + tid;
@@ -97,13 +106,13 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
   //  3 = all-thread s_wait_storecnt 0: every wave drains its posted writes with no L2
   //      writeback-invalidate; PCIe keeps posted writes to one peer ordered, so the release flag
   //      lands after the data. Correct only for fine-grained memory (coarse leaves data in L2).
-  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s);
+  r4d_archk_put(hck, peer_flags, nbw, (unsigned)slot, (unsigned)b, s, drain == 4);
   if (drain == 1) __threadfence_system();
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
   __syncthreads();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
-    store_sys_rel(&peer_flags[b], s);
+    if (drain != 4) store_sys_rel(&peer_flags[b], s);
     unsigned long long z = 0;
     // A handshake that cannot complete is a lockstep violation; trap rather than sum stale bytes.
     while (r4d_ar_seq_behind(load_sys_acq(&my_flags[b]), s)) {
@@ -550,6 +559,9 @@ void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_fl
   if (nt < 64) nt = 64;
   if (nt > 1024) nt = 1024;
   nt &= ~31;   // whole waves: the push check's wave sum reads all 32 lanes
+  // Tests only: every push lands after its flag (drain 4 above). Not in the tuning table, so no
+  // tuner can pick it.
+  if (const char* e = std::getenv("R4D_AR_TEST_LATE_PUSH"); e && *e == '1') drain = 4;
 #define L(T, LN) r4d_ar_oneshot_2rank_exact_kernel<T, LN><<<nb, nt, 0, st>>>(              \
     (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,        \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,              \

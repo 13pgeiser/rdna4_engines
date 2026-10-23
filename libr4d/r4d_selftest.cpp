@@ -23022,6 +23022,32 @@ static void ar_two_rank_sweep(const Plugin& pl, const std::vector<int>& devs, co
     if (row->fini) { row->fini(a.inst); row->fini(b.inst); }
 }
 
+/* Every peer push landing after its flag (the kernel's test mode, R4D_AR_TEST_LATE_PUSH): a push
+ * over PCIe P2P sometimes lands a microsecond or more after the release flag that follows it, so a
+ * reader that trusted the flag would sum the slot's previous contents. The push check
+ * (r4d_ar_seq.h) makes the reader wait for the bytes; here every launch of the sweep needs it. */
+static void ar_two_rank_late(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if (devs.size() < 2) { skip(name, "fewer than two gfx1201 cards"); return; }
+    setenv("R4D_AR_TEST_LATE_PUSH", "1", 1);
+    ArSweep a{ row, 0, devs[0] }, b{ row, 1, devs[1] };
+    std::thread ta(ar_sweep_worker, &a), tb(ar_sweep_worker, &b);
+    ta.join();
+    tb.join();
+    unsetenv("R4D_AR_TEST_LATE_PUSH");
+    ok("2-rank all-reduce init, pushes landing after their flags",
+       a.rc_init == RAD_OK && b.rc_init == RAD_OK,
+       "rc " + std::to_string(a.rc_init) + "/" + std::to_string(b.rc_init));
+    if (a.rc_init != RAD_OK || b.rc_init != RAD_OK) return;
+    ok("2-rank all-reduce, every push landing ~20 us after its flag, 32 rounds, every sum exact on "
+       "both ranks",
+       a.rc_launch == RAD_OK && b.rc_launch == RAD_OK && a.bad == 0 && b.bad == 0,
+       "rc " + std::to_string(a.rc_launch) + "/" + std::to_string(b.rc_launch) + ", " +
+       std::to_string(a.bad + b.bad) + " elements wrong");
+    if (row->fini) { row->fini(a.inst); row->fini(b.inst); }
+}
+
 /* ------------------------------------------------------------------ the two-rank all-gather */
 /* The payload is what the vocab-parallel sampler gathers: (u32 global token id, f32 logit) pairs.
  * A token id's bit pattern read as f32 is a denormal, so an all-gather emulated by an all-reduce
@@ -28499,6 +28525,7 @@ static void device_phase(const Plugin& pl) {
                 if (!std::strcmp(base, "ar_oneshot_2rank_exact")) {
                     ar_two_rank(pl, devs, n.c_str());
                     ar_two_rank_sweep(pl, devs, n.c_str());
+                    ar_two_rank_late(pl, devs, n.c_str());
                 } else {
                     gather_two_rank(pl, devs, n.c_str());
                 }
