@@ -829,3 +829,32 @@ fn set_nr_validates_only_on_the_wide_row_tile() {
         assert!(mq6_i8_gemm::emit(Spec::emulation(Epi::SetNr).with_tile(tile)).is_err());
     }
 }
+
+/// The norm+RoPE epilogue changes nothing in the K loop: `set_nr`'s hot-loop census equals the plain
+/// `256x128` entry's, the kernel stays inside the occupancy ceiling, and what it adds after the K
+/// loop is the documented epilogue: four staging passes and the RoPE exchange (16 b128 stores
+/// each), the inverse-RMS store, one `v_rsq_f32` and 13 barriers (the K loop's rings retire, two per
+/// staging pass, two each for the inverse RMS and the exchange).
+#[test]
+fn set_nr_keeps_the_hot_loop_and_adds_the_documented_epilogue() {
+    let plain = mq6_i8_gemm::emit(Spec::product(Epi::Set).with_tile(Tile::T256x128)).unwrap();
+    let nr = mq6_i8_gemm::emit(Spec::product(Epi::SetNr).with_tile(Tile::T256x128)).unwrap();
+    assert_eq!(
+        mq6_i8_gemm::hot_loop_census(&plain.s_text),
+        mq6_i8_gemm::hot_loop_census(&nr.s_text)
+    );
+    assert!(nr.shape.next_free_vgpr <= spec::VGPR_CEILING);
+    assert_eq!(nr.shape.wmma, plain.shape.wmma);
+    let count = |text: &str, name: &str| {
+        text.lines()
+            .filter(|l| l.trim().split_whitespace().next() == Some(name))
+            .count()
+    };
+    let added = |name: &str| count(&nr.s_text, name) - count(&plain.s_text, name);
+    assert_eq!(added("v_rsq_f32_e32"), 1);
+    assert_eq!(added("ds_store_b32"), 1);
+    assert_eq!(added("ds_store_b128"), 5 * 16);
+    assert_eq!(added("s_barrier_signal"), 13);
+    assert_eq!(added("s_barrier_wait"), 13);
+    assert_eq!(added("v_wmma_i32_16x16x16_iu8"), 0);
+}
