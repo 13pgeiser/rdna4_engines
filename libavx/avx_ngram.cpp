@@ -668,11 +668,64 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     return RAD_OK;
 }
 
+/* The on-demand regime: decode steps want a hundred-odd rows now. The session's hot rows are
+ * READY in the cache and decode from it; anything else is read straight from the file into its
+ * output row -- no claims, no eviction bookkeeping, no queue round trip, no waiting on anybody.
+ * Misses read here are deliberately not cached: the chunked prefill before decode has already
+ * cached the prompt's rows, and a decode step's occasional new trigram is not worth a claim. */
+constexpr long long kOnDemandMaxRows = 4096;
+
+int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
+                    avx::RowDecode decode, const uint16_t* lut) {
+    Gather& g = gather_state();
+    const long long M = q.M, n = q.row_bytes, ne = q.n_embd, x_ld = q.x_ld;
+    const long long base = tf.off + (long long)(q.tab - tf.lo);
+    auto row_of = [&](long long m) { return (long long)q.ids[m] - q.voff; };
+    auto pad    = [&](long long id) { return id < 0 || id >= q.n_vocab; };
+    auto key_of = [&](long long m) { return (uint64_t)(base + row_of(m) * n); };
+
+    g.src.clear();
+    g.dst.clear();
+    g.reads.clear();
+    const auto tf0 = std::chrono::steady_clock::now();
+    for (long long m = 0; m < M; ++m) {
+        uint16_t* dst = q.out + m * x_ld;
+        if (pad(row_of(m))) { std::memset(dst, 0, (size_t)ne * sizeof(uint16_t)); continue; }
+        const uint64_t key = key_of(m);
+        int64_t s = -1;
+        if (rc.lookup(key, &s) == RowCache::HIT) {
+            g.src.push_back(rc.data + (size_t)s * (size_t)n);
+            g.dst.push_back(dst);
+            ++t_ple.hits;
+            continue;
+        }
+        g.reads.push_back({m, key, -1});            /* direct read, no claim */
+        ++t_ple.none;
+    }
+    t_ple.find_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf0).count();
+    if (!g.reads.empty()) {
+        const auto tr0 = std::chrono::steady_clock::now();
+        const int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+        t_ple.pub_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr0).count();
+        if (rs != RAD_OK) return rs;
+    }
+    const auto td0 = std::chrono::steady_clock::now();
+    if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+    t_ple.dec_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+    return RAD_OK;
+}
+
 /* out[m] = decoded row ids[m] - voff for every m < M, through the cache: find or claim each row
  * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
  * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
                 long long first, avx::RowDecode decode, const uint16_t* lut) {
+    /* Two regimes. A decode step wants a hundred-odd rows now: on-demand, direct, no queue. A
+     * prefill chunk wants tens of thousands and has a known future: the producer-consumer queue. */
+    if (q.M <= kOnDemandMaxRows) return gather_ondemand(tf, rc, rr, q, decode, lut);
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
