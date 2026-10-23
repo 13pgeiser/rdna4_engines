@@ -343,10 +343,10 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
         if (host) {
             sc = r4d_ar_host_alloc((long)nslots * in->slot_bytes);
-            fl = r4d_ar_host_alloc(flag_words * 4);
+            fl = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4);
         } else {
             sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
-            fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
+            fl = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4, 1, handle, &hlen);
         }
         sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
