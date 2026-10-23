@@ -2764,6 +2764,79 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
 
+/// Exact-gfx1100 int8-activation small-batch MQ4G256V2 GEMV for speculative
+/// verify (default on exact gfx1100, `HIPFIRE_GFX1100_Q8X_VERIFY=0` off; see
+/// `gemv_q8x.rs`; registered in `kernel_registry.rs` for the gfx1100 pack): the
+/// activation quantizer and the v4 (persistent, all of K in LDS) / v3
+/// (LDS-staged chunks, two rows per warp) GEMVs, one module per batch (2..=5)
+/// and residual flavour, each with a `_multi` twin for up to four weights.
+pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
+    "#define Q8X_QUANT 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+);
+macro_rules! gemv_mq4g256v2_q8x_v4_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV4 1\n#define Q8X3_R 8\n#define Q8X3_P 3\n#define Q8X3_NT 1\n",
+            "#define Q8X3_LDSKB 64\n#define Q8X4_XP 0\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+        )
+    };
+}
+macro_rules! gemv_mq4g256v2_q8x_v3_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV3 1\n#define Q8X3_R 8\n#define Q8X3_W 2\n#define Q8X3_P 2\n",
+            "#define Q8X3_NT 1\n#define Q8X3_LDSKB 32\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")
+        )
+    };
+}
+pub const GEMV_MQ4G256V2_Q8X_V4_B2_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("2", "", "mq4v2_q8x_v4_b2");
+pub const GEMV_MQ4G256V2_Q8X_V4_B2_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("2", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b2_res");
+pub const GEMV_MQ4G256V2_Q8X_V4_B3_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("3", "", "mq4v2_q8x_v4_b3");
+pub const GEMV_MQ4G256V2_Q8X_V4_B3_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("3", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b3_res");
+pub const GEMV_MQ4G256V2_Q8X_V4_B4_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("4", "", "mq4v2_q8x_v4_b4");
+pub const GEMV_MQ4G256V2_Q8X_V4_B4_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v4_source!("4", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v4_b4_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B2_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("2", "", "mq4v2_q8x_v3_b2");
+pub const GEMV_MQ4G256V2_Q8X_V3_B2_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("2", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b2_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B3_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("3", "", "mq4v2_q8x_v3_b3");
+pub const GEMV_MQ4G256V2_Q8X_V3_B3_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("3", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b3_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B4_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("4", "", "mq4v2_q8x_v3_b4");
+pub const GEMV_MQ4G256V2_Q8X_V3_B4_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("4", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b4_res");
+pub const GEMV_MQ4G256V2_Q8X_V3_B5_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("5", "", "mq4v2_q8x_v3_b5");
+pub const GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC: &str =
+    gemv_mq4g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b5_res");
+
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
