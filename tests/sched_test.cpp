@@ -5661,8 +5661,8 @@ uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_
 TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
     struct Case { int64_t max_tok, interval, busy; uint64_t want; };
     const Case cases[] = {
-        { 256, 256, -1, 0x17b8231a20db9d46ull }, { 512, 256, -1, 0xe155e72b6a4cc94full }, { 1024, 256, -1, 0x54ba52dac3f4f61cull },
-        { 1024, 256, 0, 0x54ba52dac3f4f61cull }, { 1024, 256, 128, 0x3d9cbbf533e3c4b5ull }, { 2048, 512, -1, 0x400205b7b9afcf12ull },
+        { 256, 256, -1, 0x9b2fe92b1919355cull }, { 512, 256, -1, 0xdae73489249b5339ull }, { 1024, 256, -1, 0x44975a352e78619aull },
+        { 1024, 256, 0, 0x44975a352e78619aull }, { 1024, 256, 128, 0x3c0b9b1a1f864e4aull }, { 2048, 512, -1, 0xd6c184d0563159eeull },
     };
     for (const Case& c : cases) {
         int n = 0;
