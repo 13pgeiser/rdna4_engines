@@ -68,6 +68,10 @@ struct ActFP8 {
      * epilogue), so an int8 linear reading it declares no quantiser. Set by the model when it
      * declares the pair, before the wires are copied. */
     bool    q8_fed = false;
+    /* With q8_fed: the producer's int8 codes are rotated, had_quant_act_i8g's (a `_had_quant_i8g`
+     * producer), so only a weight stored rotated (LinearFP8 at i8a8h) reads them, and it declares
+     * no quantiser of its own. Set by the model with q8_fed. */
+    bool    q8_rot = false;
 
     /* The code pair the producer writes: int8 when the model fed it, E4M3 otherwise. */
     rad_buf cq() const { return q8_fed ? q8 : q; }
@@ -368,6 +372,8 @@ struct NormQuantFP8 {
      * (the T * n_embd * 2-byte message then crosses --tp-wire-min-kb). The wire is a declare-time
      * parameter, hence a separate op. */
     rad_op     op_arn6 = 0;
+    /* The ops write had_quant_act_i8g's rotated int8 codes into the int8 pair (ActFP8::q8_rot). */
+    bool       hi8 = false;
     Geom       gm{};
     /* The row width, for turning a row slice into element offsets. */
     int64_t    n = 0;
@@ -401,8 +407,12 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
                         "linears are bf16; its blocks take a prepared input instead\n");
         return RAD_E_UNSUPPORTED;
     }
-    if (!src || !a.x || !a.q || !a.s || !w || n <= 0) return RAD_E_INVAL;
-    op = RAD_OP(b, "rmsnorm_quant_fp8",
+    /* Rotated int8 codes (ActFP8::q8_rot) come from the `_had_quant_i8g` twins, into the int8
+     * pair; the model checked they are declared before feeding. Otherwise E4M3, as always. */
+    hi8 = a.q8_fed && a.q8_rot;
+    const rad_buf cq = hi8 ? a.q8 : a.q, cs = hi8 ? a.s8 : a.s;
+    if (!src || !a.x || !cq || !cs || !w || n <= 0) return RAD_E_INVAL;
+    op = RAD_OP(b, hi8 ? "rmsnorm_had_quant_i8g" : "rmsnorm_quant_fp8",
                 RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
                            RAD_INT("n", n), RAD_F64("eps", g.eps),
                            RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
@@ -413,7 +423,7 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
      * lifetime-extended. `residual` is INOUT, so it is in both sets; otherwise the planner could
      * reorder a reader around it. */
     rad_buf rd[2] = { src, res };
-    rad_buf wr[4] = { a.q, a.s, a.x, res };
+    rad_buf wr[4] = { cq, cs, a.x, res };
     rad_op_reads (b, op, rd, res ? 2 : 1);
     rad_op_writes(b, op, wr, res ? 4 : 3);
 
@@ -425,7 +435,7 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
      * with `x` the stream and no residual. The kernel supports it (r4d_fused_quant_fp8.hip) and the
      * schema marks `residual` optional. */
     if (fuse_ar && g.world == 2) {
-        op_arn = RAD_OP(b, "ar_rmsnorm_quant_fp8",
+        op_arn = RAD_OP(b, hi8 ? "ar_rmsnorm_had_quant_i8g" : "ar_rmsnorm_quant_fp8",
                         RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
                                    RAD_INT("n", n), RAD_F64("eps", g.eps),
                                    RAD_INT("group", RAD_FP8_BLOCK),
@@ -433,14 +443,14 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
                                    RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd)),
                         RAD_WEIGHTS(w));
         if (!op_arn) return RAD_E_INVAL;
-        rad_buf wr_ar[4] = { a.q, a.s, a.x, res ? res : src };
+        rad_buf wr_ar[4] = { cq, cs, a.x, res ? res : src };
         rad_op_reads (b, op_arn, rd, res ? 2 : 1);
         rad_op_writes(b, op_arn, wr_ar, 4);
 
         /* Only where the compressed wire is reachable and servable: a lossy payload accepted, and
          * the width tiled by the chunk (otherwise a fatal step-time shape refusal). */
         if (fuse_ar != kArExact && !g.wire_exact && (n % kArWire6Chunk) == 0) {
-            op_arn6 = RAD_OP(b, "ar_rmsnorm_quant_fp8",
+            op_arn6 = RAD_OP(b, hi8 ? "ar_rmsnorm_had_quant_i8g" : "ar_rmsnorm_quant_fp8",
                              RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
                                         RAD_INT("n", n), RAD_F64("eps", g.eps),
                                         RAD_INT("group", RAD_FP8_BLOCK),
@@ -464,8 +474,8 @@ inline void NormQuantFP8::step(RadCtx* c, int64_t T, int64_t r0, int64_t rows) c
     if (rows <= 0) rows = T - r0;
     RAD_ISSUE_N(c, pick(rows), rows, brow_slice(src, r0, rows, n),
                 res ? brow_slice(res, r0, rows, n) : RAD_NONE, RAD_W(w),
-                brow_slice(a.q, r0, rows, n),
-                brow_slice(a.s, r0, rows, n / RAD_FP8_BLOCK),
+                brow_slice(hi8 ? a.q8 : a.q, r0, rows, n),
+                brow_slice(hi8 ? a.s8 : a.s, r0, rows, n / RAD_FP8_BLOCK),
                 brow_slice(a.x, r0, rows, n));
 }
 
@@ -521,7 +531,10 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
     clamped_fused = false;
     if (!std::isfinite(limit) || limit < 0) return RAD_E_INVAL;
     if (clipped) {
-        if (!gate_up || !a.x || n <= 0 || rot || std::strcmp(act_name, "silu")) return RAD_E_INVAL;
+        /* No rotated int8 form: its quantiser would be quant_act_i8g, unrotated. */
+        if (!gate_up || !a.x || n <= 0 || rot || (a.q8_fed && a.q8_rot) ||
+            std::strcmp(act_name, "silu"))
+            return RAD_E_INVAL;
         const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
         if (fuse_clamped && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
             rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
@@ -575,9 +588,13 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
     if (!gate_up || !a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
     /* Rotated codes feed a four-bit expert, which reads E4M3 only. */
     if (rot && a.q8_fed) return RAD_E_INVAL;
+    /* Rotated int8 codes (ActFP8::q8_rot) feed a down projection stored at i8a8h:
+     * gated_had_quant_i8g, which the model checked is declared before feeding. */
+    const bool hi8 = a.q8_fed && a.q8_rot;
     const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
+    const char* gq = hi8 ? "gated_had_quant_i8g" : rot ? "gated_had_quant_fp8" : "gated_quant_fp8";
     if (!rot || rad_op_declared(b, "gated_had_quant_fp8"))
-        op = RAD_OP(b, rot ? "gated_had_quant_fp8" : "gated_quant_fp8",
+        op = RAD_OP(b, gq,
                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),
                                RAD_STR("act", act_name)),
@@ -1064,14 +1081,16 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * of 128. The codes come from the producer (ActFP8::q8_fed) or from op_q over `a.x` (probe()
      * set reads_x). The model must have declared the pair (ActFP8::declare_qs's `i8`).
      *
-     * A rotated weight (i8a8h) takes had_quant_act_i8g instead, so it always quantises its own
-     * input: a producer's codes are unrotated. */
+     * A rotated weight (i8a8h) takes had_quant_act_i8g instead. It reads a producer's codes only
+     * when they are rotated too (ActFP8::q8_rot, a `_had_quant_i8g` producer); a plain int8 weight
+     * only when they are not. */
     const bool rot8 = known && linear_is_w8h(enc);
     i8 = known && (linear_is_w8(enc) || rot8);
     if (i8) {
-        if (rot8 && a.q8_fed) {
-            fprintf(stderr, "radiance: '%s' is a rotated int8 weight and its input is fed codes "
-                            "its producer wrote unrotated\n", wn);
+        if (a.q8_fed && rot8 != a.q8_rot) {
+            fprintf(stderr, "radiance: '%s' is a%s int8 weight and its input is fed codes its "
+                            "producer wrote %s\n", wn, rot8 ? " rotated" : " plain",
+                    rot8 ? "unrotated" : "rotated");
             return RAD_E_DTYPE;
         }
         if (!a.x || !a.q8 || !a.s8) {
@@ -1496,18 +1515,52 @@ struct DenseFP8 {
     /* The caller made the name map (a row range of a checkpoint tensor); declare() does not. */
     bool       mapped = false;
 
+    /* `mapped`: the caller made the name map already, to ask the encoding before choosing this
+     * struct over another grid's -- a COPY map declared twice is refused (rad_builder.cpp). */
     int declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
                 int access, int shard, RadWeightGroup grp,
                 std::initializer_list<const char*> src,
-                std::initializer_list<int64_t> row_parts = {});
-    /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi. */
+                std::initializer_list<int64_t> row_parts = {}, bool mapped = false);
+    /* Rows [lo, hi) of the stored block-fp8 weight `src_wn` (codes and scale plane; mapped by
+     * whoever declared it), read as an [hi - lo, K] weight named `<base>`: a row slice that need
+     * not be a rank's even share, and may be the same rows on every rank. Whole 128-row blocks,
+     * so each slice's codes and scales are the stored ones. fp8 only: an MXFP4 linear's GEMM
+     * splits K by its own rule. A slice issued with `gemm(..., split_n)` set to the stored width
+     * computes the stored linear's outputs to the bit. */
+    int declare_slice(RadBuilder* b, Names& nm, const char* base, const char* src_wn, int64_t lo,
+                      int64_t hi, int64_t K, int access, RadWeightGroup grp) {
+        if (lo < 0 || hi <= lo || lo % RAD_FP8_BLOCK || hi % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK)
+            return RAD_E_INVAL;
+        mx  = false;
+        ref = 0;
+        const char* wn = nm.f("%s.weight", base);
+        const char* sn = nm.f("%s.scale", base);
+        const bool own = !std::strcmp(wn, src_wn);   /* the stored weight's own name */
+        w = decl_view(b, wn, own ? nullptr : src_wn, "codes", RAD_F8E4M3, { hi - lo, K }, access,
+                      RAD_SHARD_ROW, grp);
+        s = decl_view(b, sn, src_wn, "scale", RAD_BF16, { fp8_blocks(hi - lo), fp8_blocks(K) },
+                      access, RAD_SHARD_ROW, grp);
+        if (!w || !s) return RAD_E_INVAL;
+        RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
+        return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
+    }
+    /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi.
+     * `split_n`, when set, is the stored width a row slice takes its K split from (docs/OPS.md). */
     rad_op gemm(RadBuilder* b, int64_t hi, int64_t N, int64_t K,
-                std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes) const {
+                std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes,
+                int64_t split_n = 0) const {
         if (mx)
             return rw(b, RAD_OP(b, "gemm_nt_q",
                           RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
                                      RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
                           RAD_WEIGHTS(w, s, ref)),
+                      reads, writes);
+        if (split_n > 0)
+            return rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8"),
+                                     RAD_INT("split_n", split_n)),
+                          RAD_WEIGHTS(w, s)),
                       reads, writes);
         return rw(b, RAD_OP(b, "gemm_nt_q",
                       RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
@@ -1522,7 +1575,7 @@ struct DenseFP8 {
 inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
                              int access, int shard, RadWeightGroup grp,
                              std::initializer_list<const char*> src,
-                             std::initializer_list<int64_t> row_parts) {
+                             std::initializer_list<int64_t> row_parts, bool mapped) {
     if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
 
     /* ---- OCP-MXFP4, from the weight's encoding. The exponent grid is one row tall, so parts need

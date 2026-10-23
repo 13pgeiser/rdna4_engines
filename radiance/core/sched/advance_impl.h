@@ -159,6 +159,23 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     case ADV_TAKE:
         S.tok[a.round] = a.src[(int64_t)i * a.src_pitch];
         return;
+    case ADV_BLOCK: {
+        /* A block drafter's query row: the anchor (the token the verify just chose) at the
+         * committed end, where the next verify starts, then `aux`, the mask id, at every position
+         * after it. The host staged the furthest the anchor can be. */
+        const int32_t base = S.ctx;
+        tok[k] = S.tok[0];
+        for (int32_t j = 1; j < n; ++j) tok[k + j] = aux;
+        for (int32_t j = 0; j < n; ++j) adv_pos(a, pos, k + j, base + j);
+        ctx[i] = base;
+        adv_groups(a, i, k, base, n);
+        return;
+    }
+    case ADV_BTAKE:
+        /* Row i is the query pass's i-th block, which is the i-th drafting sequence. */
+        for (int32_t j = 0; j < a.round; ++j)
+            S.tok[1 + j] = a.src[(int64_t)i * a.src_pitch + j];
+        return;
     default:
         return;
     }

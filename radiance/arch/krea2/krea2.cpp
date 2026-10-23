@@ -73,6 +73,11 @@ enum { kMaxLanes = 8 };
 static const int kTaps[] = { 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35 };
 enum { kNTaps = 12 };
 
+/* The rebalance a request may ask for (`rebalance`, RAD_GEN_COND_REBALANCE): every tap times a fixed
+ * gain before the text fusion, ComfyUI's ConditioningKrea2Rebalance (nova452) at its defaults --
+ * multiplier 4 times the per-layer weights 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1. */
+static const double kRebalance[] = { 4, 4, 4, 4, 4, 4, 4, 10, 20, 4.4, 16, 4 };
+
 static const char* kSysPrompt =
     "Describe the image by detailing the color, shape, size, texture, quantity, text, spatial "
     "relationships of the objects and background:";
@@ -85,6 +90,8 @@ struct TeLayer {
     GateQuantFP8 gq{};
     rad_op     op_n1 = 0, op_qkr = 0, op_attn = 0, op_ar1 = 0, op_add1 = 0;
     rad_op     op_n2 = 0, op_ar2 = 0, op_add2 = 0, op_tap = 0;
+    rad_op     op_gain = 0;   /* the tap's rebalance gain into te.h2 */
+    rad_op     op_tap_g = 0;  /* the scatter from te.h2, when rebalanced */
     int        tap = -1;      /* this layer's output is tap `tap`, or none */
 };
 
@@ -131,6 +138,7 @@ struct Model {
     ActFP8  a_th{}, a_tattn{}, a_tffn{};
     std::vector<TeLayer> te;
     rad_buf b_taps = 0;        /* [T * 12, n_embd]: token t's tap i at row 12 t + i */
+    std::string tap_mul[kNTaps];   /* chan_affine's `mul` for each tap's rebalance gain */
 
     /* ---- the text fusion: the layer-wise blocks over the taps themselves, the refiner blocks
      * over the mixed rows `b_ft` */
@@ -297,6 +305,36 @@ static int check_format(const RadModelMeta* meta) {
     return RAD_OK;
 }
 
+/* ================================================================== adapter key names */
+/* LoRA files for Krea 2 name the DiT and the text fusion by the reference code's modules
+ * (krea-ai/krea-2 mmdit.py): `blocks.N.attn.wq`, `txtfusion.refiner_blocks.N.mlp.up`, `tproj.1`;
+ * the container keeps diffusers' names. The language model takes no adapters. */
+static int declare_lora_names(RadBuilder* b) {
+    std::vector<LoraName> n;
+    static const char* const kInner[][2] = {
+        { "attn.wq", "attn.to_q" },   { "attn.wk", "attn.to_k" },  { "attn.wv", "attn.to_v" },
+        { "attn.wo", "attn.to_out.0" }, { "attn.gate", "attn.to_gate" },
+        { "mlp.gate", "ff.gate" },    { "mlp.up", "ff.up" },       { "mlp.down", "ff.down" },
+    };
+    static const char* const kBlocks[][2] = {
+        { "blocks.#.", "transformer_blocks.#." },
+        { "txtfusion.layerwise_blocks.#.", "text_fusion.layerwise_blocks.#." },
+        { "txtfusion.refiner_blocks.#.", "text_fusion.refiner_blocks.#." },
+    };
+    for (const auto& bl : kBlocks)
+        for (const auto& in : kInner)
+            n.push_back({ std::string(bl[0]) + in[0], std::string(bl[1]) + in[1] });
+    n.push_back({ "txtfusion.projector", "text_fusion.projector" });
+    n.push_back({ "txtmlp.1", "txt_in.linear_1" });
+    n.push_back({ "txtmlp.3", "txt_in.linear_2" });
+    n.push_back({ "first", "img_in" });
+    n.push_back({ "last_linear", "final_layer.linear" });
+    n.push_back({ "tmlp.0", "time_embed.linear_1" });
+    n.push_back({ "tmlp.2", "time_embed.linear_2" });
+    n.push_back({ "tproj.1", "time_mod_proj" });
+    return lora_names(b, "transformer.", kLoraDiffusionSpellings, n);
+}
+
 /* ================================================================== declare */
 static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gt;
@@ -340,6 +378,24 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         std::snprintf(sections, sizeof sections, "%d %d %d", (int)sec[0], (int)sec[1], (int)sec[2]);
     else
         std::snprintf(sections, sizeof sections, "24 20 20");
+
+    /* The rebalance gains, as chan_affine lists: the tap's row seen as rows of 64 channels. The
+     * scaled copy goes through te.h2, free between a layer's add and the next layer's projections,
+     * so the residual stream itself is never scaled. */
+    enum { kGainCh = 64 };
+    if (g.n_embd % kGainCh) return RAD_E_INVAL;
+    for (int t = 0; t < kNTaps; ++t) {
+        char v[32];
+        std::snprintf(v, sizeof v, "%.9g", kRebalance[t]);
+        m.tap_mul[t].clear();
+        for (int k = 0; k < kGainCh; ++k) {
+            if (k) m.tap_mul[t] += ' ';
+            m.tap_mul[t] += v;
+        }
+    }
+    static std::string zeros64;
+    if (zeros64.empty())
+        for (int k = 0; k < kGainCh; ++k) zeros64 += k ? " 0" : "0";
 
     /* Layers up to the last tap only. */
     const int n_run = kTaps[kNTaps - 1];
@@ -419,6 +475,22 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                     T));
         L.op_ar2 = all_reduce(b, g, m.b_th2, T);
         L.op_add2 = add_op(b, T, g.n_embd, m.b_tx, m.b_th2, m.b_tx);
+        if (L.tap >= 0) {
+            /* f32 arithmetic, rounded once into bf16 (`round` 0) */
+            L.op_gain = rw(b, RAD_OP(b, "chan_affine",
+                                     RAD_PARAMS(RAD_RANGE("M", 1, kTeRows), RAD_INT("n", kGainCh),
+                                                RAD_STR("mul", m.tap_mul[L.tap].c_str()),
+                                                RAD_STR("add", zeros64.c_str()),
+                                                RAD_STR("mode", "fma"), RAD_STR("dtype", "bf16"),
+                                                RAD_INT("round", 0)),
+                                     RAD_NOWEIGHTS),
+                           { m.b_tx }, { m.b_th2 });
+            L.op_tap_g = rw(b, RAD_OP(b, "scatter_rows",
+                                      RAD_PARAMS(RAD_RANGE("M", 1, kTeRows),
+                                                 RAD_INT("n", g.n_embd), RAD_STR("dtype", "bf16")),
+                                      RAD_NOWEIGHTS),
+                            { m.b_th2, m.b_tidx, m.b_taps }, { m.b_taps });
+        }
         if (L.tap >= 0)
             L.op_tap = rw(b, RAD_OP(b, "scatter_rows",
                                     RAD_PARAMS(RAD_RANGE("M", 1, kTeRows), RAD_INT("n", g.n_embd),
@@ -426,7 +498,7 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                     RAD_NOWEIGHTS),
                           { m.b_tx, m.b_tidx, m.b_taps }, { m.b_taps });
         if (!L.op_n1 || !L.op_qkr || !L.op_attn || !L.op_add1 || !L.op_n2 || !L.op_add2 ||
-            (L.tap >= 0 && !L.op_tap))
+            (L.tap >= 0 && (!L.op_tap || !L.op_gain || !L.op_tap_g)))
             return RAD_E_INVAL;
     }
     return m.op_embed && m.op_iota ? RAD_OK : RAD_E_INVAL;
@@ -1059,6 +1131,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_prev  = decl_b(b, nm.f("lat_preview"), RAD_BF16, { lane_rows, m.C }, RAD_BUF_PERSIST);
     m.b_store = decl_b(b, nm.f("cond_store"), RAD_BF16,
                        { 2 * (int64_t)kMaxLanes * kCondRows, gd.n_embd }, RAD_BUF_PERSIST);
+    RAD_ARCH_TRY(declare_lora_names(b));
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_fusion(b, meta, m));
     RAD_ARCH_TRY(declare_dit(b, meta, m));
@@ -1126,6 +1199,7 @@ static void step_te(RadCtx* c, const RadBatch* batch, const Model& m) {
     const Geom& g = m.gt;
     const int64_t T = batch->n_tok;
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
+    const bool rebalance = batch->gen_b && (batch->gen_b->cond_opts & RAD_GEN_COND_REBALANCE);
     RAD_ISSUE_N(c, m.op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok),
                 brows(m.b_tx, T));
     RAD_ISSUE_N(c, m.op_iota, T, brows(m.b_tidx, T));
@@ -1149,8 +1223,11 @@ static void step_te(RadCtx* c, const RadBatch* batch, const Model& m) {
         L.down.step(c, m.a_tffn, m.b_th2, T);
         if (L.op_ar2) RAD_ISSUE_N(c, L.op_ar2, T * g.n_embd, brows(m.b_th2, T), RAD_NONE);
         RAD_ISSUE_N(c, L.op_add2, T, brows(m.b_tx, T), brows(m.b_th2, T), brows(m.b_tx, T));
+        if (L.tap >= 0 && rebalance)
+            RAD_ISSUE_N(c, L.op_gain, T, brows(m.b_tx, T), brows(m.b_th2, T));
         if (L.tap >= 0)
-            RAD_ISSUE_N(c, L.op_tap, T, brows(m.b_tx, T), brows(m.b_tidx, T),
+            RAD_ISSUE_N(c, rebalance ? L.op_tap_g : L.op_tap, T,
+                        brows(rebalance ? m.b_th2 : m.b_tx, T), brows(m.b_tidx, T),
                         brow_slice(m.b_taps, L.tap, (int64_t)kTeRows * kNTaps - L.tap,
                                    g.n_embd));
     }

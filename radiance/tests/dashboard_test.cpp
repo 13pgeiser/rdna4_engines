@@ -122,6 +122,8 @@ struct Dash {
         sched.m.prefix_ckpt_lru = 3;
         sched.m.hit_cut_no_snapshot = 2;
         sched.m.hit_cut_tokens = 9000;
+        sched.m.hit_cut_resumed_below = 4;
+        sched.m.prefix_restore_cuts = 1;
         sched.m.draft_depth_seen = 2;
         sched.m.draft_pos_reached[0] = 10; sched.m.draft_pos_accepted[0] = 8;
         sched.m.draft_pos_reached[1] = 8;  sched.m.draft_pos_accepted[1] = 2;
@@ -239,6 +241,8 @@ TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
     CHECK(s.value("enabled", false));
     CHECK_EQ(s["linear"]["evictions"].value("store_full", (int64_t)0), (int64_t)3);
     CHECK_EQ(s["linear"]["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);
+    CHECK_EQ(s["linear"]["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
+    CHECK_EQ(s["moved"].value("restore_cuts", (int64_t)0), (int64_t)1);
     CHECK_EQ(s["linear"].value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
 }
 
@@ -269,6 +273,37 @@ TEST(stats_reports_how_long_bringup_took_once_the_server_listens) {
     /* 0 means "not yet", so it must not overwrite a measured figure. */
     d.srv->note_ready(0);
     CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)47);
+}
+
+/* The pooled ring's element shape is a contract between two functions in the page, and no
+ * browser runs here to notice when they disagree. accWindow pushes {ratio, dr, da}; acceptTriple
+ * iterates the ring as `d` and reads `last`. When a rename left acceptTriple reading accPrev's
+ * {r, a} instead, the pooled figures became NaN and the detail line froze at "recent -" while
+ * every C++ test stayed green (Turnstone judge slices 08 and 11, 2026-10-20). So: scan the page
+ * text and hold the two sides to the same names. */
+TEST(the_pooled_acceptance_ring_reads_the_names_accWindow_writes) {
+    Dash d(false);
+    const std::string p = d.srv->router().call("GET", "/").body;
+    const std::string aw = function_body(p, "function accWindow(");
+    const std::string at = function_body(p, "function acceptTriple(");
+    REQUIRE(!aw.empty() && !at.empty());
+    /* what goes INTO the ring */
+    CHECK(aw.find("dr: dr") != std::string::npos);
+    CHECK(aw.find("da: da") != std::string::npos);
+    /* what comes OUT of it: every `d.<field>` and `last.<field>` must be a ring name */
+    const std::set<std::string> ring = {"dr", "da"};
+    for (const std::string& n : fields(at, "d")) {
+        CHECK(ring.count(n) == 1);
+        if (!ring.count(n))
+            fprintf(stderr, "    acceptTriple reads d.%s, which the ring does not carry\n", n.c_str());
+    }
+    for (const std::string& n : fields(at, "last")) {
+        CHECK(ring.count(n) == 1);
+        if (!ring.count(n))
+            fprintf(stderr, "    acceptTriple reads last.%s, which the ring does not carry\n", n.c_str());
+    }
+    /* and the ring must not be empty by construction: the push is gated on dr > 0 */
+    CHECK(aw.find("dr <= 0") != std::string::npos);
 }
 
 TEST(every_field_the_page_reads_is_one_the_routes_emit) {

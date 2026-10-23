@@ -114,6 +114,10 @@ static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_st
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
+/* The control vector's projection: one unit direction per layer (f32) and an int32 per-row switch. */
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
+                                           P_STR("dtype") };
+static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 
 static const RadParamSpec pMtpEnter[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
                                             P_STR("dtype"), P_F64O("wadd"), P_INTO("ngroup"),
@@ -138,9 +142,9 @@ static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("h
     P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
-    P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+    P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
-    OPD_O("k_scale"), OPD("bt"), OPD("cu"), OPD("nc"), OUT("score") };
+    OPD_O("k_scale"), OPD("bt"), OPD("cu"), OPD("nc"), OUT("score"), OUT_O("cu_part") };
 static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT("scale"),
     OPD_O("page"), INOUT_O("cache") };
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
@@ -254,8 +258,10 @@ static const RadParamSpec pGemmBias[]   = { P_INT("M"), P_INT("N"), P_INT("K"), 
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
+/* `split_n` is libr4d's (docs/OPS.md); accepted and ignored here. */
 static const RadParamSpec pGemmQ[]        = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                              P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2") };
+                                              P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
+                                              P_INTO("split_n") };
 static const RadParamSpec pGemmQBias[]    = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                               P_STR("dtype") };
 static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b"), WGT("b_scale"),
@@ -550,11 +556,24 @@ static const RadOperandSpec oFlowEuler[]  = { OPD("v"), OPD("sigma"), OPD("sigma
                                               OPD("pair"), OPD("lane"), OPD("flags"), OPD("seed"),
                                               OPD("cu_seqlens"), OPD_O("inp_lat"), OPD_O("inp_mask"),
                                               INOUT("state"), INOUT_O("preview") };
+/* The k-diffusion sampler's input and step: `pred` "eps" or "v", the lanes f32. */
+static const RadParamSpec pKdStep[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("pred"),
+                                        P_STR("dtype") };
+static const RadOperandSpec oKdInput[] = { OPD("sigma"), OPD("pair"), OPD("lane"), OPD("flags"),
+                                           OPD("seed"), OPD("cu_seqlens"), INOUT("state"),
+                                           OUT("y") };
+static const RadOperandSpec oKdStep[]  = { OPD("out"), OPD("sigma"), OPD("sigma_next"),
+                                           OPD("sigma_prev"), OPD("cfg"), OPD("pair"), OPD("lane"),
+                                           OPD("flags"), OPD("seed"), OPD("sampler"), OPD("step"),
+                                           OPD("cu_seqlens"), INOUT("state"), INOUT("hist"),
+                                           INOUT_O("preview") };
 static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
                                             P_STR("mode"), P_STR("dtype"), P_INTO("round") };
 static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                           P_INT("stride"), P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
+static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
+                                        P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
@@ -813,6 +832,9 @@ static const RadOpSchema kSchemas[] = {
   "gate argument, and hc_write adds into the UNNORMED h). `mix` names the matrices' stored "
   "format; a host kernel reads them as the dense tensors it is handed." },
 { "hc_write", ARR(pHcWrite), ARR(oHcWrite), "h[s] += inj[s] * y, into the unnormed stream." },
+{ "hc_project", ARR(pHcProject), ARR(oHcProject),
+  "The control vector's projection (llama.cpp's `--cvec-mode project`): h[s] -= scale * "
+  "(h[s] . v) * v for each of the hc streams of a row whose flag is on. A zero flag is not read." },
 { "mtp_enter", ARR(pMtpEnter), ARR(oMtpEnter),
   "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc. `fc` names the two "
   "matrices' stored format; a host kernel reads them as the dense tensors it is handed." },
@@ -937,6 +959,9 @@ static const RadOpSchema kSchemas[] = {
 { "lora_expand", ARR(pLoraExpand), ARR(oLoraExpand),
   "y[m, n] += scale[slot[m], n] * sum_j t[m, j] * lora_b[slot[m], n, j]; a base row is neither "
   "read nor written." },
+{ "lora_expand_mm", ARR(pLoraExpand), ARR(oLoraExpand),
+  "lora_expand with t rounded to bf16, the sum over j in any order; a base row is neither read nor "
+  "written." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, byte for "
   "byte the pair. `N` is the weight's rows, twice the fused width; the output is [M, N/2]." },
@@ -1044,12 +1069,22 @@ static const RadOpSchema kSchemas[] = {
 { "flow_euler", ARR(pLane), ARR(oFlowEuler),
   "one flow-matching Euler step per entry that moves a lane, with guidance, the preview and the "
   "repaint's kept region; libref's roundings bit for bit." },
+{ "kd_input", ARR(pLane), ARR(oKdInput),
+  "a k-diffusion sampler's model input per entry that moves a lane: a first step's noise times "
+  "sqrt(1 + sigma^2) into the lane, then rd(x / sqrt(sigma^2 + 1)) at the entry's and its pair's "
+  "rows; libref's arithmetic bit for bit." },
+{ "kd_step", ARR(pKdStep), ARR(oKdStep),
+  "one k-diffusion sampler step per entry that moves a lane: the guided clean estimate from an "
+  "eps or v output, then Euler, Euler ancestral or DPM++ 2M; libref's arithmetic bit for bit." },
 { "chan_affine", ARR(pChanAffine), ARR(oUnary),
   "a per-channel affine from two lists of n bf16 values, `fma` or `inv`; `round` 0 keeps the "
   "lists and the arithmetic in f32, rounded once." },
 { "conv2d_nhwc", ARR(pConvNhwc), ARR(oConvNhwc),
   "an image convolution, channels innermost, as GEMMs over bands of patch rows; `up` 2 reads the "
   "input upsampled nearest-neighbour, `pad` same or down." },
+{ "im2col_nhwc", ARR(pIm2col), ARR(oUnary),
+  "conv2d_nhwc's receptive fields as rows, y [Hout * Wout, cin * k * k], column (ci * k + i) * k "
+  "+ j the value conv2d_nhwc multiplies weight[o, ci, i, j] by; libref's copies bit for bit." },
 { "l2norm_chan", ARR(pL2Norm), ARR(oL2Norm),
   "each pixel's channels to unit L2, times sqrt(n), times gamma (three roundings), then `act`." },
 { "d2s_add", ARR(pSpaceDepth), ARR(oSpaceDepth),
@@ -1060,6 +1095,8 @@ static const RadOpSchema kSchemas[] = {
 { "to_rgba8", ARR(pMnD), ARR(oUnary),
   "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them, u8 out." },
 { "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
+{ "gelu_quick", ARR(pMnD), ARR(oUnary),
+  "CLIP's quick_gelu, three roundings: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)." },
 { "scatter_add_rows", ARR(pMnD), ARR(oScatterRows),
   "x[idx[i]] += v[i], rounded to x's dtype; a negative index adds nothing." },
 { "attn_prefix_self", ARR(pAttnPS), ARR(oAttnPS),
@@ -1334,6 +1371,9 @@ ROWL("avx_hc_read", "hc_read", "norm",
      avx_layout_hc),
 SIMPLE("avx_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s] * y", DT_FLOAT,
        L(hc_write)),
+SIMPLE("avx_hc_project", "hc_project", "norm",
+       "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on", DT_FLOAT,
+       L(hc_project)),
 ROWL("avx_mtp_enter", "mtp_enter", "norm",
      "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc",
      DT_FLOAT ", or fc matrices of E4M3 / int8 codes with a scale plane, joined", L(mtp_enter),
@@ -1473,6 +1513,9 @@ SIMPLE("avx_lora_shrink", "lora_shrink", "gemm", "t = x A[slot]^T per row, base 
 SIMPLE("avx_lora_expand", "lora_expand", "gemm",
        "y += scale * (t B[slot]^T) per row, base rows untouched",
        "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y", L(lora_expand)),
+SIMPLE("avx_lora_expand_mm", "lora_expand_mm", "gemm",
+       "y += scale * (bf16(t) B[slot]^T) per row, base rows untouched",
+       "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y", L(lora_expand_mm)),
 SIMPLE("avx_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
        "gemm_nt_q over a gate_up plane with the gated E4M3 quantiser in the epilogue",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; fp8_e4m3 out, f32 scale",
@@ -1586,11 +1629,17 @@ SIMPLE("avx_randn_lanes", "randn_lanes", "elem", "a lane's rows from its seed's 
        DT_FLOAT, L(randn_lanes)),
 SIMPLE("avx_flow_euler", "flow_euler", "elem", "a flow-matching Euler step with guidance",
        DT_FLOAT, L(flow_euler)),
+SIMPLE("avx_kd_input", "kd_input", "elem", "a k-diffusion sampler's model input", DT_FLOAT,
+       L(kd_input)),
+SIMPLE("avx_kd_step", "kd_step", "elem", "a k-diffusion sampler step with guidance", DT_FLOAT,
+       L(kd_step)),
 SIMPLE("avx_chan_affine", "chan_affine", "elem", "a per-channel affine from parameter lists",
        DT_FLOAT, L(chan_affine)),
 SIMPLE("avx_conv2d_nhwc", "conv2d_nhwc", "conv",
        "an image convolution, channels innermost, as GEMMs over patch rows", DT_FLOAT,
        L(conv2d_nhwc)),
+SIMPLE("avx_im2col_nhwc", "im2col_nhwc", "elem", "a convolution's receptive fields as rows",
+       DT_FLOAT, L(im2col_nhwc)),
 SIMPLE("avx_l2norm_chan", "l2norm_chan", "norm", "unit-L2 channel norm, scaled, optional silu",
        DT_FLOAT, L(l2norm_chan)),
 SIMPLE("avx_d2s_add", "d2s_add", "elem", "an upsampling shortcut added in", DT_FLOAT, L(d2s_add)),
@@ -1598,6 +1647,7 @@ SIMPLE("avx_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added 
        L(s2d_avg_add)),
 SIMPLE("avx_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, L(to_rgba8)),
 SIMPLE("avx_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, L(gelu_tanh)),
+SIMPLE("avx_gelu_quick", "gelu_quick", "elem", "quick gelu", DT_FLOAT, L(gelu_quick)),
 SIMPLE("avx_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,
        L(scatter_add_rows)),
 SIMPLE("avx_attn_prefix_self", "attn_prefix_self", "attn",

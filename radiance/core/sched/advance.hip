@@ -5,7 +5,12 @@
  */
 #include <hip/hip_runtime.h>
 
+#include <cstdlib>
+
 #include "advance_impl.h"
+#include "rad_abi.h"
+
+extern "C" int rad_dev_chain_enabled(void);   /* core/device/device.h */
 
 namespace {
 
@@ -16,12 +21,56 @@ __global__ __launch_bounds__(kThreads) void rad_step_advance(rad::AdvanceArgs a)
     if (i < a.n_seq) rad::adv_row(a, i);
 }
 
+/* The chained form (RadKernelChainFn, abi/rad_abi.h): the backend gives a kernel named r4dchain*
+ * a record at RAD_CHAIN_KARG_OFF and drops its barrier bit behind another chained kernel. Before
+ * the first read one lane waits for the queue's counter to reach the record's target; after the
+ * last write the block releases and adds 1. A record that does not check out means: run plain. */
+struct ChainRec {
+    unsigned long long  magic, target;
+    unsigned long long* ctr;
+    unsigned long long  check;
+};
+__device__ __forceinline__ const ChainRec* chain_rec() {
+    const ChainRec* r = (const ChainRec*)((const char*)__builtin_amdgcn_kernarg_segment_ptr() +
+                                          RAD_CHAIN_KARG_OFF);
+    const unsigned long long magic = r->magic, target = r->target, check = r->check;
+    if (magic != RAD_CHAIN_MAGIC ||
+        check != (magic ^ target ^ (unsigned long long)(uintptr_t)r->ctr ^ RAD_CHAIN_CHECK))
+        return nullptr;
+    return r;
+}
+
+__global__ __launch_bounds__(kThreads) void r4dchain_step_advance(rad::AdvanceArgs a) {
+    const ChainRec* r = chain_rec();
+    if (r) {
+        if (threadIdx.x == 0)
+            while (__hip_atomic_load(r->ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < r->target)
+                __builtin_amdgcn_s_sleep(1);
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    const int i = (int)(blockIdx.x * kThreads + threadIdx.x);
+    if (i < a.n_seq) rad::adv_row(a, i);
+    if (r) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __syncthreads();
+        if (threadIdx.x == 0)
+            __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+
 }  // namespace
 
 extern "C" int rad_step_advance_launch(const rad::AdvanceArgs* args, void* stream) {
     if (!args || args->n_seq <= 0) return 0;
     const unsigned blocks = (unsigned)((args->n_seq + kThreads - 1) / kThreads);
-    hipLaunchKernelGGL(rad_step_advance, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
-                       *args);
+    /* The chained form only where launches chain (rad_dev_chain_enabled): there the backend writes
+     * its record; elsewhere a launch carries only these arguments, so the plain kernel runs. */
+    if (!rad_dev_chain_enabled())
+        hipLaunchKernelGGL(rad_step_advance, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
+                           *args);
+    else
+        hipLaunchKernelGGL(r4dchain_step_advance, dim3(blocks), dim3(kThreads), 0,
+                           (hipStream_t)stream, *args);
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }

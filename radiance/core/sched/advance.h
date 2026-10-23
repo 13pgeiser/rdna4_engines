@@ -44,6 +44,9 @@ enum AdvMode : int32_t {
     ADV_HIST   = 3,   /* before the draft head's history pass: the verified positions */
     ADV_ROUND  = 4,   /* before draft round `round` >= 2: the next position, the last proposal */
     ADV_TAKE   = 5,   /* after the last round: its proposal into the state */
+    /* A block drafter (RAD_DRAFT_BLOCK) on the card: */
+    ADV_BLOCK  = 6,   /* before the query pass: the anchor at the committed end, then the masks */
+    ADV_BTAKE  = 7,   /* after it: its `round` proposals into the state, behind the bonus token */
 };
 
 /* One KV group, as the builder stages it for this build. Offsets are bytes into the rank's slab,
@@ -63,7 +66,8 @@ struct AdvGroup {
  * kernel's argument. */
 struct AdvanceArgs {
     int32_t mode = 0;
-    int32_t round = 0;        /* ADV_ROUND: the draft round, from 2; ADV_TAKE: the last, from 1 */
+    int32_t round = 0;        /* ADV_ROUND: the draft round, from 2; ADV_TAKE: the last, from 1;
+                               * ADV_BTAKE: how many proposals a row */
     int32_t n_seq = 0;
     int32_t n_groups = 0;
     char*   slab = nullptr;   /* this rank's device slab */
@@ -72,13 +76,15 @@ struct AdvanceArgs {
     /* [4][row_pitch] int32: device-row flag; the verify step's token row of the row's first
      * verified position; its first sampled row, or -1 for a row that sampled nothing; and one
      * number the mode reads -- ADV_ACCEPT the row's draft count, ADV_HIST how many of the row's
-     * positions come before the verified ones, whose tokens the host staged. */
+     * positions come before the verified ones, whose tokens the host staged, ADV_BLOCK the token
+     * id its mask rows embed. */
     int64_t row_off = 0;
     int32_t row_pitch = 0;
     int64_t grp_off = 0;      /* [n_groups] AdvGroup */
     StepSlot* st = nullptr;   /* [max_seqs], by scheduler slot */
     /* ADV_ACCEPT and ADV_HIST: the verify step's sampled tokens, one a row. ADV_ROUND and
-     * ADV_TAKE: the last round's proposals, row i at i * src_pitch. */
+     * ADV_TAKE: the last round's proposals, row i at i * src_pitch. ADV_BTAKE: the block's
+     * proposals, row i's from i * src_pitch. */
     const int32_t* src = nullptr;
     int64_t src_pitch = 1;
     const int32_t* eog = nullptr;   /* end-of-generation ids, sorted */

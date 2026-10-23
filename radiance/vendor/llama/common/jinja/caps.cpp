@@ -110,8 +110,10 @@ caps caps_get(jinja::program & prog) {
             });
         },
         [&]() {
-            // tools
-            return json{nullptr};
+            // tools: an empty array, as llama.cpp master hands it. json{nullptr} is the one-element
+            // array [null]; a template that iterates `tools` (GLM-5.3's does) threw on the null
+            // and the probe took the throw for "cannot render string content".
+            return json::array();
         },
         [&](bool success, value & messages, value &) {
             auto & content = messages->at(0)->at("content");

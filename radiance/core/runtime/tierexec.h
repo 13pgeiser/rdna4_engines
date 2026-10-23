@@ -20,9 +20,15 @@
  * per staging batch.
  *
  * Staging layout. Device staging is `max_batch * entry_bytes`; one entry is [group][layer][fragment]
- * end to end. For a given (group, layer) the destination rows sit at stride `entry_bytes` from a
- * base in the first entry, which is `gather_rows`'s `y` pitch, so one launch writes every entry's
- * fragment in place and the host side is one strided copy per run of consecutive arena slots.
+ * end to end, the replicated groups first. For a given (group, layer) the destination rows sit at
+ * stride `entry_bytes` from a base in the first entry, which is `gather_rows`'s `y` pitch, so one
+ * launch writes every entry's fragment in place and the host side is one strided copy per window
+ * per run of consecutive arena slots.
+ *
+ * The host slot. Under tensor parallelism a slot holds the whole engine's entry. A group every
+ * rank holds whole (rad_kv_group_replicated) is in the slot once, in one window at its front
+ * that rank 0 writes and every rank reads back; the groups each rank holds a shard of follow,
+ * one window per rank. slot_layout() is the one place the arithmetic lives.
  */
 #pragma once
 #include "mem/kv.h"
@@ -48,6 +54,23 @@ public:
                    const std::vector<int32_t>& groups, int max_batch, int64_t max_copy,
                    int64_t max_chain, bool leader, int device, int64_t slot_off,
                    RadStream shared);
+
+    /* One shared host slot across the ranks. `[0, rep_bytes)` is the replicated window, the
+     * replicated cached groups in cached-group order; rank r's own groups follow at
+     * `own_off[r]`, `own_bytes[r]` wide (uneven heads and rad_kv_group_zero make these differ).
+     * `entry_bytes` is the largest rank's staging entry, rep_bytes + own_bytes, which sizes()
+     * takes. Checked here: a group replicated on one rank is replicated, not zero and the same
+     * width on every rank, since every rank reads the one window back; a violation stops bringup
+     * with the group named (RAD_E_STATE). */
+    struct SlotLayout {
+        int64_t slot_bytes = 0;
+        int64_t rep_bytes = 0;
+        int64_t entry_bytes = 0;
+        std::vector<int64_t> own_off, own_bytes;
+        std::vector<std::string> replicated;   /* the replicated groups' names, for the report */
+    };
+    static int slot_layout(const std::vector<const KVManager*>& ranks,
+                           const std::vector<int32_t>& groups, SlotLayout* out);
     void close();
     bool enabled() const { return enabled_; }
     std::string report() const { return report_; }
@@ -96,7 +119,25 @@ public:
      * off-device or already has work outstanding. */
     bool plan_promote(const BlockHash& key, TierJob* out);           /* leader only */
 
-    struct Stats { int64_t passes = 0, jobs = 0, bytes_out = 0, bytes_in = 0; };
+    /* ---------------- RADIANCE_DEBUG_TIER_VERIFY, the replicated window ----------------
+     *
+     * A replicated group's bytes are the plugin's claim. Under the variable a follower gathers the
+     * replicated groups it would otherwise leave to the leader into a pinned scratch beside the
+     * copy and hashes them once landed; the engine, once every rank has landed, takes each sum
+     * and has the leader compare it with the window it wrote. Off, a follower moves nothing for
+     * the replicated groups. */
+    bool verifying_replicated() const { return verify_ && rep_bytes_ > 0; }
+    /* Follower: the sum of the replicated bytes it gathered for `key` in the last copy out, taken
+     * once. False when there is none (not verifying, no replicated group, or not in that copy). */
+    bool take_replicated_sum(const BlockHash& key, uint64_t* sum);
+    /* Leader: compares `follower_sum` from rank `rank` with the window the slot holds for job
+     * `j`; a mismatch is logged and counted (Stats::rep_mismatch). */
+    bool verify_replicated(const TierJob& j, int rank, uint64_t follower_sum);
+
+    struct Stats {
+        int64_t passes = 0, jobs = 0, bytes_out = 0, bytes_in = 0;
+        int64_t rep_checked = 0, rep_mismatch = 0;   /* verify_replicated's tallies */
+    };
     const Stats& stats() const { return st_; }
 
 private:
@@ -111,6 +152,9 @@ private:
         /* rad_kv_group_zero: no shard on this rank. Kept in place because a job's block ids are
          * one per cached group in the same order on every rank; it moves no bytes. */
         bool     zero = false;
+        /* rad_kv_group_replicated: staged at the front of the entry and in the slot's replicated
+         * window; a follower gathers it only to verify, and scatters it on every restore. */
+        bool     replicated = false;
         Resolved gather, scatter;
     };
 
@@ -127,9 +171,17 @@ private:
     void warn_once(const char* what, int st);
     int  run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int64_t layer,
                   void* stage_base, const int32_t* d_idx, int64_t n_jobs);
-    /* One strided copy per run of consecutive arena slots, `n` entries starting at job `first` of
-     * `order`. To host when `out`, from host otherwise. */
+    /* One strided copy per window per run of consecutive arena slots, `n` entries starting at job
+     * `first` of `order`. To host when `out` (the replicated window from the leader only), from
+     * host otherwise. */
     int  copy_runs(const std::vector<TierJob*>& order, size_t first, int64_t n, bool out);
+    /* Whether this rank gathers group `gi` for a copy out: its own groups always, a replicated
+     * one as the leader or to verify. */
+    bool gathers(const GroupInfo& gi) const {
+        return !gi.zero && (!gi.replicated || leader_ || verify_rep_);
+    }
+    /* The hash of one entry as the slot holds it: the replicated window, then this rank's own. */
+    uint64_t entry_sum(const char* slot) const;
     int  enqueue_copy(std::vector<TierJob>& jobs, RadStream compute);
 
     bool      enabled_ = false;
@@ -141,11 +193,13 @@ private:
     /* This rank's card. Allocations and launches use the current device, and the engine loop leaves
      * the last rank's device current, so it is set explicitly. */
     int       device_ = -1;
-    /* This rank's offset inside a shared host slot. A slot holds the whole engine's entry, which
-     * under tensor parallelism is n_ranks distinct KV shards, so the slot is n_ranks entries wide
-     * and each rank touches only its own window. */
+    /* This rank's windows of a shared host slot (SlotLayout): its own groups at `slot_off_`,
+     * `own_bytes_` wide, and the replicated groups at the slot's front, `rep_bytes_` wide, which
+     * only the leader writes. The staging entry is [replicated][own], entry_bytes_ in all. */
     int64_t   slot_off_ = 0;
-    int64_t   slot_bytes_ = 0;   /* the whole shared slot: n_ranks * entry_bytes_ */
+    int64_t   slot_bytes_ = 0;   /* the whole shared slot */
+    int64_t   rep_bytes_ = 0;
+    int64_t   own_bytes_ = 0;
     Registry* reg_ = nullptr;
     KVManager* kv_ = nullptr;
     IdleTiers* tiers_ = nullptr;
@@ -184,14 +238,18 @@ private:
      *
      * Round-trip check: hashes each entry going out and coming back and names the entry when they
      * differ, separating "the tier moved wrong bytes" from a downstream fault. A diagnostic, not a
-     * guard: host hashing costs on every entry. Off unless set; leader-only because the map is keyed
-     * by an object followers do not own. A copy out is hashed once landed (first seen by copy_state). */
+     * guard: host hashing costs on every entry. Off unless set. The round trip is the leader's
+     * (the map is keyed by an object followers do not own); a follower's part is the replicated
+     * window, above. A copy out is hashed once landed (first seen by copy_state). */
     bool      verify_ = false;
+    bool      verify_rep_ = false;    /* a follower gathering the replicated groups to verify */
     std::unordered_map<BlockHash, uint64_t, BlockHashHash> out_sum_;
-    struct VerifyNote { BlockHash key; int32_t host_slot = -1; };
+    std::unordered_map<BlockHash, uint64_t, BlockHashHash> rep_sum_;   /* follower */
+    struct VerifyNote { BlockHash key; int32_t host_slot = -1; int64_t ord = -1; };
     std::vector<VerifyNote> verify_pending_;
-    void      verify_note(const BlockHash& key, const void* p, int64_t n);
-    void      verify_check(const BlockHash& key, const void* p, int64_t n);
+    char*     vrep_ = nullptr;        /* pinned, max_copy_ * rep_bytes_: a follower's gather */
+    void      verify_note(const BlockHash& key, const char* slot);
+    void      verify_check(const BlockHash& key, const char* slot);
 
     std::string report_;
     Stats     st_;

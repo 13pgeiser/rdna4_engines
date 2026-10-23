@@ -64,17 +64,19 @@ AVX_KERNEL(dsa_score) {
         k.stride[1] = 1;
     }
     const auto &bt = a->t[5], &cu = a->t[6], &nc = a->t[7], &out = a->t[8];
+    const RadTensor* cu_part = rad_arg_in(a, 9);
     const int64_t n = p_int(a, "n", 0), h = p_int(a, "heads", 0);
-    if (h > 0 && q.rank == 2 && qs.rank == 2 && qs.shape[1] == 1 &&
-        q.shape[0] == out.shape[0] * h && qs.shape[0] == q.shape[0]) {
+    const int64_t part = p_int(a, "row_part", -1);
+    if (h > 0 && q.rank == 2 && qs.rank == 2 && qs.shape[1] == 1 && g.rank == 2 &&
+        q.shape[0] == g.shape[0] * h && qs.shape[0] == q.shape[0]) {
         q.rank = 3;
-        q.shape[0] = out.shape[0];
+        q.shape[0] = g.shape[0];
         q.shape[2] = q.shape[1];
         q.shape[1] = h;
         q.stride[2] = q.stride[1];
         q.stride[1] = q.stride[0];
         q.stride[0] *= h;
-        qs.shape[0] = out.shape[0];
+        qs.shape[0] = g.shape[0];
         qs.shape[1] = h;
         qs.stride[1] = qs.stride[0];
         qs.stride[0] *= h;
@@ -84,9 +86,14 @@ AVX_KERNEL(dsa_score) {
         g.shape[0] != q.shape[0] || qs.shape[1] != h || g.shape[1] != h || k.rank != 2 ||
         k.shape[1] != n || ks.rank != 1 || ks.shape[0] != k.shape[0] || bt.rank != 2 ||
         cu.rank != 1 || nc.rank != 1 || cu.shape[0] != bt.shape[0] + 1 ||
-        nc.shape[0] != bt.shape[0] || out.rank != 2 || out.shape[0] != q.shape[0] ||
+        nc.shape[0] != bt.shape[0] || out.rank != 2 ||
+        (part < 0 ? out.shape[0] != q.shape[0]
+                  : out.shape[0] < 1 || q.shape[0] < (part + 1) * out.shape[0]) ||
         out.shape[1] > bt.shape[1])
         return RAD_E_SHAPE;
+    if (cu_part && (part < 0 || cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0]))
+        return part < 0 ? RAD_E_INVAL : RAD_E_SHAPE;
+    if (cu_part && cu_part->dtype != RAD_I32) return RAD_E_DTYPE;
     if (q.dtype != RAD_F8E4M3 || k.dtype != RAD_F8E4M3 || qs.dtype != RAD_F32 ||
         ks.dtype != RAD_F32 || g.dtype != RAD_F32 || bt.dtype != RAD_I32 || cu.dtype != RAD_I32 ||
         nc.dtype != RAD_I32 || out.dtype != RAD_F32)
@@ -94,8 +101,15 @@ AVX_KERNEL(dsa_score) {
     for (int i = 0; i < 9; ++i)
         if (!(packed && i == 4) && !a->t[i].data) return RAD_E_INVAL;
     const float norm = 1.0f / std::sqrt((float)(h * n));
+    /* A part scores out's rows from step row part * rows; the query operands span the step. */
+    const int64_t row0 = part > 0 ? part * out.shape[0] : 0;
+    if (cu_part)
+        for (int64_t s = 0; s < cu.shape[0]; ++s)
+            st_int_dt(RAD_I32, cu_part->data, s * cu_part->stride[0],
+                ld_int_dt(cu.dtype, cu.data, s * cu.stride[0]) - row0);
     AVX_PARALLEL_FOR_IF(q.shape[0] * out.shape[1] * h * n >= AVX_PAR_MIN)
-    for (int64_t r = 0; r < q.shape[0]; ++r) {
+    for (int64_t o = 0; o < out.shape[0]; ++o) {
+        const int64_t r = row0 + o;
         int64_t seq = -1;
         for (int64_t s = 0; s < bt.shape[0]; ++s)
             if (r >= ld_int_dt(cu.dtype, cu.data, s * cu.stride[0]) &&
@@ -123,7 +137,7 @@ AVX_KERNEL(dsa_score) {
                 }
                 result *= ldt(&ks, page * ks.stride[0]) * norm;
             }
-            stt(&out, r * out.stride[0] + b * out.stride[1], result);
+            stt(&out, o * out.stride[0] + b * out.stride[1], result);
         }
     }
     return RAD_OK;

@@ -7,11 +7,21 @@
  * declare), with a second norm on each projection's output before its residual, a weightless RMS
  * norm on the value, and a GELU (not SwiGLU) feed-forward. The final logits are soft-capped to
  * cap * tanh(x / cap).
+ *
+ * Two draft models, whichever the container carries under `draft.`: Google's assistant head (a
+ * serial head over the trunk's own cache, the Gemma4Head below) or z-lab's DFlash drafter (a
+ * five-layer block drafter with its own cache, reading the trunk's residual stream at six layers,
+ * arch/common/rad_gemma4_dflash.h) -- the 31B's z-lab/gemma-4-31B-it-DFlash proposes 15 tokens a
+ * pass where the assistant proposes one a round.
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
+#include <arch/rad_gemma4_dflash.h>
+#include <arch/rad_block_dflash2.h>
 
+#include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -109,8 +119,24 @@ struct G4Linear {
     void step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const;
     /* the GEMM alone, for a caller that wrote the int8 pair itself (a fused norm + quantiser) */
     void gemm(RadCtx* c, rad_buf y, int64_t T) const;
+    /* The same two over rows [r0, r0 + n) of the step: a slice of the prefill overlap. The
+     * quantiser and the GEMM are a row at a time above their bands, so a slice's rows are the
+     * whole step's (see "the prefill overlap" below). */
+    void step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const;
+    void gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const;
 };
 
+/* A weight on the w4a8 / w8a8 grid: i4 or i8 codes with an f16 scale per [1 x 128], the encoding
+ * gemm_nt_q reads against quant_act_i8's pair. */
+static bool g4_grid_w4(const RadEncoding& enc) {
+    const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
+    const uint32_t cdt = enc.n_planes > 0 ? enc.plane[0].dtype : 0;
+    return rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
+           (cdt == RAD_I4 || cdt == RAD_I8) && enc.plane[0].block[1] == 1 &&
+           sc && sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == 128;
+}
+
+/* An empty `src` means the caller made the weight's name map (a probe asked it first). */
 inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                             std::initializer_list<const char*> src,
                             int64_t n_out, int64_t n_in, int shard, RadWeightGroup grp,
@@ -118,10 +144,10 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                             std::initializer_list<int64_t> row_parts,
                             const G4Linear* in_from) {
     N = n_out; K = n_in;
-    if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
+    if (N <= 0 || K <= 0) return RAD_E_INVAL;
     const char* wn = nm.f("%s.weight", base);
-    if (src.size() == 1) RAD_ARCH_TRY(map_copy(b, wn, *src.begin()));
-    else                RAD_ARCH_TRY(map_concat(b, wn, src, 0));
+    if (src.size() == 1)     RAD_ARCH_TRY(map_copy(b, wn, *src.begin()));
+    else if (src.size() > 1) RAD_ARCH_TRY(map_concat(b, wn, src, 0));
     RadEncoding enc{};
     const bool known = weight_enc(b, wn, &enc);
     /* A builder with no model behind it (a test, a synthetic tool) answers RAD_E_NOTFOUND, and
@@ -145,16 +171,11 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
     /* A w4 weight: i4 codes and an f16 scale per [1 x 128]. gemm_nt_q at w4a8 reads an int8
      * activation and an f32 per-row scale, so a quantiser over the bf16 plane `a` writes the int8
      * pair (q8, s8). The codes + scale layout is the same as w4a16's, so containers serve
-     * unchanged. */
-    const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
-    /* An 8-bit weight on the same grid (i8 codes, f16 scale per [1 x 128]): gemm_nt_q at w8a8
-     * reads the same int8 activation and per-row scale as w4a8, so the quantiser is shared. A
-     * recipe uses it for linears int4 hurts (attention, down_proj). */
+     * unchanged. An 8-bit weight on the same grid (i8 codes, f16 scale per [1 x 128]): gemm_nt_q
+     * at w8a8 reads the same int8 activation and per-row scale as w4a8, so the quantiser is
+     * shared. A recipe uses it for linears int4 hurts (attention, down_proj). */
     const uint32_t cdt = known && enc.n_planes > 0 ? enc.plane[0].dtype : 0;
-    const bool w4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 2 && !enc.transform[0] &&
-                    (cdt == RAD_I4 || cdt == RAD_I8) && enc.plane[0].block[1] == 1 &&
-                    sc && sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == 128;
-    if (w4) {
+    if (known && g4_grid_w4(enc)) {
         if (N % 16 || K % 128) {
             fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a w4 weight takes rows in "
                             "16s and K in whole 128-column scale groups.\n", base,
@@ -217,9 +238,27 @@ inline void G4Linear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
                 brows(y, T), RAD_NONE, RAD_NONE);
 }
 
+inline void G4Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const {
+    if (!quant) {
+        RAD_ISSUE_N(c, op, n, brow_slice(a, r0, n, K), RAD_W(w), brow_slice(y, r0, n, N));
+        return;
+    }
+    if (!shared_in)
+        RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
+                    brow_slice(s8, r0, n, 1), RAD_NONE);
+    gemm_rows(c, y, r0, n);
+}
+
+inline void G4Linear::gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const {
+    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, 1), RAD_W(w), RAD_W(ws),
+                brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
+}
+
 /* ---- one attention block, parameterised by class. */
 struct Gemma4Attn {
-    struct Wire { rad_buf x = 0, h = 0, q = 0, k = 0, v = 0, attn = 0; };
+    /* `qkv` is the fused projection's row, [max_tok, q | k | v], declared by the first layer of its
+     * class that has one (the model's slot passed to declare). */
+    struct Wire { rad_buf x = 0, h = 0, q = 0, k = 0, v = 0, attn = 0, qkv = 0; };
 
     Wire      w{};
     Geom      g{};
@@ -229,23 +268,65 @@ struct Gemma4Attn {
 
     rad_weight w_norm = 0, w_qn = 0, w_kn = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_q{}, ln_k{}, ln_v{}, ln_o{};              /* the GEMM weights (bf16 or w4a8) */
+    /* q, k and v as one linear, where the container holds them so (blk.N.attn_qkv): one GEMM a
+     * layer instead of three. q, k and v are then column slices of `w.qkv`. */
+    G4Linear   ln_qkv{};
+    bool       fused = false;
     rad_op op_norm = 0, op_vn = 0, op_qn = 0, op_kn = 0,
            op_rq = 0, op_rk = 0, op_attn = 0, op_kv = 0, op_post = 0, op_ar = 0, op_add = 0;
     /* the five prologue ops (v norm, q norm, k norm, two rotaries) as one, where it resolves */
     rad_op op_qnr = 0;
+    /* ...and that with kv_store folded in (qkv_norm_rope_kv_store), issued in place of op_qnr and
+     * op_kv where it resolves; op_kv is then not declared */
+    rad_op op_qnr_kv = 0;
+    /* Fused only: attention reading q where it lies in the row (attn_paged_qrow), where it resolves
+     * to the kernel attn_paged would take anyway -- at every height (op_attn_row), or at decode
+     * heights up to dec_hi query rows a sequence (op_attn_dec); else the copy of q into its own rows
+     * (`cast`) that a step of more than one row issues ahead of attn_paged. Without qkv_norm_rope
+     * the copies of k and v too, ahead of the unfused prologue, which reads them dense. */
+    rad_op op_attn_row = 0, op_attn_dec = 0, op_lift_q = 0, op_lift_k = 0, op_lift_v = 0;
+    int64_t dec_hi = 0;
+    /* the feed-forward's gate_up read into the cache beside this block's all-reduce, or 0 (see
+     * "Prefetch beside the reductions") */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
+    /* the feed-forward's down_proj read into the cache beside the attention itself, or 0 */
+    rad_op     op_pfd = 0;
+    rad_weight pfd_w  = 0;
+
+    /* The linear whose int8 pair a junction writes, and whether every projection reads it. */
+    const G4Linear& ln_in() const { return fused ? ln_qkv : ln_q; }
+    bool reads_pair() const {
+        return fused ? ln_qkv.quant
+                     : ln_q.quant && ln_k.shared_in && (!cls.has_v || ln_v.shared_in);
+    }
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
-                 rad_kvgroup group, const Wire& wire, const char* pre);
+                 rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot);
     /* `entry_done`: a junction op already wrote this block's quantised input (ln_q's pair).
      * `tail_fused`: the caller issues the post-norm and the add as a junction op. */
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
               bool ar_fused = false) const;
+    /* step()'s parts, for the prefill overlap: the projections over rows [r0, r0 + n) from the
+     * pair a junction wrote, everything between the projections and o_proj over the whole step
+     * (it reads every row's keys), and o_proj over rows [r0, r0 + n). */
+    void project(RadCtx* c, int64_t r0, int64_t n) const;
+    void attend(RadCtx* c, const RadBatch* batch) const;
+    void out_proj(RadCtx* c, int64_t r0, int64_t n) const;
+    /* The prologue and the attention over rows [r0, r0 + n) of a one-sequence step alone (the
+     * prefill overlap's slices), `used` the context the slice ends at (kv_len_trim for a slice
+     * that ends before the step does). Only with the one-launch prologue and a prefill-height
+     * attention that reads q dense or in the row (slicable). */
+    bool slicable() const { return op_qnr_kv && (op_attn_row || op_attn); }
+    void attend_rows(RadCtx* c, const RadBatch* batch, int64_t r0, int64_t n,
+                     RadOperand used) const;
 };
 
 int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
-                        rad_kvgroup group, const Wire& wire, const char* pre) {
+                        rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot) {
     g = geom; cls = cgeo; layer = l; kv = group; w = wire;
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    const int64_t qkvd = qd + kvd + (cls.has_v ? kvd : 0);
 
     /* The norms: always bf16 (no rule matches them), name map first. */
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l),      nm.ckpt("%s.%lld.input_layernorm.weight",   pre, (long long)l)));
@@ -263,18 +344,50 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     w_post = decl_w(b, nm.f("blk.%d.attn_post_norm.weight", l), RAD_BF16, {g.n_embd},
                      RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
 
-    /* The GEMM weights: bf16 or w4a8, probed by G4Linear. */
-    RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
-                              { nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l) },
-                              qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
-    const G4Linear* qin = &ln_q;   /* k and v read q's int8 pair */
-    RAD_ARCH_TRY(ln_k.declare(b, nm, g, nm.f("blk.%d.attn_k", l),
-                              { nm.ckpt("%s.%lld.self_attn.k_proj.weight", pre, (long long)l) },
-                              kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.k, {}, qin));
-    if (cls.has_v)
-        RAD_ARCH_TRY(ln_v.declare(b, nm, g, nm.f("blk.%d.attn_v", l),
-                                  { nm.ckpt("%s.%lld.self_attn.v_proj.weight", pre, (long long)l) },
-                                  kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.v, {}, qin));
+    /* The GEMM weights: bf16 or w4a8, probed by G4Linear.
+     *
+     * q, k and v are one linear, `blk.N.attn_qkv` (q | k | v, or q | k on a k_eq_v class), where
+     * the weight is on the w4a8 / w8a8 grid: a recipe that names it (rad-convert answers the
+     * probe from the recipe) or a container converted with one. Each rank takes its slice of each
+     * part, so the row holds this rank's q, k and v heads. The rows are q's, k's and v's rows, and
+     * the grid's groups never cross a row, so the codes are the three linears' codes (libr4d's
+     * skinny GEMM picks its K split from N, so on a card k and v may round differently in the last
+     * bit). One GEMM a layer reads the three weights in one pass where three paid the skinny GEMM's
+     * fixed cost each: on the R9700 at decode (--profile-ops, tp 4) q, k and v take 17 + 13.5 +
+     * 13.5 us and a 4096-row GEMM of the same K 25 us. A container that holds the three apart, or
+     * bf16 weights, keeps three linears reading q's int8 pair. */
+    const char* q_src = nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l);
+    const char* k_src = nm.ckpt("%s.%lld.self_attn.k_proj.weight", pre, (long long)l);
+    const char* v_src = nm.ckpt("%s.%lld.self_attn.v_proj.weight", pre, (long long)l);
+    const char* qkv_wn = nm.f("blk.%d.attn_qkv.weight", l);
+    if (cls.has_v) RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src, v_src }));
+    else           RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src }));
+    {
+        RadEncoding e{};
+        fused = weight_enc(b, qkv_wn, &e) && g4_grid_w4(e);
+    }
+    if (fused) {
+        if (!qkv_slot) return RAD_E_INVAL;
+        if (!*qkv_slot)
+            *qkv_slot = decl_b(b, nm.f(cls.has_v ? "attn_qkvs" : "attn_qkvg"), g.act_dtype,
+                               {g.max_tok, qkvd});
+        w.qkv = *qkv_slot;
+        if (cls.has_v)
+            RAD_ARCH_TRY(ln_qkv.declare(b, nm, g, nm.f("blk.%d.attn_qkv", l), {}, qkvd, g.n_embd,
+                                        RAD_SHARD_ROW, grp_layer(l), w.h, w.qkv, {qd, kvd, kvd}));
+        else
+            RAD_ARCH_TRY(ln_qkv.declare(b, nm, g, nm.f("blk.%d.attn_qkv", l), {}, qkvd, g.n_embd,
+                                        RAD_SHARD_ROW, grp_layer(l), w.h, w.qkv, {qd, kvd}));
+    } else {
+        RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l), { q_src },
+                                  qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
+        const G4Linear* qin = &ln_q;   /* k and v read q's int8 pair */
+        RAD_ARCH_TRY(ln_k.declare(b, nm, g, nm.f("blk.%d.attn_k", l), { k_src },
+                                  kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.k, {}, qin));
+        if (cls.has_v)
+            RAD_ARCH_TRY(ln_v.declare(b, nm, g, nm.f("blk.%d.attn_v", l), { v_src },
+                                      kvd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.v, {}, qin));
+    }
     RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
                               { nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l) },
                               g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
@@ -332,22 +445,36 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     /* Gemma 4 scores Q.K without the 1/sqrt(head_dim) factor (HF Gemma4TextAttention and vLLM
      * use scaling = 1.0; the q/k norm gains absorb it). attn_paged defaults to 1/sqrt(head_dim),
      * so 1.0 is passed explicitly. */
-    op_attn = rw(b, RAD_OP(b, "attn_paged",
-                   RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
-                              RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1), RAD_INT("window", cls.window),
-                              RAD_INT("n_head", cls.n_head), RAD_INT("block_size", RAD_KV_BLOCK),
-                              RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
-                              RAD_F64("scale", 1.0),
-                              RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
-                   RAD_NOWEIGHTS),
-                  {w.q}, {w.attn});
+    auto attn = [&](const char* op, std::initializer_list<rad_buf> rd, int64_t q_hi = 0) {
+        return rw(b, RAD_OP(b, op,
+                     RAD_PARAMS(RAD_RANGE("q_len", 1, q_hi > 0 ? q_hi : g.max_tok),
+                                RAD_INT("head_dim", cls.head_dim),
+                                RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1),
+                                RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
+                                RAD_INT("block_size", RAD_KV_BLOCK),
+                                RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                RAD_F64("scale", 1.0),
+                                RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                     RAD_NOWEIGHTS),
+                  rd, {w.attn});
+    };
 
     /* The prologue as one op: libr4d's `qkv_norm_rope` is rmsnorm_p + rmsnorm + rmsnorm + rope +
      * rope over the three projections, byte-identical, one workgroup per (token, head). Declared
      * beside the unfused five and used only where it resolves; a multi-component or YaRN rotary
      * keeps the five, as does an engine whose libraries do not declare it (CPU-only), where asking
-     * for it would stop the declare. */
-    if (!g.rope_mc && g.yarn.factor == 0.0f && rad_op_declared(b, "qkv_norm_rope")) {
+     * for it would stop the declare. It reads q, k and v at their own row pitches, so on a fused
+     * layer it works in place on the row's column slices. */
+    /* What the prologue reads and writes, either form. A k_eq_v class derives v from the raw k:
+     * v is written, never read. */
+    auto qnr_rw = [&](rad_op op) {
+        if (fused)
+            return cls.has_v ? rw(b, op, {w.qkv}, {w.qkv}) : rw(b, op, {w.qkv}, {w.qkv, w.v});
+        return cls.has_v ? rw(b, op, {w.q, w.k, w.v}, {w.q, w.k, w.v})
+                         : rw(b, op, {w.q, w.k}, {w.q, w.k, w.v});
+    };
+    auto decl_qnr = [&]() {
+        if (g.rope_mc || g.yarn.factor != 0.0f || !rad_op_declared(b, "qkv_norm_rope")) return;
         op_qnr = RAD_OP(b, "qkv_norm_rope",
                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
                                  RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", cls.n_head_kv),
@@ -358,18 +485,86 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                                  RAD_F64("wadd", g.wadd_qk), RAD_INT("v_from_k", cls.has_v ? 0 : 1),
                                  RAD_STR("dtype", g.dtype)),
                       RAD_WEIGHTS(w_qn, w_kn));
-        /* A k_eq_v class derives v from the raw k: v is written, never read. */
-        op_qnr = cls.has_v ? rw(b, op_qnr, {w.q, w.k, w.v}, {w.q, w.k, w.v})
-                           : rw(b, op_qnr, {w.q, w.k}, {w.q, w.k, w.v});
+        op_qnr = qnr_rw(op_qnr);
+    };
+
+    /* A column slice of the fused row copied into its own rows (`cast`, bf16 to bf16, which every
+     * library takes with pitched operands). */
+    auto lift = [&](int64_t n, rad_buf dst) {
+        return rw(b, RAD_OP(b, "cast",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n),
+                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                     RAD_NOWEIGHTS),
+                  {w.qkv}, {dst});
+    };
+
+    if (!fused) {
+        op_attn = attn("attn_paged", {w.q});
+        decl_qnr();
+    } else {
+        /* The prologue first: what attention reads depends on it. Without it the unfused five read
+         * q, k and v dense, so all three are copied out of the row ahead of them. */
+        decl_qnr();
+        if (!op_qnr) {
+            op_lift_k = lift(kvd, w.k);
+            if (cls.has_v) op_lift_v = lift(kvd, w.v);
+        }
+        /* With it attention reads q in the row where that costs nothing. libr4d's dedicated paged
+         * kernels stop at head_dim 256; at 512 (the global class) attn_paged takes the windowed
+         * kernel, which is the kernel attn_paged_qrow takes, so the row is read in place at every
+         * height. At 256 the dedicated h256 kernels serve attn_paged in 0.26-0.71 of the windowed
+         * kernel's time (libr4d/r4d_plugin.h, R4D_PRIO_ATTN_WINDOW). Their split-KV decode reads q
+         * at a pitch under attn_paged_qrow too, over its band (q_len * gqa <= 64: 32 query rows a
+         * sequence at the sliding class's gqa 2), so the sliding class reads the row there -- a
+         * verify step included -- and keeps attn_paged above it, a prefill copying q out first. */
+        const bool qrow = op_qnr && rad_op_declared(b, "attn_paged_qrow");
+        if (qrow && cls.head_dim > 256) {
+            op_attn_row = attn("attn_paged_qrow", {w.qkv});
+        } else if (qrow) {
+            dec_hi = std::min<int64_t>(g.max_tok, 64 / cls.gqa());
+            op_attn_dec = attn("attn_paged_qrow", {w.qkv}, dec_hi);
+            if (!op_attn_dec) dec_hi = 0;
+        }
+        if (!op_attn_row) {
+            op_lift_q = lift(qd, w.q);
+            op_attn = attn("attn_paged", {w.q, w.qkv});
+        }
     }
 
-    op_kv = rw(b, RAD_OP(b, "kv_store",
-                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
-                           RAD_INT("n_head_kv", cls.n_head_kv),
-                           RAD_INT("block_size", rad_kv_block_size(b, kv)),
-                           RAD_STR("kv_dtype", g.kv_dtype)),
-                RAD_NOWEIGHTS),
-                {w.k, w.v}, {});
+    /* With the cache store folded into the prologue where a library serves it
+     * (qkv_norm_rope_kv_store: the same prologue, then kv_store of the finished k and v from the
+     * same launch, byte for byte), one launch a layer fewer. Declared after the attention ops,
+     * since its block_size comes off the resolved attention kernel (rad_kv_block_size), and
+     * issued in place of op_qnr and op_kv. */
+    if (op_qnr && rad_op_declared(b, "qkv_norm_rope_kv_store")) {
+        op_qnr_kv = RAD_OP(b, "qkv_norm_rope_kv_store",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                                 RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", cls.n_head_kv),
+                                 RAD_F64("theta", cls.theta), RAD_F64("eps", g.eps),
+                                 RAD_F64("scale", cls.scale), RAD_STR("mode", "neox"),
+                                 RAD_INT("rotary_dim", cls.n_rot),
+                                 RAD_STR("ladder", cls.head_ladder ? "head" : "rotary"),
+                                 RAD_F64("wadd", g.wadd_qk), RAD_INT("v_from_k", cls.has_v ? 0 : 1),
+                                 RAD_STR("dtype", g.dtype),
+                                 RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                 RAD_STR("kv_dtype", g.kv_dtype)),
+                      RAD_WEIGHTS(w_qn, w_kn));
+        if (op_qnr_kv) op_qnr_kv = qnr_rw(op_qnr_kv);
+    }
+    /* On a fused layer with the one-op prologue, k and v are stored from the row (kv_store takes
+     * them at their own pitches); a k_eq_v class's v is its own buffer either way. Not declared
+     * where the prologue stores them itself. */
+    if (!op_qnr_kv) {
+        op_kv = RAD_OP(b, "kv_store",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                               RAD_INT("n_head_kv", cls.n_head_kv),
+                               RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                               RAD_STR("kv_dtype", g.kv_dtype)),
+                    RAD_NOWEIGHTS);
+        if (!(fused && op_qnr)) op_kv = rw(b, op_kv, {w.k, w.v}, {});
+        else if (cls.has_v)     op_kv = rw(b, op_kv, {w.qkv}, {});
+        else                    op_kv = rw(b, op_kv, {w.qkv, w.v}, {});
+    }
 
     /* o_proj is column-sharded: the rank's partial sum is reduced first, then normed. */
     if (g.world > 1)
@@ -394,15 +589,31 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     return RAD_OK;
 }
 
+/* ---- Prefetch beside the reductions (prefetch_beside, rad_arch.h). The all-reduce in front of
+ * each GEMM leaves the card's memory idle for its round trip (~20 us at a DFlash2 verify's rows on
+ * 4x R9700), so the trunk reads the next GEMM's leading bytes in that window -- gate_up's after
+ * o_proj, the next layer's q|k|v after down_proj -- and the GEMM finds them in the 64 MB on-die
+ * cache. The attention leaves it mostly idle too at a verify's few rows and a chat's context, so
+ * down_proj's weight is read beside it, after q|k|v. On four cards (a microbenchmark of the
+ * two-shot and a GEMM-like stream of a cold 29 MB weight) 16 MB read beside the reduction took a
+ * layer from 84.0 us to 70.1; read on the same lane it gained nothing. */
+
+/* The height prefetch_beside judges a trunk step by: its rows on a decode step (decode and verify
+ * rows only), and none at all on one that carries a prompt's rows (rad_arch.h, kPrefetchRows): the
+ * row ceiling keeps long prefills out, and this keeps out the short ones it would let in. */
+static int64_t prefetch_height(const RadBatch* batch) {
+    return batch->phase == RAD_PHASE_DECODE ? batch->n_tok : INT64_MAX;
+}
+
 void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tail_fused,
                       bool ar_fused) const {
-    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
-    const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
-    const int32_t* table = kvb ? kvb->block_table  : nullptr;
-    const int32_t* used  = kvb ? kvb->seqused      : nullptr;
     const int64_t T = batch->n_tok;
 
-    if (entry_done) {
+    if (fused) {
+        if (!entry_done) RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+        if (entry_done) ln_qkv.gemm(c, w.qkv, T);
+        else            ln_qkv.step(c, w.h, w.qkv, T);
+    } else if (entry_done) {
         ln_q.gemm(c, w.q, T);
         ln_k.gemm(c, w.k, T);
         if (cls.has_v) ln_v.gemm(c, w.v, T);
@@ -412,11 +623,58 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
         ln_k.step(c, w.h, w.k, T);
         if (cls.has_v) ln_v.step(c, w.h, w.v, T);
     }
+    prefetch_beside(c, op_pfd, pfd_w, prefetch_height(batch));
+    attend(c, batch);
 
-    if (op_qnr) {
-        RAD_ISSUE(c, op_qnr, brows(w.q, T), brows(w.k, T), brows(w.v, T), rope_posmc(g, batch, T),
-                  RAD_W(w_qn), RAD_W(w_kn));
+    ln_o.step(c, w.attn, w.h, T);
+    prefetch_beside(c, op_pf, pf_w, prefetch_height(batch));
+    /* The all-reduce comes before the post-norm: o_proj is column-sharded, so each rank holds a
+     * partial sum, and the norm is of the whole output (sum_r rmsnorm(p_r) != rmsnorm(sum_r p_r)). */
+    if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
+    if (tail_fused) return;
+    RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
+    RAD_ISSUE(c, op_add,  brows(w.x, T), brows(w.h, T), brows(w.x, T));
+}
+
+void Gemma4Attn::project(RadCtx* c, int64_t r0, int64_t n) const {
+    if (fused) {
+        ln_qkv.gemm_rows(c, w.qkv, r0, n);
+        return;
+    }
+    ln_q.gemm_rows(c, w.q, r0, n);
+    ln_k.gemm_rows(c, w.k, r0, n);
+    if (cls.has_v) ln_v.gemm_rows(c, w.v, r0, n);
+}
+
+void Gemma4Attn::out_proj(RadCtx* c, int64_t r0, int64_t n) const {
+    ln_o.step_rows(c, w.attn, w.h, r0, n);
+}
+
+void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
+    const int32_t* table = kvb ? kvb->block_table  : nullptr;
+    const int32_t* used  = kvb ? kvb->seqused      : nullptr;
+    const int64_t T = batch->n_tok;
+    const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    /* q, k and v where the prologue works on them: their own buffers, or on a fused layer with the
+     * one-op prologue the row's column slices (a k_eq_v class's v is its own buffer either way). */
+    const bool row = fused && op_qnr;
+    const RadOperand Q = row ? bcol(w.qkv, 0, qd, T) : brows(w.q, T);
+    const RadOperand K = row ? bcol(w.qkv, qd, kvd, T) : brows(w.k, T);
+    const RadOperand V = row && cls.has_v ? bcol(w.qkv, qd + kvd, kvd, T) : brows(w.v, T);
+
+    if (op_qnr_kv) {
+        RAD_ISSUE(c, op_qnr_kv, Q, K, V, rope_posmc(g, batch, T), RAD_W(w_qn), RAD_W(w_kn),
+                  praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    } else if (op_qnr) {
+        RAD_ISSUE(c, op_qnr, Q, K, V, rope_posmc(g, batch, T), RAD_W(w_qn), RAD_W(w_kn));
     } else {
+        if (fused) {   /* the unfused five read q, k and v dense */
+            RAD_ISSUE_N(c, op_lift_q, T, bcol(w.qkv, 0, qd, T), brows(w.q, T));
+            RAD_ISSUE_N(c, op_lift_k, T, bcol(w.qkv, qd, kvd, T), brows(w.k, T));
+            if (cls.has_v) RAD_ISSUE_N(c, op_lift_v, T, bcol(w.qkv, qd + kvd, kvd, T), brows(w.v, T));
+        }
         /* Normalise v first: on a k_eq_v class v derives from the raw k, before k_norm rewrites it. */
         RAD_ISSUE_N(c, op_vn, T * cls.n_head_kv, brows(cls.has_v ? w.v : w.k, T), brows(w.v, T));
         RAD_ISSUE_N(c, op_qn, T * cls.n_head,    brows(w.q, T), RAD_W(w_qn), brows(w.q, T));
@@ -426,23 +684,59 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
         RAD_ISSUE(c, op_rk, brows(w.k, T), rope_posmc(g, batch, T));
     }
 
-    RAD_ISSUE(c, op_kv, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    if (op_kv) RAD_ISSUE(c, op_kv, K, V, praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
-    RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                brows(w.q, T), kv_cache(kv, layer),
+    /* attn_paged reads q dense: one row of the row's slice is, a taller step copies q out. */
+    rad_op a_op = op_attn;
+    RadOperand a_q = brows(w.q, T);
+    if (op_attn_row) {
+        a_op = op_attn_row;
+        a_q  = Q;
+    } else if (op_attn_dec && batch->max_q_len <= dec_hi) {
+        a_op = op_attn_dec;
+        a_q  = Q;
+    } else if (row) {
+        if (T == 1) a_q = Q;
+        else        RAD_ISSUE_N(c, op_lift_q, T, Q, brows(w.q, T));
+    }
+    RAD_ISSUE_N(c, a_op, batch->max_q_len,
+                a_q, kv_cache(kv, layer),
                 praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
                 praw(used, RAD_I32, batch->n_seq),
                 RAD_NONE, RAD_NONE,
                 praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
                 brows(w.attn, T));
+}
 
-    ln_o.step(c, w.attn, w.h, T);
-    /* The all-reduce comes before the post-norm: o_proj is column-sharded, so each rank holds a
-     * partial sum, and the norm is of the whole output (sum_r rmsnorm(p_r) != rmsnorm(sum_r p_r)). */
-    if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
-    if (tail_fused) return;
-    RAD_ISSUE_N(c, op_post, T, brows(w.h, T), RAD_W(w_post), brows(w.h, T));
-    RAD_ISSUE(c, op_add,  brows(w.x, T), brows(w.h, T), brows(w.x, T));
+/* A slice's rows see exactly the keys they see in the whole step: the cache holds the step's
+ * earlier rows (the slices run in order, each storing its own keys first), `used` ends the context
+ * at the slice's last row, the kernel counts each row's position back from there, and the key
+ * tiles start at the sequence's first key in both cases. The prologue is a row at a time. */
+void Gemma4Attn::attend_rows(RadCtx* c, const RadBatch* batch, int64_t r0, int64_t n,
+                             RadOperand used) const {
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
+    const int32_t* table = kvb ? kvb->block_table  : nullptr;
+    const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    const int64_t qkvd = qd + kvd + (cls.has_v ? kvd : 0);
+    const bool row = fused && op_qnr;
+    const RadOperand Q = row ? bcol_at(w.qkv, r0, qkvd, 0, qd, n) : brow_slice(w.q, r0, n, qd);
+    const RadOperand K = row ? bcol_at(w.qkv, r0, qkvd, qd, kvd, n) : brow_slice(w.k, r0, n, kvd);
+    const RadOperand V = row && cls.has_v ? bcol_at(w.qkv, r0, qkvd, qd + kvd, kvd, n)
+                                          : brow_slice(w.v, r0, n, kvd);
+    RAD_ISSUE_N(c, op_qnr_kv, n, Q, K, V, praw(batch->positions + r0, RAD_I32, n), RAD_W(w_qn),
+                RAD_W(w_kn), praw(slot ? slot + r0 : nullptr, RAD_I32, n), kv_cache(kv, layer));
+    rad_op a_op = op_attn;
+    RadOperand a_q = brow_slice(w.q, r0, n, qd);
+    if (op_attn_row) {
+        a_op = op_attn_row;
+        a_q  = Q;
+    } else if (row) {
+        RAD_ISSUE_N(c, op_lift_q, n, Q, a_q);
+    }
+    RAD_ISSUE_N(c, a_op, n, a_q, kv_cache(kv, layer),
+                praw2(table, RAD_I32, 1, kvb ? kvb->block_table_pitch : 0), used,
+                RAD_NONE, RAD_NONE, RAD_NONE, brow_slice(w.attn, r0, n, qd));
 }
 
 /* ---- the feed-forward: GELU (not SwiGLU), with a second norm on the down-projection output. */
@@ -457,11 +751,39 @@ struct Gemma4Mlp {
     rad_op op_norm = 0, op_act = 0, op_post = 0, op_ar = 0, op_add = 0;
     /* gelu_mul and down's quantiser as one, where it resolves (libr4d `gelu_mul_quant_i8`) */
     rad_op op_gq = 0;
+    /* the next layer's q|k|v read into the cache beside this block's all-reduce, or 0 (see
+     * "Prefetch beside the reductions") */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre);
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
               bool ar_fused = false) const;
+    /* For the prefill overlap, over rows [r0, r0 + n): the arm from the pair a junction wrote to
+     * down_proj's partial in `h`, and the post-norm and add the last layer takes unfused. */
+    void arm(RadCtx* c, int64_t r0, int64_t n) const;
+    void tail(RadCtx* c, int64_t r0, int64_t n) const;
 };
+
+void Gemma4Mlp::arm(RadCtx* c, int64_t r0, int64_t n) const {
+    const int64_t F = g.n_ff;
+    ln_gu.gemm_rows(c, w.gu, r0, n);
+    if (op_gq) {
+        RAD_ISSUE_N(c, op_gq, n, brow_slice(w.gu, r0, n, 2 * F), brow_slice(ln_down.q8, r0, n, F),
+                    brow_slice(ln_down.s8, r0, n, 1), RAD_NONE);
+        ln_down.gemm_rows(c, w.h, r0, n);
+    } else {
+        RAD_ISSUE_N(c, op_act, n, brow_slice(w.gu, r0, n, 2 * F), brow_slice(w.ffn, r0, n, F));
+        ln_down.step_rows(c, w.ffn, w.h, r0, n);
+    }
+}
+
+void Gemma4Mlp::tail(RadCtx* c, int64_t r0, int64_t n) const {
+    const int64_t E = g.n_embd;
+    RAD_ISSUE_N(c, op_post, n, brow_slice(w.h, r0, n, E), RAD_W(w_post), brow_slice(w.h, r0, n, E));
+    RAD_ISSUE_N(c, op_add, n, brow_slice(w.x, r0, n, E), brow_slice(w.h, r0, n, E),
+                brow_slice(w.x, r0, n, E));
+}
 
 int Gemma4Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre) {
     g = geom; layer = l; w = wire;
@@ -536,6 +858,7 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
         RAD_ISSUE(c, op_act,   brows(w.gu, T),  brows(w.ffn, T));
         ln_down.step(c, w.ffn, w.h, T);
     }
+    prefetch_beside(c, op_pf, pf_w, prefetch_height(batch));
     /* The all-reduce before the post-norm, as in the attention block: down_proj is column-sharded. */
     if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     if (tail_fused) return;
@@ -546,14 +869,59 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
 /* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
  * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). With
  * `res` null it is the plain norm of `x`, the first block's entry. */
+/* The four-rank fold's band. libr4d's exact all-reduce is a one-shot up to this many elements
+ * (R4D_AR_WIDE_ONESHOT_MAX_ELEMS) and a two-shot above, and the fused junction at four ranks is
+ * that one-shot with the junction as its epilogue: three times the message per rank on the link,
+ * which pays at decode heights and not at a prefill's. So at four ranks op_ar serves the rows a
+ * one-shot would, 97 at 5376, and a taller step issues the all-reduce and the junction apart.
+ *
+ * Within that band the fold pays only at the bottom. On 4x R9700 (2026-10-17, same image) a plain
+ * decode step (1 row) ran 5.6% slower without it (89 against 94 tok/s), and a DFlash verify
+ * (16 rows) 9% faster (300 against 276): at 16 rows the standalone all-reduce is the exact
+ * two-shot, while the fold's one block a row each takes a fenced handshake. The per-row costs
+ * cross near 4-5 rows. From 5 rows libr4d's four-rank row takes its tail form instead (axis
+ * `tail`): the standalone two-shot with the junction run after it in the same launch, behind a
+ * card-local count, so the junction costs neither a handshake nor a launch. With it a DFlash2
+ * verify (8 rows) folds and gains ~1% (348 / 258 / 187 / 516 against 345 / 255 / 185 / 511 tok/s,
+ * code / prose / story / long, 4x R9700; replies identical), where the one-shot fold there lost
+ * 6%. So the fold serves up to kAr4FoldRows rows, a z-lab DFlash verify's 16 included, and a
+ * taller step issues the pair. */
+static constexpr int64_t kArOneShotElems = 524288;
+static constexpr int64_t kAr4FoldRows = 16;
+/* From kArSpMinRows rows to the same band's top, libr4d's four-rank row takes `sp` instead: the
+ * all-reduce split around the junction. Each rank reduces only the rows it owns (a quarter, in
+ * rank order), runs the junction on them and gathers the int8 codes the next GEMM reads, so the
+ * second hop carries a byte a column instead of two and the junction a quarter of the rows. The
+ * fold and the sums are the whole form's, so q and the scales are byte for byte the same; the
+ * residual stream then holds this rank's rows only, which is all the next junction reads. A
+ * junction whose stream anything else reads next asks for the residual on every row too (sp 2):
+ * the layers the drafter taps, and the last layer's attention junction, since that layer's
+ * feed-forward closes with its own all-reduce, post-norm and add over every row. One launch at a
+ * time on 4x R9700 (2026-10-19): 19.8 against 21.9 us at 4 rows of 5376 (the one-shot fold), 22.9
+ * against 24.5 at 8 and 30.8 against 34.9 at 16 (the tail), 72.3 against 89.2 at 64. Below 4 rows
+ * a rank would idle (31.7 against 18.7 us at one).
+ *
+ * In the engine it pays only where it replaces the fold: a DFlash2 verify (8 rows) ran 402 / 297 /
+ * 216 / 603 tok/s code / prose / story / long against 392 / 290 / 210 / 585, replies identical,
+ * but steps of 24-64 rows, where the pair runs instead, lost ~10% under load (4 users 588 against
+ * 698 aggregate, 8 users 781 against 867; 12 users even; 4x R9700, 2026-10-19). So it serves to
+ * kArSpMaxRows, the fold's band, within the one-shot's. */
+static constexpr int64_t kArSpMinRows = 4;
+static constexpr int64_t kArSpMaxRows = 16;
+
 struct G4Junction {
     rad_op     op = 0;
-    rad_op     op_ar = 0;   /* the same with the two-rank exact all-reduce of `x` in front, or 0 */
+    rad_op     op_ar = 0;   /* the same with the exact all-reduce of `x` in front, or 0 */
+    int64_t    ar_rows = 0; /* the most rows op_ar serves: the step's at two ranks, a band at four */
+    rad_op     op_sp = 0;   /* ...with the all-reduce split around it (four ranks), or 0 */
+    int64_t    sp_hi = 0;   /* the most rows op_sp serves, from kArSpMinRows */
     rad_buf    x = 0, res = 0, q8 = 0, s8 = 0;
     rad_weight w = 0, wp = 0, sc = 0;
 
+    /* `full_res`: something besides the next junction reads the residual stream after this one,
+     * so the split form must leave it on every row. */
     int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
-                rad_weight wp_, rad_weight sc_, const G4Linear& into) {
+                rad_weight wp_, rad_weight sc_, const G4Linear& into, bool full_res = false) {
         x = x_; res = res_; w = w_; wp = wp_; sc = sc_; q8 = into.q8; s8 = into.s8;
         if (!into.quant || into.shared_in || !q8 || !s8 || !w || (sc && !wp) || ((wp || sc) && !res))
             return RAD_E_INVAL;
@@ -571,11 +939,16 @@ struct G4Junction {
         const rad_buf wr[3] = { q8, s8, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        /* With the all-reduce in front, at two ranks on the exact wire: `x` is then a rank's
-         * partial sum of a column-sharded linear. With the lossy wire allowed, the standalone
-         * all-reduce is kept, since it may choose that wire. */
-        if (res && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
-            const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+        /* With the all-reduce in front, at two or four ranks on the exact wire: `x` is then a
+         * rank's partial sum of a column-sharded linear. With the lossy wire allowed, the
+         * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold is
+         * the one-shot's and serves only its band (kArOneShotElems, kAr4FoldRows). */
+        const bool four = g.world == 4;
+        const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd))
+                                : g.max_tok;
+        if (res && g.wire_exact && (g.world == 2 || four) && hi >= 1 &&
+            rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
+            const RadParam pa[] = { RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
             op_ar = rad_decl_op(b, "ar_rmsnorm_quant_i8", pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
@@ -583,13 +956,42 @@ struct G4Junction {
                 const rad_buf wa[4] = { x, q8, s8, res };
                 rad_op_reads (b, op_ar, rd, 2);
                 rad_op_writes(b, op_ar, wa, 4);
+                ar_rows = hi;
+            }
+            /* The split form from kArSpMinRows to kArSpMaxRows rows. It needs the post-norm, as
+             * every trunk junction past the first has; `x` is declared written, as the fold's. */
+            const int64_t top = std::min<int64_t>(
+                std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd), kArSpMaxRows);
+            if (op_ar && four && wp && top >= kArSpMinRows) {
+                const RadParam ps[] = { RAD_RANGE("M", 1, top), RAD_INT("n", g.n_embd),
+                                        RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
+                                        RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd),
+                                        RAD_INT("sp", full_res ? 2 : 1) };
+                op_sp = rad_decl_op(b, "ar_rmsnorm_quant_i8", ps, (int)(sizeof ps / sizeof ps[0]),
+                                    ws, nw);
+                if (op_sp) {
+                    const rad_buf wa[4] = { x, q8, s8, res };
+                    rad_op_reads (b, op_sp, rd, 2);
+                    rad_op_writes(b, op_sp, wa, 4);
+                    sp_hi = top;
+                }
             }
         }
         return RAD_OK;
     }
+    /* The most rows a step may have for step(..., true): the fold's band, and the split form's. */
+    int64_t ar_top() const { return op_sp ? std::max(ar_rows, sp_hi) : ar_rows; }
     void step(RadCtx* c, int64_t T, bool with_ar = false) const {
-        RAD_ISSUE_N(c, with_ar ? op_ar : op, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
+        const rad_op o = !with_ar ? op : (op_sp && T >= kArSpMinRows && T <= sp_hi) ? op_sp : op_ar;
+        RAD_ISSUE_N(c, o, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
                     brows(q8, T), brows(s8, T), RAD_NONE,
+                    wp ? RAD_W(wp) : RAD_NONE, sc ? RAD_W(sc) : RAD_NONE);
+    }
+    /* Rows [r0, r0 + n), without the all-reduce: a slice of the prefill overlap, whose reduction
+     * rode the second lane. */
+    void step_rows(RadCtx* c, int64_t E, int64_t r0, int64_t n) const {
+        RAD_ISSUE_N(c, op, n, brow_slice(x, r0, n, E), res ? brow_slice(res, r0, n, E) : RAD_NONE,
+                    RAD_W(w), brow_slice(q8, r0, n, E), brow_slice(s8, r0, n, 1), RAD_NONE,
                     wp ? RAD_W(wp) : RAD_NONE, sc ? RAD_W(sc) : RAD_NONE);
     }
 };
@@ -805,7 +1207,7 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", n_trunk),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                RAD_INT("vocab_offset", g.vocab_off),
-                               RAD_F64("mult", std::sqrt((double)n_trunk))),
+                               RAD_F64("mult", gemma4::embed_scale(n_trunk))),
                     RAD_WEIGHTS(w_tok)),
                   {}, {b_e});
     if (g.world > 1)
@@ -1053,6 +1455,13 @@ void Gemma4Head::step(RadCtx* c, const RadBatch* batch) const {
     ln_post.step(c, b_hd, b_hn, T);
 }
 
+/* The prefill overlap's smallest slice (trunk_overlap). It is above every row band the sliced
+ * kernels have, with room to spare: the int8 GEMMs' skinny band (64) and r4d_act_threads' last
+ * width change at these widths (120 rows), which fixes the norms' and the quantisers'
+ * sum-of-squares partition. And it is large enough that a slice's reduction is worth a second
+ * lane. */
+static constexpr int64_t kOverlapRows = 512;
+
 struct Layer {
     bool       global = false;
     Gemma4Attn attn{};
@@ -1064,6 +1473,19 @@ struct Layer {
      * The last layer has no j_ma: its stream goes to the final norm, which feeds the lm_head, not
      * a quantiser. */
     G4Junction j_am{}, j_ma{};
+    /* the DFlash drafter's tap: this layer's output into its column slice of `dflash_src` */
+    rad_op     op_tap = 0;
+    /* The prefill overlap's reductions (trunk_overlap): attn.op_ar and mlp.op_ar at `overlap` 1,
+     * the narrow launch that leaves the CUs to the other slice's compute; 0 where not declared. */
+    rad_op     op_ar_att_ov = 0, op_ar_ff_ov = 0;
+};
+
+/* The prefill overlap's attention per slice (trunk_overlap): slice A's context end, one
+ * kv_len_trim a KV group the attention reads. */
+struct SliceTrim {
+    rad_kvgroup kv = 0;
+    rad_op      op = 0;
+    rad_buf     used = 0;   /* [max_seqs] int32 */
 };
 
 struct Model {
@@ -1078,6 +1500,7 @@ struct Model {
     rad_buf b_x = 0, b_h = 0, b_hout = 0, b_logits = 0;
     rad_buf b_qs = 0, b_ks = 0, b_vs = 0, b_attns = 0;   /* sliding rows */
     rad_buf b_qg = 0, b_kg = 0, b_vg = 0, b_atting = 0;  /* global rows  */
+    rad_buf b_qkvs = 0, b_qkvg = 0;   /* the fused projections' rows, where a layer has one */
     rad_buf b_gu = 0, b_ffn = 0;
 
     rad_weight w_tok = 0, w_out = 0, w_lm = 0;
@@ -1098,9 +1521,233 @@ struct Model {
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
     bool       fuse = false;
     bool       fuse_ar = false;   /* every junction also carries the all-reduce in front of it */
+    int64_t    ar_rows = 0;       /* ...in a step of at most this many rows (G4Junction::ar_rows) */
+    /* A prefill step of 2 * kOverlapRows rows or more runs as two slices, each slice's
+     * all-reduces on the second lane beside the other's compute (trunk_overlap). Set at declare. */
+    bool       overlap = false;
+
+    /* z-lab's DFlash drafter (arch/common/rad_gemma4_dflash.h), declared only when the container
+     * carries one and the deployment speculates: the trunk layers it taps, the [max_tok, taps x
+     * n_embd] plane the taps fill, the block and its own KV group. */
+    enum { MAX_TAPS = gemma4::Dflash1::MAX_TAPS };
+    int             n_taps = 0;
+    int             tap_layer[MAX_TAPS] = {};
+    rad_buf         b_dfsrc = 0;
+    gemma4::Dflash1 df{};
+    rad_kvgroup     kv_draft = 0;
+    bool            have_df = false;
+    /* Or a DFlash2 drafter (arch/common/rad_block_dflash2.h): RedHatAI's speculators-format one
+     * for the 31B. Same taps and plane; its own block, buffers and KV group. */
+    Dflash2         df2{};
+    Dflash2::Wire   df2w{};
+    bool            have_df2 = false;
+    /* The prefill overlap runs attention per slice: a trim a KV group (sliding, global). */
+    SliceTrim       trim[2]{};
+    int             n_trim = 0;
+    bool            slice_attn = false;
 };
 
 static Model g_model[MAX_RANKS];
+
+/* A DFlash2 drafter's config key, from vLLM's speculators layout (the speculator's keys at the
+ * top of `draft.`) or z-lab's (under `draft.dflash_config.`), whichever the checkpoint has. */
+static long long df2_geti(const RadModelMeta* meta, const char* key, long long dflt) {
+    char k[160];
+    std::snprintf(k, sizeof k, "draft.%s", key);
+    const long long v = rad_meta_geti(meta, k, LLONG_MIN);
+    if (v != LLONG_MIN) return v;
+    std::snprintf(k, sizeof k, "draft.dflash_config.%s", key);
+    return rad_meta_geti(meta, k, dflt);
+}
+
+/* The DFlash2 drafter: RedHatAI/gemma-4-31B-it-speculator.dflash2, a speculators-format DFlash2
+ * (z-lab's architecture, trained by Red Hat on gemma-4-31B-it's outputs) in place of z-lab's
+ * DFlash. rad_block_dflash2.h is the block; this reads its config and wires it to the trunk.
+ *
+ * From the checkpoint and speculators' code (models/dflash2, models/dflash/core.py):
+ *
+ *   - five Qwen3-shaped layers at the trunk's width, every one sliding (2048) and non-causal;
+ *   - the target's table as a plain nn.Embedding: no Gemma sqrt(hidden) scale (z-lab's DFlash
+ *     goes through the target's scaled module; this one does not), so the block's unscaled
+ *     lookup is right;
+ *   - the target's head as a plain linear, no soft-cap, which the block's head is;
+ *   - taps counted as vLLM captures them, the residual entering a layer (gemma4::dflash2_taps);
+ *   - block 8: the anchor predicts nothing, seven drafts (sample_from_anchor false).
+ *
+ * The head reads the 8-bit copy the -df2 recipe makes (rad_block_dflash2.h, head_i8), so the
+ * selector ranks what an 8-bit head proposes. Nothing here is defaulted quietly: a config this
+ * block does not implement is refused by name. */
+static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx,
+                           Model& m) {
+    Names& nm = m.nm;
+    Geom   dg{};
+    RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "gemma4 DFlash2"));
+    const char* lp = drafter_layer_prefix(meta);
+    char key[160];
+    std::snprintf(key, sizeof key, "%shidden_size", lp);
+    if (rad_meta_geti(meta, key, dg.n_embd) != dg.n_embd) {
+        fprintf(stderr, "radiance: gemma4: the DFlash2 drafter is %lld wide and the trunk %lld; its "
+                        "fc and residual stream are the trunk's width\n",
+                rad_meta_geti(meta, key, 0), (long long)dg.n_embd);
+        return RAD_E_UNSUPPORTED;
+    }
+    std::snprintf(key, sizeof key, "%shidden_act", lp);
+    const char* act = rad_meta_gets(meta, key, "silu");
+    if (std::strcmp(act, "silu")) {
+        fprintf(stderr, "radiance: gemma4: the DFlash2 drafter's MLP uses %s; the block's is silu\n",
+                act);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (df2_geti(meta, "sample_from_anchor", 0)) {
+        fprintf(stderr, "radiance: gemma4: this DFlash2 drafter samples from its anchor row; the "
+                        "block's anchor predicts nothing\n");
+        return RAD_E_UNSUPPORTED;
+    }
+
+    Dflash2::Config dc{};
+    dc.n_taps   = m.n_taps;
+    dc.block    = ctx->max_spec + 1;
+    dc.taps     = df2_geti(meta, "conv_kernel_size", 2);
+    dc.group    = df2_geti(meta, "conv_group_size", 16);
+    dc.sel_rank = df2_geti(meta, "selector_rank", 0);
+    dc.sel_topk = df2_geti(meta, "selector_top_k", 0);
+    dc.prefetch = gemma4::kPrefetchBytes;
+    if (dc.sel_rank <= 0 || dc.sel_topk <= 0) {
+        fprintf(stderr, "radiance: gemma4: the DFlash2 drafter states no selector geometry (rank "
+                        "%lld, top_k %lld)\n", (long long)dc.sel_rank, (long long)dc.sel_topk);
+        return RAD_E_INVAL;
+    }
+    /* Attention: one window for every layer, since the block issues one attention op. A sliding
+     * window non-causal within the block is speculators' sliding_window_non_causal; z-lab's
+     * layout says is_causal. */
+    {
+        std::snprintf(key, sizeof key, "%slayer_types", lp);
+        std::vector<int> sliding;
+        if (const char* lt = rad_meta_gets(meta, key, nullptr))
+            RAD_ARCH_TRY(parse_layer_kinds("gemma4 DFlash2", lt, {"sliding_attention"},
+                                           "full_attention", &sliding));
+        const bool any_full = std::find(sliding.begin(), sliding.end(), 0) != sliding.end();
+        const bool any_slide = std::find(sliding.begin(), sliding.end(), 1) != sliding.end();
+        if (any_full && any_slide) {
+            fprintf(stderr, "radiance: gemma4: the DFlash2 drafter mixes sliding and full layers; "
+                            "the block takes one attention width for all of them\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        std::snprintf(key, sizeof key, "%ssliding_window", lp);
+        const long long win = rad_meta_geti(meta, key, 0);
+        std::snprintf(key, sizeof key, "%suse_sliding_window", lp);
+        if (any_slide || rad_meta_geti(meta, key, 0))
+            dc.window = df2_geti(meta, "swa_window_size", win);
+        const long long nc = rad_meta_geti(meta, "draft.sliding_window_non_causal", -1);
+        dc.causal = nc >= 0 ? (nc ? 0 : 1) : (rad_meta_geti(meta, "draft.is_causal", 0) ? 1 : 0);
+    }
+
+    /* The query block must be a power of two (the convolution masks a row's position with
+     * block_size - 1), and the depth the probe named is the trained one. */
+    const long long trained = gemma4::dflash_block(meta);
+    if (dc.block < 2 || (dc.block & (dc.block - 1))) {
+        fprintf(stderr, "radiance: gemma4: DFlash2's convolution masks the block position with "
+                        "block_size - 1, so the query block must be a power of two; %d draft "
+                        "tokens make it %lld (trained at %lld)\n",
+                ctx->max_spec, (long long)dc.block, trained);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (trained > 0 && trained != dc.block)
+        rad_note(b, "DFlash2 was trained at block_size %lld (%lld draft tokens) and runs at %lld; "
+                    "it accepts less away from its trained block", trained, trained - 1,
+                 (long long)dc.block);
+    /* The three scalars rad_block_dflash2.h does not apply (z-lab's names; speculators has none). */
+    if (rad_meta_getf(meta, "draft.dflash_config.input_embedding_scale", 1.0) != 1.0 ||
+        rad_meta_getf(meta, "draft.dflash_config.output_multiplier", 1.0) != 1.0 ||
+        rad_meta_getf(meta, "draft.dflash_config.final_logit_softcapping", 0.0) != 0.0) {
+        fprintf(stderr, "radiance: gemma4: this DFlash2 checkpoint scales its embedding or its "
+                        "logits, or soft-caps them; the block applies none of the three\n");
+        return RAD_E_UNSUPPORTED;
+    }
+
+    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, dc.window, (int)m.n_main, &m.kv_draft));
+
+    const int64_t qd  = dg.n_head * dg.head_dim;
+    const int64_t kvd = dg.n_head_kv * dg.head_dim;
+    int64_t qr = dg.max_seqs * dc.block;
+    if (qr > dg.max_tok) qr = dg.max_tok;
+    const int64_t sr   = dg.max_seqs * dc.steps();
+    const int64_t spad = ((sr + 15) / 16) * 16;
+
+    Dflash2::Wire& dw = m.df2w;
+    dw.src     = m.b_dfsrc;
+    dw.c       = decl_b(b, nm.f("df_c"),    dg.act_dtype, {dg.max_tok, dg.n_embd});
+    dw.ck      = decl_b(b, nm.f("df_ck"),   dg.act_dtype, {dg.max_tok, kvd});
+    dw.cv      = decl_b(b, nm.f("df_cv"),   dg.act_dtype, {dg.max_tok, kvd});
+    dw.x       = decl_b(b, nm.f("df_x"),    dg.act_dtype, {qr, dg.n_embd});
+    dw.h       = decl_b(b, nm.f("df_h"),    dg.act_dtype, {qr, dg.n_embd});
+    dw.h2      = decl_b(b, nm.f("df_h2"),   dg.act_dtype, {qr, dg.n_embd});
+    dw.coef    = decl_b(b, nm.f("df_coef"), dg.act_dtype, {qr, dc.coef_dim(dg.n_embd)});
+    dw.q       = decl_b(b, nm.f("df_q"),    dg.act_dtype, {qr, qd});
+    dw.k       = decl_b(b, nm.f("df_k"),    dg.act_dtype, {qr, kvd});
+    dw.v       = decl_b(b, nm.f("df_v"),    dg.act_dtype, {qr, kvd});
+    dw.attn    = decl_b(b, nm.f("df_attn"), dg.act_dtype, {qr, qd});
+    dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
+    dw.ffn     = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), RAD_F8E4M3, {dg.max_tok, dc.n_taps * dg.n_embd});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32,
+                        {dg.max_tok, fp8_blocks(dc.n_taps * dg.n_embd)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   RAD_F8E4M3, {dg.max_tok, dg.n_embd});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32,    {dg.max_tok, fp8_blocks(dg.n_embd)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  RAD_F8E4M3, {qr, dg.n_embd});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32,    {qr, fp8_blocks(dg.n_embd)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  RAD_F8E4M3, {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    dw.sel_h   = decl_b(b, nm.f("df_selh"), dg.act_dtype, {sr, dg.n_embd});
+    dw.hp      = decl_b(b, nm.f("df_hp"),   dg.act_dtype, {sr, dc.sel_rank});
+    dw.dq      = decl_b(b, nm.f("df_dq"),   RAD_I8,  {sr, dg.n_embd});
+    dw.ds      = decl_b(b, nm.f("df_ds"),   RAD_F32, {sr, 1});
+    dw.dsum    = decl_b(b, nm.f("df_dsum"), RAD_F32, {dg.n_embd / 128, spad});
+    dw.dlog    = decl_b(b, nm.f("df_dlog"), dg.act_dtype, {sr, Dflash2::head_rows(dg)});
+    /* No rescoring against the trunk's head: the -df2 recipe's head is already 8-bit, so the
+     * candidates are the ones an 8-bit head ranks (rad_block_dflash2.h, head_i8). */
+    const int64_t tw = dc.sel_topk;
+    dw.cand    = decl_b(b, nm.f("df_cand"),  RAD_I32, {sr, tw});
+    dw.unary   = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, tw});
+    if (Dflash2::head_sharded(dg)) {
+        dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, tw, 2});
+        dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * tw, 2});
+    }
+    dw.tokens  = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {dg.max_seqs, dc.steps()});
+
+    /* The head copy comes from the tied table, under the block's own name; the recipe makes it
+     * 8-bit. */
+    RAD_ARCH_TRY(m.df2.declare(b, nm, dg, dc, (int)m.n_main, m.kv_draft, m.w_tok, "draft",
+                               nm.ckpt("model.language_model.embed_tokens.weight"), dw));
+    m.have_df2 = true;
+
+    RadDrafterDecl drf{};
+    drf.name           = "dflash2";
+    drf.kind           = RAD_DRAFT_BLOCK;
+    drf.depth          = ctx->max_spec;
+    drf.block          = dc.block;
+    drf.proposal       = dw.tokens;
+    drf.proposal_pitch = dc.steps();
+    drf.window         = dc.window;
+    drf.mask_token     = (int32_t)df2_geti(meta, "mask_token_id", -1);
+    if (drf.mask_token < 0) {
+        fprintf(stderr, "radiance: gemma4: this DFlash2 checkpoint declares no mask_token_id, and "
+                        "every drafted position embeds it\n");
+        return RAD_E_FORMAT;
+    }
+    RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+
+    rad_note(b, "DFlash2 drafter: %lld layers at absolute %lld.., %lld heads / %lld kv x %lld, ffn "
+                "%lld, %s attention with a %lld-token window, %d trunk taps; one forward proposes "
+                "%lld tokens through the candidate selector, its head %s",
+             (long long)dg.n_layer, (long long)m.n_main, (long long)dg.n_head_all,
+             (long long)dg.n_head_kv_all, (long long)dg.head_dim, (long long)dg.n_ff_all,
+             dc.causal ? "causal" : "non-causal", (long long)dc.window, m.n_taps,
+             (long long)dc.steps(), m.df2.head_i8 ? "8-bit" : "2-bit");
+    return RAD_OK;
+}
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
@@ -1220,6 +1867,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
+    /* ---- the DFlash drafter's taps, declared when the container carries z-lab's drafter and this
+     * serve speculates. The plane is declared here and written by an op declared inside each layer
+     * it taps, because the buffer planner's liveness is declaration order (the tap below). */
+    {
+        const int n = gemma4::dflash_kind(meta) == 2
+            ? gemma4::dflash2_taps(meta, ctx, g.n_layer, m.tap_layer, Model::MAX_TAPS)
+            : gemma4::Dflash1::taps(meta, ctx, g.n_layer, m.tap_layer, Model::MAX_TAPS);
+        if (n < 0) return n;
+        m.n_taps = n;
+        if (n > 0)
+            m.b_dfsrc = decl_b(b, nm.f("dflash_src"), g.act_dtype,
+                               {g.max_tok, (int64_t)n * g.n_embd});
+    }
+
     /* ---- the vocabulary edges. Gemma 4 ties the head to the embedding. */
     const char* pre = "model.language_model.layers";
     RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("model.language_model.embed_tokens.weight")));
@@ -1240,12 +1901,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The embedding is scaled by sqrt(n_embd) at the lookup, not in the table (as in llama.cpp's
      * build_inp_embd and HF's ScaledWordEmbedding), so the plain table stays tied to the head.
-     * Without it the token signal in the residual stream would be ~73x too small. */
+     * Without it the token signal in the residual stream would be ~73x too small. The scale is
+     * sqrt(n_embd) rounded to bf16, as the reference multiplies by it (gemma4::embed_scale: 73.5
+     * at 5376, not 73.32). The first norm hides the difference but the residual stream does not,
+     * and the DFlash drafter was trained on the reference's hidden states. */
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                RAD_INT("vocab_offset", g.vocab_off),
-                               RAD_F64("mult", std::sqrt((double)g.n_embd))),
+                               RAD_F64("mult", gemma4::embed_scale(g.n_embd))),
                     RAD_WEIGHTS(m.w_tok)),
                    {}, {m.b_x});
     if (g.world > 1)
@@ -1278,7 +1942,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const rad_kvgroup       kg   = lay.global ? m.kv_g : m.kv_s;
         const Gemma4Attn::Wire& aw   = lay.global ? gw : sw;
         RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
-        RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre));
+        RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre,
+                                      lay.global ? &m.b_qkvg : &m.b_qkvs));
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, pre));
 
         /* The per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
@@ -1291,6 +1956,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                        RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(lay.w_scalar)),
                            {mw.x}, {mw.x});
+
+        /* The tap: a row copy of the layer's output (after the scalar, HF's hidden_states[l + 1])
+         * into the column slice the tap owns. It is declared here, in the layer it is issued
+         * after, because the buffer planner's liveness is declaration order. A tap declared once
+         * after the trunk made `dflash_src` look born at its end and free to share with what every
+         * layer writes, which on arch/gemma4 cost 98% of the drafts with the reply still fluent. */
+        for (int t = 0; t < m.n_taps; ++t)
+            if (m.tap_layer[t] == (int)l && !lay.op_tap)
+                lay.op_tap = rw(b, RAD_OP(b, "cast",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                               RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {m.b_x}, {m.b_dfsrc});
     }
 
     /* ---- the junctions, declared once every layer exists (j_ma reads the next layer's gain).
@@ -1301,31 +1979,136 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.n_main > 0) {
         bool ok = true;
         for (const Layer& lay : m.layers)
-            ok = ok && lay.attn.ln_q.quant && lay.attn.ln_k.shared_in &&
-                 (!lay.attn.cls.has_v || lay.attn.ln_v.shared_in) && lay.mlp.ln_gu.quant;
+            ok = ok && lay.attn.reads_pair() && lay.mlp.ln_gu.quant;
         if (ok) {
-            RAD_ARCH_TRY(m.j0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, 0, 0, m.layers[0].attn.ln_q));
+            RAD_ARCH_TRY(m.j0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, 0, 0,
+                                         m.layers[0].attn.ln_in()));
             ok = m.j0.op != 0;
             for (int64_t l = 0; ok && l < m.n_main; ++l) {
                 Layer& lay = m.layers[(size_t)l];
+                /* the split form's residual on every row: before the last layer's feed-forward
+                 * (its own reduction, post-norm and add over every row), and where the drafter
+                 * taps the stream */
+                bool tapped = false;
+                for (int t = 0; t < m.n_taps; ++t) tapped = tapped || m.tap_layer[t] == (int)l;
                 RAD_ARCH_TRY(lay.j_am.declare(b, g, m.b_h, m.b_x, lay.mlp.w_norm, lay.attn.w_post, 0,
-                                              lay.mlp.ln_gu));
+                                              lay.mlp.ln_gu, l + 1 == m.n_main));
                 ok = lay.j_am.op != 0;
                 if (ok && l + 1 < m.n_main) {
                     const Layer& nx = m.layers[(size_t)l + 1];
                     RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm, lay.mlp.w_post,
-                                                  lay.w_scalar, nx.attn.ln_q));
+                                                  lay.w_scalar, nx.attn.ln_in(), tapped));
                     ok = lay.j_ma.op != 0;
                 }
             }
         }
         m.fuse = ok;
-        bool ar = ok && g.world == 2;
+        bool ar = ok && (g.world == 2 || g.world == 4);
+        int64_t rows = g.max_tok;
         for (int64_t l = 0; ar && l < m.n_main; ++l) {
             const Layer& lay = m.layers[(size_t)l];
             ar = lay.j_am.op_ar != 0 && (l + 1 >= m.n_main || lay.j_ma.op_ar != 0);
+            if (ar) rows = std::min(rows, lay.j_am.ar_top());
+            if (ar && l + 1 < m.n_main) rows = std::min(rows, lay.j_ma.ar_top());
         }
         m.fuse_ar = ar;
+        m.ar_rows = ar ? rows : 0;
+    }
+
+    /* ---- prefetch beside the reductions (see prefetch_beside): gate_up's first 20 MB beside the
+     * attention block's all-reduce and the next layer's q|k|v's (q alone, unfused; after the last
+     * layer, the lm_head's) beside the feed-forward's (gemma4::kPrefetchBytes), then down_proj's
+     * first 9 MB beside the attention (gemma4::kPrefetchDownBytes). Only at more than one rank,
+     * where there are reductions to sit beside. RADIANCE_PREFETCH=0 declares none
+     * (decl_prefetch). */
+    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+        for (size_t l = 0; l < m.layers.size(); ++l) {
+            Layer& lay = m.layers[l];
+            lay.attn.pf_w  = lay.mlp.ln_gu.w;
+            lay.attn.op_pf = decl_prefetch(b, lay.attn.pf_w, gemma4::kPrefetchBytes);
+            /* after the last layer the lm_head is the next weight streamed */
+            if (l + 1 < m.layers.size()) {
+                const Gemma4Attn& nx = m.layers[l + 1].attn;
+                lay.mlp.pf_w = nx.fused ? nx.ln_qkv.w : nx.ln_q.w;
+            } else {
+                lay.mlp.pf_w = m.w_lm;
+            }
+            lay.mlp.op_pf = decl_prefetch(b, lay.mlp.pf_w, gemma4::kPrefetchBytes);
+        }
+        for (Layer& lay : m.layers) {
+            lay.attn.pfd_w  = lay.mlp.ln_down.w;
+            lay.attn.op_pfd = decl_prefetch(b, lay.attn.pfd_w, gemma4::kPrefetchDownBytes);
+        }
+    }
+
+    /* ---- the prefill overlap (trunk_overlap). It needs a reduction to hide, every junction fused
+     * (the slices issue only the fused forms), and the exact wire, the one shown to give a slice
+     * the bits it gives the whole. The buffer the second lane reduces in place is taken out of the
+     * arena's sharing, which the runtime asks of every buffer a second lane touches; it lives
+     * across the whole trunk already. */
+    const char* ov = std::getenv("RADIANCE_GEMMA4_OVERLAP");   /* 0: every step whole */
+    const bool ov_off = ov && !std::strcmp(ov, "0");
+    m.overlap = !ov_off && g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
+    for (const Layer& lay : m.layers)
+        m.overlap = m.overlap && lay.attn.op_ar && lay.mlp.op_ar;
+    if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
+    /* The reductions the overlap runs on lane 1 are their own ops at `overlap` 1. Declared like
+     * op_ar, they resolve to the wide launch: the exact two-shot over every word of a 512- to
+     * 1024-row slice takes nb_for_shard's ceiling, 24 blocks of 1024 threads, each a whole CU
+     * spinning on a peer flag for the ~1 ms the link takes -- a third of the card held away from
+     * the other slice's GEMMs. At `overlap` 1 the row is ar_twoshot_4rank_exact_lane: the same
+     * entry and the same fold per word (the block count moves no byte), four blocks by default
+     * (tArTs4Lane). Its range starts at a slice, which is above every one-shot band. */
+    if (m.overlap) {
+        auto lane_ar = [&]() {
+            return rw(b, RAD_OP(b, "all_reduce",
+                         RAD_PARAMS(RAD_INT("world_size", g.world),
+                                    RAD_RANGE("numel", kOverlapRows * g.n_embd,
+                                              g.max_tok * g.n_embd),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                    RAD_INT("min_bytes", g.wire_min_bytes),
+                                    RAD_INT("overlap", 1)),
+                         RAD_NOWEIGHTS),
+                      {m.b_h}, {m.b_h});
+        };
+        for (Layer& lay : m.layers) {
+            lay.op_ar_att_ov = lane_ar();
+            lay.op_ar_ff_ov  = lane_ar();
+        }
+    }
+    /* ...and with attention per slice. Run whole between the slices, a layer's attention leaves
+     * slice A's attention-side reduction only slice B's o_proj to hide behind, and slice B's
+     * feed-forward reduction only slice A's junction and q|k|v. Per slice (A's projection,
+     * prologue, attention and o_proj, then B's), each of the four reductions sits beside a whole
+     * block: on 4x R9700 the exact two-shot of a 1024-row slice takes ~1.05 ms alone and ~1.4x
+     * that beside any card-filling compute (a four-card microbenchmark, 2026-10-18). Slice A's
+     * attention reads its context end from kv_len_trim, one a KV group. A one-sequence step only
+     * (the slices' rows are then one sequence's), with the one-launch prologue and no
+     * multi-component rotary. Byte-identical: every greedy reply matches the whole attention's
+     * (4x R9700, two rounds, and 16 of 16 fresh starts on a 5310-token prompt); prefill +5%. */
+    if (m.overlap) {
+        bool ok = !g.rope_mc && rad_op_declared(b, "kv_len_trim");
+        for (const Layer& lay : m.layers) ok = ok && lay.attn.slicable();
+        for (const Layer& lay : m.layers) {
+            if (!ok) break;
+            int i = 0;
+            while (i < m.n_trim && m.trim[i].kv != lay.attn.kv) ++i;
+            if (i < m.n_trim) continue;
+            if (m.n_trim == 2) { ok = false; break; }
+            SliceTrim& t = m.trim[m.n_trim];
+            t.kv = lay.attn.kv;
+            t.used = decl_b(b, nm.f("slice_used_%d", m.n_trim), RAD_I32, {g.max_seqs});
+            ok = t.used && rad_buf_concurrent(b, t.used) == RAD_OK;
+            t.op = ok ? rw(b, RAD_OP(b, "kv_len_trim",
+                                RAD_PARAMS(RAD_RANGE("trim", 1, g.max_tok),
+                                           RAD_INT("max_seqs", g.max_seqs)),
+                                RAD_NOWEIGHTS),
+                           {}, {t.used})
+                      : 0;
+            ok = ok && t.op;
+            ++m.n_trim;
+        }
+        m.slice_attn = ok && m.n_trim > 0;
     }
 
     /* ---- the tail: final norm, the sampled rows, the lm_head, and the soft-cap. */
@@ -1372,10 +2155,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_drafter_shared_kv(b, kHeadPosOffset));
     }
 
-    /* ---- the vision tower, its weight groups past the trunk's and the head's (counted even when
-     * the head is not declared, so the groups do not move with max_spec). */
+    /* ---- or z-lab's DFlash drafter, past the trunk's layers. It is declared last because
+     * declaration order is the buffer planner's liveness. It reads the taps the trunk copied into
+     * `dflash_src` and the trunk's tied table, as its embedding and, where the container holds no
+     * 8-bit copy, as its head. */
+    if (m.n_taps > 0 && gemma4::dflash_kind(meta) == 2) {
+        RAD_ARCH_TRY(declare_dflash2(b, meta, ctx, m));
+    } else if (m.n_taps > 0) {
+        gemma4::Dflash1::Trunk t{};
+        t.n_taps     = m.n_taps;
+        t.escale     = gemma4::embed_scale(g.n_embd);
+        t.src        = m.b_dfsrc;
+        t.w_tok      = m.w_tok;
+        t.tok_src    = nm.ckpt("model.language_model.embed_tokens.weight");
+        t.base_layer = (int)m.n_main;
+        RAD_ARCH_TRY(gemma4::Dflash1::declare_drafter(b, meta, ctx, nm, g, t, &m.df, &m.kv_draft));
+        m.have_df = true;
+    }
+
+    /* ---- the vision tower, its weight groups past the trunk's and the draft model's: the
+     * assistant's layers and its exit, or the DFlash drafter's layers. They are counted even when
+     * the draft model is not declared, so the groups do not move with max_spec. */
     {
-        const int64_t head_groups = has_assistant(meta) ? meta_text_geti(meta, "num_hidden_layers", 0, "draft.") + 1 : 0;
+        int64_t head_groups = 0;
+        if (has_assistant(meta))
+            head_groups = meta_text_geti(meta, "num_hidden_layers", 0, "draft.") + 1;
+        else if (gemma4::dflash_kind(meta) == 1)
+            head_groups = rad_meta_geti(meta, "draft.num_hidden_layers", 0);
+        else if (gemma4::dflash_kind(meta) == 2) {
+            char k[160];
+            std::snprintf(k, sizeof k, "%snum_hidden_layers", drafter_layer_prefix(meta));
+            head_groups = rad_meta_geti(meta, k, 0);
+        }
         RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups),
                                    "model.", "gemma4_bf16"));
     }
@@ -1385,7 +2196,210 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              g.rank, g.world, (long long)g.n_layer, (long long)n_global,
              (long long)(g.n_layer - n_global), (long long)sliding_win,
               (long long)g.n_head, (long long)g.head_dim, (long long)g.n_head, (long long)head_g);
+    {
+        int64_t n_fused = 0, n_row = 0, n_dec = 0, dec_hi = 0;
+        for (const Layer& lay : m.layers) {
+            n_fused += lay.attn.fused ? 1 : 0;
+            n_row   += lay.attn.op_attn_row ? 1 : 0;
+            if (lay.attn.op_attn_dec) { ++n_dec; dec_hi = lay.attn.dec_hi; }
+        }
+        if (n_fused)
+            rad_note(b, "q, k and v as one linear (blk.*.attn_qkv) on %lld of %lld layers; attention "
+                        "reads q in the row at every height on %lld, up to %lld query rows a "
+                        "sequence on %lld, and copies it out above that or one row",
+                     (long long)n_fused, (long long)m.layers.size(), (long long)n_row,
+                     (long long)dec_hi, (long long)n_dec);
+        else
+            rad_note(b, "q, k and v as three linears (a container converted before attn_qkv, or "
+                        "bf16 weights): convert with a recipe naming blk.*.attn_qkv.weight for one");
+    }
+    if (g.world > 1) {
+        if (m.overlap)
+            rad_note(b, "prefill overlap: a step of %lld rows or more runs as two slices, each "
+                        "slice's all-reduces on a second stream beside the other's compute",
+                     (long long)(2 * kOverlapRows));
+        else
+            rad_note(b, "prefill overlap: off (%s)",
+                     ov_off        ? "RADIANCE_GEMMA4_OVERLAP=0"
+                     : !g.wire_exact ? "the lossy all-reduce wire"
+                     : !m.fuse     ? "the residual junctions are not fused"
+                                   : "a step holds fewer than two slices");
+    }
+    if (m.fuse && (g.world == 2 || g.world == 4)) {
+        if (!m.fuse_ar)
+            rad_note(b, "residual junctions: the all-reduce in front of each issued apart");
+        else if (g.world == 4 && m.layers[0].j_am.op_sp)
+            rad_note(b, "residual junctions: the all-reduce in front of each folded in at steps of "
+                        "%lld rows or fewer (libr4d's four-rank row: the fold to %lld rows, the "
+                        "all-reduce split around the junction from %lld), issued apart above",
+                     (long long)m.ar_rows, (long long)kArSpMinRows - 1, (long long)kArSpMinRows);
+        else if (g.world == 4)
+            rad_note(b, "residual junctions: the all-reduce in front of each folded in at steps of "
+                        "%lld rows or fewer (the four-rank one-shot), issued apart above",
+                     (long long)m.ar_rows);
+        else
+            rad_note(b, "residual junctions: the all-reduce in front of each folded in");
+    }
     return RAD_OK;
+}
+
+/* ==================================================================== the prefill overlap
+ *
+ * A prefill step in two slices, each slice's all-reduces on the runtime's second lane (rad_lane)
+ * beside the other slice's compute: arch/gemma4's trunk_overlap, on this trunk. A layer reduces
+ * T x n_embd twice, after o_proj and after down_proj, both column-sharded; run whole, the
+ * reductions and the compute take turns. Cut in two, a slice's reduction runs while the other
+ * slice computes:
+ *
+ *   lane 0  o(A) o(B) . jam(A) arm(A) . jam(B) arm(B) . jma(A) qkv(A) . jma(B) qkv(B) attn o(A) ..
+ *   lane 1       ar(A)       ar(B)              ar(A)              ar(B)
+ *
+ * Attention runs whole (the prologue, the cache write and attn_paged): it reads every row's keys,
+ * and its batch bounds describe the whole step. The rest is a row at a time: the projections, the
+ * junctions, the feed-forward arm and the reductions.
+ *
+ * The same kernels give the same bits (core/runtime/ctx.h, the second lane's rule four). Both slices
+ * are at least kOverlapRows rows: above the int8 GEMMs' skinny band, whose prefill and tiled
+ * kernels take each row's K in order whatever M is; above r4d_act_threads' last width change, so
+ * every junction, quantiser and norm folds a row's sum of squares as the whole step's does; and the
+ * exact all-reduce folds a word in fp32 in ascending rank order whatever message carries it. On
+ * the exact wire only.
+ *
+ * One buffer carries both reductions: o_proj and down_proj both write `h`, and the junctions read
+ * it. So the order below never lets lane 0 write rows of `h` lane 1 is reducing: slice A's arm
+ * writes h[A] only after A's attention reduction was waited for, while lane 1 reduces h[B]. Every
+ * reduction rides lane 1 behind a join from lane 0, which holds its producer; lane 0 waits for lane
+ * 1 before the reduction's consumer; each wait goes in after the lane-0 work that does not need it.
+ * The embedding's reduction stays on lane 0, ahead of everything lane 1 is first joined behind, so
+ * the collectives keep one order on every rank. At two ranks the junctions here carry no
+ * all-reduce (the reduction rode lane 1); a step that runs whole keeps the fused one. */
+static int64_t split_at(const Model& m, int64_t T) {
+    if (!m.overlap || T < 2 * kOverlapRows) return 0;
+    return (T / 2) / 128 * 128;   /* slice A whole 128-row tiles; both slices >= kOverlapRows */
+}
+
+static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int64_t cut) {
+    const int64_t T = batch->n_tok, E = m.g.n_embd;
+    const int64_t a0 = 0, an = cut, b0 = cut, bn = T - cut;
+    bool lanes_ok = true;
+    /* An all-reduce in place over rows [r0, r0 + n) of `h`, on lane 1 behind everything lane 0
+     * has issued -- its producer among it. */
+    auto reduce = [&](rad_op op, int64_t r0, int64_t n) {
+        lanes_ok = lanes_ok && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK;
+        RAD_ISSUE_N(c, op, n * E, brow_slice(m.b_h, r0, n, E), RAD_NONE);
+        lanes_ok = rad_lane(c, 0) == RAD_OK && lanes_ok;
+    };
+    /* Lane 0 behind every reduction issued so far. */
+    auto join_back = [&] { lanes_ok = rad_lane_join(c, 1, 0) == RAD_OK && lanes_ok; };
+    /* Rows [r0, r0 + n) of layer li's end, once their feed-forward reduction is in: the junction
+     * into the next layer -- or the last layer's post-norm, add and scalar -- and the drafter's
+     * taps of those rows. */
+    auto join_ff = [&](size_t li, int64_t r0, int64_t n) {
+        const Layer& y = m.layers[li];
+        if (li + 1 < m.layers.size()) {
+            y.j_ma.step_rows(c, E, r0, n);
+        } else {
+            y.mlp.tail(c, r0, n);
+            RAD_ISSUE_N(c, y.op_scale, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_scalar),
+                        brow_slice(m.b_x, r0, n, E));
+        }
+        for (int t = 0; t < m.n_taps && y.op_tap; ++t)
+            if (m.tap_layer[t] == (int)li)
+                RAD_ISSUE_N(c, y.op_tap, n, brow_slice(m.b_x, r0, n, E),
+                            bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * E, (int64_t)t * E, E, n));
+    };
+
+    m.j0.step(c, T);
+    const size_t L = m.layers.size();
+    if (m.slice_attn && batch->n_seq == 1) {
+        /* Attention per slice (see Model::slice_attn): slice A's context end first, then each
+         * layer as A's attention block, B's beside A's attention-side reduction, A's feed-forward
+         * beside B's, B's feed-forward beside A's, and the next layer's A block beside B's. Each
+         * join is issued before the reduction it must not wait for, so it orders lane 0 behind
+         * exactly the ones issued so far; lane 1 always reduces rows of `h` lane 0 is not
+         * touching. */
+        auto used_of = [&](rad_kvgroup kv, bool slice_a) -> RadOperand {
+            if (slice_a)
+                for (int i = 0; i < m.n_trim; ++i)
+                    if (m.trim[i].kv == kv) return brows(m.trim[i].used, 1);
+            const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+            return praw(kvb ? kvb->seqused : nullptr, RAD_I32, 1);
+        };
+        for (int i = 0; i < m.n_trim; ++i) {
+            const RadKVGroupBatch* kvb = kv_batch(batch, m.trim[i].kv);
+            /* the trim is `tail`'s extent, slice B's rows: a launch reads its ranged parameter
+             * as the band's upper bound, not as bn */
+            RAD_ISSUE_N(c, m.trim[i].op, bn, praw(kvb ? kvb->seqused : nullptr, RAD_I32, 1),
+                        praw(batch->positions + b0, RAD_I32, bn), brows(m.trim[i].used, 1));
+        }
+        for (size_t li = 0; li < L; ++li) {
+            const Layer& y = m.layers[li];
+            const rad_op ar_att = y.op_ar_att_ov ? y.op_ar_att_ov : y.attn.op_ar;
+            const rad_op ar_ff  = y.op_ar_ff_ov ? y.op_ar_ff_ov : y.mlp.op_ar;
+            if (li > 0) join_ff(li - 1, a0, an);     /* its reduction was waited for below */
+            y.attn.project(c, a0, an);
+            y.attn.attend_rows(c, batch, a0, an, used_of(y.attn.kv, true));
+            y.attn.out_proj(c, a0, an);
+            if (li > 0) join_back();                 /* the last layer's feed-forward, slice B */
+            reduce(ar_att, a0, an);
+            if (li > 0) join_ff(li - 1, b0, bn);
+            y.attn.project(c, b0, bn);
+            y.attn.attend_rows(c, batch, b0, bn, used_of(y.attn.kv, false));
+            y.attn.out_proj(c, b0, bn);
+            join_back();                             /* attention, slice A */
+            reduce(ar_att, b0, bn);
+            y.j_am.step_rows(c, E, a0, an);
+            y.mlp.arm(c, a0, an);
+            join_back();                             /* attention, slice B */
+            reduce(ar_ff, a0, an);
+            y.j_am.step_rows(c, E, b0, bn);
+            y.mlp.arm(c, b0, bn);
+            join_back();                             /* the feed-forward, slice A */
+            reduce(ar_ff, b0, bn);
+        }
+        join_ff(L - 1, a0, an);
+        join_back();                                 /* the last feed-forward, slice B */
+        join_ff(L - 1, b0, bn);
+        if (!lanes_ok)
+            rad_step_fail(c, "gemma4_bf16: the prefill overlap could not order its second lane "
+                             "against the first");
+        return;
+    }
+    for (size_t li = 0; li < L; ++li) {
+        const Layer& y = m.layers[li];
+        if (li == 0) {
+            y.attn.project(c, a0, an);
+            y.attn.project(c, b0, bn);
+        } else {
+            join_ff(li - 1, a0, an);         /* its reduction was waited for last layer */
+            y.attn.project(c, a0, an);
+            join_back();                     /* the last layer's feed-forward, slice B */
+            join_ff(li - 1, b0, bn);
+            y.attn.project(c, b0, bn);
+        }
+        y.attn.attend(c, batch);
+        const rad_op ar_att = y.op_ar_att_ov ? y.op_ar_att_ov : y.attn.op_ar;
+        const rad_op ar_ff  = y.op_ar_ff_ov ? y.op_ar_ff_ov : y.mlp.op_ar;
+        y.attn.out_proj(c, a0, an);
+        reduce(ar_att, a0, an);
+        y.attn.out_proj(c, b0, bn);
+        join_back();                         /* attention, slice A */
+        reduce(ar_att, b0, bn);
+        y.j_am.step_rows(c, E, a0, an);
+        y.mlp.arm(c, a0, an);
+        join_back();                         /* attention, slice B */
+        reduce(ar_ff, a0, an);
+        y.j_am.step_rows(c, E, b0, bn);
+        y.mlp.arm(c, b0, bn);
+        join_back();                         /* the feed-forward, slice A */
+        reduce(ar_ff, b0, bn);
+    }
+    join_ff(L - 1, a0, an);
+    join_back();                             /* the last feed-forward, slice B */
+    join_ff(L - 1, b0, bn);
+    if (!lanes_ok)
+        rad_step_fail(c, "gemma4_bf16: the prefill overlap could not order its second lane against "
+                         "the first");
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
@@ -1396,12 +2410,24 @@ static void step(RadCtx* c, const RadBatch* batch) {
         m.vis.step(c, batch);
         return;
     }
-    /* A draft pass runs only the head. The trunk already left its final-normed hidden state in
-     * `h`, which the head's history pass gathers from. */
+    /* A draft pass runs only the draft model. The trunk already left its final-normed hidden state
+     * in `h`, which the assistant's history pass gathers from, and its taps in `dflash_src`, which
+     * the DFlash drafter's context pass reads. */
     if (batch->draft_pass != 0) {
+        if (m.have_df) {
+            if (batch->draft_pass > 0) m.df.step(c, batch);
+            else                       m.df.context(c, batch);
+            return;
+        }
+        if (m.have_df2) {
+            if (batch->draft_pass > 0) m.df2.step(c, batch);
+            else                       m.df2.context(c, batch);
+            return;
+        }
         if (!m.have_head) {
             rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
-                             "container carries no `draft.` assistant, or declare ran at max_spec 0");
+                             "container carries no `draft.` assistant or DFlash drafter, or declare "
+                             "ran at max_spec 0");
             return;
         }
         m.head.step(c, batch);
@@ -1419,23 +2445,34 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
 
     const int64_t T = batch->n_tok;
-    if (m.fuse) m.j0.step(c, T);
-    for (size_t li = 0; li < m.layers.size(); ++li) {
+    const int64_t cut = split_at(m, T);
+    if (cut > 0) trunk_overlap(c, m, batch, cut);
+    else if (m.fuse) m.j0.step(c, T);
+    /* the junctions carry the reductions in front of them in a step their fold serves */
+    const bool far = m.fuse_ar && T <= m.ar_rows;
+    for (size_t li = 0; cut == 0 && li < m.layers.size(); ++li) {
         const Layer& l = m.layers[li];
         const bool last = li + 1 == m.layers.size();
-        l.attn.step(c, batch, m.fuse, m.fuse, m.fuse_ar);
-        if (m.fuse) l.j_am.step(c, T, m.fuse_ar);
-        l.mlp.step(c, batch, m.fuse, m.fuse && !last, m.fuse_ar);
+        l.attn.step(c, batch, m.fuse, m.fuse, far);
+        if (m.fuse) l.j_am.step(c, T, far);
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last, far);
         if (m.fuse && !last) {
             /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
-            l.j_ma.step(c, T, m.fuse_ar);
-            continue;
+            l.j_ma.step(c, T, far);
+        } else {
+            /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after
+             * the mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The
+             * checkpoint's values (0.03-0.99) are trained weights that rescale the residual toward
+             * O(1). */
+            RAD_ISSUE(c, l.op_scale, brows(m.b_x, batch->n_tok), RAD_W(l.w_scalar),
+                      brows(m.b_x, batch->n_tok));
         }
-        /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after the
-         * mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The checkpoint's
-         * values (0.03-0.99) are trained weights that rescale the residual toward O(1). */
-        RAD_ISSUE(c, l.op_scale, brows(m.b_x, batch->n_tok), RAD_W(l.w_scalar),
-                  brows(m.b_x, batch->n_tok));
+        /* The drafter's taps, once the layer's output is whole. Either way that is after the
+         * scalar, since the junction applies it to the stream it writes. */
+        for (int t = 0; t < m.n_taps && l.op_tap; ++t)
+            if (m.tap_layer[t] == (int)li)
+                RAD_ISSUE(c, l.op_tap, brows(m.b_x, T),
+                          bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, T));
     }
 
     RAD_ISSUE(c, m.op_final,
@@ -1459,13 +2496,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
 const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_chat_format(); }
 
 /* The default draft depth for `--num-speculative-tokens auto`. A serial head's depth is an
- * operating point, not a trained depth: every depth runs. */
+ * operating point, not a trained depth: every depth runs. A DFlash drafter's is the block it was
+ * trained at, fixed. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     if (has_assistant(meta)) {
         out->draft_depth = kHeadDepth;
         out->draft_depth_fixed = 0;
     }
+    /* A DFlash drafter names the block it was trained at, and only that (rad_gemma4_dflash.h); a
+     * DFlash2 one too (rad_block_dflash2.h). */
+    (void)gemma4::dflash_probe(meta, out);
+    (void)gemma4::dflash2_probe(meta, out);
     /* The tower's pooling window, so a pass size the core picks itself is whole windows. */
     if (Gemma4Vision::present(meta)) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
@@ -1476,9 +2518,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text and images), w4a8 from its bf16 or its CT-INT4 (QAT) release: "
-                "sliding-window and proportional-RoPE global attention over a plain RMSNorm stream "
-                "with GELU feed-forward, per-layer scalar scaling and soft-capped logits")
+                "Gemma 4 dense (text and images), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
+                "release: sliding-window and proportional-RoPE global attention over a plain "
+                "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
+                "logits; Google's assistant head or z-lab's DFlash drafter")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
 RAD_ARCH_PROBE(gemma4_bf16)
 #endif

@@ -61,6 +61,10 @@ public:
      * RAD_E_NOTFOUND: nothing of that name is loaded. */
     int  unload(const std::string& name, int* in_flight, std::string* err);
 
+    /* Free the least recently acquired loaded slot that no request holds, for a load that found
+     * none free; its name in *evicted. RAD_E_FULL when every loaded slot is held. */
+    int  evict_idle(std::string* evicted);
+
     /* The loaded adapters a request may name, in slot order: not the draining ones. */
     std::vector<std::string> names() const;
     /* Requests holding the adapter `name` (draining or not), 0 for none or no such adapter. */
@@ -73,6 +77,7 @@ private:
         bool        used = false;       /* ever held an adapter, so `freed_at` means something */
         bool        draining = false;
         uint64_t    freed_at = 0;       /* `epoch` when it was last freed */
+        uint64_t    last_use = 0;       /* acquire counter at its last acquire or publish */
     };
     void free_slot(Slot& s, const char* how);   /* under mu_ */
     void release(uint64_t uid);                 /* a hold's deleter */
@@ -82,6 +87,7 @@ private:
     std::vector<Slot>             slots_;
     std::map<uint64_t, int>       refs_;        /* uid -> holds */
     uint64_t                      next_uid_ = 1;
+    uint64_t                      uses_ = 0;
     const std::atomic<uint64_t>*  epoch_ = nullptr;
 };
 

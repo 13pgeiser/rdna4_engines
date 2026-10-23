@@ -95,6 +95,11 @@ struct VideoRequest {
     std::vector<uint8_t> image;
     /* The decoder (RadVideoGenDecl::decoders) by its index; 0 the model's default. */
     int32_t  decoder = 0;
+    /* The runtime LoRA slot the request's conditioning and denoising passes run with
+     * (Engine::gen_lora_acquire), -1 for none, and the hold that keeps it until the request is
+     * done. */
+    int32_t  lora_slot = -1;
+    std::shared_ptr<void> lora_hold;
     std::shared_ptr<VideoTicket> ticket;
 };
 

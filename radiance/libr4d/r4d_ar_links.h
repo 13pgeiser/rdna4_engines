@@ -83,3 +83,44 @@ inline bool r4d_ar_weights_from_rates(const double* gbs, int ws, int* w) {
   }
   return true;
 }
+
+// RADIANCE_AR8_SHARD_WEIGHTS=duplex: the weights that minimise the two-shot's link time when both
+// directions of a link run at once (the pieced kernel's aim). Rank r with shard fraction x_r sends
+// (1 - x_r) of the message in the first hop and (ws - 1) x_r in the second, and receives the same,
+// so each direction carries (1 + (ws - 2) x_r) N at rate B_r. The slowest rank sets the time T, so
+// the best table makes every rank with a shard finish together: x_r = (T B_r - 1) / (ws - 2) where
+// that is positive, 0 elsewhere, with the x summing to 1 (water filling from the fastest rank
+// down). Four ranks at B and four at B / 2 give x of 2/9 and 1/36, 8 to 1 where the quadratic rule
+// above gives 4 to 1, and a time 10% lower (7/6 N / B / 2 against 1.3 N / B / 2). Scaled so the
+// largest weight is 64. False when a rank's rate is unknown.
+inline bool r4d_ar_weights_duplex(const double* gbs, int ws, int* w) {
+  if (ws < 3 || ws > 16) return false;
+  int order[16];
+  for (int r = 0; r < ws; ++r) {
+    if (!(gbs[r] > 0.0)) return false;
+    order[r] = r;
+  }
+  for (int i = 1; i < ws; ++i)
+    for (int j = i; j > 0 && gbs[order[j]] > gbs[order[j - 1]]; --j) {
+      const int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+    }
+  // With the k fastest ranks holding shards, sum (T B_r - 1) = ws - 2 gives T; the set is right
+  // when the slowest of them still gets a positive share and the next one would not.
+  double sum = 0.0, t = 0.0;
+  int k = 0;
+  for (int n = 1; n <= ws; ++n) {
+    sum += gbs[order[n - 1]];
+    const double tn = (double)(ws - 2 + n) / sum;
+    if (tn * gbs[order[n - 1]] <= 1.0) break;
+    k = n;
+    t = tn;
+  }
+  double x[16] = { 0 }, top = 0.0;
+  for (int i = 0; i < k; ++i) {
+    const int r = order[i];
+    x[r] = (t * gbs[r] - 1.0) / (double)(ws - 2);
+    if (x[r] > top) top = x[r];
+  }
+  for (int r = 0; r < ws; ++r) w[r] = (int)std::lround(64.0 * x[r] / top);
+  return true;
+}

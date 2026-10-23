@@ -352,7 +352,41 @@ typedef struct RadGenBatch {
     const int32_t* mode_ccu;
     const int64_t* n_mode_h;
     const float*   mode_rope_f;
+
+    /* ---- appended in ABI 25 (Anima, SDXL) */
+    /* COND, for a generator that reads its prompt through a second tokenizer
+     * (RadGeneratorDecl::aux_tokens): the user's prompt as that tokenizer encodes it, `n_aux` ids
+     * on the device, and `aux_cu` {0, n_aux} on the device. 0 and null otherwise. */
+    int64_t        n_aux;
+    const int32_t* aux_ids;
+    const int32_t* aux_cu;
+    /* ---- a discrete-time denoiser (RadGeneratorDecl::train_steps), DENOISE, one value per
+     * entry: the schedule's sigma before `sigma` (0 on an image's first step), `sigma` on the
+     * model's trained clock (the nearest of its timesteps, as ComfyUI conditions it), the
+     * request's sampler (RAD_GEN_SAMPLER_*) and the image's step, from 0. */
+    const float*   sigma_prev;
+    const float*   timestep;
+    const int32_t* sampler;
+    const int32_t* step;
+    /* DENOISE: [n_seq, 2] each entry's image height and width in pixels, f32 (a model
+     * conditioned on its size); `entry_h` [n_seq, 4] the same entries on the host: the
+     * conditioning's rows (JOINT_STEP), the height and width in pixels, and the branch (0 the
+     * prompt, 1 the negative prompt), for a plugin whose ops take an image's geometry from their
+     * operands and so issue each entry on its own. */
+    const float*   size_px;
+    const int32_t* entry_h;
+    /* COND: the pass's token ids on the host ([n_tok]), for a plugin whose issue depends on
+     * where a window's end-of-text marker sits. */
+    const int32_t* tokens_h;
+    /* ---- appended in ABI 26 (Krea 2's rebalance) */
+    /* COND: the request's RAD_GEN_COND_* options, 0 for none. */
+    int32_t        cond_opts;
 } RadGenBatch;
+
+/* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
+enum {
+    RAD_GEN_COND_REBALANCE = 1   /* Krea 2: the text taps at the plugin's fixed rebalance gains */
+};
 
 /* An entry's flags on a DENOISE pass. */
 enum {

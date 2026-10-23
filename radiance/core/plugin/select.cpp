@@ -5,6 +5,7 @@
  * one. A match is necessary, not sufficient: strides, contiguity, alignment and buffer sizes are
  * properties of a call, and the entry point still rejects what it cannot run.
  */
+#include "../device/device.h"
 #include "registry.h"
 
 #include <algorithm>
@@ -384,6 +385,10 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
         for (const auto& kv : chosen) r.geom.set_i(kv.first, kv.second);
         r.choice = TuneCache::canon_choice(chosen);
     }
+    /* A chainable row runs its chained form wherever chaining is on (RadKernelChainFn); the
+     * parameter is outside the tune cache's key, which was taken above. */
+    if (r.row->chain && rad_dev_chain_enabled())
+        r.geom.set_i("chain", 1);
 
     /* scratch_bytes stays 0: the scratch hook needs a RadArgs with the operand tensors, which the
      * builder owns and sizes the arena with. */

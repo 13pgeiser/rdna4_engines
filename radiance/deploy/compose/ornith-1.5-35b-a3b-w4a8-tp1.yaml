@@ -1,0 +1,13 @@
+# Ornith-1.5-35B-A3B w4a8 on one card: every weight stays in VRAM, no host pool. At 8 sequences the
+# cache holds 1,057,824 tokens, four full 262,144-token sessions.
+name: radiance-ornith-1.5-35b-a3b-w4a8-tp1
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-ornith-1.5-35b-a3b-w4a8-tp1
+    command: >
+      --model /models/ornith-1.5-35b-a3b-w4a8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 8 --max-model-len 262144 --kv-cache-dtype fp8
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048
+      --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5

@@ -895,6 +895,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
+     * declare only (the direction table never changes); the per-request switch rides the derived
+     * mask, not this struct. */
+    if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
+        cvec_views_[(size_t) rank].dir)
+        bc.cvec = &cvec_views_[(size_t) rank];
     return bc;
 }
 
@@ -1020,6 +1026,25 @@ int Engine::declare() {
                cfg_.n_spec > 0 ? "the depth the drafter in this container states as its operating point"
                                : "this container carries no draft head");
     }
+    /* Chained launches pay on some speculative steps and cost plain decode (4x R9700: the 31B
+     * with DFlash2 +13%, the 26B-A4B with DFlash +1%, Qwen3.8-27B with DFlash2 even; the 31B with
+     * no drafter -6.5%), so they are on by default only where the model's plugin measured a gain
+     * with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
+     * speculatively. */
+    {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        rad_dev_chain_infer(cfg_.n_spec > 0 && pb.chain_pays);
+        const char* e = std::getenv("RADIANCE_CHAIN");
+        const bool on = rad_dev_chain_enabled() != 0;
+        const char* why = e && *e && std::strcmp(e, "auto") != 0
+                              ? (on || *e == '0' ? "RADIANCE_CHAIN says so" : "the backend does not chain")
+                          : on ? "the model's plugin measured a gain with its speculative drafter"
+                               : "no drafter whose plugin measured a gain with them decodes "
+                                 "speculatively, or the backend does not chain";
+        RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);
+        decide("RADIANCE_CHAIN", on ? "1" : "0", why);
+    }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
      * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
     if (cfg_.mm_audio_frames < 0) {
@@ -1063,6 +1088,64 @@ int Engine::declare() {
      * a serial loop times out. Registry::select() and init_instance() share a mutex for this. Each
      * thread binds its device first, because the current device is thread-local and the init
      * allocates on it. */
+    /* Control vectors are resolved here, before any rank declares: the plugin reads the direction
+     * table from RadBuildCtx, so a table that failed validation must stop the server before a graph
+     * is built around it.
+     *
+     * The feature is loaded only when the deployment asks: `--control-vector off|on`. Without it
+     * nothing is looked for, the graph declares no projection op, and a request that asks for one
+     * is refused by name -- so a deployment that does not use the feature pays nothing. With the
+     * flag, the engine looks beside the container (or in the directory, or in
+     * $RADIANCE_HOME/vectors) and uses the file if it is compatible; its operation parameters come
+     * from the package's own JSON. A file that does not fit is reported and skipped -- a sidecar
+     * must never stop a server nobody pointed at it. The flag's value is the startup switch: `off`
+     * leaves requests off until one asks (or the dashboard flips the default), `on` starts them on. */
+    const std::string arch = meta_.arch_id ? meta_.arch_id : "";
+    if (cfg_.control_vector == "disabled") {
+        RAD_INFO("control vectors: not loaded (no --control-vector); a request that asks for one is "
+                 "refused");
+    } else if (!arch.empty()) {
+        std::string proj_path, tried;
+        (void) control_vector_discover(cfg_.model, arch, cfg_.radiance_home, &proj_path, &tried);
+        if (proj_path.empty()) {
+            RAD_INFO("control vectors: none found (%s)", tried.c_str());
+        } else if (arch != "qwen4exp") {
+            RAD_WARN("control vectors: %s is for this family only (qwen4exp, whose gated residual "
+                     "carries the projection op); this container is '%s' -- ignoring it",
+                     proj_path.c_str(), arch.c_str());
+        } else {
+            std::string why;
+            const int rc = control_vector_load(proj_path, arch, meta_.n_embd, meta_.n_layers,
+                                               &cvec_, &why);
+            if (rc != RAD_OK) {
+                RAD_WARN("%s -- serving without it", why.c_str());
+                cvec_ = ControlVector{};
+            }
+        }
+    }
+    if (cvec_.loaded()) {
+        cvec_views_.assign(ranks_.size(), RadControlVector{});
+        cvec_salt_ = control_vector_salt(cvec_);
+        /* `--control-vector on` starts the request default on, which is also how `--kld-record`/
+         * `--kld-ref` score the projection itself: those modes serve no request to carry the
+         * switch. The switch still decides per request. */
+        const bool default_on = cfg_.control_vector == "on";
+        cvec_default_.store(default_on);
+        RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
+                 "default %s%s",
+                 cvec_.path.c_str(), (long long) cvec_.n_dirs,
+                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale,
+                 default_on ? "ON" : "off",
+                 default_on ? " (--control-vector on; a request can still say false)"
+                            : " until a request asks for it (the dashboard's switch, or a request's "
+                              "`control_vector` field)");
+        decide("control vectors", cvec_.path,
+               "found beside the container, in its directory, or in $RADIANCE_HOME/vectors; "
+               "requests opt in");
+    } else {
+        cvec_default_.store(false);
+    }
+
     std::vector<int>         st(ranks_.size(), RAD_OK);
     std::vector<std::thread> th;
     th.reserve(ranks_.size());
@@ -1075,6 +1158,17 @@ int Engine::declare() {
                 RAD_ERR("rank %d: could not bind device %d to declare on", ri, r->device);
                 st[(size_t)ri] = RAD_E_DEVICE;
                 return;
+            }
+            /* This rank's copy of the control vector's directions, on the device the thread has
+             * just bound. Uploaded outside the program's arena: it is not a weight (it is not in
+             * the container) and not an activation (it lives for the deployment). */
+            if (cvec_.loaded()) {
+                const float* d = control_vector_upload(cvec_, ri);
+                if (!d) {
+                    st[(size_t)ri] = RAD_E_DEVICE;
+                    return;
+                }
+                cvec_views_[(size_t)ri] = control_vector_view(cvec_, d);
             }
             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
             LoraDeclare ld;
@@ -1447,6 +1541,11 @@ int Engine::plan() {
         const int64_t ck_cap = INT64_MAX / 8;
         const int64_t ck_store = !cfg_.prefix_cache || ck_slot <= 0 ? 0
                                  : ck_n > ck_cap / ck_slot ? ck_cap : ck_slot * ck_n;
+        /* The direction table was allocated in declare(); it is not part of the program, and
+         * claiming its bytes back keeps a deployment that offers a vector planning against the
+         * same card as one that does not (VramFacts::held_out). */
+        const int64_t cvec_bytes = cvec_.loaded() ? (int64_t) cvec_.dir.size() * 4 : 0;
+        for (VramFacts& f : facts) f.held_out = cvec_bytes;
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
         /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
@@ -2951,21 +3050,17 @@ int Engine::configure_kv() {
     {
         const bool tier_asked = cfg_.prefix_cache_mib > 0;
         const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
-        /* One slot holds every rank's shard of an entry; each rank writes only its window. Shards
-         * can differ or be empty (uneven heads, rad_kv_group_zero), so a slot is the sum and each
-         * window starts where the previous ends. TierExec::sizes uses the largest rank's entry,
-         * since the staging ring is per rank. */
-        std::vector<int64_t> rank_entry(ranks_.size(), 0), entry_off(ranks_.size(), 0);
-        int64_t entry_bytes = 0, slot_bytes = 0;
-        for (size_t i = 0; i < ranks_.size(); ++i) {
-            for (int32_t g : cg) {
-                const KVGroupPlan* p = ranks_[i]->kv.plan(g);
-                if (p && p->paged()) rank_entry[i] += p->bytes_per_block;
-            }
-            entry_off[i] = slot_bytes;
-            slot_bytes += rank_entry[i];
-            entry_bytes = std::max(entry_bytes, rank_entry[i]);
-        }
+        /* One slot holds the whole engine's entry: the groups every rank holds alike
+         * (rad_kv_group_replicated) once, at the front, then every rank's own shard in its own
+         * window. Shards can differ or be empty (uneven heads, rad_kv_group_zero). The layout is
+         * TierExec's, so the arithmetic here and the copies agree; TierExec::sizes takes the
+         * largest rank's entry, since the staging ring is per rank. */
+        std::vector<const KVManager*> rank_kv;
+        for (auto& r : ranks_) rank_kv.push_back(&r->kv);
+        TierExec::SlotLayout layout;
+        RAD_TRY(TierExec::slot_layout(rank_kv, cg, &layout));
+        const std::vector<int64_t>& entry_off = layout.own_off;
+        const int64_t entry_bytes = layout.entry_bytes, slot_bytes = layout.slot_bytes;
 
         /* Snapshots live in the checkpoint store (--checkpoint-slots); --prefix-cache-mib is for
          * blocks only. */
@@ -2993,6 +3088,20 @@ int Engine::configure_kv() {
                  * fit is right after the turn. */
                 const int64_t held = T.arena().capacity() * tc.block_tokens;
                 const int64_t ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
+                if (layout.rep_bytes > 0 && ranks_.size() > 1) {
+                    /* What the slot would be with every rank's copy of the replicated groups. */
+                    const int64_t each = slot_bytes + layout.rep_bytes * (int64_t)(ranks_.size() - 1);
+                    std::string names;
+                    for (const std::string& n : layout.replicated)
+                        names += (names.empty() ? "" : ", ") + n;
+                    RAD_INFO("kv tiers: %s (%s of each entry) is the same on every rank and held "
+                             "once a slot: %s a slot rather than %s, so --prefix-cache-mib %lld "
+                             "holds %lld tokens rather than %lld",
+                             names.c_str(), humanb(layout.rep_bytes).c_str(),
+                             humanb(slot_bytes).c_str(), humanb(each).c_str(),
+                             (long long)cfg_.prefix_cache_mib, (long long)held,
+                             (long long)(tc.host_cap_bytes / each * tc.block_tokens));
+                }
                 if (held < ctx)
                     RAD_WARN("kv tiers: --prefix-cache-mib %lld holds %lld tokens of context (%s "
                              "per %lld-token block), less than one --max-model-len %lld "
@@ -3663,6 +3772,14 @@ int Engine::load_vocab() {
     auto v = std::make_shared<Vocab>();
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
+    if (file_ && file_->aux_vocab()) {
+        VocabBuild ab;
+        RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), file_->aux_vocab().h, ab));
+        auto av = std::make_shared<Vocab>();
+        RAD_TRY(av->load(std::move(ab)));
+        aux_vocab_ = av;
+        RAD_INFO("vocab: a second vocabulary of %d tokens", aux_vocab_->n_tokens());
+    }
 
     auto view = std::make_unique<TokenView>();
     RAD_TRY(view->init(vocab_));

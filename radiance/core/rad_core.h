@@ -57,6 +57,8 @@ struct KernelRow {
     bool                 releases_link = false;
     /* The row's plugin declared itself a reference implementation (RadPluginReferenceFn). */
     bool                 reference = false;
+    /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
+    bool                 chain = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
@@ -285,6 +287,7 @@ struct KVGroupInfo {
     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
     std::vector<int> layers;
     bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
+    bool            replicated = false; /* rad_kv_group_replicated: the same bytes on every rank */
     /* Bound only at meta.n_layers and above: the drafter's own cache, which no trunk layer reads.
      * Set at declare (Builder::finish_kv_groups). */
     bool            drafter = false;
@@ -310,6 +313,11 @@ struct LoraIssueSite {
     int32_t  pool = -1;                            /* index into Program::lora_pools */
     int32_t  t = -1;                               /* index into Program::lora_t */
     int64_t  R = 0, K = 0, N = 0;
+    /* A generator's narrower pairs: the same pools read to rank R_v[i] < R, the pass taking the
+     * narrowest that holds its slot's ranks (Program::lora_rused). */
+    uint32_t shrink_v[2] = { 0, 0 }, expand_v[2] = { 0, 0 };
+    int64_t  R_v[2] = { 0, 0 };
+    int8_t   n_v = 0;
 };
 /* One targeted weight's adapter slots: A [S, R, K], B [S, N, R] bf16 and the per-column scale
  * [S, N] f32, persistent buffers, so the arena plan (and with it the KV budget) holds them. */
@@ -322,6 +330,16 @@ struct LoraPool {
 struct LoraScratch {
     int64_t R = 0;
     rad_buf lane[2] = { 0, 0 };
+};
+/* A generator's adapter key names (rad_lora_root, rad_lora_alias in rad_builder.h). */
+struct LoraRoot {
+    std::string              native;      /* checkpoint prefix of the network's tensors */
+    std::vector<std::string> spellings;   /* adapter-side prefixes; "" is a bare key */
+};
+struct LoraAlias {
+    std::string root;                     /* LoraRoot::native it is relative to */
+    std::string from, to;                 /* module paths, '#' a decimal index */
+    int64_t     from_lo = 0, from_hi = 0, to_lo = 0;
 };
 
 /* Everything declare produced. The core owns it; the plugin only ever sees handles into it. */
@@ -349,6 +367,17 @@ public:
     std::vector<LoraIssueSite> lora_sites;
     std::vector<LoraPool>      lora_pools;
     std::vector<LoraScratch>   lora_t;
+    /* A generator's adapter key names: declared by the plugin whether or not adapters are on. A
+     * generator that declares no root carries no adapters. */
+    std::vector<LoraRoot>      lora_roots;
+    std::vector<LoraAlias>     lora_aliases;
+    /* A generator's pass runs with one adapter in every row: `lora_rows` is [S * lora_rows_n]
+     * i32, run s all s, so a pass's slot operand is run s of it. 0 on a token-step program. */
+    rad_buf                    lora_rows = 0;
+    int64_t                    lora_rows_n = 0;
+    /* A generator's slots pack each combination's ranks from j = 0: the ranks pool p takes in
+     * slot s at [p * S + s], 0 for a pool the combination does not reach (no adapter op runs). */
+    std::vector<int32_t>       lora_rused;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -588,6 +617,14 @@ struct SamplingParams {
      * scheduler thread where every other request's step waits; held here, starting is a lookup.
      * Null for a request not admitted through the server; the sampler then compiles. */
     std::shared_ptr<const GbnfProgram> grammar_program;
+
+    /* The control vector (core/cvec.h): whether this request's steps project the vector found for
+     * this deployment out of the residual stream. The server sets it from the request's
+     * `control_vector` field (`experimental_speed_projection` is Strata's spelling of the same
+     * switch), or from the deployment's runtime default when the request names none; it needs no
+     * reload and leaves the graph untouched. A deployment with no vector refuses `true` at
+     * admission rather than serving the stock model. */
+    bool   use_control_vector = false;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
@@ -716,7 +753,7 @@ struct Config {
      * slower. `on` forces P2P and stops startup naming the refused pairs instead of falling
      * back. */
     int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
-    int64_t max_tok = 8192;            /* --max-num-batched-tokens */
+    int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:
      * leave those their rows plus a share for admission, but keep at least the smallest pass the
@@ -784,6 +821,13 @@ struct Config {
     /* The pinned host pool one rank allocates: --host-pool-mib and the tables placed beside it. */
     int64_t host_pool_total_mib() const { return host_pool_mib + embedding_host_mib + tower_host_mib; }
     bool    deterministic = false;
+    /* --control-vector off|on. Without the flag (`disabled`) no vector is loaded: the program
+     * declares no projection op, an off request costs the stock model's launches, and a request
+     * that asks for one is refused by name. `off` loads the vector found for this container -- the
+     * op is declared for its layers -- and starts requests off; `on` does the same with the request
+     * default on. The graph is declared once, so this flag is the deployment's only decision about
+     * whether the op exists at all; the value names the startup switch. */
+    std::string control_vector = "disabled";
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* Checkpoint intervals one step may carry of a prefill alone in its step, from an interval
      * boundary past the first (--prefill-span; 1 splits at every interval). The step's rows stay

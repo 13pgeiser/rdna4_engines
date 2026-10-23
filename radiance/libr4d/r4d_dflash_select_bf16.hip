@@ -29,6 +29,7 @@
 #include "r4d_gdn_args.h"
 #include "r4d_dflash_conv_body.h"   // r4d_bf2f, r4d_u16
 #include "r4d_common.h"   // r4d_wave_sum
+#include "r4d_chain.h"
 
 #define DSL_THREADS 256
 #define DSL_WAVE    32
@@ -47,7 +48,8 @@
 // Ids outside [0, V) do occur (row_topk_merge reports an unfilled slot as -1, and step 0's
 // predecessor is whatever the anchor plane holds). As in ref_dflash_select, an out-of-range
 // predecessor contributes nothing and an out-of-range candidate scores its unary term alone.
-__global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below.
+__device__ __forceinline__ void r4d_dflash_select_body(
     const int* __restrict__ cand, const float* __restrict__ unary,
     const r4d_u16* __restrict__ hp, const int* __restrict__ anchor,
     const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
@@ -134,12 +136,49 @@ __global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
     __syncthreads();
   }
 }
+__global__ __launch_bounds__(DSL_THREADS) void r4d_dflash_select_kernel(
+    const int* __restrict__ cand, const float* __restrict__ unary,
+    const r4d_u16* __restrict__ hp, const int* __restrict__ anchor,
+    const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
+    int* __restrict__ out, int steps, int K, int R, int V,
+    int cand_ld, int hp_ld, int out_ld, int anchor_stride) {
+    r4d_dflash_select_body(cand, unary, hp, anchor, pred, succ, out, steps, K, R, V, cand_ld, hp_ld,
+                           out_ld, anchor_stride);
+}
+__global__ __launch_bounds__(DSL_THREADS) void r4dchain_dflash_select(
+    const int* __restrict__ cand, const float* __restrict__ unary,
+    const r4d_u16* __restrict__ hp, const int* __restrict__ anchor,
+    const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
+    int* __restrict__ out, int steps, int K, int R, int V,
+    int cand_ld, int hp_ld, int out_ld, int anchor_stride) {
+    r4d_chain_wait();
+    r4d_dflash_select_body(cand, unary, hp, anchor, pred, succ, out, steps, K, R, V, cand_ld, hp_ld,
+                           out_ld, anchor_stride);
+    r4d_chain_done();
+}
+
+/* `chain`: the chained form (the plugin entry, where the row resolved with `chain`). */
+static int dflash_select_emit(
+    const void* cand, const void* unary, const void* hp, const void* anchor,
+    const void* pred, const void* succ, void* out,
+    int M, int steps, int K, int R, int V, int cand_ld, int hp_ld, int out_ld,
+    int anchor_stride, void* stream, bool chain);
 
 extern "C" int r4d_dflash_select_bf16(
     const void* cand, const void* unary, const void* hp, const void* anchor,
     const void* pred, const void* succ, void* out,
     int M, int steps, int K, int R, int V, int cand_ld, int hp_ld, int out_ld,
     int anchor_stride, void* stream)
+{
+  return dflash_select_emit(cand, unary, hp, anchor, pred, succ, out, M, steps, K, R, V, cand_ld,
+                            hp_ld, out_ld, anchor_stride, stream, false);
+}
+
+static int dflash_select_emit(
+    const void* cand, const void* unary, const void* hp, const void* anchor,
+    const void* pred, const void* succ, void* out,
+    int M, int steps, int K, int R, int V, int cand_ld, int hp_ld, int out_ld,
+    int anchor_stride, void* stream, bool chain)
 {
   if (M <= 0 || steps <= 0) return 0;
   if (K < 1 || K > DSL_MAX_K) return -1;
@@ -149,7 +188,8 @@ extern "C" int r4d_dflash_select_bf16(
   /* hp may be null (the bigram form); then hp_ld is unused. */
   if (hp && hp_ld < R) return -1;
 
-  hipLaunchKernelGGL(r4d_dflash_select_kernel, dim3(M), dim3(DSL_THREADS), 0, (hipStream_t)stream,
+  hipLaunchKernelGGL((chain ? r4dchain_dflash_select : r4d_dflash_select_kernel), dim3(M),
+                     dim3(DSL_THREADS), 0, (hipStream_t)stream,
                      (const int*)cand, (const float*)unary, (const r4d_u16*)hp,
                      (const int*)anchor, (const r4d_u16*)pred, (const r4d_u16*)succ,
                      (int*)out, steps, K, R, V, cand_ld, hp_ld, out_ld, anchor_stride);
@@ -222,8 +262,10 @@ extern "C" int r4d_rad_dflash_select(const RadArgs* a, RadStream s) {
     if (astr < 1 || !r4d_contig(anc)) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(anc) < (M - 1) * astr + 1) return R4D_NO(RAD_E_SHAPE);
 
-    return R4D_RAW(r4d_dflash_select_bf16(cand->data, un->data, has_hp ? hp->data : nullptr,
-                                          anc->data, pr->data, sc->data,
-                                          out->data, (int)M, (int)steps, (int)K, (int)R, (int)V,
-                                          (int)cand_ld, (int)hp_ld, (int)out_ld, (int)astr, s));
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    return R4D_RAW(dflash_select_emit(cand->data, un->data, has_hp ? hp->data : nullptr,
+                                      anc->data, pr->data, sc->data,
+                                      out->data, (int)M, (int)steps, (int)K, (int)R, (int)V,
+                                      (int)cand_ld, (int)hp_ld, (int)out_ld, (int)astr, s, ch));
 }

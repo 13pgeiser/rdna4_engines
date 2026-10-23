@@ -2,6 +2,9 @@
 # distilled to eight steps with video sparse attention, the same /v1/videos API and host memory
 # as minimax-h3.yaml, about 70 s a 1344x768 clip. It runs only its trained schedule, so a
 # request's num_inference_steps may only be 9 (grid points). MiniMax-H3's license applies to it.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/h3 and add `--lora-dir /models/loras/h3` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
 name: radiance-fasth3
 services:
   radiance:

@@ -169,6 +169,78 @@ TEST(usage_counts_each_pictures_tokens_in_every_branch) {
     CHECK(s.last().has_neg);
 }
 
+/* A model that reads its prompt through a second tokenizer gets the user's prompt as that tokenizer
+ * encodes it, in each branch, and a prompt longer than it reads is refused under `prompt`. A
+ * prompt shorter than the model's minimum after the fixed prefix is padded with its padding token
+ * (an empty prompt is one, and is not turned into " " first). */
+TEST(a_second_tokenizer_and_a_minimum_prompt_reach_the_generator) {
+    Images s;
+    s.img.inf.aux_tokens = true;
+    s.img.inf.aux_max_tokens = 4;
+    s.img.inf.min_tokens = 2;
+    s.img.inf.pad_token = 9;
+    s.gen({ { "prompt", "ab" }, { "negative_prompt", "c" }, { "true_cfg_scale", 4.0 } });
+    REQUIRE(!s.img.got.empty());
+    CHECK(s.last().pos.aux == std::vector<int32_t>({ 100 + 'a', 100 + 'b', 1 }));
+    CHECK(s.last().neg.aux == std::vector<int32_t>({ 100 + 'c', 1 }));
+    /* "c" is one token after the prefix, padded to two. */
+    const gen::Branch& n = s.last().neg;
+    REQUIRE((int64_t)n.tokens.size() - n.n_drop == 2);
+    CHECK_EQ(n.tokens[(size_t)n.n_drop], (int32_t)'c');
+    CHECK_EQ(n.tokens.back(), (int32_t)9);
+    s.gen({ { "prompt", "" } });
+    const gen::Branch& p = s.last().pos;
+    REQUIRE((int64_t)p.tokens.size() - p.n_drop == 2);
+    CHECK_EQ(p.tokens[(size_t)p.n_drop], (int32_t)9);
+    CHECK(p.aux == std::vector<int32_t>({ 1 }));
+    /* An empty negative prompt stays empty for such a model: all padding. */
+    s.gen({ { "prompt", "x" }, { "negative_prompt", "" }, { "true_cfg_scale", 4.0 } });
+    const gen::Branch& e = s.last().neg;
+    REQUIRE((int64_t)e.tokens.size() - e.n_drop == 2);
+    CHECK_EQ(e.tokens[(size_t)e.n_drop], (int32_t)9);
+    CHECK(e.aux == std::vector<int32_t>({ 1 }));
+    const json longp = s.gen({ { "prompt", "abcd" } }, 400);
+    CHECK_EQ(str_at(longp["error"], "param"), std::string("prompt"));
+}
+
+/* A discrete-time model takes `sampler` and `scheduler` by ComfyUI's names, defaulting to its
+ * own, and refuses one it does not serve; a flow-matching model refuses both. A prompt read in
+ * windows reaches the generator cut into runs between their markers, each padded to the window,
+ * after the template's fixed prefix, and a prompt that fills its last window exactly takes no
+ * empty one after it. */
+TEST(a_discrete_model_takes_its_sampler_and_reads_the_prompt_in_windows) {
+    Images s;
+    const json flow = s.gen({ { "prompt", "x" }, { "sampler", "euler" } }, 400);
+    CHECK_EQ(str_at(flow["error"], "param"), std::string("sampler"));
+    s.img.inf.samplers = (1u << RAD_GEN_SAMPLER_EULER) | (1u << RAD_GEN_SAMPLER_DPMPP_2M);
+    s.img.inf.default_sampler = RAD_GEN_SAMPLER_EULER;
+    s.img.inf.default_scheduler = RAD_GEN_SCHED_NORMAL;
+    s.img.inf.chunk_tokens = 4;
+    s.img.inf.chunk_bos = 2;
+    s.img.inf.chunk_eos = 3;
+    s.img.inf.chunk_pad = 9;
+    s.gen({ { "prompt", "abcdefghij" } });
+    REQUIRE(!s.img.got.empty());
+    CHECK_EQ(s.last().sampler, (int32_t)RAD_GEN_SAMPLER_EULER);
+    CHECK_EQ(s.last().scheduler, (int32_t)RAD_GEN_SCHED_NORMAL);
+    const std::vector<int32_t> want = { '<', 's', '>', 2, 'a', 'b', 'c', 'd', 3,
+                                        2, 'e', 'f', 'g', 'h', 3, 2, 'i', 'j', 3, 9, 9 };
+    CHECK(s.last().pos.tokens == want);
+    CHECK_EQ(s.last().pos.n_drop, (int32_t)3);
+    s.gen({ { "prompt", "x" }, { "sampler", "dpmpp_2m" }, { "scheduler", "karras" } });
+    CHECK_EQ(s.last().sampler, (int32_t)RAD_GEN_SAMPLER_DPMPP_2M);
+    CHECK_EQ(s.last().scheduler, (int32_t)RAD_GEN_SCHED_KARRAS);
+    /* A prompt that fills a window takes no second one. */
+    s.gen({ { "prompt", "abcd" } });
+    const std::vector<int32_t> one = { '<', 's', '>', 2, 'a', 'b', 'c', 'd', 3 };
+    CHECK(s.last().pos.tokens == one);
+    const json bad = s.gen({ { "prompt", "x" }, { "sampler", "euler_ancestral" } }, 400);
+    CHECK_EQ(str_at(bad["error"], "param"), std::string("sampler"));
+    CHECK(bad["error"]["supported"] == json::array({ "euler", "dpmpp_2m" }));
+    const json badk = s.gen({ { "prompt", "x" }, { "scheduler", "ddim_uniform" } }, 400);
+    CHECK_EQ(str_at(badk["error"], "param"), std::string("scheduler"));
+}
+
 /* `background: auto` keeps an edited picture's transparency and is opaque otherwise; a mask must
  * be the first picture's size. */
 /* A model whose card states guidance as cond + s (cond - uncond) and guides by default (Krea 2):

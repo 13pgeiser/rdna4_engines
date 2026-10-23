@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace rad;
@@ -3829,16 +3830,36 @@ int process_vram(int64_t* out) {
     return RAD_OK;
 }
 
+/* process_vram once it holds still. A stream is a hardware queue, and KFD gives each queue a
+ * context save area (the topology's cwsr_size + ctl_stack_size: 29.3 MiB on a 64-CU RDNA4 card)
+ * that can be released a few milliseconds after the queue is destroyed, so a reading straight
+ * after a stream's destruction may still include it (#124). Reads every 10 ms until 100 ms pass
+ * without a change, for at most 2 s. */
+int settled_vram(int64_t* out) {
+    int64_t v = 0;
+    RAD_TRY(process_vram(&v));
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (int still = 0; still < 10 && std::chrono::steady_clock::now() < end;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        int64_t w = 0;
+        RAD_TRY(process_vram(&w));
+        still = w == v ? still + 1 : 0;
+        v = w;
+    }
+    *out = v;
+    return RAD_OK;
+}
+
 }  /* namespace */
 
 /* Tools and tests build and tear down movers repeatedly, and on a card every event or stream is
  * a hardware queue and VRAM. A mover that staged, promoted and filled a loan gives back every
  * event and every byte of device memory it took. */
 /* The runtime and the driver keep some memory for the life of the process once a path is first
- * used: page tables for address ranges first mapped (a page, or a page and a 2 MiB directory), and
- * on some hosts about 30 MiB the first copy sets up (#124: 2 MiB, 2 MiB + 4 KiB and 31 MiB + 348
- * KiB across runs on one host). So the work runs once before the count is taken, and the count
- * after a second run may differ by a page and a directory, never by a buffer. */
+ * used: page tables for address ranges first mapped (a page, or a page and a 2 MiB directory). So
+ * the work runs once before the count is taken, and the count after a second run may differ by a
+ * page and a directory, never by a buffer. Both counts are taken once the figure holds still: a
+ * destroyed stream's queue save area can outlive it by a few milliseconds (settled_vram, #124). */
 TEST(a_mover_gives_back_every_event_and_device_byte) {
     auto run = [&]() {
         const int64_t events0 = rad_dev_live_events();
@@ -3881,9 +3902,9 @@ TEST(a_mover_gives_back_every_event_and_device_byte) {
     };
     run();
     int64_t vram0 = 0, vram1 = 0;
-    CHECK_OK(process_vram(&vram0));
+    CHECK_OK(settled_vram(&vram0));
     run();
-    CHECK_OK(process_vram(&vram1));
+    CHECK_OK(settled_vram(&vram1));
     CHECK(vram1 - vram0 <= 2 * MiB + 4096);
 }
 

@@ -19,12 +19,14 @@
 #include "../rad_core.h"
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace rad {
+struct StTensor;
 namespace lora {
 
 /* HF module leaf names, ordered so every caller builds the same set. Empty targets nothing. */
@@ -82,6 +84,8 @@ struct PackedSite {
     std::vector<float>    scale;   /* [N_r]: the module's alpha/r (alpha/sqrt(r) rsLoRA) on its rows */
     int32_t pool = -1;
     bool    empty = true;          /* no module of this adapter lands in this pool */
+    /* Packed compact (pack_modules): the ranks the modules take, from j = 0; R otherwise. */
+    int64_t r_used = 0;
 };
 
 /* What an adapter is, independent of the name it is served under. */
@@ -156,6 +160,26 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
  * q/k/v/o -- it is listed in info->absent; check_placed() refuses one no rank took. */
 int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max_rank,
                  AdapterInfo* info, std::vector<PackedSite>* packed, std::string* err);
+
+/* One module's factors as the packer reads them: lora_A [rank, K] and lora_B [rows, rank] in any
+ * dtype a safetensors tensor carries (BF16, F16, F32), and the scale its rows run at. `name` is the
+ * module path the base's name map spells (without ".weight"). */
+struct AdModule {
+    std::string     name;
+    const StTensor* A = nullptr;
+    const StTensor* B = nullptr;
+    int64_t         rank = 0;
+    double          alpha = 0.0;
+    float           scale = 0.0f;
+};
+
+/* load_adapter's second half, for any source of factors: `mods` (by name) packed into one
+ * PackedSite per pool of `sites`, in the slot layout of the pool's sites. Fills info->modules and
+ * info->absent. `compact`: the modules of a pool take consecutive ranks from j = 0, in source
+ * order, instead of a block of max_rank each, so a pass may run only the first r_used of them. */
+int pack_modules(const std::vector<Site>& sites, int max_rank,
+                 const std::map<std::string, AdModule>& mods, AdapterInfo* info,
+                 std::vector<PackedSite>* packed, std::string* err, bool compact = false);
 
 /* After load_adapter on every rank: refuse a module that no rank placed. With `prog`/`targets`
  * (any one rank's) the message says why it is not a site (base lacks it, scope, target list, op). */

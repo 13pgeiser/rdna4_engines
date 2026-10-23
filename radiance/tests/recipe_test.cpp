@@ -175,4 +175,57 @@ TEST(the_nvfp4_recipe_decides_the_model_it_was_written_for) {
     CHECK(has_opt(dh, "codes", "u2"));
 }
 
+/* The Sage-A1.5 recipe as it ships: every trunk linear -- attention, the delta net's in- and
+ * out-projections, the routed and shared experts of all 40 blocks and the MTP layer at its own
+ * index 40 -- goes to block fp8, the head likewise, and the routers, the shared-expert gates,
+ * the delta net's parameters, the norms, the embedding and the vision tower keep the
+ * checkpoint's form. */
+TEST(the_sage_recipe_decides_the_model_it_was_written_for) {
+    std::string dir = __FILE__;
+    dir = dir.substr(0, dir.find_last_of('/')) + "/../data/recipes";
+    std::ifstream in(dir + "/sage-a1.5-fp8.recipe");
+    REQUIRE(in.good());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Recipe r;
+    std::string why;
+    REQUIRE_EQ(r.add_text(text, "sage-a1.5-fp8.recipe", &why), RAD_OK);
+    CHECK_EQ(r.rules().size(), (size_t)12);
+
+    const char* linears[] = { "blk.0.attn_qg.weight", "blk.3.attn_qg.weight", "blk.39.attn_qg.weight",
+                              "blk.40.attn_qg.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight",
+                              "blk.39.attn_output.weight", "blk.0.ssm_inz.weight", "blk.39.ssm_out.weight",
+                              "blk.0.ffn_gate_up_exps.0.weight", "blk.19.ffn_down_exps.255.weight",
+                              "blk.40.ffn_gate_up_exps.0.weight", "blk.40.ffn_down_exps.255.weight",
+                              "blk.0.ffn_gate_up_shexp.weight", "blk.40.ffn_down_shexp.weight" };
+    for (const char* n : linears) {
+        const RecipeRule* m = r.match(n);
+        REQUIRE(m != nullptr);
+        CHECK_EQ(m->quantizer, std::string("rtn"));
+        CHECK(has_opt(m, "codes", "fp8_e4m3"));
+        CHECK(has_opt(m, "block", "128x128"));
+        CHECK(has_opt(m, "scale", "bf16"));
+    }
+    const RecipeRule* head = r.match("output.weight");
+    REQUIRE(head != nullptr);
+    CHECK(has_opt(head, "codes", "fp8_e4m3"));
+    CHECK(has_opt(head, "block", "128x128"));
+    const RecipeRule* dh = r.match("mtp.draft_head.weight");
+    REQUIRE(dh != nullptr);
+    CHECK(has_opt(dh, "codes", "u2"));
+    CHECK(has_opt(dh, "zero", "u8"));
+    CHECK(has_opt(dh, "group", "128"));
+    CHECK(has_opt(dh, "scale", "f16"));
+
+    /* kept as the checkpoint ships them: the routers, the gates, the delta net's parameters,
+     * the norms, the embedding and the whole vision tower */
+    const char* kept[] = { "blk.0.ffn_norm.weight", "blk.0.attn_norm.weight", "blk.0.ssm_ab.weight",
+                           "blk.0.ssm_conv1d.weight", "blk.0.ssm_a_log", "blk.0.ssm_dt.bias",
+                           "blk.0.ssm_norm.weight", "blk.0.ffn_gate_inp.weight",
+                           "blk.0.ffn_gate_shexp.weight", "blk.40.ffn_gate_inp.weight",
+                           "token_embd.weight", "output_norm.weight", "mtp.fc.weight",
+                           "mtp.norm.weight", "v.blk.0.qkv.weight", "v.merger.fc1.weight" };
+    for (const char* n : kept)
+        CHECK(r.match(n) == nullptr);
+}
+
 RAD_TEST_MAIN()

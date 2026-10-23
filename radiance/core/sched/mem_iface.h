@@ -170,6 +170,8 @@ struct IPrefixCache {
     virtual CkptCounts ckpt_counts() const { return {}; }
     /* Entries expired by --prefix-cache-ttl; not counted as evictions. */
     virtual int64_t expired() const { return 0; }
+    /* Restores the pool could not hold whole (PrefixCache::Stats::restore_cuts). */
+    virtual int64_t restore_cuts() const { return 0; }
     virtual int64_t ckpt_expired() const { return 0; }
 
     /* Tokens of context held only by the cache right now. Blocks a running sequence also reads
@@ -282,7 +284,8 @@ struct KVBinding final : IKVManager {
 /* Content keys for a request's media runs. Placeholder ids are identical for every picture, so
  * the prefix cache also hashes each run's item content key (core/mm, over the processed patches)
  * and segment: the same picture at the same place hits, two pictures never alias. */
-inline void media_keys(const Request& r, std::vector<MMContentKey>* out) {
+inline void media_keys(const Request& r, std::vector<MMContentKey>* out,
+                       uint64_t control_vector_salt = 0) {
     out->clear();
     /* The runtime LoRA adapter is part of every block's key: KV written under an adapter is not
      * the base's. It enters the chain as one span over the whole sequence, keyed by the adapter's
@@ -293,6 +296,18 @@ inline void media_keys(const Request& r, std::vector<MMContentKey>* out) {
         k.tok_begin = 0;
         k.tok_end = INT32_MAX;
         k.hash = (r.lora_uid * 0x9e3779b97f4a7c15ull) ^ 0x4c6f5241ull;   /* "LoRA" */
+        out->push_back(k);
+    }
+    /* A control vector is part of every block's key for the same reason: a projected step's hidden
+     * states are not the stock model's, so its KV is not the stock model's either. The vector's own
+     * identity rides in as one span over the whole sequence, so every block overlaps it, and a
+     * request that runs without the vector (or a deployment with none) adds no span and hashes
+     * exactly as it did. An adapter and a vector are independent spans and compose. */
+    if (control_vector_salt != 0 && r.sp.use_control_vector) {
+        MMContentKey k;
+        k.tok_begin = 0;
+        k.tok_end = INT32_MAX;
+        k.hash = control_vector_salt ^ 0x43455643ull;   /* "CVEC" */
         out->push_back(k);
     }
     if (!r.media) return;
@@ -311,13 +326,19 @@ inline void media_keys(const Request& r, std::vector<MMContentKey>* out) {
 template <class PC>
 struct PCBinding final : IPrefixCache {
     PC* m;
+    /* The control vector's identity (Engine::cvec_salt_for), or 0 with none loaded. A request that
+     * runs with it on keys its blocks and its linear-state snapshots under a chain that includes it,
+     * so its KV is never handed to a request that runs without it: the hidden states differ, and
+     * the cache stores hidden states' consequences. Per request, not per cache: two sequences of one
+     * step may differ. */
+    uint64_t salt_id = 0;
     /* Scratch for a request's media keys, reused so a text request's lookup allocates nothing. */
     mutable std::vector<MMContentKey> mm_;
     explicit PCBinding(PC* p) : m(p) {}
 
     CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
                     const HitCap* cap) const override {
-        media_keys(r, &mm_);
+        media_keys(r, &mm_, salt_id);
         /* r.id: the admission takes its conversation's snapshots over. */
         return m->lookup(r.prompt, mm_, out, cap, r.id);
     }
@@ -327,9 +348,24 @@ struct PCBinding final : IPrefixCache {
     void restore(const Request& r) override {
         if (restore_fn) restore_fn(r);
     }
+    /* The entries restore_fn brings back, in chain order: the whole chain if the pool can be made
+     * to hold it, otherwise cut (PrefixCache::restorable_from). Room is made as evict() makes it,
+     * dropping entries with a landed host copy, then landing pending copies and dropping those, but
+     * never erasing one: a restore is worth no lost conversation. The pool's free quarter can go
+     * to it; the reserve's trim after the next publish frees it again. */
+    std::vector<BlockHash> restore_plan(const Request& r, uint64_t salt) {
+        media_keys(r, &mm_, salt);
+        std::vector<BlockHash> want = m->restorable_from(r.prompt, mm_);
+        const int64_t need = (int64_t)want.size() - m->restore_room();
+        if (need <= 0) return want;
+        const int64_t k = m->trim_for(r.prompt, mm_, need);
+        if (k < need && flush_fn && flush_fn()) (void)m->trim_for(r.prompt, mm_, need - k);
+        /* Landing copies may have moved records; take the chain again against the room made. */
+        return m->restorable_from(r.prompt, mm_, m->restore_room());
+    }
     void begin_step() override { m->begin_step(); }
     void hold(const Request& r) override {
-        media_keys(r, &mm_);
+        media_keys(r, &mm_, salt_id);
         m->hold(r.id, r.prompt, mm_);
     }
     void release(const Request& r) override { m->release(r.id); }
@@ -345,7 +381,7 @@ struct PCBinding final : IPrefixCache {
         toks.insert(toks.end(), r.output.begin(), r.output.end());
         if (n_tokens > (int64_t)toks.size()) n_tokens = (int64_t)toks.size();
         /* r.id is the session, the same id reserve_checkpoint keys its snapshots by. */
-        media_keys(r, &mm_);
+        media_keys(r, &mm_, salt_id);
         return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label);
     }
     /* Installed by the engine when the idle tiers are on: lands every pending host copy now and
@@ -386,6 +422,7 @@ struct PCBinding final : IPrefixCache {
         return { st.ckpt_retired, st.ckpt_lru, st.ckpt_refused };
     }
     int64_t expired() const override { return m->stats().expired; }
+    int64_t restore_cuts() const override { return m->stats().restore_cuts; }
     int64_t ckpt_expired() const override { return m->stats().ckpt_expired; }
     int64_t held_tokens() const override { return m->unshared_tokens(); }
 
@@ -409,7 +446,7 @@ private:
     /* The chain reserve_checkpoint and commit_checkpoint both key on; shared so they cannot
      * drift apart. */
     BlockHash prefix_hash(const Request& r, int64_t pos) const {
-        media_keys(r, &mm_);
+        media_keys(r, &mm_, salt_id);
         const int64_t bs = m->block_size();
         BlockHash h{};
         if (bs <= 0) return h;

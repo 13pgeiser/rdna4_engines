@@ -19,6 +19,7 @@
 #include "r4d_attn_args.h"
 #include "r4d_common.h"
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 using std::max;
 #include "r4d_attn_prefill_h256_gqa6.hip"
@@ -56,9 +57,25 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
     dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
-    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
-                                                KVP, P_OPT | XOPT>),
-                       grid, dim3(P_NWARPS * 32), 0, s, *a);
+    // R4D_ATTN_FP8: 0 = f16 (default), 1 = O_QK8, 2 = O_PV8, 3 = both; fp8, fp8_v4 and k6_v4 KV.
+    int fp8mode = 0;
+    if constexpr (KVP == 0) {
+        static const int m = [] { const char* e = getenv("R4D_ATTN_FP8"); return e ? atoi(e) : 0; }();
+        fp8mode = m;
+    }
+#define P_LAUNCH(OPTX)                                                                            \
+    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, \
+                                                KVP, OPTX>),                                      \
+                       grid, dim3(P_NWARPS * 32), 0, s, *a)
+    if constexpr (KVP == 0) {
+        if (fp8mode == 3)      P_LAUNCH(P_OPT | XOPT | O_QK8 | O_PV8);
+        else if (fp8mode == 2) P_LAUNCH(P_OPT | XOPT | O_PV8);
+        else if (fp8mode == 1) P_LAUNCH(P_OPT | XOPT | O_QK8);
+        else                   P_LAUNCH(P_OPT | XOPT);
+    } else {
+        P_LAUNCH(P_OPT | XOPT);
+    }
+#undef P_LAUNCH
     CHK();
     return 0;
 }
@@ -202,7 +219,11 @@ static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
     return (int64_t)r4d_attn_decode_h256_gqa6_scratch_bytes(r);
 }
 
-static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long long row = 0) {
+/* `row`: a token's bytes in a (block, head) page (fill_paged_row), 0 for 2 * head_dim; `rep`: the
+ * launch maps each kv head onto `rep` query groups (R4DArgs::kv_rep), so the split law counts
+ * groups, gqa / rep of them a kv head; `q_pitched`: q may be a slice (attn_paged_qrow). */
+static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long long row = 0,
+                              int rep = 1, bool q_pitched = false) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
 
@@ -214,7 +235,8 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long lo
         r.head_dim  = head_dim;
         r.q_heads   = (int)n_head;
         const long long gqa = r4d_geti_or(a, "gqa", 1);
-        r.kv_heads  = (int)(gqa > 0 ? n_head / gqa : n_head);
+        r.kv_heads  = (int)(gqa > 0 ? n_head / gqa : n_head) * rep;
+        r.kv_rep    = rep;
         r.num_seqs  = (int)max_seqs;
         r.q_len     = (int)r4d_geti_or(a, "q_len", 1);
         r.max_ctx   = (int)r4d_geti_or(a, "max_ctx", 0);
@@ -232,8 +254,10 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long lo
         return worst;
     }
 
-    int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);
+    int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim, q_pitched);
     if (rc != RAD_OK) return rc;
+    r.kv_heads *= rep;
+    r.kv_rep = rep;
     r.splits = sp;
     return decode_scratch_bytes_of(&r, which);
 }
@@ -246,11 +270,17 @@ extern "C" int64_t r4d_rad_attn_decode_h128_scratch(const RadArgs* a) {
     return decode_scratch(a, 128, 1);
 }
 
-static int decode_common(const RadArgs* a, R4DArgs* r, int head_dim, int which, long long row = 0) {
+static int decode_common(const RadArgs* a, R4DArgs* r, int head_dim, int which, long long row = 0,
+                         int rep = 1, bool q_pitched = false) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
-    int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim);
+    int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim, q_pitched);
     if (rc != RAD_OK) return rc;
+    /* a QLD instance reads q_ld whatever q is: dense is the pitch q_heads * head_dim */
+    if (q_pitched && r->q_ld == 0) r->q_ld = (long)r->q_heads * head_dim;
+    /* each cache head serves `rep` query groups: the kernel's grid and its gqa check count groups */
+    r->kv_heads *= rep;
+    r->kv_rep = rep;
     r->splits = sp;
     const int64_t need = decode_scratch_bytes_of(r, which);
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
@@ -371,4 +401,43 @@ extern "C" int r4d_rad_attn_decode_h128_gqa2w_bf16(const RadArgs* a, RadStream s
     int rc = decode_common(a, &r, 128, 3);
     if (rc != RAD_OK) return rc;
     return r4d_attn_decode_h128_gqa2w_bf16kv(&r, (hipStream_t)s);
+}
+
+/* The same decode under attn_paged_qrow: q read at its own row pitch (R4DArgs::q_ld), the sliding
+ * layers' q where Gemma 4 31B's fused q|k|v projection left it. Same kernel, same arithmetic. */
+extern "C" int64_t r4d_rad_attn_qrow_decode_h256_gqa2_scratch(const RadArgs* a) {
+    return decode_scratch(a, 256, 2, 0, 1, true);
+}
+extern "C" int r4d_rad_attn_qrow_decode_h256_gqa2_fp8(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 2, 0, 1, true);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa2_qld_fp8kv(&r, (hipStream_t)s);
+}
+extern "C" int r4d_rad_attn_qrow_decode_h256_gqa2_bf16(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 2, 0, 1, true);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa2_qld_bf16kv(&r, (hipStream_t)s);
+}
+
+/* Head_dim 128 at 8 queries per kv head, any window, causal or not, q_len up to 16, under
+ * attn_paged_qrow: the gqa-4 kernel with each kv head mapped onto two query groups
+ * (R4DArgs::kv_rep = 2), the 31B's DFlash drafter's attention over a cache that holds each kv head
+ * once. The workgroup holds q_len * 4 rows, so a block of 16 fits where gqa 8 (128 rows) does not;
+ * the two groups of a kv head read its blocks twice, as the copies they replace did. */
+extern "C" int64_t r4d_rad_attn_qrow_h128_gqa8_scratch(const RadArgs* a) {
+    return decode_scratch(a, 128, 1, 0, 2, true);
+}
+extern "C" int r4d_rad_attn_qrow_h128_gqa8_fp8(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 128, 1, 0, 2, true);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h128_gqa4_rep_fp8kv(&r, (hipStream_t)s);
+}
+extern "C" int r4d_rad_attn_qrow_h128_gqa8_bf16(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 128, 1, 0, 2, true);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h128_gqa4_rep_bf16kv(&r, (hipStream_t)s);
 }

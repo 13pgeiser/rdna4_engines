@@ -42,6 +42,7 @@
 
 #include "r4d_plugin.h"
 #include "r4d_launch.h"
+#include "r4d_chain.h"
 #include "rad_plugin.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && __AMDGCN_WAVEFRONT_SIZE != 32
@@ -232,8 +233,10 @@ __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* 
 }
 
 /* ------------------------------------------------------------------ the attention kernel */
+/* The body; attn_kernel and its chained form r4dchain_attn_window (r4d_chain.h) wrap it below,
+ * since its blocks return early. */
 template <int HD, int GQA, bool KV8>
-__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
+__device__ __forceinline__ void attn_body(AttnArgs A) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, RW = R / kWaves, BQ = R / GQA;
     constexpr int NC = HD / 128;                     /* 4-element chunks a lane holds of a row */
     constexpr int ESZ = KV8 ? 1 : 2;
@@ -499,15 +502,14 @@ __device__ __forceinline__ unsigned f16_bits(float f) {
     if (f == f) f = __builtin_fminf(__builtin_fmaxf(f, -65504.0f), 65504.0f);
     return (unsigned)__builtin_bit_cast(unsigned short, (_Float16)f);
 }
-__device__ __forceinline__ void fp8x16_f16(const uint4 w, unsigned (&h)[16]) {
-    const unsigned in[4] = {w.x, w.y, w.z, w.w};
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        float f[4];
-        fp8x4(in[q], f);
-#pragma unroll
-        for (int e = 0; e < 4; ++e) h[q * 4 + e] = f16_bits(f[e]);
-    }
+/* Two f32 values exact in f16 as an f16 pair, `a` low: v_cvt_pkrtz on gfx12, f16_bits elsewhere
+ * (the host emulator), the same bits either way since neither rounds an exact value. */
+__device__ __forceinline__ unsigned f16x2_exact(float a, float b) {
+#if defined(__GFX12__)
+    return __builtin_bit_cast(unsigned, __builtin_amdgcn_cvt_pkrtz(a, b));
+#else
+    return f16_bits(a) | f16_bits(b) << 16;
+#endif
 }
 __device__ __forceinline__ void bf16x8_f16(const uint4 w, unsigned (&h)[8]) {
     const unsigned in[4] = {w.x, w.y, w.z, w.w};
@@ -684,11 +686,17 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
                 const uint4 wb = (tok && kb1 >= lo && kb1 < hi) ? pv[j][1] : make_uint4(0u, 0u, 0u, 0u);
                 unsigned d[CW];                      /* f16 pairs: key 2kp low, 2kp + 1 high */
                 if constexpr (KV8) {
-                    unsigned ha[16], hb2[16];
-                    fp8x16_f16(wa, ha);
-                    fp8x16_f16(wb, hb2);
+                    /* every e4m3 value is exact in f16 (|v| <= 448, subnormals 2^-9 up), so the
+                     * pack's round-toward-zero and f16_bits' clamp leave the same bits */
+                    const unsigned ia[4] = {wa.x, wa.y, wa.z, wa.w}, ib[4] = {wb.x, wb.y, wb.z, wb.w};
 #pragma unroll
-                    for (int e = 0; e < CW; ++e) d[e] = ha[e] | hb2[e] << 16;
+                    for (int q = 0; q < 4; ++q) {
+                        float fa[4], fb[4];
+                        fp8x4(ia[q], fa);
+                        fp8x4(ib[q], fb);
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) d[q * 4 + e] = f16x2_exact(fa[e], fb[e]);
+                    }
                 } else {
                     unsigned ha[8], hb2[8];
                     bf16x8_f16(wa, ha);
@@ -747,14 +755,26 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
 
         /* ---- online softmax, row n: eight keys here, eight in lane ^ 16 */
         float sv[8], mx = -__builtin_inff();
+        /* A tile wholly inside [lo, hi) and, causal, at or before the block's first position
+         * (every row's pos >= qbase) is visible to every valid row: the same scores, unmasked. */
+        const bool interior = window <= 0 && k0 >= lo && k0 + 16 <= hi && (!causal || k0 + 15 <= qbase);
+        if (interior) {
+            const bool vis = rval && tok;
 #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int kk = k0 + 8 * h + e;
-            bool vis = rval && tok && kk >= lo && kk < hi;
-            if (causal) vis = vis && kk <= pos;
-            if (window > 0) vis = vis && (pos - kk < window) && (causal || kk - pos < window);
-            sv[e] = vis ? tot[e] * sscale : -__builtin_inff();
-            mx = __builtin_fmaxf(mx, sv[e]);
+            for (int e = 0; e < 8; ++e) {
+                sv[e] = vis ? tot[e] * sscale : -__builtin_inff();
+                mx = __builtin_fmaxf(mx, sv[e]);
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int kk = k0 + 8 * h + e;
+                bool vis = rval && tok && kk >= lo && kk < hi;
+                if (causal) vis = vis && kk <= pos;
+                if (window > 0) vis = vis && (pos - kk < window) && (causal || kk - pos < window);
+                sv[e] = vis ? tot[e] * sscale : -__builtin_inff();
+                mx = __builtin_fmaxf(mx, sv[e]);
+            }
         }
         mx = __builtin_fmaxf(mx, shfl_xor(mx, 16));
         const float mn = __builtin_fmaxf(m, mx);
@@ -773,10 +793,23 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
 
         /* ---- O^T += V^T * P^T in f16: A = V^T rows (dim n of the chunk), keys 8h .. 8h + 7 */
         const unsigned char* va = vb + (sl * kDQ + n) * VS + h * 16;
+        if constexpr (KV8) {
+            /* x * 1 = x, so a wave whose rows all kept their max skips the rescale. With an fp8
+             * cache that is ~4% at head_dim 512; with bf16 the split loop measured ~10% slower,
+             * so it keeps the fused one. */
+            if (__builtin_amdgcn_ballot_w32(corr != 1.0f) != 0) {
 #pragma unroll
-        for (int mc = 0; mc < kDQ / 16; ++mc) {
-            oacc[mc] *= corr;
-            oacc[mc] = wmma_f16(__builtin_bit_cast(win_v8h, *(const uint4*)(va + mc * 16 * VS)), pf, oacc[mc]);
+                for (int mc = 0; mc < kDQ / 16; ++mc) oacc[mc] *= corr;
+            }
+#pragma unroll
+            for (int mc = 0; mc < kDQ / 16; ++mc)
+                oacc[mc] = wmma_f16(__builtin_bit_cast(win_v8h, *(const uint4*)(va + mc * 16 * VS)), pf, oacc[mc]);
+        } else {
+#pragma unroll
+            for (int mc = 0; mc < kDQ / 16; ++mc) {
+                oacc[mc] *= corr;
+                oacc[mc] = wmma_f16(__builtin_bit_cast(win_v8h, *(const uint4*)(va + mc * 16 * VS)), pf, oacc[mc]);
+            }
         }
     }
 
@@ -800,7 +833,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
  * (kMaxSplit is 64), so the row max and denominator are one wave reduction each. Then one sweep
  * over the splits that saw a key, four at a time, each lane accumulating its 4 * NC dims. */
 template <int HD, int GQA>
-__global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
+__device__ __forceinline__ void merge_body(AttnArgs A) {
     constexpr int R = Geo<HD>::R, NC = HD / 128;
     static_assert(kMaxSplit <= 64, "two splits a lane");
     const int tile = (int)blockIdx.x, kh = (int)blockIdx.y;
@@ -840,9 +873,9 @@ __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
          * (a written split, so 0 * finite). An empty split's accumulator is never read. */
         uint64_t live = (uint64_t)__builtin_amdgcn_ballot_w32(w0 != 0.0f) |
                         ((uint64_t)__builtin_amdgcn_ballot_w32(w1 != 0.0f) << 32);
-        while (live) {
-            int zi[4];
-            float wj[4];
+        /* Group g + 1's loads go out before group g's FMAs, so a group's wait overlaps the one
+         * before it instead of following it; the FMAs keep their order, so the bytes do too. */
+        auto take = [&](int (&zi)[4], float (&wj)[4]) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const bool have = live != 0;
@@ -851,13 +884,16 @@ __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
                 wj[j] = readlane(zi[j] < 32 ? w0 : w1, zi[j] & 31);
                 if (!have) wj[j] = 0.0f;
             }
-            float4 v[4][NC];
+        };
+        auto load = [&](const int (&zi)[4], float4 (&v)[4][NC]) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float* pp = A.part + (base + (long long)zi[j] * R) * (HD + 4);
 #pragma unroll
                 for (int c = 0; c < NC; ++c) v[j][c] = *(const float4*)(pp + c * 128 + lane * 4);
             }
+        };
+        auto fold = [&](const float (&wj)[4], const float4 (&v)[4][NC]) {
 #pragma unroll
             for (int j = 0; j < 4; ++j)
 #pragma unroll
@@ -867,6 +903,23 @@ __global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
                     acc[c][2] = __builtin_fmaf(wj[j], v[j][c].z, acc[c][2]);
                     acc[c][3] = __builtin_fmaf(wj[j], v[j][c].w, acc[c][3]);
                 }
+        };
+        if (live) {
+            int za[4], zb[4];
+            float wa[4], wb[4];
+            float4 va[4][NC], vb[4][NC];
+            take(za, wa);
+            load(za, va);
+            while (true) {
+                const bool more_b = live != 0;
+                if (more_b) { take(zb, wb); load(zb, vb); }
+                fold(wa, va);
+                if (!more_b) break;
+                const bool more_a = live != 0;
+                if (more_a) { take(za, wa); load(za, va); }
+                fold(wb, vb);
+                if (!more_a) break;
+            }
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c)
@@ -912,6 +965,25 @@ static constexpr int64_t part_bytes() {
 template <int HD>
 static constexpr int64_t scratch_need() {
     return part_bytes<HD>() + (int64_t)kTinfoMax * 2 * (int64_t)sizeof(int);
+}
+
+/* The plain kernels and their chained forms (r4dchain*, RadKernelChainFn): the chained ones wait
+ * for the kernels before them on the queue in their prologue and count themselves in at the end. */
+template <int HD, int GQA, bool KV8>
+__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) { attn_body<HD, GQA, KV8>(A); }
+template <int HD, int GQA, bool KV8>
+__global__ __launch_bounds__(kThreads) void r4dchain_attn_window(AttnArgs A) {
+    r4d_chain_wait();
+    attn_body<HD, GQA, KV8>(A);
+    r4d_chain_done();
+}
+template <int HD, int GQA>
+__global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) { merge_body<HD, GQA>(A); }
+template <int HD, int GQA>
+__global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
+    r4d_chain_wait();
+    merge_body<HD, GQA>(A);
+    r4d_chain_done();
 }
 
 template <int HD, int GQA, bool KV8>
@@ -1084,11 +1156,23 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.n_split = (int)ns;
 
     hipStream_t s = (hipStream_t)stream;
-    R4D_KLAUNCH(R4D_KNAME(attn_kernel<HD, GQA, KV8>), dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns),
-               dim3(kThreads), s, A);
-    if (ns > 1)
-        R4D_KLAUNCH(R4D_KNAME(merge_kernel<HD, GQA>), dim3((unsigned)nt, (unsigned)kvh), dim3(kThreads),
-                   s, A);
+    /* The chained forms where the row resolved with `chain` (a chainable row, RADIANCE_CHAIN), at
+     * decode heights only: the 31B's full layers at a verify. */
+    const bool chain = rad_args_geti_or(a, "chain", 0) != 0 && rows <= 64;
+    if (chain)
+        R4D_KLAUNCH(R4D_KNAME(r4dchain_attn_window<HD, GQA, KV8>),
+                   dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
+    else
+        R4D_KLAUNCH(R4D_KNAME(attn_kernel<HD, GQA, KV8>),
+                   dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
+    if (ns > 1) {
+        if (chain)
+            R4D_KLAUNCH(R4D_KNAME(r4dchain_merge_window<HD, GQA>), dim3((unsigned)nt, (unsigned)kvh),
+                       dim3(kThreads), s, A);
+        else
+            R4D_KLAUNCH(R4D_KNAME(merge_kernel<HD, GQA>), dim3((unsigned)nt, (unsigned)kvh),
+                       dim3(kThreads), s, A);
+    }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

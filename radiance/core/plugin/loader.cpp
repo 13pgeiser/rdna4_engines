@@ -441,6 +441,7 @@ int Registry::commit_(Staged& s, int order) {
     }
     const auto concurrent = dl_fn<RadKernelConcurrentFn>(s.handle, "rad_kernel_concurrent");
     const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
+    const auto chainable  = dl_fn<RadKernelChainFn>(s.handle, "rad_kernel_chain");
     for (const auto& sr : staged_rows) {
         KernelRow row;
         row.info         = sr.first;
@@ -452,6 +453,7 @@ int Registry::commit_(Staged& s, int order) {
         row.collective   = coll != 0;
         row.releases_link = coll == 2;
         row.reference    = p.reference;
+        row.chain        = chainable && chainable(sr.second) != 0;
         rows_.push_back(row);
     }
 

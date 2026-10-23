@@ -594,6 +594,14 @@ struct FakeImageGen : IImageGen {
     }
     int64_t queued() const override { return 0; }
     int64_t running() const override { return 0; }
+    /* The second tokenizer: one id a byte, then 1 (an end token). */
+    int encode_aux(const std::string& text, std::vector<int32_t>* out) const override {
+        if (!inf.aux_tokens) return RAD_E_UNSUPPORTED;
+        out->clear();
+        for (unsigned char c : text) out->push_back(100 + c);
+        out->push_back(1);
+        return RAD_OK;
+    }
 };
 
 /* An audio generator that finishes every request on submit: `windows` windows of `per_window`

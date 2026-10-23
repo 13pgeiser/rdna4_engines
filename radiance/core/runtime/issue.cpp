@@ -82,15 +82,17 @@ void* Ctx::resolve_weight(rad_weight w) {
     const WeightSlot* s = residency_->lookup(w);       /* never blocks -- residency.h */
     if (s) {
         p = s->ptr;
-        /* Wait once per generation, not per issue; a stream wait orders everything issued after
-         * it. Sound because the mover bumps `generation` per transfer (residency.h). */
-        if (s->ready && waited_gen_[w] != s->generation) {
+        /* Wait once per generation and lane, not per issue; a stream wait orders everything
+         * issued after it on that stream, and nothing on the other lane. Sound because the mover
+         * bumps `generation` per transfer (residency.h). */
+        std::vector<uint32_t>& waited = waited_gen_[lane_];
+        if (s->ready && waited[w] != s->generation) {
             /* Kept out of a recording: it orders every later play too, and moving a weight a
              * pass names directly re-keys the pass. */
             if (rec_) tape_pause(true);
             rad_event_wait(cur_stream(), s->ready);         /* the stream waits, not the host */
             if (rec_) tape_pause(false);
-            waited_gen_[w] = s->generation;
+            waited[w] = s->generation;
             ++n_stream_waits_;
         }
     }
@@ -424,17 +426,21 @@ int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
  * A row-parallel gemm's y is this rank's partial sum and the plugin reduces it after this returns,
  * so the delta rides the same reduction (B.A.x is linear in x's shards). Nothing is issued on a
  * step with no adapter row (RadBatch::lora_slot null), which is then the pass an engine without
- * adapters runs, nor on a draft pass, whose proposals the trunk verifies. An encoder or generator
- * pass never reaches a site: such a weight is outside the targets' scope rule (core/lora/lora.h),
- * so reaching one here is refused rather than run without its delta. */
+ * adapters runs, nor on a draft pass, whose proposals the trunk verifies. An encoder pass never
+ * reaches a site: such a weight is outside the targets' scope rule (core/lora/lora.h), so reaching
+ * one here is refused rather than run without its delta.
+ *
+ * A generator's pass runs one adapter in all its rows (gen_lora_slot_, -1 for none), whatever the
+ * rows are -- a stream's tokens, a text encoder's taps, a video's patches -- so its slot operand
+ * is row `slot` of Program::lora_rows, the gemm's first n rows of it. */
 int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     if (!batch_) return RAD_OK;
-    if (batch_->enc != 0 || batch_->gen != 0)
+    const bool gen = batch_->gen != 0;
+    if (batch_->enc != 0)
         return abort_step_msg(h, RAD_E_UNSUPPORTED,
-                              "a LoRA-targeted gemm was issued by an encoder or generator pass, "
-                              "which runtime LoRA does not reach; leave its module out of "
-                              "--lora-target-modules");
-    if (!batch_->lora_slot || batch_->draft_pass != 0) return RAD_OK;
+                              "a LoRA-targeted gemm was issued by an encoder pass, which runtime "
+                              "LoRA does not reach; leave its module out of --lora-target-modules");
+    if (gen ? gen_lora_slot_ < 0 : (!batch_->lora_slot || batch_->draft_pass != 0)) return RAD_OK;
     const OpPlan& p = plans_[h];
     const LoraIssueSite& s = program_->lora_sites[(size_t)p.lora_site];
     if (n == RAD_N_BATCH) n = batch_->n_tok;
@@ -467,13 +473,15 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                   rad_dtype_name(xd.dtype), rad_dtype_name(yd.dtype)));
     const int64_t yw = yd.rank >= 2 ? yd.shape[yd.rank - 1] : 0;
     if (yw <= 0) return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's output has no width");
-    if (ya.cols == 0 && ya.offset % yw != 0)
+    /* A token step reads each row's slot at the row the gemm wrote, so the views must name token
+     * rows; a generator pass's one slot holds for any rows. */
+    if (!gen && ya.cols == 0 && ya.offset % yw != 0)
         return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's output view starts inside a "
                                               "row, so its token rows cannot be told");
-    const int64_t r0 = ya.offset / yw;
+    const int64_t r0 = gen ? 0 : ya.offset / yw;
     /* The activation must start at the same row: shrink reads x's row m and expand writes y's row
      * m with one slot. */
-    {
+    if (!gen) {
         const int64_t xw = xd.rank >= 2 ? xd.shape[xd.rank - 1] : 0;
         if (xw <= 0 || (xa.cols == 0 && xa.offset % xw != 0) || xa.offset / xw != r0)
             return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's activation and output "
@@ -483,26 +491,72 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         (int)op_domain_[s.expand].load(std::memory_order_relaxed) != dom)
         return abort_step_msg(h, RAD_E_UNSUPPORTED, "LoRA site: the adapter ops were placed in "
                                                     "another domain than the gemm they follow");
-    if (r0 < 0 || r0 + n > batch_->n_tok)
+    if (!gen && (r0 < 0 || r0 + n > batch_->n_tok))
         return abort_step_msg(h, RAD_E_STATE,
                               fmt("LoRA site: the gemm wrote rows [%lld, %lld) of a %lld-token step",
                                   (long long)r0, (long long)(r0 + n), (long long)batch_->n_tok));
+    if (gen && (!program_->lora_rows || gen_lora_slot_ >= program_->lora_pools[(size_t)s.pool].S))
+        return abort_step_msg(h, RAD_E_STATE,
+                              fmt("LoRA site: a generator pass in slot %d of %lld", gen_lora_slot_,
+                                  (long long)program_->lora_pools[(size_t)s.pool].S));
     /* Each row's adapter is the step batch's (RadBatch::lora_slot), rewritten in stream order
      * before each step's kernels, so the pointer this launch records is the one a replay of it
-     * reads. */
+     * reads. A generator pass is never recorded, so its run of the slot table is named directly,
+     * and it runs the pair over chunks of at most lora_rows_n rows: a video's passes run to
+     * hundreds of thousands of rows, and `t` and the slot run are sized for one chunk. */
     const LoraPool&    pool = program_->lora_pools[(size_t)s.pool];
     const rad_buf      t    = program_->lora_t[(size_t)s.t].lane[lane_ ? 1 : 0];
-    RadOperand         slot = RAD_P_T(batch_->lora_slot + r0, RAD_I32);
-    slot.rows = n;
-    const RadOperand   tv   = RAD_B_N(t, 0, n);
-    const RadOperand   sh[5] = { xa,
-                                 s.opd_a_scale >= 0 && s.opd_a_scale < n_opd ? opd[s.opd_a_scale]
-                                                                              : RAD_NONE,
-                                 slot, RAD_B(pool.a), tv };
-    int rc = issue_body((rad_op)s.shrink, sh, 5, n);
-    if (rc < 0) return rc;
-    const RadOperand ex[5] = { tv, slot, RAD_B(pool.b), RAD_B(pool.scale), ya };
-    return issue_body((rad_op)s.expand, ex, 5, n);
+    /* A generator's slot holds its ranks from 0 (Program::lora_rused): no pair where it holds
+     * none, the narrowest declared pair that holds them otherwise. */
+    uint32_t sh_op = s.shrink, ex_op = s.expand;
+    int64_t  rv = s.R;
+    if (gen) {
+        const size_t ui = (size_t)s.pool * (size_t)pool.S + (size_t)gen_lora_slot_;
+        const int64_t used = ui < program_->lora_rused.size() ? program_->lora_rused[ui] : s.R;
+        if (used <= 0) return RAD_OK;
+        for (int v = 0; v < s.n_v; ++v)
+            if (s.R_v[v] >= used) { sh_op = s.shrink_v[v]; ex_op = s.expand_v[v]; rv = s.R_v[v]; }
+    }
+    RadOperand         xs   = s.opd_a_scale >= 0 && s.opd_a_scale < n_opd ? opd[s.opd_a_scale]
+                                                                          : RAD_NONE;
+    const int64_t      step = gen ? program_->lora_rows_n : n;
+    if (step <= 0) return abort_step_msg(h, RAD_E_STATE, "LoRA site: no slot rows");
+    int64_t sw = 0;   /* a_scale's row stride, for a chunk past the first */
+    if (n > step && xs.kind != RAD_OPK_NONE) {
+        if (xs.kind != RAD_OPK_BUF || (size_t)xs.handle >= program_->buffers.size())
+            return abort_step_msg(h, RAD_E_UNSUPPORTED, "LoRA site: a generator pass's activation "
+                                                        "scale is not a declared buffer, so its "
+                                                        "rows cannot be chunked");
+        const RadBufDecl& sd = program_->buffers[xs.handle].decl;
+        sw = sd.rank >= 2 ? sd.shape[sd.rank - 1] : 1;
+    }
+    const int64_t xw = xd.rank >= 2 ? xd.shape[xd.rank - 1] : 0;
+    for (int64_t c = 0; c < n; c += step) {
+        const int64_t nc = std::min(step, n - c);
+        RadOperand x = xa, y = ya, a_s = xs;
+        if (c > 0) {
+            x.offset += c * xw;
+            y.offset += c * yw;
+            if (a_s.kind == RAD_OPK_BUF) a_s.offset += c * sw;
+        }
+        if (n > step) {
+            x.rows = nc;
+            y.rows = nc;
+            if (a_s.kind == RAD_OPK_BUF) a_s.rows = nc;
+        }
+        RadOperand slot = gen ? RAD_B(program_->lora_rows) : RAD_P_T(batch_->lora_slot + r0, RAD_I32);
+        if (gen) slot.offset = (int64_t)gen_lora_slot_ * program_->lora_rows_n;
+        slot.rows = nc;
+        RadOperand tv = RAD_B_N(t, 0, nc);
+        if (rv < s.R) tv.cols = rv;
+        const RadOperand sh[5] = { x, a_s, slot, RAD_B(pool.a), tv };
+        int rc = issue_body((rad_op)sh_op, sh, 5, nc);
+        if (rc < 0) return rc;
+        const RadOperand ex[5] = { tv, slot, RAD_B(pool.b), RAD_B(pool.scale), y };
+        rc = issue_body((rad_op)ex_op, ex, 5, nc);
+        if (rc < 0) return rc;
+    }
+    return RAD_OK;
 }
 
 int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {

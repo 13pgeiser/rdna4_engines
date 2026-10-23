@@ -53,7 +53,7 @@ int query_body(const RadArgs* a, RadStream stream) {
 }
 struct ScoreMeta {
     long qr, qh, qsr, qsc, gr, gc, kr, ksr, btr, btc, cur, ncr, op;
-    int rows, blocks, seqs, pages;
+    int rows, blocks, seqs, pages, row0;
 };
 __device__ uint32_t bytes4(const uint8_t* p) {
     if (!((uintptr_t)p & 3)) return *(const uint32_t*)p;
@@ -61,7 +61,8 @@ __device__ uint32_t bytes4(const uint8_t* p) {
 }
 /* Two waves cover all 32 heads and reuse the query across `kScoreTiles` 16-key tiles, one up to 32
  * blocks and two past them. FP8 dot products stay on WMMA; scales and the signed per-head gates
- * fold only after the per-head ReLU. */
+ * fold only after the per-head ReLU. The query operands start at a part's first row, so only the
+ * sequence lookup sees the step row (`row0 + r`). */
 template <int kScoreTiles>
 __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float* gate,
                                  const uint8_t* k, const float* ks, const int* bt, const int* cu,
@@ -75,7 +76,7 @@ __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float*
     if (!tid) {
         seq = -1;
         for (int s = 0; s < m.seqs; ++s)
-            if (r >= cu[(long)s * m.cur] && r < cu[(long)(s + 1) * m.cur]) {
+            if (m.row0 + r >= cu[(long)s * m.cur] && m.row0 + r < cu[(long)(s + 1) * m.cur]) {
                 seq = s;
                 break;
             }
@@ -133,10 +134,14 @@ __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float*
             out[(long)r * m.op + b0 + i] =
                 pages[i] >= 0 ? (partial[0][i] + partial[1][i]) * scales[i] * 0.015625f : -INFINITY;
 }
+/* The step's cu rebased to a part's first row: an op that reads cu over the part's own rows
+ * (qsa_select) then finds each row's sequence unchanged. */
+__global__ void dsa_rebase_kernel(const int* cu, int* out, long cs, long os, int n, int row0) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) out[(long)i * os] = cu[(long)i * cs] - row0;
+}
 int score_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 9) return RAD_E_INVAL;
-    RadTensor q = a->t[0], qs = a->t[1];
-    const auto& g = a->t[2];
+    RadTensor q = a->t[0], qs = a->t[1], g = a->t[2];
     RadTensor k = a->t[3], ks = a->t[4];
     const bool packed = k.dtype == RAD_U8;
     if (packed) {
@@ -156,19 +161,40 @@ int score_body(const RadArgs* a, RadStream stream) {
         k.stride[1] = 1;
     }
     const auto &bt = a->t[5], &cu = a->t[6], &nc = a->t[7], &o = a->t[8];
-    if (q.rank == 2 && qs.rank == 2 && qs.shape[1] == 1 && q.shape[0] == o.shape[0] * 32 &&
-        qs.shape[0] == q.shape[0]) {
+    const RadTensor* cu_part = rad_arg_in(a, 9);
+    const long long part = r4d_geti_or(a, "row_part", -1);
+    if (q.rank == 2 && qs.rank == 2 && qs.shape[1] == 1 && g.rank == 2 &&
+        q.shape[0] == g.shape[0] * 32 && qs.shape[0] == q.shape[0]) {
         q.rank = 3;
-        q.shape[0] = o.shape[0];
+        q.shape[0] = g.shape[0];
         q.shape[2] = q.shape[1];
         q.shape[1] = 32;
         q.stride[2] = q.stride[1];
         q.stride[1] = q.stride[0];
         q.stride[0] *= 32;
-        qs.shape[0] = o.shape[0];
+        qs.shape[0] = g.shape[0];
         qs.shape[1] = 32;
         qs.stride[1] = qs.stride[0];
         qs.stride[0] *= 32;
+    }
+    /* A part scores o's rows from step row part * rows; the query operands span the step. */
+    const long long rows = o.rank == 2 ? o.shape[0] : 0, row0 = part > 0 ? part * rows : 0;
+    if (part >= 0) {
+        if (q.rank != 3 || qs.rank != 2 || g.rank != 2 || rows < 1 || part > INT_MAX / rows ||
+            q.shape[0] < row0 + rows || qs.shape[0] != q.shape[0] || g.shape[0] != q.shape[0])
+            return RAD_E_SHAPE;
+        if (q.data && qs.data && g.data) {
+            q.data = (uint8_t*)q.data + row0 * q.stride[0];
+            qs.data = (float*)qs.data + row0 * qs.stride[0];
+            g.data = (float*)g.data + row0 * g.stride[0];
+        }
+        q.shape[0] = qs.shape[0] = g.shape[0] = rows;
+    }
+    if (cu_part) {
+        if (part < 0) return RAD_E_INVAL;
+        if (cu_part->dtype != RAD_I32) return RAD_E_DTYPE;
+        if (cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0] || cu_part->stride[0] < 1)
+            return RAD_E_SHAPE;
     }
     if (q.dtype != RAD_F8E4M3 || k.dtype != RAD_F8E4M3 || qs.dtype != RAD_F32 ||
         g.dtype != RAD_F32 || ks.dtype != RAD_F32 || o.dtype != RAD_F32 || bt.dtype != RAD_I32 ||
@@ -194,7 +220,13 @@ int score_body(const RadArgs* a, RadStream stream) {
     ScoreMeta m{ q.stride[0],      q.stride[1],    qs.stride[0], qs.stride[1],    g.stride[0],
                  g.stride[1],      k.stride[0],    ks.stride[0], bt.stride[0],    bt.stride[1],
                  cu.stride[0],     nc.stride[0],   o.stride[0],  (int)q.shape[0], (int)o.shape[1],
-                 (int)bt.shape[0], (int)k.shape[0] };
+                 (int)bt.shape[0], (int)k.shape[0], (int)row0 };
+    if (cu_part) {
+        const int rc = R4D_EMIT(stream, dsa_rebase_kernel, dim3(1), dim3(64), 0,
+                                (const int*)cu.data, (int*)cu_part->data, cu.stride[0],
+                                cu_part->stride[0], (int)cu.shape[0], (int)row0);
+        if (rc != RAD_OK) return rc;
+    }
 #define SCORE(NT)                                                                                  \
     R4D_EMIT(stream, (dsa_score_kernel<NT>), dim3((m.blocks + 16 * NT - 1) / (16 * NT), m.rows),   \
              dim3(64), 0, (const uint8_t*)q.data, (const float*)qs.data, (const float*)g.data,     \

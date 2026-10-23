@@ -48,6 +48,7 @@
 #include "r4d_common.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_fp8_lm.h"
+#include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
@@ -120,8 +121,10 @@ __device__ __forceinline__ unsigned long long tk_round(unsigned long long* t) {
   return m;
 }
 
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. A wave past the
+// chunks returns early; there is no barrier in it.
 template <int PT>
-__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stage1_kernel(
+__device__ __forceinline__ void r4d_rowtopk_stage1_body(
     const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
     int N, int RC, int NCH, int CH) {
   // WPB independent waves per block, each on its own chunk, sharing nothing. Grouping them only
@@ -179,6 +182,20 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stag
     if (lane == 0) out[r] = w;
   }
 }
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stage1_kernel(
+    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH) {
+    r4d_rowtopk_stage1_body<PT>(Y, P, N, RC, NCH, CH);
+}
+template <int PT>
+__global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4dchain_rowtopk_stage1(
+    const unsigned short* __restrict__ Y, unsigned long long* __restrict__ P,
+    int N, int RC, int NCH, int CH) {
+    r4d_chain_wait();
+    r4d_rowtopk_stage1_body<PT>(Y, P, N, RC, NCH, CH);
+    r4d_chain_done();
+}
 
 // `off` is the first global column this rank's plane stands for, and `OP` the optional (id, value)
 // pair plane an all-gather moves: eight bytes an entry, an int32 id in the first float slot, the
@@ -188,7 +205,8 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE * R4D_TOPK_WPB) void r4d_rowtopk_stag
 // An empty slot is not token `off`. A chunk that ran out of candidates leaves a zero key; OI gets
 // column 0 for it, without the offset, so a pad cannot look like this rank's first real token. The
 // pair plane writes -1, the sentinel the merge drops (not -INFINITY, a valid masked logit).
-__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below.
+__device__ __forceinline__ void r4d_rowtopk_stage2_body(
     const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
     float* __restrict__ OP, int off, int R, int n) {
   const int m = blockIdx.x;
@@ -220,6 +238,18 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
     }
   }
 }
+__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_stage2_kernel(
+    const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
+    float* __restrict__ OP, int off, int R, int n) {
+    r4d_rowtopk_stage2_body(P, OV, OI, OP, off, R, n);
+}
+__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_stage2(
+    const unsigned long long* __restrict__ P, float* __restrict__ OV, int* __restrict__ OI,
+    float* __restrict__ OP, int off, int R, int n) {
+    r4d_chain_wait();
+    r4d_rowtopk_stage2_body(P, OV, OI, OP, off, R, n);
+    r4d_chain_done();
+}
 
 // Chunks are a multiple of eight columns so stage 1 stays on the vector load; the last one is
 // clamped to N rather than padded (a padded tail would need a mask per element). The caller sizes
@@ -239,7 +269,7 @@ int r4d_rowtopk_bf16_chunks(int N, int NCH) {
 // so ranks can agree on a global top-R without gathering the plane.
 static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi, long outp,
                                      int M, int N, int R, int RC, int NCH, int PT1, int off,
-                                     RadStream stream) {
+                                     RadStream stream, bool chain = false) {
   int emit_rc = RAD_OK;
   // R <= PT2 is what makes stage 2 exact for any candidates; a real limit, so checked, not
   // clamped.
@@ -248,7 +278,8 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
     return R4D_NO(RAD_E_SHAPE);
   const int CH  = rowtopk_chunk_width(N, NCH);
   const int nch = (N + CH - 1) / CH;
-#define R4D_TK_S1(PT) emit_rc = R4D_EMIT(stream, (r4d_rowtopk_stage1_kernel<PT>),           \
+#define R4D_TK_S1(PT) emit_rc = R4D_EMIT(stream, (chain ? r4dchain_rowtopk_stage1<PT>           \
+                                                       : r4d_rowtopk_stage1_kernel<PT>),         \
                         dim3((nch + R4D_TOPK_WPB - 1) / R4D_TOPK_WPB, M),                        \
                         dim3(R4D_TOPK_WAVE * R4D_TOPK_WPB), 0,                                   \
                         (const unsigned short*)y, (unsigned long long*)partial, N, RC, nch, CH)
@@ -261,7 +292,8 @@ static int rowtopk_bf16_sharded_emit(long y, long partial, long outv, long outi,
   }
 #undef R4D_TK_S1
   if (emit_rc != RAD_OK) return emit_rc;
-  return R4D_EMIT(stream, r4d_rowtopk_stage2_kernel, dim3(M), dim3(R4D_TOPK_WAVE), 0,
+  return R4D_EMIT(stream, (chain ? r4dchain_rowtopk_stage2 : r4d_rowtopk_stage2_kernel), dim3(M),
+                  dim3(R4D_TOPK_WAVE), 0,
                   (const unsigned long long*)partial, (float*)outv, (int*)outi,
                   (float*)outp, off, R, nch * RC);
 }
@@ -284,7 +316,8 @@ __device__ __forceinline__ unsigned long long tk_key_f32(float v, unsigned id) {
   return ((unsigned long long)u << 32) | (unsigned)(0xFFFFFFFFu - id);
 }
 
-__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below.
+__device__ __forceinline__ void r4d_rowtopk_merge_body(
     const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
@@ -308,6 +341,16 @@ __global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
       OI[(size_t)m * R + r] = w ? tk_idx(w) : -1;
     }
   }
+}
+__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4d_rowtopk_merge_kernel(
+    const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
+    r4d_rowtopk_merge_body(G, OV, OI, R, n);
+}
+__global__ __launch_bounds__(R4D_TOPK_WAVE) void r4dchain_rowtopk_merge(
+    const float* __restrict__ G, float* __restrict__ OV, int* __restrict__ OI, int R, int n) {
+    r4d_chain_wait();
+    r4d_rowtopk_merge_body(G, OV, OI, R, n);
+    r4d_chain_done();
 }
 
 // ============================================================== logit_rerank
@@ -490,9 +533,11 @@ extern "C" int r4d_rad_rowtopk(const RadArgs* a, RadStream stream) {
         if (r4d_numel(pairs) < M * R * 2) return R4D_NO(RAD_E_SHAPE);
     }
 
+    /* The chained forms at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return rowtopk_bf16_sharded_emit(r4d_addr(x), (long)(uintptr_t)a->scratch, r4d_addr(val),
                                      r4d_addr(idx), pairs ? r4d_addr(pairs) : 0,
-                                     (int)M, (int)N, (int)R, RC, NCH, PT1, (int)off, stream);
+                                     (int)M, (int)N, (int)R, RC, NCH, PT1, (int)off, stream, ch);
 }
 
 /* ------------------------------------------------------------------ row_topk_merge
@@ -519,7 +564,8 @@ extern "C" int r4d_rad_rowtopk_merge(const RadArgs* a, RadStream s) {
     if (r4d_numel(idx) < M * R || r4d_numel(val) < M * R) return R4D_NO(RAD_E_SHAPE);
 
     /* R <= PT2 makes the merge exact for any candidates (one lane can hold the whole answer). */
-    return R4D_EMIT(s, r4d_rowtopk_merge_kernel, dim3((unsigned)M),
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    return R4D_EMIT(s, (ch ? r4dchain_rowtopk_merge : r4d_rowtopk_merge_kernel), dim3((unsigned)M),
                     dim3(R4D_TOPK_WAVE), 0, (const float*)g->data, (float*)val->data,
                     (int*)idx->data, (int)R, (int)(W * R));
 }

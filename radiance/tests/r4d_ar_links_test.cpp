@@ -77,8 +77,8 @@ std::string card(const Root& r, int i, const std::string& speed, int width) {
 
 struct Slot { const char* speed; int width; };
 
-/* The weights the eight cards give, or "unknown". */
-std::string weights(const Root& r, const Slot* slots) {
+/* The weights the eight cards give, or "unknown", by the quadratic rule or the duplex model. */
+std::string weights(const Root& r, const Slot* slots, bool duplex = false) {
     std::string bdf[8];
     for (int i = 0; i < 8; ++i) bdf[i] = card(r, i, slots[i].speed, slots[i].width);
     double gbs[8] = { 0 };
@@ -87,7 +87,8 @@ std::string weights(const Root& r, const Slot* slots) {
         if (r4d_ar_link_bottleneck(r.dir, bdf[i], &l)) gbs[i] = r4d_ar_link_gbs(l);
     }
     int w[8];
-    if (!r4d_ar_weights_from_rates(gbs, 8, w)) return "unknown";
+    if (!(duplex ? r4d_ar_weights_duplex(gbs, 8, w) : r4d_ar_weights_from_rates(gbs, 8, w)))
+        return "unknown";
     std::string s;
     for (int i = 0; i < 8; ++i) s += (i ? "," : "") + std::to_string(w[i]);
     return s;
@@ -121,6 +122,32 @@ TEST(repaired_links_give_four_and_one) {
     const Slot s[8] = { { G5, 16 }, { G5, 8 }, { G5, 16 }, { G5, 16 },
                         { G5, 8 }, { G5, 8 }, { G5, 16 }, { G5, 16 } };
     CHECK_EQ(weights(r, s), std::string("4,1,4,4,1,1,4,4"));
+}
+
+/* The duplex model on the board after the repair: x16 holds 2/9 of the message and x8 1/36, so
+ * each direction of every link carries the same time's bytes; on the earlier board the Gen4 x8
+ * cards hold nothing (they would need T B > N) and Gen5 x8 one seventh of x16. */
+TEST(the_duplex_model_balances_both_directions_of_every_link) {
+    Root r;
+    const Slot fixed[8] = { { G5, 16 }, { G5, 8 }, { G5, 8 }, { G5, 16 },
+                            { G5, 8 }, { G5, 8 }, { G5, 16 }, { G5, 16 } };
+    CHECK_EQ(weights(r, fixed, true), std::string("64,8,8,64,8,8,64,64"));
+    Root r2;
+    const Slot older[8] = { { G5, 16 }, { G5, 8 }, { G4, 8 }, { G5, 16 },
+                            { G4, 8 }, { G5, 8 }, { G5, 16 }, { G5, 16 } };
+    CHECK_EQ(weights(r2, older, true), std::string("64,9,0,64,0,9,64,64"));
+    Root r3;
+    Slot even[8];
+    for (Slot& x : even) x = { G5, 16 };
+    CHECK_EQ(weights(r3, even, true), std::string("64,64,64,64,64,64,64,64"));
+    /* The time each rank's bytes take, (1 + 6 x) / B, is the same for every rank with a shard. */
+    const double gbs[8] = { 63, 31.5, 31.5, 63, 31.5, 31.5, 63, 63 };
+    int w[8];
+    REQUIRE(r4d_ar_weights_duplex(gbs, 8, w));
+    double sum = 0;
+    for (int i = 0; i < 8; ++i) sum += w[i];
+    const double tf = (1 + 6 * w[0] / sum) / gbs[0], ts = (1 + 6 * w[1] / sum) / gbs[1];
+    CHECK(std::fabs(tf - ts) / tf < 1e-9);
 }
 
 TEST(equal_links_give_equal_weights) {

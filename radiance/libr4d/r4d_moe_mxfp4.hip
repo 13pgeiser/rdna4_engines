@@ -837,6 +837,228 @@ __global__ __launch_bounds__(128) void moe_mxfp4_expert_staged_kernel(
     }
 }
 
+/* The small-M form at GLM's TP8 slices: expert-major with the same per-element sequence as the two
+ * forms above, so their bytes. A verify pass of one stream routes 8 to 48 rows over as many
+ * experts, and there those forms spend their time around the loads: an expert's block was a long
+ * chain of short stages, and the blocks the LDS admitted came in rounds whose last one ran nearly
+ * empty. This form shortens and thins the chain:
+ *  - Block row y takes the y-th touched expert (a wave counts the non-empty runs by ballot), so the
+ *    grid has min(experts, rows) + 1 rows rather than one an expert, most of them idle.
+ *  - Weight codes stay packed in LDS and are decoded at the fragment read, which halves the
+ *    weight tile; gate_up stages 512 of K, so a stage reads 256 bytes of each weight row where the
+ *    256 stage read 128, and down reads its 128-byte rows whole over four column tiles.
+ *  - Loads are unconditional from clamped addresses and masked at the store, so a store waits for
+ *    its own stage and not the prefetch; weight rows load through global pointers, the barriers
+ *    order LDS only, and a 128 of K reads its activation scales and eight fragment pairs before its
+ *    WMMA chains. */
+template <int StageK>
+struct MxSmall {
+    static constexpr int Threads = 128, BN = 64, KB = StageK / 128, PA = StageK + 8,
+                         PB = StageK / 2 + 8;
+    static constexpr int AChunks = StageK / Threads, WChunks = BN * StageK / 32 / Threads,
+                         SChunks = (BN * KB + Threads - 1) / Threads;
+    mx_u4 a[AChunks], w[WChunks];
+    uint32_t s[SChunks];
+    float sa;
+    uint32_t ok;
+};
+template <int StageK, int ColTiles>
+__global__ __launch_bounds__(128) void moe_mxfp4_small_kernel(
+    const uint8_t* a, const float* as, const void* w0, const void* s0, const void* w1,
+    const void* s1, const int* sorted, const int* offset, uint16_t* y, MxMeta m) {
+    using St = MxSmall<StageK>;
+    constexpr int BN = St::BN, Threads = St::Threads, KB = St::KB, PA = St::PA, PB = St::PB;
+    static_assert(St::AChunks <= 8 && St::WChunks <= 16 && St::SChunks <= 4 &&
+                      16 * KB <= Threads && BN * PB >= 4 * 513,
+                  "stage chunks must fit the load mask and the offsets the weight tile");
+    __shared__ __align__(16) uint8_t aa[16 * PA], bb[BN * PB];
+    __shared__ uint32_t ss[BN * KB];
+    __shared__ float sa[16 * KB];
+    __shared__ int src[16];
+    __shared__ int pick;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int colb = blockIdx.x * (BN * ColTiles);
+    if ((int)blockIdx.y == (int)gridDim.y - 1) {
+        const int r0 = offset[m.experts];
+        for (long i = tid; i < (long)(m.T - r0) * BN * ColTiles; i += Threads) {
+            const int n = colb + (int)(i % (BN * ColTiles));
+            if (n < m.N) y[(long)(r0 + i / (BN * ColTiles)) * m.yr + n] = 0;
+        }
+        return;
+    }
+    {
+        // The offsets in the weight tile, whose bytes are free until the first stage.
+        int* offs = reinterpret_cast<int*>(bb);
+#pragma unroll
+        for (int q = 0; q < 5; ++q) {
+            const int x = tid + q * Threads;
+            if (x <= m.experts) offs[x] = offset[x];
+        }
+        lds_barrier();
+        if (wave == 0) {
+            int want = blockIdx.y, found = -1;
+            for (int base = 0; base < m.experts; base += 32) {
+                const int x = base + lane;
+                const bool live = x < m.experts && offs[x + 1] > offs[x];
+                const uint32_t mask = __builtin_amdgcn_ballot_w32(live);
+                const int n = __builtin_popcount(mask);
+                if (want < n) {
+                    const uint32_t below = mask & ((1u << lane) - 1u);
+                    found = base + __builtin_ctz(__builtin_amdgcn_ballot_w32(
+                                       live && __builtin_popcount(below) == want));
+                    break;
+                }
+                want -= n;
+            }
+            if (lane == 0) pick = found;
+        }
+        lds_barrier();
+    }
+    const int e = pick;
+    if (e < 0) return;
+    const int lo = offset[e], hi = offset[e + 1];
+    const int cls = e & 1, kc = m.k[cls], pw = m.N / m.parts, cw = m.n[cls] / m.parts;
+    const auto* w = entry(cls ? w1 : w0, m.wstep[cls], e / 2);
+    const auto* ws = entry(cls ? s1 : s0, m.sstep[cls], e / 2);
+    const int ksn = (kc + StageK - 1) / StageK, tiles = min(ColTiles, (m.N - colb + BN - 1) / BN),
+              S = tiles * ksn;
+    const int rowbase = (lane >> 4) * 8, mycol = wave * 16 + (lane & 15);
+    auto wrow = [&](int n, bool& valid) {
+        const int within = n % pw;
+        valid = n < m.N && within < cw;
+        return (n / pw) * cw + within;
+    };
+    for (int r0 = lo; r0 < hi; r0 += 16) {
+        lds_barrier();
+        if (tid < 16) {
+            const int r = r0 + tid, flat = r < hi ? sorted[r] : -1;
+            const int ar = flat < 0 ? -1 : m.sorted_a ? r : flat / m.topk;
+            src[tid] = ar >= 0 && ar < m.Arows ? ar : -1;
+        }
+        lds_barrier();
+        bool rv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) rv[j] = src[rowbase + j] >= 0;
+        auto load = [&](int s, St& L) {
+            const int col0 = colb + (s / ksn) * BN, k0 = (s % ksn) * StageK;
+            uint32_t ok = 0;
+#pragma unroll
+            for (int i = 0; i < St::AChunks; ++i) {
+                const int j = tid + i * Threads, r = j / (StageK / 16),
+                          d = (j % (StageK / 16)) * 16, ar = src[r];
+                const bool v = ar >= 0 && k0 + d < kc;
+                __builtin_memcpy(&L.a[i], a + (v ? (long)ar * m.ar + k0 + d : 0), 16);
+                ok |= (uint32_t)v << i;
+            }
+#pragma unroll
+            for (int i = 0; i < St::WChunks; ++i) {
+                const int j = tid + i * Threads, c = j / (StageK / 32),
+                          d = (j % (StageK / 32)) * 16;
+                bool valid;
+                const int wn = wrow(col0 + c, valid);
+                const bool v = valid && k0 + 2 * d < kc;
+                const r4d_u32x4 q = mx_ldg16(w + (v ? (long)wn * m.wrow[cls] + k0 / 2 + d : 0));
+                L.w[i] = mx_u4{ q[0], q[1], q[2], q[3] };
+                ok |= (uint32_t)v << (8 + i);
+            }
+#pragma unroll
+            for (int i = 0; i < St::SChunks; ++i) {
+                const int j = tid + i * Threads, c = j / KB, kb = k0 + (j % KB) * 128;
+                bool valid;
+                const int wn = wrow(col0 + c, valid);
+                const bool v = j < BN * KB && valid && kb < kc;
+                L.s[i] = mx_ldg4(ws + (v ? (long)wn * m.srow[cls] + kb / 32 : 0));
+                ok |= (uint32_t)v << (24 + i);
+            }
+            {
+                const int ar = src[(tid / KB) & 15], kb = k0 + (tid % KB) * 128;
+                const bool v = tid < 16 * KB && ar >= 0 && kb < kc;
+                L.sa = as[v ? (long)ar * m.asr + kb / 128 : 0];
+                ok |= (uint32_t)v << 28;
+            }
+            L.ok = ok;
+        };
+        auto store = [&](const St& L) {
+#pragma unroll
+            for (int i = 0; i < St::AChunks; ++i) {
+                const int j = tid + i * Threads, r = j / (StageK / 16),
+                          d = (j % (StageK / 16)) * 16;
+                *reinterpret_cast<mx_u4*>(aa + r * PA + d) =
+                    (L.ok >> i) & 1u ? L.a[i] : mx_u4{ 0, 0, 0, 0 };
+            }
+#pragma unroll
+            for (int i = 0; i < St::WChunks; ++i) {
+                const int j = tid + i * Threads, c = j / (StageK / 32),
+                          d = (j % (StageK / 32)) * 16;
+                const mx_u4 q = (L.ok >> (8 + i)) & 1u ? L.w[i] : mx_u4{ 0, 0, 0, 0 };
+                *reinterpret_cast<uint2*>(bb + c * PB + d) = uint2{ q[0], q[1] };
+                *reinterpret_cast<uint2*>(bb + c * PB + d + 8) = uint2{ q[2], q[3] };
+            }
+#pragma unroll
+            for (int i = 0; i < St::SChunks; ++i) {
+                const int j = tid + i * Threads;
+                if (j < BN * KB) ss[j] = (L.ok >> (24 + i)) & 1u ? L.s[i] : 0x7f7f7f7fu;
+            }
+            if (tid < 16 * KB) sa[(tid % KB) * 16 + tid / KB] = (L.ok >> 28) & 1u ? L.sa : 0.f;
+        };
+        auto total = r4d_fp8::acc_zero();
+        auto compute = [&](int s) {
+            const int k0 = (s % ksn) * StageK;
+#pragma unroll
+            for (int kb = 0; kb < KB; ++kb) {
+                if (k0 + kb * 128 >= kc) break;
+                const uint32_t exps = ss[mycol * KB + kb];
+                float act[8];
+#pragma unroll
+                for (int row = 0; row < 8; ++row) act[row] = sa[kb * 16 + rowbase + row];
+                r4d_fp8::i2v fa[8], fb[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const int k = kb * 128 + 16 * t;
+                    fa[t] = r4d_fp8::frag<StageK>(aa, 0, k, lane);
+                    const uint2 v = mx_codes8(
+                        *reinterpret_cast<const uint32_t*>(bb + mycol * PB + (k + rowbase) / 2));
+                    fb[t] = r4d_fp8::i2v{ (int)v.x, (int)v.y };
+                }
+                r4d_fp8::f8v raw[4];
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                    raw[g] = r4d_fp8::mma(fa[2 * g], fb[2 * g], r4d_fp8::acc_zero());
+#pragma unroll
+                for (int g = 0; g < 4; ++g) raw[g] = r4d_fp8::mma(fa[2 * g + 1], fb[2 * g + 1], raw[g]);
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    const uint32_t exp = (exps >> (8 * g)) & 0xffu;
+                    const float scale = __uint_as_float(exp == 255 ? 0x7fc00000u
+                                                        : exp      ? (exp << 23)
+                                                                   : 0x00400000u);
+#pragma unroll
+                    for (int row = 0; row < 8; ++row)
+                        if (rv[row]) total[row] += raw[g][row] * act[row] * scale;
+                }
+            }
+            if (s % ksn == ksn - 1) {
+                const int n = colb + (s / ksn) * BN + mycol;
+#pragma unroll
+                for (int row = 0; row < 8; ++row) {
+                    const int r = r0 + rowbase + row;
+                    if (r < hi && n < m.N) y[(long)r * m.yr + n] = f32_to_bf16(total[row]);
+                }
+                total = r4d_fp8::acc_zero();
+            }
+        };
+        St L;
+        load(0, L);
+        for (int s = 0; s < S; ++s) {
+            store(L);
+            lds_barrier();
+            if (s + 1 < S) load(s + 1, L);
+            compute(s);
+            lds_barrier();
+        }
+    }
+}
+
 int table(const RadTensor* t, uint32_t dtype, int bits, long experts, long n, long k, long* step,
           int* row) {
     if (!t || !t->data || t->rank != 3 || t->dtype != dtype || t->shape[0] < experts ||
@@ -934,6 +1156,23 @@ int body(const RadArgs* a, RadStream stream) {
         if (wide) return MX_P64(64, 128, 128, 1, false);
         return bm == 64 ? MX_P64(64, 64, 256, 1, false) : MX_P64(32, 64, 256, 1, false);
 #undef MX_P64
+    }
+    /* The small-M form at GLM's TP8 slices, ahead of the expert-major band: gate_up up to 384
+     * routed rows, down up to 32, where it stops gaining (at 5 to 8 tokens it reads 3 to 5 %
+     * slower than the staged form). Measured at those slices (perfmx, cold), expert-major against
+     * small-M: gate_up at 1, 3, 6, 8, 16 and 48 tokens 36.8/31.4, 79.5/69.5, 120.5/101.4,
+     * 145.0/122.4, 230.3/206.8 and 416.7/390.0 us; down at 1, 2 and 4 tokens 21.2/16.4, 26.0/22.5
+     * and 39.5/37.9 us. */
+    if (tp8 && m.T <= (m.K <= 256 ? 32 : 384)) {
+        const long rows = std::min<long>(m.experts, m.T) + 1;
+#define MX_SMALL(SK, CT)                                                                           \
+    R4D_EMIT(stream, (moe_mxfp4_small_kernel<SK, CT>),                                             \
+             dim3(((long)m.N + 64 * CT - 1) / (64 * CT), rows), dim3(128), 0,                      \
+             (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data,             \
+             w[1]->data, s[1]->data, (const int*)sorted->data, (const int*)off->data,              \
+             (uint16_t*)y->data, m)
+        return m.K <= 256 ? MX_SMALL(256, 4) : MX_SMALL(512, 1);
+#undef MX_SMALL
     }
     /* The expert-major form up to a routed-row bound per projection (token rows: gate_up, sorted
      * rows: down), measured at GLM's TP8 slices: gate_up up to 768 rows, where the prefill form

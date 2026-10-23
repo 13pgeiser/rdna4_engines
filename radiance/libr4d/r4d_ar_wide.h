@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include "r4d_ar_seq.h"
+#include "r4d_ar_shards.h"
 
 #define R4D_AR_SPIN_MAX 4000000000ULL
 #define R4D_AR_WIDE_MAX_BLOCKS 64
@@ -54,7 +55,9 @@ __device__ __forceinline__ void r4d_ar_drain(int drain) {
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
 }
 // acq: 0 acquire-only fence (global_inv, no writeback half), 1 full threadfence_system,
-// 2 none -- fine-grained scratch only.
+// 2 none -- fine-grained scratch only. Every thread of the block runs it after the handshake, so at
+// 0 or 1 that is one system-scope invalidate a wave. The P2P scratch is fine-grained (the reads
+// bypass L2; r4d_ar_entry.hip's allocation says why), so 2 is the documented design there.
 __device__ __forceinline__ void r4d_ar_acquire(int acq) {
   if (acq == 1) __threadfence_system();
   else if (acq != 2) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
@@ -64,17 +67,31 @@ __device__ __forceinline__ void r4d_ar_acquire(int acq) {
 // words has reached or passed it (peers may be a step ahead; counters only grow). One spin lane
 // per source, wrap-safe monotonic compare, never equality. Every rank publishes before it waits,
 // so there is no cycle; a handshake that cannot complete traps.
+//
+// `tl`, when not null, takes two wall-clock stamps: when the whole block has issued and drained
+// its stores, and when every peer's flag has been seen. A diagnostic: the eight-rank two-shot
+// passes it only for a launch asking for its timeline (r4d_ar_tl_stamp).
 template <int WS, typename S, int NPEERS>
 __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>& peers,
                                                  unsigned int* __restrict__ my_flags, int b,
                                                  int rank, unsigned int val, int drain, int acq,
-                                                 int pub) {
+                                                 int pub, long long* tl = nullptr) {
   r4d_ar_drain(drain);
   __syncthreads();
   const int tid = threadIdx.x;
+  if (tl && tid == 0) tl[0] = (long long)wall_clock64();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
-    if (pub) {
+    if (pub == 2) {
+      // No release fence: the flags go out behind the data with nothing written back. Meant for
+      // a P2P instance with drain 3, on the reasoning that fine-grained scratch stores reach past
+      // L2. They do not: on 4x R9700 the readers saw stale scratch on nearly every element
+      // (r4d_selftest, 2026-10-17), so no tuned point selects pub 2 (tArQ84); it is kept only
+      // as the measured negative.
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p)
+        r4d_ar_store_sys_rlx(&peers.flags[p][(size_t)b * WS + rank], val);
+    } else if (pub) {
       // One system writeback for the whole publish, then relaxed stores. Per-peer release stores
       // would add writebacks that order nothing, since the flags go to different peers.
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
@@ -96,7 +113,58 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
     }
   }
   __syncthreads();
+  if (tl && tid == 0) tl[1] = (long long)wall_clock64();
   r4d_ar_acquire(acq);
+}
+
+// The two halves of r4d_ar_handshake, for a kernel that tells its peers how far it has come before
+// it needs to know how far they have (the eight-rank two-shot's split form). Publish: once this
+// block's stores have drained, every peer's word [b][rank] takes `val`.
+template <int WS, typename S, int NPEERS>
+__device__ __forceinline__ void r4d_ar_publish(const R4DArWidePeers<S, NPEERS>& peers, int b,
+                                               int rank, unsigned int val, int drain, int pub) {
+  r4d_ar_drain(drain);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (drain == 2) __threadfence_system();
+    if (pub) {
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p)
+        r4d_ar_store_sys_rlx(&peers.flags[p][(size_t)b * WS + rank], val);
+    } else {
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p)
+        r4d_ar_store_sys_rel(&peers.flags[p][(size_t)b * WS + rank], val);
+    }
+  }
+}
+
+// Await: wait until each of this block's words from every peer has reached `val`, then acquire
+// what they published before it. `tl` as r4d_ar_handshake's, stamped on entry and on release.
+template <int WS, typename S, int NPEERS>
+__device__ __forceinline__ void r4d_ar_await(const R4DArWidePeers<S, NPEERS>& peers,
+                                             unsigned int* __restrict__ my_flags, int b,
+                                             unsigned int val, int acq, long long* tl = nullptr) {
+  const int tid = threadIdx.x;
+  if (tl && tid == 0) tl[0] = (long long)wall_clock64();
+  if (tid < NPEERS) {
+    const unsigned int* f = &my_flags[(size_t)b * WS + peers.rank[tid]];
+    unsigned long long z = 0;
+    while ((int)(r4d_ar_load_sys_rlx(f) - val) < 0) {
+      __builtin_amdgcn_s_sleep(2);
+      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();  // lockstep violation
+    }
+  }
+  __syncthreads();
+  if (tl && tid == 0) tl[1] = (long long)wall_clock64();
+  r4d_ar_acquire(acq);
+}
+
+// The two-shot timeline (layout in r4d_ar_shards.h), one stamp of the device wall clock.
+static_assert(R4D_AR_TL_BLOCKS == R4D_AR_WIDE_MAX_BLOCKS, "r4d_ar_shards.h restates the ceiling");
+__device__ __forceinline__ void r4d_ar_tl_stamp(long long* tl, int i) {
+  if (tl && threadIdx.x == 0) tl[i] = (long long)wall_clock64();
 }
 
 // Host side: checks stride and grid against the real allocations. Every scratch, flag and seq

@@ -96,7 +96,9 @@ class IdleTiers {
 public:
     struct Config {
         int64_t host_cap_bytes  = 0;   /* 0 is off */
-        int64_t entry_bytes     = 0;   /* one entry: sum over cached groups of bytes_per_block */
+        /* One host slot: every cached group's bytes_per_block, under tensor parallelism every
+         * rank's own shard end to end and a replicated group once (TierExec::SlotLayout). */
+        int64_t entry_bytes     = 0;
         /* ---- the linear half ----
          * `ckpt_bytes` is one snapshot including every rank's shard, like `entry_bytes`. The
          * snapshots live in the engine's checkpoint store, `ckpt_slots` deep; reported here, not

@@ -5,6 +5,9 @@
 # batch and context for an image generator itself (docs/GUIDE.md §5.6). --tp-wire wht6 sends the
 # DiT's all-reduces as 6-bit: about 10% faster per picture at a cost of a few tenths of a dB
 # against diffusers; drop it for the exact wire.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/qwen-image and add `--lora-dir /models/loras/qwen-image` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
 name: radiance-qwen-image
 services:
   radiance:

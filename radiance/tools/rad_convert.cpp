@@ -121,6 +121,13 @@ void usage() {
         "                       Declare checks the recipe against the kernels it resolves\n"
         "      --tokenizer F    tokenizer.json; its declared chain is baked instead of being\n"
         "                       reconstructed from a pre-tokenizer name\n"
+        "      --tokenizer2 F   a second tokenizer.json, baked as the container's second vocab:\n"
+        "                       a generator that reads its prompt through two tokenizers\n"
+        "      --add FILE       one more .safetensors file merged into the checkpoint, its tensor\n"
+        "                       names kept: a release shipped as separate single files (a\n"
+        "                       diffusion model, a text encoder and a VAE). Repeatable\n"
+        "      --config DIR     read config.json, generation_config.json and tokenizer.json from\n"
+        "                       DIR, for a single-file checkpoint that ships none of them\n"
         "      --imatrix F      llama.cpp imatrix: the expert-popularity profile, the column\n"
         "                       importances handed to each quantiser, and the weighting of the\n"
         "                       error report\n"
@@ -180,6 +187,8 @@ int for_row_pieces(int64_t n, bool parallel, std::string* why, F fn) {
 
 int main(int argc, char** argv) {
     std::string in, out, arch_override, home = rad_home(), tokjson, imat_path, draft_dir;
+    std::string tokjson2, config_dir;
+    std::vector<std::string> add_files;
     std::vector<std::string> hierarchy = rad_hierarchy_from_env();
     std::vector<std::string> recipe_files, quant_flags;
     int64_t  max_tok = 8192;
@@ -214,6 +223,9 @@ int main(int argc, char** argv) {
         else if (a == "--home")      home = next("--home");
         else if (a == "--kernels")   hierarchy = rad_split_list(next("--kernels"));
         else if (a == "--tokenizer") tokjson = next("--tokenizer");
+        else if (a == "--tokenizer2") tokjson2 = next("--tokenizer2");
+        else if (a == "--add")       add_files.push_back(next("--add"));
+        else if (a == "--config")    config_dir = next("--config");
         else if (a == "--imatrix")   imat_path = next("--imatrix");
         else if (a == "--set") {
             const std::string kv = next("--set");
@@ -331,7 +343,12 @@ int main(int argc, char** argv) {
 
     /* ---------------------------------------------------------------- source */
     Checkpoint ck;
+    if (!config_dir.empty()) ck.set_meta_dir(config_dir);
     if (ck.open(in) < 0) return 1;
+    for (const std::string& f : add_files) {
+        if (ck.add_file(f) < 0) return 1;
+        RAD_INFO("added    %s", f.c_str());
+    }
     MetaOwn& meta = ck.meta();
     /* Merge the drafter before declare: the architecture plugin declares a draft block only if
      * `draft.architectures` is present. */
@@ -899,6 +916,17 @@ int main(int argc, char** argv) {
     if (w.set_vocab_section(vocab_blob.data(), (int64_t)vocab_blob.size()) < 0) {
         w.abort();
         return 1;
+    }
+    if (!tokjson2.empty()) {
+        VocabBuild vb2;
+        RAD_INFO("vocab 2  %s", tokjson2.c_str());
+        if (parse_tokenizer_json(tokjson2.c_str(), vb2) < 0) { w.abort(); return 1; }
+        std::vector<uint8_t> blob2;
+        if (vocab_serialize(vb2, sink, 0, blob2) < 0 ||
+            w.set_aux_vocab_section(blob2.data(), (int64_t)blob2.size()) < 0) {
+            w.abort();
+            return 1;
+        }
     }
 
     /* ---------------------------------------------------------------- expert profile */

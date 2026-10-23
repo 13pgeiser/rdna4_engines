@@ -928,7 +928,35 @@ int Builder::kv_group_zero(rad_kvgroup h) {
             prog_.kv_groups[h].name.c_str());
         return RAD_E_INVAL;
     }
+    if (prog_.kv_groups[h].replicated) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_zero on a group declared replicated; a "
+            "replicated group is held whole on every rank", prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
     prog_.kv_groups[h].zero = true;
+    return RAD_OK;
+}
+
+int Builder::kv_group_replicated(rad_kvgroup h) {
+    if (finished_) {
+        err(RAD_E_STATE, "kv_group_replicated after declare finished");
+        return RAD_E_STATE;
+    }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    /* Paged groups only: the tiers move blocks. A linear or conv group's state travels in the
+     * checkpoint store, which has no such window. */
+    const int kind = prog_.kv_groups[h].decl.kind;
+    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_replicated on a group that is not paged",
+            prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    if (prog_.kv_groups[h].zero) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_replicated on a group declared zero; a zero "
+            "rank holds none of it", prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].replicated = true;
     return RAD_OK;
 }
 
@@ -942,7 +970,7 @@ int Builder::decl_name_map(const RadNameMap* m) {
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
         m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
-        m->mode != RAD_MAP_TAP) {
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -953,9 +981,11 @@ int Builder::decl_name_map(const RadNameMap* m) {
                                    : "the magnitude and the direction", m->n_src);
         return RAD_E_INVAL;
     }
-    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP) && m->n_src != 1) {
+    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&
+        m->n_src != 1) {
         err(RAD_E_INVAL, "name map for '%s': a %s map names one source, not %d", m->declared,
-            m->mode == RAD_MAP_TAP ? "tap" : "transpose", m->n_src);
+            m->mode == RAD_MAP_TAP ? "tap" : m->mode == RAD_MAP_COLS ? "column" : "transpose",
+            m->n_src);
         return RAD_E_INVAL;
     }
 
@@ -984,14 +1014,20 @@ int Builder::decl_name_map(const RadNameMap* m) {
                     m->declared, i, m->src_index[i], (long long)m->src_rows[i]);
                 return RAD_E_INVAL;
             }
+    if (m->mode == RAD_MAP_COLS && (m->src_index[0] < 0 || m->src_rows[0] <= 0)) {
+        err(RAD_E_INVAL, "name map for '%s': the column range starts at %d and holds %lld columns",
+            m->declared, m->src_index[0], (long long)m->src_rows[0]);
+        return RAD_E_INVAL;
+    }
 
-    /* A CONCAT map may be declared in pieces; any other repeat is an error.
+    /* A CONCAT, ROWS or EMA map may be declared in pieces; any other repeat is an error.
      *
      * `src[8]` is the ABI's cap, and a sharded checkpoint exceeds it: Qwen3.8-Flash-Next stores
      * its n-gram embedding as 128 tensors `...ngram_embedding.shard_K.weight`. Growing the array
      * would cost ~80 MB of Program (one map per declared weight, ~50K weights). So successive
      * CONCAT maps for one name extend it in call order, and rad-convert joins their sources end
-     * to end (map_concat_shards() in arch/common/rad_arch.h).
+     * to end (map_concat_shards() in arch/common/rad_arch.h). ROWS maps extend the same way (a
+     * row permutation is one piece a row).
      *
      * Other repeats are refused: a lookup built with std::map::emplace would silently keep the
      * first, so a copy-paste mistake would convert weights from the wrong tensors. */
@@ -999,11 +1035,12 @@ int Builder::decl_name_map(const RadNameMap* m) {
     if (seen != name_map_first_.end()) {
         const RadNameMap& first = prog_.name_map[seen->second];
         const bool joins = (c.mode == RAD_MAP_CONCAT && first.mode == RAD_MAP_CONCAT) ||
-                           (c.mode == RAD_MAP_EMA && first.mode == RAD_MAP_EMA);
+                           (c.mode == RAD_MAP_EMA && first.mode == RAD_MAP_EMA) ||
+                           (c.mode == RAD_MAP_ROWS && first.mode == RAD_MAP_ROWS);
         if (!joins) {
-            err(RAD_E_INVAL, "name map for '%s': declared twice, and only a CONCAT or EMA map may "
-                             "be extended -- a repeated COPY map means two sources for one weight, "
-                             "and which one wins is not something a declaration can express",
+            err(RAD_E_INVAL, "name map for '%s': declared twice, and only a CONCAT, ROWS or EMA "
+                             "map may be extended -- a repeated COPY map means two sources for one "
+                             "weight, and which one wins is not something a declaration can express",
                 c.declared);
             return RAD_E_INVAL;
         }
@@ -1232,7 +1269,32 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
             (long long)d->default_height, (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    if (d->n_sigmas < 0 || (d->n_sigmas > 0 && !d->sigmas) ||
+    if (d->train_steps < 0) {
+        err(RAD_E_INVAL, "declare_generator '%s': train_steps %d is negative", nm,
+            (int)d->train_steps);
+        return RAD_E_INVAL;
+    }
+    if (d->train_steps > 0) {
+        /* A discrete-time denoiser: its own schedule, a sampler it serves by default. */
+        const uint32_t all = (1u << RAD_GEN_SAMPLER_COUNT) - 1;
+        if (d->train_steps < 2 || !(d->beta_start > 0) || !(d->beta_end > d->beta_start) ||
+            !(d->beta_end < 1) ||
+            (d->beta_schedule != RAD_GEN_BETAS_SCALED_LINEAR &&
+             d->beta_schedule != RAD_GEN_BETAS_LINEAR) ||
+            d->n_sigmas != 0 || d->default_steps <= 0 || (d->samplers & ~all) || !d->samplers ||
+            d->default_sampler < 0 || d->default_sampler >= RAD_GEN_SAMPLER_COUNT ||
+            !(d->samplers & (1u << d->default_sampler)) || d->default_scheduler < 0 ||
+            d->default_scheduler >= RAD_GEN_SCHED_COUNT ||
+            !(d->default_cfg >= (d->cfg_original ? 0.0 : 1.0))) {
+            err(RAD_E_INVAL, "declare_generator '%s': the discrete-time sampler is incomplete (%d "
+                             "timesteps, betas %g..%g kind %d, %lld default steps, samplers 0x%x "
+                             "default %d, scheduler %d, %d fixed sigmas, guidance %g)", nm,
+                (int)d->train_steps, d->beta_start, d->beta_end, (int)d->beta_schedule,
+                (long long)d->default_steps, (unsigned)d->samplers, (int)d->default_sampler,
+                (int)d->default_scheduler, (int)d->n_sigmas, d->default_cfg);
+            return RAD_E_INVAL;
+        }
+    } else if (d->n_sigmas < 0 || (d->n_sigmas > 0 && !d->sigmas) ||
         (d->n_sigmas == 0 && d->default_steps <= 0) ||
         !(d->default_cfg >= (d->cfg_original ? 0.0 : 1.0)) ||
         (d->dyn_shift && (d->max_seq <= d->base_seq || d->base_seq <= 0)) ||
@@ -1242,6 +1304,23 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
                          "guidance %g)", nm, (int)d->n_sigmas, (long long)d->default_steps,
             d->shift, (int)d->dyn_shift, (long long)d->base_seq, (long long)d->max_seq,
             d->shift_terminal, d->default_cfg);
+        return RAD_E_INVAL;
+    }
+    if (d->sigma_grid < 0 || d->min_tokens < 0 || (d->aux_tokens && d->aux_max_tokens <= 0)) {
+        err(RAD_E_INVAL, "declare_generator '%s': sigma_grid %d, min_tokens %d and a second "
+                         "tokenizer of at most %lld tokens are not a schedule and a prompt it can "
+                         "read", nm, (int)d->sigma_grid, (int)d->min_tokens,
+            (long long)d->aux_max_tokens);
+        return RAD_E_INVAL;
+    }
+    if (d->chunk_tokens < 0 ||
+        (d->chunk_tokens > 0 &&
+         (!joint || d->pad_multiple != 0 || d->pad_token < 0 || d->chunk_bos < 0 ||
+          d->chunk_eos < 0 || d->cond_rows % (d->chunk_tokens + 2) != 0))) {
+        err(RAD_E_INVAL, "declare_generator '%s': a prompt in windows of %d tokens needs the joint "
+                         "layout without pad_multiple, bos, eos and pad tokens, and cond_rows a "
+                         "whole number of windows (cond_rows %lld)", nm, (int)d->chunk_tokens,
+            (long long)d->cond_rows);
         return RAD_E_INVAL;
     }
     for (int i = 0; i < d->n_sigmas; ++i)
@@ -1764,6 +1843,69 @@ int Builder::drafter_shared_kv(int pos_offset) {
     return RAD_OK;
 }
 
+int Builder::lora_root(const char* native, const char* spellings) {
+    if (finished_) {
+        err(RAD_E_STATE, "lora_root after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!native || !*native) {
+        err(RAD_E_INVAL, "lora_root: an empty checkpoint prefix would put every tensor in one "
+                         "network; name the prefix the network's tensors share");
+        return RAD_E_INVAL;
+    }
+    for (const LoraRoot& r : prog_.lora_roots)
+        if (r.native == native) {
+            err(RAD_E_INVAL, "lora_root '%s' declared twice", native);
+            return RAD_E_INVAL;
+        }
+    LoraRoot r;
+    r.native = native;
+    std::string cur;
+    for (const char* p = spellings ? spellings : "";; ++p) {
+        if (*p && *p != ' ') { cur += *p; continue; }
+        if (!cur.empty()) r.spellings.push_back(cur == "-" ? std::string() : cur);
+        cur.clear();
+        if (!*p) break;
+    }
+    prog_.lora_roots.push_back(std::move(r));
+    return RAD_OK;
+}
+
+int Builder::lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
+                        int64_t from_hi, int64_t to_lo) {
+    if (finished_) {
+        err(RAD_E_STATE, "lora_alias after declare finished");
+        return RAD_E_STATE;
+    }
+    bool root = false;
+    for (const LoraRoot& r : prog_.lora_roots) root = root || (native && r.native == native);
+    if (!root) {
+        err(RAD_E_INVAL, "lora_alias '%s': its root '%s' is not declared (rad_lora_root first)",
+            from ? from : "", native ? native : "");
+        return RAD_E_INVAL;
+    }
+    if (!from || !*from || !to || !*to) {
+        err(RAD_E_INVAL, "lora_alias under '%s': an empty module path", native);
+        return RAD_E_INVAL;
+    }
+    auto hashes = [](const char* s) { int n = 0; for (; *s; ++s) n += *s == '#'; return n; };
+    if (hashes(from) != hashes(to)) {
+        err(RAD_E_INVAL, "lora_alias '%s' -> '%s': %d index placeholders against %d", from, to,
+            hashes(from), hashes(to));
+        return RAD_E_INVAL;
+    }
+    if (from_lo < 0 || to_lo < 0 || (from_hi != 0 && from_hi <= from_lo)) {
+        err(RAD_E_INVAL, "lora_alias '%s' -> '%s': rows [%lld, %lld) to %lld", from, to,
+            (long long)from_lo, (long long)from_hi, (long long)to_lo);
+        return RAD_E_INVAL;
+    }
+    LoraAlias a;
+    a.root = native; a.from = from; a.to = to;
+    a.from_lo = from_lo; a.from_hi = from_hi; a.to_lo = to_lo;
+    prog_.lora_aliases.push_back(std::move(a));
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -1852,6 +1994,8 @@ void Builder::finish_layouts() {
                     const int st = ki->layout ? ki->layout(r.geom.params(), r.geom.n_params(),
                                                            operand, &w.enc, w.sel, t, w.n_sel, &L)
                                               : RAD_E_UNSUPPORTED;
+                    /* Reads the bytes uninterpreted (a prefetch): no claim (rad_abi.h). */
+                    if (st == RAD_LAYOUT_ANY) continue;
                     char enc[256];
                     rad_enc_format(&w.enc, enc, sizeof enc);
                     if (st == RAD_E_DTYPE) {
@@ -2203,6 +2347,11 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     return B(b)->kv_group_zero(g);
 }
 
+int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_replicated(g);
+}
+
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
     if (!b) return RAD_E_INVAL;
     return B(b)->decl_name_map(m);
@@ -2227,6 +2376,19 @@ int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_shared_kv(pos_offset);
 }
+
+int rad_lora_root(RadBuilder* b, const char* native, const char* spellings) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lora_root(native, spellings);
+}
+
+int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
+                   int64_t from_lo, int64_t from_hi, int64_t to_lo) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lora_alias(native, from, to, from_lo, from_hi, to_lo);
+}
+
+int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;

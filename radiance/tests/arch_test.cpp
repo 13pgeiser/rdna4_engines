@@ -10,437 +10,11 @@
  */
 #define RAD_ARCH_NO_EXPORTS 1
 
-#include "rad_test.h"
+#include "arch_fakes.h"
 
-#include "rad_builder.h"
-#include "rad_device.h"
-#include "rad_runtime.h"
-
-#include <algorithm>
-#include <cstdarg>
-#include <cmath>
-#include <cstdlib>
-#include <cstring>
-#include <dlfcn.h>
-#include <map>
-#include <memory>
-#include <set>
-#include <string>
-#include <vector>
 #include <array>
+#include <dlfcn.h>
 #include <thread>
-
-/* ==================================================================== the recording builder */
-namespace {
-
-struct RecParam {
-    std::string key;
-    int         kind = 0;
-    long long   ival = 0, ihi = 0;
-    double      dval = 0.0;
-    std::string sval;
-};
-
-struct RecWeight {
-    std::string     name;
-    RadWeightDecl   d{};
-    /* The uneven slice this weight was handed (rad_weight_shard_span), in the container's
-     * unsharded units, so tests can check which checkpoint rows each rank reads. Even shards have
-     * `span_set` false. */
-    bool            span_set = false;
-    int64_t         span_lo = 0, span_hi = 0;
-    /* rad_weight_shard_span_parts, recorded likewise. */
-    int             n_part_spans = 0;
-    int64_t         part_lo[RAD_MAX_ROW_PARTS] = {0}, part_hi[RAD_MAX_ROW_PARTS] = {0};
-    int64_t         part_total[RAD_MAX_ROW_PARTS] = {0};
-};
-struct RecBuf    { std::string name; RadBufDecl    d{}; };
-struct RecOp {
-    std::string             op;
-    std::vector<RecParam>   p;
-    std::vector<rad_weight> w;
-    std::vector<rad_buf>    reads, writes;
-    bool                    resolved = true;
-    bool                    uses_declared = false;   /* rad_op_reads/writes were called */
-};
-struct RecMap {
-    std::string              declared;
-    int                      mode = 0;
-    std::vector<std::string> src;
-    int                      concat_dim = 0;
-};
-struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; };
-struct RecIssue {
-    rad_op                  op = 0;
-    std::vector<RadOperand> opd;
-    int64_t                 n = 0;
-    int                     lane = 0;   /* the lane it was issued on (rad_lane) */
-};
-/* A rad_lane_join: `to` behind everything `from` issued before issue number `at`. */
-struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
-
-}  /* namespace */
-
-struct RadBuilder {
-    std::vector<RecWeight> weights;
-    std::vector<RecBuf>    bufs;
-    std::vector<RecOp>     ops;
-    std::vector<RecMap>    maps;
-    std::vector<RecKV>     kv_groups;
-    std::vector<std::pair<int, rad_kvgroup>> binds;
-    std::vector<std::string> notes;
-
-    /* Ops the fake kernel hierarchy refuses, to drive the fused-op fallback; and ops no loaded
-     * library declares (rad_op_declared), as without an optional library. */
-    std::set<std::string> refuse;
-    std::set<std::string> undeclared;
-    /* When set, the only ops any loaded library declares (a CPU-only engine's: libref's
-     * vocabulary); every other op is undeclared. */
-    const std::set<std::string>* vocab = nullptr;
-    std::vector<std::string> asked_undeclared;   /* what a real engine would refuse */
-    bool declared(const std::string& op) const {
-        return vocab ? vocab->count(op) != 0 : undeclared.count(op) == 0;
-    }
-    int64_t kv_block = 16;
-
-    /* The buffer the plugin named as this step's logits (rad_declare_logits), or as its pooled
-     * output (rad_declare_pooled). */
-    rad_buf logits = 0;
-    rad_buf pooled = 0;
-
-    /* The draft head's declaration (rad_declare_drafter), and whether it keeps no cache of its
-     * own (rad_drafter_shared_kv) and at which rotary offset. */
-    RadDrafterDecl drafter{};
-    std::string    drafter_name;
-    bool           drafter_shared = false;
-    int            drafter_pos = -1;
-
-    /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
-    std::vector<rad_buf> concurrent;
-
-    /* The vision and audio encoder declarations (rad_declare_encoder), if any. */
-    RadEncoderDecl encoder{};
-    std::string    encoder_name;
-    RadEncoderDecl audio_encoder{};
-    std::string    audio_encoder_name;
-
-    /* The image generator's declaration (rad_declare_generator), if any. */
-    RadGeneratorDecl generator{};
-    std::string      generator_name;
-
-    /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
-     * means no model, so every weight is plain in its declared dtype. */
-    std::vector<std::pair<std::string, RadEncoding>> encs;
-
-    const RecOp* op_of(rad_op h) const { return h ? &ops[h - 1] : nullptr; }
-};
-
-struct RadCtx {
-    RadBuilder*     b     = nullptr;
-    const RadBatch* batch = nullptr;
-    int             rank  = 0;
-    int             world = 1;
-    std::vector<RecIssue> issues;
-    std::vector<int>      routed_layers;
-    std::string           step_fail;
-    int                   lane = 0;     /* where the next issue goes */
-    std::vector<RecJoin>  joins;
-    /* Device copies into a buffer (rad_memcpy_async to a rad_buf_ptr address): the buffer and the
-     * issue number the copy came before. The step lint counts each as a write there. */
-    std::vector<std::pair<size_t, rad_buf>> copies;
-};
-
-/* -------------------------------------------------------------------- the declare-side ABI */
-extern "C" rad_weight rad_decl_weight(RadBuilder* b, const char* name, const RadWeightDecl* d) {
-    b->weights.push_back({name, *d});
-    return (rad_weight)b->weights.size();
-}
-
-extern "C" int rad_weight_encoding(RadBuilder* b, const char* source, RadEncoding* out, int64_t*,
-                                   uint32_t*) {
-    for (const auto& [key, e] : b->encs)
-        if (source && std::strstr(source, key.c_str())) { *out = e; return RAD_OK; }
-    return RAD_E_NOTFOUND;
-}
-extern "C" rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBufDecl* d) {
-    b->bufs.push_back({name, *d});
-    return (rad_buf)b->bufs.size();
-}
-
-extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_params,
-                              const rad_weight* weights, int n_weights) {
-    if (!b->declared(op)) {
-        b->asked_undeclared.push_back(op);
-        return RAD_NULL_HANDLE;
-    }
-    RecOp r;
-    r.op = op;
-    for (int i = 0; i < n_params; ++i) {
-        RecParam p;
-        p.key  = params[i].key ? params[i].key : "";
-        p.kind = params[i].kind;
-        p.ival = params[i].ival;
-        p.ihi  = params[i].ihi;
-        p.dval = params[i].dval;
-        p.sval = params[i].sval ? params[i].sval : "";
-        r.p.push_back(p);
-    }
-    for (int i = 0; i < n_weights; ++i) r.w.push_back(weights[i]);
-    r.resolved = b->refuse.count(r.op) == 0;
-    b->ops.push_back(r);
-    /* Declare always completes. An unresolved op is RAD_NULL_HANDLE, an error only if the plugin
-     * issues it (rad_builder.h). */
-    return r.resolved ? (rad_op)b->ops.size() : RAD_NULL_HANDLE;
-}
-
-extern "C" int rad_op_reads(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {
-    if (!h) return RAD_E_INVAL;
-    RecOp& r = b->ops[h - 1];
-    r.uses_declared = true;
-    for (int i = 0; i < n; ++i) r.reads.push_back(bufs[i]);
-    return RAD_OK;
-}
-
-extern "C" int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {
-    if (!h) return RAD_E_INVAL;
-    RecOp& r = b->ops[h - 1];
-    r.uses_declared = true;
-    for (int i = 0; i < n; ++i) r.writes.push_back(bufs[i]);
-    return RAD_OK;
-}
-
-extern "C" int rad_op_resolved(RadBuilder* b, rad_op h) {
-    return h != RAD_NULL_HANDLE && b->ops[h - 1].resolved;
-}
-
-extern "C" int rad_op_declared(RadBuilder* b, const char* op) {
-    return op && b->declared(op);
-}
-
-extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
-                                         const RadKVGroupDecl* d) {
-    b->kv_groups.push_back({name, *d, false});
-    return (rad_kvgroup)b->kv_groups.size();
-}
-
-extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { (void)g; return b->kv_block; }
-
-extern "C" int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
-    b->binds.push_back({layer, g});
-    return RAD_OK;
-}
-
-extern "C" int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
-    RecMap r;
-    r.declared   = m->declared;
-    r.mode       = m->mode;
-    r.concat_dim = m->concat_dim;
-    for (int i = 0; i < m->n_src; ++i) r.src.push_back(m->src[i]);
-    b->maps.push_back(r);
-    return RAD_OK;
-}
-
-extern "C" void rad_note(RadBuilder* b, const char* fmt, ...) {
-    char buf[512];
-    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    b->notes.push_back(buf);
-}
-
-/* The buffer the core samples from, recorded so tests can assert the plugin named the narrow
- * one: [max_tok, n_vocab] is legal but 8 GiB at this vocabulary. */
-extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
-    if (!b || !logits) return RAD_E_INVAL;
-    b->logits = logits;
-    return RAD_OK;
-}
-
-/* An embedding program names its pooled output instead of logits; a program declares one. */
-extern "C" int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
-    if (!b || !pooled || b->logits) return RAD_E_INVAL;
-    b->pooled = pooled;
-    return RAD_OK;
-}
-
-/* An image generator's declaration, recorded whole; it too excludes logits. */
-extern "C" int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d) {
-    if (!b || !d || !d->image_out || b->logits || b->pooled) return RAD_E_INVAL;
-    b->generator = *d;
-    b->generator_name = d->name ? d->name : "";
-    return RAD_OK;
-}
-
-/* Recorded: gemma4's prefill overlap names the buffers its second lane reduces in place. */
-extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
-    if (!b || !buf) return RAD_E_INVAL;
-    b->concurrent.push_back(buf);
-    return RAD_OK;
-}
-extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
-    if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
-    if (lo < 0 || hi <= lo) return RAD_E_INVAL;
-    /* The real Builder also checks the declared extent against hi-lo (core/build/rad_builder.cpp);
-     * the fake only records the span for tests. */
-    RecWeight& rw = b->weights[w - 1];
-    rw.span_set = true;
-    rw.span_lo  = lo;
-    rw.span_hi  = hi;
-    return RAD_OK;
-}
-extern "C" int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo,
-                                           const int64_t* hi, const int64_t* total, int n) {
-    if (!b || w == 0 || w > b->weights.size() || !lo || !hi || !total) return RAD_E_INVAL;
-    if (n < 2 || n > RAD_MAX_ROW_PARTS) return RAD_E_INVAL;
-    RecWeight& rw = b->weights[w - 1];
-    if (rw.d.n_row_parts != n) return RAD_E_INVAL;
-    for (int g = 0; g < n; ++g) {
-        if (lo[g] < 0 || hi[g] <= lo[g] || hi[g] > total[g]) return RAD_E_INVAL;
-        if (rw.d.row_parts[g] != hi[g] - lo[g]) return RAD_E_SHAPE;
-        rw.part_lo[g] = lo[g];
-        rw.part_hi[g] = hi[g];
-        rw.part_total[g] = total[g];
-    }
-    rw.n_part_spans = n;
-    return RAD_OK;
-}
-extern "C" int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
-    if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
-    b->kv_groups[g - 1].zero = true;
-    return RAD_OK;
-}
-extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {
-    if (!b || !d) return RAD_E_INVAL;
-    b->drafter = *d;
-    b->drafter_name = d->name ? d->name : "";
-    return RAD_OK;
-}
-extern "C" int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
-    if (!b || b->drafter.kind != RAD_DRAFT_SERIAL || (pos_offset != 0 && pos_offset != 1))
-        return RAD_E_STATE;
-    b->drafter_shared = true;
-    b->drafter_pos = pos_offset;
-    return RAD_OK;
-}
-extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
-    if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
-    if (d->modalities == RAD_MM_AUDIO) {
-        b->audio_encoder = *d;
-        b->audio_encoder_name = d->name;
-        return RAD_OK;
-    }
-    b->encoder = *d;
-    b->encoder_name = d->name;
-    return RAD_OK;
-}
-
-/* -------------------------------------------------------------------- model metadata */
-extern "C" long long rad_meta_geti(const RadModelMeta* m, const char* key, long long dflt) {
-    for (int i = 0; i < m->n_kv; ++i)
-        if (std::strcmp(m->kv_key[i], key) == 0) return atoll(m->kv_val[i]);
-    return dflt;
-}
-extern "C" double rad_meta_getf(const RadModelMeta* m, const char* key, double dflt) {
-    for (int i = 0; i < m->n_kv; ++i)
-        if (std::strcmp(m->kv_key[i], key) == 0) return atof(m->kv_val[i]);
-    return dflt;
-}
-extern "C" const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* dflt) {
-    for (int i = 0; i < m->n_kv; ++i)
-        if (std::strcmp(m->kv_key[i], key) == 0) return m->kv_val[i];
-    return dflt;
-}
-
-/* -------------------------------------------------------------------- the run-phase ABI */
-extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n) {
-    RecIssue r;
-    r.op = op;
-    r.n  = n;
-    for (int i = 0; i < n_opd; ++i) r.opd.push_back(opd[i]);
-    r.lane = c->lane;
-    c->issues.push_back(r);
-    return RAD_OK;
-}
-/* The second lane, recorded: each issue's lane, and each join's position among the issues. */
-extern "C" int rad_lane(RadCtx* c, int lane) {
-    if (lane != 0 && lane != 1) return RAD_E_INVAL;
-    c->lane = lane;
-    return RAD_OK;
-}
-extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
-    if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
-    c->joins.push_back({ c->issues.size(), from, to });
-    return RAD_OK;
-}
-/* A block that refuses the batch records the reason for the tests. */
-extern "C" int rad_step_fail(RadCtx* c, const char* what) {
-    c->step_fail = what ? what : "";
-    return RAD_E_SHAPE;
-}
-extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
-extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
-extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
-/* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
-extern "C" RadStream       rad_stream(RadCtx* c)     { return (RadStream)c; }
-extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK; }
-extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
-    (void)r;
-    c->routed_layers.push_back(layer);
-    return RAD_OK;
-}
-/* No card-side histogram here, so a router writes and reports its own buffer. */
-extern "C" int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert) {
-    (void)c; (void)layer; (void)n_expert;
-    return nullptr;
-}
-/* No prefetch here: the three calls are no-ops, as in a core without one. */
-extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0,
-                                   int64_t rows, int64_t n_embd) {
-    (void)c; (void)next; (void)h; (void)r0; (void)rows; (void)n_embd;
-    return RAD_OK;
-}
-extern "C" int rad_expert_prefetch_mark(RadCtx* c) { (void)c; return RAD_OK; }
-extern "C" int rad_expert_prefetch_step(RadCtx* c, int layer) { (void)c; (void)layer; return RAD_OK; }
-/* Never dereferenced: a plugin passes these through to rad_route_report or offsets one into a raw
- * operand. Each handle gets its own 2^36-byte window above any user-space address, tagged by
- * kind in the top bits, so the step lint can map a raw operand inside a buffer back to that buffer
- * (fake_buf_of). */
-constexpr int       kFakePtrShift = 36;
-constexpr uintptr_t kFakeBufTag   = (uintptr_t)1 << 61;
-constexpr uintptr_t kFakeWeightTag = (uintptr_t)1 << 62;
-extern "C" void* rad_weight_ptr(RadCtx* c, rad_weight w) {
-    (void)c;
-    return (void*)(kFakeWeightTag | (uintptr_t)w << kFakePtrShift);
-}
-extern "C" void* rad_buf_ptr(RadCtx* c, rad_buf b) {
-    (void)c;
-    return (void*)(kFakeBufTag | (uintptr_t)b << kFakePtrShift);
-}
-/* The buffer a raw operand points into, if it came from rad_buf_ptr; 0 otherwise. */
-static rad_buf fake_buf_of(const void* p, size_t n_bufs) {
-    const uintptr_t u = (uintptr_t)p;
-    if ((u & ~(kFakeBufTag - 1)) != kFakeBufTag) return 0;
-    const uintptr_t h = (u & (kFakeBufTag - 1)) >> kFakePtrShift;
-    return h >= 1 && h <= n_bufs ? (rad_buf)h : 0;
-}
-/* Pinned host memory a plugin fills itself (qwen4exp_fp8's piece bounds, the calibration tap's
- * staging), as host memory; nothing else is handed out. */
-extern "C" void* rad_dev_alloc(int64_t bytes, int kind) {
-    return kind == RAD_MEM_HOST_PINNED && bytes > 0 ? std::calloc(1, (size_t)bytes) : nullptr;
-}
-extern "C" void  rad_dev_free(void* p, int kind) { if (kind == RAD_MEM_HOST_PINNED) std::free(p); }
-/* The device copies: nothing is copied. One into a buffer on a step's stream is recorded as a
- * write of that buffer before the next issue (RadCtx::copies). */
-extern "C" int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
-    (void)src; (void)bytes;
-    RadCtx* c = (RadCtx*)s;
-    if (c && c->b)
-        if (const rad_buf h = fake_buf_of(dst, c->b->bufs.size()))
-            c->copies.push_back({ c->issues.size(), h });
-    return RAD_OK;
-}
-extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
-    (void)dst; (void)value; (void)bytes; (void)s;
-    return RAD_OK;
-}
 
 /* ==================================================================== the plugin under test */
 #include "../arch/qwen35_bf16/qwen35_bf16.cpp"
@@ -482,16 +56,8 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
 #include "../arch/embgemma2/embgemma2.cpp"
 /* Qwen-Image 2.1: a generator conditioned by Qwen3-VL. */
 #include "../arch/qwenimage21/qwenimage21.cpp"
-/* GLM-5.3-Flash: its connection, router, attention and cache blocks, and the plugin. */
-#include <arch/rad_block_mhc.h>
-#include <arch/rad_block_glm_router.h>
-#include <arch/rad_block_mla_latent.h>
-#include <arch/rad_block_kda_state.h>
-#include <arch/rad_block_dsa_cache.h>
-#include <arch/rad_block_glm_kda.h>
-#include <arch/rad_block_glm_mla.h>
-#include <arch/rad_block_glm_indexer.h>
-#include "../arch/glm5next/glm5next.cpp"
+/* Anima: a cross-attention generator conditioned through two tokenizers. */
+#include "../arch/anima/anima.cpp"
 
 /* ==================================================================== fixtures and helpers */
 namespace {
@@ -614,101 +180,6 @@ RadModelMeta gemma4_draft_meta() {
     return m;
 }
 
-RadBuildCtx build_ctx(int rank = 0, int world = 1) {
-    RadBuildCtx c{};
-    c.rank       = rank;
-    c.world_size = world;
-    c.max_tok    = 256;
-    c.max_seqs   = 8;
-    c.max_ctx    = 32768;
-    c.scope      = "";
-    return c;
-}
-
-/* The sampled rows (RadBatch::out_ids). The plugin skips the lm_head when n_out is zero (a chunk
- * finishing no sequence), so a fake batch must set them or it silently tests the no-logits
- * path. */
-static const int32_t kDecodeOut[]  = { 0, 1, 2, 3 };
-static const int32_t kPrefillOut[] = { 31, 63 };   /* last token of each 32-token sequence */
-
-RadBatch decode_batch() {
-    RadBatch b{};
-    b.phase       = RAD_PHASE_DECODE;
-    b.n_tok       = 4;
-    b.n_seq       = 4;
-    b.max_q_len   = 1;
-    b.max_ctx_len = 100;
-    b.n_out       = 4;
-    b.out_ids     = kDecodeOut;
-    return b;
-}
-
-RadBatch prefill_batch() {
-    RadBatch b{};
-    b.phase       = RAD_PHASE_PREFILL;
-    b.n_tok       = 64;
-    b.n_seq       = 2;
-    b.max_q_len   = 32;
-    b.max_ctx_len = 32;
-    b.n_out       = 2;
-    b.out_ids     = kPrefillOut;
-    return b;
-}
-
-/* --- small queries over the recorded graph --- */
-std::vector<std::string> op_names(const RadBuilder& b) {
-    std::vector<std::string> v;
-    for (const auto& o : b.ops) v.push_back(o.op);
-    return v;
-}
-
-const RecOp* find_op(const RadBuilder& b, const std::string& name, int nth = 0) {
-    for (const auto& o : b.ops)
-        if (o.op == name && nth-- == 0) return &o;
-    return nullptr;
-}
-
-int count_op(const RadBuilder& b, const std::string& name) {
-    int n = 0;
-    for (const auto& o : b.ops) if (o.op == name) ++n;
-    return n;
-}
-
-const RecParam* param(const RecOp* o, const char* key) {
-    if (!o) return nullptr;
-    for (const auto& p : o->p) if (p.key == key) return &p;
-    return nullptr;
-}
-
-long long pint(const RecOp* o, const char* key) {
-    const RecParam* p = param(o, key);
-    return p ? p->ival : -12345;
-}
-
-double pflt(const RecOp* o, const char* key) {
-    const RecParam* p = param(o, key);
-    return p ? p->dval : -12345.0;
-}
-
-std::string pstr(const RecOp* o, const char* key) {
-    const RecParam* p = param(o, key);
-    return p ? p->sval : std::string("<absent>");
-}
-
-const RecWeight* find_w(const RadBuilder& b, const std::string& name) {
-    for (const auto& w : b.weights) if (w.name == name) return &w;
-    return nullptr;
-}
-
-const RecBuf* find_b(const RadBuilder& b, const std::string& name) {
-    for (const auto& x : b.bufs) if (x.name == name) return &x;
-    return nullptr;
-}
-
-const RecMap* find_map(const RadBuilder& b, const std::string& declared) {
-    for (const auto& m : b.maps) if (m.declared == declared) return &m;
-    return nullptr;
-}
 /* The gated attention layer's ops, listed once for every test.
  *
  * The fused qk_norm_rope_gate is not declared: its schema requires a precomputed cos/sin table
@@ -772,415 +243,7 @@ std::vector<std::string> program_ops(bool tp) {
     return v;
 }
 
-std::string join(const std::vector<std::string>& v) {
-    std::string s;
-    for (size_t i = 0; i < v.size(); ++i) { if (i) s += " "; s += v[i]; }
-    return s;
-}
-
-std::vector<std::string> issued_ops(const RadBuilder& b, const RadCtx& c) {
-    std::vector<std::string> got;
-    for (const auto& i : c.issues) {
-        const RecOp* o = b.op_of(i.op);
-        got.push_back(o ? o->op : "<null>");
-    }
-    return got;
-}
-
 }  /* namespace */
-
-/* ==================================================================== the step lint
- *
- * The buffer plan takes liveness from declaration order: a transient lives over the [first, last]
- * op indices of its declared reads and writes, and two transients of one arena whose ranges are
- * disjoint may share bytes (core/build/rad_bufplan.cpp). A step that issues ops in another order,
- * or across passes of one engine step (trunk, drafter history, draft rounds), can write one buffer
- * while another that shares its bytes still holds rows a later issue reads. The runtime refuses
- * only an op outside a buffer's range, and only on the branch a real model runs, so the class is
- * checked here for every recorded step.
- *
- * lint_step walks the issues of one engine step's passes in order and reports:
- *   alias       a transient read whose last writer is followed, before the read, by a write of a
- *               transient of the same arena whose range is disjoint from its own;
- *   undeclared  an op issued outside the declared range of a buffer operand
- *               (core/runtime/issue.cpp refuses this);
- *   span        an operand that reaches past its buffer or weight, rows and columns applied as
- *               issue.cpp applies them;
- *   null op     an issue of RAD_NULL_HANDLE (a fused op that did not resolve, with no chain);
- *   unwritten   a transient read before any issue, or device copy into it, of the step wrote it;
- *   kv          a cache operand naming a group or layer no rad_bind_layer_kv bound, or a group
- *               this rank declared zero;
- *   strided     a GEMM whose input is a column slice narrower than its buffer (libr4d's GEMMs
- *               read whole rows and refuse it). */
-namespace {
-
-/* One buffer's planned lifetime. `planned` is false for a buffer live over the whole program
- * (PERSIST, DERIVED, rad_buf_concurrent, or no declared use), which shares bytes with nothing. */
-struct Live {
-    int32_t lo = 0, hi = 0;
-    bool    planned = false;
-    bool    transient = false;
-    int     domain = RAD_DOMAIN_DEVICE;
-};
-
-/* Liveness by the rule of Builder::finish_buffer_liveness (core/build/rad_builder.cpp). Op handle
- * h is op index h: the real builder keeps a sentinel at index 0, and the fake hands out ops in
- * declaration order from 1. */
-std::vector<Live> liveness(const RadBuilder& b) {
-    const size_t  nb = b.bufs.size();
-    const int32_t last_op = (int32_t)b.ops.size();
-    std::vector<int32_t> first(nb + 1, -1), last(nb + 1, -1);
-    for (size_t i = 0; i < b.ops.size(); ++i)
-        for (const std::vector<rad_buf>* v : { &b.ops[i].reads, &b.ops[i].writes })
-            for (rad_buf h : *v) {
-                if (h == 0 || h > nb) continue;
-                if (first[h] < 0) first[h] = (int32_t)(i + 1);
-                last[h] = (int32_t)(i + 1);
-            }
-    std::set<rad_buf> conc(b.concurrent.begin(), b.concurrent.end());
-    std::vector<Live> L(nb + 1);
-    for (size_t h = 1; h <= nb; ++h) {
-        const RadBufDecl& d = b.bufs[h - 1].d;
-        Live& l = L[h];
-        l.transient = d.kind == RAD_BUF_TRANSIENT;
-        l.domain    = d.domain;
-        if (!l.transient || conc.count((rad_buf)h) || first[h] < 0) {
-            l.lo = 0;
-            l.hi = last_op;
-            continue;
-        }
-        l.planned = true;
-        l.lo = first[h];
-        l.hi = last[h];
-        if ((rad_buf)h == b.logits || (rad_buf)h == b.pooled) l.hi = last_op;
-    }
-    return L;
-}
-
-/* Whether operand `o` stays inside a buffer or weight of `shape` (packed strides, rows and cols
- * applied as issue.cpp applies them), as issue.cpp's operand_fits decides. */
-bool operand_fits(const int64_t* shape, uint32_t rank, const RadOperand& o) {
-    if (o.offset < 0) return false;
-    int64_t sh[RAD_MAX_RANK] = {}, st[RAD_MAX_RANK] = {};
-    int64_t numel = 1;
-    for (uint32_t d = 0; d < rank; ++d) { sh[d] = shape[d]; numel *= shape[d]; }
-    int64_t s = 1;
-    for (int d = (int)rank - 1; d >= 0; --d) { st[d] = s; s *= sh[d]; }
-    if (o.rows > 0 && rank >= 1) sh[0] = o.rows;
-    if (o.cols > 0 && rank >= 1) sh[rank - 1] = o.cols;
-    int64_t span = o.offset;
-    for (uint32_t d = 0; d < rank; ++d) {
-        if (sh[d] <= 0) return true;
-        span += (sh[d] - 1) * st[d];
-    }
-    return span < numel;
-}
-
-bool in(const std::vector<rad_buf>& v, rad_buf h) {
-    return std::find(v.begin(), v.end(), h) != v.end();
-}
-
-std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const RadCtx*>& passes) {
-    std::vector<std::string> bad;
-    const std::vector<Live> L = liveness(b);
-    const size_t nb = b.bufs.size();
-    auto name = [&](rad_buf h) { return h && h <= nb ? b.bufs[h - 1].name : std::string("?"); };
-    auto shares = [&](rad_buf x, rad_buf y) {
-        const Live& p = L[x];
-        const Live& q = L[y];
-        return p.planned && q.planned && p.domain == q.domain && (p.hi < q.lo || q.hi < p.lo);
-    };
-    std::set<std::pair<int, rad_kvgroup>> bound(b.binds.begin(), b.binds.end());
-    std::vector<int64_t> last_write(nb + 1, -1);
-    int64_t pos = 0;
-    char where[96];
-    for (size_t pi = 0; pi < passes.size(); ++pi) {
-        const RadCtx& c = *passes[pi];
-        size_t next_copy = 0;
-        for (size_t ii = 0; ii < c.issues.size(); ++ii, ++pos) {
-            for (; next_copy < c.copies.size() && c.copies[next_copy].first <= ii; ++next_copy)
-                last_write[c.copies[next_copy].second] = pos;
-            const RecIssue& is = c.issues[ii];
-            const RecOp* o = b.op_of(is.op);
-            std::snprintf(where, sizeof where, "pass %zu issue %zu (%s, op %u)", pi, ii,
-                          o ? o->op.c_str() : "<null>", (unsigned)is.op);
-            if (!o) { bad.push_back(std::string(where) + ": null op issued"); continue; }
-            std::vector<rad_buf> rd, wr;
-            for (size_t k = 0; k < is.opd.size(); ++k) {
-                const RadOperand& od = is.opd[k];
-                const std::string at = std::string(where) + " operand " + std::to_string(k);
-                if (od.kind == RAD_OPK_BUF) {
-                    const rad_buf h = od.handle;
-                    if (h == 0 || h > nb) {
-                        bad.push_back(at + ": buffer handle out of range");
-                        continue;
-                    }
-                    const RadBufDecl& d = b.bufs[h - 1].d;
-                    if (!operand_fits(d.shape, d.rank, od))
-                        bad.push_back(at + ": span past '" + name(h) + "' (offset " +
-                                      std::to_string(od.offset) + ", rows " +
-                                      std::to_string(od.rows) + ", cols " +
-                                      std::to_string(od.cols) + ")");
-                    const Live& l = L[h];
-                    if (l.planned && ((int32_t)is.op < l.lo || (int32_t)is.op > l.hi))
-                        bad.push_back(at + ": undeclared use of '" + name(h) + "' (planned ops " +
-                                      std::to_string(l.lo) + ".." + std::to_string(l.hi) + ")");
-                    const bool r = in(o->reads, h), w = in(o->writes, h);
-                    if (r || !w) rd.push_back(h);
-                    if (w || !r) wr.push_back(h);
-                    /* A GEMM's input is read as contiguous rows: libr4d refuses a column slice
-                     * narrower than its buffer. */
-                    const int64_t width = d.rank ? d.shape[d.rank - 1] : 0;
-                    if (k == 0 && o->op.rfind("gemm_nt", 0) == 0 && od.cols > 0 &&
-                        (od.cols != width || od.offset % width))
-                        bad.push_back(at + ": " + o->op + " reads " + std::to_string(od.cols) +
-                                      " of " + std::to_string(width) + " columns of '" + name(h) +
-                                      "' as its input, which is not contiguous");
-                } else if (od.kind == RAD_OPK_WEIGHT) {
-                    const uint32_t h = od.handle;
-                    if (h == 0 || h > b.weights.size()) {
-                        bad.push_back(at + ": weight handle out of range");
-                        continue;
-                    }
-                    const RadWeightDecl& d = b.weights[h - 1].d;
-                    if ((od.offset || od.rows > 0 || od.cols > 0) &&
-                        !operand_fits(d.shape, d.rank, od))
-                        bad.push_back(at + ": span past weight '" + b.weights[h - 1].name + "'");
-                } else if (od.kind == RAD_OPK_WTAB) {
-                    if (od.handle == 0 || od.rows <= 0 || od.offset || od.cols ||
-                        (size_t)(od.handle + od.rows - 1) > b.weights.size())
-                        bad.push_back(at + ": weight table out of range");
-                } else if (od.kind == RAD_OPK_KV) {
-                    const rad_kvgroup g = od.handle;
-                    if (g == 0 || g > b.kv_groups.size())
-                        bad.push_back(at + ": KV group handle out of range");
-                    else if (b.kv_groups[g - 1].zero)
-                        bad.push_back(at + ": KV group '" + b.kv_groups[g - 1].name +
-                                      "' is declared zero on this rank");
-                    else if (!bound.count({ (int)od.offset, g }))
-                        bad.push_back(at + ": layer " + std::to_string(od.offset) +
-                                      " is not bound to KV group '" + b.kv_groups[g - 1].name +
-                                      "'");
-                } else if (od.kind == RAD_OPK_RAW) {
-                    if (od.offset && od.dtype == RAD_DT_INVALID)
-                        bad.push_back(at + ": raw operand with an offset and no dtype");
-                    /* A pointer into a buffer (rad_buf_ptr) is that buffer to the plan, so it is
-                     * classified by the op's declared sets like a buffer operand. */
-                    if (const rad_buf h = fake_buf_of(od.raw, nb)) {
-                        const Live& l = L[h];
-                        if (l.planned && ((int32_t)is.op < l.lo || (int32_t)is.op > l.hi))
-                            bad.push_back(at + ": undeclared use of '" + name(h) +
-                                          "' through a raw pointer");
-                        const bool r = in(o->reads, h), w = in(o->writes, h);
-                        if (r || !w) rd.push_back(h);
-                        if (w || !r) wr.push_back(h);
-                    }
-                }
-            }
-            for (rad_buf h : rd) {
-                if (!L[h].transient) continue;
-                const int64_t w = last_write[h];
-                if (w < 0) {
-                    bad.push_back(std::string(where) + ": reads '" + name(h) +
-                                  "' before any issue of this step wrote it");
-                    continue;
-                }
-                for (size_t x = 1; x <= nb; ++x)
-                    if (x != h && last_write[x] > w && shares(h, (rad_buf)x))
-                        bad.push_back(std::string(where) + ": reads '" + name(h) + "' (ops " +
-                                      std::to_string(L[h].lo) + ".." + std::to_string(L[h].hi) +
-                                      ") after a write of '" + name((rad_buf)x) + "' (ops " +
-                                      std::to_string(L[x].lo) + ".." + std::to_string(L[x].hi) +
-                                      "), which may share its bytes");
-            }
-            for (rad_buf h : wr) last_write[h] = pos;
-        }
-    }
-    return bad;
-}
-
-/* ---------------------------------------------------------------- whole step batches
- *
- * A batch as the core builds it: every per-token and per-sequence array filled and a group batch
- * for every KV group the builder declared, so a plugin's step can take any path. Decode sequences
- * come first (RadBatch::n_seq_decode); each `dq` entry is a decode sequence's query length (1, or
- * 1 + n_spec for a verify), each `pq` entry a prefill chunk. Every decode row is sampled (a verify
- * needs logits at each row) and a chunk's last row; a chunk continues `prefill_ctx` tokens of
- * history. */
-struct Kit {
-    std::vector<int32_t> tok, pos, cu, ctxl, qlen, out, nacc, dout;
-    std::vector<int32_t> slot, table, used, sidx;
-    std::vector<RadKVGroupBatch> kv;
-    RadBatch b{};
-};
-
-std::unique_ptr<Kit> kit(const RadBuilder& bld, const std::vector<int>& dq,
-                         const std::vector<int>& pq, int32_t prefill_ctx = 0) {
-    auto k = std::make_unique<Kit>();
-    const int64_t nd = (int64_t)dq.size(), ns = nd + (int64_t)pq.size();
-    std::vector<int> ql(dq);
-    ql.insert(ql.end(), pq.begin(), pq.end());
-    int64_t T = 0, max_q = 0, max_ctx = 0, td = 0, mqd = 0, mqp = 0;
-    k->cu.push_back(0);
-    for (int64_t s = 0; s < ns; ++s) {
-        const bool dec = s < nd;
-        const int32_t ctx = dec ? (int32_t)(40 + 7 * s) : prefill_ctx;
-        for (int i = 0; i < ql[(size_t)s]; ++i) {
-            k->tok.push_back((int32_t)(3 + (T + i) % 97));
-            k->pos.push_back(ctx + i);
-            if (dec || i + 1 == ql[(size_t)s]) k->out.push_back((int32_t)(T + i));
-        }
-        T += ql[(size_t)s];
-        k->cu.push_back((int32_t)T);
-        k->ctxl.push_back(ctx);
-        k->qlen.push_back(ql[(size_t)s]);
-        k->nacc.push_back(1);
-        k->dout.push_back((int32_t)T - 1);
-        max_q = std::max<int64_t>(max_q, ql[(size_t)s]);
-        max_ctx = std::max<int64_t>(max_ctx, ctx + ql[(size_t)s]);
-        if (dec) { td += ql[(size_t)s]; mqd = std::max<int64_t>(mqd, ql[(size_t)s]); }
-        else     mqp = std::max<int64_t>(mqp, ql[(size_t)s]);
-    }
-    k->tok.resize((size_t)T + 64, 5);   /* room for a following prompt (RadBatch::n_ahead) */
-    const int64_t pitch = 16;
-    for (int64_t i = 0; i < T; ++i) k->slot.push_back((int32_t)i);
-    for (int64_t i = 0; i < ns * pitch; ++i) k->table.push_back((int32_t)i);
-    for (int64_t s = 0; s < ns; ++s) {
-        k->used.push_back(k->ctxl[(size_t)s] + k->qlen[(size_t)s]);
-        k->sidx.push_back((int32_t)s);
-    }
-    for (size_t g = 0; g < bld.kv_groups.size(); ++g) {
-        RadKVGroupBatch gb{};
-        gb.group = (rad_kvgroup)(g + 1);
-        gb.slot_mapping = k->slot.data();
-        gb.block_table = k->table.data();
-        gb.block_table_pitch = pitch;
-        gb.seqused = k->used.data();
-        gb.state_index = k->sidx.data();
-        gb.state_index_pitch = 1;
-        gb.block_size = bld.kv_block;
-        gb.max_blocks = pitch;
-        k->kv.push_back(gb);
-    }
-    RadBatch& b = k->b;
-    b.phase = pq.empty() ? RAD_PHASE_DECODE : dq.empty() ? RAD_PHASE_PREFILL : RAD_PHASE_MIXED;
-    b.n_tok = T;
-    b.n_seq = ns;
-    b.token_ids = k->tok.data();
-    b.positions = k->pos.data();
-    b.cu_seqlens = k->cu.data();
-    b.n_out = (int64_t)k->out.size();
-    b.out_ids = k->out.data();
-    b.q_lens = k->qlen.data();
-    b.ctx_lens = k->ctxl.data();
-    b.max_q_len = (int32_t)max_q;
-    b.max_ctx_len = (int32_t)max_ctx;
-    b.n_kv_groups = (int)k->kv.size();
-    b.kv = k->kv.data();
-    b.n_spec = mqd > 1 ? (int)(mqd - 1) : 0;
-    b.num_accepted = k->nacc.data();
-    b.n_seq_decode = nd;
-    b.n_tok_decode = td;
-    b.max_q_len_decode = (int32_t)mqd;
-    b.max_q_len_prefill = (int32_t)mqp;
-    return k;
-}
-
-/* The draft passes the core stages for a step of `n_seq` sequences.
- *
- * A serial head's history pass (draft_pass -1) covers every row the trunk step had and carries
- * round 1 on each sequence's last row; round r (2..depth) is one row a sequence. A block
- * drafter's context pass (-1) covers the trunk's rows; its query pass (1) is `block` rows a
- * sequence, the anchor first, and samples the `steps` rows after it (RadDrafterDecl::block). */
-std::unique_ptr<Kit> history_pass(const RadBuilder& bld, const Kit& trunk) {
-    std::vector<int> rows;
-    for (int64_t s = 0; s < trunk.b.n_seq; ++s) rows.push_back(trunk.qlen[(size_t)s]);
-    auto k = kit(bld, rows, {});
-    k->b.draft_pass = -1;
-    k->out.clear();
-    for (int64_t i = 0; i < k->b.n_tok; ++i) k->out.push_back((int32_t)i);
-    k->b.out_ids = k->out.data();
-    k->b.n_out = k->b.n_tok;
-    k->b.n_draft_out = k->b.n_seq;
-    k->b.draft_out_ids = k->dout.data();
-    return k;
-}
-std::unique_ptr<Kit> round_pass(const RadBuilder& bld, int64_t n_seq, int r) {
-    auto k = kit(bld, std::vector<int>((size_t)n_seq, 1), {});
-    k->b.draft_pass = r;
-    return k;
-}
-std::unique_ptr<Kit> context_pass(const RadBuilder& bld, const Kit& trunk) {
-    auto k = history_pass(bld, trunk);
-    k->b.n_draft_out = 0;
-    k->b.draft_out_ids = nullptr;
-    return k;
-}
-std::unique_ptr<Kit> query_pass(const RadBuilder& bld, int64_t n_seq, int64_t block,
-                                int64_t steps) {
-    auto k = kit(bld, std::vector<int>((size_t)n_seq, (int)block), {});
-    k->b.draft_pass = 1;
-    k->out.clear();
-    for (int64_t s = 0; s < n_seq; ++s)
-        for (int64_t i = 0; i < steps; ++i)
-            k->out.push_back((int32_t)(s * block + block - steps + i));
-    k->b.out_ids = k->out.data();
-    k->b.n_out = (int64_t)k->out.size();
-    return k;
-}
-
-using StepFn = void (*)(RadCtx*, const RadBatch*);
-
-/* Runs one engine step's passes in order, each on a context of its own. */
-std::vector<std::unique_ptr<RadCtx>> run_passes(RadBuilder& b, StepFn step,
-                                                const std::vector<const Kit*>& passes,
-                                                int rank = 0, int world = 1) {
-    std::vector<std::unique_ptr<RadCtx>> out;
-    for (const Kit* k : passes) {
-        out.push_back(std::make_unique<RadCtx>());
-        RadCtx& c = *out.back();
-        c.b = &b;
-        c.batch = &k->b;
-        c.rank = rank;
-        c.world = world;
-        step(&c, &k->b);
-    }
-    return out;
-}
-
-std::vector<const RadCtx*> view(const std::vector<std::unique_ptr<RadCtx>>& v) {
-    std::vector<const RadCtx*> p;
-    for (const auto& c : v) p.push_back(c.get());
-    return p;
-}
-
-/* The lint as a check: every finding is printed, and the step passes only with none. */
-size_t report_lint(const std::vector<std::string>& f) {
-    for (size_t i = 0; i < f.size() && i < 12; ++i) fprintf(stderr, "    lint: %s\n", f[i].c_str());
-    if (f.size() > 12) fprintf(stderr, "    lint: ... %zu more\n", f.size() - 12);
-    return f.size();
-}
-
-/* Every pass of one engine step ran without a step failure. */
-bool steps_ok(const std::vector<std::unique_ptr<RadCtx>>& v) {
-    bool ok = true;
-    for (size_t i = 0; i < v.size(); ++i)
-        if (!v[i]->step_fail.empty()) {
-            fprintf(stderr, "    pass %zu failed: %s\n", i, v[i]->step_fail.c_str());
-            ok = false;
-        }
-    return ok;
-}
-
-}  /* namespace */
-
-#define CHECK_LINT(b, ...) CHECK_EQ(report_lint(lint_step((b), { __VA_ARGS__ })), (size_t)0)
-/* The passes of one engine step (run_passes): none failed and the lint is clean over them. */
-#define CHECK_PASSES(b, v)                                                                   \
-    do {                                                                                     \
-        CHECK(steps_ok(v));                                                                  \
-        CHECK_EQ(report_lint(lint_step((b), view(v))), (size_t)0);                           \
-    } while (0)
 
 /* ==================================================================== tests */
 
@@ -2310,1144 +1373,6 @@ TEST(the_encodings_the_model_holds_choose_the_flash_next_kernels) {
     CHECK(!p.layers[0].hc_mix.mix_e4m3);
 }
 
-TEST(manifold_connections_preserve_saved_coefficients_and_use_a_separate_residual_destination) {
-    using namespace rad::arch;
-    RadBuilder b;
-    Names nm("");
-    Geom g{};
-    g.n_embd = 4096;
-    g.max_tok = 32;
-    g.world = 4;
-    ManifoldConn::Config cfg;
-    ManifoldConn::Src src{ "model.layers.3.hc_attn_fn", "model.layers.3.hc_attn_scale",
-                           "model.layers.3.hc_attn_base" };
-    ManifoldConn::Wire w;
-    w.h = decl_b(&b, "h", RAD_BF16, { 32, 16384 });
-    w.x = decl_b(&b, "x", RAD_BF16, { 32, 4096 });
-    w.y = decl_b(&b, "y", RAD_BF16, { 32, 4096 });
-    w.out = decl_b(&b, "out", RAD_BF16, { 32, 16384 });
-    w.post = decl_b(&b, "post", RAD_F32, { 32, 4 });
-    w.comb = decl_b(&b, "comb", RAD_F32, { 32, 16 });
-    ManifoldConn conn;
-    REQUIRE_EQ(conn.declare(&b, nm, g, 3, "blk.3.mhc_attn", cfg, w, src), RAD_OK);
-    REQUIRE_EQ(b.weights.size(), (size_t)3);
-    CHECK_EQ(b.weights[0].d.shape[0], 24);
-    CHECK_EQ(b.weights[0].d.shape[1], 16384);
-    CHECK_EQ(b.weights[1].d.shape[0], 3);
-    CHECK_EQ(b.weights[2].d.shape[0], 24);
-    for (const auto& weight : b.weights) {
-        CHECK_EQ(weight.d.dtype, RAD_F32);
-        CHECK_EQ(weight.d.shard, RAD_SHARD_NONE);
-    }
-    CHECK(b.ops[conn.op_pre - 1].reads == std::vector<rad_buf>({ w.h }));
-    CHECK(b.ops[conn.op_pre - 1].writes == std::vector<rad_buf>({ w.x, w.post, w.comb }));
-    CHECK(b.ops[conn.op_post - 1].reads == std::vector<rad_buf>({ w.y, w.h, w.post, w.comb }));
-    CHECK(b.ops[conn.op_post - 1].writes == std::vector<rad_buf>({ w.out }));
-    RadCtx ctx;
-    conn.read(&ctx, 4);
-    conn.write(&ctx, 4);
-    REQUIRE_EQ(ctx.issues.size(), (size_t)2);
-    CHECK_EQ(ctx.issues[0].op, conn.op_pre);
-    CHECK_EQ(ctx.issues[1].op, conn.op_post);
-    CHECK_EQ(ctx.issues[0].n, 4);
-    CHECK_EQ(ctx.issues[1].n, 4);
-    REQUIRE_EQ(ctx.issues[0].opd.size(), (size_t)7);
-    CHECK_EQ(ctx.issues[0].opd[0].handle, w.h);
-    const rad_weight coefficients[] = { conn.w_fn, conn.w_scale, conn.w_base };
-    for (int i = 0; i < 3; ++i) {
-        CHECK_EQ(ctx.issues[0].opd[i + 1].kind, RAD_OPK_WEIGHT);
-        CHECK_EQ(ctx.issues[0].opd[i + 1].handle, coefficients[i]);
-    }
-    CHECK_EQ(ctx.issues[0].opd[4].handle, w.x);
-    CHECK_EQ(ctx.issues[0].opd[5].handle, w.post);
-    CHECK_EQ(ctx.issues[0].opd[6].handle, w.comb);
-    REQUIRE_EQ(ctx.issues[1].opd.size(), (size_t)5);
-    const rad_buf expected[] = { w.y, w.h, w.post, w.comb, w.out };
-    for (int i = 0; i < 5; ++i) {
-        CHECK_EQ(ctx.issues[1].opd[i].handle, expected[i]);
-        CHECK_EQ(ctx.issues[1].opd[i].rows, 4);
-    }
-    auto invalid = w;
-    invalid.out = w.h;
-    ManifoldConn refused;
-    CHECK_EQ(refused.declare(&b, nm, g, 3, "bad", cfg, invalid, src), RAD_E_INVAL);
-}
-
-TEST(manifold_read_splits_its_projection_by_chunks_over_ranks_from_the_row_threshold) {
-    using namespace rad::arch;
-    for (int world : { 1, 2, 4, 8 })
-        for (int rank = 0; rank < world; ++rank) {
-            RadBuilder b;
-            Names nm("");
-            Geom g{};
-            g.n_embd = 4096;
-            g.max_tok = 512;
-            g.world = world;
-            g.rank = rank;
-            ManifoldConn::Config cfg;
-            ManifoldConn::Src src{ "model.layers.3.hc_attn_fn", "model.layers.3.hc_attn_scale",
-                                   "model.layers.3.hc_attn_base" };
-            ManifoldConn::Wire w;
-            w.h = decl_b(&b, "h", RAD_BF16, { 512, 16384 });
-            w.x = decl_b(&b, "x", RAD_BF16, { 512, 4096 });
-            w.y = decl_b(&b, "y", RAD_BF16, { 512, 4096 });
-            w.out = decl_b(&b, "out", RAD_BF16, { 512, 16384 });
-            w.post = decl_b(&b, "post", RAD_F32, { 512, 4 });
-            w.comb = decl_b(&b, "comb", RAD_F32, { 512, 16 });
-            ManifoldConn conn;
-            REQUIRE_EQ(conn.declare(&b, nm, g, 3, "blk.3.mhc_attn", cfg, w, src), RAD_OK);
-            const bool split = world > 1;
-            const int64_t mine = 8 / world;
-            CHECK_EQ(count_op(b, "mhc_pre"), 1);
-            CHECK_EQ(count_op(b, "mhc_pre_partial"), split ? 1 : 0);
-            CHECK_EQ(count_op(b, "all_gather"), split ? 1 : 0);
-            CHECK_EQ(count_op(b, "mhc_pre_finish"), split ? 1 : 0);
-            CHECK_EQ(b.weights[0].d.shard, RAD_SHARD_NONE);
-            if (split) {
-                const RecOp* part = find_op(b, "mhc_pre_partial");
-                const RecOp* gather = find_op(b, "all_gather");
-                const RecOp* finish = find_op(b, "mhc_pre_finish");
-                REQUIRE(part && gather && finish);
-                CHECK_EQ(pint(part, "chunk"), 2048);
-                CHECK_EQ(pint(part, "first"), rank * mine);
-                CHECK_EQ(pint(part, "chunks"), mine);
-                CHECK(part->w == std::vector<rad_weight>({ conn.w_fn }));
-                CHECK(part->reads == std::vector<rad_buf>({ w.h }));
-                CHECK(part->writes == std::vector<rad_buf>({ conn.part }));
-                CHECK_EQ(pint(gather, "world_size"), world);
-                CHECK_EQ(pint(gather, "row"), mine * 28);
-                CHECK_EQ(param(gather, "numel")->kind, RAD_P_RANGE);
-                CHECK_EQ(param(gather, "numel")->ival, mine * 28);
-                CHECK_EQ(param(gather, "numel")->ihi, 512 * mine * 28);
-                CHECK_EQ(pstr(gather, "dtype"), "f32");
-                CHECK(gather->reads == std::vector<rad_buf>({ conn.part }));
-                CHECK(gather->writes == std::vector<rad_buf>({ conn.parts }));
-                CHECK_EQ(pint(finish, "chunk"), 2048);
-                CHECK_EQ(pint(finish, "iterations"), 20);
-                CHECK(finish->w == std::vector<rad_weight>({ conn.w_scale, conn.w_base }));
-                CHECK(finish->reads == std::vector<rad_buf>({ conn.parts, w.h }));
-                CHECK(finish->writes == std::vector<rad_buf>({ w.x, w.post, w.comb }));
-                CHECK_EQ(find_b(b, "blk.3.mhc_attn.parts")->d.shape[1], 8 * 28);
-            }
-            RadCtx ctx;
-            conn.read(&ctx, 300);
-            conn.read(&ctx, 255);
-            if (split) {
-                REQUIRE_EQ(ctx.issues.size(), (size_t)4);
-                CHECK_EQ(ctx.issues[0].op, conn.op_partial);
-                CHECK_EQ(ctx.issues[0].opd[0].handle, w.h);
-                CHECK_EQ(ctx.issues[0].opd[0].rows, 300);
-                CHECK_EQ(ctx.issues[0].opd[1].handle, conn.w_fn);
-                CHECK_EQ(ctx.issues[0].opd[2].handle, conn.part);
-                CHECK_EQ(ctx.issues[1].op, conn.op_gather);
-                CHECK_EQ(ctx.issues[1].n, 300 * mine * 28);
-                CHECK_EQ(ctx.issues[1].opd[1].handle, conn.parts);
-                CHECK_EQ(ctx.issues[1].opd[1].rows, 300);
-                CHECK_EQ(ctx.issues[2].op, conn.op_finish);
-                REQUIRE_EQ(ctx.issues[2].opd.size(), (size_t)7);
-                const uint32_t expected[] = { conn.parts, w.h,    conn.w_scale, conn.w_base,
-                                              w.x,        w.post, w.comb };
-                for (int i = 0; i < 7; ++i) CHECK_EQ(ctx.issues[2].opd[i].handle, expected[i]);
-                CHECK_EQ(ctx.issues[3].op, conn.op_pre);
-            } else {
-                REQUIRE_EQ(ctx.issues.size(), (size_t)2);
-                CHECK_EQ(ctx.issues[0].op, conn.op_pre);
-                CHECK_EQ(ctx.issues[1].op, conn.op_pre);
-            }
-        }
-}
-
-TEST(glm_routing_keeps_f32_logits_and_correction_replicated_under_tp4) {
-    using namespace rad::arch;
-    for (int rank = 0; rank < 4; ++rank) {
-        RadBuilder b;
-        Names nm("");
-        Geom g{};
-        g.n_embd = 4096;
-        g.max_tok = 128;
-        g.world = 4;
-        g.rank = rank;
-        GlmRouter::Config cfg;
-        GlmRouter::Wire w;
-        w.input = decl_b(&b, "hidden", RAD_BF16, { 128, 4096 });
-        w.logits = decl_b(&b, "logits", RAD_F32, { 32, 288 });
-        w.ids = decl_b(&b, "ids", RAD_I32, { 32, 8 });
-        w.weights = decl_b(&b, "weights", RAD_F32, { 32, 8 });
-        GlmRouter::Src src{ "model.layers.3.mlp.gate.weight",
-                            "model.layers.3.mlp.gate.e_score_correction_bias" };
-        GlmRouter router;
-        REQUIRE_EQ(router.declare(&b, nm, g, 3, "blk.3.router", cfg, w, src), RAD_OK);
-        REQUIRE_EQ(b.weights.size(), (size_t)2);
-        for (const auto& weight : b.weights) {
-            CHECK_EQ(weight.d.dtype, RAD_F32);
-            CHECK_EQ(weight.d.shard, RAD_SHARD_NONE);
-        }
-        CHECK_EQ(b.weights[0].d.shape[0], 288);
-        CHECK_EQ(b.weights[0].d.shape[1], 4096);
-        CHECK_EQ(b.ops[router.op_project - 1].op, std::string("gemm_nt_f32"));
-        CHECK_EQ(b.ops[router.op_select - 1].op, std::string("router_sigmoid_topk"));
-        RadCtx ctx;
-        router.step(&ctx, 7, 4);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)2);
-        CHECK_EQ(ctx.issues[0].opd[0].handle, w.input);
-        CHECK_EQ(ctx.issues[0].opd[0].offset, 7 * 4096);
-        CHECK_EQ(ctx.issues[0].opd[0].rows, 4);
-        CHECK_EQ(ctx.issues[1].opd[1].handle, router.correction);
-        CHECK_EQ(ctx.issues[1].opd[2].handle, w.ids);
-        CHECK_EQ(ctx.issues[1].opd[3].handle, w.weights);
-    }
-}
-
-TEST(glm_router_and_index_head_split_columns_over_ranks_from_the_row_threshold) {
-    using namespace rad::arch;
-    for (int world : { 1, 2, 4, 8 })
-        for (int rank = 0; rank < world; ++rank) {
-            RadBuilder b;
-            Names nm("");
-            Geom g{};
-            g.n_embd = 4096;
-            g.max_tok = 512;
-            g.world = world;
-            g.rank = rank;
-            GlmRouter::Config cfg;
-            cfg.rows = 512;
-            GlmRouter::Wire w;
-            w.input = decl_b(&b, "hidden", RAD_BF16, { 512, 4096 });
-            w.logits = decl_b(&b, "logits", RAD_F32, { 512, 288 });
-            w.ids = decl_b(&b, "ids", RAD_I32, { 512, 8 });
-            w.weights = decl_b(&b, "weights", RAD_F32, { 512, 8 });
-            GlmRouter::Src src{ "model.layers.3.mlp.gate.weight",
-                                "model.layers.3.mlp.gate.e_score_correction_bias" };
-            GlmRouter router;
-            REQUIRE_EQ(router.declare(&b, nm, g, 3, "blk.3.router", cfg, w, src), RAD_OK);
-            const bool split = world > 1;
-            const int64_t cols = 288 / world;
-            CHECK_EQ(count_op(b, "all_gather"), split ? 1 : 0);
-            CHECK_EQ(count_op(b, "gemm_nt_f32"), split ? 2 : 1);
-            // The weight stays whole and replicated: decode keeps the unsplit projection.
-            CHECK_EQ(b.weights[0].d.shape[0], 288);
-            CHECK_EQ(b.weights[0].d.shard, RAD_SHARD_NONE);
-            if (split) {
-                const RecOp* part = find_op(b, "gemm_nt_f32", 1);
-                const RecOp* gather = find_op(b, "all_gather");
-                REQUIRE(part && gather);
-                CHECK_EQ(pint(part, "N"), cols);
-                CHECK_EQ(pint(part, "K"), 4096);
-                CHECK(part->w == std::vector<rad_weight>({ router.projection }));
-                CHECK(part->reads == std::vector<rad_buf>({ w.input }));
-                CHECK(part->writes == std::vector<rad_buf>({ router.split.part }));
-                CHECK_EQ(pint(gather, "world_size"), world);
-                CHECK_EQ(pint(gather, "row"), cols);
-                CHECK_EQ(param(gather, "numel")->kind, RAD_P_RANGE);
-                CHECK_EQ(param(gather, "numel")->ival, cols);
-                CHECK_EQ(param(gather, "numel")->ihi, 512 * cols);
-                CHECK_EQ(pstr(gather, "dtype"), "f32");
-                CHECK(gather->reads == std::vector<rad_buf>({ router.split.part }));
-                CHECK(gather->writes == std::vector<rad_buf>({ w.logits }));
-            }
-            RadCtx ctx;
-            router.step(&ctx, 7, 300, 7);
-            if (split) {
-                REQUIRE_EQ(ctx.issues.size(), (size_t)3);
-                CHECK_EQ(ctx.issues[0].op, router.split.op_part);
-                CHECK_EQ(ctx.issues[0].n, 300);
-                CHECK_EQ(ctx.issues[0].opd[0].handle, w.input);
-                CHECK_EQ(ctx.issues[0].opd[0].offset, 7 * 4096);
-                CHECK_EQ(ctx.issues[0].opd[0].rows, 300);
-                CHECK_EQ(ctx.issues[0].opd[1].kind, RAD_OPK_WEIGHT);
-                CHECK_EQ(ctx.issues[0].opd[1].handle, router.projection);
-                CHECK_EQ(ctx.issues[0].opd[1].offset, rank * cols * 4096);
-                CHECK_EQ(ctx.issues[0].opd[1].rows, cols);
-                CHECK_EQ(ctx.issues[0].opd[2].handle, router.split.part);
-                CHECK_EQ(ctx.issues[0].opd[2].rows, 300);
-                CHECK_EQ(ctx.issues[1].op, router.split.op_gather);
-                CHECK_EQ(ctx.issues[1].n, 300 * cols);
-                CHECK_EQ(ctx.issues[1].opd[0].handle, router.split.part);
-                CHECK_EQ(ctx.issues[1].opd[1].handle, w.logits);
-                CHECK_EQ(ctx.issues[1].opd[1].offset, 7 * 288);
-                CHECK_EQ(ctx.issues[1].opd[1].rows, 300);
-                CHECK_EQ(ctx.issues[2].op, router.op_select);
-            } else {
-                REQUIRE_EQ(ctx.issues.size(), (size_t)2);
-                CHECK_EQ(ctx.issues[0].op, router.op_project);
-            }
-            ctx.issues.clear();
-            router.step(&ctx, 0, 255);
-            REQUIRE_EQ(ctx.issues.size(), (size_t)2);
-            CHECK_EQ(ctx.issues[0].op, router.op_project);
-        }
-}
-
-TEST(absorbed_mla_shards_complete_heads_and_reads_one_latent_cache) {
-    using namespace rad::arch;
-    for (int rank = 0; rank < 4; ++rank) {
-        RadBuilder b;
-        b.kv_block = 4;
-        Names nm("");
-        Geom g{};
-        g.n_embd = 4096;
-        g.max_tok = 32;
-        g.world = 4;
-        g.rank = rank;
-        RadKVGroupDecl kd{};
-        kd.kind = RAD_KV_FULL;
-        kd.dtype = RAD_BF16;
-        kd.n_head_kv = 1;
-        kd.head_dim = 256;
-        const rad_kvgroup kv = rad_decl_kv_group(&b, "latent", &kd);
-        MlaLatent::Config cfg;
-        MlaLatent::Wire w;
-        w.q = decl_b(&b, "q", RAD_BF16, { 32, 16, 256 });
-        w.q_latent = decl_b(&b, "ql", RAD_BF16, { 32, 16, 512 });
-        w.attn_latent = decl_b(&b, "al", RAD_BF16, { 32, 16, 512 });
-        w.out = decl_b(&b, "out", RAD_BF16, { 32, 16, 256 });
-        w.selected = decl_b(&b, "selected", RAD_I32, { 32, 513 });
-        w.length = decl_b(&b, "length", RAD_I32, { 32 });
-        MlaLatent block;
-        REQUIRE_EQ(
-            block.declare(&b, nm, g, 3, kv, cfg, w, "model.layers.3.self_attn.kv_b_proj.weight"),
-            RAD_OK);
-        REQUIRE_EQ(b.weights.size(), (size_t)1);
-        CHECK_EQ(b.weights[0].d.dtype, RAD_BF16);
-        CHECK_EQ(b.weights[0].d.shard, RAD_SHARD_ROW);
-        CHECK_EQ(b.weights[0].d.shape[0], 8192);
-        CHECK_EQ(b.weights[0].d.shape[1], 512);
-        RadCtx ctx;
-        block.step(&ctx, 4);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)3);
-        CHECK_EQ(b.ops[ctx.issues[0].op - 1].op, std::string("mla_project"));
-        CHECK_EQ(b.ops[ctx.issues[1].op - 1].op, std::string("mla_attn"));
-        CHECK_EQ(b.ops[ctx.issues[2].op - 1].op, std::string("mla_project"));
-        CHECK_EQ(ctx.issues[1].opd[1].kind, RAD_OPK_KV);
-        CHECK_EQ(ctx.issues[1].opd[2].handle, w.selected);
-        CHECK_EQ(ctx.issues[1].opd[3].handle, w.length);
-        CHECK_EQ(ctx.issues[2].opd[1].handle, block.projection);
-    }
-}
-
-TEST(
-    glm53_native_graph_declares_all_layers_preserves_mixed_formats_and_runs_mtp_only_in_draft_passes) {
-    using namespace rad::arch;
-    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                           "index_topk" };
-    const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    for (int world : { 1, 4, 8 })
-        for (int rank = 0; rank < world; ++rank) {
-            RadBuilder b;
-            b.kv_block = 4;
-            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                       { "mtp.blk.45.ffn_down_exps", fp8 },
-                       { "ffn_gate_up_exps", mx },
-                       { "ffn_down_exps", mx },
-                       { "ffn_gate_up_shexp", mx },
-                       { "ffn_down_shexp", mx },
-                       { "ffn_gate_up.weight", fp8 },
-                       { "ffn_down.weight", fp8 } };
-            RadBuildCtx build{};
-            build.rank = rank;
-            build.world_size = world;
-            build.max_tok = rank == 0 ? 512 : 16;
-            build.max_seqs = 4;
-            build.max_ctx = 4096;
-            build.max_spec = 3;
-            REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
-            const auto& m = *glm5next::models[rank];
-            CHECK(m.have_mtp);
-            CHECK_EQ(b.drafter.kind, RAD_DRAFT_SERIAL);
-            CHECK_EQ(b.drafter.depth, 3);
-            CHECK_EQ(m.layers.size(), (size_t)45);
-            int full = 0;
-            for (int l = 0; l < 45; ++l) {
-                const auto& layer = m.layers[l];
-                full += layer.full;
-                CHECK(layer.attn_hc.op_pre < layer.norm.op);
-                CHECK(layer.attn_hc.op_post < layer.ffn_hc.op_pre);
-                if (layer.full) {
-                    CHECK(layer.index.cache.op_select < layer.mla.core.op_attn);
-                    CHECK(layer.mla.output.op < layer.attn_hc.op_post);
-                } else
-                    CHECK(layer.kda.output.op < layer.attn_hc.op_post);
-                if (l >= 3) {
-                    CHECK_EQ(layer.moe.c.expert_mx, 1);
-                    CHECK(layer.moe.op_gather < layer.ffn_hc.op_post);
-                }
-            }
-            CHECK_EQ(full, 11);
-            CHECK_EQ(m.draft.moe.c.expert_f32_scale, 1);
-            for (const auto& map : b.maps)
-                if (map.declared.starts_with("mtp."))
-                    for (const auto& source : map.src) CHECK(!source.starts_with("mtp.model."));
-            int32_t cu[] = { 0, 2 }, positions[] = { 0, 1 }, ctxlens[] = { 0 }, ids[] = { 7, 9 },
-                    slots[] = { 0, 1 }, out[] = { 1 };
-            int32_t sidx[] = { 0, 0, 0, 1, 1, 1 }, ci[] = { 0 }, tables[32]{};
-            std::vector<RadKVGroupBatch> kv(b.kv_groups.size());
-            for (size_t i = 0; i < kv.size(); ++i) {
-                kv[i].group = (rad_kvgroup)i + 1;
-                kv[i].slot_mapping = slots;
-                kv[i].block_table = tables;
-                kv[i].block_table_pitch = 32;
-                kv[i].state_index = b.kv_groups[i].d.kind == RAD_KV_CONV ? ci : sidx;
-                kv[i].state_index_pitch = b.kv_groups[i].d.kind == RAD_KV_CONV ? 1 : 6;
-            }
-            RadBatch batch{};
-            batch.phase = RAD_PHASE_PREFILL;
-            batch.n_tok = 2;
-            batch.n_seq = 1;
-            batch.token_ids = ids;
-            batch.positions = positions;
-            batch.cu_seqlens = cu;
-            batch.ctx_lens = ctxlens;
-            batch.kv = kv.data();
-            batch.n_kv_groups = (int)kv.size();
-            batch.n_out = 1;
-            batch.out_ids = out;
-            RadCtx ctx;
-            ctx.b = &b;
-            ctx.rank = rank;
-            ctx.world = world;
-            ctx.batch = &batch;
-            glm5next::step(&ctx, &batch);
-            CHECK(ctx.step_fail.empty());
-            const auto ops = issued_ops(b, ctx);
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "mhc_pre"), 90);
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "kda_update"), 34);
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "mla_attn"), 11);
-            // Two rows stay under the split threshold: 42 routers and 11 index heads, replicated.
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt_f32"), 53);
-            CHECK_EQ(std::count(ops.begin(), ops.end(), "all_gather"), 0);
-            // The split is declared on every rank whatever its step size; only rank 0 issues it here.
-            const bool split = world > 1;
-            // 43 routers and 12 index heads (MTP included), and the 90 mHC reads.
-            CHECK_EQ(count_op(b, "all_gather"), split ? 55 + 90 : 0);
-            CHECK_EQ(count_op(b, "mhc_pre_partial"), split ? 90 : 0);
-            ctx.issues.clear();
-            batch.draft_pass = -1;
-            batch.n_draft_out = 1;
-            batch.draft_out_ids = out;
-            glm5next::step(&ctx, &batch);
-            CHECK(ctx.step_fail.empty());
-            const auto draft_ops = issued_ops(b, ctx);
-            CHECK_EQ(std::count(draft_ops.begin(), draft_ops.end(), "mhc_pre"), 0);
-            CHECK_EQ(std::count(draft_ops.begin(), draft_ops.end(), "mla_attn"), 1);
-            CHECK_EQ(ctx.issues.back().op, m.mhead);
-            CHECK(m.mselect < m.draft.moe.op_router);
-            for (const auto& issue : ctx.issues) {
-                if (issue.op == m.draft.moe.op_router || issue.op == m.mnorm_op)
-                    CHECK_EQ(issue.opd[0].rows, 1);   // Only the row producing a proposal.
-                if (issue.op == m.draft.residual)
-                    CHECK_EQ(issue.opd[0].rows, 2);   // Full history still fills attention caches.
-            }
-            ctx.issues.clear();
-            batch.n_draft_out = 0;
-            glm5next::step(&ctx, &batch);
-            const auto history = issued_ops(b, ctx);
-            CHECK(std::find(history.begin(), history.end(), "kv_store") != history.end());
-            CHECK(std::find(history.begin(), history.end(), "moe_gemm_q") == history.end());
-            if (rank == 0) {
-                std::vector<int32_t> long_ids(512, 7), long_positions(512), long_slots(512),
-                    long_tables(1024);
-                for (int i = 0; i < 512; ++i) long_positions[i] = long_slots[i] = i;
-                int32_t long_cu[] = { 0, 512 }, last = 511;
-                for (auto& group : kv) {
-                    group.slot_mapping = long_slots.data();
-                    group.block_table = long_tables.data();
-                    group.block_table_pitch = 1024;
-                }
-                batch.n_tok = 512;
-                batch.token_ids = long_ids.data();
-                batch.positions = long_positions.data();
-                batch.cu_seqlens = long_cu;
-                batch.out_ids = &last;
-                batch.draft_pass = 0;
-                batch.max_q_len = 512;
-                ctx.issues.clear();
-                glm5next::step(&ctx, &batch);
-                CHECK(ctx.step_fail.empty());
-                {
-                    // 512 rows reach the split: each projection runs on its column slice and each
-                    // mHC read on its chunks, both gathered; at TP1 nothing changes.
-                    const auto long_ops = issued_ops(b, ctx);
-                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"), 53);
-                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_gather"),
-                             world > 1 ? 53 + 90 : 0);
-                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mhc_pre"),
-                             world > 1 ? 0 : 90);
-                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mhc_pre_finish"),
-                             world > 1 ? 90 : 0);
-                    for (const auto& issue : ctx.issues) {
-                        if (b.ops[issue.op - 1].op != "gemm_nt_f32") continue;
-                        const int64_t n = pint(&b.ops[issue.op - 1], "N");
-                        if (world == 1)
-                            CHECK(n == 288 || n == 32);
-                        else {
-                            CHECK(n == 288 / world || n == 32 / world);
-                            CHECK_EQ(issue.opd[1].rows, n);
-                        }
-                    }
-                }
-                for (int l = 3; l < 45; ++l) {
-                    // A prefill routes its full batch once, reusing each expert's
-                    // weights across its rows instead of re-reading them in chunks.
-                    CHECK_EQ(std::count_if(ctx.issues.begin(), ctx.issues.end(),
-                                           [&](const auto& issue) {
-                                               const auto& moe = m.layers[l].moe;
-                                               return issue.op == moe.op_router ||
-                                                      issue.op == moe.glm_router.split.op_part;
-                                           }),
-                             1);
-                }
-                // Arena-lending probes must not replace the model the serving
-                // graph's handles refer to, even when they declare fewer rows.
-                const auto* live = glm5next::models[rank].get();
-                RadBuilder pb;
-                pb.kv_block = 4;
-                pb.encs = b.encs;
-                auto small = build;
-                small.shape_probe = 1;
-                small.max_tok = 1;
-                REQUIRE_EQ(glm5next::declare(&pb, &meta, &small), RAD_OK);
-                CHECK_EQ(glm5next::models[rank].get(), live);
-                CHECK_EQ(glm5next::models[rank]->g.max_tok, 512);
-                RadArchProbe capabilities{};
-                REQUIRE_EQ(glm5next::probe(&meta, &capabilities), RAD_OK);
-                CHECK_EQ(capabilities.shape_probe_ok, 1);
-                std::array<int, 8> results{};
-                std::vector<std::thread> probes;
-                for (int i = 0; i < 8; ++i)
-                    probes.emplace_back([&, i] {
-                        RadBuilder parallel;
-                        parallel.kv_block = 4;
-                        parallel.encs = b.encs;
-                        auto level = build;
-                        level.rank = i % 4;
-                        level.max_tok = i < 4 ? 256 : 1024;
-                        level.shape_probe = 1;
-                        results[i] = glm5next::declare(&parallel, &meta, &level);
-                    });
-                for (auto& thread : probes) thread.join();
-                for (int status : results) CHECK_EQ(status, RAD_OK);
-                CHECK_EQ(glm5next::models[rank].get(), live);
-            }
-        }
-}
-
-/* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
- * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
- * counts and buffer rows smaller. The TP split declares its ops whatever the step size and its
- * gathers' message as a range. */
-TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
-    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                           "index_topk" };
-    const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    const int world = 8, rank = 3;
-    for (int64_t R : { 256, 3072 }) {
-        auto encs = [&](RadBuilder& b) {
-            b.kv_block = 4;
-            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                       { "mtp.blk.45.ffn_down_exps", fp8 },
-                       { "ffn_gate_up_exps", mx },
-                       { "ffn_down_exps", mx },
-                       { "ffn_gate_up_shexp", mx },
-                       { "ffn_down_shexp", mx },
-                       { "ffn_gate_up.weight", fp8 },
-                       { "ffn_down.weight", fp8 } };
-        };
-        RadBuildCtx c{};
-        c.rank = rank;
-        c.world_size = world;
-        c.max_tok = 4096;
-        c.max_seqs = 8;
-        c.max_ctx = 32768;
-        c.max_spec = 3;
-        RadBuilder full;
-        encs(full);
-        REQUIRE_EQ(glm5next::declare(&full, &meta, &c), RAD_OK);
-        RadBuildCtx p = c;
-        p.max_tok = R;
-        p.shape_probe = 1;
-        RadBuilder small;
-        encs(small);
-        REQUIRE_EQ(glm5next::declare(&small, &meta, &p), RAD_OK);
-        REQUIRE_EQ(small.ops.size(), full.ops.size());
-        int differ = 0;
-        for (size_t i = 0; i < full.ops.size(); ++i) {
-            if (small.ops[i].op != full.ops[i].op) {
-                ++differ;
-                continue;
-            }
-            REQUIRE_EQ(small.ops[i].p.size(), full.ops[i].p.size());
-            for (size_t k = 0; k < full.ops[i].p.size(); ++k) {
-                const RecParam& a = full.ops[i].p[k];
-                const RecParam& q = small.ops[i].p[k];
-                if (a.kind == RAD_P_RANGE) continue;
-                // A capacity may shrink: its kernel writes by its operands' extents.
-                if (full.ops[i].op == "qsa_work" && a.key == "work" && q.ival <= a.ival)
-                    continue;
-                if (a.ival != q.ival || a.sval != q.sval || a.dval != q.dval) {
-                    fprintf(stderr,
-                            "    R %lld: op %zu '%s' param '%s': "
-                            "%lld real, %lld small\n",
-                            (long long)R, i, full.ops[i].op.c_str(), a.key.c_str(),
-                            a.ival, q.ival);
-                    ++differ;
-                }
-            }
-        }
-        CHECK_EQ(differ, 0);
-        REQUIRE_EQ(small.bufs.size(), full.bufs.size());
-        for (size_t i = 0; i < full.bufs.size(); ++i)
-            for (uint32_t d = 1; d < full.bufs[i].d.rank; ++d)
-                CHECK_EQ(small.bufs[i].d.shape[d], full.bufs[i].d.shape[d]);
-    }
-}
-
-/* The MoE block's decode fusions: over a two-row trunk step, its draft pass and a 512-row prefill
- * (past the router fusion's one-workgroup sort), each fused launch stands where it fits and the
- * launches it replaces are gone, with the step lint clean throughout. The sort writes each slot's
- * row (`moe_scatter_inv`) and the gather reads it (`moe_gather_inv`) in every MoE pass. */
-TEST(glm53_moe_decode_fusions_replace_their_launches_where_they_fit) {
-    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                           "index_topk" };
-    const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    using Counts = std::map<std::string, int>;
-    /* Launches per step: trunk, draft pass, prefill. The trunk has 42 MoE layers, each a routed
-     * and a shared clamped SwiGLU, and three dense ones. */
-    struct Want {
-        const char* op;
-        int trunk, draft, prefill;
-    };
-    const Want wants[] = {
-        { "router_sigmoid_topk_scatter", 42, 1, 0 }, { "router_sigmoid_topk", 0, 0, 42 },
-        { "swiglu_clamped_quant_fp8", 87, 2, 87 },   { "swiglu_clamped", 0, 0, 0 },
-        { "moe_scatter", 0, 0, 0 },                  { "moe_gather", 0, 0, 0 },
-    };
-    for (int world : { 1, 8 }) {
-        RadBuilder b;
-        b.kv_block = 4;
-        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                   { "mtp.blk.45.ffn_down_exps", fp8 },
-                   { "ffn_gate_up_exps", mx },
-                   { "ffn_down_exps", mx },
-                   { "ffn_gate_up_shexp", mx },
-                   { "ffn_down_shexp", mx },
-                   { "ffn_gate_up.weight", fp8 },
-                   { "ffn_down.weight", fp8 } };
-        RadBuildCtx build{};
-        build.rank = 0;
-        build.world_size = world;
-        build.max_tok = 512;
-        build.max_seqs = 4;
-        build.max_ctx = 4096;
-        build.max_spec = 3;
-        REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
-        int32_t cu[] = { 0, 2 }, positions[] = { 0, 1 }, ctxlens[] = { 0 }, ids[] = { 7, 9 },
-                slots[] = { 0, 1 }, out[] = { 1 };
-        int32_t sidx[] = { 0, 0, 0, 1, 1, 1 }, ci[] = { 0 }, tables[32]{};
-        std::vector<RadKVGroupBatch> kv(b.kv_groups.size());
-        for (size_t i = 0; i < kv.size(); ++i) {
-            kv[i].group = (rad_kvgroup)i + 1;
-            kv[i].slot_mapping = slots;
-            kv[i].block_table = tables;
-            kv[i].block_table_pitch = 32;
-            kv[i].state_index = b.kv_groups[i].d.kind == RAD_KV_CONV ? ci : sidx;
-            kv[i].state_index_pitch = b.kv_groups[i].d.kind == RAD_KV_CONV ? 1 : 6;
-        }
-        RadBatch batch{};
-        batch.phase = RAD_PHASE_PREFILL;
-        batch.n_tok = 2;
-        batch.n_seq = 1;
-        batch.token_ids = ids;
-        batch.positions = positions;
-        batch.cu_seqlens = cu;
-        batch.ctx_lens = ctxlens;
-        batch.kv = kv.data();
-        batch.n_kv_groups = (int)kv.size();
-        batch.n_out = 1;
-        batch.out_ids = out;
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.rank = 0;
-        ctx.world = world;
-        ctx.batch = &batch;
-        Counts got[3];
-        /* With the inverse, the fused selection writes it as its ninth operand and the gather
-         * reads it as its third. */
-        const rad_buf inv = find_b(b, "expert_inverse")
-                                ? (rad_buf)(find_b(b, "expert_inverse") - &b.bufs[0] + 1)
-                                : 0;
-        REQUIRE(inv != 0);
-        auto run = [&](int k) {
-            ctx.issues.clear();
-            glm5next::step(&ctx, &batch);
-            CHECK(ctx.step_fail.empty());
-            CHECK_LINT(b, &ctx);
-            for (const auto& op : issued_ops(b, ctx)) ++got[k][op];
-            for (const auto& is : ctx.issues) {
-                const RecOp* o = b.op_of(is.op);
-                if (!o) continue;
-                if (o->op == "router_sigmoid_topk_scatter")
-                    CHECK(is.opd.size() > 8 && is.opd[8].kind == RAD_OPK_BUF &&
-                          is.opd[8].handle == inv);
-                if (o->op == "moe_gather_inv")
-                    CHECK(is.opd.size() > 2 && is.opd[2].kind == RAD_OPK_BUF &&
-                          is.opd[2].handle == inv);
-            }
-        };
-        run(0);
-        batch.draft_pass = -1;
-        batch.n_draft_out = 1;
-        batch.draft_out_ids = out;
-        run(1);
-        std::vector<int32_t> long_ids(512, 7), long_positions(512), long_slots(512),
-            long_tables(1024);
-        for (int i = 0; i < 512; ++i) long_positions[i] = long_slots[i] = i;
-        int32_t long_cu[] = { 0, 512 }, last = 511;
-        for (auto& group : kv) {
-            group.slot_mapping = long_slots.data();
-            group.block_table = long_tables.data();
-            group.block_table_pitch = 1024;
-        }
-        batch.n_tok = 512;
-        batch.token_ids = long_ids.data();
-        batch.positions = long_positions.data();
-        batch.cu_seqlens = long_cu;
-        batch.out_ids = &last;
-        batch.draft_pass = 0;
-        batch.n_draft_out = 0;
-        batch.max_q_len = 512;
-        run(2);
-        for (int k = 0; k < 3; ++k)
-            for (const Want& w : wants) {
-                const int want = k == 0 ? w.trunk : k == 1 ? w.draft : w.prefill;
-                if (got[k][w.op] != want)
-                    fprintf(stderr, "    world %d step %d: %s %d (want %d)\n", world, k, w.op,
-                            got[k][w.op], want);
-                CHECK_EQ(got[k][w.op], want);
-            }
-    }
-}
-
-TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ring) {
-    using namespace rad::arch;
-    for (bool front : { false, true }) {
-        RadBuilder b;
-        b.kv_block = 4;
-        Names nm("");
-        Geom g{};
-        g.n_embd = 4096;
-        g.max_tok = 32;
-        g.max_seqs = 4;
-        g.max_spec = 3;
-        RadKVGroupDecl ad{};
-        ad.kind = RAD_KV_FULL;
-        ad.dtype = RAD_BF16;
-        ad.n_head_kv = 1;
-        ad.head_dim = 256;
-        const auto attn = rad_decl_kv_group(&b, "attn", &ad);
-        // Claim the attention group's consumer before declaring the index group.
-        RAD_OP(&b, "mla_attn", RAD_PARAMS(RAD_INT("block_size", 4)), RAD_NOWEIGHTS);
-        RadKVGroupDecl td{};
-        td.kind = RAD_KV_LINEAR;
-        td.dtype = RAD_BF16;
-        td.n_head_kv = 1;
-        td.state_dim[0] = 7;
-        td.state_dim[1] = 256;
-        const auto tail = rad_decl_kv_group(&b, "tail", &td);
-        DsaCache::Wire w;
-        w.query = decl_b(&b, "query", RAD_BF16, { 1024, 128 });
-        w.codes = decl_b(&b, "codes", RAD_F8E4M3, { 1024, 128 });
-        w.scales = decl_b(&b, "scales", RAD_F32, { 1024, 1 });
-        w.gate = decl_b(&b, "gates", RAD_F32, { 32, 32 });
-        w.kg = decl_b(&b, "kg", RAD_BF16, { 32, 256 });
-        w.stage = decl_b(&b, "stage", RAD_BF16, { 48, 256 });
-        w.page = decl_b(&b, "page", RAD_I32, { 12 });
-        w.bpos = decl_b(&b, "bpos", RAD_I32, { 12 });
-        w.nc = decl_b(&b, "nc", RAD_I32, { 4 });
-        w.pooled = decl_b(&b, "pooled", RAD_F8E4M3, { 12, 128 });
-        w.pool_scale = decl_b(&b, "pool_scale", RAD_F32, { 12, 1 });
-        w.score = decl_b(&b, "score", RAD_F32, { 32, 1024 });
-        w.selected = decl_b(&b, "sel", RAD_I32, { 32, 513 });
-        w.nsel = decl_b(&b, "nsel", RAD_I32, { 32 });
-        w.length = decl_b(&b, "len", RAD_I32, { 32 });
-        DsaCache block;
-        DsaCache::Config cfg;
-        cfg.blocks = 1024;
-        cfg.work = 12;
-        cfg.ring = 7;
-        rad_kvgroup index = 0;
-        GlmIndexer indexer;
-        if (front) {
-            GlmIndexer::Wire iw;
-            iw.cache = w;
-            iw.input = decl_b(&b, "input", RAD_BF16, { 32, 4096 });
-            iw.q_low = decl_b(&b, "q_low", RAD_BF16, { 32, 1536 });
-            iw.q_wide = decl_b(&b, "q_wide", RAD_BF16, { 32, 4096 });
-            iw.kg_raw = decl_b(&b, "kg_raw", RAD_BF16, { 32, 256 });
-            REQUIRE_EQ(indexer.declare(&b, nm, g, 3, iw, "indexer", cfg, attn, tail, &index),
-                       RAD_OK);
-            block = indexer.cache;
-            CHECK_EQ(b.weights[indexer.head_weight - 1].d.dtype, RAD_F32);
-            CHECK_EQ(b.weights[indexer.query.w - 1].d.shard, RAD_SHARD_NONE);
-            CHECK_EQ(b.weights[indexer.key_gate.w - 1].d.shard, RAD_SHARD_NONE);
-        } else
-            REQUIRE_EQ(block.declare(&b, nm, g, 3, cfg, w, attn, tail, &index, "indexer.pool.ape"),
-                       RAD_OK);
-        CHECK_EQ(b.kv_groups[index - 1].d.dtype, RAD_U8);
-        CHECK_EQ(b.kv_groups[index - 1].d.head_dim, 17);
-        int32_t ibt[16]{}, abt[16]{}, sidx[12]{}, cu[] = { 0, 3, 8 }, pos[8]{};
-        RadKVGroupBatch kv[3]{};
-        kv[0].group = index;
-        kv[0].block_table = ibt;
-        kv[0].block_table_pitch = 8;
-        kv[1].group = tail;
-        kv[1].state_index = sidx;
-        kv[1].state_index_pitch = 6;
-        kv[2].group = attn;
-        kv[2].block_table = abt;
-        kv[2].block_table_pitch = 8;
-        RadBatch batch{};
-        batch.n_tok = 8;
-        batch.n_seq = 2;
-        batch.n_spec = 2;
-        batch.kv = kv;
-        batch.n_kv_groups = 3;
-        batch.positions = pos;
-        batch.cu_seqlens = cu;
-        batch.max_ctx_len = 64;   // Mixed-row bound exceeds the eight physical table columns.
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.batch = &batch;
-        if (front) {
-            indexer.step(&ctx, &batch);
-            REQUIRE_EQ(ctx.issues.size(), (size_t)12);
-            CHECK_EQ(ctx.issues[1].op, indexer.op_query_copy);
-            CHECK_EQ(ctx.issues[1].opd[1].rows, 256);
-            CHECK_EQ(ctx.issues[3].op, indexer.op_norm);
-            CHECK_EQ(ctx.issues[4].opd[0].offset, 128);
-            CHECK_EQ(ctx.issues[5].op, indexer.op_head);
-            ctx.issues.erase(ctx.issues.begin(), ctx.issues.begin() + 6);
-        } else
-            block.step(&ctx, &batch);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)6);
-        CHECK_EQ(ctx.issues[0].n, 256);
-        CHECK(ctx.issues[1].opd[5].raw == ibt);
-        CHECK_EQ(ctx.issues[1].opd[4].cols, 6);
-        CHECK_EQ(ctx.issues[2].op, block.op_pool);
-        CHECK_EQ(ctx.issues[2].opd[5].handle, index);
-        CHECK_EQ(ctx.issues[3].op, block.op_tail);
-        CHECK_EQ(ctx.issues[4].opd[0].rows, 256);
-        CHECK_EQ(ctx.issues[4].opd[3].handle, index);
-        CHECK_EQ(ctx.issues[4].opd[4].kind, RAD_OPK_NONE);
-        CHECK(ctx.issues[4].opd[5].raw == ibt);
-        CHECK_EQ(ctx.issues[4].opd[8].cols, 8);
-        CHECK_EQ(ctx.issues[5].opd[0].cols, 8);
-        CHECK(ctx.issues[5].opd[1].raw == abt);
-    }
-}
-
-TEST(glm_dense_ffn_keeps_clipping_and_disables_the_unclipped_fp8_epilogue) {
-    using namespace rad::arch;
-    RadBuilder b;
-    Names nm("");
-    Geom g{};
-    g.n_embd = 4096;
-    g.n_ff = 3072;
-    g.max_tok = 32;
-    g.world = 4;
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    b.encs = { { "ffn_gate_up", fp8 }, { "ffn_down", fp8 } };
-    MlpFP8::Wire w;
-    w.x = decl_b(&b, "x", RAD_BF16, { 32, 4096 });
-    w.h.x = decl_b(&b, "h", RAD_BF16, { 32, 4096 });
-    REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", 4096), RAD_OK);
-    w.gate_up = decl_b(&b, "gate_up", RAD_BF16, { 32, 6144 });
-    w.ffn.x = decl_b(&b, "ffn", RAD_BF16, { 32, 3072 });
-    REQUIRE_EQ(w.ffn.declare_qs(&b, nm, g, "ffn", 3072), RAD_OK);
-    MlpFP8 block;
-    MlpFP8::Src src{ "post_attention_layernorm.weight", "mlp.gate_proj.weight",
-                     "mlp.up_proj.weight", "mlp.down_proj.weight" };
-    REQUIRE_EQ(block.declare(&b, nm, g, 0, w, src, false, false, kArNone, false, 10), RAD_OK);
-    CHECK_EQ(block.op_gated, 0u);
-    CHECK_EQ(b.ops[block.gq_ffn.op - 1].op, std::string("swiglu_clamped"));
-    RadCtx ctx;
-    ctx.b = &b;
-    block.slice(&ctx, 8, 4, 4);
-    const auto ops = issued_ops(b, ctx);
-    CHECK_EQ(std::count(ops.begin(), ops.end(), "swiglu_clamped"), 1);
-    CHECK(std::find(ops.begin(), ops.end(), "gemm_nt_q_gated") == ops.end());
-    CHECK(std::find(ops.begin(), ops.end(), "quant_act_fp8") != ops.end());
-}
-
-TEST(glm_mla_stores_one_normalized_latent_and_exposes_q_lora_before_sparse_attention) {
-    using namespace rad::arch;
-    for (int rank = 0; rank < 4; ++rank) {
-        RadBuilder b;
-        b.kv_block = 4;
-        Names nm("");
-        Geom g{};
-        g.n_embd = 4096;
-        g.max_tok = 32;
-        g.world = 4;
-        g.rank = rank;
-        RadKVGroupDecl kd{};
-        kd.kind = RAD_KV_FULL;
-        kd.dtype = RAD_BF16;
-        kd.n_head_kv = 1;
-        kd.head_dim = 256;
-        const auto kv = rad_decl_kv_group(&b, "latent", &kd);
-        auto buf = [&](const char* name, int64_t n) {
-            return decl_b(&b, name, RAD_BF16, { 32, n });
-        };
-        GlmMla::Wire w;
-        w.input.x = buf("input", 4096);
-        w.q_raw = buf("q_raw", 1536);
-        w.kv_raw = buf("kv_raw", 512);
-        w.q_low.x = buf("q_low", 1536);
-        w.latent = buf("latent_out", 512);
-        w.out = buf("out", 4096);
-        REQUIRE_EQ(w.input.declare_qs(&b, nm, g, "input", 4096), RAD_OK);
-        REQUIRE_EQ(w.q_low.declare_qs(&b, nm, g, "q_low", 1536), RAD_OK);
-        w.core.q = buf("q", 4096);
-        w.core.q_latent = decl_b(&b, "q_latent", RAD_BF16, { 32, 16, 512 });
-        w.core.attn_latent = decl_b(&b, "attn_latent", RAD_BF16, { 32, 16, 512 });
-        w.core.out = buf("expanded", 4096);
-        w.attn.x = w.core.out;
-        REQUIRE_EQ(w.attn.declare_qs(&b, nm, g, "expanded", 4096), RAD_OK);
-        w.core.selected = decl_b(&b, "selected", RAD_I32, { 32, 513 });
-        w.core.length = decl_b(&b, "length", RAD_I32, { 32 });
-        GlmMla block;
-        REQUIRE_EQ(block.declare(&b, nm, g, 3, w, "attn", kv), RAD_OK);
-        CHECK_EQ(b.weights[block.q_a.w - 1].d.shard, RAD_SHARD_NONE);
-        CHECK_EQ(b.weights[block.q_b.w - 1].d.shard, RAD_SHARD_ROW);
-        CHECK_EQ(b.weights[block.output.w - 1].d.shard, RAD_SHARD_COL);
-        int32_t slots[4]{};
-        RadKVGroupBatch kb{};
-        kb.group = kv;
-        kb.slot_mapping = slots;
-        RadBatch batch{};
-        batch.n_tok = 4;
-        batch.kv = &kb;
-        batch.n_kv_groups = 1;
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.batch = &batch;
-        block.prepare(&ctx, &batch);
-        auto find_issue = [&](rad_op op) -> const RecIssue* {
-            for (const auto& issue : ctx.issues)
-                if (issue.op == op) return &issue;
-            return nullptr;
-        };
-        const auto* store = find_issue(block.op_store);
-        REQUIRE(store);
-        CHECK_EQ(store->opd[0].handle, w.latent);
-        CHECK_EQ(store->opd[0].cols, 256);
-        CHECK_EQ(store->opd[1].offset, 256);
-        CHECK_EQ(store->opd[1].cols, 256);
-        CHECK(store->opd[2].raw == slots);
-        const auto before = issued_ops(b, ctx);
-        CHECK(std::find(before.begin(), before.end(), "mla_attn") == before.end());
-        block.finish(&ctx, &batch);
-        const auto* attn = find_issue(block.core.op_attn);
-        REQUIRE(attn);
-        CHECK_EQ(attn->opd[2].handle, w.core.selected);
-        CHECK_EQ(ctx.issues.back().op, block.op_ar);
-    }
-}
-
-TEST(glm_kda_projects_local_heads_and_reduces_only_after_the_output_projection) {
-    using namespace rad::arch;
-    for (int rank = 0; rank < 4; ++rank) {
-        RadBuilder b;
-        Names nm("");
-        Geom g{};
-        g.n_embd = 4096;
-        g.max_tok = 32;
-        g.world = 4;
-        g.rank = rank;
-        g.max_spec = 3;
-        RadKVGroupDecl sd{};
-        sd.kind = RAD_KV_LINEAR;
-        sd.dtype = RAD_F32;
-        sd.n_head_kv = 16;
-        sd.state_dim[0] = sd.state_dim[1] = 128;
-        RadKVGroupDecl cd{};
-        cd.kind = RAD_KV_CONV;
-        cd.dtype = RAD_BF16;
-        cd.n_head_kv = 1;
-        cd.head_dim = 6144;
-        cd.conv_width = 4;
-        const auto state = rad_decl_kv_group(&b, "state", &sd),
-                   history = rad_decl_kv_group(&b, "conv", &cd);
-        auto buf = [&](const char* name, int64_t width) {
-            return decl_b(&b, name, RAD_BF16, { 32, width });
-        };
-        GlmKda::Wire w;
-        w.input = buf("input", 4096);
-        w.forget_low = buf("forget_low", 128);
-        w.gate_low = buf("gate_low", 128);
-        w.out = buf("out", 4096);
-        w.core.qkv = buf("qkv", 6144);
-        w.core.conv = buf("conv_out", 6144);
-        w.core.a = buf("a", 2048);
-        w.core.beta = buf("beta", 16);
-        w.core.gate = buf("gate", 2048);
-        w.core.out = buf("core_out", 2048);
-        KdaState::Src src{ "attn.q_conv1d.weight", "attn.k_conv1d.weight", "attn.v_conv1d.weight",
-                           "attn.A_log",           "attn.dt_bias",         "attn.o_norm.weight" };
-        GlmKda block;
-        REQUIRE_EQ(block.declare(&b, nm, g, 0, w, "attn", src, state, history), RAD_OK);
-        CHECK_EQ(b.weights[block.qkv.w - 1].d.n_row_parts, 3);
-        CHECK_EQ(b.weights[block.forget_a.w - 1].d.shard, RAD_SHARD_NONE);
-        CHECK_EQ(b.weights[block.forget_b.w - 1].d.shard, RAD_SHARD_ROW);
-        CHECK_EQ(b.weights[block.output.w - 1].d.shard, RAD_SHARD_COL);
-        int32_t cu[] = { 0, 4 }, ctxlens[] = { 0 }, indices[] = { 0, 0, 0, 1, 1, 1 }, ci[] = { 0 };
-        RadKVGroupBatch kv[2]{};
-        kv[0].group = state;
-        kv[0].state_index = indices;
-        kv[0].state_index_pitch = 6;
-        kv[1].group = history;
-        kv[1].state_index = ci;
-        RadBatch batch{};
-        batch.phase = RAD_PHASE_PREFILL;
-        batch.n_tok = 4;
-        batch.n_seq = 1;
-        batch.cu_seqlens = cu;
-        batch.ctx_lens = ctxlens;
-        batch.kv = kv;
-        batch.n_kv_groups = 2;
-        RadCtx ctx;
-        ctx.b = &b;
-        ctx.batch = &batch;
-        block.step(&ctx, &batch);
-        const auto ops = issued_ops(b, ctx);
-        CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt"), 7);
-        CHECK_EQ(std::count(ops.begin(), ops.end(), "silu"), 0);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)11);
-        CHECK_EQ(ctx.issues[9].op, block.output.op);
-        CHECK_EQ(ctx.issues[10].op, block.op_ar);
-        CHECK_EQ(ctx.issues[10].opd[0].handle, w.out);
-    }
-}
-
-TEST(kda_state_core_splits_mixed_batches_and_preserves_absolute_prefill_offsets) {
-    using namespace rad::arch;
-    RadBuilder b;
-    Names nm("");
-    Geom g{};
-    g.n_embd = 4096;
-    g.max_tok = 32;
-    g.world = 4;
-    g.max_spec = 3;
-    RadKVGroupDecl sd{};
-    sd.kind = RAD_KV_LINEAR;
-    sd.dtype = RAD_F32;
-    sd.n_head_kv = 16;
-    sd.state_dim[0] = sd.state_dim[1] = 128;
-    RadKVGroupDecl cd{};
-    cd.kind = RAD_KV_CONV;
-    cd.dtype = RAD_BF16;
-    cd.n_head_kv = 1;
-    cd.head_dim = 6144;
-    cd.conv_width = 4;
-    const rad_kvgroup st = rad_decl_kv_group(&b, "state", &sd),
-                      cv = rad_decl_kv_group(&b, "conv", &cd);
-    KdaState::Wire w;
-    w.qkv = decl_b(&b, "qkv", RAD_BF16, { 32, 6144 });
-    w.conv = decl_b(&b, "filtered", RAD_BF16, { 32, 6144 });
-    w.a = decl_b(&b, "a", RAD_BF16, { 32, 2048 });
-    w.beta = decl_b(&b, "beta", RAD_BF16, { 32, 16 });
-    w.gate = decl_b(&b, "gate", RAD_BF16, { 32, 2048 });
-    w.out = decl_b(&b, "out", RAD_BF16, { 32, 16, 128 });
-    KdaState::Src src{ "attn.q_conv1d.weight", "attn.k_conv1d.weight", "attn.v_conv1d.weight",
-                       "attn.A_log",           "attn.dt_bias",         "attn.o_norm.weight" };
-    KdaState block;
-    KdaState::Config cfg;
-    REQUIRE_EQ(block.declare(&b, nm, g, 0, st, cv, cfg, w, src), RAD_OK);
-    CHECK_EQ(b.weights[block.taps - 1].d.n_row_parts, 3);
-    for (int p = 0; p < 3; ++p) CHECK_EQ(b.weights[block.taps - 1].d.row_parts[p], 2048);
-    CHECK_EQ(b.weights[block.bias - 1].d.shape[0], 2048);
-    for (rad_op op : { block.op_prefill, block.op_verify }) {
-        bool found = false;
-        for (const auto& p : b.ops[op - 1].p)
-            if (p.key == "state_form") {
-                CHECK_EQ(p.sval, std::string("anchor"));
-                found = true;
-            }
-        CHECK(found);
-    }
-    int32_t cu[] = { 0, 3, 8 }, ctxlens[] = { 11, 0 }, accepted[] = { 2, 1 };
-    int32_t indices[] = { 0, 0, 0, 2, 2, 2, 1, 1, 1, 3, 3, 3 }, conv_indices[] = { 0, 1 };
-    RadKVGroupBatch kv[2]{};
-    kv[0].group = st;
-    kv[0].state_index = indices;
-    kv[0].state_index_pitch = 6;
-    kv[1].group = cv;
-    kv[1].state_index = conv_indices;
-    kv[1].state_index_pitch = 1;
-    RadBatch batch{};
-    batch.phase = RAD_PHASE_MIXED;
-    batch.n_tok = 8;
-    batch.n_seq = 2;
-    batch.n_seq_decode = 1;
-    batch.n_tok_decode = 3;
-    batch.cu_seqlens = cu;
-    batch.ctx_lens = ctxlens;
-    batch.num_accepted = accepted;
-    batch.kv = kv;
-    batch.n_kv_groups = 2;
-    RadCtx ctx;
-    ctx.b = &b;
-    ctx.batch = &batch;
-    block.step(&ctx, &batch);
-    REQUIRE_EQ(ctx.issues.size(), (size_t)5);
-    CHECK_EQ(ctx.issues[0].op, block.op_conv);
-    CHECK_EQ(ctx.issues[0].n, 3);
-    CHECK_EQ(ctx.issues[1].op, block.op_verify);
-    CHECK_EQ(ctx.issues[1].opd[0].cols, 2048);
-    CHECK_EQ(ctx.issues[1].opd[1].offset, 2048);
-    CHECK_EQ(ctx.issues[1].opd[2].offset, 4096);
-    CHECK_EQ(ctx.issues[2].op, block.op_conv);
-    CHECK_EQ(ctx.issues[2].n, 8);
-    CHECK(ctx.issues[2].opd[3].raw == cu + 1);
-    CHECK_EQ(ctx.issues[2].opd[7].kind, RAD_OPK_NONE);
-    CHECK_EQ(ctx.issues[3].op, block.op_prefill);
-    CHECK(ctx.issues[3].opd[8].raw == indices + 6);
-    CHECK(ctx.issues[3].opd[9].raw == cu + 1);
-    CHECK_EQ(ctx.issues[3].opd[0].offset, 0);
-    CHECK_EQ(ctx.issues[3].opd[0].rows, 8);
-    CHECK_EQ(ctx.issues[4].op, block.op_norm);
-}
-
 TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_groups) {
     using namespace rad::arch;
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
@@ -4467,14 +2392,6 @@ const RecOp* issued_op(const RadBuilder& b, const RadCtx& c, const std::string& 
     }
     return nullptr;
 }
-const RecIssue* issue_of(const RadBuilder& b, const RadCtx& c, const std::string& name,
-                         int nth = 0) {
-    for (const auto& i : c.issues) {
-        const RecOp* o = b.op_of(i.op);
-        if (o && o->op == name && nth-- == 0) return &i;
-    }
-    return nullptr;
-}
 
 }  /* namespace */
 
@@ -5318,7 +3235,9 @@ TEST(declare_is_a_gemma4_trunk) {
 
     /* 12 layers: 10 sliding + 2 global (layers 5 and 11). */
     CHECK_EQ(count_op(b, "attn_paged"),  12);
-    CHECK_EQ(count_op(b, "kv_store"),    12);
+    /* the cache store rides the fused prologue where it resolves (qkv_norm_rope_kv_store) */
+    CHECK_EQ(count_op(b, "qkv_norm_rope_kv_store"), 12);
+    CHECK_EQ(count_op(b, "kv_store"),     0);
     CHECK_EQ(count_op(b, "rmsnorm_p"),   12);   /* weightless value norm, one per layer */
     CHECK_EQ(count_op(b, "rope"),        24);   /* q + k */
     CHECK_EQ(count_op(b, "gelu_mul"),    12);   /* Gemma's FFN activation, not SwiGLU */
@@ -5481,10 +3400,11 @@ TEST(gemma4_final_norm_softcap_and_vocab) {
     CHECK(find_map(b, "output.weight") != nullptr);
 
     /* The embedding is scaled by sqrt(n_embd) at lookup (as the reference's build_inp_embd and
-     * HF's ScaledWordEmbedding do), not baked into the table, so the table stays tied to the head. */
+     * HF's ScaledWordEmbedding do), not baked into the table, so the table stays tied to the head.
+     * HF multiplies by `embed_scale.to(bf16)`, so sqrt(5376) = 73.32 is 73.5. */
     const RecOp* el = find_op(b, "embed_lookup", 0);
     CHECK(el != nullptr);
-    CHECK_NEAR(pflt(el, "mult"), std::sqrt(5376.0), 1e-9);
+    CHECK_NEAR(pflt(el, "mult"), 73.5, 1e-9);
 }
 
 TEST(gemma4_every_op_declares_the_buffers_it_touches) {
@@ -5528,6 +3448,7 @@ TEST(gemma4_every_weight_has_a_name_map) {
 TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
     RadBuilder b;
     b.refuse.insert("qkv_norm_rope");   /* force the unfused prologue; fused is checked below */
+    b.refuse.insert("qkv_norm_rope_kv_store");
     RadModelMeta meta = gemma4_meta();
     RadBuildCtx  ctx  = build_ctx();
     CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
@@ -5594,15 +3515,19 @@ static std::vector<std::string> gemma4_w4_step(const std::set<std::string>& refu
 
 /* At two ranks the all-reduce before each junction is folded into it; only the embedding's and
  * the last feed-forward's (which feeds the final norm, not a quantiser) remain standalone. Without
- * the fused collective, junctions keep their preceding all-reduces. */
+ * the fused collective, junctions keep their preceding all-reduces. Beside each reduction a
+ * prefetch of the next GEMM's weight (the lm_head after the last), and down_proj's beside the
+ * attention (prefetch_beside). */
 TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     std::vector<std::string> want = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
-                               "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
+        for (const char* s : { "prefetch", "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                               "gemm_nt_q", "prefetch", "ar_rmsnorm_quant_i8", "gemm_nt_q",
+                               "gelu_mul_quant_i8", "gemm_nt_q" })
             want.push_back(s);
+        want.push_back("prefetch");
         if (l < 11) want.push_back("ar_rmsnorm_quant_i8");
         else for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) want.push_back(s);
     }
@@ -5614,10 +3539,12 @@ TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) plain.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
-                               "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
-                               "gemm_nt_q", "all_reduce" })
+        for (const char* s : { "prefetch", "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                               "gemm_nt_q", "prefetch", "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q",
+                               "gelu_mul_quant_i8", "gemm_nt_q" })
             plain.push_back(s);
+        plain.push_back("prefetch");
+        plain.push_back("all_reduce");
         if (l < 11) plain.push_back("rmsnorm_quant_i8");
         else for (const char* s : { "rmsnorm", "add", "scale" }) plain.push_back(s);
     }
@@ -5631,7 +3558,7 @@ TEST(a_gemma4_w4a8_step_fuses_its_residual_junctions) {
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope", "kv_store",
+        for (const char* s : { "qkv_norm_rope_kv_store",
                                "attn_paged", "quant_act_i8", "gemm_nt_q", "rmsnorm_quant_i8",
                                "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
             want.push_back(s);
@@ -5658,7 +3585,8 @@ TEST(a_gemma4_w4a8_step_without_the_fused_ops_keeps_the_chain_and_one_qkv_quanti
     }
     for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
         want.push_back(s);
-    CHECK_EQ(join(gemma4_w4_step({ "rmsnorm_quant_i8", "qkv_norm_rope", "gelu_mul_quant_i8" })), join(want));
+    CHECK_EQ(join(gemma4_w4_step({ "rmsnorm_quant_i8", "qkv_norm_rope", "qkv_norm_rope_kv_store",
+                                   "gelu_mul_quant_i8" })), join(want));
 }
 
 /* =============================== gemma4: the assistant (MTP) head =============================== */
@@ -5726,7 +3654,7 @@ TEST(gemma4_assistant_is_a_serial_head_with_no_cache_of_its_own) {
 
     /* Four head attention layers beside the trunk's twelve, none storing. */
     CHECK_EQ(count_op(b, "attn_paged"), 16);
-    CHECK_EQ(count_op(b, "kv_store"), 12);
+    CHECK_EQ(count_op(b, "kv_store") + count_op(b, "qkv_norm_rope_kv_store"), 12);
     CHECK_EQ(count_op(b, "logit_softcap"), 1);    /* trunk only; head logits are not capped */
     CHECK_EQ(count_op(b, "logits_gemm"), 2);
 
@@ -5785,11 +3713,12 @@ TEST(gemma4_assistant_is_a_serial_head_with_no_cache_of_its_own) {
     REQUIRE(mpre != nullptr);
     CHECK_EQ(mpre->src[0], std::string("draft.pre_projection.weight"));
 
-    /* The entry embeds through the trunk's table with the trunk's scale. */
+    /* The entry embeds through the trunk's table with the trunk's scale, sqrt(5376) rounded to
+     * bf16 as the reference's embedding module holds it. */
     const RecOp* el = find_op(b, "embed_lookup", 1);
     REQUIRE(el != nullptr);
     CHECK_EQ(pint(el, "n_embd"), 5376);
-    CHECK_NEAR(pflt(el, "mult"), std::sqrt(5376.0), 1e-9);
+    CHECK_NEAR(pflt(el, "mult"), 73.5, 1e-9);
     CHECK(el->w.size() == 1 && find_op(b, "embed_lookup", 0)->w == el->w);
 
     for (const auto& o : b.ops)
@@ -5888,6 +3817,7 @@ TEST(gemma4_probe_names_the_heads_operating_depth) {
     CHECK_OK(gemma4_bf16::probe(&with, &p));
     CHECK_EQ(p.draft_depth, gemma4_bf16::kHeadDepth);
     CHECK_EQ(p.draft_depth_fixed, 0);
+    CHECK_EQ(p.chain_pays, 0);   /* chained launches never measured with the head */
     RadArchProbe q{};
     RadModelMeta without = gemma4_meta();
     CHECK_OK(gemma4_bf16::probe(&without, &q));
@@ -5947,10 +3877,6 @@ int count_resolved(const RadBuilder& b, const std::string& name) {
     int n = 0;
     for (const auto& o : b.ops) if (o.op == name && o.resolved) ++n;
     return n;
-}
-
-int count_issued(const std::vector<std::string>& v, const std::string& name) {
-    return (int)std::count(v.begin(), v.end(), name);
 }
 
 }  /* namespace */
@@ -6114,6 +4040,7 @@ TEST(gemma4_probe_names_the_dflash_blocks_depth) {
     CHECK_OK(gemma4::probe(&meta, &p));
     CHECK_EQ(p.draft_depth, 15);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 1);   /* chained launches measured a gain with DFlash */
 
     for (size_t i = 0; i < keys.size(); ++i)
         if (!std::strcmp(keys[i], "draft.architectures")) vals[i] = "[\"DFlash2DraftModel\"]";
@@ -6681,6 +4608,1312 @@ TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
     CHECK_EQ(count_issued(issued_ops(b, c), "rmsnorm_quant_fp8"), 0);
 }
 
+/* At four ranks the junctions carry their reductions at decode heights, in the same issue order as
+ * at two ranks (only the embedding's and the last layer's feed-forward reduction stand alone),
+ * through ar_rmsnorm_quant_i8 declared at world_size 4 up to 16 rows (kAr4FoldRows: a DFlash
+ * verify's rows, which libr4d folds in its tail form, inside its one-shot band of 524288 / 5376 =
+ * 97), and beside each the same op with `sp` (the all-reduce split around the junction) over the
+ * same 16 rows, which a step from 4 rows takes. A taller step issues each reduction and its
+ * junction apart, and where no library declares the fold every step issues the pair. */
+TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_decode_heights) {
+    const int L = 12;
+    std::vector<std::string> folded = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
+    std::vector<std::string> apart  = folded;
+    /* beside each reduction, up to a step of 16 rows: a prefetch (prefetch_beside) */
+    auto pf = [](std::vector<std::string>& v, std::vector<std::string> s, bool next) {
+        std::vector<std::string> out = { "prefetch" };   /* o_proj's, beside the attention */
+        for (const auto& x : s) {
+            if ((x == "ar_rmsnorm_quant_i8" || x == "all_reduce") && (next || &x != &s.back()))
+                out.push_back("prefetch");
+            out.push_back(x);
+        }
+        v.insert(v.end(), out.begin(), out.end());
+    };
+    std::vector<std::string> apart_tall = folded, folded_bare = folded;
+    for (int l = 0; l < L; ++l) {
+        const bool global = (l + 1) % 6 == 0;
+        for (int i = 0; i < (global ? 2 : 3); ++i)
+            for (auto* v : { &folded, &apart, &apart_tall, &folded_bare }) v->push_back("gemm_nt_q");
+        const std::vector<std::string> fs = { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                                              "gemm_nt_q", "ar_rmsnorm_quant_i8", "gemm_nt_q",
+                                              "gelu_mul_quant_i8", "gemm_nt_q" };
+        const std::vector<std::string> as = { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                                              "gemm_nt_q", "all_reduce", "rmsnorm_quant_i8",
+                                              "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q",
+                                              "all_reduce" };
+        pf(folded, fs, true);
+        folded_bare.insert(folded_bare.end(), fs.begin(), fs.end());
+        pf(apart, as, true);
+        apart_tall.insert(apart_tall.end(), as.begin(), as.end());
+        if (l < L - 1) {
+            folded.push_back("prefetch");
+            apart_tall.push_back("rmsnorm_quant_i8");
+            folded_bare.push_back("ar_rmsnorm_quant_i8");
+            folded.push_back("ar_rmsnorm_quant_i8");
+            apart.push_back("rmsnorm_quant_i8");
+        } else {
+            folded.push_back("prefetch");   /* the lm_head's */
+            for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) {
+                folded.push_back(s);
+                folded_bare.push_back(s);
+            }
+            for (const char* s : { "rmsnorm", "add", "scale" }) {
+                apart.push_back(s);
+                apart_tall.push_back(s);
+            }
+        }
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        for (auto* v : { &folded, &apart, &apart_tall, &folded_bare }) v->push_back(s);
+    /* a decode step folds */
+    CHECK_EQ(join(gemma4_w4_step({}, 4)), join(folded));
+    /* where the library refuses `prefetch`, no reads */
+    CHECK_EQ(join(gemma4_w4_step({ "prefetch" }, 4)), join(folded_bare));
+
+    auto declare4 = [](RadBuilder& b) {
+        const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+        b.encs = { { "attn_q.", w4 }, { "attn_k.", w4 }, { "attn_v.", w4 }, { "attn_o.", w4 },
+                   { "ffn_gate_up.", w4 }, { "ffn_down.", w4 } };
+        RadModelMeta meta = gemma4_meta();
+        RadBuildCtx  ctx  = build_ctx(0, 4);
+        return gemma4_bf16::declare(&b, &meta, &ctx);
+    };
+    RadBuilder b;
+    CHECK_OK(declare4(b));
+    CHECK(noted(b, "folded in at steps of 16 rows or fewer"));
+    auto fold_hi = [](const RadBuilder& bb, int* n) {
+        int64_t hi = -1;
+        *n = 0;
+        for (const auto& o : bb.ops) {
+            if (o.op != "ar_rmsnorm_quant_i8" || pint(&o, "sp") != -12345) continue;
+            ++*n;
+            CHECK_EQ(pint(&o, "world_size"), 4);
+            for (const auto& p : o.p)
+                if (p.key == "M") hi = p.ihi;
+        }
+        return hi;
+    };
+    int n_ar = 0;
+    CHECK_EQ(fold_hi(b, &n_ar), 16);
+    CHECK_EQ(n_ar, 2 * L - 1);
+    /* the split form beside each fold, over its 16 rows; the residual on every row (sp 2) only
+     * before the last layer's feed-forward, with no drafter tapping the stream here */
+    auto sp_hi = [](const RadBuilder& bb, int* n, int* n2) {
+        int64_t hi = -1;
+        *n = 0; *n2 = 0;
+        for (const auto& o : bb.ops) {
+            if (o.op != "ar_rmsnorm_quant_i8" || pint(&o, "sp") == -12345) continue;
+            ++*n;
+            if (pint(&o, "sp") == 2) ++*n2;
+            else CHECK_EQ(pint(&o, "sp"), 1);
+            CHECK_EQ(pint(&o, "world_size"), 4);
+            for (const auto& p : o.p)
+                if (p.key == "M") hi = p.ihi;
+        }
+        return hi;
+    };
+    int n_sp = 0, n_sp2 = 0;
+    CHECK_EQ(sp_hi(b, &n_sp, &n_sp2), 16);
+    CHECK_EQ(n_sp, 2 * L - 1);
+    CHECK_EQ(n_sp2, 1);
+    /* which form a step's junctions take: the split one from 4 rows, the fold below */
+    auto sp_issued = [&b](const RadCtx& c) {
+        int n = 0, folds = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "ar_rmsnorm_quant_i8") continue;
+            ++folds;
+            if (pint(o, "sp") != -12345) ++n;
+        }
+        return std::make_pair(n, folds);
+    };
+
+    /* 20 MB of gate_up beside the attention's reduction and of the next layer's q beside the
+     * feed-forward's, and 9 MB of down_proj beside the attention */
+    int n_pf = 0, n_pf9 = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "prefetch") {
+            ++n_pf;
+            if (pint(&o, "bytes") == (int64_t)9 << 20) ++n_pf9;
+            else CHECK_EQ(pint(&o, "bytes"), (int64_t)20 << 20);
+        }
+    CHECK_EQ(n_pf, 3 * L);
+    CHECK_EQ(n_pf9, (int)L);
+
+    /* a verify's height folds (libr4d's tail form) and a step past 16 rows issues the pair; the
+     * prefetches ride a decode step's (a verify's) 16 rows, never a prompt's rows and not a step
+     * past 16 */
+    const int32_t out[1] = { 127 };
+    for (int rows : { 16, 128 }) {
+        RadBatch tall = one_prompt(rows, out);
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &tall;
+        gemma4_bf16::step(&c, &tall);
+        CHECK(c.step_fail.empty());
+        /* a prompt's rows: no reads */
+        CHECK_EQ(join(issued_ops(b, c)), join(rows <= 16 ? folded_bare : apart_tall));
+        /* the same rows as a decode step (a verify's) take them, up to 16 */
+        tall.phase = RAD_PHASE_DECODE;
+        RadCtx d; d.b = &b; d.rank = 0; d.world = 4; d.batch = &tall;
+        gemma4_bf16::step(&d, &tall);
+        CHECK(d.step_fail.empty());
+        CHECK_EQ(join(issued_ops(b, d)), join(rows <= 16 ? folded : apart_tall));
+        if (rows <= 16) CHECK(sp_issued(d) == std::make_pair(2 * L - 1, 2 * L - 1));
+    }
+    /* three rows: the fold; eight users' verify (64 rows): the pair */
+    for (int rows : { 3, 64 }) {
+        RadBatch v = one_prompt(rows, out);
+        v.phase = RAD_PHASE_DECODE;
+        RadCtx d; d.b = &b; d.rank = 0; d.world = 4; d.batch = &v;
+        gemma4_bf16::step(&d, &v);
+        CHECK(d.step_fail.empty());
+        if (rows == 64) CHECK_EQ(join(issued_ops(b, d)), join(apart_tall));
+        CHECK(sp_issued(d) == (rows == 3 ? std::make_pair(0, 2 * L - 1) : std::make_pair(0, 0)));
+    }
+
+
+    /* no library declares the fold: none declared, every step issues the pair */
+    RadBuilder off;
+    off.undeclared.insert("ar_rmsnorm_quant_i8");
+    CHECK_OK(declare4(off));
+    CHECK(noted(off, "issued apart"));
+    for (const auto& o : off.ops) CHECK(o.op != "ar_rmsnorm_quant_i8");
+}
+
+/* ============ gemma4 31B + DFlash: z-lab's block drafter on the w4a8 / w8a8 trunk ============ */
+
+namespace {
+
+/* The twelve-layer 31B above with z-lab/gemma-4-31B-it-DFlash merged under `draft.` as
+ * `rad-convert --draft-model` writes it: its own geometry (5376 wide, 64 heads / 8 kv x 128, ffn
+ * 10752, five layers -- four sliding over 2048, one full -- at block 16), reading the trunk at three
+ * of the fixture's twelve layers where the real one reads six of sixty. */
+std::vector<const char*> g431df_keys() {
+    std::vector<const char*> k(std::begin(k_gem4_keys), std::end(k_gem4_keys));
+    for (const char* s : { "draft.architectures", "draft.num_hidden_layers", "draft.head_dim",
+                           "draft.num_attention_heads", "draft.num_key_value_heads",
+                           "draft.intermediate_size", "draft.rms_norm_eps", "draft.rope_theta",
+                           "draft.hidden_size", "draft.vocab_size", "draft.block_size",
+                           "draft.dflash_config.target_layer_ids",
+                           "draft.dflash_config.mask_token_id", "draft.layer_types",
+                           "draft.sliding_window" })
+        k.push_back(s);
+    return k;
+}
+std::vector<const char*> g431df_vals() {
+    std::vector<const char*> v(std::begin(k_gem4_vals), std::end(k_gem4_vals));
+    for (const char* s : { "[\"DFlashDraftModel\"]", "5", "128", "64", "8", "10752", "1e-06",
+                           "1000000", "5376", "262144", "16", "[1, 5, 9]", "4",
+                           "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+                           "\"sliding_attention\", \"full_attention\"]",
+                           "2048" })
+        v.push_back(s);
+    return v;
+}
+
+struct G431Df {
+    std::vector<const char*> keys = g431df_keys(), vals = g431df_vals();
+    RadModelMeta meta() const {
+        RadModelMeta m = gemma4_meta();
+        m.n_kv   = (int)keys.size();
+        m.kv_key = keys.data();
+        m.kv_val = vals.data();
+        return m;
+    }
+};
+
+/* The trunk at w4a8 as the -df recipe makes it, the drafter's linears on one 8-bit grid -- the
+ * E4M3 one (block fp8) or the int8 one (w8a8) -- and, with `head`, the table's 8-bit copy in the
+ * same grid. The drafter's keys come FIRST: the fake answers the first key a name contains, and
+ * `attn_q.` is in `dflash.blk.0.attn_q.weight` too. With `fused`, the trunk's q, k and v are one
+ * linear, as a recipe naming `blk.*.attn_qkv.weight` converts them. */
+void g431df_encs(RadBuilder& b, bool i8, bool head, bool fused = false) {
+    const RadEncoding w4  = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    const RadEncoding q8  = rad_enc_affine(RAD_I8, RAD_F16, 1, 128);
+    const RadEncoding& d  = i8 ? q8 : fp8;
+    b.encs = { { "dflash.fc.", d }, { "dflash.blk.", d } };
+    if (head) b.encs.push_back({ "dflash.draft_head.", d });
+    if (fused) b.encs.push_back({ "attn_qkv.", w4 });
+    else
+        for (const char* s : { "attn_q.", "attn_k.", "attn_v." }) b.encs.push_back({ s, w4 });
+    for (const char* s : { "attn_o.", "ffn_gate_up.", "ffn_down." })
+        b.encs.push_back({ s, w4 });
+}
+
+int count_writes_to(const RadBuilder& b, const RadCtx& c, int buf) {
+    int n = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && std::find(o->writes.begin(), o->writes.end(), (rad_buf)buf) != o->writes.end())
+            ++n;
+    }
+    return n;
+}
+
+rad_kvgroup kv_named(const RadBuilder& b, const char* name) {
+    for (size_t i = 0; i < b.kv_groups.size(); ++i)
+        if (b.kv_groups[i].name == name) return (rad_kvgroup)(i + 1);
+    return 0;
+}
+
+}  /* namespace */
+
+/* The 31B declares z-lab's drafter as a block drafter past its trunk: five layers at 12..16 on a KV
+ * group of their own, the trunk's taps in one plane, its embedding read at the reference's scale,
+ * and the depth the block was trained at, the only one it serves, which probe names for rad-convert
+ * and `--num-speculative-tokens auto`. Without speculation none of it is declared. */
+TEST(gemma4_31b_declares_dflash_as_a_block_drafter_past_its_trunk) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    for (const bool served : { true, false }) {
+    RadBuilder b;
+    g431df_encs(b, false, false);
+    if (!served) b.refuse.insert("attn_paged_qrow");
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 15;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    CHECK_EQ(b.drafter_name, std::string("dflash"));
+    CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+    CHECK_EQ(b.drafter.depth, 15);
+    CHECK_EQ((int)b.drafter.block, 16);
+    CHECK_EQ(b.drafter.mask_token, 4);
+    CHECK(!b.drafter_shared);
+    CHECK_EQ(b.drafter.proposal, (rad_buf)buf_named(b, "dflash_tokens"));
+
+    /* its own cache, the five layers past the trunk's twelve bound to it */
+    const rad_kvgroup kvd = kv_named(b, "kv_draft");
+    REQUIRE(kvd != 0);
+    CHECK_EQ((int)b.kv_groups[kvd - 1].d.kind, (int)RAD_KV_FULL);
+    CHECK_EQ(b.kv_groups[kvd - 1].d.head_dim, 128);
+    /* 64 heads over 8 kv heads is gqa 8. Where a card serves it under attn_paged_qrow (libr4d's
+     * head-128 kernel with two query groups a kv head), the cache holds each kv head once and
+     * attention runs at gqa 8. Where not, libr4d's head-128 attention takes 4 queries per kv head
+     * at a block of 16: the cache holds each kv head twice, the projections stay 8 heads wide, and
+     * every attention and cache write of the drafter sees 16 kv heads at gqa 4. */
+    const int64_t heads = served ? 8 : 16;
+    CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, heads);
+    CHECK_EQ(b.bufs[buf_named(b, "df_k") - 1].d.shape[1], 8 * 128);
+    if (served) CHECK_EQ(buf_named(b, "df_k4"), 0);
+    else        CHECK_EQ(b.bufs[buf_named(b, "df_k4") - 1].d.shape[1], 16 * 128);
+    {
+        int n_attn = 0, n_store = 0;
+        for (const auto& o : b.ops) {
+            /* the asking ops (qrow_serves) name no buffer */
+            if (o.op == (served ? "attn_paged_qrow" : "attn_paged") && pint(&o, "head_dim") == 128 &&
+                !o.reads.empty()) {
+                ++n_attn;
+                CHECK_EQ(pint(&o, "gqa"), served ? 8 : 4);
+                CHECK_EQ(pint(&o, "n_head"), 64);
+            }
+            if (o.op == "kv_store" && pint(&o, "head_dim") == 128) {
+                ++n_store;
+                CHECK_EQ(pint(&o, "n_head_kv"), heads);
+            }
+        }
+        CHECK_EQ(n_attn, 2);    /* the sliding layers' and the full layer's */
+        CHECK_EQ(n_store, 2);   /* the context pass's and the query pass's */
+    }
+    std::vector<int> bound;
+    for (const auto& [layer, g] : b.binds) if (g == kvd) bound.push_back(layer);
+    CHECK(bound == (std::vector<int>{ 12, 13, 14, 15, 16 }));
+
+    /* three taps of 5376 a row */
+    const int src = buf_named(b, "dflash_src");
+    REQUIRE(src > 0);
+    CHECK_EQ(b.bufs[src - 1].d.shape[1], 3 * 5376);
+
+    /* the drafter embeds the anchor and the masks through the TRUNK's table at 73.5 */
+    const RecOp* te = find_op(b, "embed_lookup", 0);
+    const RecOp* de = find_op(b, "embed_lookup", 1);
+    REQUIRE(te != nullptr && de != nullptr);
+    CHECK(te->w == de->w);
+    CHECK_NEAR(pflt(de, "mult"), 73.5, 1e-9);
+
+    /* one name map a declared weight: a COPY map repeated is refused by the real builder */
+    std::map<std::string, int> maps;
+    for (const auto& mp : b.maps) if (mp.mode == RAD_MAP_COPY) ++maps[mp.declared];
+    for (const auto& [name, n] : maps) CHECK_EQ(name + " x" + std::to_string(n), name + " x1");
+
+    RadArchProbe p{};
+    CHECK_OK(gemma4_bf16::probe(&meta, &p));
+    CHECK_EQ(p.draft_depth, 15);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 1);
+
+    /* no speculation: no drafter, no taps */
+    RadBuilder b0;
+    g431df_encs(b0, false, false);
+    RadBuildCtx c0 = build_ctx();
+    CHECK_OK(gemma4_bf16::declare(&b0, &meta, &c0));
+    CHECK_EQ(buf_named(b0, "dflash_src"), 0);
+    CHECK(b0.drafter_name.empty());
+
+    /* and a depth the block was not trained at is refused by name */
+    RadBuilder b4;
+    g431df_encs(b4, false, false);
+    RadBuildCtx c4 = build_ctx();
+    c4.max_spec = 4;
+    CHECK_EQ(gemma4_bf16::declare(&b4, &meta, &c4), RAD_E_UNSUPPORTED);
+    }
+}
+
+/* The taps on the w4a8 trunk are declared in the layer they copy, so `dflash_src` is live from its
+ * first write on (the arch/gemma4 trap that cost 98% of the drafts). Each is issued once its
+ * layer's output is whole, after the junction that adds the feed-forward, applies the layer scalar
+ * and quantises the next layer's input, so the copy is HF's hidden_states[l + 1]. */
+TEST(gemma4_31b_dflash_taps_the_stream_the_junction_leaves) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    g431df_encs(b, false, false);
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 15;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+
+    const int src = buf_named(b, "dflash_src"), gu = buf_named(b, "gate_up");
+    REQUIRE(src > 0 && gu > 0);
+    int first_src = -1, last_gu = -1;
+    for (size_t i = 0; i < b.ops.size(); ++i)
+        for (rad_buf w : b.ops[i].writes) {
+            if ((int)w == src && first_src < 0) first_src = (int)i;
+            if ((int)w == gu) last_gu = (int)i;
+        }
+    REQUIRE(first_src >= 0 && last_gu >= 0);
+    CHECK(first_src < last_gu);
+
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+    RadBatch batch = decode_batch();
+    c.batch = &batch;
+    gemma4_bf16::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    CHECK_EQ(count_writes_to(b, c, src), 3);
+    int t = 0;
+    for (size_t i = 0; i < c.issues.size(); ++i) {
+        const RecOp* o = b.op_of(c.issues[i].op);
+        if (!o || std::find(o->writes.begin(), o->writes.end(), (rad_buf)src) == o->writes.end())
+            continue;
+        REQUIRE(i > 0);
+        CHECK_EQ(b.op_of(c.issues[i - 1].op)->op, std::string("rmsnorm_quant_i8"));
+        REQUIRE(c.issues[i].opd.size() == 2);
+        CHECK_EQ(c.issues[i].opd[1].handle, (uint32_t)src);
+        CHECK_EQ(c.issues[i].opd[1].offset, (int64_t)t * 5376);   /* the tap's own column slice */
+        ++t;
+    }
+}
+
+/* A draft pass runs only the drafter: the context pass from the taps into the drafter's cache,
+ * the query pass over the block to the proposal. */
+TEST(gemma4_31b_dflash_passes_run_the_drafter_and_nothing_else) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    g431df_encs(b, false, true);
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 15;
+    CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+    const int src = buf_named(b, "dflash_src"), tok = buf_named(b, "dflash_tokens");
+
+    for (int pass : { -1, 1 }) {
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = pass;
+        c.batch = &batch;
+        gemma4_bf16::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> ops = issued_ops(b, c);
+        REQUIRE(!ops.empty());
+        CHECK_EQ(count_issued(ops, "gelu_mul_quant_i8"), 0);   /* no trunk layer */
+        CHECK_EQ(count_issued(ops, "kv_store"), 5);
+        if (pass < 0) {
+            CHECK_EQ(ops.front(), std::string("quant_act_fp8"));
+            const RecOp* o = b.op_of(c.issues.front().op);
+            CHECK(std::find(o->reads.begin(), o->reads.end(), (rad_buf)src) != o->reads.end());
+            CHECK_EQ(count_issued(ops, "attn_paged") + count_issued(ops, "attn_paged_qrow"), 0);
+        } else {
+            CHECK_EQ(ops.front(), std::string("embed_lookup"));
+            CHECK_EQ(count_issued(ops, "attn_paged") + count_issued(ops, "attn_paged_qrow"), 5);
+            CHECK_EQ(count_writes_to(b, c, tok), 1);
+        }
+    }
+}
+
+/* Q8, the drafter on the int8 grid. Every linear is gemm_nt_q at w8a8 over quant_act_i8's per-row
+ * activation, each residual add, norm and quantiser is one rmsnorm_quant_i8 (ten per draft pass, as
+ * rmsnorm_quant_fp8 is on the E4M3 grid), and nothing on the E4M3 grid is declared. The
+ * gate_up|silu|quant fold is fp8a8 only, so the int8 grid keeps silu_mul and the quantiser. Where
+ * rmsnorm_quant_i8 is refused, the chain runs. */
+TEST(gemma4_31b_dflash_on_the_int8_grid_reads_w8a8_and_folds_its_norms) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        g431df_encs(b, true, true);
+        if (refuse) b.refuse.insert("rmsnorm_quant_i8");
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+        CHECK(b.bufs[buf_named(b, "df_hq") - 1].d.dtype == RAD_I8);
+        CHECK_EQ(b.bufs[buf_named(b, "df_hs") - 1].d.shape[1], 1);   /* a scale a row */
+        const RecWeight* wq = find_w(b, "dflash.blk.0.attn_q.weight");
+        const RecWeight* sq = find_w(b, "dflash.blk.0.attn_q.scale");
+        REQUIRE(wq != nullptr && sq != nullptr);
+        CHECK(wq->d.dtype == RAD_I8 && sq->d.dtype == RAD_F16);
+        CHECK_EQ(sq->d.shape[1], 5376 / 128);
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = 1;
+        c.batch = &batch;
+        gemma4_bf16::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> ops = issued_ops(b, c);
+        CHECK_EQ(count_issued(ops, "rmsnorm_quant_i8"), refuse ? 0 : 10);
+        CHECK_EQ(count_issued(ops, "add"), refuse ? 10 : 1);
+        /* the attention output's and the gated product's a layer, x's twice a layer in the chain,
+         * and the head's copy of the gathered rows */
+        CHECK_EQ(count_issued(ops, "quant_act_i8"), (refuse ? 20 : 10) + 1);
+        CHECK_EQ(count_issued(ops, "silu_mul"), 5);
+        for (const char* fp : { "quant_act_fp8", "rmsnorm_quant_fp8", "gemm_nt_q_gated" })
+            CHECK_EQ(count_issued(ops, fp), 0);
+        int q = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "gemm_nt_q") continue;
+            CHECK_EQ(pstr(o, "dtype"), std::string("w8a8"));
+            ++q;
+        }
+        CHECK_EQ(q, 5 * 6 + 1);   /* six linears a layer, and the head */
+        if (refuse) continue;
+
+        /* the fused form's operands: rmsnorm_quant_i8's eight, the delta and the residual past
+         * layer 0, and no junction gains */
+        const uint32_t x = (uint32_t)buf_named(b, "df_x"), h = (uint32_t)buf_named(b, "df_h");
+        int k = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "rmsnorm_quant_i8") continue;
+            REQUIRE(i.opd.size() == 8);
+            CHECK_EQ(i.opd[0].handle, k++ == 0 ? x : h);
+            CHECK_EQ((int)i.opd[6].kind, (int)RAD_OPK_NONE);
+            CHECK_EQ((int)i.opd[7].kind, (int)RAD_OPK_NONE);
+        }
+
+        /* and the context pass: two quantisers, eleven w8a8 GEMMs (fc, then k and v a layer) */
+        RadCtx cc; cc.b = &b; cc.rank = 0; cc.world = 1;
+        RadBatch cb = decode_batch();
+        cb.draft_pass = -1;
+        cc.batch = &cb;
+        gemma4_bf16::step(&cc, &cb);
+        CHECK(cc.step_fail.empty());
+        const std::vector<std::string> cops = issued_ops(b, cc);
+        CHECK_EQ(count_issued(cops, "quant_act_i8"), 2);
+        CHECK_EQ(count_issued(cops, "gemm_nt_q"), 11);
+    }
+}
+
+/* The drafter's linears take one grid: one quantised activation feeds several of them, so an fc on
+ * the E4M3 grid and layers on the int8 one would read pairs nothing writes. Refused by name. */
+TEST(gemma4_31b_dflash_refuses_linears_on_two_grids) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    RadBuilder b;
+    g431df_encs(b, true, false);
+    b.encs[0].second = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);   /* fc on E4M3 */
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 15;
+    CHECK_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_E_DTYPE);
+}
+
+/* The head's int8 copy: where the container holds one, the gathered rows are quantised a row at a
+ * time and read by gemm_nt_q at w8a8 over it; otherwise the head reads the tied bf16 table. */
+TEST(gemma4_31b_dflash_head_reads_the_int8_copy_where_the_container_holds_one) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    for (int copy = 0; copy < 2; ++copy) {
+        RadBuilder b;
+        g431df_encs(b, true, copy == 1);
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+        const int dlog = buf_named(b, "df_dlog");
+        const RecOp* head = nullptr;
+        for (const auto& o : b.ops)
+            if (o.resolved &&
+                std::find(o.writes.begin(), o.writes.end(), (rad_buf)dlog) != o.writes.end())
+                head = &o;
+        REQUIRE(head != nullptr);
+        CHECK_EQ(head->op, std::string(copy ? "gemm_nt_q" : "gemm_nt"));
+        if (!copy) continue;
+        CHECK_EQ(pstr(head, "dtype"), std::string("w8a8"));
+        const int selq = buf_named(b, "df_selq"), sels = buf_named(b, "df_sels");
+        REQUIRE(selq > 0 && sels > 0);
+        CHECK(b.bufs[selq - 1].d.dtype == RAD_I8);
+        CHECK_EQ(b.bufs[sels - 1].d.shape[1], 1);
+        const RecWeight* hs = find_w(b, "dflash.draft_head.scale");
+        REQUIRE(hs != nullptr);
+        CHECK(hs->d.dtype == RAD_F16);
+        CHECK_EQ(hs->d.shape[0], 262144);
+        CHECK_EQ(hs->d.shape[1], 5376 / 128);
+    }
+}
+
+/* At four ranks, as the R9700 box serves it: the drafter's heads split 16 / 2 kv per rank, its head
+ * is vocab-sharded with the trunk's and merged by pair_argmax, and both 8-bit grids declare (the
+ * int8 one's prefill GEMM takes N in 256s, which a 256-row k and v still are). */
+TEST(gemma4_31b_dflash_at_four_ranks) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    for (int i8 = 0; i8 < 2; ++i8)
+    for (const bool served : { true, false }) {
+        RadBuilder b;
+        g431df_encs(b, i8 == 1, true);
+        if (!served) b.refuse.insert("attn_paged_qrow");
+        RadBuildCtx ctx = build_ctx(1, 4);
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+        const rad_kvgroup kvd = kv_named(b, "kv_draft");
+        REQUIRE(kvd != 0);
+        /* two kv heads a rank: once at gqa 8 where attn_paged_qrow serves it, else each held twice
+         * at gqa 4 (the declares test says why) */
+        CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, served ? 2 : 4);
+        CHECK_EQ(b.bufs[buf_named(b, "df_q") - 1].d.shape[1], 16 * 128);
+        CHECK_EQ(b.bufs[buf_named(b, "df_k") - 1].d.shape[1], 2 * 128);
+        CHECK(buf_named(b, "df_dgath") > 0);
+        for (const auto& o : b.ops)
+            if ((o.op == "attn_paged" || o.op == "attn_paged_qrow") && pint(&o, "head_dim") == 128 &&
+                !o.reads.empty())
+                CHECK_EQ(pint(&o, "gqa"), served ? 8 : 4);
+
+        RadCtx c; c.b = &b; c.rank = 1; c.world = 4;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = 1;
+        c.batch = &batch;
+        gemma4_bf16::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> ops = issued_ops(b, c);
+        CHECK_EQ(count_issued(ops, "pair_argmax"), 1);
+        CHECK_EQ(count_issued(ops, "all_gather"), 1);
+        /* the embedding's reduction and two a layer */
+        CHECK_EQ(count_issued(ops, "all_reduce"), 1 + 2 * 5);
+        /* k and v into the cache's layout: two heads, two copies each, a layer -- or none */
+        CHECK_EQ(count_issued(ops, "cast"), served ? 0 : 5 * 2 * (2 * 2));
+    }
+}
+
+/* The 31B's prefill in two slices (gemma4_bf16, trunk_overlap). The order and the work: every
+ * trunk reduction rides lane 1 behind its producer and ahead of its consumer and nothing else does;
+ * no two issues on different lanes reach the same rows unordered (`h` carries both reductions); the
+ * cut leaves both slices at least 512 rows; and the slices issue exactly the rows the whole step
+ * issues, the drafter's taps a slice each. Only `h` is taken out of the arena's sharing. A step
+ * under two slices, and a decode step, run whole with their reductions on lane 0. At two ranks the
+ * slices take the plain junctions, the whole step the ones with the all-reduce folded in. */
+TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_second_lane) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    const int64_t E = 5376, L = 12;
+    for (int world : { 4, 2 }) {
+        auto model = [&](RadBuilder& b, bool lossy) {
+            g431df_encs(b, false, true);
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_tok  = 4096;
+            ctx.max_spec = 15;
+            if (lossy) ctx.tp_wire_lossy = 1;   /* nothing shows a slice its bits on that wire */
+            return gemma4_bf16::declare(&b, &meta, &ctx);
+        };
+        auto run = [&](RadBuilder& b, RadCtx& c, RadBatch& batch) {
+            c.b = &b; c.rank = 0; c.world = world; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+        };
+
+        struct Case { int64_t T, cut; };
+        for (const Case k : { Case{4096, 2048}, Case{1100, 512}, Case{1024, 512}, Case{1023, 0} }) {
+            const int32_t out[1] = { (int32_t)(k.T - 1) };
+            RadBuilder b;
+            CHECK_OK(model(b, false));
+            CHECK(noted(b, "prefill overlap: a step of 1024 rows or more runs as two slices"));
+            /* `h`, and slice A's context end a KV group the attention reads (per-slice
+             * attention: the sliding and the global class) */
+            REQUIRE(b.concurrent.size() == 3);
+            CHECK_EQ(b.concurrent[0], (rad_buf)buf_named(b, "h"));
+            CHECK_EQ(b.concurrent[1], (rad_buf)buf_named(b, "slice_used_0"));
+            CHECK_EQ(b.concurrent[2], (rad_buf)buf_named(b, "slice_used_1"));
+            RadBatch batch = one_prompt(k.T, out);
+            RadCtx c;
+            run(b, c, batch);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(c.lane, 0);
+            CHECK_EQ(races(b, c), 0);
+
+            std::vector<int64_t> lane1;
+            int other1 = 0;
+            for (const auto& i : c.issues) {
+                if (i.lane != 1) continue;
+                const RecOp* o = b.op_of(i.op);
+                REQUIRE(o != nullptr);
+                if (o->op == "all_reduce") {
+                    lane1.push_back(i.n);
+                    /* the narrow launch beside compute, not the wide one op_ar resolves to */
+                    CHECK_EQ(pint(o, "overlap"), 1);
+                } else {
+                    ++other1;
+                }
+            }
+            CHECK_EQ(other1, 0);
+            if (k.cut == 0) {
+                CHECK(lane1.empty());
+            } else {
+                REQUIRE(lane1.size() == (size_t)(4 * L));
+                for (int64_t l = 0; l < L; ++l) {
+                    CHECK_EQ(lane1[4 * l + 0], k.cut * E);              /* attention, slice A */
+                    CHECK_EQ(lane1[4 * l + 1], (k.T - k.cut) * E);      /* attention, slice B */
+                    CHECK_EQ(lane1[4 * l + 2], k.cut * E);              /* feed-forward, slice A */
+                    CHECK_EQ(lane1[4 * l + 3], (k.T - k.cut) * E);      /* feed-forward, slice B */
+                }
+                CHECK_EQ(count_issued(issued_ops(b, c), "ar_rmsnorm_quant_i8"), 0);
+            }
+
+            /* The whole step, on the lossy wire: the same rows by op -- every junction, GEMM and
+             * quantiser over the same rows, the reductions over the same elements. */
+            RadBuilder w;
+            CHECK_OK(model(w, true));
+            CHECK(noted(w, "prefill overlap: off (the lossy all-reduce wire)"));
+            CHECK(w.concurrent.empty());
+            RadBatch wbatch = one_prompt(k.T, out);
+            RadCtx wc;
+            run(w, wc, wbatch);
+            CHECK(wc.step_fail.empty());
+            for (const auto& i : wc.issues) CHECK_EQ(i.lane, 0);
+            std::map<std::string, int64_t> sliced = rows_by_op(b, c, k.T), whole = rows_by_op(w, wc, k.T);
+            if (k.cut) {
+                /* attention once a slice, slice A's over its context end: one kv_len_trim a KV
+                 * group, which the whole step has no use for */
+                CHECK_EQ((int)ns_of(b, c, "kv_len_trim").size(), 2);
+                CHECK_EQ((int)ns_of(b, c, "attn_paged").size() + (int)ns_of(b, c, "attn_paged_qrow").size(),
+                         2 * (int)L);
+                sliced.erase("kv_len_trim");
+            }
+            if (world == 2 && k.cut == 0) {
+                /* At two ranks on the exact wire a step that runs whole folds all but two of its
+                 * reductions -- the embedding's and the last layer's feed-forward -- into its
+                 * 2L - 1 junctions; the lossy wire folds none. */
+                CHECK_EQ(sliced["ar_rmsnorm_quant_i8"], (2 * L - 1) * k.T);
+                sliced.erase("ar_rmsnorm_quant_i8");
+                sliced["all_reduce"] += (2 * L - 1) * k.T * E;
+                sliced["rmsnorm_quant_i8"] += (2 * L - 1) * k.T;
+            }
+            CHECK(sliced == whole);
+            CHECK_EQ((int)ns_of(b, c, "cast").size(), k.cut ? 6 : 3);   /* three taps, a slice each */
+        }
+
+        /* a library without kv_len_trim: the slices keep each layer's attention whole between them,
+         * with only `h` out of the arena's sharing and the reductions still on lane 1 */
+        {
+            const int32_t out[1] = { 4095 };
+            RadBuilder b;
+            b.undeclared.insert("kv_len_trim");
+            CHECK_OK(model(b, false));
+            REQUIRE(b.concurrent.size() == 1);
+            CHECK_EQ(b.concurrent[0], (rad_buf)buf_named(b, "h"));
+            RadBatch batch = one_prompt(4096, out);
+            RadCtx c;
+            run(b, c, batch);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(races(b, c), 0);
+            CHECK(ns_of(b, c, "kv_len_trim").empty());
+            CHECK_EQ((int)ns_of(b, c, "attn_paged").size() + (int)ns_of(b, c, "attn_paged_qrow").size(),
+                     (int)L);
+            int lane1 = 0;
+            for (const auto& i : c.issues) lane1 += i.lane == 1;
+            CHECK_EQ(lane1, 4 * (int)L);
+        }
+
+        /* a decode step runs whole: every reduction on lane 0; the prefetches beside them
+         * (prefetch_beside) follow lane 0's GEMM before each -- on lane 0 itself where launches
+         * chain (prefetch_lane0), else on lane 1 behind a join from that GEMM */
+        for (const bool pf_lane0 : { false, true }) {
+            const ChainOn chain(pf_lane0);
+            RadBuilder b;
+            CHECK_OK(model(b, false));
+            RadBatch d = decode_batch();
+            RadCtx c;
+            run(b, c, d);
+            CHECK(c.step_fail.empty());
+            const std::vector<std::string> ops = issued_ops(b, c);
+            int n_pf = 0;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const bool pf = ops[i] == "prefetch";
+                CHECK_EQ(c.issues[i].lane, pf && !pf_lane0 ? 1 : 0);
+                if (!pf) continue;
+                ++n_pf;
+                CHECK(i > 0 && ops[i - 1] == "gemm_nt_q" && ordered(c, i - 1, i));
+            }
+            CHECK_EQ(n_pf, 3 * (int)L);
+            CHECK_EQ((int)c.joins.size(), pf_lane0 ? 0 : n_pf);
+            CHECK_EQ(races(b, c), 0);
+            CHECK_EQ(count_issued(ops, "ar_rmsnorm_quant_i8"), 2 * (int)L - 1);
+        }
+    }
+
+    /* the overlap needs the fused junctions: a bf16 trunk keeps its chain and runs whole */
+    RadBuilder b;
+    RadModelMeta plain = gemma4_meta();
+    RadBuildCtx ctx = build_ctx(0, 4);
+    ctx.max_tok = 4096;
+    CHECK_OK(gemma4_bf16::declare(&b, &plain, &ctx));
+    CHECK(noted(b, "prefill overlap: off (the residual junctions are not fused)"));
+    CHECK(b.concurrent.empty());
+
+    /* and the switch: every step whole, nothing on the second lane */
+    setenv("RADIANCE_GEMMA4_OVERLAP", "0", 1);
+    RadBuilder sw;
+    g431df_encs(sw, false, true);
+    RadBuildCtx sctx = build_ctx(0, 4);
+    sctx.max_tok  = 4096;
+    sctx.max_spec = 15;
+    const int rc = gemma4_bf16::declare(&sw, &meta, &sctx);
+    unsetenv("RADIANCE_GEMMA4_OVERLAP");
+    CHECK_OK(rc);
+    CHECK(noted(sw, "prefill overlap: off (RADIANCE_GEMMA4_OVERLAP=0)"));
+    CHECK(sw.concurrent.empty());
+    const int32_t out[1] = { 4095 };
+    RadBatch big = one_prompt(4096, out);
+    RadCtx sc; sc.b = &sw; sc.rank = 0; sc.world = 4; sc.batch = &big;
+    gemma4_bf16::step(&sc, &big);
+    CHECK(sc.step_fail.empty());
+    for (const auto& i : sc.issues) CHECK_EQ(i.lane, 0);
+}
+
+/* Where no loaded library declares libr4d's fused ops (a CPU-only build, where rad-convert and the
+ * host backend run), asking for one is an error, so the 31B with its DFlash drafter asks first and
+ * declares the chains: the junctions, the attention prologue, the gated quantiser, the folded
+ * all-reduce, and the drafter's fused norm on the int8 grid. It declares on both grids, at one rank
+ * and two, and never asks for an undeclared op. */
+TEST(gemma4_31b_without_libr4d_declares_the_chains_and_asks_for_no_undeclared_op) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    for (int i8 = 0; i8 < 2; ++i8)
+        for (int world : { 1, 2 }) {
+            RadBuilder b;
+            g431df_encs(b, i8 == 1, true);
+            for (const char* op : { "rmsnorm_quant_i8", "gelu_mul_quant_i8", "qkv_norm_rope",
+                                    "qkv_norm_rope_kv_store", "ar_rmsnorm_quant_i8" })
+                b.undeclared.insert(op);
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_spec = 15;
+            CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
+            CHECK(b.asked_undeclared.empty());
+            RadCtx c; c.b = &b; c.rank = 0; c.world = world;
+            RadBatch batch = decode_batch();
+            c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+            CHECK(c.step_fail.empty());
+            const std::vector<std::string> ops = issued_ops(b, c);
+            CHECK_EQ(count_issued(ops, "rmsnorm_p"), 12);    /* the prologue's value norm, unfused */
+            CHECK_EQ(count_issued(ops, "gelu_mul"), 12);
+            batch.draft_pass = 1;
+            RadCtx d; d.b = &b; d.rank = 0; d.world = world; d.batch = &batch;
+            gemma4_bf16::step(&d, &batch);
+            CHECK(d.step_fail.empty());
+            CHECK_EQ(count_issued(issued_ops(b, d), "rmsnorm_quant_i8"), 0);
+        }
+}
+
+/* The 31B's engine steps lint clean with z-lab's drafter, on both of the drafter's grids, at one,
+ * two and four ranks (the first and last rank of each): a decode step, a mixed step, a prefill
+ * chunk tall enough to run as two slices, and a verify step with the drafter's context and query
+ * passes behind it. The lint holds the buffers each pass reads to what an earlier op of the step
+ * wrote and the planner kept alive, across the passes, so a tap whose plane the planner let another
+ * buffer share, or a drafter buffer read after its arena slot was reused, fails here. Eight
+ * sequences at a block of 16 is 128 query rows, past every fused band the drafter has. Both trunk
+ * layouts: q, k and v apart, and as one linear, where a one-row decode reads q in the row and a
+ * taller step copies it out. */
+TEST(gemma4_31b_steps_lint_clean_with_a_dflash_drafter) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    for (int fused = 0; fused < 2; ++fused)
+    for (int i8 = 0; i8 < 2; ++i8)
+        for (int world : { 1, 2, 4 })
+            for (int rank : { 0, world - 1 }) {
+                if (world == 1 && rank > 0) continue;
+                RadBuilder b;
+                g431df_encs(b, i8 == 1, true, fused == 1);
+                RadBuildCtx ctx = build_ctx(rank, world);
+                ctx.max_tok = 2048;
+                ctx.max_spec = 15;
+                REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+                REQUIRE_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+                for (const auto& k : { kit(b, { 1 }, {}), kit(b, { 1, 1, 1 }, {}),
+                                       kit(b, { 8, 1 }, { 5 }), kit(b, {}, { 1500 }) }) {
+                    const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                }
+                for (int64_t n_seq : { 2, 8 }) {
+                    const auto ver = kit(b, std::vector<int>((size_t)n_seq, 16), {});
+                    const auto ctxp = context_pass(b, *ver);
+                    const auto qry = query_pass(b, n_seq, 16, 15);
+                    const auto v = run_passes(b, gemma4_bf16::step,
+                                              { ver.get(), ctxp.get(), qry.get() }, rank, world);
+                    CHECK_PASSES(b, v);
+                }
+            }
+}
+
+/* ============ gemma4 31B + DFlash2: RedHatAI's speculators-format drafter ============ */
+namespace {
+/* The 31B fixture with a DFlash2 drafter in vLLM's speculators layout, as rad-convert merges
+ * RedHatAI/gemma-4-31B-it-speculator.dflash2's config.json: the speculator's own keys at the top of
+ * `draft.`, the decoder layers' config under `draft.transformer_layer_config.`, booleans as 1/0.
+ * Taps at aux ids 1 5 9 (the residual entering those layers) for the fixture's twelve layers. */
+struct G431Df2 {
+    std::vector<const char*> keys, vals;
+    G431Df2() {
+        keys.assign(std::begin(k_gem4_keys), std::end(k_gem4_keys));
+        vals.assign(std::begin(k_gem4_vals), std::end(k_gem4_vals));
+        const char* kv[][2] = {
+            { "draft.architectures", "[\"DFlash2DraftModel\"]" },
+            { "draft.speculators_model_type", "dflash2" },
+            { "draft.block_size", "8" },
+            { "draft.mask_token_id", "4" },
+            { "draft.aux_hidden_state_layer_ids", "[1, 5, 9]" },
+            { "draft.selector_rank", "256" },
+            { "draft.selector_top_k", "16" },
+            { "draft.conv_kernel_size", "2" },
+            { "draft.conv_group_size", "16" },
+            { "draft.sample_from_anchor", "0" },
+            { "draft.sliding_window_non_causal", "1" },
+            { "draft.draft_vocab_size", "262144" },
+            { "draft.transformer_layer_config.num_hidden_layers", "5" },
+            { "draft.transformer_layer_config.head_dim", "256" },
+            { "draft.transformer_layer_config.num_attention_heads", "32" },
+            { "draft.transformer_layer_config.num_key_value_heads", "16" },
+            { "draft.transformer_layer_config.intermediate_size", "21504" },
+            { "draft.transformer_layer_config.rms_norm_eps", "1e-06" },
+            { "draft.transformer_layer_config.rope_parameters.rope_theta", "10000.0" },
+            { "draft.transformer_layer_config.hidden_size", "5376" },
+            { "draft.transformer_layer_config.vocab_size", "262144" },
+            { "draft.transformer_layer_config.hidden_act", "silu" },
+            { "draft.transformer_layer_config.sliding_window", "2048" },
+            { "draft.transformer_layer_config.use_sliding_window", "1" },
+            { "draft.transformer_layer_config.layer_types",
+              "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+              "\"sliding_attention\", \"sliding_attention\"]" },
+        };
+        for (const auto& p : kv) { keys.push_back(p[0]); vals.push_back(p[1]); }
+    }
+    RadModelMeta meta() const {
+        RadModelMeta m = gemma4_meta();
+        m.n_kv   = (int)keys.size();
+        m.kv_key = keys.data();
+        m.kv_val = vals.data();
+        return m;
+    }
+};
+
+/* The -df2 recipe's grids: the drafter's linears at block fp8, its head copy int8 (or, without
+ * `head8`, no 8-bit encoding, which leaves the 2-bit grid), and the trunk at w4a8 with q|k|v fused. */
+void g431df2_encs(RadBuilder& b, bool head8) {
+    g431df_encs(b, false, false, true);
+    if (head8) b.encs.insert(b.encs.begin(), { "dflash.draft_head.", rad_enc_affine(RAD_I8, RAD_F16, 1, 128) });
+}
+}  /* namespace */
+
+/* The 31B declares RedHatAI's DFlash2 drafter as a block drafter past its trunk, read from the
+ * speculators layout: depth 7 (block 8, the anchor predicting nothing), mask 4, every layer on a
+ * 2048-token window, non-causal, its own windowed KV group of 16 kv heads x 256, the taps on the
+ * layers BEFORE the aux ids (1 5 9 -> 0 4 8), the trunk's table read unscaled, and its head on the
+ * 8-bit copy, the candidates merged across ranks where the head is vocab-sharded. */
+TEST(gemma4_31b_declares_redhats_dflash2_from_the_speculators_layout) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    RadBuildCtx pc = build_ctx();
+    pc.max_spec = 7;
+    int taps[8] = {};
+    CHECK_EQ(gemma4::dflash2_taps(&meta, &pc, 12, taps, 8), 3);
+    CHECK_EQ(taps[0], 0);
+    CHECK_EQ(taps[1], 4);
+    CHECK_EQ(taps[2], 8);
+    RadArchProbe p{};
+    CHECK_OK(gemma4_bf16::probe(&meta, &p));
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 1);   /* and with DFlash2 */
+
+    for (int world : { 1, 4 })
+    for (int head8 = 0; head8 < 2; ++head8) {
+        RadBuilder b;
+        g431df2_encs(b, head8 == 1);
+        RadBuildCtx ctx = build_ctx(0, world);
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+
+        CHECK_EQ(b.drafter_name, std::string("dflash2"));
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+        CHECK_EQ(b.drafter.depth, 7);
+        CHECK_EQ((int)b.drafter.block, 8);
+        CHECK_EQ(b.drafter.mask_token, 4);
+        CHECK_EQ(b.drafter.window, 2048);
+        CHECK_EQ(b.drafter.proposal, (rad_buf)buf_named(b, "dflash_tokens"));
+
+        const rad_kvgroup kvd = kv_named(b, "kv_draft");
+        REQUIRE(kvd != 0);
+        CHECK_EQ((int)b.kv_groups[kvd - 1].d.kind, (int)RAD_KV_WINDOW);
+        CHECK_EQ(b.kv_groups[kvd - 1].d.head_dim, 256);
+        CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, 16 / world);
+
+        const int src = buf_named(b, "dflash_src");
+        REQUIRE(src > 0);
+        CHECK_EQ(b.bufs[src - 1].d.shape[1], 3 * 5376);
+
+        /* attention: head 256, gqa 2, non-causal, the window */
+        int n_attn = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "attn_paged" && pint(&o, "head_dim") == 256 && pint(&o, "window") == 2048 &&
+                pint(&o, "causal") == 0) {
+                ++n_attn;
+                CHECK_EQ(pint(&o, "gqa"), 2);
+            }
+        CHECK_EQ(n_attn, 1);
+
+        /* the drafter's lookup reads the trunk's table without Gemma's scale */
+        const RecOp* te = find_op(b, "embed_lookup", 0);
+        const RecOp* de = find_op(b, "embed_lookup", 1);
+        REQUIRE(te != nullptr && de != nullptr);
+        CHECK(te->w == de->w);
+        CHECK_NEAR(pflt(te, "mult"), 73.5, 1e-9);
+        CHECK(param(de, "mult") == nullptr);
+
+        /* the head: 8-bit where the copy is int8, else the 2-bit grid; merged across ranks */
+        bool head_seen = false;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q" && pint(&o, "K") == 5376 && pint(&o, "N") == 262144 / world) {
+                head_seen = true;
+                CHECK_EQ(pstr(&o, "dtype"), std::string(head8 ? "w8a8" : "w2a8"));
+            }
+        CHECK(head_seen);
+        CHECK_EQ(count_op(b, "row_topk_merge"), world > 1 ? 1 : 0);
+        CHECK_EQ(count_op(b, "dflash_select"), 1);
+    }
+}
+
+/* DFlash2's two passes each run their attention prologue as one launch a layer where
+ * qkv_norm_rope_kv_store resolves: the query pass with its q heads (8 a rank at four ranks; v_norm
+ * 0), the context pass with none (n_head 0: the keys alone, q passed as k's buffer, which it does
+ * not read). With the fold refused, both chains return: the norms, the rotaries and kv_store. */
+TEST(gemma4_31b_dflash2_folds_both_passes_prologues) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int L = 5;
+    for (int off = 0; off < 2; ++off) {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        if (off) b.refuse.insert("qkv_norm_rope_kv_store");
+        RadBuildCtx ctx = build_ctx(0, 4);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const auto ver = kit(b, { 8 }, {});
+        const auto ctxp = context_pass(b, *ver);
+        const auto qry = query_pass(b, 1, 8, 7);
+        const auto v = run_passes(b, gemma4_bf16::step, { ctxp.get(), qry.get() }, 0, 4);
+        REQUIRE(steps_ok(v));
+        for (int p = 0; p < 2; ++p) {
+            const RadCtx& c = *v[(size_t)p];
+            int fused = 0;
+            for (const RecIssue& is : c.issues) {
+                const RecOp* o = b.op_of(is.op);
+                if (!o || o->op != "qkv_norm_rope_kv_store") continue;
+                ++fused;
+                CHECK_EQ(pint(o, "n_head"), p == 0 ? 0 : 8);
+                CHECK_EQ(pint(o, "v_norm"), 0);
+                if (p == 0) {
+                    REQUIRE(is.opd.size() >= 2);
+                    CHECK_EQ(is.opd[0].handle, is.opd[1].handle);
+                }
+            }
+            const std::vector<std::string> ops = issued_ops(b, c);
+            CHECK_EQ(fused, off ? 0 : L);
+            CHECK_EQ(count_issued(ops, "kv_store"), off ? L : 0);
+            CHECK_EQ(count_issued(ops, "rope"), off ? (p == 0 ? L : 2 * L) : 0);
+        }
+    }
+}
+
+/* DFlash2's query pass issues each residual add with the norm after it, as one add_rmsnorm where it
+ * resolves: after every attention (the feed-forward norm) and every feed-forward (the next layer's
+ * attention norm, after the last the final norm), ten on the 31B's five layers, no add left and
+ * one plain norm (layer 0's, after the embedding). With add_rmsnorm refused, the pairs. */
+TEST(gemma4_31b_dflash2_folds_each_residual_add_into_the_next_norm) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int L = 5;
+    for (int off = 0; off < 2; ++off) {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        if (off) b.refuse.insert("add_rmsnorm");
+        RadBuildCtx ctx = build_ctx(0, 4);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const auto qry = query_pass(b, 1, 8, 7);
+        const auto v = run_passes(b, gemma4_bf16::step, { qry.get() }, 0, 4);
+        REQUIRE(steps_ok(v));
+        const std::vector<std::string> ops = issued_ops(b, *v[0]);
+        CHECK_EQ(count_issued(ops, "add_rmsnorm"), off ? 0 : 2 * L);
+        CHECK_EQ(count_issued(ops, "add"), off ? 2 * L : 0);
+        CHECK_EQ(count_issued(ops, "rmsnorm"), off ? 2 * L + 1 : 1);
+    }
+}
+
+/* DFlash2's query pass reads the next GEMM's weight into the cache beside each of its all-reduces
+ * (prefetch_beside, rad_arch.h): the layer's gate_up beside the attention's, the next layer's q --
+ * after the last layer, the draft head -- beside the feed-forward's, and o's beside the attention,
+ * 20 MB each, after the GEMM before it: on lane 0 where launches chain (prefetch_lane0), else on
+ * lane 1 behind a join. One rank has no reduction to sit beside and declares none, and neither
+ * does a library without `prefetch`. */
+TEST(gemma4_31b_dflash2_query_pass_prefetches_beside_its_all_reduces) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int L = 5;
+    for (int world : { 1, 4 })
+        for (int k = 0; k < 4; ++k) {
+            const int off = k & 1, pf_lane = k < 2 ? 1 : 0;   /* lane 0 where launches chain */
+            const ChainOn chain(pf_lane == 0);
+            RadBuilder b;
+            g431df2_encs(b, true);
+            if (off) b.undeclared.insert("prefetch");
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_tok = 2048;
+            ctx.max_spec = 7;
+            const int rc = gemma4_bf16::declare(&b, &meta, &ctx);
+            REQUIRE_EQ(rc, RAD_OK);
+            const auto qry = query_pass(b, 1, 8, 7);
+            const auto v = run_passes(b, gemma4_bf16::step, { qry.get() }, 0, world);
+            REQUIRE(steps_ok(v));
+            const RadCtx& c = *v[0];
+            const std::vector<std::string> ops = issued_ops(b, c);
+            std::vector<std::string> read;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                if (ops[i] != "prefetch") {
+                    CHECK_EQ(c.issues[i].lane, 0);
+                    continue;
+                }
+                CHECK_EQ(c.issues[i].lane, pf_lane);
+                size_t g = i;   /* the GEMM before this read (and any read issued with it) */
+                while (g > 0 && ops[g - 1] == "prefetch") --g;
+                CHECK(g > 0 && ops[g - 1] == "gemm_nt_q" &&
+                      ordered(c, g - 1, i));
+                CHECK(i + 1 < ops.size() &&
+                      (ops[i + 1] == "all_reduce" || ops[i + 1] == "qkv_norm_rope_kv_store" ||
+                       ops[i + 1] == "prefetch"));
+                const RecOp* o = b.op_of(c.issues[i].op);
+                REQUIRE(o != nullptr && o->w.size() == 1);
+                CHECK_EQ(pint(o, "bytes"), (int64_t)20 << 20);
+                read.push_back(b.weights[o->w[0] - 1].name);
+            }
+            CHECK_EQ(races(b, c), 0);
+            if (world == 1 || off) {
+                CHECK(read.empty());
+                continue;
+            }
+            /* a layer: o; the feed-forward's coefficient projection and gate_up; the next
+             * layer's attention coefficient projection and q -- after the last, the draft head */
+            REQUIRE_EQ((int)read.size(), 5 * L - 1);
+            std::vector<std::string> want;
+            for (int l = 0; l < L; ++l) {
+                const std::string bl = "dflash.blk." + std::to_string(l) + ".";
+                const std::string nx = "dflash.blk." + std::to_string(l + 1) + ".";
+                for (const std::string& s : { bl + "attn_output", bl + "ffn_conv_proj",
+                                              bl + "ffn_gate_up" })
+                    want.push_back(s);
+                if (l + 1 < L) { want.push_back(nx + "attn_conv_proj"); want.push_back(nx + "attn_q"); }
+                else           want.push_back("dflash.draft_head");
+            }
+            for (size_t k = 0; k < want.size(); ++k) CHECK(read[k].find(want[k]) == 0);
+        }
+}
+
+/* Every engine step with RedHatAI's DFlash2 behind the trunk lints clean at one, two and four ranks:
+ * decode, a mixed step, a prefill chunk, and a verify step with the drafter's context and query
+ * passes behind it (block 8). */
+TEST(gemma4_31b_steps_lint_clean_with_a_dflash2_drafter) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 })
+        for (int rank : { 0, world - 1 }) {
+            if (world == 1 && rank > 0) continue;
+            RadBuilder b;
+            g431df2_encs(b, true);
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_tok = 2048;
+            ctx.max_spec = 7;
+            REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+            for (const auto& k : { kit(b, { 1 }, {}), kit(b, { 1, 1, 1 }, {}),
+                                   kit(b, { 8, 1 }, { 5 }), kit(b, {}, { 1500 }) }) {
+                const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+            for (int64_t n_seq : { 2, 8 }) {
+                const auto ver = kit(b, std::vector<int>((size_t)n_seq, 8), {});
+                const auto ctxp = context_pass(b, *ver);
+                const auto qry = query_pass(b, n_seq, 8, 7);
+                const auto v = run_passes(b, gemma4_bf16::step,
+                                          { ver.get(), ctxp.get(), qry.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+        }
+}
+
+/* DFlash2's fc, split by rows over the ranks and kept bit for bit. At four ranks each rank hands
+ * over 1344 of c's 5376 columns and computes the 11 whole scale blocks covering them (1408 rows: a
+ * span of the one stored weight, so a container converted before the split serves it), its window
+ * starting 0 or 64 rows in; the GEMM takes its K split from the whole 5376 rows (split_n), and the
+ * all_gather reads each window at the GEMM output's pitch and writes c whole. At two ranks a share
+ * is 21 whole blocks; at one rank the fc is whole, and so is an MXFP4 fc at four (its GEMM picks
+ * its own K split, so only block fp8 splits). */
+TEST(gemma4_31b_dflash2_fc_splits_by_rows_without_changing_a_bit) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int64_t E = 5376, K = 3 * E;   /* the fixture taps three trunk layers */
+    struct Case { int world; int rank; int64_t lo, hi, share; };
+    for (const Case cs : { Case{ 4, 0, 0, 1408, 1344 }, Case{ 4, 1, 1280, 2688, 1344 },
+                           Case{ 4, 2, 2688, 4096, 1344 }, Case{ 4, 3, 3968, 5376, 1344 },
+                           Case{ 2, 0, 0, 2688, 2688 }, Case{ 2, 1, 2688, 5376, 2688 },
+                           Case{ 1, 0, 0, 0, 0 } }) {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        RadBuildCtx ctx = build_ctx(cs.rank, cs.world);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const RecWeight* fw = find_w(b, "dflash.fc.weight");
+        const RecWeight* fs = find_w(b, "dflash.fc.scale");
+        REQUIRE(fw != nullptr);
+        REQUIRE(fs != nullptr);
+        CHECK_EQ(fw->d.shape[1], K);
+        CHECK(find_w(b, "dflash.fc_tail.weight") == nullptr);
+        int split_gemms = 0, fc_gathers = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "gemm_nt_q" && pint(&o, "split_n") == E) {
+                ++split_gemms;
+                CHECK_EQ(pint(&o, "N"), (long long)(cs.hi - cs.lo));
+            }
+            if (o.op == "all_gather" && pint(&o, "row") == cs.share) {
+                ++fc_gathers;
+                CHECK_EQ(pint(&o, "numel"), (long long)(2048 * E));   /* the trunk's instance */
+                CHECK_EQ(pint(&o, "world_size"), (long long)cs.world);
+            }
+        }
+        if (!cs.share) {
+            CHECK_EQ(fw->d.shape[0], E);
+            CHECK_EQ(fw->d.shard, RAD_SHARD_NONE);
+            CHECK(!fw->span_set);
+            CHECK_EQ(split_gemms, 0);
+            continue;
+        }
+        CHECK_EQ(fw->d.shape[0], cs.hi - cs.lo);
+        CHECK_EQ(fw->d.shard, RAD_SHARD_ROW);
+        CHECK(fw->span_set);
+        CHECK_EQ(fw->span_lo, cs.lo);
+        CHECK_EQ(fw->span_hi, cs.hi);
+        CHECK(fs->span_set);   /* the scale plane's span is in 128-row blocks */
+        CHECK_EQ(fs->span_lo, cs.lo / 128);
+        CHECK_EQ(fs->span_hi, cs.hi / 128);
+        /* the window covers exactly this rank's share */
+        CHECK(cs.lo <= cs.rank * cs.share && (cs.rank + 1) * cs.share <= cs.hi);
+        CHECK_EQ(split_gemms, 1);
+        CHECK_EQ(fc_gathers, 1);
+    }
+
+    /* An MXFP4 drafter: fc whole on every rank. */
+    {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        for (auto& e : b.encs)
+            if (e.first == "dflash.fc." || e.first == "dflash.blk.")
+                e.second = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+        RadBuildCtx ctx = build_ctx(1, 4);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const RecWeight* fw = find_w(b, "dflash.fc.weight");
+        REQUIRE(fw != nullptr);
+        CHECK_EQ(fw->d.shape[0], E);
+        CHECK_EQ(fw->d.shard, RAD_SHARD_NONE);
+        CHECK(find_w(b, "dflash.fc_tail.weight") == nullptr);
+        for (const RecOp& o : b.ops) CHECK(pint(&o, "split_n") != E);
+    }
+}
+
+/* Where the container holds q, k and v as one linear (a recipe naming blk.*.attn_qkv.weight), the
+ * 31B declares one projection a layer -- q | k | v on a sliding layer, q | k on a global one, each
+ * rank its slice of every part -- and none of the three apart, and the junction writes that
+ * linear's int8 pair. The step: four GEMMs a layer instead of six (five on a global layer). A
+ * global layer's attention reads q in the row (attn_paged_qrow); a sliding layer's reads it there
+ * at one row and from attn_qs, copied out, at sixteen. */
+TEST(gemma4_31b_takes_q_k_and_v_as_one_linear_where_the_container_holds_them_so) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    const int64_t E = 5376, L = 12;
+    for (int world : { 1, 4 }) {
+        RadBuilder b;
+        g431df_encs(b, false, true, true);
+        RadBuildCtx ctx = build_ctx(0, world);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 15;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+
+        for (int64_t l = 0; l < L; ++l) {
+            const bool global = (l + 1) % 6 == 0;
+            const std::string pre = "blk." + std::to_string(l) + ".";
+            const RecWeight* qkv = nullptr;
+            for (const RecWeight& w : b.weights) {
+                if (w.name == pre + "attn_qkv.weight") qkv = &w;
+                for (const char* sep : { "attn_q.weight", "attn_k.weight", "attn_v.weight" })
+                    CHECK(w.name != pre + sep);
+            }
+            REQUIRE(qkv);
+            CHECK_EQ(qkv->d.shape[0], (global ? 32 * 512 + 4 * 512 : 32 * 256 + 2 * 16 * 256) / world);
+            CHECK_EQ(qkv->d.shape[1], E);
+            CHECK_EQ((int)qkv->d.n_row_parts, global ? 2 : 3);
+        }
+
+        for (const int q : { 1, 16, 40 }) {
+            const auto k = kit(b, { q }, {});
+            const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, 0, world);
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> ops = issued_ops(b, *v[0]);
+            CHECK_EQ(count_issued(ops, "gemm_nt_q"), (int)(4 * L));
+            /* the sliding layers read the row up to 32 rows a sequence (gqa 2), copy q out above */
+            const bool dec = q <= 32;
+            CHECK_EQ(count_issued(ops, "attn_paged_qrow"), dec ? 12 : 2);
+            CHECK_EQ(count_issued(ops, "attn_paged"), dec ? 0 : 10);
+            CHECK_EQ(count_issued(ops, "quant_act_i8"), (int)L);   /* o_proj's input only */
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qs")), dec ? 0 : 10);
+            /* the GEMM, then qkv_norm_rope in place */
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qkvs")), 2 * 10);
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qkvg")), 2 * 2);
+        }
+
+        /* Where attn_paged_qrow is not served: attn_paged everywhere, q in the row at one row and
+         * copied out above it. */
+        RadBuilder r;
+        g431df_encs(r, false, true, true);
+        r.refuse.insert("attn_paged_qrow");
+        REQUIRE_EQ(gemma4_bf16::declare(&r, &meta, &ctx), RAD_OK);
+        for (const int q : { 1, 16 }) {
+            const auto k = kit(r, { q }, {});
+            const auto v = run_passes(r, gemma4_bf16::step, { k.get() }, 0, world);
+            CHECK_PASSES(r, v);
+            const std::vector<std::string> ops = issued_ops(r, *v[0]);
+            CHECK_EQ(count_issued(ops, "attn_paged_qrow"), 0);
+            CHECK_EQ(count_issued(ops, "attn_paged"), 12);
+            CHECK_EQ(count_writes_to(r, *v[0], buf_named(r, "attn_qs")), q == 1 ? 0 : 10);
+            CHECK_EQ(count_writes_to(r, *v[0], buf_named(r, "attn_qg")), q == 1 ? 0 : 2);
+        }
+    }
+}
+
 /* ==================================================================== the step lint, checked */
 
 namespace {
@@ -6801,50 +6034,6 @@ TEST(the_step_lint_reports_each_rule_it_checks) {
 
 namespace {
 
-/* `fn`'s status, with what it prints kept out of the test output. */
-int stderr_of_rc(const std::function<int()>& fn) {
-    int rc = 0;
-    stderr_of([&] { rc = fn(); });
-    return rc;
-}
-
-/* Model metadata built key by key; `meta()` is valid while this object lives. */
-struct MetaKV {
-    RadModelMeta              m{};
-    std::vector<std::string>  keys, vals;
-    std::vector<const char*>  kp, vp;
-    explicit MetaKV(const RadModelMeta& base) : m(base) {
-        for (int i = 0; i < base.n_kv; ++i) set(base.kv_key[i], base.kv_val[i]);
-    }
-    MetaKV& set(const char* k, const char* v) {
-        for (size_t i = 0; i < keys.size(); ++i)
-            if (keys[i] == k) { vals[i] = v; return *this; }
-        keys.push_back(k);
-        vals.push_back(v);
-        return *this;
-    }
-    MetaKV& drop(const char* k) {
-        for (size_t i = 0; i < keys.size(); ++i)
-            if (keys[i] == k) {
-                keys.erase(keys.begin() + (long)i);
-                vals.erase(vals.begin() + (long)i);
-                break;
-            }
-        return *this;
-    }
-    const RadModelMeta* meta() {
-        kp.clear(); vp.clear();
-        for (size_t i = 0; i < keys.size(); ++i) {
-            kp.push_back(keys[i].c_str());
-            vp.push_back(vals[i].c_str());
-        }
-        m.n_kv = (int)kp.size();
-        m.kv_key = kp.data();
-        m.kv_val = vp.data();
-        return &m;
-    }
-};
-
 /* Qwen3.8-27B-FP8's shape cut to the eight-layer fixture, its MTP head declared. */
 MetaKV q35fp8_meta() {
     MetaKV k(qwen35_meta());
@@ -6863,6 +6052,26 @@ MetaKV q35moe_meta() {
     k.m.n_expert = 16;
     k.m.n_expert_used = 4;
     k.set("shared_expert_intermediate_size", "512");
+    return k;
+}
+
+/* The 35B-A3B-VL: the routed trunk with the Qwen3.5 vision tower beside it, as Sage-A1.5 and
+ * Ornith-1.5 carry it. The fixture's trunk is q35fp8_meta's (5120 wide), so the tower emits
+ * that width; the shipped checkpoints' tower is 2048, the real trunk's width. */
+MetaKV q35moe_vl_meta() {
+    MetaKV k = q35moe_meta();
+    k.set("vision_config.depth", "2")
+     .set("vision_config.hidden_size", "1152")
+     .set("vision_config.num_heads", "16")
+     .set("vision_config.intermediate_size", "4304")
+     .set("vision_config.patch_size", "16")
+     .set("vision_config.temporal_patch_size", "2")
+     .set("vision_config.in_channels", "3")
+     .set("vision_config.spatial_merge_size", "2")
+     .set("vision_config.out_hidden_size", "5120")
+     .set("vision_config.num_position_embeddings", "2304")
+     .set("vision_config.deepstack_visual_indexes", "")
+     .set("vision_config.hidden_act", "gelu_pytorch_tanh");
     return k;
 }
 
@@ -6886,12 +6095,6 @@ MetaKV with_dflash2(MetaKV k) {
      .set("draft.dflash_config.conv_kernel_size", "2")
      .set("draft.dflash_config.conv_group_size", "16");
     return k;
-}
-
-RadBuildCtx spec_ctx(int rank, int world, int max_spec) {
-    RadBuildCtx c = build_ctx(rank, world);
-    c.max_spec = max_spec;
-    return c;
 }
 
 /* Every gemm_nt handle a pass issues is issued once: the bf16 GEMMs take a whole pass in one
@@ -7140,6 +6343,7 @@ TEST(qwen35_fp8_dflash2_drafter_takes_a_power_of_two_block) {
         CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
         CHECK_EQ(p.draft_depth, 7);
         CHECK_EQ(p.draft_depth_fixed, 1);
+        CHECK_EQ(p.chain_pays, 0);   /* chained launches measured even here */
     }
 }
 
@@ -7148,6 +6352,23 @@ TEST(qwen35_fp8_dflash2_drafter_takes_a_power_of_two_block) {
 TEST(qwen35_fp8_steps_lint_clean_with_a_dflash2_drafter) {
     MetaKV mk = with_dflash2(q35fp8_meta());
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 7, true, 8);
+}
+
+/* Qwen3.8's DFlash2 drafter has head_dim 128, outside every qkv_norm_rope_kv_store a library serves
+ * (libr4d's: 256 to 512), and an op declared for a shape that resolves to no device kernel refuses
+ * startup whether or not it is issued. So the block declares no prologue fold for it, and each pass
+ * keeps its norm, rope and kv_store chain; the residual adds, which add_rmsnorm serves at n_embd,
+ * still fold, two a layer. */
+TEST(qwen35_fp8_dflash2_head_128_drafter_declares_no_prologue_fold) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(0, 1, 7);
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    int folds_128 = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "qkv_norm_rope_kv_store" && pint(&o, "head_dim") == 128) ++folds_128;
+    CHECK_EQ(folds_128, 0);
+    CHECK_EQ(count_op(b, "add_rmsnorm"), 2 * 2);
 }
 
 /* =============================== gemma3: TranslateGemma 27B's trunk =========================== */
@@ -7359,6 +6580,7 @@ TEST(gemma3_dflash2_drafter_taps_and_block) {
     CHECK_OK(gemma3::probe(mk.meta(), &p));
     CHECK_EQ(p.draft_depth, 7);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 0);   /* a block drafter, but chained launches never measured */
     MetaKV plain = gemma3_meta();
     RadArchProbe q{};
     CHECK_OK(gemma3::probe(plain.meta(), &q));
@@ -7499,6 +6721,46 @@ TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {
     lint_qwen35_fp8_family(qwen35moe_fp8::declare, qwen35moe_fp8::step, mk.meta(), 3, false, 0);
 }
 
+/* The 35B-A3B-VL: the routed trunk and the vision tower declare together, the tower once and
+ * not a copy a rank, and the routed MTP head beside them -- Sage-A1.5's shape, which no fixture
+ * covered before (the MoE fixture had no tower, the VL fixture was dense). */
+TEST(qwen35moe_fp8_declares_the_vision_tower_beside_the_routed_trunk) {
+    MetaKV mk = q35moe_vl_meta();
+    /* With no encoder budget the tower is not declared, whatever the container carries. */
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = vl_ctx(0);
+        REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK(b.encoder_name.empty());
+        CHECK(find_w(b, "v.patch.weight") == nullptr);
+        CHECK_EQ(count_op(b, "router_topk"), 8);
+    }
+    RadBuilder b;
+    RadBuildCtx ctx = vl_ctx(1024);
+    ctx.max_spec = 3;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+
+    CHECK_EQ(b.encoder_name, std::string("vision"));
+    CHECK_EQ(b.encoder.modalities, (uint32_t)(RAD_MM_IMAGE | RAD_MM_VIDEO));
+    CHECK_EQ(b.encoder.max_patches, 1024);
+    CHECK_EQ(b.encoder.n_embd, 5120);
+    CHECK_EQ(b.encoder.merge, 4);
+
+    /* The trunk is still the routed one (eight blocks, plus the MTP layer's own router under
+     * --max-spec 3), and the shared expert is still folded in. */
+    CHECK_EQ(count_op(b, "router_topk"), 9);
+    CHECK(count_op(b, "moe_gemm_q") >= 16);
+
+    /* 3 stem + 12 a block + 6 merger, each mapped from the checkpoint's model.visual.*. */
+    int nv = 0;
+    for (const auto& w : b.weights)
+        if (w.name.rfind("v.", 0) == 0) {
+            ++nv;
+            CHECK(find_map(b, w.name) != nullptr);
+        }
+    CHECK_EQ(nv, 3 + 12 * 2 + 6);
+}
+
 /* `layer_types` is checked against the interval rule, not ignored: a model built with the wrong
  * layers linear still generates fluent text. A disagreeing, short or unknown schedule is refused
  * by every plugin of the family; an agreeing one declares. */
@@ -7571,15 +6833,21 @@ int w8a8_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx
 
 }  /* namespace */
 
-/* Every trunk linear of a rotated int8 container is an i8a8h GEMM right behind its own
- * had_quant_act_i8g, at one rank and two: 2 attention layers of four linears, 6 delta-net layers
- * of two and 8 feed-forwards of two. None is left at fp8, which is what a linear that missed the
- * encoding falls back to, and the MLP declares no gated fold (an fp8a8 tile over E4M3 codes). The
- * four trunk activations carry an int8 pair; the delta net's `gdn_in` feeds no int8 linear. */
+/* The `_had_quant_i8g` producers, which libr4d serves and libref does not. */
+const char* const kW8a8Fused[] = { "rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g",
+                                   "gated_had_quant_i8g" };
+
+/* Where the `_had_quant_i8g` producers are not served, every trunk linear of a rotated int8
+ * container is an i8a8h GEMM right behind its own had_quant_act_i8g, at one rank and two: 2
+ * attention layers of four linears, 6 delta-net layers of two and 8 feed-forwards of two. None is
+ * left at fp8, which is what a linear that missed the encoding falls back to, and the MLP declares
+ * no gated fold (an fp8a8 tile over E4M3 codes). The four trunk activations carry an int8 pair;
+ * the delta net's `gdn_in` feeds no int8 linear. */
 TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
     MetaKV mk = q35w8a8_meta();
     for (int world : { 1, 2 }) {
         RadBuilder b;
+        for (const char* op : kW8a8Fused) b.undeclared.insert(op);
         w8a8_encs(&b);
         RadBuildCtx ctx = build_ctx(0, world);
         REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
@@ -7599,6 +6867,31 @@ TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
         for (const char* a : { "h.q8", "attn_out.q8", "gdn_o.q8", "ffn.q8" })
             CHECK(find_b(b, a) != nullptr);
         CHECK(find_b(b, "gdn_in.q8") == nullptr);
+    }
+}
+
+/* Where they are served, the norms and the gated product write had_quant_act_i8g's codes into the
+ * int8 pair, and the projections reading them declare no quantiser: had_quant_act_i8g is left only
+ * before the attention and delta-net output projections (2 + 6), every norm is the rotated twin (at
+ * two ranks with its fused all-reduce form beside it), and every feed-forward's product is
+ * gated_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are unchanged. */
+TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_them) {
+    MetaKV mk = q35w8a8_meta();
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        w8a8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int rot = 0;
+        for (const RecOp& o : b.ops) rot += o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
+        CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 2 + 6);
+        CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), 8 + 8);
+        CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 8);
+        for (const char* op : { "rmsnorm_quant_fp8", "ar_rmsnorm_quant_fp8", "gated_quant_fp8",
+                                "quant_act_i8g" })
+            CHECK_EQ(count_op(b, op), 0);
+        CHECK_EQ(count_op(b, "ar_rmsnorm_had_quant_i8g") > 0, world == 2);
     }
 }
 
@@ -7826,6 +7119,7 @@ TEST(llama_reads_its_drafters_taps_and_refuses_what_dspark_does_not_implement) {
     CHECK_OK(llama_fp8::probe(mk.meta(), &p));
     CHECK_EQ(p.draft_depth, 7);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 0);
 }
 
 /* One graph, two descriptors: llama_dense_fp8 serves the dense checkpoint a recipe quantises
@@ -8428,6 +7722,30 @@ TEST(qwenimage21_declares_a_generator_with_one_shared_modulation) {
 
 /* Every collective follows --tp-wire: exact unless the lossy wire was accepted, and the floor
  * under which a message stays exact is the deployment's. */
+/* The DiT's adapter names: one root before any GEMM, and every alias lands on a checkpoint tensor
+ * the plugin maps, with the gate half of ComfyUI's `gate_up` on `gate_layer`. */
+TEST(qwenimage21_names_its_adapter_keys_onto_mapped_tensors) {
+    MetaKV mk = qimg_meta();
+    RadBuilder b;
+    const RadBuildCtx ctx = qimg_ctx(0, 1);
+    REQUIRE_EQ(qwenimage21::declare(&b, mk.meta(), &ctx), RAD_OK);
+    REQUIRE_EQ(b.lora_roots.size(), (size_t)1);
+    CHECK_EQ(b.lora_roots[0].first, std::string("transformer."));
+    CHECK(b.lora_roots[0].second.find("lora_unet_") != std::string::npos);
+    std::set<std::string> srcs;
+    for (const RecMap& m : b.maps) for (const std::string& x : m.src) srcs.insert(x);
+    REQUIRE_EQ(b.lora_aliases.size(), (size_t)2);
+    for (const auto& a : b.lora_aliases) {
+        std::string to = a.native + a.to;
+        const size_t h = to.find('#');
+        if (h != std::string::npos) to.replace(h, 1, "0");
+        CHECK(srcs.count(to + ".weight"));
+    }
+    CHECK(b.lora_aliases[0].to.find("gate_layer") != std::string::npos);
+    CHECK_EQ(b.lora_aliases[0].from_lo, (int64_t)0);
+    CHECK_EQ(b.lora_aliases[1].from_lo, b.lora_aliases[0].from_hi);
+}
+
 TEST(qwenimage21_collectives_follow_the_tp_wire) {
     MetaKV mk = qimg_meta();
     for (int lossy : { 0, 1 }) {
@@ -8471,6 +7789,314 @@ TEST(qwenimage21_generator_passes_lint_clean) {
             qwenimage21::step(&c, &tok->b);
             CHECK(!c.step_fail.empty());
         }
+}
+
+/* ==================================================================== anima */
+
+namespace {
+
+/* Anima's text encoder (Qwen3-0.6B-Base) as the container's config states it; the DiT, adapter
+ * and VAE are the plugin's own constants. */
+MetaKV anima_meta(const char* variant) {
+    RadModelMeta m{};
+    m.arch_id = "anima"; m.name = "test-anima"; m.quant = "";
+    m.n_layers = 28; m.n_embd = 1024; m.n_head = 16; m.n_head_kv = 8; m.head_dim = 128;
+    m.n_ff = 3072; m.n_vocab = 151936; m.n_ctx_train = 32768;
+    m.rms_eps = 1e-6f; m.rope_theta = 1e6f; m.rope_scale = 1.0f;
+    MetaKV k(m);
+    k.set("num_hidden_layers", "28").set("hidden_size", "1024").set("anima.variant", variant);
+    return k;
+}
+
+RadBuildCtx anima_ctx() {
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2 * (4096 + 512);
+    c.max_seqs = 4;
+    return c;
+}
+
+/* A JOINT_STEP pass as the driver lays one out for Anima: COND over a prompt of `nq` Qwen3 tokens
+ * (padded to 512) and `nt` T5 ids, DENOISE over `entries` entries of 512 context rows and `ni`
+ * image rows each, or DECODE of a 64 x 64 picture. */
+struct AnimaKit {
+    std::vector<int32_t> tok, pos, cu, src, lane, flags, pair, aux, aux_cu, valid_cu;
+    std::vector<int32_t> img_cu, img_rows, mode_cu, mode_rows, mode_src, mode_ccu;
+    std::vector<int64_t> n_mode;
+    std::vector<uint32_t> seed;
+    std::vector<float> sigma, sigma_next, cfg, rope_f, mode_rope_f;
+    RadGenBatch g{};
+    RadBatch b{};
+};
+
+std::unique_ptr<AnimaKit> anima_pass(int pass, int64_t nq = 12, int64_t nt = 9, int64_t ni = 16,
+                                     int64_t entries = 1) {
+    auto k = std::make_unique<AnimaKit>();
+    RadGenBatch& g = k->g;
+    RadBatch& b = k->b;
+    b.gen = pass;
+    b.gen_b = &k->g;
+    if (pass == RAD_GEN_PASS_COND) {
+        for (int64_t i = 0; i < 512; ++i) {
+            k->tok.push_back(i < nq ? (int32_t)(100 + i) : 151643);
+            k->pos.push_back(i < nq ? (int32_t)i : 1);
+        }
+        for (int64_t i = 0; i < nt; ++i) k->aux.push_back((int32_t)(3 + i));
+        k->aux_cu = { 0, (int32_t)nt };
+        k->valid_cu = { 0, (int32_t)nq };
+        k->cu = { 0, 512 };
+        k->lane = { 0, 1 };
+        k->sigma = { 0.0f };
+        b.n_tok = 512;
+        b.n_seq = 1;
+        b.token_ids = k->tok.data();
+        b.positions = k->pos.data();
+        b.cu_seqlens = k->cu.data();
+        g.rows = 512;
+        g.n_pad = (int32_t)(512 - nq);
+        g.valid_cu = k->valid_cu.data();
+        g.n_lane = 2;
+        g.lane = k->lane.data();
+        g.lane_h = k->lane.data();
+        g.branch = 1;
+        g.sigma = k->sigma.data();
+        g.n_aux = nt;
+        g.aux_ids = k->aux.data();
+        g.aux_cu = k->aux_cu.data();
+        return k;
+    }
+    if (pass == RAD_GEN_PASS_DECODE) {
+        k->cu = { 0, 16 };
+        b.n_tok = 16;
+        b.n_seq = 1;
+        b.cu_seqlens = k->cu.data();
+        g.dec_lane = 1;
+        g.dec_height = g.dec_width = 64;
+        return k;
+    }
+    const int64_t S = entries, N = S * (512 + ni);
+    k->cu.push_back(0);
+    k->img_cu.push_back(0);
+    for (int64_t s = 0; s < S; ++s) {
+        k->mode_cu.push_back((int32_t)(s * (512 + ni)));
+        k->mode_cu.push_back((int32_t)(s * (512 + ni) + 512));
+        k->mode_cu.push_back((int32_t)(s * (512 + ni) + 512));
+        for (int64_t r = 0; r < 512; ++r) k->src.push_back((int32_t)(s * 512 + r));
+        for (int64_t r = 0; r < ni; ++r) {
+            k->src.push_back((int32_t)(-1 - (s * ni + r)));
+            k->img_rows.push_back((int32_t)(s * (512 + ni) + 512 + r));
+        }
+        k->cu.push_back((int32_t)((s + 1) * (512 + ni)));
+        k->img_cu.push_back((int32_t)((s + 1) * ni));
+        k->lane.push_back((int32_t)(s / 2));
+        k->pair.push_back(S > 1 ? (s % 2 ? -2 : (int32_t)(s + 1)) : -1);
+    }
+    k->mode_cu.push_back((int32_t)N);
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t r = 0; r < 512; ++r) {
+            k->mode_rows.push_back((int32_t)(s * (512 + ni) + r));
+            k->mode_src.push_back((int32_t)(s * 512 + r));
+        }
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t r = 0; r < ni; ++r) {
+            k->mode_rows.push_back((int32_t)(s * (512 + ni) + 512 + r));
+            k->mode_src.push_back((int32_t)(-1 - (s * ni + r)));
+        }
+    k->n_mode = { 512 * S, 0, ni * S };
+    for (int m = 0; m < 3; ++m)
+        for (int64_t s = 0; s <= S; ++s)
+            k->mode_ccu.push_back((int32_t)(s * (m == 0 ? 512 : m == 1 ? 0 : ni)));
+    k->rope_f.assign((size_t)(4 * N), 0.0f);
+    k->mode_rope_f.assign((size_t)(4 * N), 0.0f);
+    k->tok.assign((size_t)N, 0);
+    k->pos.assign((size_t)N, 0);
+    k->sigma.assign((size_t)S, 0.75f);
+    k->sigma_next.assign((size_t)S, 0.5f);
+    k->cfg.assign((size_t)S, 4.0f);
+    k->flags.assign((size_t)S, RAD_GEN_F_FIRST);
+    k->seed.assign((size_t)(2 * S), 7u);
+    b.n_tok = N;
+    b.n_seq = S;
+    b.token_ids = k->tok.data();
+    b.positions = k->pos.data();
+    b.cu_seqlens = k->cu.data();
+    g.src = k->src.data();
+    g.n_img = ni * S;
+    g.img_cu = k->img_cu.data();
+    g.img_rows = k->img_rows.data();
+    g.mode_cu = k->mode_cu.data();
+    g.rope_f = k->rope_f.data();
+    g.mode_rows = k->mode_rows.data();
+    g.mode_src = k->mode_src.data();
+    g.mode_ccu = k->mode_ccu.data();
+    g.n_mode_h = k->n_mode.data();
+    g.mode_rope_f = k->mode_rope_f.data();
+    g.sigma = k->sigma.data();
+    g.sigma_next = k->sigma_next.data();
+    g.cfg = k->cfg.data();
+    g.pair = k->pair.data();
+    g.lane = k->lane.data();
+    g.lane_dh = k->lane.data();
+    g.flags = k->flags.data();
+    g.seed = k->seed.data();
+    return k;
+}
+
+/* The linears a LoRA for Anima names: every DiT block's attention, MLP and modulation linears
+ * and the text encoder's. */
+bool anima_lora_target(const std::string& w) {
+    for (const char* t : { "attn_qkv", "attn_output", "cross_q", "cross_k", "cross_v",
+                           "cross_output", "mlp_layer1", "mlp_layer2", ".mod_", "ffn_gate_up",
+                           "ffn_down" })
+        if (has(w, t) && !has(w, ".scale")) return true;
+    return false;
+}
+
+}  /* namespace */
+
+/* A JOINT_STEP generator that reads a second tokenizer, pads an empty prompt to one token and
+ * samples on ComfyUI's simple schedule; the variant sets its defaults and the DiT keys' prefix is
+ * the checkpoint's, `model.diffusion_model.` here and `net.` for Base. */
+TEST(anima_declares_a_two_tokenizer_generator_under_the_checkpoints_prefix) {
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    RadBuildCtx ctx = anima_ctx();
+    MetaKV mk = anima_meta("aesthetic");
+    RadBuilder b;
+    b.encs = { { "dit.t_norm.mdm", plain }, { "dit.blk.0.attn_qkv", plain } };
+    REQUIRE_EQ(anima::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.logits, (rad_buf)0);
+    CHECK_EQ(b.generator_name, std::string("anima-aesthetic"));
+    const RadGeneratorDecl& d = b.generator;
+    CHECK_EQ(d.layout, (int32_t)RAD_GEN_LAYOUT_JOINT_STEP);
+    CHECK_EQ(d.aux_tokens, 1);
+    CHECK_EQ(d.aux_max_tokens, (int64_t)512);
+    CHECK_EQ(d.min_tokens, 1);
+    CHECK_EQ(d.pad_multiple, 512);
+    CHECK_EQ(d.cond_rows, (int64_t)512);
+    CHECK_EQ(d.sigma_grid, 1000);
+    CHECK_EQ(d.shift, 3.0);
+    CHECK_EQ(d.dyn_shift, 0);
+    CHECK_EQ(d.cfg_original, 0);
+    CHECK_EQ(d.default_steps, (int64_t)30);
+    CHECK_EQ(d.default_cfg, 4.0);
+    CHECK_EQ(d.latent_channels, (int64_t)64);
+    CHECK(b.kv_groups.empty());
+    const RecMap* q = find_map(b, "dit.blk.27.attn_qkv.weight");
+    REQUIRE(q != nullptr);
+    REQUIRE_EQ(q->src.size(), (size_t)3);
+    CHECK_EQ(q->src[0], std::string("model.diffusion_model.blocks.27.self_attn.q_proj.weight"));
+    const RecMap* te = find_map(b, "te.blk.3.ffn_gate_up.weight");
+    REQUIRE(te != nullptr);
+    CHECK_EQ(te->src[1], std::string("model.layers.3.mlp.up_proj.weight"));
+    /* The patch embedding over its first 64 columns, the final linear's rows in eight pieces. */
+    const RecMap* xe = find_map(b, "dit.x_embed.weight");
+    REQUIRE(xe != nullptr);
+    CHECK_EQ(xe->mode, (int)RAD_MAP_COLS);
+    int final_maps = 0;
+    for (const auto& m : b.maps)
+        if (m.declared == "dit.final.weight") { ++final_maps; CHECK_EQ(m.mode, (int)RAD_MAP_ROWS); }
+    CHECK_EQ(final_maps, 8);
+    /* The DiT's rotary: 22, 21 and 21 pairs, NeoX, over (frame, row, column). */
+    int axial = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "qk_norm_rope" && pstr(&o, "mode") == "axial") {
+            CHECK_EQ(pstr(&o, "sections"), std::string("22 21 21"));
+            ++axial;
+        }
+    CHECK_EQ(axial, 28);
+
+    MetaKV turbo = anima_meta("turbo");
+    RadBuilder bt;
+    bt.encs = { { "dit.t_norm.mdm", plain } };
+    REQUIRE_EQ(anima::declare(&bt, turbo.meta(), &ctx), RAD_OK);
+    CHECK_EQ(bt.generator_name, std::string("anima-turbo"));
+    CHECK_EQ(bt.generator.default_steps, (int64_t)10);
+    CHECK_EQ(bt.generator.default_cfg, 1.0);
+
+    MetaKV base = anima_meta("base");
+    RadBuilder bb;
+    bb.encs = { { "dit.t_norm.net", plain } };
+    REQUIRE_EQ(anima::declare(&bb, base.meta(), &ctx), RAD_OK);
+    const RecMap* nq = find_map(bb, "dit.blk.0.mlp_layer1.weight");
+    REQUIRE(nq != nullptr);
+    CHECK_EQ(nq->src[0], std::string("net.blocks.0.mlp.layer1.weight"));
+
+    /* Neither spelling, or an unknown variant, is refused. */
+    RadBuilder none;
+    CHECK(anima::declare(&none, mk.meta(), &ctx) < 0);
+    MetaKV odd = anima_meta("deluxe");
+    RadBuilder bo;
+    bo.encs = { { "dit.t_norm.mdm", plain } };
+    CHECK(anima::declare(&bo, odd.meta(), &ctx) < 0);
+}
+
+/* Every linear a LoRA for Anima names is read by a plain GEMM a runtime LoRA can follow: gemm_nt
+ * in a bf16 container, gemm_nt_q without rotated parts in a block-fp8 one, its activation a
+ * separate op. */
+TEST(anima_lora_targets_are_plain_gemms) {
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    RadBuildCtx ctx = anima_ctx();
+    MetaKV mk = anima_meta("base");
+    for (bool q : { false, true }) {
+        RadBuilder b;
+        b.encs = { { "dit.t_norm.net", plain } };
+        if (!q) b.encs.push_back({ "dit.blk.0.attn_qkv", plain });
+        if (q)
+            for (const char* t : { "attn_qkv", "attn_output", "cross_q", "cross_k", "cross_v",
+                                   "cross_output", "mlp_layer1", "mlp_layer2", "ffn_gate_up",
+                                   "ffn_down" })
+                b.encs.push_back({ t, fp8 });
+        REQUIRE_EQ(anima::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int targets = 0;
+        for (const auto& o : b.ops)
+            for (rad_weight w : o.w) {
+                const std::string& n = b.weights[w - 1].name;
+                if (!anima_lora_target(n)) continue;
+                ++targets;
+                const bool ok = o.op == "gemm_nt" || (q && o.op == "gemm_nt_q" &&
+                                                      pint(&o, "pb1") <= 0 && pint(&o, "pb2") <= 0);
+                if (!ok) fprintf(stderr, "    '%s' read by %s\n", n.c_str(), o.op.c_str());
+                CHECK(ok);
+                CHECK(o.op != "gemm_nt_bias");
+            }
+        /* 28 blocks of 8 linears (two views a block-fp8 one) and 6 modulation linears; 28 text
+         * encoder layers of 4. */
+        CHECK(targets >= 28 * (8 + 6) + 28 * 4);
+    }
+}
+
+/* The three passes the core drives (a conditioning with its T5 ids, denoising one image or a
+ * guided pair, decoding one) lint clean in a bf16 and a block-fp8 container. */
+TEST(anima_generator_passes_lint_clean) {
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    RadBuildCtx ctx = anima_ctx();
+    MetaKV mk = anima_meta("aesthetic");
+    for (bool q : { false, true }) {
+        RadBuilder b;
+        b.encs = { { "dit.t_norm.mdm", plain } };
+        if (!q) b.encs.push_back({ "dit.blk.0.attn_qkv", plain });
+        if (q) b.encs.push_back({ "attn_qkv", fp8 }), b.encs.push_back({ "attn_output", fp8 }),
+               b.encs.push_back({ "cross_", fp8 }), b.encs.push_back({ "mlp_layer", fp8 }),
+               b.encs.push_back({ "ffn_", fp8 });
+        REQUIRE_EQ(anima::declare(&b, mk.meta(), &ctx), RAD_OK);
+        for (const auto& k : { anima_pass(RAD_GEN_PASS_COND, 12, 9),
+                               anima_pass(RAD_GEN_PASS_COND, 3, 40),
+                               anima_pass(RAD_GEN_PASS_DENOISE, 12, 9, 16, 1),
+                               anima_pass(RAD_GEN_PASS_DENOISE, 12, 9, 16, 2),
+                               anima_pass(RAD_GEN_PASS_DECODE) }) {
+            RadCtx c{ .b = &b, .batch = &k->b, .rank = 0, .world = 1 };
+            anima::step(&c, &k->b);
+            CHECK(c.step_fail.empty());
+            if (!c.step_fail.empty()) fprintf(stderr, "    %s\n", c.step_fail.c_str());
+            CHECK(!c.issues.empty());
+            CHECK_LINT(b, &c);
+        }
+        const auto tok = kit(b, { 1 }, {});
+        RadCtx c{ .b = &b, .batch = &tok->b, .rank = 0, .world = 1 };
+        anima::step(&c, &tok->b);
+        CHECK(!c.step_fail.empty());
+    }
 }
 
 /* ======================================================== the conventional vocabulary */
@@ -8537,6 +8163,11 @@ struct ArchCases {
             b->encs = { { "attn_q.", w4g }, { "attn_k.", w4g }, { "attn_v.", w4g },
                         { "attn_o.", w4g }, { "ffn_gate_up.", w4g }, { "ffn_down.", w4g } };
         };
+        /* The same with q, k and v as one linear, as a recipe naming attn_qkv converts it. */
+        auto g4qkv = [this](RadBuilder* b) {
+            b->encs = { { "attn_qkv.", w4g }, { "attn_o.", w4g }, { "ffn_gate_up.", w4g },
+                        { "ffn_down.", w4g } };
+        };
         /* The ops libref lacks that each still asks for, both two-rank fusions with no chain:
          * qwen35_fp8's all-reduce norm (layer_fold assumes it at two ranks) and Flash-Next's
          * all-reduce into the wide stream. */
@@ -8555,16 +8186,16 @@ struct ArchCases {
             nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x1c28909125c12f52ull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0xb5691456a0ce7e9dull);
+            qwen35_fp8::step, 7, {}, 0x76bc2f92b452df49ull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x88e964c824896422ull);
+            qwen35_w8a8::step, 7, {}, 0x5570932de623edcaull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x7c73e987c475e40dull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xec1ca3ad670311bbull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
-            qwen35moe_fp8::step, 3, {}, 0x3157a986f13a9a72ull);
+            qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
             qwen4exp_fp8::step, 3, {}, 0xbe74d476c7fd04b8ull);
@@ -8581,15 +8212,26 @@ struct ArchCases {
         add("lfm2_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return lfm2_bf16::declare(b, &lfm, &c); },
             lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
+        /* The first three moved only by the attn_qkv name map each layer declares to ask whether
+         * the container holds q, k and v as one linear: with those maps left out of the hash they
+         * are the earlier pins, 0xafc23087c634a537, 0x719fa07788f8b98a and 0x93b174ab52cc0d31.
+         * The two-rank ones moved with the weight reads beside the reductions (prefetch_beside;
+         * from 0xade9c0ccfad1fd47 and 0x8808d46c04f12205). */
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x0cbeb3ccf57a622cull);
+            gemma4_bf16::step, 0, {}, 0x2ba2f4943031468full);
         add("gemma4_bf16, w4a8", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x0fbef815d409efd1ull);
+            gemma4_bf16::step, 0, {}, 0x2e4c6e3235dd3802ull);
         add("gemma4_bf16, w4a8, two ranks", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0x3d3d4c65aeefe59aull);
+            nullptr, 0, {}, 0x3a160b13b3a80d4eull);
+        add("gemma4_bf16, w4a8, fused qkv", [this, sc, g4qkv](RadBuilder* b) {
+                g4qkv(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
+            gemma4_bf16::step, 0, {}, 0x3913aca59733d0e2ull);
+        add("gemma4_bf16, w4a8, fused qkv, two ranks", [this, sc, g4qkv](RadBuilder* b) {
+                g4qkv(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
+            nullptr, 0, {}, 0x7be4844610b039d8ull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
             gemma4::step, 0, {}, 0x0f227f5853b6488cull);
@@ -8641,57 +8283,6 @@ std::string joined(const std::set<std::string>& s) {
     std::string r;
     for (const auto& x : s) r += (r.empty() ? "" : " ") + x;
     return r.empty() ? std::string("(none)") : r;
-}
-
-/* A 64-bit FNV-1a fingerprint of everything a declare recorded: ops with their parameters,
- * weights, read and write sets and resolution; buffers, weights, KV groups, bindings, name maps,
- * the logits / pooled / drafter / generator declarations and the concurrent list. Two declares
- * give one value only if the core would build the same program from them. */
-struct Fnv {
-    uint64_t h = 1469598103934665603ull;
-    Fnv& raw(const void* p, size_t n) {
-        const auto* c = (const unsigned char*)p;
-        for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ull; }
-        return *this;
-    }
-    Fnv& s(const std::string& x) { return raw(x.data(), x.size()).i((int64_t)x.size()); }
-    Fnv& s(const char* x) { return s(std::string(x ? x : "")); }
-    Fnv& i(int64_t v) { return raw(&v, sizeof v); }
-    Fnv& f(double v) { return raw(&v, sizeof v); }
-};
-uint64_t graph_hash(const RadBuilder& b) {
-    Fnv f;
-    for (const RecOp& o : b.ops) {
-        f.s(o.op).i(o.resolved).i((int64_t)o.p.size());
-        for (const RecParam& p : o.p) f.s(p.key).i(p.kind).i(p.ival).i(p.ihi).f(p.dval).s(p.sval);
-        for (const auto* v : { &o.w, &o.reads, &o.writes }) {
-            f.i((int64_t)v->size());
-            for (uint32_t x : *v) f.i(x);
-        }
-    }
-    for (const RecBuf& x : b.bufs) {
-        f.s(x.name).i(x.d.dtype).i(x.d.rank).i(x.d.kind).i(x.d.domain).i(x.d.kv).s(x.d.derive);
-        for (uint32_t d = 0; d < x.d.rank; ++d) f.i(x.d.shape[d]);
-    }
-    for (const RecWeight& w : b.weights) {
-        f.s(w.name).i(w.d.dtype).i(w.d.rank).i(w.d.shard).i(w.d.access).i(w.d.group.layer)
-         .i(w.d.group.expert).s(w.d.source).s(w.d.planes).i(w.d.n_row_parts).i(w.span_lo)
-         .i(w.span_hi).i(w.n_part_spans);
-        for (uint32_t d = 0; d < w.d.rank; ++d) f.i(w.d.shape[d]);
-    }
-    for (const RecKV& g : b.kv_groups)
-        f.s(g.name).i(g.d.kind).i(g.d.dtype).i(g.d.window).i(g.d.n_head_kv).i(g.d.head_dim)
-         .i(g.d.state_dim[0]).i(g.d.state_dim[1]).i(g.d.conv_width).i(g.zero);
-    for (const auto& [l, g] : b.binds) f.i(l).i(g);
-    for (const RecMap& m : b.maps) {
-        f.s(m.declared).i(m.mode).i(m.concat_dim);
-        for (const auto& x : m.src) f.s(x);
-    }
-    f.i(b.logits).i(b.pooled).s(b.drafter_name).i(b.drafter.kind).i(b.drafter.depth)
-     .i(b.drafter.block).i(b.drafter.proposal).i(b.drafter.mask_token).i(b.drafter_shared)
-     .s(b.encoder_name).s(b.audio_encoder_name).s(b.generator_name);
-    for (rad_buf x : b.concurrent) f.i(x);
-    return f.h;
 }
 
 }  /* namespace */
@@ -9032,8 +8623,8 @@ TEST(gemma4_assistant_head_engine_step_lints_clean) {
  * fingerprints above). */
 TEST(gemma4_bf16_without_the_fused_ops_declares_the_chains_and_asks_for_no_undeclared_op) {
     const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
-    const std::set<std::string> fused = { "qkv_norm_rope", "rmsnorm_quant_i8", "gelu_mul_quant_i8",
-                                          "ar_rmsnorm_quant_i8" };
+    const std::set<std::string> fused = { "qkv_norm_rope", "qkv_norm_rope_kv_store", "rmsnorm_quant_i8",
+                                          "gelu_mul_quant_i8", "ar_rmsnorm_quant_i8" };
     for (int world : { 1, 2 }) {
         std::vector<std::string> seq[2];
         for (int undeclared = 0; undeclared < 2; ++undeclared) {
@@ -9239,93 +8830,6 @@ TEST(qwen3asr_refuses_a_tower_it_does_not_serve) {
 
 RAD_TEST_MAIN()
 
-/* ==================================================================== a 4096 budget without a span */
-namespace {
-
-/* What a step issued, as a fingerprint: each launch's op (by name and declared parameters), row
- * count and lane, every operand by kind, buffer or weight name, offset and extent, a raw operand
- * by the batch array and element it points at, and every lane join. */
-uint64_t issue_hash(const RadBuilder& b, const std::vector<std::unique_ptr<RadCtx>>& v,
-                    const std::vector<const Kit*>& kits) {
-    Fnv f;
-    auto raw_at = [&](const void* p) {
-        if (!p) { f.i(-1); return; }
-        if (const rad_buf h = fake_buf_of(p, b.bufs.size())) {
-            f.i(1).s(b.bufs[h - 1].name)
-             .i((int64_t)((uintptr_t)p - (uintptr_t)rad_buf_ptr(nullptr, h)));
-            return;
-        }
-        for (size_t k = 0; k < kits.size(); ++k) {
-            const Kit& t = *kits[k];
-            const std::vector<int32_t>* arrays[] = { &t.tok, &t.pos, &t.cu, &t.ctxl, &t.qlen,
-                                                     &t.out, &t.nacc, &t.dout, &t.slot, &t.table,
-                                                     &t.used, &t.sidx };
-            for (size_t a = 0; a < sizeof arrays / sizeof arrays[0]; ++a) {
-                const std::vector<int32_t>& x = *arrays[a];
-                const int32_t* q = (const int32_t*)p;
-                if (!x.empty() && q >= x.data() && q < x.data() + x.size()) {
-                    f.i(2).i((int64_t)a).i((int64_t)(q - x.data()));
-                    return;
-                }
-            }
-        }
-        f.i(3);
-    };
-    for (const auto& c : v) {
-        f.i((int64_t)c->issues.size());
-        for (const RecIssue& r : c->issues) {
-            const RecOp* o = b.op_of(r.op);
-            f.s(o ? o->op : "<null>");
-            if (o)
-                for (const RecParam& p : o->p) f.s(p.key).i(p.ival).i(p.ihi).f(p.dval).s(p.sval);
-            f.i(r.n).i(r.lane).i((int64_t)r.opd.size());
-            for (const RadOperand& d : r.opd) {
-                f.i(d.kind).i(d.dtype).i(d.offset).i(d.rows).i(d.cols);
-                if (d.kind == RAD_OPK_BUF)
-                    f.s(d.handle && d.handle <= b.bufs.size() ? b.bufs[d.handle - 1].name : "?");
-                else if (d.kind == RAD_OPK_WEIGHT || d.kind == RAD_OPK_WTAB)
-                    f.s(d.handle && d.handle <= b.weights.size() ? b.weights[d.handle - 1].name
-                                                                 : "?");
-                else if (d.kind == RAD_OPK_RAW)
-                    raw_at(d.raw);
-                else
-                    f.i(d.handle);
-            }
-        }
-        for (const RecJoin& j : c->joins) f.i((int64_t)j.at).i(j.from).i(j.to);
-    }
-    return f.h;
-}
-
-/* The steps of the fingerprint: a 4096-row prefill after 4096 tokens of history (wider than a
- * MoE pass), a mixed step, a decode step, and with a drafter a verify and its first passes. */
-uint64_t pinned_steps(RadBuilder& b, StepFn step, int rank, int world) {
-    const auto pf = kit(b, {}, { 4096 }, 4096);
-    const auto mx = kit(b, { 1, 1 }, { 2000 }, 3000);
-    const auto dc = kit(b, { 1, 1, 1 }, {});
-    std::vector<std::unique_ptr<RadCtx>> all;
-    std::vector<const Kit*> kits;
-    for (const Kit* k : { pf.get(), mx.get(), dc.get() }) {
-        auto v = run_passes(b, step, { k }, rank, world);
-        CHECK_PASSES(b, v);
-        for (auto& c : v) all.push_back(std::move(c));
-        kits.push_back(k);
-    }
-    std::unique_ptr<Kit> ver, his, r2;
-    if (b.drafter.kind == RAD_DRAFT_SERIAL) {
-        ver = kit(b, std::vector<int>(3, 4), {});
-        his = history_pass(b, *ver);
-        r2 = round_pass(b, 3, 2);
-        auto v = run_passes(b, step, { ver.get(), his.get(), r2.get() }, rank, world);
-        CHECK_PASSES(b, v);
-        for (auto& c : v) all.push_back(std::move(c));
-        kits.push_back(ver.get()); kits.push_back(his.get()); kits.push_back(r2.get());
-    }
-    return issue_hash(b, all, kits);
-}
-
-}  /* namespace */
-
 /* Without --prefill-span a 4096 budget declares and steps the pinned graph and launches: for
  * Flash-Next and the other plugins built on the same fp8 blocks, at one, two and four ranks, taken
  * from the plugins as they were before the span. */
@@ -9344,8 +8848,8 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
         { "qwen35_fp8", 2, 1, 0x36da8d762194e24eull, 0xe4022daff02ec8bdull },
-        { "qwen35moe_fp8", 1, 0, 0xb7c4d121acb388b3ull, 0x3fcf71676e558d79ull },
-        { "qwen35moe_fp8", 2, 0, 0x5c02b2d6cd49ed0cull, 0x05e0778848bf416cull },
+        { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
+        { "qwen35moe_fp8", 2, 0, 0xf60c9508dd197370ull, 0x05e0778848bf416cull },
     };
     for (const Case& cs : cases) {
         RadBuilder b;
@@ -9371,53 +8875,6 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         const uint64_t s = pinned_steps(b, step, cs.rank, cs.world);
         fprintf(stderr, "    pin: %s world %d rank %d: graph 0x%016llxull, steps 0x%016llxull\n",
                 cs.name, cs.world, cs.rank, (unsigned long long)g, (unsigned long long)s);
-        CHECK_EQ(g, cs.graph);
-        CHECK_EQ(s, cs.steps);
-    }
-}
-
-/* GLM declares and steps the pinned graph and launches at one and eight ranks: a 4096-row prefill
- * after history, a mixed step, a decode step, a verify and its draft passes. */
-TEST(glm53_is_the_pinned_graph_and_steps) {
-    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                           "index_topk" };
-    const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    struct Case {
-        int world;
-        uint64_t graph, steps;
-    };
-    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0x98ba2952bb37b075ull },
-                           { 8, 0x8204e073efdeee0cull, 0x1279aecfe4e32d9aull } };
-    for (const Case& cs : cases) {
-        RadBuilder b;
-        b.kv_block = 4;
-        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                   { "mtp.blk.45.ffn_down_exps", fp8 },
-                   { "ffn_gate_up_exps", mx },
-                   { "ffn_down_exps", mx },
-                   { "ffn_gate_up_shexp", mx },
-                   { "ffn_down_shexp", mx },
-                   { "ffn_gate_up.weight", fp8 },
-                   { "ffn_down.weight", fp8 } };
-        RadBuildCtx ctx = spec_ctx(0, cs.world, 3);
-        ctx.max_tok = 4096;
-        ctx.max_seqs = 8;
-        ctx.max_ctx = 200000;
-        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
-        const uint64_t g = graph_hash(b);
-        const uint64_t s = pinned_steps(b, glm5next::step, 0, cs.world);
-        fprintf(stderr, "    pin: glm5next world %d: graph 0x%016llxull, steps 0x%016llxull\n",
-                cs.world, (unsigned long long)g, (unsigned long long)s);
         CHECK_EQ(g, cs.graph);
         CHECK_EQ(s, cs.steps);
     }

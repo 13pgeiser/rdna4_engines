@@ -1,0 +1,16 @@
+# anima-bf16.recipe -- Anima (Base, Aesthetic or Turbo) at bf16.
+#
+#   rad-convert <Anima>/split_files/diffusion_models/anima-aesthetic-v1.1.safetensors \
+#       --add <Anima>/split_files/text_encoders/qwen_3_06b_base.safetensors \
+#       --add <Anima>/split_files/vae/qwen_image_vae.safetensors \
+#       --config <Qwen/Qwen3-0.6B-Base> --tokenizer2 <ComfyUI>/comfy/text_encoders/t5_tokenizer/tokenizer.json \
+#       --arch anima --set anima.variant=aesthetic \
+#       --recipe data/recipes/anima-bf16.recipe -o anima-aesthetic-bf16.rad
+#
+# Every linear stays as the release holds it (bf16). Two weights are computed at convert, in f32,
+# and stored bf16 here: the patch embedding without its padding-mask columns, and the VAE's causal
+# 3-D convolutions read at their last temporal tap.
+
+dit.x_embed.weight                   cast dtype=bf16
+decoder.*                            cast dtype=bf16
+conv2.*                              cast dtype=bf16

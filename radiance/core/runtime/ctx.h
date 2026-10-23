@@ -201,6 +201,9 @@ public:
     /* Call once on the rank thread before its first run_step: the backend's current device is
      * thread-local, and init may have run on another thread. */
     int bind_thread();
+    /* The runtime LoRA slot every row of the generator passes that follow runs with, -1 for none
+     * (Ctx::issue_lora). Set by the pass loop before it releases the rank for a pass. */
+    void set_gen_lora_slot(int32_t s) { gen_lora_slot_ = s; }
 
     /* ---------------------------------------------------------- run-phase queries */
     const RadBatch* batch()      const { return batch_; }
@@ -350,6 +353,7 @@ private:
     int  bind_weights();
     int  bind_ops();
     int  issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
+    int32_t gen_lora_slot_ = -1;
     int  bind_routing();
     int  bind_profiling();
     int  check_domain(rad_op h, int domain) const;
@@ -681,7 +685,12 @@ private:
     int                    level_ = 0;
     std::vector<RadTensor> w_tmpl_;
     std::vector<int32_t>   w_bits_;
-    std::vector<uint32_t>  waited_gen_;   /* the generation we last made the stream wait on */
+    /* The generation each lane's stream was last made to wait on, a weight. Per lane: the wait
+     * orders only the stream it is put on, so a weight resolved on lane 1 (the Gemma 4 26B-A4B's
+     * dense arm, which a decode step issues on lane 1 and an overlapped prefill on lane 0) must
+     * still be waited on when lane 0 resolves it. Indexed by lane_, like the other per-lane state
+     * here: set_lane admits lanes 0 and 1 only. */
+    std::vector<uint32_t>  waited_gen_[2];
 
     std::vector<OpPlan>                 plans_;
     /* Ops not yet seen issued. flush_issued walks only these and drops each once it fires. */

@@ -2,7 +2,7 @@
  * come from the uncorrected sigmoid probabilities. All routing arithmetic is F32. */
 #ifndef RAD_BLOCK_GLM_ROUTER_H
 #define RAD_BLOCK_GLM_ROUTER_H
-#include "rad_tp_split.h"
+#include "rad_glm_tp.h"
 #include <cmath>
 
 namespace rad {

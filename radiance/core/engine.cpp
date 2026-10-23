@@ -58,6 +58,18 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
+     * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
+     * allocator is per device. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= cvec_views_.size()) continue;
+        const float* d = cvec_views_[(size_t) r->index].dir;
+        if (!d) continue;
+        if (rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        cvec_views_[(size_t) r->index].dir = nullptr;
+    }
+    cvec_views_.clear();
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
@@ -341,6 +353,8 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
+    for (int i = 0; i < block_rows_; ++i)
+        sched_.expect_draft(block_row_[(size_t)i].seq, drafter_.depth);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
@@ -391,9 +405,13 @@ int Engine::step_loop() {
     int idle = 0;
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
-     * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !embedding_ && drafter_.kind != RAD_DRAFT_BLOCK &&
-                  (serial_drafting() || cfg_.n_spec <= 0);
+     * pass issued ahead would overwrite them. A block drafter pipelines only on the card
+     * (engine_draft.cpp); the host's driver stages from the committed sequence. */
+    block_card_ = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && !cfg_.kld() &&
+                  !embedding_ && [] { const char* v = std::getenv("RADIANCE_DRAFT_BLOCK_HOST");
+                                      return !(v && *v && *v != '0'); }();
+    pipelining_ = !cfg_.kld() && !embedding_ && (drafter_.kind != RAD_DRAFT_BLOCK || block_card_) &&
+                  (serial_drafting() || block_card_ || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -684,10 +702,10 @@ int Engine::step_loop() {
         }
 
         if (t_on) phase_mark(PH_SAVE);
-        /* Queue the serial drafter's passes behind the step before waiting: the card computes
-         * acceptance itself and every pass reads it there (sched/advance.h), so one wait covers
-         * the whole step. */
-        st = issue_serial_drafter(b->step, so);
+        /* Queue the drafter's passes behind the step before waiting: the card computes acceptance
+         * itself and every pass reads it there (sched/advance.h), so one wait covers the whole
+         * step. */
+        st = block_card_ ? issue_block_drafter(b->step, so) : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
@@ -751,12 +769,13 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
-        /* The drafter for the next step. A block drafter runs here, since its passes are staged
-         * from the committed sequence. A serial one already ran on the card; what remains is to
-         * check its acceptance against the host's and publish its proposals. Both drivers return
-         * immediately for a kind that is not theirs. */
-        st = drafter_.kind == RAD_DRAFT_BLOCK ? run_block_drafter(b->step)
-                                              : finish_serial_drafter(so);
+        /* The drafter for the next step. The host's block driver runs here, since it stages from
+         * the committed sequence. A serial one, or a block one on the card, already ran; what
+         * remains is to check its acceptance against the host's and publish its proposals. Each
+         * driver returns immediately for a kind that is not its own. */
+        st = drafter_.kind != RAD_DRAFT_BLOCK ? finish_serial_drafter(so)
+           : block_card_                      ? finish_block_drafter(so)
+                                              : run_block_drafter(b->step);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
@@ -1227,6 +1246,18 @@ void Engine::tier_tick() {
         }
         if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
         if (all) {
+            /* RADIANCE_DEBUG_TIER_VERIFY: now that every rank's window has landed, each
+             * follower's hash of the replicated groups it gathered is held against the window
+             * the leader wrote (rad_kv_group_replicated's claim). The sums are taken either way,
+             * so a failed batch leaves none behind. */
+            if (lead.tierx.verifying_replicated()) {
+                for (size_t i = 1; i < ranks_.size(); ++i)
+                    for (const TierJob& j : P.copy) {
+                        uint64_t sum = 0;
+                        if (ranks_[i]->tierx.take_replicated_sum(j.key, &sum) && good)
+                            (void)lead.tierx.verify_replicated(j, (int)i, sum);
+                    }
+            }
             /* A copy is good only if every rank's shard landed; otherwise the host copy is
              * partly stale, so the whole batch fails and every slot goes back. */
             const std::vector<char> ok(P.copy.size(), good ? 1 : 0);
@@ -1444,6 +1475,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     kv_iface_ = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
     pc_iface_ = std::make_unique<PCBinding<PrefixCache>>(&ranks_[0]->prefix);
+    /* The control vector's identity partitions the block cache (PCBinding::salt_id): a request
+     * that runs with the projection on never adopts a block or a linear-state snapshot produced
+     * without it, or the other way round. Zero with no vector loaded, and then every chain hashes
+     * exactly as it did before the feature existed. */
+    static_cast<PCBinding<PrefixCache>*>(pc_iface_.get())->salt_id = cvec_salt_;
     /* The restore path, installed only when the tiers are on. The scheduler calls it before the
      * admission lookup without knowing about tiers, so it is a callable rather than an include in
      * core/sched.
@@ -1455,12 +1491,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         auto* b = static_cast<PCBinding<PrefixCache>*>(pc_iface_.get());
         /* Called inside Scheduler::step() under its lock, which makes touching the cache and rank
          * 0's manager safe; nothing here may call back into the scheduler. */
-        b->restore_fn = [this](const Request& req) {
+        b->restore_fn = [this, b](const Request& req) {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
-            std::vector<MMContentKey> mk;
-            media_keys(req, &mk);
-            const std::vector<BlockHash> want = pc.restorable_from(req.prompt, mk);
+            /* Room is made before anything is planned (PCBinding::restore_plan): a chain the free
+             * list cannot hold would otherwise come back only as far as it reaches. One block
+             * table serves every rank, so what rank 0's cache gives up is room on every rank. */
+            const std::vector<BlockHash> want =
+                b->restore_plan(req, cvec_salt_for(req.sp.use_control_vector));
             if (want.empty()) return;
             /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
              * thousands of entries; batched, it is one launch per (group, layer) per staging batch
@@ -1612,6 +1650,28 @@ bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
 }
 
 /* ------------------------------------------------------------------ the HTTP frontend */
+/* The control vector, for /stats and /server_info. `available` is
+ * what a client should test before sending the field: without a loaded vector a request that asks
+ * for it is refused, so a UI can hide the control rather than offer a switch that fails. */
+std::string Engine::cvec_json() const {
+    nlohmann::ordered_json o;
+    o["available"] = cvec_.loaded();
+    o["default"]   = cvec_default_.load();
+    if (cvec_.loaded()) {
+        /* The family the file was validated against, not a label the UI supplies: this is the same
+         * `meta_.arch_id` the loader compared against the file's own model_hint. */
+        o["arch"]    = meta_.arch_id ? meta_.arch_id : "";
+        o["first"]   = cvec_.first;
+        o["last"]    = cvec_.last;
+        o["n_embd"]  = cvec_.n_embd;
+        o["n_layers"] = cvec_.n_layers;
+        o["scale"]   = cvec_.user_scale;
+        o["file"]    = cvec_.path;
+        o["mode"]    = "project";
+    }
+    return o.dump();
+}
+
 /* The engine's part of /server_info: model, cards, KV, drafting and wire, for a running process.
  * The server holds only interfaces, so the engine renders this object and the server splices it in
  * verbatim. */
@@ -1638,6 +1698,7 @@ std::string Engine::engine_info() const {
     e["vision_tower_placement"] = { { "asked", table_placement_name(cfg_.tower_placement) },
                                     { "resolved", table_placement_name(cfg_.tower_resolved) } };
     e["prefix_cache"]           = cfg_.prefix_cache;
+    e["control_vector"]         = nlohmann::ordered_json::parse(cvec_json());
     e["checkpoint_slots"]       = cfg_.checkpoint_slots;
     e["deterministic"]          = cfg_.deterministic;
 
@@ -1992,6 +2053,15 @@ int Engine::run_server() {
     d.tok   = &tok_bridge;
     d.grammar = &grammar_bridge;
     d.live  = snap;
+    /* The control vector, when one was found. The admin endpoint flips the
+     * default through this; nothing rebuilds a graph, so a toggle takes effect on the next request
+     * and leaves the running ones alone. */
+    if (cvec_.loaded()) {
+        d.control_vector.available  = [this] { return cvec_loaded(); };
+        d.control_vector.get_default = [this] { return cvec_default_on(); };
+        d.control_vector.set_default = [this](bool on) { set_cvec_default(on); };
+        d.control_vector.json        = [this] { return cvec_json(); };
+    }
 
     /* An embedding model serves /v1/embeddings and no chat. Its named prompts are the checkpoint's
      * sentence-transformers configuration (`sentence_transformers.prompts.*`); a `messages` input
@@ -2113,7 +2183,23 @@ int Engine::run_server() {
     o.graph_json  = [this] { return dump_graph_json(ranks_[0]->program); };
     /* Per request, from a reading at most a second old (Engine::diagnostics_json). */
     o.diagnostics_json = [this] { return diagnostics_json(); };
-    if (cfg_.lora.enabled()) {
+    if (cfg_.lora.enabled() && ranks_[0]->program.is_pass_driven()) {
+        /* A generator's request names its adapters in `loras`; `model` stays the model. */
+        o.gen_lora_acquire = [this](const std::vector<std::pair<std::string, double>>& u,
+                                    int32_t* slot, std::shared_ptr<void>* hold, std::string* note,
+                                    std::string* e) {
+            std::vector<LoraUse> uses;
+            for (const auto& [n, w] : u) uses.push_back({ n, w });
+            return gen_lora_acquire(uses, slot, hold, note, e);
+        };
+        o.gen_lora_names = [this] { return gen_lora_names(); };
+        o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
+            return lora_load(n, d, e);
+        };
+        o.lora_unload = [this](const std::string& n, std::string* e, int* in_flight) {
+            return lora_unload(n, e, in_flight);
+        };
+    } else if (cfg_.lora.enabled()) {
         /* `model` picks the adapter, and the served model's own name picks the base. */
         for (const auto& [name, dir] : cfg_.lora.adapters)
             if (name == o.model_id) {
@@ -2157,7 +2243,7 @@ int Engine::run_server() {
          * are refused by name: LFM2-VL takes pictures only, and a token-budget processor (Gemma
          * 4's) sizes by soft tokens (--image-tokens, --video-max-frame-tokens), not pixel
          * bands. */
-        if (vc.family == mm::Family::Lfm2 &&
+        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next) &&
             (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
              cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
             RAD_ERR("media: this model's processor takes pictures, not video, so the --video-* "
@@ -2175,6 +2261,16 @@ int Engine::run_server() {
             }
             if (cfg_.image_tokens)           vc.image_soft_tokens = *cfg_.image_tokens;
             if (cfg_.video_max_frame_tokens) vc.video_soft_tokens = *cfg_.video_max_frame_tokens;
+        } else if (vc.family == mm::Family::Glm5Next) {
+            /* GLM-5.3 budgets an image in tokens (max_image_tokens), so --image-tokens is its
+             * ceiling and the pixel bands do not apply. */
+            if (cfg_.image_min_pixels || cfg_.image_max_pixels) {
+                RAD_ERR("media: this model's processor sizes images by a token budget, so "
+                        "--image-min-pixels and --image-max-pixels do nothing; use "
+                        "--image-tokens");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.image_tokens) vc.max_image_tokens = *cfg_.image_tokens;
         } else {
             if (cfg_.image_tokens) {
                 RAD_ERR("media: --image-tokens is a token budget, and this model's processor "
@@ -2208,6 +2304,16 @@ int Engine::run_server() {
                     "'%s' encoder takes %lld-element patches merged %lld", (long long)vc.patch_dim(),
                     (long long)vc.merge * vc.merge, ranks_[0]->program.encoder_name.c_str(),
                     (long long)encd.patch_dim, (long long)encd.merge);
+            return RAD_E_INVAL;
+        }
+        /* An explicit budget past one pass is refused; the container's is lowered to fit
+         * (Processor::init), as a pixel band is. */
+        if (vc.family == mm::Family::Glm5Next && cfg_.image_tokens &&
+            (int64_t)*cfg_.image_tokens * vc.merge * vc.merge > encd.max_patches) {
+            RAD_ERR("media: --image-tokens %d is more patches than one encoder pass holds "
+                    "(--mm-max-patches %lld, %lld tokens)", *cfg_.image_tokens,
+                    (long long)encd.max_patches,
+                    (long long)(encd.max_patches / ((int64_t)vc.merge * vc.merge)));
             return RAD_E_INVAL;
         }
         if (vc.family == mm::Family::Gemma4 &&
@@ -2246,6 +2352,17 @@ int Engine::run_server() {
                      mm_proc->config().max_pixels_tolerance, mm_proc->config().min_tiles,
                      mm_proc->config().max_tiles, mm_proc->config().tile,
                      (long long)encd.max_patches);
+        else if (mm_proc->config().family == mm::Family::Glm5Next) {
+            RAD_INFO("media: images through '%s'; an image becomes %d..%d tokens, padded to its "
+                     "canvas rather than stretched; %lld patches a pass",
+                     ranks_[0]->program.encoder_name.c_str(), mm_proc->config().min_image_tokens,
+                     mm_proc->config().max_image_tokens, (long long)encd.max_patches);
+            if (mm_proc->config().max_image_tokens < vc.max_image_tokens)
+                RAD_INFO("media: the budget of %d tokens an image is lowered to %d, what one "
+                         "encoder pass holds; --mm-max-patches %lld serves it whole",
+                         vc.max_image_tokens, mm_proc->config().max_image_tokens,
+                         (long long)vc.max_image_tokens * vc.merge * vc.merge);
+        }
         else if (mm_proc->config().family == mm::Family::Gemma4)
             RAD_INFO("media: %s%s through '%s'; an image becomes at most %d soft tokens (a "
                      "request's image_tokens may ask for 70..1120), a video %d a frame at %.3g "
@@ -2347,7 +2464,14 @@ int Engine::run_server() {
         gen::Driver*         drv = nullptr;
         const mm::Processor* proc = nullptr;
         server::ImageGenInfo inf;
+        Tokenizer            aux;
+        bool                 has_aux = false;
         const server::ImageGenInfo& info() const override { return inf; }
+        int encode_aux(const std::string& text, std::vector<int32_t>* out) const override {
+            if (!has_aux) return RAD_E_UNSUPPORTED;
+            out->clear();
+            return aux.encode(text, *out, /*add_special=*/true, /*parse_special=*/true);
+        }
         int submit(std::unique_ptr<gen::Request> r, std::string* why) override {
             return drv->submit(std::move(r), why);
         }
@@ -2393,6 +2517,27 @@ int Engine::run_server() {
         in.cfg_original = gd.cfg_original != 0;
         in.has_default_negative = pg.gen_str.has_default_negative;
         in.default_negative = pg.gen_str.default_negative;
+        in.min_tokens = gd.min_tokens;
+        in.pad_token = gd.pad_token;
+        in.aux_tokens = gd.aux_tokens != 0;
+        in.aux_max_tokens = gd.aux_max_tokens;
+        if (in.aux_tokens) {
+            if (!aux_vocab_) {
+                RAD_ERR("images: '%s' reads its prompt through a second tokenizer and %s carries "
+                        "none; convert it with rad-convert --tokenizer2", in.name.c_str(),
+                        cfg_.model.c_str());
+                return RAD_E_FORMAT;
+            }
+            RAD_TRY(image_bridge.aux.init(aux_vocab_));
+            image_bridge.has_aux = true;
+        }
+        in.samplers = gd.train_steps > 0 ? gd.samplers : 0;
+        in.default_sampler = gd.default_sampler;
+        in.default_scheduler = gd.default_scheduler;
+        in.chunk_tokens = gd.chunk_tokens;
+        in.chunk_bos = gd.chunk_bos;
+        in.chunk_eos = gd.chunk_eos;
+        in.chunk_pad = gd.pad_token;
         image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
@@ -2407,6 +2552,9 @@ int Engine::run_server() {
                  (long long)in.default_height, (long long)in.max_tokens, (long long)in.max_refs,
                  in.fixed_schedule ? (std::to_string(in.fixed_steps) + " fixed steps").c_str()
                                    : (std::to_string(in.default_steps) + " steps by default").c_str());
+        if (in.samplers)
+            RAD_INFO("images: sampler %s, scheduler %s by default", gen::sampler_name(in.default_sampler),
+                     gen::scheduler_name(in.default_scheduler));
     }
 
     /* An audio generator's endpoint: the driver's queue, the declared prompt and limits, and the

@@ -80,6 +80,12 @@ struct VramFacts {
      * or auto), not --deterministic, on a device with virtual memory management. A lending cache
      * can be sized for what live requests could need; a non-lending one would hold it empty. */
     bool    lends      = false;
+    /* A loaded control vector's direction table: device bytes the engine already holds, which are
+     * not part of the program or the pools and must not shrink what the plan may claim. It comes
+     * out of the headroom, as every deployment keeps that unclaimed. Without this, a deployment
+     * that merely *offers* a vector would plan its expert cache against a smaller card than one
+     * that does not, which is exactly the difference "off == stock" cannot allow. */
+    int64_t held_out   = 0;
     /* Integrated graphics: host memory the card must leave to the host, since device memory is
      * host memory there. 0 on a discrete card. */
     int64_t host_reserve = 0;

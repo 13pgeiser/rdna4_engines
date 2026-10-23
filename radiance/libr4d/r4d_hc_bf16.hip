@@ -1,4 +1,5 @@
-// r4d_hc_bf16.hip -- the gated residual (hyper-connections): hc_enter, hc_read and hc_write.
+// r4d_hc_bf16.hip -- the gated residual (hyper-connections): hc_enter, hc_read,
+// hc_write and hc_project.
 //
 // Qwen4-Exp carries a residual stream `hc` times the model width, with no pre-norm and no residual
 // add: every block reads a data-dependent mix of the hc sub-streams and writes its output back into
@@ -292,6 +293,39 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
             *p = f2bf(bf2f(*p) + s_g[c] * v);
         }
     }
+}
+
+/* ============================================================== hc_project
+ *
+ * The control vector (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the hc streams of a
+ * row whose `on` flag is 1 -- llama.cpp's `--cvec-mode project`, issued after a layer's write into
+ * the stream. ONE direction for every stream: the dot is per stream, against the same v. One
+ * workgroup per (row, stream), and a zero flag is not read and not written, so an unprojected
+ * request's stream is the stock model's. */
+__global__ __launch_bounds__(kThreads)
+void hc_project_kernel(unsigned short* __restrict__ h, const float* __restrict__ v,
+                       const int32_t* __restrict__ on, long rows, long n, long hrow, float scale) {
+    const long r = blockIdx.y;
+    if (r >= rows || on[r] == 0) return;   /* a row's switch: the whole workgroup takes it */
+    unsigned short* hp = h + r * hrow + (long)blockIdx.x * n;
+
+    float acc = 0.0f;
+    for (long i = threadIdx.x; i < n; i += kThreads) acc += bf2f(hp[i]) * v[i];
+    /* A wave sums itself and the waves meet in LDS, at kWave 32: the shuttle is the wave's own
+     * width here, not the 64 a 64-wide __shfl_down would assume but gfx12 does not run. */
+    __shared__ float s_g[kWaves];
+    const float w = r4d_wave_sum(acc);
+    if ((threadIdx.x % kWave) == 0) s_g[threadIdx.x / kWave] = w;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float g = 0.0f;
+        for (int k = 0; k < kWaves; ++k) g += s_g[k];
+        s_g[0] = g * scale;
+    }
+    __syncthreads();
+
+    const float g = s_g[0];
+    for (long i = threadIdx.x; i < n; i += kThreads) hp[i] = f2bf(bf2f(hp[i]) - g * v[i]);
 }
 
 /* A wave's dot product of the LDS vector with a contiguous bf16 row, using 512-byte loads but
@@ -2153,7 +2187,10 @@ unsigned int* hc_mix_ctr(RadStream s) {
     if (fi < 0) return nullptr;
     void* p = nullptr;
     if (hipMalloc(&p, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
-    if (hipMemset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess) {
+    /* Zero before any launch reads it: the memset is on the null stream, which the engine's
+     * streams need not wait for, so wait here (as r4d_moe.hip's router counters do). */
+    if (hipMemset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {
         (void)hipFree(p);
         return nullptr;
     }
@@ -3236,6 +3273,30 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
                     (const unsigned short*)y->data,
                     (const unsigned short*)inj->data, (unsigned short*)h->data,
                     (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+}
+
+enum { HCP_H = 0, HCP_V, HCP_ON };
+
+/* The control vector's projection. `v` is one layer's unit direction, [n], used for EVERY stream
+ * (the dot is per stream against the same direction): a [hc, n] table is refused here rather than
+ * read as one direction a stream, which is what a per-stream offset would silently do. */
+extern "C" int r4d_rad_hc_project(const RadArgs* a, RadStream stream) {
+    const RadTensor* h  = r4d_opt(a, HCP_H);
+    const RadTensor* v  = r4d_opt(a, HCP_V);
+    const RadTensor* on = r4d_opt(a, HCP_ON);
+    if (!h || !v || !on) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(h, RAD_BF16); R4D_DT(v, RAD_F32); R4D_DT(on, RAD_I32);
+    long long rows = 0, n = 0, hc = 0, hrow = 0;
+    const int rc = hc_common(a, h, &rows, &n, &hc, &hrow);
+    if (rc != RAD_OK) return rc;
+    long long vrows = 0, onrows = 0;
+    if (r4d_rows_pitch(v, n, &vrows) < 0 || vrows != 1) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_rows_pitch(on, 1, &onrows) < 0 || onrows < rows) return R4D_NO(RAD_E_STRIDE);
+
+    return R4D_EMIT(stream, hc_project_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads),
+                    0, (unsigned short*)h->data, (const float*)v->data,
+                    (const int32_t*)on->data, (long)rows, (long)n, (long)hrow,
+                    (float)r4d_getf(a, "scale", 1.0));
 }
 
 enum { MTE_H = 0, MTE_E, MTE_WH, MTE_WE, MTE_FCH, MTE_FCE, MTE_X };

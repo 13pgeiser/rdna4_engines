@@ -101,7 +101,13 @@ __device__ __forceinline__ void quant_group(const float v[4], float* __restrict_
 // consecutive columns, so the group's amax is a wave reduction and the store a single dword. `nr`
 // is the row the norm is taken of, already in memory (see the bit-identity note above). Shared so
 // the fused all-reduce cannot drift from the standalone norm.
-template <bool WF32, uint32_t THR>
+//
+// HI8 is had_quant_act_i8g's form (the `_had_quant_i8g` ops): the width-128 Hadamard between the
+// bf16-rounded norm output and the absmax, then int8 codes, as gated_quant_fp8_kernel's ROT and I8
+// together. r4d_quant_act_fp8's kernel has the same mapping, rotation and rounding, so the codes
+// are the norm + had_quant_act_i8g pair's bytes. `y` still receives the unrotated norm output.
+// The launchers require n % 128 == 0, so no rotated group contains padding.
+template <bool WF32, uint32_t THR, bool HI8 = false>
 __device__ __forceinline__ void norm_quant_row(
     const uint16_t* __restrict__ nr, const void* __restrict__ w, uint16_t* __restrict__ yr,
     uint8_t* __restrict__ qr, float* __restrict__ s, size_t s_row, uint32_t n, uint32_t nkb,
@@ -128,13 +134,14 @@ __device__ __forceinline__ void norm_quant_row(
                 v[j] = bf2f(h);
             }
         }
-        quant_group(v, s, qr, s_row + kb, c0, n, lane);
+        if constexpr (HI8) r4d_fwht_wave<(int)kGroup>(v, (int)lane);
+        quant_group<HI8>(v, s, qr, s_row + kb, c0, n, lane);
     }
 }
 
 // ---------------------------------------------------------------------------- rmsnorm -> quant
 // One block per row. Pass one is the block-wide sum of squares; pass two is norm_quant_row.
-template <bool WF32, bool RES, uint32_t THR>
+template <bool WF32, bool RES, uint32_t THR, bool HI8 = false>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n,
@@ -178,8 +185,8 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_fp8_kernel(
     }
     const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
 
-    norm_quant_row<WF32, THR>(nr, w, y ? y + (size_t)row * y_ld : nullptr, q + (size_t)row * q_ld,
-                              s, (size_t)row * s_ld, n, nkb, rs, wadd);
+    norm_quant_row<WF32, THR, HI8>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
+                                   q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs, wadd);
 }
 
 // ---------------------------------------------------------------------------- gate -> quant
@@ -366,7 +373,10 @@ __device__ __forceinline__ unsigned int arq_load_acq(const unsigned int* p) {
 // POST: a sandwich-norm junction (Gemma 3): the reduced sum is post-normed against `wp` before the
 // residual add, `v = bf16(sum * s1 * (wp + wadd))` with s1 the sum's own rms, as rmsnorm_quant_i8's
 // POST computes it. `x` still receives the reduced sum. Exact wire and a residual only.
-template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false>
+//
+// HI8: ar_rmsnorm_had_quant_i8g, pass two in norm_quant_row's rotated int8 form. The reduction and
+// the norm are untouched, so `x`, the residual and `y` are ar_rmsnorm_quant_fp8's bytes.
+template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false, bool HI8 = false>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp,
@@ -584,8 +594,9 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
         }
         /* block_sum's barrier is also what publishes pass one's stores to pass two's reads. */
         const float rs = rsqrtf(block_sum<THR / kWave>(ss, lds) / (float)n + eps);
-        norm_quant_row<WF32, THR>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
-                                  q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs, wadd);
+        norm_quant_row<WF32, THR, HI8>(nr, w, y ? y + (size_t)row * y_ld : nullptr,
+                                       q + (size_t)row * q_ld, s, (size_t)row * s_ld, n, nkb, rs,
+                                       wadd);
         /* lds is reused by this block's next row; without the barrier a thread still reading it
          * would race the next row's write. */
         __syncthreads();
@@ -606,14 +617,18 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
 //   res  [M][n]              bf16, `r_ld` elements a row (0 = n), optional, read and written
 //   w    [n]                 f32 or bf16
 //   y    [M][n]              bf16, `y_ld` elements a row (0 = n), optional
-//   q    [M][n]              E4M3, `q_ld` bytes a row (0 = n), rounded up to 4
+//   q    [M][n]              E4M3 (rotated int8 when `hi8`), `q_ld` bytes a row (0 = n), rounded
+//                            up to 4
 //   s    [M][ceil(n/128)]    f32,  `s_ld` elements a row (0 = ceil(n/128))
-extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int M, int n,
-                                     float eps, float wadd, int w_f32, int x_ld, int r_ld,
-                                     int y_ld, int q_ld, int s_ld, long stream) {
+//
+// `hi8` additionally requires n % 128 == 0, as gated_quant_fp8_launch's `rot`.
+static int rmsnorm_quant_launch(long x, long res, long w, long y, long q, long s, int M, int n,
+                                float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
+                                int q_ld, int s_ld, long stream, bool hi8) {
     if (!x || !w || !q || !s) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (n % 4) return -3;              // a lane owns four columns; see the kernel
+    if (hi8 && (n % (int)kGroup)) return -6;
     if (!x_ld) x_ld = n;
     if (!r_ld) r_ld = n;
     if (!y_ld) y_ld = n;
@@ -627,12 +642,14 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
     // rmsnorm_bf16 must pick the same width from the same function: the width decides which
     // columns a thread sums, so a different width changes the last bits and breaks bit identity.
     const int thr = r4d_act_threads(M, n);
-#define R4D_RQ_T(wf, rs, T)                                                                     \
-    hipLaunchKernelGGL((rmsnorm_quant_fp8_kernel<wf, rs, T>), dim3((uint32_t)M), dim3(T), 0,    \
+#define R4D_RQ_H(wf, rs, T, H)                                                                  \
+    hipLaunchKernelGGL((rmsnorm_quant_fp8_kernel<wf, rs, T, H>), dim3((uint32_t)M), dim3(T), 0, \
                        (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)res, (const void*)w,  \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)nkb, eps,    \
                        wadd, (uint32_t)x_ld, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld,     \
                        (uint32_t)s_ld)
+#define R4D_RQ_T(wf, rs, T)                                                                     \
+    do { if (hi8) R4D_RQ_H(wf, rs, T, true); else R4D_RQ_H(wf, rs, T, false); } while (0)
 #define R4D_RQ(wf, rs)                                                                          \
     do { if (thr == 1024)     R4D_RQ_T(wf, rs, 1024);                                           \
          else if (thr == 512) R4D_RQ_T(wf, rs, 512);                                            \
@@ -641,7 +658,24 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
     else       { if (res) R4D_RQ(false, true); else R4D_RQ(false, false); }
 #undef R4D_RQ
 #undef R4D_RQ_T
+#undef R4D_RQ_H
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int M, int n,
+                                     float eps, float wadd, int w_f32, int x_ld, int r_ld,
+                                     int y_ld, int q_ld, int s_ld, long stream) {
+    return rmsnorm_quant_launch(x, res, w, y, q, s, M, n, eps, wadd, w_f32, x_ld, r_ld, y_ld,
+                                q_ld, s_ld, stream, false);
+}
+
+// The same norm with had_quant_act_i8g's quantiser on its pass: the width-128 Hadamard, then int8
+// codes at amax / 127 per (row, 128). For a rotated int8 linear (dtype i8a8h); `q` is int8.
+extern "C" int r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long q, long s, int M,
+                                         int n, float eps, float wadd, int w_f32, int x_ld,
+                                         int r_ld, int y_ld, int q_ld, int s_ld, long stream) {
+    return rmsnorm_quant_launch(x, res, w, y, q, s, M, n, eps, wadd, w_f32, x_ld, r_ld, y_ld,
+                                q_ld, s_ld, stream, true);
 }
 
 // `mode` is 0 for silu (down_proj's input) and 1 for sigmoid (a gated attention o_proj's), as in
@@ -654,6 +688,8 @@ extern "C" int r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, l
 //
 // `rot` additionally requires n % 128 == 0: a ragged last group is fine unrotated (zero-padded,
 // masked by the GEMM) but a butterfly mixing real values with padding has no matching weight block.
+// `rot` with `i8` is had_quant_act_i8g's form (gated_had_quant_i8g), for a rotated int8 down
+// projection; `rot` alone pairs with a rotated four-bit expert, which reads E4M3.
 static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n, int mode,
                                   int gu_ld, int y_ld, int q_ld, int s_ld, RadStream stream,
                                   bool rot, bool i8 = false) {
@@ -663,8 +699,6 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
     if (n % 4) return -3;
     if (mode != 0 && mode != 1) return -5;
     if (rot && (n % (int)kGroup)) return -6;
-    // The rotated codes pair with a rotated four-bit expert, which reads E4M3 only.
-    if (rot && i8) return -7;
     if (!gu_ld) gu_ld = 2 * n;
     if (!y_ld) y_ld = n;
     if (!q_ld) q_ld = n;
@@ -679,7 +713,8 @@ static int gated_quant_fp8_launch(long gu, long y, long q, long s, int M, int n,
                        (float*)s, (uint32_t)n, (uint32_t)nkb, (uint32_t)gu_ld, (uint32_t)y_ld,  \
                        (uint32_t)q_ld, (uint32_t)s_ld)
 #define R4D_GQ(a)                                                                               \
-    do { if (rot) R4D_GQ_R(a, true, false);                                                     \
+    do { if (rot && i8) R4D_GQ_R(a, true, true);                                                \
+         else if (rot) R4D_GQ_R(a, true, false);                                                \
          else if (i8) R4D_GQ_R(a, false, true);                                                 \
          else R4D_GQ_R(a, false, false); } while (0)
     if (mode == 0) R4D_GQ(0);
@@ -700,6 +735,13 @@ extern "C" int r4d_gated_had_quant_fp8(long gu, long y, long q, long s, int M, i
                                        int gu_ld, int y_ld, int q_ld, int s_ld, long stream) {
     return gated_quant_fp8_launch(gu, y, q, s, M, n, mode, gu_ld, y_ld, q_ld, s_ld,
                                   (RadStream)(uintptr_t)stream, true);
+}
+
+// The same product with had_quant_act_i8g's quantiser: `q` is int8.
+extern "C" int r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, int n, int mode,
+                                       int gu_ld, int y_ld, int q_ld, int s_ld, long stream) {
+    return gated_quant_fp8_launch(gu, y, q, s, M, n, mode, gu_ld, y_ld, q_ld, s_ld,
+                                  (RadStream)(uintptr_t)stream, true, true);
 }
 
 // act . x with the gate and x in separate buffers; see the kernel for why a row is a (token, head)
@@ -760,15 +802,19 @@ extern "C" int r4d_gate_quant_fp8(long g, long x, long y, long q, long s, int M,
 // `res` behaves as in r4d_rmsnorm_quant_fp8. Returns 0, or a negative code for an unserved shape.
 extern "C" int r4d_ar_rmsnorm_quant_fp8_chunk_elems(void) { return ARQ_CE; }
 
-extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flags,
-                                        long my_flags, long seq_ctrs, long slot_stride16,
-                                        long x, long res, long w, long y, long q, long s,
-                                        int M, int n, float eps, float wadd, int w_f32,
-                                        int r_ld, int y_ld, int q_ld, int s_ld, long stream,
-                                        int nblocks, int nthreads, int drain, int acq, int wire,
-                                        long loc_pack, long loc_scale_off, long wp) {
+// `hi8` is the rotated int8 form (ar_rmsnorm_had_quant_i8g): `q` is int8, n % 128 == 0, and there
+// is no post-norm.
+static int ar_rmsnorm_quant_launch(long peer_scratch, long my_scratch, long peer_flags,
+                                   long my_flags, long seq_ctrs, long slot_stride16,
+                                   long x, long res, long w, long y, long q, long s,
+                                   int M, int n, float eps, float wadd, int w_f32,
+                                   int r_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                   int nblocks, int nthreads, int drain, int acq, int wire,
+                                   long loc_pack, long loc_scale_off, long wp, bool hi8) {
     if (!x || !w || !q || !s) return -1;
     if (wp && (!res || wire != 0)) return -10;   // a post-norm needs the stream and the exact wire
+    if (hi8 && wp) return -11;
+    if (hi8 && (n % (int)kGroup)) return -12;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
     // n % 8: n bf16 is a whole number of 16B words (see the push), which also gives every lane its
@@ -791,9 +837,9 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
     // The width must be r4d_act_threads', as for the standalone norm (it fixes the summation order).
     const int thr = nthreads ? nthreads : r4d_act_threads(M, n);
     if (thr != 256 && thr != 512 && thr != 1024) return -6;
-#define R4D_ARQ_P(wf, rs, T, W, PO)                                                              \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO>), dim3((uint32_t)nb), dim3(T), \
-                       0,                                                                        \
+#define R4D_ARQ_H(wf, rs, T, W, PO, H)                                                           \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO, H>), dim3((uint32_t)nb),   \
+                       dim3(T), 0,                                                               \
                        (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res, (const void*)w,        \
                        (const void*)wp,                                                          \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (int4*)peer_scratch,                \
@@ -802,7 +848,10 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
                        (long)loc_scale_off, M, (uint32_t)n,                                      \
                        (uint32_t)nkb, eps, wadd, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld, \
                        (uint32_t)s_ld, (int)slot_stride16, drain, acq, (unsigned)nbw)
-#define R4D_ARQ_T(wf, rs, T, W) R4D_ARQ_P(wf, rs, T, W, false)
+#define R4D_ARQ_P(wf, rs, T, W, PO) R4D_ARQ_H(wf, rs, T, W, PO, false)
+#define R4D_ARQ_T(wf, rs, T, W)                                                                  \
+    do { if (hi8) R4D_ARQ_H(wf, rs, T, W, false, true);                                          \
+         else R4D_ARQ_P(wf, rs, T, W, false); } while (0)
 #define R4D_ARQ_W(wf, rs, T)                                                                     \
     do { if (wire == 6) R4D_ARQ_T(wf, rs, T, 6);                                                 \
          else if (rs && wp) R4D_ARQ_P(wf, rs, T, 0, true);                                       \
@@ -817,7 +866,35 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
 #undef R4D_ARQ_W
 #undef R4D_ARQ_T
 #undef R4D_ARQ_P
+#undef R4D_ARQ_H
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flags,
+                                        long my_flags, long seq_ctrs, long slot_stride16,
+                                        long x, long res, long w, long y, long q, long s,
+                                        int M, int n, float eps, float wadd, int w_f32,
+                                        int r_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                        int nblocks, int nthreads, int drain, int acq, int wire,
+                                        long loc_pack, long loc_scale_off, long wp) {
+    return ar_rmsnorm_quant_launch(peer_scratch, my_scratch, peer_flags, my_flags, seq_ctrs,
+                                   slot_stride16, x, res, w, y, q, s, M, n, eps, wadd, w_f32,
+                                   r_ld, y_ld, q_ld, s_ld, stream, nblocks, nthreads, drain, acq,
+                                   wire, loc_pack, loc_scale_off, wp, false);
+}
+
+// The same with had_quant_act_i8g's quantiser on the norm's pass (no post-norm).
+extern "C" int r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_flags,
+                                            long my_flags, long seq_ctrs, long slot_stride16,
+                                            long x, long res, long w, long y, long q, long s,
+                                            int M, int n, float eps, float wadd, int w_f32,
+                                            int r_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                            int nblocks, int nthreads, int drain, int acq,
+                                            int wire, long loc_pack, long loc_scale_off) {
+    return ar_rmsnorm_quant_launch(peer_scratch, my_scratch, peer_flags, my_flags, seq_ctrs,
+                                   slot_stride16, x, res, w, y, q, s, M, n, eps, wadd, w_f32,
+                                   r_ld, y_ld, q_ld, s_ld, stream, nblocks, nthreads, drain, acq,
+                                   wire, loc_pack, loc_scale_off, 0, true);
 }
 
 // ============================================================== the plugin ABI entry points
@@ -828,7 +905,9 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
  * The standalone quantiser's shape rules, applied to the operand that produces the row. The bf16
  * output is optional so a layer without a bf16 consumer skips the store. */
 
-extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+/* `hi8`: rmsnorm_had_quant_i8g, whose codes are int8 and whose row is whole 128s (the rotation's
+ * width). Separate ops for the reason given at r4d_rad_gated_had_quant_fp8. */
+static int rad_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     const RadTensor* x  = r4d_opt(a, RQ_X);
     const RadTensor* rs = r4d_opt(a, RQ_RES);
     const RadTensor* w  = r4d_opt(a, RQ_W);
@@ -836,7 +915,7 @@ extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, RQ_S);
     const RadTensor* y  = r4d_opt(a, RQ_Y);
     if (!x || !w || !q || !sc) return R4D_NO(RAD_E_INVAL);
-    if (q->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    if (q->dtype != (hi8 ? RAD_I8 : RAD_F8E4M3)) return R4D_NO(RAD_E_DTYPE);
     /* Rank 2 on the input too, unlike the standalone quantiser: a norm has one gain per channel,
      * and folding trailing dims would spread a gain across heads. */
     if (x->rank != 2 || q->rank != 2 || sc->rank != 2) return R4D_NO(RAD_E_SHAPE);
@@ -850,19 +929,28 @@ extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     if (q->shape[0] != M || q->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
     if (sc->shape[0] != M || sc->shape[1] != nkb) return R4D_NO(RAD_E_SHAPE);
     if (y && (y->shape[0] != M || y->shape[1] != K)) return R4D_NO(RAD_E_SHAPE);
+    if (hi8 && K % grp) return R4D_NO(RAD_E_SHAPE);
     /* The residual has the input's extent and is read and written. It may alias `out_bf16` (see
      * the note at the top of the file). */
     if (rs && (rs->rank != 2 || rs->shape[0] != M || rs->shape[1] != K)) return R4D_NO(RAD_E_SHAPE);
     const long long xp = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
     const long long yp = y ? r4d_row_pitch(y) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
     if (xp < 0 || qp < 0 || sp < 0 || yp < 0 || rp < 0) return R4D_NO(RAD_E_STRIDE);
-    const int e = r4d_rmsnorm_quant_fp8(r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w),
-                                        y ? r4d_addr(y) : 0, r4d_addr(q), r4d_addr(sc),
-                                        (int)M, (int)K,
-                                        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
-                                        w->dtype == RAD_F32, (int)xp, (int)rp, (int)yp, (int)qp,
-                                        (int)sp, (long)(uintptr_t)s);
+    const int e = rmsnorm_quant_launch(r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w),
+                                       y ? r4d_addr(y) : 0, r4d_addr(q), r4d_addr(sc),
+                                       (int)M, (int)K,
+                                       (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
+                                       w->dtype == RAD_F32, (int)xp, (int)rp, (int)yp, (int)qp,
+                                       (int)sp, (long)(uintptr_t)s, hi8);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+    return rad_rmsnorm_quant(a, s, false);
+}
+
+extern "C" int r4d_rad_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
+    return rad_rmsnorm_quant(a, s, true);
 }
 
 /* The gate's activation: `act` by name overrides `mode` (libr4d's integer: 0 silu, 1 sigmoid) when
@@ -875,15 +963,17 @@ static int act_mode(const RadArgs* a, int dflt) {
     return -1;
 }
 
-static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot) {
+/* `hi8` (with `rot`): gated_had_quant_i8g, int8 codes only. */
+static int rad_gated_quant_fp8(const RadArgs* a, RadStream stream, bool rot, bool hi8 = false) {
     const RadTensor* gu = r4d_opt(a, GQ_GU);
     const RadTensor* q  = r4d_opt(a, GQ_Q);
     const RadTensor* sc = r4d_opt(a, GQ_S);
     const RadTensor* y  = r4d_opt(a, GQ_Y);
     if (!gu || !q || !sc) return R4D_NO(RAD_E_INVAL);
-    /* The codes' dtype picks the quantiser: E4M3, or int8 for an int8 down projection. */
+    /* The codes' dtype picks the quantiser: E4M3, or int8 for an int8 down projection. The two
+     * rotated ops each take one: E4M3 for a four-bit expert, int8 for a rotated int8 weight. */
     if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
-    if (rot && q->dtype == RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (rot && q->dtype != (hi8 ? RAD_I8 : RAD_F8E4M3)) return R4D_NO(RAD_E_DTYPE);
     if (gu->rank != 2 || q->rank != 2 || sc->rank != 2) return R4D_NO(RAD_E_SHAPE);
     if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long M = gu->shape[0], K = q->shape[1];
@@ -914,6 +1004,11 @@ extern "C" int r4d_rad_gated_quant_fp8(const RadArgs* a, RadStream stream) {
  * the same shape). It pairs only with a down-projection weight stored at dtype w4a8h. */
 extern "C" int r4d_rad_gated_had_quant_fp8(const RadArgs* a, RadStream stream) {
     return rad_gated_quant_fp8(a, stream, true);
+}
+
+/* Its int8 twin, had_quant_act_i8g's codes: pairs only with a weight stored at dtype i8a8h. */
+extern "C" int r4d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream stream) {
+    return rad_gated_quant_fp8(a, stream, true, true);
 }
 
 /* Elements between consecutive `width`-wide rows, as r4d_gdn.cpp's gn_row_pitch: a

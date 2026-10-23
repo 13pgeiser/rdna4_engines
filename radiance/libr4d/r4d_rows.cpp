@@ -477,6 +477,16 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
     { "o_scale",      RAD_OPD_OUT,    1 },
 };
 
+/* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
+ * stream, one unit f32 direction for every stream, an int32 switch per row. */
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
+                                           P_STR("dtype") };
+static const RadOperandSpec oHcProject[] = {
+    { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 }, { "on", RAD_OPD_IN, 0 },
+};
+static const RadConstraint cHcProject[] = {
+    C_GE("M", 1), C_GE("n", 1), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
+};
 /* The gated residual. `hc_enter` and `hc_write` share a parameter list; `hc_read` adds the two
  * switches its operand list depends on: `inject` 0 is the final mixer and `group` 0 a read whose
  * consumer wants bf16. Both default on, as every trunk connection uses both. */
@@ -718,6 +728,40 @@ static const RadOperandSpec oGemmNt[] = {
  * (w5a16, w4a16_asym, w4a8i8_asym, w5a8i8): weight rows [0, pb1), [pb1, pb2) and [pb2, N) each
  * meet their own copy of the activation, side by side in a row of `a` ([M, parts * K]). 0 leaves a
  * bound out. Absent on other grids, where a fused projection has one activation. */
+/* `add_rmsnorm` is `add` (x += a) followed by `rmsnorm` of the x it wrote (docs/OPS.md). */
+static const RadParamSpec pAddRmsNorm[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+    P_F64O("mult"),
+};
+static const RadOperandSpec oAddRmsNorm[] = {
+    { "x", RAD_OPD_INOUT,  0 },
+    { "a", RAD_OPD_IN,     0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT,    0 },
+};
+/* `kv_len_trim`: a batch's per-sequence context lengths less `trim` (docs/OPS.md). */
+static const RadParamSpec pKvLenTrim[] = {
+    { "trim",     RAD_P_INT, RAD_REQUIRED },
+    { "max_seqs", RAD_P_INT, RAD_REQUIRED },
+};
+/* `tail` is the rows past the slice (their positions); its extent is the trim, its values unread.
+ * A launch's `trim` is the band's upper bound, not the issued count (RadArgs.p). */
+static const RadOperandSpec oKvLenTrim[] = {
+    { "seqused", RAD_OPD_IN,  0 },
+    { "tail",    RAD_OPD_IN,  0 },
+    { "out",     RAD_OPD_OUT, 0 },
+};
+/* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
+static const RadParamSpec pPrefetch[] = {
+    { "bytes", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oPrefetch[] = {
+    { "w", RAD_OPD_WEIGHT, 0 },
+};
 static const RadParamSpec pGemmNtQ[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -726,6 +770,9 @@ static const RadParamSpec pGemmNtQ[] = {
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     { "pb1",   RAD_P_INT, RAD_OPTIONAL },
     { "pb2",   RAD_P_INT, RAD_OPTIONAL },
+    /* The width whose K split a row slice of a wider linear takes (docs/OPS.md); only the narrow
+     * fp8a8 / i8a8 rows split K by N, and they read it. */
+    { "split_n", RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
  * quantised GEMMs need a seventh operand. RadLayout can declare aux streams beside a weight, but
@@ -1391,6 +1438,7 @@ static const RadParamSpec pQkvNormRope[] = {
     { "ladder",     RAD_P_STR, RAD_OPTIONAL },
     P_F64O("wadd"),
     { "v_from_k",   RAD_P_INT, RAD_OPTIONAL },
+    /* 0 leaves v unnormed (Gemma 3; a Qwen3-shaped layer); absent, 1 */
     { "v_norm",     RAD_P_INT, RAD_OPTIONAL },
     { "dtype",      RAD_P_STR, RAD_REQUIRED },
 };
@@ -1401,6 +1449,39 @@ static const RadOperandSpec oQkvNormRope[] = {
     { "positions", RAD_OPD_IN,     0 },
     { "q_w",       RAD_OPD_WEIGHT, 0 },
     { "k_w",       RAD_OPD_WEIGHT, 0 },
+};
+/* `qkv_norm_rope_kv_store` is qkv_norm_rope followed by kv_store in one launch: the prologue's
+ * operands, then kv_store's slot mapping and paged cache; every parameter is one of the two ops'.
+ * Byte-identical to the pair (docs/OPS.md). */
+static const RadParamSpec pQkvNormRopeKv[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head",     RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    P_F64("theta"),
+    P_F64("eps"),
+    P_F64O("scale"),
+    { "mode",       RAD_P_STR, RAD_OPTIONAL },
+    { "rotary_dim", RAD_P_INT, RAD_OPTIONAL },
+    { "ladder",     RAD_P_STR, RAD_OPTIONAL },
+    P_F64O("wadd"),
+    { "v_from_k",   RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    { "v_norm",     RAD_P_INT, RAD_OPTIONAL },
+    { "block_size", RAD_P_INT, RAD_REQUIRED },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
+    P_F64O("k_scale"),
+    P_F64O("v_scale"),
+};
+static const RadOperandSpec oQkvNormRopeKv[] = {
+    { "q",            RAD_OPD_INOUT,  0 },
+    { "k",            RAD_OPD_INOUT,  0 },
+    { "v",            RAD_OPD_INOUT,  0 },
+    { "positions",    RAD_OPD_IN,     0 },
+    { "q_w",          RAD_OPD_WEIGHT, 0 },
+    { "k_w",          RAD_OPD_WEIGHT, 0 },
+    { "slot_mapping", RAD_OPD_IN,     0 },
+    { "kv_cache",     RAD_OPD_INOUT,  0 },
 };
 
 /* `gelu_mul_quant_i8` is `gelu_mul` with quant_act_i8's quantiser on its pass: the down projection
@@ -1418,7 +1499,11 @@ static const RadOperandSpec oGeluMulQuantI8[] = {
 };
 
 /* `ar_rmsnorm_quant_i8` is rmsnorm_quant_i8 with the two-rank exact all-reduce of `x` in front:
- * same operands with `x` inout (it receives the reduced sum), plus `world_size`. */
+ * same operands with `x` inout (it receives the reduced sum), plus `world_size`. `sp` (optional,
+ * 0) lets a row split the all-reduce around the junction at tensor parallel: 1 asks only for q and
+ * the scales on every row and the residual on the rows this rank owns (M split evenly over the
+ * ranks in rank order), 2 for the residual on every row too; `x` is then left unspecified. A row
+ * may always do more than asked (the whole form). */
 static const RadParamSpec pArRmsNormQuantI8[] = {
     { "M",          RAD_P_INT, RAD_REQUIRED },
     { "n",          RAD_P_INT, RAD_REQUIRED },
@@ -1426,6 +1511,7 @@ static const RadParamSpec pArRmsNormQuantI8[] = {
     { "world_size", RAD_P_INT, RAD_REQUIRED },
     { "dtype",      RAD_P_STR, RAD_REQUIRED },
     P_F64O("wadd"),
+    P_INTO("sp"),
 };
 static const RadOperandSpec oArRmsNormQuantI8[] = {
     { "x",        RAD_OPD_INOUT,  0 },
@@ -1662,11 +1748,13 @@ static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
                                            { "length", RAD_OPD_IN, 0 },
                                            { "out", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pDsaScore[] = { P_INT("M"),      P_INT("n"),    P_INT("heads"),
-                                          P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+                                          P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
+                                          P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = {
     { "q", RAD_OPD_IN, 0 },  { "q_scale", RAD_OPD_IN, 0 }, { "gate", RAD_OPD_IN, 0 },
     { "k", RAD_OPD_IN, 0 },  { "k_scale", RAD_OPD_IN, 1 }, { "bt", RAD_OPD_IN, 0 },
-    { "cu", RAD_OPD_IN, 0 }, { "nc", RAD_OPD_IN, 0 },      { "score", RAD_OPD_OUT, 0 }
+    { "cu", RAD_OPD_IN, 0 }, { "nc", RAD_OPD_IN, 0 },      { "score", RAD_OPD_OUT, 0 },
+    { "cu_part", RAD_OPD_OUT, 1 }
 };
 static const RadOperandSpec oDsaPool[] = {
     { "kg", RAD_OPD_IN, 0 },     { "ape", RAD_OPD_WEIGHT, 0 }, { "q", RAD_OPD_OUT, 0 },
@@ -2318,6 +2406,21 @@ static const RadOperandSpec oFlowEuler[] = {
     { "inp_lat", RAD_OPD_IN, 1 }, { "inp_mask", RAD_OPD_IN, 1 }, { "state", RAD_OPD_INOUT, 0 },
     { "preview", RAD_OPD_INOUT, 1 },
 };
+/* The k-diffusion sampler's input and step: `pred` "eps" or "v", the lanes f32. */
+static const RadParamSpec pKdStep[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("pred"),
+                                        P_STR("dtype") };
+static const RadOperandSpec oKdInput[] = {
+    { "sigma", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 },
+    { "flags", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "state", RAD_OPD_INOUT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oKdStep[] = {
+    { "out", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 }, { "sigma_next", RAD_OPD_IN, 0 },
+    { "sigma_prev", RAD_OPD_IN, 0 }, { "cfg", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 },
+    { "lane", RAD_OPD_IN, 0 }, { "flags", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 },
+    { "sampler", RAD_OPD_IN, 0 }, { "step", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "state", RAD_OPD_INOUT, 0 }, { "hist", RAD_OPD_INOUT, 0 }, { "preview", RAD_OPD_INOUT, 1 },
+};
 /* `round` 0 keeps the lists and the arithmetic in f32 (default 1, bf16 lists and roundings). */
 static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
                                             P_STR("mode"), P_STR("dtype"), P_INTO("round") };
@@ -2329,6 +2432,8 @@ static const RadOperandSpec oConvNhwc[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
+                                        P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
 static const RadOperandSpec oL2Norm[] = {
     { "x", RAD_OPD_IN, 0 }, { "gamma", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
@@ -2917,6 +3022,12 @@ static const RadOpSchema kSchemas[] = {
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
+    SCHEMA("hc_project", pHcProject, oHcProject,
+           "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
+           "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
+           "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
+           "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
+           "the stock model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -3053,17 +3164,37 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_fp8", pRmsNormQuantFp8, oRmsNormQuantFp8,
            "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
            "output the unfused pair wrote is still written, and the codes are taken over it."),
+    SCHEMA("rmsnorm_had_quant_i8g", pRmsNormQuantFp8, oRmsNormQuantFp8,
+           "rmsnorm_quant_fp8 with had_quant_act_i8g's quantiser on its pass: a `group`-wide "
+           "Hadamard of the bf16 norm output, then int8 codes per (row, `group`). `out_bf16` "
+           "receives the UNROTATED norm output. Pairs only with an i8 weight stored rotated "
+           "(dtype i8a8h); byte-identical to the norm and had_quant_act_i8g."),
     SCHEMA("rmsnorm_quant_i8", pRmsNormQuantI8, oRmsNormQuantI8,
            "RMS norm and the per-row int8 quantiser the w4a8 skinny GEMM reads, in one pass; with "
            "a residual the norm is of residual + x (+ a post-norm of x, x a scalar), stored back."),
+    SCHEMA("add_rmsnorm", pAddRmsNorm, oAddRmsNorm,
+           "x = x + a, then y = rmsnorm(x) * (w + wadd) * mult over the x written: a residual add "
+           "and the next norm in one pass, byte-identical to add then rmsnorm. The norm is taken "
+           "over the bf16 sum it stores; rmsnorm_add normalises the unrounded one."),
+    SCHEMA("kv_len_trim", pKvLenTrim, oKvLenTrim,
+           "out[s] = max(seqused[s] - trim, 0), trim the extent of `tail` (the rows past the "
+           "slice): the context a slice of a step's rows ends at, for an attention over that "
+           "slice alone."),
+    SCHEMA("prefetch", pPrefetch, oPrefetch,
+           "read a weight's leading bytes so they are in the cache when the next kernel streams "
+           "them; writes nothing."),
     SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
            "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
-           "q, k and v projections, in one dispatch; v from the raw k under v_from_k."),
+           "q, k and v projections, in one dispatch; v from the raw k under v_from_k. n_head 0 "
+           "leaves q unread (the k and v heads alone)."),
+    SCHEMA("qkv_norm_rope_kv_store", pQkvNormRopeKv, oQkvNormRopeKv,
+           "qkv_norm_rope, then kv_store of the finished k and v heads into the paged cache, in one "
+           "launch."),
     SCHEMA("gelu_mul_quant_i8", pGeluMulQuantI8, oGeluMulQuantI8,
            "gelu(gate) * up (tanh form) and the per-row int8 quantiser the w4a8 skinny GEMM reads, in "
            "one pass."),
     SCHEMA("ar_rmsnorm_quant_i8", pArRmsNormQuantI8, oArRmsNormQuantI8,
-           "the two-rank exact all-reduce of x and rmsnorm_quant_i8 after it, in one kernel."),
+           "the two- or four-rank exact all-reduce of x and rmsnorm_quant_i8 after it, in one kernel."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -3072,6 +3203,11 @@ static const RadOpSchema kSchemas[] = {
            "the rotation is a property of the quantised pair alone. Pairs with a weight stored at "
            "dtype w4a8h; substituting it for gated_quant_fp8, or the reverse, produces a model "
            "that runs and is wrong."),
+    SCHEMA("gated_had_quant_i8g", pGatedQuantFp8, oGatedQuantFp8,
+           "gated_had_quant_fp8 at int8 codes: silu(a)*b or sigmoid(a)*b, a `group`-wide Hadamard "
+           "and had_quant_act_i8g's quantiser, in one pass. `out_bf16` receives the UNROTATED "
+           "product. Pairs only with an i8 weight stored rotated (dtype i8a8h); byte-identical "
+           "to the product and had_quant_act_i8g."),
     SCHEMA("gemm_nt_q_gated", pGemmNtQGated, oGemmNtQGated,
            "gemm_nt_q over a [2n, K] gate_up plane with gated_quant_fp8's pass folded into the "
            "epilogue: the outputs are the quantiser's E4M3 codes, its scale per (row, `group` "
@@ -3189,6 +3325,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_rmsnorm_quant_fp8", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
            "quantisation that always follow it, in one kernel. Both wires."),
+    SCHEMA("ar_rmsnorm_had_quant_i8g", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
+           "the two-rank all-reduce of x and rmsnorm_had_quant_i8g after it, in one kernel; "
+           "either wire, as ar_rmsnorm_quant_fp8."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),
@@ -3231,6 +3370,11 @@ static const RadOpSchema kSchemas[] = {
            "y[m, n] = y[m, n] + scale[s, n] * sum_j t[m, j] * lora_b[s, n, j] for each row m "
            "whose s = slot[m] is in [0, S), f32 accumulate, one rounding to y's dtype. A base "
            "row's `y` is neither read nor written."),
+    SCHEMA("lora_expand_mm", pLoraExpand, oLoraExpand,
+           "lora_expand with t rounded to bf16 and the sum over j in any order: y[m, n] = y[m, n] "
+           "+ scale[s, n] * sum_j bf16(t[m, j]) * lora_b[s, n, j], f32 accumulate, one rounding "
+           "to y's dtype; a base row's `y` is neither read nor written. A row's bytes may depend "
+           "on M."),
     SCHEMA("ln_mod", pLnMod, oLnMod,
            "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a layer norm with no gain or bias, then the "
            "row's sequence's modulation row of `s`."),
@@ -3258,17 +3402,30 @@ static const RadOpSchema kSchemas[] = {
            "an image's first step: its lane's rows become its seed's normal stream."),
     SCHEMA("flow_euler", pLane, oFlowEuler,
            "one Euler step of a flow-matching sampler per entry that moves a lane."),
+    SCHEMA("kd_input", pLane, oKdInput,
+           "a k-diffusion sampler's model input per entry that moves a lane: a first step's noise "
+           "times sqrt(1 + sigma^2) into the lane, then rd(x / sqrt(sigma^2 + 1)) at its rows and "
+           "its pair's."),
+    SCHEMA("kd_step", pKdStep, oKdStep,
+           "one k-diffusion sampler step per entry that moves a lane: the guided clean estimate "
+           "from an eps or v output, then Euler, Euler ancestral or DPM++ 2M; the lanes f32."),
     SCHEMA("chan_affine", pChanAffine, oGenUnary,
            "a per-channel affine from two parameter lists of n values; `round` 0 keeps the lists "
            "and the arithmetic in f32, rounded once into y."),
     SCHEMA("conv2d_nhwc", pConvNhwc, oConvNhwc,
            "an image convolution, channels innermost, the sizes read off the operands."),
+    SCHEMA("im2col_nhwc", pIm2col, oGenUnary,
+           "conv2d_nhwc's receptive fields as rows: y [Ho * Wo, cin * k * k], column "
+           "(ci * k + i) * k + j of row oy * Wo + ox the input conv2d_nhwc multiplies weight[o, ci, "
+           "i, j] by, 0 in the padding."),
     SCHEMA("l2norm_chan", pL2Norm, oL2Norm,
            "unit-L2 per row, times sqrt(n), times gamma, then `act`: an image decoder's norm."),
     SCHEMA("d2s_add", pSpaceDepth, oSpaceDepth, "an upsampling shortcut added in."),
     SCHEMA("s2d_avg_add", pSpaceDepth, oSpaceDepth, "a downsampling shortcut added in."),
     SCHEMA("to_rgba8", pGenMn, oGenUnary, "decoded pixels in [-1, 1] to bytes."),
     SCHEMA("gelu_tanh", pGenMn, oGenUnary, "the tanh approximation of gelu."),
+    SCHEMA("gelu_quick", pGenMn, oGenUnary,
+           "CLIP's quick_gelu: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)."),
     SCHEMA("scatter_add_rows", pGenMn, oScatterAdd, "x[idx[i]] += v[i]; a negative index adds nothing."),
     SCHEMA("attn_prefix_self", pAttnPS, oAttnPS,
            "attention over a paged prefix and the step's own rows, causal over the own rows or not. "
@@ -3480,6 +3637,19 @@ static const RadConstraint cAttnDecodeH256Gqa2Fp8[] = {
 static const RadConstraint cAttnDecodeH256Gqa2Bf16[] = {
     C_GE("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+/* Head_dim 128 at 8 queries per kv head under attn_paged_qrow: the gqa-4 kernel above with each kv
+ * head mapped onto two query groups (R4DArgs::kv_rep), so q_len * 4 <= 64 bounds it where gqa 8's
+ * own decode (q_len <= 8, no window) stops at 8. The 31B's DFlash drafter: 64 heads over 8 kv heads,
+ * sliding layers over 2048 and a full non-causal one, at a block of 16. Under attn_paged_qrow, which
+ * no host library declares, so a drafter asking for it learns whether a card serves it. */
+static const RadConstraint cAttnQrowH128G8Fp8[] = {
+    C_GE("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnQrowH128G8Bf16[] = {
+    C_GE("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
 /* Gemma 4 dense sliding-window prefill (r4d_attn_paged_h256_gqa2.hip): the decode leg's geometry
  * without a q_len bound, serving q_len > 32. The kernel's WIN bit masks the window and skips tiles
@@ -4333,6 +4503,16 @@ static const RadConstraint cArRmsNormQuantFp8[] = {
     C_EQ("world_size", 2),
     C_P2P,
 };
+/* The rotated int8 twins: `n DIV 128`, since a rotation block cannot straddle the end of a row
+ * (which also gives the all-reduce's 16B words). */
+static const RadConstraint cRmsNormHadQuantI8g[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cArRmsNormHadQuantI8g[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 2),
+    C_P2P,
+};
 /* hc_write's own bounds plus the all-reduce's: `n DIV 8` because `y` is pushed as 16B words, and
  * world_size 2 because the handshake is one peer flag per block. */
 static const RadConstraint cArHcWrite[] = {
@@ -4403,6 +4583,15 @@ static const RadConstraint cRmsNormQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
 };
 /* head_dim 256 or 512: a workgroup is one head, a thread one channel. */
+static const RadConstraint cAddRmsNorm[] = {
+    C_GE("n", 1), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cKvLenTrim[] = {
+    C_GE("trim", 0), C_LE("max_seqs", 64),
+};
+static const RadConstraint cPrefetch[] = {
+    C_GE("bytes", 1),
+};
 static const RadConstraint cQkvNormRope[] = {
     C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
 };
@@ -4410,12 +4599,24 @@ static const RadConstraint cQkvNormRope[] = {
 static const RadConstraint cQkvNormRopeH128[] = {
     C_EQ("head_dim", 128), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cQkvNormRopeKv[] = {
+    C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
+    C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cQkvNormRopeKvBf16[] = {
+    C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
+    C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
+};
 static const RadConstraint cGeluMulQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
 };
 /* x is the message, pushed as 16B words, and the row is staged in LDS for the fragment store. */
 static const RadConstraint cArRmsNormQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"), C_EQ("world_size", 2), C_P2P,
+};
+/* The same at four ranks, on the wide family's transport. */
+static const RadConstraint cArRmsNormQuantI84[] = {
+    C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"), C_EQ("world_size", 4), C_P2P,
 };
 static const RadConstraint cHadQuantActI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("group", 512), C_IN("dtype", "bf16"),
@@ -4627,7 +4828,8 @@ static const RadTunable tAttnSplit[] = {
 /* ------------------------------------------------------------------- all-reduce launch geometry
  *
  * Four independent axes of the handshake: nblocks, nthreads, drain and acq. (`pub` is 1 in every
- * arm, a constant in r4d_ar_entry.hip.) nblocks 0 scales with the message and clamps; drain 3 is
+ * arm but the four-rank junction's, tArQ84, where it is an axis.) nblocks 0 scales with the message
+ * and clamps; drain 3 is
  * s_wait_storecnt, the correct wait for the fine-grained uncached IPC scratch.
  *
  * rad-tune cannot reach these rows: the two-rank kernels need a real peer over IPC and rad-tune
@@ -4638,15 +4840,49 @@ static const RadTunable tAttnSplit[] = {
  * On the fp8 fused row only drain and acq apply: it forces `nthreads` to the norm's width for
  * bit-exactness, and pinning `nblocks` would undo r4d_ar_entry.hip's cap. No axis changes the
  * result. */
-static const int64_t kArNblocks[]  = { 0, 8, 16, 24 };
+static const int64_t kArNblocks[]  = { 0, 2, 4, 8, 16, 24 };
 static const int64_t kArNthreads[] = { 256, 512, 1024 };
 static const int64_t kArDrain[]    = { 1, 3 };
 static const int64_t kArAcq[]      = { 0, 1 };
+/* `ts_min`: from this many elements the four-rank exact one-shot hands the message to the exact
+ * two-shot on the same instance (the same per-element fold, so the same bytes): a rank then sends
+ * 1.5x the message instead of 3x, for a second handshake. 32768 is about six rows of 5376, so an
+ * 8-row DFlash2 verify's all-reduces take the two-shot too (on 4x R9700, 2026-10-17: 297 -> 303
+ * tok/s code, long decode 447 -> 460, against 65536 that kept them one-shot); a 16-row verify's
+ * already did. 0 keeps the one-shot to its band's top. Read only by that
+ * adapter; declared by every all-reduce table so one RADIANCE_TUNE=all_reduce:ts_min=N pin is legal
+ * for every row the op resolves to. */
+static const int64_t kArTsMin[]    = { 0, 16384, 32768, 65536, 131072, 262144 };
 static const RadTunable tAr[] = {
   { "nblocks",  kArNblocks,  NELEM(kArNblocks),  0, "blocks in the grid. 0 = scale with the message and clamp" },
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block; the fused fp8 row overrides this for bit-exactness" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "elements from which the four-rank one-shot takes the exact two-shot; 0 = never" },
+};
+/* The four-rank fused junction (ar_rmsnorm_quant_i8_4rank): tAr's axes, its own value sets.
+ * On 4x R9700 over PCIe P2P a junction costs about 22 us at one row of 5376 and 57 us at sixteen
+ * (--profile-ops): it is bound by its handshakes, not its bytes.
+ *
+ * Every block takes one handshake, a system-scope release by its first
+ * thread and a system-scope acquire by every wave. Both are needed: on 4x R9700 behind an EPYC
+ * root complex, dropping either (an acq 2 and a pub 2 that were here, r4d_selftest 2026-10-16 and
+ * -17) left the readers with stale scratch on nearly every element, so the peers' stores do not
+ * reach them past the writer's L2 without the writeback. What can move is how many handshakes a
+ * call takes: fewer blocks (2 or 4, each owning several rows) take fewer. The defaults are the
+ * forms that have run on cards; the others are for RADIANCE_TUNE until they have. None of them
+ * changes the result. */
+static const int64_t kArQ84Tail[]  = { 1, 0 };
+static const int64_t kArQ84Nblocks[] = { 0, 2, 4, 8, 16, 24 };
+static const int64_t kArQ84Acq[]     = { 0, 1 };
+static const int64_t kArQ84Pub[]     = { 1 };
+static const RadTunable tArQ84[] = {
+  { "nblocks",  kArQ84Nblocks, NELEM(kArQ84Nblocks), 0, "blocks in the grid. 0 = one a row, clamped" },
+  { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "unused: the norm's width sets the block for bit-exactness" },
+  { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+  { "acq",      kArQ84Acq,   NELEM(kArQ84Acq),   0, "acquire after the flag read: 0 system invalidate a wave, 1 full fence" },
+  { "pub",      kArQ84Pub,   NELEM(kArQ84Pub),   1, "release before the flag store: 1 one system writeback" },
+  { "tail",     kArQ84Tail,  NELEM(kArQ84Tail),  1, "from 5 to 32 rows: the standalone two-shot with the junction as its tail, a block a row (no handshake or launch of its own); 0 = the one-shot" },
 };
 /* The four-rank two-shots beside compute: four blocks of 1024. A pipelined Flash-Next prefill at
  * TP4 (qwen4exp_fp8) runs each all-reduce of a 2048-row piece beside the other piece's MoE passes,
@@ -4658,6 +4894,7 @@ static const RadTunable tArTs4Lane[] = {
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
 };
 /* The same axes with narrow defaults, for a collective issued beside compute (`overlap` 1). The
  * wide launch (up to 24 blocks of 1024 threads spinning on peer flags) suits an all-reduce that has
@@ -4669,6 +4906,7 @@ static const RadTunable tArLane[] = {
   { "nthreads", kArNthreads, NELEM(kArNthreads), 256, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
 };
 
 /* --------------------------------------------------------------------------------- row top-k
@@ -4690,6 +4928,14 @@ static const RadTunable tTopk[] = {
 static const int64_t kMvRb[] = { 0, 1, 2, 4, 8 };
 static const RadTunable tMv[] = {
   { "rb", kMvRb, NELEM(kMvRb), 0, "rows of the weight one wave owns. 0 = libr4d's own rule" },
+};
+
+/* rmsnorm_quant_i8 at decode heights (1024 threads, n <= 8192): 1 loads every operand of the row
+ * into registers before the first reduction (rmsnorm_quant_i8_reg_kernel), 0 re-reads the row in
+ * each pass. The same bytes either way; on 4x R9700 the first is 8.2 us a launch, the second 11. */
+static const int64_t kRmsQ8Reg[] = { 1, 0 };
+static const RadTunable tRmsQ8[] = {
+  { "reg", kRmsQ8Reg, NELEM(kRmsQ8Reg), 1, "decode heights: 1 = the row's operands loaded before the reductions, 0 = re-read each pass" },
 };
 
 /* ==================================================================================== the rows */
@@ -4749,6 +4995,7 @@ static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4
 static const RadConstraint cSampleLogprobs[] = { C_GE("n_vocab", 1), C_GE("k", 1), C_LE("k", 64) };
 /* The activation width the column loop vectorises over; M is unbounded -- the kernel chunks rows. */
 static const RadConstraint cLogitsGemm[] = { C_DIV("n_embd", 8), C_IN("dtype", "bf16") };
+static const RadConstraint cLogitsGemmCols[] = { C_EQ("n_embd", 4096), C_IN("dtype", "bf16") };
 /* The fp8 head: n_embd on the 128 scale block, and no cap on M. The row relayouts the weight, so
  * it must cover the whole range; above a cap the bf16 projection would read the E4M3 codes as bf16.
  * The kernel chunks above 32, and core/build/rad_builder.cpp refuses a capped arrangement.
@@ -4762,6 +5009,13 @@ static const RadConstraint cLogitsGemmFp8[] = { C_DIV("n_embd", 128), C_IN("dtyp
 
 /* No tunable axes. */
 #define NOTUNE nullptr, 0, nullptr
+
+/* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
+ * that window's memory bandwidth without taking the compute units the other lane needs. */
+static const int64_t kPrefetchNb[] = { 64, 32, 128, 256, 16, 24, 48 };
+static const RadTunable tPrefetch[] = {
+  { "nb", kPrefetchNb, NELEM(kPrefetchNb), 64, "workgroups of 256 lanes reading the weight" },
+};
 
 /* ---- image generation ------------------------------------------------------------------- */
 /* Rows read 16 bytes at a time, so the widths are whole eights. */
@@ -4784,14 +5038,14 @@ static const RadConstraint cPatchUnfold[] = { C_IN("dtype", "f32"), C_LE("C", 64
 static const RadConstraint cGenAnyFloat[] = { C_IN("dtype", "bf16 f32") };
 static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
 /* ---- a video latent upscaler (r4d_upscaler.hip). The convolution decodes 3 x 3 x 3 taps as
- * constants and reads 16-byte chunks of a voxel row; the group norm puts a thread on an 8-channel
- * chunk inside one group, a row's chunks a power of two dividing the 256-thread block (the shim
- * checks that and n / groups % 8), and merges at most 256 groups; the temporal convolution keeps
+ * constants and reads 16-byte chunks of a voxel row; the group norm puts a thread on chunks of 8, 4
+ * or 2 channels inside one group, a row's chunks spread over at most the 256-thread block (the
+ * shim checks an even group width), and merges at most 256 groups; the temporal convolution keeps
  * its 5-frame window in registers; the fold's lists are kernel arguments, 64 floats at most. */
 static const RadConstraint cConv3d[] = { C_IN("dtype", "bf16"), C_EQ("k", 3), C_EQ("kt", 3),
                                          C_DIV("cin", 8) };
 static const RadConstraint cGroupNorm[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8),
-                                            C_LE("n", 2048), C_LE("groups", 256) };
+                                            C_LE("n", 8192), C_LE("groups", 256) };
 static const RadConstraint cTconvDw[] = { C_IN("dtype", "bf16"), C_EQ("k", 5), C_DIV("n", 8) };
 static const RadConstraint cResizeBil[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8) };
 static const RadConstraint cPatchFold[] = { C_IN("dtype", "bf16 f32"), C_LE("C", 64) };
@@ -4799,6 +5053,8 @@ static const RadConstraint cLnModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128),
                                          C_EQ("group", 128) };
 /* The lane copies move 32-bit words, so any row of whole words: bf16 latents and an f32 mask. */
 static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32") };
+/* gelu_quick: x and y of one dtype, any width and pitch. */
+static const RadConstraint cGeluQuick[] = { C_IN("dtype", "bf16 f32") };
 /* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
 static const RadConstraint cGenAffine[] = { C_IN("dtype", "bf16"), C_LE("n", 64) };
 static const RadConstraint cGenAffineF32[] = { C_IN("dtype", "f32"), C_LE("n", 64) };
@@ -5429,6 +5685,16 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_logits_gemm, nullptr, nullptr, nullptr,
   r4d_shape_logits_gemm },
 
+{ "logits_gemm_bf16_cols", "logits_gemm", "vocab",
+  "logits_gemm_bf16 with a wave per four vocabulary columns: lane l runs that row's threads 32q + l "
+  "in turn, so each column keeps its k chunks, lane butterfly and wave order",
+  "any M and any vocabulary; n_embd 4096 exactly; the activation's row pitch whole 16 bytes",
+  "bf16 x and lm_head, F32 LOGITS OUT, fp32 accumulate. BYTE-IDENTICAL to logits_gemm_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_COLS,
+  ROW(cLogitsGemmCols), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_cols, nullptr, nullptr, nullptr,
+  r4d_shape_logits_gemm },
+
 { "logits_gemm_fp8", "logits_gemm", "vocab",
   "the lm_head projection over an fp8 head: C[M, n_vocab] f32 = x[M, n_embd] @ dequant(W)^T, "
   "one wave a vocabulary row, the row's own scales in its tail",
@@ -5774,6 +6040,52 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_attn_decode_h128_gqa2w_bf16, r4d_rad_attn_decode_h128_gqa2w_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged },
+/* The same decode under attn_paged_qrow, reading q at its own row pitch: Gemma 4 31B's sliding
+ * layers read q in the fused q|k|v row. It outranks the windowed qrow rows (R4D_PRIO_ONLY) in its
+ * band, as attn_paged's does, since it takes 0.26-0.71 of their time there; above q_len 32 the
+ * windowed kernel serves the op alone. No opd_shape, as for every qrow row: libref has none. */
+{ "attn_qrow_decode_h256_gqa2_fp8kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, sliding window, split-KV (decode / verify)",
+  "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, "
+  "window taken from the launch argument (0 = full attention)",
+  "bf16 query (any row pitch, a multiple of 4), fp8-e4m3 kv cache with per-(seq,head) descales, "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256Gqa2Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_decode_h256_gqa2_fp8,
+  r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
+  nullptr, nullptr, nullptr },
+
+{ "attn_qrow_decode_h256_gqa2_bf16kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, sliding window, split-KV (decode / verify)",
+  "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, "
+  "window taken from the launch argument (0 = full attention)",
+  "bf16 query (any row pitch, a multiple of 4), bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256Gqa2Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_decode_h256_gqa2_bf16,
+  r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
+  nullptr, nullptr, nullptr },
+
+/* Head_dim 128 at gqa 8 under attn_paged_qrow (cAttnQrowH128G8Fp8 says why). */
+{ "attn_qrow_h128_gqa8_fp8kv", "attn_paged_qrow", "attn",
+  "paged attention, any window, causal or not, split-KV (draft block); q at any row pitch",
+  "head_dim 128, 8 queries per kv head as two groups of 4 a kv head, paged block 16, q_len <= 16",
+  "bf16 query (any row pitch, a multiple of 4), fp8-e4m3 kv cache with per-(seq,head) descales, "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnQrowH128G8Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_h128_gqa8_fp8, r4d_rad_attn_qrow_h128_gqa8_scratch,
+  nullptr, nullptr, nullptr },
+
+{ "attn_qrow_h128_gqa8_bf16kv", "attn_paged_qrow", "attn",
+  "paged attention, any window, causal or not, split-KV (draft block); q at any row pitch",
+  "head_dim 128, 8 queries per kv head as two groups of 4 a kv head, paged block 16, q_len <= 16",
+  "bf16 query (any row pitch, a multiple of 4), bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnQrowH128G8Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_h128_gqa8_bf16, r4d_rad_attn_qrow_h128_gqa8_scratch,
+  nullptr, nullptr, nullptr },
 
 { "attn_prefill_h256_gqa8_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -6414,6 +6726,15 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cHcPlain), NOTUNE,
   nullptr, nullptr, r4d_rad_hc_write, nullptr, nullptr, nullptr,
   r4d_shape_hc_write },
+
+{ "hc_project_bf16", "hc_project", "norm",
+  "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
+  "any M, any n, hc 2..8",
+  "bf16 stream, f32 direction, i32 switch",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcProject), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_project, nullptr, nullptr, nullptr,
+  r4d_shape_hc_project },
 
 { "mtp_enter_bf16", "mtp_enter", "norm",
   "MTP head entry: two norms, a per-sub-stream fc and one broadcast fc",
@@ -7400,6 +7721,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   /* `add` + `rmsnorm` + `quant_act_fp8`, not `rmsnorm_add` (r4d_fuse.cpp). */
   r4d_fuse_rmsnorm_quant_fp8 },
 
+/* The rotated int8 twin, for a trunk of weights stored at i8a8h: the same kernel with
+ * had_quant_act_i8g's quantiser on its second pass. No fusion hook: the architecture declares it. */
+{ "rmsnorm_had_quant_i8g", "rmsnorm_had_quant_i8g", "quant",
+  "RMS norm, a 128-wide Hadamard and the per-(row, 128) int8 quantiser in one pass over the row, "
+  "plus the bf16 norm output",
+  "n a multiple of 128 -- a rotation block cannot straddle the end of a row; one workgroup per row "
+  "and two passes over it, as rmsnorm_quant_fp8; the gain is f32 or bf16; group 128, both the "
+  "rotation width and the scale's block width; an optional residual may ALIAS out_bf16",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out that "
+  "receives the UNROTATED norm output; the codes are taken over the rotated BF16-ROUNDED norm "
+  "output, byte-identical to rmsnorm + had_quant_act_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsNormHadQuantI8g), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_had_quant_i8g },
+
 { "gated_quant_fp8", "gated_quant_fp8", "quant",
   "an elementwise gated product and the fp8 activation quantiser in one pass; `act` silu is "
   "down_proj's input and sigmoid is a gated o_proj's",
@@ -7429,6 +7766,21 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGatedHadQuantFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_gated_had_quant_fp8, nullptr, nullptr, nullptr,
   r4d_shape_gated_quant_fp8 },
+
+/* Its int8 twin, for a down projection whose weight is stored at i8a8h. */
+{ "gated_had_quant_i8g", "gated_had_quant_i8g", "quant",
+  "an elementwise gated product, a 128-wide Hadamard along n, and the per-(row, 128) int8 "
+  "quantiser, in one pass",
+  "n a multiple of 128 -- a rotation block cannot straddle the end of a row; the gated operand is "
+  "[M][2n], gate then up; no reduction across the row, so no barrier; group 128, both the "
+  "rotation width and the scale's block width; strides in elements",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out that "
+  "receives the UNROTATED product; the codes are taken over the rotated BF16-ROUNDED product, "
+  "byte-identical to the product + had_quant_act_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGatedHadQuantFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_gated_had_quant_i8g },
 
 { "gate_quant_fp8", "gate_quant_fp8", "quant",
   "an elementwise gated product and the fp8 activation quantiser in one pass, with the gate in "
@@ -7482,7 +7834,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale, optional bf16 "
   "out; every stored intermediate rounded to bf16 as the unfused chain stores it",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cRmsNormQuantI8), NOTUNE,
+  ROW(cRmsNormQuantI8), ROW(tRmsQ8), nullptr,
   nullptr, nullptr, r4d_rad_rmsnorm_quant_i8 },
 
 { "qkv_norm_rope_bf16", "qkv_norm_rope", "attn",
@@ -7494,7 +7846,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "rope x2, each norm taken by its standalone kernel's partition",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkvNormRope), NOTUNE,
-  nullptr, nullptr, r4d_rad_qkv_norm_rope },
+  nullptr, nullptr, r4d_rad_qkv_norm_rope, nullptr, nullptr, nullptr, r4d_shape_qkv_norm_rope },
 
 { "qkv_norm_rope_h128_bf16", "qkv_norm_rope", "attn",
   "per-head RMS norms of separate q and k projections, the weightless norm of v unless v_norm is 0, "
@@ -7506,6 +7858,59 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkvNormRopeH128), NOTUNE,
   nullptr, nullptr, r4d_rad_qkv_norm_rope },
+
+/* The prologue and the cache store in one launch: a k (or v) head's block ends holding its token's
+ * finished head, so it writes it into the cache too, converted as kv_store converts it. Saves the
+ * store's launch a layer, which at decode is most of its cost. */
+{ "qkv_norm_rope_kv_store_fp8", "qkv_norm_rope_kv_store", "attn",
+  "qkv_norm_rope, and kv_store into an E4M3 paged cache from the same launch",
+  "qkv_norm_rope's shapes; cache exactly [n_blocks, n_head_kv, block_size, 2*head_dim], one slot "
+  "a row; a negative or out-of-range slot stores nothing",
+  "bf16 q/k/v and gains (or f32 gains), i32 positions and slots, fp8-e4m3 cache, scalar "
+  "k_scale / v_scale descales; byte-identical to qkv_norm_rope + kv_store_fp8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkvNormRopeKv), NOTUNE,
+  nullptr, nullptr, r4d_rad_qkv_norm_rope_kv_store, nullptr, nullptr, nullptr,
+  r4d_shape_qkv_norm_rope_kv_store, nullptr, r4d_fuse_qkv_norm_rope_kv_store },
+
+/* The same into a bf16 cache: the store is the values kv_store_bf16 copies. */
+{ "qkv_norm_rope_kv_store_bf16", "qkv_norm_rope_kv_store", "attn",
+  "qkv_norm_rope, and kv_store into a bf16 paged cache from the same launch",
+  "qkv_norm_rope's shapes; cache exactly [n_blocks, n_head_kv, block_size, 2*head_dim], one slot "
+  "a row; a negative or out-of-range slot stores nothing",
+  "bf16 q/k/v, gains, cache; i32 positions and slots; byte-identical to qkv_norm_rope + "
+  "kv_store_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkvNormRopeKvBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_qkv_norm_rope_kv_store, nullptr, nullptr, nullptr,
+  r4d_shape_qkv_norm_rope_kv_store, nullptr, r4d_fuse_qkv_norm_rope_kv_store },
+
+{ "add_rmsnorm_bf16", "add_rmsnorm", "norm",
+  "x += a, then the root-mean-square norm of the x written, one workgroup a row as rmsnorm_bf16",
+  "any n; rmsnorm_bf16's width and column partition, so the sum of squares folds as it does",
+  "bf16 x / a / y, f32 or bf16 gain, fp32 reduction; byte-identical to add_bf16 + rmsnorm_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAddRmsNorm), NOTUNE,
+  nullptr, nullptr, r4d_rad_add_rmsnorm, nullptr, nullptr, nullptr,
+  r4d_shape_add_rmsnorm, nullptr, r4d_fuse_add_rmsnorm },
+
+{ "kv_len_trim", "kv_len_trim", "misc",
+  "a batch's per-sequence context lengths less a runtime trim, one workgroup",
+  "at most 64 sequences; the trim is the extent of `tail`",
+  "int32 in, int32 out, clamped at zero",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvLenTrim), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_len_trim, nullptr, nullptr, nullptr, nullptr, nullptr },
+
+/* Reads its weight's stored bytes, whatever form the weight's GEMM gave them (RAD_LAYOUT_ANY). */
+{ "prefetch", "prefetch", "misc",
+  "read a weight's leading bytes, 16 a lane over 64 workgroups, so the next kernel streaming the "
+  "weight finds them in the 64 MB on-die cache; meant for a second lane beside a collective",
+  "any weight, any stored form; `bytes` clamped to what the tensor states",
+  "any",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPrefetch), ROW(tPrefetch), nullptr,
+  nullptr, nullptr, r4d_rad_prefetch, nullptr, r4d_rad_layout_any, nullptr, nullptr, nullptr },
 
 { "gelu_mul_quant_i8", "gelu_mul_quant_i8", "quant",
   "gelu(gate) * up, the tanh form, and quant_act_i8's quantiser in one pass over the row",
@@ -7525,6 +7930,26 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cArRmsNormQuantI8), ROW(tAr), nullptr,
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8 },
+
+/* Its arithmetic is the four-rank exact one-shot's fold followed by the two-rank form's junction,
+ * each the code those two run. r4d_selftest's case of the same name holds it byte for byte to
+ * all_reduce + rmsnorm_quant_i8 on a four-card box, and the engine to a decode step's text against
+ * a build that issues the pair. Both have run on cards that way (the 31B's fused junctions, and
+ * r4d_selftest on four R9700s). */
+{ "ar_rmsnorm_quant_i8_4rank", "ar_rmsnorm_quant_i8", "quant",
+  "the four-rank exact one-shot all-reduce and the junction after it -- post-norm of the reduced "
+  "sum, residual add, scalar, RMS norm and quant_act_i8's quantiser -- in one kernel",
+  "exactly 4 ranks; n a multiple of 16, x unpitched (it is the message); a block owns whole rows; "
+  "exact wire; one-shot ((ranks - 1) x the message a rank) -- for decode heights; from 5 to 32 "
+  "rows (axis `tail`) the standalone two-shot with the junction as its tail; with `sp` the "
+  "all-reduce split around the junction (reduce-scatter, the junction on this rank's rows, "
+  "all-gather of the int8 codes), a block per local row, P2P",
+  "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale; the reduced sum "
+  "rounded to bf16 as the standalone exact all-reduce stores it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormQuantI84), ROW(tArQ84), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8_4rank, nullptr, nullptr,
+  nullptr, nullptr },
 
 { "had_quant_act_i8", "had_quant_act_i8", "quant",
   "block Hadamard along K then per-row symmetric int8 quantisation; the rotation is what makes "
@@ -7581,6 +8006,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_shape_ar_rmsnorm_quant_fp8, nullptr,
   /* `all_reduce` + `rmsnorm_quant_fp8`, both wires (r4d_fuse.cpp). */
   r4d_fuse_ar_rmsnorm_quant_fp8 },
+
+{ "ar_rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g", "quant",
+  "the two-rank all-reduce and the residual add, RMS norm, 128-wide Hadamard and per-(row, 128) "
+  "int8 quantisation that always follow it, in one kernel; the all-reduce's output is never read "
+  "back",
+  "exactly 2 ranks; n a multiple of 128 (a rotation block cannot straddle a row) and x unpitched; "
+  "group 128; a block owns whole ROWS, so the block count is clamped to M; either wire, chosen by "
+  "`wire` -- the rotated 6-bit payload additionally needs n to be a multiple of 512; residual and "
+  "out_bf16 may be null",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out of the "
+  "UNROTATED norm output; x and the residual are ar_rmsnorm_quant_fp8's bytes, and the codes "
+  "rmsnorm_had_quant_i8g's over the same norm output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormHadQuantI8g), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_ar_rmsnorm_had_quant_i8g },
 
 { "ar_rmsnorm_post_quant_fp8", "ar_rmsnorm_post_quant_fp8", "quant",
   "the two-rank all-reduce, a post-norm of the reduced sum, the residual add, RMS norm and "
@@ -7868,6 +8309,17 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
   ROW(cLoraExpand), NOTUNE,
   nullptr, nullptr, r4d_rad_lora_expand_tiled },
+/* The generators' expand (lora_expand_mm): the same delta on the WMMA, for passes of many rows of
+ * one adapter, where the exact row's scalar sum is most of the adapter's cost. */
+{ "lora_expand_mm_wmma", "lora_expand_mm", "gemm",
+  "y += scale * (bf16(t) B[slot]^T) per row, base rows neither read nor written: WMMA bf16 over "
+  "64-row x 64-column tiles, four waves of 2 x 2 16 x 16 tiles, one pass a distinct slot of a tile",
+  "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured, "
+  "16-byte pool loads where B's rows are aligned",
+  "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraExpand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_expand_mm },
 { "attn_prefix_self_h128_bf16", "attn_prefix_self", "attn",
   "attention over a paged prefix and the pass's own rows, causal over the own rows or not",
   "head_dim 128, 1/2/4/8 query heads a KV head, a flat grid over the sequences' query blocks; "
@@ -8062,6 +8514,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_euler },
 
+{ "kd_input_bf16", "kd_input", "elem",
+  "a k-diffusion sampler's model input: a first step's noise into the f32 lane, c_in x out",
+  "any M, row pitches honoured; a thread an element of an entry",
+  "f32 lanes, bf16 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_kd_input },
+
+{ "kd_step_bf16", "kd_step", "elem",
+  "a k-diffusion sampler step with guidance and preview: Euler, Euler ancestral or DPM++ 2M",
+  "any M, row pitches honoured; a thread an element of an entry",
+  "bf16 model output, f32 lanes, history and preview, f32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_kd_step },
+
 { "chan_affine_bf16", "chan_affine", "elem",
   "a per-channel affine from parameter lists; `round` 0 keeps the lists and arithmetic f32",
   "any M, row pitches honoured",
@@ -8118,6 +8586,14 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenRows8), NOTUNE,
   nullptr, nullptr, r4d_rad_gelu_tanh },
 
+{ "gelu_quick_bf16", "gelu_quick", "elem",
+  "CLIP's quick_gelu, libref's three roundings",
+  "any M and n, row pitches honoured",
+  "bf16 or f32 in and out (one dtype), f32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGeluQuick), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu_quick },
+
 { "scatter_add_rows_bf16", "scatter_add_rows", "elem",
   "x[idx[i]] += v[i]",
   "any M, row pitches honoured",
@@ -8134,6 +8610,15 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_conv2d_nhwc, nullptr, r4d_rad_layout_conv_tap, r4d_rad_relayout_conv_tap,
   nullptr, r4d_rad_unrelayout_conv_tap },
+
+{ "im2col_nhwc_bf16", "im2col_nhwc", "elem",
+  "a convolution's receptive fields as GEMM rows in the weight's (cin, kh, kw) order: 32 output "
+  "pixels by 64 channels a block, the input rows staged in LDS, coalesced loads and stores",
+  "k <= 7, stride and up 1 or 2; x rows at their own pitch; y exactly Ho * Wo rows at its pitch",
+  "bf16 in and out, copied bit for bit",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_im2col_nhwc },
 
 /* -------------------------------------------------------------------------- audio generation */
 { "conv1d_bf16", "conv1d", "conv",
@@ -8392,9 +8877,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 
 { "group_norm", "group_norm", "norm",
   "GroupNorm over all rows in three launches: per-part (count, mean, M2), their merge to mean and "
-  "rstd, then the affine, modulation and SiLU a thread an 8-channel chunk",
-  "n % 8 == 0 with n / 8 a power of two up to 256, n / groups % 8 == 0, groups <= 256, M n / "
-  "groups < 2^24; row pitches honoured, y may alias x",
+  "rstd, then the affine, modulation and SiLU a thread an 8-, 4- or 2-channel chunk",
+  "n % 8 == 0 up to 8192, an even n / groups, groups <= 256, M n / groups < 2^31; row pitches "
+  "honoured, y may alias x",
   "bf16 or f32 rows, bf16 or f32 gain, bias and modulation, f32 statistics",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGroupNorm), NOTUNE,
@@ -8676,6 +9161,52 @@ extern "C" int rad_kernel_concurrent(int i) {
     return 1;
 }
 
+/* Which rows can chain (RadKernelChainFn, rad_abi.h): every kernel their launch emits has a
+ * chained form (r4d_chain.h) the launch selects from the `chain` parameter. A row joins this list
+ * only once all of its kernels have one. */
+extern "C" int rad_kernel_chain(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    if (!k) return 0;
+    static const char* const kChained[] = {
+        "gemm_w4a8_nt_m64", "gelu_mul_quant_i8", "qkv_norm_rope_bf16",
+        "qkv_norm_rope_kv_store_fp8", "qkv_norm_rope_kv_store_bf16",
+        /* the split-KV decode and its merge (r4d_decode_launch_win); their prefill kernel stays
+         * plain, and the backend chains only the kernels named r4dchain* */
+        "attn_decode_h256_gqa2_fp8kv", "attn_decode_h256_gqa2_bf16kv",
+        "attn_qrow_decode_h256_gqa2_fp8kv", "attn_qrow_decode_h256_gqa2_bf16kv",
+        /* the fused junction: its tail form (the two-shot with the junction after it) only */
+        "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8_4rank",
+        /* the 31B's full layers: the windowed attention and its merge (r4d_attn_paged_window.hip,
+         * at decode heights) and the int8 quantiser before o_proj; h512 at every TP's gqa */
+        "attn_qrow_h512_gqa2_fp8kv", "attn_qrow_h512_gqa2_bf16kv",
+        "attn_qrow_h512_gqa4_fp8kv", "attn_qrow_h512_gqa4_bf16kv",
+        "attn_qrow_h512_gqa8_fp8kv", "attn_qrow_h512_gqa8_bf16kv",
+        "quant_act_i8",
+        /* DFlash2's query and context passes: the narrow fp8 GEMMs (the gated gate_up among
+         * them), the activation quantiser, the norms, the conv projection, the opening
+         * convolution and the verify-height reductions */
+        "gemm_fp8a8_nt_m16", "gemm_fp8a8_gated_nt_m16",
+        "gemm_i8a8_nt_m16", "quant_act_fp8", "rmsnorm_bf16", "add_rmsnorm_bf16",
+        "gemm_bf16_nt_m16", "gemm_bf16_nt_m64", "dflash_conv_t2_g16_bf16",
+        "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
+        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA pass (the
+         * matvec below three rows stays plain) and the soft-cap */
+        "embed_lookup_bf16", "gather_rows_bf16", "logits_gemm_fp8", "logits_gemm_i8",
+        "logit_softcap_bf16", "logit_softcap_f32",
+        /* the vocab-parallel sampler's candidate chain (temperature, top-k, the gathered sets'
+         * merge, the pick) and its all-gather, and DFlash2's draft head, row top-k, merge and
+         * selector */
+        "sample_temp_f32", "sample_topk_f32", "sample_merge_topk_f32", "sample_pick_f32",
+        "ar_gather_4rank", "gemm_w8a8_nt_m64", "rowtopk_bf16", "rowtopk_merge",
+        "dflash_select_bf16",
+        /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
+        "prefetch",
+    };
+    for (const char* p : kChained)
+        if (std::strcmp(k->name, p) == 0) return 1;
+    return 0;
+}
+
 /* Which rows are collectives (rad_abi.h): every row whose init builds the all-reduce family's
  * exchange buffers, peer flags and handshake (standalone all-reduces and gathers, and norms and hc
  * writes with one folded in), plus each `_host` twin. Keyed on the init, since a cross-rank kernel
@@ -8702,6 +9233,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_oneshot_4rank_exact, r4d_rad_ar_twoshot_4rank_exact,
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
         r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank,
+        r4d_rad_ar_rmsnorm_quant_i8_4rank,
     };
     for (RadLaunchFn f : kReleasing)
         if (k->launch == f) return 2;
@@ -8776,12 +9308,47 @@ extern "C" void r4d_cfg_mxfp4_tiled(const RadArgs* a, R4dMxTileCfg* out) {
 extern "C" void r4d_cfg_split(const RadArgs* a, R4dSplitCfg* out) {
     out->splits = TUNE(a, tAttnSplit, "splits");
 }
+/* A fresh-start divergence (4x R9700 behind an EPYC root complex, 2026-10-17): on a freshly
+ * started 31B server, a prefill all-reduce now and then reads a peer's scratch before that peer's
+ * words have landed -- the first reuse of a double-buffered slot, inputs identical on every rank
+ * (RADIANCE_DEBUG_OPHASH) -- and the first greedy reply flips a near-tie. Every thread's full
+ * system fence before the flag (drain 1) cures it, as does one after it (acq 1); the per-wave
+ * store wait (drain 3) and the publisher's one writeback (pub 1) do not, and Relaxed Ordering off
+ * on every link does not. The mechanism below the fence is not known. Decode heights never showed
+ * it, and the fence costs them ~0.7 %, so it is taken only from RADIANCE_AR_FENCE_FROM elements
+ * (default 131072, 24 rows of the 31B's 5376: above any verify height, and every prefill chunk);
+ * 0 never. Read once. Only at four ranks, where it was seen and cured: at two (Qwen3.8-27B's
+ * prefill at tp 2) it cost 4.5% of prefill, and no two-rank start ever flipped. */
+static long long ar_fence_from() {
+    static const long long v = [] {
+        const char* e = std::getenv("RADIANCE_AR_FENCE_FROM");
+        return e && *e ? std::atoll(e) : 131072LL;
+    }();
+    return v;
+}
+
 extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->nblocks  = TUNE(a, tAr, "nblocks");
     out->nthreads = TUNE(a, tAr, "nthreads");
     out->drain    = TUNE(a, tAr, "drain");
     out->acq      = TUNE(a, tAr, "acq");
-    out->pub      = 1;                 /* not an axis; see the note at tAr */
+    /* An axis of the four-rank junction only (tArQ84); 1 for every other row, as before. */
+    out->pub      = TUNE(a, tArQ84, "pub");
+    /* Operand 0 is the message on every collective that reads this (all_reduce's x, a junction's
+     * [M, n] input, all_gather's source). */
+    const long long from = ar_fence_from();
+    if (from > 0 && a && a->t && a->n_t > 0 && rad_tensor_numel(&a->t[0]) >= from &&
+        r4d_geti_or(a, "world_size", 4) == 4)        /* the four-rank rows carry no world_size */
+        out->drain = 1;
+}
+extern "C" int r4d_cfg_ar_tail(const RadArgs* a) {
+    return TUNE(a, tArQ84, "tail");
+}
+extern "C" int r4d_cfg_prefetch_nb(const RadArgs* a) {
+    return TUNE(a, tPrefetch, "nb");
+}
+extern "C" long r4d_cfg_ar_ts_min(const RadArgs* a) {
+    return (long)tune_i(a, tAr, NELEM(tAr), "ts_min");
 }
 extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
     out->rc  = 0;                      /* derived from pt1 at issue; see the note at tTopk */
@@ -8790,4 +9357,7 @@ extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
 }
 extern "C" void r4d_cfg_mv(const RadArgs* a, R4dMvCfg* out) {
     out->rb = TUNE(a, tMv, "rb");
+}
+extern "C" int r4d_cfg_rmsq8_reg(const RadArgs* a) {
+    return TUNE(a, tRmsQ8, "reg");
 }

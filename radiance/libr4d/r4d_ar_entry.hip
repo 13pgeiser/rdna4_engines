@@ -79,6 +79,7 @@ struct Rendezvous {
         int       w[R4D_MAX_RANKS] = { 0 };
         int       pieces = 0;
         long long weights_min = 0, pieces_min = 0;
+        int       form = 0;
         R4DArLink link;
     } ar8[R4D_MAX_RANKS];
     int  failed = 0;
@@ -134,6 +135,8 @@ struct ArInst {
     /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
     long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
     long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
+    /* Its form (RADIANCE_AR8_FORM); a launch's `form` parameter overrides it. */
+    int  form = R4D_AR8_FORM_LOCKSTEP;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -151,18 +154,21 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 long align16(long v) { return (v + 15) & ~15L; }
 
 /* RADIANCE_AR8_SHARD_WEIGHTS, read at every eight-rank build so a process can change it between
- * instances: unset or "auto" derives the weights from the links, "off" keeps the shards even,
- * eight integers set them. Anything else is "off", with one warning. */
-enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2 };
+ * instances: unset or "auto" derives the weights from the links by r4d_ar_weights_from_rates,
+ * "duplex" from the same links by r4d_ar_weights_duplex, "off" keeps the shards even, eight
+ * integers set them. Anything else is "off", with one warning. */
+enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2, AR8_DUPLEX = 3 };
 int ar8_weights_mode(int* w) {
     const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
     if (!e || !*e || !std::strcmp(e, "auto")) return AR8_AUTO;
+    if (!std::strcmp(e, "duplex")) return AR8_DUPLEX;
     if (!std::strcmp(e, "off")) return AR8_EVEN;
     if (r4d_ar_shard_weights_parse(e, 8, w)) return AR8_SET;
     static std::once_flag said;
     std::call_once(said, [e] {
         std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs auto, off or eight non-negative "
-                     "integers, comma-separated, sum > 0); eight-rank two-shot shards stay even\n",
+                     "integers, comma-separated, sum > 0, or duplex); eight-rank two-shot shards "
+                     "stay even\n",
                      R4D_AR8_SHARD_WEIGHTS_ENV, e);
     });
     return AR8_EVEN;
@@ -214,6 +220,21 @@ long long ar8_min_elems(const char* name, std::once_flag* said) {
     return v;
 }
 
+/* RADIANCE_AR8_FORM: lockstep (or unset), ring or split. Anything else is lockstep, with one
+ * warning. */
+int ar8_form() {
+    const char* e = std::getenv(R4D_AR8_FORM_ENV);
+    if (!e || !*e) return R4D_AR8_FORM_LOCKSTEP;
+    const int f = r4d_ar8_form_parse(e);
+    if (f >= 0) return f;
+    static std::once_flag said;
+    std::call_once(said, [e] {
+        std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs lockstep, ring or split); the "
+                     "eight-rank two-shot runs in lockstep\n", R4D_AR8_FORM_ENV, e);
+    });
+    return R4D_AR8_FORM_LOCKSTEP;
+}
+
 /* The eight-rank two-shot's choice for one message, a function of its size and the instance
  * alone: a recorded launch keeps the table and piece count it was recorded with, and replays of
  * the same size agree with it. */
@@ -237,7 +258,9 @@ int ar8_settle(ArInst* in, int rank, int world) {
     me.pieces = ar8_pieces();
     me.weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
     me.pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
-    if (me.mode == AR8_AUTO && !ar8_own_link(&me.link)) me.link = R4DArLink();
+    me.form = ar8_form();
+    if ((me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) && !ar8_own_link(&me.link))
+        me.link = R4DArLink();
     {
         std::lock_guard<std::mutex> lk(g_rv.m);
         g_rv.ar8[rank] = me;
@@ -249,15 +272,24 @@ int ar8_settle(ArInst* in, int rank, int world) {
     for (int r = 0; r < world; ++r)
         if (all[r].mode != me.mode || std::memcmp(all[r].w, me.w, sizeof(me.w)) ||
             all[r].pieces != me.pieces || all[r].weights_min != me.weights_min ||
-            all[r].pieces_min != me.pieces_min) {
+            all[r].pieces_min != me.pieces_min || all[r].form != me.form) {
             std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
-                         "settings (%s, %s and their _MIN_ELEMS)\n", rank, r,
-                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV);
+                         "settings (%s, %s and their _MIN_ELEMS, %s)\n", rank, r,
+                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV, R4D_AR8_FORM_ENV);
             return RAD_E_STATE;
         }
     in->pieces = me.pieces;
     in->weights_min = me.weights_min;
     in->pieces_min = me.pieces_min;
+    in->form = me.form;
+    if (me.form != R4D_AR8_FORM_LOCKSTEP) {
+        static std::once_flag said_form;
+        const int f = me.form;
+        std::call_once(said_form, [f] {
+            std::fprintf(stderr, "[r4d] eight-rank two-shot form: %s (%s)\n",
+                         f == R4D_AR8_FORM_RING ? "ring" : "split", R4D_AR8_FORM_ENV);
+        });
+    }
 
     int w[R4D_MAX_RANKS] = { 0 };
     if (me.mode == AR8_SET) {
@@ -267,10 +299,12 @@ int ar8_settle(ArInst* in, int rank, int world) {
                          "%d,%d,%d,%d,%d,%d,%d,%d (%s)\n", w[0], w[1], w[2], w[3], w[4], w[5],
                          w[6], w[7], R4D_AR8_SHARD_WEIGHTS_ENV);
         });
-    } else if (me.mode == AR8_AUTO) {
+    } else if (me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) {
         double gbs[R4D_MAX_RANKS] = { 0 };
         for (int r = 0; r < world; ++r) gbs[r] = r4d_ar_link_gbs(all[r].link);
-        if (!r4d_ar_weights_from_rates(gbs, world, w)) {
+        const bool known = me.mode == AR8_DUPLEX ? r4d_ar_weights_duplex(gbs, world, w)
+                                                 : r4d_ar_weights_from_rates(gbs, world, w);
+        if (!known) {
             std::call_once(said_unknown, [all, world] {
                 std::string who;
                 for (int r = 0; r < world; ++r)
@@ -280,7 +314,8 @@ int ar8_settle(ArInst* in, int rank, int world) {
             });
             return RAD_OK;
         }
-        std::call_once(said_links, [all, world, &w] {
+        const bool duplex = me.mode == AR8_DUPLEX;
+        std::call_once(said_links, [all, world, duplex, &w] {
             std::string l;
             for (int r = 0; r < world; ++r) {
                 char one[96];
@@ -290,7 +325,7 @@ int ar8_settle(ArInst* in, int rank, int world) {
                 l += one;
             }
             std::fprintf(stderr, "[r4d] eight-rank two-shot shard weights from the slowest PCIe "
-                         "hop of each card:%s\n", l.c_str());
+                         "hop of each card%s:%s\n", duplex ? " (duplex)" : "", l.c_str());
         });
         bool same = true;
         for (int r = 1; r < world; ++r) same = same && w[r] == w[0];
@@ -399,7 +434,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
      * changes: kernels touch other ranks only through those two, so no card addresses another's
      * VRAM. A message then crosses two links instead of one; only rows requiring device.p2p == 0
      * take this path (r4d_rows.cpp). Sequence counters stay in VRAM, since only their own rank
-     * reads them. */
+     * reads them, and coarse-grained: only this rank's kernels touch them, with device- and
+     * agent-scope atomics, which then complete in L2 rather than past it -- the first returning
+     * atomic of every launch (r4d_ar_seq_take) is on the push's path. */
     R4D_TRY("ar_ipc_alloc",
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
         if (host) {
@@ -409,7 +446,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
             sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
             fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
         }
-        sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 1, handle, &hlen));
+        sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
      * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the scales 1/64, so half
@@ -438,7 +475,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
      * peer device ordinals are known. A host can expose more HIP devices than ranks (e.g. an
-     * integrated GPU), so the ordinal comes from the peer rather than the rank. */
+     * integrated GPU), so the ordinal comes from the peer rather than the rank. A peer on this
+     * rank's own card needs none (the runtime refuses to enable it): r4d_selftest runs eight ranks
+     * on one card that way, each on its own stream. */
     int j = 0;
     for (int r = 0; r < world; ++r) {
         if (r == rank) continue;
@@ -446,7 +485,8 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         in->peer_scratch[j] = g_rv.scratch[r];
         in->peer_flags[j]   = g_rv.flags[r];
         ++j;
-        if (!host) R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
+        if (!host && g_rv.dev[r] != dev)
+            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
     }
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
@@ -602,11 +642,11 @@ extern "C" int r4d_rad_ar_ln_host_init(const RadParam* p, int n_p, int rank, int
     return ar_ln_init(p, n_p, rank, world, 1, out);
 }
 
-/* The four-rank ar_hc_write and ar_gather_hc_write. The key is {rank, 4, bf16, M_hi * n}, shared
- * with a standalone all_reduce band only where the bounds agree. Either way is safe on one stream:
- * every wide kernel advances the instance's seq counters once per all-reduce and writes only its
- * (parity, source) slot (r4d_ar_wide.h), so ops on one instance interleave in any order all ranks
- * share. Exact wire only; `wire` 6 is refused. */
+/* The four-rank ar_hc_write, ar_gather_hc_write and ar_rmsnorm_quant_i8 (the norm declares no
+ * `wire`). The key is {rank, 4, bf16, M_hi * n}, shared with a standalone all_reduce band only where
+ * the bounds agree. Either way is safe on one stream: every wide kernel advances the instance's seq
+ * counters once per all-reduce and writes only its (parity, source) slot (r4d_ar_wide.h), so ops on
+ * one instance interleave in any order all ranks share. Exact wire only; `wire` 6 is refused. */
 static int ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world, int host,
                            void** out) {
     if (!out) return RAD_E_INVAL;
@@ -665,6 +705,32 @@ static int nb_for(long words16, int max_nb) {
     return (int)nb;
 }
 
+/* The four-rank exact two-shot at decode and verify heights (the one-shot row's band from ts_min,
+ * the junction's tail form, the two-shot row up to kTsDecodeShard words a shard), over the words of
+ * one shard: one block per 2688 words, floor 2, ceiling 8 (and max_nb). A two-shot takes two
+ * handshakes, each a PCIe round trip a block, so a block more costs more than its share of the
+ * bytes saves until the shards are large. One per 672 (the rule before 2026-10-19) launched 16
+ * blocks at 64 rows of 5376, where the multi-user verify runs (8 users x DFlash2's 8 rows): on 4x
+ * R9700, one launch at a time on the real payload, 64 rows took 85.6 us at 16 blocks against 75.3
+ * at 4, 32 rows 58.9 at 16 / 47.1 at 8 against 44.2 at 4, 128 rows 143.5 at 16 against 137.9 at 8;
+ * 8 rows (two blocks either way) 19.6. The block count moves no byte: every word is folded by one
+ * thread in ascending rank order whatever the grid. */
+/* The chained two-shot (r4d_chain.h) where the row resolved with `chain`, for a decode-sized
+ * message only (64 rows of an 8192-wide residual): DFlash2's verify-height reductions. */
+static long ar_chain(const RadArgs* a, long numel) {
+    return r4d_geti_or(a, "chain", 0) != 0 && numel <= 64L * 8192L ? 1L : 0L;
+}
+
+static constexpr long kTsDecodeShard = 43008;   /* 256 rows of 5376 at tp 4 */
+static int nb_for_shard(long shard16, int max_nb) {
+    long nb = shard16 / 2688;
+    if (nb < 2) nb = 2;
+    if (nb > 8) nb = 8;
+    if (nb > max_nb) nb = max_nb;
+    if (nb > shard16) nb = shard16 > 0 ? shard16 : 1;
+    return (int)nb;
+}
+
 /* Shared front half of every all-reduce launch: find the instance, check the message against
  * init's sizing, resolve the tuned point. Every kernel of the family is safe in place (`y` absent
  * or equal to `x`); each entry point says why. */
@@ -716,7 +782,9 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
      * flag rounds cost more than the added reduce bandwidth (8 against 16 blocks measured up to 3 %
      * faster from 2097152 elements on). */
     if (shard_nb && in->world == 8 && cap > 8) cap = 8;
-    c->nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(basis, cap);
+    /* a decode-sized shard takes the decode rule (nb_for_shard), a prompt-sized one nb_for's */
+    c->nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
+               : (shard_nb && basis <= kTsDecodeShard) ? nb_for_shard(basis, cap) : nb_for(basis, cap);
     if (c->nblocks > in->max_blocks) c->nblocks = in->max_blocks;
     return RAD_OK;
 }
@@ -734,7 +802,7 @@ extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long
                                     long slot_stride16, long inp, long out, long n_elem,
                                     long dtype, long rank, long row_elems, long stream,
                                     long nblocks, long nthreads, long drain, long acq, long pub,
-                                    long gate, long gate_ctr);
+                                    long gate, long gate_ctr, long dpitch, long spitch, long chain);
 extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                     long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -743,11 +811,14 @@ extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long
                                     long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                     long out, long n_elem, long dtype, long rank, long row_elems,
                                     long stream, long nblocks, long nthreads, long drain, long acq,
-                                    long pub);
+                                    long pub, long dpitch, long spitch);
 
-/* Not ar_setup: an all-gather's output is world_size times its input. */
+/* Not ar_setup: an all-gather's output is world_size times its input. With `row`, `y` may also be
+ * the leading world_size * row columns of a wider buffer and `x` a row-wide window of one
+ * (docs/OPS.md); `*dpitch_out` and `*spitch_out` are then their row pitches in elements, else 0. */
 static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in, ArCall* c,
-                                long long* row_out) {
+                                long long* row_out, long long* dpitch_out,
+                                long long* spitch_out) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;                  /* init did not run: a core sequencing bug */
     if (in->world != ws) return RAD_E_SHAPE;      /* the peer bundle is compiled for this width */
@@ -755,7 +826,6 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
     const RadTensor* x = r4d_opt(a, AR_X);
     const RadTensor* y = r4d_opt(a, AR_Y);
     if (!x || !y) return RAD_E_INVAL;             /* the gather has no in-place form */
-    if (!r4d_contig(x) || !r4d_contig(y)) return RAD_E_STRIDE;
     if (y->data == x->data) return RAD_E_INVAL;
 
     const long n = (long)r4d_numel(x);
@@ -765,6 +835,27 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
 
     const long long row = r4d_pgeti_or(a->p, a->n_p, "row", 0);
     if (row < 0 || (row > 0 && (n % row || (row * in->esize) % 16))) return RAD_E_SHAPE;
+    /* A row-interleaved gather's [rows][world * row] may sit in the leading columns of a wider
+     * buffer, the pitch in whole 16-byte words: rows land at that pitch, the rest of each row is
+     * left alone. */
+    long long dpitch = 0;
+    if (!r4d_contig(y)) {
+        const long long p = r4d_row_pitch(y);
+        if (row <= 0 || y->rank != 2 || p <= 0 || y->shape[1] != (int64_t)row * in->world ||
+            (p * in->esize) % 16)
+            return RAD_E_STRIDE;
+        dpitch = p;
+    }
+    /* Likewise x may be [rows][row] read at a wider pitch: a rank's window of a row it computed
+     * wider (a split linear's block-aligned superset, arch/common/rad_block_dflash2.h). */
+    long long spitch = 0;
+    if (!r4d_contig(x)) {
+        const long long p = r4d_row_pitch(x);
+        if (row <= 0 || x->rank != 2 || p <= 0 || x->shape[1] != (int64_t)row ||
+            (p * in->esize) % 16)
+            return RAD_E_STRIDE;
+        spitch = p;
+    }
 
     if (((long long)n * in->esize) % 16) return RAD_E_ALIGN;
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(y->data, 16)) return RAD_E_ALIGN;
@@ -786,43 +877,46 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
     c->acq = cfgv.acq;
     c->pub = cfgv.pub;
     *row_out = row;
+    *dpitch_out = dpitch;
+    *spitch_out = spitch;
     return RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 2, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 2, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     R4D_TRY("ar_gather_2rank",
         r4d_ar_gather_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                             in->my_seq, in->slot16, c.inp, c.out, c.numel, in->dtype, in->rank,
                             (long)row, (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain,
-                            c.acq));
+                            c.acq, (long)dpitch, (long)spitch));
     return RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_3rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 3, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 3, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     R4D_TRY("ar_gather_3rank",
         r4d_ar_gather_3rank(in->peer_scratch[0], in->peer_scratch[1],
                             in->peer_flags[0], in->peer_flags[1],
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
-                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
+                            (long)dpitch, (long)spitch));
     return RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 4, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 4, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     /* One handshake, placement after it local: the release is the one-shot's. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -832,15 +926,16 @@ extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
                             (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
-                            early, early ? in->gate_ctr : 0L));
+                            early, early ? in->gate_ctr : 0L, (long)dpitch, (long)spitch,
+                            ar_chain(a, c.numel)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_8rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 8, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 8, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     R4D_TRY("ar_gather_8rank",
         r4d_ar_gather_8rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
@@ -851,7 +946,8 @@ extern "C" int r4d_rad_ar_gather_8rank(const RadArgs* a, RadStream s) {
                             in->peer_flags[6],
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
-                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
+                            (long)dpitch, (long)spitch));
     return RAD_OK;
 }
 
@@ -959,6 +1055,32 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     const ArInst* in = c.in;
+    /* From `ts_min` elements, the exact two-shot on this instance: the same fold per element, so
+     * the same bytes, for half the bytes a rank (a 16-row verify's message, 516 KiB a card at
+     * 3x, is what the link waits on). It shares the wide family's flags, counters and slots, and
+     * a shard pair fits any slot that holds the whole message. */
+    const long ts_min = r4d_cfg_ar_ts_min(a);
+    const long words16 = c.numel * in->esize / 16;
+    if (ts_min > 0 && c.numel >= ts_min && words16 % in->world == 0 &&
+        2 * (c.numel * in->esize) / in->world <= in->slot_bytes &&
+        c.numel <= R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) {
+        R4dArCfg cfgv;
+        r4d_cfg_ar(a, &cfgv);
+        int nb = cfgv.nblocks > 0 ? cfgv.nblocks
+                                  : nb_for_shard(words16 / in->world,
+                                                 in->nb_cap > 24 ? 24 : in->nb_cap);
+        if (nb > in->max_blocks) nb = in->max_blocks;
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        R4D_TRY("ar_oneshot_4rank_exact (two-shot)",
+            r4d_ar_twoshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                       in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                       in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                       c.inp, c.out, c.numel, in->dtype, in->rank,
+                                       (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
+                                       c.pub, early, early ? in->gate_ctr : 0L,
+                                       ar_chain(a, c.numel)));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     /* The wide release, the two-rank family's rule: over P2P the kernel ends the engine's hold
      * itself once the peers' pushes have landed (the kernel after the handshake is local VRAM
      * traffic); through the host mailbox the reduce reads the bytes across the link, so early
@@ -1036,6 +1158,25 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     if (words16 % c.in->world) return RAD_E_SHAPE;
     if (2 * (c.numel * c.in->esize) / c.in->world > c.in->slot_bytes) return RAD_E_SCRATCH;
     const ArInst* in = c.in;
+    /* A reduction beside compute (overlap 1) carries its pushes coded at ~12.2 bits a bf16 value
+     * (r4d_ar_twoshot_Nrank_exact.hip, the coded form), at 4 blocks of 1024 threads, wherever the
+     * message fits that form; the same bytes either way. The 31B's prefill (4x R9700, a
+     * 5033-token prompt): 5724 -> 5949 tok/s (+3.9%), every reply identical; 8 x 512 gave +2.1%,
+     * 16 x 256 +1.3%, 6 x 1024 -1.9% (the blocks crowd the GEMM beside them). `coded` 0, a launch
+     * parameter no declaration carries, keeps the plain wire: r4d_selftest's plain arm. */
+    const bool lane = r4d_geti_or(a, "overlap", 0) == 1;
+    if (lane && r4d_geti_or(a, "coded", 1) != 0 &&
+        r4d_ar_twoshot_coded_ok(c.numel, in->dtype, 4, in->slot16)) {
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        R4D_TRY("ar_twoshot_4rank_exact (coded)",
+            r4d_ar_twoshot_4rank_exact_coded(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                             c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s,
+                                             4, 1024, c.drain, c.acq, c.pub, early,
+                                             early ? in->gate_ctr : 0L, ar_chain(a, c.numel)));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     /* The kernel ends the hold after its second handshake (its reduce is fused with the phase-2
      * push); through the host mailbox early stays 0 and the engine releases by barrier. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1045,7 +1186,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub, early, early ? in->gate_ctr : 0L));
+                                   c.pub, early, early ? in->gate_ctr : 0L,
+                                   ar_chain(a, c.numel)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -1067,6 +1209,10 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     const long long asked = r4d_pgeti_or(a->p, a->n_p, "pieces", in->pieces);
     if (asked < 0 || asked > R4D_AR_TS_MAX_PIECES) return RAD_E_INVAL;
     const long long pieces = ar8_pieces_for(in, c.numel, asked);
+    /* A diagnostic: a device buffer of nblocks * R4D_AR_TL_WORDS int64 stamps (r4d.h). */
+    const long long timeline = r4d_pgeti_or(a->p, a->n_p, "timeline", 0);
+    const long long form = r4d_pgeti_or(a->p, a->n_p, "form", in->form);
+    if (form < R4D_AR8_FORM_LOCKSTEP || form > R4D_AR8_FORM_SPLIT) return RAD_E_INVAL;
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
@@ -1077,7 +1223,7 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub, weights, (long)pieces));
+                                   c.pub, weights, (long)pieces, (long)timeline, (long)form));
     return RAD_OK;
 }
 
@@ -1240,7 +1386,9 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
  * chooses it as the standalone `all_reduce` row would (lossy wire allowed, group tiles the message,
  * size above --tp-wire-min-kb), and both ranks decide on the same T. A wire-6 chunk that would
  * straddle a row is refused as a shape. */
-extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+/* `hi8`: ar_rmsnorm_had_quant_i8g, the same with had_quant_act_i8g's quantiser on the norm's pass
+ * (int8 codes, K whole 128s, no post-norm). */
+static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
     if (in->world != 2) return RAD_E_SHAPE;
@@ -1252,9 +1400,11 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, AL_SCALE);
     const RadTensor* ob = r4d_opt(a, AL_OUTBF16);
     /* ar_rmsnorm_quant_fp8's optional post-norm (Gemma 3's sandwich); ar_ln_had_quant_i8 has no
-     * seventh operand, and this function serves only the fp8 op. */
+     * seventh operand, and this function serves only the fp8 op and its rotated int8 twin. */
     const RadTensor* wpo = r4d_opt(a, AL_WPOST);
     if (!x || !w || !q || !sc) return RAD_E_INVAL;
+    if (hi8 && q->dtype != RAD_I8) return RAD_E_DTYPE;
+    if (hi8 && wpo) return RAD_E_UNSUPPORTED;
     if (!r4d_contig(w)) return RAD_E_STRIDE;
     if (wpo && (!rs || !r4d_contig(wpo) || r4d_numel(wpo) != r4d_numel(w) || wpo->dtype != w->dtype))
         return RAD_E_SHAPE;
@@ -1272,6 +1422,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const long long grp = r4d_quant_act_fp8_group();
     const long long nkb = (K + grp - 1) / grp;
     if (r4d_geti_or(a, "group", grp) != grp) return RAD_E_SHAPE;
+    if (hi8 && K % grp) return RAD_E_SHAPE;
     if (r4d_numel(w) != K) return RAD_E_SHAPE;
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
     if (q->shape[0] != M || q->shape[1] != K) return RAD_E_SHAPE;
@@ -1327,15 +1478,32 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
     if (nblocks < 1) nblocks = 1;
 
-    const int e = r4d_ar_rmsnorm_quant_fp8(
-        in->peer_scratch[0], in->my_scratch,
-        in->peer_flags[0], in->my_flags, in->my_seq,
-        in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
-        r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
-        (int)rp, (int)yp, (int)qp, (int)sp,
-        (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-        in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
+    const int e = hi8
+        ? r4d_ar_rmsnorm_had_quant_i8g(
+              in->peer_scratch[0], in->my_scratch,
+              in->peer_flags[0], in->my_flags, in->my_seq,
+              in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
+              r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
+              (int)rp, (int)yp, (int)qp, (int)sp,
+              (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
+              in->locpack, in->slot_bytes / 2)
+        : r4d_ar_rmsnorm_quant_fp8(
+              in->peer_scratch[0], in->my_scratch,
+              in->peer_flags[0], in->my_flags, in->my_seq,
+              in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
+              r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
+              (int)rp, (int)yp, (int)qp, (int)sp,
+              (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
+              in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant(a, s, false);
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant(a, s, true);
 }
 
 /* The all-reduce and the sandwich-norm junction after it, int8 out: exact `all_reduce` of `x`, then
@@ -1345,18 +1513,22 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
  * all-reduce. Width and block count as in ar_rmsnorm_quant_fp8. */
 enum { AQ8_X = 0, AQ8_RES, AQ8_W, AQ8_Q, AQ8_S, AQ8_Y, AQ8_WP, AQ8_SC };
 
-extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
-    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
-    if (!in) return RAD_E_STATE;
-    if (in->world != 2) return RAD_E_SHAPE;
-    const RadTensor* x  = r4d_opt(a, AQ8_X);
-    const RadTensor* rs = r4d_opt(a, AQ8_RES);
-    const RadTensor* w  = r4d_opt(a, AQ8_W);
-    const RadTensor* q  = r4d_opt(a, AQ8_Q);
-    const RadTensor* sc = r4d_opt(a, AQ8_S);
-    const RadTensor* ob = r4d_opt(a, AQ8_Y);
-    const RadTensor* wp = r4d_opt(a, AQ8_WP);
-    const RadTensor* sl = r4d_opt(a, AQ8_SC);
+/* The operands and their rules, the same at every width. */
+struct ArQ8Args {
+    const RadTensor *x = nullptr, *rs = nullptr, *w = nullptr, *q = nullptr, *sc = nullptr;
+    const RadTensor *ob = nullptr, *wp = nullptr, *sl = nullptr;
+    long long M = 0, K = 0, yp = 0, rp = 0;
+};
+
+static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
+    const RadTensor* x  = o->x  = r4d_opt(a, AQ8_X);
+    const RadTensor* rs = o->rs = r4d_opt(a, AQ8_RES);
+    const RadTensor* w  = o->w  = r4d_opt(a, AQ8_W);
+    const RadTensor* q  = o->q  = r4d_opt(a, AQ8_Q);
+    const RadTensor* sc = o->sc = r4d_opt(a, AQ8_S);
+    const RadTensor* ob = o->ob = r4d_opt(a, AQ8_Y);
+    const RadTensor* wp = o->wp = r4d_opt(a, AQ8_WP);
+    const RadTensor* sl = o->sl = r4d_opt(a, AQ8_SC);
     if (!x || !w || !q || !sc) return RAD_E_INVAL;
     if ((wp || sl) && !rs) return RAD_E_INVAL;
     if (!r4d_contig(w) || (wp && !r4d_contig(wp))) return RAD_E_STRIDE;
@@ -1375,6 +1547,18 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
     const long long xp = r4d_row_pitch(x), yp = ob ? r4d_row_pitch(ob) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
     if (xp != K || yp < 0 || rp < 0) return RAD_E_STRIDE;   /* x is the message: tight */
     if (r4d_geti_or(a, "wire", 0) != 0) return RAD_E_INVAL;
+    o->M = M; o->K = K; o->yp = yp; o->rp = rp;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    ArQ8Args v;
+    const int arc = ar_q8_args(a, in, &v);
+    if (arc != RAD_OK) return arc;
+    const long long M = v.M, K = v.K;
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
@@ -1385,11 +1569,70 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
     if (nblocks < 1) nblocks = 1;
     const int e = r4d_ar_rmsnorm_quant_i8(
         in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
-        in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(wp), r4d_addr(sl),
-        sl ? (sl->dtype == RAD_F32) : 0, r4d_addr(ob), r4d_addr(q), r4d_addr(sc), (int)M, (int)K,
-        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0), w->dtype == RAD_F32,
-        (int)rp, (int)yp, (long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq);
+        in->slot16, r4d_addr(v.x), r4d_addr(v.rs), r4d_addr(v.w), r4d_addr(v.wp), r4d_addr(v.sl),
+        v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc), (int)M,
+        (int)K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
+        v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
+        cfgv.acq);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* The same at four ranks, on the wide family's one-shot transport (r4d_rmsnorm_quant_i8.hip's
+ * ar_rmsnorm_quant_i8_wide_kernel), the one ar_hc_write_4rank rides, with the junction as its
+ * epilogue. The operands and the norm's width are the two-rank form's. The block count is one per
+ * row, capped by the wide family's flag array in the launcher and by the instance here. The
+ * instance is the four-rank family's {rank, 4, bf16, M_hi * n} (ar_hc_wide_init), so it is a
+ * standalone all_reduce band's where the two bounds agree, which is safe on one stream for the
+ * reason that init gives. The plugin issues it only at one-shot heights: each rank sends three
+ * times the message, which the two-shot the standalone takes above them does not. */
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+    ArQ8Args v;
+    const int arc = ar_q8_args(a, in, &v);
+    if (arc != RAD_OK) return arc;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    /* The fence-free forms rest on fine-grained P2P scratch and a store drain; the host mailbox
+     * (pinned host memory, cached on the way) keeps both fences. */
+    if (in->host || cfgv.drain != 3) {
+        if (cfgv.pub == 2) cfgv.pub = 1;
+        if (cfgv.acq == 2) cfgv.acq = 0;
+    }
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)v.M;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    /* Above one-shot heights (the plugin's fold band at 5 rows and up), the `tail` axis's form:
+     * the standalone two-shot over words on the blocks the standalone all_reduce would take for
+     * this message (nb_for_shard), with the junction as its tail; its two counters are words of the
+     * instance's zeroed sequence allocation past the landed counter (r4d_ar_seq.h). P2P only. */
+    int tail_nbt = 0;
+    if (r4d_cfg_ar_tail(a) && v.M >= 5 && !in->host) {
+        const long words16 = (long)v.M * v.K / 8;
+        tail_nbt = nb_for_shard(words16 / in->world, in->nb_cap > 24 ? 24 : in->nb_cap);
+        if (tail_nbt > in->max_blocks) tail_nbt = in->max_blocks;
+    }
+    const long tail_ctr = in->my_seq + (2L * in->max_blocks + 8) * 4;
+    /* `sp` (0 unless asked): the all-reduce split around the junction, P2P only. The host mailbox
+     * runs the whole form, which leaves every byte the split one does. */
+    const long long sp = r4d_geti_or(a, "sp", 0);
+    if (sp < 0 || sp > 2) return RAD_E_INVAL;
+    /* The junction after the last handshake is local, so either form releases there. */
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    const int e = r4d_ar_rmsnorm_quant_i8_4rank(
+        in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+        in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+        in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+        r4d_addr(v.x), r4d_addr(v.rs), r4d_addr(v.w), r4d_addr(v.wp), r4d_addr(v.sl),
+        v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc),
+        (int)v.M, (int)v.K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
+        v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (int)in->rank, (long)(uintptr_t)s, nblocks,
+        cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L, tail_ctr, tail_nbt,
+        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0, in->host ? 0 : (int)sp);
+    if (e != 0) return RAD_E_SHAPE;
+    return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
 /* The all-reduce with the gated residual write: `all_reduce` of `y`, then `hc_write` of the reduced

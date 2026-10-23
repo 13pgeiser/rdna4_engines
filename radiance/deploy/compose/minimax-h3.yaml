@@ -3,6 +3,9 @@
 # The text encoder and the modulation projections are read from pinned host memory
 # (--vision-tower-placement ram), about 39 GiB of it. MiniMax-H3's license excludes use in the EU,
 # the UK, the Republic of Korea and the USA.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/h3 and add `--lora-dir /models/loras/h3` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
 name: radiance-minimax-h3
 services:
   radiance:

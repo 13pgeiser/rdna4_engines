@@ -203,6 +203,184 @@ __global__ __launch_bounds__(128) void fp8_f32scale_experts(const uint8_t* a, co
         }
     }
 }
+/* The small-M grouped form at GLM's MTP gate_up slice, with fp8_f32scale_experts' per-element
+ * sequence and so its bytes. A draft pass routes one token to eight experts, and the four column
+ * tiles a block of the form above leave sixteen blocks, each a chain of 64 stages of 256 K. Here a
+ * block takes one column tile of the y-th touched expert (the grid has min(experts, rows) + 1
+ * rows, as at the MXFP4 small-M form), in stages of 512 K, with loads unconditional from clamped
+ * addresses and masked at the store, barriers that order LDS only, and a 128 of K's eight fragment
+ * pairs loaded before its WMMA chain. */
+typedef unsigned f8_g16 __attribute__((ext_vector_type(4), aligned(1)));
+__device__ __forceinline__ f8_u4 f8_ldg16(const uint8_t* p) {
+    return *(const __attribute__((address_space(1))) f8_g16*)p;
+}
+__device__ __forceinline__ float f8_ldgf(const float* p) {
+    return *(const __attribute__((address_space(1))) float*)p;
+}
+template <int StageK>
+struct F8Small {
+    static constexpr int Threads = 128, KB = StageK / 128, P = StageK + 8;
+    static constexpr int AChunks = StageK / Threads, WChunks = 64 * StageK / 16 / Threads;
+    f8_u4 a[AChunks], w[WChunks];
+    float wsc[KB], sa;
+    uint32_t ok;
+};
+template <int StageK>
+__global__ __launch_bounds__(128) void fp8_f32scale_small(const uint8_t* a, const float* as,
+                                                          const void* w0, const void* s0,
+                                                          const void* w1, const void* s1,
+                                                          const int* sorted, const int* offsets,
+                                                          uint16_t* y, Meta m) {
+    using St = F8Small<StageK>;
+    constexpr int KB = St::KB, P = St::P, Threads = St::Threads;
+    static_assert(St::AChunks <= 8 && St::WChunks <= 16 && KB <= 4 && 16 * KB <= Threads &&
+                      64 * P >= 4 * 513,
+                  "stage chunks must fit the load mask and the offsets the weight tile");
+    __shared__ __align__(16) uint8_t qa[16 * P], wb[64 * P];
+    __shared__ float sa[16 * KB];
+    __shared__ int source[16];
+    __shared__ int pick;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, col0 = blockIdx.x * 64;
+    if ((int)blockIdx.y == (int)gridDim.y - 1) {
+        const int r0 = offsets[m.experts];
+        for (long i = tid; i < (long)(m.T - r0) * 64; i += Threads) {
+            const int c = col0 + (int)(i % 64);
+            if (c < m.N) y[(long)(r0 + i / 64) * m.yr + c] = 0;
+        }
+        return;
+    }
+    {
+        // The offsets in the weight tile, whose bytes are free until the first stage.
+        int* offs = reinterpret_cast<int*>(wb);
+#pragma unroll
+        for (int q = 0; q < 5; ++q) {
+            const int x = tid + q * Threads;
+            if (x <= m.experts) offs[x] = offsets[x];
+        }
+        lds_barrier();
+        if (wave == 0) {
+            int want = blockIdx.y, found = -1;
+            for (int base = 0; base < m.experts; base += 32) {
+                const int x = base + lane;
+                const bool live = x < m.experts && offs[x + 1] > offs[x];
+                const uint32_t mask = __builtin_amdgcn_ballot_w32(live);
+                const int n = __builtin_popcount(mask);
+                if (want < n) {
+                    const uint32_t below = mask & ((1u << lane) - 1u);
+                    found = base + __builtin_ctz(__builtin_amdgcn_ballot_w32(
+                                       live && __builtin_popcount(below) == want));
+                    break;
+                }
+                want -= n;
+            }
+            if (lane == 0) pick = found;
+        }
+        lds_barrier();
+    }
+    const int e = pick;
+    if (e < 0) return;
+    const int lo = offsets[e], hi = offsets[e + 1];
+    const int parity = e & 1;
+    const auto* w = entry(parity ? w1 : w0, m.wstep[parity], e / 2);
+    const auto* ws = (const float*)entry(parity ? s1 : s0, m.sstep[parity], e / 2);
+    const int S = (m.K + StageK - 1) / StageK, rowbase = (lane >> 4) * 8;
+    for (int r0 = lo; r0 < hi; r0 += 16) {
+        lds_barrier();
+        if (tid < 16) {
+            const int r = r0 + tid, flat = r < hi ? sorted[r] : -1;
+            source[tid] = flat >= 0 ? (m.sorted_a ? r : flat / m.topk) : -1;
+        }
+        lds_barrier();
+        bool rv[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) rv[j] = source[rowbase + j] >= 0;
+        auto load = [&](int s, St& L) {
+            const int k0 = s * StageK;
+            uint32_t ok = 0;
+#pragma unroll
+            for (int i = 0; i < St::AChunks; ++i) {
+                const int j = tid + i * Threads, r = j / (StageK / 16), c = (j % (StageK / 16)) * 16,
+                          src = source[r];
+                const bool v = src >= 0 && k0 + c < m.K;
+                __builtin_memcpy(&L.a[i], a + (v ? (long)src * m.ar + k0 + c : 0), 16);
+                ok |= (uint32_t)v << i;
+            }
+#pragma unroll
+            for (int i = 0; i < St::WChunks; ++i) {
+                const int j = tid + i * Threads, r = j / (StageK / 16), c = (j % (StageK / 16)) * 16;
+                const bool v = k0 + c < m.K;
+                L.w[i] = f8_ldg16(w + (v ? (long)(col0 + r) * m.wr + k0 + c : 0));
+                ok |= (uint32_t)v << (8 + i);
+            }
+#pragma unroll
+            for (int kb = 0; kb < KB; ++kb) {
+                const bool v = k0 + kb * 128 < m.K;
+                L.wsc[kb] =
+                    f8_ldgf(ws + (v ? (long)(col0 / 128) * m.sr + (k0 + kb * 128) / 128 : 0));
+                ok |= (uint32_t)v << (24 + kb);
+            }
+            {
+                const int src = source[(tid / KB) & 15], kb = k0 + (tid % KB) * 128;
+                const bool v = tid < 16 * KB && src >= 0 && kb < m.K;
+                L.sa = as[v ? (long)src * m.asr + kb / 128 : 0];
+                ok |= (uint32_t)v << 28;
+            }
+            L.ok = ok;
+        };
+        auto store = [&](const St& L) {
+#pragma unroll
+            for (int i = 0; i < St::AChunks; ++i) {
+                const int j = tid + i * Threads, r = j / (StageK / 16), c = (j % (StageK / 16)) * 16;
+                *reinterpret_cast<f8_u4*>(qa + r * P + c) =
+                    (L.ok >> i) & 1u ? L.a[i] : f8_u4{ 0, 0, 0, 0 };
+            }
+#pragma unroll
+            for (int i = 0; i < St::WChunks; ++i) {
+                const int j = tid + i * Threads, r = j / (StageK / 16), c = (j % (StageK / 16)) * 16;
+                *reinterpret_cast<f8_u4*>(wb + r * P + c) =
+                    (L.ok >> (8 + i)) & 1u ? L.w[i] : f8_u4{ 0, 0, 0, 0 };
+            }
+            if (tid < 16 * KB) sa[(tid % KB) * 16 + tid / KB] = (L.ok >> 28) & 1u ? L.sa : 0.f;
+        };
+        auto acc = r4d_fp8::acc_zero();
+        St L;
+        load(0, L);
+        for (int s = 0; s < S; ++s) {
+            store(L);
+            float wsc[KB];
+#pragma unroll
+            for (int kb = 0; kb < KB; ++kb) wsc[kb] = (L.ok >> (24 + kb)) & 1u ? L.wsc[kb] : 0.f;
+            lds_barrier();
+            if (s + 1 < S) load(s + 1, L);
+            const int k0 = s * StageK;
+#pragma unroll
+            for (int kb = 0; kb < KB; ++kb) {
+                if (k0 + kb * 128 >= m.K) break;
+                r4d_fp8::i2v fa[8], fb[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    fa[t] = r4d_fp8::frag<StageK>(qa, 0, kb * 128 + 16 * t, lane);
+                    fb[t] = r4d_fp8::frag<StageK>(wb, wave * 16, kb * 128 + 16 * t, lane);
+                }
+                auto raw = r4d_fp8::acc_zero();
+#pragma unroll
+                for (int t = 0; t < 8; ++t) raw = r4d_fp8::mma(fa[t], fb[t], raw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float scale = rv[j] ? sa[kb * 16 + rowbase + j] * wsc[kb] : 0;
+                    acc[j] += raw[j] * scale;
+                }
+            }
+            lds_barrier();
+        }
+        const int c = col0 + wave * 16 + (lane & 15);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int r = r0 + rowbase + j;
+            if (r < hi) y[(long)r * m.yr + c] = f32_to_bf16(acc[j]);
+        }
+    }
+}
 // Both forms below keep fp8_f32scale's arithmetic for every output: per 128-K block the same
 // eight-mma chain from zero over the same fragments (the bytes at k + 8*(lane/16) of the block's
 // row segment, which the legacy form copies through LDS unchanged), then acc += raw * (a_scale *
@@ -504,6 +682,16 @@ int body(const RadArgs* a, RadStream stream, bool grouped) {
     m.sstep[0] = ws.stride[0] * 4;
     m.sstep[1] = so.stride[0] * 4;
     if (w.shape[0] < (m.experts + 1) / 2 || wo.shape[0] < m.experts / 2) return RAD_E_SHAPE;
+    /* The small-M form at the MTP layer's gate_up slice up to 384 routed rows: a draft pass routes
+     * one token, a verify pass a few. Measured there (perfmxf8, cold), expert-major against
+     * small-M at 1, 2, 4, 8 and 16 tokens: 73.6/36.7, 83.6/65.8, 118.4/114.9, 214.0/203.9 and
+     * 375.6/343.9 us. Down's K of 256 gains nothing from it (within a few percent, a quarter slower
+     * at three tokens). */
+    if (m.experts == 288 && m.topk == 8 && N == 512 && K == 4096 && m.T <= 384)
+        return R4D_EMIT(stream, fp8_f32scale_small<512>,
+                        dim3(N / 64, (m.T < m.experts ? m.T : m.experts) + 1), dim3(128), 0,
+                        (const uint8_t*)x.data, (const float*)xs.data, w.data, ws.data, wo.data,
+                        so.data, (const int*)st.data, (const int*)off.data, (uint16_t*)y.data, m);
     /* The expert-major form at every routed-row count. Measured at GLM's TP8 slices: a long K
      * (gate_up's 4096) wants the 256 stage, 25 to 40 % ahead of 128, and under 128 routed rows
      * four tiles a block on top; at down's K of 256 every variant reads within a few percent of

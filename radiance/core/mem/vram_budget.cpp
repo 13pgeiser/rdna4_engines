@@ -93,8 +93,13 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* The only measured term: the driver, loaded code objects and anything else on the card (e.g.
      * a desktop compositor), so it is reported on its own line rather than folded into the
-     * headroom. Read after declare(), once every kernel plugin's code object is resident. */
-    b.already_held = std::max<int64_t>(b.capacity - freeb, 0);
+     * headroom. Read after declare(), once every kernel plugin's code object is resident.
+     *
+     * `held_out` is taken back out: it is the engine's own allocation that the program does not
+     * see (core/cvec.h's direction table), which the headroom already covers. */
+    int64_t held_out = 0;
+    for (const VramFacts& f : per_rank) held_out = std::max(held_out, f.held_out);
+    b.already_held = std::max<int64_t>(b.capacity - freeb - held_out, 0);
 
     /* What is left after the fixed terms. */
     b.drift = kDriverDrift;

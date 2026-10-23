@@ -37,3 +37,11 @@ extern "C" int r4d_attn_decode_h128_gqa4_fp8kv(const R4DArgs* a, hipStream_t s) 
 extern "C" int r4d_attn_decode_h128_gqa4_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT, 1>(a, s);
 }
+// The same over a cache holding each kv head once for kv_rep query groups (O_KVREP), q at
+// R4DArgs::q_ld (O_QLD): gqa 8 on this gqa-4 kernel, under attn_paged_qrow.
+extern "C" int r4d_attn_decode_h128_gqa4_rep_fp8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_KVREP, 0>(a, s);
+}
+extern "C" int r4d_attn_decode_h128_gqa4_rep_bf16kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_KVREP, 1>(a, s);
+}

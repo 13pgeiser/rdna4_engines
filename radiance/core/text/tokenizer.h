@@ -337,6 +337,10 @@ int vocab_serialize(const VocabBuild& in, StringSink& strings, uint64_t section_
 int vocab_deserialize(const void* file_base, uint64_t file_bytes,
                       const RadVocabHeader* h, VocabBuild& out);
 
+/* `text` through the normaliser steps of `steps` (the others are skipped), as the encoder runs
+ * them. RAD_E_UNSUPPORTED when a Replace pattern does not compile. */
+int vocab_normalize(const std::vector<VocabStep>& steps, std::string* text);
+
 /* Human-readable one-liner for a step, for --debug-graph and for the convert log. */
 std::string step_describe(const VocabStep& s);
 

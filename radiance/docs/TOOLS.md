@@ -107,6 +107,12 @@ rad-convert [options] <input> -o <model.rad>
                        else every library found
       --tokenizer F    tokenizer.json; its declared chain is baked instead of being
                        reconstructed from a pre-tokenizer name
+      --tokenizer2 F   a second tokenizer.json, baked as the container's second vocab: a
+                       generator that reads its prompt through two tokenizers
+      --add FILE       one more .safetensors file merged in, its tensor names kept (a release
+                       shipped as separate single files). Repeatable
+      --config DIR     config.json, generation_config.json and tokenizer.json from DIR, for a
+                       single-file checkpoint that ships none
       --imatrix F      llama.cpp imatrix: expert profile, column importances, error weighting
       --set K=V        a metadata key, seen by declare and written into the container. Repeatable
       --max-tok N      the max_tok declare is run at (default 8192)
@@ -268,6 +274,12 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   refuses a `--max-tok` and context pair whose score plane would pass 2 GiB.
 - `--max-spec`: a container carries what the model can serve, so a draft head is written even when
   this run would not draft. `0` leaves it out.
+- `--add`, `--config` and `--tokenizer2` read a release that ships as ComfyUI's single files
+  (Anima: a diffusion model, a text encoder and a VAE in `split_files/`): the files merge into one
+  namespace with their own tensor names (a name in two files is refused), the text encoder's
+  repository supplies the config and tokenizer the plugin is sized by, and a second tokenizer.json
+  (with its `tokenizer_config.json` beside it) becomes the container's second vocab section, which
+  a generator declaring `aux_tokens` reads its prompt through. GUIDE §3.2 has the Anima command.
 - `--draft-model` merges a drafter here; the engine refuses the flag. The drafter's tensors go in
   under a `draft.` prefix and its config under `draft.` keys. It has no embedding and no `lm_head`
   of its own; it uses the target's.
@@ -781,6 +793,10 @@ The mode changes these settings itself:
 
 Everything else comes from the command line: run every candidate with the same flags, and the
 reference with the exact wire and a bf16 KV cache.
+
+The control vector's switch is per request, and KLD mode serves none, so a deployment that has one
+loaded is scored with it **off**. `--control-vector on` starts the deployment default on, which is how
+the projection itself is scored (the switch still decides per request, and a request's false wins).
 
 `--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be

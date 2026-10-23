@@ -1,8 +1,10 @@
-/* GLM manifold-constrained residual connections. The mixed residual must have a
- * separate destination: each output stream reads every original input stream. */
-#ifndef RAD_BLOCK_MHC_H
-#define RAD_BLOCK_MHC_H
-#include "rad_tp_split.h"
+/* GLM-5.3's manifold-constrained residual connections (mHC): four residual streams in one
+ * 16384-wide row. read() mixes them down to the block's 4096-wide input and saves the mixing
+ * coefficients; write() adds the block's output back into every stream. The mixed residual must
+ * have a separate destination: each output stream reads every original input stream. */
+#ifndef RAD_BLOCK_GLM_MHC_H
+#define RAD_BLOCK_GLM_MHC_H
+#include "rad_glm_tp.h"
 #include <cmath>
 
 namespace rad {
@@ -27,7 +29,7 @@ struct ManifoldConn {
     rad_op op_pre = 0, op_post = 0;
     /* Above the split threshold under TP, GLM's projection is split by residual chunks: each rank
      * computes the partials of its chunks with mhc_pre's own kernels, an all_gather joins them,
-     * and mhc_pre_finish completes the read on every rank (rad_tp_split.h). */
+     * and mhc_pre_finish completes the read on every rank (rad_glm_tp.h). */
     static constexpr int64_t kChunk = 2048, kPartStride = 28;
     rad_buf part = 0, parts = 0;
     rad_op op_partial = 0, op_gather = 0, op_finish = 0;
@@ -72,7 +74,7 @@ struct ManifoldConn {
     }
     int declare_split(RadBuilder* b, Names& nm, const char* name) {
         const int64_t total = c.hc * g.n_embd / kChunk;
-        split_rows = kGlmTpSplitRows;
+        split_rows = GlmTp::kSplitRows;
         if (g.world < 2 || g.n_embd != 4096 || c.hc != 4 || total % g.world) {
             split_rows = 0;
             return RAD_OK;

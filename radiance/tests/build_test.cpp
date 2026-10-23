@@ -1566,6 +1566,46 @@ TEST(a_two_plane_weight_needs_a_kernel_that_joins_its_planes) {
     }
 }
 
+/* A kernel that reads a weight's stored bytes without interpreting them (libr4d's prefetch into
+ * the cache) answers RAD_LAYOUT_ANY: it takes the form another kernel chose, declared before it or
+ * after, and claims none, so it never conflicts; a weight only it reads is stored as it is. */
+TEST(a_kernel_that_reads_any_stored_form_claims_none) {
+    NEED_EXTRA(reg)
+    const RadParam p[] = { RAD_RANGE("M", 1, 16), RAD_INT("N", 256), RAD_INT("K", 256),
+                           RAD_STR("dtype", "bf16") };
+    auto weight = [](Builder& b) {
+        RadWeightDecl d{};
+        d.dtype = RAD_BF16;
+        d.rank = 2;
+        d.shape[0] = 256;
+        d.shape[1] = 256;
+        d.access = RAD_ACCESS_PER_TOKEN;
+        d.group = rad_group_layer(0);
+        return b.decl_weight("w.bf16", &d);
+    };
+    for (bool any_first : { false, true }) {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_weight w = weight(b);
+        rad_op a = 0, t = 0;
+        if (any_first) a = b.decl_op("t_any", p, 4, &w, 1);
+        t = b.decl_op("t_lay", p, 4, &w, 1);
+        if (!any_first) a = b.decl_op("t_any", p, 4, &w, 1);
+        REQUIRE(a != 0 && t != 0);
+        CHECK_EQ(std::string(device_row(b.program().op(a), 0)), "t_any_read");
+        CHECK_EQ(std::string(device_row(b.program().op(t), 0)), "t_lay_tiled");
+        CHECK_OK(b.finish());
+        CHECK(b.errors().empty());
+        CHECK_EQ(b.program().weight(w)->layout_tag, std::string("tiled"));
+    }
+    Builder b(reg, make_meta(), make_ctx());
+    const rad_weight w = weight(b);
+    REQUIRE(b.decl_op("t_any", p, 4, &w, 1) != 0);
+    CHECK_OK(b.finish());
+    CHECK(b.errors().empty());
+    CHECK(b.program().weight(w)->layout_tag.empty());
+    CHECK(b.program().weight(w)->identity);
+}
+
 namespace {
 
 /* A [256, 256] E4M3 weight with one f32 scale per 128x128 tile, declared over both planes. */

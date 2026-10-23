@@ -7,23 +7,13 @@
 #include <cmath>
 
 namespace {
-__global__ void gemm_nt_f32_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp,
-                                   long yp, int n, int k) {
-    const int lane = threadIdx.x & 31, col = blockIdx.x * 4 + (threadIdx.x >> 5), r = blockIdx.y;
-    if (col >= n) return;
-    float sum = 0;
-    for (int j = lane; j < k; j += 32)
-        sum = fmaf(bf16_to_f32(x[(long)r * xp + j]), w[(long)col * wp + j], sum);
-#pragma unroll
-    for (int mask = 16; mask; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
-    if (!lane) y[(long)r * yp + col] = sum;
-}
-
 // One wave computes R rows by C columns, so each loaded weight serves R rows and each input
-// C columns. Every output keeps gemm_nt_f32_kernel's arithmetic: lane l accumulates
-// k = l, l+32, ... in ascending order with fmaf, then the same xor butterfly. Tail rows and
+// C columns. Every output has the same arithmetic: lane l accumulates k = l, l+32, ... in
+// ascending order with fmaf, then the xor butterfly over 16, 8, 4, 2, 1. A lane loads U steps of
+// k before their FMAs: at a decode pass's few rows a wave streams its weight row with no other
+// work to hide the load behind, and one step in flight left the router at 150 GB/s. Tail rows and
 // columns read a clamped valid address and are never stored.
-template <int R, int C>
+template <int R, int C, int U>
 __global__ void __launch_bounds__(128)
     gemm_nt_f32_tile_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp, long yp,
                             int m, int n, int k) {
@@ -41,15 +31,33 @@ __global__ void __launch_bounds__(128)
     for (int q = 0; q < R; ++q)
 #pragma unroll
         for (int c = 0; c < C; ++c) sum[q][c] = 0;
-    for (int j = lane; j < k; j += 32) {
-        float weight[C];
+    int j = lane;
+    for (; j + 32 * (U - 1) < k; j += 32 * U) {
+        float weight[U][C];
+        uint16_t in[U][R];
 #pragma unroll
-        for (int c = 0; c < C; ++c) weight[c] = wc[c][j];
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int c = 0; c < C; ++c) weight[u][c] = wc[c][j + 32 * u];
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int q = 0; q < R; ++q) in[u][q] = xr[q][j + 32 * u];
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+            for (int q = 0; q < R; ++q) {
+                const float v = bf16_to_f32(in[u][q]);
+#pragma unroll
+                for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, weight[u][c], sum[q][c]);
+            }
+    }
+    for (; j < k; j += 32) {
 #pragma unroll
         for (int q = 0; q < R; ++q) {
             const float v = bf16_to_f32(xr[q][j]);
 #pragma unroll
-            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, weight[c], sum[q][c]);
+            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, wc[c][j], sum[q][c]);
         }
     }
 #pragma unroll
@@ -68,11 +76,11 @@ __global__ void __launch_bounds__(128)
                 if (c0 + c < n) y[(long)(r0 + q) * yp + c0 + c] = sum[q][c];
 }
 
-template <int R, int C>
+template <int R, int C, int U = 1>
 int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
                   long n, long k) {
     const long m = x.shape[0];
-    return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C>),
+    return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U>),
                     dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)),
                     dim3(128), 0, (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
                     x.stride[0], w.stride[0], y.stride[0], (int)m, (int)n, (int)k);
@@ -89,19 +97,19 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
         w.stride[1] != 1 || y.stride[1] != 1 || x.stride[0] < k || w.stride[0] < k ||
         y.stride[0] < n)
         return RAD_E_SHAPE;
-    /* The tile form, rows x columns per wave, by M; all forms are byte-identical, so the choice is
-     * speed only. Measured on gfx1201 (r4d_selftest --perff32, cold) at N 4/32/36/288, K 4096.
-     * 16x4 gains 3-5 % at N 288/32 above 64 rows but loses 16 % at N 36; 8x4 holds at every
-     * width. A projection of a few columns has too few waves for wide tiles at any M. */
+    /* The tile form, rows x columns per wave and steps of k in flight, by M; all forms are
+     * byte-identical, so the choice is speed only. Measured on gfx1201 (r4d_selftest --perff32,
+     * cold) at N 4/32/36/288, K 4096: 16x4 gains 3-5 % at N 288/32 above 64 rows but loses 16 % at
+     * N 36; 8x4 holds at every width. Below 64 rows the steps in flight decide: at N 288 one step
+     * a lane took 28.1 / 36.0 / 36.3 / 41.9 / 45.4 / 47.9 us at 1 / 4 / 8 / 16 / 24 / 48 rows,
+     * 2x2 with 16 steps 14.4 / 14.5 / 15.0 / 19.1 us to 16 rows and 8x1 with 8 steps 21.6 / 35.5
+     * us at 24 / 48; at N 32 2x2 with 16 steps 9.8 to 10.2 us at every count below 64, where one
+     * step took 27.3 to 36.4.
+     * A projection of a few columns has too few waves for wide tiles at any M. */
     const long rows = x.shape[0];
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
-    if (rows <= 1)
-        return R4D_EMIT(stream, gemm_nt_f32_kernel, dim3((n + 3) / 4, x.shape[0]), dim3(128), 0,
-                        (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
-                        x.stride[0], w.stride[0], y.stride[0], (int)n, (int)k);
-    if (rows <= 2) return gemm_f32_tile<2, 1>(stream, x, w, y, n, k);
-    if (rows < 16) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
-    if (rows < 64) return gemm_f32_tile<4, 4>(stream, x, w, y, n, k);
+    if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k);
+    if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k);
     return gemm_f32_tile<8, 4>(stream, x, w, y, n, k);
 }
 // router_sigmoid_topk in one wave per row: p = sigmoid(logit), the top_k largest ranks p + bias

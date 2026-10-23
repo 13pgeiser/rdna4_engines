@@ -72,7 +72,10 @@ struct SchedMetrics {
     /* Admissions whose prefix hit was cut to nothing, by reason, and the checkpoint shortfall:
      * attention-cached prompt tokens computed again (rad::SchedMetrics::hit_cut_tokens). */
     int64_t hit_cut_no_snapshot = 0, hit_cut_window = 0, hit_cut_adopt = 0;
+    int64_t hit_cut_resumed_below = 0;   /* resumed more than an interval below the hit */
     int64_t hit_cut_tokens = 0;
+    /* Host-tier restores the pool could not hold whole (rad::SchedMetrics::prefix_restore_cuts). */
+    int64_t prefix_restore_cuts = 0;
     /* Removed by --prefix-cache-ttl, cumulative. Not evictions: nothing wanted the memory. */
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;
     /* Decoupled prefix caching (spec §7.3). `prefix_hit_rate` is the attention hit rate, as in
@@ -599,6 +602,22 @@ struct ImageGenInfo {
     /* A reference picture is shrunk to `ref_area` only when larger, then centre-cropped to the
      * size multiple; otherwise resized to `ref_area` at its aspect. */
     bool    ref_shrink_only = false;
+    /* A prompt of fewer tokens after the drop prefix is padded with `pad_token` up to this many
+     * (RadGeneratorDecl::min_tokens); 0: no minimum. */
+    int64_t min_tokens = 0;
+    int32_t pad_token = 0;
+    /* The prompt is also read through the model's second tokenizer (IImageGen::encode_aux), at
+     * most `aux_max_tokens` ids of it. */
+    bool    aux_tokens = false;
+    int64_t aux_max_tokens = 0;
+    /* A discrete-time model (RadGeneratorDecl::train_steps): the samplers it serves (1 << id)
+     * and the sampler and scheduler a request gets when it names none. 0 samplers: flow
+     * matching, which takes neither field. */
+    uint32_t samplers = 0;
+    int32_t  default_sampler = 0, default_scheduler = 0;
+    /* The prompt in windows (RadGeneratorDecl::chunk_tokens): tokens a window, its markers and
+     * its padding token; 0 for a prompt read whole. */
+    int32_t  chunk_tokens = 0, chunk_bos = 0, chunk_eos = 0, chunk_pad = 0;
 };
 
 class IImageGen {
@@ -612,6 +631,13 @@ public:
     virtual int picture(const mm::Frame& f, std::shared_ptr<mm::Item>* out, std::string* why) = 0;
     virtual int64_t queued() const = 0;
     virtual int64_t running() const = 0;
+    /* The user's prompt through the model's second tokenizer (ImageGenInfo::aux_tokens), with the
+     * special tokens that tokenizer adds; RAD_E_UNSUPPORTED for a model without one. */
+    virtual int encode_aux(const std::string& text, std::vector<int32_t>* out) const {
+        (void)text;
+        (void)out;
+        return RAD_E_UNSUPPORTED;
+    }
 };
 
 /* The audio generator (core/gen/audio_driver.h), for a model that makes music or other audio from

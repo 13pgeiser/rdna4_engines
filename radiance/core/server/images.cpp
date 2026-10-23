@@ -21,6 +21,7 @@
  * `.completed` event per image.
  */
 #include "server.h"
+#include "loras.h"
 #include "oai.h"
 
 #include "gen/gen.h"
@@ -58,11 +59,13 @@ struct ImgReq {
     bool        has_neg = false;
     double      cfg = 1.0;
     int32_t     w = 0, h = 0, n = 1, steps = 0, previews = 0;
+    int32_t     sampler = 0, scheduler = 0;
     bool        seed_given = false;
     uint64_t    seed = 0;
     std::string background = "auto", format = "png", quality = "auto";
     int32_t     compression = -1;
     bool        stream = false;
+    bool        rebalance = false;
     std::vector<mm::FrameRGBA> images;
     bool        has_mask = false;
     mm::FrameRGBA mask;
@@ -85,9 +88,14 @@ json form_value(const std::string& key, const std::string& v) {
         if (e && *e == 0 && !v.empty()) return json(x);
         return json(v);
     }
-    if (key == "stream") {
+    if (key == "stream" || key == "rebalance") {
         if (v == "true" || v == "1") return json(true);
         if (v == "false" || v == "0") return json(false);
+    }
+    /* `loras` as JSON text, or one adapter's name. */
+    if ((key == "loras" || key == "lora") && !v.empty() && (v[0] == '[' || v[0] == '{')) {
+        json j = json::parse(v, nullptr, false);
+        if (!j.is_discarded()) return j;
     }
     return json(v);
 }
@@ -235,7 +243,8 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         "output_compression", "response_format", "stream", "partial_images", "moderation",
         "style", "user", "input_fidelity", "seed", "negative_prompt", "true_cfg_scale",
         "guidance_scale",
-        "num_inference_steps", "width", "height",
+        "num_inference_steps", "width", "height", "loras", "lora", "sampler", "scheduler",
+        "rebalance",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -262,7 +271,20 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         return error_response(err_bad("prompt", "expected a string"), req.peer);
     if (!body.contains("prompt"))
         return error_response(err_bad("prompt", "the prompt is required"), req.peer);
-    if (r.prompt.empty()) r.prompt = " ";
+    /* Runtime LoRA adapters: `loras` and <lora:...> tags, which leave the prompt. */
+    std::vector<std::pair<std::string, double>> loras;
+    {
+        std::string field, why;
+        if (parse_loras(body, &r.prompt, &loras, &field, &why) < 0)
+            return error_response(err_bad(field.c_str(), why), req.peer);
+        if (!loras.empty() && !opt_.gen_lora_acquire)
+            return error_response(err_unsupported(field.c_str(), "this server was started without "
+                                                                 "adapters (--lora, --lora-dir)"),
+                                  req.peer);
+    }
+    /* An empty prompt becomes " ", as in the diffusers pipelines, unless the model pads a short
+     * prompt itself (ImageGenInfo::min_tokens), as ComfyUI's tokenizers do. */
+    if (r.prompt.empty() && info.min_tokens == 0) r.prompt = " ";
     std::string rf;
     if (str("response_format", &rf) < 0 || (!rf.empty() && rf != "b64_json" && rf != "url"))
         return error_response(err_bad("response_format", "expected b64_json"), req.peer);
@@ -335,12 +357,52 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         else if (r.quality == "medium") steps = std::max<int64_t>(1, info.default_steps * 3 / 4);
     }
     r.steps = (int32_t)steps;
+    /* A discrete-time model's sampler and scheduler, by ComfyUI's names. */
+    {
+        std::string sname, kname;
+        if (str("sampler", &sname) < 0)
+            return error_response(err_bad("sampler", "expected a string"), req.peer);
+        if (str("scheduler", &kname) < 0)
+            return error_response(err_bad("scheduler", "expected a string"), req.peer);
+        if (!info.samplers && (!sname.empty() || !kname.empty()))
+            return error_response(err_unsupported(sname.empty() ? "scheduler" : "sampler",
+                                                  "this model samples with flow-matching Euler "
+                                                  "on its own schedule"), req.peer);
+        r.sampler = info.default_sampler;
+        r.scheduler = info.default_scheduler;
+        if (!sname.empty()) {
+            r.sampler = gen::sampler_id(sname);
+            if (r.sampler < 0 || !(info.samplers & (1u << r.sampler))) {
+                ApiError e = err_bad("sampler", "'" + sname + "' is not a sampler this model serves");
+                for (int32_t i = 0; i < RAD_GEN_SAMPLER_COUNT; ++i)
+                    if (info.samplers & (1u << i)) e.supported.push_back(gen::sampler_name(i));
+                return error_response(e, req.peer);
+            }
+        }
+        if (!kname.empty()) {
+            r.scheduler = gen::scheduler_id(kname);
+            if (r.scheduler < 0) {
+                ApiError e = err_bad("scheduler", "'" + kname + "' is not a scheduler this model "
+                                                  "serves");
+                for (int32_t i = 0; i < RAD_GEN_SCHED_COUNT; ++i)
+                    e.supported.push_back(gen::scheduler_name(i));
+                return error_response(e, req.peer);
+            }
+        }
+    }
     /* -1 asks for a random seed, as llama-server and the chat endpoints read it. */
     if (body.contains("seed") && !body["seed"].is_null()) {
         if (!body["seed"].is_number_integer())
             return error_response(err_bad("seed", "expected an integer"), req.peer);
         r.seed = (uint64_t)body["seed"].get<int64_t>();
         r.seed_given = body["seed"].is_number_unsigned() || body["seed"].get<int64_t>() != -1;
+    }
+    /* Krea 2's fixed tap gains (ConditioningKrea2Rebalance's defaults, arch/krea2); other models
+     * ignore it. */
+    if (body.contains("rebalance") && !body["rebalance"].is_null()) {
+        if (!body["rebalance"].is_boolean())
+            return error_response(err_bad("rebalance", "expected true or false"), req.peer);
+        r.rebalance = body["rebalance"].get<bool>();
     }
     if (str("negative_prompt", &r.negative) < 0)
         return error_response(err_bad("negative_prompt", "expected a string"), req.peer);
@@ -365,12 +427,12 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
                                                        "..30"), req.peer);
     }
     /* Guidance needs a scale past its off value and a negative prompt: the request's (empty
-     * becomes " ", as in the reference pipeline), or the model's own. */
+     * becomes " " as the prompt does), or the model's own. */
     const bool guided = r.cfg > cfg_off;
     const bool named_neg = body.contains("negative_prompt") && !body["negative_prompt"].is_null();
     r.has_neg = guided && (named_neg || info.has_default_negative);
     if (r.has_neg && !named_neg) r.negative = info.default_negative;
-    else if (r.has_neg && r.negative.empty()) r.negative = " ";
+    else if (r.has_neg && r.negative.empty() && info.min_tokens == 0) r.negative = " ";
     if (guided && !r.has_neg)
         return error_response(err_bad(cfg_key, "guidance needs a negative_prompt"), req.peer);
 
@@ -470,8 +532,11 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     g->height = r.h;
     g->n = r.n;
     g->steps = r.steps;
+    g->sampler = r.sampler;
+    g->scheduler = r.scheduler;
     g->seed = r.seed;
     g->previews = r.previews;
+    g->cond_opts = r.rebalance ? RAD_GEN_COND_REBALANCE : 0;
     /* The driver guides as uncond + cfg (cond - uncond); a card's cond + s (cond - uncond) is
      * that at s + 1. */
     g->cfg = (float)(info.cfg_original ? r.cfg + 1.0 : r.cfg);
@@ -585,6 +650,41 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             return RAD_E_STATE;
         }
         out->n_drop = (int32_t)drop.size();
+        /* The reference tokenizer's minimum length: an empty prompt is padding the model reads. */
+        while ((int64_t)out->tokens.size() - out->n_drop < info.min_tokens)
+            out->tokens.push_back(info.pad_token);
+        if (info.aux_tokens) {
+            if (deps_.images->encode_aux(prompt, &out->aux) < 0) {
+                *err = err_internal("the prompt could not be read by the model's second "
+                                    "tokenizer");
+                return RAD_E_STATE;
+            }
+            if ((int64_t)out->aux.size() > info.aux_max_tokens) {
+                *err = err_bad("prompt", "the prompt is " + std::to_string(out->aux.size()) +
+                                             " tokens to this model's second tokenizer, which "
+                                             "reads at most " +
+                                             std::to_string(info.aux_max_tokens));
+                return RAD_E_INVAL;
+            }
+        }
+        /* A prompt read in windows: runs of at most chunk_tokens after the prefix, each between
+         * its markers and padded to the window. */
+        if (info.chunk_tokens > 0) {
+            const size_t W = (size_t)info.chunk_tokens;
+            std::vector<int32_t> win(out->tokens.begin(), out->tokens.begin() + out->n_drop);
+            const size_t n_body = out->tokens.size() - (size_t)out->n_drop;
+            size_t at = 0;
+            do {
+                const size_t take = std::min(W, n_body - at);
+                win.push_back(info.chunk_bos);
+                win.insert(win.end(), out->tokens.begin() + out->n_drop + (std::ptrdiff_t)at,
+                           out->tokens.begin() + out->n_drop + (std::ptrdiff_t)(at + take));
+                win.push_back(info.chunk_eos);
+                win.resize(win.size() + (W - take), info.chunk_pad);
+                at += take;
+            } while (at < n_body);
+            out->tokens = std::move(win);
+        }
         if ((int64_t)out->tokens.size() > info.max_cond_tokens) {
             *err = err_bad("prompt", "the prompt is " + std::to_string(out->tokens.size()) +
                                          " tokens with its pictures; this deployment conditions on "
@@ -600,6 +700,19 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             return error_response(err, req.peer);
     }
 
+    /* ---- the adapters' slot, held until the request is done */
+    std::string lora_note;
+    if (!loras.empty()) {
+        std::string why;
+        const int s = opt_.gen_lora_acquire(loras, &g->lora_slot, &g->lora_hold, &lora_note, &why);
+        if (s < 0) {
+            ApiError e = err_bad("loras", why);
+            if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
+            else if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
+            return error_response(e, req.peer);
+        }
+    }
+
     /* ---- admitted and queued */
     if (auto no = admit(1, req.peer)) return *no;
     std::shared_ptr<gen::Ticket> ticket = g->ticket;
@@ -613,9 +726,11 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             return error_response(e, req.peer);
         }
     }
-    RAD_INFO("images: %s %dx%d n=%d steps=%d seed=%llu%s%s%s", edit ? "edit" : "generation", r.w,
+    std::string lora_s;
+    for (const auto& [n, w] : loras) lora_s += (lora_s.empty() ? " loras=" : ",") + n + fmt(":%g", w);
+    RAD_INFO("images: %s %dx%d n=%d steps=%d seed=%llu%s%s%s%s", edit ? "edit" : "generation", r.w,
              r.h, r.n, r.steps, (unsigned long long)r.seed, r.has_neg ? " guided" : "",
-             r.has_mask ? " masked" : "", r.stream ? " streamed" : "");
+             r.has_mask ? " masked" : "", r.stream ? " streamed" : "", lora_s.c_str());
 
     /* ---- one finished picture to a file */
     const std::string size_s = std::to_string(r.w) + "x" + std::to_string(r.h);

@@ -271,7 +271,7 @@ int Ctx::bind_weights() {
     Program& P = *program_;
     w_tmpl_.assign(P.weights.size(), RadTensor{});
     w_bits_.assign(P.weights.size(), 0);
-    waited_gen_.assign(P.weights.size(), UINT32_MAX);
+    for (auto& g : waited_gen_) g.assign(P.weights.size(), UINT32_MAX);
     w_direct_.assign(P.weights.size(), 0);
 
     for (size_t i = 1; i < P.weights.size(); ++i) {
@@ -455,6 +455,7 @@ int Ctx::check_domain_layout(rad_op h, int domain, std::string* why) const {
             const int st = ki->layout ? ki->layout(ip.args.p, ip.args.n_p, opd, &w.enc, w.sel, t,
                                                    w.n_sel, &L)
                                       : RAD_E_UNSUPPORTED;
+            if (st == RAD_LAYOUT_ANY) continue;   /* reads the bytes as they lie (rad_abi.h) */
             const std::string tag = st == RAD_OK ? (L.tag && *L.tag ? L.tag : ki->name)
                                                  : std::string();
             if (st >= 0 || st == RAD_E_UNSUPPORTED) {

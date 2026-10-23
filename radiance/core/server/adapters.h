@@ -102,6 +102,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.hit_cut_no_snapshot = m.hit_cut_no_snapshot;
     o.hit_cut_window = m.hit_cut_window;
     o.hit_cut_adopt = m.hit_cut_adopt;
+    o.hit_cut_resumed_below = m.hit_cut_resumed_below;
+    o.prefix_restore_cuts = m.prefix_restore_cuts;
     o.hit_cut_tokens = m.hit_cut_tokens;
     o.prefix_expired = m.prefix_expired;
     o.prefix_ckpt_expired = m.prefix_ckpt_expired;

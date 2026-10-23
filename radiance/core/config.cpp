@@ -23,6 +23,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <sys/stat.h>
 
 namespace rad {
 
@@ -103,18 +104,30 @@ static const Flag g_flags[] = {
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
 
-    { "--lora",               "ADAPTER", "NAME=PATH: serve a PEFT LoRA adapter beside the base model,\n"
-    "                                    as model NAME (repeatable). The base stays as it is; each\n"
-    "                                    request picks its adapter by `model`"},
+    { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
+    "                                    (repeatable). A text model takes a PEFT directory and\n"
+    "                                    serves it as model NAME; an image or video generator takes\n"
+    "                                    a .safetensors file (kohya, ComfyUI, PEFT, LyCORIS) that\n"
+    "                                    a request names in `loras`. The base stays as it is"},
+    { "--lora-dir",           "DIR",    "image and video generators: a request may name any\n"
+    "                                    NAME.safetensors under DIR in `loras`, opened when first\n"
+    "                                    asked for"},
     { "--max-loras",          "N",      "adapter slots resident at once (default: the number of\n"
-    "                                    --lora). Each slot holds one adapter's A/B on the card"},
-    { "--max-lora-rank",      "R",      "the rank each slot is sized for (default 16); a smaller\n"
-    "                                    adapter is zero-padded, a larger one refused"},
+    "                                    --lora, 2 with --lora-dir alone). A text model's slot holds\n"
+    "                                    one adapter, a generator's one request's combination"},
+    { "--max-lora-rank",      "R",      "the rank each slot is sized for (default 16 for a text\n"
+    "                                    model, 64 for a generator); a text model's larger adapter is\n"
+    "                                    refused, a generator's larger combination truncated"},
     { "--lora-target-modules", "LIST",  "comma-separated HF module leaf names adapters may\n"
     "                                    target (q_proj,k_proj,...). Default: what the --lora\n"
     "                                    adapters target. Needed with --max-loras and no --lora"},
 
     { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
+    { "--control-vector",     "MODE",   "off | on | disabled: load the control-vector file found\n"
+    "                                    for this model and start requests off (off) or on (on).\n"
+    "                                    disabled -- the default, also with no flag at all -- loads\n"
+    "                                    nothing: no projection op is declared, and a request that\n"
+    "                                    asks for the vector is refused" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
     "                                    set cannot change under the heat engine. The sampler is\n"
     "                                    already order-independent and needs no pinning; note that\n"
@@ -227,8 +240,9 @@ static const Flag g_flags[] = {
     { "--video-max-frames",   "N",      "the most frames sampled from a video" },
     { "--video-max-frame-tokens", "N",  "the most prompt tokens one video frame may become; 0 is no cap (a token\n"
     "                                    budget processor -- Gemma 4's -- takes 70, 140, 280, 560 or 1120)" },
-    { "--image-tokens",       "N",      "a token-budget processor's image budget (Gemma 4: 70, 140, 280, 560, 1120;\n"
-    "                                    default the container's); a request's `image_tokens` overrides it" },
+    { "--image-tokens",       "N",      "a token-budget processor's image budget (Gemma 4: 70, 140, 280, 560, 1120,\n"
+    "                                    which a request's `image_tokens` overrides; GLM-5.3: the most tokens an\n"
+    "                                    image becomes, at most --mm-max-patches / 4; default the container's)" },
     { "--max-source-pixels",  "N",      "the largest image or video frame the decoder accepts, before any resize\n"
     "                                    (default 67108864). The media flags above default to what the container\n"
     "                                    states, and do nothing for a model that takes no media" },
@@ -520,6 +534,7 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->lora.adapters.emplace_back(std::string(v, eq), std::string(eq + 1));
         }
+        else if (S("--lora-dir"))              { if (!(v = need(i))) return RAD_E_INVAL; c->lora.dir = v; }
         else if (S("--max-loras"))             { if (!num(0, 64, &c->lora.max_loras)) return RAD_E_INVAL; }
         else if (S("--max-lora-rank"))         { if (!num(1, 512, &c->lora.max_rank)) return RAD_E_INVAL; }
         else if (S("--lora-target-modules")) {
@@ -568,6 +583,14 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->placement = v;
+        }
+        else if (S("--control-vector")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "off") && std::strcmp(v, "on") && std::strcmp(v, "disabled")) {
+                RAD_ERR("--control-vector takes off, on or disabled -- got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->control_vector = v;
         }
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
@@ -881,21 +904,18 @@ int config_parse(int argc, char** argv, Config* c) {
                 RAD_ERR("--lora names the adapter '%s' twice", name.c_str());
                 return RAD_E_INVAL;
             }
-        if (L.max_loras > 0 && L.max_loras < (int)L.adapters.size()) {
-            RAD_ERR("--max-loras %d holds fewer adapters than the %zu that --lora names",
-                    L.max_loras, L.adapters.size());
-            return RAD_E_INVAL;
-        }
         const bool rank_given = c->given.count("--max-lora-rank") != 0;
         if (!L.enabled() && (rank_given || !L.targets.empty())) {
             RAD_ERR("%s sizes runtime LoRA slots, and there are none: give --lora or --max-loras",
                     rank_given ? "--max-lora-rank" : "--lora-target-modules");
             return RAD_E_INVAL;
         }
-        if (L.adapters.empty() && L.max_loras > 0 && L.targets.empty()) {
-            RAD_ERR("--max-loras with no --lora names no module an adapter may target; give "
-                    "--lora-target-modules (q_proj,k_proj,v_proj,o_proj,...)");
-            return RAD_E_INVAL;
+        if (!L.dir.empty()) {
+            struct stat sb{};
+            if (stat(L.dir.c_str(), &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+                RAD_ERR("--lora-dir '%s' is not a directory", L.dir.c_str());
+                return RAD_E_INVAL;
+            }
         }
         if (!c->kld_lora.empty() && !c->kld()) {
             RAD_ERR("--kld-lora scores through an adapter in KL mode; give --kld-record or "
@@ -1019,14 +1039,18 @@ const ShowRow kShow[] = {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;
           return o.empty() ? std::string("none") : o; } },
+    { "--lora-dir",           [](const Config& c) {
+          return c.lora.dir.empty() ? std::string("none") : c.lora.dir; } },
     { "--max-loras",          [](const Config& c) {
           return c.lora.enabled() ? num(c.lora.slots()) : std::string("0 (off)"); } },
-    { "--max-lora-rank",      [](const Config& c) { return num(c.lora.max_rank); } },
+    { "--max-lora-rank",      [](const Config& c) {
+          return c.lora.max_rank > 0 ? num(c.lora.max_rank) : std::string("auto (16 text, 64 generator)"); } },
     { "--lora-target-modules", [](const Config& c) {
           std::string o;
           for (const std::string& t : c.lora.targets) o += (o.empty() ? "" : ",") + t;
           return o.empty() ? std::string(c.lora.enabled() ? "the adapters' own" : "-") : o; } },
     { "--placement",          [](const Config& c) { return c.placement; } },
+    { "--control-vector",     [](const Config& c) { return c.control_vector; } },
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },

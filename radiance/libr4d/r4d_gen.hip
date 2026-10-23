@@ -17,6 +17,7 @@
 #include "r4d_q8.h"
 #include "rad_philox.h"
 
+#include <algorithm>
 #include <cmath>
 #include <initializer_list>
 #include <cstdlib>
@@ -380,6 +381,118 @@ __global__ __launch_bounds__(kT) void flow_euler_kernel(
     st[so] = f32_to_bf16(xn);
 }
 
+// ---------------------------------------------------------------------------- kd_input, kd_step
+// The k-diffusion sampler over a discrete-time denoiser (libref's ref_kd_input / ref_kd_step): the
+// lanes hold x = x0 + sigma eps in f32, a thread one element of one entry, every entry's constants
+// computed by each of its threads (a handful of f32 operations beside the element's own).
+constexpr int kKdEuler = 0, kKdAncestral = 1, kKdDpm2m = 2;
+
+struct KdConst {
+    float s, sn, w, cskip, cout, sup, sdown, ratio, em, c1, c2;
+    bool second;
+};
+
+__device__ __forceinline__ KdConst kd_const(float s, float sn, float sp, float w, int sampler,
+                                            bool first) {
+    KdConst k{};
+    k.s = s;
+    k.sn = sn;
+    k.w = w;
+    const float s2p = s * s + 1.0f;
+    k.cskip = 1.0f / s2p;
+    k.cout = s / sqrtf(s2p);
+    if (sampler == kKdAncestral) {
+        const float s2 = s * s, sn2 = sn * sn;
+        const float up2 = sn2 * (s2 - sn2) / s2;
+        float sup = sqrtf(up2);
+        if (!(sup < sn)) sup = sn;
+        const float dn2 = sn2 - sup * sup;
+        k.sup = sup;
+        k.sdown = sqrtf(dn2 > 0.0f ? dn2 : 0.0f);
+    } else if (sampler == kKdDpm2m && sn > 0.0f) {
+        const float t = -logf(s), tn = -logf(sn);
+        const float h = tn - t;
+        k.ratio = sn / s;
+        k.em = expm1f(-h);
+        if (!first) {
+            const float r = (t - (-logf(sp))) / h;
+            k.c2 = 1.0f / (2.0f * r);
+            k.c1 = 1.0f + k.c2;
+            k.second = true;
+        }
+    }
+    return k;
+}
+
+__device__ __forceinline__ float kd_den(const KdConst& k, bool v_pred, float x, float o) {
+    return v_pred ? x * k.cskip - o * k.cout : x - k.s * o;
+}
+
+__global__ __launch_bounds__(kT) void kd_input_kernel(
+    const float* __restrict__ sg, const int* __restrict__ pair, const int* __restrict__ lane,
+    const int* __restrict__ flags, const uint32_t* __restrict__ seed, const int* __restrict__ cu,
+    float* __restrict__ st, uint16_t* __restrict__ y, int n, int stride, int st_ld, int y_ld) {
+    const int e = blockIdx.y;
+    const int pr = pair[e];
+    if (pr == -2) return;
+    const int b0 = cu[e];
+    const int64_t len = cu[e + 1] - b0;
+    const int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x;
+    if (i >= len * n) return;
+    const int64_t k = i / n, c = i % n;
+    const float s = sg[e];
+    float* xp = st + ((size_t)lane[e] * stride + k) * st_ld + c;
+    if (flags[e] & 1) *xp = rad_philox_normal(seed_of(seed, e), (uint64_t)i) * sqrtf(1.0f + s * s);
+    const uint16_t v = f32_to_bf16(*xp * (1.0f / sqrtf(s * s + 1.0f)));
+    y[(size_t)(b0 + k) * y_ld + c] = v;
+    if (pr >= 0) y[(size_t)(cu[pr] + k) * y_ld + c] = v;
+}
+
+__global__ __launch_bounds__(kT) void kd_step_kernel(
+    const uint16_t* __restrict__ out, const float* __restrict__ sg, const float* __restrict__ sgn,
+    const float* __restrict__ sgp, const float* __restrict__ cfg, const int* __restrict__ pair,
+    const int* __restrict__ lane, const int* __restrict__ flags, const uint32_t* __restrict__ seed,
+    const int* __restrict__ sampler, const int* __restrict__ step, const int* __restrict__ cu,
+    float* __restrict__ st, float* __restrict__ hist, float* __restrict__ pv, int n, int stride,
+    int o_ld, int st_ld, int h_ld, int pv_ld, int v_pred) {
+    const int e = blockIdx.y;
+    const int pr = pair[e];
+    if (pr == -2) return;
+    const int b0 = cu[e];
+    const int64_t len = cu[e + 1] - b0;
+    const int64_t i = (int64_t)blockIdx.x * kT + threadIdx.x;
+    if (i >= len * n) return;
+    const int64_t k = i / n, c = i % n;
+    const int f = flags[e], sm = sampler[e];
+    const KdConst K = kd_const(sg[e], sgn[e], sgp[e], cfg[e], sm, (f & 1) != 0);
+    const size_t row = (size_t)lane[e] * stride + k;
+    const float x = st[row * st_ld + c];
+    float D = kd_den(K, v_pred != 0, x, bf2f(out[(size_t)(b0 + k) * o_ld + c]));
+    if (pr >= 0) {
+        const float Du = kd_den(K, v_pred != 0, x, bf2f(out[(size_t)(cu[pr] + k) * o_ld + c]));
+        D = Du + K.w * (D - Du);
+    }
+    if ((f & 4) && pv) pv[row * pv_ld + c] = D;
+    float xn;
+    if (sm == kKdEuler) {
+        xn = x + (K.sn - K.s) * ((x - D) / K.s);
+    } else if (sm == kKdAncestral) {
+        xn = x + ((x - D) / K.s) * (K.sdown - K.s);
+        if (K.sn > 0.0f)
+            xn += rad_philox_normal_s(seed_of(seed, e), (uint64_t)(uint32_t)(1 + step[e]),
+                                      (uint64_t)i) * K.sup;
+    } else if (sm != kKdDpm2m) {
+        return;
+    } else if (K.sn == 0.0f) {
+        xn = D;
+    } else {
+        const float Dd = K.second ? K.c1 * D - K.c2 * hist[row * h_ld + c] : D;
+        xn = K.ratio * x - K.em * Dd;
+    }
+    st[row * st_ld + c] = xn;
+    hist[row * h_ld + c] = D;
+}
+
 // ---------------------------------------------------------------------------- per-channel ops
 // The two lists ride in the kernel arguments, whose segment the backend caps at 768 bytes; two
 // lists of 64 channels (a latent's) take 512.
@@ -502,6 +615,20 @@ __global__ __launch_bounds__(kT) void to_rgba8_kernel(const uint16_t* __restrict
     float u = bfr(bfr(v * 0.5f) + 0.5f);
     u = fminf(fmaxf(u, 0.0f), 1.0f);
     y[i] = (uint8_t)rintf(u * 255.0f);
+}
+
+// ---------------------------------------------------------------------------- gelu_quick
+// CLIP's quick_gelu, libref's three roundings: a workgroup a row, a thread an element.
+template <typename T>
+__global__ __launch_bounds__(kT) void gelu_quick_kernel(const T* __restrict__ x, T* __restrict__ y,
+                                                        int n, int x_ld, int y_ld) {
+    const int r = blockIdx.x;
+    for (int c = threadIdx.x; c < n; c += kT) {
+        const float v = ca_ld(x, (size_t)r * x_ld + c);
+        const float a = ca_rd(y, 1.702f * v);
+        const float s = ca_rd(y, 1.0f / (1.0f + expf(-a)));
+        ca_st(y, (int64_t)r * y_ld + c, v * s);
+    }
 }
 
 __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
@@ -696,6 +823,91 @@ __global__ __launch_bounds__(kT) void conv_direct_kernel(
         }
     }
     y[(size_t)oy * y_ld + (size_t)ox * cout + co] = f32_to_bf16(acc + bf2f(bias[co]));
+}
+
+// ---------------------------------------------------------------------------- im2col_nhwc
+// conv2d_nhwc's receptive fields as rows: y[oy Wo + ox][(ci k + i) k + j] = the input at tap
+// (i, j) of output pixel (oy, ox), channel ci. A block is a run of IC_TW output pixels of one
+// output row and IC_CC input channels: it stages the k input rows those pixels read (through the
+// upsample and the zero padding) in LDS channel-major, [cl][i][xw], 16 bytes of NHWC channels a
+// load, then writes each pixel's cc k k columns -- one contiguous run of its y row -- VW elements a
+// thread, so both the reads and the writes are coalesced. KS is k at compile time (3 and 1), 0 for
+// any other. Values are copied bit for bit.
+constexpr int IC_TW = 32;
+constexpr int IC_CC = 64;
+
+template <int KS, int VW>
+__global__ __launch_bounds__(kT) void im2col_nhwc_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int Hv, int Wv, int cin, int Wo,
+    int k_rt, int stride, int up, int pt, int pl, int64_t x_ld, int64_t y_ld, int vec) {
+    extern __shared__ uint16_t ic_lds[];
+    const int k = KS ? KS : k_rt, kk = k * k;
+    const int ox0 = blockIdx.x * IC_TW, oy = blockIdx.y, c0 = blockIdx.z * IC_CC;
+    const int cc = min(IC_CC, cin - c0), nq = min(IC_TW, Wo - ox0);
+    const int W = (IC_TW - 1) * stride + k;
+    const int iy0 = oy * stride - pt, ix0 = ox0 * stride - pl;
+    const int sites = k * W;
+    const int tid = threadIdx.x;
+    if (vec) {
+        const int groups = cc >> 3;
+        for (int u = tid; u < sites * groups; u += kT) {
+            const int g = u % groups, site = u / groups;
+            const int i = site / W, xw = site - i * W;
+            const int iy = iy0 + i, ix = ix0 + xw;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (iy >= 0 && iy < Hv && ix >= 0 && ix < Wv)
+                v = *(const uint4*)(x + (size_t)(iy / up) * x_ld + (size_t)(ix / up) * cin + c0 +
+                                    g * 8);
+            const uint32_t w4[4] = { v.x, v.y, v.z, v.w };
+            #pragma unroll
+            for (int e = 0; e < 8; ++e)
+                ic_lds[((g * 8 + e) * k + i) * W + xw] =
+                    (uint16_t)(e & 1 ? w4[e >> 1] >> 16 : w4[e >> 1] & 0xffffu);
+        }
+    } else {
+        for (int u = tid; u < sites * cc; u += kT) {
+            const int cl = u % cc, site = u / cc;
+            const int i = site / W, xw = site - i * W;
+            const int iy = iy0 + i, ix = ix0 + xw;
+            uint16_t v = 0;
+            if (iy >= 0 && iy < Hv && ix >= 0 && ix < Wv)
+                v = x[(size_t)(iy / up) * x_ld + (size_t)(ix / up) * cin + c0 + cl];
+            ic_lds[(cl * k + i) * W + xw] = v;
+        }
+    }
+    __syncthreads();
+    /* The block's pixels' runs as one list of VW-element pieces, so every thread stores whatever
+     * the run length; a thread's (pixel, piece) advances by the block each pass, without a
+     * division. */
+    const int span = cc * kk, pieces = span / VW;
+    uint16_t* yb = y + (size_t)((int64_t)oy * Wo + ox0) * y_ld + (size_t)c0 * kk;
+    int q = tid / pieces, pc = tid - q * pieces;
+    for (; q < nq;) {
+        const int t = pc * VW;
+        uint16_t* yr = yb + (size_t)q * y_ld;
+        const int xq = q * stride;
+        uint16_t v[VW];
+        #pragma unroll
+        for (int e = 0; e < VW; ++e) {
+            const int te = t + e;
+            const int cl = te / kk, r = te - cl * kk, i = r / k, j = r - i * k;
+            v[e] = ic_lds[(cl * k + i) * W + xq + j];
+        }
+        if constexpr (VW == 8)
+            *(uint4*)(yr + t) = make_uint4((uint32_t)v[0] | ((uint32_t)v[1] << 16),
+                                           (uint32_t)v[2] | ((uint32_t)v[3] << 16),
+                                           (uint32_t)v[4] | ((uint32_t)v[5] << 16),
+                                           (uint32_t)v[6] | ((uint32_t)v[7] << 16));
+        else if constexpr (VW == 4)
+            *(uint2*)(yr + t) = make_uint2((uint32_t)v[0] | ((uint32_t)v[1] << 16),
+                                           (uint32_t)v[2] | ((uint32_t)v[3] << 16));
+        else if constexpr (VW == 2)
+            *(uint32_t*)(yr + t) = (uint32_t)v[0] | ((uint32_t)v[1] << 16);
+        else
+            yr[t] = v[0];
+        pc += kT;
+        while (pc >= pieces) { pc -= pieces; ++q; }
+    }
 }
 
 inline int st_of(hipError_t e) { return e == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE); }
@@ -1073,6 +1285,72 @@ extern "C" int r4d_rad_flow_euler(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
+extern "C" int r4d_rad_kd_input(const RadArgs* a, RadStream s) {
+    const RadTensor *sg = r4d_opt(a, 0), *pair = r4d_opt(a, 1), *lane = r4d_opt(a, 2);
+    const RadTensor *fl = r4d_opt(a, 3), *seed = r4d_opt(a, 4), *cu = r4d_opt(a, 5);
+    const RadTensor *st = r4d_opt(a, 6), *y = r4d_opt(a, 7);
+    if (!sg || !pair || !lane || !fl || !seed || !cu || !st || !y) return R4D_NO(RAD_E_INVAL);
+    if (st->dtype != RAD_F32 || !is_bf16(y) || sg->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), stride = r4d_geti_or(a, "stride", 0);
+    long long rs = 0, ry = 0;
+    const long long sl = r4d_rows_pitch(st, n, &rs), yl = r4d_rows_pitch(y, n, &ry);
+    if (sl < 0 || yl < 0) return R4D_NO(RAD_E_STRIDE);
+    const long long n_seq = r4d_numel(cu) - 1;
+    if (n <= 0 || stride <= 0 || n_seq <= 0 || rs < stride) return R4D_NO(RAD_E_SHAPE);
+    /* One scalar of each kind an entry, two seed words. A lane's rows, a pair's entry and a
+     * repaint flag (device data) are not checked. */
+    for (const RadTensor* e : { sg, pair, lane, fl })
+        if (r4d_numel(e) < n_seq) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(seed) < 2 * n_seq) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(kd_input_kernel, dim3(blocks_for(stride * n), (unsigned)n_seq), dim3(kT), 0,
+                       (hipStream_t)s, (const float*)sg->data, (const int*)pair->data,
+                       (const int*)lane->data, (const int*)fl->data, (const uint32_t*)seed->data,
+                       (const int*)cu->data, (float*)st->data, (uint16_t*)y->data, (int)n,
+                       (int)stride, (int)sl, (int)yl);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_kd_step(const RadArgs* a, RadStream s) {
+    const RadTensor *o = r4d_opt(a, 0), *sg = r4d_opt(a, 1), *sgn = r4d_opt(a, 2);
+    const RadTensor *sgp = r4d_opt(a, 3), *cfg = r4d_opt(a, 4), *pair = r4d_opt(a, 5);
+    const RadTensor *lane = r4d_opt(a, 6), *fl = r4d_opt(a, 7), *seed = r4d_opt(a, 8);
+    const RadTensor *smp = r4d_opt(a, 9), *stp = r4d_opt(a, 10), *cu = r4d_opt(a, 11);
+    const RadTensor *st = r4d_opt(a, 12), *hs = r4d_opt(a, 13), *pv = r4d_opt(a, 14);
+    if (!o || !sg || !sgn || !sgp || !cfg || !pair || !lane || !fl || !seed || !smp || !stp || !cu ||
+        !st || !hs)
+        return R4D_NO(RAD_E_INVAL);
+    if (!is_bf16(o) || st->dtype != RAD_F32 || hs->dtype != RAD_F32 ||
+        (pv && pv->dtype != RAD_F32))
+        return R4D_NO(RAD_E_DTYPE);
+    const char* pred = r4d_gets(a, "pred");
+    const int v_pred = pred && !std::strcmp(pred, "v");
+    if (!v_pred && (!pred || std::strcmp(pred, "eps"))) return R4D_NO(RAD_E_INVAL);
+    const long long n = r4d_geti_or(a, "n", 0), stride = r4d_geti_or(a, "stride", 0);
+    long long ro = 0, rs = 0, rh = 0, rp = 0;
+    const long long ol = r4d_rows_pitch(o, n, &ro), sl = r4d_rows_pitch(st, n, &rs);
+    const long long hl = r4d_rows_pitch(hs, n, &rh), pl = pv ? r4d_rows_pitch(pv, n, &rp) : 0;
+    if (ol < 0 || sl < 0 || hl < 0 || pl < 0) return R4D_NO(RAD_E_STRIDE);
+    const long long n_seq = r4d_numel(cu) - 1;
+    if (n <= 0 || stride <= 0 || n_seq <= 0 || rs < stride || rh < rs || (pv && rp < rs))
+        return R4D_NO(RAD_E_SHAPE);
+    /* One scalar of each kind an entry, two seed words. A lane's rows, a pair's entry, the
+     * sampler ids and the flags (device data) are not checked here: the kernel leaves the lane of
+     * an entry whose sampler it does not know, and writes no preview without the operand, where
+     * libref refuses both. */
+    for (const RadTensor* e : { sg, sgn, sgp, cfg, pair, lane, fl, smp, stp })
+        if (r4d_numel(e) < n_seq) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(seed) < 2 * n_seq) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(kd_step_kernel, dim3(blocks_for(stride * n), (unsigned)n_seq), dim3(kT), 0,
+                       (hipStream_t)s, (const uint16_t*)o->data, (const float*)sg->data,
+                       (const float*)sgn->data, (const float*)sgp->data, (const float*)cfg->data,
+                       (const int*)pair->data, (const int*)lane->data, (const int*)fl->data,
+                       (const uint32_t*)seed->data, (const int*)smp->data, (const int*)stp->data,
+                       (const int*)cu->data, (float*)st->data, (float*)hs->data,
+                       pv ? (float*)pv->data : nullptr, (int)n, (int)stride, (int)ol, (int)sl,
+                       (int)hl, (int)pl, v_pred);
+    return st_of(hipGetLastError());
+}
+
 /* Both rows: x and y bf16 (chan_affine_bf16) or both f32 (chan_affine_f32). `round` 0 keeps the
  * lists and the arithmetic in f32. */
 extern "C" int r4d_rad_chan_affine(const RadArgs* a, RadStream s) {
@@ -1175,6 +1453,61 @@ extern "C" int r4d_rad_conv2d_nhwc(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
+extern "C" int r4d_rad_im2col_nhwc(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_bf16(x) || !is_bf16(y)) return R4D_NO(RAD_E_DTYPE);
+    const long long cin = r4d_geti_or(a, "cin", 0), k = r4d_geti_or(a, "k", 0);
+    const long long stride = r4d_geti_or(a, "stride", 1), up = r4d_geti_or(a, "up", 1);
+    const char* pad = r4d_gets(a, "pad");
+    const bool down = pad && !std::strcmp(pad, "down");
+    const bool causal = pad && !std::strcmp(pad, "causal");
+    if (pad && !down && !causal && std::strcmp(pad, "same")) return R4D_NO(RAD_E_INVAL);
+    if (cin <= 0 || k <= 0 || k > 7 || stride <= 0 || stride > 2 || up <= 0 || up > 2)
+        return R4D_NO(RAD_E_SHAPE);
+    long long Hin = 0, Win = 0;
+    if (!image_of(x, cin, &Hin, &Win, true)) return R4D_NO(RAD_E_SHAPE);
+    const long long Hv = Hin * up, Wv = Win * up;
+    const long long pt = down ? 0 : causal ? k - 1 : k / 2, pb = down ? 1 : causal ? 0 : k / 2;
+    const long long pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
+    const long long Ho = (Hv + pt + pb - k) / stride + 1, Wo = (Wv + pl + pr - k) / stride + 1;
+    const long long KK = cin * k * k;
+    long long rows = 0;
+    const long long y_ld = r4d_rows_pitch(y, KK, &rows);
+    if (y_ld < 0 || y->stride[y->rank - 1] != 1) return R4D_NO(RAD_E_STRIDE);
+    if (Ho <= 0 || Wo <= 0 || rows != Ho * Wo || Ho > 65535 || Ho * Wo * y_ld >= (1ll << 40))
+        return R4D_NO(RAD_E_SHAPE);
+    /* 16-byte channel loads where every chunk's channels start on one; the widest store every
+     * chunk's run, the row pitch and the base allow. */
+    const long long tail = cin % IC_CC ? cin % IC_CC : IC_CC;
+    const int vec = cin % 8 == 0 && x->stride[0] % 8 == 0 && !((uintptr_t)x->data & 15);
+    auto fits = [&](long long vw) {
+        return (std::min((long long)IC_CC, cin) * k * k) % vw == 0 && (tail * k * k) % vw == 0 &&
+               y_ld % vw == 0 && !((uintptr_t)y->data & (2 * vw - 1));
+    };
+    const int VW = fits(8) ? 8 : fits(4) ? 4 : fits(2) ? 2 : 1;
+    const long long W = (IC_TW - 1) * stride + k;
+    const size_t lds = (size_t)(std::min((long long)IC_CC, cin) * k * W) * sizeof(uint16_t);
+    const dim3 grid((unsigned)((Wo + IC_TW - 1) / IC_TW), (unsigned)Ho,
+                    (unsigned)((cin + IC_CC - 1) / IC_CC));
+#define R4D_IC(KS, V)                                                                            \
+    hipLaunchKernelGGL((im2col_nhwc_kernel<KS, V>), grid, dim3(kT), lds, (hipStream_t)s,         \
+                       (const uint16_t*)x->data, (uint16_t*)y->data, (int)Hv, (int)Wv, (int)cin, \
+                       (int)Wo, (int)k, (int)stride, (int)up, (int)pt, (int)pl,                  \
+                       (int64_t)x->stride[0], (int64_t)y_ld, vec)
+#define R4D_IC_K(V)                                                                              \
+    if (k == 3)      R4D_IC(3, V);                                                               \
+    else if (k == 1) R4D_IC(1, V);                                                               \
+    else             R4D_IC(0, V)
+    if (VW == 8)      { R4D_IC_K(8); }
+    else if (VW == 4) { R4D_IC_K(4); }
+    else if (VW == 2) { R4D_IC_K(2); }
+    else              { R4D_IC_K(1); }
+#undef R4D_IC_K
+#undef R4D_IC
+    return st_of(hipGetLastError());
+}
+
 extern "C" int r4d_rad_l2norm_chan(const RadArgs* a, RadStream s) {
     const RadTensor *x = r4d_opt(a, 0), *g = r4d_opt(a, 1), *y = r4d_opt(a, 2);
     if (!x || !g || !y) return R4D_NO(RAD_E_INVAL);
@@ -1243,6 +1576,27 @@ extern "C" int r4d_rad_to_rgba8(const RadArgs* a, RadStream s) {
     if (total <= 0 || r4d_numel(x) < total) return R4D_NO(RAD_E_SHAPE);
     hipLaunchKernelGGL(to_rgba8_kernel, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s,
                        (const uint16_t*)x->data, (uint8_t*)y->data, (int64_t)total);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_gelu_quick(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    const bool f32 = x->dtype == RAD_F32;
+    if ((!is_bf16(x) && !f32) || y->dtype != x->dtype) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    long long rx = 0, ry = 0;
+    const long long xl = r4d_rows_pitch(x, n, &rx), yl = r4d_rows_pitch(y, n, &ry);
+    if (n <= 0 || xl < 0 || yl < 0) return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || rx < ry) return R4D_NO(RAD_E_SHAPE);
+    if (f32)
+        hipLaunchKernelGGL(gelu_quick_kernel<float>, dim3((unsigned)ry), dim3(kT), 0,
+                           (hipStream_t)s, (const float*)x->data, (float*)y->data, (int)n, (int)xl,
+                           (int)yl);
+    else
+        hipLaunchKernelGGL(gelu_quick_kernel<uint16_t>, dim3((unsigned)ry), dim3(kT), 0,
+                           (hipStream_t)s, (const uint16_t*)x->data, (uint16_t*)y->data, (int)n,
+                           (int)xl, (int)yl);
     return st_of(hipGetLastError());
 }
 

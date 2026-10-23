@@ -3303,8 +3303,8 @@ struct TierFixture {
     Fixture f;
     IdleTiers t;
     int64_t per = 0;
-    int build() {
-        int s = f.build(/*with_linear=*/false, /*ckpt_slots=*/0);
+    int build(bool with_linear = false, int64_t ckpt_slots = 0) {
+        int s = f.build(with_linear, ckpt_slots);
         if (s < 0) return s;
         s = t.configure(tier_config(1 << 20, 1024));
         if (s < 0) return s;
@@ -3930,15 +3930,19 @@ static unsigned char pat(int rank, int64_t layer, int32_t block, int64_t i) {
     return (unsigned char)(z ^ (z >> 31));
 }
 
-static void fill(Fixture& f, int rank) {
+/* `alike`: a replicated group holds rank 0's bytes on every rank, as rad_kv_group_replicated
+ * promises. Without it the ranks differ there on purpose, so a follower restored from its own
+ * gather rather than the leader's window would show. */
+static void fill(Fixture& f, int rank, bool alike = false) {
     for (int32_t g : f.pc.cached_groups()) {
         const KVGroupPlan* p = f.kv.plan(g);
         if (p->zero) continue;
+        const int r = alike && p->replicated ? 0 : rank;
         const int64_t frag = p->layer_bytes_per_block();
         for (int64_t l = 0; l < p->n_layers; ++l)
             for (int32_t b = 0; b < (int32_t)p->n_blocks; ++b) {
                 unsigned char* row = (unsigned char*)p->base + l * p->layer_stride() + b * frag;
-                for (int64_t i = 0; i < frag; ++i) row[i] = pat(rank, g * 16 + l, b, i);
+                for (int64_t i = 0; i < frag; ++i) row[i] = pat(r, g * 16 + l, b, i);
             }
     }
 }
@@ -3953,7 +3957,8 @@ static void scribble(Fixture& f) {
 }
 
 /* The number of entries whose blocks in `now` hold, in every cached group and layer, exactly what
- * their blocks in `was` held before the move. */
+ * their blocks in `was` held before the move: this rank's own bytes, and for a replicated group
+ * rank 0's, the one copy the slot holds. */
 static int64_t same_bytes(Fixture& f, int rank, const std::vector<std::vector<int32_t>>& was,
                           const std::vector<std::vector<int32_t>>& now) {
     const std::vector<int32_t>& cg = f.pc.cached_groups();
@@ -3963,12 +3968,13 @@ static int64_t same_bytes(Fixture& f, int rank, const std::vector<std::vector<in
         for (size_t gi = 0; gi < cg.size() && ok; ++gi) {
             const KVGroupPlan* p = f.kv.plan(cg[gi]);
             if (p->zero) continue;
+            const int r = p->replicated ? 0 : rank;
             const int64_t frag = p->layer_bytes_per_block();
             for (int64_t l = 0; l < p->n_layers && ok; ++l) {
                 const unsigned char* row =
                     (const unsigned char*)p->base + l * p->layer_stride() + now[gi][k] * frag;
                 for (int64_t i = 0; i < frag && ok; ++i)
-                    ok = row[i] == pat(rank, cg[gi] * 16 + l, was[gi][k], i);
+                    ok = row[i] == pat(r, cg[gi] * 16 + l, was[gi][k], i);
             }
         }
         good += ok;
@@ -4005,8 +4011,24 @@ static std::vector<KVGroupInfo> two_paged_groups() {
 
 /* `zero_last`: the last rank keeps no attention cache (rad_kv_group_zero), so its window of a slot
  * is the narrower group alone and the windows are unequal; every rank still takes part in every
- * job. */
-static void run_transfer(int world, bool fragment, bool zero_last = false) {
+ * job. `replicated`: the attention group is the same on every rank (rad_kv_group_replicated), so
+ * the slot holds it once at its front, written by rank 0 and read back by all. `verify`: under
+ * RADIANCE_DEBUG_TIER_VERIFY each follower's gather of the replicated group is compared with the
+ * leader's window; `alike` fills the replicated group the same on every rank, as the flag
+ * promises, so the comparison passes, and without it every entry is caught. */
+struct TransferCase {
+    int  world = 1;
+    bool fragment = false;
+    bool zero_last = false;
+    bool replicated = false;
+    bool alike = false;
+    bool verify = false;
+};
+static void run_transfer(const TransferCase& tc) {
+    const int world = tc.world;
+    const bool fragment = tc.fragment, zero_last = tc.zero_last;
+    if (tc.verify) setenv("RADIANCE_DEBUG_TIER_VERIFY", "1", 1);
+    else unsetenv("RADIANCE_DEBUG_TIER_VERIFY");
     /* Host backend only: the stand-in kernels copy rows on the CPU, where host-backend "device"
      * memory lives; on a card the staging buffer is VRAM and production kernels apply. */
     if (!device_is_host()) {
@@ -4023,20 +4045,33 @@ static void run_transfer(int world, bool fragment, bool zero_last = false) {
         fx.push_back(std::make_unique<Fixture>());
         fx.back()->cfg.checkpoint_slots = 0;
         std::vector<KVGroupInfo> groups = two_paged_groups();
-        if (zero_last && r == world - 1) groups[1].zero = true;
+        /* The zero group is the one not replicated: attention, or the key cache beside a
+         * replicated attention group, which leaves that rank's own window empty. */
+        if (zero_last && r == world - 1) groups[tc.replicated ? 2 : 1].zero = true;
+        if (tc.replicated) groups[1].replicated = true;
         REQUIRE_EQ(fx.back()->build_groups(groups), RAD_OK);
     }
     Fixture& f = *fx[0];
     const std::vector<int32_t>& cg = f.pc.cached_groups();
     REQUIRE_EQ(cg.size(), 2u);
-    /* A slot is the sum of the ranks' entries, each rank's window following the previous ones
-     * (Engine::configure_kv). */
-    std::vector<int64_t> win_off((size_t)world, 0);
-    int64_t slot = 0;
-    for (int r = 0; r < world; ++r) {
-        win_off[(size_t)r] = slot;
-        for (int32_t g : cg) slot += fx[(size_t)r]->kv.plan(g)->bytes_per_block;
-    }
+    /* The slot as bringup lays it out: a replicated group once at the front, then each rank's own
+     * window following the previous ones. Checked against the plain sums here. */
+    std::vector<const KVManager*> kvs;
+    for (auto& fp : fx) kvs.push_back(&fp->kv);
+    TierExec::SlotLayout L;
+    REQUIRE_EQ(TierExec::slot_layout(kvs, cg, &L), RAD_OK);
+    const int64_t attn = f.kv.plan(cg[0])->bytes_per_block;
+    int64_t sum = 0;
+    for (int r = 0; r < world; ++r)
+        for (int32_t g : cg) sum += fx[(size_t)r]->kv.plan(g)->bytes_per_block;
+    CHECK_EQ(L.rep_bytes, tc.replicated ? attn : 0);
+    CHECK_EQ(L.slot_bytes, tc.replicated ? sum - (world - 1) * attn : sum);
+    CHECK_EQ(L.own_off[0], L.rep_bytes);
+    for (int r = 1; r < world; ++r)
+        CHECK_EQ(L.own_off[(size_t)r], L.own_off[(size_t)r - 1] + L.own_bytes[(size_t)r - 1]);
+    CHECK_EQ(L.own_off[(size_t)world - 1] + L.own_bytes[(size_t)world - 1], L.slot_bytes);
+    const std::vector<int64_t>& win_off = L.own_off;
+    const int64_t slot = L.slot_bytes;
 
     /* Forty slots. Fragmented, every other one is taken and the copy goes out as twenty runs of
      * one; whole, as one run of twenty, where a rank's pitch through the shared slots decides where
@@ -4075,7 +4110,7 @@ static void run_transfer(int world, bool fragment, bool zero_last = false) {
     REQUIRE_EQ(f.pc.lookup(prompt, {}, &hit).n_attn_tokens, 320);
     const std::vector<std::vector<int32_t>> was = hit;
     CHECK(was[0][0] != was[1][0]);
-    for (int r = 0; r < world; ++r) fill(*fx[(size_t)r], r);
+    for (int r = 0; r < world; ++r) fill(*fx[(size_t)r], r, tc.alike);
 
     /* ---- out ---- */
     std::vector<TierJob> jobs;
@@ -4089,6 +4124,22 @@ static void run_transfer(int world, bool fragment, bool zero_last = false) {
             usleep(100);
         CHECK_EQ(st, 1);
     }
+    /* Every rank landed: the follower's hash of the replicated group against the leader's window
+     * (Engine::tier_tick's order). Bytes out: a follower writes only its own window. */
+    if (tc.verify && tc.replicated) {
+        for (int r = 1; r < world; ++r)
+            for (const TierJob& j : jobs) {
+                uint64_t sum = 0;
+                REQUIRE(x[(size_t)r]->take_replicated_sum(j.key, &sum));
+                x[0]->verify_replicated(j, r, sum);
+                CHECK(!x[(size_t)r]->take_replicated_sum(j.key, &sum));
+            }
+        CHECK_EQ(x[0]->stats().rep_checked, 20ll * (world - 1));
+        CHECK_EQ(x[0]->stats().rep_mismatch, tc.alike ? 0ll : 20ll * (world - 1));
+    }
+    for (int r = 0; r < world; ++r)
+        CHECK_EQ(x[(size_t)r]->stats().bytes_out,
+                 20 * (r == 0 ? L.rep_bytes + L.own_bytes[0] : L.own_bytes[(size_t)r]));
     x[0]->report_pass(jobs, std::vector<char>(jobs.size(), 1), 0);
     CHECK_EQ(t.stats().to_host, 20);
 
@@ -4135,19 +4186,67 @@ static void run_transfer(int world, bool fragment, bool zero_last = false) {
     for (auto& xp : x) xp->close();
     for (RadStream s : compute) rad_stream_destroy(s);
     f.pc.set_tiers(nullptr);
+    unsetenv("RADIANCE_DEBUG_TIER_VERIFY");
 }
 
 TEST(a_conversation_restored_from_host_is_byte_identical_in_new_blocks) {
-    run_transfer(1, /*fragment=*/false);
-    run_transfer(1, /*fragment=*/true);
+    run_transfer({ 1, /*fragment=*/false });
+    run_transfer({ 1, /*fragment=*/true });
 }
 TEST(each_rank_restores_its_own_window_of_a_shared_slot) {
-    run_transfer(2, /*fragment=*/false);
-    run_transfer(2, /*fragment=*/true);
+    run_transfer({ 2, /*fragment=*/false });
+    run_transfer({ 2, /*fragment=*/true });
 }
 TEST(a_rank_with_a_zero_group_moves_only_its_own_groups) {
-    run_transfer(3, /*fragment=*/false, /*zero_last=*/true);
-    run_transfer(3, /*fragment=*/true, /*zero_last=*/true);
+    run_transfer({ 3, /*fragment=*/false, /*zero_last=*/true });
+    run_transfer({ 3, /*fragment=*/true, /*zero_last=*/true });
+}
+/* The replicated group is in the slot once: the leader writes it, every rank reads it back
+ * beside its own shard of the other group, and the slot is smaller by (world - 1) copies. At one
+ * rank nothing changes but the layout's bookkeeping. The ranks' copies differ on purpose, so the
+ * bytes a follower gets back are provably the leader's. */
+TEST(a_replicated_group_is_held_once_a_slot_and_restored_on_every_rank) {
+    for (int world : { 1, 2, 8 }) {
+        run_transfer({ world, /*fragment=*/false, false, /*replicated=*/true });
+        run_transfer({ world, /*fragment=*/true, false, /*replicated=*/true });
+    }
+}
+/* A replicated group beside a zero one: the last rank's own window is empty, so it writes nothing
+ * on a copy out and reads the replicated window alone on a restore. */
+TEST(a_replicated_group_beside_a_zero_rank_keeps_the_windows_apart) {
+    run_transfer({ 3, /*fragment=*/false, /*zero_last=*/true, /*replicated=*/true });
+    run_transfer({ 3, /*fragment=*/true, /*zero_last=*/true, /*replicated=*/true });
+}
+/* RADIANCE_DEBUG_TIER_VERIFY: a follower hashes the replicated bytes it would have written and
+ * the leader compares them with its window. Alike, nothing is reported (seven followers at eight
+ * ranks); differing, every entry, which the two-rank arm logs twenty times. */
+TEST(tier_verify_catches_a_follower_whose_replicated_group_differs) {
+    run_transfer({ 2, /*fragment=*/false, false, /*replicated=*/true, /*alike=*/true, /*verify=*/true });
+    run_transfer({ 8, /*fragment=*/true, false, /*replicated=*/true, /*alike=*/true, /*verify=*/true });
+    run_transfer({ 2, /*fragment=*/true, false, /*replicated=*/true, /*alike=*/false, /*verify=*/true });
+}
+/* The flag must agree across the ranks: one rank's replicated group that another rank declared
+ * zero or did not declare replicated has no one window every rank can read, so bringup stops. */
+TEST(a_group_replicated_on_one_rank_only_is_refused_by_the_slot_layout) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the tier layout fixture needs the host backend\n");
+        return;
+    }
+    for (int bad : { 0, 1 }) {
+        std::vector<std::unique_ptr<Fixture>> fx;
+        for (int r = 0; r < 2; ++r) {
+            fx.push_back(std::make_unique<Fixture>());
+            fx.back()->cfg.checkpoint_slots = 0;
+            std::vector<KVGroupInfo> groups = two_paged_groups();
+            groups[1].replicated = r == 0 || bad == 1;
+            if (bad == 1 && r == 1) groups[1].zero = true;
+            REQUIRE_EQ(fx.back()->build_groups(groups), RAD_OK);
+        }
+        std::vector<const KVManager*> kvs;
+        for (auto& fp : fx) kvs.push_back(&fp->kv);
+        TierExec::SlotLayout L;
+        CHECK_EQ(TierExec::slot_layout(kvs, fx[0]->pc.cached_groups(), &L), RAD_E_STATE);
+    }
 }
 
 /* With speculation each sequence has two physical state slots while the free list counts logical
@@ -6089,6 +6188,177 @@ TEST(the_cache_tiers_and_pool_agree_over_random_interleavings) {
     CHECK_EQ(run.x.t.arena().used_slots(), 0ll);
 }
 
+/* ================================================================== a restore makes room
+ *
+ * A conversation whose blocks went to the host tier comes back whole on its next turn, when the
+ * pool can be made to hold it. The reserve's trim leaves a quarter of the pool free after every
+ * publish; a restore larger than that gives up VRAM copies other idle conversations keep on the
+ * host as well, the same way pressure does, rather than stopping where the free list ends. These
+ * drive the engine's restore against the real cache, tiers and manager, with no bytes moving.
+ */
+
+/* The engine's restore (the binding's restore_fn) without the transfer: which entries come back,
+ * into which blocks, and what the tiers and the cache are told. Returns how many came back. */
+static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r) {
+    const std::vector<BlockHash> want = b.restore_plan(r, 0);
+    std::vector<TierJob> jobs;
+    for (const BlockHash& h : want) {
+        TierJob j;
+        if (!x.t.plan_promote(h, &j)) break;
+        jobs.push_back(std::move(j));
+    }
+    std::vector<int32_t> ids;
+    const int64_t m = x.f.kv.reserve_blocks(G_FULL, (int64_t)jobs.size(), &ids);
+    int64_t back = 0;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        TierJob& j = jobs[i];
+        const bool ok = (int64_t)i < m;
+        j.started = ok;
+        j.blocks.clear();
+        if (ok) j.blocks.push_back(ids[i]);
+        x.t.report(j, ok, rad_mono_ns());
+        if (ok) { CHECK_OK(x.f.pc.rebind(j.key, j.blocks)); ++back; }
+    }
+    return back;
+}
+
+/* Two conversations of 0.6 of the pool each, as the scheduler leaves them: A published and copied
+ * to the host, B admitted by giving up A's VRAM under pressure, published, and the reserve's trim
+ * run while B's sequence still holds its blocks (Scheduler::close_request publishes before it
+ * frees). A ends up mostly on the host with its first blocks still in VRAM. `b_live` keeps B's
+ * sequence running; otherwise it ends with no host copy yet. */
+struct TwoSessions {
+    int64_t n = 0;                       /* blocks each conversation published */
+    std::vector<int32_t> a, b;           /* prompts that hit the whole of each */
+    std::vector<BlockHash> ha;
+};
+static TwoSessions two_sessions(TierFixture& x, bool b_live, bool a_snapshots) {
+    TwoSessions s;
+    const int64_t total = x.f.kv.total_blocks(G_FULL);
+    s.n = (total * 3 / 5) & ~(int64_t)3;            /* on the 64-token checkpoint interval */
+    CHECK(2 * s.n <= x.t.arena().capacity());
+    s.a = tok_run(100000, (int)(s.n * 16 + 16));
+    s.b = tok_run(900000, (int)(s.n * 16 + 16));
+    s.ha = chain_of(s.a);
+
+    publish(x.f, 1, s.a, s.n * 16);
+    if (a_snapshots) {
+        /* A snapshot on every interval, retention after each, as a long prefill leaves them. */
+        for (int64_t pos = 64; pos <= s.n * 16; pos += 64) {
+            x.f.pc.begin_step();
+            ckpt_at(x.f, 1, s.ha, pos);
+            x.f.pc.retain(1);
+        }
+        x.f.pc.begin_step();
+    }
+    x.f.kv.free_sequence(1);
+    copy_now(x.t);
+
+    const int64_t room = total - x.f.kv.held_blocks(G_FULL);
+    CHECK_EQ(x.f.pc.trim(s.n + 1 - room), s.n + 1 - room);
+    publish(x.f, 2, s.b, s.n * 16);
+    const int64_t short_by = total / 4 - (total - x.f.kv.held_blocks(G_FULL));
+    if (short_by > 0) (void)x.f.pc.trim(short_by);
+    if (!b_live) x.f.kv.free_sequence(2);
+    return s;
+}
+
+TEST(a_restore_gives_up_other_clean_copies_to_bring_the_whole_chain_back) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/false);
+    const int64_t off = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    const int64_t free_now = x.f.kv.total_blocks(G_FULL) - x.f.kv.held_blocks(G_FULL);
+    REQUIRE(off > free_now);                        /* the free list alone cannot hold it */
+    const int64_t evictions = x.f.pc.stats().evictions;
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    int flushes = 0;
+    b.flush_fn = [&]() { ++flushes; return !copy_now(x.t).empty(); };
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), off);
+    CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    /* B had no host copy yet: its copies were landed first, then its VRAM went. Nothing lost. */
+    CHECK_EQ(flushes, 1);
+    CHECK_EQ(x.f.pc.stats().evictions, evictions);
+    CHECK_EQ(x.f.pc.size(), 2 * s.n);
+    CHECK_EQ((int64_t)x.f.pc.restorable_from(s.b, {}).size(), 2 * s.n - x.f.pc.resident());
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
+}
+
+/* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches. Cut
+ * at the free list, that is somewhere down the retention ladder, far below the tip. */
+TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
+    x.f.pc.set_policy(std::make_unique<GeometricBackoff>(64));
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/true);
+    REQUIRE_EQ(x.f.pc.checkpoints(1).back(), s.n * 16);
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
+    (void)engine_restore(x, b, turn(3, s.a, {}));
+    const CacheHit hit = x.f.pc.lookup(s.a, {});
+    CHECK_EQ(hit.n_attn_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(hit.n_linear_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
+}
+
+/* When the pool cannot be made to hold the chain, what comes back ends at a snapshot: blocks past
+ * the deepest snapshot the shorter prefix reaches would be restored for nothing. Making room
+ * never takes the conversation's own blocks, which would only have to come back too, nor a chain
+ * a running sequence reads, which frees nothing. */
+TEST(a_restore_the_pool_cannot_hold_stops_at_a_snapshot_and_spares_its_own_chain) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
+    x.f.pc.set_policy(std::make_unique<GeometricBackoff>(64));
+    const TwoSessions s = two_sessions(x, /*b_live=*/true, /*a_snapshots=*/true);
+    const int64_t off = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    const int64_t resident = s.n - off;             /* A's first blocks, still in VRAM */
+    const int64_t room = x.f.kv.total_blocks(G_FULL) - x.f.kv.held_blocks(G_FULL);
+    REQUIRE(resident > 0);
+    REQUIRE(room < off);
+    /* The deepest snapshot the prefix reaches with `room` more blocks. */
+    int64_t snap = 0;
+    for (int64_t p : x.f.pc.checkpoints(1))
+        if (p <= (resident + room) * 16) snap = p;
+    REQUIRE(snap > 0);
+    const int64_t drops = x.f.pc.stats().drops;
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
+    const int64_t back = engine_restore(x, b, turn(3, s.a, {}));
+    CHECK_EQ(back, std::max<int64_t>(0, snap / 16 - resident));
+    CHECK_EQ(x.f.pc.stats().drops, drops);          /* no VRAM copy given up: A's own, or B's */
+    const CacheHit hit = x.f.pc.lookup(s.a, {});
+    CHECK_EQ(hit.n_linear_tokens, (int32_t)snap);
+    CHECK_EQ(hit.n_attn_tokens, (int32_t)std::max<int64_t>(snap, resident * 16));
+    CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
+}
+
+/* A chain another waiting request holds is kept too: that request restored it and was refused,
+ * and taking it would only have its next attempt restore it again. */
+TEST(a_restore_does_not_take_a_chain_a_waiting_request_holds) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/false);
+    copy_now(x.t);                                  /* B is clean, so a trim could take it */
+    x.f.pc.hold(9, s.b, {});
+    const int64_t room = x.f.kv.total_blocks(G_FULL) - x.f.kv.held_blocks(G_FULL);
+    const int64_t drops = x.f.pc.stats().drops;
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), room);
+    CHECK_EQ(x.f.pc.stats().drops, drops);
+    CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
+
+    x.f.pc.release(9);
+    const int64_t rest = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), rest);
+    CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
+}
+
 /* Tools and tests build and tear down the tier executors and pools repeatedly, and on a card every
  * event is a hardware resource and every committed byte VRAM. A two-rank transfer pass gives back
  * every event and device byte it took. */
@@ -6097,7 +6367,7 @@ TEST(a_tier_transfer_gives_back_every_event_and_device_byte) {
     const int64_t events0 = rad_dev_live_events();
     int64_t vram0 = 0, vram1 = 0;
     CHECK_OK(dev_vram_used(0, &vram0));
-    run_transfer(2, /*fragment=*/true);
+    run_transfer({ 2, /*fragment=*/true });
     CHECK_EQ(rad_dev_live_events(), events0);
     CHECK_OK(dev_vram_used(0, &vram1));
     CHECK_EQ(vram1, vram0);

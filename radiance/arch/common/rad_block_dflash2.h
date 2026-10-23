@@ -69,10 +69,21 @@
  * q/kv and gate_up shard by row, o and down by column with an all-reduce: ten collectives per
  * draft pass, each 5120 * block * 2 bytes (80 KiB at block 8), below the lossy wire's floor.
  *
+ * fc              [n_embd, n_taps*n_embd], 262 MiB in fp8 at Qwen3.8's width, read whole by the
+ *                   context pass every step. Split by rows over the ranks and all-gathered, and
+ *                   kept bit for bit. Each rank hands over an equal share of c's columns
+ *                   (n_embd / world) and computes the fewest whole 128-row scale blocks that cover
+ *                   it (the 31B at tp 4: 1344 columns a rank inside 11 blocks, 1408 rows, against
+ *                   42 blocks whole), a row span of the one stored weight
+ *                   (DenseFP8::declare_slice), so no reconvert. The GEMM takes its K split from
+ *                   the whole width (OPS.md's `split_n`), so each output is summed as the unsplit
+ *                   fc sums it, and the all-gather reads each rank's window out of its wider rows
+ *                   (an input pitch) and writes c whole. A GEMM cannot write a column slice (the
+ *                   narrow fp8 kernel's store is tight), which is why the windows are the
+ *                   gather's to cut. One rank, or an fc off block fp8, keeps it whole.
+ *
  * Replicated:
  *
- *   fc              [n_embd, n_taps*n_embd], 262 MiB. Column-sharding would halve it but add an
- *                   all-reduce to the prefill path.
  *   conv weights    projection and base kernel, 26 MiB a layer. The convolution spans the whole
  *                   replicated hidden row, so every rank needs every coefficient.
  *   codebooks       [n_vocab, 256], 127 MiB each, gathered by global token id. Only 128 rows are
@@ -116,6 +127,9 @@ struct Dflash2 {
         /* The target's embedding scale, applied to the query block as the drafter was trained
          * (dflash_config.input_embedding_scale): 1 for Qwen, sqrt(hidden) in bf16 for Gemma. */
         double  escale   = 1.0;
+        /* Bytes of the next GEMM's weight read into the cache beside each all-reduce of the query
+         * pass (prefetch_beside, rad_arch.h); 0 reads none. */
+        int64_t prefetch = 0;
         int64_t steps() const { return block - 1; }
         int64_t ng(int64_t n_embd) const { return group ? n_embd / group : 0; }
         /* The kernel projection emits [2, taps, NG] per token (prepare's set, then finish's);
@@ -127,6 +141,10 @@ struct Dflash2 {
         /* the context pass */
         rad_buf src  = 0;   /* [max_tok, n_taps * n_embd]  the trunk's taps, read only */
         rad_buf c    = 0;   /* [max_tok, n_embd]           fc's output, then normed in place */
+        /* [max_tok, fc_rows]  the block-aligned rows of a split fc this rank computes, whose
+         * fc_share-wide window at fc_off is gathered into c. The block declares it (only when it
+         * splits fc); leave it 0. */
+        rad_buf cpart = 0;
         /* K and V are separate buffers because of the per-head k norm: `rmsnorm` takes one row
          * pitch, and K heads inside a fused [K|V] row are head_dim apart within a token but
          * 2*kv_dim apart between tokens. libr4d refuses such an operand (libr4d/r4d_model.cpp,
@@ -191,10 +209,17 @@ struct Dflash2 {
      * MXFP4 accepts ~1% fewer tokens per step than fp8 and saves ~1.5 ms of a ~34 ms step.
      * Quantisation can only change acceptance, since every draft is verified. */
     DenseFP8   w_fc{};
+    /* fc split by rows (see SHARDING): w_fc is this rank's fc_rows block-aligned rows, holding its
+     * fc_share output columns at row fc_off. fc_rows 0: w_fc is the whole fc, replicated. */
+    int64_t    fc_share = 0, fc_rows = 0, fc_off = 0;
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_selp = 0, w_pred = 0, w_succ = 0;
     rad_weight w_tok = 0;                    /* the target's embedding table */
-    rad_weight w_dh = 0, w_dhs = 0;          /* the 2-bit copy of the target's lm_head */
+    rad_weight w_dh = 0, w_dhs = 0;          /* the 2-bit (or 8-bit) copy of the target's lm_head */
+    /* The copy is int8 with an f16 scale per (row, 128 of K) where the recipe made it so (the
+     * 31B's: the head read at w8a8, so the selector sees the candidates an 8-bit head ranks), and
+     * the 2-bit grid otherwise. Set by declare from the copy's encoding. */
+    bool       head_i8 = false;
 
     /* per-layer weights */
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
@@ -209,7 +234,11 @@ struct Dflash2 {
 
     /* context-pass ops */
     rad_op op_cfc = 0, op_cnorm = 0, op_crope = 0, op_cstore = 0;
+    rad_op op_cgath = 0;   /* the split fc's all-gather */
     rad_op op_ck[MAX_LAYERS] = {}, op_cv[MAX_LAYERS] = {}, op_cknorm[MAX_LAYERS] = {};
+    /* The k norm, the k rotary and the cache store as one launch a layer (qkv_norm_rope_kv_store
+     * with n_head 0 and v_norm 0), issued in place of those three where it resolves. */
+    rad_op op_cqkr[MAX_LAYERS] = {};
 
     /* Activation quantisers, one per activation that feeds a linear. Weightless, so one declaration
      * serves every layer; ops with weights are per layer because a weight's prefetch interval
@@ -225,11 +254,26 @@ struct Dflash2 {
     rad_op op_qp[MAX_LAYERS] = {}, op_kp[MAX_LAYERS] = {}, op_vp[MAX_LAYERS] = {};
     rad_op op_op[MAX_LAYERS] = {};
     rad_op op_qn[MAX_LAYERS] = {}, op_kn[MAX_LAYERS] = {};
+    /* The q and k norms, both rotaries and the cache store as one launch a layer
+     * (qkv_norm_rope_kv_store with v_norm 0), issued in place of those five where it resolves. */
+    rad_op op_qkr[MAX_LAYERS] = {};
     rad_op op_gu[MAX_LAYERS] = {}, op_dn[MAX_LAYERS] = {};
     rad_op op_gug[MAX_LAYERS] = {};   /* the gate_up|silu|quant fold; 0 when nothing serves it */
     rad_op op_aconv[MAX_LAYERS] = {}, op_fconv[MAX_LAYERS] = {};
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn = 0;
     rad_op op_act = 0, op_ar = 0, op_add = 0, op_final = 0;
+    /* The residual add folded into the norm after it (add_rmsnorm), issued in place of op_add and
+     * that norm where it resolves: op_afn[i] after layer i's attention (its feed-forward norm),
+     * op_aan[i] after layer i-1's feed-forward (layer i's attention norm, i >= 1), op_afinal after
+     * the last layer's (the final norm). All or none. */
+    rad_op op_afn[MAX_LAYERS] = {}, op_aan[MAX_LAYERS] = {}, op_afinal = 0;
+    /* The reads beside the query pass's all-reduces (cfg.prefetch), each the GEMMs that follow
+     * in their order: beside the attention's, the feed-forward's coefficient projection, then
+     * gate_up; beside the feed-forward's, the next layer's attention coefficient projection, then
+     * its q -- after the last layer, the draft head; and o's beside the attention itself. 0 where
+     * none is declared. */
+    rad_op     op_pfa[MAX_LAYERS][2] = {}, op_pff[MAX_LAYERS][2] = {}, op_pfo[MAX_LAYERS] = {};
+    rad_weight pfa_w[MAX_LAYERS][2] = {}, pff_w[MAX_LAYERS][2] = {}, pfo_w[MAX_LAYERS] = {};
 
     /* head and selector */
     rad_op op_gather = 0, op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
@@ -284,9 +328,38 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     if (qrows <= 0 || srows <= 0) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- model-scope weights */
-    RAD_ARCH_TRY(w_fc.declare(b, nm, nm.f("dflash.fc"), g.n_embd, cfg.n_taps * g.n_embd,
-                              RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model(),
-                              { nm.ckpt("%s.fc.weight", ck) }));
+    {
+        const int64_t K   = cfg.n_taps * g.n_embd;
+        const char*   fwn = nm.f("dflash.fc.weight");
+        RAD_ARCH_TRY(map_linear(b, fwn, { nm.ckpt("%s.fc.weight", ck) }));
+        /* Split only block fp8 (an MXFP4 GEMM's K split is its own), into equal shares of whole
+         * 16-byte words (the gather's unit). */
+        RadEncoding  fe{};
+        const RadEncPlane* fsc = nullptr;
+        const bool fp8 = weight_enc(b, fwn, &fe) && rad_enc_is(&fe, "affine") && fe.n_planes == 2 &&
+                         !fe.transform[0] && fe.plane[0].dtype == RAD_F8E4M3 &&
+                         (fsc = rad_enc_plane(&fe, "scale")) && fsc->block[0] == RAD_FP8_BLOCK &&
+                         fsc->block[1] == RAD_FP8_BLOCK;
+        const int64_t share = (g.world > 1 && g.n_embd % RAD_FP8_BLOCK == 0 &&
+                               g.n_embd % g.world == 0 && (g.n_embd / g.world) % 8 == 0)
+                                  ? g.n_embd / g.world : 0;
+        if (fp8 && share > 0) {
+            const int64_t B  = RAD_FP8_BLOCK;
+            const int64_t lo = share * g.rank / B * B;
+            const int64_t hi = (share * (g.rank + 1) + B - 1) / B * B;
+            fc_share = share;
+            fc_rows  = hi - lo;
+            fc_off   = share * g.rank - lo;
+            RAD_ARCH_TRY(w_fc.declare_slice(b, nm, nm.f("dflash.fc"), fwn, lo, hi, K,
+                                            RAD_ACCESS_PER_TOKEN, grp_model()));
+            if (!w.cpart)
+                w.cpart = decl_b(b, nm.f("df_cpart"), g.act_dtype, { g.max_tok, fc_rows });
+        } else {
+            RAD_ARCH_TRY(w_fc.declare(b, nm, nm.f("dflash.fc"), g.n_embd, K, RAD_ACCESS_PER_TOKEN,
+                                      RAD_SHARD_NONE, grp_model(), { nm.ckpt("%s.fc.weight", ck) },
+                                      {}, true));
+        }
+    }
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.hidden_norm.weight"), nm.ckpt("%s.hidden_norm.weight", ck)));
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.norm.weight"),        nm.ckpt("%s.norm.weight", ck)));
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_proj.weight"),
@@ -321,10 +394,28 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     const int  dh_split = dh_shard ? RAD_SHARD_ROW : RAD_SHARD_NONE;
     const char* dhn = nm.f("dflash.draft_head.weight");
     RAD_ARCH_TRY(map_copy(b, dhn, ck_lm));
-    w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
-    w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
-                      {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+    /* The 8-bit form: int8 codes, one f16 scale per (row, 128 of K), symmetric, which gemm_nt_q
+     * reads at w8a8 against the same quant_act_i8 activation (without its asum). */
+    {
+        RadEncoding e{};
+        const RadEncPlane* sc = nullptr;
+        head_i8 = weight_enc(b, dhn, &e) && rad_enc_is(&e, "affine") && e.n_planes == 2 &&
+                  !e.transform[0] && e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 &&
+                  (sc = rad_enc_plane(&e, "scale")) && sc->dtype == RAD_F16 &&
+                  sc->block[0] == 1 && sc->block[1] == DF_W2_GROUP;
+    }
+    if (head_i8) {
+        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_I8, {head_rows(g), g.n_embd},
+                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale", RAD_F16,
+                          {head_rows(g), g.n_embd / DF_W2_GROUP}, RAD_ACCESS_PER_TOKEN, dh_split,
+                          grp_model());
+    } else {
+        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
+                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
+                          {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+    }
     if (!w_dh || !w_dhs) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- per-layer weights */
@@ -422,7 +513,21 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.src}, {w.srcq, w.srcs});
-    op_cfc = w_fc.gemm(b, crows, g.n_embd, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.c});
+    if (fc_rows) {
+        /* The split (SHARDING above): this rank's block-aligned rows into `cpart`, its window of
+         * them gathered into `c`. The GEMM takes its K split from the whole width. The gather
+         * rides the trunk's all-reduce instance (the same numel bound, so the same instance). */
+        op_cfc = w_fc.gemm(b, crows, fc_rows, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.cpart},
+                           g.n_embd);
+        op_cgath = rw(b, RAD_OP(b, "all_gather",
+                         RAD_PARAMS(RAD_INT("world_size", g.world),
+                                    RAD_INT("numel", crows * g.n_embd),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("row", fc_share)),
+                         RAD_NOWEIGHTS),
+                     {w.cpart}, {w.c});
+    } else {
+        op_cfc = w_fc.gemm(b, crows, g.n_embd, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.c});
+    }
     /* In place, like the per-head q/k norms below: a row's scale is computed before the row is
      * written. */
     op_cnorm = rw(b, RAD_OP(b, "rmsnorm",
@@ -600,6 +705,62 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                 RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
                  {w.k, w.v}, {});
+    /* The query pass's q/k norms, rotaries and store as one launch a layer where a library
+     * serves it: qkv_norm_rope_kv_store with v_norm 0 (v stored as it is), byte-identical to the
+     * two rmsnorms, the two ropes and kv_store (docs/OPS.md), which stay declared beside it for
+     * a library that does not. No YaRN (the fold takes none). */
+    {
+        /* Only for a shape a library serves: an op declared for one that resolves to no device
+         * kernel is a hole that refuses startup (Program::device_holes), whether or not it is
+         * issued, so the block asks within libr4d's span for the fold (head_dim 256 to 512 in
+         * steps of 256, bf16 rows, an fp8 or bf16 cache). Qwen3.8's DFlash2 drafter (head_dim
+         * 128) keeps the chain. */
+        const bool fold_shape = g.head_dim >= 256 && g.head_dim <= 512 && g.head_dim % 256 == 0 &&
+                                !std::strcmp(g.dtype, "bf16") &&
+                                (!std::strcmp(g.kv_dtype, "fp8_e4m3") ||
+                                 !std::strcmp(g.kv_dtype, "bf16"));
+        if (fold_shape && g.yarn.factor == 0.0f &&
+            rad_op_declared(b, "qkv_norm_rope_kv_store")) {
+            const int64_t bsz = rad_kv_block_size(b, kv);
+            for (int64_t l = 0; l < g.n_layer; ++l) {
+                const int i = (int)l;
+                op_qkr[i] = RAD_OP(b, "qkv_norm_rope_kv_store",
+                               RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
+                                          RAD_INT("n_head", g.n_head),
+                                          RAD_INT("n_head_kv", g.n_head_kv),
+                                          RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
+                                          RAD_F64("scale", g.rope_scale), RAD_STR("mode", "neox"),
+                                          RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype),
+                                          RAD_INT("v_norm", 0), RAD_INT("block_size", bsz),
+                                          RAD_STR("kv_dtype", g.kv_dtype)),
+                               RAD_WEIGHTS(w_qn[i], w_kn[i]));
+                if (!op_qkr[i] || !rad_op_resolved(b, op_qkr[i])) {
+                    for (int j = 0; j <= i; ++j) op_qkr[j] = 0;
+                    break;
+                }
+                op_qkr[i] = rw(b, op_qkr[i], {w.q, w.k, w.v}, {w.q, w.k, w.v});
+            }
+            /* The context pass's keys the same way: no q (n_head 0, `q` passed as k's buffer and
+             * `q_w` as k's norm, neither read), the context rows' slots. */
+            for (int64_t l = 0; op_qkr[0] && l < g.n_layer; ++l) {
+                const int i = (int)l;
+                op_cqkr[i] = RAD_OP(b, "qkv_norm_rope_kv_store",
+                                RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("head_dim", g.head_dim),
+                                           RAD_INT("n_head", 0), RAD_INT("n_head_kv", g.n_head_kv),
+                                           RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
+                                           RAD_F64("scale", g.rope_scale), RAD_STR("mode", "neox"),
+                                           RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype),
+                                           RAD_INT("v_norm", 0), RAD_INT("block_size", bsz),
+                                           RAD_STR("kv_dtype", g.kv_dtype)),
+                                RAD_WEIGHTS(w_kn[i], w_kn[i]));
+                if (!op_cqkr[i] || !rad_op_resolved(b, op_cqkr[i])) {
+                    for (int j = 0; j <= i; ++j) op_cqkr[j] = 0;
+                    break;
+                }
+                op_cqkr[i] = rw(b, op_cqkr[i], {w.ck, w.cv}, {w.ck});
+            }
+        }
+    }
     op_act = rw(b, RAD_OP(b, "silu_mul",
                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_ff),
                               RAD_STR("dtype", g.dtype)),
@@ -624,6 +785,30 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                 RAD_STR("dtype", g.dtype)),
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.h});
+    /* Each residual add and the norm after it as one launch where a library serves add_rmsnorm
+     * (byte-identical to the pair: the norm is taken over the bf16 sum it stores), taken only
+     * where every handle resolves (rad_op_resolved), all or none; the pairs declared beside it run
+     * otherwise. */
+    if (rad_op_declared(b, "add_rmsnorm")) {
+        auto an = [&](rad_weight wt) -> rad_op {
+            const rad_op h = RAD_OP(b, "add_rmsnorm",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
+                                               RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_WEIGHTS(wt));
+            return h && rad_op_resolved(b, h) ? rw(b, h, {w.x, w.h2}, {w.x, w.h}) : (rad_op)0;
+        };
+        bool all = true;
+        for (int64_t l = 0; all && l < g.n_layer; ++l) {
+            const int i = (int)l;
+            op_afn[i] = an(w_fnorm[i]);
+            if (l > 0) op_aan[i] = an(w_anorm[i]);
+            all = op_afn[i] && (l == 0 || op_aan[i]);
+        }
+        op_afinal = all ? an(w_norm) : 0;
+        if (!op_afinal)
+            for (int i = 0; i < MAX_LAYERS; ++i) op_afn[i] = op_aan[i] = 0;
+    }
 
     /* ---------------------------------------------------------------- the head and the selector
      *
@@ -643,12 +828,19 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                  RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.sel_h}, {w.dq, w.ds, w.dsum});
-    op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                       RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                                  RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
-                                  RAD_STR("dtype", "w2a8")),
-                       RAD_WEIGHTS(w_dh, w_dhs)),
-                   {w.dq, w.ds, w.dsum}, {w.dlog});
+    op_dlogits = head_i8
+        ? rw(b, RAD_OP(b, "gemm_nt_q",
+                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
+                           RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
+                           RAD_STR("dtype", "w8a8")),
+                RAD_WEIGHTS(w_dh, w_dhs)),
+             {w.dq, w.ds}, {w.dlog})
+        : rw(b, RAD_OP(b, "gemm_nt_q",
+                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
+                           RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
+                           RAD_STR("dtype", "w2a8")),
+                RAD_WEIGHTS(w_dh, w_dhs)),
+             {w.dq, w.ds, w.dsum}, {w.dlog});
     /* Sharded, the top-R runs over this rank's plane, reports global ids and also writes the pair
      * plane the gather moves. Replicated, `vocab_off` is omitted: an optional parameter present
      * with value 0 is a different declaration from an absent one. */
@@ -718,6 +910,22 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                    RAD_WEIGHTS(w_pred, w_succ)),
                {w.cand, w.unary, w.hp}, {w.tokens});
 
+    /* The reads beside the all-reduces, after every weight they read is declared. */
+    if (op_ar && cfg.prefetch > 0)
+        for (int64_t l = 0; l < g.n_layer; ++l) {
+            const int i = (int)l;
+            pfa_w[i][0] = w_fcp[i];
+            pfa_w[i][1] = w_gu[i].w;
+            pff_w[i][0] = l + 1 < g.n_layer ? w_acp[i + 1] : w_dh;
+            pff_w[i][1] = l + 1 < g.n_layer ? w_q[i + 1].w : 0;
+            for (int j = 0; j < 2; ++j) {
+                op_pfa[i][j] = decl_prefetch(b, pfa_w[i][j], cfg.prefetch);
+                op_pff[i][j] = decl_prefetch(b, pff_w[i][j], cfg.prefetch);
+            }
+            pfo_w[i]  = w_o[i].w;
+            op_pfo[i] = decl_prefetch(b, pfo_w[i], cfg.prefetch);
+        }
+
     return RAD_OK;
 }
 
@@ -731,8 +939,14 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
 
     /* As wide as the prefill chunk, one launch per op (the fp8a8 pair covers every M). */
     RAD_ISSUE_N(c, op_qsrc, T, brows(w.src, T), brows(w.srcq, T), brows(w.srcs, T));
-    RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
-                brows(w.c, T), RAD_NONE, w_fc.bref());
+    if (fc_rows) {
+        RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
+                    brows(w.cpart, T), RAD_NONE, w_fc.bref());
+        RAD_ISSUE_N(c, op_cgath, T, bcol(w.cpart, fc_off, fc_share, T), brows(w.c, T));
+    } else {
+        RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
+                    brows(w.c, T), RAD_NONE, w_fc.bref());
+    }
     RAD_ISSUE_N(c, op_cnorm, T, brows(w.c, T), RAD_W(w_hnorm), brows(w.c, T));
     RAD_ISSUE_N(c, op_qc, T, brows(w.c, T), brows(w.cq, T), brows(w.cs, T));
 
@@ -742,6 +956,12 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.ck, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_cv[i], T, brows(w.cq, T), brows(w.cs, T),
                     RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.cv, T), RAD_NONE, w_v[i].bref());
+        if (op_cqkr[i]) {
+            RAD_ISSUE_N(c, op_cqkr[i], T, brows(w.ck, T), brows(w.ck, T), brows(w.cv, T),
+                        praw(batch->positions, RAD_I32, T), RAD_W(w_kn[i]), RAD_W(w_kn[i]),
+                        praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+            continue;
+        }
         RAD_ISSUE_N(c, op_cknorm[i], T * g.n_head_kv,
                     brows(w.ck, T), RAD_W(w_kn[i]), brows(w.ck, T));
         RAD_ISSUE_N(c, op_crope, T, brows(w.ck, T), praw(batch->positions, RAD_I32, T));
@@ -767,11 +987,23 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.x, T), RAD_NONE);
 
+    /* x += h2 waits for the norm after it, which takes it in (add_rmsnorm) where declared */
+    bool add_pending = false;
+    auto norm = [&](rad_op plain, rad_op folded, rad_weight wt) {
+        if (add_pending && folded) {
+            RAD_ISSUE_N(c, folded, T, brows(w.x, T), brows(w.h2, T), RAD_W(wt), brows(w.h, T));
+        } else {
+            if (add_pending) RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h2, T), brows(w.x, T));
+            RAD_ISSUE_N(c, plain, T, brows(w.x, T), RAD_W(wt), brows(w.h, T));
+        }
+        add_pending = false;
+    };
+
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
 
         /* ---- attention, wrapped in the two halves of one convolution */
-        RAD_ISSUE_N(c, op_anorm[i], T, brows(w.x, T), RAD_W(w_anorm[i]), brows(w.h, T));
+        norm(op_anorm[i], op_aan[i], w_anorm[i]);
         RAD_ISSUE_N(c, op_acoef[i], T, brows(w.h, T), RAD_W(w_acp[i]), brows(w.coef, T));
         RAD_ISSUE_N(c, op_aconv[i], T, brows(w.h, T), bcol(w.coef, 0, half, T),
                     wrow_slice(w_acb[i], 0, 1, cfg.taps * g.n_embd), brows(w.h2, T));
@@ -783,13 +1015,20 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_vp[i], T, brows(w.h2q, T), brows(w.h2s, T),
                     RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, w_v[i].bref());
-        RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
-        RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv,
-                    brows(w.k, T), RAD_W(w_kn[i]), brows(w.k, T));
-        RAD_ISSUE_N(c, op_qrope, T, brows(w.q, T), praw(batch->positions, RAD_I32, T));
-        RAD_ISSUE_N(c, op_krope, T, brows(w.k, T), praw(batch->positions, RAD_I32, T));
-        RAD_ISSUE_N(c, op_store, T, brows(w.k, T), brows(w.v, T),
-                    praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+        prefetch_beside(c, op_pfo[i], pfo_w[i], T);
+        if (op_qkr[i]) {
+            RAD_ISSUE_N(c, op_qkr[i], T, brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                        praw(batch->positions, RAD_I32, T), RAD_W(w_qn[i]), RAD_W(w_kn[i]),
+                        praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+        } else {
+            RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
+            RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv,
+                        brows(w.k, T), RAD_W(w_kn[i]), brows(w.k, T));
+            RAD_ISSUE_N(c, op_qrope, T, brows(w.q, T), praw(batch->positions, RAD_I32, T));
+            RAD_ISSUE_N(c, op_krope, T, brows(w.k, T), praw(batch->positions, RAD_I32, T));
+            RAD_ISSUE_N(c, op_store, T, brows(w.k, T), brows(w.v, T),
+                        praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+        }
         RAD_ISSUE_N(c, op_attn, batch->max_q_len,
                     brows(w.q, T), kv_cache(kv, first_layer + i),
                     praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
@@ -800,16 +1039,17 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_qat, T, brows(w.attn, T), brows(w.atq, T), brows(w.ats, T));
         RAD_ISSUE_N(c, op_op[i], T, brows(w.atq, T), brows(w.ats, T),
                     RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h, T), RAD_NONE, w_o[i].bref());
+        for (int j = 0; j < 2; ++j) prefetch_beside(c, op_pfa[i][j], pfa_w[i][j], T);
         /* Reduce before the closing convolution. It is linear with coefficients from the
          * replicated norm, so either order gives the same result; reducing first keeps x's
          * update agreed across ranks. */
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_aconv[i], T, brows(w.h, T), bcol(w.coef, half, half, T),
                     wrow_slice(w_acb[i], 1, 1, cfg.taps * g.n_embd), brows(w.h2, T));
-        RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h2, T), brows(w.x, T));
+        add_pending = true;
 
         /* ---- the feed-forward, wrapped in the other convolution */
-        RAD_ISSUE_N(c, op_fnorm[i], T, brows(w.x, T), RAD_W(w_fnorm[i]), brows(w.h, T));
+        norm(op_fnorm[i], op_afn[i], w_fnorm[i]);
         RAD_ISSUE_N(c, op_fcoef[i], T, brows(w.h, T), RAD_W(w_fcp[i]), brows(w.coef, T));
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, 0, half, T),
                     wrow_slice(w_fcb[i], 0, 1, cfg.taps * g.n_embd), brows(w.h2, T));
@@ -826,13 +1066,14 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         }
         RAD_ISSUE_N(c, op_dn[i], T, brows(w.ffq, T), brows(w.ffs, T),
                     RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h, T), RAD_NONE, w_dn[i].bref());
+        for (int j = 0; j < 2; ++j) prefetch_beside(c, op_pff[i][j], pff_w[i][j], T);
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, half, half, T),
                     wrow_slice(w_fcb[i], 1, 1, cfg.taps * g.n_embd), brows(w.h2, T));
-        RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h2, T), brows(w.x, T));
+        add_pending = true;
     }
 
-    RAD_ISSUE_N(c, op_final, T, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+    norm(op_final, op_afinal, w_norm);
 
     /* The predicting rows, `steps` per sequence, named by the scheduler through out_ids. */
     const int64_t S = batch->n_out;
@@ -843,9 +1084,10 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
      * whole. */
     RAD_ISSUE_N(c, op_dquant, S, brows(w.sel_h, S), brows(w.dq, S), brows(w.ds, S), RAD_B(w.dsum));
     /* The trailing operand is mxfp4's optional reference, absent here. Operands are positional,
-     * so an absent optional one is RAD_NONE, not a shorter list. */
+     * so an absent optional one is RAD_NONE, not a shorter list. The 8-bit head is symmetric and
+     * takes no asum. */
     RAD_ISSUE_N(c, op_dlogits, S, brows(w.dq, S), brows(w.ds, S), RAD_W(w_dh), RAD_W(w_dhs),
-                brows(w.dlog, S), RAD_B(w.dsum), RAD_NONE);
+                brows(w.dlog, S), head_i8 ? RAD_NONE : RAD_B(w.dsum), RAD_NONE);
     /* RAD_NONE fills the unused `pairs` slot. Sharded, this rank's top-R are only candidates and
      * the merge overwrites `cand`/`unary`. */
     if (op_dmerge) {

@@ -65,6 +65,23 @@ struct R4DArgs {
     // null.
     const int* cu_q;            // (num_seqs+1,) int32 device, or null for a uniform q_len
     int  total_q;               // rows of q/out; ignored unless cu_q is set
+
+    // ---- Views the split-KV decode kernel reads (r4d_attn_decode_h256_gqa6.hip); every other
+    // kernel leaves them at zero and reads q dense with one cache head per query group.
+    //
+    // `q_ld` is the element distance between q rows, 0 for dense (q_heads * head_dim): the q part
+    // of a fused [q|k|v] projection read where it lies (attn_paged_qrow). A multiple of 4.
+    //
+    // `kv_rep` maps query groups onto cache heads: group g (q heads g*GQA .. g*GQA+GQA-1) reads
+    // cache head g / kv_rep, and the descales are per cache head. kv_heads then counts the groups
+    // (q_heads / GQA) and the cache holds kv_heads / kv_rep heads. 0 or 1 is one head a group. It
+    // runs a gqa of GQA * kv_rep on the kernel compiled for GQA, whose workgroup holds at most 64
+    // rows of q_len * GQA: the 31B's DFlash drafter, gqa 8 at a block of 16, on the gqa-4 kernel.
+    long q_ld;
+    int  kv_rep;
+    // The engine's chained launch (RadKernelChainFn, r4d_chain.h): the decode path launches its
+    // chained forms. fill_paged sets it from the resolved `chain` parameter.
+    int  chain;
 };
 
 // Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook
@@ -89,6 +106,9 @@ int  r4d_attn_decode_h256_gqa6_bf16kv (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa4_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa4_bf16kv (const R4DArgs* a, hipStream_t stream);
 long r4d_attn_decode_h128_gqa4_scratch_bytes(const R4DArgs* a);
+// ...with R4DArgs::kv_rep and q_ld read: a gqa of 4 * kv_rep over a cache of kv_heads / kv_rep.
+int  r4d_attn_decode_h128_gqa4_rep_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h128_gqa4_rep_bf16kv (const R4DArgs* a, hipStream_t stream);
 // Bytes of split-KV partial buffer one decode launch of this shape needs. Independent of the cache
 // dtype: the partials are f16 either way.
 long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
@@ -106,6 +126,9 @@ int  r4d_attn_prefill_h128_gqa2w_bf16kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa2w_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa2w_bf16kv (const R4DArgs* a, hipStream_t stream);
 long r4d_attn_decode_h128_gqa2w_scratch_bytes(const R4DArgs* a);
+// ...with q at R4DArgs::q_ld (attn_paged_qrow).
+int  r4d_attn_decode_h256_gqa2_qld_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h256_gqa2_qld_bf16kv (const R4DArgs* a, hipStream_t stream);
 // The geometry the attention kernels above are compiled for, so a caller can check a model
 // before the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
@@ -309,7 +332,8 @@ void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit
 void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream, long nblocks,
-                         long nthreads, long drain, long acq);
+                         long nthreads, long drain, long acq, long dpitch,
+                         long spitch);
 
 // ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
 // The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). Peer arguments are in ascending
@@ -343,7 +367,8 @@ void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1, long peer_flags
                          long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
                          long slot_stride16, long inp, long out, long n_elem, long dtype,
                          long rank, long row_elems, long stream, long nblocks, long nthreads,
-                         long drain, long acq, long pub);
+                         long drain, long acq, long pub, long dpitch,
+                         long spitch);
 void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -406,7 +431,18 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr);
+                                long acq, long pub, long gate, long gate_ctr, long chain);
+// The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
+// same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
+// and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.
+int r4d_ar_twoshot_coded_ok(long n_elem, long dtype, long world, long slot_stride16);
+void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                      long peer_flags0, long peer_flags1, long peer_flags2,
+                                      long my_scratch, long my_flags, long seq_ctrs,
+                                      long slot_stride16, long inp, long out, long n_elem,
+                                      long rank, long stream, long nblocks, long nthreads,
+                                      long drain, long acq, long pub, long gate, long gate_ctr,
+                                      long chain);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -415,7 +451,12 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub,
-                                const int* shard_weights, long pieces);
+                                const int* shard_weights, long pieces, long timeline,
+                                long form);
+// `form` is R4D_AR8_FORM_* (r4d_ar_shards.h), the same on every rank: lockstep, ring or split,
+// all with the same bits. `timeline`, a diagnostic, is 0 or a device buffer of nblocks * R4D_AR_TL_WORDS int64 that every
+// block of the eight-rank two-shot fills with wall-clock stamps (r4d_ar_wide.h): its start, each
+// handshake's arrival and release, its end. r4d_selftest --perfar8 with --timeline reads it.
 // The tiered int8 wire on both two-shot hops (r4d_ar_twoshot_Nrank_ti8.hip; codec in
 // r4d_ar_ti8.h), 3 or 4 ranks. Int8 groups of 32 with an fp16 scale and a per-group record
 // (T1 plain, T2 top-1-exact, T3 wht32), 38 bytes/group; tiering is deterministic and
@@ -713,6 +754,15 @@ int  r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int
                            int q_ld, int s_ld, long stream);
 int  r4d_gated_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
                          int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
+// The two above with had_quant_act_i8g's quantiser on the pass instead (the `_had_quant_i8g`
+// forms): the width-128 Hadamard, then int8 codes at amax / 127 per (row, 128), for a weight at
+// i8a8h. `q` is int8, `n` a multiple of 128, and `y` keeps the unrotated bf16 value. The codes
+// are the producer + had_quant_act_i8g pair's bytes.
+int  r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long q, long s, int M, int n,
+                               float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
+                               int q_ld, int s_ld, long stream);
+int  r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, int n, int mode,
+                             int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
 // The activation is rounded to bf16 before the product, matching the unfused `sigmoid` then `mul`
 // pair with a bf16 buffer between them.
 // The same epilogue with the gate in a different buffer from what it scales, as in gated
@@ -738,6 +788,15 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int nblocks, int nthreads, int drain, int acq, int wire,
                               long loc_pack, long loc_scale_off, long wp = 0);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
+// Its rotated int8 form, as r4d_rmsnorm_had_quant_i8g: the reduction and the norm unchanged, the
+// norm's pass quantised by had_quant_act_i8g's rule. No post-norm.
+int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_flags,
+                                  long my_flags, long seq_ctrs, long slot_stride16,
+                                  long x, long res, long w, long y, long q, long s,
+                                  int M, int n, float eps, float wadd, int w_f32,
+                                  int r_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                  int nblocks, int nthreads, int drain, int acq, int wire,
+                                  long loc_pack, long loc_scale_off);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8
@@ -747,6 +806,22 @@ int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags
                              long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
                              int drain, int acq);
+// ...and at four ranks, on the wide family's transport: r4d_ar_oneshot_4rank_exact's IPC
+// arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
+// engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h), and, with
+// `tail_nbt` blocks (positive), the standalone two-shot on that many with the junction as its tail,
+// counting on the two words at `tail_ctr` (ar_rmsnorm_quant_i8_tail_kernel). With `sp` 1 or 2 the
+// all-reduce split around the junction instead (ar_rmsnorm_quant_i8_sp_kernel): q and S on every
+// row, the residual on this rank's rows (every row at 2), `x` left as it came.
+int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                   long peer_flags0, long peer_flags1, long peer_flags2,
+                                   long my_scratch, long my_flags, long seq_ctrs,
+                                   long slot_stride16, long x, long res, long w, long wp, long sc,
+                                   int sc_f32, long y, long q, long s, int M, int n, float eps,
+                                   float wadd, int w_f32, int r_ld, int y_ld, int rank,
+                                   long stream, int nblocks, int drain, int acq, int pub,
+                                   long gate, long gate_ctr, long tail_ctr, int tail_nbt,
+                                   int chain, int sp);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //
@@ -895,6 +970,9 @@ int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_rope_heads, 
 // that compares neighbouring probabilities. K must be a multiple of 8.
 int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N, int a_ld, int c_ld,
                          long stream);
+// The same bytes from a wave per four vocabulary columns; K must be 4096.
+int r4d_logits_gemm_bf16_cols(long a, long w, long c, int M, int K, int N, int a_ld, int c_ld,
+                              long stream);
 // Scatter into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim]: K at [.., d], V at
 // [.., head_dim + d], slot decomposing as block = slot / block_size, offset = slot % block_size.
 int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim, int kv_heads,
