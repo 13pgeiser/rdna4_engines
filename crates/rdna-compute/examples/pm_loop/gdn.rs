@@ -56,7 +56,8 @@
 
 use crate::common::{
     emitted_object, emu_run, f32_unit_bytes, no_leftover, put_f32, put_i32, put_ptr, put_u32,
-    refused, shipped_object, take_dim, Elem, EmuBuf, ShapeSpec, Xs64,
+    read_rip, refused, rip_object, shipped_object, take_dim, Elem, EmuBuf, RipSource, ShapeSpec,
+    Xs64,
 };
 use crate::prod::{self, Expect, OutBuf, Producer, Ptrs};
 use crate::workload::{Knobs, Launch, Object, Result, Workload};
@@ -225,19 +226,38 @@ fn parse_shape(shape: &str) -> Result<(usize, Option<(&'static str, &'static str
     Ok((t, (!overridden).then_some((name, source))))
 }
 
+#[cfg(test)]
 pub fn new(shape: &str, _knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
+    new_with_rip(shape, _knobs, None)
+}
+
+pub fn new_with_rip(
+    shape: &str,
+    _knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
     let (rows, preset) = parse_shape(shape)?;
-    Ok(prod::boxed(Gdn { rows, preset }))
+    Ok(prod::boxed(Gdn {
+        rows,
+        preset,
+        rip: read_rip(rip)?,
+    }))
 }
 
 struct Gdn {
     rows: usize,
     preset: Option<(&'static str, &'static str)>,
+    /// `--rip`: the candidate is this script's kernel, not the Rust emit.
+    rip: RipSource,
 }
 
 impl Gdn {
     fn at(rows: usize) -> Self {
-        Self { rows, preset: None }
+        Self {
+            rows,
+            preset: None,
+            rip: None,
+        }
     }
 
     /// Both arms' outputs of one emulated launch, in `outputs()` order.
@@ -359,6 +379,16 @@ impl Producer for Gdn {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some(rip) = &self.rip {
+            return rip_object(
+                rip,
+                Arch::Gfx1201,
+                "chunk_prep",
+                gdn_chunk_prep::SYMBOL,
+                &gdn_chunk_prep::emit(Arch::Gfx1201, &GdnChunkPrepSpec::A3B)?.s_text,
+                self.knobs_json(),
+            );
+        }
         let (_, text, _) = gdn_chunk_prep::emit_module(Arch::Gfx1201, &GdnChunkPrepSpec::A3B)?;
         emitted_object(
             &text,
@@ -624,6 +654,28 @@ mod tests {
 
     /// The emulator either runs candidate and shipped object to the same bytes or refuses
     /// by name; it never reports a mismatch.
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/gdn_chunk_prep.rip");
+
+    #[test]
+    fn rip_twin_is_the_candidate_and_identical_to_the_generator() {
+        let mut g = Gdn::at(64);
+        g.rip = Some(("twin.rip".into(), TWIN.into()));
+        let o = g.candidate().unwrap();
+        assert_eq!(o.launch_symbol, gdn_chunk_prep::SYMBOL);
+        assert_eq!(o.desc["rip"]["identical_to_generator"], true);
+        assert_eq!(o.desc["rip"]["variant"], "chunk_prep");
+        // A twin edited so the gate loop's block is dropped changes the program but keeps the ABI.
+        let edited = TWIN.replace(
+            "    prod::wait_all(&mut b)?;\n    prod::label(&mut b, gdn::label(\"end\")?)?;",
+            "    prod::label(&mut b, gdn::label(\"end\")?)?;",
+        );
+        assert_ne!(edited, TWIN);
+        g.rip = Some(("edited.rip".into(), edited));
+        if let Ok(o) = g.candidate() {
+            assert_eq!(o.desc["rip"]["identical_to_generator"], false);
+        }
+    }
+
     #[test]
     fn emu_matches_the_shipped_object_or_refuses() {
         let mut k = Knobs::default();

@@ -615,13 +615,6 @@ pub fn forward_census_scope(
         has(LayerType::FullAttention),
     );
     let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
-    if compact && has_gdn && !has_qsa {
-        return Err(
-            "compact forward scratch aliases the GDN output onto QSA scratch, \
-            which a band without QSA layers does not own"
-                .to_string(),
-        );
-    }
     let hidden = layout.hidden;
     let wide = layout.wide;
     let q_width = layout.q_width;
@@ -646,6 +639,7 @@ pub fn forward_census_scope(
     let top_k = config.num_experts_per_tok;
     let moe = config.moe_intermediate_size;
 
+    let mut arena = 0usize;
     // MoE buffers whose compact size differs from the full plan.
     let (mut gate_batch, mut up_batch, mut rot_batch) =
         (ffn_batch_rows, ffn_batch_rows, rows_of(routed_width)?);
@@ -685,60 +679,11 @@ pub fn forward_census_scope(
             mul(fallback_grouped, hidden_f32_bytes)?
                 .max(mul(grouped_bound, mul(hidden, bf16_bytes)?)?),
         );
-        // `Qwen4GpuForwardScratch::plan`'s alias binds, checked as the plan
-        // checks them (every view fits its owner's capacity and row pitch) so
-        // a geometry the plan refuses is refused here too, whatever the band.
-        // `(owner elements, owner pitch, view pitch, view elements)`.
-        let at_least_one = |elements: usize| elements.max(1);
-        let wide_rows = at_least_one(rows_of(wide)?);
-        let ple_rows = at_least_one(rows_of(ple_channels)?);
-        let binds: [(usize, Option<usize>, usize, Vec<usize>); 6] = [
-            (
-                at_least_one(rows_of(max_projection)?),
-                Some(max_projection),
-                max_projection,
-                vec![wide_rows, ple_rows],
-            ),
-            (
-                at_least_one(rows_of(max_projection)?),
-                Some(max_projection),
-                max_projection,
-                vec![wide_rows, ple_rows],
-            ),
-            (
-                at_least_one(rows_of(max_rotation)?),
-                Some(max_rotation),
-                max_rotation,
-                vec![ple_rows],
-            ),
-            (y_down, None, ple_channels, vec![ple_rows]),
-            (
-                at_least_one(rows_of(hidden)?),
-                Some(hidden),
-                hidden,
-                vec![at_least_one(rows_of(hidden)?)],
-            ),
-            (
-                at_least_one(rows_of(qsa_qgate)?),
-                Some(qsa_qgate),
-                qsa_qgate,
-                vec![at_least_one(rows_of(gdn_value)?)],
-            ),
-        ];
-        for (owner_elements, owner_pitch, view_pitch, views) in &binds {
-            if let Some(pitch) = owner_pitch {
-                if *owner_elements < mul(rows, *pitch)? {
-                    return Err(
-                        "compact scratch alias owner is smaller than its row pitch".to_string()
-                    );
-                }
-            }
-            for view in views {
-                if view > owner_elements || *view > mul(rows, *view_pitch)? {
-                    return Err("compact scratch alias view does not fit its owner".to_string());
-                }
-            }
-        }
+        // The arena is `Qwen4GpuForwardScratch::plan`'s own sizing, so a
+        // geometry the plan refuses is refused here too, whatever the band.
+        arena =
+            crate::gpu_forward::Qwen4GpuForwardScratch::compact_arena_elements(config, rows, scope)
+                .map_err(|error| error.to_string())?;
     }
 
     // Bytes of one owning slot (every slot holds at least one element).
@@ -756,7 +701,7 @@ pub fn forward_census_scope(
             total.checked_add(bytes.clone()?).ok_or_else(overflow)
         })
     };
-    // Compact plan: eight phase-disjoint fields are uncharged views.
+    // Compact plan: the step-local fields are uncharged views of the arena.
     let owned = |view: bool, bytes: Result<u64, String>| -> Result<u64, String> {
         if compact && view {
             Ok(0)
@@ -765,26 +710,30 @@ pub fn forward_census_scope(
         }
     };
     let f32 = DType::F32;
-    // Compact plan: the overridden MoE buffers are exact element counts
-    // (possibly zero); everywhere else every slot holds at least one element.
+    // The MoE buffers: views of the arena in the compact plan, every slot at
+    // least one element otherwise.
     let moe_slot = |elements: usize| -> Result<u64, String> {
         if compact {
-            u64::try_from(elements.checked_mul(f32.size()).ok_or_else(overflow)?)
-                .map_err(|_| overflow())
+            Ok(0)
         } else {
             slot(elements, f32)
         }
     };
     let stage_shared = sum(&[
-        slot(rows_of(wide)?, f32),              // Streams
-        owned(true, slot(rows_of(wide)?, f32)), // HcNormalized (view)
-        slot(rows_of(config.hc_lowrank)?, f32), // HcLow
-        owned(true, slot(rows_of(wide)?, f32)), // HcUp (view)
-        slot(rows_of(hidden)?, f32),            // HcMixed
-        slot(rows_of(config.hc_count)?, f32),   // HcGates
-        slot(rows_of(max_rotation)?, f32),      // Rotation
-        slot(rows_of(max_projection)?, f32),    // Projection
-        slot(rows_of(max_projection)?, f32),    // Projection2
+        slot(rows_of(wide)?, f32),                           // Streams
+        owned(true, slot(rows_of(wide)?, f32)),              // HcNormalized (view)
+        owned(true, slot(rows_of(config.hc_lowrank)?, f32)), // HcLow (view)
+        owned(true, slot(rows_of(wide)?, f32)),              // HcUp (view)
+        slot(rows_of(hidden)?, f32),                         // HcMixed
+        slot(rows_of(config.hc_count)?, f32),                // HcGates
+        slot(rows_of(max_rotation)?, f32),                   // Rotation
+        // Projection: the compact phase arena owner.
+        if compact {
+            slot(arena, f32)
+        } else {
+            slot(rows_of(max_projection)?, f32)
+        },
+        owned(true, slot(rows_of(max_projection)?, f32)), // Projection2 (view)
         // GdnBf16: also the QSA and hyper-connection BF16 scratch.
         slot(
             if has_gdn { gdn_value } else { 0 }
@@ -794,38 +743,50 @@ pub fn forward_census_scope(
         ),
         slot(rows_of(hidden)?, f32), // AttentionOutput
         slot(rows_of(dims_router_columns(config))?, f32), // RouterLogits
-        slot(rows_of(hidden)?, f32), // MoeXRot
-        slot(rows_of(2 * moe)?, f32), // MoeGateUp
-        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeGate
-        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeUp
-        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeHidden
+        owned(true, slot(rows_of(hidden)?, f32)), // MoeXRot (view)
+        owned(true, slot(rows_of(2 * moe)?, f32)), // MoeGateUp (view)
+        owned(
+            true,
+            slot(rows_of(config.shared_expert_intermediate_size)?, f32),
+        ), // MoeGate (view)
+        owned(
+            true,
+            slot(rows_of(config.shared_expert_intermediate_size)?, f32),
+        ), // MoeUp (view)
+        owned(
+            true,
+            slot(rows_of(config.shared_expert_intermediate_size)?, f32),
+        ), // MoeHidden (view)
         slot(rows_of(hidden)?, f32), // FfnOutput
-        slot(rows_of(hidden)?, f32), // MoeSharedOutput
+        owned(true, slot(rows_of(hidden)?, f32)), // MoeSharedOutput (view)
         moe_slot(gate_batch),
         moe_slot(up_batch),
         moe_slot(rot_batch),
         slot(route_i32_bytes, DType::Raw), // MoeTopkIndices
         slot(rows_of(top_k)?, f32),        // MoeTopkWeights
         moe_slot(down_expanded),
-        slot(rows_of(config.shared_expert_intermediate_size)?, f32), // MoeScalar
-        slot(mul(config.num_experts, i32_bytes)?, DType::Raw),       // MoeExpertTokenCounts
-        slot(mul(config.num_experts + 1, i32_bytes)?, DType::Raw),   // MoeExpertOffsets
-        slot(mul(grouped_bound, i32_bytes)?, DType::Raw),            // MoeSortedSlotIndex
-        slot(mul(grouped_bound / 16, i32_bytes)?, DType::Raw),       // MoeExpertTileIds
-        slot(route_i32_bytes, DType::Raw),                           // MoeInversePerm
+        owned(
+            true,
+            slot(rows_of(config.shared_expert_intermediate_size)?, f32),
+        ), // MoeScalar (view)
+        slot(mul(config.num_experts, i32_bytes)?, DType::Raw), // MoeExpertTokenCounts
+        slot(mul(config.num_experts + 1, i32_bytes)?, DType::Raw), // MoeExpertOffsets
+        slot(mul(grouped_bound, i32_bytes)?, DType::Raw),      // MoeSortedSlotIndex
+        slot(mul(grouped_bound / 16, i32_bytes)?, DType::Raw), // MoeExpertTileIds
+        slot(route_i32_bytes, DType::Raw),                     // MoeInversePerm
         moe_slot(y_gate_up),
         moe_slot(y_down),
     ])?;
     let gdn_local = if has_gdn {
         let value_rows = rows_of(gdn_value)?;
         sum(&[
-            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnA
-            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnB
-            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnGate
-            slot(rows_of(config.linear_num_value_heads)?, f32), // GdnBeta
-            owned(true, slot(value_rows, f32)),                 // GdnRecurrentOutput (view)
-            slot(value_rows, f32),                              // GdnZ
-            slot(value_rows, f32),                              // GdnOutput
+            owned(true, slot(rows_of(config.linear_num_value_heads)?, f32)), // GdnA (view)
+            owned(true, slot(rows_of(config.linear_num_value_heads)?, f32)), // GdnB (view)
+            owned(true, slot(rows_of(config.linear_num_value_heads)?, f32)), // GdnGate (view)
+            owned(true, slot(rows_of(config.linear_num_value_heads)?, f32)), // GdnBeta (view)
+            owned(true, slot(value_rows, f32)), // GdnRecurrentOutput (view)
+            owned(true, slot(value_rows, f32)), // GdnZ (view)
+            owned(true, slot(value_rows, f32)), // GdnOutput (view)
         ])?
     } else {
         0
@@ -834,12 +795,12 @@ pub fn forward_census_scope(
         let kv_width = mul(config.num_key_value_heads, config.head_dim)?;
         let selected = mul(mul(rows, config.qsa_selected_capacity())?, i32_bytes)?;
         sum(&[
-            slot(rows_of(layout.index_width)?, f32), // QsaIndex
-            slot(rows_of(qsa_qgate)?, f32),          // QsaQgate
-            slot(rows_of(kv_width)?, f32),           // QsaK
-            slot(rows_of(kv_width)?, f32),           // QsaV
-            slot(rows_of(q_width)?, f32),            // QsaOutput
-            slot(selected, DType::Raw),              // QsaSelected
+            owned(true, slot(rows_of(layout.index_width)?, f32)), // QsaIndex (view)
+            owned(true, slot(rows_of(qsa_qgate)?, f32)),          // QsaQgate (view)
+            owned(true, slot(rows_of(kv_width)?, f32)),           // QsaK (view)
+            owned(true, slot(rows_of(kv_width)?, f32)),           // QsaV (view)
+            owned(true, slot(rows_of(q_width)?, f32)),            // QsaOutput (view)
+            owned(true, slot(selected, DType::Raw)),              // QsaSelected (view)
         ])?
     } else {
         0
@@ -848,15 +809,30 @@ pub fn forward_census_scope(
     let input_only = if scope.input {
         sum(&[
             slot(rows_of(i32_bytes)?, DType::Raw),          // TokenIds
-            slot(rows_of(hidden)?, f32),                    // EmbeddingRot
-            slot(rows_of(hidden)?, f32),                    // Embeddings
+            owned(true, slot(rows_of(hidden)?, f32)),       // EmbeddingRot (view)
+            owned(true, slot(rows_of(hidden)?, f32)),       // Embeddings (view)
             slot(rows_of(ple_embed_dim)?, DType::BF16),     // PleStaged
             slot(rows_of(ple_embed_dim.max(hidden))?, f32), // PleRows
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleKey (view)
             owned(true, slot(rows_of(hidden)?, f32)),       // PleValue (view)
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleQuery (view)
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleGated (view)
-            slot(rows_of(ple_channels)?, f32),              // PleNormed (dedicated)
+            // PleNormed (dedicated): the rows a verify rollback reads after
+            // the forward in the compact plan, every row otherwise.
+            slot(
+                if compact {
+                    mul(
+                        rows.min(crate::gpu_forward::QWEN4_PLE_NORMED_KEEP_ROWS),
+                        ple_channels,
+                    )?
+                } else {
+                    rows_of(ple_channels)?
+                },
+                f32,
+            ),
+            // PleNormedWide: an uncharged arena view in the compact plan,
+            // absent from `Full`.
+            Ok(0),
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleOutput (view)
         ])?
     } else {
@@ -4377,7 +4353,7 @@ mod tests {
         let (today_8k, new_8k) = shipped_r9700_layers(8192);
         let (today_32k, new_32k) = shipped_r9700_layers(32768);
         assert_eq!((today_8k, today_32k), (15, 15));
-        assert_eq!((new_8k, new_32k), (18, 17));
+        assert_eq!((new_8k, new_32k), (19, 18));
     }
 
     #[test]
@@ -4417,9 +4393,10 @@ mod tests {
             FnSymGfx1201,
             QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES,
         );
-        // 4,141 MiB: the measured peak beyond the weights at this config.
-        assert!(census.total().unwrap() >= 4141 << 20);
-        assert_eq!(census.total().unwrap() >> 20, 4237);
+        // The pre-arena layout measured 4,141 MiB beyond the weights here
+        // (census 4,237 MiB); the phase arena shares the step-local buffers,
+        // so the census is that minus the arena's saving.
+        assert_eq!(census.total().unwrap() >> 20, 3964);
         // For the record: the `Full` 8192-row chunk at 32K with the runtime.
         let full = census_at(
             &config,
@@ -5320,11 +5297,11 @@ mod tests {
         let forward = |rows, mode| {
             crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode).unwrap()
         };
-        // The 8192-row chunk's compact plan is 4240.125 MiB smaller, and the
+        // The 8192-row chunk's compact plan is 6144.59375 MiB smaller, and the
         // whole of it reaches the reserve: the historical baseline stays on
         // the Full layout, so the saving is not subtracted from both sides.
         let saving = forward(8192, Full) - forward(8192, FnSymGfx1201);
-        assert_eq!(saving, 4240 * (1 << 20) + (1 << 20) / 8);
+        assert_eq!(saving, 6144 * (1 << 20) + 622_592);
         assert_eq!(reserve(8192, Full) - reserve(8192, FnSymGfx1201), saving);
         // The same holds at every chunk, including the measured layout's own
         // 1536 rows.
@@ -6778,7 +6755,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_forward_census_refuses_a_gdn_band_without_a_qsa_owner() {
+    fn compact_forward_census_plans_a_gdn_band_without_a_qsa_layer() {
         let config = crate::config::compact_test_config();
         // Layers 0..3 are GDN, the first QSA layer is 3.
         let gdn_only = Qwen4BandScope {
@@ -6786,7 +6763,9 @@ mod tests {
             input: true,
             output: false,
         };
-        assert!(forward_census_scope(&config, 256, FnSymGfx1201, &gdn_only).is_err());
+        let compact = forward_census_scope(&config, 256, FnSymGfx1201, &gdn_only)
+            .expect("compact plan of a GDN band");
+        assert!(compact.stage_shared > 0 && compact.output_only == 0);
         let full = forward_census_scope(&config, 256, Full, &gdn_only).expect("full plan");
         assert!(full.band_local > 0 && full.output_only == 0 && full.input_only > 0);
         let single = forward_census_scope(&config, 256, Full, &Qwen4BandScope::single(&config))
