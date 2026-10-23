@@ -40,7 +40,8 @@
  *   The sliding layers are causal and the full layer is not. The checkpoint's `layer_types` names
  *   four sliding layers and one full one, and the PR's test pins `causal True` on the sliding
  *   layers and `False` on the full one, so this block declares two attention ops and issues the one
- *   each layer's type names.
+ *   each layer's type names. A config that states `dflash_config.causal` (NVIDIA's E4B drafter:
+ *   false, all five layers sliding) sets the sliding layers' causality.
  *
  *   The logits are soft-capped, which is deliberately ignored: the draft is an argmax, and
  *   cap * tanh(x / cap) is strictly increasing.
@@ -235,6 +236,7 @@ struct Dflash1 {
         int64_t n_taps = 0;      /* how many trunk layers `fc` concatenates */
         int64_t block  = 0;      /* query rows per sequence: the anchor plus block - 1 masks */
         int64_t window = 0;      /* the sliding layers' window; 0 for none */
+        int     causal = 1;      /* the sliding layers: causal (z-lab) or not (dflash_config.causal) */
         int     full[MAX_LAYERS] = {};   /* 1: a full-attention (non-causal, unwindowed) layer */
         double  escale = 1.0;    /* the target's embedding scale, rounded as the target holds it */
         int64_t kv_rep = 1;      /* how many times the cache holds each kv head (kv_rep_for) */
@@ -616,6 +618,11 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
                                 "window\n");
                 return RAD_E_INVAL;
             }
+            /* z-lab's configs state no causality and train the sliding layers causal; NVIDIA's
+             * (Nemotron-3.5-Bolt-E4B's DFlash) states `dflash_config.causal: false`, every layer
+             * sliding and non-causal over its window. */
+            dc.causal = rad_meta_geti(meta, "draft.dflash_config.causal",
+                                      rad_meta_geti(meta, "draft.is_causal", 1)) != 0 ? 1 : 0;
         }
     }
     if (!head_sharded(dg) && dg.world > 1) {
@@ -670,11 +677,12 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
     int nfull = 0;
     for (int64_t l = 0; l < dg.n_layer; ++l) nfull += dc.full[l];
     rad_note(b, "the DFlash drafter is declared: %lld layers at absolute %d..%d (%d full, %lld "
-                "sliding over %lld causal), %lld heads / %lld kv x %lld, ffn %lld, reading the "
+                "sliding over %lld, %s), %lld heads / %lld kv x %lld, ffn %lld, reading the "
                 "trunk at %lld tap(s); linears %s. One forward over %lld rows proposes %lld "
                 "tokens; the head is %s, argmax %s",
              (long long)dg.n_layer, t.base_layer, t.base_layer + (int)dg.n_layer - 1, nfull,
-             (long long)(dg.n_layer - nfull), (long long)dc.window, (long long)dg.n_head,
+             (long long)(dg.n_layer - nfull), (long long)dc.window,
+             dc.causal ? "causal" : "non-causal", (long long)dg.n_head,
              (long long)dg.n_head_kv, (long long)dg.head_dim, (long long)dg.n_ff,
              (long long)t.n_taps,
              df->i8 ? "int8 (w8a8, an int8 activation per row)" : "on the E4M3 grid (fp8a8 / mxfp4a8)",
@@ -855,7 +863,7 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     };
     bool any_full = false, any_swa = false;
     for (int64_t l = 0; l < g.n_layer; ++l) (cfg.full[l] ? any_full : any_swa) = true;
-    if (any_swa)  op_attn_swa  = attn(1, cfg.window);
+    if (any_swa)  op_attn_swa  = attn(cfg.causal, cfg.window);
     if (any_full) op_attn_full = attn(0, 0);
 
     /* The copies into the cache's layout (rep_kv), a head-wide strided row copy each. Each pass's
