@@ -92,6 +92,7 @@ pub mod rdna;
 pub mod replay;
 pub mod rope;
 pub mod router_fault;
+pub mod shared_i8;
 pub mod sampled_rows_compact;
 pub mod sampling;
 pub mod scratch;

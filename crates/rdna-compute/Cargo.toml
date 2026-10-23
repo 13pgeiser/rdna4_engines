@@ -322,6 +322,14 @@ name = "hc_down_fused_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "shared_i8_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_i8_bench"
+required-features = ["lab"]
+
+[[example]]
 name = "hc_down_fused_bench"
 required-features = ["lab"]
 

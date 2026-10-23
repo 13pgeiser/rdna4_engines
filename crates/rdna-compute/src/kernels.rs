@@ -5419,6 +5419,23 @@ pub const GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip")
 );
+/// gfx1201 Qwen4 shared-expert INT8 x INT8 prefill GEMM (`qwen4_shared_i8_down_set_f32`,
+/// `qwen4_shared_i8_gate_up_silu_bf16`; dynamic LDS `QWEN4_SHARED_I8_LDS_BYTES` = 36864): the
+/// `block_i8_128` prelude without its standalone quantizer, then the kernel
+/// (`Gpu::qwen4_shared_i8_gate_up` / `qwen4_shared_i8_down`).
+pub const QWEN4_SHARED_I8_GEMM_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_shared_i8_gemm.gfx12.hip")
+);
+/// Producers of the same route: BF16 rows -> FWHT -> A8 `block_i8_128` (the rotated gate/up
+/// and down weight shadows, and the shared hidden with the selector sigmoid).
+pub const QWEN4_SHARED_I8_QUANT_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    include_str!("../../../kernels/src/qwen4_shared_i8_quant.gfx12.hip")
+);
 /// Full-slab A-prefetch variant (191 VGPR, 0 spills) for end-to-end screening.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC: &str = concat!(
     "#define I8_APF_K32 0\n",

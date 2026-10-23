@@ -1746,6 +1746,10 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// Qwen4 shared-expert INT8 shadows (`shared_i8.rs`), keyed on the shared gate weight's
+    /// device pointer; built on first use, released with the other weight caches.
+    pub(crate) shared_i8_shadows: HashMap<usize, crate::shared_i8::SharedI8Shadow>,
+
     /// S1 F16-shadow arena: the installed shared plan, the planned source-pointer
     /// bindings and the lazily exact-allocated roots that back the borrowed views
     /// stored in `fp16_shadow_cache`. Inactive (and allocation-free) off S1; the
@@ -2966,6 +2970,7 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            shared_i8_shadows: HashMap::new(),
             f16_shadow_arena: crate::byte_arena::ShadowRootSet::new(),
             active_capture: None,
             capture_names: HashMap::new(),
@@ -8572,6 +8577,7 @@ impl Gpu {
         for t in shadows {
             let _ = self.free_tensor(t);
         }
+        self.drain_shared_i8_shadows();
         // A failed release is retained for `ensure_vmm_cleaned` to retry
         // and report.
         let _ = self.release_qsa_gather_workspace();
