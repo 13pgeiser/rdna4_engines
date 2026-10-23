@@ -382,7 +382,9 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     if (fused) {
         if (!qkv_slot) return RAD_E_INVAL;
         if (!*qkv_slot)
-            *qkv_slot = decl_b(b, nm.f(cls.has_v ? "attn_qkvs" : "attn_qkvg"), g.act_dtype,
+            /* named by class, not by the value path: a global class with its own v (E2B/E4B,
+             * attention_k_eq_v false) has one too, and the two rows differ in width */
+            *qkv_slot = decl_b(b, nm.f(cls.head_ladder ? "attn_qkvg" : "attn_qkvs"), g.act_dtype,
                                {g.max_tok, qkvd});
         w.qkv = *qkv_slot;
         if (cls.has_v)
