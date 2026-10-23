@@ -1289,12 +1289,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-opt-in-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
-        condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
+        condition: "Qwen4 eager prefill fusions (including default-on gfx1201 arms) and exact-gfx1151 single-token decode fusions, normally taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP); gfx1201 HC-down + activation (hc_down_fused_selected, qwen4_hc_down_fused_applies): HIPFIRE_QWEN4_HC_DOWN_FUSED, M=320/K=10240, route_rows >= 1536, checked X extent below 2^32 bytes, !recording && !capture; gfx1201 MoE front (qwen4_moe_front_fuse_applies): HIPFIRE_QWEN4_MOE_FRONT_FUSE, a shipped aggregate symmetric-IU4 descriptor, !recording && !capture, plus front_applies in qt44_qt53_prefill.rs requiring the grouped F32 route, compatible router/shared F16 consumers and no slab/FP8/shared-GU-PM arm, and its caller requiring a plain program without CPU split/deferral; gfx1201 HC row folds (hc_row_fold_gfx1201_applies): hidden=2560, rows >= 16, 16-byte aligned streams/mixed, !recording && !capture; callers resolve HIPFIRE_QWEN4_HC_ROW_FOLD with HC_FUSE >= 1 for the mixer and combine-zinit additionally for MoE, and validate paired operands; gfx1201 persistent HC up (hc_up_v2_selected and hyper_read_up_wmma_launch Auto): HIPFIRE_QWEN4_HC_UP_V2, admitted HC_UP_TILE/T128, low_rank=320, nonzero hidden divisible by 16, rows >= 128, !recording && !capture. Explicit HcUpSelect::Forced(V2) bypasses those Auto flag/row/mode gates and is not this recording-dependent choice",
         effect: KernelSelection,
-        switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector or rows8/rows16 scoring + select_from_scores, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; gfx1151 single-token decode: one gemv_mq4g256v2_multirow_r2_x3 for the three GDN a/b/z launches (ZBA_X3), one gemv_bf16_xf32_x2_q8_0_k2560_staged_pair for gemv_bf16_xf32_x4 + gemv_q8_0_k2560_staged_pair (HEAD_FUSE); recorded/captured: the incumbent unfused launches",
+        switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector or rows8/rows16 scoring + select_from_scores, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; gfx1151 single-token decode: one gemv_mq4g256v2_multirow_r2_x3 for the three GDN a/b/z launches (ZBA_X3), one gemv_bf16_xf32_x2_q8_0_k2560_staged_pair for gemv_bf16_xf32_x4 + gemv_q8_0_k2560_staged_pair (HEAD_FUSE); recorded/captured: the incumbent unfused launches; additional gfx1201 eager arms: qwen4_hc_down_fused_b64_k32 replaces the split-K HC-down tile, reducer and hc_activation_fused_f32(bf16_out); mq_rotate_x_i4_f16out emits both the IU4 sidecar and shared F16 X, removing the dead F32 mq_rotate_x and the separate convert_f32_to_f16/mq_rotate_x_i4 chain; hc_row_fold_moe_gfx1201 replaces combine + scaled-add + x8 HC write + next norm/gates, and hc_row_write_norm_gate_gfx1201 replaces x8 write + next norm/gates; hyper_read_up_wmma_bf16_gfx1201_v2 replaces T128 with a persistent 512-thread launch and grid y clamped to 1..4. Recording/capture retain each local incumbent (Auto HC-up retains T128), not the forced diagnostic route. The outer F16-WMMA versus SIMT decision remains separately NotEquivalent under qwen4-f16-wmma-prefill",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3), HC_ROW_FOLD and the 160x64 HC_DOWN_TILE default on for exact gfx1151 only (the gfx1201 HC_DOWN_TILE split-K tile is not eager-gated: recorded and eager launches take it alike), MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, QSA_SELECT_EXACT is default off, DECODE_ZBA_X3 and DECODE_HEAD_FUSE default on for exact gfx1151 only (each keeps its incumbent per-row arithmetic and reduction order verbatim; byte-exact hardware checks: rdna-compute lib mq4v2_multirow_r2_x3_tests and tests/qwen4_decode_head_fuse.rs), and no railgun default program is a qwen4 program",
+        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3) and the 160x64 HC_DOWN_TILE default on for exact gfx1151 only; HC_ROW_FOLD also has the gfx1201 mixer/MoE twins under the paired-read and combine-zinit conditions above (the gfx1201 HC_DOWN_TILE split-K tile is not eager-gated: recorded and eager launches take it alike), MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, QSA_SELECT_EXACT is default off, DECODE_ZBA_X3 and DECODE_HEAD_FUSE default on for exact gfx1151 only (each keeps its incumbent per-row arithmetic and reduction order verbatim; byte-exact hardware checks: rdna-compute lib mq4v2_multirow_r2_x3_tests and tests/qwen4_decode_head_fuse.rs), and no railgun default program is a qwen4 program; the added gfx1201 decisions preserve existing reference chains: kernels/src/qwen4_hc_down_fused.hip keeps the four zero-started ascending-K partials, P0..P3 reducer order and activation rounding; gemm.rs hc_down_fused_matches_chain_bytes (GPU-only ignored test) and examples/hc_down_fused_oracle.rs compare production-chain bytes, special values, ragged rows and guards. examples/qwen4_moe_front_oracle.rs compares F16 X, IU4 sidecar and router/selector/gate/up outputs, including RNE ties and special values, while preserving shared-scratch ownership/lifetimes. tensor_ops.rs hc_row_fold_moe_gfx1201_is_bytewise_the_default_chain and hc_row_write_norm_gate_gfx1201_is_bytewise_the_default_chain cover HC streams, normalized F16 and next gates, including NaN payloads/operand order; CHANGELOG records both original and retiled proofs. tensor_ops.rs hyper_read_up_v2_is_bytewise_t128 and examples/hc_up_v2_oracle.rs cover the unchanged WMMA chain and baseline epilogue, NaN payloads, guards and all 65536 BF16 gate-input patterns; the V2 proof is against T128, never against SIMT. These are existing source/oracle and historical CHANGELOG evidence, not new hardware qualification from this inventory update",
         reaches: &[],
     },
     Decision {
@@ -3353,6 +3353,18 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
+        function: "hc_up_v2_selected",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "hyper_read_up_wmma_launch",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
         function: "indexed_attention_select_batch_impl",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
@@ -3513,6 +3525,24 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
+        function: "hc_down_fused_selected",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_hc_down_fused_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_moe_front_fuse_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
         function: "hc_down_tile_selected",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
@@ -3532,6 +3562,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/gemm.rs",
         function: "qwen4_trunk_iu4_ragged",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/hc_row_fold.rs",
+        function: "hc_row_fold_gfx1201_applies",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
     },
