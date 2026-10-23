@@ -623,9 +623,6 @@ int ring_errno() {
 /* Reads `reads` through the ring in batches: rows with a slot are copied into the cache and
  * published READY; rows without one are decoded directly into their output rows. On a failed read,
  * every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
-void ahead_urgent(const TableFile& tf, RowCache& rc, const std::vector<uint64_t>& keys,
-                  long long n);
-
 int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
                      const std::vector<SpanRead>& reads, long long n, long long ne,
                      avx::RowDecode decode, const uint16_t* lut, uint16_t* out, long long x_ld) {
@@ -671,17 +668,11 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     return RAD_OK;
 }
 
-/* out[m] = decoded row ids[m] - voff for every m < M, through the cache. This thread issues no
- * file reads: every row is READY in the cache (decode from it), loading under a producer's claim
- * (wait on its word -- the word is notified the moment the row lands), or claimed by nobody (the
- * run is handed to the producer's urgent lane and waited on like the others). The drive serves one
- * queue, at the full rate of one ring; the step thread never competes for it.
- *
- * The one fall from grace: a row whose cache slot is recycled while it waits (cache pressure from
- * the run-ahead of later chunks) is re-handed to the producer's urgent lane, not read here. */
+/* out[m] = decoded row ids[m] - voff for every m < M, through the cache: find or claim each row
+ * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
+ * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
                 long long first, avx::RowDecode decode, const uint16_t* lut) {
-    (void)rr;
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
@@ -699,113 +690,93 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     g.waits.clear();
     g.again.clear();
 
-    /* ---- classify without claiming. A row is READY (its slot decodes), loading under a
-     * producer's claim (its word is waited on), or absent -- nobody has claimed it, so its run is
-     * handed to the producer's urgent lane, ahead of the run-ahead queue. */
     const auto tf0 = std::chrono::steady_clock::now();
-    std::vector<uint64_t> urgent;
     for (long long j = 0; j < M; ++j) {
-        const long long m = at(j);
-        uint16_t* dst = q.out + m * x_ld;
-        if (pad(row_of(m))) {
-            g.kind[m] = Gather::PAD;
-            std::memset(dst, 0, (size_t)ne * sizeof(uint16_t));
-            continue;
+        if (j + kPrefetchRows < M) {
+            const long long mp = at(j + kPrefetchRows);
+            if (!pad(row_of(mp))) __builtin_prefetch(rc.set_line(key_of(mp)));
         }
+        const long long m = at(j);
+        if (pad(row_of(m))) { g.kind[m] = Gather::PAD; continue; }
         const uint64_t key = key_of(m);
         int64_t s = -1;
-        const RowCache::Found f = rc.lookup(key, &s);
-        if (f == RowCache::HIT) {
-            g.slot[m] = s;
-            g.kind[m] = (uint8_t)RowCache::HIT;
-            ++t_ple.hits;
-        } else {
-            g.slot[m] = s;                                   /* -1 when absent */
-            if (f == RowCache::THEIRS) { g.kind[m] = (uint8_t)RowCache::THEIRS; ++t_ple.theirs; }
-            else                       { g.kind[m] = (uint8_t)Gather::DONE; urgent.push_back(key);
-                                           ++t_ple.none; }
-        }
-        /* Every row resolves through the wave loop below: READY rows decode in its first wave,
-         * the others wait on their producer and decode as they land. */
-        g.waits.push_back(m);
+        const RowCache::Found f = rc.find_or_claim(key, me, &s);
+        g.slot[m] = s;
+        g.kind[m] = (uint8_t)f;
+        if (f == RowCache::HIT)          ++t_ple.hits;
+        else if (f == RowCache::CLAIMED) ++t_ple.claimed;
+        else if (f == RowCache::NONE)    ++t_ple.none;
+        else if (f == RowCache::THEIRS)  ++t_ple.theirs;
+        if (f == RowCache::CLAIMED)     g.reads.push_back({m, key, s});
+        else if (f == RowCache::NONE) { g.reads.push_back({m, key, -1}); g.kind[m] = Gather::DONE; }
+        else if (f == RowCache::THEIRS) g.waits.push_back(m);
     }
     t_ple.find_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf0).count();
-    if (!urgent.empty()) ahead_urgent(tf, rc, urgent, n);
 
-    /* ---- resolve. Each wave scans the open rows after a producer publish: READY rows decode in
-     * one batch (the seqlock word is read before the bytes and again after), LOADING rows keep
-     * waiting on their own word, rows whose slot moved on are re-handed to the urgent lane. */
+    const auto tp0 = std::chrono::steady_clock::now();
+    int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    t_ple.pub_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+    if (rs != RAD_OK) return rs;
+
+    /* Wait for rows other threads claimed to turn READY. `published` is read before the words, so
+     * a batch landing after the scan makes the wait return at once. Released claims (failed reads)
+     * and reused slots are read by this thread instead. */
     const auto tw0 = std::chrono::steady_clock::now();
-    size_t quiet = 0;
     while (!g.waits.empty()) {
-        const uint64_t fails = rc.failed_reads.load(std::memory_order_acquire);
-        const uint32_t e     = rc.published.load(std::memory_order_acquire);
-        g.src.clear();
-        g.dst.clear();
-        g.dm.clear();
-        g.dw.clear();
+        const uint32_t e = rc.published.load(std::memory_order_acquire);
         size_t keep = 0;
         for (long long m : g.waits) {
             const uint64_t key = key_of(m);
-            int64_t s = g.slot[m];
-            if (s < 0 || ((rc.word[s].load(std::memory_order_acquire) & 3) != RowCache::READY
-                          && (rc.word[s].load(std::memory_order_relaxed) >> 10) != key)) {
-                s = -1;
-                const RowCache::Found f = rc.lookup(key, &s);   /* claimed/published since? */
-                if (f == RowCache::HIT) { g.slot[m] = s; }
-                else if (f == RowCache::THEIRS) { g.slot[m] = s; g.kind[m] = (uint8_t)RowCache::THEIRS; }
-                else { g.slot[m] = -1; g.waits[keep++] = m; continue; }
-            }
-            const uint64_t w1 = rc.word[s].load(std::memory_order_acquire);
-            if (w1 == RowCache::ready(key)) {
-                g.src.push_back(rc.data + (size_t)s * (size_t)n);
-                g.dst.push_back(q.out + m * x_ld);
-                g.dm.push_back(m);
-                g.dw.push_back(w1);
-                continue;
-            }
-            if ((w1 & 3) == RowCache::LOADING && (w1 >> 10) == key) {
-                g.slot[m] = s;
-                g.kind[m] = (uint8_t)RowCache::THEIRS;
-                g.waits[keep++] = m;
-                continue;
-            }
-            /* The slot moved to another row: the read was lost. Hand it back. */
-            g.slot[m] = -1;
-            g.kind[m] = (uint8_t)Gather::DONE;
-            urgent.push_back(key);
-            g.waits[keep++] = m;
+            const uint64_t x   = rc.word[g.slot[m]].load(std::memory_order_acquire);
+            if (x == RowCache::ready(key)) continue;
+            if ((x & 3) == RowCache::LOADING && (x >> 10) == key) { g.waits[keep++] = m; continue; }
+            g.again.push_back(m);
+            g.kind[m] = Gather::DONE;
         }
         g.waits.resize(keep);
-        if (!g.src.empty()) {
-            decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
-            std::atomic_thread_fence(std::memory_order_acquire);
-            for (size_t i = 0; i < g.dm.size(); ++i)
-                if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i]) {
-                    g.slot[g.dm[i]] = -1;
-                    g.kind[g.dm[i]] = (uint8_t)Gather::DONE;
-                    urgent.push_back(key_of(g.dm[i]));
-                    g.waits.push_back(g.dm[i]);
-                }
-            quiet = 0;
-        } else if (g.waits.size() == keep) {
-            ++quiet;
-        }
-        if (!g.waits.empty()) {
-            if (!urgent.empty()) { ahead_urgent(tf, rc, urgent, n); urgent.clear(); }
-            if (quiet > 64 && rc.failed_reads.load(std::memory_order_relaxed) > fails) {
-                /* The producer's reads are failing outright: waiting longer cannot help. */
-                t_ple.wait_ms +=
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
-                return RAD_E_IO;
-            }
-            rc.published.wait(e, std::memory_order_acquire);
-        }
+        if (keep) rc.published.wait(e, std::memory_order_acquire);
     }
     t_ple.wait_ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
-    return RAD_OK;
+
+    /* Decode all READY rows in one batch: each word is read before the bytes and again after the
+     * batch (the seqlock), and rows whose word changed are read again. */
+    const auto td0 = std::chrono::steady_clock::now();
+    g.src.clear();
+    g.dst.clear();
+    g.dm.clear();
+    g.dw.clear();
+    for (long long m = 0; m < M; ++m) {
+        uint16_t* dst = q.out + m * x_ld;
+        const uint8_t k = g.kind[m];
+        if (k == Gather::PAD)  { std::memset(dst, 0, (size_t)ne * sizeof(uint16_t)); continue; }
+        if (k == Gather::DONE) continue;
+        const int64_t  s  = g.slot[m];
+        const uint64_t w1 = rc.word[s].load(std::memory_order_acquire);
+        if (w1 != RowCache::ready(key_of(m))) { g.again.push_back(m); continue; }
+        g.src.push_back(rc.data + (size_t)s * (size_t)n);
+        g.dst.push_back(dst);
+        g.dm.push_back(m);
+        g.dw.push_back(w1);
+    }
+    if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    for (size_t i = 0; i < g.dm.size(); ++i)
+        if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
+            g.again.push_back(g.dm[i]);
+    t_ple.dec_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+
+    if (g.again.empty()) return RAD_OK;
+    const auto ta0 = std::chrono::steady_clock::now();
+    g.reads.clear();
+    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
+    const int ra = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    t_ple.again_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta0).count();
+    return ra;
 }
 
 /* ============================== the reader that runs a step ahead ==============================
@@ -900,35 +871,6 @@ AheadReader* ahead_reader() {
         return a;
     }();
     return r;
-}
-
-/* Hands a waiting consumer's own misses to the reader's urgent lane: sliced like the run-ahead
- * queue, served ahead of it. A key the reader finds already READY costs nothing; one it claims is
- * read at the full rate of a single ring -- the consumer never competes for the disk. */
-void ahead_urgent(const TableFile& tf, RowCache& rc, const std::vector<uint64_t>& keys,
-                  long long n) {
-    AheadReader* r = ahead_reader();
-    AheadJob j;
-    j.tf = &tf;
-    j.rc = &rc;
-    j.n  = n;
-    j.keys.reserve(kJobRows);
-    for (uint64_t key : keys) {
-        j.keys.push_back(key);
-        if (j.keys.size() == kJobRows) {
-            {
-                std::lock_guard<std::mutex> lk(r->mu);
-                r->urgent.push_back(j);
-            }
-            r->cv.notify_one();
-            j.keys.clear();
-        }
-    }
-    if (!j.keys.empty()) {
-        std::lock_guard<std::mutex> lk(r->mu);
-        r->urgent.push_back(std::move(j));
-    }
-    r->cv.notify_one();
 }
 
 /* Hands the rows of `q.ahead` (to be gathered by later calls) to the reader, sliced into
