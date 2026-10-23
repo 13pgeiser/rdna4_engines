@@ -1225,9 +1225,10 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                             RAD_WEIGHTS(B.ada_w[md], B.ada_b[md])),
                                   { m.a_temb.x }, { m.b_ada });
             } else {
-                B.ada[md].mapped = true;
+                /* The map_rows above made `<base>.weight` for both branches, so declare() must not
+                 * map it again -- a COPY map declared twice is refused (rad_fp8.h's `mapped`). */
                 RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
-                                               grp_layer(grp), { src_w }));
+                                               grp_layer(grp), { src_w }, {}, true));
                 B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
                                             RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
                                                        RAD_INT("K", td),
