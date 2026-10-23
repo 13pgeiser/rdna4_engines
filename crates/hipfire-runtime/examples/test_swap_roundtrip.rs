@@ -168,6 +168,7 @@ fn main() {
         .sum();
     let stamp = SnapshotStamp {
         model_hash: 0xDEAD_BEEF,
+        instance_id: 7,
         kv_dtype_tag: 1,
         per_pos_bytes: per_pos_bytes as u32,
         per_pos_v_bytes: per_pos_bytes as u32,

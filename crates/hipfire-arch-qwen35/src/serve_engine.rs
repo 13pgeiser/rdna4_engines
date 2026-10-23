@@ -16,7 +16,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -87,6 +88,8 @@ pub struct EngineConfig {
     pub prefill_chunk: usize,
     pub host_budget_bytes: u64,
     pub swap_dir: PathBuf,
+    /// Disk-tier ceiling for swap spill files. 0 disables the disk tier.
+    pub swap_disk_bytes: u64,
     /// True when the model has vision support (either inline in the trunk
     /// HFQ or in a separate `.vl` sidecar). Rig::build loads VisionWeights
     /// and VisionConfig when set.
@@ -174,6 +177,9 @@ pub struct EngineConfig {
 pub struct SlotEngine {
     tx: Option<Sender<EngineCommand>>,
     stats: Arc<Mutex<EngineStats>>,
+    /// Sessions the engine closed internally (the idle sweep). Drained by the
+    /// daemon so its pending-tool broker does not keep dead session ids.
+    closed: Arc<Mutex<Vec<u64>>>,
     handle: Option<JoinHandle<Result<(), String>>>,
 }
 
@@ -234,6 +240,12 @@ impl SlotEngine {
         *self.stats.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Drain the ids of sessions the engine closed on its own (idle sweep).
+    pub fn take_closed_sessions(&self) -> Vec<u64> {
+        let mut guard = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
     /// Build the rig on a new thread and start serving. Returns once the model
     /// is loaded, so a caller that gets `Ok` can submit immediately.
     ///
@@ -256,12 +268,19 @@ impl SlotEngine {
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let stats = Arc::new(Mutex::new(EngineStats::default()));
         let stats_thread = Arc::clone(&stats);
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        let closed_thread = Arc::clone(&closed);
 
         let handle = std::thread::Builder::new()
             .name("hipfire-slot-engine".to_string())
             .spawn(move || -> Result<(), String> {
-                match Rig::build(&cfg) {
+                match Rig::build(&cfg, closed_thread) {
                     Ok(rig) => {
+                        // Publish the swap policy before the load ack, so the
+                        // daemon reports the effective budgets and usage.
+                        if let Ok(mut st) = stats_thread.lock() {
+                            st.note_swap(&rig.swap);
+                        }
                         let _ = ready_tx.send(Ok(()));
                         run_loop(rig, rx, stats_thread)
                     }
@@ -277,6 +296,7 @@ impl SlotEngine {
             Ok(Ok(())) => Ok(SlotEngine {
                 tx: Some(tx),
                 stats,
+                closed,
                 handle: Some(handle),
             }),
             Ok(Err(e)) => Err(e),
@@ -332,6 +352,9 @@ impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
     }
     fn stats(&self) -> EngineStats {
         SlotEngine::stats(self)
+    }
+    fn take_closed_sessions(&self) -> Vec<u64> {
+        SlotEngine::take_closed_sessions(self)
     }
     fn shutdown(self: Box<Self>) -> Result<(), String> {
         // `shutdown_engine` consumes `self`; move the engine out of the Box
@@ -495,6 +518,12 @@ struct Rig {
     n_slots: usize,
     cap_tokens: usize,
     prefill_chunk: usize,
+    /// Close parked sessions after this idle period (None = never).
+    session_ttl: Option<std::time::Duration>,
+    /// Hard cap on session-table entries; 0 = auto max(64, 16 x n_slots).
+    session_max: usize,
+    /// Ids the engine closed internally, for the daemon's broker.
+    closed_sessions: Arc<Mutex<Vec<u64>>>,
     /// Global trunk-row budget (spec §5.2 S2). Enforced in `next_batch` and
     /// the MTP verify injection path; the forward assert is a backstop.
     max_batch_tokens: usize,
@@ -793,11 +822,12 @@ impl Rig {
     /// staging, PBS, scratch, logits/out are all owned after `Qwen35Weights`.
     /// On any `?`/error, all completed stages are freed, weights freed,
     /// caches/graph state invalidated and pool drained, so no VRAM leaks.
-    fn build(cfg: &EngineConfig) -> Result<Rig, String> {
+    fn build(cfg: &EngineConfig, closed_sessions: Arc<Mutex<Vec<u64>>>) -> Result<Rig, String> {
         use hipfire_runtime::hfq::HfqFile;
         use hipfire_runtime::tokenizer::Tokenizer;
         use rdna_compute::kv_slots::preflight_alloc;
 
+        let (session_ttl, session_max) = session_policy_from_config();
         let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
         let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -1590,8 +1620,15 @@ impl Rig {
             .map(|t| t.buf.size() as u64)
             .sum();
         let kv_dtype_tag = slot_snapshot_kv_tag(kv_mode);
+        // A load identity, not a full-content hash: length + sampled bytes.
+        // The per-engine nonce makes a snapshot restorable only by the engine
+        // that captured it, even if a file outlives its store.
+        let model_fingerprint = hipfire_runtime::swap::snapshot::model_fingerprint(&cfg.model_path)
+            .map_err(|e| format!("model fingerprint: {e}"))?;
+        let instance_id = instance_nonce();
         let stamp = SnapshotStamp {
-            model_hash: weight_bytes,
+            model_hash: model_fingerprint,
+            instance_id,
             kv_dtype_tag,
             per_pos_bytes: per_pos_bytes as u32,
             per_pos_v_bytes: per_pos_v_bytes as u32,
@@ -1614,8 +1651,25 @@ impl Rig {
             vram_total as u64,
         );
         adm.set_host_budget(cfg.host_budget_bytes);
-        let swap = SwapManager::new(cfg.swap_dir.clone(), cfg.host_budget_bytes)
-            .map_err(|e| format!("SwapManager: {e}"))?;
+        let swap = SwapManager::new(
+            cfg.swap_dir.clone(),
+            cfg.host_budget_bytes,
+            cfg.swap_disk_bytes,
+        )
+        .map_err(|e| format!("SwapManager: {e}"))?;
+        eprintln!(
+            "serve: swap host-budget={} B disk-budget={} B dir={} session-ttl={:?} session-max={} model-fingerprint={:016x} instance-id={:016x}",
+            cfg.host_budget_bytes,
+            swap.store().disk_budget(),
+            cfg.swap_dir.display(),
+            session_ttl,
+            session_max,
+            model_fingerprint,
+            instance_id
+        );
+        if cfg.host_budget_bytes == 0 && swap.store().disk_budget() == 0 {
+            eprintln!("serve: swap tiers disabled (host=0, disk unusable); evicted sessions will re-prefill");
+        }
 
         // Commit guard — prevent Drop cleanup, move out owned GPU state.
         g.committed = true;
@@ -1858,6 +1912,9 @@ impl Rig {
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
             prefill_chunk,
+            session_ttl,
+            session_max,
+            closed_sessions,
             max_batch_tokens,
             prefill_min_tokens,
             logits_host: vec![0.0f32; cfg.n_slots * vocab_size],
@@ -3378,6 +3435,32 @@ fn lock_stats(stats: &std::sync::Mutex<EngineStats>) -> std::sync::MutexGuard<'_
     stats.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Swap failures are not fatal (the session re-prefills), but they must not be
+/// silent. Warn once per process and per failure class so a misconfigured
+/// budget or an unwritable directory is visible without spamming the log on
+/// every eviction.
+static SWAP_PARK_WARNED: AtomicBool = AtomicBool::new(false);
+static SWAP_RESTORE_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_once(flag: &AtomicBool, message: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        eprintln!("WARNING {message}");
+    }
+}
+
+/// Random per-engine id for `SnapshotStamp::instance_id`. `RandomState` is
+/// seeded by the standard library; the pid and time keep two instances in the
+/// same process distinct as well.
+fn instance_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(u64::from(std::process::id()));
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        h.write_u128(now.as_nanos());
+    }
+    h.finish()
+}
+
 /// One request parked in the bounded waiting room (spec §5.3 S3).
 struct ParkedRequest {
     req: SubmitRequest,
@@ -3794,9 +3877,28 @@ fn run_loop(
             let idle = slots.iter().all(|s| s.is_none());
             if idle && rig.wait_queue.queued_count() == 0 {
                 // Nothing in flight and nothing queued: block rather than spin.
-                match rx.recv() {
-                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
-                    Err(_) => break 'serve, // all senders gone: shut down after drain
+                // With an idle TTL configured, wake periodically to close
+                // abandoned parked sessions instead of waiting for the next
+                // request.
+                match rig.session_ttl.map(|ttl| {
+                    ttl.min(std::time::Duration::from_secs(30))
+                        .max(std::time::Duration::from_secs(1))
+                }) {
+                    Some(wait) => match rx.recv_timeout(wait) {
+                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Err(RecvTimeoutError::Timeout) => {
+                            sweep_sessions(&mut rig);
+                            let mut st = stats.lock().expect("stats");
+                            st.note_swap(&rig.swap);
+                            drop(st);
+                            continue 'serve;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => break 'serve,
+                    },
+                    None => match rx.recv() {
+                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Err(_) => break 'serve, // all senders gone: shut down after drain
+                    },
                 }
             }
             loop {
@@ -3818,11 +3920,12 @@ fn run_loop(
             // A20 soak telemetry: sample free physical pages once per step so a
             // monotonic decline across identical request cycles (the page-level
             // leak signature) is observable from `EngineStats` (spec §9.2).
-            if let Some(pp) = rig.pool.page_pool() {
-                stats
-                    .lock()
-                    .expect("stats")
-                    .note_pool_pages(pp.free_pages(), pp.n_pages());
+            {
+                let mut st = stats.lock().expect("stats");
+                if let Some(pp) = rig.pool.page_pool() {
+                    st.note_pool_pages(pp.free_pages(), pp.n_pages());
+                }
+                st.note_swap(&rig.swap);
             }
             // Expire timed-out waiters → typed queue timeout rejection. The
             // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
@@ -5847,6 +5950,11 @@ fn admit(
         }
     }
 
+    // Bound parked-session growth before matching: close swapped/cold
+    // sessions idle past the TTL, then enforce the non-resident cap. A
+    // resident session is never a sweep victim.
+    sweep_sessions(rig);
+
     // Multi-turn continuation. The client resends the whole conversation, so a
     // follow-up turn is matched by its USER turns and then built by APPENDING
     // `continuation` to the session's exact stored tokens. Appending rather
@@ -5854,6 +5962,10 @@ fn admit(
     // turn began after an OpenThink opener that history rendering does not
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
+    // Set when a matched session's snapshot was lost and restore marked it
+    // Cold: the cold path below re-prefills into that same session instead of
+    // minting a new id (which would strand the old entry).
+    let mut cold_reuse: Option<SessionId> = None;
     if req.visual_data.is_none() && !req.continuation.tokens().is_empty() {
         if rig.gpu.slot_trace() {
             let shape = match &req.continuation {
@@ -5914,17 +6026,21 @@ fn admit(
                         .lru_idle_victim(&busy)
                         .filter(|v| *v != existing)
                         .and_then(|v| {
-                            evict(rig, v);
+                            if evict(rig, v, stats) {
+                                lock_stats(stats).note_eviction();
+                            }
                             rig.pool.acquire()
                         })
                 });
                 if let Some(target) = free {
-                    if restore(rig, existing, target) {
+                    if restore(rig, existing, target, stats) {
                         lock_stats(stats).note_restore();
                         slot = Some(target);
                     } else {
                         // restore marked it Cold; its tokens survive, so the
-                        // cold path below re-prefills.
+                        // cold path below re-prefills the same session rather
+                        // than minting a new id and stranding this entry.
+                        cold_reuse = Some(existing);
                         rig.pool.release(target);
                     }
                 }
@@ -6044,7 +6160,7 @@ fn admit(
                         let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
                             break;
                         };
-                        if !evict(rig, victim) {
+                        if !evict(rig, victim, stats) {
                             break;
                         }
                         lock_stats(stats).note_eviction();
@@ -6381,13 +6497,13 @@ fn admit(
         .len()
         .saturating_add(req.max_tokens.max(1))
         .min(rig.cap_tokens);
-    let mut opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens);
+    let mut opened = admit_cold(rig, &mut cold_reuse, grant_tokens);
     while opened.is_err() {
         // Re-derive the victim each pass: the previous park consumed it.
         let Some(victim) = rig.sessions.lru_idle_victim(&busy) else {
             break;
         };
-        if !evict(rig, victim) {
+        if !evict(rig, victim, stats) {
             let _ = send_event(
                 &req.reply,
                 Event::Rejected {
@@ -6399,7 +6515,7 @@ fn admit(
             return;
         }
         lock_stats(stats).note_eviction();
-        opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens);
+        opened = admit_cold(rig, &mut cold_reuse, grant_tokens);
     }
     let id = match opened {
         Ok(id) => id,
@@ -6717,7 +6833,7 @@ fn admit(
             let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
                 break;
             };
-            if !evict(rig, victim) {
+            if !evict(rig, victim, stats) {
                 break;
             }
             lock_stats(stats).note_eviction();
@@ -7008,11 +7124,98 @@ fn admit(
     lock_stats(stats).note_admitted();
 }
 
+/// Read the session sweep policy from the process config. The engine already
+/// reads developer config directly; these two keys are process-scoped policy,
+/// like the swap budgets.
+fn session_policy_from_config() -> (Option<std::time::Duration>, usize) {
+    let process = hipfire_config::active_or_local_process_config();
+    let value = |key: &str| {
+        process.values.get(key).and_then(|value| match value {
+            hipfire_config::ConfigValue::Integer(i) => u64::try_from(*i).ok(),
+            _ => None,
+        })
+    };
+    let ttl = value("serve.multi_slot_session_ttl_secs").unwrap_or(3600);
+    let max = value("serve.multi_slot_max_sessions").unwrap_or(0);
+    (
+        if ttl == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(ttl))
+        },
+        usize::try_from(max).unwrap_or(usize::MAX),
+    )
+}
+
+/// Close parked sessions that aged out and enforce the hard cap. The table
+/// owns the age/limit policy inputs; the engine drops their swap entries.
+///
+/// The TTL is wall-clock and the cap is generous (16 parked conversations per
+/// slot, at least 64): a parked session is only a cache entry, so closing one
+/// costs a cold re-prefill, never correctness.
+fn sweep_sessions(rig: &mut Rig) {
+    const CAP_MIN: usize = 64;
+    const PER_SLOT: usize = 16;
+    let ttl = rig.session_ttl.unwrap_or(std::time::Duration::MAX);
+    let cap = if rig.session_max == 0 {
+        rig.n_slots.saturating_mul(PER_SLOT).max(CAP_MIN)
+    } else {
+        rig.session_max
+    };
+    let closed = rig.sessions.sweep_expired(
+        &mut rig.pool,
+        &mut rig.adm,
+        std::time::Instant::now(),
+        ttl,
+        cap,
+    );
+    if closed.is_empty() {
+        return;
+    }
+    if let Ok(mut ids) = rig.closed_sessions.lock() {
+        ids.extend(closed.iter().map(|id| id.0));
+    }
+    if rig.gpu.slot_trace() {
+        eprintln!(
+            "[slot-trace] swept {} parked session(s) (ttl {ttl:?}, cap {cap})",
+            closed.len()
+        );
+    }
+    for id in closed {
+        rig.swap.forget(id.0);
+        // The session is gone; drop any fairness grant it still holds. (The
+        // normal Close command does the same.)
+        let _ = rig.fair_queue.remove(id.0);
+    }
+}
+
+/// Admit the cold path's session. When a matched session's snapshot was lost,
+/// restore marked that session Cold; reopen the same id (it still owns the
+/// conversation identity) instead of minting a new one, which would strand the
+/// old entry in the table forever.
+fn admit_cold(
+    rig: &mut Rig,
+    reuse: &mut Option<SessionId>,
+    grant_tokens: usize,
+) -> Result<SessionId, AdmitError> {
+    if let Some(id) = *reuse {
+        match rig
+            .sessions
+            .reopen_cold(&mut rig.pool, &mut rig.adm, id, grant_tokens)
+        {
+            Ok(id) => return Ok(id),
+            Err(AdmitError::UnknownSession(_)) => *reuse = None,
+            Err(e) => return Err(e),
+        }
+    }
+    rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens)
+}
+
 /// Capture an idle session's state, park it, and free its slot.
 ///
 /// Returns false if anything went wrong, in which case the session is marked
 /// `Cold`: its tokens survive, so it re-prefills next time. Slow, never wrong.
-fn evict(rig: &mut Rig, victim: SessionId) -> bool {
+fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> bool {
     let Some(sess) = rig.sessions.get(victim) else {
         return false;
     };
@@ -7032,34 +7235,58 @@ fn evict(rig: &mut Rig, victim: SessionId) -> bool {
     );
     drop(dn_refs);
 
-    match snap {
+    let evicted = match snap {
         Ok(snap) => match rig.swap.park(victim.0, snap) {
             Ok(()) => {
                 rig.sessions
                     .mark_swapped(&mut rig.pool, &mut rig.adm, victim);
                 true
             }
-            Err(_) => {
+            Err(e) => {
+                warn_once(
+                    &SWAP_PARK_WARNED,
+                    &format!(
+                        "swap park failed for session {}: {e}; the session is Cold and will re-prefill",
+                        victim.0
+                    ),
+                );
                 rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
                 true
             }
         },
-        Err(_) => {
+        Err(e) => {
+            warn_once(
+                &SWAP_PARK_WARNED,
+                &format!(
+                    "swap snapshot capture failed for session {}: {e}; the session is Cold and will re-prefill",
+                    victim.0
+                ),
+            );
             rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
             true
         }
-    }
+    };
+    lock_stats(stats).note_swap(&rig.swap);
+    evicted
 }
 
 /// Restore a previously swapped session into `slot`. Any failure marks it
 /// `Cold` so the caller re-prefills from tokens.
-fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
+fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineStats>>) -> bool {
     // A swapped session gave its VRAM admission back on eviction; take it
     // again before its state re-enters the GPU. If the budget cannot cover it
     // the snapshot is dropped and the session goes Cold (re-prefill path).
-    if rig.sessions.readmit(&mut rig.adm, id).is_err() {
+    if let Err(e) = rig.sessions.readmit(&mut rig.adm, id) {
+        warn_once(
+            &SWAP_RESTORE_WARNED,
+            &format!(
+                "swap restore failed for session {} ({e}); the session is Cold and will re-prefill",
+                id.0
+            ),
+        );
         rig.swap.forget(id.0);
         rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
+        lock_stats(stats).note_swap(&rig.swap);
         return false;
     }
     match rig.swap.unpark(id.0) {
@@ -7089,16 +7316,33 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
             match r {
                 Ok(()) => {
                     rig.sessions.mark_resident(id, slot, snap.seq_len);
+                    lock_stats(stats).note_swap(&rig.swap);
                     true
                 }
-                Err(_) => {
+                Err(e) => {
+                    warn_once(
+                        &SWAP_RESTORE_WARNED,
+                        &format!(
+                            "swap restore failed for session {} ({e}); the session is Cold and will re-prefill",
+                            id.0
+                        ),
+                    );
                     rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
+                    lock_stats(stats).note_swap(&rig.swap);
                     false
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
+            warn_once(
+                &SWAP_RESTORE_WARNED,
+                &format!(
+                    "swap restore failed for session {} ({e}); the session is Cold and will re-prefill",
+                    id.0
+                ),
+            );
             rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
+            lock_stats(stats).note_swap(&rig.swap);
             false
         }
     }
