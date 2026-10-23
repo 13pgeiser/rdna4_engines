@@ -4083,7 +4083,7 @@ constexpr int kBlk = 8, kBlkDepth = 7;
 constexpr int32_t kBlkMask = 99;
 
 /* The host's driver: both passes built after the commit, from the committed sequence. */
-BlockRun block_reference(int steps) {
+BlockRun block_reference(int steps, int blk = kBlk, int depth = kBlkDepth) {
     Fixture f;
     std::vector<uint64_t> ids;
     ahead_setup(f, kBlkDepth, ids);
@@ -4094,7 +4094,7 @@ BlockRun block_reference(int steps) {
     Scheduler::BlockRow rows[4];
     for (int t = 0; t < steps; ++t) {
         CHECK_OK(ahead_commit(f, t));
-        CHECK_EQ(f.sch.block_begin(kBlk, kBlkDepth, 0, kBlkMask, rows, 4), 3);
+        CHECK_EQ(f.sch.block_begin(blk, depth, 0, kBlkMask, rows, 4), 3);
         const RadBatch* cb = f.sch.block_context(t + 1);
         if (!cb) { CHECK(cb != nullptr); return run; }
         run.context.push_back(read_rows(cb, f.sch.plan(), f.kv));
@@ -4105,7 +4105,7 @@ BlockRun block_reference(int steps) {
         for (int i = 0; i < 3; ++i) { StepEntry e; e.seq = rows[i].seq; qp.e.push_back(e); }
         run.query.push_back(read_rows(qb, qp, f.kv));
         f.sch.block_end();
-        ahead_publish(f, ids, kBlkDepth, t + 1);
+        ahead_publish(f, ids, depth, t + 1);
         b = f.sch.step();
         if (!b) break;
         run.trunk.push_back(read_rows(b, f.sch.plan(), f.kv));
@@ -4118,7 +4118,7 @@ BlockRun block_reference(int steps) {
  * passes built before the commit with the query rows placed by ADV_BLOCK, the proposals into the
  * slots (ADV_BTAKE), expect_draft and step_next with ADV_TRUNK, then the commit, block_end, the
  * drafts published and promote_next. */
-BlockRun block_pipelined(int steps) {
+BlockRun block_pipelined(int steps, int blk = kBlk, int depth = kBlkDepth) {
     Fixture f;
     std::vector<uint64_t> ids;
     ahead_setup(f, kBlkDepth, ids);
@@ -4148,7 +4148,7 @@ BlockRun block_pipelined(int steps) {
                 ++run.card_host_disagree;
         }
 
-        CHECK_EQ(f.sch.block_begin(kBlk, kBlkDepth, 0, kBlkMask, rows, 4, /*on_card=*/true), 3);
+        CHECK_EQ(f.sch.block_begin(blk, depth, 0, kBlkMask, rows, 4, /*on_card=*/true), 3);
         const RadBatch* cb = f.sch.block_context(t + 1);
         if (!cb) { CHECK(cb != nullptr); return run; }
         run.context.push_back(read_rows(cb, f.sch.plan(), f.kv));
@@ -4161,19 +4161,20 @@ BlockRun block_pipelined(int steps) {
         StepPlan qp;
         for (int i = 0; i < 3; ++i) { StepEntry e; e.seq = rows[i].seq; qp.e.push_back(e); }
         run.query.push_back(read_rows(qb, qp, f.kv));
-        /* The block's proposals for step t + 1, taken behind the anchor. */
+        /* The block's proposals for step t + 1, taken behind the anchor, at the drafter's pitch
+         * (its own block's depth): a short block fills a row's front. */
         std::vector<int32_t> prop((size_t)3 * kBlkDepth);
         for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < kBlkDepth; ++j)
+            for (int j = 0; j < depth; ++j)
                 prop[(size_t)(i * kBlkDepth + j)] = ahead_draft(rows[i].seq, t + 1, j);
         AdvanceArgs tk = f.sch.advance_args(0);
         tk.mode = ADV_BTAKE;
-        tk.round = kBlkDepth;
+        tk.round = depth;
         tk.src = prop.data();
         tk.src_pitch = kBlkDepth;
         tk.st = slots.data();
         for (int i = 0; i < tk.n_seq; ++i) adv_row(tk, i);
-        for (int i = 0; i < 3; ++i) f.sch.expect_draft(rows[i].seq, kBlkDepth);
+        for (int i = 0; i < 3; ++i) f.sch.expect_draft(rows[i].seq, depth);
 
         const RadBatch* nb = f.sch.step_next();
         if (nb) {
@@ -4184,7 +4185,7 @@ BlockRun block_pipelined(int steps) {
         }
         CHECK_OK(ahead_commit(f, t));
         f.sch.block_end();
-        ahead_publish(f, ids, kBlkDepth, t + 1);
+        ahead_publish(f, ids, depth, t + 1);
         if (nb) {
             f.sch.promote_next();
             b = nb;
@@ -4214,6 +4215,42 @@ TEST(a_block_drafter_on_the_card_runs_the_passes_the_hosts_driver_runs) {
     const int T = 24;
     const BlockRun a = block_reference(T);
     const BlockRun b = block_pipelined(T);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
+    REQUIRE_EQ(a.trunk.size(), b.trunk.size());
+    REQUIRE_EQ(a.context.size(), b.context.size());
+    REQUIRE_EQ(a.query.size(), b.query.size());
+    for (size_t t = 0; t < a.trunk.size(); ++t) {
+        CHECK(a.trunk[t] == b.trunk[t]);
+        CHECK_EQ(b.trunk[t].bad_slots, 0);
+    }
+    for (size_t t = 0; t < a.context.size(); ++t) {
+        BatchRows ca = a.context[t], cb = b.context[t];
+        ca.tok.clear();
+        cb.tok.clear();
+        const bool same_c = ca == cb, same_q = a.query[t] == b.query[t];
+        CHECK(same_c);
+        CHECK(same_q);
+        if (!same_c || !same_q)
+            std::fprintf(stderr, "    step %zu: context %s, query %s\n", t,
+                         same_c ? "same" : "differs", same_q ? "same" : "differs");
+        CHECK_EQ(a.context[t].bad_slots, 0);
+        CHECK_EQ(b.context[t].bad_slots, 0);
+        CHECK_EQ(a.query[t].bad_slots, 0);
+        CHECK_EQ(b.query[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+}
+
+/* The same at DFlash2's short block (--draft-short-from: 4 rows, 3 proposals), which the card's driver
+ * runs once enough sequences decode (Engine::block_shape): the query pass of the short block, its
+ * proposals taken from the front of each row at the drafter's pitch, and the step issued ahead
+ * verifying 3 of them. */
+TEST(a_block_drafters_short_block_on_the_card_runs_the_passes_the_hosts_driver_runs) {
+    const int T = 24;
+    const BlockRun a = block_reference(T, 4, 3);
+    const BlockRun b = block_pipelined(T, 4, 3);
     CHECK_EQ(b.ahead, T);
     CHECK_EQ(b.card_host_disagree, 0);
     REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);

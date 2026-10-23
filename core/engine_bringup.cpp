@@ -1312,7 +1312,7 @@ int Engine::declare() {
                                                   : "is a serial head, which proposes no block");
     if (drafter_short_)
         RAD_INFO("speculation: from %lld decoding sequences on, '%s' runs its short block of %lld "
-                 "row(s), %lld token(s), on the host's block driver", (long long)cfg_.draft_short_from,
+                 "row(s), %lld token(s)", (long long)cfg_.draft_short_from,
                  drafter_name_.c_str(),
                  (long long)drafter_short_,
                  (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block

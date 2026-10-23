@@ -341,7 +341,7 @@ private:
     /* The block drafter's shorter block (rad_drafter_short_block), 0 when it has none or
      * --draft-short-from is 0. */
     int64_t              drafter_short_ = 0;
-    bool                 short_on_ = false;     /* the short block runs now (run_block_drafter) */
+    bool                 short_on_ = false;     /* the short block runs now (block_shape) */
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
@@ -417,10 +417,16 @@ private:
     int  block_pass(const RadBatch* db, const char* what, int step);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
+    /* The block and proposal count this step's query pass runs at: the drafter's own, or its short
+     * block once --draft-short-from sequences decode, back to its own only two below. */
+    void block_shape(int* block, int* steps);
     /* Handed from issue_block_drafter to finish_block_drafter and issue_ahead: the drafting rows,
      * in the query pass's order, and how many there are (0 when no query pass ran). */
     std::vector<Scheduler::BlockRow> block_row_;
     int  block_rows_ = 0;
+    /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
+     * issue_ahead's expect_draft. */
+    int  block_steps_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

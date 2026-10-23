@@ -313,6 +313,25 @@ bool Engine::block_drafting() const {
  * and its proposals go into the slots behind the anchor (ADV_BTAKE): exactly the token row the
  * next verify reads (ADV_TRUNK), so the step issued ahead verifies them with no host round trip.
  * collect_step's wait covers both passes and the slots' readback. */
+void Engine::block_shape(int* block, int* steps) {
+    *steps = drafter_.depth;
+    /* The row count is the drafter's (defaulted and checked by declare_drafter). */
+    *block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
+    /* Its short block under load (rad_drafter_short_block): the same anchor convention, so as many
+     * fewer proposals as rows. The load is the step just run's, which the next step, the one these
+     * proposals are for, mostly repeats. On from --draft-short-from decoding sequences, off again
+     * only two below it, so a load wavering at the threshold does not switch the block (a new pass
+     * shape) every step. */
+    if (drafter_short_ <= 0) return;
+    const int64_t n = sched_.decoded_seqs();
+    if (n >= cfg_.draft_short_from) short_on_ = true;
+    else if (n + 2 <= cfg_.draft_short_from) short_on_ = false;
+    if (short_on_) {
+        *steps -= *block - (int)drafter_short_;
+        *block  = (int)drafter_short_;
+    }
+}
+
 int Engine::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
     if (!block_drafting()) return RAD_OK;
@@ -321,8 +340,12 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     /* The sampled ids before either pass, as the serial driver reads them. */
     RAD_TRY(collect_issue(so));
 
-    const int steps = drafter_.depth;
-    const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
+    /* The short block too (block_shape): its query pass is a shorter batch the card positions
+     * the same way, its proposals the front of each row at the drafter's pitch (ADV_BTAKE), and
+     * the step issued ahead verifies that many (issue_ahead). */
+    int block = 0, steps = 0;
+    block_shape(&block, &steps);
+    block_steps_ = steps;
     block_row_.resize((size_t)cfg_.max_seqs);
     const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
@@ -368,7 +391,7 @@ int Engine::finish_block_drafter(const StepOut& so) {
     if (block_rows_ <= 0) return RAD_OK;
 
     Rank& r0 = *ranks_[0];
-    const int steps = drafter_.depth;
+    const int steps = block_steps_;
     draft_out_.assign((size_t)block_rows_ * (size_t)steps, 0);
     for (int i = 0; i < block_rows_; ++i) {
         const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
