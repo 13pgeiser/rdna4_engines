@@ -332,6 +332,13 @@ The pins file is written atomically and `verdict` plus `pin` run under `flock` o
   `c6f894f3d2c2ebb38326335d00418ff1`; `a3b-ar` commits md5 `9391f77ee9b35147e6766bde99b5c540` (md5 over the
   compact JSON array of ids, recipe format; `ids_md5` in the verdict and pins is a different encoding, the
   md5 of the comma-joined ids).
+- **`a3b-ar` re-pinned at the 0.4.3 RC (2026-10-23).** The A3B FP8 packet `c4c058a20f` changed the
+  `.mq4r` prefill numerics deterministically (`HIPFIRE_GDN_MOE_PRE_FUSED` flips a near-tie at token 13;
+  `HIPFIRE_FA_PREFILL_PM` with Q prep adds WT2 prefill KLD +0.0034, CI [+0.0009, +0.0058], within the A3B
+  gate; decode unchanged). By Main's decision the cell is pinned to the RC ids, `ids_md5`
+  `f4a33e160a48fb46728e640b6b488a15` (recipe-format md5 `7129643965bf3a7399ef50e6357851be`), from the RC run
+  at `8949a6bea3`; the old `9391f77e…` above is the pre-packet capture. Evidence:
+  `release-0.4.3/a3b-mq4r-divergence/`.
 - **The PP2-MTP prompt-dependent window bug is not covered.** A known `beta` error
   (`forced-token advance: ... row capture cannot be resized while a window is live`) depends on the
   prompt and was not triggered by this prompt in any observed PP2 sample, so `pp2-mtp` passes on a build
