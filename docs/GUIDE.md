@@ -1136,24 +1136,24 @@ never switches. Startup names what it will run:
 speculation: from 16 decoding sequences on, 'dflash2' runs its short block of 4 row(s), 3 token(s)
 ```
 
-or warns that the drafter declares no shorter block, or is a serial head. Qwen3.8-27B MXFP4 + DFlash2
-on two R9700s, `--num-speculative-tokens 7` at the fixed window, greedy, tok/s:
+or warns that the drafter declares no shorter block, or is a serial head. The block driver runs the
+short block on the card as it runs the drafter's own: the query pass is the shorter batch, each row's
+proposals are the front of the drafter's proposal row, and the step issued ahead verifies that many.
+Qwen3.8-27B MXFP4 + DFlash2 on two R9700s, `--num-speculative-tokens 7` at the fixed window, `k6_v4`,
+sampled (temperature 1.0), medians of six rounds at 8 streams and three at 16-64, tok/s:
 
 | streams | unset | `--draft-short-from 8` |
 |---|---|---|
-| 1 | 188.3 | 184.2 |
-| 4 | 573.2 | 572.3 |
-| 8 | 823.6 | 784.3 |
-| 16 | 922.2 | 1089.1 |
-| 32 | 1191.5 | 1252.7 |
-| 64 | 1255.8 | 1541.0 |
+| 8 | 652.8 | 696.8 |
+| 16 | 751.9 | 945.6 |
+| 32 | 985.7 | 1070.8 |
+| 64 | 1055.0 | 1334.6 |
 
-The block driver runs the short block on the card as it runs the drafter's own: the query pass is
-the shorter batch, each row's proposals are the front of the drafter's proposal row, and the step
-issued ahead verifies that many. Leave it unset for one to eight streams; for a server that
-regularly decodes 16 or more sequences, set it around 16 and measure 8..32 for your load. The
-drafts are verified as any others; as with `--num-speculative-tokens`, a different block is a
-different verify shape, so greedy text can differ at a near-tie.
+Below N the engine runs the drafter's own block, the same shapes as with the flag unset (greedy, six
+rounds: 1 stream 183.4 and 183.1, 4 streams 529.1 and 537.2). Set it to 8 for a server that decodes
+eight or more sequences at once. The drafts are verified as any others; as with
+`--num-speculative-tokens`, a different block is a different verify shape, so greedy text can differ at
+a near-tie.
 
 ### 4.7 Multiple cards
 
