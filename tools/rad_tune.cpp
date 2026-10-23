@@ -45,8 +45,14 @@ void usage() {
         "      --iters N      launches per rep (default 32). One launch is short enough that\n"
         "                     launch overhead and clock ramp would otherwise dominate.\n"
         "      --max-tok N    the max_tok declare is run at (default 8192)\n"
+        "      --max-seqs N   the max_seqs declare is run at (default 256)\n"
         "      --tp N         tensor-parallel width to declare at (default 1). The shapes a\n"
         "                     sharded deployment runs are not the shapes tp=1 runs.\n"
+        "      --kv-cache-dtype T  bf16 (default) or fp8 -- attention bands are gated on it.\n"
+        "                     Declare what the served engine runs, or the tune rows will not\n"
+        "                     match the bands it selects.\n"
+        "      --tp-wire MODE exact (default) or wht6 -- selects the all-reduce family.\n"
+        "      --tp-wire-min-kb N  the message size from which the lossy wire is used.\n"
         "      --num-speculative-tokens N|auto\n"
         "                     draft depth to declare at (default auto: the container's own). It puts\n"
         "                     the drafter's kernels in the measured graph.\n"
@@ -335,7 +341,11 @@ int main(int argc, char** argv) {
     std::vector<std::string> hierarchy = rad_hierarchy_from_env();
     int      reps = 5, iters = 32;
     int64_t  max_tok = 8192;
+    int64_t  max_seqs = 256;
     int      tp = 1, spec = -1;          /* -1 = the container's own drafter depth */
+    int      kv_dtype = RAD_DT_INVALID;  /* RAD_F8E4M3 = the engine's --kv-cache-dtype fp8 */
+    int      wire_lossy = 0;             /* the engine's --tp-wire wht6 */
+    int64_t  wire_min_kb = 128;          /* the engine's --tp-wire-min-kb */
     bool     dry = false, verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -357,7 +367,24 @@ int main(int argc, char** argv) {
         else if (a == "--reps")    reps = (int)num("--reps", 1, INT32_MAX);
         else if (a == "--iters")   iters = (int)num("--iters", 1, INT32_MAX);
         else if (a == "--max-tok") max_tok = num("--max-tok", 1, INT64_MAX);
+        else if (a == "--max-seqs") max_seqs = num("--max-seqs", 1, INT64_MAX);
         else if (a == "--tp")      tp   = (int)num("--tp", 1, INT32_MAX);
+        else if (a == "--kv-cache-dtype") {
+            const char* v = next("--kv-cache-dtype");
+            if (!std::strcmp(v, "fp8"))      kv_dtype = RAD_F8E4M3;
+            else if (!std::strcmp(v, "bf16")) kv_dtype = RAD_DT_INVALID;
+            else { std::fprintf(stderr, "rad-tune: --kv-cache-dtype: '%s' is not one of "
+                                "bf16, fp8 (the tuner tunes the bands it declares; other "
+                                "encodings are the engine's)\n", v); return 2; }
+        }
+        else if (a == "--tp-wire") {
+            const char* v = next("--tp-wire");
+            if (!std::strcmp(v, "wht6"))        wire_lossy = 1;
+            else if (!std::strcmp(v, "exact"))  wire_lossy = 0;
+            else { std::fprintf(stderr, "rad-tune: --tp-wire: '%s' is not one of exact, wht6\n",
+                                v); return 2; }
+        }
+        else if (a == "--tp-wire-min-kb") wire_min_kb = num("--tp-wire-min-kb", 0, INT64_MAX);
         else if (a == "--num-speculative-tokens") {
             /* `auto` is the container's own depth, as the engine's flag of this name reads it. */
             const char* v = next("--num-speculative-tokens");
@@ -410,10 +437,14 @@ int main(int argc, char** argv) {
      * the speculative depth decides whether the drafter (and its shapes) is in the graph. */
     RadBuildCtx ctx{};
     ctx.rank = 0; ctx.world_size = tp; ctx.max_tok = max_tok;
+    ctx.max_seqs = max_seqs;
+    ctx.tp_wire_lossy = wire_lossy;
+    ctx.tp_wire_min_bytes = wire_min_kb * 1024;
+    ctx.kv_dtype = kv_dtype;
     RadArchProbe probe{};
     (void)rad_tools_probe(plugins, meta, &probe);
     ctx.max_spec = spec >= 0 ? spec : probe.draft_depth;
-    ctx.max_seqs = 256; ctx.max_ctx = meta.n_ctx_train; ctx.scope = "";
+    ctx.max_seqs = max_seqs; ctx.max_ctx = meta.n_ctx_train; ctx.scope = "";
 
     /* Peer access, measured before selection, as Engine does: collectives constrain device.p2p
      * (abi/rad_types.h), and with the fact unset neither the peer-to-peer row nor its host-memory
