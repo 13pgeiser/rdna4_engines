@@ -164,7 +164,8 @@ TEST(a_video_request_that_cannot_be_served_names_its_field) {
              std::string("num_inference_steps"));
     CHECK_EQ(v.refused(Videos::body({ { "input_reference", "file-1" } })),
              std::string("input_reference"));
-    /* `format` is a known field; a container it does not write names the field. */
+    /* The output is always the MP4: `format` is no longer a field and is refused as an unknown
+     * one, naming itself. */
     CHECK_EQ(v.refused(Videos::body({ { "format", "avi" } })), std::string("format"));
     /* The keyframe tasks belong to a model with a video encoder; this one has none, so the name
      * is refused as a task. A model that encodes accepts it and is refused naming the missing
@@ -382,7 +383,6 @@ TEST(a_video_job_completes_and_serves_its_file) {
     CHECK(o["completed_at"].is_number());
     CHECK(o["expires_at"].get<int64_t>() > o["completed_at"].get<int64_t>());
     CHECK(o["error"].is_null());
-    CHECK_EQ(str_at(o, "format"), std::string("mp4"));   /* the default container */
     HttpResponse c = v.f->get(("/v1/videos/" + id + "/content").c_str());
     REQUIRE_EQ(c.status, 200);
     CHECK_EQ(c.content_type, std::string("video/mp4"));
@@ -418,43 +418,6 @@ TEST(a_video_job_completes_and_serves_its_file) {
     CHECK(dj["deleted"].get<bool>());
     CHECK_EQ(v.f->get(("/v1/videos/" + id).c_str()).status, 404);
     CHECK_EQ(v.f->get(("/v1/videos/" + id + "/content").c_str()).status, 404);
-}
-
-/* format=webm writes the same job as a WebM instead: an EBML header first, a VP9 video and an Opus
- * soundtrack (the 32 kHz fake resampled to Opus's 48 kHz), served as video/webm under a .webm
- * filename. The codecs are runtime-discovered, not a compile-time guarantee, so a build without a
- * VP9/Opus encoder or a WebM muxer skips rather than fails. The capability block lists the
- * containers format accepts. */
-TEST(a_video_can_be_written_as_webm) {
-    Videos v;
-    HttpResponse r = v.create(Videos::body({ { "format", "webm" } }));
-    REQUIRE_EQ(r.status, 200);
-    json o0 = json::parse(r.body, nullptr, false);
-    CHECK_EQ(str_at(o0, "format"), std::string("webm"));   /* echoed before a byte is encoded */
-    const std::string id = str_at(o0, "id");
-    json o = v.wait(id);
-    if (str_at(o, "status") == "failed") {
-        const std::string m = str_at(o["error"], "message");
-        if (has(m, "no libavcodec") || has(m, "VP9") || has(m, "Opus") || has(m, "WebM"))
-            SKIP("this build has no WebM encoder (VP9/Opus) to write the video with");
-    }
-    REQUIRE_EQ(str_at(o, "status"), std::string("completed"));
-    HttpResponse c = v.f->get(("/v1/videos/" + id + "/content").c_str());
-    REQUIRE_EQ(c.status, 200);
-    CHECK_EQ(c.content_type, std::string("video/webm"));
-    REQUIRE(c.body.size() > 64);
-    /* The EBML magic every WebM/Matroska file opens with. */
-    CHECK(c.body.compare(0, 4, std::string("\x1a\x45\xDF\xA3", 4)) == 0);
-    bool named = false;
-    for (const auto& kv : c.headers)
-        if (kv.first == "Content-Disposition" && has(kv.second, ".webm")) named = true;
-    CHECK(named);
-    HttpRequest mq;
-    mq.method = "GET";
-    mq.path = "/v1/models";
-    json caps =
-        json::parse(v.f->srv->router().dispatch(mq).body, nullptr, false)["data"][0]["capabilities"];
-    CHECK_EQ(caps["video_formats"], json::array({ "mp4", "webm", "webm-av1" }));
 }
 
 /* A request the generator fails is a failed job carrying the reason. */
