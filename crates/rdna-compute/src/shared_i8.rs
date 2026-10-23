@@ -50,9 +50,8 @@ const QUANT_ENTRY_ROT128: &str = "qwen4_shared_rot128_i8";
 
 /// `HIPFIRE_QWEN4_SHARED_INT8`: the shared expert's gate/up/down on the INT8 route
 /// (exact gfx1201, eager, `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`).
-static QWEN4_SHARED_INT8: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_INT8", false)
-});
+static QWEN4_SHARED_INT8: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_INT8", false));
 
 /// The model-lifetime INT8 shadows of one layer's shared expert: A8 planes
 /// `[K/128][rows]` of 136-byte blocks (stored as F32 words: 34 per block).
@@ -103,9 +102,7 @@ impl Gpu {
             && [w.gate, w.up, w.down]
                 .iter()
                 .all(|t| (t.buf.as_ptr() as usize) % 16 == 0)
-            && (2 * intermediate).max(w.down_rows)
-                * (hidden.max(intermediate) / 128)
-                * BLOCK_BYTES
+            && (2 * intermediate).max(w.down_rows) * (hidden.max(intermediate) / 128) * BLOCK_BYTES
                 < (1usize << 31)
             && self.route_rows(batch_size) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
     }
@@ -354,7 +351,10 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.qwen4_shared_i8_applies(w, batch_size) {
-            return Err(HipError::new(0, "qwen4_shared_i8_gate_up: route does not apply"));
+            return Err(HipError::new(
+                0,
+                "qwen4_shared_i8_gate_up: route does not apply",
+            ));
         }
         let xq = self.mq6_i8_prepare_x(x, w.hidden, batch_size)?;
         self.qwen4_shared_i8_gate_up_prequant(w, xq, hidden_bf16, batch_size)
@@ -412,7 +412,10 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.qwen4_shared_i8_applies(w, batch_size) {
-            return Err(HipError::new(0, "qwen4_shared_i8_hidden: route does not apply"));
+            return Err(HipError::new(
+                0,
+                "qwen4_shared_i8_hidden: route does not apply",
+            ));
         }
         let i = w.intermediate;
         if hidden_bf16.buf.size() < batch_size * i * 2
@@ -460,7 +463,10 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.qwen4_shared_i8_applies(w, batch_size) {
-            return Err(HipError::new(0, "qwen4_shared_i8_down: route does not apply"));
+            return Err(HipError::new(
+                0,
+                "qwen4_shared_i8_down: route does not apply",
+            ));
         }
         if out.dtype != DType::F32
             || out.numel() < batch_size * w.down_rows
@@ -501,8 +507,7 @@ impl Gpu {
 
     /// Release every shared-expert INT8 shadow (called with the other weight caches).
     pub(crate) fn drain_shared_i8_shadows(&mut self) {
-        let shadows: Vec<SharedI8Shadow> =
-            self.shared_i8_shadows.drain().map(|(_, s)| s).collect();
+        let shadows: Vec<SharedI8Shadow> = self.shared_i8_shadows.drain().map(|(_, s)| s).collect();
         for s in shadows {
             let _ = self.free_tensor(s.gate_up);
             let _ = self.free_tensor(s.down);

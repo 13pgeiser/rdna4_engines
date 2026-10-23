@@ -516,7 +516,11 @@ pub(crate) fn input_basis_front(
     if shared_int8(gpu, p, true) {
         let (xq, x16, x8) =
             hip(gpu.qwen4_moe_front_producer_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
-        return Ok(MoeFront { xq, x16, x8: Some(x8) });
+        return Ok(MoeFront {
+            xq,
+            x16,
+            x8: Some(x8),
+        });
     }
     let (xq, x16) = hip(gpu.qwen4_moe_front_producer(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
     Ok(MoeFront { xq, x16, x8: None })

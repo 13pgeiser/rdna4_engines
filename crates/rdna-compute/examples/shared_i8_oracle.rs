@@ -138,7 +138,14 @@ fn quant_block(x: &[f32]) -> [u8; BLOCK] {
 
 /// Plane `[k/128][rows]` of blocks from row-major `x` (`[rows][k]`), plane row of `row` =
 /// `dst(row)`.
-fn quant_plane(x: &[f32], k: usize, rows: usize, dst_rows: usize, dst: impl Fn(usize) -> usize, plane: &mut [u8]) {
+fn quant_plane(
+    x: &[f32],
+    k: usize,
+    rows: usize,
+    dst_rows: usize,
+    dst: impl Fn(usize) -> usize,
+    plane: &mut [u8],
+) {
     for row in 0..rows {
         for kb in 0..k / 128 {
             let b = quant_block(&x[row * k + kb * 128..row * k + kb * 128 + 128]);
@@ -179,7 +186,20 @@ fn sample_tokens(n: usize, rng: &mut Rng) -> Vec<usize> {
     if n <= 600 {
         return (0..n).collect();
     }
-    let mut t = vec![0, 1, 63, 64, 127, 128, 129, n - 129, n - 128, n - 127, n - 2, n - 1];
+    let mut t = vec![
+        0,
+        1,
+        63,
+        64,
+        127,
+        128,
+        129,
+        n - 129,
+        n - 128,
+        n - 127,
+        n - 2,
+        n - 1,
+    ];
     for _ in 0..40 {
         t.push(rng.below(n));
     }
@@ -212,7 +232,12 @@ fn main() {
 
     let rows_list: Vec<usize> = std::env::var("ROWS")
         .ok()
-        .map(|s| s.split(',').filter(|t| !t.is_empty()).map(|t| t.parse().unwrap()).collect())
+        .map(|s| {
+            s.split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse().unwrap())
+                .collect()
+        })
         .unwrap_or_else(|| vec![512, 513, 1000, 2048, 4099]);
     let max_rows = *rows_list.iter().max().unwrap();
 
@@ -243,7 +268,10 @@ fn main() {
         std::process::exit(2);
     }
 
-    let mut report = Report { text: String::new(), failures: 0 };
+    let mut report = Report {
+        text: String::new(),
+        failures: 0,
+    };
     writeln!(report.text, "shared_i8_oracle receipt").unwrap();
     writeln!(report.text, "arch {arch} I={I} H={H} switch={switch:?}").unwrap();
 
@@ -262,7 +290,14 @@ fn main() {
     let mut gu_ref = vec![0u8; gu_plane.len()];
     quant_plane(&rg, H, I, 2 * I, |r| ((r >> 2) << 3) | (r & 3), &mut gu_ref);
     let mut up_ref = vec![0u8; gu_plane.len()];
-    quant_plane(&ru, H, I, 2 * I, |r| ((r >> 2) << 3) | 4 | (r & 3), &mut up_ref);
+    quant_plane(
+        &ru,
+        H,
+        I,
+        2 * I,
+        |r| ((r >> 2) << 3) | 4 | (r & 3),
+        &mut up_ref,
+    );
     // The two writers cover disjoint plane rows: merge by row.
     let mut gu_expect = gu_ref.clone();
     for kb in 0..H / 128 {
@@ -273,8 +308,18 @@ fn main() {
             }
         }
     }
-    let gu_bad = gu_plane.iter().zip(&gu_expect).filter(|(a, b)| a != b).count();
-    report.line(gu_bad == 0, format!("shadow gate/up plane bytes={} mismatches={gu_bad}", gu_plane.len()));
+    let gu_bad = gu_plane
+        .iter()
+        .zip(&gu_expect)
+        .filter(|(a, b)| a != b)
+        .count();
+    report.line(
+        gu_bad == 0,
+        format!(
+            "shadow gate/up plane bytes={} mismatches={gu_bad}",
+            gu_plane.len()
+        ),
+    );
 
     let down_x = {
         let x = gpu.upload_f32(&widen(&down_h), &[H * I]).unwrap();
@@ -285,8 +330,18 @@ fn main() {
     };
     let mut dn_expect = vec![0u8; dn_plane.len()];
     quant_plane(&down_x, I, H, H, |r| r, &mut dn_expect);
-    let dn_bad = dn_plane.iter().zip(&dn_expect).filter(|(a, b)| a != b).count();
-    report.line(dn_bad == 0, format!("shadow down plane bytes={} mismatches={dn_bad}", dn_plane.len()));
+    let dn_bad = dn_plane
+        .iter()
+        .zip(&dn_expect)
+        .filter(|(a, b)| a != b)
+        .count();
+    report.line(
+        dn_bad == 0,
+        format!(
+            "shadow down plane bytes={} mismatches={dn_bad}",
+            dn_plane.len()
+        ),
+    );
 
     // ---- per-row-count checks ----
     // Activations: N(0,1) with a few outlier channels (post-norm massive channels).
@@ -366,7 +421,8 @@ fn main() {
         let ut = gpu.upload_f32(&u_acc, &[u_acc.len()]).unwrap();
         let hr = gpu.zeros(&[g_acc.len()], DType::F32).unwrap();
         let sdummy = gpu.zeros(&[toks.len()], DType::F32).unwrap();
-        gpu.shared_expert_activation_bf16_f32(&gt, &ut, &hr, &sdummy, toks.len()).unwrap();
+        gpu.shared_expert_activation_bf16_f32(&gt, &ut, &hr, &sdummy, toks.len())
+            .unwrap();
         let hr_f = gpu.download_f32(&hr).unwrap();
         let mut bad = 0usize;
         let mut first = None;
@@ -382,11 +438,15 @@ fn main() {
         }
         report.line(
             bad == 0,
-            format!("gate_up gemm+silu rows={n} tokens_checked={} mismatches={bad} first={first:?}", toks.len()),
+            format!(
+                "gate_up gemm+silu rows={n} tokens_checked={} mismatches={bad} first={first:?}",
+                toks.len()
+            ),
         );
 
         // 3. hidden producer: blocks + selector vs production rotate128 + host quantizer.
-        gpu.qwen4_shared_i8_hidden(&w, &hid, &blocks, &sel, n).unwrap();
+        gpu.qwen4_shared_i8_hidden(&w, &hid, &blocks, &sel, n)
+            .unwrap();
         let blk = download_raw(&gpu, blocks.buf.as_ptr(), (I / 128) * n * BLOCK);
         let hid_f: Vec<f32> = hid_bits.iter().map(|&b| bf16_f32(b)).collect();
         let hx = gpu.upload_f32(&hid_f, &[n * I]).unwrap();
@@ -397,15 +457,29 @@ fn main() {
         let mut blk_expect = vec![0u8; blk.len()];
         quant_plane(&hrot, I, n, n, |r| r, &mut blk_expect);
         let blk_bad = blk.iter().zip(&blk_expect).filter(|(a, b)| a != b).count();
-        report.line(blk_bad == 0, format!("hidden producer rows={n} bytes={} mismatches={blk_bad}", blk.len()));
+        report.line(
+            blk_bad == 0,
+            format!(
+                "hidden producer rows={n} bytes={} mismatches={blk_bad}",
+                blk.len()
+            ),
+        );
         let selr = gpu.upload_f32(&sel_host[..n], &[n]).unwrap();
         let gz = gpu.zeros(&[n * I], DType::F32).unwrap();
         let oz = gpu.zeros(&[n * I], DType::F32).unwrap();
-        gpu.shared_expert_activation_bf16_f32(&gz, &gz, &oz, &selr, n).unwrap();
+        gpu.shared_expert_activation_bf16_f32(&gz, &gz, &oz, &selr, n)
+            .unwrap();
         let sel_got = le_f32(&download_raw(&gpu, sel.buf.as_ptr(), n * 4));
         let sel_want = gpu.download_f32(&selr).unwrap();
-        let sel_bad = sel_got.iter().zip(&sel_want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-        report.line(sel_bad == 0, format!("selector sigmoid rows={n} mismatches={sel_bad}"));
+        let sel_bad = sel_got
+            .iter()
+            .zip(&sel_want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        report.line(
+            sel_bad == 0,
+            format!("selector sigmoid rows={n} mismatches={sel_bad}"),
+        );
 
         // 2b. down GEMM rows vs the host fold over the shadow plane and the produced blocks.
         gpu.qwen4_shared_i8_down(&w, &blocks, &out, n).unwrap();
@@ -423,7 +497,10 @@ fn main() {
         }
         report.line(
             bad == 0,
-            format!("down gemm rows={n} tokens_checked={} mismatches={bad} first={first:?}", toks.len()),
+            format!(
+                "down gemm rows={n} tokens_checked={} mismatches={bad} first={first:?}",
+                toks.len()
+            ),
         );
 
         // ---- numeric report vs the f64 recipe model and the F16 WMMA route ----
@@ -432,13 +509,22 @@ fn main() {
         let ok = gpu
             .gemm_bf16_xf32_f16_wmma_qwen4_groups(&[&[(&gate, &g16, I), (&up, &u16t, I)]], &x, H, n)
             .unwrap();
-        assert!(ok, "the F16 WMMA route does not apply to the reference chain");
+        assert!(
+            ok,
+            "the F16 WMMA route does not apply to the reference chain"
+        );
         let h16 = gpu.zeros(&[n * I], DType::F32).unwrap();
         let sel16 = gpu.upload_f32(&sel_host[..n], &[n]).unwrap();
-        gpu.shared_expert_activation_bf16_f32(&g16, &u16t, &h16, &sel16, n).unwrap();
+        gpu.shared_expert_activation_bf16_f32(&g16, &u16t, &h16, &sel16, n)
+            .unwrap();
         let out16 = gpu.zeros(&[n * H], DType::F32).unwrap();
-        let ok = gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&down, &out16, H)], &h16, I, n).unwrap();
-        assert!(ok, "the F16 WMMA route does not apply to the reference down");
+        let ok = gpu
+            .gemm_bf16_xf32_f16_wmma_qwen4(&[(&down, &out16, H)], &h16, I, n)
+            .unwrap();
+        assert!(
+            ok,
+            "the F16 WMMA route does not apply to the reference down"
+        );
         let out16_f = le_f32(&download_raw(&gpu, out16.buf.as_ptr(), n * H * 4));
 
         let wg: Vec<f32> = widen(&gate_h);
@@ -486,7 +572,8 @@ fn main() {
         writeln!(report.text, "{line}").unwrap();
     }
 
-    let path = std::env::var("SHARED_I8_ORACLE_RECEIPT").unwrap_or_else(|_| "./shared-i8-oracle.txt".into());
+    let path = std::env::var("SHARED_I8_ORACLE_RECEIPT")
+        .unwrap_or_else(|_| "./shared-i8-oracle.txt".into());
     writeln!(report.text, "failures {}", report.failures).unwrap();
     std::fs::write(&path, &report.text).expect("receipt");
     println!("receipt {path}: failures={}", report.failures);

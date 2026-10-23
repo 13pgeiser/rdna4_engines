@@ -7030,7 +7030,8 @@ impl Gpu {
         ];
         let blocks_k = k / 128;
         let bytes = (k * 4 + k * 2 + blocks_k * 72 + blocks_k * 136 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_i4_f16out_i8", bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_i4_f16out_i8", bytes);
         let result = self.launch_maybe_blob(
             kernel,
             [((k / 256) * batch_size) as u32, 1, 1],

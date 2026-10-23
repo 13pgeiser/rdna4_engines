@@ -88,15 +88,23 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.to_string();
     let switch = std::env::var("HIPFIRE_QWEN4_SHARED_INT8").unwrap_or_default();
-    println!("arch {arch} HIPFIRE_QWEN4_SHARED_INT8={switch:?} calls/batch {CALLS} batches {BATCHES}");
+    println!(
+        "arch {arch} HIPFIRE_QWEN4_SHARED_INT8={switch:?} calls/batch {CALLS} batches {BATCHES}"
+    );
     let rows_list: Vec<usize> = std::env::var("ROWS")
         .ok()
-        .map(|s| s.split(',').filter(|t| !t.is_empty()).map(|t| t.parse().unwrap()).collect())
+        .map(|s| {
+            s.split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse().unwrap())
+                .collect()
+        })
         .unwrap_or_else(|| vec![16384, 4096]);
     let max_rows = *rows_list.iter().max().unwrap();
 
     let mut rng = Rng(0xbe9c_4455);
-    let mut gen = |n: usize| -> Vec<u16> { (0..n).map(|_| bf16_bits(rng.gauss() * 0.03)).collect() };
+    let mut gen =
+        |n: usize| -> Vec<u16> { (0..n).map(|_| bf16_bits(rng.gauss() * 0.03)).collect() };
     let gate = upload_u16(&mut gpu, &gen(I * H), DType::BF16);
     let up = upload_u16(&mut gpu, &gen(I * H), DType::BF16);
     let down = upload_u16(&mut gpu, &gen(H * I), DType::BF16);
@@ -109,7 +117,9 @@ fn main() {
         down_rows: H,
     };
     if !gpu.qwen4_shared_i8_applies(&w, 4096) {
-        eprintln!("the INT8 route does not apply (HIPFIRE_QWEN4_SHARED_INT8={switch:?}, arch {arch})");
+        eprintln!(
+            "the INT8 route does not apply (HIPFIRE_QWEN4_SHARED_INT8={switch:?}, arch {arch})"
+        );
         std::process::exit(2);
     }
     let mut x_rng = Rng(0x77);
@@ -149,7 +159,8 @@ fn main() {
                 .unwrap());
         });
         let f16_act = time_us(&mut gpu, |gpu| {
-            gpu.shared_expert_activation_bf16_f32(&g, &u, &hid_f32, &sel, n).unwrap();
+            gpu.shared_expert_activation_bf16_f32(&g, &u, &hid_f32, &sel, n)
+                .unwrap();
         });
         let f16_down = time_us(&mut gpu, |gpu| {
             assert!(gpu
@@ -165,8 +176,10 @@ fn main() {
                 n,
             )
             .unwrap();
-            gpu.shared_expert_activation_bf16_f32(&g, &u, &hid_f32, &sel, n).unwrap();
-            gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&down, &out, H)], &hid_f32, I, n).unwrap();
+            gpu.shared_expert_activation_bf16_f32(&g, &u, &hid_f32, &sel, n)
+                .unwrap();
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&down, &out, H)], &hid_f32, I, n)
+                .unwrap();
         });
 
         let i8_prep = time_us(&mut gpu, |gpu| {
@@ -176,14 +189,16 @@ fn main() {
             gpu.qwen4_shared_i8_gate_up(&w, &x, &hid_bf, n).unwrap();
         });
         let i8_hidden = time_us(&mut gpu, |gpu| {
-            gpu.qwen4_shared_i8_hidden(&w, &hid_bf, &blocks, &sel, n).unwrap();
+            gpu.qwen4_shared_i8_hidden(&w, &hid_bf, &blocks, &sel, n)
+                .unwrap();
         });
         let i8_down = time_us(&mut gpu, |gpu| {
             gpu.qwen4_shared_i8_down(&w, &blocks, &out, n).unwrap();
         });
         let i8_chain = time_us(&mut gpu, |gpu| {
             gpu.qwen4_shared_i8_gate_up(&w, &x, &hid_bf, n).unwrap();
-            gpu.qwen4_shared_i8_hidden(&w, &hid_bf, &blocks, &sel, n).unwrap();
+            gpu.qwen4_shared_i8_hidden(&w, &hid_bf, &blocks, &sel, n)
+                .unwrap();
             gpu.qwen4_shared_i8_down(&w, &blocks, &out, n).unwrap();
         });
 
