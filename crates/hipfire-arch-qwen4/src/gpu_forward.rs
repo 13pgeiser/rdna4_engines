@@ -349,9 +349,10 @@ pub(crate) fn qwen4_route_scope_flags(
 pub const QWEN4_COMPACT_FALLBACK_ROWS: usize = 512;
 
 /// Storage-only knob of the compact scratch, read once as a tri-state:
-/// unset leaves the route's default (on for W3/MQ4 expert-slab artifacts, off
-/// for symmetric-IU4 ones), `1` forces it on where the route is eligible, `0`
-/// keeps the full allocation plan (the IU4 math stays enabled either way).
+/// unset leaves the route's default (on for W3/MQ4 expert-slab artifacts and,
+/// with the IU4 route requested, for symmetric-IU4 packed ones), `1` forces it
+/// on where the route is eligible, `0` keeps the full allocation plan (the IU4
+/// math stays enabled either way).
 pub const QWEN4_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_QWEN4_COMPACT_SCRATCH";
 
 /// Developer knob: make the compact-scratch acceptance check in
@@ -397,10 +398,12 @@ impl CompactScratchTerms {
     }
 
     pub(crate) fn mode(self) -> Qwen4ForwardScratchMode {
-        // Expert-slab artifacts default on (`0` opts out); the symmetric IU4
-        // route stays opt-in (`1`) and needs the IU4 route requested.
-        let route = (self.source_slab && self.knob != Some(false))
-            || (self.source_symmetric && self.sym_iu4_requested && self.knob == Some(true));
+        // Both routes default on (`0` opts out): expert-slab artifacts, and
+        // symmetric-IU4 packed artifacts with the IU4 route requested (the
+        // load assumes symmetry; the GPU check at attach confirms or re-plans
+        // Full).
+        let route = (self.source_slab || (self.source_symmetric && self.sym_iu4_requested))
+            && self.knob != Some(false);
         if route
             && self.exact_gfx1201
             && self.grouped_gemm
@@ -14503,8 +14506,8 @@ mod tests {
             .mode(),
             Mode::Full
         );
-        // The symmetric IU4 route stays opt-in: it needs `1` plus the IU4
-        // request plus the proven headers.
+        // The symmetric IU4 route defaults on too: unset or `1`, plus the IU4
+        // request plus the (assumed, GPU-checked) symmetric headers.
         let sym = CompactScratchTerms {
             knob: Some(true),
             exact_gfx1201: true,
@@ -14516,10 +14519,18 @@ mod tests {
             flash_next_profile: true,
         };
         assert_eq!(sym.mode(), Mode::FnSymGfx1201);
+        assert_eq!(
+            CompactScratchTerms { knob: None, ..sym }.mode(),
+            Mode::FnSymGfx1201
+        );
         let sym_off = [
-            CompactScratchTerms { knob: None, ..sym },
             CompactScratchTerms {
                 knob: Some(false),
+                ..sym
+            },
+            CompactScratchTerms {
+                knob: Some(false),
+                source_slab: true,
                 ..sym
             },
             CompactScratchTerms {
