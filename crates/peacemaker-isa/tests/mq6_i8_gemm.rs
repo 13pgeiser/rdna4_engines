@@ -166,7 +166,7 @@ fn reference(c: &Case, d: &Data, epi: Epi) -> Vec<u8> {
                 acc = (zp * dd).mul_add(s as f32, acc);
             }
             match epi {
-                Epi::Set => out.extend(acc.to_bits().to_le_bytes()),
+                Epi::Set | Epi::SetNr => out.extend(acc.to_bits().to_le_bytes()),
                 Epi::SetBf16 => {
                     let u = (0.0f32 + acc).to_bits();
                     let b = if (0.0f32 + acc).is_finite() {
@@ -249,7 +249,7 @@ fn run_tile(c: &Case, epi: Epi, tile: Tile, seed: u64) -> Vec<u8> {
         "guard after Y clobbered"
     );
     let got = &y[GUARD..GUARD + want.len()];
-    let w = if epi == Epi::Set { 4 } else { 2 };
+    let w = if epi == Epi::SetBf16 { 2 } else { 4 };
     for (i, (g, e)) in got.chunks(w).zip(want.chunks(w)).enumerate() {
         assert_eq!(
             g,
@@ -589,16 +589,20 @@ fn emission_is_deterministic_and_the_module_assembles() {
     let (_, text_b, proof_b) = mq6_i8_gemm::emit_module(Arch::Gfx1201).unwrap();
     assert_eq!(text_a, text_b);
     assert_eq!(proof_a.s_text_sha256, proof_b.s_text_sha256);
-    assert_eq!(a.len(), 4);
+    assert_eq!(a.len(), 5);
     let elf = peacemaker_isa::native::assemble(&text_a, Arch::Gfx1201).unwrap();
-    for tile in [Tile::T128x128, Tile::T128x256] {
-        for epi in [Epi::Set, Epi::SetBf16] {
-            let sym = Spec::product(epi).with_tile(tile).symbol();
-            assert!(
-                elf.windows(sym.len()).any(|w| w == sym.as_bytes()),
-                "{sym} missing from the code object"
-            );
-        }
+    let mut symbols: Vec<String> = [Tile::T128x128, Tile::T128x256]
+        .into_iter()
+        .flat_map(|tile| {
+            [Epi::Set, Epi::SetBf16].map(move |epi| Spec::product(epi).with_tile(tile).symbol())
+        })
+        .collect();
+    symbols.push(Spec::product(Epi::SetNr).with_tile(Tile::T256x128).symbol());
+    for sym in symbols {
+        assert!(
+            elf.windows(sym.len()).any(|w| w == sym.as_bytes()),
+            "{sym} missing from the code object"
+        );
     }
 }
 
@@ -613,4 +617,244 @@ fn gfx1201_only() {
         })
         .is_err());
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `Epi::SetNr`: the GEMM output with the Flash-Next QSA head RMSNorm + weight + RoPE applied to the
+// tile's head rows. The reference applies `qsa_norm_rope_head`'s arithmetic (serial fma sum of
+// squares, `sum / 256`, `rsq`, `(1 + w) * (x * inv)`, `fma(v, cos, +-(v_partner * sin))`) to the
+// exact GEMM output with the emulator's model of `v_rsq_f32`.
+
+const NORM_BASE: u64 = 0x3000_0000;
+const ROPE_BASE: u64 = 0x3100_0000;
+
+fn nr_reference(raw: &[u8], c: &Case, head_mask: usize, norm: &[u16], table: &[f32]) -> Vec<u8> {
+    let m = c.m;
+    let mut out = raw.to_vec();
+    let at = |t: usize, r: usize| {
+        f32::from_bits(u32::from_le_bytes(
+            raw[(t * m + r) * 4..(t * m + r) * 4 + 4]
+                .try_into()
+                .unwrap(),
+        ))
+    };
+    for t in 0..c.n {
+        for r0 in (0..m).step_by(256) {
+            if (r0 & head_mask) >= 256 {
+                continue;
+            }
+            let x: Vec<f32> = (0..256).map(|i| at(t, r0 + i)).collect();
+            let mut sum = 0.0f32;
+            for &v in &x {
+                sum = v.mul_add(v, sum);
+            }
+            let mean = sum / 256.0f32;
+            let inv = f32::from_bits(peacemaker_ir::emu::trans::rsq_f32(
+                peacemaker_ir::inst::Arch::Gfx1201,
+                (mean + 1.0e-6f32).to_bits(),
+            ));
+            let s: Vec<f32> = (0..256)
+                .map(|i| (1.0f32 + f32::from_bits(u32::from(norm[i]) << 16)) * (x[i] * inv))
+                .collect();
+            let mut y = s.clone();
+            for ch in 0..64 {
+                let b = ch % 32;
+                let (cos, sin) = (table[t * 64 + b], table[t * 64 + 32 + b]);
+                y[ch] = if ch < 32 {
+                    s[ch].mul_add(cos, -(s[ch + 32] * sin))
+                } else {
+                    s[ch].mul_add(cos, s[ch - 32] * sin)
+                };
+            }
+            for (i, v) in y.iter().enumerate() {
+                out[(t * m + r0 + i) * 4..(t * m + r0 + i) * 4 + 4]
+                    .copy_from_slice(&v.to_bits().to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+fn run_nr(c: &Case, head_mask: usize, seed: u64) {
+    let tile = Tile::T256x128;
+    let rng = &mut Rng(seed);
+    let data = make(rng, c);
+    let raw = reference(c, &data, Epi::Set);
+    let norm: Vec<u16> = (0..256)
+        .map(|_| ((rng.next() as f32 / u64::MAX as f32 - 0.5) * 1.5).to_bits() as u32 >> 16)
+        .map(|b| b as u16)
+        .collect();
+    let table: Vec<f32> = (0..c.n * 64)
+        .map(|_| (rng.next() as f32 / u64::MAX as f32) * 2.0 - 1.0)
+        .collect();
+    let want = nr_reference(&raw, c, head_mask, &norm, &table);
+    // The normed rows differ from the raw GEMM output; the plain (gate) rows are the raw output.
+    let changed = want
+        .chunks(4)
+        .zip(raw.chunks(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    let normed_rows = (0..c.m)
+        .step_by(256)
+        .filter(|r0| (r0 & head_mask) < 256)
+        .count()
+        * 256;
+    assert!(
+        changed > normed_rows * c.n * 9 / 10,
+        "reference leaves {changed} of {} normed values untouched",
+        normed_rows * c.n
+    );
+    let spec = Spec::emulation(Epi::SetNr).with_tile(tile);
+    let emitted = mq6_i8_gemm::emit(spec).unwrap();
+    let elf = peacemaker_isa::native::assemble(&emitted.s_text, Arch::Gfx1201).unwrap();
+    let program = peacemaker_lift::lift_object(
+        &elf,
+        peacemaker_lift::Options {
+            frontend: Frontend::Builder,
+        },
+    )
+    .unwrap()
+    .program;
+    let emu = Emulator::new(&program, &spec.symbol()).unwrap();
+
+    let mut mem = Memory::default();
+    let mut karg = vec![0u8; spec::NR_KERNARG_BYTES as usize];
+    karg[0..8].copy_from_slice(&A_BASE.to_le_bytes());
+    karg[8..16].copy_from_slice(&X_BASE.to_le_bytes());
+    karg[16..24].copy_from_slice(&(Y_BASE + GUARD as u64).to_le_bytes());
+    karg[24..28].copy_from_slice(&(c.m as u32).to_le_bytes());
+    karg[28..32].copy_from_slice(&(c.k as u32).to_le_bytes());
+    karg[32..36].copy_from_slice(&(c.n as u32).to_le_bytes());
+    karg[36..40].copy_from_slice(&(head_mask as u32).to_le_bytes());
+    let (gx, gy) = (
+        c.m.div_ceil(tile.rows() as usize) as u32,
+        c.n.div_ceil(tile.tokens() as usize) as u32,
+    );
+    karg[40..44].copy_from_slice(&gx.to_le_bytes());
+    karg[44..48].copy_from_slice(&gy.to_le_bytes());
+    karg[48..52].copy_from_slice(&1u32.to_le_bytes());
+    karg[spec::NR_NORM_OFFSET as usize..spec::NR_NORM_OFFSET as usize + 8]
+        .copy_from_slice(&NORM_BASE.to_le_bytes());
+    karg[spec::NR_ROPE_OFFSET as usize..spec::NR_ROPE_OFFSET as usize + 8]
+        .copy_from_slice(&ROPE_BASE.to_le_bytes());
+    mem.map("karg".into(), KERNARG, karg).unwrap();
+    mem.map("a".into(), A_BASE, data.a.clone()).unwrap();
+    mem.map("x".into(), X_BASE, data.x.clone()).unwrap();
+    mem.map(
+        "norm".into(),
+        NORM_BASE,
+        norm.iter().flat_map(|b| b.to_le_bytes()).collect(),
+    )
+    .unwrap();
+    mem.map(
+        "rope".into(),
+        ROPE_BASE,
+        table
+            .iter()
+            .flat_map(|f| f.to_bits().to_le_bytes())
+            .collect(),
+    )
+    .unwrap();
+    mem.map("y".into(), Y_BASE, vec![SENTINEL; want.len() + 2 * GUARD])
+        .unwrap();
+    for gy_i in 0..gy {
+        for gx_i in 0..gx {
+            emu.run_workgroup(
+                &Launch {
+                    kernarg_ptr: KERNARG,
+                    workgroup: [gx_i, gy_i, 0],
+                    block: [tile.threads(), 1, 1],
+                    dynamic_lds: tile.layout().launch,
+                },
+                &mut mem,
+            )
+            .unwrap_or_else(|e| panic!("wg({gx_i},{gy_i}): {e}"));
+        }
+    }
+    let y = &mem.regions.iter().find(|r| r.name == "y").unwrap().bytes;
+    assert!(
+        y[..GUARD].iter().all(|&b| b == SENTINEL),
+        "guard before Y clobbered"
+    );
+    assert!(
+        y[GUARD + want.len()..].iter().all(|&b| b == SENTINEL),
+        "guard after Y clobbered"
+    );
+    let got = &y[GUARD..GUARD + want.len()];
+    for (i, (g, e)) in got.chunks(4).zip(want.chunks(4)).enumerate() {
+        assert_eq!(
+            g,
+            e,
+            "M={} K={} N={} mask {head_mask}: token {} row {}",
+            c.m,
+            c.k,
+            c.n,
+            i / c.m,
+            i % c.m
+        );
+    }
+}
+
+#[test]
+fn set_nr_q_gate_layout_norms_the_q_half_of_every_head() {
+    run_nr(
+        &Case {
+            m: 768,
+            k: 256,
+            n: 40,
+            fill: Fill::Random,
+        },
+        511,
+        200,
+    );
+}
+
+#[test]
+fn set_nr_k_layout_norms_every_head_with_looped_k_and_token_tails() {
+    run_nr(
+        &Case {
+            m: 512,
+            k: 768,
+            n: 130,
+            fill: Fill::Random,
+        },
+        255,
+        201,
+    );
+}
+
+#[test]
+fn set_nr_validates_only_on_the_wide_row_tile() {
+    for tile in [Tile::T128x128, Tile::T128x256] {
+        assert!(mq6_i8_gemm::emit(Spec::emulation(Epi::SetNr).with_tile(tile)).is_err());
+    }
+}
+
+/// The norm+RoPE epilogue changes nothing in the K loop: `set_nr`'s hot-loop census equals the plain
+/// `256x128` entry's, the kernel stays inside the occupancy ceiling, and what it adds after the K
+/// loop is the documented epilogue: four staging passes and the RoPE exchange (16 b128 stores
+/// each), the inverse-RMS store, one `v_rsq_f32` and 13 barriers (the K loop's rings retire, two per
+/// staging pass, two each for the inverse RMS and the exchange).
+#[test]
+fn set_nr_keeps_the_hot_loop_and_adds_the_documented_epilogue() {
+    let plain = mq6_i8_gemm::emit(Spec::product(Epi::Set).with_tile(Tile::T256x128)).unwrap();
+    let nr = mq6_i8_gemm::emit(Spec::product(Epi::SetNr).with_tile(Tile::T256x128)).unwrap();
+    assert_eq!(
+        mq6_i8_gemm::hot_loop_census(&plain.s_text),
+        mq6_i8_gemm::hot_loop_census(&nr.s_text)
+    );
+    assert!(nr.shape.next_free_vgpr <= spec::VGPR_CEILING);
+    assert_eq!(nr.shape.wmma, plain.shape.wmma);
+    let count = |text: &str, name: &str| {
+        text.lines()
+            .filter(|l| l.trim().split_whitespace().next() == Some(name))
+            .count()
+    };
+    let added = |name: &str| count(&nr.s_text, name) - count(&plain.s_text, name);
+    assert_eq!(added("v_rsq_f32_e32"), 1);
+    assert_eq!(added("ds_store_b32"), 1);
+    assert_eq!(added("ds_store_b128"), 5 * 16);
+    assert_eq!(added("s_barrier_signal"), 13);
+    assert_eq!(added("s_barrier_wait"), 13);
+    assert_eq!(added("v_wmma_i32_16x16x16_iu8"), 0);
 }

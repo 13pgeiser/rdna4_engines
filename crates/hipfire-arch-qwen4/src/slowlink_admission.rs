@@ -3380,6 +3380,7 @@ mod tests {
                 state: state.state,
                 forward: state.forward,
                 f16_shadows,
+                shared_i8_shadows: 0,
                 workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(tile, &dims)
                     .unwrap(),
                 qsa_selector: 0,
@@ -4248,6 +4249,7 @@ mod tests {
                     state: 0,
                     forward: 0,
                     f16_shadows: 0,
+                    shared_i8_shadows: 0,
                     workspace,
                     qsa_selector: 0,
                     mtp: 0,
@@ -4309,6 +4311,7 @@ mod tests {
                 state: 0,
                 forward: 0,
                 f16_shadows: 0,
+                shared_i8_shadows: 0,
                 workspace,
                 qsa_selector: 0,
                 mtp: 0,

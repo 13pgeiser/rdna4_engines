@@ -3732,6 +3732,31 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
 }
 
+// RoPE angle table of `rows` consecutive positions for the fused QSA q/k
+// norm+RoPE GEMM epilogue: row r holds the cosines of bases 0..rotary_dim/2
+// then their sines (yarn mscale applied by rope_yarn_sincos) at
+// `table[r * rotary_dim ...]`, from the exact expression of
+// qsa_norm_rope_head. One thread per (row, base).
+extern "C" __global__ void indexed_attention_rope_table_f32(
+    float* table,
+    int rows,
+    int position_start,
+    int rotary_dim,
+    RopeYarn yarn) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half = rotary_dim / 2;
+    int row = idx / half;
+    int base = idx - row * half;
+    if (row >= rows) return;
+    int position = position_start + row;
+    float angle = (float)position
+        * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
+    float sine, cosine;
+    rope_yarn_sincos(angle, base, yarn, &sine, &cosine);
+    table[row * rotary_dim + base] = cosine;
+    table[row * rotary_dim + half + base] = sine;
+}
+
 // QSA prologue of `rows` consecutive rows in one launch (block 256, one block
 // per head and row): the index-query, query and key RMSNorm + RoPE (the three
 // indexed_attention_norm_rope_f32_batched launches), the key/value cache

@@ -51134,6 +51134,56 @@ impl Gpu {
         Ok((prepared, x16))
     }
 
+    /// [`Gpu::qwen4_moe_front_producer`] plus the shared-expert INT8 route's A8 blocks of the
+    /// same rotated rows (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`): one read of `x` yields the
+    /// IU4 sidecar, the F16 X (shared F16 scratch) and the `block_i8_128` blocks
+    /// ([`Gpu::mq6_i8_prepare_x`]'s bytes), the latter returned as a prepared handle valid until
+    /// the next INT8 activation producer call. Callers gate with
+    /// [`Gpu::qwen4_moe_front_fuse_applies`] and the INT8 route's own predicate.
+    pub fn qwen4_moe_front_producer_i8(
+        &mut self,
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<(
+        crate::scratch::Int4MmqPrepared,
+        GpuTensor,
+        crate::scratch::Int8MmqPrepared,
+    )> {
+        if !self.qwen4_moe_front_fuse_applies() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_front_producer_i8: the fused front does not apply on this device/mode",
+            ));
+        }
+        let kernel = self.qwen4_moe_sym_require("qwen4_moe_front_producer_i8")?;
+        if kernel.gate_producer.require_c2
+            && !iu4_a4_candidates_c2_only(&self.flags.hipcc_extra_flags)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "qwen4_moe_front_producer_i8: the {} route needs the C2 A4 candidate set (-DIU4_A4_CANDIDATES=2)",
+                    kernel.arch
+                ),
+            ));
+        }
+        if x.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_front_producer_i8: F32 input only",
+            ));
+        }
+        crate::moe::require_span(x, &[rows, k, 4], "qwen4_moe_front_producer_i8 activations")?;
+        let x16 = self.qwen4_f16_x_scratch(rows * k)?;
+        let reservation = self.reserve_int4_mmq(k, rows)?;
+        let reservation8 = self.reserve_int8_mmq(k, rows)?;
+        let (prepared, prepared8) =
+            self.rotate_x_mq_i4_f16out_i8_batched(x, &x16, reservation, reservation8, k, rows)?;
+        self.moe_route_census.a4_gate_producer += 1;
+        Ok((prepared, x16, prepared8))
+    }
+
     /// Sealed-slab gate/up A4 producer: [`Gpu::qwen4_moe_rotate256_i4`] on gfx1201 and gfx1151 (unchanged),
     /// and on gfx1100 the same shipped `mq_rotate_x_i4` module (FWHT256 + `block_i4_128`,
     /// hipcc, compiled for gfx1100) under the frozen C2 candidate set the K2 kernels and the

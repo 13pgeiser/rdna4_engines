@@ -1484,6 +1484,16 @@ pub const MQ_ROTATE_X_I4_F16OUT_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_f16out\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// [`MQ_ROTATE_X_I4_F16OUT_SRC`]'s kernel with the shared-expert INT8 route's third output, the
+/// A8 `block_i8_128` blocks of the same rotated row (`mq_rotate_x_i4_f16out_i8`, gfx1201): the
+/// front producer when `HIPFIRE_QWEN4_SHARED_INT8` runs the shared gate/up GEMM.
+pub const MQ_ROTATE_X_I4_F16OUT_I8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/mq_rotate_x_i4_f16out_i8.gfx12.hip")
+);
 pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -5421,6 +5431,23 @@ pub const GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip")
+);
+/// gfx1201 Qwen4 shared-expert INT8 x INT8 prefill GEMM (`qwen4_shared_i8_down_set_f32`,
+/// `qwen4_shared_i8_gate_up_silu_bf16`; dynamic LDS `QWEN4_SHARED_I8_LDS_BYTES` = 36864): the
+/// `block_i8_128` prelude without its standalone quantizer, then the kernel
+/// (`Gpu::qwen4_shared_i8_gate_up` / `qwen4_shared_i8_down`).
+pub const QWEN4_SHARED_I8_GEMM_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_shared_i8_gemm.gfx12.hip")
+);
+/// Producers of the same route: BF16 rows -> FWHT -> A8 `block_i8_128` (the rotated gate/up
+/// and down weight shadows, and the shared hidden with the selector sigmoid).
+pub const QWEN4_SHARED_I8_QUANT_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    include_str!("../../../kernels/src/qwen4_shared_i8_quant.gfx12.hip")
 );
 /// Full-slab A-prefetch variant (191 VGPR, 0 spills) for end-to-end screening.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC: &str = concat!(

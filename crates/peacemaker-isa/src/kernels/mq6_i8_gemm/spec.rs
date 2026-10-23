@@ -5,11 +5,15 @@
 //! Variant axes and fixed geometry of the MQ6G256V2 x `block_i8_128` GEMM.
 use crate::{kernels::iu4_k1::Variant, Arch, KernargLayout};
 
-/// Epilogue: F32 overwrite, or BF16 bits (`isfinite(v) ? RNE : u >> 16`, `v = 0 + y`).
+/// Epilogue: F32 overwrite, BF16 bits (`isfinite(v) ? RNE : u >> 16`, `v = 0 + y`), or F32 overwrite of
+/// a Flash-Next QSA projection with the head RMSNorm + weight + HalfSplit RoPE of
+/// `qsa_norm_rope_head` (`kernels/src/tensor_ops.hip`) applied to the head rows the tile covers
+/// (`SetNr`: `T256x128` only; see `nr_epilogue`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Epi {
     Set,
     SetBf16,
+    SetNr,
 }
 /// CTA raster. `Banded` is the product (hipcc `IU4_G12_RASTER`, band 8). `Linear`
 /// (`rs = x * 128`, `bs = y * 128`) exists only so the CPU interpreter, which has no
@@ -214,6 +218,7 @@ impl Epi {
         match self {
             Self::Set => "set",
             Self::SetBf16 => "set_bf16",
+            Self::SetNr => "set_nr",
         }
     }
 }
@@ -264,13 +269,31 @@ impl Spec {
             }
         )
     }
-    /// The hipcc twin's ABI `(A, Xq, Y, M, K, N)` followed by K1's hidden block.
+    /// The hipcc twin's ABI `(A, Xq, Y, M, K, N)` followed by K1's hidden block. `SetNr` keeps that
+    /// block where it is and adds, past it, the norm weight and the RoPE table pointers; the
+    /// seventh word (`unused`, byte 36) carries the head row stride minus one.
     pub fn kernargs(self) -> KernargLayout {
-        Variant::FullSet.kernargs()
+        let layout = Variant::FullSet.kernargs();
+        if self.epi != Epi::SetNr {
+            return layout;
+        }
+        let mut layout = layout;
+        for a in &mut layout.args {
+            if a.name == "unused" {
+                a.name = "head_mask".into();
+            }
+        }
+        layout.size = NR_KERNARG_BYTES;
+        layout
+            .pointer("norm", NR_NORM_OFFSET)
+            .pointer("rope", NR_ROPE_OFFSET)
     }
     pub fn validate(self) -> Result<(), String> {
         if self.arch != Arch::Gfx1201 {
             return Err("mq6_i8_gemm targets gfx1201 only".into());
+        }
+        if self.epi == Epi::SetNr && self.tile != Tile::T256x128 {
+            return Err("mq6_i8_gemm set_nr runs on the 256x128 tile only".into());
         }
         Ok(())
     }
@@ -281,7 +304,14 @@ impl std::str::FromStr for Epi {
         match s {
             "set" => Ok(Self::Set),
             "set_bf16" => Ok(Self::SetBf16),
+            "set_nr" => Ok(Self::SetNr),
             _ => Err(format!("unknown mq6_i8_gemm epilogue {s}")),
         }
     }
 }
+
+/// `SetNr` kernel arguments past the hidden block: the bf16 norm weight pointer, the RoPE table
+/// pointer (`[rows][64]` f32: cosines of bases 0..32 then sines), and the segment size.
+pub const NR_NORM_OFFSET: u32 = 296;
+pub const NR_ROPE_OFFSET: u32 = 304;
+pub const NR_KERNARG_BYTES: u32 = 312;

@@ -96,6 +96,7 @@ pub mod sampled_rows_compact;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
+pub mod shared_i8;
 pub mod slab_moe;
 pub mod spec_sampling_cpu_ar;
 pub mod tape_copy;
@@ -106,6 +107,7 @@ pub use gemm_fp8_verify::{
     Fp8VerifyTile, Fp8VerifyX,
 };
 pub use gemm_mq6_fp8::Mq6Fp8Arm;
+pub use gemm_mq6_i8::{QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM};
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation,
     Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared,

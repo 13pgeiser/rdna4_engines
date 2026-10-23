@@ -378,6 +378,17 @@ fn fixture_reserve(
         } else {
             0
         };
+    // The shared-expert INT8 shadows (default on: the process flag, exact gfx1201).
+    let shared_i8_shadows = residency::shared_i8_charge(
+        rdna_compute::shared_i8::shared_i8_route_enabled(
+            std::env::var("HIPFIRE_QWEN4_SHARED_INT8").map_or(true, |v| v != "0"),
+            fx.arch,
+        ),
+        chunk_rows,
+        fx.weights,
+        config.num_hidden_layers,
+    )
+    .map_err(|x| format!("qwen4: {x}"))?;
     let dense_gdn = dense_gdn_applies(fx.arch, gdn, config);
     let routed_experts = !config.ffn.is_dense();
     let routed_i4 = routed_experts
@@ -404,6 +415,7 @@ fn fixture_reserve(
         state: state.state,
         forward: state.forward,
         f16_shadows,
+        shared_i8_shadows,
         workspace,
         qsa_selector: 0,
         mtp: 0,
