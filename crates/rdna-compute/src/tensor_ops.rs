@@ -4383,6 +4383,61 @@ pub fn indexed_attention_append_prologue(
     Ok(())
 }
 
+/// RoPE angle table for the fused QSA q/k norm+RoPE GEMM epilogue
+/// (`indexed_attention_rope_table_f32`): row `r` of `table` (`rotary_dim`
+/// F32) holds the cosines of the `rotary_dim / 2` bases, then their sines,
+/// for position `position_start + r`, computed exactly as
+/// `indexed_attention_norm_rope_batch` does. `table` needs at least
+/// `rows * rotary_dim` F32.
+pub fn indexed_attention_rope_table(
+    gpu: &mut Gpu,
+    table: &GpuTensor,
+    rows: usize,
+    position_start: usize,
+    rotary_dim: usize,
+    yarn: crate::rope::RopeYarn,
+) -> HipResult<()> {
+    ensure_f32(table)?;
+    if rows == 0
+        || rotary_dim == 0
+        || rotary_dim % 2 != 0
+        || position_start
+            .checked_add(rows)
+            .map_or(true, |end| end > i32::MAX as usize)
+        || table.numel() < checked_product(rows, rotary_dim, "rope table extent")?
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let rows_i = checked_i32(rows, "rope table rows")?;
+    let position_i = checked_i32(position_start, "rope table position")?;
+    let rotary_i = checked_i32(rotary_dim, "rope table rotary width")?;
+    let threads = checked_product(rows, rotary_dim / 2, "rope table threads")?;
+    let grid = checked_u32(threads.div_ceil(256), "rope table grid")?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "indexed_attention_rope_table_f32",
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(table.buf.as_ptr());
+    args.push_i32(rows_i);
+    args.push_i32(position_i);
+    args.push_i32(rotary_i);
+    yarn.push(&mut args);
+    args.pad_to(16);
+    // Extents: grid `[ceil(rows * rotary_dim / 2 / 256), 1, 1]`; a thread
+    // writes `table[row * rotary_dim + base]` and `+ rotary_dim / 2` for
+    // `row < rows`, so the guarded extent is `rows * rotary_dim` F32.
+    gpu.launch_blob_recorded(
+        "indexed_attention_rope_table_f32",
+        [grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 pub fn indexed_attention_norm_rope_batch(
     gpu: &mut Gpu,
     p: &IndexedAttentionNormRopeBatch<'_>,

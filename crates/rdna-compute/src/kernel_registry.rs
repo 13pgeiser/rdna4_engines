@@ -2170,6 +2170,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_pool_rope_bf16",
                 "indexed_attention_pool_rope_f32",
                 "indexed_attention_reuse_selection",
+                "indexed_attention_rope_table_f32",
                 "indexed_attention_select_bf16_batched",
                 "indexed_attention_select_bf16_batched_serial",
                 "indexed_attention_select_f32",
@@ -2761,6 +2762,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_pool_rope_bf16",
                 "indexed_attention_pool_rope_f32",
                 "indexed_attention_reuse_selection",
+                "indexed_attention_rope_table_f32",
                 "indexed_attention_select_bf16_batched",
                 "indexed_attention_select_bf16_batched_serial",
                 "indexed_attention_select_f32",
@@ -2969,6 +2971,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_pool_rope_bf16",
                 "indexed_attention_pool_rope_f32",
                 "indexed_attention_reuse_selection",
+                "indexed_attention_rope_table_f32",
                 "indexed_attention_select_bf16_batched",
                 "indexed_attention_select_bf16_batched_serial",
                 "indexed_attention_select_f32",
@@ -10270,7 +10273,10 @@ mod tests {
         let current: BTreeSet<String> = elf
             .iter()
             .cloned()
-            .chain(["hyper_write_bf16x8_gfx1201".to_owned()])
+            .chain([
+                "hyper_write_bf16x8_gfx1201".to_owned(),
+                "indexed_attention_rope_table_f32".to_owned(),
+            ])
             .collect();
         assert_eq!(tensor_ops_source_exports("gfx1100"), current);
         let omitted: Vec<&str> = elf.difference(&index).map(String::as_str).collect();

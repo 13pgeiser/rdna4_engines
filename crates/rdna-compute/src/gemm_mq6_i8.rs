@@ -61,6 +61,19 @@ const MQ6_I8_PM_ENTRY_BF16: &str = "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201";
 /// The 128 x 256 entries of the same module (16 waves, 512 threads).
 const MQ6_I8_PM_ENTRY_F32_T256: &str = "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t128x256";
 const MQ6_I8_PM_ENTRY_BF16_T256: &str = "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201_t128x256";
+/// The 256 x 128 entry of the same module (16 waves, 512 threads): F32 output
+/// whose head-aligned 256-row tiles come out RMS-normed, weighted and RoPE'd
+/// (QSA q/k norm+RoPE epilogue).
+const MQ6_I8_PM_ENTRY_F32_NORM_ROPE: &str = "gemm_mq6g256v2_mmq_i8_pm_set_nr_gfx1201_t256x128";
+/// Rows per CTA and tokens per CTA of that entry, its threads and dynamic LDS.
+const MQ6_I8_PM_NR_ROWS: usize = 256;
+const MQ6_I8_PM_NR_TOKENS: usize = 128;
+/// Kernarg byte offsets of the entry's `norm` and `rope` pointers; the 40-byte
+/// explicit prefix is the other entries', the hidden block fills 40..296.
+const MQ6_I8_PM_NR_NORM_OFFSET: usize = 296;
+/// Head width and RoPE width the entry is built for.
+pub const QSA_NORM_EPI_HEAD_DIM: usize = 256;
+pub const QSA_NORM_EPI_ROTARY_DIM: usize = 64;
 /// Rows per CTA of both PM tiles.
 const MQ6_I8_PM_ROWS: usize = 128;
 /// Token-tile widths of the PM tiles: the 128 x 128 tile (256 threads,
@@ -459,6 +472,163 @@ impl Gpu {
         // `y` was overwritten: caches keyed on its pointer are stale.
         self.invalidate_x_caches_for(y.buf.as_ptr());
         result
+    }
+
+    /// Whether [`Gpu::gemm_mq6g256v2_i8_prequant_norm_rope`] would launch the
+    /// fused entry for these arguments: `HIPFIRE_QWEN4_QSA_NORM_EPI` on (exact
+    /// gfx1201), the MQ6 INT8 route admitted ([`Gpu::gemm_mq6g256v2_i8_applies`]),
+    /// the PM twin admitted for F32 `y`, `m % 256 == 0`, and `head_stride_rows`
+    /// (`head_mask + 1`: 512 for the interleaved q-gate rows, 256 for plain k
+    /// rows) dividing `m`.
+    pub fn gemm_mq6g256v2_i8_norm_rope_applies(
+        &self,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        y: &GpuTensor,
+        head_stride_rows: usize,
+    ) -> bool {
+        self.flags.qwen4_qsa_norm_epi_enabled()
+            && y.dtype == DType::F32
+            && matches!(head_stride_rows, 256 | 512)
+            && m % head_stride_rows == 0
+            && m % MQ6_I8_PM_NR_ROWS == 0
+            && self.gemm_mq6g256v2_i8_applies(m, k, batch_size)
+            && mq6_i8_pm_admits(
+                self.flags.mq6_i8_pm,
+                &self.arch,
+                m,
+                k,
+                batch_size,
+                4,
+                y.buf.as_ptr() as usize,
+            )
+    }
+
+    /// [`Gpu::gemm_mq6g256v2_i8_prequant`] into F32 `y` (`[batch_size x m]`)
+    /// through the `..._pm_set_nr_gfx1201_t256x128` entry, which also applies
+    /// the QSA RMSNorm (`norm`, BF16 `[256]`, `1 + w` weight), then the
+    /// partial RoPE (`rope_table`: F32 `[batch_size][64]` of
+    /// [`crate::tensor_ops::indexed_attention_rope_table`]) to every 256-wide
+    /// head whose row start `rs` has `(rs & (head_stride_rows - 1)) < 256`.
+    /// The result is byte-identical to the plain GEMM followed by
+    /// `indexed_attention_norm_rope_batch` over those heads; other rows
+    /// (the gate half of q-gate rows) are the plain GEMM output.
+    ///
+    /// Returns `Ok(true)` when it launched, `Ok(false)` (nothing launched)
+    /// when [`Gpu::gemm_mq6g256v2_i8_norm_rope_applies`] is false, so the
+    /// caller runs the unfused chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_i8_prequant_norm_rope(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        head_stride_rows: usize,
+        norm: &GpuTensor,
+        rope_table: &GpuTensor,
+    ) -> HipResult<bool> {
+        self.bind_thread()?;
+        if !self.gemm_mq6g256v2_i8_norm_rope_applies(m, k, batch_size, y, head_stride_rows) {
+            return Ok(false);
+        }
+        if xq.is_null()
+            || norm.dtype != DType::BF16
+            || norm.numel() < QSA_NORM_EPI_HEAD_DIM
+            || rope_table.dtype != DType::F32
+            || batch_size
+                .checked_mul(QSA_NORM_EPI_ROTARY_DIM)
+                .is_none_or(|e| rope_table.numel() < e)
+        {
+            return Err(HipError::new(
+                0,
+                "gemm_mq6g256v2_i8_norm_rope: need prepared blocks, BF16 norm[256] and an F32 rope table of N rows x 64",
+            ));
+        }
+        let weight_bytes = m
+            .checked_mul(k / 256)
+            .and_then(|v| v.checked_mul(MQ6_GROUP_BYTES))
+            .ok_or_else(|| {
+                HipError::new(0, "gemm_mq6g256v2_i8_norm_rope: weight bytes overflow")
+            })?;
+        let out_bytes = batch_size
+            .checked_mul(m)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| HipError::new(0, "gemm_mq6g256v2_i8_norm_rope: batch*m overflow"))?;
+        if a.buf.size() < weight_bytes || y.buf.size() < out_bytes {
+            return Err(HipError::new(
+                0,
+                "gemm_mq6g256v2_i8_norm_rope: undersized weight or output tensor",
+            ));
+        }
+        let kernel = MQ6_I8_PM_ENTRY_F32_NORM_ROPE;
+        self.ensure_embedded_kernel(
+            MQ6_I8_PM_MODULE,
+            kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201,
+            kernel,
+        )?;
+        let mut ap = a.buf.as_ptr();
+        let mut xp = xq;
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut head_mask = (head_stride_rows - 1) as i32;
+        let mut normp = norm.buf.as_ptr();
+        let mut ropep = rope_table.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut head_mask as *mut _ as *mut c_void,
+            &mut normp as *mut _ as *mut c_void,
+            &mut ropep as *mut _ as *mut c_void,
+        ];
+        let bytes = weight_bytes
+            + batch_size * (k / 128) * BLOCK_I8_128_BYTES
+            + out_bytes
+            + batch_size * QSA_NORM_EPI_ROTARY_DIM * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [
+                (m / MQ6_I8_PM_NR_ROWS) as u32,
+                batch_size.div_ceil(MQ6_I8_PM_NR_TOKENS) as u32,
+                1,
+            ],
+            [MQ6_I8_PM_T256_THREADS, 1, 1],
+            MQ6_I8_PM_T256_LDS_BYTES,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b.push_i32(head_mask);
+                // The hidden block (offsets 40..296) is the runtime's.
+                while b.len() < MQ6_I8_PM_NR_NORM_OFFSET {
+                    b.push_u32(0);
+                }
+                b.push_ptr(normp);
+                b.push_ptr(ropep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        // `y` was overwritten: caches keyed on its pointer are stale.
+        self.invalidate_x_caches_for(y.buf.as_ptr());
+        result.map(|()| true)
     }
 }
 

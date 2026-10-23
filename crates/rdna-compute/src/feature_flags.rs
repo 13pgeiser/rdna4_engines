@@ -760,6 +760,11 @@ pub struct FeatureFlags {
     /// (`qwen4_qsa_decode_splitk_enabled`) and the q8 split-KV for exact
     /// gfx1151 and gfx1100 (`qwen4_qsa_decode_splitkv_q8_enabled`).
     pub qwen4_qsa_decode_splitk: bool,
+    /// Fused QSA q/k RMSNorm + RoPE in the int8 PM GEMM epilogue
+    /// (`HIPFIRE_QWEN4_QSA_NORM_EPI`): on unless the value is exactly `0`
+    /// (kill switch), acted on for exact gfx1201 only
+    /// ([`Self::qwen4_qsa_norm_epi_enabled`]). Byte-identical to the unfused chain.
+    pub qwen4_qsa_norm_epi: bool,
     /// Developer QSA mapped/allocation extent checks; exactly `1` or `2`.
     pub qwen4_qsa_extent_check: bool,
     /// Exactly `2` also synchronizes immediately after each checked launch.
@@ -1369,6 +1374,7 @@ impl FeatureFlags {
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref()
                 != Some("0"),
+            qwen4_qsa_norm_epi: value("HIPFIRE_QWEN4_QSA_NORM_EPI").ok().as_deref() != Some("0"),
             qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
             qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
             qwen4_qsa_code_check: value("HIPFIRE_QWEN4_QSA_CODE_CHECK").ok().as_deref()
@@ -1459,6 +1465,14 @@ impl FeatureFlags {
     /// [`Self::qwen4_qsa_decode_splitkv_q8_enabled`].
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
+    }
+
+    /// Fused QSA q/k norm+RoPE GEMM epilogue: `HIPFIRE_QWEN4_QSA_NORM_EPI`
+    /// (default on, `=0` kills it) on exact gfx1201. The runtime additionally
+    /// requires an eager int8 PM launch (see
+    /// `Gpu::gemm_mq6g256v2_i8_norm_rope_applies`).
+    pub fn qwen4_qsa_norm_epi_enabled(&self) -> bool {
+        self.qwen4_qsa_norm_epi && self.arch == "gfx1201"
     }
 
     /// Q8 split-KV QSA decode attention: the same
@@ -1887,6 +1901,7 @@ impl FeatureFlags {
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
             qwen4_qsa_decode_splitk: false,
+            qwen4_qsa_norm_epi: false,
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
             qwen4_qsa_code_check: false,
@@ -2182,6 +2197,28 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
+    }
+
+    /// The fused QSA norm+RoPE epilogue is default on, only `0` kills it, and
+    /// only exact gfx1201 acts on it.
+    #[test]
+    fn qwen4_qsa_norm_epi_defaults_on_exact_gfx1201_and_zero_kills() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_QWEN4_QSA_NORM_EPI" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1201";
+            assert_eq!(flags(None).qwen4_qsa_norm_epi_enabled(), exact, "{arch}");
+            assert_eq!(
+                flags(Some("1")).qwen4_qsa_norm_epi_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!flags(Some("0")).qwen4_qsa_norm_epi_enabled(), "{arch}");
+        }
     }
 
     /// The QSA split decode knob is default on and only the exact value `0`

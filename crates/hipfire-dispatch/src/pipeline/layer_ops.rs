@@ -45,9 +45,11 @@ use rdna_compute::tensor_ops::{
     gated_delta_core_lanes, gated_delta_gate_batched_arena, gated_delta_gate_batched_rotate_arena,
     gated_delta_step_gate_wmma_arena, gated_delta_step_gate_wmma_qknormed_arena,
     indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
-    indexed_attention_norm_rope_batch_arena, Bf16Arena, GdnCoreLane,
+    indexed_attention_norm_rope_batch_arena, indexed_attention_rope_table, Bf16Arena, GdnCoreLane,
 };
-use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
+use rdna_compute::{
+    DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
+};
 use smallvec::SmallVec;
 use std::sync::LazyLock;
 
@@ -170,6 +172,20 @@ pub fn project_weights(
     rotation: Option<&GpuTensor>,
     projections: &[(&WeightRef<'_>, &GpuTensor)],
 ) -> Result<(), DispatchError> {
+    project_weights_with_epilogues(gpu, input, rows, rotation, projections, &[])
+}
+
+/// [`project_weights`] whose MQ6 int8 GEMMs may run the fused QSA norm+RoPE
+/// epilogue: `epilogues` is empty or parallel to `projections`, and a member
+/// that took the fused entry sets its [`NormRopeEpi::fused`].
+fn project_weights_with_epilogues(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    epilogues: &[Option<&NormRopeEpi<'_>>],
+) -> Result<(), DispatchError> {
     // The chunked GDN in-projection group: BF16 qkv ahead of F32 a/b/z.
     let members = [false, true, true, true];
     let gdn_regions = projections.len() == 4 && projections[0].1.dtype == DType::BF16;
@@ -180,7 +196,20 @@ pub fn project_weights(
         rotation,
         projections,
         gdn_regions.then_some(&members[..]),
+        epilogues,
     )
+}
+
+/// A QSA q / k projection's fused RMSNorm + RoPE epilogue request
+/// ([`Gpu::gemm_mq6g256v2_i8_prequant_norm_rope`]): the layer's `norm` weight,
+/// the head pitch in output rows (`512` for the interleaved q-gate rows,
+/// `256` for plain k rows) and the RoPE `table`. `fused` records whether the
+/// projection ran fused.
+struct NormRopeEpi<'a> {
+    norm: &'a GpuTensor,
+    head_stride_rows: usize,
+    table: &'a GpuTensor,
+    fused: std::cell::Cell<bool>,
 }
 
 /// Whether `weight`'s prefill GEMM of `rows` runs the gfx1201 native-FP8 MQ6
@@ -235,7 +264,9 @@ fn project_weights_inner(
     rotation: Option<&GpuTensor>,
     projections: &[(&WeightRef<'_>, &GpuTensor)],
     region_members: Option<&[bool]>,
+    epilogues: &[Option<&NormRopeEpi<'_>>],
 ) -> Result<(), DispatchError> {
+    debug_assert!(epilogues.is_empty() || epilogues.len() == projections.len());
     debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
     let route = gpu.route_rows(rows);
     // A verify forward row-exact past the historic few-row limit keeps the
@@ -274,7 +305,27 @@ fn project_weights_inner(
             for j in i..projections.len() {
                 let (w, out) = projections[j];
                 if !done[j] && w.k == weight.k && mq6_i8_route(gpu, w, rows) {
-                    hip(gpu.gemm_mq6g256v2_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    let epilogue = epilogues.get(j).copied().flatten();
+                    let fused = match epilogue {
+                        Some(e) => hip(gpu.gemm_mq6g256v2_i8_prequant_norm_rope(
+                            w.buf,
+                            xq,
+                            out,
+                            w.m,
+                            w.k,
+                            rows,
+                            e.head_stride_rows,
+                            e.norm,
+                            e.table,
+                        ))?,
+                        None => false,
+                    };
+                    if let Some(e) = epilogue {
+                        e.fused.set(fused);
+                    }
+                    if !fused {
+                        hip(gpu.gemm_mq6g256v2_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    }
                     done[j] = true;
                 }
             }
@@ -574,6 +625,7 @@ fn project_trunk(
         zba,
         gdn_in_proj,
         &[],
+        &[],
     )
 }
 
@@ -588,7 +640,9 @@ fn project_trunk_masked(
     zba: Option<ZbaFold<'_>>,
     gdn_in_proj: bool,
     covered: &[bool],
+    epilogues: &[Option<&NormRopeEpi<'_>>],
 ) -> Result<(), DispatchError> {
+    debug_assert!(epilogues.is_empty() || epilogues.len() == projections.len());
     debug_assert_eq!(a4.len(), projections.len());
     debug_assert!(covered.is_empty() || covered.len() == projections.len());
     // Decode's MQ6 qkv and MQ4 a/b/z already share one aligned-256 FWHT.
@@ -717,7 +771,14 @@ fn project_trunk_masked(
         }
     }
     if done.iter().all(|d| !d) {
-        return project_weights(gpu, input, rows, Some(rotation), projections);
+        return project_weights_with_epilogues(
+            gpu,
+            input,
+            rows,
+            Some(rotation),
+            projections,
+            epilogues,
+        );
     }
     debug_assert!(
         covered.is_empty() || (0..projections.len()).all(|j| !covered[j] || done[j]),
@@ -736,6 +797,14 @@ fn project_trunk_masked(
         .filter(|&j| !done[j])
         .map(|j| gdn_in_proj && j != 0)
         .collect();
+    let epilogues_rest: SmallVec<[Option<&NormRopeEpi<'_>>; 4]> = if epilogues.is_empty() {
+        SmallVec::new()
+    } else {
+        (0..projections.len())
+            .filter(|&j| !done[j])
+            .map(|j| epilogues[j])
+            .collect()
+    };
     project_weights_inner(
         gpu,
         input,
@@ -743,6 +812,7 @@ fn project_trunk_masked(
         Some(rotation),
         &rest,
         gdn_in_proj.then_some(&members[..]),
+        &epilogues_rest,
     )
 }
 
@@ -2944,6 +3014,7 @@ fn execute_gated_delta_net_hc_impl(
             }),
             true,
             projection_only.as_ref().map_or(&[][..], |m| &m[..]),
+            &[],
         )?;
     }
     if phase == MixerPhase::InProj {
@@ -3978,6 +4049,68 @@ fn execute_indexed_attention_hc_impl(
         IndexedAttentionMode::AppendOnly => &a4_without_q,
         _ => &a4_all,
     };
+    // Fused q/k RMSNorm + RoPE in the int8 PM GEMM epilogue (QSA prefill's
+    // batched-launch branch, byte-identical to its two `norm_rope` launches).
+    // Only a whole-phase eager call with no NPU arena source and no
+    // projection hook (which reads the raw projections) takes it; the
+    // projection records which of q / k actually ran fused.
+    let yarn = op.rope.yarn(op.rotary_dim);
+    let table_floats = rows * QSA_NORM_EPI_ROTARY_DIM;
+    let fuse_candidate = phase == MixerPhase::Whole
+        && arenas.is_none()
+        && projection_only.is_none()
+        && !qsa_projection_hook_installed()
+        && gpu.route_rows(rows) > gpu.few_row_limit()
+        && op.head_dim == QSA_NORM_EPI_HEAD_DIM
+        && op.rotary_dim == QSA_NORM_EPI_ROTARY_DIM
+        && op.input.dtype == DType::F32
+        && op.qsa_output.dtype == DType::F32
+        && op.qsa_output.numel() >= table_floats;
+    let q_candidate = fuse_candidate
+        && !matches!(op.mode, IndexedAttentionMode::AppendOnly)
+        && op.q.m == 2 * q_width
+        && mq6_i8_route(gpu, &op.q, rows)
+        && gpu.gemm_mq6g256v2_i8_norm_rope_applies(op.q.m, op.q.k, rows, &qgate_batch, 512);
+    let k_candidate = fuse_candidate
+        && op.k.m == kv_width
+        && mq6_i8_route(gpu, &op.k, rows)
+        && gpu.gemm_mq6g256v2_i8_norm_rope_applies(op.k.m, op.k.k, rows, &k_batch, 256);
+    // The rope table lives in `qsa_output`: it is first written by the
+    // attention launch, after both fused GEMMs have consumed the table.
+    let rope_table = view(op.qsa_output, 0, table_floats);
+    if q_candidate || k_candidate {
+        hip(indexed_attention_rope_table(
+            gpu,
+            &rope_table,
+            rows,
+            initial_position,
+            op.rotary_dim,
+            yarn,
+        ))?;
+    }
+    let q_epi = NormRopeEpi {
+        norm: op.q_norm,
+        head_stride_rows: 512,
+        table: &rope_table,
+        fused: std::cell::Cell::new(false),
+    };
+    let k_epi = NormRopeEpi {
+        norm: op.k_norm,
+        head_stride_rows: 256,
+        table: &rope_table,
+        fused: std::cell::Cell::new(false),
+    };
+    let epi_all = [
+        None,
+        q_candidate.then_some(&q_epi),
+        k_candidate.then_some(&k_epi),
+        None,
+    ];
+    let epi_without_q = [epi_all[0], epi_all[2], epi_all[3]];
+    let epi: &[Option<&NormRopeEpi<'_>>] = match op.mode {
+        IndexedAttentionMode::AppendOnly => &epi_without_q,
+        _ => &epi_all,
+    };
     if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
         project_trunk_masked(
             gpu,
@@ -3989,11 +4122,13 @@ fn execute_indexed_attention_hc_impl(
             None,
             false,
             projection_only.as_ref().map_or(&[][..], |m| &m[..]),
+            epi,
         )?;
         if projection_only.is_none() {
             qsa_projection_hook_run(gpu, op)?;
         }
     }
+    let (q_fused, k_fused) = (q_epi.fused.get(), k_epi.fused.get());
     if phase == MixerPhase::InProj {
         return Ok(());
     }
@@ -4015,7 +4150,6 @@ fn execute_indexed_attention_hc_impl(
     if let Some(mirror) = &op.state.pooled_bf16 {
         mirror.valid_blocks.clamp(initial_position / op.compress);
     }
-    let yarn = op.rope.yarn(op.rotary_dim);
     if let Some(src) = arenas {
         qsa_norm_source(
             gpu,
@@ -4212,36 +4346,40 @@ fn execute_indexed_attention_hc_impl(
                 Some(index_kv_width),
             ))?;
         }
-        hip(indexed_attention_norm_rope_batch(
-            gpu,
-            &IndexedAttentionNormRopeBatch {
-                values: &qgate_batch,
-                norm: op.q_norm,
-                rows,
-                row_stride: 2 * q_width,
-                heads: op.heads,
-                head_dim: op.head_dim,
-                head_stride: 2 * op.head_dim,
-                position_start: initial_position,
-                rotary_dim: op.rotary_dim,
-                yarn,
-            },
-        ))?;
-        hip(indexed_attention_norm_rope_batch(
-            gpu,
-            &IndexedAttentionNormRopeBatch {
-                values: &k_batch,
-                norm: op.k_norm,
-                rows,
-                row_stride: kv_width,
-                heads: op.kv_heads,
-                head_dim: op.head_dim,
-                head_stride: op.head_dim,
-                position_start: initial_position,
-                rotary_dim: op.rotary_dim,
-                yarn,
-            },
-        ))?;
+        if !q_fused {
+            hip(indexed_attention_norm_rope_batch(
+                gpu,
+                &IndexedAttentionNormRopeBatch {
+                    values: &qgate_batch,
+                    norm: op.q_norm,
+                    rows,
+                    row_stride: 2 * q_width,
+                    heads: op.heads,
+                    head_dim: op.head_dim,
+                    head_stride: 2 * op.head_dim,
+                    position_start: initial_position,
+                    rotary_dim: op.rotary_dim,
+                    yarn,
+                },
+            ))?;
+        }
+        if !k_fused {
+            hip(indexed_attention_norm_rope_batch(
+                gpu,
+                &IndexedAttentionNormRopeBatch {
+                    values: &k_batch,
+                    norm: op.k_norm,
+                    rows,
+                    row_stride: kv_width,
+                    heads: op.kv_heads,
+                    head_dim: op.head_dim,
+                    head_stride: op.head_dim,
+                    position_start: initial_position,
+                    rotary_dim: op.rotary_dim,
+                    yarn,
+                },
+            ))?;
+        }
         hip(indexed_attention_cache_append_batch(
             gpu,
             &IndexedAttentionCacheAppendBatch {
