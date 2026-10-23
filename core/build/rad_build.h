@@ -197,6 +197,7 @@ private:
     /* init() for every surviving instance, after the whole graph has resolved, so a failing init
      * cannot abort declare before the miss report is assembled. */
     void finish_instances();
+    void fill_tune_instances();
     int32_t find_kv_consumer(rad_kvgroup g);
     void finish_layouts();
     void finish_kv_groups();
