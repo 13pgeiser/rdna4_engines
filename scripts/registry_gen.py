@@ -98,6 +98,7 @@ KNOWN_QUANTS = {
     "mq4",
     "mq4p",
     "mq4r",
+    "mq4rs",
     "mq5",
     "mq6",
     # Qwen3.8-Flash-Next's packed trunk rung: MQ6G256V2 (qt47) on the wide
