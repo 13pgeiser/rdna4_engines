@@ -53,6 +53,8 @@ set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
 # test binaries can run from anywhere.
 set(RAD_CHAT_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/chat)
 set(RAD_MEDIA_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/media)
+# Checked-in golden blobs (tests/data/golden), read at test time (tests/uocr_resample_golden.h).
+set(RAD_GOLDEN_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/golden)
 
 # libstdc++ before rad_core on every test's link line. lld extracts archive members to resolve a
 # shared library's imports too: ROCm 10.1's libamdhip64 imports std::string::reserve, which g++-14
@@ -113,6 +115,7 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 # cost comes down, so the tripwire stays tight.
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
+set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.
@@ -192,7 +195,8 @@ foreach(t ${RAD_TESTS})
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)
   endif()
   target_compile_definitions(${n} PRIVATE RAD_CHAT_FIXTURES="${RAD_CHAT_FIXTURES}"
-                                          RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}")
+                                          RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}"
+                                          RAD_GOLDEN_FIXTURES="${RAD_GOLDEN_FIXTURES}")
   # Normally inherited from rad_core; tests that do not link it still need the ABI headers.
   target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi
                                           ${CMAKE_BINARY_DIR}/rad_include)
@@ -328,6 +332,24 @@ if(RAD_HIP_FOUND AND TARGET device_test)
     SKIP_RETURN_CODE 77
     TIMEOUT ${RAD_TEST_TIMEOUT}
     ENVIRONMENT "${RAD_TEST_CARD_ENV};HSA_USE_SVM=0")
+endif()
+
+# ================================================================== kernel arguments in host memory
+#
+# A card whose PCI BAR is smaller than its VRAM gets its kernel argument rings and recorded-pass
+# argument blocks in pinned host memory (core/device/aql.cpp, init_devices). --host-kargs places
+# them there on any card, so device_test and runtime_test run that path a second time.
+if(RAD_HIP_FOUND)
+  foreach(n device_test runtime_test)
+    if(TARGET ${n})
+      add_test(NAME ${n}_hostkargs COMMAND ${n} --host-kargs -perf_)
+      set_tests_properties(${n}_hostkargs PROPERTIES
+        LABELS gpu
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
+  endforeach()
 endif()
 
 # ================================================================== the host kernels

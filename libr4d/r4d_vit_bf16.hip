@@ -298,8 +298,8 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
 // weight rows of one activation row, so the bias is eight consecutive values and the store (with
 // its residual read) is one 16-byte access.
 //
-// Staging both operands through LDS with a 4 x 2 tile a wave (the kernel above at 128 x 128, which
-// this replaces) costs 384 bytes of fragment reads and 128 of stores per bf16 WMMA: all of gfx1201's
+// Staging both operands through LDS with a 4 x 2 tile a wave (the kernel above at 128 x 128)
+// costs 384 bytes of fragment reads and 128 of stores per bf16 WMMA: all of gfx1201's
 // LDS bandwidth, 64 bytes a clock per CU against one bf16 WMMA every 16 clocks per SIMD
 // (libr4d/isa/wmmamix.hip). Here it is 256 and 64, and the weight's 128 bytes come through the
 // vector cache.

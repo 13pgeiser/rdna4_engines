@@ -243,6 +243,19 @@ typedef struct RadBatch {
     /* A video generator's pass (rad_declare_video_generator; `gen` is one of its
      * RAD_GEN_PASS_*): its payload. Null on every other step. */
     const struct RadVideoGenBatch* vgen_b;
+
+    /* ---- appended in ABI 26 (control vectors) */
+    /* Host-side: nonzero when some row of this pass takes the loaded control vector (its
+     * `projection_on_rows` entry is 1). A projection skips a zero row anyway, so a block issues
+     * no projection op when this is 0 and the pass is the one a deployment without a vector runs. */
+    int32_t control_vector;
+
+    /* ---- appended in ABI 26 (per-segment encoder grids) */
+    /* host: [enc_n_seg] each segment's grid in patches, the same values enc_coord planes 2 and 3
+     * carry. A plugin that has to pick a geometry before it issues ops (a tower with one set of
+     * position tables per grid) reads them here; they live as long as the pass. */
+    const int32_t* enc_seg_h;
+    const int32_t* enc_seg_w;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -379,13 +392,15 @@ typedef struct RadGenBatch {
      * where a window's end-of-text marker sits. */
     const int32_t* tokens_h;
     /* ---- appended in ABI 26 (Krea 2's rebalance) */
-    /* COND: the request's RAD_GEN_COND_* options, 0 for none. */
+    /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
+     * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
 enum {
-    RAD_GEN_COND_REBALANCE = 1   /* Krea 2: the text taps at the plugin's fixed rebalance gains */
+    RAD_GEN_COND_REBALANCE = 1   /* the conditioning at the plugin's fixed rebalance gains (the
+                                  * request field `rebalance`; Krea 2: its text taps) */
 };
 
 /* An entry's flags on a DENOISE pass. */

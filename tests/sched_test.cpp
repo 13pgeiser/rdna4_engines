@@ -854,6 +854,28 @@ TEST(a_hit_resuming_far_below_its_blocks_is_counted_as_cut) {
     CHECK_EQ(m.hit_cut_tokens, 528);
 }
 
+/* A restore that came back cut is counted once, by the admission it served: a request refused
+ * and asked again restores again, and only the attempt that admits it counts. */
+TEST(a_cut_restore_is_counted_once_per_admission) {
+    Fixture f;
+    f.build(/*blocks=*/12, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.restore_result = RestoreResult::Cut;
+
+    uint64_t a = f.submit(160, 8);                  /* ten blocks of twelve */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().prefix_restore_cuts, 1);
+
+    uint64_t b = f.submit(160, 8);                  /* no room beside a: refused, asked again */
+    (void)f.sch.step();
+    (void)f.sch.step();
+    CHECK(f.pc.restores.size() >= 3);
+    CHECK_EQ(f.sch.find(b)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().prefix_restore_cuts, 1);
+    (void)a;
+}
+
 /* A hit that skipped tokens with no snapshot to resume from would corrupt the linear state, so it
  * is refused outright rather than served with a zeroed state. */
 TEST(a_hit_with_no_checkpoint_slot_reuses_nothing) {
@@ -1769,7 +1791,7 @@ static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
 
 /* Between a commit and the next step (where an encoder pass is prepared) the committed step's
  * plan names a request the scheduler may already have released: a client cancelled it and the
- * server reaped it. prefill_continues() reads only an open step's plan (#127). */
+ * server reaped it. prefill_continues() reads only an open step's plan. */
 TEST(prefill_continues_reads_no_committed_plan) {
     Fixture f;
     f.build();
@@ -2584,32 +2606,17 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
 }
 
 /* ================================================================== the step path */
-/* The single-sequence decode floor the dashboard reads instead of a typed ruler. Timing is real
- * wall clock, so the assertions are the ones that hold whatever the machine measured: a step of a
- * shape that must not sample leaves the floor at zero (a min only ever goes down, so a wrongly
- * sampled step could never be told apart later -- it has to be caught while the floor is still
- * unset), and a single-sequence step sets it. */
+/* The single-sequence decode floor the dashboard reads. Timing is real wall clock, so the
+ * assertions hold on any machine: a step of a shape that must not sample leaves the floor at zero
+ * (a min only goes down, so a wrong sample must be caught while the floor is unset), and a
+ * single-sequence step sets it. */
 TEST(the_decode_floor_estimator_does_not_latch_a_degenerate_bracket) {
-    /* The estimator is tested on a SYNTHETIC stream because the defect is a property of the
-     * estimator, not of the scheduler's ability to produce a degenerate bracket: the fixture runs
-     * steps in microseconds and cannot manufacture a 1.34 ms bracket behind a 15 ms one. What the
-     * live lane showed -- floor 1.34 ms against a 15.70 ms mean -- is reproduced here directly. */
+    /* A synthetic stream: the fixture runs steps in microseconds and cannot produce a degenerate
+     * 1.34 ms bracket among 15 ms steps. */
     using Est = rad::DecodeFloor;
 
-    /* First, the OLD construction, shown to fail. A min over raw brackets latches the single
-     * degenerate sample and never recovers, no matter how many honest steps follow. This is the
-     * defect, encoded as a test so the fix is measured against it rather than asserted. */
-    {
-        int64_t best = 0;
-        const int64_t real = 15'000'000, degenerate = 1'340'000;
-        auto old_min = [&](int64_t ns) { if (best == 0 || ns < best) best = ns; };
-        old_min(degenerate);                       /* one degenerate, early */
-        for (int i = 0; i < 500; ++i) old_min(real);
-        CHECK_EQ(best, degenerate);                /* latched -- this is the bug */
-    }
-
-    /* The NEW construction: a min over WINDOW MEANS. The same single degenerate is diluted by
-     * the honest steps sharing its window, so the floor tracks the real floor instead. */
+    /* A min over raw brackets would latch a single degenerate sample; a min over window means
+     * dilutes it with the steps sharing its window. */
     {
         Est est;
         const int64_t real = 15'000'000, degenerate = 1'340'000;
@@ -2618,14 +2625,11 @@ TEST(the_decode_floor_estimator_does_not_latch_a_degenerate_bracket) {
         const int64_t floor = est.best();
         CHECK(floor > 0);
         CHECK(floor > degenerate);                 /* did NOT latch the degenerate */
-        /* Within 25% of the real floor: the window mean is a faithful estimator. */
         CHECK(floor >= real * 3 / 4 && floor <= real);
     }
 
-    /* Robust to a HIGH rate of degenerates: the live lane's checkpoint interval (256 tokens)
-     * implies they recur. One in four here. The assertion is that the floor tracks the REAL step
-     * time, not merely that it beats the degenerate -- with the rejection gate in place the latter
-     * would be trivially true and prove nothing. */
+    /* A high rate of degenerates (one in four; a checkpoint every 256 tokens makes them recur):
+     * the floor must track the real step time, not merely beat the degenerate. */
     {
         Est est;
         const int64_t real = 15'000'000, degenerate = 1'340'000;
@@ -2645,22 +2649,16 @@ TEST(the_decode_floor_estimator_does_not_latch_a_degenerate_bracket) {
 }
 
 TEST(the_decode_floor_rejects_degenerate_brackets_so_the_floor_is_the_true_floor) {
-    /* Window-averaging dilutes a LONE degenerate but not a RECURRENT one. At the live lane's
-     * observed ~1.4% degenerate rate (a decode step issued ahead behind a long host commit --
-     * prefill, or a KV checkpoint every 256 tokens), a min over hundreds of windows reliably
-     * catches a window holding two or three degenerates, and the floor lands ~10% below the true
-     * floor. That residual is phantom drift: a healthy engine reads "restart pays back" against a
-     * floor it can no longer reach because the floor was never reachable -- it was an artifact.
-     * So a candidate far below the running mean of accepted steps is rejected outright: the
-     * degenerates sit at ~9% of the mean, real single-sequence steps at ~96%, so the two
-     * populations are ~10x apart and any threshold between them separates them. 0.5 is the
-     * midpoint of that gap, not a value tuned to a single distribution. */
+    /* Window means dilute a lone degenerate but not a recurrent one. At a ~1.4% degenerate rate
+     * (a decode step issued ahead behind a long host commit: prefill, or a KV checkpoint) a min
+     * over hundreds of windows catches one holding two or three, and lands ~10% below the true
+     * floor. So a candidate far below the running mean of accepted steps is rejected: degenerates
+     * sit at ~9% of the mean and real steps at ~96%, and the 0.5 threshold is the gap's midpoint. */
     using Est = rad::DecodeFloor;
     const int64_t true_floor = 14'400'000, typical = 15'000'000, degen = 1'340'000;
 
-    /* A realistic stream: ~1.4% degenerates, the rest jittered around the typical step, with the
-     * true floor occasionally reached. The floor must land near the TRUE floor, not near the
-     * degenerate-contaminated window mean. */
+    /* ~1.4% degenerates, the rest jittered between the true floor and the typical step. The
+     * floor must land near the true floor, not the contaminated window mean. */
     Est est;
     uint32_t rng = 12345;
     for (int i = 0; i < 400 * Est::kWindow; ++i) {
@@ -2680,9 +2678,8 @@ TEST(the_decode_floor_rejects_degenerate_brackets_so_the_floor_is_the_true_floor
     CHECK(floor >= true_floor * 95 / 100);
     CHECK(floor <= true_floor * 115 / 100);
 
-    /* The bootstrap hole: the gate needs a window of accepted samples before it can judge one, so
-     * the first window is un-gated. A degenerate-heavy FIRST window must therefore be recorded by
-     * neither side, or the floor latches an unreachable value forever. */
+    /* The gate needs a window of accepted samples before it can judge one, so a degenerate first
+     * window must be recorded by neither side, or the floor latches an unreachable value. */
     {
         Est est;
         for (int i = 0; i < Est::kWindow; ++i) est.update(degen);   /* whole first window poisoned */
@@ -2692,20 +2689,17 @@ TEST(the_decode_floor_rejects_degenerate_brackets_so_the_floor_is_the_true_floor
         CHECK(est.best() >= typical * 95 / 100);   /* floor came from a gated window, not bootstrap */
     }
 
-    /* And the rejection must NOT eat real steps: a stream of only real steps (no degenerates)
-     * still records a floor equal to the true floor. */
+    /* The gate does not reject real steps: a clean stream records the true floor. */
     Est clean;
     for (int i = 0; i < 100 * Est::kWindow; ++i) clean.update(true_floor);
     CHECK_EQ(clean.best(), true_floor);
 }
 
 TEST(the_decode_floor_reports_a_recent_window_for_like_for_like_drift) {
-    /* The advisory compares "how fast is it now" against "how fast has it ever been". If those two
-     * numbers come from different instruments -- the engine's floor versus the browser's per-poll
-     * mean -- they disagree by pure order statistics: a min over hundreds of windows sits below a
-     * min over the last sixty samples even on a perfectly flat engine. Measured live 2026-10-18:
-     * a 7.7% phantom gap on a lane that had not changed. So the engine reports BOTH sides of the
-     * comparison, from the same stream and the same window size. */
+    /* "How fast now" against "how fast ever" from different instruments (the engine's floor, the
+     * browser's per-poll mean) disagree by order statistics alone: a min over hundreds of windows
+     * sits below a min over the last sixty samples on a flat engine. So the engine reports both
+     * sides from the same stream and window size. */
     using Est = rad::DecodeFloor;
     const int64_t base = 15'000'000;
 
@@ -2720,13 +2714,12 @@ TEST(the_decode_floor_reports_a_recent_window_for_like_for_like_drift) {
         const int64_t floor = est.best(), recent = est.recent();
         CHECK(floor > 0);
         CHECK(recent > 0);
-        /* The phantom gap must be small: this is the number the deadband is sized against. */
+        /* The gap must be small: the deadband is sized against it. */
         const int64_t gap_pct = 100 * (recent - floor) / floor;
         CHECK(gap_pct < 3);
     }
 
-    /* A degraded engine: the recent window rises, the floor remembers the old best. The verdict
-     * must separate -- that is the whole point of the advisory. */
+    /* A degraded engine: the recent window rises and the floor keeps the best. */
     {
         Est est;
         for (int i = 0; i < 200 * Est::kWindow; ++i) est.update(base);
@@ -2734,7 +2727,7 @@ TEST(the_decode_floor_reports_a_recent_window_for_like_for_like_drift) {
         for (int i = 0; i < 20 * Est::kWindow; ++i) est.update(base * 6 / 5);   /* 20% slower */
         const int64_t recent = est.recent();
         CHECK(recent > floor * 115 / 100);
-        /* The floor does not chase the degradation: a restart is exactly what would restore it. */
+        /* The floor does not follow the degradation. */
         CHECK_EQ(est.best(), floor);
     }
 
@@ -2763,9 +2756,8 @@ TEST(the_decode_floor_records_only_single_sequence_decode_steps) {
     f.sch.step_finished();
     CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);
 
-    /* The floor is a min over WINDOW MEANS of single-sequence decode steps, so it stays 0 until a
-     * full window (DecodeFloor::kWindow) has run -- unlike the old raw min, which latched the very
-     * first bracket. One short of a window and the floor is still unset. */
+    /* The floor is a min over window means of single-sequence decode steps, so it stays 0 until a
+     * full window (DecodeFloor::kWindow) has run. */
     for (int i = 1; i < rad::DecodeFloor::kWindow; ++i) {
         REQUIRE(f.sch.step() != nullptr);
         CHECK_EQ(f.sch.plan().n_seq_decode, 1);
@@ -3273,6 +3265,90 @@ TEST(a_block_drafter_context_pass_keeps_the_rows_of_a_finished_sequence) {
     f.sch.block_end();
 }
 
+/* A restore the pool cannot hold whole waits one step while a closed sequence still holds blocks
+ * until the next commit: its conversation's VRAM may be the room the restore needs. It waits once,
+ * and with nothing deferred it is not asked to come back whole. */
+TEST(a_restore_waits_one_step_for_a_deferred_release_before_it_is_cut) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 7;
+    CHECK_OK(f.start());
+    f.pc.decline_whole = true;
+
+    uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.pc.restores_whole.size(), (size_t)1);
+    CHECK(!f.pc.restores_whole[0]);                  /* nothing deferred: no wait asked */
+
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 1);
+    CHECK(f.sch.block_context(1) != nullptr);
+    CHECK_OK(f.sch.cancel(a));
+    f.sch.block_end();
+    REQUIRE(f.sch.has_deferred());
+
+    uint64_t b = f.submit(200, 8);
+    (void)f.sch.step();
+    REQUIRE_EQ(f.pc.restores_whole.size(), (size_t)2);
+    CHECK(f.pc.restores_whole[1]);
+    CHECK_EQ(f.sch.find(b)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().running, 0);
+
+    /* Once only: the next attempt takes what the pool holds, deferred release or not. */
+    CHECK(f.sch.step() != nullptr);
+    REQUIRE_EQ(f.pc.restores_whole.size(), (size_t)3);
+    CHECK(!f.pc.restores_whole[2]);
+    CHECK_EQ(f.sch.metrics().running, 1);
+}
+
+/* The wait is once per request, not once per slot. Two conversations taking turns reuse the slots
+ * their earlier turns held, so a turn landing in a slot whose last tenant waited must still wait. */
+TEST(a_request_in_a_reused_slot_still_waits_for_a_deferred_release) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 7;
+    CHECK_OK(f.start());
+    f.pc.decline_whole = true;
+    Scheduler::BlockRow rows[4];
+    /* Closes a running sequence while a drafter pass still names its blocks. */
+    auto close_deferred = [&](uint64_t id) {
+        CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 1);
+        CHECK(f.sch.block_context(1) != nullptr);
+        CHECK_OK(f.sch.cancel(id));
+        f.sch.block_end();
+        REQUIRE(f.sch.has_deferred());
+    };
+
+    uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    close_deferred(a);
+
+    uint64_t b = f.submit(200, 64);
+    (void)f.sch.step();                               /* waits a step */
+    CHECK(f.sch.step() != nullptr);                   /* then is admitted */
+    f.commit_plain();
+    REQUIRE_EQ(f.pc.restores_whole.size(), (size_t)3);
+    CHECK(f.pc.restores_whole[1]);
+    REQUIRE(!f.sch.has_deferred());
+
+    uint64_t x = f.submit(120, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().running, 2);
+    CHECK_OK(f.sch.cancel(b));                        /* nothing in flight: released at once */
+    CHECK_OK(f.sch.reap(b));                          /* b's slot is the next one handed out */
+    close_deferred(x);
+
+    const size_t before = f.pc.restores_whole.size();
+    uint64_t c = f.submit(240, 8);
+    (void)f.sch.step();
+    REQUIRE_EQ(f.pc.restores_whole.size(), before + 1);
+    CHECK(f.pc.restores_whole.back());
+    CHECK_EQ(f.sch.find(c)->n_computed, 0);
+}
+
 /* A cancel between two drafter passes (built one at a time, lock released between) must not free
  * the blocks: the query pass would get a block-table row of -1 under a non-zero length. */
 TEST(a_cancel_between_drafter_passes_keeps_the_blocks_until_the_passes_are_built) {
@@ -3306,6 +3382,41 @@ TEST(a_cancel_between_drafter_passes_keeps_the_blocks_until_the_passes_are_built
     CHECK(!f.kv.has_sequence(a));
     CHECK_EQ(f.kv.free_blocks(0), before);
     CHECK(!f.sch.has_deferred());
+    CHECK_OK(f.sch.reap(a));
+    CHECK(f.sch.find(a) == nullptr);
+}
+
+/* On the card the drafter's rows are taken before the commit and released after it, so a cancel
+ * between the two passes is still held when the commit retires the step. The commit must not free
+ * the blocks while block_begin's rows name them; block_end hands them to the next sweep. */
+TEST(a_cancel_between_card_drafter_passes_keeps_the_blocks_past_the_commit) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = 7;
+    CHECK_OK(f.start());
+
+    const int64_t before = f.kv.free_blocks(0);
+    uint64_t a = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4, /*on_card=*/true), 1);
+    CHECK(f.sch.block_context(1) != nullptr);
+
+    CHECK_OK(f.sch.cancel(a));
+    CHECK(f.kv.has_sequence(a));
+
+    const RadBatch* qb = f.sch.block_query(1);
+    REQUIRE(qb != nullptr);
+    CHECK(qb->kv[0].block_table[0] >= 0);
+    f.commit_plain();
+    CHECK(f.kv.has_sequence(a));                     /* the rows still name it */
+    f.sch.block_end();
+
+    CHECK(f.sch.has_deferred());
+    f.sch.release_deferred();
+    CHECK(!f.kv.has_sequence(a));
+    CHECK_EQ(f.kv.free_blocks(0), before);
     CHECK_OK(f.sch.reap(a));
     CHECK(f.sch.find(a) == nullptr);
 }
@@ -4732,6 +4843,57 @@ TEST(a_preempted_request_continues_its_stream_exactly) {
     CHECK_EQ(got[0].token, 100); CHECK_EQ(got[1].token, 102); CHECK_EQ(got[2].token, 103);
     const std::vector<int32_t> want = { 100, 102, 103 };
     CHECK(f.sch.find(a)->output == want);
+}
+
+/* With a runtime window the ring rewrites its slots in place, so a recompute cannot prefill the
+ * output it replays: the prompt runs in chunks that end at the floor, then each output token a step,
+ * attending as its decode step did, and the stream still goes on exactly. */
+TEST(a_preempted_ring_sequence_replays_its_output_a_token_a_step) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    f.kv.ring_w = 16;
+    CHECK_OK(f.start());
+    auto r = f.request(160, 64);
+    r->sink = &sink;
+    const uint64_t a = f.add(std::move(r));
+    const uint64_t b = f.submit(160, 64, /*priority=*/5);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.kv.has_runtime_window(a));
+    CHECK_EQ(f.kv.ring_floor[a], 160);
+    f.commit_plain(100);
+    REQUIRE(f.sch.step() != nullptr);              /* both need a block at 160: a is preempted */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    f.commit_plain(101);
+    CHECK_OK(f.sch.cancel(b));
+    CHECK_OK(f.sch.reap(b));
+
+    /* Re-armed at the prompt's end; the prompt runs in chunks that end at it and sample
+     * nothing. */
+    int64_t at = 0;
+    for (int k = 0; k < 8 && at < 160; ++k) {
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        CHECK_EQ(f.sch.plan().e[0].ctx_len, at);
+        at += f.sch.plan().e[0].n_tokens;
+        CHECK(at <= 160);
+        CHECK(!f.sch.plan().e[0].produces_token);
+        f.commit_plain(0);
+    }
+    CHECK_EQ(at, 160);
+    CHECK_EQ(f.kv.ring_floor[a], 160);
+    /* The replayed output token on its own, which samples the next. */
+    const RadBatch* rb = f.sch.step();
+    REQUIRE(rb != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 160);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1);
+    CHECK(f.sch.plan().e[0].produces_token);
+    CHECK_EQ(rb->token_ids[0], 100);
+    CHECK_EQ(rb->positions[0], 160);
+    f.commit_plain(102);
+    const std::vector<int32_t> want = { 100, 102 };
+    CHECK(f.sch.find(a)->output == want);
+    CHECK_EQ(sink.n_produced(), (int64_t)2);
 }
 
 /* ================================================================== media rows across chunks */

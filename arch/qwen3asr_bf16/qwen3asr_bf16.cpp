@@ -9,7 +9,7 @@
  * input_audio part. The reference is transformers' modeling_qwen3_asr (5.18) with its
  * Qwen3ASRFeatureExtractor, which core/mm reproduces (AudioFamily::Qwen3ASR).
  *
- * ============================== THE SHAPE, AT 1.7B ==============================
+ * ============================== The shape, at 1.7B ==============================
  *
  *   audio encoder: log-mel [frames, 128], convolved one second (100 frames) at a time: three
  *     Conv2d 3x3 / stride 2 / pad 1 over [mel, time] with 480 channels and exact gelu, 128 mel ->
@@ -23,7 +23,7 @@
  *     q/k RMS norms, NeoX rope over the whole head at theta 1e6, SwiGLU 6144, RMS eps 1e-6,
  *     vocab 151936, the lm_head tied to the embedding.
  *
- * ============================== WHAT IS EASY TO GET WRONG ==============================
+ * ============================== What is easy to get wrong ==============================
  *
  * Each second is convolved on its own. The core lays a clip out so one convolution over it does
  * that (core/mm/processor.h, AudioFamily::Qwen3ASR): a whole second is staged as 104 frames whose

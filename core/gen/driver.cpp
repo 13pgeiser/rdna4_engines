@@ -13,8 +13,6 @@ namespace {
 
 constexpr int64_t kAlign = 256;
 
-int64_t align_up(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
-
 /* Upper bound on a reference picture's latent tokens: its area plus slack for rounding its sides
  * to the size multiple. */
 int64_t ref_tokens_max(const RadGeneratorDecl& d) {
@@ -97,7 +95,7 @@ int64_t carve(const Sizes& z, int64_t pixel_ch, int64_t (*bytes)[2], int n) {
     for (int r = 0; r < n; ++r) {
         bytes[r][0] = off;
         bytes[r][1] = want[r][1];
-        off = align_up(off + want[r][1]);
+        off = align_up(off + want[r][1], kAlign);
     }
     return off;
 }
@@ -121,6 +119,12 @@ int Driver::init(const Program& prog, IKVManager* kv, const std::vector<RankIO>&
     kv_     = kv;
     ranks_  = ranks;
     table_  = DiscreteTable{};
+    if (decl_.cond_opts & ~(uint32_t)RAD_GEN_COND_REBALANCE) {
+        RAD_ERR("image generator: '%s' declares conditioning options 0x%x, and this engine knows "
+                "only RAD_GEN_COND_REBALANCE (0x%x)", decl_.name ? decl_.name : "",
+                (unsigned)decl_.cond_opts, (unsigned)RAD_GEN_COND_REBALANCE);
+        return RAD_E_UNSUPPORTED;
+    }
     if (discrete()) {
         std::string why;
         if (discrete_table(decl_, &table_, &why) < 0) {
@@ -258,6 +262,8 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
                        !(decl_.samplers & (1u << r->sampler)) || r->scheduler < 0 ||
                        r->scheduler >= RAD_GEN_SCHED_COUNT))
         return no("the sampler or scheduler is not one this model serves");
+    if ((uint32_t)r->cond_opts & ~decl_.cond_opts)
+        return no("a conditioning option (rebalance) this model does not serve");
     r->ticket->t_submit_ns = (int64_t)rad_mono_ns();
     std::lock_guard<std::mutex> lk(mu_);
     if (closed_) {
@@ -530,6 +536,7 @@ void Driver::finish_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int ste
         G.size_px = nullptr;
         G.entry_h = nullptr;
         G.tokens_h = nullptr;
+        G.cond_opts = 0;
     }
 }
 

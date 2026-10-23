@@ -176,13 +176,13 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
 
 // The same kernel at decode heights (THR 1024, n <= 1024 * EPT), with every operand of the row
 // loaded in one go before the first reduction. The kernel above reads the row again in each pass,
-// each read behind a barrier, so a row costs three dependent memory round trips; on gfx1201 that
-// held the kernel at 11 us at any height against a 4.2 us launch floor, and this form at 8.2 us
-// (4x R9700, 1 to 16 rows of 5376, 2026-10-17). Every pass partitions the row the same way (thread
-// t takes columns t, t+THR, ...), so each thread keeps its own columns in registers and none needs
-// another's; only the fragment-order store crosses threads, through `ybuf` as before. The sums,
-// the order they are taken in and every element's arithmetic are junction_row's, so the bytes are.
-// One row of it, for this kernel and for the all-reduce's tail (ar_rmsnorm_quant_i8_tail_kernel).
+// each read behind a barrier, so a row costs three dependent memory round trips; on gfx1201 at
+// 1 to 16 rows of 5376 that is 11 us a launch against 8.2 us for this form. Every pass partitions
+// the row the same way (thread t takes columns t, t+THR, ...), so each thread keeps its own
+// columns in registers and none needs another's; only the fragment-order store crosses threads,
+// through `ybuf`. The sums, their order and every element's arithmetic are junction_row's, so the
+// output bytes are the same. One row of it, for this kernel and for the all-reduce's tail
+// (ar_rmsnorm_quant_i8_tail_kernel).
 template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
 __device__ __forceinline__ void junction_reg_row(
     const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
@@ -633,7 +633,7 @@ __global__ __launch_bounds__(1024) void r4dchain_ar_rmsnorm_quant_i8_tail(R4D_AR
 // rmsnorm_quant_i8), and the residual on its own rows only -- on every row with `gres`. `x` keeps
 // this rank's partial sums: nothing past the junction reads the reduced branch output. Against the
 // tail form the second hop carries int8 instead of bf16 and no block waits beside the transport;
-// one launch at a time on 4x R9700 (2026-10-19) it took 22.9 against 24.5 us at 8 rows of 5376,
+// one launch at a time on 4x R9700 it takes 22.9 against 24.5 us at 8 rows of 5376,
 // 30.8 against 34.9 at 16, 72.3 against 89.2 at 64, and 19.8 against the one-shot's 21.9 at 4.
 template <uint32_t EPT, uint32_t THR, int WS>
 __device__ __forceinline__ void ar_rmsnorm_quant_i8_sp_body(

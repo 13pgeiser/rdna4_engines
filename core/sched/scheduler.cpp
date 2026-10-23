@@ -70,6 +70,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     has_linear_state_ = false;
     for (const auto& g : kvgeom_.g) if (!g.paged) has_linear_state_ = true;
 
+    /* R-SWA: which groups carry runtime per-sequence windows, and the W they arm a sequence
+     * with. Empty unless the engine declared one (KVManager::declare_runtime_window), so a model
+     * with a fixed window (gemma4) takes none of the runtime-window paths. */
+    rswa_windows_.clear();
+    for (size_t i = 1; i < kvgeom_.g.size(); ++i) {
+        const int64_t w = kv->runtime_window_tokens((int32_t)i);
+        if (w > 0) rswa_windows_.push_back({(int32_t)i, w});
+    }
+    if (!rswa_windows_.empty())
+        RAD_INFO("R-SWA: %zu KV group(s) with a runtime window; a sequence keeps its prompt as the "
+                 "reference and decodes into a ring of %lld token(s) after it, and is excluded from "
+                 "the prefix cache, checkpoints and speculation",
+                 rswa_windows_.size(), (long long)rswa_windows_[0].tokens);
+
     /* A hit can leave a drafter's own cache short only where a paged group is not prefix-cached
      * (scheduler.h, hit_holes_draft_). With the cache off cached_groups() is empty and this is
      * true, which costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
@@ -282,6 +296,10 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.ckpt_src = -1;
     s.hit_attn = 0;
     s.hit_owed = false;
+    /* Slots are reused: a request that inherited `restore_waited` would never wait for a deferred
+     * release and its restore would be cut. */
+    s.restore_waited = false;
+    s.restore_cut = false;
     s.req->state = ReqState::Waiting;
 
     /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.
@@ -407,7 +425,12 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
      * and failed requests are published too; their prompts were computed, and a client that hangs
      * up mid-answer is likely to ask for that prefix again. */
     if (publish && cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
-        s.req->n_computed > 0) {
+        s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
+        /* R-SWA: a sequence with a runtime window is not published (KVManager::set_window). Its
+         * table is a reference plus a ring rather than a prefix from position 0, and the window
+         * length is runtime data that no cache key carries; a hit would adopt blocks for a window
+         * this sequence does not have. prefix.cpp already skips a windowed group -- this makes the
+         * policy explicit, rather than a consequence of the kind declared at build time. */
         const std::vector<int32_t>& cg = pc_->cached_groups();
         pub_blocks_.assign(cg.size(), {});
         bool ok = !cg.empty();
@@ -466,6 +489,11 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
  * refusal leaves the entry without one. */
 void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_t tok) {
     int32_t cs = -1;
+    /* R-SWA: a sequence with a runtime window is never checkpointed. The window is runtime data
+     * (the prompt's own length), so a slot would describe a window the sequence does not have, and
+     * the ring is not the [lo, pos) block list a restore seeds. The prefix cache can never reuse
+     * it either, so the copy would be dead weight. */
+    if (kv_->has_runtime_window(r.id)) return;
     if (pc_->reserve_checkpoint(r, pos, &cs) < 0 || cs < 0) return;
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
@@ -700,6 +728,12 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
 }
 
 /* ------------------------------------------------------------------ chunking */
+int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
+    if (rswa_windows_.empty() || !kv_->has_runtime_window(r.id)) return n_target;
+    const int64_t prompt = (int64_t)r.prompt.size();
+    return std::min(n_target, r.n_computed < prompt ? prompt : r.n_computed + 1);
+}
+
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
  * written (spec §7.3; see scheduler.h).
  *
@@ -918,6 +952,20 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
 
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
 
+    /* R-SWA: the visible set becomes [0, prompt) plus a ring of W once the prompt is placed. The
+     * floor is this sequence's own prompt length (image tokens included, they are prompt rows),
+     * and it is armed here rather than at the prefill's end so no checkpoint is reserved for the
+     * sequence: a snapshot would describe a window the sequence no longer has (set_window). */
+    for (const RswaWindow& w : rswa_windows_) {
+        const int rc = kv_->set_window(r.id, (int64_t)r.prompt.size(), w.tokens);
+        if (rc < 0) {
+            RAD_WARN("request %llu: runtime window of %lld tokens over a %zu-token prompt: %s",
+                     (unsigned long long)r.id, (long long)w.tokens, r.prompt.size(),
+                     rad_strerror(rc));
+            return rc;
+        }
+    }
+
     /* A fresh attempt: nothing looked up or counted yet. A request that kept an earlier
      * attempt's hit (n_computed > 0) keeps what it found. */
     if (r.n_computed == 0) {
@@ -937,8 +985,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     if (r.n_computed == 0 && cfg_.prefix_cache) {
         /* Restore before the lookup, which stops at the first block the tiers hold. This is
          * where a cold session gets its context back for the cost of a copy instead of a
-         * prefill. */
-        pc_->restore(r);
+         * prefill.
+         *
+         * A sequence closed while a step issued ahead still read its blocks keeps them until the
+         * next commit, and the room a restore makes cannot include them yet: a request right
+         * behind another conversation's last turn would come back cut and prefill the rest. Such
+         * a restore waits one step, once, instead of being cut. */
+        const bool whole_only = n_deferred_ > 0 && !s.restore_waited;
+        const RestoreResult rr = pc_->restore(r, whole_only);
+        if (rr == RestoreResult::Declined) {
+            s.restore_waited = true;
+            RAD_DEBUG("admit %llu: the restore waits a step for %d deferred release(s)",
+                      (unsigned long long)r.id, n_deferred_);
+            return RAD_E_FULL;
+        }
+        s.restore_cut = rr == RestoreResult::Cut;
         HitCap cap;
         if (draft_refill_ > 0) {
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
@@ -974,8 +1035,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                       "below it", (unsigned long long)r.id, (long long)h.n_attn_tokens);
         } else if (reuse < h.n_attn_tokens) {
             /* Within an interval of the hit is the ordinary case: a turn's tail past its last
-             * checkpoint. Further down, the snapshots in between are gone, or the attention
-             * blocks reach past what the tiers could restore of the chain. */
+             * checkpoint. Further down, the previous reply was longer than an interval (decode
+             * writes no snapshot), the retention policy kept nothing nearer, or the attention
+             * blocks reach past the snapshot a cut restore stopped at. */
             if (geo_.checkpoints() && h.n_attn_tokens - reuse > geo_.checkpoint_interval)
                 s.hit_cut = SchedReq::HitCut::ResumedBelow;
             RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at the snapshot at %lld",
@@ -1056,9 +1118,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * queued behind it takes every token left. The hit is known by now, so the cap applies
          * to what really has to run. */
         const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
-        want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
+        const int64_t end = chunk_end(r, target);
+        want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at);
         if (cap < budget && want > 0)
-            admit_full_ = plan_chunk(r.n_computed, target, budget, nullptr, r.checkpoint_at);
+            admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at);
     }
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
@@ -1093,6 +1156,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             m_.attn_cached_tokens += s.hit_attn;
             m_.linear_cached_tokens += r.n_cached;
             if (s.hit_attn > r.n_cached) m_.hit_cut_tokens += s.hit_attn - r.n_cached;
+            if (s.restore_cut) ++m_.prefix_restore_cuts;
             switch (s.hit_cut) {
                 case SchedReq::HitCut::NoSnapshot: ++m_.hit_cut_no_snapshot; break;
                 case SchedReq::HitCut::Window:     ++m_.hit_cut_window;      break;
@@ -1254,9 +1318,10 @@ const RadBatch* Scheduler::step() {
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
                                          /*rows_only=*/shares == 0);
-            want = plan_chunk(r.n_computed, target, cap, &ckpt, r.checkpoint_at);
+            const int64_t end = chunk_end(r, target);
+            want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at);
             if (cap < budget && want > 0 && capped_at < 0) {
-                const int64_t full = plan_chunk(r.n_computed, target, budget, nullptr,
+                const int64_t full = plan_chunk(r.n_computed, end, budget, nullptr,
                                                 r.checkpoint_at);
                 if (want < full) { capped_at = (int32_t)plan_.e.size(); capped_full = full; }
             }
@@ -1476,7 +1541,8 @@ const RadBatch* Scheduler::step() {
         if (cfg_.busy_prefill_chunk > 0) limit = std::min(limit, std::max(had, cfg_.busy_prefill_chunk));
         int64_t ckpt = -1;
         const int64_t grown = e.ckpt_slot < 0 && limit > had
-            ? plan_chunk(r.n_computed, s.seq_len(), limit, &ckpt, r.checkpoint_at) : had;
+            ? plan_chunk(r.n_computed, chunk_end(r, s.seq_len()), limit, &ckpt, r.checkpoint_at)
+            : had;
         if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
@@ -1607,7 +1673,7 @@ bool Scheduler::prefill_continues() const {
     std::lock_guard<std::mutex> lk(mu_);
     /* Only the step being released has a plan to read. Between a commit and the next step (an
      * encoder pass is prepared there) `plan_` is the committed step's, whose requests in_step() no
-     * longer holds: a cancel and reap may have released one (#127). */
+     * longer holds: a cancel and reap may have released one. */
     if (stage_rows_ <= 0 || !step_open_) return false;
     /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
      * would be dropped by that step. */
@@ -2125,7 +2191,10 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * so the host bounds it by all of them. A mid-prompt chunk verified nothing. */
         const int64_t vstart = (int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec;
         const int64_t head_max = vstart + e.n_spec;
-        bool can_draft = may_draft && e.produces_token;
+        /* A runtime-window (R-SWA) sequence is never drafted for: its rollback refuses (the ring
+         * rewrites slots KVManager::rollback cannot unwind), so a rejected draft would only warn
+         * and waste the draft compute. This is the gate kv.cpp's rollback comment states. */
+        bool can_draft = may_draft && e.produces_token && !kv_->has_runtime_window(r.id);
 
         /* Lookahead KV: round k writes the head's K and V at head + k - 1, past the committed end,
          * so blocks must exist up to the furthest head acceptance could leave. The next verify
@@ -2631,7 +2700,6 @@ SchedMetrics Scheduler::metrics_locked() const {
                m.prefix_ckpt_refused = cc.refused;
                m.prefix_expired = pc_->expired();
                m.prefix_ckpt_expired = pc_->ckpt_expired();
-               m.prefix_restore_cuts = pc_->restore_cuts();
                m.prefix_held_tokens = pc_->held_tokens(); }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;

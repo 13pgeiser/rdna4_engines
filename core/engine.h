@@ -185,7 +185,6 @@ public:
                          std::shared_ptr<void>* hold, std::string* note, std::string* err);
     /* The adapter files a generator request may name: --lora's and those under --lora-dir. */
     std::vector<std::string> gen_lora_names() const;
-    bool gen_lora_enabled() const { return lora_gen_; }
 private:
     /* A generator's adapter files by name (--lora, POST /v1/load_lora_adapter, --lora-dir), opened
      * once and kept mapped; compositions read them when a combination is put in a slot. */
@@ -383,7 +382,7 @@ private:
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
-     * prompt-lookup drafter and the host's block driver both read the committed sequence). */
+     * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
@@ -407,13 +406,11 @@ private:
     void   phase_mark(int p);
 
     /* Block driver (spec §10): a context pass mirroring the step just run, then one pass that
-     * fills every drafted position at once. DFlash2 has this shape. run_block_drafter stages both
-     * after the commit; on the card (`block_card_`, the default), issue_block_drafter queues them
-     * behind the step before its readback and finish_block_drafter publishes the proposals after
-     * the commit, so the step can be issued ahead. RADIANCE_DRAFT_BLOCK_HOST=1 keeps the host's. */
-    int  run_block_drafter(int step);
+     * fills every drafted position at once. DFlash2 has this shape. issue_block_drafter queues
+     * both behind the step before its readback and finish_block_drafter publishes the proposals
+     * after the commit, so the step can be issued ahead. */
+    bool block_drafting() const;
     int  block_pass(const RadBatch* db, const char* what, int step);
-    bool block_card_ = false;
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
     /* Handed from issue_block_drafter to finish_block_drafter and issue_ahead: the drafting rows,

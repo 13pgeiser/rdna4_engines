@@ -391,13 +391,15 @@ struct FakeMultimodal : IMultimodal {
     std::vector<int32_t> expand = { 0 };
     bool accept_image = true, accept_video = true, accept_audio = true;
     std::vector<std::pair<MediaKind, std::vector<uint8_t>>> got;
+    std::vector<MediaOpts> got_opts;   /* the options each part was prepared with */
     bool accepts(MediaKind k) const override {
         return k == MediaKind::Image ? accept_image : k == MediaKind::Video ? accept_video
                                                                             : accept_audio;
     }
-    int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts&,
+    int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
                 std::shared_ptr<mm::Item>* out, std::string*) override {
         got.emplace_back(k, bytes);
+        got_opts.push_back(opts);
         auto it = std::make_shared<mm::Item>();
         it->expand = expand;
         *out = std::move(it);

@@ -139,6 +139,7 @@ struct Model {
     std::vector<TeLayer> te;
     rad_buf b_taps = 0;        /* [T * 12, n_embd]: token t's tap i at row 12 t + i */
     std::string tap_mul[kNTaps];   /* chan_affine's `mul` for each tap's rebalance gain */
+    std::string tap_add;           /* chan_affine's `add`: zeros */
 
     /* ---- the text fusion: the layer-wise blocks over the taps themselves, the refiner blocks
      * over the mixed rows `b_ft` */
@@ -383,7 +384,12 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
      * scaled copy goes through te.h2, free between a layer's add and the next layer's projections,
      * so the residual stream itself is never scaled. */
     enum { kGainCh = 64 };
-    if (g.n_embd % kGainCh) return RAD_E_INVAL;
+    if (g.n_embd % kGainCh) {
+        fprintf(stderr, "radiance: krea2: the text encoder's hidden size %lld is not a multiple of "
+                "%d, the rows the rebalance gains are applied in\n", (long long)g.n_embd,
+                (int)kGainCh);
+        return RAD_E_UNSUPPORTED;
+    }
     for (int t = 0; t < kNTaps; ++t) {
         char v[32];
         std::snprintf(v, sizeof v, "%.9g", kRebalance[t]);
@@ -393,9 +399,8 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             m.tap_mul[t] += v;
         }
     }
-    static std::string zeros64;
-    if (zeros64.empty())
-        for (int k = 0; k < kGainCh; ++k) zeros64 += k ? " 0" : "0";
+    m.tap_add.clear();
+    for (int k = 0; k < kGainCh; ++k) m.tap_add += k ? " 0" : "0";
 
     /* Layers up to the last tap only. */
     const int n_run = kTaps[kNTaps - 1];
@@ -480,7 +485,7 @@ static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             L.op_gain = rw(b, RAD_OP(b, "chan_affine",
                                      RAD_PARAMS(RAD_RANGE("M", 1, kTeRows), RAD_INT("n", kGainCh),
                                                 RAD_STR("mul", m.tap_mul[L.tap].c_str()),
-                                                RAD_STR("add", zeros64.c_str()),
+                                                RAD_STR("add", m.tap_add.c_str()),
                                                 RAD_STR("mode", "fma"), RAD_STR("dtype", "bf16"),
                                                 RAD_INT("round", 0)),
                                      RAD_NOWEIGHTS),
@@ -1181,6 +1186,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.cond_rows = kCondRows;
         d.rope_hw_scale = 1.0;
         d.rope_text_l = 0;
+        d.cond_opts = RAD_GEN_COND_REBALANCE;
         RAD_ARCH_TRY(rad_declare_generator(b, &d));
     }
     rad_note(b, "rank %d/%d: Krea 2%s -- text encoder %d of %lld layers, text fusion %zu + %zu "

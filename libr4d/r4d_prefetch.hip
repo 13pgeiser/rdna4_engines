@@ -4,19 +4,15 @@
 // GEMMs leaves memory idle for its whole round trip: ~20 us at a DFlash2 verify's 8 rows on 4x
 // R9700. A read issued on the second lane in that window puts the next GEMM's first bytes in the
 // 64 MB Infinity Cache, and the GEMM then streams them from there. On four cards (a microbenchmark
-// of the 8-row two-shot and a GEMM-like stream of a cold 29 MB weight, 2026-10-17) 16 MB read beside
-// the all-reduce took a layer from 84.0 us to 70.1; the same read on the same stream gained nothing.
+// of the 8-row two-shot and a GEMM-like stream of a cold 29 MB weight) 16 MB read beside the
+// all-reduce took a layer from 84.0 us to 70.1; the same read on the same stream gained nothing.
 //
 // It writes nothing at all. Each lane folds its loads into one word and hands it to an empty
 // `asm volatile`, which the compiler can neither drop nor see into, so the loads stay.
 //
-// Nothing here reaches HIP's runtime. The fold once went to a word hipMalloc'ed on the first
-// launch, in the middle of a pass; then to a `__device__` word, which HIP's runtime registers and
-// places itself (the engine records only fat binaries and functions). That word cost ~8% of a
-// DFlash2 step (321 tok/s against 348 in one A/B on 4x R9700, 2026-10-17, every prefetch size
-// alike), not through extra hardware queues (every image held 16 on the four cards); the
-// mechanism is not pinned down. Neither form was the cause of the fresh-server divergence the
-// reads beside a prefill bring (rad_arch.h, kPrefetchRows): with no word at all it is still there.
+// Nothing here reaches HIP's runtime: no allocation at launch and no `__device__` word, which HIP's
+// runtime registers and places itself (the engine records only fat binaries and functions). Such a
+// word cost ~8% of a DFlash2 step on 4x R9700, for a reason not pinned down.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_chain.h"

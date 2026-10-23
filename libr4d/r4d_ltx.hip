@@ -284,7 +284,7 @@ __global__ __launch_bounds__(kT) void s2d3d_kernel(
     }
 }
 
-// ---------------------------------------------------------------------------- pix_patch / patch_pix8
+// ---------------------------------------------------------------------------- pix_patch
 __device__ __forceinline__ int patch_col(int c, int ph, int pw, int p, bool wh) {
     return c * p * p + (wh ? pw * p + ph : ph * p + pw);
 }
@@ -302,23 +302,6 @@ __global__ __launch_bounds__(kT) void pix_patch_kernel(
         stx(y, (size_t)((yy / p) * y_ld + (long long)(xx / p) * C * p * p +
                         patch_col(c, yy % p, xx % p, p, wh)),
             ldx(x, (size_t)(yy * x_ld + (long long)xx * C + c), xbf), ybf);
-    }
-}
-
-// A thread an output byte.
-__global__ __launch_bounds__(kT) void patch_pix8_kernel(
-    const void* __restrict__ x, uint8_t* __restrict__ y, long long R, int w, int C, int p, bool wh,
-    long long x_ld, long long y_ld, bool xbf) {
-    const long long Wp = (long long)w * p * C, n = R * p * Wp;
-    for (long long e = (long long)blockIdx.x * kT + threadIdx.x; e < n;
-         e += (long long)gridDim.x * kT) {
-        const long long yy = e / Wp;
-        const int rem = (int)(e % Wp), xx = rem / C, c = rem % C;
-        const float v = ldx(x, (size_t)((yy / p) * x_ld + (long long)(xx / p) * C * p * p +
-                                        patch_col(c, (int)(yy % p), xx % p, p, wh)), xbf);
-        const float cl = fminf(fmaxf(v, -1.0f), 1.0f);
-        const float u = fminf(fmaxf(rdx(rdx(cl / 2.0f, xbf) + 0.5f, xbf), 0.0f), 1.0f);
-        y[yy * y_ld + xx * C + c] = (uint8_t)rintf(u * 255.0f);
     }
 }
 
@@ -901,24 +884,6 @@ extern "C" int r4d_rad_pix_patch(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL(pix_patch_kernel, dim3(grid_for(H * W * C)), dim3(kT), 0, (hipStream_t)s,
                        x->data, y->data, (int)H, (int)W, (int)C, (int)p, wh == 1, xl, yl,
                        is_bf16(x), is_bf16(y));
-    return st_of(hipGetLastError());
-}
-
-extern "C" int r4d_rad_patch_pix8(const RadArgs* a, RadStream s) {
-    const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
-    if (!x || !y) return R4D_NO(RAD_E_INVAL);
-    if (!is_bf_or_f32(x) || y->dtype != RAD_U8) return R4D_NO(RAD_E_DTYPE);
-    const long long p = r4d_geti_or(a, "p", 0), C = r4d_geti_or(a, "C", 0);
-    const int wh = patch_order(a);
-    if (wh < 0) return R4D_NO(RAD_E_INVAL);
-    long long R = 0, Cx = 0, xl = 0, Ry = 0, Cy = 0, yl = 0;
-    if (!dense2(x, &R, &Cx, &xl) || !dense2(y, &Ry, &Cy, &yl)) return R4D_NO(RAD_E_SHAPE);
-    if (p <= 0 || C <= 0 || Cx % (C * p * p)) return R4D_NO(RAD_E_SHAPE);
-    const long long w = Cx / (C * p * p);
-    if (Ry != R * p || Cy != w * p * C) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(patch_pix8_kernel, dim3(grid_for(Ry * Cy)), dim3(kT), 0, (hipStream_t)s,
-                       x->data, (uint8_t*)y->data, R, (int)w, (int)C, (int)p, wh == 1, xl, yl,
-                       is_bf16(x));
     return st_of(hipGetLastError());
 }
 

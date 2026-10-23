@@ -975,6 +975,33 @@ TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
     }
 }
 
+/* The fused all-reduce junction resolves by width: two ranks take the two-rank row, four the
+ * wide family's row (or its host-mailbox twin without peer access), and three or eight ranks have
+ * no row, so a caller keeps the pair. Geometry is Gemma 4 31B's at decode heights. */
+TEST(libr4d_resolves_the_fused_all_reduce_junction_at_two_and_four_ranks) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    auto bands = [&](int world) {
+        Geometry g;
+        g.set_i("n", 5376);
+        g.set_i("world_size", world);
+        g.set_s("dtype", "bf16");
+        g.set_f("eps", 1e-6);
+        g.set_f("wadd", 0.0);
+        return r.build_bands("ar_rmsnorm_quant_i8", "M", 1, 4, g);
+    };
+    r.set_device_fact(RAD_FACT_P2P, 1);
+    CHECK_EQ(band_names(bands(2)), "4:ar_rmsnorm_quant_i8 ");
+    CHECK_EQ(band_names(bands(4)), "4:ar_rmsnorm_quant_i8_4rank ");
+    for (int world : { 3, 8 })
+        for (const Band& b : bands(world)) CHECK(!b.dom[RAD_DOMAIN_DEVICE]);
+    r.set_device_fact(RAD_FACT_P2P, 0);
+    CHECK_EQ(band_names(bands(2)), "4:ar_rmsnorm_quant_i8_host ");
+    CHECK_EQ(band_names(bands(4)), "4:ar_rmsnorm_quant_i8_4rank_host ");
+}
+
 /* The vision tower's attention resolves as rad_block_vit.h declares it: head_dim 72, no
  * `window`. `window` is optional in attn_dense's schema and a constraint on an absent key does
  * not hold, so a row constraining it is unreachable for a caller that omits it. rad-kbench cannot

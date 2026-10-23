@@ -834,6 +834,57 @@ TEST(linear_state_is_sized_per_sequence) {
              32LL * 128 * conv_window_entries(cd, 4) * 4);
 }
 
+/* rad_kv_group_replicated marks a paged group the same on every rank (the tiers keep it once a
+ * host slot). It is refused, by name, on a group that is not paged, beside rad_kv_group_zero in
+ * either order, on a handle that names no group, and after declare. */
+TEST(a_replicated_kv_group_is_paged_and_never_zero) {
+    NEED_PLUGIN(reg)
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_kvgroup g = decl_kv_full(b);
+        CHECK_OK(rad_kv_group_replicated(&b, g));
+        CHECK(b.program().kv_groups[g].replicated);
+        CHECK_EQ(rad_kv_group_zero(&b, g), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv group 'kv_full': kv_group_zero on a group declared "
+                                     "replicated"));
+        CHECK(!b.program().kv_groups[g].zero);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_kvgroup g = decl_kv_full(b);
+        CHECK_OK(rad_kv_group_zero(&b, g));
+        CHECK_EQ(rad_kv_group_replicated(&b, g), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv group 'kv_full': kv_group_replicated on a group declared "
+                                     "zero"));
+        CHECK(!b.program().kv_groups[g].replicated);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadKVGroupDecl ld{};
+        ld.kind = RAD_KV_LINEAR;
+        ld.dtype = RAD_F32;
+        ld.n_head_kv = 4;
+        ld.state_dim[0] = 16;
+        ld.state_dim[1] = 16;
+        const rad_kvgroup gl = b.decl_kv_group("gdn_state", &ld);
+        CHECK_EQ(rad_kv_group_replicated(&b, gl), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv group 'gdn_state': kv_group_replicated on a group that is "
+                                     "not paged"));
+        CHECK_EQ(rad_kv_group_replicated(&b, 7), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv_group_replicated: 7 is not a declared KV group"));
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_kvgroup g = decl_kv_full(b);
+        decl_t_attn(b);
+        CHECK_OK(b.bind_layer_kv(0, g));
+        CHECK_OK(b.bind_layer_kv(1, g));
+        REQUIRE_EQ(b.finish(), RAD_OK);
+        CHECK_EQ(rad_kv_group_replicated(&b, g), (int)RAD_E_STATE);
+        CHECK(!b.program().kv_groups[g].replicated);
+    }
+}
+
 /* ================================================================== names, notes, the C surface */
 
 /* decl_name_map keeps `src_index`: a set index survives and an unset one is -1, not slice 0. The

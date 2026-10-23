@@ -327,7 +327,8 @@ private:
     HttpResponse handle_sessions(const HttpRequest& req);
     /* The control vector's runtime switch (dashboard.cpp): GET reports the state, POST
      * {"enabled": bool} sets the default for requests that name no choice. Guarded by the API key
-     * like every other route but the health probes and the page. */
+     * like every other route but the health probes and the page; without a key, POST answers
+     * loopback clients only. */
     HttpResponse handle_control_vector(const HttpRequest& req);
 
     HttpResponse error_response(const ApiError& e, const std::string& peer,

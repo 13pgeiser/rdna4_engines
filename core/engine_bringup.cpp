@@ -84,6 +84,25 @@ struct MissReport {
     }
 };
 
+/* The kernels --attn-prefill-fp8 reached: the resolved rows, in any band and domain, that
+ * constrain `prefill_fp8`. An exact kernel ignores the parameter and states no constraint on it. */
+static std::vector<std::string> prefill_fp8_rows(const Program& p) {
+    std::vector<std::string> names;
+    for (const OpInfo& op : p.ops)
+        for (const Band& band : op.bands)
+            for (const Resolved& r : band.dom) {
+                if (!r || !r.row->info) continue;
+                const RadKernelInfo* k = r.row->info;
+                bool takes = false;
+                for (int c = 0; c < k->n_constraints; ++c)
+                    if (k->constraints[c].key && !std::strcmp(k->constraints[c].key, "prefill_fp8"))
+                        takes = true;
+                if (takes && std::find(names.begin(), names.end(), k->name) == names.end())
+                    names.push_back(k->name);
+            }
+    return names;
+}
+
 static MissReport miss_report(const Program& p, bool host_backend) {
     MissReport r;
     std::vector<std::string>              host_ops;    /* in first-seen order */
@@ -885,6 +904,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.kv_dtype = cfg_.kv_cache_dtype == "bf16" ? RAD_BF16 : RAD_F8E4M3;
     bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4
                 : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
+    bc.attn_prefill_fp8 = cfg_.attn_prefill_fp8;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -1026,24 +1046,23 @@ int Engine::declare() {
                cfg_.n_spec > 0 ? "the depth the drafter in this container states as its operating point"
                                : "this container carries no draft head");
     }
-    /* Chained launches pay on some speculative steps and cost plain decode (4x R9700: the 31B
-     * with DFlash2 +13%, the 26B-A4B with DFlash +1%, Qwen3.8-27B with DFlash2 even; the 31B with
-     * no drafter -6.5%), so they are on by default only where the model's plugin measured a gain
-     * with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
+    /* Chained launches pay on some speculative steps and cost plain decode (on 4x R9700 the 31B
+     * with DFlash2 gained 13%, the 26B-A4B with DFlash 1%, Qwen3.8-27B with DFlash2 nothing, and
+     * the 31B without a drafter lost 6.5%), so they are on only where the model's plugin measured a
+     * gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
      * speculatively. */
     {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb);
-        rad_dev_chain_infer(cfg_.n_spec > 0 && pb.chain_pays);
-        const char* e = std::getenv("RADIANCE_CHAIN");
+        const bool pays = cfg_.n_spec > 0 && pb.chain_pays;
+        rad_dev_chain_infer(pays);
         const bool on = rad_dev_chain_enabled() != 0;
-        const char* why = e && *e && std::strcmp(e, "auto") != 0
-                              ? (on || *e == '0' ? "RADIANCE_CHAIN says so" : "the backend does not chain")
-                          : on ? "the model's plugin measured a gain with its speculative drafter"
-                               : "no drafter whose plugin measured a gain with them decodes "
-                                 "speculatively, or the backend does not chain";
+        const char* why = on     ? "the model's plugin measured a gain with its speculative drafter"
+                          : pays ? "the device backend does not chain"
+                                 : "no drafter whose plugin measured a gain with them decodes "
+                                   "speculatively";
         RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);
-        decide("RADIANCE_CHAIN", on ? "1" : "0", why);
+        decide("chained launches", on ? "on" : "off", why);
     }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
      * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
@@ -1062,7 +1081,10 @@ int Engine::declare() {
      * area, which would need 16x the activation memory on every card. */
     if (cfg_.mm_max_patches < 0) {
         const char* enc = rad_meta_gets(&meta_, "radiance.encoder", "");
-        const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0;
+        /* A checkpoint's vision_config states a tower as a flat patch_size, or (Unlimited-OCR's
+         * DeepEncoder) only the per-width tables under a `vision_config.image_size`. */
+        const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0 ||
+                           rad_meta_geti(&meta_, "vision_config.image_size", 0) > 0;
         cfg_.mm_max_patches = (enc && *enc) || (!file_ && tower) ? 16384 : 0;
         /* Whole output rows a pass: the plugin's merge, when it states one. */
         RadArchProbe pb{};
@@ -1081,54 +1103,44 @@ int Engine::declare() {
                        : "the model carries no vision tower");
     }
 
-    /* Declare once per rank (rank and world_size in RadBuildCtx; the plugin declares dimensions
-     * already divided, spec §9), every rank concurrently on its own thread. Concurrency is
-     * required: kernel init() runs during declare, and a collective's init is a rendezvous
-     * (libr4d's all-reduce publishes its peer scratch pointer and waits for every other rank), so
-     * a serial loop times out. Registry::select() and init_instance() share a mutex for this. Each
-     * thread binds its device first, because the current device is thread-local and the init
-     * allocates on it. */
-    /* Control vectors are resolved here, before any rank declares: the plugin reads the direction
-     * table from RadBuildCtx, so a table that failed validation must stop the server before a graph
-     * is built around it.
-     *
-     * The feature is loaded only when the deployment asks: `--control-vector off|on`. Without it
-     * nothing is looked for, the graph declares no projection op, and a request that asks for one
-     * is refused by name -- so a deployment that does not use the feature pays nothing. With the
-     * flag, the engine looks beside the container (or in the directory, or in
-     * $RADIANCE_HOME/vectors) and uses the file if it is compatible; its operation parameters come
-     * from the package's own JSON. A file that does not fit is reported and skipped -- a sidecar
-     * must never stop a server nobody pointed at it. The flag's value is the startup switch: `off`
-     * leaves requests off until one asks (or the dashboard flips the default), `on` starts them on. */
-    const std::string arch = meta_.arch_id ? meta_.arch_id : "";
+    /* Control vectors are resolved before any rank declares, because the plugin reads the
+     * direction table from RadBuildCtx. Only `--control-vector off|on` loads one; without it
+     * nothing is looked for and the graph declares no projection op. With it, a plugin that does
+     * not apply control vectors (RadArchProbe::control_vector_ok), no file found, or a file that
+     * does not fit this model is refused: the operator asked for the feature. The operation's
+     * parameters come from the package's own JSON. The flag's value is the request default. */
     if (cfg_.control_vector == "disabled") {
         RAD_INFO("control vectors: not loaded (no --control-vector); a request that asks for one is "
                  "refused");
-    } else if (!arch.empty()) {
+    } else {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (!pb.control_vector_ok) {
+            RAD_ERR("--control-vector %s: the '%s' plugin does not apply control vectors for this "
+                    "model", cfg_.control_vector.c_str(), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        const std::string arch = meta_.arch_id ? meta_.arch_id : "";
         std::string proj_path, tried;
         (void) control_vector_discover(cfg_.model, arch, cfg_.radiance_home, &proj_path, &tried);
         if (proj_path.empty()) {
-            RAD_INFO("control vectors: none found (%s)", tried.c_str());
-        } else if (arch != "qwen4exp") {
-            RAD_WARN("control vectors: %s is for this family only (qwen4exp, whose gated residual "
-                     "carries the projection op); this container is '%s' -- ignoring it",
-                     proj_path.c_str(), arch.c_str());
-        } else {
-            std::string why;
-            const int rc = control_vector_load(proj_path, arch, meta_.n_embd, meta_.n_layers,
-                                               &cvec_, &why);
-            if (rc != RAD_OK) {
-                RAD_WARN("%s -- serving without it", why.c_str());
-                cvec_ = ControlVector{};
-            }
+            RAD_ERR("--control-vector %s: no control vector found for this model (looked at %s)",
+                    cfg_.control_vector.c_str(), tried.c_str());
+            return RAD_E_NOTFOUND;
+        }
+        std::string why;
+        if (control_vector_load(proj_path, arch, meta_.n_embd, meta_.n_layers, &cvec_, &why) !=
+            RAD_OK) {
+            RAD_ERR("--control-vector %s: %s", cfg_.control_vector.c_str(), why.c_str());
+            cvec_ = ControlVector{};
+            return RAD_E_INVAL;
         }
     }
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
-        /* `--control-vector on` starts the request default on, which is also how `--kld-record`/
-         * `--kld-ref` score the projection itself: those modes serve no request to carry the
-         * switch. The switch still decides per request. */
+        /* The request default; --kld-record / --kld-ref score documents with it, as they serve no
+         * request that could carry the field. */
         const bool default_on = cfg_.control_vector == "on";
         cvec_default_.store(default_on);
         RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
@@ -1146,6 +1158,13 @@ int Engine::declare() {
         cvec_default_.store(false);
     }
 
+    /* Declare once per rank (rank and world_size in RadBuildCtx; the plugin declares dimensions
+     * already divided, spec §9), every rank concurrently on its own thread. Concurrency is
+     * required: kernel init() runs during declare, and a collective's init is a rendezvous
+     * (libr4d's all-reduce publishes its peer scratch pointer and waits for every other rank), so
+     * a serial loop times out. Registry::select() and init_instance() share a mutex for this. Each
+     * thread binds its device first, because the current device is thread-local and the init
+     * allocates on it. */
     std::vector<int>         st(ranks_.size(), RAD_OK);
     std::vector<std::thread> th;
     th.reserve(ranks_.size());
@@ -1235,6 +1254,28 @@ int Engine::declare() {
                         "band(s) above, and this model needs them");
                 return RAD_E_UNSUPPORTED;
             }
+    }
+    /* --attn-prefill-fp8 is a permission an exact kernel also satisfies, so whether it acts is
+     * read off the resolution: a kernel that implements a lossy leg constrains `prefill_fp8`. A
+     * flag nothing takes stops the start rather than serving the exact form under its name. */
+    if (cfg_.attn_prefill_fp8 != 0) {
+        const std::vector<std::string> rows = prefill_fp8_rows(ranks_[0]->program);
+        const char* mode = attn_prefill_fp8_name(cfg_.attn_prefill_fp8);
+        if (rows.empty() && !cfg_.debug_graph) {
+            RAD_ERR("not starting: --attn-prefill-fp8 %s, but no attention kernel resolved for "
+                    "this model takes e4m3 products at its geometry, cache (--kv-cache-dtype %s) "
+                    "and kernel libraries; --attn-prefill-fp8 off serves it exactly", mode,
+                    cfg_.kv_cache_dtype.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        std::string names;
+        for (const std::string& r : rows) names += (names.empty() ? "" : ", ") + r;
+        RAD_WARN("attention: LOSSY prefill (--attn-prefill-fp8 %s). %s rounded to e4m3 for fp8 "
+                 "WMMA in %s, so this process does not compute the same function the exact "
+                 "attention does; bands those kernels do not serve stay exact", mode,
+                 cfg_.attn_prefill_fp8 == RAD_ATTN_FP8_QK ? "Q.K^T's query is"
+                 : cfg_.attn_prefill_fp8 == RAD_ATTN_FP8_PV ? "P.V's probabilities are"
+                 : "Q.K^T's query and P.V's probabilities are", names.c_str());
     }
     /* Checkpoint weights that cannot be served as stored cannot be loaded; name them all with the
      * remedy. */
@@ -1389,6 +1430,21 @@ void Engine::probe_arena_levels() {
 }
 
 /* ================================================================== 5. plan */
+
+/* R-SWA: a RAD_KV_RING group names its ring's W in the declaration (`window`). Tell the manager
+ * before it plans, so the group is planned for per-sequence windows: sized for the whole context
+ * plus one ring a sequence (the ring in the fixed costs), never capped at the declare-time
+ * window, never snapshotted. Every plan (each sizing probe and the real manager) goes through
+ * here, so they all plan the same bytes. */
+static int declare_ring_windows(KVManager& kv, const Program& prog) {
+    for (size_t g = 1; g < prog.kv_groups.size(); ++g) {
+        const RadKVGroupDecl& d = prog.kv_groups[g].decl;
+        if (d.kind != RAD_KV_RING) continue;
+        RAD_TRY(kv.declare_runtime_window((int32_t)g, d.window));
+    }
+    return RAD_OK;
+}
+
 int Engine::plan() {
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
@@ -1475,7 +1531,8 @@ int Engine::plan() {
              * memory, and the real pool does not exist yet. */
             KVManager probe;
             host_arenas += arena_host_bytes(r->program);
-            if (probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
+            if (declare_ring_windows(probe, r->program) == RAD_OK &&
+                probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 ck_slot += probe.checkpoint_bytes();
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
@@ -1611,7 +1668,8 @@ int Engine::plan() {
              * its carve). */
             for (size_t i = 0; i < ranks_.size(); ++i) {
                 probes[i] = std::make_unique<KVManager>();
-                if (probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
+                if (declare_ring_windows(*probes[i], ranks_[i]->program) != RAD_OK ||
+                    probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
                     kept = fmt("rank %d's KV groups did not plan", ranks_[i]->index);
                     break;
                 }
@@ -2949,6 +3007,7 @@ int Engine::configure_kv() {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         auto& r = ranks_[i];
         LogRank lr(r->index);
+        RAD_TRY(declare_ring_windows(r->kv, r->program));
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
         /* A rank plan() re-sized for the common token count must page at least that count (same
@@ -3183,13 +3242,16 @@ int Engine::configure_kv() {
     /* Can the pool hold one max-length sequence? The context limit and KV pool come from unrelated
      * flags; otherwise such a request is accepted and then refused at admission with a message
      * about blocks. Only full paged groups apply: a window group costs the window, and a linear
-     * group is O(1) in context. */
+     * group is O(1) in context. A runtime-window (RAD_KV_RING) group is not checked here either:
+     * it is sized for the whole context plus one ring a sequence and its tokens are a per-sequence
+     * reference rather than the pool's capacity, so the comparison would be about the wrong
+     * number. */
     {
         const int64_t want = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         const KVManager& kv = ranks_[0]->kv;
         for (int32_t g = 0; g < kv.n_groups(); ++g) {
             const KVGroupPlan* p = kv.plan(g);
-            if (!p || !p->paged() || p->window_blocks > 0) continue;
+            if (!p || !p->paged() || p->window_blocks > 0 || p->runtime_win) continue;
             const int64_t cap = p->n_blocks * p->block_size;
             if (cap >= want) continue;
             /* A hard limit, unlike the backing ratio (how much of every-sequence-at-max_ctx the
@@ -3477,16 +3539,18 @@ int Engine::start() {
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them
-     * in the same step). Tokens are the smallest over the full paged groups; a windowed group
-     * bounds history, not capacity. /stats and /metrics report the same numbers (kv_tokens_max,
-     * radiance:kv_cache_max_tokens). */
+     * in the same step). Tokens are the smallest over the full paged groups; a fixed-window group
+     * bounds history, not capacity. A runtime-window (RAD_KV_RING) group does hold its sequences'
+     * references, so it counts like a full group. /stats and /metrics report the same numbers
+     * (kv_tokens_max, radiance:kv_cache_max_tokens). */
     {
         const KVManager& kv = ranks_[0]->kv;
         int64_t bytes = 0, state = 0, tokens = 0;
         for (const KVGroupPlan& p : kv.plans()) {
             bytes += kv.pool_bytes_carved(p.index);
             if (p.stateful()) state += kv.pool_bytes_carved(p.index);
-            if (!p.paged() || p.kind == RAD_KV_WINDOW || p.block_size <= 0) continue;
+            if (!p.paged() || (p.kind == RAD_KV_WINDOW && !p.runtime_win) || p.block_size <= 0)
+                continue;
             const int64_t t = p.n_blocks * p.block_size;
             if (tokens == 0 || t < tokens) tokens = t;
         }

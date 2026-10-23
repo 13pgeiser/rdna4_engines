@@ -125,7 +125,6 @@ private:
            R_BT, R_USED, R_ROPEF, R_ICU, R_IROWS, R_MCU, R_VCU, R_MROWS, R_MSRC, R_MCCU, R_MROPE,
            R_AUX, R_SIGP, R_TSTEP, R_SAMP, R_STEPI, R_SIZE, R_N };
 
-    int  layout_regions();
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
         return reinterpret_cast<T*>((char*)dev_[(size_t)rank] + reg_[r].off);

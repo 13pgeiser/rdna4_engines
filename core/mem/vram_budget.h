@@ -82,9 +82,8 @@ struct VramFacts {
     bool    lends      = false;
     /* A loaded control vector's direction table: device bytes the engine already holds, which are
      * not part of the program or the pools and must not shrink what the plan may claim. It comes
-     * out of the headroom, as every deployment keeps that unclaimed. Without this, a deployment
-     * that merely *offers* a vector would plan its expert cache against a smaller card than one
-     * that does not, which is exactly the difference "off == stock" cannot allow. */
+     * out of the headroom, as every deployment keeps that unclaimed, so a deployment that only
+     * offers a vector plans its expert cache against the same card as one that does not. */
     int64_t held_out   = 0;
     /* Integrated graphics: host memory the card must leave to the host, since device memory is
      * host memory there. 0 on a discrete card. */

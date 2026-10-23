@@ -683,10 +683,9 @@ int body(const RadArgs* a, RadStream stream, bool grouped) {
     m.sstep[1] = so.stride[0] * 4;
     if (w.shape[0] < (m.experts + 1) / 2 || wo.shape[0] < m.experts / 2) return RAD_E_SHAPE;
     /* The small-M form at the MTP layer's gate_up slice up to 384 routed rows: a draft pass routes
-     * one token, a verify pass a few. Measured there (perfmxf8, cold), expert-major against
-     * small-M at 1, 2, 4, 8 and 16 tokens: 73.6/36.7, 83.6/65.8, 118.4/114.9, 214.0/203.9 and
-     * 375.6/343.9 us. Down's K of 256 gains nothing from it (within a few percent, a quarter slower
-     * at three tokens). */
+     * one token, a verify pass a few. On gfx1201 (perfmxf8, cold) it halves the expert-major time
+     * at one token and gains 3 to 21 % from 2 to 16. Down's K of 256 gains nothing from it (within
+     * a few percent, a quarter slower at three tokens). */
     if (m.experts == 288 && m.topk == 8 && N == 512 && K == 4096 && m.T <= 384)
         return R4D_EMIT(stream, fp8_f32scale_small<512>,
                         dim3(N / 64, (m.T < m.experts ? m.T : m.experts) + 1), dim3(128), 0,

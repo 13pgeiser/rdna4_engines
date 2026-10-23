@@ -717,6 +717,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         /* GPTQ calibration run (MoeFP8::Config::calib), on when the output directory is set. */
         mc.calib = calib_dir() != nullptr ? 1 : 0;
+        /* Each rank holds a width slice of every expert (n_ff is per rank), so its down
+         * projection's Hessian would be of the slice, without the cross terms between slices. */
+        if (mc.calib && g.world > 1) {
+            fprintf(stderr, "radiance: qwen35moe: calibration (RADIANCE_CALIB_DIR) runs at one "
+                            "rank; at %d ranks each holds a slice of every expert's width, and "
+                            "the down projection's Hessian would be of the slice\n", g.world);
+            return RAD_E_UNSUPPORTED;
+        }
         /* The experts' stored format, read from layer 0's first expert as qwen4exp does, so a
          * container with four-bit experts is served in that format. */
         {

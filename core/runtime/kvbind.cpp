@@ -32,6 +32,7 @@ void bind_kv_pools(const Program& p, const std::function<const KVGroupPlan*(int3
         switch (gp->kind) {
         case RAD_KV_FULL:
         case RAD_KV_WINDOW:
+        case RAD_KV_RING:
             b.rank = 4;
             b.shape[0] = gp->n_blocks;
             b.shape[1] = d.n_head_kv;

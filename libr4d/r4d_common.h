@@ -114,8 +114,6 @@ __device__ __forceinline__ float bf16w_hi(uint32_t w) { return __uint_as_float(w
 // address global memory.
 typedef __attribute__((address_space(1))) const uint16_t* r4d_gu16;
 __device__ __forceinline__ uint32_t ldg_u16(const uint16_t* p) { return *(r4d_gu16)p; }
-// The same element as a bf16 widened to float.
-__device__ __forceinline__ float ldg_bf16(const uint16_t* p) { return bf16w_lo(ldg_u16(p)); }
 
 // `lane ^ N` without the LDS pipe. `__shfl_xor` lowers to `ds_bpermute_b32` plus `s_wait_dscnt`,
 // an LDS round trip that dominates a dependency chain (e.g. a dot product closed in a token loop).
@@ -283,30 +281,31 @@ __host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
     return M <= lim ? 512 : 256;
 }
 
-// The full-card cliff, measured on the R9700 (gfx1201, 64 CUs). A launch whose wavefronts fall
-// in the last 32 before a multiple of 2048 runs about five times slower than the same work one
+// The full-card cliff of the R9700 (gfx1201, 64 CUs). A launch whose wavefront count falls in
+// the last 32 before a multiple of 2048 runs about five times slower than the same work one
 // workgroup wider, whatever the kernel does: 256-thread workgroups take 27.6 us at 253 to 256 of
-// them and 5.2 us at 252 or 257, a norm, an LDS-only kernel and a copy alike. The 31B's
-// qkv_norm_rope at a tp-4 verify is exactly 256 such workgroups (16 rows x 16 heads), and a
-// drafter's 256-row head norm too.
+// them and 5.2 us at 252 or 257, for a norm, an LDS-only kernel and a copy alike.
 //
 // 2048 is every wave slot of the R9700 (64 CUs x 2 SIMDs x 16). Both numbers are that card's and
-// apply on every target libr4d builds for; they are not derived from the device, since no other
-// card has been measured and HIP's multiProcessorCount counts WGPs, not CUs, on RDNA. On an RDNA4
-// part with fewer CUs a launch padded here costs one idle row and gives the same bytes, and a
-// cliff at that part's own full-card size, if it has one, is not stepped past.
+// apply on every target libr4d builds for. They are not derived from the device: no other card has
+// been measured, and HIP's multiProcessorCount counts WGPs, not CUs, on RDNA. On an RDNA4 part with
+// fewer CUs a launch padded here costs one idle row and gives the same bytes; a cliff at that
+// part's own full-card size, if it has one, is not stepped past.
 //
 // r4d_cliff_rows() is the row count to launch for a grid of `rows` x `per_row` workgroups of
 // `waves` wavefronts each: `rows` where that is clear of the window, else the first count past it.
-// The kernel returns at once in a row at or past `rows`, so the result is unchanged.
+// A row of `per_row * waves` wavefronts that is a multiple of 2048 lands every count on the cliff,
+// so it is launched as it is. The kernel returns at once in a row at or past `rows`, so the result
+// is unchanged.
 constexpr uint32_t kR4dCliffWaves  = 2048;   // the R9700's wave slots: 64 CUs x 2 SIMDs x 16
 constexpr uint32_t kR4dCliffWindow = 32;     // the slow window, below each multiple of it
 __host__ __device__ __forceinline__ uint32_t r4d_cliff_rows(uint32_t rows, uint32_t per_row,
                                                             uint32_t waves) {
+    if ((uint64_t)per_row * waves % kR4dCliffWaves == 0) return rows;
     uint32_t r = rows;
     for (int i = 0; i < 64; ++i, ++r) {
         const uint64_t w = (uint64_t)r * per_row * waves % kR4dCliffWaves;
-        if (w != 0 && w <= kR4dCliffWaves - kR4dCliffWindow) break;
+        if (w != 0 && w <= kR4dCliffWaves - kR4dCliffWindow) return r;
     }
-    return r;
+    return rows;
 }

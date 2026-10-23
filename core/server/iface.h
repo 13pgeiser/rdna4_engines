@@ -527,6 +527,14 @@ struct MediaOpts {
     /* A picture over this many pixels is first scaled down to that area (PIL's bicubic, sides
      * truncated), as a model's own pipeline may do before its processor; 0 leaves it as sent. */
     int64_t max_pixels = 0;
+    /* Which of the checkpoint's picture modes, for one that has two (Unlimited-OCR): 0 is the
+     * processor's choice (mm::ImageMode::Default), 1 gundam, 2 base. */
+    int32_t image_mode = 0;
+    /* The mode's sizes, when the request states them; 0 keeps the mode's own. */
+    int32_t image_base_size = 0, image_size = 0;
+    /* The request carries more than one picture (mm::ImageMode::several): a processor with a
+     * multi-page mode uses it for a picture whose mode the request did not name. */
+    bool several_pictures = false;
 };
 
 class IMultimodal {
@@ -618,6 +626,8 @@ struct ImageGenInfo {
     /* The prompt in windows (RadGeneratorDecl::chunk_tokens): tokens a window, its markers and
      * its padding token; 0 for a prompt read whole. */
     int32_t  chunk_tokens = 0, chunk_bos = 0, chunk_eos = 0, chunk_pad = 0;
+    /* The conditioning options a request may ask for (RadGeneratorDecl::cond_opts, RAD_GEN_COND_*). */
+    uint32_t cond_opts = 0;
 };
 
 class IImageGen {

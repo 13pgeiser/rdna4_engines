@@ -139,7 +139,7 @@ inline int AttnBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, 
 
     /* attn_paged before kv_store: block_size is RAD_DERIVED, read off the resolved attention
      * kernel and back into kv_store with rad_kv_block_size() (rad_block_attn_gated.h says why). */
-    op_attn = rw(b, RAD_OP(b, "attn_paged",
+    op_attn = rw(b, decl_attn(b, g, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", 0), RAD_INT("n_head", g.n_head),

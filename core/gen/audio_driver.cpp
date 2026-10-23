@@ -64,8 +64,6 @@ namespace {
 
 constexpr int64_t kAlign = 256;
 
-int64_t align_up(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
-
 struct Sizes {
     int64_t T = 0, S = 0, L = 0, NB = 0;
 };
@@ -115,7 +113,7 @@ int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
     for (int r = 0; r < n; ++r) {
         bytes[r][0] = off;
         bytes[r][1] = want[r];
-        off = align_up(off + want[r]);
+        off = align_up(off + want[r], kAlign);
     }
     return off;
 }

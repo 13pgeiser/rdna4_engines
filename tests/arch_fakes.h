@@ -33,7 +33,7 @@
 #include <vector>
 
 /* ==================================================================== the recording builder */
-namespace {
+namespace rad_fake {
 
 struct RecParam {
     std::string key;
@@ -81,7 +81,8 @@ struct RecIssue {
 /* A rad_lane_join: `to` behind everything `from` issued before issue number `at`. */
 struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 
-}  /* namespace */
+}  /* namespace rad_fake */
+using namespace rad_fake;
 
 struct RadBuilder {
     std::vector<RecWeight> weights;
@@ -477,13 +478,24 @@ extern "C" int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadSt
             c->copies.push_back({ c->issues.size(), h });
     return RAD_OK;
 }
+/* The pitched copy: recorded exactly as the 1-D one (its destination's first byte names the
+ * buffer); the unlimitedocr tower packs patch rows and lays out its map with it. */
+extern "C" int rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch,
+                                   int64_t width, int64_t height, RadStream s) {
+    (void)dpitch; (void)src; (void)spitch; (void)width; (void)height;
+    RadCtx* c = (RadCtx*)s;
+    if (c && c->b)
+        if (const rad_buf h = fake_buf_of(dst, c->b->bufs.size()))
+            c->copies.push_back({ c->issues.size(), h });
+    return RAD_OK;
+}
 extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
     (void)dst; (void)value; (void)bytes; (void)s;
     return RAD_OK;
 }
 
 /* ==================================================================== fixtures and helpers */
-namespace {
+namespace rad_fake {
 
 /* A deployment: one rank, 256 rows a step, eight sequences, 32k of context. */
 RadBuildCtx build_ctx(int rank = 0, int world = 1) {
@@ -660,7 +672,7 @@ int count_issued(const std::vector<std::string>& v, const std::string& name) {
     return (int)std::count(v.begin(), v.end(), name);
 }
 
-}  /* namespace */
+}  /* namespace rad_fake */
 
 /* ==================================================================== the step lint
  *
@@ -685,7 +697,7 @@ int count_issued(const std::vector<std::string>& v, const std::string& name) {
  *               this rank declared zero;
  *   strided     a GEMM whose input is a column slice narrower than its buffer (libr4d's GEMMs
  *               read whole rows and refuse it). */
-namespace {
+namespace rad_fake {
 
 /* One buffer's planned lifetime. `planned` is false for a buffer live over the whole program
  * (PERSIST, DERIVED, rad_buf_concurrent, or no declared use), which shares bytes with nothing. */
@@ -1045,7 +1057,7 @@ bool steps_ok(const std::vector<std::unique_ptr<RadCtx>>& v) {
     return ok;
 }
 
-}  /* namespace */
+}  /* namespace rad_fake */
 
 #define CHECK_LINT(b, ...) CHECK_EQ(report_lint(lint_step((b), { __VA_ARGS__ })), (size_t)0)
 /* The passes of one engine step (run_passes): none failed and the lint is clean over them. */
@@ -1056,7 +1068,7 @@ bool steps_ok(const std::vector<std::unique_ptr<RadCtx>>& v) {
     } while (0)
 
 /* ==================================================================== fingerprints */
-namespace {
+namespace rad_fake {
 
 /* A 64-bit FNV-1a fingerprint of everything a declare recorded: ops with their parameters,
  * weights, read and write sets and resolution; buffers, weights, KV groups, bindings, name maps,
@@ -1191,6 +1203,6 @@ uint64_t pinned_steps(RadBuilder& b, StepFn step, int rank, int world) {
     return issue_hash(b, all, kits);
 }
 
-}  /* namespace */
+}  /* namespace rad_fake */
 
 #endif /* RAD_ARCH_FAKES_H */

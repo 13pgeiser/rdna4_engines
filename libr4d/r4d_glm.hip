@@ -100,11 +100,9 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
     /* The tile form, rows x columns per wave and steps of k in flight, by M; all forms are
      * byte-identical, so the choice is speed only. Measured on gfx1201 (r4d_selftest --perff32,
      * cold) at N 4/32/36/288, K 4096: 16x4 gains 3-5 % at N 288/32 above 64 rows but loses 16 % at
-     * N 36; 8x4 holds at every width. Below 64 rows the steps in flight decide: at N 288 one step
-     * a lane took 28.1 / 36.0 / 36.3 / 41.9 / 45.4 / 47.9 us at 1 / 4 / 8 / 16 / 24 / 48 rows,
-     * 2x2 with 16 steps 14.4 / 14.5 / 15.0 / 19.1 us to 16 rows and 8x1 with 8 steps 21.6 / 35.5
-     * us at 24 / 48; at N 32 2x2 with 16 steps 9.8 to 10.2 us at every count below 64, where one
-     * step took 27.3 to 36.4.
+     * N 36; 8x4 holds at every width. Below 64 rows the steps of k in flight decide: 2x2 with 16
+     * steps is 2 to 2.5 times as fast as one step at N 288 up to 16 rows, and about 3 times at N 32
+     * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
      * A projection of a few columns has too few waves for wide tiles at any M. */
     const long rows = x.shape[0];
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);

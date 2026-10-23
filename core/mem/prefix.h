@@ -256,20 +256,19 @@ public:
      * on a miss or token mismatch. Separate from lookup because lookup is const and has no
      * device; a promotion allocates blocks and runs a scatter between steps.
      *
-     * `fit` is how many entries the pool can take. A longer chain is cut, and counted
-     * (Stats::restore_cuts): with recurrent state at the deepest snapshot the shorter prefix
-     * reaches, since the hit resumes there and blocks past it would come back for nothing;
-     * without, at `fit`. */
+     * `fit` is how many entries the pool can take. A longer chain is cut, and `*cut` set: with
+     * recurrent state at the deepest snapshot the shorter prefix reaches, since the hit resumes
+     * there and blocks past it would come back for nothing; without, at `fit`. */
     std::vector<BlockHash> restorable_from(const std::vector<int32_t>& tokens,
                                            const std::vector<MMContentKey>& mm,
-                                           int64_t fit = INT64_MAX) const;
+                                           int64_t fit = INT64_MAX, bool* cut = nullptr) const;
     /* Entries a restore can place now: free blocks against the carve, the least over the cached
      * groups. Lent blocks count, since KVManager::reserve_blocks recalls the loan for them. */
     int64_t restore_room() const;
     /* Room for a restore of this prompt's chain: trim(), sparing the chain itself (its blocks
      * would only have to come back too) and every chain a waiting request holds (hold()), whose
-     * next attempt would restore it again. Nothing is lost; the reserve's trim after the next
-     * publish puts the pool's free quarter back. */
+     * next attempt would restore it again. Only entries whose host copy has landed leave VRAM,
+     * so nothing is lost; with no host tier it takes nothing. */
     int64_t trim_for(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
                      int64_t n_blocks);
 
@@ -357,8 +356,6 @@ public:
         int64_t drops = 0;
         /* Entries and snapshots removed by --prefix-cache-ttl, from any tier. */
         int64_t expired = 0, ckpt_expired = 0;
-        /* Restores from the host tier cut short because the pool could not hold the chain. */
-        int64_t restore_cuts = 0;
     };
     const Stats& stats() const { return stats_; }
 

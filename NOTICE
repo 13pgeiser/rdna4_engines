@@ -33,7 +33,10 @@ Written by Deadcode, with contributions from:
 - Perire: Gemma 4 26B-A4B with z-lab's DFlash drafter -- its plugin, its kernels in libr4d (the
   windowed paged attention, pair_argmax, the fused sandwich joins and expert_scale) and the host
   emulator that tests them, the prefill split into two slices with their all-reduces beside the
-  compute, and the vocabulary-sharded draft head
+  compute, and the vocabulary-sharded draft head; Gemma 4 31B on four cards (its all-reduces fused
+  with the junctions, overlapped with the compute and sent compressed, chained launches with block
+  drafters), the embedding scale rounded as Hugging Face rounds it, and block drafters' drafts
+  accepted on the card
 - redxherring: --model taking a Hugging Face repo id
 - Smellyyyy: the idea behind --prefill-interleave
 - gearwave00001: /v1/messages as Claude Code sends it
@@ -48,18 +51,28 @@ Written by Deadcode, with contributions from:
   R4D_AR_MAX_BLOCKS for two engines on one set of cards, and added tokens decoded as HuggingFace
   decodes them
 - eddie168168: the rotated int8 trunk (i8a8h) and the qwen35_w8a8 plugin serving it, and the
-  out-of-tree test at the tree's VOPD setting
+  out-of-tree test at the tree's VOPD setting, and its norm and SiLU producers writing the int8
+  linears' operands directly
 - davetha: JSON Schema patterns read unanchored, with their shorthand classes and escapes
 - Nunze: the eight-rank all-reduce's bands, weighted shards from the PCIe links and pieces, the
   sampler's candidate width at eight ranks, the image test stage's parallelism, budgets and
   exclusions, jinja's dotted integer index, GLM-5.3-Flash's kernels in libr4d and tool calls whose
-  name the opener opens
+  name the opener opens, GLM-5.3-Flash's vision tower and processor, its decode at a few rows and
+  its DSA indexer split over the ranks, a host-tier restore that makes room as pressure does, KV
+  groups every rank holds kept once a host slot, and the eight-rank two-shot in ring order
 - John McDonough: GLM-5.3-Flash -- its plugin, its blocks (mHC streams, KDA, the DSA indexer and
   sparse latent attention, f32-scaled FP8 and MXFP4 experts under sigmoid routing) and their
   reference and AVX ops -- a Quark export's block-FP8 layers, the signed QSA ranking, the
   one-sequence KV floor over the live plan, and prefill staging paid by expert residency
 - Memoria: the dashboard's decode floor and recent window, the sparklines' percentile range, and
-  the bringup time in /stats
+  the bringup time in /stats, the acceptance tiles' live figures and statsdump's size-capped
+  rotation
+- C_Tamas: control vectors, loaded when the deployment asks and applied as a per-layer residual
+  projection
+- J-Nova: Unlimited-OCR, and Sage-A1.5 with its vision tower and its DFlash2 drafter
+- thekk1: the fp8 QK and PV legs of the h256 prefill attention (--attn-prefill-fp8)
+- lortht: Krea 2's rebalance of the text taps
+- Quackster: cards with a small PCI BAR, their kernel arguments kept in host memory
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.

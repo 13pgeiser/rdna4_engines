@@ -1125,7 +1125,7 @@ TEST(json_schema_refuses_what_it_cannot_actually_enforce) {
     CHECK(!err.empty());
 
     /* An empty pattern would run front()/back() on an empty string. Unanchored, as JSON Schema
-     * reads it, it now matches every string and never reaches them (vendor patch 0017). */
+     * reads it, it matches every string and never reaches them (vendor patch 0017). */
     err.clear();
     CHECK_OK(grammar_from_json_schema(
                  "{\"type\":\"string\",\"pattern\":\"\"}", "root", &gbnf, &err));
@@ -1691,6 +1691,44 @@ TEST(a_greedy_row_keeps_its_argmax_beside_a_sampled_row) {
         CHECK_EQ(tok[1], 2);
         ch.s.end_request(a.id);
         ch.s.end_request(b.id);
+    }
+}
+
+/* Whether the vocabulary-wide temperature stage was ever issued: the first sample_temp the
+ * sampler declares, over n_vocab columns (the second runs over the candidates). */
+static bool vocab_temp_issued(const HostChain& ch) {
+    for (const rad::OpInfo& o : ch.prog.ops) {
+        long long nv = 0;
+        if (o.op == "sample_temp" && o.base.get_i("n_vocab", &nv) && nv == ch.nv) return o.issued;
+    }
+    CHECK(!"no vocabulary-wide sample_temp declared");
+    return false;
+}
+
+/* sample_temp leaves a row at temperature 0 or 1 as it is, so a step whose chain rows are all one
+ * of those does not issue it; a row at any other temperature does. The tokens are the same either
+ * way. */
+TEST(the_temperature_stage_runs_only_where_a_row_is_scaled) {
+    const std::vector<float> lg = { -80.0f, 0.0f, -80.0f, -80.0f, -80.0f, -80.0f, -80.0f, -80.0f,
+                                    -80.0f, -80.0f, -80.0f, -80.0f, -80.0f, -80.0f, -80.0f, -80.0f };
+    struct Case { float temp; bool logprobs; bool temp_last; bool issued; };
+    for (const Case cs : { Case{ 1.0f, false, false, false },   /* plain sampling */
+                           Case{ 0.0f, true,  false, false },   /* greedy as a top-1 chain row */
+                           Case{ 0.7f, false, false, true  },
+                           Case{ 0.7f, false, true,  false } }) {   /* scaled in the late stage */
+        HostChain ch(16, 1, 0);
+        NEED_CHAIN(ch)
+        SamplingParams sp;
+        sp.temp = cs.temp;
+        sp.top_k = 4;
+        sp.seed = 3;
+        sp.temp_last = cs.temp_last;
+        if (cs.logprobs) sp.n_probs = 2;
+        Request a = make_req(1, { 0 }, sp);
+        std::vector<int32_t> tok;
+        CHECK_OK(ch.step({ &a }, lg, &tok));
+        CHECK_EQ(tok[0], 1);
+        CHECK_EQ(vocab_temp_issued(ch), cs.issued);
     }
 }
 

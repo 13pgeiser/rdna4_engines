@@ -6,6 +6,7 @@
 #include "device/device.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <cstdlib>
 
@@ -112,6 +113,9 @@ void BatchBuilder::carve(Set& s, char* h) {
     pair(&s.h_dout,   &s.d_dout,   S);
     pair(&s.h_rows,   &s.d_rows,   4 * S);
     pair(&s.h_first,  &s.d_first,  S * (int64_t)s.groups.size());
+    /* The advance's per-sequence runtime-window data (advance.h); 0 when there is none. */
+    pair(&s.h_rpos,   &s.d_rpos,   S);
+    pair(&s.h_tlen,   &s.d_tlen,   S);
     s.h_grp = ::rad::carve<AdvGroup>(h, oh, (int64_t)s.groups.size());
     s.d_grp = ::rad::carve<AdvGroup>(d, od, (int64_t)s.groups.size());
     for (size_t gi = 0; gi < s.groups.size(); ++gi) {
@@ -686,17 +690,37 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
         }
 
         int64_t t = 0;
+        /* The group's ring block count, read off the first armed sequence: declare_runtime_window
+         * fixes one W per group, so every armed sequence computes the same count. Collected here,
+         * with the table walk that already opens each window, so the group header below needs no
+         * second pass over the plan. */
+        int32_t ring_blocks = 0;
         for (int64_t i = 0; i < n_seq; ++i) {
             const StepEntry& e = plan.e[(size_t)i];
 
             int64_t first = 0;
+            SeqWindow win;
+            bool has_win = false;
+            int64_t bt_len = 0;       /* the sequence's block table, in blocks */
+            int64_t table_end = 0;    /* the table's last position, for a runtime window's used */
             if (L.paged) {
                 /* The manager's block table, by sequence id; Request::blocks is not the source
                  * of truth (see IKVManager). */
                 const std::vector<int32_t>& bt = kv.block_table(e.seq, (int32_t)gi);
                 first = kv.first_block_pos(e.seq, (int32_t)gi);
-                for (int32_t j = 0; j < e.n_tokens; ++j)
-                    g.h_slot[t + j] = kvgeom_.slot((int)gi, bt, first, (int64_t)e.ctx_len + j);
+                has_win = kv.runtime_window(e.seq, (int32_t)gi, &win);
+                if (has_win) {
+                    assert(!ring_blocks || ring_blocks == (int32_t)win.ring_blocks);
+                    ring_blocks = (int32_t)win.ring_blocks;
+                }
+                bt_len = (int64_t)bt.size();
+                table_end = bt_len * L.block_size;
+                for (int32_t j = 0; j < e.n_tokens; ++j) {
+                    const int64_t pos = (int64_t)e.ctx_len + j;
+                    g.h_slot[t + j] = has_win
+                        ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
+                        : kvgeom_.slot((int)gi, bt, first, pos);
+                }
                 /* Restage relative to what the card holds (BtMirror). The same sequence in the
                  * same row keeps entries below the first changed one and below the end of both
                  * old and new tables, so a decode step stages nothing or one appended block. A
@@ -737,6 +761,11 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                     s.h_convslot[(int64_t)gi * max_seqs_ + i] = st;
             }
             s.h_first[(int64_t)gi * max_seqs_ + i] = (int32_t)first;
+            /* The advance recomputes this row's used and slots after the build (advance_impl.h),
+             * so it needs the same per-sequence ring data this build staged: the row's floor and
+             * its table's length, 0 when the sequence has no runtime window. */
+            s.h_rpos[i] = has_win ? (int32_t)win.ring_pos : 0;
+            s.h_tlen[i] = has_win ? (int32_t)bt_len : 0;
             t += e.n_tokens;
 
             /* Tokens the sequence holds in this table, not min(length, window). `seqused` counts
@@ -745,8 +774,16 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
              * unwritten slots at the end of the table, read as the newest context; a non-causal
              * window group would attend to them. Do not clamp to `window` either: the held span
              * may exceed it by under a block, and clamping would drop the newest tokens. Attending
-             * a few extra old positions is the cost of paging a window (vLLM does the same). */
+             * a few extra old positions is the cost of paging a window (vLLM does the same).
+             *
+             * A runtime window (R-SWA) has reused its ring's slots once the sequence is past the
+             * ring's span, so the held span is the table's, not the context's: every slot of the
+             * reference and of the ring holds live KV, and the ring's blocks are what a non-causal
+             * decode reads. Before the ring is full the shorter of the two is the written count. */
             int64_t used = (int64_t)e.ctx_len + e.n_tokens - first;
+            if (has_win) {
+                used = std::min<int64_t>(used, table_end);
+            }
             if (used < 0) used = 0;
             g.h_used[i] = (int32_t)used;
             if (L.paged) {
@@ -773,6 +810,15 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             a.used_off   = (const char*)g.d_used - d0;
             a.bt_off     = (const char*)g.d_bt - d0;
             a.first_off  = (const char*)(s.d_first + (int64_t)gi * max_seqs_) - d0;
+            /* The runtime window (KVManager::set_window): the advance runs after this build and
+             * overwrites `used` and the slots, so it must reproduce the ring's mapping rather
+             * than the linear one (advance_impl.h). The floor and table length are per sequence
+             * (s.h_rpos / s.h_tlen), the ring's block count is the group's W, collected with the
+             * table walk above. */
+            a.ring        = ring_blocks ? 1 : 0;
+            a.ring_blocks = ring_blocks;
+            a.rpos_off    = (const char*)s.d_rpos - d0;
+            a.tlen_off    = (const char*)s.d_tlen - d0;
         }
 
         for (size_t r = 0; r < ranks_.size(); ++r) {
@@ -872,6 +918,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
     bool lora_rows = false;
+    int32_t cvec_rows = 0;
     s.h_cu[0] = 0;
     for (int64_t i = 0; i < n_seq; ++i) {
         const StepEntry& e = plan.e[(size_t)i];
@@ -905,6 +952,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             for (int32_t j = 0; j < e.n_tokens; ++j) s.h_lora[k + j] = ls;
             if (ls >= 0 && e.n_tokens > 0) lora_rows = true;
         }
+        /* The same rows derive.cpp's projection_on_rows sets (RadBatch::control_vector). */
+        if (e.req && e.req->sp.use_control_vector && e.n_tokens > 0) cvec_rows = 1;
         /* Rotary position of each row at its own position (draft-head rows rotate at the index
          * they write, not the token they embed). Three planes of n_tok. */
         if (mm_on_) {
@@ -1113,6 +1162,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         /* Null on a step with no adapter row: the core then issues no adapter op, and the step
          * runs the same pass as an engine serving no adapters. */
         B.lora_slot = lora_rows ? on_rank(base, b0, s.d_lora) : nullptr;
+        B.control_vector = cvec_rows;
         B.enc = 0;
         B.enc_n_patch = 0;
         B.enc_pixels = nullptr;
@@ -1120,6 +1170,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.enc_n_seg = 0;
         B.enc_cu = nullptr;
         B.enc_max_seg = 0;
+        B.enc_seg_h = nullptr;
+        B.enc_seg_w = nullptr;
         B.n_checkpoints = n_ck;
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
@@ -1188,6 +1240,8 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
     const int64_t max_segs = enc.max_patches / (enc.merge > 0 ? enc.merge : 1) + 1;
     int64_t n_patch = 0, n_seg = 0, max_seg = 0;
     enc_cu_host_[0] = 0;
+    enc_seg_h_host_.clear();
+    enc_seg_w_host_.clear();
     for (const EncoderPart& p : parts) {
         const mm::Item& it = *p.item;
         if (p.seg0 < 0 || p.n_seg <= 0 || p.seg0 + p.n_seg > it.n_seg) {
@@ -1210,6 +1264,8 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         for (int32_t q = p.seg0; q < p.seg0 + p.n_seg; ++q) {
             const int64_t seg_p = it.patch_at(q + 1) - it.patch_at(q);
             enc_cu_host_[n_seg + 1] = enc_cu_host_[n_seg] + (int32_t)seg_p;
+            enc_seg_h_host_.push_back(it.seg_h(q));
+            enc_seg_w_host_.push_back(it.seg_w(q));
             ++n_seg;
             if (seg_p > max_seg) max_seg = seg_p;
         }
@@ -1256,6 +1312,8 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         B.enc_n_seg = n_seg;
         B.enc_cu = static_cast<const int32_t*>(enc_cu_dev_[r]);
         B.enc_max_seg = (int32_t)max_seg;
+        B.enc_seg_h = enc_seg_h_host_.data();
+        B.enc_seg_w = enc_seg_w_host_.data();
     }
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;

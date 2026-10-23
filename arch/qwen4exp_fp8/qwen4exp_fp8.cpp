@@ -1555,7 +1555,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             if (p == K - 1) wait1();
             l.hc_ffn.write(c, T, r0(p), rn(p));
             /* The projection of this piece, before the next layer reads it. */
-            l.proj.step(c, r0(p), rn(p));
+            l.proj.step(c, batch, r0(p), rn(p));
             if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p));
         }
         if (ple_next) {
@@ -1600,7 +1600,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         l.mlp.step(c, batch);
         l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
-        l.proj.step(c, 0, T);
+        l.proj.step(c, batch, 0, T);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
 }
@@ -1677,6 +1677,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+    /* The gated residual applies a control vector after every block's write (HcProject). */
+    out->control_vector_ok = 1;
     return RAD_OK;
 }
 

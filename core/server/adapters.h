@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <iterator>
 #include <memory>
 
@@ -708,10 +709,21 @@ public:
                 std::shared_ptr<mm::Item>* out, std::string* why) override {
         if (!accepts(k)) { if (why) *why = "this kind of media is not served"; return RAD_E_UNSUPPORTED; }
         if (k == MediaKind::Audio) return p_->audio(bytes.data(), bytes.size(), out, why);
-        return k == MediaKind::Image
-                   ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
-                               opts.max_pixels)
-                   : p_->video(bytes.data(), bytes.size(), out, why);
+        if (k == MediaKind::Video) return p_->video(bytes.data(), bytes.size(), out, why);
+        mm::ImageMode mode;
+        mode.kind = (int32_t)opts.image_mode;
+        mode.base_size = opts.image_base_size;
+        mode.image_size = opts.image_size;
+        mode.several = opts.several_pictures;
+        /* The host share of a picture (decode, resample, patch staging), apart from the tower
+         * pass engine_mm.cpp times. */
+        const auto t0 = std::chrono::steady_clock::now();
+        const int rc = p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
+                                 opts.max_pixels, mode);
+        RAD_DEBUG("mm: host processor %lld bytes -> %.1f ms (rc %d)", (long long)bytes.size(),
+                  std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0).count(), rc);
+        return rc;
     }
 
     int32_t audio_rate() const override {

@@ -454,9 +454,10 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 const int* shard_weights, long pieces, long timeline,
                                 long form);
 // `form` is R4D_AR8_FORM_* (r4d_ar_shards.h), the same on every rank: lockstep, ring or split,
-// all with the same bits. `timeline`, a diagnostic, is 0 or a device buffer of nblocks * R4D_AR_TL_WORDS int64 that every
-// block of the eight-rank two-shot fills with wall-clock stamps (r4d_ar_wide.h): its start, each
-// handshake's arrival and release, its end. r4d_selftest --perfar8 with --timeline reads it.
+// all with the same bits. `timeline`, a diagnostic, is 0 or a device buffer of
+// nblocks * R4D_AR_TL_WORDS int64 that every block fills with wall-clock stamps (r4d_ar_wide.h):
+// its start, each handshake's arrival and release, its end. r4d_selftest --perfar8 --timeline
+// reads it.
 // The tiered int8 wire on both two-shot hops (r4d_ar_twoshot_Nrank_ti8.hip; codec in
 // r4d_ar_ti8.h), 3 or 4 ranks. Int8 groups of 32 with an fp16 scale and a per-group record
 // (T1 plain, T2 top-1-exact, T3 wht32), 38 bytes/group; tiering is deterministic and
@@ -693,6 +694,10 @@ void r4d_mla_matrix_pin_form(int form);
 // Null `fns` stops recording. r4d_selftest uses it to show that a pinned form dispatches a kernel
 // of its own, so a pin that is ignored cannot pass by comparing a form with itself.
 int r4d_record_dispatches(const void** fns, int cap);
+// Test hook: the eight-rank two-shot's settings (r4d_ar_shards.h) for instances built after the
+// call; null restores the engine's. r4d_selftest checks weighted and empty shards, fixed piece
+// counts and the size floors with it, and --perfar8 --ar8-weights times another board's weights.
+void r4d_ar8_test_settings(const struct R4DAr8Settings* s);
 // The narrow GEMM with r4d_gated_quant_fp8 as its epilogue, for a gate_up projection whose only
 // consumer is that quantiser. `wq` is the [2*nout][K] gate_up plane, gate first; outputs are the
 // quantiser's: `q` E4M3 [M][nout], `s` f32 [M][ceil(nout/128)], and `y` the bf16 silu product or 0.

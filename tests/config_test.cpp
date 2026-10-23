@@ -427,6 +427,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
+        { "--attn-prefill-fp8", { "both" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
@@ -637,6 +638,25 @@ TEST(the_wire_mode_is_one_of_two_names) {
     CHECK_EQ(parse({ "--tp-wire", "wht8" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--tp-wire", "" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--tp-wire", "EXACT" }, &c), RAD_E_INVAL);
+}
+
+/* The prefill attention's e4m3 legs are lossy, so the default is off and anything but the four
+ * names stops the server. */
+TEST(the_attention_fp8_mode_is_one_of_four_names) {
+    Config c;
+    CHECK_EQ(c.attn_prefill_fp8, 0);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "qk" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_QK);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "pv" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_PV);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "both" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, (int)(RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV));
+    CHECK_EQ(std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)), std::string("both"));
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "off" }, &c), RAD_OK);
+    CHECK_EQ(c.attn_prefill_fp8, 0);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "3" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--attn-prefill-fp8", "QK" }, &c), RAD_E_INVAL);
 }
 
 TEST(the_p2p_mode_is_one_of_three_names) {
@@ -1226,8 +1246,8 @@ TEST(usage_names_every_flag_it_documents) {
     for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
                            "--num-speculative-tokens", "--draft-window", "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
-                           "--embedding-placement", "--ngram-placement", "--kld-record",
-                           "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
+                           "--attn-prefill-fp8", "--embedding-placement", "--ngram-placement",
+                           "--kld-record", "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
                            "--presence-penalty", "--dry-sequence-breakers",
                            "--chat-template-kwargs", "--reasoning-format", "--max-n",
                            "--max-queued-requests", "--max-stop-strings", "--http-threads",

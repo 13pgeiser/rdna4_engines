@@ -41,15 +41,6 @@ int fail(std::string* err, int code, const std::string& m) {
     return code;
 }
 
-bool starts_with(const std::string& s, const char* p) {
-    const size_t n = std::strlen(p);
-    return s.size() >= n && s.compare(0, n, p) == 0;
-}
-bool ends_with(const std::string& s, const char* p) {
-    const size_t n = std::strlen(p);
-    return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
-}
-
 std::vector<std::string> split_dots(const std::string& s) {
     std::vector<std::string> v;
     size_t at = 0;
@@ -64,7 +55,7 @@ std::vector<std::string> split_dots(const std::string& s) {
 
 /* `<module>.weight` -> module and its leaf; "" when the source is not a `.weight` tensor. */
 std::string module_of(const std::string& src, std::string* leaf) {
-    if (!ends_with(src, ".weight")) return "";
+    if (!src.ends_with(".weight")) return "";
     std::string m = src.substr(0, src.size() - 7);
     if (m.empty()) return "";
     const size_t d = m.rfind('.');
@@ -100,7 +91,7 @@ const char* excluded_weight(const Program& prog, const WeightInfo& w) {
         return "a drafter / MTP layer (layer group at or above meta.n_layers)";
     static const char* const kScopes[] = { "draft.", "vision.", "audio.", "mtp." };
     for (const char* s : kScopes)
-        if (starts_with(w.name, s)) return "a non-trunk builder scope";
+        if (w.name.starts_with(s)) return "a non-trunk builder scope";
     return nullptr;
 }
 
@@ -743,9 +734,9 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
 std::string explain_module(const Program& prog, const TargetSet& targets, const std::string& module) {
     const std::string want[3] = {
         module,
-        starts_with(module, "model.") && !starts_with(module, "model.language_model.")
+        module.starts_with("model.") && !module.starts_with("model.language_model.")
             ? "model.language_model." + module.substr(6) : "",
-        starts_with(module, "model.language_model.") ? "model." + module.substr(21) : "" };
+        module.starts_with("model.language_model.") ? "model." + module.substr(21) : "" };
     std::string first;
     bool any = false;
     for (const RadNameMap& m : prog.name_map) {
@@ -939,7 +930,7 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
         if (!std::regex_match(k, m, key_re)) {
             std::string why = "is not a linear LoRA A/B tensor";
             if (k.find("lora_embedding_") != std::string::npos) why = "is an embedding LoRA tensor";
-            else if (ends_with(k, ".bias")) why = "is a trained bias";
+            else if (k.ends_with(".bias")) why = "is a trained bias";
             else if (k.find("modules_to_save") != std::string::npos) why = "is a modules_to_save copy";
             else if (k.find("lora_magnitude_vector") != std::string::npos) why = "is a DoRA magnitude";
             return fail(err, RAD_E_UNSUPPORTED, st_path + ": tensor " + k + " " + why +
@@ -1034,9 +1025,9 @@ int pack_modules(const std::vector<Site>& sites, int max_rank,
     for (auto& kv : mods) {
         const AdModule& am = kv.second;
         std::vector<std::string> cand{ am.name };
-        if (starts_with(am.name, "model.") && !starts_with(am.name, "model.language_model."))
+        if (am.name.starts_with("model.") && !am.name.starts_with("model.language_model."))
             cand.push_back("model.language_model." + am.name.substr(6));
-        if (starts_with(am.name, "model.language_model."))
+        if (am.name.starts_with("model.language_model."))
             cand.push_back("model." + am.name.substr(21));
         std::vector<std::string> hit;
         for (const std::string& c : cand) if (where.count(c)) hit.push_back(c);

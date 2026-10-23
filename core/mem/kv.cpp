@@ -2,6 +2,7 @@
 #include "mem/kv.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 
 namespace rad {
@@ -76,6 +77,7 @@ static const char* kv_kind_name(int k) {
         case RAD_KV_WINDOW: return "window";
         case RAD_KV_LINEAR: return "linear";
         case RAD_KV_CONV:   return "conv";
+        case RAD_KV_RING:   return "ring";
         default:            return "?";
     }
 }
@@ -126,7 +128,10 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
         KVGroupPlan p;
         p.index    = (int32_t)i;
         p.name     = g.name.empty() ? fmt("kv%zu", i) : g.name;
-        p.kind     = g.decl.kind;
+        /* R-SWA: RAD_KV_RING is a window group whose floor is per sequence (declare_runtime_window
+         * / SeqWindow), so it plans as a RAD_KV_WINDOW group with `runtime_win` set below. No
+         * other plan-path code has to know the kind. */
+        p.kind     = g.decl.kind == RAD_KV_RING ? RAD_KV_WINDOW : g.decl.kind;
         p.n_layers = (int64_t)g.layers.size();
 
         if (p.n_layers <= 0) {
@@ -161,7 +166,9 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             }
             if (p.kind == RAD_KV_WINDOW) {
                 if (g.decl.window <= 0) {
-                    RAD_ERR("KV group '%s': RAD_KV_WINDOW with window 0", p.name.c_str());
+                    RAD_ERR("KV group '%s': %s with window 0", p.name.c_str(),
+                            g.decl.kind == RAD_KV_RING ? "RAD_KV_RING (the ring's W)"
+                                                       : "RAD_KV_WINDOW");
                     return RAD_E_INVAL;
                 }
                 /* +1 because a window that is not block-aligned straddles one extra block. */
@@ -233,6 +240,28 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     }
     bundling_ = compare_bundling(bundles);
 
+    /* R-SWA: a declared runtime window turns the group's plan over to per-sequence windows (see
+     * declare_runtime_window). Applied after every declaration above, so a fixed-window group's
+     * plan is exactly what it was. */
+    for (auto& p : plans_) apply_runtime_window(p);
+    /* A RAD_KV_RING group carries a runtime window by its kind, whether or not the caller had a
+     * manager to declare it on first (the engine's sizing probes declare it, but plan_groups must
+     * not depend on that). `window` is the ring's W. */
+    for (size_t i = 1; i < plans_.size(); ++i) {
+        KVGroupPlan& p = plans_[i];
+        if (groups[i].decl.kind != RAD_KV_RING || p.runtime_win) continue;
+        p.runtime_win    = true;
+        p.runtime_tokens = groups[i].decl.window;
+        p.win_snap       = false;
+    }
+    for (const auto& [g, w] : runtime_decl_) {
+        if (g < 0 || g >= (int32_t)plans_.size() || !plans_[(size_t)g].runtime_win) {
+            RAD_ERR("declare_runtime_window(%d): the group is not a RAD_KV_WINDOW or RAD_KV_RING "
+                    "group in this program (a runtime window needs a windowed group)", (int)g);
+            return RAD_E_INVAL;
+        }
+    }
+
     /* ---- fixed costs first: they are not per-token ---- */
     checkpoint_bytes_ = 0;
     window_ck_bytes_ = 0;
@@ -243,7 +272,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     for (size_t i = 1; i < plans_.size(); ++i) {
         KVGroupPlan& p = plans_[i];
         p.win_snap = !has_state && p.kind == RAD_KV_WINDOW && p.window_blocks > 0 &&
-                     !groups[i].drafter;
+                     !p.runtime_win && !groups[i].drafter;
         if (p.win_snap && !p.zero && p.n_layers > 0)
             window_ck_bytes_ += p.window_blocks * p.bytes_per_block;
     }
@@ -257,24 +286,105 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
         if (p.stateful()) fixed += align_up(p.bytes_per_state * p.n_states, RAD_ALIGN_UNIT);
     /* And one unit per paged group, whose size need not be a multiple of the alignment. */
     for (const auto& p : plans_) if (p.paged()) fixed += RAD_ALIGN_UNIT;
+    /* A runtime window's ring is per sequence and on top of the context the split sizes: one
+     * ring a sequence, carved as a fixed cost. Its reference is the context itself, which the
+     * split already covers (the group is not capped at window_blocks). */
+    for (const auto& p : plans_)
+        if (p.runtime_win && !p.zero)
+            fixed += align_up(max_seqs_ * p.ring_blocks_max() * p.bytes_per_block, RAD_ALIGN_UNIT);
 
     fixed_ = fixed;
     ckpts_ = budget_ckpts;
     return RAD_OK;
 }
 
-/* Windowed groups are capped at window_pool_cap, as in carve(). */
+/* Windowed groups are capped at window_pool_cap, as in carve(). A runtime-window group is not:
+ * its blocks are the reference (one context a sequence, as a FULL group) plus the ring its fixed
+ * costs already carry. */
 int64_t KVManager::ceiling(int64_t ctx) const {
     if (ctx <= 0) return 0;
     int64_t need = fixed_;
     for (const auto& p : plans_) {
         if (!p.paged() || p.block_size <= 0) continue;
         int64_t blocks = max_seqs_ * ((ctx + p.block_size - 1) / p.block_size);
-        if (p.kind == RAD_KV_WINDOW && p.window_blocks > 0)
+        if (p.kind == RAD_KV_WINDOW && !p.runtime_win && p.window_blocks > 0)
             blocks = std::min(blocks, window_pool_cap(p));
         need += blocks * p.bytes_per_block;
     }
     return need;
+}
+
+/* Moves a WINDOW group's plan to per-sequence runtime windows (declare_runtime_window). Returns
+ * false for any other group, so plan_groups() can apply it to every plan unconditionally. */
+bool KVManager::apply_runtime_window(KVGroupPlan& p) const {
+    auto it = runtime_decl_.find(p.index);
+    if (it == runtime_decl_.end() || p.kind != RAD_KV_WINDOW || p.runtime_win) return false;
+    p.runtime_win = true;
+    p.runtime_tokens = it->second;
+    /* The window a sequence may inherit (a fixed-window cap) is no longer the bound, and the
+     * declare-time window is not the sequence's own, so nothing here is snapshot-able. */
+    p.win_snap = false;
+    return true;
+}
+
+int KVManager::declare_runtime_window(int32_t g, int64_t window_tokens) {
+    if (g <= 0 || window_tokens <= 0) {
+        RAD_ERR("declare_runtime_window: group %d with a window of %lld (a runtime window needs a "
+                "real group and a positive W)", (int)g, (long long)window_tokens);
+        return RAD_E_INVAL;
+    }
+    const KVGroupPlan* p = plan(g);
+    if (p && p->kind != RAD_KV_WINDOW) {
+        RAD_ERR("group '%s' is not RAD_KV_WINDOW or RAD_KV_RING, so it cannot carry a runtime "
+                "window", p->name.c_str());
+        return RAD_E_INVAL;
+    }
+    if (p && p->runtime_win && p->runtime_tokens != window_tokens) {
+        /* A RAD_KV_RING group's W is its declaration's `window`, and one already planned for
+         * another W has its ring in the fixed costs. */
+        RAD_ERR("declare_runtime_window(%d): group '%s' already carries a runtime window of %lld "
+                "tokens, and its ring is sized for that", (int)g, p->name.c_str(),
+                (long long)p->runtime_tokens);
+        return RAD_E_INVAL;
+    }
+    if (configured_) {
+        RAD_ERR("declare_runtime_window(%d) after the carve: the group's blocks and fixed costs "
+                "are already sized for a different window", (int)g);
+        return RAD_E_STATE;
+    }
+    runtime_decl_[g] = window_tokens;
+    /* A plan built before the declaration (the engine's probes, or plan_groups() then declare)
+     * is updated in place; the next plan_groups() picks the declaration up on its own.
+     *
+     * A plan set shorter than `g` returns RAD_E_INVAL below with this store kept: deliberate.
+     * The declaration is the caller's standing intent (it survives forget(), whose vectors are
+     * emptied together and are not this map), and the short plan set is the probe ordering the
+     * declaration exists for -- the next plan_groups() applies it to a plan that has the group. */
+    if (!plans_.empty()) {
+        if (g >= (int32_t)plans_.size()) return RAD_E_INVAL;
+        KVGroupPlan& q = plans_[(size_t)g];
+        /* Whether the plan counted this group's window snapshot section (plan_groups' rule). */
+        const bool counted = q.win_snap && !q.zero && q.n_layers > 0;
+        if (!apply_runtime_window(q)) return RAD_OK;   /* already applied */
+        /* The cost this declaration adds, against the plan as published: the ring is one a
+         * sequence, and the group gives up its window snapshot section. */
+        fixed_ += align_up(max_seqs_ * q.ring_blocks_max() * q.bytes_per_block, RAD_ALIGN_UNIT);
+        if (counted) {
+            const int64_t was = q.window_blocks * q.bytes_per_block;
+            /* The plan counted this group's snapshot section, so both totals carry `was`.
+             * Saturating hides an accounting bug; surface it in debug builds. */
+            assert(window_ck_bytes_ >= was && checkpoint_bytes_ >= was &&
+                   "runtime window: snapshot byte totals below the section being removed");
+            window_ck_bytes_ = window_ck_bytes_ > was ? window_ck_bytes_ - was : 0;
+            checkpoint_bytes_ = checkpoint_bytes_ > was ? checkpoint_bytes_ - was : 0;
+        }
+    }
+    return RAD_OK;
+}
+
+int64_t KVManager::runtime_window_tokens(int32_t g) const {
+    const KVGroupPlan* p = plan(g);
+    return p && p->runtime_win ? p->runtime_tokens : 0;
 }
 
 /* The vectors parallel to plans_ are filled at different points of the carve, so a partial carve
@@ -329,11 +439,11 @@ int64_t KVManager::paged_split(int64_t budget_bytes, std::vector<int64_t>* block
         if (tokens_cap_ > 0 && tokens > tokens_cap_) tokens = tokens_cap_;
 
         /* A windowed group cannot address past its pool cap; cap it and give the bytes back to
-         * the others. */
+         * the others. A runtime-window group's cap is the context plus its ring (a fixed cost). */
         int32_t capped = -1;
         for (int32_t i : open) {
             const auto& p = plans_[i];
-            if (p.kind != RAD_KV_WINDOW) continue;
+            if (p.kind != RAD_KV_WINDOW || p.runtime_win) continue;
             if (tokens / p.block_size > window_pool_cap(p)) { capped = i; break; }
         }
         if (capped < 0) break;
@@ -370,7 +480,8 @@ int64_t KVManager::pool_mib_for_tokens(int64_t tokens, int64_t max_mib) const {
 int64_t KVManager::zero_blocks(const KVGroupPlan& p, int64_t tokens) const {
     if (tokens == kUnboundedTokens) return 0;
     const int64_t b = tokens / p.block_size;
-    if (p.kind == RAD_KV_WINDOW && b > window_pool_cap(p)) return window_pool_cap(p);
+    if (p.kind == RAD_KV_WINDOW && !p.runtime_win && b > window_pool_cap(p))
+        return window_pool_cap(p);
     return b;
 }
 
@@ -509,19 +620,30 @@ int KVManager::carve_into(Pool& kv_pool) {
 
     configured_ = true;
     report_ = bundling_.report();
+    /* A runtime-window group reads as "ring": its window is the sequence's own, not the plan's. */
+    auto kind_of = [](const KVGroupPlan& p) {
+        return p.runtime_win ? "ring" : kv_kind_name(p.kind);
+    };
     for (const auto& p : plans_) {
         if (p.paged())
             report_ += fmt("    %-14s %-6s %3lld layers  block %4lld tok  page %8s  "
                            "%7lld blocks = %9s  (%lld tokens)\n",
-                           p.name.c_str(), kv_kind_name(p.kind), (long long)p.n_layers,
+                           p.name.c_str(), kind_of(p), (long long)p.n_layers,
                            (long long)p.block_size, humanb(p.bytes_per_block).c_str(),
                            (long long)p.n_blocks, humanb(p.pool_bytes).c_str(),
                            (long long)(p.n_blocks * p.block_size));
         else
             report_ += fmt("    %-14s %-6s %3lld layers  state %8s  %7lld slots = %9s\n",
-                           p.name.c_str(), kv_kind_name(p.kind), (long long)p.n_layers,
+                           p.name.c_str(), kind_of(p), (long long)p.n_layers,
                            humanb(p.bytes_per_state).c_str(),
                            (long long)p.n_states, humanb(p.pool_bytes).c_str());
+    }
+    for (const auto& p : plans_) {
+        if (!p.runtime_win) continue;
+        report_ += fmt("    %-14s runtime window W=%lld: a sequence keeps its reference and a ring "
+                       "of at most %lld block(s), rewritten in place\n",
+                       p.name.c_str(), (long long)p.runtime_tokens,
+                       (long long)p.ring_blocks_max());
     }
     /* The pool's address range, so a GPU fault address can be placed in the carve. */
     report_ += fmt("    pool at %p, %s; groups at +%lld..+%lld\n",
@@ -805,7 +927,17 @@ int64_t KVManager::blocks_for(int32_t g, int64_t n_tokens) const {
     const KVGroupPlan* p = plan(g);
     if (!p || !p->paged() || n_tokens <= 0) return 0;
     int64_t n = ceil_div(n_tokens, p->block_size);
-    if (p->kind == RAD_KV_WINDOW) n = std::min(n, window_seq_cap(*p));
+    if (p->kind == RAD_KV_WINDOW) {
+        if (p->runtime_win) {
+            /* The reference's blocks up to n, plus one ring. Without a sequence the floor is
+             * unknown, so the whole context is the bound on the reference. */
+            const int64_t ring = p->ring_blocks_max();
+            const int64_t ctx  = max_ctx_ > 0 ? max_ctx_ : n_tokens;
+            n = std::min(n, ceil_div(ctx, p->block_size)) + ring;
+        } else {
+            n = std::min(n, window_seq_cap(*p));
+        }
+    }
     return n;
 }
 
@@ -836,6 +968,7 @@ int KVManager::add_sequence(uint64_t id) {
     s.id = id;
     s.blocks.resize(plans_.size());
     s.first_block_pos.assign(plans_.size(), 0);
+    s.win.resize(plans_.size());
     s.state.assign(plans_.size(), -1);
     s.dirty_from.assign(plans_.size(), 0);
     seqs_.emplace(id, std::move(s));
@@ -853,6 +986,9 @@ int KVManager::preempt(uint64_t id) {
         for (int32_t b : s->blocks[g]) drop_block((int32_t)g, b);
         s->blocks[g].clear();
         s->first_block_pos[g] = 0;
+        /* The runtime window goes with the blocks: re-admission re-arms it at the prompt end
+         * (the scheduler's admission path calls set_window again before the KV grows). */
+        s->win[g] = SeqWindow{};
         s->dirty_from[g] = 0;
         /* The recurrent state goes too (see preempt in kv.h, spec §7.1). */
         if (s->state[g] >= 0) { drop_state((int32_t)g, s->state[g]); s->state[g] = -1; }
@@ -870,6 +1006,12 @@ int KVManager::rollback(uint64_t id, int64_t n_tokens) {
     if (n_tokens < 0) return RAD_E_INVAL;
     /* Nothing to free; RAD_OK so "every draft accepted" needs no special path in the caller. */
     if (n_tokens >= s->n_tokens) return RAD_OK;
+    /* A runtime-windowed sequence unwinds nothing: the ring's slots are reused once it is full,
+     * so the slots a rejected verify wrote may already hold newer keys. The scheduler gates
+     * drafting on has_runtime_window, so this refuses rather than corrupts, and only a caller
+     * that drafts beside a runtime window can reach it. */
+    for (const SeqWindow& w : s->win)
+        if (w.set) return RAD_E_UNSUPPORTED;
 
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
@@ -897,6 +1039,80 @@ int64_t KVManager::first_block_pos(uint64_t id, int32_t g) const {
     const Seq* s = find(id);
     if (!s || g < 0 || g >= (int32_t)s->first_block_pos.size()) return 0;
     return s->first_block_pos[(size_t)g];
+}
+
+/* ------------------------------------------------------------------ the runtime window */
+
+int KVManager::set_window(uint64_t id, int64_t visible_lo, int64_t window_tokens) {
+    if (!configured_) return RAD_E_STATE;
+    Seq* s = find(id);
+    if (!s) return RAD_E_NOTFOUND;
+    if (visible_lo < 0 || window_tokens <= 0) return RAD_E_INVAL;
+    /* The reference is written linearly, so the floor cannot be behind KV the sequence already
+     * holds: rebasing would have to move blocks the ring has not been shaped for. */
+    if (visible_lo < s->n_tokens) {
+        RAD_ERR("sequence %llu: runtime window floor %lld is behind its %lld held tokens",
+                (unsigned long long)id, (long long)visible_lo, (long long)s->n_tokens);
+        return RAD_E_STATE;
+    }
+    bool any = false;
+    /* With a declared runtime window in the program, arm exactly the declared groups: a plain
+     * fixed-window group beside them is carved for its fixed window, and arming it silently
+     * converts it. With none declared this is the caller-sizes-the-pool path kv.h states, and
+     * every windowed group arms as before. */
+    bool declared = false;
+    for (const KVGroupPlan& p : plans_)
+        if (p.kind == RAD_KV_WINDOW && p.runtime_win) declared = true;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (p.kind != RAD_KV_WINDOW) continue;
+        if (declared && !p.runtime_win) {
+            RAD_ERR("sequence %llu: set_window meets fixed-window group '%s' beside a declared "
+                    "runtime window; its pool is carved for its fixed window and the mix is not "
+                    "supported", (unsigned long long)id, p.name.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        SeqWindow w;
+        w.set        = true;
+        w.window     = window_tokens;
+        w.visible_lo = visible_lo;
+        /* Whole blocks: the ring starts at the first boundary at or after the floor, and the
+         * tokens in [visible_lo, ring_pos) stay in the reference's last block (SeqWindow). The
+         * ring itself must span all of W: the frozen tokens are the oldest of the tail, so a
+         * smaller ring would lose the last W - span positions. */
+        w.ring_pos    = ceil_div(visible_lo, p.block_size) * p.block_size;
+        w.ring_blocks = ceil_div(window_tokens, p.block_size);
+        if (w.ring_blocks < 1) w.ring_blocks = 1;   /* the ring always has somewhere to write */
+        /* What the sequence can hold: the reference's blocks, then the whole ring. */
+        const int64_t need = w.ring_pos / p.block_size + w.ring_blocks;
+        if (p.n_blocks > 0 && need > p.n_blocks) return RAD_E_FULL;
+        s->win[g] = w;
+        any = true;
+    }
+    if (!any) return RAD_E_UNSUPPORTED;
+    return RAD_OK;
+}
+
+bool KVManager::runtime_window(uint64_t id, int32_t g, SeqWindow* out) const {
+    const Seq* s = find(id);
+    if (!s || g < 0 || g >= (int32_t)s->win.size() || !s->win[(size_t)g].set) return false;
+    if (out) *out = s->win[(size_t)g];
+    return true;
+}
+
+bool KVManager::has_runtime_window(uint64_t id) const {
+    const Seq* s = find(id);
+    if (!s) return false;
+    for (const SeqWindow& w : s->win) if (w.set) return true;
+    return false;
+}
+
+/* What ensure() must have in the table for `n_tokens`: the reference grows linearly until the
+ * floor, then the ring fills up to its whole span and never grows again. */
+int64_t KVManager::window_table_len(const KVGroupPlan& p, const SeqWindow& w, int64_t n_tokens) {
+    const int64_t ref = w.ring_pos / p.block_size;
+    if (n_tokens <= w.ring_pos) return ceil_div(n_tokens, p.block_size);
+    return ref + std::min(w.ring_blocks, ceil_div(n_tokens - w.ring_pos, p.block_size));
 }
 
 int64_t KVManager::seq_tokens(uint64_t id) const { const Seq* s = find(id); return s ? s->n_tokens : 0; }
@@ -1023,11 +1239,15 @@ int64_t KVManager::step_blocks(const KVGroupPlan& p) const {
 /* Slides from the step's first query, not its last. The query at keep_from reads keys down to
  * keep_from - window + 1, which lies in block keep_from / block - (window_blocks - 1) or later
  * (window_blocks - 1 >= window / block). A target from the step's end is the same for a decode
- * step but drops keys the earlier rows of a prefill chunk still need. */
+ * step but drops keys the earlier rows of a prefill chunk still need.
+ *
+ * A sequence with a runtime window is left alone. Its visible set is anchored at 0, so nothing in
+ * the table is below a sliding floor to recycle; the ring's blocks are rewritten in place and
+ * the table never moves (SeqWindow). */
 void KVManager::recycle_window(Seq* s, int64_t keep_from) {
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
-        if (p.kind != RAD_KV_WINDOW) continue;
+        if (p.kind != RAD_KV_WINDOW || s->win[g].set) continue;
         int64_t first    = s->first_block_pos[g] / p.block_size;
         int64_t target   = std::max<int64_t>(first,
                                              keep_from / p.block_size - (p.window_blocks - 1));
@@ -1066,7 +1286,9 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
         const auto& p = plans_[g];
         if (p.paged()) {
             int64_t first = s->first_block_pos[g] / p.block_size;
-            int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            int64_t want  = s->win[g].set
+                ? window_table_len(p, s->win[g], n_tokens) - first
+                : ceil_div(n_tokens, p.block_size) - first;
             need[g] = want - (int64_t)s->blocks[g].size();
             if (need[g] < 0) need[g] = 0;
             /* Copy-on-write: the partial block is the only one a write reaches; if it is shared,
@@ -1102,7 +1324,9 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                     }
                 }
             }
-            int64_t want = ceil_div(n_tokens, p.block_size) - first;
+            int64_t want = s->win[g].set
+                ? window_table_len(p, s->win[g], n_tokens) - first
+                : ceil_div(n_tokens, p.block_size) - first;
             if ((int64_t)s->blocks[g].size() < want)
                 s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g],
                                                      (int64_t)s->blocks[g].size());
@@ -1126,6 +1350,10 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
     if (!s) return RAD_E_NOTFOUND;
     const KVGroupPlan* p = plan(g);
     if (!p || !p->paged()) return RAD_E_INVAL;
+    /* A runtime window's table is its own reference plus ring, laid out against a floor no cache
+     * entry knows (set_window), so blocks adopted from a prefix hit would sit at the wrong
+     * positions. Prefix publish is skipped for such a sequence; this is the backstop. */
+    if (s->win[(size_t)g].set) return RAD_E_STATE;
     /* Whole blocks only (see adopt in kv.h). */
     if (n_tokens % p->block_size != 0) return RAD_E_INVAL;
     if ((int64_t)blocks.size() != n_tokens / p->block_size) return RAD_E_INVAL;
@@ -1146,6 +1374,14 @@ int KVManager::fork(uint64_t parent, uint64_t child) {
     Seq* pa = find(parent);
     if (!pa) return RAD_E_NOTFOUND;
     if (seqs_.count(child)) return RAD_E_DUPLICATE;
+    /* The window is runtime data: a child that shared the table without it would read the ring
+     * as if it were a reference. A forking model (speculative decoding) does not carry one. */
+    for (const SeqWindow& w : pa->win)
+        if (w.set) {
+            RAD_ERR("sequence %llu: fork refused, it carries a runtime window",
+                    (unsigned long long)parent);
+            return RAD_E_UNSUPPORTED;
+        }
 
     /* Pass 1: the child needs its own state slot in every stateful group before anything is
      * shared (see fork in kv.h, spec §7.3). */
@@ -1160,6 +1396,7 @@ int KVManager::fork(uint64_t parent, uint64_t child) {
         if (plans_[g].paged()) {
             ch->blocks[g] = pa->blocks[g];
             ch->first_block_pos[g] = pa->first_block_pos[g];
+            ch->win[g] = pa->win[g];
             for (int32_t b : ch->blocks[g]) add_ref(g, b);
         } else {
             grab_state((int32_t)g, &ch->state[g]);
@@ -1189,7 +1426,10 @@ int KVManager::make_room(uint64_t id, int64_t n_tokens,
             if (p.paged()) {
                 int64_t first = s->first_block_pos[g] / p.block_size;
                 int64_t want  = ceil_div(n_tokens, p.block_size) - first;
-                if (p.kind == RAD_KV_WINDOW) want = std::min(want, window_seq_cap(p));
+                if (p.kind == RAD_KV_WINDOW) {
+                    if (s->win[g].set) want = window_table_len(p, s->win[g], n_tokens) - first;
+                    else               want = std::min(want, window_seq_cap(p));
+                }
                 int64_t extra = want - (int64_t)s->blocks[g].size() + 1;  /* +1 for a COW copy */
                 if (extra > available_blocks((int32_t)g)) return false;
             } else if (p.stateful() && s->state[g] < 0 && free_states_[g].empty()) return false;
@@ -1369,6 +1609,9 @@ bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out)
     out->clear();
     const Seq* s = find(id);
     if (!s || pos <= 0) return false;
+    /* A runtime window is excluded from window snapshots (set_window): the window length is
+     * runtime data and the table is a reference plus a ring, not [lo, pos). */
+    for (const SeqWindow& w : s->win) if (w.set) return false;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const KVGroupPlan& p = plans_[g];
         if (!p.win_snap) continue;
@@ -1390,6 +1633,8 @@ bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out)
 int KVManager::seed_window(uint64_t id, int64_t pos) {
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
+    /* A sequence with a runtime window is never resumed from a window snapshot (set_window). */
+    for (const SeqWindow& w : s->win) if (w.set) return RAD_E_STATE;
     /* Check every group before taking anything, as ensure() does. */
     for (size_t g = 0; g < plans_.size(); ++g) {
         const KVGroupPlan& p = plans_[g];

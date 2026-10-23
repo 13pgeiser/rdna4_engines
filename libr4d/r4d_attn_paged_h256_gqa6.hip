@@ -2,10 +2,12 @@
 // KV-dtype variants are template instantiations of one device code. The geometry is a hard gate:
 // anything else is rejected.
 //
-// The query is bf16 in every variant. A single-term 8-bit query is ~10x less accurate against an
-// fp32 reference (2.58e-02 vs ~2.3e-03 relative), and the two-term e4m3 form that reaches f16
-// accuracy is 4-10% slower end to end. Two families ship, differing in KV dtype: bf16 and fp8
-// (the production configuration).
+// The query is bf16 in every exact variant. A single-term 8-bit query is ~10x less accurate
+// against an fp32 reference (2.58e-02 vs ~2.3e-03 relative), and the two-term e4m3 form that
+// reaches f16 accuracy is 4-10% slower end to end. Two families ship, differing in KV dtype: bf16
+// and 8-bit (fp8, the production configuration, and the fp8_v4 and k6_v4 caches). Over the 8-bit
+// caches the prefill also has lossy rows that run Q.K^T, P.V or both as e4m3 WMMA (O_QK8, O_PV8),
+// taken only when the caller's `prefill_fp8` asks for them.
 //
 // `opt` is a bitmask of optimisation steps:
 //     prefill 3954187 = f16 operands | mask skip | folded query scale | contiguous-k fragments
@@ -19,7 +21,6 @@
 #include "r4d_attn_args.h"
 #include "r4d_common.h"
 #include <cmath>
-#include <cstdlib>
 #include <algorithm>
 using std::max;
 #include "r4d_attn_prefill_h256_gqa6.hip"
@@ -50,32 +51,16 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 // (36-48 bytes per lane, ~4% of the prefill). At 2 the spill is 20 bytes, outside the WMMA groups.
 #define P_OPT    3954187
 
-// KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
+// KVP: 0 = an 8-bit cache (XOPT names fp8_v4 or k6_v4 and the e4m3 legs), 1 = bf16 cache.
 template <int KVP, int XOPT = 0>
 static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
     dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
-    // R4D_ATTN_FP8: 0 = f16 (default), 1 = O_QK8, 2 = O_PV8, 3 = both; fp8, fp8_v4 and k6_v4 KV.
-    int fp8mode = 0;
-    if constexpr (KVP == 0) {
-        static const int m = [] { const char* e = getenv("R4D_ATTN_FP8"); return e ? atoi(e) : 0; }();
-        fp8mode = m;
-    }
-#define P_LAUNCH(OPTX)                                                                            \
-    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, \
-                                                KVP, OPTX>),                                      \
-                       grid, dim3(P_NWARPS * 32), 0, s, *a)
-    if constexpr (KVP == 0) {
-        if (fp8mode == 3)      P_LAUNCH(P_OPT | XOPT | O_QK8 | O_PV8);
-        else if (fp8mode == 2) P_LAUNCH(P_OPT | XOPT | O_PV8);
-        else if (fp8mode == 1) P_LAUNCH(P_OPT | XOPT | O_QK8);
-        else                   P_LAUNCH(P_OPT | XOPT);
-    } else {
-        P_LAUNCH(P_OPT | XOPT);
-    }
-#undef P_LAUNCH
+    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
+                                                KVP, P_OPT | XOPT>),
+                       grid, dim3(P_NWARPS * 32), 0, s, *a);
     CHK();
     return 0;
 }
@@ -91,6 +76,15 @@ extern "C" int r4d_attn_prefill_h256_gqa6_fp8v4kv(const R4DArgs* a, hipStream_t 
 }
 extern "C" int r4d_attn_prefill_h256_gqa6_k6v4kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch<0, O_V4 | O_K6>(a, s);
+}
+// The e4m3 product legs over an 8-bit cache (XOPT 0 fp8, O_V4 fp8_v4, O_V4 | O_K6 k6_v4). `legs`
+// is 1 Q.K^T, 2 P.V, 3 both. Lossy, so reached only through the rows a caller's attn_paged
+// `prefill_fp8` selects.
+template <int XOPT>
+static int prefill_legs_launch(const R4DArgs* a, hipStream_t s, int legs) {
+    if (legs == 1) return prefill_launch<0, XOPT | O_QK8>(a, s);
+    if (legs == 2) return prefill_launch<0, XOPT | O_PV8>(a, s);
+    return prefill_launch<0, XOPT | O_QK8 | O_PV8>(a, s);
 }
 
 // ---- decode ----------------------------------------------------------------------------------
@@ -187,6 +181,45 @@ extern "C" int r4d_rad_attn_prefill_h256_fp8(const RadArgs* a, RadStream s) {
      * are optional in the schema and the kernel, so they are optional here too. A calibrated pair
      * is used when passed. */
     return r4d_attn_prefill_h256_gqa6_fp8kv(&r, (hipStream_t)s);
+}
+
+/* The 8-bit caches with e4m3 products. `legs` is the row's `prefill_fp8`, which its constraint has
+ * matched: 1 Q.K^T, 2 P.V, 3 both. `row` is a token's bytes in a (block, head) page: 512 for fp8,
+ * 400 for fp8_v4, 352 for k6_v4. */
+template <int XOPT>
+static int prefill_h256_legs(const RadArgs* a, RadStream s, long long row, int legs) {
+    if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    R4DArgs r;
+    int rc = fill_paged_row(a, &r, 256, row);
+    if (rc != RAD_OK) return rc;
+    return prefill_legs_launch<XOPT>(&r, (hipStream_t)s, legs);
+}
+extern "C" int r4d_rad_attn_prefill_h256_fp8_qk8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<0>(a, s, 512, 1);
+}
+extern "C" int r4d_rad_attn_prefill_h256_fp8_pv8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<0>(a, s, 512, 2);
+}
+extern "C" int r4d_rad_attn_prefill_h256_fp8_qk8pv8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<0>(a, s, 512, 3);
+}
+extern "C" int r4d_rad_attn_prefill_h256_fp8v4_qk8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<O_V4>(a, s, 400, 1);
+}
+extern "C" int r4d_rad_attn_prefill_h256_fp8v4_pv8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<O_V4>(a, s, 400, 2);
+}
+extern "C" int r4d_rad_attn_prefill_h256_fp8v4_qk8pv8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<O_V4>(a, s, 400, 3);
+}
+extern "C" int r4d_rad_attn_prefill_h256_k6v4_qk8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<O_V4 | O_K6>(a, s, 352, 1);
+}
+extern "C" int r4d_rad_attn_prefill_h256_k6v4_pv8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<O_V4 | O_K6>(a, s, 352, 2);
+}
+extern "C" int r4d_rad_attn_prefill_h256_k6v4_qk8pv8(const RadArgs* a, RadStream s) {
+    return prefill_h256_legs<O_V4 | O_K6>(a, s, 352, 3);
 }
 
 extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {

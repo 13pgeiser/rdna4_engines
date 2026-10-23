@@ -254,7 +254,5 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
 /* The same walk as JSON, for the server's Model view, grouped by (op, band table): an op declared
  * once per layer with one bucket table is one row with a count. */
 std::string dump_graph_json(const Program& p);
-void        dump_graph    (const Program& p, FILE* out,
-                           const std::vector<std::string>* errors = nullptr);
 
 }  /* namespace rad */

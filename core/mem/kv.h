@@ -11,6 +11,10 @@
  *   RAD_KV_LINEAR  per-sequence, fixed size: the GDN recurrent state
  *   RAD_KV_CONV    per-sequence, fixed size: a rolling window of conv_width-1 + n_spec entries
  *
+ * A RAD_KV_RING group is a RAD_KV_WINDOW whose floor is per sequence and set at runtime (R-SWA,
+ * see SeqWindow); it is planned as a WINDOW group with `runtime_win` set, so no kind of its own
+ * reaches the plan.
+ *
  * The two stateful kinds are also allocated, mapped and freed here, so one allocator decides what
  * a sequence owns. With two, a freed sequence's state slot could still be handed to the next
  * request by the other.
@@ -50,6 +54,45 @@ struct BundleComparison {
 };
 BundleComparison compare_bundling(const std::vector<int64_t>& bundles);
 
+/* ------------------------------------------------------------------ the runtime window */
+/* A sequence's per-sequence window on a RAD_KV_WINDOW group, set at runtime (R-SWA, the
+ * "reference + ring" attention of Unlimited-OCR: a full causal prefill over the prompt and image
+ * tokens, then a ring of W decode slots right after it, rewritten in place forever).
+ *
+ * A fixed sliding window (`KVGroupPlan::window_blocks`, gemma4's) keeps the last W tokens: the
+ * table starts where the window begins and blocks leave from its front. A runtime window instead
+ * retains the whole prefill as the reference and appends into a ring after it:
+ *
+ *     visible = [0, visible_lo)  U  [visible_lo, visible_lo + W)
+ *
+ * `visible_lo` is the sequence's own prefill length (image tokens included), so the visible set is
+ * per sequence. The reference is never recycled and first_block_pos stays 0 (the table still
+ * starts at position 0); only the ring's slot mapping recycles, so RoPE positions keep increasing
+ * with the token's own position and a decode query sees the whole reference plus the ring.
+ *
+ * Blocks are whole, so the ring can start only on a block boundary: it starts at
+ * `ring_pos = ceil(visible_lo / block) * block` with `ceil(W / block)` blocks, and the tokens in
+ * [visible_lo, ring_pos) stay in the reference's last block (they are the oldest of the tail and
+ * are never rewritten). The visible tail is therefore W .. W + block - 1 tokens when W is a block
+ * multiple -- with block_size 128 = W the 128-256 token granularity of the plan, exact even when
+ * the floor is not aligned -- and up to one block more otherwise, always a superset of the
+ * reference implementation's last W. The ring's blocks hold the newest positions in place (no
+ * block is allocated past them, so the sequence's bytes are flat once the floor is set):
+ *
+ *     block index = ring_pos / block + ((pos - ring_pos) / block) % ring_blocks
+ *
+ * A sequence with a runtime window is excluded from prefix-cache reuse, window snapshots, forking
+ * and speculative rollback: all three assume the declare-time window, and the runtime length is
+ * not in any cache key (see KVManager::set_window). */
+struct SeqWindow {
+    bool    set = false;
+    int64_t window = 0;       /* W as set */
+    int64_t visible_lo = 0;   /* the retained reference ends here */
+    int64_t ring_pos = 0;     /* block-aligned first ring token position */
+    int64_t ring_blocks = 0;  /* whole blocks the ring holds */
+    int64_t ring_span(int64_t block) const { return ring_blocks * block; }
+};
+
 /* ------------------------------------------------------------------ per-group plan */
 struct KVGroupPlan {
     int32_t     index = -1;            /* position in Program::kv_groups */
@@ -62,6 +105,18 @@ struct KVGroupPlan {
     int64_t     bytes_per_state = 0;   /* LINEAR/CONV: per sequence, every layer */
     int64_t     conv_slots = 0;        /* CONV: conv_width - 1 + n_spec */
     int64_t     window_blocks = 0;     /* WINDOW: the per-sequence block cap */
+    /* WINDOW: sequences may be given a runtime window (declare_runtime_window). Such a group is
+     * sized for the whole context plus one ring per sequence instead of being capped at
+     * window_blocks, its window is not snapshotted, and a sequence armed with one is bounded by
+     * its own reference + ring rather than by window_blocks. */
+    bool        runtime_win = false;
+    int64_t     runtime_tokens = 0;    /* the W set_window arms a sequence with */
+    /* The most ring blocks one sequence needs: ceil(W / block), the reference's fraction d of
+     * the ring's first block being frozen in it (see SeqWindow). */
+    int64_t ring_blocks_max() const {
+        return runtime_tokens > 0 && block_size > 0
+                   ? (runtime_tokens + block_size - 1) / block_size : 0;
+    }
     /* WINDOW: a checkpoint slot carries this group's window (has_window_snapshot). Set only for a
      * trunk group of a model with no linear state. A drafter's window is recomputed by draft
      * refill, and a model with linear state re-prefills a hit on a windowed trunk, so neither
@@ -206,8 +261,48 @@ public:
     /* Recycles a committed chunk's window blocks. ensure() keeps a chunk's blocks beside the
      * window and only the next ensure() recycles them, so a prefill waiting for its next chunk
      * would hold a whole chunk of blocks; several such prefills can exhaust the pool. The
-     * scheduler calls this when it advances n_computed, passing the new n_computed. */
+     * scheduler calls this when it advances n_computed, passing the new n_computed.
+     *
+     * A sequence with a runtime window retains its reference and rewrites its ring in place, so
+     * nothing below the floor may be recycled and this is a no-op for it. */
     void trim_window(uint64_t seq, int64_t keep_from);
+
+    /* ---------------- the runtime window (R-SWA; see SeqWindow) ---------------- */
+    /* Mark a WINDOW group as carrying per-sequence runtime windows of `window_tokens`. Call before
+     * plan_groups()/configure(): it changes the plan (the group is sized for the whole context
+     * plus one ring a sequence, its window is not snapshotted, and the ring joins the fixed
+     * costs), so a group declared after the plan is refused. A fixed-window group is untouched.
+     *
+     * A group that is not marked still accepts set_window() -- the caller then sizes the pool
+     * itself, e.g. by declaring the group's window as the whole context -- and each sequence's
+     * capacity is checked at set_window()/ensure() against the blocks actually carved. Once any
+     * group is marked, set_window() arms only marked groups: a plain fixed-window group beside a
+     * declared runtime window is refused, not silently converted (its pool is carved for the
+     * fixed window). */
+    int declare_runtime_window(int32_t group, int64_t window_tokens);
+
+    /* Give a sequence a runtime window with `visible_lo` (its prefill length, image tokens
+     * included) as the retained reference's end and a ring of `window_tokens` after it. Every
+     * paged WINDOW group of the sequence gets the same floor. Call it before the sequence's KV
+     * grows past `visible_lo` -- at admission, where the scheduler knows the prompt length -- so
+     * the reference is written linearly and no checkpoint can be reserved for it (a snapshot
+     * would describe a window the sequence no longer has).
+     *
+     * RAD_E_UNSUPPORTED  no windowed group, or the fixed/runtime-window mix above;
+     * RAD_E_INVAL        a negative floor or a window of 0;
+     * RAD_E_STATE        the sequence already holds tokens past the floor;
+     * RAD_E_FULL         the reference plus the ring exceeds what this group carved. */
+    int set_window(uint64_t seq, int64_t visible_lo, int64_t window_tokens);
+
+    /* The sequence's window in `group`, or false when it has none (a fixed-window group keeps
+     * KVGroupPlan::window_blocks and first_block_pos). The step batch maps a ring position with
+     * SeqWindow's rule; every other position maps as (pos - first_block_pos) / block_size. */
+    bool runtime_window(uint64_t seq, int32_t group, SeqWindow* out) const;
+    /* Whether any group has a runtime window set for the sequence. Prefix publish, checkpoint
+     * reservation and snapshots are skipped for it (see set_window). */
+    bool has_runtime_window(uint64_t seq) const;
+    /* The W declare_runtime_window gave the group, 0 if it carries no runtime windows. */
+    int64_t runtime_window_tokens(int32_t group) const;
 
     /* Adopt blocks a prefix-cache hit found. `n_tokens` must be a whole multiple of the group's
      * block size: a partial block is never shared, because the next token written into it would
@@ -363,7 +458,11 @@ public:
     /* The absolute token position block_table(seq, group)[0] covers: zero for a FULL group, the
      * recycled prefix for a WINDOW group. The slot mapping is (pos - first_block_pos) /
      * block_size; without the offset a sliding-window sequence writes to the wrong slot once it
-     * passes its window. */
+     * passes its window.
+     *
+     * A sequence with a runtime window (set_window) keeps 0 for the group's whole life: its table
+     * is [reference][ring] from position 0 and only the ring's slot index recycles (SeqWindow),
+     * so the mapping above holds for the reference and SeqWindow's rule for the ring. */
     int64_t first_block_pos(uint64_t seq, int32_t group) const;
 
     /* The first table entry changed since the last call; entries below it are unchanged, and
@@ -461,6 +560,9 @@ private:
      * for a windowed group. 0 for kUnboundedTokens, which is not a count. */
     int64_t zero_blocks(const KVGroupPlan& p, int64_t tokens) const;
     void forget();
+    /* Turns a WINDOW group into a runtime-window one (declare_runtime_window). Returns false for a
+     * group that is not windowed. */
+    bool apply_runtime_window(KVGroupPlan& p) const;
 
     /* One traversal serving both checkpoint directions; see checkpoint_save. */
     int checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t ck_slot, bool save,
@@ -471,6 +573,7 @@ private:
         int64_t  n_tokens = 0;
         std::vector<std::vector<int32_t>> blocks;   /* per group */
         std::vector<int64_t> first_block_pos;       /* WINDOW: token pos of blocks[0] */
+        std::vector<SeqWindow> win;                 /* per group: the runtime window, if any */
         std::vector<int32_t> state;                 /* per group, -1 when not stateful */
         /* Per group, the lowest table entry written since the batch builder last staged this
          * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
@@ -486,8 +589,12 @@ private:
     void drop_state(int32_t g, int32_t s);
     Seq* find(uint64_t seq);
     const Seq* find(uint64_t seq) const;
-    /* Recycle a WINDOW group's blocks no query at or past `keep_from` can read. */
+    /* Recycle a WINDOW group's blocks no query at or past `keep_from` can read. A runtime window
+     * (SeqWindow) is not trimmed: its reference must stay and its ring rewrites slots in place. */
     void recycle_window(Seq* s, int64_t keep_from);
+    /* The table length a runtime-windowed sequence needs to hold `n_tokens`: the reference's
+     * blocks, then the ring's up to its whole span. */
+    static int64_t window_table_len(const KVGroupPlan& p, const SeqWindow& w, int64_t n_tokens);
 
     std::vector<KVGroupPlan> plans_;
     std::vector<std::vector<int32_t>> free_blocks_;   /* per group */
@@ -515,6 +622,9 @@ private:
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */
     int64_t   ckpts_ = 0;      /* --checkpoint-slots, kept for the warning on a model with none */
     int64_t   tokens_cap_ = 0; /* cap_paged_tokens(): the least any rank can carve; 0 is none */
+    /* declare_runtime_window(): group -> W. Survives forget(), which plan_groups() calls at its
+     * start: it is a declaration about the program, not about a plan. */
+    std::unordered_map<int32_t, int64_t> runtime_decl_;
 
     /* ---- the loan (see the public block) ----
      *

@@ -153,6 +153,18 @@ struct FakeKV : IKVManager {
     }
     bool has_sequence(uint64_t id) const override { return seqs.count(id) != 0; }
 
+    /* A runtime window (KVManager::set_window) of `ring_w` tokens on group 1, which the scheduler
+     * arms every admitted sequence with; 0 declares none. Only the floor is recorded. */
+    int64_t ring_w = 0;
+    std::unordered_map<uint64_t, int64_t> ring_floor;
+    int64_t runtime_window_tokens(int32_t g) const override { return g == 1 ? ring_w : 0; }
+    int set_window(uint64_t id, int64_t lo, int64_t w) override {
+        if (ring_w <= 0 || w != ring_w || !seqs.count(id)) return RAD_E_UNSUPPORTED;
+        ring_floor[id] = lo;
+        return RAD_OK;
+    }
+    bool has_runtime_window(uint64_t id) const override { return ring_floor.count(id) != 0; }
+
     void free_sequence(uint64_t id) override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return;
@@ -166,6 +178,7 @@ struct FakeKV : IKVManager {
             }
         }
         seqs.erase(it);
+        ring_floor.erase(id);
     }
 
     int ensure(uint64_t id, int64_t n) override {
@@ -353,7 +366,14 @@ struct FakePC : IPrefixCache {
     }
 
     std::vector<uint64_t> restores;
-    void restore(const Request& r) override { restores.push_back(r.id); }
+    std::vector<bool> restores_whole;     /* each call's whole_only */
+    bool decline_whole = false;           /* a whole_only restore is declined */
+    RestoreResult restore_result = RestoreResult::Whole;   /* any other restore */
+    RestoreResult restore(const Request& r, bool whole_only) override {
+        restores.push_back(r.id);
+        restores_whole.push_back(whole_only);
+        return whole_only && decline_whole ? RestoreResult::Declined : restore_result;
+    }
 
     mutable int64_t lookups = 0;
     /* A cap (HitCap) as prefix.cpp applies one: attention ends at a block at or below it, the

@@ -12,8 +12,8 @@
 #   - The trunk's linears (attention q/gate, k, v and output, the delta net's qkv/z and output, the
 #     MLP's gate/up and down: the set Qwen's FP8 release quantises) as int8 with a bf16 scale per
 #     (row, 128 of K), each 128 of K rotated by the unnormalised Hadamard before rounding and the
-#     1/128 kept in the scale (`transform=fwht128`). gemm_nt_q reads them at i8a8h, each linear
-#     quantising its own input under the same rotation (had_quant_act_i8g). `clamp=sym` keeps the
+#     1/128 kept in the scale (`transform=fwht128`). gemm_nt_q reads them at i8a8h, against the
+#     input quantised under the same rotation (had_quant_act_i8g's rule). `clamp=sym` keeps the
 #     codes in -127..127, the range the int8 kernels are written for. Weight error 6.3e-3 relative.
 #   - The delta net's a/b projections, the norms, the embedding and the vision tower stay bf16, as
 #     in Qwen's FP8 release.

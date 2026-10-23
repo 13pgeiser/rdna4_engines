@@ -58,7 +58,7 @@ std::vector<Case> build_cases() {
         add("scale",         { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("softmax",     { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("gather_rows", { HI("M", 6), HI("n", 640), HS("dtype", dt) }, EB(6, 640, w, 2));
-        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid" })
+        for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" })
             add("act_mul", { HI("M", 6), HI("n", 645), HS("act", act), HS("dtype", dt) },
                 EB(6, 645, w, 3));
         add("mul_weight",  { HI("M", 9), HI("n", 645), HS("dtype", dt) }, EB(9, 645, w, 2));
@@ -378,6 +378,31 @@ std::vector<Case> build_cases() {
         for (int kw : { 3, 4 })
             add("attn_na3d", { HI("M", 64), HI("head_dim", 64), HI("kt", 3), HI("kh", 3),
                                HI("kw", kw), HS("dtype", dt) });
+    /* Unlimited-OCR's SAM tower: window 14 on a 16x16 grid (padded to 2x2 windows of 14x14), the
+     * same over a 14x21 grid (a partial window in both directions, and the padded rows take part in
+     * the softmax), an exact 14x14 multiple, window 7 (21x21 after padding), the global form on a
+     * square grid, and the global form on a non-square grid whose rel_pos tables must be resampled
+     * along their row axis. Two segments where the case is multi-segment, so a wrong cu walk shows.
+     * `n_seq` is not a schema parameter: libref's shape hook sizes cu from it (the harness hint
+     * convention, avx_cases.cpp's gdn cases). */
+    add("sam_attn", { HI("M", 256), HI("head_dim", 64), HI("n_head", 2), HI("grid_h", 16),
+                      HI("grid_w", 16), HI("window", 14), HF("scale", 0.125),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 588), HI("head_dim", 32), HI("n_head", 2), HI("grid_h", 14),
+                      HI("grid_w", 21), HI("window", 14), HF("scale", 0.17677669529663687),
+                      HS("dtype", "bf16"), HI("n_seq", 2) });
+    add("sam_attn", { HI("M", 196), HI("head_dim", 64), HI("n_head", 2), HI("grid_h", 14),
+                      HI("grid_w", 14), HI("window", 14), HF("scale", 0.125),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 256), HI("head_dim", 64), HI("n_head", 2), HI("grid_h", 16),
+                      HI("grid_w", 16), HI("window", 7), HF("scale", 0.125),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 256), HI("head_dim", 16), HI("n_head", 4), HI("grid_h", 16),
+                      HI("grid_w", 16), HI("window", 0), HF("scale", 0.25),
+                      HS("dtype", "bf16") });
+    add("sam_attn", { HI("M", 240), HI("head_dim", 32), HI("n_head", 2), HI("grid_h", 12),
+                      HI("grid_w", 20), HI("window", 0), HF("scale", 0.17677669529663687),
+                      HS("dtype", "bf16") });
     for (const char* dt : { "f32", "bf16" })
         add("seg_sinusoid", { HI("M", 30), HI("n", 64), HI("period", 13), HS("dtype", dt) });
     /* Gemma 4's audio attention: left 12, over segments longer than the window. */
@@ -565,6 +590,18 @@ std::vector<Case> build_cases() {
                              HS("dtype", dt) });
         add("router_topk", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2), HI("norm", 0),
                              HS("dtype", dt) });
+        /* The pair and the pair behind the router GEMM: the whole-model form and a rank's slice
+         * with a nonzero expert base, since the sort's slicing is the part the fuse adds. */
+        add("router_topk_scatter", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2),
+                                     HI("norm", 1), HS("dtype", dt) });
+        add("router_topk_scatter", { HI("M", 9), HI("n_expert", 8), HI("n_local", 4),
+                                     HI("top_k", 2), HI("norm", 0), HI("expert_base", 2),
+                                     HS("dtype", dt) });
+        add("router_gemm_topk_scatter", { HI("M", 9), HI("K", 128), HI("n_expert", 8),
+                                          HI("top_k", 2), HI("norm", 0), HS("dtype", dt) });
+        add("router_gemm_topk_scatter", { HI("M", 9), HI("K", 128), HI("n_expert", 8),
+                                          HI("n_local", 4), HI("top_k", 2), HI("norm", 1),
+                                          HI("expert_base", 2), HS("dtype", dt) });
         add("moe_gather",  { HI("M", 9), HI("n", 128), HI("top_k", 2), HS("dtype", dt) });
         /* The shared-expert fold: `shared`/`shared_gate` are always described, so always
          * present; this case uses sigmoid, the one above "none". */
@@ -657,8 +694,8 @@ std::vector<Case> build_cases() {
 
     /* Sampling. n_vocab 517 exceeds every vector width and is not a multiple of any; n_cand 12 is
      * a realistic candidate set after top-k. */
-    for (const char* op : { "sample_penalties", "sample_dry", "sample_temp", "sample_mask",
-                            "sample_argmax" })
+    for (const char* op : { "sample_penalties", "sample_dry", "sample_ngram_ban", "sample_temp",
+                            "sample_mask", "sample_argmax" })
         add(op, { HI("M", 5), HI("n_vocab", 517) });
     add("sample_topk", { HI("M", 5), HI("n_vocab", 517), HI("vocab_off", 0) });
     /* k 7 and 20 (OpenAI's top_logprobs bound) against 517 columns; the offset case checks that
@@ -907,7 +944,6 @@ std::vector<Case> build_cases() {
         add("s2d3d", { HI("M", 64), HI("C", 6), HI("st", 2), HI("sh", 2), HI("sw", 2),
                        HI("group", 4), HS("mode", "mean"), HI("add", 1), HS("dtype", dt) });
         add("pix_patch", { HI("M", 12), HI("p", 4), HI("C", 3), HS("dtype", dt) });
-        add("patch_pix8", { HI("M", 12), HI("p", 4), HI("C", 3), HS("dtype", dt) });
         add("stft_logmel", { HI("M", 6), HI("hop", 80), HI("nfft", 512), HI("n_mel", 64),
                              HI("ch", 2), HS("dtype", dt) });
         add("bwe_up", { HI("M", 600), HI("ratio", 3), HI("ch", 2), HS("dtype", dt) });

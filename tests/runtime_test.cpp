@@ -10,6 +10,7 @@
  * host blocks (rad_dev_host_blocks).
  */
 #include "rad_test.h"
+#include "host_kargs_main.h"
 
 #include "device/device.h"
 #include "runtime/arena.h"
@@ -484,6 +485,51 @@ TEST(pending_weight_waits_on_the_stream_not_the_host) {
         CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
     }));
     CHECK_EQ(f.ctx.stream_waits(), (int64_t)2);
+
+    f.ctx.shutdown();
+    rad_event_destroy(moving);
+}
+
+/* A stream wait orders only the stream it is put on, so each lane that reads a weight in flight
+ * waits for it once: lane 0 reading a weight lane 1 already waited on must not run ahead of the
+ * copy. */
+TEST(a_pending_weight_is_waited_on_by_each_lane_that_reads_it) {
+    Fixture f;
+    rad_weight w = f.add_weight("blk.0.dense.w", RAD_BF16, 8, 4, g_weight_bytes);
+    rad_buf    x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf    y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op op = f.add_op("gemm_nt", "M", { 8192 }, { k_pre }, { "prefill" }, &g_gemm_schema, { w });
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    rad::WeightSlot& slot = res.slot[(size_t)w];
+    RadEvent moving = nullptr;
+    CHECK_OK(rad_event_create(&moving));
+    slot.ptr        = g_moved_bytes;
+    slot.ready      = moving;
+    slot.generation = 1;
+
+    CHECK_OK(f.start(&res));
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));   /* lane 0 again: already ordered */
+    }));
+    CHECK_EQ(f.ctx.stream_waits(), (int64_t)2);
+
+    /* A new transfer re-arms the wait on both lanes. */
+    slot.generation = 2;
+    CHECK_OK(f.step(4, 1, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(1));
+        CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        CHECK_OK(c.set_lane(0));
+    }));
+    CHECK_EQ(f.ctx.stream_waits(), (int64_t)4);
 
     f.ctx.shutdown();
     rad_event_destroy(moving);
@@ -1903,7 +1949,7 @@ TEST(a_lane_built_mid_step_starts_behind_lane_zero) {
 }
 
 /* A calibration tap's gram_accum sums across passes while its plugin counts the summed rows in
- * step; a played pass reissues the sum without calling step (#122). A program holding one records
+ * step; a played pass reissues the sum without calling step. A program holding one records
  * no passes; one without records them wherever the backend can. */
 TEST(a_program_with_a_calibration_tap_records_no_passes) {
     {
@@ -2225,4 +2271,4 @@ TEST(repeat_mode_flags_a_kernel_that_is_not_a_function_of_its_inputs) {
     CHECK(has(good.log, "1 issue(s) run twice, 0 of them answered differently"));
 }
 
-RAD_TEST_MAIN()
+RAD_TEST_MAIN_HOST_KARGS()

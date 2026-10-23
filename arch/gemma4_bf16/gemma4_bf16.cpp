@@ -8,11 +8,11 @@
  * norm on the value, and a GELU (not SwiGLU) feed-forward. The final logits are soft-capped to
  * cap * tanh(x / cap).
  *
- * Two draft models, whichever the container carries under `draft.`: Google's assistant head (a
- * serial head over the trunk's own cache, the Gemma4Head below) or z-lab's DFlash drafter (a
+ * Three draft models, whichever the container carries under `draft.`: Google's assistant head (a
+ * serial head over the trunk's own cache, the Gemma4Head below), z-lab's DFlash drafter (a
  * five-layer block drafter with its own cache, reading the trunk's residual stream at six layers,
- * arch/common/rad_gemma4_dflash.h) -- the 31B's z-lab/gemma-4-31B-it-DFlash proposes 15 tokens a
- * pass where the assistant proposes one a round.
+ * arch/common/rad_gemma4_dflash.h; 15 tokens a pass on the 31B), or a DFlash2 drafter such as
+ * RedHatAI's gemma-4-31B-it-speculator.dflash2 (arch/common/rad_block_dflash2.h; 7 a pass).
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_vision.h>
@@ -869,43 +869,24 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
 /* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
  * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). With
  * `res` null it is the plain norm of `x`, the first block's entry. */
-/* The four-rank fold's band. libr4d's exact all-reduce is a one-shot up to this many elements
- * (R4D_AR_WIDE_ONESHOT_MAX_ELEMS) and a two-shot above, and the fused junction at four ranks is
- * that one-shot with the junction as its epilogue: three times the message per rank on the link,
- * which pays at decode heights and not at a prefill's. So at four ranks op_ar serves the rows a
- * one-shot would, 97 at 5376, and a taller step issues the all-reduce and the junction apart.
- *
- * Within that band the fold pays only at the bottom. On 4x R9700 (2026-10-17, same image) a plain
- * decode step (1 row) ran 5.6% slower without it (89 against 94 tok/s), and a DFlash verify
- * (16 rows) 9% faster (300 against 276): at 16 rows the standalone all-reduce is the exact
- * two-shot, while the fold's one block a row each takes a fenced handshake. The per-row costs
- * cross near 4-5 rows. From 5 rows libr4d's four-rank row takes its tail form instead (axis
- * `tail`): the standalone two-shot with the junction run after it in the same launch, behind a
- * card-local count, so the junction costs neither a handshake nor a launch. With it a DFlash2
- * verify (8 rows) folds and gains ~1% (348 / 258 / 187 / 516 against 345 / 255 / 185 / 511 tok/s,
- * code / prose / story / long, 4x R9700; replies identical), where the one-shot fold there lost
- * 6%. So the fold serves up to kAr4FoldRows rows, a z-lab DFlash verify's 16 included, and a
- * taller step issues the pair. */
-static constexpr int64_t kArOneShotElems = 524288;
+/* The four-rank fold's band. libr4d's four-rank row serves it in three forms, all byte-identical
+ * to all_reduce + rmsnorm_quant_i8. Up to 4 rows it is the exact one-shot with the junction as its
+ * epilogue: three times the message per rank and one fenced handshake a row, which wins at one row
+ * (plain decode about 5% faster on 4x R9700) and loses to the standalone two-shot by 16. From 5
+ * rows it is that two-shot with the junction as its tail (axis `tail`), behind a card-local count,
+ * so the junction costs neither a handshake nor a launch. Above kAr4FoldRows a step issues the
+ * pair. */
 static constexpr int64_t kAr4FoldRows = 16;
-/* From kArSpMinRows rows to the same band's top, libr4d's four-rank row takes `sp` instead: the
- * all-reduce split around the junction. Each rank reduces only the rows it owns (a quarter, in
- * rank order), runs the junction on them and gathers the int8 codes the next GEMM reads, so the
- * second hop carries a byte a column instead of two and the junction a quarter of the rows. The
- * fold and the sums are the whole form's, so q and the scales are byte for byte the same; the
- * residual stream then holds this rank's rows only, which is all the next junction reads. A
- * junction whose stream anything else reads next asks for the residual on every row too (sp 2):
+/* From kArSpMinRows rows to kArSpMaxRows, libr4d's four-rank row takes `sp`: the all-reduce split
+ * around the junction. Each rank reduces only the rows it owns (a quarter, in rank order), runs the
+ * junction on them and gathers the int8 codes the next GEMM reads, so the second hop carries a byte
+ * a column instead of two and the junction runs on a quarter of the rows. q and the scales are
+ * the whole form's bytes; the residual stream then holds this rank's rows only, which is all the
+ * next junction reads. A junction whose stream anything else reads next asks for every row (sp 2):
  * the layers the drafter taps, and the last layer's attention junction, since that layer's
- * feed-forward closes with its own all-reduce, post-norm and add over every row. One launch at a
- * time on 4x R9700 (2026-10-19): 19.8 against 21.9 us at 4 rows of 5376 (the one-shot fold), 22.9
- * against 24.5 at 8 and 30.8 against 34.9 at 16 (the tail), 72.3 against 89.2 at 64. Below 4 rows
- * a rank would idle (31.7 against 18.7 us at one).
- *
- * In the engine it pays only where it replaces the fold: a DFlash2 verify (8 rows) ran 402 / 297 /
- * 216 / 603 tok/s code / prose / story / long against 392 / 290 / 210 / 585, replies identical,
- * but steps of 24-64 rows, where the pair runs instead, lost ~10% under load (4 users 588 against
- * 698 aggregate, 8 users 781 against 867; 12 users even; 4x R9700, 2026-10-19). So it serves to
- * kArSpMaxRows, the fold's band, within the one-shot's. */
+ * feed-forward closes with its own all-reduce, post-norm and add over every row. Below 4 rows a
+ * rank would idle (on 4x R9700, 31.7 against 18.7 us at one row); at 24-64 rows, where the pair
+ * runs, the split form lost about 10% of aggregate throughput under load. */
 static constexpr int64_t kArSpMinRows = 4;
 static constexpr int64_t kArSpMaxRows = 16;
 
@@ -941,11 +922,10 @@ struct G4Junction {
         rad_op_writes(b, op, wr, res ? 3 : 2);
         /* With the all-reduce in front, at two or four ranks on the exact wire: `x` is then a
          * rank's partial sum of a column-sharded linear. With the lossy wire allowed, the
-         * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold is
-         * the one-shot's and serves only its band (kArOneShotElems, kAr4FoldRows). */
+         * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold
+         * serves steps of up to kAr4FoldRows rows. */
         const bool four = g.world == 4;
-        const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd))
-                                : g.max_tok;
+        const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, g.max_tok) : g.max_tok;
         if (res && g.wire_exact && (g.world == 2 || four) && hi >= 1 &&
             rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
             const RadParam pa[] = { RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
@@ -960,8 +940,7 @@ struct G4Junction {
             }
             /* The split form from kArSpMinRows to kArSpMaxRows rows. It needs the post-norm, as
              * every trunk junction past the first has; `x` is declared written, as the fold's. */
-            const int64_t top = std::min<int64_t>(
-                std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd), kArSpMaxRows);
+            const int64_t top = std::min<int64_t>(g.max_tok, kArSpMaxRows);
             if (op_ar && four && wp && top >= kArSpMinRows) {
                 const RadParam ps[] = { RAD_RANGE("M", 1, top), RAD_INT("n", g.n_embd),
                                         RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
@@ -1959,9 +1938,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         /* The tap: a row copy of the layer's output (after the scalar, HF's hidden_states[l + 1])
          * into the column slice the tap owns. It is declared here, in the layer it is issued
-         * after, because the buffer planner's liveness is declaration order. A tap declared once
-         * after the trunk made `dflash_src` look born at its end and free to share with what every
-         * layer writes, which on arch/gemma4 cost 98% of the drafts with the reply still fluent. */
+         * after, because the buffer planner's liveness is declaration order. Declared after the
+         * trunk, `dflash_src` would look born at its end and free to share with what every layer
+         * writes: the drafts would fail while the reply stays fluent. */
         for (int t = 0; t < m.n_taps; ++t)
             if (m.tap_layer[t] == (int)l && !lay.op_tap)
                 lay.op_tap = rw(b, RAD_OP(b, "cast",
@@ -2019,8 +1998,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * attention block's all-reduce and the next layer's q|k|v's (q alone, unfused; after the last
      * layer, the lm_head's) beside the feed-forward's (gemma4::kPrefetchBytes), then down_proj's
      * first 9 MB beside the attention (gemma4::kPrefetchDownBytes). Only at more than one rank,
-     * where there are reductions to sit beside. RADIANCE_PREFETCH=0 declares none
-     * (decl_prefetch). */
+     * where there are reductions to sit beside. */
     if (g.world > 1 && rad_op_declared(b, "prefetch")) {
         for (size_t l = 0; l < m.layers.size(); ++l) {
             Layer& lay = m.layers[l];
@@ -2046,9 +2024,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the bits it gives the whole. The buffer the second lane reduces in place is taken out of the
      * arena's sharing, which the runtime asks of every buffer a second lane touches; it lives
      * across the whole trunk already. */
-    const char* ov = std::getenv("RADIANCE_GEMMA4_OVERLAP");   /* 0: every step whole */
-    const bool ov_off = ov && !std::strcmp(ov, "0");
-    m.overlap = !ov_off && g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
+    m.overlap = g.world > 1 && g.wire_exact && m.fuse && g.max_tok >= 2 * kOverlapRows;
     for (const Layer& lay : m.layers)
         m.overlap = m.overlap && lay.attn.op_ar && lay.mlp.op_ar;
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
@@ -2081,11 +2057,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * feed-forward reduction only slice A's junction and q|k|v. Per slice (A's projection,
      * prologue, attention and o_proj, then B's), each of the four reductions sits beside a whole
      * block: on 4x R9700 the exact two-shot of a 1024-row slice takes ~1.05 ms alone and ~1.4x
-     * that beside any card-filling compute (a four-card microbenchmark, 2026-10-18). Slice A's
-     * attention reads its context end from kv_len_trim, one a KV group. A one-sequence step only
-     * (the slices' rows are then one sequence's), with the one-launch prologue and no
-     * multi-component rotary. Byte-identical: every greedy reply matches the whole attention's
-     * (4x R9700, two rounds, and 16 of 16 fresh starts on a 5310-token prompt); prefill +5%. */
+     * that beside card-filling compute, so the reductions want whole blocks to hide behind. Slice
+     * A's attention reads its context end from kv_len_trim, one a KV group. A one-sequence step
+     * only (the slices' rows are then one sequence's), with the one-launch prologue and no
+     * multi-component rotary. A slice's attention rows see exactly the keys they see in the whole
+     * step, so the output is the whole attention's byte for byte. */
     if (m.overlap) {
         bool ok = !g.rope_mc && rad_op_declared(b, "kv_len_trim");
         for (const Layer& lay : m.layers) ok = ok && lay.attn.slicable();
@@ -2220,8 +2196,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      (long long)(2 * kOverlapRows));
         else
             rad_note(b, "prefill overlap: off (%s)",
-                     ov_off        ? "RADIANCE_GEMMA4_OVERLAP=0"
-                     : !g.wire_exact ? "the lossy all-reduce wire"
+                     !g.wire_exact ? "the lossy all-reduce wire"
                      : !m.fuse     ? "the residual junctions are not fused"
                                    : "a step holds fewer than two slices");
     }
@@ -2521,7 +2496,7 @@ RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
                 "Gemma 4 dense (text and images), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "
                 "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
-                "logits; Google's assistant head or z-lab's DFlash drafter")
+                "logits; Google's assistant head, z-lab's DFlash drafter or a DFlash2 drafter")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
 RAD_ARCH_PROBE(gemma4_bf16)
 #endif

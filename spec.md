@@ -363,8 +363,9 @@ zero, so `auto` resolves to 0.
 divided, §9); the deployment's bounds `max_tok`, `max_seqs`, `max_ctx`, `max_spec`,
 `max_enc_patches` and `max_audio_frames`, so buffers are sized for the worst step; the
 tensor-parallel wire choice `tp_wire_lossy` and its `tp_wire_min_bytes` cutover (§9); `kv_dtype`;
-`shape_probe` (§3.1); and `is_draft` / `scope`, which say whether this builder scope is the model,
-a drafter or an encoder.
+`attn_prefill_fp8`, the attention products the deployment accepts in e4m3 (`attn_paged`'s
+`prefill_fp8`, docs/OPS.md); `shape_probe` (§3.1); and `is_draft` / `scope`, which say whether this
+builder scope is the model, a drafter or an encoder.
 
 ---
 

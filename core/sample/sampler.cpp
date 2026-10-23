@@ -178,6 +178,12 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
     /* One byte per history token, nonzero where the token is a whole DRY sequence breaker (never
      * penalised). Resolved on the host, which has the vocabulary. */
     buf_brk_    = decl("sampler.dry_breakers", RAD_U8, rows, cfg_.max_hist, RAD_BUF_PERSIST);
+    /* The n-gram ban's per-row {n-gram length, window}. Its own tiny plane because the params row
+     * is the fixed RadSampleParams wire format every sampler op shares. */
+    buf_ngram_  = decl("sampler.ngram", RAD_I32, rows, 2, RAD_BUF_PERSIST);
+    /* The ban's whitelist bitmask, this rank's shard, shaped like the mask plane: a SET bit
+     * exempts that column. The ban op indexes it by the sampled row, not by mask_row. */
+    buf_ngram_wl_ = decl("sampler.ngram_wl", RAD_U32, rows, mask_words_, RAD_BUF_PERSIST);
     buf_mask_   = decl("sampler.mask", RAD_U32, rows, mask_words_, RAD_BUF_PERSIST);
     buf_cand_i_ = decl("sampler.cand_idx", RAD_I32, rows, ncand, RAD_BUF_TRANSIENT);
     buf_cand_v_ = decl("sampler.cand_val", RAD_F32, rows, ncand, RAD_BUF_TRANSIENT);
@@ -197,7 +203,8 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         buf_lp_g_ = decl("sampler.logprobs_gathered", RAD_F32, rows,
                          lp_width() * cfg_.world_size, RAD_BUF_PERSIST);
 
-    if (!buf_params_ || !buf_params_late_ || !buf_hist_ || !buf_brk_ || !buf_mask_ ||
+    if (!buf_params_ || !buf_params_late_ || !buf_hist_ || !buf_brk_ || !buf_ngram_ ||
+        !buf_ngram_wl_ || !buf_mask_ ||
         !buf_cand_i_ || !buf_cand_v_ || !buf_lp_ ||
         (vocab_parallel() && (!buf_pairs_ || !buf_gather_ || !buf_lp_g_))) {
         RAD_ERR("sampler: a staging buffer failed to declare");
@@ -239,6 +246,7 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     op_penalties_ = op_vocab_off("sample_penalties");
     op_dry_       = op_vocab_off("sample_dry");
+    op_ngram_ban_ = op_vocab_off("sample_ngram_ban");
     op_temp_      = op_vocab("sample_temp");
     op_mask_      = op_vocab("sample_mask");
     op_topk_      = op_vocab_off("sample_topk");
@@ -320,6 +328,8 @@ int Sampler::stage_alloc() {
     greedy_ready_ = false;
     hist_stage_   = (int32_t*)rad_dev_alloc(rows * cfg_.max_hist * 4, RAD_MEM_HOST_PINNED);
     brk_stage_    = (uint8_t*)rad_dev_alloc(rows * cfg_.max_hist, RAD_MEM_HOST_PINNED);
+    ngram_stage_  = (int32_t*)rad_dev_alloc(rows * 2 * 4, RAD_MEM_HOST_PINNED);
+    ngram_wl_stage_ = (uint32_t*)rad_dev_alloc(rows * mask_words_ * 4, RAD_MEM_HOST_PINNED);
     mask_stage_   = (uint32_t*)rad_dev_alloc(rows * mask_words_ * 4, RAD_MEM_HOST_PINNED);
 
     /* Logprobs readback; only rank 0 reads it. */
@@ -337,10 +347,10 @@ int Sampler::stage_alloc() {
     }
 
     if (!params_stage_ || !greedy_stage_ || !late_stage_ || !hist_stage_ || !brk_stage_ ||
-        !mask_stage_) {
+        !ngram_stage_ || !ngram_wl_stage_ || !mask_stage_) {
         RAD_ERR("sampler: could not pin %s of staging",
                 humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
-                               mask_words_ * 4)).c_str());
+                               mask_words_ * 8 + 8)).c_str());
         stage_free();
         return RAD_E_NOMEM;
     }
@@ -353,6 +363,8 @@ void Sampler::stage_free() {
     if (late_stage_)   rad_dev_free(late_stage_,   RAD_MEM_HOST_PINNED);
     if (hist_stage_)   rad_dev_free(hist_stage_,   RAD_MEM_HOST_PINNED);
     if (brk_stage_)    rad_dev_free(brk_stage_,    RAD_MEM_HOST_PINNED);
+    if (ngram_stage_)    rad_dev_free(ngram_stage_,    RAD_MEM_HOST_PINNED);
+    if (ngram_wl_stage_) rad_dev_free(ngram_wl_stage_, RAD_MEM_HOST_PINNED);
     if (mask_stage_)   rad_dev_free(mask_stage_,   RAD_MEM_HOST_PINNED);
     if (lp_host_)      rad_dev_free(lp_host_,      RAD_MEM_HOST_PINNED);
     if (lp_ci_host_)   rad_dev_free(lp_ci_host_,   RAD_MEM_HOST_PINNED);
@@ -366,6 +378,8 @@ void Sampler::stage_free() {
     cur_stage_    = nullptr;
     hist_stage_   = nullptr;
     brk_stage_    = nullptr;
+    ngram_stage_    = nullptr;
+    ngram_wl_stage_ = nullptr;
     mask_stage_   = nullptr;
 }
 
@@ -373,9 +387,9 @@ Sampler::~Sampler() { stage_free(); }
 
 /* ================================================================== admission */
 
-/* Whether the two history stages run, shared by admission, request setup and step staging so
- * they agree. As in llama.cpp, a window of 0 turns a stage off and DRY needs a base >= 1. DRY
- * also requires a positive multiplier; a negative one would reward repetition. */
+/* Whether the history stages run, shared by admission, request setup and step staging so they
+ * agree. As in llama.cpp, a window of 0 turns a stage off and DRY needs a base >= 1. DRY also
+ * requires a positive multiplier; a negative one would reward repetition. */
 static bool penalties_on(const SamplingParams& sp) {
     return sp.penalty_last_n != 0 &&
            (sp.rep_penalty != 1.0f || sp.freq_penalty != 0.0f || sp.pres_penalty != 0.0f);
@@ -383,6 +397,14 @@ static bool penalties_on(const SamplingParams& sp) {
 
 static bool dry_on(const SamplingParams& sp) {
     return sp.dry_multiplier > 0.0f && sp.dry_base >= 1.0f && sp.dry_penalty_last_n != 0;
+}
+
+/* The windowed no-repeat-ngram ban: n-gram length 0 is off (the request default). A window <= 0
+ * is legal and means the whole staged history, the un-windowed processor; it is not a separate
+ * switch, because the reference's windowed form is what the model ships and a ban with no window
+ * is still a ban. */
+static bool ngram_ban_on(const SamplingParams& sp) {
+    return sp.ngram_ban_n > 0;
 }
 
 int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
@@ -418,6 +440,12 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     /* The DRY kernels read an allowed length below 1 as 2; refused rather than rewritten. */
     if (dry_on(sp) && sp.dry_allowed_length < 1)
         return refuse("dry_allowed_length must be >= 1", RAD_E_INVAL);
+    /* The n-gram ban: an n-gram shorter than 2 is a single-token ban, which the reference defines
+     * (an empty prefix) and this chain implements, so 1 is accepted. A negative n or window has no
+     * meaning; window 0 is the whole staged history. */
+    if (sp.ngram_ban_n < 0)  return refuse("ngram_ban_n is negative", RAD_E_INVAL);
+    if (sp.ngram_window < 0)
+        return refuse("ngram_window is negative (0 searches the whole history)", RAD_E_INVAL);
     if (sp.n_probs > RAD_MAX_LOGPROBS) {
         if (why) *why = "at most " + std::to_string(RAD_MAX_LOGPROBS) +
                         " logprobs alternatives may be asked for";
@@ -457,6 +485,7 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
     if (!missing) missing = need(!sp.greedy() && sp.temp_last, op_temp_late_,
                                  "sample_temp (over the candidates, for temperature last)");
     if (!missing) missing = need(dry_on(sp), op_dry_, "sample_dry");
+    if (!missing) missing = need(ngram_ban_on(sp), op_ngram_ban_, "sample_ngram_ban");
     if (!missing) missing = need(!sp.grammar.empty() || sp.thinking_budget >= 0, op_mask_,
                                  "sample_mask");
     if (!missing) missing = need(penalties_on(sp), op_penalties_, "sample_penalties");
@@ -581,6 +610,8 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
     n_seq_ = 0;
     any_brk_ = false;
     any_late_ = false;
+    any_ngram_ = false;
+    any_ngram_wl_ = false;
     cur_stage_ = params_stage_;
     lp_rows_.clear();
 
@@ -635,6 +666,7 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
         const int64_t n_total  = n_prompt + n_out;
         const bool    pen      = penalties_on(sp);
         const bool    dry      = dry_on(sp);
+        const bool    ngram    = ngram_ban_on(sp);
 
         auto it = seqs_.find(r->id);
         SeqState* st = it == seqs_.end() ? nullptr : &it->second;
@@ -695,6 +727,26 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
             p.dry_penalty_last_n = sp.dry_penalty_last_n;
             p.mask_row = -1;
 
+            /* The n-gram ban's pair, staged for every row so a row that turns it off cannot inherit
+             * its predecessor's values. */
+            ngram_stage_[2 * row]     = (int32_t)sp.ngram_ban_n;
+            ngram_stage_[2 * row + 1] = (int32_t)sp.ngram_window;
+
+            /* The ban's whitelist, cut to this rank's shard like the grammar mask (shard_mask):
+             * global ids outside it exempt nothing here. Every row that runs the ban gets its
+             * words freshly written -- the plane is uploaded whole with the ban, so a row must
+             * never read another request's stale exemptions. */
+            if (ngram) {
+                uint32_t* w = ngram_wl_stage_ + row * mask_words_;
+                std::memset(w, 0, (size_t)mask_words_ * 4);
+                for (int32_t id : sp.ngram_whitelist) {
+                    const int64_t at = (int64_t)id - cfg_.vocab_off;
+                    if (at < 0 || at >= cfg_.n_vocab_local) continue;
+                    w[at >> 5] |= 1u << (uint32_t)(at & 31);
+                    any_ngram_wl_ = true;
+                }
+            }
+
             /* Greedy over a split vocabulary is a top-1 chain row, not an argmax: sample_argmax
              * writes a column of this rank's shard, not a token id. Top-k plus the merge produce
              * global ids, and the pick over one candidate is deterministic. A greedy row asking
@@ -723,12 +775,14 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
                 any_late_ = true;
             }
 
-            /* History for the penalties and DRY, staged only for rows that run one of them:
-             * prompt, output so far and, at draft position k, the k drafts before it (they are
-             * emitted only if accepted, as one token at a time). Oldest first, truncated to
+            /* History for the penalties, DRY and the n-gram ban, staged only for rows that run one
+             * of them: prompt, output so far and, at draft position k, the k drafts before it (they
+             * are emitted only if accepted, as one token at a time). Oldest first, truncated to
              * max_hist; penalty_last_n still decides how much counts. Each row owns its row of the
-             * plane, so hist_off stays 0. */
-            if (pen || dry) {
+             * plane, so hist_off stays 0. The n-gram ban's own window is `ngram_window`, applied to
+             * this span, so the reference's update order holds at a verify: position k sees the
+             * drafts before it, as the processor would after emitting them. */
+            if (pen || dry || ngram) {
                 const int64_t len  = n_total + k;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
@@ -741,6 +795,9 @@ int Sampler::build_step(const std::vector<Request*>& reqs) {
                 p.hist_len = (int32_t)take;
                 if (pen) p.flags |= RAD_SP_PENALTY;
                 if (dry && stage_dry(p, h, take, brk, row)) p.flags |= RAD_SP_DRY;
+                /* A row whose history is shorter than its n-gram has nothing to ban (the reference
+                 * skips it too), so the op is issued only when some row has a full n-gram. */
+                if (ngram && take >= sp.ngram_ban_n) any_ngram_ = true;
             }
 
             if (gr && !dead && gr->constrains()) {
@@ -881,7 +938,16 @@ int Sampler::build_greedy(int64_t n) {
     n_seq_ = n;
     any_brk_ = false;
     any_late_ = false;
+    any_ngram_ = false;
+    any_ngram_wl_ = false;
     cur_stage_ = greedy_stage_;
+    /* A drafter's rows run the argmax only, so the n-gram plane is cleared: `run` reads it from
+     * the staging, and a stale pair from an earlier request's build must not issue the ban over
+     * history that was not staged this step. The exemption plane needs no clear: `run` uploads
+     * it only beside an issued ban, every row that runs the ban has its words rewritten in full
+     * by the build that staged the pair (build_step), and rows below a zeroed pair are skipped
+     * by the op before they read a word. */
+    std::memset(ngram_stage_, 0, (size_t)cap * 2 * sizeof(int32_t));
     if (greedy_ready_) return RAD_OK;
     for (int64_t i = 0; i < cap; ++i) {
         DeviceSampleParams& p = greedy_stage_[i];
@@ -904,7 +970,7 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadStream s = rad_stream(c);
 
     bool any_mask = false, any_greedy = false, any_chain = false;
-    bool any_penalty = false, any_dry = false, any_xtc = false;
+    bool any_penalty = false, any_dry = false, any_xtc = false, any_ngram = false;
     bool any_topp = false, any_minp = false, any_typ = false, any_temp = false;
     for (int64_t i = 0; i < n_seq_; ++i) {
         const DeviceSampleParams& p = cur_stage_[i];
@@ -912,6 +978,11 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         any_penalty |= (p.flags & RAD_SP_PENALTY) != 0;
         any_dry     |= (p.flags & RAD_SP_DRY)     != 0;
         any_xtc     |= (p.flags & RAD_SP_XTC)     != 0;
+        /* The pair plane is read directly, not through cur_stage_: it is per-step staging the
+         * LAST builder filled (build_step writes a row's pair, build_greedy zeroes every pair),
+         * so it agrees with cur_stage_ by builder contract. A new builder must keep that
+         * contract: stage the pair with the params, zero it with the greedy ones. */
+        any_ngram   |= ngram_stage_[2 * i] > 0;
         if (p.flags & RAD_SP_GREEDY) any_greedy = true;
         else {
             any_chain = true;
@@ -941,13 +1012,21 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (late)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_params_late_), late_stage_,
                                  n_seq_ * (int64_t)sizeof(DeviceSampleParams), s));
-    if (any_penalty || any_dry)
+    if (any_penalty || any_dry || any_ngram)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_hist_), hist_stage_,
                                  n_seq_ * cfg_.max_hist * 4, s));
     const bool pass_brk = any_dry && any_brk_;
     if (pass_brk)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_brk_), brk_stage_,
                                  n_seq_ * cfg_.max_hist, s));
+    /* The ban's whitelist rides with the ban, and only a row that runs the ban reads it. */
+    const bool pass_wl = any_ngram && any_ngram_wl_;
+    if (any_ngram)
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_ngram_), ngram_stage_,
+                                 n_seq_ * 2 * (int64_t)sizeof(int32_t), s));
+    if (pass_wl)
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_ngram_wl_), ngram_wl_stage_,
+                                 n_seq_ * mask_words_ * 4, s));
     if (any_mask)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_mask_), mask_stage_,
                                  n_seq_ * mask_words_ * 4, s));
@@ -956,6 +1035,8 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadOperand o_params = opd_rows(buf_params_, n_seq_);
     const RadOperand o_hist = opd_rows(buf_hist_, n_seq_);
     const RadOperand o_brk = opd_rows(buf_brk_, n_seq_);
+    const RadOperand o_ngram = opd_rows(buf_ngram_, n_seq_);
+    const RadOperand o_ngram_wl = opd_rows(buf_ngram_wl_, n_seq_);
     const RadOperand o_mask = opd_rows(buf_mask_, n_seq_);
     const RadOperand o_ci = opd_rows(buf_cand_i_, n_seq_);
     const RadOperand o_cv = opd_rows(buf_cand_v_, n_seq_);
@@ -982,6 +1063,17 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (any_penalty) RAD_TRY(issue(op_penalties_, { o_logits, o_params, o_hist }));
     if (any_dry)
         RAD_TRY(issue(op_dry_, { o_logits, o_params, o_hist, pass_brk ? o_brk : opd_none() }));
+
+    /* The windowed no-repeat-ngram ban (Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor),
+     * after the penalties and before every cut: a banned logit is -infinity for the greedy argmax
+     * below as well as for the chain, which is the reference processor's effect on the
+     * distribution. Off (the default) the op is not issued at all, so a request without it
+     * samples exactly as before. */
+    /* The whitelist operand is passed only when some staged row carries exemptions; absent
+     * means nothing is exempt, the reference's empty whitelist and the bit-identical default. */
+    if (any_ngram)
+        RAD_TRY(issue(op_ngram_ban_, { o_logits, o_params, o_hist, o_ngram,
+                                       pass_wl ? o_ngram_wl : opd_none() }));
 
     /* Greedy rows take the argmax after penalties and the mask. In a mixed batch both the argmax
      * and the chain run over the whole batch: the argmax writes every row, then the candidate

@@ -6,6 +6,7 @@
  * execution produce wrong bytes, not just odd timestamps, and run each race several times.
  */
 #include "rad_test.h"
+#include "host_kargs_main.h"
 
 #include "rad_internal.h"
 #include "device/aql.h"
@@ -118,6 +119,19 @@ TEST(backend_reports_itself) {
     CHECK(rad_dev_props(n, &p) < 0);
     CHECK(rad_dev_set(-1) < 0);
     CHECK_OK(rad_dev_set(0));
+}
+
+/* Chained launches are on only where the engine says the model's plugin measured a gain with its
+ * drafter (rad_dev_chain_infer) and the backend is AQL, which writes the record a chained form
+ * reads: on the host backend a plugin's ask leaves them off. Ends with them off again. */
+TEST(chained_launches_follow_the_plugins_ask_on_the_aql_backend_only) {
+    const bool aql = std::strcmp(rad::device_backend_name(), "aql") == 0;
+    rad_dev_chain_infer(0);
+    CHECK_EQ(rad_dev_chain_enabled(), 0);
+    rad_dev_chain_infer(1);
+    CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    rad_dev_chain_infer(0);
+    CHECK_EQ(rad_dev_chain_enabled(), 0);
 }
 
 TEST(host_vram_budget_comes_from_the_environment) {
@@ -1550,4 +1564,4 @@ TEST(a_damaged_code_object_is_refused_not_misread) {
     CHECK(has(why, "amdhsa.kernels"));
 }
 
-RAD_TEST_MAIN()
+RAD_TEST_MAIN_HOST_KARGS()

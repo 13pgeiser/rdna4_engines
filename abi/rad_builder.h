@@ -80,6 +80,13 @@ enum {
     RAD_KVQ_K6V4 = 2
 };
 
+/* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
+ * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */
+enum {
+    RAD_ATTN_FP8_QK = 1,   /* Q.K^T, the query rounded to e4m3 after the softmax scale */
+    RAD_ATTN_FP8_PV = 2    /* P.V, the probabilities rounded to e4m3 */
+};
+
 typedef struct RadBuildCtx {
     int      rank;            /* declare runs once per rank; the plugin declares dimensions */
     int      world_size;      /* already divided -- the core inserts no collectives (spec §9) */
@@ -173,6 +180,17 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_quant;
+
+    /* ---- appended in ABI 26 (fp8 prefill attention) */
+    /* RAD_ATTN_FP8_* bits from --attn-prefill-fp8: the attention products the deployment accepts
+     * in e4m3 rather than exactly. 0 (the zero-initialised default) is exact. A plugin passes a
+     * nonzero value on as `attn_paged`'s `prefill_fp8` (docs/OPS.md) and omits the parameter at
+     * 0, so an exact declare is unchanged. The engine refuses to start when no resolved kernel
+     * takes it, so a plugin that ignores the field is refused rather than silently exact.
+     *
+     * Zero-defaulted and in the padding after kv_quant, so no other field moves and a plugin built
+     * against the older struct is unchanged. */
+    int      attn_prefill_fp8;
 
     /* ---- appended in ABI 26 (control vectors) */
     /* A control vector loaded from a GGUF `controlvector` file found for this model, or null.
@@ -351,13 +369,20 @@ enum {
     RAD_KV_FULL    = 0,   /* paged, per-token, growing -- full attention */
     RAD_KV_WINDOW  = 1,   /* paged, per-token, bounded by the window */
     RAD_KV_LINEAR  = 2,   /* per-sequence, fixed size -- GDN recurrent state */
-    RAD_KV_CONV    = 3    /* per-sequence, a rolling window of width-1 + num_spec entries */
+    RAD_KV_CONV    = 3,   /* per-sequence, a rolling window of width-1 + num_spec entries */
+    /* Paged exactly like RAD_KV_WINDOW, but the window's floor is per sequence and set at
+     * runtime (R-SWA, spec §7.2): `window` is the ring's W, and a sequence keeps everything from
+     * position 0 up to its own prompt (prefill and image rows) plus a ring of W slots after it,
+     * rewritten in place. So the group is sized for the whole context plus one ring a sequence,
+     * never checkpointed, and never reused from the prefix cache. A model that serves a fixed
+     * sliding window declares RAD_KV_WINDOW instead. */
+    RAD_KV_RING    = 4
 };
 
 typedef struct RadKVGroupDecl {
     int      kind;            /* RAD_KV_* */
     uint32_t dtype;
-    int64_t  window;          /* RAD_KV_WINDOW: the window; 0 otherwise */
+    int64_t  window;          /* RAD_KV_WINDOW: the window; RAD_KV_RING: the ring's W; 0 otherwise */
     int64_t  n_head_kv;
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */
@@ -654,12 +679,11 @@ int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
 int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
 
 /* Whether this engine's launches chain (RadKernelChainFn, abi/rad_abi.h): the core's decision, on
- * the AQL backend only, which keeps a completion counter per queue -- by default where the model's
- * plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter
- * decodes speculatively, or as RADIANCE_CHAIN says. A plugin that places work by whether a kernel
- * waits in its prologue behind the one before it -- a weight read issued on lane 0 right after its
- * GEMM -- asks this instead of reading the environment, so it follows that decision. Additive
- * export; RAD_ABI_VERSION does not move. */
+ * the AQL backend only, which keeps a completion counter per queue, where the model's plugin
+ * measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
+ * speculatively. A plugin that places work by whether a kernel waits in its prologue behind the
+ * one before it -- a weight read issued on lane 0 right after its GEMM -- asks this, so it follows
+ * that decision. Additive export; RAD_ABI_VERSION does not move. */
 int rad_chain_on(void);
 
 /* ================================================================== the encoder */
@@ -692,6 +716,12 @@ typedef struct RadEncoderDecl {
      * the pass and before any other pass runs, so the planner may share its bytes with buffers
      * no encoder pass touches. */
     rad_buf     out;
+
+    /* ---- appended in ABI 26 (one grid a pass) */
+    /* 1: every segment of a pass has one grid (Item segment height), for an encoder whose
+     * position tables or kernels are per geometry; the core ends a pass where the grid changes.
+     * 0 packs segments of any grid into a pass. */
+    int32_t     one_grid;
 } RadEncoderDecl;
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
@@ -866,6 +896,11 @@ typedef struct RadGeneratorDecl {
      * `cond_rows` a whole number of windows. */
     int32_t     chunk_tokens;
     int32_t     chunk_bos, chunk_eos;
+
+    /* ---- appended in ABI 26 (Krea 2's rebalance) */
+    /* The RAD_GEN_COND_* options (rad_runtime.h) the plugin's COND pass serves, as a mask; a
+     * request asking for another is refused. 0: none. */
+    uint32_t    cond_opts;
 } RadGeneratorDecl;
 
 /* RadGeneratorDecl::beta_schedule: betas linear in sqrt(beta) (Stable Diffusion's
@@ -1300,12 +1335,17 @@ typedef struct RadArchProbe {
      * libr4d has their rows for its attention geometry. A layout whose bit is clear is refused at
      * startup with the plugin named. */
     int32_t kv_quant_ok;
+
+    /* ---- appended in ABI 26 (chained launches, control vectors) */
     /* Nonzero when this plugin measured its speculative step faster with chained launches
      * (RadKernelChainFn: a dependent kernel waits in its own prologue rather than behind the
      * queue's barrier bit). With a drafter decoding speculatively on the AQL backend, the core
-     * then takes them by default; RADIANCE_CHAIN overrides either way. Zero keeps them off: plain
-     * decode measured slower chained, and a plugin that never measured them asks for nothing. */
+     * then takes them. Zero keeps them off: plain decode measured slower chained, and a plugin
+     * that never measured them asks for nothing. */
     int32_t chain_pays;
+    /* Nonzero when the plugin applies RadBuildCtx::cvec for this model. --control-vector is
+     * refused at startup with the plugin named when this is 0. */
+    int32_t control_vector_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

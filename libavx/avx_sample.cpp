@@ -29,6 +29,7 @@
 #include "rad_sample.h"
 
 #include <cfloat>
+#include <vector>
 
 using namespace avx;
 
@@ -217,6 +218,91 @@ AVX_KERNEL(sample_dry) {
             if (!rep) continue;
             const int64_t off = lb + ((int64_t)next - voff) * ls;
             stt(lg, off, ldt(lg, off) - dry_penalty(sp.dry_multiplier, base, len[j] - allowed));
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ sample_ngram_ban */
+/* libref's ref_sample_ngram_ban: the windowed no-repeat-ngram ban. The row's history is
+ * `s[0, hl)` oldest first; with `n` and `w` from the row's `ngram` pair,
+ *
+ *     search_start = max(0, hl - w)      (w <= 0: the whole span)
+ *     search_end   = hl - n + 1
+ *     prefix       = s[hl - n + 1, hl)   (empty at n == 1)
+ *
+ * and every n-gram in [search_start, search_end) whose first n-1 tokens equal the prefix bans the
+ * token that follows it, by -infinity. The window bounds the n-gram's START, as the reference's
+ * SlidingWindowNoRepeatNgramProcessor does. Ids are global; a token's column is its id less
+ * `vocab_off`, and a token outside the shard is another rank's.
+ *
+ * The work is integer comparisons over at most a window of history, so the rows are parallel and
+ * the scan inside a row stays scalar: libref's own loop, bit for bit. A row with n 0 (the
+ * default) is skipped before it reads anything.
+ *
+ * The optional `whitelist` bitmask (a SET bit, the row's own plane row) exempts a token from
+ * the ban, the reference's `banned.difference_update(self.whitelist)`; absent, nothing is
+ * exempt, and the result is bit-for-bit the ban without it. */
+AVX_KERNEL(sample_ngram_ban) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *lg = &a->t[0], *pr = &a->t[1], *hist = &a->t[2], *ng = &a->t[3];
+    const RadTensor* wl = rad_arg_in(a, 4);
+    const int64_t n_vocab = p_int(a, "n_vocab", lg->rank >= 2 ? lg->shape[lg->rank - 1] : 0);
+    if (n_vocab <= 0) return RAD_E_SHAPE;
+    const int64_t M = numel(lg) / n_vocab;
+    if (M <= 0) return RAD_E_SHAPE;
+    Rows R;
+    AVX_TRY(rows_of_params(pr, M, &R));
+    const int64_t hmax = numel(hist) / M;
+    if (hmax <= 0) return RAD_E_SHAPE;
+    if (numel(ng) < 2 * M) return RAD_E_SHAPE;
+    const int64_t voff = p_int(a, "vocab_off", 0);
+    const int64_t wwords = (n_vocab + 31) / 32;
+    if (wl && wl->dtype != RAD_I32 && wl->dtype != RAD_U32) return RAD_E_DTYPE;
+    if (wl && numel(wl) < M * wwords) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(M >= 2)
+    for (int64_t m = 0; m < M; ++m) {
+        const RadSampleParams& sp = R.p[m];
+        const int64_t nb = rowoff(ng, m, 2), ns = laststride(ng);
+        const int64_t n = ldi(ng, nb);
+        const int64_t win_req = ldi(ng, nb + ns);
+        if (n <= 0) continue;
+
+        int64_t ho = 0, hl = 0;
+        if (!hist_window(sp, -1, hmax, &ho, &hl)) continue;
+        if (hl < n) continue;
+        const int64_t win = win_req > 0 && win_req < hl ? win_req : hl;
+        const int64_t search_start = hl - win;
+        const int64_t search_end   = hl - n + 1;
+        if (search_end <= search_start) continue;
+
+        const int64_t hb = rowoff(hist, m, hmax) + ho * laststride(hist);
+        const int64_t hs = laststride(hist);
+        const int64_t lb = rowoff(lg, m, n_vocab), ls = laststride(lg);
+        const int64_t wb = wl ? rowoff(wl, m, wwords) : 0, ws = wl ? laststride(wl) : 0;
+        auto tok_at = [&](int64_t i) { return (int64_t)(int32_t)ldi(hist, hb + i * hs); };
+        auto exempt = [&](int64_t col) {
+            if (!wl) return false;
+            const uint32_t word = (uint32_t)ldi(wl, wb + (col / 32) * ws);
+            return ((word >> (uint32_t)(col % 32)) & 1u) != 0u;
+        };
+        const int64_t plen = n - 1, p0 = hl - plen;
+        /* The prefix is the same n-1 tokens compared at every search position: read once. */
+        std::vector<int64_t> pref((size_t)plen);
+        for (int64_t j = 0; j < plen; ++j) pref[(size_t)j] = tok_at(p0 + j);
+
+        for (int64_t idx = search_start; idx < search_end; ++idx) {
+            bool match = true;
+            for (int64_t j = 0; j < plen; ++j) {
+                if (tok_at(idx + j) != pref[(size_t)j]) { match = false; break; }
+            }
+            if (!match) continue;
+            const int64_t tok = tok_at(idx + plen);
+            const int64_t col = tok - voff;
+            if (tok < 0 || col < 0 || col >= n_vocab) continue;
+            if (exempt(col)) continue;
+            stt(lg, lb + col * ls, -INFINITY);
         }
     }
     return RAD_OK;

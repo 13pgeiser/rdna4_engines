@@ -6198,9 +6198,11 @@ TEST(the_cache_tiers_and_pool_agree_over_random_interleavings) {
  */
 
 /* The engine's restore (the binding's restore_fn) without the transfer: which entries come back,
- * into which blocks, and what the tiers and the cache are told. Returns how many came back. */
-static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r) {
-    const std::vector<BlockHash> want = b.restore_plan(r, 0);
+ * into which blocks, and what the tiers and the cache are told. Returns how many came back;
+ * `res`, when given, is whether the plan was cut. */
+static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r,
+                              RestoreResult* res = nullptr) {
+    const std::vector<BlockHash> want = b.restore_plan(r, 0, /*whole_only=*/false, res);
     std::vector<TierJob> jobs;
     for (const BlockHash& h : want) {
         TierJob j;
@@ -6275,18 +6277,19 @@ TEST(a_restore_gives_up_other_clean_copies_to_bring_the_whole_chain_back) {
     PCBinding<PrefixCache> b(&x.f.pc);
     int flushes = 0;
     b.flush_fn = [&]() { ++flushes; return !copy_now(x.t).empty(); };
-    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), off);
+    RestoreResult res = RestoreResult::Cut;
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {}), &res), off);
+    CHECK(res == RestoreResult::Whole);
     CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
     /* B had no host copy yet: its copies were landed first, then its VRAM went. Nothing lost. */
     CHECK_EQ(flushes, 1);
     CHECK_EQ(x.f.pc.stats().evictions, evictions);
     CHECK_EQ(x.f.pc.size(), 2 * s.n);
     CHECK_EQ((int64_t)x.f.pc.restorable_from(s.b, {}).size(), 2 * s.n - x.f.pc.resident());
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
 }
 
-/* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches. Cut
- * at the free list, that is somewhere down the retention ladder, far below the tip. */
+/* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches; with
+ * the whole chain back, that is the tip, not a snapshot down the retention ladder. */
 TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
     TierFixture x;
     CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
@@ -6296,11 +6299,12 @@ TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
 
     PCBinding<PrefixCache> b(&x.f.pc);
     b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
-    (void)engine_restore(x, b, turn(3, s.a, {}));
+    RestoreResult res = RestoreResult::Cut;
+    (void)engine_restore(x, b, turn(3, s.a, {}), &res);
+    CHECK(res == RestoreResult::Whole);
     const CacheHit hit = x.f.pc.lookup(s.a, {});
     CHECK_EQ(hit.n_attn_tokens, (int32_t)(s.n * 16));
     CHECK_EQ(hit.n_linear_tokens, (int32_t)(s.n * 16));
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
 }
 
 /* When the pool cannot be made to hold the chain, what comes back ends at a snapshot: blocks past
@@ -6326,14 +6330,15 @@ TEST(a_restore_the_pool_cannot_hold_stops_at_a_snapshot_and_spares_its_own_chain
 
     PCBinding<PrefixCache> b(&x.f.pc);
     b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
-    const int64_t back = engine_restore(x, b, turn(3, s.a, {}));
+    RestoreResult res = RestoreResult::Whole;
+    const int64_t back = engine_restore(x, b, turn(3, s.a, {}), &res);
+    CHECK(res == RestoreResult::Cut);
     CHECK_EQ(back, std::max<int64_t>(0, snap / 16 - resident));
     CHECK_EQ(x.f.pc.stats().drops, drops);          /* no VRAM copy given up: A's own, or B's */
     const CacheHit hit = x.f.pc.lookup(s.a, {});
     CHECK_EQ(hit.n_linear_tokens, (int32_t)snap);
     CHECK_EQ(hit.n_attn_tokens, (int32_t)std::max<int64_t>(snap, resident * 16));
     CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
 }
 
 /* A chain another waiting request holds is kept too: that request restored it and was refused,
@@ -6348,15 +6353,59 @@ TEST(a_restore_does_not_take_a_chain_a_waiting_request_holds) {
     const int64_t drops = x.f.pc.stats().drops;
 
     PCBinding<PrefixCache> b(&x.f.pc);
-    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), room);
+    RestoreResult res = RestoreResult::Whole;
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {}), &res), room);
+    CHECK(res == RestoreResult::Cut);
     CHECK_EQ(x.f.pc.stats().drops, drops);
     CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
-    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
 
     x.f.pc.release(9);
     const int64_t rest = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
-    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), rest);
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {}), &res), rest);
+    CHECK(res == RestoreResult::Whole);
     CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
+}
+
+/* A restore asked to come back whole either does, or brings back nothing and is declined: the
+ * admission waits a step and asks again (Scheduler::admit_one). */
+TEST(a_whole_only_restore_comes_back_whole_or_not_at_all) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
+    x.f.pc.set_policy(std::make_unique<GeometricBackoff>(64));
+    const TwoSessions s = two_sessions(x, /*b_live=*/true, /*a_snapshots=*/true);
+    const int64_t off = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    PCBinding<PrefixCache> b(&x.f.pc);
+    b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
+    RestoreResult res = RestoreResult::Whole;
+    CHECK(b.restore_plan(turn(3, s.a, {}), 0, /*whole_only=*/true, &res).empty());
+    CHECK(res == RestoreResult::Declined);
+    CHECK_EQ((int64_t)x.f.pc.restorable_from(s.a, {}).size(), off);   /* nothing moved */
+
+    x.f.kv.free_sequence(2);                         /* B's sequence ends: its VRAM can go */
+    CHECK_EQ((int64_t)b.restore_plan(turn(3, s.a, {}), 0, true, &res).size(), off);
+    CHECK(res == RestoreResult::Whole);
+}
+
+/* Making room for a restore never erases an entry. Without a host tier, or with one attached but
+ * off, a trim would erase, since no copy will ever land; so it takes nothing. */
+TEST(making_room_for_a_restore_without_a_host_tier_takes_nothing) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false, /*ckpt_slots=*/0));
+    publish(f, 1, tok_run(7600, 336), 320);         /* twenty 16-token blocks */
+    f.kv.free_sequence(1);                          /* finished: only the cache holds them */
+    const auto other = tok_run(900000, 336);
+    CHECK_EQ(f.pc.trim_for(other, {}, 20), 0ll);
+    CHECK_EQ(f.pc.size(), 20ll);
+    CHECK_EQ(f.pc.resident(), 20ll);
+
+    IdleTiers off;
+    CHECK_OK(off.configure(tier_config(0, 1024)));
+    REQUIRE(!off.host_on());
+    f.pc.set_tiers(&off);
+    CHECK_EQ(f.pc.trim_for(other, {}, 20), 0ll);
+    CHECK_EQ(f.pc.size(), 20ll);
+    CHECK_EQ(f.pc.stats().evictions, 0ll);
+    f.pc.set_tiers(nullptr);
 }
 
 /* Tools and tests build and tear down the tier executors and pools repeatedly, and on a card every

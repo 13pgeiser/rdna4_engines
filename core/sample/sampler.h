@@ -9,6 +9,7 @@
  * Chain order (reordering changes which tokens survive):
  *
  *     penalties (repetition / frequency / presence, then DRY)
+ *     the windowed no-repeat-ngram ban
  *     temperature
  *     the grammar mask
  *     top-k
@@ -47,6 +48,9 @@
  *   sample_penalties   M(range) n_vocab vocab_off?   logits, params, history  -> logits (inout)
  *   sample_dry         M(range) n_vocab vocab_off?   logits, params, history, breakers?
  *                                                                          -> logits (inout)
+ *   sample_ngram_ban   M(range) n_vocab vocab_off?   logits, params, history, ngram,
+ *                                                                          whitelist?
+ *                                                                          -> logits (inout)
  *   sample_temp        M(range) n_vocab   logits, params                  -> logits (inout)
  *   sample_mask        M(range) n_vocab   logits, params, bitmask         -> logits (inout)
  *   sample_topk        M(range) n_vocab vocab_off?   logits, params       -> cand_idx, cand_val,
@@ -64,7 +68,9 @@
  * a verify. `params` is [M] DeviceSampleParams rows. `history` is [M, max_hist] int32 global
  * token ids, row m addressed by its hist_off/hist_len. `breakers` is [M, max_hist] uint8 beside
  * it, nonzero where that token is a whole DRY sequence breaker. `bitmask` is [M, mask_words]
- * uint32, addressed by the row's mask_row. `vocab_off` is this rank's first vocabulary row,
+ * uint32, addressed by the row's mask_row. The ban's `whitelist` is a [M, mask_words] uint32
+ * bitmask (a SET bit exempts that column from the ban) addressed by the row itself, absent when
+ * no staged row carries one. `vocab_off` is this rank's first vocabulary row,
  * declared only when the vocabulary is split; the three ops that map between token ids and this
  * rank's logit columns use it. Every op has a libref implementation, which is both its fallback
  * and its oracle (spec §17).
@@ -232,6 +238,9 @@ private:
     /* Declared op handles; RAD_NULL_HANDLE means unresolved, which admission refuses by name. */
     rad_op op_penalties_ = RAD_NULL_HANDLE;
     rad_op op_dry_       = RAD_NULL_HANDLE;
+    /* The windowed no-repeat-ngram ban (`sample_ngram_ban`), the stage Unlimited-OCR's
+     * generation_config asks for. It reads the same history plane as the two above. */
+    rad_op op_ngram_ban_ = RAD_NULL_HANDLE;
     rad_op op_temp_      = RAD_NULL_HANDLE;
     rad_op op_temp_late_ = RAD_NULL_HANDLE;   /* sample_temp over the candidates (temp_last) */
     rad_op op_mask_      = RAD_NULL_HANDLE;
@@ -252,6 +261,10 @@ private:
     rad_buf buf_params_late_ = RAD_NULL_HANDLE;   /* the late temperature's rows */
     rad_buf buf_hist_    = RAD_NULL_HANDLE;
     rad_buf buf_brk_     = RAD_NULL_HANDLE;   /* DRY's single-token breaker marks, beside history */
+    rad_buf buf_ngram_   = RAD_NULL_HANDLE;   /* the n-gram ban's {n, window} pair a row */
+    /* The ban's whitelist bitmask, [rows, mask_words] like the grammar mask plane: a SET bit
+     * exempts that column from the ban. Uploaded with the ban, only when a staged row has one. */
+    rad_buf buf_ngram_wl_ = RAD_NULL_HANDLE;
     rad_buf buf_mask_    = RAD_NULL_HANDLE;
     rad_buf buf_cand_i_  = RAD_NULL_HANDLE;
     rad_buf buf_cand_v_  = RAD_NULL_HANDLE;
@@ -275,6 +288,8 @@ private:
     const DeviceSampleParams* cur_stage_ = nullptr;   /* what the last build staged */
     int32_t*            hist_stage_   = nullptr;
     uint8_t*            brk_stage_    = nullptr;
+    int32_t*            ngram_stage_  = nullptr;   /* [rows][2]: n-gram length, window */
+    uint32_t*           ngram_wl_stage_ = nullptr; /* [rows][mask_words] exemption bitmask */
     uint32_t*           mask_stage_   = nullptr;
 
     int64_t mask_words_ = 0;      /* words for this rank's shard; what the mask op indexes */
@@ -282,6 +297,12 @@ private:
     /* Whether any DRY row this step has breakers; only then is the breaker plane uploaded and
      * passed to sample_dry. */
     bool    any_brk_    = false;
+    /* Whether any row this step runs the n-gram ban. Its history is the plane the penalties use,
+     * so this only decides whether that plane is uploaded and the op issued. */
+    bool    any_ngram_  = false;
+    /* Whether any banned row this step whitelists a column of this rank's shard; only then is
+     * the exemption plane uploaded and passed to sample_ngram_ban. */
+    bool    any_ngram_wl_ = false;
 
     /* The whole-vocabulary mask the grammar fills, from which this rank's shard is cut. Used
      * only when the head is sharded; see declare(). */

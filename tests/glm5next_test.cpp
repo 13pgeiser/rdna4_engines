@@ -802,6 +802,67 @@ TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
     }
 }
 
+/* Each deployment or checkpoint the plugin cannot serve is refused with a line that names the
+ * setting and the reason, not a bare status. */
+TEST(glm53_refusals_name_what_was_refused) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    RadBuildCtx ok{};
+    ok.rank = 0;
+    ok.world_size = 8;
+    ok.max_tok = 64;
+    ok.max_seqs = 2;
+    ok.max_ctx = 4096;
+    ok.max_spec = 3;
+    auto refusal = [&](const RadModelMeta& mt, const RadBuildCtx& c) {
+        RadBuilder b;
+        b.kv_block = 4;
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = glm5next::declare(&b, &mt, &c); });
+        CHECK_EQ(rc, RAD_E_UNSUPPORTED);
+        return err;
+    };
+    RadBuildCtx c = ok;
+    c.kv_dtype = RAD_F8E4M3;
+    CHECK(has(refusal(meta, c), "--kv-cache-dtype fp8"));
+    c = ok;
+    c.max_spec = 32;
+    CHECK(has(refusal(meta, c), "--num-speculative-tokens 32"));
+    c = ok;
+    c.world_size = 3;
+    CHECK(has(refusal(meta, c), "--tp 3"));
+    RadModelMeta other = meta;
+    other.n_vocab = 151552;
+    CHECK(has(refusal(other, ok), "vocab_size is 151552"));
+    /* A KDA projection stored quantised: the block's linears run as bf16 GEMMs, and the refusal
+     * names the weight. */
+    {
+        const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+        const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "blk.1.attn_beta", fp8 },        { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                   { "mtp.blk.45.ffn_down_exps", fp8 }, { "ffn_gate_up_exps", mx },
+                   { "ffn_down_exps", mx },            { "ffn_gate_up_shexp", mx },
+                   { "ffn_down_shexp", mx },           { "ffn_gate_up.weight", fp8 },
+                   { "ffn_down.weight", fp8 } };
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = glm5next::declare(&b, &meta, &ok); });
+        CHECK(rc < 0);
+        CHECK(has(err, "blk.1.attn_beta.weight"));
+        CHECK(has(err, "plain bf16"));
+    }
+}
+
 /* The MoE block's decode fusions: over a two-row trunk step, its draft pass and a 512-row prefill
  * (past the router fusion's one-workgroup sort), each fused launch stands where it fits and the
  * launches it replaces are gone, with the step lint clean throughout. The sort writes each slot's
@@ -1766,13 +1827,12 @@ RAD_TEST_MAIN()
 
 /* ==================================================================== the row rule */
 
-/* GlmTp::run_rows is the one rule the indexer's runs follow, and it is the formula it replaced:
- * 4 * ceil(T / (4 * world)) for the indexer's 4-byte lengths, ceil(T / world) for a row of whole
- * 16-byte words. At the split threshold, around a chunk and at the largest step, for every
+/* GlmTp::run_rows is the one rule the indexer's runs follow: 4 * ceil(T / (4 * world)) for the
+ * indexer's 4-byte lengths, ceil(T / world) for a row of whole 16-byte words. At the split threshold, around a chunk and at the largest step, for every
  * world: run_of covers the step once with no overlap, the last run short where the step ends
  * inside it, and a rank whose run lies wholly past a small step takes the first run instead, so
  * the planes it writes and gathers are never unwritten. */
-TEST(glm_tp_row_rule_is_the_old_formula_and_covers_a_step_once) {
+TEST(glm_tp_row_rule_rounds_to_whole_words_and_covers_a_step_once) {
     using namespace rad::arch;
     for (int world : { 1, 2, 4, 8 })
         for (int64_t T : { 1, 5, 6, 48, 255, 256, 257, 300, 2047, 2048, 2049, 4096 }) {
@@ -1864,9 +1924,8 @@ const LoadedSchemas& loaded_schemas() {
  * one, a mixed step over the split threshold (two decode rows beside a 498-row chunk), a step
  * under it, a six-row verify and six single-row decodes, each with its history pass and a draft
  * round, and a verify of eight sequences at 32k of context, where the indexer splits a decode.
- * The engine refuses a step at the first mismatch, and the fakes alone cannot see one: a
- * replicated dsa_score issued with nine operands passed every host test and stopped a served
- * engine at its first long prompt. */
+ * The engine refuses a step at the first mismatch, which the recording fakes do not check, so a
+ * missing optional operand reaches no other host test. */
 TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
     const LoadedSchemas& lib = loaded_schemas();
     if (lib.ops.empty()) {

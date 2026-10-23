@@ -36,11 +36,6 @@ int fail(std::string* err, int code, const std::string& m) {
     return code;
 }
 
-bool ends_with(const std::string& s, const char* p) {
-    const size_t n = std::strlen(p);
-    return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
-}
-
 std::string shape_str(const std::vector<int64_t>& s) {
     std::string r = "[";
     for (size_t i = 0; i < s.size(); ++i) r += (i ? ", " : "") + std::to_string(s[i]);
@@ -290,7 +285,7 @@ int AdapterFile::open(const std::string& path, std::string* err) {
     for (const StTensor& t : st_.tensors()) {
         const Suffix* hit = nullptr;
         for (const Suffix& s : kSuffix)
-            if (ends_with(t.name, s.s) && (!hit || std::strlen(s.s) > std::strlen(hit->s))) hit = &s;
+            if (t.name.ends_with(s.s) && (!hit || std::strlen(s.s) > std::strlen(hit->s))) hit = &s;
         if (!hit) {
             skipped_.push_back({ t.name, "not an adapter tensor" });
             continue;
@@ -610,7 +605,7 @@ std::regex pattern(const std::string& from, bool kohya) {
 }
 
 std::string module_of(const std::string& src) {
-    return ends_with(src, ".weight") ? src.substr(0, src.size() - 7) : std::string();
+    return src.ends_with(".weight") ? src.substr(0, src.size() - 7) : std::string();
 }
 
 }  /* namespace */

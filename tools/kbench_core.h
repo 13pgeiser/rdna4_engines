@@ -62,9 +62,6 @@ const char* activation_dtype(const Geometry& g);
 /* The tolerance for output `operand` of `op` at `g`. Per-operand overrides come first. */
 TolPick tolerance_for(const std::string& op, const Geometry& g, const char* operand);
 
-/* The rows themselves, for a test that walks every op of a fixture through them. */
-const std::vector<TolRow>& tolerance_table();
-
 /* ================================================================== index outputs
  *
  * A token id, an expert id or a top-k index is right or wrong, so it is compared exactly. A rel_l2

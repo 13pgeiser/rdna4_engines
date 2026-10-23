@@ -727,6 +727,22 @@ TEST(a_checkpoint_store_the_host_cannot_hold_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* --attn-prefill-fp8 is a permission an exact kernel also satisfies. The host libraries have no
+ * e4m3 attention, so asked for it the start is refused by the flag's name instead of serving the
+ * exact form under it. */
+TEST(an_attention_fp8_mode_no_kernel_takes_is_refused_at_startup) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0",
+                                       "--attn-prefill-fp8", "both" }, {}, 120);
+    const bool named = has(r.log, "not starting: --attn-prefill-fp8 both, but no attention kernel");
+    if (r.status == 0 || r.status == 124 || !named)
+        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
+    CHECK(r.status != 0);
+    CHECK(r.status != 124);
+    CHECK(named);
+}
+
 /* Two ranks split heads, the FFN and the vocabulary, and sum partial products in an all-reduce,
  * so the rounding differs from one rank's; anything more than rounding is a wrong column or row
  * (a rank's logits read at another rank's vocabulary offset score near chance). */

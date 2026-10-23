@@ -95,15 +95,16 @@ struct SchedMetrics {
     /* Admissions whose attention hit was cut to nothing: no snapshot at or below it (recurrent
      * state or a window snapshot), a windowed trunk group no window snapshot covers, or blocks
      * that could not be adopted. `hit_cut_resumed_below` counts those that resumed at a
-     * snapshot more than one checkpoint interval below the hit: the retention ladder had
-     * nothing nearer, or the restore brought back only part of the chain. `hit_cut_tokens` is
-     * the checkpoint shortfall: prompt tokens the attention cache held and the admission
-     * computed again, because the hit resumed at a snapshot below it or was cut to nothing. */
+     * snapshot more than one checkpoint interval below the hit: the previous reply was longer
+     * than an interval (decode writes no snapshot), the retention policy kept nothing nearer, or
+     * a restore was cut (prefix_restore_cuts). `hit_cut_tokens` is the checkpoint shortfall:
+     * prompt tokens the attention cache held and the admission computed again, because the hit
+     * resumed at a snapshot below it or was cut to nothing. */
     int64_t hit_cut_no_snapshot = 0, hit_cut_window = 0, hit_cut_adopt = 0;
     int64_t hit_cut_resumed_below = 0;
     int64_t hit_cut_tokens = 0;
     /* Restores from the host tier the pool could not hold whole, even after giving up the VRAM
-     * copies of other conversations (PrefixCache::Stats::restore_cuts). */
+     * copies of other conversations, counted once per admission (RestoreResult::Cut). */
     int64_t prefix_restore_cuts = 0;
     /* Tokens of context held only by the cache, i.e. what eviction would free. Excludes blocks
      * shared with a running sequence. Same token axis as the paged groups, so comparable with

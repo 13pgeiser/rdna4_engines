@@ -386,12 +386,43 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
-    if (!GlmTp::world_ok(world) || meta->n_embd != 4096 || meta->n_layers != 45 ||
-        meta->n_vocab != 154880 || cfg(meta, "num_nextn_predict_layers", 0) != 1 ||
-        cfg(meta, "hc_mult", 0) != 4 || cfg(meta, "n_routed_experts", 0) != 288 ||
-        cfg(meta, "index_topk", 0) != 2048 || ctx->max_spec > 31 ||
-        (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16))
+    if (!GlmTp::world_ok(world)) {
+        fprintf(stderr, "radiance: glm5next: --tp %d; the head, KDA channel and expert splits of "
+                        "this plugin are built for 1, 2, 4 or 8 ranks\n", world);
         return RAD_E_UNSUPPORTED;
+    }
+    /* The graph is written for the released GLM-5.3-Flash and reads none of these from the
+     * checkpoint, so a checkpoint that differs in any of them is refused by name. */
+    const struct {
+        const char* what;
+        int64_t     got, want;
+    } shape[] = { { "hidden_size", meta->n_embd, 4096 },
+                  { "num_hidden_layers", meta->n_layers, 45 },
+                  { "vocab_size", meta->n_vocab, 154880 },
+                  { "num_nextn_predict_layers", cfg(meta, "num_nextn_predict_layers", 0), 1 },
+                  { "hc_mult", cfg(meta, "hc_mult", 0), 4 },
+                  { "n_routed_experts", cfg(meta, "n_routed_experts", 0), 288 },
+                  { "index_topk", cfg(meta, "index_topk", 0), 2048 } };
+    for (const auto& s : shape)
+        if (s.got != s.want) {
+            fprintf(stderr, "radiance: glm5next: the checkpoint's %s is %lld; this plugin serves "
+                            "the GLM-5.3-Flash geometry, where it is %lld\n",
+                    s.what, (long long)s.got, (long long)s.want);
+            return RAD_E_UNSUPPORTED;
+        }
+    if (ctx->max_spec > 31) {
+        fprintf(stderr, "radiance: glm5next: --num-speculative-tokens %d; the KDA verify pass "
+                        "takes at most 32 rows a sequence, so the MTP depth is at most 31\n",
+                ctx->max_spec);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16) {
+        fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin keeps its latent "
+                        "attention, index tail and KDA caches in bf16 and has no fp8 cache, so "
+                        "run it with --kv-cache-dtype bf16\n",
+                ctx->kv_dtype == RAD_F8E4M3 ? "fp8" : rad_dtype_name(ctx->kv_dtype));
+        return RAD_E_UNSUPPORTED;
+    }
     auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
     slot = std::make_unique<Model>();
     auto& m = *slot;

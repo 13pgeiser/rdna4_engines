@@ -47,12 +47,16 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * served by a different kernel may differ (§7.2). */
     bool has_linear = false, has_window = false;
     for (const KVGroupInfo& kg : prog.kv_groups) {
-        if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW) {
+        if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW ||
+            kg.decl.kind == RAD_KV_RING) {
             if (kg.block_size > 0) {
                 g.attn_block = lcm64(g.attn_block, kg.block_size);
                 note(g.why, "attn_block", kg.block_size, kg.name.c_str());
                 /* A drafter's window is recomputed by draft refill; only the trunk's needs a
-                 * snapshot for a prefix hit to resume. */
+                 * snapshot for a prefix hit to resume. A RAD_KV_RING group has no snapshot at all
+                 * (KVManager::declare_runtime_window): its window is each sequence's own prompt
+                 * length, which no slot could describe, so it is sized for the context plus a ring
+                 * and is never checkpointed. */
                 if (kg.decl.kind == RAD_KV_WINDOW && !kg.layers.empty() && !kg.drafter)
                     has_window = true;
             }

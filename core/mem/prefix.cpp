@@ -462,8 +462,9 @@ void PrefixCache::take_over(uint64_t session, const std::vector<BlockHash>& hs,
 
 std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& tokens,
                                                     const std::vector<MMContentKey>& mm,
-                                                    int64_t fit) const {
+                                                    int64_t fit, bool* cut) const {
     std::vector<BlockHash> out;
+    if (cut) *cut = false;
     if (!enabled_ || !tiers_ || tokens.empty()) return out;
 
     /* Only blocks a hit can use: one token must remain, so a prompt ending on a block boundary
@@ -488,13 +489,16 @@ std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& 
     if (out.empty() || (int64_t)out.size() <= fit) return out;
 
     /* Restored up to `fit`, the hit ends at the first entry left behind. */
-    ++stats_.restore_cuts;
+    if (cut) *cut = true;
     int64_t keep = std::max<int64_t>(0, fit);
     if (has_linear_) {
         const auto best = deepest_ckpt(hs, at[(size_t)keep] * block_size_);
         const int64_t upto = best == ck_by_prefix_.end() ? 0 : best->second.pos / block_size_;
         keep = std::lower_bound(at.begin(), at.begin() + keep, upto) - at.begin();
     }
+    RAD_DEBUG("prefix cache: restore of %zu entries cut to %lld: the pool holds %lld of them, and "
+              "the hit ends at token %lld", out.size(), (long long)keep,
+              (long long)std::max<int64_t>(0, fit), (long long)(at[(size_t)keep] * block_size_));
     out.resize((size_t)keep);
     return out;
 }
@@ -508,7 +512,8 @@ int64_t PrefixCache::restore_room() const {
 
 int64_t PrefixCache::trim_for(const std::vector<int32_t>& tokens,
                               const std::vector<MMContentKey>& mm, int64_t n_blocks) {
-    if (!enabled_ || n_blocks <= 0) return 0;
+    /* Without a host tier a trim erases, and making room for a restore must lose nothing. */
+    if (!enabled_ || n_blocks <= 0 || !tiers_ || !tiers_->host_on()) return 0;
     const std::vector<BlockHash> hs = chain_all(tokens, mm, (int64_t)tokens.size() / block_size_);
     std::unordered_set<BlockHash, BlockHashHash> spare(hs.begin(), hs.end());
     for (const auto& h : held_) spare.insert(h.first);

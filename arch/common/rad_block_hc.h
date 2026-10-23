@@ -365,36 +365,25 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                 c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
 }
 
-/* The block's output `y` is read from `w.x.x`, the buffer the read wrote the block's input to:
- * every block leaves its delta in the activation its norm produced, and the input is dead by
- * then. */
 /* ================================================================== the control-vector projection
  *
- * A control vector is one unit direction per layer (a `controlvector` GGUF, core/cvec.h). Turned on
- * for a request, a steered layer's wide stream is projected off that layer's direction right after
- * the feed-forward's write:
+ * A control vector is one unit direction per layer (a `controlvector` GGUF, core/cvec.h). For a
+ * request that takes it, a steered layer's wide stream loses its component along that layer's
+ * direction right after the feed-forward's write:
  *
- *     h[s]  -= scale * (h[s] . v) * v        for each of the hc streams s
+ *     h[s] -= scale * (h[s] . v) * v        for each of the hc streams s
  *
- * which is llama.cpp's `--cvec-mode project` and the operation the Qwen3.8-Flash-Next package
- * documents. The dot is per stream, not on the stream mean: the patch applies it to the
- * [n_embd, hc, tokens] view where `mul_mat(v, cur)` reduces over dim 0 alone.
+ * This is llama.cpp's `--cvec-mode project`. The dot is per stream, not on the stream mean, as
+ * llama.cpp's `mul_mat(v, cur)` over the [n_embd, hc, tokens] view reduces dim 0 alone.
  *
- * Two properties the architecture plugin does not have to think about, both here:
+ * The switch is per request: `on` is a derived buffer of one int32 per row
+ * (core/sched/derive.cpp, `projection_on_rows`), so a step that mixes a projected conversation
+ * with a stock one projects only the rows that asked. The kernel neither reads nor writes a zero
+ * row, and a pass with no row on issues nothing (RadBatch::control_vector). `scale` is the norm
+ * the file stored for the layer times the package's own scale.
  *
- *   - **the switch is per request.** `on` is a derived buffer of one int32 per token row
- *     (core/sched/derive.cpp's `projection_on_rows`), so a step that mixes a projected
- *     conversation with a stock one projects exactly the rows that asked for it. All zeros is the
- *     stock model: the kernel skips a zero row without reading or writing it, so an unprojected
- *     request's stream is the one the stock model computes. (The *deployment* is not bit-identical
- *     to one with no vector: the direction table's VRAM can move an expert or a KV block, which is
- *     the tie-level variance radiance documents elsewhere. Measured, docs/GUIDE.md 4.10.)
- *   - **the parameters travel with the file.** `scale` is the norm the file stored for that layer
- *     (times the package's own `scale`, read from its JSON), and the direction row is sliced from
- *     the table at issue, so nothing is configured per deployment or scanned per layer.
- *
- * One instance per layer: `declare` emits an op only when the vector steers that layer, so a
- * deployment without a vector declares no op, no buffer and no branch in the step. */
+ * One instance per layer; `declare` emits an op only where the vector steers, so a deployment
+ * without a vector declares no op and no buffer. */
 struct HcProject {
     rad_op       op = 0;          /* 0: this layer is not steered (or there is no vector) */
     const float* dir = nullptr;    /* this layer's row of the device direction table */
@@ -456,9 +445,10 @@ struct HcProject {
     }
 
     /* Rows [r0, r0 + rows) of the stream. The whole step is r0 = 0; the pipelined step issues one
-     * call per piece, in the same place in the graph. */
-    void step(RadCtx* c_, int64_t r0, int64_t rows) const {
-        if (!op) return;
+     * call per piece, in the same place in the graph. Nothing is issued on a pass where no row
+     * takes the vector (RadBatch::control_vector): every row would be skipped. */
+    void step(RadCtx* c_, const RadBatch* batch, int64_t r0, int64_t rows) const {
+        if (!op || !batch || !batch->control_vector) return;
         RAD_ISSUE_N(c_, op, rows,
                     brow_slice(h, r0, rows, hc * n),
                     praw(dir, RAD_F32, n),
@@ -466,6 +456,9 @@ struct HcProject {
     }
 };
 
+/* The block's output `y` is read from `w.x.x`, the buffer the read wrote the block's input to:
+ * every block leaves its delta in the activation its norm produced, and the input is dead by
+ * then. */
 inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
     if (!op_write) return;
     if (takes_gather(T)) {

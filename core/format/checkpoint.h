@@ -262,10 +262,9 @@ struct CkptWeight {
      * values in the logical shape, which ckpt_rows_f32 serves. Not trivial, so a recipe rule
      * stores it. */
     std::vector<float> derived;
-    /* An `import` rule's form, applied by ckpt_plane_rows (also `imported`). `rounded` counts the
-     * shipped scales `form.scale` does not hold exactly and `max_rel` is their largest relative
-     * change, both found by ckpt_import_form. */
-    bool        reform = false;
+    /* An `import` rule's form, applied by ckpt_plane_rows (the weight is then `imported`).
+     * `rounded` counts the shipped scales `form.scale` does not hold exactly and `max_rel` is their
+     * largest relative change, both found by ckpt_import_form. */
     ImportForm  form{};
     int64_t     rounded = 0;
     double      max_rel = 0;

@@ -405,13 +405,9 @@ int Engine::step_loop() {
     int idle = 0;
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
-     * pass issued ahead would overwrite them. A block drafter pipelines only on the card
-     * (engine_draft.cpp); the host's driver stages from the committed sequence. */
-    block_card_ = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && !cfg_.kld() &&
-                  !embedding_ && [] { const char* v = std::getenv("RADIANCE_DRAFT_BLOCK_HOST");
-                                      return !(v && *v && *v != '0'); }();
-    pipelining_ = !cfg_.kld() && !embedding_ && (drafter_.kind != RAD_DRAFT_BLOCK || block_card_) &&
-                  (serial_drafting() || block_card_ || cfg_.n_spec <= 0);
+     * pass issued ahead would overwrite them. */
+    pipelining_ = !cfg_.kld() && !embedding_ &&
+                  (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -705,7 +701,8 @@ int Engine::step_loop() {
         /* Queue the drafter's passes behind the step before waiting: the card computes acceptance
          * itself and every pass reads it there (sched/advance.h), so one wait covers the whole
          * step. */
-        st = block_card_ ? issue_block_drafter(b->step, so) : issue_serial_drafter(b->step, so);
+        st = block_drafting() ? issue_block_drafter(b->step, so)
+                              : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
@@ -769,13 +766,10 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
-        /* The drafter for the next step. The host's block driver runs here, since it stages from
-         * the committed sequence. A serial one, or a block one on the card, already ran; what
-         * remains is to check its acceptance against the host's and publish its proposals. Each
-         * driver returns immediately for a kind that is not its own. */
-        st = drafter_.kind != RAD_DRAFT_BLOCK ? finish_serial_drafter(so)
-           : block_card_                      ? finish_block_drafter(so)
-                                              : run_block_drafter(b->step);
+        /* The drafter for the next step already ran on the card; what remains is to check its
+         * acceptance against the host's and publish its proposals. Each driver returns
+         * immediately for a kind that is not its own. */
+        st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
@@ -1491,15 +1485,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         auto* b = static_cast<PCBinding<PrefixCache>*>(pc_iface_.get());
         /* Called inside Scheduler::step() under its lock, which makes touching the cache and rank
          * 0's manager safe; nothing here may call back into the scheduler. */
-        b->restore_fn = [this, b](const Request& req) {
+        b->restore_fn = [this, b](const Request& req, bool whole_only) -> RestoreResult {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
             /* Room is made before anything is planned (PCBinding::restore_plan): a chain the free
              * list cannot hold would otherwise come back only as far as it reaches. One block
              * table serves every rank, so what rank 0's cache gives up is room on every rank. */
-            const std::vector<BlockHash> want =
-                b->restore_plan(req, cvec_salt_for(req.sp.use_control_vector));
-            if (want.empty()) return;
+            RestoreResult res = RestoreResult::Whole;
+            const std::vector<BlockHash> want = b->restore_plan(
+                req, cvec_salt_for(req.sp.use_control_vector), whole_only, &res);
+            if (want.empty()) return res;
             /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
              * thousands of entries; batched, it is one launch per (group, layer) per staging batch
              * and one copy per run of arena slots instead of a round trip per entry. */
@@ -1510,7 +1505,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                 if (!ranks_[0]->tierx.plan_promote(h, &j)) break;
                 jobs.push_back(std::move(j));
             }
-            if (jobs.empty()) return;
+            /* A record still in flight ends the chain here, as a short reservation does below. */
+            if (jobs.size() < want.size()) res = RestoreResult::Cut;
+            if (jobs.empty()) return res;
             std::vector<char> ok(jobs.size(), 1);
             for (auto& r : ranks_) {
                 std::vector<char> mine;
@@ -1525,7 +1522,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             const std::vector<int32_t>& cg = pc.cached_groups();
             for (size_t i = 0; i < jobs.size(); ++i) {
                 TierJob& j = jobs[i];
-                if (!ok[i]) continue;
+                if (!ok[i]) { res = RestoreResult::Cut; continue; }
                 const int rb = pc.rebind(j.key, j.blocks);
                 if (rb != RAD_OK) {
                     /* No entry to land in: release the reserved blocks and forget the tier record,
@@ -1537,6 +1534,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                 }
             }
             ranks_[0]->tiers.note_restore((int64_t)(rad_mono_ns() - t0));
+            return res;
         };
         /* An eviction that would lose an entry waits for its copy instead. Called by the prefix
          * cache binding under the scheduler's lock when dropping already-copied entries did not
@@ -1688,6 +1686,7 @@ std::string Engine::engine_info() const {
     e["tensor_parallel"]        = cfg_.tp;
     e["tp_wire"]                = cfg_.tp > 1 ? (cfg_.tp_wire_exact ? "exact" : "wht6") : "n/a";
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
+    e["attn_prefill_fp8"]       = attn_prefill_fp8_name(cfg_.attn_prefill_fp8);
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
@@ -2538,6 +2537,7 @@ int Engine::run_server() {
         in.chunk_bos = gd.chunk_bos;
         in.chunk_eos = gd.chunk_eos;
         in.chunk_pad = gd.pad_token;
+        in.cond_opts = gd.cond_opts;
         image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
@@ -2723,8 +2723,8 @@ int Engine::run_server() {
             RAD_INFO("chat: the template takes reasoning_effort %s, and none or minimal turn "
                      "thinking off%s%s", list.c_str(), mapped.empty() ? "" : "; mapped: ",
                      mapped.c_str());
-            /* What a request naming no effort gets, which a client cannot see: Qwen3.8's template
-             * renders xhigh into a system prompt (#113). */
+            /* What a request naming no effort gets, which a client cannot see: a template may
+             * render a level into a system prompt (Qwen3.8's renders xhigh). */
             const std::string& dflt = srv.template_default_effort();
             if (cfg_.reasoning_effort.empty() && !dflt.empty())
                 RAD_INFO("chat: a request naming no reasoning_effort renders as '%s', the "

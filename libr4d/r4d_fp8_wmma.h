@@ -204,20 +204,6 @@ __device__ __forceinline__ Stage8 stage8_load(const uint8_t* __restrict__ src, b
     return r;
 }
 
-// Fragment-order counterpart: a lane's 32 bytes in a (16 row, 64 k) tile are four granules of one
-// row at k `k0 + t*16`. They are de-permuted on the way into LDS, so the padded pitch and frag()
-// apply unchanged; reading fragment order straight from LDS would put eight lanes on one bank.
-template <uint32_t FK>
-__device__ __forceinline__ void stage8_store_frag(uint8_t* __restrict__ lds, uint32_t row,
-                                                 uint32_t k0, Stage8 r) {
-    const uint4 v = r.v, w = r.w;
-    const uint2 gr[4] = { make_uint2(v.x, v.y), make_uint2(v.z, v.w), make_uint2(w.x, w.y),
-                          make_uint2(w.z, w.w) };
-#pragma unroll
-    for (uint32_t i = 0; i < 4; ++i)
-        *(uint2*)(lds + (size_t)row * lds_pitch<FK>() + k0 + i * kFragK) = gr[i];
-}
-
 template <uint32_t FK>
 __device__ __forceinline__ void stage8_store(uint8_t* __restrict__ lds, uint32_t row, uint32_t k0,
                                              Stage8 r) {

@@ -339,9 +339,13 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     std::string pcm;
     for (const gen::AudioChunk& c : chunks) append_pcm16(c.samples, &pcm);
     const double secs = (double)pcm.size() / 2.0 / (double)(info.channels * info.sample_rate);
-    RAD_INFO("audio: %.1f s from %lld frames in %lld windows, %.1f s%s", secs,
-             (long long)ticket->frames, (long long)ticket->windows,
-             (double)(ticket->t_done_ns - ticket->t_submit_ns) * 1e-9,
+    auto sec = [](int64_t a, int64_t b) { return a > 0 && b >= a ? (double)(b - a) * 1e-9 : 0.0; };
+    RAD_INFO("audio: %.1f s from %lld frames in %lld windows, %.1f s: queue and prompt %.1f s, "
+             "first audio %.1f s, frames %.1f s%s", secs, (long long)ticket->frames,
+             (long long)ticket->windows, sec(ticket->t_submit_ns, ticket->t_done_ns),
+             sec(ticket->t_submit_ns, ticket->t_prompt_ns),
+             sec(ticket->t_submit_ns, ticket->t_first_audio_ns),
+             sec(ticket->t_prompt_ns, ticket->t_frames_ns),
              ticket->model_ended ? "" : " (the request's length)");
     HttpResponse res;
     res.status = 200;

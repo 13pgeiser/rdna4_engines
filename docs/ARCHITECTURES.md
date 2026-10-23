@@ -263,14 +263,24 @@ and every difference is behind `#if QWEN35_MOE` in the shared source. It is a se
 unit rather than a branch on `n_expert` because the id is half the selection key, and one `.so`
 cannot claim both ids.
 
+The routed experts are served in the format the container stores, read from layer 0's first
+expert (`MoeFP8::probe`, as `qwen4exp` does): block FP8, the four-bit forms of
+[`docs/MOE-W4.md`](MOE-W4.md), whose rotated ones add a rotated copy of the block input (`moe_hr`),
+or OCP MXFP4 (`fp4_e2m1*e8m0[1x32]`, `data/recipes/sage-a1.5-mxfp4-df2.recipe`).
+Experts stored stacked or one by one are both read (`moe_expert_sources`). Plain bf16 experts are
+refused, since this plugin has no bf16 expert path. Tensor parallelism splits each expert's
+width, so the GPTQ calibration tap (`RADIANCE_CALIB_DIR`) runs at one rank only.
+
 **Drafters.** The container's own MTP head is the default, and `rad-convert --draft-model` can
-replace it with a DFlash2 block drafter; the shared source declares it (`declare_dflash2`) and
-does not declare the MTP head when a DFlash2 drafter is present, so the routed trunk carries a dense drafter
-without further work. `sage-a1.5-fp8-df2.rad` is such a container: Sage-A1.5's routed trunk with
+replace it with a DFlash2 block drafter. The shared source selects the drafter from the container's
+`draft.architectures` (a DFlash2 model), declares it (`declare_dflash2`) and then does not declare
+the MTP head, so the routed trunk carries a dense drafter without further work.
+`sage-a1.5-fp8-df2.rad` is such a container: Sage-A1.5's routed trunk with
 `incoai/Qwen3.6-35B-A3B-DFlash2`, whose six 2048-wide layers read eight taps
 (`target_layer_ids` 1 6 11 16 22 27 32 37) and propose a block of seven tokens in one pass. At
 depth 7 it accepts ~49% of the proposals and decodes 1.40x faster than the same trunk with its MTP
-head (393 against 282 tok/s on two R9700s). `--num-speculative-tokens auto` takes the depth the
+head (393 against 282 tok/s on two R9700s). `sage-a1.5-mxfp4-df2.rad` is the same with the trunk,
+the experts and the drafter's linears at MXFP4. `--num-speculative-tokens auto` takes the depth the
 drafter states.
 
 ## `qwen35_w8a8`
@@ -289,9 +299,13 @@ a plain int8 trunk is refused.
 - **The encoding is the only guard.** Rotated and plain int8 have the same bytes and extents, and
   the rotated weight against the plain quantiser measures rel_l2 ~1.0 (r4d_selftest, `i8a8h_rot`),
   so each dtype's layout hook takes only its own transform.
-- **Each rotated linear quantises its own input** from the bf16 plane its producer writes: q, k and
-  v quantise one input three times, and no producer writes rotated codes yet. The MLP's gated fold
-  is an fp8a8 tile over E4M3 codes, so an int8 gate_up runs the pair.
+- **The producers write the rotated codes** where libr4d declares the `_had_quant_i8g` ops: the
+  norms (`rmsnorm_had_quant_i8g`, at two ranks `ar_rmsnorm_had_quant_i8g`) and the gated product
+  (`gated_had_quant_i8g`) write `had_quant_act_i8g`'s bytes into the int8 pair (`ActFP8::q8_rot`),
+  so q, k and v share one quantiser and down has none. The attention and delta-net outputs still
+  take `had_quant_act_i8g` from the bf16 plane, and so does every linear where the ops are not
+  declared (libref and libavx). The MLP's gated fold is an fp8a8 tile over E4M3 codes, so an int8
+  gate_up runs the pair.
 - **It declines imported checkpoints** (`RAD_ARCH_SERVES_IMPORTS(0)`). An imported quantisation
   goes to the family's one quantised plugin, and a second one would refuse every Quark, ParoQuant,
   GPTQ or NVFP4 Qwen3.8 release; they stay with `qwen35_fp8`.
@@ -872,12 +886,20 @@ and the drafter reads it through the same scale.
 (slice A whole 128-row tiles, both at least 512) and runs each slice's two all-reduces per layer on
 the second lane beside the other slice's compute, as the prefill overlap above does, with one
 difference: o_proj and down_proj both write `h`, so the issue order never lets lane 0 write rows of
-`h` that lane 1 is reducing, and `h` is the one buffer taken out of the arena's sharing. Attention
-runs whole. Both slices are above every row band the sliced kernels have (the int8 GEMMs' skinny
-band at 64, since the prefill kernel takes each row's K in order whatever M is, and
-r4d_act_threads' last width change at 120 rows for these widths), so on the exact wire the output
-equals the whole step's bit for bit. Every junction must be fused, as the w4a8 and w8a8
-containers' are; a bf16 trunk runs whole, and so does every step under `RADIANCE_GEMMA4_OVERLAP=0`.
+`h` that lane 1 is reducing, and `h` is the one buffer taken out of the arena's sharing. On a
+one-sequence step the attention runs per slice too (slice A's projection, prologue, attention and
+o_proj, then slice B's), so each of a layer's four reductions sits beside a whole block; slice
+A's attention takes its context end from `kv_len_trim`, the step's context less slice B's rows. A
+step of several sequences, a multi-component rotary or a library without `kv_len_trim` runs the
+attention whole. The lane-1 reductions are their own ops at `overlap` 1: libr4d's narrow
+four-block two-shot, whose pushes carry about 12.2 bits a bf16 value where the message fits that
+form, with the same bytes. Both slices are above every row band the sliced kernels have (the int8
+GEMMs' skinny band at 64, since the prefill kernel takes each row's K in order whatever M is, and
+r4d_act_threads' last width change at 120 rows for these widths), and a slice's attention rows see
+exactly the keys they see in the whole step, so on the exact wire the output equals the whole
+step's bit for bit. The overlap is a fixed rule: it runs wherever every junction is fused (as the
+w4a8 and w8a8 containers' are) and the all-reduce wire is exact; a bf16 trunk, or `--tp-wire
+wht6`, runs every step whole, and the startup notes say which.
 
 **The 31B's q, k and v as one linear.** Converted with a recipe that names `blk.*.attn_qkv.weight`
 (both -df recipes do), each layer's q, k and v (q and k on a global layer, where v is k) are one
@@ -887,7 +909,8 @@ The grid's groups never cross a row, so the codes are those of three separate ru
 the replies are too. On libr4d the skinny GEMM picks its in-block K split from N (k and v alone
 split K in two, the fused GEMM does not), so k and v can round differently in the last bit and a
 long greedy reply can part from the old container's late. `qkv_norm_rope` and `kv_store` work on
-the row's column slices in place. Attention reads q in the row through `attn_paged_qrow`: a global
+the row's column slices in place, as one launch (`qkv_norm_rope_kv_store`, byte-identical to the
+pair) where a library serves it. Attention reads q in the row through `attn_paged_qrow`: a global
 layer at every height (the windowed kernel, which serves head_dim 512 under `attn_paged` too), a
 sliding layer up to 32 query rows a sequence (libr4d's h256/gqa2 split-KV decode with q at a pitch,
 so a verify step included); a taller sliding step (a prefill) copies q out with a `cast` for the
@@ -917,21 +940,48 @@ layers 0 16 28 46 58 (`gemma4::dflash2_taps`). It was trained against the target
 plain embedding and the target's head as a plain linear, so its lookup takes no Gemma scale and its
 head no soft-cap. The -df2 recipe stores its head copy int8 (`head_i8`, read at w8a8) rather than
 the 2-bit grid Qwen3.8's recipes use, so the selector ranks what an 8-bit head proposes. Its
-attention is the sliding layers' h256 gqa-2 split-KV decode, non-causal. `run-gemma4-31b.sh`
-takes it with `DRAFTER=df2`.
+attention is the sliding layers' h256 gqa-2 split-KV decode, non-causal. Where libr4d serves them,
+each layer's norm, rotary and cache-store chain is one `qkv_norm_rope_kv_store` launch in either
+pass (`v_norm` 0; `n_head` 0 in the context pass, which writes keys and values only), and each
+residual add is folded into the norm after it (`add_rmsnorm`), all byte-identical to the chains;
+Qwen3.8's head-128 DFlash2 drafter keeps the prologue chains and folds only the adds. At two ranks
+or more a block-fp8 `fc` is split by rows (`rad_block_dflash2.h`, SHARDING), each rank computing
+the whole 128-row scale blocks that cover its share of the columns and an `all_gather` assembling
+them, with `gemm_nt_q`'s `split_n` keeping every output the unsplit fc's to the bit. The recipe is
+`gemma4-31b-dense-bf16-w4a8-df2.recipe`.
 
 **The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
-of it (`ar_rmsnorm_quant_i8`). At four it does too, at decode heights. libr4d's
-`ar_rmsnorm_quant_i8_4rank` is the exact four-rank one-shot with the junction as its epilogue,
-byte-identical to `all_reduce` + `rmsnorm_quant_i8`. A one-shot sends three times the message per
-rank, so the plugin declares it only up to 4 rows and issues the pair in a taller step. On 4x
-R9700 the fold made plain decode 5.6% faster (94 against 89 tok/s) and a DFlash verify (16 rows)
-9% slower (276 against 300), where the standalone all-reduce is the exact two-shot. A decode step
-at tp 4 then has two standalone reductions (the embedding's and the last feed-forward's) where it
-had 121. It gives the pair's greedy text byte for byte. At sixteen rows of 5376 the junction is
-55 us against 22 at one row (--profile-ops): its handshakes, not its bytes, set it.
-`r4d_selftest --case ar_rmsnorm_quant_i8_4rank` checks it on four cards, and the startup note says
-which form a deployment takes.
+of it (`ar_rmsnorm_quant_i8`). At four it does too, in steps of up to 16 rows (decode, and a DFlash
+or DFlash2 verify), on libr4d's `ar_rmsnorm_quant_i8_4rank`, in a form chosen by height. Every form
+is byte-identical to `all_reduce` + `rmsnorm_quant_i8`:
+
+- 1 to 3 rows: the exact four-rank one-shot with the junction as its epilogue. A one-shot sends
+  three times the message per rank and takes a fenced handshake per row, so it pays only at the
+  bottom: on 4x R9700 it made plain decode about 5% faster (90 against 86 tok/s), and at 16 rows it
+  would be 9% slower than the pair.
+- 4 to 16 rows: the all-reduce split around the junction (`sp`). Each rank reduces the quarter of
+  the rows it owns, runs the junction on them and gathers the int8 codes, so the second hop carries
+  a byte a column and the junction a quarter of the rows. The residual then holds the rank's own
+  rows only, which is all the next junction reads; the junctions where the drafter taps the
+  stream, and the last layer's attention junction, gather it on every row (`sp` 2). On 4x R9700 a
+  DFlash2 verify (8 rows) ran about 2% faster than with the tail form below.
+- libr4d's row also has a tail form for 5 to 32 rows, the exact two-shot with the junction run
+  after it in the same launch; the 31B takes it only where the split form is not declared.
+
+A taller step issues the pair (the split form lost about 10% under load at 24 to 64 rows). A decode
+step at tp 4 then has two standalone reductions (the embedding's and the last feed-forward's) where
+it had 121. `r4d_selftest --case ar_rmsnorm_quant_i8_4rank` checks every form on four cards, and
+the startup note says which forms a deployment takes.
+
+**Weight reads beside the all-reduces.** At more than one rank, on decode and verify steps of up to
+16 rows that carry no prompt rows, the 31B reads the next GEMM's leading weight bytes into the
+on-die cache (libr4d `prefetch`) while an all-reduce leaves the card's memory idle: gate_up's first
+20 MB beside the attention's reduction, the next layer's q|k|v (the lm_head after the last layer)
+beside the feed-forward's, and down_proj's first 9 MB beside the attention; its DFlash2 drafter
+reads each reduction's following projections the same way. Where launches chain the read is the
+chained form right behind the GEMM before the reduction, otherwise it rides the second lane. The
+reads change no value; on 4x R9700 the 31B with DFlash2 decoded 15% faster with them, and without
+a drafter about 2%.
 
 **FP8 experts.** The experts are ~90% of the weight bytes, so each projection is served as the
 container holds it, per layer: bf16 by `moe_gemm`, block fp8 by `moe_gemm_q`. gate_up
@@ -1158,6 +1208,12 @@ VAE       Qwen-Image's (Wan 2.1's causal 3-D convolutions on one frame), 16 chan
 schedule  Raw: 28 steps, the resolution-shifted schedule of its scheduler config, guidance 4.5 in
           the card's terms against an empty negative prompt; Turbo: 8 steps at a fixed shift
           (mu 1.15), no guidance. Raw or Turbo is read from the pipeline and scheduler config
+rebalance a request's `rebalance` (RAD_GEN_COND_REBALANCE, declared in cond_opts): each tap
+          times a fixed gain before the fusion, ComfyUI's ConditioningKrea2Rebalance at its
+          defaults, 4, 4, 4, 4, 4, 4, 4, 10, 20, 4.4, 16, 4; chan_affine in f32, rounded once,
+          from te.x into te.h2, which the tap's scatter then reads. The gains cannot be folded
+          into weights: the taps enter the layer-wise fusion blocks raw, through a pre-norm
+          residual. Without it no scale is issued and the taps are scattered from te.x
 ```
 
 Traps:
@@ -1774,7 +1830,7 @@ Traps:
   first decoded garbage and the first one partly.
 - **The MP4 is not a parity instrument.** H.264 at CRF 18 in yuv420p moves a random-weight
   model's frames by about 40 levels on its own; compare the frames before encoding (the op
-  oracle's patch_pix8 output).
+  oracle's tile_stitch output).
 
 Against diffusers' pipelines in bf16 on a tiny random-weight pipeline of the same layout (256x256,
 17 frames, from the same latents), the first frame's row sums agree to within 0.2% at 2 unguided

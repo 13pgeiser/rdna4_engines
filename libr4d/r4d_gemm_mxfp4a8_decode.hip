@@ -472,8 +472,9 @@ unsigned* mxd_out_ctr(const void* out) {
   const size_t n = R4D_MXD_MAX_N / (R4D_MXD_DWN * 16);
   unsigned* p = nullptr;
   if (hipMalloc((void**)&p, n * sizeof(unsigned)) != hipSuccess) return nullptr;
-  // Zero before any launch reads it: the memset is on the null stream, which the engine's streams
-  // need not wait for, so wait here (as r4d_moe.hip's router counters do).
+  // Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has finished
+  // when it returns (core/device/aql.cpp); under HIP's own runtime (r4d_selftest) it runs on the
+  // null stream, which a non-blocking stream does not wait for, so wait here.
   if (hipMemset(p, 0, n * sizeof(unsigned)) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
     (void)hipFree(p);
     return nullptr;

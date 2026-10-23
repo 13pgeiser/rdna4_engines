@@ -31,11 +31,18 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
         while (s + 1 < n_seg && patch_at(s + 1) <= first + k) ++s;
         const int64_t within = first + k - patch_at(s);
         const int64_t bw = seg_w(s) / merge;
-        const int64_t in_col = within % merge;
-        const int64_t in_row = (within / merge) % merge;
-        const int64_t blk = within / (merge * merge);
-        const int64_t row = (blk / bw) * merge + in_row;
-        const int64_t col = (blk % bw) * merge + in_col;
+        int64_t row, col;
+        if (patch_raster) {
+            /* Raster order is its own inverse: patch i is row i / w, column i % w. */
+            row = within / seg_w(s);
+            col = within % seg_w(s);
+        } else {
+            const int64_t in_col = within % merge;
+            const int64_t in_row = (within / merge) % merge;
+            const int64_t blk = within / (merge * merge);
+            row = (blk / bw) * merge + in_row;
+            col = (blk % bw) * merge + in_col;
+        }
         planes[k]             = (int32_t)row;
         planes[count + k]     = (int32_t)col;
         planes[2 * count + k] = seg_h(s);

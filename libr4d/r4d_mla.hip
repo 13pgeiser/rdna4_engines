@@ -537,9 +537,13 @@ __global__ __launch_bounds__(128) void attend_matrix(const uint16_t* q, const ui
         atomicAdd(&g_mla_stats[2], (unsigned long long)(raster + 15) / 16);
     }
 }
-bool env_on(const char* name) {
-    const char* e = std::getenv(name);
-    return e && *e && *e != '0';
+/* Read once: the launch path asks on every matrix launch. */
+bool stats_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_MLA_CONFLICT_STATS");
+        return e && *e && *e != '0';
+    }();
+    return on;
 }
 void read_stats(unsigned long long (&v)[3], bool reset) {
     v[0] = v[1] = v[2] = 0;
@@ -609,7 +613,7 @@ int body(const RadArgs* a, RadStream stream) {
     /* The union's LDS lists hold a table of at most kUnionBlocks entries; a wider table takes the
      * positional pairing. */
     const bool by_page = bt.shape[1] <= kUnionBlocks;
-    const bool stats = MATRIX && env_on("RADIANCE_MLA_CONFLICT_STATS");
+    const bool stats = MATRIX && stats_on();
     Meta m{ q.stride[0],  q.stride[1],      kv.stride[0],  kv.stride[2],
             bt.stride[0], bt.stride[1],     len.stride[0], o.stride[0],
             o.stride[1],  (int)q.shape[0],  (int)heads,    (int)bt.shape[1],

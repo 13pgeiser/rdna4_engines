@@ -75,6 +75,9 @@ static const Flag g_flags[] = {
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
                                         "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
+    { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
+                                        "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
+                                        "k6_v4 cache: faster at long context, and lossy" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
@@ -488,6 +491,17 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->kv_cache_dtype = v;
+        }
+        else if (S("--attn-prefill-fp8")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off"))  c->attn_prefill_fp8 = 0;
+            else if (!std::strcmp(v, "qk"))   c->attn_prefill_fp8 = RAD_ATTN_FP8_QK;
+            else if (!std::strcmp(v, "pv"))   c->attn_prefill_fp8 = RAD_ATTN_FP8_PV;
+            else if (!std::strcmp(v, "both")) c->attn_prefill_fp8 = RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV;
+            else {
+                RAD_ERR("--attn-prefill-fp8 takes off, qk, pv or both, not '%s'", v);
+                return RAD_E_INVAL;
+            }
         }
         else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
@@ -971,6 +985,16 @@ int config_parse(int argc, char** argv, Config* c) {
     return RAD_OK;
 }
 
+const char* attn_prefill_fp8_name(int bits) {
+    switch (bits) {
+        case 0:                                   return "off";
+        case RAD_ATTN_FP8_QK:                     return "qk";
+        case RAD_ATTN_FP8_PV:                     return "pv";
+        case RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV:  return "both";
+    }
+    return "?";
+}
+
 /* ------------------------------------------------------------------ the startup report's rows */
 namespace {
 
@@ -1025,6 +1049,8 @@ const ShowRow kShow[] = {
     { "--rope-scaling",       [](const Config& c) { return or_none(c.rope_scaling, "the checkpoint's own"); } },
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
+    { "--attn-prefill-fp8",   [](const Config& c) {
+          return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },

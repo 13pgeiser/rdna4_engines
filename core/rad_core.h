@@ -129,6 +129,8 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  *          embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
+/* --attn-prefill-fp8's spelling of RAD_ATTN_FP8_* bits: off, qk, pv or both. */
+const char* attn_prefill_fp8_name(int bits);
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
  *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
@@ -620,11 +622,22 @@ struct SamplingParams {
 
     /* The control vector (core/cvec.h): whether this request's steps project the vector found for
      * this deployment out of the residual stream. The server sets it from the request's
-     * `control_vector` field (`experimental_speed_projection` is Strata's spelling of the same
-     * switch), or from the deployment's runtime default when the request names none; it needs no
-     * reload and leaves the graph untouched. A deployment with no vector refuses `true` at
-     * admission rather than serving the stock model. */
+     * `control_vector` field, or from the deployment's runtime default when the request names
+     * none. A deployment with no vector refuses `true` at admission. */
     bool   use_control_vector = false;
+    /* The windowed no-repeat-ngram ban (core/sample/sampler.h, `sample_ngram_ban`): a token that
+     * would complete an `ngram_ban_n`-gram already present in the last `ngram_window` tokens of
+     * the sequence is banned. `ngram_ban_n` 0 is off, the default; `ngram_window` <= 0 searches
+     * the whole staged history (the un-windowed processor). Unlimited-OCR's generation_config
+     * asks for 35 and 128 (the model card's document mode uses 1024). */
+    int    ngram_ban_n = 0;
+    int    ngram_window = 0;
+    /* The ids exempt from that ban: the reference processor's whitelist
+     * (SlidingWindowNoRepeatNgramProcessor's `whitelist_token_ids`, whose set is removed from
+     * the banned set after it is built -- modeling_unlimitedocr.py:359,379). Global token ids,
+     * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
+     * no-whitelist form. */
+    std::vector<int32_t> ngram_whitelist;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
@@ -787,6 +800,10 @@ struct Config {
      * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
      * another name. */
     std::string kv_cache_dtype = "bf16";
+    /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
+     * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
+     * attn_prefill_fp8_name() spells it as the flag does. */
+    int attn_prefill_fp8 = 0;
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read

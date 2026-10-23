@@ -276,11 +276,8 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  *
  * Proposals go out through set_draft() like every other.
  *
- * Two drivers run these passes. run_block_drafter, after the step commits, stages both from the
- * committed sequence and reads the proposals back: two host waits a step with the card idle
- * between them, and no step issued ahead. The card's driver (issue_block_drafter, the default)
- * queues both behind the step before its readback, from the card's acceptance, as the serial
- * driver does; RADIANCE_DRAFT_BLOCK_HOST=1 selects the host's.
+ * Both passes are queued behind the step before its readback, from the card's acceptance, as the
+ * serial driver's are (sched/advance.h), so the next step can be issued ahead of the commit.
  */
 
 /* One drafter pass through the barrier. Neither pass samples (no logits in the context pass; the
@@ -306,63 +303,19 @@ int Engine::block_pass(const RadBatch* db, const char* what, int step) {
     return s;
 }
 
-int Engine::run_block_drafter(int step) {
-    if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.depth <= 0) return RAD_OK;
-
-    const int steps = drafter_.depth;
-    /* The row count is the drafter's (defaulted and checked by declare_drafter). */
-    const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
-    std::vector<Scheduler::BlockRow> rows((size_t)cfg_.max_seqs);
-    const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
-                                  rows.data(), (int)rows.size());
-
-    Rank& r0 = *ranks_[0];
-    void* prop = r0.ctx.buf_ptr(drafter_.proposal);
-    if (!prop) {
-        RAD_ERR("drafter '%s': `%s` was declared as the proposal buffer but never planned",
-                drafter_.name, r0.program.buffers[drafter_.proposal].name.c_str());
-        return RAD_E_STATE;
-    }
-
-    /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
-     * drafter will need, and skipping would leave a permanent hole in its cache. */
-    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
-
-    /* Cleared so a query batch that could not be built does not republish the previous step's
-     * proposals. */
-    draft_out_.clear();
-    if (n > 0) {
-        if (const RadBatch* qb = sched_.block_query(step)) {
-            RAD_TRY(block_pass(qb, "query", step));
-            const int64_t n_raw = (int64_t)n * steps;
-            int32_t* const raw = readback_.reserve(n_raw);
-            if (!raw) return RAD_E_NOMEM;
-            RAD_TRY(rad_memcpy_async(raw, prop, n_raw * 4, r0.ctx.stream()));
-            RAD_TRY(rad_stream_sync(r0.ctx.stream()));
-            draft_out_.assign(raw, raw + n_raw);
-        }
-    }
-    sched_.block_end();
-    if (n <= 0 || draft_out_.empty()) return RAD_OK;
-
-    for (int i = 0; i < n; ++i) {
-        /* A request the sampler will not speculate on gets no draft; see finish_serial_drafter. */
-        if (!r0.sampler.allows_speculation(rows[(size_t)i].seq)) continue;
-        sched_.set_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
-    }
-    return RAD_OK;
+bool Engine::block_drafting() const {
+    return drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0;
 }
 
-/* The card's driver: both passes behind the step, without waiting. After the trunk's ranks join,
- * the acceptance runs on every rank (ADV_ACCEPT), leaving each sequence's anchor and committed
- * end in its StepSlot. The context pass mirrors the trunk step, whose positions the host knows.
+/* Both passes behind the step, without waiting. After the trunk's ranks join, the acceptance runs
+ * on every rank (ADV_ACCEPT), leaving each sequence's anchor and committed end in its StepSlot. The context pass mirrors the trunk step, whose positions the host knows.
  * The query pass's rows are device rows that the card positions at the committed end (ADV_BLOCK),
  * and its proposals go into the slots behind the anchor (ADV_BTAKE): exactly the token row the
  * next verify reads (ADV_TRUNK), so the step issued ahead verifies them with no host round trip.
  * collect_step's wait covers both passes and the slots' readback. */
 int Engine::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
-    if (!block_card_) return RAD_OK;
+    if (!block_drafting()) return RAD_OK;
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* The sampled ids before either pass, as the serial driver reads them. */
@@ -374,7 +327,8 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 
-    /* Even when nothing drafts; see run_block_drafter. */
+    /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
+     * drafter will need, and skipping would leave a permanent hole in its cache. */
     if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
@@ -393,7 +347,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
  * (a disagreement is a defect and the step is refused, as in finish_serial_drafter), move the
  * drafter's filled range, and publish each row's proposal from the slots. */
 int Engine::finish_block_drafter(const StepOut& so) {
-    if (!block_card_) return RAD_OK;
+    if (!block_drafting()) return RAD_OK;
     if (block_rows_ > 0) {
         const StepPlan& plan = sched_.plan();
         for (size_t i = 0; i < plan.e.size(); ++i) {

@@ -1052,8 +1052,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         if (known && !plain) {
             char en[256];
             rad_enc_format(&enc, en, sizeof en);
-            fprintf(stderr, "radiance: '%s' is %s and this model's linears are plain bf16; a "
-                            "bf16 container is served bf16 throughout\n", wn, en);
+            fprintf(stderr, "radiance: '%s' is %s, but this linear runs as a plain bf16 GEMM "
+                            "(a bf16 model, or a block that keeps its linears bf16); the "
+                            "container must store it bf16\n", wn, en);
             return RAD_E_DTYPE;
         }
         /* A bf16 weight needs the input's bf16 plane, which a quantised model's producer may not

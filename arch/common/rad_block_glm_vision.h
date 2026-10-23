@@ -1,7 +1,7 @@
 /* rad_block_glm_vision.h -- GLM-5.3's vision tower (transformers' Glm5NextVisionModel), served by
  * glm5next.
  *
- * WHAT IT COMPUTES, per encoder pass (RadBatch::enc):
+ * What it computes, per encoder pass (RadBatch::enc):
  *
  *   x  = patches @ Wp^T + bp                     the Conv3d patch embedding as a linear layer; a
  *                                                patch row is (channel, frame, y, x), no position

@@ -44,6 +44,24 @@ struct IKVManager {
     /* After a committed step, a window group frees what no later query can read
      * (KVManager::trim_window). */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
+    /* R-SWA (KVManager::declare_runtime_window): the W this group arms a sequence with, 0 when it
+     * carries no runtime windows. The scheduler arms every sequence it admits with
+     * set_window(seq, prompt length, W); a manager with no runtime window refuses it and the
+     * scheduler never asks. */
+    virtual int64_t runtime_window_tokens(int32_t group) const { (void)group; return 0; }
+    virtual int  set_window(uint64_t seq, int64_t visible_lo, int64_t window_tokens) {
+        (void)seq; (void)visible_lo; (void)window_tokens;
+        return RAD_E_UNSUPPORTED;
+    }
+    /* The sequence's runtime window in `group`, if it has one (KVManager::runtime_window). A
+     * sequence with one is excluded from prefix publish, checkpoint snapshots and speculation:
+     * the window is runtime data and the ring rewrites its slots in place. */
+    virtual bool runtime_window(uint64_t seq, int32_t group, SeqWindow* out) const {
+        (void)seq; (void)group; (void)out;
+        return false;
+    }
+
+    virtual bool has_runtime_window(uint64_t seq) const { (void)seq; return false; }
     /* Window snapshot of a prefix hit (KVManager::has_window_snapshot / seed_window). The
      * defaults mean no hit on a windowed trunk is ever resumed. */
     virtual bool has_window_snapshot() const { return false; }
@@ -95,7 +113,11 @@ struct IKVManager {
 
     /* Absolute token position that block_table(seq, group)[0] covers: zero for a full group,
      * non-zero for a window group once blocks below the window are recycled. The step batch maps
-     * a slot as `(pos - first_block_pos) / block_size`. */
+     * a slot as `(pos - first_block_pos) / block_size`.
+     *
+     * A sequence with a runtime window (runtime_window) keeps first_block_pos 0 even once the ring
+     * recycles: its table is [reference][ring] from position 0 and the ring's positions map
+     * modulo ring_blocks (SeqWindow), so only the slot index recycles, never the table. */
     virtual int64_t first_block_pos(uint64_t seq, int32_t group) const = 0;
 
     /* Index of the first entry of block_table(seq, group) changed since the previous call;
@@ -110,13 +132,22 @@ struct IKVManager {
 };
 
 /* ------------------------------------------------------------------ the prefix cache */
+/* What IPrefixCache::restore did: brought back every entry the tiers hold for the prompt (or there
+ * were none), brought back part of them because the pool could not hold the chain, or, asked for
+ * the whole chain only, left it on the host. */
+enum class RestoreResult : uint8_t { Whole, Cut, Declined };
+
 struct IPrefixCache {
     virtual ~IPrefixCache() = default;
 
     /* Bring back whatever the idle tiers hold for this prompt, before the lookup. The engine
      * performs it (it allocates blocks and runs a device scatter). A failure only leaves a
-     * shorter prefix, which is always safe. */
-    virtual void restore(const Request&) {}
+     * shorter prefix, which is always safe. With `whole_only`, a chain the pool cannot be made to
+     * hold whole is left on the host (RestoreResult::Declined). */
+    virtual RestoreResult restore(const Request&, bool whole_only) {
+        (void)whole_only;
+        return RestoreResult::Whole;
+    }
     /* A step's admissions begin; the last step's lookup results have been consumed. */
     virtual void begin_step() {}
     /* Keep this waiting request's chain in VRAM until release(). Called when admission is refused
@@ -170,8 +201,6 @@ struct IPrefixCache {
     virtual CkptCounts ckpt_counts() const { return {}; }
     /* Entries expired by --prefix-cache-ttl; not counted as evictions. */
     virtual int64_t expired() const { return 0; }
-    /* Restores the pool could not hold whole (PrefixCache::Stats::restore_cuts). */
-    virtual int64_t restore_cuts() const { return 0; }
     virtual int64_t ckpt_expired() const { return 0; }
 
     /* Tokens of context held only by the cache right now. Blocks a running sequence also reads
@@ -215,7 +244,7 @@ struct KVGeom {
         for (const KVGroupInfo& gi : groups) {
             G e;
             e.kind = gi.decl.kind;
-            e.paged = (e.kind == RAD_KV_FULL || e.kind == RAD_KV_WINDOW);
+            e.paged = (e.kind == RAD_KV_FULL || e.kind == RAD_KV_WINDOW || e.kind == RAD_KV_RING);
             e.block_size = gi.block_size > 0 ? gi.block_size : 1;
             e.window = gi.decl.window;
             k.g.push_back(e);
@@ -228,6 +257,23 @@ struct KVGeom {
     int32_t slot(int gi, const std::vector<int32_t>& bt, int64_t first_pos, int64_t pos) const {
         const G& e = g[(size_t)gi];
         int64_t bi = (pos - first_pos) / e.block_size;
+        if (bi < 0 || bi >= (int64_t)bt.size()) return -1;
+        return (int32_t)(bt[(size_t)bi] * e.block_size + (pos % e.block_size));
+    }
+
+    /* The same slot for a runtime window (SeqWindow): the reference maps linearly (first_pos is
+     * 0 there), and a position at or past the ring's start lives in block
+     * ring_pos/block + ((pos - ring_pos)/block) % ring_blocks, which is what rewrites the ring's
+     * slots in place. ring_pos is block-aligned, so `pos % block` stays the in-block offset. */
+    int32_t slot_ring(int gi, const std::vector<int32_t>& bt, int64_t first_pos, int64_t pos,
+                      const SeqWindow& w) const {
+        const G& e = g[(size_t)gi];
+        int64_t bi;
+        if (w.set && pos >= w.ring_pos) {
+            bi = w.ring_pos / e.block_size + ((pos - w.ring_pos) / e.block_size) % w.ring_blocks;
+        } else {
+            bi = (pos - first_pos) / e.block_size;
+        }
         if (bi < 0 || bi >= (int64_t)bt.size()) return -1;
         return (int32_t)(bt[(size_t)bi] * e.block_size + (pos % e.block_size));
     }
@@ -246,6 +292,12 @@ struct KVBinding final : IKVManager {
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
     int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
+    int64_t runtime_window_tokens(int32_t g) const override { return m->runtime_window_tokens(g); }
+    int  set_window(uint64_t s, int64_t lo, int64_t w) override { return m->set_window(s, lo, w); }
+    bool runtime_window(uint64_t s, int32_t g, SeqWindow* o) const override {
+        return m->runtime_window(s, g, o);
+    }
+    bool has_runtime_window(uint64_t s) const override { return m->has_runtime_window(s); }
     bool has_window_snapshot() const override { return m->has_window_snapshot(); }
     int  seed_window(uint64_t s, int64_t p) override { return m->seed_window(s, p); }
     int  adopt(uint64_t s, int32_t g, const std::vector<int32_t>& b, int64_t n) override {
@@ -344,16 +396,20 @@ struct PCBinding final : IPrefixCache {
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */
-    std::function<void(const Request&)> restore_fn;
-    void restore(const Request& r) override {
-        if (restore_fn) restore_fn(r);
+    std::function<RestoreResult(const Request&, bool whole_only)> restore_fn;
+    RestoreResult restore(const Request& r, bool whole_only) override {
+        return restore_fn ? restore_fn(r, whole_only) : RestoreResult::Whole;
     }
     /* The entries restore_fn brings back, in chain order: the whole chain if the pool can be made
      * to hold it, otherwise cut (PrefixCache::restorable_from). Room is made as evict() makes it,
-     * dropping entries with a landed host copy, then landing pending copies and dropping those, but
-     * never erasing one: a restore is worth no lost conversation. The pool's free quarter can go
-     * to it; the reserve's trim after the next publish frees it again. */
-    std::vector<BlockHash> restore_plan(const Request& r, uint64_t salt) {
+     * dropping entries with a landed host copy, then landing pending copies and dropping those,
+     * but never erasing one, so no other conversation is lost to a restore. The pool's free
+     * quarter can go to it; the reserve's trim after the next publish frees it again. `*res`
+     * says whether the chain was cut; with `whole_only`, a chain that would be cut comes back
+     * empty and Declined, and the room made stays for the next attempt. */
+    std::vector<BlockHash> restore_plan(const Request& r, uint64_t salt, bool whole_only = false,
+                                        RestoreResult* res = nullptr) {
+        if (res) *res = RestoreResult::Whole;
         media_keys(r, &mm_, salt);
         std::vector<BlockHash> want = m->restorable_from(r.prompt, mm_);
         const int64_t need = (int64_t)want.size() - m->restore_room();
@@ -361,7 +417,16 @@ struct PCBinding final : IPrefixCache {
         const int64_t k = m->trim_for(r.prompt, mm_, need);
         if (k < need && flush_fn && flush_fn()) (void)m->trim_for(r.prompt, mm_, need - k);
         /* Landing copies may have moved records; take the chain again against the room made. */
-        return m->restorable_from(r.prompt, mm_, m->restore_room());
+        if (whole_only) {
+            want = m->restorable_from(r.prompt, mm_);
+            if ((int64_t)want.size() <= m->restore_room()) return want;
+            if (res) *res = RestoreResult::Declined;
+            return {};
+        }
+        bool cut = false;
+        want = m->restorable_from(r.prompt, mm_, m->restore_room(), &cut);
+        if (cut && res) *res = RestoreResult::Cut;
+        return want;
     }
     void begin_step() override { m->begin_step(); }
     void hold(const Request& r) override {
@@ -422,7 +487,6 @@ struct PCBinding final : IPrefixCache {
         return { st.ckpt_retired, st.ckpt_lru, st.ckpt_refused };
     }
     int64_t expired() const override { return m->stats().expired; }
-    int64_t restore_cuts() const override { return m->stats().restore_cuts; }
     int64_t ckpt_expired() const override { return m->stats().ckpt_expired; }
     int64_t held_tokens() const override { return m->unshared_tokens(); }
 

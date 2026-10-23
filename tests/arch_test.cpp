@@ -14,6 +14,7 @@
 
 #include <array>
 #include <dlfcn.h>
+#include <sstream>
 #include <thread>
 
 /* ==================================================================== the plugin under test */
@@ -31,6 +32,8 @@
 #include "../arch/gemma4/gemma4.cpp"
 /* Qwen3-ASR: a Whisper-style audio tower over a dense Qwen3 decoder. */
 #include "../arch/qwen3asr_bf16/qwen3asr_bf16.cpp"
+/* Unlimited-OCR: the Llama-MoE decoder and its DeepEncoder tower (SAM + CLIP). */
+#include "../arch/unlimitedocr_bf16/unlimitedocr_bf16.cpp"
 /* The PLE block alone: no architecture here declares it, and what its step() hands the two
  * windowed ops is its own contract (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -58,6 +61,8 @@
 #include "../arch/qwenimage21/qwenimage21.cpp"
 /* Anima: a cross-attention generator conditioned through two tokenizers. */
 #include "../arch/anima/anima.cpp"
+/* Krea 2: a generator conditioned on twelve tapped layers of Qwen3-VL. */
+#include "../arch/krea2/krea2.cpp"
 
 /* ==================================================================== fixtures and helpers */
 namespace {
@@ -1693,6 +1698,7 @@ TEST(a_sizing_declare_leaves_the_step_state_alone_and_shrinks_only_rows) {
     RadArchProbe pb{};
     CHECK_OK(qwen4exp_fp8::probe(&meta, &pb));
     CHECK(pb.shape_probe_ok);
+    CHECK(pb.control_vector_ok);
 
     /* A 4096 budget under a span (RadBuildCtx::max_mixed_tok 2048: a step wider than 2048 is one
      * sequence) reads in pass-wide pieces and scores a pass-tall plane in windows, and at four
@@ -4611,10 +4617,10 @@ TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
 /* At four ranks the junctions carry their reductions at decode heights, in the same issue order as
  * at two ranks (only the embedding's and the last layer's feed-forward reduction stand alone),
  * through ar_rmsnorm_quant_i8 declared at world_size 4 up to 16 rows (kAr4FoldRows: a DFlash
- * verify's rows, which libr4d folds in its tail form, inside its one-shot band of 524288 / 5376 =
- * 97), and beside each the same op with `sp` (the all-reduce split around the junction) over the
- * same 16 rows, which a step from 4 rows takes. A taller step issues each reduction and its
- * junction apart, and where no library declares the fold every step issues the pair. */
+ * verify's rows), and beside each the same op with `sp` (the all-reduce split around the
+ * junction) over the same 16 rows, which a step from 4 rows takes. A taller step issues each
+ * reduction and its junction apart, and where no library declares the fold every step issues the
+ * pair. */
 TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_decode_heights) {
     const int L = 12;
     std::vector<std::string> folded = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
@@ -5364,17 +5370,16 @@ TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_sec
     CHECK(noted(b, "prefill overlap: off (the residual junctions are not fused)"));
     CHECK(b.concurrent.empty());
 
-    /* and the switch: every step whole, nothing on the second lane */
-    setenv("RADIANCE_GEMMA4_OVERLAP", "0", 1);
+    /* and the lossy wire, which gives no slice the whole step's bits: every step whole, nothing on
+     * the second lane */
     RadBuilder sw;
     g431df_encs(sw, false, true);
     RadBuildCtx sctx = build_ctx(0, 4);
-    sctx.max_tok  = 4096;
-    sctx.max_spec = 15;
-    const int rc = gemma4_bf16::declare(&sw, &meta, &sctx);
-    unsetenv("RADIANCE_GEMMA4_OVERLAP");
-    CHECK_OK(rc);
-    CHECK(noted(sw, "prefill overlap: off (RADIANCE_GEMMA4_OVERLAP=0)"));
+    sctx.max_tok       = 4096;
+    sctx.max_spec      = 15;
+    sctx.tp_wire_lossy = 1;
+    CHECK_OK(gemma4_bf16::declare(&sw, &meta, &sctx));
+    CHECK(noted(sw, "prefill overlap: off (the lossy all-reduce wire)"));
     CHECK(sw.concurrent.empty());
     const int32_t out[1] = { 4095 };
     RadBatch big = one_prompt(4096, out);
@@ -6627,6 +6632,7 @@ TEST(qwen35_fp8_fp8_v4_cache_is_400_bytes_a_token_and_head) {
 
     RadArchProbe p{};
     CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
+    CHECK_EQ(p.control_vector_ok, 0);
     CHECK_EQ(p.kv_quant_ok, (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4));
 }
 
@@ -6653,6 +6659,69 @@ TEST(qwen35_fp8_k6_v4_cache_is_352_bytes_a_token_and_head) {
     CHECK(e4 > 0);
     CHECK_EQ(v4, 0);
     CHECK(noted(b, "kv cache k6_v4"));
+}
+
+/* --attn-prefill-fp8: the trunk's attn_paged ops state `prefill_fp8` with the context's bits and
+ * the DFlash2 drafter's do not. At 0 no op names the parameter, so the exact declare is the one
+ * without the field: the same ops with the same parameters. */
+TEST(the_trunk_attention_states_prefill_fp8_only_when_the_context_asks) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    RadBuildCtx ctx = spec_ctx(0, 1, 7);
+    ctx.kv_dtype = RAD_F8E4M3;
+    RadBuilder exact, lossy;
+    REQUIRE_EQ(qwen35_fp8::declare(&exact, mk.meta(), &ctx), RAD_OK);
+    ctx.attn_prefill_fp8 = RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV;
+    REQUIRE_EQ(qwen35_fp8::declare(&lossy, mk.meta(), &ctx), RAD_OK);
+
+    for (const auto& o : exact.ops) CHECK(param(&o, "prefill_fp8") == nullptr);
+    REQUIRE_EQ(exact.ops.size(), lossy.ops.size());
+    int stated = 0, drafter = 0;
+    for (size_t i = 0; i < lossy.ops.size(); ++i) {
+        const RecOp& a = exact.ops[i];
+        const RecOp& o = lossy.ops[i];
+        CHECK_EQ(a.op, o.op);
+        const RecParam* p = param(&o, "prefill_fp8");
+        if (!p) {
+            CHECK_EQ(a.p.size(), o.p.size());
+            if (o.op == "attn_paged") ++drafter;
+            continue;
+        }
+        CHECK_EQ(o.op, std::string("attn_paged"));
+        CHECK_EQ(p->ival, (long long)(RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV));
+        CHECK_EQ(a.p.size() + 1, o.p.size());
+        ++stated;
+    }
+    CHECK(stated > 0);
+    CHECK(drafter > 0);
+
+    /* The bf16 family's block passes it on the same way. */
+    RadBuilder bf;
+    RadModelMeta meta = qwen35_meta();
+    RadBuildCtx c1 = build_ctx(0, 1);
+    c1.attn_prefill_fp8 = RAD_ATTN_FP8_QK;
+    CHECK_OK(qwen35_bf16::declare(&bf, &meta, &c1));
+    CHECK_EQ(pint(find_op(bf, "attn_paged"), "prefill_fp8"), (long long)RAD_ATTN_FP8_QK);
+
+    /* Over the fp8_v4 and k6_v4 layouts the trunk's attention states it beside the layout's
+     * kv_dtype, which is what libr4d's legs for those caches match. */
+    for (int kvq : { (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+        RadBuilder q;
+        RadBuildCtx cq = spec_ctx(0, 1, 7);
+        cq.kv_dtype = RAD_F8E4M3;
+        cq.kv_quant = kvq;
+        cq.attn_prefill_fp8 = RAD_ATTN_FP8_PV;
+        REQUIRE_EQ(qwen35_fp8::declare(&q, mk.meta(), &cq), RAD_OK);
+        const std::string want = kvq == RAD_KVQ_V4 ? "fp8_v4" : "k6_v4";
+        int legs = 0;
+        for (const auto& o : q.ops) {
+            const RecParam* p = param(&o, "prefill_fp8");
+            if (!p) continue;
+            CHECK_EQ(pstr(&o, "kv_dtype"), want);
+            CHECK_EQ(p->ival, (long long)RAD_ATTN_FP8_PV);
+            ++legs;
+        }
+        CHECK(legs > 0);
+    }
 }
 
 /* libr4d's fp8_v4 and k6_v4 rows are h256/gqa6 only: the probe answers no for another geometry, so the
@@ -6714,6 +6783,43 @@ TEST(qwen35moe_fp8_routes_every_expert_and_folds_the_shared_arm) {
     }
 }
 
+/* The experts are served in the format the container stores, read from layer 0's first expert:
+ * rotated four-bit experts take the w4a8h grouped GEMM, whose gate_up reads a rotated copy of the
+ * block input (`moe_hr`), at one rank and two. Plain bf16 experts are refused, since this plugin
+ * has no bf16 expert path. */
+TEST(qwen35moe_fp8_serves_the_experts_in_their_stored_format) {
+    MetaKV mk = q35moe_meta();
+    RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_BF16, 1, 128);
+    rad_enc_copy_str(w4.transform, "fwht128");
+    REQUIRE(rad_enc_valid(&w4));
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 } };
+        RadBuildCtx ctx = build_ctx(0, world);
+        REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const rad_buf hrq = (rad_buf)buf_named(b, "moe_hr.q");
+        REQUIRE(hrq != 0);
+        int rotated = 0, fp8 = 0, reads_hr = 0;
+        for (const auto& o : b.ops) {
+            if (o.op.rfind("moe_gemm", 0) != 0) continue;
+            rotated += pstr(&o, "dtype") == "w4a8h";
+            fp8 += pstr(&o, "dtype") == "fp8a8";
+            reads_hr += in(o.reads, hrq);
+        }
+        CHECK_EQ(rotated, 2 * 8);
+        CHECK_EQ(fp8, 0);
+        CHECK_EQ(reads_hr, 8);
+    }
+    {
+        const RadEncoding plain = rad_enc_plain(RAD_BF16);
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain } };
+        RadBuildCtx ctx = build_ctx();
+        CHECK_EQ(stderr_of_rc([&] { return qwen35moe_fp8::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+}
+
 /* The routed model's engine steps, its routed MTP head included, lint clean at one and two
  * ranks. */
 TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {
@@ -6721,9 +6827,8 @@ TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {
     lint_qwen35_fp8_family(qwen35moe_fp8::declare, qwen35moe_fp8::step, mk.meta(), 3, false, 0);
 }
 
-/* The 35B-A3B-VL: the routed trunk and the vision tower declare together, the tower once and
- * not a copy a rank, and the routed MTP head beside them -- Sage-A1.5's shape, which no fixture
- * covered before (the MoE fixture had no tower, the VL fixture was dense). */
+/* The 35B-A3B-VL (Sage-A1.5's shape): the routed trunk and the vision tower declare together,
+ * the tower once and not a copy a rank, and the routed MTP head beside them. */
 TEST(qwen35moe_fp8_declares_the_vision_tower_beside_the_routed_trunk) {
     MetaKV mk = q35moe_vl_meta();
     /* With no encoder budget the tower is not declared, whatever the container carries. */
@@ -6759,6 +6864,97 @@ TEST(qwen35moe_fp8_declares_the_vision_tower_beside_the_routed_trunk) {
             CHECK(find_map(b, w.name) != nullptr);
         }
     CHECK_EQ(nv, 3 + 12 * 2 + 6);
+}
+
+/* A DFlash2 drafter merged into the routed VL trunk (data/recipes/sage-a1.5-fp8-df2.recipe)
+ * replaces the routed MTP head: the block drafter is declared at the trained block, the MTP
+ * layer and its router are not, and the vision tower still is, at one rank and two. The probe
+ * fixes the depth at the block. */
+TEST(qwen35moe_fp8_dflash2_drafter_replaces_the_routed_mtp_head) {
+    MetaKV mk = with_dflash2(q35moe_vl_meta());
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            RadBuildCtx ctx = spec_ctx(rank, world, 7);
+            ctx.max_enc_patches = 1024;
+            REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+            CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+            CHECK_EQ(b.drafter_name, std::string("dflash2"));
+            CHECK_EQ(b.drafter.depth, 7);
+            CHECK_EQ(b.drafter.block, 8);
+            CHECK(find_b(b, "mtp_x") == nullptr);
+            CHECK(noted(b, "the DFlash2 drafter replaces the 1-layer MTP head"));
+            /* Eight routed blocks and no router for the MTP layer. */
+            CHECK_EQ(count_op(b, "router_topk"), 8);
+            for (const auto& w : b.weights) CHECK(w.name.rfind("blk.8.", 0) != 0);
+            const RecBuf* src = find_b(b, "dflash_src");
+            REQUIRE(src != nullptr);
+            CHECK_EQ(src->d.shape[1], 3 * 5120);
+            CHECK_EQ(b.encoder_name, std::string("vision"));
+        }
+    RadArchProbe p{};
+    CHECK_OK(qwen35moe_fp8::probe(mk.meta(), &p));
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    /* The same container under --num-speculative-tokens 0 declares neither drafter. */
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_NONE);
+    CHECK(find_b(b, "dflash_src") == nullptr);
+    CHECK(find_b(b, "mtp_x") == nullptr);
+}
+
+/* The routed trunk's engine steps with the DFlash2 drafter (verify, context pass, query pass)
+ * lint clean at one and two ranks. */
+TEST(qwen35moe_fp8_steps_lint_clean_with_a_dflash2_drafter) {
+    MetaKV mk = with_dflash2(q35moe_meta());
+    lint_qwen35_fp8_family(qwen35moe_fp8::declare, qwen35moe_fp8::step, mk.meta(), 7, true, 8);
+}
+
+/* data/recipes/sage-a1.5-mxfp4-df2.recipe's encodings: every trunk linear, the routed and shared
+ * experts and the drafter's linears OCP-MXFP4, the lm_head block fp8, the draft head 2-bit. The
+ * drafter's keys come first (its names contain the trunk's), the lm_head's last (`output.weight`
+ * is in `attn_output.weight`). Every routed GEMM and every trunk linear reads mxfp4a8, at one
+ * rank and two. */
+TEST(qwen35moe_fp8_serves_the_mxfp4_trunk_experts_and_drafter) {
+    MetaKV mk = with_dflash2(q35moe_meta());
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.encs = { { "dflash.draft_head", u2 }, { "dflash.", mx } };
+            for (const char* t : { "attn_qg.weight", "attn_k.weight", "attn_v.weight",
+                                   "attn_output.weight", "ssm_inz.weight", "ssm_out.weight",
+                                   "ffn_gate_up_exps", "ffn_down_exps", "ffn_gate_up_shexp",
+                                   "ffn_down_shexp" })
+                b.encs.push_back({ t, mx });
+            b.encs.push_back({ "output.weight", rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128) });
+            RadBuildCtx ctx = spec_ctx(rank, world, 7);
+            REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+            int moe = 0, trunk = 0, drafter = 0;
+            for (const auto& o : b.ops) {
+                if (o.op == "moe_gemm_q") {
+                    ++moe;
+                    CHECK_EQ(pstr(&o, "dtype"), std::string("mxfp4a8"));
+                }
+                if (o.op != "gemm_nt_q" || o.w.empty()) continue;
+                const std::string& wn = b.weights[o.w[0] - 1].name;
+                if (wn.rfind("blk.", 0) == 0) {
+                    ++trunk;
+                    CHECK_EQ(pstr(&o, "dtype"), std::string("mxfp4a8"));
+                } else if (wn.rfind("dflash.blk.", 0) == 0) {
+                    ++drafter;
+                    CHECK_EQ(pstr(&o, "dtype"), std::string("mxfp4a8"));
+                }
+            }
+            CHECK(moe >= 16);
+            /* q|gate, k, v, o for 2 attention layers; qkv|z and out for 6 delta-net layers */
+            CHECK(trunk >= 2 * 4 + 6 * 2);
+            CHECK(drafter > 0);
+        }
 }
 
 /* `layer_types` is checked against the interval rule, not ignored: a model built with the wrong
@@ -8212,11 +8408,6 @@ struct ArchCases {
         add("lfm2_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return lfm2_bf16::declare(b, &lfm, &c); },
             lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
-        /* The first three moved only by the attn_qkv name map each layer declares to ask whether
-         * the container holds q, k and v as one linear: with those maps left out of the hash they
-         * are the earlier pins, 0xafc23087c634a537, 0x719fa07788f8b98a and 0x93b174ab52cc0d31.
-         * The two-rank ones moved with the weight reads beside the reductions (prefetch_beside;
-         * from 0xade9c0ccfad1fd47 and 0x8808d46c04f12205). */
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
             gemma4_bf16::step, 0, {}, 0x2ba2f4943031468full);
@@ -8464,6 +8655,14 @@ TEST(the_probes_size_what_declare_needs) {
         CHECK_OK(qwenimage21::probe(q.meta(), &p));
         CHECK_EQ(p.gen_rows, 2 * 16800);
         CHECK_EQ(p.gen_patches, 10 * 4096 * 11 / 10);
+    }
+    {   /* Anima: an image and its guidance at the largest size, each with its 512 context rows;
+         * no reference patches */
+        MetaKV a = anima_meta("aesthetic");
+        RadArchProbe p{};
+        CHECK_OK(anima::probe(a.meta(), &p));
+        CHECK_EQ(p.gen_rows, 2 * (9216 + 512));
+        CHECK_EQ(p.gen_patches, 0);
     }
 }
 
@@ -8828,6 +9027,49 @@ TEST(qwen3asr_refuses_a_tower_it_does_not_serve) {
     CHECK_EQ(count_op(bt, "conv2d"), 0);
 }
 
+/* A control vector's projection is declared for the layers whose scale is nonzero, and issued only
+ * on a pass where some row takes the vector (RadBatch::control_vector): with no such row every
+ * row would be skipped, so the pass is the one a deployment without a vector runs. */
+TEST(the_control_vector_projection_is_issued_only_when_a_row_takes_it) {
+    using namespace rad::arch;
+    RadBuilder b;
+    Geom g{};
+    g.n_layer = 4; g.n_embd = 64; g.max_tok = 16;
+    std::vector<float> dir((size_t)(4 * 64), 0.0f);
+    float scales[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+    const RadControlVector cv{ dir.data(), scales, 64, 4 };
+    RadBufDecl hd{};
+    hd.dtype = RAD_BF16; hd.rank = 2; hd.shape[0] = 16; hd.shape[1] = 4 * 64;
+    const rad_buf h = rad_decl_buffer(&b, "h", &hd);
+    const rad_buf mask = HcProject::declare_mask(&b, "on", g, &cv);
+    REQUIRE(mask != 0);
+    HcProject p[4];
+    for (int l = 0; l < 4; ++l) CHECK_OK(p[l].declare(&b, "proj", g, l, &cv, mask, h, 4));
+    CHECK(!p[0].steered());
+    CHECK(p[1].steered());
+    CHECK(!p[2].steered());
+    CHECK(p[3].steered());
+    CHECK_EQ(count_op(b, "hc_project"), 2);
+
+    RadBatch none{};
+    none.n_tok = 3;
+    RadCtx c{ .b = &b, .batch = &none };
+    for (const HcProject& x : p) x.step(&c, &none, 0, 3);
+    CHECK_EQ(c.issues.size(), (size_t)0);
+    RadBatch some = none;
+    some.control_vector = 1;
+    c.batch = &some;
+    for (const HcProject& x : p) x.step(&c, &some, 0, 3);
+    CHECK_EQ(c.issues.size(), (size_t)2);
+
+    /* No vector: no mask, no op. */
+    RadBuilder b0;
+    CHECK_EQ(HcProject::declare_mask(&b0, "on", g, nullptr), (rad_buf)0);
+    HcProject q;
+    CHECK_OK(q.declare(&b0, "proj", g, 1, nullptr, 0, h, 4));
+    CHECK(!q.steered());
+}
+
 RAD_TEST_MAIN()
 
 /* Without --prefill-span a 4096 budget declares and steps the pinned graph and launches: for
@@ -8947,5 +9189,253 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
             CHECK_EQ(ar_piece, ar - 1);
             CHECK_EQ(ar_overlap, ar - 1);
             CHECK(!c.joins.empty());
+        }
+}
+
+/* ============================ unlimitedocr: the DeepEncoder batch ============================= */
+
+namespace {
+
+const char* k_uocr_keys[] = {
+    "n_routed_experts", "num_experts_per_tok", "moe_intermediate_size", "n_shared_experts",
+    "first_k_dense_replace", "scoring_func", "routed_scaling_factor", "topk_group", "n_group",
+    "use_mla", "norm_topk_prob", "sliding_window_size",
+};
+const char* k_uocr_vals[] = { "64", "6", "896", "2", "1", "softmax", "1.0", "1", "1", "0", "0",
+                              "128" };
+
+RadModelMeta uocr_meta() {
+    RadModelMeta m{};
+    m.arch_id     = "unlimitedocr";
+    m.name        = "test-unlimitedocr";
+    m.quant       = "bf16";
+    m.n_layers    = 12;
+    m.n_embd      = 1280;
+    m.n_head      = 10;
+    m.n_head_kv   = 10;
+    m.head_dim    = 128;
+    m.n_ff        = 6848;
+    m.n_vocab     = 129280;
+    m.n_ctx_train = 32768;
+    m.rms_eps     = 1e-6f;
+    m.rope_theta  = 10000.0f;
+    m.n_kv        = (int)(sizeof(k_uocr_keys) / sizeof(k_uocr_keys[0]));
+    m.kv_key      = k_uocr_keys;
+    m.kv_val      = k_uocr_vals;
+    return m;
+}
+
+}  /* namespace */
+
+/* One encode pass of two 640 tile lines (four tiles): the tower batches every GEMM over the whole
+ * pass, and the segment-bounded ops carry one cu entry a tile. */
+TEST(unlimitedocr_batches_the_tower_across_tile_segments) {
+    RadBuilder b;
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    b.encs = { { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain } };
+    RadModelMeta meta = uocr_meta();
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_enc_patches = 16384;
+    CHECK_OK(unlimitedocr_bf16::declare(&b, &meta, &ctx));
+    /* A pass runs one of the two towers, so the core must not mix grids in one. */
+    CHECK_EQ(b.encoder.modalities, (uint32_t)RAD_MM_IMAGE);
+    CHECK_EQ(b.encoder.one_grid, 1);
+
+    const int64_t q = 40, nseg = 2, n_patch = nseg * (2 * q + 4) * q;   /* two lines of two tiles */
+    std::vector<int32_t> sh((size_t)nseg, (int32_t)q), sw((size_t)nseg, (int32_t)(2 * q + 4));
+    std::vector<int32_t> cu = { 0, (int32_t)((2 * q + 4) * q), (int32_t)n_patch };
+    std::vector<uint16_t> pix((size_t)n_patch * 768, 0);
+    RadBatch batch{};
+    batch.enc         = RAD_MM_IMAGE;
+    batch.enc_n_patch = n_patch;
+    batch.enc_pixels  = pix.data();
+    batch.enc_n_seg   = nseg;
+    batch.enc_cu      = cu.data();
+    batch.enc_seg_h   = sh.data();
+    batch.enc_seg_w   = sw.data();
+    batch.enc_max_seg = (2 * q + 4) * q;
+    RadCtx c{ .b = &b, .batch = &batch };
+    unlimitedocr_bf16::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+
+    /* The batch bound is the pass bound over this grid's tokens, capped at 8 (10 tiles at 40,
+     * 4 at 64 for 16384 patches). */
+    const auto& enc = unlimitedocr_bf16::g_model[0].enc;
+    CHECK_EQ(enc.t40.Bmax, 8);
+    CHECK_EQ(enc.t64.Bmax, 4);
+
+    constexpr int64_t kTok40 = 1600, kTokP40 = 1764, kClip40 = 101;
+    /* One patch-embed GEMM over all four tiles, not four of one. */
+    const RecIssue* patch = issue_of(b, c, "gemm_nt_bias");
+    REQUIRE(patch != nullptr);
+    CHECK_EQ(patch->n, 4 * kTok40);
+    /* SAM's first attention is layer 0's windowed path over the padded grid. */
+    const RecIssue* sat = issue_of(b, c, "sam_attn");
+    REQUIRE(sat != nullptr);
+    CHECK_EQ(sat->n, 4 * kTokP40);
+    REQUIRE(sat->opd.size() > 4);
+    CHECK_EQ(sat->opd[3].rows, 5);
+    /* Layer 2 is the first global block: no padding, four kSamTok-row segments. */
+    const RecIssue* satg = issue_of(b, c, "sam_attn", 2);
+    REQUIRE(satg != nullptr);
+    CHECK_EQ(satg->n, 4 * kTok40);
+    CHECK_EQ(satg->opd[3].rows, 5);
+    /* CLIP's attention is one dense call over four kClipTok-row segments. */
+    const RecIssue* cat = issue_of(b, c, "attn_dense");
+    REQUIRE(cat != nullptr);
+    CHECK_EQ(cat->n, 4 * kClip40);
+    REQUIRE(cat->opd.size() > 4);
+    CHECK_EQ(cat->opd[3].rows, 5);
+    /* The unfold sees the four tiles as four kGrid-row segments. */
+    const RecIssue* unf = issue_of(b, c, "conv2d_unfold");
+    REQUIRE(unf != nullptr);
+    CHECK_EQ(unf->opd[0].rows, 4 * q);
+
+    /* The class row, the map cast, the fuse and the newline stay per tile: 4 / 4 / 4 / 2. */
+    int cls = 0, cmap = 0, fuse = 0, nl = 0;
+    for (const RecIssue& i : c.issues) {
+        if (i.op == enc.t40.op_cls) ++cls;
+        else if (i.op == enc.t40.op_cmap) ++cmap;
+        else if (i.op == enc.t40.op_fuse_clip) ++fuse;
+        else if (i.op == enc.t40.op_newline) ++nl;
+    }
+    CHECK_EQ(cls, 4);
+    CHECK_EQ(cmap, 4);
+    CHECK_EQ(fuse, 4);
+    CHECK_EQ(nl, nseg);
+
+    /* A one-tile pass is the same graph at B = 1. */
+    std::vector<int32_t> sh1 = { (int32_t)q }, sw1 = { (int32_t)(q + 4) };
+    std::vector<int32_t> cu1 = { 0, (int32_t)((q + 4) * q) };
+    std::vector<uint16_t> pix1((size_t)((q + 4) * q) * 768, 0);
+    RadBatch one{};
+    one.enc         = RAD_MM_IMAGE;
+    one.enc_n_patch = (q + 4) * q;
+    one.enc_pixels  = pix1.data();
+    one.enc_n_seg   = 1;
+    one.enc_cu      = cu1.data();
+    one.enc_seg_h   = sh1.data();
+    one.enc_seg_w   = sw1.data();
+    one.enc_max_seg = (q + 4) * q;
+    RadCtx c1{ .b = &b, .batch = &one };
+    unlimitedocr_bf16::step(&c1, &one);
+    CHECK(c1.step_fail.empty());
+    CHECK_LINT(b, &c1);
+    const RecIssue* p1 = issue_of(b, c1, "gemm_nt_bias");
+    REQUIRE(p1 != nullptr);
+    CHECK_EQ(p1->n, kTok40);
+    const RecIssue* s1 = issue_of(b, c1, "sam_attn");
+    REQUIRE(s1 != nullptr);
+    CHECK_EQ(s1->n, kTokP40);
+    REQUIRE(s1->opd.size() > 4);
+    CHECK_EQ(s1->opd[3].rows, 2);
+    const RecIssue* c_1 = issue_of(b, c1, "attn_dense");
+    REQUIRE(c_1 != nullptr);
+    CHECK_EQ(c_1->n, kClip40);
+}
+
+/* ==================================================================== krea2 */
+
+namespace {
+
+/* Krea 2 with every network cut: a 36-layer conditioning language model of 256 (the last tap is
+ * after layer 35), a one-block text fusion and DiT of 128-wide heads, and Wan 2.1's VAE. */
+MetaKV krea2_meta() {
+    RadModelMeta m{};
+    m.arch_id = "krea2"; m.name = "test-krea2"; m.quant = "";
+    m.n_layers = 36; m.n_embd = 256; m.n_head = 2; m.n_head_kv = 1; m.head_dim = 128;
+    m.n_ff = 512; m.n_vocab = 151936; m.n_ctx_train = 32768;
+    m.rms_eps = 1e-6f; m.rope_theta = 5e6f; m.rope_scale = 1.0f;
+    MetaKV k(m);
+    std::string mean, sd;
+    for (int i = 0; i < 16; ++i) {
+        mean += (i ? " " : "") + std::to_string(0.01 * i);
+        sd += (i ? " " : "") + std::to_string(1.0 + 0.01 * i);
+    }
+    k.set("pipeline._class_name", "Krea2Pipeline")
+     .set("transformer.text_hidden_dim", "256")
+     .set("transformer.text_num_attention_heads", "2")
+     .set("transformer.text_intermediate_size", "512")
+     .set("transformer.num_layerwise_text_blocks", "1")
+     .set("transformer.num_refiner_text_blocks", "1")
+     .set("transformer.num_layers", "1")
+     .set("transformer.attention_head_dim", "128")
+     .set("transformer.num_attention_heads", "2")
+     .set("transformer.num_key_value_heads", "2")
+     .set("transformer.intermediate_size", "512")
+     .set("transformer.axes_dims_rope", "32 48 48")
+     .set("vae.latents_mean", mean.c_str())
+     .set("vae.latents_std", sd.c_str());
+    return k;
+}
+
+}  /* namespace */
+
+/* `rebalance` (RAD_GEN_COND_REBALANCE, declared in the generator's cond_opts): each of the twelve
+ * taps is scaled into te.h2 by its gain (ComfyUI's ConditioningKrea2Rebalance at its defaults,
+ * multiplier 4 times 1, 1, 1, 1, 1, 1, 1, 2.5, 5, 1.1, 4, 1), f32 and rounded once, and the
+ * tap's scatter reads te.h2. Without it the pass issues no scale and scatters te.x. */
+TEST(krea2_rebalance_scales_each_tap_and_is_off_without_the_option) {
+    MetaKV mk = krea2_meta();
+    const double gains[12] = { 4, 4, 4, 4, 4, 4, 4, 10, 20, 4.4, 16, 4 };
+    RadArchProbe probe{};
+    REQUIRE_EQ(krea2::probe(mk.meta(), &probe), RAD_OK);
+    CHECK_EQ(probe.gen_rows, (int64_t)2 * (16384 + 512));
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            RadBuildCtx ctx = qimg_ctx(rank, world);
+            REQUIRE_EQ(stderr_of_rc([&] { return krea2::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+            CHECK_EQ(b.generator.cond_opts, (uint32_t)RAD_GEN_COND_REBALANCE);
+            const RecBuf* bx = find_b(b, "te.x");
+            const RecBuf* bh = find_b(b, "te.h2");
+            const RecBuf* bt = find_b(b, "te.taps");
+            REQUIRE(bx && bh && bt);
+            const rad_buf x = (rad_buf)(bx - b.bufs.data() + 1);
+            const rad_buf h2 = (rad_buf)(bh - b.bufs.data() + 1);
+            const rad_buf taps = (rad_buf)(bt - b.bufs.data() + 1);
+            for (bool rebalance : { false, true }) {
+                auto k = gen_pass(b, RAD_GEN_PASS_COND, 12);
+                k->g.cond_opts = rebalance ? RAD_GEN_COND_REBALANCE : 0;
+                RadCtx c{ .b = &b, .batch = &k->b, .rank = rank, .world = world };
+                krea2::step(&c, &k->b);
+                CHECK(c.step_fail.empty());
+                CHECK_EQ(count_issued(issued_ops(b, c), "chan_affine"), rebalance ? 12 : 0);
+                int tap = 0;
+                for (size_t i = 0; i < c.issues.size(); ++i) {
+                    const RecOp* o = b.op_of(c.issues[i].op);
+                    if (!o || o->op != "scatter_rows" || c.issues[i].opd.size() != 3 ||
+                        c.issues[i].opd[2].handle != taps)
+                        continue;
+                    REQUIRE(tap < 12);
+                    CHECK_EQ(c.issues[i].opd[0].handle, rebalance ? h2 : x);
+                    if (rebalance) {
+                        REQUIRE(i > 0);
+                        const RecIssue& gi = c.issues[i - 1];
+                        const RecOp* g = b.op_of(gi.op);
+                        REQUIRE(g && g->op == "chan_affine");
+                        CHECK_EQ(gi.opd[0].handle, x);
+                        CHECK_EQ(gi.opd[1].handle, h2);
+                        CHECK_EQ(pint(g, "n"), 64LL);
+                        CHECK_EQ(pint(g, "round"), 0LL);
+                        CHECK_EQ(pstr(g, "mode"), std::string("fma"));
+                        /* 64 copies of the tap's gain, and 64 zeros */
+                        auto list = [](const std::string& s) {
+                            std::vector<double> v;
+                            std::istringstream in(s);
+                            for (double d; in >> d;) v.push_back(d);
+                            return v;
+                        };
+                        const std::vector<double> mul = list(pstr(g, "mul")), add = list(pstr(g, "add"));
+                        CHECK_EQ(mul.size(), (size_t)64);
+                        CHECK_EQ(add.size(), (size_t)64);
+                        for (double v : mul) CHECK_EQ(v, gains[tap]);
+                        for (double v : add) CHECK_EQ(v, 0.0);
+                    }
+                    ++tap;
+                }
+                CHECK_EQ(tap, 12);
+            }
         }
 }
