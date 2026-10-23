@@ -58,13 +58,81 @@ const MQ6_I8_GFX11_T256_LDS_BYTES: u32 = 65536;
 const MQ6_I8_PM_MODULE: &str = "gemm_mq6g256v2_mmq_i8_pm_gfx1201";
 const MQ6_I8_PM_ENTRY_F32: &str = "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201";
 const MQ6_I8_PM_ENTRY_BF16: &str = "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201";
-/// The twin's CTA tile (128 rows x 128 tokens, 256 threads) and dynamic LDS
-/// (the same figures as the hipcc kernel).
-const MQ6_I8_PM_TILE: usize = 128;
+/// The 128 x 256 entries of the same module (16 waves, 512 threads).
+const MQ6_I8_PM_ENTRY_F32_T256: &str = "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t128x256";
+const MQ6_I8_PM_ENTRY_BF16_T256: &str = "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201_t128x256";
+/// Rows per CTA of both PM tiles.
+const MQ6_I8_PM_ROWS: usize = 128;
+/// Token-tile widths of the PM tiles: the 128 x 128 tile (256 threads,
+/// [`MQ6_I8_GFX12_LDS_BYTES`]) and the 128 x 256 tile (512 threads).
+const MQ6_I8_PM_TOKENS_128: usize = 128;
+const MQ6_I8_PM_TOKENS_256: usize = 256;
+const MQ6_I8_PM_T256_THREADS: u32 = 512;
+const MQ6_I8_PM_T256_LDS_BYTES: u32 = 55296;
+
+/// Token-tile width of the PM launch of `m` rows x `n` tokens on a device of `cu_count`
+/// CUs (two per WGP). The 128 x 256 tile wins by ~6-8 % (fewer weight decodes and folds per
+/// MAC) when its CTAs spread as evenly over the WGPs as the 128 x 128 ones do, and loses up
+/// to 37 % when its grid leaves WGPs idle or one WGP an extra round (card B, `fn-10k` runs
+/// `i8pm/ship/json{,2}`). It is used iff
+/// 1. it pads no more tokens than the 128-token tile (`n % 256` is 0 or above 128), and
+/// 2. the most loaded WGP does not carry more work: a WGP's load is its CTA count times the
+///    tile's token width, CTAs round-robin over the WGPs, and the wide tile's per-token cost is
+///    taken as 0.94 of the narrow one's: `2 * 94 * ceil(c256 / wgps) <= 100 * ceil(c128 / wgps)`.
+fn mq6_i8_pm_token_tile(m: usize, n: usize, cu_count: usize) -> usize {
+    let r = n % MQ6_I8_PM_TOKENS_256;
+    if r != 0 && r <= MQ6_I8_PM_TOKENS_128 {
+        return MQ6_I8_PM_TOKENS_128;
+    }
+    let wgps = (cu_count / 2).max(1);
+    let rows = m.div_ceil(MQ6_I8_PM_ROWS);
+    let rounds256 = (rows * n.div_ceil(MQ6_I8_PM_TOKENS_256)).div_ceil(wgps);
+    let rounds128 = (rows * n.div_ceil(MQ6_I8_PM_TOKENS_128)).div_ceil(wgps);
+    if 188 * rounds256 <= 100 * rounds128 {
+        MQ6_I8_PM_TOKENS_256
+    } else {
+        MQ6_I8_PM_TOKENS_128
+    }
+}
+
+/// `(entry, threads, dynamic LDS, token tile)` of one PM launch of `m` x `n` tokens.
+fn mq6_i8_pm_launch(
+    m: usize,
+    n: usize,
+    cu_count: usize,
+    bf16: bool,
+) -> (&'static str, u32, u32, usize) {
+    match (mq6_i8_pm_token_tile(m, n, cu_count), bf16) {
+        (MQ6_I8_PM_TOKENS_256, false) => (
+            MQ6_I8_PM_ENTRY_F32_T256,
+            MQ6_I8_PM_T256_THREADS,
+            MQ6_I8_PM_T256_LDS_BYTES,
+            MQ6_I8_PM_TOKENS_256,
+        ),
+        (MQ6_I8_PM_TOKENS_256, true) => (
+            MQ6_I8_PM_ENTRY_BF16_T256,
+            MQ6_I8_PM_T256_THREADS,
+            MQ6_I8_PM_T256_LDS_BYTES,
+            MQ6_I8_PM_TOKENS_256,
+        ),
+        (_, false) => (
+            MQ6_I8_PM_ENTRY_F32,
+            256,
+            MQ6_I8_GFX12_LDS_BYTES,
+            MQ6_I8_PM_TOKENS_128,
+        ),
+        (_, true) => (
+            MQ6_I8_PM_ENTRY_BF16,
+            256,
+            MQ6_I8_GFX12_LDS_BYTES,
+            MQ6_I8_PM_TOKENS_128,
+        ),
+    }
+}
 
 /// Whether the PeaceMaker twin runs one launch (`flag` = `HIPFIRE_MQ6_I8_PM`): not
 /// switched off (`0`; unset and `1` both admit), exact gfx1201, `k % 256 == 0`, `m % 4 == 0` (its row quads are stored
-/// whole), a 4-byte aligned `y`, and the 32-bit address contract (`m`, `k`, `n`
+/// whole), a `y` aligned to 4 bytes (F32) or 8 bytes (BF16: its quad stores are `buffer_store_b64`), and the 32-bit address contract (`m`, `k`, `n`
 /// and the output and weight extents under 2^31 bytes). Anything else keeps the
 /// hipcc kernel.
 fn mq6_i8_pm_admits(
@@ -83,7 +151,7 @@ fn mq6_i8_pm_admits(
         && m > 0
         && m % 4 == 0
         && n > 0
-        && y_ptr % 4 == 0
+        && y_ptr % if out_elem_bytes == 2 { 8 } else { 4 } == 0
         && m.max(k).max(n) <= i32::MAX as usize
         && crate::gemm::pm_output_extent_bytes(n, m, out_elem_bytes).is_some()
         && m.checked_mul(k / 256)
@@ -318,16 +386,18 @@ impl Gpu {
             if bf16 { 2 } else { 4 },
             y.buf.as_ptr() as usize,
         );
-        let kernel = if pm {
-            if bf16 {
-                MQ6_I8_PM_ENTRY_BF16
-            } else {
-                MQ6_I8_PM_ENTRY_F32
-            }
+        let (kernel, threads, lds, tile_tokens, tile_rows) = if pm {
+            let (e, th, l, t) = mq6_i8_pm_launch(m, batch_size, self.cu_count_or_default(), bf16);
+            (e, th, l, t, MQ6_I8_PM_ROWS)
         } else {
-            mq6_i8_entry(&self.arch, tile, bf16)
+            (
+                mq6_i8_entry(&self.arch, tile, bf16),
+                threads,
+                lds,
+                tile,
+                tile,
+            )
         };
-        let tile = if pm { MQ6_I8_PM_TILE } else { tile };
         if pm {
             self.ensure_embedded_kernel(
                 MQ6_I8_PM_MODULE,
@@ -361,7 +431,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [m.div_ceil(tile) as u32, batch_size.div_ceil(tile) as u32, 1],
+            [
+                m.div_ceil(tile_rows) as u32,
+                batch_size.div_ceil(tile_tokens) as u32,
+                1,
+            ],
             [threads, 1, 1],
             lds,
             &mut params,
@@ -458,7 +532,9 @@ mod tests {
     fn pm_twin_is_the_gfx1201_default_with_the_32_bit_address_contract() {
         let ok = |flag, arch, m, k, n, eb, y| mq6_i8_pm_admits(flag, arch, m, k, n, eb, y);
         assert!(ok(Some(true), "gfx1201", 2560, 5120, 4000, 4, 256));
-        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 2, 4));
+        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 2, 8));
+        assert!(ok(Some(true), "gfx1201", 48, 256, 1, 4, 4));
+        assert!(!ok(Some(true), "gfx1201", 48, 256, 1, 2, 4));
         // FN's largest M at a vocabulary-sized token count stays inside 2^31 bytes.
         assert!(ok(Some(true), "gfx1201", 248_320, 5120, 2162, 4, 256));
         assert!(!ok(Some(true), "gfx1201", 248_320, 5120, 4000, 4, 256));
@@ -466,7 +542,7 @@ mod tests {
         assert!(ok(None, "gfx1201", 2560, 5120, 4000, 4, 256));
         assert!(!ok(None, "gfx1201", 248_320, 5120, 4000, 4, 256));
         assert!(!ok(Some(false), "gfx1201", 2560, 5120, 4000, 4, 256));
-        assert!(!ok(Some(false), "gfx1201", 48, 256, 1, 2, 4));
+        assert!(!ok(Some(false), "gfx1201", 48, 256, 1, 2, 8));
         // Other archs, K % 256, M % 4, an unaligned Y and empty dims fall back.
         assert!(!ok(Some(true), "gfx1151", 2560, 5120, 4000, 4, 256));
         assert!(!ok(Some(true), "gfx1201", 2560, 5000, 4000, 4, 256));
@@ -474,8 +550,13 @@ mod tests {
         assert!(!ok(Some(true), "gfx1201", 2560, 5120, 4000, 4, 258));
         assert!(!ok(Some(true), "gfx1201", 0, 5120, 4000, 4, 256));
         assert!(!ok(Some(true), "gfx1201", 2560, 5120, 0, 4, 256));
-        // The embedded image carries both entries.
-        for entry in [MQ6_I8_PM_ENTRY_F32, MQ6_I8_PM_ENTRY_BF16] {
+        // The embedded image carries all four entries.
+        for entry in [
+            MQ6_I8_PM_ENTRY_F32,
+            MQ6_I8_PM_ENTRY_BF16,
+            MQ6_I8_PM_ENTRY_F32_T256,
+            MQ6_I8_PM_ENTRY_BF16_T256,
+        ] {
             assert!(
                 kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201
                     .windows(entry.len())
@@ -483,12 +564,108 @@ mod tests {
                 "image lacks {entry}"
             );
         }
-        // The twin's tile and LDS are the hipcc gfx12 build's.
+        // The 128 x 128 entries use the hipcc gfx12 build's threads and LDS.
         let (_, _, threads, lds, tile) = mq6_i8_launch("gfx1201", 2560, 512, 48).unwrap();
         assert_eq!(
             (threads, lds, tile),
-            (256, MQ6_I8_GFX12_LDS_BYTES, MQ6_I8_PM_TILE)
+            (256, MQ6_I8_GFX12_LDS_BYTES, MQ6_I8_PM_TOKENS_128)
         );
+    }
+
+    /// The 128 x 256 tile is the default; the 128 x 128 one serves launches where the
+    /// wide tile pads more tokens or loads the WGPs worse. The table is card B's measured
+    /// `(M, N, K = 2560) -> 128x256 / 128x128` time ratio (64 CUs).
+    #[test]
+    fn pm_tile_follows_the_padding_and_balance_rule() {
+        // (m, n, measured 128x256 / 128x128 time ratio): wide wins iff ratio < 1.
+        let measured: [(usize, usize, f64); 28] = [
+            (10240, 16384, 0.930),
+            (10240, 4096, 0.933),
+            (12288, 16384, 0.940),
+            (12288, 4096, 0.932),
+            (6144, 16384, 0.934),
+            (6144, 4096, 0.937),
+            (2560, 16384, 0.919),
+            (2560, 4096, 0.919),
+            (512, 16384, 0.940),
+            (512, 4096, 0.952),
+            (128, 16384, 0.951),
+            (128, 4096, 1.336),
+            (48, 4096, 1.372),
+            (48, 16384, 0.945),
+            (128, 6144, 0.931),
+            (128, 8192, 0.969),
+            (128, 12288, 1.125),
+            (256, 4096, 0.996),
+            (256, 8192, 0.960),
+            (384, 4096, 1.119),
+            (384, 8192, 0.940),
+            (512, 1024, 1.357),
+            (512, 2048, 0.960),
+            (640, 2048, 1.126),
+            (640, 4096, 1.053),
+            (1024, 1024, 0.957),
+            (1024, 2048, 0.953),
+            (2560, 1024, 1.064),
+        ];
+        for (m, n, ratio) in measured {
+            let (e, th, l, t) = mq6_i8_pm_launch(m, n, 64, false);
+            let wide = t == 256;
+            // The 0.996 point is a tie either way.
+            if ratio != 0.996 {
+                assert_eq!(wide, ratio < 1.0, "m={m} n={n} ratio={ratio}");
+            }
+            if wide {
+                assert_eq!((e, th, l), (MQ6_I8_PM_ENTRY_F32_T256, 512, 55296));
+            } else {
+                assert_eq!(
+                    (e, th, l),
+                    (MQ6_I8_PM_ENTRY_F32, 256, MQ6_I8_GFX12_LDS_BYTES)
+                );
+            }
+        }
+        assert_eq!(
+            mq6_i8_pm_launch(10240, 16384, 64, true).0,
+            MQ6_I8_PM_ENTRY_BF16_T256
+        );
+        assert_eq!(mq6_i8_pm_launch(48, 4096, 64, true).0, MQ6_I8_PM_ENTRY_BF16);
+        // Token tails: the wide tile never pads more tokens than the narrow one.
+        for n in [
+            1usize,
+            48,
+            128,
+            129,
+            255,
+            383,
+            384,
+            385,
+            4097,
+            4224,
+            16385,
+            16384 + 129,
+        ] {
+            for m in [48usize, 128, 512, 640, 2560, 10240, 248_320] {
+                let t = mq6_i8_pm_token_tile(m, n, 64);
+                let pad = |t: usize| n.div_ceil(t) * t - n;
+                assert!(pad(t) <= pad(128), "m={m} n={n}");
+            }
+        }
+        assert_eq!(mq6_i8_pm_token_tile(10240, 4097, 64), 128);
+        assert_eq!(mq6_i8_pm_token_tile(10240, 4096 + 129, 64), 256);
+        // Grid rows of every Flash-Next M (ragged M tiles are masked by the kernel).
+        for (m, gx) in [
+            (48usize, 1usize),
+            (128, 1),
+            (512, 4),
+            (640, 5),
+            (2560, 20),
+            (6144, 48),
+            (10240, 80),
+            (12288, 96),
+            (248_320, 1940),
+        ] {
+            assert_eq!(m.div_ceil(MQ6_I8_PM_ROWS), gx, "m={m}");
+        }
     }
 
     #[test]

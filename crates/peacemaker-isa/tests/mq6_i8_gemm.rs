@@ -444,19 +444,35 @@ fn one_hot_activations_pair_every_code_position_on_every_tile() {
 // ---------------------------------------------------------------------------------------------
 // Offline gates: hot-loop shape contract, occupancy ceiling, determinism, assembly of the product module.
 
-fn contract() -> serde_json::Value {
-    let path = format!(
-        "{}/kernels/mq6_i8_gemm.gfx1201.hotloop.contract.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
+fn contract(file: &str) -> serde_json::Value {
+    let path = format!("{}/kernels/{file}", env!("CARGO_MANIFEST_DIR"));
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 #[test]
-fn hot_loop_meets_shape_contract_for_both_entries() {
-    let c = contract();
+fn hot_loop_meets_shape_contract_for_every_module_entry() {
+    for (tile, file) in [
+        (Tile::T128x128, "mq6_i8_gemm.gfx1201.hotloop.contract.json"),
+        (
+            Tile::T128x256,
+            "mq6_i8_gemm.gfx1201.t128x256.hotloop.contract.json",
+        ),
+    ] {
+        hot_loop_meets_contract(tile, &contract(file));
+    }
+}
+
+fn hot_loop_meets_contract(tile: Tile, c: &serde_json::Value) {
+    assert_eq!(
+        c["symbol"].as_str().unwrap(),
+        Spec::product(Epi::Set).with_tile(tile).symbol()
+    );
+    assert_eq!(
+        c["launch_dynamic_lds_bytes"].as_u64().unwrap(),
+        u64::from(tile.layout().launch)
+    );
     for epi in [Epi::Set, Epi::SetBf16] {
-        let e = mq6_i8_gemm::emit(Spec::product(epi)).unwrap();
+        let e = mq6_i8_gemm::emit(Spec::product(epi).with_tile(tile)).unwrap();
         let census = mq6_i8_gemm::hot_loop_census(&e.s_text);
         for (name, bound) in c["counts"].as_object().unwrap() {
             let actual = census.get(name).copied().unwrap_or(0);
@@ -573,14 +589,16 @@ fn emission_is_deterministic_and_the_module_assembles() {
     let (_, text_b, proof_b) = mq6_i8_gemm::emit_module(Arch::Gfx1201).unwrap();
     assert_eq!(text_a, text_b);
     assert_eq!(proof_a.s_text_sha256, proof_b.s_text_sha256);
-    assert_eq!(a.len(), 2);
+    assert_eq!(a.len(), 4);
     let elf = peacemaker_isa::native::assemble(&text_a, Arch::Gfx1201).unwrap();
-    for epi in [Epi::Set, Epi::SetBf16] {
-        let sym = Spec::product(epi).symbol();
-        assert!(
-            elf.windows(sym.len()).any(|w| w == sym.as_bytes()),
-            "{sym} missing from the code object"
-        );
+    for tile in [Tile::T128x128, Tile::T128x256] {
+        for epi in [Epi::Set, Epi::SetBf16] {
+            let sym = Spec::product(epi).with_tile(tile).symbol();
+            assert!(
+                elf.windows(sym.len()).any(|w| w == sym.as_bytes()),
+                "{sym} missing from the code object"
+            );
+        }
     }
 }
 

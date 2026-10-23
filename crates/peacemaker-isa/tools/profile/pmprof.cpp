@@ -10,6 +10,9 @@
 //               {A.bin|G.bin,U.bin},Xq.bin[,Y.bin],meta.txt; symbol PM_V2C_SYM or the product
 //               symbol of the kind; MROWS=<rows> uses the first rows of the dumped weight)
 //   pmprof v2b  <base.co> <profiled.co> <set|add|silu> <outdir> [rounds]   (gfx1151; PM_V2B_DUMP)
+//   pmprof mq6  <base.hxaco> <profiled.co> <M,N,K> <outdir> [rounds]   (gfx1201 mq6_i8_gemm; PM_MQ6_SYM
+//               picks gemm_mq6g256v2_mmq_i8_pm_set_gfx1201 (default) or the _set_bf16_ / _t128x256 /
+//               _t256x128 entries; PM_MQ6_TILE=128x128|128x256|256x128 sets the launch geometry)
 //
 // For one real H2 shape it runs the uninstrumented and the profiled kernel on
 // identical inputs, compares every output byte (outputs are poisoned before
@@ -26,6 +29,9 @@
 // iu4: gate/up M17408 K5120 or down ADD M5120 K17408, N8192,
 //     grid [ceil(rows/128), N/128], block 256, LDS 20480. Synthetic valid
 //     MQ4V2 and block_i4_128 records; timing/clock can depend on payload.
+// mq6: gemm_mq6g256v2_mmq_i8_pm_set_gfx1201, grid [ceil(M/128), ceil(N/128)], block 256, LDS 36864;
+//     synthetic MQ6G256V2 rows (f16 s, z' headers, uniform 6-bit codes) and block_i8_128
+//     activations (d, s = 0, uniform int8); timing/clock can depend on payload.
 // attn: attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201 (KT48), 24 Q / 4 KV
 //     heads, d 256, grid [ceil(min(B,512)*6/384), 4, ceil(B/512)], block 768,
 //     LDS 49936; inputs generated exactly as fp8-ng/attn/harness/attn_bench.
@@ -335,6 +341,46 @@ int main(int argc, char** argv) {
         L.block = 768; L.lds = 49936;
         waves_per_wg = 24;
         periods = (size_t)(ctx + 47) / 48 + 2;
+    } else if (mode == "mq6") {
+        int M = 0, N = 0, K = 0;
+        if (sscanf(argv[4], "%d,%d,%d", &M, &N, &K) != 3 || K % 256 || M % 4) { fprintf(stderr, "mq6 shape M,N,K (K%%256==0, M%%4==0)\n"); return 2; }
+        outdir = argv[5]; rounds = argc > 6 ? atoi(argv[6]) : 8;
+        const char* se = getenv("PM_MQ6_SYM");
+        sym = se ? se : "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201";
+        shape = "mq6 M=" + std::to_string(M) + " K=" + std::to_string(K) + " N=" + std::to_string(N);
+        const size_t groups = (size_t)M * (K / 256), xblocks = (size_t)(K / 128) * N;
+        std::vector<unsigned char> w(groups * 200), x(xblocks * 136);
+        for (size_t g = 0; g < groups; ++g) {
+            unsigned char* p = w.data() + g * 200;
+            for (int h = 0; h < 2; ++h) {
+                const float s = 5e-4f + (salt(g * 2 + h, 0x51) & 1023) * (1.5e-3f / 1024.f);
+                const __half sh = __float2half(s), zh = __float2half(-32.f * __half2float(sh));
+                memcpy(p + 4 * h, &sh, 2); memcpy(p + 4 * h + 2, &zh, 2);
+            }
+            for (int j = 8; j < 200; ++j) p[j] = (unsigned char)salt(g * 200 + j, 0x6e);
+        }
+        for (size_t b = 0; b < xblocks; ++b) {
+            unsigned char* p = x.data() + b * 136;
+            const float d = 0.02f + (salt(b, 0x52) & 15) * 0.001f;
+            const int s0 = 0;
+            memcpy(p, &d, 4); memcpy(p + 4, &s0, 4);
+            for (int j = 8; j < 136; ++j) p[j] = (unsigned char)(int8_t)((int)(salt(b * 136 + j, 0x18) % 255) - 127);
+        }
+        Buf A = upload(w.data(), w.size()), Xq = upload(x.data(), x.size());
+        Buf Y = alloc((size_t)N * M * 4);
+        outputs = {Y};
+        const uint32_t zero = 0;
+        L.args = {arg(A.p), arg(Xq.p), arg(Y.p), arg(M), arg(K), arg(N), arg(zero)};
+        const char* te = getenv("PM_MQ6_TILE");
+        const std::string tile = te ? te : "128x128";
+        unsigned rowt = 128, tokt = 128;
+        L.block = 256; L.lds = 36864; waves_per_wg = 8;
+        if (tile == "128x256") { tokt = 256; L.block = 512; L.lds = 55296; waves_per_wg = 16; }
+        else if (tile == "256x128") { rowt = 256; L.block = 512; L.lds = 55296; waves_per_wg = 16; }
+        else if (tile != "128x128") { fprintf(stderr, "PM_MQ6_TILE 128x128|128x256|256x128\n"); return 2; }
+        L.grid[0] = (M + rowt - 1) / rowt; L.grid[1] = (N + tokt - 1) / tokt; L.grid[2] = 1;
+        shape += " tile " + tile;
+        periods = K / 128;
     } else { fprintf(stderr, "unknown mode\n"); return 2; }
 
     // Slot: 32 B header, records (8 B, budget PM_RECORDS_PER_PERIOD per block/tile
