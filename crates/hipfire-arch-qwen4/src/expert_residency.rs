@@ -800,7 +800,7 @@ pub fn forward_census_scope(
             owned(true, slot(rows_of(kv_width)?, f32)),           // QsaK (view)
             owned(true, slot(rows_of(kv_width)?, f32)),           // QsaV (view)
             owned(true, slot(rows_of(q_width)?, f32)),            // QsaOutput (view)
-            slot(selected, DType::Raw),                           // QsaSelected
+            owned(true, slot(selected, DType::Raw)),              // QsaSelected (view)
         ])?
     } else {
         0
@@ -4381,7 +4381,7 @@ mod tests {
         // The pre-arena layout measured 4,141 MiB beyond the weights here
         // (census 4,237 MiB); the phase arena shares the step-local buffers,
         // so the census is that minus the arena's saving.
-        assert_eq!(census.total().unwrap() >> 20, 3992);
+        assert_eq!(census.total().unwrap() >> 20, 3984);
         // For the record: the `Full` 8192-row chunk at 32K with the runtime.
         let full = census_at(
             &config,
@@ -5282,11 +5282,11 @@ mod tests {
         let forward = |rows, mode| {
             crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode).unwrap()
         };
-        // The 8192-row chunk's compact plan is 4240.125 MiB smaller, and the
+        // The 8192-row chunk's compact plan is 5982.59375 MiB smaller, and the
         // whole of it reaches the reserve: the historical baseline stays on
         // the Full layout, so the saving is not subtracted from both sides.
         let saving = forward(8192, Full) - forward(8192, FnSymGfx1201);
-        assert_eq!(saving, 5918 * (1 << 20) + (1 << 20) / 2);
+        assert_eq!(saving, 5982 * (1 << 20) + 622_592);
         assert_eq!(reserve(8192, Full) - reserve(8192, FnSymGfx1201), saving);
         // The same holds at every chunk, including the measured layout's own
         // 1536 rows.

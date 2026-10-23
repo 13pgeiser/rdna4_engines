@@ -5888,13 +5888,25 @@ pub(crate) fn compact_arena_groups(
         (F::GdnGate, heads),
         (F::GdnBeta, heads),
     ])?);
-    groups.push(sized(&[
+    let mut qsa = sized(&[
         (F::QsaQgate, 2 * layout.q_width),
         (F::QsaOutput, layout.q_width),
         (F::QsaIndex, layout.index_width),
         (F::QsaK, kv_width),
         (F::QsaV, kv_width),
-    ])?);
+    ])?;
+    // The per-row selections live only inside the indexed-attention launch
+    // (selection kernel then the attention kernels over it; never across a
+    // step boundary): the last QSA member, a Raw byte slot viewed as the F32
+    // elements that cover it.
+    qsa.push((
+        F::QsaSelected,
+        slots[F::QsaSelected as usize]
+            .elements
+            .div_ceil(std::mem::size_of::<f32>()),
+        None,
+    ));
+    groups.push(qsa);
     groups.push(sized(&[
         (F::HcNormalized, layout.wide),
         (F::HcLow, config.hc_lowrank),
@@ -6394,7 +6406,9 @@ impl Qwen4GpuForwardScratch {
                         .checked_add(extent)
                         .ok_or_else(|| invalid("compact scratch arena overflows"))?;
                     placed.push((field, offset, pitch));
-                    if field != F::Projection {
+                    // `QsaSelected` keeps its byte `elements` (Raw); the group
+                    // entry is the F32 cover of those bytes.
+                    if field != F::Projection && field != F::QsaSelected {
                         slots[field as usize].elements = elements;
                     }
                 }
@@ -6406,30 +6420,37 @@ impl Qwen4GpuForwardScratch {
                     continue;
                 }
                 let slot = &mut slots[field as usize];
-                if slot.dtype != DType::F32 {
+                // Only `QsaSelected` is a Raw member; its arena extent is the
+                // F32 cover of its bytes.
+                let raw_member = field == F::QsaSelected && slot.dtype == DType::Raw;
+                if slot.dtype != DType::F32 && !raw_member {
                     return Err(invalid(format!(
                         "scratch field {field:?} cannot alias {:?}",
                         F::Projection
                     )));
                 }
+                let slot_elements = if raw_member {
+                    slot.elements.div_ceil(std::mem::size_of::<f32>())
+                } else {
+                    slot.elements
+                };
                 if offset % COMPACT_ARENA_ALIGN != 0 {
                     return Err(invalid(format!(
                         "scratch field {field:?} offset {offset} is not 256-byte aligned"
                     )));
                 }
                 if offset
-                    .checked_add(slot.elements)
+                    .checked_add(slot_elements)
                     .is_none_or(|end| end > owner_elements)
                 {
                     return Err(invalid(format!(
-                        "scratch field {field:?} ({} elements at {offset}) exceeds the \
-                         {owner_elements}-element arena",
-                        slot.elements
+                        "scratch field {field:?} ({slot_elements} elements at {offset}) exceeds \
+                         the {owner_elements}-element arena"
                     )));
                 }
                 if let Some(pitch) = pitch {
                     let reserved = scratch_mul(max_chunk, pitch)?;
-                    if slot.elements > reserved
+                    if slot_elements > reserved
                         || offset
                             .checked_add(reserved)
                             .is_none_or(|end| end > owner_elements)
@@ -6640,10 +6661,22 @@ impl Qwen4GpuForwardScratch {
         }
         for (index, slot) in slots.iter().enumerate() {
             if let Some(owner) = slot.owner {
-                let view = tensors[owner as usize]
+                let owner_tensor = tensors[owner as usize]
                     .as_ref()
-                    .expect("plan validated that a view's owner owns its allocation")
-                    .sub_offset(slot.offset, slot.elements);
+                    .expect("plan validated that a view's owner owns its allocation");
+                let view = if slot.dtype == owner_tensor.dtype {
+                    owner_tensor.sub_offset(slot.offset, slot.elements)
+                } else {
+                    // A Raw member (`QsaSelected`): an F32-covered region
+                    // retyped to its byte length.
+                    let mut view = owner_tensor.sub_offset(
+                        slot.offset,
+                        slot.elements.div_ceil(owner_tensor.dtype.size()),
+                    );
+                    view.shape = vec![slot.elements];
+                    view.dtype = slot.dtype;
+                    view
+                };
                 tensors[index] = Some(view);
             }
         }
@@ -13807,24 +13840,24 @@ mod tests {
     fn fn_scratch_bytes_are_pinned() {
         assert_eq!(scratch_bytes(4096, Mode::Full), 4_538_503_044);
         assert_eq!(scratch_bytes(8192, Mode::Full), 8_957_998_980);
-        assert_eq!(scratch_bytes(256, Mode::FnSymGfx1201), 259_303_940);
-        assert_eq!(scratch_bytes(512, Mode::FnSymGfx1201), 399_600_772);
-        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 1_376_522_116);
-        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 2_752_001_924);
-        assert_eq!(scratch_bytes(16384, Mode::FnSymGfx1201), 5_502_961_540);
+        assert_eq!(scratch_bytes(256, Mode::FnSymGfx1201), 257_203_716);
+        assert_eq!(scratch_bytes(512, Mode::FnSymGfx1201), 395_400_324);
+        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 1_342_918_532);
+        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 2_684_794_756);
+        assert_eq!(scratch_bytes(16384, Mode::FnSymGfx1201), 5_368_547_204);
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(4096, Mode::FnSymGfx1201),
-            3_161_980_928
+            3_195_584_512
         );
         assert_eq!(
             scratch_bytes(8192, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            6_205_997_056
+            6_273_204_224
         );
         // The 8192-row compact scratch is smaller than the 4096-row full one.
         assert!(scratch_bytes(8192, Mode::FnSymGfx1201) <= scratch_bytes(4096, Mode::Full));
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            1_786_501_120
+            1_853_708_288
         );
         // The estimator adds the same 64-row speculative logits to either plan.
         let config = fn_config();
@@ -14044,7 +14077,6 @@ mod tests {
                 F::TokenIds,
                 F::Logits,
                 F::GdnBf16,
-                F::QsaSelected,
                 F::MoeTopkIndices,
                 F::MoeTopkWeights,
                 F::MoeExpertTokenCounts,
@@ -14064,8 +14096,14 @@ mod tests {
             for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
                 let owner = compact[slot.owner.unwrap() as usize];
                 assert!(owner.owner.is_none());
-                assert_eq!(owner.dtype, slot.dtype);
-                assert!(slot.offset + slot.elements <= owner.elements);
+                if slot.dtype == rdna_compute::DType::Raw {
+                    // `QsaSelected`: byte elements over an F32-covered region.
+                    assert_eq!(owner.dtype, rdna_compute::DType::F32);
+                    assert!(slot.offset + slot.elements.div_ceil(4) <= owner.elements);
+                } else {
+                    assert_eq!(owner.dtype, slot.dtype);
+                    assert!(slot.offset + slot.elements <= owner.elements);
+                }
             }
         }
         assert_eq!(owned_bytes(&full), scratch_bytes(8192, Mode::Full));
@@ -14074,6 +14112,12 @@ mod tests {
         assert_eq!(compact[F::PleGated as usize].pitch, Some(10_240));
         assert_eq!(compact[F::Projection as usize].pitch, Some(10_240));
         assert_eq!(compact[F::PleNormed as usize].owner, None);
+        // The selections are the last QSA member: a Raw byte slot.
+        let selected = compact[F::QsaSelected as usize];
+        assert_eq!(selected.owner, Some(F::Projection));
+        assert_eq!(selected.dtype, rdna_compute::DType::Raw);
+        assert_eq!(selected.pitch, None);
+        assert_eq!(selected.elements, 8192 * config.qsa_selected_capacity() * 4);
     }
 
     /// One grouped-GDN invocation set, host-simulated: the grouped producers
