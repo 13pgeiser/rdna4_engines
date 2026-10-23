@@ -6960,6 +6960,107 @@ impl Gpu {
         ))
     }
 
+    /// [`Self::rotate_x_mq_i4_f16out_batched`] with the shared-expert INT8 route's third output:
+    /// the A8 `block_i8_128` blocks of the same rotated rows into `reservation8` (bytes of
+    /// [`Self::rotate_x_mq_i8_batched`]'s). The F16 X and the IU4 sidecar are
+    /// `mq_rotate_x_i4_f16out`'s. Seals both reservations after a successful launch.
+    pub fn rotate_x_mq_i4_f16out_i8_batched(
+        &mut self,
+        x_in: &GpuTensor,
+        x_f16: &GpuTensor,
+        reservation: crate::scratch::Int4MmqReservation,
+        reservation8: crate::scratch::Int8MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<(
+        crate::scratch::Int4MmqPrepared,
+        crate::scratch::Int8MmqPrepared,
+    )> {
+        self.bind_thread()?;
+        if reservation.k() != k
+            || reservation.n() != batch_size
+            || reservation8.k() != k
+            || reservation8.n() != batch_size
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i4_f16out_i8_batched: reservation (k,n) mismatch",
+            ));
+        }
+        if x_in.dtype != DType::F32
+            || x_f16.dtype != DType::F16
+            || x_in.numel() < k * batch_size
+            || x_f16.numel() < k * batch_size
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i4_f16out_i8_batched: F32 input and F16 output of at least k * batch elements",
+            ));
+        }
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i4_f16out_i8_batched: exact gfx1201 only",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let kernel = "mq_rotate_x_i4_f16out_i8";
+        self.ensure_kernel(kernel, kernels::MQ_ROTATE_X_I4_F16OUT_I8_SRC, kernel)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x_in.buf.as_ptr();
+        let mut xrp: *mut c_void = std::ptr::null_mut();
+        let mut x16p = x_f16.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut i4p = reservation.ptr();
+        let mut i8p = reservation8.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut x16p as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+            &mut i8p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let blocks_k = k / 128;
+        let bytes = (k * 4 + k * 2 + blocks_k * 72 + blocks_k * 136 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_i4_f16out_i8", bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [((k / 256) * batch_size) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xrp);
+                b.push_ptr(x16p);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i4p);
+                b.push_ptr(i8p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok((
+            crate::scratch::Int4MmqPrepared::from_reservation(reservation),
+            crate::scratch::Int8MmqPrepared::from_reservation(reservation8),
+        ))
+    }
+
     /// One-pass A8 producer of the exact-INT8 MQ6G256V2 route: plain FWHT rotate (the
     /// `mq_rotate_x` body, no gate, no AWQ) emitting `block_i8_128` straight into
     /// `reservation` (`_gfx12` / `_gfx11` symbol by arch). The blocks are byte-identical to

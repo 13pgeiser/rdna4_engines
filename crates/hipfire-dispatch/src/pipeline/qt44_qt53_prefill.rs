@@ -475,6 +475,9 @@ pub(crate) fn input_basis(
 pub(crate) struct MoeFront {
     xq: rdna_compute::scratch::Int4MmqPrepared,
     x16: GpuTensor,
+    /// The shared gate/up INT8 GEMM's A8 blocks of the same rotated rows, when the producer
+    /// also emitted them ([`shared_int8`]).
+    x8: Option<rdna_compute::scratch::Int8MmqPrepared>,
 }
 
 /// Whether the symmetric IU4 route (exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
@@ -509,8 +512,14 @@ pub(crate) fn input_basis_front(
     p: &MoePrefillParams<'_>,
 ) -> Result<MoeFront, DispatchError> {
     require_geometry(p)?;
+    // The front only runs on path 2 (`front_applies`).
+    if shared_int8(gpu, p, true) {
+        let (xq, x16, x8) =
+            hip(gpu.qwen4_moe_front_producer_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+        return Ok(MoeFront { xq, x16, x8: Some(x8) });
+    }
     let (xq, x16) = hip(gpu.qwen4_moe_front_producer(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
-    Ok(MoeFront { xq, x16 })
+    Ok(MoeFront { xq, x16, x8: None })
 }
 
 /// Whether the path-2 F16 WMMA gate/up rotates the activation straight to
@@ -851,12 +860,20 @@ pub(crate) fn shared_gate_up_front(
                     "qt44/qt53 router + selector F16 WMMA route did not apply".into(),
                 ));
             }
-            return hip(gpu.qwen4_shared_i8_gate_up(
-                &shared_i8_weights(shared),
-                p.x_norm_batch,
-                shared.gate_out,
-                p.batch_size,
-            ));
+            let w = shared_i8_weights(shared);
+            return match front.and_then(|f| f.x8.as_ref()) {
+                // The front's one pass already left the A8 blocks of this call's rows.
+                Some(x8) => {
+                    let xq = hip(gpu.int8_mmq_prepared_ptr(x8, w.hidden, p.batch_size))?;
+                    hip(gpu.qwen4_shared_i8_gate_up_prequant(&w, xq, shared.gate_out, p.batch_size))
+                }
+                None => hip(gpu.qwen4_shared_i8_gate_up(
+                    &w,
+                    p.x_norm_batch,
+                    shared.gate_out,
+                    p.batch_size,
+                )),
+            };
         }
         // The router group first (its own launches, as `router_projection`
         // would issue them), then the shared group, off one F16 conversion.

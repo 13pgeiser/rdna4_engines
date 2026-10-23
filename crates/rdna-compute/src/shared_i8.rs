@@ -356,6 +356,28 @@ impl Gpu {
         if !self.qwen4_shared_i8_applies(w, batch_size) {
             return Err(HipError::new(0, "qwen4_shared_i8_gate_up: route does not apply"));
         }
+        let xq = self.mq6_i8_prepare_x(x, w.hidden, batch_size)?;
+        self.qwen4_shared_i8_gate_up_prequant(w, xq, hidden_bf16, batch_size)
+    }
+
+    /// [`Gpu::qwen4_shared_i8_gate_up`] on the A8 blocks `xq` (`[hidden/128][batch_size]`) a
+    /// producer already left in the INT8 activation scratch: [`Gpu::mq6_i8_prepare_x`]'s
+    /// pointer, or the fused MoE front's ([`Gpu::qwen4_moe_front_producer_i8`], through
+    /// [`Gpu::int8_mmq_prepared_ptr`]).
+    pub fn qwen4_shared_i8_gate_up_prequant(
+        &mut self,
+        w: &SharedI8Weights<'_>,
+        xq: *mut c_void,
+        hidden_bf16: &GpuTensor,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.qwen4_shared_i8_applies(w, batch_size) || xq.is_null() {
+            return Err(HipError::new(
+                0,
+                "qwen4_shared_i8_gate_up_prequant: route does not apply",
+            ));
+        }
         let out_bytes = batch_size * w.intermediate * 2;
         if hidden_bf16.buf.size() < out_bytes || (hidden_bf16.buf.as_ptr() as usize) % 8 != 0 {
             return Err(HipError::new(
@@ -364,7 +386,6 @@ impl Gpu {
             ));
         }
         let (gu, _) = self.qwen4_shared_i8_shadow(w)?;
-        let xq = self.mq6_i8_prepare_x(x, w.hidden, batch_size)?;
         self.shared_i8_gemm_launch(
             GEMM_ENTRY_GATE_UP,
             gu,

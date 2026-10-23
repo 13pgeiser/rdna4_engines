@@ -2855,6 +2855,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         // Qwen4 shared-expert INT8 route (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`): the
         // int8 x int8 GEMM and the BF16 -> FWHT -> A8 producers (weight shadows, hidden).
         add!(
+            "mq_rotate_x_i4_f16out_i8",
+            kernels::MQ_ROTATE_X_I4_F16OUT_I8_SRC,
+            ["mq_rotate_x_i4_f16out_i8"]
+        );
+        add!(
             "qwen4_shared_i8_gemm_gfx12",
             kernels::QWEN4_SHARED_I8_GEMM_GFX12_SRC,
             [
@@ -9853,8 +9858,11 @@ mod tests {
             );
         }
         // The Qwen4 shared-expert INT8 route (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`).
-        const SHARED_I8_ADDED_MODULES: [&str; 2] =
-            ["qwen4_shared_i8_gemm_gfx12", "qwen4_shared_i8_quant_gfx12"];
+        const SHARED_I8_ADDED_MODULES: [&str; 3] = [
+            "qwen4_shared_i8_gemm_gfx12",
+            "qwen4_shared_i8_quant_gfx12",
+            "mq_rotate_x_i4_f16out_i8",
+        ];
         for module in SHARED_I8_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),

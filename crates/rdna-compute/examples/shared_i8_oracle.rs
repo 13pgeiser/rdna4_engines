@@ -314,6 +314,40 @@ fn main() {
         let xq_ptr = gpu.mq6_i8_prepare_x(&x, H, n).unwrap();
         let xq = download_raw(&gpu, xq_ptr, (H / 128) * n * BLOCK);
 
+        // 0. The fused front producer's three outputs against the standalone chain it extends:
+        // the F16 X and the IU4 sidecar of `qwen4_moe_front_producer` and the A8 blocks of
+        // `mq6_i8_prepare_x`.
+        if gpu.qwen4_moe_front_fuse_applies() {
+            let (p4, x16r) = gpu.qwen4_moe_front_producer(&x, H, n).unwrap();
+            let p4r = download_raw(
+                &gpu,
+                gpu.int4_mmq_prepared_ptr(&p4, H, n).unwrap(),
+                (H / 128) * n * 72,
+            );
+            let x16r_b = download_raw(&gpu, x16r.buf.as_ptr(), n * H * 2);
+            let (p4n, x16n, p8) = gpu.qwen4_moe_front_producer_i8(&x, H, n).unwrap();
+            let p4n_b = download_raw(
+                &gpu,
+                gpu.int4_mmq_prepared_ptr(&p4n, H, n).unwrap(),
+                (H / 128) * n * 72,
+            );
+            let x16n_b = download_raw(&gpu, x16n.buf.as_ptr(), n * H * 2);
+            let p8_b = download_raw(
+                &gpu,
+                gpu.int8_mmq_prepared_ptr(&p8, H, n).unwrap(),
+                (H / 128) * n * BLOCK,
+            );
+            let bad4 = p4r.iter().zip(&p4n_b).filter(|(a, b)| a != b).count();
+            let bad16 = x16r_b.iter().zip(&x16n_b).filter(|(a, b)| a != b).count();
+            let bad8 = xq.iter().zip(&p8_b).filter(|(a, b)| a != b).count();
+            report.line(
+                bad4 == 0 && bad16 == 0 && bad8 == 0,
+                format!("front producer i8 rows={n} iu4_mismatches={bad4} f16x_mismatches={bad16} a8_mismatches={bad8}"),
+            );
+        } else if n == rows_list[0] {
+            println!("front producer check skipped: qwen4_moe_front_fuse_applies() is false here");
+        }
+
         gpu.qwen4_shared_i8_gate_up(&w, &x, &hid, n).unwrap();
         let hid_bits = le_u16(&download_raw(&gpu, hid.buf.as_ptr(), n * I * 2));
         let toks = sample_tokens(n, &mut rng);
