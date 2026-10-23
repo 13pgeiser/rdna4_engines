@@ -2241,7 +2241,11 @@ type Qwen4DecideAuto = (
 struct Qwen4PlacementPolicy {
     band: bool,
     hotset: bool,
-    admitted_s1: bool,
+    /// The admitted S1 profile's OWN placement charges
+    /// ([`hipfire_arch_qwen4::slowlink_admission::SlowlinkProfile::charges`]):
+    /// `Some` exactly when a profile was admitted. The profile already sized its
+    /// resident layers against them, so the settled placement is owned by it.
+    admitted_s1: Option<hipfire_arch_qwen4::expert_residency::PlacementCharges>,
     ep_agreed: Option<usize>,
     use_ranges: bool,
     explicit: Option<hipfire_arch_qwen4::expert_residency::ExpertVramLayers>,
@@ -2288,7 +2292,11 @@ fn qwen4_decide_placement(
         None
     } else if facts.hotset {
         None
-    } else if facts.admitted_s1 {
+    } else if let Some(charges) = facts.admitted_s1 {
+        // The admitted profile places exactly its own resident layers and
+        // never re-queries capacity, so no census arm runs to derive the
+        // settled margin/stage: the profile's own quote IS the owner.
+        result.charges = Some(charges);
         Some(residency::ExpertVramLayers::Auto)
     } else if let Some(layers) = facts.ep_agreed {
         Some(residency::ExpertVramLayers::Layers(layers))
@@ -2558,6 +2566,17 @@ fn qwen4_shared_charges(
 ) -> Result<hipfire_arch_qwen4::expert_residency::PlacementCharges, String> {
     hipfire_arch_qwen4::expert_residency::PlacementCharges::new(layer_experts, staged && slab_stage)
         .map(|charges| charges.with_slowlink(slowlink_bytes))
+}
+
+/// The owning margin/stage charge of a settled single-rank placement. Every
+/// placement path records the charge its own owner derived (the hot set's tier
+/// plan, the resident-fit census, the explicit/auto census, or an admitted S1
+/// profile's quote); a settled placement no owner charged is a refusal, never a
+/// zero charge.
+fn qwen4_settled_charges(
+    settled: Option<hipfire_arch_qwen4::expert_residency::PlacementCharges>,
+) -> Result<hipfire_arch_qwen4::expert_residency::PlacementCharges, String> {
+    settled.ok_or_else(|| "qwen4: settled placement has no owning margin/stage charge".into())
 }
 
 /// Free VRAM of every device in `devices` (HIP logical ids), in order, as
@@ -3134,7 +3153,7 @@ pub fn qwen4_preload_resource_plan(
         Qwen4PlacementPolicy {
             band: false,
             hotset: hotset_tier_for_plan.is_some(),
-            admitted_s1: false,
+            admitted_s1: None,
             ep_agreed: None,
             use_ranges,
             explicit: explicit_for_plan,
@@ -4883,7 +4902,7 @@ fn load_qwen4_rank_scoped(
         Qwen4PlacementPolicy {
             band: band.is_some(),
             hotset: hotset_plan.is_some(),
-            admitted_s1: slowlink_profile.is_some(),
+            admitted_s1: slowlink_profile.as_ref().map(|profile| profile.charges),
             ep_agreed: expert_vram_layers,
             use_ranges,
             explicit,
@@ -5322,8 +5341,7 @@ fn load_qwen4_rank_scoped(
                 && config.num_experts
                     == hipfire_arch_qwen4::expert_slabs::EXPERTS_PER_LAYER as usize
         }) {
-        let charges = settled_placement_charges
-            .ok_or("qwen4: settled placement has no owning margin/stage charge")?;
+        let charges = qwen4_settled_charges(settled_placement_charges)?;
         let (tier_device, tier_host, stage, margin) = if let Some((plan, _)) = &hotset_plan {
             use hipfire_arch_qwen4::expert_tier_plan::Placement;
             (
@@ -11351,6 +11369,72 @@ mod qwen4_slowlink_tests {
         }
     }
 
+    /// 0.4.3 RC blocker: Flash-Next on a gfx1100 24 GB discrete card (the XTX,
+    /// 7.1 GB/s H2D link) selects S1, places exactly the profile's resident
+    /// layers, and then refused with `settled placement has no owning
+    /// margin/stage charge`: the admitted-S1 arm never recorded a charge. The
+    /// profile owns it, so the shared decision now returns it and the settled
+    /// guard accepts it. D2 (`HIPFIRE_QWEN4_D2_DEFAULT` on or off) is decided
+    /// AFTER the settled placement and is no input of this decision, which is why
+    /// both XTX lanes failed identically; the same placement serves either.
+    #[test]
+    fn slowlink_admitted_gfx1100_placement_settles_with_the_profiles_own_charges() {
+        use hipfire_arch_qwen4::expert_residency::ExpertVramLayers;
+        for layers in [0u64, 8, 10, 11] {
+            let (_, _, outcome) = select(
+                s1::SlowlinkMode::Auto,
+                "gfx1100",
+                HostLink::Discrete { gbps: 7.09 },
+                free_for(layers),
+            );
+            let profile = outcome.unwrap().expect("a narrow gfx1100 link admits S1");
+            assert_eq!(profile.resident_layers as u64, layers);
+            let slowlink = profile.reserve_bytes().unwrap();
+            let decided = super::qwen4_decide_placement(
+                super::Qwen4PlacementPolicy {
+                    band: false,
+                    hotset: false,
+                    admitted_s1: Some(profile.charges),
+                    ep_agreed: None,
+                    use_ranges: false,
+                    explicit: None,
+                    slowlink_bytes: slowlink,
+                    table_geometry: (48, 512, false),
+                },
+                || panic!("an admitted S1 load never censuses routed bytes"),
+                || panic!("an admitted S1 load never re-queries capacity"),
+                || panic!("a discrete card has no UMA policy"),
+            )
+            .expect("admitted S1 decision");
+            assert_eq!(decided.policy, Some(ExpertVramLayers::Auto), "{layers}");
+            assert!(decided.measured.is_none() && decided.reserve.is_none());
+            // The settled guard accepts the placement with the owning charge.
+            let charges = super::qwen4_settled_charges(decided.charges)
+                .expect("an admitted S1 placement carries its owning charges");
+            assert_eq!(charges.margin, MARGIN, "{layers}");
+            assert_eq!(
+                charges.stage, 0,
+                "S1 allocates no dedicated stage: {layers}"
+            );
+            assert_eq!(charges.slowlink, slowlink, "{layers}");
+            // Exactly what the loader's own census would derive on gfx1100 (no
+            // dedicated slab stage), and the reserve the layers were quoted on.
+            assert_eq!(
+                charges,
+                super::qwen4_shared_charges(LAYER, true, false, slowlink).unwrap()
+            );
+            assert_eq!(
+                charges.reserve(BASE_RESERVE).unwrap(),
+                profile.placement.reserve_bytes,
+                "{layers}"
+            );
+        }
+        // A settled placement no owner charged is still a refusal, never zero.
+        assert!(super::qwen4_settled_charges(None)
+            .unwrap_err()
+            .contains("no owning margin/stage charge"));
+    }
+
     #[test]
     fn slowlink_arch_is_identity_and_still_probes_for_inputs() {
         // No exact-arch allowlist: every arch probes once and builds inputs on
@@ -11804,13 +11888,16 @@ mod qwen4_preload_plan_tests {
     }
     #[test]
     fn preload_shared_policy_keeps_admitted_and_fixed_paths_lazy() {
-        use hipfire_arch_qwen4::expert_residency::ExpertVramLayers;
+        use hipfire_arch_qwen4::expert_residency::{ExpertVramLayers, PlacementCharges};
+        let s1_charges = PlacementCharges::new(1 << 30, false)
+            .unwrap()
+            .with_slowlink(7 << 20);
         for (hotset, admitted_s1, explicit, expected) in [
-            (true, false, None, None),
-            (false, true, None, Some(ExpertVramLayers::Auto)),
+            (true, None, None, None),
+            (false, Some(s1_charges), None, Some(ExpertVramLayers::Auto)),
             (
                 false,
-                false,
+                None,
                 Some(ExpertVramLayers::Layers(0)),
                 Some(ExpertVramLayers::Layers(0)),
             ),
@@ -11832,6 +11919,9 @@ mod qwen4_preload_plan_tests {
             )
             .expect("lazy policy");
             assert_eq!(decided.policy, expected);
+            // An admitted S1 profile settles with ITS charges; every other lazy
+            // arm defers the charge to the owner that sizes it.
+            assert_eq!(decided.charges, admitted_s1);
             assert!(decided.measured.is_none());
         }
     }
@@ -11868,7 +11958,7 @@ mod qwen4_preload_plan_tests {
             super::Qwen4PlacementPolicy {
                 band: false,
                 hotset: false,
-                admitted_s1: false,
+                admitted_s1: None,
                 ep_agreed: None,
                 use_ranges: false,
                 explicit: None,
