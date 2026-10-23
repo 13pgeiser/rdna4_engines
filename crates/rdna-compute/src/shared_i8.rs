@@ -78,11 +78,39 @@ pub struct SharedI8Weights<'a> {
     pub down_rows: usize,
 }
 
+/// Device bytes of one layer's INT8 shadows (`gate_up` + `down` planes) for a shared expert of
+/// `intermediate` x `hidden` gate/up and `down_rows` x `intermediate` down; `None` when the
+/// route cannot take the shape (`hidden % 256`, `intermediate % 128`) or the bytes overflow.
+pub fn shared_i8_shadow_layer_bytes(
+    intermediate: usize,
+    hidden: usize,
+    down_rows: usize,
+) -> Option<u64> {
+    if hidden == 0 || hidden % 256 != 0 || intermediate == 0 || intermediate % 128 != 0 {
+        return None;
+    }
+    let words = plane_words(hidden, intermediate.checked_mul(2)?)
+        .checked_add(plane_words(intermediate, down_rows))?;
+    u64::try_from(words.checked_mul(4)?).ok()
+}
+
+/// The flag half of the route's admission, shared with the Qwen4 VRAM census: the INT8 route
+/// exists only on exact gfx1201 with `HIPFIRE_QWEN4_SHARED_INT8` not `0`.
+pub fn shared_i8_route_enabled(flag: bool, arch: &str) -> bool {
+    flag && arch == "gfx1201"
+}
+
 fn plane_words(k: usize, rows: usize) -> usize {
     (k / 128) * rows * (BLOCK_BYTES / 4)
 }
 
 impl Gpu {
+    /// Whether this device and process can ever run the shared-expert INT8 route
+    /// ([`shared_i8_route_enabled`] on `HIPFIRE_QWEN4_SHARED_INT8`): the census charge's gate.
+    pub fn qwen4_shared_i8_enabled(&self) -> bool {
+        shared_i8_route_enabled(*QWEN4_SHARED_INT8, &self.arch)
+    }
+
     /// Whether the shared-expert INT8 route admits a call of `batch_size` rows on weights
     /// `w`: the flag (`HIPFIRE_QWEN4_SHARED_INT8`), exact gfx1201, eager, BF16 weights with
     /// 16-byte aligned bases, `hidden % 256 == 0`, `intermediate % 128 == 0` (the gate/up
