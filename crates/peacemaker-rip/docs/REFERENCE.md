@@ -618,20 +618,100 @@ Geometry (256 rows x 128 tokens x 8 waves), the six LDS slots (`A0 A1 R0 R1 D0 D
 
 The committed twin [`fp8_gemm.rip`](../../peacemaker-isa/src/kernels/fp8_gemm.rip) writes the whole composition, down to the barrier lists: `declare_lds`, `prologue`, `kloop` (first block, loop of two blocks per trip, peeled last block), `block` (A1 fetched before slab 0, a uniform B1 barrier that retires A0 and publishes the next ratio planes, the next A0 payload, the fold, a split B2 barrier), `fold`, then `fp8::epilogue`. `fp8_gemm::emit` is written over the same blocks and is pinned to the digests recorded before they existed (`peacemaker-isa/tests/fp8_gemm_digests.rs`). It re-emits the bytes and the proof of every one of the twelve valid specs (`tests/fp8_gemm_twin.rs`). `pm_loop --kernel fp8_gemm --rip fp8_gemm.rip` times it ([cookbook 13](cookbook/13-fp8-blocks.md)).
 
-## 16. `qwen4_moe_sym` down entries: `QDownGen` and `qdown::*`
+## 16. Production generator on builder-level blocks: `qwen4_moe_sym` (`MoeNtGen`, `MoeNt1Gen`, `moent::*`, `moe1::*`)
 
-The gfx1201 MQ4 down NT4/NT8 entries of `qwen4_moe_sym`, flat-slot (`down_ntN`) and grouped-position (`down_gp_ntN`), as phase blocks over `qwen4_moe_sym::down_blocks`. The committed twin is `peacemaker-isa/src/kernels/qwen4_moe_down_gp.rip`; `tests/qwen4_moe_down_twin.rs` requires `s_text` and proof identity with `qwen4_moe_sym::emit` / `emit_down_gp` for all four variants. `MoeSym::emit(..)` (section 13) is the coarse native.
+The gfx1201 MQ4 entries of `qwen4_moe_sym`, composed in script like `mq6_i8_gemm` (section 14): `gate_up` (SwiGLU) and `down` at NT1, NT4 and NT8, and the grouped-position down entries `down_gp_nt4|nt8`. The committed twin is `peacemaker-isa/src/kernels/qwen4_moe_sym.rip` (variants `gate_up`, `gate_up_nt4`, `gate_up_nt8`, `down`, `down_nt4`, `down_nt8`, `down_gp_nt4`, `down_gp_nt8`: the pm_loop `--epi` names); `tests/qwen4_moe_sym_twin.rs` requires `s_text` and proof identity with `qwen4_moe_sym::emit` / `emit_down_gp` for all eight. `MoeSym::emit(..)` (section 13) is the coarse native. The Rust generators are written over the same blocks (`qwen4_moe_sym::blocks` for NT4/NT8, `qwen4_moe_sym::nt1_blocks` for NT1) and pinned to the digests recorded before the blocks existed (`peacemaker-isa/tests/qwen4_moe_sym_digests.rs`: every entry, the grouped-position entries, the module texts and the `R4Spec` experiments), so a change to a block moves both the generator and the twin.
 
-The down entries have no LDS and no ring, so there is nothing to lend: the blocks that need the typed core run in one `Driver::typed` call each (like `iu4::*`); the others emit straight into `wg.isa()`. The script owns the exit, the K-loop's trip structure, the order of weight loads and epoch folds in a trip, the descriptor step, the trip counter and prefetch distance (which descriptor each fold re-issues its activations through). The prologue, a fold, the tail and the store epilogue are single blocks (each interleaves emission with per-tile or wave-scope branches, which a typed block cannot sit under). Tile width `nt` is a spec axis (`QDownGen::new(nt, gp, arch)`, `nt` 4 or 8).
+Nothing here lends a typed region or opens a typed scope: **every block is a straight run of instructions** emitted into `wg.isa()`, every compare is a native returning an `Instruction` (turn it into a condition with `wg.scmp` / `wg.scmp_wg_uniform`), and the LDS accesses of the `gate_up` hand-off are natives returning `Instruction`s (`moent::publish_insns`, `moent::gate_load_insns`) that the script issues through `wg.ds_store` / `wg.ds_load` on the region it declared (`wg.lds::<Gate>("swiglu_gate", 0, g.lds_bytes())`). The script therefore owns: the exits (a tile past the end, a sentinel expert, a non-leader tile), the run walk's `loop_until`, the per-tile liveness branches of a fold and **where each wait sits** (`moent::wait_tile`; delete it and the build is refused: the next tile's loads are issued with the previous still pending), the order of loads and folds in a K-loop trip and across the tail, the descriptor steps, the trip counter, the odd/even tail, the per-tile output exits, and the hand-off (the gate waves' stores, the up waves' loads, `wg.handoff`). Tile geometry (`nt`, the register map, the fold math, the K-loop's prefetch schedule) is a spec axis of the Rust generator and needs a rebuild; the chains / no-prefetch / grouped axes of the `R4Spec` experiments stay Rust-only.
 
 | call | meaning |
 |---|---|
-| `QDownGen::new(nt, gp, arch)?` | the generator of one valid entry (the Rust `emit` refusals). `gen.plan()?`, `gen.kernel_spec()`, `gen.nt()`, `gen.gp()`, `gen.label(name)`, `gen.exit_label()` |
-| `qdown::prologue(wg, g, end)?` | kernel arguments, tile ids, descriptors, lane offsets, the first epoch's loads (typed) |
-| `qdown::trips_cmp(wg, "s_cmp_eq_u32" \| "s_cmp_lg_u32")?` | the trip counter against zero, a workgroup-uniform `WgCond` (typed) |
-| `qdown::trips_dec(wg)?` | one trip done |
-| `qdown::load_w(wg, g, p)?` | issue the weight loads of epoch parity `p` |
-| `qdown::compute(wg, g, p, site)?`, `qdown::compute_reload(wg, g, p, site, srd)?` | fold epoch parity `p`; the second form re-issues each tile's next-epoch activations through descriptor `srd` (`qdown::srd_x(0 \| 1)?`) right after its fold (typed) |
-| `qdown::advance(wg)?` | step the weight and activation descriptors one trip on |
-| `qdown::tail(wg, g)?` | the tail after the trips: one pair (even K/128) or one epoch (odd), one block |
-| `qdown::epilogue(wg, g, end)?` | the epilogue label and the tile stores; the script places the exit with `wg.end(end)` |
+| `MoeNtGen::new(kind, nt, gp, arch)?` | one NT4/NT8 entry (`kind` is `"gate_up"` or `"down"`; `gp` only for `down`; the Rust `emit` / `emit_down_gp` refusals). `g.plan()?`, `g.kernel_spec()`, `g.nt()`, `g.gp()`, `g.gate_up()`, `g.lds_bytes()` (the hand-off region, 0 for down), `g.label(name)`, `g.exit_label()` |
+| `MoeNt1Gen::new(kind, arch)?` | one NT1 entry (no LDS, no hand-off). `g.plan()?`, `g.kernel_spec()`, `g.gate_up()`, `g.label(name)`, `g.exit_label()` |
+| `moent::pro_front(wg, g)?`, `moent::pro_expert(wg, g)?`, `moent::pro_run(wg, g)?`, `moent::pro_leader(wg, g)?`, `moent::pro_cnt(wg, g)?`, `moent::pro_desc(wg, g)?`, `moent::pro_init(wg, g)?` | prologue runs: kernel arguments and ids; the tile's expert; the expert's weights and the tile-id descriptor; this tile's position in its run; the live-tile count, row bytes, trips, row base and descriptors; descriptors, lane offsets and the first epoch's weights; the fold magic and zeroed sums |
+| `moent::walk_head(wg, g)?`, `moent::walk_step(wg, g)?` | one iteration of the run walk up to its lane mask; its back-edge step (the body of `wg.loop_until(g.label("run_walk"), g.label("run_found"), ..)`) |
+| `moent::pro_slot_load(wg, g, j)?`, `moent::pro_tile(wg, g, j)?` | tile `j`'s sorted-slot load; its activation row offset (dead tiles gather slot -1) |
+| `moent::outside_insn(g)`, `moent::sentinel_insn(g)`, `moent::walk_hit_insn(g)`, `moent::follower_insn(g)` | `Instruction`: the tile is past the end; a sentinel expert; some lane found the run's start; not the run's leader |
+| `moent::load_w(wg, g, p)?`, `moent::load_x(wg, g, j, p)?` | weight loads of epoch parity `p`; tile `j`'s activation loads through epoch `p`'s descriptor |
+| `moent::compute_head(wg, g, p)?`, `moent::fold_tile(wg, g, p, j)?` | epoch `p`'s row scales and rebias; epoch `p` folded into tile `j`'s sums |
+| `moent::wait_tile(wg, g, j)?`, `moent::tile_live_insn(g, j)?` | the waits tile `j`'s fold needs; `Instruction`: `cnt > j` (wave-uniform) |
+| `moent::advance(wg)?`, `moent::trips_dec(wg)?` | step the weight and activation descriptors one trip on; one trip done |
+| `moent::trips_zero_insn()`, `moent::trips_more_insn()`, `moent::odd_insn()`, `moent::up_insn()` | `Instruction`: no full trip; trips remain; K/128 is odd; the up waves (hand-off readers) |
+| `moent::epilogue_label(wg, g)?`, `moent::y_descriptor(wg, g)?`, `moent::y_step(wg)?`, `moent::store_rows(wg, g, j, gate)?` | the epilogue label; the output descriptor; one tile on; tile `j`'s BF16 rows from the sums (`gate = false`) or the SwiGLU registers (`true`) |
+| `moent::bf16_roundtrip(wg, g)?`, `moent::silu_tile(wg, g, j)?` | `gate_up` only: every wave's BF16 round trip before the hand-off; tile `j`'s SwiGLU after the gate rows are read back |
+| `moent::publish_insns(g, j)?`, `moent::gate_load_insns(g, j)?` | `gate_up` only, `Vec<Instruction>` of two: tile `j`'s gate `ds_store_b128`s (issue with `wg.ds_store(region, insn)` in the `handoff` write closure); its read-back `ds_load_b128`s (`wg.ds_load(region, insn)` in the read closure) |
+| `moe1::pro_front(wg, g)?`, `moe1::pro_expert(wg)?`, `moe1::pro_setup(wg, g)?`, `moe1::pro_init(wg, g)?` | NT1 prologue runs (setup includes the first set's loads) |
+| `moe1::outside_insn()`, `moe1::sentinel_insn()`, `moe1::trips_zero_insn()`, `moe1::trips_more_insn()`, `moe1::odd_insn()` | `Instruction`, as the `moent::` forms |
+| `moe1::load_set(wg, g, p)?`, `moe1::compute(wg, g, p)?`, `moe1::advance(wg, g)?`, `moe1::trips_dec(wg)?`, `moe1::tail_pair(wg, g)?` | set `p`'s loads; set `p` folded; descriptors one trip on; one trip done; the two epochs left after the trips |
+| `moe1::epilogue_label(wg, g)?`, `moe1::swiglu(wg, g)?`, `moe1::store(wg, g)?` | the epilogue label; `gate_up` only: BF16 round trip and SwiGLU; the packed BF16 store at `Y` |
+
+Every native refuses a tile index at or past `g.nt()` and a parity above 1 before emitting. `pm_loop --kernel qwen4_moe_sym --epi <variant> --rip crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rip [--shape fn:<preset>]` times a script against the shipped entry through the card (cookbook 14); the twin's record says `identical_to_generator: true`.
+
+Out of scope: the MQ3-I4 and E8P-I4 NT1 generators (`qwen4_moe_sym_w3`, `qwen4_moe_sym_e8p`), the gfx1151 entries (including the row-repeat NT4 `rr > 1` family and its `transition`) and the grouped-position rotate producer have no twin.
+
+## 17. Production generator on the raw `Builder`: `fa_prefill`
+
+The gfx1201 GQA-fused FA2 prefill attention for the A3B head geometry (H16 / KV2 / D256; `peacemaker_isa::kernels::fa_prefill`) is composable from `.rip`. Like `fp8_gemm` (§15) it is an untyped-`Builder` kernel (a tile loop with `loop_`, `control` branches, raw barriers), so its twins are written on the raw `Builder` surface, not on `Workgroup`: no typestate and no sealed ring apply, and the checks are the Builder's (LDS slot machine, wait ledger, hazard guards, loop fixpoint). Three exports are covered, in two twin files:
+
+- [`fa_prefill.rip`](../../peacemaker-isa/src/kernels/fa_prefill.rip) (Q8_0 K/V): variants `direct` (`attention_q8_0_fa2_gqa_pm_gfx1201`) and `preconvert` (`attention_fa2_q_preconvert_pm_gfx1201`);
+- [`fa_prefill_fp8.rip`](../../peacemaker-isa/src/kernels/fa_prefill_fp8.rip) (native fp8 E4M3 K/V): variant `direct` (`attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201`).
+
+`fa_qprep` is not composed: it is a separate generator with its own module and no shared blocks.
+
+The script declares the LDS slots (`b.lds_slot`, from `g.lds_slots()`: `k_plane` + `v_plane`, or the single reused `stage`), places every label (`fa::label`), issues every barrier (`b.barrier_with_scope(.., "lds_only")`) and the tile loop (`b.loop_(fa::LOOP, ..)`). The natives emit straight into the builder passed as their first argument. Geometry (four compute waves + one helper, KT64 tiles, the register map) is fixed by the Rust generator.
+
+### Coarse natives and the generator
+
+| call | meaning |
+|---|---|
+| `FaPrefill::emit(arch, spec)?`, `FaPrefill::emit_preconvert(arch, spec)?` | what `fa_prefill::emit` / `emit_preconvert` return (`Emitted`) |
+| `FaPrefill::emit_module(arch, spec)?`, `FaPrefill::emit_fp8_module(arch, spec)?` | `(Vec<Emitted>, text, proof_json)` of the Q8_0 module (preconvert, direct) / the one-export fp8 module |
+| `FaKv::{Q8_0, Fp8E4M3}`, `FaSpec { heads, kv_heads, head_dim, kv }` | the codec enum and the spec literal; the Rust gate (gfx1201, exactly 16 / 2 / 256) stays in force and every field is required |
+| `FaGen::new(arch, spec)?` | the generator of one valid spec: an opaque value |
+| `g.plan()?`, `g.kernel_spec()` | the direct export's `RegPlan` and `KernelSpec` |
+| `g.preconvert_plan()?`, `g.preconvert_kernel_spec()` | the preconvert export's |
+| `g.lds_slots()` | `Vec<(name, base, bytes)>`, in slot-id order |
+| `g.spec()` | the `FaSpec` |
+| `fa::LOOP FILL_DONE KFILL_DONE KREADY QK QK_DONE VFILL_DONE VREADY TURN EPI END PRECONVERT_END` | the label constants (strings) |
+
+### Blocks
+
+`b` is the `Builder` of `Builder::new(g.kernel_spec(), g.plan()?)`; `g` an `FaGen`.
+
+| call | what it does |
+|---|---|
+| `fa::label(b, name)?` | place a label |
+| `fa::prologue(b, g)?` | entry block: guards (branch to `fa::END`), scalar state, query row / head, group bounds, Q fragments, online state; branches to `fa::EPI` when no tile is live |
+| `fa::tile_setup(b, g)?` | per-tile counts and the K/V tile bases (`ktile * 544` Q8_0, `ktile * 516` fp8) |
+| `fa::fill(b, g)?` | Q8_0: the joint K and V fill; the helper wave branches to `fa::FILL_DONE`. Refuses an fp8 generator |
+| `fa::fill_k(b, g)?`, `fa::fill_v(b, g)?` | fp8: the K fill, then (after the stage is retired) the V fill. Refuse a Q8_0 generator |
+| `fa::skip_if_helper(b, label)?` | the helper wave (wave 4) skips to `label` |
+| `fa::qk(b, g)?` | the QK product of the tile |
+| `fa::softmax_sub(b, g, sub)?` | one key subtile's softmax and PV, `sub` in `0..4` |
+| `fa::next_tile(b)?` | `ktile += 64` and the back edge to `fa::LOOP` while `ktile <= gmax` |
+| `fa::epilogue(b, g)?` | label `fa::EPI` through `fa::END` and `s_endpgm`: `out = O * (l > 0 ? 1/l : 0)` and the stores |
+| `fa::preconvert(b, g)?` | the whole preconvert body through `s_endpgm` |
+
+The Q8_0 tile is `tile_setup`, `fill`, label `FILL_DONE`, `[ready(0), ready(1)]`, label `QK`, `skip_if_helper(TURN)`, `qk`, four `softmax_sub`, label `TURN`, `[retire(0), retire(1)]`, `next_tile`. The fp8 tile reuses one 32-KiB stage sequentially: `fill_k`, `[ready(0)]`, `qk` (helper skips to `QK_DONE`), `[retire(0)]`, `fill_v`, `[ready(0)]`, four `softmax_sub` (helper skips to `TURN`), `[retire(0)]`, `next_tile`. `fa_prefill::emit` is written over the same blocks and is pinned to the digests recorded before they existed for both modules, every export and the three shape contracts (`peacemaker-isa/tests/fa_prefill_digests.rs`); the twins re-emit the bytes and the proof of every export (`tests/fa_prefill_twin.rs`). `pm_loop --kernel fa_prefill --rip fa_prefill.rip` times them ([cookbook 15](cookbook/15-fa-prefill-blocks.md)).
+
+## 18. The PM producers: `C8Gen`, `RotGen`, `GdnGen`
+
+`iu4_c8_producer_pm` (four exports), `moe_rotate_i4_pm` (flat-slot and grouped-position) and `gdn_chunk_prep_pm` are untyped-`Builder` kernels, so their twins are too: `Builder::new(g.kernel_spec(), g.plan()?)`, `b.enable_delay_alu()`, no `Workgroup`. A generator is an opaque handle; the natives are the public `blocks` of `iu4_c8_producer`, `moe_rotate_i4_pm` and `gdn_chunk_prep`, each emitting straight into the builder `b` passed first. The committed twins are [`iu4_c8_producer.rip`](../../peacemaker-isa/src/kernels/iu4_c8_producer.rip), [`moe_rotate_i4_pm.rip`](../../peacemaker-isa/src/kernels/moe_rotate_i4_pm.rip) and [`gdn_chunk_prep.rip`](../../peacemaker-isa/src/kernels/gdn_chunk_prep.rip); `tests/producers_twin.rs` requires `s_text` and proof identity with the Rust emit of every export and the module text assembled from the twin's exports, and `peacemaker-isa/tests/producers_pinned.rs` pins the Rust side (every export and module) to the digests recorded before the blocks were split. `pm_loop --kernel iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm --rip FILE.rip` compiles the twin's variant, ABI-checks it against the Rust emit of the same entry and times it.
+
+| call | meaning |
+|---|---|
+| `C8Gen::new(arch, tag)?` | one c8 export (`rotate`, `norm`, `sigmoid_rotate`, `norm_out`); `g.plan()?`, `g.kernel_spec()`, `g.tag()`, `g.lds_bytes()` |
+| `RotGen::new(arch, gp)?` | `moe_rotate_i4_pm` (`gp`: the grouped-position twin, record `g * P + row`); `g.plan()?`, `g.kernel_spec()`, `g.gp()` |
+| `GdnGen::new(arch)?` | `gdn_chunk_prep_pm` (the A3B geometry); `g.plan()?`, `g.kernel_spec()` |
+| `prod::label(b, name)?`, `prod::wait_all(b)?` | place a label; drain every counter |
+| `c8::prologue(b, g)?`, `c8::rotate_front(b)?`, `c8::sigmoid_rotate_front(b)?` | arguments, ids and exits, pointers, lane offsets; the rotate's `x * signs1` (AWQ divide first); the sigmoid gate in front of it |
+| `c8::norm_row_loads(b)?`, `c8::norm_prefetch(b)?`, `c8::norm_sumsq(b)?` | the norm's row dwords; the next phase's loads; the per-thread `fma` chain |
+| `c8::norm_reduce_pre(b, g)?`, `c8::norm_store_insn()`, `c8::norm_reduce_addr(b, g)?`, `c8::norm_load_insns()`, `c8::norm_reduce_post(b, g)?` | the reduction in five pieces: up to the LDS store; the store `Instruction` (for `b.ds_store(0, ..)`); the load address; the two `ds_load_b128` `Instruction`s (for `b.ds_load(0, ..)`); the eight-root tree (and for `norm_out` the in-wave levels). The barrier between is the script's `b.barrier_with_scope([ready(0)], "lds_only")` |
+| `c8::norm_rms(b)?`, `c8::norm_apply(b, g)?` | `rsqrt(eps + mean)` with the denormal guard; `y = (x * w) * rms`, the norm-out store, the AWQ divide and signs1 |
+| `c8::fwht_scale_store(b)?`, `c8::quantize(b)?`, `c8::store_record(b, g)?` | FWHT, scale and the rotated store; the C8 quantizer; the record store, the export's exit label and `s_endpgm` |
+| `rot::prologue(b, g)?`, `rot::rotate(b)?`, `rot::quantize(b, e)?`, `rot::store(b)?` | the prologue; the FWHT128 (returns the four registers the quantizer reads); the `{5,7}` quantizer; the record store |
+| `gdn::label(name)?` | `end`, `gate_loop`, `gate_done`, `k_start`, `v_start`, `epi`, `q_loop`, `k_loop`, `v_loop` |
+| `gdn::prologue(b)?`, `gdn::gate_guard(b)?`, `gdn::gate_setup(b)?`, `gdn::gate_body(b)?` | arguments and ids; only `by == 0` blocks run the gates; the gate set-up; one trip of the gate loop (back branch included: use it as the body of `b.loop_(gdn::label("gate_loop")?, \|b\| ..)`) |
+| `gdn::conv_setup(b)?`, `gdn::conv_to_v(b)?`, `gdn::conv_to_k(b)?`, `gdn::region_setup(b, "q" \| "k" \| "v")?`, `gdn::row_body(b, region, head)?`, `gdn::to_epi(b)?`, `gdn::epilogue(b)?` | the conv unit: set-up, the unit dispatch, a region's pointers, one trip of a region's row loop, `s_branch epi`, the chunk-0 conv_state advance |
+
+Variants: `rotate`, `norm`, `sigmoid_rotate`, `norm_out` (c8), `rows`, `gp` (rotate), `chunk_prep` (gdn). gfx1201 only.

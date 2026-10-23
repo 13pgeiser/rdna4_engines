@@ -59,8 +59,8 @@
 //! with two candidates).
 
 use crate::common::{
-    bf16_normal_bytes, emitted_object, emu_run, no_leftover, put_ptr, put_u32, refused,
-    shipped_object, take_dim, Elem, EmuBuf, ShapeSpec, Xs64,
+    bf16_normal_bytes, emitted_object, emu_run, no_leftover, put_ptr, put_u32, read_rip, refused,
+    rip_object, shipped_object, take_dim, Elem, EmuBuf, RipSource, ShapeSpec, Xs64,
 };
 use crate::prod::{self, Covered, Expect, OutBuf, Producer, Ptrs};
 use crate::workload::{Knobs, Launch, Object, Result, Workload};
@@ -244,9 +244,20 @@ struct Rotate {
     l: usize,
     geo: MoeRotateI4PmGeometry,
     sorted: Vec<i32>,
+    /// `--rip`: the candidate is this script's entry, not the Rust emit.
+    rip: RipSource,
 }
 
+#[cfg(test)]
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
+    new_with_rip(shape, knobs, None)
+}
+
+pub fn new_with_rip(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
     let variant = Variant::parse(&knobs.take_or("variant", "rows"))?;
     let single = match (knobs.take_or("epi", "all").as_str(), variant) {
         ("all", _) => false,
@@ -258,7 +269,8 @@ pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
         }
     };
     let ref_rows = knobs.take("ref-rows");
-    let rotate = Rotate::build(variant, single, parse_shape(shape)?, ref_rows.as_deref())?;
+    let mut rotate = Rotate::build(variant, single, parse_shape(shape)?, ref_rows.as_deref())?;
+    rotate.rip = read_rip(rip)?;
     Ok(prod::boxed(rotate))
 }
 
@@ -281,6 +293,7 @@ impl Rotate {
             l,
             geo,
             sorted,
+            rip: None,
         })
     }
 
@@ -315,7 +328,7 @@ impl Rotate {
 
     fn run_emu(&self) -> Result<Value> {
         // 2 experts x 6 tokens: two padded runs of 6 + a pad tail, 2 K128 groups.
-        let small = Self::build(
+        let mut small = Self::build(
             self.variant,
             self.single,
             Shape {
@@ -328,6 +341,7 @@ impl Rotate {
             },
             Some("full"),
         )?;
+        small.rip = self.rip.clone();
         let obj = small.candidate()?;
         let inputs = small.inputs();
         let outs = small.outputs();
@@ -406,6 +420,21 @@ impl Producer for Rotate {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some(rip) = &self.rip {
+            let spec = moe_rotate_i4_pm::Spec { arch: ARCH };
+            let (variant, generator) = match self.variant {
+                Variant::Rows => ("rows", moe_rotate_i4_pm::emit(spec)?),
+                Variant::Gp => ("gp", moe_rotate_i4_pm::emit_gp(spec)?),
+            };
+            return rip_object(
+                rip,
+                ARCH,
+                variant,
+                &self.variant.symbol(),
+                &generator.s_text,
+                self.knobs_value(),
+            );
+        }
         let (text, exports, what) = match (self.variant, self.single) {
             (Variant::Rows, true) => (
                 moe_rotate_i4_pm::emit(moe_rotate_i4_pm::Spec { arch: ARCH })?.s_text,
@@ -877,6 +906,21 @@ mod tests {
         .unwrap();
         let exp = w.reference(&w.inputs(), &w.outputs()).unwrap();
         assert_eq!(exp.outputs[0].as_ref().unwrap().ranges.len(), 5);
+    }
+
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/moe_rotate_i4_pm.rip");
+
+    #[test]
+    fn rip_twin_is_the_candidate_of_both_variants_and_identical_to_the_generator() {
+        for (variant, name) in [(Variant::Rows, "rows"), (Variant::Gp, "gp")] {
+            let mut w = build(variant, false, "fn:t16");
+            w.rip = Some(("twin.rip".into(), TWIN.into()));
+            let o = w.candidate().unwrap();
+            assert_eq!(o.launch_symbol, variant.symbol());
+            assert_eq!(o.exports, vec![variant.symbol()]);
+            assert_eq!(o.desc["rip"]["identical_to_generator"], true, "{name}");
+            assert_eq!(o.desc["rip"]["variant"], name);
+        }
     }
 
     #[test]

@@ -1003,10 +1003,8 @@ fn ds_load_b128(dst: u8, addr: u8, off: u32) -> Instruction {
     .memory(MemoryClass::DsLoad)
 }
 
-/// Norm: phase 1a sum of squares, wave tree, LDS, the eight-root tree, `rsqrt`, then `y = (x * w) * rms`
-/// (AWQ `/ awq`), `y * signs1`.
-fn norm_front(b: &mut Builder, export: Export) -> R {
-    // Phase 1a: 8 dword loads of the row at tid + 256 j (into the spare block), then the phase-2 prefetch.
+/// Norm phase 1a: the row's eight dwords at `tid + 256 j` (into the spare block).
+fn norm_row_loads(b: &mut Builder) -> R {
     op(
         b,
         format!("v_lshlrev_b32_e32 v{NV_T4}, 2, v{TID}"),
@@ -1016,6 +1014,11 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
     for j in 0..8u32 {
         gload(b, PART + j as u8, 1, NV_T4, XP0_ROW, 1024 * j)?;
     }
+    Ok(())
+}
+
+/// Norm phase 2 prefetch: this lane's x, weight, AWQ, signs1 and signs2 eights.
+fn norm_prefetch(b: &mut Builder) -> R {
     for h in 0..2u32 {
         gload(b, X + 4 * h as u8, 4, VOFF, XP, 16 * h)?;
     }
@@ -1031,7 +1034,11 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
     for h in 0..2u32 {
         gload(b, S2 + 4 * h as u8, 4, VOFF, ARG_S2, 16 * h)?;
     }
-    // Sequential per-thread fma chain from +0 (the first term is the exact square).
+    Ok(())
+}
+
+/// Norm sum of squares: the per-thread sequential `fma` chain over the eight loaded dwords.
+fn norm_sumsq(b: &mut Builder) -> R {
     op(
         b,
         format!("v_mul_f32_e32 v{NV_SUM}, v{PART}, v{PART}"),
@@ -1046,6 +1053,12 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
             &[v(NV_SUM), v(PART + j)],
         )?;
     }
+    Ok(())
+}
+
+/// Norm reduction, part 1 (up to the LDS store): `Norm` runs the in-wave tree and addresses the wave's slot;
+/// `NormOut` addresses its `lane * 32 + wave * 4` slot (no tree yet).
+fn norm_reduce_pre(b: &mut Builder, export: Export) -> R {
     if export == Export::Norm {
         wave_tree(b)?;
         // Every lane of the wave stores the same wave sum at wave * 4; one barrier publishes all eight.
@@ -1062,16 +1075,6 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
             &[v(NV_LDSA)],
             &[v(NV_LDSA)],
         )?;
-        b.ds_store(0, ds_store_b32(NV_LDSA, NV_SUM))?;
-        b.barrier(&[Transition::Ready(0)])?;
-        op(
-            b,
-            format!("v_and_b32_e32 v{NV_T4}, 0, v{LANE}"),
-            &[v(NV_T4)],
-            &[v(LANE)],
-        )?;
-        b.ds_load(0, ds_load_b128(PART, NV_T4, 0))?;
-        b.ds_load(0, ds_load_b128(PART + 4, NV_T4, 16))?;
     } else {
         // `rmsnorm_f32` order: every thread publishes its partial at `lane * 32 + wave * 4` (1 KiB, masks bound the
         // address at 1020), one barrier, then lane `l` of every wave reads the eight waves' partials of lane `l`
@@ -1094,8 +1097,25 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
             &[v(NV_LDSA)],
             &[v(NV_LDSA)],
         )?;
-        b.ds_store(0, ds_store_b32(NV_LDSA, NV_SUM))?;
-        b.barrier(&[Transition::Ready(0)])?;
+    }
+    Ok(())
+}
+
+/// The partial's LDS store (`ds_store_b32 [NV_LDSA], NV_SUM`).
+fn norm_store_insn() -> Instruction {
+    ds_store_b32(NV_LDSA, NV_SUM)
+}
+
+/// Norm reduction, part 2 (after the barrier, before the loads): the load address.
+fn norm_reduce_addr(b: &mut Builder, export: Export) -> R {
+    if export == Export::Norm {
+        op(
+            b,
+            format!("v_and_b32_e32 v{NV_T4}, 0, v{LANE}"),
+            &[v(NV_T4)],
+            &[v(LANE)],
+        )?;
+    } else {
         op(
             b,
             format!("v_lshlrev_b32_e32 v{NV_T4}, 5, v{LANE}"),
@@ -1108,9 +1128,21 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
             &[v(NV_T4)],
             &[v(NV_T4)],
         )?;
-        b.ds_load(0, ds_load_b128(PART, NV_T4, 0))?;
-        b.ds_load(0, ds_load_b128(PART + 4, NV_T4, 16))?;
     }
+    Ok(())
+}
+
+/// The two `ds_load_b128` that bring the eight partials back into `PART..PART + 8`.
+fn norm_load_insns() -> [Instruction; 2] {
+    [
+        ds_load_b128(PART, NV_T4, 0),
+        ds_load_b128(PART + 4, NV_T4, 16),
+    ]
+}
+
+/// Norm reduction, part 3: the eight-root tree `((r0 + r4) + (r2 + r6)) + ((r1 + r5) + (r3 + r7))` (and for
+/// `NormOut` the remaining in-wave levels).
+fn norm_reduce_post(b: &mut Builder, export: Export) -> R {
     let r = |i: u8| PART + i;
     // ((r0 + r4) + (r2 + r6)) + ((r1 + r5) + (r3 + r7)).
     for (d, x, y) in [(TA, r(0), r(4)), (TB, r(2), r(6))] {
@@ -1151,6 +1183,11 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
         // The remaining in-wave steps of the incumbent tree (`s = 16 .. 1`), after the cross-wave levels above.
         wave_tree(b)?;
     }
+    Ok(())
+}
+
+/// `rms = rsqrt(eps + sum / 2048)` with the incumbent's vector `v_rsq_f32` denormal guard.
+fn norm_rms(b: &mut Builder) -> R {
     // mean = sum / 2048.0f; eps + mean; the incumbent's vector rsqrt with its denormal guard.
     fdiv(b, NV_TMP, NV_SUM, Opd::S(KDIV))?;
     op(
@@ -1195,6 +1232,11 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
         &[v(NV_SUM)],
         &[v(NV_TMP), v(NV_SUM), s(LT)],
     )?;
+    Ok(())
+}
+
+/// `y = (x * w) * rms` (NormOut: store the normalized row), then the AWQ divide and the sign product.
+fn norm_apply(b: &mut Builder, export: Export) -> R {
     // y = (x * weight) * rms, two roundings in that order.
     for k in 0..8u8 {
         op(
@@ -1220,6 +1262,24 @@ fn norm_front(b: &mut Builder, export: Export) -> R {
         b.release_store_sources()?;
     }
     awq_and_signs(b, export)
+}
+
+/// Norm: phase 1a sum of squares, wave tree, LDS, the eight-root tree, `rsqrt`, then `y = (x * w) * rms`
+/// (AWQ `/ awq`), `y * signs1`. The sequence the `.rip` twin writes statement by statement.
+fn norm_front(b: &mut Builder, export: Export) -> R {
+    norm_row_loads(b)?;
+    norm_prefetch(b)?;
+    norm_sumsq(b)?;
+    norm_reduce_pre(b, export)?;
+    b.ds_store(0, norm_store_insn())?;
+    b.barrier(&[Transition::Ready(0)])?;
+    norm_reduce_addr(b, export)?;
+    for insn in norm_load_insns() {
+        b.ds_load(0, insn)?;
+    }
+    norm_reduce_post(b, export)?;
+    norm_rms(b)?;
+    norm_apply(b, export)
 }
 
 /// Wave XOR tree 16, 8, 4, 2, 1 over `NV_SUM`: every lane ends with the incumbent's `shfl_down` lane 0 value.
@@ -1568,51 +1628,145 @@ fn store_record(b: &mut Builder, export: Export) -> R {
 
 // ------------------------------------------------------------------ emission
 pub fn emit(arch: Arch, export: Export) -> Result<Emitted, String> {
-    admit(arch)?;
-    let mut kernargs = KernargLayout::new(export.kernarg_bytes())
-        .pointer_access("x", 0, Access::ReadOnly)
-        .pointer_access("rotated", 8, Access::WriteOnly)
-        .pointer_access("sidecar", 16, Access::WriteOnly)
-        .pointer_access("signs1", 24, Access::ReadOnly)
-        .pointer_access("signs2", 32, Access::ReadOnly)
-        .pointer_access("weight", 40, Access::ReadOnly)
-        .pointer_access("awq", 48, Access::ReadOnly)
-        .hidden("rows", 56, 4, "by_value")
-        .hidden("k", 60, 4, "by_value")
-        .hidden("eps", 64, 4, "by_value");
-    kernargs = match export {
-        Export::SigmoidRotate => kernargs.pointer_access("gate", 72, Access::ReadOnly),
-        Export::NormOut => kernargs.pointer_access("norm_out", 72, Access::WriteOnly),
-        _ => kernargs,
-    };
-    let kspec = KernelSpec {
-        kernel_id: KERNEL_ID.into(),
-        variant: export.tag().into(),
-        arch,
-        symbol: export.symbol().into(),
-        kernargs,
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: false,
-        workgroup_size: export.block() as u16,
-        group_segment_fixed_size: export.lds_bytes(),
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, plan()?);
+    let g = blocks::Gen::new(arch, export)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     b.enable_delay_alu();
     if export.lds_bytes() != 0 && b.lds_slot("rms_partials", 0, export.lds_bytes())? != 0 {
         return Err("LDS slot order".into());
     }
-    prologue(&mut b, export)?;
+    blocks::prologue(&mut b, &g)?;
     match export {
-        Export::Rotate => rotate_front(&mut b)?,
-        Export::SigmoidRotate => sigmoid_rotate_front(&mut b)?,
+        Export::Rotate => blocks::rotate_front(&mut b)?,
+        Export::SigmoidRotate => blocks::sigmoid_rotate_front(&mut b)?,
         Export::Norm | Export::NormOut => norm_front(&mut b, export)?,
     }
-    fwht_scale_store(&mut b)?;
-    quantize(&mut b)?;
-    store_record(&mut b, export)?;
+    blocks::fwht_scale_store(&mut b)?;
+    blocks::quantize(&mut b)?;
+    blocks::store_record(&mut b, &g)?;
     b.finish()
+}
+
+/// The emit's phases as public blocks: the sequence in [`emit`] (and `norm_front` for the norm fronts) is the
+/// sequence the `.rip` twin (`iu4_c8_producer.rip`) writes, call for call, over the `c8::*` natives. Every block
+/// emits straight into the builder; the norm's LDS store, barrier and loads are the script's statements (the
+/// blocks return the instructions).
+pub mod blocks {
+    use super::*;
+
+    /// One export: its launch contract and register plan.
+    pub struct Gen {
+        export: Export,
+    }
+
+    impl Gen {
+        pub fn new(arch: Arch, export: Export) -> Result<Gen, String> {
+            admit(arch)?;
+            Ok(Gen { export })
+        }
+        /// The export by its tag (`rotate`, `norm`, `sigmoid_rotate`, `norm_out`).
+        pub fn by_tag(arch: Arch, tag: &str) -> Result<Gen, String> {
+            let export = module_exports()
+                .into_iter()
+                .find(|e| e.tag() == tag)
+                .ok_or_else(|| {
+                    format!("export `{tag}`: expected rotate, norm, sigmoid_rotate or norm_out")
+                })?;
+            Gen::new(arch, export)
+        }
+        pub fn export(&self) -> Export {
+            self.export
+        }
+        pub fn plan(&self) -> Result<RegPlan, String> {
+            super::plan()
+        }
+        /// LDS bytes of the export (the norm's partials slot; 0 for the rotates).
+        pub fn lds_bytes(&self) -> u32 {
+            self.export.lds_bytes()
+        }
+        pub fn kernel_spec(&self) -> KernelSpec {
+            let export = self.export;
+            let mut kernargs = KernargLayout::new(export.kernarg_bytes())
+                .pointer_access("x", 0, Access::ReadOnly)
+                .pointer_access("rotated", 8, Access::WriteOnly)
+                .pointer_access("sidecar", 16, Access::WriteOnly)
+                .pointer_access("signs1", 24, Access::ReadOnly)
+                .pointer_access("signs2", 32, Access::ReadOnly)
+                .pointer_access("weight", 40, Access::ReadOnly)
+                .pointer_access("awq", 48, Access::ReadOnly)
+                .hidden("rows", 56, 4, "by_value")
+                .hidden("k", 60, 4, "by_value")
+                .hidden("eps", 64, 4, "by_value");
+            kernargs = match export {
+                Export::SigmoidRotate => kernargs.pointer_access("gate", 72, Access::ReadOnly),
+                Export::NormOut => kernargs.pointer_access("norm_out", 72, Access::WriteOnly),
+                _ => kernargs,
+            };
+            KernelSpec {
+                kernel_id: KERNEL_ID.into(),
+                variant: export.tag().into(),
+                arch: Arch::Gfx1201,
+                symbol: export.symbol().into(),
+                kernargs,
+                user_sgpr_count: 2,
+                system_sgpr_workgroup_id_y: false,
+                workgroup_size: export.block() as u16,
+                group_segment_fixed_size: export.lds_bytes(),
+                wave32: true,
+                cu_mode: false,
+            }
+        }
+    }
+
+    /// Kernel arguments, workgroup/row ids and exits, the x/rotated/sidecar pointers, lane offsets and constants.
+    pub fn prologue(b: &mut Builder, g: &Gen) -> R {
+        super::prologue(b, g.export)
+    }
+    pub fn rotate_front(b: &mut Builder) -> R {
+        super::rotate_front(b)
+    }
+    pub fn sigmoid_rotate_front(b: &mut Builder) -> R {
+        super::sigmoid_rotate_front(b)
+    }
+    pub fn norm_row_loads(b: &mut Builder) -> R {
+        super::norm_row_loads(b)
+    }
+    pub fn norm_prefetch(b: &mut Builder) -> R {
+        super::norm_prefetch(b)
+    }
+    pub fn norm_sumsq(b: &mut Builder) -> R {
+        super::norm_sumsq(b)
+    }
+    pub fn norm_reduce_pre(b: &mut Builder, g: &Gen) -> R {
+        super::norm_reduce_pre(b, g.export)
+    }
+    pub fn norm_store_insn() -> Instruction {
+        super::norm_store_insn()
+    }
+    pub fn norm_reduce_addr(b: &mut Builder, g: &Gen) -> R {
+        super::norm_reduce_addr(b, g.export)
+    }
+    pub fn norm_load_insns() -> [Instruction; 2] {
+        super::norm_load_insns()
+    }
+    pub fn norm_reduce_post(b: &mut Builder, g: &Gen) -> R {
+        super::norm_reduce_post(b, g.export)
+    }
+    pub fn norm_rms(b: &mut Builder) -> R {
+        super::norm_rms(b)
+    }
+    pub fn norm_apply(b: &mut Builder, g: &Gen) -> R {
+        super::norm_apply(b, g.export)
+    }
+    pub fn fwht_scale_store(b: &mut Builder) -> R {
+        super::fwht_scale_store(b)
+    }
+    pub fn quantize(b: &mut Builder) -> R {
+        super::quantize(b)
+    }
+    /// The record store, the export's exit label and `s_endpgm`.
+    pub fn store_record(b: &mut Builder, g: &Gen) -> R {
+        super::store_record(b, g.export)
+    }
 }
 
 /// The module as one code object (`MODULE`).

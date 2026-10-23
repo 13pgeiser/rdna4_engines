@@ -68,12 +68,12 @@ pub mod w3;
 pub mod e8p;
 
 /// A `K`-derived trip counter: workgroup-uniform.
+fn trips_insn(cmp: &str, trips: u8) -> Instruction {
+    Instruction::new(format!("{cmp} s{trips}, 0"), vec![], vec![s(trips)])
+}
+
 fn trips_cmp<T: Target>(wg: &mut Wg<T>, cmp: &str, trips: u8) -> Result<WgUniform<Scc>, String> {
-    wg.scmp_wg_uniform(Instruction::new(
-        format!("{cmp} s{trips}, 0"),
-        vec![],
-        vec![s(trips)],
-    ))
+    wg.scmp_wg_uniform(trips_insn(cmp, trips))
 }
 
 /// Run the generic kernel body `$body::<T>(&mut Workgroup<T, Builder>, ..)`
@@ -845,10 +845,9 @@ impl Gen {
     }
 }
 
-fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String> {
-    let b = wg.isa();
+/// Kernel arguments, workgroup and lane ids, the wave index, `TILE16`.
+fn pro_front(b: &mut Builder, g: &Gen) -> Result<(), String> {
     let a = g.arch();
-    let kind = g.spec.kind;
     smem(b, ARGS0, 8, KARG, 0)?;
     smem(b, ARGS1, 2, KARG, 0x20)?;
     smem(b, ARGS1 + 2, 2, KARG, 0x28)?;
@@ -880,26 +879,42 @@ fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String>
         &[TILE16],
         &[WGY],
     )?;
-    let outside = wg.scmp_wg_uniform(Instruction::new(
+    Ok(())
+}
+
+/// `s_cmp_ge_i32 TILE16, m_total`: the tile is past the end (the workgroup returns).
+fn outside_insn() -> Instruction {
+    Instruction::new(
         format!("s_cmp_ge_i32 s{TILE16}, s{}", ARGS2 + 1),
         vec![],
         vec![s(TILE16), s(ARGS2 + 1)],
-    ))?;
-    wg.exit_if(outside, end)?;
-    let b = wg.isa();
+    )
+}
+
+/// The tile's expert id and `n_experts`.
+fn pro_expert(b: &mut Builder) -> Result<(), String> {
     sop(b, format!("s_lshl_b32 s{T0}, s{WGY}, 2"), &[T0], &[WGY])?;
     add64(b, T64, ARGS0 + 2, T0)?;
     smem(b, EID, 1, T64, 0)?;
     // Fail closed: an expert id outside [0, n_experts) (the -1 sentinel, or a corrupt / non-finite-router id) exits
     // before any `expert_weight_ptrs[id]` load. One unsigned compare covers both bounds (negative ids are huge).
     smem(b, T1, 1, KARG, 0x3c)?;
-    let sentinel = wg.scmp_wg_uniform(Instruction::new(
+    Ok(())
+}
+
+/// `s_cmp_ge_u32 expert, n_experts`: a sentinel or corrupt expert id (the workgroup returns).
+fn sentinel_insn() -> Instruction {
+    Instruction::new(
         format!("s_cmp_ge_u32 s{EID}, s{T1}"),
         vec![],
         vec![s(EID), s(T1)],
-    ))?;
-    wg.exit_if(sentinel, end)?;
-    let b = wg.isa();
+    )
+}
+
+/// The expert's weight pointer, trips, row base, descriptors, lane offsets and the first set's loads.
+fn pro_setup(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let a = g.arch();
+    let kind = g.spec.kind;
     sop(b, format!("s_lshl_b32 s{T0}, s{EID}, 3"), &[T0], &[EID])?;
     add64(b, T64, ARGS0, T0)?;
     smem(b, WPTR, 2, T64, 0)?;
@@ -1101,6 +1116,11 @@ fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String>
         )?;
     }
     load_set(b, g, 0)?;
+    Ok(())
+}
+
+/// The fold magic and the zeroed sums.
+fn pro_init(b: &mut Builder, g: &Gen) -> Result<(), String> {
     for j in 0..8u8 {
         op(
             b,
@@ -1120,6 +1140,17 @@ fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String> {
+    pro_front(wg.isa(), g)?;
+    let outside = wg.scmp_wg_uniform(outside_insn())?;
+    wg.exit_if(outside, end)?;
+    pro_expert(wg.isa())?;
+    let sentinel = wg.scmp_wg_uniform(sentinel_insn())?;
+    wg.exit_if(sentinel, end)?;
+    pro_setup(wg.isa(), g)?;
+    pro_init(wg.isa(), g)
 }
 
 /// Issue set `p`'s loads (epoch parity p of the current trip): header words,
@@ -1224,6 +1255,32 @@ fn advance(b: &mut Builder, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
+/// One trip done: `s_add_i32 s{TRIPS}, s{TRIPS}, -1`.
+fn trips_dec(b: &mut Builder) -> Result<(), String> {
+    op(
+        b,
+        format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)),
+        &[s(TRIPS)],
+        &[s(TRIPS)],
+    )
+}
+
+/// An odd K/128 leaves one epoch after the trips, not two: `s_bitcmp1_b32 K, 7`.
+fn odd_insn() -> Instruction {
+    Instruction::new(
+        format!("s_bitcmp1_b32 s{}, 7", ARGS1 + 3),
+        vec![],
+        vec![s(ARGS1 + 3)],
+    )
+}
+
+/// The two epochs left after the trips: set 1's loads, then folds of sets 0 and 1.
+fn tail_pair(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    load_set(b, g, 1)?;
+    compute(b, g, 0)?;
+    compute(b, g, 1)
+}
+
 /// Two-epoch trips over `TRIPS` (skipped at zero trips), then the tail
 /// epochs.
 fn kloop<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
@@ -1239,12 +1296,7 @@ fn kloop<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
             advance(b, g)?;
             load_set(b, g, 0)?;
             compute(b, g, 1)?;
-            op(
-                b,
-                format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)),
-                &[s(TRIPS)],
-                &[s(TRIPS)],
-            )?;
+            trips_dec(b)?;
             Ok(((), trips_cmp(wg, "s_cmp_lg_u32", TRIPS)?))
         })?;
         if wg.isa().ledger.shape() != entry {
@@ -1254,62 +1306,58 @@ fn kloop<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
     })?;
     match g.spec.kind {
         // K % 256 == 0: an even epoch count, two epochs left.
-        Kind::GateUp => {
-            let b = wg.isa();
-            load_set(b, g, 1)?;
-            compute(b, g, 0)?;
-            compute(b, g, 1)
-        }
+        Kind::GateUp => tail_pair(wg.isa(), g),
         // K % 128 == 0: one epoch left when K/128 is odd, else two.
         Kind::Down => {
-            let odd = wg.scmp(Instruction::new(
-                format!("s_bitcmp1_b32 s{}, 7", ARGS1 + 3),
-                vec![],
-                vec![s(ARGS1 + 3)],
-            ))?;
+            let odd = wg.scmp(odd_insn())?;
             wg.if_else(
                 odd,
                 &g.label("tail_odd"),
                 &g.label("epilogue"),
-                |w| {
-                    let b = w.isa();
-                    load_set(b, g, 1)?;
-                    compute(b, g, 0)?;
-                    compute(b, g, 1)
-                },
+                |w| tail_pair(w.isa(), g),
                 |w| compute(w.isa(), g, 0),
             )
         }
     }
 }
 
-fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    b.label(&g.label("epilogue"))?;
-    let vals = SUM;
-    if g.spec.kind == Kind::GateUp {
-        // g and u rounded to BF16 before the shipped SwiGLU expression.
-        for t in 0..2u8 {
-            for j in 0..8u8 {
-                Bf16::rne_finite_passthrough(
-                    b,
-                    SUM + 8 * t + j,
-                    RT_TMP + j,
-                    MASKT[usize::from(j % 2)],
-                    true,
-                )?;
-            }
-        }
-        for grp in 0..2u8 {
-            crate::kernels::gemm_uk::Epilogue::silu_dense(
+/// The epilogue's label (the join of the tail's `if_else`).
+fn epilogue_label(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    b.label(&g.label("epilogue"))
+}
+
+/// `gate_up`: g and u rounded to BF16, then the shipped SwiGLU expression, in the g registers.
+fn swiglu(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    if g.spec.kind != Kind::GateUp {
+        return Err("swiglu: the gate_up entry only".into());
+    }
+    for t in 0..2u8 {
+        for j in 0..8u8 {
+            Bf16::rne_finite_passthrough(
                 b,
-                SUM + SILU_N * grp,
-                SUM + 8 + SILU_N * grp,
-                SET0,
-                SILU_MASK,
-                SILU_N,
+                SUM + 8 * t + j,
+                RT_TMP + j,
+                MASKT[usize::from(j % 2)],
+                true,
             )?;
         }
     }
+    for grp in 0..2u8 {
+        crate::kernels::gemm_uk::Epilogue::silu_dense(
+            b,
+            SUM + SILU_N * grp,
+            SUM + 8 + SILU_N * grp,
+            SET0,
+            SILU_MASK,
+            SILU_N,
+        )?;
+    }
+    Ok(())
+}
+
+/// The rounded BF16 rows of this lane, packed and stored at `Y`.
+fn store(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let vals = SUM;
     for j in 0..8u8 {
         Bf16::rne_finite_passthrough(b, vals + j, RT_TMP + j, MASKT[usize::from(j % 2)], false)?;
     }
@@ -1457,6 +1505,14 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
     bstore_b128(b, OUT, YOFF, SRD_Y, 0)
 }
 
+fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    epilogue_label(b, g)?;
+    if g.spec.kind == Kind::GateUp {
+        swiglu(b, g)?;
+    }
+    store(b, g)
+}
+
 /// The position-indexed-activation twin of a gfx1201 MQ4 down NT4 / NT8 entry (`qwen4_moe_down_iu4_sym_gp_pm_gfx1201_nt{4,8}`):
 /// the same grid, tile walk, fold order, rounding and stores, reading the down A4 plane written in grouped-position order
 /// (record `g * m_total + 16 * tile + lane`, see `moe_rotate_i4_pm::emit_gp`) instead of gathering `sorted[p]`-indexed records.
@@ -1487,20 +1543,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
         return nt::emit(spec);
     }
     let g = Gen { spec, acc: false };
-    let kspec = KernelSpec {
-        kernel_id: "qwen4_moe_sym".into(),
-        variant: spec.kind.tag().into(),
-        arch: spec.arch,
-        symbol: spec.symbol(),
-        kernargs: spec.kernargs(),
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: spec.threads() as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, g.plan()?);
+    let mut b = Builder::new(kernel_spec_nt1(spec), g.plan()?);
     b.enable_delay_alu();
     on_target!(spec.arch, &mut b, body(&g))?;
     b.finish()
@@ -1512,6 +1555,145 @@ fn body<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
     kloop(wg, g)?;
     epilogue(wg.isa(), g)?;
     wg.end(end)
+}
+
+/// The MQ4 NT1 entries (`gate_up` over two waves, `down` over four) as builder-level blocks, so a
+/// `.rip` script (`qwen4_moe_sym.rip`) owns the kernel's structure: the exits, the K-loop's trips
+/// and the order of set loads and folds inside a trip, the tail and the exit. Every block is a
+/// straight run of instructions (or one `Instruction` for a compare), emitted by the same function
+/// the Rust [`emit`] calls. The NT1 entries have no LDS and no hand-off.
+pub mod nt1_blocks {
+    use super::*;
+
+    /// Register assignment, labels and launch contract of one NT1 entry.
+    pub struct Gen {
+        g: super::Gen,
+    }
+
+    impl Gen {
+        /// The MQ4 NT1 entry `spec`. The same refusals as [`emit`].
+        pub fn new(spec: Spec) -> Result<Gen, String> {
+            spec.validate()?;
+            if spec.codec != WeightCodec::Mq4Sym || spec.nt != 1 || spec.rr != 1 {
+                return Err("qwen4_moe nt1 blocks: the MQ4 NT1 entries only".into());
+            }
+            Ok(Gen {
+                g: super::Gen { spec, acc: false },
+            })
+        }
+        pub fn spec(&self) -> Spec {
+            self.g.spec
+        }
+        pub fn kernel_spec(&self) -> KernelSpec {
+            kernel_spec_nt1(self.g.spec)
+        }
+        pub fn plan(&self) -> Result<RegPlan, String> {
+            self.g.plan()
+        }
+        /// A block label of this entry (`k_begin`, `k_loop`, `k_loop_end`, `tail_odd`,
+        /// `epilogue`, `end`).
+        pub fn label(&self, name: &str) -> String {
+            self.g.label(name)
+        }
+        /// The kernel exit's label.
+        pub fn exit_label(&self) -> String {
+            self.g.label("end")
+        }
+    }
+
+    fn parity(p: usize) -> Result<usize, String> {
+        if p < 2 {
+            Ok(p)
+        } else {
+            Err(format!("set parity {p}: expected 0 or 1"))
+        }
+    }
+
+    /// Kernel arguments, workgroup and lane ids, the wave index, `TILE16`.
+    pub fn pro_front(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::pro_front(b, &g.g)
+    }
+    /// `s_cmp_ge_i32 TILE16, m_total`: the tile is past the end (the workgroup returns).
+    pub fn outside_insn() -> Instruction {
+        super::outside_insn()
+    }
+    /// The tile's expert id and `n_experts`.
+    pub fn pro_expert(b: &mut Builder) -> Result<(), String> {
+        super::pro_expert(b)
+    }
+    /// `s_cmp_ge_u32 expert, n_experts`: a sentinel or corrupt expert id (the workgroup returns).
+    pub fn sentinel_insn() -> Instruction {
+        super::sentinel_insn()
+    }
+    /// Weight pointer, trips, row base, descriptors, lane offsets and set 0's loads.
+    pub fn pro_setup(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::pro_setup(b, &g.g)
+    }
+    /// The fold magic and the zeroed sums.
+    pub fn pro_init(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::pro_init(b, &g.g)
+    }
+    /// Issue set `p`'s loads (epoch parity `p`).
+    pub fn load_set(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
+        super::load_set(b, &g.g, parity(p)?)
+    }
+    /// Fold set `p` (one K128 epoch) into the sums.
+    pub fn compute(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
+        super::compute(b, &g.g, parity(p)?)
+    }
+    /// Step every weight descriptor and both activation descriptors one trip's epoch pair on.
+    pub fn advance(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::advance(b, &g.g)
+    }
+    /// `s_cmp_eq_u32 TRIPS, 0`: no full trip (workgroup-uniform).
+    pub fn trips_zero_insn() -> Instruction {
+        super::trips_insn("s_cmp_eq_u32", TRIPS)
+    }
+    /// `s_cmp_lg_u32 TRIPS, 0`: trips remain (workgroup-uniform back-edge condition).
+    pub fn trips_more_insn() -> Instruction {
+        super::trips_insn("s_cmp_lg_u32", TRIPS)
+    }
+    /// One trip done: `s_add_i32 TRIPS, TRIPS, -1`.
+    pub fn trips_dec(b: &mut Builder) -> Result<(), String> {
+        super::trips_dec(b)
+    }
+    /// `s_bitcmp1_b32 K, 7`: K/128 is odd, so one epoch (not two) is left after the trips.
+    pub fn odd_insn() -> Instruction {
+        super::odd_insn()
+    }
+    /// The two epochs left after the trips: set 1's loads, then folds of sets 0 and 1.
+    pub fn tail_pair(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::tail_pair(b, &g.g)
+    }
+    /// The epilogue's label (the join label of the tail's `if_else`).
+    pub fn epilogue_label(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::epilogue_label(b, &g.g)
+    }
+    /// `gate_up`: g and u rounded to BF16, then the shipped SwiGLU expression.
+    pub fn swiglu(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::swiglu(b, &g.g)
+    }
+    /// The rounded BF16 rows of this lane, packed and stored at `Y`.
+    pub fn store(b: &mut Builder, g: &Gen) -> Result<(), String> {
+        super::store(b, &g.g)
+    }
+}
+
+/// The NT1 entry's kernel descriptor.
+fn kernel_spec_nt1(spec: Spec) -> KernelSpec {
+    KernelSpec {
+        kernel_id: "qwen4_moe_sym".into(),
+        variant: spec.kind.tag().into(),
+        arch: spec.arch,
+        symbol: spec.symbol(),
+        kernargs: spec.kernargs(),
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: true,
+        workgroup_size: spec.threads() as u16,
+        group_segment_fixed_size: 0,
+        wave32: true,
+        cu_mode: false,
+    }
 }
 
 /// Every entry of one architecture ([`module_specs`]: both kinds at every
@@ -1603,7 +1785,7 @@ pub const NT_GATE_BYTES: u32 = 2048;
 /// until the reload. Pending stores are drained (`vscnt`) before the K loop
 /// so its entry and exit ledgers agree. The register plan gives every block
 /// its own adjacent body/epilogue intervals on the aliased registers.
-pub use nt::down_blocks;
+pub use nt::blocks;
 
 mod nt {
     use super::*;
@@ -2110,11 +2292,11 @@ mod nt {
         )
     }
 
-    fn prologue<T: Target>(wg: &mut Wg<T>, g: &G, end: &End) -> Result<(), String> {
-        let b = wg.isa();
+    // ---- prologue pieces: builder-level, control flow stays with the caller ----
+
+    /// Kernel arguments, workgroup ids, lane ids, the wave index, `TILE16 = 16 * tile`.
+    fn pro_front(b: &mut Builder, g: &G) -> Result<(), String> {
         let a = g.arch();
-        let kind = g.spec.kind;
-        let nt = g.nt();
         // The LDS address comes first: certification derives it from the
         // work-item id in the entry block. (32*(w&1) + lane) * 32 bytes.
         if g.gate_up() {
@@ -2167,25 +2349,35 @@ mod nt {
             &[TILE16],
             &[WGY],
         )?;
-        let outside = wg.scmp_wg_uniform(Instruction::new(
+        Ok(())
+    }
+
+    /// The tile at or past `m_total` returns (`s_cmp_ge_i32 TILE16, m_total`).
+    fn outside_insn() -> Instruction {
+        Instruction::new(
             format!("s_cmp_ge_i32 s{TILE16}, s21"),
             vec![],
             vec![s(TILE16), s(21)],
-        ))?;
-        wg.exit_if(outside, end)?;
-        let b = wg.isa();
+        )
+    }
+
+    /// The tile's expert id and `n_experts`.
+    fn pro_expert(b: &mut Builder, _g: &G) -> Result<(), String> {
         sop(b, format!("s_lshl_b32 s4, s{WGY}, 2"), &[4], &[WGY])?;
         add64(b, 6, 10, 4)?;
         smem(b, 23, 1, 6, 0)?;
         // Fail closed: an expert id outside [0, n_experts) exits before any `expert_weight_ptrs[id]` load (one unsigned compare).
         smem(b, 5, 1, 0, 0x3c)?;
-        let sentinel = wg.scmp_wg_uniform(Instruction::new(
-            "s_cmp_ge_u32 s23, s5",
-            vec![],
-            vec![s(23), s(5)],
-        ))?;
-        wg.exit_if(sentinel, end)?;
-        let b = wg.isa();
+        Ok(())
+    }
+
+    /// A sentinel / corrupt expert id returns (one unsigned compare).
+    fn sentinel_insn() -> Instruction {
+        Instruction::new("s_cmp_ge_u32 s23, s5", vec![], vec![s(23), s(5)])
+    }
+
+    /// The expert's weight pointer, the tile-id descriptor, and (flat schedules) the run-walk counter.
+    fn pro_run(b: &mut Builder, g: &G) -> Result<(), String> {
         sop(b, "s_lshl_b32 s4, s23, 3", &[4], &[23])?;
         add64(b, 6, 8, 4)?;
         smem(b, WPTR, 2, 6, 0)?;
@@ -2205,74 +2397,88 @@ mod nt {
             // Run position: lanes test tiles tile-1-back-lane; the first that is
             // before the start or another expert ends the run.
             sop(b, format!("s_mov_b32 s{BACK}, 0"), &[BACK], &[])?;
-            let (walk, found) = (g.label("run_walk"), g.label("run_found"));
-            // Wave-uniform: every lane mask is a compare over the same loads.
-            wg.loop_until(&walk, &found, |w, exit| {
-                let b = w.isa();
-                sop(b, format!("{} s4, s{WGY}, -1", s_add_i32(a)), &[4], &[WGY])?;
-                sop(
-                    b,
-                    format!("{} s4, s4, s{BACK}", sub_i32(a)),
-                    &[4],
-                    &[4, BACK],
-                )?;
-                op(b, "v_sub_nc_u32_e32 v5, s4, v2", &[v(5)], &[s(4), v(2)])?;
-                op(b, "v_lshlrev_b32_e32 v6, 2, v5", &[v(6)], &[v(5)])?;
-                bload(b, 1, 7, 6, SRD_S, 0)?;
-                op(
-                    b,
-                    format!("v_cmp_ne_u32_e64 s{MASKA}, s23, v7"),
-                    &[s(MASKA)],
-                    &[s(23), v(7)],
-                )?;
-                op(
-                    b,
-                    format!("v_cmp_gt_i32_e64 s{}, 0, v5", MASKT[0]),
-                    &[s(MASKT[0])],
-                    &[v(5)],
-                )?;
-                or_mask(b, MASKA, MASKT[0])?;
-                let hit = w.scmp(Instruction::new(
-                    format!("s_cmp_lg_u32 s{MASKA}, 0"),
-                    vec![],
-                    vec![s(MASKA)],
-                ))?;
-                w.break_if(hit, exit)?;
-                sop(
-                    w.isa(),
-                    format!("{} s{BACK}, s{BACK}, 32", s_add_i32(a)),
-                    &[BACK],
-                    &[BACK],
-                )
-            })?;
-            let b = wg.isa();
-            sop(
-                b,
-                format!("s_ctz_i32_b32 s{POS}, s{MASKA}"),
-                &[POS],
-                &[MASKA],
-            )?;
-            sop(
-                b,
-                format!("{} s{POS}, s{POS}, s{BACK}", s_add_i32(a)),
-                &[POS],
-                &[POS, BACK],
-            )?;
-            // Not a leader: another CTA folds this tile.
-            sop(
-                b,
-                format!("s_and_b32 s{POS}, s{POS}, {}", nt - 1),
-                &[POS],
-                &[POS],
-            )?;
-            let follower = wg.scmp_wg_uniform(Instruction::new(
-                format!("s_cmp_lg_u32 s{POS}, 0"),
-                vec![],
-                vec![s(POS)],
-            ))?;
-            wg.exit_if(follower, end)?;
         }
-        let b = wg.isa();
+        Ok(())
+    }
+
+    /// One iteration of the run walk, up to its lane mask.
+    fn walk_head(b: &mut Builder, g: &G) -> Result<(), String> {
+        let a = g.arch();
+        sop(b, format!("{} s4, s{WGY}, -1", s_add_i32(a)), &[4], &[WGY])?;
+        sop(
+            b,
+            format!("{} s4, s4, s{BACK}", sub_i32(a)),
+            &[4],
+            &[4, BACK],
+        )?;
+        op(b, "v_sub_nc_u32_e32 v5, s4, v2", &[v(5)], &[s(4), v(2)])?;
+        op(b, "v_lshlrev_b32_e32 v6, 2, v5", &[v(6)], &[v(5)])?;
+        bload(b, 1, 7, 6, SRD_S, 0)?;
+        op(
+            b,
+            format!("v_cmp_ne_u32_e64 s{MASKA}, s23, v7"),
+            &[s(MASKA)],
+            &[s(23), v(7)],
+        )?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{}, 0, v5", MASKT[0]),
+            &[s(MASKT[0])],
+            &[v(5)],
+        )?;
+        or_mask(b, MASKA, MASKT[0])?;
+        Ok(())
+    }
+
+    /// The walk ends when any lane found the run's start (`s_cmp_lg_u32 MASKA, 0`).
+    fn walk_hit_insn() -> Instruction {
+        Instruction::new(format!("s_cmp_lg_u32 s{MASKA}, 0"), vec![], vec![s(MASKA)])
+    }
+
+    /// The walk's back-edge step: 32 tiles further back.
+    fn walk_step(b: &mut Builder, g: &G) -> Result<(), String> {
+        let a = g.arch();
+        sop(
+            b,
+            format!("{} s{BACK}, s{BACK}, 32", s_add_i32(a)),
+            &[BACK],
+            &[BACK],
+        )
+    }
+
+    /// This tile's position in its run, modulo `nt`.
+    fn pro_leader(b: &mut Builder, g: &G) -> Result<(), String> {
+        let (a, nt) = (g.arch(), g.nt());
+        sop(
+            b,
+            format!("s_ctz_i32_b32 s{POS}, s{MASKA}"),
+            &[POS],
+            &[MASKA],
+        )?;
+        sop(
+            b,
+            format!("{} s{POS}, s{POS}, s{BACK}", s_add_i32(a)),
+            &[POS],
+            &[POS, BACK],
+        )?;
+        // Not a leader: another CTA folds this tile.
+        sop(
+            b,
+            format!("s_and_b32 s{POS}, s{POS}, {}", nt - 1),
+            &[POS],
+            &[POS],
+        )?;
+        Ok(())
+    }
+
+    /// Not the leader of its `nt` tiles: another CTA folds this tile.
+    fn follower_insn() -> Instruction {
+        Instruction::new(format!("s_cmp_lg_u32 s{POS}, 0"), vec![], vec![s(POS)])
+    }
+
+    /// `cnt` (live tiles of the leader), row bytes, trips, row base, Y offsets, the sorted-slot descriptor.
+    fn pro_cnt(b: &mut Builder, g: &G) -> Result<(), String> {
+        let (a, kind, nt) = (g.arch(), g.spec.kind, g.nt());
         // cnt: the first lane l < nt whose tile tile+l is past the end or of
         // another expert (lanes >= nt always stop).
         op(
@@ -2409,28 +2615,17 @@ mod nt {
             &[],
         )?;
         op(b, "v_lshlrev_b32_e32 v5, 2, v3", &[v(5)], &[v(3)])?;
-        for j in 0..nt {
-            if g.experimental() && j > 0 {
-                // A dead tile issues no sorted-slot load; its slots are -1.
-                op(
-                    wg.isa(),
-                    format!("v_mov_b32_e32 v{}, -1", 6 + j),
-                    &[v(6 + j)],
-                    &[],
-                )?;
-                let live = wg.scmp(Instruction::new(
-                    format!("s_cmp_gt_u32 s{CNT}, {j}"),
-                    vec![],
-                    vec![s(CNT)],
-                ))?;
-                wg.skip_unless(live, &g.label(&format!("pro_s_dead{j}")), (), |w, ()| {
-                    bload(w.isa(), 1, 6 + j, 5, SRD_S, 64 * u32::from(j))
-                })?;
-            } else {
-                bload(wg.isa(), 1, 6 + j, 5, SRD_S, 64 * u32::from(j))?;
-            }
-        }
-        let b = wg.isa();
+        Ok(())
+    }
+
+    /// Tile `j`'s sorted slot (one dword per lane).
+    fn pro_slot_load(b: &mut Builder, _g: &G, j: u8) -> Result<(), String> {
+        bload(b, 1, 6 + j, 5, SRD_S, 64 * u32::from(j))
+    }
+
+    /// Activation and weight descriptors, lane offsets, the first epoch's weights.
+    fn pro_desc(b: &mut Builder, g: &G) -> Result<(), String> {
+        let a = g.arch();
         // Activation descriptors: epoch 0 (X0) and 1 (X1), x_src_rows*72 records.
         x_descriptors(b, g.gpos)?;
         sop(b, format!("s_lshl_b32 s{XS2}, s4, 1"), &[XS2], &[4])?;
@@ -2464,50 +2659,55 @@ mod nt {
             &[s(ROWB), v(14)],
         )?;
         load_w(b, g, 0)?;
-        // Per tile: dead tiles (j >= cnt) gather slot -1, then the activation
-        // row offset (or the out-of-range offset of a padding slot).
-        for j in 0..nt {
-            let slot = 6 + j;
-            let b = wg.isa();
-            if j > 0 && !g.experimental() {
-                let m = MASKT[1];
-                sop(b, format!("s_cmp_gt_u32 s{CNT}, {j}"), &[], &[CNT])?;
-                sop(b, format!("s_cselect_b32 s{m}, -1, 0"), &[m], &[])?;
-                sop(b, format!("s_mov_b32 s{}, 0", m + 1), &[m + 1], &[])?;
-                op(
-                    b,
-                    format!("v_cndmask_b32_e64 v{slot}, -1, v{slot}, s{m}"),
-                    &[v(slot)],
-                    &[v(slot), s(m)],
-                )?;
-            }
-            if g.gpos {
-                position_offset(b, XOFF + j, slot, j, g.live(j))?;
-            } else {
-                common::gather_offset(
-                    b,
-                    XOFF + j,
-                    slot,
-                    Some(20),
-                    iu4_fold::XBLK_BYTES,
-                    g.live(j),
-                    GatherTemps {
-                        v: [14, 15, 1, 2],
-                        mask: MASKT[0],
-                    },
-                )?;
-            }
-            if a.gfx12() {
-                op(
-                    b,
-                    format!("v_lshl_add_u32 v{}, v4, 3, v{}", XQOFF + j, XOFF + j),
-                    &[v(XQOFF + j)],
-                    &[v(4), v(XOFF + j)],
-                )?;
-            }
-            load_x_init(wg, g, j)?;
+        Ok(())
+    }
+
+    /// Tile `j`'s activation row offset (dead tiles gather slot -1), before its first-epoch loads.
+    fn pro_tile(b: &mut Builder, g: &G, j: u8) -> Result<(), String> {
+        let a = g.arch();
+        let slot = 6 + j;
+        if j > 0 && !g.experimental() {
+            let m = MASKT[1];
+            sop(b, format!("s_cmp_gt_u32 s{CNT}, {j}"), &[], &[CNT])?;
+            sop(b, format!("s_cselect_b32 s{m}, -1, 0"), &[m], &[])?;
+            sop(b, format!("s_mov_b32 s{}, 0", m + 1), &[m + 1], &[])?;
+            op(
+                b,
+                format!("v_cndmask_b32_e64 v{slot}, -1, v{slot}, s{m}"),
+                &[v(slot)],
+                &[v(slot), s(m)],
+            )?;
         }
-        let b = wg.isa();
+        if g.gpos {
+            position_offset(b, XOFF + j, slot, j, g.live(j))?;
+        } else {
+            common::gather_offset(
+                b,
+                XOFF + j,
+                slot,
+                Some(20),
+                iu4_fold::XBLK_BYTES,
+                g.live(j),
+                GatherTemps {
+                    v: [14, 15, 1, 2],
+                    mask: MASKT[0],
+                },
+            )?;
+        }
+        if a.gfx12() {
+            op(
+                b,
+                format!("v_lshl_add_u32 v{}, v4, 3, v{}", XQOFF + j, XOFF + j),
+                &[v(XQOFF + j)],
+                &[v(4), v(XOFF + j)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The fold magic and the zeroed sums.
+    fn pro_init(b: &mut Builder, g: &G) -> Result<(), String> {
+        let nt = g.nt();
         for j in 0..8u8 {
             op(
                 b,
@@ -2526,8 +2726,63 @@ mod nt {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn prologue<T: Target>(wg: &mut Wg<T>, g: &G, end: &End) -> Result<(), String> {
+        let nt = g.nt();
+        pro_front(wg.isa(), g)?;
+        let outside = wg.scmp_wg_uniform(outside_insn())?;
+        wg.exit_if(outside, end)?;
+        pro_expert(wg.isa(), g)?;
+        let sentinel = wg.scmp_wg_uniform(sentinel_insn())?;
+        wg.exit_if(sentinel, end)?;
+        pro_run(wg.isa(), g)?;
+        if !g.grouped {
+            let (walk, found) = (g.label("run_walk"), g.label("run_found"));
+            // Wave-uniform: every lane mask is a compare over the same loads.
+            wg.loop_until(&walk, &found, |w, exit| {
+                walk_head(w.isa(), g)?;
+                let hit = w.scmp(walk_hit_insn())?;
+                w.break_if(hit, exit)?;
+                walk_step(w.isa(), g)
+            })?;
+            pro_leader(wg.isa(), g)?;
+            let follower = wg.scmp_wg_uniform(follower_insn())?;
+            wg.exit_if(follower, end)?;
+        }
+        pro_cnt(wg.isa(), g)?;
+        for j in 0..nt {
+            if g.experimental() && j > 0 {
+                // A dead tile issues no sorted-slot load; its slots are -1.
+                op(
+                    wg.isa(),
+                    format!("v_mov_b32_e32 v{}, -1", 6 + j),
+                    &[v(6 + j)],
+                    &[],
+                )?;
+                let live = wg.scmp(Instruction::new(
+                    format!("s_cmp_gt_u32 s{CNT}, {j}"),
+                    vec![],
+                    vec![s(CNT)],
+                ))?;
+                wg.skip_unless(live, &g.label(&format!("pro_s_dead{j}")), (), |w, ()| {
+                    pro_slot_load(w.isa(), g, j)
+                })?;
+            } else {
+                pro_slot_load(wg.isa(), g, j)?;
+            }
+        }
+        pro_desc(wg.isa(), g)?;
+        // Per tile: dead tiles (j >= cnt) gather slot -1, then the activation
+        // row offset (or the out-of-range offset of a padding slot).
+        for j in 0..nt {
+            pro_tile(wg.isa(), g, j)?;
+            load_x_init(wg, g, j)?;
+        }
+        pro_init(wg.isa(), g)?;
         if g.settles_loads() {
-            super::super::gemm_uk::Prefetch::<0>::wait_load(b)?;
+            super::super::gemm_uk::Prefetch::<0>::wait_load(wg.isa())?;
         }
         Ok(())
     }
@@ -2643,7 +2898,42 @@ mod nt {
         site: &str,
         reload: Option<u8>,
     ) -> Result<(), String> {
+        compute_head(w.isa(), g, p)?;
         let b = w.isa();
+        if !g.prefetch {
+            super::super::gemm_uk::Prefetch::<0>::wait_load(b)?;
+        }
+        if g.chains == 1 {
+            return serial_tiles(w, g, p, site, reload);
+        }
+        // The full-live path has no per-step predicates. Ragged runs retain
+        // the incumbent's skipped-tile arithmetic and output ownership.
+        for j in 0..g.nt() {
+            wait_tile(w.isa(), g, j)?;
+        }
+        let full = w.scmp(Instruction::new(
+            format!("s_cmp_lg_u32 s{CNT}, {}", g.nt()),
+            vec![],
+            vec![s(CNT)],
+        ))?;
+        w.if_else(
+            full,
+            &g.label(&format!("{site}_partial")),
+            &g.label(&format!("{site}_join")),
+            |w| match g.chains {
+                2 => full_tiles::<2, T>(w, g, p, reload),
+                4 => full_tiles::<4, T>(w, g, p, reload),
+                8 => full_tiles::<8, T>(w, g, p, reload),
+                _ => unreachable!("validated chain count"),
+            },
+            |w| serial_tiles(w, g, p, site, reload),
+        )?;
+        w.label(&g.label(&format!("{site}_join")))
+    }
+
+    /// The fold's row scales (header word -> f32 -> the eight rows of the accumulators by
+    /// `ds_swizzle` broadcast) and the nibble rebias of weight set `p`.
+    fn compute_head(b: &mut Builder, g: &G, p: usize) -> Result<(), String> {
         let a = g.arch();
         op(
             b,
@@ -2671,50 +2961,32 @@ mod nt {
                 &[v(r)],
             )?;
         }
-        if !g.prefetch {
-            super::super::gemm_uk::Prefetch::<0>::wait_load(b)?;
-        }
-        if g.chains == 1 {
-            return serial_tiles(w, g, p, site, reload);
-        }
-        // The full-live path has no per-step predicates. Ragged runs retain
-        // the incumbent's skipped-tile arithmetic and output ownership.
-        for j in 0..g.nt() {
-            let b = w.isa();
-            let x = Instruction::new(
-                "",
-                vec![],
-                vec![
-                    v(g.d(j)),
-                    crate::reg::RegRef {
-                        kind: crate::reg::Kind::V,
-                        base: g.x(j),
-                        len: g.aw(),
-                    },
-                ],
-            );
-            for (c, n, _) in b.ledger.required(&x) {
-                b.wait(c, n)?;
-            }
-        }
-        let full = w.scmp(Instruction::new(
-            format!("s_cmp_lg_u32 s{CNT}, {}", g.nt()),
+        Ok(())
+    }
+
+    /// Wait for the loads tile `j`'s fold reads (its `d` and activation operands).
+    fn wait_tile(b: &mut Builder, g: &G, j: u8) -> Result<(), String> {
+        let x = Instruction::new(
+            "",
             vec![],
-            vec![s(CNT)],
-        ))?;
-        w.if_else(
-            full,
-            &g.label(&format!("{site}_partial")),
-            &g.label(&format!("{site}_join")),
-            |w| match g.chains {
-                2 => full_tiles::<2, T>(w, g, p, reload),
-                4 => full_tiles::<4, T>(w, g, p, reload),
-                8 => full_tiles::<8, T>(w, g, p, reload),
-                _ => unreachable!("validated chain count"),
-            },
-            |w| serial_tiles(w, g, p, site, reload),
-        )?;
-        w.label(&g.label(&format!("{site}_join")))
+            vec![
+                v(g.d(j)),
+                crate::reg::RegRef {
+                    kind: crate::reg::Kind::V,
+                    base: g.x(j),
+                    len: g.aw(),
+                },
+            ],
+        );
+        for (c, n, _) in b.ledger.required(&x) {
+            b.wait(c, n)?;
+        }
+        Ok(())
+    }
+
+    /// Tile `j` is live (`cnt > j`, wave-uniform): `s_cmp_gt_u32 CNT, j`.
+    fn tile_live_insn(j: u8) -> Instruction {
+        Instruction::new(format!("s_cmp_gt_u32 s{CNT}, {j}"), vec![], vec![s(CNT)])
     }
 
     fn full_tiles<const N: usize, T: Target + peacemaker_author::MmaIu4>(
@@ -2748,6 +3020,24 @@ mod nt {
         Ok(())
     }
 
+    /// Fold weight set `p` into tile `j`'s sums: the K32 WMMA steps over the epoch's nibbles, then
+    /// the exact fold pass (`C - magic` scaled by `d * scale`).
+    fn fold_tile(b: &mut Builder, g: &G, p: usize, j: u8) -> Result<(), String> {
+        let a = g.arch();
+        for i in 0..g.aw() / 2 {
+            iu4_fold::wmma_step(
+                b,
+                a,
+                V::<8>(CACC),
+                V::<2>(g.wa(p) + 2 * i),
+                V::<2>(g.x(j) + 2 * i),
+                i == 0,
+                V::<8>(MAGIC8),
+            )?;
+        }
+        iu4_fold::fold_pass(b, CACC, g.sum(j), SCF, g.d(j), TPROD)
+    }
+
     fn serial_tiles<T: Target>(
         w: &mut Wave<'_, T, Builder>,
         g: &G,
@@ -2755,7 +3045,6 @@ mod nt {
         site: &str,
         reload: Option<u8>,
     ) -> Result<(), String> {
-        let a = g.arch();
         // Experimental schedules reload only live tiles, inside the live
         // branch; the original reloads every tile after its (maybe skipped) fold.
         let (inside, outside) = if g.experimental() {
@@ -2765,46 +3054,15 @@ mod nt {
         };
         for j in 0..g.nt() {
             let fold = |w: &mut Wave<'_, T, Builder>, ()| -> Result<(), String> {
-                let b = w.isa();
-                for i in 0..g.aw() / 2 {
-                    iu4_fold::wmma_step(
-                        b,
-                        a,
-                        V::<8>(CACC),
-                        V::<2>(g.wa(p) + 2 * i),
-                        V::<2>(g.x(j) + 2 * i),
-                        i == 0,
-                        V::<8>(MAGIC8),
-                    )?;
-                }
-                iu4_fold::fold_pass(b, CACC, g.sum(j), SCF, g.d(j), TPROD)?;
+                fold_tile(w.isa(), g, p, j)?;
                 if let Some(srd) = inside {
                     load_x(w.isa(), g, j, srd)?;
                 }
                 Ok(())
             };
             if j > 0 {
-                let b = w.isa();
-                let x = Instruction::new(
-                    "",
-                    vec![],
-                    vec![
-                        v(g.d(j)),
-                        crate::reg::RegRef {
-                            kind: crate::reg::Kind::V,
-                            base: g.x(j),
-                            len: g.aw(),
-                        },
-                    ],
-                );
-                for (c, n, _) in b.ledger.required(&x) {
-                    b.wait(c, n)?;
-                }
-                let live = w.scmp(Instruction::new(
-                    format!("s_cmp_gt_u32 s{CNT}, {j}"),
-                    vec![],
-                    vec![s(CNT)],
-                ))?;
+                wait_tile(w.isa(), g, j)?;
+                let live = w.scmp(tile_live_insn(j))?;
                 w.skip_unless(live, &g.label(&format!("{site}_dead{j}")), (), fold)?;
             } else {
                 fold(w, ())?;
@@ -2822,6 +3080,21 @@ mod nt {
             add64(b, r, r, XS2)?;
         }
         Ok(())
+    }
+
+    /// One trip done: `s_add_i32 s{TRIPS}, s{TRIPS}, -1`.
+    fn trips_dec(b: &mut Builder) -> Result<(), String> {
+        op(
+            b,
+            format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)),
+            &[s(TRIPS)],
+            &[s(TRIPS)],
+        )
+    }
+
+    /// An odd K/128 leaves one epoch after the trips, not two: `s_bitcmp1_b32 K, 7`.
+    fn odd_insn() -> Instruction {
+        Instruction::new("s_bitcmp1_b32 s19, 7", vec![], vec![s(19)])
     }
 
     fn kloop<T: Target + peacemaker_author::MmaIu4>(wg: &mut Wg<T>, g: &G) -> Result<(), String> {
@@ -2847,13 +3120,7 @@ mod nt {
                 if g.settles_loads() {
                     super::super::gemm_uk::Prefetch::<0>::wait_load(wg.isa())?;
                 }
-                let b = wg.isa();
-                op(
-                    b,
-                    format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)),
-                    &[s(TRIPS)],
-                    &[s(TRIPS)],
-                )?;
+                trips_dec(wg.isa())?;
                 Ok(((), trips_cmp(wg, "s_cmp_lg_u32", TRIPS)?))
             })?;
             if wg.isa().ledger.shape() != entry {
@@ -2866,11 +3133,7 @@ mod nt {
             Kind::GateUp => tail_pair(wg, g),
             // K % 128 == 0: one epoch left when K/128 is odd, else two.
             Kind::Down => {
-                let odd = wg.scmp(Instruction::new(
-                    "s_bitcmp1_b32 s19, 7",
-                    vec![],
-                    vec![s(19)],
-                ))?;
+                let odd = wg.scmp(odd_insn())?;
                 wg.if_else(
                     odd,
                     &g.label("tail_odd"),
@@ -3032,15 +3295,8 @@ mod nt {
         bstore_b128(b, out, YOFF, SRD_Y, 128 * u32::from(g.blk))
     }
 
-    /// Stores of every live tile: tile 0 always, tile j while j < cnt; the
-    /// descriptor base advances 16 output rows per tile.
-    fn store_tiles<T: Target>(
-        w: &mut Wave<'_, T, Builder>,
-        g: &G,
-        end: &End,
-        vals: impl Fn(&mut Wave<'_, T, Builder>, u8) -> Result<u8, String>,
-    ) -> Result<(), String> {
-        let b = w.isa();
+    /// The output descriptor over `Y` (and, on gfx11, the exchange masks of the row store).
+    fn y_descriptor(b: &mut Builder, g: &G) -> Result<(), String> {
         sop(b, format!("s_mov_b32 s{SRD_Y}, s16"), &[SRD_Y], &[16])?;
         sop(
             b,
@@ -3064,15 +3320,28 @@ mod nt {
             )?;
             op(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[s(PSEL)], &[])?;
         }
+        Ok(())
+    }
+
+    /// The output descriptor moves 16 rows (one tile) on.
+    fn y_step(b: &mut Builder) -> Result<(), String> {
+        add64(b, SRD_Y, SRD_Y, YSTEP)
+    }
+
+    /// Stores of every live tile: tile 0 always, tile j while j < cnt; the
+    /// descriptor base advances 16 output rows per tile.
+    fn store_tiles<T: Target>(
+        w: &mut Wave<'_, T, Builder>,
+        g: &G,
+        end: &End,
+        vals: impl Fn(&mut Wave<'_, T, Builder>, u8) -> Result<u8, String>,
+    ) -> Result<(), String> {
+        y_descriptor(w.isa(), g)?;
         for j in 0..g.nt() {
             if j > 0 {
-                let live = w.scmp(Instruction::new(
-                    format!("s_cmp_gt_u32 s{CNT}, {j}"),
-                    vec![],
-                    vec![s(CNT)],
-                ))?;
+                let live = w.scmp(tile_live_insn(j))?;
                 w.exit_unless(live, end)?;
-                add64(w.isa(), SRD_Y, SRD_Y, YSTEP)?;
+                y_step(w.isa())?;
             }
             let r = vals(w, j)?;
             store_rows(w.isa(), g, r, g.live(j))?;
@@ -3167,15 +3436,10 @@ mod nt {
         b.wait(crate::ledger::Counter::Vs, 0)
     }
 
-    /// Tile `j`'s gate publication (two b128 stores per lane) in the linear
-    /// write token `out`.
-    fn publish_tile<T: Target, S: StoreTarget<T::Waits, Out = S>>(
-        w: &mut Wave<'_, T, Builder>,
-        g: &G,
-        j: u8,
-        mut out: S,
-    ) -> Result<S, String> {
-        for h in 0..2u8 {
+    /// Tile `j`'s gate publication: two `ds_store_b128` per lane of the rounded sums.
+    fn publish_insns(g: &G, j: u8) -> [Instruction; 2] {
+        std::array::from_fn(|h| {
+            let h = h as u8;
             let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
             let d = crate::reg::RegRef {
                 kind: crate::reg::Kind::V,
@@ -3190,26 +3454,65 @@ mod nt {
                     format!(" offset:{off}")
                 }
             );
-            out = w.ds_store(
-                out,
-                Instruction::new(text, vec![], vec![v(LDSA), d]).memory(MemoryClass::DsStore),
-            )?;
+            Instruction::new(text, vec![], vec![v(LDSA), d]).memory(MemoryClass::DsStore)
+        })
+    }
+
+    /// Tile `j`'s gate publication in the linear write token `out`.
+    fn publish_tile<T: Target, S: StoreTarget<T::Waits, Out = S>>(
+        w: &mut Wave<'_, T, Builder>,
+        g: &G,
+        j: u8,
+        mut out: S,
+    ) -> Result<S, String> {
+        for insn in publish_insns(g, j) {
+            out = w.ds_store(out, insn)?;
         }
         Ok(out)
     }
-    fn epilogue<T: Target>(
-        wg: &mut Wg<T>,
-        g: &G,
-        end: End,
-        gate: Option<LdsRegion<Gate, Free>>,
-    ) -> Result<(), String> {
-        let b = wg.isa();
-        b.label(&g.label("epilogue"))?;
-        let Some(gate) = gate else {
-            store_tiles(wg, g, &end, |_, j| Ok(g.sum(j)))?;
-            return wg.end(end);
-        };
-        // Every wave: BF16 round trip of its sums (gate or up).
+
+    /// The up waves' reads of tile `j`'s gate rows, in the same lane layout: two `ds_load_b128`.
+    fn gate_load_insns(g: &G, j: u8) -> [Instruction; 2] {
+        let gv = g.gval();
+        std::array::from_fn(|h| {
+            let h = h as u8;
+            let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
+            let d = crate::reg::RegRef {
+                kind: crate::reg::Kind::V,
+                base: gv + 4 * h,
+                len: 4,
+            };
+            let text = format!(
+                "ds_load_b128 {d}, v{LDSA}{}",
+                if off == 0 {
+                    String::new()
+                } else {
+                    format!(" offset:{off}")
+                }
+            );
+            Instruction::new(text, vec![d], vec![v(LDSA)]).memory(MemoryClass::DsLoad)
+        })
+    }
+
+    /// Tile `j`'s SwiGLU: `silu(gate) * up` over the gate rows read back and the up sums, in the
+    /// gate registers (the value to store).
+    fn silu_tile(b: &mut Builder, g: &G, j: u8) -> Result<(), String> {
+        let gv = g.gval();
+        for grp in 0..2u8 {
+            crate::kernels::gemm_uk::Epilogue::silu_dense(
+                b,
+                gv + SILU_N * grp,
+                g.sum(j) + SILU_N * grp,
+                SILU_TMP,
+                SILU_MASK,
+                SILU_N,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every wave's BF16 round trip of its sums (gate or up), before the hand-off.
+    fn bf16_roundtrip(b: &mut Builder, g: &G) -> Result<(), String> {
         for j in 0..g.nt() {
             for i in 0..8u8 {
                 Bf16::rne_finite_passthrough(
@@ -3221,14 +3524,37 @@ mod nt {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// The up waves (`wave >= 2`) read the gate rows: `s_cmp_ge_u32 WAVE, 2`.
+    fn up_insn() -> Instruction {
+        Instruction::new(format!("s_cmp_ge_u32 s{WAVE}, 2"), vec![], vec![s(WAVE)])
+    }
+
+    /// The epilogue's label (the join of the tail's `if_else`).
+    fn epilogue_label(b: &mut Builder, g: &G) -> Result<(), String> {
+        b.label(&g.label("epilogue"))
+    }
+
+    fn epilogue<T: Target>(
+        wg: &mut Wg<T>,
+        g: &G,
+        end: End,
+        gate: Option<LdsRegion<Gate, Free>>,
+    ) -> Result<(), String> {
+        let b = wg.isa();
+        epilogue_label(b, g)?;
+        let Some(gate) = gate else {
+            store_tiles(wg, g, &end, |_, j| Ok(g.sum(j)))?;
+            return wg.end(end);
+        };
+        // Every wave: BF16 round trip of its sums (gate or up).
+        bf16_roundtrip(b, g)?;
         // Gate waves publish the rounded gate rows and leave; up waves meet
         // them at their own barrier, read the publication and store the
         // tiles (wave scope, up to the kernel exit).
-        let up = wg.scmp(Instruction::new(
-            format!("s_cmp_ge_u32 s{WAVE}, 2"),
-            vec![],
-            vec![s(WAVE)],
-        ))?;
+        let up = wg.scmp(up_insn())?;
         let gv = g.gval();
         wg.handoff(
             up,
@@ -3258,37 +3584,10 @@ mod nt {
             },
             |w, gate, end| {
                 store_tiles(w, g, end, |w, j| {
-                    for h in 0..2u8 {
-                        let off = u32::from(j) * NT_GATE_BYTES + 16 * u32::from(h);
-                        let d = crate::reg::RegRef {
-                            kind: crate::reg::Kind::V,
-                            base: gv + 4 * h,
-                            len: 4,
-                        };
-                        let text = format!(
-                            "ds_load_b128 {d}, v{LDSA}{}",
-                            if off == 0 {
-                                String::new()
-                            } else {
-                                format!(" offset:{off}")
-                            }
-                        );
-                        w.ds_load(
-                            &gate,
-                            Instruction::new(text, vec![d], vec![v(LDSA)])
-                                .memory(MemoryClass::DsLoad),
-                        )?;
+                    for insn in gate_load_insns(g, j) {
+                        w.ds_load(&gate, insn)?;
                     }
-                    for grp in 0..2u8 {
-                        crate::kernels::gemm_uk::Epilogue::silu_dense(
-                            w.isa(),
-                            gv + SILU_N * grp,
-                            g.sum(j) + SILU_N * grp,
-                            SILU_TMP,
-                            SILU_MASK,
-                            SILU_N,
-                        )?;
-                    }
+                    silu_tile(w.isa(), g, j)?;
                     Ok(gv)
                 })
             },
@@ -3397,35 +3696,55 @@ mod nt {
         epilogue(wg, &last, end, gate)
     }
 
-    /// The gfx1201 MQ4 down NT4 / NT8 entries (flat-slot and grouped-position) as phase blocks, so a
-    /// `.rip` script (`qwen4_moe_down_gp.rip`) owns the kernel's structure: the K-loop's trip
-    /// structure, the order of weight loads and epoch folds inside a trip, the descriptor steps, the
-    /// tail and the exit. The prologue, one epoch's fold (`compute`), the odd/even tail pair and the
-    /// store epilogue stay Rust blocks: they interleave instruction emission with per-tile liveness
-    /// branches, so each is one block. The down entries have no LDS and no ring, so there is no
-    /// ring state to lend. [`emit`] / [`emit_gp`] are the oracle: the twin is byte-identical to them
-    /// for every valid entry.
-    pub mod down_blocks {
+    /// The gfx1201 MQ4 NT4 / NT8 entries (`gate_up` and `down`, flat-slot and grouped-position) as
+    /// builder-level blocks, so a `.rip` script (`qwen4_moe_sym.rip`) owns the kernel's structure:
+    /// the exits, the run walk, the per-tile branches of an epoch's fold and where each wait sits,
+    /// the K-loop's trip structure and the order of loads inside a trip, the tail, the exit and,
+    /// for `gate_up`, the LDS hand-off between the gate and up waves. Every block is a straight run
+    /// of instructions (or one `Instruction` for a compare), emitted by the same function the Rust
+    /// `emit` / `emit_down_gp` call, so the twin and the generator cannot drift apart. No block
+    /// opens a control-flow scope, joins a workgroup barrier or touches the LDS.
+    pub mod blocks {
         use super::*;
 
-        /// Register assignment, labels and launch contract of one down entry.
+        /// Register assignment, labels and launch contract of one entry.
         pub struct Gen {
             g: G,
         }
 
+        /// A tile index `j` is below the entry's tile width.
+        fn tile(g: &Gen, j: u8) -> Result<u8, String> {
+            if j < g.g.nt() {
+                Ok(j)
+            } else {
+                Err(format!("tile {j}: this entry has {} tiles", g.g.nt()))
+            }
+        }
+
+        /// An epoch parity (weight set) is 0 or 1.
+        fn parity(p: usize) -> Result<usize, String> {
+            if p < 2 {
+                Ok(p)
+            } else {
+                Err(format!("epoch parity {p}: expected 0 or 1"))
+            }
+        }
+
         impl Gen {
-            /// The down NT4 / NT8 entry `spec` (`gp`: the grouped-position twin). The same
-            /// refusals as `emit` / `emit_down_gp`.
+            /// The NT4 / NT8 entry `spec` (`gp`: the grouped-position twin of the down entry). The
+            /// same refusals as `emit` / `emit_down_gp`.
             pub fn new(spec: Spec, gp: bool) -> Result<Gen, String> {
                 spec.validate()?;
                 if spec.arch != Arch::Gfx1201
-                    || spec.kind != Kind::Down
                     || spec.codec != WeightCodec::Mq4Sym
                     || spec.rr != 1
                     || !matches!(spec.nt, 4 | 8)
                 {
+                    return Err("qwen4_moe blocks: the gfx1201 MQ4 NT4/NT8 entries only".into());
+                }
+                if gp && spec.kind != Kind::Down {
                     return Err(
-                        "qwen4_moe_down blocks: the gfx1201 MQ4 down NT4/NT8 entries only".into(),
+                        "qwen4_moe blocks: only the down entry has a grouped-position twin".into(),
                     );
                 }
                 Ok(Gen {
@@ -3445,14 +3764,26 @@ mod nt {
             pub fn gp(&self) -> bool {
                 self.g.gpos
             }
+            /// Tiles per workgroup (4 or 8).
+            pub fn nt(&self) -> u8 {
+                self.g.nt()
+            }
+            /// `gate_up` (LDS hand-off, two roles) or `down`.
+            pub fn gate_up(&self) -> bool {
+                self.g.gate_up()
+            }
+            /// Bytes of the `swiglu_gate` hand-off region (`gate_up`; 0 for `down`).
+            pub fn lds_bytes(&self) -> u32 {
+                self.g.spec.lds_bytes()
+            }
             pub fn kernel_spec(&self) -> KernelSpec {
                 kernel_spec_of(&self.g)
             }
             pub fn plan(&self) -> Result<RegPlan, String> {
                 self.g.plan()
             }
-            /// A block label of this entry (`k_begin`, `k_loop`, `k_loop_end`, `tail_odd`,
-            /// `epilogue`, `end`, ...).
+            /// A block label of this entry (`k_begin`, `k_loop`, `k_loop_end`, `l0_dead1`,
+            /// `tail_odd`, `epilogue`, `up`, `end`, ...).
             pub fn label(&self, name: &str) -> String {
                 self.g.label(name)
             }
@@ -3462,81 +3793,173 @@ mod nt {
             }
         }
 
-        /// Activation descriptor SGPR base of epoch parity `p` (the `reload` operand of [`compute`]).
+        /// Activation descriptor SGPR base of epoch parity `p` (the `reload` operand of [`load_x`]).
         pub fn srd_x(p: usize) -> Result<u8, String> {
-            SRD_X
-                .get(p)
-                .copied()
-                .ok_or_else(|| format!("activation descriptor {p}: expected 0 or 1"))
+            Ok(SRD_X[parity(p)?])
         }
 
-        /// Kernel arguments, workgroup/tile ids, descriptors, lane offsets, the first epoch's loads.
-        pub fn prologue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String> {
-            super::prologue(wg, &g.g, end)
+        // ---- prologue ----
+
+        /// Kernel arguments, workgroup and lane ids, the wave index, `TILE16`.
+        pub fn pro_front(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_front(b, &g.g)
+        }
+        /// `s_cmp_ge_i32 TILE16, m_total`: the tile is past the end (the workgroup returns).
+        pub fn outside_insn(_g: &Gen) -> Instruction {
+            super::outside_insn()
+        }
+        /// The tile's expert id and `n_experts`.
+        pub fn pro_expert(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_expert(b, &g.g)
+        }
+        /// `s_cmp_ge_u32 expert, n_experts`: a sentinel or corrupt expert id (the workgroup returns).
+        pub fn sentinel_insn(_g: &Gen) -> Instruction {
+            super::sentinel_insn()
+        }
+        /// The expert's weight pointer, the tile-id descriptor and the walk counter.
+        pub fn pro_run(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_run(b, &g.g)
+        }
+        /// One iteration of the run walk (wave-uniform `loop_until` body), up to its lane mask.
+        pub fn walk_head(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::walk_head(b, &g.g)
+        }
+        /// `s_cmp_lg_u32 MASKA, 0`: some lane found the run's start (`break_if`).
+        pub fn walk_hit_insn(_g: &Gen) -> Instruction {
+            super::walk_hit_insn()
+        }
+        /// The walk's back edge: 32 tiles further back.
+        pub fn walk_step(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::walk_step(b, &g.g)
+        }
+        /// This tile's position in its run, modulo `nt`.
+        pub fn pro_leader(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_leader(b, &g.g)
+        }
+        /// `s_cmp_lg_u32 POS, 0`: not the run's leader (the workgroup returns).
+        pub fn follower_insn(_g: &Gen) -> Instruction {
+            super::follower_insn()
+        }
+        /// Live tile count, row bytes, trips, row base, output offsets, the slot descriptor.
+        pub fn pro_cnt(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_cnt(b, &g.g)
+        }
+        /// Tile `j`'s sorted slot load.
+        pub fn pro_slot_load(b: &mut Builder, g: &Gen, j: u8) -> Result<(), String> {
+            super::pro_slot_load(b, &g.g, tile(g, j)?)
+        }
+        /// Activation and weight descriptors, lane offsets, and the first epoch's weight loads.
+        pub fn pro_desc(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_desc(b, &g.g)
+        }
+        /// Tile `j`'s activation row offset (dead tiles gather slot -1).
+        pub fn pro_tile(b: &mut Builder, g: &Gen, j: u8) -> Result<(), String> {
+            super::pro_tile(b, &g.g, tile(g, j)?)
+        }
+        /// The fold magic and the zeroed sums.
+        pub fn pro_init(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::pro_init(b, &g.g)
         }
 
-        /// `cmp s{TRIPS}, 0`: the K trip counter against zero (workgroup-uniform).
-        pub fn trips_cmp<T: Target>(wg: &mut Wg<T>, cmp: &str) -> Result<WgUniform<Scc>, String> {
-            super::super::trips_cmp(wg, cmp, TRIPS)
-        }
-
-        /// One trip done: `s_add_i32 s{TRIPS}, s{TRIPS}, -1`.
-        pub fn trips_dec(b: &mut Builder) -> Result<(), String> {
-            op(
-                b,
-                format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)),
-                &[s(TRIPS)],
-                &[s(TRIPS)],
-            )
-        }
+        // ---- loads, fold, K-loop pieces ----
 
         /// Issue the weight loads of epoch parity `p`.
         pub fn load_w(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
-            super::load_w(b, &g.g, p)
+            super::load_w(b, &g.g, parity(p)?)
         }
-
-        /// Fold epoch parity `p` into the sums; `reload` = the descriptor to issue the tile's
-        /// next-epoch activations through right after its fold ([`srd_x`]).
-        pub fn compute<T: Target + peacemaker_author::MmaIu4>(
-            w: &mut Wave<'_, T, Builder>,
-            g: &Gen,
-            p: usize,
-            site: &str,
-            reload: Option<u8>,
-        ) -> Result<(), String> {
-            super::compute(w, &g.g, p, site, reload)
+        /// Tile `j`'s activation loads through the descriptor of epoch parity `p`.
+        pub fn load_x(b: &mut Builder, g: &Gen, j: u8, p: usize) -> Result<(), String> {
+            super::load_x(b, &g.g, tile(g, j)?, SRD_X[parity(p)?])
         }
-
+        /// Epoch parity `p`'s row scales and nibble rebias, before its tile folds.
+        pub fn compute_head(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
+            super::compute_head(b, &g.g, parity(p)?)
+        }
+        /// The counters tile `j`'s fold needs (`d` and activation operands) wait here, nowhere else.
+        pub fn wait_tile(b: &mut Builder, g: &Gen, j: u8) -> Result<(), String> {
+            super::wait_tile(b, &g.g, tile(g, j)?)
+        }
+        /// `s_cmp_gt_u32 CNT, j`: tile `j` is live (wave-uniform).
+        pub fn tile_live_insn(g: &Gen, j: u8) -> Result<Instruction, String> {
+            Ok(super::tile_live_insn(tile(g, j)?))
+        }
+        /// Fold epoch parity `p` into tile `j`'s sums.
+        pub fn fold_tile(b: &mut Builder, g: &Gen, p: usize, j: u8) -> Result<(), String> {
+            super::fold_tile(b, &g.g, parity(p)?, tile(g, j)?)
+        }
         /// Step the weight descriptor and both activation descriptors one trip's epoch pair on.
         pub fn advance(b: &mut Builder) -> Result<(), String> {
             super::advance(b)
         }
-
-        /// The tail after the trips, one block: two epochs left (even K/128: [`tail_pair`]) or
-        /// one (odd: a single fold), chosen by `s_bitcmp1_b32 s19, 7` in a wave-scope
-        /// `if_else`, which a typed block cannot sit under, so the branch is part of the block.
-        pub fn tail<T: Target + peacemaker_author::MmaIu4>(
-            wg: &mut Wg<T>,
-            g: &Gen,
-        ) -> Result<(), String> {
-            let odd = wg.scmp(Instruction::new(
-                "s_bitcmp1_b32 s19, 7",
-                vec![],
-                vec![s(19)],
-            ))?;
-            wg.if_else(
-                odd,
-                &g.g.label("tail_odd"),
-                &g.g.label("epilogue"),
-                |w| super::tail_pair(w, &g.g),
-                |w| super::compute(w, &g.g, 0, "t2", None),
-            )
+        /// `s_cmp_eq_u32 TRIPS, 0`: no full trip (workgroup-uniform).
+        pub fn trips_zero_insn() -> Instruction {
+            super::trips_insn("s_cmp_eq_u32", TRIPS)
+        }
+        /// `s_cmp_lg_u32 TRIPS, 0`: trips remain (workgroup-uniform back-edge condition).
+        pub fn trips_more_insn() -> Instruction {
+            super::trips_insn("s_cmp_lg_u32", TRIPS)
+        }
+        /// One trip done: `s_add_i32 TRIPS, TRIPS, -1`.
+        pub fn trips_dec(b: &mut Builder) -> Result<(), String> {
+            super::trips_dec(b)
+        }
+        /// `s_bitcmp1_b32 K, 7`: K/128 is odd, so one epoch (not two) is left after the trips.
+        pub fn odd_insn() -> Instruction {
+            super::odd_insn()
         }
 
-        /// The epilogue label and the tile stores. The caller places the kernel exit after it.
-        pub fn epilogue<T: Target>(wg: &mut Wg<T>, g: &Gen, end: &End) -> Result<(), String> {
-            wg.isa().label(&g.g.label("epilogue"))?;
-            store_tiles(wg, &g.g, end, |_, j| Ok(g.g.sum(j)))
+        // ---- epilogue ----
+
+        /// The epilogue's label (the join label of the tail's `if_else`).
+        pub fn epilogue_label(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::epilogue_label(b, &g.g)
+        }
+        /// The output descriptor over `Y`.
+        pub fn y_descriptor(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            super::y_descriptor(b, &g.g)
+        }
+        /// The output descriptor moves one tile (16 rows) on.
+        pub fn y_step(b: &mut Builder) -> Result<(), String> {
+            super::y_step(b)
+        }
+        /// Tile `j`'s BF16 rows from the sums (`gate = false`) or from the SwiGLU value registers
+        /// (`gate = true`), stored at the current output descriptor.
+        pub fn store_rows(b: &mut Builder, g: &Gen, j: u8, gate: bool) -> Result<(), String> {
+            let j = tile(g, j)?;
+            let vals = if gate { g.g.gval() } else { g.g.sum(j) };
+            super::store_rows(b, &g.g, vals, g.g.live(j))
+        }
+        /// Every wave's BF16 round trip of its sums (`gate_up`, before the hand-off).
+        pub fn bf16_roundtrip(b: &mut Builder, g: &Gen) -> Result<(), String> {
+            if !g.g.gate_up() {
+                return Err("bf16_roundtrip: the gate_up entry only".into());
+            }
+            super::bf16_roundtrip(b, &g.g)
+        }
+        /// `s_cmp_ge_u32 WAVE, 2`: the up waves (the hand-off readers).
+        pub fn up_insn() -> Instruction {
+            super::up_insn()
+        }
+        /// Tile `j`'s gate publication: two `ds_store_b128`, in order.
+        pub fn publish_insns(g: &Gen, j: u8) -> Result<Vec<Instruction>, String> {
+            if !g.g.gate_up() {
+                return Err("publish_insns: the gate_up entry only".into());
+            }
+            Ok(super::publish_insns(&g.g, tile(g, j)?).to_vec())
+        }
+        /// Tile `j`'s gate read-back: two `ds_load_b128`, in order.
+        pub fn gate_load_insns(g: &Gen, j: u8) -> Result<Vec<Instruction>, String> {
+            if !g.g.gate_up() {
+                return Err("gate_load_insns: the gate_up entry only".into());
+            }
+            Ok(super::gate_load_insns(&g.g, tile(g, j)?).to_vec())
+        }
+        /// Tile `j`'s SwiGLU over the gate rows read back and the up sums.
+        pub fn silu_tile(b: &mut Builder, g: &Gen, j: u8) -> Result<(), String> {
+            if !g.g.gate_up() {
+                return Err("silu_tile: the gate_up entry only".into());
+            }
+            super::silu_tile(b, &g.g, tile(g, j)?)
         }
     }
 }
