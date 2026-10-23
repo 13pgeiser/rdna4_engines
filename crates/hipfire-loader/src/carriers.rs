@@ -11846,6 +11846,7 @@ mod qwen4_preload_plan_tests {
                 state: 0,
                 forward: 0,
                 f16_shadows: 0,
+                shared_i8_shadows: 0,
                 workspace: std::array::from_fn(|_| ("fixture", 0)),
                 qsa_selector: 0,
                 mtp: 0,
