@@ -5599,6 +5599,7 @@ pub(crate) enum ScratchField {
     PleQuery,
     PleGated,
     PleNormed,
+    PleNormedWide,
     PleOutput,
     RouterLogits,
     MoeXRot,
@@ -5662,6 +5663,7 @@ impl ScratchField {
         Self::PleQuery,
         Self::PleGated,
         Self::PleNormed,
+        Self::PleNormedWide,
         Self::PleOutput,
         Self::RouterLogits,
         Self::MoeXRot,
@@ -5712,6 +5714,7 @@ impl ScratchField {
             | Self::PleQuery
             | Self::PleGated
             | Self::PleNormed
+            | Self::PleNormedWide
             | Self::PleOutput => L::PrepareAndFragment,
             Self::Projection
             | Self::Projection2
@@ -5843,6 +5846,25 @@ fn scratch_mul(a: usize, b: usize) -> Result<usize, Qwen4GpuForwardError> {
         .ok_or_else(|| invalid("scratch size arithmetic overflows"))
 }
 
+/// Rows of PLE convolution input the compact scratch keeps after a forward:
+/// the widest forward whose normed rows are read after it returns, for a
+/// verify rollback.  A verify window is at most
+/// `QWEN4_VERIFY_MAX_ROWS` rows (the row capture refuses more, `state.rs`
+/// `row_capture_allocation_sizes_scoped`; the n-gram lane's block is
+/// `NGRAM_DEPTHS + 1` of them; a mesh row repair's tokens equal its verify
+/// epoch's rows).  A lane step (`forward_lanes`) is `lanes * rows` with at
+/// most `lane::MAX_LANES` lanes of one store and a verify lane at most
+/// `LANE_MAX_ROWS` rows (`forward_lanes` refuses more; an AR lane is one), and
+/// a lane reads its window at its first row of the step.
+pub(crate) const QWEN4_PLE_NORMED_KEEP_ROWS: usize = {
+    let lanes = crate::lane::MAX_LANES * crate::gpu_forward_lanes::LANE_MAX_ROWS;
+    if lanes > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
+        lanes
+    } else {
+        hipfire_config::QWEN4_VERIFY_MAX_ROWS
+    }
+};
+
 /// Elements (256 bytes of F32) every phase-arena field start is rounded up to.
 const COMPACT_ARENA_ALIGN: usize = 64;
 
@@ -5917,6 +5939,7 @@ pub(crate) fn compact_arena_groups(
         (F::PleKey, layout.wide),
         (F::PleOutput, layout.wide),
         (F::PleValue, layout.hidden),
+        (F::PleNormedWide, layout.wide),
     ])?);
     groups.push(
         [
@@ -6030,7 +6053,17 @@ pub struct Qwen4GpuForwardScratch {
     pub ple_value: GpuTensor,
     pub ple_query: GpuTensor,
     pub ple_gated: GpuTensor,
+    /// The PLE convolution input rows a partial verify rollback reads after
+    /// the forward: the whole `max_chunk` in `Full`, the first
+    /// [`QWEN4_PLE_NORMED_KEEP_ROWS`] rows in the compact plan.
     pub ple_normed: GpuTensor,
+    /// Compact plan, `max_chunk > QWEN4_PLE_NORMED_KEEP_ROWS`: the normed rows
+    /// of a forward wider than the kept rows (a view of the phase arena).
+    /// Never read after the forward.
+    pub ple_normed_wide: GpuTensor,
+    /// Whether the last forward wrote its normed rows to
+    /// [`Self::ple_normed_wide`], so [`Self::ple_normed_for_rollback`] refuses.
+    ple_normed_in_wide: std::sync::atomic::AtomicBool,
     pub ple_output: GpuTensor,
     pub router_logits: GpuTensor,
     pub moe_x_rot: GpuTensor,
@@ -6100,8 +6133,10 @@ impl Qwen4GpuForwardScratch {
     ///   [`compact_arena_groups`]) are views of it, each group laid out from
     ///   element 0 with every field start rounded up to 256 bytes, and the
     ///   arena is the largest group.  `ple_gated` -> `rotation`.
-    ///   `ple_normed` stays dedicated: partial verify rollback reads it after
-    ///   the forward.
+    ///   `ple_normed` stays dedicated but holds only
+    ///   [`QWEN4_PLE_NORMED_KEEP_ROWS`] rows (partial verify rollback reads it
+    ///   after the forward); a wider forward writes `ple_normed_wide`, a PLE
+    ///   group member, and every post-forward reader then refuses.
     fn plan_scoped(
         config: &Qwen4Config,
         max_chunk: usize,
@@ -6197,6 +6232,11 @@ impl Qwen4GpuForwardScratch {
             | F::PleGated
             | F::PleNormed
             | F::PleOutput => scope.input,
+            F::PleNormedWide => {
+                scope.input
+                    && mode == Qwen4ForwardScratchMode::FnSymGfx1201
+                    && max_chunk > QWEN4_PLE_NORMED_KEEP_ROWS
+            }
             F::GdnA
             | F::GdnB
             | F::GdnGate
@@ -6279,7 +6319,19 @@ impl Qwen4GpuForwardScratch {
             alloc(F::PleValue, rows(hidden)?, DType::F32)?;
             alloc(F::PleQuery, rows(ple_channels)?, DType::F32)?;
             alloc(F::PleGated, rows(ple_channels)?, DType::F32)?;
-            alloc(F::PleNormed, rows(ple_channels)?, DType::F32)?;
+            // Full keeps every row of the forward; the compact plan keeps the
+            // rows a verify rollback can read after the forward and routes a
+            // wider forward's normed rows through `PleNormedWide`.
+            alloc(
+                F::PleNormed,
+                if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
+                    scratch_mul(max_chunk.min(QWEN4_PLE_NORMED_KEEP_ROWS), ple_channels)?
+                } else {
+                    rows(ple_channels)?
+                },
+                DType::F32,
+            )?;
+            alloc(F::PleNormedWide, rows(ple_channels)?, DType::F32)?;
             alloc(F::PleOutput, rows(ple_channels)?, DType::F32)?;
             // Viewed as `[rows, router_columns]` by every forward (one
             // placeholder column for a dense FFN).
@@ -6744,6 +6796,8 @@ impl Qwen4GpuForwardScratch {
             ple_query: take(F::PleQuery),
             ple_gated: take(F::PleGated),
             ple_normed: take(F::PleNormed),
+            ple_normed_wide: take(F::PleNormedWide),
+            ple_normed_in_wide: std::sync::atomic::AtomicBool::new(false),
             ple_output: take(F::PleOutput),
             router_logits: take(F::RouterLogits),
             moe_x_rot: take(F::MoeXRot),
@@ -6815,6 +6869,7 @@ impl Qwen4GpuForwardScratch {
             F::PleQuery => &self.ple_query,
             F::PleGated => &self.ple_gated,
             F::PleNormed => &self.ple_normed,
+            F::PleNormedWide => &self.ple_normed_wide,
             F::PleOutput => &self.ple_output,
             F::RouterLogits => &self.router_logits,
             F::MoeXRot => &self.moe_x_rot,
@@ -6884,6 +6939,55 @@ impl Qwen4GpuForwardScratch {
         }
     }
 
+    /// The field a `rows`-row forward writes its PLE normed rows to, and
+    /// whether that is the wide arena view.
+    pub(crate) fn ple_normed_field(&self, rows: usize) -> ScratchField {
+        if self.slots[ScratchField::PleNormedWide as usize].elements != 0
+            && rows > QWEN4_PLE_NORMED_KEEP_ROWS
+        {
+            ScratchField::PleNormedWide
+        } else {
+            ScratchField::PleNormed
+        }
+    }
+
+    /// The tensor a `rows`-row PLE step writes its normed rows to; a row count
+    /// past [`QWEN4_PLE_NORMED_KEEP_ROWS`] takes the arena view and marks the
+    /// kept rows stale.
+    pub(crate) fn ple_normed_for(&self, rows: usize) -> &GpuTensor {
+        let field = self.ple_normed_field(rows);
+        if field == ScratchField::PleNormedWide {
+            self.ple_normed_in_wide
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.field_tensor(field)
+    }
+
+    /// A forward of `rows` rows begins: the kept normed rows are valid again
+    /// unless this forward is wider than them.
+    pub(crate) fn note_forward_rows(&self, rows: usize) {
+        self.ple_normed_in_wide.store(
+            self.ple_normed_field(rows) == ScratchField::PleNormedWide,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The kept PLE normed rows for a verify rollback; an error when the last
+    /// forward was wider than [`QWEN4_PLE_NORMED_KEEP_ROWS`] and wrote its
+    /// normed rows elsewhere.
+    pub(crate) fn ple_normed_for_rollback(&self) -> Result<&GpuTensor, Qwen4GpuForwardError> {
+        if self
+            .ple_normed_in_wide
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(invalid(format!(
+                "the last forward was wider than {QWEN4_PLE_NORMED_KEEP_ROWS} rows: its PLE \
+                 convolution input rows are not kept for a verify rollback"
+            )));
+        }
+        Ok(&self.ple_normed)
+    }
+
     /// Free the owners.  Borrowed views are never freed: their allocation is
     /// freed once, through its owner.
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -6924,6 +7028,7 @@ impl Qwen4GpuForwardScratch {
             self.ple_query,
             self.ple_gated,
             self.ple_normed,
+            self.ple_normed_wide,
             self.ple_output,
             self.router_logits,
             self.moe_x_rot,
@@ -7173,7 +7278,7 @@ impl<'a> LayerPhaseEnv<'a> {
             key_scratch: &scratch.ple_key,
             value_scratch: &scratch.ple_value,
             gated: &scratch.ple_gated,
-            normed: &scratch.ple_normed,
+            normed: scratch.ple_normed_for(self.rows),
             output: &scratch.ple_output,
             rows: self.rows,
             branches: self.dims.hc_count,
@@ -10945,6 +11050,7 @@ impl Qwen4GpuForward {
                 self.scratch.max_chunk
             )));
         }
+        self.scratch.note_forward_rows(n);
         // The router fault row is the absolute token position for a prefill / verify
         // chunk. A one-token decode forward may be captured or retained, which bakes
         // the launch's row base in, so it reports row 0 (position = decode step).
@@ -13642,7 +13748,7 @@ mod tests {
         compact_arena_groups, owner_pitch_extent, qwen4_forward_device_bytes,
         qwen4_spec_logit_rows, slab_codec_tag_bytes, uploaded_ids_range, CompactScratchTerms,
         Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch, ScratchField as F,
-        ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
+        ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS, QWEN4_PLE_NORMED_KEEP_ROWS,
     };
     use crate::config::{compact_test_config, Qwen4Config};
 
@@ -13737,6 +13843,7 @@ mod tests {
                     F::PleQuery,
                     F::PleGated,
                     F::PleNormed,
+                    F::PleNormedWide,
                     F::PleOutput,
                 ],
                 &prepare_and_fragment,
@@ -13836,28 +13943,40 @@ mod tests {
         assert_eq!(scratch_bytes(8192, Mode::Full) - private, 8_454_551_428);
     }
 
+    /// The kept normed rows cover the widest post-forward reader: a lane step
+    /// of 64 lanes of 8 verify rows (a singleton verify window is at most 64).
+    #[test]
+    fn ple_normed_keep_rows_cover_the_widest_post_forward_reader() {
+        assert_eq!(QWEN4_PLE_NORMED_KEEP_ROWS, 512);
+        assert!(QWEN4_PLE_NORMED_KEEP_ROWS >= hipfire_config::QWEN4_VERIFY_MAX_ROWS);
+        assert!(
+            QWEN4_PLE_NORMED_KEEP_ROWS
+                >= crate::lane::MAX_LANES * crate::gpu_forward_lanes::LANE_MAX_ROWS
+        );
+    }
+
     #[test]
     fn fn_scratch_bytes_are_pinned() {
         assert_eq!(scratch_bytes(4096, Mode::Full), 4_538_503_044);
         assert_eq!(scratch_bytes(8192, Mode::Full), 8_957_998_980);
         assert_eq!(scratch_bytes(256, Mode::FnSymGfx1201), 257_203_716);
         assert_eq!(scratch_bytes(512, Mode::FnSymGfx1201), 395_400_324);
-        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 1_342_918_532);
-        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 2_684_794_756);
-        assert_eq!(scratch_bytes(16384, Mode::FnSymGfx1201), 5_368_547_204);
+        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 1_268_469_636);
+        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 2_514_925_444);
+        assert_eq!(scratch_bytes(16384, Mode::FnSymGfx1201), 5_007_837_060);
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(4096, Mode::FnSymGfx1201),
-            3_195_584_512
+            3_270_033_408
         );
         assert_eq!(
             scratch_bytes(8192, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            6_273_204_224
+            6_443_073_536
         );
         // The 8192-row compact scratch is smaller than the 4096-row full one.
         assert!(scratch_bytes(8192, Mode::FnSymGfx1201) <= scratch_bytes(4096, Mode::Full));
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            1_853_708_288
+            2_023_577_600
         );
         // The estimator adds the same 64-row speculative logits to either plan.
         let config = fn_config();
@@ -14055,7 +14174,10 @@ mod tests {
                 let field = F::ALL[index];
                 match field {
                     F::PleGated => assert_eq!(slot.owner, Some(F::Rotation)),
-                    _ if grouped.contains(&field) && field != F::Projection => {
+                    _ if grouped.contains(&field)
+                        && field != F::Projection
+                        && slot.elements != 0 =>
+                    {
                         assert_eq!(slot.owner, Some(F::Projection), "{field:?} at {rows}");
                     }
                     _ => {
@@ -14063,6 +14185,21 @@ mod tests {
                         assert_eq!(slot.offset, 0, "{field:?} at {rows}");
                     }
                 }
+            }
+            // The kept normed rows are dedicated; a forward wider than them
+            // writes the arena view, which exists only then.
+            assert_eq!(
+                compact[F::PleNormed as usize].elements,
+                rows.min(QWEN4_PLE_NORMED_KEEP_ROWS) * 10_240,
+                "{rows}"
+            );
+            let wide = compact[F::PleNormedWide as usize];
+            if rows > QWEN4_PLE_NORMED_KEEP_ROWS {
+                assert_eq!(wide.owner, Some(F::Projection), "{rows}");
+                assert_eq!(wide.pitch, Some(10_240), "{rows}");
+                assert_eq!(wide.elements, rows * 10_240, "{rows}");
+            } else {
+                assert_eq!(wide.elements, 0, "{rows}");
             }
             for field in [
                 F::Streams,
@@ -14673,7 +14810,11 @@ mod tests {
             super::Qwen4ForwardScratchMode::Full,
         )
         .unwrap();
-        assert!(plan.iter().all(|slot| slot.elements >= 1));
+        // `Full` plans no compact-only `PleNormedWide`.
+        assert!(plan.iter().enumerate().all(|(index, slot)| {
+            slot.elements >= 1
+                || super::ScratchField::ALL[index] == super::ScratchField::PleNormedWide
+        }));
         let ple = config.ple.as_ref().unwrap();
         let embed = ple.head_count * ple.row_width;
         assert_eq!(ple_bytes, rows * embed * 2);
@@ -14719,7 +14860,11 @@ mod tests {
             super::Qwen4GpuForwardScratch::plan(&config, 4, super::Qwen4ForwardScratchMode::Full)
                 .unwrap();
         assert_eq!(ple_bytes, 0);
-        assert!(plan.iter().all(|slot| slot.elements >= 1));
+        // `Full` plans no compact-only `PleNormedWide`.
+        assert!(plan.iter().enumerate().all(|(index, slot)| {
+            slot.elements >= 1
+                || super::ScratchField::ALL[index] == super::ScratchField::PleNormedWide
+        }));
     }
 
     #[test]

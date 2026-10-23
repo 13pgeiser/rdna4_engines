@@ -817,7 +817,22 @@ pub fn forward_census_scope(
             owned(true, slot(rows_of(hidden)?, f32)),       // PleValue (view)
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleQuery (view)
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleGated (view)
-            slot(rows_of(ple_channels)?, f32),              // PleNormed (dedicated)
+            // PleNormed (dedicated): the rows a verify rollback reads after
+            // the forward in the compact plan, every row otherwise.
+            slot(
+                if compact {
+                    mul(
+                        rows.min(crate::gpu_forward::QWEN4_PLE_NORMED_KEEP_ROWS),
+                        ple_channels,
+                    )?
+                } else {
+                    rows_of(ple_channels)?
+                },
+                f32,
+            ),
+            // PleNormedWide: an uncharged arena view in the compact plan,
+            // absent from `Full`.
+            Ok(0),
             owned(true, slot(rows_of(ple_channels)?, f32)), // PleOutput (view)
         ])?
     } else {
@@ -4381,7 +4396,7 @@ mod tests {
         // The pre-arena layout measured 4,141 MiB beyond the weights here
         // (census 4,237 MiB); the phase arena shares the step-local buffers,
         // so the census is that minus the arena's saving.
-        assert_eq!(census.total().unwrap() >> 20, 3984);
+        assert_eq!(census.total().unwrap() >> 20, 3964);
         // For the record: the `Full` 8192-row chunk at 32K with the runtime.
         let full = census_at(
             &config,
@@ -5282,11 +5297,11 @@ mod tests {
         let forward = |rows, mode| {
             crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode).unwrap()
         };
-        // The 8192-row chunk's compact plan is 5982.59375 MiB smaller, and the
+        // The 8192-row chunk's compact plan is 6144.59375 MiB smaller, and the
         // whole of it reaches the reserve: the historical baseline stays on
         // the Full layout, so the saving is not subtracted from both sides.
         let saving = forward(8192, Full) - forward(8192, FnSymGfx1201);
-        assert_eq!(saving, 5982 * (1 << 20) + 622_592);
+        assert_eq!(saving, 6144 * (1 << 20) + 622_592);
         assert_eq!(reserve(8192, Full) - reserve(8192, FnSymGfx1201), saving);
         // The same holds at every chunk, including the measured layout's own
         // 1536 rows.

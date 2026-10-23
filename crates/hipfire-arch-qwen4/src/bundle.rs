@@ -2654,14 +2654,15 @@ impl Qwen4Bundle {
         tokens: &[u32],
     ) -> Result<(), BundleError> {
         let ple_normed = {
-            let tensor = &self
+            let tensor = self
                 .execution
                 .as_ref()
                 .ok_or_else(|| {
                     BundleError::Forward("Qwen4 forward resources are not attached".to_string())
                 })?
                 .scratch
-                .ple_normed;
+                .ple_normed_for_rollback()
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
             tensor.sub_offset(0, tensor.numel())
         };
         self.rollback_verify_rows_retain_with(gpu, snapshot, keep, tokens, &ple_normed)
@@ -2707,14 +2708,15 @@ impl Qwen4Bundle {
             .hc_count
             .checked_mul(self.config.hidden_size)
             .ok_or_else(|| BundleError::Forward("PLE row width overflow".to_string()))?;
-        let tensor = &self
+        let tensor = self
             .execution
             .as_ref()
             .ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
             })?
             .scratch
-            .ple_normed;
+            .ple_normed_for_rollback()
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
         let offset = row
             .checked_mul(width)
             .ok_or_else(|| BundleError::Forward("PLE row offset overflow".to_string()))?;
