@@ -1609,6 +1609,12 @@ struct Model {
     G4Linear   ln_ple_proj{};
     rad_buf    b_ple = 0, b_ple_tok = 0, b_pg = 0;
     rad_op     op_ple_tok = 0, op_ple_norm = 0, op_ple_add = 0;
+    /* An image's placeholder positions take the token-identity row of pad_token_id, as the
+     * reference looks them up (Gemma4Model.forward: llm_input_ids = pad where multimodal): that row
+     * times sqrt(n_ple), made as fill(sqrt(n_ple)) * the row, scattered over the image rows. */
+    rad_weight w_ple_pad = 0;
+    rad_buf    b_ple_pad = 0;
+    rad_op     op_ple_pfill = 0, op_ple_pmul = 0, op_ple_pscat = 0;
 
     std::vector<Layer> layers;
 
@@ -2116,6 +2122,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           RAD_NOWEIGHTS),
                          {m.b_ple, m.b_ple_tok}, {m.b_ple});
         if (!m.op_ple_tok || !m.op_ple_norm || !m.op_ple_add) return RAD_E_INVAL;
+        if (m.op_mm) {
+            const int pad = (int)meta_text_geti(meta, "pad_token_id", 0);
+            RAD_ARCH_TRY(map_slice(b, nm.f("ple_pad_row.weight"),
+                                   nm.ckpt("model.language_model.embed_tokens_per_layer.weight"), pad));
+            m.w_ple_pad = decl_w(b, nm.f("ple_pad_row.weight"), RAD_BF16, {P}, RAD_ACCESS_PER_TOKEN,
+                                 RAD_SHARD_NONE, grp_model());
+            m.b_ple_pad = decl_b(b, nm.f("ple_pad"), g.act_dtype, {g.max_tok, P});
+            if (!m.w_ple_pad || !m.b_ple_pad) return RAD_E_INVAL;
+            m.op_ple_pfill = rw(b, RAD_OP(b, "fill",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                               RAD_STR("dtype", g.dtype),
+                                               RAD_F64("value", std::sqrt((double)m.n_ple))),
+                                    RAD_NOWEIGHTS),
+                                {}, {m.b_ple_pad});
+            m.op_ple_pmul = rw(b, RAD_OP(b, "mul_weight",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                              RAD_STR("dtype", g.dtype), RAD_INT("scalar", 0)),
+                                   RAD_WEIGHTS(m.w_ple_pad)),
+                               {m.b_ple_pad}, {m.b_ple_pad});
+            m.op_ple_pscat = rw(b, RAD_OP(b, "scatter_rows",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_NOWEIGHTS),
+                                {m.b_ple_pad, m.b_ple_tok}, {m.b_ple_tok});
+            if (!m.op_ple_pfill || !m.op_ple_pmul || !m.op_ple_pscat) return RAD_E_INVAL;
+        }
     }
 
     /* ---- the layers. */
@@ -2686,6 +2718,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (m.n_ple > 0) {
         RAD_ISSUE(c, m.op_ple_tok, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_ple_tok),
                   brows(m.b_ple_tok, T));
+        if (m.op_ple_pscat && batch->n_mm_rows > 0) {
+            const int64_t nm_rows = batch->n_mm_rows;
+            RAD_ISSUE_N(c, m.op_ple_pfill, nm_rows, brows(m.b_ple_pad, nm_rows));
+            RAD_ISSUE_N(c, m.op_ple_pmul, nm_rows, brows(m.b_ple_pad, nm_rows), RAD_W(m.w_ple_pad),
+                        brows(m.b_ple_pad, nm_rows));
+            RAD_ISSUE_N(c, m.op_ple_pscat, nm_rows, brows(m.b_ple_pad, nm_rows),
+                        praw(batch->mm_rows, RAD_I32, nm_rows), brows(m.b_ple_tok, T));
+        }
         m.ln_ple_proj.step(c, m.b_x, m.b_ple, T);
         /* [T, n_layer * n_ple] read as [T * n_layer, n_ple]: one norm row per (token, layer). */
         RAD_ISSUE_N(c, m.op_ple_norm, T * m.g.n_layer, brows(m.b_ple, T), RAD_W(m.w_ple_norm),
