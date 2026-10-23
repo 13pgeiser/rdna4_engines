@@ -26,14 +26,14 @@
 //!   `out = fma(s, cos, +-RN(s_partner * sin))`, minus for the low half (`v_mul` then `v_fma`,
 //!   exactly `v_mul_f32` + `v_fmac_f32` of the hipcc kernel).
 //!   The accumulators then go through the unchanged F32 store loop.
-use super::{epilogue, spec, Gen, Lds, Raster, Wg, END, EPI};
+use super::{epilogue, spec, Gen, Lds, Raster, Wg, Wv, END, EPI};
 use crate::kernels::common::{bload, lit, op, s, smem, sop, v, vr, SRD_WORD3};
 use crate::{
     insn::{Instruction, MemoryClass},
     reg::{Live, RegRef},
     Builder, RegPlan,
 };
-use peacemaker_author::{ready, retire, retire_cur, Free, LdsRegion};
+use peacemaker_author::{ready, retire, retire_cur, Free, LdsRegion, Published};
 
 /// LDS tag of the epilogue region (staging pass, inverse-RMS plane, RoPE partner exchange).
 pub enum NrRegion {}
@@ -233,32 +233,43 @@ fn fused(
     for p in 0..4u32 {
         let staged = wg.begin_write(region);
         let cond = wave_is(wg, g, 2, "s_cmp_eq_u32", p)?;
-        let staged = wg.skip_unless(cond, &format!(".Lmq6i8_nr_stage{p}"), staged, |w, mut st| {
-            for nb in 0..4usize {
-                for rg in 0..2usize {
-                    for c in 0..2usize {
-                        let imm = nb as u32 * 16 * STAGE_PITCH + rg as u32 * 64 + c as u32 * 16;
-                        st = w.ds_store(st, ds_store_b128(WR, acc(g, nb, rg, c), imm))?;
+        let staged = wg.skip_unless(
+            cond,
+            &format!(".Lmq6i8_nr_stage{p}"),
+            staged,
+            |w, mut st| {
+                for nb in 0..4usize {
+                    for rg in 0..2usize {
+                        for c in 0..2usize {
+                            let imm = nb as u32 * 16 * STAGE_PITCH + rg as u32 * 64 + c as u32 * 16;
+                            st = w.ds_store(st, ds_store_b128(WR, acc(g, nb, rg, c), imm))?;
+                        }
                     }
                 }
-            }
-            Ok(st)
-        })?;
+                Ok(st)
+            },
+        )?;
         let drained = wg.wait(staged.1)?;
         let (published,) = wg.barrier((ready(staged.0, drained),))?;
         let cond = wave_is(wg, g, 0, "s_cmp_lt_u32", 4)?;
         wg.skip_unless(cond, &format!(".Lmq6i8_nr_chain{p}"), (), |w, ()| {
-            for i in 0..16u8 {
-                w.ds_load(&published, ds_load_b128(POOL + 4 * i, RD, 16 * u32::from(i)))?;
-            }
-            let b = w.isa();
-            for x in POOL..POOL + 64 {
-                vop(
-                    b,
-                    format!("v_fmac_f32_e32 v{SUM}, v{x}, v{x}"),
-                    &[SUM],
-                    &[v(SUM), v(x)],
-                )?;
+            // Four batches of four b128 loads through two 16-register halves of the pool: batch
+            // `k + 2` is issued once batch `k` has been consumed.
+            chain_loads(w, &published, 0)?;
+            chain_loads(w, &published, 1)?;
+            for k in 0..4usize {
+                let b = w.isa();
+                for x in POOL + 16 * (k % 2) as u8..POOL + 16 * (k % 2) as u8 + 16 {
+                    vop(
+                        b,
+                        format!("v_fmac_f32_e32 v{SUM}, v{x}, v{x}"),
+                        &[SUM],
+                        &[v(SUM), v(x)],
+                    )?;
+                }
+                if k + 2 < 4 {
+                    chain_loads(w, &published, k + 2)?;
+                }
             }
             Ok(())
         })?;
@@ -299,6 +310,7 @@ fn fused(
     let (freed,) = wg.barrier((retire(published),))?;
     region = freed;
 
+    expand_weights(wg.isa())?;
     // s = (1 + w) * (x * inv).
     {
         let b = wg.isa();
@@ -342,11 +354,10 @@ fn fused(
     let cond = wave_is(wg, g, 0, "s_cmp_lt_u32", 4)?;
     wg.skip_unless(cond, ".Lmq6i8_nr_rope", (), |w, ()| {
         let rsrd = g.srd_a[0];
-        table_loads(w.isa(), 0, 0, rsrd)?;
         for nb in 0..4usize {
-            let cs = POOL + 32 * (nb % 2) as u8;
+            let cs = POOL + 32 * ((nb + 1) % 2) as u8;
             if nb + 1 < 4 {
-                table_loads(w.isa(), nb + 1, 32 * ((nb + 1) % 2) as u8, rsrd)?;
+                table_loads(w.isa(), nb + 1, 32 * (nb % 2) as u8, rsrd)?;
             }
             for rg in 0..2usize {
                 for c in 0..2usize {
@@ -432,12 +443,7 @@ fn prelude(b: &mut Builder, g: &Gen, e: &epilogue::Epilogue) -> Result<(), Strin
         &[],
     )?;
     // RoPE table: this tile's first token row on, `(N - bs) * 256` records (tokens past N read 0).
-    sop(
-        b,
-        format!("s_lshl_b32 s{t0}, s{}, 8", g.bs),
-        &[t0],
-        &[g.bs],
-    )?;
+    sop(b, format!("s_lshl_b32 s{t0}, s{}, 8", g.bs), &[t0], &[g.bs])?;
     sop(
         b,
         format!("s_add_co_u32 s{rd}, s{rd}, s{t0}"),
@@ -597,7 +603,31 @@ fn prelude(b: &mut Builder, g: &Gen, e: &epilogue::Epilogue) -> Result<(), Strin
         &[INVA],
         &[v(tok)],
     )?;
-    // 1 + bf16(w): the low half of a dword is `w << 16`, the high half `w & 0xffff0000`.
+    // The first token block's RoPE table (waves 0..3 consume it; it lands during the chain).
+    table_loads(b, 0, 32, rd)?;
+    Ok(())
+}
+
+/// Batch `k` (four registers' worth: pool offsets `16 * (k % 2) + 4 * j`) of the chain's 16
+/// staged b128 reads of this lane's token row.
+fn chain_loads(
+    w: &mut Wv,
+    published: &LdsRegion<NrRegion, Published>,
+    k: usize,
+) -> Result<(), String> {
+    for j in 0..4usize {
+        let i = 4 * k + j;
+        w.ds_load(
+            published,
+            ds_load_b128(POOL + 16 * (k % 2) as u8 + 4 * j as u8, RD, 16 * i as u32),
+        )?;
+    }
+    Ok(())
+}
+
+/// `1 + bf16(w)` of the lane's 16 rows: the low half of a dword is `w << 16`, the high half
+/// `w & 0xffff0000`.
+fn expand_weights(b: &mut Builder) -> Result<(), String> {
     for rg in 0..2u8 {
         for d in 0..4u8 {
             let raw = RAW + 4 * rg + d;
@@ -615,12 +645,7 @@ fn prelude(b: &mut Builder, g: &Gen, e: &epilogue::Epilogue) -> Result<(), Strin
                 &[v(raw)],
             )?;
             for r in [lo, lo + 1] {
-                vop(
-                    b,
-                    format!("v_add_f32_e32 v{r}, 1.0, v{r}"),
-                    &[r],
-                    &[v(r)],
-                )?;
+                vop(b, format!("v_add_f32_e32 v{r}, 1.0, v{r}"), &[r], &[v(r)])?;
             }
         }
     }

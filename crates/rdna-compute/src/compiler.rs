@@ -3455,7 +3455,10 @@ mod tests {
                     sealed
                         .iter()
                         .copied()
-                        .chain(["hyper_write_bf16x8_gfx1201"])
+                        .chain([
+                            "hyper_write_bf16x8_gfx1201",
+                            "indexed_attention_rope_table_f32"
+                        ])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
             }

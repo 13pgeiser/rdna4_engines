@@ -597,11 +597,7 @@ fn emission_is_deterministic_and_the_module_assembles() {
             [Epi::Set, Epi::SetBf16].map(move |epi| Spec::product(epi).with_tile(tile).symbol())
         })
         .collect();
-    symbols.push(
-        Spec::product(Epi::SetNr)
-            .with_tile(Tile::T256x128)
-            .symbol(),
-    );
+    symbols.push(Spec::product(Epi::SetNr).with_tile(Tile::T256x128).symbol());
     for sym in symbols {
         assert!(
             elf.windows(sym.len()).any(|w| w == sym.as_bytes()),
@@ -632,18 +628,14 @@ fn gfx1201_only() {
 const NORM_BASE: u64 = 0x3000_0000;
 const ROPE_BASE: u64 = 0x3100_0000;
 
-fn nr_reference(
-    raw: &[u8],
-    c: &Case,
-    head_mask: usize,
-    norm: &[u16],
-    table: &[f32],
-) -> Vec<u8> {
+fn nr_reference(raw: &[u8], c: &Case, head_mask: usize, norm: &[u16], table: &[f32]) -> Vec<u8> {
     let m = c.m;
     let mut out = raw.to_vec();
     let at = |t: usize, r: usize| {
         f32::from_bits(u32::from_le_bytes(
-            raw[(t * m + r) * 4..(t * m + r) * 4 + 4].try_into().unwrap(),
+            raw[(t * m + r) * 4..(t * m + r) * 4 + 4]
+                .try_into()
+                .unwrap(),
         ))
     };
     for t in 0..c.n {
@@ -757,7 +749,10 @@ fn run_nr(c: &Case, head_mask: usize, seed: u64) {
     mem.map(
         "rope".into(),
         ROPE_BASE,
-        table.iter().flat_map(|f| f.to_bits().to_le_bytes()).collect(),
+        table
+            .iter()
+            .flat_map(|f| f.to_bits().to_le_bytes())
+            .collect(),
     )
     .unwrap();
     mem.map("y".into(), Y_BASE, vec![SENTINEL; want.len() + 2 * GUARD])
@@ -777,7 +772,10 @@ fn run_nr(c: &Case, head_mask: usize, seed: u64) {
         }
     }
     let y = &mem.regions.iter().find(|r| r.name == "y").unwrap().bytes;
-    assert!(y[..GUARD].iter().all(|&b| b == SENTINEL), "guard before Y clobbered");
+    assert!(
+        y[..GUARD].iter().all(|&b| b == SENTINEL),
+        "guard before Y clobbered"
+    );
     assert!(
         y[GUARD + want.len()..].iter().all(|&b| b == SENTINEL),
         "guard after Y clobbered"
