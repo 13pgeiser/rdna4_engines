@@ -27,12 +27,15 @@
 //!   grouped order (first and last included), so they span experts, tiles, tile positions and the
 //!   ragged last tile.
 //!
-//! The tile width and the `gp` plane are the only entry-level knobs. **Ring depth, wait
-//! placement, K-loop prefetch order and the LDS hand-off are not script- or flag-level**: they are
-//! fixed inside `qwen4_moe_sym::nt` (`kloop` / `compute` / `epilogue`; the chains/prefetch axes of
-//! `R4Spec` are private and experimental). `--rip` is not accepted for this kernel
-//! (`--kernel iu4_gemm` and `mq6_i8_gemm` only); see `release-0.4.3/pm-loop/DESIGN.md`
-//! ("qwen4_moe_sym / down_gp in `.rip`") for the plan.
+//! The tile width and the `gp` plane are the only entry-level flags. **Ring depth, wait placement,
+//! K-loop prefetch order, the per-tile branches of a fold and the LDS hand-off are script-level
+//! (`--rip`)**: `--rip crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rip` runs the committed
+//! twin of every entry above (`gate_up|down` at NT1/NT4/NT8, and `down_gp_nt4|nt8`), composed from
+//! the `moent::*` / `moe1::*` natives of `qwen4_moe_sym::{blocks, nt1_blocks}`; edit the script and
+//! re-run with no rebuild. The twin is byte-identical to `qwen4_moe_sym::emit` /
+//! `emit_down_gp` (`candidate.rip.identical_to_generator`); an edited script that keeps the ABI is
+//! timed against the shipped baseline and reported as `identical_to_baseline: false`. The
+//! chains/prefetch/grouped axes of `R4Spec` stay private Rust experiments (`pm_r4_screen`).
 //!
 //! Correctness requires the candidate to be bitwise equal to the shipped baseline (every NT and
 //! `gp` entry is byte-identical to the others on the same activations) AND to pass the CPU
@@ -1113,7 +1116,7 @@ fn arm_index(arm: Arm) -> usize {
 }
 
 /// One kernel entry: a `qwen4_moe_sym` spec, or (`gp`) the grouped-position twin of
-/// the gfx1201 MQ4 down NT4/NT8 entry (`qwen4_moe_down_gp`), which reads the down A4
+/// the gfx1201 MQ4 down NT4/NT8 entry (`qwen4_moe_sym::emit_down_gp`), which reads the down A4
 /// plane in grouped-position order (record `g * m_total + row`) instead of gathering
 /// `sorted[row]`-indexed flat-slot records. Same 64-byte ABI, grid and output bytes.
 #[derive(Clone, Copy, Debug)]
@@ -1279,7 +1282,7 @@ pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
     new_with_rip(shape, knobs, None)
 }
 
-/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (down NT4/NT8 entries).
+/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry).
 pub fn new_with_rip(
     shape: &str,
     knobs: &mut Knobs,
@@ -2348,11 +2351,20 @@ mod tests {
         assert_eq!(live, p.epochs * p.geo.slots());
     }
 
-    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/qwen4_moe_down_gp.rip");
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/qwen4_moe_sym.rip");
 
     #[test]
-    fn rip_twin_is_identical_to_generator_for_every_down_entry() {
-        for epi in ["down_nt4", "down_nt8", "down_gp_nt4", "down_gp_nt8"] {
+    fn rip_twin_is_identical_to_generator_for_every_entry() {
+        for epi in [
+            "gate_up",
+            "gate_up_nt4",
+            "gate_up_nt8",
+            "down",
+            "down_nt4",
+            "down_nt8",
+            "down_gp_nt4",
+            "down_gp_nt8",
+        ] {
             let e = Entry::parse(epi).unwrap();
             let o = rip_object(e, "twin.rip", TWIN).unwrap();
             assert_eq!(o.launch_symbol, e.symbol(), "{epi}");
@@ -2365,22 +2377,26 @@ mod tests {
     #[test]
     fn rip_reordered_kloop_keeps_the_abi_and_never_claims_identity() {
         let edited = TWIN.replace(
-            "            qdown::advance(wg)?;\n            qdown::load_w(wg, g, 0)?;\n",
-            "            qdown::load_w(wg, g, 0)?;\n            qdown::advance(wg)?;\n",
+            "            moent::advance(wg)?;\n            moent::load_w(wg, g, 0)?;\n",
+            "            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
         );
         assert_ne!(edited, TWIN);
-        let e = Entry::parse("down_gp_nt4").unwrap();
-        if let Ok(o) = rip_object(e, "edited.rip", &edited) {
-            assert_eq!(o.desc["rip"]["identical_to_generator"], false);
+        for epi in ["down_gp_nt4", "gate_up_nt8"] {
+            let e = Entry::parse(epi).unwrap();
+            if let Ok(o) = rip_object(e, "edited.rip", &edited) {
+                assert_eq!(o.desc["rip"]["identical_to_generator"], false, "{epi}");
+            }
         }
     }
 
     #[test]
-    fn rip_is_refused_for_entries_without_a_twin() {
-        for epi in ["gate_up_nt4", "down", "down_nt1"] {
-            let e = Entry::parse(epi).unwrap();
-            assert!(rip_object(e, "twin.rip", TWIN).is_err(), "{epi}");
-        }
+    fn rip_is_refused_for_an_entry_the_script_does_not_declare() {
+        let edited = TWIN.replace("        \"down_gp_nt8\" => Ok((\"down\", 8, true)),\n", "");
+        assert_ne!(edited, TWIN);
+        let e = Entry::parse("down_gp_nt8").unwrap();
+        assert!(rip_object(e, "edited.rip", &edited).is_err());
+        let e = Entry::parse("down_gp_nt4").unwrap();
+        assert!(rip_object(e, "edited.rip", &edited).is_ok());
     }
 
     #[test]

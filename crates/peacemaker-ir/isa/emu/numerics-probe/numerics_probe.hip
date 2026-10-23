@@ -11,7 +11,7 @@
 //
 // Build (CPU only, no GPU launch):  build.sh <gfx1151|gfx1201> [outdir]
 // Run (inside a bounded fabric hold):  numerics_probe <outdir> <suite[,suite...]|all>
-//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv
+//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv maxmin
 // Output per test: <name>.json (schema/meta, mode request + MODE readback) and <name>.out.bin / <name>.in.bin.
 #include <hip/hip_runtime.h>
 #include <cstdarg>
@@ -1031,6 +1031,45 @@ static void suite_scalar_udiv() {
 static void suite_scalar_udiv() {}
 #endif
 
+// ============================================================================================== MAXMIN_NUM / MINMAX_NUM (gfx12)
+// v_maxmin_num_f32 (min_num(max_num(S0,S1),S2)) and v_minmax_num_f32 (max_num(min_num(S0,S1),S2)) over the full Cartesian
+// product of a 48-value f32 set (zeros, denormals, normals, infinities, quiet and signalling NaNs with payloads) cubed.
+// Opt-in suite (`maxmin`).
+#if NP_GFX12
+template <int OP> __global__ void maxmin_k(const uint32_t* in, uint32_t* out, uint32_t n) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  uint32_t a = in[3 * size_t(i)], b = in[3 * size_t(i) + 1], c = in[3 * size_t(i) + 2], d;
+  if constexpr (OP == 0) asm volatile("v_maxmin_num_f32 %0, %1, %2, %3" : "=v"(d) : "v"(a), "v"(b), "v"(c));
+  else asm volatile("v_minmax_num_f32 %0, %1, %2, %3" : "=v"(d) : "v"(a), "v"(b), "v"(c));
+  out[i] = d;
+}
+static void suite_maxmin() {
+  std::vector<uint32_t> vals = F32_S;
+  for (uint32_t x : {0x7fa00000u, 0xffa00001u, 0x7fc00001u, 0xffc12345u, 0x00400000u, 0x80400000u, 0x3f800001u, 0xbf800001u,
+                     0x00000003u, 0x80000003u, 0x7f7ffffeu, 0xff7ffffeu, 0x3f000000u, 0xbf000000u, 0x40a00000u, 0xc0a00000u})
+    vals.push_back(x);
+  std::vector<uint32_t> in;
+  for (uint32_t a : vals) for (uint32_t b : vals) for (uint32_t c : vals) { in.push_back(a); in.push_back(b); in.push_back(c); }
+  uint32_t n = in.size() / 3, padded = (n + 255) / 256 * 256;
+  in.resize(size_t(3) * padded, 0);
+  write_file(OUT + "/maxmin.in.bin", in.data(), size_t(3) * n * 4);
+  record("maxmin.in", fmt("{\"kind\":\"maxmin_inputs\",\"arch\":\"%s\",\"cases\":%u,\"record\":\"u32 s0,s1,s2\"}", ARCH, n));
+  DevBuf<uint32_t> din(in), d0(padded), d1(padded);
+  maxmin_k<0><<<padded / 256, 256>>>(din.p, d0.p, n);
+  maxmin_k<1><<<padded / 256, 256>>>(din.p, d1.p, n);
+  HIP(hipGetLastError());
+  HIP(hipDeviceSynchronize());
+  auto r0 = d0.get(), r1 = d1.get();
+  write_file(OUT + "/maxmin.maxmin.out.bin", r0.data(), size_t(n) * 4);
+  write_file(OUT + "/maxmin.minmax.out.bin", r1.data(), size_t(n) * 4);
+  record("maxmin.maxmin.out", fmt("{\"kind\":\"maxmin_result\",\"arch\":\"%s\",\"op\":\"v_maxmin_num_f32\",\"cases\":%u,\"inputs\":\"maxmin.in\"}", ARCH, n));
+  record("maxmin.minmax.out", fmt("{\"kind\":\"maxmin_result\",\"arch\":\"%s\",\"op\":\"v_minmax_num_f32\",\"cases\":%u,\"inputs\":\"maxmin.in\"}", ARCH, n));
+}
+#else
+static void suite_maxmin() {}
+#endif
+
 // ============================================================================================== identity + main
 static void suite_identity() {
   int cnt = 0;
@@ -1065,6 +1104,7 @@ int main(int argc, char** argv) {
   auto exact = [&](const char* s) { return suites.find(std::string(",") + s + ",") != std::string::npos; };
   if (exact("div_scale")) suite_div_scale();
   if (exact("scalar_udiv")) suite_scalar_udiv();
+  if (exact("maxmin")) suite_maxmin();
   std::string idx;
   for (auto& n : INDEX) idx += n + "\n";
   write_text(OUT + "/INDEX.txt", idx);

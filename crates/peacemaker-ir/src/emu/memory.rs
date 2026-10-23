@@ -1105,4 +1105,67 @@ mod tests {
             [1, 2, 3, 4]
         );
     }
+
+    // global_store_{b16,b64,b128} with the SGPR-base form `vOFF, v[data], s[base:base+1] offset:N`: exactly the access
+    // size is written at base + vOFF + offset, nothing else, and an unmapped store is a hard error.
+    #[test]
+    fn global_saddr_stores_write_exactly_their_size() {
+        let mut st = state();
+        st.s[8] = 0x1000;
+        st.s[9] = 0;
+        st.v[2][0] = 4;
+        for (n, w) in [0x0403_0201u32, 0x0807_0605, 0x0c0b_0a09, 0x100f_0e0d]
+            .into_iter()
+            .enumerate()
+        {
+            st.v[4 + n][0] = w;
+        }
+        let mut mem = Memory::default();
+        mem.map("m".into(), 0x1000, vec![0xee; 64]).unwrap();
+        let run = |st: &mut State, mem: &mut Memory, name: &str, src: Operand, imm: u16| {
+            let mut ops = vec![reg(Kind::V, 2, 1), src, reg(Kind::S, 8, 2)];
+            if imm != 0 {
+                ops.push(Operand::Imm(ImmField::VmemOffset(imm.into())));
+            }
+            execute(name, &insn(name, ops), st, mem, &mut [])
+        };
+        run(
+            &mut st,
+            &mut mem,
+            "global_store_b128",
+            reg(Kind::V, 4, 4),
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            mem.read(0x1000 + 20, 16).unwrap(),
+            (1..=16u8).collect::<Vec<_>>()
+        );
+        run(&mut st, &mut mem, "global_store_b64", reg(Kind::V, 4, 2), 0).unwrap();
+        assert_eq!(mem.read(0x1004, 8).unwrap(), (1..=8u8).collect::<Vec<_>>());
+        run(
+            &mut st,
+            &mut mem,
+            "global_store_b16",
+            reg(Kind::V, 7, 1),
+            40,
+        )
+        .unwrap();
+        assert_eq!(mem.read(0x1000 + 44, 4).unwrap(), [0x0d, 0x0e, 0xee, 0xee]);
+        let written: usize = mem.regions[0].written.count();
+        assert_eq!(
+            written,
+            16 + 8 + 2,
+            "only the stored bytes are marked written"
+        );
+        st.v[2][0] = 0x2000;
+        assert!(run(
+            &mut st,
+            &mut mem,
+            "global_store_b128",
+            reg(Kind::V, 4, 4),
+            0
+        )
+        .is_err());
+    }
 }

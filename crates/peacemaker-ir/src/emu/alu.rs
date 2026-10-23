@@ -849,6 +849,7 @@ fn vector(
         ),
         "v_add_lshl_u32" => (Class::Int, raw(0)?.wrapping_add(raw(1)?) << (raw(2)? & 31)),
         "v_lshl_or_b32" => (Class::Int, (raw(0)? << (raw(1)? & 31)) | raw(2)?),
+        "v_and_or_b32" => (Class::Int, (raw(0)? & raw(1)?) | raw(2)?),
         "v_mul_lo_u32" => (Class::Int, raw(0)?.wrapping_mul(raw(1)?)),
         "v_mul_hi_u32" => (
             Class::Int,
@@ -1044,6 +1045,22 @@ fn vector(
             Class::F32,
             num_select(num_select(f(0)?, f(1)?, false), f(2)?, false),
         ),
+        // gfx12 three-operand min/max (RDNA4 ISA): `v_maxmin_num_f32 = min_num(max_num(S0, S1), S2)`, hardware-compared
+        // with that composition over every triple of a 48-value set including zeros, denormals, infinities and
+        // quiet/signalling NaNs (receipt `gfx1201-maxmin-r1`; its `v_minmax_num_f32` twin was measured the same way but
+        // has no decode-table row). Source modifiers, omod and clamp are not measured for this opcode.
+        "v_maxmin_num_f32" => {
+            if arch != Arch::Gfx1201 {
+                return Err(format!("{name} is measured on gfx1201 only, not {arch:?}"));
+            }
+            if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.clamp {
+                return Err(format!("{name}: neg/abs/omod/clamp are not measured"));
+            }
+            (
+                Class::Own,
+                num_select(num_select(f(0)?, f(1)?, true), f(2)?, false),
+            )
+        }
         "v_div_fmas_f32" => {
             let vcc = s.vcc & (1 << lane) != 0;
             if vcc && !edge_qualified(arch) {
@@ -5588,6 +5605,128 @@ mod tests {
             0,
             "scalar udiv mismatches over {} denominators",
             rec.len() / 4
+        );
+    }
+
+    /// Receipt replay (opt-in), `PM_MAXMIN_RECEIPT_DIR=<rcpt>/gfx1201-maxmin-r1`: every triple of the 48-value set through
+    /// `v_maxmin_num_f32`.
+    #[test]
+    #[ignore]
+    fn maxmin_receipt_replay() {
+        let dir = std::env::var("PM_MAXMIN_RECEIPT_DIR").expect("PM_MAXMIN_RECEIPT_DIR");
+        let words = |name: &str| -> Vec<u32> {
+            std::fs::read(format!("{dir}/{name}"))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let ins = words("maxmin.in.bin");
+        for (name, hw) in [("v_maxmin_num_f32", words("maxmin.maxmin.out.bin"))] {
+            let mut bad = 0usize;
+            for (t, &h) in ins.chunks_exact(3).zip(&hw) {
+                let got = lane_on(Arch::Gfx1201, name, t, 0, |_| {});
+                if got != Ok(h) {
+                    bad += 1;
+                    if bad <= 8 {
+                        eprintln!("{name} {t:x?}: model {got:x?}, hardware {h:#x}");
+                    }
+                }
+            }
+            assert_eq!(bad, 0, "{name} mismatches over {} triples", hw.len());
+        }
+    }
+
+    // The ops the production producers emit that the sweeps did not name: v_and_or_b32, the gfx12 three-operand min/max
+    // (clamp use `v_maxmin_num_f32 x, lo, hi`), the `|a|, |b|` abs-max and the VOPC `_e32` compare against a literal.
+    #[test]
+    fn producer_ops_and_or_maxmin_abs_max_and_e32_compare() {
+        let arch = Arch::Gfx1201;
+        let f = f32::to_bits;
+        assert_eq!(
+            lane_on(
+                arch,
+                "v_and_or_b32",
+                &[0xf0f0_ffff, 0x0000_f000, 0x0000_000f],
+                0,
+                |_| {}
+            ),
+            Ok(0x0000_f00f)
+        );
+        // clamp(x, lo, hi) = min(max(x, lo), hi)
+        let clamp = |x: u32| lane_on(arch, "v_maxmin_num_f32", &[x, f(-8.0), f(7.0)], 0, |_| {});
+        assert_eq!(clamp(f(5.0)), Ok(f(5.0)));
+        assert_eq!(clamp(f(-100.0)), Ok(f(-8.0)));
+        assert_eq!(clamp(f(100.0)), Ok(f(7.0)));
+        assert_eq!(
+            clamp(0x7fc0_0000),
+            Ok(f(-8.0)),
+            "a NaN loses to the number: max_num(NaN, lo) = lo"
+        );
+        // No source modifier, omod or clamp is measured.
+        assert!(lane_on(
+            arch,
+            "v_maxmin_num_f32",
+            &[f(1.0), f(2.0), f(3.0)],
+            0,
+            |i| i.mods.abs = 1
+        )
+        .is_err());
+        assert!(lane_on(
+            arch,
+            "v_maxmin_num_f32",
+            &[f(1.0), f(2.0), f(3.0)],
+            0,
+            |i| i.mods.clamp = true
+        )
+        .is_err());
+        // `v_max_num_f32_e64 |a|, |b|`
+        assert_eq!(
+            lane_on(arch, "v_max_num_f32_e64", &[f(-2.0), f(1.0)], 0, |i| i
+                .mods
+                .abs =
+                0b11),
+            Ok(f(2.0))
+        );
+        assert_eq!(
+            lane_on(arch, "v_max_num_f32_e64", &[f(-0.5), f(-4.0)], 0, |i| i
+                .mods
+                .abs =
+                0b11),
+            Ok(f(4.0))
+        );
+        // v_cmp_gt_f32_e32 vcc_lo, 0x800000, vN: smallest normal > x (true for denormals and zero, false otherwise).
+        let i = insn_on(
+            arch,
+            "v_cmp_gt_f32_e32",
+            vec![
+                Operand::Special(Special::VccLo),
+                Operand::Literal(0x0080_0000),
+                v(1),
+            ],
+        );
+        let mut st = state();
+        st.exec = 0xff;
+        for (lane, x) in [
+            0u32,
+            1,
+            0x007f_ffff,
+            0x0080_0000,
+            0x0080_0001,
+            f(1.0),
+            0x7fc0_0000,
+            0x8000_0001,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            st.v[1][lane] = x;
+        }
+        st.vcc = u32::MAX;
+        execute(arch, "v_cmp_gt_f32_e32", &i, &mut st).unwrap();
+        assert_eq!(
+            st.vcc, 0b1000_0111,
+            "lanes 0,1,2 and the negative denormal 7; inactive lanes clear"
         );
     }
 }
