@@ -40,6 +40,7 @@
 #include <cstdlib>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -59,6 +60,16 @@
 #endif
 
 namespace {
+
+/* Phase timers for one rank's gather, when RAD_PLE_TIMING is set: accumulated on the issuing
+ * thread and printed by avx::row_gather. The ahead-reader thread accumulates and never prints. */
+struct PleTiming {
+    bool     on      = std::getenv("RAD_PLE_TIMING") != nullptr;
+    double   find_ms = 0, pub_ms = 0, read_ms = 0, wait_ms = 0, dec_ms = 0, again_ms = 0;
+    uint64_t enters = 0, bytes = 0;
+    size_t   spans = 0, hits = 0, claimed = 0, none = 0, theirs = 0;
+};
+thread_local PleTiming t_ple;
 
 /* Prefetch distance, in rows, for cache lookups and decodes. Rows are scattered over an 80 MiB
  * cache and the set words over 4 MiB, so each is an L3 or DRAM miss. */
@@ -281,7 +292,12 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
  * committed only as slots fill. */
 struct RowCache {
     static constexpr int      kWays = 8;
-    static constexpr uint64_t kRows = 1ull << 19;
+    /* Slot count, overridable with RAD_PLE_CACHE_ROWS (rows, clamped to [2^16, 2^25]). Data cost
+     * is `rows` * row bytes (160 at E4M3), so the shipped 2^19 rows is 80 MiB. The table's row
+     * popularity is Zipfian: a larger cache holds a longer hot head of the distribution and
+     * trades RAM directly for a lower miss rate on repeated traffic. Size it from measurement,
+     * not the model -- RAD_PLE_TIMING prints the per-call hit counts the sweep reads. */
+    static const uint64_t     kRows;
     enum : uint64_t { EMPTY = 0, LOADING = 1, READY = 2 };
 
     const TableFile*       tf       = nullptr;
@@ -361,6 +377,21 @@ T* anon_array(size_t count) {
 }
 
 /* The cache for `n`-byte rows of `tf`, created on first use and kept for the process lifetime. */
+/* Defined out of line so the environment is read once, at first use. */
+const uint64_t RowCache::kRows = [] {
+    unsigned long long v = 1ull << 19;
+    if (const char* s = std::getenv("RAD_PLE_CACHE_ROWS")) {
+        char* end        = nullptr;
+        const long long n = std::strtoll(s, &end, 10);
+        if (end != s && n > 0) v = (uint64_t)n;
+    }
+    if (v < 1ull << 16) v = 1ull << 16;
+    if (v > 1ull << 25) v = 1ull << 25;
+    /* Whole sets: the set index is `mix(key) & set_mask` over kWays-way sets. */
+    v -= v % kWays;
+    return v;
+}();
+
 RowCache* row_cache(const TableFile* tf, long long n) {
     static std::mutex mu;
     static std::vector<std::unique_ptr<RowCache>> caches;
@@ -470,6 +501,16 @@ struct ReadRing {
      * one span per `stride` bytes, submitting and waiting in one call. Short reads fail. */
     int read_spans(const TableFile& tf, const SpanRead* r, unsigned count, long long n,
                    long long stride, uint8_t* bounce) {
+        if (!t_ple.on) return read_spans_now(tf, r, count, n, stride, bounce);
+        const auto t0 = std::chrono::steady_clock::now();
+        const int  s  = read_spans_now(tf, r, count, n, stride, bounce);
+        t_ple.read_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        t_ple.spans += count;
+        return s;
+    }
+    int read_spans_now(const TableFile& tf, const SpanRead* r, unsigned count, long long n,
+                       long long stride, uint8_t* bounce) {
         const long long A = tf.align;
         unsigned tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
         for (unsigned i = 0; i < count; ++i) {
@@ -486,6 +527,7 @@ struct ReadRing {
             s->user_data = (uint64_t)(e - a);
             sq_array[idx] = idx;
             ++tail;
+            t_ple.bytes += (uint64_t)(e - a);
         }
         __atomic_store_n(sq_tail, tail, __ATOMIC_RELEASE);
         int status = RAD_OK;
@@ -493,6 +535,7 @@ struct ReadRing {
         while (got < count) {
             const long rc = syscall(__NR_io_uring_enter, fd, to_submit, count - got,
                                     IORING_ENTER_GETEVENTS, nullptr, (size_t)0);
+            ++t_ple.enters;
             if (rc < 0 && errno != EINTR && errno != EAGAIN && errno != EBUSY) return RAD_E_IO;
             if (rc > 0) to_submit -= (unsigned)rc < to_submit ? (unsigned)rc : to_submit;
             unsigned h = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
@@ -620,6 +663,7 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     g.waits.clear();
     g.again.clear();
 
+    const auto tf0 = std::chrono::steady_clock::now();
     for (long long j = 0; j < M; ++j) {
         if (j + kPrefetchRows < M) {
             const long long mp = at(j + kPrefetchRows);
@@ -632,17 +676,27 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         const RowCache::Found f = rc.find_or_claim(key, me, &s);
         g.slot[m] = s;
         g.kind[m] = (uint8_t)f;
+        if (f == RowCache::HIT)          ++t_ple.hits;
+        else if (f == RowCache::CLAIMED) ++t_ple.claimed;
+        else if (f == RowCache::NONE)    ++t_ple.none;
+        else if (f == RowCache::THEIRS)  ++t_ple.theirs;
         if (f == RowCache::CLAIMED)     g.reads.push_back({m, key, s});
         else if (f == RowCache::NONE) { g.reads.push_back({m, key, -1}); g.kind[m] = Gather::DONE; }
         else if (f == RowCache::THEIRS) g.waits.push_back(m);
     }
+    t_ple.find_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf0).count();
 
+    const auto tp0 = std::chrono::steady_clock::now();
     int rs = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    t_ple.pub_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
     if (rs != RAD_OK) return rs;
 
     /* Wait for rows other threads claimed to turn READY. `published` is read before the words, so
      * a batch landing after the scan makes the wait return at once. Released claims (failed reads)
      * and reused slots are read by this thread instead. */
+    const auto tw0 = std::chrono::steady_clock::now();
     while (!g.waits.empty()) {
         const uint32_t e = rc.published.load(std::memory_order_acquire);
         size_t keep = 0;
@@ -657,9 +711,12 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         g.waits.resize(keep);
         if (keep) rc.published.wait(e, std::memory_order_acquire);
     }
+    t_ple.wait_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
 
     /* Decode all READY rows in one batch: each word is read before the bytes and again after the
      * batch (the seqlock), and rows whose word changed are read again. */
+    const auto td0 = std::chrono::steady_clock::now();
     g.src.clear();
     g.dst.clear();
     g.dm.clear();
@@ -682,21 +739,34 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     for (size_t i = 0; i < g.dm.size(); ++i)
         if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
             g.again.push_back(g.dm[i]);
+    t_ple.dec_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
 
     if (g.again.empty()) return RAD_OK;
+    const auto ta0 = std::chrono::steady_clock::now();
     g.reads.clear();
     for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
-    return read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    const int ra = read_and_publish(tf, rc, rr, g, g.reads, n, ne, decode, lut, q.out, x_ld);
+    t_ple.again_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta0).count();
+    return ra;
 }
 
 /* ============================== the reader that runs a step ahead ==============================
  *
  * A prefill chunk gathers `heads` rows per token (32,768 for a 2048-token chunk); on unseen text
  * most are file reads (~30 ms per chunk on NVMe), during which the issuing thread waits and the card
- * idles. The next chunk's ids are known a step early (RadBatch::n_ahead, ngram_ids' `ahead_ids`), so
+ * idles. The next chunks' ids are known a step early (RadBatch::n_ahead, ngram_ids' `ahead_ids`), so
  * the call hands them to one process-wide reader thread, which claims, reads and publishes the
  * missing rows while the chunk runs. The next call waits for LOADING rows as it would for the other
  * rank's.
+ *
+ * The queue is handed over sliced: each job carries at most `kJobRows` keys, claimed and published
+ * one job at a time, in order. Claims are promises the consumer waits on (a slot LOADING for a row
+ * it needs blocks the gather on the reader's progress), so a job must stay small: bounded claims
+ * keep the promise horizon near, and a consumer that outruns the reader finds unclaimed rows it
+ * can read itself instead of waiting behind the whole queue. Jobs keep the list's order, so the
+ * nearest chunk's rows are always the reader's first work.
  *
  * Both ranks hand over the same ids; a repeated list is dropped. A failed read releases its claims
  * and the next call reads those rows itself. The reader is detached and never destroyed. */
@@ -706,6 +776,10 @@ struct AheadJob {
     long long             n  = 0;
     std::vector<uint64_t> keys;
 };
+
+/* One producer job's claim-read-publish sweep: ~2 ring batches, so the promise a job makes to a
+ * consuming gather is paid in well under a second on any disk that can stream the table. */
+constexpr size_t kJobRows = 8192;
 
 struct AheadReader {
     std::mutex              mu;
@@ -726,6 +800,8 @@ struct AheadReader {
                 q.pop_front();
             }
             if (!rr || !me) continue;
+            const auto t0 = t_ple.on ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point();
             g.reads.clear();
             for (size_t i = 0; i < j.keys.size(); ++i) {
                 if (i + kPrefetchRows < j.keys.size())
@@ -737,6 +813,12 @@ struct AheadReader {
             /* Every read has a slot, so nothing is decoded and there is no output. */
             (void)read_and_publish(*j.tf, *j.rc, *rr, g, g.reads, j.n, 0, nullptr, nullptr,
                                    nullptr, 0);
+            if (t_ple.on) {
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "ple[reader] keys %zu reads %zu %.1fms\n", j.keys.size(),
+                             g.reads.size(), ms);
+            }
         }
     }
 };
@@ -750,7 +832,9 @@ AheadReader* ahead_reader() {
     return r;
 }
 
-/* Hands the rows of `q.ahead` (to be gathered by a later call) to the reader. */
+/* Hands the rows of `q.ahead` (to be gathered by later calls) to the reader, sliced into
+ * `kJobRows`-key jobs in list order: the reader claims, reads and publishes one job at a time, so
+ * the nearest chunk's rows are its first work and a claim's promise horizon stays short. */
 void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
     uint64_t h = 1469598103934665603ull ^ (uint64_t)(uintptr_t)&rc;
     for (long long m = 0; m < q.n_ahead; ++m) { h ^= (uint32_t)q.ahead[m]; h *= 1099511628211ull; }
@@ -760,17 +844,26 @@ void read_ahead(const TableFile& tf, RowCache& rc, const avx::RowGather& q) {
         if (h == r->last) return;
         r->last = h;
     }
+    const long long base = tf.off + (long long)(q.tab - tf.lo);
     AheadJob j;
     j.tf = &tf;
     j.rc = &rc;
     j.n  = q.row_bytes;
-    const long long base = tf.off + (long long)(q.tab - tf.lo);
-    j.keys.reserve((size_t)q.n_ahead);
+    j.keys.reserve(kJobRows);
     for (long long m = 0; m < q.n_ahead; ++m) {
         const long long id = (long long)q.ahead[m] - q.voff;
-        if (id >= 0 && id < q.n_vocab) j.keys.push_back((uint64_t)(base + id * q.row_bytes));
+        if (id < 0 || id >= q.n_vocab) continue;
+        j.keys.push_back((uint64_t)(base + id * q.row_bytes));
+        if (j.keys.size() == kJobRows) {
+            {
+                std::lock_guard<std::mutex> lk(r->mu);
+                r->q.push_back(j);
+            }
+            r->cv.notify_one();
+            j.keys.clear();
+        }
     }
-    {
+    if (!j.keys.empty()) {
         std::lock_guard<std::mutex> lk(r->mu);
         r->q.push_back(std::move(j));
     }
@@ -806,6 +899,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
     if (!tfile) return ferr;
 #if defined(__linux__)
     if (tfile->fd >= 0) {
+        const auto t0 = std::chrono::steady_clock::now();
         int why = 0;
         ReadRing* rr = read_ring(&why);
         if (!rr) {
@@ -819,6 +913,18 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         const long long first = q.rank > 0 && q.rank < ws ? q.M * q.rank / ws : 0;
         const int rs = gather_rows(*tfile, *rc, *rr, q, first, decode, lut);
         if (rs != RAD_OK) return rs;
+        const double wall =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (t_ple.on)
+            std::fprintf(stderr,
+                         "ple[rank %lld] rows %lld: find %.1fms (hit %zu claimed %zu none %zu "
+                         "theirs %zu) pub %.1fms (ring %.1fms, %llu enters, %zu spans, "
+                         "%.1f MiB) wait %.1fms dec %.1fms again %.1fms | wall %.1fms\n",
+                         (long long)q.rank, (long long)q.M, t_ple.find_ms, t_ple.hits,
+                         t_ple.claimed, t_ple.none, t_ple.theirs, t_ple.pub_ms, t_ple.read_ms,
+                         (unsigned long long)t_ple.enters, t_ple.spans, t_ple.bytes / 1048576.0,
+                         t_ple.wait_ms, t_ple.dec_ms, t_ple.again_ms, wall);
+        t_ple = {};
         /* Queue the rows a later call will gather, after this call's own rows. */
         if (q.ahead && q.n_ahead > 0) read_ahead(*tfile, *rc, q);
         return RAD_OK;
