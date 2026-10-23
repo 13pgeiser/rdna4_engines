@@ -1018,6 +1018,59 @@ fn small_decl() -> Decl {
 }
 
 #[test]
+fn tuple_match_kernel_selectors_check_every_arm_and_fail_closed() {
+    // The dense-GDN v1/v2 selector: neither its scrutinee nor DType::BF16 is
+    // a kernel-name origin. All three returned names still need ABI checks.
+    let source = |last: &str| {
+        let selector = format!(
+            "let entry = match (gpu.flags.enabled(), conv.input.dtype) {{
+                (false, _) => \"base_symbol\",
+                (true, DType::BF16) => \"bf16_symbol\",
+                (true, _) => {last},
+            }};\n"
+        );
+        format!(
+            "fn launch(gpu: &Gpu, sym: &str, args: &mut KernargBlob) {{
+                gpu.launch_kernel_blob(sym, g, bl, 0, args.as_mut_slice()).unwrap();
+            }}
+            fn run(gpu: &Gpu) {{
+                {SMALL_LETS}
+                {selector}
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);
+                launch(gpu, entry, &mut b);
+            }}"
+        )
+    };
+    let names = ["base_symbol", "bf16_symbol", "f32_symbol"];
+    let symbols: Vec<_> = names.iter().map(|n| (*n, small_decl())).collect();
+    let src = source("\"f32_symbol\"");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &src, &symbols, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+    for index in 0..names.len() {
+        let mut bad = symbols.clone();
+        bad[index].1 = Decl::from_scalars(&[(8, 'p'), (4, 'i'), (4, 'f'), (8, 'i'), (4, 'i')]);
+        let (abi, cov) = run_synth_at(PROBE_PATH, &src, &bad, &no_policy());
+        assert!(
+            abi.iter().chain(&cov).any(|p| p.contains(names[index])),
+            "arm {} escaped checking: {abi:?} {cov:?}",
+            names[index]
+        );
+    }
+    // A relevant caller whose selector has no known catalogue targets must still
+    // prove every actual name before the helper can be classified outside scope.
+    let unknown = source("unresolved_entry")
+        .replace("base_symbol", "outside_base")
+        .replace("bf16_symbol", "outside_bf16")
+        .replace("let entry =", "let _ = \"base_symbol\"; let entry =");
+    let (_, cov) = run_synth_at(PROBE_PATH, &unknown, &symbols, &no_policy());
+    assert!(
+        cov.iter().any(|p| p.contains("unresolved_entry")),
+        "unknown arm value must fail closed: {cov:?}"
+    );
+}
+
+#[test]
 fn negative_blob_layout_and_alignment_mistakes_are_rejected() {
     let good = "            b.push_ptr(wp);\n            b.push_i32(nv);\n            b.push_f32(sc);\n            b.push_u64(big);\n";
     let (abi, cov) = run_synth(
