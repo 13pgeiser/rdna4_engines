@@ -77,6 +77,10 @@ namespace rad {
 
 int aql_vmem_device_of(const void* addr, int* dev);
 
+namespace {
+void stamp_hold(hsa_signal_t h, bool on);
+}
+
 namespace aql {
 namespace {
 
@@ -1157,6 +1161,15 @@ struct PlayLeft { uint32_t q = UINT32_MAX; uint64_t wr = 0; };
 constexpr int kPlayLeft = 8;
 thread_local PlayLeft t_left[kPlayLeft];
 
+/* A dispatch played under RADIANCE_AQL_STAMP (see "dispatch timestamps"). `sig` goes in as the
+ * stamp's own signal and comes out as the packet's completion signal, which is a record's or a
+ * ride's where one rides on the dispatch. */
+struct PlayStamp {
+    hsa_signal_t sig{};
+    bool         ordered = false;
+    bool         chained = false;
+};
+
 struct PlayRun {
     const Tape* tape = nullptr;   /* the tape played, for a chained record's argument bytes */
     Stream*  s = nullptr;
@@ -1191,7 +1204,7 @@ struct PlayRun {
     /* `done`, when set, is the packet's completion signal and `rel_min` its minimum release
      * scope, for a record riding on this dispatch (see a_tape_play). */
     int put(const TapeRec& r, uint64_t* out_idx, hsa_signal_t done = hsa_signal_t{0},
-            int rel_min = HSA_FENCE_SCOPE_NONE) {
+            int rel_min = HSA_FENCE_SCOPE_NONE, PlayStamp* stamp = nullptr) {
         if (s != r.s) {
             end();
             s = r.s;
@@ -1216,6 +1229,12 @@ struct PlayRun {
             s->ride.handle = 0;
         }
         if (done.handle) p->completion_signal = done;
+        if (stamp) {
+            /* Before the header: once the packet completes, the signal may return to the pool. */
+            if (done.handle) stamp_hold(done, true);
+            else p->completion_signal = stamp->sig;
+            stamp->sig = p->completion_signal;
+        }
         /* A chained record plays from this queue's own argument slot, where its chain record goes:
          * the tape's copy is shared by every play, and the next step's play may be written while
          * this one runs. */
@@ -1241,6 +1260,10 @@ struct PlayRun {
          * kernel that reads its output and sits behind a chained one (a cache read beside a
          * collective, say) would wait for the chained blocks only. */
         if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
+        if (stamp) {
+            stamp->ordered = ordered;
+            stamp->chained = chain;
+        }
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
@@ -1583,12 +1606,14 @@ struct Sig {
     bool         irq = false;                              /* an interrupt signal */
     hsa_agent_t  agent{};                                  /* where it was recorded */
     std::vector<std::pair<uint32_t, uint64_t>> waiters;    /* queue id, packet index */
+    bool         stamped = false;                          /* its times not read yet (stamp_hold) */
 };
 
 struct SigPool {
     std::mutex        mu;
     std::vector<Sig*> free[2];                             /* by irq */
     std::deque<Sig*>  retiring;                            /* in the order they were retired */
+    std::unordered_map<uint64_t, Sig*> by_handle;
 };
 
 SigPool& pool() {
@@ -1597,7 +1622,7 @@ SigPool& pool() {
 }
 
 bool reusable(const Sig* g) {
-    if (hsa_signal_load_relaxed(g->h) != 0) return false;
+    if (g->stamped || hsa_signal_load_relaxed(g->h) != 0) return false;
     for (const auto& w : g->waiters) {
         hsa_queue_t* q = g_queue_by_id[w.first].load(std::memory_order_acquire);
         if (q && hsa_queue_load_read_index_relaxed(q) <= w.second) return false;
@@ -1646,7 +1671,17 @@ Sig* sig_get(bool irq) {
     const hsa_status_t st = irq ? hsa_signal_create(0, 0, nullptr, &g->h)
                                 : hsa_amd_signal_create(0, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &g->h);
     if (st != HSA_STATUS_SUCCESS || (irq && !interrupts(g->h))) return nullptr;
+    p.by_handle[g->h.handle] = g.get();
     return g.release();
+}
+
+/* A stamp's times live in the signal until a reuse overwrites them, so a record's or a ride's
+ * signal a stamp shares stays out of the free list until they are read. */
+void stamp_hold(hsa_signal_t h, bool on) {
+    SigPool& p = pool();
+    std::lock_guard<std::mutex> lk(p.mu);
+    auto it = p.by_handle.find(h.handle);
+    if (it != p.by_handle.end()) it->second->stamped = on;
 }
 
 void sig_retire(Sig* g) {
@@ -1922,6 +1957,228 @@ int a_tape_set_overlap(RadTape rt, int i, int on) {
     return RAD_OK;
 }
 
+/* ---- dispatch timestamps (RADIANCE_AQL_STAMP)
+ *
+ * RADIANCE_AQL_STAMP=N gives every dispatch of every Nth pass played on card 0 a completion signal,
+ * into which the packet processor writes the dispatch's start and end (profiling is on on every
+ * queue). Nothing else changes: PlayRun::put decides the barrier bit and the chain as without the
+ * signal, so the queues run the pass as unstamped. A pass is the plays of one tape from its record
+ * 0 on: Ctx::play_pass plays a pass in stretches between its host ops, and counting plays would
+ * time stretches rather than passes. A dispatch a record or a ride already rides on is stamped
+ * from that signal, held out of the pool until its times are read (stamp_hold).
+ *
+ * Nothing waits for the card: a later play on card 0 reads the signals that reached 0, in issue
+ * order, and appends a line per dispatch to RADIANCE_AQL_STAMP_OUT (default
+ * /tmp/radiance-stamps-<pid>.csv); exit waits briefly for the rest. */
+constexpr size_t kStampSignals = 8192;
+
+struct StampRow {
+    hsa_signal_t h{};
+    bool     own = false;           /* the stamp's signal, not a record's or a ride's */
+    bool     ordered = false;
+    bool     chained = false;
+    uint32_t queue = 0;
+    int      seq = 0;               /* its record in the tape */
+    uint32_t play = 0;              /* the play of the pass that issued it */
+    uint32_t records = 0;           /* the tape's length, which tells kinds of pass apart */
+    uint64_t pass = 0;
+    uint64_t kernel = 0;
+};
+
+struct Stamps {
+    std::mutex   mu;
+    int          every = 0;
+    std::string  path;
+    FILE*        out = nullptr;
+    bool         out_failed = false;
+    bool         full_told = false;
+    uint64_t     passes = 0;         /* begun on card 0 */
+    const Tape*  tape = nullptr;     /* the pass being stamped, if one is */
+    uint32_t     play = 0;
+    std::vector<hsa_signal_t> free;
+    size_t       made = 0;
+    std::deque<StampRow> rows;       /* issued, times not read yet */
+    std::unordered_map<uint64_t, std::string> names;
+};
+
+void stamps_at_exit();
+
+Stamps& stamps() {
+    static Stamps* st = [] {
+        Stamps* x = new Stamps();
+        const char* n = std::getenv("RADIANCE_AQL_STAMP");
+        x->every = n ? std::max(0, std::atoi(n)) : 0;
+        const char* o = std::getenv("RADIANCE_AQL_STAMP_OUT");
+        x->path = o && *o ? std::string(o) : fmt("/tmp/radiance-stamps-%d.csv", (int)getpid());
+        if (x->every) {
+            RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card 0, "
+                     "into %s", x->every, x->path.c_str());
+            std::atexit(stamps_at_exit);
+        }
+        return x;
+    }();
+    return *st;
+}
+
+bool stamps_file(Stamps& st) {
+    if (st.out) return true;
+    if (st.out_failed) return false;
+    st.out = std::fopen(st.path.c_str(), "a");
+    if (!st.out) {
+        st.out_failed = true;
+        RAD_WARN("device: RADIANCE_AQL_STAMP: %s cannot be opened (%s); the times are dropped",
+                 st.path.c_str(), std::strerror(errno));
+        return false;
+    }
+    std::fseek(st.out, 0, SEEK_END);
+    if (std::ftell(st.out) == 0)
+        std::fputs("pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records\n", st.out);
+    return true;
+}
+
+const std::string& stamps_kernel(Stamps& st, uint64_t obj) {
+    auto it = st.names.find(obj);
+    if (it != st.names.end()) return it->second;
+    std::string n;
+    {
+        std::lock_guard<std::mutex> nl(g_names_mu);
+        auto k = g_names.find(obj);
+        n = k != g_names.end() ? k->second : fmt("%#" PRIx64, obj);
+    }
+    if (n.find_first_of(",\"") != std::string::npos) {
+        std::string q = "\"";
+        for (char c : n) {
+            if (c == '"') q += '"';
+            q += c;
+        }
+        n = q + "\"";
+    }
+    return st.names.emplace(obj, std::move(n)).first->second;
+}
+
+uint64_t stamps_ns(uint64_t t) {
+    return (uint64_t)((unsigned __int128)t * 1000000000u / G().ts_freq);
+}
+
+/* With st.mu held. Rows are read in issue order, so one still running holds back the rows after
+ * it, which a later call reads. */
+void stamps_read(Stamps& st, bool wait) {
+    bool wrote = false;
+    while (!st.rows.empty()) {
+        const StampRow w = st.rows.front();
+        if (hsa_signal_load_scacquire(w.h) != 0 &&
+            (!wait || G().faulted.load(std::memory_order_acquire) ||
+             hsa_signal_wait_scacquire(w.h, HSA_SIGNAL_CONDITION_EQ, 0, G().ts_freq / 10,
+                                       HSA_WAIT_STATE_ACTIVE) != 0))
+            break;
+        hsa_amd_profiling_dispatch_time_t t{};
+        const bool timed = hsa_amd_profiling_get_dispatch_time(G().dev[0].agent, w.h, &t) ==
+                           HSA_STATUS_SUCCESS;
+        if (w.own) st.free.push_back(w.h);
+        else stamp_hold(w.h, false);
+        st.rows.pop_front();
+        if (!stamps_file(st)) continue;
+        std::fprintf(st.out, "%" PRIu64 ",%d,%u,%s,%d,%d,", w.pass, w.seq, w.queue,
+                     stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
+        if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
+        else std::fputc(',', st.out);
+        std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+        wrote = true;
+    }
+    if (wrote) std::fflush(st.out);
+}
+
+void stamps_at_exit() {
+    Stamps& st = stamps();
+    std::lock_guard<std::mutex> lk(st.mu);
+    stamps_read(st, true);
+    if (st.out) std::fclose(st.out);
+    st.out = nullptr;
+    st.out_failed = true;
+}
+
+/* The stamping of one play: a signal for each of its dispatches, taken up front so the play
+ * takes the lock twice rather than once a dispatch. */
+struct StampRun {
+    bool     on = false;
+    uint64_t pass = 0;
+    uint32_t play = 0;
+    uint32_t records = 0;
+    std::vector<hsa_signal_t> sig;
+    size_t   used = 0;
+    std::vector<StampRow> rows;
+
+    void begin(const Tape* t, int from, int to) {
+        Stamps& st = stamps();
+        if (!st.every || from >= to || t->rec[(size_t)from].s->ord != 0) return;
+        std::lock_guard<std::mutex> lk(st.mu);
+        stamps_read(st, false);
+        if (from == 0) {
+            st.tape = ++st.passes % (uint64_t)st.every == 0 ? t : nullptr;
+            st.play = 0;
+        }
+        if (!st.tape || st.tape != t) return;
+        size_t n = 0;
+        for (int i = from; i < to; ++i) n += t->rec[(size_t)i].kind == kTapeDispatch;
+        while (sig.size() < n) {
+            hsa_signal_t h{};
+            if (!st.free.empty()) {
+                h = st.free.back();
+                st.free.pop_back();
+            } else if (st.made < kStampSignals &&
+                       hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &h) ==
+                           HSA_STATUS_SUCCESS) {
+                ++st.made;
+            } else {
+                break;
+            }
+            hsa_signal_silent_store_relaxed(h, 1);
+            sig.push_back(h);
+        }
+        if (sig.size() < n) {
+            st.tape = nullptr;
+            if (!st.full_told) {
+                st.full_told = true;
+                RAD_WARN("device: RADIANCE_AQL_STAMP: %zu signals are in flight, pass %" PRIu64
+                         " and any pass that finds them so are stamped in part", st.made, st.passes);
+            }
+        }
+        on = true;
+        pass = st.passes;
+        play = st.play++;
+        records = (uint32_t)t->rec.size();
+    }
+    PlayStamp* take(PlayStamp& ps) {
+        if (!on || used == sig.size()) return nullptr;
+        ps = PlayStamp{};
+        ps.sig = sig[used++];
+        return &ps;
+    }
+    void drop() { --used; }
+    void note(const TapeRec& r, int seq, const PlayStamp& ps) {
+        StampRow w;
+        w.h = ps.sig;
+        w.own = ps.sig.handle == sig[used - 1].handle;
+        if (!w.own) --used;
+        w.ordered = ps.ordered;
+        w.chained = ps.chained;
+        w.queue = r.s->id;
+        w.seq = seq;
+        w.play = play;
+        w.records = records;
+        w.pass = pass;
+        w.kernel = r.pkt.kernel_object;
+        rows.push_back(w);
+    }
+    void end() {
+        if (sig.empty()) return;
+        Stamps& st = stamps();
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.free.insert(st.free.end(), sig.begin() + (std::ptrdiff_t)used, sig.end());
+        st.rows.insert(st.rows.end(), rows.begin(), rows.end());
+    }
+};
+
 int a_tape_play(RadTape rt, int from, int to) {
     Tape* t = tape_of(rt);
     if (!t || from < 0 || to > (int)t->rec.size() || from > to) {
@@ -1932,6 +2189,8 @@ int a_tape_play(RadTape rt, int from, int to) {
     int rc = RAD_OK;
     PlayRun run;
     run.tape = t;
+    StampRun stamp;
+    stamp.begin(t, from, to);
     for (int i = from; i < to && rc >= 0; ++i) {
         const TapeRec& r = t->rec[(size_t)i];
         if (r.kind == kTapeDispatch) {
@@ -1950,8 +2209,14 @@ int a_tape_play(RadTape rt, int from, int to) {
                 break;
             }
             uint64_t idx = 0;
-            rc = run.put(r, &idx, g ? g->h : hsa_signal_t{0}, rel);
-            if (rc < 0) break;
+            PlayStamp ps;
+            PlayStamp* sp = stamp.take(ps);
+            rc = run.put(r, &idx, g ? g->h : hsa_signal_t{0}, rel, sp);
+            if (rc < 0) {
+                if (sp) stamp.drop();
+                break;
+            }
+            if (sp) stamp.note(r, i, ps);
             bool found = false;
             for (auto& l : t->last)
                 if (l.first == r.s->id) { l.second = idx; found = true; break; }
@@ -1972,6 +2237,7 @@ int a_tape_play(RadTape rt, int from, int to) {
                                    : a_event_wait((RadStream)r.s, r.ev);
     }
     run.end();
+    stamp.end();
     --t_tape_pause;
     return rc;
 }

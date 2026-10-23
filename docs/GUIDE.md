@@ -3489,6 +3489,7 @@ The four slots are what the amdgpu kernel driver leaves to user queues. It keeps
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
+| `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: every dispatch of one recorded pass in N on card 0 gets a completion signal of its own, which carries its start and end; the barrier bits and chains stay as unstamped, unlike `--profile-ops`, which plays no recorded pass. One CSV line a dispatch (pass, record, queue, kernel, whether it waited for the one before, whether it was chained, start and end in ns) is appended to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`) once the card is done with it. AQL backend only |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
