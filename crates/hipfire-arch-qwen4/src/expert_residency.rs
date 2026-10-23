@@ -441,6 +441,8 @@ pub struct ReserveCensus {
     pub state: u64,
     pub forward: u64,
     pub f16_shadows: u64,
+    /// The shared-expert INT8 weight shadows ([`shared_i8_shadow_bytes`]).
+    pub shared_i8_shadows: u64,
     pub workspace: [(&'static str, u64); WORKSPACE_TERM_COUNT],
     pub qsa_selector: u64,
     pub mtp: u64,
@@ -457,6 +459,7 @@ impl ReserveCensus {
             ("state", self.state),
             ("forward", self.forward),
             ("F16 weight shadows", self.f16_shadows),
+            ("INT8 shared-expert shadows", self.shared_i8_shadows),
             ("QSA selector", self.qsa_selector),
             ("native MTP", self.mtp),
             ("QSA gather", self.gather),
@@ -1393,6 +1396,66 @@ pub fn f16_shadow_charge(
 ) -> Result<u64, String> {
     if capable && route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
         f16_shadow_bytes(weights, num_layers)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Device bytes of the shared-expert INT8 shadows (`rdna_compute::shared_i8`) the long-prefill
+/// route builds lazily: for every trunk layer `0..num_layers` whose BF16, rank-2, resident,
+/// non-tied `mlp.shared_expert.{gate,up,down}_proj.weight` triple has the route's shape
+/// (`gate`/`up` `[I, K]`, `down` `[M, I]`), the planes of
+/// [`rdna_compute::shared_i8::shared_i8_shadow_layer_bytes`]. A conservative cold bound, like
+/// [`f16_shadow_bytes`]. Callers gate it with [`shared_i8_charge`].
+pub fn shared_i8_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
+    use rdna_compute::DType;
+    let find = |layer: usize, proj: &str| {
+        let name = format!("model.language_model.layers.{layer}.mlp.shared_expert.{proj}.weight");
+        weights.iter().find(|e| {
+            e.name == name
+                && e.dtype == DType::BF16
+                && e.logical_shape.len() == 2
+                && !e.residency.is_external()
+                && !matches!(e.policy, ShardPolicy::Tied { .. })
+        })
+    };
+    let mut total = 0u64;
+    for layer in 0..num_layers {
+        let (Some(gate), Some(up), Some(down)) = (
+            find(layer, "gate_proj"),
+            find(layer, "up_proj"),
+            find(layer, "down_proj"),
+        ) else {
+            continue;
+        };
+        let (i, k) = (gate.logical_shape[0], gate.logical_shape[1]);
+        if up.logical_shape != gate.logical_shape || down.logical_shape[1] != i {
+            continue;
+        }
+        let Some(bytes) =
+            rdna_compute::shared_i8::shared_i8_shadow_layer_bytes(i, k, down.logical_shape[0])
+        else {
+            continue;
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| format!("shared-expert INT8 shadow bytes of layer {layer} overflow"))?;
+    }
+    Ok(total)
+}
+
+/// The INT8 shadow bytes a load of `weights` charges: [`shared_i8_shadow_bytes`] when the
+/// route can run (`enabled`: [`rdna_compute::Gpu::qwen4_shared_i8_enabled`], i.e. exact gfx1201
+/// and `HIPFIRE_QWEN4_SHARED_INT8` not `0`) and `route_rows` reaches the route's threshold
+/// ([`rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]); 0 otherwise.
+pub fn shared_i8_charge(
+    enabled: bool,
+    route_rows: usize,
+    weights: &[WeightEntry],
+    num_layers: usize,
+) -> Result<u64, String> {
+    if enabled && route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+        shared_i8_shadow_bytes(weights, num_layers)
     } else {
         Ok(0)
     }
@@ -3550,6 +3613,16 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         config.num_hidden_layers,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
+    // The shared-expert INT8 route's pool-allocated shadows (`Gpu::qwen4_shared_i8_shadow`,
+    // built on the first prefill the route takes): the runtime's own enable predicate and the
+    // same route-rows threshold as the F16 route they replace.
+    let shared_i8_shadows = shared_i8_charge(
+        gpu.qwen4_shared_i8_enabled(),
+        f16_shadow_route_rows(&gpu.arch, chunk_rows),
+        weights,
+        config.num_hidden_layers,
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
@@ -3596,6 +3669,7 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         state: state.state,
         forward: state.forward,
         f16_shadows,
+        shared_i8_shadows,
         workspace,
         // The split QSA selector's score/filter scratch (0 unless its route
         // can run).
@@ -4017,6 +4091,7 @@ mod tests {
             state,
             forward,
             f16_shadows,
+            shared_i8_shadows: 0,
             workspace,
             qsa_selector,
             mtp: 0,
@@ -4033,6 +4108,35 @@ mod tests {
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
         }
+    }
+
+    /// The shared-expert INT8 shadows are their own census term: present (48 layers x
+    /// (20 x 1280 + 5 x 2560) blocks of 136 B) when the route is enabled at a route-rows
+    /// threshold chunk, absent with the route off (`HIPFIRE_QWEN4_SHARED_INT8=0`, or a non-gfx1201
+    /// device) or below the threshold, and part of the census total and its log line.
+    #[test]
+    fn shared_i8_shadows_are_a_census_term_only_when_the_route_is_on() {
+        let weights = target_f16_manifest();
+        let per_layer = (20 * 1280 + 5 * 2560) * 136u64;
+        let on = shared_i8_charge(true, 16384, &weights, 48).unwrap();
+        assert_eq!(on, 48 * per_layer);
+        assert_eq!(shared_i8_shadow_bytes(&weights, 48).unwrap(), on);
+        assert_eq!(shared_i8_charge(false, 16384, &weights, 48).unwrap(), 0);
+        assert_eq!(shared_i8_charge(true, 511, &weights, 48).unwrap(), 0);
+        assert!(rdna_compute::shared_i8::shared_i8_route_enabled(
+            true, "gfx1201"
+        ));
+        assert!(!rdna_compute::shared_i8::shared_i8_route_enabled(
+            false, "gfx1201"
+        ));
+        assert!(!rdna_compute::shared_i8::shared_i8_route_enabled(
+            true, "gfx1100"
+        ));
+        let mut census = census_with(1, 2, 3, 4, 5);
+        let base = census.total().unwrap();
+        census.shared_i8_shadows = on;
+        assert_eq!(census.total().unwrap(), base + on);
+        assert!(census.describe().contains("INT8 shared-expert shadows"));
     }
 
     /// The 48-layer target's F16-shadowed owners (BF16, rank 2): the final
@@ -4110,6 +4214,7 @@ mod tests {
             state: state.state,
             forward: state.forward,
             f16_shadows,
+            shared_i8_shadows: 0,
             workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap(),
             qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_capacity_bytes() as u64,
             mtp: 0,
@@ -4492,6 +4597,7 @@ mod tests {
             state: state.state,
             forward: state.forward,
             f16_shadows: 0,
+            shared_i8_shadows: 0,
             workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap(),
             qsa_selector: 0,
             mtp: 0,
@@ -4864,6 +4970,7 @@ mod tests {
                 state: state.state,
                 forward: state.forward,
                 f16_shadows,
+                shared_i8_shadows: 0,
                 workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims)
                     .unwrap(),
                 qsa_selector: 0,
