@@ -190,6 +190,17 @@ protected:
     }
 };
 
+// MiniCPM-OCR 1.0: find_best_resize aligns to patch_size * n_merge (28 in 4x).
+struct mtmd_image_preprocessor_minicpm_ocr_1_0 : mtmd_image_preprocessor_minicpmv {
+    using mtmd_image_preprocessor_minicpmv::mtmd_image_preprocessor_minicpmv;
+
+protected:
+    int get_slice_align() const override {
+        const int merge = hparams.n_merge > 0 ? hparams.n_merge : 2;
+        return hparams.patch_size * merge;
+    }
+};
+
 // custom llava-uhd slicing logic for LFM2
 // tiling params (min/max tiles, tile size, pixels tolerance) come from hparams
 // ref: https://github.com/huggingface/transformers/blob/v5.1.0/src/transformers/models/lfm2_vl/image_processing_lfm2_vl_fast.py
@@ -199,14 +210,16 @@ struct mtmd_image_preprocessor_lfm2 : mtmd_image_preprocessor_llava_uhd {
     slice_instructions get_slice_instructions(const clip_image_size & original_size) const override;
 
     static bool should_tile(const clip_hparams & hparams, const clip_image_size & original_size);
+    static clip_image_size smart_resize(const clip_hparams & hparams, const clip_image_size & original_size);
+    static clip_image_size get_grid_layout(const clip_hparams & hparams, int height, int width);
 
 private:
-    clip_image_size find_closest_aspect_ratio(
-            float aspect_ratio,
+    static clip_image_size find_closest_aspect_ratio(
+            const clip_hparams & hparams,
+            double aspect_ratio,
             const std::vector<clip_image_size> & target_ratios,
-            int width, int height) const;
-    std::vector<clip_image_size> get_target_ratios() const;
-    clip_image_size get_grid_layout(int height, int width) const;
+            int width, int height);
+    static std::vector<clip_image_size> get_target_ratios(const clip_hparams & hparams);
 };
 
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
