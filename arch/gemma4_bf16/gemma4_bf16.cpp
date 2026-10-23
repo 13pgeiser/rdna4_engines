@@ -265,6 +265,11 @@ struct Gemma4Attn {
     ClassGeom cls{};
     int         layer = 0;
     rad_kvgroup kv    = 0;
+    /* KV sharing (num_kv_shared_layers, Gemma 4 E2B/E4B): a shared layer has no k or v of its own
+     * and attends over the cache of `kv_layer`, the last earlier layer of its class that keeps
+     * one. A layer with its own cache has kv_layer == layer. */
+    bool        shared   = false;
+    int         kv_layer = 0;
 
     rad_weight w_norm = 0, w_qn = 0, w_kn = 0, w_post = 0;   /* the norms (always bf16) */
     G4Linear   ln_q{}, ln_k{}, ln_v{}, ln_o{};              /* the GEMM weights (bf16 or w4a8) */
@@ -297,12 +302,16 @@ struct Gemma4Attn {
     /* The linear whose int8 pair a junction writes, and whether every projection reads it. */
     const G4Linear& ln_in() const { return fused ? ln_qkv : ln_q; }
     bool reads_pair() const {
+        if (shared) return ln_q.quant;
         return fused ? ln_qkv.quant
                      : ln_q.quant && ln_k.shared_in && (!cls.has_v || ln_v.shared_in);
     }
 
+    /* `kv_src` < 0: the layer keeps its own cache; else the layer whose cache it reads. */
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
-                 rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot);
+                 rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot,
+                 int kv_src = -1);
+    int  declare_shared(RadBuilder* b, Names& nm, const char* pre);
     /* `entry_done`: a junction op already wrote this block's quantised input (ln_q's pair).
      * `tail_fused`: the caller issues the post-norm and the add as a junction op. */
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
@@ -323,8 +332,12 @@ struct Gemma4Attn {
 };
 
 int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
-                        rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot) {
+                        rad_kvgroup group, const Wire& wire, const char* pre, rad_buf* qkv_slot,
+                        int kv_src) {
     g = geom; cls = cgeo; layer = l; kv = group; w = wire;
+    shared = kv_src >= 0;
+    kv_layer = shared ? kv_src : l;
+    if (shared) return declare_shared(b, nm, pre);
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
     const int64_t qkvd = qd + kvd + (cls.has_v ? kvd : 0);
 
@@ -589,6 +602,78 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     return RAD_OK;
 }
 
+/* A KV-shared layer (transformers' Gemma4TextAttention with is_kv_shared_layer): q_proj, the per-head
+ * q norm and the class's rotary, attention over the source layer's cache, o_proj and the two norms.
+ * No k or v projection, no k or v norm and no cache store: the source layer, earlier in the same
+ * step, wrote the keys and values these queries read. The checkpoint's k_proj / v_proj / k_norm of
+ * these layers (the "frozen shared kv" file) are unused, as in the reference. */
+int Gemma4Attn::declare_shared(RadBuilder* b, Names& nm, const char* pre) {
+    const int l = layer;
+    const int64_t qd = cls.q_dim();
+    fused = false;
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l),      nm.ckpt("%s.%lld.input_layernorm.weight",   pre, (long long)l)));
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_norm.weight", l),    nm.ckpt("%s.%lld.self_attn.q_norm.weight",   pre, (long long)l)));
+    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_post_norm.weight", l), nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l)));
+    w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l), RAD_BF16, {g.n_embd},
+                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    w_qn = decl_w(b, nm.f("blk.%d.attn_q_norm.weight", l), RAD_BF16, {cls.head_dim},
+                 RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    w_post = decl_w(b, nm.f("blk.%d.attn_post_norm.weight", l), RAD_BF16, {g.n_embd},
+                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+    RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
+                              { nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l) },
+                              qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
+    RAD_ARCH_TRY(ln_o.declare(b, nm, g, nm.f("blk.%d.attn_o", l),
+                              { nm.ckpt("%s.%lld.self_attn.o_proj.weight", pre, (long long)l) },
+                              g.n_embd, qd, RAD_SHARD_COL, grp_layer(l), w.attn, w.h));
+    op_norm = rw(b, RAD_OP(b, "rmsnorm",
+                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                             RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
+                  RAD_WEIGHTS(w_norm)),
+                 {w.x}, {w.h});
+    op_qn = rw(b, RAD_OP(b, "rmsnorm",
+               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * cls.n_head), RAD_INT("n", cls.head_dim),
+                          RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype)),
+               RAD_WEIGHTS(w_qn)),
+             {w.q}, {w.q});
+    op_rq = rw(b, RAD_OP(b, "rope",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                            RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", 0),
+                            RAD_F64("theta", cls.theta), RAD_F64("scale", cls.scale),
+                            RAD_STR("mode", "neox"), RAD_INT("rotary_dim", cls.n_rot),
+                            RAD_STR("ladder", cls.head_ladder ? "head" : "rotary")),
+                 RAD_NOWEIGHTS),
+                {w.q}, {w.q});
+    op_attn = rw(b, RAD_OP(b, "attn_paged",
+                     RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok),
+                                RAD_INT("head_dim", cls.head_dim),
+                                RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1),
+                                RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
+                                RAD_INT("block_size", RAD_KV_BLOCK),
+                                RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                RAD_F64("scale", 1.0),
+                                RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                     RAD_NOWEIGHTS),
+                  {w.q}, {w.attn});
+    if (g.world > 1)
+        op_ar = rw(b, RAD_OP(b, "all_reduce",
+                   RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                              RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                              RAD_INT("min_bytes", g.wire_min_bytes)),
+                   RAD_NOWEIGHTS),
+                  {w.h}, {w.h});
+    op_post = rw(b, RAD_OP(b, "rmsnorm",
+                 RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                            RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
+                 RAD_WEIGHTS(w_post)),
+                {w.h}, {w.h});
+    op_add = rw(b, RAD_OP(b, "add",
+               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
+               RAD_NOWEIGHTS),
+              {w.x, w.h}, {w.x});
+    return (op_norm && op_qn && op_rq && op_attn && op_post && op_add) ? RAD_OK : RAD_E_INVAL;
+}
+
 /* ---- Prefetch beside the reductions (prefetch_beside, rad_arch.h). The all-reduce in front of
  * each GEMM leaves the card's memory idle for its round trip (~20 us at a DFlash2 verify's rows on
  * 4x R9700), so the trunk reads the next GEMM's leading bytes in that window -- gate_up's after
@@ -609,7 +694,13 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
                       bool ar_fused) const {
     const int64_t T = batch->n_tok;
 
-    if (fused) {
+    if (shared) {
+        if (entry_done) ln_q.gemm(c, w.q, T);
+        else {
+            RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+            ln_q.step(c, w.h, w.q, T);
+        }
+    } else if (fused) {
         if (!entry_done) RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
         if (entry_done) ln_qkv.gemm(c, w.qkv, T);
         else            ln_qkv.step(c, w.h, w.qkv, T);
@@ -637,6 +728,10 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
 }
 
 void Gemma4Attn::project(RadCtx* c, int64_t r0, int64_t n) const {
+    if (shared) {
+        ln_q.gemm_rows(c, w.q, r0, n);
+        return;
+    }
     if (fused) {
         ln_qkv.gemm_rows(c, w.qkv, r0, n);
         return;
@@ -657,6 +752,19 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
     const int32_t* used  = kvb ? kvb->seqused      : nullptr;
     const int64_t T = batch->n_tok;
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    if (shared) {
+        /* q only: its norm and rotary, then attention over the source layer's cache. */
+        RAD_ISSUE_N(c, op_qn, T * cls.n_head, brows(w.q, T), RAD_W(w_qn), brows(w.q, T));
+        RAD_ISSUE(c, op_rq, brows(w.q, T), rope_posmc(g, batch, T));
+        RAD_ISSUE_N(c, op_attn, batch->max_q_len,
+                    brows(w.q, T), kv_cache(kv, kv_layer),
+                    praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
+                    praw(used, RAD_I32, batch->n_seq),
+                    RAD_NONE, RAD_NONE,
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
+                    brows(w.attn, T));
+        return;
+    }
     /* q, k and v where the prologue works on them: their own buffers, or on a fused layer with the
      * one-op prologue the row's column slices (a k_eq_v class's v is its own buffer either way). */
     const bool row = fused && op_qnr;
@@ -1747,7 +1855,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Names& nm = m.nm;
 
     /* ---- geometry RadModelMeta does not name. */
-    const int64_t kv_g_all    = meta_text_geti(meta, "num_global_key_value_heads", 0);
+    /* num_global_key_value_heads may be null (Gemma 4 E2B/E4B): the global layers then take the
+     * model's num_key_value_heads, as transformers' per-layer config does. */
+    const int64_t kv_g_all    = meta_text_geti(meta, "num_global_key_value_heads",
+                                               meta_text_geti(meta, "num_key_value_heads", 0));
     const int64_t head_g      = meta_text_geti(meta, "global_head_dim", 0);
     const int64_t sliding_win = meta_text_geti(meta, "sliding_window", 0);
     const int64_t kv_shared   = meta_text_geti(meta, "num_kv_shared_layers", 0);
@@ -1777,10 +1888,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     if (!(softcap > 0.0)) { fprintf(stderr, "radiance: gemma4: final_logit_softcapping is required\n"); return RAD_E_INVAL; }
     if (kv_shared < 0) { fprintf(stderr, "radiance: gemma4: num_kv_shared_layers %lld is negative\n", (long long)kv_shared); return RAD_E_INVAL; }
-    if (kv_shared > 0) {
-        fprintf(stderr, "radiance: gemma4: num_kv_shared_layers %lld needs a shared-KV reuse path; refusing\n",
-                (long long)kv_shared);
-        return RAD_E_UNSUPPORTED;
+    if (kv_shared >= g.n_layer) {
+        fprintf(stderr, "radiance: gemma4: num_kv_shared_layers %lld leaves no layer with a cache of "
+                        "its own (%lld layers)\n", (long long)kv_shared, (long long)g.n_layer);
+        return RAD_E_INVAL;
     }
     if (sliding_win <= 0) { fprintf(stderr, "radiance: gemma4: sliding_window %lld is required\n", (long long)sliding_win); return RAD_E_INVAL; }
     if (!(prf > 0.0)) prf = 1.0;
@@ -1838,6 +1949,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_attns = decl_b(b, nm.f("attn_outs"), g.act_dtype, {g.max_tok, m.cs.q_dim()});
     m.b_qg    = decl_b(b, nm.f("attn_qg"),    g.act_dtype, {g.max_tok, m.cg.q_dim()});
     m.b_kg    = decl_b(b, nm.f("attn_kg"),    g.act_dtype, {g.max_tok, m.cg.kv_dim()});
+    /* KV sharing: from layer n_layer - num_kv_shared_layers on, a layer keeps no cache and reads the
+     * last earlier non-shared layer of its own class (transformers' store_full_length_kv; E4B:
+     * sliding layers read 22, full layers 23). kv_src[l] is that layer, or -1 for an own cache. */
+    const int64_t first_shared = g.n_layer - kv_shared;
+    std::vector<int> kv_src((size_t)g.n_layer, -1);
+    if (kv_shared > 0) {
+        int last_s = -1, last_f = -1;
+        for (int64_t l = 0; l < first_shared; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
+        for (int64_t l = first_shared; l < g.n_layer; ++l) {
+            const int src = is_global[(size_t)l] ? last_f : last_s;
+            if (src < 0) {
+                fprintf(stderr, "radiance: gemma4: KV-shared layer %lld is %s and no earlier layer of "
+                                "that class keeps a cache\n", (long long)l,
+                        is_global[(size_t)l] ? "full" : "sliding");
+                return RAD_E_INVAL;
+            }
+            kv_src[(size_t)l] = src;
+        }
+    }
+
     m.b_vg    = decl_b(b, nm.f("attn_vg"),    g.act_dtype, {g.max_tok, m.cg.kv_dim()});
     m.b_atting= decl_b(b, nm.f("attn_outg"),  g.act_dtype, {g.max_tok, m.cg.q_dim()});
     m.b_gu   = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
@@ -1920,9 +2051,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const ClassGeom&        cgeo = lay.global ? m.cg : m.cs;
         const rad_kvgroup       kg   = lay.global ? m.kv_g : m.kv_s;
         const Gemma4Attn::Wire& aw   = lay.global ? gw : sw;
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
+        /* A KV-shared layer is not bound: the group's pages hold only the layers that write. */
+        if (kv_src[(size_t)l] < 0) RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, kg));
         RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, cgeo, kg, aw, pre,
-                                      lay.global ? &m.b_qkvg : &m.b_qkvs));
+                                      lay.global ? &m.b_qkvg : &m.b_qkvs, kv_src[(size_t)l]));
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, pre));
 
         /* The per-layer scalar: `cur = cur * scalar`, a [1] bf16 over the residual stream. */
@@ -2112,7 +2244,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * the deployment speculates; otherwise its ~0.5 GB of weights stay off the card. */
     if (ctx->max_spec > 0 && has_assistant(meta)) {
         int last_s = -1, last_f = -1;
-        for (int64_t l = 0; l < m.n_main; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
+        /* the last layer of each class that keeps a cache (a KV-shared layer reads another's) */
+        for (int64_t l = 0; l < m.n_main; ++l)
+            if (kv_src[(size_t)l] < 0) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
         RAD_ARCH_TRY(m.head.declare(b, nm, meta, g, m.cs, m.cg, m.kv_s, m.kv_g, last_s, last_f,
                                     m.n_main, m.w_tok, m.b_h, m.b_logits));
         m.have_head = true;
@@ -2298,6 +2432,15 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
                 for (int i = 0; i < m.n_trim; ++i)
                     if (m.trim[i].kv == kv) return brows(m.trim[i].used, 1);
             const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    if (kv_shared > 0) {
+        int src_s = -1, src_f = -1;
+        for (int64_t l = first_shared; l < g.n_layer; ++l)
+            (is_global[(size_t)l] ? src_f : src_s) = kv_src[(size_t)l];
+        rad_note(b, "KV sharing: layers %lld..%lld keep no cache and read the last earlier layer of "
+                    "their class (sliding %d, full %d); %lld of %lld layers hold KV",
+                 (long long)first_shared, (long long)(g.n_layer - 1), src_s, src_f,
+                 (long long)first_shared, (long long)g.n_layer);
+    }
             return praw(kvb ? kvb->seqused : nullptr, RAD_I32, 1);
         };
         for (int i = 0; i < m.n_trim; ++i) {
