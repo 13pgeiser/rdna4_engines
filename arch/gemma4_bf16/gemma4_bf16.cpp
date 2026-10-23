@@ -1555,6 +1555,11 @@ struct Layer {
     Gemma4Mlp  mlp{};
     rad_weight w_scalar = 0;   /* the per-layer [1] residual scalar, `cur = cur * scalar` */
     rad_op     op_scale = 0;
+    /* Per-layer embeddings (Gemma 4 E2B/E4B), after the feed-forward's residual add and before the
+     * scalar: x += norm(proj(gelu(gate(x)) * pli[l])). `ple_post` is the norm's gain. */
+    G4Linear   ln_pg{}, ln_pp{};
+    rad_weight w_ple_post = 0;
+    rad_op     op_ple_act = 0, op_ple_post = 0, op_ple_add = 0;
     /* The fused junctions (see "Residual junctions" above): attention -> this layer's
      * feed-forward, and this layer's feed-forward -> the next layer's attention, scalar included.
      * The last layer has no j_ma: its stream goes to the final norm, which feeds the lm_head, not
@@ -1592,6 +1597,16 @@ struct Model {
 
     rad_weight w_tok = 0, w_out = 0, w_lm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_final = 0, op_gather = 0, op_logits = 0, op_cap = 0;
+
+    /* Per-layer embeddings (hidden_size_per_layer_input > 0): the token-identity table
+     * (embed_tokens_per_layer, n_layer x n_ple wide), the context projection of the scaled
+     * embedding and its per-(token, layer) norm, combined into `b_ple` [max_tok, n_layer * n_ple]
+     * that every layer reads its slice of. */
+    int64_t    n_ple = 0;
+    rad_weight w_ple_tok = 0, w_ple_norm = 0;
+    G4Linear   ln_ple_proj{};
+    rad_buf    b_ple = 0, b_ple_tok = 0, b_pg = 0;
+    rad_op     op_ple_tok = 0, op_ple_norm = 0, op_ple_add = 0;
 
     std::vector<Layer> layers;
 
@@ -1894,6 +1909,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
     if (sliding_win <= 0) { fprintf(stderr, "radiance: gemma4: sliding_window %lld is required\n", (long long)sliding_win); return RAD_E_INVAL; }
+    m.n_ple = meta_text_geti(meta, "hidden_size_per_layer_input", 0);
+    if (m.n_ple < 0) { fprintf(stderr, "radiance: gemma4: hidden_size_per_layer_input %lld is negative\n", (long long)m.n_ple); return RAD_E_INVAL; }
+    if (m.n_ple > 0) {
+        const int64_t v_ple = meta_text_geti(meta, "vocab_size_per_layer_input", g.n_vocab_all);
+        if (g.world > 1) {
+            fprintf(stderr, "radiance: gemma4: per-layer embeddings (hidden_size_per_layer_input %lld) "
+                            "are served at one rank only; this model is small enough for one card\n",
+                    (long long)m.n_ple);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (v_ple != g.n_vocab_all) {
+            fprintf(stderr, "radiance: gemma4: vocab_size_per_layer_input %lld differs from the "
+                            "vocabulary (%lld)\n", (long long)v_ple, (long long)g.n_vocab_all);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     if (!(prf > 0.0)) prf = 1.0;
     const int64_t n_rot_g = (int64_t)(head_g * prf + 0.5);
     if (n_rot_g <= 0 || n_rot_g > head_g || (n_rot_g & 1)) {
@@ -1917,6 +1948,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(g4_schedule(meta, g.n_layer, interval, is_global));
     int n_global = 0;
     for (int v : is_global) n_global += v;
+
+    /* KV sharing: from layer n_layer - num_kv_shared_layers on, a layer keeps no cache and reads the
+     * last earlier non-shared layer of its own class (transformers' store_full_length_kv; E4B:
+     * sliding layers read 22, full layers 23). kv_src[l] is that layer, or -1 for an own cache. */
+    const int64_t first_shared = g.n_layer - kv_shared;
+    std::vector<int> kv_src((size_t)g.n_layer, -1);
+    if (kv_shared > 0) {
+        int last_s = -1, last_f = -1;
+        for (int64_t l = 0; l < first_shared; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
+        for (int64_t l = first_shared; l < g.n_layer; ++l) {
+            const int src = is_global[(size_t)l] ? last_f : last_s;
+            if (src < 0) {
+                fprintf(stderr, "radiance: gemma4: KV-shared layer %lld is %s and no earlier layer of "
+                                "that class keeps a cache\n", (long long)l,
+                        is_global[(size_t)l] ? "full" : "sliding");
+                return RAD_E_INVAL;
+            }
+            kv_src[(size_t)l] = src;
+        }
+    }
 
     /* The sliding class comes from geom_from (head_dim 256, 16 kv heads, full rotation, theta_s);
      * the global class is built from the container header. */
@@ -1949,26 +2000,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_attns = decl_b(b, nm.f("attn_outs"), g.act_dtype, {g.max_tok, m.cs.q_dim()});
     m.b_qg    = decl_b(b, nm.f("attn_qg"),    g.act_dtype, {g.max_tok, m.cg.q_dim()});
     m.b_kg    = decl_b(b, nm.f("attn_kg"),    g.act_dtype, {g.max_tok, m.cg.kv_dim()});
-    /* KV sharing: from layer n_layer - num_kv_shared_layers on, a layer keeps no cache and reads the
-     * last earlier non-shared layer of its own class (transformers' store_full_length_kv; E4B:
-     * sliding layers read 22, full layers 23). kv_src[l] is that layer, or -1 for an own cache. */
-    const int64_t first_shared = g.n_layer - kv_shared;
-    std::vector<int> kv_src((size_t)g.n_layer, -1);
-    if (kv_shared > 0) {
-        int last_s = -1, last_f = -1;
-        for (int64_t l = 0; l < first_shared; ++l) (is_global[(size_t)l] ? last_f : last_s) = (int)l;
-        for (int64_t l = first_shared; l < g.n_layer; ++l) {
-            const int src = is_global[(size_t)l] ? last_f : last_s;
-            if (src < 0) {
-                fprintf(stderr, "radiance: gemma4: KV-shared layer %lld is %s and no earlier layer of "
-                                "that class keeps a cache\n", (long long)l,
-                        is_global[(size_t)l] ? "full" : "sliding");
-                return RAD_E_INVAL;
-            }
-            kv_src[(size_t)l] = src;
-        }
-    }
-
     m.b_vg    = decl_b(b, nm.f("attn_vg"),    g.act_dtype, {g.max_tok, m.cg.kv_dim()});
     m.b_atting= decl_b(b, nm.f("attn_outg"),  g.act_dtype, {g.max_tok, m.cg.q_dim()});
     m.b_gu   = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
@@ -2039,6 +2070,52 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                      {m.b_x}, {m.b_x});
 
+    /* ---- per-layer embeddings (transformers' get_per_layer_inputs / project_per_layer_inputs):
+     *   tok = embed_tokens_per_layer[id] * sqrt(n_ple)                      (bf16, sqrt(256) = 16)
+     *   ctx = rmsnorm( (e @ W_proj^T) * n_embd^-0.5 ) per (token, layer)   over n_ple, gain w_norm
+     *   pli = (ctx + tok) * 2^-0.5
+     * `e` is the scaled embedding (after any image rows are scattered in). The projection's scale
+     * is folded into the norm's eps, as embgemma2 does: rmsnorm(s x, eps) = rmsnorm(x, eps / s^2),
+     * so no bf16 rounding of s x. The table is read a row a token, so the placement puts it in the
+     * pinned host pool by default (--embedding-placement ram), off the card. */
+    if (m.n_ple > 0) {
+        const int64_t P = g.n_layer * m.n_ple;
+        RAD_ARCH_TRY(map_copy(b, nm.f("ple_token_embd.weight"),
+                              nm.ckpt("model.language_model.embed_tokens_per_layer.weight")));
+        RAD_ARCH_TRY(map_copy(b, nm.f("ple_proj_norm.weight"),
+                              nm.ckpt("model.language_model.per_layer_projection_norm.weight")));
+        m.w_ple_tok = decl_w(b, nm.f("ple_token_embd.weight"), RAD_BF16, {g.n_vocab, P},
+                             RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        m.w_ple_norm = decl_w(b, nm.f("ple_proj_norm.weight"), RAD_BF16, {m.n_ple},
+                              RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        m.b_ple     = decl_b(b, nm.f("ple_in"),  g.act_dtype, {g.max_tok, P});
+        m.b_ple_tok = decl_b(b, nm.f("ple_tok"), g.act_dtype, {g.max_tok, P});
+        m.b_pg      = decl_b(b, nm.f("ple_gate"), g.act_dtype, {g.max_tok, m.n_ple});
+        if (!m.w_ple_tok || !m.w_ple_norm || !m.b_ple || !m.b_ple_tok || !m.b_pg) return RAD_E_INVAL;
+        m.op_ple_tok = rw(b, RAD_OP(b, "embed_lookup",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", P),
+                                     RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                     RAD_INT("vocab_offset", g.vocab_off),
+                                     RAD_F64("mult", std::sqrt((double)m.n_ple))),
+                          RAD_WEIGHTS(m.w_ple_tok)),
+                         {}, {m.b_ple_tok});
+        RAD_ARCH_TRY(m.ln_ple_proj.declare(b, nm, g, nm.f("ple_model_proj"),
+                                           { nm.ckpt("model.language_model.per_layer_model_projection.weight") },
+                                           P, g.n_embd, RAD_SHARD_NONE, grp_model(), m.b_x, m.b_ple));
+        m.op_ple_norm = rw(b, RAD_OP(b, "rmsnorm",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * g.n_layer), RAD_INT("n", m.n_ple),
+                                      RAD_F64("eps", (double)g.eps * (double)g.n_embd),
+                                      RAD_F64("wadd", 0.0), RAD_STR("dtype", g.dtype)),
+                           RAD_WEIGHTS(m.w_ple_norm)),
+                          {m.b_ple}, {m.b_ple});
+        m.op_ple_add = rw(b, RAD_OP(b, "add",
+                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", P),
+                                     RAD_STR("dtype", g.dtype), RAD_F64("div", std::sqrt(2.0))),
+                          RAD_NOWEIGHTS),
+                         {m.b_ple, m.b_ple_tok}, {m.b_ple});
+        if (!m.op_ple_tok || !m.op_ple_norm || !m.op_ple_add) return RAD_E_INVAL;
+    }
+
     /* ---- the layers. */
     Gemma4Attn::Wire sw{}; sw.x = m.b_x; sw.h = m.b_h; sw.q = m.b_qs; sw.k = m.b_ks; sw.v = m.b_vs;        sw.attn = m.b_attns;
     Gemma4Attn::Wire gw{}; gw.x = m.b_x; gw.h = m.b_h; gw.q = m.b_qg; gw.k = m.b_kg; gw.v = m.b_vg;        gw.attn = m.b_atting;
@@ -2067,6 +2144,43 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                        RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(lay.w_scalar)),
                            {mw.x}, {mw.x});
+
+        /* The per-layer embedding branch (transformers' Gemma4TextDecoderLayer, after the
+         * feed-forward's residual add): gate n_embd -> n_ple, gelu_tanh times this layer's slice of
+         * `ple_in`, projection back to n_embd into `h`, its norm, the residual add. The scalar
+         * follows it. */
+        if (m.n_ple > 0) {
+            RAD_ARCH_TRY(lay.ln_pg.declare(b, nm, g, nm.f("blk.%d.ple_gate", (int)l),
+                                           { nm.ckpt("%s.%lld.per_layer_input_gate.weight", pre, (long long)l) },
+                                           m.n_ple, g.n_embd, RAD_SHARD_NONE, grp_layer((int)l),
+                                           m.b_x, m.b_pg));
+            RAD_ARCH_TRY(lay.ln_pp.declare(b, nm, g, nm.f("blk.%d.ple_proj", (int)l),
+                                           { nm.ckpt("%s.%lld.per_layer_projection.weight", pre, (long long)l) },
+                                           g.n_embd, m.n_ple, RAD_SHARD_NONE, grp_layer((int)l),
+                                           m.b_pg, m.b_h));
+            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_post_norm.weight", (int)l),
+                                  nm.ckpt("%s.%lld.post_per_layer_input_norm.weight", pre, (long long)l)));
+            lay.w_ple_post = decl_w(b, nm.f("blk.%d.ple_post_norm.weight", (int)l), RAD_BF16, {g.n_embd},
+                                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer((int)l));
+            lay.op_ple_act = rw(b, RAD_OP(b, "act_mul",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", m.n_ple),
+                                               RAD_STR("act", "gelu_tanh"), RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {m.b_pg, m.b_ple}, {m.b_pg});
+            lay.op_ple_post = rw(b, RAD_OP(b, "rmsnorm",
+                                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                                RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd),
+                                                RAD_STR("dtype", g.dtype)),
+                                     RAD_WEIGHTS(lay.w_ple_post)),
+                                 {m.b_h}, {m.b_h});
+            lay.op_ple_add = rw(b, RAD_OP(b, "add",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {m.b_x, m.b_h}, {m.b_x});
+            if (!lay.w_ple_post || !lay.op_ple_act || !lay.op_ple_post || !lay.op_ple_add)
+                return RAD_E_INVAL;
+        }
 
         /* The tap: a row copy of the layer's output (after the scalar, HF's hidden_states[l + 1])
          * into the column slice the tap owns. It is declared here, in the layer it is issued
@@ -2107,7 +2221,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ok = lay.j_am.op != 0;
                 if (ok && l + 1 < m.n_main) {
                     const Layer& nx = m.layers[(size_t)l + 1];
-                    RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm, lay.mlp.w_post,
+                    /* With per-layer embeddings the junction closes the PLE branch instead of the
+                     * feed-forward (whose post-norm and add then run apart): the branch's norm,
+                     * its add, the scalar, the next norm and quantiser, in the reference's order. */
+                    RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm,
+                                                  m.n_ple > 0 ? lay.w_ple_post : lay.mlp.w_post,
                                                   lay.w_scalar, nx.attn.ln_in(), tapped));
                     ok = lay.j_ma.op != 0;
                 }
@@ -2306,6 +2424,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              g.rank, g.world, (long long)g.n_layer, (long long)n_global,
              (long long)(g.n_layer - n_global), (long long)sliding_win,
               (long long)g.n_head, (long long)g.head_dim, (long long)g.n_head, (long long)head_g);
+    if (kv_shared > 0) {
+        int src_s = -1, src_f = -1;
+        for (int64_t l = first_shared; l < g.n_layer; ++l)
+            (is_global[(size_t)l] ? src_f : src_s) = kv_src[(size_t)l];
+        rad_note(b, "KV sharing: layers %lld..%lld keep no cache and read the last earlier layer of "
+                    "their class (sliding %d, full %d); %lld of %lld layers hold KV",
+                 (long long)first_shared, (long long)(g.n_layer - 1), src_s, src_f,
+                 (long long)first_shared, (long long)g.n_layer);
+    }
     {
         int64_t n_fused = 0, n_row = 0, n_dec = 0, dec_hi = 0;
         for (const Layer& lay : m.layers) {
@@ -2432,15 +2559,6 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
                 for (int i = 0; i < m.n_trim; ++i)
                     if (m.trim[i].kv == kv) return brows(m.trim[i].used, 1);
             const RadKVGroupBatch* kvb = kv_batch(batch, kv);
-    if (kv_shared > 0) {
-        int src_s = -1, src_f = -1;
-        for (int64_t l = first_shared; l < g.n_layer; ++l)
-            (is_global[(size_t)l] ? src_f : src_s) = kv_src[(size_t)l];
-        rad_note(b, "KV sharing: layers %lld..%lld keep no cache and read the last earlier layer of "
-                    "their class (sliding %d, full %d); %lld of %lld layers hold KV",
-                 (long long)first_shared, (long long)(g.n_layer - 1), src_s, src_f,
-                 (long long)first_shared, (long long)g.n_layer);
-    }
             return praw(kvb ? kvb->seqused : nullptr, RAD_I32, 1);
         };
         for (int i = 0; i < m.n_trim; ++i) {
@@ -2563,6 +2681,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
                     praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
 
     const int64_t T = batch->n_tok;
+    if (m.n_ple > 0) {
+        RAD_ISSUE(c, m.op_ple_tok, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_ple_tok),
+                  brows(m.b_ple_tok, T));
+        m.ln_ple_proj.step(c, m.b_x, m.b_ple, T);
+        /* [T, n_layer * n_ple] read as [T * n_layer, n_ple]: one norm row per (token, layer). */
+        RAD_ISSUE_N(c, m.op_ple_norm, T * m.g.n_layer, brows(m.b_ple, T), RAD_W(m.w_ple_norm),
+                    brows(m.b_ple, T));
+        RAD_ISSUE(c, m.op_ple_add, brows(m.b_ple, T), brows(m.b_ple_tok, T), brows(m.b_ple, T));
+    }
     const int64_t cut = split_at(m, T);
     if (cut > 0) trunk_overlap(c, m, batch, cut);
     else if (m.fuse) m.j0.step(c, T);
@@ -2573,7 +2700,18 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const bool last = li + 1 == m.layers.size();
         l.attn.step(c, batch, m.fuse, m.fuse, far);
         if (m.fuse) l.j_am.step(c, T, far);
-        l.mlp.step(c, batch, m.fuse, m.fuse && !last, far);
+        const bool ple = m.n_ple > 0;
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last && !ple, far);
+        if (ple) {
+            l.ln_pg.step(c, m.b_x, m.b_pg, T);
+            RAD_ISSUE(c, l.op_ple_act, brows(m.b_pg, T),
+                      bcol(m.b_ple, (int64_t)li * m.n_ple, m.n_ple, T), brows(m.b_pg, T));
+            l.ln_pp.step(c, m.b_pg, m.b_h, T);
+            if (!(m.fuse && !last)) {
+                RAD_ISSUE(c, l.op_ple_post, brows(m.b_h, T), RAD_W(l.w_ple_post), brows(m.b_h, T));
+                RAD_ISSUE(c, l.op_ple_add, brows(m.b_x, T), brows(m.b_h, T), brows(m.b_x, T));
+            }
+        }
         if (m.fuse && !last) {
             /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
             l.j_ma.step(c, T, far);
