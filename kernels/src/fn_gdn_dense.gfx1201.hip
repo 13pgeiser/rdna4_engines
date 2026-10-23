@@ -251,6 +251,271 @@ extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_producer(
     }
 }
 
+// The convolution's SiLU + BF16 rounding of one F32 value, exactly as the v1 kernel computes it.
+static __device__ __forceinline__ __hip_bfloat16 fn_gdn_dense_silu_bf16_exact(float value) {
+    return bf16_round(value * (1.0f / (1.0f + expf(-value))));
+}
+
+// Distance (in F32 ulps of the approximation's low 16 bits) from the BF16 round-to-nearest tie
+// point below which the approximation is not trusted. The fast path's error against the exact
+// chain is a few ulps (exp2 of a rounded product, hardware rcp), so an approximation whose
+// low half is further than this from 0x8000 rounds to the same BF16 as the exact chain.
+#define FNGD_SILU_TIE_MARGIN 64
+
+// Cheap SiLU + BF16 rounding for the bulk of the range: hardware exp2/rcp instead of ocml's
+// expf and the full-precision division (about 4x fewer instructions), accepted only when the
+// approximation provably rounds to the exact chain's BF16: |value| in [2^-20, 16] (so the
+// intermediates are normal and NaN/inf/zero/denormals fall to the exact path) and the
+// approximation is not within FNGD_SILU_TIE_MARGIN ulps of a BF16 tie. The whole function is
+// checked against `fn_gdn_dense_silu_bf16_exact` over all 2^32 F32 inputs by
+// tests/fn_gdn_chain_oracle.rs (`silu_fast_path_is_exact_over_all_f32`).
+static __device__ __forceinline__ bool fn_gdn_dense_silu_bf16_fast(float value, __hip_bfloat16& out) {
+    const float a = fabsf(value);
+    const float u = __builtin_amdgcn_exp2f(value * -1.4426950408889634f);
+    const float y = value * __builtin_amdgcn_rcpf(1.0f + u);
+    const unsigned yb = __float_as_uint(y);
+    const int low = (int)(yb & 0xffffu);
+    const int off = low - 0x8000;
+    const bool ok = a >= 9.5367431640625e-07f && a <= 16.0f &&
+                    (off > FNGD_SILU_TIE_MARGIN || off < -FNGD_SILU_TIE_MARGIN);
+    out.data = (unsigned short)((yb + 0x7fffu + ((yb >> 16) & 1u)) >> 16);
+    return ok;
+}
+
+static __device__ __forceinline__ __hip_bfloat16 fn_gdn_dense_silu_bf16(float value) {
+    __hip_bfloat16 out;
+    if (!fn_gdn_dense_silu_bf16_fast(value, out)) out = fn_gdn_dense_silu_bf16_exact(value);
+    return out;
+}
+
+// ---- fn_gdn_dense_producer_v2 (HIPFIRE_QWEN4_GDN_CHAIN_FUSE) ----------------------------
+//
+// The same producer, byte for byte, with the convolution's global loads hoisted: the
+// v1 loop interleaves one dependent load per row with the row's math and its store,
+// so (the stores may alias `input`) the compiler waits on every load before the
+// next one issues (27 VGPRs, `global_load; s_wait_loadcnt 0` per row). v2 loads the
+// thread's 3 + 16 input values first, then runs the identical per-row expression
+// chain. Specialized on the input dtype: `BF` reads the BF16 bits the exact-INT8
+// MQ6 qkv GEMM's BF16 entry stores (RNE of the F32 accumulator, the rounding the F32
+// input takes below), else the F32 projection.
+template <bool BF, typename Emit>
+static __device__ __forceinline__ void fn_gdn_dense_conv_rows_v2(
+    const float* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    float* next_history,
+    int rows,
+    int start_cursor,
+    int channel,
+    int r0,
+    Emit emit) {
+    const int channels = FNGD_CHANNELS;
+    auto in = [&](int j) {
+        if (BF) {
+            __hip_bfloat16 b;
+            b.data = ((const unsigned short*)input)[j * channels + channel];
+            return b;
+        }
+        return bf16_round(input[j * channels + channel]);
+    };
+    auto x = [&](int j) {
+        return j >= 0 ? in(j)
+                      : bf16_round(history[((start_cursor + j + 3) % 3) * channels + channel]);
+    };
+    const float k0 = bf16_to_f32(kernel[channel * 4 + 0]);
+    const float k1 = bf16_to_f32(kernel[channel * 4 + 1]);
+    const float k2 = bf16_to_f32(kernel[channel * 4 + 2]);
+    const float k3 = bf16_to_f32(kernel[channel * 4 + 3]);
+    const int r1 = min(r0 + 16, rows);
+    // The ring history (only the r0 == 0 tile; wave-uniform) ...
+    float hist[3] = {0.0f, 0.0f, 0.0f};
+    if (r0 == 0) {
+#pragma unroll
+        for (int s = 0; s < 3; ++s)
+            hist[s] = history[((start_cursor + s) % 3) * channels + channel];
+    }
+    // ... and the input rows, loaded branch-free (rows outside [0, r1) re-read a
+    // valid row and are never used) so all of them are in flight before any is
+    // consumed and before any store.
+    unsigned short rb[19];
+    float rf[19];
+#pragma unroll
+    for (int i = 0; i < 19; ++i) {
+        int j = r0 - 3 + i;
+        j = j < 0 ? 0 : (j > r1 - 1 ? r1 - 1 : j);
+        if (BF) {
+            rb[i] = ((const unsigned short*)input)[j * channels + channel];
+            rf[i] = 0.0f;
+        } else {
+            rf[i] = input[j * channels + channel];
+            rb[i] = 0;
+        }
+    }
+    __hip_bfloat16 xs[19];
+#pragma unroll
+    for (int i = 0; i < 19; ++i) {
+        const int j = r0 - 3 + i;
+        if (j < 0) {
+            xs[i] = bf16_round(hist[i]);
+        } else if (BF) {
+            xs[i].data = rb[i];
+        } else {
+            xs[i] = bf16_round(rf[i]);
+        }
+    }
+    __hip_bfloat16 tail[3];
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s) {
+            const int j = rows - 3 + ((s - (start_cursor + rows) % 3) + 6) % 3;
+            tail[s] = x(j);
+        }
+    }
+    // ... then the per-row chain, identical to the v1 loop.
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int r = r0 + i;
+        if (r < r1) {
+            const __hip_bfloat16 current_bf16 = xs[i + 3];
+            float value = k3 * bf16_to_f32(current_bf16);
+            value += k0 * bf16_to_f32(xs[i]);
+            value += k1 * bf16_to_f32(xs[i + 1]);
+            value += k2 * bf16_to_f32(xs[i + 2]);
+            const __hip_bfloat16 out = fn_gdn_dense_silu_bf16(value);
+            emit(r, out);
+        }
+    }
+    if (r0 == 0) {
+        for (int s = 0; s < 3; ++s)
+            next_history[s * channels + channel] = bf16_to_f32(tail[s]);
+    }
+}
+
+// Grid, block, arguments and every stored byte are fn_gdn_dense_producer's (see above), with
+// one proven identity applied where the rounded value only feeds a bit conversion or a square:
+// `bf(x)` of a value that is already a BF16 widening (low 16 bits zero: the `out` of the v rows,
+// the conv output staged in `smem` read by the norm chain) returns it bit for bit (RNE adds
+// < 0x8000 + lsb to a zero low half; inf/NaN with a zero low half skip both fix-ups), so that
+// first rounding is dropped. The q/k final `bf(bf(smem) * inv)` keeps both roundings: with a
+// NaN in both operands the product's payload follows the operand order the compiler picks. The entry is picked by the input dtype, `input_bf16` is carried only for ABI parity.
+template <bool BF>
+static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
+    const float* input,
+    const __hip_bfloat16* kernel,
+    const float* history,
+    float* next_history,
+    unsigned short* q16,
+    unsigned short* k16,
+    unsigned short* v16,
+    float* g,
+    float* beta,
+    const float* param_a,
+    const float* param_b,
+    const __hip_bfloat16* a_log,
+    const __hip_bfloat16* dt_bias,
+    unsigned int* ef,
+    int rows,
+    int n64,
+    int start_cursor,
+    float query_scale,
+    int ef_words) {
+    __shared__ float smem[32 * 129];
+    __shared__ float inv[32];
+    const int t = (int)threadIdx.x;
+    const int x = (int)blockIdx.x;
+    const int row0 = (int)blockIdx.y * 32;
+    if (x >= 80) {
+        if (x == 81) {
+            const int stride = (int)gridDim.y * 256;
+            uint4* p = reinterpret_cast<uint4*>(ef);
+            for (int i = (int)blockIdx.y * 256 + t; i < ef_words / 4; i += stride)
+                p[i] = make_uint4(0u, 0u, 0u, 0u);
+            return;
+        }
+        if (blockIdx.y & 1) return;
+        const int chunk = (int)blockIdx.y >> 1;
+        const int total = rows * FNGD_HEADS;
+        for (int i = t; i < 64 * FNGD_HEADS; i += 256) {
+            const int flat = chunk * 64 * FNGD_HEADS + i;
+            smem[i] = flat < total
+                ? fn_gdn_dense_params_flat(param_a, param_b, a_log, dt_bias, beta, flat)
+                : 0.0f;
+        }
+        __syncthreads();
+        if (t < FNGD_HEADS) {
+            float s = 0.0f;
+            for (int r = 0; r < 64; ++r) {
+                const int flat = chunk * 64 * FNGD_HEADS + r * FNGD_HEADS + t;
+                if (flat < total) {
+                    s += smem[r * FNGD_HEADS + t];
+                    g[flat] = s;
+                }
+            }
+        }
+        return;
+    }
+    const int c = t & 127;
+    const int half = t >> 7;
+    const int r0 = row0 + half * 16;
+    if (x >= 32) {
+        const int channel = 4096 + (x - 32) * 128 + c;
+        unsigned short* dst = v16 + (x - 32) * 128 + c;
+        if (r0 < rows) {
+            fn_gdn_dense_conv_rows_v2<BF>(input, kernel, history, next_history, rows,
+                                          start_cursor, channel, r0,
+                                          [&](int r, __hip_bfloat16 out) {
+                                              dst[(size_t)r * 6144] = f16bits(bf16_to_f32(out));
+                                          });
+        }
+        for (int r = r0 > rows ? r0 : rows; r < r0 + 16; ++r) dst[(size_t)r * 6144] = 0;
+        return;
+    }
+    const int channel = x * 128 + c;
+    if (r0 < rows) {
+        fn_gdn_dense_conv_rows_v2<BF>(input, kernel, history, next_history, rows, start_cursor,
+                                      channel, r0,
+                                      [&](int r, __hip_bfloat16 out) {
+                                          smem[(r - row0) * 129 + c] = bf16_to_f32(out);
+                                      });
+    }
+    __syncthreads();
+    if (t < 32) {
+        const float* h = smem + t * 129;
+        float s = 0.0f;
+        if (row0 + t < rows) {
+            for (int cc = 0; cc < 128; ++cc) {
+                const float xv = h[cc];
+                s += bf(xv * xv);
+            }
+        }
+        inv[t] = bf(rsqrtf(bf(s) + bf(1.0e-6f)));
+    }
+    __syncthreads();
+    unsigned short* dst = x < 16 ? q16 + (size_t)x * 128 + c : k16 + (size_t)(x - 16) * 128 + c;
+    for (int r = r0; r < r0 + 16; ++r) {
+        unsigned short bits = 0;
+        if (r < rows) {
+            const float n = bf(bf(smem[(r - row0) * 129 + c]) * inv[r - row0]);
+            bits = f16bits(x < 16 ? n * query_scale : n);
+        }
+        dst[(size_t)r * 2048] = bits;
+    }
+}
+
+#define FNGD_PRODUCER_V2_ENTRY(NAME, BF)                                                      \
+    extern "C" __global__ __launch_bounds__(256) void NAME(                                   \
+        const float* input, const __hip_bfloat16* kernel, const float* history,               \
+        float* next_history, unsigned short* q16, unsigned short* k16, unsigned short* v16,   \
+        float* g, float* beta, const float* param_a, const float* param_b,                    \
+        const __hip_bfloat16* a_log, const __hip_bfloat16* dt_bias, unsigned int* ef,         \
+        int rows, int n64, int start_cursor, int input_bf16, float query_scale,               \
+        int ef_words) {                                                                       \
+        fn_gdn_dense_producer_v2_body<BF>(input, kernel, history, next_history, q16, k16,     \
+                                          v16, g, beta, param_a, param_b, a_log, dt_bias, ef, \
+                                          rows, n64, start_cursor, query_scale, ef_words);    \
+    }
+FNGD_PRODUCER_V2_ENTRY(fn_gdn_dense_producer_v2_f32, false)
+FNGD_PRODUCER_V2_ENTRY(fn_gdn_dense_producer_v2_bf16, true)
+
 // The gated RMSNorm scale of one 128-wide head from its F32 values in LDS: the
 // serial sum of squares in channel order (every lane reads the same values and
 // walks the same chain) and gated_delta_gate_head128's rsqrt expression.

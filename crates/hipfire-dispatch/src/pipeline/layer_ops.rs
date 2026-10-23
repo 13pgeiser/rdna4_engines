@@ -2281,7 +2281,7 @@ pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
         value_dim: op.value_dim,
         position: op.start_position,
     };
-    !wide_exact_rows(gpu, op.rows)
+    (!wide_exact_rows(gpu, op.rows)
         && persistent_batch
         && gated_delta_chunk_route(gpu, &dims)
         && match op.qkv.dtype {
@@ -2292,7 +2292,36 @@ pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
                         && gpu.qwen4_trunk_iu4_applies(op.rows))
             }
             _ => false,
-        }
+        })
+        || gdn_dense_qkv_bf16(gpu, op, &dims)
+}
+
+/// gfx1201 FN dense-scan prefill (`HIPFIRE_QWEN4_GDN_QKV_BF16`, opt-in, needs
+/// `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`): the qkv projection is stored as BF16 bits by the exact-INT8 MQ6 GEMM's BF16
+/// entry (RNE of the F32 accumulator). The dense producer's convolution reads each qkv value only
+/// through that same BF16 rounding, so the chain's bytes are unchanged while the GEMM writes and
+/// the producer reads half the bytes (20 KB instead of 40 KB per row). A pure function of the
+/// whole bank (`op.rows`, never a row window), so the input-projection and core phases of a
+/// split mixer agree on the stored dtype; `step` carries the bank's dims.
+#[cfg(feature = "deltanet")]
+fn gdn_dense_qkv_bf16(
+    gpu: &Gpu,
+    op: &GatedDeltaNetOp<'_>,
+    step: &GatedDeltaStepBatched<'_>,
+) -> bool {
+    gpu.flags.qwen4_gdn_qkv_bf16_enabled()
+        && op.row_capture.is_none()
+        && step.rows == op.rows
+        && !wide_exact_rows(gpu, op.rows)
+        && gdn_persistent_batch(gpu, op, op.rows)
+        && !gated_delta_chunk_route(gpu, step)
+        && rdna_compute::fn_gdn_dense::applies(gpu, step)
+        && mq6_i8_route(gpu, &op.qkv, op.rows)
+}
+
+#[cfg(not(feature = "deltanet"))]
+fn gdn_dense_qkv_bf16(_: &Gpu, _: &GatedDeltaNetOp<'_>, _: &GatedDeltaStepBatched<'_>) -> bool {
+    false
 }
 
 pub fn execute_gated_delta_net(
@@ -2900,6 +2929,14 @@ fn execute_gated_delta_net_hc_impl(
     };
     if arenas.is_some_and(|a| a.qkv.is_some())
         || bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu)
+        || gdn_dense_qkv_bf16(
+            gpu,
+            op,
+            &GatedDeltaStepBatched {
+                rows: op.rows,
+                ..dims
+            },
+        )
     {
         projection.dtype = DType::BF16;
     }

@@ -1440,6 +1440,7 @@ fn row_fold_gfx1201_applies(
         && shared.scalar.numel() >= p.batch_size
         && p.k_top == 10
         && p.down_expanded.buf.size() >= p.batch_size * 10 * 8
+        && (p.y_down_grouped.buf.as_ptr() as usize) % 16 == 0
         && gpu.hc_row_fold_gfx1201_applies(hc.rows, hc.hidden, &hc.streams, target)
 }
 

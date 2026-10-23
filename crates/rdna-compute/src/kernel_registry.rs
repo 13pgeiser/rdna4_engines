@@ -1447,6 +1447,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::FN_GDN_DENSE_SRC,
             [
                 "fn_gdn_dense_producer",
+                "fn_gdn_dense_producer_v2_f32",
+                "fn_gdn_dense_producer_v2_bf16",
                 "fn_gdn_dense_gate_bf16in",
                 "fn_gdn_dense_gate_i8",
                 "fn_gdn_dense_gate_rotate_bf16in"
@@ -3052,6 +3054,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "hyper_read_up_wmma_bf16_gfx1201",
                 "hyper_read_up_wmma_bf16_gfx1201_t128",
+                "hyper_read_up_wmma_bf16_gfx1201_v2",
             ]
         );
         add!(

@@ -14,6 +14,11 @@
 //! persists across prefill launches. Exit Q8 uses
 //! round-to-nearest-even, not the pipe128 recurrence's stochastic rounding.
 //! Default on for admitted steps; `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
+//!
+//! `HIPFIRE_QWEN4_GDN_CHAIN_FUSE` (exact gfx1201, default on, `0` restores the v1 producer and
+//! the F32 projection): the qkv projection arrives as BF16 bits (the producer only reads it
+//! through its BF16 rounding) and the load-batched `fn_gdn_dense_producer_v2_{f32,bf16}` entries
+//! run; every stored byte is the v1 producer's.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -269,13 +274,14 @@ pub fn run(
         args.push_i32(i32::from(conv.input.dtype == DType::BF16));
         args.push_f32((p.key_dim as f32).sqrt().recip());
         args.push_i32(ef_words as i32);
-        launch(
-            gpu,
-            "fn_gdn_dense_producer",
-            [82, (n64 / 32) as u32, 1],
-            256,
-            &mut args,
-        )?;
+        // `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`: the load-batched producer (same bytes), entry by
+        // the projection's dtype; `=0` keeps the v1 entry (which reads either dtype).
+        let producer = match (gpu.flags.qwen4_gdn_chain_fuse_enabled(), conv.input.dtype) {
+            (false, _) => "fn_gdn_dense_producer",
+            (true, DType::BF16) => "fn_gdn_dense_producer_v2_bf16",
+            (true, _) => "fn_gdn_dense_producer_v2_f32",
+        };
+        launch(gpu, producer, [82, (n64 / 32) as u32, 1], 256, &mut args)?;
         gpu.gdn_chunk_kkt_solve_batched(&k, p.gate, p.beta, &s.a, n, p.key_heads, p.value_heads)?;
         let codes = raw(p.state, 0, 48 * 128 * 128);
         let scales = raw(p.state, 48 * 128 * 128, 48 * 128 * 4);
