@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Qwen4 shared-expert INT8 prefill route on exact gfx1201 (`HIPFIRE_QWEN4_SHARED_INT8`).
+//! Qwen4 shared-expert INT8 prefill route on exact gfx1201 (`HIPFIRE_QWEN4_SHARED_INT8`, default on).
 //!
 //! The Flash-Next MoE shared expert (`hidden` = 2560 -> gate/up `intermediate` = 640 ->
 //! SwiGLU -> down 640 -> 2560, BF16 weights) runs on the F16 WMMA route
@@ -48,10 +48,11 @@ const QUANT_MODULE: &str = "qwen4_shared_i8_quant_gfx12";
 const QUANT_ENTRY_ROT256: &str = "qwen4_shared_rot256_i8_w";
 const QUANT_ENTRY_ROT128: &str = "qwen4_shared_rot128_i8";
 
-/// `HIPFIRE_QWEN4_SHARED_INT8`: the shared expert's gate/up/down on the INT8 route
-/// (exact gfx1201, eager, `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`).
+/// `HIPFIRE_QWEN4_SHARED_INT8` (default on, `0` restores the F16 WMMA route): the shared
+/// expert's gate/up/down on the INT8 route (exact gfx1201, eager,
+/// `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`).
 static QWEN4_SHARED_INT8: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_INT8", false));
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_INT8", true));
 
 /// The model-lifetime INT8 shadows of one layer's shared expert: A8 planes
 /// `[K/128][rows]` of 136-byte blocks (stored as F32 words: 34 per block).
