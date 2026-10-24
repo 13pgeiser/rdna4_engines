@@ -3388,13 +3388,28 @@ fn host_mapped_is_gtt() -> bool {
 /// pressure (`echo 2 | sudo tee /proc/sys/vm/drop_caches` empties it at
 /// once). 0 unless host-mapped memory is GTT-backed
 /// (`HSA_USERPTR_FOR_PAGED_MEM=0`), or when sysfs or `/proc/meminfo` is
-/// unreadable. Unified-memory sizing counts the pool through
-/// `Gpu::device_mem_info` instead.
+/// unreadable. Loads that hold a [`rdna_compute::Gpu`] use
+/// [`ttm_pool_estimate_on`], which also counts the pool on a GTT-backed APU.
 pub fn ttm_pool_estimate() -> u64 {
     if !host_mapped_is_gtt() {
         return 0;
     }
     rdna_compute::uma_memory::ttm_pool_bytes()
+}
+
+/// [`ttm_pool_estimate`] for a load on `gpu`. A GTT-backed unified-memory APU
+/// (Strix Halo: a 1 GiB carve-out, the rest of the device pool is GTT) takes
+/// every allocation, weights and scratch included, from GTT, so a previous
+/// process's freed pages parked in TTM's page pool are available to it whether
+/// or not `HSA_USERPTR_FOR_PAGED_MEM=0` is set (hip-bridge leaves it unset on
+/// an APU, which ignores it). Without this count a reload after any exit
+/// reads the ~80 GiB the last process parked as `MemAvailable` it does not
+/// have.
+pub fn ttm_pool_estimate_on(gpu: &rdna_compute::Gpu) -> u64 {
+    if gpu.is_gtt_backed_apu() {
+        return rdna_compute::uma_memory::ttm_pool_bytes();
+    }
+    ttm_pool_estimate()
 }
 
 /// GTT room on the host: TTM's cap and what amdgpu devices already hold.

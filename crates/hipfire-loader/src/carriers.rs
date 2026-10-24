@@ -2957,7 +2957,7 @@ pub fn qwen4_preload_resource_plan(
         .map(|(free, _)| u64::try_from(free).unwrap_or(u64::MAX))
         .ok();
     let mem_available = rdna_compute::kv_slots::mem_available_bytes();
-    let ttm_pool = residency::ttm_pool_estimate();
+    let ttm_pool = residency::ttm_pool_estimate_on(gpu);
     let preallocation_gtt = residency::gtt_budget();
     let hotset_policy_for_plan = hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env()
         .map_err(|error| format!("qwen4 preload plan: hotset policy unreadable: {error}"))?;
@@ -4466,7 +4466,7 @@ fn load_qwen4_rank_scoped(
         .map(|(free, _)| u64::try_from(free).unwrap_or(u64::MAX))
         .ok();
     let preallocation_mem_available = rdna_compute::kv_slots::mem_available_bytes();
-    let preallocation_ttm_pool = residency::ttm_pool_estimate();
+    let preallocation_ttm_pool = residency::ttm_pool_estimate_on(&*ctx.gpu);
     let preallocation_gtt = residency::gtt_budget();
     // Exactly one owner of the planning inputs, including explicit-layers and
     // whole-first resident paths that previously never invoked `auto`.
@@ -6079,7 +6079,7 @@ fn load_qwen4_rank_scoped(
             if let Err(reason) = residency::check_host_ram(
                 host_inc_bytes,
                 current_mem_available,
-                residency::ttm_pool_estimate(),
+                residency::ttm_pool_estimate_on(&*ctx.gpu),
             ) {
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!(
