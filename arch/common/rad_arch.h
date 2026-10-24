@@ -608,8 +608,18 @@ constexpr int64_t kPrefetchRows = 16;
  * would read in series on lane 0, so elsewhere the read goes on lane 1, behind a join from lane
  * 0. */
 inline bool prefetch_lane0() { return rad_chain_on() != 0; }
+/* RADIANCE_PREFETCH_BESIDE=0 issues none of these reads. Beside another server on the same card
+ * the lane-1 form costs more than it gains: the card has fewer hardware queue slots than the two
+ * servers have queues, and the join puts a queue switch into every decode step. */
+inline bool prefetch_beside_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_PREFETCH_BESIDE");
+        return !(e && e[0] == '0' && e[1] == 0);
+    }();
+    return on;
+}
 inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
-    if (!op || T > kPrefetchRows) return;
+    if (!op || T > kPrefetchRows || !prefetch_beside_on()) return;
     if (prefetch_lane0()) {
         RAD_ISSUE(c, op, RAD_W(w));
         return;
