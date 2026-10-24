@@ -14,6 +14,7 @@
 //    `None`, never silently addressing whoever now holds that slot.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::admission::{AdmissionController, AdmitError};
 use crate::prefix::{plan_turn, TurnPlan};
@@ -90,6 +91,9 @@ pub struct Session {
     pub published_boundary: usize,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
+    /// Wall-clock time of the last use/refresh. The idle sweep ages parked
+    /// sessions by this; `last_used` (ticks) orders the hard cap.
+    pub last_used_at: Instant,
     /// Whether this session currently holds its VRAM admission grant.
     /// Admission is charged for GPU-resident state only (#776): a Swapped or
     /// Cold session holds no KV on the device, so leaving it charged lets
@@ -151,6 +155,7 @@ impl SessionTable {
                     self.clock += 1;
                     self.clock
                 },
+                last_used_at: Instant::now(),
             },
         );
         Ok(SessionId(id))
@@ -233,6 +238,7 @@ impl SessionTable {
             .map_err(|e| format!("begin_turn: {e}"))?;
         session.tokens.truncate(plan.reused);
         session.next_pos = plan.reused;
+        session.last_used_at = Instant::now();
         Ok(plan)
     }
 
@@ -302,6 +308,7 @@ impl SessionTable {
         let now = self.clock;
         if let Some(s) = self.sessions.get_mut(&id.0) {
             s.last_used = now;
+            s.last_used_at = Instant::now();
         }
     }
 
@@ -381,6 +388,91 @@ impl SessionTable {
         }
     }
 
+    /// Re-open a `Cold` session into a slot for a re-prefill.
+    ///
+    /// A session whose snapshot was evicted (or failed to restore) is Cold but
+    /// still owns its conversation identity and tokens. Minting a new session
+    /// would leave the old entry in the table forever, so the cold admit path
+    /// reopens it instead and re-prefills into the same id.
+    ///
+    /// Fails without mutating when the session is missing, not Cold, or already
+    /// holds a slot/grant. A successful admission is released again when the
+    /// pool has no free slot.
+    pub fn reopen_cold(
+        &mut self,
+        pool: &mut SlotPool,
+        adm: &mut AdmissionController,
+        id: SessionId,
+        requested_ctx: usize,
+    ) -> Result<SessionId, AdmitError> {
+        let Some(session) = self.sessions.get(&id.0) else {
+            return Err(AdmitError::UnknownSession(id.0));
+        };
+        if session.residency != Residency::Cold || session.slot.is_some() || session.admitted {
+            return Err(AdmitError::UnknownSession(id.0));
+        }
+        let granted_ctx = adm.admit(id.0, requested_ctx)?;
+        let Some(slot) = pool.acquire() else {
+            adm.release(id.0);
+            return Err(AdmitError::PoolFull);
+        };
+        self.clock += 1;
+        let now = self.clock;
+        let session = self.sessions.get_mut(&id.0).expect("checked above");
+        session.slot = Some(slot);
+        session.granted_ctx = granted_ctx;
+        session.admitted = true;
+        session.residency = Residency::Resident;
+        session.tokens.clear();
+        session.next_pos = 0;
+        session.published_boundary = 0;
+        session.last_used = now;
+        Ok(id)
+    }
+
+    /// Close parked sessions that have aged out, then enforce a hard cap on
+    /// non-resident sessions.
+    ///
+    /// `Resident` sessions are never touched here: the slot/eviction machinery
+    /// owns them. A parked session is only a cache entry — closing it costs a
+    /// cold re-prefill from the next prompt — so this is how abandoned
+    /// conversations stop accumulating tokens and swap entries forever. The
+    /// caller drops the returned ids' swap snapshots.
+    pub fn sweep_expired(
+        &mut self,
+        pool: &mut SlotPool,
+        adm: &mut AdmissionController,
+        now: Instant,
+        max_idle: Duration,
+        max_sessions: usize,
+    ) -> Vec<SessionId> {
+        let mut closed = Vec::new();
+        let mut expired: Vec<u64> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.residency != Residency::Resident)
+            .filter(|(_, s)| now.saturating_duration_since(s.last_used_at) > max_idle)
+            .map(|(id, _)| *id)
+            .collect();
+        expired.sort_unstable();
+        for id in expired {
+            self.close(pool, adm, SessionId(id));
+            closed.push(SessionId(id));
+        }
+        while self.sessions.len() > max_sessions {
+            let victim = self
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.residency != Residency::Resident)
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(id, _)| SessionId(*id));
+            let Some(id) = victim else { break };
+            self.close(pool, adm, id);
+            closed.push(id);
+        }
+        closed
+    }
+
     /// Re-attach a session to a slot after its state has been restored.
     /// Call [`Self::readmit`] first; this does not touch admission.
     pub fn mark_resident(&mut self, id: SessionId, slot: SlotId, seq_len: usize) {
@@ -391,6 +483,7 @@ impl SessionTable {
             s.residency = Residency::Resident;
             s.next_pos = seq_len;
             s.last_used = now;
+            s.last_used_at = Instant::now();
         }
     }
 
@@ -411,7 +504,7 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admission::{AdmissionController, ModelFootprint};
+    use crate::admission::{AdmissionController, AdmitError, ModelFootprint};
     use rdna_compute::slot_pool::SlotPool;
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -860,5 +953,149 @@ mod tests {
         assert!(!t.is_admitted(a));
         t.close(&mut pool, &mut adm, a);
         assert_eq!(adm.used_bytes(), GIB + 1024 * 1024, "b keeps its charge");
+    }
+
+    #[test]
+    fn reopen_cold_reuses_the_session_id_and_resets_its_state() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.tokens = vec![1, 2, 3];
+            s.next_pos = 3;
+            s.published_boundary = 2;
+        }
+        t.mark_cold(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+        let id = t.reopen_cold(&mut pool, &mut adm, a, 2048).unwrap();
+        assert_eq!(id, a, "the same session is reused");
+        let s = t.get(a).unwrap();
+        assert_eq!(s.residency, Residency::Resident);
+        assert!(s.slot.is_some());
+        assert!(s.tokens.is_empty(), "the re-prefill starts from zero");
+        assert_eq!(s.next_pos, 0);
+        assert_eq!(s.published_boundary, 0);
+        assert_eq!(s.granted_ctx, 2048);
+        assert!(t.is_admitted(a));
+        assert_eq!(t.active(), 1, "no second session was minted");
+        assert_eq!(adm.used_bytes(), GIB + 2048 * 1024);
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(adm.used_bytes(), 0);
+    }
+
+    #[test]
+    fn reopen_cold_refuses_a_session_that_is_not_cold() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        assert!(matches!(
+            t.reopen_cold(&mut pool, &mut adm, a, 1024),
+            Err(AdmitError::UnknownSession(id)) if id == a.0
+        ));
+        assert!(
+            t.is_admitted(a),
+            "a refused reopen must not disturb the grant"
+        );
+        t.close(&mut pool, &mut adm, a);
+    }
+
+    #[test]
+    fn reopen_cold_releases_admission_when_the_pool_is_full() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_cold(&mut pool, &mut adm, a);
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let before = adm.used_bytes();
+        assert!(matches!(
+            t.reopen_cold(&mut pool, &mut adm, a, 1024),
+            Err(AdmitError::PoolFull)
+        ));
+        assert!(
+            !t.is_admitted(a),
+            "the failed acquire must not leave a grant behind"
+        );
+        assert_eq!(adm.used_bytes(), before);
+        t.close(&mut pool, &mut adm, b);
+        assert!(t.reopen_cold(&mut pool, &mut adm, a, 1024).is_ok());
+        t.close(&mut pool, &mut adm, a);
+    }
+
+    #[test]
+    fn reopen_cold_refuses_an_unknown_session() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        assert!(matches!(
+            t.reopen_cold(&mut pool, &mut adm, SessionId(77), 1024),
+            Err(AdmitError::UnknownSession(77))
+        ));
+    }
+
+    #[test]
+    fn sweep_expired_closes_stale_parked_sessions_only() {
+        let (mut pool, mut adm, mut t) = rig(3);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, b);
+        let now = Instant::now();
+        {
+            let s = t.get_mut(b).unwrap();
+            s.last_used_at = now.checked_sub(Duration::from_secs(7200)).unwrap();
+        }
+        let closed = t.sweep_expired(&mut pool, &mut adm, now, Duration::from_secs(3600), 64);
+        assert_eq!(closed, vec![b]);
+        assert!(t.get(a).is_some(), "a resident session is never swept");
+        assert!(t.get(b).is_none());
+    }
+
+    #[test]
+    fn sweep_keeps_a_recently_used_parked_session() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, a);
+        let closed = t.sweep_expired(
+            &mut pool,
+            &mut adm,
+            Instant::now(),
+            Duration::from_secs(3600),
+            64,
+        );
+        assert!(closed.is_empty(), "a fresh snapshot is still useful");
+        assert!(t.get(a).is_some());
+    }
+
+    #[test]
+    fn sweep_cap_closes_the_lru_nonresident_but_keeps_resident() {
+        let (mut pool, mut adm, mut t) = rig(3);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let c = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, &mut adm, b);
+        t.mark_swapped(&mut pool, &mut adm, c);
+        let closed = t.sweep_expired(
+            &mut pool,
+            &mut adm,
+            Instant::now(),
+            Duration::from_secs(3600),
+            2,
+        );
+        assert_eq!(closed, vec![b], "the LRU parked session goes first");
+        assert!(t.get(a).is_some(), "the resident session is untouched");
+        assert!(t.get(c).is_some());
+        assert_eq!(t.active(), 2);
+    }
+
+    #[test]
+    fn sweep_with_all_sessions_resident_stops_at_the_cap() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let closed = t.sweep_expired(
+            &mut pool,
+            &mut adm,
+            Instant::now(),
+            Duration::from_secs(3600),
+            1,
+        );
+        assert!(closed.is_empty(), "resident sessions are not sweep victims");
+        assert!(t.get(a).is_some());
+        assert!(t.get(b).is_some());
     }
 }

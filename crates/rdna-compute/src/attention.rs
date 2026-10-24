@@ -830,7 +830,8 @@ fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
 const VERIFY_WMMA_ROWS: usize = 16;
 /// Keys per reference WMMA key tile (one f16 S tile in scratch).
 const VERIFY_WMMA_KEYS: usize = 16;
-/// f16 S tiles per (row group, kv head): the reference's 6 heads x 16 rows.
+/// f16 S tile slots per (row group, kv head): the kernel's maximum GQA group
+/// (6 heads x 16 rows); GQA 4 leaves the last two slots unused.
 const VERIFY_WMMA_FRAGS: usize = 6;
 
 /// P.V walker of the gfx1151 WMMA VerifyAttn twin (Halo sweep: the two that
@@ -863,8 +864,8 @@ impl VerifyWmmaPv {
 /// [`VerifyWmmaGeometry::default`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifyWmmaGeometry {
-    /// Pack (head, row) pairs densely into ceil(6*rows/16) WMMA fragments
-    /// instead of the reference's 6 head fragments of 16 rows.
+    /// Pack (head, row) pairs densely into ceil(group*rows/16) WMMA fragments
+    /// instead of the reference's `group` head fragments of 16 rows.
     pub packed: bool,
     /// Waves the S = Q.K^T launch aims for; its split count (grid y) is this
     /// over the waves of one split, capped by the scratch tile stride.
@@ -10171,9 +10172,12 @@ impl Gpu {
         {
             return Ok(false);
         }
+        // GQA 6 (27B, Flash-Next) and GQA 4 (Qwen3.5-9B); the kernel's
+        // `group` only indexes heads, so the arithmetic is the same.
+        let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
         if head_dim != 256
-            || n_kv_heads == 0
-            || n_heads != 6 * n_kv_heads
+            || n_heads != group * n_kv_heads
+            || !matches!(group, 4 | 6)
             || !(1..=VERIFY_GQA_MAX_ROWS).contains(&batch_size)
             || max_ctx_len == 0
         {
@@ -10192,7 +10196,7 @@ impl Gpu {
         // Fragments of row group 0 (the largest) set the block size.
         let rows0 = batch_size.min(VERIFY_WMMA_ROWS);
         let pack = if geom.packed { rows0 } else { VERIFY_WMMA_ROWS };
-        let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
+        let nf = (group * pack).div_ceil(VERIFY_WMMA_ROWS);
         // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
         let qk_block = (32 * nf.max(4)) as u32;
         let qk_splits = geom
@@ -10221,6 +10225,7 @@ impl Gpu {
         let s_ptr = scratch.buf.as_ptr();
         let nr = batch_size as i32;
         let nkv = n_kv_heads as i32;
+        let grp = group as i32;
         let ts = t_stride as i32;
         let pk = i32::from(geom.packed);
         let grid_x = (row_groups * n_kv_heads) as u32;
@@ -10232,6 +10237,7 @@ impl Gpu {
                 &s_ptr as *const _ as *mut c_void,
                 &nr as *const _ as *mut c_void,
                 &nkv as *const _ as *mut c_void,
+                &grp as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
                 &pk as *const _ as *mut c_void,
                 &scale as *const _ as *mut c_void,
@@ -10250,6 +10256,7 @@ impl Gpu {
                     b.push_ptr(s_ptr);
                     b.push_i32(nr);
                     b.push_i32(nkv);
+                    b.push_i32(grp);
                     b.push_i32(ts);
                     b.push_i32(pk);
                     b.push_f32(scale);
@@ -10265,6 +10272,7 @@ impl Gpu {
                 &o_ptr as *const _ as *mut c_void,
                 &nr as *const _ as *mut c_void,
                 &nkv as *const _ as *mut c_void,
+                &grp as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
                 &pk as *const _ as *mut c_void,
             ];
@@ -10282,6 +10290,7 @@ impl Gpu {
                     b.push_ptr(o_ptr);
                     b.push_i32(nr);
                     b.push_i32(nkv);
+                    b.push_i32(grp);
                     b.push_i32(ts);
                     b.push_i32(pk);
                     b
@@ -18238,6 +18247,81 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// gfx1151 DFlash draft full attention at head_dim 128
+    /// (`attention_dflash_wmma_kvsplit_gfx1151`): same contract as
+    /// [`Self::attention_dflash_wmma_n64_f32`], keys split across 8 waves per
+    /// (head, 16-row tile). Not byte-identical to N64 (another f32 reduction
+    /// order). `Ok(false)` = not gfx1151 or head_dim != 128; the caller runs N64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention_dflash_wmma_kvsplit(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1151" || head_dim != 128 {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_kvsplit_gfx1151: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        let name = "attention_dflash_wmma_kvsplit_gfx1151";
+        self.ensure_kernel(
+            name,
+            kernels::ATTENTION_DFLASH_WMMA_KVSPLIT_GFX1151_SRC,
+            name,
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let (qp, kp, vp, op) = (
+            q.buf.as_ptr(),
+            k.buf.as_ptr(),
+            v.buf.as_ptr(),
+            out.buf.as_ptr(),
+        );
+        let (bi, li, nh, nkv) = (b as i32, l as i32, n_heads as i32, n_kv_heads as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+            &li as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [n_heads as u32, b.div_ceil(16) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(qp);
+                blob.push_ptr(kp);
+                blob.push_ptr(vp);
+                blob.push_ptr(op);
+                blob.push_i32(bi);
+                blob.push_i32(li);
+                blob.push_i32(nh);
+                blob.push_i32(nkv);
+                blob.push_f32(scale);
+                blob
+            },
+        )?;
+        Ok(true)
     }
 
     /// FlashAttention-style WMMA, M=32 query tile and N=64 K-tile,

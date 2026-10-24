@@ -429,6 +429,70 @@ impl Metrics {
             );
         }
 
+        // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
+        // before the first request). No samples on the standard route.
+        if meta.loaded.swap.is_object() {
+            let swap_u64 = |key: &str| {
+                meta.loaded
+                    .swap
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let tier = meta
+                .loaded
+                .swap
+                .get("tier")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("none");
+            out.push_str(
+                "# HELP hipfire_swap_info The multi-slot swap tier.\n# TYPE hipfire_swap_info gauge\n",
+            );
+            out.push_str(&format!(
+                "hipfire_swap_info{{tier=\"{}\"}} 1\n",
+                escape_label(tier)
+            ));
+            for (name, help, key) in [
+                (
+                    "hipfire_swap_evictions",
+                    "Sessions parked to swap since the engine started.",
+                    "evictions",
+                ),
+                (
+                    "hipfire_swap_restores",
+                    "Sessions restored from swap since the engine started.",
+                    "restores",
+                ),
+                (
+                    "hipfire_swap_failures",
+                    "Swap park or restore failures since the engine started.",
+                    "failures",
+                ),
+                (
+                    "hipfire_swap_host_used_bytes",
+                    "Host-tier bytes held by parked snapshots.",
+                    "host_used",
+                ),
+                (
+                    "hipfire_swap_disk_used_bytes",
+                    "Disk-tier bytes held by parked snapshots.",
+                    "disk_used",
+                ),
+                (
+                    "hipfire_swap_host_budget_bytes",
+                    "Effective host-tier swap budget.",
+                    "host_budget",
+                ),
+                (
+                    "hipfire_swap_disk_budget_bytes",
+                    "Effective disk-tier swap budget.",
+                    "disk_budget",
+                ),
+            ] {
+                gauge(&mut out, name, help, swap_u64(key) as f64);
+            }
+        }
+
         self.ttft_ms.render(
             &mut out,
             "hipfire_ttft_milliseconds",
@@ -737,5 +801,35 @@ mod tests {
         let out = m.render(&unpaged, 0, 16);
         assert!(out.contains("hipfire_slots_total 2\n"), "{out}");
         assert!(!out.contains("hipfire_kv_pages"), "{out}");
+    }
+
+    #[test]
+    fn swap_gauges_render_only_when_published() {
+        let m = Metrics::default();
+        let mut meta = ServeMeta::new("t".to_owned());
+        let out = m.render(&meta, 0, 1);
+        assert!(!out.contains("hipfire_swap_info"), "{out}");
+
+        meta.loaded.swap = serde_json::json!({
+            "tier": "disk",
+            "evictions": 2,
+            "restores": 1,
+            "failures": 0,
+            "host_budget": 0,
+            "host_used": 0,
+            "disk_budget": 134217728,
+            "disk_used": 41180412,
+        });
+        let out = m.render(&meta, 0, 1);
+        for series in [
+            "hipfire_swap_info{tier=\"disk\"} 1\n",
+            "hipfire_swap_evictions 2\n",
+            "hipfire_swap_restores 1\n",
+            "hipfire_swap_failures 0\n",
+            "hipfire_swap_disk_used_bytes 41180412\n",
+            "hipfire_swap_disk_budget_bytes 134217728\n",
+        ] {
+            assert!(out.contains(series), "{series}: {out}");
+        }
     }
 }
