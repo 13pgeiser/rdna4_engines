@@ -24,7 +24,7 @@
 //         groups. Without the barrier PF has no effect.
 //   DOT2  v_dot2_f32_f16 row sum from the packed f16 P: 4 instructions instead of 8, and the
 //         denominator uses the p values the PV matmul used.
-//   BTS/KWIDE/GPREV  tile staging; see each define.
+//   BTS/KWIDE/GPREV/KLATE  tile staging; see each define.
 //   QK8   Lossy. Q rounded to e4m3 once at load, after the folded scale; K as e4m3 bytes in LDS
 //         (half the tile) and Q.K^T runs as fp8 WMMA at twice the f16 rate.
 //   PV8   Lossy. P rounded to e4m3 and V as e4m3 bytes in LDS, P.V as fp8 WMMA. GROW is 8
@@ -66,6 +66,18 @@
 // LDSB: an LDS-scoped barrier instead of __syncthreads() (lds_barrier() in r4d_common.h). The
 // default fence invalidates the vector cache twice per tile, though only LDS needs ordering.
 #define O_LDSB  2097152
+// KLATE: on the fp8 and k6_v4 caches (the wide K fetch), tile ti+1's K is fetched once tile ti's last m-tile
+// has its scores (its K fragments are dead there, so kreg costs no live range across the WMMAs), and the
+// staging phase between the barriers only widens and stores. Without it the fetch sits between the
+// barriers and every wave of the workgroup (the only one on its WGP) waits out a global round trip
+// each tile. Together with the two load-order fixes it comes with (the K fetch is branch-free and the
+// fp8_v4 / k6_v4 V scales are packed at the store, not right after their loads, see below), on the R9700
+// (r4d_selftest --perfpaged, k6_v4, 2048 queries, three interleaved rounds, medians): over 100k keys
+// 25.96 -> 21.48 ms, over 160k 41.45 -> 34.01, over 25k 5.64 -> 5.45, 1024 queries over 50k 5.70 -> 5.48;
+// fp8 over 100k 24.6 -> 22.7, at 25k and 50k within noise; bf16 (the assume alone) about 1 % faster.
+// The gap is widest where the cache no longer holds the KV (k6_v4 at 100k is 70 MB against 64 MB of
+// Infinity Cache), so the global round trip is a DRAM one.
+#define O_KLATE 4194304
 // O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
 #define O_V4    33554432
 #define O_K6    67108864
@@ -122,6 +134,11 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
+    // fp8_v4 keeps the old order on all three counts (KLATE, the assume, the scale pack): with them it
+    // gains at 100k (27.1 -> 22.5 ms) but loses 3 % at 25k and 50k, and without KLATE the other two
+    // lose it 6-7 % there.
+    constexpr int OLDV4 = V4 && !K6;
+    constexpr int KLATE = ((OPT & O_KLATE) && KWIDE && !KVP && !OLDV4) ? 1 : 0;
     constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
     constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
     static_assert(!(OPT & (O_QK8 | O_PV8)) || !KVP,
@@ -157,6 +174,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     uint8_t* const sV8 = (uint8_t*)sV16;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    // The launch is NTHR threads. Stated, so the wide K fetch's `key >= TILE` test (never true:
+    // KITEMS == NTHR) folds: as a branch its join made the compiler wait on every load in flight right
+    // after the K fetch, the V stores' cover included.
+    if constexpr (!OLDV4) __builtin_assume(tid < NTHR);
     const int c = lane & 15, h = lane >> 4;
 
     const int qb = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
@@ -245,7 +266,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     static_assert(!V4 || F16, "fp8_v4 widens V to f16");
     constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
     constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
-    uint32_t v4c[U4][2], v4s[U4];
+    // The pair's two scales stay apart until storeV4 packs them: packed here, the prefetch a tile
+    // ahead would be waited on right after it is issued (fp8_v4 packs here as before, see KLATE).
+    uint32_t v4c[U4][2], v4s[U4][2];
     auto fetchV4 = [&](int k0, const int* blks) {
         #pragma unroll
         for (int r = 0; r < U4; ++r) {
@@ -262,7 +285,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }
-                v4s[r] = sc[0] | (sc[1] << 16);
+                if constexpr (OLDV4) { v4s[r][0] = sc[0] | (sc[1] << 16); v4s[r][1] = 0; }
+                else                 { v4s[r][0] = sc[0]; v4s[r][1] = sc[1]; }
             }
         }
     };
@@ -278,7 +302,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
                 const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
-                const h2 s2 = __builtin_bit_cast(h2, v4s[r]);
+                const h2 s2 = __builtin_bit_cast(h2, OLDV4 ? v4s[r][0] : (v4s[r][0] | (v4s[r][1] << 16)));
                 const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
                 uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
@@ -456,6 +480,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     if (BTS) load_bt(tstart * NB, blk);
     if (GPREV) fetchV(tstart * TILE, blk);
     if (V4) fetchV4(tstart * TILE, blk);
+    if (KLATE) fetchK(tstart * TILE, blk);
 
     for (int ti = tstart; ti < ntiles; ++ti) {
         const int k0 = ti * TILE;
@@ -464,8 +489,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
             load_bt((ti + 1) * NB, blkn);
         }
         if (LDSB) lds_barrier(); else __syncthreads();
-        fetchK(k0, blk);
-        // V first: already in registers, so it covers K's load latency.
+        if (!KLATE) fetchK(k0, blk);
+        // V first: already in registers.
         if constexpr (V4) { storeV4(); } else { if (!GPREV) fetchV(k0, blk); storeV(); }
         storeK();
         if (LDSB) lds_barrier(); else __syncthreads();
@@ -513,6 +538,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     for (int j = 0; j < PF; ++j) s = D::wmma(kb[j], qf[g + j], s);
                 }
             }
+            if (KLATE && mt == MT - 1 && ti + 1 < ntiles) fetchK(k0 + TILE, blkn);
             float sc[8];
             #pragma unroll
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
