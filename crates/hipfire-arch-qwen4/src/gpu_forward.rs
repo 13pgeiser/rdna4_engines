@@ -5925,6 +5925,55 @@ impl NpuBankKind {
     }
 }
 
+/// How a scratch bank holds its device memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScratchBackingKind {
+    /// Every owning root is a `gpu.zeros` allocation (the ordinary bank).
+    Owned,
+    /// Owning roots are allocated, but `TokenIds` aliases a persistent tensor
+    /// that another owner frees once (the resident bank of a decode-share load).
+    ExternalIds,
+    /// Every root, and `TokenIds`, is a view of external memory (a decode-share
+    /// prefill bank over the donor span): the bank frees nothing.
+    Borrowed,
+}
+
+impl ScratchBackingKind {
+    /// Whether the bank frees the tensor of `field` (`slot` is its plan entry).
+    fn frees(
+        self,
+        field: ScratchField,
+        slot: &ScratchSlot,
+        bank_kind: Option<NpuBankKind>,
+    ) -> bool {
+        match self {
+            Self::Borrowed => false,
+            Self::ExternalIds if field == ScratchField::TokenIds => false,
+            Self::Owned | Self::ExternalIds => {
+                slot.owner.is_none()
+                    && slot.elements != 0
+                    && bank_kind.map_or(true, |kind| kind.owns(field))
+            }
+        }
+    }
+}
+
+/// The fields a bank with `slots` frees on teardown (a pure function of its
+/// plan and backing, so the decode-share free rules are testable on the CPU).
+#[cfg(test)]
+fn scratch_free_list(
+    slots: &[ScratchSlot],
+    bank_kind: Option<NpuBankKind>,
+    backing: ScratchBackingKind,
+) -> Vec<ScratchField> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| backing.frees(ScratchField::ALL[*index], slot, bank_kind))
+        .map(|(index, _)| ScratchField::ALL[index])
+        .collect()
+}
+
 /// One field of a scratch plan.
 ///
 /// `owner == None`: the field owns a device allocation of `elements` of
@@ -6136,6 +6185,7 @@ pub struct Qwen4GpuForwardScratch {
     /// its twin projection writes ahead of the consuming Core) are owned here.
     /// Bank A outlives this view.
     bank_kind: Option<NpuBankKind>,
+    backing: ScratchBackingKind,
     pub token_ids: GpuTensor,
     pub embedding_rot: GpuTensor,
     pub embeddings: GpuTensor,
@@ -6839,38 +6889,13 @@ impl Qwen4GpuForwardScratch {
             })
     }
 
-    fn allocate(
-        gpu: &mut Gpu,
-        config: &Qwen4Config,
-        max_chunk: usize,
-        mode: Qwen4ForwardScratchMode,
-        bank: Option<(&Self, NpuBankKind)>,
-        scope: &Qwen4BandScope,
-    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
-        let bank_a = bank.map(|(bank_a, _)| bank_a);
-        let bank_kind = bank.map(|(_, kind)| kind);
-        let (slots, max_ple_bytes) = Self::plan_scoped(config, max_chunk, mode, scope)?;
-        // Owners first; a view needs its owner's pointer.
-        let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
-        for (index, slot) in slots.iter().enumerate() {
-            if slot.owner.is_some()
-                || slot.elements == 0
-                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
-            {
-                tensors.push(None);
-                continue;
-            }
-            match gpu.zeros(&[slot.elements], slot.dtype) {
-                Ok(tensor) => tensors.push(Some(tensor)),
-                Err(error) => {
-                    // Only owners are present: each is freed exactly once.
-                    for tensor in tensors.into_iter().flatten() {
-                        let _ = gpu.free_tensor(tensor);
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
+    /// Bind every view slot of `slots` to its owner's tensor and every absent
+    /// (zero-element) field to a zero-length placeholder. `tensors` holds the
+    /// owning roots (allocated or placed in a borrowed span) at their field
+    /// indexes; the one routine both [`Self::allocate_with`] and
+    /// [`Self::new_borrowed`] build views with, so a borrowed bank's offsets,
+    /// pitches and dtypes are the allocated bank's by construction.
+    fn bind_views(slots: &[ScratchSlot], tensors: &mut [Option<GpuTensor>]) {
         for (index, slot) in slots.iter().enumerate() {
             if let Some(owner) = slot.owner {
                 let owner_tensor = tensors[owner as usize]
@@ -6904,6 +6929,179 @@ impl Qwen4GpuForwardScratch {
                 tensors[index] = Some(placeholder);
             }
         }
+    }
+
+    /// `TokenIds` of a decode-share bank is a view of the persistent
+    /// `token_ids` (`Raw`, the prompt chunk's rows), shared by every bank of
+    /// the load because `uploaded_token_ids` outlives a prefill forward.
+    fn check_external_ids(
+        slots: &[ScratchSlot],
+        token_ids: &GpuTensor,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let slot = &slots[ScratchField::TokenIds as usize];
+        if token_ids.dtype != slot.dtype || token_ids.numel() < slot.elements {
+            return Err(invalid(format!(
+                "persistent token ids ({:?} x {}) cannot back a bank's {:?} x {} token ids",
+                token_ids.dtype,
+                token_ids.numel(),
+                slot.dtype,
+                slot.elements
+            )));
+        }
+        Ok(())
+    }
+
+    /// The resident bank of a decode-share load: [`Self::new_scoped`] for `rows`
+    /// rows, except that `TokenIds` aliases the persistent `token_ids` (which
+    /// holds the prompt chunk's rows and is freed once by its owner), so the
+    /// bank allocates and frees no token-id storage.
+    pub(crate) fn new_resident_scoped(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        rows: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+        token_ids: &GpuTensor,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        Self::allocate_with(gpu, config, rows, mode, None, scope, Some(token_ids))
+    }
+
+    /// A prefill bank of a decode-share load for `rows` rows: no allocation, no
+    /// zeroing. Every owning root of `plan_scoped(config, rows, mode, scope)`
+    /// is a non-owning tensor at `base + root.offset` of the external span
+    /// ([`Self::borrowed_backing`] places them; the span is `span_bytes` long),
+    /// every view slot is built from its owner by [`Self::bind_views`] exactly
+    /// as [`Self::allocate_with`] builds it, and `TokenIds` is a view of the
+    /// persistent `token_ids`. Host vectors are returned as `allocate` returns
+    /// them (sized for this bank); the caller keeps the largest bank's.
+    /// [`Self::free_gpu`] frees nothing of a borrowed bank.
+    pub(crate) fn new_borrowed(
+        config: &Qwen4Config,
+        rows: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+        base: usize,
+        span_bytes: usize,
+        token_ids: &GpuTensor,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        let (slots, max_ple_bytes) = Self::plan_scoped(config, rows, mode, scope)?;
+        let backing = Self::borrowed_backing(config, rows, mode, scope)?;
+        if backing.span_bytes > span_bytes as u64 {
+            return Err(invalid(format!(
+                "a {rows}-row borrowed scratch bank needs {} bytes but its span has {span_bytes}",
+                backing.span_bytes
+            )));
+        }
+        if base % DECODE_SHARE_ROOT_ALIGN as usize != 0 {
+            return Err(invalid(format!(
+                "borrowed scratch span base {base:#x} is not {DECODE_SHARE_ROOT_ALIGN}-byte aligned"
+            )));
+        }
+        Self::check_external_ids(&slots, token_ids)?;
+        let mut tensors: Vec<Option<GpuTensor>> = (0..slots.len()).map(|_| None).collect();
+        for root in &backing.roots {
+            let index = root.field as usize;
+            let slot = &slots[index];
+            let address = usize::try_from(root.offset)
+                .ok()
+                .and_then(|offset| base.checked_add(offset))
+                .ok_or_else(|| invalid("borrowed scratch root address overflows"))?;
+            let bytes = usize::try_from(root.bytes)
+                .map_err(|_| invalid("borrowed scratch root bytes overflow"))?;
+            // SAFETY: `root.offset + root.bytes <= backing.span_bytes <=
+            // span_bytes`, and the caller guarantees `[base, base + span_bytes)`
+            // is live device memory for the bank's life. The tensor is a
+            // `Borrowed` buffer: no free path ever receives it
+            // (`ScratchBackingKind::Borrowed` frees nothing).
+            let buf = unsafe {
+                hip_bridge::DeviceBuffer::from_raw(address as *mut std::ffi::c_void, bytes)
+            };
+            tensors[index] = Some(GpuTensor {
+                buf,
+                shape: vec![slot.elements],
+                dtype: slot.dtype,
+            });
+        }
+        let ids_slot = &slots[ScratchField::TokenIds as usize];
+        tensors[ScratchField::TokenIds as usize] = Some(token_ids.sub_offset(0, ids_slot.elements));
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.owner.is_none() && slot.elements != 0 && tensors[index].is_none() {
+                return Err(invalid(format!(
+                    "borrowed scratch backing places no root for {:?}",
+                    ScratchField::ALL[index]
+                )));
+            }
+        }
+        Self::bind_views(&slots, &mut tensors);
+        Ok(Self::from_tensors(
+            rows,
+            mode,
+            None,
+            ScratchBackingKind::Borrowed,
+            slots,
+            tensors,
+            max_ple_bytes,
+        ))
+    }
+
+    fn allocate(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        bank: Option<(&Self, NpuBankKind)>,
+        scope: &Qwen4BandScope,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        Self::allocate_with(gpu, config, max_chunk, mode, bank, scope, None)
+    }
+
+    /// [`Self::allocate`]; with `external_ids` the bank's `TokenIds` is a
+    /// non-owning alias of that persistent tensor instead of an allocation.
+    fn allocate_with(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        bank: Option<(&Self, NpuBankKind)>,
+        scope: &Qwen4BandScope,
+        external_ids: Option<&GpuTensor>,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        let bank_a = bank.map(|(bank_a, _)| bank_a);
+        let bank_kind = bank.map(|(_, kind)| kind);
+        let (slots, max_ple_bytes) = Self::plan_scoped(config, max_chunk, mode, scope)?;
+        if let Some(token_ids) = external_ids {
+            Self::check_external_ids(&slots, token_ids)?;
+        }
+        // Owners first; a view needs its owner's pointer.
+        let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.owner.is_some()
+                || slot.elements == 0
+                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
+                || (external_ids.is_some() && ScratchField::ALL[index] == ScratchField::TokenIds)
+            {
+                tensors.push(None);
+                continue;
+            }
+            match gpu.zeros(&[slot.elements], slot.dtype) {
+                Ok(tensor) => tensors.push(Some(tensor)),
+                Err(error) => {
+                    // Only owners are present: each is freed exactly once.
+                    for tensor in tensors.into_iter().flatten() {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        if let Some(token_ids) = external_ids {
+            // The whole persistent tensor (the prompt chunk's rows): the ids a
+            // prefill forward uploaded are read through this bank afterwards
+            // (`uploaded_token_ids`, the MTP head append).
+            tensors[ScratchField::TokenIds as usize] =
+                Some(token_ids.sub_offset(0, token_ids.numel()));
+        }
+        Self::bind_views(&slots, &mut tensors);
         if let Some(bank_a) = bank_a {
             for (index, slot) in slots.iter().enumerate() {
                 let field = ScratchField::ALL[index];
@@ -6912,6 +7110,34 @@ impl Qwen4GpuForwardScratch {
                 }
             }
         }
+        let backing = if external_ids.is_some() {
+            ScratchBackingKind::ExternalIds
+        } else {
+            ScratchBackingKind::Owned
+        };
+        Ok(Self::from_tensors(
+            max_chunk,
+            mode,
+            bank_kind,
+            backing,
+            slots,
+            tensors,
+            max_ple_bytes,
+        ))
+    }
+
+    /// Assemble a bank from its bound tensors (every field exactly once) and
+    /// the host vectors an allocation returns: `max_chunk` token ids and the
+    /// PLE staging bytes.
+    fn from_tensors(
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        bank_kind: Option<NpuBankKind>,
+        backing: ScratchBackingKind,
+        slots: Vec<ScratchSlot>,
+        mut tensors: Vec<Option<GpuTensor>>,
+        max_ple_bytes: usize,
+    ) -> (Self, Vec<u8>, Vec<u8>) {
         let mut take = |field: ScratchField| {
             tensors[field as usize]
                 .take()
@@ -6922,6 +7148,7 @@ impl Qwen4GpuForwardScratch {
             max_chunk,
             mode,
             bank_kind,
+            backing,
             token_ids: take(F::TokenIds),
             embedding_rot: take(F::EmbeddingRot),
             embeddings: take(F::Embeddings),
@@ -6984,11 +7211,11 @@ impl Qwen4GpuForwardScratch {
             logits: take(F::Logits),
             slots,
         };
-        Ok((
+        (
             scratch,
             vec![0; max_chunk * std::mem::size_of::<i32>()],
             vec![0; max_ple_bytes],
-        ))
+        )
     }
 
     /// The tensor of `field`: an owner's allocation or a borrowed view.
@@ -7153,6 +7380,7 @@ impl Qwen4GpuForwardScratch {
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let slots = self.slots;
         let bank_kind = self.bank_kind;
+        let backing = self.backing;
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -7217,10 +7445,7 @@ impl Qwen4GpuForwardScratch {
         debug_assert_eq!(tensors.len(), slots.len());
         let mut first = None;
         for (index, (tensor, slot)) in tensors.into_iter().zip(slots).enumerate() {
-            if slot.owner.is_some()
-                || slot.elements == 0
-                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
-            {
+            if !backing.frees(ScratchField::ALL[index], &slot, bank_kind) {
                 continue;
             }
             if let Err(error) = gpu.free_tensor(tensor) {
@@ -7840,6 +8065,156 @@ impl MoeStepHooks for LayerCaptureHooks<'_> {
     }
 }
 
+/// Whether the decode-share `bank` mode (owned test backing) is requested.
+fn decode_share_bank_requested() -> bool {
+    crate::decode_share::DecodeShareMode::from_env() == crate::decode_share::DecodeShareMode::Bank
+}
+
+/// Why a load cannot take the decode-share scratch banks, `None` when the
+/// admission basics hold: one band over the whole model, the compact
+/// `FnSymGfx1201` plan on gfx1201 (which also rules out the NPU trunk, whose
+/// pair executor needs the `Full` plan), a prompt chunk above the resident
+/// bank, and no expert parallelism, pipeline/mesh band or slow-link prefill.
+fn decode_share_refusal(
+    arch: &str,
+    mode: Qwen4ForwardScratchMode,
+    max_chunk: usize,
+    single_scope: bool,
+    ep: bool,
+    pipeline: bool,
+    slowlink: bool,
+) -> Option<&'static str> {
+    if !single_scope || pipeline {
+        Some("a pipeline-parallel or mesh band")
+    } else if mode != Qwen4ForwardScratchMode::FnSymGfx1201 {
+        Some("the forward scratch is not the compact FnSymGfx1201 plan")
+    } else if arch != "gfx1201" {
+        Some("the device is not gfx1201")
+    } else if max_chunk <= QWEN4_DECODE_SHARE_RESIDENT_ROWS {
+        Some("the prompt chunk is not above the resident bank rows")
+    } else if ep {
+        Some("expert parallelism")
+    } else if slowlink {
+        Some("S1 slow-link prefill")
+    } else {
+        None
+    }
+}
+
+/// The capacity class (index into [`qwen4_decode_share_classes`]) a prompt
+/// tile of `rows` rows runs on: the smallest class `>= rows`. `None` for a
+/// tile below [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] (it runs on the resident
+/// bank) and for one wider than the largest class (a capacity error).
+pub(crate) fn decode_share_class_for_rows(classes: &[usize], rows: usize) -> Option<usize> {
+    if rows < QWEN4_DECODE_SHARE_RESIDENT_ROWS {
+        return None;
+    }
+    classes.iter().position(|&class| class >= rows)
+}
+
+/// Rows of one prompt tile given the selected bank (`scratch`) and the load's
+/// decode-share state: the share's prompt chunk, else the bank's capacity.
+fn prompt_chunk_rows_of(
+    share: Option<&DecodeShareBanks>,
+    scratch: &Qwen4GpuForwardScratch,
+) -> usize {
+    share.map_or(scratch.max_chunk, |share| share.max_chunk)
+}
+
+/// Memory the prefill banks of a decode-share load view.
+enum DecodeShareBacking {
+    /// S4: an owned device buffer of the largest class's span (a correctness
+    /// mode, charged nowhere). S5 adds the donor tail of expert VRAM.
+    Owned(GpuTensor),
+}
+
+impl DecodeShareBacking {
+    fn base(&self) -> usize {
+        match self {
+            Self::Owned(tensor) => tensor.buf.as_ptr() as usize,
+        }
+    }
+}
+
+/// Counters of a decode-share load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DecodeShareStats {
+    /// Prompt tiles that ran on a borrowed prefill bank.
+    pub tiles_borrowed: u64,
+    /// Bank swaps into `scratch` (one per borrowed tile).
+    pub bank_swaps: u64,
+}
+
+/// The scratch banks of a decode-share load. `Qwen4GpuForward::scratch` is the
+/// resident bank (rows [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`]) at every call
+/// boundary; a prompt tile of at least that many rows swaps the smallest
+/// prefill class that holds it in for the tile and swaps the resident bank
+/// back before the call returns.
+pub(crate) struct DecodeShareBanks {
+    /// Prompt chunk / schedule capacity ([`Qwen4GpuForward::prompt_chunk_rows`]).
+    max_chunk: usize,
+    /// Capacity of each prefill bank, ascending ([`qwen4_decode_share_classes`]).
+    classes: Vec<usize>,
+    /// Span bytes of each class: what a tile of that class dirties.
+    class_spans: Vec<u64>,
+    /// One prefill bank per class, ascending; the active class's slot is empty
+    /// while its bank is swapped into `scratch`.
+    banks: Vec<Option<Qwen4GpuForwardScratch>>,
+    /// The resident bank while a prefill bank is swapped in.
+    parked: Option<Qwen4GpuForwardScratch>,
+    /// Class index swapped into `scratch`.
+    active: Option<usize>,
+    /// Persistent `TokenIds` of `max_chunk` rows every bank views.
+    token_ids: GpuTensor,
+    backing: DecodeShareBacking,
+    /// Largest span of the classes used since the last restore (S5 restores
+    /// this prefix of the donor tail).
+    dirty_bytes: u64,
+    stats: DecodeShareStats,
+    /// Nesting depth of whole-prompt entries ([`Qwen4GpuForward::share_prompt_begin`]).
+    prompt_depth: u32,
+}
+
+impl DecodeShareBanks {
+    /// Swap the prefill bank of `class` into `scratch`, parking the resident one.
+    fn swap_in(&mut self, scratch: &mut Qwen4GpuForwardScratch, class: usize) {
+        debug_assert!(self.active.is_none() && self.parked.is_none());
+        let bank = self.banks[class]
+            .take()
+            .expect("a decode-share prefill bank is present when not active");
+        self.parked = Some(std::mem::replace(scratch, bank));
+        self.active = Some(class);
+        self.dirty_bytes = self.dirty_bytes.max(self.class_spans[class]);
+        self.stats.tiles_borrowed += 1;
+        self.stats.bank_swaps += 1;
+    }
+
+    /// Swap the resident bank back into `scratch`; a no-op when none is active.
+    fn swap_out(&mut self, scratch: &mut Qwen4GpuForwardScratch) {
+        if let (Some(class), Some(resident)) = (self.active.take(), self.parked.take()) {
+            self.banks[class] = Some(std::mem::replace(scratch, resident));
+        }
+    }
+
+    /// Free the persistent token ids and the owned backing; the prefill banks
+    /// own nothing. The resident bank is freed by its forward.
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for bank in self.banks.into_iter().flatten().chain(self.parked) {
+            if let Some(error) = bank.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        let DecodeShareBacking::Owned(backing) = self.backing;
+        for tensor in [backing, self.token_ids] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
 /// exact same chunk implementation.
@@ -7952,6 +8327,8 @@ pub struct Qwen4GpuForward {
     pub(crate) slowlink: crate::slowlink_prefill::SlowlinkSlot,
     #[cfg(target_os = "linux")]
     npu_trunk: Option<npu_forward::NpuForward>,
+    /// `Some` on a decode-share load: the prefill banks and bank-swap state.
+    share: Option<DecodeShareBanks>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -8808,6 +9185,111 @@ impl Qwen4GpuForward {
         npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay, rows, mode)
     }
 
+    /// The scratch of a decode-share (`bank`) load: the resident bank, one
+    /// borrowed prefill bank per [`qwen4_decode_share_classes`] class over an
+    /// owned test backing (S4: a correctness mode, charged nowhere), and the
+    /// persistent token ids every bank views. Returns the resident bank, the
+    /// share state and the largest host token/PLE staging vectors.
+    fn build_decode_share(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+    ) -> Result<(Qwen4GpuForwardScratch, DecodeShareBanks, Vec<u8>, Vec<u8>), Qwen4GpuForwardError>
+    {
+        let classes = qwen4_decode_share_classes(max_chunk);
+        let ids_bytes = max_chunk
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| invalid("decode-share token id bytes overflow"))?;
+        let token_ids = gpu.zeros(&[ids_bytes], DType::Raw)?;
+        let (resident, _, mut host_ple) = match Qwen4GpuForwardScratch::new_resident_scoped(
+            gpu,
+            config,
+            QWEN4_DECODE_SHARE_RESIDENT_ROWS,
+            mode,
+            scope,
+            &token_ids,
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                let _ = gpu.free_tensor(token_ids);
+                return Err(error);
+            }
+        };
+        let backings = classes
+            .iter()
+            .map(|&rows| Qwen4GpuForwardScratch::borrowed_backing(config, rows, mode, scope))
+            .collect::<Result<Vec<_>, _>>();
+        let class_spans: Vec<u64> = match backings {
+            Ok(backings) => backings.iter().map(|backing| backing.span_bytes).collect(),
+            Err(error) => {
+                let _ = resident.free_gpu(gpu);
+                let _ = gpu.free_tensor(token_ids);
+                return Err(error);
+            }
+        };
+        let span_bytes = class_spans.iter().copied().max().unwrap_or(0);
+        let backing = match usize::try_from(span_bytes)
+            .map_err(|_| invalid("decode-share backing bytes overflow"))
+            .and_then(|span| gpu.zeros(&[span], DType::Raw).map_err(Into::into))
+        {
+            Ok(tensor) => DecodeShareBacking::Owned(tensor),
+            Err(error) => {
+                let _ = resident.free_gpu(gpu);
+                let _ = gpu.free_tensor(token_ids);
+                return Err(error);
+            }
+        };
+        let mut share = DecodeShareBanks {
+            max_chunk,
+            classes,
+            class_spans,
+            banks: Vec::new(),
+            parked: None,
+            active: None,
+            token_ids,
+            backing,
+            dirty_bytes: 0,
+            stats: DecodeShareStats::default(),
+            prompt_depth: 0,
+        };
+        let mut host_token_bytes = vec![0u8; ids_bytes];
+        let (base, span) = (share.backing.base(), span_bytes as usize);
+        let mut failure = None;
+        for &rows in &share.classes.clone() {
+            match Qwen4GpuForwardScratch::new_borrowed(
+                config,
+                rows,
+                mode,
+                scope,
+                base,
+                span,
+                &share.token_ids,
+            ) {
+                Ok((bank, token_bytes, ple_bytes)) => {
+                    if token_bytes.len() > host_token_bytes.len() {
+                        host_token_bytes = token_bytes;
+                    }
+                    if ple_bytes.len() > host_ple.len() {
+                        host_ple = ple_bytes;
+                    }
+                    share.banks.push(Some(bank));
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            let _ = resident.free_gpu(gpu);
+            let _ = share.free_gpu(gpu);
+            return Err(error);
+        }
+        Ok((resident, share, host_token_bytes, host_ple))
+    }
+
     pub(crate) fn new_inner(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
@@ -8821,8 +9303,43 @@ impl Qwen4GpuForward {
         check_band_admission(bundle, &scope, single_scope)?;
         let mesh_trunk_ops = mesh_trunk_op_range(&bundle.config, &scope)?;
         let flash_next = bundle.config.profile.is_flash_next();
-        let (scratch, host_token_bytes, host_ple_bytes) =
-            Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
+        let share_classes = if decode_share_bank_requested() {
+            let refusal = decode_share_refusal(
+                &gpu.arch,
+                mode,
+                max_chunk,
+                single_scope,
+                bundle.weights.ep_placement().is_some() || bundle.ep.is_some(),
+                bundle.pp.is_some() || bundle.pp_band.is_some(),
+                bundle.slowlink_profile().is_some(),
+            );
+            if let Some(reason) = refusal {
+                eprintln!(
+                    "  qwen4 decode-share: {}=bank not taken ({reason}); \
+                     ordinary single scratch bank",
+                    crate::decode_share::DECODE_SHARE_ENV
+                );
+            }
+            refusal.is_none()
+        } else {
+            false
+        };
+        let (scratch, host_token_bytes, host_ple_bytes, share) = if share_classes {
+            let (scratch, share, host_token_bytes, host_ple_bytes) =
+                Self::build_decode_share(gpu, &bundle.config, max_chunk, mode, &scope)?;
+            eprintln!(
+                "  qwen4 decode-share[bank]: {}-row resident bank + prefill banks {:?} over an \
+                 owned test backing of {} MiB (prompt chunk {max_chunk})",
+                scratch.max_chunk,
+                share.classes,
+                share.class_spans.iter().copied().max().unwrap_or(0) >> 20
+            );
+            (scratch, host_token_bytes, host_ple_bytes, Some(share))
+        } else {
+            let (scratch, host_token_bytes, host_ple_bytes) =
+                Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
+            (scratch, host_token_bytes, host_ple_bytes, None)
+        };
         let mut moe: Vec<Option<Qwen4MoeLayerRuntime>> =
             (0..bundle.config.num_hidden_layers).map(|_| None).collect();
         let mut decode_q8 = Vec::new();
@@ -9330,6 +9847,9 @@ impl Qwen4GpuForward {
                 let _ = gpu.free_tensor(trace.device);
             }
             let _ = scratch.free_gpu(gpu);
+            if let Some(share) = share {
+                let _ = share.free_gpu(gpu);
+            }
             return Err(error);
         }
         Ok(Self {
@@ -9383,6 +9903,7 @@ impl Qwen4GpuForward {
             ),
             mesh_trunk_ops,
             slowlink: Default::default(),
+            share,
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
@@ -9661,6 +10182,11 @@ impl Qwen4GpuForward {
         peers: &[Vec<Qwen4PeerExpertSource>],
         gather: Arc<dyn MoeRowGather + Send + Sync>,
     ) -> Result<(), Qwen4GpuForwardError> {
+        if self.share.is_some() {
+            return Err(invalid(
+                "expert parallelism cannot attach to a decode-share forward (bank-selected scratch)",
+            ));
+        }
         let layers = self.moe_count();
         let max_chunk = self.scratch.max_chunk;
         // The EP decode runtime's route-selecting properties per MoE ordinal
@@ -9933,9 +10459,114 @@ impl Qwen4GpuForward {
     /// Name the tokens that follow the next forward (at most one chunk is
     /// kept); see the `ple_lookahead` field.
     pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
+        let rows = self.prompt_chunk_rows();
         self.ple_lookahead.clear();
         self.ple_lookahead
-            .extend_from_slice(&tokens[..tokens.len().min(self.scratch.max_chunk)]);
+            .extend_from_slice(&tokens[..tokens.len().min(rows)]);
+    }
+
+    /// Whether this forward runs decode-share banks (a resident bank plus
+    /// borrowed prefill banks).
+    pub(crate) fn decode_share_active(&self) -> bool {
+        self.share.is_some()
+    }
+
+    /// Rows of one prompt tile: the prompt schedule capacity every tiling loop,
+    /// chunk-size query and session boundary stride uses. On a decode-share
+    /// load the resident bank holds only
+    /// [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] rows while a prompt tile runs on a
+    /// borrowed prefill bank, so capacity is never the selected bank's
+    /// `max_chunk`; everywhere else it is `scratch.max_chunk`.
+    pub(crate) fn prompt_chunk_rows(&self) -> usize {
+        prompt_chunk_rows_of(self.share.as_ref(), &self.scratch)
+    }
+
+    /// The prefill class a tile of `rows` rows borrows; `None` runs the
+    /// resident bank (every tile below the resident rows, and any call on a
+    /// load without decode-share).
+    fn share_class_for_tile(&self, rows: usize) -> Result<Option<usize>, Qwen4GpuForwardError> {
+        let Some(share) = self.share.as_ref() else {
+            return Ok(None);
+        };
+        if rows < QWEN4_DECODE_SHARE_RESIDENT_ROWS {
+            return Ok(None);
+        }
+        decode_share_class_for_rows(&share.classes, rows)
+            .map(Some)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "a {rows}-row tile exceeds the largest decode-share prefill bank ({} rows)",
+                    share.classes.last().copied().unwrap_or(0)
+                ))
+            })
+    }
+
+    /// Before a prompt tile swaps prefill class `class` in. S4: nothing to
+    /// acquire (the test backing is owned); S5 implements the donor loan state
+    /// machine here.
+    fn share_acquire(&mut self, _gpu: &mut Gpu, _class: usize) -> Result<(), Qwen4GpuForwardError> {
+        Ok(())
+    }
+
+    /// Before a call that runs on the resident bank (decode, verify, lanes,
+    /// every tile below the resident rows). S4: nothing; S5 waits for or
+    /// enqueues the donor restore here.
+    pub(crate) fn share_require_resident(
+        &mut self,
+        _gpu: &mut Gpu,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        Ok(())
+    }
+
+    /// After every tile, with the resident bank back in `scratch` and whether
+    /// the tile succeeded. S4: nothing.
+    fn share_after_tile(&mut self, _gpu: &mut Gpu, _ok: bool) -> Result<(), Qwen4GpuForwardError> {
+        Ok(())
+    }
+
+    /// A whole-prompt entry begins: nested entries (a driver that issues
+    /// several `forward_chunk` calls inside its own whole-prompt loop) count,
+    /// and only the outermost one's [`Self::share_prompt_end`] finishes the
+    /// prompt. No-op without decode-share.
+    pub(crate) fn share_prompt_begin(&mut self) {
+        if let Some(share) = self.share.as_mut() {
+            share.prompt_depth += 1;
+        }
+    }
+
+    /// A whole-prompt entry ends (Ok and Err alike); the outermost one runs
+    /// [`Self::share_finish_prompt`]. No-op without decode-share.
+    pub(crate) fn share_prompt_end(&mut self, gpu: &mut Gpu) -> Result<(), Qwen4GpuForwardError> {
+        let Some(share) = self.share.as_mut() else {
+            return Ok(());
+        };
+        share.prompt_depth = share.prompt_depth.saturating_sub(1);
+        if share.prompt_depth == 0 {
+            self.share_finish_prompt(gpu)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The last scratch consumer of a whole prompt has run. S4: nothing; S5
+    /// restores the dirtied prefix of the donor tail from the mirror here.
+    pub(crate) fn share_finish_prompt(
+        &mut self,
+        _gpu: &mut Gpu,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        Ok(())
+    }
+
+    /// Device bytes this forward's scratch is charged: the resident bank, the
+    /// persistent token ids and the speculative buffers on a decode-share load
+    /// ([`qwen4_decode_share_dedicated_bytes`]); the whole forward otherwise.
+    pub(crate) fn forward_device_bytes(&self, config: &Qwen4Config) -> Option<u64> {
+        match self.share.as_ref() {
+            Some(share) => {
+                qwen4_decode_share_dedicated_bytes(config, share.max_chunk, self.scratch.mode)
+            }
+            None => qwen4_forward_device_bytes(config, self.scratch.max_chunk, self.scratch.mode),
+        }
     }
 
     /// Hand the forward the S1 slow-link profile the load admitted
@@ -9994,6 +10625,11 @@ impl Qwen4GpuForward {
         &mut self,
         gpu: &mut Gpu,
     ) -> Result<Option<RowTicket>, Qwen4GpuForwardError> {
+        if self.share.is_some() {
+            return Err(invalid(
+                "S1 slow-link prefill cannot run on a decode-share forward (bank-selected scratch)",
+            ));
+        }
         if let Some(stage) = self.expert_stage.as_ref() {
             stage.restore_blocking(gpu)?;
         }
@@ -10048,7 +10684,8 @@ impl Qwen4GpuForward {
         // executor (the layers drain again before freeing their buffers).
         let cpu_split_layers = self.cpu_split_layers;
         let Qwen4GpuForward {
-            scratch,
+            mut scratch,
+            share,
             host_ple,
             mesh_tokens,
             lane_tokens,
@@ -10095,7 +10732,20 @@ impl Qwen4GpuForward {
                 first.get_or_insert(e);
             }
         }
+        let mut share = share;
+        if let Some(share) = share.as_mut() {
+            // Never free through a prefill bank: the resident bank is back in
+            // `scratch` (and its owners are freed once, below).
+            share.swap_out(&mut scratch);
+            eprintln!(
+                "  qwen4 decode-share[bank]: {} prompt tiles ran on borrowed prefill banks ({} bank swaps)",
+                share.stats.tiles_borrowed, share.stats.bank_swaps
+            );
+        }
         if let Some(error) = scratch.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        if let Some(error) = share.and_then(|share| share.free_gpu(gpu)) {
             first.get_or_insert(error);
         }
         if let Some(stage) = expert_stage {
@@ -10250,6 +10900,20 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
+    /// The bank a tile of `rows` rows runs on, without swapping it in: the
+    /// prefill class holding it on a decode-share load (while no bank is
+    /// swapped in), else `scratch`.
+    fn scratch_for_tile_rows(&self, rows: usize) -> &Qwen4GpuForwardScratch {
+        self.share
+            .as_ref()
+            .filter(|share| share.active.is_none())
+            .and_then(|share| {
+                decode_share_class_for_rows(&share.classes, rows)
+                    .and_then(|class| share.banks[class].as_ref())
+            })
+            .unwrap_or(&self.scratch)
+    }
+
     fn preflight_output_resources(
         &self,
         bundle: &Qwen4Bundle,
@@ -10261,11 +10925,14 @@ impl Qwen4GpuForward {
         let dims = program_dims(config);
         let final_hyper = hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?;
         let lm_head = dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?;
-        let preflight_scratch = layer_scratch(&self.scratch, &self.scratch.router_logits);
+        // The bank the tile of `rows` rows will run on (the resident bank holds
+        // too few rows for a wide tile of a decode-share load).
+        let scratch = self.scratch_for_tile_rows(rows);
+        let preflight_scratch = layer_scratch(scratch, &scratch.router_logits);
         validate_final_hyper(
             dims,
             &final_hyper,
-            &self.scratch.streams,
+            &scratch.streams,
             &preflight_scratch,
             rows,
         )
@@ -10275,7 +10942,7 @@ impl Qwen4GpuForward {
         let hidden_elements = rows
             .checked_mul(config.hidden_size)
             .ok_or_else(|| invalid("Qwen4 final hidden shape overflows"))?;
-        let final_hidden = view(&self.scratch.hc_mixed, 0, hidden_elements);
+        let final_hidden = view(&scratch.hc_mixed, 0, hidden_elements);
         validate_lm_head(&lm_head, &final_hidden, logits, rows, requested_rows).map_err(
             |error| Qwen4GpuForwardError::Dispatch(format!("validate Qwen4 LM head: {error:?}")),
         )?;
@@ -10378,6 +11045,31 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_rows: Qwen4OutputRows,
     ) -> Result<(), Qwen4GpuForwardError> {
+        self.share_prompt_begin();
+        let result = self.forward_chunk_tiles(
+            bundle,
+            gpu,
+            tokens,
+            logits,
+            top1,
+            wide_hidden_capture,
+            output_rows,
+        );
+        let finish = self.share_prompt_end(gpu);
+        result.and(finish)
+    }
+
+    /// The tile loop of [`Self::forward_chunk`].
+    fn forward_chunk_tiles(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_rows: Qwen4OutputRows,
+    ) -> Result<(), Qwen4GpuForwardError> {
         // The caller's lookahead names what follows this whole request, so it
         // belongs to the final tile; earlier tiles look ahead to the next tile.
         let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
@@ -10394,7 +11086,7 @@ impl Qwen4GpuForward {
         // preflight.
         self.prefetch_first_tile_ple(bundle, tokens);
         let vocab = bundle.config.vocab_size;
-        let max_chunk = self.scratch.max_chunk;
+        let max_chunk = self.prompt_chunk_rows();
         let preflight_rows = if output_rows == Qwen4OutputRows::Final {
             (tokens.len() - 1) % max_chunk + 1
         } else {
@@ -10418,6 +11110,10 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
+                debug_assert!(
+                    self.share.is_none(),
+                    "the NPU trunk never runs under decode-share"
+                );
                 self.refuse_npu_pair()?;
                 let rows = banks[0] + banks[1];
                 self.note_npu_trunk_pair(banks, bundle.state.position);
@@ -10514,10 +11210,24 @@ impl Qwen4GpuForward {
     /// produced. With `wide_hidden_capture` each tile still writes its wide
     /// hidden rows into the capture at `offset * wide` (the trunk's output,
     /// taken before the head, so identical to [`Self::forward_chunk`]'s).
-    /// Tiles are `scratch.max_chunk` rows from the start of `tokens`, exactly
+    /// Tiles are `prompt_chunk_rows()` rows from the start of `tokens`, exactly
     /// as [`Self::forward_chunk`] tiles them, so a prefill split at tile
     /// multiples keeps the trunk numerics byte-identical.
     pub(crate) fn forward_chunk_silent(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        wide_hidden_capture: Option<&GpuTensor>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        self.share_prompt_begin();
+        let result = self.forward_chunk_silent_tiles(bundle, gpu, tokens, wide_hidden_capture);
+        let finish = self.share_prompt_end(gpu);
+        result.and(finish)
+    }
+
+    /// The tile loop of [`Self::forward_chunk_silent`].
+    fn forward_chunk_silent_tiles(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
@@ -10540,7 +11250,7 @@ impl Qwen4GpuForward {
             }
         }
         self.prefetch_first_tile_ple(bundle, tokens);
-        let max_chunk = self.scratch.max_chunk;
+        let max_chunk = self.prompt_chunk_rows();
         let mut offset = 0usize;
         while offset < tokens.len() {
             self.poll_npu_trunk(gpu)?;
@@ -10548,6 +11258,10 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
+                debug_assert!(
+                    self.share.is_none(),
+                    "the NPU trunk never runs under decode-share"
+                );
                 self.refuse_npu_pair()?;
                 let rows = banks[0] + banks[1];
                 self.note_npu_trunk_pair(banks, bundle.state.position);
@@ -10625,7 +11339,7 @@ impl Qwen4GpuForward {
         };
         let first_ids = bundle.state.ple_history.row_ids(
             &owner.metadata,
-            &tokens[..tokens.len().min(self.scratch.max_chunk)],
+            &tokens[..tokens.len().min(self.prompt_chunk_rows())],
         );
         if !self
             .ple_ahead
@@ -10656,9 +11370,9 @@ impl Qwen4GpuForward {
         } else {
             let next = offset + rows;
             self.ple_lookahead.clear();
-            self.ple_lookahead.extend_from_slice(
-                &tokens[next..(next + self.scratch.max_chunk).min(tokens.len())],
-            );
+            let window = self.prompt_chunk_rows();
+            self.ple_lookahead
+                .extend_from_slice(&tokens[next..(next + window).min(tokens.len())]);
         }
         final_chunk
     }
@@ -10776,6 +11490,11 @@ impl Qwen4GpuForward {
         route: MeshRoute,
         rows: usize,
     ) -> Result<Qwen4MeshLayout, Qwen4GpuForwardError> {
+        if self.share.is_some() {
+            return Err(invalid(
+                "a mesh forward cannot run on a decode-share forward (bank-selected scratch)",
+            ));
+        }
         if rows == 0 || rows > self.scratch.max_chunk {
             return Err(invalid(format!(
                 "mesh forward of {rows} rows exceeds the configured capacity {}",
@@ -10939,6 +11658,11 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         ops: std::ops::Range<u32>,
     ) -> Result<(), Qwen4GpuForwardError> {
+        if self.share.is_some() {
+            return Err(invalid(
+                "a mesh forward cannot run on a decode-share forward (bank-selected scratch)",
+            ));
+        }
         self.check_mesh_admission(bundle, gpu)?;
         let full = self.mesh_op_range(head.is_some(), head.is_some_and(|head| head.top1.is_some()));
         let trunk = self.mesh_trunk_ops.clone();
@@ -11093,10 +11817,80 @@ impl Qwen4GpuForward {
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
     }
 
-    /// Every forward runs under this call's routing scopes; a multi-row
-    /// verify latches the singleton AR reference before installing them.
+    /// Bank selection, the only place decode-share banks change. Every tile of
+    /// every route that reaches [`Self::forward_chunk_scoped`] passes here.
+    ///
+    /// Prompt-tile predicate: the call is a prefill tile when it is not a
+    /// device-argmax decode forward (`argmax_of`), not a lane step
+    /// (`lane_scope`) and not a mesh segment (`mesh_route_rows`), and carries
+    /// at least [`QWEN4_DECODE_SHARE_RESIDENT_ROWS`] rows. A verify window
+    /// (`!prefill_scope`, at most `QWEN4_VERIFY_MAX_ROWS` rows) is therefore
+    /// never a prefill tile, and every other call (decode, verify, lanes,
+    /// tiles below the resident rows) runs on the resident bank. A prefill
+    /// tile swaps the smallest class holding its rows into `scratch` and
+    /// swaps the resident bank back on every return path.
     #[allow(clippy::too_many_arguments)]
     fn forward_chunk_inner(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        argmax_of: Option<&GpuTensor>,
+        logits: Option<&GpuTensor>,
+        top1: Option<&GpuTensor>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        output_policy: Qwen4OutputPolicy,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.share.is_none() {
+            return self.forward_chunk_tile(
+                bundle,
+                gpu,
+                tokens,
+                argmax_of,
+                logits,
+                top1,
+                wide_hidden_capture,
+                output_policy,
+            );
+        }
+        let prefill_tile =
+            argmax_of.is_none() && !self.lane_scope && self.mesh_route_rows.is_none();
+        let class = if prefill_tile {
+            self.share_class_for_tile(tokens.len())?
+        } else {
+            None
+        };
+        match class {
+            Some(class) => {
+                self.share_acquire(gpu, class)?;
+                if let Some(share) = self.share.as_mut() {
+                    share.swap_in(&mut self.scratch, class);
+                }
+            }
+            None => self.share_require_resident(gpu)?,
+        }
+        let result = self.forward_chunk_tile(
+            bundle,
+            gpu,
+            tokens,
+            argmax_of,
+            logits,
+            top1,
+            wide_hidden_capture,
+            output_policy,
+        );
+        if let Some(share) = self.share.as_mut() {
+            share.swap_out(&mut self.scratch);
+        }
+        let after = self.share_after_tile(gpu, result.is_ok());
+        result.and(after)
+    }
+
+    /// One tile on the bank selected in `scratch`: every forward runs under
+    /// this call's routing scopes; a multi-row verify latches the singleton AR
+    /// reference before installing them.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk_tile(
         &mut self,
         bundle: &mut Qwen4Bundle,
         gpu: &mut Gpu,
@@ -14158,6 +14952,292 @@ mod tests {
                 assert!(backing.span_bytes + ids >= scratch_bytes(max_chunk, mode));
             }
         }
+    }
+
+    use rdna_compute::GpuTensor;
+
+    /// A tensor over fake device memory: tests only build and compare pointers
+    /// and metadata, nothing is dereferenced or freed.
+    fn fake_tensor(address: usize, elements: usize, dtype: rdna_compute::DType) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: a `Borrowed` buffer over an address no test dereferences.
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    address as *mut std::ffi::c_void,
+                    elements * dtype.size(),
+                )
+            },
+            shape: vec![elements],
+            dtype,
+        }
+    }
+
+    #[test]
+    fn decode_share_class_selection_table() {
+        use super::decode_share_class_for_rows as class_of;
+        let classes = super::qwen4_decode_share_classes(16384);
+        let table = [
+            (1usize, None),
+            (300, None),
+            (511, None),
+            (512, Some(0)),
+            (1000, Some(0)),
+            (1024, Some(0)),
+            (1025, Some(1)),
+            (2048, Some(1)),
+            (2049, Some(2)),
+            (4096, Some(2)),
+            (4097, Some(3)),
+            (8192, Some(3)),
+            (8193, Some(4)),
+            (16384, Some(4)),
+            (16385, None),
+        ];
+        for (rows, expected) in table {
+            assert_eq!(class_of(&classes, rows), expected, "{rows} rows");
+        }
+        let odd = super::qwen4_decode_share_classes(3000);
+        assert_eq!(odd, vec![1024, 2048, 3000]);
+        assert_eq!(class_of(&odd, 2049), Some(2));
+        assert_eq!(class_of(&odd, 3001), None);
+        assert_eq!(class_of(&[], 4096), None);
+    }
+
+    #[test]
+    fn decode_share_refusal_names_each_excluded_route() {
+        use super::decode_share_refusal as refuse;
+        let fn_mode = Mode::FnSymGfx1201;
+        assert_eq!(
+            refuse("gfx1201", fn_mode, 16384, true, false, false, false),
+            None
+        );
+        assert!(refuse("gfx1201", fn_mode, 16384, false, false, false, false).is_some());
+        assert!(refuse("gfx1201", fn_mode, 16384, true, false, true, false).is_some());
+        assert!(refuse("gfx1201", Mode::Full, 16384, true, false, false, false).is_some());
+        assert!(refuse("gfx1100", fn_mode, 16384, true, false, false, false).is_some());
+        assert!(refuse("gfx1201", fn_mode, 512, true, false, false, false).is_some());
+        assert!(refuse("gfx1201", fn_mode, 513, true, false, false, false).is_none());
+        assert!(refuse("gfx1201", fn_mode, 16384, true, true, false, false).is_some());
+        assert!(refuse("gfx1201", fn_mode, 16384, true, false, false, true).is_some());
+    }
+
+    /// The reference census: what `allocate` would hand out, built with the same
+    /// `bind_views` over fake owners (each owner at its own address).
+    fn reference_tensors(slots: &[ScratchSlot]) -> Vec<Option<GpuTensor>> {
+        let mut tensors: Vec<Option<GpuTensor>> = slots.iter().map(|_| None).collect();
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.owner.is_none() && slot.elements != 0 {
+                tensors[index] = Some(fake_tensor(
+                    0x1_0000_0000 * (index + 1),
+                    slot.elements,
+                    slot.dtype,
+                ));
+            }
+        }
+        Scratch::bind_views(slots, &mut tensors);
+        tensors
+    }
+
+    #[test]
+    fn decode_share_borrowed_bank_matches_the_allocated_census() {
+        let config = fn_config();
+        let scope = crate::weights::Qwen4BandScope::single(&config);
+        let base = 0x7000_0000_0000usize;
+        for mode in [Mode::FnSymGfx1201, Mode::Full] {
+            for rows in [1024usize, 4096, 16384] {
+                let (slots, ple_bytes) = Scratch::plan_scoped(&config, rows, mode, &scope).unwrap();
+                let backing = Scratch::borrowed_backing(&config, rows, mode, &scope).unwrap();
+                let ids_slot = slots[F::TokenIds as usize];
+                let ids_address = 0x5000_0000usize;
+                let token_ids = fake_tensor(ids_address, 16384 * 4, ids_slot.dtype);
+                let span = backing.span_bytes as usize;
+                // A span one byte short is refused; an unaligned base is refused.
+                assert!(Scratch::new_borrowed(
+                    &config,
+                    rows,
+                    mode,
+                    &scope,
+                    base,
+                    span - 1,
+                    &token_ids
+                )
+                .is_err());
+                assert!(Scratch::new_borrowed(
+                    &config,
+                    rows,
+                    mode,
+                    &scope,
+                    base + 8,
+                    span,
+                    &token_ids
+                )
+                .is_err());
+                let (bank, host_ids, host_ple) =
+                    Scratch::new_borrowed(&config, rows, mode, &scope, base, span, &token_ids)
+                        .unwrap();
+                assert_eq!(bank.max_chunk, rows);
+                assert_eq!(bank.mode, mode);
+                assert_eq!(bank.slots, slots);
+                assert_eq!(host_ids.len(), rows * 4);
+                assert_eq!(host_ple.len(), ple_bytes);
+                assert_eq!(bank.backing, super::ScratchBackingKind::Borrowed);
+                let reference = reference_tensors(&slots);
+                let owner_of = |field: F| slots[field as usize].owner.unwrap_or(field);
+                for (index, slot) in slots.iter().enumerate() {
+                    let field = F::ALL[index];
+                    let tensor = bank.field_tensor(field);
+                    if field == F::TokenIds {
+                        assert_eq!(tensor.buf.as_ptr() as usize, ids_address);
+                        assert_eq!(tensor.numel(), slot.elements);
+                        assert_eq!(tensor.dtype, slot.dtype);
+                        continue;
+                    }
+                    let expected = reference[index].as_ref().unwrap();
+                    assert_eq!(
+                        tensor.numel(),
+                        expected.numel(),
+                        "{rows} {field:?} elements"
+                    );
+                    assert_eq!(tensor.shape, expected.shape, "{rows} {field:?} shape");
+                    assert_eq!(tensor.dtype, expected.dtype, "{rows} {field:?} dtype");
+                    assert_eq!(
+                        tensor.buf.size(),
+                        expected.buf.size(),
+                        "{rows} {field:?} bytes"
+                    );
+                    if slot.elements == 0 {
+                        continue;
+                    }
+                    // Offset from the owning root is the allocated bank's.
+                    let owner = owner_of(field);
+                    let got = tensor.buf.as_ptr() as usize
+                        - bank.field_tensor(owner).buf.as_ptr() as usize;
+                    let want = expected.buf.as_ptr() as usize
+                        - reference[owner as usize].as_ref().unwrap().buf.as_ptr() as usize;
+                    assert_eq!(got, want, "{rows} {field:?} offset from {owner:?}");
+                    assert_eq!(slot.pitch, bank.slots[index].pitch);
+                }
+                // Owning roots sit at base + root.offset.
+                for root in &backing.roots {
+                    let tensor = bank.field_tensor(root.field);
+                    assert_eq!(tensor.buf.as_ptr() as usize, base + root.offset as usize);
+                    assert_eq!(tensor.buf.size() as u64, root.bytes);
+                    assert!(tensor.buf.is_borrowed());
+                }
+                // Nothing of a borrowed bank is ever freed.
+                assert!(super::scratch_free_list(&bank.slots, None, bank.backing).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn decode_share_free_lists_free_each_owner_once() {
+        use super::{scratch_free_list, ScratchBackingKind as K};
+        for mode in [Mode::FnSymGfx1201, Mode::Full] {
+            let slots = plan(1024, mode);
+            let owned = scratch_free_list(&slots, None, K::Owned);
+            let expected: Vec<F> = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.owner.is_none() && slot.elements != 0)
+                .map(|(index, _)| F::ALL[index])
+                .collect();
+            assert_eq!(owned, expected);
+            assert!(owned.contains(&F::TokenIds));
+            // The resident bank's ids belong to the persistent owner.
+            let resident = scratch_free_list(&slots, None, K::ExternalIds);
+            assert!(!resident.contains(&F::TokenIds));
+            let mut rejoined = resident.clone();
+            rejoined.insert(0, F::TokenIds);
+            assert_eq!(rejoined, owned);
+            assert!(scratch_free_list(&slots, None, K::Borrowed).is_empty());
+            // No field is freed twice.
+            let mut unique = owned.clone();
+            unique.dedup();
+            assert_eq!(unique, owned);
+        }
+    }
+
+    /// Resident + prefill banks over fake memory: the swap protocol, dirty
+    /// tracking and the prompt capacity accessor.
+    #[test]
+    fn decode_share_bank_swaps_track_capacity_and_dirty_prefix() {
+        let config = fn_config();
+        let scope = crate::weights::Qwen4BandScope::single(&config);
+        let mode = Mode::FnSymGfx1201;
+        let max_chunk = 4096usize;
+        let token_ids = fake_tensor(0x5000_0000, max_chunk * 4, rdna_compute::DType::Raw);
+        let base = 0x7000_0000_0000usize;
+        let classes = super::qwen4_decode_share_classes(max_chunk);
+        assert_eq!(classes, vec![1024, 2048, 4096]);
+        let spans: Vec<u64> = classes
+            .iter()
+            .map(|&rows| {
+                Scratch::borrowed_backing(&config, rows, mode, &scope)
+                    .unwrap()
+                    .span_bytes
+            })
+            .collect();
+        let span = *spans.iter().max().unwrap() as usize;
+        let bank = |rows: usize, at: usize| {
+            Scratch::new_borrowed(&config, rows, mode, &scope, at, span, &token_ids)
+                .unwrap()
+                .0
+        };
+        // A fake resident bank (512 rows) at another base; the real one is allocated.
+        let mut scratch = bank(super::QWEN4_DECODE_SHARE_RESIDENT_ROWS, 0x6000_0000_0000);
+        let mut share = super::DecodeShareBanks {
+            max_chunk,
+            classes: classes.clone(),
+            class_spans: spans.clone(),
+            banks: classes.iter().map(|&rows| Some(bank(rows, base))).collect(),
+            parked: None,
+            active: None,
+            token_ids: fake_tensor(0x5000_0000, max_chunk * 4, rdna_compute::DType::Raw),
+            backing: super::DecodeShareBacking::Owned(fake_tensor(
+                base,
+                span,
+                rdna_compute::DType::Raw,
+            )),
+            dirty_bytes: 0,
+            stats: Default::default(),
+            prompt_depth: 0,
+        };
+        let prompt_rows = |share: &super::DecodeShareBanks, scratch: &Scratch| {
+            super::prompt_chunk_rows_of(Some(share), scratch)
+        };
+        // Capacity is the prompt chunk whichever bank is selected.
+        assert_eq!(scratch.max_chunk, 512);
+        assert_eq!(prompt_rows(&share, &scratch), max_chunk);
+        assert_eq!(super::prompt_chunk_rows_of(None, &scratch), 512);
+        assert!(scratch.max_chunk < share.max_chunk);
+
+        share.swap_in(&mut scratch, 1);
+        assert_eq!(scratch.max_chunk, 2048);
+        assert_eq!(share.parked.as_ref().map(|bank| bank.max_chunk), Some(512));
+        assert_eq!(share.active, Some(1));
+        assert!(share.banks[1].is_none());
+        assert_eq!(share.dirty_bytes, spans[1]);
+        assert_eq!(prompt_rows(&share, &scratch), max_chunk);
+        share.swap_out(&mut scratch);
+        assert_eq!(scratch.max_chunk, 512);
+        assert!(share.parked.is_none() && share.active.is_none());
+        assert_eq!(
+            share.banks[1].as_ref().map(|bank| bank.max_chunk),
+            Some(2048)
+        );
+        // A smaller class later never lowers the dirty prefix.
+        share.swap_in(&mut scratch, 0);
+        share.swap_out(&mut scratch);
+        assert_eq!(share.dirty_bytes, spans[1]);
+        share.swap_in(&mut scratch, 2);
+        share.swap_out(&mut scratch);
+        assert_eq!(share.dirty_bytes, spans[2]);
+        assert_eq!(share.stats.tiles_borrowed, 3);
+        assert_eq!(share.stats.bank_swaps, 3);
+        // `swap_out` with nothing active is a no-op.
+        share.swap_out(&mut scratch);
+        assert_eq!(scratch.max_chunk, 512);
     }
 
     /// `G(r)`: tile-padded grouped rows of `r` rows, top-10 of 512 experts.

@@ -2406,15 +2406,31 @@ fn expert_stage_placement_switch(arch: &str, env: Option<&str>) -> bool {
 /// stage buffer per layer parity, each the largest host-tier payload of a
 /// layer of that parity (projections 256-byte aligned) plus the zeroed tail
 /// pad, as `gpu_forward::slab_stage` sizes them. An upper bound of what it
-/// allocates, so the hot set budget can hold it.
+/// allocates, so the hot set budget can hold it. This is the Resident
+/// placement; a decode-share plan stages from its BorrowPrefill placement
+/// ([`expert_tier_stage_bytes_prefill`]).
 pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -> u64 {
+    expert_tier_stage_bytes_for_entries(plan.entries())
+}
+
+/// [`expert_tier_stage_bytes`] over an explicit entry list in model id order
+/// (`layer * 512 + expert`): the plan's own entries for the Resident
+/// placement, `DecodeShareTail::borrow_entries` for BorrowPrefill (donors
+/// count as host experts of their layer).
+pub fn expert_tier_stage_bytes_for_entries(
+    entries: &[crate::expert_tier_plan::ExpertTierEntry],
+) -> u64 {
     use crate::expert_slabs::{EXPERTS_PER_LAYER, TRUNK_LAYERS};
     use crate::expert_tier_plan::Placement;
     let align = |len: u64| len.div_ceil(256) * 256;
     let mut largest = [0u64; 2];
-    for layer in 0..TRUNK_LAYERS as usize {
-        let host: u64 = (0..EXPERTS_PER_LAYER as usize)
-            .filter_map(|expert| plan.entry(layer, expert))
+    for (layer, experts) in entries
+        .chunks(EXPERTS_PER_LAYER as usize)
+        .take(TRUNK_LAYERS as usize)
+        .enumerate()
+    {
+        let host: u64 = experts
+            .iter()
             .filter(|entry| entry.tier == Placement::HostMapped)
             .map(|entry| align(entry.gate_up_len) + align(entry.down_len))
             .sum();
@@ -2424,6 +2440,17 @@ pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -
         .iter()
         .map(|bytes| bytes + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64)
         .sum()
+}
+
+/// Stage bytes of the placement a long prefill reads: the BorrowPrefill
+/// entries when the plan carries a decode-share donor tail, else the Resident
+/// entries (byte-identical to [`expert_tier_stage_bytes`] for a non-sharing
+/// plan).
+pub fn expert_tier_stage_bytes_prefill(plan: &crate::expert_tier_plan::ExpertTierPlan) -> u64 {
+    match plan.decode_share_tail() {
+        Some(tail) => expert_tier_stage_bytes_for_entries(&tail.borrow_entries),
+        None => expert_tier_stage_bytes(plan),
+    }
 }
 
 /// Whether a whole-layer (slab arena) load allocates the two dedicated
@@ -8466,5 +8493,125 @@ mod tests {
             let error = native_mtp_granule_slack(&lists.0, &lists.1, &lists.2, g).unwrap_err();
             assert!(error.contains("overflows"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod decode_share_stage_tests {
+    use super::*;
+    use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+    use crate::expert_slabs::ExpertFormat;
+    use crate::expert_tier_plan::{plan_expert_tiers_from_slabs, ExpertTierPlan, Placement};
+
+    const GU: usize = 1000; // pads to 1024
+    const DN: usize = 500; // pads to 512
+    const PADDED: u64 = 1024 + 512;
+
+    fn uniform_slabs() -> Vec<ExpertSlab> {
+        let mut cursor = 0usize;
+        (0..48 * 512)
+            .map(|_| {
+                let gate_up = ExpertSlabSpan {
+                    offset: cursor,
+                    len: GU,
+                };
+                cursor += GU;
+                let down = ExpertSlabSpan {
+                    offset: cursor,
+                    len: DN,
+                };
+                cursor += DN;
+                ExpertSlab {
+                    format: ExpertFormat::Mq4Xts,
+                    gate_up,
+                    down,
+                }
+            })
+            .collect()
+    }
+
+    fn tail_pad() -> u64 {
+        let align = ExpertTierPlan::PAYLOAD_ALIGN;
+        ((crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64).max(align) + align - 1) & !(align - 1)
+    }
+
+    /// Two resident experts per layer except layer 7 (odd), which keeps one:
+    /// layer 7 has the largest host payload of the odd parity. The last
+    /// ranked expert (the coldest) is layer 7's.
+    fn plan_and_rank() -> (ExpertTierPlan, Vec<u32>) {
+        let mut rank = Vec::new();
+        for layer in 0..48u32 {
+            if layer == 7 {
+                continue;
+            }
+            rank.push(layer * 512);
+            rank.push(layer * 512 + 1);
+        }
+        rank.push(7 * 512);
+        let budget = rank.len() as u64 * PADDED + tail_pad();
+        let plan = plan_expert_tiers_from_slabs(&uniform_slabs(), &rank, budget).unwrap();
+        assert_eq!(plan.device_experts(), rank.len());
+        (plan, rank)
+    }
+
+    fn largest_per_parity(
+        plan: &ExpertTierPlan,
+        entries: &[crate::expert_tier_plan::ExpertTierEntry],
+    ) -> [u64; 2] {
+        let _ = plan;
+        let mut largest = [0u64; 2];
+        for layer in 0..48usize {
+            let host: u64 = entries[layer * 512..(layer + 1) * 512]
+                .iter()
+                .filter(|e| e.tier == Placement::HostMapped)
+                .map(|e| e.gate_up_len.div_ceil(256) * 256 + e.down_len.div_ceil(256) * 256)
+                .sum();
+            largest[layer % 2] = largest[layer % 2].max(host);
+        }
+        largest
+    }
+
+    #[test]
+    fn decode_share_stage_bytes_resident_view_is_unchanged_for_non_sharing_plans() {
+        let (plan, _) = plan_and_rank();
+        let resident = expert_tier_stage_bytes(&plan);
+        let pad = crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64;
+        let largest = largest_per_parity(&plan, plan.entries());
+        assert_eq!(resident, largest[0] + largest[1] + 2 * pad);
+        assert_eq!(
+            expert_tier_stage_bytes_for_entries(plan.entries()),
+            resident
+        );
+        assert_eq!(expert_tier_stage_bytes_prefill(&plan), resident);
+        // Per-entry arithmetic agrees with the closed form the loader used before.
+        assert_eq!(largest, [510 * PADDED, 511 * PADDED]);
+        // A need-0 share is an empty tail and keeps the Resident bytes.
+        let (plan, rank) = plan_and_rank();
+        let (same, _) = plan.with_decode_share(&rank, 0).unwrap();
+        assert_eq!(expert_tier_stage_bytes_prefill(&same), resident);
+    }
+
+    #[test]
+    fn decode_share_stage_bytes_borrow_view_counts_donors_as_host_experts() {
+        let (plan, rank) = plan_and_rank();
+        let resident = expert_tier_stage_bytes(&plan);
+        // One donor: layer 7's expert, in the layer with the largest host payload.
+        let (shared, tail) = plan.clone().with_decode_share(&rank, PADDED).unwrap();
+        assert_eq!(tail.donors, vec![7 * 512]);
+        let borrow = expert_tier_stage_bytes_prefill(&shared);
+        assert_eq!(
+            borrow,
+            resident + PADDED,
+            "the odd-parity maximum grows by exactly the donor payload"
+        );
+        assert!(borrow >= resident);
+        // The Resident view of the shared plan is untouched by sharing (donors
+        // stay Device in the plan's own entries).
+        assert_eq!(expert_tier_stage_bytes(&shared), resident);
+        // A second donor (layer 47, odd, 511 host experts after donating) stays
+        // below layer 7's 512, so the odd maximum still grows by one payload.
+        let (shared, tail) = plan.clone().with_decode_share(&rank, 2 * PADDED).unwrap();
+        assert_eq!(tail.donors, vec![7 * 512, 47 * 512 + 1]);
+        assert_eq!(expert_tier_stage_bytes_prefill(&shared), resident + PADDED);
     }
 }

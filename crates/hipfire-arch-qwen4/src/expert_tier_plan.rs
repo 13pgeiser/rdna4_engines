@@ -292,6 +292,11 @@ impl ExpertTierPlan {
         self.entries.get(Self::index(layer, expert)?)
     }
 
+    /// Every entry in model id order (`layer * 512 + expert`).
+    pub fn entries(&self) -> &[ExpertTierEntry] {
+        &self.entries
+    }
+
     /// `(gate_up, down)` source spans in the artifact.
     pub fn source(&self, layer: usize, expert: usize) -> Option<(ExpertSlabSpan, ExpertSlabSpan)> {
         self.source.get(Self::index(layer, expert)?).copied()
