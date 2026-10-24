@@ -42,23 +42,49 @@ MODEL="$(pick_model)"
 # GPU coordination (reuse the repo's flock-based mutex).
 # shellcheck disable=SC1091
 if [ -f "$ROOT/scripts/gpu-lock.sh" ]; then source "$ROOT/scripts/gpu-lock.sh" && gpu_acquire "serve-loop-gate" || true; fi
+SERVE_PID=""
+# Kill ONLY the serve we spawned (tracked PID, its session/process group and its
+# children). Never pkill -f: on a shared host "daemon" also matches the multica
+# runtime and other agents' hipfire daemons. The serve runs under setsid, so
+# its PID is also its process-group id and `kill -- -PID` reaches the daemon it
+# spawned. TERM first, then KILL after ~10 s so a hung daemon cannot keep the
+# GPU lock fd (or the port) alive past the gate.
+kill_serve() {
+  [ -n "$SERVE_PID" ] || return 0
+  local pid="$SERVE_PID" i; SERVE_PID=""
+  pkill -TERM -P "$pid" >/dev/null 2>&1 || true
+  kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+  for i in $(seq 1 20); do
+    kill -0 -- "-$pid" >/dev/null 2>&1 || kill -0 "$pid" >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  pkill -KILL -P "$pid" >/dev/null 2>&1 || true
+  kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+  kill -KILL "$pid" >/dev/null 2>&1 || true
+}
 cleanup() {
+  kill_serve
   fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
-  pkill -f "daemon" >/dev/null 2>&1 || true
   command -v gpu_release >/dev/null 2>&1 && gpu_release || true
 }
 trap cleanup EXIT
 
 HIPFIRE="${HIPFIRE_CLI_BIN:-$ROOT/target/release/hipfire}"
+# `hipfire serve` resolves its daemon via find_daemon(), which probes
+# ~/.hipfire/bin/daemon before the tree build. Pin the tree's daemon so the gate
+# tests the code under review, not whatever is installed (a caller may override).
+export HIPFIRE_DAEMON_BIN="${HIPFIRE_DAEMON_BIN:-$ROOT/target/release/daemon}"
 [ -x "$HIPFIRE" ] || HIPFIRE="$(command -v hipfire || true)"
 [ -x "$HIPFIRE" ] || { echo "serve-loop-gate: native hipfire CLI not found; build cargo build --release -p hipfire-cli" >&2; exit 2; }
 
 SERVELOG="$(mktemp)"
 start_serve() { # $1 = extra env (e.g. "HIPFIRE_DFLASH_OFF")
-  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; pkill -f "daemon" >/dev/null 2>&1 || true; sleep 1
+  kill_serve; fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; sleep 1
   : > "$SERVELOG"
   local cfg=""; [ "${1:-}" = "ar" ] && cfg="HIPFIRE_DFLASH_DRAFT="  # disable draft auto-detect → AR path
-  env $cfg HIPFIRE_MODEL="$MODEL" setsid "$HIPFIRE" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 & disown
+  env $cfg HIPFIRE_MODEL="$MODEL" setsid "$HIPFIRE" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 &
+  SERVE_PID=$!; disown "$SERVE_PID" 2>/dev/null || true
   local warm=0
   for _ in $(seq 1 150); do
     if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null | jq -e '.model != null and .loading_model == null' >/dev/null 2>&1; then warm=1; break; fi
