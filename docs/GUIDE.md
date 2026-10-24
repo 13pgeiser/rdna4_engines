@@ -971,6 +971,13 @@ window slots, copies in the ones that are missing, and evicts the block whose us
 most; an evicted block is
 already safe in the host copy. The window is a fixed size at any context length, so context stops
 being bounded by VRAM: on two 16 GB cards, holding two 262k-token conversations, the cache went
+`--kv-resident` is a slider. Any value above 0 turns streaming on -- `--kv-resident 1` is enough,
+since the engine raises a window smaller than one decode step's selection -- and **32 768 tokens is
+the value we ship and measure with.** Turning it **up** keeps more of the cache on the card and less
+in host RAM; turning it **down** moves more of it into RAM. At or above `--max-num-seqs x
+--max-model-len` the window covers the whole context, nothing streams, and the engine says so at
+startup.
+
 from 3.84 GB of VRAM a card to 0.74 GB of VRAM and 3.22 GB of host RAM. The VRAM the cache gives
 up goes to the expert slab.
 
