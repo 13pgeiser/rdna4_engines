@@ -987,10 +987,11 @@ TEST(op_vocabulary) {
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa",
-        "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
+        "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
+        "qk_norm_rope", "qsa_block_key",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
-        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
+        "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
         "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
         "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
@@ -3487,6 +3488,148 @@ TEST(op_kv_store_reads_the_row_stride_and_not_the_shape) {
     /* Nothing reached the query columns and nothing reached the unmapped fourth slot. */
     CHECK_EQ(qkv.at(0), 90.0f);
     CHECK_EQ(kv.at(12), 0.0f); CHECK_EQ(kv.at(15), 0.0f);
+}
+
+/* The E4M3 byte a value stores as. The mirror is a byte plane, so `T::at` on it reads the byte and
+ * not the value; comparing a mirror byte to a ring element needs the byte both sides are. */
+static int e4m3_byte(float x) {
+    T t(RAD_F8E4M3, {1});
+    t.f({ x });
+    return (int)(uint8_t)t.mem[0];
+}
+
+/* kv_store_streamed: the group's host mirror is written for every token with a slot, and the ring
+ * slot only when the residency map says the block is resident. The two planes are the same paged
+ * layout, so a token's bytes land at the same offset in either.
+ *
+ * The case that decides the design: block 0 is NOT resident and block 1 is, and one token lands in
+ * each. Block 1's token must reach both copies (the ring's copy of a resident block would otherwise
+ * fall behind, and the resolve does not re-copy a resident block); block 0's must reach the mirror
+ * only, leaving the ring untouched until a resolve copies the whole block in. */
+TEST(op_kv_store_streamed_writes_the_mirror_always_and_the_ring_when_resident) {
+    /* head_dim 2, one kv head, block_size 2: a block row is [kv_heads, block_size, 2 * head_dim]
+     * = 8 bytes, K then V inside a position. */
+    T k(RAD_BF16, {2, 1, 2}); k.f({ 1, 2, 5, 6 });
+    T v(RAD_BF16, {2, 1, 2}); v.f({ 3, 4, 7, 8 });
+    T sm(RAD_I32, {2});       sm.n({ 0, 3 });        /* block 0 offset 0, block 1 offset 1 */
+    T res(RAD_I32, {2});      res.n({ -1, 0 });      /* block 0 absent, block 1 in ring slot 0 */
+    T host(RAD_U8, {2, 8});
+    T kv(RAD_F8E4M3, {1, 1, 2, 4});                  /* one ring slot, one block deep */
+    A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+          .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+          .s("kv_dtype", "fp8_e4m3");
+    CHECK_OK(run("kv_store_streamed", a));
+    /* Token 0, block 0, position 0: K then V, mirror only. */
+    CHECK_EQ((int)host.at(0), e4m3_byte(1.0f)); CHECK_EQ((int)host.at(1), e4m3_byte(2.0f));
+    CHECK_EQ((int)host.at(2), e4m3_byte(3.0f)); CHECK_EQ((int)host.at(3), e4m3_byte(4.0f));
+    /* Token 1, block 1, position 1: both planes, at the same in-block offset, so the same bytes. */
+    CHECK_EQ((int)host.at(12), e4m3_byte(5.0f)); CHECK_EQ((int)host.at(13), e4m3_byte(6.0f));
+    CHECK_EQ((int)host.at(14), e4m3_byte(7.0f)); CHECK_EQ((int)host.at(15), e4m3_byte(8.0f));
+    CHECK_EQ((int)host.at(12), e4m3_byte(kv.at(4)));
+    CHECK_EQ((int)host.at(13), e4m3_byte(kv.at(5)));
+    CHECK_EQ((int)host.at(14), e4m3_byte(kv.at(6)));
+    CHECK_EQ((int)host.at(15), e4m3_byte(kv.at(7)));
+    /* Nothing else: block 0 has no slot, so its ring stays as it was, and block 1's position 0 is
+     * another token's. */
+    for (int i = 0; i < 4; ++i) CHECK_EQ(kv.at(i), 0.0f);
+    for (int i = 4; i < 12; ++i) CHECK_EQ(host.at(i), 0.0f);
+}
+
+/* The bf16 streamed store: both planes hold the values themselves, two bytes an element, exactly
+ * as kv_store_bf16 writes them. The descales are fp8-only, so a bf16 call with a non-1 k_scale
+ * still stores the value (this is the difference from the E4M3 row, and the reason the fused bf16
+ * fold passes the prologue's bf16 bytes straight through). */
+TEST(op_kv_store_streamed_bf16_writes_the_values_into_both_planes) {
+    T k(RAD_BF16, {2, 1, 2}); k.f({ 1, 2, 5, 6 });
+    T v(RAD_BF16, {2, 1, 2}); v.f({ 3, 4, 7, 8 });
+    T sm(RAD_I32, {2});       sm.n({ 0, 3 });        /* block 0 offset 0, block 1 offset 1 */
+    T res(RAD_I32, {2});      res.n({ -1, 0 });      /* block 0 absent, block 1 in ring slot 0 */
+    T host(RAD_U8, {2, 16});                         /* 1 kv head, 2 positions, 2*hd=4, bf16 */
+    T kv(RAD_BF16, {1, 1, 2, 4});                    /* one ring slot, one block deep */
+    A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+          .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+          .s("kv_dtype", "bf16").d("k_scale", 0.5).d("v_scale", 2.0);
+    CHECK_OK(run("kv_store_streamed", a));
+    auto at16 = [](const std::vector<uint8_t>& m, size_t i) {
+        return (unsigned)((unsigned)m[i] | ((unsigned)m[i + 1] << 8));
+    };
+    /* Token 0, block 0: mirror only, the values themselves. */
+    CHECK_EQ(at16(host.mem, 0), (unsigned)f32_to_bf16(1.0f));
+    CHECK_EQ(at16(host.mem, 2), (unsigned)f32_to_bf16(2.0f));
+    CHECK_EQ(at16(host.mem, 4), (unsigned)f32_to_bf16(3.0f));
+    CHECK_EQ(at16(host.mem, 6), (unsigned)f32_to_bf16(4.0f));
+    /* Token 1, block 1 position 1: both planes at the same in-block offset. */
+    CHECK_EQ(at16(host.mem, 24), (unsigned)f32_to_bf16(5.0f));
+    CHECK_EQ(at16(host.mem, 26), (unsigned)f32_to_bf16(6.0f));
+    CHECK_EQ(at16(host.mem, 28), (unsigned)f32_to_bf16(7.0f));
+    CHECK_EQ(at16(host.mem, 30), (unsigned)f32_to_bf16(8.0f));
+    for (size_t i = 0; i < 8; ++i) CHECK_EQ(kv.mem[i], 0);       /* block 0 wrote no slot */
+    for (size_t i = 0; i < 8; ++i) CHECK_EQ((int)kv.mem[8 + i], (int)host.mem[24 + i]);
+}
+
+/* A block absent from the ring is written to the mirror alone, whatever the map holds: this is the
+ * state every token of a block's first step is in, and the resolve copies the whole block in. */
+TEST(op_kv_store_streamed_a_block_with_no_slot_reaches_only_the_mirror) {
+    T k(RAD_BF16, {1, 1, 2}); k.f({ 2, 4 });
+    T v(RAD_BF16, {1, 1, 2}); v.f({ 6, 8 });
+    T sm(RAD_I32, {1});       sm.n({ 3 });           /* block 1, position 1 */
+    T res(RAD_I32, {2});      res.n({ -1, -1 });
+    T host(RAD_U8, {2, 8});
+    T kv(RAD_F8E4M3, {1, 1, 2, 4});
+    A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+          .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+          .s("kv_dtype", "fp8_e4m3").
+          d("k_scale", 0.5).d("v_scale", 2.0);      /* the store divides by the reader's descal */
+    CHECK_OK(run("kv_store_streamed", a));
+    CHECK_EQ((int)host.at(12), e4m3_byte(4.0f)); CHECK_EQ((int)host.at(13), e4m3_byte(8.0f));
+    CHECK_EQ((int)host.at(14), e4m3_byte(3.0f)); CHECK_EQ((int)host.at(15), e4m3_byte(4.0f));
+    for (int i = 0; i < 4; ++i) CHECK_EQ(kv.at(i), 0.0f);       /* the ring is untouched */
+}
+
+/* The refusals libref makes before its first write: a slot naming a block past the mirror, a
+ * residency entry outside [-1, slots), and a mirror row wider than the block. Nothing is written on
+ * any of them - a half-written mirror is what the next step's copies would believe. */
+TEST(op_kv_store_streamed_refuses_a_state_fault_before_writing) {
+    T k(RAD_BF16, {1, 1, 2}); k.f({ 1, 2 });
+    T v(RAD_BF16, {1, 1, 2}); v.f({ 3, 4 });
+
+    /* A map entry naming a slot the ring does not have. */
+    {
+        T sm(RAD_I32, {1});  sm.n({ 0 });
+        T res(RAD_I32, {2}); res.n({ 1, -1 });       /* slot 1 of a one-slot ring */
+        T host(RAD_U8, {2, 8});
+        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+              .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+              .s("kv_dtype", "fp8_e4m3");
+        CHECK_EQ(run("kv_store_streamed", a), RAD_E_INVAL);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(host.at(i), 0.0f);
+    }
+    /* A slot naming a block past the mirror's extent. */
+    {
+        T sm(RAD_I32, {1});  sm.n({ 4 });            /* block 2 of a two-block mirror */
+        T res(RAD_I32, {2}); res.n({ -1, -1 });
+        T host(RAD_U8, {2, 8});
+        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+              .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+              .s("kv_dtype", "fp8_e4m3");
+        CHECK_EQ(run("kv_store_streamed", a), RAD_E_SHAPE);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(host.at(i), 0.0f);
+    }
+    /* A mirror row that is not the block's byte pitch: a copy into it would spill over the next
+     * block. */
+    {
+        T sm(RAD_I32, {1});  sm.n({ 0 });
+        T res(RAD_I32, {2}); res.n({ -1, -1 });
+        T host(RAD_U8, {2, 8});
+        host.t.stride[0] = 12;                       /* a padded row */
+        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
+              .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
+              .s("kv_dtype", "fp8_e4m3");
+        CHECK_EQ(run("kv_store_streamed", a), RAD_E_STRIDE);
+    }
 }
 
 TEST(op_rope) {
@@ -7625,6 +7768,453 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
 }
 
+/* ================================================================== kv_resolve
+ * The residency map of a streamed group: selected block ids in, ring slots out, a block copied in
+ * from the host mirror when it is not resident (docs/OPS.md "kv_resolve",
+ * docs/KV-STREAMING.md §3.4). */
+namespace {
+/* One pool's worth of state. A block's bytes in the mirror are `10 * b + i` for i < block_bytes, so
+ * a copied block is recognisable byte by byte; a slot nothing wrote holds NOB (a marker, not a
+ * block's bytes). */
+enum { kKvNob = 0xEE };
+struct KVF {
+    const int64_t M, blocks, slots, pitch, bbytes;
+    T sel, nsel, res, sblk, sst, ctl, host, pool;
+
+    KVF(int64_t M_, int64_t blocks_, int64_t slots_, int64_t pitch_, int64_t bbytes_)
+        : M(M_), blocks(blocks_), slots(slots_), pitch(pitch_), bbytes(bbytes_),
+          sel(RAD_I32, {M, pitch}), nsel(RAD_I32, {M}), res(RAD_I32, {blocks_}),
+          sblk(RAD_I32, {slots_}), sst(RAD_I32, {slots_, 2}), ctl(RAD_I32, {16}),
+          host(RAD_U8, {blocks_, bbytes_}), pool(RAD_U8, {slots_, bbytes_}) {}
+
+    void fill_host() {
+        for (int64_t b = 0; b < blocks; ++b)
+            for (int64_t i = 0; i < bbytes; ++i)
+                host.mem[(size_t)(b * bbytes + i)] = (uint8_t)(10 * b + i);
+    }
+    /* The pool as a resident block leaves it, and a slot no block occupies. */
+    void put(int64_t s, int64_t b) {
+        for (int64_t i = 0; i < bbytes; ++i)
+            pool.mem[(size_t)(s * bbytes + i)] = (uint8_t)(10 * b + i);
+    }
+    void clear_slot(int64_t s) {
+        for (int64_t i = 0; i < bbytes; ++i) pool.mem[(size_t)(s * bbytes + i)] = (uint8_t)kKvNob;
+    }
+    int call() {
+        A a; a.t(sel).t(nsel).t(res).t(sblk).t(sst).t(ctl).t(host).t(pool)
+            .i("M", M).i("blocks", blocks).i("slots", slots).i("sel_pitch", pitch)
+            .i("block_bytes", bbytes);
+        return run("kv_resolve", a);
+    }
+    int64_t slot(int64_t s, int64_t i) const { return pool.mem[(size_t)(s * bbytes + i)]; }
+};
+
+/* A slot's bytes are block b's, from the mirror. */
+#define CHECK_SLOT_HOLDS(F, S, B)                                                                \
+    for (int64_t i_ = 0; i_ < (F).bbytes; ++i_)                                                  \
+        CHECK_EQ((F).slot((S), i_), (int64_t)(uint8_t)(10 * (B) + i_))
+
+/* A whole int operand, element by element, against the values on paper. */
+#define CHECK_ENTRIES(T, ...)                                                                    \
+    do {                                                                                         \
+        const std::vector<int64_t> want_ = { __VA_ARGS__ };                                      \
+        REQUIRE_EQ((int64_t)want_.size(), numel(&(T).t));                                        \
+        for (size_t i_ = 0; i_ < want_.size(); ++i_) CHECK_EQ((T).iat((int64_t)i_), want_[i_]);   \
+    } while (0)
+}  /* namespace */
+
+/* Blocks 2 and 5 are resident; the selection names them (hits), then 6 and 4 (misses). The epoch
+ * reaches the hit slots, the two misses are claimed once each and placed in ascending block order
+ * (4 then 6) - not the order the rows name them - and the copies land in the mirror's bytes. */
+TEST(kv_resolve_hits_take_the_epoch_and_misses_are_placed_in_block_order) {
+    KVF f(2, 8, 4, 4, 8);
+    f.fill_host();
+    f.put(0, 2); f.put(3, 5); f.clear_slot(1); f.clear_slot(2);
+    f.res.n({ -1, -1, 0, -1, -1, 3, -1, -1 });
+    f.sblk.n({ 2, -1, -1, 5 });
+    f.sst.n({ 0, 1, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 2, 5, 6, -1, 2, 4, -1, -1 });
+    f.nsel.n({ 3, 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    /* Block 6 came after block 4 in the selection, and still lands after it: ascending block id. */
+    CHECK_ENTRIES(f.res, -1, -1, 0, -1, 1, 3, 2, -1);
+    CHECK_ENTRIES(f.sblk, 2, 4, 6, 5);
+    /* Slot 0 was referenced already (counter 1), so its use takes it to 2; slot 3's block was
+     * resident but cold, as the two placements are, so they land at 1. That is the counter doing
+     * its job on a normal decode call. */
+    CHECK_ENTRIES(f.sst, 1, 2, 1, 1, 1, 1, 1, 1);
+    CHECK_ENTRIES(f.sel, 0, 3, 2, -1, 0, 1, -1, -1);
+    CHECK_SLOT_HOLDS(f, 0, 2);
+    CHECK_SLOT_HOLDS(f, 1, 4);
+    CHECK_SLOT_HOLDS(f, 2, 6);
+    CHECK_SLOT_HOLDS(f, 3, 5);
+    CHECK_EQ(f.ctl.iat(0), 1);            /* epoch */
+    CHECK_EQ(f.ctl.iat(1), 3);            /* hand, just past the last slot taken */
+    CHECK_EQ(f.ctl.iat(2), 2);            /* placed */
+    CHECK_EQ(f.ctl.iat(3), 0);            /* no overflow */
+    CHECK_EQ(f.ctl.iat(4), 2);            /* u64 misses */
+    CHECK_EQ(f.ctl.iat(6), 5);            /* u64 lookups: 3 + 2 entries, one each */
+    CHECK_EQ(f.ctl.iat(8), 1);            /* u64 calls */
+}
+
+/* An unreferenced resident slot is the victim, and the block it held leaves the map: the sweep
+ * re-points both maps, so a block that is no longer anywhere resident reads as -1. */
+TEST(kv_resolve_evicts_an_unreferenced_slot_and_unmaps_its_block) {
+    KVF f(1, 8, 4, 1, 4);
+    f.fill_host();
+    for (int64_t s = 0; s < 4; ++s) f.put(s, s + 1);
+    f.res.n({ -1, 0, 1, 2, 3, -1, -1, -1 });
+    f.sblk.n({ 1, 2, 3, 4 });
+    f.sst.n({ 0, 1, 0, 0, 0, 1, 0, 0 });   /* slot 1's block is unreferenced */
+    f.ctl.n({ 0, 1, 0, 0 });               /* the hand starts on slot 1 */
+    f.sel.n({ 0 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 1, 0, -1, 2, 3, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, 1, 0, 3, 4);
+    CHECK_ENTRIES(f.sst, 0, 1, 1, 1, 0, 1, 0, 0);
+    CHECK_ENTRIES(f.sel, 1);
+    CHECK_SLOT_HOLDS(f, 1, 0);
+    CHECK_EQ(f.ctl.iat(1), 2);
+    CHECK_EQ(f.ctl.iat(2), 1);
+}
+
+/* A free slot is claimed before any live block is evicted, even when the hand starts on an
+ * unreferenced resident slot: the ring's empty region is not a victim. The block in that slot
+ * stays resident, its map entry and its heat counter untouched. */
+TEST(kv_resolve_takes_a_free_slot_before_an_unreferenced_one) {
+    KVF f(1, 8, 4, 1, 4);
+    f.fill_host();
+    f.put(0, 3);
+    f.res.n({ -1, -1, -1, 0, -1, -1, -1, -1 });
+    f.sblk.n({ 3, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });               /* the hand starts on the resident slot */
+    f.sel.n({ 0 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 1, -1, -1, 0, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, 3, 0, -1, -1);
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 1, 0, 0, 0, 0);   /* slot 0 never went through CLOCK */
+    CHECK_ENTRIES(f.sel, 1);
+    CHECK_SLOT_HOLDS(f, 1, 0);
+    CHECK_SLOT_HOLDS(f, 0, 3);             /* block 3 was not evicted */
+    CHECK_EQ(f.ctl.iat(1), 2);             /* hand just past the slot taken */
+    CHECK_EQ(f.ctl.iat(2), 1);
+}
+
+/* A block whose id fits the ring and whose own slot is free takes that slot, not the hand's: the
+ * map stays res[b] = b while the context is shorter than the ring, which is the layout that makes
+ * the attention's gather of adjacent ids sequential inside one layer's stripe. Identity does not
+ * move the hand, so ctl[1] is still where the call found it. */
+TEST(kv_resolve_places_a_block_in_its_own_slot_when_that_slot_is_free) {
+    KVF f(1, 12, 8, 4, 4);
+    f.fill_host();
+    f.res.n({ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 });
+    f.sblk.n({ -1, -1, -1, -1, -1, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 6, 3, 7, 3 });
+    f.nsel.n({ 4 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, -1, -1, -1, 3, -1, -1, 6, 7, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, -1, -1, -1, 3, -1, -1, 6, 7);
+    CHECK_ENTRIES(f.sel, 6, 3, 7, 3);
+    CHECK_SLOT_HOLDS(f, 3, 3);
+    CHECK_SLOT_HOLDS(f, 6, 6);
+    CHECK_SLOT_HOLDS(f, 7, 7);
+    CHECK_EQ(f.ctl.iat(1), 0);            /* identity never moves the hand */
+    CHECK_EQ(f.ctl.iat(2), 3);
+}
+
+/* A clash is not an eviction. Block 3's own slot holds block 5, so the placement is the ordinary
+ * free-slot walk from the hand -- slot 0 here -- and block 5 stays resident and referenced. Block
+ * 4's slot is free and takes it even though the hand has moved past it. */
+TEST(kv_resolve_own_slot_occupied_falls_back_to_a_free_slot) {
+    KVF f(1, 12, 8, 3, 4);
+    f.fill_host();
+    f.put(3, 5);
+    f.res.n({ -1, -1, -1, -1, -1, 3, -1, -1, -1, -1, -1, -1 });
+    f.sblk.n({ -1, -1, -1, 5, -1, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 3, 4, -1 });
+    f.nsel.n({ 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, -1, -1, -1, 0, 4, 3, -1, -1, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sblk, 3, -1, -1, 5, 4, -1, -1, -1);
+    CHECK_ENTRIES(f.sel, 0, 4, -1);
+    CHECK_SLOT_HOLDS(f, 0, 3);
+    CHECK_SLOT_HOLDS(f, 4, 4);
+    CHECK_SLOT_HOLDS(f, 3, 5);
+    CHECK_EQ(f.ctl.iat(1), 1);            /* only the fallback moved it */
+    CHECK_EQ(f.ctl.iat(2), 2);
+}
+
+/* Second chance: every slot is referenced, so the hand clears all four bits and the miss takes the
+ * slot it started on, one full turn later. The bit it passed stays cleared. */
+TEST(kv_resolve_gives_a_referenced_slot_a_second_chance) {
+    KVF f(1, 8, 4, 2, 4);
+    f.fill_host();
+    for (int64_t s = 0; s < 4; ++s) f.put(s, s + 4);
+    f.res.n({ -1, -1, -1, -1, 0, 1, 2, 3 });
+    f.sblk.n({ 4, 5, 6, 7 });
+    f.sst.n({ 0, 1, 0, 1, 0, 1, 0, 1 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 0, 1 });
+    f.nsel.n({ 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 0, 1, -1, -1, -1, -1, 2, 3);
+    CHECK_ENTRIES(f.sblk, 0, 1, 6, 7);
+    CHECK_ENTRIES(f.sst, 1, 1, 1, 1, 0, 0, 0, 0);   /* 2 and 3 lost their second chance */
+    CHECK_ENTRIES(f.sel, 0, 1);
+    CHECK_SLOT_HOLDS(f, 0, 0);
+    CHECK_SLOT_HOLDS(f, 1, 1);
+    CHECK_SLOT_HOLDS(f, 2, 6);            /* untouched: still block 6 */
+    CHECK_EQ(f.ctl.iat(1), 2);
+}
+
+/* The heat counter is what makes this different from a one-bit CLOCK: slot 0 was hit on two
+ * earlier calls (counter 2), slots 1 and 2 once each. A CLOCK sweep would clear all three bits and
+ * evict slot 0 on the second pass; the counter halves 2 -> 1 -> 0, so slot 0 survives two passes and
+ * slot 1, whose single step of heat the first pass spends, is the victim. Same inputs, a different
+ * slot: the fixture is here to pin the policy and not only agreement between two implementations. */
+TEST(kv_resolve_a_slot_hit_twice_survives_two_sweep_passes) {
+    KVF f(1, 32, 3, 1, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12 });
+    f.sst.n({ 0, 2, 0, 1, 0, 1 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 20 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.sblk, 10, 20, 12);     /* slot 0, the hot one, was not the victim */
+    /* The sweep writes only the counter; the epoch column is what a hit or a placement stamps, so
+     * slots 0 and 2 keep the 0 they entered with. */
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 1, 0, 0);
+    CHECK_ENTRIES(f.sel, 1);
+    CHECK_EQ(f.ctl.iat(1), 2);
+    CHECK_EQ(f.ctl.iat(2), 1);
+}
+
+/* The halving sequence, across three calls, with the hand put back on slot 0 so each call passes
+ * the hot slot once -- the same visits a hand that wraps once gives it. A saturated 3 is 1 after one
+ * pass (a one-bit CLOCK would have cleared it to 0, and the next call would evict it), 1 is 0 after
+ * the second, and only the third pass takes the slot. Each step is checked, because the whole of the
+ * policy is the difference between 1 and 0 here. */
+TEST(kv_resolve_halves_a_saturated_counter_three_to_one_to_zero) {
+    KVF f(1, 32, 3, 1, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12 });
+    f.sst.n({ 0, 3, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 20 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+    /* 3 -> 1: the pass cost it one halving, not the whole counter. Slot 1 (cold) was the victim. */
+    CHECK_ENTRIES(f.sblk, 10, 20, 12);
+    CHECK_ENTRIES(f.sst, 0, 1, 1, 1, 0, 0);
+
+    f.sel.n({ 21 });
+    ((int32_t*)f.ctl.t.data)[1] = 0;       /* the hand back on slot 0, the epoch untouched */
+    REQUIRE_EQ(f.call(), RAD_OK);
+    /* 1 -> 0: slot 0 passed again and is still resident; slot 2 (cold) is the victim. */
+    CHECK_ENTRIES(f.sblk, 10, 20, 21);
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 0, 2, 1);
+
+    f.sel.n({ 22 });
+    ((int32_t*)f.ctl.t.data)[1] = 0;
+    REQUIRE_EQ(f.call(), RAD_OK);
+    /* 0: the third visit takes it. */
+    CHECK_ENTRIES(f.sblk, 22, 20, 21);
+    CHECK_ENTRIES(f.sst, 3, 1, 1, 0, 2, 1);
+    CHECK_EQ(f.res.iat(10), -1);           /* evicted on the third pass */
+    CHECK_EQ(f.res.iat(20), 1);
+    CHECK_EQ(f.res.iat(21), 2);
+    CHECK_EQ(f.res.iat(22), 0);
+}
+
+/* A saturated counter and a slot placed on the previous call differ by two steps of heat, and the
+ * sweep spends the fresh one first: {3,1,1,1} walks two full laps, leaving the 3 at 1 then 0 and
+ * taking slot 1. A one-bit CLOCK, for which all four are "referenced", evicts slot 0 -- the hottest
+ * block in the ring. */
+TEST(kv_resolve_a_saturated_counter_outlasts_a_fresh_placement) {
+    KVF f(1, 32, 4, 1, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 4; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12, 13 });
+    f.sst.n({ 0, 3, 0, 1, 0, 1, 0, 1 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 20 });
+    f.nsel.n({ 1 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.sblk, 10, 20, 12, 13);
+    CHECK_ENTRIES(f.sst, 0, 0, 1, 1, 0, 0, 0, 0);
+    CHECK_EQ(f.ctl.iat(1), 2);
+}
+
+/* One bump a slot a call, not one an entry: block 10 is resident and named by both entries, so its
+ * counter goes 1 -> 2 rather than 1 -> 3. The device kernel counts the first thread to stamp a slot
+ * (`atomicExch`), so a per-entry bump in the reference would be a real disagreement, not a detail. */
+TEST(kv_resolve_counts_one_bump_a_slot_a_call) {
+    KVF f(1, 32, 3, 2, 8);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, 10 + s);
+    f.res.n({-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1});
+    f.sblk.n({ 10, 11, 12 });
+    f.sst.n({ 0, 1, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 10, 10 });
+    f.nsel.n({ 2 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.sst, 1, 2, 0, 0, 0, 0);
+    CHECK_ENTRIES(f.sel, 0, 0);
+    CHECK_EQ(f.ctl.iat(2), 0);
+}
+
+/* Overflow: three hits hold slots 0..2 and two misses want the one slot left. The first is placed,
+ * the second has nowhere and must NOT steal the slot the first took (every slot of the ring is
+ * marked with this call's epoch, so the sweep passes it), nor any hit's. ctl[3] latches, the
+ * unplaced block reverts to -1, and its selection entry is rewritten to slot 0: leaving the block id
+ * would make a device attention dereference an address past the ring, and ctl[3] is what says the
+ * table is unusable. */
+TEST(kv_resolve_overflow_latches_instead_of_taking_a_slot_it_just_filled) {
+    KVF f(1, 8, 4, 5, 4);
+    f.fill_host();
+    for (int64_t s = 0; s < 3; ++s) f.put(s, s);
+    f.clear_slot(3);
+    f.res.n({ 0, 1, 2, -1, -1, -1, -1, -1 });
+    f.sblk.n({ 0, 1, 2, -1 });
+    f.sst.n({ 0, 1, 0, 1, 0, 1, 0, 0 });
+    f.ctl.n({ 0, 3, 0, 0 });               /* the hand starts on the one free slot */
+    f.sel.n({ 6, 7, 0, 1, 2 });
+    f.nsel.n({ 5 });
+    REQUIRE_EQ(f.call(), RAD_OK);
+
+    CHECK_ENTRIES(f.res, 0, 1, 2, -1, -1, -1, 3, -1);
+    CHECK_ENTRIES(f.sblk, 0, 1, 2, 6);
+    CHECK_ENTRIES(f.sst, 1, 2, 1, 2, 1, 2, 1, 1);   /* three hits on referenced slots, one placement */
+    /* Entry 1 is block 7, unplaced: it names slot 0, a defined address inside the ring, and ctl[3]
+     * below is what marks the table unusable. */
+    CHECK_ENTRIES(f.sel, 3, 0, 0, 1, 2);
+    CHECK_SLOT_HOLDS(f, 3, 6);             /* the second miss did not overwrite the first */
+    CHECK_SLOT_HOLDS(f, 0, 0);
+    CHECK_EQ(f.ctl.iat(2), 1);
+    CHECK_EQ(f.ctl.iat(3), 1);             /* overflow, latched */
+    CHECK_EQ(f.ctl.iat(4), 1);
+    CHECK_EQ(f.ctl.iat(6), 5);
+}
+
+/* A launch's claim count is derived from its own operands, never a constant: one claim is one
+ * distinct absent block a selection entry names, so a launch makes at most `M * sel_pitch` of them
+ * -- 2052 for four rows of 513, which is what `--max-num-seqs 4` selects -- and the miss list has to
+ * hold every one of them. This runs the same fixture at 2048 and at 2052 claims and holds the wider
+ * launch to the narrower one's placement: every block the two share lands in the same slot, so the
+ * launch above the old fixed list is not a different placement, and ctl[12] reports the depth the
+ * list had to hold. */
+TEST(kv_resolve_places_2052_claims_exactly_as_it_places_2048) {
+    const int64_t bbytes = 8, blocks = 4096, pitch = 513, M = 4, slots = 2100, first = 100;
+    /* Every slot free: ids below the ring take their own slot, and the ids past it walk the free
+     * slots from the hand. */
+    auto launch = [&](int64_t per_row) {
+        KVF f(M, blocks, slots, pitch, bbytes);
+        f.fill_host();
+        std::vector<int64_t> sel((size_t)(M * pitch), -1), nsel((size_t)M, per_row);
+        for (int64_t q = 0; q < M; ++q)
+            for (int64_t i = 0; i < per_row; ++i)
+                sel[(size_t)(q * pitch + i)] = first + q * per_row + i;
+        f.sel.n(sel);
+        f.nsel.n(nsel);
+        f.res.n(std::vector<int64_t>((size_t)blocks, -1));
+        f.sblk.n(std::vector<int64_t>((size_t)slots, -1));
+        f.sst.n(std::vector<int64_t>((size_t)(slots * 2), 0));
+        f.ctl.n(std::vector<int64_t>(16, 0));
+        CHECK_EQ(f.call(), RAD_OK);
+        return f;
+    };
+    KVF small = launch(512);   /* 4 x 512 = 2048 claims */
+    KVF large = launch(513);   /* 4 x 513 = 2052 claims */
+
+    /* 2052 claims are all placed, ascending from the first, and the counters say so. Identity
+     * covers every id below the ring: block `first + k` takes slot `first + k`. The 52 ids past
+     * `slots` (2100..2151) fall back to the first free slots after the hand, which is still 0. */
+    for (int64_t k = 0; k < 2000; ++k) {              /* ids first .. slots - 1 */
+        CHECK_EQ(large.res.iat(first + k), first + k);
+        CHECK_EQ(large.sblk.iat(first + k), first + k);
+    }
+    for (int64_t j = 0; j < 52; ++j) {                /* ids slots .. first + 2051 */
+        CHECK_EQ(large.res.iat(slots + j), j);
+        CHECK_EQ(large.sblk.iat(j), slots + j);
+    }
+    CHECK_EQ(large.ctl.iat(12), 2052);    /* the claim list's depth */
+    CHECK_EQ(large.ctl.iat(10), 2052);    /* every claim is a miss: no block was resident */
+    CHECK_EQ(large.ctl.iat(2), 2052);
+    CHECK_EQ(large.ctl.iat(1), 52);       /* identity never moves the hand: 52 fallbacks did */
+    CHECK_EQ(large.ctl.iat(3), 0);
+    CHECK_SLOT_HOLDS(large, 0, slots);
+    CHECK_SLOT_HOLDS(large, 51, first + 2051);
+    CHECK_SLOT_HOLDS(large, 2051, first + 1951);
+
+    /* The 2048-claim launch places its own blocks in exactly those slots. The four blocks only the
+     * wider launch names (2148..2151) are the sole difference, so they are skipped. */
+    for (int64_t s = 0; s < slots; ++s)
+        if (large.sblk.iat(s) < first + 2048)
+            CHECK_EQ(small.sblk.iat(s), large.sblk.iat(s));
+    for (int64_t k = 0; k < 2048; ++k)
+        CHECK_EQ(small.res.iat(first + k), large.res.iat(first + k));
+    CHECK_EQ(small.ctl.iat(12), 2048);
+    CHECK_EQ(small.ctl.iat(2), 2048);
+    /* The rewrite: every valid entry names the slot of its block, and the padding past nsel[q] is
+     * -1 (the 2048-claim launch has one such entry a row). */
+    for (int64_t q = 0; q < M; ++q)
+        for (int64_t i = 0; i < pitch; ++i) {
+            const int64_t e = q * pitch + i;
+            /* The block's own id while it fits the ring, then the slot it fell back to. The wider
+             * launch packs 513 a row, the narrower one 512. */
+            const int64_t bl = first + q * pitch + i;
+            const int64_t bs = first + q * 512 + i;
+            CHECK_EQ(large.sel.iat(e), bl < slots ? bl : bl - slots);
+            if (i < 512) CHECK_EQ(small.sel.iat(e), bs < slots ? bs : bs - slots);
+            else         CHECK_EQ(small.sel.iat(e), -1);
+        }
+}
+
+
+TEST(kv_resolve_refuses_a_selection_that_does_not_fit_the_maps) {
+    KVF f(1, 8, 4, 2, 4);
+    f.fill_host();
+    f.res.n({ -1, -1, -1, -1, -1, -1, -1, -1 });
+    f.sblk.n({ -1, -1, -1, -1 });
+    f.sst.n({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    f.ctl.n({ 0, 0, 0, 0 });
+    f.sel.n({ 8, -1 });                    /* block 8 is outside [0, blocks) */
+    f.nsel.n({ 1 });
+    CHECK_EQ(f.call(), RAD_E_INVAL);
+    CHECK_EQ(f.sel.iat(0), 8);             /* nothing rewritten */
+    CHECK_ENTRIES(f.res, -1, -1, -1, -1, -1, -1, -1, -1);
+    CHECK_ENTRIES(f.sel, 8, -1);
+    CHECK_EQ(f.ctl.iat(0), 0);             /* no epoch bump either */
+    f.sel.n({ 1, 1 });
+    f.nsel.n({ 3 });                       /* more entries than the row holds */
+    CHECK_EQ(f.call(), RAD_E_SHAPE);
+    CHECK_EQ(f.ctl.iat(0), 0);
+}
+
 /* qsa_tail_store: only the last `ring` tokens of a sequence write, to row pos % ring of the
  * sequence's slot; a sequence with no slot and every untargeted row are left alone. */
 TEST(qsa_tail_store_writes_the_last_ring_tokens_into_the_sequences_slot) {
@@ -8503,6 +9093,9 @@ std::vector<Geo> geometries() {
                               .d("scale", 0.3535533905932738).s("dtype", "bf16")),
         G("kv_store", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 4)
                               .s("kv_dtype", "f32")),
+        G("kv_store_streamed", "M", 3,
+          a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 8)
+           .s("kv_dtype", "fp8_e4m3")),
         G("rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
                           .d("theta", 1e4).d("scale", 1.0).s("mode", "neox")),
         G("qk_norm_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
@@ -8514,6 +9107,8 @@ std::vector<Geo> geometries() {
         G("qsa_score", "M", 4, a.i("M", R).i("n", 32).i("heads", 2).i("blocks", 6).i("seqs", 2)
                                .s("dtype", "bf16")),
         G("qsa_select", "M", 4, a.i("M", R).i("blocks", 6).i("topk", 3).i("ratio", 4).i("seqs", 2)),
+        G("kv_resolve", "M", 3, a.i("M", R).i("blocks", 8).i("slots", 6).i("sel_pitch", 4)
+                                 .i("block_bytes", 8)),
         G("qsa_tail_store", "M", 4, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
                                     .s("dtype", "bf16")),
         G("qsa_work", "M", 6, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)

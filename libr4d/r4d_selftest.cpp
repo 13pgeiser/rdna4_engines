@@ -20520,6 +20520,351 @@ static void sample_argmax_case(const Plugin& pl) {
        " agree=" + (agree ? "1" : "0"));
 }
 
+/* kv_resolve, on the card, against libref's serial oracle (libref/ref_kvstream.cpp).
+ *
+ * Each call is applied twice from the same pre-call bytes: once by libref on host tensors, once by
+ * this kernel on device tensors. All eight operands are then compared byte for byte -- both maps,
+ * the selection, ctl (epoch, hand, placed, overflow and the u64 counters) and the copied blocks --
+ * so a different victim, a stale epoch, an invented slot, a missed copy or a drifted counter all
+ * fail. The cases are the ones tests/ref_test.cpp pins: all-hit, misses placed in ascending block
+ * id, an unreferenced victim, a second chance, and the overflow latch; the last one also repeats
+ * three calls so the epoch, the hand and the heat counters are checked across launches.
+ *
+ * The state faults libref refuses before writing cannot return a host status from a device launch,
+ * so the kernel guards them; those checks are asserted here separately and are not byte-compared.
+ */
+static void kv_resolve_case(const Plugin& pl) {
+    const char* what = "kv_resolve vs libref: hits, misses, CLOCK, second chance, overflow";
+    const RadKernelInfo* r = find(pl, "kv_resolve_i32");
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!g_plugin) { ok(what, false, "plugin path absent"); return; }
+    std::string rpath(g_plugin);
+    rpath = rpath.substr(0, rpath.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(rpath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what, false, "reference plugin unavailable"); return; }
+    auto rcount = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto rat = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (rcount && rat)
+        for (int i = 0; i < rcount(); ++i)
+            if (std::strcmp(rat(i)->op, "kv_resolve") == 0) { oracle = rat(i); break; }
+    if (!oracle) { ok(what, false, "reference operation unavailable"); dlclose(ref); return; }
+
+    struct State {
+        int64_t M, blocks, slots, pitch, bbytes;
+        std::vector<int32_t> sel, nsel, res, sblk, sst, ctl;
+        std::vector<uint8_t> host, pool;
+    };
+    auto seed = [](State& c, int64_t M, int64_t blocks, int64_t slots, int64_t pitch,
+                   int64_t bbytes) {
+        c.M = M; c.blocks = blocks; c.slots = slots; c.pitch = pitch; c.bbytes = bbytes;
+        c.sel.assign((size_t)(M * pitch), -1);
+        c.nsel.assign((size_t)M, 0);
+        c.res.assign((size_t)blocks, -1);
+        c.sblk.assign((size_t)slots, -1);
+        c.sst.assign((size_t)(slots * 2), 0);
+        c.ctl.assign(16, 0);
+        c.host.assign((size_t)(blocks * bbytes), 0);
+        c.pool.assign((size_t)(slots * bbytes), (uint8_t)0xEE);
+        for (int64_t b = 0; b < blocks; ++b)
+            for (int64_t i = 0; i < bbytes; ++i)
+                c.host[(size_t)(b * bbytes + i)] = (uint8_t)(10 * b + i);
+    };
+    auto put = [](State& c, int64_t s, int64_t b) {
+        for (int64_t i = 0; i < c.bbytes; ++i)
+            c.pool[(size_t)(s * c.bbytes + i)] = (uint8_t)(10 * b + i);
+    };
+    /* Both runs start from `c.sel`/`c.nsel` of each step; `c` keeps the state across steps.
+     *
+     * `band` is what the geometry's RANGED `M` parameter holds, which is the band's ceiling, not
+     * this call's rows: the device must read its row count from `sel`'s extent while libref is
+     * handed the call's real width. `band < 0` means the two agree. `want_kernel` lets a case
+     * assert the device's refusal (a launch above the band) while libref, which has no band,
+     * still accepts. */
+    auto run = [&](const char* label, State& c,
+                   const std::vector<std::vector<int32_t>>& sels,
+                   const std::vector<std::vector<int32_t>>& nsels,
+                   int64_t band = -1, int want_kernel = RAD_OK) {
+        std::vector<void*> d(8, nullptr);
+        const size_t bytes[8] = { (size_t)(c.M * c.pitch) * 4, (size_t)c.M * 4,
+                                  (size_t)c.blocks * 4, (size_t)c.slots * 4,
+                                  (size_t)(c.slots * 2) * 4, (size_t)16 * 4,
+                                  (size_t)(c.blocks * c.bbytes), (size_t)(c.slots * c.bbytes) };
+        for (int i = 0; i < 8; ++i) {
+            d[(size_t)i] = dalloc(bytes[i]);
+            if (!d[(size_t)i]) { ok(label, false, "allocation failed"); return; }
+        }
+        const std::vector<std::vector<int64_t>> shapes = {
+            { c.M, c.pitch }, { c.M }, { c.blocks }, { c.slots }, { c.slots, 2 }, { 16 },
+            { c.blocks, c.bbytes }, { c.slots, c.bbytes } };
+        const uint32_t dts[8] = { RAD_I32, RAD_I32, RAD_I32, RAD_I32, RAD_I32, RAD_I32,
+                                  RAD_U8, RAD_U8 };
+        /* libref reads the counters as u64 from ctl+4 and refuses a ctl that is not 8-byte
+         * aligned, which a vector<int32_t> is not guaranteed to be. */
+        alignas(8) int32_t ctl_host[16] = {};
+        std::vector<RadTensor> th, td;
+        for (int i = 0; i < 8; ++i) {
+            void* hp = i == 0 ? (void*)c.sel.data() : i == 1 ? (void*)c.nsel.data()
+                       : i == 2 ? (void*)c.res.data() : i == 3 ? (void*)c.sblk.data()
+                       : i == 4 ? (void*)c.sst.data() : i == 5 ? (void*)ctl_host
+                       : i == 6 ? (void*)c.host.data() : (void*)c.pool.data();
+            th.push_back(T(hp, dts[i], shapes[(size_t)i]));
+            td.push_back(T(d[(size_t)i], dts[i], shapes[(size_t)i]));
+        }
+        std::vector<RadParam> ps = { PI("M", c.M), PI("blocks", c.blocks), PI("slots", c.slots),
+                                     PI("sel_pitch", c.pitch), PI("block_bytes", c.bbytes) };
+        std::vector<RadParam> pd = ps;
+        if (band > 0) pd[0] = PI("M", band);
+        RadArgs ah{}, ad{};
+        ah.t = th.data(); ah.n_t = 8; ah.p = ps.data(); ah.n_p = 5; ah.world_size = 1;
+        ad.t = td.data(); ad.n_t = 8; ad.p = pd.data(); ad.n_p = 5; ad.world_size = 1;
+        const int64_t need = r->scratch ? r->scratch(&ad) : 0;
+        if (need < 0) { ok(label, false, "scratch hook refused"); return; }
+        ad.scratch_bytes = need;
+        if (need > 0) ad.scratch = dalloc((size_t)need);
+        bool pass = true;
+        std::string why;
+        for (size_t k = 0; k < sels.size() && pass; ++k) {
+            std::copy(sels[k].begin(), sels[k].end(), c.sel.begin());
+            std::copy(nsels[k].begin(), nsels[k].end(), c.nsel.begin());
+            std::memcpy(ctl_host, c.ctl.data(), sizeof ctl_host);
+            const void* const hp[8] = { c.sel.data(), c.nsel.data(), c.res.data(),
+                                        c.sblk.data(), c.sst.data(), ctl_host, c.host.data(),
+                                        c.pool.data() };
+            for (int i = 0; i < 8; ++i)
+                st_memcpy(d[(size_t)i], hp[i], bytes[i], hipMemcpyHostToDevice);
+            const int rr = oracle->launch(&ah, nullptr);
+            std::memcpy(c.ctl.data(), ctl_host, sizeof ctl_host);
+            const int rc = r->launch(&ad, nullptr);
+            st_stream_sync(nullptr);
+            if (rr != RAD_OK || rc != want_kernel) {
+                pass = false;
+                why = fmt("call %zu: libref rc=%d kernel rc=%d (wanted %d)", k, rr, rc,
+                          want_kernel);
+                break;
+            }
+            /* A refusal case has nothing to compare: the device wrote nothing. */
+            if (want_kernel != RAD_OK) break;
+            for (int i = 0; i < 8 && pass; ++i) {
+                std::vector<uint8_t> got(bytes[i]);
+                st_memcpy(got.data(), d[(size_t)i], bytes[i], hipMemcpyDeviceToHost);
+                for (size_t j = 0; j < bytes[i]; ++j)
+                    if (got[j] != ((const uint8_t*)hp[i])[j]) {
+                        pass = false;
+                        why = fmt("call %zu operand %d byte %zu: kernel %u, libref %u", k, i, j,
+                                  (unsigned)got[j], (unsigned)((const uint8_t*)hp[i])[j]);
+                        break;
+                    }
+            }
+        }
+        ok(label, pass, why);
+    };
+
+    /* All hits: the epoch reaches every slot, every counter goes to 1, nothing is copied. */
+    {
+        State c; seed(c, 2, 8, 4, 4, 8);
+        c.res = { 0, 1, 2, 3, -1, -1, -1, -1 };
+        c.sblk = { 0, 1, 2, 3 };
+        for (int64_t s = 0; s < 4; ++s) put(c, s, s);
+        run("kv_resolve all-hit", c, { { 0, 1, 2, 3, 0, 2, -1, -1 } }, { { 4, 2 } });
+    }
+    /* ref_test's first case: hits, then two misses placed in ascending block id, not row order. */
+    {
+        State c; seed(c, 2, 8, 4, 4, 8);
+        put(c, 0, 2); put(c, 3, 5);
+        c.res = { -1, -1, 0, -1, -1, 3, -1, -1 };
+        c.sblk = { 2, -1, -1, 5 };
+        c.sst = { 0, 1, 0, 0, 0, 0, 0, 0 };
+        run("kv_resolve misses in ascending block order", c,
+            { { 2, 5, 6, -1, 2, 4, -1, -1 } }, { { 3, 2 } });
+    }
+    /* ref_test's eviction: slot 1's block is unreferenced, so the hand takes it and unmaps block 2. */
+    {
+        State c; seed(c, 1, 8, 4, 1, 4);
+        for (int64_t s = 0; s < 4; ++s) put(c, s, s + 1);
+        c.res = { -1, 0, 1, 2, 3, -1, -1, -1 };
+        c.sblk = { 1, 2, 3, 4 };
+        c.sst = { 0, 1, 0, 0, 0, 1, 0, 0 };
+        c.ctl[1] = 1;
+        run("kv_resolve evicts an unreferenced slot", c, { { 0 } }, { { 1 } });
+    }
+    /* ref_test's free-first policy: slot 0 holds an unreferenced block and the hand starts on it,
+     * so the CLOCK sweep would evict it -- a free slot must be claimed instead, and block 3 must
+     * stay resident and mapped. */
+    {
+        State c; seed(c, 1, 8, 4, 1, 4);
+        put(c, 0, 3);
+        c.res = { -1, -1, -1, 0, -1, -1, -1, -1 };
+        c.sblk = { 3, -1, -1, -1 };
+        run("kv_resolve free slot before a live one", c, { { 0 } }, { { 1 } });
+    }
+    /* ref_test's second chance: every counter is 1, so the hand halves all four and comes back. */
+    {
+        State c; seed(c, 1, 8, 4, 2, 4);
+        for (int64_t s = 0; s < 4; ++s) put(c, s, s + 4);
+        c.res = { -1, -1, -1, -1, 0, 1, 2, 3 };
+        c.sblk = { 4, 5, 6, 7 };
+        c.sst = { 0, 1, 0, 1, 0, 1, 0, 1 };
+        run("kv_resolve second chance", c, { { 0, 1 } }, { { 2 } });
+    }
+    /* ref_test's overflow: three hits hold slots 0..2, one slot is free and two misses want it. The
+     * second must not take the slot the first just filled; ctl[3] latches and block 7 stays in sel. */
+    {
+        State c; seed(c, 1, 8, 4, 5, 4);
+        for (int64_t s = 0; s < 3; ++s) put(c, s, s);
+        c.res = { 0, 1, 2, -1, -1, -1, -1, -1 };
+        c.sblk = { 0, 1, 2, -1 };
+        c.sst = { 0, 1, 0, 1, 0, 1, 0, 0 };
+        c.ctl[1] = 3;
+        run("kv_resolve overflow latches", c, { { 6, 7, 0, 1, 2 } }, { { 5 } });
+    }
+    /* ref_test's heat case: slot 0 was hit twice (counter 2) and slots 1 and 2 once each. A one-bit
+     * CLOCK would evict slot 0 on the second pass; the counter halves 2 -> 1 -> 0, so slot 0 stays
+     * resident and slot 1 is the victim. Same state, a different victim, so this is the case that
+     * says the kernel runs the counter and not a bit. */
+    {
+        State c; seed(c, 1, 32, 3, 1, 8);
+        for (int64_t s = 0; s < 3; ++s) put(c, s, 10 + s);
+        c.res.assign(32, -1); c.res[10] = 0; c.res[11] = 1; c.res[12] = 2;
+        c.sblk = { 10, 11, 12 };
+        c.sst = { 0, 2, 0, 1, 0, 1 };
+        run("kv_resolve heat: a slot hit twice survives two passes", c, { { 20 } }, { { 1 } });
+    }
+    /* The claim list's depth, above the fixed 2048 ids it used to sort: four rows of 513 -- what
+     * `--max-num-seqs 4` selects -- claim 2052 distinct blocks, all with every slot free, so block
+     * `first + k` lands in slot k. A device launch derives the list's size from its own operands
+     * (libr4d/r4d_kv_resolve.hip, kv_claim_cap), and this case is the one that says so: with a
+     * constant 2048 the launch above it took the map walk and ctl[12] still had to read 2052. */
+    {
+        State c; seed(c, 4, 4096, 2100, 513, 8);
+        std::vector<int32_t> sel((size_t)(4 * 513)), nsel((size_t)4, 513);
+        for (int64_t q = 0; q < 4; ++q)
+            for (int64_t i = 0; i < 513; ++i) sel[(size_t)(q * 513 + i)] = (int32_t)(100 + q * 513 + i);
+        run("kv_resolve 2052 claims", c, { sel }, { nsel });
+    }
+    /* Three calls in a row: the epoch, the hand and the heat counters carry, and a call evicts
+     * only after halving every warm slot it passes. */
+    {
+        State c; seed(c, 2, 16, 6, 4, 16);
+        run("kv_resolve across calls", c,
+            { { 0, 1, 2, -1, 3, 4, -1, -1 },
+              { 5, 6, 7, -1, 1, 8, -1, -1 },
+              { 0, 2, 4, -1, 5, 6, -1, -1 } },
+            { { 3, 2 }, { 3, 2 }, { 3, 2 } });
+    }
+
+    /* The deployment's own block: 2 KiB across 32 lanes is 128 vectors, one full four-wide group per
+     * thread with nothing left over, and 2064 bytes is that group plus one vector of tail. Both are
+     * the copy phase 6 exists for -- four loads in flight -- and both are compared against libref's
+     * memcpy byte for byte, including the slot's last byte. */
+    for (int64_t bb : { 2048, 2064 }) {
+        State c; seed(c, 2, 8, 4, 4, bb);
+        put(c, 0, 0); put(c, 3, 3);
+        c.res = { 0, -1, -1, 3, -1, -1, -1, -1 };
+        c.sblk = { 0, -1, -1, 3 };
+        const std::string name =
+            fmt("kv_resolve copies a whole block byte for byte (%lld bytes)", (long long)bb);
+        run(name.c_str(), c, { { 0, 3, 1, 2 } }, { { 4 } });
+    }
+
+    /* The launch widths the geometry's band hid: `M` arrives as the band ceiling (2048) while the
+     * selection's own extent is one row, a 625-token prefill, or the whole band. The row count and
+     * pitch must come from `sel`, and the result must be byte-identical to libref at that width. */
+    {
+        State c; seed(c, 1, 8, 4, 2, 4);
+        put(c, 0, 2);
+        c.res = { -1, -1, 0, -1, -1, -1, -1, -1 };
+        c.sblk = { 2, -1, -1, -1 };
+        run("kv_resolve at one query row (band 2048)", c, { { 2, 5 } }, { { 2 } }, 2048);
+    }
+    {
+        const int64_t M = 625, pitch = 4;
+        State c; seed(c, M, 8, 4, pitch, 8);
+        put(c, 0, 2); put(c, 1, 5);
+        c.res = { -1, -1, 0, -1, -1, 1, -1, -1 };
+        c.sblk = { 2, 5, -1, -1 };
+        std::vector<int32_t> sel((size_t)(M * pitch), -1), ns((size_t)M, 2);
+        for (int64_t q = 0; q < M; ++q) {
+            sel[(size_t)(q * pitch)] = 2;
+            sel[(size_t)(q * pitch + 1)] = 5;
+        }
+        run("kv_resolve at 625 query rows (band 2048)", c, { sel }, { ns }, 2048);
+    }
+    {
+        const int64_t M = 2048, pitch = 4;
+        State c; seed(c, M, 8, 4, pitch, 8);
+        put(c, 0, 2); put(c, 1, 5);
+        c.res = { -1, -1, 0, -1, -1, 1, -1, -1 };
+        c.sblk = { 2, 5, -1, -1 };
+        std::vector<int32_t> sel((size_t)(M * pitch), -1), ns((size_t)M, 2);
+        for (int64_t q = 0; q < M; ++q) {
+            sel[(size_t)(q * pitch)] = 2;
+            sel[(size_t)(q * pitch + 1)] = 5;
+        }
+        run("kv_resolve at the band bound (2048 rows)", c, { sel }, { ns }, 2048);
+    }
+    /* The ceiling still refuses: five operand rows against a four-row band is a caller bug. */
+    {
+        State c; seed(c, 5, 8, 4, 2, 4);
+        c.res = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        c.sblk = { -1, -1, -1, -1 };
+        run("kv_resolve refuses a launch wider than its band", c, { { 0, 1 } }, { { 2 } }, 4,
+            RAD_E_SHAPE);
+    }
+
+    /* The state faults, guarded on device. A pitch that disagrees with sel_pitch is refused; a row
+     * that asks for more entries than it holds is clamped to its own row, and an out-of-range block
+     * id is left in sel and in the map. */
+    {
+        State c; seed(c, 2, 8, 4, 2, 4);
+        void* d[8];
+        const size_t bytes[8] = { (size_t)(c.M * c.pitch) * 4, (size_t)c.M * 4,
+                                  (size_t)c.blocks * 4, (size_t)c.slots * 4,
+                                  (size_t)(c.slots * 2) * 4, (size_t)16 * 4,
+                                  (size_t)(c.blocks * c.bbytes), (size_t)(c.slots * c.bbytes) };
+        const void* const hp[8] = { c.sel.data(), c.nsel.data(), c.res.data(), c.sblk.data(),
+                                    c.sst.data(), c.ctl.data(), c.host.data(), c.pool.data() };
+        for (int i = 0; i < 8; ++i) d[i] = dalloc(bytes[i]);
+        std::vector<RadTensor> ts = {
+            T(d[0], RAD_I32, { c.M, c.pitch }), T(d[1], RAD_I32, { c.M }),
+            T(d[2], RAD_I32, { c.blocks }), T(d[3], RAD_I32, { c.slots }),
+            T(d[4], RAD_I32, { c.slots, 2 }), T(d[5], RAD_I32, { 16 }),
+            T(d[6], RAD_U8, { c.blocks, c.bbytes }), T(d[7], RAD_U8, { c.slots, c.bbytes }) };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("blocks", c.blocks), PI("slots", c.slots),
+                                     PI("sel_pitch", c.pitch), PI("block_bytes", c.bbytes) };
+        RadArgs a{};
+        a.t = ts.data(); a.n_t = 8; a.p = ps.data(); a.n_p = 5; a.world_size = 1;
+        const int64_t need = r->scratch(&a);
+        a.scratch = dalloc((size_t)need); a.scratch_bytes = need;
+        for (int i = 0; i < 8; ++i) st_memcpy(d[i], hp[i], bytes[i], hipMemcpyHostToDevice);
+        ts[0].stride[0] = c.pitch + 1;
+        ok("kv_resolve refuses a sel row pitch that is not sel_pitch",
+           r->launch(&a, nullptr) == RAD_E_STRIDE);
+        ts[0].stride[0] = c.pitch;
+        /* Row 0 asks for five entries of a two-wide row; row 1 must keep its sentinels. */
+        const int32_t sel[4] = { 1, 1, 77, 77 };
+        const int32_t ns[2] = { 5, 0 };
+        st_memcpy(d[0], sel, sizeof sel, hipMemcpyHostToDevice);
+        st_memcpy(d[1], ns, sizeof ns, hipMemcpyHostToDevice);
+        const int rc = r->launch(&a, nullptr);
+        int32_t got[4] = {};
+        st_memcpy(got, d[0], sizeof got, hipMemcpyDeviceToHost);
+        ok("kv_resolve clamps nsel to its own row", rc == RAD_OK && got[2] == 77 && got[3] == 77,
+           fmt("rc=%d row1=%d,%d", rc, got[2], got[3]));
+        /* A block id outside the map is left alone rather than turned into a slot. */
+        const int32_t bad[4] = { 99, -1, 77, 77 };
+        const int32_t nb[2] = { 1, 0 };
+        st_memcpy(d[0], bad, sizeof bad, hipMemcpyHostToDevice);
+        st_memcpy(d[1], nb, sizeof nb, hipMemcpyHostToDevice);
+        const int rc2 = r->launch(&a, nullptr);
+        st_memcpy(got, d[0], sizeof got, hipMemcpyDeviceToHost);
+        ok("kv_resolve leaves an out-of-range block id alone", rc2 == RAD_OK && got[0] == 99,
+           fmt("rc=%d sel0=%d", rc2, got[0]));
+    }
+
+    dlclose(ref);
+}
+
 /* sample_ngram_ban, against a host port of the reference processor.
  *
  * The oracle is modeling_unlimitedocr.py:353-383's SlidingWindowNoRepeatNgramProcessor, restated
@@ -21012,6 +21357,346 @@ static void qsa_select_case(const Plugin& pl, int signed_scores = 0) {
     ok(what, pass, std::string("set=") + (set_ok ? "1" : "0") + " tail=" + (tail_ok ? "1" : "0") +
                    " dead=" + (dead_ok ? "1" : "0") + " n=" + (n_ok ? "1" : "0") +
                    " su=" + (su_ok ? "1" : "0") + " det=" + (det ? "1" : "0"));
+}
+
+/* kv_store_streamed, on the card, against libref's oracle: the store of a group whose KV streams.
+ *
+ * Both sides start from the same bytes; libref runs on host tensors and this kernel on device ones,
+ * and all six operands are compared byte for byte afterwards -- the mirror, the ring, and the four
+ * inputs, which must be unchanged. The conversion is E4M3 on both sides, so a status only one side
+ * rounds differently, or a block written to the wrong plane, fails here.
+ *
+ * The cases are the ones that decide the design: a block absent from the ring beside one resident
+ * (the resident token must reach both copies, the absent one the mirror only), a step with nothing
+ * resident (the ring untouched), the parity configuration's identity map (both planes alike), and a
+ * padded batch row. libref refuses the state faults before writing them; this kernel guards the same
+ * paths instead, since a launch cannot return a host status, so they are not byte-compared.
+ */
+static void kv_store_streamed_case(const Plugin& pl, const char* row, const char* kvd,
+                                   uint32_t kdt, int64_t eb) {
+    const std::string whats =
+        fmt("kv_store_streamed %s vs libref: mirror always, resident slot too", kvd);
+    const char* what = whats.c_str();
+    const RadKernelInfo* r = find(pl, row);
+    if (!r) { ok(what, false, "row absent"); return; }
+    if (!g_plugin) { ok(what, false, "plugin path absent"); return; }
+    std::string rpath(g_plugin);
+    rpath = rpath.substr(0, rpath.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(rpath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what, false, "reference plugin unavailable"); return; }
+    auto rcount = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto rat = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (rcount && rat)
+        for (int i = 0; i < rcount(); ++i)
+            if (std::strcmp(rat(i)->op, "kv_store_streamed") == 0) { oracle = rat(i); break; }
+    if (!oracle) { ok(what, false, "reference operation unavailable"); dlclose(ref); return; }
+
+    struct State {
+        int64_t M, blocks, slots, bs, kvh, hd, row;
+        std::vector<uint16_t> k, v;
+        std::vector<int32_t>  sm, res;
+        std::vector<uint8_t>  host, ring;
+    };
+    auto seed = [eb](State& c, int64_t M, int64_t blocks, int64_t slots, int64_t bs, int64_t kvh,
+                   int64_t hd, std::vector<int32_t> sm, std::vector<int32_t> res) {
+        c.M = M; c.blocks = blocks; c.slots = slots; c.bs = bs; c.kvh = kvh; c.hd = hd;
+        c.row = kvh * bs * 2 * hd * eb;
+        c.sm = std::move(sm);
+        c.res = std::move(res);
+        c.k.resize((size_t)(M * kvh * hd));
+        c.v.resize((size_t)(M * kvh * hd));
+        for (int64_t i = 0; i < M * kvh * hd; ++i) {
+            c.k[(size_t)i] = h_to_bf16((float)((i * 5 + 3) % 29 - 14) * 0.5f);
+            c.v[(size_t)i] = h_to_bf16((float)((i * 11 + 1) % 17 - 8) * 0.25f);
+        }
+        c.host.assign((size_t)(blocks * c.row), 0);
+        c.ring.assign((size_t)(slots * c.row), 0);
+    };
+    /* `mapped_host`: the mirror is pinned HOST memory, mapped into the device's address space, not
+     * a device allocation. That is what the engine hands the op -- a streamed group's mirror is
+     * RAD_MEM_HOST_MAPPED, one address on every card -- so the store's second destination is system
+     * RAM written by a kernel, the first in-place device write of that kind here (docs/
+     * KV-STREAMING.md §6.2). The kernel gets the device view of it; the comparison reads the host
+     * pointer, which is the same bytes by construction. */
+    auto run = [&](const char* label, State& c, int want_kernel = RAD_OK,
+                   bool mapped_host = false) {
+        void* d[6] = {};
+        const size_t bytes[6] = {
+            c.k.size() * 2, c.v.size() * 2, c.sm.size() * 4,
+            c.ring.size(), (size_t)c.res.size() * 4, c.host.size() };
+        void* host_mapped = nullptr;   /* operand 5's host pointer, when it is host memory */
+        for (int i = 0; i < 6; ++i) {
+            if (i == 5 && mapped_host) {
+                if (hipHostMalloc(&host_mapped, bytes[5], hipHostMallocMapped) != hipSuccess ||
+                    !host_mapped) {
+                    ok(label, false, "host-mapped allocation failed");
+                    return;
+                }
+                if (hipHostGetDevicePointer(&d[5], host_mapped, 0) != hipSuccess || !d[5]) {
+                    ok(label, false, "host-mapped allocation has no device view");
+                    st_free(host_mapped);
+                    return;
+                }
+                continue;
+            }
+            d[i] = dalloc(bytes[i]);
+            if (!d[i]) { ok(label, false, "allocation failed"); return; }
+        }
+        const std::vector<std::vector<int64_t>> shapes = {
+            { c.M, c.kvh, c.hd }, { c.M, c.kvh, c.hd }, { c.M },
+            { c.slots, c.kvh, c.bs, 2 * c.hd }, { c.blocks }, { c.blocks, c.row } };
+        const uint32_t dts[6] = { RAD_BF16, RAD_BF16, RAD_I32, kdt, RAD_I32, RAD_U8 };
+        const void* hp[6] = { c.k.data(), c.v.data(), c.sm.data(), c.ring.data(), c.res.data(),
+                              c.host.data() };
+        std::vector<RadTensor> th, td;
+        for (int i = 0; i < 6; ++i) {
+            th.push_back(T((void*)hp[i], dts[i], shapes[(size_t)i]));
+            td.push_back(T(d[i], dts[i], shapes[(size_t)i]));
+            if (i == 5 && mapped_host) std::memcpy(host_mapped, hp[5], bytes[5]);
+            else st_memcpy(d[i], hp[i], bytes[i], hipMemcpyHostToDevice);
+        }
+        std::vector<RadParam> ps = { PI("M", c.M), PI("head_dim", c.hd),
+                                     PI("n_head_kv", c.kvh), PI("block_size", c.bs),
+                                     { "kv_dtype", RAD_P_STR, 0, 0, kvd, 0 } };
+        RadArgs ah{}, ad{};
+        ah.t = th.data(); ah.n_t = 6; ah.p = ps.data(); ah.n_p = 5; ah.world_size = 1;
+        ad.t = td.data(); ad.n_t = 6; ad.p = ps.data(); ad.n_p = 5; ad.world_size = 1;
+        const int rr = oracle->launch(&ah, nullptr);
+        const int rc = r->launch(&ad, nullptr);
+        st_stream_sync(nullptr);
+        bool pass = rr == RAD_OK && rc == want_kernel;
+        std::string why;
+        if (!pass) why = fmt("libref rc=%d kernel rc=%d (wanted %d)", rr, rc, want_kernel);
+        if (pass && want_kernel == RAD_OK) {
+            for (int i = 0; i < 6 && pass; ++i) {
+                std::vector<uint8_t> got(bytes[i]);
+                if (i == 5 && mapped_host)
+                    std::memcpy(got.data(), host_mapped, bytes[i]);
+                else
+                    st_memcpy(got.data(), d[i], bytes[i], hipMemcpyDeviceToHost);
+                for (size_t j = 0; j < bytes[i]; ++j)
+                    if (got[j] != ((const uint8_t*)hp[i])[j]) {
+                        pass = false;
+                        why = fmt("operand %d byte %zu: kernel %u, libref %u", i, j,
+                                  (unsigned)got[j], (unsigned)((const uint8_t*)hp[i])[j]);
+                        break;
+                    }
+            }
+        }
+        if (host_mapped) (void)hip_ck(hipHostFree(host_mapped), "hipHostFree", __LINE__);
+        ok(label, pass, why);
+    };
+
+    /* Block 0 absent, block 1 resident in slot 0, block 2 absent: one token in each. */
+    {
+        State c; seed(c, 3, 4, 2, 2, 2, 4, { 1, 3, 6 }, { -1, 0, -1, -1 });
+        run("kv_store_streamed mirror always, resident slot too", c);
+    }
+    /* Nothing resident: the ring must come out untouched. */
+    {
+        State c; seed(c, 2, 4, 2, 2, 2, 4, { 0, 5 }, { -1, -1, -1, -1 });
+        run("kv_store_streamed a cold ring takes the mirror alone", c);
+    }
+    /* The parity configuration's identity map: both planes hold the same bytes. */
+    {
+        State c; seed(c, 4, 3, 3, 2, 2, 4, { 0, 3, 5, 2 }, { 0, 1, 2 });
+        run("kv_store_streamed an identity map writes both planes alike", c);
+    }
+    /* A padded batch row stores nothing in either plane. */
+    {
+        State c; seed(c, 2, 2, 1, 2, 1, 8, { -1, 3 }, { -1, 0 });
+        run("kv_store_streamed a negative slot stores nothing", c);
+    }
+    /* The engine's own configuration: the mirror is pinned host memory the kernel writes. */
+    {
+        State c; seed(c, 3, 4, 2, 2, 2, 4, { 1, 3, 6 }, { -1, 0, -1, -1 });
+        run("kv_store_streamed into a host-mapped mirror", c, RAD_OK, true);
+    }
+}
+
+/* qk_norm_rope_gate_kv_store_streamed, on the card, against the pair it replaces: the device
+ * prologue (the row the fold is byte-identical to) plus libref's `kv_store_streamed` oracle for the
+ * store half -- the mirror for every token, the ring slot only where the residency map says the
+ * block is resident. All four outputs are compared byte for byte (q, the rotated k, the mirror and
+ * the ring), as are the inputs that must not change.
+ *
+ * The cases that decide the design are the same ones the streamed store has: a partly resident map
+ * beside absent blocks, a cold ring, the parity configuration's identity map, and a padded row
+ * whose negative slot writes neither plane. The inputs span E4M3's clamp, as the hosted fold does.
+ */
+static void qk_kv_fold_streamed_case(const Plugin& pl, const char* row, const char* kvd,
+                                     uint32_t kdt, int64_t eb) {
+    if (!sel(row)) return;
+    const std::string whats =
+        fmt("qk_norm_rope_gate_kv_store_streamed %s vs prologue + libref kv_store_streamed", kvd);
+    const char* what = whats.c_str();
+    const RadKernelInfo* rk = find(pl, row);
+    const RadKernelInfo* rf = find(pl, "qk_norm_rope_gate");
+    const RadKernelInfo* rt = find(pl, "rope_table_f32");
+    if (!rk || !rf || !rt) { ok(what, false, "row absent"); return; }
+    if (!g_plugin) { ok(what, false, "plugin path absent"); return; }
+    std::string rpath(g_plugin);
+    rpath = rpath.substr(0, rpath.find_last_of('/') + 1) + "libref.so";
+    void* ref = dlopen(rpath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!ref) { ok(what, false, "reference plugin unavailable"); return; }
+    auto rcount = (int (*)(void))dlsym(ref, "rad_kernel_count");
+    auto rat = (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at");
+    const RadKernelInfo* oracle = nullptr;
+    if (rcount && rat)
+        for (int i = 0; i < rcount(); ++i)
+            if (std::strcmp(rat(i)->op, "kv_store_streamed") == 0) { oracle = rat(i); break; }
+    if (!oracle) { ok(what, false, "reference operation unavailable"); dlclose(ref); return; }
+
+    const int64_t M = 12, nq = 4, nkv = 2, hd = 64, rot = 64, ctx = 1024, bs = 8;
+    const int64_t blocks = 4, slots = 3;
+    const int64_t rowb = nkv * bs * 2 * hd * eb;         /* one block of one layer, bytes */
+    const size_t qb = (size_t)M * nq * hd * 2, kb = (size_t)M * nkv * hd * 2;
+    const size_t hb = (size_t)(blocks * rowb), cb = (size_t)(slots * rowb);
+
+    uint32_t st = 0x1234567u;
+    auto rnd = [&](float span) {
+        st = st * 1664525u + 1013904223u;
+        return ((float)(st >> 8) / 16777216.0f * 2.0f - 1.0f) * span;
+    };
+    std::vector<int32_t> pos((size_t)M), slot((size_t)M);
+    for (int64_t t = 0; t < M; ++t) {
+        pos[(size_t)t]  = (int32_t)((t * 97 + 5) % ctx);
+        slot[(size_t)t] = (int32_t)((t * 3 + 1) % (blocks * bs));   /* blocks 0..3, 3 coprime with 8 */
+    }
+    slot[2] = -1;                                                   /* a pad row */
+    std::vector<uint16_t> hqg((size_t)M * nq * 2 * hd), hk((size_t)M * nkv * hd),
+                          hv((size_t)M * nkv * hd);
+    for (auto& x : hqg) x = h_to_bf16(rnd(4.0f));
+    for (auto& x : hk)  x = h_to_bf16(rnd(4.0f));
+    for (auto& x : hv)  x = h_to_bf16(rnd(2000.0f));
+    std::vector<float> fwq((size_t)hd), fwk((size_t)hd);
+    for (int64_t d = 0; d < hd; ++d) { fwq[(size_t)d] = rnd(0.5f); fwk[(size_t)d] = rnd(0.5f); }
+
+    void* d_qg = dalloc((size_t)M * nq * 2 * hd * 2);
+    void* d_k  = dalloc(kb);        /* the prologue's rotated k, reused as the fold's k_out check */
+    void* d_v  = dalloc(kb);
+    void* d_wq = dalloc((size_t)hd * 4); void* d_wk = dalloc((size_t)hd * 4);
+    void* d_p  = dalloc((size_t)M * 4);  void* d_sl = dalloc((size_t)M * 4);
+    void* d_cs = dalloc((size_t)ctx * rot * 4);
+    void* d_qA = dalloc(qb);  void* d_qB = dalloc(qb);
+    void* d_kA = dalloc(kb);  void* d_kB = dalloc(kb);
+    void* d_hA = dalloc(hb);  void* d_hB = dalloc(hb);
+    void* d_cA = dalloc(cb);  void* d_cB = dalloc(cb);
+    void* d_res = dalloc((size_t)blocks * 4);
+    if (!d_qg || !d_k || !d_v || !d_wq || !d_wk || !d_p || !d_sl || !d_cs || !d_qA || !d_qB ||
+        !d_kA || !d_kB || !d_hA || !d_hB || !d_cA || !d_cB || !d_res) {
+        ok(what, false, "hipMalloc failed"); dlclose(ref); return;
+    }
+    st_memcpy(d_qg, hqg.data(), hqg.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_v,  hv.data(),  hv.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_k,  hk.data(),  hk.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_wq, fwq.data(), (size_t)hd * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_wk, fwk.data(), (size_t)hd * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_p,  pos.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_sl, slot.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+    st_memset(d_cs, 0, (size_t)ctx * rot * 4);
+    {
+        std::vector<RadTensor> ts = { T(d_p, RAD_I32, { M }), T(d_cs, RAD_F32, { ctx, rot }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("rot", rot), PF("theta", 1e7),
+                                     PF("scale", 1.0), PS("dtype", "f32") };
+        run_case(rt, ts, ps);
+    }
+    const std::vector<RadParam> pq = { PI("M", M), PI("head_dim", hd), PI("n_head", nq),
+                                       PI("n_head_kv", nkv), PI("rot", rot),
+                                       PS("q_dtype", "bf16"), PF("eps", 1e-6), PF("wadd", 1.0),
+                                       PI("cs_f32", 1) };
+    /* The prologue's own output is the reference for q and k, and the oracle's input for k. */
+    {
+        std::vector<RadTensor> ts = { T(d_qg, RAD_BF16, { M, nq * 2 * hd }),
+                                      T(d_k, RAD_BF16, { M, nkv * hd }),
+                                      T(d_cs, RAD_F32, { ctx, rot }), T(d_p, RAD_I32, { M }),
+                                      T(d_wq, RAD_F32, { hd }), T(d_wk, RAD_F32, { hd }),
+                                      T(d_qA, RAD_BF16, { M, nq * hd }),
+                                      T(d_kA, RAD_BF16, { M, nkv * hd }), RadTensor{} };
+        std::vector<RadParam> ps = pq;
+        run_case(rf, ts, ps);
+    }
+    std::vector<uint16_t> hkout((size_t)M * nkv * hd);
+    st_memcpy(hkout.data(), d_kA, kb, hipMemcpyDeviceToHost);
+
+    /* A map, a ring and a mirror: `res` and `slots` are the call's, the rest start from bytes the
+     * kernel must not mistake for its own. */
+    auto one = [&](const char* label, std::vector<int32_t> res) {
+        std::vector<uint8_t> hh(hb), hc(cb);
+        for (auto& x : hh) x = (uint8_t)(rnd(128.0f) + 128.0f);
+        for (auto& x : hc) x = (uint8_t)(rnd(128.0f) + 128.0f);
+        std::vector<uint8_t> ref_h = hh, ref_c = hc;
+        st_memcpy(d_hA, hh.data(), hb, hipMemcpyHostToDevice);
+        st_memcpy(d_cA, hc.data(), cb, hipMemcpyHostToDevice);
+        st_memcpy(d_hB, hh.data(), hb, hipMemcpyHostToDevice);
+        st_memcpy(d_cB, hc.data(), cb, hipMemcpyHostToDevice);
+        st_memcpy(d_res, res.data(), (size_t)blocks * 4, hipMemcpyHostToDevice);
+
+        /* The oracle on host memory: the same k_out, v, slots, ring, map and mirror. */
+        std::vector<RadTensor> th = {
+            T(hkout.data(), RAD_BF16, { M, nkv, hd }),
+            T(hv.data(), RAD_BF16, { M, nkv, hd }), T(slot.data(), RAD_I32, { M }),
+            T(ref_c.data(), kdt, { slots, nkv, bs, 2 * hd }),
+            T(res.data(), RAD_I32, { blocks }), T(ref_h.data(), RAD_U8, { blocks, rowb }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head_kv", nkv),
+                                     PI("block_size", bs), PS("kv_dtype", kvd) };
+        RadArgs ah{};
+        ah.t = th.data(); ah.n_t = (int)th.size(); ah.p = ps.data(); ah.n_p = (int)ps.size();
+        ah.world_size = 1;
+        const int rr = oracle->launch(&ah, nullptr);
+
+        std::vector<RadTensor> ts = { T(d_qg, RAD_BF16, { M, nq * 2 * hd }),
+                                      T(d_k, RAD_BF16, { M, nkv * hd }),
+                                      T(d_cs, RAD_F32, { ctx, rot }), T(d_p, RAD_I32, { M }),
+                                      T(d_wq, RAD_F32, { hd }), T(d_wk, RAD_F32, { hd }),
+                                      T(d_qB, RAD_BF16, { M, nq * hd }),
+                                      T(d_kB, RAD_BF16, { M, nkv * hd }), RadTensor{},
+                                      T(d_v, RAD_BF16, { M, nkv * hd }), T(d_sl, RAD_I32, { M }),
+                                      T(d_cB, kdt, { slots, nkv, bs, 2 * hd }),
+                                      T(d_res, RAD_I32, { blocks }),
+                                      T(d_hB, RAD_U8, { blocks, rowb }) };
+        std::vector<RadParam> pf = pq;
+        pf.push_back(PI("block_size", bs));
+        pf.push_back(PS("kv_dtype", kvd));
+        RadArgs af{};
+        af.t = ts.data(); af.n_t = (int)ts.size(); af.p = pf.data(); af.n_p = (int)pf.size();
+        af.world_size = 1;
+        const int rc = rk->launch(&af, nullptr);
+        st_stream_sync(nullptr);
+
+        std::vector<uint8_t> qa(qb), qbv(qb), ka(kb), kbv(kb), hkv(hb), ckv(cb);
+        st_memcpy(qa.data(), d_qA, qb, hipMemcpyDeviceToHost);
+        st_memcpy(qbv.data(), d_qB, qb, hipMemcpyDeviceToHost);
+        st_memcpy(ka.data(), d_kA, kb, hipMemcpyDeviceToHost);
+        st_memcpy(kbv.data(), d_kB, kb, hipMemcpyDeviceToHost);
+        st_memcpy(hkv.data(), d_hB, hb, hipMemcpyDeviceToHost);
+        st_memcpy(ckv.data(), d_cB, cb, hipMemcpyDeviceToHost);
+        auto ndiff = [](const uint8_t* a, const uint8_t* b, size_t n) {
+            int64_t k = 0;
+            for (size_t i = 0; i < n; ++i) k += a[i] != b[i];
+            return k;
+        };
+        const int64_t dq = ndiff(qa.data(), qbv.data(), qb);
+        const int64_t dk = ndiff(ka.data(), kbv.data(), kb);
+        /* The kernel's two planes against the oracle's, byte for byte. */
+        const int64_t dh = ndiff(hkv.data(), ref_h.data(), hb);
+        const int64_t dc = ndiff(ckv.data(), ref_c.data(), cb);
+        const bool touched = ndiff(ref_h.data(), hh.data(), hb) + ndiff(ref_c.data(), hc.data(), cb) > 0;
+        bool pass = rr == RAD_OK && rc == RAD_OK && dq == 0 && dk == 0 && dh == 0 && dc == 0;
+        std::string why = fmt("libref rc=%d kernel rc=%d; q %lld, k %lld, mirror %lld, ring %lld "
+                              "differ", rr, rc, (long long)dq, (long long)dk, (long long)dh,
+                              (long long)dc);
+        if (pass && !touched) { pass = false; why = "the store wrote neither plane"; }
+        ok(label, pass, why);
+    };
+    one("qk_norm_rope_gate_kv_store_streamed a partly resident map writes both planes",
+        { -1, 0, 2, -1 });       /* block 1 -> slot 0, block 2 -> slot 2, blocks 0 and 3 absent */
+    one("qk_norm_rope_gate_kv_store_streamed a cold ring takes the mirror alone",
+        { -1, -1, -1, -1 });
+    one("qk_norm_rope_gate_kv_store_streamed an identity map writes both planes alike",
+        { 0, 1, 2, -1 });
+    dlclose(ref);
 }
 
 /* qsa_select at prefill: many queries over one history, each bounded by its own position.
@@ -27497,6 +28182,34 @@ static void device_phase(const Plugin& pl) {
                              1, 4);
         qsa_select_split_one(pl, "qsa_select split, two sequences of four draft rows", 2, 4);
         qsa_select_few_live_case(pl);
+    }
+
+    if (sel("kv_resolve_i32")) {
+        if (!g_case) std::printf("\nthe streamed-KV residency map, against libref\n");
+        kv_resolve_case(pl);
+    }
+
+    if (sel("kv_store_streamed_fp8")) {
+        if (!g_case) std::printf("\nthe streamed-KV store, against libref\n");
+        kv_store_streamed_case(pl, "kv_store_streamed_fp8", "fp8_e4m3", RAD_F8E4M3, 1);
+    }
+    if (sel("kv_store_streamed_bf16")) {
+        if (!g_case) std::printf("\nthe streamed-KV store, bf16, against libref\n");
+        kv_store_streamed_case(pl, "kv_store_streamed_bf16", "bf16", RAD_BF16, 2);
+    }
+
+    if (sel("qk_norm_rope_gate_kv_store_streamed_fp8")) {
+        if (!g_case)
+            std::printf("\nthe folded streamed store, against the prologue and libref's store\n");
+        qk_kv_fold_streamed_case(pl, "qk_norm_rope_gate_kv_store_streamed_fp8", "fp8_e4m3",
+                                 RAD_F8E4M3, 1);
+    }
+    if (sel("qk_norm_rope_gate_kv_store_streamed_bf16")) {
+        if (!g_case)
+            std::printf("\nthe folded streamed store, bf16, against the prologue and libref's "
+                        "store\n");
+        qk_kv_fold_streamed_case(pl, "qk_norm_rope_gate_kv_store_streamed_bf16", "bf16",
+                                 RAD_BF16, 2);
     }
 
     if (sel("qsa_score_bf16")) {

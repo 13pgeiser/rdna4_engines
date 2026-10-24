@@ -7,6 +7,9 @@
 #include "rad_test.h"
 
 #include "mem/kv.h"
+#include "kvstream/bringup.h"
+#include "kvstream/bind.h"
+#include "kvstream/plan.h"
 #include "mem/pools.h"
 #include "mem/prefix.h"
 #include "mem/vram_budget.h"
@@ -115,6 +118,52 @@ struct Fixture {
         return pc.configure(cfg, &kv, cfg.checkpoint_interval);
     }
 };
+
+/* The streamed path an architecture plugin declares for `g`, as the builder records it: one
+ * kv_resolve stating the group's per-layer block pitch and the blocks one selection row can name,
+ * and one kv_store_streamed stating the group's page. `with_resolve`/`with_store` build the model
+ * that declares neither (or only one) -- which is what the tree's DSA-index models actually do,
+ * so --kv-resident must be ignored rather than started on them.
+ *
+ * `store_resolved` is the third state, and the one easiest to get wrong: the op is *declared* and the
+ * kernel table has no row for it. The builder records the op anyway and synthesises one band
+ * with both domains null and a miss reason (core/build/rad_builder.cpp, resolve_bands), so the op
+ * is present in prog.ops and only its handle is null -- which is exactly the packed-cache shape
+ * (`fp8_v4` / `k6_v4`, no streamed-store row). A resolved band is a bound row in a domain, which is
+ * what kvstream_ops reads (kvstream_ops; the same test as Builder::op_resolved). */
+static KernelRow& a_resolved_row() {
+    /* Static, as a plugin table's rows are: a Resolved points at one. Nothing in this test issues
+     * the op, so the row carries no kernel. */
+    static KernelRow row;
+    return row;
+}
+
+static Program stream_program(const KVGroupInfo& g, int64_t sel_pitch, bool with_resolve = true,
+                              bool with_store = true, bool store_resolved = true) {
+    Program p;
+    p.meta.arch_id = "test-arch";
+    const int64_t n_bound = g.layers.empty() ? 1 : (int64_t)g.layers.size();
+    const int64_t layer_bytes = g.bytes_per_block > 0 ? g.bytes_per_block / n_bound : 0;
+    if (with_resolve) {
+        OpInfo oi;
+        oi.op = "kv_resolve";
+        oi.bands.resize(1);          /* resolved: the builder records one band per domain */
+        oi.bands[0].dom[RAD_DOMAIN_DEVICE].row = &a_resolved_row();
+        oi.base.set_i("block_bytes", layer_bytes);
+        oi.base.set_i("sel_pitch", sel_pitch);
+        p.ops.push_back(std::move(oi));
+    }
+    if (with_store) {
+        OpInfo oi;
+        oi.op = "kv_store_streamed";
+        oi.bands.resize(1);
+        if (store_resolved) oi.bands[0].dom[RAD_DOMAIN_DEVICE].row = &a_resolved_row();
+        else oi.bands[0].miss[RAD_DOMAIN_DEVICE] = "kv_dtype in {fp8_e4m3}, have fp8_v4";
+        oi.base.set_i("block_size", g.block_size);
+        p.ops.push_back(std::move(oi));
+    }
+    return p;
+}
 
 static std::vector<int32_t> tok_run(int32_t base, int n) {
     std::vector<int32_t> v;
@@ -776,6 +825,56 @@ static KVGroupInfo paged_group(const char* name, int kind, int64_t heads, int64_
     return k;
 }
 
+/* Which group --kv-resident streams is a rule, not the widest paged FULL group: a group is a
+ * candidate only when the program states a streamed path for it, and an indexer-style dense-read
+ * group never is. GLM-5.3's two FULL groups make the difference visible: kv_latent (49 152 B) is
+ * the geometry the feature wants, kv_dsa_index (1 632 B) is read over the whole history every
+ * step and must stay resident. Width then decides only between groups that are wired. */
+TEST(kv_stream_group_picks_a_wired_full_group_not_merely_the_widest) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    const std::vector<int32_t> full_layers = { 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 45 };
+    KVGroupInfo latent = paged_group("kv_latent", RAD_KV_FULL, 1, 4, full_layers);
+    latent.decl.dtype = RAD_BF16;
+    latent.decl.head_dim = 256;
+    latent.bytes_per_block = 49152;              /* 12 layers x 4 tokens x 256 x bf16 */
+    KVGroupInfo index = paged_group("kv_dsa_index", RAD_KV_FULL, 1, 4, full_layers);
+    index.decl.dtype = RAD_U8;
+    index.decl.head_dim = 17;
+    index.bytes_per_block = 1632;                /* 12 layers x 4 tokens x 17 x u8 */
+    g.push_back(latent);
+    g.push_back(index);
+
+    auto check_pick = [&](const Program& p, int32_t want) {
+        Program prog = p;
+        prog.kv_groups = g;                      /* index-aligned, as Engine's program is */
+        CHECK_EQ(kv_stream_group(g, &prog), want);
+        /* The cap probe and the carve must agree, so the plans overload takes the same rule. */
+        Fixture f;
+        f.cfg.checkpoint_slots = 0;
+        f.cfg.max_ctx = 4096;
+        f.cfg.max_seqs = 2;
+        CHECK_OK(f.kv.plan_groups(g, f.cfg));
+        CHECK_EQ(kv_stream_group(f.kv, &prog), want);
+    };
+
+    /* Wired latent, narrower: it is picked. */
+    check_pick(stream_program(g[1], 513), 1);
+    /* The index group made wider is still not picked: it is not wired. This is the width
+     * coincidence the rule removes. */
+    g[2].bytes_per_block = 65536;
+    check_pick(stream_program(g[1], 513), 1);
+    g[2].bytes_per_block = 1632;
+    /* A resolve that states the index group's pitch (136 B a layer) is the only wired path, so
+     * the narrower group is the one that streams. */
+    check_pick(stream_program(g[2], 513), 2);
+    /* A dense-read group is never a candidate, even when its own path is declared. Nothing else
+     * is wired here, so nothing streams. */
+    g[2].dense_read = true;
+    check_pick(stream_program(g[2], 513), -1);
+    g[2].dense_read = false;
+}
+
 /* A windowed group is capped at its window on both ranks, and the cap shifts the freed bytes to
  * the other groups, a kink in paged_split the inverse must cross exactly. The dear rank's count is
  * past the window, so the window group holds max_seqs x window_blocks on both ranks. */
@@ -844,6 +943,655 @@ TEST(an_uneven_worlds_cheaper_rank_gives_its_saved_kv_to_its_weights_up_to_all_r
     s = vram_budget_rank_split(1000, 800, -1, 5000 * MiB);      /* no answer: untouched */
     CHECK(!s.resplit);
     CHECK_EQ(s.kv_mib, (int64_t)800);
+}
+
+TEST(a_streamed_group_is_refused_at_carve_without_its_host_copy) {
+    /* The failure this prevents: the manager hands out block ids over the context, the pool backs
+     * four of them, and a kv_store for block 40 writes forty blocks past the layer stride. So a
+     * streamed plan is refused unless something owns the blocks the pool does not. Each variant
+     * removes one of the three pieces the carve requires. */
+    for (int variant = 0; variant < 3; ++variant) {
+        Fixture f;
+        f.cfg.checkpoint_slots = 0;
+        f.cfg.max_ctx = 1024;                  /* the context the group will address, in host RAM */
+        CHECK_OK(configure_pools(f.pools, f.cfg));
+        f.kv.cap_resident_tokens(G_FULL, 64);
+        CHECK_OK(f.kv.plan_groups(hybrid_groups(), f.cfg));
+        /* How many blocks the group has is decided at carve; the host copy has to be there first,
+         * so size it from the context the carve will compute: every sequence at full length. */
+        const int64_t ctx_blocks = f.cfg.max_seqs * (f.cfg.max_ctx / 16);
+        const int64_t page = f.kv.plan(G_FULL)->bytes_per_block;
+        const int64_t need = ctx_blocks * page;
+        std::vector<char> host((size_t)need, 0);
+        std::vector<int32_t> res((size_t)ctx_blocks, -1);
+
+        KVManager::StreamMap m;
+        m.host       = variant == 0 ? nullptr : (uint8_t*)host.data();  /* 0: no copy at all */
+        m.host_bytes = variant == 1 ? need - 1 : need;         /* 1: a copy too small */
+        m.res        = variant == 2 ? nullptr : res.data();    /* 2: no map */
+        f.kv.set_stream_map(G_FULL, m);
+        CHECK_EQ(f.kv.carve(f.pools.kv()), RAD_E_INVAL);
+    }
+}
+
+TEST(a_streamed_group_addresses_its_context_but_backs_only_the_resident_window) {
+    /* kv streaming (docs/KV-STREAMING.md): a paged group keeps allocating block ids over its whole
+     * context -- the block table, the refcounts, the prefix cache and every `id < n_blocks` guard
+     * count in those -- while the device pool backs only `--kv-resident` of them and a residency
+     * map says which. The two numbers differ only where addressing happens, so this pins the four
+     * places that multiply by one of them: the carve, the stride between layers, the operand shape
+     * a kernel is handed, and the loan. Getting one wrong is not a crash: it is a kernel writing
+     * one layer's block into the next, which produces fluent wrong text.
+     *
+     * The split is decided at carve, not at plan: how many blocks the group has is a function of
+     * the pool's budget, which only the carve knows. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;                                  /* the context the group addresses */
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);                  /* four blocks of 16 tokens */
+    CHECK_OK(f.kv.plan_groups(hybrid_groups(), f.cfg));
+
+    /* Both numbers come from the carve: the context from --max-model-len and --max-num-seqs, the
+     * window from --kv-resident. The host copy must already cover the context. */
+    const int64_t ctx_blocks = f.cfg.max_seqs * (f.cfg.max_ctx / 16);
+    const int64_t page = f.kv.plan(G_FULL)->bytes_per_block;
+    CHECK(ctx_blocks > 4);                                 /* the pool holds more than the window */
+    std::vector<char> host((size_t)(ctx_blocks * page), 0);
+    std::vector<int32_t> res((size_t)ctx_blocks, -1);
+    KVManager::StreamMap sm_in;
+    sm_in.host       = (uint8_t*)host.data();
+    sm_in.res        = res.data();
+    sm_in.host_bytes = (int64_t)host.size();
+    f.kv.set_stream_map(G_FULL, sm_in);
+    const KVManager::StreamMap* sm = f.kv.stream_map(G_FULL);
+    CHECK(sm != nullptr && sm->host == (uint8_t*)host.data() && sm->res == res.data() &&
+          sm->host_bytes >= ctx_blocks * page);
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+
+    const KVGroupPlan* p = f.kv.plan(G_FULL);
+    CHECK_EQ(p->n_blocks, ctx_blocks);
+    CHECK_EQ(p->n_slots, 4);
+    CHECK(p->streamed());
+    CHECK_EQ(p->pool_blocks(), 4);
+    CHECK_EQ(p->layer_stride(), 4 * p->layer_bytes_per_block());
+    /* The carve is one reservation of max(ring, stage): the ring's four blocks of every layer, or
+     * the whole context one layer deep. Here the context's one layer is the larger, so the pool is
+     * a stage and the ring fits inside it (docs/KV-STREAMING.md §4.1). */
+    CHECK_EQ(f.kv.pool_bytes_carved(G_FULL),
+             std::max(4 * page, ctx_blocks * p->layer_bytes_per_block()));
+    CHECK_EQ(rad::kv_ceiling_bytes(*p, ctx_blocks, 4), ctx_blocks * p->layer_bytes_per_block());
+    /* The startup report must not read as a pool that holds the whole context. */
+    CHECK(f.kv.report().find("streaming:") != std::string::npos);
+
+    /* Not lendable: the window is what a residency map reads, and a block lent to the expert slab
+     * is one the attention has nowhere to put. */
+    CHECK(!f.kv.lendable(G_FULL));
+    /* The linear group next to it is untouched. */
+    CHECK_EQ(f.kv.plan(G_GDN)->n_slots, 0);
+    CHECK(!f.kv.plan(G_GDN)->streamed());
+
+    /* Block ids still run over the context. A sequence longer than the window asks for more ids
+     * than the pool backs and gets them, because its table names logical blocks -- which is exactly
+     * why a streamed plan may not be carved without somewhere for them to live. */
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16 * 8));                      /* eight blocks, twice the window */
+    const std::vector<int32_t>& bt = f.kv.block_table(1, G_FULL);
+    CHECK(bt.size() >= 8);
+    int32_t hi = 0;
+    for (int32_t b : bt) hi = std::max(hi, b);
+    CHECK(hi >= 4);                                        /* an id past the window */
+
+    /* And a server that does not stream carves exactly what it did before the split: nothing
+     * moves for a group with no cap_resident_tokens(). */
+    Fixture plain;
+    plain.cfg.checkpoint_slots = 0;
+    CHECK_OK(plain.build());
+    const KVGroupPlan* q = plain.kv.plan(G_FULL);
+    CHECK(q->n_blocks > 0);
+    CHECK_EQ(q->n_slots, q->n_blocks);
+    CHECK(!q->streamed());
+    CHECK_EQ(plain.kv.pool_bytes_carved(G_FULL), q->n_blocks * q->bytes_per_block);
+}
+
+TEST(a_resident_window_that_does_not_fit_vram_kv_is_refused_by_its_own_flag) {
+    /* --kv-resident is what sizes the window, so a window wider than the pool has to be refused by
+     * the carve. Left to the split, it would leave the other groups zero blocks and the operator
+     * would be told to raise --host-pool-mib -- a term that is not the one that is too large. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 100000);              /* 6250 blocks against a 1 MiB pool */
+    CHECK_OK(f.kv.plan_groups(hybrid_groups(), f.cfg));
+    /* The host copy is the right size for the context; the window is what does not fit. */
+    const int64_t ctx_blocks = f.cfg.max_seqs * (f.cfg.max_ctx / 16);
+    std::vector<char> host((size_t)(ctx_blocks * f.kv.plan(G_FULL)->bytes_per_block), 0);
+    std::vector<int32_t> res((size_t)ctx_blocks, -1);
+    KVManager::StreamMap sm_in;
+    sm_in.host       = (uint8_t*)host.data();
+    sm_in.res        = res.data();
+    sm_in.host_bytes = (int64_t)host.size();
+    f.kv.set_stream_map(G_FULL, sm_in);
+    CHECK_EQ(f.kv.carve(f.pools.kv()), RAD_E_NOMEM);
+}
+
+TEST(a_streamed_window_group_is_refused_by_name) {
+    /* A window group already bounds its own history, so the ids it allocates are its window's,
+     * while a streamed group's ids are its whole context. Streaming one would give it a table of
+     * the other shape, so it is refused instead of carved with ids nothing can resolve. */
+    auto groups = hybrid_groups();
+    groups[G_FULL].decl.kind = RAD_KV_WINDOW;
+    groups[G_FULL].decl.window = 128;                      /* window_blocks = 128/16 + 1 */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    CHECK_EQ(f.kv.carve(f.pools.kv()), RAD_E_INVAL);
+}
+
+/* The residency maps are device memory (abi/rad_runtime.h, RadKVStream: a resolve launch reads and
+ * rewrites them every step, so a host round trip per lookup would pay the link latency the ring
+ * exists to avoid). On a card the KV pool is an elastic VRAM range mapped into the address space,
+ * and a host load of it faults -- which is the card-only segfault this helper exists to keep out of
+ * the suite. The engine drains the same arrays the same way (core/engine.cpp reads `ctl` with
+ * rad_memcpy_async), so a check of their contents copies them back on a stream first. The counts
+ * are the ABI's: `res` is `n_layers * blocks`, `slot_block` is `n_layers * slots`, and
+ * `slot_state` is `n_layers * slots * 2`. */
+struct StreamMapsHost {
+    std::vector<int32_t> res, slot_block, slot_state, ctl;
+};
+
+static int read_stream_maps(const KVManager::StreamMap& m, const KVGroupPlan& p, RadStream st,
+                            StreamMapsHost* out) {
+    const int64_t layers = p.n_layers > 0 ? p.n_layers : 1;
+    out->res.assign((size_t)(layers * p.n_blocks), 0);
+    out->slot_block.assign((size_t)(layers * m.slots), 0);
+    out->slot_state.assign((size_t)(layers * m.slots * 2), 0);
+    out->ctl.assign(16, 0);
+    auto copy = [&](std::vector<int32_t>& dst, const int32_t* src) {
+        return rad_memcpy_async(dst.data(), src,
+                                (int64_t)dst.size() * (int64_t)sizeof(int32_t), st);
+    };
+    int rc = copy(out->res, m.res);
+    if (rc == RAD_OK) rc = copy(out->slot_block, m.slot_block);
+    if (rc == RAD_OK) rc = copy(out->slot_state, m.slot_state);
+    if (rc == RAD_OK) rc = copy(out->ctl, m.ctl);
+    if (rc == RAD_OK) rc = rad_stream_sync(st);
+    return rc;
+}
+
+TEST(a_streamed_plan_allocates_reports_and_frees_its_mirror) {
+    /* The host mirror and the ring's maps, end to end: what stream_cost() promises is what
+     * alloc_stream() takes, the mirror is zeroed (a block nothing wrote yet must read as zeros, not
+     * as a page's leftovers), the maps come out of the KV pool and hold the reset state a resolve
+     * launch expects, the report shows both tiers, and free_stream() releases the mirror and is
+     * safe to call twice. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);                  /* four blocks of 16 tokens */
+    CHECK_OK(f.kv.plan_groups(hybrid_groups(), f.cfg));
+
+    const KVManager::StreamCost cost = f.kv.stream_cost();
+    CHECK_EQ(cost.groups, (int64_t)1);
+    CHECK_EQ(cost.host_bytes, f.cfg.max_seqs * (f.cfg.max_ctx / 16) *
+                              f.kv.plan(G_FULL)->bytes_per_block);
+    CHECK(cost.map_bytes > 0);
+
+    const int64_t pool_used = f.pools.kv().used();
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    /* Every map byte is a reservation in the KV pool, so the paged split sees it. */
+    CHECK_EQ(f.pools.kv().used() - pool_used, cost.map_bytes);
+
+    const KVManager::StreamMap* m = f.kv.stream_map(G_FULL);
+    REQUIRE(m != nullptr);
+    CHECK(m->host != nullptr && m->res != nullptr && m->ctl != nullptr);
+    CHECK_EQ(m->host_bytes, cost.host_bytes);
+    CHECK_EQ(m->block_bytes, f.kv.plan(G_FULL)->layer_bytes_per_block());
+    CHECK_EQ(m->host_layer_stride, (f.cfg.max_seqs * (f.cfg.max_ctx / 16)) * m->block_bytes);
+    /* Zeroed at allocation: a miss copies these bytes to the ring before attention reads them. */
+    int64_t nonzero = 0;
+    for (int64_t i = 0; i < m->host_bytes; ++i) nonzero += m->host[i] != 0;
+    CHECK_EQ(nonzero, (int64_t)0);
+
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_OK(f.kv.init_stream(st));
+    CHECK_OK(rad_stream_sync(st));
+
+    /* The reset the reference contract states: both maps -1, state and control zero, in every
+     * layer's slice (the maps are device memory; read_stream_maps copies them back). */
+    const KVGroupPlan* p = f.kv.plan(G_FULL);
+    StreamMapsHost got;
+    CHECK_OK(read_stream_maps(*m, *p, st, &got));
+    rad_stream_destroy(st);
+    int64_t wrong = 0;
+    for (int64_t b = 0; b < (int64_t)got.res.size(); ++b) wrong += got.res[(size_t)b] != -1;
+    for (int64_t s = 0; s < (int64_t)got.slot_block.size(); ++s)
+        wrong += got.slot_block[(size_t)s] != -1;
+    for (int64_t i = 0; i < (int64_t)got.slot_state.size(); ++i)
+        wrong += got.slot_state[(size_t)i] != 0;
+    CHECK_EQ(wrong, (int64_t)0);
+    for (int i = 0; i < 16; ++i) CHECK_EQ(got.ctl[(size_t)i], 0);
+    CHECK_EQ(m->slots, p->pool_blocks());
+    CHECK(f.kv.stream_view(G_FULL) == m);
+
+    const KVManager::StreamStats stats = f.kv.stream_stats();
+    CHECK_EQ(stats.resident_blocks, p->pool_blocks());
+
+    /* Both tiers in one line, and the ring placed in the pool it was carved from. */
+    CHECK(f.kv.report().find("streaming:") != std::string::npos);
+    CHECK(f.kv.report().find("vram_kv") != std::string::npos);
+    CHECK(f.kv.report().find("pinned host memory") != std::string::npos);
+
+    f.kv.free_stream(rad_malloc_allocator());
+    CHECK(f.kv.stream_view(G_FULL) == nullptr);
+    CHECK(f.kv.stream_map(G_FULL) == nullptr || f.kv.stream_map(G_FULL)->host == nullptr);
+    f.kv.free_stream(rad_malloc_allocator());              /* teardown after a partial bring-up */
+}
+
+TEST(a_streamed_plans_maps_are_device_memory_read_back_on_its_stream) {
+    /* The maps are device memory (abi/rad_runtime.h, RadKVStream), and this case's job is to keep
+     * that rule visible: they are carved from the KV pool, so on a card the pool's elastic range is
+     * VRAM mapped into the address space and a host load of `res`, `slot_block`, `slot_state` or
+     * `ctl` faults -- the card-only segfault this suite used to have. The mirror is the only one of
+     * the four the host may read with a load. Their reset contents are
+     * `a_streamed_groups_maps_are_charged_before_the_pool_is_sized`'s job. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);
+    CHECK_OK(f.kv.plan_groups(hybrid_groups(), f.cfg));
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+
+    const KVManager::StreamMap* m = f.kv.stream_map(G_FULL);
+    REQUIRE(m != nullptr);
+    /* Every map array is a reservation of this pool, and the pool is what the card backs: the
+     * mirror is the only thing here the host may read with a load. */
+    const char* lo = (const char*)f.pools.kv().base();
+    const char* hi = lo + f.pools.kv().bytes();
+    CHECK((const char*)m->res >= lo && (const char*)m->res < hi);
+    CHECK(m->host < (const uint8_t*)lo || m->host >= (const uint8_t*)hi);
+    if (!device_is_host()) CHECK(rad_dev_host_ptr(m->res) == nullptr);
+
+    f.kv.free_stream(rad_malloc_allocator());
+}
+
+TEST(a_plan_that_does_not_stream_allocates_and_reports_nothing) {
+    /* The inert case every existing server runs: no cap_resident_tokens(), so stream_cost() is
+     * zero, alloc_stream() takes nothing, the ABI view is null (every group fully resident) and
+     * the report has no streaming line. */
+    Fixture f;
+    CHECK_OK(f.build());
+    const KVManager::StreamCost cost = f.kv.stream_cost();
+    CHECK_EQ(cost.groups, (int64_t)0);
+    CHECK_EQ(cost.host_bytes, (int64_t)0);
+    CHECK_EQ(cost.map_bytes, (int64_t)0);
+
+    const int64_t pool_used = f.pools.kv().used();
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_EQ(f.pools.kv().used(), pool_used);
+    CHECK(f.kv.stream_view(G_FULL) == nullptr);
+    CHECK(f.kv.stream_map(G_FULL) == nullptr);
+
+    const KVManager::StreamStats stats = f.kv.stream_stats();
+    CHECK_EQ(stats.resident_blocks, (int64_t)0);
+
+    CHECK(f.kv.report().find("streaming:") == std::string::npos);
+    f.kv.free_stream(rad_malloc_allocator());
+    CHECK_EQ(f.pools.kv().used(), pool_used);
+}
+
+TEST(a_ring_that_covers_the_context_streams_nothing_and_the_engine_pays_nothing) {
+    /* --kv-resident is the whole switch (docs/KV-STREAMING.md §5 Phase 4): absent or 0 and nothing
+     * streams, and a ring that covers the group's context streams nothing either -- the ring is
+     * sized from --max-num-seqs and --max-model-len at startup, so such a group keeps the base
+     * engine's path exactly. Not "cheap": no mirror, no residency maps, no stage view and a null
+     * RadKVStream, so the batch hands the arch no stream and no kv_resolve can be issued (the
+     * issue sites test `kvb->stream`, arch/common/rad_block_attn_gated_fp8.h). */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    f.cfg.max_seqs = 2;                                    /* context: 2 sequences x 1024 tokens */
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups[G_FULL].bytes_per_block = 2048;                 /* 16 tokens x 128 B, as declare sets it */
+    const int64_t ctx_blocks = 2 * (1024 / 16);            /* 128 blocks of 16 tokens */
+    /* A ring that covers the context. The group is bf16 here on purpose: a configuration that fits
+     * is never refused for a cache the streamed store has no row for, because nothing streams. */
+    f.cfg.kv_resident = 1024 * 2;
+    KVStreamSetup s;
+    CHECK_OK(kvstream_configure(f.cfg, 1024, groups, stream_program(groups[G_FULL], 513), &s));
+    CHECK_EQ(s.group, -1);
+    CHECK_EQ(s.asked_tokens, (int64_t)2048);
+    CHECK_EQ(s.ctx_blocks, ctx_blocks);
+    CHECK_EQ(s.ring_blocks, ctx_blocks);
+    CHECK_EQ(s.stage_blocks, (int64_t)0);                  /* no stage view is declared */
+    CHECK_EQ(s.group_name, std::string("full"));
+
+    /* And the engine applies that decision: configure_kv caps only a group that streams, so the
+     * manager is never told about a window, alloc_stream() takes nothing and the carve is the
+     * ordinary one-view pool. */
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    const KVManager::StreamCost cost = f.kv.stream_cost();
+    CHECK_EQ(cost.groups, (int64_t)0);
+    CHECK_EQ(cost.host_bytes, (int64_t)0);
+    CHECK_EQ(cost.map_bytes, (int64_t)0);
+    const int64_t pool_used = f.pools.kv().used();
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_EQ(f.pools.kv().used(), pool_used);              /* no mirror and no maps were taken */
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+    const KVGroupPlan* p = f.kv.plan(G_FULL);
+    CHECK_EQ(p->n_slots, p->n_blocks);                     /* every block has its own slot */
+    CHECK(!p->streamed());
+    CHECK_EQ(p->depth, (int64_t)0);                        /* the arch sees no stage view */
+    CHECK_EQ(f.kv.pool_bytes_carved(G_FULL), p->n_blocks * p->bytes_per_block);
+    CHECK(f.kv.stream_view(G_FULL) == nullptr);            /* so no kv_resolve can be issued */
+    CHECK(f.kv.stream_map(G_FULL) == nullptr);
+    CHECK(f.kv.report().find("streaming:") == std::string::npos);
+    f.kv.free_stream(rad_malloc_allocator());
+
+    /* Absent (the parser's default) and 0 are the same: nothing is asked for, nothing is decided,
+     * nothing is capped. */
+    {
+        Fixture g;
+        g.cfg.checkpoint_slots = 0;
+        g.cfg.max_ctx = 1024;
+        g.cfg.max_seqs = 2;
+        g.cfg.kv_resident = 0;
+        KVStreamSetup o;
+        CHECK_OK(kvstream_configure(g.cfg, 1024, groups, stream_program(groups[G_FULL], 513), &o));
+        CHECK_EQ(o.group, -1);
+        CHECK_EQ(o.asked_tokens, (int64_t)0);
+        CHECK_EQ(o.ring_blocks, (int64_t)0);
+        CHECK_EQ(o.stage_blocks, (int64_t)0);
+        CHECK_OK(g.build_groups(groups));
+        CHECK_EQ(g.kv.stream_cost().groups, (int64_t)0);
+        CHECK(g.kv.stream_view(G_FULL) == nullptr);
+        CHECK(!g.kv.plan(G_FULL)->streamed());
+        CHECK_EQ(g.kv.plan(G_FULL)->depth, (int64_t)0);
+    }
+}
+
+TEST(a_decode_pass_wider_than_a_verify_stages_instead_of_resolving_the_ring) {
+    /* The serial drafter's history pass is RAD_PHASE_DECODE, but after a prefill chunk it carries
+     * the chunk's tokens of every sequence: more rows a sequence than a decode step can select for
+     * (1 + n_spec). Its selection is the union of the histories it spans, not one row a selection,
+     * so it reads the one-layer stage -- identity-addressed over the whole context -- and cannot
+     * overflow the ring. A verify or a history pass over the verified window stays on the ring:
+     * routing those to the stage would stage every decode step. */
+    using rad::KVView;
+    CHECK(kv_pass_view(RAD_PHASE_PREFILL, 2048, 4, 3) == KVView::Stage);
+    CHECK(kv_pass_view(RAD_PHASE_MIXED, 900, 3, 3) == KVView::Stage);
+    /* The ring's passes: a verify step (4 rows a sequence with n_spec 3), one row a sequence, and
+     * the history pass that redoes the verified positions. */
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 16, 4, 3) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 4, 4, 3) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 12, 3, 3) == KVView::Ring);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 4, 4, 0) == KVView::Ring);
+    /* The history pass over a prefill chunk, and every prefill-shaped decode pass. */
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 2048, 4, 3) == KVView::Stage);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 2039, 3, 3) == KVView::Stage);
+    CHECK(kv_pass_view(RAD_PHASE_DECODE, 2048, 4, 0) == KVView::Stage);
+}
+
+TEST(a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling) {
+    /* Anything under the computed amount is ignored and pulled up to it. A within-(1 + n_spec)
+     * decode step takes the ring, not the stage (`kv_pass_view`), and issues one selection a row:
+     * max_seqs x (1 + n_spec) rows of at most `sel_pitch` blocks. A ring under that union is not a
+     * slower configuration but a request served from a selection table that no longer addresses
+     * the pool -- and the engine computes the union itself, so the flag takes it: one warning
+     * naming what was asked, what it became and why, and startup proceeds. The effective ring is
+     * the ceiling, which is what the carve must take. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    f.cfg.max_seqs = 2;
+    f.cfg.n_spec = 0;
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups[G_FULL].decl.dtype = RAD_F8E4M3;               /* the streamed store's one row */
+    groups[G_FULL].bytes_per_block = 2048;                 /* as declare sets it */
+    const int64_t sel_pitch = 8;                           /* a synthetic indexer's topk + 1 */
+    const int64_t ctx_blocks = 2 * (1024 / 16);            /* 128 blocks of 16 tokens */
+    const Program prog = stream_program(groups[G_FULL], sel_pitch);
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    /* The ceiling is 2 sequences x 1 row x sel_pitch = 16 blocks = 256 tokens. */
+    f.cfg.kv_resident = 128;                               /* 8 blocks: half of it */
+    KVStreamSetup s;
+    const std::string log = stderr_of([&] {
+        /* The budget probe prices the ring the carve will take, both of them raised. */
+        CHECK_OK(kvstream_cap_probe(f.kv, f.cfg, prog, 1024));
+        CHECK_OK(kvstream_configure(f.cfg, 1024, groups, prog, &s));
+    });
+    CHECK(has(log, "--kv-resident 128 raised to 256 tokens"));
+    CHECK(has(log, "a decode step can name 16 blocks of 16 blocks each"));
+    CHECK(has(log, "(--max-num-seqs 2 x 1 for speculation x 8)"));
+    /* Raised, not refused: the flag is as the operator left it and the plan is the ceiling. */
+    CHECK_EQ(f.cfg.kv_resident, (int64_t)128);
+    CHECK_EQ(s.group, (int32_t)G_FULL);
+    CHECK_EQ(s.asked_tokens, (int64_t)128);
+    CHECK_EQ(s.raised_tokens, (int64_t)256);
+    CHECK_EQ(s.ring_blocks, (int64_t)16);
+    CHECK_EQ(s.ring_tokens, (int64_t)256);
+    CHECK_EQ(s.ctx_blocks, ctx_blocks);
+    CHECK_EQ(s.stage_blocks, ctx_blocks);                  /* one layer, the whole context */
+
+    /* The carve takes the ceiling, not the flag's 8 blocks: cap_resident_tokens is handed the
+     * raised ring, and the residency map, the pool and the resolve's slot ceiling are that depth. */
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+    const KVGroupPlan* p = f.kv.plan(G_FULL);
+    CHECK(p->streamed());
+    CHECK_EQ(p->n_blocks, ctx_blocks);
+    CHECK_EQ(p->n_slots, (int64_t)16);                     /* the ceiling */
+    CHECK_EQ(p->n_slots, s.ring_blocks);
+    CHECK_EQ(f.kv.stream_map(G_FULL)->slots, (int64_t)16);
+    CHECK_EQ(f.kv.stream_stats().resident_blocks, (int64_t)16);
+
+    /* And the startup report says so in the ring's own line, not only in the warning: the ring is
+     * no longer what the operator typed, and the report is what people read afterwards. */
+    KVStreamHostUse use;
+    kvstream_host_add(&use, f.kv);
+    const std::string rep = stderr_of([&] { kvstream_report(s, use, 1); });
+    CHECK(has(rep, "--kv-resident 128 became 256 tokens"));
+    CHECK(has(rep, "(8 -> 16 blocks of 16 tokens each)"));
+    CHECK(has(rep, "ring 16 blocks"));                     /* the staging line quotes the ring */
+    f.kv.free_stream(rad_malloc_allocator());
+
+    /* Under speculation a verify step runs the drafts beside the accepted position, so the rows --
+     * and the ceiling -- scale by 1 + n_spec: 2 x 4 x 8 = 64 blocks = 1024 tokens. */
+    {
+        Fixture g;
+        g.cfg.checkpoint_slots = 0;
+        g.cfg.max_ctx = 1024;
+        g.cfg.max_seqs = 2;
+        g.cfg.n_spec = 3;
+        g.cfg.kv_resident = 512;                           /* 32 blocks: enough without speculation */
+        KVStreamSetup o;
+        const std::string l = stderr_of([&] {
+            CHECK_OK(kvstream_configure(g.cfg, 1024, groups, prog, &o));
+        });
+        CHECK(has(l, "--kv-resident 512 raised to 1024 tokens"));
+        CHECK(has(l, "(--max-num-seqs 2 x 4 for speculation x 8)"));
+        CHECK_EQ(o.group, (int32_t)G_FULL);
+        CHECK_EQ(o.ring_blocks, (int64_t)64);
+        CHECK_EQ(o.raised_tokens, (int64_t)1024);
+    }
+    /* At the ceiling nothing is raised and the ring is the flag's own number. */
+    {
+        Fixture g;
+        g.cfg.checkpoint_slots = 0;
+        g.cfg.max_ctx = 1024;
+        g.cfg.max_seqs = 2;
+        g.cfg.n_spec = 3;
+        g.cfg.kv_resident = 1024;                          /* exactly 2 x 4 x 8 blocks of 16 */
+        KVStreamSetup o;
+        const std::string l = stderr_of([&] {
+            CHECK_OK(kvstream_configure(g.cfg, 1024, groups, prog, &o));
+        });
+        CHECK(!has(l, "raised"));
+        CHECK_EQ(o.raised_tokens, (int64_t)0);
+        CHECK_EQ(o.ring_blocks, (int64_t)64);
+        CHECK_EQ(o.ring_tokens, (int64_t)1024);
+    }
+}
+
+TEST(a_model_whose_architecture_declares_no_streamed_ops_ignores_the_flag) {
+    /* Fail safe (docs/KV-STREAMING.md §5 Phase 4): --kv-resident is only usable where the
+     * architecture plugin actually declared the streamed path. A streamed group's attention reads
+     * `sel`, which kv_resolve rewrites from block ids into ring slots; a plugin that never issues
+     * the resolve leaves block ids in `sel` while the attention treats them as pool pages -- past
+     * the ring, which is a fault or silent corruption rather than a slow path -- and without the
+     * streamed store nothing writes the host mirror, so a miss would read zeros. So the flag is
+     * ignored with one line, and the server runs exactly as if it had not been given. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    f.cfg.max_seqs = 2;
+    f.cfg.kv_resident = 256;                             /* 16 blocks against a 128-block context */
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups[G_FULL].bytes_per_block = 2048;               /* 16 tokens x 2 kv heads x 8 x 2 B x 2 layers */
+    const Program none =
+        stream_program(groups[G_FULL], 8, /*with_resolve=*/false, /*with_store=*/false);
+    KVStreamSetup s;
+    int st = RAD_OK;
+    const std::string log = stderr_of([&] { st = kvstream_configure(f.cfg, 1024, groups, none, &s); });
+    CHECK_OK(st);                                        /* ignored, not refused */
+    CHECK_EQ(s.group, -1);
+    CHECK_EQ(s.asked_tokens, (int64_t)0);                /* nothing is claimed, so nothing is reported */
+    CHECK_EQ(s.ring_blocks, (int64_t)0);
+    CHECK_EQ(s.stage_blocks, (int64_t)0);
+    CHECK(has(log, "ignored"));
+    CHECK(has(log, "test-arch"));                        /* the architecture, not just the group */
+    CHECK(has(log, "kv_resolve"));                       /* the op that is missing, by name */
+    CHECK(!has(log, "raised to"));   /* that is the other message: this model cannot stream at all */
+
+    /* Half a path is no path: the resolve with no streamed store would leave the mirror unwritten
+     * and the miss list meaningless, so the warning names that op instead. */
+    KVStreamSetup half;
+    const std::string log2 = stderr_of([&] {
+        CHECK_OK(kvstream_configure(f.cfg, 1024, groups,
+                                    stream_program(groups[G_FULL], 8, true, false), &half));
+    });
+    CHECK_EQ(half.group, -1);
+    CHECK(has(log2, "kv_store_streamed"));
+
+    /* And the fail-safe never turns a working architecture off: the same configuration with both
+     * ops declared streams the ring it was sized for. */
+    KVStreamSetup ok;
+    CHECK_OK(kvstream_configure(f.cfg, 1024, groups, stream_program(groups[G_FULL], 8), &ok));
+    CHECK_EQ(ok.group, (int32_t)G_FULL);
+    CHECK_EQ(ok.ring_blocks, (int64_t)16);
+    CHECK_EQ(ok.stage_blocks, ok.ctx_blocks);
+}
+
+TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
+    /* The other half of the fail-safe: "declared but unresolved" is not
+     * "absent". The builder always leaves at least one band -- resolve_bands synthesises a miss band
+     * with both domains null -- and records the op whether or not a row matched, so a declaration
+     * with no kernel is present in prog.ops and only its handle is null. Counting it as a streamed
+     * path would stream a group whose store never runs: the host mirror stays empty and a miss
+     * copies zeros out of it. Modelled the way the builder produces it: one band, no domain bound. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    f.cfg.max_seqs = 2;
+    f.cfg.kv_resident = 256;                             /* 16 blocks against a 128-block context */
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups[G_FULL].decl.dtype = RAD_F8E4M3;
+    groups[G_FULL].bytes_per_block = 2048;
+    /* The resolve resolves; the store is declared with no row (both domains null). */
+    const Program unresolved = stream_program(groups[G_FULL], 8, true, true, /*store_resolved=*/false);
+    REQUIRE_EQ(unresolved.ops.size(), (size_t)2);
+    REQUIRE_EQ(unresolved.ops[1].bands.size(), (size_t)1);
+    CHECK(unresolved.ops[1].bands[0].dom[RAD_DOMAIN_DEVICE].row == nullptr);
+
+    const KVStreamOps ops = kvstream_ops(unresolved, &groups[G_FULL]);
+    CHECK(ops.resolve);
+    CHECK(!ops.store);
+    CHECK(!ops.folded);
+    CHECK(!ops.streams());                               /* no writer, so no streamed path */
+
+    KVStreamSetup s;
+    int st = RAD_OK;
+    const std::string log =
+        stderr_of([&] { st = kvstream_configure(f.cfg, 1024, groups, unresolved, &s); });
+    CHECK_OK(st);                                        /* ignored, not carved */
+    CHECK_EQ(s.group, -1);
+    CHECK_EQ(s.asked_tokens, (int64_t)0);
+    CHECK_EQ(s.ring_blocks, (int64_t)0);
+    CHECK_EQ(s.stage_blocks, (int64_t)0);
+    CHECK(has(log, "ignored"));
+    CHECK(has(log, "kv_store_streamed"));                /* the op that is missing, by name */
+
+}
+
+TEST(a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed) {
+    /* --kv-cache-dtype fp8_v4 / k6_v4: the architecture declares the resolve and no streamed store,
+     * because libr4d's streamed rows are E4M3 and bf16 and a packed cache has base-store rows only
+     * (arch/common/rad_block_attn_gated_fp8.h). The group is declared to the core as plain E4M3, so
+     * no dtype gate downstream can see the layout: the operator has to be told the *layout* has no
+     * writer, not that the architecture cannot stream -- and the group must run the base path.
+     * Before this the op was declared against a table with no row for it, which is a weightless
+     * device hole: startup refused with or without --kv-resident, naming a kernel band and never the
+     * flag. */
+    for (const char* dtype : { "fp8_v4", "k6_v4" }) {
+        Fixture f;
+        f.cfg.checkpoint_slots = 0;
+        f.cfg.max_ctx = 1024;
+        f.cfg.max_seqs = 2;
+        f.cfg.kv_resident = 256;                         /* 16 blocks against a 128-block context */
+        f.cfg.kv_cache_dtype = dtype;
+        std::vector<KVGroupInfo> groups = hybrid_groups();
+        groups[G_FULL].decl.dtype = RAD_F8E4M3;          /* what declare gives the core, packed or not */
+        groups[G_FULL].bytes_per_block = 2048;
+        /* What the gated plugin emits for a packed cache: the layout-blind resolve, no store. */
+        const Program packed = stream_program(groups[G_FULL], 8, true, /*with_store=*/false);
+        KVStreamSetup s;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] {
+            st = kvstream_configure(f.cfg, 1024, groups, packed, &s);
+        });
+        CHECK_OK(st);                                    /* started, not refused */
+        CHECK_EQ(s.group, -1);
+        CHECK_EQ(s.asked_tokens, (int64_t)0);
+        CHECK_EQ(s.stage_blocks, (int64_t)0);
+        CHECK(has(log, "ignored"));
+        CHECK(has(log, std::string("group 'full' has a ") + dtype + " cache"));
+        CHECK(has(log, "has no writer for that layout (E4M3 and bf16 only)"));
+        CHECK(!has(log, "declares no"));                 /* not that sentence: the arch declared it */
+        CHECK(!has(log, "raised to"));                   /* and not the ring's */
+
+    }
+}
+
+TEST(a_resolve_declared_for_another_group_does_not_enable_streaming) {
+    /* The check is per group, not per program: the resolve states the layer-bytes pitch of the
+     * group it was emitted for, so one declared for a narrower full group cannot make streaming
+     * of the widest group look wired. That is the difference between "some group resolves" and
+     * "the group the plan streams resolves", and only the second is safe. */
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_ctx = 1024;
+    f.cfg.max_seqs = 2;
+    f.cfg.kv_resident = 256;
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups[G_FULL].bytes_per_block = 2048;               /* 1024 B a layer */
+    Program other = stream_program(groups[G_FULL], 8);
+    other.ops[0].base.set_i("block_bytes", 4096);         /* a wider group's pitch, not this one's */
+    KVStreamSetup s;
+    int st = RAD_OK;
+    const std::string log = stderr_of([&] { st = kvstream_configure(f.cfg, 1024, groups, other, &s); });
+    CHECK_OK(st);
+    CHECK_EQ(s.group, -1);
+    CHECK(has(log, "kv_resolve"));
 }
 
 TEST(kv_refuses_a_group_with_no_block_size) {
@@ -6669,4 +7417,96 @@ TEST(a_tier_transfer_gives_back_every_event_and_device_byte) {
     CHECK_EQ(vram1, vram0);
 }
 
+/* The streamed group's residency maps are reserved from the KV pool before the carve, so the
+ * budget probe must charge them before it sizes the pool. Left out, the pool it names is short by
+ * their bytes and the group that stays resident is carved below one full-length conversation --
+ * the target shape's `kv_qsa_bkey` at 47 185 of the 51 200 blocks it needed (188 740 tokens
+ * against --max-model-len 204800). The probe has no pool and cannot reserve them; the carve has
+ * already taken them. paged_split() charges them and carve_into() adds back what was reserved, so
+ * both paths see the same bytes (kvstream/carve.h). */
+TEST(a_streamed_groups_maps_are_charged_before_the_pool_is_sized) {
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_seqs = 4;
+    f.cfg.max_ctx = 65536;                         /* the maps are more than the MiB rounding */
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups.push_back(paged_group("bkey", RAD_KV_FULL, 2, 4, { 6, 7 }));
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);          /* four blocks of 16 tokens */
+    const int64_t need = f.kv.pool_mib_for_tokens(f.cfg.max_ctx, 256);
+    REQUIRE(need > 0);
+    f.cfg.vram_kv_mib = need;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+    /* The group that stays resident holds one whole conversation, not the pool's remainder. */
+    const KVGroupPlan* bkey = f.kv.plan(3);
+    REQUIRE(bkey != nullptr);
+    CHECK(!bkey->streamed());
+    CHECK(bkey->n_blocks * bkey->block_size >= f.cfg.max_ctx);
+}
+
+/* A dense-read group is read over its whole live history every decode step, so it cannot stream.
+ * While a sibling does, its carve is a floor of max_seqs full contexts: the host mirror next to it
+ * is sized for max_seqs sequences, and an indexer funded for one makes the advertised capacity a
+ * promise the engine cannot keep. The probe sizes the pool for the floor before the carve spends
+ * it (kvstream/carve.h). */
+TEST(a_dense_read_groups_floor_holds_every_sequence_while_a_sibling_streams) {
+    Fixture f;
+    f.cfg.checkpoint_slots = 0;
+    f.cfg.max_seqs = 4;
+    f.cfg.max_ctx = 65536;
+    std::vector<KVGroupInfo> groups = hybrid_groups();
+    groups.push_back(paged_group("bkey", RAD_KV_FULL, 2, 4, { 6, 7 }));
+    groups.back().dense_read = true;
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    f.kv.cap_resident_tokens(G_FULL, 64);          /* four blocks of 16 tokens */
+    const int64_t need = f.kv.pool_mib_for_tokens(f.cfg.max_ctx, 512);
+    REQUIRE(need > 0);
+    f.cfg.vram_kv_mib = need;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.alloc_stream(rad_malloc_allocator(), f.pools.kv()));
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+    const KVGroupPlan* bkey = f.kv.plan(3);
+    REQUIRE(bkey != nullptr);
+    CHECK(!bkey->streamed());
+    CHECK_EQ(bkey->n_blocks, f.cfg.max_seqs * ((f.cfg.max_ctx + 3) / 4));
+    CHECK_EQ(bkey->n_slots, bkey->n_blocks);
+}
+
 RAD_TEST_MAIN()
+
+/* A streamed-only op exists only when the architecture's capability table says it can stream AND
+ * the deployment asked for a ring (core/kvstream/bringup.cpp, consulted from rad_op_declared). One
+ * binary serves both runs, so this is the only place the two questions meet; no model file carries
+ * the flag, and an architecture that cannot stream keeps the graph it had before streaming existed. */
+TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
+    RadBuildCtx ctx{};
+    ctx.kv_stream_ok = 1;
+    ctx.kv_resident_blocks = 32768;
+    /* capable and asked: the ops declare as they always did */
+    CHECK(!kvstream_op_gated(ctx, "kv_store_streamed"));
+    CHECK(!kvstream_op_gated(ctx, "qk_norm_rope_gate_kv_store_streamed"));
+    CHECK(!kvstream_op_gated(ctx, "kv_resolve"));
+    /* nothing that works without a ring is ever gated */
+    CHECK(!kvstream_op_gated(ctx, "kv_store"));
+    CHECK(!kvstream_op_gated(ctx, "qk_norm_rope_gate_kv_store"));
+    CHECK(!kvstream_op_gated(ctx, "attn_paged"));
+    CHECK(!kvstream_op_gated(ctx, "qsa_select"));
+    CHECK(!kvstream_op_gated(ctx, nullptr));
+
+    /* no flag: the ops that exist only for a ring are gone */
+    ctx.kv_resident_blocks = 0;
+    CHECK(kvstream_op_gated(ctx, "kv_store_streamed"));
+    CHECK(kvstream_op_gated(ctx, "kv_resolve"));
+    CHECK(!kvstream_op_gated(ctx, "kv_store"));
+
+    /* an architecture with no streamed path declares none even when the flag asks */
+    ctx.kv_resident_blocks = 32768;
+    ctx.kv_stream_ok = 0;
+    CHECK(kvstream_op_gated(ctx, "kv_store_streamed"));
+    CHECK(kvstream_op_gated(ctx, "qk_norm_rope_gate_kv_store_streamed"));
+    CHECK(kvstream_op_gated(ctx, "kv_resolve"));
+    CHECK(!kvstream_op_gated(ctx, "kv_store"));
+    CHECK(!kvstream_op_gated(ctx, "attn_paged"));
+}
