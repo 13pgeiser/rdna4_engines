@@ -274,9 +274,7 @@ fn mq4g128v2_ninepath_matches_four_kernel_sequence_hw() {
 
         let want = download_f32(&gpu, &out_ref, DOWN_M);
         let got_all = download_f32(&gpu, &out_new, DOWN_M + 64);
-        let canary_ok = got_all[DOWN_M..]
-            .iter()
-            .all(|v| v.to_bits() == 0x7FC0_DEAD);
+        let canary_ok = got_all[DOWN_M..].iter().all(|v| v.to_bits() == 0x7FC0_DEAD);
         let cmp = compare(&got_all[..DOWN_M], &want);
         // Non-vacuity: the fold must have moved the residual.
         let moved = want
@@ -289,7 +287,10 @@ fn mq4g128v2_ninepath_matches_four_kernel_sequence_hw() {
             cmp.mismatches, cmp.max_abs, cmp.first
         );
         assert!(canary_ok, "trial {trial}: ninepath wrote past out[down_m]");
-        assert!(moved > DOWN_M / 2, "trial {trial}: oracle did not move the residual");
+        assert!(
+            moved > DOWN_M / 2,
+            "trial {trial}: oracle did not move the residual"
+        );
         total_mismatch += cmp.mismatches;
     }
     assert_eq!(
@@ -350,10 +351,14 @@ fn mq4g256v2_k512_two_row_matches_one_row_hw() {
         let mut cand = y0.clone();
         cand.extend(std::iter::repeat(f32::from_bits(0x7FC0_DEAD)).take(64));
         let y_new = upload_f32(&mut gpu, &cand);
-        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_one_row(&a_t, &x_t, &y_ref, &c_t, SH_M, SH_K)
-            .expect("one-row");
-        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_two_row(&a_t, &x_t, &y_new, &c_t, SH_M, SH_K)
-            .expect("two-row");
+        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_one_row(
+            &a_t, &x_t, &y_ref, &c_t, SH_M, SH_K,
+        )
+        .expect("one-row");
+        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_two_row(
+            &a_t, &x_t, &y_new, &c_t, SH_M, SH_K,
+        )
+        .expect("two-row");
         gpu.hip.device_synchronize().expect("sync");
         let want = download_f32(&gpu, &y_ref, SH_M);
         let got_all = download_f32(&gpu, &y_new, SH_M + 64);
@@ -444,19 +449,39 @@ fn mq4rs_decode_kernels_profile_driver_hw() {
         gpu.silu_mul_f32(&gate_t, &up_t, &rot_t).unwrap();
         gpu.rotate_x_mq_128_v2(&rot_t, &rot_t, MI, K_TOP).unwrap();
         gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-            &expert_ptrs, &tk, &rot_t, &expanded_t, DOWN_M, DOWN_K, 1, POOL, K_TOP,
+            &expert_ptrs,
+            &tk,
+            &rot_t,
+            &expanded_t,
+            DOWN_M,
+            DOWN_K,
+            1,
+            POOL,
+            K_TOP,
         )
         .unwrap();
         gpu.moe_down_combine_k8_batched(&expanded_t, &w_t, &out_ref, DOWN_M, K_TOP, 1)
             .unwrap();
         gpu.gemv_mq4g128v2_moe_ninepath_d4(
-            &expert_ptrs, &tk, &w_t, &gate_t, &up_t, &out_new, DOWN_M, DOWN_K, POOL,
+            &expert_ptrs,
+            &tk,
+            &w_t,
+            &gate_t,
+            &up_t,
+            &out_new,
+            DOWN_M,
+            DOWN_K,
+            POOL,
         )
         .unwrap();
-        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_one_row(&sh_a, &sh_x, &sh_y1, &sh_c, SH_M, SH_K)
-            .unwrap();
-        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_two_row(&sh_a, &sh_x, &sh_y2, &sh_c, SH_M, SH_K)
-            .unwrap();
+        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_one_row(
+            &sh_a, &sh_x, &sh_y1, &sh_c, SH_M, SH_K,
+        )
+        .unwrap();
+        gpu.gemv_mq4g256v2_residual_sigmoid_scaled_k512_two_row(
+            &sh_a, &sh_x, &sh_y2, &sh_c, SH_M, SH_K,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 }

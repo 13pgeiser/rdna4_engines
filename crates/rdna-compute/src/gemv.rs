@@ -18885,7 +18885,9 @@ impl Gpu {
         const FUNC: &str = "gemv_mq4g128v2_moe_ninepath_d4";
         const RPB: usize = 16;
         self.bind_thread()?;
-        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+        if !(self.arch_caps.is_gfx1100()
+            || self.arch_caps.is_gfx1151()
+            || self.arch_caps.is_gfx1201())
         {
             return Err(hip_bridge::HipError::new(
                 0,

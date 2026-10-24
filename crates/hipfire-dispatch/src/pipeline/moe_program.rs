@@ -3378,11 +3378,8 @@ pub(super) fn select_decode(
         && params.dtypes.routed_gate_up == rdna_compute::DType::MQ4G256V2
         && params.dtypes.routed_down == rdna_compute::DType::MQ4G128V2
         && params.dtypes.qt53_routed_down_fallback();
-    let ninepath_eligible = ninepath_hfq4
-        || ninepath_mq3l
-        || ninepath_mq4v2
-        || ninepath_mq4g128v2
-        || ninepath_mq6v2;
+    let ninepath_eligible =
+        ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2 || ninepath_mq4g128v2 || ninepath_mq6v2;
     resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
