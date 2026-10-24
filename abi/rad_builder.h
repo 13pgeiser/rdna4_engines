@@ -597,7 +597,10 @@ typedef struct RadNameMap {
 
     /* RAD_MAP_ROWS only: piece i is rows [src_index[i], src_index[i] + src_rows[i]) of the 2-D (or
      * higher, rows along dim 0) tensor src[i]; the pieces join along dim 0. RAD_MAP_COLS: columns
-     * [src_index[0], src_index[0] + src_rows[0]) of src[0]'s last dimension. */
+     * [src_index[0], src_index[0] + src_rows[0]) of src[0]'s last dimension. RAD_MAP_TRANSPOSE with
+     * src_index[0] >= 0: rows [src_index[0] * src_rows[0], (src_index[0] + 1) * src_rows[0]) when
+     * src[0] is rank 2 and src_rows[0] > 0 (a stack flattened over rows); otherwise src_index[0] is
+     * the dim-0 sub-tensor of a higher-rank stack. */
     int64_t     src_rows[8];
 } RadNameMap;
 
@@ -624,7 +627,9 @@ typedef struct RadNameMap {
  * columns it is fed.
  *
  * RAD_MAP_TRANSPOSE swaps the last two dimensions of src[0] in each leading slice, [.., a, b] to
- * [.., b, a]: a linear a checkpoint keeps as (in, out), where the GEMMs read (out, in).
+ * [.., b, a]: a linear a checkpoint keeps as (in, out), where the GEMMs read (out, in). With
+ * src_index[0], it first takes one expert's sub-tensor (see src_rows): a stacked expert table kept
+ * [n_expert, in, out] or flattened [n_expert * in, out].
  *
  * RAD_MAP_EMA is an exponential-moving-average codebook as EnCodec-style quantisers keep it: src[0]
  * the embedding sums [bins, ...], src[1] the cluster usage [bins], and the codebook is each row

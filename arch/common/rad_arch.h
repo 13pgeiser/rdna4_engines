@@ -513,12 +513,33 @@ inline int map_copy_alt(RadBuilder* b, const char* declared, const char* a, cons
 
 /* One expert's slice of a stacked checkpoint tensor. GGUF stores a MoE layer's experts as one
  * ffn_gate_exps [.., n_expert], while placement moves one expert at a time and so needs one
- * declared weight per expert (spec §4.2). src_index carries the expert index explicitly. */
-inline int map_slice(RadBuilder* b, const char* declared, const char* src, int index) {
+ * declared weight per expert (spec §4.2). src_index carries the expert index explicitly.
+ *
+ * `sub_rows` is for a stack flattened into the rows of a rank-2 tensor (Nomic's
+ * experts.mlp.w1 is [n_expert * n_ff, n_embd]): it is the sub-tensor's row count, so the slice is
+ * rows [index * sub_rows, (index + 1) * sub_rows). Left 0, a rank-3 stack takes index as its
+ * dim-0 sub-tensor. */
+inline int map_slice(RadBuilder* b, const char* declared, const char* src, int index,
+                     int64_t sub_rows = 0) {
     RadNameMap m = map_base(declared, RAD_MAP_COPY);
     m.n_src       = 1;
     m.src[0]      = src;
     m.src_index[0]= index;
+    m.src_rows[0] = sub_rows;
+    return rad_decl_name_map(b, &m);
+}
+
+/* One expert's slice of a stacked tensor, transposed: the per-expert table a grouped GEMM reads
+ * when the checkpoint keeps it [in, out]. A rank-3 stack takes index as its dim-0 sub-tensor. A
+ * rank-2 stack flattened over its rows takes `sub_rows` as the sub-tensor's row count, as
+ * map_slice's. */
+inline int map_transpose_slice(RadBuilder* b, const char* declared, const char* src, int index,
+                               int64_t sub_rows = 0) {
+    RadNameMap m = map_base(declared, RAD_MAP_TRANSPOSE);
+    m.n_src       = 1;
+    m.src[0]      = src;
+    m.src_index[0]= index;
+    m.src_rows[0] = sub_rows;
     return rad_decl_name_map(b, &m);
 }
 
