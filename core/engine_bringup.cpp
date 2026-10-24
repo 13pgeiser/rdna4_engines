@@ -1908,10 +1908,10 @@ struct LoadRun {
 /* ================================================================== the relayout pool
  *
  * Weights the loader must rearrange (spec §4.3): the resolved kernel stores something other than
- * the canonical planes (a fragment order, a per-row scale tail), or the declaration widens bf16 to
- * f32. The sweep copies the weight's planes into a host input; once all bytes arrive, a worker
- * produces the stored form, directly into its host pool slot or, for VRAM, through the worker's
- * pinned bounce buffers.
+ * the canonical planes (a fragment order, a per-row scale tail), or the declaration converts bf16
+ * to f32, or f32 to bf16. The sweep copies the weight's planes into a host input; once all bytes
+ * arrive, a worker produces the stored form, directly into its host pool slot or, for VRAM,
+ * through the worker's pinned bounce buffers.
  *
  * It must keep pace with the disk (Qwen3.8-27B-FP8 rearranges 24 GiB of 29 per load; one thread
  * runs at a fraction of 7 GB/s), so it is a thread pool and the sweep only reads. The copies out
@@ -2248,8 +2248,8 @@ private:
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
         }
-        /* Stored as read (only reached by a weight with no sweep). */
-        if (w.identity && !w.widen) {
+        /* Stored as read (only reached by a weight with no sweep, no dtype conversion). */
+        if (w.identity && !w.widen && !w.narrow) {
             const int64_t n = w.stored_bytes;
             if (!s.dev) { std::memcpy(s.dst, s.in, (size_t)n); return RAD_OK; }
             const int us = b.upload(s.dst, s.in, n, s.device);
@@ -2277,11 +2277,15 @@ private:
 
         int st = RAD_OK;
         const char* who = "the loader";
-        if (w.widen) {
-            /* Exact: every bf16 and f16 value is representable in f32. */
+        if (w.widen || w.narrow) {
+            /* Exact: every bf16 and f16 value is representable in f32, and f32 rounds to bf16 to
+             * nearest even. */
             const int64_t cnt = w.sel_rows[0] * w.sel_cols[0];
-            if (cnt * 4 != n) st = RAD_E_SHAPE;
-            else for (int64_t e = 0; e < cnt; ++e) ((float*)out)[e] = rad_load_f32(pt[0].data, pt[0].dtype, e);
+            const int64_t esz = (int64_t)rad_dtype_bytes(w.stored_dtype, 1);
+            if (cnt * esz != n) st = RAD_E_SHAPE;
+            else for (int64_t e = 0; e < cnt; ++e)
+                rad_store_f32(out, w.stored_dtype, e,
+                              rad_load_f32(pt[0].data, pt[0].dtype, e));
         } else {
             const Resolved& r = s.prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
             const RadKernelInfo* ki = r.row->info;
@@ -2744,8 +2748,10 @@ int Engine::load_weights() {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),
-                        w.widen ? "widened at load" : w.identity ? "a shard of it"
-                                                                 : w.layout_tag.c_str());
+                        w.widen ? "widened at load"
+                                : w.narrow ? "narrowed at load"
+                                           : w.identity ? "a shard of it"
+                                                        : w.layout_tag.c_str());
                 return RAD_E_STATE;
             }
 
@@ -2862,7 +2868,8 @@ int Engine::load_weights() {
                     total += sh[k].dense_bytes();
                 }
                 sw.in_bytes = in_bytes;
-                if (w.identity && !w.widen && sh[0].dense_bytes() != w.stored_bytes) {
+                if (w.identity && !w.widen && !w.narrow &&
+                    sh[0].dense_bytes() != w.stored_bytes) {
                     RAD_ERR("rank %d: '%s': this rank's share is %lld bytes and the slot %lld",
                             r->index, w.name.c_str(), (long long)sh[0].dense_bytes(),
                             (long long)w.stored_bytes);
@@ -2884,7 +2891,7 @@ int Engine::load_weights() {
              * by plane for the relayout pool, which writes the slot. */
             int32_t stage = -1;
             int64_t in_bytes = 0;
-            if (!w.identity || w.widen) {
+            if (!w.identity || w.widen || w.narrow) {
                 stage = (int32_t)staged.size();
                 staged.emplace_back();
                 StagedWeight& sw = staged.back();

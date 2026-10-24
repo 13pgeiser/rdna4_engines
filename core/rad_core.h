@@ -189,11 +189,13 @@ struct WeightInfo {
     /* Filled by the layout pass: what the resolved kernel stores. `identity` is the selected
      * plane's bytes unchanged, the only form the file and mapped tiers can serve since they read
      * the container in place; `widen` is identity plus an exact widening (a bf16 norm read as
-     * f32) done by the loader. Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
+     * f32) done by the loader, and `narrow` an exact narrowing (an f32 readout head served as
+     * bf16). Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
      * load, as operand `lay_operand`. */
     std::string    layout_tag;
     bool           identity = true;
     bool           widen = false;
+    bool           narrow = false;
     int32_t        lay_op = -1, lay_band = -1, lay_dom = -1, lay_operand = -1;
     uint32_t       stored_dtype = RAD_DT_INVALID;
     uint32_t       stored_rank = 0;
@@ -238,7 +240,8 @@ inline void weight_planes(const WeightInfo& w, RadTensor* t) {
  * the mapped tier's pointer): only when they are the selected plane unchanged and this rank holds
  * all of it. A relayout is not in the file, and a column shard is not one contiguous range. */
 inline bool weight_file_direct(const WeightInfo& w, int world_size) {
-    return w.identity && !w.widen && (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
+    return w.identity && !w.widen && !w.narrow &&
+           (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
 
 struct BufferInfo {

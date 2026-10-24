@@ -206,21 +206,24 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
 
     /* Check the declaration against the planes. One plane is declared at its own dtype and extents
      * (this rank's share under a shard); several at the codes' dtype and the logical extents. A
-     * different dtype must be an exact widening the loader performs; a quantisation belongs to
+     * different dtype must be an exact conversion the loader performs; a quantisation belongs to
      * rad-convert and is refused. */
     const RadEncPlane& p0 = w.enc.plane[w.sel[0]];
     if (p0.dtype != d->dtype) {
         const bool widen = w.n_sel == 1 && d->dtype == RAD_F32 &&
                            (p0.dtype == RAD_BF16 || p0.dtype == RAD_F16);
+        /* A bf16 readout head over an f32 checkpoint tensor: the loader rounds it to bf16. */
+        const bool narrow = w.n_sel == 1 && d->dtype == RAD_BF16 && p0.dtype == RAD_F32;
         char e[256];
         rad_enc_format(&w.enc, e, sizeof e);
-        if (!widen)
+        if (!widen && !narrow)
             return err(RAD_E_DTYPE, "weight '%s' is declared %s, and '%s' holds %s as %s: only an "
-                                    "exact widening is done at load -- anything else is a "
-                                    "quantisation, which a recipe does before the container is "
-                                    "written (spec §4.4)", n.c_str(), rad_dtype_name(d->dtype),
+                                    "exact widening or narrowing is done at load; anything else "
+                                    "is a quantisation, which a recipe does before the container "
+                                    "is written (spec §4.4)", n.c_str(), rad_dtype_name(d->dtype),
                        w.source.c_str(), p0.role, e);
-        w.widen = true;
+        w.widen = widen;
+        w.narrow = narrow;
     }
     int64_t sr = 0, sc = 0;            /* the source's logical [rows, cols] */
     if (w.enc_known) rad_enc_view(ws.rank, ws.shape, &sr, &sc);
@@ -257,9 +260,10 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
      * the resolved kernel's layout hook asks for another (spec §4.3); no hook, or
      * RAD_E_UNSUPPORTED, keeps this. */
     w.identity     = true;
-    w.stored_dtype = w.widen ? d->dtype : p0.dtype;
-    w.stored_bytes = w.widen ? rad_dtype_bytes(d->dtype, vr * vc)
-                             : vr * rad_enc_row_bytes(p0.dtype, vc);
+    const bool converted = w.widen || w.narrow;
+    w.stored_dtype = converted ? d->dtype : p0.dtype;
+    w.stored_bytes = converted ? rad_dtype_bytes(d->dtype, vr * vc)
+                               : vr * rad_enc_row_bytes(p0.dtype, vc);
     w.stored_rank  = d->rank;
     for (uint32_t i = 0; i < RAD_MAX_RANK; ++i)
         w.stored_shape[i] = i < d->rank ? d->shape[i] : 0;
@@ -2210,12 +2214,13 @@ void Builder::finish_layouts() {
                                 w.source.c_str());
                         continue;   /* the stored defaults decl_weight set stand */
                     }
-                    if (w.widen) {
+                    if (w.widen || w.narrow) {
                         err(RAD_E_DTYPE, "'%s' is declared %s over a %s plane and kernel %s "
-                                         "relayouts it; a widening and a relayout are not both "
+                                         "relayouts it; a %s and a relayout are not both "
                                          "done at load", w.name.c_str(),
                             rad_dtype_name(w.decl.dtype),
-                            rad_dtype_name(w.enc.plane[w.sel[0]].dtype), ki->name);
+                            rad_dtype_name(w.enc.plane[w.sel[0]].dtype), ki->name,
+                            w.widen ? "widening" : "narrowing");
                         continue;
                     }
                     w.layout_tag   = tag;

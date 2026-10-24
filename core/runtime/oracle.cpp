@@ -385,7 +385,7 @@ bool Ctx::oracle_unrelayout(rad_op h, const IssuePlan& hip, const IssuePlan& dip
                      w.layout_tag.c_str(), ki->unrelayout ? "RadShapeFn" : "RadUnrelayoutFn");
             return false;
         }
-        if (!o.tab[i] && hk && !w.widen) {
+        if (!o.tab[i] && hk && !w.widen && !w.narrow) {
             RadTensor pt[RAD_ENC_MAX_PLANES];
             weight_planes(w, pt);
             RadLayout hl{};

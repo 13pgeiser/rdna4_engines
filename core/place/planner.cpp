@@ -313,7 +313,7 @@ void Planner::pin_mapped(const Program& prog, Plan* p) {
                               "directly has none; convert it to a container");
         else if (!stored)
             note_unfit(p, mu, "it must be read from the container's mapping, and its stored form "
-                              "is not the container's (a relayout, a widening or a shard)");
+                              "is not the container's (a relayout, a dtype conversion or a shard)");
         if (host_only)
             for (rad_weight w : mu.weights)
                 if (w < device_ok_.size() && device_ok_[w])
@@ -698,8 +698,8 @@ int Planner::assign_expert_tiered(Plan* p) {
                 /* With the file tier on, only a non-file-direct unit gets here (HostFall::place). */
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room, and its "
                                          "stored form is not the container's (a relayout, a "
-                                         "widening or a shard), so the file tier cannot read it "
-                                         "in place"
+                                         "dtype conversion or a shard), so the file tier cannot "
+                                         "read it in place"
                                        : "the host pool is full and no --weights-disk-tier was "
                                          "given");
                 rc = RAD_E_NOMEM;
