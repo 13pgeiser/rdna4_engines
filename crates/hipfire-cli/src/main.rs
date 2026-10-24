@@ -984,6 +984,19 @@ pub(crate) struct ServeArgs {
     /// `memory.max_seq` bounds; overrides the configured/automatic context.
     #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
     max_seq: Option<u64>,
+    /// Multi-slot serve: host-RAM ceiling for parked swap snapshots, in
+    /// bytes; zero disables the host tier so snapshots spill to disk.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1_099_511_627_776), value_name = "BYTES")]
+    swap_host_bytes: Option<u64>,
+    /// Multi-slot serve: disk ceiling for parked swap snapshots, in bytes;
+    /// zero disables disk spill. LRU snapshots are evicted at the ceiling.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1_099_511_627_776), value_name = "BYTES")]
+    swap_disk_bytes: Option<u64>,
+    /// Multi-slot serve: directory for swap spill files; empty uses
+    /// `$XDG_RUNTIME_DIR/hipfire/swap/<pid>`, falling back to
+    /// `$TMPDIR/hipfire-swap-<pid>`.
+    #[arg(long, value_name = "DIR")]
+    swap_dir: Option<PathBuf>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
@@ -3787,6 +3800,9 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             tp: None,
             speculation: None,
             max_seq: None,
+            swap_host_bytes: None,
+            swap_disk_bytes: None,
+            swap_dir: None,
             continuous_batch_size: None,
             foreground_child: false,
             ui: false,

@@ -867,7 +867,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1739
+**Count:** 1745
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2155,13 +2155,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_GDN_PREFILL` | crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs, crates/rdna-compute/examples/gdn_wy_repeat_check.rs | developer |
 | `HIPFIRE_QWEN4_GDN_Q8_INLINE` | crates/hipfire-arch-qwen4/src/state.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_GDN_QKV_BF16` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_HC_DOWN_FUSED` | crates/rdna-compute/examples/hc_down_fused_bench.rs, crates/rdna-compute/examples/hc_down_fused_oracle.rs | developer |
+| `HIPFIRE_QWEN4_HC_DOWN_FUSED` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/examples/hc_down_fused_bench.rs | developer |
 | `HIPFIRE_QWEN4_HC_DOWN_TILE` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_QWEN4_HC_ROW_FOLD` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_TWIN` | crates/rdna-compute/src/tensor_ops.rs | developer |
-| `HIPFIRE_QWEN4_HC_UP_V2` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
+| `HIPFIRE_QWEN4_HC_UP_V2` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_R4` | crates/peacemaker-isa/tests/legacy_mq4_rowtiles.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_TWIN` | crates/rdna-compute/src/gemm.rs | developer |
@@ -2446,7 +2446,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_MAX_QUEUE_BYTES` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT` | crates/hipfire-config/src/lib.rs, scripts/serve_concurrency_gate.sh | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_CTX` | crates/hipfire-config/src/lib.rs, scripts/scs_suite.py | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_MAX_SESSIONS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_SESSION_TTL_SECS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_PREFILL_MIN_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_PREFIX_CACHE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
@@ -2495,6 +2497,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
 | `HIPFIRE_STATE_QUANT` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs | stable |
+| `HIPFIRE_SWAP_DIR` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SWAP_DISK_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SWAP_HOST_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh | harness |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh | harness |
 | `HIPFIRE_SWEEP_PROMPTS_DIR` | scripts/mq3-mq2-sweep.sh | harness |
