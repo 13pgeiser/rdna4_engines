@@ -20,7 +20,10 @@ impl VisitMut for Expander {
     fn visit_stmt_mut(&mut self, s: &mut Stmt) {
         if let Stmt::Macro(sm) = s {
             let semi = sm.semi_token;
-            let e = Expr::Macro(syn::ExprMacro { attrs: std::mem::take(&mut sm.attrs), mac: sm.mac.clone() });
+            let e = Expr::Macro(syn::ExprMacro {
+                attrs: std::mem::take(&mut sm.attrs),
+                mac: sm.mac.clone(),
+            });
             *s = Stmt::Expr(e, semi);
         }
         visit_mut::visit_stmt_mut(self, s);
@@ -35,7 +38,12 @@ impl VisitMut for Expander {
 
 fn call(name: &str, args: Vec<Expr>) -> Expr {
     let f: Expr = syn::parse_str(name).expect("internal name");
-    Expr::Call(syn::ExprCall { attrs: vec![], func: Box::new(f), paren_token: Default::default(), args: args.into_iter().collect() })
+    Expr::Call(syn::ExprCall {
+        attrs: vec![],
+        func: Box::new(f),
+        paren_token: Default::default(),
+        args: args.into_iter().collect(),
+    })
 }
 
 fn unsupported(msg: String) -> Expr {
@@ -44,7 +52,9 @@ fn unsupported(msg: String) -> Expr {
 }
 
 fn args_of(tokens: TokenStream) -> syn::Result<Vec<Expr>> {
-    Punctuated::<Expr, Token![,]>::parse_terminated.parse2(tokens).map(|p| p.into_iter().collect())
+    Punctuated::<Expr, Token![,]>::parse_terminated
+        .parse2(tokens)
+        .map(|p| p.into_iter().collect())
 }
 
 struct MatchesArgs {
@@ -69,7 +79,12 @@ impl Parse for MatchesArgs {
 }
 
 fn elaborate(mac: &syn::Macro) -> Expr {
-    let name = mac.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+    let name = mac
+        .path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
     let toks = mac.tokens.clone();
     let bad = |e: syn::Error| {
         let s = e.span().start();
@@ -86,7 +101,14 @@ fn elaborate(mac: &syn::Macro) -> Expr {
             Err(e) => bad(e),
         },
         "panic" | "unreachable" | "todo" | "unimplemented" => match args_of(toks) {
-            Ok(a) => call("__panic", if a.is_empty() { vec![syn::parse_quote!("")] } else { vec![call("__fmt", a)] }),
+            Ok(a) => call(
+                "__panic",
+                if a.is_empty() {
+                    vec![syn::parse_quote!("")]
+                } else {
+                    vec![call("__fmt", a)]
+                },
+            ),
             Err(e) => bad(e),
         },
         "assert" | "debug_assert" => match args_of(toks) {
@@ -115,7 +137,8 @@ fn elaborate(mac: &syn::Macro) -> Expr {
             Err(e) => bad(e),
         },
         "vec" => {
-            let bracketed: TokenStream = std::iter::once(TokenTree::Group(Group::new(Delimiter::Bracket, toks))).collect();
+            let bracketed: TokenStream =
+                std::iter::once(TokenTree::Group(Group::new(Delimiter::Bracket, toks))).collect();
             match syn::parse2::<Expr>(bracketed) {
                 Ok(e) => e,
                 Err(e) => bad(e),
@@ -132,7 +155,9 @@ fn elaborate(mac: &syn::Macro) -> Expr {
             let lit = syn::LitStr::new(&toks.to_string(), proc_macro2::Span::call_site());
             syn::parse_quote!(#lit)
         }
-        other => unsupported(format!("macro `{other}!` is not supported by the .rip evaluator")),
+        other => unsupported(format!(
+            "macro `{other}!` is not supported by the .rip evaluator"
+        )),
     }
 }
 

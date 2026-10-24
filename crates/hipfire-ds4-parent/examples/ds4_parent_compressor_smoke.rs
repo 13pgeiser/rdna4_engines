@@ -22,9 +22,7 @@ use hipfire_ds4_parent::compressor::{
     PARENT_INDEX_HEAD_DIM,
 };
 use hipfire_ds4_parent::inventory::ParentInventory;
-use hipfire_ds4_parent::weights::{
-    ParentCompressorWeights, ParentLoadPlan, ParentWeights,
-};
+use hipfire_ds4_parent::weights::{ParentCompressorWeights, ParentLoadPlan, ParentWeights};
 use hipfire_ds4_parent::Ds4ParentBackend;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -70,7 +68,10 @@ fn run() -> Result<(), String> {
 
     println!("=== ds4_parent_compressor_smoke ===");
     println!("model: {}", model_path.display());
-    println!("layers: {LAYER_R4}..{}  rows: {ROWS}  start_pos: {START_POS}", LAYER_R128 + 1);
+    println!(
+        "layers: {LAYER_R4}..{}  rows: {ROWS}  start_pos: {START_POS}",
+        LAYER_R128 + 1
+    );
 
     let source = SafetensorsSource::open(model_path).map_err(|e| {
         format!(
@@ -174,13 +175,33 @@ fn run() -> Result<(), String> {
 
     // Warmup + timed forward.
     parent_compressor_forward(
-        &mut gpu, backend, comp2, &cfg, &mut scratch, &x, ROWS, START_POS, 4, false, &kv_out2,
+        &mut gpu,
+        backend,
+        comp2,
+        &cfg,
+        &mut scratch,
+        &x,
+        ROWS,
+        START_POS,
+        4,
+        false,
+        &kv_out2,
     )?;
     scratch.reset_ring(&gpu)?;
 
     let t0 = Instant::now();
     parent_compressor_forward(
-        &mut gpu, backend, comp2, &cfg, &mut scratch, &x, ROWS, START_POS, 4, false, &kv_out2,
+        &mut gpu,
+        backend,
+        comp2,
+        &cfg,
+        &mut scratch,
+        &x,
+        ROWS,
+        START_POS,
+        4,
+        false,
+        &kv_out2,
     )?;
     gpu.hip
         .device_synchronize()
@@ -225,8 +246,7 @@ fn run() -> Result<(), String> {
             for o in 0..proj2 {
                 let mut acc = 0.0f64;
                 for k in 0..PARENT_DIM {
-                    acc += x_f32[r * PARENT_DIM + k] as f64
-                        * wkv2[o * PARENT_DIM + k] as f64;
+                    acc += x_f32[r * PARENT_DIM + k] as f64 * wkv2[o * PARENT_DIM + k] as f64;
                 }
                 host_gemm[r * proj2 + o] = acc as f32;
             }
@@ -243,18 +263,17 @@ fn run() -> Result<(), String> {
 
     // Isolate device RMSNorm + act_quant vs host.
     {
-        use hipfire_ds4_parent::compressor::{
-            overlap_transform_host, softmax_pool_host, compressor_prefill_rope_pos,
-            PARENT_ROPE_DIM, PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_FACTOR,
-            PARENT_YARN_ORIG_SEQ, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW,
-            PARENT_RMS_EPS, PARENT_COMP_ACT_BLOCK,
-        };
         use hipfire_ds4_parent::attention::{
             apply_rope_interleaved_inplace, precompute_rope_freqs,
         };
-        use hipfire_ds4_parent::layer_ref::rms_norm_ref;
         use hipfire_ds4_parent::codec::act_quant_fp8_inplace_ref;
+        use hipfire_ds4_parent::compressor::{
+            compressor_prefill_rope_pos, overlap_transform_host, softmax_pool_host,
+            PARENT_COMPRESS_ROPE_THETA, PARENT_COMP_ACT_BLOCK, PARENT_RMS_EPS, PARENT_ROPE_DIM,
+            PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR, PARENT_YARN_ORIG_SEQ,
+        };
         use hipfire_ds4_parent::hc::parent_rms_norm;
+        use hipfire_ds4_parent::layer_ref::rms_norm_ref;
 
         let mut kv = vec![0.0f32; ROWS * proj2];
         let mut score = vec![0.0f32; ROWS * proj2];
@@ -280,8 +299,16 @@ fn run() -> Result<(), String> {
         }
         let mut kv_ot = vec![0.0f32; n_out2 * 8 * head2];
         let mut sc_ot = vec![f32::NEG_INFINITY; n_out2 * 8 * head2];
-        overlap_transform_host(&kv[..cutoff*proj2], n_out2, 4, head2, 0.0, &mut kv_ot).unwrap();
-        overlap_transform_host(&score[..cutoff*proj2], n_out2, 4, head2, f32::NEG_INFINITY, &mut sc_ot).unwrap();
+        overlap_transform_host(&kv[..cutoff * proj2], n_out2, 4, head2, 0.0, &mut kv_ot).unwrap();
+        overlap_transform_host(
+            &score[..cutoff * proj2],
+            n_out2,
+            4,
+            head2,
+            f32::NEG_INFINITY,
+            &mut sc_ot,
+        )
+        .unwrap();
         let pooled = softmax_pool_host(&kv_ot, &sc_ot, n_out2, 8, head2).unwrap();
 
         // Host RMSNorm
@@ -289,28 +316,69 @@ fn run() -> Result<(), String> {
 
         // Device RMSNorm on same pooled input
         let pooled_t = upload_f32(&mut gpu, &pooled, &[n_out2, head2])?;
-        let dev_normed_t = gpu.zeros(&[n_out2, head2], DType::F32).map_err(|e| format!("{e:?}"))?;
-        parent_rms_norm(&mut gpu, backend, &pooled_t, &comp2.norm, &dev_normed_t, n_out2, head2, PARENT_RMS_EPS)?;
+        let dev_normed_t = gpu
+            .zeros(&[n_out2, head2], DType::F32)
+            .map_err(|e| format!("{e:?}"))?;
+        parent_rms_norm(
+            &mut gpu,
+            backend,
+            &pooled_t,
+            &comp2.norm,
+            &dev_normed_t,
+            n_out2,
+            head2,
+            PARENT_RMS_EPS,
+        )?;
         let dev_normed = download_f32(&gpu, &dev_normed_t, n_out2 * head2)?;
         let (ma, mr, lr) = error_metrics(&dev_normed, &host_normed)?;
         println!("RMSNorm device vs host: max_abs={ma:.6e} mean_rel={mr:.6e} l2_rel={lr:.6e}");
 
         // Continue host rope+quant from BOTH starting points
-        let freqs = precompute_rope_freqs(PARENT_ROPE_DIM, PARENT_YARN_ORIG_SEQ, PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_FACTOR, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW).unwrap();
-        let positions: Vec<usize> = (0..n_out2).map(|i| compressor_prefill_rope_pos(i, 4)).collect();
+        let freqs = precompute_rope_freqs(
+            PARENT_ROPE_DIM,
+            PARENT_YARN_ORIG_SEQ,
+            PARENT_COMPRESS_ROPE_THETA,
+            PARENT_YARN_FACTOR,
+            PARENT_YARN_BETA_FAST,
+            PARENT_YARN_BETA_SLOW,
+        )
+        .unwrap();
+        let positions: Vec<usize> = (0..n_out2)
+            .map(|i| compressor_prefill_rope_pos(i, 4))
+            .collect();
         let mut a = host_normed.clone();
         let mut b = dev_normed.clone();
-        apply_rope_interleaved_inplace(&mut a, n_out2, 1, head2, PARENT_ROPE_DIM, &positions, &freqs, false).unwrap();
-        apply_rope_interleaved_inplace(&mut b, n_out2, 1, head2, PARENT_ROPE_DIM, &positions, &freqs, false).unwrap();
+        apply_rope_interleaved_inplace(
+            &mut a,
+            n_out2,
+            1,
+            head2,
+            PARENT_ROPE_DIM,
+            &positions,
+            &freqs,
+            false,
+        )
+        .unwrap();
+        apply_rope_interleaved_inplace(
+            &mut b,
+            n_out2,
+            1,
+            head2,
+            PARENT_ROPE_DIM,
+            &positions,
+            &freqs,
+            false,
+        )
+        .unwrap();
         let nope = head2 - PARENT_ROPE_DIM;
         let mut apply_q = |v: &mut [f32]| {
             let mut nb = vec![0.0f32; n_out2 * nope];
             for r in 0..n_out2 {
-                nb[r*nope..(r+1)*nope].copy_from_slice(&v[r*head2..r*head2+nope]);
+                nb[r * nope..(r + 1) * nope].copy_from_slice(&v[r * head2..r * head2 + nope]);
             }
             act_quant_fp8_inplace_ref(&mut nb, nope, PARENT_COMP_ACT_BLOCK).unwrap();
             for r in 0..n_out2 {
-                v[r*head2..r*head2+nope].copy_from_slice(&nb[r*nope..(r+1)*nope]);
+                v[r * head2..r * head2 + nope].copy_from_slice(&nb[r * nope..(r + 1) * nope]);
             }
         };
         apply_q(&mut a);
@@ -324,16 +392,26 @@ fn run() -> Result<(), String> {
 
         // Direct act_quant isolation on post-rope host tensor `a` before quant.
         let mut pre_q = host_normed.clone();
-        apply_rope_interleaved_inplace(&mut pre_q, n_out2, 1, head2, PARENT_ROPE_DIM, &positions, &freqs, false).unwrap();
+        apply_rope_interleaved_inplace(
+            &mut pre_q,
+            n_out2,
+            1,
+            head2,
+            PARENT_ROPE_DIM,
+            &positions,
+            &freqs,
+            false,
+        )
+        .unwrap();
         let mut host_q = pre_q.clone();
         {
             let mut nb = vec![0.0f32; n_out2 * nope];
             for r in 0..n_out2 {
-                nb[r*nope..(r+1)*nope].copy_from_slice(&host_q[r*head2..r*head2+nope]);
+                nb[r * nope..(r + 1) * nope].copy_from_slice(&host_q[r * head2..r * head2 + nope]);
             }
             act_quant_fp8_inplace_ref(&mut nb, nope, PARENT_COMP_ACT_BLOCK).unwrap();
             for r in 0..n_out2 {
-                host_q[r*head2..r*head2+nope].copy_from_slice(&nb[r*nope..(r+1)*nope]);
+                host_q[r * head2..r * head2 + nope].copy_from_slice(&nb[r * nope..(r + 1) * nope]);
             }
         }
         // GPU act_quant on same pre_q
@@ -342,25 +420,31 @@ fn run() -> Result<(), String> {
             use hipfire_ds4_parent::codec::round_to_bf16;
             let mut nb = vec![0.0f32; n_out2 * nope];
             for r in 0..n_out2 {
-                nb[r*nope..(r+1)*nope].copy_from_slice(&gpu_q[r*head2..r*head2+nope]);
+                nb[r * nope..(r + 1) * nope].copy_from_slice(&gpu_q[r * head2..r * head2 + nope]);
             }
-            let mut bytes = Vec::with_capacity(nb.len()*2);
+            let mut bytes = Vec::with_capacity(nb.len() * 2);
             for &v in &nb {
                 let bf = round_to_bf16(v);
                 let bits = (bf.to_bits() >> 16) as u16;
                 bytes.extend_from_slice(&bits.to_le_bytes());
             }
-            let t = gpu.alloc_tensor(&[n_out2, nope], DType::BF16).map_err(|e| format!("{e:?}"))?;
-            gpu.hip.memcpy_htod(&t.buf, &bytes).map_err(|e| format!("{e:?}"))?;
+            let t = gpu
+                .alloc_tensor(&[n_out2, nope], DType::BF16)
+                .map_err(|e| format!("{e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&t.buf, &bytes)
+                .map_err(|e| format!("{e:?}"))?;
             gpu.act_quant_fp8_ue8m0_inplace_gfx942(&t.buf, n_out2, nope, PARENT_COMP_ACT_BLOCK)
                 .map_err(|e| format!("actq: {e:?}"))?;
-            let mut raw = vec![0u8; nb.len()*2];
-            gpu.hip.memcpy_dtoh(&mut raw, &t.buf).map_err(|e| format!("{e:?}"))?;
+            let mut raw = vec![0u8; nb.len() * 2];
+            gpu.hip
+                .memcpy_dtoh(&mut raw, &t.buf)
+                .map_err(|e| format!("{e:?}"))?;
             for r in 0..n_out2 {
                 for d in 0..nope {
-                    let i = r*nope + d;
-                    let bits = u16::from_le_bytes([raw[2*i], raw[2*i+1]]);
-                    gpu_q[r*head2 + d] = f32::from_bits((bits as u32) << 16);
+                    let i = r * nope + d;
+                    let bits = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+                    gpu_q[r * head2 + d] = f32::from_bits((bits as u32) << 16);
                 }
             }
             let _ = gpu.free_tensor(t);
@@ -375,33 +459,35 @@ fn run() -> Result<(), String> {
         let mut wi = 0usize;
         for i in 0..gpu2.len() {
             let e = (gpu2[i] - host_q[i]).abs();
-            if e > worst { worst = e; wi = i; }
+            if e > worst {
+                worst = e;
+                wi = i;
+            }
         }
-        println!("worst err at idx {wi}: gpu={:.6} host_q={:.6} pre_q={:.6} diff={worst:.6}",
-            gpu2[wi], host_q[wi], pre_q[wi]);
+        println!(
+            "worst err at idx {wi}: gpu={:.6} host_q={:.6} pre_q={:.6} diff={worst:.6}",
+            gpu2[wi], host_q[wi], pre_q[wi]
+        );
         // print first 8 of row 0
         print!("gpu2 row0 head: ");
-        for i in 0..8 { print!("{:.5} ", gpu2[i]); }
+        for i in 0..8 {
+            print!("{:.5} ", gpu2[i]);
+        }
         println!();
         print!("host_q row0 head: ");
-        for i in 0..8 { print!("{:.5} ", host_q[i]); }
+        for i in 0..8 {
+            print!("{:.5} ", host_q[i]);
+        }
         println!();
         print!("gpu_q row0 head: ");
-        for i in 0..8 { print!("{:.5} ", gpu_q[i]); }
+        for i in 0..8 {
+            print!("{:.5} ", gpu_q[i]);
+        }
         println!();
     }
 
     let ref2 = compressor_prefill_ref(
-        &x_f32,
-        &wkv2,
-        &wgate2,
-        &norm_w2,
-        &ape2,
-        ROWS,
-        PARENT_DIM,
-        head2,
-        4,
-        false,
+        &x_f32, &wkv2, &wgate2, &norm_w2, &ape2, ROWS, PARENT_DIM, head2, 4, false,
     )?
     .ok_or_else(|| "oracle returned None".to_owned())?;
     let (max_abs, mean_rel, l2_rel) = error_metrics(&gpu2, &ref2)?;
@@ -414,19 +500,18 @@ fn run() -> Result<(), String> {
     }
     // Stage-by-stage host replay using GPU GEMM outputs as starting point.
     {
-        use hipfire_ds4_parent::compressor::{
-            overlap_transform_host, softmax_pool_host, compressor_prefill_rope_pos,
-        };
         use hipfire_ds4_parent::attention::{
             apply_rope_interleaved_inplace, precompute_rope_freqs,
         };
-        use hipfire_ds4_parent::layer_ref::rms_norm_ref;
         use hipfire_ds4_parent::codec::act_quant_fp8_inplace_ref;
         use hipfire_ds4_parent::compressor::{
-            PARENT_ROPE_DIM, PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_FACTOR,
-            PARENT_YARN_ORIG_SEQ, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW,
-            PARENT_RMS_EPS, PARENT_COMP_ACT_BLOCK,
+            compressor_prefill_rope_pos, overlap_transform_host, softmax_pool_host,
         };
+        use hipfire_ds4_parent::compressor::{
+            PARENT_COMPRESS_ROPE_THETA, PARENT_COMP_ACT_BLOCK, PARENT_RMS_EPS, PARENT_ROPE_DIM,
+            PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR, PARENT_YARN_ORIG_SEQ,
+        };
+        use hipfire_ds4_parent::layer_ref::rms_norm_ref;
 
         // Recompute host GEMM (f64) already in wkv2 path — use host_gemm-equivalent:
         let mut kv = vec![0.0f32; ROWS * proj2];
@@ -453,28 +538,61 @@ fn run() -> Result<(), String> {
         }
         let mut kv_ot = vec![0.0f32; n_out2 * 8 * head2];
         let mut sc_ot = vec![f32::NEG_INFINITY; n_out2 * 8 * head2];
-        overlap_transform_host(&kv[..cutoff*proj2], n_out2, 4, head2, 0.0, &mut kv_ot).unwrap();
-        overlap_transform_host(&score[..cutoff*proj2], n_out2, 4, head2, f32::NEG_INFINITY, &mut sc_ot).unwrap();
+        overlap_transform_host(&kv[..cutoff * proj2], n_out2, 4, head2, 0.0, &mut kv_ot).unwrap();
+        overlap_transform_host(
+            &score[..cutoff * proj2],
+            n_out2,
+            4,
+            head2,
+            f32::NEG_INFINITY,
+            &mut sc_ot,
+        )
+        .unwrap();
         let mut pooled = softmax_pool_host(&kv_ot, &sc_ot, n_out2, 8, head2).unwrap();
-        let (ma, mr, lr) = error_metrics(&pooled, &ref2[..n_out2*head2].to_vec()).unwrap_or((0.,0.,0.));
+        let (ma, mr, lr) =
+            error_metrics(&pooled, &ref2[..n_out2 * head2].to_vec()).unwrap_or((0., 0., 0.));
         // compare pooled (pre-norm) against... we don't have GPU pre-norm. Skip.
         pooled = rms_norm_ref(&pooled, &norm_w2, PARENT_RMS_EPS as f64, head2);
-        let freqs = precompute_rope_freqs(PARENT_ROPE_DIM, PARENT_YARN_ORIG_SEQ, PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_FACTOR, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW).unwrap();
-        let positions: Vec<usize> = (0..n_out2).map(|i| compressor_prefill_rope_pos(i, 4)).collect();
-        apply_rope_interleaved_inplace(&mut pooled, n_out2, 1, head2, PARENT_ROPE_DIM, &positions, &freqs, false).unwrap();
+        let freqs = precompute_rope_freqs(
+            PARENT_ROPE_DIM,
+            PARENT_YARN_ORIG_SEQ,
+            PARENT_COMPRESS_ROPE_THETA,
+            PARENT_YARN_FACTOR,
+            PARENT_YARN_BETA_FAST,
+            PARENT_YARN_BETA_SLOW,
+        )
+        .unwrap();
+        let positions: Vec<usize> = (0..n_out2)
+            .map(|i| compressor_prefill_rope_pos(i, 4))
+            .collect();
+        apply_rope_interleaved_inplace(
+            &mut pooled,
+            n_out2,
+            1,
+            head2,
+            PARENT_ROPE_DIM,
+            &positions,
+            &freqs,
+            false,
+        )
+        .unwrap();
         let nope = head2 - PARENT_ROPE_DIM;
         let mut nope_buf = vec![0.0f32; n_out2 * nope];
         for r in 0..n_out2 {
-            nope_buf[r*nope..(r+1)*nope].copy_from_slice(&pooled[r*head2..r*head2+nope]);
+            nope_buf[r * nope..(r + 1) * nope]
+                .copy_from_slice(&pooled[r * head2..r * head2 + nope]);
         }
         act_quant_fp8_inplace_ref(&mut nope_buf, nope, PARENT_COMP_ACT_BLOCK).unwrap();
         for r in 0..n_out2 {
-            pooled[r*head2..r*head2+nope].copy_from_slice(&nope_buf[r*nope..(r+1)*nope]);
+            pooled[r * head2..r * head2 + nope]
+                .copy_from_slice(&nope_buf[r * nope..(r + 1) * nope]);
         }
         let (ma, mr, lr) = error_metrics(&gpu2, &pooled).unwrap();
         println!("host-full-replay vs GPU: max_abs={ma:.6e} mean_rel={mr:.6e} l2_rel={lr:.6e}");
         let (ma2, mr2, lr2) = error_metrics(&pooled, &ref2).unwrap();
-        println!("host-full-replay vs oracle: max_abs={ma2:.6e} mean_rel={mr2:.6e} l2_rel={lr2:.6e}");
+        println!(
+            "host-full-replay vs oracle: max_abs={ma2:.6e} mean_rel={mr2:.6e} l2_rel={lr2:.6e}"
+        );
     }
 
     // Gate: GEMM is bit-near; end-to-end mean_rel ~1e-3 is elevated vs pure f32
@@ -513,7 +631,17 @@ fn run() -> Result<(), String> {
         scratch.reset_ring(&gpu)?;
         let t0 = Instant::now();
         parent_compressor_forward(
-            &mut gpu, backend, &iw, &cfg, &mut scratch, &x, ROWS, START_POS, 4, true, &kv_outi,
+            &mut gpu,
+            backend,
+            &iw,
+            &cfg,
+            &mut scratch,
+            &x,
+            ROWS,
+            START_POS,
+            4,
+            true,
+            &kv_outi,
         )?;
         gpu.hip
             .device_synchronize()
@@ -525,20 +653,14 @@ fn run() -> Result<(), String> {
         println!("GPU finite={finite_i}  L2={norm_i:.6}  wall={wall_i:.2} ms");
         let (wkvi, wgatei, norm_wi, apei) = download_comp_weights(&gpu, &iw, head_i, proj_i, 4)?;
         let refi = compressor_prefill_ref(
-            &x_f32,
-            &wkvi,
-            &wgatei,
-            &norm_wi,
-            &apei,
-            ROWS,
-            PARENT_DIM,
-            head_i,
-            4,
-            true,
+            &x_f32, &wkvi, &wgatei, &norm_wi, &apei, ROWS, PARENT_DIM, head_i, 4, true,
         )?
         .ok_or_else(|| "indexer oracle None".to_owned())?;
         let (ma, mr, lr) = error_metrics(&gpui, &refi)?;
-        println!("oracle: max_abs={ma:.6e}  mean_rel={mr:.6e}  l2_rel={lr:.6e}  ref_L2={:.6}", l2_norm(&refi));
+        println!(
+            "oracle: max_abs={ma:.6e}  mean_rel={mr:.6e}  l2_rel={lr:.6e}  ref_L2={:.6}",
+            l2_norm(&refi)
+        );
         if !finite_i {
             return Err("indexer compressor non-finite".to_owned());
         }
@@ -601,7 +723,16 @@ fn run() -> Result<(), String> {
 
     let t0 = Instant::now();
     parent_compressor_forward(
-        &mut gpu, backend, comp3, &cfg, &mut scratch, &x128_t, rows128, START_POS, 128, false,
+        &mut gpu,
+        backend,
+        comp3,
+        &cfg,
+        &mut scratch,
+        &x128_t,
+        rows128,
+        START_POS,
+        128,
+        false,
         &kv_out3,
     )?;
     gpu.hip
@@ -615,16 +746,7 @@ fn run() -> Result<(), String> {
 
     let (wkv3, wgate3, norm_w3, ape3) = download_comp_weights(&gpu, comp3, head3, proj3, 128)?;
     let ref3 = compressor_prefill_ref(
-        &x128,
-        &wkv3,
-        &wgate3,
-        &norm_w3,
-        &ape3,
-        rows128,
-        PARENT_DIM,
-        head3,
-        128,
-        false,
+        &x128, &wkv3, &wgate3, &norm_w3, &ape3, rows128, PARENT_DIM, head3, 128, false,
     )?
     .ok_or_else(|| "ratio128 oracle None".to_owned())?;
     let (ma3, mr3, lr3) = error_metrics(&gpu3, &ref3)?;
@@ -648,7 +770,17 @@ fn run() -> Result<(), String> {
         .zeros(&[1, head3], DType::F32)
         .map_err(|e| format!("dummy: {e:?}"))?;
     parent_compressor_forward(
-        &mut gpu, backend, comp3, &cfg, &mut scratch, &x, ROWS, START_POS, 128, false, &kv_dummy,
+        &mut gpu,
+        backend,
+        comp3,
+        &cfg,
+        &mut scratch,
+        &x,
+        ROWS,
+        START_POS,
+        128,
+        false,
+        &kv_dummy,
     )?;
     println!(
         "\nratio-128 with rows=16: n_out=0 (no compress event) — forward returned Ok (ring stash only)"

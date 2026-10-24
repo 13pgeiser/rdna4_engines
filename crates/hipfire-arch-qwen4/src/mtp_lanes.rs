@@ -27,25 +27,26 @@
 //!   hidden capture plus the head append of every row).
 //!
 //! The per-lane floor ([`LaneSpecPolicy`]) keeps the singleton's
-//! [`MtpFloor`] and agreement, fed in AR-row units from the store-level
+//! [`Qwen4Floor`] and agreement, fed in AR-row units from the store-level
 //! [`LaneCostModel`] instead of wall clocks (see its docs).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
+use crate::lane::Qwen4LaneStore;
 use crate::lane::{LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState};
 use crate::lane_exec::{LaneDraft, LaneRoute};
-use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot};
+use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
-    accept_native_greedy, batched_depth, draft_accept_estimate, draft_pairing,
-    finish_native_window, mtp_prefill_chunk,
-    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, observe_agreement, Agreement, DraftPairing, FloorRoute,
-    MtpFloor, NativeFinish, NativeWindow, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY, MTP_AGREEMENT_PRIOR,
-    MTP_MAX_DEPTH, MTP_ROW_WORTH,
+    accept_native_greedy, draft_accept_estimate, finish_native_window, floor_with_call_log,
+    mtp_prefill_chunk, mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
+    mtp_skip_intermediate_pick_enabled, HeadTicket, NativeFinish, Qwen4Floor, Qwen4Ops,
+    TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH, MTP_WINDOW_COST,
 };
-use crate::lane::Qwen4LaneStore;
-use crate::state::Qwen4StateSnapshot;
+
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
+use hipfire_runtime::spec_economics::{
+    observe_agreement, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
+};
 use rdna_compute::{Gpu, GpuTensor};
 
 // ---------------------------------------------------------------------------
@@ -198,14 +199,18 @@ fn floor_env_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0")
 }
 
+const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
+
 /// One lane's window router: the singleton's agreement and AR floor, priced
 /// in AR-row units (calibrated once at `ar_us = 1.0`; batched windows
 /// observed at [`LaneCostModel::window_units`], `ArSynced` windows as
 /// interleaved windows of one unit).
+/// Promotion retains the singleton's full agreement history without widening
+/// the lane's physical draft capacity.
 #[derive(Clone, Debug)]
 pub(crate) struct LaneSpecPolicy {
-    agreement: Agreement,
-    floor: MtpFloor,
+    agreement: Vec<(f32, f32)>,
+    floor: Qwen4Floor,
     floor_enabled: bool,
     max_k: usize,
     calibrated: bool,
@@ -223,14 +228,27 @@ impl LaneSpecPolicy {
     }
 
     pub(crate) fn with_floor(k: usize, floor_enabled: bool) -> Self {
+        let max_k = k.min(LANE_MAX_DRAFTS);
+        Self::with_agreement(max_k, vec![AGREEMENT_PRIOR; max_k], false, floor_enabled)
+    }
+
+    fn with_agreement(
+        max_k: usize,
+        agreement: Vec<(f32, f32)>,
+        promoted_retired: bool,
+        floor_enabled: bool,
+    ) -> Self {
+        let mut floor = Qwen4Floor::new(MTP_WINDOW_COST);
+        floor.set_capacity(max_k);
+        let floor = floor_with_call_log(floor, "lane", floor_enabled);
         Self {
-            agreement: [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
-            floor: MtpFloor::new(),
+            agreement,
+            floor,
             floor_enabled,
-            max_k: k.min(MTP_MAX_DEPTH),
+            max_k,
             calibrated: false,
             lab_windows: 0,
-            promoted_retired: false,
+            promoted_retired,
         }
     }
 
@@ -238,21 +256,22 @@ impl LaneSpecPolicy {
     /// `agreement` seeds the lane (performance only); `retired` (the
     /// singleton's floor retired it) keeps the lane `ArRetired`, otherwise
     /// the lane floor starts fresh like any admitted lane.
-    pub(crate) fn promoted(k: usize, agreement: Agreement, retired: bool) -> Self {
+    pub(crate) fn promoted(k: usize, agreement: &[(f32, f32)], retired: bool) -> Self {
         Self::promoted_with_floor(k, agreement, retired, floor_env_enabled())
     }
 
     fn promoted_with_floor(
         k: usize,
-        agreement: Agreement,
+        agreement: &[(f32, f32)],
         retired: bool,
         floor_enabled: bool,
     ) -> Self {
-        Self {
-            agreement,
-            promoted_retired: retired,
-            ..Self::with_floor(k, floor_enabled)
-        }
+        Self::with_agreement(
+            k.min(LANE_MAX_DRAFTS),
+            agreement.to_vec(),
+            retired,
+            floor_enabled,
+        )
     }
 
     /// Most drafts a window of this lane may carry.
@@ -285,7 +304,7 @@ impl LaneSpecPolicy {
             return LaneRoute::ArSynced;
         }
         let k = budget.min(self.max_k);
-        let provisional = batched_depth(&self.agreement, k);
+        let provisional = self.floor.provisional_depth(&self.agreement, k);
         let batched = |depth: usize| match depth.min(k) {
             0 => LaneRoute::ArSynced,
             k_max => LaneRoute::Batched { k_max },
@@ -294,9 +313,9 @@ impl LaneSpecPolicy {
             return batched(provisional);
         }
         match self.floor.route(&self.agreement, k, provisional) {
-            FloorRoute::Ar => LaneRoute::ArRetired,
-            FloorRoute::Interleaved => LaneRoute::ArSynced,
-            FloorRoute::Batched(depth) => batched(depth),
+            Action::ArHeadFree => LaneRoute::ArRetired,
+            Action::ArSynced | Action::Interleaved => LaneRoute::ArSynced,
+            Action::Native(depth) => batched(depth),
         }
     }
 
@@ -326,12 +345,14 @@ impl LaneSpecPolicy {
         route
     }
 
-    /// A finished batched window of budget `k` priced at `units` AR rows.
-    pub(crate) fn observe_batched(&mut self, window: &MtpWindow, units: f32, k: usize) {
-        observe_agreement(&mut self.agreement, window, MTP_AGREEMENT_DECAY);
+    /// A finished batched window routed at `cap` drafts, of budget `k`,
+    /// priced at `units` AR rows.
+    pub(crate) fn observe_batched(&mut self, window: &MtpWindow, units: f32, cap: usize, k: usize) {
+        observe_agreement(&mut self.agreement, window, DEFAULT_DECAY);
         if self.floor_enabled {
+            let stats = WindowStats::of(window, cap);
             self.floor
-                .observe_native(NativeWindow::Batched, window, units, k, &self.agreement);
+                .observe_window(NativeWindow::Batched, stats, units, k, &self.agreement);
         }
     }
 
@@ -341,7 +362,7 @@ impl LaneSpecPolicy {
         if k == 0 {
             return;
         }
-        observe_agreement(&mut self.agreement, window, MTP_AGREEMENT_DECAY);
+        observe_agreement(&mut self.agreement, window, DEFAULT_DECAY);
         if self.floor_enabled {
             self.floor
                 .observe_native(NativeWindow::Interleaved, window, 1.0, k, &self.agreement);
@@ -367,9 +388,10 @@ pub(crate) struct PendingWindow {
     /// The drafts budget (clamped to the lane's `K`) the floor observes.
     pub budget: usize,
     /// The head ticket taken before the draft steps (`Batched`).
-    pub head_ticket: Option<MtpGpuStateSnapshot>,
-    /// The target ticket taken before the verify forward (`Batched`).
-    pub target_ticket: Option<Qwen4StateSnapshot>,
+    pub head_ticket: Option<HeadTicket>,
+    /// The target ticket taken before the verify forward (`Batched`). Lanes
+    /// run on one card: always [`TargetTicket::Local`].
+    pub target_ticket: Option<TargetTicket>,
     /// Set by the forward once the window is finished; consumed by commit.
     pub outcome: Option<MtpWindow>,
 }
@@ -382,7 +404,9 @@ pub(crate) struct PendingWindow {
 pub(crate) fn lane_call<R>(
     result: Result<Result<R, BundleError>, BundleError>,
 ) -> Result<R, String> {
-    result.and_then(|inner| inner).map_err(|error| error.to_string())
+    result
+        .and_then(|inner| inner)
+        .map_err(|error| error.to_string())
 }
 
 /// One lane's drafting state inside the step-synchronous loop.
@@ -483,7 +507,7 @@ pub(crate) fn draft_lanes(
         ))
         .map_err(|e| format!("draft_step: head snapshot of {epoch:?}: {e}"))?;
         if let Some(window) = spec.window.as_mut() {
-            window.head_ticket = Some(ticket);
+            window.head_ticket = Some(HeadTicket::Local(ticket));
         }
         drafting.push(Drafting {
             lane: index,
@@ -520,9 +544,7 @@ pub(crate) fn draft_lanes(
                 pending_hidden,
                 ..
             } = spec;
-            let top1 = store
-                .draft_top1
-                .sub_offset(slot * slot_bytes, slot_bytes);
+            let top1 = store.draft_top1.sub_offset(slot * slot_bytes, slot_bytes);
             let hidden = (j == 0).then_some(&*pending_hidden);
             let (input, position) = (st.input, st.position + j);
             lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
@@ -534,6 +556,8 @@ pub(crate) fn draft_lanes(
         let bytes = active.len() * slot_bytes;
         gpu.hip
             .memcpy_dtoh(&mut store.draft_top1_host[..bytes], &store.draft_top1.buf)
+            .map_err(|e| format!("draft_step: draft download: {e}"))?;
+        gpu.take_device_wait_error()
             .map_err(|e| format!("draft_step: draft download: {e}"))?;
         for (slot, &d) in active.iter().enumerate() {
             let top = &store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
@@ -662,7 +686,7 @@ pub(crate) fn finish_lane_window(
     let mut block = Vec::with_capacity(rows);
     block.push(window.seed);
     block.extend_from_slice(&drafts);
-    let (position, steps) = (window.position, window.steps);
+    let position = window.position;
     let verify_hidden = hidden.sub_offset(row_begin * wide, rows * wide);
     // Taken before `with_lane`: it names the forward scratch.
     let ple_normed = bundle
@@ -692,17 +716,17 @@ pub(crate) fn finish_lane_window(
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
         finish_native_window(
             b,
-            gpu,
+            &mut Qwen4Ops::Single(&mut *gpu),
             NativeFinish {
                 position,
                 block: &block,
-                steps,
                 acceptance: finish_acceptance,
                 target_snapshot,
                 mtp_ticket,
                 pending_hidden,
                 verify_hidden: &verify_hidden,
-                ple_normed: &ple_normed,
+                ple_normed: Some(&ple_normed),
+                retain: false,
             },
             None,
         )
@@ -713,8 +737,8 @@ pub(crate) fn finish_lane_window(
 }
 
 /// The head work of an `ArSynced` lane after its AR row: append the seed
-/// with the `DraftPairing` conditioning, then keep the AR row's wide hidden
-/// as the pending hidden. `dec_row` is the lane's row in `hidden`.
+/// with the previous position's target hidden, then keep the AR row's wide
+/// hidden as pending for the next head row. `dec_row` is the lane's row in `hidden`.
 pub(crate) fn ar_synced_head(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -756,12 +780,10 @@ pub(crate) fn ar_synced_head(
         ));
     }
     let row = hidden.sub_offset(dec_row * wide, wide);
-    let conditioning = match draft_pairing() {
-        DraftPairing::HeadState => None,
-        DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(&row),
-    };
+    // Fills use the same (token p, target hidden p - 1) pairing as drafting.
+    // Keep `pending_hidden` intact until the append has consumed it.
     lane_call(bundle.with_lane(state, Some((&mut *head, draft)), |b| {
-        b.mtp_append_token(gpu, seed, conditioning, position)
+        b.mtp_append_token(gpu, seed, Some(pending_hidden), position)
     }))
     .map_err(|e| format!("ar_synced_head: head append: {e}"))?;
     if head.position() != position + 1 {
@@ -804,17 +826,15 @@ pub(crate) fn prefill_tile(
         ));
     }
     let end = start + tokens.len();
-    let needs_pick = mtp_prefill_chunk_needs_pick(
-        end,
-        host.prompt.len(),
-        mtp_skip_intermediate_pick_enabled(),
-    );
+    let needs_pick =
+        mtp_prefill_chunk_needs_pick(end, host.prompt.len(), mtp_skip_intermediate_pick_enabled());
     // `mtp_prefill_chunk` applies batched fill / the DET prompt fill to the scratch.
     let reuse = mtp_reuse_prefill_ids_enabled();
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-        mtp_prefill_chunk(
+        b.poll_npu_trunk(gpu)?;
+        let filled = mtp_prefill_chunk(
             b,
-            gpu,
+            &mut Qwen4Ops::Single(&mut *gpu),
             tokens,
             start,
             needs_pick,
@@ -823,7 +843,11 @@ pub(crate) fn prefill_tile(
             reuse,
             &|| false,
         )
-        .map_err(BundleError::Forward)
+        .map_err(BundleError::Forward)?;
+        match filled {
+            std::ops::ControlFlow::Continue(pick) => Ok(pick),
+            std::ops::ControlFlow::Break(()) => unreachable!("a never-abort fill cannot break"),
+        }
     }))
     .map_err(|e| format!("prefill_tile: {e}"))
 }
@@ -831,6 +855,7 @@ pub(crate) fn prefill_tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_runtime::spec_economics::batched_depth;
 
     fn window(committed: usize, accepted: usize, drafts: usize) -> MtpWindow {
         MtpWindow {
@@ -884,7 +909,10 @@ mod tests {
         let model = LaneCostModel::new();
         let fit = fit_array(&model);
         for (got, want) in fit.iter().zip(COST_PRIOR_US) {
-            assert!((got - want).abs() < want * 1e-9, "{fit:?} vs {COST_PRIOR_US:?}");
+            assert!(
+                (got - want).abs() < want * 1e-9,
+                "{fit:?} vs {COST_PRIOR_US:?}"
+            );
         }
         // A window of d drafts costs 1 + (r d + G share) / (alpha(C) / C).
         let units = model.window_units(8, 3, 0.375);
@@ -919,7 +947,10 @@ mod tests {
             let err = (fit[i] / truth[i] - 1.0).abs();
             let prior_err = (COST_PRIOR_US[i] / truth[i] - 1.0).abs();
             assert!(err < 0.15, "param {i}: {fit:?} vs {truth:?}");
-            assert!(err < 0.6 * prior_err, "param {i} barely left the prior: {fit:?}");
+            assert!(
+                err < 0.6 * prior_err,
+                "param {i} barely left the prior: {fit:?}"
+            );
         }
         let wall_err = worst_wall_error(&model, truth, 400, 200);
         assert!(wall_err < 0.10, "held-out wall error {wall_err}");
@@ -938,7 +969,10 @@ mod tests {
         feed(&mut model, after, 400, 400);
         let to_after = worst_wall_error(&model, after, 800, 200);
         let to_before = worst_wall_error(&model, before, 800, 200);
-        assert!(to_after < 0.20, "wall error against the new truth {to_after}");
+        assert!(
+            to_after < 0.20,
+            "wall error against the new truth {to_after}"
+        );
         assert!(
             to_after < 0.5 * to_before,
             "fit still follows the old truth: {to_after} vs {to_before}"
@@ -1003,21 +1037,21 @@ mod tests {
 
     #[test]
     fn fresh_and_promoted_lanes_keep_the_short_agreement_decay() {
-        assert_eq!(MTP_AGREEMENT_DECAY, 0.875);
+        assert_eq!(DEFAULT_DECAY, 0.875);
         for floor_enabled in [false, true] {
-            let inherited = [(4.0, 5.0); MTP_MAX_DEPTH];
+            let inherited = [(4.0, 5.0); 63];
             for mut policy in [
                 LaneSpecPolicy::with_floor(3, floor_enabled),
-                LaneSpecPolicy::promoted_with_floor(3, inherited, false, floor_enabled),
+                LaneSpecPolicy::promoted_with_floor(3, &inherited, false, floor_enabled),
             ] {
                 let mut expected = policy.agreement[0];
-                policy.observe_batched(&window(1, 0, 1), 1.0, 3);
+                policy.observe_batched(&window(1, 0, 1), 1.0, 1, 3);
                 expected = (expected.0 * 0.875, expected.1 * 0.875 + 1.0);
                 assert_eq!(policy.agreement[0], expected);
                 policy.observe_ar_synced(&window(2, 1, 1), 3);
                 expected = (expected.0 * 0.875 + 1.0, expected.1 * 0.875 + 1.0);
                 assert_eq!(policy.agreement[0], expected);
-                let unchanged = policy.agreement;
+                let unchanged = policy.agreement.clone();
                 policy.observe_ar_synced(&window(2, 1, 1), 0);
                 assert_eq!(policy.agreement, unchanged);
             }
@@ -1031,10 +1065,13 @@ mod tests {
         let mut policy = LaneSpecPolicy::with_floor(1, true);
         policy.route(1, LabRoutes::Floor);
         for units in [3.0, 0.8, 2.05] {
-            policy.observe_batched(&window(2, 1, 1), units, 1);
+            policy.observe_batched(&window(2, 1, 1), units, 1, 1);
         }
         assert!(!policy.retired());
-        assert_eq!(policy.route(1, LabRoutes::Floor), LaneRoute::Batched { k_max: 1 });
+        assert_eq!(
+            policy.route(1, LabRoutes::Floor),
+            LaneRoute::Batched { k_max: 1 }
+        );
     }
 
     #[test]
@@ -1048,14 +1085,14 @@ mod tests {
     #[test]
     fn floor_off_routes_the_agreement_depth() {
         let mut policy = LaneSpecPolicy::with_floor(3, false);
-        let depth = batched_depth(&policy.agreement, 3);
+        let depth = batched_depth(&policy.agreement, 3, &MTP_WINDOW_COST);
         let want = match depth {
             0 => LaneRoute::ArSynced,
             d => LaneRoute::Batched { k_max: d },
         };
         assert_eq!(policy.route(3, LabRoutes::Floor), want);
         // A smaller budget caps the depth.
-        let capped = batched_depth(&policy.agreement, 1);
+        let capped = batched_depth(&policy.agreement, 1, &MTP_WINDOW_COST);
         let want = match capped {
             0 => LaneRoute::ArSynced,
             d => LaneRoute::Batched { k_max: d },
@@ -1063,7 +1100,7 @@ mod tests {
         assert_eq!(policy.route(1, LabRoutes::Floor), want);
         // Floor off never retires, whatever it observes.
         for _ in 0..8 {
-            policy.observe_batched(&window(1, 0, 1), 50.0, 3);
+            policy.observe_batched(&window(1, 0, 1), 50.0, 1, 3);
         }
         assert!(!policy.retired());
         assert_ne!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
@@ -1073,7 +1110,7 @@ mod tests {
     fn a_fresh_floor_probes_batched_then_retires_stickily() {
         let mut policy = LaneSpecPolicy::with_floor(3, true);
         let first = policy.route(3, LabRoutes::Floor);
-        let depth = batched_depth(&policy.agreement, 3);
+        let depth = batched_depth(&policy.agreement, 3, &MTP_WINDOW_COST);
         assert_eq!(
             first,
             match depth {
@@ -1083,12 +1120,12 @@ mod tests {
         );
         // Three probe windows far costlier than their emitted tokens.
         for _ in 0..3 {
-            policy.observe_batched(&window(1, 0, 1), 6.0, 3);
+            policy.observe_batched(&window(1, 0, 1), 6.0, 1, 3);
         }
         assert!(policy.retired());
         assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
         // Sticky: a later cheap window changes nothing, nor does budget 0.
-        policy.observe_batched(&window(4, 3, 3), 0.5, 3);
+        policy.observe_batched(&window(4, 3, 3), 0.5, 3, 3);
         assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
         assert_eq!(policy.route(0, LabRoutes::Floor), LaneRoute::ArRetired);
     }
@@ -1096,8 +1133,8 @@ mod tests {
     #[test]
     fn a_low_agreement_probe_routes_ar_synced() {
         let mut policy = LaneSpecPolicy::with_floor(3, true);
-        policy.agreement = [(0.0, 2.0); MTP_MAX_DEPTH];
-        assert_eq!(batched_depth(&policy.agreement, 3), 0);
+        policy.agreement.fill((0.0, 2.0));
+        assert_eq!(batched_depth(&policy.agreement, 3, &MTP_WINDOW_COST), 0);
         // The floor's probe budget routes the provisional depth: none is
         // interleaved, which a lane runs as one synced AR row.
         assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArSynced);
@@ -1110,19 +1147,15 @@ mod tests {
     #[test]
     fn a_promoted_retired_policy_stays_ar_retired_in_every_mode() {
         for floor_enabled in [true, false] {
-            let mut policy = LaneSpecPolicy::promoted_with_floor(
-                3,
-                [(0.9, 1.0); MTP_MAX_DEPTH],
-                true,
-                floor_enabled,
-            );
+            let mut policy =
+                LaneSpecPolicy::promoted_with_floor(3, &[(0.9, 1.0); 63], true, floor_enabled);
             assert!(policy.retired());
             for lab in [LabRoutes::Floor, LabRoutes::Batched, LabRoutes::Cycle] {
                 for budget in [0, 1, 3] {
                     assert_eq!(policy.route(budget, lab), LaneRoute::ArRetired);
                 }
             }
-            policy.observe_batched(&window(4, 3, 3), 0.5, 3);
+            policy.observe_batched(&window(4, 3, 3), 0.5, 3, 3);
             policy.observe_ar_synced(&window(1, 0, 0), 3);
             assert!(policy.retired());
             assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
@@ -1131,37 +1164,70 @@ mod tests {
 
     #[test]
     fn a_promoted_live_policy_routes_like_a_fresh_one_with_the_given_agreement() {
-        let low = [(0.0, 2.0); MTP_MAX_DEPTH];
-        let mut promoted = LaneSpecPolicy::promoted_with_floor(3, low, false, true);
+        let low = [(0.0, 2.0); 63];
+        let mut promoted = LaneSpecPolicy::promoted_with_floor(3, &low, false, true);
         assert!(!promoted.retired());
         assert_eq!(promoted.agreement, low);
-        assert_eq!(batched_depth(&promoted.agreement, 3), 0);
+        assert_eq!(batched_depth(&promoted.agreement, 3, &MTP_WINDOW_COST), 0);
         let mut fresh = LaneSpecPolicy::with_floor(3, true);
-        fresh.agreement = low;
+        fresh.agreement = low.to_vec();
         assert_eq!(
             promoted.route(3, LabRoutes::Floor),
             fresh.route(3, LabRoutes::Floor)
         );
         assert_eq!(promoted.route(0, LabRoutes::Floor), LaneRoute::ArSynced);
         // The floor starts fresh: it still retires on costly probe windows.
-        let mut probing = LaneSpecPolicy::promoted_with_floor(
-            3,
-            [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH],
-            false,
-            true,
-        );
+        let mut probing =
+            LaneSpecPolicy::promoted_with_floor(3, &[AGREEMENT_PRIOR; 63], false, true);
         assert_ne!(probing.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
         for _ in 0..3 {
-            probing.observe_batched(&window(1, 0, 1), 6.0, 3);
+            probing.observe_batched(&window(1, 0, 1), 6.0, 1, 3);
         }
         assert!(probing.retired());
         assert_eq!(probing.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
         // Lab modes still bypass the floor on a live promoted lane.
-        let mut lab = LaneSpecPolicy::promoted_with_floor(3, low, false, true);
+        let mut lab = LaneSpecPolicy::promoted_with_floor(3, &low, false, true);
         assert_eq!(
             lab.route(2, LabRoutes::Batched),
             LaneRoute::Batched { k_max: 2 }
         );
+    }
+
+    #[test]
+    fn agreement_history_does_not_widen_the_physical_lane_capacity() {
+        for k in [0, 1, 4, LANE_MAX_DRAFTS, usize::MAX] {
+            let mut fresh = LaneSpecPolicy::with_floor(k, false);
+            let max_k = k.min(LANE_MAX_DRAFTS);
+            assert_eq!(fresh.max_k(), max_k);
+            assert_eq!(fresh.agreement, vec![AGREEMENT_PRIOR; max_k]);
+            let want = if max_k == 0 {
+                LaneRoute::ArSynced
+            } else {
+                LaneRoute::Batched { k_max: max_k }
+            };
+            assert_eq!(fresh.route(usize::MAX, LabRoutes::Batched), want);
+        }
+
+        let mut inherited: Vec<_> = (0..63).map(|i| (i as f32, i as f32 + 1.0)).collect();
+        let mut promoted = LaneSpecPolicy::promoted_with_floor(usize::MAX, &inherited, false, true);
+        assert_eq!(promoted.agreement, inherited);
+        assert_eq!(promoted.max_k(), LANE_MAX_DRAFTS);
+        inherited[62] = (0.0, 0.0);
+        assert_eq!(promoted.agreement[62], (62.0, 63.0));
+        let storage = promoted.agreement.as_ptr();
+        let capacity = promoted.agreement.capacity();
+        assert_eq!(
+            promoted.route(usize::MAX, LabRoutes::Batched),
+            LaneRoute::Batched {
+                k_max: LANE_MAX_DRAFTS
+            }
+        );
+        promoted.observe_batched(&window(2, 1, 1), 1.0, 1, LANE_MAX_DRAFTS);
+        promoted.observe_ar_synced(&window(2, 1, 1), LANE_MAX_DRAFTS);
+        assert_eq!(promoted.agreement.len(), 63);
+        assert_ne!(promoted.agreement[62], (62.0, 63.0));
+        assert_eq!(promoted.agreement.as_ptr(), storage);
+        assert_eq!(promoted.agreement.capacity(), capacity);
     }
 
     #[test]

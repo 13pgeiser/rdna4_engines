@@ -755,6 +755,11 @@ pub struct EffortCapability {
     /// semantic effort with a warning (never reinterpret as a budget) and
     /// require an explicit cap if a limit is desired.
     pub native: bool,
+    /// Full baseline render error when the template cannot render at all
+    /// (effort undefined). `None` whenever the baseline render succeeds, even
+    /// if the template ignores effort (`native == false`): a render failure
+    /// and an effort-ignoring template are different diagnoses.
+    pub probe_error: Option<String>,
 }
 
 impl EffortCapability {
@@ -829,10 +834,11 @@ pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortC
     // than misattributing the failure to the dial.
     let baseline = match probe(None) {
         Ok(b) => b,
-        Err(_) => {
+        Err(e) => {
             return EffortCapability {
                 supported: Vec::new(),
                 native: false,
+                probe_error: Some(e),
             }
         }
     };
@@ -846,7 +852,11 @@ pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortC
             supported.push(rung);
         }
     }
-    EffortCapability { supported, native }
+    EffortCapability {
+        supported,
+        native,
+        probe_error: None,
+    }
 }
 
 /// Multi-turn message representation for `JinjaChatFrame::render_messages`.
@@ -1306,6 +1316,22 @@ impl<'a> JinjaChatFrame<'a> {
         tools: Option<&[serde_json::Value]>,
         tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<String, String> {
+        let messages = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .collect();
+        self.render_message_values(messages, tools, tool_call_kwargs)
+    }
+
+    /// [`Self::render_messages`] over already-serialized messages, for an
+    /// architecture whose template reads a message shape [`Message`] does not
+    /// serialize to (Gemma 4 reads OpenAI `tool_calls[].function`).
+    pub fn render_message_values(
+        &self,
+        mut messages: Vec<serde_json::Value>,
+        tools: Option<&[serde_json::Value]>,
+        tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String, String> {
         use minijinja::{Environment, Error, ErrorKind, Value};
         use minijinja_contrib::pycompat::unknown_method_callback;
 
@@ -1399,11 +1425,7 @@ impl<'a> JinjaChatFrame<'a> {
         // message is patched, and only when it is a system turn — every other
         // template / model serializes through unchanged.
         let messages_val = {
-            let mut arr: Vec<serde_json::Value> = messages
-                .iter()
-                .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
-                .collect();
-            if let Some(serde_json::Value::Object(map)) = arr.first_mut() {
+            if let Some(serde_json::Value::Object(map)) = messages.first_mut() {
                 let is_system = matches!(
                     map.get("role"),
                     Some(serde_json::Value::String(r)) if r == "system"
@@ -1423,7 +1445,7 @@ impl<'a> JinjaChatFrame<'a> {
                         .or_insert_with(|| serde_json::Value::String(String::new()));
                 }
             }
-            Value::from_serialize(&arr)
+            Value::from_serialize(&messages)
         };
         let reasoning_strength_val = match self.reasoning_strength {
             Some(s) => Value::from_serialize(s),
@@ -1742,7 +1764,8 @@ pub fn build_cached_history_jinja_with(
             // Observed: a 4-turn coding session hit the key on turn 2 yet fell back to the
             // plain render, and the retokenized reasoning diverged 74 tokens into the
             // assistant turn (`lcp=173` against `prior_len=371`), collapsing the cache.
-            // `reasoning` still needs the check below because it is NOT part of the key.
+            // Keep the reasoning check below as defense in depth: callers may use
+            // a reasoning-aware key or the unambiguous content-only recovery path.
         } else {
             // Tool turn: counts must match
             if turn.tools.len() != m.tool_calls.len() {
@@ -3997,6 +4020,7 @@ SYS:{{ build_system_message(system_message) }}:END
             "high/max must be rejected by the model, not by a hipfire table"
         );
         assert!(cap.native, "the template varies on effort, so it is native");
+        assert_eq!(cap.probe_error, None);
     }
 
     #[test]
@@ -4012,7 +4036,40 @@ SYS:{{ build_system_message(system_message) }}:END
         let cap = probe_effort_capability(&t, IGNORES);
         assert_eq!(cap.supported.len(), 5, "a permissive template accepts all");
         assert!(!cap.native, "invariant output means not effort-native");
+        assert_eq!(
+            cap.probe_error, None,
+            "ignoring effort is distinct from a render failure"
+        );
         assert_eq!(cap.project("low"), None, "not native => no projection");
+    }
+
+    // Byte-exact `tokenizer_config.chat_template` shipped inside the registry
+    // `qwen3.8:27b-mq6` artifact (hipfire-models/qwen3.8-27b, file
+    // qwen3.8-27b.mq6, 21750254592 B, HFQ arch 5). Read from the HFQ metadata
+    // JSON via HTTP Range; file offset 14310342, 8952 UTF-8 bytes,
+    // sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041.
+    // Byte-identical to the template in local mq4r / mq4-pro / mq4-xt.asym.
+    const QWEN38_27B_MQ6_REAL: &str =
+        include_str!("../templates/eval/qwen38-27b-mq6-official.jinja");
+
+    #[test]
+    fn real_qwen38_27b_mq6_template_probes_native_low_medium_xhigh() {
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_27B_MQ6_REAL);
+        assert_eq!(
+            cap.supported,
+            vec!["low", "medium", "xhigh"],
+            "shipped template raises on high/max and accepts low/medium/xhigh"
+        );
+        assert!(cap.native, "shipped template varies on reasoning_effort");
+        assert_eq!(
+            cap.probe_error, None,
+            "real shipped template must render the baseline without error"
+        );
+        assert_eq!(cap.project("high"), Some("xhigh"));
+        assert_eq!(cap.project("max"), Some("xhigh"));
+        assert_eq!(cap.project("low"), Some("low"));
+        assert_eq!(cap.project("medium"), Some("medium"));
     }
 
     #[test]
@@ -4173,6 +4230,14 @@ SYS:{{ build_system_message(system_message) }}:END
         let t = make_tokenizer();
         let cap = probe_effort_capability(&t, BROKEN);
         assert!(!cap.native, "broken baseline must be non-native");
+        let err = cap
+            .probe_error
+            .as_deref()
+            .expect("baseline render failure must surface its error");
+        assert!(
+            err.contains("template broken"),
+            "probe_error must carry the full render error, got {err:?}"
+        );
         assert!(
             cap.supported.is_empty(),
             "broken baseline must have no rungs"
@@ -4194,6 +4259,10 @@ SYS:{{ build_system_message(system_message) }}:END
         let t = make_tokenizer();
         let cap = probe_effort_capability(&t, IGNORES_EFFORT);
         assert!(!cap.native, "ignoring template must be non-native");
+        assert_eq!(
+            cap.probe_error, None,
+            "successful non-native render is not a probe failure"
+        );
         for rung in EFFORT_RUNGS {
             assert_eq!(
                 cap.project(rung),

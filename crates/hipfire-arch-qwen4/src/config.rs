@@ -33,6 +33,8 @@ pub const TEXT_MODEL_TYPE: &str = "qwen4_exp_text";
 pub const ARCHITECTURE_NAME: &str = "Qwen4ExpForConditionalGeneration";
 /// Stable profile id of the pinned Qwen3.8-Flash-Next checkpoint.
 pub const FLASH_NEXT_PROFILE_ID: &str = "qwen3.8-flash-next";
+/// Stable profile id of the AR-only Flash-Next profile ([`Qwen4Profile::FlashNextArOnly`]).
+pub const FLASH_NEXT_AR_ONLY_PROFILE_ID: &str = "qwen3.8-flash-next-ar";
 /// Top-level JSON key of the explicit developer-profile marker.
 pub const PROFILE_KEY: &str = "hipfire_profile";
 /// Spelling current Transformers normalizes `full_attention` to.  It is an
@@ -242,6 +244,14 @@ pub struct Qwen4SyntheticProfile {
 pub enum Qwen4Profile {
     /// The pinned Qwen3.8-Flash-Next checkpoint (exact production pins).
     FlashNext,
+    /// The pinned Flash-Next geometry without the native MTP head: the
+    /// artifact carries no `mtp.*` tensors (the stock-FP8 recipe ships the
+    /// MTP experts as BF16 source and omits the head).  Never parsed from a
+    /// config: an artifact's recipe selects it through
+    /// [`Qwen4Config::into_ar_only`], so `config.mtp` is `None` and every MTP
+    /// entry point sees a head-free profile instead of a config that claims a
+    /// head the artifact does not carry.
+    FlashNextArOnly,
     /// Developer-only synthetic geometry with pinned HC/GDN/QSA equations.
     Synthetic(Qwen4SyntheticProfile),
 }
@@ -250,12 +260,19 @@ impl Qwen4Profile {
     pub fn id(&self) -> &str {
         match self {
             Self::FlashNext => FLASH_NEXT_PROFILE_ID,
+            Self::FlashNextArOnly => FLASH_NEXT_AR_ONLY_PROFILE_ID,
             Self::Synthetic(profile) => &profile.id,
         }
     }
 
+    /// The pinned Flash-Next geometry, with or without the MTP head.
     pub const fn is_flash_next(&self) -> bool {
-        matches!(self, Self::FlashNext)
+        matches!(self, Self::FlashNext | Self::FlashNextArOnly)
+    }
+
+    /// Flash-Next geometry admitted without the native MTP head.
+    pub const fn is_ar_only(&self) -> bool {
+        matches!(self, Self::FlashNextArOnly)
     }
 
     pub const fn is_synthetic(&self) -> bool {
@@ -269,7 +286,7 @@ impl Qwen4Profile {
 
     pub const fn equation_source(&self) -> Qwen4EquationSource {
         match self {
-            Self::FlashNext => Qwen4EquationSource::PinnedUpstream,
+            Self::FlashNext | Self::FlashNextArOnly => Qwen4EquationSource::PinnedUpstream,
             Self::Synthetic(profile) => profile.equation_source,
         }
     }
@@ -314,9 +331,10 @@ impl Qwen4FfnConfig {
     /// Dense intermediate width, or the routed-expert intermediate width.
     pub const fn intermediate_size(&self) -> usize {
         match self {
-            Self::Dense { intermediate_size } | Self::Moe { intermediate_size, .. } => {
-                *intermediate_size
-            }
+            Self::Dense { intermediate_size }
+            | Self::Moe {
+                intermediate_size, ..
+            } => *intermediate_size,
         }
     }
 
@@ -488,8 +506,18 @@ impl Qwen4PleConfig {
 
     /// The pinned Flash-Next PLE geometry.
     pub fn flash_next() -> Self {
-        Self::new(&[2], 2560, 4, 128, 8, 3, 20_000_000, 128, Some(PLE_VALID_ROWS))
-            .expect("pinned Flash-Next PLE geometry must satisfy its invariants")
+        Self::new(
+            &[2],
+            2560,
+            4,
+            128,
+            8,
+            3,
+            20_000_000,
+            128,
+            Some(PLE_VALID_ROWS),
+        )
+        .expect("pinned Flash-Next PLE geometry must satisfy its invariants")
     }
 
     /// Dilation of the PLE short convolution: upstream spaces its taps one
@@ -565,10 +593,7 @@ impl Qwen4PleConfig {
 
 /// Which parser surface is reading the config.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(any(test, feature = "qwen4-dev-profiles")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(test, feature = "qwen4-dev-profiles")), allow(dead_code))]
 enum ParseMode {
     /// Production: any developer marker is refused.
     Production,
@@ -641,6 +666,8 @@ pub struct Qwen4Config {
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
     pub norm_topk_prob: bool,
+    /// Optional original-id routed-expert membership, validated against this geometry.
+    pub expert_keep: Option<crate::ExpertKeep>,
     pub output_gate_type: String,
 
     // Hyper-connections.
@@ -676,6 +703,16 @@ pub struct Qwen4Config {
 }
 
 impl Qwen4Config {
+    /// Payload slots are compact; router and pointer-table ids stay original.
+    pub(crate) fn kept_expert_ids(&self, layer: usize, mtp: bool) -> Option<&[u16]> {
+        self.expert_keep.as_ref().and_then(|keep| {
+            if mtp {
+                keep.mtp_kept()
+            } else {
+                Some(keep.kept(layer))
+            }
+        })
+    }
     /// Parse an offline source/quantizer JSON input.
     ///
     /// This deliberately accepts either the HF metadata envelope or a raw
@@ -978,6 +1015,7 @@ impl Qwen4Config {
             moe_intermediate_size,
             shared_expert_intermediate_size: shared,
             norm_topk_prob,
+            expert_keep: crate::ExpertKeep::from_metadata(value)?,
             output_gate_type: optional_string(text, "output_gate_type")
                 .unwrap_or_else(|| "sigmoid".into()),
             hc_count: required_usize(text, "hc_count")?,
@@ -1014,11 +1052,70 @@ impl Qwen4Config {
         expect_str(&self.model_type, MODEL_TYPE, "model_type")?;
         expect_str(&self.text_model_type, TEXT_MODEL_TYPE, "text_model_type")?;
         expect_eq(self.dtype, SourceDType::BF16, "dtype")?;
+        if let Some(keep) = &self.expert_keep {
+            expect(keep.n_experts(), self.num_experts, "expert_keep.n_experts")?;
+            expect(
+                keep.n_layers(),
+                self.num_hidden_layers,
+                "expert_keep.layers",
+            )?;
+            // The masked router kernel is compiled for exactly 512 experts and top-10.
+            if self.num_experts != 512 || self.num_experts_per_tok != 10 {
+                return Err(format!(
+                    "qwen4: expert_keep requires num_experts=512 and num_experts_per_tok=10 (got {} and {})",
+                    self.num_experts, self.num_experts_per_tok
+                ));
+            }
+            if !self.norm_topk_prob {
+                return Err("qwen4: expert_keep requires norm_topk_prob=true".into());
+            }
+            for layer in 0..keep.n_layers() {
+                if keep.kept(layer).len() < self.num_experts_per_tok {
+                    return Err(format!(
+                        "qwen4: expert_keep layer {layer} has fewer than top_k experts"
+                    ));
+                }
+            }
+            if keep
+                .mtp_kept()
+                .is_some_and(|row| row.len() < self.num_experts_per_tok)
+            {
+                return Err("qwen4: expert_keep MTP has fewer than top_k experts".into());
+            }
+        }
         match &self.profile {
-            Qwen4Profile::FlashNext => self.validate_flash_next()?,
+            Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
+                self.validate_flash_next()?
+            }
             Qwen4Profile::Synthetic(profile) => self.validate_synthetic(profile)?,
         }
         self.validate_typed_agreement()
+    }
+
+    /// The AR-only form of a validated Flash-Next config: the
+    /// [`Qwen4Profile::FlashNextArOnly`] profile with no MTP head (`mtp` and
+    /// its scalar mirrors cleared).  Selected by an artifact recipe that omits
+    /// the head (`Qwen4TierRecipe::StockFp8`), never by config contents, so a
+    /// head-free artifact is admitted as head-free instead of under a config
+    /// that names a head nothing loads.  Only Flash-Next converts.
+    pub fn into_ar_only(mut self) -> Result<Self, String> {
+        match self.profile {
+            Qwen4Profile::FlashNext => {}
+            Qwen4Profile::FlashNextArOnly => return Ok(self),
+            Qwen4Profile::Synthetic(_) => {
+                return Err(format!(
+                    "qwen4: profile {} has no AR-only form (only Flash-Next does)",
+                    self.profile.id()
+                ))
+            }
+        }
+        self.validate()?;
+        self.profile = Qwen4Profile::FlashNextArOnly;
+        self.mtp = None;
+        self.mtp_num_hidden_layers = 0;
+        self.mtp_use_dedicated_embeddings = false;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Exact pinned Qwen3.8-Flash-Next geometry.
@@ -1092,7 +1189,14 @@ impl Qwen4Config {
             ));
         }
         expect(self.tie_word_embeddings, false, "tie_word_embeddings")?;
-        expect(self.mtp_num_hidden_layers, 1, "mtp_num_hidden_layers")?;
+        // The AR-only profile carries no head, so its scalar mirror is 0
+        // ("0 when the head is absent"); the checkpoint profile pins one layer.
+        let mtp_layers = if self.profile.is_ar_only() { 0 } else { 1 };
+        expect(
+            self.mtp_num_hidden_layers,
+            mtp_layers,
+            "mtp_num_hidden_layers",
+        )?;
         expect(
             self.mtp_use_dedicated_embeddings,
             false,
@@ -1134,6 +1238,12 @@ impl Qwen4Config {
         }
         if self.ple.as_ref() != Some(&Qwen4PleConfig::flash_next()) {
             return Err("qwen4: typed ple is not the pinned Flash-Next PLE".into());
+        }
+        if self.profile.is_ar_only() {
+            return match self.mtp {
+                None => Ok(()),
+                Some(_) => Err("qwen4: the AR-only Flash-Next profile carries no MTP head".into()),
+            };
         }
         self.mtp
             .as_ref()
@@ -1269,12 +1379,7 @@ impl Qwen4Config {
             MAX_INDEXER_DIM,
             "indexer_head_dim",
         )?;
-        bounded(
-            self.indexer_budget,
-            1,
-            MAX_INDEXER_BUDGET,
-            "indexer_budget",
-        )?;
+        bounded(self.indexer_budget, 1, MAX_INDEXER_BUDGET, "indexer_budget")?;
         bounded(
             self.indexer_compress_ratio,
             1,
@@ -1459,9 +1564,7 @@ impl Qwen4Config {
         match layer_elements {
             Some(elements) if elements <= MAX_ELEMENTS => {}
             _ => {
-                return Err(
-                    "qwen4: FFN weight element count overflows the developer bound".into(),
-                )
+                return Err("qwen4: FFN weight element count overflows the developer bound".into())
             }
         }
         Ok(())
@@ -1593,13 +1696,17 @@ impl Qwen4Config {
 
     /// The full-attention rotary embedding (the MTP head shares it).
     pub fn rope(&self) -> rdna_compute::rope::Rope {
-        rdna_compute::rope::Rope { theta: self.rope_theta, scaling: self.rope_scaling }
+        rdna_compute::rope::Rope {
+            theta: self.rope_theta,
+            scaling: self.rope_scaling,
+        }
     }
 
     /// Positions the RoPE covers: `max_position_embeddings`, or the YaRN
     /// `factor x original` context.
     pub fn context_limit(&self) -> usize {
-        self.rope_scaling.context_limit(self.max_position_embeddings)
+        self.rope_scaling
+            .context_limit(self.max_position_embeddings)
     }
 
     /// Number of values in each sharded n-gram row (0 without PLE).
@@ -1627,8 +1734,10 @@ impl Qwen4Config {
     }
 
     /// Bytes of one QSA layer's context-sized storage, including its
-    /// optional derived F16 arena (four-token-rounded capacity). The MTP
-    /// head passes its plain F32 format and never owns the derived arena.
+    /// optional derived F16 arena (four-token-rounded capacity) and pooled
+    /// BF16 mirror (`ceil(max_seq / compress)` blocks of `index_dim` BF16
+    /// channels). The MTP head passes its plain F32 format and never owns a
+    /// derived arena.
     pub fn qsa_context_arena_bytes(
         &self,
         max_seq: usize,
@@ -1643,8 +1752,11 @@ impl Qwen4Config {
         max_seq
             .checked_mul(kv_row.checked_mul(2)?.checked_add(index_row)?)?
             .checked_add(pooled_rows.checked_mul(index_row)?)?
+            .checked_add(pooled_rows.checked_mul(layout.pooled_bf16_bytes_per_block(raw))?)?
             .checked_add(if layout.f16_arena {
-                max_seq.div_ceil(4).checked_mul(4)?
+                max_seq
+                    .div_ceil(4)
+                    .checked_mul(4)?
                     .checked_mul(self.num_key_value_heads)?
                     .checked_mul(self.head_dim)?
                     .checked_mul(4)?
@@ -2202,9 +2314,11 @@ fn validate_profile_id(id: &str) -> Result<(), String> {
             "qwen4: profile id {id:?} must be 1..={MAX_PROFILE_ID_LEN} characters of [A-Za-z0-9._-]"
         ));
     }
-    if id.eq_ignore_ascii_case(FLASH_NEXT_PROFILE_ID) {
+    if id.eq_ignore_ascii_case(FLASH_NEXT_PROFILE_ID)
+        || id.eq_ignore_ascii_case(FLASH_NEXT_AR_ONLY_PROFILE_ID)
+    {
         return Err(format!(
-            "qwen4: profile id {id:?} is reserved for the pinned Flash-Next profile"
+            "qwen4: profile id {id:?} is reserved for the pinned Flash-Next profiles"
         ));
     }
     Ok(())
@@ -2534,7 +2648,9 @@ fn parse_trunk_iu4_default(
         .as_str()
         .ok_or_else(|| format!("qwen4: `{TRUNK_IU4_DEFAULT_KEY}` must be a string"))?;
     let default = TrunkIu4Default::from_marker(marker).ok_or_else(|| {
-        format!("qwen4: `{TRUNK_IU4_DEFAULT_KEY}` {marker:?} is not a trunk default this build knows")
+        format!(
+            "qwen4: `{TRUNK_IU4_DEFAULT_KEY}` {marker:?} is not a trunk default this build knows"
+        )
     })?;
     if !matches!(profile, Qwen4Profile::FlashNext) {
         return Err(format!(
@@ -2637,6 +2753,109 @@ fn expect_float(actual: f64, wanted: f64, field: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn expert_keep_admission_ragged_and_refusals() {
+        let mut metadata = fixture();
+        let layers: Vec<Vec<u16>> = (0..48)
+            .map(|l| (0..(16 + l * 496 / 47) as u16).collect())
+            .collect();
+        let keep = crate::ExpertKeep::new(512, layers, None, 10).unwrap();
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] = keep.to_metadata_value();
+        let cfg = Qwen4Config::from_nested_value(&metadata).unwrap();
+        assert_eq!(cfg.num_experts, 512);
+        assert_eq!(cfg.expert_keep, Some(keep));
+        let manifest = crate::weights::Qwen4Manifest::build(&cfg).unwrap();
+        assert!(manifest
+            .clone()
+            .with_expert_parallel(crate::weights::Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .unwrap_err()
+            .to_string()
+            .contains("expert_keep"));
+        assert!(manifest
+            .check_expert_tiers()
+            .unwrap_err()
+            .to_string()
+            .contains("expert_keep"));
+        let gate_up = manifest
+            .weights
+            .iter()
+            .find(|entry| entry.name == "model.language_model.layers.0.mlp.experts.gate_up_proj")
+            .unwrap();
+        assert_eq!(gate_up.logical_shape[0], 16);
+        let last = manifest
+            .weights
+            .iter()
+            .find(|entry| entry.name == "model.language_model.layers.47.mlp.experts.gate_up_proj")
+            .unwrap();
+        assert_eq!(last.logical_shape[0], 512);
+        let mut short = vec![(0..16).collect(); 48];
+        short[4] = (0..9).collect();
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] = crate::ExpertKeep::new(512, short, None, 1)
+            .unwrap()
+            .to_metadata_value();
+        assert!(Qwen4Config::from_nested_value(&metadata)
+            .unwrap_err()
+            .contains("top_k"));
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] =
+            crate::ExpertKeep::new(512, vec![(0..16).collect(); 47], None, 10)
+                .unwrap()
+                .to_metadata_value();
+        assert!(Qwen4Config::from_nested_value(&metadata)
+            .unwrap_err()
+            .contains("expert_keep.layers"));
+    }
+
+    #[test]
+    fn expert_keep_requires_fixed_e512_top10_geometry() {
+        let mut metadata = synthetic();
+        let keep = crate::ExpertKeep::new(4, vec![vec![0, 1, 2]; 2], None, 2).unwrap();
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] = keep.to_metadata_value();
+        let error = dev(&metadata).unwrap_err();
+        assert!(error.contains("num_experts=512"), "{error}");
+        // Without keep metadata the same synthetic geometry stays admitted.
+        dev(&synthetic()).expect("dense synthetic is unaffected");
+    }
+
+    /// The AR-only profile is derived, never parsed: Flash-Next converts (the
+    /// MTP head and its scalar mirrors cleared, geometry unchanged), it
+    /// validates only head-free, its id is reserved, and a synthetic profile
+    /// has no AR-only form.
+    #[test]
+    fn ar_only_profile_is_flash_next_without_mtp() {
+        let flash = compact_test_config();
+        let ar = flash
+            .clone()
+            .into_ar_only()
+            .expect("Flash-Next has an AR-only form");
+        assert_eq!(ar.profile, Qwen4Profile::FlashNextArOnly);
+        assert_eq!(ar.profile.id(), FLASH_NEXT_AR_ONLY_PROFILE_ID);
+        assert!(ar.profile.is_flash_next() && ar.profile.is_ar_only());
+        assert!(!ar.profile.developer_only());
+        assert!(ar.mtp.is_none());
+        assert_eq!(ar.mtp_num_hidden_layers, 0);
+        assert_eq!(
+            (ar.hidden_size, ar.num_experts),
+            (flash.hidden_size, flash.num_experts)
+        );
+        assert_eq!(ar.ple, flash.ple);
+        ar.validate().expect("AR-only validates");
+        assert_eq!(ar.clone().into_ar_only().unwrap(), ar);
+        // A head bolted back on (or the mirror alone) is refused.
+        let mut headed = ar.clone();
+        headed.mtp = flash.mtp.clone();
+        headed.mtp_num_hidden_layers = 1;
+        assert!(headed.validate().is_err());
+        let mut mirror = ar.clone();
+        mirror.mtp_num_hidden_layers = 1;
+        assert!(mirror.validate().is_err());
+        // The checkpoint profile still requires its head.
+        let mut headless = flash.clone();
+        headless.mtp = None;
+        headless.mtp_num_hidden_layers = 0;
+        assert!(headless.validate().is_err());
+        assert!(validate_profile_id(FLASH_NEXT_AR_ONLY_PROFILE_ID).is_err());
+    }
 
     fn fixture() -> Value {
         let layers: Vec<_> = (0..48)
@@ -2856,9 +3075,19 @@ mod tests {
         let key = TRUNK_IU4_DEFAULT_KEY;
         assert_eq!(key, "qwen4_trunk_iu4_default");
         // Unmarked artifacts (wrapped or raw) carry no default.
-        assert_eq!(Qwen4Config::from_nested_value(&fixture()).unwrap().trunk_iu4_default, None);
+        assert_eq!(
+            Qwen4Config::from_nested_value(&fixture())
+                .unwrap()
+                .trunk_iu4_default,
+            None
+        );
         let wrapped = json!({"config": fixture()});
-        assert_eq!(Qwen4Config::from_nested_value(&wrapped).unwrap().trunk_iu4_default, None);
+        assert_eq!(
+            Qwen4Config::from_nested_value(&wrapped)
+                .unwrap()
+                .trunk_iu4_default,
+            None
+        );
 
         // The marker rides at the root of the envelope, wrapped or raw.
         let mut marked_wrapped = json!({"config": fixture()});
@@ -2880,7 +3109,12 @@ mod tests {
         // A marker inside the inner config is not the envelope marker.
         let mut inner = json!({"config": fixture()});
         inner["config"][key] = json!("gfx1151-zab-v1");
-        assert_eq!(Qwen4Config::from_nested_value(&inner).unwrap().trunk_iu4_default, None);
+        assert_eq!(
+            Qwen4Config::from_nested_value(&inner)
+                .unwrap()
+                .trunk_iu4_default,
+            None
+        );
     }
 
     #[test]
@@ -2943,8 +3177,14 @@ mod tests {
         // artifact, any other value keeps the existing grammar.
         assert!(resolve(Some("0"), "gfx1151", &marked).mask.is_empty());
         assert!(resolve(Some(""), "gfx1151", &marked).mask.is_empty());
-        assert_eq!(resolve(Some("gdn.qkv"), "gfx1151", &marked).mask.bits(5), TrunkFamily::GdnQkv.bit());
-        assert_eq!(resolve(Some("1"), "gfx1151", &stock).mask.bits(5), rdna_compute::TRUNK_ALL_BITS);
+        assert_eq!(
+            resolve(Some("gdn.qkv"), "gfx1151", &marked).mask.bits(5),
+            TrunkFamily::GdnQkv.bit()
+        );
+        assert_eq!(
+            resolve(Some("1"), "gfx1151", &stock).mask.bits(5),
+            rdna_compute::TRUNK_ALL_BITS
+        );
         // A marked mask names layers the 48-layer trunk has.
         assert!(on.mask.check_layers(marked.num_hidden_layers).is_ok());
     }
@@ -3778,9 +4018,7 @@ mod tests {
             .unwrap_err()
             .contains("overflows"));
         // Explicit row counts must match the derived primes.
-        assert!(
-            Qwen4PleConfig::new(&[1], 16, 2, 1, 1, 3, 7, 8, Some(18)).is_ok()
-        );
+        assert!(Qwen4PleConfig::new(&[1], 16, 2, 1, 1, 3, 7, 8, Some(18)).is_ok());
         assert!(Qwen4PleConfig::new(&[1], 16, 2, 1, 1, 3, 7, 8, Some(17))
             .unwrap_err()
             .contains("disagrees"));

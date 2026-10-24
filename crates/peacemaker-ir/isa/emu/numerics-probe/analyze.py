@@ -5,6 +5,9 @@
   analyze.py <receipt-dir> dot   [--jobs N]
   analyze.py <receipt-dir> wmma  [--jobs N]      (v_wmma_f32/bf16/f16 *16x16x16*, iu8)
   analyze.py <receipt-dir> swmmac
+  analyze.py <receipt-dir> div_scale   (suite div_scale: v_div_scale_f32 against the exponent-field chain)
+  analyze.py <receipt-dir> scalar_udiv (suite scalar_udiv: s_cvt_f32_u32 / v_s_rcp_f32 / s_mul_f32 / s_cvt_u32_f32)
+  analyze.py <receipt-dir> maxmin      (suite maxmin: v_maxmin_num_f32 / v_minmax_num_f32 against the num_select composition)
 
 Each command prints a concise report and writes <receipt-dir>/analysis/<command>.json. The analysis never edits the
 receipts. Models are the scalar references in models.py; a mismatch count of 0 over the stated number of words is the
@@ -510,15 +513,168 @@ def cmd_wmma(r, args):
 def cmd_swmmac(r, args):
     raise SystemExit("swmmac analysis: see analyze_swmmac.py (written after the discovery data was read)")
 
+# ------------------------------------------------------------------ v_div_scale_f32 / scalar udiv chain
+INF_BITS, SIGN_BITS, QUIET_BITS = 0x7F800000, 0x80000000, 0x00400000
+
+
+def _ldexp64(x):
+    """x * 2^64 on raw f32 bits (NaN/inf untouched; overflow to inf; a denormal source normalises exactly)."""
+    e = (x >> 23) & 255
+    v = x.view(np.float32).astype(np.float64) * 2.0**64
+    out = v.astype(np.float32).view(np.uint32)
+    return np.where(e == 255, x, out)
+
+
+def _ldexp_m64(x):
+    v = x.view(np.float32).astype(np.float64) * 2.0**-64
+    out = v.astype(np.float32).view(np.uint32)
+    return np.where(((x >> 23) & 255) == 255, x, out)
+
+
+def div_scale_chain(s0, s1, s2, open_down_field=False, e2_threshold=23, e1_down=254):
+    """Vectorised port of emu/alu.rs::div_scale_chain with every 'open' domain decided by the natural fall-through
+    (the hypothesis the hardware receipt then confirms or refutes). Returns (D bits, VCC flag).
+    open_down_field: S0 * 2^-64 as raw exponent-field subtraction instead of the exact product (differs only for
+    exponent field 64, where the exact product is a denormal)."""
+    s0, s1, s2 = (np.asarray(a, dtype=np.uint32) for a in (s0, s1, s2))
+    e0, e1, e2 = (((a >> 23) & 255).astype(np.int32) for a in (s0, s1, s2))
+    d = e2 - e1
+    flag = (d >= 96) | (d <= -96)
+    z1, z2 = (s1 & 0x7FFFFFFF) == 0, (s2 & 0x7FFFFFFF) == 0
+    up0 = _ldexp64(s0)
+    zero0 = (s0 & 0x7FFFFFFF) == 0
+    if open_down_field:
+        sub = (s0 & SIGN_BITS) | (((e0 - 64).clip(0) << 23).astype(np.uint32)) | (s0 & 0x7FFFFF)
+        mid = np.where(e0 == 64, sub, _ldexp_m64(s0))
+    else:
+        mid = _ldexp_m64(s0)
+    down = np.where(e0 == 255, s0, np.where(zero0, s0, np.where(e0 <= 63, (s0 & SIGN_BITS) | INF_BITS, mid)))
+    eq01 = s0 == s1
+    D = np.where(
+        z1 | z2, np.uint32(0xFFC00000),
+        np.where(d >= 96, np.where(eq01, up0, s0),
+        np.where(e1 == 0, up0,
+        np.where(e1 >= e1_down, np.where(flag & ~eq01, s0, down),
+        np.where(d <= -96, np.where(eq01, s0, up0),
+        np.where(e2 <= e2_threshold, up0, s0))))))
+    D = D.astype(np.uint32)
+    return D, flag
+
+
+def cmd_div_scale(r, args):
+    ins = r.bin("div_scale.in").reshape(-1, 3)
+    out = r.bin("div_scale.out").reshape(-1, 2)
+    assert len(ins) == len(out)
+    s0, s1, s2 = ins[:, 0], ins[:, 1], ins[:, 2]
+    hw_d, hw_f = out[:, 0], out[:, 1].astype(bool)
+    e1 = ((s1 >> 23) & 255).astype(np.int32)
+    e2 = ((s2 >> 23) & 255).astype(np.int32)
+    e0 = ((s0 >> 23) & 255).astype(np.int32)
+    rep = {"cases": int(len(ins)), "arch": r.arch}
+    for name, kw in [("fallthrough", {}),
+                     ("e2<=24,e1>=253", {"e2_threshold": 24, "e1_down": 253}),
+                     ("e2<=24,e1>=253,field_sub_for_e0_64", {"e2_threshold": 24, "e1_down": 253, "open_down_field": True})]:
+        D, flag = div_scale_chain(s0, s1, s2, **kw)
+        if r.arch == "gfx1201":  # gfx1201 quiets every signalling NaN it returns
+            snan = ((D & 0x7FFFFFFF) > INF_BITS) & ((D & QUIET_BITS) == 0)
+            D = np.where(snan, D | QUIET_BITS, D).astype(np.uint32)
+        bad_d, bad_f = D != hw_d, flag != hw_f
+        bad = bad_d | bad_f
+        d = e2 - e1
+        groups = {}
+        for label, m in [
+            ("e1 228..253", (e1 >= 228) & (e1 <= 253)),
+            ("e1 0..227", e1 <= 227),
+            ("e1 254..255", e1 >= 254),
+            ("d == -96, e1 != 254", (d == -96) & (e1 != 254)),
+            ("e2 24..26 (threshold)", (e2 >= 24) & (e2 <= 26)),
+            ("e0 64..90", (e0 >= 64) & (e0 <= 90)),
+        ]:
+            groups[label] = {"cases": int(m.sum()), "mismatching_D": int((bad_d & m).sum()), "mismatching_vcc": int((bad_f & m).sum())}
+        first = np.flatnonzero(bad)[:12]
+        rep[name] = {
+            "mismatching_cases": int(bad.sum()), "mismatching_D": int(bad_d.sum()), "mismatching_vcc": int(bad_f.sum()),
+            "by_group": groups,
+            "first_mismatches": [
+                {"s0": hex(int(s0[i])), "s1": hex(int(s1[i])), "s2": hex(int(s2[i])), "hw_d": hex(int(hw_d[i])),
+                 "model_d": hex(int(D[i])), "hw_vcc": int(hw_f[i]), "model_vcc": int(flag[i])} for i in first],
+        }
+    write_json(r, "div_scale", rep)
+    print(json.dumps(rep, indent=1))
+    return rep
+
+
+def cmd_scalar_udiv(r, args):
+    rec = r.bin("scalar_udiv.out").reshape(-1, 4)
+    n = len(rec)
+    den = np.arange(1, n + 1, dtype=np.uint32)
+    x, rcp, m, u = (rec[:, i] for i in range(4))
+    exact_x = den.astype(np.float32).view(np.uint32)
+    mul = np.float32(np.uint32(0x4F7FFFFE).view(np.float32))
+    m_model = (rcp.view(np.float32) * mul).view(np.uint32)
+    u_model = m.view(np.float32).astype(np.uint64).astype(np.uint32)
+    # the rcp stage is read against the exact reciprocal: hardware error in ulps of the f32 result
+    exact = 1.0 / den.astype(np.float64)
+    ulp = np.abs(rcp.view(np.float32).astype(np.float64) - exact) / (2.0 ** (np.floor(np.log2(exact)) - 23))
+    rep = {
+        "dens": int(n),
+        "s_cvt_f32_u32_mismatches": int((x != exact_x).sum()),
+        "s_mul_f32_vs_ieee_mismatches": int((m != m_model).sum()),
+        "s_cvt_u32_f32_vs_trunc_mismatches": int((u != u_model).sum()),
+        "rcp_max_error_ulp": float(ulp.max()),
+        "rcp_inexact_count": int((ulp != 0).sum()),
+    }
+    write_json(r, "scalar_udiv", rep)
+    print(json.dumps(rep, indent=1))
+    return rep
+
+
+def _is_nan(x):
+    return (x & 0x7FFFFFFF) > INF_BITS
+
+
+def num_select(a, b, is_max):
+    """maxNum/minNum on raw f32 bits: a NaN loses to a number, two NaNs give the first, quieted; -0 < +0."""
+    a, b = np.asarray(a, dtype=np.uint32), np.asarray(b, dtype=np.uint32)
+    fa, fb = a.view(np.float32), b.view(np.float32)
+    with np.errstate(invalid="ignore"):
+        zero_tie = (fa == 0) & (fb == 0)
+        if is_max:
+            take_a = (fa > fb) | (zero_tie & ((a & SIGN_BITS) == 0) & ((b & SIGN_BITS) != 0))
+        else:
+            take_a = (fa < fb) | (zero_tie & ((a & SIGN_BITS) != 0) & ((b & SIGN_BITS) == 0))
+    na, nb = _is_nan(a), _is_nan(b)
+    out = np.where(take_a, a, b)
+    out = np.where(na & ~nb, b, np.where(nb & ~na, a, out))
+    return np.where(na & nb, a | QUIET_BITS, out).astype(np.uint32)
+
+
+def cmd_maxmin(r, args):
+    ins = r.bin("maxmin.in").reshape(-1, 3)
+    s0, s1, s2 = ins[:, 0], ins[:, 1], ins[:, 2]
+    rep = {"cases": int(len(ins)), "arch": r.arch}
+    for name, hw_name, outer, inner in [("v_maxmin_num_f32", "maxmin.maxmin.out", False, True),
+                                        ("v_minmax_num_f32", "maxmin.minmax.out", True, False)]:
+        hw = r.bin(hw_name)
+        model = num_select(num_select(s0, s1, inner), s2, outer)
+        bad = np.flatnonzero(hw != model)
+        rep[name] = {"mismatches": int(len(bad)), "first": [
+            {"s0": hex(int(s0[i])), "s1": hex(int(s1[i])), "s2": hex(int(s2[i])), "hw": hex(int(hw[i])), "model": hex(int(model[i]))}
+            for i in bad[:12]]}
+    write_json(r, "maxmin", rep)
+    print(json.dumps(rep, indent=1))
+    return rep
+
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("receipt")
-    ap.add_argument("cmd", choices=["identity", "dot", "wmma", "swmmac"])
+    ap.add_argument("cmd", choices=["identity", "dot", "wmma", "swmmac", "div_scale", "scalar_udiv", "maxmin"])
     ap.add_argument("--jobs", type=int, default=12)
     args = ap.parse_args()
     r = Receipt(args.receipt)
-    {"identity": cmd_identity, "dot": cmd_dot, "wmma": cmd_wmma, "swmmac": cmd_swmmac}[args.cmd](r, args)
+    {"identity": cmd_identity, "dot": cmd_dot, "wmma": cmd_wmma, "swmmac": cmd_swmmac, "div_scale": cmd_div_scale, "scalar_udiv": cmd_scalar_udiv, "maxmin": cmd_maxmin}[args.cmd](r, args)
 
 
 if __name__ == "__main__":

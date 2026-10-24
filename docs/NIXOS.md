@@ -77,9 +77,12 @@ hipfire.url = "github:warpfront/hipfire/<tag-or-commit>";
 `nix build github:warpfront/hipfire#hipfire-kernels` output contains the same
 exact-source registry objects and `.index.json` files. Override `gpuTargets`
 with the architecture of your GPU to avoid building the entire five-arch set;
-the NixOS module uses `services.hipfire.gpuTargets`. An unsupported architecture
-or unregistered runtime route requires hipcc JIT. Packaging fails if a required
-registry entry cannot compile; partial unindexed packages are not installed.
+the NixOS module uses `services.hipfire.gpuTargets`. Targets outside the
+five-arch registry (for example `gfx1200` or `gfx1030`) package no kernels,
+print an evaluation warning naming them, and are compiled by hipcc JIT on first
+use, as is any unregistered runtime route.
+Packaging fails if a required registry entry cannot compile; partial unindexed
+packages are not installed.
 
 ## NixOS module
 
@@ -124,7 +127,7 @@ services.hipfire = {
   enable = true;
   gpuTargets = [ "gfx1100" ]; # required non-empty
   openFirewall = false;  # does NOT change listen address — only skips opening the port when the host firewall is enabled
-  # openFirewall = true opens cfg.port with NO auth/TLS on the listener — see SERVE.md
+  # openFirewall = true opens cfg.port to the network; the listener has no TLS and auth is optional (serve.api_key_file) — see SERVE.md
 
   defaultModel = "qwen3.5:9b";
   # Module writes these into config.toml as stored globals. run/serve sampling
@@ -263,13 +266,13 @@ and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 `LD_LIBRARY_PATH` is set for nixpkgs ROCm. System mode also sets
 `HOME=/var/lib/hipfire` and `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels`.
 
-**Security:** `hipfire serve` has **no authentication and no TLS**
-([SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
+**Security:** `hipfire serve` has **no TLS**, and bearer authentication is
+optional (`serve.api_key_file`; [SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
 `extraSettings.host = "0.0.0.0"` to listen on all interfaces. `openFirewall = false` does
 **not** change the listen address — it only avoids opening `cfg.port` when the
 **host firewall is enabled**. Keep the firewall closed unless the host is on a
-trusted network or an authenticated TLS reverse proxy terminates in front of
-the port. Prefer probing on loopback (`127.0.0.1`).
+trusted network or a TLS reverse proxy terminates in front of the port; a key
+is recommended on any non-loopback listen address. Prefer probing on loopback (`127.0.0.1`).
 
 Device policy allows `/dev/kfd`, DRM char devices, and `/dev/accel/accel0`.
 
@@ -287,8 +290,8 @@ Set only arches you need. Common labels (not an admission list):
 | gfx1030 | RX 6800 XT class |
 | gfx1100 | RX 7900 XTX class |
 | gfx1151 | Strix Halo |
-| gfx1200 | Radeon AI PRO R9700 class |
-| gfx1201 | RX 9070 / 9070 XT class |
+| gfx1200 | RX 9060 / 9060 XT class |
+| gfx1201 | RX 9070 / 9070 XT, Radeon AI PRO R9700 class |
 
 ```nix
 services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
@@ -338,7 +341,13 @@ nixos-25.11’s ROCm 6.4.3 `libamdhip64` can segfault on **gfx1151** during
 weight upload — prefer the overlay on Strix Halo hosts.
 
 `LD_LIBRARY_PATH` is injected on the daemon/CLI wrappers and the systemd
-unit when `rocmSupport = true`.
+unit when `rocmSupport = true`. The wrappers, the kernel package build and the
+dev shell also set `HIPFIRE_ROCM_PATH` to the prefix built by
+`nix/rocm-root.nix`, which joins `clr`, `rocm-runtime` and `rocm-device-libs`:
+hipfire requires the HIP headers, `libamdhip64`, `libhsa-runtime64`, `hipcc`
+and the device bitcode under a single root, and nixpkgs splits them across
+those packages. The wrappers only set a default, so an exported
+`HIPFIRE_ROCM_PATH` wins.
 
 ### Bring your own ROCm
 
@@ -346,12 +355,15 @@ unit when `rocmSupport = true`.
 services.hipfire = {
   rocmSupport = false;
   environment = {
+    HIPFIRE_ROCM_PATH = "/opt/rocm";
     LD_LIBRARY_PATH = "/opt/rocm/lib";
   };
 };
 ```
 
-You must still satisfy GPU device access and any ICD requirements yourself.
+hipfire loads the HIP runtime and compiler from the one root named by
+`HIPFIRE_ROCM_PATH`; `LD_LIBRARY_PATH` alone does not select it. You must still
+satisfy GPU device access and any ICD requirements yourself.
 
 ## Configuration precedence
 

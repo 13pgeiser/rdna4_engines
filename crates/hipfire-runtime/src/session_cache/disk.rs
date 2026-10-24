@@ -457,12 +457,32 @@ impl DiskTier {
         true
     }
 
+    /// Allocate the host bounce buffer on first use. Every device/file copy
+    /// ([`Self::demote`], [`Self::load`]) needs it, so each caller reserves it
+    /// first: refused (nothing allocated) when host RAM cannot hold it beside
+    /// the memory guard's headroom and the live state's `growth` reserve, or
+    /// when the allocator fails.
+    pub(super) fn reserve_staging(&mut self, gpu: &Gpu, growth: u64) -> Result<(), String> {
+        if !self.staging.is_empty() {
+            return Ok(());
+        }
+        if !super::host_staging_fits(gpu, DISK_STAGING as u64, growth) {
+            return Err("host memory guard".into());
+        }
+        self.staging
+            .try_reserve_exact(DISK_STAGING)
+            .map_err(|e| format!("host staging allocation: {e}"))?;
+        self.staging.resize(DISK_STAGING, 0);
+        Ok(())
+    }
+
     /// Write the device `snapshot` at `key` to disk.
     pub(super) fn demote(
         &mut self,
         gpu: &mut Gpu,
         key: &Key,
         snapshot: &StoredSnapshot,
+        growth: u64,
     ) -> Result<(), String> {
         let SnapshotLocation::Device(buf) = &snapshot.location else {
             return Err("not a device snapshot".into());
@@ -473,6 +493,7 @@ impl DiskTier {
         if file_bytes > self.budget {
             return Err("exceeds disk budget".into());
         }
+        self.reserve_staging(gpu, growth)?;
         if !self.make_room(file_bytes) {
             return Err("disk budget pinned".into());
         }
@@ -548,7 +569,10 @@ impl DiskTier {
         }
         file.seek(SeekFrom::Start(file_bytes - snapshot.bytes))
             .map_err(fail)?;
-        let staging = staging(&mut self.staging);
+        if self.staging.is_empty() {
+            return Err(unreserved());
+        }
+        let staging = &mut self.staging[..];
         let bytes = snapshot.bytes as usize;
         let mut off = 0;
         while off < bytes {
@@ -592,11 +616,9 @@ impl DiskTier {
     }
 }
 
-fn staging(buf: &mut Vec<u8>) -> &mut [u8] {
-    if buf.is_empty() {
-        buf.resize(DISK_STAGING, 0);
-    }
-    buf
+/// A host bounce buffer is only ever allocated by [`DiskTier::reserve_staging`].
+fn unreserved() -> String {
+    "host staging buffer not reserved".into()
 }
 
 /// `prefix`, then `bytes` of `src`, into a new file at `path`, synced.
@@ -612,7 +634,10 @@ fn write_file(
     gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
     let mut file = File::create(path).map_err(fail)?;
     file.write_all(prefix).map_err(fail)?;
-    let staging = staging(staging_buf);
+    if staging_buf.is_empty() {
+        return Err(unreserved());
+    }
+    let staging = &mut staging_buf[..];
     let mut off = 0;
     while off < bytes {
         let n = (bytes - off).min(DISK_STAGING);

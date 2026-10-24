@@ -16,6 +16,25 @@
 //! the model passes only the dtype snapshot + k. One `DispatchCtx` is threaded
 //! end-to-end from the call site through every inner GEMV. Scratch stays model-owned.
 //! Grouped-GEMM prefill is a future arm (gated on `ShapeInfo.batch_size`).
+//!
+//! # qt=55 FP8E4M3B128 route (gfx942 only)
+//!
+//! qt=55 expert blocks are served by exactly one route: the sealed typed
+//! [`MoeRouteCapability::Fp8B128Grouped`] route (gfx942 only; canonical
+//! 512 experts / top-10 / hidden 2560 / routed + shared intermediate 640 / 640;
+//! routed gate_up and down both qt=55, router and every shared projection
+//! BF16). The architecture declares it through [`MoeRoutePolicy`] and
+//! `pipeline::select_fp8_grouped_route` accepts it or fails closed with a
+//! typed [`DispatchError`]; it never falls through to generic selection.
+//!
+//! Generic resolution ([`MoeResolution`], [`MoePrefillResolution`]) has no
+//! qt=55 implementation. Given any qt=55 operand it returns a *refusal state*
+//! — every route flag disabled, `fp8_b128_refused == true` — and the
+//! `check_generic_route` method on each turns that state into the typed
+//! refusal. Execution MUST call it (or `pipeline::reject_fp8_moe`) before
+//! using a generic route for a layer whose route is not
+//! [`MoeRouteCapability::Fp8B128Grouped`]; the generic prefill Path 0/1/2 and
+//! decode gpu-top-k/CPU fallback therefore can never carry qt=55 bytes.
 
 use rdna_compute::DType;
 use rdna_compute::{Gpu, GpuTensor};
@@ -35,6 +54,175 @@ pub const MOE_GROUPED_BLOCK_M: usize = 16;
 pub struct MoePointerEntries<'a> {
     pub gate_up: &'a [usize],
     pub down: &'a [usize],
+}
+
+/// Placement byte: the expert's projections live in a device (VRAM) owner.
+pub const EXPERT_TIER_DEVICE: u8 = 0;
+/// Placement byte: the expert's projections live in a host-mapped owner.
+pub const EXPERT_TIER_HOST: u8 = 1;
+
+/// Neutral per-layer metadata of an explicit per-expert tier placement
+/// (model-level device + host-mapped payload owners). Plain data only: the
+/// loader that owns the tier converts its own view/lease into this, so no
+/// arch-private type crosses the dispatch boundary.
+///
+/// `placement` and `codecs` hold one byte per layer-local expert id (the id the
+/// kernels index with; model ids never reach dispatch). `any_host` is derived
+/// from `placement`, never from a representative expert, and is for
+/// conservative capability/path decisions only: it carries no arithmetic
+/// meaning. `generation` is the owner-binding generation (a reload gets a new
+/// one), `logical_digest` the placement plan's logical digest, and `keepalive`
+/// the owner retention every captured or retained resource must hold until its
+/// GPU work is retired.
+#[derive(Clone)]
+pub struct ExpertTierIdentity {
+    generation: u64,
+    logical_digest: [u8; 32],
+    any_host: bool,
+    placement: Box<[u8]>,
+    codecs: Box<[u8]>,
+    gate_up_entries: Box<[usize]>,
+    down_entries: Box<[usize]>,
+    keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl ExpertTierIdentity {
+    /// `placement` entries must be [`EXPERT_TIER_DEVICE`] or
+    /// [`EXPERT_TIER_HOST`]. Every table has one entry per layer-local expert
+    /// and the same non-zero length; pointer entries are non-null absolute
+    /// addresses (the frozen CPU mirrors of the uploaded device tables).
+    pub fn new(
+        generation: u64,
+        logical_digest: [u8; 32],
+        placement: &[u8],
+        codecs: &[u8],
+        gate_up_entries: &[usize],
+        down_entries: &[usize],
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, String> {
+        let n = placement.len();
+        if n == 0 || n != codecs.len() || n != gate_up_entries.len() || n != down_entries.len() {
+            return Err(format!(
+                "expert tier identity tables must be non-empty and equal length \
+                 (placement {n}, codecs {}, gate/up entries {}, down entries {})",
+                codecs.len(),
+                gate_up_entries.len(),
+                down_entries.len()
+            ));
+        }
+        if let Some(index) = (0..n).find(|&i| gate_up_entries[i] == 0 || down_entries[i] == 0) {
+            return Err(format!(
+                "expert tier identity has a null pointer entry for expert {index}"
+            ));
+        }
+        if let Some(index) = placement
+            .iter()
+            .position(|&tier| tier != EXPERT_TIER_DEVICE && tier != EXPERT_TIER_HOST)
+        {
+            return Err(format!(
+                "expert tier identity placement byte {} for expert {index} is neither device nor host",
+                placement[index]
+            ));
+        }
+        Ok(Self {
+            generation,
+            logical_digest,
+            any_host: placement.iter().any(|&tier| tier == EXPERT_TIER_HOST),
+            placement: placement.into(),
+            codecs: codecs.into(),
+            gate_up_entries: gate_up_entries.into(),
+            down_entries: down_entries.into(),
+            keepalive,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn logical_digest(&self) -> &[u8; 32] {
+        &self.logical_digest
+    }
+
+    /// True when at least one expert of the layer is host-mapped. Capability
+    /// checks only; never select arithmetic from it.
+    pub fn any_host(&self) -> bool {
+        self.any_host
+    }
+
+    /// `(gate_up, down)` host-mapped residency of the layer's projections.
+    /// Both are the layer-wide `any_host` bit: a tier places a pair together.
+    pub fn host_projections(&self) -> (bool, bool) {
+        (self.any_host, self.any_host)
+    }
+
+    pub fn placement(&self) -> &[u8] {
+        &self.placement
+    }
+
+    pub fn codecs(&self) -> &[u8] {
+        &self.codecs
+    }
+
+    /// Absolute GPU-visible gate/up projection addresses per layer-local
+    /// expert: the frozen CPU mirror of the uploaded pointer table.
+    pub fn gate_up_entries(&self) -> &[usize] {
+        &self.gate_up_entries
+    }
+
+    /// Absolute GPU-visible down projection addresses (see
+    /// [`Self::gate_up_entries`]).
+    pub fn down_entries(&self) -> &[usize] {
+        &self.down_entries
+    }
+
+    pub fn keepalive(&self) -> &std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        &self.keepalive
+    }
+}
+
+impl PartialEq for ExpertTierIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.logical_digest == other.logical_digest
+            && self.any_host == other.any_host
+            && self.placement == other.placement
+            && self.codecs == other.codecs
+            && self.gate_up_entries == other.gate_up_entries
+            && self.down_entries == other.down_entries
+            && std::sync::Arc::ptr_eq(&self.keepalive, &other.keepalive)
+    }
+}
+
+impl Eq for ExpertTierIdentity {}
+
+impl std::fmt::Debug for ExpertTierIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertTierIdentity")
+            .field("generation", &self.generation)
+            .field("logical_digest", &self.logical_digest)
+            .field("any_host", &self.any_host)
+            .field("experts", &self.placement.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `(gate_up, down)` host-mapped residency of a layer's routed experts.
+/// An explicit tier binding wins over every adapter override: its answer is
+/// the layer's `any_host`, never a representative expert's residency.
+pub fn routed_host_mapped_projections(experts: &dyn RoutedExpertWeights) -> (bool, bool) {
+    experts.tier_identity().map_or_else(
+        || experts.host_mapped_projections(),
+        ExpertTierIdentity::host_projections,
+    )
+}
+
+/// Layer-wide host-mapped bit of a layer's routed experts; tier-first like
+/// [`routed_host_mapped_projections`].
+pub fn routed_host_mapped(experts: &dyn RoutedExpertWeights) -> bool {
+    experts
+        .tier_identity()
+        .map_or_else(|| experts.host_mapped(), ExpertTierIdentity::any_host)
 }
 
 /// The complete semantic recipe selected by an architecture binding.
@@ -71,6 +259,19 @@ impl MoeRecipe {
     }
 }
 
+/// Selection bias of a sigmoid router (LFM2, DeepSeek): experts are chosen on
+/// `sigmoid(logits) + bias`, weighted by the unbiased sigmoid scores,
+/// normalized over the selection, then multiplied by `route_scale`.
+#[derive(Clone, Copy)]
+pub struct MoeSelectionBias<'a> {
+    /// `[n_exp]` F32, read for selection only.
+    pub bias: &'a GpuTensor,
+    pub route_scale: f32,
+}
+
+/// Widest selection the biased sigmoid router and the k8 routed kernels take.
+pub const MOE_BIASED_SIGMOID_MAX_K: usize = 8;
+
 /// Architecture declaration, checked against both live operands and the
 /// immutable specialized-kernel contract before any route is selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +279,15 @@ pub struct MoeRoutePolicy {
     pub capability: MoeRouteCapability,
     pub geometry: MoeRouteGeometry,
     pub formats: MoeRouteFormats,
+    /// Sealed expert-slab layers only: the raw codec id of the layer's cold
+    /// bucket (W3 = 1, E8P = 3), declared by the architecture from the
+    /// layer's immutable slab metadata; `None` for a layer without cold
+    /// experts (all MQ4) and for every other route. Selection validates it
+    /// against the live dtype tables in its one pass, so lowering never
+    /// rescans a table.
+    pub slab_cold_codec: Option<u8>,
+    /// Load-owned device address of E512 u8 membership, zero for the legacy route.
+    pub expert_keep_mask: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,23 +323,89 @@ pub enum MoeRouteCapability {
     /// lowers exactly like [`Self::Qt44Qt53Grouped`] except that the opt-in
     /// symmetric IU4 prefill arm may take the routed experts.
     Qt44Qt53GroupedSymmetric,
+    /// gfx942-only qt=55 FP8E4M3B128 grouped route over the same fixed
+    /// 512/10/2560/640/640 geometry: routed gate_up and down are both qt=55,
+    /// router and all shared projections BF16. Lowered only by the typed
+    /// FP8 stages; admitted by `pipeline::select_fp8_grouped_route` and
+    /// never by generic resolution.
+    Fp8B128Grouped,
+    /// Sealed expert-slab route (ctl3-hot): the same fixed
+    /// 512/10/2560/640/640 geometry over experts whose codec is per expert,
+    /// addressed through the layer's pointer tables. gfx1201 admits MQ4
+    /// symmetric QT44/QT53, MQ3-I4 planar qt131/qt132 (W3) and E8P-I4
+    /// planar qt135/qt136; gfx1151 admits MQ4 and W3, and E8P-I4 only once
+    /// `rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is true (refused
+    /// today; its kernels are selectable, the one constant is the admission); gfx1100 admits
+    /// MQ4 and E8P-I4 (not W3); W2 is
+    /// refused on every arch. A layer carries at most one cold codec (W3 or E8P); see
+    /// `rdna_compute::qwen4_slab_codec_admitted`. Decode rows
+    /// (`route_rows <= 8`) run the K1 lane-union GEMV over the two codec
+    /// buckets (cold = 0, MQ4 = 1); longer prefill runs the K2 grouped IU4
+    /// kernels over codec-masked tile ids. Declared from the slab artifact's
+    /// per-expert table only, never from a dtype.
+    SlabCodecGrouped,
 }
 
 impl MoeRouteCapability {
     /// The source-bound QT44/QT53 route is admitted on any GPU when DeltaNet
     /// is enabled; the fixed geometry and format contract is checked separately.
+    /// The FP8 route is arch-gated, so it is never admitted by this
+    /// device-independent predicate (see [`Self::admitted_on_arch`]).
     pub(crate) fn admitted_on(self) -> bool {
         match self {
-            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => cfg!(feature = "deltanet"),
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric | Self::SlabCodecGrouped => {
+                cfg!(feature = "deltanet")
+            }
+            Self::Fp8B128Grouped => false,
         }
     }
 
-    /// Either QT44/QT53 grouped declaration: both lower through the same
-    /// fixed-shape stages.
+    /// Device-aware admission: the QT44/QT53 routes keep their
+    /// device-independent rule, the FP8 route requires gfx942.
+    pub(crate) fn admitted_on_arch(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
+        match self {
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => self.admitted_on(),
+            Self::SlabCodecGrouped => {
+                self.admitted_on() && rdna_compute::qwen4_slab_codec_admitted(arch.arch(), 0)
+            }
+            Self::Fp8B128Grouped => arch.is_gfx942(),
+        }
+    }
+
+    /// The sealed expert-slab declaration (MQ4 plus the arch's cold codec: W3 or E8P-I4).
+    pub fn is_slab(self) -> bool {
+        matches!(self, Self::SlabCodecGrouped)
+    }
+
+    /// Any QT44/QT53 grouped declaration (the slab one included): they lower
+    /// through the same fixed-shape stages. False for the FP8 route.
     pub fn is_qt44_qt53_grouped(self) -> bool {
-        matches!(self, Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric)
+        matches!(
+            self,
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric | Self::SlabCodecGrouped
+        )
+    }
+
+    /// The gfx942 qt=55 FP8E4M3B128 grouped declaration.
+    pub fn is_fp8_grouped(self) -> bool {
+        matches!(self, Self::Fp8B128Grouped)
+    }
+
+    /// Any sealed grouped declaration: QT44/QT53 (either) or FP8E4M3B128.
+    pub fn is_sealed_grouped(self) -> bool {
+        self.is_qt44_qt53_grouped() || self.is_fp8_grouped()
     }
 }
+
+/// The one fixed expert/hidden geometry every grouped specialized route
+/// (QT44/QT53 and FP8E4M3B128) is built for.
+const FIXED_ROUTE_GEOMETRY: MoeRouteGeometry = MoeRouteGeometry {
+    experts: 512,
+    top_k: 10,
+    hidden: 2560,
+    routed_intermediate: 640,
+    shared_intermediate: 640,
+};
 
 /// Exact geometry and wire-format contract of the available grouped kernels.
 /// The route also requires `admitted_on` and live operands matching the policy.
@@ -148,13 +424,7 @@ pub(crate) fn grouped_route_geometry_supported(
 ) -> bool {
     let geometry = policy.geometry;
     let formats = policy.formats;
-    let fixed_geometry = MoeRouteGeometry {
-        experts: 512,
-        top_k: 10,
-        hidden: 2560,
-        routed_intermediate: 640,
-        shared_intermediate: 640,
-    };
+    let fixed_geometry = FIXED_ROUTE_GEOMETRY;
     policy.capability.is_qt44_qt53_grouped()
         && geometry == fixed_geometry
         && experts == geometry.experts
@@ -170,7 +440,215 @@ pub(crate) fn grouped_route_geometry_supported(
         && down == formats.routed_down
 }
 
+/// Whether `dtype` is a routed gate/up format of the sealed expert-slab route
+/// on some arch (MQ4, W3 qt131, E8P-I4 qt135); per-arch membership is
+/// [`slab_codec_pair`].
+pub fn slab_gate_up_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ4G256V2 | DType::MQ3I4G128R256 | DType::E8PI4G128R256
+    )
+}
+
+/// Whether `dtype` is a routed down format of the sealed expert-slab route on
+/// some arch (MQ4, W3 qt132, E8P-I4 qt136).
+pub fn slab_down_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ4G128V2 | DType::MQ3I4G128R128 | DType::E8PI4G128R128
+    )
+}
+
+/// Slab codec byte of a routed `(gate_up, down)` pair (`0` = MQ4 symmetric
+/// QT44/QT53, `1` = W3 qt131/qt132, `3` = E8P-I4 qt135/qt136), never crossed.
+/// W2 has no codec byte: it is refused everywhere.
+pub fn slab_codec_of_pair(gate_up: DType, down: DType) -> Option<u8> {
+    match (gate_up, down) {
+        (DType::MQ4G256V2, DType::MQ4G128V2) => Some(0),
+        (DType::MQ3I4G128R256, DType::MQ3I4G128R128) => Some(1),
+        (DType::E8PI4G128R256, DType::E8PI4G128R128) => Some(3),
+        _ => None,
+    }
+}
+
+/// Whether a routed `(gate_up, down)` pair is one slab codec that `arch`
+/// admits (`rdna_compute::qwen4_slab_codec_admitted`).
+pub fn slab_codec_pair(arch: &str, gate_up: DType, down: DType) -> bool {
+    slab_codec_of_pair(gate_up, down)
+        .is_some_and(|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec))
+}
+
+/// The K1/K2 codec bucket of an admitted slab dtype pair: the cold codec (W3
+/// or E8P) is bucket 0, MQ4 bucket 1.
+pub fn slab_bucket_of_pair(arch: &str, gate_up: DType, down: DType) -> Option<usize> {
+    slab_bucket_of_pair_by(
+        &|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec),
+        gate_up,
+        down,
+    )
+}
+
+/// [`slab_bucket_of_pair`] over an explicit admission predicate (the pure decision: `admits`
+/// is the architecture's [`rdna_compute::slab_admission::qwen4_slab_codec_admitted_with`]).
+pub(crate) fn slab_bucket_of_pair_by(
+    admits: &dyn Fn(u8) -> bool,
+    gate_up: DType,
+    down: DType,
+) -> Option<usize> {
+    let codec = slab_codec_of_pair(gate_up, down)?;
+    admits(codec).then_some(usize::from(codec == 0))
+}
+
+/// The cold codec a layer's dtype metadata names, in one pass over a mixed
+/// layer's per-expert pairs: `Some(Some(codec))` for a layer holding cold
+/// experts of one codec, `Some(None)` for a uniform MQ4 layer, `None` when it
+/// is not a slab layer (an unknown or crossed pair, a codec `admits` refuses,
+/// W3 and E8P in one layer, or a mixed layer without both MQ4 and cold
+/// experts).
+fn layer_cold_codec(dtypes: &MoeDtypes<'_>, admits: &dyn Fn(u8) -> bool) -> Option<Option<u8>> {
+    if dtypes.routed_has_mixed_experts {
+        let (gate_up, down) = (dtypes.per_expert_gate_up?, dtypes.per_expert_down?);
+        let (mut cold, mut mq4) = (None, false);
+        for (g, d) in gate_up.iter().zip(down) {
+            let codec = slab_codec_of_pair(*g, *d).filter(|codec| admits(*codec))?;
+            if codec == 0 {
+                mq4 = true;
+            } else if cold.map_or(true, |seen| seen == codec) {
+                cold = Some(codec);
+            } else {
+                return None;
+            }
+        }
+        (mq4 && cold.is_some()).then_some(cold)
+    } else {
+        let codec = slab_codec_of_pair(dtypes.routed_gate_up, dtypes.routed_down)
+            .filter(|codec| admits(*codec))?;
+        Some((codec != 0).then_some(codec))
+    }
+}
+
+/// Raw `cold_codec` the runtime's K1 / tile-mask entries take for a layer that
+/// declared `declared` ([`MoeRoutePolicy::slab_cold_codec`]): the declared
+/// cold codec when `arch` admits it, or, for a layer without cold experts,
+/// the arch's default cold codec
+/// (`rdna_compute::qwen4_slab_default_cold_codec`; that bucket is never
+/// launched). `None` when `arch` is not a slab arch or refuses the declared
+/// codec.
+pub fn slab_launch_cold_codec(arch: &str, declared: Option<u8>) -> Option<u8> {
+    match declared {
+        Some(codec) => rdna_compute::qwen4_slab_codec_admitted(arch, codec).then_some(codec),
+        None => rdna_compute::qwen4_slab_default_cold_codec(arch),
+    }
+}
+
+/// Exact geometry and operand contract of the sealed expert-slab route: the
+/// fixed geometry, and routed experts that are either all one codec the
+/// architecture admits (no per-expert tables) or a per-expert table of admitted codec
+/// pairs, one entry per expert, holding MQ4 and one cold codec. The
+/// policy's declared cold codec must be the one the dtypes name. `admits:
+/// Some` (the architecture's `rdna_compute::qwen4_slab_codec_admitted` per codec) is
+/// selection's one validating pass over the dtype tables; `None` is
+/// the lowering-time shape check, which trusts that pass and never rescans
+/// them (the stage that launches the kernels enforces the device).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn slab_route_geometry_supported(
+    admits: Option<&dyn Fn(u8) -> bool>,
+    policy: &MoeRoutePolicy,
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtypes: &MoeDtypes<'_>,
+    has_codec_table: bool,
+) -> bool {
+    let geometry = policy.geometry;
+    let shape = policy.capability.is_slab()
+        && geometry == FIXED_ROUTE_GEOMETRY
+        && experts == geometry.experts
+        && top_k == geometry.top_k
+        && hidden == geometry.hidden
+        && intermediate == geometry.routed_intermediate
+        && gate_up_k == geometry.hidden
+        && down_m == geometry.hidden
+        && down_k == geometry.routed_intermediate;
+    if !shape {
+        return false;
+    }
+    if let Some(admits) = admits {
+        if layer_cold_codec(dtypes, admits) != Some(policy.slab_cold_codec) {
+            return false;
+        }
+    }
+    if dtypes.routed_has_mixed_experts {
+        let (Some(gate_up), Some(down)) = (dtypes.per_expert_gate_up, dtypes.per_expert_down)
+        else {
+            return false;
+        };
+        has_codec_table && gate_up.len() == experts && down.len() == experts
+    } else {
+        !has_codec_table && dtypes.per_expert_gate_up.is_none() && dtypes.per_expert_down.is_none()
+    }
+}
+
+/// Exact geometry and wire-format contract of the gfx942 qt=55 grouped
+/// kernels: the fixed geometry, routed gate_up and down both
+/// [`DType::FP8E4M3B128`], and BF16 router/shared projections. The route also
+/// requires `admitted_on_arch` and live operands matching the policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fp8_grouped_route_geometry_supported(
+    policy: &MoeRoutePolicy,
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    gate_up: DType,
+    down: DType,
+) -> bool {
+    let geometry = policy.geometry;
+    let formats = policy.formats;
+    policy.capability.is_fp8_grouped()
+        && geometry == FIXED_ROUTE_GEOMETRY
+        && experts == geometry.experts
+        && top_k == geometry.top_k
+        && hidden == geometry.hidden
+        && intermediate == geometry.routed_intermediate
+        && gate_up_k == geometry.hidden
+        && down_m == geometry.hidden
+        && down_k == geometry.routed_intermediate
+        && [
+            formats.router,
+            formats.shared_selector,
+            formats.shared_gate,
+            formats.shared_up,
+            formats.shared_down,
+        ]
+        .iter()
+        .all(|dtype| *dtype == DType::BF16)
+        && formats.routed_gate_up == DType::FP8E4M3B128
+        && formats.routed_down == DType::FP8E4M3B128
+        && gate_up == formats.routed_gate_up
+        && down == formats.routed_down
+}
+
+/// Typed refusal returned whenever a qt=55 operand would reach a generic
+/// (non-FP8) MoE route.
+pub(crate) fn fp8_b128_generic_refusal() -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant: "fp8b128_specialized_route_only",
+        arch: "",
+        quant: "FP8E4M3B128",
+    }
+}
+
 /// Source of the activation consumed by a MoE recipe.
+#[derive(Clone, Copy)]
 pub enum MoeNormalization<'a> {
     Provided,
     RmsNorm {
@@ -199,6 +677,7 @@ pub struct MoeSharedWeights<'a> {
 }
 
 /// Decode scratch and weights for the optional replicated/shared expert.
+#[derive(Clone, Copy)]
 pub struct MoeSharedDecode<'a> {
     pub weights: MoeSharedWeights<'a>,
     pub intermediate: usize,
@@ -208,6 +687,7 @@ pub struct MoeSharedDecode<'a> {
 }
 
 /// Prefill scratch and weights for the optional replicated/shared expert.
+#[derive(Clone, Copy)]
 pub struct MoeSharedPrefill<'a> {
     pub weights: MoeSharedWeights<'a>,
     pub intermediate: usize,
@@ -218,6 +698,7 @@ pub struct MoeSharedPrefill<'a> {
 }
 
 /// Router projection policy for Q8 prefill inputs.
+#[derive(Clone, Copy)]
 pub enum MoeQ8RouterPolicy<'a> {
     DispatcherEntry,
     FreshFp16Wmma {
@@ -227,6 +708,7 @@ pub enum MoeQ8RouterPolicy<'a> {
 }
 
 /// Complete prefill prologue declaration.
+#[derive(Clone, Copy)]
 pub struct MoePrefillPrelude<'a> {
     pub normalization: MoeNormalization<'a>,
     pub router: WeightRef<'a>,
@@ -331,6 +813,7 @@ pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
 ///
 /// `experts_all_gate_up_mq4` mirrors the `ffn.experts.iter().all(..)` clause
 /// the original `gate_side_mq4` check used (qwen35.rs:4598-4605). The routed
+#[derive(Clone, Copy)]
 pub struct MoeDtypes<'a> {
     pub router: DType,
     /// Optional shared-expert projection dtypes. `None` is a first-class
@@ -362,6 +845,65 @@ impl MoeDtypes<'_> {
             || [self.routed_gate_up, self.routed_down]
                 .iter()
                 .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
+    }
+
+    /// Any operand (router, shared projection, routed gate_up/down, or any
+    /// per-expert tier) is qt=55 FP8E4M3B128. Generic routes refuse these.
+    pub fn has_fp8_b128_projection(&self) -> bool {
+        let is_fp8 = |dtype: DType| dtype == DType::FP8E4M3B128;
+        self.shared.is_some_and(|shared| {
+            [shared.selector, shared.gate, shared.up, shared.down]
+                .into_iter()
+                .any(is_fp8)
+        }) || [self.router, self.routed_gate_up, self.routed_down]
+            .into_iter()
+            .any(is_fp8)
+            || self
+                .per_expert_gate_up
+                .is_some_and(|values| values.iter().copied().any(is_fp8))
+            || self
+                .per_expert_down
+                .is_some_and(|values| values.iter().copied().any(is_fp8))
+    }
+
+    /// The one narrow qwen35 qt53 routed-down typed fallback shape: uniform
+    /// routed gate/up `MQ4G256V2` (qt44) + uniform routed down `MQ4G128V2`
+    /// (qt53), no mixed tiers or per-expert tag shape, no Paro, and qt53 (or
+    /// any planar MQ-I4 / qt=55) nowhere else (router, shared selector,
+    /// shared gate/up/down). Pure dtype shape only; tags and AWQ sidecars are
+    /// not part of this snapshot and are refused by the pipeline stages.
+    /// Admission of this shape applies only to MoE without a route policy
+    /// (callers reach it through `route.is_none()`).
+    pub fn qt53_routed_down_fallback(&self) -> bool {
+        let uniform = |table: Option<&[DType]>, expected: DType| {
+            table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
+        };
+        let qt53_or_mq_i4 = |dtype: DType| dtype == DType::MQ4G128V2 || dtype.is_mq_i4();
+        self.routed_gate_up == DType::MQ4G256V2
+            && self.routed_down == DType::MQ4G128V2
+            && !self.routed_has_mixed_experts
+            && !self.has_paro_shared
+            && uniform(self.per_expert_gate_up, DType::MQ4G256V2)
+            && uniform(self.per_expert_down, DType::MQ4G128V2)
+            && !qt53_or_mq_i4(self.router)
+            && !self.shared.is_some_and(|shared| {
+                [shared.selector, shared.gate, shared.up, shared.down]
+                    .into_iter()
+                    .any(qt53_or_mq_i4)
+            })
+            && !self.has_fp8_b128_projection()
+    }
+}
+
+/// Typed refusal for the qwen35 qt53 routed-down fallback: the shape is
+/// admitted but the live device/route cannot launch it, so it is refused
+/// before any launch (never a silent per-expert GEMV or CPU fallback).
+pub(crate) fn qt53_fallback_unsupported(variant: &'static str) -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant,
+        arch: "",
+        quant: "MQ4G128V2",
     }
 }
 
@@ -446,6 +988,18 @@ pub struct MoeResolution {
     /// the bucketed dispatch path (Task 3). `None` tables or all-equal `Some`
     /// tables leave this `false` ⇒ unchanged uniform fast path.
     pub mixed: bool,
+    /// Refusal state: a qt=55 operand is present, so no generic route flag is
+    /// set. Resolution stays infallible; [`Self::check_generic_route`] raises
+    /// the typed refusal at execution.
+    pub fp8_b128_refused: bool,
+    /// Uniform qt44 gate/up + qt53 down without a route policy (see
+    /// [`MoeDtypes::qt53_routed_down_fallback`]): lowers on the GPU top-K
+    /// indexed path with the F32 FWHT128 down recipe. Decode requires `k == 8`.
+    pub routed_indexable_qt53_f32: bool,
+    /// Refusal state: the qt53 fallback shape is present but `k != 8` leaves no
+    /// GPU top-K route; [`Self::check_generic_route`] raises the typed refusal
+    /// (the per-expert CPU fallback has no qt53 GEMV).
+    pub qt53_fallback_refused: bool,
 }
 
 impl MoeResolution {
@@ -457,6 +1011,9 @@ impl MoeResolution {
     }
 
     pub fn resolve_arch(d: &MoeDtypes<'_>, k: usize, arch_has_e8_wmma: bool) -> Self {
+        if d.has_fp8_b128_projection() {
+            return Self::fp8_b128_refused();
+        }
         use DType::*;
         // The fused four-weight gate kernel is admitted only for the exact
         // MQ4G256 V1 quartet. The exact MQ4G256V2 quartet is admitted on a
@@ -557,6 +1114,8 @@ impl MoeResolution {
             && routed_gate_up_e8
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
+        let routed_indexable_qt53_f32 = d.qt53_routed_down_fallback();
+
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq4v2
             || routed_indexable_mq5
@@ -569,9 +1128,11 @@ impl MoeResolution {
             || routed_indexable_mq3lloyd
             || routed_indexable_mixed_lloyd
             || routed_indexable_paro
-            || routed_indexable_e8;
+            || routed_indexable_e8
+            || routed_indexable_qt53_f32;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
+        let qt53_fallback_refused = routed_indexable_qt53_f32 && !use_gpu_topk;
         let needs_x_rot_local = gate_side_mq4
             || gate_fusable_mq4v2
             || routed_indexable_mixed_per_expert
@@ -630,7 +1191,67 @@ impl MoeResolution {
             use_gpu_topk,
             needs_x_rot_local,
             mixed,
+            fp8_b128_refused: false,
+            routed_indexable_qt53_f32,
+            qt53_fallback_refused,
         }
+    }
+
+    /// Resolution for a layer sealed to [`MoeRouteCapability::Fp8B128Grouped`]:
+    /// every generic route flag disabled and no refusal. The typed FP8 route
+    /// lowers its own stages; nothing here selects a generic kernel.
+    pub fn sealed_fp8() -> Self {
+        Self {
+            fp8_b128_refused: false,
+            ..Self::fp8_b128_refused()
+        }
+    }
+
+    /// All-disabled resolution for layers carrying a qt=55 operand.
+    fn fp8_b128_refused() -> Self {
+        Self {
+            gate_side_mq4: false,
+            gate_fusable: false,
+            gate_fusable_mq4v2: false,
+            routed_indexable_mq4: false,
+            routed_indexable_mq4v2: false,
+            routed_indexable_mq5: false,
+            routed_indexable_mq6: false,
+            routed_indexable_mq6v2: false,
+            routed_indexable_mixed_gu4_dn6: false,
+            routed_indexable_mq2lloyd: false,
+            routed_indexable_mq2lloyd_u: false,
+            routed_indexable_mq3lloyd: false,
+            routed_indexable_mixed_lloyd: false,
+            routed_indexable_mixed_per_expert: false,
+            routed_indexable_paro: false,
+            use_gpu_topk: false,
+            needs_x_rot_local: false,
+            mixed: false,
+            fp8_b128_refused: true,
+            routed_indexable_qt53_f32: false,
+            qt53_fallback_refused: false,
+        }
+    }
+
+    /// Typed execution guard for the generic decode route. `route` is the
+    /// layer's selected specialized route: only
+    /// [`MoeRouteCapability::Fp8B128Grouped`] may carry qt=55 operands.
+    pub fn check_generic_route(
+        &self,
+        route: Option<MoeRouteCapability>,
+    ) -> Result<(), DispatchError> {
+        if self.fp8_b128_refused && !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
+            return Err(fp8_b128_generic_refusal());
+        }
+        // qwen35 qt53 routed-down typed fallback: the specialized Flash-Next route
+        // never consults this state.
+        if self.qt53_fallback_refused && !route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
+            return Err(qt53_fallback_unsupported(
+                "qt53-routed-down-fallback-needs-gpu-topk-k8",
+            ));
+        }
+        Ok(())
     }
 
     pub fn routed_indexable(&self) -> bool {
@@ -645,6 +1266,7 @@ impl MoeResolution {
             || self.routed_indexable_mq3lloyd
             || self.routed_indexable_mixed_lloyd
             || self.routed_indexable_paro
+            || self.routed_indexable_qt53_f32
     }
 }
 
@@ -715,6 +1337,9 @@ pub trait RoutedExpertWeights {
     /// empty sets and borrowed views. Packed adapters must override this using
     /// their allocation owners: a borrowed buffer is not residency metadata.
     fn host_mapped_projections(&self) -> (bool, bool) {
+        if let Some(tier) = self.tier_identity() {
+            return tier.host_projections();
+        }
         self.get(0).map_or((false, false), |(gate_up, down)| {
             (
                 gate_up.buf.buf.is_host_mapped(),
@@ -753,9 +1378,31 @@ pub trait RoutedExpertWeights {
 
     /// Whether the routed experts live in host-mapped memory. Expert views are
     /// borrowed byte views, so the owner's placement must be carried here; a
-    /// layer's experts share one residency. `false` by default.
+    /// layer's experts share one residency. `false` by default; an explicit
+    /// tier binding answers `any_host`.
     fn host_mapped(&self) -> bool {
-        false
+        self.tier_identity()
+            .is_some_and(ExpertTierIdentity::any_host)
+    }
+
+    /// Explicit per-expert tier placement of this layer (`None` for every
+    /// legacy layer). When `Some`, residency is never inferred from expert 0,
+    /// and the live binding retains and revalidates this identity.
+    fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+        None
+    }
+
+    /// Eager CPU-cold/GPU-hot split executor attached to this layer (the arch
+    /// owns attachment, the immutable expert placement and the format/layout
+    /// admission). `None` (the default) leaves every call in its ordinary
+    /// mode. When `Some`, a call of at most
+    /// [`crate::cpu_split::CPU_SPLIT_MAX_ROWS`] rows on the original grouped
+    /// QT44/QT53 route is sealed in the distinct split mode: the routed GPU
+    /// tail reads the executor's masked ids while the CPU computes the cold
+    /// slots' unweighted outputs, and the canonical combine still reads the
+    /// original route. Wider windows are ordinary wide prefill.
+    fn cpu_split(&self) -> Option<&crate::cpu_split::CpuSplitExecutor> {
+        None
     }
 }
 
@@ -868,6 +1515,7 @@ pub struct MoeTileExchangeParams<'a> {
 /// its weight/config/scratch structs. Resolution is owned by the family
 /// (the model passes only the dtype snapshot + k); the executor computes
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
+#[derive(Clone, Copy)]
 pub struct MoeParams<'a> {
     pub dtypes: MoeDtypes<'a>,
     pub recipe: MoeRecipe,
@@ -882,6 +1530,9 @@ pub struct MoeParams<'a> {
     pub k: usize,
     pub n_exp: usize,
     pub norm_topk_prob: bool,
+    /// `Some` for a biased sigmoid router (only with
+    /// [`MoeRecipe::SigmoidRoutedNoShared`]); `None` keeps the unbiased top-8.
+    pub selection_bias: Option<MoeSelectionBias<'a>>,
     pub x_rot_prerotated: bool,
     /// Single-GPU lowered-decode experiment: leave the atomic-free routed
     /// output expanded so the architecture layer can combine it into the
@@ -1227,6 +1878,7 @@ pub struct MoeStageTables<'a> {
 ///
 /// All tensor refs are `&'a GpuTensor` (shared, not `&mut` — GpuTensor is Copy).
 /// Scratch tensors are model-owned; the family holds only references.
+#[derive(Clone, Copy)]
 pub struct MoePrefillParams<'a> {
     // dtype snapshot
     pub dtypes: MoeDtypes<'a>,
@@ -1328,6 +1980,7 @@ pub struct MoePrefillParams<'a> {
     /// Layer index handed to `ep_row_gather` (it selects the gather buffer);
     /// read only when `ep_row_gather` is `Some`, `0` otherwise.
     pub ep_layer_idx: u16,
+
     /// Owner-routed EP chunk exchange (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): when
     /// `Some`, the lowering admits only the grouped symmetric IU4 prefill (the
     /// verified-symmetric QT44/QT53 route at >= 512 rows), inserts a
@@ -1335,6 +1988,14 @@ pub struct MoePrefillParams<'a> {
     /// mutation fence and the combine, and the grouped gate/up and down read
     /// the masked tile ids. `None` (the default) changes nothing.
     pub ep_tile_exchange: Option<MoeTileExchangeParams<'a>>,
+    /// Default-off expert IU4 prefill capability (`HIPFIRE_MOE_SYM_IU4`), bound
+    /// only by an architecture whose loader verified the routed tensors: the
+    /// loader's [`ExpertIu4Spec`](crate::families::moe_expert_iu4::ExpertIu4Spec)
+    /// and a `bool` that is `true` only when the loader verified symmetric
+    /// headers on every routed gate/up and down tensor of ALL model layers.
+    /// `None` (every non-Qwen35 constructor, and Qwen35 with the flag off) means
+    /// the route does not exist for this call and changes nothing.
+    pub expert_iu4: Option<(crate::families::moe_expert_iu4::ExpertIu4Spec, bool)>,
 }
 /// Dtype-only admission snapshot for grouped MoE prefill.
 ///
@@ -1539,6 +2200,19 @@ pub fn gated_moe_prefill_admissible_for_dtypes(
         return true;
     }
 
+    // qwen35 qt53 routed-down typed fallback: uniform qt44 gate/up + uniform qt53
+    // down. The shared expert stays an MQ4/MQ6 (G256) dense projection pair.
+    if dtypes.expert_gate_up == DType::MQ4G256V2 && dtypes.expert_down == DType::MQ4G128V2 {
+        let shared_gu_dt = dtypes.shared_expert_gate;
+        let shared_ok = |dtype: DType| {
+            matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2)
+                || (admit_mq6 && matches!(dtype, DType::MQ6G256 | DType::MQ6G256V2))
+        };
+        return shared_ok(shared_gu_dt)
+            && dtypes.shared_expert_up == shared_gu_dt
+            && shared_ok(dtypes.shared_expert_down);
+    }
+
     if admit_mq6 {
         let shared_gu_dt = dtypes.shared_expert_gate;
         let shared_gu_ok = matches!(
@@ -1603,6 +2277,261 @@ pub fn gated_moe_prefill_admissible(
 /// verify use site, not here.
 pub const NARROW_VERIFY_MAX_ROWS: usize = 4;
 
+/// Actual storage bound (rows) of a CPU split executor: the single
+/// [`crate::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS`] declaration (64) owned by
+/// `cpu_split.rs`. Storage only, NOT a qualification or a default: the legacy
+/// default route still admits at most [`NARROW_VERIFY_MAX_ROWS`] rows, and a
+/// 5..64-row call additionally needs an explicit lab-wide qualification (the
+/// routing/admission owners' `verify_rows > 8` scope). Never define a second
+/// spelling of either width here.
+pub use crate::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS;
+
+/// Per-call lab-wide verify scope the routing slice measured for this call.
+///
+/// G2/G4 contract: BOTH explicit lab arms — `wide8` and `wide64` — execute the
+/// FULL logical R1..64 CPU expert backend after actual 640-slot storage. The
+/// `wide8` arm only closes the GPU few-row projection routes above 8 (the
+/// incumbent prefill-kernel baseline); it MUST NOT leave a CPU backend hard
+/// cap of 8/4 or force a whole-forward chunk.
+///
+/// Gate (presence, not value): the CPU experimental capacity is gated on
+/// EXPLICIT existing-oracle-override presence plus the eager-verify scope and
+/// actual allocated storage — never on `Gpu::few_row_limit` as a CPU physical
+/// capacity (that is a GPU projection-route limit, not CPU storage). Concretely
+/// `lab_armed` is true only when the caller observed the existing oracle
+/// override present (the `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` developer var or the
+/// runtime override) on an exact oracle arch alongside an eager (non-prefill,
+/// non-captured) verify scope. Default (no lab override present) remains
+/// qualified CPU 4; ordinary prefill and lanes are unchanged (they never arm).
+/// Carried per call (never a global), so an ordinary prefill in the same
+/// process keeps the default 4-row route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuWideVerifyScope {
+    /// Explicit lab override observed present for this call.
+    pub lab_armed: bool,
+    /// Frozen row-exact verify rows measured for this call (the existing
+    /// override value clamped `8..=64`, or the per-arch table default).
+    /// Informational only: NEVER a CPU capacity (see `lab_armed`).
+    pub verify_rows: usize,
+}
+
+impl CpuWideVerifyScope {
+    /// Default product scope: no lab override observed.
+    pub const fn default_scope() -> Self {
+        Self {
+            lab_armed: false,
+            verify_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+        }
+    }
+
+    /// Scope from an observed override presence plus the measured
+    /// `verify_rows` value (already clamped `8..=64` by the frozen getter).
+    /// `lab_armed` MUST be the existing-override presence (env or runtime) on
+    /// an exact oracle arch with an eager verify scope — never derived from
+    /// `few_row_limit`, which is a GPU route limit, not CPU storage.
+    pub const fn from_lab_presence(lab_armed: bool, verify_rows: usize) -> Self {
+        Self {
+            lab_armed,
+            verify_rows,
+        }
+    }
+
+    /// Scope from a measured `verify_rows` value alone (no presence signal).
+    /// Presence-unknown callers MUST use this: a value above 8 does NOT arm
+    /// the lab path by itself (a wide GPU arm is not CPU storage proof).
+    /// Kept for back-compat; prefer [`Self::from_lab_presence`].
+    pub const fn from_verify_rows(verify_rows: usize) -> Self {
+        Self {
+            lab_armed: false,
+            verify_rows,
+        }
+    }
+
+    /// Whether this call runs inside an explicit lab-wide eager-verify scope:
+    /// the existing oracle override was observed present. Ordinary prefill,
+    /// lanes and the default product route read `false`.
+    pub const fn is_lab_wide(&self) -> bool {
+        self.lab_armed
+    }
+
+    /// Qualified CPU rows for this call: 4 on the default route; inside an
+    /// explicit lab-wide scope, `min(capacity, STORAGE)` — the ACTUAL
+    /// allocated capacity, never the `verify_rows` clamp. `verify_rows` is the
+    /// informational GPU arm width only; the wide8 baseline
+    /// (`from_lab_presence(true, 8)`) with 64-row storage qualifies the FULL
+    /// R1..64 CPU backend. The executor gate independently checks allocated
+    /// capacity. Default (unarmed) stays qualified 4.
+    pub const fn qualified_max_rows(&self, capacity_rows: usize) -> usize {
+        if !self.lab_armed {
+            return NARROW_VERIFY_MAX_ROWS;
+        }
+        if capacity_rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        } else {
+            capacity_rows
+        }
+    }
+}
+
+/// Prewarmed D1 host-slot scratch rows visible to the routing slice (the
+/// admission owner's `reserve_moe_cpu_host_slot_scratch` reservation, in rows;
+/// `0` until the admission owner prewarms 64-row storage). Room for the
+/// admission owner to back this with its real reservation getter without a
+/// routing-slice edit: routing calls ONLY this function for the D1 capacity
+/// source, never a constant. D1 has no split executor, so the executor
+/// capacity API does not apply here.
+/// D1 capacity source: the binding minimum of actual prewarmed host-slot
+/// scratch rows and actual pinned-transfer stage rows for this call's
+/// geometry, on the calling thread. `dim/mi/top_k` are the call's expert
+/// geometry; `device_id` is the sealing context's device. Returns `0`
+/// (legacy `<= 4` windows only, fail-closed) when nothing is prewarmed, when
+/// geometry is zero/overflows, or when the stage belongs to another device or
+/// is pending. Routing calls ONLY this function for the D1 capacity source,
+/// never a constant. The admission owner prewarms both (`admission` +
+/// `reserve_cpu_transfer_values`); this function only reads actuals.
+///
+/// Stage formula authority (`cpu_exec.rs`): `stage_bytes = (n_x + slots) * 8`
+/// with `n_x = R*dim` (activation + residual) and `slots = R*top_k` (indices +
+/// weights), so `stage_rows = bytes / (8 * (dim + top_k))`. A `4*(dim+2*top_k)`
+/// inverse would undercharge the stage and overstate capacity — never use it.
+pub fn cpu_d1_prewarmed_scratch_rows(dim: usize, mi: usize, top_k: usize, device_id: i32) -> usize {
+    let host_rows = crate::cpu_exec::moe_cpu_host_slot_scratch_capacity_rows(dim, mi, top_k);
+    if host_rows == 0 {
+        return 0;
+    }
+    let per_row = (dim as u128)
+        .checked_add(top_k as u128)
+        .unwrap_or(u128::MAX);
+    if per_row == 0 {
+        return 0;
+    }
+    let stage_bytes = crate::cpu_exec::cpu_transfer_capacity_bytes(device_id) as u128;
+    let denom = per_row.checked_mul(8).unwrap_or(0);
+    if denom == 0 {
+        return 0;
+    }
+    let stage_rows = (stage_bytes / denom).min(usize::MAX as u128) as usize;
+    host_rows.min(stage_rows)
+}
+
+/// Whether a D1 (`cpu_deferred_experts`) window of `rows` real rows over
+/// `route_rows` routing rows takes the CPU splice under this call's lab-wide
+/// scope with prewarmed host scratch: decode and a whole verify window of at
+/// most `scope.qualified_max_rows(scratch_rows)` rows, and only when the real
+/// rows are the whole routing window. Default (no lab override present, or no
+/// prewarm yet) keeps the legacy 4-row gate; an explicit lab-wide eager-verify
+/// scope with actual 64-row prewarmed scratch admits the whole logical 1..64
+/// window. Ordinary prefill and lanes never arm (their `armed` is false or
+/// their rows are not the whole routing window). No chunking, no new math.
+pub const fn cpu_d1_wide_window_qualified(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    scope: CpuWideVerifyScope,
+    scratch_rows: usize,
+) -> bool {
+    // The legacy `<= 4`-row windows never need prewarmed scratch (an armed
+    // scope with nothing prewarmed is fail-closed to them, not to zero rows).
+    let scoped = scope.qualified_max_rows(scratch_rows);
+    let qualified = if scoped < NARROW_VERIFY_MAX_ROWS {
+        NARROW_VERIFY_MAX_ROWS
+    } else {
+        scoped
+    };
+    crate::cpu_split::cpu_splice_window_qualified(armed, rows, route_rows, qualified)
+}
+
+/// Whether a call of `rows` real rows over `route_rows` routing rows takes the
+/// CPU routed-expert window on a layer that is `armed`, under this call's
+/// lab-wide scope and the executor's allocated capacity: decode and a verify
+/// window of at most `scope.qualified_max_rows(capacity_rows)` rows, and only
+/// when the real rows are the whole routing window. A call over a wider
+/// routing window (a short tail of a long prefill whose `route_rows` is the
+/// canonical chunk) takes the GPU route. No chunking: the whole logical
+/// 1..64-row window seals one forward; GDN/QSA/PLE/capture keep full-window
+/// state. `capacity_rows` is the executor's allocated
+/// [`crate::cpu_split::CpuSplitExecutor::capacity_rows`]; callers MUST pass
+/// the executor's own value, never a constant.
+pub const fn cpu_wide_window_qualified(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    scope: CpuWideVerifyScope,
+    capacity_rows: usize,
+) -> bool {
+    let qualified = scope.qualified_max_rows(capacity_rows);
+    crate::cpu_split::cpu_splice_window_qualified(armed, rows, route_rows, qualified)
+}
+
+/// The layer's CPU split executor when a `rows`-row call takes the split mode
+/// on the default route (`1..=NARROW_VERIFY_MAX_ROWS` rows and the owner
+/// attached an executor with allocated capacity for them). Storage-only gate:
+/// wider logical windows return `None` here and qualify only through
+/// [`cpu_wide_window_qualified`] with an explicit lab-wide scope plus the
+/// executor's allocated [`crate::cpu_split::CpuSplitExecutor::capacity_rows`].
+/// The one predicate both sealing and execution read on the default path;
+/// unqualified wider windows stay ordinary wide prefill.
+pub fn cpu_split_executor(
+    experts: &dyn RoutedExpertWeights,
+    rows: usize,
+) -> Option<&crate::cpu_split::CpuSplitExecutor> {
+    if rows == 0 || rows > crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+        return None;
+    }
+    experts
+        .cpu_split()
+        .filter(|executor| rows <= executor.capacity_rows())
+}
+
+/// The layer's CPU split executor for a call inside an explicit lab-wide
+/// verify scope: `1..=STORAGE`-row logical windows whose executor has
+/// allocated capacity for them. The routing slice calls this ONLY after
+/// [`cpu_wide_window_qualified`] admitted the window (armed layer, whole
+/// routing window, qualified width, allocated capacity); the executor then
+/// independently refuses any `rows` past its allocation. Unqualified windows
+/// (ordinary prefill, lanes, default route) never reach this and keep the
+/// [`cpu_split_executor`] default-4 gate. Full-window state/capture/ticket
+/// stay intact: one forward, never chunked.
+pub fn cpu_split_executor_wide(
+    experts: &dyn RoutedExpertWeights,
+    rows: usize,
+) -> Option<&crate::cpu_split::CpuSplitExecutor> {
+    if rows == 0 || rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+        return None;
+    }
+    experts
+        .cpu_split()
+        .filter(|executor| rows <= executor.capacity_rows())
+}
+
+impl<'a> MoeParams<'a> {
+    /// A by-value view of this call whose routed ids are `ids`; every other
+    /// operand, including the weights the canonical combine reads, is shared.
+    /// Only the GPU routed gate/up, activation and down readers of the CPU
+    /// split take it; the original route is never rewritten.
+    pub fn with_topk_indices<'b>(&self, ids: &'b GpuTensor) -> MoeParams<'b>
+    where
+        'a: 'b,
+    {
+        let mut view: MoeParams<'b> = *self;
+        view.topk_indices = ids;
+        view
+    }
+}
+
+impl<'a> MoePrefillParams<'a> {
+    /// Prefill counterpart of [`MoeParams::with_topk_indices`] (also read by
+    /// the grouped scatter).
+    pub fn with_topk_indices<'b>(&self, ids: &'b GpuTensor) -> MoePrefillParams<'b>
+    where
+        'a: 'b,
+    {
+        let mut view: MoePrefillParams<'b> = *self;
+        view.topk_indices = ids;
+        view
+    }
+}
+
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
 ///
 /// Distinct from [`MoeResolution`] (decode) — prefill adds the Path 0/1/2
@@ -1627,6 +2556,15 @@ pub struct MoePrefillResolution {
     /// projections. Default mixed layers back to FP16 WMMA; explicit
     /// HIPFIRE_MOE_GROUPED_I8=1 still opts into the research path.
     pub force_mq4_grouped_fp16: bool,
+    /// Refusal state: a qt=55 operand is present, so every path flag above is
+    /// disabled. Resolution stays infallible; [`Self::check_generic_route`]
+    /// raises the typed refusal at execution.
+    pub fp8_b128_refused: bool,
+    /// Refusal state: the qwen35 qt53 routed-down fallback shape is present on
+    /// a Path 0 (gfx9 atomic-GEMV) device, which has no qt53 down; the
+    /// typed refusal is raised before any launch. Never set for FP8 or for a
+    /// layer on the specialized Flash-Next route (exempt in the check).
+    pub qt53_refused: bool,
 }
 
 impl MoePrefillResolution {
@@ -1664,6 +2602,18 @@ impl MoePrefillResolution {
         is_verify: bool,
         has_host_projection: bool,
     ) -> Self {
+        if d.has_fp8_b128_projection() {
+            return Self {
+                use_path2: false,
+                down_path0: false,
+                use_paro_i8: false,
+                use_paro_i8_k8: false,
+                paro_mode: false,
+                force_mq4_grouped_fp16: false,
+                fp8_b128_refused: true,
+                qt53_refused: false,
+            };
+        }
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         // Resident routed experts never take the narrow-verify route: only a
         // host-mapped verify window moves to Path 1.
@@ -1682,7 +2632,9 @@ impl MoePrefillResolution {
             && !d.routed_has_mixed_experts
             && matches!(d.routed_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
             && matches!(d.routed_down, DType::MQ4G256 | DType::MQ4G256V2);
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify);
+        let use_path2 = flags.moe_grouped_gemm
+            && arch.has_wmma()
+            && (!narrow_verify || offloaded_uniform_verify);
         // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
         // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and
@@ -1750,7 +2702,43 @@ impl MoePrefillResolution {
             use_paro_i8_k8,
             paro_mode,
             force_mq4_grouped_fp16,
+            fp8_b128_refused: false,
+            qt53_refused: d.qt53_routed_down_fallback() && down_path0 && !use_path2,
         }
+    }
+
+    /// Resolution for a layer sealed to [`MoeRouteCapability::Fp8B128Grouped`]:
+    /// every generic path flag disabled (no Path 0/1/2) and no refusal. The
+    /// typed FP8 route is a separate arm in the sealed selection.
+    pub fn sealed_fp8() -> Self {
+        Self {
+            use_path2: false,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+            fp8_b128_refused: false,
+            qt53_refused: false,
+        }
+    }
+
+    /// Typed execution guard for the generic prefill route (Paths 0/1/2).
+    /// `route` is the layer's selected specialized route: only
+    /// [`MoeRouteCapability::Fp8B128Grouped`] may carry qt=55 operands.
+    pub fn check_generic_route(
+        &self,
+        route: Option<MoeRouteCapability>,
+    ) -> Result<(), DispatchError> {
+        if self.fp8_b128_refused && !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
+            return Err(fp8_b128_generic_refusal());
+        }
+        if self.qt53_refused && !route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
+            return Err(qt53_fallback_unsupported(
+                "qt53-routed-down-fallback-path0-unsupported",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2083,7 +3071,7 @@ mod tests {
         d
     }
 
-    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 6] {
+    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 8] {
         // Exhaustive destructuring makes a new resolution field require an
         // explicit comparison here, without changing the production API.
         let MoePrefillResolution {
@@ -2093,6 +3081,8 @@ mod tests {
             use_paro_i8_k8,
             paro_mode,
             force_mq4_grouped_fp16,
+            fp8_b128_refused,
+            qt53_refused,
         } = r;
         [
             *use_path2,
@@ -2101,11 +3091,15 @@ mod tests {
             *use_paro_i8_k8,
             *paro_mode,
             *force_mq4_grouped_fp16,
+            *fp8_b128_refused,
+            *qt53_refused,
         ]
     }
 
     fn assert_resident_verify_matches_legacy(d: &MoeDtypes<'_>) {
-        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942"] {
+        for arch_name in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942",
+        ] {
             for flag_case in 0..4 {
                 let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test(arch_name);
                 match flag_case {
@@ -2130,7 +3124,9 @@ mod tests {
                         prefill_resolution_fields(&resident),
                         prefill_resolution_fields(&legacy),
                         "{arch_name}, {:?}/{:?}, mixed={}, flags={flag_case}, batch={batch}",
-                        d.routed_gate_up, d.routed_down, d.routed_has_mixed_experts,
+                        d.routed_gate_up,
+                        d.routed_down,
+                        d.routed_has_mixed_experts,
                     );
                 }
             }
@@ -2156,7 +3152,12 @@ mod tests {
 
     #[test]
     fn prefill_resident_verify_mixed_experts_matches_legacy_all_fields() {
-        for representative in [DType::MQ4G256, DType::MQ6G256, DType::MQ6G256V2, DType::MQ5G256] {
+        for representative in [
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256,
+        ] {
             let mut d = uniform_prefill_dtypes(representative);
             d.routed_has_mixed_experts = true;
             d.experts_all_gate_up_mq4 = false;
@@ -2187,7 +3188,10 @@ mod tests {
             let decode = MoePrefillResolution::resolve_with_batch_ctx(
                 &d, &ctx.arch, &ctx.flags, 1, true, true,
             );
-            assert!(!decode.use_path2, "one row must not take the Path 2 re-admit");
+            assert!(
+                !decode.use_path2,
+                "one row must not take the Path 2 re-admit"
+            );
 
             let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1201");
             flags.moe_grouped_gemm = false;
@@ -2195,7 +3199,10 @@ mod tests {
                 let disabled = MoePrefillResolution::resolve_with_batch_ctx(
                     &d, &ctx.arch, &flags, batch, true, true,
                 );
-                assert!(!disabled.use_path2, "re-admit must respect grouped-GEMM opt-out");
+                assert!(
+                    !disabled.use_path2,
+                    "re-admit must respect grouped-GEMM opt-out"
+                );
             }
         }
     }
@@ -2229,7 +3236,16 @@ mod tests {
                     );
                     assert_eq!(
                         prefill_resolution_fields(&host),
-                        [false, false, false, false, dtype == DType::ParoQ4G128, false],
+                        [
+                            false,
+                            false,
+                            false,
+                            false,
+                            dtype == DType::ParoQ4G128,
+                            false,
+                            false,
+                            false // qt53_refused: none of these dtypes is qt53
+                        ],
                         "{arch_name}, {dtype:?}, batch={batch}",
                     );
                 }
@@ -2295,8 +3311,595 @@ mod tests {
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&1));
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&0));
         for n in 2..=NARROW_VERIFY_MAX_ROWS {
-            assert!((2..=NARROW_VERIFY_MAX_ROWS).contains(&n), "verify range must admit {n}");
+            assert!(
+                (2..=NARROW_VERIFY_MAX_ROWS).contains(&n),
+                "verify range must admit {n}"
+            );
         }
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&(NARROW_VERIFY_MAX_ROWS + 1)));
+    }
+
+    #[test]
+    fn cpu_wide_scope_truth_table_is_1_to_64_wiring_only() {
+        // Wiring only — MUST NOT be counted as numeric proof. The G1/G2
+        // family gates (real-layer exact parity, long-prefill staging) still
+        // qualify 5..64; this test only pins the routing/admission truth:
+        // default scope admits 1..=4, lab-wide scope admits whole 1..64
+        // windows with allocated capacity, tails never qualify.
+        use crate::cpu_split::{cpu_splice_window_qualified, CPU_SPLIT_MAX_ROWS};
+        assert_eq!(NARROW_VERIFY_MAX_ROWS, 4);
+        assert_eq!(CPU_SPLIT_STORAGE_MAX_ROWS, 64);
+        let default = CpuWideVerifyScope::default_scope();
+        assert!(!default.is_lab_wide());
+        assert_eq!(default.qualified_max_rows(64), 4);
+        // Value alone never arms: a wide GPU arm without override presence is
+        // not CPU storage proof (G2/G4: never gate on few_row_limit-as-value).
+        for verify in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            let scope = CpuWideVerifyScope::from_verify_rows(verify);
+            assert!(!scope.is_lab_wide(), "verify={verify}");
+            assert_eq!(scope.qualified_max_rows(64), 4, "verify={verify}");
+        }
+        // Presence arms both lab widths: wide8 AND wide64 execute the FULL
+        // logical R1..64 backend after actual storage (wide8 only closes the
+        // GPU few-row projection routes above 8; it must not cap the CPU at 8).
+        // Qualification is actual capacity clamped to storage — NEVER the
+        // verify_rows value (required wide8-baseline R64 CPU reachability).
+        assert_eq!(
+            CpuWideVerifyScope::from_lab_presence(true, 8).qualified_max_rows(64),
+            64,
+        );
+        for verify in [8usize, 9, 16, 64] {
+            let scope = CpuWideVerifyScope::from_lab_presence(true, verify);
+            assert!(scope.is_lab_wide(), "verify={verify}");
+            for capacity in [0usize, 1, 4, 8, 40, 64, 65, 512] {
+                assert_eq!(
+                    scope.qualified_max_rows(capacity),
+                    capacity.min(CPU_SPLIT_STORAGE_MAX_ROWS),
+                    "verify={verify} capacity={capacity}"
+                );
+            }
+        }
+        // Lab-wide scope at every width qualifies actual capacity (capped by
+        // storage), independent of the verify width; unarmed stays 4.
+        for verify in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            let scope = CpuWideVerifyScope::from_lab_presence(true, verify);
+            assert!(scope.is_lab_wide(), "verify={verify}");
+            assert_eq!(scope.qualified_max_rows(64), 64, "verify={verify}");
+            assert_eq!(scope.qualified_max_rows(4), 4, "verify={verify}");
+        }
+        // Whole-window predicate across the full logical 1..64 range: armed
+        // whole windows qualify iff within the qualified width; tails
+        // (`rows != route_rows`) and zero rows never do.
+        for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            assert!(
+                cpu_splice_window_qualified(true, rows, rows, CPU_SPLIT_MAX_ROWS) == (rows <= 4)
+            );
+            assert!(cpu_wide_window_qualified(true, rows, rows, default, 64) == (rows <= 4));
+            // wide8 presence executes the FULL R1..64 backend (not capped at 8).
+            let lab8 = CpuWideVerifyScope::from_lab_presence(true, 8);
+            assert!(
+                cpu_wide_window_qualified(true, rows, rows, lab8, 64),
+                "wide8 rows={rows}"
+            );
+            let lab64 = CpuWideVerifyScope::from_lab_presence(true, 64);
+            assert!(cpu_wide_window_qualified(true, rows, rows, lab64, 64));
+            assert!(!cpu_wide_window_qualified(true, rows, rows, lab64, 4) || rows <= 4);
+            assert!(!cpu_wide_window_qualified(true, rows, rows + 1, lab64, 64));
+            assert!(!cpu_wide_window_qualified(true, rows, 64, lab64, 64) || rows == 64);
+        }
+        assert!(!cpu_wide_window_qualified(true, 0, 0, default, 64));
+        assert!(!cpu_wide_window_qualified(false, 4, 4, default, 64));
+        // Storage gate: beyond-64 never resolves, even lab-wide.
+        assert!(cpu_split_executor_wide_is_none_past_storage());
+    }
+
+    #[test]
+    fn cpu_d1_wide_truth_is_1_to_64_wiring_only() {
+        // Wiring only — MUST NOT be counted as numeric proof. Default keeps the
+        // legacy `<= 4` gate; lab presence with prewarmed scratch admits whole
+        // logical 1..64 windows; tails/zero/unprewarmed refuse.
+        let default = CpuWideVerifyScope::default_scope();
+        let lab64 = CpuWideVerifyScope::from_lab_presence(true, 64);
+        let lab8 = CpuWideVerifyScope::from_lab_presence(true, 8);
+        for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, default, 64) == (rows <= 4));
+            // No prewarm (0 rows): only legacy windows qualify, even when armed.
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, lab64, 0) == (rows <= 4));
+            // Prewarmed 64: full window qualifies (wide8 presence included).
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, lab64, 64));
+            assert!(cpu_d1_wide_window_qualified(true, rows, rows, lab8, 64));
+            // Tails never qualify.
+            assert!(!cpu_d1_wide_window_qualified(
+                true,
+                rows,
+                rows + 1,
+                lab64,
+                64
+            ));
+            // Unprewarmed geometry reports 0 rows (fail-closed): zero dims and
+            // an unreserved thread hold no rows.
+            assert_eq!(cpu_d1_prewarmed_scratch_rows(0, 640, 10, 0), 0);
+            assert_eq!(cpu_d1_prewarmed_scratch_rows(2560, 0, 10, 0), 0);
+            assert_eq!(cpu_d1_prewarmed_scratch_rows(2560, 640, 0, 0), 0);
+        }
+        assert!(!cpu_d1_wide_window_qualified(true, 0, 0, lab64, 64));
+        assert!(!cpu_d1_wide_window_qualified(false, 4, 4, lab64, 64));
+    }
+
+    #[cfg(test)]
+    fn cpu_split_executor_wide_is_none_past_storage() -> bool {
+        // The storage gate refuses 65+ structurally (no executor needed: the
+        // row bound itself rejects). Proved by the bound, not by hardware.
+        65 > CPU_SPLIT_STORAGE_MAX_ROWS
+    }
+
+    fn fp8_b128_refusal(err: DispatchError) -> bool {
+        matches!(
+            err,
+            DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "fp8b128_specialized_route_only",
+                quant: "FP8E4M3B128",
+                ..
+            }
+        )
+    }
+
+    /// Every place a qt=55 operand can sit: the generic resolutions refuse
+    /// each one with all path flags disabled.
+    fn fp8_b128_operand_cases() -> Vec<MoeDtypes<'static>> {
+        static FP8_TIERS: [DType; 2] = [DType::FP8E4M3B128, DType::FP8E4M3B128];
+        static MQ4_TIERS: [DType; 2] = [DType::MQ4G256, DType::MQ4G256];
+        let mut cases = Vec::new();
+        let mut routed = uniform_mq4();
+        routed.routed_gate_up = DType::FP8E4M3B128;
+        routed.routed_down = DType::FP8E4M3B128;
+        cases.push(routed);
+        let mut down_only = uniform_mq4();
+        down_only.routed_down = DType::FP8E4M3B128;
+        cases.push(down_only);
+        let mut router = uniform_mq4();
+        router.router = DType::FP8E4M3B128;
+        cases.push(router);
+        let mut shared = uniform_mq4();
+        shared.shared.as_mut().unwrap().down = DType::FP8E4M3B128;
+        cases.push(shared);
+        let mut tiers = uniform_mq4();
+        tiers.per_expert_gate_up = Some(&MQ4_TIERS);
+        tiers.per_expert_down = Some(&FP8_TIERS);
+        cases.push(tiers);
+        cases
+    }
+
+    #[test]
+    fn fp8_capability_predicates_are_disjoint_from_qt44() {
+        assert!(MoeRouteCapability::Fp8B128Grouped.is_fp8_grouped());
+        assert!(!MoeRouteCapability::Fp8B128Grouped.is_qt44_qt53_grouped());
+        for qt44 in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            assert!(qt44.is_qt44_qt53_grouped());
+            assert!(!qt44.is_fp8_grouped());
+        }
+    }
+
+    #[test]
+    fn fp8_b128_decode_resolution_is_a_typed_refusal_state() {
+        for arch_name in ["gfx942", "gfx1151", "gfx1201", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            for d in fp8_b128_operand_cases() {
+                assert!(d.has_fp8_b128_projection());
+                let r = MoeResolution::resolve_arch(&d, 8, ctx.arch.has_wmma());
+                assert!(r.fp8_b128_refused, "{arch_name}");
+                assert!(!r.use_gpu_topk && !r.routed_indexable() && !r.mixed);
+                assert!(!r.gate_side_mq4 && !r.gate_fusable && !r.gate_fusable_mq4v2);
+                assert!(!r.needs_x_rot_local && !r.routed_indexable_mq2lloyd_u);
+                assert!(fp8_b128_refusal(r.check_generic_route(None).unwrap_err()));
+                assert!(fp8_b128_refusal(
+                    r.check_generic_route(Some(MoeRouteCapability::Qt44Qt53Grouped))
+                        .unwrap_err()
+                ));
+                r.check_generic_route(Some(MoeRouteCapability::Fp8B128Grouped))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_b128_prefill_resolution_disables_every_path() {
+        for arch_name in ["gfx942", "gfx1151", "gfx1201", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            for d in fp8_b128_operand_cases() {
+                for (batch, verify, host) in [
+                    (0, false, false),
+                    (1, false, false),
+                    (2, true, true),
+                    (4, true, false),
+                ] {
+                    let r = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, verify, host,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&r),
+                        // qwen35 qt53 routed-down typed fallback: eighth field is qt53_refused.
+                        [false, false, false, false, false, false, true, false],
+                        "{arch_name} batch={batch}",
+                    );
+                    assert!(fp8_b128_refusal(r.check_generic_route(None).unwrap_err()));
+                    assert!(fp8_b128_refusal(
+                        r.check_generic_route(Some(MoeRouteCapability::Qt44Qt53Grouped))
+                            .unwrap_err()
+                    ));
+                    r.check_generic_route(Some(MoeRouteCapability::Fp8B128Grouped))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_fp8_resolution_has_no_refusal_state() {
+        let ctx = crate::context::DispatchCtx::for_test("gfx942");
+        let d = uniform_mq4();
+        assert!(!d.has_fp8_b128_projection());
+        let decode = MoeResolution::resolve_arch(&d, 8, ctx.arch.has_wmma());
+        assert!(!decode.fp8_b128_refused);
+        decode.check_generic_route(None).unwrap();
+        let prefill = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+        assert!(!prefill.fp8_b128_refused);
+        prefill.check_generic_route(None).unwrap();
+    }
+
+    /// The cold codec comes from the layer's whole per-expert metadata, never
+    /// from the first expert or the arch alone.
+    #[test]
+    fn slab_cold_codec_is_read_from_every_expert_pair() {
+        const MQ4: (DType, DType) = (DType::MQ4G256V2, DType::MQ4G128V2);
+        const W3: (DType, DType) = (DType::MQ3I4G128R256, DType::MQ3I4G128R128);
+        const E8P: (DType, DType) = (DType::E8PI4G128R256, DType::E8PI4G128R128);
+        const W2: (DType, DType) = (DType::MQ2I4G128R256, DType::MQ2I4G128R128);
+        let layer = |pairs: &[(DType, DType)], admits: &dyn Fn(u8) -> bool| {
+            let gate_up: Vec<DType> = pairs.iter().map(|pair| pair.0).collect();
+            let down: Vec<DType> = pairs.iter().map(|pair| pair.1).collect();
+            let mut dtypes = uniform_mq4();
+            dtypes.routed_has_mixed_experts = true;
+            dtypes.routed_gate_up = gate_up[0];
+            dtypes.routed_down = down[0];
+            layer_cold_codec(
+                &MoeDtypes {
+                    per_expert_gate_up: Some(&gate_up),
+                    per_expert_down: Some(&down),
+                    ..dtypes
+                },
+                admits,
+            )
+        };
+        let all = |_: u8| true;
+        // MQ4 first, one cold expert far behind it.
+        assert_eq!(layer(&[MQ4, MQ4, MQ4, E8P], &all), Some(Some(3)));
+        assert_eq!(layer(&[MQ4, W3, MQ4], &all), Some(Some(1)));
+        assert_eq!(layer(&[E8P, MQ4], &all), Some(Some(3)));
+        // Two cold codecs in one layer, W2 anywhere, an MQ4-only or cold-only
+        // mixed table all fail closed.
+        assert_eq!(layer(&[MQ4, W3, E8P], &all), None);
+        assert_eq!(layer(&[MQ4, MQ4, W2], &all), None);
+        assert_eq!(layer(&[MQ4, MQ4], &all), None);
+        assert_eq!(layer(&[W3, W3], &all), None);
+        // An arch that refuses the cold codec refuses the layer, even when
+        // the first expert is MQ4.
+        assert_eq!(layer(&[MQ4, MQ4, E8P], &|codec| codec == 0), None);
+        assert_eq!(layer(&[MQ4, E8P], &|codec| codec != 3), None);
+        // gfx1151's own admission, with the E8P receipts not landed and landed: the layer's cold
+        // codec is read from every expert; E8P is refused (even far behind MQ4) until the one
+        // switch flips, W3 is served either way, and W3 + E8P is never one layer.
+        let gfx1151 = |landed: bool| {
+            move |codec: u8| {
+                rdna_compute::slab_admission::qwen4_slab_codec_admitted_with(
+                    "gfx1151", codec, landed,
+                )
+            }
+        };
+        let (refused, landed) = (gfx1151(false), gfx1151(true));
+        assert_eq!(layer(&[MQ4, MQ4, MQ4, E8P], &refused), None);
+        assert_eq!(layer(&[E8P, MQ4], &refused), None);
+        assert_eq!(layer(&[MQ4, MQ4, MQ4, E8P], &landed), Some(Some(3)));
+        assert_eq!(layer(&[E8P, MQ4], &landed), Some(Some(3)));
+        for admits in [&refused as &dyn Fn(u8) -> bool, &landed] {
+            assert_eq!(layer(&[MQ4, W3, MQ4], admits), Some(Some(1)));
+            assert_eq!(layer(&[MQ4, W3, E8P], admits), None);
+            assert_eq!(layer(&[MQ4, MQ4, W2], admits), None);
+        }
+        let uniform_e8p = MoeDtypes {
+            routed_gate_up: E8P.0,
+            routed_down: E8P.1,
+            ..uniform_mq4()
+        };
+        assert_eq!(layer_cold_codec(&uniform_e8p, &refused), None);
+        assert_eq!(layer_cold_codec(&uniform_e8p, &landed), Some(Some(3)));
+        // Uniform layers: MQ4 has no cold codec, W3 / E8P are their own.
+        let uniform = |pair: (DType, DType)| {
+            let dtypes = MoeDtypes {
+                routed_gate_up: pair.0,
+                routed_down: pair.1,
+                ..uniform_mq4()
+            };
+            layer_cold_codec(&dtypes, &all)
+        };
+        assert_eq!(uniform(MQ4), Some(None));
+        assert_eq!(uniform(W3), Some(Some(1)));
+        assert_eq!(uniform(E8P), Some(Some(3)));
+        assert_eq!(uniform(W2), None);
+    }
+
+    fn qt53_fallback_dtypes() -> MoeDtypes<'static> {
+        MoeDtypes {
+            routed_gate_up: DType::MQ4G256V2,
+            routed_down: DType::MQ4G128V2,
+            experts_all_gate_up_mq4: false,
+            ..uniform_mq4()
+        }
+    }
+
+    /// Pure shape table of the qwen35 qt53 routed-down typed fallback: only
+    /// uniform qt44 gate/up + uniform qt53 down, qt53 nowhere else.
+    #[test]
+    fn qt53_fallback_dtype_shape_table() {
+        static MIXED_DOWN: [DType; 2] = [DType::MQ4G128V2, DType::MQ4G256V2];
+        static MIXED_GATE_UP: [DType; 2] = [DType::MQ4G256V2, DType::MQ4G256];
+        static UNIFORM_GATE_UP: [DType; 3] = [DType::MQ4G256V2; 3];
+        static UNIFORM_DOWN: [DType; 3] = [DType::MQ4G128V2; 3];
+        let base = qt53_fallback_dtypes();
+        assert!(base.qt53_routed_down_fallback());
+        let accepted = MoeDtypes {
+            per_expert_gate_up: Some(&UNIFORM_GATE_UP),
+            per_expert_down: Some(&UNIFORM_DOWN),
+            ..base
+        };
+        assert!(accepted.qt53_routed_down_fallback());
+        let shared = |edit: fn(&mut MoeSharedDtypes)| {
+            let mut d = qt53_fallback_dtypes();
+            let mut s = d.shared.unwrap();
+            edit(&mut s);
+            d.shared = Some(s);
+            d
+        };
+        let refused = [
+            MoeDtypes {
+                routed_down: DType::MQ4G256V2,
+                ..base
+            },
+            MoeDtypes {
+                routed_gate_up: DType::MQ4G256,
+                ..base
+            },
+            MoeDtypes {
+                routed_gate_up: DType::MQ4G128V2,
+                routed_down: DType::MQ4G256V2,
+                ..base
+            },
+            MoeDtypes {
+                routed_gate_up: DType::MQ4G128V2,
+                ..base
+            },
+            MoeDtypes {
+                routed_has_mixed_experts: true,
+                ..base
+            },
+            MoeDtypes {
+                has_paro_shared: true,
+                ..base
+            },
+            MoeDtypes {
+                router: DType::MQ4G128V2,
+                ..base
+            },
+            MoeDtypes {
+                per_expert_down: Some(&MIXED_DOWN),
+                ..base
+            },
+            MoeDtypes {
+                per_expert_gate_up: Some(&MIXED_GATE_UP),
+                ..base
+            },
+            MoeDtypes {
+                shared: None,
+                routed_down: DType::MQ6G256V2,
+                ..base
+            },
+            shared(|s| s.selector = DType::MQ4G128V2),
+            shared(|s| s.gate = DType::MQ4G128V2),
+            shared(|s| s.up = DType::MQ4G128V2),
+            shared(|s| s.down = DType::MQ4G128V2),
+            shared(|s| s.down = DType::FP8E4M3B128),
+            MoeDtypes {
+                router: DType::FP8E4M3B128,
+                ..base
+            },
+        ];
+        for (index, d) in refused.iter().enumerate() {
+            assert!(!d.qt53_routed_down_fallback(), "case {index}");
+        }
+        // No-shared recipe with the same routed pair stays in the shape.
+        assert!(MoeDtypes {
+            shared: None,
+            ..base
+        }
+        .qt53_routed_down_fallback());
+    }
+
+    /// Decode resolution: the shape lowers on the GPU top-K indexed path only at
+    /// k == 8; any other k is a typed refusal (no per-expert CPU fallback has a
+    /// qt53 GEMV). qt53 never claims a V2 256 indexed flag.
+    #[test]
+    fn qt53_fallback_decode_resolution_requires_gpu_topk_k8() {
+        let d = qt53_fallback_dtypes();
+        for has_wmma in [false, true] {
+            let r = MoeResolution::resolve_arch(&d, 8, has_wmma);
+            assert!(r.routed_indexable_qt53_f32 && r.routed_indexable());
+            assert!(r.use_gpu_topk && r.needs_x_rot_local && !r.qt53_fallback_refused);
+            assert!(!r.routed_indexable_mq4v2 && !r.mixed && !r.fp8_b128_refused);
+            r.check_generic_route(None).unwrap();
+            for k in [1usize, 4, 10] {
+                let r = MoeResolution::resolve_arch(&d, k, has_wmma);
+                assert!(!r.use_gpu_topk && r.qt53_fallback_refused, "k={k}");
+                assert!(matches!(
+                    r.check_generic_route(None),
+                    Err(DispatchError::UnsupportedVariant {
+                        family: "moe",
+                        variant: "qt53-routed-down-fallback-needs-gpu-topk-k8",
+                        quant: "MQ4G128V2",
+                        ..
+                    })
+                ));
+            }
+        }
+        // A non-qt53 shape never carries the qt53 flags.
+        let r = MoeResolution::resolve_arch(&uniform_mq4(), 8, false);
+        assert!(!r.routed_indexable_qt53_f32 && !r.qt53_fallback_refused);
+    }
+
+    /// Prefill resolution: Path 0 (gfx9 atomic GEMV, no qt53 down) refuses the
+    /// shape before any launch; Path 1 / Path 2 archs keep their legacy routing.
+    #[test]
+    fn qt53_fallback_prefill_resolution_refuses_only_path0_archs() {
+        let d = qt53_fallback_dtypes();
+        for (arch_name, path0, path2) in [
+            ("gfx942", true, false),
+            ("gfx906", true, false),
+            ("gfx1030", false, false),
+            ("gfx1100", false, true),
+            ("gfx1151", false, true),
+            ("gfx1201", false, true),
+        ] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            let r = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+            assert_eq!((r.down_path0, r.use_path2), (path0, path2), "{arch_name}");
+            assert_eq!(r.qt53_refused, path0, "{arch_name}");
+            match r.check_generic_route(None) {
+                Ok(()) => assert!(!path0, "{arch_name}"),
+                Err(err) => assert!(
+                    path0
+                        && matches!(
+                            err,
+                            DispatchError::UnsupportedVariant {
+                                family: "moe",
+                                variant: "qt53-routed-down-fallback-path0-unsupported",
+                                quant: "MQ4G128V2",
+                                ..
+                            }
+                        ),
+                    "{arch_name}"
+                ),
+            }
+            // Every other dtype shape keeps the legacy fields exactly.
+            let legacy = MoePrefillResolution::resolve(&uniform_mq4(), &ctx.arch, &ctx.flags);
+            assert!(!legacy.qt53_refused, "{arch_name}");
+        }
+    }
+
+    /// The Flash-Next route (`route_policy = Some(Qt44Qt53Grouped*)`) never
+    /// consults the qt53 fallback refusal: its fixed top-10 / Path 0 shapes
+    /// still pass the generic guards exactly as before.
+    #[test]
+    fn qt53_fallback_refusal_is_exempt_for_sealed_grouped_routes() {
+        let d = qt53_fallback_dtypes();
+        let decode = MoeResolution::resolve_arch(&d, 10, false);
+        assert!(decode.qt53_fallback_refused && !decode.use_gpu_topk);
+        let ctx = crate::context::DispatchCtx::for_test("gfx942");
+        let prefill = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+        assert!(prefill.qt53_refused);
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+            MoeRouteCapability::SlabCodecGrouped,
+        ] {
+            decode.check_generic_route(Some(route)).unwrap();
+            prefill.check_generic_route(Some(route)).unwrap();
+        }
+        assert!(decode.check_generic_route(None).is_err());
+        assert!(prefill.check_generic_route(None).is_err());
+    }
+
+    /// Batched-prefill dtype snapshot admission: only uniform qt44 gate/up +
+    /// qt53 down over MQ4/MQ6 G256 shared projections; qt53 anywhere else or
+    /// beside another gate/up stays refused.
+    #[test]
+    fn qt53_fallback_prefill_snapshot_admission_is_narrow() {
+        let base = MoePrefillDtypes {
+            expert_gate_up: DType::MQ4G256V2,
+            expert_down: DType::MQ4G128V2,
+            ..MoePrefillDtypes::uniform(DType::MQ4G256V2)
+        };
+        let admits = |d: &MoePrefillDtypes, mq6: bool| {
+            gated_moe_prefill_admissible_for_dtypes(d, mq6, false, false, false)
+        };
+        assert!(admits(&base, false) && admits(&base, true));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_gate_up: DType::MQ4G256,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_gate_up: DType::MQ6G256V2,
+                ..base
+            },
+            true
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                shared_expert_down: DType::MQ4G128V2,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                shared_expert_gate: DType::MQ4G128V2,
+                shared_expert_up: DType::MQ4G128V2,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                router: DType::MQ4G128V2,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_down_uniform: false,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_gate_up_uniform: false,
+                ..base
+            },
+            false
+        ));
+        // MQ6 shared projections are only admitted under the MQ6 policy switch.
+        let mq6_shared = MoePrefillDtypes {
+            shared_expert_gate: DType::MQ6G256V2,
+            shared_expert_up: DType::MQ6G256V2,
+            shared_expert_down: DType::MQ6G256V2,
+            ..base
+        };
+        assert!(!admits(&mq6_shared, false) && admits(&mq6_shared, true));
+        // The pre-existing qt53-down refusal for any other gate_up is unchanged.
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_down: DType::MQ4G128V2,
+                ..MoePrefillDtypes::uniform(DType::MQ4G256)
+            },
+            false
+        ));
     }
 }

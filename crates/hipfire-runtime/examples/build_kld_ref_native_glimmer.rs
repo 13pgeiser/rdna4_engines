@@ -84,17 +84,38 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--slice" => { slice = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--top-k" => { top_k = argv[i + 1].parse().expect("--top-k int"); i += 2; }
-            "--n-ctx" => { n_ctx = argv[i + 1].parse().expect("--n-ctx int"); i += 2; }
-            "--max-chunks" => { max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int")); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--slice" => {
+                slice = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--top-k" => {
+                top_k = argv[i + 1].parse().expect("--top-k int");
+                i += 2;
+            }
+            "--n-ctx" => {
+                n_ctx = argv[i + 1].parse().expect("--n-ctx int");
+                i += 2;
+            }
+            "--max-chunks" => {
+                max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int"));
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: build_kld_ref_native_glimmer --model <f32-oracle.hfq> --slice <txt> --output <bin> [--top-k 256] [--n-ctx 512] [--max-chunks N]");
                 std::process::exit(0);
             }
-            o => { eprintln!("unknown arg: {o}"); std::process::exit(1); }
+            o => {
+                eprintln!("unknown arg: {o}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");
@@ -126,7 +147,11 @@ fn main() {
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("build_kld_ref_native_glimmer: arch={} model={}", gpu.arch, model.display());
+    eprintln!(
+        "build_kld_ref_native_glimmer: arch={} model={}",
+        gpu.arch,
+        model.display()
+    );
     let weights = GlimmerWeights::load(&hfq, &config, &mut gpu).expect("load weights");
     eprintln!(
         "loaded {} layers, vocab={}, n_ctx={}, top_k={}, bos={}",
@@ -134,8 +159,7 @@ fn main() {
     );
 
     // -------- build the token stream --------
-    let text = std::fs::read_to_string(slice.expect("--slice required"))
-        .expect("read slice");
+    let text = std::fs::read_to_string(slice.expect("--slice required")).expect("read slice");
     let stream = tokenizer.encode(&text);
     eprintln!("hipfire tokenize: {} tokens from slice", stream.len());
 
@@ -159,7 +183,10 @@ fn main() {
         tokens.push(config.bos_token);
         tokens.extend_from_slice(&stream[c * per_chunk_stream..(c + 1) * per_chunk_stream]);
     }
-    eprintln!("chunked into {} chunks of n_ctx={} (BOS-prefixed)", n_chunk, n_ctx);
+    eprintln!(
+        "chunked into {} chunks of n_ctx={} (BOS-prefixed)",
+        n_chunk, n_ctx
+    );
 
     let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
     let scoring_start = n_ctx / 2;
@@ -176,7 +203,8 @@ fn main() {
     out.write_all(HIPFIRE_MAGIC).unwrap();
     out.write_all(&HIPFIRE_VERSION.to_le_bytes()).unwrap();
     out.write_all(&(n_ctx as u32).to_le_bytes()).unwrap();
-    out.write_all(&(config.vocab_size as u32).to_le_bytes()).unwrap();
+    out.write_all(&(config.vocab_size as u32).to_le_bytes())
+        .unwrap();
     out.write_all(&(n_chunk as u32).to_le_bytes()).unwrap();
     out.write_all(&(top_k as u16).to_le_bytes()).unwrap();
     out.write_all(&0u16.to_le_bytes()).unwrap(); // flags
@@ -197,7 +225,8 @@ fn main() {
     // here — glimmer never uses asym3; both caches are Q8.
     // kv_max = n_ctx + 16 mirrors gemma4's `kv_max` sizing.
     let kv_max = n_ctx + 16;
-    let mut state = GlimmerState::new_with_max_seq(&mut gpu, &config, kv_max).expect("GlimmerState alloc");
+    let mut state =
+        GlimmerState::new_with_max_seq(&mut gpu, &config, kv_max).expect("GlimmerState alloc");
 
     // -------- per-chunk forward + top-K reduce --------
     let k = top_k;
@@ -219,7 +248,8 @@ fn main() {
         for pos in 0..(n_ctx - 1) {
             let cand_logits = glimmer::decode_step(
                 &config, &weights, &mut state, &mut gpu, chunk[pos], pos as u32,
-            ).expect("decode_step");
+            )
+            .expect("decode_step");
             if pos < scoring_start {
                 continue;
             }
@@ -227,9 +257,15 @@ fn main() {
 
             // Convert logits -> full log-prob vector (fp64 log-softmax).
             let mut max_logit = f32::NEG_INFINITY;
-            for &v in cand_logits.iter() { if v > max_logit { max_logit = v; } }
+            for &v in cand_logits.iter() {
+                if v > max_logit {
+                    max_logit = v;
+                }
+            }
             let mut sum_exp = 0.0f64;
-            for &v in cand_logits.iter() { sum_exp += ((v - max_logit) as f64).exp(); }
+            for &v in cand_logits.iter() {
+                sum_exp += ((v - max_logit) as f64).exp();
+            }
             let log_z = (max_logit as f64) + sum_exp.ln();
 
             // NLL on the actual next token (matches eval / llama-ppl).
@@ -246,9 +282,8 @@ fn main() {
                 let lp = (v as f64 - log_z) as f32;
                 log_probs.push((idx as u32, lp));
             }
-            let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
-                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-            };
+            let cmp_desc =
+                |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal);
             if k < log_probs.len() {
                 log_probs.select_nth_unstable_by(k - 1, cmp_desc);
             }
@@ -275,7 +310,11 @@ fn main() {
                 let el = t0.elapsed().as_secs_f64();
                 eprint!(
                     "\r  chunk {:4}/{}  scored {:7}/{:7}  ({:5.1}%, {:.0} tok/s)   ",
-                    c + 1, n_chunk, scored_done, total_scored, pct,
+                    c + 1,
+                    n_chunk,
+                    scored_done,
+                    total_scored,
+                    pct,
                     scored_done as f64 / el.max(1e-9)
                 );
             }
@@ -286,12 +325,19 @@ fn main() {
     out.flush().unwrap();
     drop(out);
 
-    let mean_nll = if nll_count > 0 { nll_sum / nll_count as f64 } else { f64::NAN };
+    let mean_nll = if nll_count > 0 {
+        nll_sum / nll_count as f64
+    } else {
+        f64::NAN
+    };
     let ppl = mean_nll.exp();
     let out_size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "build_kld_ref_native_glimmer: wrote {} ({:.3} GB) — {} scored tokens in {:.1}s",
-        output.display(), out_size as f64 / 1e9, scored_done, t0.elapsed().as_secs_f64()
+        output.display(),
+        out_size as f64 / 1e9,
+        scored_done,
+        t0.elapsed().as_secs_f64()
     );
     eprintln!(
         "build_kld_ref_native_glimmer: ORACLE mean NLL = {:.6}  PPL = {:.4}  (scored window, {} tokens)",

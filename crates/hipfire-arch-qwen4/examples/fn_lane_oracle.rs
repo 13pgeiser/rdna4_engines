@@ -63,10 +63,32 @@
 //! zeroes the promoted lane's pending hidden right after the promotion (must
 //! fail the comparison).
 //!
+//! `--spec ar --promote P` (P >= 0, AR lanes beside a loaded MTP head: serve
+//! with `serve.batch_spec = false`): after the AR matrix, for every k request
+//! 0 runs on the resident native-MTP singleton (`mtp_prefill`, then P windows
+//! of `mtp_step` at depth `k`), is moved into an AR lane by
+//! `prepare_promotion` + `commit_promotion`, and the other k-1 requests are
+//! admitted and prefilled as AR lanes. The promoted stream (singleton ids,
+//! then every lane pick) must equal the AR singleton reference ids; at P = 0
+//! (promotion right after the prefill pick, as serve promotes a request that
+//! a peer queues behind) every lane step's logits row and the step-1 and
+//! last-step trunk states are compared byte for byte too. `--controls` adds a
+//! 2-lane run that skips `commit_promotion` (the lane keeps its fresh trunk
+//! state; must fail the comparison).
+//!
 //! Exit 0 only when every compared run passes and every control is detected.
 //! Nothing is written outside OUT_DIR.
+//!
+//! Model load follows `qwen4_kld`: admission on the GPU architecture
+//! (`admit_hfqm_artifact_on`), slab layer arenas served by
+//! `expert_arena::recipe_arena_payload`, and `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`
+//! (a fixed count; `auto` is refused) keeping layers 0..N resident with the
+//! rest host-mapped and borrowed from the resident source bytes.
+//!
+//! Split bases resolve existing PLE sidecars using `HIPFIRE_PLE_FORMAT`.
+//! Like the replay gate, this tool never derives missing q4 rows.
 
-use hipfire_arch_qwen4::admit_hfqm_artifact;
+use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName, StageShare};
 use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
@@ -75,7 +97,8 @@ use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
 use hipfire_arch_qwen4::state::Qwen4State;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
+use hipfire_runtime::ple_sidecar::{PleRowsChoice, PleRowsOrigin};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
 };
@@ -118,20 +141,30 @@ struct Args {
     k: usize,
     routes: RoutesArg,
     promote: Option<usize>,
+    /// Staged lane capacity override; `None` stages exactly the lanes the run drives.
+    lane_capacity: Option<usize>,
 }
 
 fn parse_list(s: &str, what: &str) -> R<Vec<usize>> {
     s.split(',')
         .filter(|v| !v.trim().is_empty())
-        .map(|v| v.trim().parse::<usize>().map_err(|x| format!("bad {what} '{v}': {x}")))
+        .map(|v| {
+            v.trim()
+                .parse::<usize>()
+                .map_err(|x| format!("bad {what} '{v}': {x}"))
+        })
         .collect()
 }
 
 fn parse_args() -> R<Args> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    parse_args_from(&raw)
+}
+
+fn parse_args_from(raw: &[String]) -> R<Args> {
     let usage = "usage: fn_lane_oracle MODEL.mq4 TEXT.txt OUT_DIR [--ks 1,2,4,8] [--contexts 512,2048,8192] \
                  [--steps 64] [--max-seq 16384] [--policy production|per-lane|<spec>] [--g0] [--controls] [--bench N] \
-                 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P]";
+                 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P] [--lane-capacity N]";
     let mut pos = Vec::new();
     let mut a = Args {
         model: PathBuf::new(),
@@ -149,11 +182,14 @@ fn parse_args() -> R<Args> {
         k: 3,
         routes: RoutesArg::Cycle,
         promote: None,
+        lane_capacity: None,
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> R<String> {
         *i += 1;
-        raw.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value\n{usage}"))
+        raw.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("{flag} needs a value\n{usage}"))
     };
     while i < raw.len() {
         match raw[i].as_str() {
@@ -173,6 +209,9 @@ fn parse_args() -> R<Args> {
             "--k" => a.k = value(&mut i, "--k")?.parse().map_err(e)?,
             "--routes" => a.routes = RoutesArg::parse(&value(&mut i, "--routes")?)?,
             "--promote" => a.promote = Some(value(&mut i, "--promote")?.parse().map_err(e)?),
+            "--lane-capacity" => {
+                a.lane_capacity = Some(value(&mut i, "--lane-capacity")?.parse().map_err(e)?)
+            }
             "--g0" => a.g0 = true,
             "--controls" => a.controls = true,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}\n{usage}")),
@@ -192,29 +231,65 @@ fn parse_args() -> R<Args> {
     if a.contexts.is_empty() || a.contexts.contains(&0) {
         return Err("--contexts must be non-empty and positive".into());
     }
+    if a.lane_capacity == Some(0) {
+        return Err("--lane-capacity must be >= 1".into());
+    }
     if a.steps == 0 {
         return Err("--steps must be >= 1".into());
     }
-    if a.spec_mtp {
-        if a.k == 0 || a.k > 7 {
-            return Err("--k must be 1..=7".into());
-        }
-        if a.g0 {
-            return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
-        }
+    if (a.spec_mtp || a.promote.is_some()) && (a.k == 0 || a.k > 7) {
+        return Err("--k must be 1..=7".into());
+    }
+    if a.spec_mtp && a.g0 {
+        return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
     }
     if let Some(p) = a.promote {
-        if !a.spec_mtp {
-            return Err("--promote needs --spec mtp".into());
-        }
-        if p == 0 {
-            return Err("--promote must be >= 1".into());
+        if a.spec_mtp && p == 0 {
+            return Err("--spec mtp --promote must be >= 1".into());
         }
         if p >= a.steps {
-            return Err(format!("--promote {p} must be below --steps {} (the lane needs a window)", a.steps));
+            return Err(format!(
+                "--promote {p} must be below --steps {} (the lane needs a window)",
+                a.steps
+            ));
         }
     }
     Ok(a)
+}
+
+/// Most lanes one lane store holds (`MAX_LANES` in `lane.rs`, private there).
+const LANE_STORE_MAX_LANES: usize = 64;
+
+/// Logical lanes the run drives: the active `--ks` maximum, 8 for `--g0`, 2 for
+/// `--controls`. This is the singleton-reference count and never depends on
+/// `--lane-capacity`.
+fn required_lanes(args: &Args) -> usize {
+    let mut max_k = *args.ks.iter().max().unwrap();
+    if args.g0 {
+        max_k = max_k.max(8);
+    }
+    if args.controls {
+        max_k = max_k.max(2);
+    }
+    max_k
+}
+
+/// Lanes (and row budget) the store is staged with: the override, else
+/// `required`. An override below the lanes the run drives, or above what a
+/// lane store holds, is refused before any GPU work.
+fn resolve_lane_capacity(requested: Option<usize>, required: usize) -> R<usize> {
+    let capacity = requested.unwrap_or(required);
+    if capacity < required {
+        return Err(format!(
+            "--lane-capacity {capacity} is below the {required} lanes the active ks/controls/g0 need"
+        ));
+    }
+    if capacity > LANE_STORE_MAX_LANES {
+        return Err(format!(
+            "--lane-capacity {capacity} exceeds the lane store maximum {LANE_STORE_MAX_LANES}"
+        ));
+    }
+    Ok(capacity)
 }
 
 // ── log / summary ────────────────────────────────────────────────────
@@ -259,13 +334,21 @@ impl Diff {
         self.items += 1;
         self.bytes += reference.len() as u64;
         if reference.len() != got.len() {
-            self.note(format!("{label}: length ref {} got {}", reference.len(), got.len()));
+            self.note(format!(
+                "{label}: length ref {} got {}",
+                reference.len(),
+                got.len()
+            ));
             return;
         }
         if reference == got {
             return;
         }
-        let i = reference.iter().zip(got).position(|(a, b)| a != b).unwrap_or(0);
+        let i = reference
+            .iter()
+            .zip(got)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
         let n = reference.iter().zip(got).filter(|(a, b)| a != b).count();
         let mut msg = format!(
             "{label}: first differing byte {i} (ref 0x{:02x} got 0x{:02x}), {n}/{} bytes differ",
@@ -324,7 +407,10 @@ fn read_prefix(gpu: &Gpu, t: &GpuTensor, bytes: usize) -> R<Vec<u8>> {
         return Ok(Vec::new());
     }
     if bytes > t.buf.size() {
-        return Err(format!("read of {bytes} bytes exceeds the {}-byte device buffer", t.buf.size()));
+        return Err(format!(
+            "read of {bytes} bytes exceeds the {}-byte device buffer",
+            t.buf.size()
+        ));
     }
     let mut out = vec![0u8; bytes];
     gpu.hip.memcpy_dtoh(&mut out, &t.buf).map_err(e)?;
@@ -338,7 +424,9 @@ fn read_rows(gpu: &Gpu, t: &GpuTensor, rows: usize, capacity: usize) -> R<Vec<u8
     }
     let total = t.byte_size();
     if total % capacity != 0 {
-        return Err(format!("arena of {total} bytes does not hold {capacity} equal rows"));
+        return Err(format!(
+            "arena of {total} bytes does not hold {capacity} equal rows"
+        ));
     }
     read_prefix(gpu, t, rows.min(capacity) * (total / capacity))
 }
@@ -367,12 +455,24 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
     let mut items = Vec::new();
     let mut push = |name: String, bytes: Vec<u8>| items.push(Item { name, bytes });
     for (i, g) in st.gdn.iter().enumerate() {
-        push(format!("gdn_recurrent[{i}]"), read_prefix(gpu, &g.recurrent, g.recurrent.byte_size())?);
-        push(format!("gdn_conv[{i}]"), read_prefix(gpu, &g.conv, g.conv.byte_size())?);
+        push(
+            format!("gdn_recurrent[{i}]"),
+            read_prefix(gpu, &g.recurrent, g.recurrent.byte_size())?,
+        );
+        push(
+            format!("gdn_conv[{i}]"),
+            read_prefix(gpu, &g.conv, g.conv.byte_size())?,
+        );
     }
     for (i, q) in st.qsa.iter().enumerate() {
-        push(format!("qsa_full_keys[{i}]"), read_rows(gpu, &q.full_keys, q.full_len, q.full_capacity)?);
-        push(format!("qsa_full_values[{i}]"), read_rows(gpu, &q.full_values, q.full_len, q.full_capacity)?);
+        push(
+            format!("qsa_full_keys[{i}]"),
+            read_rows(gpu, &q.full_keys, q.full_len, q.full_capacity)?,
+        );
+        push(
+            format!("qsa_full_values[{i}]"),
+            read_rows(gpu, &q.full_values, q.full_len, q.full_capacity)?,
+        );
         push(
             format!("qsa_raw_index_keys[{i}]"),
             read_rows(gpu, &q.raw_index_keys, q.raw_len, q.raw_capacity)?,
@@ -391,11 +491,22 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
         );
         push(
             format!("qsa_selected_indices[{i}]"),
-            read_prefix(gpu, &q.selected_indices, (q.selected_len * 4).min(q.selected_indices.byte_size()))?,
+            read_prefix(
+                gpu,
+                &q.selected_indices,
+                (q.selected_len * 4).min(q.selected_indices.byte_size()),
+            )?,
         );
         push(
             format!("qsa_marks[{i}]"),
-            le_u64s(&[q.full_len, q.raw_len, q.pooled_len, q.partial_len, q.selected_len, q.position]),
+            le_u64s(&[
+                q.full_len,
+                q.raw_len,
+                q.pooled_len,
+                q.partial_len,
+                q.selected_len,
+                q.position,
+            ]),
         );
     }
     if let Some(ple_conv) = &st.ple_conv {
@@ -404,9 +515,13 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
             read_prefix(gpu, ple_conv, ple_conv.byte_size())?,
         );
     }
+    let hyper_feedback = st
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
     push(
         "hyper_feedback".into(),
-        read_prefix(gpu, &st.hyper_feedback, st.hyper_feedback.byte_size())?,
+        read_prefix(gpu, hyper_feedback, hyper_feedback.byte_size())?,
     );
     let prev = st.ple_history.previous();
     let mut hist = Vec::with_capacity(12);
@@ -459,20 +574,30 @@ fn write_ckpt(dir: &Path, step: usize, items: &[Item]) -> R<RefCkpt> {
         .iter()
         .map(|(n, o, l)| json!({"name": n, "offset": o, "len": l}))
         .collect();
-    fs::write(dir.join(format!("state_{tag}.json")), serde_json::to_vec_pretty(&idx).map_err(e)?)
-        .map_err(e)?;
+    fs::write(
+        dir.join(format!("state_{tag}.json")),
+        serde_json::to_vec_pretty(&idx).map_err(e)?,
+    )
+    .map_err(e)?;
     Ok(RefCkpt { step, path, index })
 }
 
 fn compare_ckpt(diff: &mut Diff, ctx: &str, reference: &RefCkpt, got: &[Item]) -> R<()> {
     let mut f = File::open(&reference.path).map_err(e)?;
     if reference.index.len() != got.len() {
-        diff.note(format!("{ctx}: state item count ref {} got {}", reference.index.len(), got.len()));
+        diff.note(format!(
+            "{ctx}: state item count ref {} got {}",
+            reference.index.len(),
+            got.len()
+        ));
     }
     for (idx, (name, offset, len)) in reference.index.iter().enumerate() {
         let Some(g) = got.get(idx) else { break };
         if &g.name != name {
-            diff.note(format!("{ctx}: state item {idx} is '{}' but the reference has '{name}'", g.name));
+            diff.note(format!(
+                "{ctx}: state item {idx} is '{}' but the reference has '{name}'",
+                g.name
+            ));
             continue;
         }
         let mut buf = vec![0u8; *len as usize];
@@ -499,12 +624,26 @@ fn read_row(w: &World) -> R<Vec<u8>> {
     read_prefix(&w.gpu, &w.row, w.vocab * 4)
 }
 
-fn record_ref(w: &mut World, i: usize, prompt: Vec<u32>, steps: usize, ckpt_steps: &[usize], dir: &Path) -> R<RefReq> {
+fn record_ref(
+    w: &mut World,
+    i: usize,
+    prompt: Vec<u32>,
+    steps: usize,
+    ckpt_steps: &[usize],
+    dir: &Path,
+) -> R<RefReq> {
     fs::create_dir_all(dir).map_err(e)?;
-    let mut rq = RefReq { prompt, ids: Vec::with_capacity(steps), dir: dir.to_path_buf(), ckpts: Vec::new() };
+    let mut rq = RefReq {
+        prompt,
+        ids: Vec::with_capacity(steps),
+        dir: dir.to_path_buf(),
+        ckpts: Vec::new(),
+    };
     w.bundle.reset(&mut w.gpu).map_err(e)?;
     let prompt = rq.prompt.clone();
-    w.bundle.prefill_final(&mut w.gpu, &prompt, 0, &w.row).map_err(e)?;
+    w.bundle
+        .prefill_final(&mut w.gpu, &prompt, 0, &w.row)
+        .map_err(e)?;
     fs::write(dir.join("logits_0.bin"), read_row(w)?).map_err(e)?;
     let items = capture(&w.gpu, &w.bundle.state)?;
     rq.ckpts.push(write_ckpt(dir, 0, &items)?);
@@ -522,7 +661,11 @@ fn record_ref(w: &mut World, i: usize, prompt: Vec<u32>, steps: usize, ckpt_step
     }
     fs::write(
         dir.join("ids.txt"),
-        rq.ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\n"),
+        rq.ids
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
     .map_err(e)?;
     Ok(rq)
@@ -542,16 +685,28 @@ struct RowSpec {
 /// empty), requests in slot order, absolute positions.
 fn make_plan(max_lanes: usize, mut rows: Vec<RowSpec>) -> BatchStepPlan {
     rows.sort_by_key(|r| r.slot);
-    let mut per: Vec<(SlotId, Vec<u32>, usize)> = (0..max_lanes).map(|s| (SlotId(s), Vec::new(), 0)).collect();
+    let mut per: Vec<(SlotId, Vec<u32>, usize)> =
+        (0..max_lanes).map(|s| (SlotId(s), Vec::new(), 0)).collect();
     for r in &rows {
         per[r.slot] = (SlotId(r.slot), r.tokens.clone(), r.start);
     }
-    let triples: Vec<(SlotId, &[u32], usize)> = per.iter().map(|(s, t, p)| (*s, t.as_slice(), *p)).collect();
+    let triples: Vec<(SlotId, &[u32], usize)> =
+        per.iter().map(|(s, t, p)| (*s, t.as_slice(), *p)).collect();
     let batch = SlotBatch::build(&triples);
-    let mut plan = BatchStepPlan { batch, ..Default::default() };
+    let mut plan = BatchStepPlan {
+        batch,
+        ..Default::default()
+    };
     let mut begin = 0;
     for r in &rows {
-        plan.requests.push(RequestRows { epoch: r.epoch, rows: RowRange { begin, len: r.tokens.len() }, kind: r.kind });
+        plan.requests.push(RequestRows {
+            epoch: r.epoch,
+            rows: RowRange {
+                begin,
+                len: r.tokens.len(),
+            },
+            kind: r.kind,
+        });
         match r.kind {
             RequestStepKind::Ar => plan.decode_rows += r.tokens.len(),
             RequestStepKind::Prefill => plan.prefill_rows += r.tokens.len(),
@@ -592,7 +747,7 @@ fn read_step_logits(
 ) -> R<Vec<(RequestEpoch, Vec<u8>)>> {
     gpu.hip.device_synchronize().map_err(e)?;
     let store = bundle.lanes().ok_or("lane store vanished")?;
-    let t = store.logits();
+    let t = store.logits().ok_or("lane store has no step logits")?;
     let mut out = Vec::new();
     let (mut ar, mut pre) = (0usize, 0usize);
     for rr in &plan.requests {
@@ -603,7 +758,10 @@ fn read_step_logits(
             }
             RequestStepKind::Prefill => {
                 if picks.get(rr.rows.end() - 1).is_some_and(|&p| p != u32::MAX) {
-                    out.push((rr.epoch, read_view(gpu, t, (max_lanes + pre) * vocab, vocab)?));
+                    out.push((
+                        rr.epoch,
+                        read_view(gpu, t, (max_lanes + pre) * vocab, vocab)?,
+                    ));
                 }
                 pre += 1;
             }
@@ -615,10 +773,19 @@ fn read_step_logits(
 
 /// provision + forward + (logits read) + commit of one plan.
 fn exec_step(w: &mut World, plan: &BatchStepPlan, read_logits: bool) -> Result<Stepped, StepErr> {
-    let World { gpu, bundle, vocab, max_lanes, .. } = w;
+    let World {
+        gpu,
+        bundle,
+        vocab,
+        max_lanes,
+        ..
+    } = w;
     let se = |stage: &'static str, msg: String| StepErr { stage, msg };
-    let mut ex = bundle.lane_executor().map_err(|x| se("provision", x.to_string()))?;
-    ex.provision_step(gpu, plan).map_err(|m| se("provision", m))?;
+    let mut ex = bundle
+        .lane_executor()
+        .map_err(|x| se("provision", x.to_string()))?;
+    ex.provision_step(gpu, plan)
+        .map_err(|m| se("provision", m))?;
     let out = match ex.forward_step(gpu, plan) {
         Ok(o) => o,
         Err(m) => {
@@ -641,9 +808,15 @@ fn exec_step(w: &mut World, plan: &BatchStepPlan, read_logits: bool) -> Result<S
     } else {
         Vec::new()
     };
-    let mut ex = bundle.lane_executor().map_err(|x| se("commit", x.to_string()))?;
+    let mut ex = bundle
+        .lane_executor()
+        .map_err(|x| se("commit", x.to_string()))?;
     match ex.commit_step(gpu, plan, out) {
-        Ok(advances) => Ok(Stepped { logits, advances, picks }),
+        Ok(advances) => Ok(Stepped {
+            logits,
+            advances,
+            picks,
+        }),
         Err(m) => {
             ex.abort_step(plan);
             Err(se("commit", m))
@@ -687,6 +860,9 @@ struct Lane {
     prefilled: usize,
     committed: Vec<u32>,
     ar_steps: usize,
+    /// Compare committed ids only (a lane promoted after native MTP windows:
+    /// its trunk rows came from verify forwards, not the AR reference's).
+    ids_only: bool,
 }
 
 struct Run {
@@ -753,7 +929,11 @@ fn absorb(
     opts: &RunOpts,
 ) -> R<()> {
     if res.advances.len() != plan.requests.len() {
-        return Err(format!("{} advances for {} plan requests", res.advances.len(), plan.requests.len()));
+        return Err(format!(
+            "{} advances for {} plan requests",
+            res.advances.len(),
+            plan.requests.len()
+        ));
     }
     for (rr, adv) in plan.requests.iter().zip(&res.advances) {
         let idx = run
@@ -766,29 +946,49 @@ fn absorb(
         }
         let (req, prompt_len) = (run.lanes[idx].req, run.lanes[idx].prompt_len);
         let rq = &refs[req];
-        let logits_of = |epoch: RequestEpoch| res.logits.iter().find(|(e2, _)| *e2 == epoch).map(|(_, v)| v);
+        let logits_of = |epoch: RequestEpoch| {
+            res.logits
+                .iter()
+                .find(|(e2, _)| *e2 == epoch)
+                .map(|(_, v)| v)
+        };
         match rr.kind {
             RequestStepKind::Prefill => {
                 run.lanes[idx].prefilled += rr.rows.len;
                 if run.lanes[idx].prefilled < prompt_len {
                     if !adv.committed_ids.is_empty() {
-                        run.diff.note(format!("req {req}: non-final prefill tile committed {:?}", adv.committed_ids));
+                        run.diff.note(format!(
+                            "req {req}: non-final prefill tile committed {:?}",
+                            adv.committed_ids
+                        ));
                     }
                     continue;
                 }
                 let before = run.diff.bad;
                 let got = logits_of(rr.epoch).ok_or("prompt-completing tile has no logits row")?;
-                run.diff.check(&format!("req {req} prefill logits"), &ref_logits(rq, 0)?, got, true);
+                run.diff.check(
+                    &format!("req {req} prefill logits"),
+                    &ref_logits(rq, 0)?,
+                    got,
+                    true,
+                );
                 match adv.committed_ids.as_slice() {
                     [id] => {
-                        run.diff.ids(&format!("req {req} first token"), rq.ids[0], *id);
+                        run.diff
+                            .ids(&format!("req {req} first token"), rq.ids[0], *id);
                         run.lanes[idx].committed.push(*id);
                     }
-                    other => run.diff.note(format!("req {req}: prefill commit returned {other:?}, expected 1 id")),
+                    other => run.diff.note(format!(
+                        "req {req}: prefill commit returned {other:?}, expected 1 id"
+                    )),
                 }
                 if opts.prefill_ckpt {
                     let items = lane_items(w, &run.lanes[idx])?;
-                    let rc = rq.ckpts.iter().find(|c| c.step == 0).ok_or("no prefill checkpoint")?;
+                    let rc = rq
+                        .ckpts
+                        .iter()
+                        .find(|c| c.step == 0)
+                        .ok_or("no prefill checkpoint")?;
                     compare_ckpt(&mut run.diff, &format!("req {req} prefill"), rc, &items)?;
                     run.ckpts += 1;
                 }
@@ -799,17 +999,28 @@ fn absorb(
                 run.lanes[idx].ar_steps += 1;
                 let s = run.lanes[idx].ar_steps;
                 let got = logits_of(rr.epoch).ok_or("AR row has no logits row")?;
-                run.diff.check(&format!("req {req} step {s} logits"), &ref_logits(rq, s)?, got, true);
+                let ids_only = run.lanes[idx].ids_only;
+                if !ids_only {
+                    run.diff.check(
+                        &format!("req {req} step {s} logits"),
+                        &ref_logits(rq, s)?,
+                        got,
+                        true,
+                    );
+                }
                 run.lane_steps += 1;
                 match adv.committed_ids.as_slice() {
                     [id] => {
                         // Commit of step `s` is the token fed at step `s + 1`.
                         if s < steps {
-                            run.diff.ids(&format!("req {req} step {s} pick"), rq.ids[s], *id);
+                            run.diff
+                                .ids(&format!("req {req} step {s} pick"), rq.ids[s], *id);
                         }
                         run.lanes[idx].committed.push(*id);
                     }
-                    other => run.diff.note(format!("req {req} step {s}: AR commit returned {other:?}, expected 1 id")),
+                    other => run.diff.note(format!(
+                        "req {req} step {s}: AR commit returned {other:?}, expected 1 id"
+                    )),
                 }
                 if adv.committed_position != prompt_len + s {
                     run.diff.note(format!(
@@ -818,14 +1029,20 @@ fn absorb(
                         prompt_len + s
                     ));
                 }
-                if ckpt_steps.contains(&s) {
+                if ckpt_steps.contains(&s) && !ids_only {
                     let items = lane_items(w, &run.lanes[idx])?;
-                    let rc = rq.ckpts.iter().find(|c| c.step == s).ok_or("missing reference checkpoint")?;
+                    let rc = rq
+                        .ckpts
+                        .iter()
+                        .find(|c| c.step == s)
+                        .ok_or("missing reference checkpoint")?;
                     compare_ckpt(&mut run.diff, &format!("req {req} step {s}"), rc, &items)?;
                     run.ckpts += 1;
                 }
             }
-            other => run.diff.note(format!("req {req}: unexpected plan row kind {other:?}")),
+            other => run
+                .diff
+                .note(format!("req {req}: unexpected plan row kind {other:?}")),
         }
     }
     Ok(())
@@ -851,7 +1068,9 @@ fn drive(
             .iter()
             .enumerate()
             .filter(|(_, l)| {
-                l.prefilled == l.prompt_len && l.ar_steps < steps && (all_prefilled || l.ar_steps < early_cap)
+                l.prefilled == l.prompt_len
+                    && l.ar_steps < steps
+                    && (all_prefilled || l.ar_steps < early_cap)
             })
             .map(|(i, _)| i)
             .collect();
@@ -861,9 +1080,16 @@ fn drive(
         let mut specs = Vec::new();
         if let Some(i) = pre {
             let l = &run.lanes[i];
-            let len = w.bundle.lane_executor().map_err(e)?.exact_prefill_chunk_len(&l.epoch)?;
+            let len = w
+                .bundle
+                .lane_executor()
+                .map_err(e)?
+                .exact_prefill_chunk_len(&l.epoch)?;
             if len == 0 || l.prefilled + len > l.prompt_len {
-                return Err(format!("req {}: prefill tile of {len} rows at {}/{}", l.req, l.prefilled, l.prompt_len));
+                return Err(format!(
+                    "req {}: prefill tile of {len} rows at {}/{}",
+                    l.req, l.prefilled, l.prompt_len
+                ));
             }
             specs.push(RowSpec {
                 slot: l.slot,
@@ -879,7 +1105,10 @@ fn drive(
 
         // Wrong position: one extra AR row for lane 0 before its third step.
         if run.control == Control::WrongPosition && !run.fired {
-            if let Some(&i) = ar.iter().find(|&&i| run.lanes[i].req == 0 && run.lanes[i].ar_steps == 2) {
+            if let Some(&i) = ar
+                .iter()
+                .find(|&&i| run.lanes[i].req == 0 && run.lanes[i].ar_steps == 2)
+            {
                 let solo = make_plan(w.max_lanes, vec![ar_spec(w, &run.lanes[i])?]);
                 run.fired = true;
                 match exec_step(w, &solo, false) {
@@ -901,12 +1130,24 @@ fn drive(
         let mut plan = make_plan(w.max_lanes, specs);
 
         // Lane swap controls fire on the first plan with two AR rows past step 2.
-        let swap = matches!(run.control, Control::SwapTokens | Control::SwapRowSlot | Control::SwapRows);
+        let swap = matches!(
+            run.control,
+            Control::SwapTokens | Control::SwapRowSlot | Control::SwapRows
+        );
         let mut swapped = false;
         if swap && !run.fired {
-            let eligible: Vec<usize> = ar.iter().copied().filter(|&i| run.lanes[i].ar_steps >= 2).collect();
+            let eligible: Vec<usize> = ar
+                .iter()
+                .copied()
+                .filter(|&i| run.lanes[i].ar_steps >= 2)
+                .collect();
             if eligible.len() >= 2 {
-                let find = |lane: &Lane| plan.requests.iter().position(|r| r.epoch == lane.epoch).unwrap();
+                let find = |lane: &Lane| {
+                    plan.requests
+                        .iter()
+                        .position(|r| r.epoch == lane.epoch)
+                        .unwrap()
+                };
                 let (ra, rb) = (find(&run.lanes[eligible[0]]), find(&run.lanes[eligible[1]]));
                 let (ba, bb) = (plan.requests[ra].rows.begin, plan.requests[rb].rows.begin);
                 if plan.batch.tokens[ba] != plan.batch.tokens[bb] {
@@ -944,7 +1185,10 @@ fn drive(
             Err(x) => {
                 run.error = Some(x.text());
                 if swapped {
-                    run.control_note = Some(format!("{} (executor error counts as detection)", run.control_note.clone().unwrap_or_default()));
+                    run.control_note = Some(format!(
+                        "{} (executor error counts as detection)",
+                        run.control_note.clone().unwrap_or_default()
+                    ));
                 }
                 break;
             }
@@ -971,6 +1215,94 @@ fn drive(
         }
     }
     Ok(())
+}
+
+/// `--spec ar --promote`: request 0 runs `windows` native-MTP windows at
+/// depth `k` on the resident singleton, then moves into an AR lane.
+#[derive(Clone, Copy)]
+struct ArPromote {
+    windows: usize,
+    k: usize,
+    /// Negative control: skip `commit_promotion` (the lane keeps its fresh
+    /// trunk state, the resident is reset), the pre-fix failure.
+    skip_commit: bool,
+}
+
+/// Run `rq`'s request on the resident native-MTP singleton for `p.windows`
+/// windows, then `prepare_promotion` (AR store: no drafter parts) +
+/// `commit_promotion` into lane `epoch`. The returned lane is Decoding with
+/// the singleton's committed ids (the last one is the pending seed) counted
+/// as AR steps, so the lane's next AR row is reference step `ids.len()`.
+fn promote_ar(
+    w: &mut World,
+    rq: &RefReq,
+    epoch: RequestEpoch,
+    p: ArPromote,
+    max_seq: usize,
+    steps: usize,
+) -> R<Lane> {
+    let prompt = rq.prompt.clone();
+    let (drafter, seed, wins) = singleton_phase(w, &prompt, p.k, max_seq, p.windows)?;
+    let mut stream = vec![seed];
+    for win in &wins {
+        stream.extend_from_slice(&win.committed);
+    }
+    let moved = (|| -> R<usize> {
+        if stream.len() > steps {
+            return Err(format!(
+                "promote: the singleton committed {} ids, more than --steps {steps}",
+                stream.len()
+            ));
+        }
+        let pending = *stream
+            .last()
+            .ok_or("the promoted request has no pending seed")?;
+        let position = w.bundle.state.position;
+        let expect = prompt.len() + stream.len() - 1;
+        if position != expect {
+            return Err(format!(
+                "promote: singleton position {position} expected {expect}"
+            ));
+        }
+        let slot = w
+            .bundle
+            .prepare_promotion(
+                &mut w.gpu,
+                epoch,
+                prompt.clone(),
+                stream.clone(),
+                pending,
+                position,
+                None,
+            )
+            .map_err(|x| format!("prepare_promotion: {x}"))?;
+        let committed = if p.skip_commit {
+            w.bundle
+                .reset(&mut w.gpu)
+                .map_err(|x| format!("control reset: {x}"))
+        } else {
+            w.bundle
+                .commit_promotion(&mut w.gpu, &epoch)
+                .map_err(|x| format!("commit_promotion: {x}"))
+        };
+        if let Err(m) = committed {
+            let _ = w.bundle.release_lane(&epoch);
+            return Err(m);
+        }
+        Ok(slot)
+    })();
+    Box::new(drafter).mtp_free(&mut w.gpu);
+    let slot = moved?;
+    Ok(Lane {
+        req: 0,
+        epoch,
+        slot,
+        prompt_len: prompt.len(),
+        prefilled: prompt.len(),
+        ar_steps: stream.len() - 1,
+        committed: stream,
+        ids_only: p.windows > 0,
+    })
 }
 
 struct RunReport {
@@ -1013,6 +1345,23 @@ impl App {
         control: Control,
         opts: &RunOpts,
     ) -> RunReport {
+        self.run_lanes_with(k, steps, policy, label, control, opts, None)
+    }
+
+    /// [`Self::run_lanes`]; with `promote`, request 0 starts on the resident
+    /// native-MTP singleton and is promoted into an AR lane ([`promote_ar`])
+    /// before requests 1..k are admitted.
+    #[allow(clippy::too_many_arguments)]
+    fn run_lanes_with(
+        &mut self,
+        k: usize,
+        steps: usize,
+        policy: LaneStagePolicy,
+        label: &str,
+        control: Control,
+        opts: &RunOpts,
+        promote: Option<ArPromote>,
+    ) -> RunReport {
         let started = Instant::now();
         let mut run = Run {
             lanes: Vec::new(),
@@ -1034,9 +1383,28 @@ impl App {
                 .lanes_mut()
                 .ok_or("lane store is not staged")?
                 .set_stage_policy(policy);
-            for req in 0..k {
+            let mut first = 0;
+            if let Some(p) = promote {
                 self.tag += 1;
-                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let epoch = RequestEpoch {
+                    request_tag: self.tag,
+                    owner_generation: 1,
+                };
+                let lane = promote_ar(&mut self.w, &self.refs[0], epoch, p, self.max_seq, steps)?;
+                run.diff.id_lists(
+                    "req 0 singleton ids before the promotion vs the AR singleton",
+                    &self.refs[0].ids[..lane.committed.len()],
+                    &lane.committed,
+                );
+                run.lanes.push(lane);
+                first = 1;
+            }
+            for req in first..k {
+                self.tag += 1;
+                let epoch = RequestEpoch {
+                    request_tag: self.tag,
+                    owner_generation: 1,
+                };
                 let prompt = self.refs[req].prompt.clone();
                 let prompt_len = prompt.len();
                 let slot = self
@@ -1044,16 +1412,33 @@ impl App {
                     .bundle
                     .admit_lane(&mut self.w.gpu, epoch, prompt)
                     .map_err(|x| format!("admit request {req}: {x}"))?;
-                run.lanes.push(Lane { req, epoch, slot, prompt_len, prefilled: 0, committed: Vec::new(), ar_steps: 0 });
+                run.lanes.push(Lane {
+                    req,
+                    epoch,
+                    slot,
+                    prompt_len,
+                    prefilled: 0,
+                    committed: Vec::new(),
+                    ar_steps: 0,
+                    ids_only: false,
+                });
             }
-            drive(&mut self.w, &self.refs, &mut run, steps, &self.ckpt_steps, opts)
+            drive(
+                &mut self.w,
+                &self.refs,
+                &mut run,
+                steps,
+                &self.ckpt_steps,
+                opts,
+            )
         })();
         if let Err(m) = res {
             run.error = Some(m);
         }
         for l in &run.lanes {
             if let Err(x) = self.w.bundle.release_lane(&l.epoch) {
-                run.release_errors.push(format!("release request {}: {x}", l.req));
+                run.release_errors
+                    .push(format!("release request {}: {x}", l.req));
             }
         }
         let clean = run.diff.bad == 0 && run.error.is_none() && run.release_errors.is_empty();
@@ -1063,10 +1448,13 @@ impl App {
             .map(|m| format!("executor error: {m}"))
             .or_else(|| run.diff.first.clone())
             .or_else(|| run.release_errors.first().cloned());
-        let prefill_pass = run.pre_bad == 0 && run.pre_checked == k && run.error.is_none();
+        let prefilled_lanes = k - usize::from(promote.is_some());
+        let prefill_pass =
+            run.pre_bad == 0 && run.pre_checked == prefilled_lanes && run.error.is_none();
         let json = json!({
             "k": k,
             "policy": label,
+            "promote": promote.map(|p| json!({"windows": p.windows, "k": p.k, "skip_commit": p.skip_commit})),
             "control": control.name(),
             "pass": clean,
             "steps": steps,
@@ -1130,15 +1518,36 @@ impl App {
         let result = (|| -> R<f64> {
             for req in 0..k {
                 self.tag += 1;
-                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let epoch = RequestEpoch {
+                    request_tag: self.tag,
+                    owner_generation: 1,
+                };
                 let prompt = self.prompts[req].clone();
                 let prompt_len = prompt.len();
-                let slot = self.w.bundle.admit_lane(&mut self.w.gpu, epoch, prompt).map_err(e)?;
-                lanes.push(Lane { req, epoch, slot, prompt_len, prefilled: 0, committed: Vec::new(), ar_steps: 0 });
+                let slot = self
+                    .w
+                    .bundle
+                    .admit_lane(&mut self.w.gpu, epoch, prompt)
+                    .map_err(e)?;
+                lanes.push(Lane {
+                    req,
+                    epoch,
+                    slot,
+                    prompt_len,
+                    prefilled: 0,
+                    committed: Vec::new(),
+                    ar_steps: 0,
+                    ids_only: false,
+                });
             }
             while let Some(i) = lanes.iter().position(|l| l.prefilled < l.prompt_len) {
                 let l = &lanes[i];
-                let len = self.w.bundle.lane_executor().map_err(e)?.exact_prefill_chunk_len(&l.epoch)?;
+                let len = self
+                    .w
+                    .bundle
+                    .lane_executor()
+                    .map_err(e)?
+                    .exact_prefill_chunk_len(&l.epoch)?;
                 let plan = make_plan(
                     self.w.max_lanes,
                     vec![RowSpec {
@@ -1154,7 +1563,10 @@ impl App {
             }
             let mut times = Vec::with_capacity(n);
             for it in 0..n + 3 {
-                let specs = lanes.iter().map(|l| ar_spec(&self.w, l)).collect::<R<Vec<_>>>()?;
+                let specs = lanes
+                    .iter()
+                    .map(|l| ar_spec(&self.w, l))
+                    .collect::<R<Vec<_>>>()?;
                 let plan = make_plan(self.w.max_lanes, specs);
                 let t = Instant::now();
                 exec_step(&mut self.w, &plan, false).map_err(|x| x.text())?;
@@ -1175,12 +1587,18 @@ impl App {
     fn bench_singleton(&mut self, n: usize) -> R<f64> {
         let prompt = self.prompts[0].clone();
         self.w.bundle.reset(&mut self.w.gpu).map_err(e)?;
-        self.w.bundle.prefill_final(&mut self.w.gpu, &prompt, 0, &self.w.row).map_err(e)?;
+        self.w
+            .bundle
+            .prefill_final(&mut self.w.gpu, &prompt, 0, &self.w.row)
+            .map_err(e)?;
         let mut times = Vec::with_capacity(n);
         for it in 0..n + 3 {
             self.w.gpu.hip.device_synchronize().map_err(e)?;
             let t = Instant::now();
-            self.w.bundle.forward_token_or_argmax(&mut self.w.gpu, None, &self.w.row).map_err(e)?;
+            self.w
+                .bundle
+                .forward_token_or_argmax(&mut self.w.gpu, None, &self.w.row)
+                .map_err(e)?;
             self.w.gpu.hip.device_synchronize().map_err(e)?;
             if it >= 3 {
                 times.push(t.elapsed().as_secs_f64() * 1e3);
@@ -1205,7 +1623,9 @@ impl RoutesArg {
             "floor" => Ok(RoutesArg::Floor),
             "cycle" => Ok(RoutesArg::Cycle),
             "batched" => Ok(RoutesArg::Batched),
-            other => Err(format!("--routes must be floor|cycle|batched, got '{other}'")),
+            other => Err(format!(
+                "--routes must be floor|cycle|batched, got '{other}'"
+            )),
         }
     }
 
@@ -1285,7 +1705,9 @@ impl SpecLane {
     /// An `ArRetired` window ran within the first `windows` windows: the head
     /// is frozen from then on and not compared.
     fn retired_by(&self, windows: usize) -> bool {
-        self.wins[..windows.min(self.wins.len())].iter().any(|w| w.route == LaneRoute::ArRetired)
+        self.wins[..windows.min(self.wins.len())]
+            .iter()
+            .any(|w| w.route == LaneRoute::ArRetired)
     }
 
     /// Request 0 under `--promote`, still on the resident singleton.
@@ -1295,7 +1717,9 @@ impl SpecLane {
 
     /// `window` is the first lane window after the promotion.
     fn first_after_promotion(&self, window: usize) -> bool {
-        self.promote.as_ref().is_some_and(|p| p.windows + 1 == window)
+        self.promote
+            .as_ref()
+            .is_some_and(|p| p.windows + 1 == window)
     }
 }
 
@@ -1352,10 +1776,15 @@ fn spec_stats(lanes: &[SpecLane]) -> SpecStats {
 /// hidden (`mtp/` prefixed).
 fn spec_lane_items(w: &World, l: &SpecLane) -> R<Vec<Item>> {
     let store = w.bundle.lanes().ok_or("lane store vanished")?;
-    let lane = store.lane(&l.epoch).ok_or_else(|| format!("lane of request {} vanished", l.req))?;
+    let lane = store
+        .lane(&l.epoch)
+        .ok_or_else(|| format!("lane of request {} vanished", l.req))?;
     let mut items = capture(&w.gpu, &lane.state)?;
     for (name, bytes) in store.lab_lane_items(&w.gpu, &l.epoch)? {
-        items.push(Item { name: format!("mtp/{name}"), bytes });
+        items.push(Item {
+            name: format!("mtp/{name}"),
+            bytes,
+        });
     }
     Ok(items)
 }
@@ -1364,10 +1793,16 @@ fn spec_lane_items(w: &World, l: &SpecLane) -> R<Vec<Item>> {
 fn singleton_items(gpu: &Gpu, bundle: &Qwen4Bundle, drafter: &Qwen4MtpDrafter) -> R<Vec<Item>> {
     let mut items = capture(gpu, &bundle.state)?;
     for (name, bytes) in bundle.lab_resident_head_items(gpu)? {
-        items.push(Item { name: format!("mtp/{name}"), bytes });
+        items.push(Item {
+            name: format!("mtp/{name}"),
+            bytes,
+        });
     }
     if !items.iter().any(|i| i.name == "mtp/pending_hidden") {
-        items.push(Item { name: "mtp/pending_hidden".into(), bytes: drafter.lab_pending_hidden_bytes(gpu)? });
+        items.push(Item {
+            name: "mtp/pending_hidden".into(),
+            bytes: drafter.lab_pending_hidden_bytes(gpu)?,
+        });
     }
     Ok(items)
 }
@@ -1384,18 +1819,29 @@ fn lane_checkpoint(w: &World, dir: &Path, l: &mut SpecLane, window: usize) -> R<
 /// Compare a lane checkpoint file with the live singleton items by name
 /// (`reference` = singleton, `got` = lane). `skip_head` leaves out the
 /// `mtp/` items (the lane ran a head-free window).
-fn compare_live(diff: &mut Diff, ctx: &str, lane: &RefCkpt, live: &[Item], skip_head: bool) -> R<()> {
+fn compare_live(
+    diff: &mut Diff,
+    ctx: &str,
+    lane: &RefCkpt,
+    live: &[Item],
+    skip_head: bool,
+) -> R<()> {
     let keep = |name: &str| !(skip_head && name.starts_with("mtp/"));
     let mut f = File::open(&lane.path).map_err(e)?;
     let lane_names: HashSet<&str> = lane.index.iter().map(|(n, _, _)| n.as_str()).collect();
     for item in live.iter().filter(|i| keep(&i.name)) {
         if !lane_names.contains(item.name.as_str()) {
-            diff.note(format!("{ctx}: singleton item '{}' has no lane counterpart", item.name));
+            diff.note(format!(
+                "{ctx}: singleton item '{}' has no lane counterpart",
+                item.name
+            ));
         }
     }
     for (name, offset, len) in lane.index.iter().filter(|(n, _, _)| keep(n)) {
         let Some(r) = live.iter().find(|i| &i.name == name) else {
-            diff.note(format!("{ctx}: lane item '{name}' has no singleton counterpart"));
+            diff.note(format!(
+                "{ctx}: lane item '{name}' has no singleton counterpart"
+            ));
             continue;
         };
         let mut buf = vec![0u8; *len as usize];
@@ -1407,7 +1853,13 @@ fn compare_live(diff: &mut Diff, ctx: &str, lane: &RefCkpt, live: &[Item], skip_
 }
 
 /// The lane's next row(s) for its drafted window.
-fn spec_row(w: &World, req: usize, slot: usize, epoch: RequestEpoch, drafts: &[LaneDraft]) -> R<RowSpec> {
+fn spec_row(
+    w: &World,
+    req: usize,
+    slot: usize,
+    epoch: RequestEpoch,
+    drafts: &[LaneDraft],
+) -> R<RowSpec> {
     let d = drafts
         .iter()
         .find(|d| d.epoch == epoch)
@@ -1417,22 +1869,41 @@ fn spec_row(w: &World, req: usize, slot: usize, epoch: RequestEpoch, drafts: &[L
         .lanes()
         .and_then(|s| s.lane(&epoch))
         .ok_or_else(|| format!("lane of request {req} vanished"))?;
-    let seed = lane.host.pending_seed.ok_or_else(|| format!("lane of request {req} has no pending seed"))?;
+    let seed = lane
+        .host
+        .pending_seed
+        .ok_or_else(|| format!("lane of request {req} has no pending seed"))?;
     let start = lane.state.position;
     match d.route {
         LaneRoute::Batched { .. } => {
             if d.drafts.is_empty() {
-                return Err(format!("request {req}: a Batched window came back with no drafts"));
+                return Err(format!(
+                    "request {req}: a Batched window came back with no drafts"
+                ));
             }
             let mut tokens = Vec::with_capacity(1 + d.drafts.len());
             tokens.push(seed);
             tokens.extend_from_slice(&d.drafts);
-            Ok(RowSpec { slot, epoch, tokens, start, kind: RequestStepKind::Verify { draft_len: d.drafts.len() } })
+            Ok(RowSpec {
+                slot,
+                epoch,
+                tokens,
+                start,
+                kind: RequestStepKind::Verify {
+                    draft_len: d.drafts.len(),
+                },
+            })
         }
-        LaneRoute::ArSynced | LaneRoute::ArRetired => {
-            Ok(RowSpec { slot, epoch, tokens: vec![seed], start, kind: RequestStepKind::Ar })
-        }
-        LaneRoute::Ar => Err(format!("request {req}: a spec lane was routed as a plain Ar row")),
+        LaneRoute::ArSynced | LaneRoute::ArRetired => Ok(RowSpec {
+            slot,
+            epoch,
+            tokens: vec![seed],
+            start,
+            kind: RequestStepKind::Ar,
+        }),
+        LaneRoute::Ar => Err(format!(
+            "request {req}: a spec lane was routed as a plain Ar row"
+        )),
     }
 }
 
@@ -1447,10 +1918,18 @@ fn absorb_spec(
     dir: &Path,
 ) -> R<()> {
     if res.advances.len() != plan.requests.len() {
-        return Err(format!("{} advances for {} plan requests", res.advances.len(), plan.requests.len()));
+        return Err(format!(
+            "{} advances for {} plan requests",
+            res.advances.len(),
+            plan.requests.len()
+        ));
     }
     for (rr, adv) in plan.requests.iter().zip(&res.advances) {
-        let idx = run.lanes.iter().position(|l| l.epoch == rr.epoch).ok_or("plan epoch not in this run")?;
+        let idx = run
+            .lanes
+            .iter()
+            .position(|l| l.epoch == rr.epoch)
+            .ok_or("plan epoch not in this run")?;
         if adv.epoch != rr.epoch {
             return Err("advance order differs from the plan".into());
         }
@@ -1461,13 +1940,19 @@ fn absorb_spec(
                 l.prefilled += rr.rows.len;
                 if l.prefilled < l.prompt_len {
                     if !adv.committed_ids.is_empty() {
-                        diff.note(format!("req {}: non-final prefill tile committed {:?}", l.req, adv.committed_ids));
+                        diff.note(format!(
+                            "req {}: non-final prefill tile committed {:?}",
+                            l.req, adv.committed_ids
+                        ));
                     }
                     continue;
                 }
                 match adv.committed_ids.as_slice() {
                     [id] => l.first = Some(*id),
-                    other => diff.note(format!("req {}: prefill commit returned {other:?}, expected 1 id", l.req)),
+                    other => diff.note(format!(
+                        "req {}: prefill commit returned {other:?}, expected 1 id",
+                        l.req
+                    )),
                 }
                 if ckpt_windows.contains(&0) {
                     lane_checkpoint(w, dir, l, 0)?;
@@ -1483,7 +1968,11 @@ fn absorb_spec(
                     drafts: d.drafts.clone(),
                     committed: adv.committed_ids.clone(),
                     accepted: adv.accepted_drafts,
-                    picks: res.picks.get(rr.rows.begin..rr.rows.end()).map(|s| s.to_vec()).unwrap_or_default(),
+                    picks: res
+                        .picks
+                        .get(rr.rows.begin..rr.rows.end())
+                        .map(|s| s.to_vec())
+                        .unwrap_or_default(),
                     offered: d.drafts.len(),
                     singleton: false,
                 };
@@ -1538,15 +2027,21 @@ fn singleton_phase(
     let mut drafter = Qwen4MtpDrafter::new(k, max_seq, None);
     drafter.configure_request(SpecRequestConfig::default());
     let result = (|| -> R<(u32, Vec<SpecWin>)> {
-        let seed = drafter.mtp_prefill(gpu, &mut *bundle, prompt, prompt, 0, false, &|| false)?;
+        let seed = drafter
+            .mtp_prefill(gpu, &mut *bundle, prompt, prompt, 0, false, &|| false)?
+            .into_first_token()?;
         let eos = bundle.config.eos_token_id;
         let mut emitted = vec![seed];
         let mut pending = seed;
         let mut wins = Vec::with_capacity(windows);
         for n in 1..=windows {
             let position = bundle.state.position;
-            let got = drafter.mtp_step(gpu, &mut *bundle, position, pending, &emitted, k, eos, None)?;
-            pending = *got.committed.last().ok_or_else(|| format!("singleton window {n} committed nothing"))?;
+            let got =
+                drafter.mtp_step(gpu, &mut *bundle, position, pending, &emitted, k, eos, None)?;
+            pending = *got
+                .committed
+                .last()
+                .ok_or_else(|| format!("singleton window {n} committed nothing"))?;
             emitted.extend_from_slice(&got.committed);
             wins.push(SpecWin {
                 route: LaneRoute::Batched { k_max: k },
@@ -1572,32 +2067,59 @@ fn singleton_phase(
 /// Promote request 0 (lane `idx`) from the resident singleton into its lane:
 /// `prepare_promotion` + `commit_promotion`, then the checkpoint right after
 /// the promotion (after the optional pending-hidden zeroing control).
-fn promote_lane(w: &mut World, run: &mut SpecRun, idx: usize, prompt: Vec<u32>, dir: &Path) -> R<()> {
-    let drafter = run.drafter.take().ok_or("the promoted request has no singleton drafter")?;
+fn promote_lane(
+    w: &mut World,
+    run: &mut SpecRun,
+    idx: usize,
+    prompt: Vec<u32>,
+    dir: &Path,
+) -> R<()> {
+    let drafter = run
+        .drafter
+        .take()
+        .ok_or("the promoted request has no singleton drafter")?;
     let zero = run.zero_pending;
     let l = &mut run.lanes[idx];
     let stream = l.stream();
     let epoch = l.epoch;
     let moved = (|| -> R<(usize, usize)> {
-        let pending = *stream.last().ok_or("the promoted request has no pending seed")?;
+        let pending = *stream
+            .last()
+            .ok_or("the promoted request has no pending seed")?;
         let position = w.bundle.state.position;
         let expect = l.prompt_len + l.wins.iter().map(|x| x.committed.len()).sum::<usize>();
         if position != expect {
-            return Err(format!("req {}: singleton position {position} expected {expect} at the promotion", l.req));
+            return Err(format!(
+                "req {}: singleton position {position} expected {expect} at the promotion",
+                l.req
+            ));
         }
         let parts = drafter.promotion_parts()?;
         let slot = w
             .bundle
-            .prepare_promotion(&mut w.gpu, epoch, prompt, stream, pending, position, Some(parts))
+            .prepare_promotion(
+                &mut w.gpu,
+                epoch,
+                prompt,
+                stream,
+                pending,
+                position,
+                Some(parts),
+            )
             .map_err(|x| format!("prepare_promotion: {x}"))?;
-        w.bundle.commit_promotion(&mut w.gpu, &epoch).map_err(|x| format!("commit_promotion: {x}"))?;
+        w.bundle
+            .commit_promotion(&mut w.gpu, &epoch)
+            .map_err(|x| format!("commit_promotion: {x}"))?;
         Ok((slot, position))
     })();
     Box::new(drafter).mtp_free(&mut w.gpu);
     let (slot, position) = moved?;
     l.slot = slot;
     let windows = {
-        let p = l.promote.as_mut().ok_or("the promoted lane has no promotion record")?;
+        let p = l
+            .promote
+            .as_mut()
+            .ok_or("the promoted lane has no promotion record")?;
         p.done = true;
         p.position = position;
         p.windows
@@ -1654,9 +2176,16 @@ fn drive_spec(
         let mut specs = Vec::new();
         if let Some(i) = pre {
             let l = &run.lanes[i];
-            let len = w.bundle.lane_executor().map_err(e)?.exact_prefill_chunk_len(&l.epoch)?;
+            let len = w
+                .bundle
+                .lane_executor()
+                .map_err(e)?
+                .exact_prefill_chunk_len(&l.epoch)?;
             if len == 0 || l.prefilled + len > l.prompt_len {
-                return Err(format!("req {}: prefill tile of {len} rows at {}/{}", l.req, l.prefilled, l.prompt_len));
+                return Err(format!(
+                    "req {}: prefill tile of {len} rows at {}/{}",
+                    l.req, l.prefilled, l.prompt_len
+                ));
             }
             specs.push(RowSpec {
                 slot: l.slot,
@@ -1668,7 +2197,8 @@ fn drive_spec(
         }
         let mut drafts: Vec<LaneDraft> = Vec::new();
         if !dec.is_empty() {
-            let reqs: Vec<(RequestEpoch, usize)> = dec.iter().map(|&i| (run.lanes[i].epoch, k)).collect();
+            let reqs: Vec<(RequestEpoch, usize)> =
+                dec.iter().map(|&i| (run.lanes[i].epoch, k)).collect();
             drafts = w
                 .bundle
                 .lane_executor()
@@ -1729,7 +2259,11 @@ fn write_windows(dir: &Path, l: &SpecLane) -> R<()> {
         })
         .collect();
     let doc = json!({"first": l.first, "windows": wins});
-    fs::write(d.join("windows.json"), serde_json::to_vec_pretty(&doc).map_err(e)?).map_err(e)?;
+    fs::write(
+        d.join("windows.json"),
+        serde_json::to_vec_pretty(&doc).map_err(e)?,
+    )
+    .map_err(e)?;
     Ok(())
 }
 
@@ -1752,7 +2286,9 @@ impl App {
         if self.ar_ids[req].len() < n {
             let want = bound.max(n);
             let prompt = self.prompts[req].clone();
-            let World { gpu, bundle, row, .. } = &mut self.w;
+            let World {
+                gpu, bundle, row, ..
+            } = &mut self.w;
             bundle.reset(gpu).map_err(e)?;
             bundle.prefill_final(gpu, &prompt, 0, row).map_err(e)?;
             let mut ids = Vec::with_capacity(want);
@@ -1781,8 +2317,12 @@ impl App {
         let before = diff.bad;
         let result = (|| -> R<()> {
             let req = l.req;
-            let seed = drafter.mtp_prefill(gpu, &mut *bundle, &prompt, &prompt, 0, false, &|| false)?;
-            let lane_first = l.first.ok_or_else(|| format!("req {req}: the lane never produced its first token"))?;
+            let seed = drafter
+                .mtp_prefill(gpu, &mut *bundle, &prompt, &prompt, 0, false, &|| false)?
+                .into_first_token()?;
+            let lane_first = l
+                .first
+                .ok_or_else(|| format!("req {req}: the lane never produced its first token"))?;
             diff.ids(&format!("req {req} prompt pick"), seed, lane_first);
             if let Some(c) = l.ckpts.iter().find(|c| c.step == 0) {
                 let live = singleton_items(gpu, bundle, &drafter)?;
@@ -1799,18 +2339,45 @@ impl App {
                 let n = i + 1;
                 let position = bundle.state.position;
                 let got = match win.route {
-                    LaneRoute::Batched { k_max } => {
-                        drafter.mtp_step(gpu, &mut *bundle, position, pending, &emitted, k_max, eos, None)?
+                    LaneRoute::Batched { k_max } => drafter.mtp_step(
+                        gpu,
+                        &mut *bundle,
+                        position,
+                        pending,
+                        &emitted,
+                        k_max,
+                        eos,
+                        None,
+                    )?,
+                    LaneRoute::ArSynced => {
+                        drafter.lab_ar_window(gpu, &mut *bundle, position, pending, true)?
                     }
-                    LaneRoute::ArSynced => drafter.lab_ar_window(gpu, &mut *bundle, position, pending, true)?,
-                    LaneRoute::ArRetired => drafter.lab_ar_window(gpu, &mut *bundle, position, pending, false)?,
-                    LaneRoute::Ar => return Err(format!("req {req} window {n}: plain Ar route in a spec run")),
+                    LaneRoute::ArRetired => {
+                        drafter.lab_ar_window(gpu, &mut *bundle, position, pending, false)?
+                    }
+                    LaneRoute::Ar => {
+                        return Err(format!(
+                            "req {req} window {n}: plain Ar route in a spec run"
+                        ))
+                    }
                 };
                 let label = format!("req {req} window {n} ({})", route_name(win.route));
-                diff.id_lists(&format!("{label} committed"), &got.committed, &win.committed);
+                diff.id_lists(
+                    &format!("{label} committed"),
+                    &got.committed,
+                    &win.committed,
+                );
                 if matches!(win.route, LaneRoute::Batched { .. }) {
-                    diff.counts(&format!("{label} drafts offered"), got.drafts_generated, win.offered);
-                    diff.counts(&format!("{label} drafts accepted"), got.accepted, win.accepted);
+                    diff.counts(
+                        &format!("{label} drafts offered"),
+                        got.drafts_generated,
+                        win.offered,
+                    );
+                    diff.counts(
+                        &format!("{label} drafts accepted"),
+                        got.accepted,
+                        win.accepted,
+                    );
                 }
                 if diff.bad > before {
                     break;
@@ -1819,7 +2386,13 @@ impl App {
                 pending = *got.committed.last().ok_or("empty singleton window")?;
                 if let Some(c) = l.ckpts.iter().find(|c| c.step == n) {
                     let live = singleton_items(gpu, bundle, &drafter)?;
-                    compare_live(diff, &format!("req {req} window {n}"), c, &live, l.retired_by(n))?;
+                    compare_live(
+                        diff,
+                        &format!("req {req} window {n}"),
+                        c,
+                        &live,
+                        l.retired_by(n),
+                    )?;
                     compared += 1;
                 }
             }
@@ -1833,7 +2406,11 @@ impl App {
     fn compare_ar_ids(&mut self, diff: &mut Diff, l: &SpecLane, k: usize, steps: usize) -> R<()> {
         let stream = l.stream();
         let ids = self.singleton_ids(l.req, stream.len(), steps * (k + 1) + 1)?;
-        diff.id_lists(&format!("req {} committed ids vs the AR singleton", l.req), &ids, &stream);
+        diff.id_lists(
+            &format!("req {} committed ids vs the AR singleton", l.req),
+            &ids,
+            &stream,
+        );
         Ok(())
     }
 
@@ -1867,16 +2444,24 @@ impl App {
         ckpt_windows.sort_unstable();
         ckpt_windows.dedup();
         let res = (|| -> R<()> {
-            let store = self.w.bundle.lanes_mut().ok_or("lane store is not staged")?;
+            let store = self
+                .w
+                .bundle
+                .lanes_mut()
+                .ok_or("lane store is not staged")?;
             store.set_stage_policy(policy);
             store.lab_set_routes(routes.lab());
             store.lab_set_skip_rollback(skip_rollback);
             let mut first_lane = 0;
             if let Some(p) = promote {
                 self.tag += 1;
-                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let epoch = RequestEpoch {
+                    request_tag: self.tag,
+                    owner_generation: 1,
+                };
                 let prompt_len = self.prompts[0].len();
-                let (drafter, seed, wins) = singleton_phase(&mut self.w, &self.prompts[0], k, self.max_seq, p)?;
+                let (drafter, seed, wins) =
+                    singleton_phase(&mut self.w, &self.prompts[0], k, self.max_seq, p)?;
                 run.drafter = Some(drafter);
                 run.lanes.push(SpecLane {
                     req: 0,
@@ -1887,13 +2472,20 @@ impl App {
                     first: Some(seed),
                     wins,
                     ckpts: Vec::new(),
-                    promote: Some(Promote { windows: p, position: 0, done: false }),
+                    promote: Some(Promote {
+                        windows: p,
+                        position: 0,
+                        done: false,
+                    }),
                 });
                 first_lane = 1;
             }
             for req in first_lane..lanes {
                 self.tag += 1;
-                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let epoch = RequestEpoch {
+                    request_tag: self.tag,
+                    owner_generation: 1,
+                };
                 let prompt = self.prompts[req].clone();
                 let prompt_len = prompt.len();
                 let slot = self
@@ -1913,7 +2505,15 @@ impl App {
                     promote: None,
                 });
             }
-            drive_spec(&mut self.w, &self.prompts, &mut run, steps, k, &ckpt_windows, &self.lanes_dir)
+            drive_spec(
+                &mut self.w,
+                &self.prompts,
+                &mut run,
+                steps,
+                k,
+                &ckpt_windows,
+                &self.lanes_dir,
+            )
         })();
         if let Err(m) = res {
             run.error = Some(m);
@@ -1923,24 +2523,30 @@ impl App {
         }
         for l in &run.lanes {
             if let Err(m) = write_windows(&self.lanes_dir, l) {
-                run.release_errors.push(format!("windows.json of request {}: {m}", l.req));
+                run.release_errors
+                    .push(format!("windows.json of request {}: {m}", l.req));
             }
         }
         let lane_stats: Vec<Value> = run
             .lanes
             .iter()
             .map(|l| {
-                self.w.bundle.lanes().and_then(|s| s.lane_spec_stats(&l.epoch)).map_or(Value::Null, |s| {
-                    json!({
-                        "windows": s.windows, "ar_windows": s.ar_windows, "drafts": s.drafts,
-                        "accepted": s.accepted, "retired": s.retired,
+                self.w
+                    .bundle
+                    .lanes()
+                    .and_then(|s| s.lane_spec_stats(&l.epoch))
+                    .map_or(Value::Null, |s| {
+                        json!({
+                            "windows": s.windows, "ar_windows": s.ar_windows, "drafts": s.drafts,
+                            "accepted": s.accepted, "retired": s.retired,
+                        })
                     })
-                })
             })
             .collect();
         for l in run.lanes.iter().filter(|l| !l.pending_promotion()) {
             if let Err(x) = self.w.bundle.release_lane(&l.epoch) {
-                run.release_errors.push(format!("release request {}: {x}", l.req));
+                run.release_errors
+                    .push(format!("release request {}: {x}", l.req));
             }
         }
         if let Some(store) = self.w.bundle.lanes_mut() {
@@ -1982,12 +2588,24 @@ impl App {
             .iter()
             .map(|l| {
                 let n: usize = l.wins.iter().map(|w| w.committed.len()).sum();
-                if l.wins.is_empty() { 0.0 } else { n as f64 / l.wins.len() as f64 }
+                if l.wins.is_empty() {
+                    0.0
+                } else {
+                    n as f64 / l.wins.len() as f64
+                }
             })
             .collect();
-        let head_free: Vec<usize> =
-            run.lanes.iter().filter(|l| l.retired_by(l.wins.len())).map(|l| l.req).collect();
-        let control = if skip_rollback { "spec_skip_rollback" } else { "none" };
+        let head_free: Vec<usize> = run
+            .lanes
+            .iter()
+            .filter(|l| l.retired_by(l.wins.len()))
+            .map(|l| l.req)
+            .collect();
+        let control = if skip_rollback {
+            "spec_skip_rollback"
+        } else {
+            "none"
+        };
         let json = json!({
             "k": lanes,
             "spec": "mtp",
@@ -2048,15 +2666,32 @@ impl App {
         if let Some(f) = &first {
             line += &format!("\n    first divergence: {f}");
         }
-        SpecReport { pass: clean, first, json, stats, run, line }
+        SpecReport {
+            pass: clean,
+            first,
+            json,
+            stats,
+            run,
+            line,
+        }
     }
 
     /// Lane step (draft + verify) wall time at `lanes` lanes, median over
     /// `n`; returns (step ms, committed tokens per second, committed tokens
     /// per lane step). `budget` 0 times the AR rows of spec lanes.
-    fn bench_spec_lanes(&mut self, lanes_n: usize, n: usize, budget: usize, routes: RoutesArg) -> R<(f64, f64, f64)> {
+    fn bench_spec_lanes(
+        &mut self,
+        lanes_n: usize,
+        n: usize,
+        budget: usize,
+        routes: RoutesArg,
+    ) -> R<(f64, f64, f64)> {
         {
-            let store = self.w.bundle.lanes_mut().ok_or("lane store is not staged")?;
+            let store = self
+                .w
+                .bundle
+                .lanes_mut()
+                .ok_or("lane store is not staged")?;
             store.set_stage_policy(LaneStagePolicy::production());
             store.lab_set_routes(routes.lab());
             store.lab_set_skip_rollback(false);
@@ -2065,15 +2700,36 @@ impl App {
         let result = (|| -> R<(f64, f64, f64)> {
             for req in 0..lanes_n {
                 self.tag += 1;
-                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let epoch = RequestEpoch {
+                    request_tag: self.tag,
+                    owner_generation: 1,
+                };
                 let prompt = self.prompts[req].clone();
                 let prompt_len = prompt.len();
-                let slot = self.w.bundle.admit_lane(&mut self.w.gpu, epoch, prompt).map_err(e)?;
-                lanes.push(Lane { req, epoch, slot, prompt_len, prefilled: 0, committed: Vec::new(), ar_steps: 0 });
+                let slot = self
+                    .w
+                    .bundle
+                    .admit_lane(&mut self.w.gpu, epoch, prompt)
+                    .map_err(e)?;
+                lanes.push(Lane {
+                    req,
+                    epoch,
+                    slot,
+                    prompt_len,
+                    prefilled: 0,
+                    committed: Vec::new(),
+                    ar_steps: 0,
+                    ids_only: false,
+                });
             }
             while let Some(i) = lanes.iter().position(|l| l.prefilled < l.prompt_len) {
                 let l = &lanes[i];
-                let len = self.w.bundle.lane_executor().map_err(e)?.exact_prefill_chunk_len(&l.epoch)?;
+                let len = self
+                    .w
+                    .bundle
+                    .lane_executor()
+                    .map_err(e)?
+                    .exact_prefill_chunk_len(&l.epoch)?;
                 let plan = make_plan(
                     self.w.max_lanes,
                     vec![RowSpec {
@@ -2090,7 +2746,8 @@ impl App {
             let mut times = Vec::with_capacity(n);
             let mut tokens = 0usize;
             for it in 0..n + 3 {
-                let reqs: Vec<(RequestEpoch, usize)> = lanes.iter().map(|l| (l.epoch, budget)).collect();
+                let reqs: Vec<(RequestEpoch, usize)> =
+                    lanes.iter().map(|l| (l.epoch, budget)).collect();
                 self.w.gpu.hip.device_synchronize().map_err(e)?;
                 let t = Instant::now();
                 let drafts = self
@@ -2109,12 +2766,20 @@ impl App {
                 self.w.gpu.hip.device_synchronize().map_err(e)?;
                 if it >= 3 {
                     times.push(t.elapsed().as_secs_f64() * 1e3);
-                    tokens += res.advances.iter().map(|a| a.committed_ids.len()).sum::<usize>();
+                    tokens += res
+                        .advances
+                        .iter()
+                        .map(|a| a.committed_ids.len())
+                        .sum::<usize>();
                 }
             }
             let total_ms: f64 = times.iter().sum();
             let per_step = tokens as f64 / (n * lanes_n) as f64;
-            Ok((median(&mut times), tokens as f64 * 1000.0 / total_ms, per_step))
+            Ok((
+                median(&mut times),
+                tokens as f64 * 1000.0 / total_ms,
+                per_step,
+            ))
         })();
         for l in &lanes {
             let _ = self.w.bundle.release_lane(&l.epoch);
@@ -2124,10 +2789,21 @@ impl App {
 }
 
 /// `--spec mtp`: lane windows against the singleton `Qwen4MtpDrafter`.
-fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file_size: u64, primary: LaneStagePolicy) -> R<bool> {
+fn spec_main(
+    args: &Args,
+    w: World,
+    log: Log,
+    toks: Vec<u32>,
+    max_k: usize,
+    lane_capacity: usize,
+    file_size: u64,
+    primary: LaneStagePolicy,
+    loaded_evidence: String,
+) -> R<bool> {
     let k = args.k;
-    let prompts: Vec<Vec<u32>> =
-        (0..max_k).map(|i| prompt_for(&toks, i, args.contexts[i % args.contexts.len()])).collect();
+    let prompts: Vec<Vec<u32>> = (0..max_k)
+        .map(|i| prompt_for(&toks, i, args.contexts[i % args.contexts.len()]))
+        .collect();
     let mut app = App {
         w,
         refs: Vec::new(),
@@ -2146,7 +2822,17 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
 
     // ── main matrix ────────────────────────────────────────────────
     for &lanes in &args.ks {
-        let r = app.run_spec_lanes(lanes, args.steps, k, primary, &args.policy, args.routes, false, args.promote, false);
+        let r = app.run_spec_lanes(
+            lanes,
+            args.steps,
+            k,
+            primary,
+            &args.policy,
+            args.routes,
+            false,
+            args.promote,
+            false,
+        );
         app.log.say(r.line.clone());
         all_pass &= r.pass;
         runs.push(r.json);
@@ -2159,7 +2845,17 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
             return Err("--controls needs --steps >= 4".into());
         }
         // Positive: cycle routes with rejected verify windows and ring rollback must match.
-        let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, RoutesArg::Cycle, false, None, false);
+        let r = app.run_spec_lanes(
+            2,
+            short_steps,
+            k,
+            primary,
+            &args.policy,
+            RoutesArg::Cycle,
+            false,
+            None,
+            false,
+        );
         app.log.say(r.line.clone());
         let exercised = r.stats.rejected > 0 && r.stats.batched > 0;
         let ok = r.pass && exercised;
@@ -2178,19 +2874,38 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
             "run": r.json,
         }));
         // Negative: a rejected verify keeps its full rows; the comparison must fail.
-        let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, RoutesArg::Cycle, true, None, false);
+        let r = app.run_spec_lanes(
+            2,
+            short_steps,
+            k,
+            primary,
+            &args.policy,
+            RoutesArg::Cycle,
+            true,
+            None,
+            false,
+        );
         app.log.say(r.line.clone());
         let exercised = r.stats.rejected > 0;
         let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
         let (detected, how) = if !exercised {
-            (false, "control was not exercised (no rejected verify window)".to_string())
+            (
+                false,
+                "control was not exercised (no rejected verify window)".to_string(),
+            )
         } else if diverged {
-            (true, format!("comparison failed: {}", r.first.clone().unwrap_or_default()))
+            (
+                true,
+                format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
+            )
         } else {
             (false, "comparison still passed".to_string())
         };
         all_pass &= detected;
-        app.log.say(format!("control spec_skip_rollback: {} ({how})", if detected { "detected" } else { "MISSED" }));
+        app.log.say(format!(
+            "control spec_skip_rollback: {} ({how})",
+            if detected { "detected" } else { "MISSED" }
+        ));
         controls_json.push(json!({
             "control": "spec_skip_rollback",
             "detected": detected,
@@ -2201,14 +2916,35 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
         if let Some(p) = args.promote {
             // Negative: the promoted lane's pending hidden is zeroed right after the promotion; the comparison must fail.
             let p = p.min(short_steps - 1);
-            let r = app.run_spec_lanes(2, short_steps, k, primary, &args.policy, args.routes, false, Some(p), true);
+            let r = app.run_spec_lanes(
+                2,
+                short_steps,
+                k,
+                primary,
+                &args.policy,
+                args.routes,
+                false,
+                Some(p),
+                true,
+            );
             app.log.say(r.line.clone());
-            let promoted = r.run.lanes.first().and_then(|l| l.promote.as_ref()).is_some_and(|x| x.done);
+            let promoted = r
+                .run
+                .lanes
+                .first()
+                .and_then(|l| l.promote.as_ref())
+                .is_some_and(|x| x.done);
             let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
             let (detected, how) = if !promoted {
-                (false, "control was not exercised (the promotion did not happen)".to_string())
+                (
+                    false,
+                    "control was not exercised (the promotion did not happen)".to_string(),
+                )
             } else if diverged {
-                (true, format!("comparison failed: {}", r.first.clone().unwrap_or_default()))
+                (
+                    true,
+                    format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
+                )
             } else {
                 (false, "comparison still passed".to_string())
             };
@@ -2264,7 +3000,10 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
         }
     }
 
-    app.log.say(format!("fn_lane_oracle: {}", if all_pass { "PASS" } else { "FAIL" }));
+    app.log.say(format!(
+        "fn_lane_oracle: {}",
+        if all_pass { "PASS" } else { "FAIL" }
+    ));
     let summary = json!({
         "pass": all_pass,
         "gpu_arch": app.w.gpu.arch,
@@ -2272,33 +3011,112 @@ fn spec_main(args: &Args, w: World, log: Log, toks: Vec<u32>, max_k: usize, file
         "model_bytes": file_size,
         "args": {
             "ks": args.ks, "contexts": args.contexts, "steps": args.steps, "max_seq": args.max_seq,
+            "lane_capacity": lane_capacity,
             "policy": args.policy, "policy_described": primary.describe(), "g0": false,
             "controls": args.controls, "bench": args.bench,
             "spec": "mtp", "k": args.k, "routes": args.routes.name(), "promote": args.promote,
         },
-        "policy_evidence": primary.evidence(),
+        "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
+        "loaded_policy_evidence": loaded_evidence,
         "requests": app.prompts.iter().map(|p| json!({"context": p.len()})).collect::<Vec<_>>(),
         "runs": runs,
         "controls": controls_json,
         "bench": bench_json,
         "log": app.log.lines,
     });
-    fs::write(args.out.join("summary.json"), serde_json::to_vec_pretty(&summary).map_err(e)?).map_err(e)?;
+    fs::write(
+        args.out.join("summary.json"),
+        serde_json::to_vec_pretty(&summary).map_err(e)?,
+    )
+    .map_err(e)?;
     Ok(all_pass)
 }
 
 // ── model load ───────────────────────────────────────────────────────
 
+/// The PLE rows source of `path`, attached to `hfq`: the shared validation
+/// entrypoint `attach_validation_ple_rows` under the same layout gate as the serve
+/// loader (`resolve_qwen4_ple_rows_hfq`). A base without the Flash-Next PLE
+/// layout (a developer profile's embedded rows, or a profile without PLE) and
+/// a stock-FP8 base under `auto` have no sidecar to resolve: `None`. A missing
+/// q4 sidecar is never derived here.
+fn resolve_ple_rows(
+    hfq: &mut HfqFile,
+    path: &Path,
+    request: hipfire_config::memory::PleFormatRequest,
+    gpu_arch: &str,
+) -> R<Option<PleRowsChoice>> {
+    use hipfire_arch_qwen4::weights::is_ple_shard_name;
+    if hfq.ple_rows_marker().is_none() && !hfq.tensors().iter().any(|t| is_ple_shard_name(&t.name))
+    {
+        return Ok(None);
+    }
+    if hfq
+        .tensors()
+        .iter()
+        .any(|t| t.quant_type == 56 && is_ple_shard_name(&t.name))
+    {
+        return match request {
+            hipfire_config::memory::PleFormatRequest::Auto => Ok(None),
+            request => Err(format!(
+                "qwen4: memory.ple_format = {request:?} requests PLE sidecar rows, but this stock-FP8 \
+                 artifact reads its embedded FP8E4M3PT PLE rows; unset memory.ple_format"
+            )),
+        };
+    }
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(hfq, path, request, gpu_arch)
+        .map(Some)
+        .map_err(|error| format!("qwen4 PLE rows: {error}"))
+}
+
 fn load(
     path: &Path,
     max_seq: usize,
-    max_k: usize,
+    lane_capacity: usize,
     spec: Option<LaneSpecConfig>,
+    attach_mtp: bool,
 ) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
-    let receipt = admit_hfqm_artifact(&hfq).map_err(e)?;
     let mut gpu = Gpu::init().map_err(e)?;
+    // The PLE rows source (`memory.ple_format` / `HIPFIRE_PLE_FORMAT`), bound
+    // while the base is open and before admission, exactly as `qwen4_kld`,
+    // `qwen4_greedy_ids` and the serve loader do. Never derives a missing q4
+    // table (`hipfire ple derive` first); a sidecar that does not open and bind
+    // is refused, never replaced by the embedded rows.
+    let choice = resolve_ple_rows(
+        &mut hfq,
+        path,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+    )?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(e)?;
+    match &choice {
+        Some(choice) => {
+            eprintln!(
+                "fn_lane_oracle: ple rows: {} from {}",
+                choice.format.name(),
+                match &choice.origin {
+                    PleRowsOrigin::Embedded => "embedded model file".to_string(),
+                    PleRowsOrigin::Sidecar(sidecar) => sidecar.display().to_string(),
+                }
+            );
+            if let Some(note) = &choice.note {
+                eprintln!("fn_lane_oracle: ple rows: {note}");
+            }
+        }
+        None => match &receipt.ple_rows {
+            hipfire_arch_qwen4::Qwen4PleRows::Absent => eprintln!(
+                "fn_lane_oracle: ple rows: none (profile {} declares no PLE)",
+                receipt.config.profile.id()
+            ),
+            _ => eprintln!(
+                "fn_lane_oracle: ple rows: embedded rows (no q4/q8 sidecar for this artifact)"
+            ),
+        },
+    }
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
@@ -2314,13 +3132,52 @@ fn load(
     let mesh = DeviceMesh::single().map_err(e)?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+    // and host-maps the rest (a slab artifact larger than one card).
+    let weights = {
+        let mut weights = receipt.manifest.weights.clone();
+        match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+            None => {}
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                if gpu.is_uma() {
+                    return Err("host-mapped experts are only for discrete GPUs".into());
+                }
+                let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                    &mut weights,
+                    layers,
+                );
+                eprintln!(
+                    "fn_lane_oracle: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                );
+            }
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                return Err("fn_lane_oracle takes a fixed expert layer count, not auto".into());
+            }
+        }
+        weights
+    };
     let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
+        &weights,
         &mesh,
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            // The store rejects a host-mapped entry as a range: borrow it
+            // from the resident source bytes, as the product loader does.
+            if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             source
                 .tensor_range(&entry.name)
                 .map_err(|x| x.to_string())?
@@ -2337,7 +3194,7 @@ fn load(
         &receipt.config,
     )?;
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -2345,22 +3202,43 @@ fn load(
         &mut gpu,
         max_seq,
         receipt.ple,
+        receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .map_err(e)?;
-    bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(e)?;
-    if spec.is_some() {
+    bundle
+        .attach_forward(&mut gpu, max_seq, scratch_mode)
+        .map_err(e)?;
+    if attach_mtp {
         bundle.attach_mtp(&mut gpu, max_seq).map_err(e)?;
     }
-    bundle.stage_lanes(&mut gpu, max_k, max_k, spec).map_err(e)?;
+    bundle
+        .stage_lanes(&mut gpu, lane_capacity, lane_capacity, spec)
+        .map_err(e)?;
     let row = gpu.zeros(&[vocab], DType::F32).map_err(e)?;
-    let max_lanes = bundle.lanes().map(|s| s.max_lanes()).ok_or("lane store is not staged")?;
-    Ok((source, World { gpu, bundle, vocab, row, max_lanes }, tokenizer))
+    let max_lanes = bundle
+        .lanes()
+        .map(|s| s.max_lanes())
+        .ok_or("lane store is not staged")?;
+    Ok((
+        source,
+        World {
+            gpu,
+            bundle,
+            vocab,
+            row,
+            max_lanes,
+        },
+        tokenizer,
+    ))
 }
 
 fn prompt_for(tokens: &[u32], i: usize, ctx: usize) -> Vec<u32> {
-    (0..ctx).map(|j| tokens[(i * 997 + j) % tokens.len()]).collect()
+    (0..ctx)
+        .map(|j| tokens[(i * 997 + j) % tokens.len()])
+        .collect()
 }
 
 fn stage_rust_line(stage: StageName, share: StageShare) -> String {
@@ -2385,24 +3263,25 @@ fn real_main() -> R<bool> {
     fs::create_dir_all(&args.out).map_err(e)?;
     let primary = LaneStagePolicy::parse(&args.policy)?;
     let spec_cfg = if args.spec_mtp {
-        if !matches!(hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref(), Ok("0")) {
+        if !matches!(
+            hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL").as_deref(),
+            Ok("0")
+        ) {
             return Err(
                 "--spec mtp requires HIPFIRE_MTP_INCREMENTAL=0 so the singleton reference window runs the batched \
                  route at depth k"
                     .into(),
             );
         }
-        Some(LaneSpecConfig { k: args.k, end_of_turn: None })
+        Some(LaneSpecConfig {
+            k: args.k,
+            end_of_turn: None,
+        })
     } else {
         None
     };
-    let mut max_k = *args.ks.iter().max().unwrap();
-    if args.g0 {
-        max_k = max_k.max(8);
-    }
-    if args.controls {
-        max_k = max_k.max(2);
-    }
+    let max_k = required_lanes(&args);
+    let lane_capacity = resolve_lane_capacity(args.lane_capacity, max_k)?;
     let max_ctx = *args.contexts.iter().max().unwrap();
     let per_window = if args.spec_mtp { args.k + 1 } else { 1 };
     let longest_run = args.steps.max(args.bench + 3) * per_window;
@@ -2415,10 +3294,23 @@ fn real_main() -> R<bool> {
 
     let mut log = Log::default();
     let file_size = fs::metadata(&args.model).map_err(e)?.len();
-    let (_source, mut w, tokenizer) = load(&args.model, args.max_seq, max_k, spec_cfg)?;
+    // `--spec ar --promote` keeps the MTP head resident beside AR lanes, as serve does with `serve.batch_spec = false`.
+    let attach_mtp = args.spec_mtp || args.promote.is_some();
+    let (_source, mut w, tokenizer) = load(
+        &args.model,
+        args.max_seq,
+        lane_capacity,
+        spec_cfg,
+        attach_mtp,
+    )?;
     log.say(format!("gpu arch: {}", w.gpu.arch));
-    log.say(format!("model: {} ({file_size} bytes)", args.model.display()));
-    {
+    log.say(format!(
+        "model: {} ({file_size} bytes)",
+        args.model.display()
+    ));
+    // The proofs the store resolved at load (`store.evidence()`): diagnostic
+    // only. Every run below installs an explicit policy, which clears them.
+    let loaded_evidence = {
         let store = w.bundle.lanes().ok_or("lane store is not staged")?;
         let r = store.receipt(&w.gpu);
         log.say(format!(
@@ -2429,10 +3321,11 @@ fn real_main() -> R<bool> {
         if args.spec_mtp {
             log.say(format!("lanes spec: spec={} spec_k={}", r.spec, r.spec_k));
         }
-    }
+        store.evidence().to_string()
+    };
     log.say(format!(
-        "args: ks={:?} contexts={:?} steps={} max_seq={} policy={} ({}) g0={} controls={} bench={}",
-        args.ks, args.contexts, args.steps, args.max_seq, args.policy, primary.describe(), args.g0,
+        "args: ks={:?} contexts={:?} steps={} max_seq={} lane_capacity={} policy={} ({}) g0={} controls={} bench={}",
+        args.ks, args.contexts, args.steps, args.max_seq, lane_capacity, args.policy, primary.describe(), args.g0,
         args.controls, args.bench
     ));
     if args.spec_mtp {
@@ -2442,8 +3335,8 @@ fn real_main() -> R<bool> {
             args.routes.name()
         ));
     }
-    if !primary.evidence().is_empty() {
-        log.say(format!("policy evidence: {}", primary.evidence()));
+    if !loaded_evidence.is_empty() {
+        log.say(format!("loaded policy proofs: {loaded_evidence}"));
     }
 
     let text = fs::read_to_string(&args.text).map_err(e)?;
@@ -2458,7 +3351,17 @@ fn real_main() -> R<bool> {
         ));
     }
     if args.spec_mtp {
-        return spec_main(&args, w, log, toks, max_k, file_size, primary);
+        return spec_main(
+            &args,
+            w,
+            log,
+            toks,
+            max_k,
+            lane_capacity,
+            file_size,
+            primary,
+            loaded_evidence,
+        );
     }
 
     // Checkpoints: prefill, step 1, the shortened g0/control run, the last step.
@@ -2524,25 +3427,36 @@ fn real_main() -> R<bool> {
     }
     let s1_pass = s1.unwrap_or(false);
     all_pass &= s1_pass;
-    app.log.say(format!("S1 prefill parity k=2: {}", if s1_pass { "PASS" } else { "FAIL" }));
+    app.log.say(format!(
+        "S1 prefill parity k=2: {}",
+        if s1_pass { "PASS" } else { "FAIL" }
+    ));
 
     // ── G0 per-stage probe ─────────────────────────────────────────
     let mut g0_json = Value::Null;
     if args.g0 {
-        let probe = RunOpts { prefill_ckpt: false };
+        let probe = RunOpts {
+            prefill_ckpt: false,
+        };
         let mut verdicts = Vec::new();
         let mut combined = LaneStagePolicy::all_per_lane();
         let mut identical_stages = Vec::new();
         for stage in StageName::ALL {
             if stage.stateful() {
-                app.log.say(format!("g0 stage {}: per lane by construction (stateful)", stage.key()));
-                verdicts.push(json!({"stage": stage.key(), "verdict": "stateful", "identical": false}));
+                app.log.say(format!(
+                    "g0 stage {}: per lane by construction (stateful)",
+                    stage.key()
+                ));
+                verdicts
+                    .push(json!({"stage": stage.key(), "verdict": "stateful", "identical": false}));
                 continue;
             }
-            let policy = match LaneStagePolicy::all_per_lane().with(stage, StageShare::OnceAllRows) {
+            let policy = match LaneStagePolicy::all_per_lane().with(stage, StageShare::OnceAllRows)
+            {
                 Ok(p) => p,
                 Err(m) => {
-                    app.log.say(format!("g0 stage {}: policy refused: {m}", stage.key()));
+                    app.log
+                        .say(format!("g0 stage {}: policy refused: {m}", stage.key()));
                     verdicts.push(json!({"stage": stage.key(), "verdict": format!("refused: {m}"), "identical": false}));
                     continue;
                 }
@@ -2555,7 +3469,9 @@ fn real_main() -> R<bool> {
                 let r = app.run_lanes(k, short_steps, policy, &label, Control::None, &probe);
                 if !r.pass {
                     identical = false;
-                    first.get_or_insert_with(|| format!("k={k}: {}", r.first.clone().unwrap_or_default()));
+                    first.get_or_insert_with(|| {
+                        format!("k={k}: {}", r.first.clone().unwrap_or_default())
+                    });
                 }
                 per_k.push(r.json);
             }
@@ -2578,7 +3494,8 @@ fn real_main() -> R<bool> {
                 "runs": per_k,
             }));
         }
-        app.log.say(format!("g0 combined policy: {}", combined.describe()));
+        app.log
+            .say(format!("g0 combined policy: {}", combined.describe()));
         app.log.say("g0 combined STAGE_SHARE:".to_string());
         let mut table = Vec::new();
         for stage in StageName::ALL {
@@ -2609,16 +3526,27 @@ fn real_main() -> R<bool> {
             return Err("--controls needs --steps >= 4".into());
         }
         let probe = RunOpts { prefill_ckpt: true };
-        for control in [Control::SwapTokens, Control::SwapRowSlot, Control::SwapRows, Control::WrongPosition] {
+        for control in [
+            Control::SwapTokens,
+            Control::SwapRowSlot,
+            Control::SwapRows,
+            Control::WrongPosition,
+        ] {
             let r = app.run_lanes(2, short_steps, primary, &args.policy, control, &probe);
             let refused = r.run.refused.clone();
             let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
             let (detected, how) = if !r.run.fired {
-                (false, "control was not exercised (no eligible step)".to_string())
+                (
+                    false,
+                    "control was not exercised (no eligible step)".to_string(),
+                )
             } else if let Some(m) = &refused {
                 (true, format!("refused at provision: {m}"))
             } else if diverged {
-                (true, format!("comparison failed: {}", r.first.clone().unwrap_or_default()))
+                (
+                    true,
+                    format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
+                )
             } else {
                 (false, "comparison still passed".to_string())
             };
@@ -2656,12 +3584,73 @@ fn real_main() -> R<bool> {
         );
     }
 
+    // ── promotion: native-MTP singleton → AR lane ──────────────────
+    let mut promote_json = Vec::new();
+    if let Some(windows) = args.promote {
+        let promote = ArPromote {
+            windows,
+            k: args.k,
+            skip_commit: false,
+        };
+        let label = format!("promote:{windows}@k{}", args.k);
+        for &k in &args.ks {
+            let r = app.run_lanes_with(
+                k,
+                args.steps,
+                primary,
+                &label,
+                Control::None,
+                &full,
+                Some(promote),
+            );
+            app.say_run(&r);
+            all_pass &= r.pass;
+            promote_json.push(r.json);
+        }
+        if args.controls {
+            // Negative: the lane keeps its fresh trunk state (no commit); the comparison must fail.
+            let control = ArPromote {
+                windows: 0,
+                k: args.k,
+                skip_commit: true,
+            };
+            let r = app.run_lanes_with(
+                2,
+                short_steps,
+                primary,
+                "promote:skip_commit",
+                Control::None,
+                &full,
+                Some(control),
+            );
+            let detected = r.run.diff.bad > 0 || r.run.error.is_some();
+            all_pass &= detected;
+            let how = if detected {
+                format!("comparison failed: {}", r.first.clone().unwrap_or_default())
+            } else {
+                "comparison still passed".to_string()
+            };
+            app.log.say(format!(
+                "control promote_skip_commit: {} ({how})",
+                if detected { "detected" } else { "MISSED" }
+            ));
+            controls_json.push(json!({
+                "control": "promote_skip_commit",
+                "detected": detected,
+                "how": how,
+                "run": r.json,
+            }));
+        }
+    }
+
     // ── bench ──────────────────────────────────────────────────────
     let mut bench_json = Vec::new();
     if args.bench > 0 {
         let n = args.bench;
         let singleton_ms = app.bench_singleton(n)?;
-        app.log.say(format!("bench singleton: {singleton_ms:.3} ms/step (median of {n}, request 0)"));
+        app.log.say(format!(
+            "bench singleton: {singleton_ms:.3} ms/step (median of {n}, request 0)"
+        ));
         for &k in &args.ks {
             let step_ms = app.bench_lanes(k, n)?;
             let tok_s = k as f64 * 1000.0 / step_ms;
@@ -2675,7 +3664,10 @@ fn real_main() -> R<bool> {
         }
     }
 
-    app.log.say(format!("fn_lane_oracle: {}", if all_pass { "PASS" } else { "FAIL" }));
+    app.log.say(format!(
+        "fn_lane_oracle: {}",
+        if all_pass { "PASS" } else { "FAIL" }
+    ));
     let summary = json!({
         "pass": all_pass,
         "gpu_arch": app.w.gpu.arch,
@@ -2683,18 +3675,238 @@ fn real_main() -> R<bool> {
         "model_bytes": file_size,
         "args": {
             "ks": args.ks, "contexts": args.contexts, "steps": args.steps, "max_seq": args.max_seq,
+            "lane_capacity": lane_capacity,
             "policy": args.policy, "policy_described": primary.describe(), "g0": args.g0,
             "controls": args.controls, "bench": args.bench, "spec": "ar",
+            "promote": args.promote, "k": args.promote.map(|_| args.k),
         },
-        "policy_evidence": primary.evidence(),
+        "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
+        "loaded_policy_evidence": loaded_evidence,
         "requests": app.refs.iter().map(|r| json!({"context": r.prompt.len(), "dir": r.dir.display().to_string()})).collect::<Vec<_>>(),
         "s1_prefill_parity_k2": s1_pass,
         "runs": runs,
+        "promote_runs": promote_json,
         "g0": g0_json,
         "controls": controls_json,
         "bench": bench_json,
         "log": app.log.lines,
     });
-    fs::write(args.out.join("summary.json"), serde_json::to_vec_pretty(&summary).map_err(e)?).map_err(e)?;
+    fs::write(
+        args.out.join("summary.json"),
+        serde_json::to_vec_pretty(&summary).map_err(e)?,
+    )
+    .map_err(e)?;
     Ok(all_pass)
+}
+
+#[cfg(test)]
+mod ple_rows_tests {
+    use super::*;
+    use hipfire_config::memory::{ple_sidecar_path, PleFormat, PleFormatRequest};
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    use hipfire_runtime::ple_sidecar::ple_shard_name;
+
+    /// Removes its temp directory on drop, pass or fail.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("fn_lane_oracle_ple_{}_{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A monolithic PLE base: three embedded q8 shard tensors (4 rows x 64).
+    fn write_monolithic(path: &Path) {
+        let tensors: Vec<HfqMemTensor> = (0..3)
+            .map(|s| HfqMemTensor {
+                name: ple_shard_name(s),
+                quant_type: 3,
+                shape: vec![4, 64],
+                group_size: 32,
+                data: vec![0; 4 * (64 / 32 * 34)],
+            })
+            .collect();
+        write_hfqm_package_mem(path, 16, "{}", &tensors).unwrap();
+    }
+
+    fn resolve(
+        path: &Path,
+        request: PleFormatRequest,
+        arch: &str,
+    ) -> (R<Option<PleRowsChoice>>, bool) {
+        let mut hfq = HfqFile::open(path).unwrap();
+        let out = resolve_ple_rows(&mut hfq, path, request, arch);
+        (out, hfq.ple_rows().is_some())
+    }
+
+    #[test]
+    fn explicit_q4_without_its_sidecar_refuses_and_never_derives() {
+        let dir = Scratch::new("missing");
+        let base = dir.0.join("m.hfqm");
+        write_monolithic(&base);
+        let (out, attached) = resolve(&base, PleFormatRequest::Q4, "gfx1100");
+        let err = out.unwrap_err();
+        assert!(err.starts_with("qwen4 PLE rows:"), "{err}");
+        assert!(
+            err.contains("sidecar is missing") && err.contains("derivation was not requested"),
+            "{err}"
+        );
+        assert!(!attached);
+        assert!(
+            !ple_sidecar_path(&base, PleFormat::Q4).exists(),
+            "the oracle must not derive"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_that_does_not_open_and_bind_is_refused_not_replaced_by_embedded_rows() {
+        let dir = Scratch::new("damaged");
+        let base = dir.0.join("m.hfqm");
+        write_monolithic(&base);
+        fs::write(ple_sidecar_path(&base, PleFormat::Q4), b"not a ple table").unwrap();
+        // An explicit q4 request, and `auto` on the q4-preferring gfx1151.
+        for (request, arch) in [
+            (PleFormatRequest::Q4, "gfx1100"),
+            (PleFormatRequest::Auto, "gfx1151"),
+        ] {
+            let (out, attached) = resolve(&base, request, arch);
+            let err = out.unwrap_err();
+            assert!(err.starts_with("qwen4 PLE rows:"), "{err}");
+            assert!(!attached, "{request:?} on {arch}");
+        }
+    }
+
+    #[test]
+    fn embedded_rows_default_is_unchanged() {
+        let dir = Scratch::new("embedded");
+        let base = dir.0.join("m.hfqm");
+        write_monolithic(&base);
+        // The q4 sidecar is not consulted when q8 is wanted, even a bad one.
+        fs::write(ple_sidecar_path(&base, PleFormat::Q4), b"not a ple table").unwrap();
+        for request in [PleFormatRequest::Auto, PleFormatRequest::Q8] {
+            let (out, attached) = resolve(&base, request, "gfx1100");
+            let choice = out.unwrap().expect("a PLE base resolves a choice");
+            assert_eq!(
+                (choice.format, &choice.origin),
+                (PleFormat::Q8, &PleRowsOrigin::Embedded)
+            );
+            assert!(!choice.derived && choice.note.is_none() && !attached);
+        }
+        // `auto` on gfx1151 with no q4 sidecar falls back to the embedded rows, with a note.
+        fs::remove_file(ple_sidecar_path(&base, PleFormat::Q4)).unwrap();
+        let (out, attached) = resolve(&base, PleFormatRequest::Auto, "gfx1151");
+        let choice = out.unwrap().unwrap();
+        assert_eq!(
+            (choice.format, &choice.origin),
+            (PleFormat::Q8, &PleRowsOrigin::Embedded)
+        );
+        assert!(choice.note.is_some() && !attached);
+    }
+
+    #[test]
+    fn a_base_without_the_ple_layout_resolves_nothing() {
+        let dir = Scratch::new("plain");
+        let base = dir.0.join("plain.hfqm");
+        write_hfqm_package_mem(&base, 16, "{}", &[]).unwrap();
+        for request in [
+            PleFormatRequest::Auto,
+            PleFormatRequest::Q4,
+            PleFormatRequest::Q8,
+        ] {
+            let (out, attached) = resolve(&base, request, "gfx1151");
+            assert_eq!(out.unwrap(), None);
+            assert!(!attached);
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_capacity_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> R<Args> {
+        let mut raw: Vec<String> = ["m.mq4", "t.txt", "out"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        raw.extend(extra.iter().map(|s| s.to_string()));
+        parse_args_from(&raw)
+    }
+
+    #[test]
+    fn flag_parses_and_defaults_to_none() {
+        assert_eq!(parse(&[]).unwrap().lane_capacity, None);
+        assert_eq!(
+            parse(&["--lane-capacity", "8"]).unwrap().lane_capacity,
+            Some(8)
+        );
+        assert!(parse(&["--lane-capacity"])
+            .err()
+            .expect("missing value must fail")
+            .contains("needs a value"));
+        assert!(parse(&["--lane-capacity", "x"]).is_err());
+        assert!(parse(&["--lane-capacity", "0"])
+            .err()
+            .expect("zero capacity must fail")
+            .contains(">= 1"));
+    }
+
+    #[test]
+    fn default_capacity_is_the_required_lanes() {
+        // Full run: --ks 1,2,4,8 stages 8; the default smoke (--ks 2) stages 2.
+        let full = parse(&[]).unwrap();
+        assert_eq!(
+            resolve_lane_capacity(full.lane_capacity, required_lanes(&full)).unwrap(),
+            8
+        );
+        let smoke = parse(&["--ks", "2"]).unwrap();
+        assert_eq!(
+            resolve_lane_capacity(smoke.lane_capacity, required_lanes(&smoke)).unwrap(),
+            2
+        );
+        let g0 = parse(&["--ks", "2", "--g0"]).unwrap();
+        assert_eq!(required_lanes(&g0), 8);
+    }
+
+    #[test]
+    fn capacity_bounds_are_refused() {
+        assert_eq!(resolve_lane_capacity(Some(8), 2).unwrap(), 8);
+        assert_eq!(resolve_lane_capacity(Some(2), 2).unwrap(), 2);
+        assert_eq!(
+            resolve_lane_capacity(Some(LANE_STORE_MAX_LANES), 2).unwrap(),
+            LANE_STORE_MAX_LANES
+        );
+        assert!(resolve_lane_capacity(Some(1), 2)
+            .unwrap_err()
+            .contains("below"));
+        assert!(resolve_lane_capacity(Some(LANE_STORE_MAX_LANES + 1), 2)
+            .unwrap_err()
+            .contains("exceeds"));
+        // Below the g0 requirement of 8 lanes.
+        let g0 = parse(&["--ks", "2", "--g0", "--lane-capacity", "4"]).unwrap();
+        assert!(resolve_lane_capacity(g0.lane_capacity, required_lanes(&g0)).is_err());
+    }
+
+    #[test]
+    fn selected_k1_with_capacity_8_keeps_two_references_and_ks() {
+        let a = parse(&["--ks", "1", "--controls", "--lane-capacity", "8"]).unwrap();
+        assert_eq!(a.ks, vec![1]);
+        // The singleton references are generated for `required_lanes` (2: k=1 plus the controls), not for the capacity.
+        let required = required_lanes(&a);
+        assert_eq!(required, 2);
+        assert_eq!(resolve_lane_capacity(a.lane_capacity, required).unwrap(), 8);
+        assert_eq!(a.ks, vec![1]);
+        let k4 = parse(&["--ks", "4", "--lane-capacity", "8"]).unwrap();
+        assert_eq!((k4.ks.clone(), required_lanes(&k4)), (vec![4], 4));
+    }
 }

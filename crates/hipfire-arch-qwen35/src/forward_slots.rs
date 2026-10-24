@@ -96,20 +96,25 @@ pub mod vmm;
 
 use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
-    moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
-    run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key, run_plain_gemm_key,
-    run_residual_gemm_key, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState,
-    FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights, MoeFfnWeights,
-    PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
+    moe_prefill_dtypes, prefill_moe_ffn_body_batched, DeltaNetLayerWeights,
+    DeltaNetMoeLayerWeights, DeltaNetState, FullAttnLayerWeights, FullAttnMoeLayerWeights,
+    LayerType, LayerWeights, MoeFfnWeights, PrefillBatchScratch, Qwen35Config, Qwen35Scratch,
+    Qwen35Weights, StateQuant,
 };
-use hipfire_runtime::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for;
+use hipfire_dispatch::families::fused_qkv::{
+    fused_gate_up_key_for, fused_qkv_key_for, fused_qkvza_key_for,
+};
 use hipfire_dispatch::families::gemm::residual_gemm_key_for;
 use hipfire_dispatch::families::moe::{
     gated_moe_prefill_admissible, mq6_batched_admit_enabled_from_env,
 };
+use hipfire_dispatch::pipeline::batched::{
+    q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
+    run_plain_gemm_key, run_residual_gemm_key,
+};
+use hipfire_runtime::slot_batch::SlotBatch;
 
 use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
@@ -352,7 +357,6 @@ impl SlotDescStaging {
     }
 }
 
-
 /// Where one FullAttention layer's KV lives for a slots step.
 ///
 /// `Arena` is the explicitly-legacy shared-arena route (`SlotPool` slab or
@@ -447,9 +451,7 @@ fn layer_kv_write_attend(
                 }),
             )
         }
-        LayerKvAddr::Vmm(layer) => {
-            vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n)
-        }
+        LayerKvAddr::Vmm(layer) => vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n),
     }
 }
 
@@ -662,11 +664,7 @@ fn plan_proj_group_dtypes(members: &[(DType, bool)], arch: &str) -> Result<Group
 
 /// Weight-bearing wrapper: names the group in the error and reads the AWQ
 /// sidecar off each `WeightTensor`.
-fn plan_proj_group(
-    weights: &[&WeightTensor],
-    group: &str,
-    arch: &str,
-) -> HipResult<GroupPlan> {
+fn plan_proj_group(weights: &[&WeightTensor], group: &str, arch: &str) -> HipResult<GroupPlan> {
     let members: Vec<(DType, bool)> = weights
         .iter()
         .map(|w| (w.gpu_dtype, w.awq_scale.is_some()))
@@ -800,7 +798,11 @@ fn slots_plain_proj(
     y: &GpuTensor,
     n: usize,
 ) -> HipResult<()> {
-    let x = if slots_weight_rotated(w.gpu_dtype) { x_rot } else { x_norm };
+    let x = if slots_weight_rotated(w.gpu_dtype) {
+        x_rot
+    } else {
+        x_norm
+    };
     run_plain_gemm_key(
         gpu,
         slots_plain_gemm_key(w.gpu_dtype).expect("mixed group members have plain keys"),
@@ -895,72 +897,6 @@ fn slots_residual_proj(
     run_residual_gemm_key(gpu, key, &w.buf, dt, x, &y_n, w.m, w.k, n)
 }
 
-
-
-// ── Kernel-key selection by weight CONTAINER, never hardcoded ──────────────
-//
-// qt=6 (HFQ4G256) and qt=13 (MQ4G256) share one container: 136 B groups holding
-// `[0..4) f32 scale, [4..8) f32 zero` over all 256 weights, then 128 B of nibbles.
-// MQ4 is that container plus an offline FWHT, so it has always borrowed HFQ4's
-// kernel keys and that is correct — only the activations differ.
-//
-// qt=44 (MQ4G256V2) is a DIFFERENT container. Same 136 B stride, same nibble
-// payload at the same offset, but the 8 header bytes become
-// `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1`, with s0/z0
-// governing weights 0..127 and s1/z1 governing 128..255.
-//
-// Hand a v1 key a qt=44 weight and the kernel bit_casts an fp16 pair to f32,
-// yielding ~1e-14: every weight in the tensor collapses to numerically zero. It
-// cannot fail — every bit pattern is a valid finite f32, the nibbles are read
-// correctly, and stride/alignment/K%256 are identical — so it runs at full speed
-// and returns noise. That cost two full KLD measurement cycles (WT2 12.137559
-// against a 0.043776 baseline, bit-identical across both runs) before it was
-// found. Select on the container; never hardcode.
-
-pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
-    match dt {
-        DType::Q8_0 => KernelKey::FusedQkvzaQ8_0,
-        DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
-        DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
-        DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
-        DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
-        DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
-        DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
-        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
-        // read them at the 136 B HFQ4 stride and return noise at full speed.
-        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
-        DType::MQ3G256 => KernelKey::FusedQkvzaHfq3G256,
-        DType::MQ3G256Lloyd => KernelKey::FusedQkvzaMq3G256Lloyd,
-        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
-        DType::MQ4G256V2Lloyd => panic!(
-            "fused_qkvza_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
-        ),
-        _ => KernelKey::FusedQkvzaHfq4G256,
-    }
-}
-
-pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
-    match dt {
-        DType::Q8_0 => KernelKey::FusedQkvQ8_0,
-        DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
-        DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
-        DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
-        DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
-        DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
-        DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
-        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
-        DType::MQ3G256 => KernelKey::FusedQkvHfq3G256,
-        DType::MQ3G256Lloyd => KernelKey::FusedQkvMq3G256Lloyd,
-        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
-        DType::MQ4G256V2Lloyd => panic!(
-            "fused_qkv_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
-        ),
-        _ => KernelKey::FusedQkvHfq4G256,
-    }
-}
-
-
-
 /// MoE-FFN weight-dtype admissibility gate, delegating to the reference's own
 /// `moe_ffn_batched_admissible` (same predicate `prefill_batch_pbs_eligible`
 /// checks before ever entering `forward_prefill_chunk`'s MoE branches) so
@@ -1024,17 +960,7 @@ fn mq4_residual_proj(
             ),
         )
     })?;
-    run_residual_gemm_key(
-        gpu,
-        key,
-        &w.buf,
-        w.gpu_dtype,
-        scratch,
-        &y_n,
-        w.m,
-        w.k,
-        n,
-    )
+    run_residual_gemm_key(gpu, key, &w.buf, w.gpu_dtype, scratch, &y_n, w.m, w.k, n)
 }
 
 /// `y[0..n*m] += w · x[0..n*k]`, dispatched through the same
@@ -1170,7 +1096,10 @@ fn dense_ffn_body_slots(
 
     let (need_rot, need_norm) = match gu_plan {
         GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+        GroupPlan::Mixed {
+            needs_rot,
+            needs_norm,
+        } => (needs_rot, needs_norm),
     };
     let gu_anchor = if let GroupPlan::Mixed { .. } = gu_plan {
         [w_gate, w_up]
@@ -1210,7 +1139,11 @@ fn dense_ffn_body_slots(
             fused_gate_up_key_for(dt),
             &w_gate.buf,
             &w_up.buf,
-            if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch },
+            if slots_weight_rotated(dt) {
+                &pbs.x_rot_batch
+            } else {
+                &pbs.x_norm_batch
+            },
             &pbs.gate_ffn_batch,
             &pbs.up_batch,
             w_gate.m,
@@ -1431,7 +1364,10 @@ where
     // rotated activations).
     let (need_rot, need_norm) = match qkvza_plan {
         GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+        GroupPlan::Mixed {
+            needs_rot,
+            needs_norm,
+        } => (needs_rot, needs_norm),
     };
     let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
         slots_weight_rotated(dt).then_some(&layer.wqkv)
@@ -1477,7 +1413,11 @@ where
             )?;
         }
         GroupPlan::Uniform(dt) => {
-            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            let x = if slots_weight_rotated(dt) {
+                &pbs.x_rot_batch
+            } else {
+                &pbs.x_norm_batch
+            };
             run_fused_qkvza_key(
                 gpu,
                 fused_qkvza_key_for(dt),
@@ -1510,7 +1450,6 @@ where
             }
         }
     }
-
 
     // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
@@ -1740,7 +1679,10 @@ where
     // QKVZA projection — same group-plan rules as the dense DeltaNet body.
     let (need_rot, need_norm) = match qkvza_plan {
         GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+        GroupPlan::Mixed {
+            needs_rot,
+            needs_norm,
+        } => (needs_rot, needs_norm),
     };
     let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
         slots_weight_rotated(dt).then_some(&layer.wqkv)
@@ -1786,7 +1728,11 @@ where
             )?;
         }
         GroupPlan::Uniform(dt) => {
-            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            let x = if slots_weight_rotated(dt) {
+                &pbs.x_rot_batch
+            } else {
+                &pbs.x_norm_batch
+            };
             run_fused_qkvza_key(
                 gpu,
                 fused_qkvza_key_for(dt),
@@ -1819,7 +1765,6 @@ where
             }
         }
     }
-
 
     // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
@@ -1973,7 +1918,10 @@ where
     // pbs.x_batch as input and accumulates the FFN output residual back
     // into it (same contract as the reference's own call site).
     let (attn_ns, t_moe) = match (&t_attn, trace_on) {
-        (Some(t), true) => (t.elapsed().as_nanos() as u64, Some(std::time::Instant::now())),
+        (Some(t), true) => (
+            t.elapsed().as_nanos() as u64,
+            Some(std::time::Instant::now()),
+        ),
         _ => (0, None),
     };
     let ctx = DispatchCtx::new(gpu);
@@ -2777,7 +2725,10 @@ fn run_fullattn_layer_slots(
     // projection — same group-plan rules as the DeltaNet site above.
     let (need_rot, need_norm) = match qkv_plan {
         GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+        GroupPlan::Mixed {
+            needs_rot,
+            needs_norm,
+        } => (needs_rot, needs_norm),
     };
     let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
         slots_weight_rotated(dt).then_some(&layer.wq)
@@ -2820,7 +2771,11 @@ fn run_fullattn_layer_slots(
             )?;
         }
         GroupPlan::Uniform(dt) => {
-            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            let x = if slots_weight_rotated(dt) {
+                &pbs.x_rot_batch
+            } else {
+                &pbs.x_norm_batch
+            };
             run_fused_qkv_key(
                 gpu,
                 fused_qkv_key_for(dt),
@@ -2849,7 +2804,6 @@ fn run_fullattn_layer_slots(
             }
         }
     }
-
 
     // 3. Deinterleave Q + gate.
     gpu.deinterleave_f32_batched(
@@ -3014,7 +2968,10 @@ fn run_fullattn_moe_layer_slots(
     // projection — same group-plan rules as the dense FullAttn body.
     let (need_rot, need_norm) = match qkv_plan {
         GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+        GroupPlan::Mixed {
+            needs_rot,
+            needs_norm,
+        } => (needs_rot, needs_norm),
     };
     let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
         slots_weight_rotated(dt).then_some(&layer.wq)
@@ -3057,7 +3014,11 @@ fn run_fullattn_moe_layer_slots(
             )?;
         }
         GroupPlan::Uniform(dt) => {
-            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            let x = if slots_weight_rotated(dt) {
+                &pbs.x_rot_batch
+            } else {
+                &pbs.x_norm_batch
+            };
             run_fused_qkv_key(
                 gpu,
                 fused_qkv_key_for(dt),
@@ -3086,7 +3047,6 @@ fn run_fullattn_moe_layer_slots(
             }
         }
     }
-
 
     // 3. Deinterleave Q + gate.
     gpu.deinterleave_f32_batched(
@@ -3191,7 +3151,10 @@ fn run_fullattn_moe_layer_slots(
 
     // 10. Batched MoE FFN — stateless per row, no slot machinery needed.
     let (attn_ns, t_moe) = match (&t_attn, trace_on) {
-        (Some(t), true) => (t.elapsed().as_nanos() as u64, Some(std::time::Instant::now())),
+        (Some(t), true) => (
+            t.elapsed().as_nanos() as u64,
+            Some(std::time::Instant::now()),
+        ),
         _ => (0, None),
     };
     let ctx = DispatchCtx::new(gpu);
@@ -4142,7 +4105,15 @@ pub fn forward_batch_slots_opts(
             unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
     }
-    embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+    embed_lookup_slots(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &pbs.x_batch,
+        &pbs.tokens,
+        n,
+        dim,
+    )?;
 
     // ── 1b. VL rows: overwrite image-pad rows with vision embeddings ─────
     // `batch.ext_emb` (per-row matrix index, -1 = token table) and the
@@ -4611,10 +4582,22 @@ mod tests {
         // 0/1/38/39) route through these selectors; an HFQ4 key here reads the
         // 200 B/group container at the 136 B stride and decodes noise.
         for dt in [DType::MQ6G256, DType::HFQ6G256] {
-            assert_eq!(fused_qkvza_key_for(dt), KernelKey::FusedQkvzaHfq6G256, "{dt:?}");
+            assert_eq!(
+                fused_qkvza_key_for(dt),
+                KernelKey::FusedQkvzaHfq6G256,
+                "{dt:?}"
+            );
             assert_eq!(fused_qkv_key_for(dt), KernelKey::FusedQkvHfq6G256, "{dt:?}");
-            assert_eq!(fused_gate_up_key_for(dt), KernelKey::FusedGateUpHfq6G256, "{dt:?}");
-            assert_eq!(residual_gemm_key_for(dt), KernelKey::GemmHfq6G256Residual, "{dt:?}");
+            assert_eq!(
+                fused_gate_up_key_for(dt),
+                KernelKey::FusedGateUpHfq6G256,
+                "{dt:?}"
+            );
+            assert_eq!(
+                residual_gemm_key_for(dt),
+                KernelKey::GemmHfq6G256Residual,
+                "{dt:?}"
+            );
         }
     }
 
@@ -4713,30 +4696,27 @@ mod tests {
         );
         // qt15 Promote6 member in a MIXED group: no GemmHfq6G256 plain key →
         // refuse with a named reason (uniform qt15 stays fused-legal).
-        assert!(plan_proj_group_dtypes(&[m(DType::MQ6G256), m(DType::MQ4G256V2)], arch)
-            .unwrap_err()
-            .contains("no per-projection GEMM key"));
+        assert!(
+            plan_proj_group_dtypes(&[m(DType::MQ6G256), m(DType::MQ4G256V2)], arch)
+                .unwrap_err()
+                .contains("no per-projection GEMM key")
+        );
         // AWQ in a mixed group: flat-member sidecars refuse (no kernel
         // applies them on the natural basis); rotated members may all carry
         // a sidecar or none, but not a mix.
-        assert!(plan_proj_group_dtypes(
-            &[m(DType::MQ4G256V2), (DType::Q8_0, true)],
-            arch
-        )
-        .unwrap_err()
-        .contains("FLAT"));
-        assert!(plan_proj_group_dtypes(
-            &[(DType::MQ4G256V2, true), m(DType::MQ6G256V2)],
-            arch
-        )
-        .unwrap_err()
-        .contains("AWQ"));
+        assert!(
+            plan_proj_group_dtypes(&[m(DType::MQ4G256V2), (DType::Q8_0, true)], arch)
+                .unwrap_err()
+                .contains("FLAT")
+        );
+        assert!(
+            plan_proj_group_dtypes(&[(DType::MQ4G256V2, true), m(DType::MQ6G256V2)], arch)
+                .unwrap_err()
+                .contains("AWQ")
+        );
         // All-rotated members sharing AWQ presence is admitted.
         assert_eq!(
-            plan_proj_group_dtypes(
-                &[(DType::MQ4G256V2, true), (DType::MQ6G256V2, true)],
-                arch
-            ),
+            plan_proj_group_dtypes(&[(DType::MQ4G256V2, true), (DType::MQ6G256V2, true)], arch),
             Ok(GroupPlan::Mixed {
                 needs_rot: true,
                 needs_norm: false
@@ -4774,7 +4754,10 @@ mod tests {
             DType::MQ3G256V2,
             DType::MQ2G256V2,
         ] {
-            assert!(slots_plain_gemm_key(dt).is_some(), "{dt:?} needs a plain key");
+            assert!(
+                slots_plain_gemm_key(dt).is_some(),
+                "{dt:?} needs a plain key"
+            );
             assert!(
                 slots_residual_gemm_key(dt).is_some(),
                 "{dt:?} needs a residual key"
@@ -4823,7 +4806,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("rotated container {dt:?} lost its residual key"));
             if dt != DType::MQ4G256 {
                 assert_ne!(
-                    key, KernelKey::GemmHfq4G256Residual,
+                    key,
+                    KernelKey::GemmHfq4G256Residual,
                     "{dt:?} must not share the HFQ4 v1 residual kernel"
                 );
             }

@@ -8,6 +8,8 @@ description = "Safe Rust FFI to AMD HIP/HSA runtime via dlopen"
 [features]
 # Archived research probes; see the note by the [[example]] blocks.
 lab = []
+# Strict preallocated eager-HIP launch-event measurement; absent from production.
+kernel-timing = []
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }

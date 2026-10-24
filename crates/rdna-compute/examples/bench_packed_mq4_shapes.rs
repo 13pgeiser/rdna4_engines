@@ -9,7 +9,9 @@ fn main() {
     // Optional numerical-only mode. Refuse existing directories and preserve
     // GPU-produced activation bytes for an independent CPU oracle.
     let dump = std::env::var_os("MQ4_ORACLE_DIR").map(std::path::PathBuf::from);
-    if let Some(path) = &dump { std::fs::create_dir(path).unwrap(); }
+    if let Some(path) = &dump {
+        std::fs::create_dir(path).unwrap();
+    }
     let mut gpu = Gpu::init_with_device(0).expect("GPU init");
     assert_eq!(gpu.arch, "gfx1100");
     for (m, k, add) in [(17408usize, 5120usize, false), (5120, 17408, true)] {
@@ -74,15 +76,27 @@ fn main() {
                     sq += (delta as f64).powi(2);
                     ref_sq += (*b as f64).powi(2);
                 }
-                println!("NUMERIC m={m} k={k} n={n} add={add} max_abs={max_abs} relative_l2={}", (sq / ref_sq).sqrt());
+                println!(
+                    "NUMERIC m={m} k={k} n={n} add={add} max_abs={max_abs} relative_l2={}",
+                    (sq / ref_sq).sqrt()
+                );
             }
-            if dump.is_some() { continue; }
-            for _ in 0..10 { launch(&mut gpu).unwrap(); }
+            if dump.is_some() {
+                continue;
+            }
+            for _ in 0..10 {
+                launch(&mut gpu).unwrap();
+            }
             gpu.hip.device_synchronize().unwrap();
             let start = Instant::now();
-            for _ in 0..50 { launch(&mut gpu).unwrap(); }
+            for _ in 0..50 {
+                launch(&mut gpu).unwrap();
+            }
             gpu.hip.device_synchronize().unwrap();
-            println!("TIMING m={m} k={k} n={n} add={add} packed={packed} us={:.3}", start.elapsed().as_secs_f64() * 1e6 / 50.);
+            println!(
+                "TIMING m={m} k={k} n={n} add={add} packed={packed} us={:.3}",
+                start.elapsed().as_secs_f64() * 1e6 / 50.
+            );
         }
         gpu.free_tensor(dw).unwrap();
         gpu.free_tensor(dx).unwrap();

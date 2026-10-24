@@ -2,15 +2,15 @@
   "module": "fused_qkv_hfq4g256_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "69d1dd4ea392201f4bc3d253997f46e932292c39",
-  "s_text_sha256": "2ecbe594223526c724df00c7b8efb198aa658b9710e14c59fdaa261b18954fc9",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "bfe282eb4b998d2fa9a10e48b1d53e03b869572dab379ff6914985ce88d15bf6",
   "kernels": [
     {
       "kernel_id": "fused_qkv_hfq4g256_mq4v2",
       "variant": "four-stream-quad-ilp",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "69d1dd4ea392201f4bc3d253997f46e932292c39",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "workitem",
@@ -391,7 +391,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "2ecbe594223526c724df00c7b8efb198aa658b9710e14c59fdaa261b18954fc9"
+      "s_text_sha256": "bfe282eb4b998d2fa9a10e48b1d53e03b869572dab379ff6914985ce88d15bf6"
     }
   ]
 }

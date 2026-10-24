@@ -9,8 +9,8 @@
 //! policy.  GPU lowering consumes the same shape/ordering contracts through the
 //! Qwen4-specific dispatch and compute modules.
 
-use rdna_compute::rope::Rope;
 use crate::state::{ReferenceGdnLayerState, StateError};
+use rdna_compute::rope::Rope;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -791,7 +791,10 @@ mod tests {
             let want = [(l * cos - r * sin) * mscale, (l * sin + r * cos) * mscale];
             for (got, want) in [values[i], values[i + dim / 2]].into_iter().zip(want) {
                 // f32 angles near 3e5 rad carry ~0.03 rad of rounding.
-                assert!((got as f64 - want).abs() < 0.05, "pair {i}: {got} vs {want}");
+                assert!(
+                    (got as f64 - want).abs() < 0.05,
+                    "pair {i}: {got} vs {want}"
+                );
             }
         }
     }

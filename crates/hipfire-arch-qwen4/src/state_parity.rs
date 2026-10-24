@@ -35,6 +35,121 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+// Kept CPU-only so every real-model state/profile loader uses a testable
+// split-base attachment boundary before artifact admission.
+fn attach_state_validation_rows(
+    hfq: &mut hipfire_runtime::hfq::HfqFile,
+    model_path: &Path,
+    request: hipfire_config::memory::PleFormatRequest,
+    arch: &str,
+) -> Result<(), String> {
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(hfq, model_path, request, arch)?;
+    Ok(())
+}
+
+#[test]
+fn state_loader_split_base_refuses_missing_q4_without_derivation() {
+    use hipfire_config::memory::PleFormatRequest;
+    use hipfire_runtime::external_rows::RowEncoding;
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+    use hipfire_runtime::ple_hot_pack::{
+        encode_ple_table_header, PackKind, PackOrder, PleHotPackHeader, PleTableFields,
+        TABLE_SEGMENT_BYTES,
+    };
+    use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
+    use sha2::{Digest, Sha256};
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-state-split-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("state-split.hfqm");
+    let metadata = json!({
+        "qwen4_ple": {
+            "version": 1, "multipliers": [-3, 5, 7],
+            "head_vocab_sizes": vec![0; 16], "head_offsets": vec![0; 16], "padded_rows": 12
+        },
+        "hipfire_ple_rows": {
+            "version": 1, "location": "sidecar", "shard_count": 3,
+            "rows_per_shard": 4, "row_width": 64, "q8_rows_sha256": "ab".repeat(32)
+        }
+    });
+    let tensor = HfqMemTensor {
+        name: "model.language_model.layers.1.ple.ple_embedding.layer_multipliers".into(),
+        quant_type: 54,
+        shape: vec![3],
+        group_size: 0,
+        data: vec![0; 24],
+    };
+    write_hfqm_package_mem(&path, 16, &metadata.to_string(), &[tensor]).unwrap();
+    let mut hfq = HfqFile::open(&path).unwrap();
+    let error =
+        attach_state_validation_rows(&mut hfq, &path, PleFormatRequest::Q4, "gfx1201").unwrap_err();
+    assert!(error.contains(".ple-q4"), "{error}");
+    assert!(hfq.ple_rows().is_none());
+    assert!(!path.with_extension("hfqm.ple-q4").exists());
+    // An existing, correctly bound Q4 table must be selected without deriving
+    // or consulting process-global format/GPU settings.
+    let sidecar = path.with_extension("hfqm.ple-q4");
+    let data = vec![0u8; 12 * RowEncoding::Q4Lm.encoded_row_bytes(64)];
+    let segment_digest = Sha256::digest(&data);
+    let mut header = PleHotPackHeader {
+        padded_rows: 12,
+        rows_per_shard: 4,
+        row_encoding: RowEncoding::Q4Lm,
+        row_width: 64,
+        encoded_row_bytes: RowEncoding::Q4Lm.encoded_row_bytes(64) as u64,
+        ple_fingerprint: hipfire_runtime::ple_sidecar::ple_fingerprint_from_metadata(
+            &metadata.to_string(),
+        )
+        .unwrap(),
+        rank_payload_sha256: "0".repeat(64),
+        tier_group: 256,
+        kept_buckets: 256,
+        tier_rows: vec![12],
+        data_offset: 0,
+        data_bytes: data.len() as u64,
+        shard_offsets: Vec::new(),
+        model_file_bytes: 0,
+        version: 3,
+        kind: PackKind::PleTable,
+        order: PackOrder::Row,
+        rank_offset: 0,
+        rank_bytes: 0,
+        table: Some(PleTableFields {
+            codebook_f32_bits: Some(lm4_codebook_bits()),
+            scale_grid_f32_bits: Some(lm4_scale_grid_bits()),
+            source_encoding: RowEncoding::Q8F16,
+            source_rows_sha256: "ab".repeat(32),
+            segment_bytes: TABLE_SEGMENT_BYTES,
+            segment_sha256: vec![format!("{segment_digest:x}")],
+            data_sha256: format!("{:x}", Sha256::digest(segment_digest)),
+            base_index_sha256: hfq
+                .index_sha256()
+                .unwrap()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            base_file_bytes: hfq.file_len(),
+        }),
+        generator: "hipfire state parity CPU regression".to_string(),
+    };
+    let mut bytes = encode_ple_table_header(&mut header).unwrap();
+    bytes.extend_from_slice(&data);
+    std::fs::write(&sidecar, bytes).unwrap();
+    let mut hfq = HfqFile::open(&path).unwrap();
+    attach_state_validation_rows(&mut hfq, &path, PleFormatRequest::Q4, "gfx1201").unwrap();
+    let rows = hfq.ple_rows().unwrap();
+    assert_eq!(rows.path(), sidecar);
+    assert_eq!(rows.encoding(), RowEncoding::Q4Lm);
+    drop(hfq);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const MAX_SEQ: usize = 8;
 const PREFIX: usize = 4;
 const DRAFTS: [u32; 2] = [1001, 1002];
@@ -492,6 +607,8 @@ fn select_target(
     let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
     let result = (|| {
         for qsa in &mut state.qsa {
+            // Rewrites pooled keys outside the forward: drop the BF16 mirror.
+            qsa.invalidate_f16_arena();
             indexed_attention_pool_rope(
                 gpu,
                 &IndexedAttentionPoolRope {
@@ -680,7 +797,11 @@ fn mutate_target(gpu: &mut Gpu, state: &mut Qwen4State) -> Result<(), String> {
     if let Some(ple_conv) = &state.ple_conv {
         write_scalar_f32(gpu, ple_conv, 95.0)?;
     }
-    write_scalar_f32(gpu, &state.hyper_feedback, 96.0)
+    let hyper_feedback = state
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
+    write_scalar_f32(gpu, hyper_feedback, 96.0)
 }
 
 fn mutate_mtp(gpu: &mut Gpu, state: &MtpGpuState) -> Result<(), String> {
@@ -701,10 +822,13 @@ fn target_families(
     let mut recurrent = Family::new();
     let mut conv = Family::new();
     for layer in &state.gdn {
-        append_f32(
+        // Compare the live slot's storage bytes, including Q8 codes/scales;
+        // an F32 download is not a storage-byte oracle for Q8.
+        append_raw(
             gpu,
             &mut recurrent,
             &layer.recurrent,
+            layer.recurrent.numel(),
             layer.recurrent.numel(),
         )?;
         append_f32(gpu, &mut conv, &layer.conv, layer.conv.numel())?;
@@ -784,7 +908,11 @@ fn target_families(
     if let Some(ple_conv) = &state.ple_conv {
         families.insert("ple_conv".into(), tensor(gpu, ple_conv)?);
     }
-    families.insert("hyper_feedback".into(), tensor(gpu, &state.hyper_feedback)?);
+    let hyper_feedback = state
+        .hyper_feedback
+        .as_ref()
+        .expect("hyper_feedback is input-band state");
+    families.insert("hyper_feedback".into(), tensor(gpu, hyper_feedback)?);
     families.insert("metadata".into(), metadata.finish());
     Ok(families)
 }
@@ -1056,6 +1184,7 @@ fn rollback_failure(
     case: &str,
     injected: Option<&str>,
 ) -> Result<Value, String> {
+    let scope_before = verify_scope(gpu);
     target.reset(gpu).map_err(|e| e.to_string())?;
     mtp.reset(gpu).map_err(|e| e.to_string())?;
     for (position, &token) in [10u32, 11, 12, 13].iter().enumerate() {
@@ -1078,13 +1207,15 @@ fn rollback_failure(
     let target_compare =
         compare_family_maps(&before_target, &target_families(gpu, config, target)?);
     let mtp_compare = compare_family_maps(&before_mtp, &mtp_families(gpu, config, mtp)?);
-    let pass = target_compare.0 && mtp_compare.0;
+    let scope_restored = verify_scope(gpu) == scope_before;
+    let pass = target_compare.0 && mtp_compare.0 && scope_restored;
     Ok(json!({
         "case": case,
         "status": if pass {"pass"} else {"fail"},
         "replay_error": failure,
         "target_rollback": target_compare.1,
         "mtp_rollback": mtp_compare.1,
+        "gpu_scope_restored": scope_restored,
     }))
 }
 
@@ -1470,10 +1601,15 @@ fn qwen4_use_range_payload(is_uma: bool, residency: WeightResidency) -> bool {
 
 fn qwen4_oracle_payload<'a>(
     source: &'a hipfire_runtime::hfq::HfqModelSource,
+    recipe: &crate::weights::Qwen4TierRecipe,
     entry: &WeightEntry,
     use_ranges: bool,
 ) -> Result<hipfire_runtime::model_source::SourcePayload<'a>, String> {
     use hipfire_runtime::model_source::SourcePayload;
+    // An expert-slab layer arena is one span of the container, not a tensor.
+    if let Some(payload) = crate::expert_arena::recipe_arena_payload(source, recipe, entry) {
+        return payload;
+    }
     if qwen4_use_range_payload(use_ranges, entry.residency) {
         return source
             .tensor_range(&entry.name)
@@ -1521,25 +1657,31 @@ fn run_profile_inner(
     let open_ns = profile_duration_ns(open_started);
     emit_profile_load_checkpoint("open_hfq", open_ns);
 
+    let gpu_init_started = Instant::now();
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let gpu_init_ns = profile_duration_ns(gpu_init_started);
+    emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
     let admission_started = Instant::now();
-    let receipt = crate::admit_hfqm_artifact(&hfq)
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let admission_ns = profile_duration_ns(admission_started);
     emit_profile_load_checkpoint("admission", admission_ns);
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-
-    let gpu_init_started = Instant::now();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let gpu_init_ns = profile_duration_ns(gpu_init_started);
-    emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode =
-        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
-            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+        .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1551,8 +1693,9 @@ fn run_profile_inner(
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let manifest_started = Instant::now();
     let source_progress = RefCell::new((0_u64, None::<Instant>, None::<Instant>));
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
@@ -1579,7 +1722,7 @@ fn run_profile_inner(
             };
             emit_profile_source_callback(index, entry, elapsed_ns, cumulative_ns);
 
-            qwen4_oracle_payload(&source, entry, use_ranges)
+            qwen4_oracle_payload(&source, &manifest.identity.recipe, entry, use_ranges)
         },
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
@@ -1588,7 +1731,7 @@ fn run_profile_inner(
 
     let assemble_started = Instant::now();
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -1596,8 +1739,10 @@ fn run_profile_inner(
         &mut gpu,
         1,
         metadata,
+        receipt.ple_rows,
         crate::state::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let assemble_ns = profile_duration_ns(assemble_started);
@@ -1855,18 +2000,25 @@ pub fn run_state_parity(
     let (tokens, corpus) = read_state_tokens(corpus_path)?;
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
-    let receipt = crate::admit_hfqm_artifact(&hfq)
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode =
-        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
-            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+        .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1875,17 +2027,18 @@ pub fn run_state_parity(
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
+        |entry| qwen4_oracle_payload(&source, &manifest.identity.recipe, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -1893,8 +2046,10 @@ pub fn run_state_parity(
         &mut gpu,
         2048,
         metadata,
+        receipt.ple_rows,
         crate::state::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {
@@ -1934,6 +2089,83 @@ pub fn run_state_parity(
     })))
 }
 
+// The rows API intentionally only exposes a replacing setter. Observe it
+// without leaving a changed scope; no test-only public getter is necessary.
+fn verify_scope(
+    gpu: &mut Gpu,
+) -> (
+    usize,
+    Option<rdna_compute::prefill_invariant::Qwen4VerifyReference>,
+) {
+    let rows = gpu.set_wide_verify_rows(0);
+    gpu.set_wide_verify_rows(rows);
+    (rows, gpu.qwen4_verify_reference())
+}
+
+/// The snapshot itself launches copy_regions, so it MUST precede arming the
+/// first-launch seam. This exercises scoped forward failure plus a manual
+/// ticket abort, not aggregate verify auto-abort or failure after kernel work.
+fn scoped_launch_abort_probe(
+    gpu: &mut Gpu,
+    bundle: &mut crate::bundle::Qwen4Bundle,
+    block: &[u32],
+) -> Result<Value, String> {
+    let scope_before = verify_scope(gpu);
+    let conv_history = bundle.config.linear_conv_kernel_dim - 1;
+    bundle
+        .ensure_spec_hidden(gpu, block.len())
+        .map_err(|e| e.to_string())?;
+    bundle
+        .state
+        .ensure_row_capture(gpu, block.len(), conv_history)
+        .map_err(|e| e.to_string())?;
+    let before = target_families(gpu, &bundle.config, &bundle.state)?;
+    bundle.state.row_capture_armed = true;
+    let ticket = match bundle.snapshot(gpu) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            bundle.state.row_capture_armed = false;
+            return Err(error.to_string());
+        }
+    };
+    hip_bridge::arm_hip_fault("launch", 1);
+    let failure = bundle
+        .spec_forward_rows(gpu, block, true)
+        .err()
+        .map(|e| e.to_string());
+    hip_bridge::arm_hip_fault("launch", 0);
+    bundle.state.row_capture_armed = false;
+    let scope_restored = verify_scope(gpu) == scope_before;
+    #[cfg(feature = "lab")]
+    let scope_entry_observed = Some(bundle.last_verify_reference().is_some());
+    #[cfg(not(feature = "lab"))]
+    let scope_entry_observed: Option<bool> = None;
+    bundle.restore(gpu, ticket).map_err(|e| e.to_string())?;
+    let state = compare_family_maps(
+        &before,
+        &target_families(gpu, &bundle.config, &bundle.state)?,
+    );
+    let injected = failure
+        .as_ref()
+        .is_some_and(|error| error.contains("injected launch failure"));
+    if !injected || !scope_restored || !state.0 || scope_entry_observed == Some(false) {
+        return Err(format!(
+            "scoped first-launch/manual-abort probe failed: error={failure:?}, scope={scope_restored}, entry={scope_entry_observed:?}, state={}",
+            state.1,
+        ));
+    }
+    Ok(json!({
+        "status": "pass",
+        "failure": failure,
+        "rows": block.len(),
+        "scope_restored": scope_restored,
+        "scope_entry_observed": scope_entry_observed,
+        "abort": "manual_ticket_restore_after_scoped_forward_failure",
+        "after_partial_kernel_work": false,
+        "state_families": state.1,
+    }))
+}
+
 fn real_model_probe(
     gpu: &mut Gpu,
     bundle: &mut crate::bundle::Qwen4Bundle,
@@ -1941,6 +2173,37 @@ fn real_model_probe(
     corpus: &Value,
 ) -> Result<Value, String> {
     let vocab = bundle.config.vocab_size;
+    use hipfire_runtime::spec::SpecTarget;
+    let entry_scope = verify_scope(gpu);
+    let effective_rows = bundle.row_exact_verify_rows(gpu);
+    if let Some(forward) = bundle.execution.as_ref() {
+        let logits_rows = bundle.spec_logits.as_ref().map_or(0, |t| t.numel() / vocab);
+        let top1_rows = bundle.spec_top1.as_ref().map_or(0, GpuTensor::byte_size) / 4;
+        let physical_rows = crate::gpu_forward::qwen4_spec_logit_rows(forward.scratch.max_chunk)
+            .min(logits_rows)
+            .min(top1_rows);
+        if effective_rows > physical_rows
+            || forward
+                .native_mtp_cpu_window_rows()
+                .is_some_and(|cap| effective_rows > cap)
+        {
+            return Err(format!(
+                "effective verify capacity {effective_rows} exceeds actual scratch/CPU capacity"
+            ));
+        }
+    }
+    // A block larger than its allocated transaction scratch must be refused
+    // before any target snapshot/launch, with both GPU scopes untouched.
+    let mut refusal_scratch = bundle.new_spec_scratch(gpu, 1)?;
+    let position = bundle.state.position;
+    let prelaunch_refusal = bundle
+        .verify_block(gpu, &[0, 0], position, refusal_scratch.as_mut(), None)
+        .err();
+    refusal_scratch.free(gpu);
+    let prelaunch_scope_restored = verify_scope(gpu) == entry_scope;
+    if prelaunch_refusal.is_none() || !prelaunch_scope_restored {
+        return Err("verify prelaunch refusal did not preserve rows/reference scope".into());
+    }
     let ar_elements = tokens
         .len()
         .checked_mul(vocab)
@@ -1980,13 +2243,25 @@ fn real_model_probe(
     };
     let mut drafter = crate::mtp_spec::Qwen4MtpDrafter::new(DRAFTS.len(), 2048, None);
     use hipfire_runtime::spec::MtpDrafter;
-    let seed = match drafter.mtp_prefill(gpu, bundle, tokens, tokens, 0, false, &|| false) {
+    let seed = match drafter
+        .mtp_prefill(gpu, bundle, tokens, tokens, 0, false, &|| false)
+        .and_then(|outcome| outcome.into_first_token())
+    {
         Ok(seed) => seed,
         Err(error) => {
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
             let _ = gpu.free_tensor(mtp_buffer);
             let _ = gpu.free_tensor(ar_buffer);
             return Err(format!("real native MTP prefill: {error}"));
+        }
+    };
+    let scoped_abort = match scoped_launch_abort_probe(gpu, bundle, &[seed, seed]) {
+        Ok(report) => report,
+        Err(error) => {
+            MtpDrafter::mtp_free(Box::new(drafter), gpu);
+            let _ = gpu.free_tensor(mtp_buffer);
+            let _ = gpu.free_tensor(ar_buffer);
+            return Err(error);
         }
     };
     let eos = bundle.config.eos_token_id;
@@ -2005,9 +2280,18 @@ fn real_model_probe(
             MtpDrafter::mtp_free(Box::new(drafter), gpu);
             let _ = gpu.free_tensor(mtp_buffer);
             let _ = gpu.free_tensor(ar_buffer);
-            return Err(format!("real native MTP step: {error}"));
+            let restored = verify_scope(gpu) == entry_scope;
+            return Err(format!(
+                "real native MTP step: {error}; verify scope restored={restored}"
+            ));
         }
     };
+    let verify_scope_restored = verify_scope(gpu) == entry_scope;
+    #[cfg(feature = "lab")]
+    let reference_bound =
+        (window.drafts_generated != 0).then(|| bundle.last_verify_reference().is_some());
+    #[cfg(not(feature = "lab"))]
+    let reference_bound: Option<bool> = None;
     let probe_token = window.committed.last().copied().unwrap_or(seed);
     let mtp_position = match bundle.mtp_position() {
         Ok(position) => position,
@@ -2053,12 +2337,18 @@ fn real_model_probe(
     let finite = ar_logits.values.iter().all(|value| value.is_finite())
         && mtp_logits.values.iter().all(|value| value.is_finite());
     let result = json!({
-        "status": if finite {"pass"} else {"fail"},
+        "status": if finite && verify_scope_restored && reference_bound != Some(false) {"pass"} else {"fail"},
         "corpus": corpus,
         "ar_logit_row": tokens.len() - 1,
         "ar_token_count": tokens.len(),
         "accepted_drafts": window.accepted,
         "drafts_generated": window.drafts_generated,
+        "effective_row_exact_rows": effective_rows,
+        "verify_prelaunch_refusal": prelaunch_refusal,
+        "verify_prelaunch_scope_restored": prelaunch_scope_restored,
+        "scoped_first_launch_manual_abort": scoped_abort,
+        "verify_scope_restored": verify_scope_restored,
+        "multirow_reference_bound": reference_bound,
         "committed": window.committed,
         "seed": seed,
         "probe_token": probe_token,
@@ -2233,13 +2523,21 @@ pub fn run_mtp_fill_digest(
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|error| format!("tokenizer: {error}"))?;
     let prompt_ids = prompt_text.map(|text| tokenizer.encode(text));
-    let receipt = crate::admit_hfqm_artifact(&hfq)
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     let domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
         &hfq,
         &tokenizer,
@@ -2249,9 +2547,8 @@ pub fn run_mtp_fill_digest(
     );
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode =
-        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
-            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+        .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2267,12 +2564,12 @@ pub fn run_mtp_fill_digest(
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
+        |entry| qwen4_oracle_payload(&source, &manifest.identity.recipe, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
     let warm = warm_chunks > 0;
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -2280,8 +2577,10 @@ pub fn run_mtp_fill_digest(
         &mut gpu,
         max_seq,
         metadata,
+        receipt.ple_rows,
         crate::state::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let run = (|| -> Result<Value, String> {
@@ -2337,15 +2636,17 @@ pub fn run_mtp_fill_digest(
                         "warm length {length}: session plan starts at {start_pos}, expected {prefix_len}"
                     ));
                 }
-                drafter.mtp_prefill(
-                    &mut gpu,
-                    &mut bundle,
-                    &prompt,
-                    &prompt[prefix_len..],
-                    prefix_len,
-                    true,
-                    &|| false,
-                )?
+                drafter
+                    .mtp_prefill(
+                        &mut gpu,
+                        &mut bundle,
+                        &prompt,
+                        &prompt[prefix_len..],
+                        prefix_len,
+                        true,
+                        &|| false,
+                    )?
+                    .into_first_token()?
             } else {
                 let prompt = match prompt_ids.as_deref() {
                     Some(ids) => ids
@@ -2356,7 +2657,9 @@ pub fn run_mtp_fill_digest(
                         .to_vec(),
                     None => tokens(length as u64, length),
                 };
-                drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
+                drafter
+                    .mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
+                    .into_first_token()?
             };
             let after_fill = bundle_family_json(&gpu, &bundle)?;
             // The prompt's last row: the final chunk's LM head writes it.
@@ -2411,6 +2714,379 @@ pub fn run_mtp_fill_digest(
     Ok(value)
 }
 
+// ── S1 slow-link layer-major prefill: gate-facing state oracle ─────────
+//
+// Raw-byte SHA-256 digests of everything a prefill commits (GDN recurrent and
+// conv state per layer, the QSA arenas up to their active marks, the bounded
+// QSA buffers, PLE conv/history, HC feedback, positions and lengths), the
+// shared slab-capable range loader the S1 hardware gate and the parity CLI
+// use, and one bounded-row logit summary. Nothing here allocates N×vocab.
+
+/// Hex SHA-256 of `bytes`.
+fn slowlink_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The first `elements` elements of `tensor` as raw device bytes (empty reads
+/// nothing; an extent past the tensor is an error, never a clamp).
+fn slowlink_tensor_bytes(
+    gpu: &Gpu,
+    tensor: &GpuTensor,
+    elements: usize,
+) -> Result<Vec<u8>, String> {
+    if elements == 0 {
+        return Ok(Vec::new());
+    }
+    if elements > tensor.numel() {
+        return Err(format!(
+            "state extent {elements} exceeds tensor {}",
+            tensor.numel()
+        ));
+    }
+    let view = tensor.sub_offset(0, elements);
+    let mut bytes = vec![0u8; view.buf.size()];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &view.buf)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+/// Combine ordered `(name, hex digest)` parts into one digest. The names are
+/// part of the preimage, so a reordered or renamed part changes the result.
+fn slowlink_combine_digests(parts: &[(String, String)]) -> String {
+    let mut preimage = String::new();
+    for (name, digest) in parts {
+        preimage.push_str(name);
+        preimage.push('=');
+        preimage.push_str(digest);
+        preimage.push('\n');
+    }
+    slowlink_sha256(preimage.as_bytes())
+}
+
+/// Per-family raw-byte digests of the request state a prefill committed.
+/// Capacity-pinned QSA arenas are read up to their active marks only (beyond
+/// them the model never reads and `reset` zeroes); the bounded partial and
+/// selected buffers are read whole. `combined` covers every part in order.
+pub fn slowlink_state_digest(
+    gpu: &Gpu,
+    bundle: &crate::bundle::Qwen4Bundle,
+) -> Result<Value, String> {
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let config = &bundle.config;
+    let state = &bundle.state;
+    let raw_width = config
+        .indexer_kv_heads
+        .checked_mul(config.indexer_head_dim)
+        .ok_or("raw index width overflows")?;
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut gdn = Vec::with_capacity(state.gdn.len());
+    for (layer, layer_state) in state.gdn.iter().enumerate() {
+        let recurrent = slowlink_sha256(&slowlink_tensor_bytes(
+            gpu,
+            &layer_state.recurrent,
+            layer_state.recurrent.numel(),
+        )?);
+        let conv = slowlink_sha256(&slowlink_tensor_bytes(
+            gpu,
+            &layer_state.conv,
+            layer_state.conv.numel(),
+        )?);
+        parts.push((format!("gdn.{layer}.recurrent"), recurrent.clone()));
+        parts.push((format!("gdn.{layer}.conv"), conv.clone()));
+        gdn.push(json!({"layer": layer, "recurrent": recurrent, "conv": conv}));
+    }
+    let mut qsa = Vec::with_capacity(state.qsa.len());
+    for (layer, owner) in state.qsa.iter().enumerate() {
+        let active = [
+            (
+                "full_keys",
+                &owner.full_keys,
+                owner.full_len,
+                owner.full_row_units,
+            ),
+            (
+                "full_values",
+                &owner.full_values,
+                owner.full_len,
+                owner.full_row_units,
+            ),
+            ("raw_keys", &owner.raw_index_keys, owner.raw_len, raw_width),
+            (
+                "pooled_keys",
+                &owner.pooled_keys,
+                owner.pooled_len,
+                raw_width,
+            ),
+        ];
+        let mut digests = Map::new();
+        for (name, tensor, rows, width) in active {
+            let elements = rows
+                .checked_mul(width)
+                .ok_or_else(|| format!("qsa.{layer}.{name} extent overflows"))?;
+            let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, elements)?);
+            parts.push((format!("qsa.{layer}.{name}"), digest.clone()));
+            digests.insert(name.to_string(), Value::String(digest));
+        }
+        for (name, tensor) in [
+            ("partial_keys", &owner.partial_keys),
+            ("partial_values", &owner.partial_values),
+            ("selected", &owner.selected_indices),
+        ] {
+            let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, tensor.numel())?);
+            parts.push((format!("qsa.{layer}.{name}"), digest.clone()));
+            digests.insert(name.to_string(), Value::String(digest));
+        }
+        let lengths = [
+            owner.full_len,
+            owner.raw_len,
+            owner.pooled_len,
+            owner.partial_len,
+            owner.selected_len,
+        ];
+        parts.push((format!("qsa.{layer}.lengths"), format!("{lengths:?}")));
+        qsa.push(json!({"layer": layer, "lengths": lengths, "digests": digests}));
+    }
+    let mut ple = Map::new();
+    if let Some(tensor) = &state.ple_conv {
+        let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, tensor.numel())?);
+        parts.push(("ple.conv".into(), digest.clone()));
+        ple.insert("conv".into(), Value::String(digest));
+    }
+    if let Some(tensor) = &state.hyper_feedback {
+        let digest = slowlink_sha256(&slowlink_tensor_bytes(gpu, tensor, tensor.numel())?);
+        parts.push(("ple.hyper_feedback".into(), digest.clone()));
+        ple.insert("hyper_feedback".into(), Value::String(digest));
+    }
+    let history = state.ple_history.previous();
+    parts.push(("ple.history".into(), format!("{history:?}")));
+    parts.push(("position".into(), state.position.to_string()));
+    Ok(json!({
+        "position": state.position,
+        "ple_history": history,
+        "gdn": gdn,
+        "qsa": qsa,
+        "ple": ple,
+        "combined": slowlink_combine_digests(&parts),
+        "parts": parts.len(),
+    }))
+}
+
+/// Indices and raw bits of the `k` largest finite entries, descending, ties
+/// broken by the lower index. Non-finite entries never rank.
+fn slowlink_top_k(values: &[f32], k: usize) -> Vec<(usize, u32)> {
+    let mut ranked: Vec<(usize, f32)> = values
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(k);
+    ranked
+        .into_iter()
+        .map(|(index, value)| (index, value.to_bits()))
+        .collect()
+}
+
+/// Bounded summary of `rows` consecutive logits rows of width `vocab` in
+/// `logits` (a view of exactly `rows * vocab` elements): per row the SHA-256
+/// of its bytes, finiteness, top-1 and the top-`top_k` (index, raw f32 bits).
+/// Callers keep `rows` small (the head view is never N×vocab).
+pub fn slowlink_logit_rows_summary(
+    gpu: &Gpu,
+    logits: &GpuTensor,
+    rows: usize,
+    vocab: usize,
+    top_k: usize,
+) -> Result<Value, String> {
+    let expected = rows
+        .checked_mul(vocab)
+        .ok_or("logit summary extent overflows")?;
+    if logits.numel() != expected {
+        return Err(format!(
+            "logit summary expects {rows}x{vocab}={expected} elements, tensor has {}",
+            logits.numel()
+        ));
+    }
+    let values = gpu
+        .download_f32(logits)
+        .map_err(|error| error.to_string())?;
+    let mut summary = Vec::with_capacity(rows);
+    let mut parts = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let slice = &values[row * vocab..(row + 1) * vocab];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) };
+        let digest = slowlink_sha256(bytes);
+        let finite = slice.iter().all(|value| value.is_finite());
+        let top = slowlink_top_k(slice, top_k);
+        parts.push((format!("row{row}"), digest.clone()));
+        summary.push(json!({
+            "row": row,
+            "sha256": digest,
+            "finite": finite,
+            "top1": top.first().map(|(index, _)| *index),
+            "top": top.iter().map(|(index, bits)| json!([index, bits])).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(json!({
+        "rows": rows,
+        "vocab": vocab,
+        "combined": slowlink_combine_digests(&parts),
+        "per_row": summary,
+    }))
+}
+
+// The shared single-device load (admission-first placement, S1 profile attach)
+// lives in `crate::slowlink_load`, tools-gated (`test` / `lab` /
+// `reference-parity`) like every S1 validation entry.
+pub use crate::slowlink_load::{slowlink_load_bundle, SlowlinkLoaded};
+
+/// One whole-prompt production prefill per repeat from a fresh state
+/// (`prefill_final`: the selector's request path), each with its route
+/// receipt, fixed-state digest and final-row logit summary. The repeats must
+/// agree byte for byte (same-route determinism); the report says whether they
+/// did. The route is whatever `HIPFIRE_QWEN4_SLOWLINK_PREFILL` and the
+/// selector decide; run once per setting and compare the two reports.
+pub fn run_slowlink_prefill_state(
+    model_path: &Path,
+    prompt: &[u32],
+    max_seq: usize,
+    repeats: usize,
+) -> Result<Value, String> {
+    if prompt.is_empty() {
+        return Err("slowlink state prompt is empty".to_string());
+    }
+    if repeats == 0 {
+        return Err("slowlink state repeats must be > 0".to_string());
+    }
+    if prompt.len() >= max_seq {
+        return Err(format!(
+            "slowlink state prompt of {} rows does not fit max_seq {max_seq}",
+            prompt.len()
+        ));
+    }
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let loaded = slowlink_load_bundle(
+        &mut gpu,
+        model_path,
+        max_seq,
+        None,
+        crate::slowlink_admission::AdmissionPurpose::Product,
+    )?;
+    let SlowlinkLoaded {
+        mut bundle,
+        vocab,
+        num_layers,
+        host_mapped_tensors,
+        resident_layers,
+        placement,
+        slowlink_profile,
+        ple_format,
+        ..
+    } = loaded;
+    let run = (|| -> Result<Value, String> {
+        let logits = gpu
+            .zeros(&[vocab], DType::F32)
+            .map_err(|error| error.to_string())?;
+        let mut runs = Vec::with_capacity(repeats);
+        let mut outcome = Ok(());
+        for repeat in 0..repeats {
+            let step = (|| -> Result<Value, String> {
+                bundle
+                    .prefill_final(&mut gpu, prompt, 0, &logits)
+                    .map_err(|error| format!("prefill {repeat}: {error}"))?;
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({
+                    "repeat": repeat,
+                    "receipt": bundle.slowlink_receipt(),
+                    "state": slowlink_state_digest(&gpu, &bundle)?,
+                    "final_logits": slowlink_logit_rows_summary(&gpu, &logits, 1, vocab, 16)?,
+                }))
+            })();
+            match step {
+                Ok(value) => runs.push(value),
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        let _ = gpu.free_tensor(logits);
+        outcome?;
+        let first = &runs[0];
+        let equal = runs.iter().all(|run| {
+            run["state"]["combined"] == first["state"]["combined"]
+                && run["final_logits"]["combined"] == first["final_logits"]["combined"]
+        });
+        Ok(json!({
+            "schema": "hipfire.qwen4.slowlink_prefill_state.v1",
+            "status": if equal { "pass" } else { "fail" },
+            "prompt_rows": prompt.len(),
+            "max_seq": max_seq,
+            "num_layers": num_layers,
+            "host_mapped_tensors": host_mapped_tensors,
+            "resident_layers": resident_layers,
+            "placement": placement,
+            "slowlink_profile": slowlink_profile,
+            "ple_format": ple_format,
+            "repeat_equal": equal,
+            "runs": runs,
+        }))
+    })();
+    let cleanup = bundle
+        .free_gpu(&mut gpu)
+        .err()
+        .map(|error| format!("qwen4 bundle teardown failed: {error}"));
+    let value = run?;
+    if let Some(error) = cleanup {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod slowlink_state_tests {
+    use super::*;
+
+    #[test]
+    fn slowlink_state_combined_digest_binds_names_and_order() {
+        let a = ("gdn.0.recurrent".to_string(), "aa".to_string());
+        let b = ("gdn.0.conv".to_string(), "bb".to_string());
+        let forward = slowlink_combine_digests(&[a.clone(), b.clone()]);
+        assert_eq!(forward, slowlink_combine_digests(&[a.clone(), b.clone()]));
+        assert_ne!(forward, slowlink_combine_digests(&[b.clone(), a.clone()]));
+        let renamed = ("gdn.1.recurrent".to_string(), "aa".to_string());
+        assert_ne!(forward, slowlink_combine_digests(&[renamed, b]));
+        assert_eq!(
+            slowlink_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn slowlink_state_top_k_is_descending_stable_and_skips_non_finite() {
+        let values = [1.0f32, f32::NAN, 3.0, 3.0, f32::INFINITY, -2.0];
+        let top = slowlink_top_k(&values, 3);
+        assert_eq!(
+            top,
+            vec![
+                (2, 3.0f32.to_bits()),
+                (3, 3.0f32.to_bits()),
+                (0, 1.0f32.to_bits())
+            ]
+        );
+        assert!(slowlink_top_k(&values, 0).is_empty());
+        assert_eq!(slowlink_top_k(&values, 99).len(), 4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2432,6 +3108,175 @@ mod tests {
             eprintln!("skip: Qwen4 compact state parity requires a GPU");
             None
         })
+    }
+
+    /// Descriptor-only GPU fixture: real allocations, no arithmetic kernel
+    /// claim. Every admitted verify width reuses the immutable Q8 copy.
+    #[test]
+    fn decode_copy_descriptor_identity_through_64() {
+        use hipfire_dispatch::families::gemv::WeightRef;
+        let Some(mut gpu) = try_gpu() else { return };
+        let max = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        for k in [320, 640, 2560] {
+            let m = 3;
+            let source_buf = gpu.zeros(&[m * k], DType::BF16).expect("source");
+            let stride = crate::projection::row_stride(DType::Q8_0, k);
+            let copies = [gpu.zeros(&[m * stride], DType::Raw).expect("Q8 copy")];
+            gpu.hip
+                .memset(&copies[0].buf, 0x5a, copies[0].byte_size())
+                .expect("seed copy");
+            let original = gpu.download_raw_bytes(&copies[0]).expect("copy bytes");
+            let source = WeightRef {
+                buf: &source_buf,
+                dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 2 * k,
+                rotation: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            };
+            for rows in 1..=max {
+                let selected = crate::gpu_forward::decode_copy(&copies, 0, rows, max, source);
+                assert!(std::ptr::eq(selected.buf, &copies[0]));
+                assert_eq!(selected.buf.buf.as_ptr(), copies[0].buf.as_ptr());
+                assert_eq!(selected.dtype, DType::Q8_0);
+                assert_eq!(
+                    (selected.m, selected.k, selected.row_stride),
+                    (m, k, stride)
+                );
+            }
+            for (index, rows, limit) in [(0, max + 1, max), (0, 9, 8), (1, max, max)] {
+                let selected = crate::gpu_forward::decode_copy(&copies, index, rows, limit, source);
+                assert!(std::ptr::eq(selected.buf, &source_buf));
+                assert_eq!(selected.dtype, source.dtype);
+                assert_eq!((selected.m, selected.k, selected.row_stride), (m, k, 2 * k));
+            }
+            assert_eq!(
+                gpu.download_raw_bytes(&copies[0]).expect("unchanged copy"),
+                original
+            );
+            gpu.free_tensor(source_buf).expect("free source");
+            for copy in copies {
+                gpu.free_tensor(copy).expect("free copy");
+            }
+        }
+    }
+
+    /// Extends the existing append/select + restore/replay parity harness:
+    /// all 64 kept prefixes, full abort and subsequent append/transaction.
+    /// This is snapshot/QSA state coverage, not full-model row arithmetic.
+    #[test]
+    fn state_parity_64_restore_prefixes_abort_and_continuation() {
+        let Some(mut gpu) = try_gpu() else { return };
+        let config = crate::config::synthetic_test_config(
+            crate::config::Qwen4FfnConfig::Dense {
+                intermediate_size: 16,
+            },
+            16,
+            2,
+            true,
+            false,
+        );
+        let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
+        let mut ar = Qwen4State::new(&mut gpu, &config, 128, crate::state::Qwen4StateFormat::F32)
+            .expect("AR state");
+        let mut candidate =
+            Qwen4State::new(&mut gpu, &config, 128, crate::state::Qwen4StateFormat::F32)
+                .expect("candidate state");
+        let block: Vec<_> = (0..rows).map(|r| 10 + r as u32).collect();
+        for keep in 0..=rows {
+            reset_target(&mut gpu, &mut ar).expect("reset AR");
+            reset_target(&mut gpu, &mut candidate).expect("reset candidate");
+            for (position, token) in [1, 2, 3, 4].into_iter().enumerate() {
+                append_target_pair(&mut gpu, &config, &mut ar, &mut candidate, position, token)
+                    .expect("prefix");
+            }
+            select_target_pair(&mut gpu, &config, &mut ar, &mut candidate, PREFIX)
+                .expect("select prefix");
+            let ticket = candidate.snapshot(&mut gpu).expect("snapshot");
+            for (row, &token) in block.iter().enumerate() {
+                append_target_single(&mut gpu, &config, &mut candidate, PREFIX + row, token)
+                    .expect("verify append");
+            }
+            select_target(&mut gpu, &config, &mut candidate, PREFIX + rows)
+                .expect("select verified end");
+            if keep < rows {
+                mutate_target(&mut gpu, &mut candidate).expect("partial work");
+                candidate
+                    .restore_retain(&mut gpu, ticket)
+                    .expect("restore before replay");
+                for (row, &token) in block[..keep].iter().enumerate() {
+                    append_target_single(&mut gpu, &config, &mut candidate, PREFIX + row, token)
+                        .expect("kept replay");
+                }
+            }
+            candidate
+                .commit(ticket, &mut gpu)
+                .expect("commit or finish abort");
+            for (row, &token) in block[..keep].iter().enumerate() {
+                append_target_single(&mut gpu, &config, &mut ar, PREFIX + row, token)
+                    .expect("AR kept");
+            }
+            select_target_pair(&mut gpu, &config, &mut ar, &mut candidate, PREFIX + keep)
+                .expect("select kept end");
+            let compare = compare_family_maps(
+                &target_families(&gpu, &config, &ar).expect("AR digest"),
+                &target_families(&gpu, &config, &candidate).expect("candidate digest"),
+            );
+            assert!(compare.0, "keep={keep}: {}", compare.1);
+            assert!(
+                candidate.validate_commit(ticket).is_err(),
+                "consumed ticket keep={keep}"
+            );
+            append_target_pair(
+                &mut gpu,
+                &config,
+                &mut ar,
+                &mut candidate,
+                PREFIX + keep,
+                BONUS,
+            )
+            .expect("AR continuation");
+            // A second transaction rejects its suffix, then continues from
+            // the restored marks, catching stale pooled/selection visibility.
+            let next = candidate.snapshot(&mut gpu).expect("next snapshot");
+            append_target_single(
+                &mut gpu,
+                &config,
+                &mut candidate,
+                PREFIX + keep + 1,
+                BONUS + 1,
+            )
+            .expect("next verify append");
+            candidate.restore(&mut gpu, next).expect("next abort");
+            append_target_pair(
+                &mut gpu,
+                &config,
+                &mut ar,
+                &mut candidate,
+                PREFIX + keep + 1,
+                BONUS + 2,
+            )
+            .expect("post-abort continuation");
+            select_target_pair(
+                &mut gpu,
+                &config,
+                &mut ar,
+                &mut candidate,
+                PREFIX + keep + 2,
+            )
+            .expect("select continuation");
+            let compare = compare_family_maps(
+                &target_families(&gpu, &config, &ar).expect("continued AR digest"),
+                &target_families(&gpu, &config, &candidate).expect("continued candidate digest"),
+            );
+            assert!(compare.0, "continuation keep={keep}: {}", compare.1);
+        }
+        ar.free_gpu(&mut gpu).expect("free AR");
+        candidate.free_gpu(&mut gpu).expect("free candidate");
     }
 
     fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
@@ -2639,7 +3484,10 @@ mod tests {
     fn cache_suffix_refusal_reports_position_zero_cache_hit_refusal() {
         let report = cache_suffix_refusal();
         assert_pass(&report);
-        assert_eq!(field(&report, "case").as_str(), Some("cache_suffix_refusal"));
+        assert_eq!(
+            field(&report, "case").as_str(),
+            Some("cache_suffix_refusal")
+        );
         assert_eq!(field(&report, "cache_hit").as_bool(), Some(true));
         assert_eq!(field(&report, "prompt_len").as_u64(), Some(3));
         assert_eq!(field(&report, "fill_len").as_u64(), Some(3));
@@ -2651,12 +3499,10 @@ mod tests {
 }
 
 /// Hardware takeover oracle used by `mtp_takeover_fill_hw`. Route knobs must
-/// be set before starting the process. Qwen4 pairs token p with hidden p,
-/// including the seed row; an accepted EOS stays pending, not head-filled.
-pub fn run_mtp_takeover_fill_oracle(
-    model_path: &Path,
-    max_seq: usize,
-) -> Result<Value, String> {
+/// be set before starting the process. Qwen4 head rows pair token p with the
+/// target hidden of p-1 (a prompt's position 0 with its own hidden); an
+/// accepted EOS stays pending, not head-filled.
+pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result<Value, String> {
     use crate::bundle::Qwen4Bundle;
     use crate::mtp_spec::Qwen4MtpDrafter;
     use hipfire_runtime::ngram_mod::NgramModConfig;
@@ -2666,7 +3512,11 @@ pub fn run_mtp_takeover_fill_oracle(
 
     // Preserve the existing family/metadata report, and additionally hash
     // storage bytes: dequantized equality alone is not byte identity.
-    fn snapshot(gpu: &Gpu, bundle: &Qwen4Bundle, drafter: &Qwen4MtpDrafter) -> Result<Value, String> {
+    fn snapshot(
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        drafter: &Qwen4MtpDrafter,
+    ) -> Result<Value, String> {
         let mut families = bundle_family_json(gpu, bundle)?;
         let mut target = Family::new();
         let mut head = Family::new();
@@ -2695,11 +3545,12 @@ pub fn run_mtp_takeover_fill_oracle(
         if let Some(ple_conv) = &bundle.state.ple_conv {
             append(&mut target, ple_conv, ple_conv.numel())?;
         }
-        append(
-            &mut target,
-            &bundle.state.hyper_feedback,
-            bundle.state.hyper_feedback.numel(),
-        )?;
+        let hyper_feedback = bundle
+            .state
+            .hyper_feedback
+            .as_ref()
+            .expect("hyper_feedback is input-band state");
+        append(&mut target, hyper_feedback, hyper_feedback.numel())?;
         let state = bundle
             .mtp
             .as_ref()
@@ -2728,14 +3579,24 @@ pub fn run_mtp_takeover_fill_oracle(
         }))
     }
 
-    fn head_rows(gpu: &Gpu, bundle: &Qwen4Bundle, start: usize, rows: usize) -> Result<Value, String> {
-        let state = bundle.mtp.as_ref().ok_or("missing MTP head")?.parity_state();
+    fn head_rows(
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        start: usize,
+        rows: usize,
+    ) -> Result<Value, String> {
+        let state = bundle
+            .mtp
+            .as_ref()
+            .ok_or("missing MTP head")?
+            .parity_state();
         let buffers = state.parity_buffers();
         let full = bundle.config.num_key_value_heads * bundle.config.head_dim;
         let raw = bundle.config.indexer_kv_heads * bundle.config.indexer_head_dim;
         let mut family = Family::new();
         for (tensor, width) in [
-            (buffers.full_keys, full), (buffers.full_values, full),
+            (buffers.full_keys, full),
+            (buffers.full_values, full),
             (buffers.raw_index_keys, raw),
         ] {
             let view = tensor.sub_offset(start * width, rows * width);
@@ -2746,9 +3607,87 @@ pub fn run_mtp_takeover_fill_oracle(
 
     fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
         assert_eq!(a.len(), b.len(), "hidden dimensions");
-        let numerator: f64 = a.iter().zip(b).map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2)).sum();
+        let numerator: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum();
         let denominator: f64 = b.iter().map(|&x| f64::from(x).powi(2)).sum();
         (numerator / denominator.max(1e-30)).sqrt()
+    }
+
+    /// K, V and index-key rows `start..start + rows` of the MTP head, F32.
+    fn head_values(
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        start: usize,
+        rows: usize,
+    ) -> Result<Vec<f32>, String> {
+        let state = bundle
+            .mtp
+            .as_ref()
+            .ok_or("missing MTP head")?
+            .parity_state();
+        let buffers = state.parity_buffers();
+        let full = bundle.config.num_key_value_heads * bundle.config.head_dim;
+        let raw = bundle.config.indexer_kv_heads * bundle.config.indexer_head_dim;
+        let mut values = Vec::new();
+        for (tensor, width) in [
+            (buffers.full_keys, full),
+            (buffers.full_values, full),
+            (buffers.raw_index_keys, raw),
+        ] {
+            // The head's K/V/index caches are allocated F32 unconditionally
+            // (the target's fp8 QSA format does not reach them); refuse to
+            // read raw bytes as floats should that ever change.
+            if tensor.dtype != DType::F32 {
+                return Err(format!(
+                    "MTP head row cache is {:?}, expected F32",
+                    tensor.dtype
+                ));
+            }
+            let view = tensor.sub_offset(start * width, rows * width);
+            values.extend(gpu.download_f32(&view).map_err(|error| error.to_string())?);
+        }
+        Ok(values)
+    }
+
+    /// Head-only one-row appends of `tokens` at `start..` after a fresh
+    /// prefill, with explicit hiddens: `lag` pairs token `i` with
+    /// `hidden[i - 1]` (token 0 with the prefill's `pending`, the hidden of
+    /// `start - 1`), otherwise with `hidden[i]`. Returns the rows' values.
+    fn one_row_head(
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
+        drafter: &Qwen4MtpDrafter,
+        tokens: &[u32],
+        hidden: &[Vec<f32>],
+        lag: bool,
+        start: usize,
+    ) -> Result<Vec<f32>, String> {
+        for (row, &token) in tokens.iter().enumerate() {
+            let uploaded = if lag && row == 0 {
+                None
+            } else {
+                let values = &hidden[row - usize::from(lag)];
+                Some(
+                    gpu.upload_f32(values, &[values.len()])
+                        .map_err(|error| error.to_string())?,
+                )
+            };
+            let source = match &uploaded {
+                Some(tensor) => tensor,
+                None => drafter.pending_hidden_for_parity()?,
+            };
+            let appended = bundle
+                .mtp_append_token(gpu, token, Some(source), start + row)
+                .map_err(|error| error.to_string());
+            if let Some(tensor) = uploaded {
+                let _ = gpu.free_tensor(tensor);
+            }
+            appended?;
+        }
+        head_values(gpu, bundle, start, tokens.len())
     }
 
     fn prefill(
@@ -2763,13 +3702,15 @@ pub fn run_mtp_takeover_fill_oracle(
             allow_ngram_modifier: true,
             ..SpecRequestConfig::default()
         });
-        drafter.mtp_prefill(gpu, bundle, prompt, prompt, 0, false, &|| false)
+        drafter
+            .mtp_prefill(gpu, bundle, prompt, prompt, 0, false, &|| false)?
+            .into_first_token()
     }
 
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|error| error.to_string())?;
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|error| error.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
     let rendered = JinjaChatFrame {
         tokenizer: &tokenizer,
@@ -2783,20 +3724,36 @@ pub fn run_mtp_takeover_fill_oracle(
     }.render()?;
     let prompt = tokenizer.encode(&rendered);
     const REF_STEPS: usize = 40;
-    assert!(!prompt.is_empty() && prompt.len() + REF_STEPS + 8 < max_seq, "oracle context");
-    let receipt = crate::admit_hfqm_artifact(&hfq)
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
-    let mut gpu = Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
+    assert!(
+        !prompt.is_empty() && prompt.len() + REF_STEPS + 8 < max_seq,
+        "oracle context"
+    );
+    let mut gpu =
+        Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = crate::artifact::source_forward_scratch_mode(
-        &gpu, &hfq, &receipt.config, &receipt.manifest,
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
     )
     .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
-    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
+    let mesh =
+        hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
@@ -2807,14 +3764,22 @@ pub fn run_mtp_takeover_fill_oracle(
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
-    ).map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+        |entry| {
+            qwen4_oracle_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+                use_ranges,
+            )
+        },
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     // Match run_mtp_fill_digest: the reusable family walker uses logical
     // F32 row widths. This is a head-fill/rollback oracle, not a KV-format
     // admission test; retain the automatic VMM/legacy storage backend.
     let format = crate::state::Qwen4StateFormat::F32;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -2822,8 +3787,10 @@ pub fn run_mtp_takeover_fill_oracle(
         &mut gpu,
         max_seq,
         receipt.ple,
+        receipt.ple_rows,
         format,
         backend,
+        None,
     )
     .map_err(|error| error.to_string())?;
     // Longer than the entire oracle history: the armed pool is provably
@@ -2835,10 +3802,17 @@ pub fn run_mtp_takeover_fill_oracle(
         n_max: 3,
     }));
     let run = (|| -> Result<Value, String> {
-        bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(|error| error.to_string())?;
-        bundle.attach_mtp(&mut gpu, max_seq).map_err(|error| error.to_string())?;
+        bundle
+            .attach_forward(&mut gpu, max_seq, scratch_mode)
+            .map_err(|error| error.to_string())?;
+        bundle
+            .attach_mtp(&mut gpu, max_seq)
+            .map_err(|error| error.to_string())?;
         map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
-        let dim = bundle.config.hc_count.checked_mul(bundle.config.hidden_size)
+        let dim = bundle
+            .config
+            .hc_count
+            .checked_mul(bundle.config.hidden_size)
             .ok_or("oracle hidden width overflow")?;
         let eos = bundle.config.eos_token_id;
         let interleaved = hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL")
@@ -2850,24 +3824,39 @@ pub fn run_mtp_takeover_fill_oracle(
         let mut reference = vec![seed0];
         let mut reference_hidden = Vec::with_capacity(REF_STEPS);
         for i in 0..REF_STEPS {
-            assert_ne!(reference[i], eos, "reference stopped before oracle sequence");
-            let pick = bundle.spec_capture_token(&mut gpu, reference[i])
+            assert_ne!(
+                reference[i], eos,
+                "reference stopped before oracle sequence"
+            );
+            let pick = bundle
+                .spec_capture_token(&mut gpu, reference[i])
                 .map_err(|error| error.to_string())?;
-            let hidden = bundle.spec_hidden.as_ref().ok_or("missing reference hidden")?;
-            reference_hidden.push(gpu.download_f32(&hidden.sub_offset(0, dim))
-                .map_err(|error| error.to_string())?);
+            let hidden = bundle
+                .spec_hidden
+                .as_ref()
+                .ok_or("missing reference hidden")?;
+            reference_hidden.push(
+                gpu.download_f32(&hidden.sub_offset(0, dim))
+                    .map_err(|error| error.to_string())?,
+            );
             reference.push(pick);
         }
         let wrong = |token: u32| if token == 0 { 1 } else { token - 1 };
-        assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
         let mut index = 0usize;
         let mut windows = Vec::new();
         // The first EOS candidate is index 1, so two drafts are emitted but
         // only seed and candidate 0 are consumed.
         for (label, expected, stop) in [
-            ("partial", 1, false), ("full", 3, false), ("zero", 0, false),
+            ("partial", 1, false),
+            ("full", 3, false),
+            ("zero", 0, false),
             ("accepted_eos_index1", 2, true),
-            ("reject_index0", 0, false), ("reject_index1", 1, false),
+            ("reject_index0", 0, false),
+            ("reject_index1", 1, false),
             ("reject_index2", 2, false),
         ] {
             let position = prompt.len() + index;
@@ -2879,23 +3868,44 @@ pub fn run_mtp_takeover_fill_oracle(
             let consumed = expected + 1 - usize::from(stop);
             let untouched = head_rows(&gpu, &bundle, position + consumed, 4 - consumed)?;
             let window = drafter.mtp_takeover_step(
-                &mut gpu, &mut bundle, position, reference[index],
-                &reference[..=index], &candidates, window_eos,
+                &mut gpu,
+                &mut bundle,
+                position,
+                reference[index],
+                &reference[..=index],
+                &candidates,
+                window_eos,
             )?;
             let emitted = if stop { expected } else { expected + 1 };
             assert_eq!(window.accepted, expected, "{label}: accepted prefix");
             assert_eq!(window.drafts_generated, 3, "{label}: candidates offered");
-            assert_eq!(window.committed, reference[index + 1..index + 1 + emitted], "{label}: greedy IDs");
-            assert_eq!(bundle.state.position, position + consumed, "{label}: target position");
-            assert_eq!(bundle.mtp_position().map_err(|error| error.to_string())?, position + consumed, "{label}: head position");
+            assert_eq!(
+                window.committed,
+                reference[index + 1..index + 1 + emitted],
+                "{label}: greedy IDs"
+            );
+            assert_eq!(
+                bundle.state.position,
+                position + consumed,
+                "{label}: target position"
+            );
+            assert_eq!(
+                bundle.mtp_position().map_err(|error| error.to_string())?,
+                position + consumed,
+                "{label}: head position"
+            );
             assert_eq!(
                 head_rows(&gpu, &bundle, position + consumed, 4 - consumed)?,
-                untouched, "{label}: unconsumed head rows must never be written",
+                untouched,
+                "{label}: unconsumed head rows must never be written",
             );
             // Interleaved capture overwrites row 0 each time; that physical
             // row is the logical verify row consumed-1.
             let capture_row = if interleaved { 0 } else { consumed - 1 };
-            let captured = bundle.spec_hidden.as_ref().ok_or("missing verify hidden")?
+            let captured = bundle
+                .spec_hidden
+                .as_ref()
+                .ok_or("missing verify hidden")?
                 .sub_offset(capture_row * dim, dim);
             let pending = drafter.pending_hidden_for_parity()?;
             assert_eq!(
@@ -2913,26 +3923,51 @@ pub fn run_mtp_takeover_fill_oracle(
         }
         // No reset/demotion between the explicit hits and this real native
         // miss. The same request remains armed; history is too short to hit.
-        assert!(drafter.request_stats().mtp_ngram, "modifier request must remain armed");
+        assert!(
+            drafter.request_stats().mtp_ngram,
+            "modifier request must remain armed"
+        );
         let before_stats = drafter.request_stats();
         let miss = drafter.mtp_step(
-            &mut gpu, &mut bundle, prompt.len() + index, reference[index],
-            &reference[..=index], 3, eos, None,
+            &mut gpu,
+            &mut bundle,
+            prompt.len() + index,
+            reference[index],
+            &reference[..=index],
+            3,
+            eos,
+            None,
         )?;
-        assert_eq!(miss.committed.first(), Some(&reference[index + 1]), "native miss resumes at reference token");
+        assert_eq!(
+            miss.committed.first(),
+            Some(&reference[index + 1]),
+            "native miss resumes at reference token"
+        );
         if !interleaved {
-            assert!(miss.drafts_generated >= 1, "native miss must draft, not retire to AR");
+            assert!(
+                miss.drafts_generated >= 1,
+                "native miss must draft, not retire to AR"
+            );
         }
         let after_stats = drafter.request_stats();
-        assert_eq!(after_stats.ngram_mod_windows, before_stats.ngram_mod_windows, "empty pool must miss");
-        assert!(after_stats.mtp_windows > before_stats.mtp_windows, "native window counter must advance");
+        assert_eq!(
+            after_stats.ngram_mod_windows, before_stats.ngram_mod_windows,
+            "empty pool must miss"
+        );
+        assert!(
+            after_stats.mtp_windows > before_stats.mtp_windows,
+            "native window counter must advance"
+        );
 
         // Two identical cold states, same first rejection, different rejected
         // tail. Compare live device families, raw storage and pending bytes.
         let mut starts = Vec::new();
         let mut tails = Vec::new();
         for variant in 0..2 {
-            assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
+            assert_eq!(
+                prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+                seed0
+            );
             starts.push(snapshot(&gpu, &bundle, &drafter)?);
             let untouched = head_rows(&gpu, &bundle, prompt.len() + 1, 3)?;
             let mut candidates = reference[1..4].to_vec();
@@ -2942,43 +3977,164 @@ pub fn run_mtp_takeover_fill_oracle(
                 candidates[2] = wrong(candidates[2]);
             }
             let window = drafter.mtp_takeover_step(
-                &mut gpu, &mut bundle, prompt.len(), seed0, &[seed0], &candidates, eos,
+                &mut gpu,
+                &mut bundle,
+                prompt.len(),
+                seed0,
+                &[seed0],
+                &candidates,
+                eos,
             )?;
             assert_eq!(window.accepted, 0, "tail fixture first rejection");
-            assert_eq!(window.committed, reference[1..2], "tail fixture committed IDs");
-            assert_eq!(head_rows(&gpu, &bundle, prompt.len() + 1, 3)?, untouched,
-                "tail fixture: rejected head rows must remain untouched");
+            assert_eq!(
+                window.committed,
+                reference[1..2],
+                "tail fixture committed IDs"
+            );
+            assert_eq!(
+                head_rows(&gpu, &bundle, prompt.len() + 1, 3)?,
+                untouched,
+                "tail fixture: rejected head rows must remain untouched"
+            );
             tails.push(snapshot(&gpu, &bundle, &drafter)?);
         }
-        assert_eq!(starts[0], starts[1], "tail fixture must start byte-identically");
-        assert_eq!(tails[0], tails[1], "rejected tail must not enter committed target/head/pending state");
+        assert_eq!(
+            starts[0], starts[1],
+            "tail fixture must start byte-identically"
+        );
+        assert_eq!(
+            tails[0], tails[1],
+            "rejected tail must not enter committed target/head/pending state"
+        );
 
-        // Compare token-p/hidden-p teacher forcing against the existing route.
-        assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
+        // Teacher-forced pairing: head row p is (token p, target hidden p-1),
+        // so `pending` always holds the hidden of the head's position - 1 and
+        // a fill consumes it before replacing it with its own row's hidden.
+        // A draft step is exactly this shape (the seed at position p with the
+        // pending hidden of p-1, which is what `probe_first_draft` runs), and
+        // the head learned it that way: the Qwen3.5 MTP head fuses the
+        // embedding of the token being predicted-from with the trunk hidden
+        // one position back, and vLLM's proposer builds the same inputs by
+        // shifting the token ids left by one against the target hiddens.
+        // Filling the head with (token p, hidden p) instead would train its
+        // cache on rows no draft step ever reads. Only a prompt's own first
+        // row (position 0) has no previous hidden and takes its own; this
+        // oracle starts after a prefill (position >= 1), so row 0 here takes
+        // the prefill's `pending` = hidden of P-1.
+        //
+        // Discriminator: after the same window the head's K/V/index rows must
+        // match the one-row references built with explicit hiddens, the paired
+        // one (row 0: prefill's pending, row i: h_(P+i-1)) and the shifted one
+        // (row i: h_(P+i)). Reference hiddens are the one-row AR forwards, so
+        // the one-row forced route is compared at the same time and must match
+        // the paired reference essentially exactly; the 4-row verify takeover
+        // differs only by batch-vs-single-row numerics, hence the 0.1 ratio.
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
         let pairing_start = snapshot(&gpu, &bundle, &drafter)?;
         let full = drafter.mtp_takeover_step(
-            &mut gpu, &mut bundle, prompt.len(), seed0, &[seed0], &reference[1..4], eos,
+            &mut gpu,
+            &mut bundle,
+            prompt.len(),
+            seed0,
+            &[seed0],
+            &reference[1..4],
+            eos,
         )?;
         assert_eq!(full.accepted, 3, "pairing takeover must fully accept");
-        let takeover = gpu.download_f32(drafter.pending_hidden_for_parity()?)
+        let takeover = gpu
+            .download_f32(drafter.pending_hidden_for_parity()?)
             .map_err(|error| error.to_string())?;
+        let takeover_head = head_values(&gpu, &bundle, prompt.len(), 4)?;
         let takeover_state = snapshot(&gpu, &bundle, &drafter)?;
-        assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
-        assert_eq!(snapshot(&gpu, &bundle, &drafter)?, pairing_start, "pairing starts must match");
-        assert!(drafter.mtp_forced_advance(
-            &mut gpu, &mut bundle, &reference[..4], prompt.len(), &|| false,
-        )?, "teacher-forced route must handle all rows");
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
+        assert_eq!(
+            snapshot(&gpu, &bundle, &drafter)?,
+            pairing_start,
+            "pairing starts must match"
+        );
+        assert!(
+            drafter.mtp_forced_advance(
+                &mut gpu,
+                &mut bundle,
+                &reference[..4],
+                prompt.len(),
+                &|| false,
+            )?,
+            "teacher-forced route must handle all rows"
+        );
+        let forced_head = head_values(&gpu, &bundle, prompt.len(), 4)?;
         let forced_state = snapshot(&gpu, &bundle, &drafter)?;
-        assert_eq!(takeover_state["target_position"], forced_state["target_position"]);
+        assert_eq!(
+            takeover_state["target_position"],
+            forced_state["target_position"]
+        );
         assert_eq!(takeover_state["mtp_position"], forced_state["mtp_position"]);
-        let forced = gpu.download_f32(drafter.pending_hidden_for_parity()?)
+        let forced = gpu
+            .download_f32(drafter.pending_hidden_for_parity()?)
             .map_err(|error| error.to_string())?;
-        let correct = rel_l2(&takeover, &forced);
-        // h_(P+2), rather than the required h_(P+3), is the off-by-one
-        // Qwen3.5-style pairing. Reference uses the same one-row forwards.
-        let shifted = rel_l2(&takeover, &reference_hidden[2]);
-        assert!(correct.is_finite() && shifted.is_finite() && correct < 0.1 * shifted,
-            "teacher-forced token-p/hidden-p pairing: rel-L2={correct:e}, shifted={shifted:e}");
+        // Head-only references from the same prefill state.
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
+        let paired_head = one_row_head(
+            &mut gpu,
+            &mut bundle,
+            &drafter,
+            &reference[..4],
+            &reference_hidden,
+            true,
+            prompt.len(),
+        )?;
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
+        let shifted_head = one_row_head(
+            &mut gpu,
+            &mut bundle,
+            &drafter,
+            &reference[..4],
+            &reference_hidden,
+            false,
+            prompt.len(),
+        )?;
+        let head_correct = rel_l2(&takeover_head, &paired_head);
+        let head_shifted = rel_l2(&takeover_head, &shifted_head);
+        let forced_correct = rel_l2(&forced_head, &paired_head);
+        let forced_shifted = rel_l2(&forced_head, &shifted_head);
+        // The window consumed rows P..=P+3, so the pending hidden is h_(P+3)
+        // (the head's position - 1); h_(P+2) would be a pending one row behind.
+        let pending_correct = rel_l2(&takeover, &forced);
+        let pending_lag = rel_l2(&takeover, &reference_hidden[2]);
+        for (label, correct, wrong) in [
+            (
+                "takeover head rows (token p, hidden p-1)",
+                head_correct,
+                head_shifted,
+            ),
+            (
+                "forced head rows (token p, hidden p-1)",
+                forced_correct,
+                forced_shifted,
+            ),
+            (
+                "pending hidden = last consumed row",
+                pending_correct,
+                pending_lag,
+            ),
+        ] {
+            assert!(
+                correct.is_finite() && wrong.is_finite() && correct < 0.1 * wrong,
+                "{label}: rel-L2={correct:e}, wrong pairing/lag={wrong:e}"
+            );
+        }
         Ok(json!({
             "schema": "hipfire.qwen4.mtp_takeover_fill.v1",
             "gpu_arch": gpu.arch,
@@ -2990,8 +4146,16 @@ pub fn run_mtp_takeover_fill_oracle(
             "windows": windows,
             "rejected_tail": {"same_state": true, "before": starts[0], "after": tails[0]},
             "pairing": {
-                "rel_l2": correct, "shifted_rel_l2": shifted,
-                "shifted_row": -1,
+                // Token p pairs with the target hidden of row p-1. `rel_l2` /
+                // `shifted_rel_l2` are the takeover head's rows against the
+                // one-row references; `forced_*` are the same for the one-row
+                // teacher-forced route; `pending_*` the pending hidden after
+                // the window against the forced route's and against the row
+                // one behind it (a pending that lags the head).
+                "paired_hidden_row": -1,
+                "rel_l2": head_correct, "shifted_rel_l2": head_shifted,
+                "forced_rel_l2": forced_correct, "forced_shifted_rel_l2": forced_shifted,
+                "pending_rel_l2": pending_correct, "pending_lag_rel_l2": pending_lag,
                 "pending_byte_identical": takeover_state["pending_hidden"] == forced_state["pending_hidden"],
                 "families_byte_identical": takeover_state["families"] == forced_state["families"],
                 "takeover": takeover_state, "forced": forced_state,

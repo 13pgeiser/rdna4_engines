@@ -209,13 +209,8 @@ fn run() -> Result<bool, String> {
         gpu.hip
             .memcpy_dtoh(&mut table, &weights.embed.buf)
             .map_err(|e| format!("embed dtoh: {e:?}"))?;
-        let ref_hc = embed_gather_ref(
-            &table,
-            &token_ids,
-            PARENT_VOCAB,
-            PARENT_DIM,
-            PARENT_HC_MULT,
-        )?;
+        let ref_hc =
+            embed_gather_ref(&table, &token_ids, PARENT_VOCAB, PARENT_DIM, PARENT_HC_MULT)?;
         parent_embed(&mut gpu, backend, &weights, &cfg, &token_ids, &hc_a)?;
         gpu.hip
             .device_synchronize()
@@ -291,9 +286,7 @@ fn run() -> Result<bool, String> {
                     "layer {li}: None→err={} Some→ok={} None_msg={:?} Some_msg={:?}",
                     no_err,
                     with_ok,
-                    no_ids
-                        .err()
-                        .map(|e| e.chars().take(80).collect::<String>()),
+                    no_ids.err().map(|e| e.chars().take(80).collect::<String>()),
                     with_ids
                         .as_ref()
                         .err()
@@ -339,8 +332,7 @@ fn run() -> Result<bool, String> {
         let mut nonhash_ok = true;
         if num_hash < n_layers {
             let layer = &weights.layers[num_hash];
-            if let Err(e) = parent_route(&mut gpu, backend, layer, &cfg, &act_bf16, rows, None)
-            {
+            if let Err(e) = parent_route(&mut gpu, backend, layer, &cfg, &act_bf16, rows, None) {
                 nonhash_ok = false;
                 if hash_fail_detail.is_empty() {
                     hash_fail_detail = format!(
@@ -392,9 +384,7 @@ fn run() -> Result<bool, String> {
         checks.push(Check {
             name: "kv_sentinel_seed".into(),
             pass: ok,
-            detail: format!(
-                "seeded {n_layers} rings with SENTINEL_BASE+L ({SENTINEL_BASE}+L)"
-            ),
+            detail: format!("seeded {n_layers} rings with SENTINEL_BASE+L ({SENTINEL_BASE}+L)"),
         });
         println!(
             "CHECK kv_sentinel_seed: {}  n_rings={n_layers} base={SENTINEL_BASE}",

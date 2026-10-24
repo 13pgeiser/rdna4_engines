@@ -52,7 +52,10 @@ struct Registry {
     next_seq: [u64; 3],
 }
 
-static REGISTRY: Mutex<Registry> = Mutex::new(Registry { live: BTreeMap::new(), next_seq: [0; 3] });
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
+    live: BTreeMap::new(),
+    next_seq: [0; 3],
+});
 static ROLE: AtomicU8 = AtomicU8::new(0);
 
 fn role_from(v: u8) -> AllocationRole {
@@ -90,7 +93,11 @@ pub fn role_scope(role: AllocationRole) -> RoleGuard {
 }
 
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    let var = |name: &str| hipfire_config::developer_var(name).ok().filter(|v| !v.trim().is_empty());
+    let var = |name: &str| {
+        hipfire_config::developer_var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    };
     var("HIPFIRE_RAILGUN_CHECK").is_some_and(|v| v.trim() != "off")
         || var("HIPFIRE_RAILGUN_DIGEST").as_deref() == Some("1")
 });
@@ -120,7 +127,16 @@ fn insert(base: usize, bytes: usize, kind: AllocationKind) {
     let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let seq = registry.next_seq[role_index(role)];
     registry.next_seq[role_index(role)] += 1;
-    registry.live.insert(base, LiveAllocation { base, bytes, kind, role, seq });
+    registry.live.insert(
+        base,
+        LiveAllocation {
+            base,
+            bytes,
+            kind,
+            role,
+            seq,
+        },
+    );
 }
 
 fn remove(base: usize) {
@@ -136,7 +152,10 @@ pub fn live_allocations() -> Vec<LiveAllocation> {
 
 /// Live allocations of one role, in allocation order.
 pub fn live_allocations_with_role(role: AllocationRole) -> Vec<LiveAllocation> {
-    let mut v: Vec<_> = live_allocations().into_iter().filter(|a| a.role == role).collect();
+    let mut v: Vec<_> = live_allocations()
+        .into_iter()
+        .filter(|a| a.role == role)
+        .collect();
     v.sort_by_key(|a| a.seq);
     v
 }
@@ -158,12 +177,19 @@ mod tests {
             .into_iter()
             .filter(|a| a.base >= 0x7000_0000 && a.base < 0x7000_3000)
             .collect();
-        assert_eq!(weights.iter().map(|a| a.base).collect::<Vec<_>>(), vec![0x7000_0000, 0x7000_2000]);
+        assert_eq!(
+            weights.iter().map(|a| a.base).collect::<Vec<_>>(),
+            vec![0x7000_0000, 0x7000_2000]
+        );
         assert!(weights[0].seq < weights[1].seq);
-        assert!(live_allocations().iter().any(|a| a.base == 0x7000_1000 && a.role == AllocationRole::Internal));
+        assert!(live_allocations()
+            .iter()
+            .any(|a| a.base == 0x7000_1000 && a.role == AllocationRole::Internal));
         for base in [0x7000_0000, 0x7000_1000, 0x7000_2000] {
             remove(base);
         }
-        assert!(!live_allocations().iter().any(|a| (0x7000_0000..0x7000_3000).contains(&a.base)));
+        assert!(!live_allocations()
+            .iter()
+            .any(|a| (0x7000_0000..0x7000_3000).contains(&a.base)));
     }
 }

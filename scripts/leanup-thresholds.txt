@@ -89,7 +89,7 @@ required_features_daemon    == 0
 # Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
 # stays 0. Paid down when the message loop's per-verb refusal boilerplate is
 # factored out.
-daemon_lines                <= 5515
+daemon_lines                <= 5850
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -100,7 +100,10 @@ daemon_lines                <= 5515
 # RATCHET-RAISE 63 -> 64: v0.4.1 shipped at 64 (CI red on this ratchet); the
 # 0.4.1 cycle added QSA/PM oracles in rdna-compute/examples that their gates
 # invoke. Pay down by gating archived probes behind `lab` in 0.4.2.
-ungated_examples            <= 64
+# route-043 sub-4 oracles; Kaden-approved raise 2026-10-15
+# RATCHET-RAISE 67 -> 68: `rdna-compute/gdn_wy_repeat_check`, the synthetic GPU oracle for the Qwen GDN WY
+# T-inverse fix (repeated-token NaN); its gate runs it without `--features lab`.
+ungated_examples            <= 68
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is

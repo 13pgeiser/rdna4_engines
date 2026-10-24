@@ -9,7 +9,9 @@
 //! mutate the same sparse `~/.hipfire/config.toml` document.
 
 use hipfire_config::{
-    field, load_global, write_global_toml, ConfigLayer, ConfigPaths, ConfigValue,
+    effective::Choice, field, is_deprecated_key, is_developer_key, is_typed_bool_developer_key,
+    load_global, parse_typed_bool, write_global_toml, ConfigLayer, ConfigPaths, ConfigValue,
+    ValueRule,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -18,9 +20,13 @@ use std::path::Path;
 pub enum FieldKind {
     Enum(&'static [&'static str]),
     Bool,
-    Float { min: f64, max: f64 },
-    Int { min: i64, max: i64 },
-    FreeStr { require_existing_file: bool },
+    /// Numeric kinds carry no bounds: `hipfire-config` is the sole validator,
+    /// and [`schema_range`] reads the schema's own range for display.
+    Float,
+    Int,
+    FreeStr {
+        require_existing_file: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -29,9 +35,12 @@ pub struct FieldSpec {
     pub kind: FieldKind,
 }
 
+/// KV cache modes in cycling order. Every entry is in the schema's own list
+/// (`memory.kv_cache`); the deprecated asymN/turboN aliases and the
+/// `legacy-*` Givens opt-outs are left out. A test pins this list to the schema
+/// minus those, so a mode the schema gains cannot silently go unselectable.
 const KV_CACHE: &[&str] = &[
-    "auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4",
-    "turbo3", "turbo2",
+    "auto", "q8", "fwht4", "fwht3", "fwht2", "fp8", "bf16", "f16", "f32",
 ];
 const KV_ADAPTIVE: &[&str] = &[
     "off",
@@ -48,22 +57,25 @@ const KV_ADAPTIVE: &[&str] = &[
     "advanced:k=fwht2,v=lloyd3",
     "advanced:k=fwht2,v=lloyd2",
 ];
+const KV_BACKENDS: &[&str] = &["legacy", "vmm"];
 const AUTO_ON_OFF: &[&str] = &["off", "on", "auto"];
 const THINKING: &[&str] = &["on", "off"];
 const THINKING_BUDGET: &[&str] = &["low", "med", "high", "xhigh", "max", "uncapped"];
 const FLASH_MODE: &[&str] = &["auto", "always", "never"];
-const PREFILL_COMPRESSION: &[&str] = &["off", "auto", "always"];
 
-/// Curated display order. Bounds are descriptive only; `hipfire-config` is the
-/// sole validator.
+/// The typed-boolean developer key the Settings screen edits (Flash-Next
+/// experts). Written as a TOML boolean.
+pub const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";
+
+/// Overrides of the schema-derived kind, only where the curated list has a
+/// better option order than the schema's own. Every other non-deprecated
+/// schema field gets its kind from its `ValueRule` ([`field_spec`]).
+/// `hipfire-config` is the sole validator; deprecated CASK/PFlash keys are
+/// deliberately absent (read-only in the TUI).
 pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "kv_cache",
         kind: FieldKind::Enum(KV_CACHE),
-    },
-    FieldSpec {
-        key: "kv_adaptive",
-        kind: FieldKind::Enum(KV_ADAPTIVE),
     },
     FieldSpec {
         key: "mtp_mode",
@@ -81,78 +93,6 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "thinking_budget",
         kind: FieldKind::Enum(THINKING_BUDGET),
     },
-    // Also an easy row with no spec, so it was equally uneditable. The values come
-    // from the schema's own list rather than a local copy, so this cannot drift
-    // from what `set_cli` accepts.
-    FieldSpec {
-        key: "reasoning_effort",
-        kind: FieldKind::Enum(hipfire_config::REASONING_EFFORTS),
-    },
-    FieldSpec {
-        key: "chat_template",
-        kind: FieldKind::FreeStr {
-            require_existing_file: true,
-        },
-    },
-    FieldSpec {
-        key: "temperature",
-        kind: FieldKind::Float { min: 0.0, max: 2.0 },
-    },
-    FieldSpec {
-        key: "top_p",
-        kind: FieldKind::Float { min: 0.0, max: 1.0 },
-    },
-    FieldSpec {
-        key: "max_tokens",
-        kind: FieldKind::Int {
-            min: 1,
-            max: 131072,
-        },
-    },
-    FieldSpec {
-        key: "max_seq",
-        kind: FieldKind::Int {
-            min: 512,
-            max: 524288,
-        },
-    },
-    // Present in `config::easy_keys()`, so the Settings editor offers it as an
-    // inline-editable row; without a spec here Enter falls through to "not
-    // editable from the TUI" and no value can be typed. `min: -1` matches the
-    // schema (negative is the reserved auto spelling). Clearing: the editor seeds
-    // its buffer from the *current* value, so an emptied buffer is the unset
-    // spelling — `write_value` maps empty input on a nullable field to clear — and
-    // a typed `null` is the config/CLI spelling rather than something the buffer
-    // can reach once a value exists (typing appends to the seed).
-    FieldSpec {
-        key: "gpu_layer_budget",
-        kind: FieldKind::Int {
-            min: -1,
-            max: 65536,
-        },
-    },
-    FieldSpec {
-        key: "moe_expert_budget",
-        kind: FieldKind::Int {
-            min: -1,
-            max: 65536,
-        },
-    },
-    // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
-    // which is also what its own field validates against, so the two cannot drift.
-    FieldSpec {
-        key: "offload_exec",
-        kind: FieldKind::Enum(hipfire_config::OFFLOAD_EXECS),
-    },
-    // A free string rather than an enum: the share is `auto` or a *continuum*
-    // (0, 0.5], which a fixed list cannot express. The schema's `PassbackShare`
-    // rule is the validator, so a typed `0.6` is rejected by `write_value`.
-    FieldSpec {
-        key: "offload_passback_share",
-        kind: FieldKind::FreeStr {
-            require_existing_file: false,
-        },
-    },
     FieldSpec {
         key: "flash_mode",
         kind: FieldKind::Enum(FLASH_MODE),
@@ -161,52 +101,129 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         key: "mmq_screen",
         kind: FieldKind::Enum(AUTO_ON_OFF),
     },
-    FieldSpec {
-        key: "prefill_compression",
-        kind: FieldKind::Enum(PREFILL_COMPRESSION),
-    },
-    FieldSpec {
-        key: "prefill_drafter",
-        kind: FieldKind::FreeStr {
-            require_existing_file: false,
-        },
-    },
-    FieldSpec {
-        key: "prefill_threshold",
-        kind: FieldKind::Int {
-            min: 0,
-            max: 524288,
-        },
-    },
-    FieldSpec {
-        key: "mtp_k",
-        kind: FieldKind::Int { min: 1, max: 10 },
-    },
-    FieldSpec {
-        key: "dflash_adaptive_b",
-        kind: FieldKind::Bool,
-    },
-    FieldSpec {
-        key: "cask",
-        kind: FieldKind::Bool,
-    },
-    FieldSpec {
-        key: "prompt_normalize",
-        kind: FieldKind::Bool,
-    },
-    FieldSpec {
-        key: "default_chatml",
-        kind: FieldKind::Bool,
-    },
 ];
 
-pub fn field_spec(key: &str) -> Option<&'static FieldSpec> {
-    EDITABLE_FIELDS
+/// The editing kind a schema rule implies.
+fn kind_from_rule(rule: &ValueRule) -> FieldKind {
+    match rule {
+        ValueRule::Bool => FieldKind::Bool,
+        ValueRule::Integer { .. }
+        | ValueRule::NullableInteger { .. }
+        | ValueRule::AutoInteger { .. }
+        | ValueRule::NullableIntegerOrAuto { .. } => FieldKind::Int,
+        ValueRule::Float { .. } | ValueRule::NullableFloat { .. } => FieldKind::Float,
+        ValueRule::Enum(values) | ValueRule::NullableEnum(values) => FieldKind::Enum(values),
+        ValueRule::AutoBool => FieldKind::Enum(AUTO_ON_OFF),
+        ValueRule::KvAdaptive => FieldKind::Enum(KV_ADAPTIVE),
+        ValueRule::KvBackend => FieldKind::Enum(KV_BACKENDS),
+        ValueRule::PathOrEmpty => FieldKind::FreeStr {
+            require_existing_file: true,
+        },
+        // A free string rather than an enum: `PassbackShare` is `auto` or a
+        // continuum (0, 0.5] that a fixed list cannot express; the schema rule
+        // is the validator, so a bad typed value is rejected by `write_value`.
+        ValueRule::String
+        | ValueRule::NonEmptyString
+        | ValueRule::Host
+        | ValueRule::AbsolutePathOrEmpty
+        | ValueRule::NullableString
+        | ValueRule::PassbackShare
+        | ValueRule::Deepseek4Placement => FieldKind::FreeStr {
+            require_existing_file: false,
+        },
+    }
+}
+
+/// Every editable key: canonical key → spec. Built once from the schema (each
+/// non-deprecated field, kind from its rule) with the curated overrides applied
+/// on top, plus the typed-boolean developer key.
+fn spec_table() -> &'static [(&'static str, FieldSpec)] {
+    static TABLE: std::sync::LazyLock<Vec<(&'static str, FieldSpec)>> =
+        std::sync::LazyLock::new(build_spec_table);
+    &TABLE
+}
+
+fn build_spec_table() -> Vec<(&'static str, FieldSpec)> {
+    let mut table: Vec<(&'static str, FieldSpec)> = hipfire_config::fields()
         .iter()
-        .find(|candidate| candidate.key == key)
+        .filter(|schema| !is_deprecated_key(schema.key))
+        .map(|schema| {
+            let curated = EDITABLE_FIELDS
+                .iter()
+                .find(|spec| field(spec.key).is_some_and(|f| f.key == schema.key));
+            let spec = match curated {
+                Some(spec) => *spec,
+                None => FieldSpec {
+                    key: schema.key,
+                    kind: kind_from_rule(&schema.rule),
+                },
+            };
+            (schema.key, spec)
+        })
+        .collect();
+    table.push((
+        SYM_IU4_KEY,
+        FieldSpec {
+            key: SYM_IU4_KEY,
+            kind: FieldKind::Bool,
+        },
+    ));
+    table
+}
+
+/// The edit spec of `key` (canonical or legacy spelling); `None` for a
+/// deprecated key, an unknown key, and any `developer.*` key but the typed
+/// boolean one (see [`field_kind`]).
+pub fn field_spec(key: &str) -> Option<&'static FieldSpec> {
+    let canonical = match field(key) {
+        Some(schema) => schema.key,
+        None if key == SYM_IU4_KEY => SYM_IU4_KEY,
+        None => return None,
+    };
+    spec_table()
+        .iter()
+        .find(|(candidate, _)| *candidate == canonical)
+        .map(|(_, spec)| spec)
+}
+
+/// [`field_spec`]'s kind, extended to every `developer.*` key (free text:
+/// developer keys keep their legacy free-form spelling).
+pub fn field_kind(key: &str) -> Option<FieldKind> {
+    field_spec(key).map(|spec| spec.kind).or_else(|| {
+        is_developer_key(key).then_some(FieldKind::FreeStr {
+            require_existing_file: false,
+        })
+    })
+}
+
+/// The accepted numeric range of `key`, read from the schema's `ValueRule` (the
+/// sole validator), as display text: `"1..=1048576"`, `"0..=2"`. `None` for keys
+/// whose rule has no numeric bounds.
+pub fn schema_range(key: &str) -> Option<String> {
+    use hipfire_config::ValueRule;
+    match field(key)?.rule {
+        ValueRule::Integer { min, max }
+        | ValueRule::NullableInteger { min, max }
+        | ValueRule::AutoInteger { min, max }
+        | ValueRule::NullableIntegerOrAuto { min, max } => Some(format!("{min}..={max}")),
+        ValueRule::Float {
+            min,
+            max,
+            min_inclusive,
+        } => Some(if min_inclusive {
+            format!("{min}..={max}")
+        } else {
+            format!(">{min}..={max}")
+        }),
+        ValueRule::NullableFloat { min, max } => Some(format!("{min}..={max}")),
+        _ => None,
+    }
 }
 
 pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteError> {
+    if field(key).is_none() && is_developer_key(key) {
+        return write_developer_value(path, key, raw);
+    }
     let schema = field(key).ok_or_else(|| WriteError::Invalid {
         key: key.to_owned(),
         value: raw.to_owned(),
@@ -229,6 +246,41 @@ pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteErro
     let json = to_json(&config_value);
     write_config_value(path, schema.key, config_value)?;
     Ok(json)
+}
+
+/// `developer.*` keys are not in the schema. The typed-boolean key takes a
+/// boolean spelling (`true`/`false`/`1`/`0`) and is written as a TOML
+/// boolean; every other developer key keeps its free-form string.
+fn write_developer_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteError> {
+    let value = if is_typed_bool_developer_key(key) {
+        let parsed = parse_typed_bool(raw.trim()).ok_or_else(|| WriteError::Invalid {
+            key: key.to_owned(),
+            value: raw.to_owned(),
+        })?;
+        ConfigValue::Bool(parsed)
+    } else {
+        ConfigValue::String(raw.to_owned())
+    };
+    let json = to_json(&value);
+    write_config_value(path, key, value)?;
+    Ok(json)
+}
+
+/// Apply a virtual row's choice (Settings "Prompt processing"): set or remove
+/// each key it names, in one write, so the file never holds half a choice.
+#[allow(dead_code)] // consumed by the Settings pane rewrite
+pub fn write_choice(path: &Path, choice: &Choice) -> Result<(), WriteError> {
+    let paths = paths_for(path);
+    let mut loaded = load_global(&paths).map_err(config_error)?;
+    for (key, value) in &choice.writes {
+        match value {
+            Some(value) => loaded.layer.set(key, value.clone()).map_err(config_error)?,
+            None => {
+                loaded.layer.remove(key).map_err(config_error)?;
+            }
+        }
+    }
+    write_global_toml(&paths, &loaded.layer).map_err(config_error)
 }
 
 pub fn write_raw_value(path: &Path, key: &str, value: Value) -> Result<(), WriteError> {
@@ -436,6 +488,94 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// `ple_format` is editable and lands under its canonical schema key.
+    #[test]
+    fn ple_format_round_trips_under_the_schema_key() {
+        let (root, path) = temp_config();
+        let spec = field_spec("ple_format").expect("ple_format has a spec");
+        assert_eq!(spec.kind, FieldKind::Enum(hipfire_config::PLE_FORMATS));
+        assert_eq!(
+            write_value(&path, "ple_format", "q4").unwrap(),
+            Value::String("q4".into())
+        );
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("memory.ple_format"),
+            Some(&ConfigValue::String("q4".into()))
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("ple_format"), "{text}");
+        assert!(write_value(&path, "ple_format", "q5").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The `speculation` row offers exactly the schema's mode list.
+    #[test]
+    fn speculation_options_are_the_schema_values() {
+        let (root, path) = temp_config();
+        let spec = field_spec("speculation").expect("speculation has a spec");
+        let FieldKind::Enum(options) = spec.kind else {
+            panic!("speculation must be an enum row");
+        };
+        assert_eq!(options, hipfire_config::SPECULATION_MODES);
+        for value in options {
+            write_value(&path, "speculation", value)
+                .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
+        }
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("speculation.mode"),
+            Some(&ConfigValue::String("dspark".into()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Deprecated CASK/PFlash keys are not editable rows.
+    #[test]
+    fn deprecated_keys_have_no_field_spec() {
+        for spec in EDITABLE_FIELDS {
+            assert!(
+                !hipfire_config::is_deprecated_key(spec.key),
+                "{} is deprecated but editable",
+                spec.key
+            );
+        }
+        for key in [
+            "cask",
+            "prefill_compression",
+            "prefill_drafter",
+            "prefill_threshold",
+        ] {
+            assert!(field_spec(key).is_none(), "{key}");
+        }
+    }
+
+    /// Numeric ranges come from the schema, not a local copy: the old table said
+    /// 131072/524288 where the schema allows 393216/1048576.
+    #[test]
+    fn numeric_rows_report_the_schema_range() {
+        for spec in EDITABLE_FIELDS {
+            if matches!(spec.kind, FieldKind::Int | FieldKind::Float) {
+                assert!(
+                    schema_range(spec.key).is_some(),
+                    "numeric row {} has no schema range",
+                    spec.key
+                );
+            }
+        }
+        let rule = field("max_seq").unwrap().rule;
+        let hipfire_config::ValueRule::Integer { max, .. } = rule else {
+            panic!("max_seq rule is not an integer: {rule:?}");
+        };
+        assert!(schema_range("max_seq")
+            .unwrap()
+            .ends_with(&format!("..={max}")));
+        let (root, path) = temp_config();
+        assert!(write_value(&path, "max_seq", &(max + 1).to_string()).is_err());
+        assert!(write_value(&path, "max_seq", &max.to_string()).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn reset_removes_only_the_selected_override() {
         let (root, path) = temp_config();
@@ -459,5 +599,140 @@ mod tests {
             Some("advanced:k=fwht4,v=lloyd3")
         );
         assert!(cycle_enum("temperature", "0.3", true).is_none());
+    }
+
+    /// KV options are the schema's list minus the deprecated aliases, so a mode
+    /// the schema gains cannot be unselectable and fp8/bf16/f16/f32 are offered.
+    #[test]
+    fn kv_options_are_the_schema_list_minus_deprecated_aliases() {
+        let spec = field_spec("kv_cache").expect("kv_cache has a spec");
+        let FieldKind::Enum(options) = spec.kind else {
+            panic!("kv_cache must be an enum row");
+        };
+        let ValueRule::Enum(schema_list) = field("memory.kv_cache").unwrap().rule else {
+            panic!("memory.kv_cache is not an enum rule");
+        };
+        let live: std::collections::BTreeSet<&str> = schema_list
+            .iter()
+            .copied()
+            .filter(|mode| {
+                !(mode.starts_with("asym")
+                    || mode.starts_with("turbo")
+                    || mode.starts_with("legacy-"))
+            })
+            .collect();
+        let offered: std::collections::BTreeSet<&str> = options.iter().copied().collect();
+        assert_eq!(offered, live);
+        for mode in ["fp8", "bf16", "f16", "f32"] {
+            assert!(options.contains(&mode), "{mode}");
+        }
+        let (root, path) = temp_config();
+        for mode in options {
+            write_value(&path, "memory.kv_cache", mode)
+                .unwrap_or_else(|e| panic!("{mode} must be writable: {e:?}"));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every non-deprecated schema field is editable and its kind follows its
+    /// rule; deprecated and unknown keys stay read-only.
+    #[test]
+    fn every_live_schema_field_has_a_kind_from_its_rule() {
+        for schema in hipfire_config::fields() {
+            let spec = field_spec(schema.key);
+            if is_deprecated_key(schema.key) {
+                assert!(spec.is_none(), "{} is deprecated", schema.key);
+                continue;
+            }
+            let spec = spec.unwrap_or_else(|| panic!("{} has no spec", schema.key));
+            assert!(
+                spec.key == schema.key || EDITABLE_FIELDS.iter().any(|s| s.key == spec.key),
+                "{}",
+                schema.key
+            );
+            if matches!(schema.rule, ValueRule::Bool) {
+                assert_eq!(spec.kind, FieldKind::Bool, "{}", schema.key);
+            }
+        }
+        assert_eq!(
+            field_spec("memory.kv_backend").map(|s| s.kind),
+            Some(FieldKind::Enum(&["legacy", "vmm"]))
+        );
+        assert!(field_spec("developer.some_future_flag").is_none());
+        assert!(matches!(
+            field_kind("developer.some_future_flag"),
+            Some(FieldKind::FreeStr { .. })
+        ));
+        assert!(field_spec("no.such.key").is_none());
+    }
+
+    /// The typed-boolean developer key is written as a TOML boolean, never the
+    /// string spelling.
+    #[test]
+    fn sym_iu4_is_written_as_a_toml_boolean() {
+        let (root, path) = temp_config();
+        assert_eq!(
+            field_spec(SYM_IU4_KEY).map(|s| s.kind),
+            Some(FieldKind::Bool)
+        );
+        assert_eq!(
+            write_value(&path, SYM_IU4_KEY, "false").unwrap(),
+            Value::Bool(false)
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("qwen4_moe_sym_iu4 = false"),
+            "expected a TOML boolean in:\n{text}"
+        );
+        assert!(
+            !text.contains("\"false\"") && !text.contains("\"0\""),
+            "{text}"
+        );
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get(SYM_IU4_KEY),
+            Some(&ConfigValue::Bool(false))
+        );
+        // `0` is the same boolean; a non-boolean word is rejected.
+        assert_eq!(
+            write_value(&path, SYM_IU4_KEY, "1").unwrap(),
+            Value::Bool(true)
+        );
+        assert!(write_value(&path, SYM_IU4_KEY, "maybe").is_err());
+        assert!(delete_key(&path, SYM_IU4_KEY).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A virtual row's choice sets or removes each of its keys in one write.
+    #[test]
+    fn write_choice_sets_then_removes_the_iu4_key_on_gfx1201() {
+        use hipfire_config::effective::{quality_choices_for, A8Prefill, ArchCtx};
+        let ctx = ArchCtx {
+            gpu_arch: Some("gfx1201".into()),
+            gpu_count: 1,
+            model_arch_id: None,
+            registry_tag: Some("qwen3.8:27b".into()),
+            a8_prefill: A8Prefill::NotLanded,
+        };
+        let choices = quality_choices_for(&ctx, A8Prefill::NotLanded);
+        let (root, path) = temp_config();
+        write_value(&path, "max_tokens", "8192").unwrap();
+        write_choice(&path, &choices[1]).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("kernel.iu4_prefill"),
+            Some(&ConfigValue::Bool(false))
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("iu4_prefill = false"), "{text}");
+        write_choice(&path, &choices[0]).unwrap();
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert!(loaded.layer.get("kernel.iu4_prefill").is_none());
+        assert_eq!(
+            loaded.layer.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(8192)),
+            "unrelated keys survive a choice write"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

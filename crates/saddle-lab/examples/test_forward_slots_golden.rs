@@ -102,11 +102,11 @@ fn main() {
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch,
         Qwen35Weights,
     };
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv_backend::KvBackend;
     use hipfire_runtime::kv_mode::{self, KvMode, SlotKvTierPlan};
     use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
     use hipfire_runtime::slot_batch::SlotBatch;
-    use hipfire_runtime::hfq::HfqFile;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
     use rdna_compute::page_pool::PAGE_TOKENS;
     use rdna_compute::slot_pool::{SlotId, SlotPool};
@@ -215,11 +215,7 @@ fn main() {
         SlotBatch::build(&triples)
     }
 
-    fn build_decode_batch(
-        lens: &[usize],
-        streams: &[Vec<u32>],
-        positions: &[usize],
-    ) -> SlotBatch {
+    fn build_decode_batch(lens: &[usize], streams: &[Vec<u32>], positions: &[usize]) -> SlotBatch {
         let triples: Vec<(SlotId, &[u32], usize)> = (0..lens.len())
             .map(|s| {
                 let start = positions[s];
@@ -502,9 +498,8 @@ fn main() {
         } else {
             0
         };
-        let mut desc_staging =
-            SlotDescStaging::new(gpu, n_slots, max_batch, max_pages_per_slot)
-                .expect("candidate: SlotDescStaging::new");
+        let mut desc_staging = SlotDescStaging::new(gpu, n_slots, max_batch, max_pages_per_slot)
+            .expect("candidate: SlotDescStaging::new");
         let kv_tier = build_slot_kv_tier(gpu, fx);
         let pbs = PrefillBatchScratch::new(gpu, config, max_batch)
             .expect("candidate: PrefillBatchScratch::new");
@@ -521,8 +516,7 @@ fn main() {
             let mut batch = if step_idx == 0 {
                 build_prefill_batch(lens, streams)
             } else {
-                let positions: Vec<usize> =
-                    lens.iter().map(|&l| l + step_idx - 1).collect();
+                let positions: Vec<usize> = lens.iter().map(|&l| l + step_idx - 1).collect();
                 build_decode_batch(lens, streams, &positions)
             };
             if let Some((cstep, victim, target)) = corrupt {
@@ -815,7 +809,11 @@ fn main() {
         .collect();
     println!(
         "kv matrix: {} (pool: {})",
-        fixtures.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", "),
+        fixtures
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
         if paged { "paged" } else { "legacy slab" }
     );
     assert!(
@@ -832,8 +830,16 @@ fn main() {
         .len();
     let cap_rounded = CAP_TOKENS.div_ceil(128) * 128;
 
-    let max_k_per_pos = fixtures.iter().map(|f| f.plan.k_bytes_per_pos).max().unwrap();
-    let max_v_per_pos = fixtures.iter().map(|f| f.plan.v_bytes_per_pos).max().unwrap();
+    let max_k_per_pos = fixtures
+        .iter()
+        .map(|f| f.plan.k_bytes_per_pos)
+        .max()
+        .unwrap();
+    let max_v_per_pos = fixtures
+        .iter()
+        .map(|f| f.plan.v_bytes_per_pos)
+        .max()
+        .unwrap();
 
     // Candidate arm: K+V arenas across every FullAttention layer, sized for
     // N_SLOTS_MAX at the widest tier's strides and held live for that
@@ -862,9 +868,8 @@ fn main() {
     // Reference arm: one single-sequence KvCache (masked to the FA layers,
     // as the carrier builds it) + DeltaNetState + Qwen35Scratch alive at a
     // time (freed between slots) — budget one at the widest strides.
-    let ref_kv_bytes = (n_fa_layers as u64)
-        * (max_k_per_pos as u64 + max_v_per_pos as u64)
-        * (cap_rounded as u64);
+    let ref_kv_bytes =
+        (n_fa_layers as u64) * (max_k_per_pos as u64 + max_v_per_pos as u64) * (cap_rounded as u64);
     let reference_bytes = ref_kv_bytes + per_slot_dn_bytes + 64 * 1024 * 1024;
 
     // Host-side logits downloads, summed across the whole run rather than
@@ -875,11 +880,9 @@ fn main() {
     let n_modes = fixtures.len();
     let golden_ref_downloads: usize =
         (1..=N_SLOTS_MAX).sum::<usize>() * (1 + DECODE_STEPS) * n_modes;
-    let golden_cand_downloads: usize =
-        N_SLOTS_MAX * (1 + DECODE_STEPS) * n_modes + 2 * 2 * n_modes;
-    let host_logit_bytes = (golden_ref_downloads + golden_cand_downloads) as u64
-        * (config.vocab_size as u64)
-        * 4;
+    let golden_cand_downloads: usize = N_SLOTS_MAX * (1 + DECODE_STEPS) * n_modes + 2 * 2 * n_modes;
+    let host_logit_bytes =
+        (golden_ref_downloads + golden_cand_downloads) as u64 * (config.vocab_size as u64) * 4;
 
     let planned = weight_bytes
         + candidate_kv_bytes
@@ -946,7 +949,9 @@ fn main() {
 
     weights.free_gpu(&mut gpu);
 
-    println!("\n{n_ok}/{n_total} slot-steps passed golden equivalence across {} kv tiers.",
-        fixtures.len());
+    println!(
+        "\n{n_ok}/{n_total} slot-steps passed golden equivalence across {} kv tiers.",
+        fixtures.len()
+    );
     println!("ALL CHECKS PASS");
 }

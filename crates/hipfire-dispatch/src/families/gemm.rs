@@ -68,8 +68,14 @@ pub fn run_q8_projection_fresh(
 /// projection callers retain the incumbent dispatcher-entry behavior.
 #[allow(clippy::too_many_arguments)]
 pub fn run_mtp_fill_mq4(
-    gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
-    m: usize, k: usize, n: usize, use_pm: bool,
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+    use_pm: bool,
 ) -> hip_bridge::HipResult<()> {
     if use_pm && gpu.supports_gemm_hfq4g256_rows_pm(m, k, n) {
         gpu.gemm_hfq4g256_rows_pm(w, x, y, m, k, n)
@@ -237,6 +243,14 @@ impl GemmFamily {
                     quant: "MQ4G128V2",
                 });
             }
+            DType::MQ3I4G128R256
+            | DType::MQ3I4G128R128
+            | DType::MQ2I4G128R256
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128 => {
+                return Err(reject_mq_i4(dtype, "gemm"));
+            }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
             DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
             DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
@@ -304,6 +318,9 @@ impl GemmFamily {
                 arch: "",
                 quant: "MQ4G128V2",
             });
+        }
+        if params.w.dtype.is_mq_i4() {
+            return Err(reject_mq_i4(params.w.dtype, "gemm"));
         }
         // Validate the explicit key is registered and arch-admissible. The
         // dispatcher-entry keys used at migrated prefill sites are registered
@@ -622,7 +639,11 @@ impl GemmFamily {
             // `(w.buf, x, y, m, k, batch_size)` is byte-identical, and each method
             // keeps its own internal arch routing (WMMA for batch>1 on gfx11/12,
             // dp4a on gfx906, fp16/scalar fallback) so output is preserved exactly.
-            K::GemmQ8_0Batched => hip!(gpu.gemm_q8_0_batched(w.buf, x, y, m, k, batch_size)),
+            // Scalar Q8 kernel, F32 in/out, launched in 64-row chunks
+            // (`q8_0_batched_chunks`, #732).
+            K::GemmQ8_0Batched => {
+                hip!(gpu.gemm_q8_0_batched_f32_chunked(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G256BatchedLmhead => {
                 hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size))
             }

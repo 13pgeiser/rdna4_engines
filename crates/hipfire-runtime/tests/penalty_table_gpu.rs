@@ -64,14 +64,62 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    Case { name: "presence_tc", repeat: 1.0, window: 128, presence: 1.5, frequency: 0.0 },
-    Case { name: "repeat_1_1", repeat: 1.1, window: 128, presence: 0.0, frequency: 0.0 },
-    Case { name: "repeat_lt_1", repeat: 0.87, window: 64, presence: 0.0, frequency: 0.0 },
-    Case { name: "repeat_capped", repeat: 2.3, window: 32, presence: 0.0, frequency: 0.0 },
-    Case { name: "frequency_odd", repeat: 1.0, window: 128, presence: 0.0, frequency: 0.3 },
-    Case { name: "combined", repeat: 1.07, window: 128, presence: 0.7, frequency: 0.13 },
-    Case { name: "combined_w1", repeat: 1.3, window: 1, presence: 1.5, frequency: 0.5 },
-    Case { name: "combined_w2048", repeat: 1.05, window: 2048, presence: 0.4, frequency: 0.21 },
+    Case {
+        name: "presence_tc",
+        repeat: 1.0,
+        window: 128,
+        presence: 1.5,
+        frequency: 0.0,
+    },
+    Case {
+        name: "repeat_1_1",
+        repeat: 1.1,
+        window: 128,
+        presence: 0.0,
+        frequency: 0.0,
+    },
+    Case {
+        name: "repeat_lt_1",
+        repeat: 0.87,
+        window: 64,
+        presence: 0.0,
+        frequency: 0.0,
+    },
+    Case {
+        name: "repeat_capped",
+        repeat: 2.3,
+        window: 32,
+        presence: 0.0,
+        frequency: 0.0,
+    },
+    Case {
+        name: "frequency_odd",
+        repeat: 1.0,
+        window: 128,
+        presence: 0.0,
+        frequency: 0.3,
+    },
+    Case {
+        name: "combined",
+        repeat: 1.07,
+        window: 128,
+        presence: 0.7,
+        frequency: 0.13,
+    },
+    Case {
+        name: "combined_w1",
+        repeat: 1.3,
+        window: 1,
+        presence: 1.5,
+        frequency: 0.5,
+    },
+    Case {
+        name: "combined_w2048",
+        repeat: 1.05,
+        window: 2048,
+        presence: 0.4,
+        frequency: 0.21,
+    },
 ];
 
 fn cfg(case: &Case) -> SamplerConfig {
@@ -100,7 +148,15 @@ fn sliding_rows(rng: &mut Lcg, vocab: usize, base_len: usize, rows: usize) -> Ve
     (0..rows).map(|r| tokens[..base_len + r].to_vec()).collect()
 }
 
-fn check(gpu: &mut Gpu, stage: &mut Option<rdna_compute::sampling::PenaltyTableStage>, rng: &mut Lcg, case: &Case, vocab: usize, base_len: usize, rows: usize) {
+fn check(
+    gpu: &mut Gpu,
+    stage: &mut Option<rdna_compute::sampling::PenaltyTableStage>,
+    rng: &mut Lcg,
+    case: &Case,
+    vocab: usize,
+    base_len: usize,
+    rows: usize,
+) {
     let cfg = cfg(case);
     let hists = sliding_rows(rng, vocab, base_len, rows);
     let mut table = PenaltyTable::default();
@@ -109,7 +165,9 @@ fn check(gpu: &mut Gpu, stage: &mut Option<rdna_compute::sampling::PenaltyTableS
         table.push_row(hist, &cfg, vocab);
     }
     let orig = synth_logits(rng, rows * vocab);
-    let logits = gpu.upload_f32(&orig, &[rows * vocab]).expect("upload logits");
+    let logits = gpu
+        .upload_f32(&orig, &[rows * vocab])
+        .expect("upload logits");
     gpu.apply_penalty_table(
         stage,
         &logits,
@@ -143,7 +201,11 @@ fn check(gpu: &mut Gpu, stage: &mut Option<rdna_compute::sampling::PenaltyTableS
             .filter(|(w, o)| w.to_bits() != o.to_bits())
             .count();
     }
-    assert!(touched > 0, "{} vocab={vocab}: the case penalized nothing", case.name);
+    assert!(
+        touched > 0,
+        "{} vocab={vocab}: the case penalized nothing",
+        case.name
+    );
 }
 
 #[test]

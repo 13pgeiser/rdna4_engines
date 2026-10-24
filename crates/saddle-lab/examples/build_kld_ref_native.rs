@@ -589,18 +589,16 @@ fn main() {
                 .kv_sliding
                 .clear_gpu(&mut gpu)
                 .expect("gemma kv sliding clear");
-            state.kv_full.clear_gpu(&mut gpu).expect("gemma kv full clear");
+            state
+                .kv_full
+                .clear_gpu(&mut gpu)
+                .expect("gemma kv full clear");
             let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
             // Per-token decode for the entire chunk, matching qwen35's proven
             // per-token loop.
             for pos in 0..(n_ctx - 1) {
                 let cand_logits = forward::decode_step(
-                    &cfg,
-                    &weights,
-                    &mut state,
-                    &mut gpu,
-                    chunk[pos],
-                    pos as u32,
+                    &cfg, &weights, &mut state, &mut gpu, chunk[pos], pos as u32,
                 )
                 .expect("gemma decode_step");
                 if pos < scoring_start {

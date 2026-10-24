@@ -69,7 +69,9 @@ impl DescriptorCodec for KernelDescriptor {
         let properties = u16_at(56);
         if properties & KCP_RESERVED != 0 {
             let bit = (properties & KCP_RESERVED).trailing_zeros() as usize;
-            return Err(DescriptorError::Reserved { offset: 56 + bit / 8 });
+            return Err(DescriptorError::Reserved {
+                offset: 56 + bit / 8,
+            });
         }
         Ok(KernelDescriptor {
             group_segment_fixed_size: u32_at(0),
@@ -111,7 +113,11 @@ pub enum DescriptorReject {
     #[error(transparent)]
     Descriptor(#[from] DescriptorError),
     #[error("{field} bits {bits:#x} must be 0 on {arch:?}")]
-    ReservedBits { field: &'static str, bits: u32, arch: Arch },
+    ReservedBits {
+        field: &'static str,
+        bits: u32,
+        arch: Arch,
+    },
     #[error("USES_DYNAMIC_STACK is set")]
     DynamicStack,
     #[error("{0} is unsupported with architected flat scratch")]
@@ -128,27 +134,50 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(DescriptorReject::UnsupportedArch(arch));
     }
-    let reserved_bytes = RESERVED.iter().flat_map(|&(lo, hi)| lo..hi).zip(kd.reserved);
+    let reserved_bytes = RESERVED
+        .iter()
+        .flat_map(|&(lo, hi)| lo..hi)
+        .zip(kd.reserved);
     if let Some((offset, _)) = reserved_bytes.into_iter().find(|&(_, b)| b != 0) {
         return Err(DescriptorError::Reserved { offset }.into());
     }
-    let reserved = |field, bits: u32| if bits == 0 { Ok(()) } else { Err(DescriptorReject::ReservedBits { field, bits, arch }) };
+    let reserved = |field, bits: u32| {
+        if bits == 0 {
+            Ok(())
+        } else {
+            Err(DescriptorReject::ReservedBits { field, bits, arch })
+        }
+    };
     let properties = kd.kernel_code_properties.0;
-    reserved("kernel_code_properties", u32::from(properties & KCP_RESERVED))?;
+    reserved(
+        "kernel_code_properties",
+        u32::from(properties & KCP_RESERVED),
+    )?;
     if properties & KCP_USES_DYNAMIC_STACK != 0 {
         return Err(DescriptorReject::DynamicStack);
     }
     if properties & KCP_PRIVATE_SEGMENT_BUFFER != 0 {
-        return Err(DescriptorReject::ArchitectedFlatScratch("ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER"));
+        return Err(DescriptorReject::ArchitectedFlatScratch(
+            "ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER",
+        ));
     }
     if properties & KCP_FLAT_SCRATCH_INIT != 0 {
-        return Err(DescriptorReject::ArchitectedFlatScratch("ENABLE_SGPR_FLAT_SCRATCH_INIT"));
+        return Err(DescriptorReject::ArchitectedFlatScratch(
+            "ENABLE_SGPR_FLAT_SCRATCH_INIT",
+        ));
     }
     // The KD table defines KERNARG_PRELOAD only for GFX90A/GFX942; GFX12 has no row, so a
     // nonzero value would ask CP for preloaded SGPRs it does not provide.
     reserved("kernarg_preload", u32::from(kd.kernarg_preload.0))?;
-    reserved("compute_pgm_rsrc1", kd.compute_pgm_rsrc1.0 &
-        if arch == Arch::Gfx1201 { GFX120_RSRC1_MUST_BE_ZERO } else { GFX11_RSRC1_MUST_BE_ZERO })?;
+    reserved(
+        "compute_pgm_rsrc1",
+        kd.compute_pgm_rsrc1.0
+            & if arch == Arch::Gfx1201 {
+                GFX120_RSRC1_MUST_BE_ZERO
+            } else {
+                GFX11_RSRC1_MUST_BE_ZERO
+            },
+    )?;
     let rsrc2 = kd.compute_pgm_rsrc2.0;
     if rsrc2 & GFX120_RSRC2_DYNAMIC_VGPR != 0 {
         return Err(DescriptorError::DynamicVgpr.into());
@@ -158,8 +187,16 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
     }
     reserved("compute_pgm_rsrc2", rsrc2 & RSRC2_MUST_BE_ZERO)?;
     let rsrc3 = kd.compute_pgm_rsrc3.0;
-    let mask = if arch == Arch::Gfx1201 { GFX120_RSRC3_MUST_BE_ZERO }
-        else { GFX11_RSRC3_MUST_BE_ZERO | if kd.kernel_code_properties.wave32() { 0xf } else { 0 } };
+    let mask = if arch == Arch::Gfx1201 {
+        GFX120_RSRC3_MUST_BE_ZERO
+    } else {
+        GFX11_RSRC3_MUST_BE_ZERO
+            | if kd.kernel_code_properties.wave32() {
+                0xf
+            } else {
+                0
+            }
+    };
     reserved("compute_pgm_rsrc3", rsrc3 & mask)?;
     Ok(())
 }
@@ -201,34 +238,90 @@ mod tests {
         for offset in [12, 15, 24, 43, 60, 63] {
             let mut bytes = original;
             bytes[offset] = 0x10;
-            assert_eq!(KernelDescriptor::from_bytes(&bytes), Err(DescriptorError::Reserved { offset }));
+            assert_eq!(
+                KernelDescriptor::from_bytes(&bytes),
+                Err(DescriptorError::Reserved { offset })
+            );
         }
         for (bit, offset) in [(7, 56), (9, 57), (12, 57), (15, 57)] {
             let mut bytes = original;
             let properties = u16::from_le_bytes([bytes[56], bytes[57]]) | (1 << bit);
             bytes[56..58].copy_from_slice(&properties.to_le_bytes());
-            assert_eq!(KernelDescriptor::from_bytes(&bytes), Err(DescriptorError::Reserved { offset }), "bit {bit}");
+            assert_eq!(
+                KernelDescriptor::from_bytes(&bytes),
+                Err(DescriptorError::Reserved { offset }),
+                "bit {bit}"
+            );
         }
-        assert_eq!(KernelDescriptor::from_bytes(&original[..63]), Err(DescriptorError::Length));
+        assert_eq!(
+            KernelDescriptor::from_bytes(&original[..63]),
+            Err(DescriptorError::Length)
+        );
     }
 
     #[test]
     fn validate_applies_gfx120_rejects_and_keeps_defined_bits() {
         let (kd, _) = kt48_selected();
-        let with = |edit: fn(&mut KernelDescriptor)| { let mut kd = kd.clone(); edit(&mut kd); validate(&kd, Arch::Gfx1201) };
-        assert_eq!(with(|kd| kd.compute_pgm_rsrc2.0 |= 1 << 6), Err(DescriptorError::DynamicVgpr.into()));
-        assert_eq!(with(|kd| kd.compute_pgm_rsrc2.0 |= 3 << 15), Err(DescriptorReject::LdsGranule(3)));
-        assert_eq!(with(|kd| kd.compute_pgm_rsrc3.0 |= 1 << 17),
-            Err(DescriptorReject::ReservedBits { field: "compute_pgm_rsrc3", bits: 1 << 17, arch: Arch::Gfx1201 }));
-        assert_eq!(with(|kd| kd.compute_pgm_rsrc1.0 |= 1 << 6),
-            Err(DescriptorReject::ReservedBits { field: "compute_pgm_rsrc1", bits: 1 << 6, arch: Arch::Gfx1201 }));
+        let with = |edit: fn(&mut KernelDescriptor)| {
+            let mut kd = kd.clone();
+            edit(&mut kd);
+            validate(&kd, Arch::Gfx1201)
+        };
+        assert_eq!(
+            with(|kd| kd.compute_pgm_rsrc2.0 |= 1 << 6),
+            Err(DescriptorError::DynamicVgpr.into())
+        );
+        assert_eq!(
+            with(|kd| kd.compute_pgm_rsrc2.0 |= 3 << 15),
+            Err(DescriptorReject::LdsGranule(3))
+        );
+        assert_eq!(
+            with(|kd| kd.compute_pgm_rsrc3.0 |= 1 << 17),
+            Err(DescriptorReject::ReservedBits {
+                field: "compute_pgm_rsrc3",
+                bits: 1 << 17,
+                arch: Arch::Gfx1201
+            })
+        );
+        assert_eq!(
+            with(|kd| kd.compute_pgm_rsrc1.0 |= 1 << 6),
+            Err(DescriptorReject::ReservedBits {
+                field: "compute_pgm_rsrc1",
+                bits: 1 << 6,
+                arch: Arch::Gfx1201
+            })
+        );
         assert_eq!(with(|kd| kd.private_segment_fixed_size = 16), Ok(()));
-        assert_eq!(with(|kd| kd.kernel_code_properties.0 |= 1 << 11), Err(DescriptorReject::DynamicStack));
-        assert!(matches!(with(|kd| kd.kernel_code_properties.0 |= 1 << 5), Err(DescriptorReject::ArchitectedFlatScratch(_))));
-        assert!(matches!(with(|kd| kd.kernarg_preload.0 = 1), Err(DescriptorReject::ReservedBits { field: "kernarg_preload", .. })));
-        assert_eq!(with(|kd| kd.reserved[4] = 1), Err(DescriptorError::Reserved { offset: 24 }.into()));
+        assert_eq!(
+            with(|kd| kd.kernel_code_properties.0 |= 1 << 11),
+            Err(DescriptorReject::DynamicStack)
+        );
+        assert!(matches!(
+            with(|kd| kd.kernel_code_properties.0 |= 1 << 5),
+            Err(DescriptorReject::ArchitectedFlatScratch(_))
+        ));
+        assert!(matches!(
+            with(|kd| kd.kernarg_preload.0 = 1),
+            Err(DescriptorReject::ReservedBits {
+                field: "kernarg_preload",
+                ..
+            })
+        ));
+        assert_eq!(
+            with(|kd| kd.reserved[4] = 1),
+            Err(DescriptorError::Reserved { offset: 24 }.into())
+        );
         // GLG_EN (rsrc3 bit 13) and WG_RR_EN (rsrc1 bit 21) are defined on GFX12: kept, not rejected.
-        assert_eq!(with(|kd| { kd.compute_pgm_rsrc3.0 |= 1 << 13; kd.compute_pgm_rsrc1.0 |= 1 << 21 }), Ok(()));
-        assert_eq!(validate(&kd, Arch::Gfx1030), Err(DescriptorReject::UnsupportedArch(Arch::Gfx1030)));
+        assert_eq!(
+            with(|kd| {
+                kd.compute_pgm_rsrc3.0 |= 1 << 13;
+                kd.compute_pgm_rsrc1.0 |= 1 << 21
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            validate(&kd, Arch::Gfx1030),
+            Err(DescriptorReject::UnsupportedArch(Arch::Gfx1030))
+        );
     }
 }

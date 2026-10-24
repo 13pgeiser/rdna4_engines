@@ -9,6 +9,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 
+mod emu_budget;
 mod error;
 mod ffi;
 mod kernarg;
@@ -20,20 +21,28 @@ mod rocsolver;
 mod vmm;
 
 pub use error::{
-    HipError, HipErrorCode, HipResult, LaunchContext, HIP_ERROR_INVALID_IMAGE,
-    HIP_ERROR_OUT_OF_MEMORY, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    register_first_illegal_address_hook, HipError, HipErrorCode, HipResult, LaunchContext,
+    HIP_ERROR_ILLEGAL_ADDRESS, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_OUT_OF_MEMORY,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+};
+#[cfg(feature = "kernel-timing")]
+pub use ffi::kernel_timing::{
+    reject_kernel_timing_backend, KernelTimingCoverage, KernelTimingPool, KernelTimingReport,
 };
 pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
-    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module,
-    PinnedHostBuffer, PinnedTransferBuffer, Stream,
-    HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, HostAllocOwner,
+    InputReady, MappedHostBuffer, MappedPhase, MappedPublished, MappedWrite, Module,
+    PinnedHostBuffer, PinnedTransferBuffer, SignalGen, SignalHostPtr, SignalWord, Stream,
+    HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE, HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING,
+    HIP_EVENT_RELEASE_TO_SYSTEM, HIP_HOST_MALLOC_COHERENT, HIP_HOST_MALLOC_MAPPED,
+    HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-    HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
+    HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, HIP_STREAM_WAIT_VALUE_GTE,
+    HIP_STREAM_WRITE_VALUE_DEFAULT, QWEN4_EXPERT_VRAM_LAYERS_ENV, SIGNAL_ABORT, SIGNAL_GEN_MAX,
 };
 pub use kernarg::KernargBlob;
 pub use launch_grid::{check_launch_grid, grid_yz_limit_for_arch, GFX1201_MAX_GRID_YZ};
@@ -90,6 +99,11 @@ pub struct DeviceBuffer {
     ptr: *mut std::ffi::c_void,
     size: usize,
     ownership: DeviceBufferOwnership,
+    /// Emu capacity charge for an owning `hipMalloc` allocation (`None` when
+    /// emu is off, and always `None` for borrowed/VMM/host-mapped views). Not
+    /// auto-releasing: dropping the buffer without `HipRuntime::free` keeps
+    /// the charge, like the leaked allocation itself.
+    token: Option<emu_budget::Token>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +143,23 @@ impl DeviceBuffer {
         self.ownership == DeviceBufferOwnership::HostMapped
     }
 
+    /// Attach the emu capacity charge of this owning allocation.
+    pub(crate) fn with_charge(mut self, token: Option<emu_budget::Token>) -> DeviceBuffer {
+        self.token = token;
+        self
+    }
+
+    /// Detach the emu capacity charge so `free` can release it only after the
+    /// raw free succeeds.
+    pub(crate) fn take_charge(&mut self) -> Option<emu_budget::Token> {
+        self.token.take()
+    }
+
+    #[cfg(test)]
+    fn is_charged(&self) -> bool {
+        self.token.is_some()
+    }
+
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
     /// The caller must ensure the pointer is valid GPU memory.
     /// The resulting buffer must NOT be freed (it doesn't own the memory).
@@ -142,6 +173,7 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Borrowed,
+            token: None,
         }
     }
 
@@ -156,6 +188,7 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Vmm,
+            token: None,
         }
     }
 
@@ -177,6 +210,7 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::HostMapped,
+            token: None,
         }
     }
 
@@ -190,6 +224,7 @@ impl DeviceBuffer {
             ptr: self.ptr,
             size: self.size,
             ownership: DeviceBufferOwnership::Borrowed,
+            token: None,
         }
     }
 
@@ -230,6 +265,7 @@ impl DeviceBuffer {
             ptr,
             size: byte_len,
             ownership: DeviceBufferOwnership::Borrowed,
+            token: None,
         }
     }
 }
@@ -267,5 +303,21 @@ mod device_buffer_tests {
         let view = unsafe { owner.alias() };
         assert!(view.is_borrowed());
         assert!(!view.is_vmm_owner());
+    }
+
+    #[test]
+    fn aliases_views_and_host_mapped_owners_carry_no_charge() {
+        // SAFETY: dangling non-null ptr is never dereferenced; tests only check charge tags.
+        let mapped = unsafe { DeviceBuffer::from_host_mapped(std::ptr::dangling_mut(), 4096) };
+        // SAFETY: alias must not outlive `mapped`; both stay on the stack for this test.
+        let alias = unsafe { mapped.alias() };
+        let view = mapped.byte_view(0, 1024);
+        assert!(!mapped.is_charged() && !alias.is_charged() && !view.is_charged());
+        // SAFETY: dangling non-null ptr is never dereferenced.
+        let vmm = unsafe { DeviceBuffer::from_vmm_owner(std::ptr::dangling_mut(), 4096) };
+        assert!(!vmm.is_charged());
+        // SAFETY: dangling non-null ptr is never dereferenced.
+        let mut raw = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) };
+        assert!(raw.take_charge().is_none());
     }
 }

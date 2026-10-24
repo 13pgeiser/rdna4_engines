@@ -27,9 +27,7 @@ use hipfire_ds4_parent::forward::{
     PARENT_HC_SINKHORN_ITERS,
 };
 use hipfire_ds4_parent::head::parent_embed;
-use hipfire_ds4_parent::indexer::{
-    indexer_n_compressed, indexer_n_visible, PARENT_INDEX_TOPK,
-};
+use hipfire_ds4_parent::indexer::{indexer_n_compressed, indexer_n_visible, PARENT_INDEX_TOPK};
 use hipfire_ds4_parent::inventory::ParentInventory;
 use hipfire_ds4_parent::layer_ref::{
     attention_swa_ref, hc_pre_ref, rms_norm_ref, AttnCompRefWeights, AttnIndexerRefWeights,
@@ -223,26 +221,10 @@ fn run() -> Result<(), String> {
 
     // ── Probe layers ────────────────────────────────────────────────────
     probe_layer(
-        &mut gpu,
-        backend,
-        &weights,
-        &cfg,
-        0,
-        0,
-        &x_attn_l0,
-        rows,
-        /*dump_topk=*/ false,
+        &mut gpu, backend, &weights, &cfg, 0, 0, &x_attn_l0, rows, /*dump_topk=*/ false,
     )?;
     probe_layer(
-        &mut gpu,
-        backend,
-        &weights,
-        &cfg,
-        2,
-        4,
-        &x_attn_l2,
-        rows,
-        /*dump_topk=*/ true,
+        &mut gpu, backend, &weights, &cfg, 2, 4, &x_attn_l2, rows, /*dump_topk=*/ true,
     )?;
 
     // L3 real residual: continue from L2 HC through L2 then take L3 input.
@@ -282,15 +264,7 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "layer 3 missing".to_owned())?;
     let x_attn_l3 = real_attn_input_from_hc(&gpu, layer3, &cfg, &l3_hc_host, rows)?;
     probe_layer(
-        &mut gpu,
-        backend,
-        &weights,
-        &cfg,
-        3,
-        128,
-        &x_attn_l3,
-        rows,
-        /*dump_topk=*/ false,
+        &mut gpu, backend, &weights, &cfg, 3, 128, &x_attn_l3, rows, /*dump_topk=*/ false,
     )?;
 
     println!();
@@ -360,7 +334,12 @@ fn probe_layer(
             let wp_k = ix.weights_proj.shape.get(1).copied().unwrap_or(PARENT_DIM);
             let wp = download_bf16_as_f32(gpu, &ix.weights_proj, wp_n * wp_k)?;
             let cproj = ix.compressor_wkv.shape.get(0).copied().unwrap_or(0);
-            let cdim = ix.compressor_wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+            let cdim = ix
+                .compressor_wkv
+                .shape
+                .get(1)
+                .copied()
+                .unwrap_or(PARENT_DIM);
             (
                 Some(wq),
                 Some(wp),
@@ -458,7 +437,16 @@ fn probe_layer(
 
     let t_gpu = Instant::now();
     parent_attention_swa(
-        gpu, backend, layer, cfg, &mut scratch, &x, rows, START_POS, &kv_ring, &out,
+        gpu,
+        backend,
+        layer,
+        cfg,
+        &mut scratch,
+        &x,
+        rows,
+        START_POS,
+        &kv_ring,
+        &out,
     )?;
     gpu.hip
         .device_synchronize()
@@ -589,14 +577,19 @@ fn dump_causality(
 
     println!();
     println!("=== compressed causality dump (ratio={ratio}, n_comp={n_comp}) ===");
-    println!("PARENT_ATTN_INDEX_TOPK={PARENT_ATTN_INDEX_TOPK}  PARENT_INDEX_TOPK={PARENT_INDEX_TOPK}");
-    println!("oracle compress_idxs stride={}  host get_compress_topk k={host_k}", {
-        if rows > 0 {
-            reference.compress_idxs.len() / rows
-        } else {
-            0
+    println!(
+        "PARENT_ATTN_INDEX_TOPK={PARENT_ATTN_INDEX_TOPK}  PARENT_INDEX_TOPK={PARENT_INDEX_TOPK}"
+    );
+    println!(
+        "oracle compress_idxs stride={}  host get_compress_topk k={host_k}",
+        {
+            if rows > 0 {
+                reference.compress_idxs.len() / rows
+            } else {
+                0
+            }
         }
-    });
+    );
 
     // Per-row n_active summary.
     let mut n_active_mismatch = 0usize;
@@ -613,9 +606,7 @@ fn dump_causality(
             }
         }
     }
-    println!(
-        "n_active vs min(topk,vis): mismatches={n_active_mismatch}/{rows}"
-    );
+    println!("n_active vs min(topk,vis): mismatches={n_active_mismatch}/{rows}");
 
     // Full-row causality + packing scan.
     let mut rows_with_future = 0usize;
@@ -651,12 +642,7 @@ fn dump_causality(
             if s < plan.n_out {
                 let cur = &plan.current_windows[s];
                 let prev = &plan.prev_windows[s];
-                let max_tok = cur
-                    .iter()
-                    .chain(prev.iter())
-                    .copied()
-                    .max()
-                    .unwrap_or(0);
+                let max_tok = cur.iter().chain(prev.iter()).copied().max().unwrap_or(0);
                 // Query at row r may see tokens ≤ r.
                 if max_tok > r {
                     tok_ok = false;
@@ -686,12 +672,8 @@ fn dump_causality(
     println!(
         "causality: rows_with_future_slots={rows_with_future}/{rows}  max_future_slot={max_future_slot}"
     );
-    println!(
-        "packing: rows_with_-1_hole_in_n_active_prefix={rows_with_hole_in_prefix}/{rows}"
-    );
-    println!(
-        "packing: rows_n_valid_in_prefix != n_active={rows_n_valid_ne_n_active}/{rows}"
-    );
+    println!("packing: rows_with_-1_hole_in_n_active_prefix={rows_with_hole_in_prefix}/{rows}");
+    println!("packing: rows_n_valid_in_prefix != n_active={rows_n_valid_ne_n_active}/{rows}");
     for e in &future_examples {
         println!("  {e}");
     }
@@ -765,8 +747,14 @@ fn dump_causality(
             swa_n_valid(START_POS, r, PARENT_SWA_WINDOW)
         );
         println!("  gpu topk[0..max(na,32)] = {:?}", &gpu_slots);
-        println!("  oracle compress (local) = {:?}", &ora[..ora.len().min(40)]);
-        println!("  host get_compress_topk  = {:?}", &host[..host.len().min(40)]);
+        println!(
+            "  oracle compress (local) = {:?}",
+            &ora[..ora.len().min(40)]
+        );
+        println!(
+            "  host get_compress_topk  = {:?}",
+            &host[..host.len().min(40)]
+        );
         let mut n_bad = 0usize;
         for (idx, ok, detail) in &gpu_valid {
             if !ok {
@@ -781,13 +769,10 @@ fn dump_causality(
         }
 
         // Set compare gpu vs oracle (ignore -1, ignore order).
-        let gset: std::collections::BTreeSet<i32> = row
-            .iter()
-            .copied()
-            .filter(|&v| v >= 0)
-            .take(na)
-            .collect();
-        let oset: std::collections::BTreeSet<i32> = ora.iter().copied().filter(|&v| v >= 0).collect();
+        let gset: std::collections::BTreeSet<i32> =
+            row.iter().copied().filter(|&v| v >= 0).take(na).collect();
+        let oset: std::collections::BTreeSet<i32> =
+            ora.iter().copied().filter(|&v| v >= 0).collect();
         let only_g: Vec<i32> = gset.difference(&oset).copied().collect();
         let only_o: Vec<i32> = oset.difference(&gset).copied().collect();
         if only_g.is_empty() && only_o.is_empty() {
@@ -950,9 +935,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--model" => {
-                model = it
-                    .next()
-                    .ok_or_else(|| "--model needs value".to_owned())?;
+                model = it.next().ok_or_else(|| "--model needs value".to_owned())?;
             }
             "--token-ids" => {
                 token_ids = PathBuf::from(

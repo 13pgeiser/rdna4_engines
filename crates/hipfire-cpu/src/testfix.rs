@@ -88,6 +88,17 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
             // fp16 [scale][zero] + 4 B padding.
             bytes[..4].copy_from_slice(&f16x4(F16_QUAD)[..4]);
         }
+        CpuQuant::Mq4G128V2 => {
+            // fp16 [scale][zero], then the 64 B nibble payload.
+            bytes[..4].copy_from_slice(&f16x4(F16_QUAD)[..4]);
+        }
+        // Planar formats have no per-group header: `group_bytes` is just the
+        // group's code bytes, and the scales live in a separate plane that
+        // `weight_bytes` / `planar_tensor` build.
+        CpuQuant::Mq3I4G128R256
+        | CpuQuant::Mq3I4G128R128
+        | CpuQuant::E8pI4G128R256
+        | CpuQuant::E8pI4G128R128 => {}
         CpuQuant::Hfq3G256
         | CpuQuant::Hfq2G256
         | CpuQuant::Hfq4G128
@@ -136,8 +147,53 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
     bytes
 }
 
-/// A `[m, k]` weight tensor's bytes, group by group.
+/// SplitMix64 byte/word stream for the planar fixtures (the `(i*37+11)` payload
+/// of the row formats would only ever produce odd E8P `idx` bytes).
+pub struct SplitMix(pub u64);
+
+impl SplitMix {
+    pub fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// A finite, strictly positive f16 bit pattern with its exponent field drawn
+/// uniformly from `0..=30` (subnormal through `2^15`), so a tensor's groups span
+/// tiny and huge scales.
+pub fn random_scale_bits(rng: &mut SplitMix) -> u16 {
+    let exp = (rng.next() % 31) as u16;
+    let man = (rng.next() % 1024) as u16;
+    // Exponent 0 is subnormal: keep the mantissa nonzero so the scale is > 0.
+    let man = if exp == 0 { man | 1 } else { man };
+    (exp << 10) | man
+}
+
+/// A planar `[m, k]` tensor (`[codes plane][f16 scale plane]`): uniformly random
+/// code bytes — every bit pattern is a legal E8P word and every 3-bit code is
+/// legal — and [`random_scale_bits`] scales. Exactly `tensor_bytes(q, m, k)`
+/// long.
+pub fn planar_tensor(q: CpuQuant, m: usize, k: usize, seed: u64) -> Vec<u8> {
+    assert!(q.is_planar() && k % 128 == 0);
+    let mut rng = SplitMix(seed);
+    let codes = m * crate::gemv::row_bytes(q, k);
+    let mut out = Vec::with_capacity(crate::gemv::tensor_bytes(q, m, k));
+    out.extend((0..codes).map(|_| rng.next() as u8));
+    for _ in 0..m * (k / 128) {
+        out.extend_from_slice(&random_scale_bits(&mut rng).to_le_bytes());
+    }
+    out
+}
+
+/// A `[m, k]` weight tensor's bytes, group by group (planar formats: the
+/// [`planar_tensor`] layout with a fixed seed).
 pub fn weight_bytes(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
+    if q.is_planar() {
+        return planar_tensor(q, m, k, 0x5EED_0000 + (m * k) as u64);
+    }
     let groups = k / q.group_elems();
     let mut out = Vec::with_capacity(m * crate::gemv::row_bytes(q, k));
     for row in 0..m {
@@ -147,6 +203,104 @@ pub fn weight_bytes(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
                 out.extend_from_slice(&bytes[..q.row_header_bytes()]);
             }
             out.extend_from_slice(&bytes[q.row_header_bytes()..]);
+        }
+    }
+    out
+}
+
+/// Reference encoder for qt 53 (`MQ4G128V2`): a transcription of
+/// `hipfire_quantize::quant_fwht::quantize_mq4g128v2` (that crate is a binary
+/// and cannot be a dev-dependency). Row-local `ceil(k/128)` groups, the last
+/// zero-padded before the rotation; per group `lo = min`, `hi = max`,
+/// `step = (hi-lo)/15`, `scale = f16(step)`, `zero = f16(lo)`,
+/// `q = clamp(floor((w - zero) / scale + 0.5), 0, 15)`, 68 B per group:
+/// `[f16 scale][f16 zero][64 B nibbles]`, byte `i` = `q[2i] | q[2i+1] << 4`.
+///
+/// The rotation is written from its *definition* (`R = s2 · H · s1 / sqrt(128)`
+/// with `H[i][j] = (-1)^popcount(i & j)`), not from the butterfly the crate's
+/// `rotate_x_128_v2` uses, so the two agree only if both are the same linear
+/// map.
+pub fn encode_mq4g128v2_ref(w: &[f32], m: usize, k: usize) -> Vec<u8> {
+    let s1 = crate::quant::fwht_signs(43, 128);
+    let s2 = crate::quant::fwht_signs(1043, 128);
+    let gpr = k.div_ceil(128);
+    let norm = 1.0f32 / (128.0f32).sqrt();
+    let mut out = vec![0u8; m * gpr * 68];
+    for row in 0..m {
+        for g in 0..gpr {
+            let start = g * 128;
+            let actual = k.saturating_sub(start).min(128);
+            let mut x = [0.0f32; 128];
+            x[..actual].copy_from_slice(&w[row * k + start..row * k + start + actual]);
+            let mut rot = [0.0f32; 128];
+            for (i, r) in rot.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for (j, v) in x.iter().enumerate() {
+                    let h = if (i & j).count_ones() % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    acc += h * s1[j] * v;
+                }
+                *r = acc * norm * s2[i];
+            }
+            let lo = rot.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = rot.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let step = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+            let mut scale_bits = half::f16::from_f32(step).to_bits();
+            let zero_bits = half::f16::from_f32(lo).to_bits();
+            let scale = half::f16::from_bits(scale_bits).to_f32();
+            let zero = half::f16::from_bits(zero_bits).to_f32();
+            let degenerate = hi == lo || step == 0.0 || scale == 0.0;
+            if degenerate {
+                scale_bits = 0;
+            }
+            let base = (row * gpr + g) * 68;
+            out[base..base + 2].copy_from_slice(&scale_bits.to_le_bytes());
+            out[base + 2..base + 4].copy_from_slice(&zero_bits.to_le_bytes());
+            if !degenerate {
+                let inv = 1.0 / scale;
+                for (i, r) in rot.iter().enumerate() {
+                    let q = ((r - zero) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
+                    if i & 1 == 0 {
+                        out[base + 4 + i / 2] = q & 0xF;
+                    } else {
+                        out[base + 4 + i / 2] |= (q & 0xF) << 4;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Reference decoder for qt 53: a transcription of
+/// `decode_mq4g128v2` in `crates/hipfire-quantize/src/quant_e8.rs` (the
+/// authoritative layout). Returns the *code* values in the rotated basis, row
+/// major `m * k` (the tail of a non-multiple-of-128 `k` is dropped).
+pub fn decode_mq4g128v2_ref(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
+    const GROUP: usize = 128;
+    const BYTES: usize = 68;
+    let gpr = k.div_ceil(GROUP);
+    assert_eq!(packed.len(), m * gpr * BYTES, "qt53 byte extent");
+    let f16 = |lo: u8, hi: u8| half::f16::from_bits(u16::from_le_bytes([lo, hi])).to_f32();
+    let mut out = vec![0.0f32; m * k];
+    for row in 0..m {
+        for g in 0..gpr {
+            let base = (row * gpr + g) * BYTES;
+            let scale = f16(packed[base], packed[base + 1]);
+            let zero = f16(packed[base + 2], packed[base + 3]);
+            for i in 0..64usize {
+                let byte = packed[base + 4 + i];
+                let at = g * GROUP + 2 * i;
+                if at < k {
+                    out[row * k + at] = zero + scale * ((byte & 0xF) as f32);
+                }
+                if at + 1 < k {
+                    out[row * k + at + 1] = zero + scale * (((byte >> 4) & 0xF) as f32);
+                }
+            }
         }
     }
     out

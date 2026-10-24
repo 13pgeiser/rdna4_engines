@@ -27,9 +27,7 @@
 use hipfire_ds4_parent::attention::{PARENT_DIM, PARENT_HEAD_DIM};
 use hipfire_ds4_parent::compressor::compressor_prefill_n_out;
 use hipfire_ds4_parent::forward::PARENT_HC_MULT;
-use hipfire_ds4_parent::head::{
-    parent_logits_to_plog, PARENT_HC_DIM, PARENT_VOCAB,
-};
+use hipfire_ds4_parent::head::{parent_logits_to_plog, PARENT_HC_DIM, PARENT_VOCAB};
 use hipfire_ds4_parent::inventory::ParentInventory;
 use hipfire_ds4_parent::manifest::{
     sha256_bytes, sha256_file, CaptureBoundary, CaptureInfo, CorpusInfo, ModelInfo, ModelQuantInfo,
@@ -126,9 +124,7 @@ fn run() -> Result<bool, String> {
             return Err("deepseek4 parent: --tokens must be > 0".into());
         }
         let ids = select_token_ids(TOKEN_SEED, n);
-        let desc = format!(
-            "PRNG smoke sequence seed={TOKEN_SEED:#x} (NOT for promoted artifacts)"
-        );
+        let desc = format!("PRNG smoke sequence seed={TOKEN_SEED:#x} (NOT for promoted artifacts)");
         (ids, desc, false)
     };
     let n_tokens = token_ids.len();
@@ -414,9 +410,7 @@ fn run() -> Result<bool, String> {
             };
             // Always print ratio-128 rows + any non-ok row; summarize the rest.
             if ratio == 128 || status != "ok" || n_tokens <= 64 {
-                println!(
-                    "  {i:>5}  {ratio:>5}  {observed:>8}  {expect:>8}  {status}"
-                );
+                println!("  {i:>5}  {ratio:>5}  {observed:>8}  {expect:>8}  {status}");
             }
         }
         println!(
@@ -531,7 +525,10 @@ fn run() -> Result<bool, String> {
             v.extend((n_tokens - 8)..n_tokens);
             v
         };
-        println!("argmax per position ({} shown of {n_tokens}):", dump_positions.len());
+        println!(
+            "argmax per position ({} shown of {n_tokens}):",
+            dump_positions.len()
+        );
         for &r in &dump_positions {
             let row = &logits_host[r * PARENT_VOCAB..(r + 1) * PARENT_VOCAB];
             let (idx, val) = argmax(row);
@@ -738,9 +735,7 @@ fn run() -> Result<bool, String> {
             } else {
                 0.0
             };
-            println!(
-                "  mean_ex0  {mean_le_ex0:>10.4}  {ref_mean_ex0:>10.4}  {mean_ratio:>10.4}"
-            );
+            println!("  mean_ex0  {mean_le_ex0:>10.4}  {ref_mean_ex0:>10.4}  {mean_ratio:>10.4}");
             // Plain verdict: does LE_ex0 track the reference (near-flat ~1),
             // or does parent LE rise/stay elevated at depth?
             let deep = [20usize, 30, 38, 42];
@@ -832,9 +827,7 @@ fn run() -> Result<bool, String> {
         det_detail = if det_pass {
             format!("bit-identical ({:.3} s second forward)", det_s)
         } else {
-            format!(
-                "{n_mismatch} mismatches; first={first_mismatch:?}"
-            )
+            format!("{n_mismatch} mismatches; first={first_mismatch:?}")
         };
         println!("{det_detail}");
 
@@ -1007,8 +1000,7 @@ fn run() -> Result<bool, String> {
             let plog_bytes = std::fs::metadata(plog_path)
                 .map_err(|e| format!("deepseek4 parent: plog metadata: {e}"))?
                 .len();
-            let expect_bytes =
-                8u64 + 4 + 4 + 8 + (n_tokens as u64) * (PARENT_VOCAB as u64) * 4;
+            let expect_bytes = 8u64 + 4 + 4 + 8 + (n_tokens as u64) * (PARENT_VOCAB as u64) * 4;
             plog_ok = plog_bytes == expect_bytes;
             plog_detail = format!(
                 "path={} bytes={plog_bytes} (expect {expect_bytes}) sha256={plog_sha}",
@@ -1189,7 +1181,6 @@ fn run() -> Result<bool, String> {
     Ok(all_pass)
 }
 
-
 // ── Stability ───────────────────────────────────────────────────────────────
 
 /// Report layer-to-layer norm ratios and decide stable / unstable.
@@ -1367,12 +1358,8 @@ fn select_token_ids(seed: u64, n: usize) -> Vec<u32> {
 
 /// Load flat u32 LE token-ids file produced by `ds4_tokenize_corpus`.
 fn read_token_ids_file(path: &Path) -> Result<Vec<u32>, String> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        format!(
-            "deepseek4 parent: read token-ids {}: {e}",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("deepseek4 parent: read token-ids {}: {e}", path.display()))?;
     if bytes.len() % 4 != 0 {
         return Err(format!(
             "deepseek4 parent: token-ids file {} has {} bytes (not a multiple of 4)",
@@ -1419,8 +1406,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
         ));
     }
     let mut host = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: download_f32: {e:?}"))?;

@@ -3,9 +3,11 @@
 //!
 //! A successful module load admits one immutable [`CodeObjectArtifact`]: the
 //! exact image bytes, their SHA-256 ([`CodeObjectId`]), the origin and the
-//! optional Radiowave certification. Hashing, file reads and manifest parsing
-//! happen once at admission; recording and replay only clone the
-//! [`RecordedArtifact`] handle and never touch the filesystem.
+//! optional Radiowave certification. Whole-image hashing, file reads and
+//! manifest parsing happen once at admission; recording and replay only clone
+//! the [`RecordedArtifact`] handle and never touch the filesystem. Lab-only
+//! device-ELF identities are derived from those admitted bytes and cached once
+//! per architecture on first observation.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -57,6 +59,14 @@ pub struct CodeObjectArtifact {
     image: CodeObjectBytes,
     origin: CodeObjectOrigin,
     radiowave: Option<CodeObjectCertification>,
+    /// Cached per-arch raw device IDs: SHA-256 of the `arch` device ELF
+    /// extracted from the admitted image via `device_code_object`
+    /// (raw ELF as is; the arch entry of an uncompressed clang offload
+    /// bundle). `#[cfg(lab)]`-only; empty (no alloc) until lab uses it.
+    /// `None` per arch means extraction refused (compressed/missing/
+    /// ambiguous/malformed) — never the container digest as fallback.
+    #[cfg(feature = "lab")]
+    device_ids: std::sync::Mutex<std::collections::HashMap<String, Option<CodeObjectId>>>,
 }
 
 pub type RecordedArtifact = Arc<CodeObjectArtifact>;
@@ -74,6 +84,8 @@ impl CodeObjectArtifact {
             image: image.into(),
             origin: CodeObjectOrigin::HipFile(path.to_path_buf()),
             radiowave,
+            #[cfg(feature = "lab")]
+            device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -92,11 +104,29 @@ impl CodeObjectArtifact {
             image,
             origin: CodeObjectOrigin::NativeEmbedded(module),
             radiowave,
+            #[cfg(feature = "lab")]
+            device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn id(&self) -> CodeObjectId {
         self.id
+    }
+
+    /// Raw device ID for `arch`: SHA-256 of the `arch` device ELF extracted
+    /// from the admitted image (`#[cfg(lab)]`-only; cached per arch, hashed
+    /// once from the borrowed payload). `None` when extraction refuses
+    /// (compressed/missing/ambiguous/malformed) — never the container digest.
+    #[cfg(feature = "lab")]
+    pub fn device_id(&self, arch: &str) -> Option<CodeObjectId> {
+        let mut cached = self.device_ids.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(known) = cached.get(arch) {
+            return *known;
+        }
+        let id =
+            crate::scratch::device_code_object(self.image.as_bytes(), arch).map(CodeObjectId::of);
+        cached.insert(arch.to_string(), id);
+        id
     }
 
     pub fn image(&self) -> &CodeObjectBytes {
@@ -240,7 +270,11 @@ mod tests {
     fn identity_is_sha256_of_the_exact_image() {
         let artifact = native("m", IMAGE_A);
         assert_eq!(artifact.id(), CodeObjectId(Sha256::digest(IMAGE_A).into()));
-        assert_eq!(artifact.image().as_bytes().as_ptr(), IMAGE_A.as_ptr(), "static image is not copied");
+        assert_eq!(
+            artifact.image().as_bytes().as_ptr(),
+            IMAGE_A.as_ptr(),
+            "static image is not copied"
+        );
         assert_eq!(artifact.origin(), &CodeObjectOrigin::NativeEmbedded("m"));
         let json = artifact.provenance_json();
         assert_eq!(json["origin"], "native_embedded");
@@ -253,13 +287,19 @@ mod tests {
         let mut registry = CodeObjectRegistry::default();
         let a = registry.admit_module("m", native("m", IMAGE_A)).unwrap();
         registry.bind_function("k", &a).unwrap();
-        let err = registry.admit_module("m", native("m", IMAGE_B)).unwrap_err();
+        let err = registry
+            .admit_module("m", native("m", IMAGE_B))
+            .unwrap_err();
         assert!(err.contains("cannot rebind"), "{err}");
-        let b = registry.admit_module("other", native("other", IMAGE_B)).unwrap();
+        let b = registry
+            .admit_module("other", native("other", IMAGE_B))
+            .unwrap();
         let err = registry.bind_function("k", &b).unwrap_err();
         assert!(err.contains("cannot rebind"), "{err}");
         assert!(registry.check_function_image("k", IMAGE_A).is_ok());
-        assert!(registry.check_function_image("k", IMAGE_A.to_vec().as_slice()).is_ok());
+        assert!(registry
+            .check_function_image("k", IMAGE_A.to_vec().as_slice())
+            .is_ok());
         assert!(registry.check_function_image("k", IMAGE_B).is_err());
         assert_eq!(registry.function("k").unwrap().id(), a.id());
     }
@@ -267,12 +307,16 @@ mod tests {
     #[test]
     fn multi_export_aliases_share_one_artifact() {
         let mut registry = CodeObjectRegistry::default();
-        let a = registry.admit_module("bundle", native("bundle", IMAGE_A)).unwrap();
+        let a = registry
+            .admit_module("bundle", native("bundle", IMAGE_A))
+            .unwrap();
         for symbol in ["k_b1s", "k_qkv_b1s", "k_gate_up_b1s"] {
             registry.bind_function(symbol, &a).unwrap();
         }
         // Re-admitting the same digest (reload) returns the same handle.
-        let again = registry.admit_module("bundle", native("bundle", IMAGE_A)).unwrap();
+        let again = registry
+            .admit_module("bundle", native("bundle", IMAGE_A))
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &again));
         for symbol in ["k_b1s", "k_qkv_b1s", "k_gate_up_b1s"] {
             assert!(Arc::ptr_eq(registry.function(symbol).unwrap(), &a));

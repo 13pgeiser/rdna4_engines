@@ -61,10 +61,12 @@ fn peacemaker_manifest_round_trips_unchanged() {
     assert_eq!(manifest.schema_version, 3);
     assert!(manifest.peacemaker.is_some());
 
-    let record: PeacemakerRecord =
-        serde_json::from_value(original["peacemaker"].clone()).unwrap();
+    let record: PeacemakerRecord = serde_json::from_value(original["peacemaker"].clone()).unwrap();
     assert!(record.oracle_receipt.is_some());
-    assert_eq!(serde_json::to_value(&record).unwrap(), original["peacemaker"]);
+    assert_eq!(
+        serde_json::to_value(&record).unwrap(),
+        original["peacemaker"]
+    );
 }
 
 #[test]

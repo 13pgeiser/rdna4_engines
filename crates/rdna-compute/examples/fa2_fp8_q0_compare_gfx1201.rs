@@ -65,7 +65,9 @@ fn main() {
     gpu.hip.memcpy_htod(&q.buf, bytes_of_f32(&q_host)).unwrap();
     gpu.hip.memcpy_htod(&k.buf, bytes_of_f32(&k_host)).unwrap();
     gpu.hip.memcpy_htod(&v.buf, bytes_of_f32(&v_host)).unwrap();
-    gpu.hip.memcpy_htod(&positions.buf, bytes_of_i32(&pos_host)).unwrap();
+    gpu.hip
+        .memcpy_htod(&positions.buf, bytes_of_i32(&pos_host))
+        .unwrap();
 
     let k_cache = gpu.alloc_tensor(&[CAP * ROW], DType::Raw).unwrap();
     let v_cache = gpu.alloc_tensor(&[CAP * ROW], DType::Raw).unwrap();
@@ -90,13 +92,21 @@ fn main() {
     }
     let mut hr = vec![0f32; BATCH * NH * HD];
     let mut hf = vec![0f32; BATCH * NH * HD];
-    gpu.hip.memcpy_dtoh(as_bytes_mut(&mut hr), &out_ref.buf).unwrap();
-    gpu.hip.memcpy_dtoh(as_bytes_mut(&mut hf), &out_fa2.buf).unwrap();
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut hr), &out_ref.buf)
+        .unwrap();
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut hf), &out_fa2.buf)
+        .unwrap();
 
     let n = hr.len();
     let mut max_abs = 0f32;
     let mut sum_abs = 0f64;
-    let mut pairs: Vec<(f32, f32)> = hr.iter().zip(hf.iter()).map(|(&a, &b)| (a, (a - b).abs())).collect();
+    let mut pairs: Vec<(f32, f32)> = hr
+        .iter()
+        .zip(hf.iter())
+        .map(|(&a, &b)| (a, (a - b).abs()))
+        .collect();
     for &(_, d) in &pairs {
         max_abs = max_abs.max(d);
         sum_abs += d as f64;
@@ -114,7 +124,14 @@ fn main() {
     let _ = scale_attn;
     println!("fa2q0-vs-tiledref n={n} batch={BATCH}");
     println!("max_abs={max_abs:.6e} mean_abs={:.6e}", sum_abs / n as f64);
-    println!("tail1pct_mean_abs={:.6e} max_rel(|ref|>1e-3)={max_rel:.6e}", tail_sum / tail_n as f64);
-    let bad = hr.iter().zip(hf.iter()).filter(|(&a, &b)| !a.is_finite() || !b.is_finite()).count();
+    println!(
+        "tail1pct_mean_abs={:.6e} max_rel(|ref|>1e-3)={max_rel:.6e}",
+        tail_sum / tail_n as f64
+    );
+    let bad = hr
+        .iter()
+        .zip(hf.iter())
+        .filter(|(&a, &b)| !a.is_finite() || !b.is_finite())
+        .count();
     println!("nonfinite={bad}");
 }

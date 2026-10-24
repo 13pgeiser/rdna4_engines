@@ -48,9 +48,7 @@ use hipfire_ds4_parent::layer_ref::{
 use hipfire_ds4_parent::moe::{
     parent_route, PARENT_MOE_INTER, PARENT_ROUTE_SCALE, PARENT_SWIGLU_LIMIT,
 };
-use hipfire_ds4_parent::weights::{
-    ParentLayerWeights, ParentLoadPlan, ParentWeights,
-};
+use hipfire_ds4_parent::weights::{ParentLayerWeights, ParentLoadPlan, ParentWeights};
 use hipfire_ds4_parent::{Ds4ParentBackend, ParentQuantConfig};
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -251,11 +249,7 @@ fn run() -> Result<(), String> {
         let residual_hc = download_f32(&gpu, scratch.residual_hc(), rows * PARENT_HC_DIM)?;
         let moe_gpu = download_f32(&gpu, scratch.stream_block(), rows * PARENT_DIM)?;
         let post_gpu = download_f32(&gpu, scratch.post(), rows * PARENT_HC_MULT)?;
-        let comb_gpu = download_f32(
-            &gpu,
-            scratch.comb(),
-            rows * PARENT_HC_MULT * PARENT_HC_MULT,
-        )?;
+        let comb_gpu = download_f32(&gpu, scratch.comb(), rows * PARENT_HC_MULT * PARENT_HC_MULT)?;
         let ffn_y_gpu = download_f32(&gpu, scratch.stream_y(), rows * PARENT_DIM)?;
         let ffn_norm_gpu = download_f32(&gpu, scratch.stream_normed(), rows * PARENT_DIM)?;
 
@@ -278,8 +272,7 @@ fn run() -> Result<(), String> {
             PARENT_HC_SINKHORN_ITERS as usize,
             PARENT_HC_EPS as f64,
         )?;
-        let ffn_norm_ref =
-            rms_norm_ref(&y_ref, &hl.ffn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
+        let ffn_norm_ref = rms_norm_ref(&y_ref, &hl.ffn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
         let moe_x_bf16 = download_bf16_as_f32(&gpu, scratch.moe_x_bf16(), rows * PARENT_DIM)?;
         let gpu_routing = parent_route(
             &mut gpu,
@@ -294,15 +287,7 @@ fn run() -> Result<(), String> {
             weights: gpu_routing.weights,
             indices: gpu_routing.indices,
         };
-        let moe_ref = moe_ref_host(
-            &mut gpu,
-            layer,
-            hl,
-            &moe_x_bf16,
-            &routing,
-            rows,
-            &w_decode,
-        )?;
+        let moe_ref = moe_ref_host(&mut gpu, layer, hl, &moe_x_bf16, &routing, rows, &w_decode)?;
         let out_ffn_ref = hc_post_ref(
             &moe_ref,
             &residual_hc,
@@ -319,12 +304,7 @@ fn run() -> Result<(), String> {
         // Intermediate FFN checks (diagnostic).
         let y_m = metrics(&ffn_y_gpu, &y_ref, rows, PARENT_DIM);
         let post_m = metrics(&post_gpu, &post_ref, rows, PARENT_HC_MULT);
-        let comb_m = metrics(
-            &comb_gpu,
-            &comb_ref,
-            rows,
-            PARENT_HC_MULT * PARENT_HC_MULT,
-        );
+        let comb_m = metrics(&comb_gpu, &comb_ref, rows, PARENT_HC_MULT * PARENT_HC_MULT);
         let norm_m = metrics(&ffn_norm_gpu, &ffn_norm_ref, rows, PARENT_DIM);
         let moe_m = metrics(&moe_gpu, &moe_ref, rows, PARENT_DIM);
         // ── Attn-half residual oracle (GPU residual_hc is post-attn) ─────
@@ -344,8 +324,7 @@ fn run() -> Result<(), String> {
             PARENT_HC_SINKHORN_ITERS as usize,
             PARENT_HC_EPS as f64,
         )?;
-        let attn_norm_f32 =
-            rms_norm_ref(&attn_y, &hl.attn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
+        let attn_norm_f32 = rms_norm_ref(&attn_y, &hl.attn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
         let attn_in_bf16: Vec<f32> = attn_norm_f32.iter().copied().map(round_to_bf16).collect();
         let aw = hl.attn_ref_weights();
         // Sanity: ratio>0 must have compressor; ratio==4 must have indexer.
@@ -374,16 +353,7 @@ fn run() -> Result<(), String> {
 
         // ── Full-layer oracle (BF16 domain on attn + MoE inputs) ─────────
         let out_full = full_layer_ref(
-            &x_host,
-            hl,
-            rows,
-            start_pos,
-            layer_i,
-            ratio,
-            &cfg,
-            input_ids,
-            &mut gpu,
-            layer,
+            &x_host, hl, rows, start_pos, layer_i, ratio, &cfg, input_ids, &mut gpu, layer,
             &w_decode,
         )?;
         let full_metrics = metrics(&out_gpu, &out_full, rows, PARENT_HC_DIM);
@@ -482,10 +452,7 @@ fn run() -> Result<(), String> {
                 rmax,
                 format_row_dist(&rhc_metrics.row_max_abs)
             );
-            println!(
-                "      res_hc buckets: {}",
-                format_buckets(&rhc_buckets)
-            );
+            println!("      res_hc buckets: {}", format_buckets(&rhc_buckets));
         }
         {
             let fmax = ffn_metrics
@@ -504,10 +471,7 @@ fn run() -> Result<(), String> {
                 fmax,
                 format_row_dist(&ffn_metrics.row_max_abs)
             );
-            println!(
-                "      ffn buckets: {}",
-                format_buckets(&ffn_buckets)
-            );
+            println!("      ffn buckets: {}", format_buckets(&ffn_buckets));
         }
         // Stage split when FFN or residual_hc is dirty.
         if ffn_metrics.max_abs > CLEAN_MAX_ABS
@@ -913,14 +877,7 @@ fn moe_ref_host(
     // Shared expert (no route weight).
     let gate = dense_linear_bf16_host(x_f32, &hl.shared_w1, rows, inter, dim)?;
     let up = dense_linear_bf16_host(x_f32, &hl.shared_w3, rows, inter, dim)?;
-    let hid = expert_swiglu_ref(
-        &gate,
-        &up,
-        rows,
-        inter,
-        PARENT_SWIGLU_LIMIT as f64,
-        None,
-    );
+    let hid = expert_swiglu_ref(&gate, &up, rows, inter, PARENT_SWIGLU_LIMIT as f64, None);
     let shared = dense_linear_bf16_host(&hid, &hl.shared_w2, rows, dim, inter)?;
     for i in 0..rows * dim {
         y[i] += shared[i];
@@ -980,12 +937,12 @@ fn route_ref(
     let topk = cfg.num_experts_per_tok;
     let is_hash = layer_idx < cfg.num_hash_layers;
     if is_hash {
-        let ids = input_ids.ok_or_else(|| {
-            format!("deepseek4 parent: hash layer {layer_idx} needs input_ids")
-        })?;
-        let tid2eid = hl.tid2eid.as_ref().ok_or_else(|| {
-            format!("deepseek4 parent: hash layer {layer_idx} missing tid2eid")
-        })?;
+        let ids = input_ids
+            .ok_or_else(|| format!("deepseek4 parent: hash layer {layer_idx} needs input_ids"))?;
+        let tid2eid = hl
+            .tid2eid
+            .as_ref()
+            .ok_or_else(|| format!("deepseek4 parent: hash layer {layer_idx} missing tid2eid"))?;
         // Indices from hash table; weights from uncorrected scores (same as parent_route).
         let hash = gate_hash_ref(ids, tid2eid, n_experts, topk)?;
         // Score path for weights: gate_ref gives score-topk; we need gather-by-hash-idx.
@@ -1003,7 +960,7 @@ fn route_ref(
             true,
         )?;
         let _ = full; // scores path below
-        // Direct score gather matching parent_route / hash_route_weights.
+                      // Direct score gather matching parent_route / hash_route_weights.
         let mut scores = vec![0.0f32; rows * n_experts];
         for r in 0..rows {
             let xr = &x[r * dim..(r + 1) * dim];
@@ -1033,8 +990,7 @@ fn route_ref(
             }
             if sum > 0.0 {
                 for t in 0..topk {
-                    weights[r * topk + t] =
-                        weights[r * topk + t] / sum * PARENT_ROUTE_SCALE;
+                    weights[r * topk + t] = weights[r * topk + t] / sum * PARENT_ROUTE_SCALE;
                 }
             }
         }
@@ -1131,23 +1087,23 @@ impl HostLayerWeights {
         };
 
         // Main compressor (ratio > 0).
-        let (comp_wkv, comp_wgate, comp_norm, comp_ape) =
-            if let Some(c) = layer.compressor.as_ref() {
-                let proj = c.wkv.shape.get(0).copied().unwrap_or(0);
-                let dim_k = c.wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
-                (
-                    Some(download_bf16_as_f32(gpu, &c.wkv, proj * dim_k)?),
-                    Some(download_bf16_as_f32(gpu, &c.wgate, proj * dim_k)?),
-                    Some(download_bf16_as_f32(gpu, &c.norm, PARENT_HEAD_DIM)?),
-                    Some(download_f32(
-                        gpu,
-                        &c.ape,
-                        c.ape.shape.iter().product::<usize>().max(1),
-                    )?),
-                )
-            } else {
-                (None, None, None, None)
-            };
+        let (comp_wkv, comp_wgate, comp_norm, comp_ape) = if let Some(c) = layer.compressor.as_ref()
+        {
+            let proj = c.wkv.shape.get(0).copied().unwrap_or(0);
+            let dim_k = c.wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+            (
+                Some(download_bf16_as_f32(gpu, &c.wkv, proj * dim_k)?),
+                Some(download_bf16_as_f32(gpu, &c.wgate, proj * dim_k)?),
+                Some(download_bf16_as_f32(gpu, &c.norm, PARENT_HEAD_DIM)?),
+                Some(download_f32(
+                    gpu,
+                    &c.ape,
+                    c.ape.shape.iter().product::<usize>().max(1),
+                )?),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         // Indexer (ratio == 4).
         let (ix_wq_b, ix_weights_proj, ix_comp_wkv, ix_comp_wgate, ix_comp_norm, ix_comp_ape) =
@@ -1157,12 +1113,21 @@ impl HostLayerWeights {
                 let wp_k = ix.weights_proj.shape.get(1).copied().unwrap_or(PARENT_DIM);
                 let wp = download_bf16_as_f32(gpu, &ix.weights_proj, wp_n * wp_k)?;
                 let cproj = ix.compressor_wkv.shape.get(0).copied().unwrap_or(0);
-                let cdim = ix.compressor_wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+                let cdim = ix
+                    .compressor_wkv
+                    .shape
+                    .get(1)
+                    .copied()
+                    .unwrap_or(PARENT_DIM);
                 (
                     Some(wq),
                     Some(wp),
                     Some(download_bf16_as_f32(gpu, &ix.compressor_wkv, cproj * cdim)?),
-                    Some(download_bf16_as_f32(gpu, &ix.compressor_wgate, cproj * cdim)?),
+                    Some(download_bf16_as_f32(
+                        gpu,
+                        &ix.compressor_wgate,
+                        cproj * cdim,
+                    )?),
                     // index head_dim = 128
                     Some(download_bf16_as_f32(gpu, &ix.compressor_norm, 128)?),
                     Some(download_f32(
@@ -1202,28 +1167,12 @@ impl HostLayerWeights {
             hc_ffn_fn: download_f32(gpu, &layer.hc_ffn_fn, mix_hc * hc_flat)?,
             hc_ffn_base: download_f32(gpu, &layer.hc_ffn_base, mix_hc)?,
             hc_ffn_scale: download_f32(gpu, &layer.hc_ffn_scale, 3)?,
-            gate_weight: download_bf16_as_f32(
-                gpu,
-                &layer.gate_weight,
-                cfg.n_routed_experts * dim,
-            )?,
+            gate_weight: download_bf16_as_f32(gpu, &layer.gate_weight, cfg.n_routed_experts * dim)?,
             gate_bias,
             tid2eid,
-            shared_w1: download_bf16_as_f32(
-                gpu,
-                layer.shared_w1.tensor(),
-                inter * dim,
-            )?,
-            shared_w2: download_bf16_as_f32(
-                gpu,
-                layer.shared_w2.tensor(),
-                dim * inter,
-            )?,
-            shared_w3: download_bf16_as_f32(
-                gpu,
-                layer.shared_w3.tensor(),
-                inter * dim,
-            )?,
+            shared_w1: download_bf16_as_f32(gpu, layer.shared_w1.tensor(), inter * dim)?,
+            shared_w2: download_bf16_as_f32(gpu, layer.shared_w2.tensor(), dim * inter)?,
+            shared_w3: download_bf16_as_f32(gpu, layer.shared_w3.tensor(), inter * dim)?,
         })
     }
 
@@ -1251,16 +1200,14 @@ impl HostLayerWeights {
             self.ix_comp_norm.as_deref(),
             self.ix_comp_ape.as_deref(),
         ) {
-            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => {
-                Some(AttnIndexerRefWeights {
-                    wq_b: a,
-                    weights_proj: b,
-                    compressor_wkv: c,
-                    compressor_wgate: d,
-                    compressor_norm: e,
-                    compressor_ape: f,
-                })
-            }
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some(AttnIndexerRefWeights {
+                wq_b: a,
+                weights_proj: b,
+                compressor_wkv: c,
+                compressor_wgate: d,
+                compressor_norm: e,
+                compressor_ape: f,
+            }),
             _ => None,
         };
         AttnSwARefWeights {
@@ -1277,7 +1224,6 @@ impl HostLayerWeights {
         }
     }
 }
-
 
 // ── Metrics / buckets ───────────────────────────────────────────────────────
 
@@ -1502,8 +1448,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
         ));
     }
     let mut data = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: f32 download: {e:?}"))?;
@@ -1561,12 +1506,8 @@ fn zeros_f32(gpu: &mut Gpu, shape: &[usize]) -> Result<GpuTensor, String> {
 }
 
 fn read_token_ids(path: &Path) -> Result<Vec<u32>, String> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        format!(
-            "deepseek4 parent: read token-ids {}: {e}",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("deepseek4 parent: read token-ids {}: {e}", path.display()))?;
     if bytes.len() % 4 != 0 {
         return Err(format!(
             "deepseek4 parent: token-ids {} size {} not multiple of 4",
@@ -1601,10 +1542,7 @@ fn parse_args() -> Result<Args, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--model" => {
-                model = args
-                    .get(i + 1)
-                    .ok_or("--model needs a value")?
-                    .clone();
+                model = args.get(i + 1).ok_or("--model needs a value")?.clone();
                 i += 2;
             }
             "--token-ids" => {

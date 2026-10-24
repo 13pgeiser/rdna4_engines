@@ -109,7 +109,8 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_4w_k2(
     const int*                __restrict__ sorted_slot_index,  // [m_total]
     const _Float16*           __restrict__ X_src,              // [n_rows x K]
     float*                    __restrict__ Y_grouped,          // [m_total x M]
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
 ) {
     const int block_m    = blockIdx.x * M_TILE;
     const int tile_y     = blockIdx.y;
@@ -118,7 +119,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_4w_k2(
 
     // Sentinel early-return: expert_tile_ids[tile_y] == -1 marks padding tiles.
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
 
     // BLOCK-UNIFORM tag (all 128 threads share one expert) -> no divergence.
     const unsigned char tag = dtype_tags[expert_id];

@@ -47,7 +47,6 @@ const LAYER0_P_KV_REF: f32 = 0.233705;
 const LAYER0_P_SINK_REF: f32 = 0.766295;
 const LAYER0_P_TOL: f32 = 1e-4;
 
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -188,7 +187,6 @@ fn run() -> Result<(), String> {
         fwd_bytes_before as f64 / (1024.0 * 1024.0)
     );
 
-
     for &(layer_idx, expect_ratio) in LAYERS {
         let local = layer_idx - weights.layer_range.start;
         let layer = &weights.layers[local];
@@ -199,9 +197,7 @@ fn run() -> Result<(), String> {
             ));
         }
         println!();
-        println!(
-            "── layer {layer_idx}  compress_ratio={expect_ratio} ──────────────────────"
-        );
+        println!("── layer {layer_idx}  compress_ratio={expect_ratio} ──────────────────────");
 
         let kv_ring = zeros_f32(
             &mut gpu,
@@ -237,9 +233,7 @@ fn run() -> Result<(), String> {
             attn_scratch.attn_out_f32_ref()?,
             ROWS * PARENT_Q_WIDTH,
         )?;
-        println!(
-            "  attn-only: finite={finite}  out_L2={out_norm:.6}  wall={attn_ms:.2} ms"
-        );
+        println!("  attn-only: finite={finite}  out_L2={out_norm:.6}  wall={attn_ms:.2} ms");
         println!(
             "  stage: q_post_rope={:.6}  kv_post_quant={:.6}  attn_pre_wo_a={:.6}",
             l2_norm(&q_host),
@@ -370,7 +364,6 @@ fn run() -> Result<(), String> {
                     "deepseek4 parent: layer {layer_idx} pos15 joint probs sum {p15}"
                 ));
             }
-
         } else {
             // ratio 128 at rows=16: no compress event yet (16/128=0).
             let n_active = download_i32(&gpu, attn_scratch.n_active_topk_ref(), ROWS)?;
@@ -462,8 +455,6 @@ fn run() -> Result<(), String> {
         }
     }
 
-
-
     let bytes_after = fwd_scratch.bytes();
     println!();
     println!(
@@ -544,11 +535,7 @@ fn joint_prob_sum_row_head0(
 ) -> Result<f32, String> {
     let inv_scale = 1.0f32 / (PARENT_HEAD_DIM as f32).sqrt();
     // Download full staged buffers (small: 16*512*128 and 16*512*512).
-    let swa_all = download_f32(
-        gpu,
-        swa_staged,
-        ROWS * PARENT_HEAD_DIM * PARENT_SWA_WINDOW,
-    )?;
+    let swa_all = download_f32(gpu, swa_staged, ROWS * PARENT_HEAD_DIM * PARENT_SWA_WINDOW)?;
     let topk_all = download_f32(
         gpu,
         topk_staged,
@@ -562,8 +549,8 @@ fn joint_prob_sum_row_head0(
         let mut dot = 0.0f64;
         for d in 0..PARENT_HEAD_DIM {
             // layout: [row, d, col] with col stride = window
-            dot += q_host[q_base + d] as f64
-                * swa_all[swa_base + d * PARENT_SWA_WINDOW + col] as f64;
+            dot +=
+                q_host[q_base + d] as f64 * swa_all[swa_base + d * PARENT_SWA_WINDOW + col] as f64;
         }
         scores.push((dot as f32) * inv_scale);
     }
@@ -592,7 +579,6 @@ fn joint_prob_sum_row_head0(
     }
     Ok(sum_p)
 }
-
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> Result<GpuTensor, String> {
     gpu.upload_f32(data, shape)
@@ -683,4 +669,3 @@ fn download_bf16_as_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f
     }
     Ok(out)
 }
-

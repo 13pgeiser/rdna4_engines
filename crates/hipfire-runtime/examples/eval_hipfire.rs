@@ -17,19 +17,62 @@
 //!                [--variant <name>=auto-from-model-path] \
 //!                [--arch <name>=auto-from-gpu] \
 //!                [--kv-mode <mode>=asym3] \
-//!                [--scoring-mode <per-token|prefill>=per-token]
+//!                [--scoring-mode <per-token|prefill|prefill-whole|prefill-prompt>=prefill]
 //!
-//! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5):
+//! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5), with
+//! the kernel admission each one runs (qwen35). Hidden rows are captured
+//! either through `forward_prefill_batch`'s verify capture
+//! (`per_token_hidden_out`), which selects the speculative-verify kernels
+//! (`DispatchWorkload::SpeculativeVerify`; the GDN chunk scan is never
+//! admitted — the sequential GDN recurrence runs), or through
+//! `forward_prefill_batch_capture_hidden`, which is a plain prompt prefill
+//! plus output rows (`DispatchWorkload::Standard`, GDN chunk scan admitted
+//! wherever a plain prefill admits it):
 //!   prefill:   (default, canonical since 2026-05-11) forward_prefill_batch
 //!              (transformer stack batched, lm_head fan-out per scored
 //!              position). ~7× wall-clock vs per-token on gfx1100/gfx1151
 //!              9B Q3/Q4. Requires the model's LA dtype to be in
 //!              `is_batchable_la`'s OK set; auto-falls-back to per-token
 //!              inside `forward_prefill_batch` otherwise (e.g., MQ4-Lloyd,
-//!              HFP4G32, MFP4G32 — no batched kernel yet).
-//!   per-token: forward_scratch in a per-position loop. Historical baseline,
+//!              HFP4G32, MFP4G32 — no batched kernel yet). Split in two
+//!              calls (prefix, then the scored region): the prefix call
+//!              captures nothing and has plain prompt-prefill admission
+//!              (`DispatchWorkload::Standard`, GDN chunk scan admissible);
+//!              the scored-region call captures hidden rows through the
+//!              verify capture, so it runs the speculative-verify kernels
+//!              (`DispatchWorkload::SpeculativeVerify`, no GDN chunk scan).
+//!   per-token: forward_scratch in a per-position loop (single-token decode
+//!              kernels; no batched prefill admission, no GDN chunk scan,
+//!              no verify workload). Historical baseline,
 //!              retained for direct comparison against the 2026-05-08 kldseqs
 //!              under `results/2026-05-08/per-seq/*__per-token.kldseq`.
+//!   prefill-whole: (opt-in, qwen35 only) the whole window — prefix, scored
+//!              region and the final unscored token — as ONE
+//!              forward_prefill_batch call, scoring the same reference
+//!              positions from the captured rows (`n_ctx/2..`). An n_ctx-512
+//!              window becomes one 512-row prefill, so routes that gate on the
+//!              chunk's row count see what a real prompt prefill sees; the
+//!              split `prefill` mode runs 256 + 255 rows. The whole-window
+//!              plan is `eval_common::whole_window_plan` (unit-tested). The
+//!              existing modes' forward calls are unchanged (partly
+//!              source-pinned) and their scoring math/output is preserved by
+//!              extraction into `eval_common::kld_from_block`, `seq_stats`,
+//!              `write_hfkseq` (fixed-fixture golden: `cargo test -p
+//!              hipfire-runtime --lib eval_common`). Results
+//!              are NOT comparable with split-`prefill` kldseqs: KV/state
+//!              commit cadence differs, so compare like with like.
+//!              Its hidden rows are captured through `forward_prefill_batch`'s
+//!              verify capture, which selects the speculative-verify kernels
+//!              (`DispatchWorkload::SpeculativeVerify`, e.g. the sequential
+//!              GDN recurrence, never the chunk scan).
+//!   prefill-prompt: (opt-in, qwen35 only) the same whole-window plan as
+//!              `prefill-whole`, but captured through
+//!              `forward_prefill_batch_capture_hidden`, whose chunk planning,
+//!              admission (GDN chunk scan included) and dispatch workload
+//!              (`DispatchWorkload::Standard`) are exactly a plain prompt
+//!              prefill's. This is the mode that measures the production
+//!              prompt route; not comparable with `prefill-whole` kldseqs
+//!              where a route is capture-gated.
 //!
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
@@ -55,7 +98,7 @@ fn main() {
     use hipfire_runtime::llama::{KvCache, VMode};
     use rdna_compute::DType;
     use std::fs::File;
-    use std::io::{BufReader, BufWriter, Read, Write};
+    use std::io::{BufReader, BufWriter, Read};
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -69,6 +112,21 @@ fn main() {
         scoring_mode: String,
         max_chunks: Option<usize>,
     }
+    // Every mode's kernel admission, shared by the --scoring-mode error and
+    // --help text (kept in sync with the module docs above).
+    const SCORING_MODE_HELP: &str = "\
+  scoring modes (qwen35 admission; prefill-whole / prefill-prompt are qwen35 only):
+    prefill         (default) two forward_prefill_batch calls: the prefix call is a plain
+                    prompt prefill (Standard workload, GDN chunk scan admissible); the
+                    scored-region call captures hidden rows through the verify capture
+                    (SpeculativeVerify kernels, no GDN chunk scan)
+    per-token       forward_scratch per position: single-token decode kernels, no batched
+                    prefill admission or GDN chunk scan
+    prefill-whole   whole window in ONE forward_prefill_batch call with verify capture
+                    (SpeculativeVerify kernels, no GDN chunk scan)
+    prefill-prompt  whole window in ONE forward_prefill_batch_capture_hidden call: plain
+                    production prompt-prefill admission (Standard workload, GDN chunk
+                    scan admitted where a plain prefill admits it)";
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut ref_path: Option<PathBuf> = None;
@@ -124,8 +182,13 @@ fn main() {
             }
             "--scoring-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "per-token" | "prefill") {
-                    eprintln!("--scoring-mode must be one of: per-token prefill (got {v})");
+                if !matches!(
+                    v.as_str(),
+                    "per-token" | "prefill" | "prefill-whole" | "prefill-prompt"
+                ) {
+                    eprintln!(
+                        "--scoring-mode must be one of: per-token prefill prefill-whole prefill-prompt (got {v})\n{SCORING_MODE_HELP}"
+                    );
                     std::process::exit(1);
                 }
                 scoring_mode = v;
@@ -136,7 +199,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill] [--max-chunks N]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N]\n{SCORING_MODE_HELP}");
                 std::process::exit(0);
             }
             other => {
@@ -184,6 +247,12 @@ fn main() {
         // Qwen35Scratch's HIPFIRE_PREFILL_REUSE_PBS hook so the 1175 chunk
         // calls don't each pay 25-tensor alloc/free overhead. (Plan §M1.)
         if args.scoring_mode == "prefill" {
+            std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
+        }
+        if args.scoring_mode == "prefill-whole" {
+            std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
+        }
+        if args.scoring_mode == "prefill-prompt" {
             std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
         }
     }
@@ -239,86 +308,11 @@ fn main() {
     }
 
     // -------- shared KLD helper (arch-independent) --------
-    // Factor so each arch only supplies logits per scored position and the
-    // comparison/reporting stays shared. Do NOT duplicate this math per arch;
-    // a divergent copy would silently make two models' numbers incomparable.
-    // Mirrors eval_hipfire's original score_position closure verbatim.
-    fn kld_from_block(
-        logits: &[f32],
-        block_buf: &[u8],
-        top_k: usize,
-        actual_next: usize,
-    ) -> (f64, Option<f64>) {
-        // parse block: [top_k u32 idx][top_k f32 logp][f32 sum_p_residual][f32 pad]
-        let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
-        let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
-        for j in 0..top_k {
-            top_indices.push(u32::from_le_bytes(
-                block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
-            ));
-        }
-        let lp_off = top_k * 4;
-        for j in 0..top_k {
-            top_log_probs.push(f32::from_le_bytes(
-                block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            ));
-        }
-        let resid_off = top_k * 8;
-        let sum_p_residual =
-            f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
-
-        // Candidate's log-Z = log Σ exp(logit_i) — fp64 throughout.
-        let mut max_logit = f32::NEG_INFINITY;
-        for &v in logits.iter() {
-            if v > max_logit {
-                max_logit = v;
-            }
-        }
-        let mut sum_exp = 0.0f64;
-        for &v in logits.iter() {
-            sum_exp += ((v - max_logit) as f64).exp();
-        }
-        let log_z = (max_logit as f64) + sum_exp.ln();
-
-        // KLD = Σ_{i in top_K_P_ref} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
-        //     + residual cross-term  (sum_p_residual_ref * Δlog_residual)
-        let mut kld_token = 0.0f64;
-        let mut sum_p_cand_at_ref_top = 0.0f64;
-        for j in 0..top_k {
-            let ref_idx = top_indices[j] as usize;
-            if ref_idx >= logits.len() {
-                continue;
-            }
-            let log_p_ref = top_log_probs[j] as f64;
-            let log_p_cand = (logits[ref_idx] as f64) - log_z;
-            let p_ref = log_p_ref.exp();
-            let p_cand = log_p_cand.exp();
-            kld_token += p_ref * (log_p_ref - log_p_cand);
-            sum_p_cand_at_ref_top += p_cand;
-        }
-        let sum_p_residual_ref = sum_p_residual as f64;
-        let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
-        if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-            kld_token += sum_p_residual_ref * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
-        }
-        // KLD ≥ 0 by Gibbs' inequality. Tiny negatives are fp64 roundoff on
-        // ~257-term sums; >1e-9 magnitudes indicate a math bug. debug_assert
-        // surfaces the latter in dev builds; release runs clamp at 0.
-        debug_assert!(
-            kld_token >= -1e-9,
-            "negative KLD beyond fp roundoff: {kld_token}"
-        );
-        let kld_token = kld_token.max(0.0);
-
-        let nll = if actual_next < logits.len() {
-            Some(-((logits[actual_next] as f64) - log_z))
-        } else {
-            None
-        };
-        (kld_token, nll)
-    }
+    // `eval_common::kld_from_block` (extracted from here; executed by
+    // eval_common's legacy-output golden test). Do NOT duplicate this math per
+    // arch; a divergent copy would silently make two models' numbers
+    // incomparable.
+    use hipfire_runtime::eval_common::kld_from_block;
 
     // -------- helper to read ref header (shared) --------
     // Open once; after header the file cursor sits at the token stream.
@@ -347,8 +341,25 @@ fn main() {
     // Quality-only: execute the final, unscored token so the scored-region
     // forward is tile-aligned; score only the original reference positions.
     let pad_scoring_tail = std::env::var("HIPFIRE_FP8_G3_PAD_TAIL").as_deref() == Ok("1");
+    // `prefill-whole` (additive; the existing modes above and below are
+    // untouched): the whole window (prefix + scored region + the final token)
+    // as ONE prefill call, so an n_ctx-512 reference runs 512-row prefills and
+    // row-count-gated prefill routes see the full window. It always pads the
+    // final token and scores the same reference positions
+    // (`eval_common::whole_window_plan`).
+    let whole_window =
+        args.scoring_mode == "prefill-whole" || args.scoring_mode == "prefill-prompt";
+    let prompt_capture = args.scoring_mode == "prefill-prompt";
+    let pad_scoring_tail =
+        hipfire_runtime::eval_common::scoring_tail_padded(whole_window, pad_scoring_tail);
     if pad_scoring_tail {
         eprintln!("eval_hipfire: quality-only final-token padding; scored positions unchanged");
+    }
+    if whole_window && !is_qwen35 {
+        eprintln!(
+            "eval_hipfire: --scoring-mode prefill-whole / prefill-prompt is implemented for qwen35 only"
+        );
+        std::process::exit(1);
     }
     let effective_n_chunk = match args.max_chunks {
         Some(m) => m.min(n_chunk),
@@ -449,10 +460,12 @@ fn main() {
             .unwrap(),
             "fp8" => {
                 // Stage-b Q0: native fp8 KV (E4M3FN + f16 scale per
-                // token/head, 1032 B rows at Hkv4/D256). Admission is exact
-                // and fails before allocation: gfx1201 only, dense Qwen
-                // H24/Hkv4/D256, neutral V (`--kv-v q8` spelling identifies
-                // fp8/fp8); never falls through to a q8 reader.
+                // token/head). Admission is the shared mode-specific guard
+                // before allocation: neutral V (`--kv-v q8` spelling
+                // identifies fp8/fp8) plus qwen35_native_refusal for Fp8
+                // (exact gfx1201, single GPU, no adaptive/CASK; H24/KV4/D256
+                // dense or H16/KV2/D256 MoE); never falls through to a q8
+                // reader.
                 if args.kv_v != "q8" {
                     eprintln!(
                         "eval_hipfire: --kv-mode fp8 requires --kv-v q8 (neutral V spelling); got --kv-v {}",
@@ -460,25 +473,17 @@ fn main() {
                     );
                     std::process::exit(1);
                 }
-                if config.num_experts != 0 {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode fp8 admitted only for dense Qwen (num_experts={})",
-                        config.num_experts
-                    );
-                    std::process::exit(1);
-                }
-                if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode fp8 admitted only for H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
-                        config.n_heads, config.n_kv_heads, config.head_dim
-                    );
-                    std::process::exit(1);
-                }
-                if gpu.arch != "gfx1201" {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode fp8 admitted only on gfx1201 (got {})",
-                        gpu.arch
-                    );
+                if let Some(reason) = hipfire_runtime::kv_mode::qwen35_native_refusal(
+                    hipfire_runtime::kv_mode::KvMode::Fp8,
+                    gpu.arch.as_str(),
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    1,
+                    false,
+                    false,
+                ) {
+                    eprintln!("eval_hipfire: --kv-mode fp8 refused: {reason}");
                     std::process::exit(1);
                 }
                 eprintln!("eval_hipfire: fp8/fp8 native KV (E4M3FN + f16/token/head)");
@@ -493,9 +498,11 @@ fn main() {
             }
             "bf16" => {
                 // Quality control: unscaled bf16 K/V (stride D*2 per head,
-                // no scales). Same exact admission as fp8 (gfx1201, dense
-                // Qwen H24/Hkv4/D256, neutral V); never falls through to a
-                // q8 reader. Expected to read ≈ the f32 reference.
+                // no scales). Admission is the shared mode-specific guard
+                // before allocation: neutral V, dense only, plus
+                // qwen35_native_refusal for Bf16 (exact gfx1201, single GPU,
+                // no adaptive/CASK, dense H24/Hkv4/D256); never falls through
+                // to a q8 reader. Expected to read ≈ the f32 reference.
                 if args.kv_v != "q8" {
                     eprintln!(
                         "eval_hipfire: --kv-mode bf16 requires --kv-v q8 (neutral V spelling); got --kv-v {}",
@@ -510,18 +517,17 @@ fn main() {
                     );
                     std::process::exit(1);
                 }
-                if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode bf16 admitted only for H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
-                        config.n_heads, config.n_kv_heads, config.head_dim
-                    );
-                    std::process::exit(1);
-                }
-                if gpu.arch != "gfx1201" {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode bf16 admitted only on gfx1201 (got {})",
-                        gpu.arch
-                    );
+                if let Some(reason) = hipfire_runtime::kv_mode::qwen35_native_refusal(
+                    hipfire_runtime::kv_mode::KvMode::Bf16,
+                    gpu.arch.as_str(),
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    1,
+                    false,
+                    false,
+                ) {
+                    eprintln!("eval_hipfire: --kv-mode bf16 refused: {reason}");
                     std::process::exit(1);
                 }
                 eprintln!("eval_hipfire: bf16/bf16 unscaled KV (quality control)");
@@ -605,6 +611,9 @@ fn main() {
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
         let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
 
+        // prefill-whole (additive): one captured call over the whole window.
+        let whole_plan =
+            whole_window.then(|| hipfire_runtime::eval_common::whole_window_plan(n_ctx));
         let hidden_buf = if args.scoring_mode == "prefill" {
             Some(
                 gpu.alloc_tensor(
@@ -612,6 +621,11 @@ fn main() {
                     DType::F32,
                 )
                 .expect("alloc hidden_buf"),
+            )
+        } else if let Some(plan) = whole_plan.as_ref() {
+            Some(
+                gpu.alloc_tensor(&[plan.hidden_rows, config.dim], DType::F32)
+                    .expect("alloc hidden_buf"),
             )
         } else {
             None
@@ -671,36 +685,82 @@ fn main() {
                 // forward_prefill_batch calls (prefix + scored region), then
                 // weight_gemv per scored position on the captured hidden states.
                 let h_buf = hidden_buf.as_ref().expect("hidden_buf in prefill mode");
-                qwen35::forward_prefill_batch(
-                    &mut gpu,
-                    &weights,
-                    &config,
-                    &chunk_tokens[0..scoring_start],
-                    0,
-                    &mut kv_cache,
-                    &mut dn_state,
-                    &scratch,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .expect("forward_prefill_batch prefix");
-                qwen35::forward_prefill_batch(
-                    &mut gpu,
-                    &weights,
-                    &config,
-                    &chunk_tokens[scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail))],
-                    scoring_start,
-                    &mut kv_cache,
-                    &mut dn_state,
-                    &scratch,
-                    None,
-                    Some(h_buf),
-                    None,
-                    None,
-                )
-                .expect("forward_prefill_batch scored");
+                let whole_scored;
+                let h_buf = if let Some(plan) = whole_plan.as_ref() {
+                    // prefill-whole / prefill-prompt: prefix, scored region and
+                    // the final token in one call; score rows
+                    // `first_scored_row..` (the same reference positions as the
+                    // split mode). prefill-prompt captures through the plain
+                    // prompt-prefill entry (production route); prefill-whole
+                    // keeps the verify capture.
+                    if prompt_capture {
+                        qwen35::forward_prefill_batch_capture_hidden(
+                            &mut gpu,
+                            &weights,
+                            &config,
+                            &chunk_tokens[plan.rows.clone()],
+                            0,
+                            &mut kv_cache,
+                            &mut dn_state,
+                            &scratch,
+                            h_buf,
+                        )
+                        .expect("forward_prefill_batch_capture_hidden whole window");
+                    } else {
+                        qwen35::forward_prefill_batch(
+                            &mut gpu,
+                            &weights,
+                            &config,
+                            &chunk_tokens[plan.rows.clone()],
+                            0,
+                            &mut kv_cache,
+                            &mut dn_state,
+                            &scratch,
+                            None,
+                            Some(h_buf),
+                            None,
+                            None,
+                        )
+                        .expect("forward_prefill_batch whole window");
+                    }
+                    whole_scored = h_buf.sub_offset(
+                        plan.first_scored_row * config.dim,
+                        plan.scored_rows * config.dim,
+                    );
+                    &whole_scored
+                } else {
+                    qwen35::forward_prefill_batch(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &chunk_tokens[0..scoring_start],
+                        0,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("forward_prefill_batch prefix");
+                    qwen35::forward_prefill_batch(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &chunk_tokens[scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail))],
+                        scoring_start,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                        None,
+                        Some(h_buf),
+                        None,
+                        None,
+                    )
+                    .expect("forward_prefill_batch scored");
+                    h_buf
+                };
 
                 let f16_lmhead = weights.output.gpu_dtype == DType::F16;
                 let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
@@ -769,22 +829,13 @@ fn main() {
                 }
             }
 
-            if chunk_klds.is_empty() {
-                mean_kld_per_seq.push(0.0);
-                p99_kld_per_seq.push(0.0);
-                mean_nll_per_seq.push(f64::NAN);
-                continue;
-            }
-            let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
-            let mut sorted = chunk_klds.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
-            let p99 = sorted[p99_idx];
-            let mean_nll = if chunk_nll_count > 0 {
-                chunk_nll_sum / chunk_nll_count as f64
-            } else {
-                f64::NAN
-            };
+            // Per-sequence (mean, p99, mean NLL): `eval_common::seq_stats`
+            // (extracted from here; executed by the golden test).
+            let (mean, p99, mean_nll) = hipfire_runtime::eval_common::seq_stats(
+                &chunk_klds,
+                chunk_nll_sum,
+                chunk_nll_count,
+            );
             mean_kld_per_seq.push(mean);
             p99_kld_per_seq.push(p99);
             mean_nll_per_seq.push(mean_nll);
@@ -989,7 +1040,10 @@ fn main() {
             Gemma4State::new_with_max_seq(&mut gpu, &cfg, kv_max).expect("gemma4 state");
 
         for c in 0..effective_n_chunk {
-            state.kv_sliding.clear_gpu(&mut gpu).expect("kv sliding clear");
+            state
+                .kv_sliding
+                .clear_gpu(&mut gpu)
+                .expect("kv sliding clear");
             state.kv_full.clear_gpu(&mut gpu).expect("kv full clear");
             let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
             let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
@@ -1497,21 +1551,14 @@ fn main() {
     }
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
-    out.write_all(b"HFKSEQ\0\0").unwrap();
-    out.write_all(&2u32.to_le_bytes()).unwrap();
-    out.write_all(&(effective_n_chunk as u32).to_le_bytes())
-        .unwrap();
-    out.write_all(&0u32.to_le_bytes()).unwrap();
-    for ((m, p), n) in mean_kld_per_seq
-        .iter()
-        .zip(p99_kld_per_seq.iter())
-        .zip(mean_nll_per_seq.iter())
-    {
-        out.write_all(&m.to_le_bytes()).unwrap();
-        out.write_all(&p.to_le_bytes()).unwrap();
-        out.write_all(&n.to_le_bytes()).unwrap();
-    }
-    out.flush().unwrap();
+    hipfire_runtime::eval_common::write_hfkseq(
+        &mut out,
+        effective_n_chunk,
+        &mean_kld_per_seq,
+        &p99_kld_per_seq,
+        &mean_nll_per_seq,
+    )
+    .unwrap();
 
     let overall_mean: f64 =
         mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;

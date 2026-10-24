@@ -16,7 +16,8 @@ const SYMBOL: &str = "fused_qkvza_mq4g256v2";
 
 fn m7(text: &str, tag: &str) -> Result<serde_json::Value, String> {
     let elf = peacemaker_isa::native::assemble(text, Arch::Gfx1201)?;
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("load-fifo-{tag}-{}", std::process::id()));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("load-fifo-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{SYMBOL}.co"));
     std::fs::write(&path, &elf).map_err(|e| e.to_string())?;

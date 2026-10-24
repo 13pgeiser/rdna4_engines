@@ -84,13 +84,20 @@ pub enum RewriteError {
     #[error("lift: {0}")]
     Lift(#[from] LiftError),
     #[error("step {step}: {error}")]
-    Edit { step: usize, #[source] error: EditError },
+    Edit {
+        step: usize,
+        #[source]
+        error: EditError,
+    },
     #[error("analysis: {0}")]
     Analysis(EditError),
     #[error(transparent)]
     Emit(#[from] emit::EmitError),
     #[error("claim {claim:?} is not admissible: {reason}")]
-    Claim { claim: EquivalenceKind, reason: String },
+    Claim {
+        claim: EquivalenceKind,
+        reason: String,
+    },
     #[error("anchor: {0}")]
     Anchor(String),
     #[error("build: {0}")]
@@ -100,10 +107,16 @@ pub enum RewriteError {
 }
 
 fn kernel<'a>(program: &'a Program, symbol: &SymbolId) -> &'a Kernel {
-    program.kernels.iter().find(|k| &k.symbol == symbol).expect("kernel present")
+    program
+        .kernels
+        .iter()
+        .find(|k| &k.symbol == symbol)
+        .expect("kernel present")
 }
 
-fn key(o: &Obligation) -> (String, Vec<InstId>) { (o.rule_id.clone(), o.insts.clone()) }
+fn key(o: &Obligation) -> (String, Vec<InstId>) {
+    (o.rule_id.clone(), o.insts.clone())
+}
 
 /// Apply `rewrite` to the lifted `base` object (see the module docs).
 pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certified, RewriteError> {
@@ -111,13 +124,20 @@ pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certifie
     let base_sha = sha256(base);
     let before = analyze(lifted.program, &rewrite.kernel).map_err(RewriteError::Analysis)?;
     let base_kernel = kernel(&before.program, &rewrite.kernel).clone();
-    let base_obligations: BTreeSet<(String, Vec<InstId>)> = before.obligations.iter().map(key).collect();
+    let base_obligations: BTreeSet<(String, Vec<InstId>)> =
+        before.obligations.iter().map(key).collect();
     let mut current = before;
     let mut symbol = rewrite.kernel.clone();
     let (mut claims, mut delay_rewrites, mut reencoded) = (Vec::new(), Vec::new(), BTreeSet::new());
     for (step, edit) in rewrite.script.iter().enumerate() {
-        let (next, delta) = current.edit(&symbol, edit.clone()).map_err(|error| RewriteError::Edit { step, error })?;
-        for claim in delta.claims { if !claims.contains(&claim) { claims.push(claim); } }
+        let (next, delta) = current
+            .edit(&symbol, edit.clone())
+            .map_err(|error| RewriteError::Edit { step, error })?;
+        for claim in delta.claims {
+            if !claims.contains(&claim) {
+                claims.push(claim);
+            }
+        }
         delay_rewrites.extend(delta.delay_rewrites);
         reencoded.extend(delta.reencoded_branches);
         symbol = delta.kernel;
@@ -127,7 +147,12 @@ pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certifie
     let edited = kernel(&current.program, &symbol);
     let emitted = kernel(&relifted.program, &symbol);
     let definedness = definedness::check(&base_kernel, edited, emitted);
-    let new_obligations: Vec<Obligation> = current.obligations.iter().filter(|o| !base_obligations.contains(&key(o))).cloned().collect();
+    let new_obligations: Vec<Obligation> = current
+        .obligations
+        .iter()
+        .filter(|o| !base_obligations.contains(&key(o)))
+        .cloned()
+        .collect();
     admit(&rewrite, edited, base, &bytes)?;
     let receipt = Receipt {
         base_object_sha256: base_sha,
@@ -140,33 +165,63 @@ pub fn apply(base: &[u8], options: Options, rewrite: Rewrite) -> Result<Certifie
         reencoded_branches: reencoded.len(),
         new_obligations,
         definedness,
-        equivalence: Equivalence { baseline_object_sha256: base_sha, kind: rewrite.claim.clone() },
+        equivalence: Equivalence {
+            baseline_object_sha256: base_sha,
+            kind: rewrite.claim.clone(),
+        },
     };
-    Ok(Certified { bytes, receipt, program: current })
+    Ok(Certified {
+        bytes,
+        receipt,
+        program: current,
+    })
 }
 
 /// The equivalence rule (architecture.md §3 "two claims, never conflated").
-fn admit(rewrite: &Rewrite, edited: &Kernel, base: &[u8], bytes: &[u8]) -> Result<(), RewriteError> {
-    let refuse = |reason: String| Err(RewriteError::Claim { claim: rewrite.claim.clone(), reason });
+fn admit(
+    rewrite: &Rewrite,
+    edited: &Kernel,
+    base: &[u8],
+    bytes: &[u8],
+) -> Result<(), RewriteError> {
+    let refuse = |reason: String| {
+        Err(RewriteError::Claim {
+            claim: rewrite.claim.clone(),
+            reason,
+        })
+    };
     match &rewrite.claim {
         EquivalenceKind::Unproved => Ok(()),
         EquivalenceKind::ByteIdentical if bytes == base => Ok(()),
         EquivalenceKind::ByteIdentical => refuse("the emitted bytes differ from the base".into()),
-        EquivalenceKind::GpuBitExact { .. } => refuse("no path-specific GPU oracle receipt is checked in M3".into()),
+        EquivalenceKind::GpuBitExact { .. } => {
+            refuse("no path-specific GPU oracle receipt is checked in M3".into())
+        }
         EquivalenceKind::ProvedCommutation => {
             for (step, edit) in rewrite.script.iter().enumerate() {
-                if !matches!(edit, Edit::Insert { .. } | Edit::Descriptor { .. } | Edit::Metadata { .. }) {
+                if !matches!(
+                    edit,
+                    Edit::Insert { .. } | Edit::Descriptor { .. } | Edit::Metadata { .. }
+                ) {
                     return refuse(format!("step {step} is not an insertion or an ABI change"));
                 }
             }
             for &id in &edited.body.layout {
                 let inst = edited.body.insts.get(id).expect("laid out");
-                if inst.prov.edit.is_none() { continue; }
+                if inst.prov.edit.is_none() {
+                    continue;
+                }
                 let text = inst.text(Arch::Gfx1201).unwrap_or_default();
                 if !matches!(inst.effects.control, Control::None | Control::Wait) {
-                    return refuse(format!("inserted `{text}` is control flow, a barrier or a window"));
+                    return refuse(format!(
+                        "inserted `{text}` is control flow, a barrier or a window"
+                    ));
                 }
-                if inst.effects.lds.is_some() || inst.effects.mem.is_some_and(|m| !matches!(m.class, MemClass::VmemStore | MemClass::SmemLoad)) {
+                if inst.effects.lds.is_some()
+                    || inst.effects.mem.is_some_and(|m| {
+                        !matches!(m.class, MemClass::VmemStore | MemClass::SmemLoad)
+                    })
+                {
                     return refuse(format!("inserted `{text}` accesses memory other than a vector store or a scalar load"));
                 }
             }
@@ -191,34 +246,59 @@ impl SourceMap {
     pub fn new(kernel: &Kernel, source: &str) -> Result<Self, RewriteError> {
         let fail = |reason: String| RewriteError::Anchor(reason);
         let file = parse_source(source).map_err(|e| fail(e.to_string()))?;
-        let insts: Vec<(usize, &str)> = file.lines.iter()
-            .filter_map(|l| match &l.kind { SourceKind::Inst(text) => Some((l.line_no, text.as_str())), _ => None })
+        let insts: Vec<(usize, &str)> = file
+            .lines
+            .iter()
+            .filter_map(|l| match &l.kind {
+                SourceKind::Inst(text) => Some((l.line_no, text.as_str())),
+                _ => None,
+            })
             .collect();
-        let first = file.labels.iter().find(|(l, _)| *l == kernel.symbol.0).map(|(_, at)| *at)
+        let first = file
+            .labels
+            .iter()
+            .find(|(l, _)| *l == kernel.symbol.0)
+            .map(|(_, at)| *at)
             .ok_or_else(|| fail(format!("{} is not a label in the source", kernel.symbol.0)))?;
         let n = kernel.body.layout.len();
-        let own = insts.get(first..first + n).ok_or_else(|| fail("the source holds fewer instructions than the kernel".into()))?;
+        let own = insts
+            .get(first..first + n)
+            .ok_or_else(|| fail("the source holds fewer instructions than the kernel".into()))?;
         for (k, ((_, text), &id)) in own.iter().zip(&kernel.body.layout).enumerate() {
             let name = mnemonic(kernel.body.insts.get(id).expect("laid out"));
             if text.split_whitespace().next() != Some(name) {
-                return Err(fail(format!("source instruction {k} {text:?} is not the kernel's {name}")));
+                return Err(fail(format!(
+                    "source instruction {k} {text:?} is not the kernel's {name}"
+                )));
             }
         }
         Ok(Self {
             lines: own.iter().map(|(_, t)| (*t).to_owned()).collect(),
             line_no: own.iter().map(|(n, _)| *n).collect(),
-            labels: file.labels.iter().filter(|(_, at)| (first..first + n).contains(at)).map(|(l, at)| (l.clone(), at - first)).collect(),
+            labels: file
+                .labels
+                .iter()
+                .filter(|(_, at)| (first..first + n).contains(at))
+                .map(|(l, at)| (l.clone(), at - first))
+                .collect(),
         })
     }
 
     /// Layout index of the instruction on `.s` line `line`.
     pub fn at_line(&self, line: usize) -> Result<usize, RewriteError> {
-        self.line_no.iter().position(|&n| n == line).ok_or_else(|| RewriteError::Anchor(format!(".s line {line} is not an instruction of the kernel")))
+        self.line_no.iter().position(|&n| n == line).ok_or_else(|| {
+            RewriteError::Anchor(format!(
+                ".s line {line} is not an instruction of the kernel"
+            ))
+        })
     }
 
     /// Layout index of the instruction `label` precedes.
     pub fn at_label(&self, label: &str) -> Result<usize, RewriteError> {
-        self.labels.get(label).copied().ok_or_else(|| RewriteError::Anchor(format!("label {label} is not in the kernel")))
+        self.labels
+            .get(label)
+            .copied()
+            .ok_or_else(|| RewriteError::Anchor(format!("label {label} is not in the kernel")))
     }
 }
 
@@ -230,6 +310,11 @@ pub fn mnemonic(inst: &peacemaker_ir::inst::Inst) -> &'static str {
 
 /// Block and instruction id at layout index `at` of `kernel`.
 pub fn position(kernel: &Kernel, at: usize) -> (BlockId, InstId) {
-    let block = kernel.body.blocks.iter().position(|b| b.range.0 <= at && at < b.range.1).expect("laid out");
+    let block = kernel
+        .body
+        .blocks
+        .iter()
+        .position(|b| b.range.0 <= at && at < b.range.1)
+        .expect("laid out");
     (BlockId(block), kernel.body.layout[at])
 }

@@ -194,7 +194,7 @@ impl GgufFile {
         if magic != GGUF_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid GGUF magic: 0x{magic:08x}"),
+                format!("invalid GGUF magic: 0x{magic:08x}; this is not a GGUF file (or it is corrupt) — re-download it"),
             ));
         }
 
@@ -202,7 +202,7 @@ impl GgufFile {
         if version < 2 || version > 3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported GGUF version: {version}"),
+                format!("unsupported GGUF version: {version}; hipfire reads GGUF versions 2 and 3 — re-export or re-download the model"),
             ));
         }
 
@@ -230,7 +230,7 @@ impl GgufFile {
             let dtype = GgmlType::from_u32(dtype_raw).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("unknown GGML type: {dtype_raw}"),
+                    format!("unknown GGML type: {dtype_raw}; this GGUF uses a tensor type hipfire does not support — use a different quantization of the model"),
                 )
             })?;
             let offset = cursor.read_u64::<LittleEndian>()? as usize;

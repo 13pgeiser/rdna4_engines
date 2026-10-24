@@ -50,7 +50,7 @@
       "kind": "embedded",
       "module": "qwen4_mq6_x4_pm_gfx1151",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_mq6_x4_pm_gfx1151.hxaco",
-      "sha256": "3af58382793bddf8ab25d9c8ec7ced94e8444a55cf2c47ad77b815ba91104500",
+      "sha256": "abfc9a35b60f76538e705327bc53f0ea5f5a51fa5783650b25c620004769ec11",
       "symbols": [
         "qwen4_mq6_x4_pm_gfx1151_w8_bf16out",
         "qwen4_mq6_x4_pm_gfx1151_w8_regions"
@@ -150,7 +150,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "4206f421af1a8bd2b331bb77952516e0689179d046896b9e381b7afe3b2b1ad9",
+      "sha256": "bbb1a93064b553995df25fa6b844d9d68f72973d29d4ea3bb0747bc4388905e3",
       "symbols": [
         "gated_delta_chunk_gate_wmma"
       ],
@@ -514,7 +514,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "58bfaf053aa2763382a91a0a82a4f349a465184f79b6eec8d339460bf7939910",
+      "sha256": "5664142b8350721326adba278fd26cbde29e19c932e8db77072f4b8016773924",
       "symbols": [
         "moe_router_softmax_top10_f32_fast"
       ],
@@ -868,7 +868,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2",
+      "sha256": "fb1fcae98660e1bad807d9fda24de3bab45a8cb0c5b951da9d1e4fd67e4c8b25",
       "symbols": [
         "quantize_bf16_q8_0"
       ],
@@ -986,7 +986,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "1ed557aa3d9f40769ffa519c855c966e2427e6d7d6891f28b320f550172119d3",
+      "sha256": "a2bf86ef70fbc7b9092c88ca3c3aa9a63b9cba8deb839980509e1ca393f088c2",
       "symbols": [
         "qwen4_moe_sym_check_gfx1151"
       ],
@@ -1037,7 +1037,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "c150ddb2cb0d30fea4a238637af57384391d0a8ffe0207962197cffb666541d9",
+      "sha256": "c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621",
       "symbols": [
         "qwen4_moe_group_prefix",
         "qwen4_moe_group_ranks",
@@ -1202,7 +1202,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
+      "sha256": "025735d483ef906c80c9d023d9af401552d40d177403c0f68ea24301c8b7bd2a",
       "symbols": [
         "gated_delta_conv_qknorm_bf16_f32_batched_k4",
         "gdn_state_f32_to_q8",

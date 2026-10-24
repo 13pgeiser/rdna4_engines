@@ -92,7 +92,11 @@ fn descendants(pid: u32) -> Vec<u32> {
             let Some(tail) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
                 continue;
             };
-            if let Some(pp) = tail.split_whitespace().nth(1).and_then(|s| s.parse::<u32>().ok()) {
+            if let Some(pp) = tail
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u32>().ok())
+            {
                 parent_of.push((p, pp));
             }
         }
@@ -267,7 +271,9 @@ impl M4 {
     }
 
     fn prefills(&mut self, prefix: &str) -> Result<Vec<Value>, String> {
-        (0..3).map(|i| self.prefill(&format!("{prefix}-{i}"))).collect()
+        (0..3)
+            .map(|i| self.prefill(&format!("{prefix}-{i}")))
+            .collect()
     }
 
     fn phases(&mut self, npu_cmd: &str, npu_alone_cmd: &str) -> Result<i32, String> {
@@ -347,15 +353,15 @@ impl M4 {
         }
         terminate(&mut self.sampler);
         if !self.alone.is_empty() && !self.conc.is_empty() {
-            let mean = |v: &[Value]| v.iter().filter_map(Value::as_f64).sum::<f64>() / v.len() as f64;
+            let mean =
+                |v: &[Value]| v.iter().filter_map(Value::as_f64).sum::<f64>() / v.len() as f64;
             let (a, c) = (mean(&self.alone), mean(&self.conc));
             if a == 0.0 {
                 self.mark(&format!("end rc={rc}")).ok();
                 return Err("ZeroDivisionError: float division by zero".to_string());
             }
-            let list = |v: &[Value]| {
-                format!("[{}]", v.iter().map(py_str).collect::<Vec<_>>().join(", "))
-            };
+            let list =
+                |v: &[Value]| format!("[{}]", v.iter().map(py_str).collect::<Vec<_>>().join(", "));
             let line = format!(
                 "summary gpu_alone_ms={} concurrent_ms={} mean_alone={a:.1} mean_concurrent={c:.1} slowdown={:.2}%",
                 list(&self.alone),
@@ -388,7 +394,10 @@ pub fn run(args: &[String]) -> Result<i32, String> {
 
     let arg = args.first().ok_or("usage: npu-m4 OUTDIR")?;
     let out = abspath(arg)?;
-    io(fs::create_dir_all(out.join("home/.hipfire")), "create OUTDIR")?;
+    io(
+        fs::create_dir_all(out.join("home/.hipfire")),
+        "create OUTDIR",
+    )?;
     let npu_cmd = env::var("NPU_M4_CMD").map_err(|_| "KeyError: 'NPU_M4_CMD'".to_string())?;
     let npu_alone_cmd = env::var("NPU_M4_ALONE_CMD").unwrap_or_else(|_| npu_cmd.clone());
     let mut marks = io(File::create(out.join("marks.txt")), "marks.txt")?;

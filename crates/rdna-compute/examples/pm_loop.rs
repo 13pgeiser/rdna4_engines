@@ -1,0 +1,1250 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+
+//! PM loop: one command that emits a PeaceMaker production-generator variant,
+//! certifies it, checks it on the card, and ABBA-times it against the shipped
+//! kernel (gfx1201). Prints ONE JSON object (schema 1) on stdout.
+//!
+//! ```text
+//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym --shape <S> [kernel knobs]
+//!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
+//!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
+//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym and the PM producers
+//!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm)
+//! ```
+//!
+//! Pipeline (every step lands in the JSON record):
+//! 1. Emit + link the candidate with the native writer (the path of
+//!    `peacemaker-isa emit --co`, no ROCm tools) and resolve the baseline: the
+//!    SHIPPED production object (committed `.hxaco` that `rdna-compute` embeds;
+//!    `baseline.source` names the selecting file:line and the artifact sha256),
+//!    or, when any `--base-<knob>` is given, a second emitted variant whose
+//!    unspecified knobs inherit the candidate's (time two arbitrary variants).
+//! 2. Certify: M7 (`pm_check`, behind `peacemaker-isa emit --m7`) on EVERY
+//!    export of the candidate object through the cert cache (`m7.cache` is
+//!    `hit`, `miss` or `disabled`; `HIPFIRE_CERT_CACHE=0` disables it); the
+//!    lifted kernel descriptor/metadata give VGPRs, SGPRs, LDS, scratch and code
+//!    bytes per export, plus `cost_lint` loop statistics.
+//! 3. Correctness on the card: deterministic synthetic inputs at `--shape`,
+//!    candidate and baseline each launched once with the production kernarg
+//!    packing; `correctness` reports candidate vs the CPU reference
+//!    (`max_abs_err`, `tolerance`, `pass`), the baseline vs the same
+//!    reference, and candidate vs baseline (`identical_to_baseline`,
+//!    `max_abs_diff_vs_baseline`). An epilogue with no CPU reference (iu4_gemm
+//!    silu) reports `reference: "none"` and `pass` is then
+//!    `identical_to_baseline` (`pass_basis` says which). `--emu` runs the candidate on the peacemaker emulator
+//!    when every instruction is qualified, else `refused (<reason>)`.
+//! 4. Timing: ABBA, A = baseline, B = candidate, like `pm_decode_twins time`:
+//!    one checked warm launch per arm, then `--rounds R` (default 6) ABBA
+//!    rounds of `--time N` (default 50) launches per block, per-launch
+//!    hipEvents on the default stream, accumulating output state restored
+//!    outside the event interval. Each block of N launches has a block
+//!    median, and each ABBA round pairs the candidate's two block medians with
+//!    the baseline's two from that same round (ratio = candidate mean / baseline
+//!    mean; this cancels between-round clock and power drift, which is several
+//!    times larger than a few-percent effect). `separable` is true iff the exact
+//!    two-sided sign test over those paired rounds has `sign_p <= 1e-3` (ties
+//!    count against it, so at least 11 rounds are needed); `direction` is
+//!    `faster`/`slower` from the majority sign, with `rounds_faster/slower/tied`
+//!    and `round_ratio_min/max`. `block_ratio` = median(candidate block
+//!    medians) / median(baseline block medians). The stricter
+//!    `separable_block_disjoint` (every candidate block median on one side of
+//!    every baseline block median) and the twins' full-range rule
+//!    `separable_full_range` (unchanged for `pm_decode_twins`; one hiccup launch
+//!    vetoes it) stay in the record. Not separable: ABBA rounds keep being added
+//!    (doubling) until `separable`, `--max-rounds` (default 256) or
+//!    `--time-budget-s` (default 240, under the fabric's timing cap) is reached;
+//!    `rounds_run`, `extended` and `stop` report it. The sign test also
+//!    detects real but immaterial placement and order effects (two arms with
+//!    byte-identical code objects came out separable at 0.2-0.3%), so
+//!    `material` = `separable` AND `|block_ratio - 1| >= --min-effect`
+//!    (default 0.005); the human verdict says `faster/slower (material)` or
+//!    `separable but below min-effect`. Sampling is refused when the
+//!    candidate fails correctness.
+//!
+//! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
+//! candidate could not be emitted/certified/launched (record printed with the
+//! error); 2 usage error.
+//!
+//! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
+//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
+//! (`--kernel fp8_gemm`), `pm_loop/fa.rs` (`--kernel fa_prefill`) and `pm_loop/moe.rs`
+//! (`--kernel qwen4_moe_sym`).
+//!
+//! Use (build once, then take a gfx1201 card through the fabric; check
+//! `fabric-run.sh --status` first and pick an idle hiptrx card A/B/C/E):
+//! ```text
+//! cargo build --release -p rdna-compute --features lab --example pm_loop
+//! /home/kaden/qcal/locks/fabric/fabric-run.sh --class timing --card B --mem-gb 4 \
+//!   --max-secs 900 --owner PmLoop -- target/release/examples/pm_loop \
+//!   --kernel iu4_gemm --fold k128 --tile 256x128x16 --epi set \
+//!   --shape M=17408,N=512,K=5120 --time 50 --rounds 6
+//! ```
+//! 2:4-sparse candidate vs the shipped dense kernel (pruned weights), and a `.rip` candidate:
+//! ```text
+//! pm_loop --kernel iu4_gemm --mma s24x64 --epi set --shape M=17408,N=512,K=5120 --emu
+//! pm_loop --kernel iu4_gemm --mma s24x32 --epi add --shape M=5120,N=512,K=17408
+//! pm_loop --kernel iu4_gemm --rip my_twin.rip --mma s24x64 --shape M=17408,N=512,K=5120
+//! ```
+//! The fabric exports `ROCR_VISIBLE_DEVICES`/`FABRIC_CARDS`, recorded under
+//! `device`. GPU-free tests: `cargo test -p rdna-compute --features lab --example pm_loop`.
+
+#[path = "support/abba.rs"]
+mod abba;
+#[path = "pm_loop/c8.rs"]
+mod c8;
+#[path = "pm_loop/common.rs"]
+mod common;
+#[path = "pm_loop/fa.rs"]
+mod fa;
+#[path = "pm_loop/fp8.rs"]
+mod fp8;
+#[path = "pm_loop/gdn.rs"]
+mod gdn;
+#[path = "pm_loop/iu4.rs"]
+mod iu4;
+#[path = "pm_loop/moe.rs"]
+mod moe;
+#[path = "pm_loop/mq6.rs"]
+mod mq6;
+#[path = "pm_loop/prod.rs"]
+mod prod;
+#[path = "pm_loop/rotate.rs"]
+mod rotate;
+#[path = "pm_loop/workload.rs"]
+mod workload;
+
+use abba::{timing_relation, timing_schedule, timing_stats, TimingArm, TimingStats};
+use rdna_compute::Gpu;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use workload::{Arm, Knobs, Object, Result, Workload};
+
+const SCHEMA: u32 = 1;
+const ARCH: &str = "gfx1201";
+const DEFAULT_TIME: usize = 50;
+const DEFAULT_ROUNDS: usize = 6;
+const DEFAULT_MAX_ROUNDS: usize = 256;
+/// Below the fabric timing cap (1800 s) and the usual `--max-secs 900`.
+const DEFAULT_TIME_BUDGET_S: f64 = 240.0;
+/// Smallest |block_ratio - 1| that counts as a material difference (0.5%): the paired
+/// sign test also detects real but immaterial placement/order effects (two arms with
+/// byte-identical code objects came out "separable" at 0.2-0.3%).
+const DEFAULT_MIN_EFFECT: f64 = 0.005;
+
+fn err<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+
+#[derive(Debug)]
+struct Opts {
+    kernel: String,
+    shape: Option<String>,
+    time: usize,
+    rounds: usize,
+    /// Auto-extension ceiling for the total ABBA rounds.
+    max_rounds: usize,
+    /// Wall-clock budget of the sampling phase, seconds.
+    time_budget_s: f64,
+    /// `--min-effect`: `material` needs `|block_ratio - 1| >=` this.
+    min_effect: f64,
+    emu: bool,
+    out: Option<PathBuf>,
+    /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
+    rip: Option<PathBuf>,
+    knobs: Knobs,
+}
+
+const DRIVER_FLAGS: &str =
+    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
+
+fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
+    let mut o = Opts {
+        kernel: String::new(),
+        shape: None,
+        time: DEFAULT_TIME,
+        rounds: DEFAULT_ROUNDS,
+        max_rounds: DEFAULT_MAX_ROUNDS,
+        time_budget_s: DEFAULT_TIME_BUDGET_S,
+        min_effect: DEFAULT_MIN_EFFECT,
+        emu: false,
+        out: None,
+        rip: None,
+        knobs: Knobs::default(),
+    };
+    while let Some(arg) = a.next() {
+        let key = arg
+            .strip_prefix("--")
+            .ok_or_else(|| format!("unexpected argument {arg} (usage: {DRIVER_FLAGS})"))?
+            .to_owned();
+        if key == "emu" {
+            o.emu = true;
+            continue;
+        }
+        let value = a
+            .next()
+            .ok_or_else(|| format!("--{key} needs a value (usage: {DRIVER_FLAGS})"))?;
+        match key.as_str() {
+            "kernel" => o.kernel = value,
+            "shape" => o.shape = Some(value),
+            "time" => o.time = abba::positive_count(&value).map_err(|e| format!("--time: {e}"))?,
+            "rounds" => {
+                o.rounds = abba::positive_count(&value).map_err(|e| format!("--rounds: {e}"))?
+            }
+            "max-rounds" => {
+                o.max_rounds =
+                    abba::positive_count(&value).map_err(|e| format!("--max-rounds: {e}"))?
+            }
+            "time-budget-s" => {
+                o.time_budget_s = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .ok_or_else(|| format!("--time-budget-s {value}: expected seconds > 0"))?
+            }
+            "min-effect" => {
+                o.min_effect = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| format!("--min-effect {value}: expected a fraction >= 0"))?
+            }
+            "out" => o.out = Some(PathBuf::from(value)),
+            "rip" => o.rip = Some(PathBuf::from(value)),
+            _ => {
+                if o.knobs.0.insert(key.clone(), value).is_some() {
+                    return Err(format!("--{key} given twice"));
+                }
+            }
+        }
+    }
+    if o.kernel.is_empty() {
+        return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
+    }
+    if o.rip.is_some()
+        && !matches!(
+            o.kernel.as_str(),
+            "iu4_gemm"
+                | "mq6_i8_gemm"
+                | "fp8_gemm"
+                | "fa_prefill"
+                | "qwen4_moe_sym"
+                | "iu4_c8_producer_pm"
+                | "moe_rotate_i4_pm"
+                | "gdn_chunk_prep_pm"
+        )
+    {
+        return Err(format!(
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym, iu4_c8_producer_pm, moe_rotate_i4_pm or gdn_chunk_prep_pm: only those generators are exposed to .rip so far (got --kernel {})",
+            o.kernel
+        ));
+    }
+    if o.max_rounds < o.rounds {
+        return Err(format!(
+            "--max-rounds {} is below --rounds {}",
+            o.max_rounds, o.rounds
+        ));
+    }
+    abba::timing_counts(o.time, o.max_rounds)?;
+    Ok(o)
+}
+
+fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
+    let shape = o.shape.clone().unwrap_or_default();
+    let mut knobs = std::mem::take(&mut o.knobs);
+    let w = match o.kernel.as_str() {
+        "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
+        "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
+        "fa_prefill" => fa::new(&shape, &mut knobs, o.rip.as_deref())?,
+        "qwen4_moe_sym" => moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "iu4_c8_producer_pm" => c8::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "moe_rotate_i4_pm" => rotate::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "gdn_chunk_prep_pm" => gdn::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        other => {
+            return Err(format!(
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
+            ))
+        }
+    };
+    knobs.finish()?;
+    Ok(w)
+}
+
+// ---------------------------------------------------------------------------
+// Object facts: M7, resources, cost lint
+
+fn write_object(dir: &Path, tag: &str, obj: &Object) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("{tag}.{}.co", &sha256_hex(&obj.bytes)[..16]));
+    std::fs::write(&path, &obj.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Descriptor/metadata resources of every kernel of a lifted object, keyed by
+/// symbol. `code_bytes` is the re-encoded instruction stream length.
+fn resources(program: &peacemaker_ir::Program, symbols: &[String]) -> Result<Vec<Value>> {
+    use peacemaker_ir::inst::Abi;
+    let mut rows = Vec::new();
+    for symbol in symbols {
+        let kernel = program
+            .kernels
+            .iter()
+            .find(|k| &k.symbol.0 == symbol)
+            .ok_or_else(|| format!("object has no kernel {symbol}"))?;
+        let Abi::Hsa {
+            descriptor,
+            metadata,
+        } = &kernel.abi
+        else {
+            return Err(format!("{symbol}: not an HSA kernel"));
+        };
+        let m = &metadata.parsed;
+        let code = peacemaker_lift::emit::bytes(kernel, program.target.arch).map_err(err)?;
+        rows.push(json!({
+            "symbol": symbol,
+            "vgprs": m.vgpr_count,
+            "sgprs": m.sgpr_count,
+            "lds_bytes": descriptor.group_segment_fixed_size,
+            "scratch_bytes": descriptor.private_segment_fixed_size,
+            "code_bytes": code.len(),
+            "kernarg_bytes": descriptor.kernarg_size,
+            "vgpr_spills": m.vgpr_spill_count,
+            "sgpr_spills": m.sgpr_spill_count,
+            "max_flat_workgroup_size": m.max_flat_workgroup_size,
+        }));
+    }
+    Ok(rows)
+}
+
+fn lift(bytes: &[u8]) -> Result<peacemaker_ir::Program> {
+    peacemaker_lift::lift_object(
+        bytes,
+        peacemaker_lift::Options {
+            frontend: peacemaker_ir::inst::Frontend::Builder,
+        },
+    )
+    .map(|l| l.program)
+    .map_err(err)
+}
+
+/// `cost_lint` loop statistics per kernel, `{symbol: [loop..]}`; `{"error": ..}`
+/// if the static analysis refuses the object.
+fn cost_lint(program: &peacemaker_ir::Program) -> Value {
+    match peacemaker_isa::cost_lint::analyze(program, &Default::default()) {
+        Ok(report) => {
+            let mut out = serde_json::Map::new();
+            for k in report.kernels {
+                out.insert(
+                    k.symbol,
+                    serde_json::to_value(k.loops).unwrap_or(Value::Null),
+                );
+            }
+            Value::Object(out)
+        }
+        Err(e) => json!({"error": e}),
+    }
+}
+
+/// M7 on every export through the cert cache. Err only when M7 itself rejects;
+/// the cache status of each export is kept alongside its receipt.
+fn certify(path: &Path, symbols: &[String]) -> Value {
+    let mut cache = Vec::new();
+    let mut receipts = serde_json::Map::new();
+    let mut status = "pass";
+    let mut error = Value::Null;
+    for symbol in symbols {
+        match peacemaker_isa::pm_check::m7_status(path, ARCH, symbol) {
+            Ok((receipt, c)) => {
+                cache.push(json!({"symbol": symbol, "cache": c.as_str()}));
+                receipts.insert(symbol.clone(), receipt);
+            }
+            Err(e) => {
+                status = "fail";
+                error = json!({"symbol": symbol, "error": e});
+                break;
+            }
+        }
+    }
+    let summary = if !cache.is_empty() && cache.iter().all(|c| c["cache"] == "hit") {
+        "hit"
+    } else if cache.iter().any(|c| c["cache"] == "miss") {
+        "miss"
+    } else if cache.iter().any(|c| c["cache"] == "disabled") {
+        "disabled"
+    } else {
+        "hit"
+    };
+    json!({"status": status, "cache": summary, "per_export": cache,
+        "receipts": receipts, "error": error})
+}
+
+// ---------------------------------------------------------------------------
+// Device
+
+struct Loaded {
+    _module: hip_bridge::Module,
+    func: hip_bridge::Function,
+}
+
+fn load(gpu: &Gpu, obj: &Object) -> Result<Loaded> {
+    let module = gpu.hip.module_load_data(&obj.bytes).map_err(err)?;
+    let func = gpu
+        .hip
+        .module_get_function(&module, &obj.launch_symbol)
+        .map_err(err)?;
+    Ok(Loaded {
+        _module: module,
+        func,
+    })
+}
+
+fn launch(gpu: &Gpu, w: &dyn Workload, arm: Arm, f: &Loaded) -> Result<()> {
+    let mut l = w.launch(arm);
+    // SAFETY: the workload packs the kernarg per the kernel's declared ABI
+    // and every pointer addresses a live allocation it owns.
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(&f.func, l.grid, l.block, l.lds, None, &mut l.kernarg)
+    }
+    .map_err(err)
+}
+
+fn device_json(gpu: &Gpu) -> Value {
+    let env = |k: &str| std::env::var(k).ok();
+    let cards: Vec<String> = env("FABRIC_CARDS")
+        .map(|s| s.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
+    json!({
+        "arch": gpu.arch, "device_id": gpu.device_id,
+        "uuid": env("ROCR_VISIBLE_DEVICES").or_else(|| env("HIPFIRE_DEVICES")),
+        "fabric_cards": cards,
+        "fabric_job": env("FABRIC_JOB"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Timing record
+
+fn us(v: f64) -> f64 {
+    v / 1e3
+}
+
+fn arm_json(s: &TimingStats) -> Value {
+    json!({"median": us(s.median), "min": us(s.min), "max": us(s.max),
+        "p90": us(s.p90), "mean": us(s.mean)})
+}
+
+const RULE: &str = "separable = exact two-sided sign test over the per-round paired ratios \
+    (each ABBA round: mean of the candidate's two block medians over the mean of the baseline's \
+    two, same round) has p <= 1e-3, ties counting against; direction = majority sign; \
+    material = separable AND |block_ratio - 1| >= min_effect (the sign test also detects real \
+    but immaterial placement/order effects). \
+    separable_block_disjoint = every candidate block median is below every baseline block \
+    median, or every one above. separable_full_range = the pm_decode_twins rule: |median delta| \
+    > larger full spread AND ranges disjoint";
+
+/// Pure timing record from the two arms' samples (nanoseconds, in schedule
+/// order, whole ABBA rounds): the paired-round sign test is `separable`; the
+/// block-disjoint rule and the twins' full-range rule are kept as
+/// `separable_block_disjoint` and `separable_full_range`. `ratio` is the
+/// candidate/baseline ratio of the full-sample medians.
+fn timing_record(
+    s: &Sampled,
+    n: usize,
+    rounds: usize,
+    stop: abba::ExtendStop,
+    sampling_s: f64,
+    min_effect: f64,
+) -> Result<Value> {
+    let a = timing_stats(&s.base_ns)?;
+    let b = timing_stats(&s.cand_ns)?;
+    let (ratio, spread, delta, full_range) = timing_relation(&a, &b);
+    let r = abba::block_rule(&s.base_ns, &s.cand_ns, n)?;
+    let rounds_run = s.base_ns.len() / (2 * n);
+    let ext = |v: &[f64]| {
+        (
+            v.iter().copied().fold(f64::INFINITY, f64::min),
+            v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let (bmin, bmax) = ext(&r.baseline_block_medians);
+    let (cmin, cmax) = ext(&r.candidate_block_medians);
+    Ok(json!({
+        "n": n, "rounds": rounds, "rounds_run": rounds_run, "extended": rounds_run > rounds,
+        "stop": stop.as_str(), "sampling_s": sampling_s, "calls_per_arm": a.count,
+        "baseline_us": arm_json(&a), "candidate_us": arm_json(&b),
+        "ratio": ratio, "separable": r.separable, "direction": r.direction,
+        "material": r.separable && (r.block_ratio - 1.0).abs() >= min_effect,
+        "min_effect": min_effect,
+        "sign_p": r.sign_p, "p_max": abba::PAIRED_P_MAX,
+        "rounds_faster": r.rounds_faster, "rounds_slower": r.rounds_slower,
+        "rounds_tied": r.rounds_tied,
+        "block_ratio": r.block_ratio,
+        "round_ratio_min": r.round_ratio_min, "round_ratio_max": r.round_ratio_max,
+        "baseline_block_median_us": {"min": us(bmin), "max": us(bmax)},
+        "candidate_block_median_us": {"min": us(cmin), "max": us(cmax)},
+        "separable_block_disjoint": r.block_disjoint,
+        "separable_full_range": full_range,
+        "observed_spread_us": us(spread), "median_delta_us": us(delta),
+        "unit": "us per launch (hipEvent, default stream)",
+        "rule": RULE,
+    }))
+}
+
+/// An emulator refusal carries the faulting instruction's full register dump
+/// after ` | `; keep the reason, drop the dump.
+fn tidy_emu(v: Value) -> Value {
+    match v {
+        Value::String(s) if s.starts_with("refused (") && s.contains(" | ") => {
+            let reason = s.split(" | ").next().unwrap_or(&s);
+            Value::String(format!("{reason})"))
+        }
+        other => other,
+    }
+}
+
+#[derive(Default)]
+struct Sampled {
+    base_ns: Vec<f64>,
+    cand_ns: Vec<f64>,
+}
+
+/// Append `rounds` whole ABBA rounds of `n` launches per block to `s`.
+fn sample_rounds(
+    gpu: &Gpu,
+    w: &dyn Workload,
+    base: &Loaded,
+    cand: &Loaded,
+    n: usize,
+    rounds: usize,
+    s: &mut Sampled,
+) -> Result<()> {
+    let (calls, _) = abba::timing_counts(n, rounds)?;
+    s.base_ns.reserve(calls);
+    s.cand_ns.reserve(calls);
+    let start = gpu.hip.event_create().map_err(err)?;
+    let stop = match gpu.hip.event_create() {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = gpu.hip.event_destroy(start);
+            return Err(err(e));
+        }
+    };
+    let measured = (|| -> Result<()> {
+        for which in timing_schedule(n, rounds)? {
+            let (arm, f) = match which {
+                TimingArm::Incumbent => (Arm::Baseline, base),
+                TimingArm::Candidate => (Arm::Candidate, cand),
+            };
+            w.reset(gpu, arm)?;
+            gpu.hip.event_record(&start, None).map_err(err)?;
+            launch(gpu, w, arm, f)?;
+            gpu.hip.event_record(&stop, None).map_err(err)?;
+            gpu.hip.event_synchronize(&stop).map_err(err)?;
+            let ns = f64::from(gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6;
+            match which {
+                TimingArm::Incumbent => s.base_ns.push(ns),
+                TimingArm::Candidate => s.cand_ns.push(ns),
+            }
+        }
+        Ok(())
+    })();
+    let d1 = gpu.hip.event_destroy(start).map_err(err);
+    let d2 = gpu.hip.event_destroy(stop).map_err(err);
+    measured?;
+    d1?;
+    d2
+}
+
+/// Sampling plan: `rounds` initial ABBA rounds of `n` launches per block,
+/// then doubling until the block-median rule separates, `max_rounds` or
+/// `budget_s` (seconds of `clock`) is reached. `run(extra, s)` appends `extra`
+/// whole rounds. Returns the samples, why it stopped and the elapsed time.
+fn drive_sampling(
+    n: usize,
+    rounds: usize,
+    max_rounds: usize,
+    budget_s: f64,
+    clock: &mut dyn FnMut() -> f64,
+    run: &mut dyn FnMut(usize, &mut Sampled) -> Result<()>,
+) -> Result<(Sampled, abba::ExtendStop, f64)> {
+    let t0 = clock();
+    let mut s = Sampled::default();
+    let mut extra = rounds;
+    loop {
+        run(extra, &mut s)?;
+        let done = s.base_ns.len() / (2 * n);
+        let separable = abba::block_rule(&s.base_ns, &s.cand_ns, n)?.separable;
+        let elapsed = clock() - t0;
+        match abba::extend_rounds(done, max_rounds, elapsed, budget_s, separable) {
+            Ok(more) => extra = more,
+            Err(stop) => return Ok((s, stop, elapsed)),
+        }
+    }
+}
+
+fn sample(
+    gpu: &Gpu,
+    w: &dyn Workload,
+    base: &Loaded,
+    cand: &Loaded,
+    o: &Opts,
+) -> Result<(Sampled, abba::ExtendStop, f64)> {
+    let start = std::time::Instant::now();
+    drive_sampling(
+        o.time,
+        o.rounds,
+        o.max_rounds,
+        o.time_budget_s,
+        &mut || start.elapsed().as_secs_f64(),
+        &mut |extra, s| sample_rounds(gpu, w, base, cand, o.time, extra, s),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+
+/// Exit classification of a run.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Ok,
+    CorrectnessFailed,
+    CandidateUnusable,
+}
+
+fn object_json(obj: &Object, resources: Value, extra: serde_json::Map<String, Value>) -> Value {
+    let mut v = json!({
+        "co_sha256": sha256_hex(&obj.bytes), "co_bytes": obj.bytes.len(),
+        "launch_symbol": obj.launch_symbol, "symbols": obj.exports,
+        "resources": resources,
+    });
+    let o = v.as_object_mut().unwrap();
+    if let Some(d) = obj.desc.as_object() {
+        o.extend(d.clone());
+    }
+    o.extend(extra);
+    v
+}
+
+fn run(o: &mut Opts) -> (Value, Outcome) {
+    let mut rec = json!({"schema": SCHEMA, "kernel": o.kernel, "arch": ARCH});
+    let fail = |mut rec: Value, stage: &str, e: String| {
+        rec["error"] = json!({"stage": stage, "message": e});
+        (rec, Outcome::CandidateUnusable)
+    };
+    let mut w = match build_workload(o) {
+        Ok(w) => w,
+        Err(e) => return fail(rec, "args", e),
+    };
+    rec["shape"] = w.shape_json();
+    for (key, value) in w.record_extra() {
+        rec[key] = value;
+    }
+    rec["candidate"] = json!({"knobs": w.candidate_knobs()});
+    let out_dir = o
+        .out
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("pm_loop-{}", std::process::id())));
+
+    // 1. emit + link
+    let cand = match w.candidate() {
+        Ok(c) => c,
+        Err(e) => return fail(rec, if o.rip.is_some() { "rip" } else { "emit" }, e),
+    };
+    let base = match w.baseline() {
+        Ok(b) => b,
+        Err(e) => return fail(rec, "baseline", e),
+    };
+
+    // 2. certify + resources
+    let cand_path = match write_object(&out_dir, "candidate", &cand) {
+        Ok(p) => p,
+        Err(e) => return fail(rec, "write", e),
+    };
+    let m7 = certify(&cand_path, &cand.exports);
+    let (cand_res, cand_lint) = match lift(&cand.bytes).and_then(|p| {
+        let r = resources(&p, &cand.exports)?;
+        Ok((r, cost_lint(&p)))
+    }) {
+        Ok((r, l)) => (json!(r), l),
+        Err(e) => (json!({"error": e}), Value::Null),
+    };
+    let mut cextra = serde_json::Map::new();
+    cextra.insert("m7".into(), {
+        let mut v = m7.clone();
+        v.as_object_mut().map(|o| o.remove("receipts"));
+        v
+    });
+    cextra.insert("m7_receipts".into(), m7["receipts"].clone());
+    cextra.insert("cost_lint".into(), cand_lint);
+    cextra.insert("object_path".into(), json!(cand_path.display().to_string()));
+    cextra.insert("knobs".into(), w.candidate_knobs());
+    rec["candidate"] = object_json(&cand, cand_res, cextra);
+    if m7["status"] != "pass" {
+        let msg = m7["error"].to_string();
+        return fail(rec, "m7", msg);
+    }
+    let (base_res, base_lint) = match lift(&base.bytes).and_then(|p| {
+        let r = resources(&p, std::slice::from_ref(&base.launch_symbol))?;
+        Ok((r, cost_lint(&p)))
+    }) {
+        Ok((r, l)) => (json!(r), l),
+        Err(e) => (json!({"error": e}), Value::Null),
+    };
+    let base_path = write_object(&out_dir, "baseline", &base);
+    let base_m7 = match &base_path {
+        Ok(p) => certify(p, std::slice::from_ref(&base.launch_symbol)),
+        Err(e) => json!({"status": "skipped", "error": e}),
+    };
+    let mut bextra = serde_json::Map::new();
+    bextra.insert("source".into(), base.source.clone());
+    bextra.insert("m7".into(), {
+        let mut v = base_m7;
+        v.as_object_mut().map(|o| o.remove("receipts"));
+        v
+    });
+    // The shipped bundle carries every epilogue symbol: keep the launched one.
+    bextra.insert(
+        "cost_lint".into(),
+        match base_lint.get(&base.launch_symbol) {
+            Some(loops) => json!({ base.launch_symbol.clone(): loops }),
+            None => base_lint,
+        },
+    );
+    rec["baseline"] = object_json(&base, base_res, bextra);
+
+    // 3. correctness on the card
+    let gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => return fail(rec, "gpu_init", err(e)),
+    };
+    rec["device"] = device_json(&gpu);
+    if gpu.arch != ARCH {
+        let msg = format!("device is {}, pm_loop requires {ARCH}", gpu.arch);
+        return fail(rec, "device", msg);
+    }
+    let staged = (|| -> Result<(Loaded, Loaded)> {
+        w.setup(&gpu)?;
+        Ok((load(&gpu, &base)?, load(&gpu, &cand)?))
+    })();
+    let (bf, cf) = match staged {
+        Ok(v) => v,
+        Err(e) => return fail(rec, "setup", e),
+    };
+    let warm = (|| -> Result<(Vec<u8>, Vec<u8>)> {
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            w.reset(&gpu, arm)?;
+        }
+        launch(&gpu, &*w, Arm::Baseline, &bf)?;
+        launch(&gpu, &*w, Arm::Candidate, &cf)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        Ok((
+            w.output(&gpu, Arm::Baseline)?,
+            w.output(&gpu, Arm::Candidate)?,
+        ))
+    })();
+    let (base_out, cand_out) = match warm {
+        Ok(v) => v,
+        Err(e) => return fail(rec, "launch", e),
+    };
+    let reference = w.check(&cand_out);
+    let base_report = w.check(&base_out);
+    let diff = match w.max_abs_diff(&base_out, &cand_out) {
+        Ok(d) => d,
+        Err(e) => return fail(rec, "compare", e),
+    };
+    let identical = base_out == cand_out;
+    // Without a CPU reference (e.g. an epilogue whose device intrinsics are not
+    // reproducible) bit identity with the shipped baseline is the only
+    // admissible evidence: `pass` is then `identical_to_baseline`.
+    let pass = match &reference {
+        Ok(r) => r.pass && (identical || !w.requires_baseline_identity()),
+        Err(_) => identical,
+    };
+    rec["correctness"] = json!({
+        "reference": reference.as_ref().map(|r| r.reference.as_str()).unwrap_or("none"),
+        "reference_error": reference.as_ref().err(),
+        "max_abs_err": reference.as_ref().ok().map(|r| r.max_abs_err),
+        "tolerance": reference.as_ref().ok().map(|r| r.tolerance),
+        "pass": pass,
+        "pass_basis": if reference.is_ok() && w.requires_baseline_identity() { "cpu_reference and identical_to_baseline" } else if reference.is_ok() { "cpu_reference" } else { "identical_to_baseline (no CPU reference)" },
+        "baseline_max_abs_err": base_report.as_ref().ok().map(|r| r.max_abs_err),
+        "baseline_pass": base_report.as_ref().ok().map(|r| r.pass),
+        "baseline_reference_error": base_report.as_ref().err(),
+        "identical_to_baseline": identical,
+        "max_abs_diff_vs_baseline": diff,
+        "output_bytes": cand_out.len(),
+        "emu": if o.emu { tidy_emu(w.emu()) } else { json!("not requested (--emu)") },
+    });
+    if !pass {
+        rec["timing"] = json!({"status": "refused: candidate failed correctness"});
+        return (rec, Outcome::CorrectnessFailed);
+    }
+
+    // 4. ABBA timing
+    let sampled = sample(&gpu, &*w, &bf, &cf, o);
+    let post = (|| -> Result<bool> {
+        // The last timed launch of each arm must still equal its warm output.
+        gpu.hip.device_synchronize().map_err(err)?;
+        Ok(w.output(&gpu, Arm::Baseline)? == base_out
+            && w.output(&gpu, Arm::Candidate)? == cand_out)
+    })();
+    match (sampled, post) {
+        (Ok((s, stop, secs)), Ok(true)) => {
+            match timing_record(&s, o.time, o.rounds, stop, secs, o.min_effect) {
+                Ok(mut t) => {
+                    t["post_outputs_unchanged"] = json!(true);
+                    rec["timing"] = t;
+                }
+                Err(e) => return fail(rec, "timing", e),
+            }
+        }
+        (Ok(_), Ok(false)) => {
+            rec["timing"] =
+                json!({"status": "post-sampling outputs changed; no performance claim"});
+            return (rec, Outcome::CorrectnessFailed);
+        }
+        (Err(e), _) | (_, Err(e)) => return fail(rec, "timing", e),
+    }
+    rec["device_after"] = device_json(&gpu);
+    (rec, Outcome::Ok)
+}
+
+/// The human verdict line of a timing record.
+fn verdict(ts: &Value) -> String {
+    let f = |k: &str| ts[k].as_f64().unwrap_or(f64::NAN);
+    if ts["separable"] == true {
+        let (dir, ratio) = (ts["direction"].as_str().unwrap_or("?"), f("block_ratio"));
+        if ts["material"] == true {
+            format!(
+                "{dir} (material): block ratio {ratio:.6} after {} rounds, sign p {:.3e}",
+                ts["rounds_run"],
+                f("sign_p")
+            )
+        } else {
+            format!(
+                "separable but below min-effect ({:.3}%): {dir} by {:.3}% (block ratio {ratio:.6}), sign p {:.3e}, {} rounds",
+                f("min_effect") * 100.0,
+                (ratio - 1.0).abs() * 100.0,
+                f("sign_p"),
+                ts["rounds_run"]
+            )
+        }
+    } else {
+        format!(
+            "not separable after {} rounds ({}); {}/{}/{} rounds faster/slower/tied, sign p {:.3e}, block ratio {:.6}",
+            ts["rounds_run"],
+            ts["stop"],
+            ts["rounds_faster"],
+            ts["rounds_slower"],
+            ts["rounds_tied"],
+            f("sign_p"),
+            f("block_ratio")
+        )
+    }
+}
+
+fn main() {
+    let mut opts = match parse_args(std::env::args().skip(1)) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("pm_loop: {e}");
+            std::process::exit(2);
+        }
+    };
+    let (rec, outcome) = run(&mut opts);
+    println!(
+        "{}",
+        serde_json::to_string(&rec).expect("record serializes")
+    );
+    if let Some(ts) = rec.get("timing").filter(|t| t["ratio"].is_number()) {
+        let verdict = verdict(ts);
+        eprintln!("pm_loop: {verdict}");
+    }
+    std::process::exit(match outcome {
+        Outcome::Ok => 0,
+        Outcome::CorrectnessFailed => 1,
+        Outcome::CandidateUnusable => 3,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> impl Iterator<Item = String> + '_ {
+        s.split_whitespace().map(str::to_owned)
+    }
+
+    #[test]
+    fn defaults_and_knob_passthrough() {
+        let o = parse_args(args(
+            "--kernel iu4_gemm --shape M=128,N=128,K=256 --fold k128 --base-tile 128x128x8",
+        ))
+        .unwrap();
+        assert_eq!(o.kernel, "iu4_gemm");
+        assert_eq!(o.shape.as_deref(), Some("M=128,N=128,K=256"));
+        assert_eq!(
+            (o.time, o.rounds, o.emu),
+            (DEFAULT_TIME, DEFAULT_ROUNDS, false)
+        );
+        assert_eq!(o.knobs.0.get("fold").map(String::as_str), Some("k128"));
+        assert_eq!(
+            o.knobs.0.get("base-tile").map(String::as_str),
+            Some("128x128x8")
+        );
+        assert_eq!(o.knobs.0.len(), 2, "driver flags are not knobs");
+    }
+
+    #[test]
+    fn rip_flag_parses_and_is_iu4_only() {
+        let o = parse_args(args("--kernel iu4_gemm --rip /tmp/a.rip --fold k128")).unwrap();
+        assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
+        assert_eq!(o.knobs.0.len(), 1, "--rip is not a knob");
+        assert!(parse_args(args("--kernel iu4_gemm")).unwrap().rip.is_none());
+        let e = parse_args(args("--kernel nope --rip /tmp/a.rip")).unwrap_err();
+        assert!(e.contains("--rip is only supported with --kernel"), "{e}");
+        // qwen4_moe_sym takes --rip (every MQ4 entry; the entry check is the workload's).
+        let o = parse_args(args(
+            "--kernel qwen4_moe_sym --rip /tmp/a.rip --epi down_gp_nt4",
+        ))
+        .unwrap();
+        assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
+        assert!(parse_args(args("--kernel iu4_gemm --rip")).is_err());
+        // The PM producers take --rip (the twin of the selected export / variant).
+        for k in [
+            "iu4_c8_producer_pm",
+            "moe_rotate_i4_pm",
+            "gdn_chunk_prep_pm",
+        ] {
+            let o = parse_args(args(&format!("--kernel {k} --rip /tmp/a.rip"))).unwrap();
+            assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")), "{k}");
+        }
+    }
+
+    #[test]
+    fn driver_flags_and_emu() {
+        let o = parse_args(args(
+            "--kernel qwen4_moe_sym --time 7 --rounds 2 --emu --out /tmp/x --epi down_nt4",
+        ))
+        .unwrap();
+        assert_eq!((o.time, o.rounds, o.emu), (7, 2, true));
+        assert_eq!(o.out, Some(PathBuf::from("/tmp/x")));
+        assert!(o.shape.is_none());
+        assert_eq!(o.knobs.0.len(), 1);
+    }
+
+    #[test]
+    fn bad_args_are_refused() {
+        for bad in [
+            "",
+            "--shape M=1",
+            "--kernel",
+            "--kernel k --time 0",
+            "--kernel k --rounds 0",
+            "--kernel k --time x",
+            "--kernel k positional",
+            "--kernel k --fold a --fold b",
+            "--kernel k --time 18446744073709551615",
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_kernel_and_leftover_knobs_are_refused() {
+        let mut o = parse_args(args("--kernel nope")).unwrap();
+        assert!(build_workload(&mut o)
+            .err()
+            .is_some_and(|e| e.contains("unknown --kernel")));
+        let mut k = Knobs::default();
+        k.0.insert("bogus".into(), "1".into());
+        assert!(k.finish().unwrap_err().contains("--bogus"));
+    }
+
+    #[test]
+    fn abba_schedule_is_balanced_and_blocked() {
+        let seq: Vec<_> = timing_schedule(3, 5).unwrap().collect();
+        assert_eq!(seq.len(), 3 * 5 * 4);
+        assert_eq!(
+            seq.iter().filter(|a| **a == TimingArm::Incumbent).count(),
+            30
+        );
+        // A A A | B B B | B B B | A A A, repeated per round.
+        assert_eq!(
+            &seq[..12],
+            &[
+                TimingArm::Incumbent,
+                TimingArm::Incumbent,
+                TimingArm::Incumbent,
+                TimingArm::Candidate,
+                TimingArm::Candidate,
+                TimingArm::Candidate,
+                TimingArm::Candidate,
+                TimingArm::Candidate,
+                TimingArm::Candidate,
+                TimingArm::Incumbent,
+                TimingArm::Incumbent,
+                TimingArm::Incumbent,
+            ]
+        );
+    }
+
+    fn samples(base: &[f64], cand: &[f64]) -> Sampled {
+        Sampled {
+            base_ns: base.to_vec(),
+            cand_ns: cand.to_vec(),
+        }
+    }
+
+    /// `rounds` ABBA rounds of `n`-launch blocks, every baseline launch `base`
+    /// and every candidate launch `cand` (ns).
+    fn flat(n: usize, rounds: usize, base: f64, cand: f64) -> Sampled {
+        samples(&vec![base; 2 * n * rounds], &vec![cand; 2 * n * rounds])
+    }
+
+    #[test]
+    fn timing_record_units_ratio_and_separability() {
+        use abba::ExtendStop::{MaxRounds, Separable};
+        let t = timing_record(
+            &flat(2, 12, 100_000.0, 200_000.0),
+            2,
+            6,
+            Separable,
+            1.5,
+            0.005,
+        )
+        .unwrap();
+        assert_eq!(t["separable"], true);
+        assert_eq!(t["direction"], "slower");
+        assert_eq!(t["separable_block_disjoint"], true);
+        assert_eq!(t["separable_full_range"], true);
+        assert_eq!(t["baseline_us"]["median"], 100.0);
+        assert_eq!(t["candidate_us"]["min"], 200.0);
+        assert_eq!(t["ratio"], 2.0);
+        assert_eq!(t["block_ratio"], 2.0);
+        assert_eq!(
+            (t["rounds_run"].as_u64(), t["extended"].as_bool()),
+            (Some(12), Some(true))
+        );
+        assert_eq!(
+            (t["rounds_slower"].as_u64(), t["rounds_faster"].as_u64()),
+            (Some(12), Some(0))
+        );
+        assert_eq!(t["stop"], "separable");
+        assert_eq!(t["p_max"], 1e-3);
+        assert!(t["sign_p"].as_f64().unwrap() <= 1e-3);
+        assert_eq!(t["round_ratio_min"], 2.0);
+        assert_eq!(t["candidate_block_median_us"]["max"], 200.0);
+        // Equal arms: every round ties, never separable.
+        let same = timing_record(&flat(2, 12, 7.0, 7.0), 2, 12, MaxRounds, 1.0, 0.005).unwrap();
+        assert_eq!(same["separable"], false);
+        assert_eq!(
+            (same["direction"].as_str(), same["rounds_tied"].as_u64()),
+            (Some("tie"), Some(12))
+        );
+        assert_eq!(
+            (same["ratio"].clone(), same["sign_p"].clone()),
+            (json!(1.0), json!(1.0))
+        );
+        assert!(timing_record(&samples(&[], &[1.0; 8]), 1, 1, Separable, 0.0, 0.005).is_err());
+        // The rule text names all three rules.
+        let rule = t["rule"].as_str().unwrap();
+        assert!(
+            rule.contains("sign test")
+                && rule.contains("block_disjoint")
+                && rule.contains("full_range")
+        );
+    }
+
+    /// The 7 ms hiccup of the noprio record: the paired rule stays separable,
+    /// the twins' full-range rule (kept as `separable_full_range`) does not.
+    #[test]
+    fn one_hiccup_vetoes_only_the_full_range_rule() {
+        let mut s = flat(2, 12, 330_000.0, 320_000.0);
+        s.base_ns[3] = 7_003_000.0;
+        let t = timing_record(&s, 2, 6, abba::ExtendStop::Separable, 1.0, 0.005).unwrap();
+        assert_eq!(t["separable"], true);
+        assert_eq!(t["direction"], "faster");
+        assert_eq!(t["separable_full_range"], false);
+        assert!(t["block_ratio"].as_f64().unwrap() < 1.0);
+    }
+
+    /// Fake sampler: `gap` ns between the arms, 1 s per round, `noise` makes
+    /// the arms overlap until it is zero.
+    fn fake_run(
+        gap: f64,
+        per_round_s: f64,
+        now: &std::cell::Cell<f64>,
+    ) -> impl FnMut(usize, &mut Sampled) -> Result<()> + '_ {
+        move |extra, s| {
+            for r in 0..extra {
+                for _ in 0..4 {
+                    let j = f64::from((s.base_ns.len() + r) as u32 % 7);
+                    s.base_ns.push(300_000.0 + j * 1_000.0);
+                    s.cand_ns.push(300_000.0 + j * 1_000.0 - gap);
+                }
+            }
+            now.set(now.get() + per_round_s * extra as f64);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sampling_extends_by_doubling_until_a_stop() {
+        use abba::ExtendStop::{MaxRounds, Separable, TimeBudget};
+        let now = std::cell::Cell::new(0.0);
+        let clock = &mut || now.get();
+        // Identical arms never separate: 2 -> 4 -> 8 -> 16 -> 20 (max_rounds).
+        let mut run = fake_run(0.0, 1.0, &now);
+        let (s, stop, secs) = drive_sampling(2, 2, 20, 1e9, clock, &mut run).unwrap();
+        assert_eq!((s.base_ns.len() / 4, stop, secs), (20, MaxRounds, 20.0));
+        // A clear gap needs 11 paired rounds: 12 initial rounds stop at once ...
+        now.set(0.0);
+        let clock = &mut || now.get();
+        let mut run = fake_run(50_000.0, 1.0, &now);
+        let (s, stop, _) = drive_sampling(2, 12, 64, 1e9, clock, &mut run).unwrap();
+        assert_eq!((s.base_ns.len() / 4, stop), (12, Separable));
+        // ... and 2 initial rounds double 2 -> 4 -> 8 -> 16 (p <= 1e-3 first at 16).
+        now.set(0.0);
+        let clock = &mut || now.get();
+        let mut run = fake_run(50_000.0, 1.0, &now);
+        let (s, stop, _) = drive_sampling(2, 2, 64, 1e9, clock, &mut run).unwrap();
+        assert_eq!((s.base_ns.len() / 4, stop), (16, Separable));
+        // Time budget: 1 s/round, 10 s budget, never separable: 2, 4, 8 (6+2...) then stop.
+        now.set(0.0);
+        let clock = &mut || now.get();
+        let mut run = fake_run(0.0, 1.0, &now);
+        let (s, stop, secs) = drive_sampling(2, 2, 64, 10.0, clock, &mut run).unwrap();
+        assert_eq!(stop, TimeBudget);
+        assert!(
+            secs <= 10.0 && s.base_ns.len() / 4 == 10,
+            "{secs} {}",
+            s.base_ns.len()
+        );
+    }
+
+    /// Two byte-identical arms that a placement effect makes 0.25% slower every
+    /// round: statistically separable, but not material at the default gate.
+    #[test]
+    fn immaterial_separable_difference_is_not_material() {
+        use abba::ExtendStop::Separable;
+        let s = flat(2, 40, 300_000.0, 300_750.0);
+        let t = timing_record(&s, 2, 6, Separable, 1.0, DEFAULT_MIN_EFFECT).unwrap();
+        assert_eq!(t["separable"], true);
+        assert_eq!(t["direction"], "slower");
+        assert_eq!(t["material"], false);
+        assert_eq!(t["min_effect"], 0.005);
+        let v = verdict(&t);
+        assert!(v.starts_with("separable but below min-effect"), "{v}");
+        // The same data is material once the gate is below the effect, and a real 2% win is material.
+        assert_eq!(
+            timing_record(&s, 2, 6, Separable, 1.0, 0.001).unwrap()["material"],
+            true
+        );
+        let win = timing_record(
+            &flat(2, 40, 300_000.0, 294_000.0),
+            2,
+            6,
+            Separable,
+            1.0,
+            DEFAULT_MIN_EFFECT,
+        )
+        .unwrap();
+        assert_eq!(
+            (win["material"].clone(), win["direction"].clone()),
+            (json!(true), json!("faster"))
+        );
+        assert!(
+            verdict(&win).starts_with("faster (material)"),
+            "{}",
+            verdict(&win)
+        );
+        // Not separable is never material.
+        let tie = timing_record(
+            &flat(2, 12, 7.0, 7.0),
+            2,
+            12,
+            abba::ExtendStop::MaxRounds,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(tie["material"], false);
+        assert!(verdict(&tie).starts_with("not separable"));
+    }
+
+    #[test]
+    fn min_effect_flag_parses() {
+        assert_eq!(
+            parse_args(args("--kernel iu4_gemm")).unwrap().min_effect,
+            0.005
+        );
+        let o = parse_args(args("--kernel iu4_gemm --min-effect 0.02")).unwrap();
+        assert_eq!(o.min_effect, 0.02);
+        assert!(o.knobs.0.is_empty());
+        for bad in ["--min-effect -1", "--min-effect x", "--min-effect nan"] {
+            assert!(
+                parse_args(args(&format!("--kernel k {bad}"))).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_flags_parse() {
+        let o = parse_args(args("--kernel iu4_gemm")).unwrap();
+        assert_eq!((o.time, o.rounds, o.max_rounds), (50, 6, 256));
+        assert_eq!(o.time_budget_s, 240.0);
+        let o = parse_args(args(
+            "--kernel iu4_gemm --rounds 3 --max-rounds 9 --time-budget-s 12.5",
+        ))
+        .unwrap();
+        assert_eq!((o.rounds, o.max_rounds, o.time_budget_s), (3, 9, 12.5));
+        assert!(o.knobs.0.is_empty());
+        for bad in [
+            "--kernel k --max-rounds 0",
+            "--kernel k --rounds 8 --max-rounds 4",
+            "--kernel k --time-budget-s 0",
+            "--kernel k --time-budget-s -3",
+            "--kernel k --time-budget-s nan",
+            "--kernel k --time-budget-s x",
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn emu_refusals_drop_register_dumps() {
+        let long = json!(
+            "refused (wg (0,0): k inst=3 v_div_scale_f32: not measured | arch=Gfx1201 w0=[0x1])"
+        );
+        assert_eq!(
+            tidy_emu(long),
+            json!("refused (wg (0,0): k inst=3 v_div_scale_f32: not measured)")
+        );
+        let short = json!("refused (no semantics for s_setprio)");
+        assert_eq!(tidy_emu(short.clone()), short);
+        let ran = json!({"status": "pass"});
+        assert_eq!(tidy_emu(ran.clone()), ran);
+    }
+
+    #[test]
+    fn m7_cache_summary_vocabulary() {
+        use peacemaker_isa::pm_check::M7Cache;
+        let all = [M7Cache::Hit, M7Cache::Miss, M7Cache::Disabled].map(M7Cache::as_str);
+        assert_eq!(all, ["hit", "miss", "disabled"]);
+    }
+}

@@ -56,7 +56,11 @@ fn access_bytes(name: &str) -> u32 {
         12
     } else if name.contains("_b64") || name.ends_with("_u64") || name.ends_with("_i64") {
         8
-    } else if name.contains("_b32") || name.ends_with("_u32") || name.ends_with("_i32") || name.ends_with("_f32") {
+    } else if name.contains("_b32")
+        || name.ends_with("_u32")
+        || name.ends_with("_i32")
+        || name.ends_with("_f32")
+    {
         4
     } else if name.contains("_b16") {
         2
@@ -74,14 +78,24 @@ fn own_offsets(inst: &Inst, bytes: u32, name: &str) -> Value {
     for op in &inst.operands {
         let n = match op {
             Operand::Imm(ImmField::DsOffset(n)) => u32::from(*n),
-            Operand::Imm(ImmField::DsOffset0(n) | ImmField::DsOffset1(n)) =>
-                u32::from(*n) * bytes * if name.contains("st64") || name.contains("stride64") { 64 } else { 1 },
+            Operand::Imm(ImmField::DsOffset0(n) | ImmField::DsOffset1(n)) => {
+                u32::from(*n)
+                    * bytes
+                    * if name.contains("st64") || name.contains("stride64") {
+                        64
+                    } else {
+                        1
+                    }
+            }
             _ => continue,
         };
         lo = lo.min(n);
         hi = hi.max(n);
     }
-    Value { lo: if lo == u32::MAX { 0 } else { lo }, hi }
+    Value {
+        lo: if lo == u32::MAX { 0 } else { lo },
+        hi,
+    }
 }
 
 fn const_operand(operand: &Operand) -> Option<u32> {
@@ -95,14 +109,27 @@ fn const_operand(operand: &Operand) -> Option<u32> {
 /// Inclusive unsigned interval. The full domain is the unknown value, not
 /// evidence that a launch's LDS allocation is large enough.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Value { lo: u32, hi: u32 }
+struct Value {
+    lo: u32,
+    hi: u32,
+}
 impl Value {
-    const UNKNOWN: Self = Self { lo: 0, hi: u32::MAX };
-    fn constant(n: u32) -> Self { Self { lo: n, hi: n } }
-    fn join(self, rhs: Self) -> Self {
-        Self { lo: self.lo.min(rhs.lo), hi: self.hi.max(rhs.hi) }
+    const UNKNOWN: Self = Self {
+        lo: 0,
+        hi: u32::MAX,
+    };
+    fn constant(n: u32) -> Self {
+        Self { lo: n, hi: n }
     }
-    fn constant_value(self) -> Option<u32> { (self.lo == self.hi).then_some(self.lo) }
+    fn join(self, rhs: Self) -> Self {
+        Self {
+            lo: self.lo.min(rhs.lo),
+            hi: self.hi.max(rhs.hi),
+        }
+    }
+    fn constant_value(self) -> Option<u32> {
+        (self.lo == self.hi).then_some(self.lo)
+    }
     fn add(self, rhs: Self) -> Self {
         if let (Some(a), Some(b)) = (self.constant_value(), rhs.constant_value()) {
             return Self::constant(a.wrapping_add(b));
@@ -122,9 +149,16 @@ impl Value {
         }
     }
     fn fact(self) -> AddrFact {
-        if self == Self::UNKNOWN { AddrFact::Unknown }
-        else if self.lo == self.hi { AddrFact::Const(self.lo) }
-        else { AddrFact::Bounded { lo: self.lo, hi: self.hi } }
+        if self == Self::UNKNOWN {
+            AddrFact::Unknown
+        } else if self.lo == self.hi {
+            AddrFact::Const(self.lo)
+        } else {
+            AddrFact::Bounded {
+                lo: self.lo,
+                hi: self.hi,
+            }
+        }
     }
 }
 
@@ -142,10 +176,13 @@ fn location(reg: crate::reg::RegRef) -> Option<usize> {
 }
 impl Values {
     fn operand(&self, op: &Operand) -> Value {
-        if let Some(n) = const_operand(op) { return Value::constant(n); }
+        if let Some(n) = const_operand(op) {
+            return Value::constant(n);
+        }
         match op {
             Operand::Reg(r) if r.len == 1 => location(*r)
-                .and_then(|i| self.regs.get(i).copied()).unwrap_or(Value::UNKNOWN),
+                .and_then(|i| self.regs.get(i).copied())
+                .unwrap_or(Value::UNKNOWN),
             _ => Value::UNKNOWN,
         }
     }
@@ -154,9 +191,15 @@ impl Values {
         for (old, next) in self.regs.iter_mut().zip(&rhs.regs) {
             let mut joined = old.join(*next);
             if widen {
-                if joined.lo < old.lo { joined.lo = 0; }
+                if joined.lo < old.lo {
+                    joined.lo = 0;
+                }
                 if joined.hi > old.hi {
-                    joined.hi = thresholds.iter().copied().find(|n| *n >= joined.hi).unwrap_or(u32::MAX);
+                    joined.hi = thresholds
+                        .iter()
+                        .copied()
+                        .find(|n| *n >= joined.hi)
+                        .unwrap_or(u32::MAX);
                 }
             }
             changed |= *old != joined;
@@ -169,28 +212,45 @@ impl Values {
 }
 
 fn evaluate(name: &str, src: &[Value]) -> Value {
-    let name = name.strip_suffix("_e32").or_else(|| name.strip_suffix("_e64")).unwrap_or(name);
+    let name = name
+        .strip_suffix("_e32")
+        .or_else(|| name.strip_suffix("_e64"))
+        .unwrap_or(name);
     let a = src.first().copied().unwrap_or(Value::UNKNOWN);
     let b = src.get(1).copied().unwrap_or(Value::UNKNOWN);
     let c = src.get(2).copied().unwrap_or(Value::UNKNOWN);
-    if name.starts_with("s_mov_b32") || name.starts_with("v_mov_b32")
-        || name == "v_readfirstlane_b32" || name == "v_readlane_b32" {
+    if name.starts_with("s_mov_b32")
+        || name.starts_with("v_mov_b32")
+        || name == "v_readfirstlane_b32"
+        || name == "v_readlane_b32"
+    {
         return a;
     }
     match name {
-        "s_add_u32" | "s_add_co_u32" | "s_add_i32" | "v_add_u32" | "v_add_nc_u32" | "v_add_co_u32" => a.add(b),
-        "s_sub_u32" | "s_sub_co_u32" | "s_sub_i32" | "v_sub_u32" | "v_sub_nc_u32" | "v_sub_co_u32" => {
+        "s_add_u32" | "s_add_co_u32" | "s_add_i32" | "v_add_u32" | "v_add_nc_u32"
+        | "v_add_co_u32" => a.add(b),
+        "s_sub_u32" | "s_sub_co_u32" | "s_sub_i32" | "v_sub_u32" | "v_sub_nc_u32"
+        | "v_sub_co_u32" => {
             if let (Some(x), Some(y)) = (a.constant_value(), b.constant_value()) {
                 Value::constant(x.wrapping_sub(y))
-            } else if a.lo >= b.hi { Value { lo: a.lo - b.hi, hi: a.hi - b.lo } }
-            else { Value::UNKNOWN }
+            } else if a.lo >= b.hi {
+                Value {
+                    lo: a.lo - b.hi,
+                    hi: a.hi - b.lo,
+                }
+            } else {
+                Value::UNKNOWN
+            }
         }
         "s_mul_i32" | "v_mul_lo_u32" | "v_mul_lo_i32" => a.mul(b),
         "v_mad_u32_u24" => {
             let truncate = |x: Value| match x.constant_value() {
                 Some(n) => Value::constant(n & 0xffffff),
                 None if x.hi <= 0xffffff => x,
-                None => Value { lo: 0, hi: 0xffffff },
+                None => Value {
+                    lo: 0,
+                    hi: 0xffffff,
+                },
             };
             let a = truncate(a);
             let b = truncate(b);
@@ -200,7 +260,12 @@ fn evaluate(name: &str, src: &[Value]) -> Value {
         "s_and_b32" | "v_and_b32" => {
             if let (Some(x), Some(y)) = (a.constant_value(), b.constant_value()) {
                 Value::constant(x & y)
-            } else { Value { lo: 0, hi: a.hi.min(b.hi) } }
+            } else {
+                Value {
+                    lo: 0,
+                    hi: a.hi.min(b.hi),
+                }
+            }
         }
         "s_or_b32" | "v_or_b32" | "s_xor_b32" | "v_xor_b32" => {
             let xor = name.contains("xor");
@@ -208,25 +273,45 @@ fn evaluate(name: &str, src: &[Value]) -> Value {
                 Value::constant(if xor { x ^ y } else { x | y })
             } else {
                 let bits = 32 - (a.hi | b.hi).leading_zeros();
-                Value { lo: 0, hi: u32::MAX.checked_shr(32 - bits).unwrap_or(0) }
+                Value {
+                    lo: 0,
+                    hi: u32::MAX.checked_shr(32 - bits).unwrap_or(0),
+                }
             }
         }
         "s_lshl_b32" | "v_lshlrev_b32" | "s_lshr_b32" | "v_lshrrev_b32" => {
-            let (value, shift) = if name.starts_with("v_") { (b, a) } else { (a, b) };
-            let Some(n) = shift.constant_value().map(|n| n & 31) else { return Value::UNKNOWN };
+            let (value, shift) = if name.starts_with("v_") {
+                (b, a)
+            } else {
+                (a, b)
+            };
+            let Some(n) = shift.constant_value().map(|n| n & 31) else {
+                return Value::UNKNOWN;
+            };
             if name.contains("lshr") {
-                Value { lo: value.lo >> n, hi: value.hi >> n }
+                Value {
+                    lo: value.lo >> n,
+                    hi: value.hi >> n,
+                }
             } else if let Some(x) = value.constant_value() {
                 Value::constant(x.wrapping_shl(n))
             } else if value.hi <= u32::MAX >> n {
-                Value { lo: value.lo << n, hi: value.hi << n }
-            } else { Value::UNKNOWN }
+                Value {
+                    lo: value.lo << n,
+                    hi: value.hi << n,
+                }
+            } else {
+                Value::UNKNOWN
+            }
         }
         "v_lshl_add_u32" => {
             let shift = b.constant_value().map(|n| n & 31);
             match shift {
-                Some(n) if a.hi <= u32::MAX >> n =>
-                    Value { lo: a.lo << n, hi: a.hi << n }.add(c),
+                Some(n) if a.hi <= u32::MAX >> n => Value {
+                    lo: a.lo << n,
+                    hi: a.hi << n,
+                }
+                .add(c),
                 _ => Value::UNKNOWN,
             }
         }
@@ -241,24 +326,44 @@ fn evaluate(name: &str, src: &[Value]) -> Value {
         // In wave64 the upper lanes count all 32 lower-mask bits.
         "v_mbcnt_lo_u32_b32" => b.add(Value { lo: 0, hi: 32 }),
         "v_mbcnt_hi_u32_b32" => b.add(Value { lo: 0, hi: 32 }),
-        "s_min_u32" | "v_min_u32" => Value { lo: a.lo.min(b.lo), hi: a.hi.min(b.hi) },
-        "s_max_u32" | "v_max_u32" => Value { lo: a.lo.max(b.lo), hi: a.hi.max(b.hi) },
+        "s_min_u32" | "v_min_u32" => Value {
+            lo: a.lo.min(b.lo),
+            hi: a.hi.min(b.hi),
+        },
+        "s_max_u32" | "v_max_u32" => Value {
+            lo: a.lo.max(b.lo),
+            hi: a.hi.max(b.hi),
+        },
         "s_cselect_b32" | "v_cndmask_b32" => a.join(b),
         "s_bfe_u32" => match b.constant_value() {
             Some(control) => {
                 let shift = control & 31;
                 let width = (control >> 16) & 127;
-                let mask = u32::MAX.checked_shr(32u32.saturating_sub(width)).unwrap_or(0);
-                if let Some(x) = a.constant_value() { Value::constant((x >> shift) & mask) }
-                else { Value { lo: 0, hi: (a.hi >> shift).min(mask) } }
+                let mask = u32::MAX
+                    .checked_shr(32u32.saturating_sub(width))
+                    .unwrap_or(0);
+                if let Some(x) = a.constant_value() {
+                    Value::constant((x >> shift) & mask)
+                } else {
+                    Value {
+                        lo: 0,
+                        hi: (a.hi >> shift).min(mask),
+                    }
+                }
             }
             None => Value::UNKNOWN,
         },
         "v_bfe_u32" => match (b.constant_value(), c.constant_value()) {
             (Some(shift), Some(width)) => {
                 let mask = u32::MAX.checked_shr(32 - (width & 31)).unwrap_or(0);
-                if let Some(x) = a.constant_value() { Value::constant((x >> (shift & 31)) & mask) }
-                else { Value { lo: 0, hi: (a.hi >> (shift & 31)).min(mask) } }
+                if let Some(x) = a.constant_value() {
+                    Value::constant((x >> (shift & 31)) & mask)
+                } else {
+                    Value {
+                        lo: 0,
+                        hi: (a.hi >> (shift & 31)).min(mask),
+                    }
+                }
             }
             _ => Value::UNKNOWN,
         },
@@ -268,37 +373,66 @@ fn evaluate(name: &str, src: &[Value]) -> Value {
 
 fn transfer(st: &mut Values, inst: &Inst, arch: Arch) {
     use crate::effects::ImplicitSet;
-    let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else { return };
+    let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else {
+        return;
+    };
     let mut src = smallvec::SmallVec::<[Value; 4]>::new();
-    for ((field, _), op) in row.slots(crate::isa::atomic_returns(arch, &inst.mods.cpol)).zip(&inst.operands) {
+    for ((field, _), op) in row
+        .slots(crate::isa::atomic_returns(arch, &inst.mods.cpol))
+        .zip(&inst.operands)
+    {
         if row.uses.split(',').any(|f| f == field) {
             src.push(st.operand(op));
         }
     }
-    let value = if inst.mods.abs != 0 || inst.mods.neg != 0 || inst.mods.sdwa.is_some()
-        || inst.mods.op_sel != 0 || inst.effects.mem.is_some() {
+    let value = if inst.mods.abs != 0
+        || inst.mods.neg != 0
+        || inst.mods.sdwa.is_some()
+        || inst.mods.op_sel != 0
+        || inst.effects.mem.is_some()
+    {
         Value::UNKNOWN
     } else if row.name == "s_getreg_b32" {
         // A hardware-register extract includes wave IDs without assuming a
         // particular dispatch's number of waves.
-        inst.operands.iter().find_map(|op| match op {
-            Operand::Hwreg(r) if r.size > 0 && r.size <= 32 =>
-                Some(Value { lo: 0, hi: u32::MAX >> (32 - r.size) }),
-            _ => None,
-        }).unwrap_or(Value::UNKNOWN)
-    } else { evaluate(row.name, &src) };
+        inst.operands
+            .iter()
+            .find_map(|op| match op {
+                Operand::Hwreg(r) if r.size > 0 && r.size <= 32 => Some(Value {
+                    lo: 0,
+                    hi: u32::MAX >> (32 - r.size),
+                }),
+                _ => None,
+            })
+            .unwrap_or(Value::UNKNOWN)
+    } else {
+        evaluate(row.name, &src)
+    };
     for reg in &inst.effects.defs {
         if let Some(base) = location(*reg) {
             for i in 0..usize::from(reg.len) {
                 if let Some(old) = st.regs.get_mut(base + i) {
-                    let next = if i == 0 && reg.len == 1 { value } else { Value::UNKNOWN };
-                    let partial = inst.operands.iter().any(|op| matches!(op, Operand::Half(r, _) if r == reg));
-                    *old = if reg.kind == Kind::V && (!st.full_exec || partial) { old.join(next) } else { next };
+                    let next = if i == 0 && reg.len == 1 {
+                        value
+                    } else {
+                        Value::UNKNOWN
+                    };
+                    let partial = inst
+                        .operands
+                        .iter()
+                        .any(|op| matches!(op, Operand::Half(r, _) if r == reg));
+                    *old = if reg.kind == Kind::V && (!st.full_exec || partial) {
+                        old.join(next)
+                    } else {
+                        next
+                    };
                 }
             }
         }
     }
-    if inst.effects.implicit.writes & ImplicitSet::EXEC != 0 { st.full_exec = false; }
+    if inst.effects.implicit.writes & ImplicitSet::EXEC != 0 {
+        st.full_exec = false;
+    }
 }
 
 /// Refine unsigned scalar loop guards only while their SCC and source
@@ -307,13 +441,26 @@ fn refine(st: &mut Values, body: &Body, arch: Arch, range: (usize, usize), scc: 
     use crate::effects::ImplicitSet;
     for pos in (range.0..range.1).rev() {
         let inst = body.insts.get(body.layout[pos]).expect("validated layout");
-        if inst.effects.implicit.writes & ImplicitSet::SCC == 0 { continue; }
+        if inst.effects.implicit.writes & ImplicitSet::SCC == 0 {
+            continue;
+        }
         let name = inst.op.name(arch).unwrap_or("");
-        let Some(Operand::Reg(reg)) = inst.operands.first() else { return };
-        if reg.kind != Kind::S || reg.len != 1 { return; }
-        let Some(n) = inst.operands.get(1).and_then(const_operand) else { return };
-        if body.layout[pos+1..range.1].iter().any(|id| body.insts.get(*id).unwrap().effects.defs.iter()
-            .any(|r| r.kind == reg.kind && r.base <= reg.base && reg.base < r.base + u16::from(r.len))) { return; }
+        let Some(Operand::Reg(reg)) = inst.operands.first() else {
+            return;
+        };
+        if reg.kind != Kind::S || reg.len != 1 {
+            return;
+        }
+        let Some(n) = inst.operands.get(1).and_then(const_operand) else {
+            return;
+        };
+        if body.layout[pos + 1..range.1].iter().any(|id| {
+            body.insts.get(*id).unwrap().effects.defs.iter().any(|r| {
+                r.kind == reg.kind && r.base <= reg.base && reg.base < r.base + u16::from(r.len)
+            })
+        }) {
+            return;
+        }
         let value = &mut st.regs[location(*reg).unwrap()];
         let (lo, hi) = match (name, scc) {
             ("s_cmp_lt_u32", true) | ("s_cmp_ge_u32", false) if n > 0 => (0, n - 1),
@@ -325,7 +472,10 @@ fn refine(st: &mut Values, body: &Body, arch: Arch, range: (usize, usize), scc: 
         // An impossible edge may be retained, but must never create an
         // invalid interval.
         if value.lo.max(lo) <= value.hi.min(hi) {
-            *value = Value { lo: value.lo.max(lo), hi: value.hi.min(hi) };
+            *value = Value {
+                lo: value.lo.max(lo),
+                hi: value.hi.min(hi),
+            };
         }
         return;
     }
@@ -335,12 +485,22 @@ fn entries(body: &Body, arch: Arch) -> Vec<Option<Values>> {
     use crate::cfg::Cond;
     use crate::effects::Control;
     let count = body.blocks.len().max(1);
-    let size = body.insts.iter().flat_map(|(_, i)| i.effects.defs.iter().chain(&i.effects.uses))
-        .filter_map(|r| location(*r).map(|n| n + usize::from(r.len))).max().unwrap_or(0);
-    let seed = Values { regs: vec![Value::UNKNOWN; size], full_exec: true };
+    let size = body
+        .insts
+        .iter()
+        .flat_map(|(_, i)| i.effects.defs.iter().chain(&i.effects.uses))
+        .filter_map(|r| location(*r).map(|n| n + usize::from(r.len)))
+        .max()
+        .unwrap_or(0);
+    let seed = Values {
+        regs: vec![Value::UNKNOWN; size],
+        full_exec: true,
+    };
     let mut input = vec![None; count];
     input[0] = Some(seed);
-    if body.blocks.is_empty() { return input; }
+    if body.blocks.is_empty() {
+        return input;
+    }
     let mut queue = std::collections::VecDeque::from([0]);
     let mut queued = vec![false; count];
     queued[0] = true;
@@ -352,16 +512,28 @@ fn entries(body: &Body, arch: Arch) -> Vec<Option<Values>> {
     for (_, inst) in body.insts.iter() {
         for n in inst.operands.iter().filter_map(const_operand) {
             thresholds.push(n);
-            if n > 0 { thresholds.push(n - 1); }
-            if n < u32::MAX { thresholds.push(n + 1); }
+            if n > 0 {
+                thresholds.push(n - 1);
+            }
+            if n < u32::MAX {
+                thresholds.push(n + 1);
+            }
         }
     }
     thresholds.sort_unstable();
     thresholds.dedup();
-    let indices: std::collections::HashMap<_, _> = body.blocks.iter().enumerate()
-        .map(|(i, b)| (b.id, i)).collect();
-    let first_at: std::collections::HashMap<_, _> = body.blocks.iter().enumerate()
-        .map(|(i, b)| (b.range.0, i)).collect();
+    let indices: std::collections::HashMap<_, _> = body
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+    let first_at: std::collections::HashMap<_, _> = body
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.range.0, i))
+        .collect();
     while let Some(b) = queue.pop_front() {
         queued[b] = false;
         let block = &body.blocks[b];
@@ -369,11 +541,17 @@ fn entries(body: &Body, arch: Arch) -> Vec<Option<Values>> {
         let mut enqueue = |next: usize, edge: &Values| {
             let changed = match &mut input[next] {
                 Some(old) => old.merge(edge, updates[next] >= 3, &thresholds),
-                slot @ None => { *slot = Some(edge.clone()); true },
+                slot @ None => {
+                    *slot = Some(edge.clone());
+                    true
+                }
             };
             if changed {
                 updates[next] += 1;
-                if !queued[next] { queue.push_back(next); queued[next] = true; }
+                if !queued[next] {
+                    queue.push_back(next);
+                    queued[next] = true;
+                }
             }
         };
         let mut falls = true;
@@ -392,13 +570,23 @@ fn entries(body: &Body, arch: Arch) -> Vec<Option<Values>> {
                 };
                 if let Some(next) = target {
                     let mut edge = out.clone();
-                    if let Some(scc) = scc { refine(&mut edge, body, arch, (block.range.0, pos + 1), scc); }
+                    if let Some(scc) = scc {
+                        refine(&mut edge, body, arch, (block.range.0, pos + 1), scc);
+                    }
                     enqueue(next, &edge);
                 }
-                if matches!(inst.effects.control, Control::Jump) { falls = false; break; }
-                if let Some(scc) = scc { refine(&mut out, body, arch, (block.range.0, pos + 1), !scc); }
+                if matches!(inst.effects.control, Control::Jump) {
+                    falls = false;
+                    break;
+                }
+                if let Some(scc) = scc {
+                    refine(&mut out, body, arch, (block.range.0, pos + 1), !scc);
+                }
             }
-            if matches!(inst.effects.control, Control::EndPgm | Control::Trap | Control::Halt) {
+            if matches!(
+                inst.effects.control,
+                Control::EndPgm | Control::Trap | Control::Halt
+            ) {
                 falls = false;
                 break;
             }
@@ -419,39 +607,70 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<LdsAnalysis, LdsError> {
     }
     let whole = SegId(0);
     let mut facts = LdsFacts {
-        segments: vec![LdsSegment { id: whole, range: None, origin: SegmentOrigin::Whole }],
+        segments: vec![LdsSegment {
+            id: whole,
+            range: None,
+            origin: SegmentOrigin::Whole,
+        }],
         accesses: Vec::new(),
         max_end: Some(0),
     };
     let mut end = 0u32;
     let mut bounded = false;
     for id in &body.layout {
-        if body.insts.get(*id).is_none() { return Err(LdsError::DanglingInst { id: *id }); }
+        if body.insts.get(*id).is_none() {
+            return Err(LdsError::DanglingInst { id: *id });
+        }
     }
     let input = entries(body, arch);
-    let ranges: Vec<_> = if body.blocks.is_empty() { vec![(0, body.layout.len())] }
-        else { body.blocks.iter().map(|b| b.range).collect() };
+    let ranges: Vec<_> = if body.blocks.is_empty() {
+        vec![(0, body.layout.len())]
+    } else {
+        body.blocks.iter().map(|b| b.range).collect()
+    };
     for (block, range) in ranges.iter().enumerate() {
-        let Some(mut st) = input[block].clone() else { continue };
+        let Some(mut st) = input[block].clone() else {
+            continue;
+        };
         for pos in range.0..range.1 {
             let id = body.layout[pos];
             let inst = body.insts.get(id).expect("validated layout");
             if let Some(kind) = inst.effects.mem.as_ref().and_then(|m| access_kind(m.class)) {
                 let name = inst.op.name(arch).unwrap_or("");
                 let bytes = access_bytes(name);
-                let value = inst.effects.uses.first().and_then(|r| location(*r))
-                    .and_then(|i| st.regs.get(i).copied()).unwrap_or(Value::UNKNOWN)
+                let value = inst
+                    .effects
+                    .uses
+                    .first()
+                    .and_then(|r| location(*r))
+                    .and_then(|i| st.regs.get(i).copied())
+                    .unwrap_or(Value::UNKNOWN)
                     .add(own_offsets(inst, bytes, name));
                 let addr = value.fact();
                 match value.hi.checked_add(bytes) {
                     Some(n) if addr != AddrFact::Unknown && bytes != 0 => end = end.max(n),
                     _ => bounded = true,
                 }
-                facts.accesses.push((LdsAccess { inst: id, addr, bytes, kind }, whole));
+                facts.accesses.push((
+                    LdsAccess {
+                        inst: id,
+                        addr,
+                        bytes,
+                        kind,
+                    },
+                    whole,
+                ));
             }
             transfer(&mut st, inst, arch);
-            if matches!(inst.effects.control, crate::effects::Control::Jump | crate::effects::Control::EndPgm
-                | crate::effects::Control::Trap | crate::effects::Control::Halt) { break; }
+            if matches!(
+                inst.effects.control,
+                crate::effects::Control::Jump
+                    | crate::effects::Control::EndPgm
+                    | crate::effects::Control::Trap
+                    | crate::effects::Control::Halt
+            ) {
+                break;
+            }
         }
     }
     facts.max_end = if bounded { None } else { Some(end) };
@@ -469,12 +688,19 @@ mod tests {
     use crate::provenance::Provenance;
 
     fn row(name: &str) -> (crate::inst::Opcode, Form) {
-        let row = crate::isa::gfx12().iter().find(|row| row.name == name).expect(name);
+        let row = crate::isa::gfx12()
+            .iter()
+            .find(|row| row.name == name)
+            .expect(name);
         (row.op, row.form)
     }
 
     fn v(base: u16) -> Operand {
-        Operand::Reg(crate::reg::RegRef { kind: Kind::V, base, len: 1 })
+        Operand::Reg(crate::reg::RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        })
     }
 
     fn inst(name: &str, operands: Vec<Operand>) -> Inst {
@@ -530,24 +756,54 @@ mod tests {
     }
 
     fn s(base: u16) -> Operand {
-        Operand::Reg(crate::reg::RegRef { kind: Kind::S, base, len: 1 })
+        Operand::Reg(crate::reg::RegRef {
+            kind: Kind::S,
+            base,
+            len: 1,
+        })
     }
-    fn literal(n: u32) -> Operand { Operand::Literal(n) }
+    fn literal(n: u32) -> Operand {
+        Operand::Literal(n)
+    }
     fn bounded_address(body: &Body) -> AddrFact {
-        analyze(body, Arch::Gfx1201).unwrap().facts.accesses[0].0.addr
+        analyze(body, Arch::Gfx1201).unwrap().facts.accesses[0]
+            .0
+            .addr
     }
 
     #[test]
     fn lane_wave_scalar_mul_and_mad_address_chain() {
         let body = body_of(vec![
-            inst("s_getreg_b32", vec![s(4), Operand::Hwreg(crate::operand::HwReg { id: 4, offset: 0, size: 5 })]),
+            inst(
+                "s_getreg_b32",
+                vec![
+                    s(4),
+                    Operand::Hwreg(crate::operand::HwReg {
+                        id: 4,
+                        offset: 0,
+                        size: 5,
+                    }),
+                ],
+            ),
             inst("s_mul_i32", vec![s(4), s(4), literal(128)]),
-            inst("v_mbcnt_lo_u32_b32", vec![v(2), literal(u32::MAX), literal(0)]),
+            inst(
+                "v_mbcnt_lo_u32_b32",
+                vec![v(2), literal(u32::MAX), literal(0)],
+            ),
             inst("v_mad_u32_u24", vec![v(3), v(2), literal(4), s(4)]),
-            inst("ds_store_b32", vec![v(3), v(11), Operand::Imm(ImmField::DsOffset(64))]),
+            inst(
+                "ds_store_b32",
+                vec![v(3), v(11), Operand::Imm(ImmField::DsOffset(64))],
+            ),
         ]);
-        assert_eq!(bounded_address(&body), AddrFact::Bounded { lo: 64, hi: 4160 });
-        assert_eq!(analyze(&body, Arch::Gfx1201).unwrap().facts.max_end, Some(4164));
+        assert_eq!(
+            bounded_address(&body),
+            AddrFact::Bounded { lo: 64, hi: 4160 }
+        );
+        assert_eq!(
+            analyze(&body, Arch::Gfx1201).unwrap().facts.max_end,
+            Some(4164)
+        );
     }
 
     #[test]
@@ -563,9 +819,31 @@ mod tests {
             inst("s_cbranch_scc1", vec![Operand::Label(BlockId(1))]),
         ]);
         body.blocks = vec![
-            Block { id: BlockId(0), range: (0,1), term: Terminator::FallThrough, preds: smallvec::smallvec![], succs: smallvec::smallvec![BlockId(1)] },
-            Block { id: BlockId(1), range: (1,7), term: Terminator::Branch { cond: Cond::Scc1, taken: BlockId(1), fallthrough: BlockId(2) }, preds: smallvec::smallvec![BlockId(0),BlockId(1)], succs: smallvec::smallvec![BlockId(1),BlockId(2)] },
-            Block { id: BlockId(2), range: (7,7), term: Terminator::EndPgm, preds: smallvec::smallvec![BlockId(1)], succs: smallvec::smallvec![] },
+            Block {
+                id: BlockId(0),
+                range: (0, 1),
+                term: Terminator::FallThrough,
+                preds: smallvec::smallvec![],
+                succs: smallvec::smallvec![BlockId(1)],
+            },
+            Block {
+                id: BlockId(1),
+                range: (1, 7),
+                term: Terminator::Branch {
+                    cond: Cond::Scc1,
+                    taken: BlockId(1),
+                    fallthrough: BlockId(2),
+                },
+                preds: smallvec::smallvec![BlockId(0), BlockId(1)],
+                succs: smallvec::smallvec![BlockId(1), BlockId(2)],
+            },
+            Block {
+                id: BlockId(2),
+                range: (7, 7),
+                term: Terminator::EndPgm,
+                preds: smallvec::smallvec![BlockId(1)],
+                succs: smallvec::smallvec![],
+            },
         ];
         assert_eq!(bounded_address(&body), AddrFact::Bounded { lo: 0, hi: 60 });
     }
@@ -583,13 +861,34 @@ mod tests {
             inst("ds_store_b32", vec![v(2), v(11)]),
         ]);
         body.blocks = vec![
-            Block { id: BlockId(0), range: (0,4), term: Terminator::Jump(BlockId(2)), preds: smallvec::smallvec![], succs: smallvec::smallvec![BlockId(1),BlockId(2)] },
-            Block { id: BlockId(1), range: (4,6), term: Terminator::Jump(BlockId(2)), preds: smallvec::smallvec![BlockId(0)], succs: smallvec::smallvec![BlockId(2)] },
-            Block { id: BlockId(2), range: (6,7), term: Terminator::EndPgm, preds: smallvec::smallvec![BlockId(0),BlockId(1)], succs: smallvec::smallvec![] },
+            Block {
+                id: BlockId(0),
+                range: (0, 4),
+                term: Terminator::Jump(BlockId(2)),
+                preds: smallvec::smallvec![],
+                succs: smallvec::smallvec![BlockId(1), BlockId(2)],
+            },
+            Block {
+                id: BlockId(1),
+                range: (4, 6),
+                term: Terminator::Jump(BlockId(2)),
+                preds: smallvec::smallvec![BlockId(0)],
+                succs: smallvec::smallvec![BlockId(2)],
+            },
+            Block {
+                id: BlockId(2),
+                range: (6, 7),
+                term: Terminator::EndPgm,
+                preds: smallvec::smallvec![BlockId(0), BlockId(1)],
+                succs: smallvec::smallvec![],
+            },
         ];
         let facts = analyze(&body, Arch::Gfx1201).unwrap().facts;
         assert_eq!(facts.accesses[0].0.addr, AddrFact::Const(16));
-        assert_eq!(facts.accesses[1].0.addr, AddrFact::Bounded { lo: 16, hi: 128 });
+        assert_eq!(
+            facts.accesses[1].0.addr,
+            AddrFact::Bounded { lo: 16, hi: 128 }
+        );
     }
 
     #[test]
@@ -601,9 +900,31 @@ mod tests {
             inst("ds_store_b32", vec![v(2), v(11)]),
         ]);
         body.blocks = vec![
-            Block { id: BlockId(0), range: (0,1), term: Terminator::Branch { cond: Cond::Scc1, taken: BlockId(2), fallthrough: BlockId(1) }, preds: smallvec::smallvec![], succs: smallvec::smallvec![BlockId(1),BlockId(2)] },
-            Block { id: BlockId(1), range: (1,2), term: Terminator::FallThrough, preds: smallvec::smallvec![BlockId(0)], succs: smallvec::smallvec![BlockId(2)] },
-            Block { id: BlockId(2), range: (2,3), term: Terminator::EndPgm, preds: smallvec::smallvec![BlockId(0),BlockId(1)], succs: smallvec::smallvec![] },
+            Block {
+                id: BlockId(0),
+                range: (0, 1),
+                term: Terminator::Branch {
+                    cond: Cond::Scc1,
+                    taken: BlockId(2),
+                    fallthrough: BlockId(1),
+                },
+                preds: smallvec::smallvec![],
+                succs: smallvec::smallvec![BlockId(1), BlockId(2)],
+            },
+            Block {
+                id: BlockId(1),
+                range: (1, 2),
+                term: Terminator::FallThrough,
+                preds: smallvec::smallvec![BlockId(0)],
+                succs: smallvec::smallvec![BlockId(2)],
+            },
+            Block {
+                id: BlockId(2),
+                range: (2, 3),
+                term: Terminator::EndPgm,
+                preds: smallvec::smallvec![BlockId(0), BlockId(1)],
+                succs: smallvec::smallvec![],
+            },
         ];
         assert_eq!(bounded_address(&body), AddrFact::Unknown);
         let body = body_of(vec![
@@ -623,23 +944,65 @@ mod tests {
             inst("v_mov_b32_e32", vec![v(2), literal(16)]),
             inst("ds_store_b32", vec![v(2), v(11)]),
         ]);
-        assert_eq!(bounded_address(&body), AddrFact::Bounded { lo: 16, hi: 1024 });
+        assert_eq!(
+            bounded_address(&body),
+            AddrFact::Bounded { lo: 16, hi: 1024 }
+        );
         let body = body_of(vec![
             inst("v_mov_b32_e32", vec![v(2), literal(128)]),
-            inst("ds_load_2addr_b64", vec![
-                Operand::Reg(crate::reg::RegRef { kind: Kind::V, base: 4, len: 4 }), v(2),
-                Operand::Imm(ImmField::DsOffset0(3)), Operand::Imm(ImmField::DsOffset1(1)),
-            ]),
+            inst(
+                "ds_load_2addr_b64",
+                vec![
+                    Operand::Reg(crate::reg::RegRef {
+                        kind: Kind::V,
+                        base: 4,
+                        len: 4,
+                    }),
+                    v(2),
+                    Operand::Imm(ImmField::DsOffset0(3)),
+                    Operand::Imm(ImmField::DsOffset1(1)),
+                ],
+            ),
         ]);
-        assert_eq!(bounded_address(&body), AddrFact::Bounded { lo: 136, hi: 152 });
-        assert_eq!(analyze(&body, Arch::Gfx1201).unwrap().facts.max_end, Some(160));
+        assert_eq!(
+            bounded_address(&body),
+            AddrFact::Bounded { lo: 136, hi: 152 }
+        );
+        assert_eq!(
+            analyze(&body, Arch::Gfx1201).unwrap().facts.max_end,
+            Some(160)
+        );
     }
 
     #[test]
     fn overflow_and_u24_truncation_are_not_unsigned_linear_arithmetic() {
-        assert_eq!(Value { lo: u32::MAX - 4, hi: u32::MAX }.add(Value::constant(8)), Value::UNKNOWN);
-        assert_eq!(Value { lo: 1, hi: u32::MAX }.mul(Value::constant(4)), Value::UNKNOWN);
-        assert_eq!(evaluate("v_mad_u32_u24", &[Value::constant(0x1000001),Value::constant(4),Value::constant(8)]), Value::constant(12));
+        assert_eq!(
+            Value {
+                lo: u32::MAX - 4,
+                hi: u32::MAX
+            }
+            .add(Value::constant(8)),
+            Value::UNKNOWN
+        );
+        assert_eq!(
+            Value {
+                lo: 1,
+                hi: u32::MAX
+            }
+            .mul(Value::constant(4)),
+            Value::UNKNOWN
+        );
+        assert_eq!(
+            evaluate(
+                "v_mad_u32_u24",
+                &[
+                    Value::constant(0x1000001),
+                    Value::constant(4),
+                    Value::constant(8)
+                ]
+            ),
+            Value::constant(12)
+        );
     }
 
     #[test]
@@ -648,7 +1011,11 @@ mod tests {
             "global_load_b32",
             vec![
                 v(1),
-                Operand::Reg(crate::reg::RegRef { kind: Kind::V, base: 2, len: 2 }),
+                Operand::Reg(crate::reg::RegRef {
+                    kind: Kind::V,
+                    base: 2,
+                    len: 2,
+                }),
                 Operand::Vmem(crate::operand::VmemToken::Off),
             ],
         );
@@ -699,7 +1066,11 @@ mod kt48_tests {
         let analysis = super::analyze(&body, Arch::Gfx1201).unwrap();
         assert!(!analysis.facts.accesses.is_empty());
         assert!(
-            analysis.facts.accesses.iter().any(|(access, _)| access.addr == AddrFact::Unknown),
+            analysis
+                .facts
+                .accesses
+                .iter()
+                .any(|(access, _)| access.addr == AddrFact::Unknown),
             "expected computed LDS addresses"
         );
         assert_eq!(analysis.facts.max_end, None);

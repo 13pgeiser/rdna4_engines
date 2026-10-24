@@ -29,8 +29,8 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
     use hipfire_runtime::swap::SwapManager;
     use hipfire_runtime::tokenizer::Tokenizer;

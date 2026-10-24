@@ -49,6 +49,21 @@ impl sealed::State for Published {}
 pub trait State: sealed::State + 'static {}
 impl<S: sealed::State + 'static> State for S {}
 
+/// The states a ring may be in when it crosses between a typed body and the
+/// runtime `Driver` (`runtime::Lend`): `Free` and `Published`. A `Writing`
+/// buffer carries a `Pending` token, which has no dynamic form, so it never
+/// crosses.
+pub trait Lendable: State {
+    #[doc(hidden)]
+    const PHASE: crate::runtime::Phase;
+}
+impl Lendable for Free {
+    const PHASE: crate::runtime::Phase = crate::runtime::Phase::RtFree;
+}
+impl Lendable for Published {
+    const PHASE: crate::runtime::Phase = crate::runtime::Phase::RtPublished;
+}
+
 /// Backend slots of one region (a declared leaf, or joined leaves).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -59,14 +74,36 @@ pub struct Slots {
 impl Slots {
     const MAX: usize = 4;
     pub(crate) fn one(id: usize) -> Self {
-        Self { ids: [id; Self::MAX], len: 1 }
+        Self {
+            ids: [id; Self::MAX],
+            len: 1,
+        }
     }
     pub(crate) fn ids(&self) -> &[usize] {
         &self.ids[..self.len]
     }
+    /// Slots from build-time ids (the inverse of `ids`).
+    pub(crate) fn from_ids(ids: &[usize]) -> Result<Self, String> {
+        if ids.is_empty() || ids.len() > Self::MAX {
+            return Err(format!(
+                "a ring buffer holds 1 to {} slots, not {}",
+                Self::MAX,
+                ids.len()
+            ));
+        }
+        let mut out = Self {
+            ids: [ids[0]; Self::MAX],
+            len: ids.len(),
+        };
+        out.ids[..ids.len()].copy_from_slice(ids);
+        Ok(out)
+    }
     fn join(a: Self, b: Self) -> Result<Self, String> {
         if a.len + b.len > Self::MAX {
-            return Err(format!("a joined LDS region holds at most {} slots", Self::MAX));
+            return Err(format!(
+                "a joined LDS region holds at most {} slots",
+                Self::MAX
+            ));
         }
         let mut out = a;
         out.ids[a.len..a.len + b.len].copy_from_slice(b.ids());
@@ -75,12 +112,21 @@ impl Slots {
     }
     fn split(self, first: usize) -> Result<(Self, Self), String> {
         if first == 0 || first >= self.len {
-            return Err(format!("cannot split a {}-slot region after {first} slots", self.len));
+            return Err(format!(
+                "cannot split a {}-slot region after {first} slots",
+                self.len
+            ));
         }
         let mut b = self;
         b.ids.copy_within(first..self.len, 0);
         b.len = self.len - first;
-        Ok((Self { ids: self.ids, len: first }, b))
+        Ok((
+            Self {
+                ids: self.ids,
+                len: first,
+            },
+            b,
+        ))
     }
 }
 
@@ -93,7 +139,11 @@ pub struct LdsRegion<R, S: State> {
 }
 impl<R, S: State> LdsRegion<R, S> {
     pub(crate) fn new(slots: Slots, last: Option<EventId>) -> Self {
-        Self { slots, last, _p: PhantomData }
+        Self {
+            slots,
+            last,
+            _p: PhantomData,
+        }
     }
     fn to<T: State>(self) -> LdsRegion<R, T> {
         LdsRegion::new(self.slots, self.last)
@@ -120,7 +170,13 @@ pub struct Ring<R, C: State, N: State> {
 impl<R> Ring<R, Free, Free> {
     /// A ring over two equal regions; `first` is written first.
     pub fn new(first: LdsRegion<R, Free>, second: LdsRegion<R, Free>) -> Self {
-        Self { bufs: [first.slots, second.slots], cur: 1, cur_live: false, last: None, _p: PhantomData }
+        Self {
+            bufs: [first.slots, second.slots],
+            cur: 1,
+            cur_live: false,
+            last: None,
+            _p: PhantomData,
+        }
     }
 }
 impl<R, N: State> Ring<R, Free, N> {
@@ -146,15 +202,60 @@ impl<R, C: State, N: State> Ring<R, C, N> {
     pub(crate) fn next_slots(&self) -> Slots {
         self.bufs[1 - self.cur]
     }
+    /// A ring's whole build-time state, for a hand-over to the runtime
+    /// `Driver` (`runtime::Lend`).
+    pub(crate) fn into_parts(self) -> RingParts {
+        RingParts {
+            bufs: self.bufs,
+            cur: self.cur,
+            cur_live: self.cur_live,
+            last: self.last,
+        }
+    }
+    pub(crate) fn from_parts(p: RingParts) -> Self {
+        Ring {
+            bufs: p.bufs,
+            cur: p.cur,
+            cur_live: p.cur_live,
+            last: p.last,
+            _p: PhantomData,
+        }
+    }
     pub(crate) fn duplicate(&self) -> Self {
-        Ring { bufs: self.bufs, cur: self.cur, cur_live: self.cur_live, last: self.last, _p: PhantomData }
+        Ring {
+            bufs: self.bufs,
+            cur: self.cur,
+            cur_live: self.cur_live,
+            last: self.last,
+            _p: PhantomData,
+        }
     }
     fn to<C2: State, N2: State>(self) -> Ring<R, C2, N2> {
-        Ring { bufs: self.bufs, cur: self.cur, cur_live: self.cur_live, last: self.last, _p: PhantomData }
+        Ring {
+            bufs: self.bufs,
+            cur: self.cur,
+            cur_live: self.cur_live,
+            last: self.last,
+            _p: PhantomData,
+        }
     }
     fn rotated<C2: State, N2: State>(self) -> Ring<R, C2, N2> {
-        Ring { bufs: self.bufs, cur: 1 - self.cur, cur_live: true, last: None, _p: PhantomData }
+        Ring {
+            bufs: self.bufs,
+            cur: 1 - self.cur,
+            cur_live: true,
+            last: None,
+            _p: PhantomData,
+        }
     }
+}
+
+/// The fields of a `Ring` that cross to and from the runtime `Driver`.
+pub(crate) struct RingParts {
+    pub(crate) bufs: [Slots; 2],
+    pub(crate) cur: usize,
+    pub(crate) cur_live: bool,
+    pub(crate) last: Option<EventId>,
 }
 
 /// Something an LDS store may write: a `Free` region (or a ring's `Free`
@@ -184,7 +285,10 @@ impl<W: WaitModel, R: 'static> StoreTarget<W> for LdsRegion<R, Free> {
         (self.to(), Pending::new(None))
     }
     fn stored(self, event: EventId) -> Self::Out {
-        (LdsRegion::new(self.slots, Some(event)), Pending::new(Some(event)))
+        (
+            LdsRegion::new(self.slots, Some(event)),
+            Pending::new(Some(event)),
+        )
     }
 }
 impl<W: WaitModel, R> sealed::Store for (LdsRegion<R, Writing>, Pending<W, LdsWrite<R>>) {}
@@ -197,7 +301,10 @@ impl<W: WaitModel, R: 'static> StoreTarget<W> for (LdsRegion<R, Writing>, Pendin
         self
     }
     fn stored(self, event: EventId) -> Self {
-        (LdsRegion::new(self.0.slots, Some(event)), Pending::new(Some(event)))
+        (
+            LdsRegion::new(self.0.slots, Some(event)),
+            Pending::new(Some(event)),
+        )
     }
 }
 impl<R, C: State> sealed::Store for Ring<R, C, Free> {}
@@ -216,7 +323,9 @@ impl<W: WaitModel, R: 'static, C: State> StoreTarget<W> for Ring<R, C, Free> {
     }
 }
 impl<W: WaitModel, R, C: State> sealed::Store for (Ring<R, C, Writing>, Pending<W, LdsWrite<R>>) {}
-impl<W: WaitModel, R: 'static, C: State> StoreTarget<W> for (Ring<R, C, Writing>, Pending<W, LdsWrite<R>>) {
+impl<W: WaitModel, R: 'static, C: State> StoreTarget<W>
+    for (Ring<R, C, Writing>, Pending<W, LdsWrite<R>>)
+{
     type Out = Self;
     fn slots(&self) -> Slots {
         self.0.next_slots()
@@ -240,12 +349,19 @@ pub struct Lowering {
 impl Lowering {
     const MAX: usize = 32;
     pub(crate) fn new() -> Self {
-        Self { items: [SlotTransition::Retire(0); Self::MAX], retire: 0, ready: 0 }
+        Self {
+            items: [SlotTransition::Retire(0); Self::MAX],
+            retire: 0,
+            ready: 0,
+        }
     }
     fn push(&mut self, t: SlotTransition) -> Result<(), String> {
         let n = self.retire + self.ready;
         if n == Self::MAX {
-            return Err(format!("one barrier carries at most {} slot transitions", Self::MAX));
+            return Err(format!(
+                "one barrier carries at most {} slot transitions",
+                Self::MAX
+            ));
         }
         // Retires first, then readies, each in transition order: the slot
         // list every hand-written builder barrier passes.
@@ -263,10 +379,14 @@ impl Lowering {
         Ok(())
     }
     fn retire(&mut self, s: Slots) -> Result<(), String> {
-        s.ids().iter().try_for_each(|&id| self.push(SlotTransition::Retire(id)))
+        s.ids()
+            .iter()
+            .try_for_each(|&id| self.push(SlotTransition::Retire(id)))
     }
     fn ready(&mut self, s: Slots) -> Result<(), String> {
-        s.ids().iter().try_for_each(|&id| self.push(SlotTransition::Ready(id)))
+        s.ids()
+            .iter()
+            .try_for_each(|&id| self.push(SlotTransition::Ready(id)))
     }
     pub(crate) fn list(&self) -> &[SlotTransition] {
         &self.items[..self.retire + self.ready]
@@ -333,7 +453,10 @@ pub struct Rotate<R> {
     ring: Ring<R, Published, Writing>,
     drained: Drained<LdsWrite<R>>,
 }
-pub fn rotate<R: 'static>(ring: Ring<R, Published, Writing>, drained: Drained<LdsWrite<R>>) -> Rotate<R> {
+pub fn rotate<R: 'static>(
+    ring: Ring<R, Published, Writing>,
+    drained: Drained<LdsWrite<R>>,
+) -> Rotate<R> {
     Rotate { ring, drained }
 }
 impl<R> sealed::Transition for Rotate<R> {}
@@ -453,8 +576,14 @@ impl<J, R> JoinPart<J, Free> for LdsRegion<R, Free> {
 }
 /// Re-carve two `Free` regions into one region `J` (a store or load then
 /// covers every slot of both).
-pub fn join<J: 'static, A: JoinPart<J, Free>, B: JoinPart<J, Free>>(a: A, b: B) -> Result<LdsRegion<J, Free>, String> {
-    Ok(LdsRegion::new(Slots::join(a.part_slots(), b.part_slots())?, None))
+pub fn join<J: 'static, A: JoinPart<J, Free>, B: JoinPart<J, Free>>(
+    a: A,
+    b: B,
+) -> Result<LdsRegion<J, Free>, String> {
+    Ok(LdsRegion::new(
+        Slots::join(a.part_slots(), b.part_slots())?,
+        None,
+    ))
 }
 /// Two `Free` regions split from one.
 pub type FreeParts<A, B> = (LdsRegion<A, Free>, LdsRegion<B, Free>);

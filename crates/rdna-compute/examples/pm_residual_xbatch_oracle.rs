@@ -73,16 +73,38 @@ thread_local! {
 /// `[batch][m]` (f32, row-major); W is MQ4G256 v2 (`m` rows of `k/256`
 /// 136-byte groups). Exact gfx1201 only.
 pub trait ResidualXbatch {
-    fn gemv_mq4g256v2_residual_xbatch(&mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()>;
+    fn gemv_mq4g256v2_residual_xbatch(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()>;
 }
 
 impl ResidualXbatch for Gpu {
-    fn gemv_mq4g256v2_residual_xbatch(&mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+    fn gemv_mq4g256v2_residual_xbatch(
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
         let fail = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
         if self.arch != "gfx1201" {
             return fail(format!("{SYMBOL}: exact gfx1201 only, got {}", self.arch));
         }
-        if !(1..=RESIDUAL_XBATCH_MAX).contains(&batch) || m == 0 || k == 0 || k % 256 != 0 || m > i32::MAX as usize || k > i32::MAX as usize {
+        if !(1..=RESIDUAL_XBATCH_MAX).contains(&batch)
+            || m == 0
+            || k == 0
+            || k % 256 != 0
+            || m > i32::MAX as usize
+            || k > i32::MAX as usize
+        {
             return fail(format!("{SYMBOL}: batch {batch} (1..={RESIDUAL_XBATCH_MAX}), m {m} > 0, k {k} % 256 == 0 required"));
         }
         PM_OBJECT.with(|slot| -> HipResult<()> {
@@ -104,7 +126,16 @@ impl ResidualXbatch for Gpu {
             // SAFETY: the blob follows the object's ABI (A/x/y at 0/8/16,
             // M/K/B at 24/28/32) and every pointer is a live device buffer.
             let grid = m.div_ceil(RESIDUAL_XBATCH_ROWS) as u32;
-            unsafe { self.hip.launch_kernel_blob(func, [grid, 1, 1], [32, 1, 1], 0, None, blob.as_mut_slice()) }
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    [grid, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    None,
+                    blob.as_mut_slice(),
+                )
+            }
         })
     }
 }
@@ -117,15 +148,22 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(err)).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(err))
+        .collect()
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?).map_err(err)
+    serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
+        .map_err(err)
 }
 
 /// A SHA-checked pre-launch argument of a capture.
@@ -133,7 +171,9 @@ fn capture_arg(dir: &Path, off: usize, tag: &str) -> Result<Vec<u8>> {
     let meta = read_json(&dir.join("meta.json"))?;
     let name = format!("arg{off}.{tag}.bin");
     let bytes = std::fs::read(dir.join(&name)).map_err(err)?;
-    let want = meta["files"][&name]["sha256"].as_str().ok_or(format!("{}: no hash for {name}", dir.display()))?;
+    let want = meta["files"][&name]["sha256"]
+        .as_str()
+        .ok_or(format!("{}: no hash for {name}", dir.display()))?;
     if sha256_hex(&bytes) != want {
         return Err(format!("{}/{name}: sha256 mismatch", dir.display()));
     }
@@ -150,7 +190,9 @@ struct Capture {
 }
 
 fn residual_capture(occ: &str) -> Result<Capture> {
-    let dir = Path::new(CAPTURES).join("gemv_mq4g256v2_residual").join(occ);
+    let dir = Path::new(CAPTURES)
+        .join("gemv_mq4g256v2_residual")
+        .join(occ);
     let meta = read_json(&dir.join("meta.json"))?;
     if meta["symbol"] != INC_SYMBOL {
         return Err(format!("{}: not a {INC_SYMBOL} capture", dir.display()));
@@ -158,9 +200,19 @@ fn residual_capture(occ: &str) -> Result<Capture> {
     let ka = unhex(meta["kernarg_hex"].as_str().ok_or("kernarg_hex")?)?;
     let rd = |o: usize| i32::from_le_bytes(ka[o..o + 4].try_into().unwrap()) as usize;
     let (m, k) = (rd(24), rd(28));
-    let c = Capture { w: capture_arg(&dir, 0, "pre")?, x: capture_arg(&dir, 8, "pre")?, y: capture_arg(&dir, 16, "pre")?, m, k, dir };
+    let c = Capture {
+        w: capture_arg(&dir, 0, "pre")?,
+        x: capture_arg(&dir, 8, "pre")?,
+        y: capture_arg(&dir, 16, "pre")?,
+        m,
+        k,
+        dir,
+    };
     if c.w.len() != m * (k / 256) * 136 || c.x.len() != k * 4 || c.y.len() != m * 4 {
-        return Err(format!("{}: argument sizes disagree with M={m} K={k}", c.dir.display()));
+        return Err(format!(
+            "{}: argument sizes disagree with M={m} K={k}",
+            c.dir.display()
+        ));
     }
     Ok(c)
 }
@@ -169,13 +221,21 @@ fn residual_capture(occ: &str) -> Result<Capture> {
 fn activation_pool() -> Result<Vec<u8>> {
     let mut pool = Vec::new();
     for (module, occ, off) in [
-        ("gemv_mq4g256v2_residual", "occ0", 8), ("gemv_mq4g256v2_residual", "occ127", 8),
-        ("fused_gate_up_mq4g256v2", "occ0", 16), ("fused_gate_up_mq4g256v2", "occ63", 16),
-        ("fused_qkv_mq4g256v2", "occ0", 24), ("fused_qkv_mq4g256v2", "occ15", 24),
-        ("fused_qkvza_mq4g256v2", "occ0", 32), ("fused_qkvza_mq4g256v2", "occ47", 32),
+        ("gemv_mq4g256v2_residual", "occ0", 8),
+        ("gemv_mq4g256v2_residual", "occ127", 8),
+        ("fused_gate_up_mq4g256v2", "occ0", 16),
+        ("fused_gate_up_mq4g256v2", "occ63", 16),
+        ("fused_qkv_mq4g256v2", "occ0", 24),
+        ("fused_qkv_mq4g256v2", "occ15", 24),
+        ("fused_qkvza_mq4g256v2", "occ0", 32),
+        ("fused_qkvza_mq4g256v2", "occ47", 32),
         ("gemv_mq4g256v2_multirow_r2", "occ0", 8),
     ] {
-        pool.extend(capture_arg(&Path::new(CAPTURES).join(module).join(occ), off, "pre")?);
+        pool.extend(capture_arg(
+            &Path::new(CAPTURES).join(module).join(occ),
+            off,
+            "pre",
+        )?);
     }
     Ok(pool)
 }
@@ -184,7 +244,9 @@ fn activation_pool() -> Result<Vec<u8>> {
 fn residual_pool() -> Result<Vec<u8>> {
     let mut pool = Vec::new();
     for occ in ["occ0", "occ127"] {
-        let dir = Path::new(CAPTURES).join("gemv_mq4g256v2_residual").join(occ);
+        let dir = Path::new(CAPTURES)
+            .join("gemv_mq4g256v2_residual")
+            .join(occ);
         pool.extend(capture_arg(&dir, 16, "pre")?);
         pool.extend(capture_arg(&dir, 16, "post")?);
     }
@@ -194,10 +256,12 @@ fn residual_pool() -> Result<Vec<u8>> {
 /// `len` f32 of `pool` starting at f32 `start`, wrapping around.
 fn window(pool: &[u8], start: usize, len: usize) -> Vec<u8> {
     let n = pool.len() / 4;
-    (0..len).flat_map(|i| {
-        let j = (start + i) % n;
-        pool[j * 4..j * 4 + 4].to_vec()
-    }).collect()
+    (0..len)
+        .flat_map(|i| {
+            let j = (start + i) % n;
+            pool[j * 4..j * 4 + 4].to_vec()
+        })
+        .collect()
 }
 
 /// The first `groups` groups of each of the first `rows` rows.
@@ -211,8 +275,12 @@ fn reslice(w: &[u8], real_groups: usize, rows: usize, groups: usize) -> Vec<u8> 
 
 fn incumbent_source() -> Result<(String, String)> {
     let inv = read_json(Path::new(INVENTORY))?;
-    let m = inv["modules"].as_array().ok_or("inventory.modules")?.iter()
-        .find(|m| m["module"] == INC_MODULE).ok_or(format!("{INC_MODULE} not in inventory"))?;
+    let m = inv["modules"]
+        .as_array()
+        .ok_or("inventory.modules")?
+        .iter()
+        .find(|m| m["module"] == INC_MODULE)
+        .ok_or(format!("{INC_MODULE} not in inventory"))?;
     let snap = m["source_snapshot"].as_str().ok_or("source_snapshot")?;
     let source = std::fs::read_to_string(snap).map_err(err)?;
     let sha = sha256_hex(source.as_bytes());
@@ -247,17 +315,34 @@ impl Dev {
 }
 
 fn guards_intact(framed: &[u8], len: usize) -> bool {
-    framed[..GUARD].iter().chain(&framed[GUARD + len..]).all(|&b| b == GUARD_BYTE)
+    framed[..GUARD]
+        .iter()
+        .chain(&framed[GUARD + len..])
+        .all(|&b| b == GUARD_BYTE)
 }
 
-fn singleton(gpu: &Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> Result<()> {
+fn singleton(
+    gpu: &Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> Result<()> {
     let mut blob = KernargBlob::new();
     blob.push_ptr(w.buf.as_ptr() as *const c_void);
     blob.push_ptr(x.buf.as_ptr() as *const c_void);
     blob.push_ptr(y.buf.as_ptr() as *const c_void);
     blob.push_i32(m as i32);
     blob.push_i32(k as i32);
-    gpu.launch_kernel_blob(INC_SYMBOL, [m as u32, 1, 1], [32, 1, 1], 0, blob.as_mut_slice()).map_err(err)
+    gpu.launch_kernel_blob(
+        INC_SYMBOL,
+        [m as u32, 1, 1],
+        [32, 1, 1],
+        0,
+        blob.as_mut_slice(),
+    )
+    .map_err(err)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +379,8 @@ fn check(gpu: &mut Gpu, s: &Shape, batch: usize, flip_weight: bool) -> Result<(u
     let ycat: Vec<u8> = s.ys[..batch].concat();
     let (xcd, xc) = Dev::framed(gpu, &xcat)?;
     let (ycd, yc) = Dev::framed(gpu, &ycat)?;
-    gpu.gemv_mq4g256v2_residual_xbatch(&wc, &xc, &yc, m, k, batch).map_err(err)?;
+    gpu.gemv_mq4g256v2_residual_xbatch(&wc, &xc, &yc, m, k, batch)
+        .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
     let cand_y = ycd.download(gpu)?;
     let cand_x = xcd.download(gpu)?;
@@ -303,8 +389,14 @@ fn check(gpu: &mut Gpu, s: &Shape, batch: usize, flip_weight: bool) -> Result<(u
     for (b, (xd, yd)) in refs.iter().enumerate() {
         let ry = yd.download(gpu)?;
         let rx = xd.download(gpu)?;
-        if !guards_intact(&ry, m * 4) || !guards_intact(&rx, k * 4) || rx[GUARD..GUARD + k * 4] != s.xs[b][..] {
-            return Err(format!("{}: singleton reference wrote outside y[{b}]", s.name));
+        if !guards_intact(&ry, m * 4)
+            || !guards_intact(&rx, k * 4)
+            || rx[GUARD..GUARD + k * 4] != s.xs[b][..]
+        {
+            return Err(format!(
+                "{}: singleton reference wrote outside y[{b}]",
+                s.name
+            ));
         }
         let r = &ry[GUARD..GUARD + m * 4];
         let c = &cand_y[GUARD + b * m * 4..][..m * 4];
@@ -313,7 +405,8 @@ fn check(gpu: &mut Gpu, s: &Shape, batch: usize, flip_weight: bool) -> Result<(u
         // Non-vacuous: the reference changed y.
         let updated = r.iter().zip(&s.ys[b]).filter(|(a, b)| a != b).count();
         total += mism;
-        let mut v = json!({"column": b, "mismatch_bytes": mism, "reference_updated_bytes": updated});
+        let mut v =
+            json!({"column": b, "mismatch_bytes": mism, "reference_updated_bytes": updated});
         if let Some(i) = first {
             v["first_index"] = json!(i);
         }
@@ -331,14 +424,25 @@ fn check(gpu: &mut Gpu, s: &Shape, batch: usize, flip_weight: bool) -> Result<(u
     for d in [wd, wcd, xcd, ycd] {
         d.free(gpu)?;
     }
-    Ok((total, json!({
-        "shape": s.name, "M": m, "K": k, "groups": k / 256, "quads": k / 1024, "tail": (k / 256) % 4, "B": batch,
-        "mismatch_bytes": total, "candidate_guards_intact": guards, "candidate_x_unchanged": x_intact,
-        "columns": cols,
-    })))
+    Ok((
+        total,
+        json!({
+            "shape": s.name, "M": m, "K": k, "groups": k / 256, "quads": k / 1024, "tail": (k / 256) % 4, "B": batch,
+            "mismatch_bytes": total, "candidate_guards_intact": guards, "candidate_x_unchanged": x_intact,
+            "columns": cols,
+        }),
+    ))
 }
 
-fn shape_inputs<'a>(name: String, w: &'a [u8], m: usize, k: usize, own: Option<(&[u8], &[u8])>, act: &[u8], res: &[u8]) -> Shape<'a> {
+fn shape_inputs<'a>(
+    name: String,
+    w: &'a [u8],
+    m: usize,
+    k: usize,
+    own: Option<(&[u8], &[u8])>,
+    act: &[u8],
+    res: &[u8],
+) -> Shape<'a> {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     for b in 0..RESIDUAL_XBATCH_MAX {
@@ -353,7 +457,14 @@ fn shape_inputs<'a>(name: String, w: &'a [u8], m: usize, k: usize, own: Option<(
             }
         }
     }
-    Shape { name, w, m, k, xs, ys }
+    Shape {
+        name,
+        w,
+        m,
+        k,
+        xs,
+        ys,
+    }
 }
 
 fn oracle(gpu: &mut Gpu) -> Result<(usize, Value)> {
@@ -366,7 +477,15 @@ fn oracle(gpu: &mut Gpu) -> Result<(usize, Value)> {
     for occ in ["occ0", "occ127"] {
         let c = residual_capture(occ)?;
         let groups = c.k / 256;
-        let s = shape_inputs(format!("{occ} real M={} K={}", c.m, c.k), &c.w, c.m, c.k, Some((&c.x, &c.y)), &act, &res);
+        let s = shape_inputs(
+            format!("{occ} real M={} K={}", c.m, c.k),
+            &c.w,
+            c.m,
+            c.k,
+            Some((&c.x, &c.y)),
+            &act,
+            &res,
+        );
         for batch in 1..=RESIDUAL_XBATCH_MAX {
             let (n, v) = check(gpu, &s, batch, false)?;
             failures += n;
@@ -385,7 +504,15 @@ fn oracle(gpu: &mut Gpu) -> Result<(usize, Value)> {
             // Every row remainder of the 4/6/8-row workgroups, odd final rows.
             for rows in [1usize, 2, 3, 4, 5, 6, 7, 9, 13, 33, 65, c.m - 1] {
                 let w = reslice(&c.w, groups, rows, g);
-                let s = shape_inputs(format!("{occ} edge M={rows} K={}", g * 256), &w, rows, g * 256, None, &act, &res);
+                let s = shape_inputs(
+                    format!("{occ} edge M={rows} K={}", g * 256),
+                    &w,
+                    rows,
+                    g * 256,
+                    None,
+                    &act,
+                    &res,
+                );
                 for batch in 1..=RESIDUAL_XBATCH_MAX {
                     let (n, v) = check(gpu, &s, batch, false)?;
                     failures += n;
@@ -398,13 +525,22 @@ fn oracle(gpu: &mut Gpu) -> Result<(usize, Value)> {
             }
         }
     }
-    let real_mism: usize = real.iter().map(|v| v["mismatch_bytes"].as_u64().unwrap_or(0) as usize).sum();
-    let edge_mism: usize = edges.iter().map(|v| v["mismatch_bytes"].as_u64().unwrap_or(0) as usize).sum();
-    Ok((failures, json!({
-        "real": {"launches": real.len(), "mismatch_bytes": real_mism, "results": real},
-        "edges": {"launches": edges.len(), "mismatch_bytes": edge_mism, "results": edges},
-        "negative_controls": controls,
-    })))
+    let real_mism: usize = real
+        .iter()
+        .map(|v| v["mismatch_bytes"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    let edge_mism: usize = edges
+        .iter()
+        .map(|v| v["mismatch_bytes"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    Ok((
+        failures,
+        json!({
+            "real": {"launches": real.len(), "mismatch_bytes": real_mism, "results": real},
+            "edges": {"launches": edges.len(), "mismatch_bytes": edge_mism, "results": edges},
+            "negative_controls": controls,
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +552,12 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 /// Median per-call ms of `f` over `samples` event-timed samples of `reps` calls.
-fn time(gpu: &mut Gpu, samples: usize, reps: usize, mut f: impl FnMut(&mut Gpu) -> Result<()>) -> Result<(f64, Vec<f64>)> {
+fn time(
+    gpu: &mut Gpu,
+    samples: usize,
+    reps: usize,
+    mut f: impl FnMut(&mut Gpu) -> Result<()>,
+) -> Result<(f64, Vec<f64>)> {
     for _ in 0..5 {
         f(gpu)?;
     }
@@ -453,7 +594,12 @@ const XBATCH_RESIDUAL_SRC: &str = concat!(
 const COLD_BYTES: usize = 384 << 20;
 
 fn timing(gpu: &mut Gpu, batches: &[usize]) -> Result<Value> {
-    gpu.ensure_kernel_public("gemv_mq4g256v2_xbatch_residual", XBATCH_RESIDUAL_SRC, "gemv_mq4g256v2_xbatch_residual").map_err(err)?;
+    gpu.ensure_kernel_public(
+        "gemv_mq4g256v2_xbatch_residual",
+        XBATCH_RESIDUAL_SRC,
+        "gemv_mq4g256v2_xbatch_residual",
+    )
+    .map_err(err)?;
     let act = activation_pool()?;
     let res = residual_pool()?;
     let mut rows = Vec::new();
@@ -468,28 +614,47 @@ fn timing(gpu: &mut Gpu, batches: &[usize]) -> Result<Value> {
         }
         let xcat: Vec<u8> = s.xs.concat();
         let ycat: Vec<u8> = s.ys.concat();
-        let xf: Vec<f32> = xcat.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let yf: Vec<f32> = ycat.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let x = gpu.upload_f32(&xf, &[RESIDUAL_XBATCH_MAX, k]).map_err(err)?;
-        let y = gpu.upload_f32(&yf, &[RESIDUAL_XBATCH_MAX, m]).map_err(err)?;
+        let xf: Vec<f32> = xcat
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let yf: Vec<f32> = ycat
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let x = gpu
+            .upload_f32(&xf, &[RESIDUAL_XBATCH_MAX, k])
+            .map_err(err)?;
+        let y = gpu
+            .upload_f32(&yf, &[RESIDUAL_XBATCH_MAX, m])
+            .map_err(err)?;
         for (regime, n_w) in [("hot", 1usize), ("cold", copies)] {
             let ws = &ws[..n_w];
             for &batch in batches {
                 let mut i = 0usize;
                 let (cand, cand_s) = time(gpu, 15, 20, |g| {
                     i += 1;
-                    g.gemv_mq4g256v2_residual_xbatch(&ws[i % n_w], &x, &y, m, k, batch).map_err(err)
+                    g.gemv_mq4g256v2_residual_xbatch(&ws[i % n_w], &x, &y, m, k, batch)
+                        .map_err(err)
                 })?;
                 let (single, single_s) = time(gpu, 15, 20, |g| {
                     i += 1;
                     for b in 0..batch {
-                        singleton(g, &ws[i % n_w], &x.sub_offset(b * k, k), &y.sub_offset(b * m, m), m, k)?;
+                        singleton(
+                            g,
+                            &ws[i % n_w],
+                            &x.sub_offset(b * k, k),
+                            &y.sub_offset(b * m, m),
+                            m,
+                            k,
+                        )?;
                     }
                     Ok(())
                 })?;
                 let (wmma, wmma_s) = time(gpu, 15, 20, |g| {
                     i += 1;
-                    g.gemm_hfq4g256_residual_mq4v2(&ws[i % n_w], &x, &y, m, k, batch).map_err(err)
+                    g.gemm_hfq4g256_residual_mq4v2(&ws[i % n_w], &x, &y, m, k, batch)
+                        .map_err(err)
                 })?;
                 let (xb4, xb4_s) = time(gpu, 15, 20, |g| {
                     i += 1;
@@ -504,7 +669,14 @@ fn timing(gpu: &mut Gpu, batches: &[usize]) -> Result<Value> {
                         blob.push_i32(k as i32);
                         blob.push_i32(n as i32);
                         blob.pad_to(8);
-                        g.launch_kernel_blob("gemv_mq4g256v2_xbatch_residual", [m as u32, 1, 1], [32, 1, 1], 0, blob.as_mut_slice()).map_err(err)?;
+                        g.launch_kernel_blob(
+                            "gemv_mq4g256v2_xbatch_residual",
+                            [m as u32, 1, 1],
+                            [32, 1, 1],
+                            0,
+                            blob.as_mut_slice(),
+                        )
+                        .map_err(err)?;
                     }
                     Ok(())
                 })?;
@@ -527,7 +699,9 @@ fn timing(gpu: &mut Gpu, batches: &[usize]) -> Result<Value> {
             gpu.free_tensor(t).map_err(err)?;
         }
     }
-    Ok(json!({"rows": rows, "method": "hip events, null stream, 5 warmup calls, 15 samples x 20 calls, median per call; hot = one weight copy (LLC-resident), cold = copies rotated per call totalling >= 384 MiB"}))
+    Ok(
+        json!({"rows": rows, "method": "hip events, null stream, 5 warmup calls, 15 samples x 20 calls, median per call; hot = one weight copy (LLC-resident), cold = copies rotated per call totalling >= 384 MiB"}),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -545,14 +719,21 @@ fn main() {
 
 fn run() -> Result<usize> {
     let mut args = std::env::args().skip(1);
-    let cmd = args.next().ok_or("usage: pm_residual_xbatch_oracle <oracle|timing> [--label L] [--batches 1,2,4,8]")?;
+    let cmd = args.next().ok_or(
+        "usage: pm_residual_xbatch_oracle <oracle|timing> [--label L] [--batches 1,2,4,8]",
+    )?;
     let mut label = cmd.clone();
     let mut batches: Vec<usize> = (1..=RESIDUAL_XBATCH_MAX).collect();
     while let Some(k) = args.next() {
         let v = args.next().ok_or(format!("{k} needs a value"))?;
         match k.as_str() {
             "--label" => label = v,
-            "--batches" => batches = v.split(',').map(|s| s.parse().map_err(err)).collect::<Result<_>>()?,
+            "--batches" => {
+                batches = v
+                    .split(',')
+                    .map(|s| s.parse().map_err(err))
+                    .collect::<Result<_>>()?
+            }
             _ => return Err(format!("unknown option {k}")),
         }
     }
@@ -561,7 +742,8 @@ fn run() -> Result<usize> {
     if gpu.arch != "gfx1201" {
         return Err(format!("gfx1201 only, got {}", gpu.arch));
     }
-    gpu.ensure_kernel_public(INC_MODULE, &source, INC_SYMBOL).map_err(err)?;
+    gpu.ensure_kernel_public(INC_MODULE, &source, INC_SYMBOL)
+        .map_err(err)?;
     let report_dir = Path::new(RESULTS).join(&label);
     std::fs::create_dir_all(&report_dir).map_err(err)?;
     let mut report = json!({
@@ -596,6 +778,10 @@ fn run() -> Result<usize> {
             r["real"]["launches"], r["real"]["mismatch_bytes"], r["edges"]["launches"], r["edges"]["mismatch_bytes"],
             r["negative_controls"].as_array().map(|a| a.iter().all(|c| c["detected"] == true)).unwrap_or(false));
     }
-    println!("{}: {}", if failures == 0 { "PASS" } else { "FAIL" }, path.display());
+    println!(
+        "{}: {}",
+        if failures == 0 { "PASS" } else { "FAIL" },
+        path.display()
+    );
     Ok(failures)
 }

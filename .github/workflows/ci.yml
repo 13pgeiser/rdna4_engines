@@ -16,9 +16,10 @@ name: CI
 # Required vs advisory: `build` and `test` are the load-bearing
 # "is it broken" gates and are intended to be required status checks on
 # master. `fmt` and `clippy` start advisory (not required) because this
-# repo predates CI and carries lint/format debt. rustfmt is enforced on
-# changed Rust files only until the historical workspace-wide churn is paid
-# down; promote the full gate after that cleanup pass.
+# repo predates CI and carries lint/format debt. beta is rustfmt-clean since
+# the 0.4.3 sweep: `fmt` checks the whole workspace plus the changed files
+# (which covers tools/ outside it); master carries the old debt until the
+# release merge, so the job stays advisory until then.
 
 on:
   pull_request:
@@ -98,8 +99,58 @@ jobs:
         # Moved from peacemaker-isa: compares the builder device-accept kernel
         # with the rdna-compute host twin on the CPU interpreter.
         run: cargo test --locked -p rdna-compute --test dflash_accept_emu
+      - name: Run MoE launcher ABI test (no GPU)
+        run: cargo test --locked -p rdna-compute --test all_launcher_abi
       - name: Run serve fault-injection tests
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
+
+  windows:
+    name: Windows MSVC (advisory, no GPU)
+    runs-on: windows-latest
+    # Promote to a required check after the first green run on beta.
+    # Compile/smoke coverage is not Windows GPU/runtime certification.
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: "12"
+      ROCR_VISIBLE_DEVICES: "-1"
+      HIP_VISIBLE_DEVICES: "-1"
+      HIPFIRE_TEST_REQUIRE_ROCM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native CLI and daemon (MSVC)
+        run: cargo build --release --locked -p hipfire-cli -p hipfire-daemon
+      - name: Test control-plane libraries (no GPU)
+        run: cargo test --locked --lib -p hipfire-config -p hipfire-registry -p hipfire-client
+      - name: Smoke version and JSON diagnostics without HIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:HIPFIRE_HOME = Join-Path $env:RUNNER_TEMP 'hipfire-smoke'
+          New-Item -ItemType Directory -Force -Path $env:HIPFIRE_HOME | Out-Null
+          & ./target/release/hipfire.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'hipfire --version failed' }
+          # Missing HIP is reported by diag; it must not fail the CLI or
+          # contaminate stdout. Do not assert GPU values on a hosted runner.
+          $diag = & ./target/release/hipfire.exe diag --json
+          if ($LASTEXITCODE -ne 0) { throw 'hipfire diag --json failed' }
+          $json = $diag -join "`n"
+          if ([string]::IsNullOrWhiteSpace($json)) { throw 'Empty diagnostic output' }
+          $null = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+          Write-Output $json
+      - name: Package unsigned developer artifact
+        run: ./scripts/package-windows.ps1
+      # upload-artifact@v4 is already used in hw-gate.yml and allowed here.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hipfire-windows-msvc
+          path: |
+            dist/hipfire-*-x86_64-pc-windows-msvc.zip
+            dist/hipfire-*-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
 
   gates:
     name: gates (ratchets, layering, registers)
@@ -166,9 +217,10 @@ jobs:
   fmt:
     name: rustfmt (advisory)
     runs-on: ubuntu-latest
-    # Truly advisory: on pushes, ci-rustfmt-changed diffs vs master and surfaces
-    # the whole dispatch-effort format backlog (Kevin's in-flight files included),
-    # so keep the step visible without making the job's status check red.
+    # Advisory: on master the old format debt remains until the 0.4.3 release
+    # merge (beta is clean since the sweep), so keep the steps visible without
+    # making the job's status check red. cargo-fmt is called directly because
+    # .cargo/config.toml shadows `cargo fmt`.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -176,6 +228,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - run: cargo-fmt --all -- --check
+        continue-on-error: true
       - run: bash scripts/ci-rustfmt-changed.sh
         continue-on-error: true
 

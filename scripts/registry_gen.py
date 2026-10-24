@@ -53,19 +53,34 @@ SCHEMA_VERSION = 1
 # truth. Disagreement beyond this fraction means the curated entry is stale
 # (wrong file / re-quantized upload) — fail so a human reconciles it.
 SIZE_TOLERANCE = 0.25
-# Keep old-client wire defaults through 0.4.x and at least 90 days. Upgraded
-# clients normalize this exact pin locally; the generator must never rename
-# the existing public tags or silently admit a replacement payload.
+# Flash-Next MQ4 XTS is published as ONE split base (`<name>-base.mq4-xts`) on
+# the family's shared PLE pair, under four stock tags. The monolithic spellings
+# below are removed from HF: no entry may download them. A verified local
+# monolithic keeps serving the split tags through a pin compiled into the
+# client (hipfire-registry GRANDFATHERED_MONOLITHICS), so these names survive
+# here only to be banned.
 FLASH_NEXT_XTS_REPO = "hipfire-models/qwen3.8-flash-next"
 FLASH_NEXT_XTS_LEGACY_FILE = "qwen3.8-flash-next-gptq3.mq4"
 FLASH_NEXT_XTS_CANONICAL_FILE = "qwen3.8-flash-next.mq4-xts"
-FLASH_NEXT_XTS_SHA256 = "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
-FLASH_NEXT_XTS_SIZE = 125288544792
-FLASH_NEXT_XTS_WIRE_FILES = {
-    "qwen3.8:flash-next": FLASH_NEXT_XTS_LEGACY_FILE,
-    "qwen3.8:flash-next-mq4": FLASH_NEXT_XTS_LEGACY_FILE,
-    "qwen3.8:flash-next-gptq3": FLASH_NEXT_XTS_LEGACY_FILE,
-    "qwen3.8:flash-next-mq4-xts": FLASH_NEXT_XTS_CANONICAL_FILE,
+FLASH_NEXT_XTS_MONOLITHIC_FILES = (
+    FLASH_NEXT_XTS_CANONICAL_FILE,
+    FLASH_NEXT_XTS_LEGACY_FILE,
+)
+FLASH_NEXT_XTS_SPLIT_BASE_FILE = "qwen3.8-flash-next-base.mq4-xts"
+FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = (
+    "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
+)
+FLASH_NEXT_XTS_SPLIT_BASE_SIZE = 70888270360
+FLASH_NEXT_XTS_TAGS = (
+    "qwen3.8:flash-next",
+    "qwen3.8:flash-next-mq4",
+    "qwen3.8:flash-next-gptq3",
+    "qwen3.8:flash-next-mq4-xts",
+)
+# The family-shared PLE rows every Flash-Next split base names.
+FLASH_NEXT_XTS_SHARED_PLE = {
+    "q4": "qwen3.8-flash-next.ple-q4",
+    "q8": "qwen3.8-flash-next.ple-q8",
 }
 # Known weight-file quant suffixes (see docs/MODELS.md). Anything else is an
 # error: a new format must be added here deliberately, not silently passed.
@@ -83,6 +98,7 @@ KNOWN_QUANTS = {
     "mq4",
     "mq4p",
     "mq4r",
+    "mq4rs",
     "mq5",
     "mq6",
     # Qwen3.8-Flash-Next's packed trunk rung: MQ6G256V2 (qt47) on the wide
@@ -135,6 +151,13 @@ KNOWN_KV_MODES = {
     "legacy-asym3",
 }
 KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
+# Flash-Next split-base PLE row sidecars (the `ple` map, keyed by format token
+# `q4`, `q8`, ...): live-annotated from the HF tree like every other sidecar, and
+# digest-pinned (LFS oid required). Mirrors hipfire-registry's `ple` validation.
+PLE_FORMAT_KEY = re.compile(r"^[a-z0-9]+$")
+# Stem (before `-base`) of the one split-base family whose PLE row files are
+# shared between bases (`qwen3.8-flash-next.ple-<key>`).
+SHARED_PLE_FAMILY = "qwen3.8-flash-next"
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
@@ -255,7 +278,7 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus finetunes)
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus / decider finetunes)
 #   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
@@ -284,6 +307,18 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 16
     if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
+    # Decider-4B = dense Qwen3.5-4B finetune used as a /v1/systemone judge
+    # (Mapika/decider-4b, Apache-2.0). The architecture is unchanged dense
+    # qwen3_5 (5); it has no A3B variant, so there is no "a3b" split here.
+    if family == "decider":
+        return 5
+
+    # EmbeddingGemma 2 (`google/embeddinggemma-2`) — the arch-18 single-vector
+    # embedding encoder: a Gemma-4-family bidirectional trunk with no LM head,
+    # served only by the `embed` verb. Its towers ride a `<trunk-stem>.vl`
+    # sidecar, declared per entry below like the Qwen3.8-27B vision slot.
+    if family in ("embeddinggemma", "embeddinggemma-2"):
+        return 18
 
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
@@ -322,15 +357,13 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
 
 
 def quant_for(file: str) -> str | None:
-    # Local-only Flash-Next ZAB carrier keeps the stock MQ4 quant family.
-    if file == "qwen3.8-flash-next.mq4-xts-zab":
-        return "mq4"
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
-    # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-xts / model.mq4-pro → quant mq4
-    m = re.search(r"\.(mq\d)(?:-(?:xts?|pro))?$", file)
+    # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-xts / model.mq4-pro → quant mq4;
+    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2)
+    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+)?|pro))?$", file)
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]
@@ -403,51 +436,109 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
 
 
 def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
-    """Pin both published spellings and preserve old clients' wire defaults."""
-    if not any(tag in models for tag in FLASH_NEXT_XTS_WIRE_FILES) and not any(
+    """The four stock MQ4 tags are one split base on the shared PLE pair."""
+    if not any(tag in models for tag in FLASH_NEXT_XTS_TAGS) and not any(
         entry.get("repo") == FLASH_NEXT_XTS_REPO for entry in models.values()
     ):
         # build_registry also serves small, unrelated fixture/custom catalogs.
         return
-    for tag, file in FLASH_NEXT_XTS_WIRE_FILES.items():
+    for tag, entry in models.items():
+        if entry.get("file") in FLASH_NEXT_XTS_MONOLITHIC_FILES:
+            errors.append(
+                f"{tag}: names the removed monolithic {entry['file']!r}; the MQ4 XTS "
+                f"payload is only published as {FLASH_NEXT_XTS_SPLIT_BASE_FILE!r}"
+            )
+    expected = {
+        "repo": FLASH_NEXT_XTS_REPO,
+        "file": FLASH_NEXT_XTS_SPLIT_BASE_FILE,
+        "sha256": FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+        "size_bytes": FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+        "arch_id": 16,
+        "quant": "mq4",
+    }
+    present: list[tuple[str, dict]] = []
+    for tag in FLASH_NEXT_XTS_TAGS:
         entry = models.get(tag)
         if entry is None:
-            errors.append(f"{tag}: required Flash-Next XTS compatibility tag is missing")
+            errors.append(f"{tag}: required Flash-Next MQ4 XTS tag is missing")
             continue
-        expected = {
-            "repo": FLASH_NEXT_XTS_REPO,
-            "file": file,
-            "sha256": FLASH_NEXT_XTS_SHA256,
-            "size_bytes": FLASH_NEXT_XTS_SIZE,
-            "arch_id": 16,
-            "quant": "mq4",
-        }
+        present.append((tag, entry))
         for key, value in expected.items():
             if entry.get(key) != value:
                 errors.append(f"{tag}: XTS invariant {key} must be {value!r}")
         desc = entry.get("desc", "")
         if "MQ4 XTS" not in desc or "GPTQ3" in desc:
             errors.append(f"{tag}: user-facing recipe must be named MQ4 XTS")
+        ple = entry.get("ple")
+        ple = ple if isinstance(ple, dict) else {}
+        for key, file in FLASH_NEXT_XTS_SHARED_PLE.items():
+            sidecar = ple.get(key)
+            if not isinstance(sidecar, dict) or sidecar.get("file") != file:
+                errors.append(f"{tag}: ple.{key} must be the shared {file!r}")
 
-    # Renaming must not change load defaults, settings, sidecars or identity.
-    base = models.get("qwen3.8:flash-next")
-    if base is not None:
-        contract = {key: value for key, value in base.items() if key != "file"}
-        for tag in FLASH_NEXT_XTS_WIRE_FILES:
-            entry = models.get(tag)
-            if entry is not None:
-                other = {key: value for key, value in entry.items() if key != "file"}
-                if other != contract:
-                    errors.append(f"{tag}: XTS rename changed non-filename metadata")
+    # One artifact under four names: identity, settings and sidecars never differ.
+    if present:
+        first_tag, first = present[0]
+        for tag, entry in present[1:]:
+            if entry != first:
+                errors.append(f"{tag}: XTS metadata differs from {first_tag}")
 
+
+def split_base_stem(file: str) -> str | None:
+    """`<stem>` of a bare split-base file name `<stem>-base.<ext>`, else None."""
+    if "/" in file or "\\" in file:
+        return None
+    stem = file.rsplit(".", 1)[0] if "." in file else file
+    if not stem.endswith("-base") or stem == "-base":
+        return None
+    return stem[: -len("-base")]
+
+
+def validate_ple_sidecar(
+    tag: str, file: str, key: str, sidecar: dict, errors: list[str]
+) -> None:
+    """Fail-closed mirror of the registry's `ple` map rules for one sidecar."""
+    kind = f"ple.{key}"
+    if not PLE_FORMAT_KEY.fullmatch(key):
+        errors.append(
+            f"{tag}: invalid PLE format key {key!r} (expected lowercase letters and digits)"
+        )
+        return
+    family = split_base_stem(file)
+    if family is None:
+        errors.append(
+            f"{tag}: {kind} requires a split base file (<name>-base.<ext>), got {file!r}"
+        )
+        return
+    own = f"{file}.ple-{key}"
+    shared = f"{SHARED_PLE_FAMILY}.ple-{key}" if family == SHARED_PLE_FAMILY else None
+    if sidecar.get("file") not in (own, shared):
+        errors.append(
+            f"{tag}: {kind} file {sidecar.get('file')!r} must be {own!r}"
+            + (f" or the shared {shared!r}" if shared else "")
+        )
+
+
+def validate_shared_ple_pins(models: dict, errors: list[str]) -> None:
+    """Every entry naming a shared PLE file must pin the same bytes."""
+    pins: dict[str, tuple[str, tuple]] = {}
     for tag, entry in models.items():
-        if entry.get("repo") == FLASH_NEXT_XTS_REPO and entry.get("file") in (
-            FLASH_NEXT_XTS_LEGACY_FILE, FLASH_NEXT_XTS_CANONICAL_FILE
-        ):
-            if (entry.get("sha256"), entry.get("size_bytes")) != (
-                FLASH_NEXT_XTS_SHA256, FLASH_NEXT_XTS_SIZE
-            ):
-                errors.append(f"{tag}: published XTS filename has a different content pin")
+        ple = entry.get("ple")
+        if not isinstance(ple, dict):
+            continue
+        for key, sidecar in ple.items():
+            if not isinstance(sidecar, dict):
+                continue
+            file = sidecar.get("file", "")
+            if "/" in file or file != f"{SHARED_PLE_FAMILY}.ple-{key}":
+                continue
+            pin = (sidecar.get("sha256"), sidecar.get("size_bytes"))
+            first_tag, first = pins.setdefault(file, (tag, pin))
+            if pin != first:
+                errors.append(
+                    f"{tag}: ple.{key} shared file {file!r} is pinned differently "
+                    f"than by {first_tag}"
+                )
 
 
 def annotate_sidecar(
@@ -591,6 +682,22 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
             for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
+            ple = entry.get("ple")
+            if ple is not None:
+                if not isinstance(ple, dict):
+                    errors.append(f"{tag}: ple must be an object keyed by format token")
+                else:
+                    new_entry["ple"] = {}
+                    for key, sidecar in ple.items():
+                        kind = f"ple.{key}"
+                        if not isinstance(sidecar, dict):
+                            errors.append(f"{tag}: {kind} must be a sidecar object")
+                            continue
+                        validate_ple_sidecar(tag, entry["file"], key, sidecar, errors)
+                        annotated = annotate_sidecar(sidecar, tree, tag, kind, errors)
+                        if not annotated.get("sha256"):
+                            errors.append(f"{tag}: {kind} sidecar has no LFS sha256 pin")
+                        new_entry["ple"][key] = annotated
             # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
             # single one — same annotation, once per entry, so a head that is
             # missing from the repo fails the run like any other sidecar.
@@ -625,6 +732,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
     is_strict_superset(curated.get("models", {}), registry["models"], "models", errors)
     is_strict_superset(curated.get("aliases", {}), registry["aliases"], "aliases", errors)
     validate_flash_next_xts(out_models, errors)
+    validate_shared_ple_pins(out_models, errors)
 
     if errors:
         return None, errors

@@ -34,9 +34,7 @@
 //! implemented via the same ring-state semantics as the reference so the
 //! indexer sibling can call one entry point for both phases.
 
-use crate::attention::{
-    apply_rope_interleaved_inplace, precompute_rope_freqs, rms_norm_host,
-};
+use crate::attention::{apply_rope_interleaved_inplace, precompute_rope_freqs, rms_norm_host};
 use crate::codec::{
     act_quant_fp4_inplace_ref, act_quant_fp8_inplace_ref, hadamard_rotate_ref, round_to_bf16,
 };
@@ -104,7 +102,14 @@ pub fn compressor_proj_dim(head_dim: usize, ratio: usize) -> usize {
 pub fn compressor_dims(
     w: &ParentCompressorWeights,
     ratio: usize,
-) -> Result<(usize /*head*/, usize /*proj*/, bool /*overlap*/), String> {
+) -> Result<
+    (
+        usize, /*head*/
+        usize, /*proj*/
+        bool,  /*overlap*/
+    ),
+    String,
+> {
     if ratio == 0 {
         return Err(err("compressor_dims: ratio must be > 0"));
     }
@@ -208,7 +213,10 @@ pub struct CompressorWindowPlan {
 }
 
 /// Build the prefill window plan (`start_pos == 0`, full windows only).
-pub fn compressor_prefill_windows(rows: usize, ratio: usize) -> Result<CompressorWindowPlan, String> {
+pub fn compressor_prefill_windows(
+    rows: usize,
+    ratio: usize,
+) -> Result<CompressorWindowPlan, String> {
     if ratio == 0 {
         return Err(err("compressor_prefill_windows: ratio must be > 0"));
     }
@@ -303,8 +311,7 @@ pub fn overlap_transform_host(
             // current half → dst slots [ratio + r]
             let src_base = (w * ratio + r) * proj + head_dim;
             let dst_base = (w * 2 * ratio + ratio + r) * head_dim;
-            dst[dst_base..dst_base + head_dim]
-                .copy_from_slice(&src[src_base..src_base + head_dim]);
+            dst[dst_base..dst_base + head_dim].copy_from_slice(&src[src_base..src_base + head_dim]);
         }
         for r in 0..ratio {
             let dst_base = (w * 2 * ratio + r) * head_dim;
@@ -466,7 +473,12 @@ impl ParentCompressorScratch {
         // Init prev/ring scores to -inf and kv to 0 so unfilled overlap slots
         // get zero softmax weight (`model.py:310`).
         zero_f32_buf(gpu, &prev_kv, MAX_RATIO * MAX_PROJ_DIM)?;
-        fill_f32_buf(gpu, &prev_score, MAX_RATIO * MAX_PROJ_DIM, f32::NEG_INFINITY)?;
+        fill_f32_buf(
+            gpu,
+            &prev_score,
+            MAX_RATIO * MAX_PROJ_DIM,
+            f32::NEG_INFINITY,
+        )?;
         zero_f32_buf(gpu, &ring_kv, MAX_STATE_ROWS * MAX_PROJ_DIM)?;
         fill_f32_buf(
             gpu,
@@ -524,7 +536,6 @@ impl ParentCompressorScratch {
         Ok(())
     }
 }
-
 
 // ── Forward ─────────────────────────────────────────────────────────────────
 
@@ -625,8 +636,15 @@ pub fn parent_compressor_forward(
     };
 
     // BF16 path verification point: gemm only — no act_quant between stage and gemm.
-    gpu.gemm_bf16_mfma_gfx942(&w.wkv.buf, &x_bf16.buf, &kv_view.buf, proj_dim, PARENT_DIM, rows)
-        .map_err(|e| err(format!("compressor wkv BF16 GEMM: {e:?}")))?;
+    gpu.gemm_bf16_mfma_gfx942(
+        &w.wkv.buf,
+        &x_bf16.buf,
+        &kv_view.buf,
+        proj_dim,
+        PARENT_DIM,
+        rows,
+    )
+    .map_err(|e| err(format!("compressor wkv BF16 GEMM: {e:?}")))?;
     // Re-stage x: gemm does not destroy B, but keep the contract explicit and
     // safe if a future kernel mutates activations.
     stage_f32_to_bf16(gpu, x, &scratch.act_bf16, rows, PARENT_DIM)?;
@@ -643,32 +661,12 @@ pub fn parent_compressor_forward(
     // ── 2. Branch prefill / decode ──────────────────────────────────────
     if start_pos == 0 {
         parent_compressor_prefill(
-            gpu,
-            backend,
-            w,
-            scratch,
-            rows,
-            ratio,
-            head_dim,
-            proj_dim,
-            overlap,
-            hadamard,
-            kv_out,
+            gpu, backend, w, scratch, rows, ratio, head_dim, proj_dim, overlap, hadamard, kv_out,
         )
     } else {
         parent_compressor_decode(
-            gpu,
-            backend,
-            w,
-            scratch,
-            rows,
-            start_pos,
-            ratio,
-            head_dim,
-            proj_dim,
-            overlap,
-            hadamard,
-            kv_out,
+            gpu, backend, w, scratch, rows, start_pos, ratio, head_dim, proj_dim, overlap,
+            hadamard, kv_out,
         )
     }
 }
@@ -690,7 +688,9 @@ fn parent_compressor_prefill(
     if n_out == 0 {
         // Entire sequence is remainder (rows < ratio). Stash into ring.
         let _ = (backend, w, hadamard, kv_out); // unused on short-prefill path
-        stash_prefill_remainder(gpu, scratch, rows, /*cutoff=*/ 0, ratio, proj_dim, overlap)?;
+        stash_prefill_remainder(
+            gpu, scratch, rows, /*cutoff=*/ 0, ratio, proj_dim, overlap,
+        )?;
         return Ok(());
     }
     let cutoff = n_out * ratio;
@@ -783,8 +783,7 @@ fn parent_compressor_prefill(
         for r in 0..remainder {
             let src = (cutoff + r) * proj_dim;
             let dst_base = (off + r) * MAX_PROJ_DIM;
-            ring_kv[dst_base..dst_base + proj_dim]
-                .copy_from_slice(&kv_host[src..src + proj_dim]);
+            ring_kv[dst_base..dst_base + proj_dim].copy_from_slice(&kv_host[src..src + proj_dim]);
             // score_host[cutoff+] has no ape yet (`model.py:341`).
             for d in 0..proj_dim {
                 ring_sc[dst_base + d] = score_host[src + d] + ape[r * proj_dim + d];
@@ -877,8 +876,7 @@ fn stash_prefill_remainder(
     for r in 0..remainder {
         let src = r * proj_dim;
         let dst_base = (off + r) * MAX_PROJ_DIM;
-        ring_kv[dst_base..dst_base + proj_dim]
-            .copy_from_slice(&kv_host[src..src + proj_dim]);
+        ring_kv[dst_base..dst_base + proj_dim].copy_from_slice(&kv_host[src..src + proj_dim]);
     }
     upload_f32(
         gpu,
@@ -946,10 +944,8 @@ fn parent_compressor_decode(
                 for r in 0..ratio {
                     let src = (ratio + r) * MAX_PROJ_DIM + head_dim;
                     let dst = (ratio + r) * head_dim;
-                    kv_cat[dst..dst + head_dim]
-                        .copy_from_slice(&ring_kv[src..src + head_dim]);
-                    sc_cat[dst..dst + head_dim]
-                        .copy_from_slice(&ring_sc[src..src + head_dim]);
+                    kv_cat[dst..dst + head_dim].copy_from_slice(&ring_kv[src..src + head_dim]);
+                    sc_cat[dst..dst + head_dim].copy_from_slice(&ring_sc[src..src + head_dim]);
                 }
                 let pooled = softmax_pool_host(&kv_cat, &sc_cat, 1, t, head_dim)?;
                 // shift ring[:ratio] = ring[ratio:]
@@ -1147,10 +1143,8 @@ fn parent_compressor_decode_multi(
                 for r in 0..ratio {
                     let src = (ratio + r) * MAX_PROJ_DIM + head_dim;
                     let dst = (ratio + r) * head_dim;
-                    kv_cat[dst..dst + head_dim]
-                        .copy_from_slice(&ring_kv[src..src + head_dim]);
-                    sc_cat[dst..dst + head_dim]
-                        .copy_from_slice(&ring_sc[src..src + head_dim]);
+                    kv_cat[dst..dst + head_dim].copy_from_slice(&ring_kv[src..src + head_dim]);
+                    sc_cat[dst..dst + head_dim].copy_from_slice(&ring_sc[src..src + head_dim]);
                 }
                 for r in 0..ratio {
                     let src = (ratio + r) * MAX_PROJ_DIM;
@@ -1286,7 +1280,9 @@ pub fn compressor_prefill_ref(
     hadamard: bool,
 ) -> Result<Option<Vec<f32>>, String> {
     if dim == 0 || head_dim == 0 || ratio == 0 {
-        return Err(err("compressor_prefill_ref: dim/head_dim/ratio must be > 0"));
+        return Err(err(
+            "compressor_prefill_ref: dim/head_dim/ratio must be > 0",
+        ));
     }
     if x.len() < rows * dim {
         return Err(err("compressor_prefill_ref: x short"));
@@ -1725,7 +1721,7 @@ mod tests {
             + max_rows * PARENT_HEAD_DIM * 2 // kv_head_bf16
             + max_rows * 4 // positions
             + PARENT_HEAD_DIM * 4; // norm_f32
-        // Just assert the formula is self-consistent and non-trivial.
+                                   // Just assert the formula is self-consistent and non-trivial.
         assert!(expected > 1_000_000, "expected scratch ~MB, got {expected}");
         // ratio-4 n_out for 16 rows
         assert_eq!(compressor_prefill_n_out(16, 4), 4);
@@ -1764,8 +1760,7 @@ mod tests {
         }
 
         let out = compressor_prefill_ref(
-            &x, &wkv, &wgate, &norm_w, &ape, rows, dim, head_dim, ratio,
-            /*hadamard=*/ false,
+            &x, &wkv, &wgate, &norm_w, &ape, rows, dim, head_dim, ratio, /*hadamard=*/ false,
         )
         .unwrap()
         .expect("n_out > 0");

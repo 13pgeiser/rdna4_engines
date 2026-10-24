@@ -23,6 +23,7 @@ crates/
 ├── radiowave/                # policy-driven HIP compiler + AMDGPU code-object inspector
 ├── peacemaker-ir/            # typed RDNA machine-code representation, gfx12 instruction tables
 ├── peacemaker-lift/          # ELF/bundle/metadata lifter for typed AMDGPU programs
+├── peacemaker-cdna/          # CDNA3 (gfx942, wave64) instruction model, encoder/decoder, CPU emulator; transitive via peacemaker-isa, never selected at runtime
 ├── peacemaker-author/        # typed kernel-authoring core (targets, LDS regions, wait tokens)
 ├── peacemaker-isa/           # checked instruction Builder (wait ledger, LDS, hazards) + peacemaker tooling
 ├── peacemaker-rip/           # standalone `.rip` kernel-script front end onto the peacemaker-isa builder
@@ -97,7 +98,7 @@ operator runtime.
 | Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
 | Kernel compile policy | `radiowave` | Policy-driven hipcc invocation and AMDGPU code-object inspection behind `rdna-compute`'s compile path |
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
-| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. Authoring and validation, **not** the retained transport (see railgun below) |
+| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. `peacemaker-cdna` (CDNA3/gfx942 instruction model and CPU emulator) is reached only through `peacemaker-isa`'s opt-in `cdna` arm. It is a transitive compile-time dependency of `rdna-compute` (which depends on `peacemaker-isa`), but no runtime dispatch, callsite selection or default behavior uses it. Authoring and validation, **not** the retained transport (see railgun below) |
 | Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
 | Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
 | NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
@@ -159,15 +160,27 @@ asymmetric artifacts fail that check and stay on the F16 WMMA route.
 lower KLD but the slower prefill; the measured trade for each architecture is
 recorded with the knob in [`env-vars.md`](env-vars.md).
 
-### Qwen4 expert-parallel mesh (Flash-Next, EP2/EP4)
+On gfx1151, Flash-Next prefill tiles of 48 to 511 rows (agent-turn appends,
+tool results, short prompt tails) run on the >= 512-row kernel family by
+default. The tile engages `Gpu::prefill_invariant_scope`, so every row-count
+routing predicate sees the canonical chunk while launches keep the real row
+count. `Gpu::qwen4_append_f16_moe_scope` keeps that tile's MoE on the F16 WMMA
+grouped arm, because the IU4 arm below 512 rows exceeds the KLD cap.
+`HIPFIRE_QWEN4_APPEND_WMMA=0` restores the F32 SIMT routes.
 
-`topology.ep` (`HIPFIRE_TOPOLOGY_EP`) takes `1`, `2` or `4`; `HIPFIRE_QWEN4_EP=0`
-forces `1`. Qwen4 admits expert parallelism only with `pp = 1`, `tp = 1`, on
-exact gfx1201 on every rank, with the peers directly accessible from each
+### Qwen4 expert-parallel mesh (Flash-Next, EP2 through EP8)
+
+`topology.ep` (`HIPFIRE_TOPOLOGY_EP`) takes an integer `1..=8`;
+`HIPFIRE_QWEN4_EP=0` forces `1`. Qwen4 admits expert parallelism only with
+`pp = 1`, `tp = 1`, on `ep` ranks of one exact arch, gfx1100 or gfx1201 (a
+mixed set is refused), with the peers directly accessible from each
 other (`qwen4_ep_geometry_refusal`, `qwen4_ep_preflight` in
 `crates/hipfire-loader/src/admission.rs`; checked before rank 0 allocates).
-Routed experts shard by id; every rank runs the unchanged single-device
-program.
+Routed experts shard by id (`e % N`; an N that does not divide 512 gives
+uneven per-rank counts, `Qwen4EpPlacement::local_count`); every rank runs the
+unchanged single-device program. Under the developer-only
+`HIPFIRE_EMULATE_GPUS` the ranks alias physical devices (rank `r` on device
+`r % count`, `qwen4_ep_rank_devices`).
 
 The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
 `crates/hipfire-arch-qwen4/src/ep.rs`): peers are bundles on persistent worker
@@ -179,24 +192,29 @@ PFlash, an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 
-Two EP levers are **default-on under EP2**, each with an exact-`0` kill switch
+Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
 (`gpu_forward.rs`):
 
-- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE. A prefill chunk of
-  at least 512 rows whose MoE layers verified symmetric on every rank computes
-  only its owned expert tiles and pulls the other ranks' down rows over P2P,
-  instead of computing every expert on every rank. It also needs gfx1201, the
-  Flash-Next profile and the symmetric IU4 route requested.
+- `HIPFIRE_EP_BALANCED_OWNERS`: balanced per-call expert ownership on the
+  host-mapped trunk MoE layers. It ships for exact gfx1201 at 2..=4 ranks only;
+  a gfx1100 rank logs `balanced ownership not admitted (needs gfx1201); static
+  split`, a gfx1201 rank at 5..=8 ranks `... (needs at most 4 ranks); static
+  split`, and both run the exact static split.
+- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE, EP2 through EP8.
+  A prefill chunk of at least 512 rows computes only its owned expert tiles and
+  pulls the other ranks' down rows over P2P, instead of computing every expert
+  on every rank. It needs the Flash-Next profile and one of two routes: exact
+  gfx1201 on the symmetric IU4 route (every MoE layer verified symmetric on
+  every rank), or exact gfx1100 on the F16 WMMA grouped route (BF16-out
+  gate/up with the SwiGLU epilogue, BF16-out down; the per-layer verdict is
+  the QT44/QT53 expert formats, and the grouping is the stable one so every
+  rank shares the grouped layout).
 - `HIPFIRE_EP_EXPERT_STAGE`: Flash-Next long-prefill expert staging. It exists
-  only when owner-routed prefill is admitted, so it is never created with
-  that lever off.
+  only when owner-routed prefill is admitted and only on gfx1201; a gfx1100
+  rank logs `expert staging not admitted (needs gfx1201)` and builds nothing.
 
-**EP4 is refused for both levers.** The transport is rank-generic and the mesh
-itself admits four ranks, but `Qwen4TileRoute::admit` refuses with
-`EP4 owner-routed prefill not yet gated`, so EP4 keeps the full-table chunk
-route (and never stages). Exact figures, memory arithmetic and the
-hardware-validation record live in [`multi-gpu.md`](multi-gpu.md) and
-[`env-vars.md`](env-vars.md), not here.
+Exact figures, memory arithmetic and the hardware-validation record live in
+[`multi-gpu.md`](multi-gpu.md) and [`env-vars.md`](env-vars.md), not here.
 
 ### Qwen4 long context, trunk overlay and PLE rows
 
@@ -273,7 +291,7 @@ hipfire-loader
   ModelSource::from_path  →  HfqFile  |  SafetensorsSource dir
   Carrier registry probe on arch_id (+ is_dir namespace)
   carrier.load → LoadedModel { arch_id, state: Option<Box<dyn ArchModel>>, tokenizer, … }
-  optional: draft/speculator, VL weights, EP/PP scaffolding (Qwen4 EP2/EP4 mesh rides rank 0's bundle)
+  optional: draft/speculator, VL weights, EP/PP scaffolding (Qwen4 EP mesh rides rank 0's bundle)
   Qwen3.5-VL tower sidecar: `params.vision` / `HIPFIRE_VISION_SIDECAR` → separate `qwen3.8-27b-vision.hfq` validated at admission, tower sized by the trunk's `vision_config`
         │
         ▼
@@ -371,7 +389,7 @@ Qwen4's EP mesh lives inside rank 0's `Qwen4Bundle`.
 
 | API | Scope |
 |---|---|
-| `load_model` | Single GPU (Qwen3.5 PP when `pp > 1` inside the carrier; the Qwen4 carrier also attaches its EP2/EP4 mesh here, `attach_qwen4_ep_peers`) |
+| `load_model` | Single GPU (Qwen3.5 PP when `pp > 1` inside the carrier; the Qwen4 carrier also attaches its EP mesh here, `attach_qwen4_ep_peers`) |
 | `load_model_ep` | Expert-parallel: arch_id 9 and 10 only; staging reclaims completed/pushed ranks on failure (constructor-mid-failure can still leak that rank’s partial allocs) |
 
 ## Architecture crates
@@ -389,7 +407,7 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-qwen2` | Standalone Qwen2 text |
 | `hipfire-arch-qwen35` | Hybrid DeltaNet + full attention; dense (5) and MoE/A3B (6); DFlash/MTP hooks |
 | `hipfire-arch-qwen35-vl` | Vision tower attached to Qwen3.5 ids 5/6 |
-| `hipfire-arch-qwen4` | Qwen3.8-Flash-Next / Qwen4 (16): hybrid GatedDeltaNet + QSA sparse attention, PLE, 512-expert MoE, native MTP, EP2/EP4, NPU trunk |
+| `hipfire-arch-qwen4` | Qwen3.8-Flash-Next / Qwen4 (16): hybrid GatedDeltaNet + QSA sparse attention, PLE, 512-expert MoE, native MTP, EP (2..=8 ranks), NPU trunk |
 | `hipfire-arch-dots-ocr` | dots.ocr / Qwen2-VL-class OCR |
 | `hipfire-arch-deepseek4` | DeepSeek V4 Flash (HC, compressed-KV indexer, optional MTP/DSpark) |
 | `hipfire-arch-minimax` | MiniMax-M2 MoE |
@@ -400,7 +418,8 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-muse-glimmer` | Muse Glimmer dense text (14): 3:1 sliding/NoPE-full attention; DFlash drafter id 23 |
 | `hipfire-arch-maple` | Maple-Preview natively-ternary 256-expert MoE (15), plain AR |
 | `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
-| `hipfire-arch-qwen35-embed` | Qwen3.5 multi-vector embedding encoder (17) — bidirectional full attention + causal GDN, SigLIP tower, 128-d late-interaction head; served only via the non-chat `embed` verb |
+| `hipfire-arch-qwen35-embed` | Qwen3.5 multi-vector embedding encoder (17) — bidirectional full attention + causal GDN, SigLIP tower, 128-d late-interaction head; served only via the non-chat `embed` verb. Under `serve.multi_slot` its own engine merges concurrent requests into one batched forward (`slot_engine.rs`); the trait hook is the defaulted `SlotEngineHandle::encode`, so the generation engine is untouched. |
+| `hipfire-arch-embeddinggemma2` | EmbeddingGemma 2 single-vector embedding encoder (18) — bidirectional Gemma-4-family encoder (sliding/full hybrid, PLE, per-layer head dims, 768-d Matryoshka head, mean pooling + L2); served only via the non-chat `embed` verb with the arch-17 slot-engine shape. Text-only is the `vision_mode=off` default: with the shared `.vl` pack resolved (`auto`/`on`) the vision and audio towers are resident and media input serves on the `embed` verb; a tower-less load refuses it by modality. Video is not served yet. |
 | `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
 
 Bring-up contract: implement `hipfire_runtime::arch::Architecture` (see
@@ -463,6 +482,11 @@ The runtime verifies the installed index and object SHA-256 before loading,
 even with hipcc present. A missing or stale index falls back to JIT only when
 hipcc is available; compiler-free loads fail closed. Packaged module names
 come from the exact Rust registry, never HIP source basenames.
+The installed pack is read-only to the runtime: a missing, stale or rejected
+packaged object is recompiled into the hot JIT cache only and is never rewritten
+under `kernels/compiled/<arch>`. Only the packaging tools (`hipfire-kernel-pack`
+and `daemon --precompile`, which publish to an explicit output directory) write
+a pack.
 
 JIT and packaged objects share one core recipe: `--genco --offload-arch=<arch>
 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`, then the
@@ -513,8 +537,12 @@ After `load_model`, request handling builds sampling defaults
 Continuous batching is a separate exact-id staging route
 (`hipfire_loader::continuous_batch_route`): Qwen3.5 (5/6) and Flash-Next
 (16). Qwen4 batches only as exact AR lanes through the VMM branch
-(`serve.vmm_batch`; there is no fixed-lane Qwen4 body), and its lane steps are
-refused under expert parallelism. LFM2 (11) has no servable batch path.
+(`serve.vmm_batch`; there is no fixed-lane Qwen4 body). Lane steps run on one
+card, replicated across EP ranks, or band-split across PP bands (sequential
+bands, host-staged HC edges; each device's lane store must fit its own free
+memory). Multi-card lanes are AR only: no native-MTP lanes and no promotion of a
+running singleton; their GPU gates and performance are pending. LFM2 (11) has
+no servable batch path.
 
 Capability examples that are **implemented** but not automatically
 “product-certified”:
@@ -589,8 +617,8 @@ it records launches, retains the tape and replays it as PM4/AQL through ROCr.
   receipt corpus of runtime-JIT modules and checks coverage; `railgun-corpus` is
   the runtime's read-only view of those records.
 - Kernel authoring and instruction validation sit beneath it in
-  `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `peacemaker-isa` and
-  `peacemaker-rip`.
+  `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`,
+  `peacemaker-isa` and `peacemaker-rip`.
 
 Its product-tree integration is developer-only and opt-in, and certifies no
 route: `HIPFIRE_RAILGUN_SHADOW` diffs railgun's lowering against Redline's
@@ -615,16 +643,19 @@ accepted sets differ by carrier). Concrete modes include:
 | `asym2` / `asym3` / `asym4` | **Deprecated since 0.4.0, removal in 0.5.0**: legacy Givens-rotated Lloyd K + Q8 V (fwht3 supersedes Givens asym KV). On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
-exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
-no adaptive, no CASK (deprecated since 0.4.0, removal in 0.5.0)); **q8/q8** everywhere else, gfx1100 and gfx1151
-included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+exact `gfx1201` single GPU when the load is native-eligible (H24/Hkv4/D256
+dense or H16/Hkv2/D256 A3B, D256, no adaptive, no CASK
+(deprecated since 0.4.0, removal in 0.5.0), no slots/TP/PP split);
+**q8/q8** everywhere else, gfx1100 and gfx1151 included. Native `bf16`
+stays H24 dense-only. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
 `--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
 
 **Flash-Next (Qwen4, arch 16)** has its own `kv_cache` table for the QSA
 full-attention K/V arenas: `auto` is `fp8` on exact gfx1201 (for a head
-geometry the kernels implement) and the exact `bf16` state elsewhere; `q8` is
-opt-in on gfx11/gfx12; `fwhtN`/`asymN` are refused. The GatedDeltaNet state is
+geometry the kernels implement), `q8` on exact gfx1151 and exact gfx1100
+(head_dim 256) and the exact `bf16` state elsewhere; `q8` is opt-in on the
+other gfx11/gfx12 arches; `fwhtN`/`asymN` are refused. The GatedDeltaNet state is
 separate. Table and sizes: [`CONFIG.md`](CONFIG.md).
 
 **Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only
@@ -689,8 +720,10 @@ hipGraph route (Qwen4 replays prepared PM4, below).
   APU's GTT or carve-out) and yield to context growth. A capture is skipped,
   or older snapshots are evicted, unless free device memory
   (`Gpu::device_mem_info`: `hipMemGetInfo`, on a GTT-backed APU clamped to
-  `MemAvailable` plus TTM's page pool) still holds the live state's growth
-  through the prompt in flight plus headroom.
+  `MemAvailable` minus the CMA region plus TTM's page pool) still holds the live
+  state's growth through the prompt in flight plus headroom: on a
+  unified-memory APU `clamp(MemTotal / 16, 2 GiB, 8 GiB)`, on a discrete GPU
+  256 MiB; every allocation path, disk staging included, keeps it.
   When a forward crosses a VMM growth boundary, snapshots are freed (LRU
   leaves first, then the turn's pending captures) until that growth fits.
 - **Live continuation.** Inside one conversation, a turn whose canonical

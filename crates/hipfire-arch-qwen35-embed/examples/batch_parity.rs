@@ -49,7 +49,10 @@ fn main() -> Result<(), String> {
     let mut bundle = load_qwen35_embed_from_source(&mut gpu, src)?;
     println!(
         "gpu {} | dim {} | {} layers | {} out",
-        gpu.arch, bundle.config.hidden_size, bundle.config.num_layers, bundle.config.dense_out_features
+        gpu.arch,
+        bundle.config.hidden_size,
+        bundle.config.num_layers,
+        bundle.config.dense_out_features
     );
 
     // Length mix: 40 (tiled, no pad), 300 (eager + 44 pad rows), 256 (exactly
@@ -59,7 +62,10 @@ fn main() -> Result<(), String> {
         (InputKind::Query, "what is the capital of Peru".to_string()),
         (InputKind::Document, "word ".repeat(300)),
         (InputKind::Document, "token ".repeat(256)),
-        (InputKind::Query, "explain the difference between a process and a thread in one paragraph".to_string()),
+        (
+            InputKind::Query,
+            "explain the difference between a process and a thread in one paragraph".to_string(),
+        ),
         (InputKind::Document, "sentence ".repeat(120)),
         (InputKind::Query, "hipfire".to_string()),
     ];
@@ -145,7 +151,10 @@ fn main() -> Result<(), String> {
         // segment's state or inputs (the failure this probe was written for),
         // and they normalize to zero rather than NaN, so they would otherwise
         // read as a small error.
-        let zero_rows = emb.chunks(128).filter(|c| c.iter().all(|x| *x == 0.0)).count();
+        let zero_rows = emb
+            .chunks(128)
+            .filter(|c| c.iter().all(|x| *x == 0.0))
+            .count();
         println!(
             "  [{i}] {} -> {} tokens ({} in, {} rows): n_tokens {} | max {max:.3e} | rel_l2 {r:.3e}",
             if *kind == InputKind::Query { "query   " } else { "document" },

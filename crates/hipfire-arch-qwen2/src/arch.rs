@@ -67,7 +67,6 @@ impl Architecture for Qwen2 {
     // mostly fit; the one explicit override is to disable `<think>`
     // stripping since Qwen2-1.5B-Instruct doesn't emit thinking blocks.
 
-
     fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
         EosFilterOverrides {
             stop_at: vec![],

@@ -36,10 +36,15 @@ fn map_image_err(e: image::ImageError) -> String {
 fn jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     match libjpeg_turbo_rs::probe(bytes) {
         Ok(info) => {
-            let w = u32::try_from(info.width)
-                .map_err(|_| format!("failed to decode image: width {} overflows u32", info.width))?;
-            let h = u32::try_from(info.height)
-                .map_err(|_| format!("failed to decode image: height {} overflows u32", info.height))?;
+            let w = u32::try_from(info.width).map_err(|_| {
+                format!("failed to decode image: width {} overflows u32", info.width)
+            })?;
+            let h = u32::try_from(info.height).map_err(|_| {
+                format!(
+                    "failed to decode image: height {} overflows u32",
+                    info.height
+                )
+            })?;
             Ok((w, h))
         }
         // Header unreadable after SOI matched: same wording the carriers
@@ -76,10 +81,15 @@ pub fn decode_rgb8(bytes: &[u8]) -> Result<image::RgbImage, String> {
             .map_err(|e| format!("failed to decode image: {e}"))?;
         let w = u32::try_from(img.width)
             .map_err(|_| format!("failed to decode image: width {} overflows u32", img.width))?;
-        let h = u32::try_from(img.height)
-            .map_err(|_| format!("failed to decode image: height {} overflows u32", img.height))?;
-        return image::RgbImage::from_raw(w, h, img.data)
-            .ok_or_else(|| "failed to decode image: pixel buffer size mismatches dimensions".to_string());
+        let h = u32::try_from(img.height).map_err(|_| {
+            format!(
+                "failed to decode image: height {} overflows u32",
+                img.height
+            )
+        })?;
+        return image::RgbImage::from_raw(w, h, img.data).ok_or_else(|| {
+            "failed to decode image: pixel buffer size mismatches dimensions".to_string()
+        });
     }
     image::load_from_memory(bytes)
         .map(|dyn_img| dyn_img.to_rgb8())

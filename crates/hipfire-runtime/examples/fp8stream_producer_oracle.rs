@@ -31,7 +31,9 @@ fn run_case(gpu: &mut rdna_compute::Gpu, n: usize, k: usize, awq: bool) -> bool 
             x[r * k + c] = s * hash01(r * k + c);
         }
     }
-    let w: Vec<f32> = (0..k).map(|c| 1.0 + (hash01(c + 7) * 0.5 + 0.5) * 0.2).collect();
+    let w: Vec<f32> = (0..k)
+        .map(|c| 1.0 + (hash01(c + 7) * 0.5 + 0.5) * 0.2)
+        .collect();
     let a: Vec<f32> = (0..k).map(|c| 0.5 + (hash01(c + 13) * 0.5 + 0.5)).collect();
 
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
@@ -97,8 +99,14 @@ fn run_case(gpu: &mut rdna_compute::Gpu, n: usize, k: usize, awq: bool) -> bool 
         }
     };
 
-    let ra: Vec<u8> = rot_a.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-    let rb: Vec<u8> = rot_b.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+    let ra: Vec<u8> = rot_a
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .collect();
+    let rb: Vec<u8> = rot_b
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .collect();
     report("x_rot", &ra, &rb);
     report("codes", &codes_a, &codes_b);
     report("half_sums", &sums_a, &sums_b);
@@ -109,9 +117,9 @@ fn run_case(gpu: &mut rdna_compute::Gpu, n: usize, k: usize, awq: bool) -> bool 
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let (mn, mx) = scales.iter().fold((f32::INFINITY, 0f32), |(a, b), &v| {
-        (a.min(v), b.max(v))
-    });
+    let (mn, mx) = scales
+        .iter()
+        .fold((f32::INFINITY, 0f32), |(a, b), &v| (a.min(v), b.max(v)));
     eprintln!("  N={n} K={k} awq={awq}: mismatched_bytes={bad} scales_min={mn} scales_max={mx}");
 
     for t in [d_x, d_w, d_a, d_rot_a, d_rot_b] {

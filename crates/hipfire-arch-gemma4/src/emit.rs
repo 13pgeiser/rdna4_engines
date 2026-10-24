@@ -639,3 +639,514 @@ pub fn gemma_longest_marker_suffix(s: &str) -> usize {
     }
     0
 }
+
+/// Opens a Gemma 4 native tool-call block in the answer channel.
+const TOOL_CALL_OPEN: &str = "<|tool_call>";
+/// Closes a Gemma 4 native tool-call block.
+const TOOL_CALL_CLOSE: &str = "<tool_call|>";
+/// Google-format string delimiter: one special token that decodes to this text.
+const TOOL_STR_DELIM: &str = "<|\"|>";
+/// Nesting cap so a degenerate generation cannot overflow the parser stack.
+const TOOL_MAX_DEPTH: usize = 64;
+
+/// Why a Gemma 4 tool-call body could not be turned into a [`ToolCall`](hipfire_runtime::prompt_frame::ToolCall).
+/// The message names the offending construct and byte offset so a malformed
+/// generation is diagnosable from the serve log alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GemmaToolCallError(pub String);
+
+impl std::fmt::Display for GemmaToolCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GemmaToolCallError {}
+
+struct ToolArgParser<'a> {
+    s: &'a str,
+    i: usize,
+}
+
+impl<'a> ToolArgParser<'a> {
+    fn err<T>(&self, msg: impl std::fmt::Display) -> Result<T, GemmaToolCallError> {
+        Err(GemmaToolCallError(format!("{msg} at byte {}", self.i)))
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.s[self.i..]
+    }
+
+    fn skip_ws(&mut self) {
+        self.i = self.s.len() - self.rest().trim_start().len();
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        if self.rest().starts_with(c) {
+            self.i += c.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume a `<|"|>...<|"|>` string; the cursor must be on the opening delimiter.
+    fn string(&mut self) -> Result<String, GemmaToolCallError> {
+        let start = self.i;
+        self.i += TOOL_STR_DELIM.len();
+        match self.rest().find(TOOL_STR_DELIM) {
+            Some(k) => {
+                let out = self.rest()[..k].to_string();
+                self.i += k + TOOL_STR_DELIM.len();
+                Ok(out)
+            }
+            None => {
+                self.i = start;
+                self.err("unterminated string")
+            }
+        }
+    }
+
+    fn key(&mut self) -> Result<String, GemmaToolCallError> {
+        self.skip_ws();
+        let key = if self.rest().starts_with(TOOL_STR_DELIM) {
+            self.string()?
+        } else {
+            let end = self
+                .rest()
+                .find([':', ',', '}'])
+                .unwrap_or(self.rest().len());
+            let k = self.rest()[..end].trim().to_string();
+            self.i += end;
+            k
+        };
+        if key.is_empty() {
+            return self.err("empty key");
+        }
+        Ok(key)
+    }
+
+    /// Parse object members; the opening `{` is already consumed.
+    fn object(&mut self, depth: usize) -> Result<serde_json::Value, GemmaToolCallError> {
+        let mut map = serde_json::Map::new();
+        self.skip_ws();
+        if self.eat('}') {
+            return Ok(serde_json::Value::Object(map));
+        }
+        loop {
+            let key = self.key()?;
+            self.skip_ws();
+            if !self.eat(':') {
+                return self.err(format!("missing ':' after key `{key}`"));
+            }
+            let value = self.value(depth + 1)?;
+            if map.contains_key(&key) {
+                return self.err(format!("duplicate key `{key}`"));
+            }
+            map.insert(key, value);
+            self.skip_ws();
+            if self.eat(',') {
+                continue;
+            }
+            if self.eat('}') {
+                return Ok(serde_json::Value::Object(map));
+            }
+            return self.err("unbalanced object: expected ',' or '}'");
+        }
+    }
+
+    /// Parse array items; the opening `[` is already consumed.
+    fn array(&mut self, depth: usize) -> Result<serde_json::Value, GemmaToolCallError> {
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.eat(']') {
+            return Ok(serde_json::Value::Array(items));
+        }
+        loop {
+            items.push(self.value(depth + 1)?);
+            self.skip_ws();
+            if self.eat(',') {
+                continue;
+            }
+            if self.eat(']') {
+                return Ok(serde_json::Value::Array(items));
+            }
+            return self.err("unbalanced array: expected ',' or ']'");
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<serde_json::Value, GemmaToolCallError> {
+        if depth > TOOL_MAX_DEPTH {
+            return self.err("nesting too deep");
+        }
+        self.skip_ws();
+        if self.rest().starts_with(TOOL_STR_DELIM) {
+            return Ok(serde_json::Value::String(self.string()?));
+        }
+        if self.eat('{') {
+            return self.object(depth);
+        }
+        if self.eat('[') {
+            return self.array(depth);
+        }
+        let end = self
+            .rest()
+            .find([',', '}', ']'])
+            .unwrap_or(self.rest().len());
+        let tok = self.rest()[..end].trim();
+        if tok.is_empty() {
+            return self.err("missing value");
+        }
+        let value = match tok {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            "null" => serde_json::Value::Null,
+            _ => {
+                if let Ok(n) = tok.parse::<i64>() {
+                    serde_json::Value::from(n)
+                } else if let Some(n) = tok
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .and_then(serde_json::Number::from_f64)
+                {
+                    serde_json::Value::Number(n)
+                } else {
+                    serde_json::Value::String(tok.to_string())
+                }
+            }
+        };
+        self.i += end;
+        Ok(value)
+    }
+}
+
+/// Strictly parse one Gemma 4 tool call: `body` is the text between
+/// `<|tool_call>` and `<tool_call|>`, i.e. `call:NAME{ARGS}` (surrounding
+/// whitespace tolerated). Strict on purpose: a half-formed call must surface
+/// as an error instead of reaching a client as plausible-looking arguments.
+pub fn parse_gemma4_tool_call(
+    body: &str,
+) -> Result<hipfire_runtime::prompt_frame::ToolCall, GemmaToolCallError> {
+    let trimmed = body.trim();
+    let Some(after) = trimmed.strip_prefix("call:") else {
+        return Err(GemmaToolCallError(
+            "tool call must start with `call:`".to_string(),
+        ));
+    };
+    let name_len = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+        .unwrap_or(after.len());
+    if name_len == 0 {
+        return Err(GemmaToolCallError(
+            "tool call has an empty name".to_string(),
+        ));
+    }
+    let name = after[..name_len].to_string();
+    let mut p = ToolArgParser {
+        s: after,
+        i: name_len,
+    };
+    if !p.eat('{') {
+        return p.err(format!("expected '{{' after tool name `{name}`"));
+    }
+    let arguments = p.object(0)?;
+    p.skip_ws();
+    if !p.rest().is_empty() {
+        return p.err("trailing text after tool-call arguments");
+    }
+    Ok(hipfire_runtime::prompt_frame::ToolCall {
+        id: None,
+        name,
+        arguments,
+        rendered_body: None,
+    })
+}
+
+/// Length of the longest proper prefix of [`TOOL_CALL_OPEN`] that ends `s`.
+fn tool_open_prefix_suffix_len(s: &str) -> usize {
+    (1..TOOL_CALL_OPEN.len())
+        .rev()
+        .find(|&len| {
+            len <= s.len()
+                && s.is_char_boundary(s.len() - len)
+                && TOOL_CALL_OPEN.starts_with(&s[s.len() - len..])
+        })
+        .unwrap_or(0)
+}
+
+/// Splits Gemma 4 answer-channel text into visible content and native tool
+/// calls. Tool-call text is withheld wholesale so clients only ever see
+/// structured calls, never the raw `<|tool_call>` markup. Disabled, it is a
+/// byte-identical pass-through so non-tool requests pay nothing.
+pub struct GemmaToolSplitter {
+    enabled: bool,
+    in_call: bool,
+    /// Outside a call: a held possible marker prefix. Inside: the call body so far.
+    pending: String,
+    calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
+}
+
+impl GemmaToolSplitter {
+    /// `enabled` is true only when the request declared tools.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            in_call: false,
+            pending: String::new(),
+            calls: Vec::new(),
+        }
+    }
+
+    /// Feed answer-channel text in order; returns the visible content now
+    /// safe to emit. A trailing partial `<|tool_call>` marker is held back so
+    /// a marker split across fragments is still caught. A malformed completed
+    /// call is an error.
+    pub fn push(&mut self, text: &str) -> Result<String, GemmaToolCallError> {
+        if !self.enabled {
+            return Ok(text.to_owned());
+        }
+        self.pending.push_str(text);
+        let mut out = String::new();
+        loop {
+            if self.in_call {
+                let Some(j) = self.pending.find(TOOL_CALL_CLOSE) else {
+                    break;
+                };
+                let parsed = parse_gemma4_tool_call(&self.pending[..j]);
+                self.pending.drain(..j + TOOL_CALL_CLOSE.len());
+                self.in_call = false;
+                self.calls.push(parsed?);
+            } else if let Some(i) = self.pending.find(TOOL_CALL_OPEN) {
+                out.push_str(&self.pending[..i]);
+                self.pending.drain(..i + TOOL_CALL_OPEN.len());
+                self.in_call = true;
+            } else {
+                let release = self.pending.len() - tool_open_prefix_suffix_len(&self.pending);
+                out.push_str(&self.pending[..release]);
+                self.pending.drain(..release);
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// End of turn; `ended_on_stop` is true when a stop token (not the
+    /// max_tokens/context cap) ended it. Releases held non-marker text. An
+    /// open call is parsed when a stop token ended it (checkpoints that close
+    /// a call with `<turn|>` rather than `<tool_call|>`), and dropped when
+    /// the turn was truncated: a half-written call is never released.
+    pub fn finish(&mut self, ended_on_stop: bool) -> Result<String, GemmaToolCallError> {
+        if !self.enabled {
+            return Ok(String::new());
+        }
+        let held = std::mem::take(&mut self.pending);
+        if !self.in_call {
+            return Ok(held);
+        }
+        self.in_call = false;
+        if ended_on_stop {
+            self.calls.push(parse_gemma4_tool_call(&held)?);
+        }
+        Ok(String::new())
+    }
+
+    /// Tool calls recorded so far, in emission order.
+    pub fn calls(&self) -> &[hipfire_runtime::prompt_frame::ToolCall] {
+        &self.calls
+    }
+}
+
+#[cfg(test)]
+mod gemma_tool_tests {
+    use super::{parse_gemma4_tool_call, GemmaToolSplitter};
+    use serde_json::json;
+
+    #[test]
+    fn parses_oslo_example() {
+        let c = parse_gemma4_tool_call("call:get_temperature{city:<|\"|>Oslo<|\"|>}").unwrap();
+        assert_eq!(c.name, "get_temperature");
+        assert_eq!(c.arguments, json!({"city": "Oslo"}));
+        assert!(c.id.is_none() && c.rendered_body.is_none());
+    }
+
+    #[test]
+    fn parses_mixed_typed_args() {
+        let body = "  call:f{count:42,flag:true,nested:{k:<|\"|>v<|\"|>},items:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],x:1.5,n:null,<|\"|>city<|\"|>:<|\"|>Oslo<|\"|>,off:false,neg:-7,word:hello world}\n";
+        let c = parse_gemma4_tool_call(body).unwrap();
+        assert_eq!(c.name, "f");
+        assert_eq!(
+            c.arguments,
+            json!({
+                "count": 42,
+                "flag": true,
+                "nested": {"k": "v"},
+                "items": ["a", "b"],
+                "x": 1.5,
+                "n": null,
+                "city": "Oslo",
+                "off": false,
+                "neg": -7,
+                "word": "hello world",
+            })
+        );
+        assert!(c.arguments["count"].is_i64());
+        assert!(c.arguments["x"].is_f64());
+    }
+
+    #[test]
+    fn string_may_contain_structural_chars() {
+        let c = parse_gemma4_tool_call("call:f{s:<|\"|>a{b},c:d\ne}<|\"|>,t:1}").unwrap();
+        assert_eq!(c.arguments, json!({"s": "a{b},c:d\ne}", "t": 1}));
+    }
+
+    #[test]
+    fn parses_empty_args_and_empty_containers() {
+        let c = parse_gemma4_tool_call("call:noargs{}").unwrap();
+        assert_eq!(c.name, "noargs");
+        assert_eq!(c.arguments, json!({}));
+        let c = parse_gemma4_tool_call("call:f{a:[],b:{}}").unwrap();
+        assert_eq!(c.arguments, json!({"a": [], "b": {}}));
+    }
+
+    #[test]
+    fn big_integer_falls_back_to_float() {
+        let c = parse_gemma4_tool_call("call:f{a:99999999999999999999}").unwrap();
+        assert!(c.arguments["a"].is_f64());
+    }
+
+    #[test]
+    fn malformed_calls_are_errors() {
+        for bad in [
+            "call:f{a:<|\"|>unterminated}",
+            "call:f{a:1",
+            "call:f{a:{b:1}",
+            "call:f{a:[1,2}",
+            "call:f{a}",
+            "call:f{a 1}",
+            "call:f{a:1}}",
+            "call:f{a:1} junk",
+            "call:{a:1}",
+            "call:",
+            "f{a:1}",
+            "call:f",
+            "call:f{:1}",
+            "call:f{a:1,}",
+            "call:f{a:1,a:2}",
+            "call:f{a:}",
+            "call:f{a:[1,]}",
+        ] {
+            assert!(parse_gemma4_tool_call(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn disabled_splitter_is_identity() {
+        let mut s = GemmaToolSplitter::new(false);
+        let text = "a <|tool_call>call:f{a:1}<tool_call|> b <|to";
+        assert_eq!(s.push(text).unwrap(), text);
+        assert_eq!(s.push("").unwrap(), "");
+        assert_eq!(s.finish(true).unwrap(), "");
+        assert!(s.calls().is_empty());
+    }
+
+    #[test]
+    fn marker_split_across_three_fragments() {
+        let mut s = GemmaToolSplitter::new(true);
+        let mut vis = String::new();
+        vis.push_str(&s.push("Sure <|to").unwrap());
+        assert_eq!(vis, "Sure ");
+        vis.push_str(&s.push("ol_call>call:f{a:1}").unwrap());
+        vis.push_str(&s.push("<tool_call|> done").unwrap());
+        vis.push_str(&s.finish(true).unwrap());
+        assert_eq!(vis, "Sure  done");
+        assert_eq!(s.calls().len(), 1);
+        assert_eq!(s.calls()[0].name, "f");
+        assert_eq!(s.calls()[0].arguments, json!({"a": 1}));
+    }
+
+    #[test]
+    fn marker_split_one_char_at_a_time() {
+        let mut s = GemmaToolSplitter::new(true);
+        let mut vis = String::new();
+        for ch in "x<|tool_call>call:g{b:<|\"|>q<|\"|>}<tool_call|>y".chars() {
+            vis.push_str(&s.push(&ch.to_string()).unwrap());
+        }
+        vis.push_str(&s.finish(true).unwrap());
+        assert_eq!(vis, "xy");
+        assert_eq!(s.calls()[0].arguments, json!({"b": "q"}));
+    }
+
+    #[test]
+    fn two_calls_with_interleaved_text() {
+        let mut s = GemmaToolSplitter::new(true);
+        let mut vis = String::new();
+        vis.push_str(
+            &s.push("A<|tool_call>call:f{a:1}<tool_call|>B<|tool_call>call:g{}<tool_call|>C")
+                .unwrap(),
+        );
+        vis.push_str(&s.finish(true).unwrap());
+        assert_eq!(vis, "ABC");
+        let calls = s.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[1].name, "g");
+        assert_eq!(calls[1].arguments, json!({}));
+    }
+
+    #[test]
+    fn lookalike_prefix_is_released() {
+        let mut s = GemmaToolSplitter::new(true);
+        let mut vis = String::new();
+        vis.push_str(&s.push("<|to").unwrap());
+        assert_eq!(vis, "");
+        vis.push_str(&s.push("x").unwrap());
+        assert_eq!(vis, "<|tox");
+        vis.push_str(&s.finish(true).unwrap());
+        assert_eq!(vis, "<|tox");
+        assert!(s.calls().is_empty());
+    }
+
+    #[test]
+    fn held_prefix_released_at_finish() {
+        let mut s = GemmaToolSplitter::new(true);
+        assert_eq!(s.push("ok <|tool").unwrap(), "ok ");
+        assert_eq!(s.finish(true).unwrap(), "<|tool");
+    }
+
+    #[test]
+    fn open_block_parsed_when_stop_ended_turn() {
+        let mut s = GemmaToolSplitter::new(true);
+        assert_eq!(s.push("hi <|tool_call>call:f{a:1}").unwrap(), "hi ");
+        assert_eq!(s.finish(true).unwrap(), "");
+        assert_eq!(s.calls().len(), 1);
+        assert_eq!(s.calls()[0].arguments, json!({"a": 1}));
+    }
+
+    #[test]
+    fn open_block_unparseable_on_stop_is_error() {
+        let mut s = GemmaToolSplitter::new(true);
+        assert_eq!(s.push("<|tool_call>call:f{a:").unwrap(), "");
+        assert!(s.finish(true).is_err());
+        assert!(s.calls().is_empty());
+    }
+
+    #[test]
+    fn open_block_dropped_when_truncated() {
+        let mut s = GemmaToolSplitter::new(true);
+        assert_eq!(s.push("hi <|tool_call>call:f{a:1}").unwrap(), "hi ");
+        assert_eq!(s.finish(false).unwrap(), "");
+        assert!(s.calls().is_empty());
+        let mut s = GemmaToolSplitter::new(true);
+        assert_eq!(s.push("<|tool_call>call:f{a:<|\"|>unfin").unwrap(), "");
+        assert_eq!(s.finish(false).unwrap(), "");
+        assert!(s.calls().is_empty());
+    }
+
+    #[test]
+    fn malformed_closed_block_is_error() {
+        let mut s = GemmaToolSplitter::new(true);
+        assert!(s.push("<|tool_call>call:f{a:}<tool_call|>").is_err());
+        assert!(s.calls().is_empty());
+    }
+}

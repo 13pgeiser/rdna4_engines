@@ -40,7 +40,11 @@ impl ArchModel for DotsOcrBundle {
         //   b.state.free_gpu(gpu);
         // DotsOcrWeights::free_gpu frees both text and vision halves.
         // Order (weights then state) matches the old manual sequence.
-        let DotsOcrBundle { config: _, weights, state } = *self;
+        let DotsOcrBundle {
+            config: _,
+            weights,
+            state,
+        } = *self;
         weights.free_gpu(gpu);
         state.free_gpu(gpu);
     }

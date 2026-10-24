@@ -20,16 +20,67 @@ Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
 below. Branch-only model routes (for example LFM framing details) are not
 implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATION.md).
 
-## Security (no auth / no TLS)
+## Security (bearer authentication and HTTPS proxies)
 
-The native handler implements **no authentication and no TLS**.
-Anyone who can reach the bind address can call every endpoint, including
-chat completions. Default bind is `127.0.0.1` (loopback only); set
-`serve.host = "0.0.0.0"` (or pass `0.0.0.0:11435`) to listen on all interfaces.
+The API key is **optional**. Without one, every route is unauthenticated
+(including on a non-loopback bind, where serve starts and prints one line
+recommending a key); anyone who can reach the bind address can call every
+endpoint, including chat completions. A key is **recommended** whenever you
+bind a non-loopback address. Configure `serve.api_key_file` (or
+`HIPFIRE_SERVE_API_KEY_FILE`), or pass `--api-key-file <absolute-path>`. Only
+the path is stored in configuration. Local CLI/TUI clients read the configured
+file automatically. Native Windows does not generate a key for you: create the
+file yourself.
 
-- Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
-- Expose beyond localhost only behind a trusted network or an authenticated
-  TLS reverse proxy you control. Do not publish the raw port to the internet.
+The file must contain at least 32 bytes of printable ASCII after trimming trailing
+whitespace; a space, line break, control character or non-ASCII character inside the
+key is refused at startup with an error naming the file and the character position
+(the key is sent as an HTTP header value).
+On Unix, group/other permissions are refused: use `chmod 600`. Windows ACLs are
+not checked yet; restrict access to the account running serve yourself.
+For example, create a private random token and persist its **path**, not its contents:
+
+```bash
+umask 077
+openssl rand -hex 32 > "$HOME/.hipfire/api-key"
+hipfire config set serve.api_key_file "$HOME/.hipfire/api-key"
+hipfire serve 127.0.0.1:11435        # key from serve.api_key_file
+```
+
+With a key configured, every route requires `Authorization: Bearer <key>`,
+except `/health`: without valid credentials it returns only minimal liveness
+and version, not process identity or model details. Authenticated `/health`
+retains detailed diagnostics. Missing/wrong credentials receive the same 401.
+The existing instance token identifies a process; it is not the API credential.
+
+Authentication runs before routing or request-body reads, including UI assets
+and `OPTIONS` requests. A 401 has an empty body and `WWW-Authenticate: Bearer`.
+The embedded UI cannot supply credentials and therefore receives 401 when a
+key is configured; browser pairing is not implemented. Without a key it works
+unchanged. Existing successful responses retain permissive CORS
+(`Access-Control-Allow-Origin: *`), but an unauthenticated preflight is
+refused when a key is configured. Native clients do not need CORS.
+
+Serve itself has **no TLS**. A bearer on plaintext HTTP can be intercepted.
+Use loopback behind verified HTTPS for remote access; never publish the raw
+port to the internet. Clients support `http://` and verified `https://` URLs
+(including proxy base paths), with no insecure-certificate fallback.
+
+### Tailscale Serve (tailnet-only HTTPS)
+
+Keep the backend bound to loopback, with bearer authentication enabled (recommended):
+
+```bash
+hipfire serve 127.0.0.1:11435 --api-key-file "$HOME/.hipfire/api-key"
+tailscale serve --bg http://127.0.0.1:11435
+```
+
+Use the HTTPS URL printed by Tailscale Serve and supply the same bearer to
+your client. Retain tailnet ACLs/grants as well as app authentication.
+Do **not** enable public Funnel by default. For a manual LAN proxy, use
+HTTPS with a trusted certificate and forward the Authorization header.
+The embedded browser UI does not provide credential pairing; use a
+bearer-capable API client for protected access.
 
 ## Start and stop
 
@@ -38,15 +89,15 @@ hipfire serve                         # foreground; Ctrl-C stops (default bind 1
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 60s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
-hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
+hipfire serve 0.0.0.0:11435 --api-key-file /absolute/private/key -d # key recommended on a non-loopback bind; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
 hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
 hipfire serve --spec off -d           # plain AR (no MTP/DFlash) for every load, e.g. an A/B
 hipfire serve --max-seq 32768 -d      # KV context for every load (replaces memory.max_seq)
 
-hipfire ps                            # daemons / quantize / uploads + port state (Linux)
-hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
+hipfire ps                            # tracked process liveness + port state
+hipfire stop                          # tracked serve only: SIGTERM (Unix), graceful HTTP (Windows)
 # Forceful — inspect first (hipfire ps, curl /health):
 hipfire stop --force                  # also kill this install's untracked daemons (TERM, KILL after 5s)
 hipfire stop --all                    # --force plus pkill orphan quantize jobs
@@ -60,15 +111,36 @@ process answering on the port, exits 1 with that reason. Readiness requires
 the `/health` `pid` to be the child it just spawned, and if the child exits
 early the error includes the last `FATAL`/`hipfire:` line from `serve.log`.
 
-**Forceful lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
-pid after ownership checks — use that by default. `--force`, `--all`, and
-`restart` also stop this install's other daemons: PIDs from the pidfile and
+**Forceful lifecycle flags (Unix).** Plain `hipfire stop` only SIGTERMs the
+tracked pid after ownership checks — use that by default. `--force`, `--all`,
+and `restart` also stop this install's other daemons: PIDs from the pidfile and
 the GPU lock, each verified by command line (this install's daemon binary)
 and matching `HIPFIRE_HOME`, sent SIGTERM and then SIGKILL after 5 s. They no
 longer kill processes by name or by port; if something else still holds the
 port, the CLI prints `port N is still in use by a process that is not this
 install's hipfire; not killing it`. `--all` also runs `pkill -f` against
 release quantize binaries.
+
+**Local management (Windows).** Windows has no signal `hipfire stop` can
+send, so each Windows serve process binds a separate `127.0.0.1` listener on
+an OS-assigned port. Only that listener accepts `POST /api/v1/shutdown`,
+authenticated with its own random 32-byte bearer credential. The inference
+listener never serves this route, including requests forwarded by a
+localhost reverse proxy. The management credential is separate from the
+public instance-identity token, which is not authorization. A Windows
+`serve.pid` stores `manage_port` and `manage_token` and inherits ACLs from the
+user's hipfire home. Keep it private: never share its contents or forward the
+management listener through a proxy. Unix serves bind no management listener
+and their `serve.pid` is unchanged.
+
+**Windows stop.** After checking image, creation time, and port ownership,
+`hipfire stop` sends the local management request and waits up to 35 seconds
+for exit. Shutdown cancels the existing token and drains inference requests
+for at most 30 seconds. If exit times out, the command reports an error rather
+than force-terminating the process. Old pid records without management fields
+require Ctrl-C and a restart with the updated CLI. Windows `--force` / `--all`
+do not reap daemons when ownership cannot be proven from process environment;
+the CLI explains this conservative skip and never kills by name or port.
 
 Flags (also accepted by `restart`). In detached mode (`-d`) the parent forwards
 these to the foreground child as CLI arguments; none of them is turned into an
@@ -78,6 +150,7 @@ environment variable.
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
 | `--model <m>` | Model tag/path to pre-warm for this process (same as the positional model) |
+| `--api-key-file <absolute-path>` | Protected printable-ASCII bearer file; overrides `serve.api_key_file` for this process |
 | `--no-prewarm` | Bind first and load on the first request instead of pre-warming |
 | `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
 | `--kv-k <f>` / `--kv-v <f>` | Qwen-only K / V format override for models this service loads |
@@ -167,7 +240,19 @@ Config and env owners for bind, idle, queue, and body limits:
    With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    decode at once on the experimental multi-slot engine. Concurrent requests
    can produce different greedy text than serial requests at ≥4 slots; output
-   is deterministic for a fixed batch composition. 2 slots matched serial in
+   is deterministic for a fixed batch composition.
+
+   The **embedding** route (arch 17) uses the same switch with a different
+   engine behind it: `POST /v1/embeddings` requests arriving together are
+   served as **one batched forward** rather than one at a time, and because the
+   encoder is deterministic (no KV, GDN state reset per sequence) that batch is
+   **bit-identical** to encoding each input alone — batching is a throughput
+   choice there, never an output change. `serve.multi_slot_slots` is the number
+   of requests one forward may hold and `serve.max_batch_tokens` its row
+   budget; an isolated request pays only the collector's window
+   (`HIPFIRE_EMBED_BATCH_WINDOW_US`, default 2 ms). Measured on gfx1101: eight
+   concurrent 9-token queries go from 100 ms serial (80 req/s) to 19 ms
+   (**416 req/s, 5.2x**) in a single 72-row forward. 2 slots matched serial in
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
    1–4 of 4 prompts.
 
@@ -209,9 +294,9 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`; `503` unless `status` is `ok` |
-| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture` |
-| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s` |
+| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`, `reasoning_effort_probe_error`; `503` unless `status` is `ok` |
+| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it |
+| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s`, `loaded_config`. `loaded_config` is `{ model, kv_mode, kv_backend, max_seq }` — the values the resident model was actually loaded with, from the daemon's load ack (a field is `null` when the ack did not carry it); the whole object is `null` while no model is resident |
 | `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
 | `POST` | `/v1/messages` | Anthropic Messages API (stream or non-stream), adapted onto chat completions |
@@ -232,9 +317,10 @@ redirects to `/ui` only while the UI is enabled.
 
 The UI talks to the same `/v1/chat/completions` gateway as any other
 client and keeps chat history in the browser's IndexedDB — serve stores
-nothing on its behalf. Like every serve endpoint it is **unauthenticated**:
-binding a non-loopback host with the UI enabled prints a warning, since
-that makes the gateway reachable from any browser on the network.
+nothing on its behalf. It cannot send a bearer token: without
+`serve.api_key_file` it works as before (on loopback or any other bind), and on
+a keyed serve its assets and requests receive 401
+(see [Security](#security-bearer-authentication-and-https-proxies)).
 
 For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
 Agent / Pi custom-provider configuration, see
@@ -254,7 +340,8 @@ reload. `token` is a per-process instance token. `n_ctx` is the `max_seq` the
 resident model was loaded with (`null` while none is resident).
 `reasoning_contract`, `reasoning_effort_native` and `reasoning_efforts`
 publish the resident model's reasoning capability (see the reasoning contract
-below). All of these come from serve's own metadata, so `/health` never waits
+below); `reasoning_effort_probe_error` is the full render error when the
+daemon's baseline effort probe failed, `null` otherwise. All of these come from serve's own metadata, so `/health` never waits
 on a model load.
 
 Model switch lifecycle: a load request is first admitted read-only; a refused
@@ -304,6 +391,24 @@ TTFT, latency and TPOT are measured at the gateway.
 
 Buckets: TTFT and latency `10 … 60000` ms; TPOT `2 … 500` ms; throughput
 `1 … 5000` tok/s.
+
+Multi-slot serve (`serve.multi_slot`) attaches the engine's counters to every
+`done` event as `engine_stats`, and serve exports the latest snapshot. The
+values change when a request finishes, not during a long generation. Free
+pages are sampled at the start of that request's last engine step; active
+slots exclude the finishing request, so an idle engine reads 0. The standard
+route sends no snapshot, so these series are absent there (never 0); a model
+switch clears them until the new model finishes a request.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `hipfire_kv_pages_free`, `hipfire_kv_pages_total` | gauge | Free and total pages in the KV page pool (absent when the engine is not paged) |
+| `hipfire_slots_active`, `hipfire_slots_total` | gauge | Slots holding a request; engine slots |
+| `hipfire_evictions_total`, `hipfire_restores_total` | counter | Idle sessions parked to host swap; parked sessions restored to a slot |
+| `hipfire_prefix_hits_total` | counter | Continuations served from a session's resident KV |
+| `hipfire_prefix_reused_tokens_total` | counter | Prompt tokens reused from the cross-session prefix cache |
+
+The engine counters start at 0 when the model loads.
 
 ### `POST /v1/chat/completions`
 
@@ -790,7 +895,11 @@ request run alone on the singleton route. **Default off, experimental.**
 - **Eligible requests:** greedy decoding, plain text chat only — no tools,
   images, logprobs or penalties. Ineligible requests keep the singleton route.
 - **Singleton when alone:** a request that is alone at dispatch runs the
-  unchanged singleton route (including native MTP).
+  unchanged singleton route (including native MTP). When a batched peer
+  queues behind it, a greedy singleton moves into a lane at its next
+  committed window boundary (promotion): into an MTP lane with its trunk,
+  head and draft states, or, with `serve.batch_spec = false`, into an AR lane
+  with its trunk state, continuing the AR singleton's text byte for byte.
 - **MTP lanes (default when the MTP head is loaded):** each lane runs its own
   native MTP window per step: a step-synchronous batched draft for every
   drafting lane, then one `(d+1)`-row verify per lane inside the shared lane
@@ -798,7 +907,7 @@ request run alone on the singleton route. **Default off, experimental.**
   drafts nothing, or that the floor retires, decodes one AR row per step.
   `serve.batch_spec = false` (`HIPFIRE_SERVE_BATCH_SPEC=0`) keeps the AR lanes
   of before (one token per lane per step). There is no per-lane session
-  cache, parking or promotion.
+  cache or parking.
 - **Per-lane AR floor:** each lane keeps the singleton's MTP floor (probe
   windows, sticky retirement, decayed per-depth costs), priced in AR-row
   units from a measured model of the shared step (an AR row costs its
@@ -813,6 +922,29 @@ request run alone on the singleton route. **Default off, experimental.**
   On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
   GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
   every stage per lane until their own G0 run.
+- **Under `topology.pp` / `topology.ep` (2..=8 cards):** the same exact
+  **AR** fn-lanes route is staged across the cards, with these differences from
+  the single-card route above. The lane store is budgeted per device: every
+  band (PP) or rank (EP) must satisfy `need <= free` on its own card, else
+  nothing is staged and the singleton route is kept. There are **no native-MTP
+  lanes** (`continuous_batch_spec: false`, spec mode `"off"`) and a running
+  singleton is **never promoted** into a lane
+  (`continuous_batch_promotion: false`). EP replicates the lane store on every
+  rank; PP keeps a band-scoped store per band, the HC streams crossing each
+  band edge through pinned host memory; a decode step is split into `G`
+  contiguous whole-lane micro-batches that wavefront through the bands
+  (`G` = the maximal overlap `min(lanes, 2 * stages)` under the default
+  per-lane policy; adaptive over `1..=min(lanes, 2 * stages)` under a shared
+  policy; the developer variables `HIPFIRE_PP_LANE_GROUPS=<G>` and
+  `HIPFIRE_FN_LANE_POLICY=<spec>` override group count and stage policy, see
+  [env-vars.md](env-vars.md)). Row-local stages run once over all lanes'
+  rows only where per-stage proof rows cover the bound routes (gfx1201: PP2
+  mq2 and EP2 mq4, byte-exact against the topology singleton); every other
+  stage runs per lane. Measured on 2x R9700 (16 prompts x 256 tokens, 3 fresh
+  processes per arm), aggregate output at C8 is 1.97x (PP2) and 1.83x (EP2)
+  the batching-off C1, and batching on costs C1 0.3% (PP2) and 2.2% (EP2).
+  Like the single-card route it stays default-off. Details:
+  [multi-gpu.md](multi-gpu.md#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
 
 The loaded ack reports `continuous_batch_route: "fn-lanes"`,
 `continuous_batch_history_capable: true` (the typed capability the serve
@@ -829,7 +961,11 @@ and the lane-store receipt:
 policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
 policy). Each lane's `done` event carries the singleton's MTP counters
 (`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
-`mtp_accepted`.
+`mtp_accepted`. Under PP/EP the ack also reports `fn_lanes_topology`
+(`"single"`, `"ep"` or `"pp"`) and `fn_lanes_device_receipts`, one entry per
+card (EP rank order; PP input band to output band); the scalar `fn_lanes_*`
+receipt is the root's (rank 0, or the output band), and
+`continuous_batch_promotion` is `true` only on a single card.
 
 ## Multi-process notes
 

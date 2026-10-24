@@ -21,6 +21,15 @@ def out(obj):
 def echo_ids(req):
     return req.get("id"), req.get("attempt_id")
 
+
+def wait_fixture_control(kind, rid, aid):
+    # Test-only handshake: keep done or its side-channel log unpublished until
+    # the test has observed the admission state on the other side of the gate.
+    msg = json.loads(sys.stdin.readline())
+    log_req(msg)
+    if msg.get("type") != kind or echo_ids(msg) != (rid, aid):
+        raise RuntimeError("unexpected fixture control: " + repr(msg))
+
 def eligible_from_model():
     # Task 15: "ineligible" in model path/name => retry_reset_eligible false.
     blob = (MODEL_PATH or "").lower()
@@ -64,6 +73,9 @@ def scenario_from(req):
         "t15-reset-fail-attempt",
         "t11-premature-eof",
         "t20-legacy-staged-tool",
+        "t22-gemma4-stop",
+        "t22-gemma4-length",
+        "t22-gemma4-tool",
         "t20-gpu-poison",
         "t11-capability-denial",
         "t11-dirty-markers",
@@ -74,6 +86,7 @@ def scenario_from(req):
         "t11-stop-text",
         "t11-usage",
         "t11-long-nonstream",
+        "t11-gated-nonstream",
         "t11-open-think-stop",
         "t21-think-text",
     )
@@ -167,6 +180,44 @@ def handle_generate(req):
         emit_correlated({"type": "gen_start"}, rid, aid)
         terminal = {"finish_reason": "tool_calls", "prompt_tokens": 2, "tokens": 1,
                     "tok_s": 9.0, "calls": calls}
+        emit_correlated(dict(terminal, type="commit_ready"), rid, aid)
+        if wait_commit(rid, aid) != "commit":
+            return
+        emit_correlated(dict(terminal, type="done"), rid, aid)
+        return
+
+    if scenario in ("t22-gemma4-stop", "t22-gemma4-length", "t22-gemma4-tool"):
+        # Gemma 4 legacy contract (no contract_version in gen_start): tokens,
+        # then the two-phase commit_ready/commit handshake, then a done that
+        # is byte-identical to commit_ready apart from `type`. Tool-call text
+        # never reaches the wire as tokens; calls ride the terminal only.
+        emit_correlated({"type": "gen_start", "started_in_think": False}, rid, aid)
+        terminal = {
+            "tokens": 5,
+            "tok_s": 41.5,
+            "prompt_tokens": 31,
+            "prefill_tokens": 31,
+            "cached_tokens": 0,
+            "prefill_ms": 62.0,
+            "prefill_tok_s": 500.0,
+            "decode_tok_s": 52.0,
+            "ttft_ms": 71.0,
+            "total_ms": 168.0,
+            "finish_reason": "stop",
+        }
+        if scenario == "t22-gemma4-length":
+            terminal["finish_reason"] = "length"
+        if scenario == "t22-gemma4-tool":
+            terminal.update({
+                "prompt_tokens": 88,
+                "prefill_tokens": 60,
+                "cached_tokens": 28,
+                "finish_reason": "tool_calls",
+                "calls": [{"name": "get_temperature", "arguments": {"city": "Oslo"}}],
+            })
+        else:
+            for text in ("391", "\n\nExplanation."):
+                emit_correlated({"type": "token", "text": text}, rid, aid)
         emit_correlated(dict(terminal, type="commit_ready"), rid, aid)
         if wait_commit(rid, aid) != "commit":
             return
@@ -280,7 +331,7 @@ def handle_generate(req):
         success_stop(rid, aid)
         return
 
-    if scenario == "t11-long-nonstream":
+    if scenario in ("t11-long-nonstream", "t11-gated-nonstream"):
         # Delayed generation that stays stdin-responsive so a correlated abort
         # can land while no further tokens are produced (silent cancel path).
         ready_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture-ready.log")
@@ -315,10 +366,13 @@ def handle_generate(req):
                 })
                 emit_correlated({"type": "aborted", "reason": "client_cancelled"}, rid, aid)
                 log_req({"type": "daemon_aborted", "id": rid, "attempt_id": aid})
-                # Deliberate drain lag so tests can observe done/aborted before
-                # AdmissionGuard release (inflight must not hit zero early).
-                time.sleep(0.3)
+                if scenario == "t11-gated-nonstream":
+                    wait_fixture_control("fixture_release_done", rid, aid)
+                else:
+                    time.sleep(0.3)
                 emit_correlated({"type": "done", "finish_reason": "aborted"}, rid, aid)
+                if scenario == "t11-gated-nonstream":
+                    wait_fixture_control("fixture_release_done_log", rid, aid)
                 log_req({"type": "daemon_done_aborted", "id": rid, "attempt_id": aid})
                 return
             if ty == "commit":

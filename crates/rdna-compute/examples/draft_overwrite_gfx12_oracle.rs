@@ -134,17 +134,27 @@ fn fetch(gpu: &Gpu, t: &GpuTensor) -> Vec<u32> {
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     if gpu.arch != "gfx1201" {
-        eprintln!("draft_overwrite_gfx12_oracle: needs exact gfx1201, got {}", gpu.arch);
+        eprintln!(
+            "draft_overwrite_gfx12_oracle: needs exact gfx1201, got {}",
+            gpu.arch
+        );
         std::process::exit(2);
     }
     println!(
         "arch={} wmma_batch_tiles={} draft_collapse_off={} ldsstage={}",
-        gpu.arch, gpu.flags.wmma_batch_tiles, gpu.flags.draft_collapse_off,
+        gpu.arch,
+        gpu.flags.wmma_batch_tiles,
+        gpu.flags.draft_collapse_off,
         gpu.flags.hfq4g256_ldsstage_wmma,
     );
 
-    const SHAPES: [(usize, usize); 5] =
-        [(5120, 5120), (1024, 5120), (17408, 5120), (5120, 17408), (4096, 5120)];
+    const SHAPES: [(usize, usize); 5] = [
+        (5120, 5120),
+        (1024, 5120),
+        (17408, 5120),
+        (5120, 17408),
+        (4096, 5120),
+    ];
     const BATCHES: [usize; 7] = [2, 9, 16, 17, 33, 48, 63];
 
     let mut rng = Rng(0xD0F1_A5B7);
@@ -155,7 +165,9 @@ fn main() {
 
     for &(m, k) in &SHAPES {
         let bytes = pack_mq4g256v2(m, k, &mut rng);
-        let w = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload weights");
+        let w = gpu
+            .upload_raw(&bytes, &[bytes.len()])
+            .expect("upload weights");
 
         for &batch in &BATCHES {
             cases += 1;
@@ -172,13 +184,19 @@ fn main() {
                 *v = 0.0;
             }
             let d_x = gpu.upload_f32(&x, &[x.len()]).expect("upload x");
-            let d_ya = gpu.upload_f32(&vec![1.0; batch * m], &[batch * m]).expect("alloc ya");
-            let d_yb = gpu.upload_f32(&vec![1.0; batch * m], &[batch * m]).expect("alloc yb");
+            let d_ya = gpu
+                .upload_f32(&vec![1.0; batch * m], &[batch * m])
+                .expect("alloc ya");
+            let d_yb = gpu
+                .upload_f32(&vec![1.0; batch * m], &[batch * m])
+                .expect("alloc yb");
 
             // Arm A: legacy tail (memset + residual).
             gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             gpu.hip.device_synchronize().expect("sync");
-            gpu.hip.memset(&d_ya.buf, 0, batch * m * 4).expect("memset ya");
+            gpu.hip
+                .memset(&d_ya.buf, 0, batch * m * 4)
+                .expect("memset ya");
             gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(&w, &d_x, &d_ya, m, k, batch)
                 .expect("legacy residual launch");
             let a = fetch(&gpu, &d_ya);
@@ -226,8 +244,12 @@ fn main() {
                 *v = 0.0;
             }
             let d_x = gpu.upload_f32(&x, &[x.len()]).expect("upload x64");
-            let d_ya = gpu.upload_f32(&vec![1.0; batch * m], &[batch * m]).expect("alloc ya64");
-            let d_yb = gpu.upload_f32(&vec![1.0; batch * m], &[batch * m]).expect("alloc yb64");
+            let d_ya = gpu
+                .upload_f32(&vec![1.0; batch * m], &[batch * m])
+                .expect("alloc ya64");
+            let d_yb = gpu
+                .upload_f32(&vec![1.0; batch * m], &[batch * m])
+                .expect("alloc yb64");
             let want_admit = gpu.flags.wmma_batch_tiles;
 
             // Scope closed: N = 64 must NOT be admitted (device untouched).
@@ -259,10 +281,18 @@ fn main() {
             let scoped_admit = scoped.expect("overwrite launch (scope open)");
             let b = fetch(&gpu, &d_yb);
 
-            let mismatches = if scoped_admit { a.iter().zip(&b).filter(|(p, q)| p != q).count() } else { usize::MAX };
+            let mismatches = if scoped_admit {
+                a.iter().zip(&b).filter(|(p, q)| p != q).count()
+            } else {
+                usize::MAX
+            };
             let pz = b.iter().filter(|&&v| v == 0x0000_0000).count();
             let nz = b.iter().filter(|&&v| v == 0x8000_0000).count();
-            let nans = if scoped_admit { b.iter().filter(|&&v| f32::from_bits(v).is_nan()).count() } else { 0 };
+            let nans = if scoped_admit {
+                b.iter().filter(|&&v| f32::from_bits(v).is_nan()).count()
+            } else {
+                0
+            };
             let scope_restored = !gpu.draft_rows64_scope;
             total_pz += pz;
             total_nz += nz;
@@ -274,7 +304,11 @@ fn main() {
             if !ok {
                 failures += 1;
             }
-            let mismatches_txt = if scoped_admit { mismatches.to_string() } else { "n/a".into() };
+            let mismatches_txt = if scoped_admit {
+                mismatches.to_string()
+            } else {
+                "n/a".into()
+            };
             println!(
                 "{} m={m:<5} k={k:<5} batch=64 scoped_admitted={scoped_admit} (want {want_admit}) closed_admitted={closed_admit} ref_admitted={ref_admitted} mismatches_vs_4xN16={mismatches_txt} nan_left={nans} +0={pz} -0={nz}",
                 if ok { "PASS" } else { "FAIL" },

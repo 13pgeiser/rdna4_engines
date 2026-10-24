@@ -16,26 +16,26 @@ use hipfire_engine::terminal::*;
 use hipfire_generate::ar::*;
 use hipfire_generate::common::*;
 
-    use qwen_ar_eviction_prefill_chunk_limit;
-    use hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH;
+use hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH;
+use qwen_ar_eviction_prefill_chunk_limit;
 
-    #[test]
-    fn staging_uses_adaptive_boundaries_until_handoff() {
-        let window = 2048 + 128;
-        assert_eq!(
-            qwen_ar_eviction_prefill_chunk_limit(0, window, true),
-            PREFILL_MAX_BATCH
-        );
-        assert_eq!(
-            qwen_ar_eviction_prefill_chunk_limit(8192 - PREFILL_MAX_BATCH, window, true),
-            PREFILL_MAX_BATCH
-        );
-        assert_eq!(
-            qwen_ar_eviction_prefill_chunk_limit(2048, window, false),
-            128
-        );
-        assert_eq!(
-            qwen_ar_eviction_prefill_chunk_limit(window, window, false),
-            1
-        );
-    }
+#[test]
+fn staging_uses_adaptive_boundaries_until_handoff() {
+    let window = 2048 + 128;
+    assert_eq!(
+        qwen_ar_eviction_prefill_chunk_limit(0, window, true),
+        PREFILL_MAX_BATCH
+    );
+    assert_eq!(
+        qwen_ar_eviction_prefill_chunk_limit(8192 - PREFILL_MAX_BATCH, window, true),
+        PREFILL_MAX_BATCH
+    );
+    assert_eq!(
+        qwen_ar_eviction_prefill_chunk_limit(2048, window, false),
+        128
+    );
+    assert_eq!(
+        qwen_ar_eviction_prefill_chunk_limit(window, window, false),
+        1
+    );
+}

@@ -534,14 +534,8 @@ impl<'a> Enc<'a> {
         // shapes and other architectures (including other gfx12) retain the
         // tiled SIMT kernel, which handles any n and is cheap at small n
         // precisely because its cost is O(n^2).
-        let wmma =
-            self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch == "gfx1201";
-        if !embed_attn_no_gemm()
-            && n % 64 == 0
-            && n >= 256
-            && cfg.head_dim % 64 == 0
-            && wmma
-        {
+        let wmma = self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch == "gfx1201";
+        if !embed_attn_no_gemm() && n % 64 == 0 && n >= 256 && cfg.head_dim % 64 == 0 && wmma {
             return self
                 .attention_gemm(q, k, v, ctx, n, n_valid, cfg)
                 .map_err(|e| rdna_compute::HipError::new(0, &e));
@@ -766,7 +760,12 @@ fn embed_attn_naive() -> bool {
 fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// Run the full encoder and the Dense head; returns `[n, dense_out]`

@@ -20,7 +20,8 @@
 //! little-endian BF16, whatever tier the shards store.
 
 use crate::model_source::{SourceError, SourceRangeDescriptor};
-use crate::ple_hot_store::HotRowStore;
+use crate::ple_hot_store::{HotRowStore, NowaitRead};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -64,6 +65,20 @@ const READS_PER_READER: usize = 64;
 /// Readers for `groups` scattered page-group reads, at most `max_readers`.
 fn reader_count(groups: usize, max_readers: usize) -> usize {
     (groups / READS_PER_READER).clamp(PARALLEL_READERS, max_readers)
+}
+
+/// A fetch of at most this many reads (source page groups plus hot-pack runs)
+/// first tries each read inline against the page cache (`preadv2(RWF_NOWAIT)`):
+/// the reads that are cached cost no thread and no device wait, and only the
+/// rest take the blocking path (see [`RowStoreInner::fetch_inline`]).  A decode
+/// step plans a few dozen reads, a prefill chunk thousands.
+const INLINE_FETCH_MAX_READS: usize = 64;
+
+/// Whether small fetches try their reads inline first
+/// (`HIPFIRE_PLE_INLINE_FETCH`, default on; `0` keeps the blocking readers for
+/// every fetch).  Read once when a [`RowStore`] is built.
+fn inline_fetch_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_PLE_INLINE_FETCH", true)
 }
 
 /// Pages inserted into the cache per state-lock hold when a multi-group
@@ -110,6 +125,21 @@ struct ReadWork<'a> {
     hot: &'a HotPlan,
     hot_cursor: AtomicUsize,
     store: Option<&'a HotRowStore>,
+    /// Bit `i` set: source group `i` was already read inline, readers skip it.
+    /// Only plans of at most [`INLINE_FETCH_MAX_READS`] (< 64) reads set bits.
+    groups_done: u64,
+    /// As `groups_done`, for `hot.runs`.
+    runs_done: u64,
+}
+
+impl ReadWork<'_> {
+    fn group_done(&self, index: usize) -> bool {
+        index < u64::BITS as usize && (self.groups_done >> index) & 1 == 1
+    }
+
+    fn run_done(&self, index: usize) -> bool {
+        index < u64::BITS as usize && (self.runs_done >> index) & 1 == 1
+    }
 }
 
 /// One reader's result of a multi-read fetch.
@@ -140,6 +170,10 @@ struct FetchTrace {
     groups_done_ms: f64,
     parallel_ms: f64,
     inline_read_ms: f64,
+    /// Reads of the fetch completed inline from the page cache, of
+    /// `inline_planned` (0/0 when the fetch did not try inline).
+    inline_done: usize,
+    inline_planned: usize,
 }
 
 impl FetchTrace {
@@ -162,6 +196,8 @@ impl FetchTrace {
             groups_done_ms: 0.0,
             parallel_ms: 0.0,
             inline_read_ms: 0.0,
+            inline_done: 0,
+            inline_planned: 0,
         })
     }
 
@@ -196,11 +232,16 @@ impl FetchTrace {
         self.inline_read_ms = Self::ms_since(started);
     }
 
+    fn mark_inline(&mut self, done: usize, planned: usize) {
+        self.inline_done = done;
+        self.inline_planned = planned;
+    }
+
     fn finish(self) {
         eprintln!(
             "  ple fetch: {} rows {} pages | pack {} pages {} rows {} reads | classified at {:.1} ms | \
              cache {} hits {} misses {} groups, scanned at {:.1} ms | parallel {:.1} ms with {} \
-             readers, source groups done at {:.1} ms | inline reads {:.1} ms | total {:.1} ms",
+             readers, source groups done at {:.1} ms | inline {}/{} reads cached, {:.1} ms | total {:.1} ms",
             self.rows,
             self.pages,
             self.hot_pages,
@@ -214,6 +255,8 @@ impl FetchTrace {
             self.parallel_ms,
             self.readers,
             self.groups_done_ms,
+            self.inline_done,
+            self.inline_planned,
             self.inline_read_ms,
             Self::ms_since(self.started),
         );
@@ -236,31 +279,56 @@ pub const READER_QUEUE_CAPACITY: usize = 64;
 /// background readers only run while no request is being served.
 pub const FETCH_QUIET: Duration = Duration::from_secs(5);
 
-/// Whether a [`RowStore`] is serving fetches.  Every fetch (a prefill chunk or
-/// a decode step) holds a [`FetchGuard`]; background readers of the same table
-/// (the hot-row prewarm, the PLE rows prewarm) wait until the store has been
-/// idle for their quiet period.
+/// Whether a [`RowStore`] is serving requests.  Two kinds of guard hold it
+/// busy, sharing one in-flight count: a [`ServingGuard`] spans a whole request
+/// (every chunk's fetch AND the compute between them, which can outlast
+/// [`FETCH_QUIET`]), and a [`FetchGuard`] covers one fetch (a prefill chunk or
+/// a decode step).  Background readers of the same table (the hot-row
+/// prewarm, the PLE rows prewarm) wait until no guard is held and the last one
+/// dropped at least their quiet period ago.
 pub struct FetchActivity {
     /// Time base of `last_ms`.
     created: Instant,
     /// Milliseconds after `created` (plus one; 0 = never) at which the last
-    /// fetch finished.
+    /// guard (fetch or serving) dropped.
     last_ms: AtomicU64,
-    /// Fetches in flight.
+    /// Guards held: fetches in flight plus requests being served.
     active: AtomicUsize,
 }
 
 /// A fetch in flight (from [`FetchActivity::busy`]); the store counts as busy
 /// until [`FETCH_QUIET`] (or the waiter's own quiet period) after the last
-/// guard drops.
+/// guard drops.  It only covers the fetch itself; hold a [`ServingGuard`] for
+/// the whole request.
 pub struct FetchGuard<'a>(&'a FetchActivity);
 
 impl Drop for FetchGuard<'_> {
     fn drop(&mut self) {
-        let activity = self.0;
-        let at = activity.created.elapsed().as_millis() as u64 + 1;
-        activity.last_ms.fetch_max(at, Ordering::AcqRel);
-        activity.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.finish();
+    }
+}
+
+/// A whole request being served (from [`FetchActivity::serving`]): held from
+/// the request's start to its end, including the compute between fetches.  It
+/// releases on drop, so an error or a cancellation unwinding the request
+/// releases it too.  Owns an `Arc` of the activity, so it is not tied to a
+/// borrow of the store and nests with [`FetchGuard`]s.  The store counts as
+/// busy until [`FETCH_QUIET`] (or the waiter's own quiet period) after the
+/// last guard drops.
+#[derive(Debug)]
+pub struct ServingGuard(Arc<FetchActivity>);
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+impl fmt::Debug for FetchActivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchActivity")
+            .field("in_flight", &self.in_flight())
+            .finish()
     }
 }
 
@@ -279,13 +347,27 @@ impl FetchActivity {
         FetchGuard(self)
     }
 
-    /// Fetches in flight.
+    /// A request starts being served; the returned guard marks it finished
+    /// when dropped.  Clones only the `Arc` (no allocation).
+    pub fn serving(self: &Arc<Self>) -> ServingGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ServingGuard(Arc::clone(self))
+    }
+
+    /// A guard dropped: stamp the quiet-period start, then release its count.
+    fn finish(&self) {
+        let at = self.created.elapsed().as_millis() as u64 + 1;
+        self.last_ms.fetch_max(at, Ordering::AcqRel);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Guards held: fetches in flight plus requests being served.
     pub fn in_flight(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
 
-    /// How long the store has been quiet: `None` while a fetch is in flight,
-    /// `Some(MAX)` when it never served one.
+    /// How long the store has been quiet: `None` while a fetch or request is
+    /// in flight, `Some(MAX)` when it never served one.
     fn quiet_for(&self) -> Option<Duration> {
         if self.in_flight() > 0 {
             return None;
@@ -299,8 +381,8 @@ impl FetchActivity {
         ))
     }
 
-    /// No fetch is in flight and the last one finished at least `quiet` ago
-    /// (or none ever ran).
+    /// No fetch or request is in flight and the last one finished at least
+    /// `quiet` ago (or none ever ran).
     pub fn idle_for(&self, quiet: Duration) -> bool {
         self.quiet_for().is_some_and(|since| since >= quiet)
     }
@@ -345,6 +427,13 @@ pub enum RowEncoding {
     /// Q4LM: `width / 32` blocks of `[f16 scale][16 bytes of 4-bit Lloyd-Max
     /// labels]` (18 bytes), the derived tier of [`crate::ple_q4`].
     Q4Lm,
+    /// qt=56 `FP8E4M3PT`: one OCP e4m3fn code byte per value, `width` bytes
+    /// per row, behind a [`rdna_compute::fp8_e4m3::PT_HEADER_BYTES`]-byte
+    /// shard header carrying the shard's single BF16 scale.  A row decodes to
+    /// `bf16_rne(f32(e4m3(q)) * f32(scale))` through
+    /// [`rdna_compute::fp8_e4m3::dequant_row_pt`], so the scale is a property
+    /// of the shard, read once when the row store opens.
+    Fp8PerTensor,
 }
 
 /// Bytes of one Q8F16 block: an f16 scale followed by 32 signed bytes.
@@ -369,7 +458,17 @@ impl RowEncoding {
             Self::Q4Lm if width % Q8_BLOCK_WEIGHTS == 0 => {
                 Some(width / Q8_BLOCK_WEIGHTS * crate::ple_q4::Q4LM_BLOCK_BYTES)
             }
+            Self::Fp8PerTensor => Some(width),
             _ => None,
+        }
+    }
+
+    /// Bytes ahead of row 0 in one shard's payload: the qt=56 per-tensor
+    /// header for [`Self::Fp8PerTensor`], none for the other encodings.
+    pub const fn shard_header_bytes(self) -> usize {
+        match self {
+            Self::Fp8PerTensor => rdna_compute::fp8_e4m3::PT_HEADER_BYTES,
+            Self::Bf16 | Self::Q8F16 | Self::Q4Lm => 0,
         }
     }
 
@@ -394,6 +493,7 @@ impl RowEncoding {
             Self::Bf16 => "BF16",
             Self::Q8F16 => "Q8_0",
             Self::Q4Lm => "Q4LM",
+            Self::Fp8PerTensor => "FP8E4M3PT",
         }
     }
 
@@ -408,6 +508,7 @@ impl RowEncoding {
             "BF16" | "BFLOAT16" => Some(Self::Bf16),
             "Q8_0" | "Q8F16" | "Q8" | "Q8_F16" => Some(Self::Q8F16),
             "Q4LM" => Some(Self::Q4Lm),
+            "FP8E4M3PT" => Some(Self::Fp8PerTensor),
             _ => None,
         }
     }
@@ -416,8 +517,15 @@ impl RowEncoding {
     ///
     /// `out` fixes the row width; `encoded` must be exactly
     /// [`Self::encoded_row_bytes`] of that width, so a short row can never be
-    /// silently padded.
-    fn decode_row(self, encoded: &[u8], out: &mut [u8]) -> Result<(), RowStoreError> {
+    /// silently padded.  `shard_scale` is the BF16 bits of the row's shard
+    /// scale: required by [`Self::Fp8PerTensor`] (a missing scale is refused),
+    /// ignored by the other encodings.
+    fn decode_row(
+        self,
+        shard_scale: Option<u16>,
+        encoded: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), RowStoreError> {
         match self {
             Self::Bf16 => {
                 if encoded.len() != out.len() {
@@ -450,6 +558,34 @@ impl RowEncoding {
                 }
                 crate::ple_q4::decode_q4lm_row_bf16(encoded, out)
                     .map_err(|reason| RowStoreError::InvalidLease { reason })?;
+            }
+            Self::Fp8PerTensor => {
+                if Some(encoded.len()) != self.checked_encoded_row_bytes(out.len() / 2)
+                    || out.len() % 2 != 0
+                {
+                    return Err(RowStoreError::InvalidLease {
+                        reason: "FP8E4M3PT row length mismatch".to_string(),
+                    });
+                }
+                let scale = shard_scale.ok_or_else(|| RowStoreError::InvalidLease {
+                    reason: "FP8E4M3PT row has no shard scale".to_string(),
+                })?;
+                // The one decoder of the format (the teacher's twin); a
+                // bounded stack chunk adapts its u16 output to the lease's
+                // byte layout without allocating per row.
+                const CHUNK: usize = 64;
+                let mut bits = [0u16; CHUNK];
+                for (codes, cells) in encoded.chunks(CHUNK).zip(out.chunks_mut(2 * CHUNK)) {
+                    let bits = &mut bits[..codes.len()];
+                    rdna_compute::fp8_e4m3::dequant_row_pt(codes, scale, bits).map_err(
+                        |error| RowStoreError::InvalidLease {
+                            reason: format!("FP8E4M3PT row decode: {error}"),
+                        },
+                    )?;
+                    for (cell, value) in cells.chunks_exact_mut(2).zip(bits.iter()) {
+                        cell.copy_from_slice(&value.to_le_bytes());
+                    }
+                }
             }
         }
         Ok(())
@@ -886,11 +1022,23 @@ impl RowStore {
         wide_readers: bool,
     ) -> Result<Self, RowStoreError> {
         let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
-        let layout = validate_descriptors(&descriptors, valid_rows)?;
+        let mut layout = validate_descriptors(&descriptors, valid_rows)?;
+        if layout.encoding == RowEncoding::Fp8PerTensor {
+            layout.shard_scales = read_pt_shard_scales(&descriptors)?;
+        }
         let source: Arc<dyn PositionalRowSource> = Arc::new(DescriptorRowSource {
             descriptors: descriptors.clone(),
+            data_offset: layout.encoding.shard_header_bytes() as u64,
         });
-        Self::spawn(name, source, descriptors, layout, rows, wide_readers)
+        Self::spawn(
+            name,
+            source,
+            descriptors,
+            layout,
+            rows,
+            wide_readers,
+            inline_fetch_enabled(),
+        )
     }
 
     /// A row store over a rank-ordered PLE table ([`HotRowStore::open_table`]):
@@ -922,6 +1070,13 @@ impl RowStore {
             )));
         }
         let encoding = store.encoding();
+        if encoding == RowEncoding::Fp8PerTensor {
+            // A pack carries no per-shard scales, so it cannot hold these rows.
+            return Err(invalid(
+                "a PLE table store cannot carry FP8E4M3PT rows (their scale is per shard)"
+                    .to_string(),
+            ));
+        }
         let row_width = store.row_width();
         if encoding.checked_encoded_row_bytes(row_width) != Some(store.encoded_row_bytes()) {
             return Err(invalid(format!(
@@ -937,6 +1092,7 @@ impl RowStore {
             row_width,
             valid_rows,
             encoding,
+            shard_scales: Vec::new().into(),
         };
         let source: Arc<dyn PositionalRowSource> = Arc::new(TableRowSource {
             store: store.clone(),
@@ -951,6 +1107,7 @@ impl RowStore {
             layout,
             staging_rows,
             wide_readers,
+            inline_fetch_enabled(),
         )?;
         rows.attach_hot_store(store).map_err(invalid)?;
         Ok(rows)
@@ -963,6 +1120,7 @@ impl RowStore {
         layout: Layout,
         staging_rows: usize,
         wide_readers: bool,
+        inline_fetch: bool,
     ) -> Result<Self, RowStoreError> {
         let decoded_row_bytes = layout.row_width * 2;
         let staging_bytes = staging_rows
@@ -981,6 +1139,7 @@ impl RowStore {
             padded_rows: layout.shard_count as u64 * layout.rows_per_shard as u64,
             encoding: layout.encoding,
             encoded_row_bytes: layout.encoding.encoded_row_bytes(layout.row_width),
+            shard_scales: layout.shard_scales,
             decoded_row_bytes,
             staging_bytes,
             max_readers: if wide_readers {
@@ -988,6 +1147,7 @@ impl RowStore {
             } else {
                 PARALLEL_READERS
             },
+            inline_fetch,
             rows_per_shard: layout.rows_per_shard,
             rows_per_page: layout.rows_per_page,
             current_epoch: AtomicU64::new(0),
@@ -1435,6 +1595,12 @@ impl RowStore {
     /// store.  Errs (and attaches nothing) when the store's geometry or row
     /// encoding is not this table's.
     pub fn attach_hot_store(&self, store: Arc<HotRowStore>) -> Result<(), String> {
+        if self.inner.encoding == RowEncoding::Fp8PerTensor {
+            return Err(
+                "a hot-row store cannot serve FP8E4M3PT rows (a pack carries no per-shard scale)"
+                    .to_string(),
+            );
+        }
         let inner = &self.inner;
         if store.padded_rows() != inner.padded_rows
             || store.rows_per_shard() != inner.rows_per_shard
@@ -1681,6 +1847,9 @@ struct RowStoreInner {
     padded_rows: u64,
     /// Stored row representation, fixed by the sealed shard dtype.
     encoding: RowEncoding,
+    /// Per-shard BF16 scale bits of [`RowEncoding::Fp8PerTensor`] rows, read
+    /// from each shard's header at open; empty for every other encoding.
+    shard_scales: Arc<[u16]>,
     encoded_row_bytes: usize,
     /// BF16 width of one published row.
     decoded_row_bytes: usize,
@@ -1688,6 +1857,9 @@ struct RowStoreInner {
     staging_bytes: usize,
     /// Reader ceiling of one request's scattered reads.
     max_readers: usize,
+    /// Small fetches try their reads against the page cache inline first
+    /// ([`inline_fetch_enabled`], fixed at construction).
+    inline_fetch: bool,
     rows_per_shard: usize,
     rows_per_page: usize,
     epoch_started: AtomicBool,
@@ -1704,6 +1876,12 @@ struct RowStoreInner {
 }
 
 impl RowStoreInner {
+    /// The shard scale [`RowEncoding::Fp8PerTensor`] rows decode with; `None`
+    /// for every other encoding (they carry their scales in-row).
+    fn shard_scale(&self, shard: usize) -> Option<u16> {
+        self.shard_scales.get(shard).copied()
+    }
+
     fn locate_row(&self, row: u64) -> Result<RowLocation, RowStoreError> {
         if row >= self.padded_rows {
             return Err(RowStoreError::GlobalRowOutOfRange {
@@ -1918,8 +2096,10 @@ impl RowStoreInner {
         pending: &mut PendingPages,
     ) -> Result<(), RowStoreError> {
         // Every PLE fetch (a prefill chunk or a decode step) marks the row
-        // store busy, so background readers of the table (the hot store's
-        // fill, the rows prewarm) only run while no request is being served.
+        // store busy for the fetch itself; the whole-request
+        // [`ServingGuard`] (held by the caller) also covers the compute
+        // between fetches.  Background readers of the table (the hot
+        // store's fill, the rows prewarm) only run while neither is held.
         let _busy = self.activity.busy();
         if pages.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(RowStoreError::InvalidLease {
@@ -1980,6 +2160,7 @@ impl RowStoreInner {
             if let Some(cached) = state.cache.pages.get(&page) {
                 copy_requested_rows(
                     self.encoding,
+                    self.shard_scale(page.shard),
                     self.encoded_row_bytes,
                     self.decoded_row_bytes,
                     page,
@@ -1999,7 +2180,25 @@ impl RowStoreInner {
         if let Some(trace) = trace.as_mut() {
             trace.mark_cache_scanned(pages.len() - missing.len(), missing.len(), groups.len());
         }
-        let result = if groups.len() + hot.runs.len() > 1 {
+        let planned_reads = groups.len() + hot.runs.len();
+        let result = if self.inline_fetch && (1..=INLINE_FETCH_MAX_READS).contains(&planned_reads) {
+            let started = Instant::now();
+            let result = self.fetch_inline(
+                &groups,
+                &hot,
+                store,
+                &requested,
+                output,
+                read_staging,
+                canceled,
+                pending,
+                &mut trace,
+            );
+            if let Some(trace) = trace.as_mut() {
+                trace.inline_reads(started);
+            }
+            result
+        } else if planned_reads > 1 {
             // Rows are drawn at random over the table, so the groups are
             // scattered single-page reads: issued serially each one waits a
             // full device round trip (~64 reads = 10-15 ms per few-token
@@ -2015,6 +2214,8 @@ impl RowStoreInner {
                 hot: &hot,
                 hot_cursor: AtomicUsize::new(0),
                 store,
+                groups_done: 0,
+                runs_done: 0,
             };
             let work = &work;
             let shared = SharedOutput::new(&mut *output);
@@ -2104,32 +2305,13 @@ impl RowStoreInner {
             let Some(group) = work.groups.get(index) else {
                 break;
             };
+            if work.group_done(index) {
+                continue;
+            }
             let mut bytes = Vec::new();
             self.read_group_bytes(group, &mut bytes)?;
-            let single = group.len() == 1;
-            let mut offset = 0usize;
-            for &page in group {
-                let length = self.page_len(page)?;
-                let page_bytes = &bytes[offset..offset + length];
-                if let Some(rows) = requested.get(&page) {
-                    copy_requested_rows_shared(
-                        self.encoding,
-                        self.encoded_row_bytes,
-                        self.decoded_row_bytes,
-                        page,
-                        page_bytes,
-                        rows,
-                        output,
-                    )?;
-                }
-                if !single {
-                    share.pages.push((page, page_bytes.to_vec()));
-                }
-                offset += length;
-            }
-            if single {
-                share.pages.push((group[0], bytes));
-            }
+            self.decode_group(group, &bytes, requested, output)?;
+            self.queue_group_pages(group, Cow::Owned(bytes), &mut share)?;
         }
         share.groups_done = started.elapsed();
         if let Some(store) = work.store {
@@ -2139,6 +2321,9 @@ impl RowStoreInner {
                 let Some(run) = work.hot.runs.get(index) else {
                     break;
                 };
+                if work.run_done(index) {
+                    continue;
+                }
                 self.read_hot_run(store, work.hot, run, output, &mut buffer)?;
             }
         }
@@ -2226,6 +2411,18 @@ impl RowStoreInner {
         store
             .read_pack(run.offset, buffer)
             .map_err(RowStoreError::Source)?;
+        self.decode_hot_run(plan, run, buffer, output)
+    }
+
+    /// Decode the requested rows of one pack run into `output` from `buffer`,
+    /// the run's `run.len` bytes read at `run.offset`.
+    fn decode_hot_run(
+        &self,
+        plan: &HotPlan,
+        run: &HotRun,
+        buffer: &[u8],
+        output: &SharedOutput<'_>,
+    ) -> Result<(), RowStoreError> {
         for item in &plan.items[run.items.clone()] {
             let at = (item.pack_offset - run.offset) as usize;
             let end = item
@@ -2241,8 +2438,13 @@ impl RowStoreInner {
             // pages), positions are `decoded_row_bytes` apart, and every run
             // is decoded by exactly one reader.
             let destination = unsafe { output.range_mut(item.output_offset..end) };
-            self.encoding
-                .decode_row(&buffer[at..at + self.encoded_row_bytes], destination)?;
+            // A hot store is never attached to FP8E4M3PT rows
+            // (`attach_hot_store`), so no shard scale is needed here.
+            self.encoding.decode_row(
+                None,
+                &buffer[at..at + self.encoded_row_bytes],
+                destination,
+            )?;
         }
         Ok(())
     }
@@ -2353,6 +2555,16 @@ impl RowStoreInner {
         group: &[PageKey],
         bytes: &mut Vec<u8>,
     ) -> Result<(), RowStoreError> {
+        let (first, first_offset, total) = self.group_extent(group)?;
+        bytes.resize(total, 0);
+        self.source
+            .read_at(first.shard, first_offset, bytes)
+            .map_err(RowStoreError::Source)
+    }
+
+    /// The first page, shard-local byte offset and byte length of one
+    /// coalesced page group's read, checked against the staging budget.
+    fn group_extent(&self, group: &[PageKey]) -> Result<(PageKey, u64, usize), RowStoreError> {
         let first = *group.first().ok_or_else(|| RowStoreError::InvalidLease {
             reason: "empty coalesced page group".to_string(),
         })?;
@@ -2376,10 +2588,7 @@ impl RowStoreInner {
                 reason: "coalesced read exceeds staging budget".to_string(),
             });
         }
-        bytes.resize(total, 0);
-        self.source
-            .read_at(first.shard, first_offset, bytes)
-            .map_err(RowStoreError::Source)
+        Ok((first, first_offset, total))
     }
 
     /// Insert pages read by a multi-group request into the cache in ascending
@@ -2418,6 +2627,7 @@ impl RowStoreInner {
             if let Some(rows) = requested.get(&page) {
                 copy_requested_rows(
                     self.encoding,
+                    self.shard_scale(page.shard),
                     self.encoded_row_bytes,
                     self.decoded_row_bytes,
                     page,
@@ -2433,6 +2643,275 @@ impl RowStoreInner {
         state.cache.coalesced_reads += 1;
         state.cache.read_bytes += total as u64;
         Ok(())
+    }
+
+    /// [`RowStoreInner::read_group_bytes`] that only completes from the page
+    /// cache: `Done` leaves the group's bytes in `bytes`, `WouldBlock` leaves
+    /// `bytes` unspecified and the read still to do.
+    fn try_read_group_nowait(
+        &self,
+        group: &[PageKey],
+        bytes: &mut Vec<u8>,
+    ) -> Result<NowaitRead, RowStoreError> {
+        let (first, first_offset, total) = self.group_extent(group)?;
+        bytes.resize(total, 0);
+        self.source
+            .read_nowait_at(first.shard, first_offset, bytes)
+            .map_err(RowStoreError::Source)
+    }
+
+    /// [`RowStoreInner::read_hot_run`]'s read that only completes from the
+    /// page cache (see [`RowStoreInner::try_read_group_nowait`]).
+    fn try_read_hot_nowait(
+        &self,
+        store: &HotRowStore,
+        run: &HotRun,
+        buffer: &mut Vec<u8>,
+    ) -> Result<NowaitRead, RowStoreError> {
+        buffer.resize(run.len, 0);
+        store
+            .read_pack_nowait(run.offset, buffer)
+            .map_err(RowStoreError::Source)
+    }
+
+    /// Decode the requested rows of every page of a read group into `output`;
+    /// `bytes` is the group's read.
+    fn decode_group(
+        &self,
+        group: &[PageKey],
+        bytes: &[u8],
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &SharedOutput<'_>,
+    ) -> Result<(), RowStoreError> {
+        let mut offset = 0usize;
+        for &page in group {
+            let length = self.page_len(page)?;
+            if let Some(rows) = requested.get(&page) {
+                copy_requested_rows_shared(
+                    self.encoding,
+                    self.shard_scale(page.shard),
+                    self.encoded_row_bytes,
+                    self.decoded_row_bytes,
+                    page,
+                    &bytes[offset..offset + length],
+                    rows,
+                    output,
+                )?;
+            }
+            offset += length;
+        }
+        Ok(())
+    }
+
+    /// Queue the pages of a read group in `share` for caching.  An owned read
+    /// of a one-page group is handed over without a copy.
+    fn queue_group_pages(
+        &self,
+        group: &[PageKey],
+        bytes: Cow<'_, [u8]>,
+        share: &mut ReaderShare,
+    ) -> Result<(), RowStoreError> {
+        if let [page] = group {
+            share.pages.push((*page, bytes.into_owned()));
+            return Ok(());
+        }
+        let mut offset = 0usize;
+        for &page in group {
+            let length = self.page_len(page)?;
+            share
+                .pages
+                .push((page, bytes[offset..offset + length].to_vec()));
+            offset += length;
+        }
+        Ok(())
+    }
+
+    /// Count `groups` source reads of `bytes` bytes in the cache statistics.
+    fn note_group_reads(&self, groups: usize, bytes: usize) {
+        let mut state = self.state.lock().expect("row store state mutex poisoned");
+        state.cache.reads += groups as u64;
+        state.cache.coalesced_reads += groups as u64;
+        state.cache.read_bytes += bytes as u64;
+    }
+
+    /// Fetch of 1..=[`INLINE_FETCH_MAX_READS`] planned reads (`groups` source
+    /// page groups and `hot.runs` pack runs): each read is first tried inline
+    /// with a no-wait read, which only completes when its bytes are already in
+    /// the page cache, and a completed read is decoded and queued right away
+    /// by the same helpers the readers use.  A read that would block (cache
+    /// miss, short read, no kernel support) takes the blocking path: with one
+    /// such read it runs on this thread, with `n > 1` on `min(n,
+    /// max_readers)` scoped readers, with none no thread starts.  Real I/O
+    /// errors of the no-wait read surface as they would from the blocking
+    /// read.
+    ///
+    /// A single planned read behaves as the single-read path of
+    /// [`RowStoreInner::fill_output`] (cache inserted inline); several leave
+    /// their pages in `pending`, as its multi-read path does, also when
+    /// returning `Canceled`.  Cancellation is checked before every no-wait
+    /// read and after the assembly.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_inline(
+        &self,
+        groups: &[Vec<PageKey>],
+        hot: &HotPlan,
+        store: Option<&HotRowStore>,
+        requested: &HashMap<PageKey, Vec<RowCopy>>,
+        output: &mut [u8],
+        read_staging: &mut Vec<u8>,
+        canceled: &AtomicBool,
+        pending: &mut PendingPages,
+        trace: &mut Option<FetchTrace>,
+    ) -> Result<(), RowStoreError> {
+        let planned = groups.len() + hot.runs.len();
+        if planned == 1 {
+            if canceled.load(Ordering::Acquire) {
+                return Err(RowStoreError::Canceled);
+            }
+            return match (groups.first(), hot.runs.first(), store) {
+                (Some(group), _, _) => {
+                    if self.try_read_group_nowait(group, read_staging)? == NowaitRead::Done {
+                        if let Some(trace) = trace.as_mut() {
+                            trace.mark_inline(1, 1);
+                        }
+                        if canceled.load(Ordering::Acquire) {
+                            return Err(RowStoreError::Canceled);
+                        }
+                        self.publish_group(group, read_staging, requested, output)
+                    } else {
+                        self.read_group(group, requested, output, read_staging, canceled)
+                    }
+                }
+                (None, Some(run), Some(store)) => {
+                    let shared = SharedOutput::new(&mut *output);
+                    let read = if self.try_read_hot_nowait(store, run, read_staging)?
+                        == NowaitRead::Done
+                    {
+                        if let Some(trace) = trace.as_mut() {
+                            trace.mark_inline(1, 1);
+                        }
+                        self.decode_hot_run(hot, run, read_staging, &shared)
+                    } else {
+                        self.read_hot_run(store, hot, run, &shared, read_staging)
+                    };
+                    if read.is_ok() {
+                        store.note_served(hot.rows, hot.pages, 1);
+                    }
+                    read
+                }
+                _ => Ok(()),
+            };
+        }
+
+        let started = Instant::now();
+        let shared = SharedOutput::new(&mut *output);
+        let shared = &shared;
+        let mut share = ReaderShare::default();
+        let mut groups_done = 0u64;
+        let mut runs_done = 0u64;
+        let mut hot_rows_done = 0u64;
+        let mut stopped = false;
+        for (index, group) in groups.iter().enumerate() {
+            if canceled.load(Ordering::Acquire) {
+                stopped = true;
+                break;
+            }
+            if self.try_read_group_nowait(group, read_staging)? == NowaitRead::Done {
+                self.decode_group(group, read_staging, requested, shared)?;
+                self.queue_group_pages(group, Cow::Borrowed(&read_staging[..]), &mut share)?;
+                groups_done |= 1u64 << index;
+            }
+        }
+        if let Some(store) = store.filter(|_| !stopped) {
+            for (index, run) in hot.runs.iter().enumerate() {
+                if canceled.load(Ordering::Acquire) {
+                    stopped = true;
+                    break;
+                }
+                if self.try_read_hot_nowait(store, run, read_staging)? == NowaitRead::Done {
+                    self.decode_hot_run(hot, run, read_staging, shared)?;
+                    runs_done |= 1u64 << index;
+                    hot_rows_done += run.items.len() as u64;
+                }
+            }
+        }
+        share.groups_done = started.elapsed();
+        let inline_done = (groups_done.count_ones() + runs_done.count_ones()) as usize;
+        if let Some(trace) = trace.as_mut() {
+            trace.mark_inline(inline_done, planned);
+        }
+        if stopped {
+            // The completed reads are cached all the same, as when a request
+            // is canceled after its readers finished.
+            let read_bytes: usize = share.pages.iter().map(|(_, bytes)| bytes.len()).sum();
+            self.note_group_reads(groups_done.count_ones() as usize, read_bytes);
+            if let Some(store) = store.filter(|_| runs_done != 0) {
+                store.note_served(hot_rows_done, 0, u64::from(runs_done.count_ones()));
+            }
+            if !share.pages.is_empty() {
+                *pending = vec![share.pages];
+            }
+            return Err(RowStoreError::Canceled);
+        }
+
+        let remaining = planned - inline_done;
+        let mut shares = Vec::with_capacity(2);
+        shares.push(share);
+        let mut readers = 0;
+        if remaining > 0 {
+            readers = remaining.min(self.max_readers);
+            let work = ReadWork {
+                groups,
+                group_cursor: AtomicUsize::new(0),
+                hot,
+                hot_cursor: AtomicUsize::new(0),
+                store,
+                groups_done,
+                runs_done,
+            };
+            let work = &work;
+            if readers == 1 {
+                shares.push(self.run_reader(work, requested, shared, started)?);
+            } else {
+                let more =
+                    std::thread::scope(|scope| -> Result<Vec<ReaderShare>, RowStoreError> {
+                        let handles: Vec<_> = (0..readers)
+                            .map(|_| {
+                                scope.spawn(move || {
+                                    self.run_reader(work, requested, shared, started)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|handle| handle.join().expect("row reader thread panicked"))
+                            .collect()
+                    })?;
+                shares.extend(more);
+            }
+        }
+        let read_bytes: usize = shares
+            .iter()
+            .flat_map(|share| share.pages.iter())
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        self.note_group_reads(groups.len(), read_bytes);
+        if let Some(store) = store {
+            store.note_served(hot.rows, hot.pages, hot.runs.len() as u64);
+        }
+        if let Some(trace) = trace.as_mut() {
+            trace.parallel(started, readers, &shares);
+        }
+        *pending = shares
+            .into_iter()
+            .map(|share| share.pages)
+            .filter(|pages| !pages.is_empty())
+            .collect();
+        if canceled.load(Ordering::Acquire) {
+            Err(RowStoreError::Canceled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2452,6 +2931,7 @@ struct RowCopy {
 /// same encoding ratio.
 fn copy_requested_rows(
     encoding: RowEncoding,
+    shard_scale: Option<u16>,
     encoded_row_bytes: usize,
     decoded_row_bytes: usize,
     page: PageKey,
@@ -2468,7 +2948,11 @@ fn copy_requested_rows(
             output.len(),
             row,
         )?;
-        encoding.decode_row(&page_bytes[page_range], &mut output[output_range])?;
+        encoding.decode_row(
+            shard_scale,
+            &page_bytes[page_range],
+            &mut output[output_range],
+        )?;
     }
     Ok(())
 }
@@ -2482,6 +2966,7 @@ fn copy_requested_rows(
 /// positions, and every page of a request is read by exactly one thread.
 fn copy_requested_rows_shared(
     encoding: RowEncoding,
+    shard_scale: Option<u16>,
     encoded_row_bytes: usize,
     decoded_row_bytes: usize,
     page: PageKey,
@@ -2505,7 +2990,7 @@ fn copy_requested_rows_shared(
         // (strictly ascending, so unique) page to exactly one thread.  No
         // other slice of this row exists while this one is live.
         let destination = unsafe { output.range_mut(output_range) };
-        encoding.decode_row(&page_bytes[page_range], destination)?;
+        encoding.decode_row(shard_scale, &page_bytes[page_range], destination)?;
     }
     Ok(())
 }
@@ -2835,29 +3320,67 @@ fn complete_ticket_locked(
 
 trait PositionalRowSource: Send + Sync {
     fn read_at(&self, shard: usize, local_offset: u64, dst: &mut [u8]) -> Result<(), SourceError>;
+
+    /// [`PositionalRowSource::read_at`] that completes only when every byte is
+    /// already in memory and otherwise reports [`NowaitRead::WouldBlock`]
+    /// without waiting for the device (`dst` unspecified then).  Real I/O
+    /// errors are returned.  The default never serves a read.
+    fn read_nowait_at(
+        &self,
+        _shard: usize,
+        _local_offset: u64,
+        _dst: &mut [u8],
+    ) -> Result<NowaitRead, SourceError> {
+        Ok(NowaitRead::WouldBlock)
+    }
 }
 
 struct DescriptorRowSource {
     descriptors: Arc<[SourceRangeDescriptor]>,
+    /// Bytes ahead of row 0 in every shard ([`RowEncoding::shard_header_bytes`]).
+    data_offset: u64,
 }
 
-impl PositionalRowSource for DescriptorRowSource {
-    fn read_at(&self, shard: usize, local_offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+impl DescriptorRowSource {
+    /// The descriptor of `shard` and the absolute source offset of
+    /// `local_offset` within it.
+    fn locate(
+        &self,
+        shard: usize,
+        local_offset: u64,
+    ) -> Result<(&SourceRangeDescriptor, u64), SourceError> {
         let descriptor = self
             .descriptors
             .get(shard)
             .ok_or_else(|| SourceError::InvalidSource {
                 reason: format!("row shard {shard} is absent"),
             })?;
-        let absolute =
-            descriptor
-                .offset
-                .checked_add(local_offset)
-                .ok_or(SourceError::Overflow {
-                    offset: descriptor.offset,
-                    length: local_offset,
-                })?;
+        let absolute = descriptor
+            .offset
+            .checked_add(self.data_offset)
+            .and_then(|start| start.checked_add(local_offset))
+            .ok_or(SourceError::Overflow {
+                offset: descriptor.offset,
+                length: local_offset,
+            })?;
+        Ok((descriptor, absolute))
+    }
+}
+
+impl PositionalRowSource for DescriptorRowSource {
+    fn read_at(&self, shard: usize, local_offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        let (descriptor, absolute) = self.locate(shard, local_offset)?;
         descriptor.read_exact_at(absolute, dst)
+    }
+
+    fn read_nowait_at(
+        &self,
+        shard: usize,
+        local_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<NowaitRead, SourceError> {
+        let (descriptor, absolute) = self.locate(shard, local_offset)?;
+        descriptor.read_nowait_at(absolute, dst)
     }
 }
 
@@ -2995,7 +3518,7 @@ impl PageCache {
 }
 
 /// Physical layout of one validated shard set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Layout {
     shard_count: usize,
     rows_per_shard: usize,
@@ -3003,6 +3526,40 @@ struct Layout {
     row_width: usize,
     valid_rows: u64,
     encoding: RowEncoding,
+    /// Per-shard scales of [`RowEncoding::Fp8PerTensor`] rows (empty otherwise).
+    shard_scales: Arc<[u16]>,
+}
+
+/// The scale of every qt=56 shard, read from its 16-byte header
+/// ([`rdna_compute::fp8_e4m3::pt_header_scale`]: bytes 2..16 must be zero).
+/// A non-finite scale is refused here, before any row is served.
+fn read_pt_shard_scales(
+    descriptors: &[SourceRangeDescriptor],
+) -> Result<Arc<[u16]>, RowStoreError> {
+    let mut scales = Vec::with_capacity(descriptors.len());
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let mut header = [0u8; rdna_compute::fp8_e4m3::PT_HEADER_BYTES];
+        descriptor
+            .read_exact_at(descriptor.offset, &mut header)
+            .map_err(|error| RowStoreError::Descriptor {
+                index,
+                reason: format!("FP8E4M3PT shard header read failed: {error}"),
+            })?;
+        let scale = rdna_compute::fp8_e4m3::pt_header_scale(&header).map_err(|error| {
+            RowStoreError::Descriptor {
+                index,
+                reason: format!("FP8E4M3PT shard header: {error}"),
+            }
+        })?;
+        if !rdna_compute::fp8_e4m3::bf16_to_f32(scale).is_finite() {
+            return Err(RowStoreError::Descriptor {
+                index,
+                reason: format!("FP8E4M3PT shard scale 0x{scale:04x} is not finite"),
+            });
+        }
+        scales.push(scale);
+    }
+    Ok(scales.into())
 }
 
 fn validate_descriptors(
@@ -3016,14 +3573,18 @@ fn validate_descriptors(
             reason: "at least one physical shard is required".to_string(),
         })?;
     // The declared dtype is the contract: BF16 shards are `2 * width`-byte raw
-    // rows, Q8F16 shards are `width / 32` 34-byte blocks per row and Q4LM
-    // shards `width / 32` 18-byte blocks per row. Nothing infers the tier from
-    // the byte count, so a mislabelled artifact is refused rather than decoded
-    // as the wrong width.
+    // rows, Q8F16 shards are `width / 32` 34-byte blocks per row, Q4LM
+    // shards `width / 32` 18-byte blocks per row and FP8E4M3PT shards a
+    // 16-byte scale header then `width`-byte code rows. Nothing infers the
+    // tier from the byte count, so a mislabelled artifact is refused rather
+    // than decoded as the wrong width.
     let encoding =
         RowEncoding::from_dtype(first.dtype()).ok_or_else(|| RowStoreError::Descriptor {
             index: 0,
-            reason: format!("rows must be BF16, Q8_0 or Q4LM, got {}", first.dtype()),
+            reason: format!(
+                "rows must be BF16, Q8_0, Q4LM or FP8E4M3PT, got {}",
+                first.dtype()
+            ),
         })?;
     let shape = first.logical_shape();
     if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
@@ -3044,6 +3605,7 @@ fn validate_descriptors(
     }
     let expected_length = (rows as u64)
         .checked_mul(encoding.encoded_row_bytes(width) as u64)
+        .and_then(|bytes| bytes.checked_add(encoding.shard_header_bytes() as u64))
         .ok_or_else(|| RowStoreError::Descriptor {
             index: 0,
             reason: "descriptor length overflow".to_string(),
@@ -3102,6 +3664,7 @@ fn validate_descriptors(
         row_width: width,
         valid_rows,
         encoding,
+        shard_scales: Vec::new().into(),
     })
 }
 
@@ -3110,6 +3673,124 @@ mod tests {
     use super::*;
     use std::io;
     use std::sync::atomic::AtomicUsize;
+
+    /// Guard counting: a serving guard and fetch guards share one in-flight
+    /// count, and the store is not idle until all of them dropped.
+    #[test]
+    fn serving_and_fetch_guards_share_the_in_flight_count() {
+        let activity = Arc::new(FetchActivity::new());
+        assert_eq!(activity.in_flight(), 0);
+        assert!(activity.idle_for(Duration::ZERO), "never served: idle");
+        let serving = activity.serving();
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        let fetch = activity.busy();
+        assert_eq!(activity.in_flight(), 2);
+        // Overlapping: the fetch ending leaves the request being served.
+        drop(fetch);
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        // And a fetch starting/ending after the serving guard dropped.
+        let fetch = activity.busy();
+        drop(serving);
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        drop(fetch);
+        assert_eq!(activity.in_flight(), 0);
+        assert!(activity.idle_for(Duration::ZERO));
+        // The quiet period starts at the last guard's drop.
+        assert!(!activity.idle_for(Duration::from_secs(3600)));
+        // Two serving guards (two requests) also share the count.
+        let (a, b) = (activity.serving(), activity.serving());
+        assert_eq!(activity.in_flight(), 2);
+        drop(a);
+        assert_eq!(activity.in_flight(), 1);
+        drop(b);
+        assert_eq!(activity.in_flight(), 0);
+    }
+
+    /// The gap between two fetches of one request (compute) is covered by a
+    /// serving guard, but not by the per-fetch guards alone; the quiet period
+    /// then starts when the request ends.
+    #[test]
+    fn serving_guard_covers_the_gap_between_fetches() {
+        const QUIET: Duration = Duration::from_millis(20);
+        const GAP: Duration = Duration::from_millis(120);
+        let activity = Arc::new(FetchActivity::new());
+
+        // Fetch guards only: idle once the gap outlasts the quiet period.
+        drop(activity.busy());
+        std::thread::sleep(GAP);
+        assert!(activity.idle_for(QUIET), "per-fetch guard misses the gap");
+
+        // Whole request: busy across the same gap, between and after fetches.
+        let serving = activity.serving();
+        drop(activity.busy());
+        std::thread::sleep(GAP);
+        assert!(!activity.idle_for(QUIET), "serving guard covers the gap");
+        drop(activity.busy());
+        std::thread::sleep(GAP);
+        assert!(!activity.idle_for(QUIET));
+        drop(serving);
+        assert!(
+            !activity.idle_for(QUIET),
+            "quiet period restarts at the end"
+        );
+        std::thread::sleep(GAP);
+        assert!(activity.idle_for(QUIET));
+    }
+
+    /// An error return, a panic and a cancelled thread all release the
+    /// serving guard (and nested fetch guards) on unwind.
+    #[test]
+    fn serving_guard_releases_on_error_panic_and_cancel() {
+        fn request(activity: &Arc<FetchActivity>, fail: bool) -> Result<(), RowStoreError> {
+            let _serving = activity.serving();
+            let _fetch = activity.busy();
+            assert_eq!(activity.in_flight(), 2);
+            if fail {
+                return Err(RowStoreError::Canceled);
+            }
+            Ok(())
+        }
+        let activity = Arc::new(FetchActivity::new());
+        assert!(request(&activity, true).is_err());
+        assert_eq!(activity.in_flight(), 0, "error path released");
+        assert!(request(&activity, false).is_ok());
+        assert_eq!(activity.in_flight(), 0, "success path released");
+
+        let panicked = {
+            let activity = activity.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _serving = activity.serving();
+                let _fetch = activity.busy();
+                panic!("request failed mid-flight");
+            }))
+        };
+        assert!(panicked.is_err());
+        assert_eq!(activity.in_flight(), 0, "unwind released");
+        assert!(!activity.idle_for(Duration::from_secs(3600)));
+
+        // A request cancelled between chunks: the thread stops at its flag and
+        // the guard drops with it.
+        let canceled = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let (activity, canceled) = (activity.clone(), canceled.clone());
+            std::thread::spawn(move || {
+                let _serving = activity.serving();
+                started_tx.send(()).unwrap();
+                while !canceled.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        started_rx.recv().unwrap();
+        assert_eq!(activity.in_flight(), 1, "held across the request");
+        canceled.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert_eq!(activity.in_flight(), 0, "cancel released");
+    }
 
     struct MemoryRowSource {
         shards: Vec<Vec<u8>>,
@@ -3249,6 +3930,26 @@ mod tests {
             encoding: RowEncoding,
             source: Arc<MemoryRowSource>,
         ) -> Result<Self, RowStoreError> {
+            Self::from_test_positional(
+                metadata,
+                rows_per_shard,
+                rows_per_page,
+                encoding,
+                source,
+                true,
+            )
+        }
+
+        /// A store over any positional source, with the inline fetch fixed by
+        /// `inline_fetch` instead of `HIPFIRE_PLE_INLINE_FETCH`.
+        fn from_test_positional(
+            metadata: Fixture,
+            rows_per_shard: usize,
+            rows_per_page: usize,
+            encoding: RowEncoding,
+            source: Arc<dyn PositionalRowSource>,
+            inline_fetch: bool,
+        ) -> Result<Self, RowStoreError> {
             if rows_per_shard == 0 || rows_per_page == 0 {
                 return Err(RowStoreError::Descriptor {
                     index: 0,
@@ -3279,9 +3980,11 @@ mod tests {
                     row_width: ROW_WIDTH,
                     valid_rows: metadata.valid_rows,
                     encoding,
+                    shard_scales: Vec::new().into(),
                 },
                 0,
                 true,
+                inline_fetch,
             )
         }
     }
@@ -3853,7 +4556,7 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..DECODES {
             RowEncoding::Q8F16
-                .decode_row(&encoded, &mut out)
+                .decode_row(None, &encoded, &mut out)
                 .expect("decode");
             std::hint::black_box(&out);
         }
@@ -3866,6 +4569,7 @@ mod tests {
                 RowEncoding::Bf16 => rows_source(2, rows_per_shard),
                 RowEncoding::Q8F16 => rows_source_q8(2, rows_per_shard),
                 RowEncoding::Q4Lm => rows_source_q4(2, rows_per_shard),
+                RowEncoding::Fp8PerTensor => unreachable!("not a probe arm"),
             };
             let tokens: Vec<u32> = (0..256).collect();
             let rows = RowStore::from_test_source_encoded(
@@ -3943,18 +4647,177 @@ mod tests {
         let shards = rows_source_q4(1, 2);
         let row = &shards[0][..90];
         let mut got = vec![0u8; ROW_BYTES];
-        RowEncoding::Q4Lm.decode_row(row, &mut got).unwrap();
+        RowEncoding::Q4Lm.decode_row(None, row, &mut got).unwrap();
         let mut want = vec![0u8; ROW_BYTES];
         crate::ple_q4::decode_q4lm_row_bf16(row, &mut want).unwrap();
         assert_eq!(got, want);
-        assert!(RowEncoding::Q4Lm.decode_row(&row[..89], &mut got).is_err());
-        assert!(RowEncoding::Q4Lm.decode_row(row, &mut got[..318]).is_err());
+        assert!(RowEncoding::Q4Lm
+            .decode_row(None, &row[..89], &mut got)
+            .is_err());
+        assert!(RowEncoding::Q4Lm
+            .decode_row(None, row, &mut got[..318])
+            .is_err());
     }
 
-    /// Sealed single-file reader of the descriptor fixtures below.
+    /// Deterministic xorshift for the FP8 row fixtures.
+    fn fp8_rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// One random finite e4m3fn code (never the NaN codes 0x7F / 0xFF, which
+    /// the teacher and the decoder refuse; 0x80 = -0 is included).
+    fn fp8_code(state: &mut u64) -> u8 {
+        loop {
+            let code = fp8_rng(state) as u8;
+            if code & 0x7F != 0x7F {
+                return code;
+            }
+        }
+    }
+
+    /// A random positive finite BF16 scale over the range a per-tensor PLE
+    /// scale lives in (2^-20 .. 2^4), full 7-bit mantissa.
+    fn fp8_scale(state: &mut u64) -> u16 {
+        let exponent = 127 - 20 + (fp8_rng(state) % 25) as u16;
+        (exponent << 7) | (fp8_rng(state) & 0x7F) as u16
+    }
+
+    /// `Fp8PerTensor` rows publish exactly the BF16 bits the qt=56 decode
+    /// module produces (`bf16_rne(f32(e4m3(q)) * f32(scale))`), on random rows
+    /// and scales and on every code; NaN codes, a missing scale and a wrong
+    /// row length are refused.
+    #[test]
+    fn fp8_per_tensor_rows_decode_bit_identical_to_the_fp8_module() {
+        let encoding = RowEncoding::Fp8PerTensor;
+        assert_eq!(RowEncoding::from_dtype("FP8E4M3PT"), Some(encoding));
+        assert_eq!(RowEncoding::from_dtype("fp8e4m3pt"), Some(encoding));
+        assert_eq!(encoding.dtype_name(), "FP8E4M3PT");
+        assert_eq!(encoding.encoded_row_bytes(ROW_WIDTH), ROW_WIDTH);
+        assert_eq!(encoding.checked_encoded_row_bytes(0), None);
+        assert_eq!(encoding.shard_header_bytes(), 16);
+        assert_eq!(RowEncoding::Q8F16.shard_header_bytes(), 0);
+
+        let decode_ref = |codes: &[u8], scale: u16| {
+            let mut bits = vec![0u16; codes.len()];
+            rdna_compute::fp8_e4m3::dequant_row_pt(codes, scale, &mut bits).unwrap();
+            bits.iter()
+                .flat_map(|bits| bits.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..512 {
+            let width = [ROW_WIDTH, 1, 63, 64, 65, 200][(fp8_rng(&mut state) % 6) as usize];
+            let codes: Vec<u8> = (0..width).map(|_| fp8_code(&mut state)).collect();
+            let scale = fp8_scale(&mut state);
+            let mut got = vec![0u8; 2 * width];
+            encoding.decode_row(Some(scale), &codes, &mut got).unwrap();
+            assert_eq!(got, decode_ref(&codes, scale), "scale 0x{scale:04x}");
+        }
+        // Every finite code, including -0 (0x80 -> BF16 0x8000).
+        let all: Vec<u8> = (0..=255u8).filter(|code| code & 0x7F != 0x7F).collect();
+        for scale in [0x3F80u16, 0x3B80, 0x4100, 0x3000] {
+            let mut got = vec![0u8; 2 * all.len()];
+            encoding.decode_row(Some(scale), &all, &mut got).unwrap();
+            assert_eq!(got, decode_ref(&all, scale));
+        }
+        let mut zero = [0u8; 2];
+        encoding
+            .decode_row(Some(0x3F80), &[0x80], &mut zero)
+            .unwrap();
+        assert_eq!(u16::from_le_bytes(zero), 0x8000);
+
+        let mut got = vec![0u8; 2 * ROW_WIDTH];
+        let mut codes = vec![0x38u8; ROW_WIDTH];
+        assert!(encoding.decode_row(None, &codes, &mut got).is_err());
+        assert!(encoding
+            .decode_row(Some(0x3F80), &codes[1..], &mut got)
+            .is_err());
+        for nan in [0x7Fu8, 0xFF] {
+            codes[17] = nan;
+            assert!(encoding.decode_row(Some(0x3F80), &codes, &mut got).is_err());
+        }
+    }
+
+    /// One qt=56 shard payload: the 16-byte scale header, then the codes.
+    fn pt_shard(scale: u16, codes: &[u8]) -> Vec<u8> {
+        let mut shard = rdna_compute::fp8_e4m3::pt_header(scale).to_vec();
+        shard.extend_from_slice(codes);
+        shard
+    }
+
+    /// qt=56 shards open through the production descriptor constructor: each
+    /// shard's header scale is read once, rows are addressed past the header,
+    /// and a lease publishes every row decoded with its own shard's scale.  A
+    /// header with stray bytes, a missing header and a hot store are refused.
+    #[test]
+    fn fp8_per_tensor_descriptors_round_trip_through_the_row_store() {
+        let rows_per_shard = 64;
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let scales = [fp8_scale(&mut state), fp8_scale(&mut state)];
+        let codes: Vec<Vec<u8>> = (0..2)
+            .map(|_| {
+                (0..rows_per_shard * ROW_WIDTH)
+                    .map(|_| fp8_code(&mut state))
+                    .collect()
+            })
+            .collect();
+        let shards: Vec<Vec<u8>> = scales
+            .iter()
+            .zip(&codes)
+            .map(|(&scale, codes)| pt_shard(scale, codes))
+            .collect();
+        let (_dir, descriptors) =
+            shard_descriptors(&shards, "FP8E4M3PT", rows_per_shard, ROW_WIDTH);
+        let rows = RowStore::new("fp8-test-reader", descriptors, 128).unwrap();
+        assert_eq!(rows.inner.shard_scales.as_ref(), scales.as_slice());
+        let ids = [0u64, 1, 5, 63, 64, 100, 127, 64, 0, 3];
+        let want: Vec<u8> = ids
+            .iter()
+            .flat_map(|&id| {
+                let (shard, local) = (id as usize / rows_per_shard, id as usize % rows_per_shard);
+                let row = &codes[shard][local * ROW_WIDTH..(local + 1) * ROW_WIDTH];
+                let mut bits = vec![0u16; ROW_WIDTH];
+                rdna_compute::fp8_e4m3::dequant_row_pt(row, scales[shard], &mut bits).unwrap();
+                bits.into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<u8>>()
+            })
+            .collect();
+        assert_eq!(fetch(&rows, &ids), want);
+        // Cached pages keep the one-byte codes.
+        let location = rows.locate_row(100).unwrap();
+        assert_eq!(
+            rows.inner.page_len(location.page_key()).unwrap(),
+            RowEncoding::Fp8PerTensor.page_bytes(ROW_WIDTH)
+        );
+        assert!(rows.unload().unwrap().is_clean());
+
+        let descriptor_reason = |shards: &[Vec<u8>]| {
+            let (_dir, descriptors) = shard_descriptors(shards, "FP8E4M3PT", 4, ROW_WIDTH);
+            match RowStore::new("fp8-test-reader", descriptors, 4).err() {
+                Some(RowStoreError::Descriptor { reason, .. }) => reason,
+                other => panic!("expected a descriptor error, got {other:?}"),
+            }
+        };
+        let mut stray = pt_shard(0x3F80, &[0x38; 4 * ROW_WIDTH]);
+        stray[5] = 1;
+        assert!(descriptor_reason(&[stray]).contains("FP8E4M3PT"));
+        let reason = descriptor_reason(&[vec![0x38; 4 * ROW_WIDTH]]);
+        assert!(reason.contains("FP8E4M3PT"), "{reason}");
+        let infinite = pt_shard(0x7F80, &[0x38; 4 * ROW_WIDTH]);
+        assert!(descriptor_reason(&[infinite]).contains("not finite"));
+    }
+
+    /// Sealed single-file reader of the descriptor fixtures below.  Its no-wait
+    /// read is answered by `cache` when set (served from the file as if cached,
+    /// or "would block"), else by the real `preadv2(RWF_NOWAIT)`.
     struct FileRowReader {
         identity: crate::model_source::SourceIdentity,
         file: std::fs::File,
+        cache: Option<Arc<CacheModel>>,
     }
 
     impl crate::model_source::SourceReaderImpl for FileRowReader {
@@ -3970,6 +4833,22 @@ mod tests {
                 dst,
             )
         }
+
+        fn read_nowait_at(&self, offset: u64, dst: &mut [u8]) -> Result<NowaitRead, SourceError> {
+            match &self.cache {
+                Some(cache) if !cache.answer() => {
+                    dst.fill(0xA5);
+                    Ok(NowaitRead::WouldBlock)
+                }
+                Some(_) => self.read_exact_at(offset, dst).map(|()| NowaitRead::Done),
+                None => crate::model_source::read_file_nowait_at(
+                    &self.file,
+                    &self.identity.files[0],
+                    offset,
+                    dst,
+                ),
+            }
+        }
     }
 
     /// Sealed descriptors over `path`: one per `(offset, length)` range, each
@@ -3981,6 +4860,18 @@ mod tests {
         dtype: &str,
         rows_per_shard: usize,
         width: usize,
+    ) -> Vec<SourceRangeDescriptor> {
+        file_descriptors_with(path, ranges, dtype, rows_per_shard, width, None)
+    }
+
+    /// [`file_descriptors`] whose readers answer no-wait reads from `cache`.
+    fn file_descriptors_with(
+        path: &std::path::Path,
+        ranges: &[(u64, u64)],
+        dtype: &str,
+        rows_per_shard: usize,
+        width: usize,
+        cache: Option<Arc<CacheModel>>,
     ) -> Vec<SourceRangeDescriptor> {
         use crate::model_source::{
             capture_file_identity, SourceFormat, SourceIdentity, SourceReader,
@@ -3999,6 +4890,7 @@ mod tests {
                 let reader = SourceReader::from_inner(FileRowReader {
                     identity: identity.as_ref().clone(),
                     file: std::fs::File::open(path).unwrap(),
+                    cache: cache.clone(),
                 });
                 SourceRangeDescriptor::from_parts(
                     identity.clone(),
@@ -4021,6 +4913,17 @@ mod tests {
         rows_per_shard: usize,
         width: usize,
     ) -> (tempfile::TempDir, Vec<SourceRangeDescriptor>) {
+        shard_descriptors_with(shards, dtype, rows_per_shard, width, None)
+    }
+
+    /// [`shard_descriptors`] whose readers answer no-wait reads from `cache`.
+    fn shard_descriptors_with(
+        shards: &[Vec<u8>],
+        dtype: &str,
+        rows_per_shard: usize,
+        width: usize,
+        cache: Option<Arc<CacheModel>>,
+    ) -> (tempfile::TempDir, Vec<SourceRangeDescriptor>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rows.ple-q4");
         let mut file = vec![0u8; 4096];
@@ -4030,7 +4933,8 @@ mod tests {
             file.extend_from_slice(shard);
         }
         std::fs::write(&path, &file).unwrap();
-        let descriptors = file_descriptors(&path, &ranges, dtype, rows_per_shard, width);
+        let descriptors =
+            file_descriptors_with(&path, &ranges, dtype, rows_per_shard, width, cache);
         (dir, descriptors)
     }
 
@@ -4086,7 +4990,7 @@ mod tests {
         // A dtype with no decoder names the three that exist.
         let reason = descriptor_reason(&[vec![0u8; 4 * 90]], "F32", ROW_WIDTH);
         assert!(
-            reason.contains("BF16, Q8_0 or Q4LM") && reason.contains("F32"),
+            reason.contains("BF16, Q8_0, Q4LM or FP8E4M3PT") && reason.contains("F32"),
             "{reason}"
         );
     }
@@ -4804,5 +5708,584 @@ mod tests {
         fresh
             .attach_hot_store(hot_pack(&source, 64, 4, 3).store.clone())
             .unwrap();
+    }
+
+    // ---- inline (RWF_NOWAIT) fetch ---------------------------------------
+
+    /// How the modelled page cache answers a no-wait read.
+    const CACHE_NONE: usize = 0;
+    const CACHE_ALL: usize = 1;
+    /// The 1st, 3rd, 5th... attempt is served.
+    const CACHE_ALTERNATE: usize = 2;
+
+    /// Deterministic stand-in for the page cache's answer to a no-wait read,
+    /// independent of the host filesystem: counts attempts and serves them by
+    /// `mode`.  The inline phase of a fetch runs on one thread, so the attempt
+    /// order is fixed.
+    struct CacheModel {
+        mode: AtomicUsize,
+        attempts: AtomicUsize,
+        served: AtomicUsize,
+    }
+
+    impl CacheModel {
+        fn new(mode: usize) -> Arc<Self> {
+            Arc::new(Self {
+                mode: AtomicUsize::new(mode),
+                attempts: AtomicUsize::new(0),
+                served: AtomicUsize::new(0),
+            })
+        }
+
+        /// Whether this attempt is served.
+        fn answer(&self) -> bool {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+            let serve = match self.mode.load(Ordering::Acquire) {
+                CACHE_ALL => true,
+                CACHE_ALTERNATE => attempt % 2 == 0,
+                _ => false,
+            };
+            if serve {
+                self.served.fetch_add(1, Ordering::AcqRel);
+            }
+            serve
+        }
+
+        /// `(attempts, served)` so far.
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.attempts.load(Ordering::Acquire),
+                self.served.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    /// A [`MemoryRowSource`] whose no-wait reads follow a [`CacheModel`]: a
+    /// served read copies the shard bytes without touching `inner.reads`, so
+    /// `inner.reads` counts exactly the blocking reads.  A read that would
+    /// block scribbles over the buffer first (its content is unspecified).
+    struct NowaitSource {
+        inner: Arc<MemoryRowSource>,
+        cache: Arc<CacheModel>,
+    }
+
+    impl PositionalRowSource for NowaitSource {
+        fn read_at(&self, shard: usize, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+            self.inner.read_at(shard, offset, dst)
+        }
+
+        fn read_nowait_at(
+            &self,
+            shard: usize,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> Result<NowaitRead, SourceError> {
+            if !self.cache.answer() {
+                dst.fill(0xA5);
+                return Ok(NowaitRead::WouldBlock);
+            }
+            let begin = offset as usize;
+            dst.copy_from_slice(&self.inner.shards[shard][begin..begin + dst.len()]);
+            Ok(NowaitRead::Done)
+        }
+    }
+
+    const INLINE_ROWS_PER_SHARD: usize = 16384;
+
+    fn inline_source() -> Arc<MemoryRowSource> {
+        Arc::new(MemoryRowSource {
+            shards: rows_source(2, INLINE_ROWS_PER_SHARD),
+            reads: AtomicUsize::new(0),
+            fail: None,
+        })
+    }
+
+    /// BF16 rows, one row per page: the pages of rows four apart are never
+    /// adjacent, so each is its own source read.
+    fn inline_rows(source: Arc<dyn PositionalRowSource>, inline_fetch: bool) -> RowStore {
+        RowStore::from_test_positional(
+            metadata_with_head_size(2048, 32768),
+            INLINE_ROWS_PER_SHARD,
+            1,
+            RowEncoding::Bf16,
+            source,
+            inline_fetch,
+        )
+        .unwrap()
+    }
+
+    /// Cache statistics once the worker has finished publishing the ticket's
+    /// pages.  `wait_completed_lease` returns as soon as the ticket is
+    /// completed, which for a multi-read ticket is before `worker_loop` inserts
+    /// its pages (the reader stays counted as active until then), so a snapshot
+    /// taken right after `fetch` may not see them yet.
+    fn settled_stats(rows: &RowStore) -> RowCacheStats {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = rows.cache_stats();
+            if stats.outstanding_readers == 0 {
+                return stats;
+            }
+            assert!(Instant::now() < deadline, "a reader is still publishing");
+            std::thread::yield_now();
+        }
+    }
+
+    fn inline_expected(source: &MemoryRowSource, ids: &[u64]) -> Vec<u8> {
+        ids.iter()
+            .flat_map(|&id| {
+                let shard = id as usize / INLINE_ROWS_PER_SHARD;
+                let row = id as usize % INLINE_ROWS_PER_SHARD;
+                source.shards[shard][row * ROW_BYTES..(row + 1) * ROW_BYTES].to_vec()
+            })
+            .collect()
+    }
+
+    /// `count` rows four apart in a scrambled order (each a one-page source
+    /// read), the row after one of them (a two-page group), a repeated row, and
+    /// the last row of shard 0 and first of shard 1 (adjacent pages in
+    /// different shards never coalesce).
+    fn scattered_ids(count: u64) -> Vec<u64> {
+        let mut ids: Vec<u64> = (0..count).map(|i| ((i * 37) % count) * 4).collect();
+        ids.push(ids[3] + 1);
+        ids.push(ids[5]);
+        ids.push(INLINE_ROWS_PER_SHARD as u64 - 1);
+        ids.push(INLINE_ROWS_PER_SHARD as u64);
+        ids
+    }
+
+    /// The enabled fetch returns the blocking readers' bytes and counters for
+    /// every answer of the page cache, tries each read inline exactly when the
+    /// plan has at most 64 reads, and leaves the same pages in the cache.
+    fn assert_source_inline_matches_blocking(ids: &[u64], small: bool) {
+        let blocking_source = inline_source();
+        let want = inline_expected(&blocking_source, ids);
+        let blocking = inline_rows(blocking_source.clone(), false);
+        assert_eq!(fetch(&blocking, ids), want);
+        let old = settled_stats(&blocking);
+        let groups = old.reads as usize;
+        assert_eq!(groups > INLINE_FETCH_MAX_READS, !small, "{groups} groups");
+        assert_eq!(blocking_source.reads.load(Ordering::Acquire), groups);
+
+        for mode in [CACHE_ALL, CACHE_NONE, CACHE_ALTERNATE] {
+            let memory = inline_source();
+            let cache = CacheModel::new(mode);
+            let rows = inline_rows(
+                Arc::new(NowaitSource {
+                    inner: memory.clone(),
+                    cache: cache.clone(),
+                }),
+                true,
+            );
+            assert_eq!(fetch(&rows, ids), want, "mode {mode}");
+            let (attempts, served) = cache.counts();
+            let fallbacks = memory.reads.load(Ordering::Acquire);
+            if small {
+                assert_eq!(attempts, groups, "mode {mode}: every read tried once");
+                assert_eq!(served + fallbacks, groups, "mode {mode}");
+                match mode {
+                    CACHE_ALL => assert_eq!((served, fallbacks), (groups, 0)),
+                    CACHE_NONE => assert_eq!((served, fallbacks), (0, groups)),
+                    _ => assert!(served > 0 && fallbacks > 0),
+                }
+            } else {
+                // More than 64 reads: the unchanged blocking readers.
+                assert_eq!((attempts, served, fallbacks), (0, 0, groups));
+            }
+            let stats = settled_stats(&rows);
+            assert_eq!(
+                (
+                    stats.reads,
+                    stats.coalesced_reads,
+                    stats.read_bytes,
+                    stats.cache_hits,
+                    stats.cache_misses,
+                    stats.resident_pages,
+                    stats.resident_bytes,
+                ),
+                (
+                    old.reads,
+                    old.coalesced_reads,
+                    old.read_bytes,
+                    old.cache_hits,
+                    old.cache_misses,
+                    old.resident_pages,
+                    old.resident_bytes,
+                ),
+                "mode {mode}"
+            );
+
+            // The pages the first fetch read are cached: no read of any kind.
+            assert_eq!(fetch(&rows, ids), want, "mode {mode}, second fetch");
+            assert_eq!(cache.counts().0, attempts);
+            assert_eq!(memory.reads.load(Ordering::Acquire), fallbacks);
+            let again = rows.cache_stats();
+            assert_eq!(again.reads, old.reads);
+            assert_eq!(again.cache_hits, old.cache_misses);
+            assert!(rows.unload().unwrap().is_clean());
+        }
+    }
+
+    #[test]
+    fn inline_fetch_source_pages_are_byte_identical_for_a_small_fetch() {
+        assert_source_inline_matches_blocking(&scattered_ids(20), true);
+    }
+
+    /// More than 64 planned reads after coalescing (202 groups here): the
+    /// enabled store never tries inline and behaves as the blocking readers.
+    #[test]
+    fn inline_fetch_source_pages_are_byte_identical_for_a_large_fetch() {
+        assert_source_inline_matches_blocking(&scattered_ids(200), false);
+    }
+
+    /// The plan size that decides is the number of reads: 64 are tried inline,
+    /// 65 are not, however many rows they carry.
+    #[test]
+    fn inline_fetch_limit_counts_reads_after_coalescing() {
+        let at_limit: Vec<u64> = (0..INLINE_FETCH_MAX_READS as u64).map(|i| i * 4).collect();
+        let over_limit: Vec<u64> = (0..INLINE_FETCH_MAX_READS as u64 + 1)
+            .map(|i| i * 4)
+            .collect();
+        // One read per group: the 64 groups use every bit of the done mask.
+        for (ids, tried) in [(at_limit, true), (over_limit, false)] {
+            for mode in [CACHE_ALL, CACHE_ALTERNATE] {
+                let memory = inline_source();
+                let cache = CacheModel::new(mode);
+                let rows = inline_rows(
+                    Arc::new(NowaitSource {
+                        inner: memory.clone(),
+                        cache: cache.clone(),
+                    }),
+                    true,
+                );
+                assert_eq!(fetch(&rows, &ids), inline_expected(&memory, &ids));
+                let (attempts, served) = cache.counts();
+                if tried {
+                    assert_eq!(attempts, ids.len(), "mode {mode}");
+                    assert_eq!(
+                        served + memory.reads.load(Ordering::Acquire),
+                        ids.len(),
+                        "mode {mode}"
+                    );
+                } else {
+                    assert_eq!(attempts, 0, "mode {mode}");
+                }
+            }
+        }
+    }
+
+    /// One planned read keeps the single-read behaviour: served inline and
+    /// cached at once, or read blocking.
+    #[test]
+    fn inline_fetch_single_read_is_cached_inline_and_falls_back() {
+        for (mode, served_inline) in [(CACHE_ALL, true), (CACHE_NONE, false)] {
+            let memory = inline_source();
+            let cache = CacheModel::new(mode);
+            let rows = inline_rows(
+                Arc::new(NowaitSource {
+                    inner: memory.clone(),
+                    cache: cache.clone(),
+                }),
+                true,
+            );
+            let ids = [40u64, 40];
+            assert_eq!(fetch(&rows, &ids), inline_expected(&memory, &ids));
+            assert_eq!(cache.counts(), (1, usize::from(served_inline)));
+            assert_eq!(
+                memory.reads.load(Ordering::Acquire),
+                usize::from(!served_inline)
+            );
+            let stats = rows.cache_stats();
+            assert_eq!(
+                (stats.reads, stats.read_bytes, stats.resident_pages),
+                (1, ROW_BYTES as u64, 1)
+            );
+            assert_eq!(fetch(&rows, &ids), inline_expected(&memory, &ids));
+            assert_eq!(rows.cache_stats().cache_hits, 1);
+            assert_eq!(cache.counts().0, 1);
+        }
+    }
+
+    /// Cancellation is checked before every no-wait read: the reads completed
+    /// so far stay pending for the cache, the others are not read.
+    struct CancelSource {
+        inner: Arc<MemoryRowSource>,
+        served: AtomicUsize,
+        cancel_at: usize,
+        canceled: Arc<AtomicBool>,
+    }
+
+    impl PositionalRowSource for CancelSource {
+        fn read_at(&self, shard: usize, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+            self.inner.read_at(shard, offset, dst)
+        }
+
+        /// Serves every read from memory and raises the cancel flag when the
+        /// `cancel_at`-th one is served.
+        fn read_nowait_at(
+            &self,
+            shard: usize,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> Result<NowaitRead, SourceError> {
+            let begin = offset as usize;
+            dst.copy_from_slice(&self.inner.shards[shard][begin..begin + dst.len()]);
+            if self.served.fetch_add(1, Ordering::AcqRel) + 1 == self.cancel_at {
+                self.canceled.store(true, Ordering::Release);
+            }
+            Ok(NowaitRead::Done)
+        }
+    }
+
+    /// Run `fill_output` of eight one-page reads with the cancel flag already
+    /// `preset`, or raised when the `cancel_at`-th inline read is served.
+    #[allow(clippy::type_complexity)]
+    fn canceled_inline_fetch(
+        cancel_at: usize,
+        preset: bool,
+    ) -> (
+        RowStore,
+        Arc<MemoryRowSource>,
+        Arc<CancelSource>,
+        Vec<u64>,
+        Vec<u8>,
+        PendingPages,
+        Result<(), RowStoreError>,
+    ) {
+        let memory = inline_source();
+        let canceled = Arc::new(AtomicBool::new(preset));
+        let source = Arc::new(CancelSource {
+            inner: memory.clone(),
+            served: AtomicUsize::new(0),
+            cancel_at,
+            canceled: canceled.clone(),
+        });
+        let rows = inline_rows(source.clone(), true);
+        let ids: Vec<u64> = (0..8).map(|i| i * 4).collect();
+        let (locations, pages) = rows.plan_rows(&ids).unwrap();
+        let mut output = vec![0u8; ids.len() * ROW_BYTES];
+        let mut staging = Vec::new();
+        let mut pending = PendingPages::new();
+        let result = rows.inner.fill_output(
+            &locations,
+            &pages,
+            &mut output,
+            &mut staging,
+            &canceled,
+            &mut pending,
+        );
+        (rows, memory, source, ids, output, pending, result)
+    }
+
+    #[test]
+    fn inline_fetch_cancel_stops_before_the_next_nowait_read_and_keeps_completed_pages() {
+        let (rows, memory, source, ids, output, pending, result) = canceled_inline_fetch(3, false);
+        assert!(matches!(result, Err(RowStoreError::Canceled)), "{result:?}");
+        // Three reads completed; the fourth saw the flag before its attempt.
+        assert_eq!(source.served.load(Ordering::Acquire), 3);
+        assert_eq!(memory.reads.load(Ordering::Acquire), 0);
+        let done = 3 * ROW_BYTES;
+        assert_eq!(output[..done], inline_expected(&memory, &ids[..3])[..]);
+        assert!(output[done..].iter().all(|&byte| byte == 0));
+        let queued: usize = pending.iter().map(Vec::len).sum();
+        assert_eq!(queued, 3);
+        let stats = rows.cache_stats();
+        assert_eq!((stats.reads, stats.read_bytes), (3, done as u64));
+        // The worker caches them as it does for a canceled multi-read ticket.
+        rows.inner.publish_pending(pending);
+        assert_eq!(rows.cache_stats().resident_pages, 3);
+    }
+
+    /// Every read completed inline and the flag rose with the last one: the
+    /// check after the assembly reports it, and all pages are still pending.
+    #[test]
+    fn inline_fetch_cancel_after_assembly_reports_canceled_with_every_page_pending() {
+        let (rows, memory, source, ids, output, pending, result) = canceled_inline_fetch(8, false);
+        assert!(matches!(result, Err(RowStoreError::Canceled)), "{result:?}");
+        assert_eq!(source.served.load(Ordering::Acquire), 8);
+        assert_eq!(output, inline_expected(&memory, &ids));
+        assert_eq!(pending.iter().map(Vec::len).sum::<usize>(), 8);
+        assert_eq!(rows.cache_stats().reads, 8);
+    }
+
+    #[test]
+    fn inline_fetch_cancel_before_the_first_read_reads_nothing() {
+        let (rows, memory, source, _, output, pending, result) =
+            canceled_inline_fetch(usize::MAX, true);
+        assert!(matches!(result, Err(RowStoreError::Canceled)), "{result:?}");
+        assert_eq!(source.served.load(Ordering::Acquire), 0);
+        assert_eq!(memory.reads.load(Ordering::Acquire), 0);
+        assert!(output.iter().all(|&byte| byte == 0));
+        assert!(pending.is_empty());
+        assert_eq!(rows.cache_stats().reads, 0);
+    }
+
+    // Hot-pack runs (and source pages) through a real `PackFixture`.
+
+    fn q8_inline_store(source: Arc<dyn PositionalRowSource>, inline_fetch: bool) -> RowStore {
+        RowStore::from_test_positional(
+            metadata_with_head_size(512, HOT_PADDED_ROWS),
+            HOT_ROWS_PER_SHARD,
+            ROWS_PER_PAGE,
+            RowEncoding::Q8F16,
+            source,
+            inline_fetch,
+        )
+        .unwrap()
+    }
+
+    /// With `kept` of the 256 pack buckets, the enabled fetch of `ids` returns
+    /// the table's bytes and the blocking readers' counters for every answer
+    /// of the cache, for source pages and pack runs alike.
+    fn assert_hot_inline_matches_blocking(kept: usize, ids: &[u64], small: bool) {
+        let want = expected_rows(ids);
+        let base_source = q8_source();
+        let base_pack = hot_pack(&base_source, kept, 4, 21);
+        let blocking = q8_inline_store(base_source.clone(), false);
+        blocking.attach_hot_store(base_pack.store.clone()).unwrap();
+        assert_eq!(fetch(&blocking, ids), want);
+        let old = settled_stats(&blocking);
+        let (groups, runs) = (old.reads as usize, old.hot_reads as usize);
+        assert!(runs > 0);
+        assert_eq!(
+            groups + runs > INLINE_FETCH_MAX_READS,
+            !small,
+            "{groups} groups + {runs} runs"
+        );
+
+        for mode in [CACHE_ALL, CACHE_NONE, CACHE_ALTERNATE] {
+            let memory = q8_source();
+            let pack = hot_pack(&memory, kept, 4, 21);
+            let pack_cache = CacheModel::new(mode);
+            {
+                let cache = pack_cache.clone();
+                pack.store
+                    .set_nowait_policy(Arc::new(move |_offset: u64| cache.answer()));
+            }
+            let source_cache = CacheModel::new(mode);
+            let rows = q8_inline_store(
+                Arc::new(NowaitSource {
+                    inner: memory.clone(),
+                    cache: source_cache.clone(),
+                }),
+                true,
+            );
+            rows.attach_hot_store(pack.store.clone()).unwrap();
+            assert_eq!(fetch(&rows, ids), want, "mode {mode}");
+
+            let (run_attempts, run_served) = pack_cache.counts();
+            let (group_attempts, group_served) = source_cache.counts();
+            if small {
+                assert_eq!(run_attempts, runs, "mode {mode}");
+                assert_eq!(group_attempts, groups, "mode {mode}");
+                assert_eq!(
+                    memory.reads.load(Ordering::Acquire),
+                    groups - group_served,
+                    "mode {mode}"
+                );
+                match mode {
+                    CACHE_ALL => {
+                        assert_eq!((run_served, group_served), (runs, groups), "mode {mode}")
+                    }
+                    CACHE_NONE => assert_eq!((run_served, group_served), (0, 0)),
+                    _ => assert!(run_served > 0 && run_served < runs, "{run_served}/{runs}"),
+                }
+            } else {
+                assert_eq!((run_attempts, group_attempts), (0, 0), "mode {mode}");
+                assert_eq!(memory.reads.load(Ordering::Acquire), groups);
+            }
+            let stats = settled_stats(&rows);
+            assert_eq!(
+                (
+                    stats.reads,
+                    stats.read_bytes,
+                    stats.cache_misses,
+                    stats.hot_rows,
+                    stats.hot_pages,
+                    stats.hot_reads,
+                ),
+                (
+                    old.reads,
+                    old.read_bytes,
+                    old.cache_misses,
+                    old.hot_rows,
+                    old.hot_pages,
+                    old.hot_reads,
+                ),
+                "mode {mode}"
+            );
+
+            // Source pages are cached now; pack rows are read again.
+            assert_eq!(fetch(&rows, ids), want, "mode {mode}, second fetch");
+            assert_eq!(source_cache.counts().0, group_attempts);
+            assert_eq!(rows.cache_stats().cache_hits, old.cache_misses);
+        }
+    }
+
+    /// Every row hot: the plan is pack runs only (at least 12 of them, tried
+    /// inline) or more than 64 of them.
+    #[test]
+    fn inline_fetch_hot_runs_are_byte_identical() {
+        let ids = mixed_ids();
+        assert_hot_inline_matches_blocking(256, &ids[..24], true);
+        assert_hot_inline_matches_blocking(256, &ids[..400], false);
+    }
+
+    /// Half the rows hot: pages split between source groups and pack runs, so
+    /// a small plan mixes served and blocking reads of both kinds.
+    #[test]
+    fn inline_fetch_mixes_source_pages_pack_runs_and_fallbacks() {
+        let ids = mixed_ids();
+        assert_hot_inline_matches_blocking(128, &ids[..40], true);
+        assert_hot_inline_matches_blocking(128, &ids[..500], false);
+    }
+
+    /// The descriptor source reaches the reader's no-wait read through
+    /// `SourceRangeDescriptor`, with the reader's bytes and counters.
+    #[test]
+    fn descriptor_source_inline_fetch_goes_through_the_reader_nowait_read() {
+        let rows_per_shard = 64;
+        let shards = rows_source_q4(2, rows_per_shard);
+        let ids = [0u64, 5, 63, 64, 100, 127, 64, 0, 3];
+        let want = expected_q4_rows(&shards, &ids, rows_per_shard);
+        for mode in [
+            Some(CACHE_ALL),
+            Some(CACHE_NONE),
+            Some(CACHE_ALTERNATE),
+            None,
+        ] {
+            let cache = mode.map(CacheModel::new);
+            let (_dir, descriptors) =
+                shard_descriptors_with(&shards, "Q4LM", rows_per_shard, ROW_WIDTH, cache.clone());
+            let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
+            let layout = validate_descriptors(&descriptors, 128).unwrap();
+            let source = Arc::new(DescriptorRowSource {
+                descriptors: descriptors.clone(),
+                data_offset: layout.encoding.shard_header_bytes() as u64,
+            });
+            let rows = RowStore::spawn(
+                "descriptor-inline-test",
+                source,
+                descriptors,
+                layout,
+                0,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(fetch(&rows, &ids), want, "mode {mode:?}");
+            let stats = rows.cache_stats();
+            if let Some(cache) = cache {
+                let (attempts, served) = cache.counts();
+                assert_eq!(attempts as u64, stats.reads, "mode {mode:?}");
+                match mode {
+                    Some(CACHE_ALL) => assert_eq!(served, attempts),
+                    Some(CACHE_NONE) => assert_eq!(served, 0),
+                    _ => assert!(served > 0 && served < attempts),
+                }
+            }
+            assert_eq!(fetch(&rows, &ids), want);
+            assert!(rows.unload().unwrap().is_clean());
+        }
     }
 }

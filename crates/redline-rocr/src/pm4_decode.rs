@@ -41,7 +41,9 @@ pub struct ShReg(u16);
 
 impl ShReg {
     pub fn try_new(offset: u32) -> Option<Self> {
-        (SH_FIRST..=SH_LAST).contains(&offset).then_some(Self(offset as u16))
+        (SH_FIRST..=SH_LAST)
+            .contains(&offset)
+            .then_some(Self(offset as u16))
     }
 
     pub fn offset(self) -> u32 {
@@ -54,7 +56,10 @@ pub struct NonZeroGrid([u32; 3]);
 
 impl NonZeroGrid {
     pub fn try_new(dimensions: [u32; 3]) -> Option<Self> {
-        dimensions.iter().all(|&n| n != 0).then_some(Self(dimensions))
+        dimensions
+            .iter()
+            .all(|&n| n != 0)
+            .then_some(Self(dimensions))
     }
 
     pub fn dimensions(self) -> [u32; 3] {
@@ -92,13 +97,19 @@ impl CacheScope {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Pm4Packet {
-    SetShRegs { first: ShReg, values: Vec<u32> },
+    SetShRegs {
+        first: ShReg,
+        values: Vec<u32>,
+    },
     DispatchDirect {
         dimensions: NonZeroGrid,
         initiator: DispatchInitiator,
     },
     EventComputeIdle,
-    Acquire { scope: CacheScope, gcr: u32 },
+    Acquire {
+        scope: CacheScope,
+        gcr: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,7 +332,12 @@ mod tests {
         );
         let encoded = encode_pm4(Pm4Family::Gfx12_0, &packets, &ResolvedRelocations).unwrap();
         assert_eq!(encoded, words);
-        let bytes = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let bytes = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(bytes(&encoded), bytes(&words));
     }
 
@@ -368,7 +384,10 @@ mod tests {
         bad[dispatch_at] = header(0x7f, 4, true);
         assert!(decode(&bad).is_err());
         for end in [1, set_at + 1, dispatch_at + 2, words.len() - 1] {
-            assert!(decode(&words[..end]).is_err(), "accepted truncated stream {end}");
+            assert!(
+                decode(&words[..end]).is_err(),
+                "accepted truncated stream {end}"
+            );
         }
     }
 
@@ -382,30 +401,36 @@ mod tests {
         let mut builder = Gfx12Pm4CommandBuffer::new();
         builder.wait_compute_idle();
         let timed = builder.with_gpu_timestamps(0x1000, 0x2000);
-        assert!(parse_pm4(
-            Pm4Family::Gfx12_0,
-            timed.dwords(),
-            ParseMode::Diagnostic,
-            &ResolvedRelocations
-        )
-        .is_err());
-        assert!(encode_pm4(
-            Pm4Family::Gfx12_0,
-            &[Pm4Packet::SetShRegs {
-                first: ShReg::try_new(0x200).unwrap(),
-                values: vec![],
-            }],
-            &ResolvedRelocations
-        )
-        .is_err());
-        assert!(encode_pm4(
-            Pm4Family::Gfx12_0,
-            &[Pm4Packet::Acquire {
-                scope: CacheScope::System,
-                gcr: INTER_NODE_GCR,
-            }],
-            &ResolvedRelocations
-        )
-        .is_err());
+        assert!(
+            parse_pm4(
+                Pm4Family::Gfx12_0,
+                timed.dwords(),
+                ParseMode::Diagnostic,
+                &ResolvedRelocations
+            )
+            .is_err()
+        );
+        assert!(
+            encode_pm4(
+                Pm4Family::Gfx12_0,
+                &[Pm4Packet::SetShRegs {
+                    first: ShReg::try_new(0x200).unwrap(),
+                    values: vec![],
+                }],
+                &ResolvedRelocations
+            )
+            .is_err()
+        );
+        assert!(
+            encode_pm4(
+                Pm4Family::Gfx12_0,
+                &[Pm4Packet::Acquire {
+                    scope: CacheScope::System,
+                    gcr: INTER_NODE_GCR,
+                }],
+                &ResolvedRelocations
+            )
+            .is_err()
+        );
     }
 }

@@ -84,6 +84,8 @@ fn kernel_dtype_for_quant_type(quant_type: u8) -> rdna_compute::DType {
         49 => DType::MQ3G256V2,
         50 => DType::MQ2G256V2,
         53 => DType::MQ4G128V2,
+        55 => DType::FP8E4M3B128,
+        56 => DType::FP8E4M3PT,
         _ => DType::Raw,
     }
 }
@@ -107,6 +109,30 @@ pub struct SequenceHint {
     pub model_ctx: usize,
     pub automatic: bool,
     pub card_cap: usize,
+}
+
+/// Per-load continuous-batch request, carried from admission to the carrier
+/// so a load can size memory for the batch it will stage afterwards. The
+/// default is off (`vmm_batch == false`): every load that does not ask keeps
+/// its plan unchanged. Only Qwen4 expert-parallel loads read it; every other
+/// carrier ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchLoadRequest {
+    /// The VMM continuous-batching route is requested (`serve_vmm_batch`).
+    pub vmm_batch: bool,
+    /// Requested lane count (`continuous_batch_size`); below 2 is no batch.
+    pub continuous_batch_size: usize,
+    /// Requested step row budget (`serve.max_batch_tokens`); the staged
+    /// budget is `max(row_budget, continuous_batch_size)`.
+    pub row_budget: usize,
+}
+
+impl BatchLoadRequest {
+    /// Lanes to reserve for, when the request asks for a batch (VMM route and
+    /// more than one lane); `None` when it is off.
+    pub fn lanes(&self) -> Option<usize> {
+        (self.vmm_batch && self.continuous_batch_size > 1).then_some(self.continuous_batch_size)
+    }
 }
 
 /// Everything a carrier's `load` needs beyond the source itself.
@@ -155,6 +181,18 @@ pub struct LoadCtx<'a> {
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,
     pub pp: usize,
+    /// Admission-only explicit pipeline layer counts (one entry per rank,
+    /// summing to the model layer count). Populated solely from
+    /// `SourceAdmission::pp_layer_counts`; carriers must never reread the
+    /// environment. `None` = carrier-default balanced placement.
+    pub pp_layer_counts: Option<&'a [usize]>,
+    /// Admitted PP mesh (physical rank identity and edge transports) for a
+    /// carrier with a mesh-executor PP route (Qwen4 `topology.pp`). Populated
+    /// solely from `SourceAdmission::mesh` when `pp > 1`; `None` otherwise.
+    pub admitted_mesh: Option<&'a crate::mesh_placement::AdmittedMesh>,
+    /// Admitted band placement matching `admitted_mesh` (from
+    /// `SourceAdmission::pp_bands`). `None` outside a mesh-executor PP load.
+    pub band_placement: Option<&'a crate::mesh_placement::BandPlacement>,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
     /// Gemma4 EAGLE drafter path (arch 22 `gemma4_unified_assistant`), separate
@@ -174,6 +212,11 @@ pub struct LoadCtx<'a> {
     /// is `None`. Populated by the loader from the daemon `xdna` load param;
     /// projected CLI-side by `load_params` from the registry `xdna` slot.
     pub xdna: Option<hipfire_registry::XdnaSidecarDescriptor>,
+    /// Continuous-batch request of this load (default off). Read by
+    /// `Qwen4Carrier` for an expert-parallel load only: it reserves the AR
+    /// lane store's device bytes before splitting the experts. Populated
+    /// solely from `SourceAdmission::batch_request`.
+    pub batch_request: BatchLoadRequest,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through
@@ -215,14 +258,17 @@ pub struct SpecLoadCfg {
     /// still wins over this in the builder.
     pub dspark_conf_threshold: Option<f32>,
     /// Qwen MTP (NextN) enable, lowered from the `speculation` selector:
-    /// `Some(true)` = `mtp` mode (load + force), `Some(false)` = another
-    /// mechanism selected (skip load + build), `None` = `auto` (load if a
-    /// bundled trailer or `.mtp` sidecar exists).
+    /// `Some(true)` = `mtp` mode (load + force, whatever the producer
+    /// declares), `Some(false)` = another mechanism selected (skip load +
+    /// build), `None` = `auto`: the head loads only for a producer that
+    /// declares a measured AR floor (`hipfire_config::mtp_mode_admits`;
+    /// native Qwen4 only — Qwen3.5/3.6 and DeepSeek V4 keep plain AR) and
+    /// only if a bundled trailer or `.mtp` sidecar exists.
     pub mtp: Option<bool>,
     /// MTP draft window K. `Some` = explicit (load param, `HIPFIRE_MTP_K`, or
     /// `speculation.mtp_k`); `None` = `auto`: each producer applies its own
-    /// default (`hipfire_config::mtp_k_default_for_arch` for native Qwen4 MTP,
-    /// else `hipfire_config::MTP_K_DEFAULT`).
+    /// default (`hipfire_config::mtp_k_default` over the GPU's row-exact verify
+    /// rows for native Qwen4 MTP, else `hipfire_config::MTP_K_DEFAULT`).
     pub mtp_k: Option<usize>,
     /// Qwen DFlash draft enable, lowered from `dflash_mode`: `Some(true)` =
     /// `on` (fail the load when the draft is missing or unloadable),
@@ -242,6 +288,10 @@ pub struct SpecLoadCfg {
     /// [`crate::dflash::DFLASH_BLOCK_UNBATCHED`]. Legacy DFlash drafts keep
     /// their declared width.
     pub dflash_block: Option<usize>,
+    /// `speculation.dflash_block` was `auto` (the default): a producer with
+    /// its own measured default width may use it instead of `dflash_block`
+    /// (Qwen4 DFlash2). `false` = an explicit width, or no daemon resolution.
+    pub dflash_block_auto: bool,
 }
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
@@ -363,5 +413,39 @@ mod cask_config_tests {
             32_768,
             "adaptive floor reservation must not be clamped to the eviction window"
         );
+    }
+}
+
+#[cfg(test)]
+mod ep_lane_reservation_request_tests {
+    use super::BatchLoadRequest;
+
+    #[test]
+    fn ep_lane_reservation_request_is_off_by_default_and_for_one_lane() {
+        assert_eq!(BatchLoadRequest::default().lanes(), None);
+        let one = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: 1,
+            row_budget: 4096,
+        };
+        assert_eq!(one.lanes(), None);
+        let no_vmm = BatchLoadRequest {
+            vmm_batch: false,
+            continuous_batch_size: 8,
+            row_budget: 4096,
+        };
+        assert_eq!(no_vmm.lanes(), None);
+        let zero = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: 0,
+            row_budget: 0,
+        };
+        assert_eq!(zero.lanes(), None);
+        let on = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: 4,
+            row_budget: 0,
+        };
+        assert_eq!(on.lanes(), Some(4));
     }
 }

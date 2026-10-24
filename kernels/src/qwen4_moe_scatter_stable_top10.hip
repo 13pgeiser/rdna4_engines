@@ -19,11 +19,16 @@
 //      writes -1; tile ids written per 16-position tile. Each output word is
 //      written exactly once per invocation, so replay needs no pre-clear.
 // Complexity O(256 L + E C).
+//
+// Wave-size neutral (gfx1100/gfx1151/gfx1201 wave32, gfx942 wave64): no shuffles,
+// ballots, or wave masks; every cross-thread exchange goes through LDS behind
+// __syncthreads (s_e[256] = 1 KiB, s_pad[1024] = 4 KiB), and every block size
+// (256, or E <= 1024) is a whole number of threads, not of waves.
 
 #include <hip/hip_runtime.h>
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(__gfx1201__)
-#error "qwen4_moe_scatter_stable_top10.hip is gfx1151/gfx1201-only"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__) && !defined(__gfx1201__) && !defined(__gfx942__)
+#error "qwen4_moe_scatter_stable_top10.hip is gfx1100/gfx1151/gfx1201/gfx942-only"
 #endif
 
 extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_ranks(
@@ -34,17 +39,25 @@ extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_ranks(
     const int flat = c * 256 + t;
     for (int e = t; e < E; e += 256) partial[(size_t)e * C + c] = 0;
     const int n = min(256, L - c * 256);
-    const int my = t < n ? topk[flat] : -1;
+    // An id outside [0, E) (the router's -1 non-finite-row marker, or any
+    // corrupt id) is not routed: it joins no expert's rank/count, its rank
+    // cell is -1, and nothing is addressed by it.
+    const int raw = t < n ? topk[flat] : -1;
+    const int my = (raw >= 0 && raw < E) ? raw : -1;
     s_e[t] = my;
     __syncthreads();
     if (t < n) {
-        int r = 0;
-        for (int j = 0; j < t; ++j) r += s_e[j] == my;
-        rank[flat] = r;
-        if (r == 0) {
-            int cnt = 1;
-            for (int j = t + 1; j < n; ++j) cnt += s_e[j] == my;
-            partial[(size_t)my * C + c] = cnt;
+        if (my < 0) {
+            rank[flat] = -1;
+        } else {
+            int r = 0;
+            for (int j = 0; j < t; ++j) r += s_e[j] == my;
+            rank[flat] = r;
+            if (r == 0) {
+                int cnt = 1;
+                for (int j = t + 1; j < n; ++j) cnt += s_e[j] == my;
+                partial[(size_t)my * C + c] = cnt;
+            }
         }
     }
 }
@@ -86,9 +99,13 @@ extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_scatter(
     const int C = (L + 255) / 256;
     if (i < L) {
         const int e = topk[i];
-        const int pos = offsets[e] + chunk_prefix[(size_t)e * (C + 1) + i / 256] + rank[i];
-        sorted[pos] = i;
-        inverse[i] = pos;
+        if (e >= 0 && e < E) {
+            const int pos = offsets[e] + chunk_prefix[(size_t)e * (C + 1) + i / 256] + rank[i];
+            sorted[pos] = i;
+            inverse[i] = pos;
+        } else {
+            inverse[i] = -1;  // unrouted slot: no grouped row
+        }
     }
     if (i < Pmax) {
         const int used = offsets[E];

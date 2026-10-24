@@ -93,12 +93,16 @@ fn quantize_q8_0(k: usize, rows: usize, seed: u64) -> Vec<u8> {
     let mut rng = seed;
     for _ in 0..rows {
         for _ in 0..groups_per_row {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             // Scale in a realistic range; exactly representable in f16.
             let scale = 0.00390625f32 * (1 + ((rng >> 33) & 7)) as f32;
             out.extend_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
             for _ in 0..32 {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 out.push(((rng >> 40) & 0xff) as u8);
             }
         }
@@ -126,11 +130,31 @@ fn main() {
     } else {
         (
             vec![
-                Cell { m: 4096, k: 4096, b: 1 },
-                Cell { m: 4096, k: 4096, b: 6 },
-                Cell { m: 129280, k: 4096, b: 1 },
-                Cell { m: 129280, k: 4096, b: 5 },
-                Cell { m: 2048, k: 4096, b: 1 },
+                Cell {
+                    m: 4096,
+                    k: 4096,
+                    b: 1,
+                },
+                Cell {
+                    m: 4096,
+                    k: 4096,
+                    b: 6,
+                },
+                Cell {
+                    m: 129280,
+                    k: 4096,
+                    b: 1,
+                },
+                Cell {
+                    m: 129280,
+                    k: 4096,
+                    b: 5,
+                },
+                Cell {
+                    m: 2048,
+                    k: 4096,
+                    b: 1,
+                },
             ],
             10usize,
         )
@@ -142,7 +166,11 @@ fn main() {
         "is_gfx942={}  has_wmma={}  -> `prod` (gemm_q8_0_batched_chunked) routes to {}\n",
         gpu.arch_caps.is_gfx942(),
         gpu.arch_caps.has_wmma(),
-        if gpu.arch_caps.has_wmma() { "gemm_q8_0_wmma (f16 WMMA)" } else { "the scalar kernel" }
+        if gpu.arch_caps.has_wmma() {
+            "gemm_q8_0_wmma (f16 WMMA)"
+        } else {
+            "the scalar kernel"
+        }
     );
 
     println!(
@@ -166,10 +194,25 @@ fn main() {
         gpu.hip.memcpy_htod(&w_gpu, &w_bytes).expect("htod W");
         gpu.hip.memcpy_htod(&x_gpu, &x_bytes).expect("htod X");
 
-        let w_t = wrap_buf(w_gpu.as_ptr(), w_bytes.len(), vec![c.m, groups * 34], DType::Q8_0);
+        let w_t = wrap_buf(
+            w_gpu.as_ptr(),
+            w_bytes.len(),
+            vec![c.m, groups * 34],
+            DType::Q8_0,
+        );
         let x_t = wrap_buf(x_gpu.as_ptr(), x_bytes.len(), vec![c.b, c.k], DType::F32);
-        let y_ref_t = wrap_buf(y_ref_gpu.as_ptr(), c.b * c.m * 4, vec![c.b, c.m], DType::F32);
-        let y_new_t = wrap_buf(y_new_gpu.as_ptr(), c.b * c.m * 4, vec![c.b, c.m], DType::F32);
+        let y_ref_t = wrap_buf(
+            y_ref_gpu.as_ptr(),
+            c.b * c.m * 4,
+            vec![c.b, c.m],
+            DType::F32,
+        );
+        let y_new_t = wrap_buf(
+            y_new_gpu.as_ptr(),
+            c.b * c.m * 4,
+            vec![c.b, c.m],
+            DType::F32,
+        );
 
         // Weight bytes are the streamed quantity; X is tiny and L2-resident.
         let stream_bytes = (c.m * groups * 34) as f64;
@@ -219,8 +262,12 @@ fn main() {
             // Bit-exactness gate.
             let mut ref_h = vec![0u8; c.b * c.m * 4];
             let mut new_h = vec![0u8; c.b * c.m * 4];
-            gpu.hip.memcpy_dtoh(&mut ref_h, &y_ref_gpu).expect("dtoh ref");
-            gpu.hip.memcpy_dtoh(&mut new_h, &y_new_gpu).expect("dtoh new");
+            gpu.hip
+                .memcpy_dtoh(&mut ref_h, &y_ref_gpu)
+                .expect("dtoh ref");
+            gpu.hip
+                .memcpy_dtoh(&mut new_h, &y_new_gpu)
+                .expect("dtoh new");
             let exact = ref_h == new_h;
             let mut max_diff = 0.0f32;
             for i in (0..ref_h.len()).step_by(4) {

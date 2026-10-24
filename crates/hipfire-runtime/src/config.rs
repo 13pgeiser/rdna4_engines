@@ -156,7 +156,8 @@ pub struct RuntimeConfig {
     pub mtp_mode: String,
     /// Explicit numeric `HIPFIRE_MTP_K` / `speculation.mtp_k`. `None` = unset
     /// or `auto`: the consumer applies its default (`hipfire_config::
-    /// mtp_k_default_for_arch` for native Qwen4 MTP, else `MTP_K_DEFAULT`).
+    /// mtp_k_default` over the GPU's row-exact verify rows for native Qwen4
+    /// MTP, else `MTP_K_DEFAULT`).
     pub mtp_k: Option<usize>,
     /// `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR`: YaRN RoPE factor
     /// override applied by [`crate::rope::rope_scaling`]. `None` = the
@@ -233,9 +234,13 @@ impl RuntimeConfig {
             ngram_window: value("HIPFIRE_NGRAM_WINDOW")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
+            // `auto` is not an explicit arm here (the daemon-direct fallback);
+            // on/1/true is, via the shared strict tri-state parser.
             ngram_draft: matches!(
-                value("HIPFIRE_NGRAM_DRAFT").as_deref(),
-                Some("1") | Some("on")
+                value("HIPFIRE_NGRAM_DRAFT")
+                    .as_deref()
+                    .map(hipfire_config::parse_tri_state_alias),
+                Some(Ok(Some(true)))
             ),
             ngram_k: value("HIPFIRE_NGRAM_DRAFT_K")
                 .and_then(|v| v.parse().ok())
@@ -303,8 +308,12 @@ mod tests {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
         assert!(redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, 1, false));
         for ep in [2, 4] {
-            assert!(!redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, ep, false));
-            assert!(!redline_with_ep("gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false));
+            assert!(!redline_with_ep(
+                "gfx1201", "qwen4", fn_xts, 1, 1, ep, false
+            ));
+            assert!(!redline_with_ep(
+                "gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false
+            ));
             assert!(!redline_with_ep(
                 "gfx1201",
                 "qwen4",
@@ -624,14 +633,24 @@ mod tests {
     #[test]
     fn qwen4_redline_default_requires_gfx1201_single_gpu_without_mtp() {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
-        assert!(retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, false));
+        assert!(retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 1, false
+        ));
         // The native MTP head is a drafter: an MTP load keeps its spec path.
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, true));
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 2, 1, false));
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 2, false));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 1, true
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 2, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 2, false
+        ));
         // A plain `.mq4` Flash-Next stays on HIP off gfx1201.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
-            assert!(!retained_redline_default(gpu_arch, "qwen4", fn_xts, 1, 1, false));
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen4", fn_xts, 1, 1, false
+            ));
         }
     }
 
@@ -648,7 +667,11 @@ mod tests {
             OffloadBudget::Auto,
             OffloadBudget::Layers(4),
         ] {
-            assert!(!cpu_offload_configured_from(OffloadExec::Pcie, budget, budget));
+            assert!(!cpu_offload_configured_from(
+                OffloadExec::Pcie,
+                budget,
+                budget
+            ));
         }
         // CPU with both tiers unset is not configured on any model.
         assert!(!cpu_offload_configured_from(
@@ -673,7 +696,11 @@ mod tests {
         ] {
             assert!(cpu_offload_configured_from(OffloadExec::Cpu, layer, expert));
             // `passback` runs the CPU arm of a spilled step, so it counts too.
-            assert!(cpu_offload_configured_from(OffloadExec::Passback, layer, expert));
+            assert!(cpu_offload_configured_from(
+                OffloadExec::Passback,
+                layer,
+                expert
+            ));
         }
     }
 }

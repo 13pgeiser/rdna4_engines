@@ -37,12 +37,14 @@ use crate::dflash_spec::{
 use crate::qwen35::prefill::multi::{multi_chunk_pack_cap, MULTI_CHUNK_MAX_LANE_ROWS};
 use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::speculative::{
-    dflash_commit_decision_parts, dflash_eager_hip_verify_receipt, dflash_greedy_accept_commit_parts,
-    dflash_sampled_accept_rows, DeltaNetSnapshot, DflashCbDraft, DflashSampledDraft,
-    DflashTargetParts, DflashVerifyOutput,
+    dflash_commit_decision_parts, dflash_eager_hip_verify_receipt,
+    dflash_greedy_accept_commit_parts, dflash_sampled_accept_rows, DeltaNetSnapshot, DflashCbDraft,
+    DflashSampledDraft, DflashTargetParts, DflashVerifyOutput,
 };
 use hip_bridge::HipError;
-use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
+use hipfire_runtime::slot_batch::{
+    BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind,
+};
 use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig};
 use rdna_compute::Gpu;
 
@@ -74,7 +76,10 @@ impl DflashLaneCheckpointReaders {
 ///   `target_snap`, not a checkpoint).
 /// Flip a field only together with the code that reads the checkpoints.
 pub const DFLASH_LANE_CHECKPOINT_READERS: DflashLaneCheckpointReaders =
-    DflashLaneCheckpointReaders { conversation_reuse: false, rewind: false };
+    DflashLaneCheckpointReaders {
+        conversation_reuse: false,
+        rewind: false,
+    };
 
 /// The store's DFlash engine: the shared draft-weight assets (one resident
 /// draft, a counted `Arc` reference) and the shared verify scratch (trunk row
@@ -150,13 +155,24 @@ impl VmmDflashEngine {
         // A lone request is the singleton's own route: at most 63 rows, whatever
         // the aggregate cap (a 64+-row window would be the quantized route).
         if !(2..=MULTI_CHUNK_MAX_LANE_ROWS).contains(&block) {
-            return refuse_engine(gpu, assets, format!("block {block} outside 2..={MULTI_CHUNK_MAX_LANE_ROWS}"));
+            return refuse_engine(
+                gpu,
+                assets,
+                format!("block {block} outside 2..={MULTI_CHUNK_MAX_LANE_ROWS}"),
+            );
         }
         let rows = multi_chunk_pack_cap(gpu, weights, config, max_rows);
         if rows < block {
-            return refuse_engine(gpu, assets, format!("{max_rows} planned rows cannot hold one {block}-row block"));
+            return refuse_engine(
+                gpu,
+                assets,
+                format!("{max_rows} planned rows cannot hold one {block}-row block"),
+            );
         }
-        if assets.staging_rows < block || assets.tape_max_rows < block || assets.ring_positions < block {
+        if assets.staging_rows < block
+            || assets.tape_max_rows < block
+            || assets.ring_positions < block
+        {
             let why = format!(
                 "lane ring/tape (staging {}, tape {}, ring {}) cannot hold a {block}-row block",
                 assets.staging_rows, assets.tape_max_rows, assets.ring_positions
@@ -184,10 +200,14 @@ impl VmmDflashEngine {
         // resident DeltaNet state, measure the live-byte drop (HIP free plus
         // pool-parked), free them. The freed buffers park in the pool, where
         // the first lane reuses them.
-        let live = |gpu: &Gpu| gpu.device_mem_info().map(|(f, _)| f + gpu.pool_parked_bytes());
+        let live = |gpu: &Gpu| {
+            gpu.device_mem_info()
+                .map(|(f, _)| f + gpu.pool_parked_bytes())
+        };
         let probed = (|| -> Result<(usize, usize), String> {
             let before = live(gpu).map_err(|e| e.to_string())?;
-            let df = new_dflash_lane_state(gpu, &assets, config, template_dn, DflashOwnerKind::VmmLane)?;
+            let df =
+                new_dflash_lane_state(gpu, &assets, config, template_dn, DflashOwnerKind::VmmLane)?;
             let mid = live(gpu).map_err(|e| e.to_string());
             let snap = DeltaNetSnapshot::new_for(gpu, template_dn);
             let after = live(gpu).map_err(|e| e.to_string());
@@ -366,15 +386,26 @@ impl Qwen35VmmStore {
         if !matches!(self.phase, Phase::Idle) {
             return Err("dflash prefill during an uncommitted step".into());
         }
-        let engine = self.dflash_engine.as_ref().ok_or("dflash prefill: no DFlash engine staged")?;
+        let engine = self
+            .dflash_engine
+            .as_ref()
+            .ok_or("dflash prefill: no DFlash engine staged")?;
         if request.temp > 1e-6 && (!engine.supports_sampled() || !gpu.flags.dflash_fast_sample) {
             return Err("dflash prefill: sampled lanes require FAST_SAMPLE selector chain".into());
         }
         if prompt.is_empty() || prompt.len() >= engine.ctx_capacity() {
-            return Err(format!("dflash prefill: prompt {} outside 1..{}", prompt.len(), engine.ctx_capacity()));
+            return Err(format!(
+                "dflash prefill: prompt {} outside 1..{}",
+                prompt.len(),
+                engine.ctx_capacity()
+            ));
         }
         self.spec_provision(gpu, epoch, prompt.len())?;
-        let Self { slots, dflash_engine, .. } = self;
+        let Self {
+            slots,
+            dflash_engine,
+            ..
+        } = self;
         let engine = dflash_engine.as_mut().expect("checked above");
         let s = slots
             .iter_mut()
@@ -386,17 +417,13 @@ impl Qwen35VmmStore {
         }
         let r = (|| -> Result<PrefillOutcome, String> {
             let lane_policy = engine.lane_checkpoint;
-            let df = new_dflash_lane_state(gpu, &engine.assets, config, &s.dn, DflashOwnerKind::VmmLane)
-                .map_err(|e| format!("dflash prefill: lane state: {e}"))?;
+            let df =
+                new_dflash_lane_state(gpu, &engine.assets, config, &s.dn, DflashOwnerKind::VmmLane)
+                    .map_err(|e| format!("dflash prefill: lane state: {e}"))?;
             // Configure the private u64 stream before the first-token draw.
             // This lane survives prefill; no post-prefill constructor reseeds it.
-            let mut lane = DflashVmmLaneState::cold(
-                df,
-                Vec::new(),
-                lane_policy,
-                prompt.len(),
-                &request,
-            );
+            let mut lane =
+                DflashVmmLaneState::cold(df, Vec::new(), lane_policy, prompt.len(), &request);
             let cfg = lane.sample_cfg();
             if cfg.temp > 1e-6 {
                 let b = lane.df.block_size;
@@ -407,7 +434,13 @@ impl Qwen35VmmStore {
             // The lane owns no FWHT rotation buffers: the engine lends its
             // own for the prompt prefill (the draft backfill GEMMs) and
             // takes them back on every path.
-            let DflashVmmLaneState { df: lane_df, checkpoints, rng_state, sample_scratch, .. } = &mut lane;
+            let DflashVmmLaneState {
+                df: lane_df,
+                checkpoints,
+                rng_state,
+                sample_scratch,
+                ..
+            } = &mut lane;
             let outcome = engine.with_lent_mq(lane_df, |assets, df| {
                 let mut target = DflashTargetParts {
                     weights,
@@ -417,8 +450,17 @@ impl Qwen35VmmStore {
                     scratch,
                 };
                 dflash_prefill_lane_parts(
-                    gpu, &mut target, assets, lane_policy, df, checkpoints,
-                    prompt, cfg, rng_state, sample_scratch, abort,
+                    gpu,
+                    &mut target,
+                    assets,
+                    lane_policy,
+                    df,
+                    checkpoints,
+                    prompt,
+                    cfg,
+                    rng_state,
+                    sample_scratch,
+                    abort,
                 )
             });
             let outcome = match outcome {
@@ -491,15 +533,25 @@ impl Qwen35VmmStore {
         if !matches!(self.phase, Phase::Idle) {
             return Err("dflash adopt during an uncommitted step".into());
         }
-        let Self { slots, dflash_engine, .. } = self;
-        let engine = dflash_engine.as_ref().ok_or("dflash adopt: no DFlash engine staged")?;
+        let Self {
+            slots,
+            dflash_engine,
+            ..
+        } = self;
+        let engine = dflash_engine
+            .as_ref()
+            .ok_or("dflash adopt: no DFlash engine staged")?;
         let s = slots
             .iter_mut()
             .flatten()
             .find(|s| s.epoch == *epoch)
             .ok_or_else(|| format!("dflash adopt: unknown epoch {epoch:?}"))?;
         let lane = slot_lane.as_mut().expect("lane present");
-        if s.mtp.is_some() || s.dflash.is_some() || s.pending_seed.is_none() || s.position != lane.position {
+        if s.mtp.is_some()
+            || s.dflash.is_some()
+            || s.pending_seed.is_none()
+            || s.position != lane.position
+        {
             return Err(format!(
                 "dflash adopt: lane position {} / snapshot position {} / seed {:?} / other drafter {}",
                 s.position,
@@ -537,7 +589,8 @@ impl Qwen35VmmStore {
             }
         }
         lane.policy = lane_policy;
-        let fresh = DeltaNetSnapshot::new_for(gpu, &s.dn).map_err(|e| format!("dflash adopt: DeltaNet snapshot: {e}"))?;
+        let fresh = DeltaNetSnapshot::new_for(gpu, &s.dn)
+            .map_err(|e| format!("dflash adopt: DeltaNet snapshot: {e}"))?;
         std::mem::replace(&mut lane.df.target_snap, fresh).free_gpu(gpu);
         lane.last_window = None;
         lane.last_emit.clear();
@@ -552,16 +605,30 @@ impl Qwen35VmmStore {
     /// Returns the singleton's block `B = min(block, max(E, 2))` the planned
     /// Verify request must carry (`draft_len = B - 1`, rows `B`); the accept
     /// clamp is `E - 1`.
-    pub fn dflash_set_max_emit(&mut self, epoch: &RequestEpoch, max_emit: usize) -> Result<usize, String> {
+    pub fn dflash_set_max_emit(
+        &mut self,
+        epoch: &RequestEpoch,
+        max_emit: usize,
+    ) -> Result<usize, String> {
         if max_emit == 0 {
             return Err("dflash_set_max_emit: no remaining output budget".into());
         }
-        let block = self.dflash_engine.as_ref().ok_or("dflash_set_max_emit: no DFlash engine staged")?.block_size();
+        let block = self
+            .dflash_engine
+            .as_ref()
+            .ok_or("dflash_set_max_emit: no DFlash engine staged")?
+            .block_size();
         let s = self
             .request_state_mut(epoch)
             .ok_or_else(|| format!("dflash_set_max_emit: unknown epoch {epoch:?}"))?;
-        let Qwen35RequestState { dflash, dflash_draft, .. } = s;
-        let lane = dflash.as_mut().ok_or("dflash_set_max_emit: not a DFlash lane")?;
+        let Qwen35RequestState {
+            dflash,
+            dflash_draft,
+            ..
+        } = s;
+        let lane = dflash
+            .as_mut()
+            .ok_or("dflash_set_max_emit: not a DFlash lane")?;
         if dflash_draft.is_some() || lane.verified {
             return Err("dflash_set_max_emit: a window is in flight".into());
         }
@@ -612,11 +679,15 @@ impl Qwen35VmmStore {
             poisoned,
             ..
         } = s;
-        let lane = dflash.as_mut().ok_or("dflash terminal repair: not a DFlash lane")?;
+        let lane = dflash
+            .as_mut()
+            .ok_or("dflash terminal repair: not a DFlash lane")?;
         if dflash_draft.is_some() || lane.verified {
             return Err("dflash terminal repair: a window is in flight".into());
         }
-        let mark = lane.last_window.ok_or("dflash terminal repair: no completed window available")?;
+        let mark = lane
+            .last_window
+            .ok_or("dflash terminal repair: no completed window available")?;
         if mark.position != position || mark.seed != seed {
             return Err(format!(
                 "dflash terminal repair: window mismatch (saved pos={} seed={}, requested pos={position} seed={seed})",
@@ -631,7 +702,10 @@ impl Qwen35VmmStore {
             ));
         }
         if consumed.len() > emitted || consumed != &lane.last_emit[..consumed.len()] {
-            return Err("dflash terminal repair: consumed tokens are not a prefix of the window's emit".into());
+            return Err(
+                "dflash terminal repair: consumed tokens are not a prefix of the window's emit"
+                    .into(),
+            );
         }
         if consumed.len() == emitted {
             return Ok(());
@@ -689,10 +763,16 @@ impl Qwen35VmmStore {
             .ok_or("provision_step: DFlash Verify rows need the staged DFlash engine")?;
         let lane = s.dflash.as_ref().expect("dispatched on the DFlash tag");
         if s.dflash_draft.is_some() || lane.verified {
-            return Err(format!("provision_step: {:?} is not an idle DFlash lane", r.epoch));
+            return Err(format!(
+                "provision_step: {:?} is not an idle DFlash lane",
+                r.epoch
+            ));
         }
         if lane.max_emit == 0 {
-            return Err(format!("provision_step: {:?} has no installed DFlash output budget", r.epoch));
+            return Err(format!(
+                "provision_step: {:?} has no installed DFlash output budget",
+                r.epoch
+            ));
         }
         let b = dflash_block_for_emit(engine.block_size(), lane.max_emit);
         if draft_len + 1 != b || r.rows.len != b {
@@ -702,7 +782,10 @@ impl Qwen35VmmStore {
             ));
         }
         if s.pending_seed != Some(seed_row_token) {
-            return Err(format!("provision_step: Verify seed row {seed_row_token} != pending seed {:?}", s.pending_seed));
+            return Err(format!(
+                "provision_step: Verify seed row {seed_row_token} != pending seed {:?}",
+                s.pending_seed
+            ));
         }
         if s.position + b > engine.ctx_capacity() {
             return Err(format!(
@@ -754,8 +837,13 @@ impl Qwen35VmmStore {
         if planned.is_empty() {
             return Ok(());
         }
-        let Self { slots, dflash_engine, .. } = self;
-        let mut owners: Vec<Option<&mut Qwen35RequestState>> = planned.iter().map(|_| None).collect();
+        let Self {
+            slots,
+            dflash_engine,
+            ..
+        } = self;
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> =
+            planned.iter().map(|_| None).collect();
         for s in slots.iter_mut().flatten() {
             if let Some(i) = planned.iter().position(|(e, _)| *e == s.epoch) {
                 owners[i] = Some(s);
@@ -772,7 +860,14 @@ impl Qwen35VmmStore {
         let mut pending: Vec<Pending<'_>> = Vec::with_capacity(planned.len());
         for (owner, (epoch, b)) in owners.into_iter().zip(&planned) {
             let s = owner.ok_or_else(|| format!("provision_step: epoch {epoch:?} vanished"))?;
-            let Qwen35RequestState { kv, dflash, dflash_draft, position, pending_seed, .. } = s;
+            let Qwen35RequestState {
+                kv,
+                dflash,
+                dflash_draft,
+                position,
+                pending_seed,
+                ..
+            } = s;
             let Some(lane) = dflash.as_mut() else {
                 continue;
             };
@@ -784,14 +879,29 @@ impl Qwen35VmmStore {
                 max_accept: lane.max_emit.saturating_sub(1),
                 mark: lane.df.draft_scratch.thlog.mark(),
             });
-            lanes.push(DflashCbDraftLane { state: lane, position: *position, seed, b: *b, compact_offset: kv.compact_offset as i32 });
+            lanes.push(DflashCbDraftLane {
+                state: lane,
+                position: *position,
+                seed,
+                b: *b,
+                compact_offset: kv.compact_offset as i32,
+            });
         }
         if lanes.is_empty() {
             return Ok(());
         }
-        let engine = dflash_engine.as_mut().ok_or("provision_step: DFlash lanes without a DFlash engine")?;
-        let tokens = dflash_cb_draft(gpu, weights, config, &mut engine.cb, &mut lanes, *DRAFT_BATCH_ON)
-            .map_err(|e| format!("provision_step: DFlash draft: {e}"))?;
+        let engine = dflash_engine
+            .as_mut()
+            .ok_or("provision_step: DFlash lanes without a DFlash engine")?;
+        let tokens = dflash_cb_draft(
+            gpu,
+            weights,
+            config,
+            &mut engine.cb,
+            &mut lanes,
+            *DRAFT_BATCH_ON,
+        )
+        .map_err(|e| format!("provision_step: DFlash draft: {e}"))?;
         for (p, t) in pending.into_iter().zip(tokens) {
             *p.slot = Some(DflashCbDraft {
                 position: p.position,
@@ -822,18 +932,25 @@ impl Qwen35VmmStore {
             .iter()
             .filter(|r| {
                 matches!(r.kind, RequestStepKind::Verify { .. })
-                    && self.request_state(&r.epoch).is_some_and(|s| s.dflash.is_some())
+                    && self
+                        .request_state(&r.epoch)
+                        .is_some_and(|s| s.dflash.is_some())
             })
             .map(|r| r.epoch)
             .collect();
         if epochs.is_empty() {
             return Ok(());
         }
-        let Self { slots, dflash_engine, .. } = self;
+        let Self {
+            slots,
+            dflash_engine,
+            ..
+        } = self;
         let engine = dflash_engine
             .as_mut()
             .ok_or_else(|| HipError::new(0, "verify: DFlash lanes without a DFlash engine"))?;
-        let mut owners: Vec<Option<&mut Qwen35RequestState>> = epochs.iter().map(|_| None).collect();
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> =
+            epochs.iter().map(|_| None).collect();
         for s in slots.iter_mut().flatten() {
             if let Some(i) = epochs.iter().position(|e| *e == s.epoch) {
                 owners[i] = Some(s);
@@ -842,8 +959,16 @@ impl Qwen35VmmStore {
         let mut lanes: Vec<DflashCbVerifyLane<'_>> = Vec::with_capacity(epochs.len());
         for s in owners {
             let s = s.ok_or_else(|| HipError::new(0, "verify: planned owner vanished"))?;
-            let Qwen35RequestState { kv, dn, dflash, dflash_draft, .. } = s;
-            let draft = dflash_draft.as_ref().ok_or_else(|| HipError::new(0, "verify: no DFlash draft"))?;
+            let Qwen35RequestState {
+                kv,
+                dn,
+                dflash,
+                dflash_draft,
+                ..
+            } = s;
+            let draft = dflash_draft
+                .as_ref()
+                .ok_or_else(|| HipError::new(0, "verify: no DFlash draft"))?;
             lanes.push(DflashCbVerifyLane {
                 kv_cache: kv,
                 dn_state: dn,
@@ -879,14 +1004,31 @@ impl Qwen35VmmStore {
         let s = self
             .request_state_mut(epoch)
             .ok_or_else(|| format!("commit_step: epoch {epoch:?} no longer owns its slot"))?;
-        let Qwen35RequestState { kv, dn, dflash, dflash_draft, position, pending_seed, history, stop_ids, .. } = s;
-        let draft = dflash_draft.take().ok_or("commit_step: DFlash verify without a draft")?;
-        let lane = dflash.as_mut().ok_or("commit_step: lane lost its DFlash state")?;
+        let Qwen35RequestState {
+            kv,
+            dn,
+            dflash,
+            dflash_draft,
+            position,
+            pending_seed,
+            history,
+            stop_ids,
+            ..
+        } = s;
+        let draft = dflash_draft
+            .take()
+            .ok_or("commit_step: DFlash verify without a draft")?;
+        let lane = dflash
+            .as_mut()
+            .ok_or("commit_step: lane lost its DFlash state")?;
         if !std::mem::replace(&mut lane.verified, false) {
             return Err("commit_step: DFlash verify without an outcome".into());
         }
         if draft.position != *position {
-            return Err(format!("commit_step: DFlash window at {} but lane at {}", draft.position, *position));
+            return Err(format!(
+                "commit_step: DFlash window at {} but lane at {}",
+                draft.position, *position
+            ));
         }
         let verified = DflashVerifyOutput {
             argmax_per_pos: std::mem::take(&mut lane.picks),
@@ -903,20 +1045,38 @@ impl Qwen35VmmStore {
             let t0 = phase_start(gpu);
             let r = if lane.sample_temp > 1e-6 {
                 let cfg = lane.sample_cfg();
-                let proposal = lane.sampled_draft.as_ref()
+                let proposal = lane
+                    .sampled_draft
+                    .as_ref()
                     .ok_or("commit_step: sampled DFlash verify without its proposal")?;
                 let decision = match lane.device_decision.take() {
                     Some(decision) => decision,
                     None => dflash_sampled_accept_rows(
-                        &draft.verify_tokens, proposal, Some(&lane.sampled_target), &[],
-                        config.vocab_size, cfg, draft.max_accept, &mut lane.rng_state,
+                        &draft.verify_tokens,
+                        proposal,
+                        Some(&lane.sampled_target),
+                        &[],
+                        config.vocab_size,
+                        cfg,
+                        draft.max_accept,
+                        &mut lane.rng_state,
                         &mut lane.sample_scratch,
                     ),
                 };
                 let receipt = dflash_eager_hip_verify_receipt(
-                    gpu, &target, &lane.df, draft.verify_tokens.len(),
+                    gpu,
+                    &target,
+                    &lane.df,
+                    draft.verify_tokens.len(),
                 );
-                dflash_commit_decision_parts(gpu, &mut target, &mut lane.df, &draft, decision, receipt)
+                dflash_commit_decision_parts(
+                    gpu,
+                    &mut target,
+                    &mut lane.df,
+                    &draft,
+                    decision,
+                    receipt,
+                )
             } else {
                 dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified)
             };
@@ -975,8 +1135,10 @@ static DRAFT_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 static PHASES_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
 });
-static PHASE_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-static PHASE_N: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static PHASE_NS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static PHASE_N: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 fn phase_start(gpu: &mut Gpu) -> Option<std::time::Instant> {
     if !*PHASES_ON {
@@ -993,7 +1155,8 @@ fn phase_end(gpu: &mut Gpu, i: usize, t0: Option<std::time::Instant>) {
     PHASE_NS[i].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     let n = PHASE_N[i].fetch_add(1, Relaxed) + 1;
     if i == 1 && n % 16 == 0 {
-        static BASE: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+        static BASE: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
         static LAST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let now = BASE.elapsed().as_nanos() as u64;
         let wall = now.saturating_sub(LAST_NS.swap(now, Relaxed)) as f64 / 1e6;

@@ -378,8 +378,7 @@ fn run_residency_and_linear(gpu: &mut Gpu) -> Result<(), String> {
     let codes_e = vec![0x11u8; n_e * (k_e / 2)]; // nibbles 1,1 → 0.5,0.5
     let scales_e = vec![127u8; n_e * (k_e / 32)];
     let stored_e = codes_e.len() + scales_e.len();
-    let w_exp =
-        ParentExpertWeight::upload_compressed(gpu, backend, &codes_e, &scales_e, n_e, k_e)?;
+    let w_exp = ParentExpertWeight::upload_compressed(gpu, backend, &codes_e, &scales_e, n_e, k_e)?;
     let exp_bytes = w_exp.compressed_bytes();
     println!(
         "  ExpertWeight logical[{n_e},{k_e}]: compressed_bytes={exp_bytes} (expect {stored_e} = 1× stored codes+scales)"
@@ -402,8 +401,7 @@ fn run_residency_and_linear(gpu: &mut Gpu) -> Result<(), String> {
         .map(|i| e4m3_code_for_quarter(if i % 2 == 0 { 1 } else { -1 }))
         .collect();
     let scales_s = vec![127u8; n_s.div_ceil(128) * k_s.div_ceil(128)];
-    let w_small =
-        ParentDenseWeight::decode_resident(gpu, backend, &codes_s, &scales_s, n_s, k_s)?;
+    let w_small = ParentDenseWeight::decode_resident(gpu, backend, &codes_s, &scales_s, n_s, k_s)?;
 
     let m = 32usize;
     let x_f = fill_bf16_grid(m * k_s, 0x0C01);

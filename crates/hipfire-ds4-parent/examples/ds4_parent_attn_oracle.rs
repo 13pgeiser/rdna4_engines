@@ -17,14 +17,12 @@
 //!   -- --model /mnt/scratch/models/DeepSeek-V4-Flash-0731 --rows 128
 //! ```
 use hipfire_ds4_parent::attention::{
-    all_finite, l2_norm, parent_attention_swa, precompute_rope_freqs, ParentAttnScratch, PARENT_DIM,
-    PARENT_HEAD_DIM, PARENT_N_HEADS, PARENT_N_KV_HEADS, PARENT_O_GROUPS, PARENT_O_LORA,
+    all_finite, l2_norm, parent_attention_swa, precompute_rope_freqs, ParentAttnScratch,
+    PARENT_DIM, PARENT_HEAD_DIM, PARENT_N_HEADS, PARENT_N_KV_HEADS, PARENT_O_GROUPS, PARENT_O_LORA,
     PARENT_PER_GROUP_IN, PARENT_Q_LORA, PARENT_Q_WIDTH, PARENT_ROPE_DIM, PARENT_ROPE_THETA,
     PARENT_SWA_WINDOW, PARENT_WO_A_OUT,
 };
-use hipfire_ds4_parent::codec::{
-    act_quant_fp8_inplace_ref, fast_round_scale, round_to_bf16,
-};
+use hipfire_ds4_parent::codec::{act_quant_fp8_inplace_ref, fast_round_scale, round_to_bf16};
 use hipfire_ds4_parent::compressor::{
     PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR,
     PARENT_YARN_ORIG_SEQ,
@@ -107,32 +105,18 @@ fn run() -> Result<(), String> {
     let mut any_implicated = false;
     for &(layer_idx, ratio) in LAYERS {
         println!();
-        println!(
-            "################################################################"
-        );
+        println!("################################################################");
         println!("# layer {layer_idx}  compress_ratio={ratio}");
-        println!(
-            "################################################################"
-        );
+        println!("################################################################");
         let implicated = run_layer(
-            &mut gpu,
-            backend,
-            &source,
-            &cfg,
-            &inv,
-            &x_f32,
-            rows,
-            layer_idx,
-            ratio,
+            &mut gpu, backend, &source, &cfg, &inv, &x_f32, rows, layer_idx, ratio,
         )?;
         any_implicated |= implicated;
     }
 
     println!();
     if any_implicated {
-        println!(
-            "OVERALL: at least one ratio>0 layer shows position-growing main-path error."
-        );
+        println!("OVERALL: at least one ratio>0 layer shows position-growing main-path error.");
     } else {
         println!(
             "OVERALL: main-path stages agree with oracle on all reported layers \
@@ -185,12 +169,8 @@ fn verify_rope_tables() -> Result<(), String> {
     println!("=== RoPE table policy (model.py:481-488 / attention.rs:1000-1021) ===");
     println!("ratio==0: original_seq_len={o0}  theta={t0}  (YaRN off)");
     println!("ratio>0:  original_seq_len={o4}  theta={t4}  (YaRN on)");
-    println!(
-        "table divergence plain vs yarn: max_abs={max_abs:.6e}  max_rel={max_rel:.6e}"
-    );
-    println!(
-        "GPU parent_attention_swa call sites for ratio>0 (all three share one `freqs`):"
-    );
+    println!("table divergence plain vs yarn: max_abs={max_abs:.6e}  max_rel={max_rel:.6e}");
+    println!("GPU parent_attention_swa call sites for ratio>0 (all three share one `freqs`):");
     println!("  - main q   apply_rope_interleaved_inplace(..., inverse=false)  // ~L1023");
     println!("  - main kv  apply_rope_interleaved_inplace(..., inverse=false)  // ~L1033");
     println!("  - inv o    apply_rope_interleaved_inplace(..., inverse=true)   // ~L1157");
@@ -290,9 +270,7 @@ fn run_layer(
         let norm_c = download_bf16_as_f32(gpu, &c.norm, PARENT_HEAD_DIM)?;
         let ape_n = c.ape.shape.iter().product::<usize>().max(1);
         let ape_c = download_f32(gpu, &c.ape, ape_n)?;
-        println!(
-            "compressor: wkv=[{proj},{dim_k}] ape_elems={ape_n} ratio={ratio}"
-        );
+        println!("compressor: wkv=[{proj},{dim_k}] ape_elems={ape_n} ratio={ratio}");
         (Some(wkv_c), Some(wgate_c), Some(norm_c), Some(ape_c))
     } else {
         (None, None, None, None)
@@ -304,7 +282,12 @@ fn run_layer(
             let wp_k = ix.weights_proj.shape.get(1).copied().unwrap_or(PARENT_DIM);
             let wp = download_bf16_as_f32(gpu, &ix.weights_proj, wp_n * wp_k)?;
             let cproj = ix.compressor_wkv.shape.get(0).copied().unwrap_or(0);
-            let cdim = ix.compressor_wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+            let cdim = ix
+                .compressor_wkv
+                .shape
+                .get(1)
+                .copied()
+                .unwrap_or(PARENT_DIM);
             let cwkv = download_bf16_as_f32(gpu, &ix.compressor_wkv, cproj * cdim)?;
             let cwgate = download_bf16_as_f32(gpu, &ix.compressor_wgate, cproj * cdim)?;
             // index head_dim = 128
@@ -329,9 +312,7 @@ fn run_layer(
         };
 
     let (orig, theta) = attention_main_rope_policy(ratio)?;
-    println!(
-        "oracle RoPE policy: original_seq_len={orig}  theta={theta}  (ratio={ratio})"
-    );
+    println!("oracle RoPE policy: original_seq_len={orig}  theta={theta}  (ratio={ratio})");
 
     let comp_ref = match (
         comp_wkv.as_deref(),
@@ -533,8 +514,20 @@ fn run_layer(
         );
     }
     full_row_scan("o", &gpu_o, &reference.o, rows, PARENT_DIM);
-    full_row_scan("attn_inv", &gpu_attn_inv, &reference.attn_inv_rope, rows, PARENT_Q_WIDTH);
-    full_row_scan("wo_a", &gpu_wo_a, &reference.wo_a_out, rows, PARENT_WO_A_OUT);
+    full_row_scan(
+        "attn_inv",
+        &gpu_attn_inv,
+        &reference.attn_inv_rope,
+        rows,
+        PARENT_Q_WIDTH,
+    );
+    full_row_scan(
+        "wo_a",
+        &gpu_wo_a,
+        &reference.wo_a_out,
+        rows,
+        PARENT_WO_A_OUT,
+    );
 
     // Global summary
     let (gmax, gmean, gl2) = metrics(&gpu_o, &reference.o);
@@ -617,9 +610,7 @@ fn run_layer(
             );
         }
     } else if joint_high < 1e-3 && main_high < 1e-3 {
-        println!(
-            "VERDICT layer {layer_idx}: joint SWA+compress path agrees with oracle (clean)."
-        );
+        println!("VERDICT layer {layer_idx}: joint SWA+compress path agrees with oracle (clean).");
     } else if implicated {
         println!(
             "VERDICT layer {layer_idx}: joint-path error GROWS with position \
@@ -633,9 +624,7 @@ fn run_layer(
             joint_high / joint_low.max(1e-30)
         );
     } else {
-        println!(
-            "VERDICT layer {layer_idx}: mixed / small residual — inspect the per-row table."
-        );
+        println!("VERDICT layer {layer_idx}: mixed / small residual — inspect the per-row table.");
     }
 
     // Explicit numeric confirmation that GPU used the expected table:
@@ -649,17 +638,13 @@ fn run_layer(
              GPU q vs WRONG plain-oracle max_abs={wmax:.6e}"
         );
         if rmax > 1e-2 {
-            println!(
-                "  → GPU main q does NOT match the yarn table oracle (bug or earlier stage)."
-            );
+            println!("  → GPU main q does NOT match the yarn table oracle (bug or earlier stage).");
         } else if wmax < rmax * 2.0 {
             println!(
                 "  → plain vs yarn oracles too close on this input (unexpected; tables should separate)."
             );
         } else {
-            println!(
-                "  → GPU main q matches yarn table and rejects plain table (swap ruled out)."
-            );
+            println!("  → GPU main q matches yarn table and rejects plain table (swap ruled out).");
         }
     }
 
@@ -962,8 +947,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
         ));
     }
     let mut data = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: f32 download: {e:?}"))?;

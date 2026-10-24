@@ -20,7 +20,7 @@ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_mfma_gfx942(
     float* __restrict__ y_gate,
     float* __restrict__ y_up,
     int M,
-    int K
+    int K, int n_experts
 ) {
     const int lane = threadIdx.x;
     const int n_lane = lane & 15;
@@ -29,6 +29,20 @@ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_mfma_gfx942(
     if (row_start >= M) return;
     const int krank = blockIdx.y;
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (n_lane == 0) {
+            const int mi_inv = M >> 1;
+            #pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const int row = row_start + strip * 4 + r;
+                if (row < M) {
+                    if (row < mi_inv) y_gate[(long long)krank * mi_inv + row] = 0.0f;
+                    else              y_up[(long long)krank * mi_inv + row - mi_inv] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 

@@ -62,6 +62,33 @@
 #define HIPFIRE_FA2_KMODE 0
 #endif
 
+// A3B native-fp8 specialization (KMODE=8 f16 body only, never FA2_FP8):
+// `-DHIPFIRE_FA2_Q0_A3B` compiles H=16/Hkv=2/D=256 (GQA8) instead of the
+// H=24/Hkv=4/D=256 (GQA6) Q0 geometry. It exists as the HIP oracle twin of
+// the PeaceMaker `attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201` export (same
+// frozen kernel ABI): 4 compute waves (one 16-row tile each, 8 positions x 8
+// heads) plus one barrier-only helper wave (block 160); the cooperative fills
+// run on tid < 128 only. Native fp8 row = [2*256 head-major codes][2 f16
+// scales] (stride 516). Without the macro every constant below is the Q0
+// H24/KV4 value, so all other objects are byte-identical.
+#ifdef HIPFIRE_FA2_Q0_A3B
+#if HIPFIRE_FA2_KMODE != 8 || defined(HIPFIRE_FA2_FP8)
+#error "HIPFIRE_FA2_Q0_A3B requires HIPFIRE_FA2_KMODE=8 without HIPFIRE_FA2_FP8"
+#endif
+#define FA2_HEADS 16
+#define FA2_KV_HEADS 2
+#define FA2_BLOCK 160
+#else
+#define FA2_HEADS 24
+#define FA2_KV_HEADS 4
+#define FA2_BLOCK 128
+#endif
+#define FA2_GQA (FA2_HEADS / FA2_KV_HEADS)
+#define FA2_CWAVES (FA2_GQA / 2)
+// Native fp8 token-local row: head-major codes, then one f16 scale per KV head.
+#define FA2_FP8_SCALE_OFF (FA2_KV_HEADS * 256)
+#define FA2_FP8_ROW (FA2_FP8_SCALE_OFF + FA2_KV_HEADS * 2)
+
 // Product split-KV verifier (HIPFIRE_GFX12_FA2_SPLIT_VERIFY): only the base
 // f16/Q8 `attention_q8_0_fa2_gqa_{partial,merge}_gfx1201` entries use the CK
 // style LSE + normalized-Oacc record layout. Every other module build
@@ -168,10 +195,15 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int lane = tid & 31;
     const int ml = lane & 15;
     const int kg = lane >> 4;
-    const bool compute = wave < 3;
+    const bool compute = wave < FA2_CWAVES;
+    // Cooperative fills are written for exactly 128 filler threads; the A3B
+    // block (160) has a fifth barrier-only helper wave. Compile-time true at
+    // block 128, so the default objects are unchanged.
+    const bool filler = (FA2_BLOCK == 128) || (tid < 128);
+    (void)filler;
 
-    const int q_stride = 24 * 256;
-    const int row_stride = 4 * (256 / 32) * 34;
+    const int q_stride = FA2_HEADS * 256;
+    const int row_stride = FA2_KV_HEADS * (256 / 32) * 34;
     const int kv_blk = kv_h * (256 / 32);
 
     extern __shared__ uint32_t LDS[];
@@ -193,10 +225,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     bool qok_ml = false;
     unsigned qq_base = 0;
     if (compute) {
-        h_ml = 6 * kv_h + (wave << 1) + (ml >> 3);
+        h_ml = FA2_GQA * kv_h + (wave << 1) + (ml >> 3);
         qr_ml = q_base + (ml & 7);
         qok_ml = qr_ml < batch_size;
-        qq_base = (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+        qq_base = (unsigned)qr_ml * (unsigned)(FA2_HEADS * 256) + (unsigned)h_ml * 256u;
 #pragma unroll
         for (int dc = 0; dc < 16; ++dc)
             Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -266,18 +298,18 @@ __device__ __forceinline__ void fa2_gqa_body(
         // rows read zero codes with a zero scale, like the Q8 path.
         (void)row_stride;
         (void)kv_blk;
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < (filler ? 4 : 0); ++t) {
             const int idx = tid + t * 128;
             const int k = idx >> 3;
             const int b = idx & 7;
             const int gk = ktile + k;
             const unsigned char* row = (gk < seq_len)
-                ? k_cache + (unsigned long long)gk * 1032ULL
+                ? k_cache + (unsigned long long)gk * (unsigned long long)FA2_FP8_ROW
                 : nullptr;
             uint16_t su = 0;
             if (row != nullptr)
-                su = (uint16_t)row[1024 + kv_h * 2] |
-                    ((uint16_t)row[1024 + kv_h * 2 + 1] << 8);
+                su = (uint16_t)row[FA2_FP8_SCALE_OFF + kv_h * 2] |
+                    ((uint16_t)row[FA2_FP8_SCALE_OFF + kv_h * 2 + 1] << 8);
             _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
             const float sf = (float)s;
             const int sub = k >> 4;
@@ -287,7 +319,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 : nullptr;
 #pragma unroll 1
             // 8 dwords cover the 32 codes (memcpy emits a correct load at any
-            // alignment; 1032 % 4 == 0 so rows stay dword-aligned anyway).
+            // alignment; 1032 / 516 % 4 == 0 so rows stay dword-aligned anyway).
             for (int w = 0; w < 8; ++w) {
                 uint32_t u = 0;
                 if (codes != nullptr)
@@ -409,25 +441,25 @@ __device__ __forceinline__ void fa2_gqa_body(
         // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
         // one fragment at consecutive j. Same decode/rounding contract as
         // the K fill above.
-        for (int t = 0; t < 2; ++t) {
+        for (int t = 0; t < (filler ? 2 : 0); ++t) {
             const int pair = tid + t * 128;
             const int m = pair >> 3;
             const int b = pair & 7;
             const int k0 = ktile + 2 * m;
             const unsigned char* row0 = (k0 < seq_len)
-                ? v_cache + (unsigned long long)k0 * 1032ULL
+                ? v_cache + (unsigned long long)k0 * (unsigned long long)FA2_FP8_ROW
                 : nullptr;
             const unsigned char* row1 = (k0 + 1 < seq_len)
-                ? v_cache + (unsigned long long)(k0 + 1) * 1032ULL
+                ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)FA2_FP8_ROW
                 : nullptr;
             uint16_t s0u = 0;
             uint16_t s1u = 0;
             if (row0 != nullptr)
-                s0u = (uint16_t)row0[1024 + kv_h * 2] |
-                    ((uint16_t)row0[1024 + kv_h * 2 + 1] << 8);
+                s0u = (uint16_t)row0[FA2_FP8_SCALE_OFF + kv_h * 2] |
+                    ((uint16_t)row0[FA2_FP8_SCALE_OFF + kv_h * 2 + 1] << 8);
             if (row1 != nullptr)
-                s1u = (uint16_t)row1[1024 + kv_h * 2] |
-                    ((uint16_t)row1[1024 + kv_h * 2 + 1] << 8);
+                s1u = (uint16_t)row1[FA2_FP8_SCALE_OFF + kv_h * 2] |
+                    ((uint16_t)row1[FA2_FP8_SCALE_OFF + kv_h * 2 + 1] << 8);
             _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
             _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
             const float sf0 = (float)s0;
@@ -662,15 +694,18 @@ __device__ __forceinline__ void fa2_gqa_body(
                     (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
                 m_old = m_new;
 
+                // Exponent origin only: m_old already holds the real running
+                // maximum. Use +0 when m_new == -inf so masked (-inf) scores
+                // stay +0 while a live NaN score survives and propagates.
+                const float exp_origin = (m_new == -INFINITY) ? 0.0f : m_new;
+
                 // Probabilities pack straight into the PV B operand.
                 // The sum chain likewise serializes rows.
                 half8_t prow;
                 float sum = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const float e = (m_new == -INFINITY)
-                        ? 0.0f
-                        : __expf(sacc[j] - m_new);
+                    const float e = __expf(sacc[j] - exp_origin);
                     prow[j] = (_Float16)e;
                     sum += e;
                 }
@@ -712,7 +747,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
                 // 32-bit row base (whole O tensor < 10 MiB).
                 const unsigned bo =
-                    (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+                    (unsigned)qr_ml * (unsigned)(FA2_HEADS * 256) + (unsigned)h_ml * 256u;
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
                     const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
@@ -728,11 +763,11 @@ __device__ __forceinline__ void fa2_gqa_body(
             //   oacc[record][256] (normalized partial output)
             // record = ((query * H + head) * n_splits + split).
             const unsigned records =
-                (unsigned)batch_size * 24u * (unsigned)n_splits;
+                (unsigned)batch_size * (unsigned)FA2_HEADS * (unsigned)n_splits;
             float* lse = out;
             float* oacc = out + records;
             const unsigned record =
-                ((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                ((unsigned)qr_ml * (unsigned)FA2_HEADS + (unsigned)h_ml)
                     * (unsigned)n_splits + (unsigned)split;
             const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
             if (kg == 0) {
@@ -760,7 +795,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 if (qok_ml) {
                     // 32-bit record base (partials < 64 MiB even at S=8).
                     const unsigned rb =
-                        (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                        (((unsigned)qr_ml * (unsigned)FA2_HEADS + (unsigned)h_ml)
                              * (unsigned)n_splits + (unsigned)split)
                         * 258u;
                     float* rec = out + rb;
@@ -770,7 +805,7 @@ __device__ __forceinline__ void fa2_gqa_body(
             }
             if (qok_ml) {
                 const unsigned rb =
-                    (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                    (((unsigned)qr_ml * (unsigned)FA2_HEADS + (unsigned)h_ml)
                          * (unsigned)n_splits + (unsigned)split)
                         * 258u;
                 float* rec = out + rb;
@@ -1403,11 +1438,17 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
 }
 #else
 #if HIPFIRE_FA2_KMODE == 8
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
-#elif defined(HIPFIRE_FA2_FP8)
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fp8_gfx1201(
+#ifdef HIPFIRE_FA2_Q0_A3B
+// A3B H16/KV2 twin of the PeaceMaker export `..._f16_pm_gfx1201`: its own
+// symbol (the host function cache is keyed by symbol alone).
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_fp8_e4m3_fa2_gqa_f16_a3b_gfx1201(
 #else
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1201(
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
+#endif
+#elif defined(HIPFIRE_FA2_FP8)
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_q8_0_fa2_gqa_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_q8_0_fa2_gqa_gfx1201(
 #endif
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
@@ -1420,10 +1461,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
     int batch_size,
     float scale_attn)
 {
-    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+    if (n_heads != FA2_HEADS || n_kv_heads != FA2_KV_HEADS || head_dim != 256)
         return;
     const int kv_h = blockIdx.y;
-    if (kv_h >= 4)
+    if (kv_h >= FA2_KV_HEADS)
         return;
     const int q_base = blockIdx.x * 8;
     if (q_base >= batch_size)
@@ -1460,7 +1501,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
 #elif HIPFIRE_FA2_KMODE == 8
 // Q0 body is f16 with no rotation, same as KMODE=0, but the symbol must be
 // distinct: the host function cache is keyed by symbol alone.
+#ifdef HIPFIRE_FA2_Q0_A3B
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_f16_a3b_gfx1201
+#else
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201
+#endif
 #else
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx1201
 #endif
@@ -1482,12 +1527,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
     const int wave = tid >> 5;
     const int lane = tid & 31;
     const int r = (int)blockIdx.x * 4 + wave;
-    if (r >= batch_size * 24)
+    if (r >= batch_size * FA2_HEADS)
         return;
-    const int qr = r / 24;
-    const int h = r % 24;
-    const float* rp = q + (unsigned)qr * 6144u + (unsigned)h * 256u;
-    _Float16* wp = q16 + (unsigned)qr * 6144u + (unsigned)h * 256u;
+    const int qr = r / FA2_HEADS;
+    const int h = r % FA2_HEADS;
+    const float* rp = q + (unsigned)qr * (unsigned)(FA2_HEADS * 256) + (unsigned)h * 256u;
+    _Float16* wp = q16 + (unsigned)qr * (unsigned)(FA2_HEADS * 256) + (unsigned)h * 256u;
     float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
     float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
     float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
@@ -1644,7 +1689,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
                            batch_size, scale_attn, kv_h, q_base, t0, t1,
                            split, n_splits);
 }
-#else
+#elif !defined(HIPFIRE_FA2_Q0_A3B)
 #if HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
@@ -1742,7 +1787,7 @@ extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_mer
             (den > 0.0f) ? num / den : 0.0f;
     }
 }
-#else
+#elif !defined(HIPFIRE_FA2_Q0_A3B)
 #if HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
@@ -3150,6 +3195,23 @@ static __device__ __forceinline__ void fa2_a4_epilogue(
 }
 #endif
 
+// Wave arbitration hint (A3B only; no arithmetic): the WMMA bursts of one
+// wave run ahead of the others' VALU/fill work. The dense body is unchanged.
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+#define FA2_QR2_PRIO(x) __builtin_amdgcn_s_setprio(x)
+#else
+#define FA2_QR2_PRIO(x) ((void)0)
+#endif
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+// Geometry-only specialization: the KT48 Q-resident arithmetic below is shared.
+#if !defined(HIPFIRE_FA2_QRESIDENT_V2_Q8) || defined(HIPFIRE_FA2_A4_EPILOGUE)
+#error "A3B requires the Q8-input body without the A4 epilogue"
+#endif
+static __device__ __forceinline__
+void fa2_qresident_v2_q8_a3b_body(
+    const unsigned char* __restrict__ q_codes,
+    const float* __restrict__ q_scales,
+#else
 extern "C" __global__ __launch_bounds__(768, 1)
 __attribute__((amdgpu_waves_per_eu(6), amdgpu_num_vgpr(240)))
 #if defined(HIPFIRE_FA2_A4_EPILOGUE)
@@ -3163,6 +3225,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
 #else
 void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const float* __restrict__ q,
+#endif
 #endif
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -3182,10 +3245,18 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     int batch_size,
     float scale_attn)
 {
-    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    constexpr int QR_HEADS = 16, QR_KV_HEADS = 2, QR_GQA = 8;
+#else
+    constexpr int QR_HEADS = 24, QR_KV_HEADS = 4, QR_GQA = 6;
+#endif
+    constexpr unsigned QR_KV_CODES = QR_KV_HEADS * 256u;
+    constexpr unsigned long long QR_KV_STRIDE = QR_KV_CODES + QR_KV_HEADS * 2u;
+    constexpr unsigned QR_OUT_STRIDE = QR_HEADS * 256u;
+    if (n_heads != QR_HEADS || n_kv_heads != QR_KV_HEADS || head_dim != 256)
         return;
     const int kv_h = (int)blockIdx.y;
-    if (kv_h >= 4)
+    if (kv_h >= QR_KV_HEADS)
         return;
     // Heaviest-first: the last run and the last query block start first.
     const int bz = (int)gridDim.z - 1 - (int)blockIdx.z;
@@ -3195,7 +3266,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         return;
     const int run_rows = min(512, batch_size - query_offset);
     const int row_base = 384 * bx;
-    if (row_base >= 6 * run_rows)
+    if (row_base >= QR_GQA * run_rows)
         return;
 
     const int tid = (int)threadIdx.x;
@@ -3204,12 +3275,12 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const int ml = lane & 15;
     const int kg = lane >> 4;
     const int row = row_base + 16 * wave + ml;
-    const int query_local = row / 6;
+    const int query_local = row / QR_GQA;
     const int query = query_offset + query_local;
-    const int head = 6 * kv_h + row % 6;
-    const bool qok = row < 6 * run_rows;
+    const int head = QR_GQA * kv_h + row % QR_GQA;
+    const bool qok = row < QR_GQA * run_rows;
     const unsigned qrow =
-        qok ? (unsigned)query * 24u + (unsigned)head : 0u;
+        qok ? (unsigned)query * (unsigned)QR_HEADS + (unsigned)head : 0u;
 
     extern __shared__ uint32_t LDS[];
     int* bounds = (int*)((unsigned char*)LDS + 49920);
@@ -3219,10 +3290,10 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         bounds[1] = 0x7fffffff;
     }
     __syncthreads();
-    const int bound_queries = ((min(row_base + 384, 6 * run_rows) - 1) / 6)
-        - row_base / 6 + 1;
+    const int bound_queries = ((min(row_base + 384, QR_GQA * run_rows) - 1) / QR_GQA)
+        - row_base / QR_GQA + 1;
     if (tid < bound_queries) {
-        const int ql = row_base / 6 + tid;
+        const int ql = row_base / QR_GQA + tid;
         if (ql < run_rows) {
             const int p = positions[query_offset + ql];
             atomicMax(bounds + 0, p);
@@ -3309,15 +3380,151 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const int gmax = bounds[0];
     const int gmin = bounds[1];
     const int seq_len = gmax + 1;
-    const bool qok_all = row_base + 383 < 6 * run_rows;
+    const bool qok_all = row_base + 383 < QR_GQA * run_rows;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    const bool wave_live = row_base + 16 * wave < QR_GQA * run_rows;
+#endif
 
-    // Fill roles: waves 0..11 load K (4 b64 wave-loads each), waves 12..23
-    // load pre-transposed V (4 GLOBAL_LOAD_TR_B64 each), wave 0 also loads
-    // the tile's 48 K/V scale pairs. Keys at/after seq_len are zero in every
-    // plane, as in v1.
+    // Fill roles (dense H24; the A3B fill below has its own roles): waves
+    // 0..11 load K (4 b64 wave-loads each), waves 12..23 load pre-transposed
+    // V (4 GLOBAL_LOAD_TR_B64 each), wave 0 also loads the tile's 48 K/V
+    // scale pairs. Keys at/after seq_len are zero in every plane, as in v1.
     constexpr int TK = 48;
     constexpr unsigned KPL = 12288u;
     constexpr unsigned BUFB = 2u * KPL + 384u;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    // A3B fill (native 516-byte rows: four-byte alignment only). Every wave
+    // loads one 16-byte K chunk (one key, 16 dims); waves 12..23 also load
+    // one 4-byte word per key of an 8-key x 4-dim V block and transpose it
+    // into four fragment words in commit(); wave 0 loads the tile's 48 K/V
+    // scale pairs. Keys at/after seq_len are zero in every plane, as in v1.
+    const bool sfill = wave == 0;
+    const bool vfill = wave >= 12;
+    const int ksub = wave >> 3;
+    const int kdcf = ((wave & 7) << 1) | (lane & 1);
+    const int kml = lane >> 1;
+    const int vw_i = wave - 12;
+    const int vsub = vw_i >> 2;
+    const int vkg = (vw_i >> 1) & 1;
+    const int vdc = ((vw_i & 1) << 3) | (lane >> 2);
+    uint32_t kwords[4];
+    uint32_t vwords[8];
+    uint32_t spre[2];
+
+    auto issue = [&](int kt) {
+        {
+            const int gk = kt + ksub * 16 + kml;
+            uint32_t k0 = 0u, k1 = 0u, k2 = 0u, k3 = 0u;
+            if (gk < seq_len) {
+                const uint32_t* p = (const uint32_t*)(k_cache
+                    + (unsigned long long)gk * QR_KV_STRIDE
+                    + (unsigned)(kv_h * 256 + kdcf * 16));
+                k0 = p[0];
+                k1 = p[1];
+                k2 = p[2];
+                k3 = p[3];
+            }
+            kwords[0] = k0;
+            kwords[1] = k1;
+            kwords[2] = k2;
+            kwords[3] = k3;
+        }
+        if (vfill) {
+            const int kb = kt + vsub * 16 + vkg * 8;
+            const unsigned char* vp = v_cache
+                + (unsigned)(kv_h * 256 + vdc * 16 + (lane & 3) * 4);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int key = min(kb + r, seq_len - 1);
+                vwords[r] = *(const uint32_t*)(
+                    vp + (unsigned long long)key * QR_KV_STRIDE);
+            }
+        }
+        if (sfill) {
+            uint32_t s0 = 0u, s1 = 0u;
+            const int gk0 = kt + lane;
+            const int gk1 = kt + 32 + lane;
+            if (gk0 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s0 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            if (lane < 16 && gk1 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s1 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            spre[0] = s0;
+            spre[1] = s1;
+        }
+    };
+    auto commit = [&](int kt, unsigned b) {
+        unsigned char* K8w = (unsigned char*)LDS + b * BUFB;
+        unsigned char* V8w = K8w + KPL;
+        float* SKw = (float*)(K8w + 2u * KPL);
+        float* SVw = SKw + 48;
+        {
+            // Key kml, dims 16*kdcf..+15: the kg=0 / kg=1 fragment halves.
+            unsigned char* kd = K8w
+                + (unsigned)((((kdcf >> 1) * 3 + ksub) * 32 + kml) * 16
+                             + (kdcf & 1) * 8);
+            *(unsigned long long*)kd = (unsigned long long)kwords[0]
+                | ((unsigned long long)kwords[1] << 32);
+            *(unsigned long long*)(kd + 256) = (unsigned long long)kwords[2]
+                | ((unsigned long long)kwords[3] << 32);
+        }
+        if (vfill) {
+            // 8 keys x 4 dims -> four fragment words (byte j = key k0 + j).
+            const int k0 = kt + vsub * 16 + vkg * 8;
+            unsigned long long keep = ~0ULL;
+            if (k0 + 8 > seq_len) {
+                const int nvalid = max(0, seq_len - k0);
+                keep = (1ULL << (8 * nvalid)) - 1ULL;
+            }
+            uint32_t lo[4], hi[4];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t w0 = vwords[4 * h], w1 = vwords[4 * h + 1];
+                const uint32_t w2 = vwords[4 * h + 2], w3 = vwords[4 * h + 3];
+                const uint32_t t0 = __builtin_amdgcn_perm(w1, w0, 0x05010400u);
+                const uint32_t t1 = __builtin_amdgcn_perm(w1, w0, 0x07030602u);
+                const uint32_t u0 = __builtin_amdgcn_perm(w3, w2, 0x05010400u);
+                const uint32_t u1 = __builtin_amdgcn_perm(w3, w2, 0x07030602u);
+                uint32_t* o = h ? hi : lo;
+                o[0] = __builtin_amdgcn_perm(u0, t0, 0x05040100u);
+                o[1] = __builtin_amdgcn_perm(u0, t0, 0x07060302u);
+                o[2] = __builtin_amdgcn_perm(u1, t1, 0x05040100u);
+                o[3] = __builtin_amdgcn_perm(u1, t1, 0x07060302u);
+            }
+            unsigned char* vdst = V8w
+                + (unsigned)(((vsub * 8 + (vdc >> 1)) * 32 + vkg * 16
+                              + 4 * (lane & 3)) * 16 + (vdc & 1) * 8);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const unsigned long long v =
+                    ((unsigned long long)lo[c] | ((unsigned long long)hi[c] << 32))
+                    & keep;
+                *(unsigned long long*)(vdst + c * 16) = v;
+            }
+        }
+        if (sfill) {
+            const fa2_dw_t d0 = {.u = spre[0]};
+            const fa2_dw_t d1 = {.u = spre[1]};
+            SKw[lane] = (float)d0.h[0];
+            SVw[lane] = (float)d0.h[1];
+            if (lane < 16) {
+                SKw[32 + lane] = (float)d1.h[0];
+                SVw[32 + lane] = (float)d1.h[1];
+            }
+        }
+    };
+#else
     const bool kfill = wave < 12;
     const bool sfill = wave == 0;
     unsigned long long pre[4];
@@ -3332,10 +3539,12 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                 const int dcf = idx & 15;
                 const int gk = kt + sub * 16 + ml;
                 unsigned long long v = 0ULL;
-                if (gk < seq_len)
-                    v = *(const unsigned long long*)(k_cache
-                        + (unsigned long long)gk * 1032ULL
-                        + (unsigned)(kv_h * 256 + dcf * 16 + kg * 8));
+                if (gk < seq_len) {
+                    const unsigned char* p = k_cache
+                        + (unsigned long long)gk * QR_KV_STRIDE
+                        + (unsigned)(kv_h * 256 + dcf * 16 + kg * 8);
+                    v = *(const unsigned long long*)p;
+                }
                 pre[i] = v;
             }
         } else {
@@ -3348,7 +3557,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                 const int dc = idx & 15;
                 const int gk = min(kt + sub * 16 + skey, seq_len - 1);
                 const unsigned char* p = v_cache
-                    + (unsigned long long)gk * 1032ULL
+                    + (unsigned long long)gk * QR_KV_STRIDE
                     + (unsigned)(kv_h * 256 + dc * 16
                                  + 8 * ((lane >> 2) & 1));
                 const v2i_t r = __builtin_amdgcn_global_load_tr_b64_v2i32(
@@ -3363,17 +3572,17 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
             const int gk1 = kt + 32 + lane;
             if (gk0 < seq_len) {
                 const unsigned char* kr = k_cache
-                    + (unsigned long long)gk0 * 1032ULL + 1024u + kv_h * 2;
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
                 const unsigned char* vr = v_cache
-                    + (unsigned long long)gk0 * 1032ULL + 1024u + kv_h * 2;
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
                 s0 = (uint32_t)*(const uint16_t*)kr
                     | ((uint32_t)*(const uint16_t*)vr << 16);
             }
             if (lane < 16 && gk1 < seq_len) {
                 const unsigned char* kr = k_cache
-                    + (unsigned long long)gk1 * 1032ULL + 1024u + kv_h * 2;
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
                 const unsigned char* vr = v_cache
-                    + (unsigned long long)gk1 * 1032ULL + 1024u + kv_h * 2;
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
                 s1 = (uint32_t)*(const uint16_t*)kr
                     | ((uint32_t)*(const uint16_t*)vr << 16);
             }
@@ -3425,6 +3634,8 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
         }
     };
 
+#endif
+
     float8_t Ofr[16];
 #pragma unroll
     for (int dc = 0; dc < 16; ++dc)
@@ -3444,6 +3655,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     __syncthreads();
     unsigned buf = 0u;
     for (int ktile = 0; ktile < seq_len; ktile += TK) {
+        FA2_QR2_PRIO(0);
         if (ktile + TK < seq_len) {
             commit(ktile + TK, buf ^ 1u);
             if (ktile + 2 * TK < seq_len)
@@ -3457,10 +3669,18 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
 #pragma unroll 1
         for (int sub = 0; sub < 3; ++sub) {
             const int kt_sub = ktile + sub * 16;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+            // A wave whose 16 rows all lie past the run's last query computes
+            // nothing that is stored; it still fills and joins the barriers.
+            if (kt_sub > gmax || !wave_live)
+                break;
+#else
             if (kt_sub > gmax)
                 break;
+#endif
             float8_t sacc =
                 (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            FA2_QR2_PRIO(3);
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
                 const uint4 kv = *(const uint4*)(K8
@@ -3475,6 +3695,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                         kf1, Qfr[2 * p + 1], sacc);
                 asm volatile("" ::: "memory");
             }
+            FA2_QR2_PRIO(0);
             const float4 sk0 = *(const float4*)(SKf + sub * 16 + 8 * kg);
             const float4 sk1 = *(const float4*)(SKf + sub * 16 + 8 * kg + 4);
             const float4 sv0 = *(const float4*)(SVf + sub * 16 + 8 * kg);
@@ -3584,6 +3805,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
                     sacc[6] / b_ref, sacc[7] / b_ref, p1, true);
             }
             const v2i_t pb = {(int)p0, (int)p1};
+            FA2_QR2_PRIO(3);
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
                 const uint4 vv = *(const uint4*)(V8
@@ -3627,7 +3849,7 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     if (qok) {
         const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
         const unsigned bo =
-            (unsigned)query * 6144u + (unsigned)head * 256u;
+            (unsigned)query * QR_OUT_STRIDE + (unsigned)head * 256u;
 #pragma unroll
         for (int dc = 0; dc < 16; ++dc) {
             const unsigned bd =
@@ -3639,6 +3861,31 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     }
 #endif
 }
+
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+// Both entry points use the dense packed ABI. The range caller advances both
+// Q planes independently from the FULL allocation's plane bases, and advances
+// output/positions; batch_size is the number of rows in that selected range.
+#define FA2_QR2_A3B_ENTRY(NAME) \
+extern "C" __global__ __launch_bounds__(768, 1) \
+__attribute__((amdgpu_waves_per_eu(6), amdgpu_num_vgpr(240))) \
+void NAME( \
+    const unsigned char* __restrict__ q_codes, \
+    const float* __restrict__ q_scales, \
+    const unsigned char* __restrict__ k_cache, \
+    const unsigned char* __restrict__ v_cache, \
+    float* __restrict__ out, \
+    const int* __restrict__ positions, \
+    int n_heads, int n_kv_heads, int head_dim, int batch_size, float scale_attn) \
+{ \
+    fa2_qresident_v2_q8_a3b_body(q_codes, q_scales, k_cache, v_cache, out, \
+        positions, n_heads, n_kv_heads, head_dim, batch_size, scale_attn); \
+}
+FA2_QR2_A3B_ENTRY(attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201)
+FA2_QR2_A3B_ENTRY(attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201)
+#undef FA2_QR2_A3B_ENTRY
+#endif
+#undef FA2_QR2_PRIO
 #undef FA2_QR2_YLO
 #undef FA2_QR2_YHI
 #endif

@@ -59,11 +59,14 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 
 ## Speculation settings
 
-- **Defaults** (`speculation=auto`, `dflash_mode=off`): eligible MTP paths may
-  still engage; DFlash stays off. Force plain AR with
+- **Defaults** (`speculation=auto`, `dflash_mode=off`): native MTP engages
+  under `auto` only on a producer with a measured AR floor (today Flash-Next /
+  Qwen4); Qwen3.5-class and DeepSeek V4 stay AR until `--spec mtp` opts in.
+  DFlash stays off. Force plain AR with
   `hipfire config set speculation off`. Exception: `qwen3.8:27b` and its
   `mq3*` / `mq4*` tiers resolve `dflash_mode=auto` from the registry, so a
-  paired draft file that is present is used (absent: MTP `auto` as before);
+  paired draft file that is present is used (absent: MTP `auto` as before,
+  which is AR for this Qwen35 producer);
   `hipfire config <tag> set dflash_mode off` opts out
   ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)).
 - **DFlash** elsewhere is opt-in: `hipfire config <tag> set dflash_mode auto`.

@@ -78,7 +78,11 @@ impl PleUpload {
     /// State just before an asynchronous copy is enqueued. The copy may
     /// already be reading when the call fails, so this is pessimistic.
     pub(crate) fn enqueue(self) -> Self {
-        debug_assert_eq!(self, Self::Idle, "an upload was enqueued over an undrained one");
+        debug_assert_eq!(
+            self,
+            Self::Idle,
+            "an upload was enqueued over an undrained one"
+        );
         Self::Unfenced
     }
 
@@ -190,8 +194,7 @@ impl PleHostStage {
             );
         }
         self.upload = self.upload.enqueue();
-        gpu.hip
-            .memcpy_htod_async_default(dst, &self.bytes[..len])?;
+        gpu.hip.memcpy_htod_async_default(dst, &self.bytes[..len])?;
         // Same (legacy) stream as the copy, so the event completes after it.
         let fence = self.fence.as_ref().expect("fence created above");
         gpu.hip.event_record(fence, None)?;
@@ -270,7 +273,10 @@ mod tests {
         // (enabled, device_token, deferred, capturing)
         assert!(ple_async_upload(true, false, true, false));
         assert!(!ple_async_upload(false, false, true, false), "opt-out");
-        assert!(!ple_async_upload(true, true, true, false), "device-token branch");
+        assert!(
+            !ple_async_upload(true, true, true, false),
+            "device-token branch"
+        );
         assert!(!ple_async_upload(true, false, false, false), "not deferred");
         assert!(!ple_async_upload(true, false, true, true), "graph capture");
     }
@@ -293,7 +299,13 @@ mod tests {
         assert!(ple_async_upload_enabled(None), "unset");
         assert!(!ple_async_upload_enabled(Some("0")), "=0 opts out");
         assert!(ple_async_upload_enabled(Some("1")), "=1 forces on");
-        assert!(ple_async_upload_enabled(Some("")), "empty falls back to default");
-        assert!(ple_async_upload_enabled(Some("true")), "strict table: other spelling is default");
+        assert!(
+            ple_async_upload_enabled(Some("")),
+            "empty falls back to default"
+        );
+        assert!(
+            ple_async_upload_enabled(Some("true")),
+            "strict table: other spelling is default"
+        );
     }
 }

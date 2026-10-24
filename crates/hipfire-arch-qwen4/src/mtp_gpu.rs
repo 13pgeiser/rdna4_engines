@@ -24,11 +24,13 @@ use crate::weights::{Qwen4EpPlacement, Qwen4FfnWeights, Qwen4Weights, WeightErro
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::MoeRowGather;
+use hipfire_dispatch::pipeline::gated_mlp::{
+    Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
+};
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DenseFfnOp, DenseFfnRecipe,
-    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
-    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
-    MixerPhase, ProjectOp, Step,
+    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
+    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
+    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -50,8 +52,8 @@ use std::fmt;
 const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
-/// Metadata words of an MTP head session snapshot: a reserved zero word and
-/// the state mark.
+/// Metadata words of an MTP head session snapshot: the boundary-row word
+/// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
@@ -156,7 +158,6 @@ fn hc_read<'a>(
         low: &scratch.hc_low,
         up: &scratch.hc_up,
         mixed: &scratch.hc_mixed,
-        bf16_scratch: &scratch.hc_bf16,
         rows: MTP_HC_ROWS,
         branches: config.hc_count,
         hidden: config.hidden_size,
@@ -253,7 +254,7 @@ pub struct MtpGpuScratch {
     hc_up: GpuTensor,
     hc_mixed: GpuTensor,
     hc_gates: GpuTensor,
-    /// BF16 scratch of the shared HC read and indexed attention.
+    /// BF16 scratch of the indexed attention.
     hc_bf16: GpuTensor,
     rotation: GpuTensor,
     index: GpuTensor,
@@ -390,6 +391,16 @@ impl MtpGpuScratch {
             .iter()
             .map(|&(elements, dtype)| elements * dtype.size())
             .sum())
+    }
+
+    /// [`Self::device_bytes`] per allocation of [`Self::new`], in field
+    /// order; `None` on overflow.
+    pub(crate) fn allocation_sizes(config: &Qwen4Config) -> Option<Vec<u64>> {
+        Self::shapes(config)
+            .ok()?
+            .iter()
+            .map(|&(elements, dtype)| u64::try_from(elements.checked_mul(dtype.size())?).ok())
+            .collect()
     }
 
     fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, MtpGpuError> {
@@ -610,6 +621,19 @@ impl MtpAppendScratch {
             .try_fold(0usize, |total, &(elements, dtype)| {
                 total.checked_add(elements.checked_mul(dtype.size())?)
             })
+    }
+
+    /// [`Self::device_bytes`] per allocation of [`Self::new`], in field
+    /// order; `None` on overflow.
+    pub(crate) fn allocation_sizes(
+        config: &Qwen4Config,
+        rows: usize,
+        id_rows: usize,
+    ) -> Option<Vec<u64>> {
+        Self::shapes(config, rows, id_rows)?
+            .iter()
+            .map(|&(elements, dtype)| u64::try_from(elements.checked_mul(dtype.size())?).ok())
+            .collect()
     }
 
     pub(crate) fn new(
@@ -926,6 +950,9 @@ struct MtpGpuStateSnapshotArena {
     mark: MtpStateMark,
     model_id: u64,
     active: bool,
+    /// The entry stays active after a committed window so the window can
+    /// still be rolled back (`retain_validated`).
+    retained: bool,
     generation: u64,
 }
 
@@ -961,6 +988,7 @@ impl MtpGpuStateSnapshotArena {
             mark,
             model_id,
             active: false,
+            retained: false,
             generation: 0,
         })
     }
@@ -1026,6 +1054,7 @@ impl MtpGpuStateSnapshotArena {
 
     fn invalidate(&mut self) {
         self.active = false;
+        self.retained = false;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -1054,6 +1083,22 @@ fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), Mtp
         return Err(invalid("MTP snapshot mark exceeds state capacity"));
     }
     Ok(())
+}
+
+/// Word 0 of an MTP session capture at `position`: the position plus one when
+/// the boundary row was saved for exactly that position, else 0 (the row is
+/// stale and a restore refuses the snapshot).
+fn boundary_word(saved: Option<usize>, position: usize) -> u64 {
+    match saved {
+        Some(saved) if saved == position => position as u64 + 1,
+        _ => 0,
+    }
+}
+
+/// Whether word 0 of a snapshot at `position` names a boundary row saved for
+/// that position.
+fn boundary_word_names(word: u64, position: usize) -> bool {
+    word == position as u64 + 1
 }
 
 /// Map more of one VMM context arena so it covers `rows` rows of a
@@ -1110,6 +1155,9 @@ pub struct MtpGpuState {
     selected_indices: GpuTensor,
     selected_len_out: GpuTensor,
     wide_hidden: GpuTensor,
+    /// The target's boundary hidden (row `position - 1`) kept for the
+    /// session snapshot; no snapshot backup of its own.
+    boundary_hidden: GpuTensor,
     full_capacity: usize,
     raw_capacity: usize,
     pooled_capacity: usize,
@@ -1127,6 +1175,12 @@ pub struct MtpGpuState {
     selected_len: usize,
     step_index: usize,
     request_epoch: u64,
+    /// Position `boundary_hidden` was saved for ([`Self::save_boundary_hidden`]),
+    /// or restored with at a session restore.
+    boundary_saved: Option<usize>,
+    /// Set by a session restore whose snapshot held a boundary row for its
+    /// position, until [`Self::restore_boundary_hidden`] takes it.
+    boundary_restored: Option<usize>,
     generation: u64,
     model_id: u64,
     snapshot_arena: MtpGpuStateSnapshotArena,
@@ -1180,24 +1234,86 @@ impl MtpGpuState {
     /// QSA arenas as `context` commits them (legacy: all of them; VMM: the
     /// first chunk's mapped pages, the rest being virtual until forwards
     /// map it), then the selection and wide-hidden carry, twice with their
-    /// snapshot backups.
+    /// snapshot backups, and the one target boundary-hidden row.
     pub(crate) fn device_bytes(
         config: &Qwen4Config,
         context: &Qwen4ContextCommit,
     ) -> Option<usize> {
+        let row = config
+            .hc_count
+            .checked_mul(config.hidden_size)?
+            .checked_mul(std::mem::size_of::<f32>())?;
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
             .checked_add(std::mem::size_of::<i32>())?
-            .checked_add(
-                config
-                    .hc_count
-                    .checked_mul(config.hidden_size)?
-                    .checked_mul(std::mem::size_of::<f32>())?,
-            )?;
+            .checked_add(row)?;
         context
             .committed_layer_bytes(config, QsaKvFormat::F32)?
-            .checked_add(carry.checked_mul(2)?)
+            .checked_add(carry.checked_mul(2)?)?
+            .checked_add(row)
+    }
+
+    /// [`Self::device_bytes`] per allocation of [`Self::new_with_backend`]
+    /// and [`MtpGpuStateSnapshotArena::new`], in that order: the four context
+    /// arenas as `context` commits them (legacy: whole; VMM: each arena's
+    /// mapped pages, pooled keys by `ceil(tokens / compress)` rows), the
+    /// selection, its length word and the wide hidden carry, the target
+    /// boundary-hidden row, then the snapshot backups of the selection, the
+    /// length word and the wide hidden. Zero-byte entries are omitted.
+    pub(crate) fn allocation_sizes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+    ) -> Option<Vec<u64>> {
+        let compress = config.indexer_compress_ratio;
+        if compress == 0 {
+            return None;
+        }
+        let f32_bytes = std::mem::size_of::<f32>();
+        let row = config
+            .hc_count
+            .checked_mul(config.hidden_size)?
+            .checked_mul(f32_bytes)?;
+        let selected = config
+            .qsa_selected_capacity()
+            .checked_mul(std::mem::size_of::<i32>())?;
+        let length = std::mem::size_of::<i32>();
+        let kv_row = QsaKvFormat::F32.kv_row_bytes(config.num_key_value_heads, config.head_dim);
+        let index_row = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)?
+            .checked_mul(QsaKvFormat::F32.index_dtype().size())?;
+        let pooled_rows = context.max_seq.div_ceil(compress);
+        let pooled_tokens = context.tokens.div_ceil(compress);
+        let arena = |row_bytes: usize, rows: usize, tokens: usize| -> Option<usize> {
+            match context.backend {
+                Qwen4KvBackend::Legacy => row_bytes.checked_mul(rows),
+                Qwen4KvBackend::Vmm => crate::state::vmm_context_arena_mapped_bytes(
+                    row_bytes,
+                    rows,
+                    tokens,
+                    context.granularity,
+                ),
+            }
+        };
+        let sizes = [
+            arena(kv_row, context.max_seq, context.tokens)?,
+            arena(kv_row, context.max_seq, context.tokens)?,
+            arena(index_row, context.max_seq, context.tokens)?,
+            arena(index_row, pooled_rows, pooled_tokens)?,
+            selected,
+            length,
+            row,
+            row,
+            selected,
+            length,
+            row,
+        ];
+        sizes
+            .into_iter()
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| u64::try_from(bytes).ok())
+            .collect()
     }
     /// Legacy full-capacity state; see [`Self::new_with_backend`].
     pub(crate) fn new(
@@ -1236,6 +1352,7 @@ impl MtpGpuState {
             ),
             (std::mem::size_of::<i32>(), DType::Raw, false),
             (config.hc_count * config.hidden_size, DType::F32, false),
+            (config.hc_count * config.hidden_size, DType::F32, false),
         ];
         let mut allocated = Vec::with_capacity(shapes.len());
         for (elements, dtype, context) in shapes {
@@ -1262,7 +1379,8 @@ impl MtpGpuState {
         let mut next = || tensors.next().expect("one tensor per MTP state shape");
         let (full_keys, full_values, raw_index_keys, pooled_keys) =
             (next(), next(), next(), next());
-        let (selected_indices, selected_len_out, wide_hidden) = (next(), next(), next());
+        let (selected_indices, selected_len_out, wide_hidden, boundary_hidden) =
+            (next(), next(), next(), next());
         let model_id = next_mtp_model_id();
         let snapshot_arena = match MtpGpuStateSnapshotArena::new(
             gpu,
@@ -1289,6 +1407,7 @@ impl MtpGpuState {
                     selected_indices,
                     selected_len_out,
                     wide_hidden,
+                    boundary_hidden,
                 ] {
                     let _ = gpu.free_tensor(tensor);
                 }
@@ -1303,6 +1422,7 @@ impl MtpGpuState {
             selected_indices,
             selected_len_out,
             wide_hidden,
+            boundary_hidden,
             full_capacity: max_seq,
             raw_capacity: max_seq,
             pooled_capacity,
@@ -1323,6 +1443,8 @@ impl MtpGpuState {
             generation: 0,
             model_id,
             snapshot_arena,
+            boundary_saved: None,
+            boundary_restored: None,
         })
     }
 
@@ -1365,6 +1487,12 @@ impl MtpGpuState {
         self.mapped_tokens = self.mapped_token_coverage(gpu)?;
         debug_assert!(self.mapped_tokens >= required_tokens);
         Ok(())
+    }
+
+    /// Admitted token capacity of the context arenas (the bound
+    /// [`Self::ensure_mapped_capacity`] refuses above).
+    pub(crate) fn context_capacity(&self) -> usize {
+        self.full_capacity
     }
 
     /// Tokens every context arena's mapped prefix covers.
@@ -1418,8 +1546,26 @@ impl MtpGpuState {
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, true)
+    }
+
+    /// Cold reset of a side request: as [`Self::reset`] except the
+    /// append-only row streams (full K/V, raw index keys, pooled keys) keep
+    /// their bytes.
+    pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, false)
+    }
+
+    /// Per-stream row ends of a side request writing tokens `[0, through)`,
+    /// in [`Self::session_layout`] stream order: full keys, full values, raw
+    /// index keys, pooled keys.
+    pub(crate) fn side_request_rows(&self, through: usize) -> Vec<usize> {
+        vec![through, through, through, through.div_ceil(self.compress)]
+    }
+
+    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
-        for tensor in [
+        for (index, tensor) in [
             &self.full_keys,
             &self.full_values,
             &self.raw_index_keys,
@@ -1427,7 +1573,15 @@ impl MtpGpuState {
             &self.selected_indices,
             &self.selected_len_out,
             &self.wide_hidden,
-        ] {
+            &self.boundary_hidden,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // The first four are the append-only row streams.
+            if !clear_rows && index < 4 {
+                continue;
+            }
             // An unmapped VMM arena has an empty accessible prefix.
             if tensor.buf.size() > 0 {
                 gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
@@ -1439,6 +1593,8 @@ impl MtpGpuState {
         self.pooled_len = 0;
         self.selected_len = 0;
         self.step_index = 0;
+        self.boundary_saved = None;
+        self.boundary_restored = None;
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
         Ok(())
@@ -1446,10 +1602,13 @@ impl MtpGpuState {
 
     /// A snapshot ticket of this state's arena is outstanding.
     pub(crate) fn snapshot_active(&self) -> bool {
-        self.snapshot_arena.active
+        self.snapshot_arena.active && !self.snapshot_arena.retained
     }
 
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
+        // A retained entry belongs to a window already committed: the next
+        // snapshot supersedes it (its tickets stop validating).
+        self.release_retained();
         let dimensions = MtpGpuStateSnapshotArena::dimensions(self);
         let mark = self.mark();
         {
@@ -1599,6 +1758,24 @@ impl MtpGpuState {
         );
         self.snapshot_arena.invalidate();
     }
+
+    /// Keep a validated ticket's arena entry active after a committed
+    /// window so a terminal stop inside it can still restore the head. The
+    /// next [`Self::snapshot`], any reset or a session restore drops it.
+    pub(crate) fn retain_validated(&mut self, _snapshot: MtpGpuStateSnapshot) {
+        debug_assert!(
+            self.snapshot_arena.active,
+            "MTP retain_validated requires an active snapshot"
+        );
+        self.snapshot_arena.retained = true;
+    }
+
+    /// Drop the retained arena entry, if any (a no-op otherwise).
+    pub(crate) fn release_retained(&mut self) {
+        if self.snapshot_arena.retained {
+            self.snapshot_arena.invalidate();
+        }
+    }
     #[cfg(test)]
     fn commit(&mut self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
         self.validate_commit(snapshot)?;
@@ -1636,13 +1813,15 @@ impl MtpGpuState {
     }
 
     /// Layout of the state at `mark`: full K/V, raw and pooled rows below it,
-    /// then selection, device selected length and wide hidden.
+    /// then selection, device selected length, wide hidden and the target
+    /// boundary hidden.
     fn session_layout(&self, mark: &MtpStateMark) -> StateLayout<'_> {
         StateLayout {
             fixed: vec![
                 whole_part(&self.selected_indices),
                 whole_part(&self.selected_len_out),
                 whole_part(&self.wide_hidden),
+                whole_part(&self.boundary_hidden),
             ],
             rows: [
                 (&self.full_keys, self.full_capacity, mark.full_len),
@@ -1661,7 +1840,11 @@ impl MtpGpuState {
     }
 
     /// Session-cache capture: `MTP_SESSION_WORDS` metadata words and the
-    /// device ranges of the live state.
+    /// device ranges of the live state. Word 0 is the boundary row's
+    /// position plus one when [`Self::save_boundary_hidden`] saved it for
+    /// exactly this position, else 0 (the row is then stale). A capture
+    /// without the row is allowed (digest contexts read it only), but such a
+    /// snapshot is refused by every restore ([`Self::parse_session_mark`]).
     fn session_parts(&self) -> Result<(Vec<u64>, StateLayout<'_>), MtpGpuError> {
         let mark = self.mark();
         validate_mtp_mark(&mark, self)?;
@@ -1674,8 +1857,9 @@ impl MtpGpuState {
             mark.step_index,
         ]
         .map(|value| value as u64);
+        let boundary = boundary_word(self.boundary_saved, mark.position);
         Ok((
-            [0].into_iter().chain(words).collect(),
+            [boundary].into_iter().chain(words).collect(),
             self.session_layout(&mark),
         ))
     }
@@ -1693,6 +1877,15 @@ impl MtpGpuState {
             step_index: words[6] as usize,
         };
         validate_mtp_mark(&mark, self)?;
+        // Word 0 is the boundary row's position plus one: a snapshot whose
+        // row was not saved for its own position cannot be restored (the
+        // row would be stale), so the cache entry is refused.
+        if !boundary_word_names(words[0], mark.position) {
+            return Err(invalid(format!(
+                "MTP session snapshot at {} holds no boundary hidden for its position",
+                mark.position
+            )));
+        }
         Ok(mark)
     }
 
@@ -1715,6 +1908,9 @@ impl MtpGpuState {
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
+        // The boundary row is overwritten by the copy this layout drives.
+        self.boundary_saved = None;
+        self.boundary_restored = None;
         Ok(self.session_layout(&mark))
     }
 
@@ -1726,29 +1922,96 @@ impl MtpGpuState {
         self.selected_len = mark.selected_len;
         self.position = mark.position;
         self.step_index = mark.step_index;
+        // `parse_session_mark` proved word 0 names this position: the row the
+        // restore just copied in is the boundary hidden for it.
+        self.boundary_saved = Some(mark.position);
+        self.boundary_restored = Some(mark.position);
+        Ok(())
+    }
+
+    /// Keep the target's boundary hidden for the position the head is at: the
+    /// target hidden of row `position - 1`, which the caller holds in
+    /// `pending` right after a prompt chunk's append and before the session
+    /// capture at this boundary. Written into the head's own row so the
+    /// capture carries it; a live `pending` is only read, never changed.
+    pub(crate) fn save_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), MtpGpuError> {
+        self.boundary_row_matches(pending)?;
+        self.boundary_saved = None;
+        gpu.copy_d2d(
+            pending,
+            &self.boundary_hidden,
+            self.boundary_hidden.byte_size(),
+        )?;
+        self.boundary_saved = Some(self.position);
+        Ok(())
+    }
+
+    /// After an actual session restore (never a live continuation, which
+    /// leaves `pending` as the live hidden), copy the restored boundary row
+    /// into `pending` and report `true` (a restore refuses any snapshot
+    /// without a boundary row for its position, so a restored head always
+    /// holds one). `false`: no restore since, or the row was already taken;
+    /// `pending` is then untouched.
+    pub(crate) fn restore_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<bool, MtpGpuError> {
+        if self.boundary_restored != Some(self.position) {
+            return Ok(false);
+        }
+        self.boundary_row_matches(pending)?;
+        gpu.copy_d2d(
+            &self.boundary_hidden,
+            pending,
+            self.boundary_hidden.byte_size(),
+        )?;
+        self.boundary_restored = None;
+        Ok(true)
+    }
+
+    fn boundary_row_matches(&self, pending: &GpuTensor) -> Result<(), MtpGpuError> {
+        if pending.dtype != DType::F32 || pending.numel() != self.boundary_hidden.numel() {
+            return Err(invalid(format!(
+                "MTP boundary hidden needs one F32 row of {} elements",
+                self.boundary_hidden.numel()
+            )));
+        }
         Ok(())
     }
 
     /// Context-arena bytes still unmapped below `through` tokens (at most
-    /// capacity; 0 for legacy).
+    /// capacity; 0 for legacy), row-exact per arena like the target's
+    /// ([`crate::state::context_arena_bytes_through`]).
     fn context_growth_bytes(&self, through: usize) -> u64 {
         if self.backend == Qwen4KvBackend::Legacy || self.full_capacity == 0 {
             return 0;
         }
-        let capacity: u64 = [
-            &self.full_keys,
-            &self.full_values,
-            &self.raw_index_keys,
-            &self.pooled_keys,
+        let through = through.min(self.full_capacity);
+        [
+            (&self.full_keys, self.full_capacity, 1),
+            (&self.full_values, self.full_capacity, 1),
+            (&self.raw_index_keys, self.raw_capacity, 1),
+            (&self.pooled_keys, self.pooled_capacity, self.compress),
         ]
-        .iter()
-        .map(|tensor| tensor.byte_size() as u64)
-        .sum();
-        capacity
-            * through
-                .min(self.full_capacity)
-                .saturating_sub(self.mapped_tokens) as u64
-            / self.full_capacity as u64
+        .into_iter()
+        .map(|(tensor, capacity, tokens_per_row)| {
+            let bytes = |tokens| {
+                crate::state::context_arena_bytes_through(
+                    tensor,
+                    capacity,
+                    tokens_per_row,
+                    false,
+                    tokens,
+                )
+            };
+            bytes(through).saturating_sub(bytes(self.mapped_tokens))
+        })
+        .sum()
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
@@ -1760,6 +2023,7 @@ impl MtpGpuState {
             selected_indices,
             selected_len_out,
             wide_hidden,
+            boundary_hidden,
             snapshot_arena,
             ..
         } = self;
@@ -1772,6 +2036,7 @@ impl MtpGpuState {
             selected_indices,
             selected_len_out,
             wide_hidden,
+            boundary_hidden,
         ] {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
@@ -1898,8 +2163,6 @@ const DRAFT_FULL_HOLD: u32 = 64;
 pub(crate) enum MtpStep {
     /// The full step and its argmax draft token.
     Predict,
-    /// The full step: its head state feeds a following step without hidden.
-    Advance,
     /// Only this position's K/V and index-key cache rows. For the last step
     /// of a chain: the next step brings its own backbone hidden and reselects
     /// (the head state and selection are left stale; a reuse is refused).
@@ -1909,7 +2172,7 @@ pub(crate) enum MtpStep {
 /// The FFN call of one non-Append MTP step, in the profile's FFN kind.
 enum MtpFfnCall<'a> {
     Moe(hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>),
-    Dense(DenseFfnOp<'a>),
+    Dense(GatedMlpOp<'a>),
 }
 
 /// Draft ranking policy (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`) and row
@@ -2015,6 +2278,32 @@ impl Qwen4MtpGpu {
         Some((resident, scratch))
     }
 
+    /// [`Self::device_bytes`] per allocation: `(resident, load scratch)`, one
+    /// entry per device allocation [`Self::new_with_backend`] makes and keeps
+    /// (operator scratch, QSA state with its snapshot mirrors, the MoE
+    /// pointer tables, the draft head), and the draft head's build scratch
+    /// released before construction returns. Each side sums to the matching
+    /// `device_bytes` figure; `None` on overflow.
+    pub(crate) fn allocation_sizes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+        head_dtype: DType,
+    ) -> Option<(Vec<u64>, Vec<u64>)> {
+        let (policy, layout) = draft_head_config(config);
+        let (draft, draft_scratch) = DraftHead::allocation_sizes(head_dtype, layout, policy)?;
+        let widen = |sizes: Vec<usize>| -> Option<Vec<u64>> {
+            sizes
+                .into_iter()
+                .map(|bytes| u64::try_from(bytes).ok())
+                .collect()
+        };
+        let mut resident = MtpGpuScratch::allocation_sizes(config)?;
+        resident.extend(MtpGpuState::allocation_sizes(config, context)?);
+        resident.extend(Qwen4MoeLayerRuntime::allocation_sizes(config)?);
+        resident.extend(widen(draft)?);
+        Some((resident, widen(draft_scratch)?))
+    }
+
     /// MTP head whose QSA context arenas are `backend` storage (admission
     /// resolves it); see [`MtpGpuState::new_with_backend`]. Under expert
     /// parallelism `ep` is the rank's binding from its attached forward (the
@@ -2047,6 +2336,18 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
+        // The MTP head is never an expert-tier layer: its experts are the
+        // separately loaded `mtp.` tensors (host-mapped by name), and its
+        // runtime label 0 must never resolve trunk layer 0's tier view.
+        // Tiers are single-device only, so an EP head cannot coexist with a
+        // tier lease at all.
+        if ep.is_some() && weights.expert_tiers().is_some() {
+            let _ = state.free_gpu(gpu);
+            let _ = scratch.free_gpu(gpu);
+            return Err(invalid(
+                "expert tiers are single-device: an EP MTP head cannot attach to tiered weights",
+            ));
+        }
         let moe = match head.ffn.moe() {
             Some(moe_weights) => {
                 let built = match ep {
@@ -2059,9 +2360,23 @@ impl Qwen4MtpGpu {
                         placement,
                         dummy,
                     ),
-                    None => Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config),
+                    None => Qwen4MoeLayerRuntime::from_moe_untiered(
+                        gpu,
+                        weights,
+                        moe_weights,
+                        0,
+                        config,
+                    ),
                 };
                 match built {
+                    Ok(moe) if moe.tier_lease().is_some() => {
+                        let _ = moe.free_gpu(gpu);
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(invalid(
+                            "the MTP head's MoE runtime must be untiered (its experts are the `mtp.` tensors)",
+                        ));
+                    }
                     Ok(moe) => Some(moe),
                     Err(error) => {
                         let _ = state.free_gpu(gpu);
@@ -2148,6 +2463,18 @@ impl Qwen4MtpGpu {
         self.state.reset(gpu)
     }
 
+    /// Side-request cold reset: fresh draft policy as [`Self::reset`], rows
+    /// of the append-only streams untouched.
+    pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.draft.reset_request_state();
+        self.state.reset_for_side(gpu)
+    }
+
+    /// See [`MtpGpuState::side_request_rows`].
+    pub(crate) fn side_request_rows(&self, through: usize) -> Vec<usize> {
+        self.state.side_request_rows(through)
+    }
+
     /// See [`MtpGpuState::ensure_mapped_capacity`].
     pub(crate) fn ensure_mapped_capacity(
         &mut self,
@@ -2155,6 +2482,11 @@ impl Qwen4MtpGpu {
         required_tokens: usize,
     ) -> Result<(), MtpGpuError> {
         self.state.ensure_mapped_capacity(gpu, required_tokens)
+    }
+
+    /// Admitted token capacity of the head's context arenas.
+    pub(crate) fn context_capacity(&self) -> usize {
+        self.state.context_capacity()
     }
 
     /// See [`MtpGpuState::mapped_context_bytes`].
@@ -2180,6 +2512,16 @@ impl Qwen4MtpGpu {
         meta_words(meta)
             .filter(|words| words.len() == MTP_SESSION_WORDS + 2)
             .ok_or_else(|| invalid("MTP session snapshot shape mismatch"))
+    }
+
+    /// Validate a snapshot's head metadata (shape, mark, boundary row)
+    /// without touching any state: a restore is refused here before any owner
+    /// mutates.
+    pub(crate) fn check_session_restore(&self, meta: &[u8]) -> Result<(), MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .parse_session_mark(&words[..MTP_SESSION_WORDS])
+            .map(|_| ())
     }
 
     pub(crate) fn prepare_session_restore(
@@ -2210,6 +2552,24 @@ impl Qwen4MtpGpu {
     /// See [`MtpGpuState::context_growth_bytes`].
     pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
         self.state.context_growth_bytes(through)
+    }
+
+    /// See [`MtpGpuState::save_boundary_hidden`].
+    pub(crate) fn save_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), MtpGpuError> {
+        self.state.save_boundary_hidden(gpu, pending)
+    }
+
+    /// See [`MtpGpuState::restore_boundary_hidden`].
+    pub(crate) fn restore_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<bool, MtpGpuError> {
+        self.state.restore_boundary_hidden(gpu, pending)
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)
@@ -2245,6 +2605,10 @@ impl Qwen4MtpGpu {
 
     pub(crate) fn commit_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
         self.state.commit_validated(snapshot);
+    }
+
+    pub(crate) fn retain_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
+        self.state.retain_validated(snapshot);
     }
 
     pub(crate) fn position(&self) -> usize {
@@ -2484,6 +2848,7 @@ impl Qwen4MtpGpu {
                     pooled_keys: &state.pooled_keys,
                     selected_indices: &state.selected_indices,
                     f16_arena: None,
+                    pooled_bf16: None,
                     full_capacity: state.full_capacity,
                     raw_capacity: state.raw_capacity,
                     pooled_capacity: state.pooled_capacity,
@@ -2582,21 +2947,27 @@ impl Qwen4MtpGpu {
                     }
                     (Qwen4FfnWeights::Dense(dense), None) => {
                         let gate = dense_ref(weights, &dense.gate)?;
-                        MtpFfnCall::Dense(DenseFfnOp {
-                            recipe: DenseFfnRecipe::SiluBf16Source,
+                        MtpFfnCall::Dense(GatedMlpOp {
+                            rows: 1,
+                            hidden,
                             intermediate: gate.m,
+                            x: &scratch.hc_mixed,
+                            pre_norm: None,
                             gate,
                             up: dense_ref(weights, &dense.up)?,
                             down: dense_ref(weights, &dense.down)?,
-                            input: &scratch.hc_mixed,
+                            activation: Activation::Silu,
+                            storage: MlpStorage::Bf16Source,
+                            output: MlpOutput::Write(&scratch.ffn_output),
+                            ladder: MlpLadder::Trunk,
                             // The MoE batch scratch, sized to the dense
                             // intermediate for a dense profile.
-                            gate_scratch: &scratch.moe_gate_batch,
-                            up_scratch: &scratch.moe_up_batch,
-                            output: &scratch.ffn_output,
-                            rotation: &scratch.rotation,
-                            rows: 1,
-                            hidden,
+                            scratch: GatedMlpScratch {
+                                gate: &scratch.moe_gate_batch,
+                                up: &scratch.moe_up_batch,
+                                act: &scratch.moe_gate_batch,
+                                x_rot: &scratch.rotation,
+                            },
                         })
                     }
                     _ => return Err(invalid("MTP FFN weights and runtime disagree")),
@@ -2667,7 +3038,7 @@ impl Qwen4MtpGpu {
                         }));
                         steps.push(Step::Moe(moe));
                     }
-                    MtpFfnCall::Dense(dense) => steps.push(Step::DenseFfn(dense)),
+                    MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
                 }
                 steps.push(Step::HyperWrite(hc_write(
                     &mlp.write,
@@ -2702,8 +3073,10 @@ impl Qwen4MtpGpu {
     }
 
     /// [`MtpStep::Append`] for `tokens.len()` consecutive prompt rows starting
-    /// at `position`, row `i` paired with `hidden` row `i` (the per-row loop's
-    /// (token p, hidden p) pairing). Runs the per-row `forward_token` Append
+    /// at `position`, row `i` paired with `hidden` row `i` (the caller supplies
+    /// the pairing: the token at position `p` pairs with the target hidden of
+    /// position `p - 1`, prompt position 0 with its own hidden, as the per-row
+    /// loop does). Runs the per-row `forward_token` Append
     /// op sequence once over all rows, calling the rdna-compute entry points
     /// directly (never the `Step` dispatcher or `project_weight`, whose
     /// multi-row routes change the arithmetic): each op is the single-row
@@ -3208,6 +3581,165 @@ mod tests {
     use super::*;
     use crate::config::compact_test_config;
     use crate::state::Qwen4State;
+
+    fn sum(sizes: &[u64]) -> u64 {
+        sizes.iter().sum()
+    }
+
+    /// Operator and fill scratch inventories are their owners' own shape
+    /// tables: one entry per tensor, summing to the byte queries, with the
+    /// append scratch refusing overflow like its byte query.
+    #[test]
+    fn scratch_allocation_sizes_follow_the_shape_tables() {
+        let config = compact_test_config();
+        let sizes = MtpGpuScratch::allocation_sizes(&config).unwrap();
+        assert_eq!(sizes.len(), MTP_SCRATCH_TENSORS);
+        assert_eq!(
+            Some(sum(&sizes) as usize),
+            MtpGpuScratch::device_bytes(&config).ok()
+        );
+        for (rows, id_rows) in [(1usize, 1usize), (1, 1536), (256, 4096), (1024, 1536)] {
+            let sizes = MtpAppendScratch::allocation_sizes(&config, rows, id_rows).unwrap();
+            assert_eq!(sizes.len(), MTP_APPEND_TENSORS);
+            assert_eq!(
+                Some(sum(&sizes) as usize),
+                MtpAppendScratch::device_bytes(&config, rows, id_rows)
+            );
+        }
+        assert_eq!(
+            MtpAppendScratch::allocation_sizes(&config, usize::MAX, 1),
+            None
+        );
+        assert_eq!(
+            MtpAppendScratch::allocation_sizes(&config, 1, usize::MAX),
+            None
+        );
+        assert_eq!(MtpAppendScratch::device_bytes(&config, usize::MAX, 1), None);
+    }
+
+    /// The head state's inventory: four context arenas (legacy whole, VMM
+    /// mapped pages), the carries, and exactly one snapshot backup per
+    /// in-place carry; sums to `MtpGpuState::device_bytes`.
+    #[test]
+    fn state_allocation_sizes_charge_arenas_carries_and_backups_once() {
+        use hipfire_runtime::kv_backend::{
+            KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+        };
+        let config = compact_test_config();
+        let row = (config.hc_count * config.hidden_size * 4) as u64;
+        let selected = (config.qsa_selected_capacity() * 4) as u64;
+        let granularity = 2 << 20;
+        for context in [
+            Qwen4ContextCommit::legacy(1024),
+            Qwen4ContextCommit::legacy(262_144),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 8193, 1025, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, granularity),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 100, 8192, granularity),
+        ] {
+            let sizes = MtpGpuState::allocation_sizes(&config, &context).unwrap();
+            assert_eq!(
+                Some(sum(&sizes) as usize),
+                MtpGpuState::device_bytes(&config, &context),
+                "{context:?}"
+            );
+            // Carries and backups follow the four arenas.
+            assert_eq!(
+                sizes[4..],
+                [selected, 4, row, row, selected, 4, row],
+                "{context:?}"
+            );
+            // The arenas against the owner's plan per stride.
+            let mapped = |row_bytes: usize, rows: usize, tokens: usize| match context.backend {
+                Qwen4KvBackend::Legacy => (row_bytes * rows) as u64,
+                Qwen4KvBackend::Vmm => KvChunkPlan::new(
+                    row_bytes,
+                    rows,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    granularity,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .unwrap()
+                .mapped_bytes_for_tokens(tokens)
+                .unwrap() as u64,
+            };
+            let kv = config.num_key_value_heads * config.head_dim * 4;
+            let index = config.indexer_kv_heads * config.indexer_head_dim * 4;
+            let pooled = context.max_seq.div_ceil(config.indexer_compress_ratio);
+            let pooled_tokens = context.tokens.div_ceil(config.indexer_compress_ratio);
+            assert_eq!(
+                sizes[..4],
+                [
+                    mapped(kv, context.max_seq, context.tokens),
+                    mapped(kv, context.max_seq, context.tokens),
+                    mapped(index, context.max_seq, context.tokens),
+                    mapped(index, pooled, pooled_tokens),
+                ],
+                "{context:?}"
+            );
+        }
+        assert_eq!(
+            MtpGpuState::allocation_sizes(&config, &Qwen4ContextCommit::legacy(usize::MAX)),
+            None
+        );
+    }
+
+    /// Resident and build-scratch inventories of the whole head are the
+    /// operator scratch, state, MoE tables and draft head, and sum to
+    /// `Qwen4MtpGpu::device_bytes` for every head dtype and context commit.
+    #[test]
+    fn head_allocation_sizes_sum_to_the_head_device_bytes() {
+        let config = compact_test_config();
+        for context in [
+            Qwen4ContextCommit::legacy(4096),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, 2 << 20),
+        ] {
+            for head in [
+                DType::BF16,
+                DType::Q8_0,
+                DType::MQ6G256V2,
+                DType::MQ5G256V2,
+                DType::F32,
+            ] {
+                let (resident, scratch) =
+                    Qwen4MtpGpu::allocation_sizes(&config, &context, head).unwrap();
+                assert_eq!(
+                    Some((sum(&resident) as usize, sum(&scratch) as usize)),
+                    Qwen4MtpGpu::device_bytes(&config, &context, head),
+                    "{head:?} {context:?}"
+                );
+                let mut parts = MtpGpuScratch::allocation_sizes(&config).unwrap();
+                parts.extend(MtpGpuState::allocation_sizes(&config, &context).unwrap());
+                parts.extend(Qwen4MoeLayerRuntime::allocation_sizes(&config).unwrap());
+                assert_eq!(resident[..parts.len()], parts[..]);
+                assert!(resident.iter().chain(&scratch).all(|&bytes| bytes > 0));
+            }
+        }
+    }
+
+    /// A capture carries a restorable boundary row only when the row was saved
+    /// for exactly the captured position, at any position (a prefill chunk
+    /// boundary such as 8192, or a live-position park such as 17051).
+    #[test]
+    fn boundary_word_is_restorable_only_for_the_position_it_was_saved_at() {
+        for position in [1usize, 4096, 8192, 17051, 32767] {
+            let word = boundary_word(Some(position), position);
+            assert_eq!(word, position as u64 + 1);
+            assert!(boundary_word_names(word, position));
+            // Never saved: the capture is refused at restore.
+            let unsaved = boundary_word(None, position);
+            assert_eq!(unsaved, 0);
+            assert!(!boundary_word_names(unsaved, position));
+            // Saved for another position: stale, refused.
+            for other in [0usize, position - 1, position + 1, 2 * position] {
+                let stale = boundary_word(Some(other), position);
+                assert_eq!(stale, 0, "saved {other}, captured {position}");
+                assert!(!boundary_word_names(stale, position));
+            }
+            // A word carrying another position never names this one.
+            assert!(!boundary_word_names(position as u64, position));
+            assert!(!boundary_word_names(position as u64 + 2, position));
+        }
+    }
 
     #[test]
     fn append_det_is_exact_gfx1151_only_and_zero_kills_it() {

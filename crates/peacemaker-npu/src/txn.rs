@@ -27,7 +27,14 @@ pub struct Txn {
 
 impl Txn {
     pub fn new(dev_gen: u8, rows: u8, cols: u8, mem_rows: u8) -> Txn {
-        Txn { dev_gen, rows, cols, mem_rows, ops: 0, words: Vec::new() }
+        Txn {
+            dev_gen,
+            rows,
+            cols,
+            mem_rows,
+            ops: 0,
+            words: Vec::new(),
+        }
     }
     /// Strix / Strix Halo NPU (npu2/npu4/npu5 class): 6 rows, 8 columns, 1 mem-tile row.
     pub fn aie2p_8col() -> Txn {
@@ -41,12 +48,18 @@ impl Txn {
     pub const MASKPOLL_VALUE_WORD: usize = 4;
 
     /// Number of op payload words appended so far (excludes the header).
-    pub fn word_len(&self) -> usize { self.words.len() }
+    pub fn word_len(&self) -> usize {
+        self.words.len()
+    }
     /// Number of ops appended so far.
-    pub fn op_count(&self) -> usize { self.ops as usize }
+    pub fn op_count(&self) -> usize {
+        self.ops as usize
+    }
     /// u32 index inside [`Txn::to_bytes`] of the first word of the NEXT op to be appended. Combined with
     /// [`Txn::WRITE32_VALUE_WORD`] / [`Txn::MASKPOLL_VALUE_WORD`] it names a value word a host may patch.
-    pub fn next_op_word(&self) -> usize { Self::HEADER_WORDS + self.words.len() }
+    pub fn next_op_word(&self) -> usize {
+        Self::HEADER_WORDS + self.words.len()
+    }
     /// Append every op of `other` (its header geometry is ignored; both streams must target the same device).
     pub fn append(&mut self, other: &Txn) -> &mut Self {
         self.words.extend_from_slice(&other.words);
@@ -61,7 +74,12 @@ impl Txn {
     }
 
     pub fn block_write(&mut self, addr: u32, col: u32, row: u32, data: &[u32]) -> &mut Self {
-        self.words.extend([1, (col & 0xff) | ((row & 0xff) << 8), addr, (16 + 4 * data.len()) as u32]);
+        self.words.extend([
+            1,
+            (col & 0xff) | ((row & 0xff) << 8),
+            addr,
+            (16 + 4 * data.len()) as u32,
+        ]);
         self.words.extend_from_slice(data);
         self.ops += 1;
         self
@@ -80,15 +98,41 @@ impl Txn {
     }
 
     /// Wait for the task-complete token of (col, row, dir: 0 = S2MM / 1 = MM2S, chan).
-    pub fn sync(&mut self, col: u32, row: u32, dir: u32, chan: u32, ncol: u32, nrow: u32) -> &mut Self {
-        self.words.extend([0x80, 16, (dir & 0xff) | ((row & 0xff) << 8) | ((col & 0xff) << 16), ((nrow & 0xff) << 8) | ((ncol & 0xff) << 16) | ((chan & 0xff) << 24)]);
+    pub fn sync(
+        &mut self,
+        col: u32,
+        row: u32,
+        dir: u32,
+        chan: u32,
+        ncol: u32,
+        nrow: u32,
+    ) -> &mut Self {
+        self.words.extend([
+            0x80,
+            16,
+            (dir & 0xff) | ((row & 0xff) << 8) | ((col & 0xff) << 16),
+            ((nrow & 0xff) << 8) | ((ncol & 0xff) << 16) | ((chan & 0xff) << 24),
+        ]);
         self.ops += 1;
         self
     }
 
     /// Patch `addr` (a shim BD address-low register) with buffer argument `arg_idx` + `plus`.
     pub fn ddr_patch(&mut self, addr: u32, arg_idx: u32, plus: u64) -> &mut Self {
-        self.words.extend([0x81, 48, 0, 0, 0, 0, addr, 0, arg_idx, 0, plus as u32, (plus >> 32) as u32]);
+        self.words.extend([
+            0x81,
+            48,
+            0,
+            0,
+            0,
+            0,
+            addr,
+            0,
+            arg_idx,
+            0,
+            plus as u32,
+            (plus >> 32) as u32,
+        ]);
         self.ops += 1;
         self
     }
@@ -96,7 +140,16 @@ impl Txn {
     pub fn to_bytes(&self) -> Vec<u8> {
         let size = 16 + 4 * self.words.len() as u32;
         let mut out = Vec::with_capacity(size as usize);
-        out.extend([0u8, 1, self.dev_gen, self.rows, self.cols, self.mem_rows, 0, 0]);
+        out.extend([
+            0u8,
+            1,
+            self.dev_gen,
+            self.rows,
+            self.cols,
+            self.mem_rows,
+            0,
+            0,
+        ]);
         out.extend(self.ops.to_le_bytes());
         out.extend(size.to_le_bytes());
         for w in &self.words {
@@ -113,9 +166,14 @@ mod tests {
     /// Rebuild the vendor add_one runtime sequence (mlir-aie npu2) op by op; must be byte-identical.
     #[test]
     fn reproduces_vendor_add_one_insts() {
-        let Some(corpus) = crate::vendor_corpus() else { return };
+        let Some(corpus) = crate::vendor_corpus() else {
+            return;
+        };
         let p = corpus.join("8309a7e39620419663f2aff6/insts.bin");
-        let Ok(orig) = std::fs::read(&p) else { eprintln!("skip: {} missing", p.display()); return };
+        let Ok(orig) = std::fs::read(&p) else {
+            eprintln!("skip: {} missing", p.display());
+            return;
+        };
         let bd = dma::shim_bd(4096, 0);
         let mut t = Txn::aie2p_8col();
         t.block_write(regs::shim::DMA_BD0, 0, 0, &bd)

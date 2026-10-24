@@ -56,7 +56,11 @@
 use super::gemm_i8::{ArgKind, ArgSpec};
 use crate::{
     cdo::Cdo,
-    dma::{Bd, Direction::{self, Mm2s, S2mm}, Location, ShimAxi, Task},
+    dma::{
+        Bd,
+        Direction::{self, Mm2s, S2mm},
+        Location, ShimAxi, Task,
+    },
     regs,
     route::{Circuit, Port, ShimDma},
     txn::Txn,
@@ -108,16 +112,29 @@ impl BwConfig {
     /// Geometry and raw register-fit checks only, for an explicitly opted-in hazardous probe.
     pub fn validate_for_hazardous_probe(&self) -> Result<(), String> {
         self.axi.validate()?;
-        if !(1..=8).contains(&self.cols) { return Err(format!("cols {} not in 1..=8", self.cols)); }
-        if self.read_ch > 2 || self.write_ch > 2 { return Err("read/write channels per column must be 0..=2".into()); }
-        if self.read_ch + self.write_ch == 0 { return Err("at least one of read/write channels must be > 0".into()); }
+        if !(1..=8).contains(&self.cols) {
+            return Err(format!("cols {} not in 1..=8", self.cols));
+        }
+        if self.read_ch > 2 || self.write_ch > 2 {
+            return Err("read/write channels per column must be 0..=2".into());
+        }
+        if self.read_ch + self.write_ch == 0 {
+            return Err("at least one of read/write channels must be > 0".into());
+        }
         if self.bytes == 0 || self.bytes % 4096 != 0 || self.bytes > MAX_BYTES {
-            return Err(format!("bytes {} must be a multiple of 4096 in 4096..={MAX_BYTES}", self.bytes));
+            return Err(format!(
+                "bytes {} must be a multiple of 4096 in 4096..={MAX_BYTES}",
+                self.bytes
+            ));
         }
         Ok(())
     }
-    pub fn read_total(&self) -> usize { self.cols * self.read_ch * self.bytes }
-    pub fn write_total(&self) -> usize { self.cols * self.write_ch * self.bytes }
+    pub fn read_total(&self) -> usize {
+        self.cols * self.read_ch * self.bytes
+    }
+    pub fn write_total(&self) -> usize {
+        self.cols * self.write_ch * self.bytes
+    }
 }
 
 /// Built probe image + command stream; no NPU access occurs here.
@@ -157,60 +174,120 @@ impl BwDesign {
     }
     /// The 16 KiB memtile pattern of `(col, ch)`.
     pub fn pattern(&self, col: usize, ch: usize) -> Vec<u8> {
-        (0..BUF_WORDS as usize).flat_map(|i| pattern_word(col as u32, ch as u32, i).to_le_bytes()).collect()
+        (0..BUF_WORDS as usize)
+            .flat_map(|i| pattern_word(col as u32, ch as u32, i).to_le_bytes())
+            .collect()
     }
     /// Compare the whole arg1 against the memtile pattern repeated in every segment.
     pub fn check_write(&self, buf: &[u8]) -> WriteCheck {
         assert_eq!(buf.len(), self.cfg.write_total(), "write buffer size");
-        let mut out = WriteCheck { bad_words: 0, first_bad: None };
-        for col in 0..self.cfg.cols { for ch in 0..self.cfg.write_ch {
-            let seg = self.write_segment(col, ch);
-            let pattern = self.pattern(col, ch);
-            for (n, chunk) in buf[seg.clone()].chunks(BUF_BYTES).enumerate() {
-                if chunk == &pattern[..chunk.len()] { continue; }
-                for (w, got) in chunk.chunks_exact(4).enumerate() {
-                    let got = u32::from_le_bytes(got.try_into().unwrap());
-                    let want = u32::from_le_bytes(pattern[w * 4..w * 4 + 4].try_into().unwrap());
-                    if got != want {
-                        out.bad_words += 1;
-                        out.first_bad.get_or_insert((seg.start + n * BUF_BYTES + w * 4, got, want));
+        let mut out = WriteCheck {
+            bad_words: 0,
+            first_bad: None,
+        };
+        for col in 0..self.cfg.cols {
+            for ch in 0..self.cfg.write_ch {
+                let seg = self.write_segment(col, ch);
+                let pattern = self.pattern(col, ch);
+                for (n, chunk) in buf[seg.clone()].chunks(BUF_BYTES).enumerate() {
+                    if chunk == &pattern[..chunk.len()] {
+                        continue;
+                    }
+                    for (w, got) in chunk.chunks_exact(4).enumerate() {
+                        let got = u32::from_le_bytes(got.try_into().unwrap());
+                        let want =
+                            u32::from_le_bytes(pattern[w * 4..w * 4 + 4].try_into().unwrap());
+                        if got != want {
+                            out.bad_words += 1;
+                            out.first_bad.get_or_insert((
+                                seg.start + n * BUF_BYTES + w * 4,
+                                got,
+                                want,
+                            ));
+                        }
                     }
                 }
             }
-        } }
+        }
         out
     }
 }
 
-fn shim_loc(col: u32) -> Location { Location::new(col, 0) }
-fn mem_loc(col: u32) -> Location { Location::new(col, 1) }
+fn shim_loc(col: u32) -> Location {
+    Location::new(col, 0)
+}
+fn mem_loc(col: u32) -> Location {
+    Location::new(col, 1)
+}
 
 /// Source (write lane) memtile channel and its BDs.
-fn write_chain_bd(ch: usize, i: usize) -> u32 { WRITE_BD0[ch] + i as u32 }
-fn write_rem_bd(ch: usize) -> u32 { WRITE_BD0[ch] + CHAIN as u32 }
-fn source_off(ch: usize) -> u32 { SOURCE_OFF + ch as u32 * LANE_STRIDE }
-fn sink_off(ch: usize) -> u32 { SINK_OFF + ch as u32 * LANE_STRIDE }
+fn write_chain_bd(ch: usize, i: usize) -> u32 {
+    WRITE_BD0[ch] + i as u32
+}
+fn write_rem_bd(ch: usize) -> u32 {
+    WRITE_BD0[ch] + CHAIN as u32
+}
+fn source_off(ch: usize) -> u32 {
+    SOURCE_OFF + ch as u32 * LANE_STRIDE
+}
+fn sink_off(ch: usize) -> u32 {
+    SINK_OFF + ch as u32 * LANE_STRIDE
+}
 
 fn circuits(cfg: BwConfig, col: u32) -> Vec<Circuit> {
     let (shim, mem) = (shim_loc(col), mem_loc(col));
     let mut v = Vec::new();
     for k in 0..cfg.read_ch as u8 {
-        let mm = ShimDma { tile: shim, direction: Mm2s, channel: k };
-        v.push(Circuit { tile: shim, slave: mm.port(), master: Port::North(k) });
-        v.push(Circuit { tile: mem, slave: Port::South(k), master: Port::Dma(READ_S2MM0 as u8 + k) });
+        let mm = ShimDma {
+            tile: shim,
+            direction: Mm2s,
+            channel: k,
+        };
+        v.push(Circuit {
+            tile: shim,
+            slave: mm.port(),
+            master: Port::North(k),
+        });
+        v.push(Circuit {
+            tile: mem,
+            slave: Port::South(k),
+            master: Port::Dma(READ_S2MM0 as u8 + k),
+        });
     }
     for k in 0..cfg.write_ch as u8 {
-        let sm = ShimDma { tile: shim, direction: S2mm, channel: k };
-        v.push(Circuit { tile: mem, slave: Port::Dma(k), master: Port::South(k) });
-        v.push(Circuit { tile: shim, slave: Port::North(k), master: sm.port() });
+        let sm = ShimDma {
+            tile: shim,
+            direction: S2mm,
+            channel: k,
+        };
+        v.push(Circuit {
+            tile: mem,
+            slave: Port::Dma(k),
+            master: Port::South(k),
+        });
+        v.push(Circuit {
+            tile: shim,
+            slave: Port::North(k),
+            master: sm.port(),
+        });
     }
     v
 }
 
 fn shim_routes(cfg: BwConfig, col: u32) -> Vec<ShimDma> {
     let shim = shim_loc(col);
-    (0..cfg.read_ch as u8).map(|k| ShimDma { tile: shim, direction: Mm2s, channel: k })
-        .chain((0..cfg.write_ch as u8).map(|k| ShimDma { tile: shim, direction: S2mm, channel: k })).collect()
+    (0..cfg.read_ch as u8)
+        .map(|k| ShimDma {
+            tile: shim,
+            direction: Mm2s,
+            channel: k,
+        })
+        .chain((0..cfg.write_ch as u8).map(|k| ShimDma {
+            tile: shim,
+            direction: S2mm,
+            channel: k,
+        }))
+        .collect()
 }
 
 /// Memtile BDs of a column: `(id, bd)`; independent of `bytes`.
@@ -224,7 +301,9 @@ fn memtile_descriptors(cfg: BwConfig) -> Vec<(u32, Bd)> {
     for k in 0..cfg.write_ch {
         for i in 0..CHAIN {
             let mut bd = Bd::new((MEM_BASE + source_off(k)) as u64, BUF_WORDS);
-            if i + 1 < CHAIN { bd.next = Some(write_chain_bd(k, i + 1)); }
+            if i + 1 < CHAIN {
+                bd.next = Some(write_chain_bd(k, i + 1));
+            }
             v.push((write_chain_bd(k, i), bd));
         }
     }
@@ -236,40 +315,73 @@ fn write_tasks(ch: usize, bytes: usize) -> Vec<(u32, u32)> {
     let (q, rem) = (bytes / BUF_BYTES, bytes % BUF_BYTES);
     let (repeat, tail) = (q / CHAIN, q % CHAIN);
     let mut t = Vec::new();
-    if repeat > 0 { t.push((write_chain_bd(ch, 0), repeat as u32)); }
+    if repeat > 0 {
+        t.push((write_chain_bd(ch, 0), repeat as u32));
+    }
     // The suffix of the chain ends at the last BD (no next), so it is a valid shorter chain.
-    if tail > 0 { t.push((write_chain_bd(ch, CHAIN - tail), 1)); }
-    if rem > 0 { t.push((write_rem_bd(ch), 1)); }
+    if tail > 0 {
+        t.push((write_chain_bd(ch, CHAIN - tail), 1));
+    }
+    if rem > 0 {
+        t.push((write_rem_bd(ch), 1));
+    }
     t
 }
 
 /// CTRL register of a channel (bit1 reset on memtile, bits 8..15 token controller id on shim).
 fn channel_ctrl(loc: Location, direction: Direction, channel: u32) -> u32 {
-    let bd = if loc.row == 1 && channel % 2 == 1 { 24 } else { 0 };
-    Task { direction, channel, bd, repeat: 1, issue_token: false }.write(loc).0 - 4
+    let bd = if loc.row == 1 && channel % 2 == 1 {
+        24
+    } else {
+        0
+    };
+    Task {
+        direction,
+        channel,
+        bd,
+        repeat: 1,
+        issue_token: false,
+    }
+    .write(loc)
+    .0 - 4
 }
 
 /// Memtile channels used by the probe `(direction, channel)`.
 fn memtile_channels(cfg: BwConfig) -> Vec<(Direction, u32)> {
-    (0..cfg.read_ch as u32).map(|k| (S2mm, READ_S2MM0 + k)).chain((0..cfg.write_ch as u32).map(|k| (Mm2s, k))).collect()
+    (0..cfg.read_ch as u32)
+        .map(|k| (S2mm, READ_S2MM0 + k))
+        .chain((0..cfg.write_ch as u32).map(|k| (Mm2s, k)))
+        .collect()
 }
 
 fn build_cdo(cfg: BwConfig) -> Cdo {
     let mut cdo = Cdo::new();
-    for col in 0..cfg.cols as u32 { emit_column_cdo(&mut cdo, cfg, col); }
+    for col in 0..cfg.cols as u32 {
+        emit_column_cdo(&mut cdo, cfg, col);
+    }
     cdo
 }
 
 /// Persistent state of one column; only `cfg.read_ch` / `cfg.write_ch` (the lanes of this column) are used.
 fn emit_column_cdo(cdo: &mut Cdo, cfg: BwConfig, col: u32) {
-    for (id, bd) in memtile_descriptors(cfg) { bd.emit_cdo(mem_loc(col), id, cdo); }
+    for (id, bd) in memtile_descriptors(cfg) {
+        bd.emit_cdo(mem_loc(col), id, cdo);
+    }
     for k in 0..cfg.write_ch {
-        let words: Vec<u32> = (0..BUF_WORDS as usize).map(|i| pattern_word(col, k as u32, i)).collect();
+        let words: Vec<u32> = (0..BUF_WORDS as usize)
+            .map(|i| pattern_word(col, k as u32, i))
+            .collect();
         cdo.dma_write(mem_loc(col).address(source_off(k)), &words);
     }
-    for c in circuits(cfg, col) { c.emit_cdo(cdo); }
-    for r in shim_routes(cfg, col) { r.emit_cdo(cdo); }
-    for (addr, value) in regs::shim_token_route(col) { cdo.write(addr, value); }
+    for c in circuits(cfg, col) {
+        c.emit_cdo(cdo);
+    }
+    for r in shim_routes(cfg, col) {
+        r.emit_cdo(cdo);
+    }
+    for (addr, value) in regs::shim_token_route(col) {
+        cdo.write(addr, value);
+    }
 }
 
 fn build_txn(cfg: BwConfig) -> Txn {
@@ -282,28 +394,59 @@ fn build_txn_for_probe(cfg: BwConfig, hazardous: bool) -> Txn {
     let rem_words = ((cfg.bytes % BUF_BYTES) / 4) as u32;
     // 1. reset used memtile channels, then release the reset.
     let chans: Vec<(Location, Direction, u32)> = (0..cfg.cols as u32)
-        .flat_map(|c| memtile_channels(cfg).into_iter().map(move |(d, ch)| (mem_loc(c), d, ch))).collect();
-    for &(loc, d, ch) in &chans { txn.mask_write(channel_ctrl(loc, d, ch), 2, 2); }
-    for &(loc, d, ch) in &chans { txn.mask_write(channel_ctrl(loc, d, ch), 0, 2); }
+        .flat_map(|c| {
+            memtile_channels(cfg)
+                .into_iter()
+                .map(move |(d, ch)| (mem_loc(c), d, ch))
+        })
+        .collect();
+    for &(loc, d, ch) in &chans {
+        txn.mask_write(channel_ctrl(loc, d, ch), 2, 2);
+    }
+    for &(loc, d, ch) in &chans {
+        txn.mask_write(channel_ctrl(loc, d, ch), 0, 2);
+    }
     // 2. tail BD, shim token ids, shim BDs + DDR patches.
     for col in 0..cfg.cols as u32 {
         if rem_words > 0 {
             for k in 0..cfg.write_ch {
-                Bd::new((MEM_BASE + source_off(k)) as u64, rem_words).emit_txn(mem_loc(col), write_rem_bd(k), &mut txn);
+                Bd::new((MEM_BASE + source_off(k)) as u64, rem_words).emit_txn(
+                    mem_loc(col),
+                    write_rem_bd(k),
+                    &mut txn,
+                );
             }
         }
         let shim = shim_loc(col);
         for k in 0..cfg.read_ch {
             txn.mask_write(channel_ctrl(shim, Mm2s, k as u32), 0xf00, 0x1f00);
             let id = SHIM_READ_BD + k as u32;
-            emit_shim_bd(Bd { axi: cfg.axi, ..Bd::new(0, words) }, shim, id, &mut txn, hazardous);
+            emit_shim_bd(
+                Bd {
+                    axi: cfg.axi,
+                    ..Bd::new(0, words)
+                },
+                shim,
+                id,
+                &mut txn,
+                hazardous,
+            );
             let off = ((col as usize * cfg.read_ch + k) * cfg.bytes) as u64;
             txn.ddr_patch(Bd::address(shim, id) + 4, READ_ARG, off);
         }
         for k in 0..cfg.write_ch {
             txn.mask_write(channel_ctrl(shim, S2mm, k as u32), 0xf00, 0x1f00);
             let id = SHIM_WRITE_BD + k as u32;
-            emit_shim_bd(Bd { axi: cfg.axi, ..Bd::new(0, words) }, shim, id, &mut txn, hazardous);
+            emit_shim_bd(
+                Bd {
+                    axi: cfg.axi,
+                    ..Bd::new(0, words)
+                },
+                shim,
+                id,
+                &mut txn,
+                hazardous,
+            );
             let off = ((col as usize * cfg.write_ch + k) * cfg.bytes) as u64;
             txn.ddr_patch(Bd::address(shim, id) + 4, WRITE_ARG, off);
         }
@@ -312,32 +455,69 @@ fn build_txn_for_probe(cfg: BwConfig, hazardous: bool) -> Txn {
     for col in 0..cfg.cols as u32 {
         let mem = mem_loc(col);
         for k in 0..cfg.read_ch {
-            Task { direction: S2mm, channel: READ_S2MM0 + k as u32, bd: SINK_BD[k], repeat: 1, issue_token: false }.emit_txn(mem, &mut txn);
+            Task {
+                direction: S2mm,
+                channel: READ_S2MM0 + k as u32,
+                bd: SINK_BD[k],
+                repeat: 1,
+                issue_token: false,
+            }
+            .emit_txn(mem, &mut txn);
         }
         for k in 0..cfg.write_ch {
             for (bd, repeat) in write_tasks(k, cfg.bytes) {
-                Task { direction: Mm2s, channel: k as u32, bd, repeat, issue_token: false }.emit_txn(mem, &mut txn);
+                Task {
+                    direction: Mm2s,
+                    channel: k as u32,
+                    bd,
+                    repeat,
+                    issue_token: false,
+                }
+                .emit_txn(mem, &mut txn);
             }
         }
     }
     for col in 0..cfg.cols as u32 {
         let shim = shim_loc(col);
         for k in 0..cfg.write_ch {
-            Task { direction: S2mm, channel: k as u32, bd: SHIM_WRITE_BD + k as u32, repeat: 1, issue_token: true }.emit_txn(shim, &mut txn);
+            Task {
+                direction: S2mm,
+                channel: k as u32,
+                bd: SHIM_WRITE_BD + k as u32,
+                repeat: 1,
+                issue_token: true,
+            }
+            .emit_txn(shim, &mut txn);
         }
         for k in 0..cfg.read_ch {
-            Task { direction: Mm2s, channel: k as u32, bd: SHIM_READ_BD + k as u32, repeat: 1, issue_token: true }.emit_txn(shim, &mut txn);
+            Task {
+                direction: Mm2s,
+                channel: k as u32,
+                bd: SHIM_READ_BD + k as u32,
+                repeat: 1,
+                issue_token: true,
+            }
+            .emit_txn(shim, &mut txn);
         }
     }
     // 4. one aggregate SYNC per active (direction, channel).
-    for k in 0..cfg.read_ch as u32 { txn.sync(0, 0, 1, k, cfg.cols as u32, 1); }
-    for k in 0..cfg.write_ch as u32 { txn.sync(0, 0, 0, k, cfg.cols as u32, 1); }
+    for k in 0..cfg.read_ch as u32 {
+        txn.sync(0, 0, 1, k, cfg.cols as u32, 1);
+    }
+    for k in 0..cfg.write_ch as u32 {
+        txn.sync(0, 0, 0, k, cfg.cols as u32, 1);
+    }
     txn
 }
 
 fn emit_shim_bd(bd: Bd, loc: Location, id: u32, txn: &mut Txn, hazardous: bool) {
     if hazardous {
-        txn.block_write(Bd::address(loc, id), loc.col, loc.row, &bd.shim_words_for_hazardous_probe());
+        txn.block_write(
+            Bd::address(loc, id),
+            loc.col,
+            loc.row,
+            &bd.shim_words_for_hazardous_probe(),
+        );
     } else {
         bd.emit_txn(loc, id, txn);
     }
@@ -345,14 +525,16 @@ fn emit_shim_bd(bd: Bd, loc: Location, id: u32, txn: &mut Txn, hazardous: bool) 
 
 /// Build the probe (see the module header). Panics on an invalid [`BwConfig`] (use [`BwConfig::validate`]).
 pub fn design(cfg: BwConfig) -> BwDesign {
-    cfg.validate().unwrap_or_else(|e| panic!("invalid bw_probe config: {e}"));
+    cfg.validate()
+        .unwrap_or_else(|e| panic!("invalid bw_probe config: {e}"));
     build_design(cfg, build_txn(cfg))
 }
 
 /// Build one explicitly opted-in hazardous probe. Non-vendor AXI attributes can wedge the platform.
 /// This is not a safety guarantee and must never be selected by an automatic/default experiment.
 pub fn design_for_hazardous_probe(cfg: BwConfig) -> BwDesign {
-    cfg.validate_for_hazardous_probe().unwrap_or_else(|e| panic!("invalid bw_probe config: {e}"));
+    cfg.validate_for_hazardous_probe()
+        .unwrap_or_else(|e| panic!("invalid bw_probe config: {e}"));
     build_design(cfg, build_txn_for_probe(cfg, true))
 }
 
@@ -361,8 +543,14 @@ fn build_design(cfg: BwConfig, txn: Txn) -> BwDesign {
         pdi: crate::pdi::build(&build_cdo(cfg).to_words()),
         insts: txn.to_bytes(),
         args: vec![
-            ArgSpec { bytes: cfg.read_total(), kind: ArgKind::In },
-            ArgSpec { bytes: cfg.write_total(), kind: ArgKind::Out },
+            ArgSpec {
+                bytes: cfg.read_total(),
+                kind: ArgKind::In,
+            },
+            ArgSpec {
+                bytes: cfg.write_total(),
+                kind: ArgKind::Out,
+            },
         ],
         cfg,
     }
@@ -402,7 +590,11 @@ const ACTIVE_CHANNELS: [usize; 6] = [0, 1, 2, 4, 8, 16];
 
 /// `(column, lane)` of active-channel index `index` (`index < 16`): column `index % 8`, lane `index / 8`.
 pub fn channel_location(index: usize) -> (usize, usize) {
-    assert!(index < 2 * COLUMNS, "channel index {index} must be < {}", 2 * COLUMNS);
+    assert!(
+        index < 2 * COLUMNS,
+        "channel index {index} must be < {}",
+        2 * COLUMNS
+    );
     (index % COLUMNS, index / COLUMNS)
 }
 
@@ -427,7 +619,10 @@ impl ConcurrencyConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.axi.validate_vendor_word5()?;
         self.axi.validate()?;
-        for (name, n) in [("read_channels", self.read_channels), ("write_channels", self.write_channels)] {
+        for (name, n) in [
+            ("read_channels", self.read_channels),
+            ("write_channels", self.write_channels),
+        ] {
             if !ACTIVE_CHANNELS.contains(&n) {
                 return Err(format!("{name} {n} must be one of {ACTIVE_CHANNELS:?}"));
             }
@@ -435,26 +630,44 @@ impl ConcurrencyConfig {
         if self.read_channels + self.write_channels == 0 {
             return Err("at least one of read_channels/write_channels must be > 0".into());
         }
-        if ![1, 2, 4].contains(&self.queued_tasks) || self.queued_tasks > CONCURRENCY_QUEUE_CAPACITY {
-            return Err(format!("queued_tasks {} must be 1, 2 or 4 (queue capacity {CONCURRENCY_QUEUE_CAPACITY})", self.queued_tasks));
+        if ![1, 2, 4].contains(&self.queued_tasks) || self.queued_tasks > CONCURRENCY_QUEUE_CAPACITY
+        {
+            return Err(format!(
+                "queued_tasks {} must be 1, 2 or 4 (queue capacity {CONCURRENCY_QUEUE_CAPACITY})",
+                self.queued_tasks
+            ));
         }
-        if !self.bd_bytes.is_power_of_two() || !(CONCURRENCY_MIN_BD_BYTES..=CONCURRENCY_MAX_BD_BYTES).contains(&self.bd_bytes) {
+        if !self.bd_bytes.is_power_of_two()
+            || !(CONCURRENCY_MIN_BD_BYTES..=CONCURRENCY_MAX_BD_BYTES).contains(&self.bd_bytes)
+        {
             return Err(format!(
                 "bd_bytes {} must be a power of two in {CONCURRENCY_MIN_BD_BYTES}..={CONCURRENCY_MAX_BD_BYTES}", self.bd_bytes));
         }
         // Q <= queue capacity and 2 directions x 2 lanes x capacity == CONCURRENCY_SHIM_BDS (const-asserted above).
         Ok(())
     }
-    pub fn read_total(&self) -> usize { self.read_channels * self.queued_tasks * self.bd_bytes }
-    pub fn write_total(&self) -> usize { self.write_channels * self.queued_tasks * self.bd_bytes }
+    pub fn read_total(&self) -> usize {
+        self.read_channels * self.queued_tasks * self.bd_bytes
+    }
+    pub fn write_total(&self) -> usize {
+        self.write_channels * self.queued_tasks * self.bd_bytes
+    }
     /// `(column, lane)` of active-channel `index`; same as the free [`channel_location`].
-    pub fn channel_location(&self, index: usize) -> (usize, usize) { channel_location(index) }
+    pub fn channel_location(&self, index: usize) -> (usize, usize) {
+        channel_location(index)
+    }
     /// Columns with at least one active channel: `0..active_columns()`.
-    fn active_columns(&self) -> usize { self.read_channels.max(self.write_channels).min(COLUMNS) }
+    fn active_columns(&self) -> usize {
+        self.read_channels.max(self.write_channels).min(COLUMNS)
+    }
     /// Lane counts of one column as a [`BwConfig`] so the established per-column helpers apply; `bytes` is the
     /// whole per-channel stream (`Q * bd_bytes`).
     fn column(&self, col: usize) -> BwConfig {
-        let lanes = |total| (0..2).filter(|&lane| col < lane_columns(total, lane)).count();
+        let lanes = |total| {
+            (0..2)
+                .filter(|&lane| col < lane_columns(total, lane))
+                .count()
+        };
         BwConfig {
             cols: 1,
             read_ch: lanes(self.read_channels),
@@ -492,7 +705,10 @@ impl ConcurrencyDesign {
     pub fn check_write(&self, buf: &[u8]) -> WriteCheck {
         assert_eq!(buf.len(), self.cfg.write_total(), "write buffer size");
         let task_words = self.cfg.bd_bytes / 4;
-        let mut out = WriteCheck { bad_words: 0, first_bad: None };
+        let mut out = WriteCheck {
+            bad_words: 0,
+            first_bad: None,
+        };
         for index in 0..self.cfg.write_channels {
             let (col, lane) = channel_location(index);
             for task in 0..self.cfg.queued_tasks {
@@ -512,13 +728,19 @@ impl ConcurrencyDesign {
 }
 
 /// Shim BD id of read `(lane, task)`: lane 0 `0..4`, lane 1 `4..8`.
-fn concurrency_read_bd(lane: usize, task: usize) -> u32 { (lane * CONCURRENCY_QUEUE_CAPACITY + task) as u32 }
+fn concurrency_read_bd(lane: usize, task: usize) -> u32 {
+    (lane * CONCURRENCY_QUEUE_CAPACITY + task) as u32
+}
 /// Shim BD id of write `(lane, task)`: lane 0 `8..12`, lane 1 `12..16`.
-fn concurrency_write_bd(lane: usize, task: usize) -> u32 { (2 * CONCURRENCY_QUEUE_CAPACITY + lane * CONCURRENCY_QUEUE_CAPACITY + task) as u32 }
+fn concurrency_write_bd(lane: usize, task: usize) -> u32 {
+    (2 * CONCURRENCY_QUEUE_CAPACITY + lane * CONCURRENCY_QUEUE_CAPACITY + task) as u32
+}
 
 fn build_concurrency_cdo(cfg: ConcurrencyConfig) -> Cdo {
     let mut cdo = Cdo::new();
-    for col in 0..cfg.active_columns() { emit_column_cdo(&mut cdo, cfg.column(col), col as u32); }
+    for col in 0..cfg.active_columns() {
+        emit_column_cdo(&mut cdo, cfg.column(col), col as u32);
+    }
     cdo
 }
 
@@ -527,17 +749,33 @@ fn build_concurrency_txn(cfg: ConcurrencyConfig) -> Txn {
     let words = (cfg.bd_bytes / 4) as u32;
     let total = cfg.queued_tasks * cfg.bd_bytes;
     let rem_words = ((total % BUF_BYTES) / 4) as u32;
-    let cols: Vec<(u32, BwConfig)> = (0..cfg.active_columns()).map(|c| (c as u32, cfg.column(c))).collect();
+    let cols: Vec<(u32, BwConfig)> = (0..cfg.active_columns())
+        .map(|c| (c as u32, cfg.column(c)))
+        .collect();
     // 1. reset used memtile channels, then release the reset.
-    let chans: Vec<(Location, Direction, u32)> = cols.iter()
-        .flat_map(|&(c, lanes)| memtile_channels(lanes).into_iter().map(move |(d, ch)| (mem_loc(c), d, ch))).collect();
-    for &(loc, d, ch) in &chans { txn.mask_write(channel_ctrl(loc, d, ch), 2, 2); }
-    for &(loc, d, ch) in &chans { txn.mask_write(channel_ctrl(loc, d, ch), 0, 2); }
+    let chans: Vec<(Location, Direction, u32)> = cols
+        .iter()
+        .flat_map(|&(c, lanes)| {
+            memtile_channels(lanes)
+                .into_iter()
+                .map(move |(d, ch)| (mem_loc(c), d, ch))
+        })
+        .collect();
+    for &(loc, d, ch) in &chans {
+        txn.mask_write(channel_ctrl(loc, d, ch), 2, 2);
+    }
+    for &(loc, d, ch) in &chans {
+        txn.mask_write(channel_ctrl(loc, d, ch), 0, 2);
+    }
     // 2. tail BD, shim token ids, one distinct shim BD + DDR patch per (channel, task).
     for &(col, lanes) in &cols {
         if rem_words > 0 {
             for k in 0..lanes.write_ch {
-                Bd::new((MEM_BASE + source_off(k)) as u64, rem_words).emit_txn(mem_loc(col), write_rem_bd(k), &mut txn);
+                Bd::new((MEM_BASE + source_off(k)) as u64, rem_words).emit_txn(
+                    mem_loc(col),
+                    write_rem_bd(k),
+                    &mut txn,
+                );
             }
         }
         let shim = shim_loc(col);
@@ -546,7 +784,16 @@ fn build_concurrency_txn(cfg: ConcurrencyConfig) -> Txn {
             let index = col as usize + lane * COLUMNS;
             for task in 0..cfg.queued_tasks {
                 let id = concurrency_read_bd(lane, task);
-                emit_shim_bd(Bd { axi: cfg.axi, ..Bd::new(0, words) }, shim, id, &mut txn, false);
+                emit_shim_bd(
+                    Bd {
+                        axi: cfg.axi,
+                        ..Bd::new(0, words)
+                    },
+                    shim,
+                    id,
+                    &mut txn,
+                    false,
+                );
                 let off = ((index * cfg.queued_tasks + task) * cfg.bd_bytes) as u64;
                 txn.ddr_patch(Bd::address(shim, id) + 4, READ_ARG, off);
             }
@@ -556,7 +803,16 @@ fn build_concurrency_txn(cfg: ConcurrencyConfig) -> Txn {
             let index = col as usize + lane * COLUMNS;
             for task in 0..cfg.queued_tasks {
                 let id = concurrency_write_bd(lane, task);
-                emit_shim_bd(Bd { axi: cfg.axi, ..Bd::new(0, words) }, shim, id, &mut txn, false);
+                emit_shim_bd(
+                    Bd {
+                        axi: cfg.axi,
+                        ..Bd::new(0, words)
+                    },
+                    shim,
+                    id,
+                    &mut txn,
+                    false,
+                );
                 let off = ((index * cfg.queued_tasks + task) * cfg.bd_bytes) as u64;
                 txn.ddr_patch(Bd::address(shim, id) + 4, WRITE_ARG, off);
             }
@@ -566,11 +822,25 @@ fn build_concurrency_txn(cfg: ConcurrencyConfig) -> Txn {
     for &(col, lanes) in &cols {
         let mem = mem_loc(col);
         for k in 0..lanes.read_ch {
-            Task { direction: S2mm, channel: READ_S2MM0 + k as u32, bd: SINK_BD[k], repeat: 1, issue_token: false }.emit_txn(mem, &mut txn);
+            Task {
+                direction: S2mm,
+                channel: READ_S2MM0 + k as u32,
+                bd: SINK_BD[k],
+                repeat: 1,
+                issue_token: false,
+            }
+            .emit_txn(mem, &mut txn);
         }
         for k in 0..lanes.write_ch {
             for (bd, repeat) in write_tasks(k, total) {
-                Task { direction: Mm2s, channel: k as u32, bd, repeat, issue_token: false }.emit_txn(mem, &mut txn);
+                Task {
+                    direction: Mm2s,
+                    channel: k as u32,
+                    bd,
+                    repeat,
+                    issue_token: false,
+                }
+                .emit_txn(mem, &mut txn);
             }
         }
     }
@@ -578,25 +848,41 @@ fn build_concurrency_txn(cfg: ConcurrencyConfig) -> Txn {
         let shim = shim_loc(col);
         for lane in 0..lanes.write_ch {
             for task in 0..cfg.queued_tasks {
-                Task { direction: S2mm, channel: lane as u32, bd: concurrency_write_bd(lane, task), repeat: 1,
-                    issue_token: task + 1 == cfg.queued_tasks }.emit_txn(shim, &mut txn);
+                Task {
+                    direction: S2mm,
+                    channel: lane as u32,
+                    bd: concurrency_write_bd(lane, task),
+                    repeat: 1,
+                    issue_token: task + 1 == cfg.queued_tasks,
+                }
+                .emit_txn(shim, &mut txn);
             }
         }
         for lane in 0..lanes.read_ch {
             for task in 0..cfg.queued_tasks {
-                Task { direction: Mm2s, channel: lane as u32, bd: concurrency_read_bd(lane, task), repeat: 1,
-                    issue_token: task + 1 == cfg.queued_tasks }.emit_txn(shim, &mut txn);
+                Task {
+                    direction: Mm2s,
+                    channel: lane as u32,
+                    bd: concurrency_read_bd(lane, task),
+                    repeat: 1,
+                    issue_token: task + 1 == cfg.queued_tasks,
+                }
+                .emit_txn(shim, &mut txn);
             }
         }
     }
     // 4. one SYNC per active (direction, lane) over its contiguous active columns `0..n`.
     for lane in 0..2 {
         let n = lane_columns(cfg.read_channels, lane) as u32;
-        if n > 0 { txn.sync(0, 0, 1, lane as u32, n, 1); }
+        if n > 0 {
+            txn.sync(0, 0, 1, lane as u32, n, 1);
+        }
     }
     for lane in 0..2 {
         let n = lane_columns(cfg.write_channels, lane) as u32;
-        if n > 0 { txn.sync(0, 0, 0, lane as u32, n, 1); }
+        if n > 0 {
+            txn.sync(0, 0, 0, lane as u32, n, 1);
+        }
     }
     txn
 }
@@ -604,13 +890,20 @@ fn build_concurrency_txn(cfg: ConcurrencyConfig) -> Txn {
 /// Build the concurrency probe (see the section header above). Vendor-safe AXI attributes only. Panics on an invalid
 /// [`ConcurrencyConfig`] (use [`ConcurrencyConfig::validate`]).
 pub fn concurrency_design(cfg: ConcurrencyConfig) -> ConcurrencyDesign {
-    cfg.validate().unwrap_or_else(|e| panic!("invalid bw_probe concurrency config: {e}"));
+    cfg.validate()
+        .unwrap_or_else(|e| panic!("invalid bw_probe concurrency config: {e}"));
     ConcurrencyDesign {
         pdi: crate::pdi::build(&build_concurrency_cdo(cfg).to_words()),
         insts: build_concurrency_txn(cfg).to_bytes(),
         args: vec![
-            ArgSpec { bytes: cfg.read_total(), kind: ArgKind::In },
-            ArgSpec { bytes: cfg.write_total(), kind: ArgKind::Out },
+            ArgSpec {
+                bytes: cfg.read_total(),
+                kind: ArgKind::In,
+            },
+            ArgSpec {
+                bytes: cfg.write_total(),
+                kind: ArgKind::Out,
+            },
         ],
         cfg,
     }
@@ -622,19 +915,55 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Op { Write(u32, u32), Block(u32, usize), Mask(u32, u32, u32), Sync { col: u32, dir: u32, chan: u32, ncol: u32 }, Patch { addr: u32, arg: u32, plus: u64 } }
+    enum Op {
+        Write(u32, u32),
+        Block(u32, usize),
+        Mask(u32, u32, u32),
+        Sync {
+            col: u32,
+            dir: u32,
+            chan: u32,
+            ncol: u32,
+        },
+        Patch {
+            addr: u32,
+            arg: u32,
+            plus: u64,
+        },
+    }
 
     fn txn_ops(bytes: &[u8]) -> Vec<Op> {
-        let w: Vec<u32> = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let w: Vec<u32> = bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         let (count, mut i) = (w[2], 4);
         let mut ops = Vec::new();
         for _ in 0..count {
             let (op, len) = match w[i] {
                 0 => (Op::Write(w[i + 2], w[i + 4]), 6),
-                1 => (Op::Block(w[i + 2], (w[i + 3] as usize - 16) / 4), (w[i + 3] / 4) as usize),
+                1 => (
+                    Op::Block(w[i + 2], (w[i + 3] as usize - 16) / 4),
+                    (w[i + 3] / 4) as usize,
+                ),
                 3 => (Op::Mask(w[i + 2], w[i + 4], w[i + 5]), 7),
-                0x80 => (Op::Sync { col: w[i + 2] >> 16, dir: w[i + 2] & 0xff, chan: w[i + 3] >> 24, ncol: (w[i + 3] >> 16) & 0xff }, 4),
-                0x81 => (Op::Patch { addr: w[i + 6], arg: w[i + 8], plus: w[i + 10] as u64 | (w[i + 11] as u64) << 32 }, 12),
+                0x80 => (
+                    Op::Sync {
+                        col: w[i + 2] >> 16,
+                        dir: w[i + 2] & 0xff,
+                        chan: w[i + 3] >> 24,
+                        ncol: (w[i + 3] >> 16) & 0xff,
+                    },
+                    4,
+                ),
+                0x81 => (
+                    Op::Patch {
+                        addr: w[i + 6],
+                        arg: w[i + 8],
+                        plus: w[i + 10] as u64 | (w[i + 11] as u64) << 32,
+                    },
+                    12,
+                ),
                 other => panic!("unknown txn op {other:#x}"),
             };
             ops.push(op);
@@ -644,12 +973,28 @@ mod tests {
         ops
     }
 
-    fn cfg(cols: usize, read_ch: usize, write_ch: usize, bytes: usize) -> BwConfig { BwConfig { cols, read_ch, write_ch, bytes, axi: ShimAxi::default() } }
+    fn cfg(cols: usize, read_ch: usize, write_ch: usize, bytes: usize) -> BwConfig {
+        BwConfig {
+            cols,
+            read_ch,
+            write_ch,
+            bytes,
+            axi: ShimAxi::default(),
+        }
+    }
 
     #[test]
     fn validate_rejects_bad_geometry() {
-        for bad in [cfg(0, 1, 0, 4096), cfg(9, 1, 0, 4096), cfg(1, 3, 0, 4096), cfg(1, 0, 3, 4096), cfg(1, 0, 0, 4096),
-            cfg(1, 1, 0, 0), cfg(1, 1, 0, 4000), cfg(1, 1, 0, MAX_BYTES + 4096)] {
+        for bad in [
+            cfg(0, 1, 0, 4096),
+            cfg(9, 1, 0, 4096),
+            cfg(1, 3, 0, 4096),
+            cfg(1, 0, 3, 4096),
+            cfg(1, 0, 0, 4096),
+            cfg(1, 1, 0, 0),
+            cfg(1, 1, 0, 4000),
+            cfg(1, 1, 0, MAX_BYTES + 4096),
+        ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
         cfg(8, 2, 2, MAX_BYTES).validate().unwrap();
@@ -657,22 +1002,47 @@ mod tests {
 
     #[test]
     fn validate_checks_axi_field_ranges_independently_of_geometry() {
-        let axi = |burst, cache, qos| BwConfig { axi: ShimAxi { burst, cache, qos }, ..cfg(2, 1, 1, 8192) };
+        let axi = |burst, cache, qos| BwConfig {
+            axi: ShimAxi { burst, cache, qos },
+            ..cfg(2, 1, 1, 8192)
+        };
         for ok in [axi(0, 2, 0), axi(3, 2, 0), axi(2, 2, 0)] {
             ok.validate().unwrap_or_else(|e| panic!("{ok:?}: {e}"));
         }
-        for (bad, field) in [(axi(4, 2, 0), "burst"), (axi(3, 16, 0), "AxCACHE"), (axi(3, 2, 16), "AxQoS")] {
+        for (bad, field) in [
+            (axi(4, 2, 0), "burst"),
+            (axi(3, 16, 0), "AxCACHE"),
+            (axi(3, 2, 16), "AxQoS"),
+        ] {
             let e = bad.validate().unwrap_err();
             assert!(e.contains(field), "{bad:?}: {e}");
         }
         // Geometry errors still reported for an otherwise valid AXI setting.
-        assert!(BwConfig { cols: 0, ..axi(3, 2, 0) }.validate().unwrap_err().contains("cols"));
+        assert!(BwConfig {
+            cols: 0,
+            ..axi(3, 2, 0)
+        }
+        .validate()
+        .unwrap_err()
+        .contains("cols"));
     }
 
     #[test]
     fn non_vendor_word5_requires_explicit_hazardous_probe() {
-        for axi in [ShimAxi { qos: 15, ..ShimAxi::default() }, ShimAxi { cache: 3, ..ShimAxi::default() }] {
-            let c = BwConfig { axi, ..cfg(1, 0, 1, 4096) };
+        for axi in [
+            ShimAxi {
+                qos: 15,
+                ..ShimAxi::default()
+            },
+            ShimAxi {
+                cache: 3,
+                ..ShimAxi::default()
+            },
+        ] {
+            let c = BwConfig {
+                axi,
+                ..cfg(1, 0, 1, 4096)
+            };
             assert!(c.validate().is_err());
             assert!(std::panic::catch_unwind(|| design(c)).is_err());
             assert!(c.validate_for_hazardous_probe().is_ok());
@@ -688,17 +1058,39 @@ mod tests {
             for ci in &all {
                 let w = ci.writes(); // panics on an absent port
                 assert!(w[0].1 >> 31 == 1);
-                assert!(driven.insert((ci.tile.col, ci.tile.row, format!("{:?}", ci.master))), "master driven twice {ci:?}");
+                assert!(
+                    driven.insert((ci.tile.col, ci.tile.row, format!("{:?}", ci.master))),
+                    "master driven twice {ci:?}"
+                );
             }
-            let by_master: HashMap<_, _> = all.iter().map(|ci| ((ci.tile.row, format!("{:?}", ci.master)), ci.slave)).collect();
+            let by_master: HashMap<_, _> = all
+                .iter()
+                .map(|ci| ((ci.tile.row, format!("{:?}", ci.master)), ci.slave))
+                .collect();
             for k in 0..2u8 {
                 // read: shim MM2S k -> North(k) -> memtile South(k) -> S2MM 4+k
-                let mm = ShimDma { tile: shim_loc(col), direction: Mm2s, channel: k }.port();
+                let mm = ShimDma {
+                    tile: shim_loc(col),
+                    direction: Mm2s,
+                    channel: k,
+                }
+                .port();
                 assert_eq!(by_master[&(0, format!("{:?}", Port::North(k)))], mm);
-                assert_eq!(by_master[&(1, format!("{:?}", Port::Dma(4 + k)))], Port::South(k));
+                assert_eq!(
+                    by_master[&(1, format!("{:?}", Port::Dma(4 + k)))],
+                    Port::South(k)
+                );
                 // write: memtile MM2S k -> South(k) -> shim North(k) -> S2MM k
-                let sm = ShimDma { tile: shim_loc(col), direction: S2mm, channel: k }.port();
-                assert_eq!(by_master[&(1, format!("{:?}", Port::South(k)))], Port::Dma(k));
+                let sm = ShimDma {
+                    tile: shim_loc(col),
+                    direction: S2mm,
+                    channel: k,
+                }
+                .port();
+                assert_eq!(
+                    by_master[&(1, format!("{:?}", Port::South(k)))],
+                    Port::Dma(k)
+                );
                 assert_eq!(by_master[&(0, format!("{:?}", sm))], Port::North(k));
             }
         }
@@ -710,7 +1102,10 @@ mod tests {
         let bds = memtile_descriptors(c);
         let ids: Vec<u32> = bds.iter().map(|b| b.0).collect();
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
-        assert!(ids.iter().chain([write_rem_bd(0), write_rem_bd(1)].iter()).all(|&i| i < 48));
+        assert!(ids
+            .iter()
+            .chain([write_rem_bd(0), write_rem_bd(1)].iter())
+            .all(|&i| i < 48));
         assert!(!ids.contains(&write_rem_bd(0)) && !ids.contains(&write_rem_bd(1)));
         // sinks are cyclic (next = itself); chains end without next; banks match the channel parity.
         for (k, &id) in SINK_BD.iter().enumerate() {
@@ -720,8 +1115,17 @@ mod tests {
         }
         for k in 0..2 {
             assert_eq!(write_rem_bd(k) >= 24, k % 2 == 1);
-            assert_eq!(bds.iter().find(|b| b.0 == write_chain_bd(k, CHAIN - 1)).unwrap().1.next, None);
-            for i in 0..CHAIN { assert_eq!(write_chain_bd(k, i) >= 24, k % 2 == 1); }
+            assert_eq!(
+                bds.iter()
+                    .find(|b| b.0 == write_chain_bd(k, CHAIN - 1))
+                    .unwrap()
+                    .1
+                    .next,
+                None
+            );
+            for i in 0..CHAIN {
+                assert_eq!(write_chain_bd(k, i) >= 24, k % 2 == 1);
+            }
         }
         // Task::write asserts the bank rule for every queued task.
         build_txn(cfg(2, 2, 2, 5 * BUF_BYTES + 4096));
@@ -729,13 +1133,26 @@ mod tests {
 
     #[test]
     fn write_tasks_emit_exactly_bytes() {
-        for bytes in [4096, 16384, 20480, 16 * 16384, 16 * 16384 + 4096, 19 * 16384 + 8192, 100 * 16384 + 12288, MAX_BYTES] {
+        for bytes in [
+            4096,
+            16384,
+            20480,
+            16 * 16384,
+            16 * 16384 + 4096,
+            19 * 16384 + 8192,
+            100 * 16384 + 12288,
+            MAX_BYTES,
+        ] {
             let t = write_tasks(0, bytes);
             assert!(t.len() <= 3);
             let mut total = 0usize;
             for &(bd, repeat) in &t {
                 assert!((1..=256).contains(&repeat));
-                let len = if bd == write_rem_bd(0) { bytes % BUF_BYTES } else { (CHAIN - (bd - write_chain_bd(0, 0)) as usize) * BUF_BYTES };
+                let len = if bd == write_rem_bd(0) {
+                    bytes % BUF_BYTES
+                } else {
+                    (CHAIN - (bd - write_chain_bd(0, 0)) as usize) * BUF_BYTES
+                };
                 total += len * repeat as usize;
             }
             assert_eq!(total, bytes, "{bytes}");
@@ -746,24 +1163,72 @@ mod tests {
     fn txn_patches_segments_and_syncs_every_active_channel() {
         let d = design(cfg(3, 2, 1, 32768 + 4096));
         let ops = txn_ops(&d.insts);
-        let patches: Vec<_> = ops.iter().filter_map(|o| if let Op::Patch { addr, arg, plus } = o { Some((*addr, *arg, *plus)) } else { None }).collect();
+        let patches: Vec<_> = ops
+            .iter()
+            .filter_map(|o| {
+                if let Op::Patch { addr, arg, plus } = o {
+                    Some((*addr, *arg, *plus))
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(patches.len(), 3 * 3);
         for col in 0..3u32 {
             for k in 0..2u32 {
                 let addr = Bd::address(shim_loc(col), SHIM_READ_BD + k) + 4;
-                assert!(patches.contains(&(addr, 0, ((col * 2 + k) as u64) * (32768 + 4096))), "read col {col} ch {k}");
+                assert!(
+                    patches.contains(&(addr, 0, ((col * 2 + k) as u64) * (32768 + 4096))),
+                    "read col {col} ch {k}"
+                );
             }
             let addr = Bd::address(shim_loc(col), SHIM_WRITE_BD) + 4;
-            assert!(patches.contains(&(addr, 1, col as u64 * (32768 + 4096))), "write col {col}");
+            assert!(
+                patches.contains(&(addr, 1, col as u64 * (32768 + 4096))),
+                "write col {col}"
+            );
         }
-        let syncs: Vec<_> = ops.iter().filter_map(|o| if let Op::Sync { col, dir, chan, ncol } = o { Some((*col, *dir, *chan, *ncol)) } else { None }).collect();
+        let syncs: Vec<_> = ops
+            .iter()
+            .filter_map(|o| {
+                if let Op::Sync {
+                    col,
+                    dir,
+                    chan,
+                    ncol,
+                } = o
+                {
+                    Some((*col, *dir, *chan, *ncol))
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(syncs, vec![(0, 1, 0, 3), (0, 1, 1, 3), (0, 0, 0, 3)]);
         assert!(matches!(ops.last(), Some(Op::Sync { .. })));
-        assert_eq!(d.args, vec![ArgSpec { bytes: 3 * 2 * 36864, kind: ArgKind::In }, ArgSpec { bytes: 3 * 36864, kind: ArgKind::Out }]);
+        assert_eq!(
+            d.args,
+            vec![
+                ArgSpec {
+                    bytes: 3 * 2 * 36864,
+                    kind: ArgKind::In
+                },
+                ArgSpec {
+                    bytes: 3 * 36864,
+                    kind: ArgKind::Out
+                }
+            ]
+        );
         // Reset is asserted on every used memtile channel, then released, before anything is queued.
         let first_queue = ops.iter().position(|o| matches!(o, Op::Write(..))).unwrap();
-        let resets = ops[..first_queue].iter().filter(|o| matches!(o, Op::Mask(_, 2, 2))).count();
-        let releases = ops[..first_queue].iter().filter(|o| matches!(o, Op::Mask(_, 0, 2))).count();
+        let resets = ops[..first_queue]
+            .iter()
+            .filter(|o| matches!(o, Op::Mask(_, 2, 2)))
+            .count();
+        let releases = ops[..first_queue]
+            .iter()
+            .filter(|o| matches!(o, Op::Mask(_, 0, 2)))
+            .count();
         assert_eq!((resets, releases), (3 * 3, 3 * 3));
     }
 
@@ -788,12 +1253,22 @@ mod tests {
     fn check_write_reports_first_mismatch() {
         let d = design(cfg(2, 0, 2, 20480));
         let mut buf = vec![0u8; d.cfg.write_total()];
-        for col in 0..2 { for ch in 0..2 {
-            let p = d.pattern(col, ch);
-            let seg = d.write_segment(col, ch);
-            for (i, b) in buf[seg].iter_mut().enumerate() { *b = p[i % BUF_BYTES]; }
-        } }
-        assert_eq!(d.check_write(&buf), WriteCheck { bad_words: 0, first_bad: None });
+        for col in 0..2 {
+            for ch in 0..2 {
+                let p = d.pattern(col, ch);
+                let seg = d.write_segment(col, ch);
+                for (i, b) in buf[seg].iter_mut().enumerate() {
+                    *b = p[i % BUF_BYTES];
+                }
+            }
+        }
+        assert_eq!(
+            d.check_write(&buf),
+            WriteCheck {
+                bad_words: 0,
+                first_bad: None
+            }
+        );
         let at = d.write_segment(1, 1).start + BUF_BYTES + 8;
         buf[at] ^= 1;
         let got = d.check_write(&buf);

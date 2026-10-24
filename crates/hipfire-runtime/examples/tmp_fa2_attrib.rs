@@ -134,8 +134,7 @@ const PROD_FWHT3_SRC: &str = concat!(
 /// Frozen pre-change (b81) gfx1201 Q8 direct entry, all symbols renamed
 /// (`fa2_attrib_prod_1201*`) so the symbol-keyed host function cache never
 /// collides with the shipping `attention_q8_0_fa2_gqa_gfx1201*` modules.
-const PROD_1201_Q8_SRC: &str =
-    include_str!("tmp_fa2_attrib_prod_1201.hip");
+const PROD_1201_Q8_SRC: &str = include_str!("tmp_fa2_attrib_prod_1201.hip");
 /// Frozen pre-change (b81) gfx1201 fwht3 entry (in-place Q rotation, like the
 /// old shipping path) + turbo_common, all symbols renamed. Only
 /// `fa2_attrib_prod_1201_fwht3` is ever ensured out of this module.
@@ -839,7 +838,11 @@ fn f32_to_f16_rne(x: f32) -> u16 {
         let shift = (14 - half_exp) as u32; // 14..24
         let rounded = (mant_full >> (shift + 1)) as u32;
         let round_bit = (mant_full >> shift) & 1;
-        let sticky = if (mant_full & ((1u32 << shift) - 1)) != 0 { 1 } else { 0 };
+        let sticky = if (mant_full & ((1u32 << shift) - 1)) != 0 {
+            1
+        } else {
+            0
+        };
         let mut out_m = rounded;
         if round_bit == 1 && (sticky == 1 || (out_m & 1) == 1) {
             out_m += 1;
@@ -893,8 +896,8 @@ fn fill_q8_cache(seq_len: usize, salt: u32) -> Vec<u8> {
                     let r = prng_u32((g * 64 + kv * 8 + b) as u64 * 32 + c as u64, salt);
                     codes[c] = ((r % 61) as i8).wrapping_sub(30);
                 }
-                let scale =
-                    0.01 + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
+                let scale = 0.01
+                    + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
                 let blk = pack_q8_block(scale, &codes);
                 let off = g * ROW_STRIDE + (kv * BPH + b) * Q8_BLOCK;
                 buf[off..off + 34].copy_from_slice(&blk);
@@ -1009,7 +1012,10 @@ fn download_f32(gpu: &Gpu, t: &rdna_compute::GpuTensor, n: usize) -> Vec<f32> {
 }
 
 fn bitwise_eq_f32(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 fn run_attribution(gpu: &mut Gpu) {
@@ -1144,10 +1150,7 @@ fn run_attribution(gpu: &mut Gpu) {
         for i in 0..9 {
             med[i] = median_f64(&mut samples[i]);
             let mn = samples[i].iter().cloned().fold(f64::INFINITY, f64::min);
-            let mx = samples[i]
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let mx = samples[i].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             eprintln!(
                 "  {:<24} median_us={:.2}  min={:.2} max={:.2}",
                 SYMS[i], med[i], mn, mx
@@ -1212,7 +1215,6 @@ fn run_attribution(gpu: &mut Gpu) {
     }
 }
 
-
 fn fill_fwht3_k(seq_len: usize, salt: u32) -> Vec<u8> {
     let mut buf = vec![0u8; seq_len * FWHT3_POS];
     for g in 0..seq_len {
@@ -1223,8 +1225,7 @@ fn fill_fwht3_k(seq_len: usize, salt: u32) -> Vec<u8> {
             for g3 in 0..32 {
                 let mut packed = 0u32;
                 for i in 0..8 {
-                    let code =
-                        (prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8) as u32;
+                    let code = (prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8) as u32;
                     packed |= code << (3 * i);
                 }
                 let bytes = packed.to_le_bytes();
@@ -1518,9 +1519,7 @@ fn run_ship(gpu: &mut Gpu) {
                 n_diff_q += 1;
             }
         }
-        eprintln!(
-            "  bitwise_eq L={l} fwht3 postQ ship_vs_input = {eq_q}  n_diff_bytes={n_diff_q}"
-        );
+        eprintln!("  bitwise_eq L={l} fwht3 postQ ship_vs_input = {eq_q}  n_diff_bytes={n_diff_q}");
         let prod_rotated = !bitwise_eq_bytes(&prod_q_post, &q_bytes_host);
         eprintln!("  fwht3 prod rotated in place = {prod_rotated} (expect true)");
 
@@ -1704,8 +1703,14 @@ fn launch_prod_1201(
     gpu.hip
         .event_record(&start, gpu.active_stream.as_ref())
         .unwrap();
-    gpu.launch_kernel_blob(sym, [grid_x, 4, 1], BLOCK, LDS_1201_BYTES, args.as_mut_slice())
-        .unwrap_or_else(|e| panic!("launch {sym}: {e:?}"));
+    gpu.launch_kernel_blob(
+        sym,
+        [grid_x, 4, 1],
+        BLOCK,
+        LDS_1201_BYTES,
+        args.as_mut_slice(),
+    )
+    .unwrap_or_else(|e| panic!("launch {sym}: {e:?}"));
     gpu.hip
         .event_record(&stop, gpu.active_stream.as_ref())
         .unwrap();
@@ -1839,7 +1844,14 @@ fn run_ship1201(gpu: &mut Gpu) {
             BATCH as i32,
         );
         let _ = launch_ship_1201_q8(
-            gpu, &d_q_ship, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l,
+            gpu,
+            &d_q_ship,
+            &d_k_q8,
+            &d_v,
+            &d_out_ship_q8,
+            &d_pos,
+            BATCH,
+            l,
         );
         let prod_out = download_f32(gpu, &d_out_prod_q8, BATCH * QO_ROW);
         let ship_out = download_f32(gpu, &d_out_ship_q8, BATCH * QO_ROW);
@@ -1917,9 +1929,7 @@ fn run_ship1201(gpu: &mut Gpu) {
                 n_diff_q += 1;
             }
         }
-        eprintln!(
-            "  bitwise_eq L={l} fwht3 postQ ship_vs_input = {eq_q}  n_diff_bytes={n_diff_q}"
-        );
+        eprintln!("  bitwise_eq L={l} fwht3 postQ ship_vs_input = {eq_q}  n_diff_bytes={n_diff_q}");
         let prod_rotated = !bitwise_eq_bytes(&prod_q_post, &q_bytes_host);
         eprintln!("  fwht3 prod rotated in place = {prod_rotated} (expect true)");
 
@@ -1938,7 +1948,14 @@ fn run_ship1201(gpu: &mut Gpu) {
                 BATCH as i32,
             );
             let _ = launch_ship_1201_q8(
-                gpu, &d_q_ship, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l,
+                gpu,
+                &d_q_ship,
+                &d_k_q8,
+                &d_v,
+                &d_out_ship_q8,
+                &d_pos,
+                BATCH,
+                l,
             );
             // fwht3: refresh PROD Q outside timed path (in-place rotate
             // consumes it). Ship Q is immutable — no refresh.
@@ -1990,7 +2007,14 @@ fn run_ship1201(gpu: &mut Gpu) {
             );
             samp_prod_q8.push(us);
             let us = launch_ship_1201_q8(
-                gpu, &d_q_ship, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l,
+                gpu,
+                &d_q_ship,
+                &d_k_q8,
+                &d_v,
+                &d_out_ship_q8,
+                &d_pos,
+                BATCH,
+                l,
             );
             samp_ship_q8.push(us);
 
@@ -2115,7 +2139,9 @@ fn run_rotcheck(gpu: &mut Gpu) {
         )
         .map(|_| true)
         .unwrap_or_else(|e| {
-            eprintln!("  note: {SHIP_FWHT3_PRECONVERT_SYM} absent ({e:?}); skipping ship-f16 check");
+            eprintln!(
+                "  note: {SHIP_FWHT3_PRECONVERT_SYM} absent ({e:?}); skipping ship-f16 check"
+            );
             false
         });
 
@@ -2136,7 +2162,14 @@ fn run_rotcheck(gpu: &mut Gpu) {
     // (a) Frozen prod twin once: rotates Q in place; download rotated f32.
     let d_q_prod = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
     let _ = launch_prod_fwht3(
-        gpu, &d_q_prod, &d_k_fw, &d_v, &d_out, &d_pos, &d_s1, &d_s2,
+        gpu,
+        &d_q_prod,
+        &d_k_fw,
+        &d_v,
+        &d_out,
+        &d_pos,
+        &d_s1,
+        &d_s2,
         BATCH as i32,
     );
     let rot_h = download_f32(gpu, &d_q_prod, BATCH * QO_ROW);
@@ -2158,7 +2191,10 @@ fn run_rotcheck(gpu: &mut Gpu) {
             n_diff += 1;
         }
     }
-    eprintln!("  prod_rot32 vs debug_f32: n_diff={n_diff} / {}", rot_h.len());
+    eprintln!(
+        "  prod_rot32 vs debug_f32: n_diff={n_diff} / {}",
+        rot_h.len()
+    );
     for (i, pb, nb) in &first {
         let qr = i / (N_HEADS * HD);
         let h = (i / HD) % N_HEADS;
@@ -2177,7 +2213,14 @@ fn run_rotcheck(gpu: &mut Gpu) {
         let d_q_ship = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
         let d_q16 = gpu.zeros(&[BATCH * QO_ROW], DType::F16).unwrap();
         launch_preconvert_raw(
-            gpu, SHIP_FWHT3_PRECONVERT_SYM, &d_q_ship, &d_q16, &d_s1, &d_s2, BATCH, 1,
+            gpu,
+            SHIP_FWHT3_PRECONVERT_SYM,
+            &d_q_ship,
+            &d_q16,
+            &d_s1,
+            &d_s2,
+            BATCH,
+            1,
         );
         let ship16 = download_bytes(gpu, &d_q16, BATCH * QO_ROW * 2);
         let mut n16 = 0usize;
@@ -2199,7 +2242,14 @@ fn run_rotcheck(gpu: &mut Gpu) {
     let d_q_leg = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
     let d_q16leg = gpu.zeros(&[BATCH * QO_ROW], DType::F16).unwrap();
     launch_preconvert_raw(
-        gpu, SHIP_Q8_PRECONVERT_SYM, &d_q_leg, &d_q16leg, &d_s1, &d_s2, BATCH, 1,
+        gpu,
+        SHIP_Q8_PRECONVERT_SYM,
+        &d_q_leg,
+        &d_q16leg,
+        &d_s1,
+        &d_s2,
+        BATCH,
+        1,
     );
     let leg16 = download_bytes(gpu, &d_q16leg, BATCH * QO_ROW * 2);
     let orig16: Vec<u8> = q_h
@@ -2464,7 +2514,10 @@ fn iu8_host_fold_check() -> bool {
             let (qv, kv) = match it % 4 {
                 1 => (127i32, -128i32),
                 2 => (0, 0),
-                3 => (if d % 2 == 0 { 127 } else { -127 }, if d % 3 == 0 { 127 } else { -128 }),
+                3 => (
+                    if d % 2 == 0 { 127 } else { -127 },
+                    if d % 3 == 0 { 127 } else { -128 },
+                ),
                 _ => (
                     (prng_u32(it * 256 + d as u64, 0xF501) % 256) as i32 - 128,
                     (prng_u32(it * 256 + d as u64, 0xF502) % 256) as i32 - 128,
@@ -2836,13 +2889,9 @@ fn main() {
         if gpu.arch != "gfx1201" {
             eprintln!("skip: ship1201 needs gfx1201, got {}", gpu.arch);
             eprintln!("R9700 command (parent runs gates):");
-            eprintln!(
-                "  HOME=/tmp/home-ab0 HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=0 \\"
-            );
+            eprintln!("  HOME=/tmp/home-ab0 HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=0 \\");
             eprintln!("    HIPFIRE_KERNEL_CACHE=/tmp/kc-r9700-fa2 \\");
-            eprintln!(
-                "    ./target/release/examples/tmp_fa2_attrib ship1201"
-            );
+            eprintln!("    ./target/release/examples/tmp_fa2_attrib ship1201");
             return;
         }
         if gpu.active_stream.is_none() {
@@ -2851,18 +2900,14 @@ fn main() {
         run_ship1201(&mut gpu);
         return;
     }
-    eprintln!(
-        "Production Q conversion: (_Float16)float C cast → AMD v_cvt_f16_f32 (RNE)."
-    );
+    eprintln!("Production Q conversion: (_Float16)float C cast → AMD v_cvt_f16_f32 (RNE).");
     if !matches!(
         gpu.arch.as_str(),
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151"
     ) {
         eprintln!("skip: need gfx11 family for FA2 WMMA, got {}", gpu.arch);
         eprintln!("Halo command (parent runs gates):");
-        eprintln!(
-            "  HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \\"
-        );
+        eprintln!("  HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \\");
         eprintln!("    HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f4a \\");
         eprintln!(
             "    cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib -- ship"

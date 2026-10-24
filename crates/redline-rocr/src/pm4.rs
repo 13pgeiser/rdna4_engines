@@ -854,10 +854,7 @@ mod tests {
 
     #[test]
     fn rmw_acquire_ladder_encodings_are_stable() {
-        assert_eq!(
-            Gfx12RmwAcquirePolicy::CurrentSequential.gcr_cntl(),
-            0x10180
-        );
+        assert_eq!(Gfx12RmwAcquirePolicy::CurrentSequential.gcr_cntl(), 0x10180);
         assert_eq!(
             Gfx12RmwAcquirePolicy::RadvGlobal.gcr_cntl(),
             (1 << 7) | (1 << 8) | (1 << 9) | (1 << 14) | (1 << 15)
@@ -896,14 +893,8 @@ mod tests {
         // GCR word.
         let mut boundary = Gfx12Pm4CommandBuffer::new();
         boundary.dependency_rmw_hip_llvm_vmem_gfx12();
-        assert_eq!(
-            &boundary.dwords()[..2],
-            &[0xc000_4600, 0x407]
-        );
-        assert_eq!(
-            &boundary.dwords()[2..],
-            vmem.dwords()
-        );
+        assert_eq!(&boundary.dwords()[..2], &[0xc000_4600, 0x407]);
+        assert_eq!(&boundary.dwords()[2..], vmem.dwords());
     }
 
     #[test]
@@ -969,7 +960,9 @@ mod tests {
             buffer
                 .dwords
                 .push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
-            buffer.dwords.extend_from_slice(&[i as u32 + 1, 1, 1, 0x8025]);
+            buffer
+                .dwords
+                .extend_from_slice(&[i as u32 + 1, 1, 1, 0x8025]);
             buffer.pace_after_dispatch();
         }
         buffer.wait_compute_idle();
@@ -1014,7 +1007,11 @@ mod tests {
             );
             let timed = paced.with_gpu_timestamps(0x1000, 0x1008);
             let (kept, dispatches) = strip_nops(timed.dwords());
-            assert_eq!(kept, plain.with_gpu_timestamps(0x1000, 0x1008).dwords(), "{pacing:?}");
+            assert_eq!(
+                kept,
+                plain.with_gpu_timestamps(0x1000, 0x1008).dwords(),
+                "{pacing:?}"
+            );
             assert_eq!(dispatches.len(), 23);
             assert_eq!(paced.pacing_dwords(), 23 * u64::from(body + 1));
             for at in dispatches {

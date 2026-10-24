@@ -686,6 +686,10 @@ mod tests {
         let error = state
             .check_relocation_supported(&[one_move()])
             .expect_err("captured graph state must refuse relocation");
-        assert!(error.message.contains("not implemented"), "{}", error.message);
+        assert!(
+            error.message.contains("not implemented"),
+            "{}",
+            error.message
+        );
     }
 }

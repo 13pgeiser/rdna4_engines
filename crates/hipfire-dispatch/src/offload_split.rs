@@ -86,7 +86,7 @@ use crate::context::DispatchCtx;
 use crate::cpu_exec::{self, HostExec, StepTiming};
 use crate::families::gemv::{weight_row_bytes, WeightRef};
 use crate::pipeline::steps::{launch_op_rows, GemvInput, Step};
-use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
+use crate::types::{DispatchError, KernelKey};
 
 /// Split offsets are rounded down to a multiple of this many rows: 2 covers the
 /// residual kernels' `row0 = blockIdx.x << 1` + `float2` store at `y + row0` (an
@@ -187,16 +187,20 @@ pub fn enabled() -> bool {
     cpu_exec::passback_enabled()
 }
 
-/// Whether `dtype` can be *split*: a CPU decoder exists **and** its vector row dot
-/// is available. With the scalar decoder the CPU rate (~10 GMAC/s) is well below
-/// the GPU's PCIe read rate, so the best share is all-GPU — which plain `pcie`
-/// does better. The load-time coverage line counts a splittable layer with this.
+/// Whether `dtype` can be *split*: a row-addressed CPU decoder exists **and** its
+/// vector row dot is available. With the scalar decoder the CPU rate (~10
+/// GMAC/s) is well below the GPU's PCIe read rate, so the best share is
+/// all-GPU — which plain `pcie` does better. The load-time coverage line counts a
+/// splittable layer with this. A planar expert-slab payload has no row stride to
+/// split at, so it never qualifies.
 pub fn passback_capable_format(dtype: DType) -> bool {
-    cpu_exec::cpu_quant_for(dtype).is_some_and(|q| hipfire_cpu::simd::row_dot_enabled(q, None))
+    cpu_exec::dense_cpu_quant_for(dtype)
+        .is_some_and(|q| hipfire_cpu::simd::row_dot_enabled(q, None))
 }
 
-/// Bytes per weight row for `dtype` at `k`, or `None` when there is no CPU
-/// decoder for it.
+/// Bytes per weight row for `dtype` at `k`, or `None` when there is no
+/// row-addressed CPU decoder for it (a planar expert-slab payload keeps its
+/// scales in a separate plane, so it has no per-row stride).
 ///
 /// Re-exported for callers that size a probe without depending on `hipfire-cpu`
 /// (the CLI's `hipfire offload-bench` route reaches this through
@@ -204,7 +208,7 @@ pub fn passback_capable_format(dtype: DType) -> bool {
 /// stride, which is also the invariant the feasibility gate checks the weight's
 /// byte length against.
 pub fn row_bytes_for(dtype: DType, k: usize) -> Option<usize> {
-    cpu_exec::cpu_quant_for(dtype).map(|q| hipfire_cpu::gemv::row_bytes(q, k))
+    cpu_exec::dense_cpu_quant_for(dtype).map(|q| hipfire_cpu::gemv::row_bytes(q, k))
 }
 
 /// The share of a step's rows the GPU takes, chosen from `(m, row_bytes, share)`.
@@ -548,10 +552,7 @@ fn observe(
     let waited_extra = waited_extra_ns(join_ns, baseline);
     let gpu_waited = waited_extra > 0;
     if gpu_waited && cpu_ns + waited_extra > 0 {
-        let sample = bytes_per_s(
-            rows_gpu as f64 * row_bytes as f64,
-            cpu_ns + waited_extra,
-        );
+        let sample = bytes_per_s(rows_gpu as f64 * row_bytes as f64, cpu_ns + waited_extra);
         state.r_gpu = Some(match state.r_gpu {
             Some(mut ewma) => {
                 ewma.update(sample);
@@ -651,7 +652,7 @@ fn hip_err(e: hip_bridge::HipError) -> DispatchError {
 fn probe_activation<'a>(step: &'a Step<'a>, w: &WeightRef) -> Option<(&'a GpuTensor, bool)> {
     match step {
         Step::Gemv { input, .. } | Step::GemvResidual { input, .. } => match input {
-            GemvInput::Raw(t) => Some((*t, dtype_rotation_plan(w.dtype) == RotationPlan::FwhtG256)),
+            GemvInput::Raw(t) => Some((*t, cpu_exec::raw_input_is_rotated(w.dtype))),
             GemvInput::Prerotated(t) => Some((*t, false)),
         },
         _ => None,
@@ -676,6 +677,16 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
+/// Which CPU worker pool a two-engine probe's CPU arm runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuProbePool {
+    /// The global rayon pool (what a pass-back step's CPU arm and
+    /// `hipfire offload-bench` use).
+    Global,
+    /// The pinned physical-core pool of the routed-expert splice.
+    Splice,
+}
+
 /// Time both engines on `probe`'s weight buffer, `reps` times each, and return
 /// the median rates. `Ok(None)` when the format has no launchable GPU arm (the
 /// scheduler then keeps [`DEFAULT_GPU_SHARE`] and the online controller converges
@@ -692,16 +703,28 @@ fn measure_both(
     row_bytes: usize,
     x_host: &[f32],
     reps: usize,
+    pool: CpuProbePool,
 ) -> Result<Option<SplitCalibration>, DispatchError> {
     let reps = reps.max(1);
     let Some(bytes) = gpu.host_bytes(w.buf) else {
         return Ok(None);
     };
-    let mut y = vec![0.0f32; w.m];
+    if pool == CpuProbePool::Splice {
+        // Build (and pin) the pool before the first timed pass, so the first
+        // sample is not the thread spawn.
+        let _ = cpu_exec::splice_pool_threads();
+    }
+    let (m, k) = (w.m, w.k);
+    let mut y = vec![0.0f32; m];
     let mut cpu_ns = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t = Instant::now();
-        hipfire_cpu::gemv::gemv(q, bytes, w.m, w.k, x_host, &mut y);
+        match pool {
+            CpuProbePool::Global => hipfire_cpu::gemv::gemv(q, bytes, m, k, x_host, &mut y),
+            CpuProbePool::Splice => {
+                cpu_exec::in_splice_pool(|| hipfire_cpu::gemv::gemv(q, bytes, m, k, x_host, &mut y))
+            }
+        }
         cpu_ns.push(t.elapsed().as_nanos() as f64);
     }
     let mut gpu_ns = Vec::with_capacity(reps);
@@ -788,7 +811,17 @@ pub fn probe_weight(
             out: &scratch,
         },
     };
-    let result = measure_both(gpu, ctx, &probe, w, q, row_bytes, &x_host, reps);
+    let result = measure_both(
+        gpu,
+        ctx,
+        &probe,
+        w,
+        q,
+        row_bytes,
+        &x_host,
+        reps,
+        CpuProbePool::Global,
+    );
     let _ = gpu.free_tensor(scratch);
     if let Some(acc) = acc_scratch {
         let _ = gpu.free_tensor(acc);
@@ -797,7 +830,8 @@ pub fn probe_weight(
 }
 
 /// The same two-engine measurement over a **synthetic** host-mapped weight, for
-/// `hipfire offload-bench`: no model and no step list needed.
+/// `hipfire offload-bench`: no model and no step list needed. The CPU arm runs
+/// on the global rayon pool, like a pass-back step's CPU arm.
 ///
 /// Allocates, uses and frees its own buffers (a host-mapped weight of `m` rows —
 /// system RAM the GPU reads over the link — an f32 activation of `k`, an f32
@@ -810,6 +844,24 @@ pub fn probe_synthetic(
     m: usize,
     k: usize,
     reps: usize,
+) -> Result<SplitCalibration, DispatchError> {
+    probe_synthetic_on(gpu, ctx, dtype, m, k, reps, CpuProbePool::Global)
+}
+
+/// [`probe_synthetic`] with the CPU arm's worker pool chosen. The routed-expert
+/// splice (D1/D2) runs its CPU side on [`CpuProbePool::Splice`] (one pinned
+/// worker per physical core), so a dense probe of that engine must time that
+/// pool, not the global one. This is a dense, alone-and-best-of figure: the
+/// qwen4 D2 default no longer decides from it (it times the production
+/// expert arm on the model's real spans instead).
+pub fn probe_synthetic_on(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dtype: DType,
+    m: usize,
+    k: usize,
+    reps: usize,
+    pool: CpuProbePool,
 ) -> Result<SplitCalibration, DispatchError> {
     let q = cpu_exec::cpu_quant_for(dtype).ok_or_else(|| {
         DispatchError::Hip(format!(
@@ -861,9 +913,9 @@ pub fn probe_synthetic(
             input: GemvInput::Raw(&x_act),
             out: &scratch,
         };
-        let rotate = dtype_rotation_plan(dtype) == RotationPlan::FwhtG256;
+        let rotate = cpu_exec::raw_input_is_rotated(dtype);
         let (x_host, _) = cpu_exec::prepare_activation(gpu, &w_ref, &x_act, rotate)?;
-        measure_both(gpu, ctx, &probe, &w_ref, q, row_bytes, &x_host, reps)?
+        measure_both(gpu, ctx, &probe, &w_ref, q, row_bytes, &x_host, reps, pool)?
     };
     let _ = gpu.free_tensor(scratch);
     let _ = gpu.free_tensor(x_act);
@@ -1038,7 +1090,10 @@ mod tests {
                     continue;
                 };
                 assert_eq!(g % ROW_ALIGN, 0, "m={m} share={share} g={g}");
-                assert!(g >= ROW_ALIGN && g <= m - ROW_ALIGN, "m={m} share={share} g={g}");
+                assert!(
+                    g >= ROW_ALIGN && g <= m - ROW_ALIGN,
+                    "m={m} share={share} g={g}"
+                );
             }
         }
     }
@@ -1153,7 +1208,10 @@ mod tests {
             observe(key, 3072, 4096, 2176, 500_000, 60_000);
         }
         let after = shape_state(key.0, key.1).expect("seeded");
-        assert!(!after.frozen, "a moved balance point must re-open the latch");
+        assert!(
+            !after.frozen,
+            "a moved balance point must re-open the latch"
+        );
         assert!(
             after.share > before + 0.05,
             "the share must follow the move: {before} -> {}",
@@ -1177,7 +1235,10 @@ mod tests {
     }
     impl Plant {
         fn noise(&mut self) -> i64 {
-            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.seed = self
+                .seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let x = (self.seed >> 33) as i64;
             (x % (2 * self.jitter as i64 + 1)) - self.jitter as i64
         }
@@ -1195,7 +1256,13 @@ mod tests {
     /// The field 9B shape: `m=12288 k=4096` at 2176 B/row, a ~40 µs no-wait
     /// floor and ±60 µs host jitter (the checkpoint's `d2h=0.03 / join=0.04ms`).
     fn plant(seed: u64) -> Plant {
-        Plant { m: 12288, rb: 2176, copy_ns: 40_000, jitter: 60_000, seed }
+        Plant {
+            m: 12288,
+            rb: 2176,
+            copy_ns: 40_000,
+            jitter: 60_000,
+            seed,
+        }
     }
 
     /// Drive a shape through the real `observe`/`scheduled_share`/`plan_rows`
@@ -1244,7 +1311,10 @@ mod tests {
             "the trace-visible re-open counter must agree"
         );
         let optimum = 18.0 / (35.0 + 18.0);
-        assert!((end - optimum).abs() < 0.05, "share {end} vs optimum {optimum}");
+        assert!(
+            (end - optimum).abs() < 0.05,
+            "share {end} vs optimum {optimum}"
+        );
     }
 
     #[test]
@@ -1259,7 +1329,10 @@ mod tests {
             "the trace-visible re-open counter must move with the latch"
         );
         let optimum = 18.0 / (22.0 + 18.0);
-        assert!((end - optimum).abs() < 0.03, "share {end} vs optimum {optimum}");
+        assert!(
+            (end - optimum).abs() < 0.03,
+            "share {end} vs optimum {optimum}"
+        );
     }
 
     #[test]
@@ -1273,9 +1346,15 @@ mod tests {
             (35e9 - 13e9 * t, 18e9)
         };
         let (reopens, end) = simulate((DType::Q8_0, 9103), plant(31), 0.36, 4096, &ramp);
-        assert!(reopens >= 2, "a slow drift left the latch shut: reopens={reopens}");
+        assert!(
+            reopens >= 2,
+            "a slow drift left the latch shut: reopens={reopens}"
+        );
         let optimum = 18.0 / (18.0 + 22.0);
-        assert!(end > optimum - 0.05, "the share did not track the drift: {end} vs {optimum}");
+        assert!(
+            end > optimum - 0.05,
+            "the share did not track the drift: {end} vs {optimum}"
+        );
     }
 
     #[test]
@@ -1283,7 +1362,11 @@ mod tests {
         assert_eq!(advance_reopen_streak(0, 0.001), 0, "in band clears the run");
         assert_eq!(advance_reopen_streak(0, 0.03), 1);
         assert_eq!(advance_reopen_streak(1, 0.03), 2, "a same-sign run extends");
-        assert_eq!(advance_reopen_streak(1, -0.03), -1, "noise flips sign, the run restarts");
+        assert_eq!(
+            advance_reopen_streak(1, -0.03),
+            -1,
+            "noise flips sign, the run restarts"
+        );
         assert_eq!(advance_reopen_streak(-2, -0.03), -3);
         assert_eq!(advance_reopen_streak(-2, 0.001), 0);
     }

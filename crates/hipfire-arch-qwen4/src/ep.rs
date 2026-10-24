@@ -15,12 +15,11 @@
 //! state so it is testable without a device. [`Qwen4EpMesh`] is the Qwen4
 //! instantiation: peers are [`Qwen4EpPeer`] and a failure on any rank aborts
 //! the row-gather barrier so no rank is left waiting on a dead peer. The mesh is
-//! rank-generic over EP2 and EP4 (`attach_ep_mesh` admits `1 + peers` of 2 or 4).
+//! rank-generic over EP2..=EP8 (`attach_ep_mesh` admits `1 + peers` of 2..=8).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
-    qwen4_ep_buffer_index, Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS,
-    QWEN4_EP_GATHER_MAX_ROWS,
+    Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
@@ -33,7 +32,7 @@ use hipfire_runtime::serve_contract::{
     TemplateIdentity, TokenizerIdentity,
 };
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
-use rdna_compute::moe::Qwen4EpOwnerTables;
+use rdna_compute::moe::{Qwen4EpOwnerTables, QWEN4_EP_OWNER_EXPERTS};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -43,7 +42,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {
@@ -144,6 +145,20 @@ impl Shared {
     fn poison(&self) -> Option<String> {
         lock(&self.poison).clone()
     }
+
+    /// Record a failure that belongs to no single rank (the ranks diverged)
+    /// and abort the barrier. The first failure wins.
+    fn fail_mesh(&self, message: &str) {
+        {
+            let mut poison = lock(&self.poison);
+            if poison.is_none() {
+                *poison = Some(message.to_string());
+            }
+        }
+        if let Some(abort) = self.abort.get() {
+            abort();
+        }
+    }
 }
 
 /// Peers load one after another in ascending rank order: the loader's host-RAM
@@ -213,7 +228,10 @@ fn worker_main<P: 'static>(
 ) -> Result<(), String> {
     let index = rank - 1;
     if !baton.wait(index) {
-        let _ = ready.send((rank, Err("not loaded: an earlier rank failed to load".to_string())));
+        let _ = ready.send((
+            rank,
+            Err("not loaded: an earlier rank failed to load".to_string()),
+        ));
         return Ok(());
     }
     let mut peer = match catch_unwind(AssertUnwindSafe(|| init(rank))) {
@@ -241,9 +259,7 @@ fn worker_main<P: 'static>(
         match catch_unwind(AssertUnwindSafe(|| job.run(rank, &mut peer))) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => shared.fail(rank, &error),
-            Err(payload) => {
-                shared.fail(rank, &format!("panicked: {}", panic_message(&*payload)))
-            }
+            Err(payload) => shared.fail(rank, &format!("panicked: {}", panic_message(&*payload))),
         }
         latch.count_down();
     }
@@ -327,6 +343,11 @@ impl<P: 'static> PeerPool<P> {
         self.shared.poison()
     }
 
+    /// Poison the pool with a failure no single rank owns.
+    pub(crate) fn poison_mesh(&self, message: &str) {
+        self.shared.fail_mesh(message);
+    }
+
     /// Run `f` on the workers `targets` (indices) while `local` runs on the
     /// calling thread; returns once every targeted worker finished. A failure
     /// or panic anywhere poisons the pool and aborts the barrier at once.
@@ -366,8 +387,10 @@ impl<P: 'static> PeerPool<P> {
             });
             if sent.is_err() {
                 latch.count_down();
-                self.shared
-                    .fail(index + 1, "worker thread is gone (it exited or panicked earlier)");
+                self.shared.fail(
+                    index + 1,
+                    "worker thread is gone (it exited or panicked earlier)",
+                );
             }
         }
         let local_result = local.map(|local| match catch_unwind(AssertUnwindSafe(local)) {
@@ -645,11 +668,10 @@ impl PeerMirrors {
 
 // ─────────────────────────────── Qwen4 mesh ───────────────────────────────
 
-/// Loads one peer rank on the worker's own thread: `(hip device id,
-/// placement)` → the peer's `Gpu` and a fully attached bundle (forward
-/// attached, experts uploaded compactly for the placement).
-pub type PeerLoadFn =
-    dyn Fn(i32, Qwen4EpPlacement) -> Result<(Gpu, Qwen4Bundle), String> + Send + Sync;
+/// Loads one peer rank on the worker's own thread: rank → the peer's `Gpu`
+/// (on the seal's physical device for the rank) and a fully attached bundle
+/// bound to rank 0's seal at that rank (`Qwen4Bundle::bind_ep_seal`).
+pub type PeerLoadFn = dyn Fn(usize) -> Result<(Gpu, Qwen4Bundle), String> + Send + Sync;
 
 /// What a peer worker owns.
 pub struct Qwen4EpPeer {
@@ -785,7 +807,12 @@ impl Qwen4EpRowGatherHook {
                 tables,
                 slot_owner: Mutex::new(plan.slot_owner),
             })
-            .map_err(|_| format!("qwen4 EP rank {}: balanced owners are already installed", self.rank))
+            .map_err(|_| {
+                format!(
+                    "qwen4 EP rank {}: balanced owners are already installed",
+                    self.rank
+                )
+            })
     }
 }
 
@@ -809,14 +836,20 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         down_expanded: &GpuTensor,
         topk_indices: &GpuTensor,
     ) -> Result<(), String> {
-        let buffer = qwen4_ep_buffer_index(usize::from(layer_idx), self.trunk_layers);
+        // Singleton forwards select by layer parity; lane steps select by
+        // invocation ordinal because a layer can invoke MoE more than once.
+        // The expanded-row allocation identifies the actual transport buffer.
         let ptr = down_expanded.buf.as_ptr() as usize;
-        if self.buffer_ptrs.get(buffer) != Some(&ptr) {
-            return Err(format!(
-                "qwen4 EP row gather: layer {layer_idx} expanded rows at {ptr:#x} are not gather buffer {buffer} of rank {}",
-                self.rank
-            ));
-        }
+        let buffer = self
+            .buffer_ptrs
+            .iter()
+            .position(|&buffer_ptr| buffer_ptr == ptr)
+            .ok_or_else(|| {
+                format!(
+                    "qwen4 EP row gather: layer {layer_idx} expanded rows at {ptr:#x} are not a gather buffer of rank {}",
+                    self.rank
+                )
+            })?;
         note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
         // A balanced layer gathers from the owners its own assignment wrote
         // this call; every other layer keeps the static `e % ranks` placement.
@@ -839,11 +872,16 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 gpu,
                 self.rank,
                 buffer,
-                EpSlotOwners::ExpertModulo(topk_indices),
+                EpSlotOwners::ExpertModulo(topk_indices, QWEN4_EP_OWNER_EXPERTS),
                 slots,
             ),
         };
-        result.map_err(|error| format!("qwen4 EP row gather layer {layer_idx} rank {}: {error}", self.rank))
+        result.map_err(|error| {
+            format!(
+                "qwen4 EP row gather layer {layer_idx} rank {}: {error}",
+                self.rank
+            )
+        })
     }
 
     fn assigns_owners(&self, layer_idx: u16) -> bool {
@@ -897,7 +935,10 @@ mod gather_hook_tests {
             note_gather_buffer(&last, 1, buffer).unwrap();
         }
         let error = note_gather_buffer(&last, 1, 0).unwrap_err();
-        assert!(error.contains("buffer 0") && error.contains("rank 1"), "{error}");
+        assert!(
+            error.contains("buffer 0") && error.contains("rank 1"),
+            "{error}"
+        );
         // The same buffer twice in a row is refused wherever it occurs.
         assert!(note_gather_buffer(&last, 1, 2).is_ok());
         assert!(note_gather_buffer(&last, 1, 2).is_err());
@@ -918,8 +959,14 @@ mod gather_hook_tests {
         // than the trunk to prove the head range is excluded by the guard.
         let by_layer = [None, Some(tables), None, Some(tables), Some(tables)];
         let trunk_layers = 4;
-        assert_eq!(balanced_layer_tables(&by_layer, 1, trunk_layers), Some(&tables));
-        assert_eq!(balanced_layer_tables(&by_layer, 3, trunk_layers), Some(&tables));
+        assert_eq!(
+            balanced_layer_tables(&by_layer, 1, trunk_layers),
+            Some(&tables)
+        );
+        assert_eq!(
+            balanced_layer_tables(&by_layer, 3, trunk_layers),
+            Some(&tables)
+        );
         assert_eq!(balanced_layer_tables(&by_layer, 0, trunk_layers), None);
         assert_eq!(balanced_layer_tables(&by_layer, 2, trunk_layers), None);
         // The MTP head's layer indices start at the trunk layer count.
@@ -1016,7 +1063,14 @@ impl MoeTileExchange for Qwen4EpTileExchangeHook {
         tiles: usize,
     ) -> Result<(), String> {
         self.tile
-            .exchange(gpu, self.rank, &self.owner_table, tile_ids, y_down_grouped, tiles)
+            .exchange(
+                gpu,
+                self.rank,
+                &self.owner_table,
+                tile_ids,
+                y_down_grouped,
+                tiles,
+            )
             .map_err(|error| error.to_string())
     }
 }
@@ -1058,6 +1112,24 @@ impl Qwen4EpMesh {
         self.pool.poisoned()
     }
 
+    /// Poison the mesh after the ranks diverged on a result that must agree.
+    pub(crate) fn poison(&self, message: &str) {
+        self.pool.poison_mesh(message);
+    }
+
+    /// [`Self::run`] that also runs on a poisoned mesh (rollback and teardown
+    /// drains).
+    pub(crate) fn run_forced<R: Send>(
+        &self,
+        local: impl FnOnce() -> Result<R, String>,
+        job: PeerJob<'_, R>,
+    ) -> Result<Vec<R>, String> {
+        self.pool
+            .run_all_forced(local, &|_, peer: &mut Qwen4EpPeer| {
+                job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
+            })
+    }
+
     /// Run `job` on every peer while `local` runs rank 0 on the caller's
     /// thread. Results in rank order. Any rank's error or panic aborts the
     /// row-gather barrier, poisons the mesh, and is returned (the first one).
@@ -1081,12 +1153,13 @@ impl Qwen4EpMesh {
     /// Drain every rank, stop the workers (each frees its own bundle on its
     /// thread) and release rank 0's gather events. Always attempts every step.
     pub(crate) fn close(self, gpu: &mut Gpu) -> Result<(), String> {
-        let Self { pool, gather, tile, .. } = self;
+        let Self {
+            pool, gather, tile, ..
+        } = self;
         let mut first: Option<String> = None;
-        let drained = pool.run_all_forced(
-            || sync_device(gpu),
-            &|_, peer: &mut Qwen4EpPeer| sync_device(&mut peer.gpu),
-        );
+        let drained = pool.run_all_forced(|| sync_device(gpu), &|_, peer: &mut Qwen4EpPeer| {
+            sync_device(&mut peer.gpu)
+        });
         if let Err(error) = drained {
             first.get_or_insert(error);
         }
@@ -1105,7 +1178,7 @@ impl Qwen4EpMesh {
     }
 }
 
-fn ep_err(message: impl Into<String>) -> BundleError {
+pub(crate) fn ep_err(message: impl Into<String>) -> BundleError {
     BundleError::Forward(format!("qwen4 EP: {}", message.into()))
 }
 
@@ -1133,7 +1206,9 @@ impl Qwen4Bundle {
     ) -> Result<R, String> {
         let ranks = self.ranks();
         if rank >= ranks {
-            return Err(format!("qwen4 EP rank {rank} out of range (ranks = {ranks})"));
+            return Err(format!(
+                "qwen4 EP rank {rank} out of range (ranks = {ranks})"
+            ));
         }
         if rank == 0 {
             let mesh = self.ep.take();
@@ -1156,12 +1231,13 @@ impl Qwen4Bundle {
 
     /// Replicate the loaded single-rank bundle into an EP mesh.
     ///
-    /// `self` is rank 0 on `gpu` and must already be loaded with the rank-0
-    /// expert-parallel placement and its forward attached. `peer_device_ids`
-    /// are the HIP devices of ranks `1..`; `loader` builds one peer on its
-    /// worker thread (hipfire-loader supplies it). Sequence:
+    /// `self` is rank 0 on `gpu`: loaded with its forward attached and bound
+    /// to its load's seal ([`Qwen4Bundle::bind_ep_seal`]), from which the
+    /// rank count and every rank's physical device come. `loader` builds one
+    /// peer on its worker thread (hipfire-loader supplies it). Sequence:
     ///
-    /// 1. every peer loads concurrently on its own thread; its config and EP
+    /// 1. every peer loads on its own thread; it must be bound to rank 0's
+    ///    seal at its own rank on the seal's device, and its config and EP
     ///    placement are checked against rank 0;
     /// 2. each rank registers its gather buffers with one
     ///    [`EpRowGatherBuilder`](hipfire_runtime::ep_row_gather::EpRowGatherBuilder)
@@ -1171,8 +1247,8 @@ impl Qwen4Bundle {
     /// 5. every rank builds its full (P2P) tables from all sources and installs
     ///    the row-gather hook (`Qwen4GpuForward::attach_ep`);
     /// 5b. with `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, every rank's tile-exchange
-    ///    registration and symmetric verdicts are collected (`run_all`, every rank, EP2
-    ///    and EP4); the exchange is installed only if all ranks admitted and agree;
+    ///    registration and symmetric verdicts are collected (`run_all`, every rank, any
+    ///    admitted rank count); the exchange is installed only if all ranks admitted and agree;
     /// 6. per-rank memory is recorded and the mesh is stored in `self`.
     ///
     /// On `Err` the bundle must be freed, not served (rank 0's forward may
@@ -1180,24 +1256,37 @@ impl Qwen4Bundle {
     pub fn attach_ep_mesh(
         &mut self,
         gpu: &mut Gpu,
-        peer_device_ids: &[i32],
         loader: Arc<PeerLoadFn>,
     ) -> Result<(), BundleError> {
         if self.ep.is_some() {
             return Err(ep_err("the mesh is already attached"));
         }
-        let ranks = 1 + peer_device_ids.len();
-        if !matches!(ranks, 2 | 4) {
-            return Err(ep_err(format!("{ranks} ranks requested; supported: 2 or 4")));
-        }
-        let mut device_ids = vec![gpu.device_id];
-        for &id in peer_device_ids {
-            if device_ids.contains(&id) {
-                return Err(ep_err(format!("device {id} is used by more than one rank")));
+        let seal = match &self.ep_seal {
+            Some(bound) if bound.rank == 0 => bound.seal.clone(),
+            Some(bound) => {
+                return Err(ep_err(format!(
+                    "this bundle is rank {}, not rank 0",
+                    bound.rank
+                )))
             }
-            device_ids.push(id);
+            None => return Err(ep_err("rank 0 is not bound to an EP seal")),
+        };
+        let ranks = seal.ranks();
+        if !(2..=8).contains(&ranks) {
+            return Err(ep_err(format!("{ranks} ranks requested; supported: 2..=8")));
         }
-        let own = Qwen4EpPlacement { rank: 0, ranks };
+        // The sealed planner admitted the physical devices (distinct unless
+        // `HIPFIRE_EMULATE_GPUS` aliases logical ranks onto one device).
+        let device_ids = seal.physical_devices().to_vec();
+        if device_ids[0] != gpu.device_id {
+            return Err(ep_err(format!(
+                "rank 0 runs on device {}, the seal places it on {}",
+                gpu.device_id, device_ids[0]
+            )));
+        }
+        let own = seal
+            .placement(0)
+            .map_err(|error| ep_err(error.to_string()))?;
         let forward = self
             .execution
             .as_ref()
@@ -1216,36 +1305,39 @@ impl Qwen4Bundle {
         };
         let fingerprint = self.ep_replication_fingerprint();
 
-        let inits: Vec<Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>> =
-            peer_device_ids
-                .iter()
-                .map(|&device| {
-                    let loader = loader.clone();
-                    let config = self.config.clone();
-                    let fingerprint = fingerprint.clone();
-                    Box::new(move |rank: usize| {
-                        let placement = Qwen4EpPlacement { rank, ranks };
-                        let (gpu, mut bundle) = loader(device, placement)?;
-                        align_peer_session(&mut bundle, placement, &fingerprint);
-                        let peer = Qwen4EpPeer {
-                            rank,
-                            gpu,
-                            bundle,
-                            mirrors: PeerMirrors::default(),
-                            gather: None,
-                            tile: None,
-                        };
-                        let checked = peer.check_replica(&config, placement, &fingerprint);
-                        match checked {
-                            Ok(()) => Ok(peer),
-                            Err(error) => {
-                                let _ = peer.teardown();
-                                Err(error)
-                            }
+        let inits: Vec<Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>> = (1..ranks)
+            .map(|_| {
+                let loader = loader.clone();
+                let config = self.config.clone();
+                let fingerprint = fingerprint.clone();
+                let seal = seal.clone();
+                Box::new(move |rank: usize| {
+                    // Before the load: no early return may drop a loaded peer
+                    // without its teardown.
+                    let placement = seal.placement(rank).map_err(|error| error.to_string())?;
+                    let (gpu, mut bundle) = loader(rank)?;
+                    align_peer_session(&mut bundle, placement, &fingerprint);
+                    let peer = Qwen4EpPeer {
+                        rank,
+                        gpu,
+                        bundle,
+                        mirrors: PeerMirrors::default(),
+                        gather: None,
+                        tile: None,
+                    };
+                    let checked = peer
+                        .check_seal(&seal)
+                        .and_then(|()| peer.check_replica(&config, placement, &fingerprint));
+                    match checked {
+                        Ok(()) => Ok(peer),
+                        Err(error) => {
+                            let _ = peer.teardown();
+                            Err(error)
                         }
-                    }) as Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>
-                })
-                .collect();
+                    }
+                }) as Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>
+            })
+            .collect();
         let pool = PeerPool::spawn(inits, Qwen4EpPeer::teardown).map_err(ep_err)?;
 
         match self.ep_attach_steps(gpu, pool, spec, trunk_layers, device_ids) {
@@ -1286,10 +1378,9 @@ impl Qwen4Bundle {
         {
             let me = &*self;
             let gpu0 = &mut *gpu;
-            pool.run_all(
-                || register(0, me, gpu0),
-                &|rank, peer: &mut Qwen4EpPeer| register(rank, &peer.bundle, &mut peer.gpu),
-            )?;
+            pool.run_all(|| register(0, me, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
+                register(rank, &peer.bundle, &mut peer.gpu)
+            })?;
         }
         let gather = lock(&builder)
             .take()
@@ -1314,10 +1405,9 @@ impl Qwen4Bundle {
         // P2P is enabled below) with one transport.
         let capacities = {
             let me = &*self;
-            pool.run_all(
-                || Ok(tile_capacity(me)),
-                &|_, peer: &mut Qwen4EpPeer| Ok(tile_capacity(&peer.bundle)),
-            )
+            pool.run_all(|| Ok(tile_capacity(me)), &|_, peer: &mut Qwen4EpPeer| {
+                Ok(tile_capacity(&peer.bundle))
+            })
         };
         let capacities = match capacities {
             Ok(capacities) => capacities,
@@ -1355,7 +1445,9 @@ impl Qwen4Bundle {
                 let gpu0 = &mut *gpu;
                 pool.run_all(
                     || register_tile(0, me, gpu0),
-                    &|rank, peer: &mut Qwen4EpPeer| register_tile(rank, &peer.bundle, &mut peer.gpu),
+                    &|rank, peer: &mut Qwen4EpPeer| {
+                        register_tile(rank, &peer.bundle, &mut peer.gpu)
+                    },
                 )
             };
             if let Err(error) = registered {
@@ -1397,14 +1489,11 @@ impl Qwen4Bundle {
         };
         let enabled = {
             let gpu0 = &mut *gpu;
-            pool.run_all(
-                || enable(0, gpu0),
-                &|rank, peer: &mut Qwen4EpPeer| {
-                    peer.gather = Some(gather.clone());
-                    peer.tile = tile.clone();
-                    enable(rank, &mut peer.gpu)
-                },
-            )
+            pool.run_all(|| enable(0, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
+                peer.gather = Some(gather.clone());
+                peer.tile = tile.clone();
+                enable(rank, &mut peer.gpu)
+            })
         };
         if let Err(error) = enabled {
             return Err(release_rank0(gpu, error));
@@ -1413,10 +1502,9 @@ impl Qwen4Bundle {
         // 4. Compact expert sources of every rank.
         let sources = {
             let me = &*self;
-            pool.run_all(
-                || rank_sources(me),
-                &|_, peer: &mut Qwen4EpPeer| rank_sources(&peer.bundle),
-            )
+            pool.run_all(|| rank_sources(me), &|_, peer: &mut Qwen4EpPeer| {
+                rank_sources(&peer.bundle)
+            })
         };
         let sources: Vec<Vec<Qwen4PeerExpertSource>> = match sources {
             Ok(sources) => sources,
@@ -1446,7 +1534,9 @@ impl Qwen4Bundle {
                 .map_err(|error| format!("attach EP tables: {error}"))
                 .and_then(|()| match forward.balanced_plan() {
                     // Default on (`HIPFIRE_EP_BALANCED_OWNERS=0` disables) with a
-                    // host-mapped layer.
+                    // host-mapped layer on gfx1201 at 2..=4 ranks; other arches and
+                    // more ranks run the exact static split (`attach_ep` builds no
+                    // balanced layers).
                     Some(plan) => hook.install_balanced(plan),
                     None => Ok(()),
                 });
@@ -1456,26 +1546,25 @@ impl Qwen4Bundle {
         let attached = {
             let me = &mut *self;
             let gpu0 = &mut *gpu;
-            pool.run_all(
-                || attach(0, me, gpu0),
-                &|rank, peer: &mut Qwen4EpPeer| attach(rank, &mut peer.bundle, &mut peer.gpu),
-            )
+            pool.run_all(|| attach(0, me, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
+                attach(rank, &mut peer.bundle, &mut peer.gpu)
+            })
         };
         if let Err(error) = attached {
             return Err(release_rank0(gpu, error));
         }
 
-        // 5b. Owner-routed chunk MoE (EP2/EP4): every rank's per-layer symmetric verdicts (taken
-        // on the full tables in `attach_ep`) must be identical and all-true on ALL ranks; only
+        // 5b. Owner-routed chunk MoE (EP2..EP8): every rank's per-layer verdicts (symmetric IU4
+        // headers on gfx1201, QT44/QT53 formats on gfx1100's F16 WMMA route; taken on the full
+        // tables in `attach_ep`) must be identical and all-true on ALL ranks; only
         // then does every rank propagate them to its compact layers and install the exchange.
         // Any mismatch refuses the lever for this load: never a per-rank route divergence.
         if let Some(tile) = tile.as_ref() {
             let verdicts = {
                 let me = &*self;
-                pool.run_all(
-                    || Ok(tile_verdicts(me)),
-                    &|_, peer: &mut Qwen4EpPeer| Ok(tile_verdicts(&peer.bundle)),
-                )
+                pool.run_all(|| Ok(tile_verdicts(me)), &|_, peer: &mut Qwen4EpPeer| {
+                    Ok(tile_verdicts(&peer.bundle))
+                })
             };
             let verdicts = match verdicts {
                 Ok(verdicts) => verdicts,
@@ -1506,16 +1595,15 @@ impl Qwen4Bundle {
                 };
                 let installed = {
                     let me = &mut *self;
-                    pool.run_all(
-                        || install(0, me),
-                        &|rank, peer: &mut Qwen4EpPeer| install(rank, &mut peer.bundle),
-                    )
+                    pool.run_all(|| install(0, me), &|rank, peer: &mut Qwen4EpPeer| {
+                        install(rank, &mut peer.bundle)
+                    })
                 };
                 if let Err(error) = installed {
                     return Err(release_rank0(gpu, error));
                 }
                 eprintln!(
-                    "qwen4 EP: owner-routed prefill on ({} MoE layers symmetric on every rank, \
+                    "qwen4 EP: owner-routed prefill on ({} MoE layers admitted on every rank, \
                      owners e % {ranks})",
                     layer_count
                 );
@@ -1529,7 +1617,7 @@ impl Qwen4Bundle {
                     })
                     .collect();
                 eprintln!(
-                    "qwen4 EP: owner-routed prefill refused (per-rank symmetric layers {counts:?} \
+                    "qwen4 EP: owner-routed prefill refused (per-rank admitted layers {counts:?} \
                      are not identical and complete); chunks keep the full-table route"
                 );
             }
@@ -1574,10 +1662,7 @@ impl Qwen4Bundle {
         let Some(mesh) = self.ep.take() else {
             return local(self);
         };
-        let result = mesh.run(
-            || local(&mut *self).map_err(|error| error.to_string()),
-            job,
-        );
+        let result = mesh.run(|| local(&mut *self).map_err(|error| error.to_string()), job);
         self.ep = Some(mesh);
         result
             .and_then(|values| agree(what, values))
@@ -1634,13 +1719,26 @@ impl Qwen4Bundle {
         agreed
     }
 
-    /// Refuse an entry point that has no EP replication (lanes, MTP/spec, state
-    /// snapshots) instead of running it on rank 0 alone and stalling the gather
-    /// barrier.
+    /// Refuse an entry point that has no EP replication (MTP/spec, state
+    /// snapshots, wave prefill) instead of running it on rank 0 alone and
+    /// stalling the gather barrier.
     pub(crate) fn ep_refuse(&self, what: &str) -> Result<(), BundleError> {
+        self.pp_refuse(what)?;
         if self.ep.is_some() {
             return Err(BundleError::Forward(format!(
                 "{what} is unsupported under qwen4 EP"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse an entry point that has no pipeline-parallel form. Entry points
+    /// replicated across an EP mesh (fn-lanes) use this instead of
+    /// [`Self::ep_refuse`].
+    pub(crate) fn pp_refuse(&self, what: &str) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(BundleError::Forward(format!(
+                "{what} is not supported under qwen4 topology.pp yet"
             )));
         }
         Ok(())
@@ -1845,6 +1943,521 @@ impl Qwen4Bundle {
     }
 }
 
+// ───────────────────────────────── fn-lanes ─────────────────────────────────
+
+use crate::lane::{LaneSpecConfig, LaneStoreReceipt, Qwen4LaneStore};
+use crate::lane_exec::{LaneDraft, Qwen4LaneExecutor};
+use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, StepOutput};
+
+/// Free device bytes a rank keeps beyond its lane store when EP stages lanes.
+/// The single-device loader (`batch_staging::stage_qwen4_lanes`) compares the
+/// store with the free device memory directly, with no reserve, and EP stages
+/// by the same rule; a loader that reserves headroom passes its own value to
+/// [`ep_lane_budget`] / [`ep_lane_fit`].
+pub const QWEN4_EP_LANE_RESERVE_BYTES: u64 = 0;
+
+/// Device bytes a rank may commit to its lane store: its own `free` memory
+/// minus `reserve` (saturating).
+pub fn ep_lane_budget(free: u64, reserve: u64) -> u64 {
+    free.saturating_sub(reserve)
+}
+
+/// Whether a lane store of `need` bytes fits rank `rank`'s `free` memory
+/// after `reserve`; the refusal names the rank, the need and the free bytes.
+pub fn ep_lane_fit(rank: usize, need: u64, free: u64, reserve: u64) -> Result<(), String> {
+    if need <= ep_lane_budget(free, reserve) {
+        return Ok(());
+    }
+    Err(format!(
+        "rank {rank}: lane store needs {need} bytes, {free} bytes free ({reserve} bytes reserved)"
+    ))
+}
+
+/// Row budget an AR lane store is staged with: the requested step row budget
+/// (`serve.max_batch_tokens`), never below one row per lane. The one rule the
+/// load-time reservation and the batch staging share.
+pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
+    requested_row_budget.max(lanes)
+}
+
+/// Device bytes one rank's lane store commits, for `lanes` lanes at
+/// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
+/// `max_seq`, `chunk_rows` and `granularity` are the context commit the QSA
+/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). The single
+/// source of the byte count: the loader's EP load reservation and
+/// `stage_rank_lanes` (and the single-device staging check) all call it, so
+/// planned and staged bytes cannot differ. `None` on overflow.
+#[allow(clippy::too_many_arguments)]
+pub fn ep_lane_store_device_bytes(
+    config: &crate::Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    backend: crate::Qwen4KvBackend,
+    max_seq: usize,
+    chunk_rows: usize,
+    granularity: usize,
+    lanes: usize,
+    row_budget: usize,
+    spec_k: Option<usize>,
+) -> Option<u64> {
+    let context =
+        crate::kv_backend::Qwen4ContextCommit::new(backend, max_seq, chunk_rows, granularity);
+    Qwen4LaneStore::device_bytes(config, format, &context, lanes, row_budget, spec_k)
+}
+
+/// A lane-entry error as the plain text every rank compares.
+fn bundle_text(error: BundleError) -> String {
+    match error {
+        BundleError::Forward(message) => message,
+        other => other.to_string(),
+    }
+}
+
+/// Run `f` on `bundle`'s lane executor (`Qwen4Bundle::lane_executor`).
+fn run_lane_exec<T>(
+    bundle: &mut Qwen4Bundle,
+    f: impl FnOnce(&mut Qwen4LaneExecutor<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut executor = bundle.lane_executor().map_err(bundle_text)?;
+    f(&mut executor)
+}
+
+/// One rank's lane staging: the loader's budget check against this rank's own
+/// free memory, then the singleton `stage_lanes`. `Ok` means this call
+/// created the rank's store; `Err` means it created nothing.
+fn stage_rank_lanes(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    max_lanes: usize,
+    row_budget: usize,
+    reserve: u64,
+) -> Result<(), String> {
+    let rank = bundle
+        .weights
+        .ep_placement()
+        .map_or(0, |placement| placement.rank);
+    let max_seq = bundle.state.max_seq_len;
+    // The rank's attached forward plan; an EP load always keeps `Full`.
+    let mode = bundle
+        .forward_scratch_mode()
+        .unwrap_or(crate::gpu_forward::Qwen4ForwardScratchMode::Full);
+    let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, mode);
+    let need = ep_lane_store_device_bytes(
+        &bundle.config,
+        bundle.state_format(),
+        bundle.state.qsa_backend(),
+        max_seq,
+        chunk,
+        gpu.vmm_recommended_granularity().unwrap_or(1),
+        max_lanes,
+        row_budget,
+        None,
+    )
+    .ok_or_else(|| format!("rank {rank}: lane store device bytes overflow"))?;
+    let free = gpu
+        .device_mem_info()
+        .map(|(free, _)| free as u64)
+        .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
+    ep_lane_fit(rank, need, free, reserve)?;
+    bundle
+        .stage_lanes(gpu, max_lanes, row_budget, None)
+        .map_err(|error| format!("rank {rank}: {}", bundle_text(error)))
+}
+
+/// Free the lane store a failed stage left on this rank (a no-op when none).
+fn rollback_rank_lanes(bundle: &mut Qwen4Bundle, gpu: &mut Gpu) -> Result<(), String> {
+    match bundle.lanes.take() {
+        Some(store) => store.free_gpu(gpu),
+        None => Ok(()),
+    }
+}
+
+fn rank_lane_receipt(bundle: &Qwen4Bundle, gpu: &Gpu) -> Result<LaneStoreReceipt, String> {
+    bundle
+        .lanes()
+        .map(|store| store.receipt(gpu))
+        .ok_or_else(|| "Qwen4 lanes are not staged".to_string())
+}
+
+/// The replicated forms of the fn-lanes entries. Every rank owns its own
+/// lane store, built from the same calls in the same order, so the host lane
+/// tables stay identical; the device states differ per rank only in what the
+/// row gather and the expert split make rank-local.
+///
+/// Two failure disciplines, both requiring agreed host results:
+///
+/// - [`Self::ep_lane_soft`] (everything but `forward_step`): no rank blocks on
+///   the row-gather barrier, so a refusal or error every rank reports
+///   identically is returned as an ordinary error and the mesh stays usable.
+///   Ranks that disagree (one failed, or different outcomes) have diverged
+///   tables or states: the mesh is poisoned.
+/// - [`Self::ep_lane_strict`] (`forward_step`): ranks share the gather
+///   barrier, so any rank's failure aborts it and poisons the mesh, as every
+///   singleton forward does.
+impl Qwen4Bundle {
+    /// Run `local` (rank 0, mesh detached) and `job` (every peer) and return
+    /// every rank's value in rank order without comparing them: only for
+    /// calls whose per-rank values legitimately differ (staging, receipts,
+    /// rollback). Without a mesh this is `local` alone. `forced` also runs on
+    /// a poisoned mesh (rollback drains).
+    fn ep_run_ranks<R: Send>(
+        &mut self,
+        forced: bool,
+        local: impl FnOnce(&mut Self) -> Result<R, String>,
+        job: PeerJob<'_, R>,
+    ) -> Result<Vec<R>, String> {
+        let Some(mesh) = self.ep.take() else {
+            return local(self).map(|value| vec![value]);
+        };
+        let result = if forced {
+            mesh.run_forced(|| local(&mut *self), job)
+        } else {
+            mesh.run(|| local(&mut *self), job)
+        };
+        self.ep = Some(mesh);
+        result
+    }
+
+    /// Host-only / non-barrier lane call over [`Self::ep_fanout`]: every
+    /// rank's whole outcome (value or error) is the fanned-out result, so an
+    /// error all ranks agree on comes back as an ordinary `Err` and leaves
+    /// the mesh usable. A mesh failure or a disagreement between ranks
+    /// (already poisoned or not) leaves the mesh poisoned.
+    fn ep_lane_soft<T: Send + PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        local: impl FnOnce(&mut Self) -> Result<T, String>,
+        job: PeerJob<'_, T>,
+    ) -> Result<T, String> {
+        let fanned = self.ep_fanout(
+            what,
+            |bundle| Ok(local(bundle)),
+            &|bundle, peer_gpu, mirrors| Ok(job(bundle, peer_gpu, mirrors)),
+        );
+        match fanned {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = bundle_text(error);
+                if let Some(mesh) = self.ep.as_ref() {
+                    mesh.poison(&message);
+                }
+                Err(message)
+            }
+        }
+    }
+
+    /// Barrier-sharing lane call: [`Self::ep_fanout`] as is (any failure
+    /// poisons the mesh).
+    fn ep_lane_strict<T: Send + PartialEq + std::fmt::Debug>(
+        &mut self,
+        what: &str,
+        local: impl FnOnce(&mut Self) -> Result<T, String>,
+        job: PeerJob<'_, T>,
+    ) -> Result<T, String> {
+        self.ep_fanout(
+            what,
+            |bundle| local(bundle).map_err(BundleError::Forward),
+            job,
+        )
+        .map_err(bundle_text)
+    }
+
+    /// Stage the AR lane store on every rank, all or nothing. Refused before
+    /// any work for a native-MTP spec, or when any rank already holds a store
+    /// (rollback frees only stores this call made). Each rank checks the
+    /// store against its own free memory ([`ep_lane_fit`], reserve
+    /// [`QWEN4_EP_LANE_RESERVE_BYTES`]); if any rank fails, every rank's new
+    /// store is freed and the first failure is returned. A failed stage does
+    /// not poison the mesh (the singleton route keeps running).
+    pub(crate) fn ep_stage_lanes(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+        spec: Option<LaneSpecConfig>,
+    ) -> Result<(), BundleError> {
+        if spec.is_some() {
+            return Err(ep_err(
+                "native-MTP lanes are not supported yet; stage AR lanes (serve.batch_spec = false)",
+            ));
+        }
+        let reserve = QWEN4_EP_LANE_RESERVE_BYTES;
+        let staged = self
+            .ep_run_ranks(
+                false,
+                |bundle| Ok(bundle.lanes.is_some()),
+                &|bundle, _, _| Ok(bundle.lanes.is_some()),
+            )
+            .map_err(BundleError::Forward)?;
+        if let Some(rank) = staged.iter().position(|&has_store| has_store) {
+            return Err(ep_err(format!(
+                "Qwen4 lanes are already staged (rank {rank})"
+            )));
+        }
+        let outcomes = self.ep_run_ranks(
+            false,
+            |bundle| {
+                Ok(stage_rank_lanes(
+                    bundle, gpu, max_lanes, row_budget, reserve,
+                ))
+            },
+            &|bundle, peer_gpu, _| {
+                Ok(stage_rank_lanes(
+                    bundle, peer_gpu, max_lanes, row_budget, reserve,
+                ))
+            },
+        );
+        let reason = match outcomes {
+            Ok(outcomes) => match outcomes.into_iter().find_map(Result::err) {
+                Some(reason) => reason,
+                None => return Ok(()),
+            },
+            Err(pool) => pool,
+        };
+        let rollback = self.ep_run_ranks(
+            true,
+            |bundle| rollback_rank_lanes(bundle, gpu),
+            &|bundle, peer_gpu, _| rollback_rank_lanes(bundle, peer_gpu),
+        );
+        let note = match rollback {
+            Ok(_) => String::new(),
+            Err(error) => format!("; rollback also failed: {error}"),
+        };
+        Err(ep_err(format!("{reason}{note}")))
+    }
+
+    /// Every rank's lane-store receipt in rank order (rank 0 alone without a
+    /// mesh), not compared: device receipts (`mapped_bytes`) legitimately
+    /// differ per rank. A rank without a store is an error naming it.
+    pub fn ep_lane_receipts(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<Vec<LaneStoreReceipt>, BundleError> {
+        let receipts = self
+            .ep_run_ranks(
+                false,
+                |bundle| Ok(rank_lane_receipt(bundle, gpu)),
+                &|bundle, peer_gpu, _| Ok(rank_lane_receipt(bundle, peer_gpu)),
+            )
+            .map_err(BundleError::Forward)?;
+        receipts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, receipt)| receipt.map_err(|error| ep_err(format!("rank {rank}: {error}"))))
+            .collect()
+    }
+
+    pub(crate) fn ep_admit_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+    ) -> Result<usize, BundleError> {
+        self.ep_lane_soft(
+            "admit_lane",
+            |bundle| {
+                bundle
+                    .admit_lane(gpu, epoch, prompt.clone())
+                    .map_err(bundle_text)
+            },
+            &|bundle, peer_gpu, _| {
+                bundle
+                    .admit_lane(peer_gpu, epoch, prompt.clone())
+                    .map_err(bundle_text)
+            },
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    /// [`Self::set_lane_stage_policy`] on every rank: the policy is
+    /// host-only, so ranks must agree (a store that cannot take it on every
+    /// rank refuses with the common message and leaves the mesh usable).
+    pub(crate) fn ep_set_lane_stage_policy(
+        &mut self,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "set_lane_stage_policy",
+            |bundle| bundle.set_lane_stage_policy_local(policy),
+            &|bundle, _, _| bundle.set_lane_stage_policy_local(policy),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_release_lane(&mut self, epoch: &RequestEpoch) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "release_lane",
+            |bundle| bundle.release_lane(epoch).map_err(bundle_text),
+            &|bundle, _, _| bundle.release_lane(epoch).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    /// `poison_lane` returns nothing: a mesh failure or disagreement is
+    /// logged (the mesh is poisoned and the next replicated call reports it).
+    pub(crate) fn ep_poison_lane(&mut self, epoch: &RequestEpoch) {
+        let poisoned = self.ep_lane_soft(
+            "poison_lane",
+            |bundle| {
+                bundle.poison_lane(epoch);
+                Ok(())
+            },
+            &|bundle, _, _| {
+                bundle.poison_lane(epoch);
+                Ok(())
+            },
+        );
+        if let Err(error) = poisoned {
+            eprintln!("  qwen4 EP: poison_lane: {error}");
+        }
+    }
+
+    pub(crate) fn ep_force_lane_seed(
+        &mut self,
+        epoch: &RequestEpoch,
+        token: u32,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "force_lane_seed",
+            |bundle| bundle.force_lane_seed(epoch, token).map_err(bundle_text),
+            &|bundle, _, _| bundle.force_lane_seed(epoch, token).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_abort_promotion(&mut self, epoch: &RequestEpoch) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "abort_promotion",
+            |bundle| bundle.abort_promotion(epoch).map_err(bundle_text),
+            &|bundle, _, _| bundle.abort_promotion(epoch).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_commit_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "commit_promotion",
+            |bundle| bundle.commit_promotion(gpu, epoch).map_err(bundle_text),
+            &|bundle, peer_gpu, _| {
+                bundle
+                    .commit_promotion(peer_gpu, epoch)
+                    .map_err(bundle_text)
+            },
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    pub(crate) fn ep_lane_draft_step(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[(RequestEpoch, usize)],
+    ) -> Result<Vec<LaneDraft>, String> {
+        self.ep_lane_soft(
+            "lane draft_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.draft_step(gpu, requests)),
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| exec.draft_step(peer_gpu, requests))
+            },
+        )
+    }
+
+    pub(crate) fn ep_lane_provision_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<(), String> {
+        self.ep_lane_soft(
+            "lane provision_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.provision_step(gpu, plan)),
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| exec.provision_step(peer_gpu, plan))
+            },
+        )
+    }
+
+    /// Best effort and void, like the singleton entry: a mesh failure or
+    /// disagreement is logged and `provision_step` grows on demand.
+    pub(crate) fn ep_lane_map_ahead_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+        remaining_new_tokens: usize,
+    ) {
+        let mapped = self.ep_lane_soft(
+            "lane map_ahead_decode",
+            |bundle| {
+                run_lane_exec(bundle, |exec| {
+                    exec.map_ahead_decode(gpu, epoch, remaining_new_tokens);
+                    Ok(())
+                })
+            },
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| {
+                    exec.map_ahead_decode(peer_gpu, epoch, remaining_new_tokens);
+                    Ok(())
+                })
+            },
+        );
+        if let Err(error) = mapped {
+            eprintln!("  qwen4 EP: lane map_ahead_decode: {error}");
+        }
+    }
+
+    pub(crate) fn ep_lane_forward_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<StepOutput, String> {
+        self.ep_lane_strict(
+            "lane forward_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.forward_step(gpu, plan)),
+            &|bundle, peer_gpu, _| run_lane_exec(bundle, |exec| exec.forward_step(peer_gpu, plan)),
+        )
+    }
+
+    pub(crate) fn ep_lane_commit_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+        output: StepOutput,
+    ) -> Result<Vec<RequestAdvance>, String> {
+        self.ep_lane_soft(
+            "lane commit_step",
+            |bundle| run_lane_exec(bundle, |exec| exec.commit_step(gpu, plan, output.clone())),
+            &|bundle, peer_gpu, _| {
+                run_lane_exec(bundle, |exec| {
+                    exec.commit_step(peer_gpu, plan, output.clone())
+                })
+            },
+        )
+    }
+
+    /// `abort_step` returns nothing: a mesh failure or disagreement is logged.
+    pub(crate) fn ep_lane_abort_step(&mut self, plan: &BatchStepPlan) {
+        let aborted = self.ep_lane_soft(
+            "lane abort_step",
+            |bundle| {
+                run_lane_exec(bundle, |exec| {
+                    exec.abort_step(plan);
+                    Ok(())
+                })
+            },
+            &|bundle, _, _| {
+                run_lane_exec(bundle, |exec| {
+                    exec.abort_step(plan);
+                    Ok(())
+                })
+            },
+        );
+        if let Err(error) = aborted {
+            eprintln!("  qwen4 EP: lane abort_step: {error}");
+        }
+    }
+}
+
 /// A peer loads without rank 0's tokenizer, so it has no session cache and no
 /// `<|im_end|>` id. Every rank plans prefill boundaries and snapshots from the
 /// same host configuration, so give the peer a cache of rank 0's budget and
@@ -1915,11 +2528,41 @@ pub(crate) struct ReplicaFingerprint {
     pub(crate) state_format: crate::state::Qwen4StateFormat,
     pub(crate) turn_end_token: Option<u32>,
     pub(crate) turn_snapshots: bool,
+    pub(crate) tail_snapshot: bool,
+    pub(crate) tail_snapshot_min_gap: usize,
+    pub(crate) tail_snapshot_min_prompt: usize,
     pub(crate) has_mtp: bool,
     pub(crate) has_lanes: bool,
 }
 
 impl Qwen4EpPeer {
+    /// A loaded peer must be bound to rank 0's seal itself (not an equal
+    /// one planned from another mesh epoch) at its own rank, on the seal's
+    /// physical device for that rank.
+    fn check_seal(&self, seal: &Arc<crate::ep_seal::Qwen4EpSeal>) -> Result<(), String> {
+        let bound = self
+            .bundle
+            .ep_seal()
+            .ok_or("the loaded peer is not bound to an EP seal")?;
+        if !Arc::ptr_eq(&bound.seal, seal) || bound.rank != self.rank {
+            return Err(format!(
+                "the loaded peer is bound to rank {} of a seal of epoch {}, expected rank {} of epoch {}",
+                bound.rank,
+                bound.seal.mesh().epoch().as_u64(),
+                self.rank,
+                seal.mesh().epoch().as_u64()
+            ));
+        }
+        let device = seal.physical_devices()[self.rank];
+        if self.gpu.device_id != device {
+            return Err(format!(
+                "the loaded peer runs on device {}, the seal places rank {} on {device}",
+                self.gpu.device_id, self.rank
+            ));
+        }
+        Ok(())
+    }
+
     /// A loaded peer must be the same model as rank 0, at its own placement,
     /// with the same host-side request configuration.
     fn check_replica(
@@ -2013,10 +2656,9 @@ mod tests {
         let tokens = vec![3u32, 5, 7];
         let sum = |t: &[u32]| t.iter().sum::<u32>() as i64;
         let out = pool
-            .run_all(
-                || Ok(sum(&tokens)),
-                &|_, peer: &mut Fake| Ok(sum(&tokens) + peer.rank as i64),
-            )
+            .run_all(|| Ok(sum(&tokens)), &|_, peer: &mut Fake| {
+                Ok(sum(&tokens) + peer.rank as i64)
+            })
             .expect("run");
         assert_eq!(out, vec![15, 16, 17]);
     }
@@ -2030,21 +2672,26 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
         let error = pool
-            .run_all(
-                || Ok(()),
-                &|rank, _: &mut Fake| {
-                    if rank == 2 {
-                        Err("boom".to_string())
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
+            .run_all(|| Ok(()), &|rank, _: &mut Fake| {
+                if rank == 2 {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            })
             .expect_err("rank 2 fails");
-        assert!(error.contains("rank 2") && error.contains("boom"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("boom"),
+            "{error}"
+        );
         assert!(aborts.load(Ordering::SeqCst) >= 1);
-        let again = pool.run_all(|| Ok(()), &|_, _: &mut Fake| Ok(())).expect_err("poisoned");
-        assert!(again.contains("poisoned") && again.contains("boom"), "{again}");
+        let again = pool
+            .run_all(|| Ok(()), &|_, _: &mut Fake| Ok(()))
+            .expect_err("poisoned");
+        assert!(
+            again.contains("poisoned") && again.contains("boom"),
+            "{again}"
+        );
         assert!(pool.poisoned().is_some());
         // A forced run (teardown drain) still reaches the workers.
         pool.run_all_forced(|| Ok(()), &|_, _: &mut Fake| Ok(()))
@@ -2077,24 +2724,27 @@ mod tests {
                 },
             )
             .expect_err("fails");
-        assert!(error.contains("rank 0") && error.contains("rank0 failed"), "{error}");
+        assert!(
+            error.contains("rank 0") && error.contains("rank0 failed"),
+            "{error}"
+        );
     }
 
     #[test]
     fn peer_panic_becomes_an_error_and_the_worker_survives_for_teardown() {
         let pool = pool(2);
         let error = pool
-            .run_all(
-                || Ok(()),
-                &|rank, _: &mut Fake| {
-                    if rank == 1 {
-                        panic!("kernel exploded");
-                    }
-                    Ok(())
-                },
-            )
+            .run_all(|| Ok(()), &|rank, _: &mut Fake| {
+                if rank == 1 {
+                    panic!("kernel exploded");
+                }
+                Ok(())
+            })
             .expect_err("panic is an error");
-        assert!(error.contains("rank 1") && error.contains("kernel exploded"), "{error}");
+        assert!(
+            error.contains("rank 1") && error.contains("kernel exploded"),
+            "{error}"
+        );
         pool.run_all_forced(|| Ok(()), &|_, _: &mut Fake| Ok(()))
             .expect("workers still answer");
         pool.close().expect("close");
@@ -2123,7 +2773,9 @@ mod tests {
     #[test]
     fn run_rank_targets_one_peer() {
         let pool = pool(3);
-        let value = pool.run_rank(2, &|rank, peer: &mut Fake| Ok((rank, peer.value))).expect("run");
+        let value = pool
+            .run_rank(2, &|rank, peer: &mut Fake| Ok((rank, peer.value)))
+            .expect("run");
         assert_eq!(value, (2, 20));
         assert!(pool.run_rank(0, &|_, _: &mut Fake| Ok(())).is_err());
         assert!(pool.run_rank(4, &|_, _: &mut Fake| Ok(())).is_err());
@@ -2142,7 +2794,10 @@ mod tests {
             Box::new(|rank| Ok(Fake { rank, value: 0 })),
         ];
         let error = PeerPool::spawn(inits, count).err().expect("spawn fails");
-        assert!(error.contains("rank 2") && error.contains("load failed"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("load failed"),
+            "{error}"
+        );
         // Rank 1 built and is torn down; rank 3 never loads after rank 2 failed.
         assert_eq!(TORN_DOWN.load(Ordering::SeqCst), 1);
     }
@@ -2156,7 +2811,11 @@ mod tests {
                 let order = order.clone();
                 let active = active.clone();
                 Box::new(move |rank: usize| {
-                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0, "two loads overlapped");
+                    assert_eq!(
+                        active.fetch_add(1, Ordering::SeqCst),
+                        0,
+                        "two loads overlapped"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(10 * (5 - rank as u64)));
                     lock(&order).push(rank);
                     active.fetch_sub(1, Ordering::SeqCst);
@@ -2186,7 +2845,10 @@ mod tests {
             })
             .collect();
         let error = PeerPool::spawn(inits, teardown_ok).err().expect("fails");
-        assert!(error.contains("rank 2") && error.contains("out of host memory"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("out of host memory"),
+            "{error}"
+        );
         assert_eq!(loaded.load(Ordering::SeqCst), 2, "rank 3 must not load");
     }
 
@@ -2207,7 +2869,10 @@ mod tests {
             .collect();
         let pool = PeerPool::spawn(inits, bad).expect("spawn");
         let error = pool.close().expect_err("teardown error surfaces");
-        assert!(error.contains("rank 2") && error.contains("free failed"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("free failed"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2216,9 +2881,7 @@ mod tests {
         assert_eq!(agree("unit", vec![(), ()]).unwrap(), ());
         let error = agree("token", vec![7u32, 7, 9, 7]).unwrap_err();
         assert!(
-            error.contains("token")
-                && error.contains("rank 0 = 7")
-                && error.contains("rank 2 = 9"),
+            error.contains("token") && error.contains("rank 0 = 7") && error.contains("rank 2 = 9"),
             "{error}"
         );
         assert!(agree::<u32>("none", Vec::new()).is_err());
@@ -2246,6 +2909,144 @@ mod tests {
             }
         );
     }
+
+    fn lane_draft(tag: u64, route: crate::lane_exec::LaneRoute) -> crate::lane_exec::LaneDraft {
+        crate::lane_exec::LaneDraft {
+            epoch: RequestEpoch {
+                request_tag: tag,
+                owner_generation: 1,
+            },
+            route,
+            drafts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lane_results_must_agree_across_ranks() {
+        use crate::lane_exec::LaneRoute;
+        let ar = || Ok(vec![lane_draft(1, LaneRoute::Ar)]);
+        let outcomes: Vec<Result<Vec<_>, String>> = vec![ar(), ar(), ar()];
+        assert_eq!(agree("lane draft_step", outcomes).unwrap(), ar());
+        // A different route on one rank.
+        let error = agree(
+            "lane draft_step",
+            vec![ar(), Ok(vec![lane_draft(1, LaneRoute::ArRetired)])],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("lane draft_step") && error.contains("rank 1"),
+            "{error}"
+        );
+        // One rank refusing where the others succeed is a disagreement; every
+        // rank refusing identically is an agreed refusal.
+        let refusal: Result<Vec<_>, String> = Err("no free lane".to_string());
+        assert!(agree("lane draft_step", vec![ar(), refusal.clone()]).is_err());
+        assert_eq!(
+            agree("lane draft_step", vec![refusal.clone(), refusal.clone()]).unwrap(),
+            refusal
+        );
+        // Step output and advances compare field by field.
+        let output = |pick: u32| -> Result<StepOutput, String> {
+            Ok(StepOutput {
+                step_id: 3,
+                target_picks: vec![pick],
+            })
+        };
+        assert!(agree("lane forward_step", vec![output(5), output(5)]).is_ok());
+        assert!(agree("lane forward_step", vec![output(5), output(6)]).is_err());
+        let advance = |position: usize| -> Result<Vec<RequestAdvance>, String> {
+            Ok(vec![RequestAdvance {
+                epoch: RequestEpoch {
+                    request_tag: 1,
+                    owner_generation: 1,
+                },
+                committed_ids: vec![9],
+                committed_position: position,
+                accepted_drafts: 0,
+                verified_rows: 0,
+                finish: None,
+            }])
+        };
+        assert!(agree("lane commit_step", vec![advance(4), advance(4)]).is_ok());
+        assert!(agree("lane commit_step", vec![advance(4), advance(5)]).is_err());
+    }
+
+    #[test]
+    fn lane_budget_is_own_free_minus_reserve() {
+        assert_eq!(QWEN4_EP_LANE_RESERVE_BYTES, 0);
+        assert_eq!(ep_lane_budget(100, 0), 100);
+        assert_eq!(ep_lane_budget(100, 30), 70);
+        // The reserve never underflows.
+        assert_eq!(ep_lane_budget(10, 30), 0);
+        // The loader's rule at zero reserve: need <= free fits, one byte over does not.
+        assert!(ep_lane_fit(0, 100, 100, 0).is_ok());
+        assert!(ep_lane_fit(0, 70, 100, 30).is_ok());
+        let error = ep_lane_fit(3, 71, 100, 30).unwrap_err();
+        for part in [
+            "rank 3",
+            "needs 71 bytes",
+            "100 bytes free",
+            "30 bytes reserved",
+        ] {
+            assert!(error.contains(part), "{part}: {error}");
+        }
+        assert!(ep_lane_fit(2, 1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn ep_lane_reservation_bytes_are_the_stage_bytes() {
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let format = Qwen4StateFormat::F32;
+        let (max_seq, chunk, granularity) = (32768usize, 1536usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let mut previous = 0u64;
+        for lanes in [2usize, 4, 8] {
+            let budget = ep_lane_row_budget(4096, lanes);
+            let planned = ep_lane_store_device_bytes(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                lanes,
+                budget,
+                None,
+            );
+            assert_eq!(
+                planned,
+                Qwen4LaneStore::device_bytes(&config, format, &context, lanes, budget, None)
+            );
+            let planned = planned.unwrap();
+            assert!(planned > previous, "lanes={lanes}");
+            previous = planned;
+        }
+        // A request below one row per lane is raised to the lane count.
+        assert_eq!(ep_lane_row_budget(2, 8), 8);
+        assert_eq!(ep_lane_row_budget(0, 8), 8);
+        assert_eq!(ep_lane_row_budget(4096, 8), 4096);
+        // Overflow is reported, never wrapped.
+        assert_eq!(
+            ep_lane_store_device_bytes(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                usize::MAX,
+                usize::MAX,
+                None,
+            ),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2256,21 +3057,34 @@ mod tile_verdict_tests {
     fn agreement_needs_every_rank_identical_and_complete() {
         for ranks in [2usize, 4] {
             let all = vec![Some(vec![true; 40]); ranks];
-            assert_eq!(agreed_tile_verdicts(&all).map(Vec::len), Some(40), "{ranks}");
+            assert_eq!(
+                agreed_tile_verdicts(&all).map(Vec::len),
+                Some(40),
+                "{ranks}"
+            );
             // One rank that did not admit the lever refuses it for all.
             for absent in 0..ranks {
                 let mut mixed = all.clone();
                 mixed[absent] = None;
-                assert!(agreed_tile_verdicts(&mixed).is_none(), "{ranks} absent {absent}");
+                assert!(
+                    agreed_tile_verdicts(&mixed).is_none(),
+                    "{ranks} absent {absent}"
+                );
             }
             // One rank with one asymmetric layer, or a different layer count, refuses.
             for odd in 0..ranks {
                 let mut asymmetric = all.clone();
                 asymmetric[odd].as_mut().unwrap()[7] = false;
-                assert!(agreed_tile_verdicts(&asymmetric).is_none(), "{ranks} asym {odd}");
+                assert!(
+                    agreed_tile_verdicts(&asymmetric).is_none(),
+                    "{ranks} asym {odd}"
+                );
                 let mut shorter = all.clone();
                 shorter[odd].as_mut().unwrap().pop();
-                assert!(agreed_tile_verdicts(&shorter).is_none(), "{ranks} short {odd}");
+                assert!(
+                    agreed_tile_verdicts(&shorter).is_none(),
+                    "{ranks} short {odd}"
+                );
             }
         }
         assert!(agreed_tile_verdicts(&[]).is_none());

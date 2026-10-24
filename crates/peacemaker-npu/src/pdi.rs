@@ -24,7 +24,9 @@ fn put(w: &mut [u32], byte_off: usize, v: u32) {
 
 fn checksum(w: &mut [u32], start: usize, words: usize) {
     let s = start / 4;
-    let ck = !w[s..s + words - 1].iter().fold(0u32, |a, &x| a.wrapping_add(x));
+    let ck = !w[s..s + words - 1]
+        .iter()
+        .fold(0u32, |a, &x| a.wrapping_add(x));
     w[s + words - 1] = ck;
 }
 
@@ -53,7 +55,11 @@ pub fn build(cdo: &[u32]) -> Vec<u8> {
     put(&mut w, IH_OFF + 0x04, 1); // dataSectionCount
     let name = b"aie_image\0\0\0\0\0\0\0";
     for (i, c) in name.chunks(4).enumerate() {
-        put(&mut w, IH_OFF + 0x10 + 4 * i, u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        put(
+            &mut w,
+            IH_OFF + 0x10 + 4 * i,
+            u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+        );
     }
     put(&mut w, IH_OFF + 0x20, 0x1C00_0000); // imageId (AIE)
     checksum(&mut w, IH_OFF, 16);
@@ -74,7 +80,10 @@ pub fn build(cdo: &[u32]) -> Vec<u8> {
 
 /// Extract the CDO words from a PDI built in this layout (single image / partition).
 pub fn extract_cdo(pdi: &[u8]) -> Option<Vec<u32>> {
-    let w: Vec<u32> = pdi.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let w: Vec<u32> = pdi
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     let ph = *w.get(IHT_OFF / 4 + 4)? as usize;
     let unenc = *w.get(ph + 1)? as usize;
     let data = *w.get(ph + 8)? as usize;
@@ -88,9 +97,14 @@ mod tests {
     /// (checks every header field and checksum). Skipped if the reference file is absent.
     #[test]
     fn rewrap_reproduces_bootgen_pdi() {
-        let Some(corpus) = crate::vendor_corpus() else { return };
+        let Some(corpus) = crate::vendor_corpus() else {
+            return;
+        };
         let p = corpus.join("8309a7e39620419663f2aff6/main.pdi");
-        let Ok(orig) = std::fs::read(&p) else { eprintln!("skip: {} missing", p.display()); return };
+        let Ok(orig) = std::fs::read(&p) else {
+            eprintln!("skip: {} missing", p.display());
+            return;
+        };
         let cdo = extract_cdo(&orig).unwrap();
         assert_eq!(build(&cdo), orig);
     }

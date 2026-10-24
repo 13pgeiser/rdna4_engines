@@ -90,7 +90,8 @@ fn json_object_len(bytes: &[u8]) -> Result<usize, String> {
 
 fn index(file: &mut File) -> Result<Vec<Tensor>, String> {
     let mut header = [0; 32];
-    file.read_exact(&mut header).map_err(|e| format!("hfqm header: {e}"))?;
+    file.read_exact(&mut header)
+        .map_err(|e| format!("hfqm header: {e}"))?;
     if &header[..4] != b"HFQM" || u32::from_le_bytes(header[4..8].try_into().unwrap()) != 1 {
         return Err("not an HFQM v1 file".into());
     }
@@ -99,7 +100,8 @@ fn index(file: &mut File) -> Result<Vec<Tensor>, String> {
     if data < metadata || data - metadata >= 32_000_000 {
         return Err("bad HFQM metadata range".into());
     }
-    file.seek(SeekFrom::Start(metadata)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(metadata))
+        .map_err(|e| e.to_string())?;
     let mut bytes = vec![0; (data - metadata) as usize];
     file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
     let mut pos = json_object_len(&bytes)?;
@@ -108,13 +110,21 @@ fn index(file: &mut File) -> Result<Vec<Tensor>, String> {
     let mut offset = data;
     for _ in 0..count {
         let n = u16::from_le_bytes(take(&bytes, &mut pos, 2).try_into().unwrap()) as usize;
-        let name = String::from_utf8(take(&bytes, &mut pos, n).to_vec()).map_err(|e| e.to_string())?;
+        let name =
+            String::from_utf8(take(&bytes, &mut pos, n).to_vec()).map_err(|e| e.to_string())?;
         let qt = take(&bytes, &mut pos, 1)[0];
         let ndim = take(&bytes, &mut pos, 1)[0];
         let dims = (0..ndim).map(|_| word(&bytes, &mut pos)).collect();
         let group = word(&bytes, &mut pos);
         let size = u64::from_le_bytes(take(&bytes, &mut pos, 8).try_into().unwrap());
-        tensors.push(Tensor { name, qt, dims, group, off: offset, size });
+        tensors.push(Tensor {
+            name,
+            qt,
+            dims,
+            group,
+            off: offset,
+            size,
+        });
         offset += size;
     }
     if offset != file.metadata().map_err(|e| e.to_string())?.len() {
@@ -124,7 +134,8 @@ fn index(file: &mut File) -> Result<Vec<Tensor>, String> {
 }
 
 fn read_raw(file: &mut File, t: &Tensor) -> Result<Vec<u8>, String> {
-    file.seek(SeekFrom::Start(t.off)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(t.off))
+        .map_err(|e| e.to_string())?;
     let mut v = vec![0u8; t.size as usize];
     file.read_exact(&mut v).map_err(|e| e.to_string())?;
     Ok(v)
@@ -182,7 +193,11 @@ struct DecodedWeights {
 
 fn decode_mq6(blob: &[u8], m: usize, k: usize) -> DecodedWeights {
     let epochs = k / 128;
-    let mut out = DecodedWeights { codes: vec![0; m * k], s: vec![0.0; m * epochs], z: vec![0.0; m * epochs] };
+    let mut out = DecodedWeights {
+        codes: vec![0; m * k],
+        s: vec![0.0; m * epochs],
+        z: vec![0.0; m * epochs],
+    };
     let mut q = [0u8; 256];
     let mut q2 = [0u8; 256];
     for (gi, g) in blob.chunks_exact(GROUP_BYTES).enumerate() {
@@ -208,7 +223,9 @@ fn wprep_w8(w: &DecodedWeights, m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
     let mut w8 = vec![0i8; m * k];
     let mut ws = vec![0f32; m];
     for n in 0..m {
-        let wf = |i: usize| (w.codes[n * k + i] as f32) * w.s[n * epochs + i / 128] + w.z[n * epochs + i / 128];
+        let wf = |i: usize| {
+            (w.codes[n * k + i] as f32) * w.s[n * epochs + i / 128] + w.z[n * epochs + i / 128]
+        };
         let absmax = (0..k).map(|i| wf(i).abs()).fold(0.0f32, f32::max);
         let wsn = (absmax as f64 / 127.0) as f32;
         ws[n] = wsn;
@@ -229,39 +246,68 @@ fn find_tensor<'a>(tensors: &'a [Tensor], exact: &str, suffix: &str) -> &'a Tens
     if let Some(t) = tensors.iter().find(|t| t.name == exact) {
         return t;
     }
-    let hits: Vec<&Tensor> = tensors.iter().filter(|t| t.name.ends_with(suffix) && !t.name.starts_with("mtp.")).collect();
+    let hits: Vec<&Tensor> = tensors
+        .iter()
+        .filter(|t| t.name.ends_with(suffix) && !t.name.starts_with("mtp."))
+        .collect();
     match hits.as_slice() {
         [t] => t,
-        _ => panic!("tensor {exact} not found; {} suffix matches for {suffix}: {:?}", hits.len(), hits.iter().map(|t| &t.name).collect::<Vec<_>>()),
+        _ => panic!(
+            "tensor {exact} not found; {} suffix matches for {suffix}: {:?}",
+            hits.len(),
+            hits.iter().map(|t| &t.name).collect::<Vec<_>>()
+        ),
     }
 }
 
 #[test]
 #[ignore = "reads the 125 GB Flash-Next artifact; run explicitly with --ignored"]
 fn real_mq6_trunk_tensors_match_oracle() {
-    let path = std::env::var("HIPFIRE_NPU_TRUNK_TEST_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let path =
+        std::env::var("HIPFIRE_NPU_TRUNK_TEST_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let mut file = File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let len = file.metadata().unwrap().len();
     println!("model: {path} ({len} bytes); pinned md5 {PINNED_MD5} (docs/npu/coop-flashnext.md:135, full digest not computed)");
     if path == DEFAULT_MODEL {
-        assert_eq!(len, DEFAULT_MODEL_BYTES, "default model size differs from the pinned artifact");
+        assert_eq!(
+            len, DEFAULT_MODEL_BYTES,
+            "default model size differs from the pinned artifact"
+        );
     }
     let tensors = index(&mut file).unwrap_or_else(|e| panic!("{path}: {e}"));
     println!("hfqm: {} tensors", tensors.len());
 
     let wanted = [
-        ("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", "layers.0.linear_attn.in_proj_qkv.weight"),
-        ("model.language_model.layers.3.self_attn.q_proj.weight", "layers.3.self_attn.q_proj.weight"),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "layers.0.linear_attn.in_proj_qkv.weight",
+        ),
+        (
+            "model.language_model.layers.3.self_attn.q_proj.weight",
+            "layers.3.self_attn.q_proj.weight",
+        ),
     ];
     for (exact, suffix) in wanted {
         let t = find_tensor(&tensors, exact, suffix);
-        println!("tensor {}: raw qt={} dims={:?} group={} off={} size={}", t.name, t.qt, t.dims, t.group, t.off, t.size);
-        assert_eq!(t.qt, QT_MQ6G256V2, "{}: raw quant type {} is not MQ6G256V2 (47)", t.name, t.qt);
+        println!(
+            "tensor {}: raw qt={} dims={:?} group={} off={} size={}",
+            t.name, t.qt, t.dims, t.group, t.off, t.size
+        );
+        assert_eq!(
+            t.qt, QT_MQ6G256V2,
+            "{}: raw quant type {} is not MQ6G256V2 (47)",
+            t.name, t.qt
+        );
         assert_eq!(t.dims.len(), 2, "{}: dims", t.name);
         let (m, k) = (t.dims[0], t.dims[1]);
         assert_eq!(k, TRUNK_K, "{}: K", t.name);
         assert_eq!(t.group, 256, "{}: group size", t.name);
-        assert_eq!(t.size as usize, m * (k / 256) * GROUP_BYTES, "{}: stored bytes", t.name);
+        assert_eq!(
+            t.size as usize,
+            m * (k / 256) * GROUP_BYTES,
+            "{}: stored bytes",
+            t.name
+        );
 
         let blob = read_raw(&mut file, t).unwrap_or_else(|e| panic!("{}: {e}", t.name));
 
@@ -291,10 +337,24 @@ fn real_mq6_trunk_tensors_match_oracle() {
         let (w8_ref, ws_ref) = wprep_w8(&decode_mq6(&blob, m, k), m, k);
         println!("  oracle: {:.3} s", t1.elapsed().as_secs_f64());
         for n in 0..m {
-            assert_eq!(ws[n].to_bits(), ws_ref[n].to_bits(), "{}: ws[{n}] {:e} vs oracle {:e}", t.name, ws[n], ws_ref[n]);
+            assert_eq!(
+                ws[n].to_bits(),
+                ws_ref[n].to_bits(),
+                "{}: ws[{n}] {:e} vs oracle {:e}",
+                t.name,
+                ws[n],
+                ws_ref[n]
+            );
         }
         if let Some(i) = (0..m * k).find(|&i| w8[i] != w8_ref[i]) {
-            panic!("{}: w8[{}][{}] = {} vs oracle {}", t.name, i / k, i % k, w8[i], w8_ref[i]);
+            panic!(
+                "{}: w8[{}][{}] = {} vs oracle {}",
+                t.name,
+                i / k,
+                i % k,
+                w8[i],
+                w8_ref[i]
+            );
         }
         println!("  exact w8/ws match with the lab oracle over all {m} rows");
     }

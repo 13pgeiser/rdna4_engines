@@ -133,13 +133,17 @@ mod tests {
     #[test]
     fn header_checksum_and_alignment() {
         let mut c = Cdo::new();
-        c.mask_write(0x0023_2000, 1, 0).dma_write(0x0022_0000, &[1, 2, 3]);
+        c.mask_write(0x0023_2000, 1, 0)
+            .dma_write(0x0022_0000, &[1, 2, 3]);
         let w = c.to_words();
         assert_eq!(w[4], !(4u32 + 0x004F_4443 + 0x200 + w[3]));
         // payload of the DMA write must start at a 4-word boundary
         let pos = w.iter().position(|&x| x & 0xffff == CMD_DMA_WRITE).unwrap();
         assert_eq!((pos + 3) % 4, 0);
         let cmds = parse(&w).unwrap();
-        assert_eq!(cmds.last().unwrap(), &Cmd::DmaWrite(0x0022_0000, vec![1, 2, 3]));
+        assert_eq!(
+            cmds.last().unwrap(),
+            &Cmd::DmaWrite(0x0022_0000, vec![1, 2, 3])
+        );
     }
 }

@@ -29,7 +29,9 @@
 //! Each child prints exactly one `MTP_TAKEOVER_FILL_SUMMARY {json}` line on
 //! stdout. The parent requires the batched and serial `windows` arrays to be
 //! identical JSON (digests, pending hidden, positions), and for every arm:
-//! `rejected_tail.same_state`, `pairing.rel_l2 < 0.1 * pairing.shifted_rel_l2`
+//! `rejected_tail.same_state`, `pairing.paired_hidden_row == -1`, the three
+//! `pairing` (`rel_l2`, `forced_rel_l2`, `pending_rel_l2`) `< 0.1 *` their
+//! shifted/lagging counterparts
 //! and a non-empty `native_miss.committed`; the batched and serial arms also
 //! need `native_miss.drafts_generated >= 1`. The route is confirmed from the
 //! drafter's own `HIPFIRE_MTP_TRACE` window events: n-gram takeover windows
@@ -49,9 +51,14 @@
 //! reference (40 forwards), and the unconsumed physical head K/V/raw-index
 //! rows must be unchanged as well as the live family bytes. The report also
 //! carries the forced pending/family byte-identical booleans, which are not
-//! asserted across the 4-row/1-row schedule. Draft/target pairing must be
-//! decisively aligned (`rel_l2` of the correct pairing < 0.1 of the shifted
-//! one). The parent additionally requires the batched-fill and serial-fill
+//! asserted across the 4-row/1-row schedule. Draft/target pairing is token
+//! `p` with the target hidden of `p - 1` (a prompt's position 0 with its own;
+//! the pending hidden holds head position - 1, the pairing every draft step
+//! runs): the head rows of the takeover and of the one-row forced route must
+//! be decisively closer (`rel_l2 < 0.1 *`) to one-row references built with
+//! hidden `p - 1` than to ones built with hidden `p`, and the pending hidden
+//! after the window (row `P + 3`) closer to the forced route's than to row
+//! `P + 2`. The parent additionally requires the batched-fill and serial-fill
 //! `windows` arrays to be exactly equal. The interleaved arm repeats the
 //! sequence and the native miss; no cross-route digest equality is required of
 //! it.
@@ -216,7 +223,11 @@ fn check_result(arm: &Arm, result: &Value) {
     let windows = result["windows"]
         .as_array()
         .unwrap_or_else(|| panic!("{} arm result has no windows array", arm.name));
-    assert!(!windows.is_empty(), "{} arm result has no windows", arm.name);
+    assert!(
+        !windows.is_empty(),
+        "{} arm result has no windows",
+        arm.name
+    );
 
     assert_eq!(
         result["rejected_tail"]["same_state"],
@@ -226,17 +237,32 @@ fn check_result(arm: &Arm, result: &Value) {
         result["rejected_tail"]
     );
 
-    let rel_l2 = result["pairing"]["rel_l2"]
-        .as_f64()
-        .unwrap_or_else(|| panic!("{} arm pairing.rel_l2 missing", arm.name));
-    let shifted = result["pairing"]["shifted_rel_l2"]
-        .as_f64()
-        .unwrap_or_else(|| panic!("{} arm pairing.shifted_rel_l2 missing", arm.name));
-    assert!(
-        rel_l2 < 0.1 * shifted,
-        "{} arm pairing is not decisively aligned: rel_l2 {rel_l2} vs shifted_rel_l2 {shifted}",
+    assert_eq!(
+        result["pairing"]["paired_hidden_row"],
+        json!(-1),
+        "{} arm pairing must be token p with the hidden of p - 1",
         arm.name
     );
+    // (correct, wrong) pairs: takeover head rows vs the one-row references
+    // (paired p-1 vs own-row p), the one-row forced route likewise, and the
+    // pending hidden vs the forced route's and vs a pending one row behind.
+    for (correct, wrong) in [
+        ("rel_l2", "shifted_rel_l2"),
+        ("forced_rel_l2", "forced_shifted_rel_l2"),
+        ("pending_rel_l2", "pending_lag_rel_l2"),
+    ] {
+        let near = result["pairing"][correct]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{} arm pairing.{correct} missing", arm.name));
+        let far = result["pairing"][wrong]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{} arm pairing.{wrong} missing", arm.name));
+        assert!(
+            near < 0.1 * far,
+            "{} arm pairing is not decisively aligned: {correct} {near} vs {wrong} {far}",
+            arm.name
+        );
+    }
 
     let committed = result["native_miss"]["committed"]
         .as_array()
@@ -278,7 +304,6 @@ fn mtp_takeover_fill_hw() {
             .env_remove("HIPFIRE_MTP_DRAFT_HEAD")
             .env_remove("HIPFIRE_MTP_K")
             .env_remove("HIPFIRE_MTP_SAMPLED_MODE")
-            .env_remove("HIPFIRE_MTP_PAIRING")
             .env("HIPFIRE_MTP_INCREMENTAL", arm.incremental)
             .env("HIPFIRE_QWEN4_MTP_BATCHED_FILL", arm.batched_fill)
             .env("HIPFIRE_MTP_TRACE", "1")

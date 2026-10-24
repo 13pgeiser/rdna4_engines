@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Flash-Next expert-parallel (EP, 2 or 4 ranks) owner-routed chunk MoE
+//! Flash-Next expert-parallel (EP, 2 to 8 ranks) owner-routed chunk MoE
 //! exchange transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
 //!
 //! Every rank runs the same router, top-k and stable grouping of a prefill chunk
@@ -24,7 +24,7 @@
 //!    branches), launches ONE pull kernel
 //!    (`ep_gather_grouped_rows_by_tile_owner`: for every live tile of a
 //!    nonlocal-owned expert, copy the tile's sixteen rows of the OWNER's
-//!    `y_down_grouped`, selected from a four-slot source table, onto the same
+//!    `y_down_grouped`, selected from an eight-slot source table, onto the same
 //!    rows of this rank's), records `done[k % 2]` and passes a second host
 //!    barrier. `k` is the rank's exchange counter; all ranks execute the same
 //!    invocation sequence (replicated routing, one admission verdict per layer).
@@ -36,7 +36,7 @@
 //!    sits one layer of trunk work after the pull it covers, so it is never
 //!    exposed.
 //!
-//! # Hazard argument (N ranks, N in {2, 4})
+//! # Hazard argument (N ranks, 2 <= N <= 8)
 //!
 //! Fix a row `R` of rank `o`'s `y_down_grouped`, owned by `o` in exchange `k`.
 //! Its only writer in an exchange is `o`'s routed down (stream order on `o`):
@@ -100,14 +100,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// Largest supported rank count: the pull kernel takes a four-slot source
-/// table. Supported counts are exactly 2 and this.
-pub const MAX_RANKS: usize = 4;
+/// Largest supported rank count: the pull kernel takes an eight-slot source
+/// table. Supported counts are 2 through this.
+pub const MAX_RANKS: usize = 8;
 
 /// Shape of the exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpTileExchangeSpec {
-    /// Participants; 2 or [`MAX_RANKS`].
+    /// Participants; `2..=`[`MAX_RANKS`].
     pub ranks: usize,
     /// Experts the owner table covers.
     pub experts: usize,
@@ -130,9 +130,9 @@ impl EpTileExchangeSpec {
     }
 
     pub fn validate(&self) -> HipResult<()> {
-        if !matches!(self.ranks, 2 | MAX_RANKS) {
+        if !(2..=MAX_RANKS).contains(&self.ranks) {
             return Err(err(format!(
-                "ep_tile_exchange: ranks must be 2 or {MAX_RANKS}, got {}",
+                "ep_tile_exchange: ranks must be 2..={MAX_RANKS}, got {}",
                 self.ranks
             )));
         }
@@ -201,7 +201,7 @@ fn peers(ranks: usize, rank: usize) -> impl Iterator<Item = usize> {
     (0..ranks).filter(move |&r| r != rank)
 }
 
-/// The pull kernel's four-slot source table: slot `r` is rank `r`'s
+/// The pull kernel's eight-slot source table: slot `r` is rank `r`'s
 /// `y_down_grouped` base (this rank's own slot is its destination, a valid
 /// local base); slots past the rank count stay zero. A fixed stack array so
 /// an exchange allocates nothing.
@@ -264,7 +264,9 @@ impl EpTileExchangeBuilder {
             )));
         }
         if self.regs[rank].is_some() {
-            return Err(err(format!("ep_tile_exchange: rank {rank} registered twice")));
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} registered twice"
+            )));
         }
         let len = y_down_grouped.buf.size();
         let base = y_down_grouped.buf.as_ptr() as usize;
@@ -318,11 +320,14 @@ impl EpTileExchangeBuilder {
                 "ep_tile_exchange: rank {rank} never registered (builder dropped; registered events leak)"
             )));
         }
-        let devices: Vec<i32> = ranks.iter().map(|r| r.device_id).collect();
-        if let Some(device) = shared_device(&devices) {
-            return Err(err(format!(
-                "ep_tile_exchange: two ranks share device {device}"
-            )));
+        // Logical emulation (`HIPFIRE_EMULATE_GPUS`) deliberately maps several ranks onto one device.
+        if crate::config::get().emulate_gpus.is_none() {
+            let devices: Vec<i32> = ranks.iter().map(|r| r.device_id).collect();
+            if let Some(device) = shared_device(&devices) {
+                return Err(err(format!(
+                    "ep_tile_exchange: two ranks share device {device}"
+                )));
+            }
         }
         let states = ranks
             .into_iter()
@@ -415,6 +420,11 @@ impl EpTileExchange {
         gpu.bind_thread()?;
         for q in peers(self.spec.ranks, rank) {
             let peer = &self.ranks[q];
+            // Logical emulation (`HIPFIRE_EMULATE_GPUS`) maps several ranks onto one device:
+            // a device is trivially its own peer, so there is nothing to enable.
+            if peer.device_id == gpu.device_id {
+                continue;
+            }
             if !gpu.hip.can_access_peer(gpu.device_id, peer.device_id)? {
                 return Err(err(format!(
                     "ep_tile_exchange: device {} cannot access peer device {} (rank {rank} -> {q})",
@@ -427,7 +437,9 @@ impl EpTileExchange {
                 Err(e) => return Err(e),
             }
         }
-        self.ranks[rank].peers_enabled.store(true, Ordering::Release);
+        self.ranks[rank]
+            .peers_enabled
+            .store(true, Ordering::Release);
         Ok(())
     }
 
@@ -603,7 +615,12 @@ impl Drop for EpTileExchange {
         let live = self
             .ranks
             .iter()
-            .filter(|r| r.ready.iter().chain(r.done.iter()).any(|e| lock(e).is_some()))
+            .filter(|r| {
+                r.ready
+                    .iter()
+                    .chain(r.done.iter())
+                    .any(|e| lock(e).is_some())
+            })
             .count();
         if live > 0 {
             eprintln!(
@@ -637,20 +654,53 @@ mod tests {
 
     #[test]
     fn supported_rank_counts_validate() {
-        assert!(EpTileExchangeSpec { ranks: 2, ..spec(8) }.validate().is_ok());
-        assert!(EpTileExchangeSpec { ranks: 4, ..spec(8) }.validate().is_ok());
+        assert!(EpTileExchangeSpec {
+            ranks: 2,
+            ..spec(8)
+        }
+        .validate()
+        .is_ok());
+        for ranks in 2..=MAX_RANKS {
+            assert!(
+                EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_ok(),
+                "ranks={ranks}"
+            );
+        }
     }
 
     #[test]
     fn spec_validation_refuses_everything_else() {
-        for ranks in [0, 1, 3, 5, 8, usize::MAX] {
-            assert!(EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_err(), "ranks={ranks}");
+        for ranks in [0, 1, 9, 16, usize::MAX] {
+            assert!(
+                EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_err(),
+                "ranks={ranks}"
+            );
         }
-        assert!(EpTileExchangeSpec { experts: 0, ..spec(8) }.validate().is_err());
-        assert!(EpTileExchangeSpec { experts: usize::MAX, ..spec(8) }.validate().is_err());
-        assert!(EpTileExchangeSpec { row_u4: 0, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec {
+            experts: 0,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
+        assert!(EpTileExchangeSpec {
+            experts: usize::MAX,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
+        assert!(EpTileExchangeSpec {
+            row_u4: 0,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
         // 16 rows x 72 uint4 = 1152 uint4: not a multiple of 1024.
-        assert!(EpTileExchangeSpec { row_u4: 72, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec {
+            row_u4: 72,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
         assert!(spec(0).validate().is_err());
         // 60,000 tiles x 80 KiB exceeds 32 bits.
         assert!(spec(60_000).validate().is_err());
@@ -675,18 +725,21 @@ mod tests {
         assert_eq!(pending_done_parity(3), Some(0));
         assert_eq!(pending_done_parity(48), Some(1));
         assert_eq!(pending_done_parity(49), Some(0));
-        assert_eq!((parity(0), parity(1), parity(2), parity(47), parity(48)), (0, 1, 0, 1, 0));
+        assert_eq!(
+            (parity(0), parity(1), parity(2), parity(47), parity(48)),
+            (0, 1, 0, 1, 0)
+        );
     }
 
     #[test]
     fn builder_requires_valid_spec_and_all_ranks() {
         // Unsupported rank counts fail at build on the spec, before any registration.
-        for ranks in [0, 1, 3, 5, 8] {
+        for ranks in [0, 1, 9, usize::MAX] {
             let b = EpTileExchange::builder(EpTileExchangeSpec { ranks, ..spec(8) });
             assert!(b.build().is_err(), "ranks={ranks}");
         }
         // Supported counts with nothing registered: the missing registration is the refusal.
-        for ranks in [2, 4] {
+        for ranks in 2..=MAX_RANKS {
             let b = EpTileExchange::builder(EpTileExchangeSpec { ranks, ..spec(8) });
             assert!(b.build().is_err(), "ranks={ranks}: no rank registered");
         }
@@ -694,13 +747,16 @@ mod tests {
 
     #[test]
     fn builder_holds_one_slot_per_supported_rank() {
-        for ranks in [2, 4] {
+        for ranks in 2..=MAX_RANKS {
             let b = EpTileExchange::builder(EpTileExchangeSpec { ranks, ..spec(8) });
             assert_eq!(b.regs.len(), ranks);
             assert!(b.regs.iter().all(Option::is_none));
         }
         // An unsupported spec never sizes a registration table past MAX_RANKS.
-        let b = EpTileExchange::builder(EpTileExchangeSpec { ranks: usize::MAX, ..spec(8) });
+        let b = EpTileExchange::builder(EpTileExchangeSpec {
+            ranks: usize::MAX,
+            ..spec(8)
+        });
         assert!(b.regs.len() <= MAX_RANKS);
     }
 
@@ -714,8 +770,10 @@ mod tests {
         assert_eq!(peers(4, 1).collect::<Vec<_>>(), [0, 2, 3]);
         assert_eq!(peers(4, 2).collect::<Vec<_>>(), [0, 1, 3]);
         assert_eq!(peers(4, 3).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(peers(8, 7).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(peers(8, 3).collect::<Vec<_>>(), [0, 1, 2, 4, 5, 6, 7]);
         // Pairwise coverage: every ordered pair (waiter, writer) appears exactly once.
-        for ranks in [2, 4] {
+        for ranks in 2..=MAX_RANKS {
             for waiter in 0..ranks {
                 for writer in 0..ranks {
                     let hits = peers(ranks, waiter).filter(|&q| q == writer).count();
@@ -729,10 +787,17 @@ mod tests {
     /// stays valid), unused slots zero, fixed-size (no per-exchange allocation).
     #[test]
     fn pull_sources_layout() {
-        assert_eq!(pull_sources([0x1000, 0x2000].into_iter()), [0x1000, 0x2000, 0, 0]);
+        assert_eq!(
+            pull_sources([0x1000, 0x2000].into_iter()),
+            [0x1000, 0x2000, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(
             pull_sources([0x1000, 0x2000, 0x3000, 0x4000].into_iter()),
-            [0x1000, 0x2000, 0x3000, 0x4000]
+            [0x1000, 0x2000, 0x3000, 0x4000, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            pull_sources((1..=8).map(|r| r * 0x1000)),
+            [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 0x8000]
         );
     }
 

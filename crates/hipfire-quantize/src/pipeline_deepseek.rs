@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use std::path::Path;
 
 use crate::hfq::*;
@@ -11,7 +10,10 @@ use crate::pipeline_gguf::dequantize_hfq_q8f16;
 use crate::quant_e8::*;
 use crate::quant_fwht::*;
 
-pub(crate) fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -> Result<(), String> {
+pub(crate) fn build_deepseek4_dense_e8soa_overlay(
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(input)
         .map_err(|e| format!("open source HFQ {}: {e}", input.display()))?;
     if hfq.arch_id != 9 {
@@ -97,7 +99,8 @@ pub(crate) fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -
                 data: packed,
                 spilled_len: 0,
             });
-            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024).map_err(|e| format!("spill: {e}"))?;
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+                .map_err(|e| format!("spill: {e}"))?;
         }
     }
 
@@ -145,7 +148,10 @@ pub(crate) fn build_deepseek4_dense_e8soa_overlay(input: &Path, output: &Path) -
 /// `DeepseekV4::validate_mq2r_dspark_sidecar` requires, so the artifact is
 /// born valid instead of being patched afterwards by
 /// `scripts/reap/hfq_metadata_stamp.rs`.
-pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) -> Result<(), String> {
+pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
     let hfq = hipfire_runtime::hfq::HfqFile::open(input)
         .map_err(|e| format!("open source sidecar {}: {e}", input.display()))?;
     if hfq.arch_id != 9 {
@@ -215,7 +221,8 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) 
                 data: bytes,
                 spilled_len: 0,
             });
-            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024).map_err(|e| format!("spill: {e}"))?;
+            maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+                .map_err(|e| format!("spill: {e}"))?;
             continue;
         }
 
@@ -239,7 +246,8 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) 
             data: packed,
             spilled_len: 0,
         });
-        maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024).map_err(|e| format!("spill: {e}"))?;
+        maybe_spill(&mut tensors, &mut spill, 64 * 1024 * 1024)
+            .map_err(|e| format!("spill: {e}"))?;
     }
 
     if n_conv == 0 {

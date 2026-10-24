@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: dump_hfq_dtypes <path.hfq>")?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: dump_hfq_dtypes <path.hfq>")?;
     let hfq = HfqFile::open(Path::new(&path))?;
     let mut by_qt: BTreeMap<u8, (usize, u64)> = BTreeMap::new();
     for t in hfq.tensors() {
@@ -26,7 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\n== tensors matching {filter:?} ==");
             for t in hfq.tensors() {
                 if t.name.contains(&filter) {
-                    println!("  qt={:<3} {:<50} shape={:?}", t.quant_type, t.name, t.shape);
+                    println!(
+                        "  qt={:<3} {:<50} shape={:?}",
+                        t.quant_type, t.name, t.shape
+                    );
                 }
             }
         }

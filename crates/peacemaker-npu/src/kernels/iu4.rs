@@ -54,14 +54,25 @@ pub fn f16_to_f32(h: u16) -> f32 {
 
 /// Symmetric MQ4G256V2 weights: `rows` features x `k` (row-major groups).
 #[derive(Clone, Copy)]
-pub struct Weights<'a> { pub rows: usize, pub k: usize, pub bytes: &'a [u8] }
+pub struct Weights<'a> {
+    pub rows: usize,
+    pub k: usize,
+    pub bytes: &'a [u8],
+}
 
 impl<'a> Weights<'a> {
     /// `k` is a positive multiple of 128: whole MQ4G256V2 groups, plus (IEF15 odd epoch counts, tests) one tail group of which
     /// only the first K half (epoch `k/128 - 1`) is addressed; its second half is never read.
     pub fn new(rows: usize, k: usize, bytes: &'a [u8]) -> Self {
-        assert!(k % EPOCH_K == 0 && k > 0, "MQ4G256V2 K must be a positive multiple of 128 (256 for whole groups)");
-        assert_eq!(bytes.len(), rows * k.div_ceil(256) * GROUP_BYTES, "weight bytes");
+        assert!(
+            k % EPOCH_K == 0 && k > 0,
+            "MQ4G256V2 K must be a positive multiple of 128 (256 for whole groups)"
+        );
+        assert_eq!(
+            bytes.len(),
+            rows * k.div_ceil(256) * GROUP_BYTES,
+            "weight bytes"
+        );
         Self { rows, k, bytes }
     }
     fn group(&self, r: usize, g: usize) -> &'a [u8] {
@@ -86,12 +97,23 @@ impl<'a> Weights<'a> {
 
 /// `block_i4_128` activations: `tokens` x `k`, block `e*tokens + t`.
 #[derive(Clone, Copy)]
-pub struct Acts<'a> { pub tokens: usize, pub k: usize, pub bytes: &'a [u8] }
+pub struct Acts<'a> {
+    pub tokens: usize,
+    pub k: usize,
+    pub bytes: &'a [u8],
+}
 
 impl<'a> Acts<'a> {
     pub fn new(tokens: usize, k: usize, bytes: &'a [u8]) -> Self {
-        assert!(k % EPOCH_K == 0 && k > 0, "block_i4_128 K must be a positive multiple of 128");
-        assert_eq!(bytes.len(), (k / EPOCH_K) * tokens * XBLK_BYTES, "activation bytes");
+        assert!(
+            k % EPOCH_K == 0 && k > 0,
+            "block_i4_128 K must be a positive multiple of 128"
+        );
+        assert_eq!(
+            bytes.len(),
+            (k / EPOCH_K) * tokens * XBLK_BYTES,
+            "activation bytes"
+        );
         Self { tokens, k, bytes }
     }
     fn block(&self, t: usize, e: usize) -> &'a [u8] {
@@ -115,8 +137,16 @@ impl<'a> Acts<'a> {
 /// Integer operands of epoch `e`: activations `tokens x 128` (row-major) into `xa`, weights `128 x rows`
 /// (row-major, i.e. `W^T`) into `wb`.
 fn epoch_operands(w: &Weights, x: &Acts, e: usize, xa: &mut [i8], wb: &mut [i8]) {
-    for t in 0..x.tokens { for j in 0..EPOCH_K { xa[t * EPOCH_K + j] = x.value(t, e * EPOCH_K + j); } }
-    for r in 0..w.rows { for j in 0..EPOCH_K { wb[j * w.rows + r] = w.value(r, e * EPOCH_K + j); } }
+    for t in 0..x.tokens {
+        for j in 0..EPOCH_K {
+            xa[t * EPOCH_K + j] = x.value(t, e * EPOCH_K + j);
+        }
+    }
+    for r in 0..w.rows {
+        for j in 0..EPOCH_K {
+            wb[j * w.rows + r] = w.value(r, e * EPOCH_K + j);
+        }
+    }
 }
 
 /// CPU reference of the GPU's int32 epoch partials: `[e][t][r]` (epoch, token, feature), `C_e` exactly.
@@ -124,9 +154,14 @@ pub fn partials(w: &Weights, x: &Acts) -> Vec<i32> {
     assert_eq!(w.k, x.k, "K mismatch");
     let (tokens, rows, epochs) = (x.tokens, w.rows, w.k / EPOCH_K);
     let mut out = vec![0i32; epochs * tokens * rows];
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(epochs.max(1));
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(epochs.max(1));
     std::thread::scope(|s| {
-        for (part, chunk) in out.chunks_mut(tokens * rows * epochs.div_ceil(threads)).enumerate() {
+        for (part, chunk) in out
+            .chunks_mut(tokens * rows * epochs.div_ceil(threads))
+            .enumerate()
+        {
             let e0 = part * epochs.div_ceil(threads);
             s.spawn(move || {
                 let mut xa = vec![0i8; tokens * EPOCH_K];
@@ -134,13 +169,25 @@ pub fn partials(w: &Weights, x: &Acts) -> Vec<i32> {
                 for (i, c) in chunk.chunks_mut(tokens * rows).enumerate() {
                     let e = e0 + i;
                     // Feature-major copy of W epoch e so the inner loop is two contiguous 128-element rows.
-                    for t in 0..tokens { for j in 0..EPOCH_K { xa[t * EPOCH_K + j] = x.value(t, e * EPOCH_K + j); } }
-                    for r in 0..rows { for j in 0..EPOCH_K { wt[r * EPOCH_K + j] = w.value(r, e * EPOCH_K + j); } }
+                    for t in 0..tokens {
+                        for j in 0..EPOCH_K {
+                            xa[t * EPOCH_K + j] = x.value(t, e * EPOCH_K + j);
+                        }
+                    }
+                    for r in 0..rows {
+                        for j in 0..EPOCH_K {
+                            wt[r * EPOCH_K + j] = w.value(r, e * EPOCH_K + j);
+                        }
+                    }
                     for t in 0..tokens {
                         let xr = &xa[t * EPOCH_K..(t + 1) * EPOCH_K];
                         for r in 0..rows {
                             let wr = &wt[r * EPOCH_K..(r + 1) * EPOCH_K];
-                            c[t * rows + r] = xr.iter().zip(wr).map(|(&a, &b)| i32::from(a) * i32::from(b)).sum();
+                            c[t * rows + r] = xr
+                                .iter()
+                                .zip(wr)
+                                .map(|(&a, &b)| i32::from(a) * i32::from(b))
+                                .sum();
                         }
                     }
                 }
@@ -173,9 +220,20 @@ pub fn fold_set(w: &Weights, x: &Acts, partials: &[i32]) -> Vec<f32> {
 /// in `[2^-10, 2^-3)`, `d` positive normal f32 and `s` the exact nibble sum. `extremes` forces the all-`-8`
 /// activation block 0 of every token and features 0/1 to all-`u = 0` / all-`u = 15`, so `C_0` reaches
 /// `+8192` and `-7168` (the full GPU range).
-pub fn random_operands(tokens: usize, rows: usize, k: usize, seed: u64, extremes: bool) -> (Vec<u8>, Vec<u8>) {
+pub fn random_operands(
+    tokens: usize,
+    rows: usize,
+    k: usize,
+    seed: u64,
+    extremes: bool,
+) -> (Vec<u8>, Vec<u8>) {
     let mut state = seed | 1;
-    let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
     let mut w = vec![0u8; rows * k.div_ceil(256) * GROUP_BYTES];
     for g in w.chunks_mut(GROUP_BYTES) {
         for h in 0..2 {
@@ -184,13 +242,20 @@ pub fn random_operands(tokens: usize, rows: usize, k: usize, seed: u64, extremes
             g[4 * h..4 * h + 2].copy_from_slice(&sc.to_le_bytes());
             g[4 * h + 2..4 * h + 4].copy_from_slice(&zp.to_le_bytes());
         }
-        for b in &mut g[8..] { *b = next() as u8; }
+        for b in &mut g[8..] {
+            *b = next() as u8;
+        }
     }
     let mut x = vec![0u8; (k / EPOCH_K) * tokens * XBLK_BYTES];
     for blk in x.chunks_mut(XBLK_BYTES) {
         let d = f32::from_bits(((next() % 20) as u32 + 110) << 23 | (next() as u32 & 0x7f_ffff));
-        for b in &mut blk[8..] { *b = next() as u8; }
-        let s: i32 = blk[8..].iter().map(|&b| i32::from(((b << 4) as i8) >> 4) + i32::from((b as i8) >> 4)).sum();
+        for b in &mut blk[8..] {
+            *b = next() as u8;
+        }
+        let s: i32 = blk[8..]
+            .iter()
+            .map(|&b| i32::from(((b << 4) as i8) >> 4) + i32::from((b as i8) >> 4))
+            .sum();
         blk[0..4].copy_from_slice(&d.to_le_bytes());
         blk[4..8].copy_from_slice(&s.to_le_bytes());
     }
@@ -201,7 +266,10 @@ pub fn random_operands(tokens: usize, rows: usize, k: usize, seed: u64, extremes
             blk[4..8].copy_from_slice(&(-8 * 128i32).to_le_bytes());
         }
         for (r, fill) in [(0usize, 0x00u8), (1, 0xff)] {
-            if r < rows { w[r * k.div_ceil(256) * GROUP_BYTES + 8..r * k.div_ceil(256) * GROUP_BYTES + 72].fill(fill); }
+            if r < rows {
+                w[r * k.div_ceil(256) * GROUP_BYTES + 8..r * k.div_ceil(256) * GROUP_BYTES + 72]
+                    .fill(fill);
+            }
         }
     }
     (w, x)
@@ -220,18 +288,35 @@ pub struct EpochGemm {
 impl EpochGemm {
     /// `k` a multiple of 256 (MQ4G256V2), `epochs * ceil(tokens/512) * ceil(rows/512) <= 256` waves.
     pub fn new(tokens: usize, rows: usize, k: usize, ctl: Control) -> Self {
-        assert!(k % 256 == 0 && k > 0, "K must be a positive multiple of 256");
+        assert!(
+            k % 256 == 0 && k > 0,
+            "K must be a positive multiple of 256"
+        );
         let mpad = tokens.div_ceil(gemm_array::WAVE_M) * gemm_array::WAVE_M;
         let design = gemm_array::design_v8((k / EPOCH_K) * mpad, rows, EPOCH_K, Epilogue::I32, ctl);
         assert_eq!(design.wave_m(), gemm_array::WAVE_M);
-        Self { design, tokens, rows, k, mpad }
+        Self {
+            design,
+            tokens,
+            rows,
+            k,
+            mpad,
+        }
     }
-    pub fn epochs(&self) -> usize { self.k / EPOCH_K }
+    pub fn epochs(&self) -> usize {
+        self.k / EPOCH_K
+    }
     /// Real useful ops `2*tokens*rows*k`.
-    pub fn useful_ops(&self) -> u64 { 2 * (self.tokens * self.rows * self.k) as u64 }
+    pub fn useful_ops(&self) -> u64 {
+        2 * (self.tokens * self.rows * self.k) as u64
+    }
     /// Packed `[arg0, arg1]` from the native operands.
     pub fn pack_in(&self, w: &Weights, x: &Acts) -> [Vec<u8>; 2] {
-        assert_eq!((w.rows, w.k, x.tokens, x.k), (self.rows, self.k, self.tokens, self.k), "operand shapes");
+        assert_eq!(
+            (w.rows, w.k, x.tokens, x.k),
+            (self.rows, self.k, self.tokens, self.k),
+            "operand shapes"
+        );
         let epochs = self.epochs();
         let mut a = vec![0i8; epochs * self.mpad * EPOCH_K];
         let mut b = vec![0i8; epochs * EPOCH_K * self.rows];
@@ -243,7 +328,10 @@ impl EpochGemm {
         }
         let waves_per_epoch = self.mpad / gemm_array::WAVE_M;
         let per = EPOCH_K * self.rows;
-        let b_of_mw = |mw: usize| { let e = mw / waves_per_epoch; &b[e * per..(e + 1) * per] };
+        let b_of_mw = |mw: usize| {
+            let e = mw / waves_per_epoch;
+            &b[e * per..(e + 1) * per]
+        };
         self.design.pack_in_per_mw(&a, &b_of_mw)
     }
     /// `[e][t][r]` partials from the packed C argument.
@@ -259,8 +347,9 @@ impl EpochGemm {
     pub fn padded(&self, partials: &[i32]) -> Vec<i32> {
         let mut full = vec![0i32; self.epochs() * self.mpad * self.rows];
         for e in 0..self.epochs() {
-            full[e * self.mpad * self.rows..][..self.tokens * self.rows]
-                .copy_from_slice(&partials[e * self.tokens * self.rows..(e + 1) * self.tokens * self.rows]);
+            full[e * self.mpad * self.rows..][..self.tokens * self.rows].copy_from_slice(
+                &partials[e * self.tokens * self.rows..(e + 1) * self.tokens * self.rows],
+            );
         }
         full
     }
@@ -272,15 +361,27 @@ mod tests {
 
     #[test]
     fn f16_widening_is_exact() {
-        for (h, want) in [(0x3c00u16, 1.0f32), (0xc000, -2.0), (0x0001, 2f32.powi(-24)), (0x03ff, 1023.0 * 2f32.powi(-24)),
-            (0x0400, 2f32.powi(-14)), (0x7bff, 65504.0), (0x8000, -0.0), (0x7c00, f32::INFINITY)] {
+        for (h, want) in [
+            (0x3c00u16, 1.0f32),
+            (0xc000, -2.0),
+            (0x0001, 2f32.powi(-24)),
+            (0x03ff, 1023.0 * 2f32.powi(-24)),
+            (0x0400, 2f32.powi(-14)),
+            (0x7bff, 65504.0),
+            (0x8000, -0.0),
+            (0x7c00, f32::INFINITY),
+        ] {
             assert_eq!(f16_to_f32(h).to_bits(), want.to_bits(), "{h:#06x}");
         }
         assert!(f16_to_f32(0x7e00).is_nan());
         // Every finite half round-trips through f64 arithmetic of its definition.
         for h in 0..0x7c00u16 {
             let (e, m) = (i32::from(h >> 10), f64::from(h & 0x3ff));
-            let v = if e == 0 { m * 2f64.powi(-24) } else { (1.0 + m / 1024.0) * 2f64.powi(e - 15) };
+            let v = if e == 0 {
+                m * 2f64.powi(-24)
+            } else {
+                (1.0 + m / 1024.0) * 2f64.powi(e - 15)
+            };
             assert_eq!(f64::from(f16_to_f32(h)), v, "{h:#06x}");
         }
     }
@@ -303,7 +404,14 @@ mod tests {
         x[blk + 8 + 10] = 0x9f; // K 2*128+20 low nibble -1, K 2*128+21 high nibble -7
         x[blk..blk + 4].copy_from_slice(&0.5f32.to_le_bytes());
         let xx = Acts::new(2, k, &x);
-        assert_eq!((xx.value(1, 256 + 20), xx.value(1, 256 + 21), xx.value(0, 256 + 20)), (-1, -7, 0));
+        assert_eq!(
+            (
+                xx.value(1, 256 + 20),
+                xx.value(1, 256 + 21),
+                xx.value(0, 256 + 20)
+            ),
+            (-1, -7, 0)
+        );
         assert_eq!(xx.d(1, 2), 0.5);
     }
 

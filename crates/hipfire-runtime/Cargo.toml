@@ -149,6 +149,10 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
+# MoE-GEMV byte oracle (certified R1 records via S2's I4ExpertFinalCodeRecord, ExpertFormat/slab
+# geometry). hipfire-quantize depends on this crate as a normal edge; dev-dep cycles are legal.
+hipfire-quantize = { path = "../hipfire-quantize", default-features = false }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
 # Property tests (`ple_q4::tests::props`).
@@ -161,6 +165,79 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # not listed here (bench_q8, probe_wmma, dump_meta, …) build under any
 # feature combination.
 
+# Raw PM dense-row K1 GPU byte oracle (no production dispatch wiring).
+[[example]]
+name = "mq_i4_rows_byte_oracle"
+required-features = ["lab"]
+
+# K2 G1 oracle for the MQ3-I4 NT1 gate/up (raw PM module; no production dispatch).
+[[example]]
+name = "qwen4_moe_sym_w3_g1_oracle"
+required-features = ["lab"]
+
+# K-E1 E8P-on-IU4 NT1 gate/up + down synthetic G1 oracle (raw PM module + device BF16 probe hook; no production dispatch).
+[[example]]
+name = "qwen4_moe_sym_e8p_g1_oracle"
+required-features = ["lab"]
+
+# Raw PM K3 (R128 / K640 A4 producer) GPU runner for the byte oracle (no production dispatch wiring).
+[[example]]
+name = "mq_i4_a4_byte_oracle"
+required-features = ["lab"]
+
+# Raw PM K1 MoE decode-GEMV G1 byte oracle + timing runner (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_byte_oracle"
+required-features = ["lab"]
+
+# K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner (raw PM module; no production dispatch wiring).
+[[example]]
+name = "e8p_i4_moe_gemv_oracle"
+required-features = ["lab"]
+
+# Raw PM gfx1100 EP tile-mask G1 runner (bit-exact vs the CPU law; no production dispatch wiring).
+[[example]]
+name = "ep_tile_mask_gfx1100_g1"
+required-features = ["lab"]
+
+# Raw PM gfx1100 E8P-on-IU4 MoE decode GEMV G1 runner (no production dispatch wiring).
+[[example]]
+name = "e8p_i4_moe_gemv_gfx1100_g1"
+required-features = ["lab"]
+
+# Raw PM gfx1100 MQ-I4 MoE decode GEMV G1 runner (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_gfx1100_g1"
+required-features = ["lab"]
+
+# Raw PM gfx1100 MQ-I4 A4 producer G1 oracle (no production dispatch wiring).
+[[example]]
+name = "mq_i4_a4_gfx1100_g1_oracle"
+required-features = ["lab"]
+
+# Raw PM gfx1100 qwen4 MoE sym G1 oracle (no production dispatch wiring).
+[[example]]
+name = "qwen4_moe_sym_gfx1100_g1_oracle"
+required-features = ["lab"]
+
+# gfx1100 observers for the peacemaker-isa divide / epilogue-intrinsic / intrinsic-key probe code objects.
+[[example]]
+name = "gfx1100_divide_cases_observe"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx1100_epilogue_intrinsic_observe"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx1100_intrinsic_keys_observe"
+required-features = ["lab"]
+
+# K1-C1 (gfx1151 one-lane slab decode GEMV) GPU byte-exactness + timing oracle against the incumbent
+# K1 route (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_c1_oracle"
+required-features = ["lab"]
 [[example]]
 name = "coherence_probe"
 required-features = []
@@ -735,6 +812,12 @@ required-features = ["deltanet"]
 
 
 [[example]]
+name = "a8_gfx11_oracle"
+required-features = ["lab"]
+
+
+
+[[example]]
 name = "tmp_halo_iu4_oracle"
 required-features = ["lab"]
 
@@ -762,5 +845,13 @@ name = "ep_row_gather_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "ep_transport_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "ep2_boundary_micro"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_nan_guard_regress"
 required-features = ["lab"]

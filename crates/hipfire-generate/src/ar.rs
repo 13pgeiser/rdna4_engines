@@ -154,7 +154,8 @@ pub enum QwenArTerminalCause {
     StopSequence,
     /// The turn ended inside `<think>` without running out of budget (decoded
     /// EOT, or a natural stop, inside the span). A graceful `stop`: the
-    /// reasoning already streamed, no answer, no tool calls and no cache.
+    /// reasoning already streamed, no answer and no tool calls. Completed
+    /// whole-body turns may be cached alongside their producer reasoning text.
     OpenThink,
 }
 
@@ -226,14 +227,19 @@ pub fn qwen_ar_think_budget_step(
     }
 }
 
-/// Finish the AR router. Length-cap (without EOT) never exposes tool_calls
-/// or primes asst_turn_cache. Decoded EOT on the final budget token still
-/// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
+/// Finish the AR router. Length-cap (without EOT) never exposes tool_calls,
+/// but a successful call-less length body (prose or open-think) IS cached: the
+/// generated tokens are stored verbatim so the next turn splices the exact wire
+/// IDs. Decoded EOT on the final budget token still classifies as
+/// stop/tool_calls. Unclosed/malformed without length → Err.
 /// A stop sequence keeps calls completed before it, drops a call it cut off,
 /// and never primes asst_turn_cache (the KV holds the trimmed stop text).
-/// Open think → `stop` with the reasoning only: no tool calls and no cache,
-/// because the KV holds an unclosed `<think>` span that no rendered history
-/// reproduces.
+/// Open think → `stop` with the reasoning only and no tool calls. A completed
+/// open-think stop IS cached: the whole generated body is stored verbatim
+/// beside its router reasoning text (`qwen_cached_turn_entry`), so history
+/// replays the unclosed span as one body. Length and open-think stay uncached
+/// when the tool router fails or finished a call the terminal would discard
+/// (a call-less fingerprint would not describe that body).
 pub fn qwen_ar_finish_route(
     router: ToolOutputRouter,
     cause: QwenArTerminalCause,
@@ -246,9 +252,9 @@ pub fn qwen_ar_finish_route(
     match router.finish() {
         Err(err) => {
             if length_unsafe || stop_sequence || open_think {
-                // Any pure-length terminal is unsafe: no calls, no cache. A
-                // stop sequence that cut a call short leaves no call either,
-                // and neither does a turn that ended inside `<think>`.
+                // A truncated router (error) at length leaves no call and no
+                // cache. A stop sequence that cut a call short leaves no call
+                // either, and neither does a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
                     finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
@@ -274,14 +280,26 @@ pub fn qwen_ar_finish_route(
                     }
                 }
             }
-            if length_unsafe || open_think {
-                // Length is never a tool-safe or cache-safe terminal —
-                // prose-only, complete hidden call, or trailing flush alike.
-                // Neither is a turn that ended inside `<think>`.
+            if length_unsafe {
+                // Length never releases a call, but a call-less successful
+                // body (prose or open-think) is cache-safe. A completed hidden
+                // call would not be described by the call-less fingerprint.
                 Ok(QwenArRouteFinish {
-                    finish_reason: if length_unsafe { "length" } else { "stop" },
+                    finish_reason: "length",
                     wire_tool_calls: Vec::new(),
-                    store_cache: false,
+                    store_cache: finished_calls.is_empty(),
+                    trailing_visible,
+                    cause,
+                })
+            } else if open_think {
+                // A turn that ended inside `<think>` stops with its reasoning
+                // only: no calls on the wire. Its whole body is cache-safe
+                // unless a completed call sits in that body, which a
+                // call-less fingerprint would not describe.
+                Ok(QwenArRouteFinish {
+                    finish_reason: "stop",
+                    wire_tool_calls: Vec::new(),
+                    store_cache: finished_calls.is_empty(),
                     trailing_visible,
                     cause,
                 })
@@ -836,8 +854,8 @@ pub fn truncate_checkpoints(
 /// dispatch branch choice and tools capability. Precedence matches production:
 /// EP (Qwen 5|6 → QwenAr semantic AR over `generate_ep`, which refines MoE vs
 /// dense-TP by loaded `EpArch`) / arch short-circuits (Qwen2, DeepSeek4, LFM,
-/// Cohere, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic
-/// wrapper) → default AR/unknown.
+/// Cohere, Maple, Gemma 4, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP
+/// uses the generic wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
@@ -852,6 +870,7 @@ pub enum GenerationRoute {
     CohereAr,
     CohereSpec,
     MapleAr,
+    Gemma4Ar,
     MiniMaxAr,
     MiniMaxEp,
     MiniMaxSpec,
@@ -882,6 +901,7 @@ impl GenerationRoute {
         Self::CohereAr,
         Self::CohereSpec,
         Self::MapleAr,
+        Self::Gemma4Ar,
         Self::MiniMaxAr,
         Self::MiniMaxEp,
         Self::MiniMaxSpec,
@@ -898,7 +918,7 @@ impl GenerationRoute {
 
     /// Proven semantic-safe producers for non-empty tools.
     /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
-    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR.
+    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4.
     ///
     /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
     /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
@@ -916,6 +936,14 @@ impl GenerationRoute {
     /// `emit_text::extract_tool_calls_from_text` used for `qwen_ar`, because
     /// Maple's vendor template emits the identical
     /// `<tool_call>{json}</tool_call>` shape.
+    ///
+    /// `Gemma4Ar` is admitted on the same legacy contract. `generate_gemma4`
+    /// renders `tools` through the model's embedded template, withholds its
+    /// native `<|tool_call>call:NAME{ARGS}<tool_call|>` blocks from the
+    /// content stream (`GemmaToolSplitter`), and stages the parsed calls on a
+    /// `finish_reason == "tool_calls"` terminal. A load whose template carries
+    /// no tool format refuses tools by name instead. The developer-gated EAGLE
+    /// branch never serves a tools request, so tools always decode AR.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -929,6 +957,7 @@ impl GenerationRoute {
                 | Self::GlimmerAr
                 | Self::GlimmerSpec
                 | Self::MapleAr
+                | Self::Gemma4Ar
         )
     }
 
@@ -971,6 +1000,7 @@ impl GenerationRoute {
             Self::CohereAr => "cohere_ar",
             Self::CohereSpec => "cohere_spec",
             Self::MapleAr => "maple_ar",
+            Self::Gemma4Ar => "gemma4_ar",
             Self::MiniMaxAr => "minimax_ar",
             Self::MiniMaxEp => "minimax_ep",
             Self::MiniMaxSpec => "minimax_spec",
@@ -1339,6 +1369,7 @@ define_route_start!(deepseek4_spec_route_start, 9);
 define_route_start!(cohere_ar_route_start, 12);
 define_route_start!(cohere_spec_route_start, 12);
 define_route_start!(maple_ar_route_start, 15);
+define_route_start!(gemma4_ar_route_start, 13);
 define_route_start!(minimax_ar_route_start, 10);
 define_route_start!(minimax_ep_route_start, 10);
 define_route_start!(minimax_spec_route_start, 10);
@@ -1368,6 +1399,7 @@ define_route_terminal!(
 define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
 define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
 define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(gemma4_ar_route_terminal, GenerationRoute::Gemma4Ar);
 define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
 define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
 define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
@@ -1443,6 +1475,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: cohere_spec_route_start,
             terminal: cohere_spec_route_terminal,
+        },
+        GenerationRoute::Gemma4Ar => GenerationRouteAdapter {
+            route,
+            start: gemma4_ar_route_start,
+            terminal: gemma4_ar_route_terminal,
         },
         GenerationRoute::MapleAr => GenerationRouteAdapter {
             route,
@@ -1651,6 +1688,9 @@ pub struct GenerationRouteInputs {
     pub pp: usize,
     pub has_speculator: bool,
     pub speculator_is_mtp: bool,
+    /// The loaded speculator is the shared DFlash2 drafter (`name() ==
+    /// "dflash2"`), the one non-MTP speculator a Qwen4 load admits.
+    pub speculator_is_dflash2: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
@@ -1720,10 +1760,24 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // penalized sampled request keeps the MTP route. A penalized
             // greedy request, adaptive KV, or a force-AR switch keeps the
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
-            let spec_ok = i.has_speculator
+            // Qwen4 PP uses the same native driver for greedy, unpenalized
+            // requests. Sampled or penalized requests explicitly keep the PP
+            // AR producer; they never enter the Qwen3.5-only PP route.
+            let mtp_ok = (i.pp <= 1 || (i.temp <= 1e-6 && !i.nonneutral_penalties))
                 && i.speculator_is_mtp
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
-                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor))
+                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor));
+            // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
+            // card): it verifies greedy picks, or sampled rows with the AR
+            // sampler's law (temperature, top_k, top_p, min_p), and applies
+            // no token penalties, so a penalized request keeps the AR
+            // producer. Any other speculator stays on AR.
+            let dflash2_ok = i.speculator_is_dflash2
+                && i.pp <= 1
+                && !i.nonneutral_penalties
+                && (i.temp <= 1e-6 || i.supports_temp_swor);
+            let spec_ok = i.has_speculator
+                && (mtp_ok || dflash2_ok)
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off
                 && !i.kv_adaptive;
@@ -1773,6 +1827,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // speculator built by the carrier must NOT change the route — an
         // arch-15 turn is always plain AR.
         15 => return GenerationRoute::MapleAr,
+        // Gemma 4. One route: the EAGLE speculator is a developer opt-in
+        // (`HIPFIRE_GEMMA4_EAGLE=1`) decided inside `generate_gemma4` after
+        // tokenization, and it never takes a tools request, so a tool turn is
+        // always the AR producer this route names.
+        13 => return GenerationRoute::Gemma4Ar,
         10 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -2026,6 +2085,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     m.seq_pos = prompt_tokens.len();
     m.conversation_tokens.extend_from_slice(prompt_tokens);
     let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t_prefill = Instant::now();
+    // Once per request, after prefill and before the first decode forward
+    // (and any decode capture/record): map context ahead for the whole
+    // `max_tokens` budget (AR: no draft rows). Best effort; the model logs
+    // and swallows a failure, leaving on-demand growth.
+    if let Some(state) = m.state.as_deref_mut() {
+        state.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, 0);
+    }
     let sampler_config = SamplerConfig {
         temperature: temp,
         top_p,
@@ -2070,6 +2137,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // exactly like a sampled token (KV write, commit, classify, stops).
     let mut forced_close = std::collections::VecDeque::new();
     let t_decode = Instant::now();
+    // One promotion attempt per request: a refusal (e.g. no free lane) keeps
+    // it here for good rather than retrying every token.
+    let mut promotion_tried = false;
 
     while generated < max_tokens {
         if check_abort(id) {
@@ -2077,6 +2147,83 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             let _ = gpu.free_tensor(decode_logits);
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
+        }
+        // Qwen4 fn-lanes continuous batching: a serve-batched peer is waiting
+        // and the daemon granted a permit. Here the next token is picked but
+        // neither fed nor streamed, so the request moves into an exact lane
+        // that feeds and streams it, instead of the peer waiting for this
+        // whole generation. A refusal changes nothing: the same token is fed
+        // below.
+        if !promotion_tried
+            && forced_close.is_empty()
+            && greedy_on_gpu
+            && !decode_penalizes
+            && m.qwen4().is_some_and(|b| b.lanes().is_some())
+        {
+            if let Some(permit) = crate::batch::promotion_permit()
+                .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
+            {
+                promotion_tried = true;
+                // `sample_cpu` is the decode argmax here (greedy, no penalty).
+                let seed = match pending {
+                    Some(token) => Ok(token),
+                    None => gpu.download_f32(&decode_logits).map(|mut row| {
+                        sampler::sample_cpu(&mut row, &m.conversation_tokens, &sampler_config)
+                    }),
+                };
+                if let Ok(seed) = seed {
+                    pending = Some(seed);
+                    let position = m.seq_pos;
+                    let promoted = match (
+                        m.tokenizer.as_ref(),
+                        m.state.as_deref_mut().and_then(|s| {
+                            (s as &mut dyn std::any::Any)
+                                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+                        }),
+                    ) {
+                        (Some(tokenizer), Some(bundle)) => crate::batch::promote_qwen4_singleton(
+                            gpu,
+                            bundle,
+                            None,
+                            crate::batch::Qwen4Boundary {
+                                id,
+                                permit,
+                                tokenizer,
+                                started_in_think,
+                                prompt_tokens,
+                                emitted: &streamed_tokens,
+                                position,
+                                seed_token: seed,
+                                seed_emitted: false,
+                                max_tokens,
+                                created_at: t0,
+                                prefill_done_at: t_prefill,
+                            },
+                        ),
+                        _ => Err("no qwen4 bundle or tokenizer".to_string()),
+                    };
+                    match promoted {
+                        Ok(promoted) => {
+                            // The resident state moved into the lane: drop the
+                            // host caches that described it.
+                            m.seq_pos = 0;
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                            crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                            crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                            gpu.replay.rearm_after_layout_growth();
+                            eprintln!(
+                                "[fn-lanes-promote] id={id} promoted from AR singleton at generated={generated} position={position}"
+                            );
+                            crate::batch::put_promoted_qwen4(promoted);
+                            let _ = gpu.free_tensor(decode_logits);
+                            return;
+                        }
+                        Err(e) => eprintln!("[fn-lanes-promote] id={id} stays on AR: {e}"),
+                    }
+                }
+            }
         }
         if let Some(token) = forced_close.pop_front() {
             pending = Some(token);
@@ -2282,8 +2429,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // fingerprint / trailer trim / value contract (`qwen_cached_turn_entry`) the
     // MTP route stores, so the next turn of EITHER route splices these exact
     // IDs instead of re-encoding the decoded text. `finish.store_cache` already
-    // excludes length-capped, stop-sequence, malformed and open-think
-    // terminals; a client abort returned above.
+    // excludes stop-sequence and malformed terminals, truncated tool routers,
+    // and completed calls hidden by length/open-think; length-capped call-less
+    // bodies store. A client abort returned above.
     let cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
     if cache_action.store {
         let tok = m.tokenizer.as_ref().unwrap();
@@ -2358,6 +2506,11 @@ pub fn generate(
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
 ) {
+    // Whole-request PLE serving guard (Qwen4 with PLE rows; `None` otherwise):
+    // every route below (Qwen4 AR, native MTP, the spec-capacity fallthrough)
+    // prefills and decodes under it, and it drops on every return, error and
+    // unwind, so a caller outside the daemon is covered too.
+    let _ple_serving = m.ple_serving_guard();
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
     // every stateful branch. Non-empty tools are denied for unsafe routes
@@ -2386,6 +2539,7 @@ pub fn generate(
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
@@ -2408,6 +2562,20 @@ pub fn generate(
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let selected_route = select_generation_route(&route_inputs);
+    if selected_route == GenerationRoute::Qwen4Ar
+        && route_inputs.pp > 1
+        && route_inputs.has_speculator
+        && route_inputs.speculator_is_mtp
+        && (route_inputs.temp > 1e-6 || route_inputs.nonneutral_penalties)
+    {
+        static QWEN4_PP_MTP_AR_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !QWEN4_PP_MTP_AR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[hipfire] PP native MTP is greedy-only; sampled/penalized requests decode AR"
+            );
+        }
+    }
     let tools_nonempty = tools.map(|t| !t.is_empty()).unwrap_or(false);
     if tools_nonempty && !selected_route.supports_tools() {
         crate::dense::emit_active_attempt_error(
@@ -2797,6 +2965,9 @@ pub fn generate(
                 repeat_window,
             );
             return;
+        }
+        GenerationRoute::Gemma4Ar => {
+            unreachable!("gemma4 dispatches through generation_early_route before this match")
         }
         GenerationRoute::MapleAr => {
             // Arch 15 has no pflash/no eviction, but it DOES honour the
@@ -3893,9 +4064,12 @@ pub fn generate(
                     let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     // `build_cached_history` (the non-Jinja ChatScaffold path) still splices a
                     // flat token vector, so project the content slot out of the per-channel
-                    // cache value. Qwen turns are content-only, so nothing is dropped.
+                    // cache value. Qwen turns are content-only, so nothing is dropped. The
+                    // echoed `reasoning_content` selects the exact producer turn when several
+                    // turns share this content/tool fingerprint (e.g. think-only turns); with no
+                    // echo only a unique identity hits.
                     let hit = cache_ref
-                        .get(&fp)
+                        .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
                         .and_then(|turn| turn.content.as_ref().map(|c| c.token_ids.clone()));
                     if trace_cache {
                         eprintln!(
@@ -5763,7 +5937,7 @@ pub fn generate(
         // Length-cap never exposes executable calls; malformed without
         // length fails closed (error, no tool_calls, no asst_turn_cache).
         // Decoded EOT on the final budget token beats length.
-        // Open think → reasoning-only stop (no calls, no cache) via finish().
+        // Open think → reasoning-only stop (no calls) via finish().
         // finish() shares the same drain + classify path as unit tests.
         let hit_length_cap = generated >= max_tokens;
         let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
@@ -5838,8 +6012,9 @@ pub fn generate(
         // the model wrote into KV instead of re-encoding via
         // `tokenizer.encode(msg.content)` (BPE non-bijective).
         //
-        // Suppressed on malformed / length-partial / open-think turns and
-        // on client Abort (effects.store_cache == false).
+        // Suppressed on malformed / truncated-tool / hidden-call turns and on
+        // client Abort (effects.store_cache == false). Call-less length and
+        // completed open-think bodies store.
         let mut cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
         cache_action.store = effects.store_cache && cache_action.store;
         if cache_action.store {
@@ -5988,7 +6163,11 @@ pub fn generate(
                 }
             }
             let mut out_bytes = [0u8; 8];
-            if let Err(e) = gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf) {
+            if let Err(e) = gpu
+                .hip
+                .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
+                .and_then(|()| gpu.take_device_wait_error())
+            {
                 let _ = (config, weights, scratch, kv);
                 crate::dense::dense_fail_closed_error(
                     m,
@@ -6244,11 +6423,18 @@ pub fn generate(
 /// through to `mtp_mode` for DSpark made `speculation = "dspark"` load and build
 /// the sidecar, then silently route the request through AR because that selector
 /// correctly pins MTP off.
+///
+/// The native in-trunk MTP is gated by the producer capability
+/// (`model_mtp_measured_ar_floor`, [`LoadedModel::mtp_measured_ar_floor`]): an
+/// `auto` model mode needs weights present AND a declared measured AR floor, so
+/// head presence alone never rearms `auto` (DeepSeek V4 declares none: `auto`
+/// stays AR). An explicit `on` (process or model) still requests MTP.
 pub fn deepseek4_spec_requested_from_policy(
     drafter_name: Option<&str>,
     process_mtp_mode: &str,
     model_mtp_mode: &str,
     model_mtp_weights_present: bool,
+    model_mtp_measured_ar_floor: bool,
 ) -> bool {
     if drafter_name == Some("dspark") {
         return true;
@@ -6256,7 +6442,15 @@ pub fn deepseek4_spec_requested_from_policy(
     match process_mtp_mode {
         "on" => true,
         "off" => false,
-        _ => model_mtp_mode == "on" || (model_mtp_mode == "auto" && model_mtp_weights_present),
+        _ => {
+            model_mtp_mode == "on"
+                || (model_mtp_mode == "auto"
+                    && model_mtp_weights_present
+                    && hipfire_config::mtp_mode_admits(
+                        hipfire_config::MtpMode::Auto,
+                        model_mtp_measured_ar_floor,
+                    ))
+        }
     }
 }
 
@@ -6266,6 +6460,7 @@ pub fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
         hipfire_runtime::config::get().mtp_mode.as_str(),
         &m.mtp_mode,
         m.mtp_weights_present,
+        m.mtp_measured_ar_floor(),
     )
 }
 
@@ -6795,5 +6990,119 @@ mod route_scope_tests {
         clear_generation_route();
         clear_terminal_control();
         set_active_attempt_id(0);
+    }
+}
+
+#[cfg(test)]
+mod qwen4_pp_route_tests {
+    use super::*;
+
+    /// Source-level: the public `generate` holds the whole-request PLE guard
+    /// before route selection, so no Qwen4 route runs unprotected.
+    #[test]
+    fn generate_holds_the_ple_serving_guard_before_route_selection() {
+        let src = include_str!("ar.rs");
+        let generate = src.find("pub fn generate(").expect("generate");
+        let guard = src[generate..]
+            .find("let _ple_serving = m.ple_serving_guard();")
+            .expect("guard");
+        let route = src[generate..]
+            .find("let selected_route = select_generation_route")
+            .expect("route selection");
+        assert!(guard < route);
+    }
+
+    fn inputs(arch_id: u32, pp: usize) -> GenerationRouteInputs {
+        GenerationRouteInputs {
+            arch_id,
+            ep: false,
+            dense_tp: false,
+            pp,
+            has_speculator: false,
+            speculator_is_mtp: false,
+            speculator_is_dflash2: false,
+            deepseek4_spec_requested: false,
+            ngram_can_sample: false,
+            temp: 0.0,
+            user_explicit_sampling: false,
+            min_p: None,
+            nonneutral_penalties: false,
+            force_ar_chat: false,
+            temp_spec_env_off: false,
+            fast_sample_on: false,
+            supports_temp_swor: false,
+            supports_chain_nucleus_verify: false,
+            kv_adaptive: false,
+        }
+    }
+
+    #[test]
+    fn qwen4_pipeline_parallel_stays_on_the_qwen4_ar_route() {
+        for pp in 1..=8 {
+            for temp in [0.0f32, 0.7] {
+                let mut i = inputs(16, pp);
+                i.temp = temp;
+                assert_eq!(
+                    select_generation_route(&i),
+                    GenerationRoute::Qwen4Ar,
+                    "pp {pp}"
+                );
+                // Penalties, explicit sampling and chain verify flags never
+                // reach the Qwen3.5 mesh route.
+                i.nonneutral_penalties = true;
+                i.user_explicit_sampling = true;
+                i.supports_chain_nucleus_verify = true;
+                assert_eq!(
+                    select_generation_route(&i),
+                    GenerationRoute::Qwen4Ar,
+                    "pp {pp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qwen4_native_greedy_mtp_uses_the_same_route_under_pp() {
+        let mut single = inputs(16, 1);
+        single.has_speculator = true;
+        single.speculator_is_mtp = true;
+        assert_eq!(select_generation_route(&single), GenerationRoute::Qwen4Spec);
+        for pp in 2..=8 {
+            let mut i = single;
+            i.pp = pp;
+            assert_eq!(
+                select_generation_route(&i),
+                GenerationRoute::Qwen4Spec,
+                "pp {pp}"
+            );
+            // Sampling-capable Single support does not qualify PP sampling.
+            i.supports_temp_swor = true;
+            i.temp = 0.7;
+            assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
+            i.temp = 0.0;
+            i.nonneutral_penalties = true;
+            assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
+            i.temp = 0.7;
+            assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
+        }
+    }
+
+    #[test]
+    fn only_qwen35_pipeline_parallel_takes_the_mesh_route() {
+        for arch_id in [5u32, 6] {
+            assert_eq!(
+                select_generation_route(&inputs(arch_id, 2)),
+                GenerationRoute::PipelineParallel
+            );
+        }
+        // Single, and every other arch short-circuit, is unchanged.
+        assert_eq!(
+            select_generation_route(&inputs(16, 1)),
+            GenerationRoute::Qwen4Ar
+        );
+        assert_ne!(
+            select_generation_route(&inputs(16, 6)),
+            GenerationRoute::PipelineParallel
+        );
     }
 }

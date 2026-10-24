@@ -71,7 +71,16 @@ const ARM_ENV: &str = "HIPFIRE_MTP_VERIFY_GRAPH_ORACLE_ARM";
 const OUT_ENV: &str = "HIPFIRE_MTP_VERIFY_GRAPH_ORACLE_OUT";
 const OUT_ROOT_ENV: &str = "HIPFIRE_MTP_VERIFY_GRAPH_ORACLE_OUT_ROOT";
 const FAMS: [&str; 10] = [
-    "logits", "hidden", "prev", "dn_s", "dn_scales", "dn_conv", "dn_ef", "kv", "mtpkv", "tape",
+    "logits",
+    "hidden",
+    "prev",
+    "dn_s",
+    "dn_scales",
+    "dn_conv",
+    "dn_ef",
+    "kv",
+    "mtpkv",
+    "tape",
 ];
 const PROMPT: &str = "Write a Rust function `fn parse_kv(line: &str) -> Option<(String, String)>` that splits \
 a `key=value` line on the first '=', trims both sides, and rejects an empty key. Add three unit tests.";
@@ -133,7 +142,11 @@ fn assert_all_finite_f16(tag: &str, bytes: &[u8]) {
 /// f32 lanes.
 fn assert_q8_blocks(tag: &str, bytes: &[u8]) {
     assert!(!bytes.is_empty(), "{tag}: empty q8 bytes");
-    assert!(bytes.len() % 34 == 0, "{tag}: ragged q8 len {}", bytes.len());
+    assert!(
+        bytes.len() % 34 == 0,
+        "{tag}: ragged q8 len {}",
+        bytes.len()
+    );
     for (i, blk) in bytes.chunks_exact(34).enumerate() {
         let s = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         assert!(s.is_finite(), "{tag} block {i}: non-finite scale");
@@ -141,7 +154,11 @@ fn assert_q8_blocks(tag: &str, bytes: &[u8]) {
 }
 
 fn raw_prefix(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<u8> {
-    assert!(n <= t.buf.size(), "prefix {n} exceeds allocation {}", t.buf.size());
+    assert!(
+        n <= t.buf.size(),
+        "prefix {n} exceeds allocation {}",
+        t.buf.size()
+    );
     let mut out = vec![0u8; n];
     gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("dtoh prefix");
     out
@@ -152,7 +169,9 @@ fn raw_all(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
 }
 
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
-    let model: PathBuf = std::env::var("HIPFIRE_MTP_BYTE_IDENTITY_MODEL").ok()?.into();
+    let model: PathBuf = std::env::var("HIPFIRE_MTP_BYTE_IDENTITY_MODEL")
+        .ok()?
+        .into();
     let head: PathBuf = std::env::var("HIPFIRE_MTP_BYTE_IDENTITY_HEAD")
         .map(PathBuf::from)
         .unwrap_or_else(|_| model.with_extension("mtp"));
@@ -160,8 +179,7 @@ fn model_paths() -> Option<(PathBuf, PathBuf)> {
 }
 
 fn unique_out_dir(root: Option<PathBuf>, arm: &str) -> PathBuf {
-    let base =
-        root.unwrap_or_else(|| std::env::temp_dir().join("vg-oracle"));
+    let base = root.unwrap_or_else(|| std::env::temp_dir().join("vg-oracle"));
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -187,11 +205,19 @@ fn load_offloaded_session(
     assert!(n > HOST_EXPERT_LAYERS, "fixture has only {n} layers");
 
     let mut placement = Placement::all_device(n);
-    for r in placement.expert_residency.iter_mut().take(HOST_EXPERT_LAYERS) {
+    for r in placement
+        .expert_residency
+        .iter_mut()
+        .take(HOST_EXPERT_LAYERS)
+    {
         *r = ExpertResidency::HostMapped;
     }
     assert_eq!(placement.host_expert_layers(), HOST_EXPERT_LAYERS);
-    assert_eq!(placement.host_layers(), 0, "trunk own-weights must stay resident");
+    assert_eq!(
+        placement.host_layers(),
+        0,
+        "trunk own-weights must stay resident"
+    );
     // Host-weight count drives the model-level CPU-offload flag exactly as the
     // production loader sets it (`Architecture::load_weights_with_placement` /
     // the slots loader): a host-mapped weight that the CPU may multiply is the
@@ -227,14 +253,9 @@ host_cpu_weights={} cpu_offload_active={}",
         .iter()
         .map(|t| *t == LayerType::FullAttention)
         .collect();
-    let kv_cache = KvCache::new_gpu_q8_filtered(
-        gpu,
-        &is_kv_layer,
-        config.n_kv_heads,
-        config.head_dim,
-        CTX,
-    )
-    .expect("q8 kv");
+    let kv_cache =
+        KvCache::new_gpu_q8_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, CTX)
+            .expect("q8 kv");
     let dn_state =
         DeltaNetState::new_with_quant(gpu, &config, StateQuant::Q8).expect("q8 dn state");
     // Default Q8 build runs with F16 error-feedback; the orchestrator enforces
@@ -261,7 +282,12 @@ host_cpu_weights={} cpu_offload_active={}",
     }
 }
 
-fn free_session(gpu: &mut Gpu, slot: ModelSlot, state: MtpSpecState, head: mtp_head::Qwen35MtpHead) {
+fn free_session(
+    gpu: &mut Gpu,
+    slot: ModelSlot,
+    state: MtpSpecState,
+    head: mtp_head::Qwen35MtpHead,
+) {
     gpu.invalidate_graph_state();
     state.free_gpu(&mut *gpu);
     gpu.invalidate_weight_caches();
@@ -335,12 +361,21 @@ fn collect_fams(
     let prev = raw_all(gpu, &state.prev_hidden);
     assert_all_finite_f32("verify-logits", &{
         assert!(logits.len() % 4 == 0);
-        logits.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>()
+        logits
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<_>>()
     });
     assert_all_finite_f32("verify-hidden", &{
-        hidden.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>()
+        hidden
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<_>>()
     });
-    assert_all_finite_f32("prev-hidden", &gpu.download_f32(&state.prev_hidden).expect("prev"));
+    assert_all_finite_f32(
+        "prev-hidden",
+        &gpu.download_f32(&state.prev_hidden).expect("prev"),
+    );
 
     let mut dn_s = Vec::new();
     let mut dn_scales = Vec::new();
@@ -362,7 +397,10 @@ fn collect_fams(
     // (checked below), NOT blocked Q8_0: never read as f32 lanes or 34B blocks.
     assert!(!dn_s.is_empty(), "dn-s empty");
     assert_all_finite_f32("dn-scales", &gpu_download_all(gpu, &slot.dn_state.s_scales));
-    assert_all_finite_f32("dn-conv", &gpu_download_all(gpu, &slot.dn_state.conv_states));
+    assert_all_finite_f32(
+        "dn-conv",
+        &gpu_download_all(gpu, &slot.dn_state.conv_states),
+    );
     assert_all_finite_f16("dn-ef", &dn_ef);
 
     let kv = trunk_kv_prefix(gpu, slot, end_pos);
@@ -372,9 +410,13 @@ fn collect_fams(
     assert_q8_blocks("mtp-kv", &mtpkv);
     let tape = tape_prefix(gpu, state, n_verify);
     assert_all_finite_f32("tape", &{
-        tape.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>()
+        tape.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<_>>()
     });
-    vec![logits, hidden, prev, dn_s, dn_scales, dn_conv, dn_ef, kv, mtpkv, tape]
+    vec![
+        logits, hidden, prev, dn_s, dn_scales, dn_conv, dn_ef, kv, mtpkv, tape,
+    ]
 }
 
 fn gpu_download_all(gpu: &Gpu, ts: &[GpuTensor]) -> Vec<f32> {
@@ -458,7 +500,11 @@ impl Worker {
             h ^= fnv1a(f);
             h = h.wrapping_mul(0x100000001b3);
         }
-        let toks = committed.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
+        let toks = committed
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         self.emit(format!(
             "WIN tag={tag} k={k} pos={pos} seed={seed} committed={toks} \
 accept={accept} advance={advance} drafts={drafts} n={n_verify} end={end_pos} h={h:016x}"
@@ -485,15 +531,34 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
         eprintln!("skipping: HIPFIRE_MTP_BYTE_IDENTITY_MODEL not set");
         return;
     };
-    assert!(model.is_file(), "trunk fixture missing: {}", model.display());
-    assert!(head_path.is_file(), "mtp sidecar missing: {}", head_path.display());
+    assert!(
+        model.is_file(),
+        "trunk fixture missing: {}",
+        model.display()
+    );
+    assert!(
+        head_path.is_file(),
+        "mtp sidecar missing: {}",
+        head_path.display()
+    );
     std::fs::create_dir_all(&out_dir).expect("create oracle out dir");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
-    eprintln!("[vg-oracle] arm={arm} gpu={} model={}", gpu.arch, model.display());
-    assert_eq!(gpu.arch.as_str(), "gfx1201", "oracle requires single-GPU gfx1201");
+    eprintln!(
+        "[vg-oracle] arm={arm} gpu={} model={}",
+        gpu.arch,
+        model.display()
+    );
+    assert_eq!(
+        gpu.arch.as_str(),
+        "gfx1201",
+        "oracle requires single-GPU gfx1201"
+    );
 
-    let mut w = Worker { out_dir, lines: Vec::new() };
+    let mut w = Worker {
+        out_dir,
+        lines: Vec::new(),
+    };
     let mut slot = load_offloaded_session(&mut gpu, &model, "vg-oracle", &mut w.lines);
     let head = mtp_head::load_mtp_head(&head_path, &mut gpu, CTX).expect("load head");
     let tokenizer = slot.load_tokenizer().expect("tokenizer");
@@ -501,34 +566,64 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
     let n = prompt.len();
     let eos = slot.config.eos_token;
     let vocab = slot.config.vocab_size;
-    let mut state =
-        MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(&mut gpu, &slot, &head, MAX_N, VERIFY_CAP, MtpKvMode::Q8)
-            .expect("state");
+    let mut state = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
+        &mut gpu,
+        &slot,
+        &head,
+        MAX_N,
+        VERIFY_CAP,
+        MtpKvMode::Q8,
+    )
+    .expect("state");
     if let Some(cvs) = head.weights.compressed_vocab_size {
-        state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs).expect("head compressed logits");
-        state.ensure_compressed_lm_logits(&mut gpu, cvs).expect("batched compressed logits");
+        state
+            .mtp_scratch
+            .ensure_compressed_logits(&mut gpu, cvs)
+            .expect("head compressed logits");
+        state
+            .ensure_compressed_lm_logits(&mut gpu, cvs)
+            .expect("batched compressed logits");
     }
     w.emit(format!("PROMPT n={n} eos={eos}"));
 
     // Phase A: native windows at n_verify 2/3/4, same prefilled prompt/seed.
     let seed0 = prefill_and_seed(&mut gpu, &mut slot, &head, &mut state, &prompt);
     let mut first_k3: Option<(Vec<u32>, Vec<Vec<u8>>)> = None;
-    let mut seen: std::collections::BTreeSet<(usize, usize, u32)> = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<(usize, usize, u32)> =
+        std::collections::BTreeSet::new();
     for k in 1..=MAX_N {
         let mut seed = prefill_and_seed(&mut gpu, &mut slot, &head, &mut state, &prompt);
         assert_eq!(seed, seed0, "k={k}: prefill seed changed after reset");
         let mut pos = n;
         let rb = state.mtp_verify_graph_replays();
         for win in 0..NATIVE_WINDOWS_PER_K {
-            let r = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot, &head, &mut state, pos, seed, eos, k)
-                .expect("native window");
+            let r = spec_step_mtp_compressed_serial_with_k(
+                &mut gpu, &mut slot, &head, &mut state, pos, seed, eos, k,
+            )
+            .expect("native window");
             assert!(!r.hit_eos, "phase A hit EOS");
             assert_eq!(r.drafts_generated, k);
             let end = pos + r.advance;
             let tag = format!("A-k{k}-{win}");
-            let fams = w.snap(&gpu, &slot, &state, &tag, k, pos, seed, &r.committed, r.accept_count, r.advance, r.drafts_generated, end);
+            let fams = w.snap(
+                &gpu,
+                &slot,
+                &state,
+                &tag,
+                k,
+                pos,
+                seed,
+                &r.committed,
+                r.accept_count,
+                r.advance,
+                r.drafts_generated,
+                end,
+            );
             w.replay(&state, &tag);
-            assert!(seen.insert((k, pos, seed)), "k={k}: repeated (pos, seed) input");
+            assert!(
+                seen.insert((k, pos, seed)),
+                "k={k}: repeated (pos, seed) input"
+            );
             if k == MAX_N && win == 0 {
                 first_k3 = Some((r.committed.clone(), fams));
             }
@@ -536,11 +631,20 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
             pos = end;
         }
         if arm == "graph" {
-            assert!(state.mtp_verify_graph_captures() > 0, "graph: no capture at k={k}");
-            assert!(state.mtp_verify_graph_replays() - rb >= 2, "graph: <2 replays at k={k}");
+            assert!(
+                state.mtp_verify_graph_captures() > 0,
+                "graph: no capture at k={k}"
+            );
+            assert!(
+                state.mtp_verify_graph_replays() - rb >= 2,
+                "graph: <2 replays at k={k}"
+            );
         }
     }
-    let (caps_a, reps_a) = (state.mtp_verify_graph_captures(), state.mtp_verify_graph_replays());
+    let (caps_a, reps_a) = (
+        state.mtp_verify_graph_captures(),
+        state.mtp_verify_graph_replays(),
+    );
     if arm == "graph" {
         assert!(caps_a >= 3, "graph: only {caps_a} captures");
         assert!(reps_a >= 6, "graph: only {reps_a} replays");
@@ -551,11 +655,22 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
 
     // Phase B: deterministic k=0 reference, then full/partial/zero takeovers
     // inside the 2..4-row envelope, each followed by native continuation.
-    let mut toks = vec![prefill_and_seed(&mut gpu, &mut slot, &head, &mut state, &prompt)];
+    let mut toks = vec![prefill_and_seed(
+        &mut gpu, &mut slot, &head, &mut state, &prompt,
+    )];
     assert_eq!(toks[0], seed0);
     for i in 0..REF_STEPS {
-        let r = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot, &head, &mut state, n + i, toks[i], eos, 0)
-            .expect("ref step");
+        let r = spec_step_mtp_compressed_serial_with_k(
+            &mut gpu,
+            &mut slot,
+            &head,
+            &mut state,
+            n + i,
+            toks[i],
+            eos,
+            0,
+        )
+        .expect("ref step");
         assert!(!r.hit_eos, "reference hit EOS");
         toks.push(r.committed[0]);
     }
@@ -563,11 +678,16 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
     assert_eq!(seed_b, seed0, "re-prefill must reproduce the seed");
     let wrong = |t: u32| {
         let c = if t == 0 { 1 } else { t - 1 };
-        if c == eos { (c + 1) % vocab as u32 } else { c }
+        if c == eos {
+            (c + 1) % vocab as u32
+        } else {
+            c
+        }
     };
     // (label, n_match, append_wrong): rows = matches + wrong? + bonus...
     // drafts = candidates.len(), n_verify = drafts + 1.
-    let plan: [(&str, usize, bool); 3] = [("full", 2, false), ("partial", 2, true), ("zero", 0, true)];
+    let plan: [(&str, usize, bool); 3] =
+        [("full", 2, false), ("partial", 2, true), ("zero", 0, true)];
     let mut idx = 0usize;
     for (label, nmatch, add_wrong) in plan {
         let p = n + idx;
@@ -580,24 +700,65 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
             }
             c
         };
-        assert!((2..=4).contains(&(cands.len() + 1)), "{label}: outside 2..4-row envelope");
-        let r = spec_step_mtp_compressed_serial_with_takeover_candidates(&mut gpu, &mut slot, &head, &mut state, p, toks[idx], eos, &cands)
-            .expect("takeover window");
+        assert!(
+            (2..=4).contains(&(cands.len() + 1)),
+            "{label}: outside 2..4-row envelope"
+        );
+        let r = spec_step_mtp_compressed_serial_with_takeover_candidates(
+            &mut gpu, &mut slot, &head, &mut state, p, toks[idx], eos, &cands,
+        )
+        .expect("takeover window");
         assert_eq!(r.accept_count, nmatch, "{label}: accept mismatch");
-        assert_eq!(&r.committed[..], &toks[idx + 1..=idx + r.advance], "{label}: committed drift");
+        assert_eq!(
+            &r.committed[..],
+            &toks[idx + 1..=idx + r.advance],
+            "{label}: committed drift"
+        );
         let end = p + r.advance;
         let tag = format!("B-{label}");
-        w.snap(&gpu, &slot, &state, &tag, cands.len().saturating_sub(1).min(MAX_N).max(1), p, toks[idx], &r.committed, r.accept_count, r.advance, r.drafts_generated, end);
+        w.snap(
+            &gpu,
+            &slot,
+            &state,
+            &tag,
+            cands.len().saturating_sub(1).min(MAX_N).max(1),
+            p,
+            toks[idx],
+            &r.committed,
+            r.accept_count,
+            r.advance,
+            r.drafts_generated,
+            end,
+        );
         w.replay(&state, &tag);
         idx += r.advance;
         // Native continuation on the retained post-rollback state.
-        let c = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot, &head, &mut state, end, toks[idx], eos, 2)
-            .expect("post-takeover continuation");
+        let c = spec_step_mtp_compressed_serial_with_k(
+            &mut gpu, &mut slot, &head, &mut state, end, toks[idx], eos, 2,
+        )
+        .expect("post-takeover continuation");
         assert!(!c.hit_eos, "{label}: continuation hit EOS");
-        assert_eq!(&c.committed[..], &toks[idx + 1..=idx + c.advance], "{label}: continuation drift");
+        assert_eq!(
+            &c.committed[..],
+            &toks[idx + 1..=idx + c.advance],
+            "{label}: continuation drift"
+        );
         let cend = end + c.advance;
         let ctag = format!("B-{label}-cont");
-        w.snap(&gpu, &slot, &state, &ctag, 2, end, toks[idx], &c.committed, c.accept_count, c.advance, c.drafts_generated, cend);
+        w.snap(
+            &gpu,
+            &slot,
+            &state,
+            &ctag,
+            2,
+            end,
+            toks[idx],
+            &c.committed,
+            c.accept_count,
+            c.advance,
+            c.drafts_generated,
+            cend,
+        );
         w.replay(&state, &ctag);
         idx += c.advance;
     }
@@ -607,12 +768,27 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
     assert_eq!(seed_c, seed0, "gen2 reset must reproduce the seed");
     let (mut pos_c, mut seed_c_mut) = (n, seed_c);
     for win in 0..4 {
-        let r = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot, &head, &mut state, pos_c, seed_c_mut, eos, MAX_N)
-            .expect("gen2 window");
+        let r = spec_step_mtp_compressed_serial_with_k(
+            &mut gpu, &mut slot, &head, &mut state, pos_c, seed_c_mut, eos, MAX_N,
+        )
+        .expect("gen2 window");
         assert!(!r.hit_eos, "gen2 hit EOS");
         let end = pos_c + r.advance;
         let tag = format!("C-3-{win}");
-        w.snap(&gpu, &slot, &state, &tag, MAX_N, pos_c, seed_c_mut, &r.committed, r.accept_count, r.advance, r.drafts_generated, end);
+        w.snap(
+            &gpu,
+            &slot,
+            &state,
+            &tag,
+            MAX_N,
+            pos_c,
+            seed_c_mut,
+            &r.committed,
+            r.accept_count,
+            r.advance,
+            r.drafts_generated,
+            end,
+        );
         w.replay(&state, &tag);
         seed_c_mut = *r.committed.last().unwrap();
         pos_c = end;
@@ -623,30 +799,64 @@ fn run_worker(arm: &str, out_dir: PathBuf) {
     free_session(&mut gpu, slot, state, head);
     let mut slot2 = load_offloaded_session(&mut gpu, &model, "vg-oracle-reload", &mut w.lines);
     let head2 = mtp_head::load_mtp_head(&head_path, &mut gpu, CTX).expect("reload head");
-    let mut state2 =
-        MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(&mut gpu, &slot2, &head2, MAX_N, VERIFY_CAP, MtpKvMode::Q8)
-            .expect("reload state");
+    let mut state2 = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
+        &mut gpu,
+        &slot2,
+        &head2,
+        MAX_N,
+        VERIFY_CAP,
+        MtpKvMode::Q8,
+    )
+    .expect("reload state");
     if let Some(cvs) = head2.weights.compressed_vocab_size {
-        state2.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs).expect("reload head compressed logits");
-        state2.ensure_compressed_lm_logits(&mut gpu, cvs).expect("reload batched compressed logits");
+        state2
+            .mtp_scratch
+            .ensure_compressed_logits(&mut gpu, cvs)
+            .expect("reload head compressed logits");
+        state2
+            .ensure_compressed_lm_logits(&mut gpu, cvs)
+            .expect("reload batched compressed logits");
     }
     let seed_r = prefill_and_seed(&mut gpu, &mut slot2, &head2, &mut state2, &prompt);
     assert_eq!(seed_r, seed0, "reload prefill must reproduce the seed");
-    let r = spec_step_mtp_compressed_serial_with_k(&mut gpu, &mut slot2, &head2, &mut state2, n, seed_r, eos, MAX_N)
-        .expect("reload window");
-    assert_eq!(r.committed, want_toks, "reload committed diverged from Phase A");
+    let r = spec_step_mtp_compressed_serial_with_k(
+        &mut gpu,
+        &mut slot2,
+        &head2,
+        &mut state2,
+        n,
+        seed_r,
+        eos,
+        MAX_N,
+    )
+    .expect("reload window");
+    assert_eq!(
+        r.committed, want_toks,
+        "reload committed diverged from Phase A"
+    );
     let got = collect_fams(&gpu, &slot2, &state2, r.drafts_generated + 1, n + r.advance);
     assert_eq!(got.len(), want_fams.len(), "reload family count diverged");
     for (i, (g, want)) in got.iter().zip(want_fams.iter()).enumerate() {
         assert_eq!(g, want, "reload family {} diverged from Phase A", FAMS[i]);
     }
-    w.emit(format!("RELOAD committed={} match=1", r.committed.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")));
+    w.emit(format!(
+        "RELOAD committed={} match=1",
+        r.committed
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
     free_session(&mut gpu, slot2, state2, head2);
 
-    std::fs::write(w.out_dir.join("digests.log"), w.lines.join("\n") + "\n").expect("write digests");
-    eprintln!("[vg-oracle] arm={arm} DONE lines={} out={}", w.lines.len(), w.out_dir.display());
+    std::fs::write(w.out_dir.join("digests.log"), w.lines.join("\n") + "\n")
+        .expect("write digests");
+    eprintln!(
+        "[vg-oracle] arm={arm} DONE lines={} out={}",
+        w.lines.len(),
+        w.out_dir.display()
+    );
 }
-
 
 fn win_field<'a>(line: &'a str, key: &str) -> &'a str {
     line.split_whitespace()
@@ -658,9 +868,9 @@ fn win_field<'a>(line: &'a str, key: &str) -> &'a str {
 }
 
 fn read_sidecar(dir: &Path, tag: &str, fam: &str) -> Vec<u8> {
-    std::fs::read(dir.join(format!("{tag}-{fam}.bin"))).unwrap_or_else(|_| panic!("missing {tag}-{fam}.bin"))
+    std::fs::read(dir.join(format!("{tag}-{fam}.bin")))
+        .unwrap_or_else(|_| panic!("missing {tag}-{fam}.bin"))
 }
-
 
 fn run_orchestrator() {
     let Some(_) = model_paths() else {
@@ -691,21 +901,48 @@ fn run_orchestrator() {
     let graph = std::fs::read_to_string(graph_dir.join("digests.log")).expect("read graph digests");
     let ew: Vec<_> = eager.lines().filter(|l| l.starts_with("WIN ")).collect();
     let gw: Vec<_> = graph.lines().filter(|l| l.starts_with("WIN ")).collect();
-    assert_eq!(ew.len(), gw.len(), "window count diverged eager={} graph={}", ew.len(), gw.len());
+    assert_eq!(
+        ew.len(),
+        gw.len(),
+        "window count diverged eager={} graph={}",
+        ew.len(),
+        gw.len()
+    );
     assert!(!ew.is_empty(), "no WIN lines recorded");
     for (e, g) in ew.iter().zip(&gw) {
-        for key in ["tag", "k", "pos", "seed", "committed", "accept", "advance", "drafts", "n", "end"] {
-            assert_eq!(win_field(e, key), win_field(g, key), "eager/graph {key}: {e} vs {g}");
+        for key in [
+            "tag",
+            "k",
+            "pos",
+            "seed",
+            "committed",
+            "accept",
+            "advance",
+            "drafts",
+            "n",
+            "end",
+        ] {
+            assert_eq!(
+                win_field(e, key),
+                win_field(g, key),
+                "eager/graph {key}: {e} vs {g}"
+            );
         }
         let tag = win_field(e, "tag");
         for fam in FAMS {
             let eager_bytes = read_sidecar(eager_dir, tag, fam);
             let graph_bytes = read_sidecar(graph_dir, tag, fam);
             if eager_bytes != graph_bytes {
-                let offset = eager_bytes.iter().zip(&graph_bytes).position(|(a, b)| a != b)
+                let offset = eager_bytes
+                    .iter()
+                    .zip(&graph_bytes)
+                    .position(|(a, b)| a != b)
                     .unwrap_or(eager_bytes.len().min(graph_bytes.len()));
-                panic!("{tag} family {fam}: eager/graph differ at byte {offset}, lengths {} vs {}",
-                    eager_bytes.len(), graph_bytes.len());
+                panic!(
+                    "{tag} family {fam}: eager/graph differ at byte {offset}, lengths {} vs {}",
+                    eager_bytes.len(),
+                    graph_bytes.len()
+                );
             }
         }
     }
@@ -715,18 +952,38 @@ fn run_orchestrator() {
     let first_tag = win_field(ew[0], "tag");
     let (eager_ef, graph_ef) = (ef_len(eager_dir, first_tag), ef_len(graph_dir, first_tag));
     assert_eq!(eager_ef, graph_ef, "dn_ef length diverged across arms");
-    assert!(eager_ef > 0, "dn_ef empty on both arms (HIPFIRE_DN_STATE_EF=0 set?)");
+    assert!(
+        eager_ef > 0,
+        "dn_ef empty on both arms (HIPFIRE_DN_STATE_EF=0 set?)"
+    );
 
-    for (name, text, is_graph) in [("eager", eager.as_str(), false), ("graph", graph.as_str(), true)] {
-        let host = text.lines().find(|l| l.starts_with("HOST ")).expect("HOST line");
+    for (name, text, is_graph) in [
+        ("eager", eager.as_str(), false),
+        ("graph", graph.as_str(), true),
+    ] {
+        let host = text
+            .lines()
+            .find(|l| l.starts_with("HOST "))
+            .expect("HOST line");
         assert!(host.contains("host_expert_layers=16"), "{name}: {host}");
-        assert!(text.lines().any(|l| l.starts_with("PLACEMENT explicit-fixed-first16")), "{name}: placement line missing");
-        assert_eq!(text.lines().filter(|l| l.starts_with("RELOAD ")).count(), 1, "{name}: reload check missing");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("PLACEMENT explicit-fixed-first16")),
+            "{name}: placement line missing"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("RELOAD ")).count(),
+            1,
+            "{name}: reload check missing"
+        );
         let reps: Vec<&str> = text.lines().filter(|l| l.starts_with("REPLAY ")).collect();
         assert!(!reps.is_empty(), "{name}: no REPLAY lines");
         let last = reps.last().unwrap();
         let get = |k: &str| -> u64 {
-            last.split_whitespace().find(|p| p.starts_with(&format!("{k}="))).and_then(|p| p.split_once('=').unwrap().1.parse().ok()).unwrap_or(u64::MAX)
+            last.split_whitespace()
+                .find(|p| p.starts_with(&format!("{k}=")))
+                .and_then(|p| p.split_once('=').unwrap().1.parse().ok())
+                .unwrap_or(u64::MAX)
         };
         let (caps, reps_n) = (get("captures"), get("replays"));
         if is_graph {
@@ -749,9 +1006,11 @@ fn run_orchestrator() {
 #[ignore = "requires real HIP GPU (gfx1201) + HIPFIRE_MTP_BYTE_IDENTITY_MODEL (qwen3.6-35b-a3b.mq4p) + MTP sidecar"]
 fn mtp_verify_graph_eager_vs_replay() {
     if let Ok(arm) = std::env::var(ARM_ENV) {
-        let out = std::env::var(OUT_ENV).map(PathBuf::from).unwrap_or_else(|_| {
-            unique_out_dir(std::env::var(OUT_ROOT_ENV).map(PathBuf::from).ok(), &arm)
-        });
+        let out = std::env::var(OUT_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                unique_out_dir(std::env::var(OUT_ROOT_ENV).map(PathBuf::from).ok(), &arm)
+            });
         run_worker(&arm, out);
     } else {
         run_orchestrator();
@@ -921,8 +1180,16 @@ const CPU_SAME_ROUTE_FAMS: [&str; 2] = ["mtpkv", "tape"];
 /// tested window must have kept. Comparing it against the one-row serial
 /// reference can only *bound* the serial-vs-batch drift, and a tolerance is
 /// exactly what could hide a skipped rollback; this byte comparison cannot.
-const CPU_SAME_ROUTE_STATE_FAMS: [&str; 8] =
-    ["prev", "dn_s", "dn_scales", "dn_conv", "dn_ef", "kv", "mtpkv", "tape"];
+const CPU_SAME_ROUTE_STATE_FAMS: [&str; 8] = [
+    "prev",
+    "dn_s",
+    "dn_scales",
+    "dn_conv",
+    "dn_ef",
+    "kv",
+    "mtpkv",
+    "tape",
+];
 
 fn fam_idx(name: &str) -> usize {
     FAMS.iter()
@@ -931,7 +1198,10 @@ fn fam_idx(name: &str) -> usize {
 }
 
 fn cpu_csv(v: &[u32]) -> String {
-    v.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+    v.iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn cpu_parse_ids(s: &str, what: &str) -> Vec<u32> {
@@ -939,13 +1209,20 @@ fn cpu_parse_ids(s: &str, what: &str) -> Vec<u32> {
         return Vec::new();
     }
     s.split(',')
-        .map(|x| x.trim().parse::<u32>().unwrap_or_else(|_| panic!("{what}: bad id {x:?} in {s:?}")))
+        .map(|x| {
+            x.trim()
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("{what}: bad id {x:?} in {s:?}"))
+        })
         .collect()
 }
 
 fn f32_le(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.len() % 4 == 0, "ragged f32 bytes: {}", bytes.len());
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// First `id` that is provably different from the token the model predicts at
@@ -1023,15 +1300,44 @@ fn cpu_trials(toks: &[u32], vocab: usize, eos: u32) -> Vec<CpuTrial> {
         },
     ];
     for t in &trials {
-        assert!(t.k <= VERIFY_CAP, "{}: K={} exceeds verify capacity {VERIFY_CAP}", t.label, t.k);
-        assert_eq!(t.k, t.cands.len(), "{}: k must be the candidate count", t.label);
-        assert_eq!(t.advance, t.accept + 1, "{}: advance must be accept+1", t.label);
+        assert!(
+            t.k <= VERIFY_CAP,
+            "{}: K={} exceeds verify capacity {VERIFY_CAP}",
+            t.label,
+            t.k
+        );
+        assert_eq!(
+            t.k,
+            t.cands.len(),
+            "{}: k must be the candidate count",
+            t.label
+        );
+        assert_eq!(
+            t.advance,
+            t.accept + 1,
+            "{}: advance must be accept+1",
+            t.label
+        );
         for (i, &c) in t.cands.iter().enumerate() {
-            assert!((c as usize) < vocab, "{}: candidate {c} out of vocab", t.label);
+            assert!(
+                (c as usize) < vocab,
+                "{}: candidate {c} out of vocab",
+                t.label
+            );
             if i < t.accept {
-                assert_eq!(c, toks[i + 1], "{}: accepted candidate {i} is not the AR token", t.label);
+                assert_eq!(
+                    c,
+                    toks[i + 1],
+                    "{}: accepted candidate {i} is not the AR token",
+                    t.label
+                );
             } else {
-                assert_ne!(c, toks[i + 1], "{}: rejected candidate {i} equals the AR token", t.label);
+                assert_ne!(
+                    c,
+                    toks[i + 1],
+                    "{}: rejected candidate {i} equals the AR token",
+                    t.label
+                );
             }
         }
         match &t.bad {
@@ -1055,7 +1361,11 @@ fn cpu_trials(toks: &[u32], vocab: usize, eos: u32) -> Vec<CpuTrial> {
                     t.label
                 );
             }
-            None => assert_eq!(t.accept, t.k, "{}: only a full-accept window has no rejected tail", t.label),
+            None => assert_eq!(
+                t.accept, t.k,
+                "{}: only a full-accept window has no rejected tail",
+                t.label
+            ),
         }
     }
     trials
@@ -1065,7 +1375,9 @@ fn cpu_trials(toks: &[u32], vocab: usize, eos: u32) -> Vec<CpuTrial> {
 
 fn raw_at(gpu: &Gpu, t: &GpuTensor, offset: usize, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
-    gpu.hip.memcpy_dtoh_at(&mut out, &t.buf, offset).expect("dtoh at");
+    gpu.hip
+        .memcpy_dtoh_at(&mut out, &t.buf, offset)
+        .expect("dtoh at");
     out
 }
 
@@ -1113,10 +1425,20 @@ fn tape_row(gpu: &Gpu, state: &MtpSpecState, row_sel: usize) -> Vec<u8> {
     let tape = &state.trunk_gdn_tape;
     let mut out = Vec::new();
     for t in &tape.qkv_bufs {
-        out.extend_from_slice(&raw_at(gpu, t, row_sel * tape.qkv_dim * 4, tape.qkv_dim * 4));
+        out.extend_from_slice(&raw_at(
+            gpu,
+            t,
+            row_sel * tape.qkv_dim * 4,
+            tape.qkv_dim * 4,
+        ));
     }
     for t in tape.alpha_bufs.iter().chain(tape.beta_bufs.iter()) {
-        out.extend_from_slice(&raw_at(gpu, t, row_sel * tape.n_v_heads * 4, tape.n_v_heads * 4));
+        out.extend_from_slice(&raw_at(
+            gpu,
+            t,
+            row_sel * tape.n_v_heads * 4,
+            tape.n_v_heads * 4,
+        ));
     }
     out
 }
@@ -1141,8 +1463,14 @@ fn cpu_snap(
 ) -> usize {
     let dim = slot.config.dim;
     let vocab = slot.config.vocab_size;
-    assert!(win_start < win_end, "{tag}: empty row window {win_start}..{win_end}");
-    assert!(row_sel < state.verify_capacity + 1, "{tag}: row {row_sel} outside the verify envelope");
+    assert!(
+        win_start < win_end,
+        "{tag}: empty row window {win_start}..{win_end}"
+    );
+    assert!(
+        row_sel < state.verify_capacity + 1,
+        "{tag}: row {row_sel} outside the verify envelope"
+    );
 
     let logits = raw_at(gpu, &state.verify_logits, row_sel * vocab * 4, vocab * 4);
     let hidden = raw_at(gpu, &state.verify_hidden, row_sel * dim * 4, dim * 4);
@@ -1214,7 +1542,11 @@ fn cpu_require_fixture() -> (PathBuf, PathBuf) {
              (+ optional HIPFIRE_MTP_BYTE_IDENTITY_HEAD)"
         )
     });
-    assert!(model.is_file(), "trunk fixture missing: {}", model.display());
+    assert!(
+        model.is_file(),
+        "trunk fixture missing: {}",
+        model.display()
+    );
     assert!(head.is_file(), "mtp sidecar missing: {}", head.display());
     (model, head)
 }
@@ -1231,7 +1563,11 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
     );
 
     let mut gpu = Gpu::init().expect("Gpu::init");
-    assert_eq!(gpu.arch.as_str(), "gfx1201", "cpu oracle requires single-GPU gfx1201");
+    assert_eq!(
+        gpu.arch.as_str(),
+        "gfx1201",
+        "cpu oracle requires single-GPU gfx1201"
+    );
     let mut lines = Vec::new();
     let mut slot = load_offloaded_session(&mut gpu, &model, "cpu-oracle-ref", &mut lines);
     let head = mtp_head::load_mtp_head(&head_path, &mut gpu, CTX).expect("load head");
@@ -1241,14 +1577,27 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
     let eos = slot.config.eos_token;
     let vocab = slot.config.vocab_size;
     let mut state = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
-        &mut gpu, &slot, &head, MAX_N, VERIFY_CAP, MtpKvMode::Q8,
+        &mut gpu,
+        &slot,
+        &head,
+        MAX_N,
+        VERIFY_CAP,
+        MtpKvMode::Q8,
     )
     .expect("state");
     if let Some(cvs) = head.weights.compressed_vocab_size {
-        state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs).expect("head compressed logits");
-        state.ensure_compressed_lm_logits(&mut gpu, cvs).expect("batched compressed logits");
+        state
+            .mtp_scratch
+            .ensure_compressed_logits(&mut gpu, cvs)
+            .expect("head compressed logits");
+        state
+            .ensure_compressed_lm_logits(&mut gpu, cvs)
+            .expect("batched compressed logits");
     }
-    assert!(gpu.owns_host_cpu_weights(), "loader did not set the host CPU-weight gate");
+    assert!(
+        gpu.owns_host_cpu_weights(),
+        "loader did not set the host CPU-weight gate"
+    );
     lines.push(format!(
         "CPU-ORACLE role=ref exec=cpu cpu_exec={} moe_cpu_experts={} host_cpu_weights={}",
         u8::from(hipfire_dispatch::cpu_exec_enabled()),
@@ -1273,7 +1622,14 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
     for d in 1..=CPU_REF_DEPTH {
         let c0 = cpu_exec_counters();
         let r = spec_step_mtp_compressed_serial_with_k(
-            &mut gpu, &mut slot, &head, &mut state, n + d - 1, toks[d - 1], eos, 0,
+            &mut gpu,
+            &mut slot,
+            &head,
+            &mut state,
+            n + d - 1,
+            toks[d - 1],
+            eos,
+            0,
         )
         .expect("serial reference step");
         let c1 = cpu_exec_counters();
@@ -1289,7 +1645,10 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
                 );
                 m_per_forward = Some(steps);
             }
-            Some(m) => assert_eq!(steps, m, "reference step d={d}: {steps} CPU steps, expected {m}"),
+            Some(m) => assert_eq!(
+                steps, m,
+                "reference step d={d}: {steps} CPU steps, expected {m}"
+            ),
         }
         toks.push(r.committed[0]);
         if d <= CPU_REF_WINDOW {
@@ -1297,30 +1656,65 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
             // row: omit both here and pin them against the same-route batched
             // window in the judging process.
             cpu_snap(
-                &gpu, &slot, &state, &out_dir, &format!("REF-d{d}"), 0, n, n + d, &CPU_SAME_ROUTE_FAMS,
+                &gpu,
+                &slot,
+                &state,
+                &out_dir,
+                &format!("REF-d{d}"),
+                0,
+                n,
+                n + d,
+                &CPU_SAME_ROUTE_FAMS,
             );
-            lines.push(format!("SNAP kind=ref tag=REF-d{d} depth={d} rows=1 win={n}..{}", n + d));
+            lines.push(format!(
+                "SNAP kind=ref tag=REF-d{d} depth={d} rows=1 win={n}..{}",
+                n + d
+            ));
         }
     }
     let m = m_per_forward.expect("no reference step ran");
-    lines.push(format!("REF toks={} depths=1..{CPU_REF_WINDOW}", cpu_csv(&toks)));
+    lines.push(format!(
+        "REF toks={} depths=1..{CPU_REF_WINDOW}",
+        cpu_csv(&toks)
+    ));
 
     // Per-rejection-shape un-rolled-back models: the window's whole batch
     // consumed serially from a fresh prefill.
     for t in cpu_trials(&toks, vocab, eos) {
         let Some(bad) = &t.bad else { continue };
         let seed = prefill_and_seed(&mut gpu, &mut slot, &head, &mut state, &prompt);
-        assert_eq!(seed, toks[0], "{}: bad-model prefill seed diverged", t.label);
+        assert_eq!(
+            seed, toks[0],
+            "{}: bad-model prefill seed diverged",
+            t.label
+        );
         for (i, &tok) in bad.iter().enumerate() {
             let r = spec_step_mtp_compressed_serial_with_k(
-                &mut gpu, &mut slot, &head, &mut state, n + i, tok, eos, 0,
+                &mut gpu,
+                &mut slot,
+                &head,
+                &mut state,
+                n + i,
+                tok,
+                eos,
+                0,
             )
             .expect("bad-model step");
             assert!(!r.hit_eos, "{}: bad-model step hit EOS", t.label);
             assert_eq!(r.advance, 1);
         }
         let tag = format!("BAD-{}", t.label);
-        cpu_snap(&gpu, &slot, &state, &out_dir, &tag, 0, n, n + bad.len(), &CPU_SAME_ROUTE_FAMS);
+        cpu_snap(
+            &gpu,
+            &slot,
+            &state,
+            &out_dir,
+            &tag,
+            0,
+            n,
+            n + bad.len(),
+            &CPU_SAME_ROUTE_FAMS,
+        );
         lines.push(format!(
             "SNAP kind=bad tag={tag} label={} depth={} rows=1 win={n}..{}",
             t.label,
@@ -1336,8 +1730,7 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
     // splice trace.
     let final_counters = cpu_exec_counters();
     assert_eq!(
-        final_counters.1,
-        0,
+        final_counters.1, 0,
         "{} host-mapped GEMV steps stayed on the GPU",
         final_counters.1
     );
@@ -1351,7 +1744,8 @@ graph_captures={} graph_replays={} graph_mode={}",
         state.mtp_verify_graph_mode(),
     ));
     free_session(&mut gpu, slot, state, head);
-    std::fs::write(out_dir.join("digests.log"), lines.join("\n") + "\n").expect("write ref digests");
+    std::fs::write(out_dir.join("digests.log"), lines.join("\n") + "\n")
+        .expect("write ref digests");
     eprintln!("[cpu-oracle] role=ref DONE out={}", out_dir.display());
 }
 
@@ -1398,7 +1792,17 @@ impl CpuCtx<'_> {
     }
 
     fn snap(&self, tag: &str, row_sel: usize, win_start: usize, win_end: usize) -> usize {
-        cpu_snap(self.gpu, self.slot, self.state, &self.out_dir, tag, row_sel, win_start, win_end, &[])
+        cpu_snap(
+            self.gpu,
+            self.slot,
+            self.state,
+            &self.out_dir,
+            tag,
+            row_sel,
+            win_start,
+            win_end,
+            &[],
+        )
     }
 
     /// Fresh prefill + takeover window + native `k=1` continuation, with the
@@ -1406,20 +1810,36 @@ impl CpuCtx<'_> {
     /// and `{prefix}C-<label>`.
     fn trial(&mut self, t: &CpuTrial, prefix: &str) -> CpuTrialOutcome {
         let (seed, prefill_steps) = self.prefill();
-        assert_eq!(seed, self.toks[0], "{}: prefill seed diverged from the reference process", t.label);
+        assert_eq!(
+            seed, self.toks[0],
+            "{}: prefill seed diverged from the reference process",
+            t.label
+        );
         assert_eq!(
             prefill_steps, 0,
-            "{}: wide prompt prefill took {prefill_steps} CPU steps", t.label
+            "{}: wide prompt prefill took {prefill_steps} CPU steps",
+            t.label
         );
 
         let c0 = cpu_exec_counters();
         let r = spec_step_mtp_compressed_serial_with_takeover_candidates(
-            self.gpu, self.slot, self.head, self.state, self.n, self.toks[0], self.eos, &t.cands,
+            self.gpu,
+            self.slot,
+            self.head,
+            self.state,
+            self.n,
+            self.toks[0],
+            self.eos,
+            &t.cands,
         )
         .expect("takeover window");
         let c1 = cpu_exec_counters();
         let steps = c1.0 - c0.0;
-        assert!(steps > 0, "{}: takeover window took 0 CPU steps — the CPU splice did not run", t.label);
+        assert!(
+            steps > 0,
+            "{}: takeover window took 0 CPU steps — the CPU splice did not run",
+            t.label
+        );
         assert_eq!(
             steps % self.m_per_forward,
             0,
@@ -1428,9 +1848,17 @@ impl CpuCtx<'_> {
             self.m_per_forward
         );
         assert!(!r.hit_eos, "{}: hit EOS", t.label);
-        assert_eq!(r.accept_count, t.accept, "{}: accept_count drifted", t.label);
+        assert_eq!(
+            r.accept_count, t.accept,
+            "{}: accept_count drifted",
+            t.label
+        );
         assert_eq!(r.advance, t.advance, "{}: advance drifted", t.label);
-        assert_eq!(r.drafts_generated, t.k, "{}: drafts_generated drifted", t.label);
+        assert_eq!(
+            r.drafts_generated, t.k,
+            "{}: drafts_generated drifted",
+            t.label
+        );
         assert_eq!(
             r.committed.as_slice(),
             &self.toks[1..=t.advance],
@@ -1447,7 +1875,14 @@ impl CpuCtx<'_> {
         // candidate or bonus), which is exactly what a wrong rollback breaks.
         let cc0 = cpu_exec_counters();
         let c = spec_step_mtp_compressed_serial_with_k(
-            self.gpu, self.slot, self.head, self.state, end, *r.committed.last().unwrap(), self.eos, 1,
+            self.gpu,
+            self.slot,
+            self.head,
+            self.state,
+            end,
+            *r.committed.last().unwrap(),
+            self.eos,
+            1,
         )
         .expect("post-window continuation");
         let cc1 = cpu_exec_counters();
@@ -1459,10 +1894,20 @@ impl CpuCtx<'_> {
             self.m_per_forward
         );
         assert!(!c.hit_eos, "{}: continuation hit EOS", t.label);
-        assert_eq!(c.drafts_generated, 1, "{}: continuation must draft exactly one", t.label);
-        assert!((1..=2).contains(&c.advance), "{}: continuation advance {}", t.label, c.advance);
         assert_eq!(
-            c.committed[0], self.toks[t.advance + 1],
+            c.drafts_generated, 1,
+            "{}: continuation must draft exactly one",
+            t.label
+        );
+        assert!(
+            (1..=2).contains(&c.advance),
+            "{}: continuation advance {}",
+            t.label,
+            c.advance
+        );
+        assert_eq!(
+            c.committed[0],
+            self.toks[t.advance + 1],
             "{}: continuation token diverged from the reference AR token",
             t.label
         );
@@ -1485,14 +1930,25 @@ impl CpuCtx<'_> {
             vec![(self.toks[1] + 1) % self.vocab as u32]
         };
         let (tr_seed, tr_prefill_steps) = self.prefill();
-        assert_eq!(tr_seed, self.toks[0], "{}: truncated-reference prefill seed diverged", t.label);
+        assert_eq!(
+            tr_seed, self.toks[0],
+            "{}: truncated-reference prefill seed diverged",
+            t.label
+        );
         assert_eq!(
             tr_prefill_steps, 0,
             "{}: truncated-reference prefill took {tr_prefill_steps} CPU steps",
             t.label
         );
         let tr = spec_step_mtp_compressed_serial_with_takeover_candidates(
-            self.gpu, self.slot, self.head, self.state, self.n, self.toks[0], self.eos, &tr_cands,
+            self.gpu,
+            self.slot,
+            self.head,
+            self.state,
+            self.n,
+            self.toks[0],
+            self.eos,
+            &tr_cands,
         )
         .expect("truncated reference window");
         assert_eq!(
@@ -1530,7 +1986,11 @@ impl CpuCtx<'_> {
             1,
         )
         .expect("truncated-reference continuation");
-        assert!(!tc.hit_eos, "{}: truncated-reference continuation hit EOS", t.label);
+        assert!(
+            !tc.hit_eos,
+            "{}: truncated-reference continuation hit EOS",
+            t.label
+        );
         assert_eq!(
             tc.drafts_generated, 1,
             "{}: truncated-reference continuation must draft exactly one",
@@ -1547,7 +2007,12 @@ impl CpuCtx<'_> {
             t.label, tc.advance, c.advance
         );
         let tc_tag = format!("{prefix}TC-{}", t.label);
-        self.snap(&tc_tag, tc.advance - 1, self.n, self.n + tr.advance + tc.advance);
+        self.snap(
+            &tc_tag,
+            tc.advance - 1,
+            self.n,
+            self.n + tr.advance + tc.advance,
+        );
 
         CpuTrialOutcome {
             steps,
@@ -1582,7 +2047,11 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
     );
 
     let mut gpu = Gpu::init().expect("Gpu::init");
-    assert_eq!(gpu.arch.as_str(), "gfx1201", "cpu oracle requires single-GPU gfx1201");
+    assert_eq!(
+        gpu.arch.as_str(),
+        "gfx1201",
+        "cpu oracle requires single-GPU gfx1201"
+    );
     let mut lines = Vec::new();
     let mut slot = load_offloaded_session(&mut gpu, &model, "cpu-oracle-verify", &mut lines);
     let head = mtp_head::load_mtp_head(&head_path, &mut gpu, CTX).expect("load head");
@@ -1592,14 +2061,27 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
     let eos = slot.config.eos_token;
     let vocab = slot.config.vocab_size;
     let mut state = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
-        &mut gpu, &slot, &head, MAX_N, VERIFY_CAP, MtpKvMode::Q8,
+        &mut gpu,
+        &slot,
+        &head,
+        MAX_N,
+        VERIFY_CAP,
+        MtpKvMode::Q8,
     )
     .expect("state");
     if let Some(cvs) = head.weights.compressed_vocab_size {
-        state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs).expect("head compressed logits");
-        state.ensure_compressed_lm_logits(&mut gpu, cvs).expect("batched compressed logits");
+        state
+            .mtp_scratch
+            .ensure_compressed_logits(&mut gpu, cvs)
+            .expect("head compressed logits");
+        state
+            .ensure_compressed_lm_logits(&mut gpu, cvs)
+            .expect("batched compressed logits");
     }
-    assert!(gpu.owns_host_cpu_weights(), "loader did not set the host CPU-weight gate");
+    assert!(
+        gpu.owns_host_cpu_weights(),
+        "loader did not set the host CPU-weight gate"
+    );
     lines.push(format!(
         "CPU-ORACLE role=verify exec=cpu cpu_exec={} moe_cpu_experts={} host_cpu_weights={}",
         u8::from(hipfire_dispatch::cpu_exec_enabled()),
@@ -1607,7 +2089,12 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
         u8::from(gpu.owns_host_cpu_weights()),
     ));
     lines.push(format!("MODEL vocab={vocab} eos={eos} n={n} roles=verify"));
-    lines.push(format!("REFTOKS path={} len={} toks={}", toks_path.display(), toks.len(), cpu_csv(&toks)));
+    lines.push(format!(
+        "REFTOKS path={} len={} toks={}",
+        toks_path.display(),
+        toks.len(),
+        cpu_csv(&toks)
+    ));
 
     let trials = cpu_trials(&toks, vocab, eos);
     let mut ctx = CpuCtx {
@@ -1627,7 +2114,10 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
     // Calibration: the prefill route and the per-forward CPU splice count, both
     // measured against the reference tokens (an independent process's trail).
     let (seed, cal_prefill_steps) = ctx.prefill();
-    assert_eq!(seed, toks[0], "prefill seed diverged from the reference process");
+    assert_eq!(
+        seed, toks[0],
+        "prefill seed diverged from the reference process"
+    );
     let c0 = cpu_exec_counters();
     let cal = spec_step_mtp_compressed_serial_with_k(
         ctx.gpu, ctx.slot, ctx.head, ctx.state, n, toks[0], eos, 0,
@@ -1641,7 +2131,10 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
          (host placement / memory.offload_exec=cpu / HIPFIRE_MOE_CPU_EXPERTS)"
     );
     assert_eq!(cal.advance, 1, "calibration step must commit one token");
-    assert_eq!(cal.committed[0], toks[1], "calibration token diverged from the reference trail");
+    assert_eq!(
+        cal.committed[0], toks[1],
+        "calibration token diverged from the reference trail"
+    );
     ctx.m_per_forward = m;
     lines.push(format!(
         "CALIB prefill_steps={cal_prefill_steps} per_forward={m} leak={} caps={} reps={} seed={seed} next={}",
@@ -1708,14 +2201,18 @@ cont_advance={} cont_committed={} cont_ref={} steps={} forwards={} leak={} caps=
         let first = read_sidecar(&out_dir, "V-k3-partial", fam);
         let again = read_sidecar(&out_dir, "V2-k3-partial", fam);
         assert_eq!(
-            first, again,
+            first,
+            again,
             "reset/second request diverged in family {fam} ({} vs {} bytes)",
             first.len(),
             again.len()
         );
         let first_c = read_sidecar(&out_dir, "VC-k3-partial", fam);
         let again_c = read_sidecar(&out_dir, "V2C-k3-partial", fam);
-        assert_eq!(first_c, again_c, "reset/second continuation diverged in family {fam}");
+        assert_eq!(
+            first_c, again_c,
+            "reset/second continuation diverged in family {fam}"
+        );
     }
     lines.push("RESETCHECK tag=k3-partial fams=10 byte_identical=1".to_string());
 
@@ -1723,7 +2220,11 @@ cont_advance={} cont_committed={} cont_ref={} steps={} forwards={} leak={} caps=
     drop(ctx);
 
     let final_counters = cpu_exec_counters();
-    assert_eq!(final_counters.1, 0, "{} host-mapped steps leaked to the GPU", final_counters.1);
+    assert_eq!(
+        final_counters.1, 0,
+        "{} host-mapped steps leaked to the GPU",
+        final_counters.1
+    );
     assert_eq!(
         state.mtp_verify_graph_captures(),
         0,
@@ -1739,7 +2240,8 @@ cont_advance={} cont_committed={} cont_ref={} steps={} forwards={} leak={} caps=
         state.mtp_verify_graph_mode(),
     ));
     free_session(&mut gpu, slot, state, head);
-    std::fs::write(out_dir.join("digests.log"), lines.join("\n") + "\n").expect("write verify digests");
+    std::fs::write(out_dir.join("digests.log"), lines.join("\n") + "\n")
+        .expect("write verify digests");
     eprintln!("[cpu-oracle] role=verify DONE out={}", out_dir.display());
 }
 
@@ -1790,7 +2292,10 @@ fn dn_state_lanes(codes: &[u8], scales: &[u8]) -> Vec<f32> {
         scales.len()
     );
     let per_row = codes.len() / scales.len();
-    assert_eq!(per_row, 128, "DN Q8 layout drift: {per_row} codes/scale (expected a 128-wide row)");
+    assert_eq!(
+        per_row, 128,
+        "DN Q8 layout drift: {per_row} codes/scale (expected a 128-wide row)"
+    );
     let mut out = Vec::with_capacity(codes.len());
     for (row, &s) in codes.chunks_exact(per_row).zip(scales.iter()) {
         for &c in row {
@@ -1818,7 +2323,13 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 /// denominator floored at 1e-4 so a zero-signal family is judged on an absolute
 /// floor instead of dividing by ~0.
 fn lane_delta(a: &[f32], b: &[f32], scale: f32) -> FamDelta {
-    assert_eq!(a.len(), b.len(), "family lane count diverged: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "family lane count diverged: {} vs {}",
+        a.len(),
+        b.len()
+    );
     assert!(!a.is_empty(), "empty family");
     let mut max_abs = 0f32;
     let mut n_diff = 0usize;
@@ -1830,7 +2341,13 @@ fn lane_delta(a: &[f32], b: &[f32], scale: f32) -> FamDelta {
         max_abs = max_abs.max(d);
     }
     let scale = scale.max(1e-4);
-    FamDelta { max_abs, scale, rel: max_abs / scale, n_diff, n: a.len() }
+    FamDelta {
+        max_abs,
+        scale,
+        rel: max_abs / scale,
+        n_diff,
+        n: a.len(),
+    }
 }
 
 /// Delta on a pair's own magnitude (the plain-family convention).
@@ -1870,7 +2387,12 @@ fn dn_coupled_delta(
 fn cpu_log_fam(line_tag: &str, fam: &str, d: &FamDelta, ok: bool) -> String {
     format!(
         "STATE tag={line_tag} fam={fam} rel={:.3e} max_abs={:.3e} scale={:.3e} diff={}/{} ok={}",
-        d.rel, d.max_abs, d.scale, d.n_diff, d.n, u8::from(ok)
+        d.rel,
+        d.max_abs,
+        d.scale,
+        d.n_diff,
+        d.n,
+        u8::from(ok)
     )
 }
 
@@ -1957,7 +2479,10 @@ impl Drop for JudgeLog {
                 .to_string()
         });
         if let Err(e) = std::fs::write(&self.path, self.lines.join("\n") + "\n") {
-            eprintln!("[cpu-oracle-cmp] could not write {}: {e}", self.path.display());
+            eprintln!(
+                "[cpu-oracle-cmp] could not write {}: {e}",
+                self.path.display()
+            );
         }
     }
 }
@@ -1986,7 +2511,11 @@ fn cpu_judge_trial(
     assert_eq!(trial.k, k, "{label}: K drifted");
     assert_eq!(trial.accept, accept, "{label}: accept drifted");
     assert_eq!(trial.advance, advance, "{label}: advance drifted");
-    assert_eq!(trial.advance, trial.committed.len(), "{label}: committed length != advance");
+    assert_eq!(
+        trial.advance,
+        trial.committed.len(),
+        "{label}: committed length != advance"
+    );
     assert_eq!(trial.cands.len(), k, "{label}: candidate count != K");
     assert!(
         trial.advance + trial.cont_advance <= CPU_REF_WINDOW,
@@ -1997,11 +2526,22 @@ fn cpu_judge_trial(
     // to accept, and provably different where it claims to reject — so the
     // expectation cannot have been derived from the tested output.
     for (i, &c) in trial.cands.iter().enumerate() {
-        assert!((c as usize) < vocab, "{label}: candidate {c} outside the vocabulary");
+        assert!(
+            (c as usize) < vocab,
+            "{label}: candidate {c} outside the vocabulary"
+        );
         if i < accept {
-            assert_eq!(c, toks[i + 1], "{label}: accepted candidate {i} is not the reference token");
+            assert_eq!(
+                c,
+                toks[i + 1],
+                "{label}: accepted candidate {i} is not the reference token"
+            );
         } else {
-            assert_ne!(c, toks[i + 1], "{label}: rejected candidate {i} equals the reference token");
+            assert_ne!(
+                c,
+                toks[i + 1],
+                "{label}: rejected candidate {i} equals the reference token"
+            );
         }
     }
     // CPU evidence: the splice must have run for this *multi-row* narrow window,
@@ -2012,15 +2552,25 @@ fn cpu_judge_trial(
         "{label}: verify width {} outside the 2..4-row splice envelope",
         trial.n_verify
     );
-    assert!(trial.steps > 0, "{label}: no CPU splice steps recorded for the window");
+    assert!(
+        trial.steps > 0,
+        "{label}: no CPU splice steps recorded for the window"
+    );
     assert_eq!(
         trial.steps % m_per_forward,
         0,
         "{label}: {} CPU steps is not a multiple of {m_per_forward}/forward",
         trial.steps
     );
-    assert_eq!(trial.forwards, trial.steps / m_per_forward, "{label}: forward count drifted");
-    assert!(trial.forwards >= 1, "{label}: no CPU-spliced forward in the window");
+    assert_eq!(
+        trial.forwards,
+        trial.steps / m_per_forward,
+        "{label}: forward count drifted"
+    );
+    assert!(
+        trial.forwards >= 1,
+        "{label}: no CPU-spliced forward in the window"
+    );
     log.push(format!(
         "CPUROWS tag={label} n_verify={} steps={} forwards={} per_forward={m_per_forward} leak={} caps={} reps={}",
         trial.n_verify, trial.steps, trial.forwards, trial.leak, trial.caps, trial.reps
@@ -2035,11 +2585,29 @@ fn cpu_judge_trial(
         &toks[1..=advance],
         "{label}: worker's reference-committed field diverged"
     );
-    assert_eq!(trial.cont_first, toks[advance + 1], "{label}: continuation token diverged");
-    assert_eq!(trial.cont_ref, toks[advance + 1], "{label}: continuation expectation diverged");
-    assert_eq!(trial.leak, 0, "{label}: {} host-mapped steps leaked to the GPU", trial.leak);
-    assert_eq!(trial.caps, 0, "{label}: graph captured during a CPU-spliced window");
-    assert_eq!(trial.reps, 0, "{label}: graph replayed during a CPU-spliced window");
+    assert_eq!(
+        trial.cont_first,
+        toks[advance + 1],
+        "{label}: continuation token diverged"
+    );
+    assert_eq!(
+        trial.cont_ref,
+        toks[advance + 1],
+        "{label}: continuation expectation diverged"
+    );
+    assert_eq!(
+        trial.leak, 0,
+        "{label}: {} host-mapped steps leaked to the GPU",
+        trial.leak
+    );
+    assert_eq!(
+        trial.caps, 0,
+        "{label}: graph captured during a CPU-spliced window"
+    );
+    assert_eq!(
+        trial.reps, 0,
+        "{label}: graph replayed during a CPU-spliced window"
+    );
 
     let good_tag = format!("REF-d{advance}");
     let got_tag = format!("{snap_prefix}-{label}");
@@ -2243,8 +2811,16 @@ fn run_cpu_orchestrator() {
         eprintln!("skipping cpu oracle: HIPFIRE_MTP_BYTE_IDENTITY_MODEL not set");
         return;
     };
-    assert!(model.is_file(), "explicitly requested fixture missing: {}", model.display());
-    assert!(head.is_file(), "explicitly requested MTP sidecar missing: {}", head.display());
+    assert!(
+        model.is_file(),
+        "explicitly requested fixture missing: {}",
+        model.display()
+    );
+    assert!(
+        head.is_file(),
+        "explicitly requested MTP sidecar missing: {}",
+        head.display()
+    );
     let exe = std::env::current_exe().expect("current_exe");
     let root = std::env::var(OUT_ROOT_ENV).map(PathBuf::from).ok();
 
@@ -2264,8 +2840,11 @@ fn run_cpu_orchestrator() {
     let verify_dir = unique_out_dir(root, "cpu-verify");
     let toks_file = verify_dir.join("ref_toks.txt");
     std::fs::create_dir_all(&verify_dir).expect("create verify dir");
-    std::fs::write(&toks_file, toks.iter().map(|t| format!("{t}\n")).collect::<String>())
-        .expect("write reference tokens");
+    std::fs::write(
+        &toks_file,
+        toks.iter().map(|t| format!("{t}\n")).collect::<String>(),
+    )
+    .expect("write reference tokens");
     let ver_log = cpu_spawn_worker(&exe, "verify", &verify_dir, &model, &head, Some(&toks_file));
 
     // Evidence for the whole judging pass; written even if an assertion fires.
@@ -2278,38 +2857,73 @@ fn run_cpu_orchestrator() {
             .unwrap_or_else(|| panic!("{role}: no CPU-ORACLE line"));
         assert_eq!(win_field(oracle, "exec"), "cpu", "{role}: {oracle}");
         assert_eq!(win_field(oracle, "cpu_exec"), "1", "{role}: {oracle}");
-        assert_eq!(win_field(oracle, "moe_cpu_experts"), "1", "{role}: {oracle}");
-        assert_eq!(win_field(oracle, "host_cpu_weights"), "1", "{role}: {oracle}");
-        let host = log.lines().find(|l| l.starts_with("HOST ")).unwrap_or_else(|| panic!("{role}: no HOST line"));
+        assert_eq!(
+            win_field(oracle, "moe_cpu_experts"),
+            "1",
+            "{role}: {oracle}"
+        );
+        assert_eq!(
+            win_field(oracle, "host_cpu_weights"),
+            "1",
+            "{role}: {oracle}"
+        );
+        let host = log
+            .lines()
+            .find(|l| l.starts_with("HOST "))
+            .unwrap_or_else(|| panic!("{role}: no HOST line"));
         assert!(host.contains("host_expert_layers=16"), "{role}: {host}");
         assert!(host.contains("host_cpu_weights=1"), "{role}: {host}");
         assert!(
-            log.lines().any(|l| l.starts_with("PLACEMENT explicit-fixed-first16")),
+            log.lines()
+                .any(|l| l.starts_with("PLACEMENT explicit-fixed-first16")),
             "{role}: explicit fixed placement line missing"
         );
         let calib = log
             .lines()
             .find(|l| l.starts_with("CALIB ") || l.starts_with("COUNTERS role=ref"))
             .unwrap_or_else(|| panic!("{role}: no CALIB/COUNTERS line"));
-        let m: usize = win_field(calib, "per_forward").parse().expect("per_forward");
-        assert!(m > 0, "{role}: per-forward CPU splice count is 0 — the CPU expert path never ran");
-        let prefill_steps: usize = win_field(calib, "prefill_steps").parse().expect("prefill_steps");
+        let m: usize = win_field(calib, "per_forward")
+            .parse()
+            .expect("per_forward");
+        assert!(
+            m > 0,
+            "{role}: per-forward CPU splice count is 0 — the CPU expert path never ran"
+        );
+        let prefill_steps: usize = win_field(calib, "prefill_steps")
+            .parse()
+            .expect("prefill_steps");
         assert_eq!(
             prefill_steps, 0,
             "{role}: wide prompt prefill took {prefill_steps} CPU steps (must stay on the GPU route)"
         );
         match per_forward {
             None => per_forward = Some(m),
-            Some(m0) => assert_eq!(m, m0, "the two processes armed different host MoE layer sets"),
+            Some(m0) => assert_eq!(
+                m, m0,
+                "the two processes armed different host MoE layer sets"
+            ),
         }
         let counters = log
             .lines()
             .find(|l| l.starts_with(&format!("COUNTERS role={role} ")))
             .unwrap_or_else(|| panic!("{role}: no final COUNTERS line"));
         assert_eq!(win_field(counters, "leak"), "0", "{role}: {counters}");
-        assert_eq!(win_field(counters, "graph_captures"), "0", "{role}: capture ran under CPU offload");
-        assert_eq!(win_field(counters, "graph_replays"), "0", "{role}: replay ran under CPU offload");
-        assert!(win_field(counters, "on_cpu").parse::<usize>().expect("on_cpu") > 0);
+        assert_eq!(
+            win_field(counters, "graph_captures"),
+            "0",
+            "{role}: capture ran under CPU offload"
+        );
+        assert_eq!(
+            win_field(counters, "graph_replays"),
+            "0",
+            "{role}: replay ran under CPU offload"
+        );
+        assert!(
+            win_field(counters, "on_cpu")
+                .parse::<usize>()
+                .expect("on_cpu")
+                > 0
+        );
         judge.push(format!("ROLE {role} ok=1 per_forward={m} prefill_steps=0"));
     }
     let m = per_forward.expect("no worker reported a per-forward CPU splice count");
@@ -2333,7 +2947,10 @@ fn run_cpu_orchestrator() {
         );
     }
     let vocab = win_field(
-        ver_log.lines().find(|l| l.starts_with("MODEL ")).expect("verify MODEL line"),
+        ver_log
+            .lines()
+            .find(|l| l.starts_with("MODEL "))
+            .expect("verify MODEL line"),
         "vocab",
     )
     .parse()
@@ -2348,7 +2965,16 @@ fn run_cpu_orchestrator() {
         .find(|l| l.starts_with("RESET "))
         .expect("verify worker recorded no reset/second-request trial");
     let reset = cpu_parse_trial(reset_line);
-    cpu_judge_trial(&ref_dir, &verify_dir, &mut judge, &reset, "V2", &toks, m, vocab);
+    cpu_judge_trial(
+        &ref_dir,
+        &verify_dir,
+        &mut judge,
+        &reset,
+        "V2",
+        &toks,
+        m,
+        vocab,
+    );
     assert!(
         ver_log
             .lines()
@@ -2397,9 +3023,11 @@ fn mtp_cpu_offload_rollback_oracle() {
         arm == "ref" || arm == "verify",
         "{CPU_ARM_ENV} must be `ref` or `verify`, got {arm:?}"
     );
-    let out = std::env::var(CPU_OUT_ENV).map(PathBuf::from).unwrap_or_else(|_| {
-        unique_out_dir(std::env::var(OUT_ROOT_ENV).map(PathBuf::from).ok(), &arm)
-    });
+    let out = std::env::var(CPU_OUT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            unique_out_dir(std::env::var(OUT_ROOT_ENV).map(PathBuf::from).ok(), &arm)
+        });
     if arm == "ref" {
         run_cpu_ref_worker(out);
     } else {

@@ -32,8 +32,8 @@ use crate::reap_overlay;
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use hipfire_quantize::vision_sidecar::{
-    VisionDtype, is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix,
-    resolve_vision_prefix, vision_dtype,
+    eg2_sidecar_dtype, is_eg2_sidecar_tensor, is_vision_group_tensor, is_vision_tower_tensor,
+    passes_include_prefix, resolve_vision_prefix, vision_dtype, VisionDtype,
 };
 use hipfire_runtime::hfq::{HfqFile as RuntimeHfqFile, HfqTensorInfo};
 
@@ -124,12 +124,116 @@ struct MainQuantState<'a> {
     spill: &'a mut Option<TensorSpill>,
 }
 
-
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ2V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
+/// `--moe-expert-down mq4g128v2-symmetric`: routed-expert down_proj goes to
+/// symmetric qt53 (MQ4G128V2) instead of the recipe's qt44.
+static MOE_EXPERT_DOWN_MQ4G128V2_SYM: OnceLock<bool> = OnceLock::new();
 
+fn moe_expert_down_mq4g128v2_symmetric() -> bool {
+    MOE_EXPERT_DOWN_MQ4G128V2_SYM
+        .get()
+        .copied()
+        .unwrap_or(false)
+}
 
+/// Un-stacked routed-expert down_proj: 2-D `...mlp.experts.{N}.down_proj.weight`
+/// (also `mtp.layers.*.mlp.experts.{N}.down_proj.weight`). Selected by role and
+/// shape only. `shared_expert`, dense `mlp.down_proj`, gate_up and every other
+/// tensor are not routed-expert down_proj. Stacked 3-D `experts.down_proj` is
+/// decided in `handle_moe_expert_3d` by its `base_name`.
+fn is_routed_expert_down_2d(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 {
+        return false;
+    }
+    let Some(stem) = name.strip_suffix(".down_proj.weight") else {
+        return false;
+    };
+    let Some((_, expert)) = stem.rsplit_once(".mlp.experts.") else {
+        return false;
+    };
+    !expert.is_empty() && expert.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Encode one routed-expert down_proj `[m, k]` as symmetric MQ4G128V2 (qt53).
+/// FWHT128 signs are `gen_fwht_signs(43, 128)` / `gen_fwht_signs(1043, 128)`.
+/// An encoder error is fatal: there is no fallback to qt44.
+fn encode_routed_expert_down_qt53(name: &str, weights: &[f32], m: usize, k: usize) -> Vec<u8> {
+    let signs1 = gen_fwht_signs(43, 128);
+    let signs2 = gen_fwht_signs(1043, 128);
+    quantize_mq4g128v2_symmetric(weights, m, k, &signs1, &signs2).unwrap_or_else(|error| {
+        eprintln!("error: symmetric qt53 encode of {name} [{m}x{k}] failed: {error}");
+        std::process::exit(1);
+    })
+}
+
+/// Refuse every combination `--moe-expert-down mq4g128v2-symmetric` does not
+/// implement. `env` reads developer env levers (`Some(value)` when set).
+fn check_moe_expert_down(
+    args: &QuantizeArgs,
+    route: crate::cli::Route,
+    use_mq4v2: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    if args.moe_expert_down.is_none() {
+        return Ok(());
+    }
+    const FLAG: &str = "--moe-expert-down mq4g128v2-symmetric";
+    if route != crate::cli::Route::Main {
+        return Err(format!(
+            "{FLAG} only applies to the safetensors quantize path"
+        ));
+    }
+    if !use_mq4v2 {
+        return Err(format!("{FLAG} requires --format mq4"));
+    }
+    if !args.uniform {
+        return Err(format!("{FLAG} requires --uniform (no K-map promotion)"));
+    }
+    if !args.mq4v2_symmetric {
+        return Err(format!("{FLAG} requires --mq4v2-symmetric"));
+    }
+    if args.reap_overlay.is_some() || args.reap_bake.is_some() {
+        return Err(format!(
+            "{FLAG} cannot be combined with --reap-overlay/--reap-bake (REAP re-quant has only asymmetric encoders)"
+        ));
+    }
+    if args.awq
+        || args.awq_alpha.is_some()
+        || args.awq_a4_aware
+        || args.awq_a4_route_c2
+        || args.awq_a4_signed_capture.is_some()
+    {
+        return Err(format!("{FLAG} cannot be combined with AWQ"));
+    }
+    if args.imatrix.is_some() {
+        return Err(format!("{FLAG} cannot be combined with --imatrix"));
+    }
+    if args.hessian_dir.is_some() {
+        return Err(format!(
+            "{FLAG} cannot be combined with --hessian-dir (GPTQ/Hessian)"
+        ));
+    }
+    if env("HIPFIRE_MOE_TIER_MAP").is_some() {
+        return Err(format!(
+            "{FLAG} cannot be combined with HIPFIRE_MOE_TIER_MAP"
+        ));
+    }
+    for var in [
+        "HIPFIRE_MOE_GRADED",
+        "HIPFIRE_ROUTED_GL",
+        "HIPFIRE_MOE_DOWN_MQ6",
+        "HIPFIRE_MOE_EXPERTS_MQ6",
+        "HIPFIRE_MOE_DOWN_MQ5",
+        "HIPFIRE_MOE_EXPERTS_MQ5",
+    ] {
+        if env(var).as_deref() == Some("1") {
+            return Err(format!("{FLAG} cannot be combined with {var}=1"));
+        }
+    }
+    Ok(())
+}
 fn quantize_mq4g256v2_selected(
     weights: &[f32],
     m: usize,
@@ -325,10 +429,10 @@ fn export_mq4v2_final_codes(
                 record.name
             )
         })?;
-        let m = u32::try_from(record.m)
-            .map_err(|_| format!("{}: M does not fit u32", record.name))?;
-        let k = u32::try_from(record.k)
-            .map_err(|_| format!("{}: K does not fit u32", record.name))?;
+        let m =
+            u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
+        let k =
+            u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
         let expected_bytes = record
             .m
             .checked_mul(record.k)
@@ -451,13 +555,9 @@ fn export_mq4v2_final_codes(
             .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
         for mapped in &records {
             let record = mapped.as_record();
-            let packed = pack_mq4g256v2_from_f16_grid(
-                record.m,
-                record.k,
-                record.d_z_f16,
-                record.codes_u8,
-            )
-            .map_err(|error| format!("{}: {error}", record.name))?;
+            let packed =
+                pack_mq4g256v2_from_f16_grid(record.m, record.k, record.d_z_f16, record.codes_u8)
+                    .map_err(|error| format!("{}: {error}", record.name))?;
             let tensor = by_name[record.name];
             if packed.len() != tensor.data_size {
                 return Err(format!(
@@ -520,72 +620,123 @@ fn export_mqn_final_codes(
         _ => return Err(format!("unsupported final-code qt={qt}")),
     };
     if !input.is_file() {
-        return Err(format!("--input must be an HFQ file, got {}", input.display()));
+        return Err(format!(
+            "--input must be an HFQ file, got {}",
+            input.display()
+        ));
     }
     let canonical = std::fs::canonicalize(input)
         .map_err(|error| format!("canonicalize input {}: {error}", input.display()))?;
-    if output.exists()
-        && std::fs::canonicalize(output).is_ok_and(|path| path == canonical)
-    {
+    if output.exists() && std::fs::canonicalize(output).is_ok_and(|path| path == canonical) {
         return Err("--output must differ from the source HFQ".to_string());
     }
     if output.exists() {
-        return Err(format!("refusing to overwrite existing output {}", output.display()));
+        return Err(format!(
+            "refusing to overwrite existing output {}",
+            output.display()
+        ));
     }
     eprintln!("{label} final-code import: hashing {}", input.display());
     let source_sha = sha256_file_hex(input)?;
     let source = RuntimeHfqFile::open_with_reap_plan(input, None)
         .map_err(|error| format!("open source HFQ {}: {error}", input.display()))?;
-    let by_name: HashMap<&str, &HfqTensorInfo> = source.tensors()
-        .iter().map(|tensor| (tensor.name.as_str(), tensor)).collect();
+    let by_name: HashMap<&str, &HfqTensorInfo> = source
+        .tensors()
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
     let records = load_mqn_final_code_records(records_path, &source_sha, qt)?;
     for mapped in &records {
         let record = mapped.as_record();
-        let tensor = by_name.get(record.name)
-            .ok_or_else(|| format!("{}: tensor `{}` is absent from source HFQ", mapped.path.display(), record.name))?;
-        let m = u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
-        let k = u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
-        let groups = record.m.checked_mul(record.k).ok_or_else(|| format!("{}: shape overflows", record.name))? / 256;
-        let expected_bytes = groups.checked_mul(group_bytes).ok_or_else(|| format!("{}: packed size overflows", record.name))?;
-        if tensor.quant_type != qt || tensor.group_size != 256
-            || tensor.shape != [m, k] || tensor.data_size != expected_bytes
+        let tensor = by_name.get(record.name).ok_or_else(|| {
+            format!(
+                "{}: tensor `{}` is absent from source HFQ",
+                mapped.path.display(),
+                record.name
+            )
+        })?;
+        let m =
+            u32::try_from(record.m).map_err(|_| format!("{}: M does not fit u32", record.name))?;
+        let k =
+            u32::try_from(record.k).map_err(|_| format!("{}: K does not fit u32", record.name))?;
+        let groups = record
+            .m
+            .checked_mul(record.k)
+            .ok_or_else(|| format!("{}: shape overflows", record.name))?
+            / 256;
+        let expected_bytes = groups
+            .checked_mul(group_bytes)
+            .ok_or_else(|| format!("{}: packed size overflows", record.name))?;
+        if tensor.quant_type != qt
+            || tensor.group_size != 256
+            || tensor.shape != [m, k]
+            || tensor.data_size != expected_bytes
         {
             return Err(format!(
                 "{}: source type-map entry for `{}` is qt={} shape={:?} group_size={} bytes={}, expected qt={qt} shape=[{m},{k}] group_size=256 bytes={expected_bytes}",
                 mapped.path.display(), record.name, tensor.quant_type, tensor.shape, tensor.group_size, tensor.data_size
             ));
         }
-        let (_, source_bytes) = source.tensor_data(record.name)
+        let (_, source_bytes) = source
+            .tensor_data(record.name)
             .ok_or_else(|| format!("{}: missing source tensor data", record.name))?;
         for (group, bytes) in source_bytes.chunks_exact(group_bytes).enumerate() {
             if bytes[..8] != record.d_z_f16[group * 8..group * 8 + 8] {
-                return Err(format!("{}: frozen d_z_f16 differs from source at group {group}", record.name));
+                return Err(format!(
+                    "{}: frozen d_z_f16 differs from source at group {group}",
+                    record.name
+                ));
             }
         }
         let sidecar = awq_sidecar_name(record.name);
         if let Some((info, data)) = source.tensor_data(&sidecar) {
-            if info.quant_type != QuantType::F16 as u8 || info.shape != [k] || data != record.s_f16 {
-                return Err(format!("{}: frozen S_f16 differs from source AWQ sidecar `{sidecar}`", record.name));
+            if info.quant_type != QuantType::F16 as u8 || info.shape != [k] || data != record.s_f16
+            {
+                return Err(format!(
+                    "{}: frozen S_f16 differs from source AWQ sidecar `{sidecar}`",
+                    record.name
+                ));
             }
         }
-        if let Some((index, code)) = record.codes_u8.iter().enumerate().find(|(_, code)| **code > max_code) {
-            return Err(format!("{}: code {code} at index {index} exceeds {label} range", record.name));
+        if let Some((index, code)) = record
+            .codes_u8
+            .iter()
+            .enumerate()
+            .find(|(_, code)| **code > max_code)
+        {
+            return Err(format!(
+                "{}: code {code} at index {index} exceeds {label} range",
+                record.name
+            ));
         }
     }
 
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     if !parent.is_dir() {
-        return Err(format!("output parent directory does not exist: {}", parent.display()));
+        return Err(format!(
+            "output parent directory does not exist: {}",
+            parent.display()
+        ));
     }
-    let name = output.file_name().and_then(|name| name.to_str())
+    let name = output
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or_else(|| format!("invalid output path {}", output.display()))?;
-    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("system clock before Unix epoch: {error}"))?.as_nanos();
-    let temporary = parent.join(format!(".{name}.mqn-final-{}-{nonce}.tmp", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock before Unix epoch: {error}"))?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{name}.mqn-final-{}-{nonce}.tmp",
+        std::process::id()
+    ));
     let result = (|| -> Result<(), String> {
         std::fs::copy(input, &temporary)
             .map_err(|error| format!("copy source HFQ to {}: {error}", temporary.display()))?;
-        let file = OpenOptions::new().read(true).write(true).open(&temporary)
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)
             .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
         let mut mapped = unsafe { memmap2::MmapMut::map_mut(&file) }
             .map_err(|error| format!("map temporary HFQ {}: {error}", temporary.display()))?;
@@ -597,8 +748,10 @@ fn export_mqn_final_codes(
                 let codes = &record.codes_u8[group * 256..(group + 1) * 256];
                 if qt == 50 {
                     for (i, dst) in block[8..].iter_mut().enumerate() {
-                        *dst = codes[i * 4] | codes[i * 4 + 1] << 2
-                            | codes[i * 4 + 2] << 4 | codes[i * 4 + 3] << 6;
+                        *dst = codes[i * 4]
+                            | codes[i * 4 + 1] << 2
+                            | codes[i * 4 + 2] << 4
+                            | codes[i * 4 + 3] << 6;
                     }
                 } else {
                     // Encoder quantize_mq3g256v2: eight three-bit codes
@@ -612,9 +765,12 @@ fn export_mqn_final_codes(
                 }
             }
         }
-        mapped.flush().map_err(|error| format!("flush temporary HFQ: {error}"))?;
+        mapped
+            .flush()
+            .map_err(|error| format!("flush temporary HFQ: {error}"))?;
         drop(mapped);
-        file.sync_all().map_err(|error| format!("sync temporary HFQ: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync temporary HFQ: {error}"))?;
         let rewritten = RuntimeHfqFile::open_with_reap_plan(&temporary, None)
             .map_err(|error| format!("reopen temporary HFQ: {error}"))?;
         if !same_hfq_manifest(&source, &rewritten) {
@@ -626,8 +782,13 @@ fn export_mqn_final_codes(
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
-    std::fs::rename(&temporary, output)
-        .map_err(|error| format!("rename completed HFQ {} to {}: {error}", temporary.display(), output.display()))?;
+    std::fs::rename(&temporary, output).map_err(|error| {
+        format!(
+            "rename completed HFQ {} to {}: {error}",
+            temporary.display(),
+            output.display()
+        )
+    })?;
     Ok((records.len(), source_sha))
 }
 
@@ -643,27 +804,65 @@ mod mqn_final_code_tests {
         let output = dir.path().join("result.hfq");
         let record_path = dir.path().join("codes.safetensors");
         let (m, k) = (2usize, 512usize);
-        let weights: Vec<f32> = (0..m * k).map(|i| ((i * 37) as f32 * 0.017).sin()).collect();
+        let weights: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 37) as f32 * 0.017).sin())
+            .collect();
         let signs1 = gen_fwht_signs(42, 256);
         let signs2 = gen_fwht_signs(1042, 256);
         let (encoded, quant, stride) = if qt == 49 {
-            (quantize_mq3g256v2(&weights, m, k, &signs1, &signs2), QuantType::MQ3G256V2, 104)
+            (
+                quantize_mq3g256v2(&weights, m, k, &signs1, &signs2),
+                QuantType::MQ3G256V2,
+                104,
+            )
         } else {
-            (quantize_mq2g256v2(&weights, m, k, &signs1, &signs2), QuantType::MQ2G256V2, 72)
+            (
+                quantize_mq2g256v2(&weights, m, k, &signs1, &signs2),
+                QuantType::MQ2G256V2,
+                72,
+            )
         };
         let tensor_name = "model.layers.0.linear_attn.in_proj_a.weight";
         let sidecar_name = awq_sidecar_name(tensor_name);
         let s: Vec<u8> = (0..k).flat_map(|_| f32_to_f16(1.0).to_le_bytes()).collect();
-        write_hfq(&input, 1, "{}", &[
-            HfqTensor { name: tensor_name.into(), quant_type: quant, shape: vec![m as u32,k as u32],
-                        group_size: 256, data: encoded.clone(), spilled_len: 0 },
-            HfqTensor { name: sidecar_name, quant_type: QuantType::F16, shape: vec![k as u32],
-                        group_size: 0, data: s.clone(), spilled_len: 0 },
-            HfqTensor { name: "untouched.weight".into(), quant_type: QuantType::F16,
-                        shape: vec![4], group_size: 0, data: vec![7; 8], spilled_len: 0 },
-        ], None).unwrap();
+        write_hfq(
+            &input,
+            1,
+            "{}",
+            &[
+                HfqTensor {
+                    name: tensor_name.into(),
+                    quant_type: quant,
+                    shape: vec![m as u32, k as u32],
+                    group_size: 256,
+                    data: encoded.clone(),
+                    spilled_len: 0,
+                },
+                HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F16,
+                    shape: vec![k as u32],
+                    group_size: 0,
+                    data: s.clone(),
+                    spilled_len: 0,
+                },
+                HfqTensor {
+                    name: "untouched.weight".into(),
+                    quant_type: QuantType::F16,
+                    shape: vec![4],
+                    group_size: 0,
+                    data: vec![7; 8],
+                    spilled_len: 0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
         let sha = sha256_file_hex(&input).unwrap();
-        let grid: Vec<u8> = encoded.chunks_exact(stride).flat_map(|group| group[..8].to_vec()).collect();
+        let grid: Vec<u8> = encoded
+            .chunks_exact(stride)
+            .flat_map(|group| group[..8].to_vec())
+            .collect();
         let mut codes = vec![0u8; m * k];
         for (group, block) in encoded.chunks_exact(stride).enumerate() {
             if qt == 50 {
@@ -674,7 +873,8 @@ mod mqn_final_code_tests {
                 }
             } else {
                 for (i, chunk) in block[8..].chunks_exact(3).enumerate() {
-                    let word = u32::from(chunk[0]) | u32::from(chunk[1]) << 8 | u32::from(chunk[2]) << 16;
+                    let word =
+                        u32::from(chunk[0]) | u32::from(chunk[1]) << 8 | u32::from(chunk[2]) << 16;
                     for j in 0..8 {
                         codes[group * 256 + i * 8 + j] = (word >> (j * 3) & 7) as u8;
                     }
@@ -686,12 +886,20 @@ mod mqn_final_code_tests {
         }
         let tensors = [
             ("S_f16", TensorView::new(Dtype::F16, vec![k], &s).unwrap()),
-            ("d_z_f16", TensorView::new(Dtype::F16, vec![m, k / 256, 2, 2], &grid).unwrap()),
-            ("codes_u8", TensorView::new(Dtype::U8, vec![m, k], &codes).unwrap()),
+            (
+                "d_z_f16",
+                TensorView::new(Dtype::F16, vec![m, k / 256, 2, 2], &grid).unwrap(),
+            ),
+            (
+                "codes_u8",
+                TensorView::new(Dtype::U8, vec![m, k], &codes).unwrap(),
+            ),
         ];
         let metadata = HashMap::from([
-            ("name".into(), tensor_name.into()), ("M".into(), m.to_string()),
-            ("K".into(), k.to_string()), ("qt".into(), qt.to_string()),
+            ("name".into(), tensor_name.into()),
+            ("M".into(), m.to_string()),
+            ("K".into(), k.to_string()),
+            ("qt".into(), qt.to_string()),
             ("source_sha".into(), sha.clone()),
         ]);
         serialize_to_file(tensors, Some(metadata), &record_path).unwrap();
@@ -701,20 +909,40 @@ mod mqn_final_code_tests {
             let mapped = load_mqn_final_code_record(&record_path, &sha, qt).unwrap();
             let record = mapped.as_record();
             assert!(validate_mqn_final_code_record(
-                &Mq4v2FinalCodeRecord { qt: if qt == 49 { 50 } else { 49 }, ..record }, &sha, qt
-            ).is_err());
+                &Mq4v2FinalCodeRecord {
+                    qt: if qt == 49 { 50 } else { 49 },
+                    ..record
+                },
+                &sha,
+                qt
+            )
+            .is_err());
             assert!(validate_mqn_final_code_record(
-                &Mq4v2FinalCodeRecord { m: m + 1, ..record }, &sha, qt
-            ).is_err());
+                &Mq4v2FinalCodeRecord { m: m + 1, ..record },
+                &sha,
+                qt
+            )
+            .is_err());
             assert!(validate_mqn_final_code_record(&record, &"0".repeat(64), qt).is_err());
         }
         let original = std::fs::read(&input).unwrap();
         let rewritten = std::fs::read(&output).unwrap();
-        let offset = RuntimeHfqFile::open_with_reap_plan(&input, None).unwrap()
-            .tensors().iter().find(|tensor| tensor.name == tensor_name).unwrap().data_offset;
-        let changed_offsets: Vec<usize> = original.iter().zip(&rewritten).enumerate()
-            .filter_map(|(i, (a, b))| (a != b).then_some(i)).collect();
-        let expected = if !changed { vec![] } else if qt == 49 {
+        let offset = RuntimeHfqFile::open_with_reap_plan(&input, None)
+            .unwrap()
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == tensor_name)
+            .unwrap()
+            .data_offset;
+        let changed_offsets: Vec<usize> = original
+            .iter()
+            .zip(&rewritten)
+            .enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i))
+            .collect();
+        let expected = if !changed {
+            vec![]
+        } else if qt == 49 {
             vec![offset + 8, offset + 9] // code 2 straddles MQ3 bytes 0 and 1
         } else {
             vec![offset + 8] // code 2 occupies MQ2 bits 4..5 of byte 0
@@ -767,6 +995,8 @@ fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Flux
     } else if args.qwen4_flash_next {
         Route::Qwen4
+    } else if args.recipe.is_some() {
+        Route::Qwen4StockFp8
     } else if args.mq4v2_final_codes.is_some()
         || args.mq3v2_final_codes.is_some()
         || args.mq2v2_final_codes.is_some()
@@ -774,7 +1004,11 @@ fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::FinalCodes
     } else if is_early_special_format(&args.format) {
         Route::EarlySpecial
-    } else if args.input.as_deref().is_some_and(|i| is_gguf_input(Path::new(i))) {
+    } else if args
+        .input
+        .as_deref()
+        .is_some_and(|i| is_gguf_input(Path::new(i)))
+    {
         Route::Gguf
     } else if args.reap_overlay.is_some() {
         Route::ReapOverlay
@@ -856,6 +1090,55 @@ pub(crate) fn run() {
         }
     }
 
+    // ── Stock FP8 passthrough converter (`--recipe stock-fp8`) ──────────
+    // Selected by the recipe flag alone; a dedicated producer with its own
+    // manifest pin, receipt and writer.  It never reaches the legacy
+    // handlers below, and `reject_unreachable` has already refused every
+    // flag it does not read.
+    if let Some(recipe) = args.recipe.as_deref() {
+        debug_assert_eq!(recipe, "stock-fp8", "clap restricts --recipe to stock-fp8");
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --recipe stock-fp8");
+        let mode = match args.qwen4_component_mode.as_str() {
+            "production" => crate::qwen4::Qwen4Mode::Production,
+            "compact-fixture" => crate::qwen4::Qwen4Mode::CompactFixture,
+            other => {
+                eprintln!(
+                    "error: --qwen4-component-mode unknown mode '{other}' \
+                     (expected production|compact-fixture)"
+                );
+                std::process::exit(2);
+            }
+        };
+        match crate::qwen4::run_stock_fp8_cli(Path::new(input), Path::new(&args.output), mode) {
+            Ok(summary) => {
+                eprintln!(
+                    "stock-fp8: wrote {} ({} entries: {} experts, {} PLE shards; \
+                     fp8 tensors scanned={}, mtp omitted={}, vision omitted={}; \
+                     artifact={} bytes sha256={}; receipt={}; {:.1}s)",
+                    args.output,
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.ple_shards,
+                    summary.fp8_scanned,
+                    summary.mtp_omitted,
+                    summary.vision_omitted,
+                    summary.artifact_bytes,
+                    summary.artifact_sha256,
+                    summary.receipt_path.display(),
+                    summary.elapsed_seconds
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: stock-fp8 conversion: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // ── Developer-only complete tiny Qwen4 checkpoint ───────────────────
     // Feature-gated; consumes only --input/--output/--qwen4-dev-tiny and is
     // dispatched to its own producer entry, never to the Flash-Next path.
@@ -877,9 +1160,7 @@ pub(crate) fn run() {
             .as_deref()
             .expect("--input is required with --qwen4-dev-tiny");
         if input.starts_with("hf://") {
-            eprintln!(
-                "error: --qwen4-dev-tiny needs a local safetensors directory, not '{input}'"
-            );
+            eprintln!("error: --qwen4-dev-tiny needs a local safetensors directory, not '{input}'");
             std::process::exit(2);
         }
         match crate::qwen4::run_dev_tiny_cli(Path::new(input), Path::new(&args.output), encoding) {
@@ -908,11 +1189,7 @@ pub(crate) fn run() {
             .input
             .as_deref()
             .expect("--input is required for --mq4v2-final-codes");
-        match export_mq4v2_final_codes(
-            Path::new(input),
-            records_path,
-            Path::new(&args.output),
-        ) {
+        match export_mq4v2_final_codes(Path::new(input), records_path, Path::new(&args.output)) {
             Ok((count, source_sha)) => {
                 eprintln!(
                     "MQ4V2 final-code import complete: {count} tensor(s), source_sha={source_sha}, output={}",
@@ -932,8 +1209,16 @@ pub(crate) fn run() {
         (50, args.mq2v2_final_codes.as_deref()),
     ] {
         if let Some(records_path) = records_path {
-            let input = args.input.as_deref().expect("--input is required for final-code import");
-            match export_mqn_final_codes(Path::new(input), records_path, Path::new(&args.output), qt) {
+            let input = args
+                .input
+                .as_deref()
+                .expect("--input is required for final-code import");
+            match export_mqn_final_codes(
+                Path::new(input),
+                records_path,
+                Path::new(&args.output),
+                qt,
+            ) {
                 Ok((count, source_sha)) => {
                     eprintln!("MQ{}V2 final-code import complete: {count} tensor(s), source_sha={source_sha}, output={}", if qt == 49 { 3 } else { 2 }, args.output);
                     return;
@@ -1604,7 +1889,8 @@ pub(crate) fn run() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.awq || args.awq_alpha.is_some() || args.awq_a4_aware || args.awq_a4_route_c2;
+    let awq_enabled =
+        args.awq || args.awq_alpha.is_some() || args.awq_a4_aware || args.awq_a4_route_c2;
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
     let main_route = route_for(&args) == crate::cli::Route::Main;
     // ── Unknown --format ──
@@ -1612,26 +1898,68 @@ pub(crate) fn run() {
     // typo silently produced a qt=0 model. `q4f16` is the one spelling that
     // asks for that arm on purpose.
     let use_q4f16 = format == "q4f16";
-    let format_known = use_q8 || use_q4f16 || use_f32_passthrough || use_mixed || use_fast
-        || use_q8hfq || use_q4k_all || use_q4k_q8embed || use_mq8g256
-        || use_deepseek4_source_precision || use_deepseek4_mq2rxt_overlay
-        || use_mq4g256 || use_mq4v2 || use_mq4v2_lloyd || use_mq4c
-        || use_hfq4g256 || use_hfq3g256 || use_hfq3g128 || use_hfq2g256 || use_hfq2g128
-        || use_hfq_mixed || use_mq6g256 || use_mq5g256 || use_mq6g256v2 || use_mq5g256v2
-        || use_mq3g256v2 || use_mq2g256v2 || use_bf16 || use_f16
-        || use_mq4_mq2lloydexp || use_mq4_mq2glexp || use_mq4_mq2lloyd_native
-        || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix || use_mq4_mq3lloyd_kmap
-        || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez || use_mq4_mqlloyd_antirez_gptq
-        || use_mq4_mq2lloyd_gptq_all || use_mq4_mq6exp
-        || use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq2g256_lloyd_anchored
-        || use_mq3g256_lloyd || use_mq4g256_lloyd || use_hfq6 || use_hfp4 || use_mfp4
-        || use_mfp4l || use_mfp4p || use_mfp4e8 || use_mfp4e8soa
-        || use_mfp3e8_gptq_fmt || use_mfp2e8_gptq_fmt;
+    let format_known = use_q8
+        || use_q4f16
+        || use_f32_passthrough
+        || use_mixed
+        || use_fast
+        || use_q8hfq
+        || use_q4k_all
+        || use_q4k_q8embed
+        || use_mq8g256
+        || use_deepseek4_source_precision
+        || use_deepseek4_mq2rxt_overlay
+        || use_mq4g256
+        || use_mq4v2
+        || use_mq4v2_lloyd
+        || use_mq4c
+        || use_hfq4g256
+        || use_hfq3g256
+        || use_hfq3g128
+        || use_hfq2g256
+        || use_hfq2g128
+        || use_hfq_mixed
+        || use_mq6g256
+        || use_mq5g256
+        || use_mq6g256v2
+        || use_mq5g256v2
+        || use_mq3g256v2
+        || use_mq2g256v2
+        || use_bf16
+        || use_f16
+        || use_mq4_mq2lloydexp
+        || use_mq4_mq2glexp
+        || use_mq4_mq2lloyd_native
+        || use_mq4_mq2lloyd_kmap
+        || use_mq4_mq2lloyd_imatrix
+        || use_mq4_mq3lloyd_kmap
+        || use_mq4_mqlloyd_tiered
+        || use_mq4_mqlloyd_antirez
+        || use_mq4_mqlloyd_antirez_gptq
+        || use_mq4_mq2lloyd_gptq_all
+        || use_mq4_mq6exp
+        || use_mq3g256
+        || use_mq2g256
+        || use_mq2g256_lloyd
+        || use_mq2g256_lloyd_anchored
+        || use_mq3g256_lloyd
+        || use_mq4g256_lloyd
+        || use_hfq6
+        || use_hfp4
+        || use_mfp4
+        || use_mfp4l
+        || use_mfp4p
+        || use_mfp4e8
+        || use_mfp4e8soa
+        || use_mfp3e8_gptq_fmt
+        || use_mfp2e8_gptq_fmt;
     if main_route && !format_known {
         if GgufFormat::from_flag(format).is_some() {
             eprintln!("error: --format {format} is only supported for GGUF weight input");
         } else {
-            eprintln!("error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)");
+            eprintln!(
+                "error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)"
+            );
         }
         std::process::exit(2);
     }
@@ -1659,13 +1987,31 @@ pub(crate) fn run() {
         std::process::exit(2);
     }
     // Formats whose encoder arm applies AWQ pre-scaling to dense tensors.
-    let awq_format = use_mq4g256 || use_mq4_mq6exp || use_mq4_mq2lloydexp || use_mq4_mq2glexp
-        || use_mq4_mq2lloyd_native || use_mq4_mq2lloyd_kmap || use_mq4_mq2lloyd_imatrix
-        || use_mq4_mq3lloyd_kmap || use_mq4_mqlloyd_tiered || use_mq4_mqlloyd_antirez
-        || use_mq4_mqlloyd_antirez_gptq || use_mq4_mq2lloyd_gptq_all
-        || use_mq4v2 || use_mq4v2_lloyd || use_mq4c || use_mq5g256 || use_mq6g256v2
-        || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2 || use_mq3g256_lloyd
-        || use_mq2g256_lloyd_anchored || use_mq2g256_lloyd || use_mq3g256 || use_mq2g256;
+    let awq_format = use_mq4g256
+        || use_mq4_mq6exp
+        || use_mq4_mq2lloydexp
+        || use_mq4_mq2glexp
+        || use_mq4_mq2lloyd_native
+        || use_mq4_mq2lloyd_kmap
+        || use_mq4_mq2lloyd_imatrix
+        || use_mq4_mq3lloyd_kmap
+        || use_mq4_mqlloyd_tiered
+        || use_mq4_mqlloyd_antirez
+        || use_mq4_mqlloyd_antirez_gptq
+        || use_mq4_mq2lloyd_gptq_all
+        || use_mq4v2
+        || use_mq4v2_lloyd
+        || use_mq4c
+        || use_mq5g256
+        || use_mq6g256v2
+        || use_mq5g256v2
+        || use_mq3g256v2
+        || use_mq2g256v2
+        || use_mq3g256_lloyd
+        || use_mq2g256_lloyd_anchored
+        || use_mq2g256_lloyd
+        || use_mq3g256
+        || use_mq2g256;
     if (args.awq_a4_aware || args.awq_a4_route_c2) && !use_mq4v2 {
         eprintln!("error: A4-aware AWQ currently requires --format mq4v2");
         std::process::exit(1);
@@ -1682,11 +2028,20 @@ pub(crate) fn run() {
         eprintln!("error: --mq2v2-symmetric currently requires --format mq2v2");
         std::process::exit(1);
     }
+    if let Err(message) = check_moe_expert_down(&args, route_for(&args), use_mq4v2, &|var| {
+        hipfire_config::developer_var(var).ok()
+    }) {
+        eprintln!("error: {message}");
+        std::process::exit(2);
+    }
     if args.awq_a4_route_c2 {
         AWQ_A4_ROUTE_C2.set(true).expect("AWQ c2 recipe set twice");
     }
     if let Some(capture) = &args.awq_a4_signed_capture {
-        let source_sha = args.awq_a4_source_sha.as_ref().expect("capture requires source SHA");
+        let source_sha = args
+            .awq_a4_source_sha
+            .as_ref()
+            .expect("capture requires source SHA");
         if source_sha.len() != 64 || !source_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             eprintln!("error: --awq-a4-source-sha must be a 64-digit SHA-256");
             std::process::exit(1);
@@ -1696,7 +2051,8 @@ pub(crate) fn run() {
                 eprintln!("error: cannot open AWQ capture manifest: {error}");
                 std::process::exit(1);
             }),
-        ).unwrap_or_else(|error| {
+        )
+        .unwrap_or_else(|error| {
             eprintln!("error: invalid AWQ capture manifest: {error}");
             std::process::exit(1);
         });
@@ -1706,32 +2062,41 @@ pub(crate) fn run() {
             eprintln!("error: AWQ capture source SHA/path does not match --input");
             std::process::exit(1);
         }
-        AWQ_A4_SIGNED_CAPTURE.set(capture.clone()).expect("AWQ capture set twice");
-        AWQ_A4_SOURCE_SHA.set(source_sha.clone()).expect("AWQ source SHA set twice");
-        eprintln!("AWQ signed QAT capture: {} (partial-layer c2/symmetric objective)", capture.display());
+        AWQ_A4_SIGNED_CAPTURE
+            .set(capture.clone())
+            .expect("AWQ capture set twice");
+        AWQ_A4_SOURCE_SHA
+            .set(source_sha.clone())
+            .expect("AWQ source SHA set twice");
+        eprintln!(
+            "AWQ signed QAT capture: {} (partial-layer c2/symmetric objective)",
+            capture.display()
+        );
     }
     MQ4V2_SYMMETRIC
         .set(args.mq4v2_symmetric)
         .expect("MQ4V2_SYMMETRIC set twice — should not happen");
     if args.mq4v2_symmetric {
-        eprintln!(
-            "MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)"
-        );
+        eprintln!("MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)");
     }
     MQ3V2_SYMMETRIC
         .set(args.mq3v2_symmetric)
         .expect("MQ3V2_SYMMETRIC set twice — should not happen");
     if args.mq3v2_symmetric {
-        eprintln!(
-            "MQ3V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-4*d)"
-        );
+        eprintln!("MQ3V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-4*d)");
     }
     MQ2V2_SYMMETRIC
         .set(args.mq2v2_symmetric)
         .expect("MQ2V2_SYMMETRIC set twice — should not happen");
     if args.mq2v2_symmetric {
+        eprintln!("MQ2V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-2*d)");
+    }
+    MOE_EXPERT_DOWN_MQ4G128V2_SYM
+        .set(args.moe_expert_down == Some(MoeExpertDown::Mq4g128v2Symmetric))
+        .expect("MOE_EXPERT_DOWN_MQ4G128V2_SYM set twice — should not happen");
+    if args.moe_expert_down.is_some() {
         eprintln!(
-            "MQ2V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-2*d)"
+            "Routed-expert down_proj: symmetric MQ4G128V2 (qt53, 68 B per 128 weights, FWHT128 signs 43/1043, per-128 MSE scale search, zero=-8*d); gate_up and all other tensors unchanged"
         );
     }
     if awq_enabled {
@@ -2039,6 +2404,13 @@ pub(crate) fn run() {
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
     let is_moe_like =
         is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    if args.moe_expert_down.is_some() && (is_cohere2moe || is_deepseek4 || is_lfm2moe || is_minimax)
+    {
+        eprintln!(
+            "error: --moe-expert-down mq4g128v2-symmetric is not implemented for this architecture's routed-expert tensor layout (arch_id={arch_id}); its expert handler would ignore it"
+        );
+        std::process::exit(2);
+    }
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
         eprintln!(
             "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
@@ -2155,7 +2527,14 @@ pub(crate) fn run() {
     if is_cohere2moe {
         // The cohere2moe handler only knows these tiers; any other format
         // used to fall through to Q8 experts without a word.
-        if !(use_q8 || use_f16 || use_bf16 || use_f32_passthrough || use_mq6g256 || use_mq4g256 || use_mq4v2) {
+        if !(use_q8
+            || use_f16
+            || use_bf16
+            || use_f32_passthrough
+            || use_mq6g256
+            || use_mq4g256
+            || use_mq4v2)
+        {
             eprintln!(
                 "error: --format {format} is not supported for Cohere2-MoE; use one of q8, f16, bf16, oracle, mq6, mq4 (experts are written as MQ4G256, qt=13)"
             );
@@ -2260,7 +2639,7 @@ pub(crate) fn run() {
     // config.json. Same key schema the loader's `apply_st_config` /
     // `apply_mask_config` read, so the loader consumes the fold with no
     // second parser.
-    let st_sidecar: Option<serde_json::Value> = if arch_id == 17 {
+    let st_sidecar: Option<serde_json::Value> = if arch_id == 17 || arch_id == 18 {
         let read = |rel: &str| -> Option<serde_json::Value> {
             std::fs::read_to_string(input_dir.join(rel))
                 .ok()
@@ -2270,7 +2649,10 @@ pub(crate) fn run() {
         // The ST ≤ v3 file first; the newer config_sentence_transformers.json
         // wins per key where both define one — the same precedence the dir
         // loader's overlay order gives.
-        for rel in ["sentence_bert_config.json", "config_sentence_transformers.json"] {
+        for rel in [
+            "sentence_bert_config.json",
+            "config_sentence_transformers.json",
+        ] {
             if let Some(v) = read(rel) {
                 for k in ["prompts", "query_length", "document_length"] {
                     if let Some(val) = v.get(k) {
@@ -2305,6 +2687,9 @@ pub(crate) fn run() {
     if args.mq4v2_symmetric {
         metadata["mq4v2.symmetric"] = serde_json::json!(1);
     }
+    if args.moe_expert_down == Some(MoeExpertDown::Mq4g128v2Symmetric) {
+        metadata["moe.expert_down"] = serde_json::json!("mq4g128v2-symmetric");
+    }
     if args.mq3v2_symmetric {
         metadata["mq3v2.symmetric"] = serde_json::json!(1);
     }
@@ -2333,8 +2718,9 @@ pub(crate) fn run() {
     if let Some(capture) = &args.awq_a4_signed_capture {
         let manifest_path = capture.join("manifest.json");
         let manifest: serde_json::Value = serde_json::from_reader(
-            File::open(&manifest_path).expect("AWQ capture manifest disappeared")
-        ).expect("AWQ capture manifest changed");
+            File::open(&manifest_path).expect("AWQ capture manifest disappeared"),
+        )
+        .expect("AWQ capture manifest changed");
         metadata["awq_a4_capture"] = serde_json::json!({
             "source_sha256": manifest["source"]["sha256"],
             "prompt_sha256": manifest["corpus"]["token_stream"]["sha256"],
@@ -2410,10 +2796,22 @@ pub(crate) fn run() {
         // Visit the largest fused projection first so it chooses the alpha
         // cached for its qkvza/gate-up siblings.
         const A4_ANCHOR_ORDER: [(&str, &str); 7] = [
-            (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_0_qkv.weight"),
-            (".linear_attn.in_proj_z.weight", ".linear_attn.in_proj_1_z.weight"),
-            (".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_2_a.weight"),
-            (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_3_b.weight"),
+            (
+                ".linear_attn.in_proj_qkv.weight",
+                ".linear_attn.in_proj_0_qkv.weight",
+            ),
+            (
+                ".linear_attn.in_proj_z.weight",
+                ".linear_attn.in_proj_1_z.weight",
+            ),
+            (
+                ".linear_attn.in_proj_a.weight",
+                ".linear_attn.in_proj_2_a.weight",
+            ),
+            (
+                ".linear_attn.in_proj_b.weight",
+                ".linear_attn.in_proj_3_b.weight",
+            ),
             (".self_attn.q_proj.weight", ".self_attn.0_q_proj.weight"),
             (".self_attn.k_proj.weight", ".self_attn.1_k_proj.weight"),
             (".self_attn.v_proj.weight", ".self_attn.2_v_proj.weight"),
@@ -2789,6 +3187,26 @@ pub(crate) fn run() {
             .iter()
             .any(|(n, _)| n.starts_with("model.language_model."));
 
+    // EmbeddingGemma 2 (arch 18): same text-only bring-up — the checkpoint
+    // is a bare composite, so the trunk tensors start at `language_model.`
+    // and the vision/audio towers + projectors (`vision_tower.*`,
+    // `audio_tower.*`, `embed_vision.*`, `embed_audio.*`) leave the trunk.
+    // They are not dropped: the checkpoint ships the towers as part of the
+    // model, so they are collected here and written as the arch-18 `.vl`
+    // sidecar beside the output (see `emit_eg2_sidecar_tensor` and the
+    // sidecar write at the end of `run`). The trunk stays tower-less — the
+    // tensors are still skipped from the main artifact, same
+    // `skipped_params` accounting as before.
+    let eg2_skip_non_lm = arch_id == 18
+        && all_tensors
+            .iter()
+            .any(|(n, _)| n.starts_with("language_model."));
+    // 963 tower tensors (~660M params, ~1.4 GB at the sidecar's F16/F32
+    // containers). Held in RAM rather than spilled: `TensorSpill`'s path is
+    // PID-unique, so a second spill in this process would collide with the
+    // trunk's.
+    let mut eg2_sidecar_tensors: Vec<HfqTensor> = Vec::new();
+
     if use_mq4v2_lloyd {
         lloyd_v2_stats_reset();
     }
@@ -2813,6 +3231,37 @@ pub(crate) fn run() {
         // rest of the module. Towers always behaved this way — the projector
         // is the fix (it used to land on the text-quantize tail).
         let vision_group = is_vision_group_tensor(name);
+        // EmbeddingGemma 2 (arch 18): every tensor outside `language_model.`
+        // leaves the text trunk here — BEFORE the vision-group skip below,
+        // because the arch-18 towers are spelled `vision_tower.*` (which that
+        // gate would otherwise swallow) and they are never inlined in the
+        // trunk. The tower groups are not lost: they ride the same emit path
+        // the qwen35 `--vision-only` pack uses, into the arch-18 `.vl` sidecar
+        // written beside the output. The trunk accounting is unchanged —
+        // `skipped_params` grows by exactly what it grew by before.
+        if eg2_skip_non_lm && !name.starts_with("language_model.") {
+            let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            if is_eg2_sidecar_tensor(name) {
+                emit_eg2_sidecar_tensor(
+                    &PerTensorCtx {
+                        name,
+                        file_idx: *file_idx,
+                        n_elements: n,
+                        arch_id,
+                        is_vision,
+                    },
+                    meta,
+                    raw_data,
+                    &mut eg2_sidecar_tensors,
+                    &fp8_scale_for,
+                    &st_files,
+                );
+                st_files[*file_idx].drop_tensor_pages(name);
+            }
+            skipped_params += n as u64;
+            continue;
+        }
         if vision_group && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
@@ -3242,6 +3691,7 @@ pub(crate) fn run() {
                 data: q,
                 spilled_len: 0,
             });
+            quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
             st_files[*file_idx].drop_tensor_pages(name);
             continue;
         }
@@ -3599,6 +4049,7 @@ pub(crate) fn run() {
                 use_hfp4,
                 use_mfp4l,
                 routed_gl,
+                moe_expert_down_mq4g128v2_symmetric(),
                 &imatrix_path,
                 bake_keep_active,
                 &reap_bake_plan,
@@ -3803,7 +4254,7 @@ pub(crate) fn run() {
                 &st_files,
             );
         } // Release source file page cache after each tensor to prevent
-        // mmap'd pages from starving GPU allocations on UMA systems.
+          // mmap'd pages from starving GPU allocations on UMA systems.
         st_files[*file_idx].drop_tensor_pages(name);
     }
 
@@ -3866,8 +4317,15 @@ pub(crate) fn run() {
 
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
+        // Arch 18 ships its towers in the `.vl` sidecar, so the VL hint is
+        // wrong there: nothing about `--include-vision` changes the trunk.
         eprintln!(
-            "  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)"
+            "  Skipped params:   {skipped_params} ({})",
+            if eg2_skip_non_lm {
+                "text trunk only — the tower groups rode into the .vl sidecar"
+            } else {
+                "mtp/visual — use --include-vision for VL"
+            }
         );
     }
     eprintln!("  Total params:     {total_params}");
@@ -4066,7 +4524,10 @@ pub(crate) fn run() {
         spill.as_mut(),
     )
     .unwrap_or_else(|e| {
-        eprintln!("error: writing {} failed: {e}; no output written", output_path.display());
+        eprintln!(
+            "error: writing {} failed: {e}; no output written",
+            output_path.display()
+        );
         if let Some(s) = spill.as_ref() {
             let _ = std::fs::remove_file(s.path());
         }
@@ -4074,6 +4535,15 @@ pub(crate) fn run() {
     });
     if let Some(s) = spill {
         s.cleanup();
+    }
+
+    // EmbeddingGemma-2 (arch 18): the tower pack rides beside the trunk in
+    // this same invocation. There is no second command to forget — the
+    // checkpoint's tower names are flat (`vision_tower.*` / `audio_tower.*`),
+    // so no `--include-prefix` can select them and a separate build could
+    // never produce this pack.
+    if !eg2_sidecar_tensors.is_empty() {
+        write_eg2_sidecar(output_path, arch_id, &metadata_json, &eg2_sidecar_tensors);
     }
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
@@ -4652,6 +5122,12 @@ fn try_handle_lfm2moe(
                 data: bytes,
                 spilled_len: 0,
             });
+            // The bias rides F32 (precision-sensitive router input), but it is
+            // still a handled tensor: count it or the load-bearing
+            // "param accounting does not close" check refuses the artifact
+            // (caught live quantizing LFM2.5-24B-A2B: 38 MoE layers × 64
+            // experts = 2432 dropped params).
+            *quantized_params += n_elements as u64;
             st_files[file_idx].drop_tensor_pages(name);
             return true;
         }
@@ -5258,6 +5734,9 @@ fn handle_moe_expert_3d(
     _use_hfp4: bool,
     _use_mfp4l: bool,
     routed_gl: bool,
+    // `--moe-expert-down mq4g128v2-symmetric`: stacked routed-expert
+    // down_proj → symmetric qt53 (group 128). gate_up is untouched.
+    moe_expert_down_sym: bool,
     imatrix_path: &Option<PathBuf>,
     bake_keep_active: bool,
     reap_bake_plan: &Option<hipfire_reap::plan::ReapPlan>,
@@ -5641,9 +6120,15 @@ fn handle_moe_expert_3d(
                 .and_then(|t| t.get(x))
                 .filter(|v| v.len() == inner_k_e)
                 .map(|v| compute_awq_scales(v, awq_alpha_e));
-            let (quantized, qt, gs) = if let (Some(tm), Some(lay)) =
-                (moe_tier_map.as_ref(), parent_layer)
-            {
+            let (quantized, qt, gs) = if moe_expert_down_sym && base_name == "down_proj" {
+                // Validated recipe (uniform symmetric MQ4, no promotion / AWQ /
+                // Lloyd / graded / tier-map) — the override is exclusive.
+                (
+                    encode_routed_expert_down_qt53(name, &f32_slice, inner_m, inner_k_e),
+                    QuantType::MQ4G128V2,
+                    128u32,
+                )
+            } else if let (Some(tm), Some(lay)) = (moe_tier_map.as_ref(), parent_layer) {
                 // N-tier TIER_MAP dispatch: look up (layer, expert) -> QuantType.
                 // Fires for BOTH gate_up and down (unlike graded_hot which is down-only).
                 // Falls back to uniform MQ4 for unmapped (layer,expert) pairs.
@@ -5852,9 +6337,7 @@ fn handle_moe_expert_3d(
                     && (use_mq4v2 || use_mq4v2_lloyd)
                     && mq6v2_promote_supported(arch_id)
                 {
-                    let q = quantize_mq6g256v2(
-                        &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
-                    );
+                    let q = quantize_mq6g256v2(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                     (q, QuantType::MQ6G256V2, 256u32)
                 } else {
                     let q = quantize_mq6g256(&f32_slice, &signs1, &signs2);
@@ -5936,7 +6419,8 @@ fn handle_moe_expert_3d(
                 // This arm is what makes `--format mq4` mean qt44 for routed
                 // experts. Without it the experts fall to the qt13 arm below,
                 // and on an A3B MoE that is ~99% of the model by tensor count.
-                let q = quantize_mq4g256v2_selected(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                let q =
+                    quantize_mq4g256v2_selected(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                 (q, QuantType::MQ4G256V2, 256u32)
             } else if supports_g256 {
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
@@ -5981,7 +6465,9 @@ fn handle_moe_expert_3d(
     }
     *quantized_params += inner_n as u64 * n_out_experts as u64;
     // Single eprintln to summarize the whole expert sweep.
-    let label = if moe_tier_map.is_some() && parent_layer.is_some() {
+    let label = if moe_expert_down_sym && base_name == "down_proj" {
+        "MQ4G128V2-sym"
+    } else if moe_tier_map.is_some() && parent_layer.is_some() {
         "TierMap"
     } else if graded_hot.is_some() {
         "Graded(MQ6/MQ2L)"
@@ -6067,6 +6553,12 @@ fn handle_moe_expert_3d(
 /// ~6 MB extra on the 222 Qwen3.8 tower vectors. Name-selected by
 /// `vision_sidecar::vision_dtype`, not rank-selected: `pos_embed.weight`
 /// is a 2-D table but loads through `load_f32_cpu`.
+///
+/// EmbeddingGemma-2 (arch 18) rides the same predicate chain: its towers are
+/// emitted through this function too, so `eg2_sidecar_dtype` is consulted
+/// first — it is the only one that knows the arch-18 spelling of the
+/// positional table (3-D `position_embedding_table`) and that the audio
+/// tower's clip bounds are 0-d scalars.
 fn emit_vision_f32_vector(
     ctx: &PerTensorCtx,
     meta: &TensorMeta,
@@ -6075,7 +6567,9 @@ fn emit_vision_f32_vector(
     fp8_scale_for: &HashMap<String, (usize, String)>,
     st_files: &[SafetensorsFile],
 ) -> bool {
-    if vision_dtype(ctx.name, meta.shape.len()) != Some(VisionDtype::F32Vector) {
+    let dtype = eg2_sidecar_dtype(ctx.name, meta.shape.len())
+        .or_else(|| vision_dtype(ctx.name, meta.shape.len()));
+    if dtype != Some(VisionDtype::F32Vector) {
         return false;
     }
     let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
@@ -6128,7 +6622,16 @@ fn handle_main_quant(
     // as f16 and refuses a compressed tier. Everything else quantizes as
     // usual; norms already fall out via should_quantize.
     let keep_dense_head = arch_id == 17 && name == "linear.weight";
-    if !keep_dense_head && should_quantize(name) && n_elements >= 32 {
+    // EmbeddingGemma 2's `embedding_projection` is the final pooled-vector
+    // head — kept raw like arch 17's Dense. (768×512 ≈ 0.4M params: no size
+    // win worth a retrieval-quality cost.)
+    let keep_eg2_head = arch_id == 18
+        && name.ends_with("embedding_projection.weight")
+        && !name.starts_with("embed_");
+    if keep_eg2_head {
+        // fall through to the raw path below unchanged
+    }
+    if !keep_dense_head && !keep_eg2_head && should_quantize(name) && n_elements >= 32 {
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, &fp8_scale_for, &st_files);
         *state.quantized_params += n_elements as u64;
@@ -6196,7 +6699,14 @@ fn handle_main_quant(
             let mut awq_sidecar_scales: Option<Vec<f32>> = None;
             let mut lloyd_sidecar_levels: Option<[f32; 16]> = None;
 
-            let (quantized, qt, gs, label) = if flags.q8_conv1d_default && is_conv1d_tensor(name) {
+            let (quantized, qt, gs, label) = if moe_expert_down_mq4g128v2_symmetric()
+                && is_routed_expert_down_2d(name, &meta.shape)
+            {
+                // Un-stacked routed-expert down_proj → symmetric qt53.
+                let q =
+                    encode_routed_expert_down_qt53(name, &f32_data, meta.shape[0], meta.shape[1]);
+                (q, QuantType::MQ4G128V2, 128u32, "MQ4G128V2-sym")
+            } else if flags.q8_conv1d_default && is_conv1d_tensor(name) {
                 // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -6246,9 +6756,7 @@ fn handle_main_quant(
                         && mq6v2_promote_supported(arch_id)
                     {
                         let m = n_elements / k_dim;
-                        let q = quantize_mq6g256v2(
-                            &f32_data, m, k_dim, &signs1, &signs2,
-                        );
+                        let q = quantize_mq6g256v2(&f32_data, m, k_dim, &signs1, &signs2);
                         (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                     } else {
                         let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
@@ -6338,13 +6846,7 @@ fn handle_main_quant(
                                 if awq_eligible(name) {
                                     let m_dim = meta.shape[0];
                                     let selected = compute_awq_scales_for_weight(
-                                        name,
-                                        im_weights,
-                                        alpha,
-                                        &f32_data,
-                                        m_dim,
-                                        k_dim,
-                                        &signs1,
+                                        name, im_weights, alpha, &f32_data, m_dim, k_dim, &signs1,
                                         &signs2,
                                     );
                                     if selected.relative_output_mse.is_finite() {
@@ -6357,7 +6859,9 @@ fn handle_main_quant(
                                     awq_sidecar_scales = Some(scales.clone());
                                     let mut scaled = f32_data.clone();
                                     awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                    quantize_mq4g256v2_selected(
+                                        &scaled, m_dim, k_dim, &signs1, &signs2,
+                                    )
                                 } else {
                                     let m = meta.shape[0];
                                     let k = k_dim;
@@ -6998,13 +7502,7 @@ fn handle_main_quant(
                             if awq_eligible(name) {
                                 let m_dim = meta.shape[0];
                                 let selected = compute_awq_scales_for_weight(
-                                    name,
-                                    im_weights,
-                                    alpha,
-                                    &f32_data,
-                                    m_dim,
-                                    k_dim,
-                                    &signs1,
+                                    name, im_weights, alpha, &f32_data, m_dim, k_dim, &signs1,
                                     &signs2,
                                 );
                                 if selected.relative_output_mse.is_finite() {
@@ -7542,7 +8040,9 @@ fn handle_main_quant(
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq3g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
-                                quantize_mq3g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq3g256v2_selected(
+                                    &f32_data, m_dim, k_dim, &signs1, &signs2,
+                                )
                             }
                         } else {
                             quantize_mq3g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
@@ -7575,7 +8075,9 @@ fn handle_main_quant(
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq2g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
-                                quantize_mq2g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq2g256v2_selected(
+                                    &f32_data, m_dim, k_dim, &signs1, &signs2,
+                                )
                             }
                         } else {
                             quantize_mq2g256v2_selected(&f32_data, m_dim, k_dim, &signs1, &signs2)
@@ -7903,7 +8405,7 @@ fn handle_main_quant(
                     (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
                 }
             }; // end K-map outer if-else
-            // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
+               // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
             if qt == QuantType::Q4F16G64 {
                 let is_q4_opt_in = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
                 if !is_q4_opt_in
@@ -8081,51 +8583,152 @@ fn handle_main_quant(
         if emit_vision_f32_vector(ctx, meta, raw_data, state, fp8_scale_for, st_files) {
             return;
         }
-        // ── F16 fallback for non-quantizable tensors ───────────────────────
-        // Every included tensor not handled by `should_quantize(name) && n_elements >= 32`
-        // must still be emitted so the dense artifact is loadable. Historical
-        // source stored these as F16 verbatim when source already F16, otherwise
-        // numerically converting BF16/F32 → F16 (using the truncating encoder).
-        // No model-specific name list; general predicate above controls routing.
-        let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-        let f16_bytes: Vec<u8> = if meta.dtype == "F16" {
-            // Preserve exact F16 bits when source already F16.
-            raw_data.to_vec()
-        } else {
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                meta,
-                fp8_scale_for,
-                st_files,
-            );
-            f32_data
-                .iter()
-                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                .collect()
-        };
-        *state.quantized_params += n_elements as u64;
-        eprintln!(
-            "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [F16 fallback]",
-            "F16",
-            name,
-            meta.shape,
-            n_elements,
-            raw_data.len() as f64 / 1024.0,
-            f16_bytes.len() as f64 / 1024.0
-        );
-        state.hfq_tensors.push(HfqTensor {
-            name: name.to_string(),
-            quant_type: QuantType::F16,
-            shape,
-            group_size: 0,
-            data: f16_bytes,
-            spilled_len: 0,
-        });
-        if let Some(sp) = state.spill.as_mut() {
-            spill_or_exit(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
-        }
+        emit_f16_fallback(ctx, meta, raw_data, state, fp8_scale_for, st_files);
     }
+}
+
+/// ── F16 fallback for non-quantizable tensors ───────────────────────────────
+/// Every included tensor not handled by `should_quantize(name) && n_elements >= 32`
+/// must still be emitted so the dense artifact is loadable. Historical source
+/// stored these as F16 verbatim when source already F16, otherwise numerically
+/// converting BF16/F32 → F16 (using the truncating encoder). No model-specific
+/// name list; the general predicate above controls routing.
+///
+/// Shared by the dense artifact and the EmbeddingGemma-2 (arch 18) `.vl`
+/// tower sidecar — see `emit_eg2_sidecar_tensor`.
+fn emit_f16_fallback(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    state: &mut MainQuantState,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+) {
+    let name = ctx.name;
+    let n_elements = ctx.n_elements;
+    let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+    let f16_bytes: Vec<u8> = if meta.dtype == "F16" {
+        // Preserve exact F16 bits when source already F16.
+        raw_data.to_vec()
+    } else {
+        let f32_data =
+            tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, fp8_scale_for, st_files);
+        f32_data
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect()
+    };
+    *state.quantized_params += n_elements as u64;
+    eprintln!(
+        "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [F16 fallback]",
+        "F16",
+        name,
+        meta.shape,
+        n_elements,
+        raw_data.len() as f64 / 1024.0,
+        f16_bytes.len() as f64 / 1024.0
+    );
+    state.hfq_tensors.push(HfqTensor {
+        name: name.to_string(),
+        quant_type: QuantType::F16,
+        shape,
+        group_size: 0,
+        data: f16_bytes,
+        spilled_len: 0,
+    });
+    if let Some(sp) = state.spill.as_mut() {
+        spill_or_exit(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+    }
+}
+
+/// Emit one EmbeddingGemma-2 (arch 18) tower tensor into the `.vl` sidecar
+/// container: the arch-18 checkpoint's towers are part of the model, so they
+/// leave the text trunk (which stays byte-identical) and land in the sibling
+/// pack the loader resolves for the arch-18 carrier.
+///
+/// The emit path is the qwen35 vision-sidecar one verbatim —
+/// `emit_vision_f32_vector` for the F32 containers (norms, biases,
+/// `per_dim_scale`, 0-d clip scalars, the positional lookup table) and the
+/// shared `emit_f16_fallback` for the F16 matrices and conv kernels — only
+/// the destination list differs.
+///
+/// The scratch counters are per-tensor and discarded: the tower's params are
+/// already booked as `skipped_params` (the trunk does not carry them), and
+/// the sidecar's own size is reported when the pack is written.
+fn emit_eg2_sidecar_tensor(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    tensors: &mut Vec<HfqTensor>,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+) {
+    let mut params = 0u64;
+    let mut quant_error = 0.0f64;
+    let mut max_error = 0.0f32;
+    let mut n_groups = 0u64;
+    // No spill: the pack is written from memory once the trunk is complete.
+    let mut no_spill: Option<TensorSpill> = None;
+    let mut state = MainQuantState {
+        hfq_tensors: tensors,
+        quantized_params: &mut params,
+        total_quant_error: &mut quant_error,
+        max_quant_error: &mut max_error,
+        _n_quant_groups: &mut n_groups,
+        spill: &mut no_spill,
+    };
+    if !emit_vision_f32_vector(ctx, meta, raw_data, &mut state, fp8_scale_for, st_files) {
+        emit_f16_fallback(ctx, meta, raw_data, &mut state, fp8_scale_for, st_files);
+    }
+}
+
+/// `.vl` sidecar path for the EmbeddingGemma-2 (arch 18) tower pack written
+/// beside `trunk`: the most specific candidate of the loader's own
+/// `hipfire_runtime::sidecar` probe list (`<trunk with its extension
+/// replaced>`), so the pack is what `resolve_vl_sidecar` picks ahead of every
+/// quant-suffix form and two quant tags of one model keep distinct towers.
+fn eg2_vl_sidecar_path(trunk: &Path) -> PathBuf {
+    hipfire_runtime::sidecar::vl_sidecar_candidates(trunk)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| trunk.with_extension("vl"))
+}
+
+/// Write the EmbeddingGemma-2 (arch 18) tower pack beside the trunk, stamped
+/// with the same `arch_id` (18) so the loader's admission — which keys the
+/// pack's family off that stamp — admits it for this trunk and refuses a
+/// Qwen3.5-VL pack whose tower names would never resolve here.
+fn write_eg2_sidecar(trunk: &Path, arch_id: u32, metadata_json: &str, tensors: &[HfqTensor]) {
+    let vl_path = eg2_vl_sidecar_path(trunk);
+    if vl_path == trunk {
+        eprintln!(
+            "error: --output {} already ends in .vl, the EmbeddingGemma-2 tower \
+             sidecar's own path — write the trunk to a .hfq path (the arch-18 pack \
+             always emits the trunk plus its tower sidecar); no tower pack written",
+            trunk.display()
+        );
+        std::process::exit(2);
+    }
+    eprintln!(
+        "\nWriting: {} (EmbeddingGemma-2 tower sidecar, {} tensors)",
+        vl_path.display(),
+        tensors.len()
+    );
+    write_hfq(&vl_path, arch_id, metadata_json, tensors, None).unwrap_or_else(|e| {
+        eprintln!(
+            "error: writing {} failed: {e}; {} is written but its \
+             EmbeddingGemma-2 tower pack is missing",
+            vl_path.display(),
+            trunk.display()
+        );
+        std::process::exit(2);
+    });
+    let size = std::fs::metadata(&vl_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "Done: {} ({:.1} MB, EmbeddingGemma-2 tower pack)",
+        vl_path.display(),
+        size as f64 / 1e6
+    );
 }
 
 #[cfg(test)]
@@ -8454,7 +9057,9 @@ mod handle_main_quant_f16_fallback_tests {
         let mut spill: Option<TensorSpill> = None;
         let name = "model.layers.10.self_attn.q_proj.weight";
         let shape = vec![4usize, 256];
-        let vals: Vec<f32> = (0..1024).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01).collect();
+        let vals: Vec<f32> = (0..1024)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+            .collect();
         let raw = f16_bytes_of(&vals);
         let mut state = MainQuantState {
             hfq_tensors: &mut hfq_tensors,
@@ -8523,6 +9128,7 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
     enum Recipe {
         Mq4V2Lloyd,
         Mq4V2,
+        Mq4V2DownQt53,
     }
 
     /// `developer_var` overrides would change the emitted bytes for reasons
@@ -8555,23 +9161,34 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
 
     /// Runs the REAL `handle_moe_expert_3d` for one stacked expert tensor with
     /// K-map Promote6, exactly the flag set `run()` builds for `recipe`.
-    fn run_handler(
+    fn run_handler(arch_id: u32, recipe: Recipe, shape: [usize; 3], bf16: &[u8]) -> Vec<HfqTensor> {
+        run_handler_with(EXPERT_NAME, arch_id, recipe, shape, bf16, true)
+    }
+
+    /// Same, for any stacked expert tensor name; `promote6` marks it K-map
+    /// Promote6 (false = uniform, empty K-map).
+    fn run_handler_with(
+        expert_name: &str,
         arch_id: u32,
         recipe: Recipe,
         shape: [usize; 3],
         bf16: &[u8],
+        promote6: bool,
     ) -> Vec<HfqTensor> {
         assert_no_ambient_expert_overrides();
         let dir = tempfile::tempdir().unwrap();
         let st_path = dir.path().join("experts.safetensors");
         let view = TensorView::new(Dtype::BF16, shape.to_vec(), bf16).unwrap();
-        serialize_to_file([(EXPERT_NAME, view)], None, &st_path).unwrap();
+        serialize_to_file([(expert_name, view)], None, &st_path).unwrap();
         let st_files = vec![SafetensorsFile::open(&st_path).unwrap()];
-        let (meta, raw_data) = st_files[0].tensor_data(EXPERT_NAME).unwrap();
-        let kmap: HashMap<String, QuantLevel> =
-            HashMap::from([(EXPERT_NAME.to_string(), QuantLevel::Promote6)]);
+        let (meta, raw_data) = st_files[0].tensor_data(expert_name).unwrap();
+        let kmap: HashMap<String, QuantLevel> = if promote6 {
+            HashMap::from([(expert_name.to_string(), QuantLevel::Promote6)])
+        } else {
+            HashMap::new()
+        };
         let ctx = PerTensorCtx {
-            name: EXPERT_NAME,
+            name: expert_name,
             file_idx: 0,
             n_elements: shape.iter().product(),
             arch_id,
@@ -8593,47 +9210,48 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
             false,
             0.0,
             &None,
-            false, // use_gptq_e8
-            false, // use_gptq_mfp3e8
-            false, // use_gptq_mfp2e8
-            false, // use_mq6g256
-            false, // use_mq4g256
-            matches!(recipe, Recipe::Mq4V2), // use_mq4v2
-            matches!(recipe, Recipe::Mq4V2Lloyd), // use_mq4v2_lloyd
-            false, // use_mq4c
-            false, // use_mq4_mq6exp
-            false, // use_mq4_mq2lloydexp
-            false, // use_mq4_mq2glexp
-            false, // use_mq4_mq2lloyd_native
-            false, // use_mq4_mq2lloyd_kmap
-            false, // use_mq4_mq2lloyd_imatrix
-            false, // use_mq4_mq3lloyd_kmap
-            false, // use_mq4_mqlloyd_tiered
-            false, // use_mq4_mqlloyd_antirez
-            false, // use_mq4_mqlloyd_antirez_gptq
-            false, // use_mq4_mq2lloyd_gptq_all
-            false, // use_mq5g256
-            false, // use_hfq6
-            false, // use_hfq4g256
-            false, // use_hfq3g256
-            false, // use_hfq3g128
-            false, // use_hfq2g256
-            false, // use_hfq2g128
-            false, // use_hfq_mixed
-            false, // use_mfp4
-            false, // use_mfp4p
-            false, // use_mfp4e8
-            false, // use_mfp4e8soa
-            false, // use_mfp3e8_gptq_fmt
-            false, // use_mfp2e8_gptq_fmt
-            false, // use_mq3g256
-            false, // use_mq2g256
-            false, // use_mq2g256_lloyd
-            false, // use_mq3g256_lloyd
-            false, // use_mq4g256_lloyd
-            false, // use_hfp4
-            false, // use_mfp4l
-            false, // routed_gl
+            false,                                                   // use_gptq_e8
+            false,                                                   // use_gptq_mfp3e8
+            false,                                                   // use_gptq_mfp2e8
+            false,                                                   // use_mq6g256
+            false,                                                   // use_mq4g256
+            matches!(recipe, Recipe::Mq4V2 | Recipe::Mq4V2DownQt53), // use_mq4v2
+            matches!(recipe, Recipe::Mq4V2Lloyd),                    // use_mq4v2_lloyd
+            false,                                                   // use_mq4c
+            false,                                                   // use_mq4_mq6exp
+            false,                                                   // use_mq4_mq2lloydexp
+            false,                                                   // use_mq4_mq2glexp
+            false,                                                   // use_mq4_mq2lloyd_native
+            false,                                                   // use_mq4_mq2lloyd_kmap
+            false,                                                   // use_mq4_mq2lloyd_imatrix
+            false,                                                   // use_mq4_mq3lloyd_kmap
+            false,                                                   // use_mq4_mqlloyd_tiered
+            false,                                                   // use_mq4_mqlloyd_antirez
+            false,                                                   // use_mq4_mqlloyd_antirez_gptq
+            false,                                                   // use_mq4_mq2lloyd_gptq_all
+            false,                                                   // use_mq5g256
+            false,                                                   // use_hfq6
+            false,                                                   // use_hfq4g256
+            false,                                                   // use_hfq3g256
+            false,                                                   // use_hfq3g128
+            false,                                                   // use_hfq2g256
+            false,                                                   // use_hfq2g128
+            false,                                                   // use_hfq_mixed
+            false,                                                   // use_mfp4
+            false,                                                   // use_mfp4p
+            false,                                                   // use_mfp4e8
+            false,                                                   // use_mfp4e8soa
+            false,                                                   // use_mfp3e8_gptq_fmt
+            false,                                                   // use_mfp2e8_gptq_fmt
+            false,                                                   // use_mq3g256
+            false,                                                   // use_mq2g256
+            false,                                                   // use_mq2g256_lloyd
+            false,                                                   // use_mq3g256_lloyd
+            false,                                                   // use_mq4g256_lloyd
+            false,                                                   // use_hfp4
+            false,                                                   // use_mfp4l
+            false,                                                   // routed_gl
+            matches!(recipe, Recipe::Mq4V2DownQt53),                 // moe_expert_down_sym
             &None,
             false,
             &None,
@@ -8696,7 +9314,11 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         for arch in UNAUDITED_ARCHS {
             let tensors = run_handler(arch, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
             let what = format!("arch {arch} Lloyd+Promote6");
-            assert_eq!(tensors.len(), SYNTH_SHAPE[0], "{what}: one tensor per expert");
+            assert_eq!(
+                tensors.len(),
+                SYNTH_SHAPE[0],
+                "{what}: one tensor per expert"
+            );
             assert_all_qt(&tensors, QuantType::MQ4G256, &what);
             for (slot, t) in tensors.iter().enumerate() {
                 assert_eq!(
@@ -8730,7 +9352,11 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
         for arch in QT47_ARCHS {
             let tensors = run_handler(arch, Recipe::Mq4V2Lloyd, SYNTH_SHAPE, &bf16);
-            assert_all_qt(&tensors, QuantType::MQ6G256V2, &format!("arch {arch} Lloyd+Promote6"));
+            assert_all_qt(
+                &tensors,
+                QuantType::MQ6G256V2,
+                &format!("arch {arch} Lloyd+Promote6"),
+            );
             assert_ne!(tensors_sha256(&tensors), SYNTH_TENSORS_SHA256);
         }
     }
@@ -8742,7 +9368,11 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
         for arch in UNAUDITED_ARCHS {
             let tensors = run_handler(arch, Recipe::Mq4V2, SYNTH_SHAPE, &bf16);
-            assert_all_qt(&tensors, QuantType::MQ6G256, &format!("arch {arch} MQ4V2+Promote6"));
+            assert_all_qt(
+                &tensors,
+                QuantType::MQ6G256,
+                &format!("arch {arch} MQ4V2+Promote6"),
+            );
         }
     }
 
@@ -8756,7 +9386,12 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
     #[test]
     #[ignore = "real-checkpoint: needs /mnt/nas/kaden/models/Qwen3.5-35B-A3B (or MQ6_REAL_A3B_DIR)"]
     fn unaudited_arch_lloyd_promote6_real_expert0_gate_up_stays_qt13_with_baseline_bytes() {
-        let tensors = run_handler(10, Recipe::Mq4V2Lloyd, [1, 1024, 2048], &real_expert0_gate_up());
+        let tensors = run_handler(
+            10,
+            Recipe::Mq4V2Lloyd,
+            [1, 1024, 2048],
+            &real_expert0_gate_up(),
+        );
         assert_eq!(tensors.len(), 1);
         assert_all_qt(&tensors, QuantType::MQ4G256, "real expert0 gate_up arch 10");
         assert_eq!(tensors[0].data.len(), 1024 * 2048 / 256 * 136);
@@ -8771,8 +9406,8 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
                 .unwrap_or_else(|_| "/mnt/nas/kaden/models/Qwen3.5-35B-A3B".to_string()),
         );
         let path = dir.join("model.safetensors-00006-of-00014.safetensors");
-        let file = SafetensorsFile::open(&path)
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let file =
+            SafetensorsFile::open(&path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         let name = "model.language_model.layers.0.mlp.experts.gate_up_proj";
         let (meta, bytes) = file
             .tensor_data(name)
@@ -8780,6 +9415,286 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         assert_eq!(meta.dtype, "BF16");
         assert_eq!(meta.shape[1..], [1024, 2048]);
         bytes[..1024 * 2048 * 2].to_vec()
+    }
+
+    const DOWN_NAME: &str = "model.language_model.layers.3.mlp.experts.down_proj";
+
+    /// Independent expectation: symmetric qt53 of expert `expert`'s `[m, k]`
+    /// slice straight from the encoder with the 43/1043 sign tables.
+    fn expected_qt53(bf16: &[u8], expert: usize, m: usize, k: usize) -> Vec<u8> {
+        let bytes = m * k * 2;
+        let weights = to_f32(&bf16[expert * bytes..(expert + 1) * bytes], "BF16");
+        quantize_mq4g128v2_symmetric(
+            &weights,
+            m,
+            k,
+            &gen_fwht_signs(43, 128),
+            &gen_fwht_signs(1043, 128),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn symmetric_down_override_emits_qt53_for_stacked_down_only() {
+        let [n, m, k] = SYNTH_SHAPE;
+        let bf16 = synth_bf16(n, m, k);
+        let tensors = run_handler_with(
+            DOWN_NAME,
+            6,
+            Recipe::Mq4V2DownQt53,
+            SYNTH_SHAPE,
+            &bf16,
+            false,
+        );
+        assert_all_qt(
+            &tensors,
+            QuantType::MQ4G128V2,
+            "stacked down_proj with override",
+        );
+        assert_eq!(QuantType::MQ4G128V2 as u8, 53);
+        assert_eq!(tensors.len(), n);
+        for (slot, tensor) in tensors.iter().enumerate() {
+            assert_eq!(
+                tensor.name,
+                format!("model.language_model.layers.3.mlp.experts.{slot}.down_proj.weight")
+            );
+            assert_eq!(tensor.shape, vec![m as u32, k as u32]);
+            assert_eq!(tensor.group_size, 128);
+            assert_eq!(tensor.data.len(), m * k.div_ceil(128) * 68);
+            assert_eq!(
+                tensor.data,
+                expected_qt53(&bf16, slot, m, k),
+                "expert {slot}"
+            );
+        }
+        // Control: without the override the same stacked down is qt44.
+        let control = run_handler_with(DOWN_NAME, 6, Recipe::Mq4V2, SYNTH_SHAPE, &bf16, false);
+        assert_all_qt(
+            &control,
+            QuantType::MQ4G256V2,
+            "stacked down_proj, no override",
+        );
+        assert_ne!(control[0].data, tensors[0].data);
+        // gate_up is untouched: same qt44 bytes with and without the override.
+        let gate_up_flagged = run_handler_with(
+            EXPERT_NAME,
+            6,
+            Recipe::Mq4V2DownQt53,
+            SYNTH_SHAPE,
+            &bf16,
+            false,
+        );
+        let gate_up_plain =
+            run_handler_with(EXPERT_NAME, 6, Recipe::Mq4V2, SYNTH_SHAPE, &bf16, false);
+        assert_all_qt(
+            &gate_up_flagged,
+            QuantType::MQ4G256V2,
+            "stacked gate_up with override",
+        );
+        assert_eq!(
+            tensors_sha256(&gate_up_flagged),
+            tensors_sha256(&gate_up_plain)
+        );
+        assert_eq!(gate_up_flagged[0].group_size, 256);
+    }
+
+    #[test]
+    fn symmetric_down_override_encodes_unaligned_k_without_falling_back() {
+        // K=129 is not a multiple of 256 (the qt44 arm would drop to HFQ4G128)
+        // nor of 128; the override still emits row-local padded qt53.
+        let shape = [2usize, 3, 129];
+        let bf16 = synth_bf16(shape[0], shape[1], shape[2]);
+        let tensors = run_handler_with(DOWN_NAME, 6, Recipe::Mq4V2DownQt53, shape, &bf16, false);
+        assert_all_qt(&tensors, QuantType::MQ4G128V2, "K=129 stacked down_proj");
+        for (slot, tensor) in tensors.iter().enumerate() {
+            assert_eq!(tensor.group_size, 128);
+            assert_eq!(tensor.data.len(), 3 * 2 * 68);
+            assert_eq!(tensor.data, expected_qt53(&bf16, slot, 3, 129));
+        }
+    }
+
+    #[test]
+    fn symmetric_down_override_is_thread_count_independent() {
+        let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
+        let mut digests = Vec::new();
+        for threads in [1usize, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let tensors = pool.install(|| {
+                run_handler_with(
+                    DOWN_NAME,
+                    6,
+                    Recipe::Mq4V2DownQt53,
+                    SYNTH_SHAPE,
+                    &bf16,
+                    false,
+                )
+            });
+            digests.push(tensors_sha256(&tensors));
+        }
+        assert!(
+            digests.windows(2).all(|pair| pair[0] == pair[1]),
+            "{digests:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod moe_expert_down_override_tests {
+    use super::*;
+    use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn two_d_role_predicate_selects_routed_expert_down_only() {
+        let shape = [4usize, 8];
+        for (name, expected) in [
+            (
+                "model.language_model.layers.0.mlp.experts.7.down_proj.weight",
+                true,
+            ),
+            ("mtp.layers.0.mlp.experts.3.down_proj.weight", true),
+            (
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+                false,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.7.gate_up_proj.weight",
+                false,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.7.gate_proj.weight",
+                false,
+            ),
+            ("model.language_model.layers.0.mlp.down_proj.weight", false),
+            (
+                "model.language_model.layers.0.mlp.experts.down_proj.weight",
+                false,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.7.down_proj.bias",
+                false,
+            ),
+        ] {
+            assert_eq!(is_routed_expert_down_2d(name, &shape), expected, "{name}");
+        }
+        // 3-D (stacked) tensors are decided by handle_moe_expert_3d, not here.
+        assert!(!is_routed_expert_down_2d(
+            "model.language_model.layers.0.mlp.experts.7.down_proj.weight",
+            &[2, 4, 8]
+        ));
+    }
+
+    const GOOD: [&str; 7] = [
+        "--format",
+        "mq4",
+        "--uniform",
+        "--mq4v2-symmetric",
+        "--no-q8-router",
+        "--moe-expert-down",
+        "mq4g128v2-symmetric",
+    ];
+
+    fn parse(extra: &[&str]) -> QuantizeArgs {
+        let argv = ["hipfire-quantize", "--input", "i", "--output", "o"]
+            .into_iter()
+            .chain(extra.iter().copied());
+        let matches = QuantizeArgs::command().try_get_matches_from(argv).unwrap();
+        QuantizeArgs::from_arg_matches(&matches).unwrap()
+    }
+
+    fn check(extra: &[&str], env: &[(&str, &str)]) -> Result<(), String> {
+        let args = parse(extra);
+        let use_mq4v2 = matches!(args.format.as_str(), "mq4v2" | "mq4" | "mq4g256v2");
+        check_moe_expert_down(&args, route_for(&args), use_mq4v2, &|var| {
+            env.iter()
+                .find(|(name, _)| *name == var)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn validation_accepts_exactly_the_uniform_symmetric_mq4_recipe() {
+        check(&GOOD, &[]).unwrap();
+        // Levers set to something other than "1" are inert.
+        check(
+            &GOOD,
+            &[
+                ("HIPFIRE_MOE_DOWN_MQ6", "0"),
+                ("HIPFIRE_MOE_EXPERTS_MQ5", "0"),
+            ],
+        )
+        .unwrap();
+        // Absent flag: nothing is checked.
+        let args = parse(&["--format", "mq6", "--awq"]);
+        check_moe_expert_down(&args, route_for(&args), false, &|_| Some("1".to_string())).unwrap();
+    }
+
+    #[test]
+    fn validation_refuses_every_unsupported_combination() {
+        let without = |drop: &str| -> Vec<&str> {
+            let mut v: Vec<&str> = GOOD.to_vec();
+            let at = v.iter().position(|a| *a == drop).unwrap();
+            v.remove(at);
+            v
+        };
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            let mut v: Vec<&'static str> = GOOD.to_vec();
+            v.extend_from_slice(extra);
+            v
+        };
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (without("--uniform"), "--uniform"),
+            (without("--mq4v2-symmetric"), "--mq4v2-symmetric"),
+            (
+                vec![
+                    "--format",
+                    "mq6",
+                    "--uniform",
+                    "--mq4v2-symmetric",
+                    "--moe-expert-down",
+                    "mq4g128v2-symmetric",
+                ],
+                "--format mq4",
+            ),
+            (with(&["--reap-bake", "p"]), "REAP"),
+            (with(&["--reap-overlay", "p"]), "safetensors quantize path"),
+            (with(&["--awq"]), "AWQ"),
+            (with(&["--awq-alpha", "0.5"]), "AWQ"),
+            (with(&["--imatrix", "x"]), "--imatrix"),
+            (with(&["--hessian-dir", "d"]), "--hessian-dir"),
+        ];
+        for (argv, needle) in &cases {
+            let error = check(argv, &[]).unwrap_err();
+            assert!(error.contains(needle), "{argv:?}: {error}");
+        }
+        for var in [
+            "HIPFIRE_MOE_DOWN_MQ6",
+            "HIPFIRE_MOE_EXPERTS_MQ6",
+            "HIPFIRE_MOE_DOWN_MQ5",
+            "HIPFIRE_MOE_EXPERTS_MQ5",
+            "HIPFIRE_MOE_GRADED",
+            "HIPFIRE_ROUTED_GL",
+        ] {
+            let error = check(&GOOD, &[(var, "1")]).unwrap_err();
+            assert!(error.contains(var), "{var}: {error}");
+        }
+        let error = check(&GOOD, &[("HIPFIRE_MOE_TIER_MAP", "/tmp/map")]).unwrap_err();
+        assert!(error.contains("HIPFIRE_MOE_TIER_MAP"), "{error}");
+        // Any non-Main route (qwen4-flash-next, GGUF, ...) is refused.
+        let args = parse(&GOOD);
+        for route in [
+            crate::cli::Route::Qwen4,
+            crate::cli::Route::Gguf,
+            crate::cli::Route::ReapOverlay,
+        ] {
+            let error = check_moe_expert_down(&args, route, true, &|_| None).unwrap_err();
+            assert!(
+                error.contains("safetensors quantize path"),
+                "{route:?}: {error}"
+            );
+        }
     }
 }
 

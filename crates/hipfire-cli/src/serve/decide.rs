@@ -12,8 +12,10 @@ use hyper::{header, Response};
 use std::sync::Arc;
 
 fn is_local_model(runtime: &super::ServeRuntime, model: &str) -> bool {
-    crate::registry_entry_for_path(&runtime.paths, &runtime.registry, model).is_some()
-        || crate::find_model_path(&runtime.paths, &runtime.registry, model).is_some()
+    !matches!(
+        crate::model_card(&runtime.paths, &runtime.registry, model),
+        crate::ModelCard::Unregistered
+    ) || crate::find_local_model_path(&runtime.paths, &runtime.registry, model).is_some()
 }
 
 /// The daemon's message for a `messages` that is not a non-empty array of

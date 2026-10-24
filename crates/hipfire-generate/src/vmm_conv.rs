@@ -82,8 +82,17 @@ impl Reuse {
 
 /// `ar.rs` `generate`'s prompt-cache decision for `rendered` against a prior
 /// conversation and its checkpoints (single GPU, no eviction, qwen35).
-pub fn plan_reuse(prior: &[u32], checkpoints: &[(usize, DeltaNetSnapshot)], rendered: &[u32]) -> Reuse {
-    plan_reuse_at(prior, checkpoints.iter().map(|(p, _)| *p), rendered, ckpt_resume_enabled())
+pub fn plan_reuse(
+    prior: &[u32],
+    checkpoints: &[(usize, DeltaNetSnapshot)],
+    rendered: &[u32],
+) -> Reuse {
+    plan_reuse_at(
+        prior,
+        checkpoints.iter().map(|(p, _)| *p),
+        rendered,
+        ckpt_resume_enabled(),
+    )
 }
 
 /// [`plan_reuse`] over checkpoint positions (ascending, as the ring keeps
@@ -96,7 +105,11 @@ fn plan_reuse_at<I>(prior: &[u32], positions: I, rendered: &[u32], resume_enable
 where
     I: DoubleEndedIterator<Item = usize> + ExactSizeIterator,
 {
-    let lcp = prior.iter().zip(rendered).take_while(|(a, b)| a == b).count();
+    let lcp = prior
+        .iter()
+        .zip(rendered)
+        .take_while(|(a, b)| a == b)
+        .count();
     if lcp < prior.len() || lcp == rendered.len() {
         if !resume_enabled {
             return Reuse::Cold;
@@ -124,7 +137,12 @@ fn best_entry(pool: &[VmmPrefixEntry], rendered: &[u32]) -> Option<(usize, Reuse
 }
 
 /// Snapshot `dn` into `checkpoints` at the singleton's cadence.
-pub fn checkpoint(checkpoints: &mut Checkpoints, dn: &DeltaNetState, gpu: &mut rdna_compute::Gpu, pos: usize) {
+pub fn checkpoint(
+    checkpoints: &mut Checkpoints,
+    dn: &DeltaNetState,
+    gpu: &mut rdna_compute::Gpu,
+    pos: usize,
+) {
     if ckpt_resume_enabled() {
         speculative::take_dn_checkpoint(checkpoints, dn, gpu, pos, ckpt_interval(), ckpt_max());
     }
@@ -157,8 +175,14 @@ pub fn pool_enabled(m: &LoadedModel) -> bool {
         && m.pp <= 1
         && m.ep.is_none()
         && m.chat_template.is_some()
-        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
-        && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() != Some("0")
+        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0")
+        && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+            .ok()
+            .as_deref()
+            != Some("0")
         && store(m).is_some_and(|s| s.spec_engine().is_none())
 }
 
@@ -228,15 +252,21 @@ pub fn retain(
 /// The client decided the attempt whose finished conversation was kept:
 /// commit makes it reusable, abort drops it (the singleton rolls back an
 /// aborted turn's conversation).
-pub fn settle(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, id: &str, attempt_id: u64, commit: bool) {
+pub fn settle(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    id: &str,
+    attempt_id: u64,
+    commit: bool,
+) {
     let Some(store) = bundle_mut(&mut m.state).and_then(|b| b.vmm_store.as_mut()) else {
         return;
     };
-    let Some(i) = store
-        .prefix_pool
-        .iter()
-        .position(|e| e.pending.as_ref().is_some_and(|(pid, a)| pid == id && *a == attempt_id))
-    else {
+    let Some(i) = store.prefix_pool.iter().position(|e| {
+        e.pending
+            .as_ref()
+            .is_some_and(|(pid, a)| pid == id && *a == attempt_id)
+    }) else {
         return;
     };
     if commit {
@@ -261,7 +291,11 @@ pub fn clear(state: &mut Option<Box<dyn ArchModel>>, gpu: &mut rdna_compute::Gpu
 
 /// Copy `src`'s DeltaNet state into `dst` (common buffer extent: same
 /// shapes, allocations may be pool-rounded differently). Synchronizes.
-fn copy_dn(gpu: &mut rdna_compute::Gpu, dst: &DeltaNetState, src: &DeltaNetState) -> Result<(), String> {
+fn copy_dn(
+    gpu: &mut rdna_compute::Gpu,
+    dst: &DeltaNetState,
+    src: &DeltaNetState,
+) -> Result<(), String> {
     if dst.s_matrices.len() != src.s_matrices.len()
         || dst.s_scales.len() != src.s_scales.len()
         || dst.conv_states.len() != src.conv_states.len()
@@ -299,7 +333,15 @@ pub fn alloc_owner(
     init: impl Fn() -> VmmRequestInit,
 ) -> Result<Qwen35RequestState, String> {
     loop {
-        match Qwen35RequestState::new_like(gpu, &b.config, &b.kv_cache, &b.dn_state, epoch, slot, init()) {
+        match Qwen35RequestState::new_like(
+            gpu,
+            &b.config,
+            &b.kv_cache,
+            &b.dn_state,
+            epoch,
+            slot,
+            init(),
+        ) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 let evicted = b.vmm_store.as_mut().is_some_and(|s| evict_one(s, gpu));
@@ -395,7 +437,14 @@ pub fn park_resident(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
     let Some(b) = bundle_mut(state) else {
         return;
     };
-    if let Err(e) = park_bundle(gpu, b, seq_pos, conversation_tokens, prefill_checkpoints, dflash_checkpoints) {
+    if let Err(e) = park_bundle(
+        gpu,
+        b,
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+    ) {
         eprintln!("[vmm-prefix] park resident: {e}");
     }
 }
@@ -431,7 +480,14 @@ pub fn singleton_adopt(
         return;
     }
     let entry = store.prefix_pool.remove(idx);
-    if let Err(e) = park_bundle(gpu, b, seq_pos, conversation, checkpoints, dflash_checkpoints) {
+    if let Err(e) = park_bundle(
+        gpu,
+        b,
+        seq_pos,
+        conversation,
+        checkpoints,
+        dflash_checkpoints,
+    ) {
         // The resident stays (and stays resident); the entry goes back.
         eprintln!("[vmm-prefix] singleton adopt: {e}");
         if let Some(store) = b.vmm_store.as_mut() {
@@ -476,10 +532,9 @@ pub fn lane_owner(
     slot: usize,
     init: impl Fn() -> VmmRequestInit,
 ) -> Result<(Qwen35RequestState, Checkpoints, usize), String> {
-    let reused = b
-        .vmm_store
-        .as_mut()
-        .and_then(|store| best_entry(&store.prefix_pool, rendered).map(|(i, r)| (store.prefix_pool.remove(i), r)));
+    let reused = b.vmm_store.as_mut().and_then(|store| {
+        best_entry(&store.prefix_pool, rendered).map(|(i, r)| (store.prefix_pool.remove(i), r))
+    });
     if let Some((entry, reuse)) = reused {
         let VmmPrefixEntry {
             state: mut st,
@@ -605,7 +660,10 @@ impl ThinkCtl {
         if self.force_answer_latched && self.latch_gen_mark.is_none() {
             self.latch_gen_mark = Some(generated);
         }
-        if self.max_total_think > 0 && in_think && self.total_think_tokens >= self.max_total_think + 256 {
+        if self.max_total_think > 0
+            && in_think
+            && self.total_think_tokens >= self.max_total_think + 256
+        {
             eprintln!(
                 "[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS",
                 id, self.total_think_tokens, self.max_total_think
@@ -648,7 +706,10 @@ impl ThinkCtl {
                     id, self.max_think_tokens
                 );
             } else if force_answer_now {
-                eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                eprintln!(
+                    "[force-answer] id={} — closing <think> mid-turn to commit to the answer",
+                    id
+                );
             }
             self.think_count = 0;
             self.prev_in_think = false;

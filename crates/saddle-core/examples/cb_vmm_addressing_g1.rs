@@ -34,7 +34,10 @@ const LEN_C: usize = 517;
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
     fn vec(&mut self, n: usize) -> Vec<f32> {
@@ -105,7 +108,10 @@ fn legacy_write(
     row: usize,
 ) -> HipResult<Legacy> {
     let kv_dim = N_KV * HD;
-    let mut out = Legacy { k: vec![], v: vec![] };
+    let mut out = Legacy {
+        k: vec![],
+        v: vec![],
+    };
     let pos: Vec<i32> = rows.clone().map(|p| p as i32).collect();
     let pos_t = up_i32(gpu, &pos)?;
     for (l, &is_kv) in LAYERS.iter().enumerate() {
@@ -117,9 +123,14 @@ fn legacy_write(
         let mut sides = vec![];
         for src in [&data.k[l], &data.v[l]] {
             let dst = gpu.zeros(&[MAX_SEQ * row / 4], DType::F32)?;
-            let s = gpu.upload_f32(&src[rows.start * kv_dim..rows.end * kv_dim], &[pos.len() * kv_dim])?;
+            let s = gpu.upload_f32(
+                &src[rows.start * kv_dim..rows.end * kv_dim],
+                &[pos.len() * kv_dim],
+            )?;
             match fmt {
-                VmmKvFormat::Q8 => gpu.kv_cache_write_q8_0_batched(&dst, &s, &pos_t, N_KV, HD, pos.len())?,
+                VmmKvFormat::Q8 => {
+                    gpu.kv_cache_write_q8_0_batched(&dst, &s, &pos_t, N_KV, HD, pos.len())?
+                }
                 VmmKvFormat::Fp8E4M3 => {
                     gpu.kv_cache_write_fp8_e4m3_batched(&dst, &s, &pos_t, N_KV, HD, pos.len())?
                 }
@@ -161,11 +172,25 @@ fn vmm_write(
         for side in [VmmKvSide::K, VmmKvSide::V] {
             let mut src = Vec::with_capacity(rows.len() * kv_dim);
             for &(_, p, data) in rows {
-                let s = if side == VmmKvSide::K { &data.k[l] } else { &data.v[l] };
+                let s = if side == VmmKvSide::K {
+                    &data.k[l]
+                } else {
+                    &data.v[l]
+                };
                 src.extend_from_slice(&s[p * kv_dim..(p + 1) * kv_dim]);
             }
             let s_t = gpu.upload_f32(&src, &[src.len()])?;
-            gpu.kv_cache_write_batched_vmm(fmt, side, &s_t, &pos_t, N_KV, HD, rows.len(), &d_t, &slot_t)?;
+            gpu.kv_cache_write_batched_vmm(
+                fmt,
+                side,
+                &s_t,
+                &pos_t,
+                N_KV,
+                HD,
+                rows.len(),
+                &d_t,
+                &slot_t,
+            )?;
             gpu.free_tensor(s_t)?;
         }
         gpu.free_tensor(d_t)?;
@@ -187,7 +212,13 @@ fn legacy_prefix(gpu: &Gpu, t: &GpuTensor, len: usize, row: usize) -> HipResult<
     Ok(out)
 }
 
-fn kv_bytes_equal(gpu: &Gpu, owner: &KvCache, legacy: &Legacy, len: usize, row: usize) -> HipResult<bool> {
+fn kv_bytes_equal(
+    gpu: &Gpu,
+    owner: &KvCache,
+    legacy: &Legacy,
+    len: usize,
+    row: usize,
+) -> HipResult<bool> {
     for (l, &is_kv) in LAYERS.iter().enumerate() {
         if !is_kv {
             continue;
@@ -217,13 +248,39 @@ fn legacy_attn(
     let q_t = gpu.upload_f32(q, &[q.len()])?;
     let o_t = gpu.zeros(&[q.len()], DType::F32)?;
     let p_t = up_i32(gpu, pos)?;
-    let (k, v) = (legacy.k[layer].as_ref().unwrap(), legacy.v[layer].as_ref().unwrap());
+    let (k, v) = (
+        legacy.k[layer].as_ref().unwrap(),
+        legacy.v[layer].as_ref().unwrap(),
+    );
     match fmt {
         VmmKvFormat::Q8 => gpu.attention_q8_0_kv_batched(
-            &q_t, k, v, &o_t, &p_t, N_HEADS, N_KV, HD, MAX_SEQ, max_ctx, pos.len(),
+            &q_t,
+            k,
+            v,
+            &o_t,
+            &p_t,
+            N_HEADS,
+            N_KV,
+            HD,
+            MAX_SEQ,
+            max_ctx,
+            pos.len(),
         )?,
         VmmKvFormat::Fp8E4M3 => gpu.attention_fp8_e4m3_kv_batched(
-            &q_t, k, v, &o_t, &p_t, N_HEADS, N_KV, HD, MAX_SEQ, max_ctx, pos.len(), None, 0, 0,
+            &q_t,
+            k,
+            v,
+            &o_t,
+            &p_t,
+            N_HEADS,
+            N_KV,
+            HD,
+            MAX_SEQ,
+            max_ctx,
+            pos.len(),
+            None,
+            0,
+            0,
         )?,
     }
     gpu.hip.device_synchronize()?;
@@ -251,7 +308,19 @@ fn vmm_attn(
     let p_t = up_i32(gpu, pos)?;
     let s_t = up_i32(gpu, slot)?;
     let d_t = gpu.upload_raw(VmmKvSlotDesc::as_bytes(descs), &[descs.len() * 32])?;
-    gpu.attention_kv_batched_vmm(fmt, &q_t, &o_t, &p_t, N_HEADS, N_KV, HD, max_ctx, pos.len(), &d_t, &s_t)?;
+    gpu.attention_kv_batched_vmm(
+        fmt,
+        &q_t,
+        &o_t,
+        &p_t,
+        N_HEADS,
+        N_KV,
+        HD,
+        max_ctx,
+        pos.len(),
+        &d_t,
+        &s_t,
+    )?;
     gpu.hip.device_synchronize()?;
     let out = gpu.download_f32(&o_t)?;
     for t in [q_t, o_t, p_t, s_t, d_t] {
@@ -283,13 +352,21 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     // ---- capacity refusal per admission --------------------------------
     let before = a.mapped_token_capacity()?.unwrap_or(0);
     let over_bound = a.provision_vmm_positions(gpu, MAX_SEQ + 1, budget);
-    check(over_bound.is_err(), "refuse positions > logical bound (no silent max_seq reduction)", fails);
+    check(
+        over_bound.is_err(),
+        "refuse positions > logical bound (no silent max_seq reduction)",
+        fails,
+    );
     if let Err(e) = &over_bound {
         println!("    refusal: {e}");
     }
     let need = a.vmm_admission_bytes(gpu, LEN_A)?;
     let over_budget = a.provision_vmm_positions(gpu, LEN_A, need - 1);
-    check(over_budget.is_err(), "refuse admission over physical budget", fails);
+    check(
+        over_budget.is_err(),
+        "refuse admission over physical budget",
+        fails,
+    );
     if let Err(e) = &over_budget {
         println!("    refusal: {e}");
     }
@@ -331,7 +408,11 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     let stable = LAYERS.iter().enumerate().all(|(l, _)| {
         descs_a[l].k_base == descs_a0[l].k_base && descs_a[l].v_base == descs_a0[l].v_base
     });
-    check(stable && grown > 0, &format!("A grew by {grown} B at a stable VA"), fails);
+    check(
+        stable && grown > 0,
+        &format!("A grew by {grown} B at a stable VA"),
+        fails,
+    );
     check(
         descs_a[1].mapped_positions as usize >= LEN_A + 8 && gen(&descs_a) == gens[0],
         "A mapped prefix covers LEN_A+8, owner generation unchanged",
@@ -352,7 +433,10 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     }
     check(
         descs_a.iter().zip(&descs_b).enumerate().all(|(l, (x, y))| {
-            !LAYERS[l] || (x.k_base != y.k_base && x.v_base != y.v_base && x.owner_generation != y.owner_generation)
+            !LAYERS[l]
+                || (x.k_base != y.k_base
+                    && x.v_base != y.v_base
+                    && x.owner_generation != y.owner_generation)
         }),
         "A and B own distinct VAs and generations",
         fails,
@@ -362,13 +446,27 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     let leg_a = legacy_write(gpu, fmt, &data_a, 0..LEN_A, row)?;
     let leg_b = legacy_write(gpu, fmt, &data_b, 0..LEN_B, row)?;
     gpu.hip.device_synchronize()?;
-    check(kv_bytes_equal(gpu, &a, &leg_a, LEN_A, row)?, "A KV bytes == isolated legacy", fails);
-    check(kv_bytes_equal(gpu, &b, &leg_b, LEN_B, row)?, "B KV bytes == isolated legacy", fails);
+    check(
+        kv_bytes_equal(gpu, &a, &leg_a, LEN_A, row)?,
+        "A KV bytes == isolated legacy",
+        fails,
+    );
+    check(
+        kv_bytes_equal(gpu, &b, &leg_b, LEN_B, row)?,
+        "B KV bytes == isolated legacy",
+        fails,
+    );
 
     // ---- mixed attention: decode + forced verify rows + boundary rows ---
     let pos_a: Vec<i32> = vec![
-        (LEN_A - 5) as i32, (LEN_A - 4) as i32, (LEN_A - 3) as i32, (LEN_A - 2) as i32,
-        (LEN_A - 1) as i32, (m1 - 1) as i32, m1 as i32, 0,
+        (LEN_A - 5) as i32,
+        (LEN_A - 4) as i32,
+        (LEN_A - 3) as i32,
+        (LEN_A - 2) as i32,
+        (LEN_A - 1) as i32,
+        (m1 - 1) as i32,
+        m1 as i32,
+        0,
     ];
     let pos_b: Vec<i32> = vec![(LEN_B - 1) as i32, 0, 17];
     let mut qr = Lcg(0x5EED);
@@ -390,7 +488,11 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
         }
     }
     let max_ctx = LEN_A + 8;
-    let mut attn_check = |gpu: &mut Gpu, label: &str, descs_a: &[VmmKvSlotDesc], fails: &mut Vec<String>| -> HipResult<()> {
+    let mut attn_check = |gpu: &mut Gpu,
+                          label: &str,
+                          descs_a: &[VmmKvSlotDesc],
+                          fails: &mut Vec<String>|
+     -> HipResult<()> {
         for (l, &is_kv) in LAYERS.iter().enumerate() {
             if !is_kv {
                 continue;
@@ -400,7 +502,11 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
             let descs = vec![descs_a[l], descs_b[l]];
             let (mut q, mut pos, mut slot, mut rg) = (vec![], vec![], vec![], vec![]);
             for &(s, i) in &order {
-                let (qq, pp) = if s == 0 { (&q_a, &pos_a) } else { (&q_b, &pos_b) };
+                let (qq, pp) = if s == 0 {
+                    (&q_a, &pos_a)
+                } else {
+                    (&q_b, &pos_b)
+                };
                 q.extend_from_slice(&qq[i * qd..(i + 1) * qd]);
                 pos.push(pp[i]);
                 slot.push(s as i32);
@@ -412,7 +518,11 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
                 let want = if s == 0 { &ref_a } else { &ref_b };
                 ok &= bits_equal(&got[r * qd..(r + 1) * qd], &want[i * qd..(i + 1) * qd]);
             }
-            check(ok, &format!("{label}: layer {l} mixed VMM attention bitwise == isolated legacy"), fails);
+            check(
+                ok,
+                &format!("{label}: layer {l} mixed VMM attention bitwise == isolated legacy"),
+                fails,
+            );
         }
         Ok(())
     };
@@ -420,8 +530,16 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
 
     // ---- poisoned rejected tail (rows past every live query) ------------
     let poison = ReqData {
-        k: data_a.k.iter().map(|v| v.iter().map(|x| x * 1.0e3 + 7.0).collect()).collect(),
-        v: data_a.v.iter().map(|v| v.iter().map(|x| -x * 1.0e3).collect()).collect(),
+        k: data_a
+            .k
+            .iter()
+            .map(|v| v.iter().map(|x| x * 1.0e3 + 7.0).collect())
+            .collect(),
+        v: data_a
+            .v
+            .iter()
+            .map(|v| v.iter().map(|x| -x * 1.0e3).collect())
+            .collect(),
     };
     let rows: Vec<(usize, usize, &ReqData)> = (LEN_A..LEN_A + 8).map(|p| (0, p, &poison)).collect();
     vmm_write(gpu, fmt, &[descs_a.clone(), descs_b.clone()], &rows, &gens)?;
@@ -433,15 +551,36 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     let wrong_epoch = validate_vmm_rows(&d1, &[0], &[5], &[gens[0] + 1000]);
     check(wrong_epoch.is_err(), "wrong-epoch row rejected", fails);
     let wrong_row = validate_vmm_rows(&d1, &[1], &[5], &[gens[0]]);
-    check(wrong_row.is_err(), "wrong-row (A row pointed at B slot) rejected", fails);
+    check(
+        wrong_row.is_err(),
+        "wrong-row (A row pointed at B slot) rejected",
+        fails,
+    );
     let past = validate_vmm_rows(&d1, &[1], &[descs_b[1].mapped_positions as i32], &[gens[1]]);
-    check(past.is_err(), "position == mapped_positions rejected", fails);
+    check(
+        past.is_err(),
+        "position == mapped_positions rejected",
+        fails,
+    );
     let oob_slot = validate_vmm_rows(&d1, &[2], &[0], &[gens[0]]);
     check(oob_slot.is_err(), "slot index out of range rejected", fails);
     let masked = validate_vmm_rows(&[VmmKvSlotDesc::MASKED], &[0], &[0], &[0]);
     check(masked.is_err(), "masked/idle slot rejected", fails);
-    let masked_layer = vmm_attn(gpu, fmt, &[descs_a[0], descs_b[0]], &q_a[..qd], &[0], &[0], &[gens[0]], 8);
-    check(masked_layer.is_err(), "non-KV layer descriptor refused before launch", fails);
+    let masked_layer = vmm_attn(
+        gpu,
+        fmt,
+        &[descs_a[0], descs_b[0]],
+        &q_a[..qd],
+        &[0],
+        &[0],
+        &[gens[0]],
+        8,
+    );
+    check(
+        masked_layer.is_err(),
+        "non-KV layer descriptor refused before launch",
+        fails,
+    );
 
     // ---- abort A, reuse slot 0 with a new owner C -----------------------
     gpu.hip.device_synchronize()?;
@@ -453,21 +592,43 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
     let mut c = new_owner(gpu, mode)?;
     c.provision_vmm_positions(gpu, LEN_C, budget)?;
     let descs_c = c.vmm_slot_descs(gpu)?;
-    check(gen(&descs_c) != gens[0], "reused slot gets a new owner generation", fails);
+    check(
+        gen(&descs_c) != gens[0],
+        "reused slot gets a new owner generation",
+        fails,
+    );
     let stale = validate_vmm_rows(&[descs_c[1], descs_b[1]], &[0], &[3], &[gens[0]]);
-    check(stale.is_err(), "stale A epoch rejected against reused slot C", fails);
+    check(
+        stale.is_err(),
+        "stale A epoch rejected against reused slot C",
+        fails,
+    );
     let data_c = req_data(0xC, LEN_C);
     let gens_c = vec![gen(&descs_c), gens[1]];
     // C prefill rows mixed with one B decode-row rewrite of B's last position
     // (same data, so B's bytes must still equal its isolated reference).
     let mut rows: Vec<(usize, usize, &ReqData)> = (0..LEN_C).map(|p| (0, p, &data_c)).collect();
     rows.push((1, LEN_B - 1, &data_b));
-    vmm_write(gpu, fmt, &[descs_c.clone(), descs_b.clone()], &rows, &gens_c)?;
+    vmm_write(
+        gpu,
+        fmt,
+        &[descs_c.clone(), descs_b.clone()],
+        &rows,
+        &gens_c,
+    )?;
     gpu.hip.device_synchronize()?;
     let leg_c = legacy_write(gpu, fmt, &data_c, 0..LEN_C, row)?;
     gpu.hip.device_synchronize()?;
-    check(kv_bytes_equal(gpu, &c, &leg_c, LEN_C, row)?, "C (reused slot) KV bytes == isolated legacy", fails);
-    check(kv_bytes_equal(gpu, &b, &leg_b, LEN_B, row)?, "B unaffected by abort/reuse (no bleed)", fails);
+    check(
+        kv_bytes_equal(gpu, &c, &leg_c, LEN_C, row)?,
+        "C (reused slot) KV bytes == isolated legacy",
+        fails,
+    );
+    check(
+        kv_bytes_equal(gpu, &b, &leg_b, LEN_B, row)?,
+        "B unaffected by abort/reuse (no bleed)",
+        fails,
+    );
     for (l, &is_kv) in LAYERS.iter().enumerate() {
         if !is_kv {
             continue;
@@ -475,8 +636,21 @@ fn run(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<()> {
         let pos_c = vec![(LEN_C - 1) as i32, 100];
         let q_c = qr.vec(pos_c.len() * qd);
         let want = legacy_attn(gpu, fmt, &leg_c, l, &q_c, &pos_c, LEN_C)?;
-        let got = vmm_attn(gpu, fmt, &[descs_c[l], descs_b[l]], &q_c, &pos_c, &[0, 0], &[gens_c[0]; 2], LEN_C)?;
-        check(bits_equal(&got, &want), &format!("C layer {l} VMM attention == isolated legacy"), fails);
+        let got = vmm_attn(
+            gpu,
+            fmt,
+            &[descs_c[l], descs_b[l]],
+            &q_c,
+            &pos_c,
+            &[0, 0],
+            &[gens_c[0]; 2],
+            LEN_C,
+        )?;
+        check(
+            bits_equal(&got, &want),
+            &format!("C layer {l} VMM attention == isolated legacy"),
+            fails,
+        );
     }
 
     free_legacy(gpu, leg_b)?;
@@ -520,11 +694,16 @@ fn long_fill(
         validate_vmm_rows(descs, &slots, &pos, &vec![gens[slot]; n]).map_err(err)?;
         let p_t = up_i32(gpu, &pos)?;
         let s_t = up_i32(gpu, &slots)?;
-        for (side, pool, dst) in [(VmmKvSide::K, &pool_k, &legacy.0), (VmmKvSide::V, &pool_v, &legacy.1)] {
+        for (side, pool, dst) in [
+            (VmmKvSide::K, &pool_k, &legacy.0),
+            (VmmKvSide::V, &pool_v, &legacy.1),
+        ] {
             gpu.kv_cache_write_batched_vmm(fmt, side, pool, &p_t, N_KV, HD, n, &d_t, &s_t)?;
             match fmt {
                 VmmKvFormat::Q8 => gpu.kv_cache_write_q8_0_batched(dst, pool, &p_t, N_KV, HD, n)?,
-                VmmKvFormat::Fp8E4M3 => gpu.kv_cache_write_fp8_e4m3_batched(dst, pool, &p_t, N_KV, HD, n)?,
+                VmmKvFormat::Fp8E4M3 => {
+                    gpu.kv_cache_write_fp8_e4m3_batched(dst, pool, &p_t, N_KV, HD, n)?
+                }
             }
         }
         gpu.free_tensor(p_t)?;
@@ -557,8 +736,8 @@ fn singleton_decode(
             &q_t, &legacy.0, &legacy.1, &o_t, &p_t.buf, hint, N_HEADS, N_KV, HD, LONG_MAX, &part,
         )?,
         VmmKvFormat::Fp8E4M3 => gpu.attention_flash_fp8_e4m3_tile(
-            &q_t, &legacy.0, &legacy.1, &o_t, &p_t.buf, hint, N_HEADS, N_KV, HD, LONG_MAX, &part, None,
-            None,
+            &q_t, &legacy.0, &legacy.1, &o_t, &p_t.buf, hint, N_HEADS, N_KV, HD, LONG_MAX, &part,
+            None, None,
         )?,
     }
     gpu.hip.device_synchronize()?;
@@ -589,7 +768,19 @@ fn vmm_flash(
     let s_t = up_i32(gpu, &slot)?;
     let d_t = gpu.upload_raw(VmmKvSlotDesc::as_bytes(descs), &[descs.len() * 32])?;
     let part = gpu.zeros(&[rows.len() * plan.partial_floats_per_row], DType::F32)?;
-    gpu.attention_flash_decode_vmm(&plan, &q_t, &o_t, &p_t, N_HEADS, N_KV, HD, rows.len(), &part, &d_t, &s_t)?;
+    gpu.attention_flash_decode_vmm(
+        &plan,
+        &q_t,
+        &o_t,
+        &p_t,
+        N_HEADS,
+        N_KV,
+        HD,
+        rows.len(),
+        &part,
+        &d_t,
+        &s_t,
+    )?;
     gpu.hip.device_synchronize()?;
     let out = gpu.download_f32(&o_t)?;
     for t in [q_t, o_t, p_t, s_t, d_t, part] {
@@ -627,22 +818,52 @@ fn run_long(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<(
         let k = gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?;
         let v = gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?;
         legacy.push((k, v));
-        long_fill(gpu, fmt, &descs, &gens, i, 0..len, 0x100 + i as u64, &legacy[i])?;
+        long_fill(
+            gpu,
+            fmt,
+            &descs,
+            &gens,
+            i,
+            0..len,
+            0x100 + i as u64,
+            &legacy[i],
+        )?;
     }
     gpu.hip.device_synchronize()?;
     for (i, &len) in LONG_LENS.iter().enumerate() {
         let o = &owners[i];
-        let same = vmm_prefix(gpu, &o.k_gpu[LONG_LAYER], len, row)? == legacy_prefix(gpu, &legacy[i].0, len, row)?
-            && vmm_prefix(gpu, &o.v_gpu[LONG_LAYER], len, row)? == legacy_prefix(gpu, &legacy[i].1, len, row)?;
-        check(same, &format!("long req{i} ({len}) KV bytes == isolated legacy"), fails);
+        let same = vmm_prefix(gpu, &o.k_gpu[LONG_LAYER], len, row)?
+            == legacy_prefix(gpu, &legacy[i].0, len, row)?
+            && vmm_prefix(gpu, &o.v_gpu[LONG_LAYER], len, row)?
+                == legacy_prefix(gpu, &legacy[i].1, len, row)?;
+        check(
+            same,
+            &format!("long req{i} ({len}) KV bytes == isolated legacy"),
+            fails,
+        );
     }
 
     // Mixed rows: decode tips, tile-boundary rows, position 0, and a forced
     // 4-row verify run on the ~100K request; interleaved across requests.
-    let (x, y, z) = (LONG_LENS[0] as i32, LONG_LENS[1] as i32, LONG_LENS[2] as i32);
+    let (x, y, z) = (
+        LONG_LENS[0] as i32,
+        LONG_LENS[1] as i32,
+        LONG_LENS[2] as i32,
+    );
     let rows: Vec<(usize, i32)> = vec![
-        (2, z - 4), (0, x - 1), (1, y - 1), (2, z - 3), (0, 4095), (2, z - 2), (1, 0),
-        (0, 4096), (2, z - 1), (2, 65_535), (1, 16_383), (2, 65_536), (1, 16_384),
+        (2, z - 4),
+        (0, x - 1),
+        (1, y - 1),
+        (2, z - 3),
+        (0, 4095),
+        (2, z - 2),
+        (1, 0),
+        (0, 4096),
+        (2, z - 1),
+        (2, 65_535),
+        (1, 16_383),
+        (2, 65_536),
+        (1, 16_384),
     ];
     let qd = N_HEADS * HD;
     let mut qr = Lcg(0xF1A5);
@@ -650,7 +871,13 @@ fn run_long(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<(
     let row_gen: Vec<u64> = rows.iter().map(|r| gens[r.0]).collect();
     let mut want = vec![];
     for (r, &(s, p)) in rows.iter().enumerate() {
-        want.extend(singleton_decode(gpu, fmt, &legacy[s], &q[r * qd..(r + 1) * qd], p)?);
+        want.extend(singleton_decode(
+            gpu,
+            fmt,
+            &legacy[s],
+            &q[r * qd..(r + 1) * qd],
+            p,
+        )?);
     }
     let compare = |got: &[f32], label: &str, fails: &mut Vec<String>| {
         let mut all = true;
@@ -661,15 +888,34 @@ fn run_long(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<(
             }
             all &= ok;
         }
-        check(all, &format!("{label}: {} mixed rows bitwise == isolated singleton flash decode", rows.len()), fails);
+        check(
+            all,
+            &format!(
+                "{label}: {} mixed rows bitwise == isolated singleton flash decode",
+                rows.len()
+            ),
+            fails,
+        );
     };
     let got = vmm_flash(gpu, fmt, &descs, &rows, &row_gen, &q)?;
     compare(&got, "long mixed", fails);
 
     // Poisoned rejected tail past every live query of each request.
     for (i, &len) in LONG_LENS.iter().enumerate() {
-        let scratch = (gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?, gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?);
-        long_fill(gpu, fmt, &descs, &gens, i, len..len + tail, 0xBAD + i as u64, &scratch)?;
+        let scratch = (
+            gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?,
+            gpu.zeros(&[LONG_MAX * row / 4], DType::F32)?,
+        );
+        long_fill(
+            gpu,
+            fmt,
+            &descs,
+            &gens,
+            i,
+            len..len + tail,
+            0xBAD + i as u64,
+            &scratch,
+        )?;
         gpu.free_tensor(scratch.0)?;
         gpu.free_tensor(scratch.1)?;
     }
@@ -680,7 +926,11 @@ fn run_long(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<(
     // Negative controls on the flash path (refused before any launch).
     let mut bad = row_gen.clone();
     bad[0] = gens[0];
-    check(vmm_flash(gpu, fmt, &descs, &rows, &bad, &q).is_err(), "long wrong-row/epoch row refused", fails);
+    check(
+        vmm_flash(gpu, fmt, &descs, &rows, &bad, &q).is_err(),
+        "long wrong-row/epoch row refused",
+        fails,
+    );
     let past = [(2usize, descs[2].mapped_positions as i32)];
     check(
         vmm_flash(gpu, fmt, &descs, &past, &[gens[2]], &q[..qd]).is_err(),
@@ -688,7 +938,11 @@ fn run_long(gpu: &mut Gpu, mode: KvMode, fails: &mut Vec<String>) -> HipResult<(
         fails,
     );
     let over = gpu.vmm_flash_decode_plan(fmt, N_HEADS, N_KV, HD, LONG_MAX, LONG_MAX + 1);
-    check(over.is_err(), "flash plan refuses max_ctx > model max_seq", fails);
+    check(
+        over.is_err(),
+        "flash plan refuses max_ctx > model max_seq",
+        fails,
+    );
 
     for (k, v) in legacy {
         gpu.free_tensor(k)?;

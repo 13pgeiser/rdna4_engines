@@ -102,7 +102,10 @@ impl Gpu {
             return Ok(());
         }
         if elements % 8 != 0 {
-            return Err(HipError::new(0, "grouped F16 gather needs a multiple of 8 elements"));
+            return Err(HipError::new(
+                0,
+                "grouped F16 gather needs a multiple of 8 elements",
+            ));
         }
         let total_i = checked_i32(elements, "grouped gather elements")?;
         self.bind_thread()?;
@@ -741,7 +744,8 @@ impl Gpu {
         let channels = checked_product(groups, group_size, "fused PLE channels")?;
         let elements = checked_product(tokens, channels, "fused PLE elements")?;
         let rows = checked_product(tokens, groups, "fused PLE rows")?;
-        let history_rows = checked_product(kernel_size.saturating_sub(1), dilation, "fused PLE history")?;
+        let history_rows =
+            checked_product(kernel_size.saturating_sub(1), dilation, "fused PLE history")?;
         require_dtype(key, DType::F32, "fused PLE key projection")?;
         require_dtype(value, DType::F32, "fused PLE value projection")?;
         require_dtype(scalars, DType::F32, "fused PLE scalars")?;
@@ -751,12 +755,20 @@ impl Gpu {
         require_dtype(conv_norm, DType::BF16, "fused PLE convolution norm")?;
         require_dtype(conv_weight, DType::BF16, "fused PLE convolution weight")?;
         require_numel(key, elements, "fused PLE key projection")?;
-        require_numel(value, checked_product(tokens, group_size, "fused PLE value")?, "fused PLE value projection")?;
+        require_numel(
+            value,
+            checked_product(tokens, group_size, "fused PLE value")?,
+            "fused PLE value projection",
+        )?;
         // The streams tensor is F32-typed storage holding `elements` BF16 halves.
         if streams.numel() * 2 < elements {
             return Err(HipError::new(0, "fused PLE streams too small"));
         }
-        require_numel(scalars, checked_product(rows, 2, "fused PLE scalars")?, "fused PLE scalars")?;
+        require_numel(
+            scalars,
+            checked_product(rows, 2, "fused PLE scalars")?,
+            "fused PLE scalars",
+        )?;
         require_numel(key_norm, channels, "fused PLE key norm")?;
         require_numel(query_norm, channels, "fused PLE query norm")?;
         require_numel(conv_norm, channels, "fused PLE convolution norm")?;
@@ -770,7 +782,13 @@ impl Gpu {
             checked_product(history_rows, channels, "fused PLE state")?,
             "fused PLE convolution state",
         )?;
-        if tokens == 0 || groups == 0 || groups > 4 || group_size % 32 != 0 || kernel_size == 0 || dilation == 0 {
+        if tokens == 0
+            || groups == 0
+            || groups > 4
+            || group_size % 32 != 0
+            || kernel_size == 0
+            || dilation == 0
+        {
             return Err(HipError::new(0, "fused PLE geometry is not admitted"));
         }
         let tokens_i = checked_i32(tokens, "fused PLE token count")?;
@@ -864,7 +882,11 @@ impl Gpu {
             const WINDOW_CHUNK: usize = 64;
             let window_chunk_i = checked_i32(WINDOW_CHUNK, "fused PLE window chunk")?;
             let window_grid = checked_u32(tokens.div_ceil(WINDOW_CHUNK), "fused PLE window grid")?;
-            self.ensure_kernel(GROUPED_MODULE, GROUPED_KERNEL_SRC, "ple_conv_add_bf16s_k4d3")?;
+            self.ensure_kernel(
+                GROUPED_MODULE,
+                GROUPED_KERNEL_SRC,
+                "ple_conv_add_bf16s_k4d3",
+            )?;
             let mut window_params = [
                 &gate_ptr as *const _ as *mut c_void,
                 &inverse_ptr as *const _ as *mut c_void,
@@ -922,7 +944,11 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             "ple_conv_add_bf16s",
-            [checked_grid(channels, BLOCK, "fused PLE channel grid")?, chunk_grid, 1],
+            [
+                checked_grid(channels, BLOCK, "fused PLE channel grid")?,
+                chunk_grid,
+                1,
+            ],
             [BLOCK, 1, 1],
             0,
             &mut conv_params,
@@ -1138,8 +1164,8 @@ pub fn grouped_ple_fused_bf16s(gpu: &mut Gpu, p: &GroupedPleFused<'_>) -> HipRes
 mod tests {
     use super::*;
 
-    fn try_gpu() -> Option<Gpu> {
-        Gpu::init().ok()
+    fn try_gpu() -> Option<crate::gpu_test::TestGpu> {
+        crate::gpu_test::init().ok()
     }
 
     fn null_tensor(shape: &[usize], dtype: DType) -> GpuTensor {
@@ -1449,7 +1475,15 @@ mod tests {
             crate::tensor_ops::hc_state_bf16_to_f32(&mut gpu, &streams_old, &query, elements)
                 .unwrap();
             gpu.grouped_gate_bf16(
-                &key, &query, &value, &norm_key, &norm_query, &gated, tokens, BRANCHES, HIDDEN,
+                &key,
+                &query,
+                &value,
+                &norm_key,
+                &norm_query,
+                &gated,
+                tokens,
+                BRANCHES,
+                HIDDEN,
                 epsilon,
             )
             .unwrap();
@@ -1520,20 +1554,30 @@ mod tests {
         let elements = TOKENS * ROWS * WIDTH;
         let bits: Vec<u16> = (0..elements)
             .map(|i| ((((i * 2654435761usize) >> 7) as u32).wrapping_mul(0x0101_0101) >> 16) as u16)
-            .map(|b| if (b & 0x7f80) == 0x7f80 { b & 0x3fff } else { b })
+            .map(|b| {
+                if (b & 0x7f80) == 0x7f80 {
+                    b & 0x3fff
+                } else {
+                    b
+                }
+            })
             .collect();
         let staged = gpu.zeros(&[elements], DType::BF16).unwrap();
         let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_ne_bytes()).collect();
         gpu.hip.memcpy_htod(&staged.buf, &bytes).unwrap();
         let wide = gpu.zeros(&[elements], DType::F32).unwrap();
         let direct = gpu.zeros(&[elements], DType::F32).unwrap();
-        gpu.grouped_gather_convert_bf16(&staged, &wide, TOKENS, ROWS, WIDTH).unwrap();
-        gpu.grouped_gather_convert_bf16_f16(&staged, &direct, TOKENS, ROWS, WIDTH).unwrap();
+        gpu.grouped_gather_convert_bf16(&staged, &wide, TOKENS, ROWS, WIDTH)
+            .unwrap();
+        gpu.grouped_gather_convert_bf16_f16(&staged, &direct, TOKENS, ROWS, WIDTH)
+            .unwrap();
         let x16 = gpu.convert_fp16_x_uncached(&wide, elements).unwrap();
         let mut want = vec![0u8; elements * 2];
-        gpu.hip.memcpy_dtoh(&mut want, &unsafe {
-            hip_bridge::DeviceBuffer::from_raw(x16, elements * 2)
-        }).unwrap();
+        gpu.hip
+            .memcpy_dtoh(&mut want, &unsafe {
+                hip_bridge::DeviceBuffer::from_raw(x16, elements * 2)
+            })
+            .unwrap();
         let mut got = gpu.download_raw_bytes(&direct).unwrap();
         got.truncate(elements * 2);
         assert_eq!(got, want);

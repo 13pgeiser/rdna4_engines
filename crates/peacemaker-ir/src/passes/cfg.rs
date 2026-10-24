@@ -41,7 +41,13 @@ pub fn base_dwords(form: Form, arch: crate::inst::Arch) -> usize {
         Form::Smem => 2,
         Form::Vop1Dpp | Form::Vop2Dpp | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vinterp => 2,
         Form::Ds => 2,
-        Form::Vmem(_) => if arch == crate::inst::Arch::Gfx1201 { 3 } else { 2 },
+        Form::Vmem(_) => {
+            if arch == crate::inst::Arch::Gfx1201 {
+                3
+            } else {
+                2
+            }
+        }
         // No M1 table rows yet; provisional until the forms are tabled.
         Form::Export => 2,
     }
@@ -126,7 +132,10 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
     }
     let mut dwords = Vec::with_capacity(n);
     for id in &body.layout {
-        let inst = body.insts.get(*id).ok_or(CfgError::DanglingInst { id: *id })?;
+        let inst = body
+            .insts
+            .get(*id)
+            .ok_or(CfgError::DanglingInst { id: *id })?;
         dwords.push(dwords_of(inst, arch));
     }
     let mut pcs = vec![0u32; n];
@@ -151,7 +160,10 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
         ends.push(None);
     }
     for (i, id) in body.layout.iter().enumerate() {
-        let inst = body.insts.get(*id).ok_or(CfgError::DanglingInst { id: *id })?;
+        let inst = body
+            .insts
+            .get(*id)
+            .ok_or(CfgError::DanglingInst { id: *id })?;
         match inst.effects.control {
             Control::Branch { .. } | Control::Jump => {
                 let off = branch_offset(inst, i)?;
@@ -160,9 +172,10 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
                     return Err(CfgError::TargetOutsideKernel { index: i, target });
                 }
                 let target = target as u32;
-                let target_pos = pos_of_pc.get(&target).copied().ok_or(
-                    CfgError::TargetMidInstruction { index: i, target },
-                )?;
+                let target_pos = pos_of_pc
+                    .get(&target)
+                    .copied()
+                    .ok_or(CfgError::TargetMidInstruction { index: i, target })?;
                 ends[i] = Some(if matches!(inst.effects.control, Control::Jump) {
                     End::Jump { target_pos }
                 } else {
@@ -234,8 +247,16 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
     let mut terms: Vec<Term> = vec![Term::FallThrough { next: None }; block_count];
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); block_count];
     for block_idx in 0..block_count {
-        let end = if block_idx + 1 < block_count { leader_list[block_idx + 1] } else { n };
-        let next = if block_idx + 1 < block_count { Some(block_idx + 1) } else { None };
+        let end = if block_idx + 1 < block_count {
+            leader_list[block_idx + 1]
+        } else {
+            n
+        };
+        let next = if block_idx + 1 < block_count {
+            Some(block_idx + 1)
+        } else {
+            None
+        };
         match &ends[end - 1] {
             Some(End::Jump { target_pos }) => {
                 let taken = pos_block[*target_pos];
@@ -282,30 +303,36 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
             }
         }
     }
-    if matches!(terms[block_count - 1], Term::FallThrough { next: None }) && reachable[block_count - 1]
+    if matches!(terms[block_count - 1], Term::FallThrough { next: None })
+        && reachable[block_count - 1]
     {
         return Err(CfgError::MissingEndPgm);
     }
 
     let mut blocks: Vec<Block> = Vec::with_capacity(block_count);
     for (block_idx, &start) in leader_list.iter().enumerate() {
-        let end = if block_idx + 1 < block_count { leader_list[block_idx + 1] } else { n };
+        let end = if block_idx + 1 < block_count {
+            leader_list[block_idx + 1]
+        } else {
+            n
+        };
         let term = if !reachable[block_idx] {
             Terminator::Unreachable
         } else {
             match &terms[block_idx] {
                 Term::Branch { taken } => {
-                    let cond = match body.insts.get(body.layout[end - 1]).and_then(
-                        |inst| match inst.effects.control {
-                            Control::Branch { cond } => Some(cond),
-                            _ => None,
-                        },
-                    ) {
-                        Some(cond) => cond,
-                        None => {
-                            return Err(CfgError::MissingOffset { index: end - 1 });
-                        }
-                    };
+                    let cond =
+                        match body.insts.get(body.layout[end - 1]).and_then(|inst| {
+                            match inst.effects.control {
+                                Control::Branch { cond } => Some(cond),
+                                _ => None,
+                            }
+                        }) {
+                            Some(cond) => cond,
+                            None => {
+                                return Err(CfgError::MissingOffset { index: end - 1 });
+                            }
+                        };
                     Terminator::Branch {
                         cond,
                         taken: BlockId(*taken),
@@ -347,7 +374,10 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
             _ => None,
         };
         if let Some(taken) = taken_block {
-            let inst = body.insts.get_mut(*id).ok_or(CfgError::DanglingInst { id: *id })?;
+            let inst = body
+                .insts
+                .get_mut(*id)
+                .ok_or(CfgError::DanglingInst { id: *id })?;
             for op in inst.operands.iter_mut() {
                 if matches!(op, Operand::Imm(ImmField::Sopp(_))) {
                     *op = Operand::Label(taken);
@@ -371,7 +401,9 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
 pub fn branch_target_positions(body: &Body) -> BTreeSet<usize> {
     let mut out = BTreeSet::new();
     for id in &body.layout {
-        let Some(inst) = body.insts.get(*id) else { continue };
+        let Some(inst) = body.insts.get(*id) else {
+            continue;
+        };
         for op in &inst.operands {
             if let Operand::Label(target) = op {
                 out.insert(body.blocks[target.0].range.0);
@@ -473,7 +505,9 @@ impl Cfg {
                 ids
             };
             let is_loop = members.len() > 1
-                || members.iter().any(|id| graph.contains_edge(node[id], node[id]));
+                || members
+                    .iter()
+                    .any(|id| graph.contains_edge(node[id], node[id]));
             if !is_loop {
                 continue;
             }
@@ -484,9 +518,7 @@ impl Cfg {
                     .blocks
                     .iter()
                     .find(|block| block.id == candidate)
-                    .map(|block| {
-                        block.preds.iter().any(|pred| !in_set.contains(pred))
-                    })
+                    .map(|block| block.preds.iter().any(|pred| !in_set.contains(pred)))
                     .unwrap_or(false);
                 if has_outside_pred {
                     header = candidate;
@@ -497,7 +529,18 @@ impl Cfg {
         }
         loops.sort_by_key(|info| info.header);
 
-        Ok(Self { graph, node, rev, rev_node, rev_exit, entry, exits, dom, postdom, loops })
+        Ok(Self {
+            graph,
+            node,
+            rev,
+            rev_node,
+            rev_exit,
+            entry,
+            exits,
+            dom,
+            postdom,
+            loops,
+        })
     }
 
     fn node(&self, id: BlockId) -> Option<NodeIndex> {
@@ -527,7 +570,9 @@ impl Cfg {
         ) else {
             return false;
         };
-        pd.dominators(rb).map(|mut it| it.any(|n| n == ra)).unwrap_or(false)
+        pd.dominators(rb)
+            .map(|mut it| it.any(|n| n == ra))
+            .unwrap_or(false)
     }
 
     /// Natural loops found by SCC; empty for straight-line and diamond CFGs.
@@ -537,7 +582,10 @@ impl Cfg {
 
     /// Number of loops containing `id`.
     pub fn loop_depth(&self, id: BlockId) -> usize {
-        self.loops.iter().filter(|info| info.members.contains(&id)).count()
+        self.loops
+            .iter()
+            .filter(|info| info.members.contains(&id))
+            .count()
     }
 
     /// True when the block is reachable from entry.
@@ -575,7 +623,10 @@ mod tests {
             operands: operands.into_iter().collect(),
             mods: Default::default(),
             literal: None,
-            effects: Effects { control, ..Default::default() },
+            effects: Effects {
+                control,
+                ..Default::default()
+            },
             prov: Provenance::default(),
         }
     }
@@ -607,7 +658,11 @@ mod tests {
     }
 
     fn reg_def(inst: &mut Inst, base: u16) {
-        inst.effects.defs.push(RegRef { kind: Kind::V, base, len: 1 });
+        inst.effects.defs.push(RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        });
     }
 
     fn body_of(insts: Vec<Inst>) -> Body {
@@ -616,7 +671,11 @@ mod tests {
         for inst in insts {
             layout.push(arena.insert(inst));
         }
-        Body { insts: arena, blocks: Vec::new(), layout }
+        Body {
+            insts: arena,
+            blocks: Vec::new(),
+            layout,
+        }
     }
 
     fn sopp_branch(name: &str, cond: Option<Cond>, off: i16) -> Inst {
@@ -624,7 +683,12 @@ mod tests {
             Some(cond) => Control::Branch { cond },
             None => Control::Jump,
         };
-        inst(name, Form::Sopp, control, vec![Operand::Imm(ImmField::Sopp(off))])
+        inst(
+            name,
+            Form::Sopp,
+            control,
+            vec![Operand::Imm(ImmField::Sopp(off))],
+        )
     }
 
     #[test]
@@ -632,7 +696,11 @@ mod tests {
         // AMD MR-ISA sample dwords (gfx1100/gfx1151) and pinned llvm-mc
         // samples (gfx1201): base words, or base+1 with a literal. No gfx11
         // MIMG NSA row is tabled; an unseen variable-length MIMG fails decode.
-        for arch in [crate::inst::Arch::Gfx1100, crate::inst::Arch::Gfx1151, crate::inst::Arch::Gfx1201] {
+        for arch in [
+            crate::inst::Arch::Gfx1100,
+            crate::inst::Arch::Gfx1151,
+            crate::inst::Arch::Gfx1201,
+        ] {
             for row in isa::table(arch) {
                 let words = row.encoding.split_whitespace().count();
                 let base = base_dwords(row.form, arch);
@@ -702,7 +770,10 @@ mod tests {
         // Offsets are rewritten to labels.
         for id in &body.layout {
             for op in &body.insts.get(*id).unwrap().operands {
-                assert!(!matches!(op, Operand::Imm(ImmField::Sopp(_))), "offset survived");
+                assert!(
+                    !matches!(op, Operand::Imm(ImmField::Sopp(_))),
+                    "offset survived"
+                );
             }
         }
         assert_eq!(body.blocks[3].preds.len(), 2);
@@ -760,7 +831,10 @@ mod tests {
         let cfg = Cfg::build(&body).unwrap();
         assert_eq!(cfg.loops().len(), 1);
         assert_eq!(cfg.loops()[0].header, BlockId(1));
-        assert_eq!(cfg.loops()[0].members, vec![BlockId(1), BlockId(2), BlockId(3)]);
+        assert_eq!(
+            cfg.loops()[0].members,
+            vec![BlockId(1), BlockId(2), BlockId(3)]
+        );
         assert!(cfg.dominates(BlockId(1), BlockId(3)));
         assert!(!cfg.dominates(BlockId(3), BlockId(1)));
     }
@@ -784,7 +858,10 @@ mod tests {
         ]);
         assert_eq!(
             build_blocks(&mut body, crate::inst::Arch::Gfx1201),
-            Err(CfgError::TargetMidInstruction { index: 0, target: 2 })
+            Err(CfgError::TargetMidInstruction {
+                index: 0,
+                target: 2
+            })
         );
 
         let mut body = body_of(vec![
@@ -793,7 +870,10 @@ mod tests {
         ]);
         assert_eq!(
             build_blocks(&mut body, crate::inst::Arch::Gfx1201),
-            Err(CfgError::TargetOutsideKernel { index: 0, target: 91 })
+            Err(CfgError::TargetOutsideKernel {
+                index: 0,
+                target: 91
+            })
         );
     }
 
@@ -803,7 +883,10 @@ mod tests {
             plain("v_mov_b32_e32", Form::Vop1),
             plain("v_add_nc_u32_e32", Form::Vop2),
         ]);
-        assert_eq!(build_blocks(&mut body, crate::inst::Arch::Gfx1201), Err(CfgError::MissingEndPgm));
+        assert_eq!(
+            build_blocks(&mut body, crate::inst::Arch::Gfx1201),
+            Err(CfgError::MissingEndPgm)
+        );
 
         // Padding after s_endpgm becomes Unreachable with no successors.
         let mut body = body_of(vec![

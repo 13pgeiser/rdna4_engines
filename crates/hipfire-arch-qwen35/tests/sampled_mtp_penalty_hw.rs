@@ -199,7 +199,8 @@ const ARM_TEST: &str = "sampled_mtp_penalty_arm";
 // position, n_eff ~0.5-0.75 n). A fixed story or a "repeat this line" prompt
 // is near-deterministic for the first tokens and fails the degeneracy guard.
 const ANIMALS: &str = "Name ten random animals, one per line, and nothing else.";
-const INTEGERS: &str = "Write twenty random integers between 1 and 1000, separated by spaces, with no other text.";
+const INTEGERS: &str =
+    "Write twenty random integers between 1 and 1000, separated by spaces, with no other text.";
 
 const MAX_SEQ: usize = 4096;
 /// `ModelSlotConfig::repeat_window`: sizes `scratch.repeat_buf` (F32 cells).
@@ -399,7 +400,8 @@ fn model_and_head() -> Result<Option<(PathBuf, PathBuf)>, String> {
     let Some(model) = std::env::var_os(MODEL_ENV).map(PathBuf::from) else {
         return Ok(None);
     };
-    let model = fs::canonicalize(&model).map_err(|e| format!("{MODEL_ENV}={}: {e}", model.display()))?;
+    let model =
+        fs::canonicalize(&model).map_err(|e| format!("{MODEL_ENV}={}: {e}", model.display()))?;
     let head = std::env::var_os(HEAD_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| model.with_extension("mtp"));
@@ -418,17 +420,21 @@ fn render_from_env(model: &Path) -> Result<(String, String), String> {
                 .map_err(|e| format!("open {} for its chat template: {e}", model.display()))?;
             Ok(match hfq.chat_template() {
                 None => ("open".into(), "auto: no embedded chat template".into()),
-                Some(t) if t.contains(TEMPLATE_THINK_OPEN) && t.contains(TEMPLATE_THINK_CLOSED) => (
-                    "think_closed".into(),
-                    "auto: the chat template's generation prompt opens a think block".into(),
-                ),
+                Some(t) if t.contains(TEMPLATE_THINK_OPEN) && t.contains(TEMPLATE_THINK_CLOSED) => {
+                    (
+                        "think_closed".into(),
+                        "auto: the chat template's generation prompt opens a think block".into(),
+                    )
+                }
                 Some(_) => (
                     "open".into(),
                     "auto: the chat template does not open a think block".into(),
                 ),
             })
         }
-        other => Err(format!("{RENDER_ENV}={other:?}: expected auto | open | think_closed")),
+        other => Err(format!(
+            "{RENDER_ENV}={other:?}: expected auto | open | think_closed"
+        )),
     }
 }
 
@@ -540,11 +546,13 @@ fn config_hash(cfg: &Config) -> String {
 }
 
 fn out_base() -> PathBuf {
-    let base = std::env::var_os(OUT_ENV).map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
-            .unwrap_or_else(|| panic!("neither {OUT_ENV} nor HOME is set"));
-        PathBuf::from(home).join(".hipfire/oracles/qwen35-sampled-mtp")
-    });
+    let base = std::env::var_os(OUT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .unwrap_or_else(|| panic!("neither {OUT_ENV} nor HOME is set"));
+            PathBuf::from(home).join(".hipfire/oracles/qwen35-sampled-mtp")
+        });
     assert!(
         !base.starts_with("/tmp"),
         "{} is under /tmp; pick a persistent output directory",
@@ -795,7 +803,10 @@ fn chat_prompt(tok: &Tokenizer, user: &str, render: &str) -> Vec<u32> {
     t
 }
 
-fn count_ids(padded: &[Vec<u32>], tokens: usize) -> (Vec<BTreeMap<u32, u64>>, BTreeMap<String, u64>) {
+fn count_ids(
+    padded: &[Vec<u32>],
+    tokens: usize,
+) -> (Vec<BTreeMap<u32, u64>>, BTreeMap<String, u64>) {
     let mut positions: Vec<BTreeMap<u32, u64>> = vec![BTreeMap::new(); tokens];
     let mut joint: BTreeMap<String, u64> = BTreeMap::new();
     for ids in padded {
@@ -886,7 +897,8 @@ fn ar_trial(
     stop_eos: Option<u32>,
 ) -> Result<Vec<u32>, String> {
     let vocab = slot.config.vocab_size;
-    slot.reset_state(gpu).map_err(|e| format!("reset_state: {e:?}"))?;
+    slot.reset_state(gpu)
+        .map_err(|e| format!("reset_state: {e:?}"))?;
     for (i, &t) in prompt.iter().enumerate() {
         slot.forward(gpu, t, i)
             .map_err(|e| format!("prompt forward {i}: {e:?}"))?;
@@ -933,9 +945,16 @@ fn ar_cases(
         for trial in 0..cfg.trials {
             let seed = fold_seed32(trial_seed(salt, trial));
             seeds.push(seed as u64);
-            raw.push(ar_trial(gpu, slot, prompt, &sc, seed, cfg.tokens, stop_eos)?);
+            raw.push(ar_trial(
+                gpu, slot, prompt, &sc, seed, cfg.tokens, stop_eos,
+            )?);
             if (trial + 1) % 100 == 0 {
-                println!("ARM ar case {} trial {}/{}", case.name, trial + 1, cfg.trials);
+                println!(
+                    "ARM ar case {} trial {}/{}",
+                    case.name,
+                    trial + 1,
+                    cfg.trials
+                );
             }
         }
         out.push(finish_case(
@@ -964,7 +983,8 @@ fn mtp_trial(
     stop_eos: Option<u32>,
     totals: &mut (u64, u64),
 ) -> Result<Vec<u32>, String> {
-    slot.reset_state(gpu).map_err(|e| format!("reset_state: {e:?}"))?;
+    slot.reset_state(gpu)
+        .map_err(|e| format!("reset_state: {e:?}"))?;
     spec.configure_request(req);
     let first = match spec.prefill(gpu, slot, prompt, prompt, 0, false, None, &|| false)? {
         PrefillOutcome::Ready { first_token } => first_token,
@@ -976,14 +996,7 @@ fn mtp_trial(
     while generated.len() < tokens && stop_eos != generated.last().copied() {
         let remaining = tokens - generated.len();
         let step = spec.step(
-            gpu,
-            slot,
-            position,
-            seed,
-            &generated,
-            None,
-            req.temp,
-            remaining,
+            gpu, slot, position, seed, &generated, None, req.temp, remaining,
         )?;
         if step.emit.is_empty() {
             return Err(format!("empty step at position {position}"));
@@ -1019,7 +1032,9 @@ fn mtp_cases(
     pad: u32,
 ) -> Result<Vec<CaseOutput>, String> {
     if cfg.mode == "sampled" && !spec.supports_temp_verify() {
-        return Err("speculator does not advertise sampled verification (HIPFIRE_MTP_SAMPLED)".into());
+        return Err(
+            "speculator does not advertise sampled verification (HIPFIRE_MTP_SAMPLED)".into(),
+        );
     }
     let mut out = Vec::new();
     for (ci, (case, prompt)) in cfg.cases.iter().zip(prompts).enumerate() {
@@ -1033,10 +1048,22 @@ fn mtp_cases(
             seeds.push(seed);
             let req = spec_request(cfg, window, seed);
             raw.push(mtp_trial(
-                gpu, slot, spec, prompt, req, cfg.tokens, stop_eos, &mut totals,
+                gpu,
+                slot,
+                spec,
+                prompt,
+                req,
+                cfg.tokens,
+                stop_eos,
+                &mut totals,
             )?);
             if (trial + 1) % 100 == 0 {
-                println!("ARM mtp case {} trial {}/{}", case.name, trial + 1, cfg.trials);
+                println!(
+                    "ARM mtp case {} trial {}/{}",
+                    case.name,
+                    trial + 1,
+                    cfg.trials
+                );
             }
         }
         out.push(finish_case(
@@ -1113,7 +1140,15 @@ fn run_arm(cfg: &Config, arm: &str) -> Result<ArmOutput, String> {
     };
     slot.config.eos_token = arm_eos;
     let cases = match (arm, spec.as_mut()) {
-        ("ar", None) => ar_cases(&mut gpu, &mut slot, cfg, &prompts, effective_window, stop_eos, real_eos),
+        ("ar", None) => ar_cases(
+            &mut gpu,
+            &mut slot,
+            cfg,
+            &prompts,
+            effective_window,
+            stop_eos,
+            real_eos,
+        ),
         ("mtp", Some(s)) => mtp_cases(
             &mut gpu,
             &mut slot,
@@ -1169,11 +1204,17 @@ fn sampled_mtp_penalty_arm() {
 fn spawn_arm(cfg: &Config, dir: &Path, arm: &str) -> ArmOutput {
     let exe = std::env::current_exe().expect("test binary path");
     let mut cmd = Command::new(exe);
-    cmd.args(["--exact", ARM_TEST, "--ignored", "--nocapture", "--test-threads=1"])
-        .env(ARM_ENV, arm)
-        .env(CONFIG_ENV, dir.join("config.json"))
-        .current_dir(dir)
-        .stdin(Stdio::null());
+    cmd.args([
+        "--exact",
+        ARM_TEST,
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(ARM_ENV, arm)
+    .env(CONFIG_ENV, dir.join("config.json"))
+    .current_dir(dir)
+    .stdin(Stdio::null());
     if arm == "mtp" {
         for (k, v) in &cfg.mtp_child_flags {
             cmd.env(k, v);
@@ -1189,8 +1230,10 @@ fn spawn_arm(cfg: &Config, dir: &Path, arm: &str) -> ArmOutput {
         dir.display()
     );
     let path = dir.join(format!("{arm}.arm.json"));
-    serde_json::from_slice(&fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())))
-        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    serde_json::from_slice(
+        &fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 /// Writes `config.json`, runs both arms in fresh processes, and validates the
@@ -1207,7 +1250,10 @@ fn run_oracle(test: &str, mut cfg: Config) -> (PathBuf, Config, ArmOutput, ArmOu
     eprintln!("[oracle] {test}: output {}", dir.display());
     let ar = spawn_arm(&cfg, &dir, ARMS[0]);
     let mtp = spawn_arm(&cfg, &dir, ARMS[1]);
-    assert_eq!(ar.effective_window, mtp.effective_window, "arms disagree on the penalty window");
+    assert_eq!(
+        ar.effective_window, mtp.effective_window,
+        "arms disagree on the penalty window"
+    );
     assert_eq!(ar.eos_token, mtp.eos_token, "arms disagree on EOS");
     assert_eq!(ar.cases.len(), cfg.cases.len());
     assert_eq!(mtp.cases.len(), cfg.cases.len());
@@ -1341,7 +1387,11 @@ fn greedy_presence_penalty_matches_ar_ids() {
             ai.len(),
             m.proposed,
             m.accepted,
-            if line.is_none() { "IDENTICAL" } else { "MISMATCH" }
+            if line.is_none() {
+                "IDENTICAL"
+            } else {
+                "MISMATCH"
+            }
         );
         stats.push(StatLine {
             case: a.name.clone(),
@@ -1385,7 +1435,10 @@ fn degeneracy_guard_fails_single_cell_and_low_diversity() {
     assert!(s.degenerate && !s.pass, "low effective sample must fail");
     let even: BTreeMap<u32, u64> = [(1, 1000), (2, 600), (3, 400)].into_iter().collect();
     let s = stat_line("c", "t".into(), homogeneity(&even, &even));
-    assert!(!s.degenerate && s.pass, "diverse identical counts must pass");
+    assert!(
+        !s.degenerate && s.pass,
+        "diverse identical counts must pass"
+    );
 }
 
 #[test]

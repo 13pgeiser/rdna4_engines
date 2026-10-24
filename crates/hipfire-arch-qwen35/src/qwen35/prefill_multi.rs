@@ -112,7 +112,8 @@ pub const MULTI_CHUNK_MAX_LANE_ROWS: usize = 63;
 /// `HIPFIRE_CB_VERIFY_CHUNK128` and WMMA batch tiles, else 63) bounded to the
 /// supported `MULTI_CHUNK_PRODUCT_MAX_ROWS..=MULTI_CHUNK_MAX_ROWS`.
 pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
-    gpu.mq4_verify_chunk_rows().clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
+    gpu.mq4_verify_chunk_rows()
+        .clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
 }
 
 /// May an aggregate chunk of 64+ rows run on this target? The wide route is
@@ -125,13 +126,18 @@ pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
 /// Lloyd, MQ3/MQ6, Q8 or other dtypes), with `w_down.k == hidden_dim` (the
 /// `SingletonWmma` FFN-down shape). Decided before any request state is
 /// written; a refusal keeps the cap at [`MULTI_CHUNK_PRODUCT_MAX_ROWS`].
-pub fn multi_chunk_wide_admitted(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+pub fn multi_chunk_wide_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+) -> bool {
     multi_chunk_wide_route(&gpu.arch, &gpu.flags) && multi_chunk_dense_mq4v2_target(weights, config)
 }
 
 /// The device/flag half of [`multi_chunk_wide_admitted`] (no device needed).
 fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> bool {
-    Gpu::mq4_verify_chunk_rows_for(arch, flags).clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
+    Gpu::mq4_verify_chunk_rows_for(arch, flags)
+        .clamp(MULTI_CHUNK_PRODUCT_MAX_ROWS, MULTI_CHUNK_MAX_ROWS)
         > MULTI_CHUNK_PRODUCT_MAX_ROWS
         && Gpu::mq4_verify_singleton_chain_for(arch, flags)
 }
@@ -141,22 +147,31 @@ fn multi_chunk_wide_route(arch: &str, flags: &rdna_compute::FeatureFlags) -> boo
 /// trunk + head. The DFlash verify call sites (singleton and multi-request)
 /// open `Gpu::iu4_verify_scope` with this, so both run the same A4 producers
 /// and IU4 GEMMs ([`DenseBatchMath::Iu4Verify`]).
-pub fn dflash_iu4_verify_admitted(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+pub fn dflash_iu4_verify_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+) -> bool {
     gpu.iu4_verify_route_admitted() && multi_chunk_dense_mq4v2_target(weights, config)
 }
 
 /// The target half of [`multi_chunk_wide_admitted`] (also the dense-target
 /// half of the PM FP8 verify admission, `prefill::fp8_verify_target`).
-pub(crate) fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
+pub(crate) fn multi_chunk_dense_mq4v2_target(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+) -> bool {
     use rdna_compute::DType::MQ4G256V2;
     config.num_experts == 0
         && weights.output.gpu_dtype == MQ4G256V2
         && weights.layers.iter().all(|l| match l {
             LayerWeights::DeltaNet(d) => {
                 d.w_down.k == config.hidden_dim
-                    && [&d.wqkv, &d.wz, &d.w_alpha, &d.w_beta, &d.wo, &d.w_gate, &d.w_up, &d.w_down]
-                        .iter()
-                        .all(|w| w.gpu_dtype == MQ4G256V2)
+                    && [
+                        &d.wqkv, &d.wz, &d.w_alpha, &d.w_beta, &d.wo, &d.w_gate, &d.w_up, &d.w_down,
+                    ]
+                    .iter()
+                    .all(|w| w.gpu_dtype == MQ4G256V2)
             }
             LayerWeights::FullAttn(f) => {
                 f.w_down.k == config.hidden_dim
@@ -172,19 +187,33 @@ pub(crate) fn multi_chunk_dense_mq4v2_target(weights: &Qwen35Weights, config: &Q
 /// `cap` when the wide route is admitted for this target, else at most
 /// [`MULTI_CHUNK_PRODUCT_MAX_ROWS`] (a scratch sized for the wide route may
 /// serve a target that cannot take it).
-pub fn multi_chunk_pack_cap(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, cap: usize) -> usize {
+pub fn multi_chunk_pack_cap(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    cap: usize,
+) -> usize {
     pack_cap_for(multi_chunk_wide_admitted(gpu, weights, config), cap)
 }
 
 fn pack_cap_for(wide_admitted: bool, cap: usize) -> usize {
-    cap.min(if wide_admitted { MULTI_CHUNK_MAX_ROWS } else { MULTI_CHUNK_PRODUCT_MAX_ROWS })
+    cap.min(if wide_admitted {
+        MULTI_CHUNK_MAX_ROWS
+    } else {
+        MULTI_CHUNK_PRODUCT_MAX_ROWS
+    })
 }
 
 /// Rows a shared verify scratch planned for `requested` rows allocates on
 /// this target: its effective packing cap ([`multi_chunk_pack_cap`]), at
 /// least [`MIN_BATCH`]. A target the wide route does not admit allocates at
 /// most [`MULTI_CHUNK_PRODUCT_MAX_ROWS`] rows, whatever the device cap.
-pub fn multi_chunk_scratch_rows(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, requested: usize) -> usize {
+pub fn multi_chunk_scratch_rows(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    requested: usize,
+) -> usize {
     scratch_rows_for(multi_chunk_wide_admitted(gpu, weights, config), requested)
 }
 
@@ -297,12 +326,13 @@ const CB_DN_SAVE_FREE_DEFAULT: bool = true;
 /// DeltaNet state and its pre-verify snapshot instead of copying the live
 /// state into the snapshot (see `dflash_cb::cb_dn_save_free_admitted`). Off
 /// restores today's SAVE + in-place verify, byte for byte.
-static CB_DN_SAVE_FREE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    match hipfire_config::developer_var("HIPFIRE_CB_DN_SAVE_FREE") {
-        Ok(v) => v.trim() != "0",
-        Err(_) => CB_DN_SAVE_FREE_DEFAULT,
-    }
-});
+static CB_DN_SAVE_FREE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(
+        || match hipfire_config::developer_var("HIPFIRE_CB_DN_SAVE_FREE") {
+            Ok(v) => v.trim() != "0",
+            Err(_) => CB_DN_SAVE_FREE_DEFAULT,
+        },
+    );
 
 /// Is the save-free CB verify enabled for this process? (The scratch arms its
 /// from-table at construction only when it is.)
@@ -350,15 +380,15 @@ const LANE_FA_PARTIALS_GROW_FLOATS: usize = (64usize << 20) / 4;
 /// Bytes of one layer's device GDN lane table (`CONV_LANES_MAX`
 /// [`GdnLaneTable`](rdna_compute::lane_gdn::GdnLaneTable) rows, 80 B each): the
 /// layer stride `gated_delta_net_q8_fast_lanes_varrows` is launched with.
-const GDN_LANE_TABLE_LAYER_BYTES: usize =
-    rdna_compute::lane_gdn::CONV_LANES_MAX * std::mem::size_of::<rdna_compute::lane_gdn::GdnLaneTable>();
+const GDN_LANE_TABLE_LAYER_BYTES: usize = rdna_compute::lane_gdn::CONV_LANES_MAX
+    * std::mem::size_of::<rdna_compute::lane_gdn::GdnLaneTable>();
 
 /// Bytes of one layer's device snapshot-source GDN lane table
 /// (`CONV_LANES_MAX` [`GdnLaneTableFrom`](rdna_compute::lane_gdn::GdnLaneTableFrom)
 /// rows, 104 B each): the layer stride `gated_delta_net_q8_fast_lanes_varrows_from`
 /// is launched with.
-const GDN_LANE_FROM_TABLE_LAYER_BYTES: usize =
-    rdna_compute::lane_gdn::CONV_LANES_MAX * std::mem::size_of::<rdna_compute::lane_gdn::GdnLaneTableFrom>();
+const GDN_LANE_FROM_TABLE_LAYER_BYTES: usize = rdna_compute::lane_gdn::CONV_LANES_MAX
+    * std::mem::size_of::<rdna_compute::lane_gdn::GdnLaneTableFrom>();
 
 /// The save-free route's lane tables: device `GdnLaneTableFrom` rows
 /// `[delta_layer][lane]` plus the host copy of what each holds. Separate from
@@ -370,7 +400,9 @@ const GDN_LANE_FROM_TABLE_LAYER_BYTES: usize =
 /// configurations hit without an upload after the first two steps.
 struct GdnLaneFromTable {
     devices: [GpuTensor; 2],
-    host: std::sync::Mutex<crate::speculative::TwoSlot<Vec<rdna_compute::lane_gdn::GdnLaneTableFrom>>>,
+    host: std::sync::Mutex<
+        crate::speculative::TwoSlot<Vec<rdna_compute::lane_gdn::GdnLaneTableFrom>>,
+    >,
 }
 
 /// A HIP error that leaves the device context unusable (illegal address,
@@ -415,8 +447,16 @@ impl MultiChunkScratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_rows: usize) -> HipResult<Self> {
         let rows = max_rows.clamp(MIN_BATCH, multi_chunk_row_cap(gpu));
         let pbs = PrefillBatchScratch::new(gpu, config, rows)?;
-        let n_fa = config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count();
-        let n_delta = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+        let n_fa = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count();
+        let n_delta = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count();
         let bytes = n_fa.max(1) * MULTI_CHUNK_MAX_SEGS * std::mem::size_of::<AttnFp8Seg>();
         let attn_segs = match gpu.zeros(&[bytes.div_ceil(4)], rdna_compute::DType::F32) {
             Ok(t) => t,
@@ -460,16 +500,30 @@ impl MultiChunkScratch {
     /// unavailable (out of memory, compile failure): readiness stays false
     /// and every chunk keeps today's SAVE route. A device-context fault is
     /// propagated (the caller frees what it built).
-    fn arm_gdn_lane_from(gpu: &mut Gpu, config: &Qwen35Config, n_delta: usize) -> HipResult<Option<GdnLaneFromTable>> {
+    fn arm_gdn_lane_from(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        n_delta: usize,
+    ) -> HipResult<Option<GdnLaneFromTable>> {
         if !cb_dn_save_free_enabled() || n_delta == 0 || !lane_gdn_batch_ready(gpu, config, 1) {
             return Ok(None);
         }
         let ready = gpu.ensure_lane_gdn_varrows_from();
         if let Err(e) = ready {
-            return if hip_context_fault(&e) { Err(e) } else { Ok(None) };
+            return if hip_context_fault(&e) {
+                Err(e)
+            } else {
+                Ok(None)
+            };
         }
         let bytes = n_delta * GDN_LANE_FROM_TABLE_LAYER_BYTES;
-        let fail = |e: HipError| if hip_context_fault(&e) { Err(e) } else { Ok(None) };
+        let fail = |e: HipError| {
+            if hip_context_fault(&e) {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        };
         let first = match gpu.zeros(&[bytes.div_ceil(4)], rdna_compute::DType::F32) {
             Ok(t) => t,
             Err(e) => return fail(e),
@@ -560,7 +614,9 @@ fn lane_gdn_chunk_admitted(
         && lane_gdn_batch_ready(gpu, config, reqs.len())
         && (equal
             || (lane_gdn_varrows_enabled()
-                && reqs.iter().all(|r| (1..=LANE_GDN_VARROWS_MAX_N).contains(&r.tokens.len()))))
+                && reqs
+                    .iter()
+                    .all(|r| (1..=LANE_GDN_VARROWS_MAX_N).contains(&r.tokens.len()))))
         && reqs.iter().all(|r| {
             r.fusion.is_chain_verify() && r.gdn_tape.is_some_and(|t| r.tokens.len() <= t.max_n)
         })
@@ -585,7 +641,10 @@ impl MultiChunkScratch {
                 gpu.free_tensor(old).ok()?;
             }
             let rounded = floats.next_multiple_of(LANE_FA_PARTIALS_GROW_FLOATS);
-            *guard = Some(gpu.alloc_tensor(&[rounded], rdna_compute::DType::F32).ok()?);
+            *guard = Some(
+                gpu.alloc_tensor(&[rounded], rdna_compute::DType::F32)
+                    .ok()?,
+            );
         }
         Some(guard)
     }
@@ -595,7 +654,13 @@ impl MultiChunkScratch {
 /// + the VerifyAttn tile (`AttnFp8E4m3KvBatchedMasked` with
 /// `verify_tile_attend`)? [`attn_fp8_twin_eligible`] without its context /
 /// fusion limits: the same tier-plan derivation `execute_fa_attend_step` does.
-fn lane_fa_plan_ok(gpu: &Gpu, s: &Qwen35Scratch, kv: &llama::KvCache, start_pos: usize, n: usize) -> bool {
+fn lane_fa_plan_ok(
+    gpu: &Gpu,
+    s: &Qwen35Scratch,
+    kv: &llama::KvCache,
+    start_pos: usize,
+    n: usize,
+) -> bool {
     KvTierPlan::derive(KvTierInputs {
         pos: start_pos,
         flash_mode: s.flash_mode as usize,
@@ -674,7 +739,13 @@ fn lane_fa_chunk_admitted(
             || !kv.quant_fp8
             || kv.compact_offset != 0
             || !(MIN_BATCH..64).contains(&n)
-            || gfx12_fa_prep_admitted(gpu, config, r.fusion, n)
+            || gfx12_fa_prep_admitted(
+                gpu,
+                &hybrid_dims(config),
+                r.fusion,
+                n,
+                hipfire_runtime::triattn::tap_enabled(),
+            )
             || multirow
             || !lane_fa_plan_ok(gpu, s, kv, r.start_pos, n)
             || s.flash_partials.numel()
@@ -709,15 +780,33 @@ fn stage_gdn_lane_table(
 ) -> HipResult<()> {
     use rdna_compute::dflash_gdn_replay::{table_bytes, GdnLayerTable};
     use rdna_compute::lane_gdn::{GdnLaneTable, CONV_LANES_MAX};
-    let n_delta = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+    let n_delta = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::LinearAttention)
+        .count();
     let mut cache = scratch
         .gdn_lane_table_host
         .lock()
         .map_err(|_| HipError::new(0, "gdn lane table cache poisoned"))?;
     let mut dirty = false;
     if cache.len() != n_delta * CONV_LANES_MAX {
-        let base = GdnLayerTable { q: 0, k: 0, v: 0, gate: 0, beta: 0, s_q8: 0, s_scales: 0, output: 0, ef: 0 };
-        let zero = GdnLaneTable { base, n_tokens: 0, frame_off: 0 };
+        let base = GdnLayerTable {
+            q: 0,
+            k: 0,
+            v: 0,
+            gate: 0,
+            beta: 0,
+            s_q8: 0,
+            s_scales: 0,
+            output: 0,
+            ef: 0,
+        };
+        let zero = GdnLaneTable {
+            base,
+            n_tokens: 0,
+            frame_off: 0,
+        };
         cache.clear();
         cache.resize(n_delta * CONV_LANES_MAX, zero);
         dirty = true;
@@ -785,12 +874,22 @@ fn stage_gdn_lane_table_from(
     use rdna_compute::dflash_gdn_replay::{table_bytes, GdnLayerTable, GdnLayerTableFrom};
     use rdna_compute::lane_gdn::{GdnLaneTableFrom, CONV_LANES_MAX};
     let Some(from) = scratch.gdn_lane_from.as_ref() else {
-        return Err(HipError::new(0, "stage_gdn_lane_table_from: the snapshot-source lane table is not armed"));
+        return Err(HipError::new(
+            0,
+            "stage_gdn_lane_table_from: the snapshot-source lane table is not armed",
+        ));
     };
     if reqs.iter().any(|r| r.dn_state_src.is_none()) {
-        return Err(HipError::new(0, "stage_gdn_lane_table_from: request without a snapshot source"));
+        return Err(HipError::new(
+            0,
+            "stage_gdn_lane_table_from: request without a snapshot source",
+        ));
     }
-    let n_delta = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+    let n_delta = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::LinearAttention)
+        .count();
     let total = n_delta * CONV_LANES_MAX;
     let ptr = |t: &GpuTensor| t.buf.as_ptr() as u64;
     // The row of DeltaNet layer `l`, lane `i` (every request carries a source,
@@ -798,7 +897,8 @@ fn stage_gdn_lane_table_from(
     let row = |l: usize, i: usize| -> GdnLaneTableFrom {
         let (r, view) = (&reqs[i], &views[i]);
         let d = &*r.dn_state;
-        let [s_src, scales_src, _conv_src, ef_src] = r.dn_state_src.map_or([0; 4], |src| src.layer_state_ptrs(l));
+        let [s_src, scales_src, _conv_src, ef_src] =
+            r.dn_state_src.map_or([0; 4], |src| src.layer_state_ptrs(l));
         GdnLaneTableFrom {
             base: GdnLayerTableFrom {
                 base: GdnLayerTable {
@@ -828,7 +928,8 @@ fn stage_gdn_lane_table_from(
     // never read by the launch.
     let hit = cache.lookup_by(|host: &Vec<GdnLaneTableFrom>| {
         host.len() == total
-            && (0..n_delta).all(|l| (0..reqs.len()).all(|i| host[l * CONV_LANES_MAX + i] == row(l, i)))
+            && (0..n_delta)
+                .all(|l| (0..reqs.len()).all(|i| host[l * CONV_LANES_MAX + i] == row(l, i)))
     });
     match hit {
         Ok(slot) => {
@@ -840,9 +941,28 @@ fn stage_gdn_lane_table_from(
             // empty (a full re-stage), never keyed to an unknown table.
             let mut host = cache.take(victim).unwrap_or_default();
             if host.len() != total {
-                let z = GdnLayerTable { q: 0, k: 0, v: 0, gate: 0, beta: 0, s_q8: 0, s_scales: 0, output: 0, ef: 0 };
-                let zb = GdnLayerTableFrom { base: z, s_q8_src: 0, s_scales_src: 0, ef_src: 0 };
-                let zero = GdnLaneTableFrom { base: zb, n_tokens: 0, frame_off: 0 };
+                let z = GdnLayerTable {
+                    q: 0,
+                    k: 0,
+                    v: 0,
+                    gate: 0,
+                    beta: 0,
+                    s_q8: 0,
+                    s_scales: 0,
+                    output: 0,
+                    ef: 0,
+                };
+                let zb = GdnLayerTableFrom {
+                    base: z,
+                    s_q8_src: 0,
+                    s_scales_src: 0,
+                    ef_src: 0,
+                };
+                let zero = GdnLaneTableFrom {
+                    base: zb,
+                    n_tokens: 0,
+                    frame_off: 0,
+                };
                 host.clear();
                 host.resize(total, zero);
             }
@@ -896,7 +1016,12 @@ fn attn_fp8_twin_eligible(
 
 /// Rows `[r0, r0 + n)` of `pbs` as a scratch of `n` rows. Only row-major
 /// fields are re-pointed; they alias `pbs` (never freed through the view).
-fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usize) -> std::mem::ManuallyDrop<PrefillBatchScratch> {
+fn rows_view(
+    pbs: &PrefillBatchScratch,
+    config: &Qwen35Config,
+    r0: usize,
+    n: usize,
+) -> std::mem::ManuallyDrop<PrefillBatchScratch> {
     let dim = config.dim;
     let hidden = config.hidden_dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -931,7 +1056,10 @@ fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usi
         set(&mut p.gate_ffn_batch, v(&pbs.gate_ffn_batch, hidden));
         set(&mut p.up_batch, v(&pbs.up_batch, hidden));
         set(&mut p.ffn_hidden_batch, v(&pbs.ffn_hidden_batch, hidden));
-        set(&mut p.dn_normed_rot_batch, v(&pbs.dn_normed_rot_batch, v_dim));
+        set(
+            &mut p.dn_normed_rot_batch,
+            v(&pbs.dn_normed_rot_batch, v_dim),
+        );
         set(&mut p.positions, v(&pbs.positions, 1));
         set(&mut p.rope_positions, v(&pbs.rope_positions, 1));
         set(&mut p.pos3, v(&pbs.pos3, 3));
@@ -943,7 +1071,10 @@ fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usi
         set(&mut p.fa_k_batch, v(&pbs.fa_k_batch, kv_dim));
         set(&mut p.fa_v_batch, v(&pbs.fa_v_batch, kv_dim));
         set(&mut p.fa_attn_out_batch, v(&pbs.fa_attn_out_batch, q_dim));
-        set(&mut p.fa_attn_out_rot_batch, v(&pbs.fa_attn_out_rot_batch, q_dim));
+        set(
+            &mut p.fa_attn_out_rot_batch,
+            v(&pbs.fa_attn_out_rot_batch, q_dim),
+        );
         p
     }
 }
@@ -963,9 +1094,15 @@ fn rows_view(pbs: &PrefillBatchScratch, config: &Qwen35Config, r0: usize, n: usi
 /// (not proven identical), so it keeps the split.
 fn any_lane_s4(gpu: &Gpu, reqs: &[MultiChunkRequest<'_>], w_dtype: rdna_compute::DType) -> bool {
     !gpu.arch_caps.is_gfx1201()
-        && reqs
-            .iter()
-            .any(|r| s4_residual_fast(gpu, r.fusion, w_dtype, &BatchEpilogue::Residual, r.tokens.len()))
+        && reqs.iter().any(|r| {
+            s4_residual_fast(
+                gpu,
+                r.fusion,
+                w_dtype,
+                &BatchEpilogue::Residual,
+                r.tokens.len(),
+            )
+        })
 }
 
 /// Capture the post-layer residual rows of every request whose ring extracts
@@ -1023,7 +1160,12 @@ pub fn forward_prefill_batch_multi(
     reqs: &mut [MultiChunkRequest<'_>],
     hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
-    let refuse = |why: &str| Err(HipError::new(0, &format!("forward_prefill_batch_multi: {why}")));
+    let refuse = |why: &str| {
+        Err(HipError::new(
+            0,
+            &format!("forward_prefill_batch_multi: {why}"),
+        ))
+    };
     let pbs = &scratch.pbs;
     let total: usize = reqs.iter().map(|r| r.tokens.len()).sum();
     if reqs.is_empty() || total > multi_chunk_row_cap(gpu) || total > pbs.max_batch || pbs.lean {
@@ -1046,6 +1188,13 @@ pub fn forward_prefill_batch_multi(
     } else {
         verify_dense_math(gpu)
     };
+    // Never the plain-AR retained body (see `forward_prefill_batch`'s batched
+    // path). Cleared before the refusal: a recording window left open by a
+    // decode forward that returned early (RecordingWarmup with stale
+    // eligibility) then no longer reads as recording this batched forward, which
+    // runs eager; a genuine graph capture is still refused, and the next
+    // plain-AR forward re-arms eligibility.
+    gpu.replay.enter_batched_forward();
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return refuse("graph capture / replay recording is not supported");
     }
@@ -1086,10 +1235,16 @@ pub fn forward_prefill_batch_multi(
                 || n > rb.max_batch
                 || n > rb.max_positions
             {
-                return refuse("hidden ring layers/dimension/staging cannot hold the request's rows");
+                return refuse(
+                    "hidden ring layers/dimension/staging cannot hold the request's rows",
+                );
             }
         }
-        kv_ends.push(checked_kv_end(r.start_pos, n, "forward_prefill_batch_multi")?);
+        kv_ends.push(checked_kv_end(
+            r.start_pos,
+            n,
+            "forward_prefill_batch_multi",
+        )?);
     }
     if !weights.layers.iter().all(|l| match l {
         LayerWeights::DeltaNet(_) => true,
@@ -1112,7 +1267,9 @@ pub fn forward_prefill_batch_multi(
         None
     } else {
         if n_sourced != reqs.len() {
-            return refuse("save-free verify: every request of a chunk must carry a snapshot source, or none");
+            return refuse(
+                "save-free verify: every request of a chunk must carry a snapshot source, or none",
+            );
         }
         if !lane_gdn {
             return refuse("save-free verify: a sourced chunk needs the lane-batched GDN route");
@@ -1122,10 +1279,17 @@ pub fn forward_prefill_batch_multi(
         };
         for r in reqs.iter() {
             if r.tokens.len() > rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS {
-                return refuse("save-free verify: more rows than the snapshot-source replay admits");
+                return refuse(
+                    "save-free verify: more rows than the snapshot-source replay admits",
+                );
             }
-            if !r.dn_state_src.is_some_and(|src| src.cb_verify_owned_exact(&*r.dn_state, config)) {
-                return refuse("save-free verify: DeltaNet state / snapshot are not an exact owned pair");
+            if !r
+                .dn_state_src
+                .is_some_and(|src| src.cb_verify_owned_exact(&*r.dn_state, config))
+            {
+                return refuse(
+                    "save-free verify: DeltaNet state / snapshot are not an exact owned pair",
+                );
             }
         }
         Some(from)
@@ -1138,7 +1302,6 @@ pub fn forward_prefill_batch_multi(
     }
 
     let dim = config.dim;
-    let hidden_dim = config.hidden_dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
@@ -1155,13 +1318,33 @@ pub fn forward_prefill_batch_multi(
         offs.push(off);
         off += r.tokens.len();
     }
-    let views: Vec<_> = reqs.iter().zip(&offs).map(|(r, &o)| rows_view(pbs, config, o, r.tokens.len())).collect();
+    let views: Vec<_> = reqs
+        .iter()
+        .zip(&offs)
+        .map(|(r, &o)| rows_view(pbs, config, o, r.tokens.len()))
+        .collect();
     // Any request on the ChainVerify gfx1100 F16 projection route at its own
     // row count: the projection/FFN input stages run per request view.
-    let split_proj = reqs.iter().any(|r| mq_f16_projection_fast_route(gpu, r.fusion, r.tokens.len(), dim));
+    let split_proj = reqs
+        .iter()
+        .any(|r| mq_f16_projection_fast_route(gpu, r.fusion, r.tokens.len(), dim));
 
     let tokens: Vec<u32> = reqs.iter().flat_map(|r| r.tokens.iter().copied()).collect();
-    batch_chunk_embed_tokens(gpu, weights, &tokens, s, pbs, total, dim, dim * 4, true, false, false, None, None)?;
+    batch_chunk_embed_tokens(
+        gpu,
+        weights,
+        &tokens,
+        s,
+        pbs,
+        total,
+        dim,
+        dim * 4,
+        true,
+        false,
+        false,
+        None,
+        None,
+    )?;
     if cb_upload_coalesce_enabled() {
         // One upload of every lane's positions. Each per-lane call below (all
         // Sequential, no tree ctx, no active mask, not pre-uploaded) is a
@@ -1175,8 +1358,9 @@ pub fn forward_prefill_batch_multi(
             .flat_map(|r| (0..r.tokens.len()).map(move |i| (r.start_pos + i) as i32))
             .collect();
         debug_assert_eq!(positions.len(), total);
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4) };
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4)
+        };
         gpu.hip.memcpy_htod(&pbs.positions.buf, bytes)?;
     } else {
         for (r, view) in reqs.iter().zip(&views) {
@@ -1190,22 +1374,41 @@ pub fn forward_prefill_batch_multi(
     // MTP / plain requests keep the attend crossover; a ChainVerify request
     // attends through the tile + reduce (`verify_tile_attend`).
     let ctx = DispatchCtx::new(gpu).with_workload(workload);
-    let chain_ctx = DispatchCtx::new(gpu).with_workload(workload).with_verify_tile_attend(true);
+    let chain_ctx = DispatchCtx::new(gpu)
+        .with_workload(workload)
+        .with_verify_tile_attend(true);
 
     // Requests whose singleton attend is the fp8 scalar-batched arm run it
     // as one segment-twin launch per layer (tables staged up front). All
     // twin segments share the singleton `max_seq` (`physical_cap`) word.
     let mut twin_attn: Vec<bool> = reqs
         .iter()
-        .map(|r| *SEG_TWINS && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), r.fusion))
+        .map(|r| {
+            *SEG_TWINS
+                && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), r.fusion)
+        })
         .collect();
-    let twin_cap = reqs.iter().zip(&twin_attn).find(|(_, &t)| t).map(|(r, _)| r.kv_cache.physical_cap);
+    let twin_cap = reqs
+        .iter()
+        .zip(&twin_attn)
+        .find(|(_, &t)| t)
+        .map(|(r, _)| r.kv_cache.physical_cap);
     for (r, t) in reqs.iter().zip(twin_attn.iter_mut()) {
         *t &= Some(r.kv_cache.physical_cap) == twin_cap;
     }
-    let twin_ctx: Vec<usize> =
-        reqs.iter().zip(&twin_attn).filter(|(_, &t)| t).map(|(r, _)| r.start_pos + r.tokens.len()).collect();
-    let twin_rows = reqs.iter().zip(&twin_attn).filter(|(_, &t)| t).map(|(r, _)| r.tokens.len()).max().unwrap_or(0);
+    let twin_ctx: Vec<usize> = reqs
+        .iter()
+        .zip(&twin_attn)
+        .filter(|(_, &t)| t)
+        .map(|(r, _)| r.start_pos + r.tokens.len())
+        .collect();
+    let twin_rows = reqs
+        .iter()
+        .zip(&twin_attn)
+        .filter(|(_, &t)| t)
+        .map(|(r, _)| r.tokens.len())
+        .max()
+        .unwrap_or(0);
     if !twin_ctx.is_empty() {
         let mut fa_idx = 0usize;
         for (layer_idx, ty) in config.layer_types.iter().enumerate() {
@@ -1242,18 +1445,20 @@ pub fn forward_prefill_batch_multi(
     let mut kv_layer_idx = 0usize;
     // Deferred tape-capture copies of one DeltaNet layer (all requests),
     // issued as one batched launch after the layer's per-request recurrence.
-    let mut tape_copies: Vec<rdna_compute::tape_copy::TapeCopy> = Vec::with_capacity(if *TAPE_COPY_BATCH && tapes {
-        (3 + usize::from(lane_from.is_some())) * reqs.len()
-    } else {
-        0
-    });
+    let mut tape_copies: Vec<rdna_compute::tape_copy::TapeCopy> =
+        Vec::with_capacity(if *TAPE_COPY_BATCH && tapes {
+            (3 + usize::from(lane_from.is_some())) * reqs.len()
+        } else {
+            0
+        });
     // Lane-batched GDN route (see `lane_gdn_chunk_admitted`, decided above
     // with the source mode): the batched tape copy (`TAPE_COPY_BATCH`), whose
     // descriptors it queues, is part of its admission, so each kill switch
     // keeps its own A/B meaning.
     // Each lane's own row count and prefix frame offset live in its table row
     // (`offs`, reset to zero per chunk); the recurrence launches reserve `total`.
-    let mut lane_conv: Vec<(u64, usize, usize)> = Vec::with_capacity(if lane_gdn { reqs.len() } else { 0 });
+    let mut lane_conv: Vec<(u64, usize, usize)> =
+        Vec::with_capacity(if lane_gdn { reqs.len() } else { 0 });
     let mut lane_from_slot = 0usize;
     if lane_gdn {
         if lane_from.is_some() {
@@ -1267,11 +1472,19 @@ pub fn forward_prefill_batch_multi(
     // whole forward.
     let mut lane_fa_guard = None;
     if lane_fa_chunk_admitted(gpu, config, s, reqs, sem, &twin_attn) {
-        let shape: Vec<(usize, usize)> =
-            reqs.iter().map(|r| (r.tokens.len(), r.start_pos + r.tokens.len())).collect();
-        lane_fa_guard = scratch.lane_fa_partials_acquire(gpu, Gpu::lane_fa_partials_len(config.n_heads, &shape));
+        let shape: Vec<(usize, usize)> = reqs
+            .iter()
+            .map(|r| (r.tokens.len(), r.start_pos + r.tokens.len()))
+            .collect();
+        lane_fa_guard = scratch
+            .lane_fa_partials_acquire(gpu, Gpu::lane_fa_partials_len(config.n_heads, &shape));
     }
     let lane_fa_partials: Option<&GpuTensor> = lane_fa_guard.as_ref().and_then(|g| (**g).as_ref());
+    let dims = hybrid_dims(config);
+    let batch = pbs.view();
+    let flash = flash_scratch(s);
+    let tap_fn = batched_attention_tap(config);
+    let tap = tap_fn.get();
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -1279,13 +1492,30 @@ pub fn forward_prefill_batch_multi(
                 if split_proj {
                     for (r, view) in reqs.iter().zip(&views) {
                         batch_chunk_delta_net_input_projection(
-                            gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion, None,
+                            gpu,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
+                            r.tokens.len(),
+                            dim,
+                            q8_wmma_arch,
+                            r.fusion,
+                            None,
                             DenseBatchMath::Product,
                         )?;
                     }
                 } else {
                     batch_chunk_delta_net_input_projection(
-                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, None, math,
+                        gpu,
+                        &layer.mixer_view(),
+                        &dims,
+                        &batch,
+                        total,
+                        dim,
+                        q8_wmma_arch,
+                        shared_fusion,
+                        None,
+                        math,
                     )?;
                 }
                 if lane_gdn {
@@ -1313,7 +1543,7 @@ pub fn forward_prefill_batch_multi(
                     //  * requests own disjoint rows of the shared scratch and
                     //    disjoint DeltaNet/tape state, so interleaving their
                     //    work across launches changes no byte.
-                    gdn_sigmoid_alpha_gate(gpu, layer, pbs, n_v_heads, total)?;
+                    gdn_sigmoid_alpha_gate(gpu, &layer.mixer_view(), &batch, n_v_heads, total)?;
                     // DFlash tape capture (the pre-GDN sink branch's three
                     // descriptors per request): nothing below writes the
                     // source rows, and the next layer's producers have not
@@ -1321,7 +1551,13 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter().zip(&views) {
                         if let Some(tape) = r.gdn_tape {
                             push_gdn_tape_copies(
-                                &mut tape_copies, tape, view, n_v_heads, 0, r.tokens.len(), delta_layer_idx,
+                                &mut tape_copies,
+                                &gdn_tape_view(tape),
+                                &view.view(),
+                                n_v_heads,
+                                0,
+                                r.tokens.len(),
+                                delta_layer_idx,
                             );
                         }
                     }
@@ -1343,10 +1579,13 @@ pub fn forward_prefill_batch_multi(
                         // in-place kernel (1-8 ulp on gfx1201). The ring copy
                         // is ~4.9% of the state bytes the old SAVE moved
                         // (conv ring vs S + scales + EF).
-                        let conv_bytes = ((2 * k_dim + v_dim) * (config.conv_kernel_dim - 1) * 4) as u64;
+                        let conv_bytes =
+                            ((2 * k_dim + v_dim) * (config.conv_kernel_dim - 1) * 4) as u64;
                         for r in reqs.iter() {
                             let Some(src) = r.dn_state_src else {
-                                return refuse("save-free verify: request without a snapshot source");
+                                return refuse(
+                                    "save-free verify: request without a snapshot source",
+                                );
                             };
                             tape_copies.push(rdna_compute::tape_copy::TapeCopy {
                                 dst: r.dn_state.conv_states[delta_layer_idx].buf.as_ptr() as u64,
@@ -1361,7 +1600,11 @@ pub fn forward_prefill_batch_multi(
                     }
                     lane_conv.clear();
                     lane_conv.extend(reqs.iter().zip(&offs).map(|(r, &o)| {
-                        (r.dn_state.conv_states[delta_layer_idx].buf.as_ptr() as u64, o, r.tokens.len())
+                        (
+                            r.dn_state.conv_states[delta_layer_idx].buf.as_ptr() as u64,
+                            o,
+                            r.tokens.len(),
+                        )
                     }));
                     gpu.conv1d_silu_split_f32_lanes(
                         &pbs.dn_q_raw_batch,
@@ -1373,7 +1616,7 @@ pub fn forward_prefill_batch_multi(
                         k_dim,
                         v_dim,
                     )?;
-                    gdn_qk_norm_interleave(gpu, config, pbs, n_v_heads, hd, total)?;
+                    gdn_qk_norm_interleave(gpu, &dims, &batch, n_v_heads, hd, total)?;
                     match lane_from {
                         Some(from) => {
                             // `_from` changes only the S / scales / EF LOAD
@@ -1412,8 +1655,23 @@ pub fn forward_prefill_batch_multi(
                         let n = r.tokens.len();
                         let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
                         let parents = batch_chunk_delta_net_pre_gdn(
-                            gpu, layer, config, view, r.dn_state, n, k_dim, v_dim, n_v_heads, hd, sem, None, r.gdn_tape,
-                            0, delta_layer_idx, r.fusion, sink,
+                            gpu,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
+                            &deltanet_state_view(r.dn_state),
+                            n,
+                            k_dim,
+                            v_dim,
+                            n_v_heads,
+                            hd,
+                            sem,
+                            None,
+                            r.gdn_tape.map(gdn_tape_view).as_ref(),
+                            0,
+                            delta_layer_idx,
+                            r.fusion,
+                            sink,
                         )?;
                         if parents.is_some() {
                             return refuse("tree recurrence in a linear verify");
@@ -1450,9 +1708,9 @@ pub fn forward_prefill_batch_multi(
                         let n = r.tokens.len();
                         batch_chunk_delta_net_output_projection(
                             gpu,
-                            layer,
-                            config,
-                            view,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
                             n,
                             n_v_heads,
                             q8_wmma_arch,
@@ -1462,17 +1720,25 @@ pub fn forward_prefill_batch_multi(
                             GdnScanOut::F32,
                             DenseBatchMath::Product,
                         )?;
-                        batch_chunk_delta_net_ffn(
-                            gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                            BatchEpilogue::Residual, r.fusion, DenseBatchMath::Product,
+                        layer.ffn_rows(
+                            gpu,
+                            config.norm_eps,
+                            &view.view(),
+                            n,
+                            dim,
+                            q8_wmma_arch,
+                            arch_has_wmma,
+                            MlpOutput::Residual,
+                            r.fusion,
+                            DenseBatchMath::Product,
                         )?;
                     }
                 } else {
                     batch_chunk_delta_net_output_projection(
                         gpu,
-                        layer,
-                        config,
-                        pbs,
+                        &layer.mixer_view(),
+                        &dims,
+                        &batch,
                         total,
                         n_v_heads,
                         q8_wmma_arch,
@@ -1482,9 +1748,17 @@ pub fn forward_prefill_batch_multi(
                         GdnScanOut::F32,
                         math,
                     )?;
-                    batch_chunk_delta_net_ffn(
-                        gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                        BatchEpilogue::Residual, shared_fusion, math,
+                    layer.ffn_rows(
+                        gpu,
+                        config.norm_eps,
+                        &batch,
+                        total,
+                        dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        MlpOutput::Residual,
+                        shared_fusion,
+                        math,
                     )?;
                 }
                 capture_layer_rows(gpu, reqs, &views, layer_idx)?;
@@ -1496,13 +1770,28 @@ pub fn forward_prefill_batch_multi(
                 if split_proj {
                     for (r, view) in reqs.iter().zip(&views) {
                         batch_chunk_full_attn_input_projection(
-                            gpu, layer, config, view, r.tokens.len(), dim, q8_wmma_arch, r.fusion,
+                            gpu,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
+                            r.tokens.len(),
+                            dim,
+                            q8_wmma_arch,
+                            r.fusion,
                             DenseBatchMath::Product,
                         )?;
                     }
                 } else {
                     batch_chunk_full_attn_input_projection(
-                        gpu, layer, config, pbs, total, dim, q8_wmma_arch, shared_fusion, math,
+                        gpu,
+                        &layer.mixer_view(),
+                        &dims,
+                        &batch,
+                        total,
+                        dim,
+                        q8_wmma_arch,
+                        shared_fusion,
+                        math,
                     )?;
                 }
                 if let Some(lane_partials) = lane_fa_partials {
@@ -1515,8 +1804,8 @@ pub fn forward_prefill_batch_multi(
                     // lanes. Per request this is exactly the unfused prep +
                     // `batch_chunk_fa_attend` (fp8 write, then the
                     // `verify_tile_attend` tile + reduce).
-                    fa_prep_unfused_qk_norm(gpu, layer, config, pbs, total)?;
-                    fa_prep_unfused_rope(gpu, config, pbs, &pbs.positions, total, 0)?;
+                    fa_prep_unfused_qk_norm(gpu, &layer.mixer_view(), &dims, &batch, total)?;
+                    fa_prep_unfused_rope(gpu, &dims, &batch, &pbs.positions, total, 0)?;
                     let k_writes: Vec<rdna_compute::lane_fa::LaneFaWrite<'_>> = reqs
                         .iter()
                         .zip(&views)
@@ -1527,7 +1816,11 @@ pub fn forward_prefill_batch_multi(
                             rows: r.tokens.len(),
                         })
                         .collect();
-                    gpu.kv_cache_write_fp8_e4m3_lanes(&k_writes, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_fp8_e4m3_lanes(
+                        &k_writes,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     let v_writes: Vec<rdna_compute::lane_fa::LaneFaWrite<'_>> = reqs
                         .iter()
                         .zip(&views)
@@ -1538,7 +1831,11 @@ pub fn forward_prefill_batch_multi(
                             rows: r.tokens.len(),
                         })
                         .collect();
-                    gpu.kv_cache_write_fp8_e4m3_lanes(&v_writes, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_fp8_e4m3_lanes(
+                        &v_writes,
+                        config.n_kv_heads,
+                        config.head_dim,
+                    )?;
                     let attends: Vec<rdna_compute::lane_fa::LaneFaAttend<'_>> = reqs
                         .iter()
                         .zip(&views)
@@ -1565,8 +1862,13 @@ pub fn forward_prefill_batch_multi(
                     for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                         let n = r.tokens.len();
                         let max_ctx_len = r.start_pos + n;
-                        let rctx = if r.fusion.is_chain_verify() { &chain_ctx } else { &ctx };
-                        let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, r.fusion, n);
+                        let rctx = if r.fusion.is_chain_verify() {
+                            &chain_ctx
+                        } else {
+                            &ctx
+                        };
+                        let gfx12_fa_prep =
+                            gfx12_fa_prep_admitted(gpu, &dims, r.fusion, n, tap.is_some());
                         let multirow = q8_multirow_attn_admitted(
                             gpu.arch_caps.arch(),
                             r.kv_cache.quant_q8,
@@ -1581,8 +1883,26 @@ pub fn forward_prefill_batch_multi(
                             false,
                         );
                         batch_chunk_full_attn_prepare(
-                            gpu, multirow, layer, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem,
-                            None, kv_layer_idx, layer_idx, r.fusion, gfx12_fa_prep, false, false,
+                            gpu,
+                            multirow,
+                            &layer.mixer_view(),
+                            &dims,
+                            &view.view(),
+                            &flash,
+                            &kv_view(r.kv_cache),
+                            n,
+                            r.start_pos,
+                            max_ctx_len,
+                            rctx,
+                            sem,
+                            None,
+                            kv_layer_idx,
+                            layer_idx,
+                            r.fusion,
+                            gfx12_fa_prep,
+                            false,
+                            false,
+                            tap,
                         )?;
                         if twin {
                             // The singleton attend's paired write; the attention
@@ -1603,10 +1923,30 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             // Same S6 paired Q8 K/V-write admission as the singleton
                             // attend (byte-identical to the two batched writes).
-                            let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, r.fusion, n);
+                            let pair_q8_writes = dflash_fa_batch_fusion_admitted(
+                                gpu,
+                                &dims,
+                                r.fusion,
+                                n,
+                                tap.is_some(),
+                            );
                             batch_chunk_fa_attend(
-                                gpu, config, view, s, r.kv_cache, n, r.start_pos, max_ctx_len, rctx, sem, None,
-                                layer_idx, multirow, None, false, pair_q8_writes,
+                                gpu,
+                                &dims,
+                                &view.view(),
+                                &flash,
+                                &kv_view(r.kv_cache),
+                                n,
+                                r.start_pos,
+                                max_ctx_len,
+                                rctx,
+                                sem,
+                                None,
+                                layer_idx,
+                                multirow,
+                                None,
+                                false,
+                                pair_q8_writes,
                             )?;
                         }
                     }
@@ -1632,8 +1972,8 @@ pub fn forward_prefill_batch_multi(
                         let n = r.tokens.len();
                         batch_chunk_full_attn_output_projection(
                             gpu,
-                            layer,
-                            view,
+                            &layer.mixer_view(),
+                            &view.view(),
                             n,
                             q8_wmma_arch,
                             arch_has_wmma,
@@ -1643,16 +1983,24 @@ pub fn forward_prefill_batch_multi(
                             None,
                             DenseBatchMath::Product,
                         )?;
-                        batch_chunk_full_attn_ffn(
-                            gpu, layer, config, view, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                            BatchEpilogue::Residual, r.fusion, DenseBatchMath::Product,
+                        layer.ffn_rows(
+                            gpu,
+                            config.norm_eps,
+                            &view.view(),
+                            n,
+                            dim,
+                            q8_wmma_arch,
+                            arch_has_wmma,
+                            MlpOutput::Residual,
+                            r.fusion,
+                            DenseBatchMath::Product,
                         )?;
                     }
                 } else {
                     batch_chunk_full_attn_output_projection(
                         gpu,
-                        layer,
-                        pbs,
+                        &layer.mixer_view(),
+                        &batch,
                         total,
                         q8_wmma_arch,
                         arch_has_wmma,
@@ -1662,9 +2010,17 @@ pub fn forward_prefill_batch_multi(
                         None,
                         math,
                     )?;
-                    batch_chunk_full_attn_ffn(
-                        gpu, layer, config, pbs, total, dim, hidden_dim, q8_wmma_arch, arch_has_wmma,
-                        BatchEpilogue::Residual, shared_fusion, math,
+                    layer.ffn_rows(
+                        gpu,
+                        config.norm_eps,
+                        &batch,
+                        total,
+                        dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        MlpOutput::Residual,
+                        shared_fusion,
+                        math,
                     )?;
                 }
                 capture_layer_rows(gpu, reqs, &views, layer_idx)?;
@@ -1701,7 +2057,8 @@ pub fn forward_prefill_batch_multi(
 #[cfg(test)]
 mod pack_tests {
     use super::{
-        multi_chunk_wide_route, pack_whole_lanes, scratch_rows_for, MULTI_CHUNK_MAX_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
+        multi_chunk_wide_route, pack_whole_lanes, scratch_rows_for, MULTI_CHUNK_MAX_ROWS,
+        MULTI_CHUNK_PRODUCT_MAX_ROWS,
     };
     use rdna_compute::FeatureFlags;
 
@@ -1719,7 +2076,9 @@ mod pack_tests {
     const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 4] = [
         ("HIPFIRE_FP16=0", |f| f.fp16_disabled = true),
         ("HIPFIRE_LM_HEAD_WMMA=0", |f| f.lm_head_wmma_disabled = true),
-        ("HIPFIRE_HFQ4G256_LDSSTAGE=1", |f| f.hfq4g256_ldsstage_wmma = true),
+        ("HIPFIRE_HFQ4G256_LDSSTAGE=1", |f| {
+            f.hfq4g256_ldsstage_wmma = true
+        }),
         ("HIPFIRE_WMMA_BATCH_TILES=0", |f| f.wmma_batch_tiles = false),
     ];
 
@@ -1727,19 +2086,28 @@ mod pack_tests {
     fn wide_route_admitted_by_default_refused_under_each_singleton_switch() {
         assert!(multi_chunk_wide_route("gfx1201", &chunk128_flags()));
         // The chunk128 flag off, or another arch, never opens the wide route.
-        assert!(!multi_chunk_wide_route("gfx1201", &FeatureFlags::for_test("gfx1201")));
+        assert!(!multi_chunk_wide_route(
+            "gfx1201",
+            &FeatureFlags::for_test("gfx1201")
+        ));
         assert!(!multi_chunk_wide_route("gfx1100", &chunk128_flags()));
         for (name, set) in SINGLETON_ARM_SWITCHES {
             let mut f = chunk128_flags();
             set(&mut f);
-            assert!(!multi_chunk_wide_route("gfx1201", &f), "{name} must refuse wide admission");
+            assert!(
+                !multi_chunk_wide_route("gfx1201", &f),
+                "{name} must refuse wide admission"
+            );
         }
     }
 
     #[test]
     fn scratch_rows_equal_the_effective_cap() {
         // Admitted: the planned rows, up to 128.
-        assert_eq!(scratch_rows_for(true, MULTI_CHUNK_MAX_ROWS), MULTI_CHUNK_MAX_ROWS);
+        assert_eq!(
+            scratch_rows_for(true, MULTI_CHUNK_MAX_ROWS),
+            MULTI_CHUNK_MAX_ROWS
+        );
         assert_eq!(scratch_rows_for(true, 4096), MULTI_CHUNK_MAX_ROWS);
         assert_eq!(scratch_rows_for(true, 96), 96);
         // Not admitted (any refusing switch, a non-dense target, flag off):
@@ -1747,10 +2115,14 @@ mod pack_tests {
         for (name, set) in SINGLETON_ARM_SWITCHES {
             let mut f = chunk128_flags();
             set(&mut f);
-            let rows = scratch_rows_for(multi_chunk_wide_route("gfx1201", &f), MULTI_CHUNK_MAX_ROWS);
+            let rows =
+                scratch_rows_for(multi_chunk_wide_route("gfx1201", &f), MULTI_CHUNK_MAX_ROWS);
             assert_eq!(rows, MULTI_CHUNK_PRODUCT_MAX_ROWS, "{name}");
         }
-        assert_eq!(scratch_rows_for(false, MULTI_CHUNK_MAX_ROWS), MULTI_CHUNK_PRODUCT_MAX_ROWS);
+        assert_eq!(
+            scratch_rows_for(false, MULTI_CHUNK_MAX_ROWS),
+            MULTI_CHUNK_PRODUCT_MAX_ROWS
+        );
         assert_eq!(scratch_rows_for(false, 32), 32);
         // Never below the batched-prefill minimum.
         assert_eq!(scratch_rows_for(false, 0), 2);
@@ -1767,7 +2139,10 @@ mod pack_tests {
     fn c8_block16_packs_by_effective_cap() {
         let rows = [16usize; 8];
         // Flag off (product cap 63): 48 + 48 + 32.
-        assert_eq!(pack(&rows, MULTI_CHUNK_PRODUCT_MAX_ROWS), vec![0..3, 3..6, 6..8]);
+        assert_eq!(
+            pack(&rows, MULTI_CHUNK_PRODUCT_MAX_ROWS),
+            vec![0..3, 3..6, 6..8]
+        );
         // Cap 64: 64 + 64.
         assert_eq!(pack(&rows, 64), vec![0..4, 4..8]);
         // Cap 128: one chunk.

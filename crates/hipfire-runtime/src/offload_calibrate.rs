@@ -98,6 +98,26 @@ pub fn resolvable_formats() -> Vec<String> {
         .collect()
 }
 
+/// The CPU-decodable dense formats the default matrix measures, by `--format`
+/// name. Lets a caller measure the matrix one format at a time (deadline checks,
+/// per-format failure) without re-stating the list.
+pub fn format_names() -> impl Iterator<Item = &'static str> {
+    FORMATS.iter().map(|(name, _, _)| *name)
+}
+
+/// Every CPU-decodable dense format of the default matrix as `(name, dtype)`:
+/// the spelling a calibration record stores as `EngineRate::format`, paired
+/// with the dtype it names.
+pub fn formats() -> impl Iterator<Item = (&'static str, DType)> {
+    FORMATS.iter().map(|(name, _, dtype)| (*name, *dtype))
+}
+
+/// The name `dtype` is stored under in a calibration record; `None` for a
+/// dtype the offload-bench matrix does not measure.
+pub fn format_name(dtype: DType) -> Option<&'static str> {
+    formats().find(|(_, d)| *d == dtype).map(|(name, _)| name)
+}
+
 fn hip_err(msg: String) -> hip_bridge::HipError {
     hip_bridge::HipError::new(0, &msg)
 }

@@ -345,7 +345,8 @@ mod tests {
             }
             let scaled = 16.0 * e;
             assert_eq!(
-                scaled, scaled.round_ties_even(),
+                scaled,
+                scaled.round_ties_even(),
                 "16·e must already be integer for |e|≥1 E4M3 e={e} b=0x{b:02x}"
             );
             let expected = scaled as i32;

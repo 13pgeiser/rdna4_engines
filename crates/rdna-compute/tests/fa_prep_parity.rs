@@ -5,10 +5,11 @@
 //! gfx1100/gfx1151: the A3B 16Q/2K decode fusion; gfx1100/gfx1201:
 //! the Qwen3.6/3.8-27B 24Q/4K decode fusion must produce the same bytes
 //! as the chain it replaces: `deinterleave_f32`, Q/K `rmsnorm_batched`, then
-//! `rope_partial_interleaved_f32` (the half-split partial RoPE). The Qwen3.5
-//! lowered decode uses the fusion and the hand decode
-//! (`HIPFIRE_FORWARD_LOWERED=0`) uses the chain, so any difference makes the
-//! two decode paths diverge. On gfx1100 it did: left to the compiler, the
+//! `rope_partial_interleaved_f32` (the half-split partial RoPE). Qwen3.5
+//! decode runs the fusion where its gate admits the shape and the chain
+//! where it does not (the TriAttention tap, VL mrope,
+//! `HIPFIRE_QWEN35_FA_PREP_FUSE=0`), so any difference makes the same model's
+//! decode depend on that gate. On gfx1100 it did: left to the compiler, the
 //! fused RoPE second output was `fma(x1, cos, x0 * sin)` where the chain
 //! computes `fma(x0, sin, x1 * cos)`.
 //!
@@ -65,7 +66,10 @@ fn write(gpu: &Gpu, t: &GpuTensor, data: &[f32]) {
 fn qwen36_27b_fa_prep_matches_unfused_chain_bit_for_bit() {
     let mut gpu = Gpu::init().expect("gpu init");
     if !(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201()) {
-        eprintln!("skip: {} does not admit the 24Q/4K FA prep fusion", gpu.arch);
+        eprintln!(
+            "skip: {} does not admit the 24Q/4K FA prep fusion",
+            gpu.arch
+        );
         return;
     }
     check_prep(&mut gpu, 24, 4);
@@ -92,9 +96,16 @@ fn check_prep(mut gpu: &mut Gpu, NQ: usize, NK: usize) {
     write(&gpu, &q_weight, &fill(&mut seed, HD, 2.0));
     write(&gpu, &k_weight, &fill(&mut seed, HD, 2.0));
     let pos = alloc(&mut gpu, 1);
-    let (q_ref, gate_ref, k_ref) = (alloc(&mut gpu, NQ * HD), alloc(&mut gpu, NQ * HD), alloc(&mut gpu, NK * HD));
-    let (q_fused, gate_fused, k_fused) =
-        (alloc(&mut gpu, NQ * HD), alloc(&mut gpu, NQ * HD), alloc(&mut gpu, NK * HD));
+    let (q_ref, gate_ref, k_ref) = (
+        alloc(&mut gpu, NQ * HD),
+        alloc(&mut gpu, NQ * HD),
+        alloc(&mut gpu, NK * HD),
+    );
+    let (q_fused, gate_fused, k_fused) = (
+        alloc(&mut gpu, NQ * HD),
+        alloc(&mut gpu, NQ * HD),
+        alloc(&mut gpu, NK * HD),
+    );
 
     for p in POSITIONS {
         write(&gpu, &q_full, &fill(&mut seed, NQ * 2 * HD, 4.0));
@@ -102,20 +113,36 @@ fn check_prep(mut gpu: &mut Gpu, NQ: usize, NK: usize) {
         write(&gpu, &k_ref, &k_raw);
         write(&gpu, &k_fused, &k_raw);
 
-        gpu.deinterleave_f32(&q_full, &q_ref, &gate_ref, NQ, HD).unwrap();
-        gpu.rmsnorm_batched(&q_ref, &q_weight, &q_ref, NQ, HD, EPS).unwrap();
-        gpu.rmsnorm_batched(&k_ref, &k_weight, &k_ref, NK, HD, EPS).unwrap();
+        gpu.deinterleave_f32(&q_full, &q_ref, &gate_ref, NQ, HD)
+            .unwrap();
+        gpu.rmsnorm_batched(&q_ref, &q_weight, &q_ref, NQ, HD, EPS)
+            .unwrap();
+        gpu.rmsnorm_batched(&k_ref, &k_weight, &k_ref, NK, HD, EPS)
+            .unwrap();
         gpu.rope_partial_interleaved_f32(&q_ref, &k_ref, &pos.buf, NQ, NK, HD, NROT, THETA)
             .unwrap();
 
         gpu.qwen35_fa_prep_gfx1100(
-            &q_full, &q_fused, &gate_fused, &k_fused, &q_weight, &k_weight, &pos.buf, EPS, THETA, NQ,
+            &q_full,
+            &q_fused,
+            &gate_fused,
+            &k_fused,
+            &q_weight,
+            &k_weight,
+            &pos.buf,
+            EPS,
+            THETA,
+            NQ,
             NK,
         )
         .unwrap();
         gpu.hip.device_synchronize().unwrap();
 
-        for (name, r, f) in [("q", &q_ref, &q_fused), ("gate", &gate_ref, &gate_fused), ("k", &k_ref, &k_fused)] {
+        for (name, r, f) in [
+            ("q", &q_ref, &q_fused),
+            ("gate", &gate_ref, &gate_fused),
+            ("k", &k_ref, &k_fused),
+        ] {
             let (r, f) = (bits(&gpu, r), bits(&gpu, f));
             let differ: Vec<usize> = (0..r.len()).filter(|&i| r[i] != f[i]).collect();
             assert!(
@@ -129,7 +156,9 @@ fn check_prep(mut gpu: &mut Gpu, NQ: usize, NK: usize) {
             );
         }
     }
-    for t in [q_full, q_weight, k_weight, pos, q_ref, gate_ref, k_ref, q_fused, gate_fused, k_fused] {
+    for t in [
+        q_full, q_weight, k_weight, pos, q_ref, gate_ref, k_ref, q_fused, gate_fused, k_fused,
+    ] {
         gpu.free_tensor(t).unwrap();
     }
 }

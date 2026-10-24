@@ -110,8 +110,7 @@ fn pack_mq4g256v2_synth(m: usize, k: usize, salt: u32) -> Vec<u8> {
     for r in 0..m {
         for g in 0..gpr {
             let dst = (r * gpr + g) * GB;
-            let sc0 =
-                f16_bits(0.05 + (prng_u32((r * gpr + g) as u64, salt) % 20) as f32 * 0.001);
+            let sc0 = f16_bits(0.05 + (prng_u32((r * gpr + g) as u64, salt) % 20) as f32 * 0.001);
             let zp0 = f16_bits(-8.0 * f16_to_f32(sc0));
             let sc1 =
                 f16_bits(0.07 + (prng_u32((r * gpr + g) as u64, salt ^ 1) % 20) as f32 * 0.001);
@@ -131,10 +130,12 @@ fn pack_mq4g256v2_synth(m: usize, k: usize, salt: u32) -> Vec<u8> {
 }
 
 fn cache_dir(arch: &str) -> PathBuf {
-    let root = std::env::var_os("HIPFIRE_KERNEL_CACHE").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".hipfire_kernels")
-    });
+    let root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+            PathBuf::from(home).join(".hipfire_kernels")
+        });
     root.join(arch)
 }
 
@@ -191,7 +192,10 @@ fn launch_iu4(
     // variant (IU4_LDS override): v2 12288, A-full 24576, A3 19456, two-slot 20480 (default).
     // (W double-buffered + ping-pong DS/SZ, A single; store slots overlap).
     let grid = [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
-    let lds: u32 = std::env::var("IU4_LDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20480);
+    let lds: u32 = std::env::var("IU4_LDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20480);
     gpu.launch_kernel_blob(sym, grid, [256, 1, 1], lds, &mut blob)
         .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
 }
@@ -305,8 +309,9 @@ fn run_case(
         })
         .collect();
     let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload X");
-    let xq_ptr =
-        gpu.ensure_int4_mmq_x(&d_x, n, k).expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
+    let xq_ptr = gpu
+        .ensure_int4_mmq_x(&d_x, n, k)
+        .expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
     let xq_len = (k / 128) * n * 72;
     let xq = dtoh_raw(gpu, xq_ptr, xq_len);
 
@@ -331,7 +336,10 @@ fn run_case(
     gpu.hip.device_synchronize().expect("sync");
     let y1 = gpu.download_f32(&d_y1).expect("dl y1");
     let y2 = gpu.download_f32(&d_y2).expect("dl y2");
-    assert!(y1.iter().all(|v| v.is_finite()), "{label}: non-finite gpu output");
+    assert!(
+        y1.iter().all(|v| v.is_finite()),
+        "{label}: non-finite gpu output"
+    );
 
     // 2. repeat bit-identical (full).
     let (eq_rep, mism_rep) = bitwise_eq(&y1, &y2, None, m);
@@ -354,26 +362,29 @@ fn run_case(
     let mut fp8_stat = String::from("n/a");
     if n % 64 == 0 {
         let d_yf = gpu.upload_f32(&y0, &[n, m]).expect("upload Yf");
-        gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(
-            &d_a,
-            &d_x,
-            &d_yf,
-            m,
-            k,
-            n,
-            1,
-        )
-        .expect("fp8 route");
+        gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(&d_a, &d_x, &d_yf, m, k, n, 1)
+            .expect("fp8 route");
         gpu.hip.device_synchronize().expect("sync fp8");
         let yf = gpu.download_f32(&d_yf).expect("dl yf");
         // For add mode the fp8 route also accumulates onto y0: compare deltas.
-        let mut absv: Vec<f32> = y1.iter().zip(yf.iter()).map(|(a, b)| (a - b).abs()).collect();
+        let mut absv: Vec<f32> = y1
+            .iter()
+            .zip(yf.iter())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
         absv.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let max = absv[absv.len() - 1];
         let mean = absv.iter().sum::<f32>() / absv.len() as f32;
         let p999 = absv[(absv.len() * 999 / 1000).min(absv.len() - 1)];
-        let denom = y_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
-        fp8_stat = format!("max_abs={max:.4e} mean_abs={mean:.4e} p99.9={p999:.4e} max_rel={:.4e}", max / denom);
+        let denom = y_ref
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-6);
+        fp8_stat = format!(
+            "max_abs={max:.4e} mean_abs={mean:.4e} p99.9={p999:.4e} max_rel={:.4e}",
+            max / denom
+        );
         let _ = gpu.free_tensor(d_yf);
     }
 
@@ -393,25 +404,20 @@ fn run_case(
 
 /// GPU-event us/call: warmup then 100 timed launches, median. Returns
 /// (median_us, tops_vs_539.7).
-fn time_case(
-    gpu: &mut Gpu,
-    label: &str,
-    a_bytes: &[u8],
-    m: usize,
-    k: usize,
-    n: usize,
-    add: bool,
-) {
+fn time_case(gpu: &mut Gpu, label: &str, a_bytes: &[u8], m: usize, k: usize, n: usize, add: bool) {
     let sym = if add { ADD_SYM } else { SET_SYM };
     for s in [SET_SYM, ADD_SYM] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
     }
     // Random X once (timing only; values don't matter).
-    let x: Vec<f32> = (0..n * k).map(|i| prng_f32(i, 0x71E0).mul_add(1.0, 0.0)).collect();
+    let x: Vec<f32> = (0..n * k)
+        .map(|i| prng_f32(i, 0x71E0).mul_add(1.0, 0.0))
+        .collect();
     let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload X");
-    let xq_ptr =
-        gpu.ensure_int4_mmq_x(&d_x, n, k).expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
+    let xq_ptr = gpu
+        .ensure_int4_mmq_x(&d_x, n, k)
+        .expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
     let d_a = gpu.upload_raw(a_bytes, &[a_bytes.len()]).expect("upload A");
     let a_ptr = d_a.buf.as_ptr() as *const std::ffi::c_void;
     let y0 = vec![0.0f32; n * m];
@@ -437,7 +443,10 @@ fn time_case(
     let gflop = 2.0 * m as f64 * k as f64 * n as f64 / 1e9;
     // 1 GFLOP/us = 1000 TOPS.
     let tops = gflop / med * 1000.0;
-    eprintln!("TIME {label}: med={med:.1} us/call GFLOP={gflop:.2} -> {tops:.1} TOPS ({:.1}% of 539.7)", tops / 539.7 * 100.0);
+    eprintln!(
+        "TIME {label}: med={med:.1} us/call GFLOP={gflop:.2} -> {tops:.1} TOPS ({:.1}% of 539.7)",
+        tops / 539.7 * 100.0
+    );
     let _ = gpu.free_tensor(d_x);
     let _ = gpu.free_tensor(d_a);
     let _ = gpu.free_tensor(d_y);
@@ -446,10 +455,14 @@ fn time_case(
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let compile_only = args.iter().any(|a| a == "--compile-only");
-    let model = args.iter().find(|a| !a.starts_with('-')).cloned().unwrap_or_else(|| {
-        eprintln!("usage: tmp_iu4_gfx12_oracle <model.mq4-xt> [--compile-only]");
-        std::process::exit(2);
-    });
+    let model = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!("usage: tmp_iu4_gfx12_oracle <model.mq4-xt> [--compile-only]");
+            std::process::exit(2);
+        });
 
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
@@ -488,22 +501,65 @@ fn main() {
     // then return (no correctness checks).
     if std::env::var("TIME").ok().as_deref() == Some("1") {
         // gate_up row: gate + up (real gate weights stand in for both halves).
-        time_case(&mut gpu, "gate-M17408-K5120-N512/set", &gate, gate_m, gate_k, 512, false);
-        time_case(&mut gpu, "gate-M17408-K5120-N512/add", &gate, gate_m, gate_k, 512, true);
+        time_case(
+            &mut gpu,
+            "gate-M17408-K5120-N512/set",
+            &gate,
+            gate_m,
+            gate_k,
+            512,
+            false,
+        );
+        time_case(
+            &mut gpu,
+            "gate-M17408-K5120-N512/add",
+            &gate,
+            gate_m,
+            gate_k,
+            512,
+            true,
+        );
         // residual row: down.
-        time_case(&mut gpu, "down-M5120-K17408-N512/add", &down, down_m, down_k, 512, true);
+        time_case(
+            &mut gpu,
+            "down-M5120-K17408-N512/add",
+            &down,
+            down_m,
+            down_k,
+            512,
+            true,
+        );
         // qkvza row (M=16480 = 10240+6144+48+48, K=5120) and qkv row
         // (M=14336 = 12288+1024+1024, K=5120): synthetic weights, same shapes.
         let aqkvza = pack_mq4g256v2_synth(16480, 5120, 0x71E0_A000);
-        time_case(&mut gpu, "qkvza-M16480-K5120-N512/set", &aqkvza, 16480, 5120, 512, false);
+        time_case(
+            &mut gpu,
+            "qkvza-M16480-K5120-N512/set",
+            &aqkvza,
+            16480,
+            5120,
+            512,
+            false,
+        );
         let aqkv = pack_mq4g256v2_synth(14336, 5120, 0x71E0_B000);
-        time_case(&mut gpu, "qkv-M14336-K5120-N512/set", &aqkv, 14336, 5120, 512, false);
+        time_case(
+            &mut gpu,
+            "qkv-M14336-K5120-N512/set",
+            &aqkv,
+            14336,
+            5120,
+            512,
+            false,
+        );
         return;
     }
     // OCC=1: occupancy probe (block 256, IU4_LDS) for gate 2, then return.
     if std::env::var("OCC").ok().as_deref() == Some("1") {
         for s in [SET_SYM, ADD_SYM] {
-            let ol: u32 = std::env::var("IU4_LDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20480);
+            let ol: u32 = std::env::var("IU4_LDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20480);
             match gpu.occupancy_max_active_blocks(s, [256, 1, 1], ol) {
                 Ok(n) => eprintln!("OCC {s}: max_active_blocks_per_CU={n} (block 256, lds {ol})"),
                 Err(e) => eprintln!("OCC {s}: ERROR {e}"),
@@ -514,21 +570,94 @@ fn main() {
     drop(hfq);
 
     let mut ok = true;
-    ok &= run_case(&mut gpu, "gate/set", &gate, gate_m, gate_k, 512, false, 0xC0DE_0001, false);
-    ok &= run_case(&mut gpu, "gate/add", &gate, gate_m, gate_k, 512, true, 0xC0DE_0002, false);
-    ok &= run_case(&mut gpu, "down/set", &down, down_m, down_k, 512, false, 0xC0DE_0003, false);
-    ok &= run_case(&mut gpu, "down/add", &down, down_m, down_k, 512, true, 0xC0DE_0004, false);
+    ok &= run_case(
+        &mut gpu,
+        "gate/set",
+        &gate,
+        gate_m,
+        gate_k,
+        512,
+        false,
+        0xC0DE_0001,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "gate/add",
+        &gate,
+        gate_m,
+        gate_k,
+        512,
+        true,
+        0xC0DE_0002,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "down/set",
+        &down,
+        down_m,
+        down_k,
+        512,
+        false,
+        0xC0DE_0003,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "down/add",
+        &down,
+        down_m,
+        down_k,
+        512,
+        true,
+        0xC0DE_0004,
+        false,
+    );
     // Phase edges, synthetic data (full CPU check: small).
     let a48 = pack_mq4g256v2_synth(48, 1024, 0xED6E_4000);
-    ok &= run_case(&mut gpu, "m48tail/set", &a48, 48, 1024, 512, false, 0xE040, true);
+    ok &= run_case(
+        &mut gpu,
+        "m48tail/set",
+        &a48,
+        48,
+        1024,
+        512,
+        false,
+        0xE040,
+        true,
+    );
     let a80 = pack_mq4g256v2_synth(2048, 1024, 0xED6E_5000);
-    ok &= run_case(&mut gpu, "n80cols/set", &a80, 2048, 1024, 80, false, 0xE050, true);
+    ok &= run_case(
+        &mut gpu,
+        "n80cols/set",
+        &a80,
+        2048,
+        1024,
+        80,
+        false,
+        0xE050,
+        true,
+    );
     let a256 = pack_mq4g256v2_synth(256, 256, 0xED6E_6000);
-    ok &= run_case(&mut gpu, "k256/set", &a256, 256, 256, 512, false, 0xE060, true);
-    ok &= run_case(&mut gpu, "k256/add", &a256, 256, 256, 512, true, 0xE061, true);
+    ok &= run_case(
+        &mut gpu, "k256/set", &a256, 256, 256, 512, false, 0xE060, true,
+    );
+    ok &= run_case(
+        &mut gpu, "k256/add", &a256, 256, 256, 512, true, 0xE061, true,
+    );
     let apart = pack_mq4g256v2_synth(100, 512, 0xED6E_7000);
-    ok &= run_case(&mut gpu, "m100n100/set", &apart, 100, 512, 100, false, 0xE070, true);
-
+    ok &= run_case(
+        &mut gpu,
+        "m100n100/set",
+        &apart,
+        100,
+        512,
+        100,
+        false,
+        0xE070,
+        true,
+    );
 
     if ok {
         eprintln!("GFX12-IU4 ORACLE PASS");

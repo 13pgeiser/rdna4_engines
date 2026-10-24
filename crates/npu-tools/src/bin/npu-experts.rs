@@ -59,6 +59,7 @@
 //! (`cpu_direct_exact=a/b`, b = verified rounds x CPU-checked experts), the CPU coverage (`cpu_experts=k/E`) and the
 //! CPU-vs-eager-oracle count, and `RESULT: PASS|FAIL`. `us_per_group` is the mean timed-region time per round,
 //! `useful_tops` = `E * 2*M*N*K / us_per_group`. Exit status: 0 pass, 1 fail, 2 bad usage or a shape the design rejects.
+use npu_tools::util::{lcg, parse_num, percentile, round_up, us};
 use peacemaker_npu::kernels::experts::{grouped, grouped_v9, ExpertPlan, GroupedDesign};
 use peacemaker_npu::kernels::gemm_array::V8_DEFAULT_EPILOGUE;
 use peacemaker_npu::kernels::gemm_core::Control;
@@ -68,7 +69,6 @@ use railgun::npu::{clflush, Bo, Device, HwCtx, Prepared, ERT_STATE_COMPLETED};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use npu_tools::util::{lcg, percentile, parse_num, round_up, us};
 
 const USAGE: &str = "usage: npu-experts [--design V9|G80] --proj gate_up|down --m M --experts E [--ring] [--secs S | --rounds R] [--timeout-ms T] [--verify-every] [--insts-only]";
 const POISON: u8 = 0xA5;
@@ -140,7 +140,13 @@ impl Design {
         }
     }
     /// `experts` as ONE group of this design; panics on a shape the design rejects.
-    fn group(self, n: usize, k: usize, experts: &[ExpertPlan], ring: Option<(RingLayout, usize, u32)>) -> GroupedDesign {
+    fn group(
+        self,
+        n: usize,
+        k: usize,
+        experts: &[ExpertPlan],
+        ring: Option<(RingLayout, usize, u32)>,
+    ) -> GroupedDesign {
         match self {
             Design::V9 => grouped_v9(n, k, experts, ring),
             Design::G80 => {
@@ -166,7 +172,6 @@ struct Cfg {
     insts_only: bool,
 }
 
-
 /// `Ok(None)` = help requested.
 fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
     let (mut design, mut proj, mut m, mut experts) = (Design::V9, None, None, None);
@@ -174,7 +179,11 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
     let (mut secs, mut rounds, mut timeout_ms) = (None, None, DEFAULT_TIMEOUT_MS);
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
+        let mut val = |name: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
         match a.as_str() {
             "-h" | "--help" => return Ok(None),
             "--design" => {
@@ -232,15 +241,28 @@ fn parse(args: &[String]) -> Result<Option<Cfg>, String> {
         return Err("--design G80 supports only --proj gate_up".into());
     }
     if !(1..=design.max_m()).contains(&m) {
-        return Err(format!("--m must be 1..={} for --design {}, got {m}", design.max_m(), design.name()));
+        return Err(format!(
+            "--m must be 1..={} for --design {}, got {m}",
+            design.max_m(),
+            design.name()
+        ));
     }
     if experts == 0 {
         return Err("--experts must be >= 1".into());
     }
-    Ok(Some(Cfg { design, proj, m, experts, ring, secs, rounds, timeout_ms, verify_every, insts_only }))
+    Ok(Some(Cfg {
+        design,
+        proj,
+        m,
+        experts,
+        ring,
+        secs,
+        rounds,
+        timeout_ms,
+        verify_every,
+        insts_only,
+    }))
 }
-
-
 
 fn mean(v: &[f64]) -> f64 {
     if v.is_empty() {
@@ -302,13 +324,19 @@ fn par_map<T: Send, F: Fn(usize) -> T + Sync>(n: usize, threads: usize, f: F) ->
             }
         }
     });
-    out.into_iter().map(|o| o.expect("every index computed")).collect()
+    out.into_iter()
+        .map(|o| o.expect("every index computed"))
+        .collect()
 }
 
 /// Deterministic CPU sample: all experts when E < 4, else the distinct indices {0, E/3, 2E/3, E-1} (E >= 4 gives
 /// exactly four distinct values).
 fn sample_indices(e: usize) -> Vec<usize> {
-    let mut v: Vec<usize> = if e < 4 { (0..e).collect() } else { vec![0, e / 3, 2 * e / 3, e - 1] };
+    let mut v: Vec<usize> = if e < 4 {
+        (0..e).collect()
+    } else {
+        vec![0, e / 3, 2 * e / 3, e - 1]
+    };
     v.sort_unstable();
     v.dedup();
     v
@@ -341,7 +369,11 @@ impl Ring {
     fn done(&self) -> (u32, u32, u32) {
         let off = self.layout.done_line(self.slot);
         unsafe { clflush(self.bo.host.add(off), 64) };
-        (rd32(&self.bo, off), rd32(&self.bo, off + 4), rd32(&self.bo, off + 8))
+        (
+            rd32(&self.bo, off),
+            rd32(&self.bo, off + 4),
+            rd32(&self.bo, off + 8),
+        )
     }
 
     /// The slot may take a new seq only when the previous one has its DONE line (or it was never used).
@@ -375,12 +407,16 @@ impl Ring {
             let (s, slot, magic) = self.done();
             if s == seq {
                 if slot != self.slot as u32 || magic != DONE_MAGIC {
-                    return Err(format!("malformed DONE line: seq {s:#x} slot field {slot} magic {magic:#x}"));
+                    return Err(format!(
+                        "malformed DONE line: seq {s:#x} slot field {slot} magic {magic:#x}"
+                    ));
                 }
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(format!("DONE line seq {s:#x}, want {seq:#x} (command completed without acknowledging)"));
+                return Err(format!(
+                    "DONE line seq {s:#x}, want {seq:#x} (command completed without acknowledging)"
+                ));
             }
             core::hint::spin_loop();
         }
@@ -402,14 +438,21 @@ fn patch_hot(bo: &Bo, host: &mut [u8], sites: &[(usize, PatchKind)], seq: u32) {
 
 /// Audit (untimed): the retained BO equals the host image, and the host image differs from the freshly built stream
 /// only at the declared patch words.
-fn audit_insts(bo: &Bo, host: &[u8], built: &[u8], sites: &[(usize, PatchKind)]) -> Result<(), String> {
+fn audit_insts(
+    bo: &Bo,
+    host: &[u8],
+    built: &[u8],
+    sites: &[(usize, PatchKind)],
+) -> Result<(), String> {
     unsafe { clflush(bo.host, host.len()) };
     if bo.as_slice()[..host.len()] != *host {
         return Err("retained insts BO differs from the patched host image".into());
     }
     for (w, (a, b)) in host.chunks_exact(4).zip(built.chunks_exact(4)).enumerate() {
         if a != b && !sites.iter().any(|s| s.0 == w) {
-            return Err(format!("insts word {w} changed but is not a declared patch site"));
+            return Err(format!(
+                "insts word {w} changed but is not a declared patch site"
+            ));
         }
     }
     Ok(())
@@ -425,7 +468,14 @@ struct Counts {
 
 /// Compare every expert's C of the group arena with its eager oracle (bytes), and the CPU-checked experts also with
 /// their exact CPU reference (unpacked). Returns the first few failure descriptions.
-fn verify_round(g: &GroupedDesign, plans: &[ExpertPlan], c: &Bo, oracle: &[Vec<u8>], refs: &[Option<Vec<i32>>], cnt: &mut Counts) -> Vec<String> {
+fn verify_round(
+    g: &GroupedDesign,
+    plans: &[ExpertPlan],
+    c: &Bo,
+    oracle: &[Vec<u8>],
+    refs: &[Option<Vec<i32>>],
+    cnt: &mut Counts,
+) -> Vec<String> {
     let mut bad = Vec::new();
     c.flush();
     let all = c.as_slice();
@@ -443,7 +493,9 @@ fn verify_round(g: &GroupedDesign, plans: &[ExpertPlan], c: &Bo, oracle: &[Vec<u
             if g.unpack_out(e, got) == *want {
                 cnt.exact_ok += 1;
             } else if bad.len() < 5 {
-                bad.push(format!("expert {e}: C differs from the exact CPU reference"));
+                bad.push(format!(
+                    "expert {e}: C differs from the exact CPU reference"
+                ));
             }
         }
     }
@@ -465,17 +517,45 @@ fn main() {
     };
     let (n, k) = cfg.proj.nk();
     fn reject(cfg: &Cfg, what: &str) -> ! {
-        eprintln!("npu-experts: {} rejected {} m={} E={}{}: {what}", cfg.design.builder(), cfg.proj.name(), cfg.m, cfg.experts, if cfg.ring { " --ring" } else { "" });
+        eprintln!(
+            "npu-experts: {} rejected {} m={} E={}{}: {what}",
+            cfg.design.builder(),
+            cfg.proj.name(),
+            cfg.m,
+            cfg.experts,
+            if cfg.ring { " --ring" } else { "" }
+        );
         std::process::exit(2)
     }
     // One-expert design: per-expert byte sizes (-> arena strides) and the eager full-TXN baseline (same PDI).
-    let single = match catch_unwind(AssertUnwindSafe(|| cfg.design.group(n, k, &[ExpertPlan { m: cfg.m, a_off: 0, b_off: 0, c_off: 0 }], None))) {
+    let single = match catch_unwind(AssertUnwindSafe(|| {
+        cfg.design.group(
+            n,
+            k,
+            &[ExpertPlan {
+                m: cfg.m,
+                a_off: 0,
+                b_off: 0,
+                c_off: 0,
+            }],
+            None,
+        )
+    })) {
         Ok(d) => d,
         Err(_) => reject(&cfg, "single-expert baseline design"),
     };
-    let strides = [round_up(single.a_bytes(0), ARENA_ALIGN), round_up(single.b_bytes(0), ARENA_ALIGN), round_up(single.c_bytes(0), ARENA_ALIGN)];
+    let strides = [
+        round_up(single.a_bytes(0), ARENA_ALIGN),
+        round_up(single.b_bytes(0), ARENA_ALIGN),
+        round_up(single.c_bytes(0), ARENA_ALIGN),
+    ];
     let plans: Vec<ExpertPlan> = (0..cfg.experts)
-        .map(|e| ExpertPlan { m: cfg.m, a_off: (e * strides[0]) as u64, b_off: (e * strides[1]) as u64, c_off: (e * strides[2]) as u64 })
+        .map(|e| ExpertPlan {
+            m: cfg.m,
+            a_off: (e * strides[0]) as u64,
+            b_off: (e * strides[1]) as u64,
+            c_off: (e * strides[2]) as u64,
+        })
         .collect();
     let ring = cfg.ring.then_some((RingLayout { nslots: 1 }, 0usize, 1u32));
     let g = match catch_unwind(AssertUnwindSafe(|| cfg.design.group(n, k, &plans, ring))) {
@@ -512,7 +592,13 @@ fn main() {
     }
 }
 
-fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan], strides: [usize; 3]) -> Result<bool, String> {
+fn run(
+    cfg: &Cfg,
+    g: &GroupedDesign,
+    single: &GroupedDesign,
+    plans: &[ExpertPlan],
+    strides: [usize; 3],
+) -> Result<bool, String> {
     let (n, k) = cfg.proj.nk();
     let (m, ne) = (cfg.m, cfg.experts);
     let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
@@ -521,14 +607,25 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
     }
     let expect_args = if cfg.ring { 4 } else { 3 };
     if g.args.len() != expect_args {
-        return Err(format!("group design has {} args, expected {expect_args}", g.args.len()));
+        return Err(format!(
+            "group design has {} args, expected {expect_args}",
+            g.args.len()
+        ));
     }
     if single.args.len() != 3 {
-        return Err(format!("single-expert design has {} args, expected 3", single.args.len()));
+        return Err(format!(
+            "single-expert design has {} args, expected 3",
+            single.args.len()
+        ));
     }
     for e in 0..ne {
-        if g.a_bytes(e) != single.a_bytes(0) || g.b_bytes(e) != single.b_bytes(0) || g.c_bytes(e) != single.c_bytes(0) {
-            return Err(format!("expert {e} packed sizes differ from the single-expert design"));
+        if g.a_bytes(e) != single.a_bytes(0)
+            || g.b_bytes(e) != single.b_bytes(0)
+            || g.c_bytes(e) != single.c_bytes(0)
+        {
+            return Err(format!(
+                "expert {e} packed sizes differ from the single-expert design"
+            ));
         }
     }
     if cfg.ring {
@@ -536,14 +633,26 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
             && g.patch_sites.iter().any(|s| s.1 == PatchKind::PollSeq(0))
             && g.patch_sites.iter().any(|s| s.1 == PatchKind::DoneSeq(0));
         if !ok {
-            return Err(format!("ring group has patch sites {:?}, expected exactly PollSeq(0) and DoneSeq(0)", g.patch_sites));
+            return Err(format!(
+                "ring group has patch sites {:?}, expected exactly PollSeq(0) and DoneSeq(0)",
+                g.patch_sites
+            ));
         }
     } else if !g.patch_sites.is_empty() {
-        return Err(format!("non-ring group unexpectedly declares {} patch sites", g.patch_sites.len()));
+        return Err(format!(
+            "non-ring group unexpectedly declares {} patch sites",
+            g.patch_sites.len()
+        ));
     }
     // Arena sizes: every expert's range, at least the design's declared argument bytes, page rounded.
-    let need = [(ne - 1) * strides[0] + g.a_bytes(ne - 1), (ne - 1) * strides[1] + g.b_bytes(ne - 1), (ne - 1) * strides[2] + g.c_bytes(ne - 1)];
-    let sizes: Vec<usize> = (0..3).map(|i| round_up(g.args[i].bytes.max(need[i]).max(4096), 4096)).collect();
+    let need = [
+        (ne - 1) * strides[0] + g.a_bytes(ne - 1),
+        (ne - 1) * strides[1] + g.b_bytes(ne - 1),
+        (ne - 1) * strides[2] + g.c_bytes(ne - 1),
+    ];
+    let sizes: Vec<usize> = (0..3)
+        .map(|i| round_up(g.args[i].bytes.max(need[i]).max(4096), 4096))
+        .collect();
     println!(
         "setup: proj={} shape={m}x{n}x{k} E={ne} ring={} insts_bytes={} pdi_bytes={} patch_sites={} per_expert packed A {} B {} C {} arenas A {} B {} C {} cpu_threads={threads}{}",
         cfg.proj.name(),
@@ -561,7 +670,8 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
     );
 
     let mut dev = Device::open().map_err(|e| format!("device open failed: {e}"))?;
-    dev.map_heap(64 << 20).map_err(|e| format!("device heap map failed: {e}"))?;
+    dev.map_heap(64 << 20)
+        .map_err(|e| format!("device heap map failed: {e}"))?;
     let ntiles = dev.meta.cols as u32 * dev.meta.core.0 as u32;
     let ctx = HwCtx::create(&dev, ntiles, MAX_OPC)?;
     let pdi = dev.dev_bo(&g.pdi)?;
@@ -576,10 +686,22 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
         par_map(ne, threads, |e| {
             let (av, bv) = gen_ab(e, m, n, k);
             let [pa, pb] = g.pack_in(e, &av, &bv);
-            assert_eq!((pa.len(), pb.len()), (g.a_bytes(e), g.b_bytes(e)), "packed operand sizes of expert {e}");
+            assert_eq!(
+                (pa.len(), pb.len()),
+                (g.a_bytes(e), g.b_bytes(e)),
+                "packed operand sizes of expert {e}"
+            );
             unsafe {
-                core::ptr::copy_nonoverlapping(pa.as_ptr(), (a_base + plans[e].a_off as usize) as *mut u8, pa.len());
-                core::ptr::copy_nonoverlapping(pb.as_ptr(), (b_base + plans[e].b_off as usize) as *mut u8, pb.len());
+                core::ptr::copy_nonoverlapping(
+                    pa.as_ptr(),
+                    (a_base + plans[e].a_off as usize) as *mut u8,
+                    pa.len(),
+                );
+                core::ptr::copy_nonoverlapping(
+                    pb.as_ptr(),
+                    (b_base + plans[e].b_off as usize) as *mut u8,
+                    pb.len(),
+                );
             }
         });
     }
@@ -598,8 +720,10 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
     let mut eager_us = Vec::with_capacity(ne);
     for (e, p) in plans.iter().enumerate() {
         let (alen, blen, clen) = (g.a_bytes(e), g.b_bytes(e), g.c_bytes(e));
-        ea.as_mut_slice()[..alen].copy_from_slice(&a.as_slice()[p.a_off as usize..p.a_off as usize + alen]);
-        eb.as_mut_slice()[..blen].copy_from_slice(&b.as_slice()[p.b_off as usize..p.b_off as usize + blen]);
+        ea.as_mut_slice()[..alen]
+            .copy_from_slice(&a.as_slice()[p.a_off as usize..p.a_off as usize + alen]);
+        eb.as_mut_slice()[..blen]
+            .copy_from_slice(&b.as_slice()[p.b_off as usize..p.b_off as usize + blen]);
         ea.flush();
         eb.flush();
         ec.as_mut_slice().fill(POISON);
@@ -609,14 +733,19 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
         let state = ctx.wait(&cmd_eager, seq, cfg.timeout_ms)?;
         let dt = Instant::now() - t0;
         if state != ERT_STATE_COMPLETED {
-            return Err(format!("eager submit of expert {e}: state {state} (want {ERT_STATE_COMPLETED})"));
+            return Err(format!(
+                "eager submit of expert {e}: state {state} (want {ERT_STATE_COMPLETED})"
+            ));
         }
         eager_us.push(us(dt));
         ec.flush();
         oracle.push(ec.as_slice()[..clen].to_vec());
     }
     let eager_per_expert = mean(&eager_us);
-    println!("eager: {ne} full-TXN submits, eager_us_per_expert={}", fmt(eager_per_expert, 2));
+    println!(
+        "eager: {ne} full-TXN submits, eager_us_per_expert={}",
+        fmt(eager_per_expert, 2)
+    );
 
     // 3. CPU reference. `GroupedDesign::reference` is already row-parallel over all host threads, so the experts are
     //    computed one after the other (no nested threading). The sample runs first and its measured time decides
@@ -658,7 +787,9 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
     }
     println!("oracle: eager C vs exact CPU reference {oracle_ok}/{oracle_total}");
     if oracle_ok != oracle_total {
-        println!("check: cpu_experts={cpu_experts}/{ne} oracle_cpu_exact={oracle_ok}/{oracle_total}");
+        println!(
+            "check: cpu_experts={cpu_experts}/{ne} oracle_cpu_exact={oracle_ok}/{oracle_total}"
+        );
         return Err("eager oracle is not CPU-exact; the group comparison is meaningless".into());
     }
 
@@ -668,7 +799,12 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
         let mut bo = dev.shmem_bo(round_up(layout.bytes().max(4096), 4096))?;
         layout.initialize(&mut bo.as_mut_slice()[..layout.bytes()]);
         bo.flush();
-        Some(Ring { layout, slot: 0, bo, prev: 0 })
+        Some(Ring {
+            layout,
+            slot: 0,
+            bo,
+            prev: 0,
+        })
     } else {
         None
     };
@@ -710,20 +846,28 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
             if r > 0 {
                 patch_hot(&insts, &mut insts_host, &g.patch_sites, seq);
             }
-            rg.publish(seq, m as u32, (plans[0].a_off, plans[0].b_off, plans[0].c_off));
+            rg.publish(
+                seq,
+                m as u32,
+                (plans[0].a_off, plans[0].b_off, plans[0].c_off),
+            );
         }
         let sq = ctx.submit_prepared(&prepared)?;
         let waited = ctx.wait(&prepared.cmd, sq, cfg.timeout_ms);
         let dt = us(t0.elapsed());
         let state = waited.map_err(|e| format!("round {r}: wait failed: {e}"))?;
         if state != ERT_STATE_COMPLETED {
-            return Err(format!("round {r}: state {state} (want {ERT_STATE_COMPLETED})"));
+            return Err(format!(
+                "round {r}: state {state} (want {ERT_STATE_COMPLETED})"
+            ));
         }
         times.push(dt);
         // Untimed: DONE validation, retained-BO audit, verification.
         if let Some(rg) = &ring {
-            rg.check_done(seq, cfg.timeout_ms).map_err(|e| format!("round {r}: {e}"))?;
-            audit_insts(&insts, &insts_host, &g.insts, &g.patch_sites).map_err(|e| format!("round {r}: {e}"))?;
+            rg.check_done(seq, cfg.timeout_ms)
+                .map_err(|e| format!("round {r}: {e}"))?;
+            audit_insts(&insts, &insts_host, &g.insts, &g.patch_sites)
+                .map_err(|e| format!("round {r}: {e}"))?;
         }
         let mut status = "unverified".to_string();
         if verify {
@@ -736,7 +880,15 @@ fn run(cfg: &Cfg, g: &GroupedDesign, single: &GroupedDesign, plans: &[ExpertPlan
                 status = format!("MISMATCH ({})", bad.join("; "));
             }
         }
-        println!("round {r}: seq={}{} us={dt:.1} {status}", if cfg.ring { format!("{seq} ") } else { "n/a ".to_string() }, if cfg.ring { "done=ok" } else { "" });
+        println!(
+            "round {r}: seq={}{} us={dt:.1} {status}",
+            if cfg.ring {
+                format!("{seq} ")
+            } else {
+                "n/a ".to_string()
+            },
+            if cfg.ring { "done=ok" } else { "" }
+        );
         if !ok || final_round {
             break;
         }

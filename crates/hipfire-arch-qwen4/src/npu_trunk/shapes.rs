@@ -207,6 +207,26 @@ impl ColumnMap {
             (fused_col >= col0 && fused_col < col0 + cols).then(|| (family, fused_col - col0))
         })
     }
+
+    /// Panels `floor(first selected col0 / PANEL_COLS)..ceil(last selected end / PANEL_COLS)` covering the parts
+    /// whose family is in `families`. `None` when none of this map's parts is selected, or when the selected parts are
+    /// not adjacent in the map's fused order (a skipped retained family sits between them).
+    pub fn panel_range(&self, families: FamilyMask) -> Option<std::ops::Range<usize>> {
+        let mut selected = self
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, &(family, _, _))| families.contains(family));
+        let (first, &(_, col0, cols)) = selected.next()?;
+        let (mut last, mut end) = (first, (col0 + cols) as usize);
+        for (i, &(_, c, n)) in selected {
+            if i != last + 1 {
+                return None;
+            }
+            (last, end) = (i, (c + n) as usize);
+        }
+        Some(col0 as usize / PANEL_COLS..end.div_ceil(PANEL_COLS))
+    }
 }
 
 /// A fused trunk shape: the two input shapes (`GdnIn`, `QsaIn`; K = 2560, 1280-column panels) and the two out-projection
@@ -249,12 +269,20 @@ impl Shape {
 
     /// Reduction dimension: [`TRUNK_K`] for the input shapes, [`OUT_K`] for the out shapes.
     pub const fn k(self) -> usize {
-        if self.is_out() { OUT_K } else { TRUNK_K }
+        if self.is_out() {
+            OUT_K
+        } else {
+            TRUNK_K
+        }
     }
 
     /// Columns of one panel: [`PANEL_COLS`] (1280) or [`OUT_PANEL_COLS`] (512).
     pub const fn panel_cols(self) -> usize {
-        if self.is_out() { OUT_PANEL_COLS } else { PANEL_COLS }
+        if self.is_out() {
+            OUT_PANEL_COLS
+        } else {
+            PANEL_COLS
+        }
     }
 
     /// Panels of the full-width shape: 13 / 11 for the input shapes with every family selected, 5 for the out shapes
@@ -315,6 +343,29 @@ impl fmt::Display for Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_range_selects_contiguous_groups_only() {
+        let gdn = Shape::GdnIn.column_map(FamilyMask::ALL);
+        let qsa = Shape::QsaIn.column_map(FamilyMask::ALL);
+        let qkv = FamilyMask::from(Family::GdnQkv);
+        assert_eq!(gdn.panel_range(qkv), Some(0..8));
+        assert_eq!(gdn.panel_range(FamilyMask::from_bits(0x0e)), Some(8..13));
+        assert_eq!(gdn.panel_range(FamilyMask::from_bits(0x0f)), Some(0..13));
+        let q = FamilyMask::from(Family::QsaQ);
+        assert_eq!(qsa.panel_range(q), Some(0..10));
+        assert_eq!(qsa.panel_range(FamilyMask::from_bits(0xe0)), Some(9..11));
+        assert_eq!(qsa.panel_range(FamilyMask::from_bits(0xf0)), Some(0..11));
+        // A skipped retained family between two selected ones, and nothing selected.
+        assert_eq!(gdn.panel_range(qkv | Family::GdnA), None);
+        assert_eq!(
+            gdn.panel_range(FamilyMask::from(Family::GdnZ) | Family::GdnB),
+            None
+        );
+        assert_eq!(qsa.panel_range(q | Family::QsaIdx), None);
+        assert_eq!(gdn.panel_range(FamilyMask::NONE), None);
+        assert_eq!(gdn.panel_range(FamilyMask::QSA), None);
+    }
 
     #[test]
     fn family_table_and_order() {
@@ -392,7 +443,10 @@ mod tests {
     #[test]
     fn masked_maps_are_contiguous_and_shape_local() {
         // The other shape's bits never leak in.
-        assert_eq!(Shape::GdnIn.column_map(FamilyMask::QSA), ColumnMap::default());
+        assert_eq!(
+            Shape::GdnIn.column_map(FamilyMask::QSA),
+            ColumnMap::default()
+        );
         let m = Family::GdnZ | Family::GdnB | Family::QsaQ;
         let g = Shape::GdnIn.column_map(m);
         assert_eq!(g.parts, [(Family::GdnZ, 0, 6144), (Family::GdnB, 6144, 48)]);
@@ -425,7 +479,10 @@ mod tests {
         assert_eq!(m.panel_count(), 8);
         assert_eq!(m.padded_cols(), 10240);
         let m = Shape::GdnIn.column_map(Family::GdnA | Family::GdnB);
-        assert_eq!((m.useful_cols(), m.panel_count(), m.padded_cols()), (96, 1, 1280));
+        assert_eq!(
+            (m.useful_cols(), m.panel_count(), m.padded_cols()),
+            (96, 1, 1280)
+        );
     }
 
     #[test]
@@ -463,7 +520,15 @@ mod tests {
         assert_eq!(Shape::OUT.map(Shape::index), [2, 3]);
         for shape in Shape::OUT {
             assert!(shape.is_out());
-            assert_eq!((shape.k(), shape.panel_cols(), shape.panels(), shape.passes()), (6144, 512, 5, 1));
+            assert_eq!(
+                (
+                    shape.k(),
+                    shape.panel_cols(),
+                    shape.panels(),
+                    shape.passes()
+                ),
+                (6144, 512, 5, 1)
+            );
             assert_eq!(shape.panels() * shape.panel_cols(), OUT_COLS);
             assert!(shape.families().is_empty());
             assert!(shape.column_map(FamilyMask::ALL).parts.is_empty());
@@ -472,6 +537,9 @@ mod tests {
             assert!(!shape.is_out());
             assert_eq!((shape.k(), shape.panel_cols()), (TRUNK_K, PANEL_COLS));
         }
-        assert_eq!((Shape::GdnOut.name(), Shape::QsaO.name()), ("gdn_out", "qsa_o"));
+        assert_eq!(
+            (Shape::GdnOut.name(), Shape::QsaO.name()),
+            ("gdn_out", "qsa_o")
+        );
     }
 }

@@ -24,7 +24,7 @@ extern "C" __global__ void gemv_q8_0_moe_down_residual_scaled_k8_indexed(
     const float* __restrict__ per_expert_scale,             // [n_exp]
     const float* __restrict__ hidden_batch,                 // [k_top × K]
     float* __restrict__ x_residual,                         // [M] — accumulator
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -32,6 +32,7 @@ extern "C" __global__ void gemv_q8_0_moe_down_residual_scaled_k8_indexed(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const unsigned char* __restrict__ A =
         reinterpret_cast<const unsigned char*>(expert_ptrs[expert_id]);
 

@@ -6,14 +6,19 @@
 
 pub mod admission;
 pub mod batch_staging;
+pub mod bench_topology;
 mod carriers;
 pub use carriers::*;
 pub mod decide;
+mod qwen4_slab;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel` and the arch crates are in scope.
 pub mod spec_build;
+
+#[cfg(target_os = "linux")]
+pub use hipfire_arch_qwen4::npu_trunk::set_diagnostic_gpu_route;
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -41,6 +46,24 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::any::Any;
 use std::path::Path;
+
+/// Plain-language refusal for a model family that cannot be split across GPUs
+/// in pipeline mode. `family` is the carrier name (kept as the stable prefix),
+/// `pp` is the requested degree. Names the setting that fixes it.
+pub(crate) fn pp_unsupported_message(family: &str, is_dir: bool, pp: usize) -> String {
+    if is_dir {
+        format!(
+            "{family}: a safetensors model directory cannot be split across GPUs in pipeline \
+             mode (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU, or convert it \
+             to a packed .hfq file first"
+        )
+    } else {
+        format!(
+            "{family}: this model family cannot be split across GPUs in pipeline mode \
+             (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU"
+        )
+    }
+}
 
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
@@ -70,11 +93,7 @@ pub trait Carrier: Send + Sync {
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if pp > 1 {
-            return Err(if is_dir {
-                format!("{}: safetensors + pp>1 unsupported", self.name())
-            } else {
-                format!("{}: pipeline-parallel (pp>1) unsupported", self.name())
-            });
+            return Err(pp_unsupported_message(self.name(), is_dir, pp));
         }
         Ok(())
     }
@@ -231,6 +250,17 @@ pub trait Carrier: Send + Sync {
         None
     }
 
+    /// Producer capability: this arch's native MTP drafter ships a measured
+    /// autoregressive floor, so `speculation.mtp = auto` may attach it
+    /// (`hipfire_config::mtp_mode_admits`). Default `false`: an `auto` MTP is
+    /// declined, the head is not loaded, and the model keeps plain AR; only an
+    /// explicit `on` arms it. A carrier overrides with its producer crate's
+    /// `MTP_MEASURED_AR_FLOOR` — the declaration lives with the drafter, never
+    /// in a central arch table.
+    fn mtp_measured_ar_floor(&self) -> bool {
+        false
+    }
+
     // ── decide (Jev-compatible logit readout) ──────────────────────────────
     /// Whether this arch implements the three decide hooks below.
     fn decide_supported(&self) -> bool {
@@ -364,6 +394,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         14 => "muse_glimmer",
         16 => "qwen4",
         17 => "qwen3_5_embed",
+        18 => "embedding_gemma2",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -387,6 +418,9 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     // implementation to run (QwenVl vs DotsOcr vs Lfm2Vl have distinct generate
     // bodies in `hipfire_generate::vision`), not just whether vision is present.
     // Consulting caps here makes the gate declarative without changing behaviour.
+    // The converse is not implied: an images-capable arch with no generate-side
+    // VL body still returns `None` — the embed-only encoders (arch 17, 18) take
+    // their media through the bundle, and 18's `None` is pinned by test.
     let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
     if !caps.supports_images {
         return VisionRoute::None;
@@ -463,7 +497,7 @@ pub enum WireVerb {
 /// needs no change here; a new non-generating arch is added explicitly.
 pub fn wire_verb(arch_id: u32) -> WireVerb {
     match arch_id {
-        17 => WireVerb::Embed,
+        17 | 18 => WireVerb::Embed,
         _ => WireVerb::Generate,
     }
 }
@@ -540,6 +574,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MuseGlimmerCarrier,
     &FluxDiffusionCarrier,
     &Qwen35EmbedCarrier,
+    &EmbeddingGemma2Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -607,10 +642,39 @@ impl Eviction {
 // ─── AsstTurnCache ────────────────────────────────────────────────────
 
 /// Per-turn token cache for V4F prefix-cache stability.
+///
+/// Entries are keyed by the content/tool-call fingerprint PLUS the producer
+/// reasoning identity (`entry.reasoning.text`, missing and empty being the same
+/// identity). Two turns that normalize to the same content fingerprint (e.g.
+/// distinct think-only turns with empty content) therefore coexist instead of
+/// overwriting each other. `by_content` indexes the identities present for each
+/// content fingerprint so the reasoning-less fallback is an O(1) uniqueness
+/// check rather than a scan.
 pub struct AsstTurnCache {
     cap: Option<usize>,
-    map: std::collections::HashMap<u64, hipfire_runtime::prompt_frame::CachedAssistantTurn>,
-    order: std::collections::VecDeque<u64>,
+    map: std::collections::HashMap<AsstTurnKey, hipfire_runtime::prompt_frame::CachedAssistantTurn>,
+    order: std::collections::VecDeque<AsstTurnKey>,
+    by_content: std::collections::HashMap<u64, Vec<AsstTurnKey>>,
+}
+
+/// Cache slot identity: content/tools fingerprint + fingerprint of NONEMPTY
+/// producer reasoning (`None` for missing/empty).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AsstTurnKey {
+    fp: u64,
+    reasoning: Option<u64>,
+}
+
+impl AsstTurnKey {
+    fn new(fp: u64, reasoning: Option<&str>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let reasoning = reasoning.filter(|r| !r.is_empty()).map(|r| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            r.hash(&mut h);
+            h.finish()
+        });
+        Self { fp, reasoning }
+    }
 }
 
 impl AsstTurnCache {
@@ -629,56 +693,100 @@ impl AsstTurnCache {
                     .unwrap_or(32),
             )
         };
+        Self::with_cap(cap)
+    }
+
+    fn with_cap(cap: Option<usize>) -> Self {
         Self {
             cap,
             map: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
+            by_content: std::collections::HashMap::new(),
         }
     }
 
-    pub fn touch_mru(&mut self, fp: u64) {
-        if let Some(pos) = self.order.iter().position(|k| *k == fp) {
+    fn touch_mru(&mut self, key: AsstTurnKey) {
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
             self.order.remove(pos);
         }
-        self.order.push_back(fp);
+        self.order.push_back(key);
     }
 
+    /// True when any reasoning identity is cached for this content fingerprint.
     pub fn contains_key(&self, fp: &u64) -> bool {
-        self.map.contains_key(fp)
+        self.by_content.contains_key(fp)
     }
 
+    /// Reasoning-less lookup: hits only when exactly one identity is cached
+    /// for `fp`. See [`Self::get_for_reasoning`].
     pub fn get(&mut self, fp: &u64) -> Option<&hipfire_runtime::prompt_frame::CachedAssistantTurn> {
-        if self.map.contains_key(fp) {
-            self.touch_mru(*fp);
-            self.map.get(fp)
-        } else {
-            None
-        }
+        self.get_for_reasoning(fp, None)
+    }
+
+    /// Nonempty `reasoning` selects exactly that producer-reasoning identity.
+    /// `None`/empty hits only when exactly ONE identity is cached for `fp`
+    /// (ambiguity → miss). A hit refreshes MRU order.
+    pub fn get_for_reasoning(
+        &mut self,
+        fp: &u64,
+        reasoning: Option<&str>,
+    ) -> Option<&hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+        let wanted = reasoning.filter(|r| !r.is_empty());
+        let key = match wanted {
+            Some(r) => {
+                let key = AsstTurnKey::new(*fp, Some(r));
+                // Guard the 64-bit reasoning hash with the stored text.
+                let exact = self
+                    .map
+                    .get(&key)
+                    .and_then(|t| t.reasoning.as_ref())
+                    .is_some_and(|b| b.text == r);
+                if !exact {
+                    return None;
+                }
+                key
+            }
+            None => match self.by_content.get(fp).map(Vec::as_slice) {
+                Some([only]) => *only,
+                _ => return None,
+            },
+        };
+        self.touch_mru(key);
+        self.map.get(&key)
     }
 
     pub fn insert(&mut self, fp: u64, turn: hipfire_runtime::prompt_frame::CachedAssistantTurn) {
-        if self.map.contains_key(&fp) {
-            self.map.insert(fp, turn);
-            self.touch_mru(fp);
+        let key = AsstTurnKey::new(fp, turn.reasoning.as_ref().map(|b| b.text.as_str()));
+        if self.map.contains_key(&key) {
+            self.map.insert(key, turn);
+            self.touch_mru(key);
             return;
         }
         if let Some(c) = self.cap {
             while self.order.len() >= c {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
+                    if let Some(keys) = self.by_content.get_mut(&old.fp) {
+                        keys.retain(|k| *k != old);
+                        if keys.is_empty() {
+                            self.by_content.remove(&old.fp);
+                        }
+                    }
                 } else {
                     break;
                 }
             }
         }
-        self.map.insert(fp, turn);
-        self.order.push_back(fp);
+        self.map.insert(key, turn);
+        self.order.push_back(key);
+        self.by_content.entry(fp).or_default().push(key);
     }
 
     /// Drop all cached assistant-turn token sequences (authoritative cold reset).
     pub fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.by_content.clear();
     }
 
     /// Read-only emptiness probe for test/snapshot surfaces.
@@ -1044,6 +1152,11 @@ pub struct LoadedModel {
     /// the `DflashSpeculator` impl behind this trait object.
     pub speculator: Option<Box<dyn Speculator>>,
     pub chat_template: Option<String>,
+    /// Where `chat_template` came from after override/embedded/fallback
+    /// selection (`None` iff `chat_template` is `None`): human-readable,
+    /// names user-override file paths exactly. Published only in the daemon's
+    /// effort-probe diagnostic line.
+    pub chat_template_source: Option<String>,
     // Author-recommended sampling defaults, baked into the .hfq's
     // `generation_config` metadata and read at load time on the HFQ source
     // path (raw-safetensors PP path leaves them `None`). The generate handler
@@ -1069,6 +1182,7 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
+        chat_template_source: Option<String>,
     ) -> Self {
         LoadedModel {
             arch_id,
@@ -1098,12 +1212,28 @@ impl LoadedModel {
             model_path,
             speculator: None,
             chat_template,
+            chat_template_source,
             rec_temperature: None,
             rec_top_p: None,
             rec_top_k: None,
             rec_min_p: None,
             rec_presence_penalty: None,
         }
+    }
+
+    /// Whether this model's producer declared a measured AR floor
+    /// ([`Carrier::mtp_measured_ar_floor`]); `false` for an arch with no
+    /// registered carrier. Every MTP consumer of an `auto` mode reads this
+    /// (not head presence) so a loaded head never rearms `auto` by itself.
+    pub fn mtp_measured_ar_floor(&self) -> bool {
+        carrier_for(self.arch_id).is_some_and(|carrier| carrier.mtp_measured_ar_floor())
+    }
+
+    /// `mtp_mode` after the producer-capability gate
+    /// ([`hipfire_config::mtp_effective_mode_name`]): `auto` on a producer
+    /// without a measured AR floor is `"off"`; `on`/`off` are unchanged.
+    pub fn effective_mtp_mode(&self) -> &'static str {
+        hipfire_config::mtp_effective_mode_name(&self.mtp_mode, self.mtp_measured_ar_floor())
     }
 
     /// LFM2.5-MoE bundle if this model is arch_id=11, else None.
@@ -1139,6 +1269,29 @@ impl LoadedModel {
         self.state.as_deref_mut().and_then(|s| {
             (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
         })
+    }
+
+    /// Whole-request PLE serving guard of a Qwen4 model: while it is held
+    /// the PLE row store counts as busy, so background PLE prewarm readers
+    /// stay paused. `None` for any other architecture, or a Qwen4 profile
+    /// without PLE. Hold it for the full lifespan of a request (admission to
+    /// terminal event) and drop it on every exit.
+    pub fn ple_serving_guard(&self) -> Option<hipfire_runtime::external_rows::ServingGuard> {
+        self.qwen4().and_then(|bundle| bundle.ple_serving_guard())
+    }
+
+    /// The Qwen4 PP root bundle and its generic `Gpus` as disjoint borrows
+    /// (`state` and `pp_gpus` are separate fields), for generation closures
+    /// that need both at once. `None` unless this is a Qwen4 bundle whose
+    /// `pp_gpus` is present.
+    pub fn qwen4_mesh_mut(
+        &mut self,
+    ) -> Option<(&mut hipfire_arch_qwen4::bundle::Qwen4Bundle, &mut Gpus)> {
+        let bundle = self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        })?;
+        let gpus = self.pp_gpus.as_mut()?;
+        Some((bundle, gpus))
     }
 
     pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
@@ -1182,6 +1335,25 @@ impl LoadedModel {
     pub fn qwen35_embed_mut(&mut self) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
         self.state.as_deref_mut().and_then(|s| {
             (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>()
+        })
+    }
+
+    /// EmbeddingGemma-2 bundle if this model is arch_id=18, else `None`.
+    /// The daemon `embed` verb's typed handle.
+    pub fn embeddinggemma2_mut(
+        &mut self,
+    ) -> Option<&mut hipfire_arch_embeddinggemma2::EmbedGemmaBundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_embeddinggemma2::EmbedGemmaBundle>()
+        })
+    }
+
+    /// Read-only twin of [`Self::embeddinggemma2_mut`] for the residency
+    /// probes (`has_vision_encoder` / `has_audio_encoder` / `has_video_route`)
+    /// and any other inspection that needs no mutation.
+    pub fn embeddinggemma2(&self) -> Option<&hipfire_arch_embeddinggemma2::EmbedGemmaBundle> {
+        self.state.as_deref().and_then(|s| {
+            (s as &dyn Any).downcast_ref::<hipfire_arch_embeddinggemma2::EmbedGemmaBundle>()
         })
     }
 
@@ -1296,9 +1468,11 @@ impl LoadedModel {
     }
 
     /// Declared vision capability across ALL carriers that can carry a
-    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8), and
-    /// lfm2-vl (arch-11 bundle field). The daemon's image gate consults
-    /// this instead of the qwen-typed accessors above.
+    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8),
+    /// lfm2-vl (arch-11 bundle field), and embeddinggemma2 (arch 18, whose
+    /// `.vl` pack carries the Gemma4 tower). The daemon's image gate and the
+    /// `loaded` ack's `vl` fact consult this instead of the qwen-typed
+    /// accessors above.
     pub fn has_vision_encoder(&self) -> bool {
         if self.dots_ocr().is_some() {
             return true;
@@ -1308,7 +1482,27 @@ impl LoadedModel {
                 return true;
             }
         }
+        if self.embeddinggemma2().is_some_and(|b| b.vision.is_some()) {
+            return true;
+        }
         self.qwen35().is_some_and(|b| b.vision_config.is_some())
+    }
+
+    /// Declared audio capability: an audio tower is resident in this load.
+    /// Today only embeddinggemma2 (arch 18) carries one (in the same `.vl`
+    /// pack as the vision tower); every other arch answers `false`, matching
+    /// the embed body's per-modality refusals.
+    pub fn has_audio_encoder(&self) -> bool {
+        self.embeddinggemma2().is_some_and(|b| b.audio.is_some())
+    }
+
+    /// Declared video capability: the arch serves the embed route's video
+    /// leg. Video has no tower of its own — arch 18's frames ride the vision
+    /// tower, one pass per frame — so this is the vision tower's residency on
+    /// the one arch with a video leg, and `false` everywhere else (arch 17's
+    /// encoder has no video leg; chat VL arches take no video input).
+    pub fn has_video_route(&self) -> bool {
+        self.embeddinggemma2().is_some_and(|b| b.vision.is_some())
     }
 
     /// LFM2-VL (arch 11) projected-vision config + weights, when loaded
@@ -1380,6 +1574,7 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
+        chat_template_source: Option<String>,
         pp: usize,
         pp_gpus: Gpus,
         pp_dn_la_to_device: Vec<u8>,
@@ -1395,6 +1590,7 @@ impl LoadedModel {
                 physical_cap,
                 model_path,
                 chat_template,
+                chat_template_source,
             )
         }
     }
@@ -1484,14 +1680,24 @@ impl EpArch {
 
 // ─── Helper functions ─────────────────────────────────────────────────
 
+/// Provenance text for the embedded HFQ tokenizer_config template.
+const SRC_EMBEDDED_HFQ: &str = "embedded HFQ tokenizer_config.chat_template";
+/// Provenance text for the safetensors-directory template files.
+pub(crate) const SRC_DIR_JINJA: &str = "model-dir chat_template.jinja";
+pub(crate) const SRC_DIR_TOKENIZER_CONFIG: &str = "model-dir tokenizer_config.json chat_template";
+
 /// Layer 1 (resolved config) + Layer 2 (per-model ~/.hipfire/templates).
-fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
+/// Returns `(template, source)`; the source names the exact override file.
+fn resolve_chat_template_overrides(model_path: &str) -> Option<(String, String)> {
     if let Some(config_path) = hipfire_runtime::config::get().chat_template_file.as_deref() {
         if !config_path.is_empty() {
             match std::fs::read_to_string(config_path) {
                 Ok(s) => {
                     eprintln!("[chat_template] using configured template {config_path}");
-                    return Some(s);
+                    return Some((
+                        s,
+                        format!("user override: configured chat_template_file {config_path}"),
+                    ));
                 }
                 Err(e) => eprintln!(
                     "[chat_template] configured template {config_path} failed to read ({e}); falling through"
@@ -1516,7 +1722,9 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
                             "[chat_template] using per-model override {}",
                             per_model.display()
                         );
-                        return Some(s);
+                        let source =
+                            format!("user override: per-model template {}", per_model.display());
+                        return Some((s, source));
                     }
                     Err(e) => eprintln!(
                         "[chat_template] per-model file {} failed to read ({e}); falling through",
@@ -1529,55 +1737,79 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
     None
 }
 
-fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
-    if let Some(s) = resolve_chat_template_overrides(model_path) {
-        return Some(s);
+/// Effective template for an HFQ load plus its provenance description.
+/// `(None, None)` when the artifact has no template and no built-in applies.
+fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> (Option<String>, Option<String>) {
+    if let Some((s, source)) = resolve_chat_template_overrides(model_path) {
+        return (Some(s), Some(source));
     }
     match hfq.arch_id {
         // Prefer HFQ-embedded tokenizer_config.chat_template (Qwen3.8 official
         // low/medium/xhigh reasoning_effort). Fall back to froggeric for older
         // Qwen3.5/3.6 files that lack one.
         5 | 6 => {
-            return Some(qwen35_template_from_embedded(
-                hfq.chat_template(),
-                model_path,
-            ));
+            let (t, source) = qwen35_template_from_embedded(hfq.chat_template(), model_path);
+            return (Some(t), Some(source));
         }
         11 => {
             if let Some(t) = hfq.chat_template() {
-                return Some(t);
+                return (Some(t), Some(SRC_EMBEDDED_HFQ.to_string()));
             }
-            return Some(LFM2_TEMPLATE.to_string());
+            return (
+                Some(LFM2_TEMPLATE.to_string()),
+                Some("built-in fallback: LFM2 liquidai template".to_string()),
+            );
         }
         12 => {
             if let Some(t) = hfq.chat_template_named("tool_use") {
-                return Some(
-                    t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
-                        .replace("<|END_RESPONSE|>", "<|END_TEXT|>")
-                        .replace("{{message.tool_plan}}", "{{ message.tool_plan or '' }}")
-                        .replace("{{ tc['function']['name'] }}", "{{ tc.name }}")
-                        .replace(
-                            "{{ tc['function']['arguments']|tojson }}",
-                            "{{ tc.arguments|tojson }}",
-                        ),
+                return (
+                    Some(
+                        t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
+                            .replace("<|END_RESPONSE|>", "<|END_TEXT|>")
+                            .replace("{{message.tool_plan}}", "{{ message.tool_plan or '' }}")
+                            .replace("{{ tc['function']['name'] }}", "{{ tc.name }}")
+                            .replace(
+                                "{{ tc['function']['arguments']|tojson }}",
+                                "{{ tc.arguments|tojson }}",
+                            ),
+                    ),
+                    Some(
+                        "embedded HFQ tokenizer_config.chat_template[tool_use] (rewritten for cohere2moe)"
+                            .to_string(),
+                    ),
                 );
             }
         }
         _ => {}
     }
-    hfq.chat_template()
+    let t = hfq.chat_template();
+    let source = t.as_ref().map(|_| SRC_EMBEDDED_HFQ.to_string());
+    (t, source)
 }
 
 /// Arch 5/6 template after configured/per-model overrides: embedded HFQ
 /// `tokenizer_config.chat_template` when present, else froggeric fallback.
 /// Ornith 1.5 basenames get a load-time Qwen3.8-shaped `reasoning_effort`
 /// adaptation of the embedded (non-native) parent template; other models and
-/// the froggeric missing-template path are left alone.
-fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> String {
+/// the froggeric missing-template path are left alone. Returns the template
+/// and its provenance description.
+fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> (String, String) {
     match embedded {
-        Some(t) if is_ornith15_artifact(model_path) => adapt_ornith15_embedded_chat_template(t),
-        Some(t) => t,
-        None => FROGGERIC_QWEN35_TEMPLATE.to_string(),
+        Some(t) if is_ornith15_artifact(model_path) => {
+            let (t, adapted) = adapt_ornith15_embedded_chat_template(t);
+            let source = if adapted {
+                format!("{SRC_EMBEDDED_HFQ} (ornith-1.5 reasoning_effort adapter applied)")
+            } else {
+                SRC_EMBEDDED_HFQ.to_string()
+            };
+            (t, source)
+        }
+        Some(t) => (t, SRC_EMBEDDED_HFQ.to_string()),
+        None => (
+            FROGGERIC_QWEN35_TEMPLATE.to_string(),
+            "built-in fallback: froggeric qwen35 template (artifact has no embedded chat_template)"
+                .to_string(),
+        ),
     }
 }
 
@@ -1674,17 +1906,17 @@ const ORNITH_NO_TOOLS_SYSTEM_BRANCH_ADAPTED: &str = concat!(
 /// official Qwen3.8 `reasoning_effort` low/medium/xhigh system-prompt contract
 /// via exact-marker rewrite. Already-native templates and marker drift are
 /// returned unchanged so `probe_effort_capability` stays honest.
-fn adapt_ornith15_embedded_chat_template(template: String) -> String {
+fn adapt_ornith15_embedded_chat_template(template: String) -> (String, bool) {
     if template.contains("reasoning_effort") {
-        return template;
+        return (template, false);
     }
     match try_adapt_ornith15_qwen35_to_effort_native(&template) {
-        Ok(adapted) => adapted,
+        Ok(adapted) => (adapted, true),
         Err(reason) => {
             eprintln!(
                 "[chat_template] ornith-1.5 reasoning_effort adapter skipped ({reason}); keeping embedded template"
             );
-            template
+            (template, false)
         }
     }
 }
@@ -1839,7 +2071,7 @@ pub(crate) fn parse_state_quant(
         "fp32" | "f32" => Ok(StateQuant::FP32),
         "q4" | "int4" => Ok(StateQuant::Q4),
         other => Err(format!(
-            "unsupported DeltaNet state_quant '{other}' (expected q8|fp32|q4)"
+            "unsupported state_quant '{other}' for the DeltaNet recurrent state; choose q8 (the default), fp32 or q4"
         )),
     }
 }
@@ -1973,7 +2205,10 @@ fn resolve_qwen35_mtp_head(
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
-) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Vec<String>,
+) {
     let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
         trunk_path,
         sidecar,
@@ -2061,6 +2296,7 @@ fn finish_qwen35_load(
     physical_cap: usize,
     arch_id: u32,
     chat_template: Option<String>,
+    chat_template_source: Option<String>,
     ctx: &mut LoadCtx,
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -2165,7 +2401,7 @@ fn finish_qwen35_load(
                                             physical_cap,
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
-                                            0.5,
+                                            hipfire_runtime::dspark_block_controller::WindowCost::Measured { max_ratio: 0.5 },
                                         ))
                                         }
                                         Err(e) => {
@@ -2240,7 +2476,11 @@ fn finish_qwen35_load(
             Ok(s) => {
                 eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size, s.block_size
+                    dp,
+                    s.draft_config.n_layers,
+                    s.draft_config.hidden,
+                    s.draft_config.block_size,
+                    s.block_size
                 );
                 Some(s)
             }
@@ -2248,7 +2488,7 @@ fn finish_qwen35_load(
                 if ctx.spec.dflash == Some(true) {
                     return Err(rollback_unfinished_qwen35(
                         format!(
-                            "DFlash draft required (dflash_mode=on) but failed to load ({dp}): {e}"
+                            "DFlash draft required (speculation.dflash = on) but failed to load ({dp}): {e}"
                         ),
                         bundle,
                         vision_weights,
@@ -2306,12 +2546,20 @@ fn finish_qwen35_load(
     // declines over a host-mapped spill, `on` (`Some(true)`) arms, `off`
     // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
     // empty. Worded once in `hipfire_config::mtp_host_spill_decline_line`.
-    let mtp_spill_mode = match ctx.spec.mtp {
-        Some(true) => hipfire_config::MtpMode::On,
-        Some(false) => hipfire_config::MtpMode::Off,
-        None => hipfire_config::MtpMode::Auto,
-    };
+    let mtp_spill_mode = hipfire_config::MtpMode::from_tri_state(ctx.spec.mtp);
+    // Producer capability gate first: qwen35's drafter declares no measured AR
+    // floor (`hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR`), so `auto` keeps
+    // plain AR and the head is never loaded (the retained AR spine keeps its
+    // memory); only an explicit `on` arms it. A floor decline supersedes the
+    // spill decline below (its line would misdescribe the cause).
+    let mtp_floor_declined = matches!(arch_id, 5 | 6)
+        && mtp_spill_mode == hipfire_config::MtpMode::Auto
+        && !hipfire_config::mtp_mode_admits(
+            mtp_spill_mode,
+            hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR,
+        );
     let mtp_spill_degrade = matches!(arch_id, 5 | 6)
+        && !mtp_floor_declined
         && !hipfire_config::mtp_host_spill_policy(
             mtp_spill_mode,
             host_mapped_expert_blobs,
@@ -2335,56 +2583,68 @@ fn finish_qwen35_load(
             )
         );
     }
+    if mtp_floor_declined
+        && !adaptive_blocks_generic_spec
+        && eviction.is_none()
+        && dflash.is_none()
+        && dspark_speculator.is_none()
+    {
+        eprintln!("{}", hipfire_config::mtp_no_floor_decline_line("qwen35"));
+    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
-    // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
+    // and a typed mtp the producer-capability gate admits (`on`; `auto` only with a
+    // declared measured AR floor, which qwen35 lacks, so `auto` never loads a head).
+    // Bundled first, then the sidecar the CLI resolved
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
-    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> = if adaptive_blocks_generic_spec
-        || eviction.is_some()
-        || !matches!(arch_id, 5 | 6)
-        || ctx.spec.mtp == Some(false)
-        || mtp_spill_degrade
-        || dflash.is_some()
-        || dspark_speculator.is_some()
-    {
-        None
-    } else {
-        // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
-        // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
-        // daemon clients keep the canonical-sibling lookup.
-        let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
-            Path::new(ctx.path),
-            ctx.mtp_path.clone(),
-            (config.dim, config.vocab_size),
-            &mut *ctx.gpu,
-            physical_cap,
-            None,
-        );
-        if resolved.is_none() {
-            if ctx.spec.mtp == Some(true) {
-                let reason = if errors.is_empty() {
-                    "no bundled trailer or .mtp sidecar found".to_string()
-                } else {
-                    errors.join("; ")
-                };
-                return Err(rollback_unfinished_qwen35(
-                    format!("MTP head required (mtp=on) but not loaded: {reason}"),
-                    bundle,
-                    vision_weights,
-                    ctx.gpu,
-                ));
+    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> =
+        if adaptive_blocks_generic_spec
+            || eviction.is_some()
+            || !matches!(arch_id, 5 | 6)
+            || ctx.spec.mtp == Some(false)
+            || mtp_spill_degrade
+            || mtp_floor_declined
+            || dflash.is_some()
+            || dspark_speculator.is_some()
+        {
+            None
+        } else {
+            // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
+            // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
+            // daemon clients keep the canonical-sibling lookup.
+            let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
+                Path::new(ctx.path),
+                ctx.mtp_path.clone(),
+                (config.dim, config.vocab_size),
+                &mut *ctx.gpu,
+                physical_cap,
+                None,
+            );
+            if resolved.is_none() {
+                if ctx.spec.mtp == Some(true) {
+                    let reason = if errors.is_empty() {
+                        "no bundled trailer or .mtp sidecar found".to_string()
+                    } else {
+                        errors.join("; ")
+                    };
+                    return Err(rollback_unfinished_qwen35(
+                        format!("MTP head required (mtp=on) but not loaded: {reason}"),
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
+                if !errors.is_empty() {
+                    eprintln!(
+                        "  MTP head not loaded: {} — falling back to AR/n-gram",
+                        errors.join("; ")
+                    );
+                }
             }
-            if !errors.is_empty() {
-                eprintln!(
-                    "  MTP head not loaded: {} — falling back to AR/n-gram",
-                    errors.join("; ")
-                );
-            }
-        }
-        resolved
-    };
+            resolved
+        };
     if mtp.is_some() {
         if let Some(reason) = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
             &bundle.weights.layers,
@@ -2403,10 +2663,7 @@ fn finish_qwen35_load(
         }
     }
     let mtp_present = mtp.is_some();
-    let (mtp, mtp_source) = match mtp {
-        Some((head, source)) => (Some(head), Some(source)),
-        None => (None, None),
-    };
+    let mtp = mtp.map(|(head, _source)| head);
     // Auto-attached drafters (mode `auto`, not forced `on`) get one line that
     // names the artifact and the switch, so an A/B never starts with a hunt.
     let auto_draft = match (ctx.spec.dflash, &dflash, ctx.draft_path) {
@@ -2446,8 +2703,6 @@ fn finish_qwen35_load(
             eprintln!(
                 "DFlash: on (auto, draft {draft}) — disable with --spec off or speculation.dflash off"
             );
-        } else if let (Some(source), None, "mtp") = (&mtp_source, ctx.spec.mtp, name) {
-            eprintln!("MTP: on (auto, {source}) — disable with --spec off or speculation.mtp off");
         }
     }
 
@@ -2471,6 +2726,7 @@ fn finish_qwen35_load(
             physical_cap,
             ctx.path.to_string(),
             chat_template,
+            chat_template_source,
         )
     };
     model.mtp_weights_present = mtp_present;
@@ -2702,12 +2958,24 @@ struct RouteRequest<'a> {
     state_quant_override: Option<&'a str>,
     cask: &'a CaskConfig,
     spec: SpecLoadCfg,
+    kv_backend: KvBackend,
 }
 
-/// A begun route: the speculative route its plan was resolved for, checked
-/// against the loaded model before the route is sealed.
+/// A begun route, checked against the loaded model before it finishes.
+/// `spec` is the speculative route its closed plan was resolved for; `None`
+/// for a predicted-family fallback (no closed plan): that route is always
+/// open and nothing of the model can leave it.
 struct PlannedRoute {
-    spec: rdna_compute::kernel_registry::KernelSpecRoute,
+    spec: Option<rdna_compute::kernel_registry::KernelSpecRoute>,
+    predicted: Option<PredictedRoute>,
+}
+
+/// The predicted-family set a route compiles beyond (or instead of) a closed
+/// plan, summarised for the load log.
+struct PredictedRoute {
+    family: &'static str,
+    basis: &'static str,
+    modules: usize,
 }
 
 /// Resolve this load's kernel route plan from header metadata and the
@@ -2720,6 +2988,7 @@ fn resolve_route_plan(
     (
         rdna_compute::kernel_registry::RouteKernelPlan,
         rdna_compute::kernel_registry::KernelSpecRoute,
+        rdna_compute::kernel_registry::RouteSeal,
     ),
     String,
 > {
@@ -2728,9 +2997,19 @@ fn resolve_route_plan(
     let ModelSource::Hfq(hfq) = req.source else {
         return Err("safetensors directory source".into());
     };
-    // Only the Qwen3.5 dense carrier has closed plans; it shares this policy.
-    if hfq.arch_id != 5 {
-        return Err(format!("model arch {}", hfq.arch_id));
+    // Developer kill switch, and how route walks (scripts/route_plan_walk.py)
+    // observe a route's whole lazy closure without the plan they regenerate.
+    // Qwen3.5 resolves its axes (and logs them for the walk) before refusing.
+    let route_plan_off = !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true);
+    const ROUTE_PLAN_OFF: &str = "HIPFIRE_ROUTE_PLAN=0";
+    match hfq.arch_id {
+        // Qwen3.5 dense (5) and MoE (6: A3B, Qwen3.6, Ornith) share the qwen35
+        // carrier: the hand-walked 27B closure and the walked plans share this
+        // policy.
+        5 | 6 => {}
+        _ if route_plan_off => return Err(ROUTE_PLAN_OFF.into()),
+        hipfire_arch_qwen4::ARCH_ID => return resolve_qwen4_route_plan(req, gpu, hfq),
+        other => return Err(format!("model arch {other}")),
     }
     if req.pp != 1 {
         return Err(format!("pp={}", req.pp));
@@ -2777,15 +3056,16 @@ fn resolve_route_plan(
     {
         return Err("vision tower".into());
     }
-    let config = <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
-        .map_err(|e| e.to_string())?;
+    let config =
+        <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
+            .map_err(|e| e.to_string())?;
     // Same K/V resolution as the qwen35 HFQ carrier (adaptive/CASK refused above).
     let mode_raw = req
         .kv_mode_override
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
-    let native_eligible = kv_mode::qwen35_native_eligible(
+    let auto_native = kv_mode::qwen35_native_auto_eligible(
         gpu.arch.as_str(),
         config.n_heads,
         config.n_kv_heads,
@@ -2795,7 +3075,7 @@ fn resolve_route_plan(
         false,
     );
     let policy =
-        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, auto_native);
     let pair = kv_mode::resolve_kv_pair(
         &mode_raw,
         req.kv_k_override.filter(|s| !s.is_empty()),
@@ -2810,9 +3090,10 @@ fn resolve_route_plan(
             let name = kv_mode::qwen_k_display_name(k);
             (name, name)
         }
-        kv_mode::KvPair::Split(k, v) => {
-            (kv_mode::qwen_k_display_name(k), kv_mode::qwen_v_display_name(v))
-        }
+        kv_mode::KvPair::Split(k, v) => (
+            kv_mode::qwen_k_display_name(k),
+            kv_mode::qwen_v_display_name(v),
+        ),
     };
     let state_quant = match parse_state_quant(req.state_quant_override)? {
         StateQuant::Q8 => "q8",
@@ -2821,8 +3102,13 @@ fn resolve_route_plan(
     };
     // Native MTP head, in the loader's order: bundled trailer, then sidecar.
     // A head that later fails its trunk check falls back to AR, a subset of
-    // the MTP plan.
-    let head = if req.spec.mtp == Some(false) {
+    // the MTP plan. The plan applies the loader's producer-capability gate:
+    // `auto` without a declared measured AR floor (qwen35's case) loads no
+    // head, so the plan is the AR route.
+    let head = if !hipfire_config::mtp_mode_admits(
+        hipfire_config::MtpMode::from_tri_state(req.spec.mtp),
+        hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR,
+    ) {
         None
     } else {
         match hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(base) {
@@ -2856,7 +3142,58 @@ fn resolve_route_plan(
             shape: &t.shape,
         })
         .collect();
-    let plan = rdna_compute::kernel_registry::route_entries(&RouteKernelInput {
+    // Routed-expert placement: a closed plan is the fully resident one. The
+    // pager, a REAP keep-map and any configured spill (host-placed experts or
+    // layers, which run other kernels) have no closed route.
+    if config.paged_experts {
+        return Err("paged experts".into());
+    }
+    if config.reap_keep.is_some() {
+        return Err("REAP keep-map".into());
+    }
+    {
+        use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+        if effective_offload_budgets() != (OffloadBudget::Full, OffloadBudget::Full) {
+            return Err("memory.gpu_layer_budget / memory.moe_expert_budget spill".into());
+        }
+    }
+    // The walked-plan axes: every resolved policy a walk must have covered
+    // exactly (`#! axis` lines). Names match `scripts/route_plan_build.py`.
+    let prefill_chunk_rows = qwen35::prefill::prefill_chunk_rows_requested(gpu);
+    let axes = [
+        ("kv_k", kv_k.to_owned()),
+        ("kv_v", kv_v.to_owned()),
+        ("state_quant", state_quant.to_owned()),
+        ("kv_backend", req.kv_backend.as_str().to_owned()),
+        ("prefill_chunk_rows", prefill_chunk_rows.to_string()),
+        // MoE shape the tensor layout does not pin (top-k), and the resident
+        // placement the refusals above guarantee; dense models walk 0 / 0.
+        ("num_experts", config.num_experts.to_string()),
+        ("experts_per_tok", config.num_experts_per_tok.to_string()),
+        ("expert_placement", "resident".to_owned()),
+    ];
+    // Developer-only: the resolved route facts `route_plan_build.py` reads
+    // from a walk's stderr (the Qwen3.5 counterpart of `qwen4 state:`).
+    if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+        let resolved: Vec<String> = axes
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        eprintln!(
+            "  route plan axes: arch={} model_arch={} spec={spec:?} heads={},{},{} max_seq={} {}",
+            gpu.arch,
+            hfq.arch_id,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            req.max_seq,
+            resolved.join(" ")
+        );
+    }
+    if route_plan_off {
+        return Err(ROUTE_PLAN_OFF.into());
+    }
+    let (plan, seal) = rdna_compute::kernel_registry::route_entries_sealed(&RouteKernelInput {
         arch: gpu.arch.as_str(),
         model_arch: hfq.arch_id,
         tensors: &tensors,
@@ -2864,7 +3201,7 @@ fn resolve_route_plan(
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
         max_seq: req.max_seq,
-        prefill_chunk_rows: qwen35::prefill::prefill_chunk_rows_requested(gpu),
+        prefill_chunk_rows,
         kv_k,
         kv_v,
         state_quant,
@@ -2874,43 +3211,280 @@ fn resolve_route_plan(
         retained_decode: true,
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
+        route_axes: &axes,
     })
     .map_err(|e| format!("{e:?}"))?;
-    Ok((plan, spec))
+    Ok((plan, spec, seal))
+}
+
+/// Flash-Next (Qwen4) route plan: the walked plan (`kernel_registry`
+/// `route_plans/`) for this header layout and exact arch, resolved with the
+/// carrier's own policy resolvers. Every option the walks did not cover
+/// refuses here, so the load keeps lazy kernel loading.
+fn resolve_qwen4_route_plan(
+    req: &RouteRequest<'_>,
+    gpu: &Gpu,
+    hfq: &HfqFile,
+) -> Result<
+    (
+        rdna_compute::kernel_registry::RouteKernelPlan,
+        rdna_compute::kernel_registry::KernelSpecRoute,
+        rdna_compute::kernel_registry::RouteSeal,
+    ),
+    String,
+> {
+    use rdna_compute::kernel_registry::{KernelSpecRoute, KernelTensorMeta, RouteKernelInput};
+    use rdna_compute::tensor_ops::QsaKvFormat;
+    if req.pp != 1 {
+        return Err(format!("pp={}", req.pp));
+    }
+    let ep = hipfire_config::topology::qwen4_ep()?;
+    if ep > 1 {
+        return Err(format!("expert parallelism (topology.ep = {ep})"));
+    }
+    if req.draft_path.is_some() || req.cask.sidecar.is_some() {
+        return Err("a drafter or CASK sidecar".into());
+    }
+    if crate::admission::qwen4_kv_adaptive_requested(req.kv_adaptive_override) {
+        return Err("adaptive KV".into());
+    }
+    if hipfire_runtime::config::retained_redline_default(
+        &gpu.arch, "qwen4", req.path, req.pp, 1, ep, true,
+    ) {
+        return Err("retained Redline route".into());
+    }
+    let default_k = hipfire_config::mtp_k_default(
+        hipfire_arch_qwen4::ARCH_ID,
+        rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&gpu.arch),
+    );
+    if let Some(k) = req
+        .spec
+        .mtp_k
+        .or(hipfire_runtime::config::get().mtp_k)
+        .filter(|&k| k != default_k)
+    {
+        return Err(format!("MTP K={k} (walked K={default_k})"));
+    }
+    let native_mtp =
+        crate::admission::qwen4_native_mtp(req.spec, &gpu.arch, req.path, req.pp, 1, ep)?;
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
+        .map_err(|error| error.to_string())?;
+    if hipfire_arch_qwen4::resolve_trunk_overlay(
+        hfq,
+        Path::new(req.path),
+        &gpu.arch,
+        &receipt.config,
+    )?
+    .is_some()
+    {
+        return Err("trunk overlay".into());
+    }
+    let kv_mode = req
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+    let state = hipfire_arch_qwen4::resolve_state_format(
+        &kv_mode,
+        req.state_quant_override.unwrap_or(""),
+        gpu,
+        &receipt.config,
+    )?;
+    // Names as the load log prints them (`qwen4 state:` line), which the
+    // route walk records.
+    let qsa = match state.qsa {
+        QsaKvFormat::Fp8 => "fp8",
+        QsaKvFormat::Fp8Fnuz => "fp8-fnuz",
+        QsaKvFormat::Q8 => "q8",
+        QsaKvFormat::F32 => "f32",
+    };
+    let on_off = |on: bool| if on { "on" } else { "off" }.to_owned();
+    let axes = [
+        ("qsa", qsa.to_owned()),
+        (
+            "kv_backend",
+            hipfire_arch_qwen4::Qwen4KvBackend::from(req.kv_backend)
+                .name()
+                .to_owned(),
+        ),
+        ("gdn", state.gdn.name().to_owned()),
+        ("qsa_f16_arena", on_off(state.qsa_f16_arena)),
+        ("qsa_pooled_bf16", on_off(state.qsa_pooled_bf16)),
+    ];
+    let spec = if native_mtp {
+        KernelSpecRoute::NativeMtp
+    } else {
+        KernelSpecRoute::Ar
+    };
+    let owned = hipfire_runtime::loader_api::header_tensor_meta(hfq);
+    let tensors: Vec<KernelTensorMeta<'_>> = owned
+        .iter()
+        .map(|t| KernelTensorMeta {
+            name: &t.name,
+            dtype: t.dtype,
+            shape: &t.shape,
+        })
+        .collect();
+    let (plan, seal) = rdna_compute::kernel_registry::route_entries_sealed(&RouteKernelInput {
+        arch: gpu.arch.as_str(),
+        model_arch: hfq.arch_id,
+        tensors: &tensors,
+        n_heads: receipt.config.num_attention_heads,
+        n_kv_heads: receipt.config.num_key_value_heads,
+        head_dim: receipt.config.head_dim,
+        max_seq: req.max_seq,
+        prefill_chunk_rows: 0,
+        kv_k: qsa,
+        kv_v: qsa,
+        state_quant: state.gdn.name(),
+        spec,
+        host_mapped_experts: false,
+        retained_decode: true,
+        hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
+        flags: &gpu.flags,
+        route_axes: &axes,
+    })
+    .map_err(|e| format!("{e:?}"))?;
+    Ok((plan, spec, seal))
 }
 
 /// User-facing note for the lazy kernel path: a cold kernel cache compiles
 /// each kernel at its first launch, which is the slow first run users see.
 const LAZY_KERNELS_NOTE: &str = "compiling kernels on first use (one-time, cached afterwards)…";
 
-/// Start a planner-closed route's kernel load: the bounded batch compile
-/// overlaps the weight load when the host budget admits a worker alongside
-/// it; otherwise the whole plan is compiled and loaded before any weight
-/// allocation. A load no budget admits fails here, before destructive work.
-/// Refused routes reset to lazy loading and return `None`.
+/// Start a route's kernel load: the bounded batch compile overlaps the
+/// weight load when the host budget admits a worker alongside it; otherwise
+/// the whole plan is compiled and loaded before any weight allocation. A
+/// load no budget admits, or any planned or predicted module that fails to
+/// compile, fails here, before destructive work and never at the first
+/// request.
+///
+/// Everything predictable is compiled before the model is loaded: a refused
+/// route (no closed plan) and an open walked plan both add the model
+/// family's predicted module set (the arch's whole installer inventory
+/// minus the plan; the family trace only chooses which symbols bind; see
+/// `kernel_registry::predicted_kernels`). That coverage is never a closure:
+/// the route finishes open, never sealed. `HIPFIRE_ROUTE_PLAN=0` (a route
+/// walk) returns `None` and loads lazily with no preload, so the walk
+/// records the real dispatch. `HIPFIRE_ROUTE_PLAN_SEAL=1` (a sealed replay)
+/// loads only the exact plan, with no predicted extras, and seals it; a
+/// refused route then stays lazy so the replay fails loudly.
 fn begin_route_kernels(
     req: &RouteRequest<'_>,
     gpu: &mut Gpu,
 ) -> Result<Option<PlannedRoute>, String> {
-    use rdna_compute::compile_jobs::{compile_job_budget, host_available_memory, parse_job_override};
+    use rdna_compute::compile_jobs::{
+        compile_job_budget, host_available_memory, parse_job_override,
+    };
+    use rdna_compute::kernel_registry::{PredictKernelInput, RouteKernelPlan, RouteSeal};
     gpu.abort_route_kernel_load()
         .map_err(|e| format!("kernel route reset: {e}"))?;
-    let (plan, spec) = match resolve_route_plan(req, gpu) {
-        Ok(resolved) => resolved,
-        Err(reason) => {
-            eprintln!("  kernels: {LAZY_KERNELS_NOTE} [no closed route plan: {reason}]");
+    // Resolve first: a walk (`HIPFIRE_ROUTE_PLAN=0`) still needs the axes
+    // line the resolver logs, then loads lazily with nothing preloaded.
+    let resolved = resolve_route_plan(req, gpu);
+    if !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true) {
+        eprintln!(
+            "  kernels: {LAZY_KERNELS_NOTE} [HIPFIRE_ROUTE_PLAN=0: route walk, nothing preloaded]"
+        );
+        return Ok(None);
+    }
+    let sealed_replay = hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN_SEAL", false);
+    let (plan, spec, mut open, refusal) = match resolved {
+        Ok((plan, spec, _)) if sealed_replay => (plan, Some(spec), None, None),
+        Ok((plan, spec, RouteSeal::Sealed)) => (plan, Some(spec), None, None),
+        Ok((plan, spec, RouteSeal::Open(family))) => (
+            plan,
+            Some(spec),
+            Some(format!("{family} {} {spec:?}", gpu.arch)),
+            None,
+        ),
+        Err(reason) if sealed_replay => {
+            eprintln!(
+                "  kernels: {LAZY_KERNELS_NOTE} [HIPFIRE_ROUTE_PLAN_SEAL=1: no closed route plan: {reason}]"
+            );
             return Ok(None);
         }
+        Err(reason) => (
+            RouteKernelPlan {
+                entries: Vec::new(),
+            },
+            None,
+            None,
+            Some(reason),
+        ),
+    };
+    // A sealed plan is an exact closure and takes no speculative extras.
+    let predicted = if open.is_none() && refusal.is_none() {
+        None
+    } else {
+        let model_arch = match req.source {
+            ModelSource::Hfq(hfq) => Some(hfq.arch_id),
+            _ => None,
+        };
+        match rdna_compute::kernel_registry::predicted_kernels(
+            &PredictKernelInput {
+                arch: gpu.arch.as_str(),
+                model_arch,
+                hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
+                pm_decode: gpu.flags.pm_decode,
+                // Only an exact recognised plan lets the family trace choose binds.
+                exact_plan: refusal.is_none(),
+            },
+            &plan,
+        ) {
+            Ok(predicted) => Some(predicted),
+            Err(e) => {
+                eprintln!(
+                    "  kernels: no predicted kernel set for {} ({e:?})",
+                    gpu.arch
+                );
+                None
+            }
+        }
+    };
+    if let Some(reason) = &refusal {
+        // No registry inventory for this arch: nothing is predictable.
+        let Some(predicted) = &predicted else {
+            eprintln!("  kernels: {LAZY_KERNELS_NOTE} [no closed route plan: {reason}]");
+            return Ok(None);
+        };
+        open = Some(format!(
+            "{} {} predicted fallback",
+            predicted.family, gpu.arch
+        ));
+    }
+    let summary = predicted.as_ref().map(|p| PredictedRoute {
+        family: p.family,
+        basis: p.basis.label(),
+        modules: p.modules.len(),
+    });
+    let predicted_note = predicted.as_ref().map_or_else(String::new, |p| {
+        format!(
+            " + {} predicted {} modules [{}] ({} symbols in {} modules bound, {} compile-only, {} omitted)",
+            p.modules.len(),
+            p.family,
+            p.basis.label(),
+            p.bound_symbols(),
+            p.bound_modules(),
+            p.modules.len() - p.bound_modules(),
+            p.omitted.len(),
+        )
+    });
+    let route_note = match (&spec, &refusal) {
+        (Some(spec), _) => format!("{spec:?} route plan ({} modules)", plan.entries.len()),
+        (None, Some(reason)) => format!("no closed route plan ({reason}); predicted fallback"),
+        (None, None) => unreachable!("a refusal or a plan"),
     };
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
     let override_jobs = parse_job_override(
         "HIPFIRE_JIT_JOBS",
-        hipfire_config::developer_var("HIPFIRE_JIT_JOBS").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_JIT_JOBS")
+            .ok()
+            .as_deref(),
     )?;
     let available = host_available_memory();
-    let modules = plan.entries.len();
     let overlap = compile_job_budget(
         cores,
         available,
@@ -2920,62 +3494,138 @@ fn begin_route_kernels(
     let started = std::time::Instant::now();
     match overlap {
         Ok(jobs) => {
-            gpu.begin_route_kernel_load(plan, jobs)
+            gpu.begin_route_kernel_load_predicted(plan, predicted, jobs, open)
                 .map_err(|e| format!("kernel route compile: {e}"))?;
             eprintln!(
-                "  kernels: {spec:?} route plan ({modules} modules), compiling with up to {jobs} jobs during weight load"
+                "  kernels: {route_note}{predicted_note}, compiling with up to {jobs} jobs during weight load"
             );
         }
         Err(overlap) => {
             let jobs = compile_job_budget(cores, available, ROUTE_COMPILE_SAFETY_RESERVE, override_jobs)
                 .map_err(|e| {
-                    format!("refusing load: no kernel compile worker fits ({overlap}; before weights: {e})")
+                    format!("load refused: not enough free host memory to start even one GPU-kernel compile worker ({overlap}; before weights: {e}). Free some system memory and retry")
                 })?;
-            gpu.begin_route_kernel_load(plan, jobs)
+            gpu.begin_route_kernel_load_predicted(plan, predicted, jobs, open)
                 .and_then(|()| gpu.ensure_route_modules_preloaded())
                 .map_err(|e| {
                     let _ = gpu.abort_route_kernel_load();
                     format!("kernel route compile: {e}")
                 })?;
             eprintln!(
-                "  kernels: {spec:?} route plan ({modules} modules) loaded before weights with {jobs} jobs in {:.2}s ({overlap})",
+                "  kernels: {route_note}{predicted_note} loaded before weights with {jobs} jobs in {:.2}s ({overlap})",
                 started.elapsed().as_secs_f64()
             );
         }
     }
-    Ok(Some(PlannedRoute { spec }))
+    Ok(Some(PlannedRoute {
+        spec,
+        predicted: summary,
+    }))
 }
 
-/// Seal a begun route once the model loaded: every planned module is on the
-/// GPU before ready, and an unplanned kernel can no longer compile or load.
-/// A model that resolved outside the plan returns to lazy loading instead.
+/// Log how a route finished: where its kernels were compiled (before ready
+/// versus lazily during load) and the open-route contract after ready.
+fn log_open_route(
+    route: &str,
+    predicted: Option<&PredictedRoute>,
+    stats: rdna_compute::scratch::RouteKernelStats,
+) {
+    match predicted {
+        Some(predicted) => eprintln!(
+            "  kernels: {route} ready, open (never sealed): {}/{} predicted {} modules [{}] compiled before ready \
+             ({} symbols in {} modules bound, {} compile-only); {} unplanned kernel requests during load \
+             (counts requests, not compiles: includes binds of already compiled or embedded modules); \
+             off-plan loads after ready stay lazy, warn and are counted",
+            stats.predicted_compiled,
+            predicted.modules,
+            predicted.family,
+            predicted.basis,
+            stats.predicted_bound_symbols,
+            stats.predicted_bound_modules,
+            stats.predicted_compiled.saturating_sub(stats.predicted_bound_modules),
+            stats.lazy_during_load,
+        ),
+        None => eprintln!(
+            "  kernels: {route} preloaded (open: off-plan loads stay lazy and warn); \
+             {} unplanned kernel requests during load (counts requests, not compiles)",
+            stats.lazy_during_load
+        ),
+    }
+}
+
+/// Finish a begun route once the model loaded: every planned and predicted
+/// module is compiled and on the GPU before ready. A sealed route then
+/// refuses an unplanned kernel; an open one (walked plans and every
+/// predicted fallback) loads it lazily, warns and counts it. A model that
+/// resolved outside a closed plan still completes its predictable
+/// compilation and finishes open, never sealed, keeping the counters.
 fn finish_route_kernels(
     planned: PlannedRoute,
     model: &LoadedModel,
     gpu: &mut Gpu,
 ) -> Result<(), String> {
     use rdna_compute::kernel_registry::KernelSpecRoute;
-    let mismatch = if model.kv_adaptive.is_some() {
-        Some("adaptive KV engaged")
-    } else if model.eviction.is_some() {
-        Some("eviction engaged")
-    } else if model.speculator.is_some()
-        && !(planned.spec == KernelSpecRoute::NativeMtp && model.mtp_weights_present)
-    {
-        Some("a speculator outside the plan")
-    } else {
-        None
+    let route = match planned.spec {
+        Some(spec) => format!("{spec:?} route"),
+        None => "predicted fallback".to_owned(),
+    };
+    let mismatch = match planned.spec {
+        None => None,
+        Some(spec) => {
+            if model.kv_adaptive.is_some() {
+                Some("adaptive KV engaged")
+            } else if model.eviction.is_some() {
+                Some("eviction engaged")
+            } else if model.speculator.is_some()
+                && !(spec == KernelSpecRoute::NativeMtp && model.mtp_weights_present)
+            {
+                Some("a speculator outside the plan")
+            } else {
+                None
+            }
+        }
     };
     if let Some(why) = mismatch {
-        eprintln!("  kernels: {LAZY_KERNELS_NOTE} [left the planned route: {why}]");
-        return gpu
-            .abort_route_kernel_load()
-            .map_err(|e| format!("kernel route compile: {e}"));
+        eprintln!("  kernels: {route} left the planned route: {why}; completing its predictable kernels, route stays open");
+        gpu.finish_route_kernel_load_open(format!("{route} (left the plan: {why})"))
+            .map_err(|e| format!("kernel route preload: {e}"))?;
+        log_open_route(&route, planned.predicted.as_ref(), gpu.route_kernel_stats());
+        return Ok(());
     }
     gpu.finish_route_kernel_load()
         .map_err(|e| format!("kernel route preload: {e}"))?;
-    eprintln!("  kernels: {:?} route preloaded and sealed", planned.spec);
+    if gpu.route_kernels_sealed() {
+        eprintln!("  kernels: {route} preloaded and sealed");
+        return Ok(());
+    }
+    log_open_route(&route, planned.predicted.as_ref(), gpu.route_kernel_stats());
     Ok(())
+}
+
+/// The load-time KHO scratch warning line: only on a unified-memory GPU, and
+/// only at [`rdna_compute::uma_memory::KHO_WARN_BYTES`] or more.
+fn kho_scratch_load_warning(uma: bool, scratch: Option<u64>) -> Option<String> {
+    if !uma {
+        return None;
+    }
+    rdna_compute::uma_memory::kho_scratch_warning(scratch?).map(|text| format!("  warning: {text}"))
+}
+
+/// Print [`kho_scratch_load_warning`] at most once per process (every load
+/// path of the daemon and `hipfire serve` goes through
+/// [`load_admitted_with_gemma4_drafter`]).
+fn warn_kho_scratch_once(uma: bool) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if !uma {
+        return;
+    }
+    WARNED.call_once(|| {
+        if let Some(line) =
+            kho_scratch_load_warning(uma, rdna_compute::uma_memory::kho_scratch_bytes())
+        {
+            eprintln!("{line}");
+        }
+    });
 }
 
 /// Consume an already-admitted source: the retained [`SourceAdmission`] handle
@@ -3013,11 +3663,16 @@ pub fn load_admitted_with_gemma4_drafter(
         carrier,
         vision_path,
         vision_mode,
+        pp_layer_counts,
+        mesh,
+        pp_bands,
+        batch_request,
         ..
     } = admission;
     let carrier =
         carrier.ok_or_else(|| "single/pp admission must resolve a carrier".to_string())?;
     ensure_vmm_ready_for_load(gpu)?;
+    warn_kho_scratch_once(gpu.is_uma());
     let rec_sampling = match &source {
         ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
         _ => None,
@@ -3025,6 +3680,7 @@ pub fn load_admitted_with_gemma4_drafter(
     // Planner-closed routes start their bounded kernel compile now, overlapped
     // with the non-dispatching weight load, and preload every planned module
     // before the first dispatch. Refused routes keep lazy loading.
+    let route_begin_started = std::time::Instant::now();
     let planned_route = begin_route_kernels(
         &RouteRequest {
             path,
@@ -3043,9 +3699,23 @@ pub fn load_admitted_with_gemma4_drafter(
             state_quant_override,
             cask,
             spec,
+            kv_backend,
         },
         gpu,
     )?;
+    rdna_compute::load_phases::add(
+        "kernels.route_begin",
+        rdna_compute::load_phases::ns_since(route_begin_started),
+        0,
+    );
+    rdna_compute::load_phases::note(
+        "kernels",
+        if planned_route.is_some() {
+            "route_plan"
+        } else {
+            "lazy"
+        },
+    );
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -3071,6 +3741,9 @@ pub fn load_admitted_with_gemma4_drafter(
         state_quant_override,
         cask,
         pp,
+        pp_layer_counts: pp_layer_counts.as_deref(),
+        admitted_mesh: pp_bands.as_ref().map(|_| &mesh),
+        band_placement: pp_bands.as_ref(),
         spec,
         gpu,
         gemma4_drafter_path,
@@ -3078,6 +3751,7 @@ pub fn load_admitted_with_gemma4_drafter(
         // Slice 4 (integration) populates this from the daemon `xdna` param
         // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
         xdna: None,
+        batch_request,
     };
     let mut result = match carrier.load(source, &mut ctx) {
         Ok(result) => result,
@@ -3091,7 +3765,14 @@ pub fn load_admitted_with_gemma4_drafter(
         }
     };
     if let Some(planned) = planned_route {
-        if let Err(error) = finish_route_kernels(planned, &result, ctx.gpu) {
+        let route_wait_started = std::time::Instant::now();
+        let finished = finish_route_kernels(planned, &result, ctx.gpu);
+        rdna_compute::load_phases::add(
+            "kernels.route_wait",
+            rdna_compute::load_phases::ns_since(route_wait_started),
+            0,
+        );
+        if let Err(error) = finished {
             return Err(match unload_model(result, ctx.gpu) {
                 Ok(()) => error,
                 Err(e) => format!("{error}; cleanup also failed: {e}"),
@@ -3149,7 +3830,7 @@ fn load_cohere2moe(
             .or_else(|| try_one("<|endoftext|>"))
             .unwrap_or(255001)
     };
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
         state: Some(Box::new(Cohere2MoeBundle {
             config,
@@ -3164,6 +3845,7 @@ fn load_cohere2moe(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -3599,7 +4281,7 @@ pub fn qwen35_ep_moe_topology_refusal(
     }
     if num_experts % tp != 0 {
         return Some(format!(
-            "Qwen3.5-MoE (arch_id={arch_id}) EP tp={tp} does not divide num_experts={num_experts}"
+            "Qwen3.5-MoE (arch_id={arch_id}) expert parallelism: tp={tp} does not divide num_experts={num_experts}; choose a tp that divides the expert count, or set tp=1"
         ));
     }
     None
@@ -3607,9 +4289,9 @@ pub fn qwen35_ep_moe_topology_refusal(
 
 /// Message constructor shared by [`ep_admission`] and the per-entry match
 /// backstops so the refusal text cannot drift between the two.
-fn ep_unsupported_arch_message(arch_id: u32) -> String {
+pub(crate) fn ep_unsupported_arch_message(arch_id: u32) -> String {
     format!(
-        "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+        "expert parallelism (tp>1) is not supported for arch_id={arch_id}; it works for Qwen3.5 (5|6), DeepSeek V4 (9) and MiniMax (10). Set tp=1 for this model"
     )
 }
 
@@ -3825,12 +4507,12 @@ pub fn load_model_ep_with_compressor_cache(
         10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
             load_model_ep_minimax(path, max_seq, tp)
         }
-        10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
+        10 => Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to MiniMax models; remove it for this model".to_string()),
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
             load_model_ep_with_kv_mode(path, max_seq, tp, None, None, None)
         }
         5 | 6 => {
-            Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
+            Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to Qwen3.5 models; remove it for this model".to_string())
         }
         // Backstop: `ep_admission` above already refused these; route through the
         // shared constructor (not `unreachable!`) so the refusal survives a
@@ -3869,7 +4551,7 @@ fn load_model_ep_ds4(
     // ds4 EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP graph
     // itself (deepseek4 forward.rs begin_graph_capture) is untouched — it still
     // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
     let gpus =
@@ -3984,13 +4666,18 @@ fn load_model_ep_ds4(
             &config,
             ep_prefill_max_batch,
         )?;
+        // TP across several devices has no per-rank budget: refuse under a
+        // HIPFIRE_EMU profile (a no-op when emulation is off).
+        staging.gpus_mut().devices[0]
+            .emu_refuse_multi_device("gfx1201 TP batched prefill")
+            .map_err(|e| format!("{e:?}"))?;
         for rank in 0..n {
             let dev = &mut staging.gpus_mut().devices[rank];
             dev.bind_thread()
                 .map_err(|e| format!("bind gfx1201 TP prefill rank {rank}: {e:?}"))?;
+            // Capped per-device query (UMA-safe clamp, then the emu cap).
             let (free, _total) = dev
-                .hip
-                .get_vram_info()
+                .device_mem_info_for(dev.device_id)
                 .map_err(|e| format!("query gfx1201 TP prefill VRAM rank {rank}: {e:?}"))?;
             if free < projected {
                 return Err(format!(
@@ -4085,6 +4772,7 @@ fn load_model_ep_ds4(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4109,7 +4797,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     // minimax EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP
     // graph itself (minimax forward.rs begin_graph_capture) is untouched — it still
     // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
     let gpus =
@@ -4218,6 +4906,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4239,7 +4928,7 @@ fn load_model_ep_qwen35(
     let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     if hfq_probe.arch_id != 5 && hfq_probe.arch_id != 6 {
         return Err(format!(
-            "EP qwen35 requires arch 5 or 6, got {}",
+            "expert parallelism (tp>1) via this path needs a Qwen3.5 model (arch 5 or 6), got arch {}",
             hfq_probe.arch_id
         ));
     }
@@ -4297,11 +4986,14 @@ fn load_model_ep_qwen35(
         return Err("EP qwen35: paged_experts must be false".to_string());
     }
     if config.reap_keep.is_some() {
-        return Err("EP qwen35: REAP keep-map incompatible with EP".to_string());
+        return Err(
+            "EP qwen35: this REAP-pruned model cannot run with expert parallelism; set tp=1"
+                .to_string(),
+        );
     }
     let arch_id = hfq_probe.arch_id;
     let n_exp = config.num_experts;
-    let chat_template = resolve_chat_template(&hfq_probe, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq_probe, path);
     let rec = hfq_probe.recommended_sampling();
     let gpus = Gpus::init_ep(tp, config.n_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
@@ -4490,6 +5182,7 @@ fn load_model_ep_qwen35(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4551,7 +5244,7 @@ fn load_model_tp_qwen35_dense(
         .map(|layout| qwen35::local_dense_tp_config(&config, layout))
         .collect::<Vec<_>>();
     let arch_id = hfq.arch_id;
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
     let eos_tok = {
         let ids = tokenizer.encode("<|im_end|>");
@@ -4639,16 +5332,18 @@ fn load_model_tp_qwen35_dense(
         .can_access_peer_all()
         .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
     if peer {
-        // Opt-in gfx1100 TP2 whole-token decode graph: the runtime admits it
-        // and prepares its signal tape before peer access is enabled.
+        // TP2 whole-token decode graph (exact gfx1201 pair by default, gfx1100
+        // pair with `HIPFIRE_TP_FULL_GRAPH=1`): the runtime admits it and
+        // prepares its signal tape before peer access is enabled.
         let barriers = config.n_layers * 2;
         let whole_token_graph = staging
             .gpus_mut()
             .prepare_tp2_whole_token_graph(barriers, config.dim * std::mem::size_of::<f32>())
-            .map_err(|e| format!("prepare gfx1100 TP2 whole-token graph: {e:?}"))?;
+            .map_err(|e| format!("prepare TP2 whole-token graph: {e:?}"))?;
         if whole_token_graph {
+            let arch = staging.gpus_mut().devices[0].arch.clone();
             eprintln!(
-                "[loader] dense qwen gfx1100 TP2 whole-token graph signal tape: {barriers} barriers"
+                "[loader] dense qwen {arch} TP2 whole-token graph signal tape: {barriers} barriers"
             );
         }
         let enabled = staging
@@ -4743,6 +5438,7 @@ fn load_model_tp_qwen35_dense(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4751,12 +5447,87 @@ fn load_model_tp_qwen35_dense(
 pub fn ensure_vmm_ready_for_load(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     gpu.ensure_vmm_cleaned().map_err(|err| {
         format!(
-            "refusing load: prior VMM teardown still pending ({err}); retry unload or restart the process"
+            "load refused: the previous model's GPU virtual memory is still being released ({err}); retry the unload, or restart the process"
         )
     })
 }
 
 // ─── Unload ───────────────────────────────────────────────────────────
+
+/// True when `m` is a Qwen4 mesh-executor PP load: the bundle holds the band
+/// bundles and plans while `pp_gpus` is the sole hardware owner (`Gpus` is
+/// `!Send`, so it cannot live inside the `Send` bundle); `m.pp` keeps the
+/// admitted PP degree and `pp_dn_la_to_device` stays `None`.
+fn qwen4_pp_mesh_owner(m: &LoadedModel) -> bool {
+    m.state.as_ref().is_some_and(|state| {
+        (state.as_ref() as &dyn Any)
+            .downcast_ref::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+            .is_some_and(|bundle| bundle.pp_mesh_active())
+    })
+}
+
+/// What unload reports when the Qwen4 PP teardown failed: the bundle's mesh
+/// teardown drains every epoch and edge before freeing anything, and a failed
+/// drain keeps all resources (devices, bands, edges) alive and unreclaimed.
+fn qwen4_pp_quarantine_report(error: &str) -> String {
+    format!(
+        "qwen4 topology.pp unload failed ({error}); mesh resources quarantined until process restart"
+    )
+}
+
+/// Unload a Qwen4 mesh-executor PP model. `Qwen4Bundle::pp_free_gpu` drains
+/// epochs and edges first and then frees every band on its own device; a
+/// failed teardown quarantines: the bundle leaks the root and bands, and the
+/// `Gpus` and the rest of the model are leaked here, never freed under
+/// possibly in-flight work. Unload reports the failure.
+fn unload_qwen4_pp(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    if let Some(spec) = m.speculator.take() {
+        spec.free(gpu);
+    }
+    if let Some(ev) = m.eviction.take() {
+        ev.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.prefill_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    for (_, snap) in std::mem::take(&mut m.dflash_checkpoints) {
+        snap.free_gpu(gpu);
+    }
+    let Some(mut gpus) = m.pp_gpus.take() else {
+        std::mem::forget(m);
+        return Err(qwen4_pp_quarantine_report("the PP model carries no Gpus"));
+    };
+    let bundle =
+        match m.state.take().map(|state| {
+            (state as Box<dyn Any>).downcast::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+        }) {
+            Some(Ok(bundle)) => bundle,
+            other => {
+                std::mem::forget(other);
+                std::mem::forget(gpus);
+                std::mem::forget(m);
+                return Err(qwen4_pp_quarantine_report(
+                    "model state is not a Qwen4 bundle",
+                ));
+            }
+        };
+    if let Err(error) = hipfire_arch_qwen4::bundle::Qwen4Bundle::pp_free_gpu(*bundle, &mut gpus) {
+        std::mem::forget(gpus);
+        std::mem::forget(m);
+        return Err(qwen4_pp_quarantine_report(&error.to_string()));
+    }
+    for device in gpus.devices.iter_mut() {
+        let _ = device.bind_thread();
+        device.invalidate_weight_caches();
+        device.invalidate_graph_state();
+        device.drain_pool();
+    }
+    drop(gpus);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    gpu.ensure_vmm_cleaned().map_err(|e| e.to_string())
+}
 
 pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     // The next load (or none) starts lazy; a sealed route never outlives its model.
@@ -5013,6 +5784,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         return Ok(());
         // `gpus` drops here, tearing down comms + devices.
     }
+    // Qwen4 mesh-executor PP: the root bundle owns the `Gpus` (`pp_gpus` is
+    // `None`), so it must leave before the legacy Qwen3.5 `m.pp > 1` arm.
+    if qwen4_pp_mesh_owner(&m) {
+        return unload_qwen4_pp(m, gpu);
+    }
     if m.pp > 1 {
         if let Some(b) = m.qwen35_mut() {
             if let Some(batch_state) = b.qwen35_decode_batch.take() {
@@ -5113,7 +5889,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     match (first_err, weight_lease) {
         (Some(err), Some(lease)) => {
             drop(lease);
-            Err(format!("{err}; weight-host lease closed without release (teardown not proven clean)"))
+            Err(format!(
+                "{err}; weight-host lease closed without release (teardown not proven clean)"
+            ))
         }
         (Some(err), None) => Err(err),
         (None, Some(lease)) => lease.release(),
@@ -5156,7 +5934,10 @@ mod ep_admission_tests {
                 Ok(()) => panic!("arch {arch} + EP must refuse"),
                 Err(e) => e,
             };
-            assert!(err.contains("EP not supported"), "reason: {err}");
+            assert!(
+                err.contains("expert parallelism (tp>1) is not supported"),
+                "reason: {err}"
+            );
             assert!(
                 err.contains(&arch.to_string()),
                 "reason names the arch: {err}"
@@ -5314,7 +6095,7 @@ mod ep_admission_tests {
             &mut effects,
         )
         .unwrap_err();
-        assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
+        assert!(refusal.contains("vmm") && refusal.contains("not available"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
         let _ = std::fs::remove_file(candidate);
@@ -5356,6 +6137,138 @@ mod lfm2_batch_admission_tests {
                 .caps()
                 .supports_continuous_batch
         );
+    }
+}
+
+#[cfg(test)]
+mod kho_scratch_warning_tests {
+    use super::kho_scratch_load_warning;
+
+    #[test]
+    fn kho_load_warning_is_uma_only_and_needs_one_gib() {
+        let hipx = Some(13_536u64 << 20);
+        assert_eq!(
+            kho_scratch_load_warning(true, hipx).as_deref(),
+            Some("  warning: KHO scratch reserves 13.2 GiB unusable by the GPU; boot with kho=off to reclaim it")
+        );
+        assert_eq!(kho_scratch_load_warning(false, hipx), None);
+        assert_eq!(kho_scratch_load_warning(true, None), None);
+        assert_eq!(kho_scratch_load_warning(true, Some((1 << 30) - 1)), None);
+        assert!(kho_scratch_load_warning(true, Some(1 << 30)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod asst_turn_cache_tests {
+    use super::AsstTurnCache;
+    use hipfire_runtime::prompt_frame::{CachedAssistantBody, CachedAssistantTurn};
+
+    fn turn(reasoning: Option<&str>, marker: u32) -> CachedAssistantTurn {
+        CachedAssistantTurn {
+            reasoning: reasoning.map(|text| CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: text.to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![marker],
+                text: String::new(),
+            }),
+        }
+    }
+
+    fn marker(t: Option<&CachedAssistantTurn>) -> Option<u32> {
+        t.and_then(|t| t.content.as_ref()).map(|c| c.token_ids[0])
+    }
+
+    #[test]
+    fn distinct_reasoning_turns_with_same_content_fp_coexist() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(7, turn(Some("alpha"), 1));
+        c.insert(7, turn(Some("beta"), 2));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("alpha"))), Some(1));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("beta"))), Some(2));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("gamma"))), None);
+    }
+
+    #[test]
+    fn empty_content_turns_with_different_reasoning_coexist_and_missing_equals_empty() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(0, turn(Some("think one"), 1));
+        c.insert(0, turn(Some("think two"), 2));
+        // Absent and empty reasoning are the same identity: replace, not coexist.
+        c.insert(9, turn(None, 3));
+        c.insert(9, turn(Some(""), 4));
+        assert_eq!(marker(c.get_for_reasoning(&0, Some("think one"))), Some(1));
+        assert_eq!(marker(c.get_for_reasoning(&0, Some("think two"))), Some(2));
+        assert_eq!(marker(c.get_for_reasoning(&9, None)), Some(4));
+        assert_eq!(marker(c.get_for_reasoning(&9, Some(""))), Some(4));
+    }
+
+    #[test]
+    fn absent_or_empty_reasoning_misses_when_content_fp_is_ambiguous() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(7, turn(Some("alpha"), 1));
+        c.insert(7, turn(Some("beta"), 2));
+        assert_eq!(marker(c.get_for_reasoning(&7, None)), None);
+        assert_eq!(marker(c.get_for_reasoning(&7, Some(""))), None);
+        assert_eq!(marker(c.get(&7)), None);
+    }
+
+    #[test]
+    fn unique_identity_serves_absent_or_empty_reasoning_fallback() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(7, turn(Some("alpha"), 1));
+        assert_eq!(marker(c.get_for_reasoning(&7, None)), Some(1));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some(""))), Some(1));
+        assert_eq!(marker(c.get(&7)), Some(1));
+        // Nonempty reasoning is exact: no fallback to the unique entry.
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("other"))), None);
+    }
+
+    #[test]
+    fn eviction_removes_ambiguity_and_clear_drops_all_indices() {
+        let mut c = AsstTurnCache::with_cap(Some(2));
+        c.insert(7, turn(Some("alpha"), 1));
+        c.insert(7, turn(Some("beta"), 2));
+        assert_eq!(marker(c.get(&7)), None);
+        // Third distinct entry evicts the LRU ("alpha"), leaving "beta" unique.
+        c.insert(8, turn(None, 3));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("alpha"))), None);
+        assert_eq!(marker(c.get(&7)), Some(2));
+        assert!(c.contains_key(&7));
+        // Evicting the last identity of a content fp removes it entirely.
+        c.insert(10, turn(None, 4));
+        c.insert(11, turn(None, 5));
+        assert!(!c.contains_key(&7));
+        assert_eq!(marker(c.get(&7)), None);
+        c.clear();
+        assert!(c.is_empty());
+        assert!(!c.contains_key(&11));
+        assert_eq!(marker(c.get(&11)), None);
+        // Cache remains usable and unambiguous after clear.
+        c.insert(7, turn(Some("gamma"), 6));
+        assert_eq!(marker(c.get(&7)), Some(6));
+    }
+
+    #[test]
+    fn replacement_keeps_slot_and_refreshes_mru_under_cap() {
+        let mut c = AsstTurnCache::with_cap(Some(2));
+        c.insert(1, turn(Some("a"), 1));
+        c.insert(2, turn(Some("b"), 2));
+        // Replace oldest: no growth, becomes MRU, new body served.
+        c.insert(1, turn(Some("a"), 10));
+        assert_eq!(marker(c.get_for_reasoning(&1, Some("a"))), Some(10));
+        // Next insert evicts fp 2 (now LRU), not the refreshed fp 1.
+        c.insert(3, turn(Some("c"), 3));
+        assert_eq!(marker(c.get_for_reasoning(&2, Some("b"))), None);
+        assert_eq!(marker(c.get_for_reasoning(&1, Some("a"))), Some(10));
+        assert_eq!(marker(c.get_for_reasoning(&3, Some("c"))), Some(3));
+        // A lookup hit also refreshes MRU: touch 1, then insert evicts 3.
+        let _ = c.get_for_reasoning(&1, Some("a"));
+        c.insert(4, turn(Some("d"), 4));
+        assert_eq!(marker(c.get_for_reasoning(&3, Some("c"))), None);
+        assert_eq!(marker(c.get_for_reasoning(&1, Some("a"))), Some(10));
     }
 }
 
@@ -5613,6 +6526,24 @@ mod registry_tests {
                 .caps()
                 .supports_images,
             "lfm2moe (arch 11, lfm2_vl artifacts) must declare supports_images —              tower-less checkpoints still refuse images via has_vision_encoder()"
+        );
+        // EmbeddingGemma-2 (arch 18) declares the capability: the checkpoint's
+        // vision tower ships in the arch-18 `.vl` pack, and the per-instance
+        // gate is the loaded bundle's tower. It has no generate-side VL route
+        // — embed inputs dispatch through the bundle — so `vision_route(18)`
+        // must stay `None` even with the capability declared.
+        let eg2 = REGISTRY
+            .iter()
+            .find(|c| c.name() == "embeddinggemma2")
+            .expect("embeddinggemma2 carrier missing");
+        assert!(
+            eg2.caps().supports_images,
+            "embeddinggemma2 (arch 18) must declare supports_images — tower-less trunks (no .vl pack) still refuse images via the bundle check"
+        );
+        assert_eq!(
+            super::vision_route(18),
+            super::VisionRoute::None,
+            "embeddinggemma2 is embed-only: no generate-side VL route"
         );
         for name in [
             "qwen2",
@@ -5965,19 +6896,22 @@ mod registry_tests {
     fn qwen_embedded_template_wins_over_froggeric() {
         // Qwen3.8-style embedded template carries official reasoning_effort.
         let embedded = "{% if reasoning_effort %}{{ reasoning_effort }}{% endif %}".to_string();
-        let got = super::qwen35_template_from_embedded(Some(embedded.clone()), "qwen3.8-27b.mq4");
+        let (got, source) =
+            super::qwen35_template_from_embedded(Some(embedded.clone()), "qwen3.8-27b.mq4");
         assert_eq!(got, embedded);
         assert!(got.contains("reasoning_effort"));
         assert_ne!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
     #[test]
     fn qwen_missing_template_uses_froggeric_fallback() {
         // Legacy Qwen3.5/3.6 HFQs without tokenizer_config.chat_template.
         // Ornith path without embedded also keeps plain froggeric (no adapt).
-        let got = super::qwen35_template_from_embedded(None, "ornith-1.5-35b-a3b.mq4");
+        let (got, source) = super::qwen35_template_from_embedded(None, "ornith-1.5-35b-a3b.mq4");
         assert_eq!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
-        let got2 = super::qwen35_template_from_embedded(None, "qwen3.6-35b.mq4");
+        assert!(source.starts_with("built-in fallback: froggeric"));
+        let (got2, _) = super::qwen35_template_from_embedded(None, "qwen3.6-35b.mq4");
         assert_eq!(got2.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
     }
 
@@ -6116,6 +7050,24 @@ mod registry_tests {
             Some(ornith_parent_template_skeleton()),
             "ornith-1.5-35b-a3b.mq4",
         )
+        .0
+    }
+
+    #[test]
+    fn ornith_adapter_provenance_reports_applied_vs_plain_embedded() {
+        let (adapted, source) = super::qwen35_template_from_embedded(
+            Some(ornith_parent_template_skeleton()),
+            "ornith-1.5-35b-a3b.mq4",
+        );
+        assert!(adapted.contains("reasoning_effort"));
+        assert!(source.starts_with(super::SRC_EMBEDDED_HFQ));
+        assert!(source.contains("adapter applied"));
+        // Marker drift: the adapter is skipped, the embedded text is kept.
+        let drifted = "{{ messages }}".to_string();
+        let (kept, source) =
+            super::qwen35_template_from_embedded(Some(drifted.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(kept, drifted);
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
     fn render_ornith(
@@ -6162,7 +7114,11 @@ mod registry_tests {
             "/models/ornith1.5-35b-a3b.mq4",
             "ornith1.5-35b-a3b.mq4r",
         ] {
-            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert!(
+                source.contains("adapter applied"),
+                "path {path} must report the adapter in its source: {source}"
+            );
             assert!(
                 got.contains("reasoning_effort|default('xhigh')"),
                 "path {path} must adapt: missing default"
@@ -6207,8 +7163,9 @@ mod registry_tests {
             "ornith-2.0-35b-a3b.mq4",
             "not-ornith-1.5-35b.mq4",
         ] {
-            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
             assert_eq!(got, skeleton, "path {path} must not adapt");
+            assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
             assert!(!got.contains("reasoning_effort"), "path {path}");
         }
     }
@@ -6226,8 +7183,9 @@ mod registry_tests {
             "/models/ORNITH-1.5-35B-A3B.hfq",
             "ornith-1.5-35b-a3b.mq4r.bak",
         ] {
-            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
             assert_eq!(got, skeleton, "path {path} must not adapt (extension gate)");
+            assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
             assert!(
                 !got.contains("reasoning_effort"),
                 "path {path} must not gain effort"
@@ -6243,9 +7201,10 @@ mod registry_tests {
             ornith_parent_template_skeleton()
         );
         assert!(native.contains("reasoning_effort"));
-        let got =
+        let (got, source) =
             super::qwen35_template_from_embedded(Some(native.clone()), "ornith-1.5-35b-a3b.mq4");
         assert_eq!(got, native, "already-native must not be rewritten");
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
     #[test]
@@ -6255,8 +7214,9 @@ mod registry_tests {
             "{}\n{{%- set ns = namespace(x=1) %}}",
             super::ORNITH_TOOLS_SYSTEM_OPEN
         );
-        let got =
+        let (got, source) =
             super::qwen35_template_from_embedded(Some(drifted.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
         assert_eq!(
             got, drifted,
             "drift must keep original so probe stays honest"
@@ -6269,9 +7229,10 @@ mod registry_tests {
             gate = super::ORNITH_TOOLS_GATE,
             no_tools = super::ORNITH_NO_TOOLS_SYSTEM_BRANCH
         );
-        let got2 =
+        let (got2, source2) =
             super::qwen35_template_from_embedded(Some(dup.clone()), "ornith1.5-35b-a3b.mq4r");
         assert_eq!(got2, dup);
+        assert_eq!(source2, super::SRC_EMBEDDED_HFQ);
     }
 
     #[test]

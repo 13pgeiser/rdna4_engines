@@ -177,8 +177,7 @@ fn run() -> Result<(), String> {
     // Fill with -1.
     {
         let fill = vec![-1i32; ROWS * PARENT_INDEX_TOPK];
-        let bytes =
-            unsafe { std::slice::from_raw_parts(fill.as_ptr() as *const u8, topk_bytes) };
+        let bytes = unsafe { std::slice::from_raw_parts(fill.as_ptr() as *const u8, topk_bytes) };
         gpu.hip
             .memcpy_htod(&topk_idx.buf, bytes)
             .map_err(|e| format!("deepseek4 parent: topk fill: {e:?}"))?;
@@ -248,11 +247,7 @@ fn run() -> Result<(), String> {
 
     // Download intermediates for oracle comparison.
     let q_host = download_f32(&gpu, scratch.q_score_f32_ref(), ROWS * PARENT_INDEX_Q_WIDTH)?;
-    let w_host = download_f32(
-        &gpu,
-        scratch.weights_f32_ref(),
-        ROWS * PARENT_INDEX_N_HEADS,
-    )?;
+    let w_host = download_f32(&gpu, scratch.weights_f32_ref(), ROWS * PARENT_INDEX_N_HEADS)?;
     let kv_host = download_f32(
         &gpu,
         scratch.kv_cache_f32_ref(),

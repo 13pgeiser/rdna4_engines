@@ -4,10 +4,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #[cfg(test)]
-use crate::quant_hfp4::e2m1_round;
+use crate::quant_fwht::cpu_fwht_128;
 use crate::quant_fwht::cpu_fwht_256;
 #[cfg(test)]
-use crate::quant_fwht::cpu_fwht_128;
+use crate::quant_hfp4::e2m1_round;
 use crate::quant_hfp4::{e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
 use std::path::Path;
@@ -248,8 +248,6 @@ pub(crate) fn quantize_mfpn_e8_row(row: &[f32], n: u32, quant_step: f32) -> Vec<
     }
     out
 }
-
-
 
 /// mfpN-E8 2D: FWHT-rotate (same signs as mfp4-E8), then per-row encode.
 pub(crate) fn quantize_mfpn_e8_2d(
@@ -1160,12 +1158,8 @@ pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod awq_tests {
-    
+
     use crate::calibration::{awq_pre_scale_weights, compute_awq_scales};
-    
-    
-    
-    
 
     /// Verify geometric mean of computed AWQ scales is ~1.0 — the
     /// normalization in compute_awq_scales should center the scale
@@ -1276,7 +1270,7 @@ mod awq_tests {
 #[cfg(test)]
 mod hfp4_tests {
     use super::*;
-    
+
     use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
     use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
 

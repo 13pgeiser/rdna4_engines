@@ -704,13 +704,22 @@ fn indexed_top10(gpu: &mut Gpu) -> Result<(), String> {
         k,
         tokens,
         experts_count,
+        10,
     )
     .map_err(|error| error.to_string())?;
     let expanded_host = gpu
         .download_f32(&expanded)
         .map_err(|error| error.to_string())?;
-    gpu.moe_down_combine_top10_batched(&expanded, &indices, &weights, &residual, m, tokens)
-        .map_err(|error| error.to_string())?;
+    gpu.moe_down_combine_top10_batched(
+        &expanded,
+        &indices,
+        &weights,
+        &residual,
+        m,
+        tokens,
+        experts_count,
+    )
+    .map_err(|error| error.to_string())?;
     let actual = gpu
         .download_f32(&residual)
         .map_err(|error| error.to_string())?;
@@ -843,6 +852,7 @@ fn grouped_prefill(gpu: &mut Gpu) -> Result<(), String> {
         hidden,
         grouped_rows,
         batch,
+        experts_count,
     )
     .map_err(|error| error.to_string())?;
     let actual = gpu

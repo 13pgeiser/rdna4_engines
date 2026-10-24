@@ -16,9 +16,19 @@ use crate::Arch;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
-struct Pending<'a> { defs: BTreeSet<u16>, locks: BTreeSet<u16>, kind: Kind, opcode: &'a str }
+struct Pending<'a> {
+    defs: BTreeSet<u16>,
+    locks: BTreeSet<u16>,
+    kind: Kind,
+    opcode: &'a str,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind { Vmem, Store, Ds, Km }
+enum Kind {
+    Vmem,
+    Store,
+    Ds,
+    Km,
+}
 
 pub(crate) fn registers(operands: &str) -> BTreeSet<u16> {
     let bytes = operands.as_bytes();
@@ -26,22 +36,37 @@ pub(crate) fn registers(operands: &str) -> BTreeSet<u16> {
     let mut i = 0;
     while i < bytes.len() {
         if !matches!(bytes[i], b'v' | b's')
-            || (i > 0 && (bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_')) {
-            i += 1; continue;
+            || (i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
+            i += 1;
+            continue;
         }
         let class = if bytes[i] == b's' { 256 } else { 0 };
         i += 1;
         let bracket = bytes.get(i) == Some(&b'[');
-        if bracket { i += 1; }
+        if bracket {
+            i += 1;
+        }
         let begin = i;
-        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
-        let Some(first) = operands.get(begin..i).and_then(|s| s.parse::<u16>().ok()) else { continue };
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        let Some(first) = operands.get(begin..i).and_then(|s| s.parse::<u16>().ok()) else {
+            continue;
+        };
         let last = if bracket && bytes.get(i) == Some(&b':') {
             i += 1;
             let begin = i;
-            while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
-            operands.get(begin..i).and_then(|s| s.parse::<u16>().ok()).unwrap_or(first)
-        } else { first };
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            operands
+                .get(begin..i)
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(first)
+        } else {
+            first
+        };
         if last >= first && last <= 255 {
             found.extend((first + class)..=(last + class));
         }
@@ -50,31 +75,44 @@ pub(crate) fn registers(operands: &str) -> BTreeSet<u16> {
 }
 fn wait_count(rest: &str) -> Option<usize> {
     let token = rest.split_whitespace().next()?.split('_').next()?;
-    if let Some(hex) = token.strip_prefix("0x") { usize::from_str_radix(hex, 16).ok() }
-    else { token.parse().ok() }
+    if let Some(hex) = token.strip_prefix("0x") {
+        usize::from_str_radix(hex, 16).ok()
+    } else {
+        token.parse().ok()
+    }
 }
 
 /// In-order class of a pending VMEM load (see the module comment).
 fn vmem_class(opcode: &str, gfx12: bool) -> &str {
-    if gfx12 && (opcode.starts_with("buffer_load") || opcode.starts_with("global_load")) { return "vmem_read" }
+    if gfx12 && (opcode.starts_with("buffer_load") || opcode.starts_with("global_load")) {
+        return "vmem_read";
+    }
     opcode.split('_').next().unwrap_or(opcode)
 }
 
 fn retire(pending: &mut Vec<Pending<'_>>, kind: Kind, count: usize, gfx12: bool) {
     let mut outstanding = pending.iter().filter(|item| item.kind == kind).count();
     // SMEM, stores, and mixed VMEM load classes have no in-order guarantee.
-    if count != 0 && (matches!(kind, Kind::Km | Kind::Store)
-        || kind == Kind::Vmem && {
-            let mut types = pending.iter().filter(|item| item.kind == Kind::Vmem)
-                .map(|item| vmem_class(item.opcode, gfx12));
-            let first = types.next();
-            types.any(|family| Some(family) != first)
-        }) { return; }
+    if count != 0
+        && (matches!(kind, Kind::Km | Kind::Store)
+            || kind == Kind::Vmem && {
+                let mut types = pending
+                    .iter()
+                    .filter(|item| item.kind == Kind::Vmem)
+                    .map(|item| vmem_class(item.opcode, gfx12));
+                let first = types.next();
+                types.any(|family| Some(family) != first)
+            })
+    {
+        return;
+    }
     pending.retain(|item| {
         if item.kind == kind && outstanding > count {
             outstanding -= 1;
             false
-        } else { true }
+        } else {
+            true
+        }
     });
 }
 
@@ -111,10 +149,18 @@ fn gfx11_waitcnt(operands: &str) -> Option<(Option<usize>, Option<usize>)> {
         return Some(((vm != 0x3f).then_some(vm), (lgkm != 0x3f).then_some(lgkm)));
     }
     let (mut vm, mut lgkm) = (None, None);
-    for field in operands.split(|c: char| c.is_whitespace() || c == '&' || c == ',').filter(|f| !f.is_empty()) {
+    for field in operands
+        .split(|c: char| c.is_whitespace() || c == '&' || c == ',')
+        .filter(|f| !f.is_empty())
+    {
         let (name, value) = field.split_once('(')?;
         let value: usize = value.strip_suffix(')')?.parse().ok()?;
-        match name { "vmcnt" => vm = Some(value), "lgkmcnt" => lgkm = Some(value), "expcnt" => {}, _ => return None }
+        match name {
+            "vmcnt" => vm = Some(value),
+            "lgkmcnt" => lgkm = Some(value),
+            "expcnt" => {}
+            _ => return None,
+        }
     }
     Some((vm, lgkm))
 }
@@ -129,31 +175,57 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
             pending.clear();
             continue;
         }
-        let Some((name, operands)) = line.split_once(char::is_whitespace) else { continue };
-        if name.starts_with('.') || name.ends_with(':') { continue; }
+        let Some((name, operands)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if name.starts_with('.') || name.ends_with(':') {
+            continue;
+        }
         if gfx11 {
-            let count = || operands.rsplit(',').next().and_then(wait_count)
-                .ok_or_else(|| format!("line {}: invalid wait", line_no+1));
+            let count = || {
+                operands
+                    .rsplit(',')
+                    .next()
+                    .and_then(wait_count)
+                    .ok_or_else(|| format!("line {}: invalid wait", line_no + 1))
+            };
             match name {
                 "s_waitcnt" => {
                     let (vm, lgkm) = gfx11_waitcnt(operands)
-                        .ok_or_else(|| format!("line {}: invalid s_waitcnt", line_no+1))?;
-                    if let Some(n) = vm { retire(&mut pending, Kind::Vmem, n, false); }
-                    if let Some(n) = lgkm { retire_lgkm(&mut pending, n); }
+                        .ok_or_else(|| format!("line {}: invalid s_waitcnt", line_no + 1))?;
+                    if let Some(n) = vm {
+                        retire(&mut pending, Kind::Vmem, n, false);
+                    }
+                    if let Some(n) = lgkm {
+                        retire_lgkm(&mut pending, n);
+                    }
                     continue;
                 }
-                "s_waitcnt_vmcnt" => { retire(&mut pending, Kind::Vmem, count()?, false); continue; }
-                "s_waitcnt_vscnt" => { retire(&mut pending, Kind::Store, count()?, false); continue; }
-                "s_waitcnt_lgkmcnt" => { retire_lgkm(&mut pending, count()?); continue; }
+                "s_waitcnt_vmcnt" => {
+                    retire(&mut pending, Kind::Vmem, count()?, false);
+                    continue;
+                }
+                "s_waitcnt_vscnt" => {
+                    retire(&mut pending, Kind::Store, count()?, false);
+                    continue;
+                }
+                "s_waitcnt_lgkmcnt" => {
+                    retire_lgkm(&mut pending, count()?);
+                    continue;
+                }
                 "s_waitcnt_depctr" if operands.contains("depctr_vm_vsrc(0)") => {
-                    for item in pending.iter_mut().filter(|item| item.kind == Kind::Store) { item.locks.clear(); }
+                    for item in pending.iter_mut().filter(|item| item.kind == Kind::Store) {
+                        item.locks.clear();
+                    }
                     continue;
                 }
-                _ if name.starts_with("s_wait_") => return Err(format!("line {}: {name} is not a gfx11 wait", line_no+1)),
+                _ if name.starts_with("s_wait_") => {
+                    return Err(format!("line {}: {name} is not a gfx11 wait", line_no + 1))
+                }
                 _ => {}
             }
         } else if name == "s_waitcnt" || name.starts_with("s_waitcnt_") {
-            return Err(format!("line {}: {name} is not a gfx12 wait", line_no+1));
+            return Err(format!("line {}: {name} is not a gfx12 wait", line_no + 1));
         }
         let wait_kind = match name {
             "s_wait_loadcnt" => Some(Kind::Vmem),
@@ -163,15 +235,16 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
             _ => None,
         };
         if let Some(kind) = wait_kind {
-            let count = wait_count(operands).ok_or_else(|| format!("line {}: invalid wait", line_no+1))?;
+            let count = wait_count(operands)
+                .ok_or_else(|| format!("line {}: invalid wait", line_no + 1))?;
             retire(&mut pending, kind, count, true);
             continue;
         }
         if name == "s_wait_loadcnt_dscnt" {
             let encoded = wait_count(operands)
-                .ok_or_else(|| format!("line {}: invalid combined wait", line_no+1))?;
+                .ok_or_else(|| format!("line {}: invalid combined wait", line_no + 1))?;
             if encoded > 0x3f3f || encoded & 0xc0c0 != 0 {
-                return Err(format!("line {}: out-of-range combined wait", line_no+1));
+                return Err(format!("line {}: out-of-range combined wait", line_no + 1));
             }
             retire(&mut pending, Kind::Vmem, (encoded >> 8) & 0x3f, true);
             retire(&mut pending, Kind::Ds, encoded & 0x3f, true);
@@ -180,29 +253,41 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
         // VM_VSRC counts VMEM instructions that have not yet read their
         // source registers; at 0 every pending store has consumed its sources.
         if name == "s_wait_alu" && operands.contains("depctr_vm_vsrc(0)") {
-            for item in pending.iter_mut().filter(|item| item.kind == Kind::Store) { item.locks.clear(); }
+            for item in pending.iter_mut().filter(|item| item.kind == Kind::Store) {
+                item.locks.clear();
+            }
             continue;
         }
         let kind = if name.starts_with("buffer_load") || name.starts_with("global_load") {
             Some((Kind::Vmem, true))
         } else if name.starts_with("buffer_store") || name.starts_with("global_store") {
             Some((Kind::Store, false))
-        } else if name.starts_with("ds_load") || name == "ds_swizzle_b32" || name == "ds_bpermute_b32" {
+        } else if name.starts_with("ds_load")
+            || name == "ds_swizzle_b32"
+            || name == "ds_bpermute_b32"
+        {
             // ds_swizzle_b32 / ds_bpermute_b32 return their lane exchange through the DS queue like a load.
             Some((Kind::Ds, true))
         } else if name.starts_with("ds_store") {
             Some((Kind::Ds, false))
-        } else if name.starts_with("s_load") || name.starts_with("s_buffer_load")
-            || name.starts_with("s_sendmsg_rtn") {
+        } else if name.starts_with("s_load")
+            || name.starts_with("s_buffer_load")
+            || name.starts_with("s_sendmsg_rtn")
+        {
             Some((Kind::Km, true))
         } else if name.starts_with("s_store") || name.starts_with("s_buffer_store") {
             Some((Kind::Km, false))
-        } else { None };
+        } else {
+            None
+        };
         let all_regs = registers(operands);
         let first = operands.split(',').next().unwrap_or("");
         let defs = if kind.is_some_and(|(_, load)| load)
-            || name.starts_with("v_") || name.starts_with("s_mov")
-            || name.starts_with("s_add") || name.starts_with("s_sub") {
+            || name.starts_with("v_")
+            || name.starts_with("s_mov")
+            || name.starts_with("s_add")
+            || name.starts_with("s_sub")
+        {
             let mut result = registers(first);
             if name.starts_with("v_dual_") {
                 if let Some((_, second)) = operands.split_once("::") {
@@ -213,17 +298,27 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
                 }
             }
             result
-        } else { BTreeSet::new() };
-        if pending.iter().any(|event| !event.defs.is_disjoint(&all_regs)
-            || !event.locks.is_disjoint(&defs)) {
-            if !all { return Err(format!("line {}: {name} touches unfinished memory operands", line_no+1)); }
+        } else {
+            BTreeSet::new()
+        };
+        if pending
+            .iter()
+            .any(|event| !event.defs.is_disjoint(&all_regs) || !event.locks.is_disjoint(&defs))
+        {
+            if !all {
+                return Err(format!(
+                    "line {}: {name} touches unfinished memory operands",
+                    line_no + 1
+                ));
+            }
             hazards.push(line.to_string());
         }
         if let Some((kind, load)) = kind {
             pending.push(Pending {
                 defs: if load { defs } else { BTreeSet::new() },
                 locks: if load { BTreeSet::new() } else { all_regs },
-                kind, opcode: name,
+                kind,
+                opcode: name,
             });
         }
     }
@@ -233,7 +328,9 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
 #[cfg(test)]
 mod tests {
     use super::replay_waits as gfx12_replay;
-    fn replay_waits(text: &str) -> Result<(), String> { gfx12_replay(text, crate::Arch::Gfx1201) }
+    fn replay_waits(text: &str) -> Result<(), String> {
+        gfx12_replay(text, crate::Arch::Gfx1201)
+    }
     #[test]
     fn load_wait_uses_only_retired_destinations() {
         let legal = "buffer_load_b32 v0, v8, s[4:7], s9 offen\n\
@@ -271,8 +368,11 @@ mod tests {
             v_mov_b32 v0, 0\n";
         assert!(replay_waits(source).is_err());
         assert!(replay_waits(&source.replace("v_mov_b32", "s_wait_storecnt 0\nv_mov_b32")).is_ok());
-        assert!(replay_waits("buffer_store_b32 v0, v1, s[4:7], s8 offen\n\
-            v_add_f32 v2, v0, v3\n").is_ok());
+        assert!(replay_waits(
+            "buffer_store_b32 v0, v1, s[4:7], s8 offen\n\
+            v_add_f32 v2, v0, v3\n"
+        )
+        .is_ok());
     }
     #[test]
     fn smem_load_requires_kmcnt_before_scalar_use() {
@@ -284,10 +384,16 @@ mod tests {
     fn vm_vsrc_releases_store_sources_and_realtime_needs_kmcnt() {
         let store = "global_store_addtid_b32 v9, s[4:5] offset:-8\nv_writelane_b32 v9, s6, 0\n";
         assert!(replay_waits(store).is_err());
-        assert!(replay_waits(&store.replace("v_writelane", "s_wait_alu depctr_vm_vsrc(0)\nv_writelane")).is_ok());
-        let clock = "s_sendmsg_rtn_b64 s[6:7], sendmsg(MSG_RTN_GET_REALTIME)\nv_writelane_b32 v9, s6, 0\n";
+        assert!(replay_waits(
+            &store.replace("v_writelane", "s_wait_alu depctr_vm_vsrc(0)\nv_writelane")
+        )
+        .is_ok());
+        let clock =
+            "s_sendmsg_rtn_b64 s[6:7], sendmsg(MSG_RTN_GET_REALTIME)\nv_writelane_b32 v9, s6, 0\n";
         assert!(replay_waits(clock).is_err());
-        assert!(replay_waits(&clock.replace("v_writelane", "s_wait_kmcnt 0x0\nv_writelane")).is_ok());
+        assert!(
+            replay_waits(&clock.replace("v_writelane", "s_wait_kmcnt 0x0\nv_writelane")).is_ok()
+        );
     }
     /// gfx12 LOADcnt: buffer and global loads share one in-order VMEM_ACCESS
     /// event, so a partial wait retires exactly the oldest of the mixed window.
@@ -299,10 +405,15 @@ mod tests {
             buffer_load_b32 v5, v8, s[4:7], s9 offen offset:8\n";
         // loadcnt 2 retires only the oldest (buffer v[0:1]).
         assert!(replay_waits(&format!("{window}s_wait_loadcnt 2\nv_add_f32 v3, v0, v4\n")).is_ok());
-        assert!(replay_waits(&format!("{window}s_wait_loadcnt 2\nv_add_f32 v3, v2, v4\n")).is_err(), "global still pending");
+        assert!(
+            replay_waits(&format!("{window}s_wait_loadcnt 2\nv_add_f32 v3, v2, v4\n")).is_err(),
+            "global still pending"
+        );
         assert!(replay_waits(&format!("{window}s_wait_loadcnt 1\nv_add_f32 v3, v2, v4\n")).is_ok());
         // Insufficient wait for the youngest (buffer v5).
-        assert!(replay_waits(&format!("{window}s_wait_loadcnt 1\nv_add_f32 v3, v5, v4\n")).is_err());
+        assert!(
+            replay_waits(&format!("{window}s_wait_loadcnt 1\nv_add_f32 v3, v5, v4\n")).is_err()
+        );
         assert!(replay_waits(&format!("{window}s_wait_loadcnt 0\nv_add_f32 v3, v5, v4\n")).is_ok());
         // gfx11 VMcnt keeps the per-family rule.
         let gfx11 = "buffer_load_b64 v[0:1], v8, s[4:7], s9 offen\nglobal_load_b32 v2, v8, s[4:5]\ns_waitcnt vmcnt(1)\nv_add_f32 v3, v0, v4\n";
@@ -313,13 +424,28 @@ mod tests {
         let gfx11 = |text: &str| super::replay_waits(text, crate::Arch::Gfx1100);
         let loads = "global_load_b32 v0, v8, s[4:5]\nglobal_load_b32 v1, v8, s[4:5] offset:4\n\
             ds_load_b32 v2, v9\nds_load_b32 v3, v9 offset:4\n";
-        assert!(gfx11(&format!("{loads}s_waitcnt vmcnt(1) lgkmcnt(1)\nv_add_f32 v4, v0, v2\n")).is_ok());
-        assert!(gfx11(&format!("{loads}s_waitcnt vmcnt(1) lgkmcnt(1)\nv_add_f32 v4, v1, v2\n")).is_err());
-        assert!(gfx11(&format!("{loads}s_waitcnt vmcnt(1)\nv_add_f32 v4, v0, v2\n")).is_err());
+        assert!(gfx11(&format!(
+            "{loads}s_waitcnt vmcnt(1) lgkmcnt(1)\nv_add_f32 v4, v0, v2\n"
+        ))
+        .is_ok());
+        assert!(gfx11(&format!(
+            "{loads}s_waitcnt vmcnt(1) lgkmcnt(1)\nv_add_f32 v4, v1, v2\n"
+        ))
+        .is_err());
+        assert!(gfx11(&format!(
+            "{loads}s_waitcnt vmcnt(1)\nv_add_f32 v4, v0, v2\n"
+        ))
+        .is_err());
         // SMEM shares LGKMcnt and returns out of order: only lgkmcnt(0) retires.
         let mixed = "s_load_b32 s6, s[0:1], 0x0\nds_load_b32 v2, v9\nds_load_b32 v3, v9 offset:4\n";
-        assert!(gfx11(&format!("{mixed}s_waitcnt lgkmcnt(1)\nv_add_f32 v4, v2, v2\n")).is_err());
-        assert!(gfx11(&format!("{mixed}s_waitcnt lgkmcnt(0)\nv_add_f32 v4, v2, v2\n")).is_ok());
+        assert!(gfx11(&format!(
+            "{mixed}s_waitcnt lgkmcnt(1)\nv_add_f32 v4, v2, v2\n"
+        ))
+        .is_err());
+        assert!(gfx11(&format!(
+            "{mixed}s_waitcnt lgkmcnt(0)\nv_add_f32 v4, v2, v2\n"
+        ))
+        .is_ok());
         // Raw immediate: VM[15:10] = 0, LGKM[9:4] = 63 (no wait), EXP[2:0] = 7.
         assert!(gfx11(&format!("{loads}s_waitcnt 0x3f7\nv_add_f32 v4, v1, v1\n")).is_ok());
         assert!(gfx11(&format!("{loads}s_waitcnt 0x3f7\nv_add_f32 v4, v2, v2\n")).is_err());
@@ -327,9 +453,14 @@ mod tests {
         let store = "global_store_b32 v1, v0, s[4:5]\nv_mov_b32_e32 v0, 0\n";
         assert!(gfx11(store).is_err());
         assert!(gfx11(&store.replace("v_mov", "s_waitcnt_vscnt null, 0x0\nv_mov")).is_ok());
-        assert!(gfx11(&store.replace("v_mov", "s_waitcnt_depctr depctr_vm_vsrc(0)\nv_mov")).is_ok());
+        assert!(
+            gfx11(&store.replace("v_mov", "s_waitcnt_depctr depctr_vm_vsrc(0)\nv_mov")).is_ok()
+        );
         // Architecture-foreign spellings are rejected, not ignored.
-        assert!(gfx11(&format!("{loads}s_wait_loadcnt 0x0\nv_add_f32 v4, v1, v1\n")).is_err());
+        assert!(gfx11(&format!(
+            "{loads}s_wait_loadcnt 0x0\nv_add_f32 v4, v1, v1\n"
+        ))
+        .is_err());
         assert!(super::replay_waits("s_waitcnt vmcnt(0)\n", crate::Arch::Gfx1201).is_err());
     }
     /// A ds_swizzle_b32 lane exchange returns through the DS queue: its
@@ -340,20 +471,39 @@ mod tests {
         let gfx11 = |text: &str| super::replay_waits(text, crate::Arch::Gfx1100);
         let stream = "ds_load_b32 v2, v9\nds_swizzle_b32 v3, v4 offset:swizzle(BROADCAST,16,0)\nds_load_b32 v5, v9 offset:4\n";
         assert!(gfx11(&format!("{stream}v_add_f32 v6, v3, v3\n")).is_err());
-        assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(2)\nv_add_f32 v6, v3, v3\n")).is_err());
-        assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v3, v3\n")).is_ok());
+        assert!(gfx11(&format!(
+            "{stream}s_waitcnt lgkmcnt(2)\nv_add_f32 v6, v3, v3\n"
+        ))
+        .is_err());
+        assert!(gfx11(&format!(
+            "{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v3, v3\n"
+        ))
+        .is_ok());
         // lgkmcnt(1) leaves the youngest load, behind the swizzle, pending.
-        assert!(gfx11(&format!("{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v5, v5\n")).is_err());
+        assert!(gfx11(&format!(
+            "{stream}s_waitcnt lgkmcnt(1)\nv_add_f32 v6, v5, v5\n"
+        ))
+        .is_err());
     }
     /// A ds_bpermute_b32 lane exchange returns through the gfx12 DS queue in
     /// order with the DS loads around it, exactly like a swizzle.
     #[test]
     fn gfx12_bpermute_results_wait_like_ds_loads() {
         let gfx12 = |text: &str| super::replay_waits(text, crate::Arch::Gfx1201);
-        let stream = "ds_load_b32 v2, v9\nds_bpermute_b32 v3, v4, v7\nds_load_b32 v5, v9 offset:4\n";
+        let stream =
+            "ds_load_b32 v2, v9\nds_bpermute_b32 v3, v4, v7\nds_load_b32 v5, v9 offset:4\n";
         assert!(gfx12(&format!("{stream}v_add_f32_e32 v6, v3, v3\n")).is_err());
-        assert!(gfx12(&format!("{stream}s_wait_dscnt 0x2\nv_add_f32_e32 v6, v3, v3\n")).is_err());
-        assert!(gfx12(&format!("{stream}s_wait_dscnt 0x1\nv_add_f32_e32 v6, v3, v3\n")).is_ok());
-        assert!(gfx12(&format!("{stream}s_wait_dscnt 0x1\nv_add_f32_e32 v6, v5, v5\n")).is_err());
+        assert!(gfx12(&format!(
+            "{stream}s_wait_dscnt 0x2\nv_add_f32_e32 v6, v3, v3\n"
+        ))
+        .is_err());
+        assert!(gfx12(&format!(
+            "{stream}s_wait_dscnt 0x1\nv_add_f32_e32 v6, v3, v3\n"
+        ))
+        .is_ok());
+        assert!(gfx12(&format!(
+            "{stream}s_wait_dscnt 0x1\nv_add_f32_e32 v6, v5, v5\n"
+        ))
+        .is_err());
     }
 }

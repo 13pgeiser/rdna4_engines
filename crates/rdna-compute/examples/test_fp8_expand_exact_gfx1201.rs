@@ -54,8 +54,7 @@ fn synth_weights(m: usize, seed: u64) -> Vec<u8> {
                 } else {
                     -4.0 + 0.05 * ((prng(&mut st) >> 11) % 160) as f32
                 };
-                out[dst + h * 4..dst + h * 4 + 2]
-                    .copy_from_slice(&half_from_f32(sc).to_le_bytes());
+                out[dst + h * 4..dst + h * 4 + 2].copy_from_slice(&half_from_f32(sc).to_le_bytes());
                 out[dst + h * 4 + 2..dst + h * 4 + 4]
                     .copy_from_slice(&half_from_f32(zp).to_le_bytes());
             }
@@ -98,9 +97,7 @@ fn main() {
         eprintln!("=== SKIP === exact gfx1201 only (arch={})", gpu.arch);
         return;
     }
-    let dump_dir = std::env::args()
-        .skip_while(|a| a != "--dump-dir")
-        .nth(1);
+    let dump_dir = std::env::args().skip_while(|a| a != "--dump-dir").nth(1);
     if let Some(d) = &dump_dir {
         std::fs::create_dir_all(d).unwrap();
     }
@@ -111,16 +108,36 @@ fn main() {
     gpu.hip.memcpy_htod(&x_full.buf, bytes_of(&x_host)).unwrap();
 
     // Weight blobs (shared across N).
-    let w_gate = gpu.upload_raw(&synth_weights(256, 0xA1), &[256 * GPR * GB]).unwrap();
-    let w_up = gpu.upload_raw(&synth_weights(256, 0xA2), &[256 * GPR * GB]).unwrap();
-    let w_q = gpu.upload_raw(&synth_weights(256, 0xB1), &[256 * GPR * GB]).unwrap();
-    let w_k = gpu.upload_raw(&synth_weights(128, 0xB2), &[128 * GPR * GB]).unwrap();
-    let w_v = gpu.upload_raw(&synth_weights(128, 0xB3), &[128 * GPR * GB]).unwrap();
-    let w_qkv = gpu.upload_raw(&synth_weights(256, 0xC1), &[256 * GPR * GB]).unwrap();
-    let w_z = gpu.upload_raw(&synth_weights(64, 0xC2), &[64 * GPR * GB]).unwrap();
-    let w_b = gpu.upload_raw(&synth_weights(64, 0xC3), &[64 * GPR * GB]).unwrap();
-    let w_a = gpu.upload_raw(&synth_weights(64, 0xC4), &[64 * GPR * GB]).unwrap();
-    let w_res = gpu.upload_raw(&synth_weights(512, 0xD1), &[512 * GPR * GB]).unwrap();
+    let w_gate = gpu
+        .upload_raw(&synth_weights(256, 0xA1), &[256 * GPR * GB])
+        .unwrap();
+    let w_up = gpu
+        .upload_raw(&synth_weights(256, 0xA2), &[256 * GPR * GB])
+        .unwrap();
+    let w_q = gpu
+        .upload_raw(&synth_weights(256, 0xB1), &[256 * GPR * GB])
+        .unwrap();
+    let w_k = gpu
+        .upload_raw(&synth_weights(128, 0xB2), &[128 * GPR * GB])
+        .unwrap();
+    let w_v = gpu
+        .upload_raw(&synth_weights(128, 0xB3), &[128 * GPR * GB])
+        .unwrap();
+    let w_qkv = gpu
+        .upload_raw(&synth_weights(256, 0xC1), &[256 * GPR * GB])
+        .unwrap();
+    let w_z = gpu
+        .upload_raw(&synth_weights(64, 0xC2), &[64 * GPR * GB])
+        .unwrap();
+    let w_b = gpu
+        .upload_raw(&synth_weights(64, 0xC3), &[64 * GPR * GB])
+        .unwrap();
+    let w_a = gpu
+        .upload_raw(&synth_weights(64, 0xC4), &[64 * GPR * GB])
+        .unwrap();
+    let w_res = gpu
+        .upload_raw(&synth_weights(512, 0xD1), &[512 * GPR * GB])
+        .unwrap();
 
     // Output buffers at max N.
     let y_gate = gpu.alloc_tensor(&[max_n * 256], DType::F32).unwrap();
@@ -180,8 +197,7 @@ fn main() {
             let yb = y_beta.sub_offset(0, n * 64);
             let ya = y_alpha.sub_offset(0, n * 64);
             gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8(
-                &w_qkv, &w_z, &w_b, &w_a, &x, &yq, &yz, &yb, &ya, 256, 64, 64, 64,
-                K, n, 1,
+                &w_qkv, &w_z, &w_b, &w_a, &x, &yq, &yz, &yb, &ya, 256, 64, 64, 64, K, n, 1,
             )
             .unwrap();
             gpu.hip.device_synchronize().unwrap();

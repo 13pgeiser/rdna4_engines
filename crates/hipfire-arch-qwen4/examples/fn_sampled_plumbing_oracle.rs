@@ -59,6 +59,7 @@
 //! pool-boundary ties, equal-rounded-exp weights and partial final tiles, and
 //! also times policy index 4 (0.8/1.0/pool 64/min_p 0.1).
 
+use hip_bridge::KernargBlob;
 use hip_bridge::{launch_counters, memory_effects, Graph, GraphExec};
 use hipfire_runtime::spec_sampling::{
     accept_sampled_prefix, SampleSpec, SparseDist as RtDist, SpecRng,
@@ -67,7 +68,6 @@ use rdna_compute::spec_sampling_cpu_ar as sc;
 use rdna_compute::{DType, Gpu, GpuTensor, HipError, HipResult};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use hip_bridge::KernargBlob;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -321,10 +321,17 @@ fn canonical_target(
         return Ok(vec![(0, 1.0)]);
     };
     let inv_temp = 1.0f32 / spec.temperature;
-    let args: Vec<f32> = scr.iter().map(|&(_, l)| (l - max_logit) * inv_temp).collect();
+    let args: Vec<f32> = scr
+        .iter()
+        .map(|&(_, l)| (l - max_logit) * inv_temp)
+        .collect();
     let ex = exp(&args)?;
     if ex.len() != args.len() {
-        return Err(format!("exp map returned {} values for {}", ex.len(), args.len()));
+        return Err(format!(
+            "exp map returned {} values for {}",
+            ex.len(),
+            args.len()
+        ));
     }
     let mut w = [0f32; CAP];
     let mut ids = [u32::MAX; CAP];
@@ -431,8 +438,14 @@ fn exp_map_run(gpu: &mut Gpu, s: &mut ExpState, misses: &[u32]) -> R<()> {
             gpu.ensure_kernel_public(EXP_MAP_MODULE, EXP_MAP_SRC, EXP_MAP_SYMBOL),
             "ensure expf map kernel",
         )?;
-        s.args = Some(hip(gpu.alloc_tensor(&[EXP_MAP_CAP], DType::F32), "alloc expf args")?);
-        s.out = Some(hip(gpu.alloc_tensor(&[EXP_MAP_CAP], DType::F32), "alloc expf out")?);
+        s.args = Some(hip(
+            gpu.alloc_tensor(&[EXP_MAP_CAP], DType::F32),
+            "alloc expf args",
+        )?);
+        s.out = Some(hip(
+            gpu.alloc_tensor(&[EXP_MAP_CAP], DType::F32),
+            "alloc expf out",
+        )?);
         s.prepared = true;
     }
     let (a, o) = match (s.args.as_ref(), s.out.as_ref()) {
@@ -441,7 +454,10 @@ fn exp_map_run(gpu: &mut Gpu, s: &mut ExpState, misses: &[u32]) -> R<()> {
     };
     for chunk in misses.chunks(EXP_MAP_CAP) {
         let n = chunk.len();
-        hip(gpu.memcpy_htod_auto(&a.buf, &u32_bytes(chunk)), "expf map h2d")?;
+        hip(
+            gpu.memcpy_htod_auto(&a.buf, &u32_bytes(chunk)),
+            "expf map h2d",
+        )?;
         let mut blob = KernargBlob::new();
         blob.push_ptr(a.buf.as_ptr());
         blob.push_ptr(o.buf.as_ptr());
@@ -510,7 +526,13 @@ fn dev_exp(gpu: &mut Gpu, args: &[f32]) -> Result<Vec<f32>, String> {
 fn exp_diag_json(st: &Stats) -> Value {
     let (unique, differ, launches, samples, prepared) = EXP_STATE.with(|c| {
         let s = c.borrow();
-        (s.unique, s.differ_from_host, s.launches, s.samples.clone(), s.prepared)
+        (
+            s.unique,
+            s.differ_from_host,
+            s.launches,
+            s.samples.clone(),
+            s.prepared,
+        )
     });
     json!({
         "authoritative_check": "device rows == canonical_target() fed by the test-only HIP expf map \
@@ -732,12 +754,16 @@ fn d2h_async(gpu: &Gpu, t: &GpuTensor, out: &mut [u8]) -> R<()> {
     W_D2H_CALLS.fetch_add(1, Ordering::Relaxed);
     W_D2H_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
     hip(
-        gpu.hip.memcpy_dtoh_async(out, &t.buf, Some(stream_of(gpu)?)),
+        gpu.hip
+            .memcpy_dtoh_async(out, &t.buf, Some(stream_of(gpu)?)),
         "d2h_async",
     )
 }
 fn sync(gpu: &Gpu) -> R<()> {
-    hip(gpu.hip.stream_synchronize(stream_of(gpu)?), "stream_synchronize")
+    hip(
+        gpu.hip.stream_synchronize(stream_of(gpu)?),
+        "stream_synchronize",
+    )
 }
 /// Blocking D2H of one logit row out of a resident logits tensor, as the
 /// existing request path's `download_f32_into`-per-visited-row does.
@@ -1294,7 +1320,12 @@ fn outside_support(p: &SparseDist, vocab: usize, r: &mut Rng) -> Option<u32> {
     (0..vocab as u32).find(|t| !p.entries().iter().any(|&(x, _)| x == *t))
 }
 
-fn gen_cands(p: &SparseDist, vocab: usize, eos_hint: Option<u32>, r: &mut Rng) -> ([u32; 8], [f32; 8]) {
+fn gen_cands(
+    p: &SparseDist,
+    vocab: usize,
+    eos_hint: Option<u32>,
+    r: &mut Rng,
+) -> ([u32; 8], [f32; 8]) {
     let mut ids = [0u32; 8];
     let mut n = 0usize;
     fn put(t: u32, ids: &mut [u32; 8], n: &mut usize, vocab: usize) {
@@ -1593,7 +1624,11 @@ fn upload_window(gpu: &Gpu, res: &Res, c: &Corpus, win: &Win, qs: &[SparseDist])
     }
     h2d(gpu, &res.logits, &f32_bytes(&flat))?;
     // Sentinels prove the device wrote every output it is responsible for.
-    h2d(gpu, &res.tgt.counts, &u32_bytes(&vec![SENT; res.tgt.capacity_rows]))?;
+    h2d(
+        gpu,
+        &res.tgt.counts,
+        &u32_bytes(&vec![SENT; res.tgt.capacity_rows]),
+    )?;
     let dc = res.drf.capacity_rows;
     let mut counts = vec![SENT; dc];
     let mut ids = vec![0u32; dc * CAP];
@@ -1646,7 +1681,10 @@ fn rows_enqueue(
     match backend() {
         RowsBackend::Reference => match res.scratch.as_ref() {
             Some(s) => gpu.spec_cpu_ar_rows_enqueue(&res.logits, &res.tgt, s, vocab, rows, policy),
-            None => Err(HipError::new(0, "reference rows backend allocated no scratch")),
+            None => Err(HipError::new(
+                0,
+                "reference rows backend allocated no scratch",
+            )),
         },
         RowsBackend::CanonicalParallelF32 => match rows_impl() {
             Impl::Pm => {
@@ -1674,9 +1712,8 @@ fn accept_enqueue_with(
     eos: u32,
 ) -> HipResult<()> {
     match which {
-        Impl::Pm => gpu.spec_accept_ordered_enqueue(
-            &res.tgt, &res.drf, &res.props, &res.tape, result, k, eos,
-        ),
+        Impl::Pm => gpu
+            .spec_accept_ordered_enqueue(&res.tgt, &res.drf, &res.props, &res.tape, result, k, eos),
         Impl::HipTwin => gpu.spec_accept_ordered_hip_twin_enqueue(
             &res.tgt, &res.drf, &res.props, &res.tape, result, k, eos,
         ),
@@ -1696,10 +1733,7 @@ fn enqueue_window(
 ) -> R<CallNodes> {
     let mut nodes: CallNodes = Vec::new();
     let b0 = gpu.graphs.capture_blobs.len();
-    hip(
-        rows_enqueue(gpu, res, vocab, k + 1, policy),
-        "rows enqueue",
-    )?;
+    hip(rows_enqueue(gpu, res, vocab, k + 1, policy), "rows enqueue")?;
     let mut last = gpu.graphs.capture_blobs.len();
     nodes.push(("rows".into(), last - b0));
     for j in 0..k {
@@ -2059,7 +2093,15 @@ fn run_window(
     sync(gpu)?;
     let cu = cand_us_of(win);
     let before = tally();
-    enqueue_window(gpu, res, win.vocab, win.k, policy_of(spec), eos_word(win.eos), &cu)?;
+    enqueue_window(
+        gpu,
+        res,
+        win.vocab,
+        win.k,
+        policy_of(spec),
+        eos_word(win.eos),
+        &cu,
+    )?;
     let during = tally().since(before);
     if during.any_host_traffic() {
         return mismatch(format!(
@@ -2075,7 +2117,11 @@ fn run_window(
     if twin_enabled() {
         // The other ordered-accept implementation on the same resident
         // target/draft rows, proposals and tape; result words must be equal.
-        let other = if accept_impl() == Impl::Pm { Impl::HipTwin } else { Impl::Pm };
+        let other = if accept_impl() == Impl::Pm {
+            Impl::HipTwin
+        } else {
+            Impl::Pm
+        };
         sync(gpu)?;
         h2d(gpu, &res.result2, &u32_bytes(&[0xDEAD_BEEF, 0xDEAD_BEEF]))?;
         let b = tally();
@@ -2145,16 +2191,32 @@ fn run_twin_rows(
                 for (t, pat) in [(&res.tgt, 0xA5A5_A5A5u32), (&twin, 0x5A5A_5A5Au32)] {
                     h2d(gpu, &t.counts, &u32_bytes(&vec![pat; t.capacity_rows]))?;
                     h2d(gpu, &t.ids, &u32_bytes(&vec![pat; t.capacity_rows * CAP]))?;
-                    h2d(gpu, &t.probabilities, &u32_bytes(&vec![pat; t.capacity_rows * CAP]))?;
+                    h2d(
+                        gpu,
+                        &t.probabilities,
+                        &u32_bytes(&vec![pat; t.capacity_rows * CAP]),
+                    )?;
                 }
                 sync(gpu)?;
                 let before = tally();
                 hip(
-                    gpu.spec_cpu_ar_rows_parallel_enqueue(&res.logits, &res.tgt, *vocab, n, policy_of(*spec)),
+                    gpu.spec_cpu_ar_rows_parallel_enqueue(
+                        &res.logits,
+                        &res.tgt,
+                        *vocab,
+                        n,
+                        policy_of(*spec),
+                    ),
                     "pm rows enqueue",
                 )?;
                 hip(
-                    gpu.spec_cpu_ar_rows_parallel_hip_twin_enqueue(&res.logits, &twin, *vocab, n, policy_of(*spec)),
+                    gpu.spec_cpu_ar_rows_parallel_hip_twin_enqueue(
+                        &res.logits,
+                        &twin,
+                        *vocab,
+                        n,
+                        policy_of(*spec),
+                    ),
                     "hip twin rows enqueue",
                 )?;
                 let during = tally().since(before);
@@ -2239,7 +2301,11 @@ fn run_distribution(
                     flat.extend_from_slice(r);
                 }
                 h2d(gpu, &res.logits, &f32_bytes(&flat))?;
-                h2d(gpu, &res.tgt.counts, &u32_bytes(&vec![SENT; res.tgt.capacity_rows]))?;
+                h2d(
+                    gpu,
+                    &res.tgt.counts,
+                    &u32_bytes(&vec![SENT; res.tgt.capacity_rows]),
+                )?;
                 sync(gpu)?;
                 let before = tally();
                 hip(
@@ -2311,30 +2377,99 @@ fn directed_specs() -> Vec<(String, usize, Vec<DKind>, EosMode)> {
     push("k1_accepted_eos_last", vec![AcceptEq], EosMode::Draft(0));
     push("k1_bonus_eos", vec![AcceptEq], EosMode::Terminal);
     push("k1_reject_point_out", vec![RejectPointOut], EosMode::None);
-    push("k1_replacement_eos", vec![RejectPointOut], EosMode::Terminal);
+    push(
+        "k1_replacement_eos",
+        vec![RejectPointOut],
+        EosMode::Terminal,
+    );
     push("k1_zero_residual", vec![ZeroResidual], EosMode::None);
-    push("k1_zero_residual_eos", vec![ZeroResidual], EosMode::Terminal);
+    push(
+        "k1_zero_residual_eos",
+        vec![ZeroResidual],
+        EosMode::Terminal,
+    );
     push("k1_ngram_point", vec![AcceptPoint], EosMode::None);
     push("k1_cand", vec![Cand], EosMode::None);
-    push("k3_reject_first", vec![RejectPointOut, AcceptEq, AcceptEq], EosMode::None);
-    push("k3_reject_mid", vec![AcceptEq, RejectPointOut, AcceptEq], EosMode::None);
-    push("k3_reject_last", vec![AcceptEq, AcceptEq, RejectPointOut], EosMode::None);
-    push("k3_reject_last_eos", vec![AcceptEq, AcceptEq, RejectPointOut], EosMode::Terminal);
-    push("k3_all_accept", vec![AcceptEq, AcceptEq, AcceptEq], EosMode::None);
-    push("k3_all_accept_bonus_eos", vec![AcceptEq, AcceptEq, AcceptEq], EosMode::Terminal);
-    push("k3_accepted_eos_first", vec![AcceptEq, AcceptEq, AcceptEq], EosMode::Draft(0));
-    push("k3_accepted_eos_last", vec![AcceptEq, AcceptEq, AcceptEq], EosMode::Draft(2));
-    push("k3_zero_residual_mid", vec![AcceptEq, ZeroResidual, AcceptEq], EosMode::None);
-    push("k3_zero_residual_last", vec![AcceptEq, AcceptEq, ZeroResidual], EosMode::None);
-    push("k3_ngram_chain", vec![AcceptPoint, AcceptPoint, AcceptPoint], EosMode::None);
-    push("k3_ngram_chain_eos", vec![AcceptPoint, AcceptPoint, AcceptPoint], EosMode::Terminal);
-    push("k3_ngram_reject", vec![AcceptPoint, RejectPointOut, AcceptPoint], EosMode::None);
+    push(
+        "k3_reject_first",
+        vec![RejectPointOut, AcceptEq, AcceptEq],
+        EosMode::None,
+    );
+    push(
+        "k3_reject_mid",
+        vec![AcceptEq, RejectPointOut, AcceptEq],
+        EosMode::None,
+    );
+    push(
+        "k3_reject_last",
+        vec![AcceptEq, AcceptEq, RejectPointOut],
+        EosMode::None,
+    );
+    push(
+        "k3_reject_last_eos",
+        vec![AcceptEq, AcceptEq, RejectPointOut],
+        EosMode::Terminal,
+    );
+    push(
+        "k3_all_accept",
+        vec![AcceptEq, AcceptEq, AcceptEq],
+        EosMode::None,
+    );
+    push(
+        "k3_all_accept_bonus_eos",
+        vec![AcceptEq, AcceptEq, AcceptEq],
+        EosMode::Terminal,
+    );
+    push(
+        "k3_accepted_eos_first",
+        vec![AcceptEq, AcceptEq, AcceptEq],
+        EosMode::Draft(0),
+    );
+    push(
+        "k3_accepted_eos_last",
+        vec![AcceptEq, AcceptEq, AcceptEq],
+        EosMode::Draft(2),
+    );
+    push(
+        "k3_zero_residual_mid",
+        vec![AcceptEq, ZeroResidual, AcceptEq],
+        EosMode::None,
+    );
+    push(
+        "k3_zero_residual_last",
+        vec![AcceptEq, AcceptEq, ZeroResidual],
+        EosMode::None,
+    );
+    push(
+        "k3_ngram_chain",
+        vec![AcceptPoint, AcceptPoint, AcceptPoint],
+        EosMode::None,
+    );
+    push(
+        "k3_ngram_chain_eos",
+        vec![AcceptPoint, AcceptPoint, AcceptPoint],
+        EosMode::Terminal,
+    );
+    push(
+        "k3_ngram_reject",
+        vec![AcceptPoint, RejectPointOut, AcceptPoint],
+        EosMode::None,
+    );
     push("k3_cand_mix", vec![Cand, HostCand, Cand], EosMode::None);
     push("k3_cand_eos", vec![Cand, Cand, Cand], EosMode::Terminal);
     push("k8_all_accept", vec![AcceptEq; 8], EosMode::None);
     push(
         "k8_reject_last",
-        vec![AcceptEq, AcceptEq, AcceptEq, AcceptEq, AcceptEq, AcceptEq, AcceptEq, RejectPointOut],
+        vec![
+            AcceptEq,
+            AcceptEq,
+            AcceptEq,
+            AcceptEq,
+            AcceptEq,
+            AcceptEq,
+            AcceptEq,
+            RejectPointOut,
+        ],
         EosMode::None,
     );
     push("k8_cand", vec![Cand; 8], EosMode::None);
@@ -2373,7 +2508,14 @@ fn run_windows(
                     seed: seed_ctr,
                     fixed_u: None,
                 };
-                let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("directed:{name}:{}:p{pi}", c.name))?;
+                let win = build_window(
+                    gpu,
+                    corpora,
+                    pols,
+                    &sp,
+                    &mut dr,
+                    format!("directed:{name}:{}:p{pi}", c.name),
+                )?;
                 run_window(gpu, res, corpora, pols, &win, "directed", st)?;
                 directed += 1;
             }
@@ -2448,7 +2590,12 @@ const REQUIRED_COVERAGE: &[&str] = &[
 
 /// All eight candidates non-finite: the host build errors; the device must
 /// report the invalid pick and an empty row.
-fn run_candidate_invalid(gpu: &mut Gpu, res: &Res, pols: &[(SampleSpec, String)], vocab: usize) -> R<Value> {
+fn run_candidate_invalid(
+    gpu: &mut Gpu,
+    res: &Res,
+    pols: &[(SampleSpec, String)],
+    vocab: usize,
+) -> R<Value> {
     let spec = pols[0].0;
     let ids: [u32; 8] = [3, 5, 8, 13, 21, 34, 55, 89];
     let nan = f32::NAN;
@@ -2464,10 +2611,22 @@ fn run_candidate_invalid(gpu: &mut Gpu, res: &Res, pols: &[(SampleSpec, String)]
     }
     h2d(gpu, &res.cand[0], &u32_bytes(&w))?;
     h2d(gpu, &res.picked[0], &u32_bytes(&[0x1234_5678]))?;
-    h2d(gpu, &res.drf.counts, &u32_bytes(&vec![0x7777u32; res.drf.capacity_rows]))?;
+    h2d(
+        gpu,
+        &res.drf.counts,
+        &u32_bytes(&vec![0x7777u32; res.drf.capacity_rows]),
+    )?;
     sync(gpu)?;
     hip(
-        gpu.spec_cpu_ar_candidates_enqueue(&res.cand[0], &res.drf, 0, vocab, policy_of(spec), 0.5, &res.picked[0]),
+        gpu.spec_cpu_ar_candidates_enqueue(
+            &res.cand[0],
+            &res.drf,
+            0,
+            vocab,
+            policy_of(spec),
+            0.5,
+            &res.picked[0],
+        ),
         "candidates_enqueue(invalid)",
     )?;
     sync(gpu)?;
@@ -2634,7 +2793,14 @@ fn run_graph_oracle(
             seed: args.seed ^ gi as u64,
             fixed_u: Some(fixed_u.clone()),
         };
-        let w0 = build_window(gpu, corpora, pols, &first, &mut dr, format!("graph{gi}:seed"))?;
+        let w0 = build_window(
+            gpu,
+            corpora,
+            pols,
+            &first,
+            &mut dr,
+            format!("graph{gi}:seed"),
+        )?;
         let qs0 = qs_host(&w0, spec);
         upload_window(gpu, &res, &corpora[0], &w0, &qs0)?;
         sync(gpu)?;
@@ -2654,7 +2820,14 @@ fn run_graph_oracle(
                 seed: dr.next(),
                 fixed_u: Some(fixed_u.clone()),
             };
-            let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("graph{gi}:replay{rp}"))?;
+            let win = build_window(
+                gpu,
+                corpora,
+                pols,
+                &sp,
+                &mut dr,
+                format!("graph{gi}:replay{rp}"),
+            )?;
             // Mutate every resident input, then replay the captured graph.
             let qs = qs_host(&win, spec);
             upload_window(gpu, &res, &corpora[0], &win, &qs)?;
@@ -2663,7 +2836,10 @@ fn run_graph_oracle(
             replay(gpu, &cap)?;
             let d = tally().since(before);
             if d.graph_launch != 1 || d.dtoh + d.dtod + d.memset + d.htod != 0 {
-                return mismatch(format!("graph{gi} replay {rp}: unexpected host traffic {}", d.json()));
+                return mismatch(format!(
+                    "graph{gi} replay {rp}: unexpected host traffic {}",
+                    d.json()
+                ));
             }
             let rf = check_window(gpu, &res, &win, spec, &format!("graph{gi} replay"), st)?;
             accepted_hist[rf.accepted] += 1;
@@ -2727,7 +2903,11 @@ fn run_timing_policy(
     pi: usize,
 ) -> R<Value> {
     // Real rows when supplied, else the main synthetic corpus.
-    let tci = if corpora.len() > 2 { corpora.len() - 1 } else { 0 };
+    let tci = if corpora.len() > 2 {
+        corpora.len() - 1
+    } else {
+        0
+    };
     let c = &corpora[tci];
     let vocab = c.vocab;
     // `pi` indexes policies(); the default (1) is 0.7 / 0.95 / pool 20, the AR default family.
@@ -2752,7 +2932,14 @@ fn run_timing_policy(
                 seed: dr.next(),
                 fixed_u: Some(fixed_u),
             };
-            let win = build_window(gpu, corpora, pols, &sp, &mut dr, format!("timing:k{k}:w{w}"))?;
+            let win = build_window(
+                gpu,
+                corpora,
+                pols,
+                &sp,
+                &mut dr,
+                format!("timing:k{k}:w{w}"),
+            )?;
             let qs = qs_host(&win, spec);
             let rf = host_reference(&win, &qs, win.eos)?;
             let accepted_eos = rf.hit_eos && rf.committed.len() == rf.accepted;
@@ -2847,7 +3034,9 @@ fn run_timing_policy(
                         &mut tgt,
                         |row, o| {
                             let a = Instant::now();
-                            if let Err(e) = d2h_row_at(gpu, &tw.res.logits, row * vocab * 4, &mut buf) {
+                            if let Err(e) =
+                                d2h_row_at(gpu, &tw.res.logits, row * vocab * 4, &mut buf)
+                            {
                                 err = Some(e);
                                 return Err("d2h".to_string());
                             }
@@ -2866,7 +3055,10 @@ fn run_timing_policy(
                     // The existing host route always uses the reference law; its
                     // verdict only equals the device words under that law.
                     if backend() == RowsBackend::Reference && acc.accepted as u32 != tw.words[0] {
-                        return mismatch(format!("{}: host timing route verdict changed", tw.win.name));
+                        return mismatch(format!(
+                            "{}: host timing route verdict changed",
+                            tw.win.name
+                        ));
                     }
                     total.push(wall);
                     dl.push(dl_acc);
@@ -2924,8 +3116,20 @@ fn run_timing_policy(
                             enqueue_window(gpu, &tw.res, vocab, k, policy, EOS_NONE, &none)?;
                             enq_traffic.add(tally().since(b));
                         }
-                        1 => replay(gpu, tw.g_host_q.as_ref().ok_or_else(|| Fail { code: 2, msg: "graph".into() })?)?,
-                        _ => replay(gpu, tw.g_cand.as_ref().ok_or_else(|| Fail { code: 2, msg: "graph".into() })?)?,
+                        1 => replay(
+                            gpu,
+                            tw.g_host_q.as_ref().ok_or_else(|| Fail {
+                                code: 2,
+                                msg: "graph".into(),
+                            })?,
+                        )?,
+                        _ => replay(
+                            gpu,
+                            tw.g_cand.as_ref().ok_or_else(|| Fail {
+                                code: 2,
+                                msg: "graph".into(),
+                            })?,
+                        )?,
                     }
                     d2h_async(gpu, &tw.res.result, &mut result_bytes)?;
                     sync(gpu)?;
@@ -2955,7 +3159,10 @@ fn run_timing_policy(
             });
             if mode == 0 {
                 if enq_traffic.any_host_traffic() {
-                    return mismatch(format!("timed enqueue calls issued traffic: {}", enq_traffic.json()));
+                    return mismatch(format!(
+                        "timed enqueue calls issued traffic: {}",
+                        enq_traffic.json()
+                    ));
                 }
                 m["traffic_inside_enqueue_calls"] = enq_traffic.json();
             }
@@ -2971,10 +3178,22 @@ fn run_timing_policy(
                         }
                         h2d_async(gpu, &tw.res.props, &tw.props_b)?;
                         h2d_async(gpu, &tw.res.tape, &tw.tape_b)?;
-                        hip(gpu.hip.event_record(&ev0, Some(stream_of(gpu)?)), "event_record")?;
+                        hip(
+                            gpu.hip.event_record(&ev0, Some(stream_of(gpu)?)),
+                            "event_record",
+                        )?;
                         let g = if mode == 1 { &tw.g_host_q } else { &tw.g_cand };
-                        replay(gpu, g.as_ref().ok_or_else(|| Fail { code: 2, msg: "graph".into() })?)?;
-                        hip(gpu.hip.event_record(&ev1, Some(stream_of(gpu)?)), "event_record")?;
+                        replay(
+                            gpu,
+                            g.as_ref().ok_or_else(|| Fail {
+                                code: 2,
+                                msg: "graph".into(),
+                            })?,
+                        )?;
+                        hip(
+                            gpu.hip.event_record(&ev1, Some(stream_of(gpu)?)),
+                            "event_record",
+                        )?;
                         sync(gpu)?;
                         let ms = hip(gpu.hip.event_elapsed_ms(&ev0, &ev1), "event_elapsed")?;
                         ev.push(ms as f64 * 1e3);
@@ -2993,8 +3212,13 @@ fn run_timing_policy(
             if !variants.contains_key(vn) {
                 continue;
             }
-            let p50 = variants[vn]["per_window"]["p50_us"].as_f64().unwrap_or(f64::NAN);
-            within.insert(vn.into(), json!({"p50_us": p50, "within_0_2ms_budget": p50 <= BUDGET_US}));
+            let p50 = variants[vn]["per_window"]["p50_us"]
+                .as_f64()
+                .unwrap_or(f64::NAN);
+            within.insert(
+                vn.into(),
+                json!({"p50_us": p50, "within_0_2ms_budget": p50 <= BUDGET_US}),
+            );
         }
         out.push(json!({
             "k": k, "vocab": vocab, "corpus": c.name, "policy": pols[pi].1, "policy_index": pi,
@@ -3044,12 +3268,18 @@ fn run_timing(
 // ── identity / main ──────────────────────────────────────────────────
 
 fn sha_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn identity(gpu: &Gpu, args: &Args) -> R<Value> {
     let uuid = hip(gpu.hip.device_uuid(gpu.device_id), "device_uuid")?;
-    let bdf = hip(gpu.hip.device_pci_bus_id(gpu.device_id), "device_pci_bus_id")?;
+    let bdf = hip(
+        gpu.hip.device_pci_bus_id(gpu.device_id),
+        "device_pci_bus_id",
+    )?;
     if let Some(a) = &args.expect_arch {
         if &gpu.arch != a {
             return setup(format!("arch {} != expected {a}", gpu.arch));
@@ -3070,7 +3300,10 @@ fn identity(gpu: &Gpu, args: &Args) -> R<Value> {
         .as_ref()
         .and_then(|p| std::fs::read(p).ok())
         .map(|b| sha_hex(&b));
-    let kernel_src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels/src/spec_sampling_cpu_ar.hip");
+    let kernel_src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernels/src/spec_sampling_cpu_ar.hip"
+    );
     let kernel_sha = std::fs::read(kernel_src).ok().map(|b| sha_hex(&b));
     let mut env_map = BTreeMap::new();
     for (k, v) in std::env::vars() {
@@ -3123,7 +3356,10 @@ fn finish_fail(rec: &mut Map<String, Value>, stage: &str, e: Fail, st: &Stats) -
     fill_stats(rec, st);
     rec.insert("pass".into(), json!(false));
     rec.insert("speedup_claimed".into(), json!(false));
-    rec.insert("failure".into(), json!({"stage": stage, "code": e.code, "message": e.msg}));
+    rec.insert(
+        "failure".into(),
+        json!({"stage": stage, "code": e.code, "message": e.msg}),
+    );
     Ok(false)
 }
 
@@ -3199,16 +3435,16 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     }
     // Serial reference rows, candidates and the HIP accept twin: explicit
     // oracle setup. The HIP parallel rows twin is always bound.
-    hip(gpu.spec_cpu_ar_oracle_precompile(), "spec_cpu_ar_oracle_precompile")?;
+    hip(
+        gpu.spec_cpu_ar_oracle_precompile(),
+        "spec_cpu_ar_oracle_precompile",
+    )?;
     hip(
         gpu.spec_cpu_ar_rows_parallel_hip_twin_precompile(),
         "spec_cpu_ar_rows_parallel_hip_twin_precompile",
     )?;
     let canonical = backend() == RowsBackend::CanonicalParallelF32;
-    if supported
-        || args.accept_impl == Impl::Pm
-        || (canonical && args.rows_impl == Impl::Pm)
-    {
+    if supported || args.accept_impl == Impl::Pm || (canonical && args.rows_impl == Impl::Pm) {
         // On an arch without PM images this errors, by design (no fallback).
         hip(
             gpu.spec_cpu_ar_rows_parallel_precompile(),
@@ -3259,7 +3495,10 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
         })?;
         let row_bytes = args.rows_vocab * 4;
         if b.is_empty() || b.len() % row_bytes != 0 {
-            return setup(format!("{path}: size {} not a multiple of vocab*4", b.len()));
+            return setup(format!(
+                "{path}: size {} not a multiple of vocab*4",
+                b.len()
+            ));
         }
         let rows: Vec<Vec<f32>> = b
             .chunks_exact(row_bytes)
@@ -3294,14 +3533,18 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     let mut dist_corpora: Vec<(usize, Vec<Vec<f32>>)> =
         corpora.iter().map(|c| (c.vocab, c.rows.clone())).collect();
     for v in [10usize, 64] {
-        let rows: Vec<Vec<f32>> = (0..n_kinds()).map(|kind| gen_row(kind, v, &mut rng)).collect();
+        let rows: Vec<Vec<f32>> = (0..n_kinds())
+            .map(|kind| gen_row(kind, v, &mut rng))
+            .collect();
         dist_corpora.push((v, rows));
     }
     if backend() == RowsBackend::CanonicalParallelF32 {
         // Vocabularies straddling the 1024-token tile boundaries, with
         // partial final tiles.
         for v in [1023usize, 1024, 1025, 2047, 2049, 3500] {
-            let rows: Vec<Vec<f32>> = (0..n_kinds()).map(|kind| gen_row(kind, v, &mut rng)).collect();
+            let rows: Vec<Vec<f32>> = (0..n_kinds())
+                .map(|kind| gen_row(kind, v, &mut rng))
+                .collect();
             dist_corpora.push((v, rows));
         }
     }
@@ -3318,7 +3561,9 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     if twin_enabled() {
         let mut trng = Rng(args.seed ^ 0x7770);
         let mut tc: Vec<(usize, Vec<Vec<f32>>)> = Vec::new();
-        for v in [args.vocab, 37usize, 10, 64, 1023, 1024, 1025, 2047, 2049, 3500] {
+        for v in [
+            args.vocab, 37usize, 10, 64, 1023, 1024, 1025, 2047, 2049, 3500,
+        ] {
             let rows: Vec<Vec<f32>> = (0..N_KINDS_CANON)
                 .map(|kind| gen_row(kind, v, &mut trng))
                 .collect();
@@ -3343,7 +3588,9 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
             Ok(v) => {
                 rec.insert("candidates_invalid".into(), v);
             }
-            Err(e) => return finish_fail(rec, "candidates_invalid(device q, NOT shipping)", e, &st),
+            Err(e) => {
+                return finish_fail(rec, "candidates_invalid(device q, NOT shipping)", e, &st)
+            }
         }
     }
     match run_windows(&mut gpu, &res, &corpora, &pols, &args, &mut st) {
@@ -3355,7 +3602,10 @@ fn real_main(rec: &mut Map<String, Value>) -> R<bool> {
     free_res(&mut gpu, res);
     let missing: Vec<&&str> = REQUIRED_COVERAGE
         .iter()
-        .filter(|k| (cand_device() || **k != "visited_device_cand_q") && st.cov.get(**k).copied().unwrap_or(0) == 0)
+        .filter(|k| {
+            (cand_device() || **k != "visited_device_cand_q")
+                && st.cov.get(**k).copied().unwrap_or(0) == 0
+        })
         .collect();
     if !missing.is_empty() {
         let e = Fail {
@@ -3422,7 +3672,9 @@ fn main() {
     if !pass {
         eprintln!(
             "[fn_sampled_plumbing_oracle] FAIL: {}",
-            rec.get("failure").map(|v| v.to_string()).unwrap_or_default()
+            rec.get("failure")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         );
         std::process::exit(code.max(1));
     }

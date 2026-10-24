@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hipfire daemon — JSON IPC engine (standalone binary)"
+# Shares the CLI's build script: it emits HIPFIRE_BUILD_COMMIT (full commit,
+# HIPFIRE_BUILD_COMMIT_OVERRIDE honoured) for `--version`. It reads only
+# CARGO_MANIFEST_DIR (../.. = repo root), CARGO_PKG_VERSION, TARGET and git.
+build = "../hipfire-cli/build.rs"
 
 [[bin]]
 name = "daemon"

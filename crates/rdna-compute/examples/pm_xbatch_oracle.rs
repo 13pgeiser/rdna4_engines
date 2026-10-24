@@ -50,7 +50,10 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// One captured file, checked against its capture's meta.json hash.
@@ -58,9 +61,15 @@ fn capture(rel: &str) -> Result<Vec<u8>> {
     let path = Path::new(CAP).join(rel);
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let dir = path.parent().ok_or("capture without directory")?;
-    let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(err)?).map_err(err)?;
-    let name = path.file_name().and_then(|n| n.to_str()).ok_or("capture name")?;
-    let want = meta["files"][name]["sha256"].as_str().ok_or(format!("{rel}: no hash"))?;
+    let meta: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("meta.json")).map_err(err)?).map_err(err)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("capture name")?;
+    let want = meta["files"][name]["sha256"]
+        .as_str()
+        .ok_or(format!("{rel}: no hash"))?;
     if sha256_hex(&bytes) != want {
         return Err(format!("{rel}: sha256 mismatch"));
     }
@@ -68,7 +77,10 @@ fn capture(rel: &str) -> Result<Vec<u8>> {
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Real activation sources in preference order: captured x inputs, then
@@ -114,7 +126,10 @@ impl Activations {
             names.push(name.clone());
         }
         if names.len() != MAXB {
-            return Err(format!("only {} real activation vectors hold K={k}", names.len()));
+            return Err(format!(
+                "only {} real activation vectors hold K={k}",
+                names.len()
+            ));
         }
         Ok((x, names))
     }
@@ -132,9 +147,18 @@ fn real_matrix(name: &str, rel: &str, k: usize) -> Result<Matrix> {
     let bytes = capture(rel)?;
     let row = k / 256 * GROUP;
     if bytes.len() % row != 0 {
-        return Err(format!("{rel}: {} bytes is not whole K={k} rows", bytes.len()));
+        return Err(format!(
+            "{rel}: {} bytes is not whole K={k} rows",
+            bytes.len()
+        ));
     }
-    Ok(Matrix { name: name.into(), source: rel.into(), m: bytes.len() / row, k, bytes })
+    Ok(Matrix {
+        name: name.into(),
+        source: rel.into(),
+        m: bytes.len() / row,
+        k,
+        bytes,
+    })
 }
 
 /// Rows `start..start+m`, groups `0..groups` of a real matrix.
@@ -145,7 +169,11 @@ fn sub_matrix(src: &Matrix, start: usize, m: usize, groups: usize) -> Matrix {
         bytes.extend_from_slice(&src.bytes[r * row..r * row + groups * GROUP]);
     }
     Matrix {
-        name: format!("{}[rows {start}..{}, groups 0..{groups}]", src.name, start + m),
+        name: format!(
+            "{}[rows {start}..{}, groups 0..{groups}]",
+            src.name,
+            start + m
+        ),
         source: src.source.clone(),
         m,
         k: groups * 256,
@@ -163,7 +191,11 @@ fn load_candidate(gpu: &Gpu, path: &str) -> Result<Candidate> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let module = gpu.hip.module_load_data(&bytes).map_err(err)?;
     let func = gpu.hip.module_get_function(&module, SYMBOL).map_err(err)?;
-    Ok(Candidate { _module: module, func, sha256: sha256_hex(&bytes) })
+    Ok(Candidate {
+        _module: module,
+        func,
+        sha256: sha256_hex(&bytes),
+    })
 }
 
 fn kernarg(a: u64, x: u64, y: u64, m: usize, k: usize, b: usize) -> Vec<u8> {
@@ -190,10 +222,20 @@ struct Problem {
 
 impl Problem {
     fn new(gpu: &mut Gpu, mat: &Matrix, x: &[f32]) -> Result<Self> {
-        let a = gpu.upload_raw(&mat.bytes, &[mat.bytes.len()]).map_err(err)?;
+        let a = gpu
+            .upload_raw(&mat.bytes, &[mat.bytes.len()])
+            .map_err(err)?;
         let x = gpu.upload_f32(x, &[x.len()]).map_err(err)?;
-        let y = gpu.zeros(&[(2 * GUARD) / 4 + MAXB * mat.m], DType::F32).map_err(err)?;
-        Ok(Self { m: mat.m, k: mat.k, a, x, y })
+        let y = gpu
+            .zeros(&[(2 * GUARD) / 4 + MAXB * mat.m], DType::F32)
+            .map_err(err)?;
+        Ok(Self {
+            m: mat.m,
+            k: mat.k,
+            a,
+            x,
+            y,
+        })
     }
     fn a_ptr(&self) -> u64 {
         self.a.buf.as_ptr() as u64
@@ -208,7 +250,9 @@ impl Problem {
         2 * GUARD + MAXB * self.m * 4
     }
     fn reset_y(&self, gpu: &Gpu) -> Result<()> {
-        gpu.hip.memset(&self.y.buf, SENTINEL as i32, self.y_bytes()).map_err(err)
+        gpu.hip
+            .memset(&self.y.buf, SENTINEL as i32, self.y_bytes())
+            .map_err(err)
     }
     fn download_y(&self, gpu: &Gpu) -> Result<Vec<u8>> {
         gpu.hip.device_synchronize().map_err(err)?;
@@ -225,9 +269,26 @@ impl Problem {
     }
     /// Candidate over columns `0..b`, one launch.
     fn launch_pm(&self, gpu: &Gpu, cand: &Candidate, b: usize) -> Result<()> {
-        let mut ka = kernarg(self.a_ptr(), self.x_ptr(0), self.y_ptr(0), self.m, self.k, b);
+        let mut ka = kernarg(
+            self.a_ptr(),
+            self.x_ptr(0),
+            self.y_ptr(0),
+            self.m,
+            self.k,
+            b,
+        );
         // SAFETY: the kernarg follows the candidate's ABI and addresses live allocations.
-        unsafe { gpu.hip.launch_kernel_blob(&cand.func, [self.m as u32, 1, 1], [32, 1, 1], 0, None, &mut ka) }.map_err(err)
+        unsafe {
+            gpu.hip.launch_kernel_blob(
+                &cand.func,
+                [self.m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                None,
+                &mut ka,
+            )
+        }
+        .map_err(err)
     }
     /// hipcc x-batch over columns `first..first+b`, chunked like the
     /// production wrapper (`Gpu::gemv_v2_xbatch_rows`, XBATCH_MAX 4).
@@ -235,8 +296,16 @@ impl Problem {
         let mut start = 0;
         while start < b {
             let rows = XBATCH_MAX.min(b - start);
-            let mut ka = kernarg(self.a_ptr(), self.x_ptr(first + start), self.y_ptr(first + start), self.m, self.k, rows);
-            gpu.launch_kernel_blob(XBATCH, [self.m as u32, 1, 1], [32, 1, 1], 0, &mut ka).map_err(err)?;
+            let mut ka = kernarg(
+                self.a_ptr(),
+                self.x_ptr(first + start),
+                self.y_ptr(first + start),
+                self.m,
+                self.k,
+                rows,
+            );
+            gpu.launch_kernel_blob(XBATCH, [self.m as u32, 1, 1], [32, 1, 1], 0, &mut ka)
+                .map_err(err)?;
             start += rows;
         }
         Ok(())
@@ -265,7 +334,14 @@ fn diff(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
 /// Verify one matrix: singleton references, then candidate and hipcc x-batch
 /// for every B. `gate_up`: the matching other half for the production
 /// singleton cross-check (`Some((up, is_gate))`).
-fn verify_matrix(gpu: &mut Gpu, cand: &Candidate, mat: &Matrix, acts: &Activations, gate_up: Option<(&Matrix, bool)>, tally: &mut Tally) -> Result<()> {
+fn verify_matrix(
+    gpu: &mut Gpu,
+    cand: &Candidate,
+    mat: &Matrix,
+    acts: &Activations,
+    gate_up: Option<(&Matrix, bool)>,
+    tally: &mut Tally,
+) -> Result<()> {
     let (x, names) = acts.columns(mat.k)?;
     let p = Problem::new(gpu, mat, &x)?;
     // Reference: hipcc x-batch with B = 1 on each column.
@@ -300,15 +376,19 @@ fn verify_matrix(gpu: &mut Gpu, cand: &Candidate, mat: &Matrix, acts: &Activatio
     let mut extra = json!(null);
     if let Some((other, is_gate)) = gate_up {
         // Production singleton fused_gate_up on each column (gate, up halves).
-        let o = gpu.upload_raw(&other.bytes, &[other.bytes.len()]).map_err(err)?;
+        let o = gpu
+            .upload_raw(&other.bytes, &[other.bytes.len()])
+            .map_err(err)?;
         let scratch = gpu.zeros(&[other.m], DType::F32).map_err(err)?;
         p.reset_y(gpu)?;
         for col in 0..MAXB {
             let (xv, yv) = (p.x_view(col), p.y_view(col));
             if is_gate {
-                gpu.fused_gate_up_hfq4g256_mq4v2(&p.a, &o, &xv, &yv, &scratch, p.m, other.m, p.k).map_err(err)?;
+                gpu.fused_gate_up_hfq4g256_mq4v2(&p.a, &o, &xv, &yv, &scratch, p.m, other.m, p.k)
+                    .map_err(err)?;
             } else {
-                gpu.fused_gate_up_hfq4g256_mq4v2(&o, &p.a, &xv, &scratch, &yv, other.m, p.m, p.k).map_err(err)?;
+                gpu.fused_gate_up_hfq4g256_mq4v2(&o, &p.a, &xv, &scratch, &yv, other.m, p.m, p.k)
+                    .map_err(err)?;
             }
         }
         let fused = p.download_y(gpu)?;
@@ -318,7 +398,10 @@ fn verify_matrix(gpu: &mut Gpu, cand: &Candidate, mat: &Matrix, acts: &Activatio
     }
     tally.mismatched_bytes += case_bytes;
     tally.cross_mismatched_bytes += cross_bytes;
-    eprintln!("{:<60} M={:<6} K={:<5} candidate mismatches {case_bytes} cross {cross_bytes}", mat.name, p.m, p.k);
+    eprintln!(
+        "{:<60} M={:<6} K={:<5} candidate mismatches {case_bytes} cross {cross_bytes}",
+        mat.name, p.m, p.k
+    );
     tally.cases.push(json!({
         "matrix": mat.name, "source": mat.source, "M": p.m, "K": p.k, "groups": p.k / 256,
         "tail_groups": (p.k / 256) % 4, "columns": names, "by_B": by_b,
@@ -332,7 +415,12 @@ fn verify(gpu: &mut Gpu, cand: &Candidate) -> Result<Value> {
     let gate = real_matrix("gate", "fused_gate_up_mq4g256v2/occ0/arg0.pre.bin", 5120)?;
     let up = real_matrix("up", "fused_gate_up_mq4g256v2/occ0/arg8.pre.bin", 5120)?;
     let down = real_matrix("down", "gemv_mq4g256v2_residual/occ127/arg0.pre.bin", 17408)?;
-    let mut tally = Tally { cases: Vec::new(), launches: 0, mismatched_bytes: 0, cross_mismatched_bytes: 0 };
+    let mut tally = Tally {
+        cases: Vec::new(),
+        launches: 0,
+        mismatched_bytes: 0,
+        cross_mismatched_bytes: 0,
+    };
     verify_matrix(gpu, cand, &gate, &acts, Some((&up, true)), &mut tally)?;
     verify_matrix(gpu, cand, &up, &acts, Some((&gate, false)), &mut tally)?;
     verify_matrix(gpu, cand, &down, &acts, None, &mut tally)?;
@@ -345,14 +433,21 @@ fn verify(gpu: &mut Gpu, cand: &Candidate) -> Result<Value> {
         ("qkvza.b", "fused_qkvza_mq4g256v2/occ0/arg16.pre.bin", 5120),
         ("qkvza.a", "fused_qkvza_mq4g256v2/occ0/arg24.pre.bin", 5120),
         ("wo", "gemv_mq4g256v2_residual/occ0/arg0.pre.bin", 6144),
-        ("lm_head", "gemv_mq4g256v2_multirow_r2/occ0/arg0.pre.bin", 5120),
+        (
+            "lm_head",
+            "gemv_mq4g256v2_multirow_r2/occ0/arg0.pre.bin",
+            5120,
+        ),
     ] {
         let mat = real_matrix(name, rel, k)?;
         verify_matrix(gpu, cand, &mat, &acts, None, &mut tally)?;
     }
     // Tails and odd M from real bytes: K = 1..9 groups and real K - 256.
     let ms = [1usize, 3, 6, 7, 4097, 4099];
-    for (i, groups) in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 19, 23, 67].into_iter().enumerate() {
+    for (i, groups) in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 19, 23, 67]
+        .into_iter()
+        .enumerate()
+    {
         let src = if groups <= 20 { &gate } else { &down };
         for (j, &m) in ms.iter().enumerate() {
             let start = (977 * (i * ms.len() + j)) % (src.m - m);
@@ -374,7 +469,10 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 fn time_arm(gpu: &mut Gpu, mut arm: impl FnMut(&mut Gpu) -> Result<()>) -> Result<Vec<f64>> {
-    let (start, stop) = (gpu.hip.event_create().map_err(err)?, gpu.hip.event_create().map_err(err)?);
+    let (start, stop) = (
+        gpu.hip.event_create().map_err(err)?,
+        gpu.hip.event_create().map_err(err)?,
+    );
     for _ in 0..5 {
         arm(gpu)?;
     }
@@ -416,7 +514,8 @@ fn time(gpu: &mut Gpu, cand: &Candidate) -> Result<Value> {
             let mut xb = time_arm(gpu, |g| p.launch_xbatch(g, 0, b))?;
             let mut single = time_arm(gpu, |g| {
                 for col in 0..b {
-                    g.gemv_mq4g256v2(&p.a, &p.x_view(col), &p.y_view(col), p.m, p.k).map_err(err)?;
+                    g.gemv_mq4g256v2(&p.a, &p.x_view(col), &p.y_view(col), p.m, p.k)
+                        .map_err(err)?;
                 }
                 Ok(())
             })?;
@@ -435,14 +534,21 @@ fn time(gpu: &mut Gpu, cand: &Candidate) -> Result<Value> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let (Some(mode), Some(co), Some(out)) = (args.get(1).cloned(), flag("--co"), flag("--out")) else {
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let (Some(mode), Some(co), Some(out)) = (args.get(1).cloned(), flag("--co"), flag("--out"))
+    else {
         eprintln!("usage: pm_xbatch_oracle verify|time --co FILE --out FILE.json");
         std::process::exit(2);
     };
     let run = || -> Result<Value> {
         let mut gpu = Gpu::init().map_err(err)?;
-        gpu.ensure_kernel_public(XBATCH, XBATCH_SRC, XBATCH).map_err(err)?;
+        gpu.ensure_kernel_public(XBATCH, XBATCH_SRC, XBATCH)
+            .map_err(err)?;
         let cand = load_candidate(&gpu, &co)?;
         let body = match mode.as_str() {
             "verify" => verify(&mut gpu, &cand)?,
@@ -459,7 +565,10 @@ fn main() {
     match run() {
         Ok(v) => {
             std::fs::write(&out, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
-            let bad = v["result"]["candidate_mismatch_bytes"].as_u64().unwrap_or(0) + v["result"]["cross_mismatch_bytes"].as_u64().unwrap_or(0);
+            let bad = v["result"]["candidate_mismatch_bytes"]
+                .as_u64()
+                .unwrap_or(0)
+                + v["result"]["cross_mismatch_bytes"].as_u64().unwrap_or(0);
             eprintln!("wrote {out}");
             std::process::exit(if bad == 0 { 0 } else { 1 });
         }

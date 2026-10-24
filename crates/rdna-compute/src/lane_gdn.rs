@@ -324,7 +324,11 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             symbol,
-            [n_heads as u32, (GDN_LANE_HEAD_DIM / GDN_LANE_TILE_ROWS) as u32, n_lanes as u32],
+            [
+                n_heads as u32,
+                (GDN_LANE_HEAD_DIM / GDN_LANE_TILE_ROWS) as u32,
+                n_lanes as u32,
+            ],
             [32, 1, 1],
             0,
             &mut params,
@@ -376,7 +380,10 @@ impl Gpu {
     pub fn upload_gdn_lane_table(&mut self, dst: &GpuTensor, bytes: &[u8]) -> HipResult<()> {
         self.bind_thread()?;
         if self.graphs.capture_mode {
-            return Err(HipError::new(0, "upload_gdn_lane_table: table staging during graph capture"));
+            return Err(HipError::new(
+                0,
+                "upload_gdn_lane_table: table staging during graph capture",
+            ));
         }
         if bytes.len() > dst.buf.size() {
             return Err(HipError::new(

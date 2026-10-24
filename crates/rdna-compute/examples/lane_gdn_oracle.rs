@@ -135,7 +135,11 @@ fn make_host(rng: &mut Rng, lanes: usize, total: usize) -> Host {
     let beta = f32s(rng, total * NV, 2.0);
     let conv = (0..lanes).map(|_| f32s(rng, QKV_DIM * 3, 1.0)).collect();
     let s_q8 = (0..lanes)
-        .map(|_| (0..NV * HD * HD).map(|_| ((rng.next() % 255) as i32 - 127) as i8 as u8).collect())
+        .map(|_| {
+            (0..NV * HD * HD)
+                .map(|_| ((rng.next() % 255) as i32 - 127) as i8 as u8)
+                .collect()
+        })
         .collect();
     let scales = (0..lanes)
         .map(|_| (0..NV * HD).map(|_| 0.001 + rng.unit() * 0.02).collect())
@@ -153,7 +157,15 @@ fn make_host(rng: &mut Rng, lanes: usize, total: usize) -> Host {
             b
         })
         .collect();
-    Host { qkv, alpha, beta, conv, s_q8, scales, ef }
+    Host {
+        qkv,
+        alpha,
+        beta,
+        conv,
+        s_q8,
+        scales,
+        ef,
+    }
 }
 
 /// Per-lane recurrent state of one arm (one "bank").
@@ -173,14 +185,16 @@ fn make_bank(gpu: &mut Gpu, h: &Host, with_ef: bool, sentinel: bool) -> Bank {
     let f32_buf = |gpu: &mut Gpu, v: &[f32]| {
         if sentinel {
             let w = f32::from_bits(u32::from_ne_bytes([BANK_SENTINEL; 4]));
-            gpu.upload_f32(&vec![w; v.len()], &[v.len()]).expect("sentinel f32")
+            gpu.upload_f32(&vec![w; v.len()], &[v.len()])
+                .expect("sentinel f32")
         } else {
             gpu.upload_f32(v, &[v.len()]).expect("f32 state")
         }
     };
     let raw_buf = |gpu: &mut Gpu, v: &[u8]| {
         if sentinel {
-            gpu.upload_raw(&vec![BANK_SENTINEL; v.len()], &[v.len()]).expect("sentinel raw")
+            gpu.upload_raw(&vec![BANK_SENTINEL; v.len()], &[v.len()])
+                .expect("sentinel raw")
         } else {
             gpu.upload_raw(v, &[v.len()]).expect("raw state")
         }
@@ -189,7 +203,11 @@ fn make_bank(gpu: &mut Gpu, h: &Host, with_ef: bool, sentinel: bool) -> Bank {
         conv: h.conv.iter().map(|c| f32_buf(gpu, c)).collect(),
         s_q8: h.s_q8.iter().map(|s| raw_buf(gpu, s)).collect(),
         scales: h.scales.iter().map(|s| f32_buf(gpu, s)).collect(),
-        ef: h.ef.iter().map(|e| with_ef.then(|| raw_buf(gpu, e))).collect(),
+        ef: h
+            .ef
+            .iter()
+            .map(|e| with_ef.then(|| raw_buf(gpu, e)))
+            .collect(),
     }
 }
 
@@ -214,9 +232,15 @@ struct Arm {
 /// (arm C's destination bank) instead of the host's initial state.
 fn make_arm(gpu: &mut Gpu, h: &Host, total: usize, with_ef: bool, sentinel_state: bool) -> Arm {
     let sentinel = |gpu: &mut Gpu, w: usize| {
-        gpu.upload_f32(&vec![f32::from_bits(0x7fc0_dead); total * w], &[total * w]).expect("alloc sentinel")
+        gpu.upload_f32(&vec![f32::from_bits(0x7fc0_dead); total * w], &[total * w])
+            .expect("alloc sentinel")
     };
-    let Bank { conv, s_q8, scales, ef } = make_bank(gpu, h, with_ef, sentinel_state);
+    let Bank {
+        conv,
+        s_q8,
+        scales,
+        ef,
+    } = make_bank(gpu, h, with_ef, sentinel_state);
     Arm {
         qkv: gpu.upload_f32(&h.qkv, &[h.qkv.len()]).expect("qkv"),
         alpha: gpu.upload_f32(&h.alpha, &[h.alpha.len()]).expect("alpha"),
@@ -237,20 +261,31 @@ fn make_arm(gpu: &mut Gpu, h: &Host, total: usize, with_ef: bool, sentinel_state
 /// Names of the bank buffers whose bytes differ from the host's initial state
 /// (`name:count`), i.e. a source bank the `_from` kernels wrote.
 fn bank_vs_host(gpu: &Gpu, bank: &Bank, h: &Host) -> Vec<String> {
-    gpu.hip.device_synchronize().expect("sync before bank download");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync before bank download");
     let mut bad = Vec::new();
     let mut chk = |name: String, t: &GpuTensor, want: &[u8]| {
         let got = gpu.download_raw_bytes(t).expect("download");
-        let mism = got.iter().zip(want).filter(|(p, q)| p != q).count() + got.len().abs_diff(want.len());
+        let mism =
+            got.iter().zip(want).filter(|(p, q)| p != q).count() + got.len().abs_diff(want.len());
         if mism != 0 {
             bad.push(format!("{name}:{mism}"));
         }
     };
     let f32_bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
     for i in 0..bank.conv.len() {
-        chk(format!("src_conv[{i}]"), &bank.conv[i], &f32_bytes(&h.conv[i]));
+        chk(
+            format!("src_conv[{i}]"),
+            &bank.conv[i],
+            &f32_bytes(&h.conv[i]),
+        );
         chk(format!("src_s_q8[{i}]"), &bank.s_q8[i], &h.s_q8[i]);
-        chk(format!("src_scales[{i}]"), &bank.scales[i], &f32_bytes(&h.scales[i]));
+        chk(
+            format!("src_scales[{i}]"),
+            &bank.scales[i],
+            &f32_bytes(&h.scales[i]),
+        );
         if let Some(e) = &bank.ef[i] {
             chk(format!("src_ef[{i}]"), e, &h.ef[i]);
         }
@@ -261,7 +296,9 @@ fn bank_vs_host(gpu: &Gpu, bank: &Bank, h: &Host) -> Vec<String> {
 fn snapshot(gpu: &Gpu, a: &Arm) -> Vec<(String, Vec<u8>)> {
     gpu.hip.device_synchronize().expect("sync before download");
     let mut out = Vec::new();
-    let mut put = |name: String, t: &GpuTensor| out.push((name, gpu.download_raw_bytes(t).expect("download")));
+    let mut put = |name: String, t: &GpuTensor| {
+        out.push((name, gpu.download_raw_bytes(t).expect("download")))
+    };
     for (name, t) in [
         ("qkv", &a.qkv),
         ("alpha", &a.alpha),
@@ -306,7 +343,9 @@ fn prefix(ns: &[usize]) -> Vec<usize> {
 }
 
 fn free_arm(gpu: &mut Gpu, a: Arm) {
-    for t in [a.qkv, a.alpha, a.beta, a.q_raw, a.k_raw, a.v, a.q, a.k, a.attn] {
+    for t in [
+        a.qkv, a.alpha, a.beta, a.q_raw, a.k_raw, a.v, a.q, a.k, a.attn,
+    ] {
         gpu.free_tensor(t).expect("free");
     }
     for t in a.conv.into_iter().chain(a.s_q8).chain(a.scales) {
@@ -350,7 +389,14 @@ struct ARun {
 }
 
 /// Arm A: today's per-lane sequence on each lane's own row views.
-fn run_arm_a(gpu: &mut Gpu, ctx: &Ctx, host: &Host, ns: &[usize], with_ef: bool, frame0: u32) -> ARun {
+fn run_arm_a(
+    gpu: &mut Gpu,
+    ctx: &Ctx,
+    host: &Host,
+    ns: &[usize],
+    with_ef: bool,
+    frame0: u32,
+) -> ARun {
     let lanes = ns.len();
     let offs = prefix(ns);
     let total: usize = ns.iter().sum();
@@ -364,21 +410,52 @@ fn run_arm_a(gpu: &mut Gpu, ctx: &Ctx, host: &Host, ns: &[usize], with_ef: bool,
         let (r0, n) = (offs[i], ns[i]);
         let vw = |t: &GpuTensor, w: usize| t.sub_offset(r0 * w, n * w);
         let before = gdn_requant_frame_checkpoint();
-        gpu.fused_sigmoid_alpha_gate_f32_batched(&vw(&a.beta, NV), &vw(&a.alpha, NV), &ctx.dt_bias, &ctx.a_log, NV, n)
-            .expect("A sigmoid");
+        gpu.fused_sigmoid_alpha_gate_f32_batched(
+            &vw(&a.beta, NV),
+            &vw(&a.alpha, NV),
+            &ctx.dt_bias,
+            &ctx.a_log,
+            NV,
+            n,
+        )
+        .expect("A sigmoid");
         gpu.conv1d_silu_split_f32_n(
-            &vw(&a.q_raw, K_DIM), &vw(&a.k_raw, K_DIM), &vw(&a.v, V_DIM), &vw(&a.qkv, QKV_DIM),
-            &ctx.conv_w, &a.conv[i], K_DIM, V_DIM, n,
+            &vw(&a.q_raw, K_DIM),
+            &vw(&a.k_raw, K_DIM),
+            &vw(&a.v, V_DIM),
+            &vw(&a.qkv, QKV_DIM),
+            &ctx.conv_w,
+            &a.conv[i],
+            K_DIM,
+            V_DIM,
+            n,
         )
         .expect("A conv");
         gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
-            &vw(&a.q_raw, K_DIM), &vw(&a.k_raw, K_DIM), &vw(&a.q, V_DIM), &vw(&a.k, V_DIM),
-            NK, ratio, HD, q_scale, EPS, n,
+            &vw(&a.q_raw, K_DIM),
+            &vw(&a.k_raw, K_DIM),
+            &vw(&a.q, V_DIM),
+            &vw(&a.k, V_DIM),
+            NK,
+            ratio,
+            HD,
+            q_scale,
+            EPS,
+            n,
         )
         .expect("A interleave");
         gpu.gated_delta_net_q8_batch_seq(
-            &vw(&a.q, V_DIM), &vw(&a.k, V_DIM), &vw(&a.v, V_DIM), &vw(&a.alpha, NV),
-            &vw(&a.beta, NV), &a.s_q8[i], &a.scales[i], &vw(&a.attn, V_DIM), n, NV, HD,
+            &vw(&a.q, V_DIM),
+            &vw(&a.k, V_DIM),
+            &vw(&a.v, V_DIM),
+            &vw(&a.alpha, NV),
+            &vw(&a.beta, NV),
+            &a.s_q8[i],
+            &a.scales[i],
+            &vw(&a.attn, V_DIM),
+            n,
+            NV,
+            HD,
             a.ef[i].as_ref(),
         )
         .expect("A gdn");
@@ -386,12 +463,19 @@ fn run_arm_a(gpu: &mut Gpu, ctx: &Ctx, host: &Host, ns: &[usize], with_ef: bool,
         let want_before = frame0.wrapping_add(r0 as u32);
         let want_after = want_before.wrapping_add(n as u32);
         if before != want_before || after != want_after {
-            ck_bad.push(format!("lane{i}:{before:#x}->{after:#x}(want {want_before:#x}->{want_after:#x})"));
+            ck_bad.push(format!(
+                "lane{i}:{before:#x}->{after:#x}(want {want_before:#x}->{want_after:#x})"
+            ));
         }
     }
     let end = gdn_requant_frame_checkpoint();
     let snap = snapshot(gpu, &a);
-    ARun { arm: a, snap, end, ck_bad }
+    ARun {
+        arm: a,
+        snap,
+        end,
+        ck_bad,
+    }
 }
 
 /// Lane-batched arm variants: the new variable-row ABI or the old uniform
@@ -452,7 +536,10 @@ fn run_variant(
     let ratio = NV / NK;
     let q_scale = 1.0 / (HD as f32).sqrt();
     if matches!(v, Variant::Old | Variant::OldFrom) {
-        assert!(ns.iter().all(|&n| n == ns[0]), "old uniform ML APIs need equal n");
+        assert!(
+            ns.iter().all(|&n| n == ns[0]),
+            "old uniform ML APIs need equal n"
+        );
     }
     let arm = make_arm(gpu, host, total, with_ef, v.sourced());
     let bank_src = v.sourced().then(|| make_bank(gpu, host, with_ef, false));
@@ -462,26 +549,53 @@ fn run_variant(
         Variant::Old => std::mem::size_of::<GdnLayerTable>(),
         Variant::OldFrom => std::mem::size_of::<GdnLayerTableFrom>(),
     };
-    let table = gpu.zeros(&[(lanes * row_size).div_ceil(4)], DType::F32).expect("table");
+    let table = gpu
+        .zeros(&[(lanes * row_size).div_ceil(4)], DType::F32)
+        .expect("table");
     gpu.hip.device_synchronize().expect("sync");
     restore_gdn_requant_frame_checkpoint(frame0);
 
-    gpu.fused_sigmoid_alpha_gate_f32_batched(&arm.beta, &arm.alpha, &ctx.dt_bias, &ctx.a_log, NV, total)
-        .expect("sigmoid");
+    gpu.fused_sigmoid_alpha_gate_f32_batched(
+        &arm.beta,
+        &arm.alpha,
+        &ctx.dt_bias,
+        &ctx.a_log,
+        NV,
+        total,
+    )
+    .expect("sigmoid");
     if let Some(src) = &bank_src {
         // Conv ring: byte copy src bank -> destination ring, then the
         // unchanged in-place lane conv on the destination (the `_from` conv
         // twin's codegen differed by a few ulp). LOGICAL ring bytes (the pool
         // may round the allocations up).
         let ring_copies: Vec<TapeCopy> = (0..lanes)
-            .map(|i| TapeCopy::new(&arm.conv[i].buf, 0, &src.conv[i].buf, 0, host.conv[i].len() * 4))
+            .map(|i| {
+                TapeCopy::new(
+                    &arm.conv[i].buf,
+                    0,
+                    &src.conv[i].buf,
+                    0,
+                    host.conv[i].len() * 4,
+                )
+            })
             .collect();
         gpu.tape_copy_batched(&ring_copies).expect("ring copy");
     }
-    let lane_args: Vec<(u64, usize, usize)> =
-        (0..lanes).map(|i| (arm.conv[i].buf.as_ptr() as u64, offs[i], ns[i])).collect();
-    gpu.conv1d_silu_split_f32_lanes(&arm.q_raw, &arm.k_raw, &arm.v, &arm.qkv, &ctx.conv_w, &lane_args, K_DIM, V_DIM)
-        .expect("conv");
+    let lane_args: Vec<(u64, usize, usize)> = (0..lanes)
+        .map(|i| (arm.conv[i].buf.as_ptr() as u64, offs[i], ns[i]))
+        .collect();
+    gpu.conv1d_silu_split_f32_lanes(
+        &arm.q_raw,
+        &arm.k_raw,
+        &arm.v,
+        &arm.qkv,
+        &ctx.conv_w,
+        &lane_args,
+        K_DIM,
+        V_DIM,
+    )
+    .expect("conv");
     gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
         &arm.q_raw, &arm.k_raw, &arm.q, &arm.k, NK, ratio, HD, q_scale, EPS, total,
     )
@@ -525,44 +639,79 @@ fn run_variant(
     };
     match v {
         Variant::Old => {
-            gpu.upload_gdn_lane_table(&table, table_bytes(&base_rows)).expect("table upload");
-            gpu.gated_delta_net_q8_fast_ml(table.buf.as_ptr(), lanes, ns[0], NV, HD).expect("old gdn");
+            gpu.upload_gdn_lane_table(&table, table_bytes(&base_rows))
+                .expect("table upload");
+            gpu.gated_delta_net_q8_fast_ml(table.buf.as_ptr(), lanes, ns[0], NV, HD)
+                .expect("old gdn");
         }
         Variant::OldFrom => {
-            gpu.upload_gdn_lane_table(&table, table_bytes(&from_rows)).expect("table upload");
-            gpu.gated_delta_net_q8_fast_ml_from(table.buf.as_ptr(), lanes, ns[0], NV, HD).expect("old gdn_from");
+            gpu.upload_gdn_lane_table(&table, table_bytes(&from_rows))
+                .expect("table upload");
+            gpu.gated_delta_net_q8_fast_ml_from(table.buf.as_ptr(), lanes, ns[0], NV, HD)
+                .expect("old gdn_from");
         }
         Variant::New => {
             let rows: Vec<GdnLaneTable> = (0..lanes)
-                .map(|i| GdnLaneTable { base: base_rows[i], n_tokens: n_tok(i), frame_off: f_off(i) })
+                .map(|i| GdnLaneTable {
+                    base: base_rows[i],
+                    n_tokens: n_tok(i),
+                    frame_off: f_off(i),
+                })
                 .collect();
-            gpu.upload_gdn_lane_table(&table, table_bytes(&rows)).expect("table upload");
+            gpu.upload_gdn_lane_table(&table, table_bytes(&rows))
+                .expect("table upload");
             gpu.gated_delta_net_q8_fast_lanes_varrows(table.buf.as_ptr(), lanes, total, NV, HD)
                 .expect("varrows gdn");
         }
         Variant::NewFrom => {
             let rows: Vec<GdnLaneTableFrom> = (0..lanes)
-                .map(|i| GdnLaneTableFrom { base: from_rows[i], n_tokens: n_tok(i), frame_off: f_off(i) })
+                .map(|i| GdnLaneTableFrom {
+                    base: from_rows[i],
+                    n_tokens: n_tok(i),
+                    frame_off: f_off(i),
+                })
                 .collect();
-            gpu.upload_gdn_lane_table(&table, table_bytes(&rows)).expect("table upload");
-            gpu.gated_delta_net_q8_fast_lanes_varrows_from(table.buf.as_ptr(), lanes, total, NV, HD)
-                .expect("varrows gdn_from");
+            gpu.upload_gdn_lane_table(&table, table_bytes(&rows))
+                .expect("table upload");
+            gpu.gated_delta_net_q8_fast_lanes_varrows_from(
+                table.buf.as_ptr(),
+                lanes,
+                total,
+                NV,
+                HD,
+            )
+            .expect("varrows gdn_from");
         }
     }
     let end = gdn_requant_frame_checkpoint();
     let snap = snapshot(gpu, &arm);
-    let src_bad = bank_src.as_ref().map(|b| bank_vs_host(gpu, b, host)).unwrap_or_default();
+    let src_bad = bank_src
+        .as_ref()
+        .map(|b| bank_vs_host(gpu, b, host))
+        .unwrap_or_default();
     gpu.free_tensor(table).expect("free");
     if let Some(b) = bank_src {
         free_bank(gpu, b);
     }
-    VarRun { arm, snap, end, src_bad }
+    VarRun {
+        arm,
+        snap,
+        end,
+        src_bad,
+    }
 }
 
 /// One case: arm A vs new B (and C when every n <= 16), plus the old uniform
 /// ML B / C when the lanes are equal. `base`: restore the frame counter to it
 /// first (else continue from the current value).
-fn run_case(gpu: &mut Gpu, ctx: &Ctx, rng: &mut Rng, ns: &[usize], with_ef: bool, base: Option<u32>) -> bool {
+fn run_case(
+    gpu: &mut Gpu,
+    ctx: &Ctx,
+    rng: &mut Rng,
+    ns: &[usize],
+    with_ef: bool,
+    base: Option<u32>,
+) -> bool {
     let lanes = ns.len();
     let total: usize = ns.iter().sum();
     let equal = ns.iter().all(|&n| n == ns[0]);
@@ -599,19 +748,31 @@ fn run_case(gpu: &mut Gpu, ctx: &Ctx, rng: &mut Rng, ns: &[usize], with_ef: bool
         let bad = diff(&a.snap, &r.snap);
         let end_ok = r.end == want_end;
         ok &= bad.is_empty() && end_ok && r.src_bad.is_empty();
-        line.push_str(&format!(" | {} end_ok={end_ok} mismatching_buffers=[{}]", v.name(), bad.join(", ")));
+        line.push_str(&format!(
+            " | {} end_ok={end_ok} mismatching_buffers=[{}]",
+            v.name(),
+            bad.join(", ")
+        ));
         if v.sourced() {
             line.push_str(&format!(" source_bank_changed=[{}]", r.src_bad.join(", ")));
         }
         runs.push((v, r));
     }
     // New vs old uniform ML APIs, directly.
-    for (new_v, old_v) in [(Variant::New, Variant::Old), (Variant::NewFrom, Variant::OldFrom)] {
+    for (new_v, old_v) in [
+        (Variant::New, Variant::Old),
+        (Variant::NewFrom, Variant::OldFrom),
+    ] {
         let find = |want: Variant| runs.iter().find(|(v, _)| *v == want).map(|(_, r)| r);
         if let (Some(n), Some(o)) = (find(new_v), find(old_v)) {
             let bad = diff(&o.snap, &n.snap);
             ok &= bad.is_empty();
-            line.push_str(&format!(" | {}-vs-{} mismatching_buffers=[{}]", new_v.name(), old_v.name(), bad.join(", ")));
+            line.push_str(&format!(
+                " | {}-vs-{} mismatching_buffers=[{}]",
+                new_v.name(),
+                old_v.name(),
+                bad.join(", ")
+            ));
         }
     }
     println!("{} {line}", if ok { "PASS" } else { "FAIL" });
@@ -637,7 +798,11 @@ fn negative_controls(gpu: &mut Gpu, ctx: &Ctx, rng: &mut Rng) -> usize {
     for with_ef in [false, true] {
         let a = run_arm_a(gpu, ctx, &host, &ns, with_ef, frame0);
         for v in [Variant::New, Variant::NewFrom] {
-            let mut report = |gpu: &mut Gpu, name: String, tw: Tweak, expect: &dyn Fn(&[String]) -> bool, must_detect: bool| {
+            let mut report = |gpu: &mut Gpu,
+                              name: String,
+                              tw: Tweak,
+                              expect: &dyn Fn(&[String]) -> bool,
+                              must_detect: bool| {
                 let r = run_variant(gpu, ctx, &host, &ns, with_ef, v, frame0, tw);
                 let bad = diff(&a.snap, &r.snap);
                 // The total reservation is unchanged by the corruption.
@@ -656,29 +821,56 @@ fn negative_controls(gpu: &mut Gpu, ctx: &Ctx, rng: &mut Rng) -> usize {
                 free_arm(gpu, r.arm);
             };
             // Baseline: untouched metadata must match A.
-            report(gpu, "clean metadata".into(), Tweak::default(), &|bad| !bad.is_empty(), false);
+            report(
+                gpu,
+                "clean metadata".into(),
+                Tweak::default(),
+                &|bad| !bad.is_empty(),
+                false,
+            );
             // Shifted frame prefix: only the EF-off stochastic seed sees it.
             for lane in [1usize, 4, 7] {
-                let tw = Tweak { frame_off: Some((lane, offs[lane] as u32 + 1)), ..Tweak::default() };
+                let tw = Tweak {
+                    frame_off: Some((lane, offs[lane] as u32 + 1)),
+                    ..Tweak::default()
+                };
                 let state = format!("s_q8[{lane}]:");
                 let scales = format!("scales[{lane}]:");
                 if with_ef {
                     // EF bypasses the RNG: the shifted prefix must change nothing.
-                    report(gpu, format!("frame_off[{lane}]+1 (EF bypasses RNG)"), tw, &|bad| !bad.is_empty(), false);
+                    report(
+                        gpu,
+                        format!("frame_off[{lane}]+1 (EF bypasses RNG)"),
+                        tw,
+                        &|bad| !bad.is_empty(),
+                        false,
+                    );
                 } else {
                     report(
                         gpu,
                         format!("frame_off[{lane}]+1"),
                         tw,
-                        &|bad| bad.iter().any(|m| m.starts_with(&state) || m.starts_with(&scales)),
+                        &|bad| {
+                            bad.iter()
+                                .any(|m| m.starts_with(&state) || m.starts_with(&scales))
+                        },
                         true,
                     );
                 }
             }
             // Wrong token counts inside the allocation (shorter / longer).
             for (lane, n) in [(0usize, 7u32), (1, 4)] {
-                let tw = Tweak { n_tokens: Some((lane, n)), ..Tweak::default() };
-                report(gpu, format!("n_tokens[{lane}]={n} (true {})", ns[lane]), tw, &|bad| !bad.is_empty(), true);
+                let tw = Tweak {
+                    n_tokens: Some((lane, n)),
+                    ..Tweak::default()
+                };
+                report(
+                    gpu,
+                    format!("n_tokens[{lane}]={n} (true {})", ns[lane]),
+                    tw,
+                    &|bad| !bad.is_empty(),
+                    true,
+                );
             }
         }
         free_arm(gpu, a.arm);
@@ -693,7 +885,9 @@ fn main() {
         std::process::exit(2);
     }
     if !gpu.lane_gdn_batch_admitted(NV, NK, HD, HD) {
-        eprintln!("lane_gdn_oracle: lane_gdn_batch_admitted is false (HIPFIRE_DN_REQUANT_PER_TOKEN set?)");
+        eprintln!(
+            "lane_gdn_oracle: lane_gdn_batch_admitted is false (HIPFIRE_DN_REQUANT_PER_TOKEN set?)"
+        );
         std::process::exit(2);
     }
     println!("arch={} lane_gdn_batch_admitted=true", gpu.arch);

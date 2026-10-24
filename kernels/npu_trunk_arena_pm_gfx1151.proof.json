@@ -2,15 +2,15 @@
   "module": "npu_trunk_arena_pm_gfx1151",
   "arch": "gfx1151",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "unknown",
-  "s_text_sha256": "b0a280a5b83b738c4d168d8083941a40cfbdcea48209d0425d6b647c2709d362",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "d26a565301e4950661962c0f99c9b8aaa88b70aee49e2f59a009627b819c7342",
   "kernels": [
     {
       "kernel_id": "npu_trunk_arena",
       "variant": "npu_arena_copy_bf16_f32_pm",
       "arch": "gfx1151",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "kernargs",
@@ -313,14 +313,14 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "b848c6610550bd3ee6e708cb7c9379015ee4378bef760683baf1874b6b827e67"
+      "s_text_sha256": "c9900d303544fdf390002be3dfc471d57a0e5488e0a6788ed07fb1f3e50e6a18"
     },
     {
       "kernel_id": "npu_trunk_arena",
       "variant": "npu_arena_copy_bf16_bf16_pm",
       "arch": "gfx1151",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "kernargs",
@@ -623,14 +623,14 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "dc4b28ee245cbd860f98bebc8d66fc74d2526f2625ee7928ca6ba79d133b4157"
+      "s_text_sha256": "26c995476f144db65596b37f8fb87283a2f9ce1ba815791e7d58894af9f4928d"
     },
     {
       "kernel_id": "npu_trunk_arena",
       "variant": "npu_arena_copy_f32_f32_pm",
       "arch": "gfx1151",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "kernargs",
@@ -933,7 +933,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "3868fbd8a30a4acebb110adb3d684f4abae2e31660f28a1d96267b16f3b67944"
+      "s_text_sha256": "0adb9b4c102c4ec1a1ebce05ba5c6f8fb5f1d05b8764a700205cff342e664430"
     }
   ]
 }

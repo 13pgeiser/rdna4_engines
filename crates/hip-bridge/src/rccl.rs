@@ -150,9 +150,8 @@ impl RcclComms {
             )
         };
         // SAFETY: as above — one RCCL symbol from the live Library.
-        let fn_comm_destroy = unsafe {
-            load_sym!("ncclCommDestroy", unsafe extern "C" fn(NcclComm) -> u32)
-        };
+        let fn_comm_destroy =
+            unsafe { load_sym!("ncclCommDestroy", unsafe extern "C" fn(NcclComm) -> u32) };
         // SAFETY: as above — one RCCL symbol from the live Library.
         let fn_all_reduce = unsafe {
             load_sym!(
@@ -186,24 +185,13 @@ impl RcclComms {
         let fn_recv = unsafe {
             load_sym!(
                 "ncclRecv",
-                unsafe extern "C" fn(
-                    *mut c_void,
-                    usize,
-                    u32,
-                    c_int,
-                    NcclComm,
-                    *mut c_void,
-                ) -> u32
+                unsafe extern "C" fn(*mut c_void, usize, u32, c_int, NcclComm, *mut c_void) -> u32
             )
         };
         // SAFETY: as above — one RCCL symbol from the live Library.
-        let fn_group_start = unsafe {
-            load_sym!("ncclGroupStart", unsafe extern "C" fn() -> u32)
-        };
+        let fn_group_start = unsafe { load_sym!("ncclGroupStart", unsafe extern "C" fn() -> u32) };
         // SAFETY: as above — one RCCL symbol from the live Library.
-        let fn_group_end = unsafe {
-            load_sym!("ncclGroupEnd", unsafe extern "C" fn() -> u32)
-        };
+        let fn_group_end = unsafe { load_sym!("ncclGroupEnd", unsafe extern "C" fn() -> u32) };
         // SAFETY: as above — one RCCL symbol from the live Library.
         let fn_get_error_string = unsafe {
             load_sym!(
@@ -212,9 +200,8 @@ impl RcclComms {
             )
         };
         // SAFETY: as above — one RCCL symbol from the live Library.
-        let fn_get_version = unsafe {
-            load_sym!("ncclGetVersion", unsafe extern "C" fn(*mut c_int) -> u32)
-        };
+        let fn_get_version =
+            unsafe { load_sym!("ncclGetVersion", unsafe extern "C" fn(*mut c_int) -> u32) };
 
         let n = device_ids.len() as c_int;
         let mut comms: Vec<NcclComm> = vec![std::ptr::null_mut(); device_ids.len()];
@@ -226,11 +213,7 @@ impl RcclComms {
             // SAFETY: ncclGetErrorString returns a static C string for the status.
             let ptr = unsafe { fn_get_error_string(status) };
             // SAFETY: ptr is static message text from RCCL for this status code.
-            let msg = unsafe {
-                CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let msg = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
             return Err(RcclError {
                 status,
                 context: format!(
@@ -283,11 +266,7 @@ impl RcclComms {
         // SAFETY: fn_get_error_string is live; returns a static C string for status.
         let ptr = unsafe { (self.fn_get_error_string)(status) };
         // SAFETY: ptr is the non-null static string from ncclGetErrorString.
-        let msg = unsafe {
-            CStr::from_ptr(ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
+        let msg = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
         RcclError {
             status,
             context: format!("{ctx}: {msg}"),

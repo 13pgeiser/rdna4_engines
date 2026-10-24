@@ -18,8 +18,9 @@
 //! Functional ticks are simulator ticks, never silicon cycles. Budget: a fixed number of submits of one wave,
 //! `tick_limit` as in the peacemaker-npu harness (`Config` default, per wait, so a stall is an `Err`, not a hang).
 use hipfire_arch_qwen4::npu_trunk::{
-    build_out_programs, build_programs_for_families, pack_out, pack_shape, EpilogueContract, Family, FamilyMask, MatrixRef,
-    PackedB, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
+    build_out_programs, build_programs_for_families, pack_out, pack_shape, EpilogueContract,
+    Family, FamilyMask, MatrixRef, PackedB, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS,
+    TRUNK_K,
 };
 use peacemaker_npu::kernels::gemm_array::ArrayDesign;
 use peacemaker_npu::kernels::gemm_core::{Control, Epilogue};
@@ -80,8 +81,10 @@ fn random_mq6_k(m: usize, k: usize, seed: u64) -> Vec<u8> {
                     let z = (((r >> 8) & 0xff) as f32 - 128.0) / 256.0;
                     (s, z)
                 };
-                out[at + 4 * h..at + 4 * h + 2].copy_from_slice(&half::f16::from_f32(s).to_bits().to_le_bytes());
-                out[at + 4 * h + 2..at + 4 * h + 4].copy_from_slice(&half::f16::from_f32(z).to_bits().to_le_bytes());
+                out[at + 4 * h..at + 4 * h + 2]
+                    .copy_from_slice(&half::f16::from_f32(s).to_bits().to_le_bytes());
+                out[at + 4 * h + 2..at + 4 * h + 4]
+                    .copy_from_slice(&half::f16::from_f32(z).to_bits().to_le_bytes());
             }
             for b in out[at + 8..at + MQ6_GROUP_BYTES].chunks_mut(8) {
                 let r = rng.next().to_le_bytes();
@@ -114,7 +117,9 @@ impl Fam {
 fn quantize_direct(row: &[u8]) -> (Vec<i8>, f32, (u16, i16)) {
     let mut w = Vec::with_capacity(TRUNK_K);
     for group in row.chunks_exact(MQ6_GROUP_BYTES) {
-        let h = |i: usize| half::f16::from_bits(u16::from_le_bytes([group[2 * i], group[2 * i + 1]])).to_f32();
+        let h = |i: usize| {
+            half::f16::from_bits(u16::from_le_bytes([group[2 * i], group[2 * i + 1]])).to_f32()
+        };
         let payload = &group[8..];
         for j in 0..256 {
             let mut q = 0u32;
@@ -131,7 +136,13 @@ fn quantize_direct(row: &[u8]) -> (Vec<i8>, f32, (u16, i16)) {
     let ws = (f64::from(grid.0) * 2f64.powi(i32::from(grid.1))) as f32;
     let codes = w
         .iter()
-        .map(|&x| if ws == 0.0 { 0 } else { ((x / ws).round_ties_even() as i32).clamp(-127, 127) as i8 })
+        .map(|&x| {
+            if ws == 0.0 {
+                0
+            } else {
+                ((x / ws).round_ties_even() as i32).clamp(-127, 127) as i8
+            }
+        })
         .collect();
     (codes, ws, grid)
 }
@@ -145,7 +156,11 @@ fn fixture(shape: Shape, which: FamilyMask, keep_k: usize) -> Vec<Fam> {
         .map(|&family| {
             let m = family.cols();
             let mq6 = random_mq6(m, 0x5eed_0000 + family.index() as u64);
-            let (mut w8, mut ws, mut grid) = (Vec::with_capacity(m * keep_k), Vec::with_capacity(m), Vec::with_capacity(m));
+            let (mut w8, mut ws, mut grid) = (
+                Vec::with_capacity(m * keep_k),
+                Vec::with_capacity(m),
+                Vec::with_capacity(m),
+            );
             for row in mq6.chunks_exact(TRUNK_K / 256 * MQ6_GROUP_BYTES) {
                 let (codes, s, g) = quantize_direct(row);
                 w8.extend_from_slice(&codes[..keep_k]);
@@ -153,7 +168,14 @@ fn fixture(shape: Shape, which: FamilyMask, keep_k: usize) -> Vec<Fam> {
                 grid.push(g);
             }
             assert_eq!((w8.len(), ws.len()), (m * keep_k, m));
-            Fam { family, mq6, w8, ws, grid, keep_k }
+            Fam {
+                family,
+                mq6,
+                w8,
+                ws,
+                grid,
+                keep_k,
+            }
         })
         .collect()
 }
@@ -180,13 +202,22 @@ fn want_bf16(i: i32, weight: (u16, i16), token: (u16, i16)) -> i32 {
 }
 
 fn refs(fams: &[Fam]) -> Vec<MatrixRef<'_>> {
-    fams.iter().map(|f| MatrixRef { family: f.family, mq6: &f.mq6, m: f.family.cols(), k: TRUNK_K }).collect()
+    fams.iter()
+        .map(|f| MatrixRef {
+            family: f.family,
+            mq6: &f.mq6,
+            m: f.family.cols(),
+            k: TRUNK_K,
+        })
+        .collect()
 }
 
 /// a8 `[WAVE_M][k]` in -127..=127 with edge rows: all +127, all -127, all 0, alternating +-127.
 fn random_a8(k: usize, seed: u64) -> Vec<i8> {
     let mut rng = Rng::new(seed);
-    let mut a: Vec<i8> = (0..WAVE_M * k).map(|_| (((rng.next() >> 33) % 255) as i32 - 127) as i8).collect();
+    let mut a: Vec<i8> = (0..WAVE_M * k)
+        .map(|_| (((rng.next() >> 33) % 255) as i32 - 127) as i8)
+        .collect();
     for kk in 0..k {
         a[kk] = 127;
         a[k + kk] = -127;
@@ -215,10 +246,21 @@ fn expected_parts(shape: Shape, mask: FamilyMask) -> Vec<(Family, usize, usize)>
 
 fn assert_map(shape: Shape, mask: FamilyMask) -> hipfire_arch_qwen4::npu_trunk::ColumnMap {
     let map = shape.column_map(mask);
-    let got: Vec<_> = map.parts.iter().map(|&(f, c0, n)| (f, c0 as usize, n as usize)).collect();
+    let got: Vec<_> = map
+        .parts
+        .iter()
+        .map(|&(f, c0, n)| (f, c0 as usize, n as usize))
+        .collect();
     assert_eq!(got, expected_parts(shape, mask), "{shape:?} column map");
     let useful: usize = got.iter().map(|p| p.2).sum();
-    assert_eq!((map.useful_cols(), map.panel_count(), map.padded_cols()), (useful, useful.div_ceil(PANEL_COLS), useful.div_ceil(PANEL_COLS) * PANEL_COLS));
+    assert_eq!(
+        (map.useful_cols(), map.panel_count(), map.padded_cols()),
+        (
+            useful,
+            useful.div_ceil(PANEL_COLS),
+            useful.div_ceil(PANEL_COLS) * PANEL_COLS
+        )
+    );
     map
 }
 
@@ -281,12 +323,27 @@ fn g80(rows: usize, k: usize) -> ArrayDesign {
 /// One submit on a (possibly reused) `Config`: returns the row-major `WAVE_M x 1280` BF16 bits (as i32). The packed inputs
 /// must be unchanged by the run.
 fn submit(sim: &mut Config, d: &ArrayDesign, a_host: &[u8], b_host: &[u8], what: &str) -> Vec<i32> {
-    assert_eq!((a_host.len(), b_host.len()), (d.args[0].bytes, d.args[1].bytes), "{what}: packed argument sizes");
-    let mut args = vec![a_host.to_vec(), b_host.to_vec(), vec![POISON; d.args[2].bytes]];
+    assert_eq!(
+        (a_host.len(), b_host.len()),
+        (d.args[0].bytes, d.args[1].bytes),
+        "{what}: packed argument sizes"
+    );
+    let mut args = vec![
+        a_host.to_vec(),
+        b_host.to_vec(),
+        vec![POISON; d.args[2].bytes],
+    ];
     let ticks0 = sim.ticks;
-    sim.submit(&d.insts, &mut args).unwrap_or_else(|e| panic!("{what}: submit failed: {e}"));
-    assert!(args[0] == a_host && args[1] == b_host, "{what}: packed inputs changed");
-    eprintln!("PASS {what}: {} functional ticks (simulator ticks, not hardware cycles)", sim.ticks - ticks0);
+    sim.submit(&d.insts, &mut args)
+        .unwrap_or_else(|e| panic!("{what}: submit failed: {e}"));
+    assert!(
+        args[0] == a_host && args[1] == b_host,
+        "{what}: packed inputs changed"
+    );
+    eprintln!(
+        "PASS {what}: {} functional ticks (simulator ticks, not hardware cycles)",
+        sim.ticks - ticks0
+    );
     d.unpack_out(&args[2])
 }
 
@@ -303,7 +360,10 @@ fn sim_all_families(shape: Shape) {
     let packed = pack(shape, &fams, mask);
     let map = assert_map(shape, mask);
     assert_eq!(packed.panels.len(), map.panel_count());
-    assert_eq!(packed.map.parts, map.parts, "PackedB carries the column map");
+    assert_eq!(
+        packed.map.parts, map.parts,
+        "PackedB carries the column map"
+    );
 
     let d = g80(WAVE_M, K_SIM);
     let a8 = random_a8(K_SIM, 0xa8a8 + shape.index() as u64);
@@ -312,18 +372,34 @@ fn sim_all_families(shape: Shape) {
     let mut sim = fresh(&d);
 
     // Per-family output tensors filled ONLY through ColumnMap::locate.
-    let mut out: Vec<Vec<i32>> = fams.iter().map(|f| vec![i32::MIN; WAVE_M * f.family.cols()]).collect();
+    let mut out: Vec<Vec<i32>> = fams
+        .iter()
+        .map(|f| vec![i32::MIN; WAVE_M * f.family.cols()])
+        .collect();
     let mut written = vec![0usize; fams.len()];
     for p in 0..packed.panels.len() {
         let b_host = truncate_panel(&packed.panels[p], K_SIM / K_CHUNK);
-        let canonical = pack_b_bf16(&d, &fused_b(shape, mask, &fams, p, K_SIM), &fused_scales(shape, mask, &fams, p));
+        let canonical = pack_b_bf16(
+            &d,
+            &fused_b(shape, mask, &fams, p, K_SIM),
+            &fused_scales(shape, mask, &fams, p),
+        );
         assert!(b_host == canonical, "{shape:?} panel {p}: truncated pack_shape panel != canonical pack_b_bf16 of the K-prefix B");
-        let c = submit(&mut sim, &d, &a_host, &b_host, &format!("{shape:?} panel {p}/{} K{K_SIM}", packed.panels.len()));
+        let c = submit(
+            &mut sim,
+            &d,
+            &a_host,
+            &b_host,
+            &format!("{shape:?} panel {p}/{} K{K_SIM}", packed.panels.len()),
+        );
         assert_eq!(c.len(), WAVE_M * PANEL_COLS);
         for j in 0..PANEL_COLS {
             match map.locate(p * PANEL_COLS + j) {
                 Some((family, col)) => {
-                    let fi = fams.iter().position(|f| f.family == family).expect("family in fixture");
+                    let fi = fams
+                        .iter()
+                        .position(|f| f.family == family)
+                        .expect("family in fixture");
                     for row in 0..WAVE_M {
                         out[fi][row * family.cols() + col] = c[row * PANEL_COLS + j];
                     }
@@ -331,7 +407,8 @@ fn sim_all_families(shape: Shape) {
                 }
                 None => {
                     assert!(
-                        (0..WAVE_M).all(|row| c[row * PANEL_COLS + j] == want_bf16(0, (0, 0), ds[row])),
+                        (0..WAVE_M)
+                            .all(|row| c[row * PANEL_COLS + j] == want_bf16(0, (0, 0), ds[row])),
                         "{shape:?} panel {p}: padded column {j} must be +0"
                     );
                 }
@@ -339,16 +416,34 @@ fn sim_all_families(shape: Shape) {
         }
     }
     for (fi, fam) in fams.iter().enumerate() {
-        assert_eq!(written[fi], fam.family.cols(), "{:?}: every column scattered exactly once", fam.family);
+        assert_eq!(
+            written[fi],
+            fam.family.cols(),
+            "{:?}: every column scattered exactly once",
+            fam.family
+        );
         for c in 0..fam.family.cols() {
             let w = fam.row(c);
             for row in 0..WAVE_M {
-                let want = want_bf16(dot(&a8[row * K_SIM..(row + 1) * K_SIM], w), fam.grid[c], ds[row]);
+                let want = want_bf16(
+                    dot(&a8[row * K_SIM..(row + 1) * K_SIM], w),
+                    fam.grid[c],
+                    ds[row],
+                );
                 let got = out[fi][row * fam.family.cols() + c];
-                assert_eq!(got, want, "{:?} row {row} col {c}: sim {got:#06x} != twin {want:#06x}", fam.family);
+                assert_eq!(
+                    got, want,
+                    "{:?} row {row} col {c}: sim {got:#06x} != twin {want:#06x}",
+                    fam.family
+                );
             }
         }
-        eprintln!("PASS {:?}: {} x {} BF16 outputs equal the bf16_direct twin through ColumnMap", fam.family, WAVE_M, fam.family.cols());
+        eprintln!(
+            "PASS {:?}: {} x {} BF16 outputs equal the bf16_direct twin through ColumnMap",
+            fam.family,
+            WAVE_M,
+            fam.family.cols()
+        );
     }
 }
 
@@ -367,7 +462,8 @@ fn sim_qsa_in_all_families_k128() {
 fn sim_masked_programs_k2560() {
     use Family::*;
     let mask = FamilyMask::from(GdnA) | FamilyMask::from(GdnB) | FamilyMask::from(QsaIdx);
-    let progs = build_programs_for_families(EpilogueContract::Bf16Direct, WAVE_M, mask).expect("programs");
+    let progs =
+        build_programs_for_families(EpilogueContract::Bf16Direct, WAVE_M, mask).expect("programs");
     assert_eq!(progs.rows_max, WAVE_M);
     for shape in Shape::ALL {
         let prog = progs.get(shape);
@@ -376,18 +472,35 @@ fn sim_masked_programs_k2560() {
         let packed = pack(shape, &fams, mask);
         let map = assert_map(shape, mask);
         assert_eq!(packed.panels.len(), 1);
-        assert_eq!(packed.panels[0].len(), prog.arg_bytes[1], "{shape:?}: panel bytes == program B argument");
+        assert_eq!(
+            packed.panels[0].len(),
+            prog.arg_bytes[1],
+            "{shape:?}: panel bytes == program B argument"
+        );
         assert_eq!(packed.ws.len(), prog.padded_cols);
 
         let a8 = random_a8(TRUNK_K, 0x2560 + shape.index() as u64);
         let ds = token_scales(WAVE_M, 3 + shape.index());
         let a_host = pack_a_bf16(&prog.design, &a8, &ds);
-        let b_ref = pack_b_bf16(&prog.design, &fused_b(shape, mask, &fams, 0, TRUNK_K), &fused_scales(shape, mask, &fams, 0));
+        let b_ref = pack_b_bf16(
+            &prog.design,
+            &fused_b(shape, mask, &fams, 0, TRUNK_K),
+            &fused_scales(shape, mask, &fams, 0),
+        );
         assert_eq!(a_host.len(), prog.arg_bytes[0]);
-        assert!(packed.panels[0] == b_ref, "{shape:?}: pack_shape panel != canonical pack_b_bf16 of the independent fused B");
+        assert!(
+            packed.panels[0] == b_ref,
+            "{shape:?}: pack_shape panel != canonical pack_b_bf16 of the independent fused B"
+        );
 
         let mut sim = fresh(&prog.design);
-        let c = submit(&mut sim, &prog.design, &a_host, &packed.panels[0], &format!("{shape:?} program K{TRUNK_K}"));
+        let c = submit(
+            &mut sim,
+            &prog.design,
+            &a_host,
+            &packed.panels[0],
+            &format!("{shape:?} program K{TRUNK_K}"),
+        );
         assert_eq!(c.len(), WAVE_M * PANEL_COLS);
         let useful = map.useful_cols();
         for j in 0..PANEL_COLS {
@@ -396,14 +509,23 @@ fn sim_masked_programs_k2560() {
                     let fam = fams.iter().find(|f| f.family == family).unwrap();
                     let w = fam.row(col);
                     for row in 0..WAVE_M {
-                        let want = want_bf16(dot(&a8[row * TRUNK_K..(row + 1) * TRUNK_K], w), fam.grid[col], ds[row]);
-                        assert_eq!(c[row * PANEL_COLS + j], want, "{shape:?} {family:?} row {row} col {col}");
+                        let want = want_bf16(
+                            dot(&a8[row * TRUNK_K..(row + 1) * TRUNK_K], w),
+                            fam.grid[col],
+                            ds[row],
+                        );
+                        assert_eq!(
+                            c[row * PANEL_COLS + j],
+                            want,
+                            "{shape:?} {family:?} row {row} col {col}"
+                        );
                     }
                 }
                 None => {
                     assert!(j >= useful);
                     assert!(
-                        (0..WAVE_M).all(|row| c[row * PANEL_COLS + j] == want_bf16(0, (0, 0), ds[row])),
+                        (0..WAVE_M)
+                            .all(|row| c[row * PANEL_COLS + j] == want_bf16(0, (0, 0), ds[row])),
                         "{shape:?}: padded column {j} must be +0"
                     );
                 }
@@ -422,23 +544,42 @@ fn crosscheck(shape: Shape, mask: FamilyMask) {
     assert_eq!(packed.ws.len(), map.padded_cols());
     let d = g80(1, TRUNK_K);
     for p in 0..packed.panels.len() {
-        let canonical = pack_b_bf16(&d, &fused_b(shape, mask, &fams, p, TRUNK_K), &fused_scales(shape, mask, &fams, p));
+        let canonical = pack_b_bf16(
+            &d,
+            &fused_b(shape, mask, &fams, p, TRUNK_K),
+            &fused_scales(shape, mask, &fams, p),
+        );
         assert_eq!(packed.panels[p].len(), canonical.len());
-        assert!(packed.panels[p] == canonical, "{shape:?} {mask:?} panel {p}: pack_shape != canonical G80 BF16 B");
+        assert!(
+            packed.panels[p] == canonical,
+            "{shape:?} {mask:?} panel {p}: pack_shape != canonical G80 BF16 B"
+        );
     }
     for (family, col0, cols) in expected_parts(shape, mask) {
         let fam = fams.iter().find(|f| f.family == family).unwrap();
         for c in 0..cols {
-            assert_eq!(packed.ws[col0 + c].to_bits(), fam.ws[c].to_bits(), "{family:?} ws {c}");
+            assert_eq!(
+                packed.ws[col0 + c].to_bits(),
+                fam.ws[c].to_bits(),
+                "{family:?} ws {c}"
+            );
         }
     }
     let useful = map.useful_cols();
-    assert!(packed.ws[useful..].iter().all(|&w| w == 0.0), "padded ws is 0");
-    eprintln!("PASS {shape:?} {mask:?}: {} panels equal the canonical pack_in B", packed.panels.len());
+    assert!(
+        packed.ws[useful..].iter().all(|&w| w == 0.0),
+        "padded ws is 0"
+    );
+    eprintln!(
+        "PASS {shape:?} {mask:?}: {} panels equal the canonical pack_in B",
+        packed.panels.len()
+    );
 }
 
 fn mask_of(families: &[Family]) -> FamilyMask {
-    families.iter().fold(FamilyMask::NONE, |m, &f| m | FamilyMask::from(f))
+    families
+        .iter()
+        .fold(FamilyMask::NONE, |m, &f| m | FamilyMask::from(f))
 }
 
 #[test]
@@ -482,7 +623,8 @@ fn sim_out_panels_k6144_equal_the_whole_k_twin() {
     let mut sim = fresh(&prog.design);
     for panel in [0usize, 4] {
         let rows = panel * OUT_PANEL_COLS..(panel + 1) * OUT_PANEL_COLS;
-        let (mut b, mut scales, mut codes) = (vec![0i8; OUT_K * OUT_PANEL_COLS], Vec::new(), Vec::new());
+        let (mut b, mut scales, mut codes) =
+            (vec![0i8; OUT_K * OUT_PANEL_COLS], Vec::new(), Vec::new());
         for (c, row) in rows.clone().enumerate() {
             let (q, _, grid) = quantize_direct(&mq6[row * rb..(row + 1) * rb]);
             for (k, &v) in q.iter().enumerate() {
@@ -491,24 +633,50 @@ fn sim_out_panels_k6144_equal_the_whole_k_twin() {
             scales.push(grid);
             codes.push(q);
         }
-        assert_eq!(&packed.scales[rows.clone()], &scales[..], "panel {panel}: scales");
-        assert!(packed.panels[panel] == pack_b_bf16(&prog.design, &b, &scales), "panel {panel}: pack_out != pack_b_bf16 of the independent codes");
-        let c = submit(&mut sim, &prog.design, &a_host, &packed.panels[panel], &format!("out panel {panel} K{OUT_K}"));
+        assert_eq!(
+            &packed.scales[rows.clone()],
+            &scales[..],
+            "panel {panel}: scales"
+        );
+        assert!(
+            packed.panels[panel] == pack_b_bf16(&prog.design, &b, &scales),
+            "panel {panel}: pack_out != pack_b_bf16 of the independent codes"
+        );
+        let c = submit(
+            &mut sim,
+            &prog.design,
+            &a_host,
+            &packed.panels[panel],
+            &format!("out panel {panel} K{OUT_K}"),
+        );
         assert_eq!(c.len(), 512 * OUT_PANEL_COLS);
         for row in 0..512 {
             for col in 0..OUT_PANEL_COLS {
-                let dot: i32 = a8[row * OUT_K..(row + 1) * OUT_K].iter().zip(&codes[col]).map(|(&x, &w)| i32::from(x) * i32::from(w)).sum();
-                assert_eq!(c[row * OUT_PANEL_COLS + col], want_bf16(dot, scales[col], ds[row]), "panel {panel} row {row} col {col}");
+                let dot: i32 = a8[row * OUT_K..(row + 1) * OUT_K]
+                    .iter()
+                    .zip(&codes[col])
+                    .map(|(&x, &w)| i32::from(x) * i32::from(w))
+                    .sum();
+                assert_eq!(
+                    c[row * OUT_PANEL_COLS + col],
+                    want_bf16(dot, scales[col], ds[row]),
+                    "panel {panel} row {row} col {col}"
+                );
             }
         }
     }
-    assert!(packed.scales[3] == (0, 0) && packed.scales[OUT_COLS - 1] == (0, 0), "blank rows have zero scale");
+    assert!(
+        packed.scales[3] == (0, 0) && packed.scales[OUT_COLS - 1] == (0, 0),
+        "blank rows have zero scale"
+    );
 }
 
 /// `m` activation rows `[m][k]` in -127..=127 (edge rows as in `random_a8`).
 fn random_a8_rows(m: usize, k: usize, seed: u64) -> Vec<i8> {
     let mut rng = Rng::new(seed);
-    let mut a: Vec<i8> = (0..m * k).map(|_| (((rng.next() >> 33) % 255) as i32 - 127) as i8).collect();
+    let mut a: Vec<i8> = (0..m * k)
+        .map(|_| (((rng.next() >> 33) % 255) as i32 - 127) as i8)
+        .collect();
     for kk in 0..k {
         a[kk] = 127;
         a[k + kk] = -127;

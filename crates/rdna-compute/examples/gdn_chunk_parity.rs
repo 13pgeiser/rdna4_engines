@@ -20,7 +20,6 @@ fn main() {
     std::process::exit(2);
 }
 
-
 #[cfg(feature = "deltanet")]
 fn main() {
     use rdna_compute::DType;
@@ -120,7 +119,18 @@ fn main() {
         let sc = gpu.upload_f32(&s_scales, &[N_HEADS * HD]).unwrap();
         let ef = gpu.upload_f16_bits(&s_ef, &[N_HEADS * HD * HD]).unwrap();
         gpu.gated_delta_net_q8_batch_seq(
-            &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &sq, &sc, &out, 512, N_HEADS, HD, Some(&ef),
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &g_gpu,
+            &b_gpu,
+            &sq,
+            &sc,
+            &out,
+            512,
+            N_HEADS,
+            HD,
+            Some(&ef),
         )
         .unwrap();
         gpu.hip.device_synchronize().unwrap();
@@ -136,7 +146,18 @@ fn main() {
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         gpu.gated_delta_net_q8_batch_seq(
-            &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &sq, &sc, &out, 512, N_HEADS, HD, Some(&ef),
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &g_gpu,
+            &b_gpu,
+            &sq,
+            &sc,
+            &out,
+            512,
+            N_HEADS,
+            HD,
+            Some(&ef),
         )
         .unwrap();
         gpu.hip.device_synchronize().unwrap();
@@ -154,7 +175,6 @@ fn main() {
         gpu.free_tensor(tns).unwrap();
     }
 }
-
 
 #[cfg(feature = "deltanet")]
 fn gen_inputs(

@@ -5,6 +5,8 @@
 //! Run the generated Qwen4 operator oracle on the production HIP path,
 //! execute the production HFQM carrier on the fixed teacher-forced corpus, or
 //! exercise real-model state/MTP rollback plus compact arena fault scenarios.
+//! Split bases resolve existing PLE sidecars using `HIPFIRE_PLE_FORMAT`.
+//! Like the replay gate, this tool never derives missing q4 rows.
 //!
 //! Fixture usage:
 //!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity --example qwen4_parity -- \
@@ -27,16 +29,16 @@
 //!       --mode cache-quality --model /abs/model.hfq \
 //!       --tokens /abs/cache-quality-fixture.json --out /abs/cache-quality-result.json
 
-use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
+use hipfire_arch_qwen4::{PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::tensor_ops::{
     bf16_roundtrip_f32, gated_delta_params_f32, gated_delta_step, hyper_read, hyper_write,
     indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
     indexed_attention_pool_rope, indexed_attention_select, Bf16Roundtrip, GatedDeltaStep,
-    HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
+    GdnStateFormat, HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
     IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1381,6 +1383,8 @@ fn run_gdn_sequence(
                     gate: &gate_t,
                     beta: &beta_t,
                     state: &state,
+                    format: GdnStateFormat::F32,
+                    residual: None,
                     output: &output,
                     key_heads,
                     value_heads,
@@ -2557,6 +2561,7 @@ fn run_qsa(
                 head_dim,
                 selected_len: capacity,
                 full_capacity: tokens,
+                end_position: token + 1,
                 format: QsaKvFormat::F32,
             },
         )
@@ -2809,6 +2814,8 @@ fn run_moe_operator(
         tokens,
         true,
         false,
+        0,
+        0,
     )
     .map_err(|error| error.to_string())?;
     let selected_experts = download_i32(gpu, &selected_gpu, tokens * top_k)?;
@@ -2850,6 +2857,7 @@ fn run_moe_operator(
         &residual_gpu,
         hidden_size,
         tokens,
+        experts,
     )
     .map_err(|error| error.to_string())?;
     let routed_output = gpu
@@ -3447,6 +3455,7 @@ fn run_mtp(
                 selected_len: capacity,
                 full_capacity: tokens,
                 format: QsaKvFormat::F32,
+                end_position: token + 1,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3854,7 +3863,17 @@ fn run_quality_candidate(
     let (tokens, corpus) = read_quality_tokens(corpus_path)?;
     let mut hfq = HfqFile::open(model_path)
         .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
-    let receipt = admit_hfqm_artifact(&hfq)
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(
+        &mut hfq,
+        model_path,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+    )
+    .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let artifact_sha256 = sha256_path(model_path)?;
     let identity_sha256 = artifact_identity_digest(&receipt)?;
@@ -3862,13 +3881,11 @@ fn run_quality_candidate(
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-        &gpu, &hfq, &config, &manifest,
-    )
-    .map_err(|error| error.to_string())?;
+    let scratch_mode =
+        hipfire_arch_qwen4::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| error.to_string())?;
     // Load by byte range like the serve loader and state runner. The borrowed
     // mmap path never finished on gfx1151 UMA (over an hour, stuck in SVM
     // registration); range loading takes about a minute.
@@ -3878,13 +3895,52 @@ fn run_quality_candidate(
     let mesh = DeviceMesh::single().map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+    // and host-maps the rest (a slab artifact larger than one card).
+    let weights = {
+        let mut weights = manifest.weights.clone();
+        match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+            None => {}
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                if gpu.is_uma() {
+                    return Err("host-mapped experts are only for discrete GPUs".into());
+                }
+                let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                    &mut weights,
+                    layers,
+                );
+                eprintln!(
+                    "qwen4_parity: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                );
+            }
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                return Err("qwen4_parity takes a fixed expert layer count, not auto".into());
+            }
+        }
+        weights
+    };
     let transaction = fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            // The store rejects a host-mapped entry as a range: borrow it
+            // from the resident source bytes, as the product loader does.
+            if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             source
                 .tensor_range(&entry.name)
                 .map_err(|error| error.to_string())?
@@ -3895,7 +3951,7 @@ fn run_quality_candidate(
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let placements = placements;
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -3903,8 +3959,10 @@ fn run_quality_candidate(
         &mut gpu,
         2048,
         metadata,
+        receipt.ple_rows,
         hipfire_arch_qwen4::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));
@@ -4070,6 +4128,11 @@ enum ParityMode {
         fixture: PathBuf,
         output: PathBuf,
     },
+    SlowlinkState {
+        model: PathBuf,
+        fixture: PathBuf,
+        output: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<ParityMode, String> {
@@ -4135,8 +4198,26 @@ fn parse_args() -> Result<ParityMode, String> {
         (Some("cache-quality"), _, _, _) => fail(
             "--mode cache-quality needs --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON (and no --fixtures)",
         ),
+        (Some("slowlink-state"), None, Some(model), Some(fixture)) => {
+            for (flag, path) in [("--model", &model), ("--tokens", &fixture), ("--out", &output)] {
+                if !path.is_absolute() {
+                    return fail(format!(
+                        "--mode slowlink-state needs absolute paths: {flag} {} is relative",
+                        path.display()
+                    ));
+                }
+            }
+            Ok(ParityMode::SlowlinkState {
+                model,
+                fixture,
+                output,
+            })
+        }
+        (Some("slowlink-state"), _, _, _) => fail(
+            "--mode slowlink-state needs --model ABS --tokens ABS_PROMPT_JSON --out ABS_REPORT_JSON (and no --fixtures)",
+        ),
         (Some(other), _, _, _) => fail(format!(
-            "unsupported --mode {other:?}; only --mode state, --mode profile and --mode cache-quality are available"
+            "unsupported --mode {other:?}; only --mode state, --mode profile, --mode cache-quality and --mode slowlink-state are available"
         )),
         _ => fail(
             "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, --mode state --model FILE --tokens CORPUS, --mode profile --model FILE --tokens CORPUS, or --mode cache-quality --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON",
@@ -4274,6 +4355,11 @@ fn run() -> Result<(), String> {
             println!("qwen4 bounded profile written: {}", output.display());
             Ok(())
         }
+        ParityMode::SlowlinkState {
+            model,
+            fixture,
+            output,
+        } => run_slowlink_state(&model, &fixture, &output),
         ParityMode::CacheQuality {
             model,
             fixture,
@@ -4282,6 +4368,117 @@ fn run() -> Result<(), String> {
             hipfire_arch_qwen4::cache_quality::run_prefix_cache_quality(&model, &fixture, &output)?;
             println!("qwen4 cache quality PASS: {}", output.display());
             Ok(())
+        }
+    }
+}
+
+/// The `--mode slowlink-state` prompt file: `{"prompt_ids": [..], "max_seq":
+/// N, "repeats": R (default 3)}`. The ids are used verbatim; `max_seq` must
+/// hold the whole prompt. Placement is the loader's own (the S1 profile's
+/// joint placement when admitted, else the incumbent's automatic one).
+#[derive(Debug, PartialEq, Eq)]
+struct SlowlinkStateFixture {
+    prompt_ids: Vec<u32>,
+    max_seq: usize,
+    repeats: usize,
+}
+
+fn parse_slowlink_state_fixture(value: &Value) -> Result<SlowlinkStateFixture, String> {
+    let prompt_ids: Vec<u32> = serde_json::from_value(
+        value
+            .get("prompt_ids")
+            .cloned()
+            .ok_or("slowlink-state fixture has no prompt_ids")?,
+    )
+    .map_err(|error| format!("invalid prompt_ids: {error}"))?;
+    if prompt_ids.is_empty() {
+        return Err("slowlink-state prompt_ids is empty".to_string());
+    }
+    let unsigned = |key: &str| -> Result<Option<usize>, String> {
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .map(|n| Some(n as usize))
+                .ok_or_else(|| format!("slowlink-state {key} is not an unsigned integer")),
+        }
+    };
+    let max_seq = unsigned("max_seq")?.ok_or("slowlink-state fixture has no max_seq")?;
+    if max_seq <= prompt_ids.len() {
+        return Err(format!(
+            "slowlink-state max_seq {max_seq} does not hold {} prompt ids and a trailer",
+            prompt_ids.len()
+        ));
+    }
+    let repeats = unsigned("repeats")?.unwrap_or(3);
+    if repeats < 2 {
+        return Err(
+            "slowlink-state repeats must be at least 2 (determinism needs a repeat)".to_string(),
+        );
+    }
+    Ok(SlowlinkStateFixture {
+        prompt_ids,
+        max_seq,
+        repeats,
+    })
+}
+
+fn run_slowlink_state(model: &Path, fixture: &Path, output: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(fixture)
+        .map_err(|error| format!("read {}: {error}", fixture.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("parse {}: {error}", fixture.display()))?;
+    let fixture = parse_slowlink_state_fixture(&value)?;
+    let report = hipfire_arch_qwen4::state_parity::run_slowlink_prefill_state(
+        model,
+        &fixture.prompt_ids,
+        fixture.max_seq,
+        fixture.repeats,
+    )?;
+    fs::write(
+        output,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write {}: {error}", output.display()))?;
+    if report["status"] == "pass" {
+        println!("qwen4 slowlink state PASS: {}", output.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "slowlink state repeats differ (same-route determinism); report: {}",
+            output.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod slowlink_state_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn slowlink_state_fixture_requires_ids_context_and_a_repeat() {
+        let ok = parse_slowlink_state_fixture(&json!({
+            "prompt_ids": [1, 2, 3], "max_seq": 16
+        }))
+        .unwrap();
+        assert_eq!(
+            ok,
+            SlowlinkStateFixture {
+                prompt_ids: vec![1, 2, 3],
+                max_seq: 16,
+                repeats: 3,
+            }
+        );
+        for bad in [
+            json!({"max_seq": 16}),
+            json!({"prompt_ids": [], "max_seq": 16}),
+            json!({"prompt_ids": [1, 2, 3]}),
+            json!({"prompt_ids": [1, 2, 3], "max_seq": 3}),
+            json!({"prompt_ids": [1, 2, 3], "max_seq": 16, "repeats": 1}),
+            json!({"prompt_ids": [1, -2], "max_seq": 16}),
+            json!({"prompt_ids": [1, 2], "max_seq": "x"}),
+        ] {
+            assert!(parse_slowlink_state_fixture(&bad).is_err(), "{bad}");
         }
     }
 }

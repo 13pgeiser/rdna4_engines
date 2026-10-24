@@ -105,11 +105,11 @@ extern "C" __global__ __launch_bounds__(64) void qwen4_moe_gate_up_silu_iu4_sym_
     const int* __restrict__ sorted_slot_index,
     const block_i4_128* __restrict__ Xq,
     unsigned short* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total, int x_src_rows) {
+    int M, int K, int x_row_div, int m_total, int x_src_rows, int n_experts) {
     const int tile = blockIdx.y;
     if (tile * 16 >= m_total) return;
     const int e = expert_tile_ids[tile];
-    if (e < 0) return;
+    if (e < 0 || e >= n_experts) return;
     __shared__ unsigned short sOut[16][32];
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, lr = lane & 15;
     const int half = M >> 1;
@@ -183,11 +183,11 @@ extern "C" __global__ __launch_bounds__(128) void qwen4_moe_down_iu4_sym_gfx1151
     const int* __restrict__ sorted_slot_index,
     const block_i4_128* __restrict__ Xq,
     unsigned short* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total, int x_src_rows) {
+    int M, int K, int x_row_div, int m_total, int x_src_rows, int n_experts) {
     const int tile = blockIdx.y;
     if (tile * 16 >= m_total) return;
     const int e = expert_tile_ids[tile];
-    if (e < 0) return;
+    if (e < 0 || e >= n_experts) return;
     __shared__ unsigned short sOut[16][64];
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31, lr = lane & 15;
     const int rbase = blockIdx.x * 64 + wave * 16;
@@ -293,12 +293,12 @@ template <int NT, bool PF>
 __device__ __forceinline__ void sym_gate_up_nt(
     const unsigned long long* __restrict__ expert_weight_ptrs, const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index, const block_i4_128* __restrict__ Xq,
-    unsigned short* __restrict__ Y_grouped, int M, int K, int x_row_div, int m_total, int x_src_rows) {
+    unsigned short* __restrict__ Y_grouped, int M, int K, int x_row_div, int m_total, int x_src_rows, int n_experts) {
     // Four waves: (row pair p = w & 1) x (gate w < 2 / up w >= 2); 32 output columns per CTA as NT=1.
     const int tile = blockIdx.y;
     if (tile * 16 >= m_total) return;
     const int e = expert_tile_ids[tile];
-    if (e < 0) return;
+    if (e < 0 || e >= n_experts) return;
     if (sym_run_pos(expert_tile_ids, tile, e) % NT != 0) return;
     const int ntiles = m_total >> 4;
     int cnt = 1;
@@ -384,11 +384,11 @@ template <int NT, bool PF>
 __device__ __forceinline__ void sym_down_nt(
     const unsigned long long* __restrict__ expert_weight_ptrs, const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index, const block_i4_128* __restrict__ Xq,
-    unsigned short* __restrict__ Y_grouped, int M, int K, int x_row_div, int m_total, int x_src_rows) {
+    unsigned short* __restrict__ Y_grouped, int M, int K, int x_row_div, int m_total, int x_src_rows, int n_experts) {
     const int tile = blockIdx.y;
     if (tile * 16 >= m_total) return;
     const int e = expert_tile_ids[tile];
-    if (e < 0) return;
+    if (e < 0 || e >= n_experts) return;
     if (sym_run_pos(expert_tile_ids, tile, e) % NT != 0) return;
     const int ntiles = m_total >> 4;
     int cnt = 1;
@@ -450,8 +450,8 @@ __device__ __forceinline__ void sym_down_nt(
 }
 
 #define SYM_ARGS const unsigned long long* __restrict__ p, const int* __restrict__ ti, const int* __restrict__ so, \
-    const block_i4_128* __restrict__ xq, unsigned short* __restrict__ y, int M, int K, int d, int mt, int xs
-#define SYM_PASS p, ti, so, xq, y, M, K, d, mt, xs
+    const block_i4_128* __restrict__ xq, unsigned short* __restrict__ y, int M, int K, int d, int mt, int xs, int ne
+#define SYM_PASS p, ti, so, xq, y, M, K, d, mt, xs, ne
 extern "C" __global__ __launch_bounds__(128) void qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4(SYM_ARGS) {
     sym_gate_up_nt<4, true>(SYM_PASS);
 }

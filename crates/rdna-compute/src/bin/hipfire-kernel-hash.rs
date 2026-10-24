@@ -28,7 +28,10 @@ fn print_help() {
 
 fn derive_name(source_path: &str) -> String {
     let p = Path::new(source_path);
-    let file = p.file_name().and_then(|s| s.to_str()).unwrap_or(source_path);
+    let file = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(source_path);
     // Strip .hip suffix if present
     let stem = if let Some(s) = file.strip_suffix(".hip") {
         s
@@ -136,7 +139,8 @@ fn main() -> ExitCode {
     // but the packaging script is expected to produce default keys.
     let extra = extra_flags.unwrap_or_default();
 
-    let hash = rdna_compute::KernelCompiler::packaging_hash_for(&arch, &kernel_name, &source, &extra);
+    let hash =
+        rdna_compute::KernelCompiler::packaging_hash_for(&arch, &kernel_name, &source, &extra);
     println!("{hash}");
     ExitCode::SUCCESS
 }

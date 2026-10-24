@@ -187,7 +187,7 @@ __device__ __forceinline__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry(
     const int*                __restrict__ sorted_slot_index,
     const _Float16*           __restrict__ X_src,
     void* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total, int n_experts
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -195,7 +195,7 @@ __device__ __forceinline__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry(
     const int slot_start = tile_y * 16;
     if (row_start >= M || slot_start >= m_total) return;
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     int local = 0;
     while (tile_y - local - 1 >= 0 && expert_tile_ids[tile_y - local - 1] == expert_id) ++local;
     if (local % 4) return;
@@ -217,17 +217,17 @@ __device__ __forceinline__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry(
     const unsigned long long* __restrict__ expert_weight_ptrs, \
     const int* __restrict__ expert_tile_ids, const int* __restrict__ sorted_slot_index, \
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped, \
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total, int n_experts
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151(MOE_WMMA_ARGS) {
     gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry<false>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
-                         Y_grouped, M, K, x_row_div, m_total);
+                         Y_grouped, M, K, x_row_div, m_total, n_experts);
 }
 // Y_grouped as BF16 (RNE) for consumers that round each value to BF16 first.
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out(MOE_WMMA_ARGS) {
     gemm_mq4g128v2_moe_grouped_wmma_gfx1151_entry<true>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
-                        Y_grouped, M, K, x_row_div, m_total);
+                        Y_grouped, M, K, x_row_div, m_total, n_experts);
 }
 #undef MOE_WMMA_ARGS
 
@@ -391,14 +391,16 @@ extern "C" __global__ void gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out(
     const unsigned long long* __restrict__ expert_weight_ptrs,
     const int* __restrict__ expert_tile_ids, const int* __restrict__ sorted_slot_index,
     const _Float16* __restrict__ X_src, void* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total) {
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
+) {
     (void)x_row_div;
     const int tid = threadIdx.x;
     const int tile_y = blockIdx.y;
     const int slot_start = tile_y * 16;
     if (slot_start >= m_total) return;
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     int local = 0;
     while (tile_y - local - 1 >= 0 && expert_tile_ids[tile_y - local - 1] == expert_id) ++local;
     if (local % 4) return;

@@ -119,7 +119,10 @@ impl HostSignal {
             .hip
             .host_get_device_pointer(host, 0)
             .expect("HARNESS: hipHostGetDevicePointer for the release word");
-        assert!(!device.is_null(), "HARNESS: null device alias for the release word");
+        assert!(
+            !device.is_null(),
+            "HARNESS: null device alias for the release word"
+        );
         // SAFETY: device alias of the live hipHostMalloc allocation `host`,
         // freed once through `host` by `HostSignal::free`.
         let buf = unsafe { DeviceBuffer::from_host_mapped(device, SIGNAL_BYTES) };
@@ -259,7 +262,8 @@ struct State {
 }
 
 fn mapped_len(gpu: &Gpu, t: &GpuTensor) -> usize {
-    gpu.vmm_mapped_bytes(t).map_or(t.buf.size(), |m| m.min(t.buf.size()))
+    gpu.vmm_mapped_bytes(t)
+        .map_or(t.buf.size(), |m| m.min(t.buf.size()))
 }
 
 fn state_tensors(slot: &ModelSlot) -> Vec<&GpuTensor> {
@@ -306,9 +310,18 @@ fn logits(gpu: &Gpu, slot: &ModelSlot) -> Vec<u8> {
 }
 
 fn forward(gpu: &mut Gpu, slot: &mut ModelSlot, token: u32, pos: usize) -> Result<(), String> {
-    let ModelSlot { weights, config, kv_cache, dn_state, scratch, .. } = slot;
-    qwen35::forward_scratch(gpu, weights, config, token, pos, kv_cache, dn_state, scratch)
-        .map_err(|error| error.to_string())
+    let ModelSlot {
+        weights,
+        config,
+        kv_cache,
+        dn_state,
+        scratch,
+        ..
+    } = slot;
+    qwen35::forward_scratch(
+        gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
+    )
+    .map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -354,12 +367,16 @@ fn submit_lowering() -> &'static str {
 }
 
 fn bring_up() -> Option<Rig> {
-    let guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_env();
     let model = PathBuf::from(std::env::var("PM4_HOLD_MODEL").unwrap_or_else(|_| {
         "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts".to_owned()
     }));
-    let ctx: usize = std::env::var("PM4_HOLD_CTX").ok().map_or(256, |v| v.parse().expect("PM4_HOLD_CTX"));
+    let ctx: usize = std::env::var("PM4_HOLD_CTX")
+        .ok()
+        .map_or(256, |v| v.parse().expect("PM4_HOLD_CTX"));
 
     let mut gpu = match Gpu::init() {
         Ok(gpu) => gpu,
@@ -369,10 +386,17 @@ fn bring_up() -> Option<Rig> {
         }
     };
     if gpu.arch != "gfx1201" {
-        eprintln!("skip: the dense retained PM4 default is gfx1201-only, found {}", gpu.arch);
+        eprintln!(
+            "skip: the dense retained PM4 default is gfx1201-only, found {}",
+            gpu.arch
+        );
         return None;
     }
-    assert!(model.is_file(), "model not found: {} (set PM4_HOLD_MODEL)", model.display());
+    assert!(
+        model.is_file(),
+        "model not found: {} (set PM4_HOLD_MODEL)",
+        model.display()
+    );
 
     let mut cfg = ModelSlotConfig::default();
     // Pinned 27B artifact runs at max_seq 512; keep at least that.
@@ -387,11 +411,22 @@ fn bring_up() -> Option<Rig> {
     );
     gpu.replay
         .set_pm4_gfx12_dispatch_pacing(rdna_compute::replay::gfx1201_pm4_pacing_from_config());
-    assert_eq!(gpu.replay.transport_name(), "pm4", "the default dense route must be PM4");
+    assert_eq!(
+        gpu.replay.transport_name(),
+        "pm4",
+        "the default dense route must be PM4"
+    );
 
     let prompt: Vec<u32> = (0..ctx as u32).map(|i| 10 + (i % 1000)).collect();
     {
-        let ModelSlot { weights, config, kv_cache, dn_state, scratch, .. } = &mut slot;
+        let ModelSlot {
+            weights,
+            config,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = &mut slot;
         qwen35::forward_prefill_batch(
             &mut gpu, weights, config, &prompt, 0, kv_cache, dn_state, scratch, None, None, None,
             None,
@@ -426,7 +461,16 @@ fn bring_up() -> Option<Rig> {
         submit_lowering()
     );
     let signal = HostSignal::new(&gpu);
-    Some(Rig { _guard: guard, gpu, slot, before, frame, pos, signal, embedding })
+    Some(Rig {
+        _guard: guard,
+        gpu,
+        slot,
+        before,
+        frame,
+        pos,
+        signal,
+        embedding,
+    })
 }
 
 impl Rig {
@@ -474,8 +518,15 @@ impl Rig {
     }
 
     fn teardown(self) {
-        let Rig { mut gpu, slot, signal, .. } = self;
-        gpu.hip.device_synchronize().expect("HARNESS: sync teardown");
+        let Rig {
+            mut gpu,
+            slot,
+            signal,
+            ..
+        } = self;
+        gpu.hip
+            .device_synchronize()
+            .expect("HARNESS: sync teardown");
         gpu.replay.shutdown().expect("retained replay quiescence");
         signal.free(&gpu);
         drop(slot);
@@ -525,11 +576,17 @@ fn open_hold(rig: &mut Rig, hold: Hold) -> (Releaser, Option<Stream>) {
         .expect("HARNESS: queue hipStreamWaitValue32 on the holder stream");
     match hold {
         Hold::DefaultStream => {
-            assert!(rig.gpu.active_stream.is_none(), "HARNESS: active stream installed");
+            assert!(
+                rig.gpu.active_stream.is_none(),
+                "HARNESS: active stream installed"
+            );
             (releaser, Some(holder))
         }
         Hold::InstalledBlocking => {
-            assert!(rig.gpu.active_stream.is_none(), "HARNESS: active stream installed");
+            assert!(
+                rig.gpu.active_stream.is_none(),
+                "HARNESS: active stream installed"
+            );
             rig.gpu.active_stream = Some(holder);
             (releaser, None)
         }
@@ -541,15 +598,25 @@ fn close_hold(rig: &mut Rig, mut releaser: Releaser, held_default: Option<Stream
     releaser.release_now();
     let holder = match held_default {
         Some(holder) => holder,
-        None => rig.gpu.active_stream.take().expect("installed holder stream"),
+        None => rig
+            .gpu
+            .active_stream
+            .take()
+            .expect("installed holder stream"),
     };
     rig.gpu
         .hip
         .stream_synchronize(&holder)
         .expect("HARNESS: drain the holder after release");
     releaser.finish();
-    rig.gpu.hip.device_synchronize().expect("HARNESS: sync after hold");
-    rig.gpu.hip.stream_destroy(holder).expect("HARNESS: destroy holder");
+    rig.gpu
+        .hip
+        .device_synchronize()
+        .expect("HARNESS: sync after hold");
+    rig.gpu
+        .hip
+        .stream_destroy(holder)
+        .expect("HARNESS: destroy holder");
 }
 
 /// Restore, hold the staging stream, run the real decode, release, drain.
@@ -665,7 +732,10 @@ fn held_oracle(hold: Hold) {
              invisible"
         );
         if let Err(reason) = &held.forward {
-            panic!("held real decode failed ({:?}, tokens {stale}->{new}): {reason}", held.hold);
+            panic!(
+                "held real decode failed ({:?}, tokens {stale}->{new}): {reason}",
+                held.hold
+            );
         }
         eprintln!(
             "EMPIRICAL held decode [{:?}, embedding {embedding}, tokens {stale}->{new}]: \

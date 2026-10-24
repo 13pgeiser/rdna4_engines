@@ -13,19 +13,106 @@
 
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen4Profile};
 use hipfire_runtime::external_rows::RowEncoding;
+use hipfire_runtime::mesh_placement::BandPlacement;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
-use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
-#[cfg(test)]
-use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::tp_shard::ExpertAssign;
+use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
+use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::weight_manifest::{
     DTypeConstraint, ExpertSourceLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry,
-    StateKind, WeightEntry,
+    StateKind, StateScope, WeightEntry,
 };
 use hipfire_runtime::weight_store::{TakenWeight, WeightHandle, WeightLoadTransaction};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Range;
+
+/// Rank-local ownership projected from the admitted, absolute trunk partition.
+/// This value owns neither devices nor an independent topology.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4BandScope {
+    pub band: Range<usize>,
+    pub input: bool,
+    pub output: bool,
+}
+
+impl Qwen4BandScope {
+    /// The historical whole-model allocation and assembly scope.
+    pub fn single(config: &Qwen4Config) -> Self {
+        Self {
+            band: 0..config.num_hidden_layers,
+            input: true,
+            output: true,
+        }
+    }
+
+    /// Project one admitted stage, refusing a PLE cut off the input owner.
+    pub fn from_placement(
+        config: &Qwen4Config,
+        placement: &BandPlacement,
+        stage: usize,
+    ) -> Result<Self, String> {
+        if placement.n_trunk_layers != config.num_hidden_layers || stage >= placement.stages() {
+            return Err("Qwen4 band placement does not match the model or stage".to_string());
+        }
+        if let Some(ple) = &config.ple {
+            if !placement.band(0).contains(&ple.layer) {
+                return Err("Qwen4 PLE layer must belong to the input band".to_string());
+            }
+        }
+        let scope = Self {
+            band: placement.band(stage),
+            input: stage == 0,
+            output: stage + 1 == placement.stages(),
+        };
+        scope.validate(config)?;
+        Ok(scope)
+    }
+
+    /// Check absolute geometry and endpoint ownership before side effects.
+    pub fn validate(&self, config: &Qwen4Config) -> Result<(), String> {
+        if self.band.is_empty()
+            || self.band.end > config.num_hidden_layers
+            || config.layer_types.len() != config.num_hidden_layers
+            || self.input != (self.band.start == 0)
+            || self.output != (self.band.end == config.num_hidden_layers)
+        {
+            return Err("invalid Qwen4 band or endpoint ownership".to_string());
+        }
+        if config
+            .ple
+            .as_ref()
+            .is_some_and(|ple| self.input != self.owns_layer(ple.layer))
+        {
+            return Err("Qwen4 PLE layer must belong to the input band".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn owns_layer(&self, layer: usize) -> bool {
+        self.band.contains(&layer)
+    }
+
+    /// MTP is an output-pinned auxiliary namespace, never another trunk layer.
+    pub fn owns_entry(&self, entry: &WeightEntry) -> bool {
+        if entry.name.starts_with("mtp.") {
+            return self.output;
+        }
+        if let Some(layer) = entry.layer {
+            return self.owns_layer(layer);
+        }
+        match entry.placement {
+            PlacementHint::Pin(PinTarget::Embed) => self.input,
+            PlacementHint::Pin(PinTarget::Output) => self.output,
+            PlacementHint::Policy => match entry.policy {
+                ShardPolicy::Pin(PinTarget::Embed) => self.input,
+                _ => self.output,
+            },
+        }
+    }
+}
 
 /// The routed experts' declared targets: gate/up at the aligned-K group width
 /// and down at the row-local one.
@@ -56,6 +143,33 @@ fn qwen4_quantized_dtype(dtype: DType) -> bool {
         dtype,
         DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA | DType::Q8_0
     )
+}
+
+/// The planar expert-slab dtypes (qt=131..=136) that no qwen4 trunk/dense route
+/// has a kernel for.  The qwen4 planner never produces them, but a caller-supplied
+/// [`DType`] could otherwise ride through [`qwen4_target_dtype`]'s
+/// pass-through arm into a declaration and fail much later in a generic
+/// consumer.
+fn qwen4_expert_slab_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ3I4G128R256
+            | DType::MQ3I4G128R128
+            | DType::MQ2I4G128R256
+            | DType::MQ2I4G128R128
+            | DType::E8PI4G128R256
+            | DType::E8PI4G128R128
+    )
+}
+
+/// Typed refusal of an expert-slab dtype at a result-returning boundary that
+/// receives a caller-supplied [`DType`].
+fn reject_expert_slab_dtype(dtype: DType) -> Result<(), WeightError> {
+    if qwen4_expert_slab_dtype(dtype) {
+        Err(WeightError::ExpertSlabDtypeKernelsUnavailable { dtype })
+    } else {
+        Ok(())
+    }
 }
 
 /// Payloads that stay source-exact BF16 even though they are rank-2 matrices.
@@ -140,6 +254,14 @@ fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
 /// lossier tier does there: a four-bit trunk opened a reasoning block the model
 /// could not close.  Q8F16 costs 8.5 bpw but needs no rotation basis at all, and
 /// the trunk is a rounding error next to the experts.
+///
+/// Invariant: this takes only a shape, so it can never receive an expert-slab
+/// dtype (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`) and always returns
+/// one of the MQ4/Q8 tiers above.  The public entries that carry a caller
+/// [`DType`] ([`TensorRef::new`], [`Qwen4Manifest::build_with_recipe`],
+/// [`Qwen4Manifest::with_expert_parallel`] and [`Qwen4Weights::assemble`])
+/// refuse those dtypes with [`WeightError::ExpertSlabDtypeKernelsUnavailable`]
+/// before any mapping runs.
 fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     let k = shape.last().copied().unwrap_or_default();
     if shape.len() == 3 {
@@ -156,6 +278,10 @@ fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     }
 }
 
+/// Pure mapping: a `requested` dtype that is neither BF16 nor a recognised
+/// packed format is returned unchanged, so this function would preserve an
+/// expert-slab dtype.  It is infallible by design; every public caller that
+/// can hold such a dtype rejects it first (see [`qwen4_matrix_dtype`]).
 fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
     if matches!(requested, DType::BF16 | DType::Q8_0) {
         if name == QWEN4_LM_HEAD {
@@ -289,20 +415,24 @@ fn qwen4_trunk_target(name: &str, shape: &[usize], requested: DType, trunk_tier:
 }
 
 /// Metadata key naming the recipe a developer artifact was written under.
-/// A Flash-Next artifact's key predates the typed recipe and carries no `id`;
-/// only a synthetic profile reads or requires one.
+/// A Flash-Next artifact's key predates the typed recipe and carries no `id`,
+/// except the stock-FP8 artifact ([`STOCK_FP8_RECIPE_ID`]), which a Flash-Next
+/// config may declare; a synthetic profile reads or requires one.
 pub const RECIPE_METADATA_KEY: &str = "qwen4_recipe";
 /// `id` of [`Qwen4TierRecipe::SyntheticSourceBf16`] in artifact metadata.
 pub const SYNTHETIC_SOURCE_BF16_RECIPE_ID: &str = "synthetic-source-bf16";
 /// `id` of [`Qwen4TierRecipe::SyntheticPacked`] in artifact metadata.
 pub const SYNTHETIC_PACKED_RECIPE_ID: &str = "synthetic-packed";
+/// `id` of [`Qwen4TierRecipe::StockFp8`] in artifact metadata (written by
+/// `hipfire-quantize --recipe stock-fp8`).
+pub const STOCK_FP8_RECIPE_ID: &str = "stock-fp8";
 
 impl Qwen4TierRecipe {
     /// Stable artifact-metadata id of a synthetic recipe; `None` for the
-    /// Flash-Next recipe, which is never selected by metadata.
+    /// Flash-Next recipes.
     pub const fn synthetic_id(&self) -> Option<&'static str> {
         match self {
-            Self::FlashNextPacked { .. } => None,
+            Self::FlashNextPacked { .. } | Self::FlashNextSlab { .. } | Self::StockFp8 => None,
             Self::SyntheticSourceBf16 => Some(SYNTHETIC_SOURCE_BF16_RECIPE_ID),
             Self::SyntheticPacked => Some(SYNTHETIC_PACKED_RECIPE_ID),
         }
@@ -314,6 +444,47 @@ impl Qwen4TierRecipe {
             SYNTHETIC_SOURCE_BF16_RECIPE_ID => Some(Self::SyntheticSourceBf16),
             SYNTHETIC_PACKED_RECIPE_ID => Some(Self::SyntheticPacked),
             _ => None,
+        }
+    }
+
+    /// The Flash-Next recipe an artifact-metadata `id` names (only
+    /// [`STOCK_FP8_RECIPE_ID`]; the packed recipe carries no id).
+    pub fn from_flash_next_id(id: &str) -> Option<Self> {
+        match id {
+            STOCK_FP8_RECIPE_ID => Some(Self::StockFp8),
+            _ => None,
+        }
+    }
+
+    /// The stock-FP8 recipe ([`Self::StockFp8`]).
+    pub const fn is_stock_fp8(&self) -> bool {
+        matches!(self, Self::StockFp8)
+    }
+
+    /// Whether the Flash-Next trunk (every trunk/head/HC/shared-expert/router/
+    /// embedding matrix) is source BF16 (qt=16) loaded raw — the
+    /// `HIPFIRE_CALIB_BF16` behaviour as a recipe property: the forward keeps
+    /// BF16 reads and builds no Q8 decode copies.  True for [`Self::StockFp8`]
+    /// only (a synthetic profile never takes the Flash-Next decode recipe).
+    pub const fn trunk_raw_bf16(&self) -> bool {
+        self.is_stock_fp8()
+    }
+
+    /// Whether the routed experts are qt=55 `FP8E4M3B128` tables, which only
+    /// a device with `Qwen4Capabilities::fp8_experts` (gfx942) may load.
+    pub const fn fp8_experts(&self) -> bool {
+        self.is_stock_fp8()
+    }
+
+    /// Refuses a recipe whose trunk tier names an expert-slab dtype
+    /// (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`,
+    /// `E8PI4G128R256`/`R128`): no qwen4 trunk kernel exists for them.
+    pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
+        match self {
+            Self::FlashNextPacked { trunk_tier, .. } | Self::FlashNextSlab { trunk_tier, .. } => {
+                reject_expert_slab_dtype(*trunk_tier)
+            }
+            Self::SyntheticSourceBf16 | Self::SyntheticPacked | Self::StockFp8 => Ok(()),
         }
     }
 }
@@ -382,7 +553,11 @@ pub fn synthetic_packed_decision(name: &str, shape: &[usize]) -> SyntheticPackDe
     let gate_up = name.ends_with(".experts.gate_up_proj");
     let down = name.ends_with(".experts.down_proj");
     if shape.len() == 3 && (gate_up || down) {
-        let class = if gate_up { "routed gate/up" } else { "routed down" };
+        let class = if gate_up {
+            "routed gate/up"
+        } else {
+            "routed down"
+        };
         // gate_up is [experts, 2 * intermediate, hidden]; down is
         // [experts, hidden, intermediate].
         let (hidden, intermediate) = if gate_up {
@@ -428,7 +603,10 @@ pub fn synthetic_packed_decision(name: &str, shape: &[usize]) -> SyntheticPackDe
         return if k % 128 == 0 {
             packed(DType::Q8_0, "trunk projection")
         } else {
-            exact("trunk projection", "K is not a multiple of 128 (the Flash-Next trunk rule)")
+            exact(
+                "trunk projection",
+                "K is not a multiple of 128 (the Flash-Next trunk rule)",
+            )
         };
     }
     const KEPT: &str = "the Flash-Next recipe keeps this role source-exact";
@@ -493,6 +671,8 @@ pub enum TensorRole {
     SharedExpertDown,
     RoutedGateUp,
     RoutedDown,
+    /// A trunk layer's contiguous expert slab arena (`FlashNextSlab` recipe).
+    RoutedArena,
     DenseFfnGate,
     DenseFfnUp,
     DenseFfnDown,
@@ -530,6 +710,7 @@ impl TensorRef {
         if name.is_empty() || shape.is_empty() || shape.iter().any(|&dim| dim == 0) {
             return Err(WeightError::InvalidShape { name, shape });
         }
+        reject_expert_slab_dtype(dtype)?;
         let dtype = qwen4_target_dtype(&name, &shape, dtype);
         Ok(Self {
             name,
@@ -571,6 +752,26 @@ pub enum Qwen4TierRecipe {
     /// Q8 embedding, MQ6 head, Q8F16 PLE rows.  `trunk_tier` and `mtp_source`
     /// are the two producer/loader-shared knobs, resolved once.
     FlashNextPacked { trunk_tier: DType, mtp_source: bool },
+    /// [`Self::FlashNextPacked`] with the 48 trunk layers' routed experts held
+    /// as per-layer slab arenas (version-1 expert-slab artifact): each layer
+    /// declares ONE `slab_arena` entry (raw bytes, resident or host-mapped)
+    /// instead of the two aggregate expert tensors, and `arenas` carries the
+    /// validated per-expert format and offsets. The MTP head's experts stay
+    /// the legacy aggregates.
+    FlashNextSlab {
+        trunk_tier: DType,
+        mtp_source: bool,
+        arenas: std::sync::Arc<crate::expert_arena::ExpertArenaPlan>,
+    },
+    /// The stock FP8 checkpoint (rev `236dfdf2`) converted byte-for-byte:
+    /// routed experts qt=55 `FP8E4M3B128` (OCP e4m3 codes + BF16 `s_inv`
+    /// 128x128 blocks, gate_up `[E, 1280, 2560]`, down `[E, 2560, 640]`),
+    /// every other tensor source BF16 (qt=16) loaded raw, PLE rows qt=56
+    /// `FP8E4M3PT`.  AR-only: the artifact carries no MTP head, so it is
+    /// declared for [`crate::config::Qwen4Profile::FlashNextArOnly`] only.
+    /// Selected by `qwen4_recipe.id = "stock-fp8"`; no environment knob
+    /// moves it.
+    StockFp8,
     /// Developer-only synthetic profiles stay conservative: every tensor is
     /// declared source-exact BF16 (and BF16 external PLE rows) until a role
     /// format has an executable consumer, a producer and a proof.  No
@@ -601,6 +802,7 @@ pub struct Qwen4ManifestIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen4Manifest {
     pub identity: Qwen4ManifestIdentity,
+    pub expert_keep: Option<crate::ExpertKeep>,
     pub weights: Vec<WeightEntry>,
     pub state: Vec<StateEntry>,
     pub metadata: Vec<MetadataTensor>,
@@ -625,11 +827,14 @@ impl Qwen4Manifest {
     /// The declaration both the producer and the loader read.
     ///
     /// Flash-Next takes its packed tier from `HIPFIRE_QWEN4_TRUNK_TIER`; the
-    /// source-tier experiment affects only rank-2 MTP records.  A synthetic
-    /// developer profile ignores both knobs and declares
-    /// [`Qwen4TierRecipe::SyntheticSourceBf16`].
+    /// source-tier experiment affects only rank-2 MTP records.  The AR-only
+    /// Flash-Next profile has exactly one recipe,
+    /// [`Qwen4TierRecipe::StockFp8`].  A synthetic developer profile ignores
+    /// both knobs and declares [`Qwen4TierRecipe::SyntheticSourceBf16`].
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
-        let tier = if config.profile.is_flash_next() {
+        let tier = if config.profile.is_ar_only() {
+            Qwen4TierRecipe::StockFp8
+        } else if config.profile.is_flash_next() {
             Qwen4TierRecipe::FlashNextPacked {
                 trunk_tier: qwen4_trunk_tier(
                     hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_TIER")
@@ -664,23 +869,49 @@ impl Qwen4Manifest {
         config: &Qwen4Config,
         recipe: Qwen4TierRecipe,
     ) -> Result<Self, WeightError> {
+        recipe.reject_expert_slab_dtypes()?;
         config.validate().map_err(WeightError::Config)?;
         let (packed, trunk_tier, mtp_source) = match &recipe {
             Qwen4TierRecipe::FlashNextPacked {
                 trunk_tier,
                 mtp_source,
-            } => (true, *trunk_tier, *mtp_source),
-            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
-                (false, DType::BF16, false)
             }
+            | Qwen4TierRecipe::FlashNextSlab {
+                trunk_tier,
+                mtp_source,
+                ..
+            } => (true, *trunk_tier, *mtp_source),
+            Qwen4TierRecipe::StockFp8
+            | Qwen4TierRecipe::SyntheticSourceBf16
+            | Qwen4TierRecipe::SyntheticPacked => (false, DType::BF16, false),
         };
         let synthetic_packed = matches!(recipe, Qwen4TierRecipe::SyntheticPacked);
-        if packed != config.profile.is_flash_next() {
+        let stock_fp8 = recipe.is_stock_fp8();
+        let profile_admits_recipe = match &recipe {
+            Qwen4TierRecipe::FlashNextPacked { .. } | Qwen4TierRecipe::FlashNextSlab { .. } => {
+                matches!(config.profile, Qwen4Profile::FlashNext)
+            }
+            Qwen4TierRecipe::StockFp8 => config.profile.is_ar_only(),
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                config.profile.is_synthetic()
+            }
+        };
+        if !profile_admits_recipe {
             return Err(WeightError::UnsupportedProfile {
                 profile: config.profile.id().to_string(),
                 reason: format!("profile cannot be declared under the {recipe:?} recipe"),
             });
         }
+        // The unpacked recipes declare one exact representation per tensor.
+        let unpacked_dtype = |name: &str, shape: &[usize]| {
+            if stock_fp8 {
+                stock_fp8_dtype(name, shape)
+            } else if synthetic_packed {
+                synthetic_packed_decision(name, shape).dtype
+            } else {
+                DType::BF16
+            }
+        };
         let bf16 = DTypeConstraint::source_exact(DType::BF16);
         // Converted HFQM records may already carry either MQ4G256V2 (qt=44)
         // or MQ4G128V2 (qt=53).  The source checkpoint itself remains BF16.
@@ -698,11 +929,7 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             if !packed {
-                let dtype = if synthetic_packed {
-                    synthetic_packed_decision(name, &shape).dtype
-                } else {
-                    DType::BF16
-                };
+                let dtype = unpacked_dtype(name, &shape);
                 return WeightEntry::model_with_dtype_constraint(
                     name,
                     shape,
@@ -732,11 +959,7 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             if !packed {
-                let dtype = if synthetic_packed {
-                    synthetic_packed_decision(name, &shape).dtype
-                } else {
-                    DType::BF16
-                };
+                let dtype = unpacked_dtype(name, &shape);
                 return WeightEntry::layer_with_dtype_constraint(
                     name,
                     layer_idx,
@@ -1059,6 +1282,7 @@ impl Qwen4Manifest {
                         ple,
                         packed,
                         synthetic_packed,
+                        stock_fp8,
                         &bf16,
                     );
                 }
@@ -1190,11 +1414,28 @@ impl Qwen4Manifest {
             }
         }
         // PLE is injected at its declared layer and retains its depthwise
-        // convolution history.  StateKind has no family-local name; the
-        // architecture state owner keeps this entry distinct by type.  A
+        // convolution history, owned by the input band (the PLE layer is
+        // admitted only inside band 0), so it is declared as input-pinned
+        // state rather than a second Conv entry of that trunk layer.  A
         // profile without PLE declares no PLE state.
-        if let Some(ple) = ple {
-            state.push(StateEntry::new(StateKind::Conv, ple.layer));
+        if ple.is_some() {
+            state.push(StateEntry::pinned(StateKind::Conv, PinTarget::Embed));
+        }
+        if config.expert_keep.is_some() {
+            for entry in &mut weights {
+                if entry.name.ends_with(".experts.gate_up_proj")
+                    || entry.name.ends_with(".experts.down_proj")
+                {
+                    if let Some(ids) = config
+                        .kept_expert_ids(entry.layer.unwrap_or(0), entry.name.starts_with("mtp."))
+                    {
+                        entry.logical_shape[0] = ids.len();
+                    }
+                }
+            }
+        }
+        if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = &recipe {
+            apply_expert_arenas(&mut weights, arenas)?;
         }
         let identity = Qwen4ManifestIdentity {
             profile_id: config.profile.id().to_string(),
@@ -1207,11 +1448,35 @@ impl Qwen4Manifest {
             recipe,
         };
         Ok(Self {
+            expert_keep: config.expert_keep.clone(),
             identity,
             weights,
             state,
             metadata,
         })
+    }
+
+    /// Refuses a manifest (built here or assembled by hand from its public
+    /// fields) that declares or admits an expert-slab dtype
+    /// (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`) for any weight or
+    /// source constraint, or whose recipe names one.  Pure; no GPU is touched.
+    pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
+        self.identity.recipe.reject_expert_slab_dtypes()?;
+        for entry in &self.weights {
+            reject_expert_slab_dtype(entry.dtype)?;
+            match &entry.dtype_constraint.source {
+                hipfire_runtime::weight_manifest::SourceDType::Any => {}
+                hipfire_runtime::weight_manifest::SourceDType::Exact(dtype) => {
+                    reject_expert_slab_dtype(*dtype)?;
+                }
+                hipfire_runtime::weight_manifest::SourceDType::OneOf(dtypes) => {
+                    for dtype in dtypes {
+                        reject_expert_slab_dtype(*dtype)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn entry(&self, name: &str, layer: Option<usize>) -> Option<&WeightEntry> {
@@ -1231,6 +1496,64 @@ impl Qwen4Manifest {
             .iter()
             .filter(|entry| !entry.residency.is_external())
             .map(|entry| (entry.name.as_str(), entry.layer))
+    }
+
+    /// Keep declaration order and source identities while removing every
+    /// resource not owned by this band. Single is the unchanged declaration.
+    pub fn with_band_scope(
+        mut self,
+        config: &Qwen4Config,
+        scope: &Qwen4BandScope,
+    ) -> Result<Self, WeightError> {
+        scope.validate(config).map_err(WeightError::Config)?;
+        if *scope == Qwen4BandScope::single(config) {
+            return Ok(self);
+        }
+        if self.weights.iter().any(|entry| {
+            matches!(
+                entry.policy,
+                ShardPolicy::ExpertSharded { .. } | ShardPolicy::ExpertTensorSharded { .. }
+            )
+        }) {
+            return Err(WeightError::EpPlacement(
+                "Qwen4 pipeline bands cannot be combined with expert parallelism".to_string(),
+            ));
+        }
+        self.weights.retain(|entry| scope.owns_entry(entry));
+        for entry in &mut self.weights {
+            if entry.name.starts_with("mtp.") {
+                entry.placement = PlacementHint::Pin(PinTarget::Output);
+            }
+        }
+        self.state.retain(|entry| match entry.scope {
+            StateScope::Layer(layer) => scope.owns_layer(layer),
+            StateScope::Pin(PinTarget::Embed) => scope.input,
+            StateScope::Pin(PinTarget::Output) => scope.output,
+        });
+        if !scope.input {
+            self.metadata.clear();
+        }
+        Ok(self)
+    }
+
+    /// Exact ordered placement keys for an admitted local band.
+    pub fn placements_for_scope(
+        &self,
+        config: &Qwen4Config,
+        scope: &Qwen4BandScope,
+        device: usize,
+    ) -> Result<Vec<Qwen4Placement>, WeightError> {
+        scope.validate(config).map_err(WeightError::Config)?;
+        Ok(self
+            .weights
+            .iter()
+            .filter(|entry| !entry.residency.is_external() && scope.owns_entry(entry))
+            .map(|entry| Qwen4Placement {
+                name: entry.name.clone(),
+                layer: entry.layer,
+                device,
+            })
+            .collect())
     }
 
     /// Number of source tensor records represented by this text manifest.
@@ -1269,10 +1592,22 @@ impl Qwen4Manifest {
     /// of `ranks` holds experts `e % ranks == r` compactly in ascending `e`
     /// (local index `e / ranks`). The entries keep their logical shape
     /// (`[n_experts, ..]`, which the manifest validator requires); the
-    /// fulfilled tensor is `[n_experts / ranks, ..]`. Everything else is
+    /// fulfilled tensor is `[ep.local_count(n_experts), ..]` (uneven splits
+    /// give the low ranks one more expert). Everything else is
     /// unchanged, and a manifest that is never passed through here (ep = 1)
     /// stays byte-identical to the single-device declaration.
     pub fn with_expert_parallel(mut self, ep: Qwen4EpPlacement) -> Result<Self, WeightError> {
+        if self.expert_keep.is_some() {
+            return Err(WeightError::EpPlacement("qwen4.expert_keep artifacts do not support ExpertSharded/EP placement; use one device".into()));
+        }
+        if self.identity.recipe.is_stock_fp8() {
+            return Err(WeightError::EpPlacement(format!(
+                "the stock-FP8 recipe loads every routed expert fully resident on one device \
+                 (P1); expert parallelism (rank {} of {}) is refused",
+                ep.rank, ep.ranks
+            )));
+        }
+        self.reject_expert_slab_dtypes()?;
         if ep.ranks < 2 || ep.rank >= ep.ranks {
             return Err(WeightError::EpPlacement(format!(
                 "rank {} of {} is not an expert-parallel placement",
@@ -1286,9 +1621,9 @@ impl Qwen4Manifest {
             .filter(|entry| is_routed_expert_tensor(&entry.name))
         {
             let experts = entry.logical_shape.first().copied().unwrap_or(0);
-            if experts == 0 || experts % ep.ranks != 0 {
+            if experts < ep.ranks {
                 return Err(WeightError::EpPlacement(format!(
-                    "{}: {experts} routed experts do not divide across {} ranks",
+                    "{}: {experts} routed experts cannot cover {} ranks",
                     entry.name, ep.ranks
                 )));
             }
@@ -1305,6 +1640,125 @@ impl Qwen4Manifest {
         }
         Ok(self)
     }
+
+    /// This manifest declared for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the
+    /// 48 trunk layers' aggregate routed `gate_up`/`down` entries are owned by
+    /// the expert-tier lease instead of the weight store, so they are removed
+    /// (and so leave [`Self::resident_keys`]).  Everything else, the MTP
+    /// head's aggregate experts included, is unchanged.
+    ///
+    /// Only the dense-aggregate Flash-Next declaration qualifies: exactly the
+    /// expected 96 trunk entries (`[512,1280,2560]` MQ4G256V2 gate_up and
+    /// `[512,2560,640]` MQ4G128V2 down, replicated, resident, one pair per
+    /// layer) must be present.  The slab-arena and stock-FP8 recipes, a
+    /// dense FFN, synthetic profiles and expert-parallel shards are refused.
+    pub fn with_expert_tiers(mut self) -> Result<Self, WeightError> {
+        self.check_expert_tiers()?;
+        self.weights
+            .retain(|entry| !is_trunk_routed_expert_entry(entry));
+        Ok(self)
+    }
+
+    /// The validation half of [`Self::with_expert_tiers`], with no mutation:
+    /// `Ok(())` exactly when `with_expert_tiers` would accept this manifest.
+    pub fn check_expert_tiers(&self) -> Result<(), WeightError> {
+        let refuse = |why: &str| WeightError::Config(format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {why}"));
+        if self.expert_keep.is_some() {
+            return Err(refuse("qwen4.expert_keep artifacts do not support expert-hotset/tier placement; use the single-device packed or slab arena route"));
+        }
+        match &self.identity.recipe {
+            Qwen4TierRecipe::FlashNextPacked { .. } => {}
+            Qwen4TierRecipe::FlashNextSlab { .. } => {
+                return Err(refuse(
+                    "the slab-arena recipe already holds its experts in per-layer arenas",
+                ))
+            }
+            Qwen4TierRecipe::StockFp8 => {
+                return Err(refuse(
+                    "the stock-FP8 recipe's qt=55 experts have no tier owner",
+                ))
+            }
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                return Err(refuse("synthetic profiles have no Flash-Next expert tiers"))
+            }
+        }
+        if self.identity.ffn_kind != "moe" {
+            return Err(refuse("the dense FFN declares no routed experts"));
+        }
+        let layers = crate::expert_slabs::TRUNK_LAYERS as usize;
+        let trunk_routed = self
+            .weights
+            .iter()
+            .filter(|entry| is_trunk_routed_expert_entry(entry))
+            .count();
+        if trunk_routed != 2 * layers {
+            return Err(refuse(&format!(
+                "the manifest declares {trunk_routed} trunk routed expert entries, expected {}",
+                2 * layers
+            )));
+        }
+        for layer in 0..layers {
+            for (suffix, shape, dtype) in [
+                (
+                    "gate_up_proj",
+                    crate::expert_slab_aggregate::GATE_UP_SHAPE,
+                    ROUTED_GATE_UP_DTYPE,
+                ),
+                (
+                    "down_proj",
+                    crate::expert_slab_aggregate::DOWN_SHAPE,
+                    ROUTED_DOWN_DTYPE,
+                ),
+            ] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{suffix}");
+                let Some(entry) = self.entry(&name, Some(layer)) else {
+                    return Err(refuse(&format!("the manifest lacks {name}")));
+                };
+                if entry.logical_shape != shape
+                    || entry.dtype != dtype
+                    || entry.policy != ShardPolicy::Replicate
+                    || entry.residency != WeightResidency::Resident
+                {
+                    return Err(refuse(&format!(
+                        "{name} is not the dense aggregate {shape:?} {dtype:?} replicated \
+                         resident entry (expert-parallel, host-mapped or reshaped declarations \
+                         are refused)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A trunk layer's aggregate routed expert entry (`layers.{L}.mlp.experts.*`);
+/// the MTP head's (`mtp.…`, no layer) is not one.
+fn is_trunk_routed_expert_entry(entry: &WeightEntry) -> bool {
+    entry.layer.is_some()
+        && entry.name.starts_with("model.language_model.layers.")
+        && is_routed_expert_tensor(&entry.name)
+}
+
+/// The placement set must be exactly the manifest's resident keys.
+fn check_placement_set(
+    manifest: &Qwen4Manifest,
+    placements: &[Qwen4Placement],
+) -> Result<(), WeightError> {
+    let expected = manifest
+        .resident_keys()
+        .map(|(name, layer)| (name.to_string(), layer))
+        .collect::<BTreeSet<_>>();
+    let provided = placements
+        .iter()
+        .map(|placement| (placement.name.clone(), placement.layer))
+        .collect::<BTreeSet<_>>();
+    if expected != provided {
+        return Err(WeightError::PlacementSetMismatch {
+            expected: expected.len(),
+            actual: provided.len(),
+        });
+    }
+    Ok(())
 }
 
 fn mtp_entry(
@@ -1586,8 +2040,9 @@ where
             let experts = positive("num_experts", *num_experts)?;
             let intermediate = positive("moe intermediate_size", *intermediate_size)?;
             let gate_up_rows = checked_product("routed gate_up rows", 2, intermediate)?;
-            checked_product("routed gate_up elements", gate_up_rows, hidden)
-                .and_then(|per_expert| checked_product("routed expert elements", per_expert, experts))?;
+            checked_product("routed gate_up elements", gate_up_rows, hidden).and_then(
+                |per_expert| checked_product("routed expert elements", per_expert, experts),
+            )?;
             weights.push(layer(
                 &format!("{mlp}.experts.down_proj"),
                 layer_idx,
@@ -1657,8 +2112,9 @@ where
 /// the Flash-Next values are that config's canonical instance, not constants
 /// here.  `packed` is the Flash-Next recipe: it ships Q8F16 rows and still
 /// admits BF16 ones.  `synthetic_packed` ships exactly the one tier the row
-/// width allows ([`synthetic_packed_ple_row_dtype`]); any other synthetic recipe
-/// ships and admits BF16 rows only.
+/// width allows ([`synthetic_packed_ple_row_dtype`]); `stock_fp8` ships and
+/// admits qt=56 `FP8E4M3PT` rows only; any other synthetic recipe ships and
+/// admits BF16 rows only.
 fn push_ple_entries<F>(
     weights: &mut Vec<WeightEntry>,
     layer: &F,
@@ -1669,6 +2125,7 @@ fn push_ple_entries<F>(
     config: &Qwen4PleConfig,
     packed: bool,
     synthetic_packed: bool,
+    stock_fp8: bool,
     bf16: &DTypeConstraint,
 ) where
     F: Fn(&str, usize, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
@@ -1726,7 +2183,13 @@ fn push_ple_entries<F>(
     // sealed artifact written before the Q8F16 tier carries BF16 rows and must
     // stay loadable, so both tiers are admitted and the reader derives its page
     // and read geometry from whichever one the shard declares.
-    let (ple_rows, row_dtype, encoding) = if packed {
+    let (ple_rows, row_dtype, encoding) = if stock_fp8 {
+        (
+            DTypeConstraint::source_exact(DType::FP8E4M3PT),
+            DType::FP8E4M3PT,
+            RowEncoding::Fp8PerTensor,
+        )
+    } else if packed {
         (
             DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]),
             DType::Q8_0,
@@ -1828,6 +2291,10 @@ pub struct PleWeights {
 pub struct MoeWeights {
     pub experts_down: TensorRef,
     pub experts_gate_up: TensorRef,
+    /// `Some` on a `FlashNextSlab` trunk layer: the one raw arena holding all
+    /// 512 experts (per-expert format and offsets live in the recipe's plan).
+    /// `experts_gate_up` / `experts_down` then name no fulfilled tensor.
+    pub expert_arena: Option<TensorRef>,
     /// The pinned checkpoint carries one stacked gate/up source.  Gate and up
     /// remain distinct logical projection slices in the sealed runtime plan;
     /// do not rewrite the artifact merely to spell them as separate sources.
@@ -1927,6 +2394,142 @@ impl Qwen4EpPlacement {
     pub fn local_index(self, expert: usize) -> usize {
         expert / self.ranks
     }
+
+    /// Number of routed experts this rank owns out of `experts`
+    /// (`e % ranks == rank`): the low ranks hold one more when the split is
+    /// uneven (512 over 6 ranks = 86/86/85/85/85/85).
+    pub fn local_count(self, experts: usize) -> usize {
+        (experts + self.ranks - 1 - self.rank) / self.ranks
+    }
+
+    /// The largest per-rank expert count (rank 0's): the count a layer must
+    /// budget on every rank so it is resident on all ranks or none.
+    pub fn max_local_count(self, experts: usize) -> usize {
+        experts.div_ceil(self.ranks)
+    }
+}
+
+/// Device view of one resident stacked qt=55 `FP8E4M3B128` routed-expert
+/// matrix `[experts, rows, k]` (the stock-FP8 recipe's gate_up `[512, 1280,
+/// 2560]` — rows 0..640 gate_proj, 640..1280 up_proj — and down `[512, 2560,
+/// 640]`).  Expert `e`'s block starts at `base + e * stride`
+/// (`stride = S(R, K) = round_up(R*K + 2*ceil(R/128)*ceil(K/128), 256)`,
+/// [`rdna_compute::fp8_e4m3::b128_block_stride`]): its OCP e4m3fn codes
+/// `u8[R*K]` row-major at `+0`, its BF16 `s_inv` grid
+/// `[ceil(R/128) * ceil(K/128)]` row-major at `+R*K`.  Addresses are device
+/// pointers as `usize` (the `MoePointerEntries` convention).  Built only from
+/// a fully resident (not host-mapped), 256-byte-aligned buffer that holds
+/// every block, so every derived pointer is in bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp8B128ExpertTable {
+    /// Device address of expert 0's block (its codes).
+    pub base: usize,
+    pub experts: usize,
+    /// Rows `R` of one expert's matrix (output features).
+    pub rows: usize,
+    /// Reduction width `K` of one row.
+    pub k: usize,
+    /// Expert block stride `S(R, K)` in bytes.
+    pub stride: usize,
+}
+
+impl Fp8B128ExpertTable {
+    /// Validate `tensor` (the resident handle of manifest entry `name`) as a
+    /// stacked qt=55 table and describe it.
+    pub fn from_tensor(name: &str, tensor: &GpuTensor) -> Result<Self, WeightError> {
+        let refuse = |reason: String| {
+            WeightError::DescriptorMismatch(format!("{name}: FP8E4M3B128 expert table: {reason}"))
+        };
+        if tensor.dtype != DType::FP8E4M3B128 {
+            return Err(refuse(format!("resident dtype is {:?}", tensor.dtype)));
+        }
+        let [experts, rows, k] = tensor.shape[..] else {
+            return Err(refuse(format!(
+                "shape {:?} is not [experts, rows, K]",
+                tensor.shape
+            )));
+        };
+        if experts == 0 || rows == 0 || k == 0 {
+            return Err(refuse(format!(
+                "shape {:?} has a zero dimension",
+                tensor.shape
+            )));
+        }
+        let stride = rdna_compute::fp8_e4m3::b128_block_stride(rows, k)
+            .ok_or_else(|| refuse("block stride overflows".to_string()))?;
+        let bytes = rdna_compute::fp8_e4m3::b128_tensor_bytes(experts, rows, k)
+            .ok_or_else(|| refuse("payload size overflows".to_string()))?;
+        if tensor.buf.size() < bytes {
+            return Err(refuse(format!(
+                "buffer holds {} bytes, {experts} blocks of {stride} need {bytes}",
+                tensor.buf.size()
+            )));
+        }
+        if tensor.buf.is_host_mapped() {
+            return Err(refuse(
+                "it is host-mapped; the stock-FP8 recipe requires every routed expert fully \
+                 resident in device memory (P1)"
+                    .to_string(),
+            ));
+        }
+        let base = tensor.buf.as_ptr() as usize;
+        if base % rdna_compute::fp8_e4m3::B128_ALIGN != 0 {
+            return Err(refuse(format!(
+                "base 0x{base:x} is not {}-byte aligned",
+                rdna_compute::fp8_e4m3::B128_ALIGN
+            )));
+        }
+        Ok(Self {
+            base,
+            experts,
+            rows,
+            k,
+            stride,
+        })
+    }
+
+    /// Device address of expert `expert`'s block — its codes (`base + e*S`);
+    /// `None` past the last expert.
+    pub fn block_ptr(&self, expert: usize) -> Option<usize> {
+        (expert < self.experts).then(|| self.base + expert * self.stride)
+    }
+
+    /// Device address of expert `expert`'s codes (same as [`Self::block_ptr`]).
+    pub fn codes_ptr(&self, expert: usize) -> Option<usize> {
+        self.block_ptr(expert)
+    }
+
+    /// Device address of expert `expert`'s BF16 `s_inv` grid (`block + R*K`).
+    pub fn scales_ptr(&self, expert: usize) -> Option<usize> {
+        Some(self.block_ptr(expert)? + self.scales_offset())
+    }
+
+    /// Byte offset of the scale grid inside one block (`R * K`).
+    pub fn scales_offset(&self) -> usize {
+        self.rows * self.k
+    }
+
+    /// `(ceil(R/128), ceil(K/128))`: the row-major `s_inv` grid of one block.
+    pub fn scale_grid(&self) -> (usize, usize) {
+        rdna_compute::fp8_e4m3::b128_scale_dims(self.rows, self.k)
+    }
+
+    /// Every expert's block address in expert order: the per-expert pointer
+    /// table a grouped launch uploads (codes at `+0`, scales at `+R*K`).
+    pub fn block_entries(&self) -> Vec<usize> {
+        (0..self.experts)
+            .map(|expert| self.base + expert * self.stride)
+            .collect()
+    }
+}
+
+/// The two qt=55 routed-expert tables of one MoE layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp8MoeExpertTables {
+    /// `[E, 2*intermediate, hidden]`: gate rows first, then up rows.
+    pub gate_up: Fp8B128ExpertTable,
+    /// `[E, hidden, intermediate]`.
+    pub down: Fp8B128ExpertTable,
 }
 
 /// Published resident ownership.  External PLE descriptors remain in the
@@ -1938,13 +2541,20 @@ pub struct Qwen4Weights {
     /// and a linear scan over every taken weight cost ~3 ms per decode token.
     taken_by_name: HashMap<String, Vec<usize>>,
     pub root: Qwen4RootWeights,
+    /// Compact owned layers in absolute order; use [`Self::layer`] for an
+    /// absolute layer ID instead of indexing this vector.
     pub layer_refs: Vec<Qwen4LayerWeights>,
-    /// `Some` iff `config.mtp` is declared.
+    /// `Some` iff native MTP is declared and this scope owns the output.
     pub mtp: Option<Qwen4MtpWeights>,
     /// `Some` iff the routed experts were uploaded expert-sharded for one
-    /// rank of an expert-parallel mesh (compact tensors of `512 / ranks`
+    /// rank of an expert-parallel mesh (compact tensors of `local_count(512)`
     /// experts); `None` on the single-device route.
     ep: Option<Qwen4EpPlacement>,
+    pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    scope: Qwen4BandScope,
+    device: usize,
+    /// `Some((rank, parts))` once [`Self::shard_dense_ffn`] kept that slice.
+    tp_shard: Option<(usize, usize)>,
 }
 
 impl Qwen4Weights {
@@ -1962,25 +2572,102 @@ impl Qwen4Weights {
         config: &Qwen4Config,
         recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
     ) -> Result<Self, WeightError> {
-        let manifest = assembly_manifest(config, recipe)?;
-        let expected = manifest
-            .resident_keys()
-            .map(|(name, layer)| (name.to_string(), layer))
-            .collect::<BTreeSet<_>>();
-        let provided = placements
-            .iter()
-            .map(|placement| (placement.name.clone(), placement.layer))
-            .collect::<BTreeSet<_>>();
-        if expected != provided {
-            return Err(WeightError::PlacementSetMismatch {
-                expected: expected.len(),
-                actual: provided.len(),
-            });
+        Self::assemble_impl(tx, config, recipe, placements, scope, None)
+    }
+
+    /// [`Self::assemble`] for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the trunk
+    /// layers' aggregate routed experts are owned by `lease`, not the
+    /// transaction, so the manifest is [`Qwen4Manifest::with_expert_tiers`]
+    /// and `placements` must cover exactly its remaining resident keys.  The
+    /// lease is retained by the returned weights ([`Self::expert_tiers`]).
+    pub fn assemble_with_expert_tiers(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
+        lease: crate::expert_tier_owners::ExpertTierLease,
+    ) -> Result<Self, WeightError> {
+        Self::assemble_impl(tx, config, recipe, placements, scope, Some(lease))
+    }
+
+    fn assemble_impl(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    ) -> Result<Self, WeightError> {
+        let mut manifest = assembly_manifest(config, recipe)?;
+        if expert_tiers.is_some() {
+            manifest = manifest.with_expert_tiers()?;
         }
-        let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
+        let placements = if *scope == Qwen4BandScope::single(config) {
+            Cow::Borrowed(placements)
+        } else {
+            Cow::Owned(
+                placements
+                    .iter()
+                    .filter(|placement| {
+                        manifest
+                            .entry(&placement.name, placement.layer)
+                            .is_none_or(|entry| scope.owns_entry(entry))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let manifest = manifest.with_band_scope(config, scope)?;
+        check_placement_set(&manifest, &placements)?;
+        let device = placements.first().map_or(0, |placement| placement.device);
+        if placements
+            .iter()
+            .any(|placement| placement.device != device)
+        {
+            return Err(WeightError::Config(
+                "Qwen4 band assembly requires one owning device".to_string(),
+            ));
+        }
+        let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, device))?;
+        if ep.is_some() && *scope != Qwen4BandScope::single(config) {
+            return Err(WeightError::EpPlacement(
+                "Qwen4 pipeline bands cannot be combined with expert parallelism".to_string(),
+            ));
+        }
+        if recipe.is_stock_fp8() {
+            // Checked before anything is taken, so a refusal leaves every
+            // handle with the transaction for its normal rollback.
+            if let Some(ep) = ep {
+                return Err(WeightError::EpPlacement(format!(
+                    "the stock-FP8 recipe loads every routed expert on one device (P1); \
+                     expert-parallel rank {} of {} is refused",
+                    ep.rank, ep.ranks
+                )));
+            }
+            for entry in manifest
+                .weights
+                .iter()
+                .filter(|entry| is_routed_expert_tensor(&entry.name))
+            {
+                match tx.get(&entry.name, entry.layer, device) {
+                    Some(WeightHandle::Resident(tensor)) => {
+                        Fp8B128ExpertTable::from_tensor(&entry.name, tensor)?;
+                    }
+                    _ => {
+                        return Err(WeightError::MissingResident {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device,
+                        })
+                    }
+                }
+            }
+        }
         let mut assembly = tx.begin_assembly();
-        for placement in placements {
+        for placement in placements.iter() {
             if assembly
                 .take(&placement.name, placement.layer, placement.device)
                 .is_none()
@@ -1992,7 +2679,50 @@ impl Qwen4Weights {
                 });
             }
         }
-        let taken = assembly.commit().finalize();
+        let assembly = assembly.commit();
+        let mut root = build_root_refs(config)?;
+        if !scope.input && scope.output && config.mtp.is_some() {
+            root.embedding.name = "mtp.embed_tokens.weight".to_string();
+        }
+        let mut layer_refs = if *scope == Qwen4BandScope::single(config) {
+            build_layer_refs(config)?
+        } else {
+            build_layer_refs_scoped(config, scope)?
+        };
+        if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = recipe {
+            for layer in &mut layer_refs {
+                let Qwen4FfnWeights::Moe(moe) = &mut layer.ffn else {
+                    continue;
+                };
+                let plan = arenas.layer(layer.layer).ok_or_else(|| {
+                    WeightError::DescriptorMismatch(format!(
+                        "expert arena plan has no layer {}",
+                        layer.layer
+                    ))
+                })?;
+                let prefix = moe
+                    .experts_gate_up
+                    .name
+                    .strip_suffix(".mlp.experts.gate_up_proj")
+                    .ok_or_else(|| {
+                        WeightError::DescriptorMismatch(moe.experts_gate_up.name.clone())
+                    })?;
+                moe.expert_arena = Some(TensorRef::new(
+                    format!("{prefix}{}", crate::expert_arena::ARENA_SUFFIX),
+                    TensorRole::RoutedArena,
+                    Some(layer.layer),
+                    vec![plan.bytes],
+                    DType::Raw,
+                )?);
+            }
+        }
+        let mtp = config
+            .mtp
+            .as_ref()
+            .filter(|_| scope.output)
+            .map(|_| build_mtp_refs(config))
+            .transpose()?;
+        let taken = assembly.finalize();
         let mut taken_by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (slot, weight) in taken.iter().enumerate() {
             taken_by_name
@@ -2000,13 +2730,6 @@ impl Qwen4Weights {
                 .or_default()
                 .push(slot);
         }
-        let root = build_root_refs(config)?;
-        let layer_refs = build_layer_refs(config)?;
-        let mtp = config
-            .mtp
-            .is_some()
-            .then(|| build_mtp_refs(config))
-            .transpose()?;
         Ok(Self {
             manifest,
             taken,
@@ -2015,7 +2738,46 @@ impl Qwen4Weights {
             layer_refs,
             mtp,
             ep,
+            expert_tiers,
+            scope: scope.clone(),
+            device,
+            tp_shard: None,
         })
+    }
+
+    /// Absolute half-open trunk interval owned by this rank.
+    pub fn owned_layers(&self) -> Range<usize> {
+        self.scope.band.clone()
+    }
+
+    /// The validated endpoint and trunk ownership used during assembly.
+    pub fn band_scope(&self) -> &Qwen4BandScope {
+        &self.scope
+    }
+
+    /// `(rank, parts)` of the dense FFN slice these weights hold, `None` when
+    /// unsharded.
+    pub fn tp_shard(&self) -> Option<(usize, usize)> {
+        self.tp_shard
+    }
+
+    /// Resolve an absolute layer ID to its compact rank-local reference.
+    pub fn layer(&self, absolute: usize) -> Option<&Qwen4LayerWeights> {
+        let local = absolute.checked_sub(self.scope.band.start)?;
+        self.layer_refs
+            .get(local)
+            .filter(|layer| layer.layer == absolute)
+    }
+
+    pub fn expert_tiers(&self) -> Option<&crate::expert_tier_owners::ExpertTierLease> {
+        self.expert_tiers.as_ref()
+    }
+
+    pub fn expert_tier_layer(
+        &self,
+        layer: usize,
+    ) -> Option<crate::expert_tier_owners::LayerExpertTierView<'_>> {
+        self.expert_tiers.as_ref()?.layer(layer)
     }
 
     /// The expert-parallel placement these weights were assembled for, or
@@ -2026,11 +2788,11 @@ impl Qwen4Weights {
 
     /// Resolve one immutable typed reference to its resident GPU buffer.
     ///
-    /// Qwen4 is currently admitted only on the Single route, so device zero is
-    /// the sole logical placement.  Tied weights are followed by their
-    /// canonical source name and never trigger I/O or allocation.
+    /// Resolve only on the assembled band's owning logical device. Local ties
+    /// follow their source; separately materialized endpoint ties resolve their
+    /// own handle. Neither path performs I/O or allocation.
     pub fn resident(&self, reference: &TensorRef) -> Result<&GpuTensor, WeightError> {
-        self.resident_named(&reference.name, reference.layer, 0, 0)
+        self.resident_named(&reference.name, reference.layer, self.device, 0)
     }
 
     fn resident_named(
@@ -2068,6 +2830,26 @@ impl Qwen4Weights {
         }
     }
 
+    /// The resident qt=55 table behind a routed-expert reference
+    /// (`MoeWeights::experts_gate_up` / `experts_down`) of a stock-FP8 load.
+    pub fn fp8_expert_table(
+        &self,
+        reference: &TensorRef,
+    ) -> Result<Fp8B128ExpertTable, WeightError> {
+        Fp8B128ExpertTable::from_tensor(&reference.name, self.resident(reference)?)
+    }
+
+    /// Both qt=55 tables of one MoE layer of a stock-FP8 load.
+    pub fn fp8_moe_expert_tables(
+        &self,
+        moe: &MoeWeights,
+    ) -> Result<Fp8MoeExpertTables, WeightError> {
+        Ok(Fp8MoeExpertTables {
+            gate_up: self.fp8_expert_table(&moe.experts_gate_up)?,
+            down: self.fp8_expert_table(&moe.experts_down)?,
+        })
+    }
+
     pub fn external_descriptor<'a>(
         tx: &'a WeightLoadTransaction,
         placement: &Qwen4Placement,
@@ -2079,17 +2861,7 @@ impl Qwen4Weights {
     /// transaction.  The attached transaction census is drained separately,
     /// after readers and these resident handles are gone.
     pub fn free_gpu(self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
-        let mut first = None;
-        for taken in self.taken {
-            if let WeightHandle::Resident(tensor) = taken.handle {
-                if let Err(error) = gpu.free_tensor(tensor) {
-                    if first.is_none() {
-                        first = Some(error);
-                    }
-                }
-            }
-        }
-        first.map_or(Ok(()), Err)
+        free_taken_handles(self.taken, |tensor| gpu.free_tensor(tensor))
     }
 
     /// Load-time precision experiments: `HIPFIRE_QWEN4_REQUANT="pat=fmt;..."`
@@ -2138,7 +2910,7 @@ impl Qwen4Weights {
             let [m, k] = taken.projection.logical_shape[..] else {
                 continue;
             };
-            let copy = if let Some(dir) = dir {
+            let replacement = if let Some(dir) = dir {
                 // A matching tensor without a file keeps its payload (the
                 // MTP attention shares the trunk's names).
                 let path = dir.join(format!("{}.bin", taken.key.name));
@@ -2154,19 +2926,20 @@ impl Qwen4Weights {
                         bytes.len()
                     ));
                 }
-                upload_qt44(gpu, &bytes)?
+                Replacement::Qt44(Cow::Owned(bytes))
             } else {
                 if tensor.dtype == target {
                     continue;
                 }
-                if target == DType::Q8_0 {
+                let produced = if target == DType::Q8_0 {
                     gpu.quantize_bf16_q8_0(tensor, m, k)
                 } else {
                     gpu.requant_g256(tensor, m, k, target)
                 }
-                .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?
+                .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?;
+                Replacement::Tensor(produced)
             };
-            let (old_bytes, new_bytes) = swap_resident(gpu, taken, copy)?;
+            let (old_bytes, new_bytes) = replace_resident(gpu, taken, replacement)?;
             count += 1;
             before += old_bytes;
             after += new_bytes;
@@ -2231,8 +3004,11 @@ impl Qwen4Weights {
         }
         let (mut before, mut after) = (0usize, 0usize);
         for (payload, &slot) in payloads.iter().zip(&slots) {
-            let copy = upload_qt44(gpu, &payload.bytes)?;
-            let (old_bytes, new_bytes) = swap_resident(gpu, &mut self.taken[slot], copy)?;
+            let (old_bytes, new_bytes) = replace_resident(
+                gpu,
+                &mut self.taken[slot],
+                Replacement::Qt44(Cow::Borrowed(&payload.bytes[..])),
+            )?;
             before += old_bytes;
             after += new_bytes;
         }
@@ -2241,6 +3017,106 @@ impl Qwen4Weights {
             before_bytes: before,
             after_bytes: after,
         }))
+    }
+
+    /// Keep only TP rank `rank` of `parts` of every dense FFN layer: gate/up
+    /// rows and down columns along the intermediate, as their manifest
+    /// policies (`ColumnShard { axis: 0 }`, `RowShard { axis: 1 }`) declare,
+    /// so the forward runs each layer at `intermediate / parts` and writes
+    /// this rank's partial sum. Every other weight stays whole (replicated).
+    /// The dense FFN is source-exact BF16 (unpacked), so a slice is plain
+    /// bytes. Run after any load-time replacement (requant, trunk overlay:
+    /// they read the source projection shape) and before the first forward
+    /// (the Gpu keys its lazy F16 weight shadows on the device pointer).
+    pub fn shard_dense_ffn(
+        &mut self,
+        gpu: &mut Gpu,
+        rank: usize,
+        parts: usize,
+    ) -> Result<(), String> {
+        if parts < 2 || rank >= parts || self.tp_shard.is_some() {
+            return Err(format!(
+                "TP rank {rank} of {parts} parts: needs two or more parts, a rank inside them \
+                 and unsharded weights (already {:?})",
+                self.tp_shard
+            ));
+        }
+        for index in 0..self.layer_refs.len() {
+            let Qwen4FfnWeights::Dense(dense) = &self.layer_refs[index].ffn else {
+                continue;
+            };
+            let mut shards = Vec::with_capacity(3);
+            for reference in [&dense.gate, &dense.up, &dense.down] {
+                let context = &reference.name;
+                let policy = &self
+                    .manifest
+                    .entry(&reference.name, reference.layer)
+                    .ok_or_else(|| format!("{context}: no manifest entry"))?
+                    .policy;
+                let tensor = self.resident(reference).map_err(|e| e.to_string())?;
+                let [rows, cols] = reference.shape[..] else {
+                    return Err(format!(
+                        "{context}: shape {:?} is not a matrix",
+                        reference.shape
+                    ));
+                };
+                if tensor.dtype != DType::BF16 {
+                    return Err(format!("{context}: {:?} is not BF16", tensor.dtype));
+                }
+                let split = match policy {
+                    ShardPolicy::ColumnShard { axis: 0 } => rows,
+                    ShardPolicy::RowShard { axis: 1 } => cols,
+                    other => {
+                        return Err(format!("{context}: policy {other:?} is not an FFN split"))
+                    }
+                };
+                if split % parts != 0 {
+                    return Err(format!(
+                        "{context}: intermediate {split} is not divisible by {parts}"
+                    ));
+                }
+                let (start, end) = (rank * split / parts, (rank + 1) * split / parts);
+                let bytes = gpu.download_raw_bytes(tensor).map_err(|e| e.to_string())?;
+                let (bytes, shape) = if split == rows {
+                    let rows_bytes =
+                        hipfire_runtime::tp_shard::slice_uniform_rows(&bytes, rows, start, end)?;
+                    (rows_bytes, vec![end - start, cols])
+                } else {
+                    let cols_bytes = hipfire_runtime::tp_shard::slice_uniform_group_cols(
+                        &bytes, rows, cols, start, end, 1,
+                    )?;
+                    (cols_bytes, vec![rows, end - start])
+                };
+                let slot = self
+                    .taken_by_name
+                    .get(&reference.name)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&slot| {
+                        let key = &self.taken[slot].key;
+                        key.layer == reference.layer && key.device == self.device
+                    })
+                    .ok_or_else(|| format!("{context}: no resident handle"))?;
+                shards.push((slot, bytes, shape));
+            }
+            // Every slice of the layer is checked before any is installed.
+            for (slot, bytes, shape) in &shards {
+                let mut tensor = gpu.upload_raw(bytes, shape).map_err(|e| e.to_string())?;
+                tensor.dtype = DType::BF16;
+                replace_resident(gpu, &mut self.taken[*slot], Replacement::Tensor(tensor))?;
+            }
+            if let Qwen4FfnWeights::Dense(dense) = &mut self.layer_refs[index].ffn {
+                for (reference, (_, _, shape)) in [&mut dense.gate, &mut dense.up, &mut dense.down]
+                    .into_iter()
+                    .zip(shards)
+                {
+                    reference.shape = shape;
+                }
+            }
+        }
+        self.tp_shard = Some((rank, parts));
+        Ok(())
     }
 }
 
@@ -2265,26 +3141,157 @@ fn qt44_matrix_bytes(m: usize, k: usize) -> Option<usize> {
     (k % 256 == 0).then(|| m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES)
 }
 
-/// Upload pre-encoded QT44 bytes as a resident tensor (dtype `MQ4G256V2`).
-/// The one upload path of `HIPFIRE_QWEN4_REQUANT`'s `qt44:` rule and of the
-/// trunk overlay.
-fn upload_qt44(gpu: &mut Gpu, bytes: &[u8]) -> Result<GpuTensor, String> {
-    let mut copy = gpu
-        .upload_raw(bytes, &[bytes.len()])
-        .map_err(|error| error.to_string())?;
-    copy.dtype = DType::MQ4G256V2;
-    Ok(copy)
+/// Release every finalized handle through `free`, one owner each. A true
+/// `Borrowed` resident is a view into an arena root that the transaction's
+/// store owns (and releases last, once): it owns no bytes, so it is skipped
+/// and never reaches the owner free path. Owned handles free normally; the
+/// first error is reported after every handle was attempted.
+fn free_taken_handles(
+    taken: Vec<TakenWeight>,
+    mut free: impl FnMut(GpuTensor) -> hip_bridge::HipResult<()>,
+) -> hip_bridge::HipResult<()> {
+    let mut first = None;
+    for taken in taken {
+        if let WeightHandle::Resident(tensor) = taken.handle {
+            if tensor.buf.is_borrowed() {
+                continue;
+            }
+            if let Err(error) = free(tensor) {
+                if first.is_none() {
+                    first = Some(error);
+                }
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
-/// Install `copy` as `taken`'s resident tensor and free the old one; returns
-/// the old and new device bytes.
-fn swap_resident(
+/// What replaces a resident weight in `HIPFIRE_QWEN4_REQUANT` / a trunk
+/// overlay: a kernel-produced tensor, or pre-encoded QT44 bytes (dtype
+/// `MQ4G256V2`, shape `[len]`).
+enum Replacement<'a> {
+    Tensor(GpuTensor),
+    Qt44(Cow<'a, [u8]>),
+}
+
+/// The device/owner operations of a replacement. [`GpuReplace`] is the only
+/// production implementation; CPU tests substitute a recording fake.
+trait ReplaceOps {
+    /// Prepare an arena-registered weight for an in-place rewrite of its span:
+    /// the Gpu quiesces the device exactly once (even with no cached shadow, a
+    /// direct reader may be in flight), drops the source's cached shadow view
+    /// without freeing any root or binding, and clears value-dependent weight
+    /// metadata, so a stable pointer carrying new bytes/dtype cannot stale-hit.
+    /// An error means nothing may be written.
+    fn invalidate_arena_source(&mut self, ptr: usize) -> Result<bool, String>;
+    /// Upload host bytes to the start of `dst`.
+    fn write_host(&mut self, dst: &hip_bridge::DeviceBuffer, bytes: &[u8]) -> Result<(), String>;
+    /// Copy `bytes` device bytes from the start of `src` to the start of `dst`.
+    fn copy_device(
+        &mut self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &hip_bridge::DeviceBuffer,
+        bytes: usize,
+    ) -> Result<(), String>;
+    /// Free an owned tensor.
+    fn free(&mut self, tensor: GpuTensor) -> Result<(), String>;
+    /// Upload pre-encoded QT44 bytes as an owned resident tensor.
+    fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String>;
+}
+
+struct GpuReplace<'g>(&'g mut Gpu);
+
+impl ReplaceOps for GpuReplace<'_> {
+    fn invalidate_arena_source(&mut self, ptr: usize) -> Result<bool, String> {
+        self.0
+            .invalidate_arena_weight_source(ptr)
+            .map_err(|error| error.to_string())
+    }
+
+    fn write_host(&mut self, dst: &hip_bridge::DeviceBuffer, bytes: &[u8]) -> Result<(), String> {
+        self.0
+            .hip
+            .memcpy_htod_offset(dst, 0, bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn copy_device(
+        &mut self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &hip_bridge::DeviceBuffer,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.0
+            .hip
+            .memcpy_dtod_at(dst, 0, src, 0, bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn free(&mut self, tensor: GpuTensor) -> Result<(), String> {
+        self.0
+            .free_tensor(tensor)
+            .map_err(|error| error.to_string())
+    }
+
+    fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+        let mut copy = self
+            .0
+            .upload_raw(bytes, &[bytes.len()])
+            .map_err(|error| error.to_string())?;
+        copy.dtype = DType::MQ4G256V2;
+        Ok(copy)
+    }
+}
+
+fn replace_resident(
     gpu: &mut Gpu,
     taken: &mut TakenWeight,
-    copy: GpuTensor,
+    replacement: Replacement<'_>,
 ) -> Result<(usize, usize), String> {
+    replace_resident_with(&mut GpuReplace(gpu), taken, replacement)
+}
+
+/// Install `replacement` as `taken`'s resident weight and return the old and
+/// new device bytes.
+///
+/// An owned resident is swapped for the replacement and the old tensor is
+/// freed (the pre-arena behavior, unchanged). A true `Borrowed` resident is a
+/// planned arena span: the replacement payload is written INTO that span (no
+/// new permanent owner, the pointer the shadow arena bound stays valid), the
+/// handle's dtype/shape are retagged, and any temporary owner is freed. A
+/// replacement larger than the planned span is refused loudly.
+fn replace_resident_with(
+    ops: &mut dyn ReplaceOps,
+    taken: &mut TakenWeight,
+    replacement: Replacement<'_>,
+) -> Result<(usize, usize), String> {
+    let arena_backed = match &taken.handle {
+        WeightHandle::Resident(old) => old.buf.is_borrowed(),
+        WeightHandle::Alias(_) => {
+            if let Replacement::Tensor(copy) = replacement {
+                let _ = ops.free(copy);
+            }
+            return Err(format!("{}: weight is not resident", taken.key.name));
+        }
+    };
+    if arena_backed {
+        replace_in_arena_span(ops, taken, replacement)
+    } else {
+        replace_owned(ops, taken, replacement)
+    }
+}
+
+fn replace_owned(
+    ops: &mut dyn ReplaceOps,
+    taken: &mut TakenWeight,
+    replacement: Replacement<'_>,
+) -> Result<(usize, usize), String> {
+    let copy = match replacement {
+        Replacement::Tensor(copy) => copy,
+        Replacement::Qt44(bytes) => ops.upload_qt44(&bytes)?,
+    };
     let WeightHandle::Resident(old) = &taken.handle else {
-        let _ = gpu.free_tensor(copy);
+        let _ = ops.free(copy);
         return Err(format!("{}: weight is not resident", taken.key.name));
     };
     let sizes = (old.buf.size(), copy.buf.size());
@@ -2293,8 +3300,118 @@ fn swap_resident(
     else {
         unreachable!()
     };
-    gpu.free_tensor(old).map_err(|error| error.to_string())?;
+    ops.free(old)?;
     Ok(sizes)
+}
+
+/// Exact byte extent of an `[m, k]` replacement of `dtype`: the Q8_0 rows or
+/// the `MQ{2..6}G256V2` groups (`8 + 32*bits` bytes per 256 values) the
+/// requant kernels emit; `None` for any other dtype, a `k` that is not whole
+/// groups, or overflow.
+fn replacement_payload_bytes(dtype: DType, m: usize, k: usize) -> Option<usize> {
+    let group_bytes = match dtype {
+        DType::Q8_0 => return dtype.row_bytes(k).and_then(|row| row.checked_mul(m)),
+        DType::MQ2G256V2 => rdna_compute::MQ2G256V2_GROUP_BYTES,
+        DType::MQ3G256V2 => rdna_compute::MQ3G256V2_GROUP_BYTES,
+        DType::MQ4G256V2 => rdna_compute::MQ4V2_GROUP_BYTES,
+        DType::MQ5G256V2 => rdna_compute::MQ5G256V2_GROUP_BYTES,
+        DType::MQ6G256V2 => rdna_compute::MQ6G256V2_GROUP_BYTES,
+        _ => return None,
+    };
+    (k != 0 && k % 256 == 0)
+        .then(|| m.checked_mul(k / 256)?.checked_mul(group_bytes))
+        .flatten()
+}
+
+/// The retagged view of an arena span that now holds a replacement payload:
+/// SAME pointer and span capacity as `old`, new dtype/shape. Refuses a payload
+/// larger than the span.
+fn arena_replacement_view(
+    old: &GpuTensor,
+    payload_bytes: usize,
+    shape: &[usize],
+    dtype: DType,
+) -> Result<GpuTensor, String> {
+    if !old.buf.is_borrowed() {
+        return Err("arena replacement needs a borrowed arena view".to_string());
+    }
+    if payload_bytes > old.buf.size() {
+        return Err(format!(
+            "replacement payload of {payload_bytes} bytes exceeds the planned arena span of {} bytes; \
+             an arena view cannot grow",
+            old.buf.size()
+        ));
+    }
+    Ok(GpuTensor {
+        buf: old.buf.byte_view(0, old.buf.size()),
+        shape: shape.to_vec(),
+        dtype,
+    })
+}
+
+/// Write a kernel-produced `copy` into the span `old` views.
+fn write_tensor_into_span(
+    ops: &mut dyn ReplaceOps,
+    old: &GpuTensor,
+    copy: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> Result<(GpuTensor, usize), String> {
+    let payload = replacement_payload_bytes(copy.dtype, m, k)
+        .filter(|&bytes| bytes <= copy.buf.size())
+        .ok_or_else(|| {
+            format!(
+                "{:?} replacement of [{m}, {k}] has no exact payload extent within its {}-byte buffer",
+                copy.dtype,
+                copy.buf.size()
+            )
+        })?;
+    let view = arena_replacement_view(old, payload, &copy.shape, copy.dtype)?;
+    // One fence: the Gpu quiesces (even with no cached shadow), drops the
+    // cached shadow view and value-dependent metadata, THEN we overwrite. A
+    // failed fence writes nothing.
+    ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+    ops.copy_device(&old.buf, &copy.buf, payload)?;
+    Ok((view, payload))
+}
+
+fn replace_in_arena_span(
+    ops: &mut dyn ReplaceOps,
+    taken: &mut TakenWeight,
+    replacement: Replacement<'_>,
+) -> Result<(usize, usize), String> {
+    let WeightHandle::Resident(old) = &taken.handle else {
+        unreachable!("caller proved the handle is a borrowed resident")
+    };
+    let (view, before, after, temp) = match replacement {
+        Replacement::Qt44(bytes) => {
+            let view = arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::MQ4G256V2)?;
+            ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+            ops.write_host(&old.buf, &bytes)?;
+            (view, old.buf.size(), bytes.len(), None)
+        }
+        Replacement::Tensor(copy) => {
+            let [m, k] = taken.projection.logical_shape[..] else {
+                let _ = ops.free(copy);
+                return Err(format!(
+                    "{}: replacement needs a rank-2 weight, got {:?}",
+                    taken.key.name, taken.projection.logical_shape
+                ));
+            };
+            match write_tensor_into_span(ops, old, &copy, m, k) {
+                Ok((view, payload)) => (view, old.buf.size(), payload, Some(copy)),
+                Err(error) => {
+                    let _ = ops.free(copy);
+                    return Err(error);
+                }
+            }
+        }
+    };
+    taken.handle = WeightHandle::Resident(view);
+    if let Some(copy) = temp {
+        ops.free(copy)?;
+    }
+    Ok((before, after))
 }
 
 fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError> {
@@ -2384,6 +3501,14 @@ fn build_hyper_refs(
 }
 
 fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, WeightError> {
+    build_layer_refs_scoped(config, &Qwen4BandScope::single(config))
+}
+
+fn build_layer_refs_scoped(
+    config: &Qwen4Config,
+    scope: &Qwen4BandScope,
+) -> Result<Vec<Qwen4LayerWeights>, WeightError> {
+    scope.validate(config).map_err(WeightError::Config)?;
     let hidden = config.hidden_size;
     let hc_wide = config.hc_count * hidden;
     let hc_rank = config.hc_lowrank;
@@ -2394,8 +3519,9 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
     let gdn_qk = config.linear_num_key_heads * config.linear_key_head_dim;
     let gdn_v = config.linear_num_value_heads * config.linear_value_head_dim;
     let gdn_qkv = 2 * gdn_qk + gdn_v;
-    let mut refs = Vec::with_capacity(config.num_hidden_layers);
-    for (layer, kind) in config.layer_types.iter().copied().enumerate() {
+    let mut refs = Vec::with_capacity(scope.band.len());
+    for layer in scope.band.clone() {
+        let kind = config.layer_types[layer];
         let prefix = format!("model.language_model.layers.{layer}");
         let attn_hyper = build_hyper_refs(
             &format!("{prefix}.attn_hyper_connection"),
@@ -2678,6 +3804,7 @@ fn build_ple_refs(
 /// `artifact` independently of this executor admission.
 ///
 /// * Flash-Next: the pinned shared-expert MoE with PLE and the native MTP head.
+/// * AR-only Flash-Next: the same, with no MTP head (the stock-FP8 recipe).
 /// * Synthetic developer profiles: only under `cfg(test)` or the
 ///   `qwen4-dev-profiles` feature, and only a dense FFN (PLE and MTP optional
 ///   at this layer).  A synthetic MoE has no sealed route (see
@@ -2688,7 +3815,7 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
         reason: reason.to_string(),
     };
     match &config.profile {
-        Qwen4Profile::FlashNext => {
+        Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
             if !matches!(
                 &config.ffn,
                 Qwen4FfnConfig::Moe {
@@ -2703,12 +3830,15 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
             if config.ple.is_none() {
                 return Err(unsupported("the Qwen4 executor requires PLE"));
             }
-            if config.mtp.is_none() {
-                return Err(unsupported(
+            match (config.profile.is_ar_only(), config.mtp.is_some()) {
+                (false, false) => Err(unsupported(
                     "the Qwen4 executor requires the native MTP head",
-                ));
+                )),
+                (true, true) => Err(unsupported(
+                    "the AR-only Flash-Next profile carries no MTP head",
+                )),
+                _ => Ok(()),
             }
-            Ok(())
         }
         Qwen4Profile::Synthetic(_) => admit_synthetic_profile(config),
     }
@@ -2721,8 +3851,65 @@ fn assembly_manifest(
     config: &Qwen4Config,
     recipe: &Qwen4TierRecipe,
 ) -> Result<Qwen4Manifest, WeightError> {
+    recipe.reject_expert_slab_dtypes()?;
     admit_executable_profile(config)?;
     Qwen4Manifest::build_with_recipe(config, recipe.clone())
+}
+
+/// Replace each trunk layer's two aggregate routed-expert entries with the one
+/// `slab_arena` entry of its [`crate::expert_arena::ExpertArenaLayer`]: raw
+/// bytes (`DType::Raw`, shape `[arena_bytes]`), replicated. The MTP head's
+/// experts (`mtp.…`, not `layers.{L}.`) keep their aggregate entries.
+fn apply_expert_arenas(
+    weights: &mut Vec<WeightEntry>,
+    arenas: &crate::expert_arena::ExpertArenaPlan,
+) -> Result<(), WeightError> {
+    use crate::expert_arena::ARENA_SUFFIX;
+    let mut seen = 0usize;
+    let mut out = Vec::with_capacity(weights.len());
+    for entry in weights.drain(..) {
+        let trunk = entry
+            .layer
+            .filter(|_| entry.name.starts_with("model.language_model.layers."));
+        let projection = if entry.name.ends_with(".mlp.experts.gate_up_proj") {
+            Some(".mlp.experts.gate_up_proj")
+        } else if entry.name.ends_with(".mlp.experts.down_proj") {
+            Some(".mlp.experts.down_proj")
+        } else {
+            None
+        };
+        let (Some(layer), Some(suffix)) = (trunk, projection) else {
+            out.push(entry);
+            continue;
+        };
+        if suffix == ".mlp.experts.down_proj" {
+            continue;
+        }
+        let plan = arenas.layer(layer).ok_or_else(|| {
+            WeightError::DescriptorMismatch(format!("expert arena plan has no layer {layer}"))
+        })?;
+        let prefix = entry
+            .name
+            .strip_suffix(suffix)
+            .expect("suffix checked above");
+        out.push(WeightEntry::layer_with_dtype_constraint(
+            format!("{prefix}{ARENA_SUFFIX}"),
+            layer,
+            vec![plan.bytes],
+            DType::Raw,
+            DTypeConstraint::source_exact(DType::Raw),
+            ShardPolicy::Replicate,
+        ));
+        seen += 1;
+    }
+    *weights = out;
+    if seen != arenas.layers().len() {
+        return Err(WeightError::DescriptorMismatch(format!(
+            "expert arena plan has {} layers but the manifest declares {seen} trunk MoE layers",
+            arenas.layers().len()
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `name` is a routed expert stack (trunk `…mlp.experts.*` or the MTP
@@ -2730,6 +3917,19 @@ fn assembly_manifest(
 /// shards.
 fn is_routed_expert_tensor(name: &str) -> bool {
     name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+}
+
+/// What [`Qwen4TierRecipe::StockFp8`] declares for one tensor: qt=55
+/// `FP8E4M3B128` for the stacked routed experts, qt=56 `FP8E4M3PT` for the
+/// PLE n-gram shards, source BF16 for everything else.
+fn stock_fp8_dtype(name: &str, shape: &[usize]) -> DType {
+    if shape.len() == 3 && is_routed_expert_tensor(name) {
+        DType::FP8E4M3B128
+    } else if is_ple_shard_name(name) {
+        DType::FP8E4M3PT
+    } else {
+        DType::BF16
+    }
 }
 
 /// The expert-parallel placement recorded in a transaction's projection
@@ -2858,17 +4058,21 @@ fn build_ffn_refs(
             ..
         } => {
             let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
+            let payload_experts = config
+                .kept_expert_ids(layer.unwrap_or(0), prefix.starts_with("mtp."))
+                .map_or(experts, <[u16]>::len);
             Ok(Qwen4FfnWeights::Moe(MoeWeights {
+                expert_arena: None,
                 experts_down: tr(
                     "experts.down_proj",
                     TensorRole::RoutedDown,
-                    vec![experts, hidden, intermediate],
+                    vec![payload_experts, hidden, intermediate],
                     ROUTED_DOWN_DTYPE,
                 )?,
                 experts_gate_up: tr(
                     "experts.gate_up_proj",
                     TensorRole::RoutedGateUp,
-                    vec![experts, 2 * intermediate, hidden],
+                    vec![payload_experts, 2 * intermediate, hidden],
                     ROUTED_GATE_UP_DTYPE,
                 )?,
                 expert_source_layout: ExpertSourceLayout::PackedFused {
@@ -2986,6 +4190,13 @@ pub enum WeightError {
     /// An expert-parallel placement that is malformed, or a transaction whose
     /// routed expert tensors do not agree on one.
     EpPlacement(String),
+    /// A planar expert-slab dtype (`MQ3I4G128R256`/`R128`,
+    /// `MQ2I4G128R256`/`R128`, `E8PI4G128R256`/`R128`) reached a declaration
+    /// boundary.  The format is recognised but no generic qwen4 GPU kernel route
+    /// exists for it.
+    ExpertSlabDtypeKernelsUnavailable {
+        dtype: DType,
+    },
 }
 
 impl fmt::Display for WeightError {
@@ -3030,6 +4241,12 @@ impl fmt::Display for WeightError {
             Self::UnsupportedProfile { profile, reason } => {
                 write!(f, "Qwen4 profile {profile:?} is not executable: {reason}")
             }
+            Self::ExpertSlabDtypeKernelsUnavailable { dtype } => write!(
+                f,
+                "Qwen4 expert-slab dtype {dtype:?} is unsupported: no GPU kernels exist for the \
+                 MQ3I4G128R256/MQ3I4G128R128/MQ2I4G128R256/MQ2I4G128R128/E8PI4G128R256/E8PI4G128R128 \
+                 planar formats at this declaration boundary"
+            ),
             Self::EpPlacement(reason) => write!(f, "Qwen4 expert-parallel placement: {reason}"),
         }
     }
@@ -3040,6 +4257,311 @@ impl std::error::Error for WeightError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stock-FP8 declaration: qt=55 routed experts, qt=56 external PLE
+    /// rows (160-byte rows), source BF16 for everything else, no MTP tensor;
+    /// declared for the AR-only profile only, and the AR-only profile builds
+    /// it by default.
+    #[test]
+    fn stock_fp8_manifest_declares_fp8_experts_ple_and_bf16_trunk() {
+        let ar_only = pinned_config().into_ar_only().unwrap();
+        let manifest = Qwen4Manifest::build_with_recipe(&ar_only, Qwen4TierRecipe::StockFp8)
+            .expect("stock-FP8 manifest");
+        assert_eq!(Qwen4Manifest::build(&ar_only).unwrap(), manifest);
+        assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::StockFp8);
+        assert!(manifest.identity.recipe.trunk_raw_bf16());
+        assert!(manifest.identity.recipe.fp8_experts());
+        let (mut experts, mut shards) = (0, 0);
+        for entry in &manifest.weights {
+            assert!(!entry.name.starts_with("mtp."), "{}", entry.name);
+            let want = if is_routed_expert_tensor(&entry.name) {
+                experts += 1;
+                DType::FP8E4M3B128
+            } else if is_ple_shard_name(&entry.name) {
+                shards += 1;
+                assert_eq!(
+                    entry.residency,
+                    WeightResidency::external_rows(
+                        160,
+                        ar_only.ple.as_ref().unwrap().shard_valid_rows(
+                            entry
+                                .name
+                                .rsplit("shard_")
+                                .next()
+                                .and_then(|tail| tail.strip_suffix(".weight"))
+                                .and_then(|index| index.parse().ok())
+                                .unwrap()
+                        )
+                    )
+                );
+                DType::FP8E4M3PT
+            } else {
+                DType::BF16
+            };
+            assert_eq!(entry.dtype, want, "{}", entry.name);
+            assert_eq!(
+                entry.dtype_constraint,
+                DTypeConstraint::source_exact(want),
+                "{}",
+                entry.name
+            );
+        }
+        assert_eq!(experts, 2 * 48);
+        assert_eq!(shards, PLE_SHARD_COUNT);
+        let gate_up = manifest
+            .entry(
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(gate_up.logical_shape, vec![512, 1280, 2560]);
+        let down = manifest
+            .entry(
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(down.logical_shape, vec![512, 2560, 640]);
+
+        // Recipe and profile must agree both ways.
+        let flash = pinned_config();
+        assert!(matches!(
+            Qwen4Manifest::build_with_recipe(&flash, Qwen4TierRecipe::StockFp8),
+            Err(WeightError::UnsupportedProfile { .. })
+        ));
+        assert!(matches!(
+            Qwen4Manifest::build_with_recipe(
+                &ar_only,
+                Qwen4TierRecipe::FlashNextPacked {
+                    trunk_tier: DType::Q8_0,
+                    mtp_source: false
+                }
+            ),
+            Err(WeightError::UnsupportedProfile { .. })
+        ));
+        // P1: no expert parallelism for the stock-FP8 recipe.
+        let error = manifest
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .unwrap_err();
+        assert!(error.to_string().contains("stock-FP8"), "{error}");
+        assert_eq!(
+            Qwen4TierRecipe::from_flash_next_id(STOCK_FP8_RECIPE_ID),
+            Some(Qwen4TierRecipe::StockFp8)
+        );
+        assert_eq!(Qwen4TierRecipe::StockFp8.synthetic_id(), None);
+        assert_eq!(
+            Qwen4TierRecipe::from_synthetic_id(STOCK_FP8_RECIPE_ID),
+            None
+        );
+    }
+
+    /// The AR-only profile is head-free everywhere an MTP entry point looks:
+    /// the executor admits it without a head and refuses one bolted on.
+    #[test]
+    fn ar_only_profile_is_executable_without_mtp() {
+        let ar_only = pinned_config().into_ar_only().unwrap();
+        assert!(ar_only.mtp.is_none());
+        admit_executable_profile(&ar_only).expect("AR-only Flash-Next is executable");
+        let mut headed = ar_only.clone();
+        headed.mtp = pinned_config().mtp;
+        assert!(admit_executable_profile(&headed).is_err());
+        assert!(admit_executable_profile(&pinned_config()).is_ok());
+    }
+
+    /// A fake device address (never dereferenced) for table-geometry tests.
+    fn fake_tensor(base: usize, bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: a borrowed (non-owning) wrapper the test never reads,
+            // writes or frees; `from_tensor` only does address arithmetic.
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(base as *mut std::ffi::c_void, bytes)
+            },
+            shape,
+            dtype,
+        }
+    }
+
+    /// The qt=55 accessor: block/codes/scales addresses follow
+    /// `base + e*S(R,K)` and `+R*K`; a wrong dtype/shape, a short or
+    /// misaligned buffer is refused.
+    #[test]
+    fn fp8_expert_table_addresses_follow_the_contract_stride() {
+        let base = 0x7f00_0000_0000usize;
+        let bytes = 512 * 3_277_312;
+        let gate_up = Fp8B128ExpertTable::from_tensor(
+            "gate_up",
+            &fake_tensor(base, bytes, vec![512, 1280, 2560], DType::FP8E4M3B128),
+        )
+        .unwrap();
+        assert_eq!(
+            gate_up,
+            Fp8B128ExpertTable {
+                base,
+                experts: 512,
+                rows: 1280,
+                k: 2560,
+                stride: 3_277_312
+            }
+        );
+        assert_eq!(gate_up.block_ptr(0), Some(base));
+        assert_eq!(gate_up.codes_ptr(7), Some(base + 7 * 3_277_312));
+        assert_eq!(gate_up.scales_offset(), 1280 * 2560);
+        assert_eq!(
+            gate_up.scales_ptr(511),
+            Some(base + 511 * 3_277_312 + 1280 * 2560)
+        );
+        assert_eq!(gate_up.block_ptr(512), None);
+        assert_eq!(gate_up.scale_grid(), (10, 20));
+        let entries = gate_up.block_entries();
+        assert_eq!(entries.len(), 512);
+        assert_eq!(entries[300], base + 300 * 3_277_312);
+        let down = Fp8B128ExpertTable::from_tensor(
+            "down",
+            &fake_tensor(
+                base,
+                512 * 1_638_656,
+                vec![512, 2560, 640],
+                DType::FP8E4M3B128,
+            ),
+        )
+        .unwrap();
+        assert_eq!((down.stride, down.scale_grid()), (1_638_656, (20, 5)));
+
+        for (tensor, needle) in [
+            (
+                fake_tensor(base, bytes, vec![512, 1280, 2560], DType::MQ4G256V2),
+                "dtype",
+            ),
+            (
+                fake_tensor(base, bytes, vec![655_360, 2560], DType::FP8E4M3B128),
+                "shape",
+            ),
+            (
+                fake_tensor(base, bytes - 1, vec![512, 1280, 2560], DType::FP8E4M3B128),
+                "buffer",
+            ),
+            (
+                fake_tensor(base + 16, bytes, vec![512, 1280, 2560], DType::FP8E4M3B128),
+                "aligned",
+            ),
+        ] {
+            let error = Fp8B128ExpertTable::from_tensor("t", &tensor).unwrap_err();
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
+
+    const EXPERT_SLAB_DTYPES: [DType; 6] = [
+        DType::MQ3I4G128R256,
+        DType::MQ3I4G128R128,
+        DType::MQ2I4G128R256,
+        DType::MQ2I4G128R128,
+        DType::E8PI4G128R256,
+        DType::E8PI4G128R128,
+    ];
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_by_tensor_ref() {
+        for dtype in EXPERT_SLAB_DTYPES {
+            for (name, role, shape) in [
+                (
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                    TensorRole::RoutedGateUp,
+                    vec![512, 1280, 2560],
+                ),
+                (
+                    "model.language_model.layers.0.mlp.experts.down_proj",
+                    TensorRole::RoutedDown,
+                    vec![512, 2560, 640],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    TensorRole::QsaQ,
+                    vec![4096, 2560],
+                ),
+            ] {
+                assert_eq!(
+                    TensorRef::new(name, role, Some(0), shape, dtype),
+                    Err(WeightError::ExpertSlabDtypeKernelsUnavailable { dtype }),
+                    "{dtype:?} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_by_recipe_guard() {
+        let config = pinned_config();
+        for dtype in EXPERT_SLAB_DTYPES {
+            let recipe = Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: dtype,
+                mtp_source: false,
+            };
+            let expected = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype };
+            assert_eq!(recipe.reject_expert_slab_dtypes(), Err(expected.clone()));
+            assert_eq!(
+                Qwen4Manifest::build_with_recipe(&config, recipe.clone()).err(),
+                Some(expected.clone()),
+                "{dtype:?}"
+            );
+            assert_eq!(
+                assembly_manifest(&config, &recipe).err(),
+                Some(expected),
+                "{dtype:?}"
+            );
+        }
+        // The legacy tiers still build.
+        for tier in [DType::Q8_0, DType::MQ6G256V2] {
+            assert!(Qwen4Manifest::build_with_trunk_tier(&config, tier).is_ok());
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_in_raw_manifests() {
+        use hipfire_runtime::weight_manifest::SourceDType;
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        assert_eq!(base.reject_expert_slab_dtypes(), Ok(()));
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        for dtype in EXPERT_SLAB_DTYPES {
+            let expected = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype };
+            let mut target = base.clone();
+            target.weights[0].dtype = dtype;
+            assert_eq!(target.reject_expert_slab_dtypes(), Err(expected.clone()));
+            assert_eq!(
+                target.with_expert_parallel(placement).err(),
+                Some(expected.clone())
+            );
+            for source in [
+                SourceDType::Exact(dtype),
+                SourceDType::OneOf(vec![DType::BF16, dtype]),
+            ] {
+                let mut constraint = base.clone();
+                constraint.weights[0].dtype_constraint.source = source;
+                assert_eq!(
+                    constraint.reject_expert_slab_dtypes(),
+                    Err(expected.clone())
+                );
+                assert_eq!(
+                    constraint.with_expert_parallel(placement).err(),
+                    Some(expected.clone())
+                );
+            }
+            let mut recipe = base.clone();
+            recipe.identity.recipe = Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: dtype,
+                mtp_source: false,
+            };
+            assert_eq!(recipe.reject_expert_slab_dtypes(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtype_error_names_the_dtype() {
+        for dtype in EXPERT_SLAB_DTYPES {
+            let message = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype }.to_string();
+            assert!(message.contains(&format!("{dtype:?}")), "{message}");
+            assert!(message.contains("unsupported"), "{message}");
+        }
+    }
 
     #[test]
     fn ple_shards_exclude_padding() {
@@ -3100,7 +4622,7 @@ mod tests {
             .iter()
             .filter(|entry| is_routed_expert_tensor(&entry.name))
             .all(|entry| entry.policy == ShardPolicy::Replicate));
-        for ranks in [2usize, 4] {
+        for ranks in [2usize, 3, 4, 5, 6, 8] {
             let rank = ranks - 1;
             let ep = base
                 .clone()
@@ -3144,12 +4666,46 @@ mod tests {
     }
 
     #[test]
+    fn ep_placement_splits_experts_unevenly_and_densely() {
+        for experts in [512usize, 8] {
+            for ranks in [2usize, 3, 4, 5, 6, 8] {
+                let mut total = 0;
+                let mut owner_of = vec![usize::MAX; experts];
+                for rank in 0..ranks {
+                    let placement = Qwen4EpPlacement { rank, ranks };
+                    let count = placement.local_count(experts);
+                    assert!(count <= placement.max_local_count(experts));
+                    assert_eq!(count, (0..experts).filter(|&e| placement.owns(e)).count());
+                    // Owned experts fill slots 0..count densely, ascending.
+                    let slots: Vec<usize> = (0..experts)
+                        .filter(|&e| placement.owns(e))
+                        .map(|e| placement.local_index(e))
+                        .collect();
+                    assert_eq!(slots, (0..count).collect::<Vec<_>>());
+                    for e in (0..experts).filter(|&e| placement.owns(e)) {
+                        assert_eq!(owner_of[e], usize::MAX, "expert {e} owned twice");
+                        owner_of[e] = rank;
+                    }
+                    total += count;
+                }
+                assert_eq!(total, experts, "experts={experts} ranks={ranks}");
+                assert!(owner_of.iter().all(|&o| o != usize::MAX));
+            }
+        }
+        let six = |rank| Qwen4EpPlacement { rank, ranks: 6 };
+        let counts: Vec<usize> = (0..6).map(|r| six(r).local_count(512)).collect();
+        assert_eq!(counts, [86, 86, 85, 85, 85, 85]);
+        assert_eq!(six(3).max_local_count(512), 86);
+    }
+
+    #[test]
     fn expert_parallel_manifest_refuses_bad_placements() {
         let base = Qwen4Manifest::build(&pinned_config()).unwrap();
-        for (rank, ranks) in [(0, 1), (0, 0), (2, 2), (4, 4), (0, 3), (1, 5)] {
+        for (rank, ranks) in [(0, 1), (0, 0), (2, 2), (4, 4), (0, 513), (1, 600)] {
             assert!(
                 matches!(
-                    base.clone().with_expert_parallel(Qwen4EpPlacement { rank, ranks }),
+                    base.clone()
+                        .with_expert_parallel(Qwen4EpPlacement { rank, ranks }),
                     Err(WeightError::EpPlacement(_))
                 ),
                 "rank {rank} of {ranks}"
@@ -3176,7 +4732,10 @@ mod tests {
             ep_from_projections(&manifest, |_, _| Some(&compact)).unwrap(),
             Some(Qwen4EpPlacement { rank: 1, ranks: 4 })
         );
-        assert_eq!(ep_from_projections(&manifest, |_, _| Some(&plain)).unwrap(), None);
+        assert_eq!(
+            ep_from_projections(&manifest, |_, _| Some(&plain)).unwrap(),
+            None
+        );
         assert_eq!(ep_from_projections(&manifest, |_, _| None).unwrap(), None);
         // A mixture of compact and full expert stacks is refused.
         assert!(ep_from_projections(&manifest, |name, _| {
@@ -3282,7 +4841,12 @@ mod tests {
         let row = ShardPolicy::RowShard { axis: 1 };
         let rep = ShardPolicy::Replicate;
         for (suffix, shape, packed, policy) in [
-            ("indexer.index_qk_proj.weight", &[640usize, 2560][..], true, col.clone()),
+            (
+                "indexer.index_qk_proj.weight",
+                &[640usize, 2560][..],
+                true,
+                col.clone(),
+            ),
             ("indexer.k_layernorm.weight", &[128][..], false, rep.clone()),
             ("indexer.q_layernorm.weight", &[128][..], false, rep.clone()),
             ("k_norm.weight", &[256][..], false, rep.clone()),
@@ -3389,11 +4953,8 @@ mod tests {
     /// it is an independent oracle for the profile-owned generator.
     fn flash_next_oracle() -> Vec<WeightEntry> {
         let mut out = Vec::new();
-        let head = DTypeConstraint::source_from_sources(vec![
-            DType::BF16,
-            DType::Q8_0,
-            DType::MQ6G256V2,
-        ]);
+        let head =
+            DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0, DType::MQ6G256V2]);
         out.push(
             WeightEntry::model_with_dtype_constraint(
                 "model.language_model.embed_tokens.weight",
@@ -3456,15 +5017,28 @@ mod tests {
         }
         for layer in 0..48usize {
             let prefix = format!("model.language_model.layers.{layer}");
-            oracle_hc(&mut out, Some(layer), &format!("{prefix}.attn_hyper_connection"));
-            oracle_hc(&mut out, Some(layer), &format!("{prefix}.mlp_hyper_connection"));
+            oracle_hc(
+                &mut out,
+                Some(layer),
+                &format!("{prefix}.attn_hyper_connection"),
+            );
+            oracle_hc(
+                &mut out,
+                Some(layer),
+                &format!("{prefix}.mlp_hyper_connection"),
+            );
             if layer % 4 == 3 {
                 oracle_qsa(&mut out, Some(layer), &prefix);
             } else {
                 let col = ShardPolicy::ColumnShard { axis: 0 };
                 for (suffix, shape, packed, policy) in [
                     ("A_log", &[48usize][..], false, ShardPolicy::Replicate),
-                    ("conv1d.weight", &[10240, 1, 4][..], false, ShardPolicy::Replicate),
+                    (
+                        "conv1d.weight",
+                        &[10240, 1, 4][..],
+                        false,
+                        ShardPolicy::Replicate,
+                    ),
                     ("dt_bias", &[48][..], false, ShardPolicy::Replicate),
                     ("in_proj_a.weight", &[48, 2560][..], true, col.clone()),
                     ("in_proj_b.weight", &[48, 2560][..], true, col.clone()),
@@ -3499,7 +5073,11 @@ mod tests {
                 let ple = format!("{prefix}.ple");
                 let col = ShardPolicy::ColumnShard { axis: 0 };
                 for (suffix, shape, policy) in [
-                    ("conv1d.weight", &[10240usize, 1, 4][..], ShardPolicy::Replicate),
+                    (
+                        "conv1d.weight",
+                        &[10240usize, 1, 4][..],
+                        ShardPolicy::Replicate,
+                    ),
                     ("key_proj.weight", &[10240, 2560][..], col),
                     ("norm_conv.weight", &[10240][..], ShardPolicy::Replicate),
                     ("norm_key.weight", &[10240][..], ShardPolicy::Replicate),
@@ -3610,7 +5188,11 @@ mod tests {
         MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(None));
         let manifest = built.expect("pinned manifest");
         let oracle = flash_next_oracle();
-        assert_eq!(manifest.weights.len(), 1323, "weights (1325 source records)");
+        assert_eq!(
+            manifest.weights.len(),
+            1323,
+            "weights (1325 source records)"
+        );
         assert_eq!(oracle.len(), manifest.weights.len());
         for (index, (built, expected)) in manifest.weights.iter().zip(&oracle).enumerate() {
             assert_eq!(built, expected, "entry {index} {}", expected.name);
@@ -3629,7 +5211,7 @@ mod tests {
                 state.push(StateEntry::new(StateKind::Conv, layer));
             }
         }
-        state.push(StateEntry::new(StateKind::Conv, 1));
+        state.push(StateEntry::pinned(StateKind::Conv, PinTarget::Embed));
         assert_eq!(manifest.state, state);
         assert_eq!(manifest.state.len(), 85);
         let metadata_base = "model.language_model.layers.1.ple.ple_embedding";
@@ -3656,7 +5238,13 @@ mod tests {
         );
     }
 
-    fn synthetic(ffn: Qwen4FfnConfig, hidden: usize, layers: usize, ple: bool, mtp: bool) -> Qwen4Config {
+    fn synthetic(
+        ffn: Qwen4FfnConfig,
+        hidden: usize,
+        layers: usize,
+        ple: bool,
+        mtp: bool,
+    ) -> Qwen4Config {
         crate::config::synthetic_test_config(ffn, hidden, layers, ple, mtp)
     }
 
@@ -3684,7 +5272,13 @@ mod tests {
             Qwen4FfnConfig::Moe {
                 shared_intermediate_size,
                 ..
-            } => 3 + if shared_intermediate_size.is_some() { 4 } else { 0 },
+            } => {
+                3 + if shared_intermediate_size.is_some() {
+                    4
+                } else {
+                    0
+                }
+            }
         };
         // embedding, head, final HC mixer (3)
         let mut count = 5 + config.num_hidden_layers * (8 + 9 + ffn);
@@ -3706,10 +5300,17 @@ mod tests {
             manifest.identity.equation_source,
             config.profile.equation_source().as_str()
         );
-        assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::SyntheticSourceBf16);
+        assert_eq!(
+            manifest.identity.recipe,
+            Qwen4TierRecipe::SyntheticSourceBf16
+        );
         for entry in &manifest.weights {
             assert_eq!(entry.dtype, DType::BF16, "{} must stay BF16", entry.name);
-            assert!(entry.dtype_constraint.accepts(DType::BF16), "{}", entry.name);
+            assert!(
+                entry.dtype_constraint.accepts(DType::BF16),
+                "{}",
+                entry.name
+            );
             for packed in [
                 DType::Q8_0,
                 DType::MQ6G256V2,
@@ -3760,9 +5361,8 @@ mod tests {
             assert_synthetic_bf16_inventory(&config, &manifest);
             assert_eq!(manifest.identity.ffn_kind, "dense");
             for layer in [0usize, 63] {
-                let name = |role: &str| {
-                    format!("model.language_model.layers.{layer}.mlp.{role}.weight")
-                };
+                let name =
+                    |role: &str| format!("model.language_model.layers.{layer}.mlp.{role}.weight");
                 for (role, shape) in [
                     ("gate_proj", [17_408usize, 5120]),
                     ("up_proj", [17_408, 5120]),
@@ -3833,7 +5433,10 @@ mod tests {
                 .expect("routed down");
             assert_eq!(down.logical_shape, [8, 256, 64]);
             assert_eq!(
-                manifest.entry(&layer("gate.weight"), Some(0)).unwrap().logical_shape,
+                manifest
+                    .entry(&layer("gate.weight"), Some(0))
+                    .unwrap()
+                    .logical_shape,
                 [8, 256]
             );
             for role in [
@@ -3872,16 +5475,25 @@ mod tests {
             else {
                 panic!("PLE shard must be external rows");
             };
-            assert_eq!(row_bytes, RowEncoding::Bf16.encoded_row_bytes(ple.row_width));
+            assert_eq!(
+                row_bytes,
+                RowEncoding::Bf16.encoded_row_bytes(ple.row_width)
+            );
             assert_eq!(valid_rows, ple.shard_valid_rows(index));
             total_valid += valid_rows;
         }
         assert_eq!(total_valid as u64, ple.valid_rows);
-        let base = format!("model.language_model.layers.{}.ple.ple_embedding", ple.layer);
+        let base = format!(
+            "model.language_model.layers.{}.ple.ple_embedding",
+            ple.layer
+        );
         assert_eq!(
             manifest.metadata,
             vec![
-                MetadataTensor::i64(format!("{base}.layer_multipliers"), vec![ple.multiplier_count]),
+                MetadataTensor::i64(
+                    format!("{base}.layer_multipliers"),
+                    vec![ple.multiplier_count]
+                ),
                 MetadataTensor::i64(format!("{base}.ngram_heads_offsets"), vec![ple.head_count]),
                 MetadataTensor::i64(
                     format!("{base}.ngram_heads_vocab_sizes"),
@@ -3891,11 +5503,18 @@ mod tests {
         );
         let trimmed = manifest.clone().without_ple_shards();
         assert_eq!(trimmed.external_entries().count(), 0);
-        assert_eq!(manifest.weights.len() - trimmed.weights.len(), ple.shard_count);
-        assert!(is_ple_shard_name_within(
-            &shards[0].name.replace(&format!("layers.{}.", ple.layer), "layers.1."),
+        assert_eq!(
+            manifest.weights.len() - trimmed.weights.len(),
             ple.shard_count
-        ) || ple.layer != 1);
+        );
+        assert!(
+            is_ple_shard_name_within(
+                &shards[0]
+                    .name
+                    .replace(&format!("layers.{}.", ple.layer), "layers.1."),
+                ple.shard_count
+            ) || ple.layer != 1
+        );
     }
 
     #[test]
@@ -3909,21 +5528,33 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(error, WeightError::UnsupportedProfile { .. }), "{error}");
+        assert!(
+            matches!(error, WeightError::UnsupportedProfile { .. }),
+            "{error}"
+        );
         let error = Qwen4Manifest::build_with_recipe(
             &pinned_config(),
             Qwen4TierRecipe::SyntheticSourceBf16,
         )
         .unwrap_err();
-        assert!(matches!(error, WeightError::UnsupportedProfile { .. }), "{error}");
+        assert!(
+            matches!(error, WeightError::UnsupportedProfile { .. }),
+            "{error}"
+        );
         // The MTP source-tier switch and the trunk tier do not move a
         // synthetic recipe.
         MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(Some(true)));
         let built = Qwen4Manifest::build(&synthetic(small_moe(Some(64)), 256, 4, false, true));
         MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(None));
         let manifest = built.expect("synthetic manifest");
-        assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::SyntheticSourceBf16);
-        assert!(manifest.weights.iter().all(|entry| entry.dtype == DType::BF16));
+        assert_eq!(
+            manifest.identity.recipe,
+            Qwen4TierRecipe::SyntheticSourceBf16
+        );
+        assert!(manifest
+            .weights
+            .iter()
+            .all(|entry| entry.dtype == DType::BF16));
     }
 
     /// PLE channels are `hc_count * hidden` and the key/value projections read
@@ -3935,7 +5566,10 @@ mod tests {
     fn ple_channels_follow_hidden_and_projections_follow_embed_dim() {
         let config = synthetic(dense_ffn(), 5120, 64, true, false);
         let ple = config.ple.clone().expect("PLE");
-        assert_ne!(ple.embed_dim, config.hidden_size, "mixed hidden/embed fixture");
+        assert_ne!(
+            ple.embed_dim, config.hidden_size,
+            "mixed hidden/embed fixture"
+        );
         let channels = config.hc_count * config.hidden_size;
         let manifest = Qwen4Manifest::build(&config).expect("manifest");
         let shape = |suffix: &str| {
@@ -3950,7 +5584,10 @@ mod tests {
         };
         assert_eq!(shape("conv1d.weight"), [channels, 1, ple.conv_kernel_size]);
         assert_eq!(shape("key_proj.weight"), [channels, ple.embed_dim]);
-        assert_eq!(shape("value_proj.weight"), [config.hidden_size, ple.embed_dim]);
+        assert_eq!(
+            shape("value_proj.weight"),
+            [config.hidden_size, ple.embed_dim]
+        );
         for norm in ["norm_conv.weight", "norm_key.weight", "norm_query.weight"] {
             assert_eq!(shape(norm), [channels], "{norm}");
         }
@@ -3969,7 +5606,12 @@ mod tests {
         let mut injects = 0usize;
         for entry in &manifest.weights {
             if entry.name.ends_with(".block_inject_weight.weight") {
-                assert_eq!(entry.logical_shape, [config.hc_count, wide], "{}", entry.name);
+                assert_eq!(
+                    entry.logical_shape,
+                    [config.hc_count, wide],
+                    "{}",
+                    entry.name
+                );
                 injects += 1;
             }
         }
@@ -3982,7 +5624,10 @@ mod tests {
             assert!(manifest.entry(name, None).is_none(), "{name}");
         }
         for (name, layer) in [
-            ("model.language_model.layers.1.mlp_hyper_connection", Some(1)),
+            (
+                "model.language_model.layers.1.mlp_hyper_connection",
+                Some(1),
+            ),
             ("mtp.layers.0.attn_hyper_connection", None),
         ] {
             let shape = |suffix: &str| {
@@ -3993,8 +5638,14 @@ mod tests {
                     .clone()
             };
             assert_eq!(shape("hc_norm.weight"), [wide]);
-            assert_eq!(shape("input_mix_weight_down.weight"), [config.hc_lowrank, wide]);
-            assert_eq!(shape("input_mix_weight_up.weight"), [wide, config.hc_lowrank]);
+            assert_eq!(
+                shape("input_mix_weight_down.weight"),
+                [config.hc_lowrank, wide]
+            );
+            assert_eq!(
+                shape("input_mix_weight_up.weight"),
+                [wide, config.hc_lowrank]
+            );
         }
     }
 
@@ -4048,7 +5699,9 @@ mod tests {
             "p",
             0,
             4096,
-            &Qwen4FfnConfig::Dense { intermediate_size: 0 },
+            &Qwen4FfnConfig::Dense {
+                intermediate_size: 0,
+            },
             &bf16,
             &quant,
         )
@@ -4146,6 +5799,144 @@ mod tests {
             matches!(error, WeightError::UnsupportedProfile { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn expert_tier_manifest_removes_only_trunk_routed_entries() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        assert_eq!(tiered.identity, base.identity);
+        assert_eq!(tiered.weights.len() + 96, base.weights.len());
+        assert_eq!(tiered.state, base.state);
+        assert_eq!(tiered.metadata, base.metadata);
+        let removed = |name: &str, layer: Option<usize>| {
+            layer.is_some()
+                && name.starts_with("model.language_model.layers.")
+                && (name.ends_with(".mlp.experts.gate_up_proj")
+                    || name.ends_with(".mlp.experts.down_proj"))
+        };
+        let kept = base
+            .resident_keys()
+            .filter(|(name, layer)| !removed(name, *layer))
+            .collect::<Vec<_>>();
+        assert_eq!(tiered.resident_keys().collect::<Vec<_>>(), kept);
+        // The MTP head's aggregate experts stay declared.
+        for name in [
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ] {
+            assert!(tiered.entry(name, None).is_some(), "{name}");
+        }
+        // A second application, expert parallelism and a stock/synthetic/dense
+        // declaration are each refused under the HOTSET name.
+        let refused = [
+            tiered.clone().with_expert_tiers(),
+            base.clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+                .and_then(Qwen4Manifest::with_expert_tiers),
+            Qwen4Manifest::build(&synthetic(dense_ffn(), 256, 4, true, true))
+                .and_then(Qwen4Manifest::with_expert_tiers),
+        ];
+        for result in refused {
+            let error = result.expect_err("tier manifest refusal");
+            assert!(
+                error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_expert_tiers_accepts_base_and_refuses_without_mutation() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let base_keys = base.resident_keys().collect::<Vec<_>>();
+        let base_len = base.weights.len();
+        base.check_expert_tiers().expect("base manifest qualifies");
+        assert_eq!(base.weights.len(), base_len);
+        assert_eq!(base.resident_keys().collect::<Vec<_>>(), base_keys);
+
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        let tiered_keys = tiered.resident_keys().collect::<Vec<_>>();
+        let tiered_len = tiered.weights.len();
+        let ep = base
+            .clone()
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .expect("ep manifest");
+        let ep_keys = ep.resident_keys().collect::<Vec<_>>();
+        let ep_len = ep.weights.len();
+        for (manifest, keys, len) in [(&tiered, &tiered_keys, tiered_len), (&ep, &ep_keys, ep_len)]
+        {
+            let error = manifest.check_expert_tiers().expect_err("refusal");
+            assert!(
+                error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
+                "{error}"
+            );
+            assert_eq!(manifest.weights.len(), len);
+            assert_eq!(&manifest.resident_keys().collect::<Vec<_>>(), keys);
+        }
+    }
+
+    #[test]
+    fn placement_set_accepts_missing_tier_entries_but_not_missing_nonexpert() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        let placements = |manifest: &Qwen4Manifest| {
+            manifest
+                .resident_keys()
+                .map(|(name, layer)| Qwen4Placement {
+                    name: name.to_string(),
+                    layer,
+                    device: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        // The tier-owned entries are absent from the tier placement set.
+        let tier_placements = placements(&tiered);
+        check_placement_set(&tiered, &tier_placements).expect("tier set accepted");
+        // A regular load still requires them.
+        assert!(matches!(
+            check_placement_set(&base, &tier_placements),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
+        // And a missing non-expert tensor is rejected under the tier manifest.
+        let mut missing = tier_placements.clone();
+        let at = missing
+            .iter()
+            .position(|placement| {
+                !placement.name.contains(".mlp.experts.") && placement.layer.is_some()
+            })
+            .expect("a trunk non-expert placement");
+        missing.remove(at);
+        assert!(matches!(
+            check_placement_set(&tiered, &missing),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
+        // A tier-owned tensor offered as a placement is not expected either.
+        let mut extra = tier_placements;
+        extra.push(Qwen4Placement {
+            name: "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
+            layer: Some(0),
+            device: 0,
+        });
+        assert!(matches!(
+            check_placement_set(&tiered, &extra),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
     }
 
     #[test]
@@ -4770,5 +6561,831 @@ mod tests {
         // must stay loadable: both tiers are admitted by the same declaration.
         assert!(ple.dtype_constraint.accepts(DType::BF16));
         assert!(!ple.dtype_constraint.accepts(DType::MQ4G128V2));
+    }
+
+    #[test]
+    fn single_band_preserves_manifest_keys_references_and_assembly_order() {
+        let config = pinned_config();
+        let base = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let scope = Qwen4BandScope::single(&config);
+        let scoped = base.clone().with_band_scope(&config, &scope).unwrap();
+        assert_eq!(scoped, base);
+        let placements = scoped.placements_for_scope(&config, &scope, 0).unwrap();
+        let keys: Vec<_> = base.resident_keys().collect();
+        assert_eq!(
+            placements
+                .iter()
+                .map(|p| (p.name.as_str(), p.layer))
+                .collect::<Vec<_>>(),
+            keys
+        );
+        let refs = build_layer_refs_scoped(&config, &scope).unwrap();
+        assert_eq!(
+            refs.iter().map(|layer| layer.layer).collect::<Vec<_>>(),
+            (0..config.num_hidden_layers).collect::<Vec<_>>()
+        );
+        // Exercise the real assembly take order using the store's CPU-only
+        // symbolic ownership seam. No GPU tensor is fabricated or allocated.
+        let mut store = hipfire_runtime::weight_store::WeightStore::default();
+        for entry in base
+            .weights
+            .iter()
+            .filter(|entry| !entry.residency.is_external())
+        {
+            store
+                .stage_alias(
+                    &entry.name,
+                    entry.layer,
+                    0,
+                    "test-source",
+                    hipfire_runtime::weight_store::WeightProjection {
+                        kind: hipfire_runtime::weight_store::WeightProjectionKind::Static,
+                        axis: None,
+                        rank: 0,
+                        world_size: 1,
+                        logical_shape: entry.logical_shape.clone(),
+                        dtype: entry.dtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut tx = WeightLoadTransaction::new(store);
+        let weights =
+            Qwen4Weights::assemble(&mut tx, &config, &base.identity.recipe, &placements, &scope)
+                .unwrap();
+        assert_eq!(
+            weights
+                .taken
+                .iter()
+                .map(|taken| (taken.key.name.as_str(), taken.key.layer))
+                .collect::<Vec<_>>(),
+            keys
+        );
+        assert!(tx.is_empty());
+        for absolute in scope.band.clone() {
+            assert_eq!(weights.layer(absolute).unwrap().layer, absolute);
+        }
+        assert!(weights.layer(config.num_hidden_layers).is_none());
+    }
+
+    #[test]
+    fn pp2_and_pp6_partition_every_flash_next_key_exactly_once() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let config = pinned_config();
+        let base = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let expected: BTreeSet<_> = base
+            .weights
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.layer))
+            .collect();
+        for counts in [&[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, 48, counts).unwrap();
+            let mut union = BTreeSet::new();
+            let mut states = Vec::new();
+            for stage in 0..counts.len() {
+                let scope = Qwen4BandScope::from_placement(&config, &placement, stage).unwrap();
+                let local = base.clone().with_band_scope(&config, &scope).unwrap();
+                let expected_order: Vec<_> = base
+                    .weights
+                    .iter()
+                    .filter(|entry| scope.owns_entry(entry))
+                    .map(|entry| (entry.name.as_str(), entry.layer))
+                    .collect();
+                assert_eq!(
+                    local
+                        .weights
+                        .iter()
+                        .map(|entry| (entry.name.as_str(), entry.layer))
+                        .collect::<Vec<_>>(),
+                    expected_order
+                );
+                let placements = base.placements_for_scope(&config, &scope, stage).unwrap();
+                check_placement_set(&local, &placements).unwrap();
+                assert!(placements.iter().all(|entry| entry.device == stage));
+                assert_eq!(
+                    build_layer_refs_scoped(&config, &scope)
+                        .unwrap()
+                        .iter()
+                        .map(|layer| layer.layer)
+                        .collect::<Vec<_>>(),
+                    scope.band.clone().collect::<Vec<_>>()
+                );
+                for entry in &local.weights {
+                    assert!(
+                        union.insert((entry.name.clone(), entry.layer)),
+                        "{}",
+                        entry.name
+                    );
+                    if let Some(layer) = entry.layer {
+                        assert!(scope.owns_layer(layer));
+                    }
+                    if entry.name.starts_with("mtp.") {
+                        assert!(scope.output);
+                        assert_eq!(entry.placement, PlacementHint::Pin(PinTarget::Output));
+                    }
+                }
+                assert_eq!(local.metadata.is_empty(), !scope.input);
+                states.extend(local.state);
+            }
+            assert_eq!(union, expected);
+            assert_eq!(states.len(), base.state.len());
+            for state in &base.state {
+                assert_eq!(
+                    states.iter().filter(|entry| *entry == state).count(),
+                    base.state.iter().filter(|entry| *entry == state).count()
+                );
+            }
+        }
+    }
+
+    /// A real 48-layer slab plan whose per-layer arena sizes all differ
+    /// (layer `l` holds `(5 * l) % 64` MQ4 experts, the rest W3).
+    fn nonuniform_slab_plan() -> std::sync::Arc<crate::expert_arena::ExpertArenaPlan> {
+        use crate::expert_slabs::ExpertFormat;
+        let tensors = crate::expert_slab_table::full_fn_headers(|layer, expert| {
+            if expert < (layer * 5) % 64 {
+                ExpertFormat::Mq4Xts
+            } else {
+                ExpertFormat::Mq3I4
+            }
+        });
+        let table = crate::expert_slab_table::build_expert_slab_table(
+            &crate::expert_slabs::ExpertSlabsV1::fn_v1(),
+            &tensors,
+        )
+        .unwrap();
+        std::sync::Arc::new(crate::expert_arena::ExpertArenaPlan::from_table(&table).unwrap())
+    }
+
+    #[test]
+    fn slab_manifest_band_scope_keeps_own_arenas_and_pins_mtp_to_output() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let config = pinned_config();
+        let plan = nonuniform_slab_plan();
+        let base = Qwen4Manifest::build_with_recipe(
+            &config,
+            Qwen4TierRecipe::FlashNextSlab {
+                trunk_tier: DType::Q8_0,
+                mtp_source: false,
+                arenas: plan.clone(),
+            },
+        )
+        .unwrap();
+        let arena_name =
+            |layer: usize| format!("model.language_model.layers.{layer}.mlp.experts.slab_arena");
+        let is_arena = |name: &str| name.ends_with(crate::expert_arena::ARENA_SUFFIX);
+        let is_aggregate = |name: &str| {
+            name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+        };
+        // The whole-model declaration: one arena per trunk layer sized by
+        // the plan, MTP aggregates kept, no trunk aggregates.
+        let arena_bytes: BTreeSet<_> = plan.layers().iter().map(|layer| layer.bytes).collect();
+        assert_eq!(arena_bytes.len(), 48, "every layer's arena size differs");
+        for layer in 0..48 {
+            let entry = base.entry(&arena_name(layer), Some(layer)).unwrap();
+            assert_eq!(entry.dtype, DType::Raw);
+            assert_eq!(entry.logical_shape, vec![plan.layer(layer).unwrap().bytes]);
+        }
+        let mtp_aggregates: Vec<_> = base
+            .weights
+            .iter()
+            .filter(|entry| entry.name.starts_with("mtp.") && is_aggregate(&entry.name))
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(
+            mtp_aggregates,
+            [
+                "mtp.layers.0.mlp.experts.down_proj",
+                "mtp.layers.0.mlp.experts.gate_up_proj"
+            ]
+        );
+        assert!(base
+            .weights
+            .iter()
+            .all(|entry| entry.name.starts_with("mtp.") || !is_aggregate(&entry.name)));
+
+        for counts in [&[24, 24][..], &[16, 16, 16][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, 48, counts).unwrap();
+            let mut arenas_seen = BTreeSet::new();
+            let mut mtp_bands = 0;
+            for stage in 0..counts.len() {
+                let scope = Qwen4BandScope::from_placement(&config, &placement, stage).unwrap();
+                let local = base.clone().with_band_scope(&config, &scope).unwrap();
+                // Exactly this band's arenas, in layer order.
+                let kept: Vec<_> = local
+                    .weights
+                    .iter()
+                    .filter(|entry| is_arena(&entry.name))
+                    .map(|entry| (entry.name.clone(), entry.layer.unwrap()))
+                    .collect();
+                let want: Vec<_> = scope
+                    .band
+                    .clone()
+                    .map(|layer| (arena_name(layer), layer))
+                    .collect();
+                assert_eq!(kept, want, "{counts:?} band {:?}", scope.band);
+                for (name, layer) in &kept {
+                    assert!(arenas_seen.insert(name.clone()), "{name} on two bands");
+                    let entry = local.entry(name, Some(*layer)).unwrap();
+                    assert_eq!(entry.logical_shape, vec![plan.layer(*layer).unwrap().bytes]);
+                }
+                // No trunk aggregate survives; the MTP ones are output-only
+                // and pinned there.
+                let mtp: Vec<_> = local
+                    .weights
+                    .iter()
+                    .filter(|entry| entry.name.starts_with("mtp.") && is_aggregate(&entry.name))
+                    .collect();
+                assert!(local
+                    .weights
+                    .iter()
+                    .all(|entry| entry.name.starts_with("mtp.") || !is_aggregate(&entry.name)));
+                if scope.output {
+                    mtp_bands += 1;
+                    assert_eq!(
+                        mtp.iter()
+                            .map(|entry| entry.name.as_str())
+                            .collect::<Vec<_>>(),
+                        mtp_aggregates
+                    );
+                    for entry in mtp {
+                        assert_eq!(entry.placement, PlacementHint::Pin(PinTarget::Output));
+                    }
+                } else {
+                    assert!(mtp.is_empty(), "{counts:?} band {:?}", scope.band);
+                }
+                // Placements name the same arenas the band keeps.
+                let placements = base.placements_for_scope(&config, &scope, stage).unwrap();
+                check_placement_set(&local, &placements).unwrap();
+                assert_eq!(
+                    placements
+                        .iter()
+                        .filter(|placement| is_arena(&placement.name))
+                        .count(),
+                    scope.band.len()
+                );
+            }
+            assert_eq!(mtp_bands, 1);
+            assert_eq!(arenas_seen.len(), 48);
+        }
+    }
+
+    #[test]
+    fn output_embedding_preserves_tied_source_without_input_allocation() {
+        let config = pinned_config();
+        let base = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let scope = Qwen4BandScope {
+            band: 24..48,
+            input: false,
+            output: true,
+        };
+        let local = base.with_band_scope(&config, &scope).unwrap();
+        assert!(local
+            .entry("model.language_model.embed_tokens.weight", None)
+            .is_none());
+        let tied = local.entry("mtp.embed_tokens.weight", None).unwrap();
+        assert_eq!(
+            tied.policy,
+            ShardPolicy::Tied {
+                source: "model.language_model.embed_tokens.weight".to_string()
+            }
+        );
+        assert_eq!(tied.placement, PlacementHint::Pin(PinTarget::Output));
+    }
+
+    #[test]
+    fn bands_refuse_invalid_endpoints_ple_cut_and_expert_parallelism() {
+        use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+        let config = pinned_config();
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 2)]).unwrap();
+        let bad = BandPlacement::from_counts(&mesh, 48, &[1, 47]).unwrap();
+        for stage in 0..2 {
+            assert!(Qwen4BandScope::from_placement(&config, &bad, stage).is_err());
+        }
+        assert!(Qwen4BandScope::from_placement(&config, &bad, 2).is_err());
+        assert!(Qwen4BandScope {
+            band: 24..48,
+            input: true,
+            output: true
+        }
+        .validate(&config)
+        .is_err());
+        let ep = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0)
+            .unwrap()
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .unwrap();
+        let scope = Qwen4BandScope {
+            band: 0..24,
+            input: true,
+            output: false,
+        };
+        assert!(matches!(
+            ep.with_band_scope(&config, &scope),
+            Err(WeightError::EpPlacement(_))
+        ));
+    }
+
+    #[test]
+    fn scoped_assembly_failure_returns_taken_handles_to_the_transaction() {
+        let config = pinned_config();
+        let manifest = Qwen4Manifest::build_with_trunk_tier(&config, DType::Q8_0).unwrap();
+        let scope = Qwen4BandScope {
+            band: 0..24,
+            input: true,
+            output: false,
+        };
+        let placements = manifest.placements_for_scope(&config, &scope, 0).unwrap();
+        let mut store = hipfire_runtime::weight_store::WeightStore::default();
+        for placement in placements.iter().take(5) {
+            let entry = manifest.entry(&placement.name, placement.layer).unwrap();
+            store
+                .stage_alias(
+                    &entry.name,
+                    entry.layer,
+                    0,
+                    "test-source",
+                    hipfire_runtime::weight_store::WeightProjection {
+                        kind: hipfire_runtime::weight_store::WeightProjectionKind::Static,
+                        axis: None,
+                        rank: 0,
+                        world_size: 1,
+                        logical_shape: entry.logical_shape.clone(),
+                        dtype: entry.dtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut tx = WeightLoadTransaction::new(store);
+        assert!(matches!(
+            Qwen4Weights::assemble(
+                &mut tx,
+                &config,
+                &manifest.identity.recipe,
+                &placements,
+                &scope,
+            ),
+            Err(WeightError::MissingPlacement { .. })
+        ));
+        assert_eq!(tx.len(), 5);
+        for placement in placements.iter().take(5) {
+            assert!(tx.contains(&placement.name, placement.layer, 0));
+            assert!(tx.projection(&placement.name, placement.layer, 0).is_some());
+        }
+    }
+}
+
+/// CPU tests of the arena-aware teardown and in-place replacement. Device
+/// buffers are fabricated descriptors that are never dereferenced; the fake
+/// [`ReplaceOps`] records the exact operation order.
+#[cfg(test)]
+mod weight_store_arena_replacement {
+    use super::*;
+    use hip_bridge::DeviceBuffer;
+    use hipfire_runtime::weight_store::{
+        WeightPlacementKey, WeightProjection, WeightProjectionKind,
+    };
+
+    const ROOT_BASE: usize = 0x4000_0000;
+    const TEMP_BASE: usize = 0x9000_0000;
+
+    /// A borrowed arena view.
+    fn view(ptr: usize, size: usize, dtype: DType, shape: &[usize]) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: never dereferenced; tests only read the descriptor.
+            buf: unsafe { DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, size) },
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
+    /// An owned (non-borrowed) tensor descriptor. A VMM-owner tag is the one
+    /// non-borrowed constructor that needs no device.
+    fn owned(ptr: usize, size: usize, dtype: DType, shape: &[usize]) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: never dereferenced or freed; the fake owner only logs.
+            buf: unsafe { DeviceBuffer::from_vmm_owner(ptr as *mut std::ffi::c_void, size) },
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
+    fn taken(handle: WeightHandle, m: usize, k: usize) -> TakenWeight {
+        TakenWeight {
+            key: WeightPlacementKey::new("w", Some(0), 0),
+            handle,
+            projection: WeightProjection {
+                kind: WeightProjectionKind::Static,
+                axis: None,
+                rank: 0,
+                world_size: 1,
+                logical_shape: vec![m, k],
+                dtype: DType::BF16,
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        log: Vec<String>,
+        fail_invalidate: bool,
+        fail_copy: bool,
+    }
+
+    impl ReplaceOps for Fake {
+        fn invalidate_arena_source(&mut self, ptr: usize) -> Result<bool, String> {
+            self.log.push(format!("invalidate:{ptr:#x}"));
+            if self.fail_invalidate {
+                return Err("fake quiesce failure".into());
+            }
+            Ok(true)
+        }
+        fn write_host(&mut self, dst: &DeviceBuffer, bytes: &[u8]) -> Result<(), String> {
+            self.log.push(format!(
+                "write:{:#x}:{}",
+                dst.as_ptr() as usize,
+                bytes.len()
+            ));
+            Ok(())
+        }
+        fn copy_device(
+            &mut self,
+            dst: &DeviceBuffer,
+            src: &DeviceBuffer,
+            bytes: usize,
+        ) -> Result<(), String> {
+            self.log.push(format!(
+                "copy:{:#x}<-{:#x}:{bytes}",
+                dst.as_ptr() as usize,
+                src.as_ptr() as usize
+            ));
+            if self.fail_copy {
+                return Err("fake copy failure".into());
+            }
+            Ok(())
+        }
+        fn free(&mut self, tensor: GpuTensor) -> Result<(), String> {
+            self.log
+                .push(format!("free:{:#x}", tensor.buf.as_ptr() as usize));
+            Ok(())
+        }
+        fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+            self.log.push(format!("upload_qt44:{}", bytes.len()));
+            Ok(owned(
+                TEMP_BASE,
+                bytes.len(),
+                DType::MQ4G256V2,
+                &[bytes.len()],
+            ))
+        }
+    }
+
+    fn ptr_of(taken: &TakenWeight) -> usize {
+        let WeightHandle::Resident(tensor) = &taken.handle else {
+            panic!("not resident")
+        };
+        tensor.buf.as_ptr() as usize
+    }
+
+    #[test]
+    fn free_gpu_skips_borrowed_views_and_frees_owned_tensors() {
+        let handles = vec![
+            taken(
+                WeightHandle::Resident(view(ROOT_BASE, 4096, DType::BF16, &[4, 512])),
+                4,
+                512,
+            ),
+            taken(
+                WeightHandle::Resident(owned(TEMP_BASE, 64, DType::F32, &[16])),
+                1,
+                16,
+            ),
+            taken(WeightHandle::Alias("w".into()), 1, 1),
+            taken(
+                WeightHandle::Resident(view(ROOT_BASE + 4096, 256, DType::BF16, &[1, 128])),
+                1,
+                128,
+            ),
+        ];
+        let mut freed = Vec::new();
+        free_taken_handles(handles, |tensor| {
+            freed.push(tensor.buf.as_ptr() as usize);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            freed,
+            vec![TEMP_BASE],
+            "only the owned tensor reaches the free path"
+        );
+    }
+
+    #[test]
+    fn free_gpu_reports_the_first_owned_free_error_after_attempting_all() {
+        let handles = vec![
+            taken(
+                WeightHandle::Resident(owned(TEMP_BASE, 64, DType::F32, &[16])),
+                1,
+                16,
+            ),
+            taken(
+                WeightHandle::Resident(owned(TEMP_BASE + 64, 64, DType::F32, &[16])),
+                1,
+                16,
+            ),
+        ];
+        let mut attempts = 0;
+        let error = free_taken_handles(handles, |_| {
+            attempts += 1;
+            Err(hip_bridge::HipError::new(7, &format!("fail {attempts}")))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert!(error.message.contains("fail 1"));
+    }
+
+    #[test]
+    fn replaced_owned_weight_still_frees_the_old_tensor() {
+        let mut weight = taken(
+            WeightHandle::Resident(owned(TEMP_BASE, 4096, DType::BF16, &[4, 512])),
+            4,
+            512,
+        );
+        let copy = owned(TEMP_BASE + 0x1000, 544, DType::Q8_0, &[4, 512]);
+        let mut ops = Fake::default();
+        let sizes =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap();
+        assert_eq!(sizes, (4096, 544));
+        assert_eq!(ptr_of(&weight), TEMP_BASE + 0x1000, "the copy is installed");
+        assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
+    }
+
+    #[test]
+    fn every_requant_rule_replaces_in_place_keeping_pointer_and_span_capacity() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        for (target, expected) in [
+            (DType::MQ2G256V2, m * (k / 256) * 72),
+            (DType::MQ3G256V2, m * (k / 256) * 104),
+            (DType::MQ4G256V2, m * (k / 256) * 136),
+            (DType::MQ5G256V2, m * (k / 256) * 168),
+            (DType::MQ6G256V2, m * (k / 256) * 200),
+            (DType::Q8_0, m * (k / 32) * 34),
+        ] {
+            assert_eq!(replacement_payload_bytes(target, m, k), Some(expected));
+            let mut weight = taken(
+                WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+                m,
+                k,
+            );
+            let copy = owned(TEMP_BASE, expected, target, &[m, k]);
+            let mut ops = Fake::default();
+            let (before, after) =
+                replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap();
+            assert_eq!((before, after), (span, expected), "{target:?}");
+            let WeightHandle::Resident(now) = &weight.handle else {
+                panic!("not resident")
+            };
+            assert_eq!(
+                now.buf.as_ptr() as usize,
+                ROOT_BASE,
+                "{target:?}: pointer stable"
+            );
+            assert!(now.buf.is_borrowed(), "{target:?}: still a borrowed view");
+            assert_eq!(now.buf.size(), span, "{target:?}: span capacity preserved");
+            assert_eq!(now.dtype, target);
+            assert_eq!(now.shape, vec![m, k]);
+            // One fence+invalidate, then write, then free only the temporary
+            // owner. The planned span is never freed.
+            assert_eq!(
+                ops.log,
+                vec![
+                    format!("invalidate:{ROOT_BASE:#x}"),
+                    format!("copy:{ROOT_BASE:#x}<-{TEMP_BASE:#x}:{expected}"),
+                    format!("free:{TEMP_BASE:#x}"),
+                ],
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qt44_replacement_writes_the_payload_directly_into_the_span() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let payload = vec![7u8; m * (k / 256) * 136];
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&payload[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (span, payload.len()));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.buf.as_ptr() as usize, ROOT_BASE);
+        assert_eq!(now.buf.size(), span);
+        assert_eq!(now.dtype, DType::MQ4G256V2);
+        assert_eq!(now.shape, vec![payload.len()]);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("write:{ROOT_BASE:#x}:{}", payload.len()),
+            ],
+            "no temporary owner exists, so nothing is uploaded or freed"
+        );
+    }
+
+    #[test]
+    fn a_second_replacement_still_fits_the_original_span_capacity() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let small = vec![1u8; m * (k / 256) * 72];
+        let mut ops = Fake::default();
+        replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&small)),
+        )
+        .unwrap();
+        // A larger payload than the first, still within the planned span.
+        let larger = vec![2u8; m * (k / 256) * 200];
+        let mut ops = Fake::default();
+        let (before, after) = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&larger)),
+        )
+        .unwrap();
+        assert_eq!((before, after), (span, larger.len()));
+        assert_eq!(ptr_of(&weight), ROOT_BASE);
+    }
+
+    #[test]
+    fn an_oversized_replacement_errors_before_any_write() {
+        let span = 1024usize;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[4, 128])),
+            4,
+            256,
+        );
+        let oversized = vec![0u8; span + 1];
+        let mut ops = Fake::default();
+        let error = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&oversized)),
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds the planned arena span"), "{error}");
+        assert!(
+            ops.log.is_empty(),
+            "no invalidate, write or fallback: {:?}",
+            ops.log
+        );
+        assert_eq!(ptr_of(&weight), ROOT_BASE, "the original view is untouched");
+
+        // A kernel-produced tensor too large for the span is refused the same
+        // way, its temporary owner is freed, and nothing is written.
+        let copy = owned(TEMP_BASE, 4 * 4 * 200, DType::MQ6G256V2, &[4, 1024]);
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[4, 128])),
+            4,
+            1024,
+        );
+        let mut ops = Fake::default();
+        let error =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert!(error.contains("exceeds the planned arena span"), "{error}");
+        assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
+        assert_eq!(ptr_of(&weight), ROOT_BASE);
+    }
+
+    #[test]
+    fn a_failed_fence_writes_nothing_and_keeps_the_original_view() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let expected = m * (k / 256) * 136;
+        let copy = owned(TEMP_BASE, expected, DType::MQ4G256V2, &[m, k]);
+        let mut ops = Fake {
+            fail_invalidate: true,
+            ..Fake::default()
+        };
+        let error =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert!(error.contains("fake quiesce failure"));
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("free:{TEMP_BASE:#x}")
+            ],
+            "no write; only the temporary owner is released"
+        );
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(
+            now.dtype,
+            DType::BF16,
+            "the weight keeps its original metadata"
+        );
+
+        let payload = vec![0u8; expected];
+        let mut ops = Fake {
+            fail_invalidate: true,
+            ..Fake::default()
+        };
+        replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Borrowed(&payload)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            ops.log,
+            vec![format!("invalidate:{ROOT_BASE:#x}")],
+            "no write on a failed fence"
+        );
+    }
+
+    #[test]
+    fn a_failed_copy_still_frees_the_temporary_and_keeps_the_view_metadata() {
+        let (m, k) = (4usize, 512usize);
+        let span = m * k * 2;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let expected = m * (k / 256) * 136;
+        let copy = owned(TEMP_BASE, expected, DType::MQ4G256V2, &[m, k]);
+        let mut ops = Fake {
+            fail_copy: true,
+            ..Fake::default()
+        };
+        replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert_eq!(ops.log.last().unwrap(), &format!("free:{TEMP_BASE:#x}"));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.dtype, DType::BF16);
+    }
+
+    #[test]
+    fn replaced_view_does_not_free_the_root_at_teardown() {
+        let (m, k) = (4usize, 512usize);
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, m * k * 2, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Qt44(Cow::Owned(vec![0u8; m * (k / 256) * 136])),
+        )
+        .unwrap();
+        let mut freed = 0;
+        free_taken_handles(vec![weight], |_| {
+            freed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            freed, 0,
+            "the retagged view is still borrowed: the root owner frees it"
+        );
+    }
+
+    #[test]
+    fn a_non_resident_weight_is_refused_and_the_temporary_freed() {
+        let mut weight = taken(WeightHandle::Alias("src".into()), 4, 512);
+        let copy = owned(TEMP_BASE, 544, DType::Q8_0, &[4, 512]);
+        let mut ops = Fake::default();
+        let error =
+            replace_resident_with(&mut ops, &mut weight, Replacement::Tensor(copy)).unwrap_err();
+        assert!(error.contains("not resident"));
+        assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
     }
 }

@@ -26,11 +26,12 @@ extern "C" __global__ void gemv_hfq4g128_moe_down_grouped(
     const float* __restrict__ per_expert_scale,
     const float* __restrict__ act,        // [slots, K]
     float* __restrict__ y,                // [m_total, M]
-    int M, int K
+    int M, int K,
+    int n_experts
 ) {
     const int tile = blockIdx.y;
     const int expert = tile_ids[tile];
-    if (expert < 0) return;
+    if (expert < 0 || expert >= n_experts) return;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int row = blockIdx.x * GD_ROWS + (tid >> 5);

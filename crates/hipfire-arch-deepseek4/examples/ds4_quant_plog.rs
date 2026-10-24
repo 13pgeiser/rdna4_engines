@@ -29,12 +29,12 @@
 //! intentionally not used because it would silently drop intermediate rows.
 
 use hipfire_arch_deepseek4::forward::decode_step;
+use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4Config};
 use hipfire_ds4_parent::manifest::{
     sha256_bytes, sha256_file, CaptureBoundary, CaptureInfo, CorpusInfo, ModelInfo, ModelQuantInfo,
     OutputInfo, OutputKind, ParentManifest, ShardInfo, SourceInfo, MANIFEST_SCHEMA,
 };
 use hipfire_ds4_parent::plog::PlogWriter;
-use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4Config};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -169,12 +169,8 @@ fn run() -> Result<(), String> {
 
     // ── 4. Load model ───────────────────────────────────────────────────
     println!("=== load ===");
-    let mut hfq = HfqFile::open(model_path).map_err(|e| {
-        format!(
-            "deepseek4 parent: open HFQ {}: {e:?}",
-            model_path.display()
-        )
-    })?;
+    let mut hfq = HfqFile::open(model_path)
+        .map_err(|e| format!("deepseek4 parent: open HFQ {}: {e:?}", model_path.display()))?;
     let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
     // Capture path does not need the DSpark sidecar.
     cfg.load_dspark = false;
@@ -215,14 +211,13 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("deepseek4 parent: tokenizer from HFQ: {e:?}"))?;
     println!(
         "tokenizer: bos_id={} eos_id={} vocab~{}",
-        tokenizer.bos_id,
-        tokenizer.eos_id,
-        cfg.vocab_size
+        tokenizer.bos_id, tokenizer.eos_id, cfg.vocab_size
     );
 
     let mut gpu = Gpu::init().map_err(|e| format!("deepseek4 parent: Gpu::init: {e:?}"))?;
     println!("gpu: {}", gpu.arch);
-    if !gpu.arch.contains("gfx942") && std::env::var_os("HIPFIRE_DS4_QUANT_PLOG_ALLOW_NON_GFX942").is_none()
+    if !gpu.arch.contains("gfx942")
+        && std::env::var_os("HIPFIRE_DS4_QUANT_PLOG_ALLOW_NON_GFX942").is_none()
     {
         return Err(format!(
             "deepseek4 parent: gfx942 required for Gate 6 capture (got {}); \
@@ -304,7 +299,10 @@ fn run() -> Result<(), String> {
     }
     w.finish()?;
     let fwd_s = fwd_t0.elapsed().as_secs_f64();
-    println!("forward done in {fwd_s:.3} s ({:.2} tok/s)", n_tokens as f64 / fwd_s.max(1e-9));
+    println!(
+        "forward done in {fwd_s:.3} s ({:.2} tok/s)",
+        n_tokens as f64 / fwd_s.max(1e-9)
+    );
 
     let mean = if n_finite > 0 {
         sum / n_finite as f64
@@ -338,8 +336,7 @@ fn run() -> Result<(), String> {
     let plog_bytes = std::fs::metadata(plog_path)
         .map_err(|e| format!("deepseek4 parent: plog metadata: {e}"))?
         .len();
-    let expect_bytes =
-        8u64 + 4 + 4 + 8 + (n_tokens as u64) * (cfg.vocab_size as u64) * 4;
+    let expect_bytes = 8u64 + 4 + 4 + 8 + (n_tokens as u64) * (cfg.vocab_size as u64) * 4;
     println!("=== plog ===");
     println!(
         "path={} bytes={plog_bytes} (expect {expect_bytes}) sha256={plog_sha}",
@@ -389,11 +386,7 @@ fn run() -> Result<(), String> {
         config_sha256: model_sha.clone(),
         tokenizer_sha256: model_sha.clone(),
     };
-    let quant_label = if cfg.mq2r {
-        "mq2r"
-    } else {
-        "mq2lloyd"
-    };
+    let quant_label = if cfg.mq2r { "mq2r" } else { "mq2lloyd" };
     let route_desc = if let Some(s) = route_scale_override {
         format!("route_scale_override={s} (HIPFIRE_DEEPSEEK4_ROUTE_SCALE); cfg.routed_scaling_factor={cfg_route}")
     } else if cfg.mq2r {
@@ -564,7 +557,10 @@ fn parse_args() -> Result<Args, String> {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--model" => {
-                model = Some(args.next().ok_or("deepseek4 parent: --model needs a value")?);
+                model = Some(
+                    args.next()
+                        .ok_or("deepseek4 parent: --model needs a value")?,
+                );
             }
             "--expect-sha256" => {
                 expect_sha256 = Some(
@@ -579,20 +575,18 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--plog" => {
-                plog = Some(
-                    PathBuf::from(
-                        args.next()
-                            .ok_or("deepseek4 parent: --plog needs a value")?,
-                    ),
-                );
+                plog = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("deepseek4 parent: --plog needs a value")?,
+                ));
             }
             "--route-scale" => {
                 let v = args
                     .next()
                     .ok_or("deepseek4 parent: --route-scale needs a value")?;
-                let s: f32 = v.parse().map_err(|e| {
-                    format!("deepseek4 parent: --route-scale parse {v:?}: {e}")
-                })?;
+                let s: f32 = v
+                    .parse()
+                    .map_err(|e| format!("deepseek4 parent: --route-scale parse {v:?}: {e}"))?;
                 if !s.is_finite() || s <= 0.0 {
                     return Err(format!(
                         "deepseek4 parent: --route-scale must be finite and > 0, got {s}"
@@ -628,9 +622,8 @@ fn parse_args() -> Result<Args, String> {
          usage: ds4_quant_plog --model <path.hfq> --expect-sha256 <hex> \
          --token-ids tokens.bin --plog OUT.plog [--route-scale S] [--manifest PATH]",
     )?;
-    let expect_sha256 = expect_sha256.ok_or(
-        "deepseek4 parent: missing --expect-sha256 (mandatory; refuse-on-mismatch)",
-    )?;
+    let expect_sha256 = expect_sha256
+        .ok_or("deepseek4 parent: missing --expect-sha256 (mandatory; refuse-on-mismatch)")?;
     if expect_sha256.len() != 64 || !expect_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
             "deepseek4 parent: --expect-sha256 must be 64 hex chars, got {:?}",
@@ -691,14 +684,9 @@ fn chdir_to_git_worktree() -> Result<(), String> {
     Ok(())
 }
 
-
 fn read_token_ids(path: &Path) -> Result<Vec<u32>, String> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        format!(
-            "deepseek4 parent: read tokens {}: {e}",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("deepseek4 parent: read tokens {}: {e}", path.display()))?;
     if bytes.len() % 4 != 0 {
         return Err(format!(
             "deepseek4 parent: tokens {} size {} not multiple of 4",

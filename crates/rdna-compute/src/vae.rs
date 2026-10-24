@@ -606,11 +606,7 @@ impl Gpu {
             // grid has y = ceil(rows/th), which a tall image carries past the
             // gfx1201 gridDim.y ceiling of 65535.
             let grid = [
-                fold_grid([
-                    wdt.div_ceil(tw),
-                    rows.div_ceil(th),
-                    c_in.div_ceil(c_tile),
-                ])?,
+                fold_grid([wdt.div_ceil(tw), rows.div_ceil(th), c_in.div_ceil(c_tile)])?,
                 1,
                 1,
             ];

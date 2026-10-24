@@ -136,7 +136,13 @@ impl KTier {
             // is that callers gate on that first. Panicking keeps a
             // compaction path that forgot the gate loud instead of silently
             // compacting a layout no gather kernel can read.
-            KTier::F32 | KTier::Bf16 | KTier::Fp8 | KTier::Hfq4 | KTier::Q4 | KTier::Int8c | KTier::Hfq8 => {
+            KTier::F32
+            | KTier::Bf16
+            | KTier::Fp8
+            | KTier::Hfq4
+            | KTier::Q4
+            | KTier::Int8c
+            | KTier::Hfq8 => {
                 panic!("k_bytes_per_pos undefined for {self:?}")
             }
         }

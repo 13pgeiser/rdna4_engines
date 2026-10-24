@@ -2,15 +2,15 @@
   "module": "gemv_hfq4g256_residual_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "d58bff4b856c26e7b618db469377defa60f18fec",
-  "s_text_sha256": "b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "463cad60ff98ae9eec7ec9d52632745cd8d16acef672b057029cf8c7b42b28dd",
   "kernels": [
     {
       "kernel_id": "gemv_hfq4g256_residual_mq4v2",
       "variant": "exact_four_stream",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "d58bff4b856c26e7b618db469377defa60f18fec",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "kernarg",
@@ -722,7 +722,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f"
+      "s_text_sha256": "463cad60ff98ae9eec7ec9d52632745cd8d16acef672b057029cf8c7b42b28dd"
     }
   ]
 }

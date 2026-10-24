@@ -15,7 +15,7 @@ pub use crate::compiler::KERNEL_CACHE_ABI;
 use crate::kernel_registry::{self, KernelEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Manifest schema version. Bump on any field change.
 pub const PACK_FORMAT: u32 = 1;
@@ -73,6 +73,11 @@ pub struct VerifiedPack {
 /// else. `local_toolchain_id` is the machine's device compiler identity, if
 /// any: a pack from a different compiler build would be rejected by the
 /// runtime and recompiled, so it is rejected here too.
+///
+/// Every symbol an index advertises must also be a kernel the compiled object
+/// exports (registry symbols are a subset of the index by the runtime's own
+/// index check), so an index can neither omit a supported export nor name one
+/// the object lacks.
 pub fn verify_dir(
     arch: &str,
     extra_flags: &str,
@@ -81,7 +86,38 @@ pub fn verify_dir(
 ) -> Result<VerifiedPack, String> {
     let entries = kernel_registry::entries(arch, extra_flags)
         .map_err(|error| format!("no indexed kernel registry for {arch}: {error:?}"))?;
-    verify_entries(&entries, arch, extra_flags, dir, local_toolchain_id)
+    let verified = verify_entries(&entries, arch, extra_flags, dir, local_toolchain_id)?;
+    verify_exports(&entries, arch, dir)?;
+    Ok(verified)
+}
+
+/// Every indexed symbol of every registry module must be exported by the
+/// module's object. All offenders are reported, not the first.
+pub(crate) fn verify_exports(
+    entries: &[KernelEntry],
+    arch: &str,
+    dir: &Path,
+) -> Result<(), String> {
+    let mut unexported = Vec::new();
+    for entry in entries {
+        let object = dir.join(format!("{}.hsaco", entry.module));
+        let bytes = std::fs::read(&object).map_err(|e| format!("{}: {e}", object.display()))?;
+        let exports =
+            code_object_exports(&bytes, arch).map_err(|e| format!("{}: {e}", object.display()))?;
+        for symbol in KernelCompiler::indexed_symbols(dir, entry.module)? {
+            if !exports.contains(&symbol) {
+                unexported.push(format!("{}:{symbol}", entry.module));
+            }
+        }
+    }
+    if unexported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} indexed symbol(s) are not exported by the compiled {arch} objects: {}",
+        unexported.len(),
+        unexported.join(", ")
+    ))
 }
 
 pub(crate) fn verify_entries(
@@ -207,6 +243,32 @@ impl PackManifest {
     }
 }
 
+/// The `kernels/compiled/<arch>` directory beside the executable in
+/// `exe_dir`: where the runtime loads a pack from and `kernel-pack install`
+/// writes one.
+pub fn pack_arch_dir(exe_dir: &Path, arch: &str) -> PathBuf {
+    exe_dir.join("kernels").join("compiled").join(arch)
+}
+
+/// Sibling file `<arch_dir>.manifest.json` where `kernel-pack install`
+/// records the manifest of the pack it installed.
+pub fn installed_manifest_path(arch_dir: &Path) -> PathBuf {
+    let name = arch_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    arch_dir.with_file_name(format!("{name}.manifest.json"))
+}
+
+/// Manifest of the pack installed at `arch_dir`, if `kernel-pack install`
+/// recorded one for this architecture. A missing, unreadable or foreign-arch
+/// record is `None`: the directory then has no known provenance.
+pub fn installed_manifest(arch_dir: &Path) -> Option<PackManifest> {
+    let bytes = std::fs::read(installed_manifest_path(arch_dir)).ok()?;
+    let manifest: PackManifest = serde_json::from_slice(&bytes).ok()?;
+    (arch_dir.file_name()?.to_str()? == manifest.arch).then_some(manifest)
+}
+
 /// Numeric components of a dotted version, ignoring a non-numeric tail in each
 /// component (`7.15.26333-0000000` → `[7, 15, 26333]`).
 fn version_parts(version: &str) -> Option<Vec<u64>> {
@@ -253,11 +315,13 @@ pub fn default_rocm_range(version: &str) -> Option<(String, String)> {
     Some((format!("{major}.{minor}"), format!("{}.0", major + 1)))
 }
 
-/// AMDGPU code-object version of a `--genco` object: an uncompressed clang
-/// offload bundle holding one amdgcn ELF, or that ELF itself.
-pub fn code_object_version(object: &[u8]) -> Result<u32, String> {
+/// The amdgcn ELF of a `--genco` object: an uncompressed clang offload bundle
+/// or that ELF itself. With `arch`, a bundle must carry an image for exactly
+/// that target (`hipv4-amdgcn-amd-amdhsa--<arch>[:features]`; the host entry
+/// and other targets are skipped); without it, the last amdgcn image. A bare
+/// ELF carries no target triple and is taken as is.
+fn device_elf<'a>(object: &'a [u8], arch: Option<&str>) -> Result<&'a [u8], String> {
     const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
-    const ELFOSABI_AMDGPU_HSA: u8 = 64;
     let read_u64 = |at: usize| -> Result<usize, String> {
         let bytes = object
             .get(at..at.checked_add(8).ok_or("offload bundle offset overflow")?)
@@ -281,7 +345,23 @@ pub fn code_object_version(object: &[u8]) -> Result<u32, String> {
                 .ok_or("offload bundle offset overflow")?;
             let triple = object.get(start..end).ok_or("truncated offload bundle")?;
             cursor = end;
-            if size > 0 && triple.windows(6).any(|window| window == b"amdgcn") {
+            let target = std::str::from_utf8(triple)
+                .ok()
+                .and_then(|t| t.rsplit("--").next())
+                .map(|t| t.split(':').next().unwrap_or(t));
+            let amdgcn = triple.windows(6).any(|window| window == b"amdgcn");
+            let wanted = amdgcn
+                && match arch {
+                    None => size > 0,
+                    Some(arch) => target == Some(arch),
+                };
+            if wanted && size == 0 {
+                return Err(format!(
+                    "offload bundle entry `{}` is empty",
+                    String::from_utf8_lossy(triple)
+                ));
+            }
+            if wanted {
                 let stop = offset
                     .checked_add(size)
                     .ok_or("offload bundle offset overflow")?;
@@ -292,18 +372,109 @@ pub fn code_object_version(object: &[u8]) -> Result<u32, String> {
                 );
             }
         }
-        device.ok_or("offload bundle has no amdgcn object")?
+        device.ok_or_else(|| match arch {
+            Some(arch) => format!("offload bundle has no amdgcn image for {arch}"),
+            None => "offload bundle has no amdgcn object".to_owned(),
+        })?
     } else {
         object
     };
+    if object.starts_with(b"CCOB") {
+        return Err("compressed offload bundle (the recipe uses --no-offload-compress)".to_owned());
+    }
     if elf.get(..4) != Some(b"\x7fELF".as_slice()) || elf.len() < 16 {
         return Err("not an ELF code object".to_owned());
     }
+    Ok(elf)
+}
+
+/// AMDGPU code-object version of a `--genco` object: an uncompressed clang
+/// offload bundle holding one amdgcn ELF, or that ELF itself.
+pub fn code_object_version(object: &[u8]) -> Result<u32, String> {
+    const ELFOSABI_AMDGPU_HSA: u8 = 64;
+    let elf = device_elf(object, None)?;
     if elf[7] != ELFOSABI_AMDGPU_HSA {
         return Err(format!("ELF OS/ABI {} is not AMDGPU HSA", elf[7]));
     }
     // EI_ABIVERSION: 2 → code object v4, 3 → v5, 4 → v6.
     Ok(u32::from(elf[8]) + 2)
+}
+
+/// The kernels a code object exports: the global function symbols of its
+/// `.dynsym`, the names `hipModuleGetFunction` resolves. (`<kernel>.kd`
+/// descriptors are data objects, not kernels.) The object is the same
+/// uncompressed bundle or bare ELF [`code_object_version`] accepts.
+pub fn code_object_exports(object: &[u8], arch: &str) -> Result<BTreeSet<String>, String> {
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const SHT_DYNSYM: u64 = 11;
+    const STT_FUNC: u8 = 2;
+    const STB_GLOBAL: u8 = 1;
+    const SYM_SIZE: usize = 24;
+    const SECTION_SIZE: usize = 64;
+    let elf = device_elf(object, Some(arch))?;
+    if elf[4] != ELFCLASS64 || elf[5] != ELFDATA2LSB {
+        return Err("not a little-endian ELF64 code object".to_owned());
+    }
+    let field = |at: usize, len: usize| -> Result<u64, String> {
+        let bytes = at
+            .checked_add(len)
+            .and_then(|end| elf.get(at..end))
+            .ok_or("truncated ELF code object")?;
+        Ok(bytes
+            .iter()
+            .rev()
+            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
+    };
+    let offset = |at: usize, len: usize| -> Result<usize, String> {
+        usize::try_from(field(at, len)?).map_err(|_| "ELF offset overflow".to_owned())
+    };
+    let section_table = offset(0x28, 8)?;
+    let section_entry = offset(0x3a, 2)?;
+    let section_count = offset(0x3c, 2)?;
+    if section_entry < SECTION_SIZE {
+        return Err("ELF section header entries are too small".to_owned());
+    }
+    let section_at = |index: usize| -> Result<usize, String> {
+        index
+            .checked_mul(section_entry)
+            .and_then(|delta| section_table.checked_add(delta))
+            .ok_or_else(|| "ELF section table overflow".to_owned())
+    };
+    let dynsym = (0..section_count)
+        .find_map(|index| {
+            let at = section_at(index).ok()?;
+            (field(at + 4, 4).ok()? == SHT_DYNSYM).then_some(at)
+        })
+        .ok_or("ELF code object has no .dynsym")?;
+    let (symbols, symbols_size) = (offset(dynsym + 24, 8)?, offset(dynsym + 32, 8)?);
+    let strtab_at = section_at(offset(dynsym + 40, 4)?)?;
+    let (strings, strings_size) = (offset(strtab_at + 24, 8)?, offset(strtab_at + 32, 8)?);
+    let strings = strings
+        .checked_add(strings_size)
+        .and_then(|end| elf.get(strings..end))
+        .ok_or("truncated ELF .dynstr")?;
+    let mut exports = BTreeSet::new();
+    for index in 0..symbols_size / SYM_SIZE {
+        let at = symbols + index * SYM_SIZE;
+        let info = *elf.get(at + 4).ok_or("truncated ELF .dynsym")?;
+        let defined = field(at + 6, 2)? != 0;
+        if defined && info & 0xf == STT_FUNC && info >> 4 == STB_GLOBAL {
+            let name = strings
+                .get(offset(at, 4)?..)
+                .ok_or("ELF symbol name outside .dynstr")?;
+            let end = name
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or("unterminated ELF symbol name")?;
+            exports.insert(
+                std::str::from_utf8(&name[..end])
+                    .map_err(|_| "non-UTF-8 ELF symbol name".to_owned())?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(exports)
 }
 
 #[cfg(test)]
@@ -328,5 +499,294 @@ mod tests {
             default_rocm_range("7.2.4"),
             Some(("7.2".into(), "8.0".into()))
         );
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-kpack-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest(arch: &str) -> PackManifest {
+        PackManifest {
+            format: PACK_FORMAT,
+            tag: "v0.4.3".into(),
+            commit: "0".repeat(40),
+            arch: arch.into(),
+            modules: 3,
+            kernel_cache_abi: KERNEL_CACHE_ABI,
+            extra_flags: String::new(),
+            toolchain_id: "HIP version: 7.2".into(),
+            hip_version: "7.2".into(),
+            rocm_version: "7.2.0".into(),
+            code_object_version: 6,
+            rocm_min: "7.2".into(),
+            rocm_max_exclusive: "8.0".into(),
+        }
+    }
+
+    #[test]
+    fn installed_manifest_round_trips_through_the_sibling_file() {
+        let root = scratch("roundtrip");
+        let arch_dir = root.join("gfx1151");
+        let expected = manifest("gfx1151");
+        std::fs::write(
+            installed_manifest_path(&arch_dir),
+            serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_manifest_path(&arch_dir),
+            root.join("gfx1151.manifest.json")
+        );
+        assert_eq!(installed_manifest(&arch_dir), Some(expected));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_manifest_for_another_arch_is_ignored() {
+        let root = scratch("mismatch");
+        let arch_dir = root.join("gfx1151");
+        std::fs::write(
+            installed_manifest_path(&arch_dir),
+            serde_json::to_vec(&manifest("gfx1201")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed_manifest(&arch_dir), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_manifest_missing_or_garbled_is_none() {
+        let root = scratch("missing");
+        let arch_dir = root.join("gfx1151");
+        assert_eq!(installed_manifest(&arch_dir), None);
+        std::fs::write(installed_manifest_path(&arch_dir), b"not json").unwrap();
+        assert_eq!(installed_manifest(&arch_dir), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pack_arch_dir_is_the_executable_neighbour_layout() {
+        assert_eq!(
+            pack_arch_dir(Path::new("/opt/hipfire/bin"), "gfx1151"),
+            Path::new("/opt/hipfire/bin/kernels/compiled/gfx1151")
+        );
+    }
+
+    /// A minimal AMDGPU HSA ELF64 whose `.dynsym` holds `(name, STT_*, STB_*)`
+    /// symbols, all defined (section index 1).
+    fn elf_with_dynsym(symbols: &[(&str, u8, u8)]) -> Vec<u8> {
+        let mut strtab = vec![0u8];
+        let mut symtab = vec![0u8; 24];
+        for (name, kind, bind) in symbols {
+            symtab.extend_from_slice(&(strtab.len() as u32).to_le_bytes());
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+            symtab.push(bind << 4 | kind);
+            symtab.push(0);
+            symtab.extend_from_slice(&1u16.to_le_bytes());
+            symtab.extend_from_slice(&[0u8; 16]);
+        }
+        let symtab_at = 64;
+        let strtab_at = symtab_at + symtab.len();
+        let sections_at = strtab_at + strtab.len();
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // little endian
+        elf[6] = 1;
+        elf[7] = 64; // AMDGPU HSA
+        elf[8] = 4; // code object v6
+        elf[0x28..0x30].copy_from_slice(&(sections_at as u64).to_le_bytes());
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&3u16.to_le_bytes());
+        elf.extend_from_slice(&symtab);
+        elf.extend_from_slice(&strtab);
+        let section = |kind: u32, offset: usize, size: usize, link: u32| {
+            let mut header = vec![0u8; 64];
+            header[4..8].copy_from_slice(&kind.to_le_bytes());
+            header[24..32].copy_from_slice(&(offset as u64).to_le_bytes());
+            header[32..40].copy_from_slice(&(size as u64).to_le_bytes());
+            header[40..44].copy_from_slice(&link.to_le_bytes());
+            header
+        };
+        elf.extend(section(0, 0, 0, 0));
+        elf.extend(section(11, symtab_at, symtab.len(), 2)); // SHT_DYNSYM, strings: section 2
+        elf.extend(section(3, strtab_at, strtab.len(), 0)); // SHT_STRTAB
+        elf
+    }
+
+    const FUNC: u8 = 2;
+    const OBJECT: u8 = 1;
+    const GLOBAL: u8 = 1;
+    const LOCAL: u8 = 0;
+
+    #[test]
+    fn code_object_exports_are_the_global_function_kernels() {
+        let elf = elf_with_dynsym(&[
+            ("kernel_a", FUNC, GLOBAL),
+            ("kernel_a.kd", OBJECT, GLOBAL),
+            ("kernel_b", FUNC, GLOBAL),
+            ("helper", FUNC, LOCAL),
+        ]);
+        let expected: BTreeSet<String> = ["kernel_a", "kernel_b"].map(str::to_owned).into();
+        assert_eq!(code_object_exports(&elf, "gfx1100").unwrap(), expected);
+        assert_eq!(code_object_version(&elf).unwrap(), 6);
+
+        // The same ELF inside an uncompressed offload bundle next to a host entry.
+        let bundle = offload_bundle(&[
+            (b"host-x86_64-unknown-linux-gnu-", &[]),
+            (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &elf),
+        ]);
+        assert_eq!(code_object_exports(&bundle, "gfx1100").unwrap(), expected);
+
+        assert!(code_object_exports(b"not an elf at all, sixteen+ bytes", "gfx1100").is_err());
+        let mut no_symbols = elf.clone();
+        // Retype the dynsym section header (section 1) so no `.dynsym` remains.
+        let sections_at = u64::from_le_bytes(no_symbols[0x28..0x30].try_into().unwrap()) as usize;
+        no_symbols[sections_at + 64 + 4] = 1;
+        assert!(code_object_exports(&no_symbols, "gfx1100")
+            .unwrap_err()
+            .contains(".dynsym"));
+    }
+
+    /// An uncompressed clang offload bundle of `(triple, payload)` entries.
+    fn offload_bundle(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut at = 32 + entries.iter().map(|(t, _)| 24 + t.len()).sum::<usize>();
+        let mut bundle = b"__CLANG_OFFLOAD_BUNDLE__".to_vec();
+        bundle.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (triple, payload) in entries {
+            for value in [at, payload.len(), triple.len()] {
+                bundle.extend_from_slice(&(value as u64).to_le_bytes());
+            }
+            bundle.extend_from_slice(triple);
+            at += payload.len();
+        }
+        for (_, payload) in entries {
+            bundle.extend_from_slice(payload);
+        }
+        bundle
+    }
+
+    #[test]
+    fn bundle_exports_come_from_the_target_arch_image_only() {
+        let g1100 = elf_with_dynsym(&[("only_1100", FUNC, GLOBAL)]);
+        let g1151 = elf_with_dynsym(&[("only_1151", FUNC, GLOBAL)]);
+        let host: (&[u8], &[u8]) = (b"host-x86_64-unknown-linux-gnu-", &[]);
+        let bundle = offload_bundle(&[
+            host,
+            (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &g1100),
+            (b"hipv4-amdgcn-amd-amdhsa--gfx1151:xnack-", &g1151),
+        ]);
+        let names = |arch: &str| {
+            code_object_exports(&bundle, arch).map(|set| set.into_iter().collect::<Vec<_>>())
+        };
+        assert_eq!(names("gfx1100").unwrap(), ["only_1100"]);
+        // A target feature suffix does not change the selected arch.
+        assert_eq!(names("gfx1151").unwrap(), ["only_1151"]);
+        let error = names("gfx1201").unwrap_err();
+        assert!(error.contains("no amdgcn image for gfx1201"), "{error}");
+        // `gfx11` is not a prefix match for gfx1100.
+        assert!(names("gfx11").is_err());
+
+        // A target entry whose payload runs past the file is truncated, not skipped.
+        let truncated = &bundle[..bundle.len() - g1151.len() / 2];
+        assert_eq!(code_object_exports(truncated, "gfx1100").unwrap().len(), 1);
+        let error = code_object_exports(truncated, "gfx1151").unwrap_err();
+        assert!(error.contains("truncated offload bundle entry"), "{error}");
+        // An empty target image is an error for that arch; other arches are unaffected.
+        let empty = offload_bundle(&[host, (b"hipv4-amdgcn-amd-amdhsa--gfx1100", &[])]);
+        assert!(code_object_exports(&empty, "gfx1100")
+            .unwrap_err()
+            .contains("is empty"));
+        // Compressed bundles are refused by name, never read as ELF.
+        let error = code_object_exports(b"CCOB\x03\x00\x00\x00 compressed", "gfx1100").unwrap_err();
+        assert!(error.contains("compressed offload bundle"), "{error}");
+    }
+
+    /// The actual sealed j1778 gfx1100 `tensor_ops.hsaco` (a clang offload bundle:
+    /// host entry + gfx1100 image, not an ELF at offset 0), as staged and copied
+    /// byte for byte: the reader unwraps its target image and returns the 83
+    /// measured kernels; the bare ELF inside gives the same; other targets and a
+    /// truncated file are refused.
+    #[test]
+    fn real_sealed_tensor_ops_bundle_exports_the_measured_kernels() {
+        use sha2::{Digest, Sha256};
+        let bundle: &[u8] =
+            include_bytes!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.hsaco");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bundle)),
+            "bda5593608b016e8adf70a412b114a4799bf7500af9c3d4173be79549de84a3b"
+        );
+        assert!(bundle.starts_with(b"__CLANG_OFFLOAD_BUNDLE__"));
+        assert_eq!(code_object_version(bundle).unwrap(), 6);
+        let measured: BTreeSet<String> =
+            include_str!("../tests/fixtures/pack-closure/tensor_ops-gfx1100-j1778.symbols.txt")
+                .lines()
+                .filter_map(|line| line.strip_prefix("export "))
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(measured.len(), 83);
+        assert_eq!(code_object_exports(bundle, "gfx1100").unwrap(), measured);
+        // The gfx1100 ELF at its bundle offset (4096) is the same image.
+        assert_eq!(
+            code_object_exports(&bundle[4096..], "gfx1100").unwrap(),
+            measured
+        );
+        assert!(code_object_exports(bundle, "gfx1151")
+            .unwrap_err()
+            .contains("no amdgcn image"));
+        assert!(code_object_exports(&bundle[..bundle.len() - 4096], "gfx1100").is_err());
+    }
+
+    #[test]
+    fn pack_export_check_names_every_indexed_symbol_the_object_lacks() {
+        let root = scratch("exports");
+        let entries = vec![KernelEntry {
+            arch: "gfx1100",
+            module: "alpha",
+            symbols: &["alpha_a", "alpha_b", "alpha_c"],
+            source: "".into(),
+            flags: Vec::new(),
+            scheduler_profile: None,
+        }];
+        let write_index = |symbols: &[&str]| {
+            let index = serde_json::json!({
+                "version": 1, "module": "alpha", "symbols": symbols, "arch": "gfx1100",
+                "source_sha256": "", "flags": [], "scheduler_profile": "", "cache_abi": 0,
+                "packaging_key": "", "object_sha256": "", "toolchain_id": "t",
+                "toolchain_sha256": "",
+            });
+            std::fs::write(
+                root.join("alpha.index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+        };
+        std::fs::write(
+            root.join("alpha.hsaco"),
+            elf_with_dynsym(&[("alpha_a", FUNC, GLOBAL), ("alpha_b", FUNC, GLOBAL)]),
+        )
+        .unwrap();
+
+        write_index(&["alpha_a", "alpha_b"]);
+        assert!(verify_exports(&entries, "gfx1100", &root).is_ok());
+        write_index(&["alpha_a", "alpha_b", "alpha_c", "alpha_d"]);
+        let error = verify_exports(&entries, "gfx1100", &root).unwrap_err();
+        assert!(error.contains("2 indexed symbol(s)"), "{error}");
+        assert!(
+            error.contains("alpha:alpha_c") && error.contains("alpha:alpha_d"),
+            "{error}"
+        );
+        assert!(!error.contains("alpha:alpha_a"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

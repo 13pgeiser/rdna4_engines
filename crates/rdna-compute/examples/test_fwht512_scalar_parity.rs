@@ -25,7 +25,9 @@ const ELEMS_PER_LANE: usize = N / LANES; // = 16
 // ---- Scalar reference (matches fwht_forward_512 in turbo_common.h) --------
 
 fn fwht_forward_512_ref(x: &mut [f32; N], signs1: &[f32; N], signs2: &[f32; N]) {
-    for i in 0..N { x[i] *= signs1[i]; }
+    for i in 0..N {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1;
     while stride < N {
         let mut i = 0;
@@ -33,7 +35,7 @@ fn fwht_forward_512_ref(x: &mut [f32; N], signs1: &[f32; N], signs2: &[f32; N]) 
             for j in 0..stride {
                 let a = x[i + j];
                 let b = x[i + j + stride];
-                x[i + j]          = a + b;
+                x[i + j] = a + b;
                 x[i + j + stride] = a - b;
             }
             i += stride * 2;
@@ -41,7 +43,9 @@ fn fwht_forward_512_ref(x: &mut [f32; N], signs1: &[f32; N], signs2: &[f32; N]) 
         stride <<= 1;
     }
     let scale = 1.0_f32 / (N as f32).sqrt(); // 0.0441941738…
-    for i in 0..N { x[i] *= scale * signs2[i]; }
+    for i in 0..N {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 // ---- Shuffle simulation (matches fwht_shfl_forward_512 in turbo_common.h) -
@@ -78,26 +82,34 @@ fn fwht_shfl_forward_512_sim(x: &mut [f32; N], signs1: &[f32; N], signs2: &[f32;
         let v = &mut regs;
         // Pass 1: stride 1 — pairs (0,1),(2,3),(4,5),(6,7),(8,9),(10,11),(12,13),(14,15)
         for k in [0, 2, 4, 6, 8, 10, 12, 14] {
-            let a = v[k][tid]; let b = v[k+1][tid];
-            v[k][tid] = a + b; v[k+1][tid] = a - b;
+            let a = v[k][tid];
+            let b = v[k + 1][tid];
+            v[k][tid] = a + b;
+            v[k + 1][tid] = a - b;
         }
         // Pass 2: stride 2 — pairs (0,2),(1,3),(4,6),(5,7),(8,10),(9,11),(12,14),(13,15)
         for k in [0, 1, 4, 5, 8, 9, 12, 13] {
             let b_idx = k + 2;
-            let a = v[k][tid]; let b = v[b_idx][tid];
-            v[k][tid] = a + b; v[b_idx][tid] = a - b;
+            let a = v[k][tid];
+            let b = v[b_idx][tid];
+            v[k][tid] = a + b;
+            v[b_idx][tid] = a - b;
         }
         // Pass 3: stride 4 — pairs (0,4),(1,5),(2,6),(3,7),(8,12),(9,13),(10,14),(11,15)
         for k in [0, 1, 2, 3, 8, 9, 10, 11] {
             let b_idx = k + 4;
-            let a = v[k][tid]; let b = v[b_idx][tid];
-            v[k][tid] = a + b; v[b_idx][tid] = a - b;
+            let a = v[k][tid];
+            let b = v[b_idx][tid];
+            v[k][tid] = a + b;
+            v[b_idx][tid] = a - b;
         }
         // Pass 4: stride 8 — pairs (0,8),(1,9),(2,10),(3,11),(4,12),(5,13),(6,14),(7,15)
         for k in 0..8 {
             let b_idx = k + 8;
-            let a = v[k][tid]; let b = v[b_idx][tid];
-            v[k][tid] = a + b; v[b_idx][tid] = a - b;
+            let a = v[k][tid];
+            let b = v[b_idx][tid];
+            v[k][tid] = a + b;
+            v[b_idx][tid] = a - b;
         }
     }
 
@@ -145,12 +157,17 @@ fn main() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
-    println!("FWHT-512 scalar-ref vs shuffle-sim: max abs error = {:e}", max_err);
+    println!(
+        "FWHT-512 scalar-ref vs shuffle-sim: max abs error = {:e}",
+        max_err
+    );
     println!("First 8 elements:");
     for i in 0..8 {
         println!(
             "  [{i:3}]  ref={:.7}  sim={:.7}  diff={:.2e}",
-            ref_x[i], sim_x[i], (ref_x[i] - sim_x[i]).abs()
+            ref_x[i],
+            sim_x[i],
+            (ref_x[i] - sim_x[i]).abs()
         );
     }
 
@@ -183,8 +200,13 @@ fn main() {
     let threshold = 1e-5_f32;
     let combined_max = max_err.max(max_err2);
     if combined_max >= threshold {
-        eprintln!("\nFAIL: max abs error {:e} >= {:e}", combined_max, threshold);
+        eprintln!(
+            "\nFAIL: max abs error {:e} >= {:e}",
+            combined_max, threshold
+        );
         std::process::exit(1);
     }
-    println!("\nPASS: fwht_shfl_forward_512 shuffle simulation agrees with scalar reference within 1e-5");
+    println!(
+        "\nPASS: fwht_shfl_forward_512 shuffle simulation agrees with scalar reference within 1e-5"
+    );
 }

@@ -179,7 +179,9 @@ pub struct Fp8VerifyTile {
 const FP8_VERIFY_TILES: [(u8, u8); 7] = [(1, 1), (2, 4), (2, 8), (4, 4), (4, 8), (8, 4), (8, 8)];
 
 fn tile_index(tile: Fp8VerifyTile) -> Option<usize> {
-    FP8_VERIFY_TILES.iter().position(|&(bt, w)| bt == tile.bt && w == tile.waves)
+    FP8_VERIFY_TILES
+        .iter()
+        .position(|&(bt, w)| bt == tile.bt && w == tile.waves)
 }
 
 macro_rules! fp8_symbols {
@@ -226,7 +228,11 @@ pub fn fp8_verify_tile(n: usize, total_m: usize) -> Fp8VerifyTile {
     } else {
         8
     };
-    let bt = if row_tiles >= FP8_VERIFY_HEAD_MIN_ROW_TILES { bt.max(4) } else { bt };
+    let bt = if row_tiles >= FP8_VERIFY_HEAD_MIN_ROW_TILES {
+        bt.max(4)
+    } else {
+        bt
+    };
     let waves = if wide { 8 } else { 4 };
     Fp8VerifyTile { bt, waves }
 }
@@ -236,7 +242,10 @@ pub fn fp8_verify_tile(n: usize, total_m: usize) -> Fp8VerifyTile {
 pub fn fp8_verify_symbol(op: Fp8VerifyOp, tile: Fp8VerifyTile) -> &'static str {
     match tile_index(tile) {
         Some(i) => FP8_VERIFY_SYMBOLS[op.row()][i],
-        None => panic!("fp8_verify_symbol: no bt{}w{} tile in the FP8 verify bundle", tile.bt, tile.waves),
+        None => panic!(
+            "fp8_verify_symbol: no bt{}w{} tile in the FP8 verify bundle",
+            tile.bt, tile.waves
+        ),
     }
 }
 
@@ -275,7 +284,9 @@ fn fp8_err(msg: &str) -> HipError {
 /// Error for an F16-input or non-FP8 MQ4G256V2 GEMM entry reached inside the
 /// FP8 verify scope (fail closed: never a silent F16 route).
 pub(crate) fn fp8_verify_scope_error(what: &str) -> HipError {
-    fp8_err(&format!("{what}: not available inside the FP8 verify scope"))
+    fp8_err(&format!(
+        "{what}: not available inside the FP8 verify scope"
+    ))
 }
 
 /// Whether a target-verify forward can run inside the FP8 verify scope,
@@ -317,7 +328,8 @@ impl Gpu {
                      target, an FP8/Q8/asym KV tier and chain verify)",
                 ));
             }
-            FP8_VERIFY_ANNOUNCE.call_once(|| eprintln!("[cb-verify-fp8] FP8 verify GEMM route active"));
+            FP8_VERIFY_ANNOUNCE
+                .call_once(|| eprintln!("[cb-verify-fp8] FP8 verify GEMM route active"));
         }
         let prev = self.fp8_verify_scope;
         self.fp8_verify_scope = want;
@@ -364,21 +376,31 @@ impl Gpu {
             )));
         }
         if k == 0 || k % 256 != 0 {
-            return Err(fp8_err(&format!("{what}: K must be a positive multiple of 256, got {k}")));
+            return Err(fp8_err(&format!(
+                "{what}: K must be a positive multiple of 256, got {k}"
+            )));
         }
         if n == 0 || n > FP8_VERIFY_MAX_ROWS {
-            return Err(fp8_err(&format!("{what}: N must be 1..={FP8_VERIFY_MAX_ROWS}, got {n}")));
+            return Err(fp8_err(&format!(
+                "{what}: N must be 1..={FP8_VERIFY_MAX_ROWS}, got {n}"
+            )));
         }
         if ms.iter().any(|&m| m == 0) {
-            return Err(fp8_err(&format!("{what}: every projection height must be non-zero ({ms:?})")));
+            return Err(fp8_err(&format!(
+                "{what}: every projection height must be non-zero ({ms:?})"
+            )));
         }
         let total_m: usize = ms.iter().sum();
         if total_m == 0 || total_m >= (1usize << 31) {
-            return Err(fp8_err(&format!("{what}: total M out of range ({total_m})")));
+            return Err(fp8_err(&format!(
+                "{what}: total M out of range ({total_m})"
+            )));
         }
         match n.checked_mul(k) {
             Some(nk) if nk < (1usize << 31) => Ok(()),
-            _ => Err(fp8_err(&format!("{what}: N*K must be below 2^31 (N={n}, K={k})"))),
+            _ => Err(fp8_err(&format!(
+                "{what}: N*K must be below 2^31 (N={n}, K={k})"
+            ))),
         }
     }
 
@@ -386,10 +408,18 @@ impl Gpu {
     /// scratch: one `pack_f32_to_fp8_verify_rows_gfx1201` launch, always
     /// executed (no source-pointer cache). F32 input only. The returned
     /// pointers stay valid until the next pack on this `Gpu`.
-    pub fn fp8_verify_pack_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<Fp8VerifyX> {
+    pub fn fp8_verify_pack_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<Fp8VerifyX> {
         const WHAT: &str = "fp8_verify_pack_x";
         if x.dtype != DType::F32 {
-            return Err(fp8_err(&format!("{WHAT}: activations must be F32, got {:?}", x.dtype)));
+            return Err(fp8_err(&format!(
+                "{WHAT}: activations must be F32, got {:?}",
+                x.dtype
+            )));
         }
         if self.arch != "gfx1201" {
             return Err(fp8_err(&format!("{WHAT}: gfx1201 only, not {}", self.arch)));
@@ -400,12 +430,16 @@ impl Gpu {
             )));
         }
         if n == 0 || n > FP8_VERIFY_MAX_ROWS {
-            return Err(fp8_err(&format!("{WHAT}: N must be 1..={FP8_VERIFY_MAX_ROWS}, got {n}")));
+            return Err(fp8_err(&format!(
+                "{WHAT}: N must be 1..={FP8_VERIFY_MAX_ROWS}, got {n}"
+            )));
         }
         // n <= 128 and k <= 32768, so n * k cannot overflow or reach 2^31.
         let x_ptr = x.buf.as_ptr();
         if (x_ptr as usize) % 16 != 0 {
-            return Err(fp8_err(&format!("{WHAT}: activation pointer must be 16-byte aligned")));
+            return Err(fp8_err(&format!(
+                "{WHAT}: activation pointer must be 16-byte aligned"
+            )));
         }
         if x.buf.size() < n * k * 4 {
             return Err(fp8_err(&format!(
@@ -454,7 +488,11 @@ impl Gpu {
     /// is an error.
     fn fp8_verify_load(&mut self, op: Fp8VerifyOp, tile: Fp8VerifyTile) -> HipResult<&'static str> {
         let symbol = fp8_verify_symbol(op, tile);
-        self.ensure_embedded_kernel(FP8_VERIFY_MODULE, kernels::MQ4_FP8_VERIFY_PM_GFX1201, symbol)?;
+        self.ensure_embedded_kernel(
+            FP8_VERIFY_MODULE,
+            kernels::MQ4_FP8_VERIFY_PM_GFX1201,
+            symbol,
+        )?;
         Ok(symbol)
     }
 
@@ -488,7 +526,8 @@ impl Gpu {
         }
         ints[nm] = k as i32;
         ints[nm + 1] = n as i32;
-        let mut params = [std::ptr::null_mut::<c_void>(); FP8_VERIFY_MAX_PTRS + FP8_VERIFY_MAX_INTS];
+        let mut params =
+            [std::ptr::null_mut::<c_void>(); FP8_VERIFY_MAX_PTRS + FP8_VERIFY_MAX_INTS];
         for (slot, p) in params.iter_mut().zip(ptrs[..np].iter_mut()) {
             *slot = p as *mut _ as *mut c_void;
         }
@@ -504,10 +543,17 @@ impl Gpu {
         ];
         let block = [(32 * waves) as u32, 1, 1];
         let out_bytes = n * total_m * 4;
-        let bytes = m.iter().map(|&mi| crate::profile::hfq4g256_weight_bytes(mi, k)).sum::<usize>()
+        let bytes = m
+            .iter()
+            .map(|&mi| crate::profile::hfq4g256_weight_bytes(mi, k))
+            .sum::<usize>()
             + n * k
             + n * 4
-            + if op == Fp8VerifyOp::Residual { 2 * out_bytes } else { out_bytes };
+            + if op == Fp8VerifyOp::Residual {
+                2 * out_bytes
+            } else {
+                out_bytes
+            };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, bytes);
         let result = self.launch_maybe_blob(symbol, grid, block, 0, &mut params[..np + ni], || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -781,7 +827,13 @@ mod tests {
             let narrow = [(1, 1), (2, 4), (4, 4), (8, 4)][tier];
             let wide = [(2, 8), (2, 8), (4, 8), (8, 8)][tier];
             let head = [(4, 8), (4, 8), (4, 8), (8, 8)][tier];
-            for (total_m, want) in [(5120, narrow), (14336, wide), (16480, wide), (34816, wide), (248320, head)] {
+            for (total_m, want) in [
+                (5120, narrow),
+                (14336, wide),
+                (16480, wide),
+                (34816, wide),
+                (248320, head),
+            ] {
                 let t = fp8_verify_tile(n, total_m);
                 assert_eq!((t.bt, t.waves), want, "n={n} total_m={total_m}");
                 // The batch tiles cover the rows and the tile ships in the bundle.
@@ -816,7 +868,10 @@ mod tests {
     #[test]
     fn symbol_table_names_all_35_entries() {
         let mut seen = std::collections::BTreeSet::new();
-        for (op, name) in OPS.iter().zip(["qkvza", "qkv", "gate_up", "residual", "set"]) {
+        for (op, name) in OPS
+            .iter()
+            .zip(["qkvza", "qkv", "gate_up", "residual", "set"])
+        {
             for &(bt, w) in &FP8_VERIFY_TILES {
                 let sym = fp8_verify_symbol(*op, Fp8VerifyTile { bt, waves: w });
                 assert_eq!(sym, format!("mq4_fp8_verify_{name}_pm_gfx1201_bt{bt}w{w}"));
@@ -841,7 +896,10 @@ mod tests {
     #[test]
     fn unshipped_tiles_are_not_indexed() {
         for (bt, waves) in [(1, 4), (2, 1), (3, 4), (8, 2), (16, 4), (0, 0)] {
-            assert!(tile_index(Fp8VerifyTile { bt, waves }).is_none(), "bt{bt}w{waves}");
+            assert!(
+                tile_index(Fp8VerifyTile { bt, waves }).is_none(),
+                "bt{bt}w{waves}"
+            );
         }
     }
 

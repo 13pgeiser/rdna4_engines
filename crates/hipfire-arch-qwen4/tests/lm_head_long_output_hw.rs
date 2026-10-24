@@ -100,7 +100,9 @@ fn run(rows: usize) {
     }
 
     let bytes = synthetic_mq4_weight();
-    let weight_buf = gpu.upload_raw(&bytes, &[bytes.len()]).expect("weight upload");
+    let weight_buf = gpu
+        .upload_raw(&bytes, &[bytes.len()])
+        .expect("weight upload");
     drop(bytes);
     let weight = WeightRef {
         buf: &weight_buf,
@@ -131,15 +133,25 @@ fn run(rows: usize) {
         .expect("logits (needs >= 2 GiB of free VRAM)");
 
     validate_lm_head(&weight, &hidden, &logits, rows, rows).expect("validate");
-    execute_lm_head(&mut gpu, &weight, &hidden, &logits, rows, rows, Some(&rotation))
-        .expect("all-row head");
+    execute_lm_head(
+        &mut gpu,
+        &weight,
+        &hidden,
+        &logits,
+        rows,
+        rows,
+        Some(&rotation),
+    )
+    .expect("all-row head");
     gpu.hip.device_synchronize().expect("sync");
 
     // The oracle is the same projection of one tile alone, below the limit.
     let ref_logits = gpu
         .alloc_tensor(&[TILE * VOCAB], DType::F32)
         .expect("reference tile");
-    let ref_rotation = gpu.alloc_tensor(&[TILE * K], DType::F32).expect("ref rotation");
+    let ref_rotation = gpu
+        .alloc_tensor(&[TILE * K], DType::F32)
+        .expect("ref rotation");
     let mut first = 0usize;
     while first < rows {
         let len = TILE.min(rows - first);

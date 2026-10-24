@@ -170,7 +170,9 @@ impl Liveness {
             // Upward-exposed uses, forward: a use counts only when no earlier
             // instruction in the block defines the location.
             for &id in &body.layout[start..end] {
-                let Some(inst) = body.insts.get(id) else { continue };
+                let Some(inst) = body.insts.get(id) else {
+                    continue;
+                };
                 let (uses, defs) = inst_use_def(inst);
                 inst_facts.insert(id, (uses.clone(), defs.clone()));
                 for loc in uses {
@@ -194,8 +196,7 @@ impl Liveness {
             .iter()
             .map(|block| (block.id, BTreeSet::new()))
             .collect();
-        let mut queue: VecDeque<BlockId> =
-            body.blocks.iter().rev().map(|block| block.id).collect();
+        let mut queue: VecDeque<BlockId> = body.blocks.iter().rev().map(|block| block.id).collect();
         let mut queued: BTreeSet<BlockId> = queue.iter().copied().collect();
         while let Some(id) = queue.pop_front() {
             queued.remove(&id);
@@ -208,7 +209,11 @@ impl Liveness {
             }
             let mut inn = use_b.get(&id).cloned().unwrap_or_default();
             for loc in out.iter() {
-                if !def_b.get(&id).map(|defs| defs.contains(loc)).unwrap_or(false) {
+                if !def_b
+                    .get(&id)
+                    .map(|defs| defs.contains(loc))
+                    .unwrap_or(false)
+                {
                     inn.insert(*loc);
                 }
             }
@@ -241,17 +246,28 @@ impl Liveness {
                 before.insert(id, live.clone());
             }
         }
-        Self { live_in, live_out, before, after }
+        Self {
+            live_in,
+            live_out,
+            before,
+            after,
+        }
     }
 
     /// Live-in set of a block (empty when the block is unknown).
     pub fn live_in(&self, block: BlockId) -> &BTreeSet<Loc> {
-        self.live_in.get(&block).as_ref().map_or(const { &EMPTY }, |set| set)
+        self.live_in
+            .get(&block)
+            .as_ref()
+            .map_or(const { &EMPTY }, |set| set)
     }
 
     /// Live-out set of a block.
     pub fn live_out(&self, block: BlockId) -> &BTreeSet<Loc> {
-        self.live_out.get(&block).as_ref().map_or(const { &EMPTY }, |set| set)
+        self.live_out
+            .get(&block)
+            .as_ref()
+            .map_or(const { &EMPTY }, |set| set)
     }
 
     /// Live-before set of an instruction, if analysed.
@@ -290,8 +306,12 @@ impl Liveness {
             .collect();
         let mut out = Vec::new();
         for &from in &body.layout {
-            let Some(after) = self.after.get(&from) else { continue };
-            let Some(inst) = body.insts.get(from) else { continue };
+            let Some(after) = self.after.get(&from) else {
+                continue;
+            };
+            let Some(inst) = body.insts.get(from) else {
+                continue;
+            };
             let (_, defs) = inst_use_def(inst);
             let from_block = containing_block(body, from);
             for loc in defs {
@@ -308,9 +328,10 @@ impl Liveness {
                         continue;
                     }
                     let reachable_ok = match (from_block, containing_block(body, id)) {
-                        (Some(fb), Some(tb)) => {
-                            reachable.get(&fb).map(|set| set.contains(&tb)).unwrap_or(false)
-                        }
+                        (Some(fb), Some(tb)) => reachable
+                            .get(&fb)
+                            .map(|set| set.contains(&tb))
+                            .unwrap_or(false),
                         _ => false,
                     };
                     if !reachable_ok {
@@ -327,7 +348,15 @@ impl Liveness {
                 // no later live-before point exists (e.g. use in the same
                 // instruction is impossible, so keep `to == from`).
                 let _ = after;
-                out.push(LiveRange { reg: RegRef { kind, base: index, len: 1 }, from, to });
+                out.push(LiveRange {
+                    reg: RegRef {
+                        kind,
+                        base: index,
+                        len: 1,
+                    },
+                    from,
+                    to,
+                });
             }
         }
         out
@@ -348,7 +377,11 @@ impl Liveness {
             let mut cur = base;
             while cur < end {
                 let len = (end - cur).min(u16::from(u8::MAX)) as u8;
-                free.push(RegRef { kind, base: cur, len });
+                free.push(RegRef {
+                    kind,
+                    base: cur,
+                    len,
+                });
                 cur += u16::from(len);
             }
         };
@@ -419,7 +452,11 @@ mod tests {
         for inst in insts {
             layout.push(arena.insert(inst));
         }
-        Body { insts: arena, blocks: Vec::new(), layout }
+        Body {
+            insts: arena,
+            blocks: Vec::new(),
+            layout,
+        }
     }
 
     fn branch(off: i16) -> Inst {
@@ -445,14 +482,26 @@ mod tests {
 
     fn vdef(base: u16) -> Inst {
         let mut inst = mk("v_mov_b32_e32", Form::Vop1);
-        inst.effects.defs.push(RegRef { kind: Kind::V, base, len: 1 });
+        inst.effects.defs.push(RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        });
         inst
     }
 
     fn vuse(base: u16) -> Inst {
         let mut inst = mk("v_add_nc_u32_e32", Form::Vop2);
-        inst.effects.uses.push(RegRef { kind: Kind::V, base, len: 1 });
-        inst.effects.defs.push(RegRef { kind: Kind::V, base: 100, len: 1 });
+        inst.effects.uses.push(RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        });
+        inst.effects.defs.push(RegRef {
+            kind: Kind::V,
+            base: 100,
+            len: 1,
+        });
         inst
     }
 
@@ -496,7 +545,11 @@ mod tests {
         // later definite-assignment check (C6) must refuse unguarded uses.
         // b0 branch, b1 defines v200, b2 never defines it, b3 is the join.
         let mut def = mk("v_mov_b32_e32", Form::Vop1);
-        def.effects.defs.push(RegRef { kind: Kind::V, base: 200, len: 1 });
+        def.effects.defs.push(RegRef {
+            kind: Kind::V,
+            base: 200,
+            len: 1,
+        });
         let mut body = body_of(vec![
             branch(2),
             def,
@@ -521,8 +574,16 @@ mod tests {
         // True blocks: b0 def+jump, b1 use, b2 branch, b3 body+jump-back.
         // Leaders {0,2,3,4,6}.
         let mut use5 = mk("v_add_nc_u32_e32", Form::Vop2);
-        use5.effects.uses.push(RegRef { kind: Kind::V, base: 5, len: 1 });
-        use5.effects.defs.push(RegRef { kind: Kind::V, base: 6, len: 1 });
+        use5.effects.uses.push(RegRef {
+            kind: Kind::V,
+            base: 5,
+            len: 1,
+        });
+        use5.effects.defs.push(RegRef {
+            kind: Kind::V,
+            base: 6,
+            len: 1,
+        });
         let mut body = body_of(vec![
             vdef(5),
             jump(1),
@@ -539,7 +600,17 @@ mod tests {
         assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
         // The def's range spans the loop back to the back-edge jump.
         let ranges = live.ranges(&body);
-        let r5 = ranges.iter().find(|r| r.reg == RegRef { kind: Kind::V, base: 5, len: 1 }).unwrap();
+        let r5 = ranges
+            .iter()
+            .find(|r| {
+                r.reg
+                    == RegRef {
+                        kind: Kind::V,
+                        base: 5,
+                        len: 1,
+                    }
+            })
+            .unwrap();
         assert_eq!(r5.from, body.layout[0]);
         assert_eq!(r5.to, body.layout[5]);
     }
@@ -552,7 +623,11 @@ mod tests {
         cmpx.effects.implicit.writes |= ImplicitSet::EXEC;
         let mut predicated = mk("v_mov_b32_e32", Form::Vop1);
         predicated.effects.implicit.reads |= ImplicitSet::EXEC;
-        predicated.effects.defs.push(RegRef { kind: Kind::V, base: 7, len: 1 });
+        predicated.effects.defs.push(RegRef {
+            kind: Kind::V,
+            base: 7,
+            len: 1,
+        });
         let mut body = body_of(vec![cmpx, predicated, endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let live = Liveness::analyze(&body);
@@ -564,16 +639,38 @@ mod tests {
     #[test]
     fn free_at_reports_coalesced_dead_ranges() {
         // v0 live across the cursor, everything else free.
-        let mut body = body_of(vec![vdef(0), mk("v_mov_b32_e32", Form::Vop1), vuse(0), endpgm()]);
+        let mut body = body_of(vec![
+            vdef(0),
+            mk("v_mov_b32_e32", Form::Vop1),
+            vuse(0),
+            endpgm(),
+        ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let live = Liveness::analyze(&body);
-        let at = LivePoint { block: BlockId(0), before: Some(body.layout[1]) };
+        let at = LivePoint {
+            block: BlockId(0),
+            before: Some(body.layout[1]),
+        };
         let free = live.free_at(&body, at);
-        let v_ranges: Vec<_> =
-            free.0.iter().filter(|r| r.kind == Kind::V).copied().collect();
-        assert_eq!(v_ranges, vec![RegRef { kind: Kind::V, base: 1, len: 255 }]);
+        let v_ranges: Vec<_> = free
+            .0
+            .iter()
+            .filter(|r| r.kind == Kind::V)
+            .copied()
+            .collect();
+        assert_eq!(
+            v_ranges,
+            vec![RegRef {
+                kind: Kind::V,
+                base: 1,
+                len: 255
+            }]
+        );
         // Past the use, v0 is free again.
-        let at_end = LivePoint { block: BlockId(0), before: Some(body.layout[3]) };
+        let at_end = LivePoint {
+            block: BlockId(0),
+            before: Some(body.layout[3]),
+        };
         let free_end = live.free_at(&body, at_end);
         assert!(free_end.0.iter().any(|r| r.kind == Kind::V && r.base == 0));
     }

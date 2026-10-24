@@ -2293,7 +2293,9 @@ impl KvCache {
         if positions > bound {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("VMM admission refused: {positions} positions exceed logical bound {bound}"),
+                &format!(
+                    "VMM admission refused: {positions} positions exceed logical bound {bound}"
+                ),
             ));
         }
         self.planned_mapped_growth_bytes(gpu, positions)
@@ -2335,8 +2337,9 @@ impl KvCache {
             .iter()
             .find(|t| t.buf.is_vmm_owner())
             .ok_or_else(|| hip_bridge::HipError::new(0, "KV cache has no VMM K owner"))?;
-        gpu.vmm_owner_generation(k)
-            .ok_or_else(|| hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU"))
+        gpu.vmm_owner_generation(k).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")
+        })
     }
 
     /// Per-layer VMM descriptors for this request (index = model layer;
@@ -2353,9 +2356,8 @@ impl KvCache {
         self.vmm_kv_format()?;
         let mapped = self.mapped_token_capacity()?.unwrap_or(0);
         let to_u32 = |v: usize, what: &str| {
-            u32::try_from(v).map_err(|_| {
-                hip_bridge::HipError::new(0, &format!("VMM {what} {v} exceeds u32"))
-            })
+            u32::try_from(v)
+                .map_err(|_| hip_bridge::HipError::new(0, &format!("VMM {what} {v} exceeds u32")))
         };
         let mapped_positions = to_u32(mapped.min(self.vmm_logical_bound()), "mapped prefix")?;
         let logical_bound = to_u32(self.vmm_logical_bound(), "logical bound")?;
@@ -2368,7 +2370,10 @@ impl KvCache {
                     return Ok(VmmKvSlotDesc::MASKED);
                 }
                 if !v.buf.is_vmm_owner() {
-                    return Err(hip_bridge::HipError::new(0, "VMM K owner paired with non-VMM V"));
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM K owner paired with non-VMM V",
+                    ));
                 }
                 gpu.vmm_owner_generation(k).ok_or_else(|| {
                     hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")

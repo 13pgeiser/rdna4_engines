@@ -30,9 +30,7 @@ use crate::forward::{
     parent_layer_forward, parent_layer_forward_traced, ParentForwardScratch, ParentLayerTrace,
     PARENT_HC_DIM, PARENT_HC_MULT,
 };
-use crate::head::{
-    parent_embed, parent_head_with_scratch, ParentHeadScratch, PARENT_VOCAB,
-};
+use crate::head::{parent_embed, parent_head_with_scratch, ParentHeadScratch, PARENT_VOCAB};
 use crate::weights::ParentWeights;
 use crate::{Ds4ParentBackend, ParentQuantConfig};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -217,19 +215,9 @@ pub fn parent_model_forward(
     logits: &GpuTensor,
 ) -> Result<(), String> {
     parent_model_forward_inner(
-        gpu,
-        backend,
-        weights,
-        cfg,
-        scratch,
-        token_ids,
-        start_pos,
-        logits,
-        None,
-        None,
+        gpu, backend, weights, cfg, scratch, token_ids, start_pos, logits, None, None,
     )
 }
-
 
 /// Per-layer HC residual norms after `hc_post_ffn`.
 ///
@@ -488,10 +476,7 @@ fn parent_model_forward_inner(
 
 fn require_dtype(t: &GpuTensor, want: DType, name: &str) -> Result<(), String> {
     if t.dtype != want {
-        return Err(err(format!(
-            "{name} must be {want:?} (got {:?})",
-            t.dtype
-        )));
+        return Err(err(format!("{name} must be {want:?} (got {:?})", t.dtype)));
     }
     Ok(())
 }
@@ -505,7 +490,6 @@ fn require_elems(t: &GpuTensor, n: usize, name: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 /// Per-row L2 norms of HC residual `[rows, hc_mult, dim]`, then median/p90/max,
 /// aggregate L2, and position buckets matching `residual_pos_traj.py`.
@@ -688,7 +672,6 @@ pub fn assert_compress_events(
     }
 }
 
-
 // ── Host-side unit tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -735,14 +718,7 @@ mod tests {
     #[test]
     fn compress_events_pass_when_ratio_layers_fire() {
         // 1024 tokens: ratio-128 → 8, ratio-4 → 256, ratio-0 → 0.
-        let events = vec![
-            (0, 0),
-            (0, 0),
-            (128, 8),
-            (4, 256),
-            (128, 8),
-            (0, 0),
-        ];
+        let events = vec![(0, 0), (0, 0), (128, 8), (4, 256), (128, 8), (0, 0)];
         assert!(assert_compress_events(&events, 1024).is_ok());
     }
 
@@ -798,9 +774,21 @@ mod tests {
         let close = |a: f32, b: f64| (a as f64 - b).abs() <= (1e-5 * b.abs().max(1.0));
 
         assert_eq!(s.n_rows, 1024);
-        assert!(close(s.early128_mean, early_ref), "{} vs {early_ref}", s.early128_mean);
-        assert!(close(s.late128_mean, late_ref), "{} vs {late_ref}", s.late128_mean);
-        assert!(close(s.late_over_early, le_ref), "{} vs {le_ref}", s.late_over_early);
+        assert!(
+            close(s.early128_mean, early_ref),
+            "{} vs {early_ref}",
+            s.early128_mean
+        );
+        assert!(
+            close(s.late128_mean, late_ref),
+            "{} vs {late_ref}",
+            s.late128_mean
+        );
+        assert!(
+            close(s.late_over_early, le_ref),
+            "{} vs {le_ref}",
+            s.late_over_early
+        );
         assert!(
             close(s.early128_ex0_mean, early_ex0_ref),
             "{} vs {early_ex0_ref}",
@@ -831,5 +819,4 @@ mod tests {
         assert_eq!(s.pos512, 0.0); // n <= 512
         assert!((s.pos_last as f64 - 64.0).abs() < 1e-5);
     }
-
 }

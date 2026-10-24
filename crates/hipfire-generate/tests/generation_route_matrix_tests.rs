@@ -26,6 +26,7 @@ fn base() -> GenerationRouteInputs {
         pp: 1,
         has_speculator: false,
         speculator_is_mtp: false,
+        speculator_is_dflash2: false,
         deepseek4_spec_requested: false,
         ngram_can_sample: false,
         temp: 0.0,
@@ -43,18 +44,58 @@ fn base() -> GenerationRouteInputs {
 
 #[test]
 fn dspark_request_is_independent_of_mtp_mode() {
-    assert!(deepseek4_spec_requested_from_policy(
-        Some("dspark"),
-        "off",
-        "off",
-        false,
-    ));
+    // DSpark short-circuits before any MTP verdict, whatever the declared floor.
+    for floor in [false, true] {
+        assert!(deepseek4_spec_requested_from_policy(
+            Some("dspark"),
+            "off",
+            "off",
+            false,
+            floor,
+        ));
+    }
     assert!(!deepseek4_spec_requested_from_policy(
-        None, "off", "auto", true,
+        None, "off", "auto", true, true,
     ));
     assert!(deepseek4_spec_requested_from_policy(
-        None, "auto", "auto", true,
+        None, "auto", "auto", true, true,
     ));
+}
+
+#[test]
+fn deepseek4_native_mtp_auto_without_a_measured_floor_stays_ar_and_explicit_on_still_arms() {
+    // DeepSeek V4's native MTP declares no measured AR floor.
+    let floor = hipfire_arch_deepseek4::MTP_MEASURED_AR_FLOOR;
+    assert!(!floor);
+    // `auto` with the weights present (a loaded head or a DSpark sidecar's
+    // presence flag) must not rearm without the capability.
+    assert!(!deepseek4_spec_requested_from_policy(
+        None, "auto", "auto", true, floor,
+    ));
+    // No weights: `auto` is AR either way.
+    assert!(!deepseek4_spec_requested_from_policy(
+        None, "auto", "auto", false, true,
+    ));
+    // A declared floor admits `auto` (weights present) exactly as before.
+    assert!(deepseek4_spec_requested_from_policy(
+        None, "auto", "auto", true, true,
+    ));
+    // Explicit `on` (model or process) still requests MTP without the floor.
+    assert!(deepseek4_spec_requested_from_policy(
+        None, "auto", "on", false, floor,
+    ));
+    assert!(deepseek4_spec_requested_from_policy(
+        None, "on", "auto", false, floor,
+    ));
+    // Explicit `off` never does, floor or not.
+    for floor in [false, true] {
+        assert!(!deepseek4_spec_requested_from_policy(
+            None, "off", "on", true, floor,
+        ));
+        assert!(!deepseek4_spec_requested_from_policy(
+            None, "auto", "off", true, floor,
+        ));
+    }
 }
 
 /// One canonical input row that selects each ALL variant (coverage guard).
@@ -162,6 +203,18 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             GenerationRoute::MapleAr,
             GenerationRouteInputs {
                 arch_id: 15,
+                has_speculator: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
+            // Gemma 4 has one route. `has_speculator: true` is deliberate: an
+            // attached EAGLE drafter must not move a turn off `gemma4_ar`
+            // (the developer-gated spec branch is chosen inside the producer).
+            GenerationRoute::Gemma4Ar,
+            GenerationRouteInputs {
+                arch_id: 13,
                 has_speculator: true,
                 temp: 0.0,
                 ..base()
@@ -287,6 +340,11 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // terminal, parsing calls with the same Qwen `<tool_call>` parser as
     // `qwen_ar` because Maple's vendor template emits the identical shape.
     GenerationRoute::MapleAr,
+    // Arch 13, legacy contract like Maple. `generate_gemma4` renders tools
+    // through the embedded template, withholds the model's native
+    // `<|tool_call>call:NAME{ARGS}<tool_call|>` blocks from content and stages
+    // the parsed calls on a `finish_reason=tool_calls` commit_ready terminal.
+    GenerationRoute::Gemma4Ar,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -912,11 +970,11 @@ fn cache_disabled_inputs_plan_cold_through_the_shared_planner() {
     assert_plan(&got, &divergent, 37, Some(37), "cache enabled divergence");
 }
 
-/// Route isolation: only the native MTP speculator selects the Qwen4 spec
-/// route; an n-gram (non-MTP) speculator on arch 16 stays on Qwen4 AR even
-/// when it can sample. Both routes plan their prefix through the bundle's
-/// session cache (`SessionRoute::Ar` / `SessionRoute::Mtp`), never through the
-/// shared conversation planner.
+/// Route isolation: only the native MTP speculator and the DFlash2 drafter
+/// select the Qwen4 spec route; an n-gram (non-MTP, non-DFlash2) speculator
+/// on arch 16 stays on Qwen4 AR even when it can sample. Both routes plan
+/// their prefix through the bundle's session cache (`SessionRoute::Ar` /
+/// `SessionRoute::Mtp`), never through the shared conversation planner.
 #[test]
 fn non_mtp_speculators_on_qwen4_stay_on_ar() {
     for ngram_can_sample in [false, true] {
@@ -933,6 +991,68 @@ fn non_mtp_speculators_on_qwen4_stay_on_ar() {
             "{ngram:?}"
         );
     }
+}
+
+/// DFlash2 on Qwen4: greedy and sampled requests take the spec route on one
+/// card; any token penalty (DFlash2 applies none), pipeline parallelism,
+/// adaptive KV and the force-AR switches keep the AR producer.
+#[test]
+fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
+    let dflash2 = GenerationRouteInputs {
+        arch_id: 16,
+        has_speculator: true,
+        speculator_is_dflash2: true,
+        supports_temp_swor: true,
+        supports_chain_nucleus_verify: true,
+        ..base()
+    };
+    for temp in [0.0f32, 1.0] {
+        let request = GenerationRouteInputs { temp, ..dflash2 };
+        assert_eq!(
+            select_generation_route(&request),
+            GenerationRoute::Qwen4Spec,
+            "{request:?}"
+        );
+        for refused in [
+            GenerationRouteInputs {
+                nonneutral_penalties: true,
+                ..request
+            },
+            GenerationRouteInputs { pp: 2, ..request },
+            GenerationRouteInputs {
+                kv_adaptive: true,
+                ..request
+            },
+            GenerationRouteInputs {
+                force_ar_chat: true,
+                ..request
+            },
+            GenerationRouteInputs {
+                temp_spec_env_off: true,
+                ..request
+            },
+            GenerationRouteInputs {
+                has_speculator: false,
+                ..request
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&refused),
+                GenerationRoute::Qwen4Ar,
+                "{refused:?}"
+            );
+        }
+    }
+    // A sampled request needs a drafter that verifies at temperature.
+    let greedy_only = GenerationRouteInputs {
+        temp: 1.0,
+        supports_temp_swor: false,
+        ..dflash2
+    };
+    assert_eq!(
+        select_generation_route(&greedy_only),
+        GenerationRoute::Qwen4Ar
+    );
 }
 
 /// Native MTP stays the native Qwen4 route whether or not an n-gram-style
@@ -968,7 +1088,8 @@ fn qwen4_native_mtp_with_ngram_flag_remains_the_native_route() {
 }
 
 #[test]
-fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
+fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_maple_ar_and_gemma4_ar(
+) {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
         .copied()
@@ -978,13 +1099,49 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 10);
+    assert_eq!(from_all.len(), 11);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
             assert!(!r.supports_tools(), "{:?} must not be tool-safe", r);
         }
     }
+}
+
+/// Gemma 4 (arch 13) used to fall through every arch arm to `unknown`, so a
+/// tools request was refused as "tools are not supported on producer route
+/// unknown". It now has its own named, tool-capable route whatever the
+/// sampling or drafter state; only EP (no Gemma EP producer) stays unknown.
+#[test]
+fn gemma4_is_classified_and_routes_tools() {
+    for (temp, has_speculator, nonneutral_penalties) in [
+        (0.0, false, false),
+        (0.0, true, false),
+        (0.7, true, false),
+        (0.7, false, true),
+    ] {
+        let route = select_generation_route(&GenerationRouteInputs {
+            arch_id: 13,
+            temp,
+            has_speculator,
+            nonneutral_penalties,
+            ..base()
+        });
+        assert_eq!(route, GenerationRoute::Gemma4Ar);
+        assert_eq!(route.name(), "gemma4_ar");
+        assert!(pure_tools_gate(route, true).allowed);
+        assert!(!route.supports_stop());
+        let adapter = generation_route_adapter(route).expect("gemma4 adapter");
+        assert_eq!(adapter.route, GenerationRoute::Gemma4Ar);
+    }
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            arch_id: 13,
+            ep: true,
+            ..base()
+        }),
+        GenerationRoute::Unknown
+    );
 }
 
 #[test]

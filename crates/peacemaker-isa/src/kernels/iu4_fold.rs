@@ -11,7 +11,11 @@
 //! [`MAGIC`]; the fold is `sum = fma(RN(d * sc), float(C), sum)` with
 //! `float(C) = bits(C + magic) - 1.5*2^23` ([`MAGIC_NEG`]), exact for
 //! `|C| < 2^22`.
-use crate::{Arch, Builder, V, insn::Wmma, vopd::{Operand, VopdF32, VopdOp}};
+use crate::{
+    insn::Wmma,
+    vopd::{Operand, VopdF32, VopdOp},
+    Arch, Builder, V,
+};
 
 /// int32 bit pattern of 12582912.0f: the WMMA chain seed.
 pub const MAGIC: u32 = 0x4b40_0000;
@@ -27,8 +31,22 @@ pub const XBLK_BYTES: u32 = 72;
 
 /// One WMMA step of a magic-seeded chain: the first step of an epoch reads
 /// the seed registers, later steps accumulate in place.
-pub fn wmma_step(b: &mut Builder, arch: Arch, dst: V<8>, a: V<2>, x: V<2>, first: bool, magic: V<8>) -> Result<(), String> {
-    b.push(Wmma::iu4(arch, dst, a, x, Some(if first { magic } else { dst })))
+pub fn wmma_step(
+    b: &mut Builder,
+    arch: Arch,
+    dst: V<8>,
+    a: V<2>,
+    x: V<2>,
+    first: bool,
+    magic: V<8>,
+) -> Result<(), String> {
+    b.push(Wmma::iu4(
+        arch,
+        dst,
+        a,
+        x,
+        Some(if first { magic } else { dst }),
+    ))
 }
 
 /// Fold one 8-element accumulator fragment as 12 VOPD packets:
@@ -40,14 +58,34 @@ pub fn wmma_step(b: &mut Builder, arch: Arch, dst: V<8>, a: V<2>, x: V<2>, first
 pub fn fold_pass(b: &mut Builder, c: u8, sum: u8, sc: u8, d: u8, t: u8) -> Result<(), String> {
     let ts = |j: u8| t + (j ^ 2);
     for j in 0..8u8 {
-        let mul = VopdOp { op: VopdF32::Mul, dst: ts(j), src0: Operand::V(d), src1: sc + j };
+        let mul = VopdOp {
+            op: VopdF32::Mul,
+            dst: ts(j),
+            src0: Operand::V(d),
+            src1: sc + j,
+        };
         let cf = c + (j ^ 1);
-        let add = VopdOp { op: VopdF32::Add, dst: cf, src0: Operand::Lit(MAGIC_NEG), src1: cf };
+        let add = VopdOp {
+            op: VopdF32::Add,
+            dst: cf,
+            src0: Operand::Lit(MAGIC_NEG),
+            src1: cf,
+        };
         b.vopd(mul, add)?;
     }
     for j in (0..8u8).step_by(2) {
-        let x = VopdOp { op: VopdF32::Fmac, dst: sum + j, src0: Operand::V(ts(j)), src1: c + j };
-        let y = VopdOp { op: VopdF32::Fmac, dst: sum + j + 1, src0: Operand::V(ts(j + 1)), src1: c + j + 1 };
+        let x = VopdOp {
+            op: VopdF32::Fmac,
+            dst: sum + j,
+            src0: Operand::V(ts(j)),
+            src1: c + j,
+        };
+        let y = VopdOp {
+            op: VopdF32::Fmac,
+            dst: sum + j + 1,
+            src0: Operand::V(ts(j + 1)),
+            src1: c + j + 1,
+        };
         b.vopd(x, y)?;
     }
     Ok(())

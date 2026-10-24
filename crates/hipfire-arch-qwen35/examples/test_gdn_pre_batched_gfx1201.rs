@@ -175,13 +175,18 @@ fn main() {
         }
 
         // Old path, verbatim hook order.
-        gpu.fused_sigmoid_alpha_gate_f32_batched(
-            &old.beta, &old.alpha, &dt_bias, &a_log, N_V, n,
-        )
-        .expect("old sigmoid");
+        gpu.fused_sigmoid_alpha_gate_f32_batched(&old.beta, &old.alpha, &dt_bias, &a_log, N_V, n)
+            .expect("old sigmoid");
         gpu.conv1d_silu_split_f32_n(
-            &old.q_raw, &old.k_raw, &old.v, &qkv_in, &conv_w, &old.conv_state, K_DIM,
-            V_DIM, n,
+            &old.q_raw,
+            &old.k_raw,
+            &old.v,
+            &qkv_in,
+            &conv_w,
+            &old.conv_state,
+            K_DIM,
+            V_DIM,
+            n,
         )
         .expect("old conv");
         gpu.fused_qk_l2_norm_scale_interleave_f32_batched(

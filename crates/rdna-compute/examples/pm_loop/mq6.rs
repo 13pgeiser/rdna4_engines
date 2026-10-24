@@ -1,0 +1,1103 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+
+//! `mq6_i8_gemm` workload: the builder-emitted MQ6G256V2 x A8 `block_i8_128`
+//! INT8 prefill GEMM for gfx1201 (`peacemaker-isa emit --kernel mq6_i8_gemm`)
+//! against the shipped object `kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco`.
+//!
+//! # Shape grammar
+//! `M=<rows>,N=<tokens>,K=<k>` (all three required, any order), `K % 256 == 0`,
+//! `M % 4 == 0` (the PM entries store whole row quads, `mq6_i8_pm_admits`),
+//! `N >= 1`; ragged M/N tiles are handled by the kernel. Or a preset
+//! `fn:<name>`, the Fn gfx1201 prefill shapes
+//! (N in {4096, 16384} x (M, K) in {(10240,2560), (6144,2560), (12288,2560),
+//! (2560,6144), (512,2560), (128,2560)}):
+//!
+//! ```text
+//! fn:m10240k2560-n4096   fn:m10240k2560-n16384
+//! fn:m6144k2560-n4096    fn:m6144k2560-n16384
+//! fn:m12288k2560-n4096   fn:m12288k2560-n16384
+//! fn:m2560k6144-n4096    fn:m2560k6144-n16384
+//! fn:m512k2560-n4096     fn:m512k2560-n16384
+//! fn:m128k2560-n4096     fn:m128k2560-n16384
+//! ```
+//!
+//! # Knobs (candidate; names as `peacemaker-isa emit --kernel mq6_i8_gemm`)
+//! `epi` (`set` F32 | `set_bf16` BF16 bits), `raster` (`banded`, the product,
+//! default | `linear`, the CPU-interpreter raster), `tile` (`128x128`, the
+//! shipped tile, default | `256x128` | `128x256`: weight rows x tokens per
+//! workgroup; the two wide tiles run 16 waves of the same 32 x 64 per-wave tile,
+//! 55296 B of LDS). The launch of the `128x128` tile is exactly the runtime's
+//! (`gemm_mq6g256v2_i8_prequant`, `mq6_i8_launch`): grid
+//! `[ceil(M/128), ceil(N/128), 1]`, 256 threads, 36864 B dynamic LDS, kernarg
+//! `A, Xq, Y` pointers then `M, K, N` and the PM image's seventh word (`0`); the
+//! other tiles' grid, block and LDS follow the spec (`Tile::{rows, tokens,
+//! threads, layout}`). The baseline is always the shipped `128x128` object and
+//! launches with its own geometry; the output is the same bits for every tile
+//! (exact integer dot, the same per-element fold order), so
+//! `identical_to_baseline` stays required.
+//!
+//! # Baseline
+//! The shipped PM object's 128x128 entry (the pre-128x256 kernel, byte for byte; the
+//! runtime now takes the `_t128x256` entries of the same object for wide launches,
+//! `gemm_mq6_i8.rs` `mq6_i8_pm_token_tile`): `gemm_mq6g256v2_mmq_i8_pm_set_gfx1201` (F32) or
+//! `..._pm_set_bf16_gfx1201` (BF16) (`gemm_mq6_i8.rs` `MQ6_I8_PM_ENTRY_*`; the
+//! hipcc entry `mq6_i8_entry` is the non-admitted fallback and is not in this
+//! object). Selection file:line and the object sha256 go in
+//! `baseline.source`.
+//!
+//! # Correctness
+//! The candidate must be bitwise equal to the shipped baseline (the driver
+//! requires `identical_to_baseline` for this workload) AND equal, bit for bit,
+//! to the CPU reference (a transcription of the kernel's exact arithmetic,
+//! `crates/peacemaker-isa/tests/mq6_i8_gemm.rs::reference`: per K128 block the
+//! integer chain `C = sum q*qx`, `fc = float(C - 32*s)`, then
+//! `acc = fma(RN(s_h*d), fc, acc); acc = fma(RN(z'_h*d), float(s), acc)` with
+//! `z' = fma(32, s_h, z_h)`; BF16 = `isfinite ? RNE : truncate` of `0 + acc`).
+//! The reference is exact; it is evaluated on all `(row, token)` pairs while
+//! `M*N*K <= 2e9` MACs, else on a sampled grid (rows `0..64`, the last 64 and
+//! `n` spread; the same for tokens): `--ref-rows` / `--ref-cols`
+//! `full|sample:<n>` (default `sample:192`). The record names the covered rows
+//! and tokens and the mismatch count.
+//!
+//! # Inputs (deterministic)
+//! Weights in the exact MQ6G256V2 format (`mq6_fp8_gemm_bench.rs::gen_weights`
+//! distribution: `s = f16(1e-4 + |N(0,1)|*1e-3)`, `z = f16(-32 s + N(0,1) s)`,
+//! uniform 6-bit codes); activations N(0,1) with 0.1% x30 outliers quantized to
+//! A8 blocks `{f32 d = amax/127, i32 s = sum q, i8 qs[128]}` laid `[K/128][N]`
+//! (qs byte `j` holds natural K element `nat(j)`, the producer's nibble-pair
+//! order).
+//!
+//! # `--emu`
+//! Runs the candidate object on the peacemaker emulator at M=132,N=130,K=512 and
+//! compares every output element with the reference. The emulator has no SALU
+//! float-reciprocal semantics, so the banded raster is refused with the
+//! emulator's own message: use `--raster linear`.
+
+use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
+use crate::iu4::{abi_signature, max_diff, sample_rows};
+use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Raster, Spec, Tile};
+use peacemaker_isa::Arch;
+use rdna_compute::Gpu;
+use serde_json::{json, Value};
+use std::cell::OnceCell;
+use std::path::Path;
+
+const GROUP_BYTES: usize = 200;
+const XBLK_BYTES: usize = 136;
+const FULL_REF_MACS: u128 = 2_000_000_000;
+const OBJECT: &str = "kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco";
+
+/// `(preset name, M, K)` of the Fn gfx1201 shapes, each at both N.
+const FN_MK: [(&str, usize, usize); 6] = [
+    ("m10240k2560", 10240, 2560),
+    ("m6144k2560", 6144, 2560),
+    ("m12288k2560", 12288, 2560),
+    ("m2560k6144", 2560, 6144),
+    ("m512k2560", 512, 2560),
+    ("m128k2560", 128, 2560),
+];
+const FN_N: [usize; 2] = [4096, 16384];
+
+/// Every `fn:<name>` preset with its `(M, N, K)`.
+fn fn_presets() -> Vec<(String, (usize, usize, usize))> {
+    FN_MK
+        .iter()
+        .flat_map(|&(name, m, k)| {
+            FN_N.iter()
+                .map(move |&n| (format!("{name}-n{n}"), (m, n, k)))
+        })
+        .collect()
+}
+
+fn parse_shape(s: &str) -> Result<(usize, usize, usize)> {
+    if let Some(name) = s.strip_prefix("fn:") {
+        return fn_presets()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, mnk)| mnk)
+            .ok_or_else(|| {
+                format!(
+                    "unknown preset fn:{name} (one of {})",
+                    fn_presets()
+                        .iter()
+                        .map(|(n, _)| format!("fn:{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+    }
+    let (mut m, mut n, mut k) = (None, None, None);
+    for part in s.split(',') {
+        let (key, v) = part
+            .split_once('=')
+            .ok_or_else(|| format!("shape `{s}`: expected M=..,N=..,K=.. or fn:<name>"))?;
+        let v: usize = v
+            .trim()
+            .parse()
+            .map_err(|e| format!("shape `{s}`: {key}: {e}"))?;
+        let slot = match key.trim() {
+            "M" => &mut m,
+            "N" => &mut n,
+            "K" => &mut k,
+            other => return Err(format!("shape `{s}`: unknown dimension `{other}`")),
+        };
+        if slot.replace(v).is_some() {
+            return Err(format!("shape `{s}`: duplicate {key}"));
+        }
+    }
+    match (m, n, k) {
+        (Some(m), Some(n), Some(k)) => Ok((m, n, k)),
+        _ => Err(format!("shape `{s}`: M, N and K are all required")),
+    }
+}
+
+/// xorshift64*.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    /// Uniform in `(0, 1]`.
+    fn unit(&mut self) -> f64 {
+        ((self.next() >> 11) + 1) as f64 / (1u64 << 53) as f64
+    }
+    /// Standard normal (Box-Muller, one variate per call).
+    fn normal(&mut self) -> f64 {
+        let (a, b) = (self.unit(), self.unit());
+        (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+    }
+}
+
+fn f16_bits(x: f64) -> u16 {
+    half::f16::from_f64(x).to_bits()
+}
+
+fn f16_val(b: u16) -> f32 {
+    half::f16::from_bits(b).to_f32()
+}
+
+/// `m` rows x `k/256` MQ6G256V2 groups (the bench's distribution).
+fn synth_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut r = Rng::new(seed);
+    let mut w = vec![0u8; m * (k / 256) * GROUP_BYTES];
+    for g in w.chunks_exact_mut(GROUP_BYTES) {
+        for h in 0..2 {
+            let s = half::f16::from_f64(1e-4 + r.normal().abs() * 1e-3);
+            let sf = f64::from(s.to_f32());
+            g[4 * h..4 * h + 2].copy_from_slice(&s.to_bits().to_le_bytes());
+            let z = f16_bits(-32.0 * sf + r.normal() * sf);
+            g[4 * h + 2..4 * h + 4].copy_from_slice(&z.to_le_bytes());
+        }
+        for c in g[8..].chunks_mut(8) {
+            let v = r.next().to_le_bytes();
+            c.copy_from_slice(&v[..c.len()]);
+        }
+    }
+    w
+}
+
+/// Natural K index (within the K128 block) of qs byte `j` (nibble-pair order).
+fn nat(j: usize) -> usize {
+    let (g, r) = (j / 8, j % 8);
+    8 * g + if r < 4 { 2 * r } else { 2 * (r - 4) + 1 }
+}
+
+/// A8 blocks `[K/128][N]` from N(0,1) activations with 0.1% x30 outliers.
+fn synth_x(n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut r = Rng::new(seed);
+    let mut x = vec![0u8; k / 128 * n * XBLK_BYTES];
+    let mut v = [0f32; 128];
+    // qs byte j holds natural element nat(j): the inverse permutation.
+    let mut inv_nat = [0usize; 128];
+    for j in 0..128 {
+        inv_nat[nat(j)] = j;
+    }
+    for kb in 0..k / 128 {
+        for t in 0..n {
+            for e in &mut v {
+                let g = r.normal();
+                *e = (if r.next() % 1000 == 0 { g * 30.0 } else { g }) as f32;
+            }
+            let amax = v.iter().fold(0f32, |a, e| a.max(e.abs()));
+            let d = amax / 127.0;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let o = (kb * n + t) * XBLK_BYTES;
+            let mut sum = 0i32;
+            for (i, e) in v.iter().enumerate() {
+                let q = (e * inv).round().clamp(-127.0, 127.0) as i32;
+                sum += q;
+                x[o + 8 + inv_nat[i]] = q as i8 as u8;
+            }
+            x[o..o + 4].copy_from_slice(&d.to_le_bytes());
+            x[o + 4..o + 8].copy_from_slice(&sum.to_le_bytes());
+        }
+    }
+    x
+}
+
+pub struct Host {
+    /// `[M][K/256][200]`.
+    w: Vec<u8>,
+    /// `[K/128][N][136]`.
+    x: Vec<u8>,
+}
+
+impl Host {
+    fn synth(m: usize, n: usize, k: usize) -> Self {
+        Self {
+            w: synth_weights(m, k, 0x9e37_79b9_7f4a_7c15),
+            x: synth_x(n, k, 0x1234_5678_9abc_def1),
+        }
+    }
+}
+
+/// 6-bit code `c` (natural index) of K128 half `half` of one group.
+fn code(group: &[u8], half: usize, c: usize) -> i32 {
+    let bits = 6 * c;
+    let payload = &group[8 + 96 * half..8 + 96 * half + 96];
+    let (byte, sh) = (bits / 8, bits % 8);
+    let v = u32::from(payload[byte]) | u32::from(*payload.get(byte + 1).unwrap_or(&0)) << 8;
+    ((v >> sh) & 63) as i32
+}
+
+/// Output element bits (F32 bits, or BF16 bits in the low 16) of `acc`.
+fn out_bits(acc: f32, bf16: bool) -> u32 {
+    if !bf16 {
+        return acc.to_bits();
+    }
+    let y = 0.0f32 + acc;
+    let u = y.to_bits();
+    if y.is_finite() {
+        u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16
+    } else {
+        u >> 16
+    }
+}
+
+/// Reference bits for `rows` x `cols` (row-major in `rows` order, `cols` within).
+fn reference(
+    host: &Host,
+    m: usize,
+    n: usize,
+    k: usize,
+    bf16: bool,
+    rows: &[usize],
+    cols: &[usize],
+) -> Vec<u32> {
+    let _ = m;
+    let (gpr, nkb) = (k / 256, k / 128);
+    let mut out = vec![0u32; rows.len() * cols.len()];
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    let per = rows.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (rs, os) in rows.chunks(per).zip(out.chunks_mut(per * cols.len())) {
+            s.spawn(move || {
+                // codes[kb][j]: the code paired with qs byte j; (s_h, z'_h) per kb.
+                let mut codes = vec![0i32; k];
+                let mut sz = vec![(0f32, 0f32); nkb];
+                for (&r, orow) in rs.iter().zip(os.chunks_exact_mut(cols.len())) {
+                    for kb in 0..nkb {
+                        let (gi, h) = (kb / 2, kb % 2);
+                        let grp = &host.w[(r * gpr + gi) * GROUP_BYTES..][..GROUP_BYTES];
+                        for j in 0..128 {
+                            codes[kb * 128 + j] = code(grp, h, nat(j));
+                        }
+                        let sh = f16_val(u16::from_le_bytes([grp[4 * h], grp[4 * h + 1]]));
+                        let zh = f16_val(u16::from_le_bytes([grp[4 * h + 2], grp[4 * h + 3]]));
+                        sz[kb] = (sh, 32.0f32.mul_add(sh, zh));
+                    }
+                    for (&t, o) in cols.iter().zip(orow.iter_mut()) {
+                        let mut acc = 0.0f32;
+                        for kb in 0..nkb {
+                            let xb = &host.x[(kb * n + t) * XBLK_BYTES..][..XBLK_BYTES];
+                            let d = f32::from_le_bytes(xb[0..4].try_into().unwrap());
+                            let sx = i32::from_le_bytes(xb[4..8].try_into().unwrap());
+                            let cq: i32 = codes[kb * 128..][..128]
+                                .iter()
+                                .zip(&xb[8..])
+                                .map(|(&q, &b)| q * i32::from(b as i8))
+                                .sum();
+                            let fc = (cq - 32 * sx) as f32;
+                            let (sh, zp) = sz[kb];
+                            acc = (sh * d).mul_add(fc, acc);
+                            acc = (zp * d).mul_add(sx as f32, acc);
+                        }
+                        *o = out_bits(acc, bf16);
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Explicit kernarg: `A Xq Y` at 0/8/16, `M K N` at 24/28/32 and the PM image's
+/// seventh word `unused = 0` at 36 (`gemm_mq6g256v2_i8_prequant`).
+fn pack(a: u64, xq: u64, y: u64, m: usize, k: usize, n: usize) -> Vec<u8> {
+    let mut b = Vec::with_capacity(40);
+    for p in [a, xq, y] {
+        put_ptr(&mut b, p);
+    }
+    for v in [m, k, n, 0] {
+        put_i32(&mut b, v as i32);
+    }
+    b
+}
+
+/// `full` or `sample:<n>` indices over `0..dim`.
+fn parse_axis(mode: &str, dim: usize, flag: &str) -> Result<(Vec<usize>, String)> {
+    if mode == "full" {
+        Ok(((0..dim).collect(), "full".to_owned()))
+    } else if let Some(c) = mode.strip_prefix("sample:") {
+        let c: usize = c.parse().map_err(|e| format!("--{flag} {mode}: {e}"))?;
+        Ok((sample_rows(dim, c.max(2)), format!("sample:{c}")))
+    } else {
+        Err(format!("--{flag} {mode}: expected full|sample:<n>"))
+    }
+}
+
+struct Dev {
+    w: hip_bridge::DeviceBuffer,
+    x: hip_bridge::DeviceBuffer,
+    y: [hip_bridge::DeviceBuffer; 2],
+}
+
+pub struct Mq6 {
+    m: usize,
+    n: usize,
+    k: usize,
+    cand: Spec,
+    /// `--rip`: source path and text of the candidate script.
+    rip: Option<(String, String)>,
+    /// `--base-tile` / `--base-rip`: the baseline is an emitted (or scripted) variant of this spec
+    /// instead of the shipped object (hill-climbing against a tile's generator output).
+    base: Option<(Spec, Option<(String, String)>)>,
+    rows: Vec<usize>,
+    rows_desc: String,
+    cols: Vec<usize>,
+    cols_desc: String,
+    host: Option<Host>,
+    dev: Option<Dev>,
+    reference: OnceCell<Vec<u32>>,
+}
+
+fn parse_spec(epi: &str, raster: &str, tile: &str) -> Result<Spec> {
+    let epi: Epi = epi.parse()?;
+    let tile: Tile = tile.parse().map_err(|e| format!("--tile: {e}"))?;
+    let raster = match raster {
+        "banded" => Raster::Banded,
+        "linear" => Raster::Linear,
+        o => return Err(format!("--raster {o}: expected banded|linear")),
+    };
+    let spec = Spec {
+        epi,
+        raster,
+        tile,
+        arch: Arch::Gfx1201,
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn Workload>> {
+    let (m, n, k) = parse_shape(shape)?;
+    if m == 0 || n == 0 || k == 0 || k % 256 != 0 || m % 4 != 0 {
+        return Err(format!(
+            "shape M={m},N={n},K={k}: need M%4==0, K%256==0, N>=1"
+        ));
+    }
+    let (epi_k, raster_k, tile_k) = (
+        knobs.take_or("epi", "set"),
+        knobs.take_or("raster", "banded"),
+        knobs.take_or("tile", "128x128"),
+    );
+    let cand = parse_spec(&epi_k, &raster_k, &tile_k)?;
+    let (base_tile, base_rip) = (knobs.take("base-tile"), knobs.take("base-rip"));
+    let base = if base_tile.is_some() || base_rip.is_some() {
+        let spec = parse_spec(&epi_k, &raster_k, base_tile.as_deref().unwrap_or(&tile_k))?;
+        let rip = match &base_rip {
+            Some(p) => Some((
+                p.clone(),
+                std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?,
+            )),
+            None => None,
+        };
+        Some((spec, rip))
+    } else {
+        None
+    };
+    let macs = (m as u128) * (n as u128) * (k as u128);
+    let default = if macs <= FULL_REF_MACS {
+        "full"
+    } else {
+        "sample:192"
+    };
+    let (rows, rows_desc) = parse_axis(&knobs.take_or("ref-rows", default), m, "ref-rows")?;
+    let (cols, cols_desc) = parse_axis(&knobs.take_or("ref-cols", default), n, "ref-cols")?;
+    let rip = match rip {
+        Some(p) => Some((
+            p.display().to_string(),
+            std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        )),
+        None => None,
+    };
+    Ok(Box::new(Mq6 {
+        m,
+        n,
+        k,
+        cand,
+        rip,
+        base,
+        rows,
+        rows_desc,
+        cols,
+        cols_desc,
+        host: None,
+        dev: None,
+        reference: OnceCell::new(),
+    }))
+}
+
+/// Compile `.rip` source for `spec`, refuse unless its ABI equals that of
+/// `mq6_i8_gemm::emit(spec)`; returns the ELF, symbol and the `candidate.rip`
+/// fields (`variant`, `sha256`, `identical_to_generator`).
+fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
+    let variant = spec.variant_name();
+    let compiled = peacemaker_rip::compile(source, spec.arch, &variant)?;
+    let generator = mq6_i8_gemm::emit(spec)?;
+    let symbol = spec.symbol();
+    let elf = peacemaker_isa::native::assemble(&compiled.s_text, spec.arch)?;
+    let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, spec.arch)?;
+    let got = abi_signature(&elf, &symbol)
+        .map_err(|e| format!("compiled kernel does not expose {symbol}: {e}"))?;
+    let want = abi_signature(&gen_elf, &symbol)?;
+    if got != want {
+        return Err(format!(
+            "ABI mismatch with mq6_i8_gemm::emit({variant}):\n  .rip:      {got}\n  generator: {want}"
+        ));
+    }
+    let info = json!({
+        "sha256": sha256_hex(source.as_bytes()),
+        "variant": variant,
+        "identical_to_generator": compiled.s_text == generator.s_text,
+    });
+    Ok((elf, symbol, info))
+}
+
+/// `(grid, threads, dynamic LDS)` of `tile`'s launch at `M` rows and `N` tokens.
+fn geometry(m: usize, n: usize, tile: Tile) -> ([u32; 3], u32, u32) {
+    (
+        [
+            m.div_ceil(tile.rows() as usize) as u32,
+            n.div_ceil(tile.tokens() as usize) as u32,
+            1,
+        ],
+        tile.threads(),
+        tile.layout().launch,
+    )
+}
+
+impl Mq6 {
+    fn bf16(&self) -> bool {
+        self.cand.epi == Epi::SetBf16
+    }
+
+    fn width(&self) -> usize {
+        if self.bf16() {
+            2
+        } else {
+            4
+        }
+    }
+
+    fn out_bytes(&self) -> usize {
+        self.n * self.m * self.width()
+    }
+
+    fn emitted(&self) -> Result<Object> {
+        let e = mq6_i8_gemm::emit(self.cand)?;
+        let elf = peacemaker_isa::native::assemble(&e.s_text, self.cand.arch)?;
+        let symbol = self.cand.symbol();
+        Ok(Object {
+            source: json!({
+                "source": "peacemaker_isa::kernels::mq6_i8_gemm::emit + native::assemble (peacemaker-isa emit --co)",
+                "variant": self.cand.variant_name(),
+                "sha256": sha256_hex(&elf),
+            }),
+            desc: json!({"knobs": self.knobs_json()}),
+            exports: vec![symbol.clone()],
+            launch_symbol: symbol,
+            bytes: elf,
+        })
+    }
+
+    fn rip_object(&self, path: &str, text: &str) -> Result<Object> {
+        let (elf, symbol, mut info) = compile_rip(text, self.cand)?;
+        info["path"] = json!(path);
+        Ok(Object {
+            source: json!({
+                "source": format!("peacemaker_rip::compile({path}) + native::assemble"),
+                "variant": self.cand.variant_name(),
+                "sha256": sha256_hex(&elf),
+            }),
+            desc: json!({"knobs": self.knobs_json(), "rip": info}),
+            exports: vec![symbol.clone()],
+            launch_symbol: symbol,
+            bytes: elf,
+        })
+    }
+
+    fn knobs_json(&self) -> Value {
+        json!({"epi": self.cand.epi.name(), "raster": match self.cand.raster {
+            Raster::Banded => "banded",
+            Raster::Linear => "linear",
+        }, "tile": self.cand.tile.name()})
+    }
+
+    /// Run the candidate object on the emulator at a small shape and compare
+    /// every element with the reference.
+    fn run_emu(&self) -> Result<Value> {
+        use peacemaker_ir::emu::{Emulator, Launch as ELaunch, Memory};
+        let obj = self.candidate()?;
+        let lifted = peacemaker_lift::lift_object(
+            &obj.bytes,
+            peacemaker_lift::Options {
+                frontend: peacemaker_ir::inst::Frontend::Builder,
+            },
+        )
+        .map_err(|e| format!("lift: {e:?}"))?;
+        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?;
+        let (m, n, k) = (132usize, 130usize, 512usize);
+        let host = Host::synth(m, n, k);
+        let (kva, ava, xva, yva) = (
+            0x1000_0000u64,
+            0x2000_0000u64,
+            0x3000_0000u64,
+            0x4000_0000u64,
+        );
+        let tile = self.cand.tile;
+        let (gx, gy) = (
+            m.div_ceil(tile.rows() as usize),
+            n.div_ceil(tile.tokens() as usize),
+        );
+        let mut kern = pack(ava, xva, yva, m, k, n);
+        kern.resize(self.cand.kernargs().size as usize, 0);
+        for (off, v) in [(40, gx as u32), (44, gy as u32), (48, 1)] {
+            kern[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut mem = Memory::default();
+        mem.map("kernarg".into(), kva, kern)?;
+        let ylen = n * m * self.width();
+        for (name, va, bytes) in [
+            ("a", ava, host.w.clone()),
+            ("xq", xva, host.x.clone()),
+            ("y", yva, vec![0; ylen]),
+        ] {
+            let len = bytes.len() as u64;
+            mem.map(name.into(), va, bytes)?;
+            mem.map(format!("{name}_tail"), va + len, vec![0; 4096])?;
+        }
+        for y in 0..gy {
+            for x in 0..gx {
+                emu.run_workgroup(
+                    &ELaunch {
+                        kernarg_ptr: kva,
+                        workgroup: [x as u32, y as u32, 0],
+                        block: [tile.threads(), 1, 1],
+                        dynamic_lds: tile.layout().launch,
+                    },
+                    &mut mem,
+                )?;
+            }
+        }
+        let got = mem.read(yva, ylen)?;
+        let rows: Vec<usize> = (0..m).collect();
+        let cols: Vec<usize> = (0..n).collect();
+        let want = reference(&host, m, n, k, self.bf16(), &rows, &cols);
+        let w = self.width();
+        let mismatches = (0..m)
+            .flat_map(|r| (0..n).map(move |c| (r, c)))
+            .filter(|&(r, c)| {
+                let o = (c * m + r) * w;
+                let bits = if w == 2 {
+                    u32::from(u16::from_le_bytes([got[o], got[o + 1]]))
+                } else {
+                    u32::from_le_bytes(got[o..o + 4].try_into().unwrap())
+                };
+                bits != want[r * n + c]
+            })
+            .count();
+        Ok(json!({
+            "ran": true,
+            "shape": {"M": m, "N": n, "K": k},
+            "symbol": obj.launch_symbol,
+            "reference": "cpu_mq6_i8_fold",
+            "mismatching_elements": mismatches,
+            "bit_exact": mismatches == 0,
+        }))
+    }
+}
+
+impl Workload for Mq6 {
+    fn kernel(&self) -> &'static str {
+        "mq6_i8_gemm"
+    }
+    fn arch(&self) -> &'static str {
+        "gfx1201"
+    }
+    fn shape_json(&self) -> Value {
+        json!({"M": self.m, "N": self.n, "K": self.k})
+    }
+    fn candidate_knobs(&self) -> Value {
+        let mut v = self.knobs_json();
+        v["variant"] = json!(self.cand.variant_name());
+        v
+    }
+    fn requires_baseline_identity(&self) -> bool {
+        true
+    }
+
+    fn candidate(&self) -> Result<Object> {
+        match &self.rip {
+            Some((path, text)) => self.rip_object(path, text),
+            None => self.emitted(),
+        }
+    }
+
+    fn baseline(&self) -> Result<Object> {
+        if let Some((spec, rip)) = &self.base {
+            let (elf, symbol) = match rip {
+                Some((path, text)) => {
+                    let (elf, symbol, _) = compile_rip(text, *spec)?;
+                    let _ = path;
+                    (elf, symbol)
+                }
+                None => {
+                    let e = mq6_i8_gemm::emit(*spec)?;
+                    (
+                        peacemaker_isa::native::assemble(&e.s_text, spec.arch)?,
+                        spec.symbol(),
+                    )
+                }
+            };
+            return Ok(Object {
+                source: json!({
+                    "source": "--base-tile/--base-rip: second emitted (or scripted) variant, not the shipped object",
+                    "variant": spec.variant_name(),
+                    "base_rip": rip.as_ref().map(|(p, _)| p.clone()),
+                    "sha256": sha256_hex(&elf),
+                }),
+                desc: json!({"variant": spec.variant_name()}),
+                exports: vec![symbol.clone()],
+                launch_symbol: symbol,
+                bytes: elf,
+            });
+        }
+        let bytes = rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201;
+        let symbol = match self.cand.epi {
+            Epi::Set => "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
+            Epi::SetBf16 => "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201",
+        };
+        if !contains(bytes, symbol.as_bytes()) {
+            return Err(format!(
+                "symbol {symbol} is not in the shipped object {OBJECT}"
+            ));
+        }
+        Ok(Object {
+            bytes: bytes.to_vec(),
+            launch_symbol: symbol.to_owned(),
+            exports: vec![symbol.to_owned()],
+            desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded"}}),
+            source: json!({
+                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries); \
+                           entry choice mq6_i8_pm_launch / mq6_i8_pm_token_tile and embedded-module load (gemm_mq6g256v2_i8_prequant), \
+                           admission mq6_i8_pm_admits, 128x128 launch (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
+                "artifact": OBJECT,
+                "kernels_const": "crates/rdna-compute/src/kernels.rs:4434 GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201",
+                "sha256": sha256_hex(bytes),
+            }),
+        })
+    }
+
+    fn setup(&mut self, gpu: &Gpu) -> Result<()> {
+        let host = Host::synth(self.m, self.n, self.k);
+        let up = |b: &[u8]| -> Result<hip_bridge::DeviceBuffer> {
+            let d = gpu.hip.malloc(b.len().max(16)).map_err(dev_err)?;
+            gpu.hip.memcpy_htod(&d, b).map_err(dev_err)?;
+            Ok(d)
+        };
+        let out = self.out_bytes().max(16);
+        let dev = Dev {
+            w: up(&host.w)?,
+            x: up(&host.x)?,
+            y: [
+                gpu.hip.malloc(out).map_err(dev_err)?,
+                gpu.hip.malloc(out).map_err(dev_err)?,
+            ],
+        };
+        self.host = Some(host);
+        self.dev = Some(dev);
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            self.reset(gpu, arm)?;
+        }
+        Ok(())
+    }
+
+    fn launch(&self, arm: Arm) -> Launch {
+        let dev = self.dev.as_ref().expect("launch before setup");
+        let ptr = |b: &hip_bridge::DeviceBuffer| b.as_ptr() as u64;
+        let y = match arm {
+            Arm::Baseline => &dev.y[0],
+            Arm::Candidate => &dev.y[1],
+        };
+        // The baseline is the shipped 128x128 kernel whatever the candidate's tile is; each
+        // arm's grid, block and LDS follow its own tile.
+        let tile = match arm {
+            Arm::Baseline => self.base.as_ref().map_or(Tile::T128x128, |(s, _)| s.tile),
+            Arm::Candidate => self.cand.tile,
+        };
+        let (grid, threads, lds) = geometry(self.m, self.n, tile);
+        Launch {
+            kernarg: pack(ptr(&dev.w), ptr(&dev.x), ptr(y), self.m, self.k, self.n),
+            grid,
+            block: [threads, 1, 1],
+            lds,
+        }
+    }
+
+    fn reset(&self, gpu: &Gpu, arm: Arm) -> Result<()> {
+        let dev = self.dev.as_ref().ok_or("reset before setup")?;
+        let y = match arm {
+            Arm::Baseline => &dev.y[0],
+            Arm::Candidate => &dev.y[1],
+        };
+        gpu.hip.memset(y, 0, y.size()).map_err(dev_err)
+    }
+
+    fn output(&self, gpu: &Gpu, arm: Arm) -> Result<Vec<u8>> {
+        let dev = self.dev.as_ref().ok_or("output before setup")?;
+        let y = match arm {
+            Arm::Baseline => &dev.y[0],
+            Arm::Candidate => &dev.y[1],
+        };
+        let mut v = vec![0u8; y.size()];
+        gpu.hip.memcpy_dtoh(&mut v, y).map_err(dev_err)?;
+        v.truncate(self.out_bytes());
+        Ok(v)
+    }
+
+    fn check(&self, out: &[u8]) -> Result<RefReport> {
+        if out.len() != self.out_bytes() {
+            return Err(format!(
+                "output is {} bytes, expected {}",
+                out.len(),
+                self.out_bytes()
+            ));
+        }
+        let host = self.host.as_ref().ok_or("check before setup")?;
+        let want = self.reference.get_or_init(|| {
+            reference(
+                host,
+                self.m,
+                self.n,
+                self.k,
+                self.bf16(),
+                &self.rows,
+                &self.cols,
+            )
+        });
+        let w = self.width();
+        let (mut mismatches, mut worst) = (0usize, 0f64);
+        for (ri, &r) in self.rows.iter().enumerate() {
+            for (ci, &t) in self.cols.iter().enumerate() {
+                let o = (t * self.m + r) * w;
+                let bits = if w == 2 {
+                    u32::from(u16::from_le_bytes([out[o], out[o + 1]]))
+                } else {
+                    u32::from_le_bytes(out[o..o + 4].try_into().unwrap())
+                };
+                let exp = want[ri * self.cols.len() + ci];
+                if bits != exp {
+                    mismatches += 1;
+                    worst = worst.max(max_diff(&out[o..o + w], &exp_bytes(exp, w), w));
+                }
+            }
+        }
+        Ok(RefReport {
+            reference: format!(
+                "cpu_mq6_i8_fold(rows={},tokens={},elements={},mismatching_elements={mismatches})",
+                self.rows_desc,
+                self.cols_desc,
+                self.rows.len() * self.cols.len()
+            ),
+            max_abs_err: worst,
+            tolerance: 0.0,
+            pass: mismatches == 0,
+        })
+    }
+
+    fn max_abs_diff(&self, a: &[u8], b: &[u8]) -> Result<f64> {
+        if a.len() != b.len() {
+            return Err(format!("length mismatch {} vs {}", a.len(), b.len()));
+        }
+        Ok(max_diff(a, b, self.width()))
+    }
+
+    fn emu(&self) -> Value {
+        match self.run_emu() {
+            Ok(v) => v,
+            Err(e) => Value::String(format!("refused ({e})")),
+        }
+    }
+}
+
+fn exp_bytes(bits: u32, w: usize) -> Vec<u8> {
+    if w == 2 {
+        (bits as u16).to_le_bytes().to_vec()
+    } else {
+        bits.to_le_bytes().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn knobs(kv: &[(&str, &str)]) -> Knobs {
+        Knobs(kv.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect())
+    }
+
+    #[test]
+    fn shape_grammar_and_presets() {
+        assert_eq!(
+            parse_shape("M=12288,N=16384,K=2560").unwrap(),
+            (12288, 16384, 2560)
+        );
+        assert_eq!(parse_shape("K=256,N=1,M=4").unwrap(), (4, 1, 256));
+        assert!(parse_shape("M=4,N=1").is_err());
+        assert!(parse_shape("M=4,N=1,K=256,K=256").is_err());
+        assert!(parse_shape("fn:nope").is_err());
+        assert!(new("M=4,N=1,K=128", &mut knobs(&[]), None).is_err());
+        assert!(new("M=6,N=1,K=256", &mut knobs(&[]), None).is_err());
+    }
+
+    #[test]
+    fn fn_preset_table_is_the_twelve_fn_shapes() {
+        let p = fn_presets();
+        assert_eq!(p.len(), 12);
+        let mut mnk: Vec<_> = p.iter().map(|(_, s)| *s).collect();
+        mnk.sort_unstable();
+        mnk.dedup();
+        assert_eq!(mnk.len(), 12, "every preset is a distinct shape");
+        for (mk, n) in FN_MK
+            .iter()
+            .flat_map(|mk| FN_N.iter().map(move |n| (mk, n)))
+        {
+            assert!(mnk.contains(&(mk.1, *n, mk.2)), "{mk:?} N={n}");
+        }
+        assert_eq!(
+            parse_shape("fn:m12288k2560-n16384").unwrap(),
+            (12288, 16384, 2560)
+        );
+        assert_eq!(
+            parse_shape("fn:m2560k6144-n4096").unwrap(),
+            (2560, 4096, 6144)
+        );
+        for (name, (m, _, k)) in &p {
+            assert!(
+                m % 4 == 0 && k % 256 == 0,
+                "{name} must satisfy the PM gate"
+            );
+        }
+    }
+
+    #[test]
+    fn knob_to_spec_and_symbol() {
+        let w = new(
+            "fn:m128k2560-n4096",
+            &mut knobs(&[("epi", "set_bf16"), ("raster", "linear")]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(w.kernel(), "mq6_i8_gemm");
+        assert_eq!(w.candidate_knobs()["variant"], "128x128x8-set_bf16-linear");
+        assert!(w.requires_baseline_identity());
+        let d = new("M=128,N=128,K=256", &mut knobs(&[]), None).unwrap();
+        assert_eq!(d.candidate_knobs()["variant"], "128x128x8-set");
+        assert!(new("M=128,N=128,K=256", &mut knobs(&[("epi", "add")]), None).is_err());
+        assert!(new("M=128,N=128,K=256", &mut knobs(&[("raster", "x")]), None).is_err());
+        assert!(new(
+            "M=128,N=128,K=256",
+            &mut knobs(&[("ref-rows", "some")]),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tile_knob_selects_the_tile_and_the_launch_follows_it() {
+        for (knob, variant, grid, block, lds) in [
+            ("128x128", "128x128x8-set", [3u32, 2, 1], 256u32, 36864u32),
+            ("256x128", "256x128x16-set", [2, 2, 1], 512, 55296),
+            ("128x256", "128x256x16-set", [3, 1, 1], 512, 55296),
+        ] {
+            let w = new("M=260,N=130,K=256", &mut knobs(&[("tile", knob)]), None).unwrap();
+            assert_eq!(w.candidate_knobs()["variant"], variant);
+            assert_eq!(
+                w.candidate_knobs()["tile"],
+                variant.split('-').next().unwrap()
+            );
+            let c = w.candidate().unwrap();
+            assert!(c
+                .launch_symbol
+                .starts_with("gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"));
+            // The baseline is the shipped object whatever the tile.
+            assert_eq!(
+                w.baseline().unwrap().launch_symbol,
+                "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"
+            );
+            let tile: Tile = knob.parse().unwrap();
+            assert_eq!(geometry(260, 130, tile), (grid, block, lds), "{knob}");
+        }
+        assert!(new("M=128,N=128,K=256", &mut knobs(&[("tile", "64x64")]), None).is_err());
+    }
+
+    #[test]
+    fn baseline_is_the_shipped_pm_entry() {
+        for (epi, sym) in [
+            ("set", "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"),
+            ("set_bf16", "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201"),
+        ] {
+            let w = new("M=128,N=128,K=256", &mut knobs(&[("epi", epi)]), None).unwrap();
+            let b = w.baseline().unwrap();
+            assert_eq!(b.launch_symbol, sym);
+            assert_eq!(b.source["artifact"], OBJECT);
+            assert_eq!(b.source["sha256"].as_str().unwrap().len(), 64);
+        }
+    }
+
+    #[test]
+    fn emitted_candidate_symbol_follows_spec() {
+        let w = new(
+            "M=128,N=128,K=256",
+            &mut knobs(&[("raster", "linear")]),
+            None,
+        )
+        .unwrap();
+        let c = w.candidate().unwrap();
+        assert_eq!(
+            c.launch_symbol,
+            "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_linear"
+        );
+    }
+
+    #[test]
+    fn launch_is_the_runtime_geometry() {
+        let mut w = new("M=260,N=130,K=256", &mut knobs(&[]), None).unwrap();
+        let _ = &mut w;
+        let b = pack(1, 2, 3, 260, 256, 130);
+        assert_eq!(b.len(), 40);
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 3);
+        for (off, v) in [(24, 260), (28, 256), (32, 130), (36, 0)] {
+            assert_eq!(i32::from_le_bytes(b[off..off + 4].try_into().unwrap()), v);
+        }
+    }
+
+    #[test]
+    fn reference_hand_case() {
+        // One row, one token, K=256: all codes 32 (q-32 = 0) and qx = 1 => C part 0,
+        // acc = fma(RN(z'*d), s, 0) with z' = fma(32, s_h, z_h) = z_h + 32 s_h.
+        let (m, n, k) = (4usize, 1usize, 256usize);
+        let mut w = vec![0u8; m * 200];
+        for r in 0..m {
+            let g = &mut w[r * 200..(r + 1) * 200];
+            for h in 0..2 {
+                g[4 * h..4 * h + 2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+                g[4 * h + 2..4 * h + 4].copy_from_slice(&f16_bits(-16.0).to_le_bytes());
+            }
+            // 6-bit code 32 = 0b100000 everywhere: bit 5 of every 6-bit field.
+            for half in 0..2 {
+                let p = &mut g[8 + 96 * half..8 + 96 * half + 96];
+                for c in 0..128 {
+                    let bit = 6 * c + 5;
+                    p[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+        }
+        let mut x = vec![0u8; 2 * XBLK_BYTES];
+        for kb in 0..2 {
+            let o = kb * XBLK_BYTES;
+            x[o..o + 4].copy_from_slice(&2.0f32.to_le_bytes());
+            x[o + 4..o + 8].copy_from_slice(&128i32.to_le_bytes());
+            for j in 0..128 {
+                x[o + 8 + j] = 1;
+            }
+        }
+        let host = Host { w, x };
+        assert_eq!(code(&host.w[0..200], 1, 127), 32);
+        let got = reference(&host, m, n, k, false, &[0, 3], &[0]);
+        // z' = -16 + 32*0.5 = 0, so every block contributes 0*d*128 = 0.
+        assert_eq!(got, vec![0f32.to_bits(); 2]);
+        // bf16 of 1.0 is 0x3f80.
+        assert_eq!(out_bits(1.0, true), 0x3f80);
+        assert_eq!(out_bits(f32::INFINITY, true), 0x7f80);
+    }
+
+    #[test]
+    fn nat_is_a_permutation_and_synthesis_is_deterministic() {
+        let mut seen = [false; 128];
+        for j in 0..128 {
+            seen[nat(j)] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+        let a = Host::synth(8, 4, 256);
+        let b = Host::synth(8, 4, 256);
+        assert_eq!(a.w, b.w);
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.w.len(), 8 * 200);
+        assert_eq!(a.x.len(), 2 * 4 * XBLK_BYTES);
+    }
+
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip");
+
+    #[test]
+    fn rip_twin_is_identical_to_generator() {
+        for (epi, raster, tile) in [
+            ("set", "banded", "128x128"),
+            ("set_bf16", "banded", "128x128"),
+            ("set", "linear", "128x128"),
+            ("set_bf16", "linear", "128x128"),
+            ("set", "banded", "256x128"),
+            ("set_bf16", "linear", "256x128"),
+            ("set", "banded", "128x256"),
+            ("set_bf16", "linear", "128x256"),
+        ] {
+            let spec = parse_spec(epi, raster, tile).unwrap();
+            let (_, symbol, info) = compile_rip(TWIN, spec).unwrap();
+            assert_eq!(symbol, spec.symbol());
+            assert_eq!(
+                info["identical_to_generator"], true,
+                "{epi} {raster} {tile}"
+            );
+            assert_eq!(info["variant"], spec.variant_name());
+            assert_eq!(info["sha256"], sha256_hex(TWIN.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn rip_garbage_is_refused() {
+        let spec = parse_spec("set", "banded", "128x128").unwrap();
+        assert!(compile_rip("fn emit(", spec).is_err());
+    }
+}

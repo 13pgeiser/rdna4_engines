@@ -122,7 +122,11 @@ impl BoundaryState {
     }
 
     fn of(v: Visibility) -> Self {
-        Self { wait_idle: v.wait_idle, acquire: (v.acquire != Rung::None).then(|| v.acquire.into()), nop_dwords: 0 }
+        Self {
+            wait_idle: v.wait_idle,
+            acquire: (v.acquire != Rung::None).then(|| v.acquire.into()),
+            nop_dwords: 0,
+        }
     }
 }
 
@@ -153,23 +157,35 @@ fn parse(ib: &[u32]) -> Result<Parsed, String> {
     while cursor < ib.len() {
         let header = ib[cursor];
         if header >> 30 != 3 {
-            return Err(format!("dword {cursor}: not a type-3 packet header ({header:#010x})"));
+            return Err(format!(
+                "dword {cursor}: not a type-3 packet header ({header:#010x})"
+            ));
         }
         let body = ((header >> 16) & 0x3fff) as usize + 1;
         let end = cursor + 1 + body;
         if end > ib.len() {
             return Err(format!("dword {cursor}: packet runs past the IB"));
         }
-        let packet = Packet { opcode: (header >> 8) & 0xff, dwords: ib[cursor..end].to_vec() };
+        let packet = Packet {
+            opcode: (header >> 8) & 0xff,
+            dwords: ib[cursor..end].to_vec(),
+        };
         cursor = end;
         match packet.opcode {
             PACKET3_SET_SH_REG => state.push(packet),
             PACKET3_DISPATCH_DIRECT => {
                 state.push(packet);
-                groups.push(Group { boundary: std::mem::take(&mut boundary), state: std::mem::take(&mut state) });
+                groups.push(Group {
+                    boundary: std::mem::take(&mut boundary),
+                    state: std::mem::take(&mut state),
+                });
             }
             _ if !state.is_empty() => {
-                return Err(format!("dword {}: opcode {:#x} between register writes and their dispatch", cursor - body - 1, packet.opcode));
+                return Err(format!(
+                    "dword {}: opcode {:#x} between register writes and their dispatch",
+                    cursor - body - 1,
+                    packet.opcode
+                ));
             }
             _ => boundary.push(packet),
         }
@@ -177,7 +193,10 @@ fn parse(ib: &[u32]) -> Result<Parsed, String> {
     if !state.is_empty() {
         return Err("register writes after the last dispatch".into());
     }
-    Ok(Parsed { groups, epilogue: boundary })
+    Ok(Parsed {
+        groups,
+        epilogue: boundary,
+    })
 }
 
 fn decode_boundary(packets: &[Packet]) -> (BoundaryState, Vec<u32>) {
@@ -185,7 +204,9 @@ fn decode_boundary(packets: &[Packet]) -> (BoundaryState, Vec<u32>) {
     let mut other = Vec::new();
     for p in packets {
         match p.opcode {
-            PACKET3_EVENT_WRITE if p.dwords.get(1) == Some(&CS_PARTIAL_FLUSH) => state.wait_idle = true,
+            PACKET3_EVENT_WRITE if p.dwords.get(1) == Some(&CS_PARTIAL_FLUSH) => {
+                state.wait_idle = true
+            }
             PACKET3_ACQUIRE_MEM => {
                 let gcr = *p.dwords.last().expect("packet has a body");
                 let rung = Acquire::from_gcr(gcr);
@@ -478,7 +499,13 @@ impl Collector {
             .into_iter()
             .map(|((class, surface, detail), mut dispatches)| {
                 dispatches.retain(|d| *d != usize::MAX);
-                Difference { class, surface, detail, count: dispatches.len().max(1), dispatches }
+                Difference {
+                    class,
+                    surface,
+                    detail,
+                    count: dispatches.len().max(1),
+                    dispatches,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.class.cmp(&a.class).then(b.count.cmp(&a.count)));
@@ -494,7 +521,10 @@ fn describe(b: &BoundaryState) -> String {
         Acquire::System => "system acquire".to_owned(),
         Acquire::Other(gcr) => format!("acquire gcr={gcr:#x}"),
     };
-    format!("{} + {acquire}", if b.wait_idle { "wait" } else { "no wait" })
+    format!(
+        "{} + {acquire}",
+        if b.wait_idle { "wait" } else { "no wait" }
+    )
 }
 
 fn word_kind(role: &WordRole) -> String {
@@ -504,14 +534,27 @@ fn word_kind(role: &WordRole) -> String {
 }
 
 /// Compare railgun's prepared lowering with Redline's prepared tape.
-pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, redline: &RedlineTape) -> ShadowDiff {
+pub fn diff(
+    program: &KernelProgram,
+    plan: &Pm4Plan,
+    railgun: &RailgunLowering,
+    redline: &RedlineTape,
+) -> ShadowDiff {
     let mut c = Collector::default();
     let mut errors = Vec::new();
     let n = program.nodes.len();
     if redline.dispatches.len() != n {
-        errors.push(format!("railgun authored {n} nodes, Redline prepared {} dispatches", redline.dispatches.len()));
+        errors.push(format!(
+            "railgun authored {n} nodes, Redline prepared {} dispatches",
+            redline.dispatches.len()
+        ));
     }
-    let symbol = |i: usize| program.nodes.get(i).map_or("?", |node| node.symbol.as_str());
+    let symbol = |i: usize| {
+        program
+            .nodes
+            .get(i)
+            .map_or("?", |node| node.symbol.as_str())
+    };
 
     // --- IB -------------------------------------------------------------
     let mut ib = IbDiff {
@@ -523,7 +566,9 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
     ib.equal_raw = railgun.segments.len() == 1 && railgun.segments[0].ib == redline.ib;
     ib.redline_nop_dwords = nop_dwords(&redline.ib);
     ib.railgun_nop_dwords = railgun.segments.iter().map(|s| nop_dwords(&s.ib)).sum();
-    let redline_parsed = parse(&redline.ib).map_err(|e| errors.push(format!("Redline IB: {e}"))).ok();
+    let redline_parsed = parse(&redline.ib)
+        .map_err(|e| errors.push(format!("Redline IB: {e}")))
+        .ok();
     let mut railgun_groups: BTreeMap<usize, Group> = BTreeMap::new();
     let mut railgun_exit: Option<Vec<Packet>> = None;
     for segment in &railgun.segments {
@@ -540,7 +585,10 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                 segment.end,
                 parsed.groups.len()
             )),
-            Err(e) => errors.push(format!("railgun segment {}..{}: {e}", segment.first, segment.end)),
+            Err(e) => errors.push(format!(
+                "railgun segment {}..{}: {e}",
+                segment.first, segment.end
+            )),
         }
     }
     let mut boundaries = BoundaryDiff::default();
@@ -548,7 +596,10 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
     let mut canonical_equal = railgun.segments.len() == 1 && errors.is_empty();
     if let Some(parsed) = &redline_parsed {
         if parsed.groups.len() != n {
-            errors.push(format!("Redline IB has {} dispatches, the tape {n}", parsed.groups.len()));
+            errors.push(format!(
+                "Redline IB has {} dispatches, the tape {n}",
+                parsed.groups.len()
+            ));
             canonical_equal = false;
         }
         for (k, group) in parsed.groups.iter().enumerate().take(n) {
@@ -563,7 +614,10 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                 c.add(
                     Class::RailgunStronger,
                     Surface::Ib,
-                    format!("{}: lowered outside PM4 with full barriers ({reason})", symbol(k)),
+                    format!(
+                        "{}: lowered outside PM4 with full barriers ({reason})",
+                        symbol(k)
+                    ),
                     Some(k),
                 );
                 if k > 0 {
@@ -576,11 +630,18 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                         dispatch: k,
                         previous: symbol(k - 1).to_owned(),
                         symbol: symbol(k).to_owned(),
-                        redline: BoundaryState { nop_dwords: 0, ..red_b },
+                        redline: BoundaryState {
+                            nop_dwords: 0,
+                            ..red_b
+                        },
                         railgun: railgun_state,
                         class: Some(Class::RailgunStronger),
                         hazards: Vec::new(),
-                        redline_decision: redline.dispatches.get(k).map(|d| d.decision.clone()).unwrap_or_default(),
+                        redline_decision: redline
+                            .dispatches
+                            .get(k)
+                            .map(|d| d.decision.clone())
+                            .unwrap_or_default(),
                     });
                 }
                 continue;
@@ -590,17 +651,44 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
             // A segment's first dispatch follows only the entry acquire in its
             // own IB; after a non-PM4 node it also follows the previous
             // segment's exit and the drained HIP stream (the planned barrier).
-            let expected = if planned.split { BoundaryState::of(ENTRY) } else { BoundaryState::of(planned.visibility) };
-            let expected_nop = if planned.split { 0 } else { railgun.post_dispatch_nop };
-            if (BoundaryState { nop_dwords: expected_nop, ..expected }) != ib_b {
+            let expected = if planned.split {
+                BoundaryState::of(ENTRY)
+            } else {
+                BoundaryState::of(planned.visibility)
+            };
+            let expected_nop = if planned.split {
+                0
+            } else {
+                railgun.post_dispatch_nop
+            };
+            if (BoundaryState {
+                nop_dwords: expected_nop,
+                ..expected
+            }) != ib_b
+            {
                 ib.plan_matches_ib = false;
             }
-            let rg_b = if planned.split && k > 0 { BoundaryState { nop_dwords: ib_b.nop_dwords, ..BoundaryState::of(planned.visibility) } } else { ib_b };
+            let rg_b = if planned.split && k > 0 {
+                BoundaryState {
+                    nop_dwords: ib_b.nop_dwords,
+                    ..BoundaryState::of(planned.visibility)
+                }
+            } else {
+                ib_b
+            };
             let (rg_state, rg_address) = canonical_state(&rg.state);
             if red_state != rg_state {
                 canonical_equal = false;
                 ib.state_mismatch.push(k);
-                c.add(Class::RailgunWeaker, Surface::Ib, format!("{}: register/dispatch packets differ (what runs differs)", symbol(k)), Some(k));
+                c.add(
+                    Class::RailgunWeaker,
+                    Surface::Ib,
+                    format!(
+                        "{}: register/dispatch packets differ (what runs differs)",
+                        symbol(k)
+                    ),
+                    Some(k),
+                );
             }
             if red_address != rg_address {
                 ib.relocated_user_data += 1;
@@ -612,7 +700,13 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                 );
             }
             let invariant_writes = |g: &Group| {
-                g.state.iter().filter(|p| p.opcode == PACKET3_SET_SH_REG && p.dwords.get(1) == Some(&COMPUTE_RESOURCE_LIMITS)).count()
+                g.state
+                    .iter()
+                    .filter(|p| {
+                        p.opcode == PACKET3_SET_SH_REG
+                            && p.dwords.get(1) == Some(&COMPUTE_RESOURCE_LIMITS)
+                    })
+                    .count()
             };
             if invariant_writes(group) != invariant_writes(rg) {
                 canonical_equal = false;
@@ -625,7 +719,15 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
             }
             if red_other != rg_other {
                 canonical_equal = false;
-                c.add(Class::RailgunWeaker, Surface::Ib, format!("{}: other boundary packets differ ({red_other:x?} vs {rg_other:x?})", symbol(k)), Some(k));
+                c.add(
+                    Class::RailgunWeaker,
+                    Surface::Ib,
+                    format!(
+                        "{}: other boundary packets differ ({red_other:x?} vs {rg_other:x?})",
+                        symbol(k)
+                    ),
+                    Some(k),
+                );
             }
             if group.boundary != rg.boundary {
                 canonical_equal = false;
@@ -633,7 +735,16 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
             if k == 0 {
                 boundaries.entry_equal = red_b == rg_b;
                 if !boundaries.entry_equal {
-                    c.add(boundary_class(&red_b, &rg_b), Surface::Boundary, format!("entry: Redline {} vs railgun {}", describe(&red_b), describe(&rg_b)), Some(0));
+                    c.add(
+                        boundary_class(&red_b, &rg_b),
+                        Surface::Boundary,
+                        format!(
+                            "entry: Redline {} vs railgun {}",
+                            describe(&red_b),
+                            describe(&rg_b)
+                        ),
+                        Some(0),
+                    );
                 }
                 continue;
             }
@@ -648,13 +759,28 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                 c.add(
                     Class::PacingMismatch,
                     Surface::Ib,
-                    format!("post-dispatch NOP dwords before {} (Redline {} vs railgun {})", symbol(k), red_b.nop_dwords, rg_b.nop_dwords),
+                    format!(
+                        "post-dispatch NOP dwords before {} (Redline {} vs railgun {})",
+                        symbol(k),
+                        red_b.nop_dwords,
+                        rg_b.nop_dwords
+                    ),
                     Some(k),
                 );
             }
-            let red_cmp = BoundaryState { nop_dwords: 0, ..red_b };
-            let rg_cmp = BoundaryState { nop_dwords: 0, ..rg_b };
-            let decision = redline.dispatches.get(k).map(|d| d.decision.clone()).unwrap_or_default();
+            let red_cmp = BoundaryState {
+                nop_dwords: 0,
+                ..red_b
+            };
+            let rg_cmp = BoundaryState {
+                nop_dwords: 0,
+                ..rg_b
+            };
+            let decision = redline
+                .dispatches
+                .get(k)
+                .map(|d| d.decision.clone())
+                .unwrap_or_default();
             let mut hazards: Vec<_> = plan.boundaries[k].edges.iter().map(|e| e.hazard).collect();
             hazards.sort();
             hazards.dedup();
@@ -678,12 +804,22 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
             let why = if edges.is_empty() {
                 "railgun derives no edge".to_owned()
             } else {
-                let hazards: BTreeSet<String> = edges.iter().map(|e| format!("{:?}", e.hazard)).collect();
-                format!("railgun edges {}", hazards.into_iter().collect::<Vec<_>>().join("+"))
+                let hazards: BTreeSet<String> =
+                    edges.iter().map(|e| format!("{:?}", e.hazard)).collect();
+                format!(
+                    "railgun edges {}",
+                    hazards.into_iter().collect::<Vec<_>>().join("+")
+                )
             };
-            let redline_why = match (decision.pre_dispatch_name, decision.name_acquire, decision.resource_independent) {
+            let redline_why = match (
+                decision.pre_dispatch_name,
+                decision.name_acquire,
+                decision.resource_independent,
+            ) {
                 (true, _, _) => "Redline pre-dispatch name table",
-                (false, true, true) => "Redline mid-acquire name table at a resource-independent boundary",
+                (false, true, true) => {
+                    "Redline mid-acquire name table at a resource-independent boundary"
+                }
                 (false, true, false) => "Redline dependency + mid-acquire name table",
                 (false, false, true) => "Redline resource-independent",
                 (false, false, false) => "Redline resource dependency",
@@ -691,7 +827,11 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
             c.add(
                 class,
                 Surface::Boundary,
-                format!("{pair}: Redline {} ({redline_why}) vs railgun {} ({why})", describe(&red_cmp), describe(&rg_cmp)),
+                format!(
+                    "{pair}: Redline {} ({redline_why}) vs railgun {} ({why})",
+                    describe(&red_cmp),
+                    describe(&rg_cmp)
+                ),
                 Some(k),
             );
             row.class = Some(class);
@@ -713,7 +853,8 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
         }
         let (red_exit, _) = decode_boundary(&parsed.epilogue);
         let rg_exit = railgun_exit.as_ref().map(|p| decode_boundary(p).0);
-        boundaries.exit_equal = rg_exit == Some(red_exit) && railgun_exit.as_deref() == Some(parsed.epilogue.as_slice());
+        boundaries.exit_equal = rg_exit == Some(red_exit)
+            && railgun_exit.as_deref() == Some(parsed.epilogue.as_slice());
         if let Some(rg_exit) = rg_exit {
             if rg_exit.nop_dwords != railgun.post_dispatch_nop {
                 ib.plan_matches_ib = false;
@@ -727,13 +868,34 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                     c.add(
                         Class::PacingMismatch,
                         Surface::Ib,
-                        format!("post-dispatch NOP dwords before the exit (Redline {} vs railgun {})", red_exit.nop_dwords, rg_exit.nop_dwords),
+                        format!(
+                            "post-dispatch NOP dwords before the exit (Redline {} vs railgun {})",
+                            red_exit.nop_dwords, rg_exit.nop_dwords
+                        ),
                         Some(n),
                     );
                 }
-                let (red_cmp, rg_cmp) = (BoundaryState { nop_dwords: 0, ..red_exit }, BoundaryState { nop_dwords: 0, ..rg_exit });
+                let (red_cmp, rg_cmp) = (
+                    BoundaryState {
+                        nop_dwords: 0,
+                        ..red_exit
+                    },
+                    BoundaryState {
+                        nop_dwords: 0,
+                        ..rg_exit
+                    },
+                );
                 if red_cmp != rg_cmp {
-                    c.add(boundary_class(&red_cmp, &rg_cmp), Surface::Boundary, format!("exit: Redline {} vs railgun {}", describe(&red_cmp), describe(&rg_cmp)), None);
+                    c.add(
+                        boundary_class(&red_cmp, &rg_cmp),
+                        Surface::Boundary,
+                        format!(
+                            "exit: Redline {} vs railgun {}",
+                            describe(&red_cmp),
+                            describe(&rg_cmp)
+                        ),
+                        None,
+                    );
                 }
             }
         }
@@ -747,14 +909,26 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
     let mut bindings = CountDiff::default();
     for (k, red) in redline.dispatches.iter().enumerate().take(n) {
         let node = &program.nodes[k];
-        let Some((image, _)) = railgun.kernargs.get(k).and_then(Option::as_ref) else { continue };
+        let Some((image, _)) = railgun.kernargs.get(k).and_then(Option::as_ref) else {
+            continue;
+        };
         kernargs.compared += 1;
         if *image == red.kernarg {
             kernargs.equal += 1;
         } else {
             kernargs.different += 1;
             if image.len() != red.kernarg.len() {
-                c.add(Class::RailgunWeaker, Surface::Kernarg, format!("{}: {} vs {} loader bytes", node.symbol, red.kernarg.len(), image.len()), Some(k));
+                c.add(
+                    Class::RailgunWeaker,
+                    Surface::Kernarg,
+                    format!(
+                        "{}: {} vs {} loader bytes",
+                        node.symbol,
+                        red.kernarg.len(),
+                        image.len()
+                    ),
+                    Some(k),
+                );
             } else {
                 let mut fields = BTreeSet::new();
                 for (at, (a, b)) in red.kernarg.iter().zip(image).enumerate() {
@@ -766,8 +940,17 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                 for (field, declared) in fields {
                     // Bytes no explicit or hidden argument declares are never
                     // read by the kernel: what either side leaves there is inert.
-                    let class = if declared { Class::RailgunWeaker } else { Class::BenignRelocation };
-                    c.add(class, Surface::Kernarg, format!("{}: {field} differs", node.symbol), Some(k));
+                    let class = if declared {
+                        Class::RailgunWeaker
+                    } else {
+                        Class::BenignRelocation
+                    };
+                    c.add(
+                        class,
+                        Surface::Kernarg,
+                        format!("{}: {field} differs", node.symbol),
+                        Some(k),
+                    );
                 }
             }
         }
@@ -775,29 +958,61 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
             .args
             .iter()
             .filter_map(|(offset, arg)| match arg {
-                Arg::Resource { resource, interior } => program.resources.get(resource.0 as usize).map(|b| {
-                    (*offset, SlotBinding { offset: *offset, base: b.base, bytes: b.bytes, interior: *interior })
-                }),
+                Arg::Resource { resource, interior } => {
+                    program.resources.get(resource.0 as usize).map(|b| {
+                        (
+                            *offset,
+                            SlotBinding {
+                                offset: *offset,
+                                base: b.base,
+                                bytes: b.bytes,
+                                interior: *interior,
+                            },
+                        )
+                    })
+                }
                 _ => None,
             })
             .collect();
-        let red_slots: BTreeMap<u32, SlotBinding> = red.bindings.iter().map(|s| (s.offset, *s)).collect();
-        for offset in rg_slots.keys().chain(red_slots.keys()).collect::<BTreeSet<_>>() {
+        let red_slots: BTreeMap<u32, SlotBinding> =
+            red.bindings.iter().map(|s| (s.offset, *s)).collect();
+        for offset in rg_slots
+            .keys()
+            .chain(red_slots.keys())
+            .collect::<BTreeSet<_>>()
+        {
             bindings.compared += 1;
             match (red_slots.get(offset), rg_slots.get(offset)) {
                 (Some(a), Some(b)) if a == b => bindings.equal += 1,
                 (Some(a), Some(b)) => {
                     bindings.different += 1;
-                    let wider = b.base <= a.base && b.base + b.bytes >= a.base + a.bytes && b.base + b.interior == a.base + a.interior;
-                    let class = if wider { Class::RailgunStronger } else { Class::RailgunWeaker };
-                    c.add(class, Surface::Binding, format!("{} +{offset}: Redline binds {:#x}+{} B, railgun {:#x}+{} B", node.symbol, a.base, a.bytes, b.base, b.bytes), Some(k));
+                    let wider = b.base <= a.base
+                        && b.base + b.bytes >= a.base + a.bytes
+                        && b.base + b.interior == a.base + a.interior;
+                    let class = if wider {
+                        Class::RailgunStronger
+                    } else {
+                        Class::RailgunWeaker
+                    };
+                    c.add(
+                        class,
+                        Surface::Binding,
+                        format!(
+                            "{} +{offset}: Redline binds {:#x}+{} B, railgun {:#x}+{} B",
+                            node.symbol, a.base, a.bytes, b.base, b.bytes
+                        ),
+                        Some(k),
+                    );
                 }
                 (None, Some(_)) => {
                     bindings.different += 1;
                     c.add(
                         Class::BenignRelocation,
                         Surface::Binding,
-                        format!("{} +{offset}: railgun binds a pointer Redline keeps as recorded bytes", node.symbol),
+                        format!(
+                            "{} +{offset}: railgun binds a pointer Redline keeps as recorded bytes",
+                            node.symbol
+                        ),
                         Some(k),
                     );
                 }
@@ -806,7 +1021,10 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
                     c.add(
                         Class::RailgunWeaker,
                         Surface::Binding,
-                        format!("{} +{offset}: Redline relocates a pointer railgun keeps constant", node.symbol),
+                        format!(
+                            "{} +{offset}: Redline relocates a pointer railgun keeps constant",
+                            node.symbol
+                        ),
                         Some(k),
                     );
                 }
@@ -820,18 +1038,42 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
     let rg_words: BTreeSet<WordPatch> = program
         .words
         .iter()
-        .map(|w| WordPatch { dispatch: w.node, offset: w.offset, kind: word_kind(&w.role) })
+        .map(|w| WordPatch {
+            dispatch: w.node,
+            offset: w.offset,
+            kind: word_kind(&w.role),
+        })
         .collect();
-    let word_patches = compare_sets(&red_words, &rg_words, &mut c, Surface::WordPatch, |p| (p.dispatch, format!("{} +{} {}", symbol(p.dispatch), p.offset, p.kind)));
+    let word_patches = compare_sets(&red_words, &rg_words, &mut c, Surface::WordPatch, |p| {
+        (
+            p.dispatch,
+            format!("{} +{} {}", symbol(p.dispatch), p.offset, p.kind),
+        )
+    });
     let red_grids: BTreeSet<GridPatch> = redline.grid_patches.iter().cloned().collect();
     // M1 grids are constants: railgun has no grid patches.
     let rg_grids = BTreeSet::new();
     let grid_patches = compare_sets(&red_grids, &rg_grids, &mut c, Surface::GridPatch, |p| {
-        (p.dispatch, format!("{} axis {} ceil((pos+{})/{})", symbol(p.dispatch), p.axis, p.addend, p.divisor))
+        (
+            p.dispatch,
+            format!(
+                "{} axis {} ceil((pos+{})/{})",
+                symbol(p.dispatch),
+                p.axis,
+                p.addend,
+                p.divisor
+            ),
+        )
     });
 
     let differences = c.finish();
-    let tally = |class| differences.iter().filter(|d| d.class == class).map(|d| d.count).sum();
+    let tally = |class| {
+        differences
+            .iter()
+            .filter(|d| d.class == class)
+            .map(|d| d.count)
+            .sum()
+    };
     let verdict = Verdict {
         benign_relocation: tally(Class::BenignRelocation),
         pacing_mismatch: tally(Class::PacingMismatch),
@@ -839,9 +1081,22 @@ pub fn diff(program: &KernelProgram, plan: &Pm4Plan, railgun: &RailgunLowering, 
         railgun_weaker: tally(Class::RailgunWeaker),
         g7_pass: false,
     };
-    let verdict =
-        Verdict { g7_pass: verdict.railgun_weaker == 0 && verdict.pacing_mismatch == 0 && errors.is_empty(), ..verdict };
-    ShadowDiff { dispatches: n, ib, kernargs, bindings, word_patches, grid_patches, boundaries, differences, verdict, errors }
+    let verdict = Verdict {
+        g7_pass: verdict.railgun_weaker == 0 && verdict.pacing_mismatch == 0 && errors.is_empty(),
+        ..verdict
+    };
+    ShadowDiff {
+        dispatches: n,
+        ib,
+        kernargs,
+        bindings,
+        word_patches,
+        grid_patches,
+        boundaries,
+        differences,
+        verdict,
+        errors,
+    }
 }
 
 /// Body dwords of every type-3 `NOP` in `ib` (stops at a malformed header;
@@ -885,11 +1140,21 @@ fn compare_sets<T: Ord>(
             (true, true) => d.equal += 1,
             (true, false) => {
                 d.different += 1;
-                c.add(Class::RailgunWeaker, surface, format!("{text}: Redline patches it, railgun does not"), Some(dispatch));
+                c.add(
+                    Class::RailgunWeaker,
+                    surface,
+                    format!("{text}: Redline patches it, railgun does not"),
+                    Some(dispatch),
+                );
             }
             (false, true) => {
                 d.different += 1;
-                c.add(Class::RailgunStronger, surface, format!("{text}: railgun patches it, Redline does not"), Some(dispatch));
+                c.add(
+                    Class::RailgunStronger,
+                    surface,
+                    format!("{text}: railgun patches it, Redline does not"),
+                    Some(dispatch),
+                );
             }
             (false, false) => unreachable!(),
         }
@@ -920,7 +1185,10 @@ fn field_name(program: &KernelProgram, node: usize, at: usize) -> (String, bool)
             return (format!("{kind} +{offset}"), true);
         }
     }
-    (format!("undeclared byte +{at} (no argument; the kernel never reads it)"), false)
+    (
+        format!("undeclared byte +{at} (no argument; the kernel never reads it)"),
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -934,13 +1202,19 @@ mod tests {
     }
 
     fn dispatch(address: u64) -> Vec<u32> {
-        let mut out = packet(PACKET3_SET_SH_REG, &[COMPUTE_USER_DATA_0, address as u32, (address >> 32) as u32]);
+        let mut out = packet(
+            PACKET3_SET_SH_REG,
+            &[COMPUTE_USER_DATA_0, address as u32, (address >> 32) as u32],
+        );
         out.extend(packet(PACKET3_DISPATCH_DIRECT, &[64, 1, 1, 0x8025]));
         out
     }
 
     fn acquire(gcr: u32) -> Vec<u32> {
-        packet(PACKET3_ACQUIRE_MEM, &[0, u32::MAX, 0xff_ffff, 0, 0, 0xa, gcr])
+        packet(
+            PACKET3_ACQUIRE_MEM,
+            &[0, u32::MAX, 0xff_ffff, 0, 0, 0xa, gcr],
+        )
     }
 
     #[test]
@@ -953,20 +1227,46 @@ mod tests {
         let parsed = parse(&ib).unwrap();
         assert_eq!(parsed.groups.len(), 2);
         let (b, _) = decode_boundary(&parsed.groups[1].boundary);
-        assert_eq!(b, BoundaryState { wait_idle: true, acquire: Some(Acquire::InterNode), nop_dwords: 0 });
+        assert_eq!(
+            b,
+            BoundaryState {
+                wait_idle: true,
+                acquire: Some(Acquire::InterNode),
+                nop_dwords: 0
+            }
+        );
         let (state, address) = canonical_state(&parsed.groups[1].state);
         assert_eq!(address, Some(0x2000));
-        assert_eq!(state, canonical_state(&parse(&dispatch(0x9999)).unwrap().groups[0].state).0);
+        assert_eq!(
+            state,
+            canonical_state(&parse(&dispatch(0x9999)).unwrap().groups[0].state).0
+        );
     }
 
     #[test]
     fn weaker_means_less_wait_or_an_incomparable_or_lower_rung() {
-        let s = |wait, acquire| BoundaryState { wait_idle: wait, acquire, nop_dwords: 0 };
+        let s = |wait, acquire| BoundaryState {
+            wait_idle: wait,
+            acquire,
+            nop_dwords: 0,
+        };
         let redline = s(true, Some(Acquire::InterNode));
-        assert_eq!(boundary_class(&redline, &s(true, Some(Acquire::System))), Class::RailgunStronger);
-        assert_eq!(boundary_class(&redline, &s(false, Some(Acquire::InterNode))), Class::RailgunWeaker);
-        assert_eq!(boundary_class(&redline, &s(true, Some(Acquire::Vmem))), Class::RailgunWeaker);
-        assert_eq!(boundary_class(&s(false, Some(Acquire::InterNode)), &s(false, None)), Class::RailgunWeaker);
+        assert_eq!(
+            boundary_class(&redline, &s(true, Some(Acquire::System))),
+            Class::RailgunStronger
+        );
+        assert_eq!(
+            boundary_class(&redline, &s(false, Some(Acquire::InterNode))),
+            Class::RailgunWeaker
+        );
+        assert_eq!(
+            boundary_class(&redline, &s(true, Some(Acquire::Vmem))),
+            Class::RailgunWeaker
+        );
+        assert_eq!(
+            boundary_class(&s(false, Some(Acquire::InterNode)), &s(false, None)),
+            Class::RailgunWeaker
+        );
     }
 
     /// Two independent nodes: railgun elides the boundary Redline waits at,
@@ -982,7 +1282,11 @@ mod tests {
             launch(&[(0, 0x7100_0000)], 16, vec![ptr(0, &[VmemLoad])]),
         ];
         let program = author("gfx1201", &launches);
-        let p = plan(&program, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD);
+        let p = plan(
+            &program,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        );
         assert!(p.boundaries[1].visibility.is_empty());
         let exit = |ib: &mut Vec<u32>| {
             ib.extend(packet(PACKET3_EVENT_WRITE, &[CS_PARTIAL_FLUSH]));
@@ -998,10 +1302,20 @@ mod tests {
         redline_ib.extend(acquire(GCR_INTER_NODE));
         redline_ib.extend(dispatch(0x2100));
         exit(&mut redline_ib);
-        let images: Vec<_> = (0..2).map(|i| program.kernarg_image(i, 16, &[]).unwrap()).collect();
+        let images: Vec<_> = (0..2)
+            .map(|i| program.kernarg_image(i, 16, &[]).unwrap())
+            .collect();
         let railgun = RailgunLowering {
-            segments: vec![SegmentIb { first: 0, end: 2, ib: railgun_ib }],
-            kernargs: images.iter().zip([0x1000, 0x1100]).map(|(k, a)| Some((k.clone(), a))).collect(),
+            segments: vec![SegmentIb {
+                first: 0,
+                end: 2,
+                ib: railgun_ib,
+            }],
+            kernargs: images
+                .iter()
+                .zip([0x1000, 0x1100])
+                .map(|(k, a)| Some((k.clone(), a)))
+                .collect(),
             post_dispatch_nop: 0,
         };
         let dispatch_of = |i: usize, address| RedlineDispatch {
@@ -1014,17 +1328,34 @@ mod tests {
         let redline = RedlineTape {
             ib: redline_ib,
             dispatches: vec![dispatch_of(0, 0x2000), dispatch_of(1, 0x2100)],
-            word_patches: vec![WordPatch { dispatch: 1, offset: 8, kind: "position+1".into() }],
+            word_patches: vec![WordPatch {
+                dispatch: 1,
+                offset: 8,
+                kind: "position+1".into(),
+            }],
             grid_patches: Vec::new(),
         };
         let d = diff(&program, &p, &railgun, &redline);
         assert!(d.errors.is_empty(), "{:?}", d.errors);
         assert!(!d.verdict.g7_pass);
-        assert_eq!((d.boundaries.equal, d.boundaries.weaker, d.boundaries.weak[0].dispatch), (0, 1, 1));
+        assert_eq!(
+            (
+                d.boundaries.equal,
+                d.boundaries.weaker,
+                d.boundaries.weak[0].dispatch
+            ),
+            (0, 1, 1)
+        );
         assert_eq!(d.word_patches.different, 1);
         assert_eq!(d.ib.relocated_user_data, 2);
-        assert!(d.ib.state_mismatch.is_empty() && d.boundaries.entry_equal && d.boundaries.exit_equal);
-        assert_eq!(d.verdict.benign_relocation, 2 + 2, "two relocated kernarg addresses, two railgun-only pointer bindings");
+        assert!(
+            d.ib.state_mismatch.is_empty() && d.boundaries.entry_equal && d.boundaries.exit_equal
+        );
+        assert_eq!(
+            d.verdict.benign_relocation,
+            2 + 2,
+            "two relocated kernarg addresses, two railgun-only pointer bindings"
+        );
         assert_eq!(d.verdict.railgun_weaker, 2);
     }
 
@@ -1041,7 +1372,11 @@ mod tests {
             launch(&[(0, 0x7100_0000)], 16, vec![ptr(0, &[VmemLoad])]),
         ];
         let program = author("gfx1201", &launches);
-        let p = plan(&program, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD);
+        let p = plan(
+            &program,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        );
         let nop = ArchLowering::for_arch("gfx1201").post_dispatch_nop;
         assert_eq!(nop, 64);
         assert_eq!(ArchLowering::for_arch("gfx1100").post_dispatch_nop, 0);
@@ -1057,7 +1392,9 @@ mod tests {
             ib.extend(acquire(GCR_SYSTEM_GFX12));
             ib
         };
-        let images: Vec<_> = (0..2).map(|i| program.kernarg_image(i, 16, &[]).unwrap()).collect();
+        let images: Vec<_> = (0..2)
+            .map(|i| program.kernarg_image(i, 16, &[]).unwrap())
+            .collect();
         let redline = RedlineTape {
             ib: tape(nop),
             dispatches: (0..2)
@@ -1073,17 +1410,38 @@ mod tests {
             grid_patches: Vec::new(),
         };
         let lowering = |pace: u32| RailgunLowering {
-            segments: vec![SegmentIb { first: 0, end: 2, ib: tape(pace) }],
-            kernargs: images.iter().zip([0x1000, 0x1100]).map(|(k, a)| Some((k.clone(), a))).collect(),
+            segments: vec![SegmentIb {
+                first: 0,
+                end: 2,
+                ib: tape(pace),
+            }],
+            kernargs: images
+                .iter()
+                .zip([0x1000, 0x1100])
+                .map(|(k, a)| Some((k.clone(), a)))
+                .collect(),
             post_dispatch_nop: pace,
         };
         let paced = diff(&program, &p, &lowering(nop), &redline);
         assert!(paced.errors.is_empty(), "{:?}", paced.errors);
         assert!(paced.verdict.g7_pass && paced.ib.equal_raw && paced.ib.plan_matches_ib);
-        assert_eq!((paced.ib.redline_nop_dwords, paced.ib.railgun_nop_dwords), (128, 128));
+        assert_eq!(
+            (paced.ib.redline_nop_dwords, paced.ib.railgun_nop_dwords),
+            (128, 128)
+        );
         let unpaced = diff(&program, &p, &lowering(0), &redline);
         assert!(!unpaced.verdict.g7_pass && unpaced.ib.plan_matches_ib);
-        assert_eq!(unpaced.ib.pacing_mismatch, vec![1, 2], "before dispatch 1 and before the exit");
-        assert_eq!((unpaced.verdict.pacing_mismatch, unpaced.verdict.railgun_weaker), (2, 0));
+        assert_eq!(
+            unpaced.ib.pacing_mismatch,
+            vec![1, 2],
+            "before dispatch 1 and before the exit"
+        );
+        assert_eq!(
+            (
+                unpaced.verdict.pacing_mismatch,
+                unpaced.verdict.railgun_weaker
+            ),
+            (2, 0)
+        );
     }
 }

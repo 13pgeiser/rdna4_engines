@@ -1307,11 +1307,19 @@ mod symmetric_tests {
             assert_eq!(validate_symmetric_flags(mq4, mq3, false, false), Ok(()));
             assert_eq!(
                 validate_symmetric_flags(mq4, mq3, true, false),
-                if mq4 { Ok(()) } else { Err("--mq4v2-symmetric requires --mq4v2") },
+                if mq4 {
+                    Ok(())
+                } else {
+                    Err("--mq4v2-symmetric requires --mq4v2")
+                },
             );
             assert_eq!(
                 validate_symmetric_flags(mq4, mq3, false, true),
-                if mq3 { Ok(()) } else { Err("--mq3v2-symmetric requires --mq3v2") },
+                if mq3 {
+                    Ok(())
+                } else {
+                    Err("--mq3v2-symmetric requires --mq3v2")
+                },
             );
             assert!(validate_symmetric_flags(mq4, mq3, true, true).is_err());
         }
@@ -1323,7 +1331,13 @@ mod symmetric_tests {
         let signs2 = gen_fwht_signs(1042, 256);
         for zero in [true, false] {
             let weights: Vec<f32> = (0..1024)
-                .map(|i| if zero { 0.0 } else { (i as f32 * 0.017).sin() * 0.42 })
+                .map(|i| {
+                    if zero {
+                        0.0
+                    } else {
+                        (i as f32 * 0.017).sin() * 0.42
+                    }
+                })
                 .collect();
             for bits in [4usize, 3] {
                 let blob = if bits == 4 {

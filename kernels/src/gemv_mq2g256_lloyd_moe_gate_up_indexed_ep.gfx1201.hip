@@ -22,7 +22,7 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_gfx1201_ep(
     float* __restrict__ y_gate,
     float* __restrict__ y_up,
     int M,
-    int K
+    int K, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -31,6 +31,13 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_gfx1201_ep(
     const int mi = M >> 1;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            if (row < mi) y_gate[krank * mi + row] = 0.0f;
+            else          y_up[krank * mi + (row - mi)] = 0.0f;
+        }
+        return;
+    }
     const unsigned long long expert_address = expert_ptrs[expert_id];
     if (reinterpret_cast<const void*>(expert_address) == nonowned_dummy) {
         if (tid == 0) {

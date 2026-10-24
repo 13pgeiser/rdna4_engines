@@ -107,10 +107,16 @@ fn parse(var: &str, default: &str) -> Vec<Vec<usize>> {
 }
 
 fn projections(gpu: &mut Gpu, reps: usize) {
-    for s in parse("SHAPES", "320x20480x1536,320x20480x512,320x10240x1900,320x10240x1131,4x20480x1536") {
+    for s in parse(
+        "SHAPES",
+        "320x20480x1536,320x20480x512,320x10240x1900,320x10240x1131,4x20480x1536",
+    ) {
         let (m, k, b) = (s[0], s[1], s[2]);
         let wb: Vec<u16> = lcg(m * k, 11, 0.05).iter().map(|&v| bf16_bits(v)).collect();
-        let xr: Vec<f32> = lcg(b * k, 23, 2.0).iter().map(|&v| bf16_val(bf16_bits(v))).collect();
+        let xr: Vec<f32> = lcg(b * k, 23, 2.0)
+            .iter()
+            .map(|&v| bf16_val(bf16_bits(v)))
+            .collect();
         let wr: Vec<f32> = wb.iter().map(|&h| bf16_val(h)).collect();
         let weight = upload_u16(gpu, &wb, DType::BF16);
         let x = gpu.upload_f32(&xr, &[b * k]).unwrap();
@@ -122,7 +128,9 @@ fn projections(gpu: &mut Gpu, reps: usize) {
             .flat_map(|&bi| {
                 let (xr, wr) = (&xr, &wr);
                 (0..m).map(move |mi| {
-                    (0..k).map(|kk| wr[mi * k + kk] as f64 * xr[bi * k + kk] as f64).sum::<f64>()
+                    (0..k)
+                        .map(|kk| wr[mi * k + kk] as f64 * xr[bi * k + kk] as f64)
+                        .sum::<f64>()
                 })
             })
             .collect();
@@ -138,7 +146,8 @@ fn projections(gpu: &mut Gpu, reps: usize) {
         };
         let flop = 2.0 * (m * k * b) as f64;
         let t_old = time_ms(gpu, reps, |g| {
-            g.gemm_bf16_xf32_multirow(&weight, &x, &y_old, m, k, b).unwrap()
+            g.gemm_bf16_xf32_multirow(&weight, &x, &y_old, m, k, b)
+                .unwrap()
         });
         let mut admitted = false;
         let t_new = time_ms(gpu, reps, |g| {
@@ -175,7 +184,10 @@ fn reads(gpu: &mut Gpu, reps: usize) {
     for s in parse("READS", "5120x1536,5120x512,2560x1900,2560x1131") {
         let (hidden, rows) = (s[0], s[1]);
         let wide = 4 * hidden;
-        let up: Vec<u16> = lcg(wide * low_rank, 5, 0.1).iter().map(|&v| bf16_bits(v)).collect();
+        let up: Vec<u16> = lcg(wide * low_rank, 5, 0.1)
+            .iter()
+            .map(|&v| bf16_bits(v))
+            .collect();
         // hc_activation's output: silu of BF16 values, BF16-rounded.
         let low: Vec<f32> = lcg(rows * low_rank, 7, 3.0)
             .iter()
@@ -188,11 +200,17 @@ fn reads(gpu: &mut Gpu, reps: usize) {
             .collect();
         let up_weight = upload_u16(gpu, &up, DType::BF16);
         let low_f32 = gpu.upload_f32(&low, &[rows * low_rank]).unwrap();
-        let low_bf16 =
-            upload_u16(gpu, &low.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>(), DType::BF16);
+        let low_bf16 = upload_u16(
+            gpu,
+            &low.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>(),
+            DType::BF16,
+        );
         let norm_f32 = gpu.upload_f32(&norm, &[rows * wide]).unwrap();
-        let norm_f16 =
-            upload_u16(gpu, &norm.iter().map(|&v| f16_of_bf16(v)).collect::<Vec<_>>(), DType::F16);
+        let norm_f16 = upload_u16(
+            gpu,
+            &norm.iter().map(|&v| f16_of_bf16(v)).collect::<Vec<_>>(),
+            DType::F16,
+        );
         let mixed_old = gpu.zeros(&[rows * hidden], DType::F32).unwrap();
         let mixed_new = gpu.zeros(&[rows * hidden], DType::F32).unwrap();
         let old = HyperReadUpFused {
@@ -254,7 +272,10 @@ fn tile_of(name: &str) -> LdsTileSplitK {
         .iter()
         .find_map(|p| p.strip_prefix('s').and_then(|v| v.parse().ok()))
         .unwrap_or(1);
-    let ks = parts[4].strip_prefix('k').and_then(|v| v.parse().ok()).unwrap_or(64);
+    let ks = parts[4]
+        .strip_prefix('k')
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     LdsTileSplitK::new(n(0), n(1), n(2), n(3), pipe, split).k_stage(ks)
 }
 
@@ -268,16 +289,24 @@ fn sweep(gpu: &mut Gpu, reps: usize) {
     for s in parse("SHAPES", "320x20480x1536,320x10240x1900,320x10240x1131") {
         let (m, k, b) = (s[0], s[1], s[2]);
         let wb: Vec<u16> = lcg(m * k, 11, 0.05).iter().map(|&v| bf16_bits(v)).collect();
-        let xr: Vec<f32> = lcg(b * k, 23, 2.0).iter().map(|&v| bf16_val(bf16_bits(v))).collect();
+        let xr: Vec<f32> = lcg(b * k, 23, 2.0)
+            .iter()
+            .map(|&v| bf16_val(bf16_bits(v)))
+            .collect();
         let weight = upload_u16(gpu, &wb, DType::BF16);
         let w16: Vec<u16> = wb.iter().map(|&h| f16_of_bf16(bf16_val(h))).collect();
         let w_f16 = upload_u16(gpu, &w16, DType::F16);
-        let x_f16 = upload_u16(gpu, &xr.iter().map(|&v| f16_of_bf16(v)).collect::<Vec<_>>(), DType::F16);
+        let x_f16 = upload_u16(
+            gpu,
+            &xr.iter().map(|&v| f16_of_bf16(v)).collect::<Vec<_>>(),
+            DType::F16,
+        );
         let y_prod = gpu.zeros(&[b * m], DType::F32).unwrap();
         let y = gpu.zeros(&[b * m], DType::F32).unwrap();
         let flop = 2.0 * (m * k * b) as f64;
         let t_prod = time_ms(gpu, reps, |g| {
-            g.gemm_bf16_xf16_f16_wmma(&weight, &x_f16, &y_prod, m, k, b).unwrap()
+            g.gemm_bf16_xf16_f16_wmma(&weight, &x_f16, &y_prod, m, k, b)
+                .unwrap()
         });
         let prod = gpu.download_f32(&y_prod).unwrap();
         let scale = prod.iter().fold(0f32, |a, v| a.max(v.abs())) as f64;
@@ -290,10 +319,14 @@ fn sweep(gpu: &mut Gpu, reps: usize) {
                 continue;
             }
             let t = time_ms(gpu, reps, |g| {
-                g.gemm_f16_x_f16_wmma_lds_splitk(&w_f16, &x_f16, &y, m, k, b, *tile).unwrap()
+                g.gemm_f16_x_f16_wmma_lds_splitk(&w_f16, &x_f16, &y, m, k, b, *tile)
+                    .unwrap()
             });
             let got = gpu.download_f32(&y).unwrap();
-            let d = got.iter().zip(&prod).fold(0f64, |a, (x, p)| a.max((x - p).abs() as f64));
+            let d = got
+                .iter()
+                .zip(&prod)
+                .fold(0f64, |a, (x, p)| a.max((x - p).abs() as f64));
             println!(
                 "sweep M{m:<5} K{k:<5} B{b:<4} {:36} {t:7.3} ms ({:5.1} TF/s) x{:5.2} vs production, max |diff| / max |y| {:.2e}",
                 tile.entry(),
@@ -308,7 +341,10 @@ fn sweep(gpu: &mut Gpu, reps: usize) {
 /// Every output of every iteration against iteration 0 (bitwise) and the
 /// multirow / fused reference (tolerance).
 fn stress(gpu: &mut Gpu) -> bool {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
     let pid = std::process::id();
     let shapes = parse(
         "SHAPES",
@@ -335,12 +371,19 @@ fn stress(gpu: &mut Gpu) -> bool {
     let mut cases: Vec<Case> = Vec::new();
     for s in &shapes {
         let (m, k, b) = (s[0], s[1], s[2]);
-        let wb: Vec<u16> = lcg(m * k, 11 + m as u64, 0.05).iter().map(|&v| bf16_bits(v)).collect();
-        let xr: Vec<f32> = lcg(b * k, 23 + b as u64, 2.0).iter().map(|&v| bf16_val(bf16_bits(v))).collect();
+        let wb: Vec<u16> = lcg(m * k, 11 + m as u64, 0.05)
+            .iter()
+            .map(|&v| bf16_bits(v))
+            .collect();
+        let xr: Vec<f32> = lcg(b * k, 23 + b as u64, 2.0)
+            .iter()
+            .map(|&v| bf16_val(bf16_bits(v)))
+            .collect();
         let weight = std::rc::Rc::new(upload_u16(gpu, &wb, DType::BF16));
         let x = std::rc::Rc::new(gpu.upload_f32(&xr, &[b * k]).unwrap());
         let exact = gpu.zeros(&[b * m], DType::F32).unwrap();
-        gpu.gemm_bf16_xf32_multirow(&weight, &x, &exact, m, k, b).unwrap();
+        gpu.gemm_bf16_xf32_multirow(&weight, &x, &exact, m, k, b)
+            .unwrap();
         let reference = gpu.download_f32(&exact).unwrap();
         let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs()));
         let out = gpu.zeros(&[b * m], DType::F32).unwrap();
@@ -350,10 +393,14 @@ fn stress(gpu: &mut Gpu) -> bool {
         let (w2, x2) = (weight.clone(), x.clone());
         cases.push(Case {
             run: Box::new(move |g: &mut Gpu| {
-                assert!(g.gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &o, m)], &x, k, b).unwrap());
+                assert!(g
+                    .gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &o, m)], &x, k, b)
+                    .unwrap());
             }),
             fallback: Box::new(move |g: &mut Gpu| {
-                assert!(!g.gemm_bf16_xf32_f16_wmma_qwen4(&[(&w2, &c, m)], &x2, k, b).unwrap());
+                assert!(!g
+                    .gemm_bf16_xf32_f16_wmma_qwen4(&[(&w2, &c, m)], &x2, k, b)
+                    .unwrap());
                 g.gemm_bf16_xf32_multirow(&w2, &x2, &c, m, k, b).unwrap();
             }),
             out,
@@ -368,7 +415,10 @@ fn stress(gpu: &mut Gpu) -> bool {
     for s in &reads {
         let (hidden, rows) = (s[0], s[1]);
         let wide = 4 * hidden;
-        let up: Vec<u16> = lcg(wide * low_rank, 5, 0.1).iter().map(|&v| bf16_bits(v)).collect();
+        let up: Vec<u16> = lcg(wide * low_rank, 5, 0.1)
+            .iter()
+            .map(|&v| bf16_bits(v))
+            .collect();
         let low: Vec<f32> = lcg(rows * low_rank, 7, 3.0)
             .iter()
             .map(|&v| bf16_val(bf16_bits(v / (1.0 + (-v).exp()))))
@@ -379,9 +429,17 @@ fn stress(gpu: &mut Gpu) -> bool {
             .collect();
         let up_weight = std::rc::Rc::new(upload_u16(gpu, &up, DType::BF16));
         let low_f32 = gpu.upload_f32(&low, &[rows * low_rank]).unwrap();
-        let low_bf16 = upload_u16(gpu, &low.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>(), DType::BF16);
+        let low_bf16 = upload_u16(
+            gpu,
+            &low.iter().map(|&v| bf16_bits(v)).collect::<Vec<_>>(),
+            DType::BF16,
+        );
         let norm_f32 = gpu.upload_f32(&norm, &[rows * wide]).unwrap();
-        let norm_f16 = upload_u16(gpu, &norm.iter().map(|&v| f16_of_bf16(v)).collect::<Vec<_>>(), DType::F16);
+        let norm_f16 = upload_u16(
+            gpu,
+            &norm.iter().map(|&v| f16_of_bf16(v)).collect::<Vec<_>>(),
+            DType::F16,
+        );
         let fused = gpu.zeros(&[rows * hidden], DType::F32).unwrap();
         hyper_read_up_fused(
             gpu,
@@ -460,20 +518,26 @@ fn stress(gpu: &mut Gpu) -> bool {
         }
         gpu.hip.device_synchronize().unwrap();
         let stream = gpu.active_stream.take().unwrap();
-        gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, &stream).unwrap();
+        gpu.graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, &stream)
+            .unwrap();
         gpu.active_stream = Some(stream);
         for case in &cases {
             (case.fallback)(gpu);
         }
         let stream = gpu.active_stream.take().unwrap();
-        gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, &stream).unwrap();
+        gpu.graphs
+            .end_graph_capture(&gpu.hip, gpu.device_id, &stream)
+            .unwrap();
         gpu.active_stream = Some(stream);
     }
     let (mut unstable, mut wrong, mut outputs, mut cap_differ) = (0usize, 0usize, 0usize, 0usize);
     for it in 0..iters {
         if capture {
             let stream = gpu.active_stream.take().unwrap();
-            gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, &stream).unwrap();
+            gpu.graphs
+                .graph_launch(&gpu.hip, gpu.device_id, &stream)
+                .unwrap();
             gpu.active_stream = Some(stream);
         }
         for case in cases.iter_mut() {
@@ -484,7 +548,10 @@ fn stress(gpu: &mut Gpu) -> bool {
             match &case.first {
                 None => {
                     let far = if case.tol >= 0.0 {
-                        got.iter().zip(&case.reference).filter(|(g, r)| (*g - *r).abs() > case.tol).count()
+                        got.iter()
+                            .zip(&case.reference)
+                            .filter(|(g, r)| (*g - *r).abs() > case.tol)
+                            .count()
                     } else {
                         got.iter()
                             .zip(&case.reference)
@@ -492,7 +559,10 @@ fn stress(gpu: &mut Gpu) -> bool {
                             .count()
                     };
                     if far > 0 {
-                        println!("[{pid}] it {it} {}: {far} outputs outside the reference tolerance", case.name);
+                        println!(
+                            "[{pid}] it {it} {}: {far} outputs outside the reference tolerance",
+                            case.name
+                        );
                     }
                     wrong += far;
                     case.first = Some(bits);
@@ -500,7 +570,10 @@ fn stress(gpu: &mut Gpu) -> bool {
                 Some(first) => {
                     let differ = first.iter().zip(&bits).filter(|(a, b)| a != b).count();
                     if differ > 0 {
-                        println!("[{pid}] it {it} {}: {differ} outputs differ from iteration 0", case.name);
+                        println!(
+                            "[{pid}] it {it} {}: {differ} outputs differ from iteration 0",
+                            case.name
+                        );
                     }
                     unstable += differ;
                 }
@@ -508,9 +581,16 @@ fn stress(gpu: &mut Gpu) -> bool {
             if capture {
                 gpu.hip.device_synchronize().unwrap();
                 let got = gpu.download_f32(&case.cap).unwrap();
-                let differ = got.iter().zip(&case.reference).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                let differ = got
+                    .iter()
+                    .zip(&case.reference)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
                 if differ > 0 {
-                    println!("[{pid}] it {it} {}: {differ} captured-fallback outputs differ from eager", case.name);
+                    println!(
+                        "[{pid}] it {it} {}: {differ} captured-fallback outputs differ from eager",
+                        case.name
+                    );
                 }
                 cap_differ += differ;
             }
@@ -528,7 +608,10 @@ fn stress(gpu: &mut Gpu) -> bool {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch {}", gpu.arch);
-    let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let reps: usize = std::env::var("REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
     match std::env::var("MODE").as_deref() {
         Ok("sweep") => sweep(&mut gpu, reps),
         Ok("stress") => {

@@ -116,7 +116,10 @@ pub const UNSAFE_WSL_VMM_KV: &str = "HIPFIRE_UNSAFE_WSL_VMM_KV";
 /// Why Redline PM4 (retained default or explicit backend) is refused on
 /// `platform`, or `None` when it may run. Native Windows has no ROCr, so no
 /// knob lifts it there.
-pub fn redline_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: bool) -> Option<String> {
+pub fn redline_refusal(
+    platform: Option<UncertifiedPlatform>,
+    unsafe_override: bool,
+) -> Option<String> {
     match platform? {
         UncertifiedPlatform::NativeWindows => Some(
             "Redline PM4 needs ROCr (libhsa-runtime64), which the Windows HIP SDK does not ship".into(),
@@ -129,7 +132,10 @@ pub fn redline_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: b
 }
 
 /// Why the VMM KV backend is refused on `platform`, or `None` when allowed.
-pub fn vmm_kv_refusal(platform: Option<UncertifiedPlatform>, unsafe_override: bool) -> Option<String> {
+pub fn vmm_kv_refusal(
+    platform: Option<UncertifiedPlatform>,
+    unsafe_override: bool,
+) -> Option<String> {
     match platform? {
         UncertifiedPlatform::NativeWindows => {
             Some("Windows VMM mapping/graph semantics are not certified".into())
@@ -147,12 +153,18 @@ fn process_flag(name: &str) -> bool {
 
 /// [`redline_refusal`] for this host and process configuration.
 pub fn redline_platform_refusal() -> Option<String> {
-    redline_refusal(UncertifiedPlatform::detect(), process_flag(UNSAFE_WSL_REDLINE))
+    redline_refusal(
+        UncertifiedPlatform::detect(),
+        process_flag(UNSAFE_WSL_REDLINE),
+    )
 }
 
 /// [`vmm_kv_refusal`] for this host and process configuration.
 pub fn vmm_kv_platform_refusal() -> Option<String> {
-    vmm_kv_refusal(UncertifiedPlatform::detect(), process_flag(UNSAFE_WSL_VMM_KV))
+    vmm_kv_refusal(
+        UncertifiedPlatform::detect(),
+        process_flag(UNSAFE_WSL_VMM_KV),
+    )
 }
 
 const KEY: &str = "hardware.devices";
@@ -331,7 +343,8 @@ pub fn enumerate_gpus(nodes_dir: &Path) -> Result<Vec<GpuDevice>> {
         };
         let location_id = property("location_id").ok_or_else(|| malformed("location_id"))?;
         let domain = property("domain").unwrap_or(0);
-        let version = property("gfx_target_version").ok_or_else(|| malformed("gfx_target_version"))?;
+        let version =
+            property("gfx_target_version").ok_or_else(|| malformed("gfx_target_version"))?;
         devices.push(GpuDevice {
             index: 0,
             rocr_index: devices.len(),
@@ -348,11 +361,127 @@ pub fn enumerate_gpus(nodes_dir: &Path) -> Result<Vec<GpuDevice>> {
     Ok(devices)
 }
 
+/// Why CU masking is refused on RDNA devices.
+pub const RDNA_CU_MASK_BAN: &str = "CU masking is refused on RDNA (gfx10/gfx11/gfx12): on 2026-10-14 a CU-masked queue probe hung the R9700 (gfx1201) MES scheduler, forced mode1 resets and took the host down; it stays banned until a safe method is approved.";
+
+/// True iff `device_name` is an RDNA ISA name: `gfx` followed by a four-digit
+/// number starting with `1` (gfx10xx/gfx11xx/gfx12xx). A `:feature` suffix and
+/// ASCII case are ignored.
+#[must_use]
+pub fn cu_mask_refused_on(device_name: &str) -> bool {
+    let base = device_name.split(':').next().unwrap_or("");
+    let Some(digits) = base
+        .get(..3)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("gfx"))
+        .map(|_| &base[3..])
+    else {
+        return false;
+    };
+    digits.len() == 4 && digits.starts_with('1') && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// ROCr's process-wide CU affinity mask.
+pub const HSA_CU_MASK: &str = "HSA_CU_MASK";
+/// ROCclr/HIP's global CU affinity mask.
+pub const ROC_GLOBAL_CU_MASK: &str = "ROC_GLOBAL_CU_MASK";
+
+/// `gfx_target_version` of every GPU node (SIMDs > 0) in a KFD topology
+/// directory, in node order. `None` when the topology cannot be read in full,
+/// so callers can fail closed.
+pub fn kfd_gpu_gfx_target_versions(nodes_dir: &Path) -> Option<Vec<u32>> {
+    let mut nodes = fs::read_dir(nodes_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    nodes.sort_unstable();
+    let mut versions = Vec::new();
+    for node in nodes {
+        let text = fs::read_to_string(nodes_dir.join(node.to_string()).join("properties")).ok()?;
+        let property = |name: &str| {
+            text.lines().find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.trim().parse::<u64>().ok())?
+            })
+        };
+        if property("simd_count").unwrap_or(0) == 0 {
+            continue;
+        }
+        versions.push(u32::try_from(property("gfx_target_version")?).ok()?);
+    }
+    Some(versions)
+}
+
+/// Pure decision of [`cu_mask_env_guard`]. An env var counts as set when it is
+/// present and non-empty after trimming. `gpu_gfx_target_versions` is
+/// `major*10000 + minor*100 + stepping` per GPU node (`None`: topology
+/// unreadable). With a mask variable set, any RDNA device (major >= 10), an
+/// unreadable topology or an empty GPU list is refused: the caller cannot
+/// prove that no RDNA device is visible. Only all-major-9 (GCN/CDNA) passes.
+pub fn cu_mask_env_decision(
+    hsa_cu_mask: Option<&str>,
+    roc_global_cu_mask: Option<&str>,
+    gpu_gfx_target_versions: Option<&[u32]>,
+) -> std::result::Result<(), String> {
+    let set = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    let mut names = Vec::new();
+    if set(hsa_cu_mask) {
+        names.push(HSA_CU_MASK);
+    }
+    if set(roc_global_cu_mask) {
+        names.push(ROC_GLOBAL_CU_MASK);
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    let names = names.join(" / ");
+    let reason = match gpu_gfx_target_versions {
+        None | Some([]) => {
+            "cannot prove no RDNA device is visible (KFD topology unreadable or lists no GPU)"
+                .to_owned()
+        }
+        Some(versions) => {
+            let rdna = versions
+                .iter()
+                .filter(|&&version| version / 10000 >= 10)
+                .map(|&version| gfx_name(u64::from(version)))
+                .collect::<Vec<_>>();
+            if rdna.is_empty() {
+                return Ok(());
+            }
+            format!("RDNA device(s) present: {}", rdna.join(", "))
+        }
+    };
+    Err(format!(
+        "{names} set but refused: {reason}. {RDNA_CU_MASK_BAN}"
+    ))
+}
+
+/// Process-start guard: refuse a set `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` when
+/// any RDNA GPU may be visible. Reads the REAL process environment (ROCr reads
+/// the real environment, not hipfire's config snapshot) and every GPU node of
+/// the KFD topology. It deliberately does not honour `ROCR_VISIBLE_DEVICES`: a
+/// filter is not trusted to hide an RDNA card from a mask the runtime would
+/// apply. Call it before any ROCr/HIP library is loaded.
+pub fn cu_mask_env_guard() -> std::result::Result<(), String> {
+    let read =
+        |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+    let hsa = read(HSA_CU_MASK);
+    let roc = read(ROC_GLOBAL_CU_MASK);
+    let is_set = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    if !is_set(&hsa) && !is_set(&roc) {
+        return Ok(());
+    }
+    let versions = kfd_gpu_gfx_target_versions(Path::new(KFD_TOPOLOGY_NODES));
+    cu_mask_env_decision(hsa.as_deref(), roc.as_deref(), versions.as_deref())
+}
+
 /// Parse HIP's `GPU-<hex>` UUID spelling: ROCr's 16 ASCII hex digits, or the
 /// raw 16 UUID bytes as 32 hex digits. All zeros means no UUID.
 fn parse_hip_uuid(value: &str) -> Option<u128> {
     let value = value.trim();
-    let hex = value.strip_prefix("GPU-").or_else(|| value.strip_prefix("gpu-"))?;
+    let hex = value
+        .strip_prefix("GPU-")
+        .or_else(|| value.strip_prefix("gpu-"))?;
     if hex.is_empty() || hex.len() > 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
@@ -363,7 +492,9 @@ fn parse_hip_uuid(value: &str) -> Option<u128> {
 /// no KFD topology. The result is in logical order; `index` is the PCI BDF
 /// position and `rocr_index`/`node` carry the HIP ordinal. Two devices with
 /// one lock identity fail closed: a single lock must never cover two cards.
-pub fn devices_from_hip(observed: &[ObservedDevice]) -> std::result::Result<Vec<GpuDevice>, String> {
+pub fn devices_from_hip(
+    observed: &[ObservedDevice],
+) -> std::result::Result<Vec<GpuDevice>, String> {
     let mut devices = observed
         .iter()
         .map(|seen| {
@@ -471,8 +602,14 @@ impl fmt::Display for DeviceSelector {
             Self::Index(index) => write!(f, "{index}"),
             Self::Arch(arch) => f.write_str(arch),
             Self::Uuid(id) => write!(f, "GPU-{id:016x}"),
-            Self::Bdf { bdf, has_domain: true } => write!(f, "{bdf}"),
-            Self::Bdf { bdf, has_domain: false } => {
+            Self::Bdf {
+                bdf,
+                has_domain: true,
+            } => write!(f, "{bdf}"),
+            Self::Bdf {
+                bdf,
+                has_domain: false,
+            } => {
                 write!(f, "{:02x}:{:02x}.{:x}", bdf.bus, bdf.device, bdf.function)
             }
         }
@@ -512,7 +649,9 @@ fn parse_selector(token: &str) -> std::result::Result<DeviceSelector, String> {
     }
     if let Some(hex) = lower.strip_prefix("gpu-") {
         return match u64::from_str_radix(hex, 16) {
-            Ok(0) => Err(format!("{token:?} is the no-UUID placeholder; select that card by PCI address")),
+            Ok(0) => Err(format!(
+                "{token:?} is the no-UUID placeholder; select that card by PCI address"
+            )),
             Ok(id) if hex.len() <= 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
                 Ok(DeviceSelector::Uuid(id))
             }
@@ -773,10 +912,12 @@ pub fn apply_device_visibility(
                 .as_deref()
                 .and_then(override_arch),
         };
-        ACTIVE_DEVICES.set(active).map_err(|_| ConfigError::InvalidValue {
-            key: KEY.into(),
-            message: "device selection was already applied in this process".into(),
-        })?;
+        ACTIVE_DEVICES
+            .set(active)
+            .map_err(|_| ConfigError::InvalidValue {
+                key: KEY.into(),
+                message: "device selection was already applied in this process".into(),
+            })?;
     }
     Ok(selection)
 }
@@ -869,7 +1010,9 @@ fn rocr_visible(devices: &[GpuDevice], filter: Option<&str>) -> Option<Vec<GpuDe
                 .iter()
                 .find(|device| match token.parse::<usize>() {
                     Ok(ordinal) => device.rocr_index == ordinal,
-                    Err(_) => device.uuid().is_some_and(|uuid| uuid.eq_ignore_ascii_case(token)),
+                    Err(_) => device
+                        .uuid()
+                        .is_some_and(|uuid| uuid.eq_ignore_ascii_case(token)),
                 })
                 .cloned()
         })
@@ -920,7 +1063,10 @@ impl ActiveDevices {
             let Some(device) = self.devices.get(seen.logical) else {
                 return Err(self.mismatch(
                     observed,
-                    &format!("logical device {} is outside the resolved set", seen.logical),
+                    &format!(
+                        "logical device {} is outside the resolved set",
+                        seen.logical
+                    ),
                 ));
             };
             let expected_arch = self.hip_arch_override.as_deref().unwrap_or(&device.arch);
@@ -953,7 +1099,9 @@ impl ActiveDevices {
             ));
         }
         if let Some(arch) = &self.hip_arch_override {
-            message.push_str(&format!("\n  ({HSA_OVERRIDE_GFX_VERSION} expects HIP arch {arch})"));
+            message.push_str(&format!(
+                "\n  ({HSA_OVERRIDE_GFX_VERSION} expects HIP arch {arch})"
+            ));
         }
         message.push_str("\nHIP reports:\n  logical  arch      pci");
         for seen in observed {
@@ -967,7 +1115,7 @@ impl ActiveDevices {
 }
 
 /// `HSA_OVERRIDE_GFX_VERSION=11.0.0` → `gfx1100`.
-fn override_arch(value: &str) -> Option<String> {
+pub fn override_arch(value: &str) -> Option<String> {
     let mut parts = value.trim().split('.').map(|part| part.parse::<u64>().ok());
     let (Some(Some(major)), Some(Some(minor)), Some(Some(stepping)), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -1038,7 +1186,11 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("properties"), properties).unwrap();
         };
-        write(0, "cpu_cores_count 32\nsimd_count 0\ngfx_target_version 0\nlocation_id 0\ndomain 0\n".into());
+        write(
+            0,
+            "cpu_cores_count 32\nsimd_count 0\ngfx_target_version 0\nlocation_id 0\ndomain 0\n"
+                .into(),
+        );
         for (offset, (version, unique_id, location)) in gpus.iter().enumerate() {
             write(
                 offset + 1,
@@ -1080,7 +1232,10 @@ mod tests {
     }
 
     fn uuids(devices: &[GpuDevice]) -> Vec<String> {
-        devices.iter().map(|device| device.rocr_selector()).collect()
+        devices
+            .iter()
+            .map(|device| device.rocr_selector())
+            .collect()
     }
 
     fn message(error: ConfigError) -> String {
@@ -1149,7 +1304,11 @@ mod tests {
             picked.iter().map(|device| device.index).collect::<Vec<_>>(),
             [2, 3, 1]
         );
-        assert_eq!(claimed, [1, 2, 3], "exact entries are claimed before arch entries");
+        assert_eq!(
+            claimed,
+            [1, 2, 3],
+            "exact entries are claimed before arch entries"
+        );
     }
 
     #[test]
@@ -1163,7 +1322,12 @@ mod tests {
         // BDF order 66, 6e, 99, bf.
         assert_eq!(
             arches,
-            [("gfx1100", 0), ("gfx1030", 2), ("gfx1010", 3), ("gfx1151", 1)]
+            [
+                ("gfx1100", 0),
+                ("gfx1030", 2),
+                ("gfx1010", 3),
+                ("gfx1151", 1)
+            ]
         );
         let picked = resolve_free("gfx1010,gfx1151,gfx1030", &host).unwrap();
         assert_eq!(
@@ -1198,19 +1362,31 @@ mod tests {
             ("0,,1", "empty entry"),
             ("GPU-0", "no-UUID placeholder"),
             ("03:00", "not a DDDD:BB:DD.F"),
-            ("gfx1201,gfx1201,gfx1201,gfx1201,gfx1201,gfx1201", "no free gfx1201 GPU for entry 6: 5 already selected"),
+            (
+                "gfx1201,gfx1201,gfx1201,gfx1201,gfx1201,gfx1201",
+                "no free gfx1201 GPU for entry 6: 5 already selected",
+            ),
         ] {
             let error = message(resolve_free(spec, &host).unwrap_err());
             assert!(error.contains(reason), "{spec}: {error}");
-            assert!(error.contains("GPU-e475645fe0200397  0000:13:00.0"), "{spec}: {error}");
+            assert!(
+                error.contains("GPU-e475645fe0200397  0000:13:00.0"),
+                "{spec}: {error}"
+            );
         }
 
         let devices = enumerate_gpus(&host.0).unwrap();
         let mut busy = |_: &GpuDevice| Ok(Claim::Busy("reserved by holder PID 9".into()));
         let error = message(resolve_device_selectors("1", &devices, &mut busy).unwrap_err());
-        assert!(error.contains("which is reserved by holder PID 9"), "{error}");
+        assert!(
+            error.contains("which is reserved by holder PID 9"),
+            "{error}"
+        );
         let error = message(resolve_device_selectors("gfx1201", &devices, &mut busy).unwrap_err());
-        assert!(error.contains("busy: [index 0 reserved by holder PID 9;"), "{error}");
+        assert!(
+            error.contains("busy: [index 0 reserved by holder PID 9;"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1223,8 +1399,13 @@ mod tests {
             "simd_count 128\ngfx_target_version 120001\nlocation_id 768\ndomain 1\nunique_id 2\n",
         )
         .unwrap();
-        assert!(message(resolve_free("03:00.0", &root).unwrap_err()).contains("give the PCI domain"));
-        assert_eq!(uuids(&resolve_free("0001:03:00.0", &root).unwrap()), ["GPU-0000000000000002"]);
+        assert!(
+            message(resolve_free("03:00.0", &root).unwrap_err()).contains("give the PCI domain")
+        );
+        assert_eq!(
+            uuids(&resolve_free("0001:03:00.0", &root).unwrap()),
+            ["GPU-0000000000000002"]
+        );
     }
 
     fn process_with_devices(spec: &str) -> ProcessConfig {
@@ -1263,9 +1444,8 @@ mod tests {
 
         let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
         let missing = Path::new("/nonexistent-kfd-topology");
-        let inherited = |hip, rocr| {
-            synchronized_device_visibility(&defaults, hip, rocr, missing, &mut free)
-        };
+        let inherited =
+            |hip, rocr| synchronized_device_visibility(&defaults, hip, rocr, missing, &mut free);
         assert_eq!(
             inherited(Some("2"), None).unwrap(),
             DeviceSelection::Inherited(DeviceVisibility {
@@ -1335,7 +1515,10 @@ mod tests {
         let root = DeviceRoot::at(&wsl.0);
         assert!(root.is_wsl_dxg());
         assert_eq!(root.identity_source(), IdentitySource::Hip);
-        assert_eq!(UncertifiedPlatform::detect_at(&root), Some(UncertifiedPlatform::WslDxg));
+        assert_eq!(
+            UncertifiedPlatform::detect_at(&root),
+            Some(UncertifiedPlatform::WslDxg)
+        );
 
         let devices = identify_observed(
             &root,
@@ -1361,15 +1544,25 @@ mod tests {
 
         let error = identify_observed(
             &root,
-            &[seen(0, "gfx1201", "0000:00:00.0"), seen(1, "gfx1201", "0000:00:00.0")],
+            &[
+                seen(0, "gfx1201", "0000:00:00.0"),
+                seen(1, "gfx1201", "0000:00:00.0"),
+            ],
         )
         .unwrap_err();
-        assert!(error.contains("share the lock identity pci-0000:00:00.0"), "{error}");
+        assert!(
+            error.contains("share the lock identity pci-0000:00:00.0"),
+            "{error}"
+        );
         let error = identify_observed(&root, &[seen(0, "gfx1201", "dxg")]).unwrap_err();
         assert!(error.contains("unparsable PCI bus ID"), "{error}");
 
-        let error = message(hip_identity_visibility(&root, &process_with_devices("0")).unwrap_err());
-        assert!(error.contains("select cards with HIP_VISIBLE_DEVICES"), "{error}");
+        let error =
+            message(hip_identity_visibility(&root, &process_with_devices("0")).unwrap_err());
+        assert!(
+            error.contains("select cards with HIP_VISIBLE_DEVICES"),
+            "{error}"
+        );
         let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
         assert_eq!(hip_identity_visibility(&root, &defaults).unwrap(), None);
     }
@@ -1382,17 +1575,24 @@ mod tests {
             let root = DeviceRoot::at(&host.0);
             assert_eq!(root.identity_source(), IdentitySource::Kfd, "{nodes:?}");
             assert_eq!(UncertifiedPlatform::detect_at(&root), None, "{nodes:?}");
-            let devices =
-                identify_observed(&root, &[seen_uuid(0, "0000:03:00.0", "GPU-ffffffffffffffff")])
-                    .unwrap();
+            let devices = identify_observed(
+                &root,
+                &[seen_uuid(0, "0000:03:00.0", "GPU-ffffffffffffffff")],
+            )
+            .unwrap();
             assert_eq!(devices[0].lock_file_name(), "gpu-GPU-0000000000001234.lock");
-            assert!(identify_observed(&root, &[seen(0, "gfx1201", "0000:04:00.0")])
-                .unwrap_err()
-                .contains("not in the KFD topology"));
+            assert!(
+                identify_observed(&root, &[seen(0, "gfx1201", "0000:04:00.0")])
+                    .unwrap_err()
+                    .contains("not in the KFD topology")
+            );
         }
         let missing = device_root(&[], false);
-        assert!(identify_observed(&DeviceRoot::at(&missing.0), &[seen(0, "gfx1201", "0000:03:00.0")])
-            .is_err());
+        assert!(identify_observed(
+            &DeviceRoot::at(&missing.0),
+            &[seen(0, "gfx1201", "0000:03:00.0")]
+        )
+        .is_err());
     }
 
     #[test]
@@ -1404,9 +1604,15 @@ mod tests {
             assert!(refusal(Some(NativeWindows), true).is_some());
         }
         let redline = redline_refusal(Some(WslDxg), false).unwrap();
-        assert!(redline.contains("WSL/ROCDXG") && redline.contains("HIPFIRE_UNSAFE_WSL_REDLINE=1"), "{redline}");
+        assert!(
+            redline.contains("WSL/ROCDXG") && redline.contains("HIPFIRE_UNSAFE_WSL_REDLINE=1"),
+            "{redline}"
+        );
         let vmm = vmm_kv_refusal(Some(WslDxg), false).unwrap();
-        assert!(vmm.contains("WSL/ROCDXG") && vmm.contains("HIPFIRE_UNSAFE_WSL_VMM_KV=1"), "{vmm}");
+        assert!(
+            vmm.contains("WSL/ROCDXG") && vmm.contains("HIPFIRE_UNSAFE_WSL_VMM_KV=1"),
+            "{vmm}"
+        );
     }
 
     #[test]
@@ -1417,16 +1623,29 @@ mod tests {
             hip_arch_override: None,
         };
         active
-            .verify_visible(&[seen(0, "gfx1010", "0000:99:00.0"), seen(1, "gfx1030", "0000:6E:00.0")])
+            .verify_visible(&[
+                seen(0, "gfx1010", "0000:99:00.0"),
+                seen(1, "gfx1030", "0000:6E:00.0"),
+            ])
             .unwrap();
         let swapped = active
-            .verify_visible(&[seen(0, "gfx1030", "0000:6e:00.0"), seen(1, "gfx1010", "0000:99:00.0")])
+            .verify_visible(&[
+                seen(0, "gfx1030", "0000:6e:00.0"),
+                seen(1, "gfx1010", "0000:99:00.0"),
+            ])
             .unwrap_err();
-        assert!(swapped.contains("logical device 0 should be gfx1010 PCI 0000:99:00.0"), "{swapped}");
+        assert!(
+            swapped.contains("logical device 0 should be gfx1010 PCI 0000:99:00.0"),
+            "{swapped}"
+        );
         assert!(swapped.contains("HIP reports:"), "{swapped}");
-        assert!(active.verify_visible(&[seen(0, "gfx1010", "0000:99:00.0")]).is_err());
+        assert!(active
+            .verify_visible(&[seen(0, "gfx1010", "0000:99:00.0")])
+            .is_err());
         assert!(active.verify(&[seen(1, "gfx1030", "0000:6e:00.0")]).is_ok());
-        assert!(active.verify(&[seen(2, "gfx1030", "0000:6e:00.0")]).is_err());
+        assert!(active
+            .verify(&[seen(2, "gfx1030", "0000:6e:00.0")])
+            .is_err());
 
         let overridden = ActiveDevices {
             hip_arch_override: override_arch("10.3.0"),
@@ -1446,12 +1665,111 @@ mod tests {
     }
 
     #[test]
+    fn cu_mask_refused_on_is_exactly_rdna_gfx1x() {
+        for name in [
+            "gfx1010",
+            "gfx1030",
+            "gfx1100",
+            "gfx1151",
+            "gfx1200",
+            "gfx1201",
+            "gfx1201:xnack-",
+            "GFX1100",
+            "gfx1100:sramecc+:xnack-",
+        ] {
+            assert!(cu_mask_refused_on(name), "{name} must be refused");
+        }
+        for name in [
+            "gfx906",
+            "gfx908",
+            "gfx90a",
+            "gfx940",
+            "gfx942",
+            "gfx950",
+            "gfx942:sramecc+:xnack-",
+            "gfx90a:xnack+",
+            "",
+            "gfx",
+            "gfx1",
+            "gfx12010",
+            "x1100",
+        ] {
+            assert!(!cu_mask_refused_on(name), "{name} must not be refused");
+        }
+    }
+
+    #[test]
+    fn cu_mask_env_unset_or_blank_is_ok_on_any_hardware() {
+        assert_eq!(cu_mask_env_decision(None, None, Some(&[120001])), Ok(()));
+        assert_eq!(cu_mask_env_decision(None, None, None), Ok(()));
+        assert_eq!(
+            cu_mask_env_decision(Some("  \t"), Some(""), Some(&[120001, 110501])),
+            Ok(())
+        );
+        assert_eq!(cu_mask_env_decision(Some(" "), None, None), Ok(()));
+    }
+
+    #[test]
+    fn cu_mask_env_set_on_rdna_is_refused() {
+        let message = cu_mask_env_decision(Some("0x1"), None, Some(&[120001])).unwrap_err();
+        assert!(message.contains("HSA_CU_MASK"), "{message}");
+        assert!(!message.contains("ROC_GLOBAL_CU_MASK"), "{message}");
+        assert!(message.contains("gfx1201"), "{message}");
+        assert!(message.contains("2026-10-14"), "{message}");
+        assert!(message.contains(RDNA_CU_MASK_BAN), "{message}");
+        let message = cu_mask_env_decision(None, Some("0x1"), Some(&[110501, 110000])).unwrap_err();
+        assert!(message.contains("ROC_GLOBAL_CU_MASK"), "{message}");
+        assert!(message.contains("gfx1151"), "{message}");
+        assert!(cu_mask_env_decision(Some("1"), Some("1"), Some(&[100300])).is_err());
+        // One RDNA card among CDNA cards is enough.
+        assert!(cu_mask_env_decision(Some("1"), None, Some(&[90402, 100300])).is_err());
+    }
+
+    #[test]
+    fn cu_mask_env_set_on_cdna_only_is_ok() {
+        for versions in [&[90402][..], &[90010, 90500, 90008][..]] {
+            assert_eq!(
+                cu_mask_env_decision(Some("0x1"), None, Some(versions)),
+                Ok(())
+            );
+            assert_eq!(
+                cu_mask_env_decision(None, Some("0x1"), Some(versions)),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn cu_mask_env_set_without_topology_proof_is_refused() {
+        for versions in [None, Some(&[][..])] {
+            let message = cu_mask_env_decision(Some("0x1"), None, versions).unwrap_err();
+            assert!(
+                message.contains("cannot prove no RDNA device is visible"),
+                "{message}"
+            );
+            assert!(message.contains("2026-10-14"), "{message}");
+        }
+    }
+
+    #[test]
+    fn kfd_gpu_versions_skip_cpu_nodes_and_fail_closed() {
+        let host = hipx();
+        let mut versions = kfd_gpu_gfx_target_versions(&host.0).unwrap();
+        versions.sort_unstable();
+        assert_eq!(versions, [100100, 100300, 110000, 110501]);
+        assert_eq!(kfd_gpu_gfx_target_versions(&host.0.join("absent")), None);
+    }
+
+    #[test]
     fn rocr_filter_keeps_the_cards_it_names() {
         let topology = hipx();
         let devices = enumerate_gpus(&topology.0).unwrap();
         let archs = |filter: Option<&str>| {
-            rocr_visible(&devices, filter)
-                .map(|kept| kept.into_iter().map(|device| device.arch).collect::<Vec<_>>())
+            rocr_visible(&devices, filter).map(|kept| {
+                kept.into_iter()
+                    .map(|device| device.arch)
+                    .collect::<Vec<_>>()
+            })
         };
         // Unfiltered: every GPU in BDF order, the APU included.
         assert_eq!(
@@ -1473,8 +1791,14 @@ mod tests {
     #[test]
     fn entry_point_resolves_only_when_set_and_not_yet_applied() {
         assert!(needs_entry_point_resolution(true, false));
-        assert!(!needs_entry_point_resolution(false, false), "unset keeps device 0");
-        assert!(!needs_entry_point_resolution(true, true), "daemon already applied");
+        assert!(
+            !needs_entry_point_resolution(false, false),
+            "unset keeps device 0"
+        );
+        assert!(
+            !needs_entry_point_resolution(true, true),
+            "daemon already applied"
+        );
         assert!(!needs_entry_point_resolution(false, true));
     }
 

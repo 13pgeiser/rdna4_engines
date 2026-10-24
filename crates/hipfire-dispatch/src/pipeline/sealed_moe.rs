@@ -15,8 +15,9 @@ use super::moe_program::{self, MoeKernelSelection};
 use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
-    MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries, MoePrefillParams, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability, RoutedExpertWeights,
+    ExpertTierIdentity, MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries,
+    MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability,
+    RoutedExpertWeights, MOE_BIASED_SIGMOID_MAX_K,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -68,6 +69,37 @@ pub fn specialized_sealed_moe_retained_admission() -> SpecializedRouteAdmission 
 fn diagnostic_specialized_capture_requested() -> bool {
     hipfire_config::process_value("HIPFIRE_REPLAY_DIAGNOSTIC_SPECIALIZED_MOE_CAPTURE")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` (`developer.moe_router_fused_prefill`, a
+/// typed boolean): the explicit value, read once. `true`/`1` runs the fused
+/// prefill router on any wave32 arch, `false`/`0` is the kill switch. Unset
+/// follows `prefill_route_capabilities` qualification of `arch`. Admission
+/// (top-k 8, expert count, wave32) stays `Gpu::moe_router_fused_prefill_admitted`.
+fn moe_router_fused_prefill_on(arch: &str) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, PrefillRoute};
+    static EXPLICIT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_typed_bool("HIPFIRE_MOE_ROUTER_FUSED_PREFILL")
+    });
+    enabled(*EXPLICIT, arch, PrefillRoute::MoeRouterFusedPrefill)
+}
+
+/// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` (`developer.moe_router_topk_multirow`, a
+/// typed boolean): the explicit value, read once. Unset follows the
+/// exact-gfx1201 qualification (on there, off elsewhere); `false`/`0` kills it and
+/// `true`/`1` selects the wave-per-row fused router wherever the raw capability
+/// inventory of `arch` is present.
+/// The caller still requires the fused-prefill route itself to be enabled and
+/// admitted (an explicit `HIPFIRE_MOE_ROUTER_FUSED_PREFILL=0` therefore keeps the
+/// incumbent router whatever this says), plus `Gpu::moe_router_topk_multirow_admitted`
+/// for the shape.
+fn moe_router_topk_multirow_on(arch: &str) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, raw_inventory, PrefillRoute};
+    static EXPLICIT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_typed_bool("HIPFIRE_MOE_ROUTER_TOPK_MULTIROW")
+    });
+    enabled(*EXPLICIT, arch, PrefillRoute::MoeRouterTopkMultirow)
+        && raw_inventory(arch, PrefillRoute::MoeRouterTopkMultirow)
 }
 
 /// What a model adapter's eligible-forward boundary must do with the retained
@@ -562,6 +594,7 @@ pub struct ExpertMetadata {
     owner_rank: usize,
     local_slot: usize,
     resources: ExpertResources,
+    absent: bool,
 }
 
 impl ExpertMetadata {
@@ -620,6 +653,7 @@ impl ExpertMetadata {
             owner_rank,
             local_slot,
             resources,
+            absent: false,
         })
     }
 
@@ -637,6 +671,16 @@ impl ExpertMetadata {
 
     pub fn resources(&self) -> &ExpertResources {
         &self.resources
+    }
+
+    /// Mark an original-id slot as carrying no resource bytes and never routable.
+    pub fn into_absent(mut self) -> Self {
+        self.absent = true;
+        self
+    }
+
+    pub fn is_absent(&self) -> bool {
+        self.absent
     }
 }
 
@@ -1015,22 +1059,34 @@ impl ExpertTable {
 struct LiveTensorIdentity {
     ptr: usize,
     byte_capacity: usize,
+    /// Allocation bytes past the tensor's logical shape (see
+    /// [`dtype_tag_tail_bytes`]); zero for every other resource.
+    tail: usize,
     shape: Box<[usize]>,
     dtype: DType,
 }
 
 impl LiveTensorIdentity {
     fn capture(tensor: &GpuTensor, name: &str) -> Result<Self, DispatchError> {
+        Self::capture_with_tail(tensor, name, 0)
+    }
+
+    fn capture_with_tail(
+        tensor: &GpuTensor,
+        name: &str,
+        tail: usize,
+    ) -> Result<Self, DispatchError> {
         let tensor_bytes = tensor_capacity_bytes(tensor)?;
         let byte_capacity = tensor.buf.size();
-        if byte_capacity != tensor_bytes {
+        if byte_capacity != tensor_bytes + tail {
             return Err(invalid(format!(
-                "{name} buffer capacity {byte_capacity} does not equal tensor capacity {tensor_bytes}"
+                "{name} buffer capacity {byte_capacity} does not equal tensor capacity {tensor_bytes} + tail {tail}"
             )));
         }
         Ok(Self {
             ptr: tensor.buf.as_ptr() as usize,
             byte_capacity,
+            tail,
             shape: tensor.shape.clone().into_boxed_slice(),
             dtype: tensor.dtype,
         })
@@ -1051,7 +1107,7 @@ impl LiveTensorIdentity {
         if self.ptr != tensor.buf.as_ptr() as usize {
             return Err(invalid(format!("{name} live buffer identity differs")));
         }
-        if self.byte_capacity != byte_capacity || byte_capacity != tensor_bytes {
+        if self.byte_capacity != byte_capacity || byte_capacity != tensor_bytes + self.tail {
             return Err(invalid(format!(
                 "{name} live buffer capacity {byte_capacity} differs from bound {}",
                 self.byte_capacity
@@ -1141,6 +1197,11 @@ struct LiveMoeBinding {
     /// entry check compares whole slices.
     gate_up_entries: Box<[usize]>,
     down_entries: Box<[usize]>,
+    /// Explicit per-expert tier identity the bound expert set carried
+    /// ([`RoutedExpertWeights::tier_identity`]); `None` for every legacy
+    /// layer. Its owner keepalive is retained for as long as this binding
+    /// lives.
+    tier: Option<ExpertTierIdentity>,
 }
 
 /// The live gate/up and down buffer pointers of `experts`, in order.
@@ -1163,6 +1224,196 @@ fn live_entry_ptrs(
 pub struct CompactLiveWeight<'a> {
     pub gate_up: crate::families::gemv::WeightRef<'a>,
     pub down: crate::families::gemv::WeightRef<'a>,
+}
+
+/// `ExpertResource::source_fingerprint` of an expert-slab layer's resident views.
+pub const SLAB_RESOURCE_FORMAT: &str = "qwen4-resident-slab-v1";
+
+/// Neutral plain data a layer's retained-route identities derive from (no
+/// arch-private types, so loaders outside this crate can build it too).
+#[derive(Clone, Debug)]
+pub struct RetainedRouteInputs<'a> {
+    pub layer: u32,
+    /// Stable id of the layer's expert table (`ExpertTable` identity).
+    pub table_identity: u64,
+    /// The live binding's pointer-level mapping fingerprint.
+    pub mapping_fingerprint: &'a str,
+    /// `Some` on an expert-slab layer: the codec byte of every expert
+    /// (`0` = MQ4, `1` = W3, `3` = E8P-I4, `255` = unknown; W2 is never a slab codec).
+    pub codecs: Option<&'a [u8]>,
+    /// `(device address, bytes)` of the gate/up and down pointer tables and of
+    /// the layer's codec-tag tensor, when it has one.
+    pub gate_up_table: (u64, u64),
+    pub down_table: (u64, u64),
+    pub tag_table: Option<(u64, u64)>,
+    /// Generation of the bound expert set (the arena set); `0` when none.
+    pub owner_generation: u64,
+    /// `Some` on an explicit per-expert tier layer: generation, logical
+    /// digest, per-expert placement (so the layer host bit), codecs and the
+    /// frozen pointer-table mirrors all move the identity. `None` keeps the
+    /// legacy/slab identity byte-identical.
+    pub tier: Option<&'a ExpertTierIdentity>,
+}
+
+/// The exact `(key, identity)` pairs a layer passes to
+/// `ReplayController::note_route_identity` (and that the top-level validation
+/// before a retained replay compares). A legacy layer yields its one
+/// `(table identity, mapping fingerprint)` pair, byte-identical to before; a
+/// slab layer's pair also carries the route profile, the per-expert codec
+/// digest and the arena generation, and a second pair keyed by the layer binds
+/// the tables, codec digest and generation separately.
+pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, String)> {
+    let suffix = input.tier.map_or_else(String::new, tier_identity_suffix);
+    let tags = input.tag_table.map_or_else(
+        || "none".to_owned(),
+        |(ptr, bytes)| format!("{ptr:x}:{bytes}"),
+    );
+    let Some(codecs) = input.codecs else {
+        if input.tier.is_none() {
+            return vec![(input.table_identity, input.mapping_fingerprint.to_owned())];
+        }
+        let layer_key =
+            fnv1a_u64(format!("tier-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes())
+                | (1 << 63);
+        return vec![
+            (
+                input.table_identity,
+                format!("{}{suffix}", input.mapping_fingerprint),
+            ),
+            (
+                layer_key,
+                format!(
+                    "tier-layer/v1|layer={}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}{suffix}",
+                    input.layer,
+                    input.gate_up_table.0,
+                    input.gate_up_table.1,
+                    input.down_table.0,
+                    input.down_table.1,
+                    input.owner_generation
+                ),
+            ),
+        ];
+    };
+    let codec = fnv1a_u64(codecs);
+    let layer_key =
+        fnv1a_u64(format!("slab-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes())
+            | (1 << 63);
+    vec![
+        (
+            input.table_identity,
+            format!(
+                "{}|slab-v1|codec={codec:016x}|gen={}{suffix}",
+                input.mapping_fingerprint, input.owner_generation
+            ),
+        ),
+        (
+            layer_key,
+            format!(
+                "slab-layer/v1|layer={}|profile=slab-codec-grouped|codec={codec:016x}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}{suffix}",
+                input.layer,
+                input.gate_up_table.0,
+                input.gate_up_table.1,
+                input.down_table.0,
+                input.down_table.1,
+                input.owner_generation
+            ),
+        ),
+    ]
+}
+
+/// Canonical identity suffix of an explicit tier layer: owner generation,
+/// logical digest, the layer-wide host bit, and digests of the per-expert
+/// placement, codec and frozen pointer-table mirrors.
+fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
+    let mut digest = String::with_capacity(64);
+    for byte in tier.logical_digest() {
+        digest.push_str(&format!("{byte:02x}"));
+    }
+    let entry_hash = |entries: &[usize]| {
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| (*entry as u64).to_le_bytes())
+            .collect();
+        fnv1a_u64(&bytes)
+    };
+    format!(
+        "|tier-v1|gen={}|digest={digest}|host={}|place={:016x}|codec={:016x}|gu={:016x}|dn={:016x}",
+        tier.generation(),
+        u8::from(tier.any_host()),
+        fnv1a_u64(tier.placement()),
+        fnv1a_u64(tier.codecs()),
+        entry_hash(tier.gate_up_entries()),
+        entry_hash(tier.down_entries()),
+    )
+}
+
+/// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `3` = E8P-I4,
+/// `255` = unknown.
+fn expert_codec_byte(down: DType) -> u8 {
+    match down {
+        DType::MQ4G128V2 => 0,
+        DType::MQ3I4G128R128 => 1,
+        DType::E8PI4G128R128 => 3,
+        _ => 255,
+    }
+}
+
+/// A tier identity must describe exactly this table: one placement and codec
+/// per expert, each codec the one the expert's sealed down dtype implies.
+fn validate_tier_binding(
+    table: &ExpertTable,
+    tier: &ExpertTierIdentity,
+) -> Result<(), DispatchError> {
+    let n_experts = table.n_experts();
+    if tier.placement().len() != n_experts {
+        return Err(invalid(format!(
+            "expert tier identity covers {} experts, expected {n_experts}",
+            tier.placement().len()
+        )));
+    }
+    for (index, expert) in table.experts().iter().enumerate() {
+        let expected = expert_codec_byte(expert.resources().down().dtype());
+        if tier.codecs()[index] != expected {
+            return Err(invalid(format!(
+                "expert {index} tier codec {} differs from the sealed down dtype codec {expected}",
+                tier.codecs()[index]
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The live call's tier identity must be the bound one: same owner
+/// generation, logical digest, placement, codecs, pointer-table content and
+/// the very same owner retention.
+fn check_tier_identity(
+    expected: &ExpertTierIdentity,
+    actual: &ExpertTierIdentity,
+) -> Result<(), DispatchError> {
+    if expected == actual {
+        return Ok(());
+    }
+    let field = if expected.generation() != actual.generation() {
+        "owner generation"
+    } else if expected.logical_digest() != actual.logical_digest() {
+        "logical digest"
+    } else if expected.placement() != actual.placement() {
+        "placement"
+    } else if expected.codecs() != actual.codecs() {
+        "codec table"
+    } else if expected.gate_up_entries() != actual.gate_up_entries() {
+        "gate/up pointer entries"
+    } else if expected.down_entries() != actual.down_entries() {
+        "down pointer entries"
+    } else {
+        "owner retention"
+    };
+    Err(invalid(format!(
+        "live expert tier identity differs from the bound identity: {field} \
+         (generation {} bound, {} live)",
+        expected.generation(),
+        actual.generation()
+    )))
 }
 
 /// Reject a cache/table generation mismatch before any bind work.
@@ -1220,6 +1471,70 @@ pub struct ExpertBindingCache {
 }
 
 impl ExpertBindingCache {
+    /// The retained-route `(key, identity)` pairs of this live binding for
+    /// `layer` ([`retained_route_identities`]), derived from the table's
+    /// per-expert dtypes and the live tensor identities. The one derivation
+    /// both the per-call note and the top-level replay validation use.
+    pub fn retained_route_identities(
+        &self,
+        table: &ExpertTable,
+        layer: u32,
+    ) -> Result<Vec<(u64, String)>, DispatchError> {
+        check_cache_table(self, table)?;
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| invalid("expert binding cache has no live resource binding"))?;
+        let slab = table.experts().first().is_some_and(|expert| {
+            expert
+                .resources()
+                .gate_up()
+                .is_some_and(|resource| resource.source_fingerprint() == SLAB_RESOURCE_FORMAT)
+        });
+        let codecs: Option<Vec<u8>> = slab.then(|| {
+            table
+                .experts()
+                .iter()
+                .map(|expert| expert_codec_byte(expert.resources().down().dtype()))
+                .collect()
+        });
+        Ok(retained_route_identities(&RetainedRouteInputs {
+            layer,
+            table_identity: live.table_identity,
+            mapping_fingerprint: &live.mapping_fingerprint,
+            codecs: codecs.as_deref(),
+            gate_up_table: (
+                live.gate_up_ptrs.ptr as u64,
+                live.gate_up_ptrs.byte_capacity as u64,
+            ),
+            down_table: (
+                live.down_ptrs.ptr as u64,
+                live.down_ptrs.byte_capacity as u64,
+            ),
+            tag_table: live
+                .dtype_tags
+                .as_ref()
+                .map(|tags| (tags.ptr as u64, tags.byte_capacity as u64)),
+            tier: live.tier.as_ref(),
+            owner_generation: live.tier.as_ref().map_or(
+                live.source_identity.unwrap_or(0),
+                ExpertTierIdentity::generation,
+            ),
+        }))
+    }
+
+    /// The explicit tier identity this cache was bound with, if any.
+    pub fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+        self.live.as_ref().and_then(|live| live.tier.as_ref())
+    }
+
+    /// The tier owner retention bound into this cache. Anything that keeps
+    /// the cache's tables or tapes alive (captured graphs, retained bodies)
+    /// must hold it until its GPU work is retired.
+    pub fn tier_keepalive(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.tier_identity().map(|tier| tier.keepalive().clone())
+    }
+
     pub fn new(
         table: &ExpertTable,
         local_rank: usize,
@@ -1885,6 +2200,28 @@ impl<'a> SealedMoeCall<'a> {
                 gpu.arch
             )));
         }
+        // The eager CPU-cold/GPU-hot split blocks the host between the router
+        // and the routed tail, so capture, retained/shadow bodies, PM4/AQL, a
+        // canonicalised route width or a grouped (non-F32-slot) down refuse
+        // here, before any launch or state mutation of this call.
+        match (&self.params, &self.selection) {
+            (SealedParams::Decode(params), MoeKernelSelection::Decode(selection))
+                if selection.cpu_split =>
+            {
+                moe_program::validate_split_decode(gpu, params, selection)?;
+            }
+            (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection))
+                if selection.cpu_split =>
+            {
+                moe_program::validate_split_prefill_exec(
+                    gpu,
+                    params,
+                    selection,
+                    self.dispatch_ctx.cpu_wide_verify(),
+                )?;
+            }
+            _ => {}
+        }
         if let MoeKernelSelection::Decode(selection) = &self.selection {
             if !selection.resolution.use_gpu_topk && gpu.graphs.replay.capturing.is_some() {
                 return Err(DispatchError::UnsupportedVariant {
@@ -2005,11 +2342,26 @@ impl<'a> SealedMoeCall<'a> {
         if let (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection)) =
             (&self.params, &self.selection)
         {
-            if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+            if selection
+                .route
+                .is_some_and(MoeRouteCapability::is_fp8_grouped)
+                && !gpu.arch_caps.is_gfx942()
+            {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "fp8-grouped-gfx942-only",
+                    arch: "",
+                    quant: "FP8E4M3B128",
+                });
+            }
+            if selection
+                .route
+                .is_some_and(MoeRouteCapability::is_sealed_grouped)
+            {
                 super::qt44_qt53_prefill::validate_scratch(
                     gpu,
                     params,
-                    selection.resolution.use_path2,
+                    selection.uses_grouped_rows(),
                     selection.path2_m_total,
                 )?;
             }
@@ -2092,13 +2444,48 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+            let grouped = route.is_some_and(MoeRouteCapability::is_sealed_grouped);
+            // Fail-closed router faults name the sealed call's layer and the global
+            // row (prefill chunk offset + row in this batch).
+            let router_layer = params.ep_layer_idx as usize;
+            let row_base = gpu.router_row_base();
             // The grouped top-10 router rounds each logit it reads itself.
             if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            if grouped {
+            let keep_mask = params
+                .route_policy
+                .map_or(0, |policy| policy.expert_keep_mask);
+            if keep_mask != 0 {
+                // The masked kernel reads unrounded logits whenever the in-place
+                // round above was skipped (a grouped route), so the observer
+                // copy owes the same round: the exact complement of that skip.
+                #[cfg(feature = "moe-oracle")]
+                super::router_observer::record(
+                    "prefill-top10-masked",
+                    super::router_observer::RouterScoresAfterRoute::Logits,
+                    params.recipe.bf16_round_trip() && grouped,
+                );
+                gpu.moe_router_softmax_top10_masked_f32(
+                    scores,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.batch_size,
+                    normalize,
+                    keep_mask,
+                    params.recipe.bf16_round_trip(),
+                    router_layer,
+                    row_base,
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            } else if grouped {
+                #[cfg(feature = "moe-oracle")]
+                super::router_observer::record(
+                    "prefill-top10-grouped",
+                    super::router_observer::RouterScoresAfterRoute::Logits,
+                    params.recipe.bf16_round_trip(),
+                );
                 gpu.moe_router_softmax_top10_f32(
                     scores,
                     params.topk_indices,
@@ -2106,12 +2493,30 @@ pub(super) fn produce_prefill_route<'a>(
                     params.batch_size,
                     normalize,
                     params.recipe.bf16_round_trip(),
+                    router_layer,
+                    row_base,
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
-                gpu.softmax_f32(scores)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let result = if params.k_top == 10 {
+                    #[cfg(feature = "moe-oracle")]
+                    super::router_observer::record(
+                        "prefill-guard-softmax-top10",
+                        super::router_observer::RouterScoresAfterRoute::Probabilities,
+                        false,
+                    );
+                    // Pre-softmax guard: records any NaN/Inf logit row and poisons it
+                    // so the renorm below fails it closed (ids -1, weights 0).
+                    gpu.moe_router_logits_guard_top10(
+                        scores,
+                        params.n_exp,
+                        params.batch_size,
+                        router_layer,
+                        row_base,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    gpu.softmax_f32(scores)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_top10_batched(
                         scores,
                         params.topk_indices,
@@ -2119,8 +2524,62 @@ pub(super) fn produce_prefill_route<'a>(
                         params.n_exp,
                         normalize,
                         params.batch_size,
+                        router_layer,
+                        row_base,
                     )
+                } else if Gpu::moe_router_fused_prefill_admitted(
+                    // Explicit `1`/`0` wins on any wave32 arch; unset follows
+                    // `prefill_route_capabilities` qualification.
+                    moe_router_fused_prefill_on(&gpu.arch),
+                    params.k_top,
+                    params.n_exp,
+                    gpu.arch_caps.is_wave32(),
+                ) {
+                    // Not grouped: the logits were rounded in place above.
+                    #[cfg(feature = "moe-oracle")]
+                    super::router_observer::record(
+                        "prefill-fused-softmax-topk-k8",
+                        super::router_observer::RouterScoresAfterRoute::Logits,
+                        false,
+                    );
+                    // Wave-per-row launch (unset on at exact gfx1201 by qualification), nested
+                    // under the fused route's own flag and admission: top-8, 256 experts,
+                    // wave32, non-empty batch.
+                    if Gpu::moe_router_topk_multirow_admitted(
+                        moe_router_topk_multirow_on(&gpu.arch),
+                        params.k_top,
+                        params.n_exp,
+                        params.batch_size,
+                        gpu.arch_caps.is_wave32(),
+                    ) {
+                        gpu.moe_router_softmax_topk_k8_multirow_prefill(
+                            scores,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.n_exp,
+                            normalize,
+                            params.batch_size,
+                        )
+                    } else {
+                        gpu.moe_router_softmax_topk_k8_prefill(
+                            scores,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.n_exp,
+                            normalize,
+                            params.batch_size,
+                            Gpu::MOE_ROUTER_FUSED_PREFILL_LANES,
+                        )
+                    }
                 } else {
+                    #[cfg(feature = "moe-oracle")]
+                    super::router_observer::record(
+                        "prefill-softmax-topk-k8",
+                        super::router_observer::RouterScoresAfterRoute::Probabilities,
+                        false,
+                    );
+                    gpu.softmax_f32(scores)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_k8_batched(
                         scores,
                         params.topk_indices,
@@ -2141,6 +2600,12 @@ pub(super) fn produce_prefill_route<'a>(
         MoeRouterInput::SigmoidTopK | MoeRouterInput::PrecomputedSigmoidTopK => {
             #[cfg(feature = "deltanet")]
             {
+                #[cfg(feature = "moe-oracle")]
+                super::router_observer::record(
+                    "prefill-sigmoid-topk-k8",
+                    super::router_observer::RouterScoresAfterRoute::Sigmoid,
+                    false,
+                );
                 gpu.sigmoid_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.moe_topk_renorm_k8_batched(
@@ -2184,6 +2649,19 @@ pub(crate) fn execute_sealed(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<
     moe_program::execute(gpu, call)
 }
 
+/// [`execute_sealed`] for the S1 layer-major prepare half only: the same bound-call
+/// checks, then normalize/input basis/router/shared gate-up and activation/route
+/// for the call's own tile, and nothing of the routed tail or the shared down
+/// (see [`moe_program::execute_prepare`]).
+pub(crate) fn execute_sealed_prepare(
+    gpu: &mut Gpu,
+    call: &SealedMoeCall<'_>,
+) -> Result<(), DispatchError> {
+    call.validate_for_gpu(gpu)?;
+    call.note_retained_route_identity(gpu)?;
+    moe_program::execute_prepare(gpu, call)
+}
+
 /// [`execute_sealed`] for a call that directly follows `Step::Clear(clear)`
 /// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the zero fill is either taken over by
 /// the combine or launched here, first.  With the HC write `hc` (whose gates
@@ -2222,19 +2700,34 @@ impl SealedMoeCall<'_> {
             SealedParams::Decode(params) => params.route_policy.is_some(),
             SealedParams::Prefill(params) => params.route_policy.is_some(),
         };
-        if !specialized {
+        let tier_bound = self
+            .experts
+            .cache
+            .live
+            .as_ref()
+            .is_some_and(|live| live.tier.is_some());
+        if !specialized && !tier_bound {
             return Ok(());
         }
-        let Some(live) = self.experts.cache.live.as_ref() else {
+        if self.experts.cache.live.is_none() {
             return Err(invalid(
                 "specialized sealed MoE retained body requires a live expert binding",
             ));
+        }
+        let layer = match &self.params {
+            SealedParams::Decode(params) => params.layer_idx as u32,
+            SealedParams::Prefill(params) => params.ep_layer_idx as u32,
         };
-        let identity = live.mapping_fingerprint.clone();
-        let key = live.table_identity;
-        gpu.replay
-            .note_route_identity(key, &identity)
-            .map_err(|reason| invalid(reason))
+        for (key, identity) in self
+            .experts
+            .cache
+            .retained_route_identities(self.experts.table, layer)?
+        {
+            gpu.replay
+                .note_route_identity(key, &identity)
+                .map_err(|reason| invalid(reason))?;
+        }
+        Ok(())
     }
 }
 
@@ -2393,6 +2886,40 @@ fn seal_decode_with_router<'a>(
     seal_indexed_decode(experts, ctx, params, router)
 }
 
+/// The unbiased sigmoid router selects exactly eight experts; a selection
+/// bias routes through the runtime-width bias-aware selector.
+pub(super) fn sigmoid_decode_width_ok(params: &MoeParams<'_>) -> bool {
+    match params.selection_bias {
+        None => params.k == 8,
+        Some(_) => (1..=MOE_BIASED_SIGMOID_MAX_K).contains(&params.k),
+    }
+}
+
+/// A selection bias belongs to the sigmoid recipe, always normalizes over the
+/// selection, and covers every expert.
+fn validate_selection_bias(params: &MoeParams<'_>) -> Result<(), DispatchError> {
+    let Some(bias) = params.selection_bias else {
+        return Ok(());
+    };
+    if params.recipe != MoeRecipe::SigmoidRoutedNoShared {
+        return Err(invalid(
+            "a selection bias requires the sigmoid routed recipe",
+        ));
+    }
+    if !params.norm_topk_prob {
+        return Err(invalid(
+            "the biased sigmoid router always normalizes; norm_topk_prob must be true",
+        ));
+    }
+    if !bias.route_scale.is_finite() {
+        return Err(invalid("selection bias route scale is not finite"));
+    }
+    if bias.bias.dtype != DType::F32 {
+        return Err(invalid("selection bias must be F32"));
+    }
+    require_elements(bias.bias, params.n_exp, "selection bias")
+}
+
 fn require_recipe_feature(recipe: MoeRecipe) -> Result<(), DispatchError> {
     #[cfg(not(feature = "deltanet"))]
     if recipe == MoeRecipe::SigmoidRoutedNoShared {
@@ -2451,9 +2978,9 @@ fn prepare_decode<'a>(
     require_recipe_feature(params.recipe)?;
     resolve_decode_normalization(ctx, &mut params)?;
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
-        if params.k != 8 {
+        if !sigmoid_decode_width_ok(&params) {
             return Err(invalid(format!(
-                "sigmoid MoE decode requires k=8, got {}",
+                "sigmoid MoE decode requires k=8 (1..={MOE_BIASED_SIGMOID_MAX_K} with a selection bias), got {}",
                 params.k
             )));
         }
@@ -3072,12 +3599,15 @@ fn validate_decode(
         return Err(invalid("deferred routed combine requires routed_out=None"));
     }
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared
-        && (params.k != 8 || params.ep_mode != MoeEpMode::None || params.defer_routed_combine)
+        && (!sigmoid_decode_width_ok(params)
+            || params.ep_mode != MoeEpMode::None
+            || params.defer_routed_combine)
     {
         return Err(invalid(
-            "sigmoid MoE decode requires k=8, no EP, and no deferred combine",
+            "sigmoid MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine",
         ));
     }
+    validate_selection_bias(params)?;
     validate_normalization(&params.normalization, params.hidden, params.hidden)?;
     validate_shared_decode(params, params.hidden)?;
     validate_weight_ref(
@@ -3112,6 +3642,21 @@ fn validate_decode(
         params.expert_dtype_tags,
         params.expert_ptrs_host,
     )?;
+    // An explicit tier layer's replay dereferences the uploaded pointer
+    // tables: their host mirror is mandatory on every call, not only on a
+    // specialized retained body.
+    if experts
+        .cache
+        .live
+        .as_ref()
+        .is_some_and(|live| live.tier.is_some())
+        && params.expert_ptrs_host.is_none()
+    {
+        return Err(invalid(
+            "tier-bound sealed MoE decode requires the host expert pointer entries \
+             (expert_ptrs_host) that the tier pointer tables were uploaded from",
+        ));
+    }
     validate_dtype_tag_table(
         params.expert_dtype_tags,
         params.n_exp,
@@ -3649,14 +4194,19 @@ fn build_live_binding(
         validate_pointer_table(table, n_experts, "live down AWQ")?;
     }
     validate_dtype_tag_table(dtype_tags, n_experts, table_has_mixed_dtypes(table)?)?;
+    let tier = routed_experts.tier_identity().cloned();
+    if let Some(tier) = &tier {
+        validate_tier_binding(table, tier)?;
+    }
 
     let gate_up_identity = LiveTensorIdentity::capture(gate_up_ptrs, "live gate/up")?;
     let down_identity = LiveTensorIdentity::capture(down_ptrs, "live down")?;
     let down_awq_identity = down_awq_ptrs
         .map(|table| LiveTensorIdentity::capture(table, "live down AWQ"))
         .transpose()?;
+    let dtype_tag_tail = dtype_tag_tail_bytes(table)?;
     let dtype_tag_identity = dtype_tags
-        .map(|table| LiveTensorIdentity::capture(table, "live dtype tags"))
+        .map(|tags| LiveTensorIdentity::capture_with_tail(tags, "live dtype tags", dtype_tag_tail))
         .transpose()?;
 
     let mut live_experts = Vec::with_capacity(n_experts);
@@ -3701,8 +4251,26 @@ fn build_live_binding(
         }
         None => canonical.push_str("none;"),
     }
+    if let Some(tier) = &tier {
+        canonical.push_str(&tier_identity_suffix(tier));
+    }
 
     let (gate_up_entries, down_entries) = live_entry_ptrs(&live_experts);
+    if let Some(tier) = &tier {
+        for index in 0..n_experts {
+            if tier.gate_up_entries()[index] != gate_up_entries[index]
+                || tier.down_entries()[index] != down_entries[index]
+            {
+                return Err(invalid(format!(
+                    "expert {index} tier pointer entries ({:x}, {:x}) do not name its live tensors ({:x}, {:x})",
+                    tier.gate_up_entries()[index],
+                    tier.down_entries()[index],
+                    gate_up_entries[index],
+                    down_entries[index]
+                )));
+            }
+        }
+    }
     Ok(LiveMoeBinding {
         table_identity: table.identity,
         table_ptr: table.experts.as_ptr() as usize,
@@ -3716,6 +4284,7 @@ fn build_live_binding(
         source_identity: routed_experts.immutable_identity(),
         gate_up_entries,
         down_entries,
+        tier,
     })
 }
 
@@ -3955,6 +4524,7 @@ fn build_compact_live_binding(
         source_identity: None,
         gate_up_entries,
         down_entries,
+        tier: None,
     })
 }
 
@@ -4008,6 +4578,29 @@ fn bind_live_weight(
     index: usize,
     role: &str,
 ) -> Result<LiveWeightIdentity, DispatchError> {
+    if metadata.is_absent() {
+        if !weight.buf.buf.as_ptr().is_null()
+            || weight.buf.buf.size() != 0
+            || weight.buf.shape.as_slice() != [0]
+        {
+            return Err(invalid(format!(
+                "absent expert {index} {role} must have a null zero-byte view"
+            )));
+        }
+        return Ok(LiveWeightIdentity {
+            buffer: LiveTensorIdentity {
+                ptr: 0,
+                byte_capacity: 0,
+                tail: 0,
+                shape: vec![0].into_boxed_slice(),
+                dtype: weight.buf.dtype,
+            },
+            dtype: weight.dtype,
+            m: weight.m,
+            k: weight.k,
+            row_stride: weight.row_stride,
+        });
+    }
     let (rows, cols, dtype, bytes) = expected_live_weight_geometry(metadata, gate_up, index, role)?;
 
     if weight.dtype != dtype {
@@ -4041,6 +4634,9 @@ fn live_weight_matches_metadata(
     index: usize,
     role: &str,
 ) -> bool {
+    if metadata.is_absent() {
+        return weight.buf.buf.as_ptr().is_null() && weight.buf.buf.size() == 0;
+    }
     let Ok((rows, cols, dtype, bytes)) =
         expected_live_weight_geometry(metadata, gate_up, index, role)
     else {
@@ -4088,6 +4684,29 @@ fn resource_dims(
         )));
     }
     Ok((resource.shape()[0], resource.shape()[1]))
+}
+
+/// Extra allocation bytes behind the logical u8 tag table of a mixed layer
+/// that carries a slab codec: the i32 owner table of the codec-masked tile
+/// ids (`slab_route::codec_i32`) rides after the one-byte-per-expert table in
+/// the same allocation. Every other tag table has no tail.
+fn dtype_tag_tail_bytes(table: &ExpertTable) -> Result<usize, DispatchError> {
+    if !table_has_mixed_dtypes(table)? {
+        return Ok(0);
+    }
+    let slab = table.experts().iter().any(|metadata| {
+        let resources = metadata.resources();
+        resources
+            .gate_up()
+            .or_else(|| resources.gate())
+            .is_some_and(|resource| {
+                matches!(
+                    resource.dtype(),
+                    DType::MQ3I4G128R256 | DType::E8PI4G128R256
+                )
+            })
+    });
+    Ok(if slab { 4 * table.n_experts() } else { 0 })
 }
 
 fn table_has_mixed_dtypes(table: &ExpertTable) -> Result<bool, DispatchError> {
@@ -4149,6 +4768,20 @@ fn validate_live_binding(
             live.experts.len()
         )));
     }
+    match (&live.tier, routed_experts.tier_identity()) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) => check_tier_identity(expected, actual)?,
+        (Some(_), None) => {
+            return Err(invalid(
+                "live routed experts carry no tier identity but the binding was made with one",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "live routed experts carry a tier identity the binding was not made with",
+            ));
+        }
+    }
     // The set this binding was captured from promised immutability: its id
     // stands for every expert identity checked at bind time.
     let bound_source = live.source_identity.is_some()
@@ -4164,7 +4797,8 @@ fn validate_live_binding(
             expected_down.matches(&down, "live down")?;
         }
     }
-    live.gate_up_ptrs.matches(gate_up_ptrs, "gate/up pointer table")?;
+    live.gate_up_ptrs
+        .matches(gate_up_ptrs, "gate/up pointer table")?;
     live.down_ptrs.matches(down_ptrs, "down pointer table")?;
     // Table *contents*, not just the table tensor: a replay dereferences these
     // entries without re-uploading them, so each entry must point at the live
@@ -4848,6 +5482,262 @@ mod tests {
         .is_err());
     }
 
+    use crate::families::moe::{EXPERT_TIER_DEVICE, EXPERT_TIER_HOST};
+
+    struct TierRouted {
+        inner: FakeRouted,
+        tier: ExpertTierIdentity,
+    }
+
+    impl RoutedExpertWeights for TierRouted {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn get(
+            &self,
+            expert_idx: usize,
+        ) -> Option<(
+            crate::families::gemv::WeightRef<'_>,
+            crate::families::gemv::WeightRef<'_>,
+        )> {
+            self.inner.get(expert_idx)
+        }
+
+        fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+            Some(&self.tier)
+        }
+    }
+
+    fn tier_for(
+        fixture: &LiveFixture,
+        generation: u64,
+        placement: &[u8],
+        codecs: &[u8],
+        keep: &std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> ExpertTierIdentity {
+        let gate_up: Vec<usize> = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|expert| expert.gate_up.buf.buf.as_ptr() as usize)
+            .collect();
+        let down: Vec<usize> = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|expert| expert.down.buf.buf.as_ptr() as usize)
+            .collect();
+        ExpertTierIdentity::new(
+            generation,
+            [3; 32],
+            placement,
+            codecs,
+            &gate_up,
+            &down,
+            keep.clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tier_binding_validates_generation_content_and_keeps_owners_alive() {
+        let table = table(2, DType::MQ4G128V2);
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let fixture = live_fixture(&table, 0x90_0000);
+        // Expert 0 is device-resident, expert 1 host-mapped.
+        let tier = tier_for(
+            &fixture,
+            5,
+            &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST],
+            &[0, 0],
+            &keep,
+        );
+        let entries = (
+            tier.gate_up_entries().to_vec(),
+            tier.down_entries().to_vec(),
+        );
+        let routed = TierRouted {
+            inner: fixture.routed,
+            tier,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        cache
+            .bind_live(
+                &table,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &cache.tier_keepalive().unwrap(),
+            &keep
+        ));
+        assert_eq!(routed.host_mapped_projections(), (true, true));
+        assert!(crate::families::moe::routed_host_mapped(&routed));
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let host_entries = MoePointerEntries {
+            gate_up: &entries.0,
+            down: &entries.1,
+        };
+        validate_live_binding(
+            &bound,
+            Some(&routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap();
+        let identities = cache.retained_route_identities(&table, 3).unwrap();
+        assert_eq!(identities.len(), 2);
+        assert!(identities
+            .iter()
+            .all(|(_, identity)| identity.contains("|tier-v1|gen=5|")));
+        assert!(identities
+            .iter()
+            .all(|(_, identity)| identity.contains("|host=1|")));
+
+        // A reloaded owner set (new generation) at identical addresses is refused.
+        let twin = live_fixture(&table, 0x90_0000);
+        let reloaded = TierRouted {
+            tier: tier_for(
+                &twin,
+                6,
+                &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST],
+                &[0, 0],
+                &keep,
+            ),
+            inner: twin.routed,
+        };
+        let error = validate_live_binding(
+            &bound,
+            Some(&reloaded),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("owner generation"));
+
+        // A flipped placement byte is refused.
+        let flipped_fixture = live_fixture(&table, 0x90_0000);
+        let flipped = TierRouted {
+            tier: tier_for(
+                &flipped_fixture,
+                5,
+                &[EXPERT_TIER_HOST, EXPERT_TIER_HOST],
+                &[0, 0],
+                &keep,
+            ),
+            inner: flipped_fixture.routed,
+        };
+        let error = validate_live_binding(
+            &bound,
+            Some(&flipped),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("placement"));
+
+        // A call without any tier identity is refused (no silent legacy fallback).
+        let plain = live_fixture(&table, 0x90_0000);
+        let error = validate_live_binding(
+            &bound,
+            Some(&plain.routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("tier identity"));
+
+        // Host pointer entries that do not name the live tensors are refused.
+        let mut bad = entries.0.clone();
+        bad[1] += 0x100;
+        let error = validate_live_binding(
+            &bound,
+            Some(&routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(MoePointerEntries {
+                gate_up: &bad,
+                down: &entries.1,
+            }),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("does not point at its live tensor"));
+    }
+
+    #[test]
+    fn tier_bind_refuses_wrong_codec_and_pointer_entries_off_the_live_tensors() {
+        let table = table(2, DType::MQ4G128V2);
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let fixture = live_fixture(&table, 0xA0_0000);
+        // W3 codec for an MQ4 expert.
+        let wrong_codec = TierRouted {
+            tier: tier_for(
+                &fixture,
+                1,
+                &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE],
+                &[0, 1],
+                &keep,
+            ),
+            inner: live_fixture(&table, 0xA0_0000).routed,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let error = cache
+            .bind_live(
+                &table,
+                &wrong_codec,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("tier codec"));
+
+        // Entries minted from a different base than the live tensors.
+        let other = live_fixture(&table, 0xB0_0000);
+        let misplaced = TierRouted {
+            tier: tier_for(
+                &other,
+                1,
+                &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE],
+                &[0, 0],
+                &keep,
+            ),
+            inner: live_fixture(&table, 0xA0_0000).routed,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let error = cache
+            .bind_live(
+                &table,
+                &misplaced,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("tier pointer entries"));
+    }
+
     fn table(n: usize, dtype: DType) -> ExpertTable {
         let records = (0..n)
             .map(|id| {
@@ -4979,6 +5869,64 @@ mod tests {
         assert!(validate_dtype_tag_table(Some(&tags), 3, false).is_err());
         let short_tags = live_tensor(0xa0_1000, 2, &[2], DType::Raw);
         assert!(validate_dtype_tag_table(Some(&short_tags), 3, true).is_err());
+    }
+
+    #[test]
+    fn slab_mixed_tag_allocation_carries_the_i32_owner_table_behind_the_u8_table() {
+        // Regression: the first real-artifact forward refused the 2560 B tag
+        // allocation (u8 table + i32 owner table) against its 512 B logical shape.
+        let expert = |index: usize, gate: DType, down: DType| {
+            ExpertMetadata::new(
+                index,
+                0,
+                index,
+                ExpertResources::fused(
+                    resource(&format!("gu{index}"), gate, &[8, 256]),
+                    resource(&format!("dn{index}"), down, &[4, 256]),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let slab = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&slab).unwrap(), 4 * 2);
+        let e8p_slab = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::E8PI4G128R256, DType::E8PI4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&e8p_slab).unwrap(), 4 * 2);
+        // A uniform slab layer (no tag table) and a legacy mixed layer have no tail.
+        let uniform = ExpertTable::new(vec![
+            expert(0, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            expert(1, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&uniform).unwrap(), 0);
+        let legacy = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::MQ6G256, DType::MQ6G256),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&legacy).unwrap(), 0);
+
+        // Allocation 2 + 8 bytes behind a [2] u8 logical table.
+        let tags = live_tensor(0xb0_0000, 2 + 8, &[2], DType::Raw);
+        validate_dtype_tag_table(Some(&tags), 2, true).unwrap();
+        assert!(LiveTensorIdentity::capture(&tags, "tags").is_err());
+        let bound = LiveTensorIdentity::capture_with_tail(&tags, "tags", 8).unwrap();
+        bound.matches(&tags, "tags").unwrap();
+        assert!(bound
+            .matches(&live_tensor(0xb0_0000, 2, &[2], DType::Raw), "tags")
+            .is_err());
+        assert!(bound
+            .matches(&live_tensor(0xb0_1000, 2 + 8, &[2], DType::Raw), "tags")
+            .is_err());
+        assert!(LiveTensorIdentity::capture_with_tail(&tags, "tags", 4).is_err());
     }
 
     #[test]
@@ -5828,6 +6776,7 @@ mod tests {
             k,
             n_exp,
             norm_topk_prob: false,
+            selection_bias: None,
             x_rot_prerotated: true,
             defer_routed_combine: false,
             cpu_deferred_experts: false,
@@ -6045,6 +6994,7 @@ mod tests {
             k,
             n_exp,
             norm_topk_prob: false,
+            selection_bias: None,
             x_rot_prerotated: true,
             defer_routed_combine: false,
             cpu_deferred_experts: false,
@@ -6162,6 +7112,135 @@ mod tests {
         assert!(format!("{error:?}").contains("context device"), "{error:?}");
     }
 
+    #[test]
+    #[cfg(feature = "deltanet")]
+    fn biased_sigmoid_decode_admits_narrow_k_only_as_normalized_sigmoid() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+        let table = table(8, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x95_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x96_0000);
+        let bias = f32_elems(0x97_0000, 8);
+        let short_bias = f32_elems(0x98_0000, 7);
+        let biases = [&bias, &short_bias];
+        let params = |k, which: Option<usize>| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                k,
+                8,
+                MoeEpMode::None,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params.norm_topk_prob = true;
+            params.selection_bias = which.map(|i| MoeSelectionBias {
+                bias: biases[i],
+                route_scale: 1.0,
+            });
+            params
+        };
+        let call = seal_decode(experts, &ctx, params(4, Some(0))).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+
+        // Without the bias the sigmoid route stays top-8 only.
+        let error = seal_decode(experts, &ctx, params(4, None))
+            .err()
+            .expect("unbiased sigmoid k=4 must fail");
+        assert!(format!("{error:?}").contains("k=8"), "{error:?}");
+        // The bias-aware selector always normalizes.
+        let mut unnormalized = params(4, Some(0));
+        unnormalized.norm_topk_prob = false;
+        let error = seal_decode(experts, &ctx, unnormalized)
+            .err()
+            .expect("unnormalized biased route must fail");
+        assert!(format!("{error:?}").contains("norm_topk_prob"), "{error:?}");
+        // The bias must cover every expert.
+        let error = seal_decode(experts, &ctx, params(4, Some(1)))
+            .err()
+            .expect("short bias must fail");
+        assert!(format!("{error:?}").contains("selection bias"), "{error:?}");
+        // A selection bias belongs to the sigmoid recipe only.
+        let mut softmax = ep_decode_params(
+            &scratch,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            0,
+            8,
+            8,
+            MoeEpMode::None,
+            None,
+            false,
+        );
+        softmax.selection_bias = Some(MoeSelectionBias {
+            bias: &bias,
+            route_scale: 1.0,
+        });
+        let error = seal_decode(experts, &ctx, softmax)
+            .err()
+            .expect("biased softmax route must fail");
+        assert!(
+            format!("{error:?}").contains("sigmoid routed recipe"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "deltanet")]
+    fn biased_sigmoid_decode_admits_lloyd_experts_only_at_top8() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+        let table = table(8, DType::MQ2G256Lloyd);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x99_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x9a_0000);
+        let bias = f32_elems(0x9b_0000, 8);
+        let params = |k| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                k,
+                8,
+                MoeEpMode::None,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params.dtypes.experts_all_gate_up_mq4 = false;
+            params.dtypes.routed_gate_up = DType::MQ2G256Lloyd;
+            params.dtypes.routed_down = DType::MQ2G256Lloyd;
+            params.norm_topk_prob = true;
+            params.selection_bias = Some(MoeSelectionBias {
+                bias: &bias,
+                route_scale: 1.0,
+            });
+            params
+        };
+        let call = seal_decode(experts, &ctx, params(8)).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+        // The Lloyd routed kernels read a fixed top-8 width.
+        let error = seal_decode(experts, &ctx, params(4))
+            .err()
+            .expect("biased Lloyd k=4 must fail");
+        assert!(format!("{error:?}").contains("runtime-width"), "{error:?}");
+    }
     #[cfg(not(feature = "deltanet"))]
     #[test]
     fn sigmoid_decode_refuses_before_publication_without_deltanet() {
@@ -6610,7 +7689,28 @@ mod tests {
             shared_down_out: None,
             ep_layer_idx: 0,
             ep_tile_exchange: None,
+            expert_iu4: None,
         }
+    }
+
+    /// A prefill constructor that does not bind the expert IU4 capability (every
+    /// non-Qwen35 caller, and the base fixture the struct updates inherit from)
+    /// leaves `expert_iu4` absent, so the default-off route does not exist.
+    #[test]
+    fn base_prefill_params_carry_no_expert_iu4() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE6_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let scratch = prefill_scratch(0xE7_0000);
+        let params = ep_prefill_params(
+            &scratch,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        );
+        assert!(params.expert_iu4.is_none());
     }
 
     fn ep_prefill_table() -> (ExpertTable, ExpertBindingCache, CompactFixture) {
@@ -6815,7 +7915,7 @@ mod tests {
     // ---- EP row gather lowering (decode and few-row grouped prefill) ----
 
     use crate::families::moe::{MoeRouteCapability, MoeRowGather};
-    use moe_program::{MoeStage, MoePrefillSelection, MoeDecodeSelection};
+    use moe_program::{MoeDecodeSelection, MoePrefillSelection, MoeStage};
 
     struct NoopGather;
 
@@ -6865,8 +7965,11 @@ mod tests {
         params: &MoeParams<'_>,
         route: Option<MoeRouteCapability>,
     ) -> MoeKernelSelection {
-        let mut resolution =
-            crate::families::moe::MoeResolution::resolve_arch(&params.dtypes, params.k, ctx.arch.has_wmma());
+        let mut resolution = crate::families::moe::MoeResolution::resolve_arch(
+            &params.dtypes,
+            params.k,
+            ctx.arch.has_wmma(),
+        );
         if route.is_some() {
             resolution.use_gpu_topk = true;
             resolution.needs_x_rot_local = true;
@@ -6884,6 +7987,8 @@ mod tests {
             ninepath_mq4v2: false,
             ninepath_mq6v2: false,
             cpu_deferred_experts: false,
+            cpu_split: false,
+            cpwait: false,
         })
     }
 
@@ -6903,6 +8008,8 @@ mod tests {
             coalesced_verify: false,
             route,
             cpu_deferred_experts: false,
+            cpu_split: false,
+            cpwait: false,
         })
     }
 
@@ -6973,6 +8080,784 @@ mod tests {
         let selection = prefill_selection(&ctx, &params, route);
         let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
         moe_program::lowered_stages(&call)
+    }
+
+    /// Stages a CPU-deferred grouped call lowers to (decode or prefill) under a
+    /// recipe with the given `shared_after_combine`; nothing launches.
+    fn deferred_stages(decode: bool, shared_after_combine: bool) -> Vec<MoeStage> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xEA_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let recipe = MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine,
+        };
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        if decode {
+            let scratch = decode_scratch(0xEB_0000);
+            let params = MoeParams {
+                recipe,
+                cpu_deferred_experts: true,
+                ..ep_decode_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    0,
+                    8,
+                    4,
+                    MoeEpMode::None,
+                    None,
+                    false,
+                )
+            };
+            let MoeKernelSelection::Decode(mut selection) = decode_selection(&ctx, &params, route)
+            else {
+                unreachable!("decode_selection returns a decode selection");
+            };
+            selection.cpu_deferred_experts = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Decode(selection),
+                SealedParams::Decode(params),
+            );
+            moe_program::lowered_stages(&call).unwrap()
+        } else {
+            let scratch = prefill_scratch(0xEC_0000);
+            let params = MoePrefillParams {
+                recipe,
+                cpu_deferred_experts: true,
+                ..ep_prefill_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            let MoeKernelSelection::Prefill(mut selection) =
+                prefill_selection(&ctx, &params, route)
+            else {
+                unreachable!("prefill_selection returns a prefill selection");
+            };
+            selection.cpu_deferred_experts = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Prefill(selection),
+                SealedParams::Prefill(params),
+            );
+            moe_program::lowered_stages(&call).unwrap()
+        }
+    }
+
+    #[test]
+    fn cpu_deferred_splice_replaces_the_routed_tail_in_recipe_order() {
+        for decode in [true, false] {
+            for shared_after_combine in [true, false] {
+                let stages = deferred_stages(decode, shared_after_combine);
+                let at = |stage: MoeStage| stages.iter().position(|s| *s == stage);
+                let label = format!("decode={decode} shared_after_combine={shared_after_combine}");
+                assert_eq!(
+                    stages.iter().filter(|s| **s == MoeStage::CpuSplice).count(),
+                    1,
+                    "{label}: {stages:?}"
+                );
+                for omitted in [
+                    MoeStage::Scatter,
+                    MoeStage::GateUp,
+                    MoeStage::Unscatter,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::Combine,
+                ] {
+                    assert!(at(omitted).is_none(), "{label}: {omitted:?} in {stages:?}");
+                }
+                let splice = at(MoeStage::CpuSplice).unwrap();
+                let shared_down = at(MoeStage::SharedDown).expect("shared down stays on the GPU");
+                if shared_after_combine {
+                    // Routed contribution first, then the shared expert, like
+                    // the GPU tail (`Combine` then `SharedDown`).
+                    assert!(splice < shared_down, "{label}: {stages:?}");
+                } else {
+                    assert!(shared_down < splice, "{label}: {stages:?}");
+                }
+                // The route the splice consumes exists before it runs.
+                assert!(at(MoeStage::Route).unwrap() < splice, "{label}: {stages:?}");
+            }
+        }
+    }
+
+    // ---- eager CPU-cold/GPU-hot split lowering and admission (no GPU) ----
+
+    /// Stages a one-row decode call lowers to over the original grouped
+    /// QT44/QT53 route, in the split mode when `split` (nothing launches).
+    fn split_decode_stages(
+        route: Option<MoeRouteCapability>,
+        split: bool,
+        configure: impl FnOnce(&mut MoeParams<'_>),
+        select: impl FnOnce(&mut MoeDecodeSelection),
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF4_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = decode_scratch(0xF5_0000);
+        let mut params = MoeParams {
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ..ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                8,
+                4,
+                MoeEpMode::None,
+                None,
+                false,
+            )
+        };
+        configure(&mut params);
+        let MoeKernelSelection::Decode(mut selection) = decode_selection(&ctx, &params, route)
+        else {
+            unreachable!("decode_selection returns a decode selection");
+        };
+        selection.cpu_split = split;
+        select(&mut selection);
+        let call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Decode(selection),
+            SealedParams::Decode(params),
+        );
+        moe_program::lowered_stages(&call)
+    }
+
+    /// Same for a `rows`-row grouped prefill window.
+    fn split_prefill_stages(
+        rows: usize,
+        route: Option<MoeRouteCapability>,
+        split: bool,
+        configure: impl FnOnce(&mut MoePrefillParams<'_>),
+        select: impl FnOnce(&mut MoePrefillSelection),
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF6_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = prefill_scratch(0xF7_0000);
+        let mut params = MoePrefillParams {
+            batch_size: rows,
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+            )
+        };
+        params.prelude.route = PrefillRouteMode::Replicated;
+        // The Qwen4 routed-only recipe: the natural activation is provided.
+        params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+        configure(&mut params);
+        let MoeKernelSelection::Prefill(mut selection) = prefill_selection(&ctx, &params, route)
+        else {
+            unreachable!("prefill_selection returns a prefill selection");
+        };
+        selection.cpu_split = split;
+        select(&mut selection);
+        let call = lowering_call(
+            &ctx,
+            experts,
+            MoeKernelSelection::Prefill(selection),
+            SealedParams::Prefill(params),
+        );
+        moe_program::lowered_stages(&call)
+    }
+
+    fn split_refused(result: Result<Vec<MoeStage>, DispatchError>, label: &str, needle: &str) {
+        let error = result.expect_err(label);
+        let text = format!("{error:?}");
+        assert!(text.contains(needle), "{label}: {text}");
+    }
+
+    const SPLIT_ROUTES: [MoeRouteCapability; 3] = [
+        MoeRouteCapability::Qt44Qt53Grouped,
+        MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        MoeRouteCapability::SlabCodecGrouped,
+    ];
+
+    #[test]
+    fn split_mode_brackets_the_routed_gpu_tail_in_both_protocols() {
+        for route in SPLIT_ROUTES {
+            let mut programs = vec![(
+                "decode".to_string(),
+                split_decode_stages(Some(route), true, |_| {}, |_| {}).unwrap(),
+            )];
+            for rows in 1..=crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                programs.push((
+                    format!("prefill rows={rows}"),
+                    split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap(),
+                ));
+            }
+            for (label, stages) in programs {
+                let label = format!("{route:?} {label}: {stages:?}");
+                let at = |stage: MoeStage| stages.iter().position(|s| *s == stage);
+                let count = |stage: MoeStage| stages.iter().filter(|s| **s == stage).count();
+                for once in [
+                    MoeStage::InputBasis,
+                    MoeStage::Route,
+                    MoeStage::PrepareSplit,
+                    MoeStage::GateUp,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::JoinSplit,
+                    MoeStage::Combine,
+                    MoeStage::SharedDown,
+                ] {
+                    assert_eq!(count(once), 1, "{once:?} in {label}");
+                }
+                let prepare = at(MoeStage::PrepareSplit).unwrap();
+                // Original route and the rotated input exist before the one
+                // input-readiness wait; nothing routed on the GPU precedes it.
+                assert!(at(MoeStage::InputBasis).unwrap() < prepare, "{label}");
+                assert!(at(MoeStage::Route).unwrap() < prepare, "{label}");
+                let first_tail = [MoeStage::Scatter, MoeStage::GateUp]
+                    .into_iter()
+                    .filter_map(at)
+                    .min()
+                    .unwrap();
+                assert!(prepare < first_tail, "{label}");
+                // The cold rows are queued after the GPU down and before the
+                // canonical combine; the shared down follows it exactly once.
+                let join = at(MoeStage::JoinSplit).unwrap();
+                assert!(at(MoeStage::Down).unwrap() < join, "{label}");
+                assert!(join < at(MoeStage::Combine).unwrap(), "{label}");
+                assert!(
+                    at(MoeStage::Combine).unwrap() < at(MoeStage::SharedDown).unwrap(),
+                    "{label}"
+                );
+                // Neither the D1 deferral nor the host arm is in the mode.
+                for absent in [
+                    MoeStage::CpuSplice,
+                    MoeStage::HostExperts,
+                    MoeStage::RowGather,
+                    MoeStage::TileMask,
+                    MoeStage::TileExchange,
+                ] {
+                    assert!(at(absent).is_none(), "{absent:?} in {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpwait_split_queues_the_combine_before_the_join_in_both_protocols() {
+        for route in SPLIT_ROUTES {
+            let mut programs = vec![(
+                "decode".to_string(),
+                split_decode_stages(Some(route), true, |_| {}, |s| s.cpwait = true).unwrap(),
+                split_decode_stages(Some(route), true, |_| {}, |_| {}).unwrap(),
+            )];
+            for rows in 1..=crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                programs.push((
+                    format!("prefill rows={rows}"),
+                    split_prefill_stages(rows, Some(route), true, |_| {}, |s| s.cpwait = true)
+                        .unwrap(),
+                    split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap(),
+                ));
+            }
+            for (label, cpwait, host) in programs {
+                let label = format!("{route:?} {label}: {cpwait:?}");
+                let at = |stage: MoeStage| cpwait.iter().position(|s| *s == stage);
+                // Only the position of JoinSplit moves: the CPU arithmetic is
+                // the last stage, after the combine and the shared down.
+                let join = at(MoeStage::JoinSplit).unwrap();
+                assert_eq!(join, cpwait.len() - 1, "{label}");
+                assert!(
+                    at(MoeStage::Down).unwrap() < at(MoeStage::Combine).unwrap(),
+                    "{label}"
+                );
+                assert!(
+                    at(MoeStage::Combine).unwrap() < at(MoeStage::SharedDown).unwrap(),
+                    "{label}"
+                );
+                assert!(
+                    at(MoeStage::PrepareSplit).unwrap() < at(MoeStage::GateUp).unwrap(),
+                    "{label}"
+                );
+                let mut reordered = host.clone();
+                let host_join = reordered
+                    .iter()
+                    .position(|s| *s == MoeStage::JoinSplit)
+                    .unwrap();
+                reordered.remove(host_join);
+                reordered.push(MoeStage::JoinSplit);
+                assert_eq!(reordered, cpwait, "{label}: host order {host:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn split_mode_adds_only_the_two_split_stages_to_the_ordinary_program() {
+        let without_split = |stages: Vec<MoeStage>| -> Vec<MoeStage> {
+            stages
+                .into_iter()
+                .filter(|s| !matches!(s, MoeStage::PrepareSplit | MoeStage::JoinSplit))
+                .collect()
+        };
+        for route in SPLIT_ROUTES {
+            let ordinary = split_decode_stages(Some(route), false, |_| {}, |_| {}).unwrap();
+            assert!(!ordinary.contains(&MoeStage::PrepareSplit), "{ordinary:?}");
+            assert!(!ordinary.contains(&MoeStage::JoinSplit), "{ordinary:?}");
+            let split = split_decode_stages(Some(route), true, |_| {}, |_| {}).unwrap();
+            assert_eq!(without_split(split), ordinary, "decode {route:?}");
+            for rows in 1..=crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                let ordinary =
+                    split_prefill_stages(rows, Some(route), false, |_| {}, |_| {}).unwrap();
+                assert!(!ordinary.contains(&MoeStage::PrepareSplit), "{ordinary:?}");
+                assert!(!ordinary.contains(&MoeStage::JoinSplit), "{ordinary:?}");
+                let split = split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap();
+                assert_eq!(
+                    without_split(split),
+                    ordinary,
+                    "prefill rows={rows} {route:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_mode_is_distinct_from_cpu_deferred_experts() {
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let split = split_prefill_stages(4, route, true, |_| {}, |_| {}).unwrap();
+        let deferred = split_prefill_stages(
+            4,
+            route,
+            false,
+            |params| params.cpu_deferred_experts = true,
+            |selection| selection.cpu_deferred_experts = true,
+        )
+        .unwrap();
+        // The deferral drops the whole GPU tail; the split keeps it.
+        assert!(deferred.contains(&MoeStage::CpuSplice) && !deferred.contains(&MoeStage::GateUp));
+        assert!(!split.contains(&MoeStage::CpuSplice) && split.contains(&MoeStage::GateUp));
+        split_refused(
+            split_prefill_stages(
+                4,
+                route,
+                true,
+                |_| {},
+                |selection| selection.cpu_deferred_experts = true,
+            ),
+            "split + deferred selection",
+            "mutually exclusive",
+        );
+        split_refused(
+            split_prefill_stages(
+                4,
+                route,
+                true,
+                |params| params.cpu_deferred_experts = true,
+                |_| {},
+            ),
+            "split + deferred params",
+            "mutually exclusive",
+        );
+        split_refused(
+            split_decode_stages(
+                route,
+                true,
+                |params| params.cpu_deferred_experts = true,
+                |_| {},
+            ),
+            "decode split + deferred params",
+            "mutually exclusive",
+        );
+        split_refused(
+            split_decode_stages(
+                route,
+                true,
+                |_| {},
+                |selection| selection.cpu_deferred_experts = true,
+            ),
+            "decode split + deferred selection",
+            "mutually exclusive",
+        );
+    }
+
+    #[test]
+    fn split_mode_refuses_every_lowering_it_does_not_bracket() {
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let grouped = "grouped QT44/QT53";
+        for (label, route) in [
+            ("no route", None),
+            ("fp8", Some(MoeRouteCapability::Fp8B128Grouped)),
+        ] {
+            split_refused(
+                split_prefill_stages(2, route, true, |_| {}, |_| {}),
+                &format!("prefill {label}"),
+                grouped,
+            );
+            split_refused(
+                split_decode_stages(route, true, |_| {}, |_| {}),
+                &format!("decode {label}"),
+                grouped,
+            );
+        }
+        // The recipe must keep BF16 round trips and the shared expert after the combine.
+        for (bf16, after) in [(false, true), (true, false)] {
+            let recipe = MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: bf16,
+                shared_after_combine: after,
+            };
+            split_refused(
+                split_prefill_stages(2, route, true, |p| p.recipe = recipe, |_| {}),
+                "prefill recipe",
+                "shared_after_combine",
+            );
+            split_refused(
+                split_decode_stages(route, true, |p| p.recipe = recipe, |_| {}),
+                "decode recipe",
+                "shared_after_combine",
+            );
+        }
+        // Single-device canonical combine only: no partial, EP gather/exchange or deferred combine.
+        split_refused(
+            split_prefill_stages(2, route, true, |p| p.routed_out = Some(p.x_batch), |_| {}),
+            "prefill partial",
+            "single-device",
+        );
+        split_refused(
+            split_prefill_stages(
+                2,
+                route,
+                true,
+                |p| p.ep_row_gather = Some(&NoopGather),
+                |_| {},
+            ),
+            "prefill gather",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.routed_out = Some(p.x_residual), |_| {}),
+            "decode partial",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.ep_row_gather = Some(&NoopGather), |_| {}),
+            "decode gather",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(route, true, |p| p.defer_routed_combine = true, |_| {}),
+            "decode deferred combine",
+            "single-device",
+        );
+        split_refused(
+            split_decode_stages(
+                route,
+                true,
+                |p| p.ep_mode = MoeEpMode::RootRoutedPartial,
+                |_| {},
+            ),
+            "decode root partial",
+            "single-device",
+        );
+        // Row caps: decode is one row; the default grouped window is one to
+        // four rows. A wide window without a lab-wide scope refuses with the
+        // qualified-window message (wiring only, not numeric proof).
+        split_refused(
+            split_decode_stages(route, true, |p| p.batch_size = 2, |_| {}),
+            "decode two rows",
+            "one row",
+        );
+        for rows in [0, crate::cpu_split::CPU_SPLIT_MAX_ROWS + 1, 8] {
+            split_refused(
+                split_prefill_stages(rows, route, true, |_| {}, |_| {}),
+                &format!("prefill rows={rows}"),
+                "wider windows are ordinary wide prefill",
+            );
+        }
+        // Wiring truth across the full logical 1..64 window: default scope
+        // (no lab override) admits 1..=4 and refuses 5..=64 before any write.
+        // These are routing/admission assertions only and MUST NOT be counted
+        // as numeric proof (G1/G2 family qualification still required).
+        for rows in 1..=crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS {
+            let conflict = moe_program::cpu_split_prefill_conflict_width(rows, 4);
+            if rows <= crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                assert!(conflict.is_none(), "rows={rows}: default route must admit");
+            } else {
+                assert!(
+                    conflict.is_some(),
+                    "rows={rows}: default route must refuse wide windows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_cap_matches_the_narrow_verify_window_and_wide_prefill_is_ordinary() {
+        assert_eq!(crate::cpu_split::CPU_SPLIT_MAX_ROWS, 4);
+        assert_eq!(
+            crate::cpu_split::CPU_SPLIT_MAX_ROWS,
+            crate::families::moe::NARROW_VERIFY_MAX_ROWS
+        );
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xF8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        // No attachment: no row count takes the mode (the default provider is `None`).
+        for rows in [0, 1, 2, 3, 4, 5, 8, 512] {
+            assert!(
+                crate::families::moe::cpu_split_executor(&fixture.routed, rows).is_none(),
+                "rows={rows}"
+            );
+        }
+        // Without a provider a window sealed with the flag off lowers the
+        // ordinary wide program at every width above the cap.
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        for rows in [5, 8] {
+            let stages = split_prefill_stages(rows, route, false, |_| {}, |_| {}).unwrap();
+            assert!(
+                !stages.contains(&MoeStage::PrepareSplit) && !stages.contains(&MoeStage::JoinSplit),
+                "rows={rows}: {stages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_transaction_phases_are_ordered_and_the_reference_keeps_the_original_route() {
+        let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        {
+            let table = table(4, DType::MQ4G256);
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let fixture = live_fixture(&table, 0xF9_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let ctx = DispatchCtx::for_test("gfx1201");
+            let scratch = decode_scratch(0xFA_0000);
+            let params = MoeParams {
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_decode_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    0,
+                    8,
+                    4,
+                    MoeEpMode::None,
+                    None,
+                    false,
+                )
+            };
+            let MoeKernelSelection::Decode(mut selection) = decode_selection(&ctx, &params, route)
+            else {
+                unreachable!("decode_selection returns a decode selection");
+            };
+            selection.cpu_split = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Decode(selection),
+                SealedParams::Decode(params),
+            );
+            moe_program::split_phase_probe(&call).unwrap();
+        }
+        for batch_size in 1..=4usize {
+            let table = table(4, DType::MQ4G256);
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let fixture = live_fixture(&table, 0xFB_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let ctx = DispatchCtx::for_test("gfx1201");
+            let scratch = prefill_scratch(0xFC_0000);
+            let mut params = MoePrefillParams {
+                batch_size,
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_prefill_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            params.prelude.route = PrefillRouteMode::Replicated;
+            params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;
+            let MoeKernelSelection::Prefill(mut selection) =
+                prefill_selection(&ctx, &params, route)
+            else {
+                unreachable!("prefill_selection returns a prefill selection");
+            };
+            selection.cpu_split = true;
+            let call = lowering_call(
+                &ctx,
+                experts,
+                MoeKernelSelection::Prefill(selection),
+                SealedParams::Prefill(params),
+            );
+            moe_program::split_phase_probe(&call)
+                .unwrap_or_else(|e| panic!("prefill batch_size={batch_size}: {e}"));
+        }
+    }
+
+    #[test]
+    fn split_run_gate_refuses_capture_retained_shadow_and_pm4() {
+        use moe_program::CpuSplitRunGate;
+        assert_eq!(CpuSplitRunGate::default().refusal(), None);
+        CpuSplitRunGate::default().require_eager().unwrap();
+        let cases = [
+            (
+                CpuSplitRunGate {
+                    graph_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    verify_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    replay_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    stream_capture: true,
+                    ..Default::default()
+                },
+                "graph capture",
+            ),
+            (
+                CpuSplitRunGate {
+                    recording: true,
+                    ..Default::default()
+                },
+                "replay recording",
+            ),
+            (
+                CpuSplitRunGate {
+                    pm4: true,
+                    ..Default::default()
+                },
+                "PM4",
+            ),
+            (
+                CpuSplitRunGate {
+                    aql: true,
+                    ..Default::default()
+                },
+                "AQL",
+            ),
+            (
+                CpuSplitRunGate {
+                    shadow: true,
+                    ..Default::default()
+                },
+                "shadow",
+            ),
+        ];
+        for (gate, name) in cases {
+            let error = gate.require_eager().expect_err(name);
+            let text = format!("{error:?}");
+            assert!(
+                text.contains(name) && text.contains("CPU tier split"),
+                "{gate:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2() {
+        for rows in [1, 2, 17, 128, 1536] {
+            let table = table(4, DType::MQ4G256);
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let fixture = live_fixture(&table, 0xE8_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let ctx = DispatchCtx::for_test("gfx942");
+            let scratch = prefill_scratch(0xE9_0000);
+            // This probe exercises lowering only; route admission and live
+            // block geometry are covered by the independent FP8 selector tests.
+            let params = MoePrefillParams {
+                batch_size: rows,
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_prefill_params(
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            let resolution = crate::families::moe::MoePrefillResolution::sealed_fp8();
+            assert!(!resolution.use_path2 && !resolution.down_path0);
+            let selection = MoeKernelSelection::Prefill(MoePrefillSelection {
+                resolution,
+                path2_m_total: params.m_total_max,
+                force_mq4_grouped_fp16: false,
+                coalesced_verify: false,
+                route: Some(MoeRouteCapability::Fp8B128Grouped),
+                cpu_deferred_experts: false,
+                cpu_split: false,
+                cpwait: false,
+            });
+            let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+            assert_eq!(
+                moe_program::lowered_stages(&call).unwrap(),
+                [
+                    MoeStage::Normalize,
+                    MoeStage::InputBasis,
+                    MoeStage::RouterProjection,
+                    MoeStage::SharedGateUp,
+                    MoeStage::SharedActivation,
+                    MoeStage::Route,
+                    MoeStage::Scatter,
+                    MoeStage::GateUp,
+                    MoeStage::Unscatter,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::MutationFence,
+                    MoeStage::Combine,
+                    MoeStage::SharedDown,
+                ],
+                "rows={rows}"
+            );
+        }
     }
 
     /// `with` is `without` plus exactly one `RowGather`, right after the
@@ -7060,7 +8945,9 @@ mod tests {
             "static ownership lowers no OwnerAssign stage: {without:?}"
         );
         assert_eq!(
-            with.iter().filter(|stage| **stage == MoeStage::OwnerAssign).count(),
+            with.iter()
+                .filter(|stage| **stage == MoeStage::OwnerAssign)
+                .count(),
             1,
             "{with:?}"
         );
@@ -7072,7 +8959,10 @@ mod tests {
         let assign = route + 1;
         for reader in [MoeStage::Scatter, MoeStage::GateUp, MoeStage::Down] {
             if let Some(position) = with.iter().position(|stage| *stage == reader) {
-                assert!(assign < position, "{reader:?} reads the live tables: {with:?}");
+                assert!(
+                    assign < position,
+                    "{reader:?} reads the live tables: {with:?}"
+                );
             }
         }
         let mut stripped = with.to_vec();
@@ -7163,9 +9053,11 @@ mod tests {
             },
             ep_row_gather: gather,
             // Lowering never reads the masked ids; any tensor stands in for them.
-            ep_tile_exchange: exchange.map(|exchange| crate::families::moe::MoeTileExchangeParams {
-                exchange,
-                tile_ids_owned: &scratch.partial,
+            ep_tile_exchange: exchange.map(|exchange| {
+                crate::families::moe::MoeTileExchangeParams {
+                    exchange,
+                    tile_ids_owned: &scratch.partial,
+                }
             }),
             ..ep_prefill_params(
                 &scratch,
@@ -7184,13 +9076,22 @@ mod tests {
     /// `TileExchange` between the mutation fence and the combine.
     fn assert_tile_stages(with: &[MoeStage], without: &[MoeStage]) {
         for stage in [MoeStage::TileMask, MoeStage::TileExchange] {
-            assert!(!without.contains(&stage), "no exchange installed, no {stage:?}: {without:?}");
+            assert!(
+                !without.contains(&stage),
+                "no exchange installed, no {stage:?}: {without:?}"
+            );
             assert_eq!(with.iter().filter(|s| **s == stage).count(), 1, "{with:?}");
         }
-        let scatter = with.iter().position(|s| *s == MoeStage::Scatter).expect("scatter");
+        let scatter = with
+            .iter()
+            .position(|s| *s == MoeStage::Scatter)
+            .expect("scatter");
         assert_eq!(with[scatter + 1], MoeStage::TileMask, "{with:?}");
         assert_eq!(with[scatter + 2], MoeStage::GateUp, "{with:?}");
-        let fence = with.iter().position(|s| *s == MoeStage::MutationFence).expect("fence");
+        let fence = with
+            .iter()
+            .position(|s| *s == MoeStage::MutationFence)
+            .expect("fence");
         assert_eq!(with[fence + 1], MoeStage::TileExchange, "{with:?}");
         assert_eq!(with[fence + 2], MoeStage::Combine, "{with:?}");
         let mut stripped = with.to_vec();
@@ -7208,17 +9109,251 @@ mod tests {
         assert_eq!(without, prefill_stages(None, symmetric, false).unwrap());
     }
 
+    /// The gfx1100 route: the layer declares the plain grouped QT44/QT53 route (its F16 WMMA
+    /// arms are chosen at stage time), and the exchange lowers the same two stages around the
+    /// same program as on the symmetric route.
     #[test]
-    fn prefill_lowering_refuses_a_tile_exchange_off_the_symmetric_route() {
-        for route in [None, Some(MoeRouteCapability::Qt44Qt53Grouped)] {
-            let error = tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
-            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
-        }
+    fn prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_f16_wmma_route() {
+        let wmma = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let without = tile_prefill_stages(None, None, wmma, false).unwrap();
+        let with = tile_prefill_stages(Some(&NoopTileExchange), None, wmma, false).unwrap();
+        assert_tile_stages(&with, &without);
+        // The unmasked lowering is the historical one.
+        assert_eq!(without, prefill_stages(None, wmma, false).unwrap());
+        // Both declarations lower identically.
         let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
-        // A compact EP partial and the few-row row gather are other EP contracts.
-        let error = tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, true).unwrap_err();
-        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
-        let error = tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), symmetric, false).unwrap_err();
-        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
+        let with_symmetric =
+            tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, false).unwrap();
+        assert_eq!(with_symmetric, with);
+    }
+
+    #[test]
+    fn prefill_lowering_refuses_a_tile_exchange_off_the_grouped_qt44_qt53_route() {
+        for route in [None, Some(MoeRouteCapability::Fp8B128Grouped)] {
+            let error =
+                tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("tile exchange"),
+                "{route:?}: {error:?}"
+            );
+        }
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            // A compact EP partial and the few-row row gather are other EP contracts.
+            let error =
+                tile_prefill_stages(Some(&NoopTileExchange), None, Some(route), true).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("tile exchange"),
+                "{route:?}: {error:?}"
+            );
+            let error = tile_prefill_stages(
+                Some(&NoopTileExchange),
+                Some(&NoopGather),
+                Some(route),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("tile exchange"),
+                "{route:?}: {error:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_route_identity_tests {
+    use super::*;
+
+    fn input<'a>(codecs: Option<&'a [u8]>, generation: u64) -> RetainedRouteInputs<'a> {
+        RetainedRouteInputs {
+            layer: 3,
+            table_identity: 7,
+            mapping_fingerprint: "fp",
+            codecs,
+            gate_up_table: (0x1000, 8),
+            down_table: (0x2000, 8),
+            tag_table: codecs.map(|_| (0x3000, 512)),
+            owner_generation: generation,
+            tier: None,
+        }
+    }
+
+    #[test]
+    fn legacy_layers_keep_their_one_pair() {
+        assert_eq!(
+            retained_route_identities(&input(None, 9)),
+            vec![(7, "fp".to_owned())]
+        );
+    }
+
+    fn tier(
+        generation: u64,
+        placement: &[u8],
+        keep: &std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> ExpertTierIdentity {
+        let n = placement.len();
+        let gate_up: Vec<usize> = (0..n).map(|i| 0x10_0000 + i * 0x1000).collect();
+        let down: Vec<usize> = (0..n).map(|i| 0x20_0000 + i * 0x1000).collect();
+        ExpertTierIdentity::new(
+            generation,
+            [9; 32],
+            placement,
+            &vec![0u8; n],
+            &gate_up,
+            &down,
+            keep.clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tier_identity_rejects_malformed_tables() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        assert!(ExpertTierIdentity::new(1, [0; 32], &[], &[], &[], &[], keep.clone()).is_err());
+        assert!(ExpertTierIdentity::new(
+            1,
+            [0; 32],
+            &[0, 2],
+            &[0, 0],
+            &[1, 2],
+            &[3, 4],
+            keep.clone()
+        )
+        .is_err());
+        assert!(
+            ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0], &[1, 2], &[3, 4], keep.clone())
+                .is_err()
+        );
+        assert!(
+            ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0, 0], &[1, 0], &[3, 4], keep).is_err()
+        );
+    }
+
+    #[test]
+    fn tier_host_bit_is_any_host_not_expert_zero() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        assert!(!tier(1, &[0, 0, 0], &keep).any_host());
+        assert!(tier(1, &[0, 0, 1], &keep).any_host());
+        assert!(tier(1, &[1, 0, 0], &keep).any_host());
+        assert_eq!(tier(1, &[0, 0, 1], &keep).host_projections(), (true, true));
+    }
+
+    #[test]
+    fn tier_layers_move_identity_with_generation_digest_host_bit_and_content() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let base_tier = tier(5, &[0, 0, 0], &keep);
+        let mut base = input(None, 5);
+        base.tier = Some(&base_tier);
+        let reference = retained_route_identities(&base);
+        assert_eq!(reference.len(), 2);
+        assert_ne!(
+            reference,
+            retained_route_identities(&input(None, 5)),
+            "tier vs legacy"
+        );
+        assert_ne!(
+            reference[1].0, 7,
+            "the tier layer key never collides with a table id"
+        );
+        let check = |changed: ExpertTierIdentity, name: &str| {
+            let mut other = input(None, 5);
+            other.tier = Some(&changed);
+            assert_ne!(reference, retained_route_identities(&other), "{name}");
+        };
+        check(tier(6, &[0, 0, 0], &keep), "generation");
+        check(tier(5, &[0, 0, 1], &keep), "host bit via a non-zero expert");
+        check(tier(5, &[1, 0, 0], &keep), "host bit via expert 0");
+        let digest = ExpertTierIdentity::new(
+            5,
+            [8; 32],
+            &[0, 0, 0],
+            &[0, 0, 0],
+            base_tier.gate_up_entries(),
+            base_tier.down_entries(),
+            keep.clone(),
+        )
+        .unwrap();
+        check(digest, "logical digest");
+        let moved = ExpertTierIdentity::new(
+            5,
+            [9; 32],
+            &[0, 0, 0],
+            &[0, 0, 0],
+            &[0x10_0000, 0x10_1000, 0x10_2000],
+            &[0x20_0000, 0x20_1000, 0x30_2000],
+            keep.clone(),
+        )
+        .unwrap();
+        check(moved, "down pointer content");
+        let same = tier(5, &[0, 0, 0], &keep);
+        let mut equal = input(None, 5);
+        equal.tier = Some(&same);
+        assert_eq!(reference, retained_route_identities(&equal));
+    }
+
+    #[test]
+    fn slab_identity_moves_with_codec_arena_generation_and_layer() {
+        let base = retained_route_identities(&input(Some(&[0, 1, 1]), 1));
+        assert_eq!(base.len(), 2);
+        assert_ne!(base[1].0, 7, "the layer key never collides with a table id");
+        assert_ne!(
+            base,
+            retained_route_identities(&input(Some(&[1, 1, 1]), 1)),
+            "codec"
+        );
+        assert_ne!(
+            base,
+            retained_route_identities(&input(Some(&[0, 1, 1]), 2)),
+            "generation"
+        );
+        assert_eq!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 1)));
+    }
+
+    #[test]
+    fn every_input_field_moves_a_slab_identity_and_a_rebuilt_table_is_unbound() {
+        let codecs = [0u8, 1, 1];
+        let base = input(Some(&codecs), 1);
+        let reference = retained_route_identities(&base);
+        let vary: [(&str, Box<dyn Fn(&mut RetainedRouteInputs<'_>)>); 7] = [
+            ("layer", Box::new(|i| i.layer += 1)),
+            ("table", Box::new(|i| i.table_identity += 1)),
+            ("fingerprint", Box::new(|i| i.mapping_fingerprint = "other")),
+            ("gate_up table", Box::new(|i| i.gate_up_table.0 += 16)),
+            ("down table", Box::new(|i| i.down_table.1 += 8)),
+            ("tag table", Box::new(|i| i.tag_table = Some((0x3100, 512)))),
+            ("generation", Box::new(|i| i.owner_generation += 1)),
+        ];
+        for (name, change) in vary {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(reference, retained_route_identities(&changed), "{name}");
+        }
+        // A reload at reused addresses builds a new table (new id): the key
+        // sets are disjoint, so a tape latched on the old ones finds none bound.
+        let mut reloaded = base.clone();
+        reloaded.table_identity += 100;
+        let fresh = retained_route_identities(&reloaded);
+        assert!(reference
+            .iter()
+            .all(|(key, _)| fresh.iter().all(|(other, _)| other != key)));
+        let mut controller = rdna_compute::replay::ReplayController::new(
+            rdna_compute::replay::ReplayBackendRequest::Auto,
+        );
+        for (key, identity) in &reference {
+            controller.note_route_identity(*key, identity).unwrap();
+        }
+        let bound = |pairs: &'static [(u64, String)]| {
+            controller.validate_route_identities(|key| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.as_str())
+            })
+        };
+        let fresh: &'static [(u64, String)] = Box::leak(fresh.into_boxed_slice());
+        assert!(bound(fresh).unwrap_err().contains("not bound"));
     }
 }

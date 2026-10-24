@@ -13,11 +13,12 @@
 //! assembler parity holds with the lossless/reported split.
 
 use super::{canonical, kernel_lines};
-use crate::text::support::{self, Parity, classify, lossy_mask};
+use crate::text::support::{self, classify, lossy_mask, Parity};
 use peacemaker_ir::{
     codec::gfx12,
     inst::{Arch, FormFields, Inst},
-    isa, operand::Operand,
+    isa,
+    operand::Operand,
 };
 use smallvec::SmallVec;
 
@@ -25,9 +26,18 @@ const KT48_VA: u32 = 0x7f00;
 #[test]
 fn dpp_text_roundtrips_and_assembles_to_the_shipped_words() {
     for (words, expected) in [
-        ([0x0624_24fa, 0xff09_0812], "v_add_f32_dpp v18, v18, v18 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1"),
-        ([0x7e04_02fa, 0xff09_0101], "v_mov_b32_dpp v2, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1"),
-        ([0x7fb2_02fa, 0xff01_50ed], "v_mov_b32_dpp v217, v237 row_share:0 row_mask:0xf bank_mask:0xf"),
+        (
+            [0x0624_24fa, 0xff09_0812],
+            "v_add_f32_dpp v18, v18, v18 row_shl:8 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+        ),
+        (
+            [0x7e04_02fa, 0xff09_0101],
+            "v_mov_b32_dpp v2, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+        ),
+        (
+            [0x7fb2_02fa, 0xff01_50ed],
+            "v_mov_b32_dpp v217, v237 row_share:0 row_mask:0xf bank_mask:0xf",
+        ),
     ] {
         let (inst, used) = gfx12::decode(&words).expect("shipped DPP encoding");
         assert_eq!(used, 2);
@@ -35,46 +45,74 @@ fn dpp_text_roundtrips_and_assembles_to_the_shipped_words() {
         let parsed = crate::text::parse_line(expected, Arch::Gfx1201).unwrap();
         assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
         if let Some(tc) = support::toolchain().expect("toolchain discovery") {
-            assert_eq!(support::mc_batch(&tc.mc, &[expected.into()]).unwrap()[0], words);
+            assert_eq!(
+                support::mc_batch(&tc.mc, &[expected.into()]).unwrap()[0],
+                words
+            );
         }
     }
 }
 
 #[test]
 fn every_table_example_matches_pinned_llvm_mc_except_declared_dont_cares() {
-    let Some(tc) = support::toolchain().expect("toolchain discovery") else { return };
+    let Some(tc) = support::toolchain().expect("toolchain discovery") else {
+        return;
+    };
     let rows = isa::gfx12();
     let lines: Vec<String> = rows.iter().map(|row| row.sample.into()).collect();
     let assembled = support::mc_batch(&tc.mc, &lines).expect("assemble every table example");
     let mut reported = Vec::new();
     for (row, words) in rows.iter().zip(&assembled) {
-        let original: Vec<u32> = row.encoding.split_whitespace()
-            .map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+        let original: Vec<u32> = row
+            .encoding
+            .split_whitespace()
+            .map(|w| u32::from_str_radix(w, 16).unwrap())
+            .collect();
         let (inst, consumed) = gfx12::decode(&original).unwrap();
         assert_eq!(consumed, original.len(), "{}", row.name);
-        assert_eq!(gfx12::encode(&inst).unwrap().as_slice(), original, "{}", row.name);
+        assert_eq!(
+            gfx12::encode(&inst).unwrap().as_slice(),
+            original,
+            "{}",
+            row.name
+        );
         match classify(&inst, words).unwrap_or(Parity::Mismatch) {
             Parity::Exact => {}
             Parity::Reported => reported.push(row.name),
-            Parity::Mismatch => panic!("{}: llvm-mc={words:08x?}, encoded={original:08x?}", row.name),
+            Parity::Mismatch => panic!(
+                "{}: llvm-mc={words:08x?}, encoded={original:08x?}",
+                row.name
+            ),
         }
     }
-    eprintln!("{} table rows, {} syntax-lossy samples", rows.len(), reported.len());
+    eprintln!(
+        "{} table rows, {} syntax-lossy samples",
+        rows.len(),
+        reported.len()
+    );
 }
 
 #[test]
 fn buffer_cache_hints_roundtrip_through_objdump_and_llvm_mc_syntax() {
     for (words, line) in [
-        ([0xc405_005c, 0x409c_50b8, 0x0000_00b6],
-            "buffer_load_b32 v184, v182, s[40:43], s92 offen th:TH_LOAD_NT scope:SCOPE_SYS"),
-        ([0xc406_8051, 0x40fc_5020, 0x0000_008a],
-            "buffer_store_b32 v32, v138, s[40:43], s81 offen th:TH_STORE_NT_WB scope:SCOPE_SYS"),
+        (
+            [0xc405_005c, 0x409c_50b8, 0x0000_00b6],
+            "buffer_load_b32 v184, v182, s[40:43], s92 offen th:TH_LOAD_NT scope:SCOPE_SYS",
+        ),
+        (
+            [0xc406_8051, 0x40fc_5020, 0x0000_008a],
+            "buffer_store_b32 v32, v138, s[40:43], s81 offen th:TH_STORE_NT_WB scope:SCOPE_SYS",
+        ),
     ] {
         let (inst, used) = gfx12::decode(&words).unwrap();
         assert_eq!(used, 3);
         assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), line);
         let parsed = crate::text::parse_line(line, Arch::Gfx1201).unwrap();
-        assert_eq!((&parsed.operands, &parsed.fields, &parsed.mods), (&inst.operands, &inst.fields, &inst.mods), "{line}");
+        assert_eq!(
+            (&parsed.operands, &parsed.fields, &parsed.mods),
+            (&inst.operands, &inst.fields, &inst.mods),
+            "{line}"
+        );
         assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
         if let Some(tc) = support::toolchain().expect("toolchain discovery") {
             assert_eq!(support::mc_batch(&tc.mc, &[line.into()]).unwrap()[0], words);
@@ -95,7 +133,9 @@ const KT48_EXPECTED: [(&str, usize, usize, usize); 6] = [
     ("attention_fp8_e4m3_fa2_gqa_merge_gfx1201", 130, 9, 6),
     (
         "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
-        1696, 67, 57,
+        1696,
+        67,
+        57,
     ),
 ];
 
@@ -116,9 +156,8 @@ fn decode_all() -> Vec<Kt48> {
         let mut insts = Vec::new();
         let mut index = 0usize;
         while index < stream.len() {
-            let (inst, n) = gfx12::decode(&stream[index..]).unwrap_or_else(
-                |e| panic!("{name} word {index}: {e}"),
-            );
+            let (inst, n) = gfx12::decode(&stream[index..])
+                .unwrap_or_else(|e| panic!("{name} word {index}: {e}"));
             addrs.push(va + (index as u32) * 4);
             words.push(stream[index..index + n].to_vec());
             insts.push(inst);
@@ -126,7 +165,14 @@ fn decode_all() -> Vec<Kt48> {
         }
         let size = stream.len() * 4;
         assert_eq!(index * 4, size, "{name} size");
-        out.push(Kt48 { name, va, size, addrs, words, insts });
+        out.push(Kt48 {
+            name,
+            va,
+            size,
+            addrs,
+            words,
+            insts,
+        });
     }
     assert_eq!(out.len(), KT48_EXPECTED.len(), "six-kernel census");
     for (kt, (name, insts, _, _)) in out.iter().zip(KT48_EXPECTED.iter()) {
@@ -140,18 +186,14 @@ fn decode_all() -> Vec<Kt48> {
 }
 
 fn objdump_all() -> Vec<support::ObjdumpLine> {
-    let lines = match support::toolchain()
-        .expect("toolchain discovery must not fail")
-    {
+    let lines = match support::toolchain().expect("toolchain discovery must not fail") {
         Some(tc) => {
             let output = std::process::Command::new(&tc.objdump)
                 .args(["--mcpu=gfx1201", "-d"])
-                .arg(
-                    concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/tests/fixtures/kt48/hipcc.co"
-                    ),
-                )
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/kt48/hipcc.co"
+                ))
                 .output()
                 .expect("run pinned llvm-objdump");
             assert!(
@@ -159,9 +201,7 @@ fn objdump_all() -> Vec<support::ObjdumpLine> {
                 "pinned llvm-objdump failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let live = support::parse_objdump_stdout(
-                &String::from_utf8_lossy(&output.stdout),
-            );
+            let live = support::parse_objdump_stdout(&String::from_utf8_lossy(&output.stdout));
             // The committed fixture must equal the live tool output.
             let pinned = support::pinned_all_objdump_fixture();
             assert_eq!(
@@ -202,9 +242,7 @@ fn t3_decoder_agrees_with_pinned_objdump() {
     let mut total = 0usize;
     let mut total_branches = 0usize;
     let mut total_targets = std::collections::BTreeSet::new();
-    for (kt, (_, _, want_branches, want_targets)) in
-        kernels.iter().zip(KT48_EXPECTED.iter())
-    {
+    for (kt, (_, _, want_branches, want_targets)) in kernels.iter().zip(KT48_EXPECTED.iter()) {
         let ol: Vec<&support::ObjdumpLine> = lines
             .iter()
             .filter(|l| l.addr >= kt.va && l.addr < kt.va + kt.size as u32)
@@ -266,14 +304,10 @@ fn t3_decoder_agrees_with_pinned_objdump() {
             }
             branches += 1;
             let simm = match inst.operands.first() {
-                Some(Operand::Imm(
-                    peacemaker_ir::operand::ImmField::Sopp(n),
-                )) => *n as i32,
+                Some(Operand::Imm(peacemaker_ir::operand::ImmField::Sopp(n))) => *n as i32,
                 other => panic!("branch without simm16 at {:#x}: {other:?}", kt.addrs[i]),
             };
-            let target = kt.addrs[i] as i32
-                + (kt.words[i].len() as i32) * 4
-                + simm * 4;
+            let target = kt.addrs[i] as i32 + (kt.words[i].len() as i32) * 4 + simm * 4;
             let ann = &ol[i].ann;
             let hex = ann
                 .strip_prefix(&format!("<{}+0x", kt.name))
@@ -291,11 +325,7 @@ fn t3_decoder_agrees_with_pinned_objdump() {
             targets.insert(expected);
             total_targets.insert((kt.name, expected));
             // The printed unsigned operand re-parses to the same simm.
-            let printed_operand = printed[i]
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .to_owned();
+            let printed_operand = printed[i].split_whitespace().nth(1).unwrap().to_owned();
             let reparsed = printed_operand.parse::<u32>().unwrap() as u16 as i16;
             assert_eq!(reparsed, simm as i16, "unsigned branch pitfall");
         }
@@ -326,14 +356,13 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
         .flat_map(|kt| kt.addrs.iter().copied())
         .collect();
     assert_eq!(insts.len(), 4780, "all six kernels census");
-    let lines = kernel_lines(&insts, Arch::Gfx1201)
-        .expect("all KT48 instructions print");
+    let lines = kernel_lines(&insts, Arch::Gfx1201).expect("all KT48 instructions print");
     // Synthetic VOP3b with the non-canonical benign fill first, so the
     // reported-set logic is exercised even without tools.
-    let vop3b_index =
-        insts.iter().position(|inst| {
-            matches!(inst.fields, FormFields::Vop3b { .. })
-        }).expect("KT48 holds VOP3b instructions");
+    let vop3b_index = insts
+        .iter()
+        .position(|inst| matches!(inst.fields, FormFields::Vop3b { .. }))
+        .expect("KT48 holds VOP3b instructions");
     let mut synth = insts[vop3b_index].clone();
     synth.fields = FormFields::Vop3b { src2_unused: 0x00 };
     let synth = Inst::from_parts(
@@ -347,15 +376,13 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
         peacemaker_ir::provenance::Provenance::default(),
     )
     .expect("synthetic VOP3b validates");
-    let synth_text =
-        canonical(&synth, Arch::Gfx1201).expect("synthetic prints");
+    let synth_text = canonical(&synth, Arch::Gfx1201).expect("synthetic prints");
     assert_eq!(
         synth_text, lines[vop3b_index],
         "don't-care fill is invisible in canonical text"
     );
     let enc_synth = gfx12::encode(&synth).expect("synthetic encodes");
-    let enc_canon =
-        gfx12::encode(&insts[vop3b_index]).expect("canonical encodes");
+    let enc_canon = gfx12::encode(&insts[vop3b_index]).expect("canonical encodes");
     assert_ne!(enc_synth.as_slice(), enc_canon.as_slice());
     let mask = lossy_mask(&synth);
     assert!(
@@ -367,19 +394,15 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
             .iter()
             .zip(enc_canon.iter())
             .enumerate()
-            .all(|(i, (a, b))| {
-                (a ^ b) & !mask.get(i).copied().unwrap_or(0) == 0
-            });
+            .all(|(i, (a, b))| (a ^ b) & !mask.get(i).copied().unwrap_or(0) == 0);
     assert!(only_masked, "synthetic differs only in src2");
     match support::toolchain().expect("toolchain discovery") {
         Some(tc) => {
-            let mc_words = support::mc_batch(&tc.mc, &lines)
-                .expect("pinned llvm-mc assembles KT48 text");
+            let mc_words =
+                support::mc_batch(&tc.mc, &lines).expect("pinned llvm-mc assembles KT48 text");
             let mut reported = Vec::new();
             let mut mismatched = Vec::new();
-            for (i, (inst, mc)) in
-                insts.iter().zip(mc_words.iter()).enumerate()
-            {
+            for (i, (inst, mc)) in insts.iter().zip(mc_words.iter()).enumerate() {
                 match classify(inst, mc).unwrap_or(Parity::Mismatch) {
                     Parity::Exact => {}
                     Parity::Reported => reported.push(i),
@@ -387,9 +410,7 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
                         "{:#x}: {} mc={mc:08X?} enc={:08X?}",
                         addrs[i],
                         lines[i],
-                        gfx12::encode(inst)
-                            .map(|e| e.to_vec())
-                            .unwrap_or_default()
+                        gfx12::encode(inst).map(|e| e.to_vec()).unwrap_or_default()
                     )),
                 }
             }
@@ -397,7 +418,11 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
                 mismatched.is_empty(),
                 "{} assembler mismatches:\n{}",
                 mismatched.len(),
-                mismatched.into_iter().take(10).collect::<Vec<_>>().join("\n")
+                mismatched
+                    .into_iter()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
             assert!(
                 reported.is_empty(),
@@ -428,5 +453,29 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
                 "synthetic VOP3b must land in the reported set"
             );
         }
+    }
+}
+
+#[test]
+fn swmmac_index_key_prints_before_neg_lo_and_roundtrips() {
+    for (words, expected) in [
+        (
+            [0xcc50_4b00, 0x7c52_1908],
+            "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]",
+        ),
+        (
+            [0xcc57_4800, 0x1c3a_1508],
+            "v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14 index_key:1",
+        ),
+        (
+            [0xcc54_4000, 0x1c3a_1508],
+            "v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14",
+        ),
+    ] {
+        let (inst, used) = gfx12::decode(&words).unwrap();
+        assert_eq!(used, 2);
+        assert_eq!(canonical(&inst, Arch::Gfx1201).unwrap(), expected);
+        let parsed = crate::text::parse_line(expected, Arch::Gfx1201).unwrap();
+        assert_eq!(gfx12::encode(&parsed).unwrap().as_slice(), &words);
     }
 }

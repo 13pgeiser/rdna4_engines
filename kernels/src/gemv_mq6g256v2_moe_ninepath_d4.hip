@@ -52,7 +52,7 @@ extern "C" __global__ void gemv_mq6g256v2_moe_ninepath_d4(
     const float* __restrict__ topk_weights,              // [8]
     const float* __restrict__ act,                       // [8 × 512] rotated silu out
     float* __restrict__ out,                             // [down_m] accumulated
-    int down_m, int down_k
+    int down_m, int down_k, int n_experts
 ) {
     constexpr int RPB = 16;
     __shared__ float act_s[8][512];
@@ -65,8 +65,9 @@ extern "C" __global__ void gemv_mq6g256v2_moe_ninepath_d4(
     const int warp = tid >> 5;   // 0..7 = krank
     const int lane = tid & 31;
     const int expert_id = topk_indices[warp];
+    const bool expert_valid = (unsigned)expert_id < (unsigned)n_experts;
     const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+        expert_valid ? reinterpret_cast<const char*>(expert_ptrs[expert_id]) : nullptr;
     const int r0 = blockIdx.x * RPB;
     const int boff = lane * 6;
     // Lane-constant affine-grid header offset -- see the note above.
@@ -99,6 +100,10 @@ extern "C" __global__ void gemv_mq6g256v2_moe_ninepath_d4(
     } while (0)
 
     for (int r = 0; r < RPB; r++) {
+        if (!expert_valid) {
+            if (lane == 0) part[warp][r] = 0.0f;
+            continue;
+        }
         const int row = r0 + r;
         const char* row_ptr = A + (long long)row * 2 * 200;
 

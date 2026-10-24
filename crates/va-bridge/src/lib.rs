@@ -31,8 +31,7 @@ pub use ffi::{
     VaBufferId, VaConfigId, VaContextId, VaDisplay, VaDrmPrimeDescriptor, VaDrmPrimeLayer,
     VaDrmPrimeObject, VaError, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
     VaJpegSliceParam, VaLib, VaSurfaceId, VA_EXPORT_SURFACE_READ_ONLY,
-    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2,
-    VA_STATUS_SUCCESS,
+    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2, VA_STATUS_SUCCESS,
 };
 pub use interop::HipMapping;
 pub use jpeg::{parse_for_va, JpegVaParams};
@@ -1501,12 +1500,7 @@ mod layout_tests {
         let d = mk_desc(VA_FOURCC_NV12, &[u32::MAX], &[wide, uv]);
         assert!(normalize_export_layers(&d, 64, 64).is_err());
         // UV offset near u32::MAX: end computation overflows, rejects.
-        let far = mk_layer(
-            1,
-            [0, 0, 0, 0],
-            [u32::MAX, 0, 0, 0],
-            [64, 0, 0, 0],
-        );
+        let far = mk_layer(1, [0, 0, 0, 0], [u32::MAX, 0, 0, 0], [64, 0, 0, 0]);
         let d = mk_desc(VA_FOURCC_NV12, &[u32::MAX], &[y, far]);
         assert!(normalize_export_layers(&d, 64, 32).is_err());
     }
@@ -1556,12 +1550,7 @@ mod layout_tests {
         let d = mk_desc(
             FOURCC_444P,
             &[384],
-            &[mk_layer(
-                3,
-                [0, 0, 0, 0],
-                [0, 128, 256, 0],
-                [16, 16, 16, 0],
-            )],
+            &[mk_layer(3, [0, 0, 0, 0], [0, 128, 256, 0], [16, 16, 16, 0])],
         );
         let (layers, n) = normalize_export_layers(&d, 16, 8).unwrap();
         assert_eq!(n, 3);

@@ -5,9 +5,11 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// Fixed Qwen3.5-27B GDN KKT solve: C64, K128, 16 key heads and three
-// value heads per key head.  A workgroup forms one Gram matrix and applies
-// three independent gate/beta systems.  Only the final FP16 inverses leave it.
+// Runtime-geometry Qwen GDN KKT solve: C64, K128, n_key_heads key heads and
+// n_value_heads / n_key_heads value heads per key head (Qwen3.5-27B: 16 and 48,
+// three per key head; A3B: 16 and 32, two).  A workgroup forms one Gram matrix
+// and applies each of its value heads' independent gate/beta systems.  Only the
+// final FP16 inverses leave it.
 #define GK_C 64
 #define GK_D 128
 #define GK_PITCH 68
@@ -126,8 +128,8 @@ struct __attribute__((aligned(16))) GkLds {
 
 // GDN_KKT_BATCHED (`gdn_chunk_kkt_solve_batched`): one launch per layer for
 // every commit segment (row0 = 0, T = all rows) instead of one per <= 512-row
-// segment.  The segment cap is lifted and the grid is [16, ceil(T/64)] (key
-// head fastest): the 16 head workgroups of a chunk share its k/G/beta rows and
+// segment.  The segment cap is lifted and the grid is [HK, ceil(T/64)] (key
+// head fastest): the HK head workgroups of a chunk share its k/G/beta rows and
 // A rows, as in the per-segment launches; chunk-fastest over a whole layer was
 // 46% slower.  With segments on 64-row boundaries the C64 chunks, their reads
 // and every A value are the per-segment launches'; chunk c's A lands at row
@@ -144,7 +146,12 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
     const float* __restrict__ beta,
     unsigned short* __restrict__ A,
     int row0,
-    int T) {
+    int T,
+    unsigned n_key_heads,
+    unsigned n_value_heads) {
+    const int hk = (int)n_key_heads;
+    const int hv = (int)n_value_heads;
+    const int ratio = hv / hk;
 #ifdef GDN_KKT_BATCHED
     if (T <= 0) return;
     const int chunk = (int)blockIdx.y;
@@ -154,12 +161,12 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
     const int chunk = (int)blockIdx.x;
     const int kh = (int)blockIdx.y;
 #endif
-    if (kh >= 16 || chunk*GK_C >= T) return;
+    if (kh >= hk || chunk*GK_C >= T) return;
     const int tid=(int)threadIdx.x, wave=tid>>5, lane=tid&31;
     const int local0=chunk*GK_C;
     int rows=T-local0; if(rows>GK_C)rows=GK_C;
     const int parent0=row0+local0;
-    const unsigned kstride=16*GK_D;
+    const unsigned kstride=(unsigned)hk*GK_D;
     const unsigned short* kp=k+(unsigned long long)parent0*kstride+(unsigned)kh*GK_D;
 
     // Ten Gram tiles remain in registers while the three value-head systems
@@ -167,6 +174,8 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
     gk_f8 gram[3]={gk_zero(),gk_zero(),gk_zero()};
 #if GK_G12_VEC
     __shared__ GkLds s;
+    // Each wave owns at most three tiles; value heads are processed in groups
+    // of three (one group for the 27B and A3B ratios).
     float pgate[3]={0.0f,0.0f,0.0f},pbeta[3]={0.0f,0.0f,0.0f};
     {uint4 w[8];
 #pragma unroll
@@ -174,7 +183,7 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
       w[it]=*reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned char*>(kp)+(unsigned)rr*(kstride*2u)+(unsigned)(idx&15)*16u);}
      if(tid<rows){
 #pragma unroll
-      for(int sub=0;sub<3;++sub){const unsigned long long off=(unsigned long long)(parent0+tid)*48+kh*3+sub;pgate[sub]=G[off];pbeta[sub]=beta[off];}}
+      for(int sub=0;sub<3;++sub)if(sub<ratio){const unsigned long long off=(unsigned long long)(parent0+tid)*hv+kh*ratio+sub;pgate[sub]=G[off];pbeta[sub]=beta[off];}}
 #pragma unroll
      for(int it=0;it<8;++it){const int idx=tid+it*128,r=idx>>4,c=(idx&15)*8;uint2*dst=reinterpret_cast<uint2*>(&s.kc[r][c]);
       dst[0]=make_uint2(w[it].x,w[it].y);dst[1]=make_uint2(w[it].z,w[it].w);}}
@@ -207,9 +216,18 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
 
     __shared__ GkLds s;
 #endif
+#pragma unroll 1
+    for(int sub0=0;sub0<ratio;sub0+=3){
+#if GK_G12_VEC
+    if(sub0>0&&tid<rows){
+#pragma unroll
+        for(int sub=0;sub<3;++sub)if(sub0+sub<ratio){const unsigned long long off=(unsigned long long)(parent0+tid)*hv+kh*ratio+sub0+sub;pgate[sub]=G[off];pbeta[sub]=beta[off];}
+    }
+#endif
 #pragma unroll
     for(int sub=0;sub<3;++sub){
-        const int vh=kh*3+sub;
+        if(sub0+sub>=ratio)break;
+        const int vh=kh*ratio+sub0+sub;
 #if GK_G12_VEC
         for(int x=tid;x<GK_C*GK_PITCH/8;x+=128)
             reinterpret_cast<uint4*>(s.a)[x]=make_uint4(0u,0u,0u,0u);
@@ -222,7 +240,7 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
             reinterpret_cast<unsigned short*>(s.a)[x]=0;
         if(tid<GK_C){
             if(tid<rows){
-                const unsigned long long off=(unsigned long long)(parent0+tid)*48+vh;
+                const unsigned long long off=(unsigned long long)(parent0+tid)*hv+vh;
                 s.gate[tid]=G[off]; s.beta[tid]=beta[off];
             }else{s.gate[tid]=0.0f;s.beta[tid]=0.0f;}
         }
@@ -359,19 +377,20 @@ __global__ void GDN_KKT_SOLVE_KERNEL(
         }
         __syncthreads();
 
-        const unsigned long long abase=(unsigned long long)local0*48*GK_C+(unsigned long long)vh*GK_C;
+        const unsigned long long abase=(unsigned long long)local0*hv*GK_C+(unsigned long long)vh*GK_C;
 #if GK_G12_VEC
         {unsigned char*ab=reinterpret_cast<unsigned char*>(A+abase);
 #pragma unroll
          for(int it=0;it<4;++it){const int idx=tid+it*128,r=idx>>3,c=(idx&7)*8;
           const uint2 lo2=*reinterpret_cast<const uint2*>(&s.a[r][c]),hi2=*reinterpret_cast<const uint2*>(&s.a[r][c+4]);
-          *reinterpret_cast<uint4*>(ab+(unsigned)r*(48u*GK_C*2u)+(unsigned)c*2u)=make_uint4(lo2.x,lo2.y,hi2.x,hi2.y);}}
+          *reinterpret_cast<uint4*>(ab+(unsigned)r*((unsigned)hv*GK_C*2u)+(unsigned)c*2u)=make_uint4(lo2.x,lo2.y,hi2.x,hi2.y);}}
 #else
         for(int x=tid;x<GK_C*GK_C;x+=128){
             const int r=x/GK_C,c=x-r*GK_C;
-            A[abase+(unsigned long long)r*48*GK_C+c]=s.a[r][c];
+            A[abase+(unsigned long long)r*hv*GK_C+c]=s.a[r][c];
         }
 #endif
         __syncthreads();
+    }
     }
 }

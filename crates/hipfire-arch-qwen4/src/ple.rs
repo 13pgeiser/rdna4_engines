@@ -114,7 +114,10 @@ impl std::fmt::Display for PleMetadataError {
                 write!(f, "PLE metadata head count {got} is not a supported layout")
             }
             Self::GeometryMismatch(reason) => {
-                write!(f, "PLE metadata disagrees with the typed geometry: {reason}")
+                write!(
+                    f,
+                    "PLE metadata disagrees with the typed geometry: {reason}"
+                )
             }
             Self::EmptyHead { head } => write!(f, "PLE head {head} has zero valid rows"),
             Self::HeadSizeTooLarge { head, size } => {
@@ -745,7 +748,10 @@ mod tests {
         }
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(metadata.fingerprint(), expected);
-        assert_eq!(metadata.fingerprint(), PleHashMetadata::qwen4().fingerprint());
+        assert_eq!(
+            metadata.fingerprint(),
+            PleHashMetadata::qwen4().fingerprint()
+        );
         let mut multipliers = PLE_MULTIPLIERS;
         multipliers[2] += 1;
         let other = PleHashMetadata::from_stored(
@@ -975,7 +981,10 @@ mod tests {
         // The canonical 16-head/128 parser refuses the same object.
         assert!(PleHashMetadata::from_json_value(&tiny_value()).is_err());
         // Distinct layouts have distinct fingerprints.
-        assert_ne!(metadata.fingerprint(), PleHashMetadata::qwen4().fingerprint());
+        assert_ne!(
+            metadata.fingerprint(),
+            PleHashMetadata::qwen4().fingerprint()
+        );
     }
 
     #[test]

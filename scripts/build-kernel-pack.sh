@@ -7,7 +7,7 @@
 # Build release kernel packs from one exact commit. For each architecture the
 # commit's own scripts/compile-kernels.sh packages the exact Rust registry into
 # kernels/compiled/<arch>, then hipfire-kernel-manifest re-verifies every index
-# against the sources and the build compiler and records the provenance.
+# against the sources, the build compiler and each object's kernel exports, and records the provenance.
 #
 # Outputs, per arch, in --out:
 #   hipfire-kernels-<tag>-<arch>.tar.gz         manifest.json + <arch>/*.{hsaco,hash,index.json}
@@ -159,7 +159,10 @@ BUILD_ENV=(
     "HIPFIRE_KERNEL_CACHE=$WORK/kernel-cache"
 )
 BUILD_ENV+=("HIPFIRE_PACK_JOBS=$MODULE_JOBS")
-for name in ROCM_PATH HIP_PATH HIPFIRE_ROCM_ROOT HIPFIRE_ROCM_PATH HIPFIRE_HIPCC HIPFIRE_ROCM_STRICT RUSTUP_TOOLCHAIN; do
+# Caller device/job selection passes through untouched: the pack build itself
+# runs no GPU work, but the caller's ROCR/HIP visibility and cargo job budget
+# must reach the compile workers unchanged (never defaulted or clamped here).
+for name in ROCM_PATH HIP_PATH HIPFIRE_ROCM_ROOT HIPFIRE_ROCM_PATH HIPFIRE_HIPCC HIPFIRE_ROCM_STRICT RUSTUP_TOOLCHAIN ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES HIPFIRE_DEVICES CUDA_VISIBLE_DEVICES CARGO_BUILD_JOBS; do
     if [ -n "${!name:-}" ]; then
         BUILD_ENV+=("$name=${!name}")
     fi

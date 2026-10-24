@@ -229,6 +229,14 @@ pub trait SpecTarget {
         false
     }
 
+    /// One-shot advisory for the next session begin (the following
+    /// [`Speculator::prefill`]): this request will write state rows at most
+    /// up to absolute position `through`, including speculative rows. A target
+    /// that parks side state may use it to bound that parking before prefill.
+    /// It is not validation and never rejects a request; the limit applies to
+    /// the next begin only. Default: no-op.
+    fn session_request_write_limit(&mut self, _through: usize) {}
+
     // ── Arch-generic speculation primitives ─────────────────────────────────
     //
     // These let a *model-free* speculator (n-gram / PLD) drive any arch's target
@@ -346,6 +354,21 @@ pub trait SpecTarget {
     /// The target's usable context capacity (decode-loop overflow guard).
     fn ctx_capacity(&self) -> usize;
 
+    /// Once per request, after the speculator's prefill and before the first
+    /// decode window: map the target's context-growing state ahead for a
+    /// decode from `position` that may emit `remaining_new_tokens` more
+    /// tokens, with windows writing up to `max_draft_rows` rows past the
+    /// seed. Best effort (implementations log and swallow failure); default
+    /// no-op, as [`crate::arch_model::ArchModel::map_ahead_for_decode`].
+    fn map_ahead_for_decode(
+        &mut self,
+        _gpu: &mut Gpu,
+        _position: usize,
+        _remaining_new_tokens: usize,
+        _max_draft_rows: usize,
+    ) {
+    }
+
     /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
     /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
     /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
@@ -389,6 +412,18 @@ pub trait SpecTarget {
         _n: usize,
     ) -> Result<Vec<f32>, String> {
         Err("target does not expose lm_head over hidden".into())
+    }
+
+    /// [`lm_head_logits`](Self::lm_head_logits) left on the device: a
+    /// non-owning `[n, vocab]` F32 view of the target's logit scratch, valid
+    /// until the target's next forward or head call. Returns `Err` by default.
+    fn lm_head_logits_device(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<GpuTensor, String> {
+        Err("target does not expose a device lm_head over hidden".into())
     }
 
     /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
@@ -515,6 +550,24 @@ pub trait SpecTarget {
     /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 
+    /// The drafter reads only the last `rows` rows of the `hidden_out` sink
+    /// of [`spec_advance`](Self::spec_advance): the target may drop leading
+    /// rows of the sink while it appends, keeping at least `rows` (the drafter
+    /// re-derives its base from the end position). Default: keep every row.
+    fn set_dflash_feature_window(&mut self, _rows: usize) {}
+
+    /// Roll back a verify whose window will not reach
+    /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
+    /// verify ran): restore whatever the verify snapshotted into `scratch`.
+    /// A no-op when no verify is outstanding. Default: nothing to restore.
+    fn abandon_verify(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Capture the target's residual hidden states at `layers` for a freshly-
     /// committed `seed` token at absolute `position`, returning the concatenated
     /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
@@ -588,6 +641,10 @@ pub trait SpecScratch {
     /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
     /// would orphan device memory. Called from the speculator's `free`.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Forget per-window state that names target state a reset discarded
+    /// (an outstanding verify ticket). Default: nothing to forget.
+    fn clear(&mut self) {}
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].
@@ -628,7 +685,7 @@ pub trait SpecGrammar {
 }
 
 /// Outcome of [`Speculator::prefill`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefillOutcome {
     /// Prompt prefilled; `first_token` is the target's next-token draw at the
     /// last prompt position (the seed for the first decode window). At temp≈0
@@ -638,6 +695,17 @@ pub enum PrefillOutcome {
     /// Client cancelled mid-prefill. The caller resets conversation state and
     /// emits the aborted/done events; the slot guard restores the target bundle.
     Aborted,
+}
+
+impl PrefillOutcome {
+    /// The seed of a prefill whose caller never aborts (oracles, tests);
+    /// an abort there is an error.
+    pub fn into_first_token(self) -> Result<u32, String> {
+        match self {
+            PrefillOutcome::Ready { first_token } => Ok(first_token),
+            PrefillOutcome::Aborted => Err("prefill aborted".into()),
+        }
+    }
 }
 
 /// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
@@ -785,6 +853,29 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Whether [`Self::ar_step`] is implemented. The spec-retire policy
+    /// ([`crate::spec_retire`]) only arms for speculators that can continue a
+    /// request as plain AR.
+    fn supports_ar_step(&self) -> bool {
+        false
+    }
+
+    /// One greedy target-only token for a request the spec-retire policy
+    /// retired: feed `seed` at absolute `position` through the target, keep
+    /// drafter-local per-position state in sync (a later request that hits
+    /// this prompt cache drafts from those rows), and return the target's
+    /// argmax next token. No draft runs.
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<u32, String> {
+        let _ = (gpu, target, position, seed);
+        Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
     /// Repair a terminal that consumed only a strict prefix of the most recent
     /// speculative window. Implementations with a retained pre-window snapshot
     /// restore it and replay only the state-committable prefix, leaving the last
@@ -792,6 +883,13 @@ pub trait Speculator {
     ///
     /// Returns `true` when the resident target and drafter caches are repaired.
     /// The default is unsupported; callers retain the conservative reset path.
+    ///
+    /// Call it right after observing the window, before any further `step`,
+    /// forced advance, prefill, reset or [`Self::configure_request`] on this
+    /// speculator: an implementation that retains pre-window state (Qwen4
+    /// native MTP) releases it at the next such call. `false` also means "no
+    /// retained window" (see [`SpecRequestConfig::stop_sequences`]), not only
+    /// "unsupported".
     fn repair_terminal_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -926,6 +1024,16 @@ pub trait Speculator {
     fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+
+    /// The raw target logit row (full vocabulary, before penalties and
+    /// truncation) that produced token `index` of the most recent emission:
+    /// index 0 is the prefill's first token right after [`Self::prefill`],
+    /// otherwise `index` indexes the last [`Self::step`]'s `emit`. Rows are
+    /// kept only for a request configured with
+    /// [`SpecRequestConfig::logprobs`]. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
@@ -975,6 +1083,19 @@ pub struct SpecRequestConfig {
     pub presence_penalty: f32,
     /// OpenAI frequency penalty over the window. `0.0` = off.
     pub frequency_penalty: f32,
+    /// The request can end inside a speculative window on a stop sequence,
+    /// which no draft-side signal predicts. A speculator whose cheapest
+    /// windows commit rows one at a time (Qwen4's interleaved MTP routes)
+    /// keeps pre-window state only when this is set, so
+    /// [`Speculator::repair_terminal_prefix`] can still repair such a stop;
+    /// windows that already snapshot for their own rollback retain it
+    /// regardless. A caller sets it from `!stop.is_empty()`; the default is
+    /// `false`, which keeps those windows snapshot-free.
+    pub stop_sequences: bool,
+    /// The request asked for logprobs: a speculator that implements
+    /// [`Speculator::token_logits`] keeps the target logit row behind each
+    /// emitted token. Default `false`, which keeps no rows.
+    pub logprobs: bool,
 }
 
 impl Default for SpecRequestConfig {
@@ -993,6 +1114,8 @@ impl Default for SpecRequestConfig {
             repeat_window: 0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            stop_sequences: false,
+            logprobs: false,
         }
     }
 }
@@ -1067,6 +1190,10 @@ pub struct MtpRequestStats {
     pub ngram_mod_accept_rate: f64,
     /// Native MTP windows (every n-gram miss, or plain MTP).
     pub mtp_windows: usize,
+    /// Of `mtp_windows`, the target-only tokens the native Qwen4 AR floor
+    /// timed before any retirement: the request's calibration token and the
+    /// AR probes of a would-be retirement. They draft nothing.
+    pub floor_ar_windows: usize,
     /// Target-only (`k=0`) windows after sticky native Qwen4 floor retirement.
     /// Qwen35 MTP does not retire after an n-gram accept because the takeover
     /// fills the head KV.
@@ -1104,7 +1231,8 @@ pub trait MtpDrafter {
     /// `fill_tokens` is the slice actually advanced this call (warm suffix on
     /// cache hit, full prompt on miss). `cache_hit=false` ⇒ cold start (reset
     /// recurrent + MTP cache first); `true` ⇒ warm suffix extension (preserve
-    /// prior state).
+    /// prior state). A client abort polled through `abort` is
+    /// `Ok(PrefillOutcome::Aborted)`, never `Err`: errors are real failures.
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -1114,7 +1242,7 @@ pub trait MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
-    ) -> Result<u32, String>;
+    ) -> Result<PrefillOutcome, String>;
 
     /// One acceptance window: seed at absolute `position`; draft up to `k`,
     /// verify, accept the longest matching prefix + bonus under the installed
@@ -1247,6 +1375,11 @@ pub trait MtpDrafter {
     fn request_stats(&self) -> MtpRequestStats {
         MtpRequestStats::default()
     }
+
+    /// [`Speculator::token_logits`] of this drafter. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
@@ -1320,7 +1453,7 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
         } else {
             (prompt_tokens, 0)
         };
-        let first_token = self.arch.mtp_prefill(
+        self.arch.mtp_prefill(
             gpu,
             target,
             prompt_tokens,
@@ -1328,8 +1461,7 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
             start_pos,
             cache_hit,
             abort,
-        )?;
-        Ok(PrefillOutcome::Ready { first_token })
+        )
     }
 
     fn step(
@@ -1451,6 +1583,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
     fn request_stats(&self) -> MtpRequestStats {
         self.arch.request_stats()
     }
+
+    fn token_logits(&self, index: usize) -> Option<&[f32]> {
+        self.arch.token_logits(index)
+    }
 }
 
 // ─── Per-token emission seam (SpecEmit) ─────────────────────────────────────
@@ -1558,7 +1694,10 @@ pub struct FinishSummary {
     /// lowering so wrappers do not recompute solely from the last token id.
     pub decoded_eot: bool,
     /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
-    /// a reasoning-only `stop` with no tool calls and no cache store.
+    /// a reasoning-only `stop` with no tool calls. Qwen may cache a completed
+    /// whole-body turn; truncation and fail-closed exits stay unstored. A
+    /// length terminal is classified by the wrapper (the AR route stores a
+    /// call-less length body verbatim; see `qwen_ar_finish_route`).
     pub open_think: bool,
 }
 
@@ -1677,6 +1816,15 @@ pub trait SpecEmit {
     /// enters the force path, so every other emitter is byte-identical no-op.
     fn take_forced(&mut self) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// The most tokens the next speculative window may commit so that no
+    /// emitter intervention (think-budget force-close or think-cap stop) lands
+    /// strictly inside it: any intervention may only fall on the window's last
+    /// token, so the loop never has to repair already-committed state.
+    /// `None` = no limit (the default).
+    fn window_cap(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -2037,7 +2185,7 @@ mod tests {
                 _start_pos: usize,
                 _cache_hit: bool,
                 _abort: &dyn Fn() -> bool,
-            ) -> Result<u32, String> {
+            ) -> Result<PrefillOutcome, String> {
                 unreachable!()
             }
 
@@ -2171,5 +2319,30 @@ mod tests {
             ClientEvent::Committed { id: 42, idx: 7 }
         ));
         assert!(matches!(&o.events[1], ClientEvent::Token(t) if t == "hi"));
+    }
+}
+
+#[cfg(test)]
+mod prefill_outcome_tests {
+    use super::PrefillOutcome;
+
+    #[test]
+    fn into_first_token_returns_the_seed() {
+        let ready = PrefillOutcome::Ready { first_token: 7 };
+        assert_eq!(ready.into_first_token(), Ok(7));
+    }
+
+    #[test]
+    fn into_first_token_turns_an_abort_into_an_error_for_never_abort_callers() {
+        assert!(PrefillOutcome::Aborted.into_first_token().is_err());
+    }
+
+    #[test]
+    fn an_abort_is_distinct_from_a_ready_prefill() {
+        assert_ne!(
+            PrefillOutcome::Aborted,
+            PrefillOutcome::Ready { first_token: 0 }
+        );
+        assert_eq!(PrefillOutcome::Aborted, PrefillOutcome::Aborted);
     }
 }

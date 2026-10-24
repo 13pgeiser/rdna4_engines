@@ -680,7 +680,8 @@ fn child(draft_path: &str, outdir: &Path) {
         .iter()
         .enumerate()
         .map(|(i, &l)| {
-            let seed = 0x2b7e_1516_28ae_d2a6u64 ^ 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1);
+            let seed =
+                0x2b7e_1516_28ae_d2a6u64 ^ 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1);
             gen_inputs(seed, B, l, 2000 + 500 * i as i32, h, ne)
         })
         .collect();
@@ -894,7 +895,11 @@ fn finish(outdir: &Path, fails: Vec<String>, on_cap: Value, off_cap: Value) -> b
             summary["failures"].as_array().map_or(0, |f| f.len()),
             summary["failures"]
                 .as_array()
-                .map(|f| f.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("; "))
+                .map(|f| f
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "))
                 .unwrap_or_default(),
             outdir.join("summary.json").display()
         );

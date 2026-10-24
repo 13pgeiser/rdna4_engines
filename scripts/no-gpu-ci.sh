@@ -27,6 +27,7 @@ cargo check --workspace --examples
 
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
+cargo test -p rdna-compute --test all_launcher_abi
 cargo test -p hipfire-cpu --lib
 cargo test -p hipfire-engine --lib decide
 cargo test -p hipfire-generate --lib decide
@@ -46,9 +47,11 @@ PYTEST_PATHS=(
     tests scripts/test_astrea.py autoresearch/ar/tests
     scripts/hw-gate/tests
     scripts/test_registry_gen_ornith.py scripts/test_registry_gen_vision.py
-    scripts/test_registry_gen_coverage.py
+    scripts/test_registry_gen_coverage.py scripts/test_registry_gen_decider.py
     scripts/test_lmx_corpus.py scripts/test_ck_runtime_bundle.py
     scripts/test_check_changelog.py scripts/test_kernel_idproof.py
+    scripts/test_agentic_gate_driver.py
+    scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
 )
 if python3 -c 'import pytest, numpy' 2>/dev/null; then
     python3 -m pytest "${PYTEST_PATHS[@]}"
@@ -63,6 +66,7 @@ python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'
 python3 scripts/test_install_revision.py
 python3 scripts/test_uninstall.py
 bash scripts/test-gpu-lock.sh
+bash scripts/test-fmt-sweep-rebase.sh
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py

@@ -119,10 +119,11 @@ gives different token streams across fresh processes on three of the eight
 prompts (a known issue in the wall-time route chooser). Greedy AR and greedy
 MTP are bit-identical across processes.
 
-- **Qwen3.8-Flash EP2.** Owner-routed prefill and long-prefill expert staging
-  are on by default when two R9700s (gfx1201) admit EP2. Balanced per-call
-  expert ownership and native MTP also run under EP. EP4 owner-routed
-  prefill is still refused at admission.
+- **Qwen3.8-Flash expert parallelism (EP2 through EP8).** Owner-routed prefill
+  is on by default when `topology.ep` ranks of one exact arch, gfx1201 or
+  gfx1100, admit it; long-prefill expert staging and balanced per-call expert
+  ownership are gfx1201-only. Native MTP also runs under EP. EP is opt-in and
+  experimental.
   *Measured on 2x R9700 (gfx1201), pinned Qwen3.8-Flash XTS, committed prompts,
   2026-10-13: prefill went from 3,033 to 3,943 tok/s at 8K (1.30x) and from
   3,754 to 4,308 tok/s at 16K (1.15x), one card vs EP2.* See
@@ -156,10 +157,12 @@ MTP are bit-identical across processes.
   committed 8.2K-token prompt, 2026-10-12: prompt throughput went from
   3,809 to 4,921 tok/s (+29%).* See the
   [paired DFlash default](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
-- **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolves to 4 for
-  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else.
+- **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolved to 4 for
+  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else in 0.4.2.
   *Measured on gfx1151, pinned Qwen3.8-Flash XTS, code prompts (Rust/Go/Java),
-  2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).*
+  2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).* Since
+  0.4.3 `auto` drafts up to 7 on gfx1151 and the adaptive depth chooser picks
+  each window's depth; see the [CHANGELOG](CHANGELOG.md).
 - **Also in 0.4.2:**
   - a faster Qwen35 MTP prompt fill
   - gfx1201 batched MTP fill for Qwen3.8-Flash
@@ -178,8 +181,8 @@ not current product baselines.
 
 ## Models
 
-The bundled registry (`registry/v1.json`) contains 90 curated entries
-(models, quant variants and draft sidecars) and 82 aliases. Run
+The bundled registry (`registry/v1.json`) contains 92 curated entries
+(models, quant variants and draft sidecars) and 83 aliases. Run
 `hipfire list -r` for the live list.
 
 | Family | Pull tags |
@@ -208,6 +211,60 @@ Curated weights are published under
 [docs/MODELS.md](docs/MODELS.md) covers sizes, minimum VRAM, sampling
 defaults, sidecars and provenance. To bring your own model, use
 `hipfire quantize`.
+
+### Qwen 3.8 Flash Next split-PLE tiers (0.4.3)
+
+The `hipfire-models/qwen3.8-flash-next` repository publishes three plain
+split-PLE trunk files at its root, next to the shared PLE sidecar. The sizes
+below are **file sizes in bytes, not VRAM or peak-memory requirements**.
+Publishing a file is not a claim that every GPU route or speed has been
+measured on it.
+The [published model card](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/fc845731a50018daf1eb43ad2619ca2cdd75c0ee/README.md#measurement-boundary-for-the-new-hashes)
+records the receipt-backed measurements and their acceptance scope.
+
+| Tier | File (HF link) | Bytes | SHA-256 |
+|---|---|---:|---|
+| MQ3 | [`qwen3.8-flash-next-base.mq3-xts`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next-base.mq3-xts) | 59109362200 | `d35896ca69b87d3e93176847a036db3e2cb1554931f130a842b13718b486238b` |
+| MQ2 (6,306 hot) | [`qwen3.8-flash-next-base.mq2-xts`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next-base.mq2-xts) | 46895167000 | `e2ba747485190da92cd7a36d3f56809e6db31a3ec328f5ab23e000275d798e57` |
+| MQ2 (4,500 hot) | [`qwen3.8-flash-next-base.mq2-xts-4500`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next-base.mq2-xts-4500) | 44537253400 | `9087d7d8f67629a3256c26bfeb705e7ed22dd1622bb91e074035543d6caea5c2` |
+| Shared PLE sidecar (Q4) | [`qwen3.8-flash-next.ple-q4`](https://huggingface.co/hipfire-models/qwen3.8-flash-next/blob/main/qwen3.8-flash-next.ple-q4) | 29120146432 | `fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e` |
+
+Trunk plus the Q4 sidecar totals 88,229,508,632 (MQ3), 76,015,313,432 (MQ2
+6,306) and 73,657,399,832 (MQ2 4,500) bytes on disk. The MQ2 tiers need
+hipfire at or after `ea2abd111f06339e9f25ac86715b7d210d0c5ae8`; the MQ3 tier
+needs `ca0aee9c925b4180651b194b440bcda80f656ac5`.
+
+**MQ2 KLD on an RX 7900 XTX (gfx1100), post-land.** Mean KLD against the FP8
+reference, hipfire `ea2abd111f06339e9f25ac86715b7d210d0c5ae8`, with the
+shipping MQ2 hashes above. WikiText-2 (`wt2`): 32 chunks, 8160 scored rows;
+`code24`: 24 chunks, 6120 scored rows. Pre-land references describe earlier
+d2 predecessor bytes, not fresh measurements of the published roots; decode
+rows are paired against the weight-only reference and prefill rows against
+the prefill reference. The pre-land
+decode references (MQ2 6,306: 0.1851 wt2 / 0.1981 code24; MQ2 4,500: 0.2078 /
+0.2077) are weight-only model KLD, not GPU route measurements; the XTX
+columns are GPU route measurements.
+
+| Tier | Corpus | Route | Pre-land reference | XTX post-land | Paired Δ (95% CI) | Relative Δ | Status |
+|---|---|---|---:|---:|---|---:|---|
+| MQ2 6,306 | wt2 | decode | 0.1851 | 0.1966 | +0.0115 (+0.0075, +0.0155) | +6.23% | accepted by Kaden exact-row exception |
+| MQ2 6,306 | code24 | decode | 0.1981 | 0.2083 | +0.0103 (+0.0018, +0.0160) | +5.18% | accepted, relative budget |
+| MQ2 6,306 | wt2 | prefill | 0.2095 | 0.2106 | +0.0011 (−0.0058, +0.0080) | +0.55% | accepted, not significant |
+| MQ2 6,306 | code24 | prefill | 0.2111 | 0.2112 | +0.0001 (−0.0059, +0.0068) | +0.05% | accepted, not significant |
+| MQ2 4,500 | wt2 | decode | 0.2078 | not re-measured (identity + G2 pass) | — | — | not re-measured (identity + G2 pass) |
+| MQ2 4,500 | code24 | decode | 0.2077 | 0.2192 | +0.0116 (+0.0053, +0.0179) | +5.56% | accepted, relative budget |
+| MQ2 4,500 | wt2 | prefill | 0.2274 | 0.2291 | +0.0017 (−0.0055, +0.0091) | +0.76% | accepted, not significant |
+| MQ2 4,500 | code24 | prefill | 0.2237 | not re-measured (identity + G2 pass) | — | — | not re-measured (identity + G2 pass) |
+
+Six of the eight cells were measured on the XTX. The MQ2 6,306 wt2 decode row
+(0.1966, +6.23%) exceeds the 6% relative budget and is accepted only as an
+explicit exact-row exception by Kaden; it is not a budget pass. The two
+remaining MQ2 4,500 cells were not re-measured. Product identity compared
+the builds on earlier d2 bytes (32 identical greedy token ids); G2 AR-lane
+parity passed on the published root hashes. Neither is a KLD measurement.
+This is not an
+all-eight-measured result. MQ3 XTX evidence is refusal-only; no XTX KLD or
+speed measurement is claimed.
 
 ## GPU support
 
@@ -313,6 +370,10 @@ detected arch when one is available. Otherwise they build kernels locally
 with hipcc. See
 [Prebuilt kernel packs](docs/GETTING_STARTED.md#prebuilt-kernel-packs).
 
+Before the first pull, `hipfire doctor` checks the driver and ROCm install, and
+`hipfire fit <model> --ctx N` says whether that model loads at that context on
+this machine, what the load would choose, and what to change if it does not.
+
 `hipfire version` compares the installed binary, the managed source checkout
 and the daemon. To switch revisions, use `hipfire update @beta`,
 `hipfire update --tag <tag>` or `hipfire update --commit <sha>`. To
@@ -337,12 +398,8 @@ nix build github:warpfront/hipfire    # build package
 Containers ([docs/CONTAINER.md](docs/CONTAINER.md)):
 
 ```bash
-podman build -f Containerfile --target runtime -t hipfire .
-podman run --rm -it --device /dev/kfd --device /dev/dri \
-  --group-add keep-groups --security-opt seccomp=unconfined \
-  -v hipfire-models:/root/.hipfire/models \
-  -v hipfire-kcache:/var/cache/hipfire \
-  hipfire run qwen3.5:4b "2+2="
+docker compose up -d      # or: podman compose up -d
+curl http://127.0.0.1:11435/v1/models
 ```
 
 ## Deprecated features

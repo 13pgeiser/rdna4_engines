@@ -27,7 +27,10 @@ impl DriverEnv {
         let driver_lib = build.join("src/amd/vulkan/libvulkan_radeon.so");
         for p in [&icd_json, &driver_lib] {
             if !p.is_file() {
-                return Err(format!("{} missing (run `aco-export build-mesa` first)", p.display()));
+                return Err(format!(
+                    "{} missing (run `aco-export build-mesa` first)",
+                    p.display()
+                ));
             }
         }
         let shim_lib = if shim {
@@ -39,7 +42,12 @@ impl DriverEnv {
         } else {
             None
         };
-        Ok(Self { icd_json, driver_lib, shim_lib, shim_gpu_id: "gfx1201".into() })
+        Ok(Self {
+            icd_json,
+            driver_lib,
+            shim_lib,
+            shim_gpu_id: "gfx1201".into(),
+        })
     }
 
     /// The complete, explicit environment of every host run. The inherited environment is dropped so
@@ -51,10 +59,19 @@ impl DriverEnv {
                 env.insert(k.into(), v);
             }
         }
-        env.insert("VK_DRIVER_FILES".into(), self.icd_json.display().to_string());
-        env.insert("VK_ICD_FILENAMES".into(), self.icd_json.display().to_string());
+        env.insert(
+            "VK_DRIVER_FILES".into(),
+            self.icd_json.display().to_string(),
+        );
+        env.insert(
+            "VK_ICD_FILENAMES".into(),
+            self.icd_json.display().to_string(),
+        );
         env.insert("VK_LOADER_LAYERS_DISABLE".into(), "~all~".into());
-        env.insert("RADV_ACO_EXPORT_DIR".into(), capture_dir.display().to_string());
+        env.insert(
+            "RADV_ACO_EXPORT_DIR".into(),
+            capture_dir.display().to_string(),
+        );
         env.insert("RADV_DEBUG".into(), "nocache".into());
         env.insert("MESA_SHADER_CACHE_DISABLE".into(), "true".into());
         if let Some(s) = &self.shim_lib {
@@ -76,7 +93,11 @@ pub fn find_llvm_mc(a: &Args) -> Res<PathBuf> {
     if let Ok(p) = std::env::var("ACO_LLVM_MC") {
         return Ok(PathBuf::from(p));
     }
-    for p in ["/opt/rocm/core/lib/llvm/bin/llvm-mc", "/opt/rocm/llvm/bin/llvm-mc", "/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc"] {
+    for p in [
+        "/opt/rocm/core/lib/llvm/bin/llvm-mc",
+        "/opt/rocm/llvm/bin/llvm-mc",
+        "/opt/rocm/core-10.0/lib/llvm/bin/llvm-mc",
+    ] {
         if Path::new(p).is_file() {
             return Ok(PathBuf::from(p));
         }
@@ -96,27 +117,57 @@ fn disassemble(llvm_mc: &Path, arch: &str, wave: u64, exec: &[u8]) -> Res<String
         text.push_str(&format!("0x{b:02x}"));
     }
     text.push('\n');
-    let attr = if wave == 32 { "+wavefrontsize32,-wavefrontsize64" } else { "-wavefrontsize32,+wavefrontsize64" };
+    let attr = if wave == 32 {
+        "+wavefrontsize32,-wavefrontsize64"
+    } else {
+        "-wavefrontsize32,+wavefrontsize64"
+    };
     let mut child = Command::new(llvm_mc)
-        .args(["--disassemble", "--triple=amdgcn-amd-amdhsa", &format!("--mcpu={arch}"), &format!("-mattr={attr}")])
+        .args([
+            "--disassemble",
+            "--triple=amdgcn-amd-amdhsa",
+            &format!("--mcpu={arch}"),
+            &format!("-mattr={attr}"),
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn llvm-mc: {e}"))?;
-    child.stdin.take().unwrap().write_all(text.as_bytes()).map_err(err)?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .map_err(err)?;
     let out = child.wait_with_output().map_err(err)?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() || stderr.contains("invalid instruction encoding") || stderr.contains("error:") {
-        return Err(format!("llvm-mc could not disassemble every executable word:\n{stderr}"));
+    if !out.status.success()
+        || stderr.contains("invalid instruction encoding")
+        || stderr.contains("error:")
+    {
+        return Err(format!(
+            "llvm-mc could not disassemble every executable word:\n{stderr}"
+        ));
     }
     let asm = String::from_utf8_lossy(&out.stdout);
-    let body: Vec<&str> = asm.lines().map(str::trim_end).filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with(".text") && !l.trim_start().starts_with("//")).collect();
+    let body: Vec<&str> = asm
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| {
+            !l.trim().is_empty()
+                && !l.trim_start().starts_with(".text")
+                && !l.trim_start().starts_with("//")
+        })
+        .collect();
     Ok(body.join("\n"))
 }
 
 fn mask_bit(masks: &[u64], i: u64) -> bool {
-    masks.get((i / 32) as usize).map(|m| (m >> (i % 32)) & 1 == 1).unwrap_or(false)
+    masks
+        .get((i / 32) as usize)
+        .map(|m| (m >> (i % 32)) & 1 == 1)
+        .unwrap_or(false)
 }
 
 fn parse_masks(t: &Value, key: &str) -> Res<Vec<u64>> {
@@ -124,7 +175,12 @@ fn parse_masks(t: &Value, key: &str) -> Res<Vec<u64>> {
     if arr.len() != 4 {
         return Err(format!("typed_post_ra.{key} must have 4 words"));
     }
-    arr.iter().map(|v| u64::from_str_radix(v.as_str().unwrap_or(""), 16).map_err(|e| format!("typed_post_ra.{key}: {e}"))).collect()
+    arr.iter()
+        .map(|v| {
+            u64::from_str_radix(v.as_str().unwrap_or(""), 16)
+                .map_err(|e| format!("typed_post_ra.{key}: {e}"))
+        })
+        .collect()
 }
 
 /// Bind register facts that come from the compiler itself: ACO's typed post-RA instructions (every fixed
@@ -145,7 +201,9 @@ fn apply_body_reads(an: &mut abi::Analysis, cap: &Value) -> Res<()> {
     let live_in = parse_masks(t, "entry_live_mask")?;
     let typed_ordinary = ju64(t, "ordinary_sgprs")?;
     if typed_ordinary > 106 {
-        return Err(format!("REJECT: typed ordinary SGPR count {typed_ordinary} > 106"));
+        return Err(format!(
+            "REJECT: typed ordinary SGPR count {typed_ordinary} > 106"
+        ));
     }
     let mut drop_bases: Vec<u64> = Vec::new();
     if let Some(list) = an.abi["user_sgprs"].as_array_mut() {
@@ -153,7 +211,9 @@ fn apply_body_reads(an: &mut abi::Analysis, cap: &Value) -> Res<()> {
             let base = e["sgpr_index"].as_u64().unwrap_or(u64::MAX);
             let len = e["dwords"].as_u64().unwrap_or(0);
             if base + len > 106 {
-                return Err(format!("REJECT: entry SGPR s{base}+{len} is not ordinary (>=106)"));
+                return Err(format!(
+                    "REJECT: entry SGPR s{base}+{len} is not ordinary (>=106)"
+                ));
             }
             let read = (base..base + len).any(|r| mask_bit(&reads, r));
             let defd = (base..base + len).any(|r| mask_bit(&defs, r));
@@ -171,14 +231,30 @@ fn apply_body_reads(an: &mut abi::Analysis, cap: &Value) -> Res<()> {
             }
         }
     }
-    an.entry.retain(|f| !(f["loc"]["kind"] == "sgpr" && f["value"]["kind"] == "defined" && drop_bases.contains(&f["loc"]["base"].as_u64().unwrap_or(u64::MAX))));
+    an.entry.retain(|f| {
+        !(f["loc"]["kind"] == "sgpr"
+            && f["value"]["kind"] == "defined"
+            && drop_bases.contains(&f["loc"]["base"].as_u64().unwrap_or(u64::MAX)))
+    });
 
-    let hw_total = an.config["sgprs_allocated"].as_u64().ok_or("config.sgprs_allocated")?;
-    let ra_incl_vcc = an.config["sgprs_actual"].as_u64().ok_or("config.sgprs_actual")?;
+    let hw_total = an.config["sgprs_allocated"]
+        .as_u64()
+        .ok_or("config.sgprs_allocated")?;
+    let ra_incl_vcc = an.config["sgprs_actual"]
+        .as_u64()
+        .ok_or("config.sgprs_actual")?;
     if hw_total != 108 {
         return Err(format!("REJECT: final config.num_sgprs {hw_total} != 108 (gfx10+ fixed total, ac_gpu_info.c:253); SGPR semantics unverified"));
     }
-    let user_end = an.abi["user_sgprs"].as_array().map(|l| l.iter().map(|e| e["sgpr_index"].as_u64().unwrap_or(0) + e["dwords"].as_u64().unwrap_or(0)).max().unwrap_or(0)).unwrap_or(0);
+    let user_end = an.abi["user_sgprs"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .map(|e| e["sgpr_index"].as_u64().unwrap_or(0) + e["dwords"].as_u64().unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
     let ordinary_actual = user_end.max(typed_ordinary);
     let vcc = jbool(t, "vcc_touched")?;
     let other_special = jbool(t, "other_special_touched")?;
@@ -198,7 +274,10 @@ fn apply_body_reads(an: &mut abi::Analysis, cap: &Value) -> Res<()> {
 }
 
 fn tree_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, Value>) -> Res<()> {
-    let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir).map_err(err)?.collect::<Result<Vec<_>, _>>().map_err(err)?;
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
@@ -209,27 +288,48 @@ fn tree_files(root: &Path, dir: &Path, out: &mut BTreeMap<String, Value>) -> Res
             if rel == "artifact.json" {
                 continue;
             }
-            out.insert(rel, json!({"sha256": sha256_file(&p)?, "bytes": fs::metadata(&p).map_err(err)?.len()}));
+            out.insert(
+                rel,
+                json!({"sha256": sha256_file(&p)?, "bytes": fs::metadata(&p).map_err(err)?.len()}),
+            );
         }
     }
     Ok(())
 }
 
 /// Compile the SPIR-V through the patched RADV in the host and return the single compute capture dir.
-pub fn host_compile(host: &Path, drv: &DriverEnv, spv: &Path, k: &Value, device_arg: &[String], work: &Path, extra: &[String]) -> Res<(PathBuf, BTreeMap<String, String>, Vec<String>)> {
+pub fn host_compile(
+    host: &Path,
+    drv: &DriverEnv,
+    spv: &Path,
+    k: &Value,
+    device_arg: &[String],
+    work: &Path,
+    extra: &[String],
+) -> Res<(PathBuf, BTreeMap<String, String>, Vec<String>)> {
     let capture_tmp = work.join("capture-tmp");
     if capture_tmp.exists() {
         fs::remove_dir_all(&capture_tmp).map_err(err)?;
     }
     fs::create_dir_all(&capture_tmp).map_err(err)?;
-    let local: Vec<String> = jarr(k, "local_size")?.iter().map(|v| v.to_string()).collect();
+    let local: Vec<String> = jarr(k, "local_size")?
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
     let mut argv: Vec<String> = vec![
-        "compile".into(), "--spv".into(), spv.display().to_string(),
-        "--push-size".into(), ju64(k, "push.size")?.to_string(),
-        "--local".into(), local.join(","),
-        "--subgroup".into(), ju64(k, "subgroup.required")?.to_string(),
-        "--stats-out".into(), work.join("host-stats.txt").display().to_string(),
-        "--identity-out".into(), work.join("identity.json").display().to_string(),
+        "compile".into(),
+        "--spv".into(),
+        spv.display().to_string(),
+        "--push-size".into(),
+        ju64(k, "push.size")?.to_string(),
+        "--local".into(),
+        local.join(","),
+        "--subgroup".into(),
+        ju64(k, "subgroup.required")?.to_string(),
+        "--stats-out".into(),
+        work.join("host-stats.txt").display().to_string(),
+        "--identity-out".into(),
+        work.join("identity.json").display().to_string(),
     ];
     argv.extend(device_arg.iter().cloned());
     argv.extend(extra.iter().cloned());
@@ -239,9 +339,18 @@ pub fn host_compile(host: &Path, drv: &DriverEnv, spv: &Path, k: &Value, device_
     let out = cmd.output().map_err(|e| format!("spawn host: {e}"))?;
     write_file(&work.join("host.stderr.txt"), &out.stderr)?;
     if !out.status.success() {
-        return Err(format!("vk_aco_host failed ({}):\n{}", out.status, String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "vk_aco_host failed ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
-    let mut dirs: Vec<PathBuf> = fs::read_dir(&capture_tmp).map_err(err)?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&capture_tmp)
+        .map_err(err)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
     dirs.sort();
     if dirs.len() != 1 {
         return Err(format!(
@@ -253,7 +362,9 @@ pub fn host_compile(host: &Path, drv: &DriverEnv, spv: &Path, k: &Value, device_
 }
 
 pub fn spec_kernel<'a>(spec: &'a Value, name: &str) -> Res<&'a Value> {
-    spec["kernels"].get(name).ok_or_else(|| format!("kernel `{name}` not in spec"))
+    spec["kernels"]
+        .get(name)
+        .ok_or_else(|| format!("kernel `{name}` not in spec"))
 }
 
 pub fn layout_hashes(k: &Value) -> Res<(Value, String, Value, String)> {
@@ -271,7 +382,10 @@ pub fn layout_hashes(k: &Value) -> Res<(Value, String, Value, String)> {
 }
 
 pub fn cmd_export(a: &Args) -> Res<()> {
-    let spec_path = a.opt("spec").map(PathBuf::from).unwrap_or_else(default_spec);
+    let spec_path = a
+        .opt("spec")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_spec);
     let spec = read_json(&spec_path)?;
     let kname = a.req("kernel")?;
     let k = spec_kernel(&spec, kname)?;
@@ -306,16 +420,35 @@ pub fn cmd_export(a: &Args) -> Res<()> {
     let spirv_dis = which("spirv-dis")?;
     let spv = out.join("shader.spv");
     let target_env = jstr(&spec, "glslang.target_env")?;
-    let glslang_argv: Vec<String> = vec!["-V".into(), "--target-env".into(), target_env.into(), "-S".into(), jstr(&spec, "glslang.stage")?.into(),
-                                         "-e".into(), jstr(&spec, "glslang.entry")?.into(), src_path.file_name().unwrap().to_string_lossy().into_owned(),
-                                         "-o".into(), spv.display().to_string()];
-    run(Command::new(&glslang).current_dir(src_path.parent().unwrap()).args(&glslang_argv))?;
-    run(Command::new(&spirv_val).args(["--target-env", target_env]).arg(&spv))?;
+    let glslang_argv: Vec<String> = vec![
+        "-V".into(),
+        "--target-env".into(),
+        target_env.into(),
+        "-S".into(),
+        jstr(&spec, "glslang.stage")?.into(),
+        "-e".into(),
+        jstr(&spec, "glslang.entry")?.into(),
+        src_path.file_name().unwrap().to_string_lossy().into_owned(),
+        "-o".into(),
+        spv.display().to_string(),
+    ];
+    run(Command::new(&glslang)
+        .current_dir(src_path.parent().unwrap())
+        .args(&glslang_argv))?;
+    run(Command::new(&spirv_val)
+        .args(["--target-env", target_env])
+        .arg(&spv))?;
     let dis = run(Command::new(&spirv_dis).arg(&spv))?;
     let dis_text = String::from_utf8_lossy(&dis.stdout).into_owned();
-    for needle in ["OpExecutionMode %main DenormPreserve 32", "OpExecutionMode %main SignedZeroInfNanPreserve 32", "PhysicalStorageBufferAddresses"] {
+    for needle in [
+        "OpExecutionMode %main DenormPreserve 32",
+        "OpExecutionMode %main SignedZeroInfNanPreserve 32",
+        "PhysicalStorageBufferAddresses",
+    ] {
         if !dis_text.contains(needle) {
-            return Err(format!("SPIR-V lacks required `{needle}` (float controls / BDA did not reach the module)"));
+            return Err(format!(
+                "SPIR-V lacks required `{needle}` (float controls / BDA did not reach the module)"
+            ));
         }
     }
     let spv_sha = sha256_file(&spv)?;
@@ -365,7 +498,10 @@ pub fn cmd_export(a: &Args) -> Res<()> {
     write_file(&out.join("shader.rawspec.json"), &rawspec_bytes)?;
 
     let stats = fs::read_to_string(work.join("host-stats.txt")).map_err(err)?;
-    let local: Vec<String> = jarr(k, "local_size")?.iter().map(|v| v.to_string()).collect();
+    let local: Vec<String> = jarr(k, "local_size")?
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
     let dump = format!(
         "workgroup_size: {}\nwave_size: {}\n# generated by tools/aco-export: instructions disassembled from shader.bin[0..{exec_size}] by ROCm llvm-mc; statistics from RADV VK_KHR_pipeline_executable_properties\n\ndisasm:\n{asm}\n\n{stats}",
         local.join(", "), analysis.wave
@@ -379,9 +515,22 @@ pub fn cmd_export(a: &Args) -> Res<()> {
     let mut files = BTreeMap::new();
     tree_files(&out, &out, &mut files)?;
     let radiowave_argv = vec![
-        "oracle".to_string(), "aco".into(), "--input".into(), "shader.aco.dump".into(), "--input-artifact".into(), "shader.spv".into(),
-        "--kernel".into(), jstr(k, "symbol")?.into(), "--arch".into(), analysis.arch.clone(), "--wavefront".into(), analysis.wave.to_string(),
-        "--workgroup".into(), local.join(","), "--compiler-version".into(), format!("RADV/ACO {} {}", jstr(&pin, "tag")?, jstr(&pin, "commit")?),
+        "oracle".to_string(),
+        "aco".into(),
+        "--input".into(),
+        "shader.aco.dump".into(),
+        "--input-artifact".into(),
+        "shader.spv".into(),
+        "--kernel".into(),
+        jstr(k, "symbol")?.into(),
+        "--arch".into(),
+        analysis.arch.clone(),
+        "--wavefront".into(),
+        analysis.wave.to_string(),
+        "--workgroup".into(),
+        local.join(","),
+        "--compiler-version".into(),
+        format!("RADV/ACO {} {}", jstr(&pin, "tag")?, jstr(&pin, "commit")?),
         // no --output: the report goes to stdout so nothing is ever written inside the artifact directory
     ];
     let artifact = json!({
@@ -439,9 +588,16 @@ pub fn cmd_export(a: &Args) -> Res<()> {
     });
     write_file(&out.join("artifact.json"), &canon(&artifact))?;
     println!("artifact: {}", out.display());
-    println!("artifact.json canonical sha256: {}", canon_sha256(&artifact));
+    println!(
+        "artifact.json canonical sha256: {}",
+        canon_sha256(&artifact)
+    );
     println!("shader.spv sha256: {spv_sha}\nshader.bin sha256: {bin_sha}\nexecutable sha256: {exec_sha} ({exec_size} bytes of {})", code.len());
-    println!("radiowave: cd {} && radiowave {}", out.display(), radiowave_argv.join(" "));
+    println!(
+        "radiowave: cd {} && radiowave {}",
+        out.display(),
+        radiowave_argv.join(" ")
+    );
     Ok(())
 }
 
@@ -453,14 +609,26 @@ pub fn cmd_oracle(a: &Args) -> Res<()> {
     let canon_dir = fs::canonicalize(&dir).map_err(err)?;
     let out_parent = out.parent().ok_or("--out has no parent")?;
     fs::create_dir_all(out_parent).map_err(err)?;
-    if fs::canonicalize(out_parent).map_err(err)?.starts_with(&canon_dir) {
-        return Err("--out must not be inside the artifact directory (artifacts are immutable)".into());
+    if fs::canonicalize(out_parent)
+        .map_err(err)?
+        .starts_with(&canon_dir)
+    {
+        return Err(
+            "--out must not be inside the artifact directory (artifacts are immutable)".into(),
+        );
     }
     let art = read_json(&dir.join("artifact.json"))?;
-    let argv: Vec<String> = jarr(&art, "radiowave.argv")?.iter().map(|v| v.as_str().unwrap_or_default().to_owned()).collect();
+    let argv: Vec<String> = jarr(&art, "radiowave.argv")?
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_owned())
+        .collect();
     let bin = a.path("radiowave")?;
     let o = run(Command::new(&bin).current_dir(&dir).args(&argv))?;
     write_file(&out, &o.stdout)?;
-    println!("radiowave oracle report: {} sha256 {}", out.display(), sha256_file(&out)?);
+    println!(
+        "radiowave oracle report: {} sha256 {}",
+        out.display(),
+        sha256_file(&out)?
+    );
     Ok(())
 }

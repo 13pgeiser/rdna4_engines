@@ -61,9 +61,7 @@ impl Config {
                 "--expect-arch0" => cfg.expect_arch0 = Some(value(&mut i)?.to_owned()),
                 "--expect-arch1" => cfg.expect_arch1 = Some(value(&mut i)?.to_owned()),
                 "-h" | "--help" => {
-                    println!(
-                        "gfx11_generic_smoke [--expect-arch0 ARCH] [--expect-arch1 ARCH]"
-                    );
+                    println!("gfx11_generic_smoke [--expect-arch0 ARCH] [--expect-arch1 ARCH]");
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument {flag:?}; use --help")),
@@ -78,10 +76,7 @@ fn u32_bytes(values: &[u32]) -> &[u8] {
     // SAFETY: every possible bit pattern is valid for `u8`, and the byte
     // extent exactly covers the source slice.
     unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(values),
-        )
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
@@ -168,14 +163,7 @@ fn launch(
     // SAFETY: argument order and widths exactly match `gfx11_generic_rawbits`;
     // both device buffers cover `n_arg * sizeof(u32)` bytes.
     unsafe {
-        hip.launch_kernel(
-            function,
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            None,
-            &mut params,
-        )?;
+        hip.launch_kernel(function, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)?;
     }
     Ok(())
 }
@@ -198,15 +186,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(expected_arch) = expected_arch {
             if arch != expected_arch {
-                return Err(
-                    format!("device {device} is {arch}, expected {expected_arch}").into(),
-                );
+                return Err(format!("device {device} is {arch}, expected {expected_arch}").into());
             }
         }
     }
 
     let mut compiler = KernelCompiler::new("gfx11-generic", String::new())?;
-    let artifact = compiler.compile("gfx11_generic_rawbits", SOURCE)?.to_owned();
+    let artifact = compiler
+        .compile("gfx11_generic_rawbits", SOURCE)?
+        .to_owned();
     let image = std::fs::read(&artifact)?;
     println!(
         "artifact={} target=gfx11-generic code_object=6 bytes={} arch0={} arch1={}",

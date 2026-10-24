@@ -185,8 +185,8 @@ State:
                                                    ◀── snapshot (end of shared prefix)
 Question: {instructions}
 Options:
-A. {criteria for option 1}
-B. {criteria for option 2}
+A. {key 1}[: {description 1}]
+B. {key 2}[: {description 2}]
 …
 Answer with the option code only.<|im_end|>
 <|im_start|>assistant
@@ -210,9 +210,14 @@ Answer with the option code only.<|im_end|>
   - Every question is therefore evaluated on exactly the tokens of its own
     full prompt, with no tokenization-boundary assumptions.
 - **Labels:**
-  - `choice`: codes `A`–`Z`, then two-letter codes, in criteria order.
-  - `score`: levels labelled `0`…`k-1`, with each level's description.
-  - `noul`: `Yes`/`No`, with the criteria descriptions when provided.
+  - `choice`: codes `A`–`Z`, then two-letter codes, in criteria order. Each
+    option line shows the criteria key; `: {description}` follows only when
+    the description is present. A `null` description renders the key alone
+    (never the text `null`). The code, not the key, is the readout token.
+  - `score`: levels labelled `0`…`k-1`, with each level's description. A
+    `null` level prints its own code (`0. 0`).
+  - `noul`: `Yes`/`No`, with the criteria descriptions when provided; an
+    absent or `null` description prints `yes` / `no`.
 - **Code check.** Per request (not cached), every candidate code is checked
   to encode to exactly one token, after stripping a leading BOS that
   tokenizers with `add_bos_token` (Llama / Mistral style) prepend in
@@ -262,9 +267,11 @@ Request validation, returning 422 with the question and field named:
 - `state`: string, JSON object or JSON array.
 - `questions`: non-empty map, name → question, at most 128 questions. Each
   question needs `instructions` (string) and a `type`:
-  - `choice`: `criteria` is an object with 2–255 keys (key → description);
-  - `score`: `criteria` is an array of 2–10 level descriptions, low → high;
-  - `noul`: optional `criteria` `{true, false}`.
+  - `choice`: `criteria` is an object with 2–255 keys (key → description or
+    `null`);
+  - `score`: `criteria` is an array of 2–10 level descriptions (`null`
+    allowed), low → high;
+  - `noul`: optional `criteria` `{true, false}`; each value a string or `null`.
 
 Token limits (hipfire bounds chosen to match Jev's published limits, §3),
 checked by the daemon after rendering, 422 naming the limit and without

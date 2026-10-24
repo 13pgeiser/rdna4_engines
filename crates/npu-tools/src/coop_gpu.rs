@@ -34,12 +34,23 @@ pub fn copy_args(dst: u64, src: u64, count16: u64, stride: u64) -> [u8; 32] {
 }
 
 /// `wait_free`: poll the done line for `free_ref` first (a slot is reused only after its previous seq is done).
-pub fn publish_args(seq_addr: u64, done_addr: u64, stats: u64, seq: u32, free_ref: u32, max_iters: u32, wait_free: bool) -> [u8; 40] {
+pub fn publish_args(
+    seq_addr: u64,
+    done_addr: u64,
+    stats: u64,
+    seq: u32,
+    free_ref: u32,
+    max_iters: u32,
+    wait_free: bool,
+) -> [u8; 40] {
     let mut a = [0u8; 40];
     a[0..8].copy_from_slice(&seq_addr.to_le_bytes());
     a[8..16].copy_from_slice(&done_addr.to_le_bytes());
     a[16..24].copy_from_slice(&stats.to_le_bytes());
-    for (i, v) in [seq, free_ref, max_iters, wait_free as u32].into_iter().enumerate() {
+    for (i, v) in [seq, free_ref, max_iters, wait_free as u32]
+        .into_iter()
+        .enumerate()
+    {
         a[24 + 4 * i..28 + 4 * i].copy_from_slice(&v.to_le_bytes());
     }
     a

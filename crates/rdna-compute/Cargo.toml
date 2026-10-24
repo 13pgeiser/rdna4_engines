@@ -8,6 +8,9 @@ description = "Compute kernel dispatch for RDNA GPUs"
 [features]
 # Archived research probes; see the note by the [[example]] blocks.
 lab = []
+# Explicit timing instrumentation opt-in; neither default builds nor lab alone
+# enable timing state or launch-path hooks.
+kernel-timing = ["lab", "hip-bridge/kernel-timing"]
 deltanet = []
 flash-attn-ck = ["dep:libloading"]
 
@@ -26,18 +29,30 @@ sha2.workspace = true
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
+half.workspace = true
 peacemaker-npu = { path = "../peacemaker-npu" }
 peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
 peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
-half.workspace = true
-
+peacemaker-rip = { path = "../peacemaker-rip" }
 [[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
-
 [[example]]
 name = "npu_trunk_consumers_check"
+required-features = ["lab"]
+[[example]]
+name = "qwen4_moe_front_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_moe_cn_tiled_numeric_oracle"
+required-features = ["lab"]
+
+# Single-card gfx1201 GPU gate for the bounded device spin waits
+# (crate::device_wait): forced timeout, host error path, fail-fast, recovery.
+[[example]]
+name = "device_wait_deadline"
 required-features = ["lab"]
 
 # ---------------------------------------------------------------------------
@@ -62,6 +77,10 @@ name = "pm_mtp_gemm_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_fp8_gemm_bench"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_aco_oracle"
 required-features = ["lab"]
 
@@ -74,7 +93,32 @@ name = "test_mq4v2_xlds_gfx1151"
 required-features = ["lab"]
 
 [[example]]
+name = "test_moe_down_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_gateup_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hc_read_up_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_qsa_hg12_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fp8_moe_gfx942"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_moe_sym"
+required-features = ["lab"]
+
+# NT4 vs NT8 byte oracle; includes qwen4_moe_sym.rs by path (child module).
+[[example]]
+name = "moe_iu4_wide_tiles_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -111,6 +155,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_argmax_vs_download_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hc_row_fold_gfx1201"
 required-features = ["lab"]
 
 [[example]]
@@ -270,6 +318,22 @@ name = "bench_qwen4_hc_wmma"
 required-features = ["lab"]
 
 [[example]]
+name = "hc_down_fused_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_down_fused_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_up_v2_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_up_v2_bench"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_mq2g256_lloyd_grouped_gfx12"
 required-features = ["lab"]
 
@@ -394,6 +458,14 @@ name = "gdn_chunk_parity"
 required-features = ["lab"]
 
 [[example]]
+name = "gdn_chunk_generalized_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_state_precision_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "gfx11_generic_smoke"
 required-features = ["lab"]
 
@@ -431,7 +503,7 @@ required-features = ["lab"]
 
 [[example]]
 name = "rope_compact_offset_check"
-required-features = ["lab"]
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "sample_accept_parity"
@@ -803,7 +875,7 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_mrope_rope_parity"
-required-features = ["lab"]
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "test_multislot_ops"
@@ -914,11 +986,19 @@ name = "qsa_pm_check"
 required-features = ["lab"]
 
 [[example]]
+name = "qsa_code_check_selftest"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_residual_xbatch_oracle"
 required-features = ["lab"]
 
 [[example]]
 name = "pm_decode_twins"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_loop"
 required-features = ["lab"]
 
 [[example]]
@@ -931,6 +1011,26 @@ required-features = ["lab"]
 
 [[example]]
 name = "mq4_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "bf16_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_wide_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_lm_head_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "bf16_rows_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "q8_wide_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -961,6 +1061,75 @@ required-features = ["lab"]
 name = "cb_rows_twins_gate"
 required-features = ["deltanet"]
 
+
+[[example]]
+name = "moe_router_topk_multirow_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_shared_prepared_iu4_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_combine_v2_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "prefill_iu4_producer_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_down_sigmoid_epi_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_a3b_screen"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_fp8_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "fa_pm_qprep_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "a3b_gqa8_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_rotate_i4_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "iu4_c8_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_prep_pm_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_qk_indexed_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_moe_pre_fused_oracle"
+required-features = ["lab", "deltanet"]
+
 [[example]]
 name = "gemma4_kernel_f64_check"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_lmhead_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_rows_pm_gfx1201_h0"
 required-features = ["lab"]

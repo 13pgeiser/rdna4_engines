@@ -59,6 +59,10 @@ pub struct FeatureFlags {
     pub pm_decode: bool,
     /// Exact gfx1201 MQ4v2 A8 prefill (int8 per K128); opt-in, default off.
     pub a8_prefill: bool,
+    /// Exact gfx1100/gfx1151 MQ4v2 A8 prefill (`kernel.gfx11_a8_prefill`,
+    /// `HIPFIRE_GFX11_A8_PREFILL`); opt-in, default off. Takes precedence over
+    /// the IU4 W4A4 projections wherever it is admitted.
+    pub gfx11_a8_prefill: bool,
     /// Fuse A8 sidecar emission into the four activation producers (default on).
     pub a8_fused_prod: bool,
     /// Qwen4 chunked GDN prefill (`HIPFIRE_QWEN4_GDN_CONV_QKNORM`): the
@@ -72,6 +76,25 @@ pub struct FeatureFlags {
     /// Bytes identical. Opt-in, default off (the kill switch for the new
     /// module); exact gfx1151 only.
     pub qwen4_gdn_q8_inline: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_I8_FUSE`): the dense GDN gate
+    /// also rotates and quantizes the MQ6 out projection's A8 activation
+    /// (`fn_gdn_dense_gate_i8`), so the F32 gate output and the separate
+    /// `mq_rotate_x_i8_gfx12` launch disappear. Bytes identical to the two-launch
+    /// pair. Exact gfx1201 only, where it defaults on; `0` is the kill switch.
+    pub qwen4_gdn_i8_fuse: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_CHAIN_FUSE`): the dense-GDN chain
+    /// runs the load-batched `fn_gdn_dense_producer_v2_{f32,bf16}` entries (and, with
+    /// `HIPFIRE_QWEN4_GDN_QKV_BF16`, reads a BF16 qkv projection). Bytes identical to the
+    /// v1 producer on the F32 projection. Exact gfx1201 only, where it defaults on; `0` is
+    /// the kill switch restoring today's chain exactly.
+    pub qwen4_gdn_chain_fuse: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_QKV_BF16`, opt-in, default off): with
+    /// [`Self::qwen4_gdn_chain_fuse_enabled`], the dense route's qkv GEMM stores BF16 bits
+    /// (halving the GEMM write and the producer read; byte-identical). Off by default because
+    /// the PeaceMaker INT8 GEMM's BF16 entry is currently slower than its F32 entry at the qkv
+    /// shape (M = 10240, K = 2048, 16384 rows: 5.53 vs 4.96 ms), which outweighs the 0.39 ms the
+    /// producer gains.
+    pub qwen4_gdn_qkv_bf16: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -79,17 +102,41 @@ pub struct FeatureFlags {
     /// Retiled HC up+mix read tail (`HIPFIRE_QWEN4_HC_UP_TILE`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_hc_up_tile: bool,
+    /// Persistent W-stationary HC up+mix read tail (`HIPFIRE_QWEN4_HC_UP_V2`):
+    /// `hyper_read_up_wmma_bf16_gfx1201_v2`, bytewise the retiled `_t128` entry.
+    /// Exact gfx1201 only (with the retiled read admitted), default on; `0` is
+    /// the kill switch.
+    pub qwen4_hc_up_v2: bool,
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
-    /// MoE row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): combine + shared fold + HC
-    /// write + the next HC read's norm/gate in one row kernel; default on
-    /// for gfx1151, off elsewhere.
+    /// HC row folds (`HIPFIRE_QWEN4_HC_ROW_FOLD`), default on for gfx1151 and
+    /// gfx1201, off elsewhere.  gfx1151: combine + shared fold + HC write + the
+    /// next HC read's norm/gate in one MoE row kernel.  gfx1201: the same for
+    /// the MoE tail (its scaled-add + HC write + norm chain) and for the mixer
+    /// tail (HC write + the next read's norm/gate); `=0` restores the unfused
+    /// launches on both.
     pub qwen4_hc_row_fold: bool,
     /// Wave-per-token Qwen4 E512/top-10 prefill router
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
     pub qwen4_router_fast: bool,
+    /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
+    /// on for gfx1151, off elsewhere.
+    pub qwen4_gdn_lanes: bool,
+    /// Qwen4 MQ4G128V2 K=640 indexed MoE down with four weight rows per wave
+    /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1151.
+    pub qwen4_moe_down_r4: bool,
+    /// Single-token Q8 K=640 shared-expert down + BF16 scaled add in one
+    /// launch (`HIPFIRE_QWEN4_SHARED_DOWN_FUSE`), default on for gfx1151.
+    pub qwen4_shared_down_fuse: bool,
+    /// Exact single-token GDN a/b/z MQ4 projection fusion
+    /// (`HIPFIRE_QWEN4_DECODE_ZBA_X3`), default on only for gfx1151.
+    pub qwen4_decode_zba_x3: bool,
+    /// Exact single-token decode MoE head fusion (BF16 router/selector rows
+    /// plus the Q8_0 shared gate/up pair, `HIPFIRE_QWEN4_DECODE_HEAD_FUSE`),
+    /// default on only for gfx1151.
+    pub qwen4_decode_head_fuse: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
@@ -187,6 +234,33 @@ pub struct FeatureFlags {
     /// `Some` = set (`1` on, any other value off); unset = on inside the
     /// Qwen4 forward on gfx1151 (`Gpu::qwen4_mq6_x4_regions`).
     pub qwen4_mq6_x4_regions: Option<bool>,
+    /// gfx1201 MQ6G256V2 native-FP8 prefill GEMM (`HIPFIRE_GFX12_MQ6_FP8`,
+    /// developer, opt-in research route): `Some(true)` (`1`) on for any scope
+    /// (still exact gfx1201, eager, K % 256 == 0); anything else off
+    /// (`Gpu::gemm_mq6g256v2_fp8_applies`).
+    pub gfx12_mq6_fp8: Option<bool>,
+    /// Weight-plane arm of the MQ6 FP8 GEMM (`HIPFIRE_GFX12_MQ6_FP8_ARM`,
+    /// developer): `split` (default, exact hi/lo E4M3 planes) or `round`
+    /// (single lossy E4M3_RNE(q-32) plane).
+    pub gfx12_mq6_fp8_arm: crate::gemm_mq6_fp8::Mq6Fp8Arm,
+    /// Double-buffered continuous-pipeline kernel variant of the MQ6 FP8 GEMM
+    /// (`HIPFIRE_GFX12_MQ6_FP8_DB`, developer): `1` selects the `_db_` symbols
+    /// (A/W/S/SZ double-buffered in LDS, one barrier per K64 slab); anything
+    /// else (default) keeps the single-buffer kernel until measured.
+    pub gfx12_mq6_fp8_db: bool,
+    /// Exact-INT8 MQ6G256V2 prefill GEMM on gfx1201 / gfx1151
+    /// (`HIPFIRE_MQ6_I8`, developer): `Some(true)` (`1`) on for any scope,
+    /// `Some(false)` (`0`) off, unset = the per-arch default
+    /// (`crate::gemm_mq6_i8::MQ6_I8_DEFAULT_ARCHS`, qwen4 scope)
+    /// (`Gpu::gemm_mq6g256v2_i8_applies`).
+    pub mq6_i8: Option<bool>,
+    /// Certified-builder (PeaceMaker) twin of the exact-INT8 MQ6G256V2 GEMM on
+    /// exact gfx1201 (`HIPFIRE_MQ6_I8_PM`, developer): `Some(false)` (`0`) keeps
+    /// the hipcc kernel; `Some(true)` (`1`) and unset (default) run
+    /// `kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201` whenever the INT8 route is
+    /// admitted and the launch meets its preconditions, else hipcc
+    /// (`Gpu::gemm_mq6g256v2_i8_prequant`).
+    pub mq6_i8_pm: Option<bool>,
     /// Calibration-only override keeping native-BF16 teachers in BF16
     /// (`HIPFIRE_CALIB_BF16=1`). Mirrors the `calib_force_bf16` snapshot
     /// read so fresh `Gpu` code can take the flag from `self.flags`
@@ -263,6 +337,9 @@ pub struct FeatureFlags {
 
     // ── Graph / capture / deterministic ─────────────────────────────
     pub graph_forward: Option<bool>,
+    /// Autoregressive-forward hipGraph capture (`experimental.graph.ar`,
+    /// `HIPFIRE_AR_GRAPH`). Default on, except on Windows exact gfx1100, where
+    /// it defaults off (#655); see [`graph_ar_default`].
     pub graph_ar: bool,
     pub graph_moe: bool,
     pub force_blob_path: bool,
@@ -285,7 +362,8 @@ pub struct FeatureFlags {
     pub gate_up_ldsstage: bool,
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 WMMA
     /// GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per block, X slab staged in
-    /// LDS) for gate_up/qkvza/qkv/residual. Default on for exact gfx1151, false
+    /// LDS) for gate_up/qkvza/qkv/residual, and the matching Q8_0
+    /// `gemm_q8_0_wmma_gfx1151_xlds` (DFlash Q8 lm_head). Default on for exact gfx1151, false
     /// elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
@@ -420,6 +498,55 @@ pub struct FeatureFlags {
     /// Default ON on exact gfx1201; `=1` forces it on other arches
     /// (launchers stay gfx1201-only).
     pub gfx12_fa2_prefill: bool,
+    /// `HIPFIRE_FA_PREFILL_PM` (`developer.fa_prefill_pm`): typed flag for
+    /// A3B H16/KV2/D256 Q8_0 prefill. Unset follows route qualification
+    /// (on only on exact gfx1201); explicit 1/0 wins, admission still applies.
+    pub fa_prefill_pm: bool,
+    /// The same `HIPFIRE_FA_PREFILL_PM` key resolved for the native fp8-E4M3 KV codec: an
+    /// explicit 1/0 wins, unset follows `PrefillRoute::FaPrefillPm` fp8 qualification
+    /// (`prefill_route_capabilities::FP8_KV_QUALIFIED`, on only on exact gfx1201).
+    /// The Q8_0 qualification never enables fp8 KV.
+    pub fa_prefill_pm_fp8_kv: bool,
+    /// `HIPFIRE_MOE_IU4_WIDE_TILES` (`developer.moe_iu4_wide_tiles`): typed flag
+    /// for the NT8 gate/up expert-run tile on VRAM-resident symmetric IU4 MoE experts
+    /// (exact gfx1201 raw inventory, per-expert real slots >= 128; see
+    /// `Gpu::qwen4_moe_sym_gemm_symbols`). The resident down entry stays NT4 whatever this
+    /// says. Unset follows route qualification (on only on exact gfx1201); explicit 1 opts in
+    /// (raw inventory is applied at selection), 0 kills.
+    /// Host-mapped experts keep their existing NT8 gate/up and down whatever this says.
+    pub moe_iu4_wide_tiles: bool,
+    /// `HIPFIRE_FA_PREFILL_PM_QPREP` (`developer.fa_prefill_pm_qprep`): typed
+    /// flag for the exact Q-prep fold that feeds the PM direct attention
+    /// (A3B H16/KV2/D256 Q8_0 prefill). Unset follows route qualification (on only on exact
+    /// gfx1201), explicit 1 opts in, 0 kills. Independent of `fa_prefill_pm` as a flag; the
+    /// route nests beneath the *resolved* PM flag (an explicit PM 0 refuses the fold), and
+    /// admission still applies.
+    pub fa_prefill_pm_qprep: bool,
+    /// The same `HIPFIRE_FA_PREFILL_PM_QPREP` key resolved for the native fp8-E4M3 KV codec;
+    /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (on only on exact gfx1201 when unset).
+    pub fa_prefill_pm_qprep_fp8_kv: bool,
+    /// `HIPFIRE_MOE_ROTATE_I4_PM` (`developer.moe_rotate_i4_pm`): typed flag for the exact
+    /// PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`, resolved through its
+    /// qualification (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills). Raw
+    /// inventory, the requested symmetric IU4 route, the C2 candidate set and the launch shape
+    /// are applied at selection.
+    pub moe_rotate_i4_pm: bool,
+    /// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (`developer.prefill_iu4_producer_fused`): typed
+    /// flag for the exact IU4 producer fusion, resolved through its qualification (on only on
+    /// exact gfx1201 when unset; explicit 1 opts in, 0 kills). The raw inventory is a separate
+    /// conjunct at the callers. Read here only so the exact C8 PM wrappers can nest beneath it.
+    pub prefill_iu4_producer_fused: bool,
+    /// `HIPFIRE_PREFILL_IU4_C8_PM` (`developer.prefill_iu4_c8_pm`): typed flag for the
+    /// PeaceMaker C8 rotate / RMSNorm-rotate producer twins, resolved through its qualification
+    /// (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills; raw inventory is
+    /// applied at admission). Nests beneath the resolved `prefill_iu4_producer_fused` flag.
+    pub prefill_iu4_c8_pm: bool,
+    /// `HIPFIRE_GDN_CHUNK_PREP_PM` (`developer.gdn_chunk_prep_pm`): typed flag for the PM
+    /// twin of `gdn_chunk_prep` (A3B 16/32-head GDN chunk-scan preamble), resolved through its
+    /// qualification (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills).
+    /// Independent of the chunk-scan flag as a flag; the MoE chunk-scan layer admission still
+    /// applies in `hipfire-arch-qwen35`.
+    pub gdn_chunk_prep_pm: bool,
     /// gfx1201 packet-minimal Q128 FA2 body (`HIPFIRE_GFX12_FA_PACKET`,
     /// `kernel.gfx12_fa_packet`). Default ON on exact gfx1201; `=0` opts out
     /// to the route-N body. Exact stage-b arithmetic; any raw-O bit difference
@@ -446,9 +573,9 @@ pub struct FeatureFlags {
     pub verify_attn: bool,
     /// Exact-gfx1100 FA2 split-KV implementation of VerifyAttn
     /// (`HIPFIRE_GFX1100_FA2_SPLIT_VERIFY`,
-    /// `kernel.gfx1100_fa2_split_verify`). Default OFF on every arch; an
-    /// explicit opt-in takes effect only on exact gfx1100 with VMM KV, and
-    /// the stable [`Self::verify_attn`] switch remains the parent opt-out.
+    /// `kernel.gfx1100_fa2_split_verify`). Default ON only on exact gfx1100
+    /// inside its existing VMM-KV admission envelope. This switch and the
+    /// stable [`Self::verify_attn`] parent are independent opt-outs.
     pub gfx1100_fa2_split_verify: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
@@ -641,8 +768,43 @@ pub struct FeatureFlags {
     /// Flash-Next lane-step PeaceMaker row kernels (`HIPFIRE_FN_LANE_PM_ROWS`):
     /// multi-column GEMVs that keep every column byte-identical to the 1-row
     /// incumbent while sharing activation loads across weight rows. Default on
-    /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
+    /// for gfx1151 (`0` is the kill switch); exact gfx1151, the lane step and
+    /// the Qwen4 speculative verify only.
     pub fn_lane_pm_rows: bool,
+    /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
+    /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
+    /// exactly `0` (kill switch for both). KLD-gated, not bit-exact against
+    /// the per-head kernel; the F32 split-K is acted on only for exact gfx1151
+    /// (`qwen4_qsa_decode_splitk_enabled`) and the q8 split-KV for exact
+    /// gfx1151 and gfx1100 (`qwen4_qsa_decode_splitkv_q8_enabled`).
+    pub qwen4_qsa_decode_splitk: bool,
+    /// Developer QSA mapped/allocation extent checks; exactly `1` or `2`.
+    pub qwen4_qsa_extent_check: bool,
+    /// Exactly `2` also synchronizes immediately after each checked launch.
+    pub qwen4_qsa_extent_sync: bool,
+    /// Developer CPU-visible loaded-code snapshot; exactly `1`, default off.
+    pub qwen4_qsa_code_check: bool,
+}
+
+/// Built-in default of `experimental.graph.ar` for an architecture on a host
+/// platform. On, except Windows exact gfx1100 (#655): there AR-forward graph
+/// capture/replay silently produces wrong output (token soup on an RX 7900 XTX
+/// until the replay is fixed), so the default is off. Linux gfx1100 and every
+/// other architecture on every platform keep the default on.
+pub fn graph_ar_default(arch: &str, windows: bool) -> bool {
+    !(windows && arch == "gfx1100")
+}
+
+/// Resolve `experimental.graph.ar` from the process-config compatibility value
+/// of `HIPFIRE_AR_GRAPH`. Absence (the built-in default is never carried in
+/// the process config) selects [`graph_ar_default`]; an explicit value from the
+/// user, the environment or a one-shot argument always wins, and only the exact
+/// value `0` (a rendered `false`) turns capture off.
+pub fn resolve_graph_ar(raw: Option<&str>, arch: &str, windows: bool) -> bool {
+    match raw {
+        None => graph_ar_default(arch, windows),
+        Some(raw) => raw != "0",
+    }
 }
 
 impl FeatureFlags {
@@ -655,6 +817,16 @@ impl FeatureFlags {
     }
 
     fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
+        Self::from_lookup_on_host(arch, cfg!(windows), value)
+    }
+
+    /// [`Self::from_lookup`] with the host platform passed in, so CPU tests can
+    /// exercise the Windows-only defaults on any build host.
+    fn from_lookup_on_host(
+        arch: &str,
+        windows: bool,
+        value: impl Fn(&str) -> std::result::Result<String, ()>,
+    ) -> Self {
         let parse_bool = |name: &str| -> Option<bool> {
             match value(name).ok().as_deref() {
                 Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
@@ -676,6 +848,8 @@ impl FeatureFlags {
                 _ => None,
             }
         };
+
+        let qsa_extent_mode = value("HIPFIRE_QWEN4_QSA_EXTENT_CHECK").ok();
 
         let is_gfx906 = arch == "gfx906";
         // The bytewise-identical Halo hyper units (H5 GDN conv+Q/K norm, H4
@@ -775,20 +949,41 @@ impl FeatureFlags {
             g12_iu4_isa: parse_bool("HIPFIRE_G12_IU4_ISA").unwrap_or(true),
             pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(arch == "gfx1201"),
             a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
+            gfx11_a8_prefill: parse_bool("HIPFIRE_GFX11_A8_PREFILL").unwrap_or(false),
             a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
                 .unwrap_or(halo_hyper_default),
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
+            qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
+            qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
+            qwen4_gdn_qkv_bf16: parse_bool("HIPFIRE_QWEN4_GDN_QKV_BF16").unwrap_or(false),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
-                .unwrap_or(if halo_hyper_default { 3 } else if is_gfx1201 { 1 } else { 0 }),
+                .unwrap_or(if halo_hyper_default {
+                    3
+                } else if is_gfx1201 {
+                    1
+                } else {
+                    0
+                }),
             qwen4_hc_up_tile: parse_bool("HIPFIRE_QWEN4_HC_UP_TILE")
                 .unwrap_or(halo_hyper_default || is_gfx1201),
+            qwen4_hc_up_v2: parse_bool("HIPFIRE_QWEN4_HC_UP_V2").unwrap_or(is_gfx1201),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(exact_unit_default),
-            qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(halo_hyper_default),
-            qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(exact_unit_default),
+            qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD")
+                .unwrap_or(halo_hyper_default || is_gfx1201),
+            qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST")
+                .unwrap_or(exact_unit_default),
+            qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(arch == "gfx1151"),
+            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4").unwrap_or(arch == "gfx1151"),
+            qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
+                .unwrap_or(arch == "gfx1151"),
+            qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
+                .unwrap_or(arch == "gfx1151"),
+            qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
+                .unwrap_or(arch == "gfx1151"),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
@@ -873,6 +1068,18 @@ impl FeatureFlags {
                 Ok(_) => Some(false),
                 Err(()) => None,
             },
+            gfx12_mq6_fp8: parse_bool("HIPFIRE_GFX12_MQ6_FP8"),
+            gfx12_mq6_fp8_arm: match value("HIPFIRE_GFX12_MQ6_FP8_ARM")
+                .ok()
+                .map(|v| v.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("round") => crate::gemm_mq6_fp8::Mq6Fp8Arm::Round,
+                _ => crate::gemm_mq6_fp8::Mq6Fp8Arm::Split,
+            },
+            gfx12_mq6_fp8_db: value("HIPFIRE_GFX12_MQ6_FP8_DB").as_deref() == Ok("1"),
+            mq6_i8: parse_bool("HIPFIRE_MQ6_I8"),
+            mq6_i8_pm: parse_bool("HIPFIRE_MQ6_I8_PM"),
             calib_force_bf16: value("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"),
 
             // MMQ screening
@@ -934,7 +1141,7 @@ impl FeatureFlags {
 
             // Graph / capture / deterministic
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
-            graph_ar: value("HIPFIRE_AR_GRAPH").ok().as_deref() != Some("0"),
+            graph_ar: resolve_graph_ar(value("HIPFIRE_AR_GRAPH").ok().as_deref(), arch, windows),
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
@@ -942,7 +1149,8 @@ impl FeatureFlags {
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
             mq4v2_gateup_k5120: parse_bool("HIPFIRE_MQ4V2_GATEUP_K5120").unwrap_or(true),
-            gfx12_mq4v2_gateup_k5120: parse_bool("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120").unwrap_or(false),
+            gfx12_mq4v2_gateup_k5120: parse_bool("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120")
+                .unwrap_or(false),
             gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")
@@ -974,18 +1182,95 @@ impl FeatureFlags {
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
                 .unwrap_or(arch == "gfx1201"),
-            gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
-                .unwrap_or(arch == "gfx1201"),
-            gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET")
-                .unwrap_or(arch == "gfx1201"),
-            attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
-                .unwrap_or(arch == "gfx1201"),
-            attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2")
-                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL").unwrap_or(arch == "gfx1201"),
+            fa_prefill_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_FA_PREFILL_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPm,
+            ),
+            fa_prefill_pm_fp8_kv: crate::prefill_route_capabilities::enabled_fp8_kv(
+                value("HIPFIRE_FA_PREFILL_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPm,
+            ),
+            moe_iu4_wide_tiles: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_MOE_IU4_WIDE_TILES").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_MOE_IU4_WIDE_TILES is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::MoeIu4WideTiles,
+            ),
+            fa_prefill_pm_qprep: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_FA_PREFILL_PM_QPREP").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM_QPREP is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPmQprep,
+            ),
+            fa_prefill_pm_qprep_fp8_kv: crate::prefill_route_capabilities::enabled_fp8_kv(
+                value("HIPFIRE_FA_PREFILL_PM_QPREP").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM_QPREP is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPmQprep,
+            ),
+            moe_rotate_i4_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_MOE_ROTATE_I4_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_MOE_ROTATE_I4_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::MoeRotateI4Pm,
+            ),
+            prefill_iu4_producer_fused: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_PREFILL_IU4_PRODUCER_FUSED").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::PrefillIu4ProducerFused,
+            ),
+            prefill_iu4_c8_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_PREFILL_IU4_C8_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_PREFILL_IU4_C8_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::PrefillIu4C8Pm,
+            ),
+            gdn_chunk_prep_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_GDN_CHUNK_PREP_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_GDN_CHUNK_PREP_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::GdnChunkPrepPm,
+            ),
+            gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET").unwrap_or(arch == "gfx1201"),
+            attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT").unwrap_or(arch == "gfx1201"),
+            attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2").unwrap_or(arch == "gfx1201"),
             verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
             gfx1100_fa2_split_verify: parse_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY")
-                .unwrap_or(false),
+                .unwrap_or(arch == "gfx1100"),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
@@ -1103,6 +1388,12 @@ impl FeatureFlags {
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
+            qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref()
+                != Some("0"),
+            qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
+            qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
+            qwen4_qsa_code_check: value("HIPFIRE_QWEN4_QSA_CODE_CHECK").ok().as_deref()
+                == Some("1"),
         }
     }
 
@@ -1146,9 +1437,12 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
-    /// A8 replaces the gfx1201 FP8 projection route only when explicitly selected.
+    /// A8 projection route, only when explicitly selected: `HIPFIRE_A8_PREFILL`
+    /// on exact gfx1201 (replacing FP8), `kernel.gfx11_a8_prefill` on exact
+    /// gfx1100/gfx1151 (replacing IU4).
     pub fn a8_prefill_enabled(&self) -> bool {
-        self.a8_prefill && self.arch == "gfx1201"
+        (self.a8_prefill && self.arch == "gfx1201")
+            || (self.gfx11_a8_prefill && matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
     }
 
     /// H5: the chunked GDN convolution also writes the normalized Q/K. Exact
@@ -1164,12 +1458,48 @@ impl FeatureFlags {
         self.qwen4_gdn_q8_inline && self.arch == "gfx1151"
     }
 
+    /// Dense GDN gate + out-projection A8 producer fusion. Exact gfx1201 only.
+    pub fn qwen4_gdn_i8_fuse_enabled(&self) -> bool {
+        self.qwen4_gdn_i8_fuse && self.arch == "gfx1201"
+    }
+
+    /// Dense-GDN chain: the load-batched producer. Exact gfx1201 only.
+    pub fn qwen4_gdn_chain_fuse_enabled(&self) -> bool {
+        self.qwen4_gdn_chain_fuse && self.arch == "gfx1201"
+    }
+
+    /// Dense-GDN chain with the BF16 qkv projection (opt-in; needs the chain fusion on).
+    pub fn qwen4_gdn_qkv_bf16_enabled(&self) -> bool {
+        self.qwen4_gdn_qkv_bf16 && self.qwen4_gdn_chain_fuse_enabled()
+    }
+
     /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
     /// (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151: on unless `0`). Exact gfx1151 only; the
     /// runtime additionally requires the lane-step scope
     /// ([`crate::Gpu::lane_rows_pm_enabled`]).
     pub fn fn_lane_pm_rows_enabled(&self) -> bool {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
+    }
+
+    /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
+    /// on; `=0` is the kill switch for both the F32 split-K and the q8
+    /// split-KV routes). This gate covers the F32 split-K route: exact gfx1151
+    /// only; the runtime additionally requires F32 K/V, head_dim 256, an
+    /// admitted decode call (1..=`few_row_limit` rows) and an eager (unrecorded,
+    /// uncaptured) launch. The q8 split-KV route uses
+    /// [`Self::qwen4_qsa_decode_splitkv_q8_enabled`].
+    pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
+        self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
+    }
+
+    /// Q8 split-KV QSA decode attention: the same
+    /// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK` switch (default on; `=0` kills it),
+    /// acted on for exact gfx1151 and exact gfx1100. The runtime additionally
+    /// requires q8 K/V, head_dim 256, 24 query heads over 2 KV heads, an
+    /// admitted decode call (1..=`few_row_limit` rows) and an eager
+    /// (unrecorded, uncaptured) launch.
+    pub fn qwen4_qsa_decode_splitkv_q8_enabled(&self) -> bool {
+        self.qwen4_qsa_decode_splitk && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
     }
 
     /// H4: Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`, 0 = off):
@@ -1191,6 +1521,12 @@ impl FeatureFlags {
         self.qwen4_hc_up_tile && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    /// The persistent W-stationary HC up+mix entry (`HIPFIRE_QWEN4_HC_UP_V2`).
+    /// Exact gfx1201 only.
+    pub fn qwen4_hc_up_v2_enabled(&self) -> bool {
+        self.qwen4_hc_up_v2 && self.arch == "gfx1201"
+    }
+
     /// H8a: the MoE combine zero-initializes its own output instead of
     /// accumulating into a cleared tensor (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`).
     /// Exact gfx1151 / gfx1201.
@@ -1200,7 +1536,9 @@ impl FeatureFlags {
 
     /// Row fold of the MoE tail (`HIPFIRE_QWEN4_HC_ROW_FOLD`): exact gfx1151,
     /// on top of the `HIPFIRE_QWEN4_HC_FUSE` >= 3 shared-down route and the
-    /// zero-initialized combine.
+    /// zero-initialized combine.  gfx1201 has its own accessors
+    /// ([`Self::qwen4_hc_row_fold_moe_gfx1201_enabled`],
+    /// [`Self::qwen4_hc_row_fold_mixer_gfx1201_enabled`]); this one stays false there.
     pub fn qwen4_hc_row_fold_enabled(&self) -> bool {
         self.qwen4_hc_row_fold
             && self.arch == "gfx1151"
@@ -1208,10 +1546,51 @@ impl FeatureFlags {
             && self.qwen4_moe_combine_zinit_enabled()
     }
 
+    /// gfx1201 mixer-tail row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`, default on, `=0`
+    /// off): a paired HC write and the next HC read's norm/gate in one row
+    /// kernel.  Needs the read-side pairing (`HIPFIRE_QWEN4_HC_FUSE` >= 1) that
+    /// hands the write its gates; the out-projection epilogue levels (>= 2) are
+    /// NOT required and stay off by default on gfx1201.
+    pub fn qwen4_hc_row_fold_mixer_gfx1201_enabled(&self) -> bool {
+        self.qwen4_hc_row_fold && self.arch == "gfx1201" && self.qwen4_hc_fuse_level() >= 1
+    }
+
+    /// gfx1201 MoE-tail row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`, default on, `=0`
+    /// off): the mixer fold's conditions plus the zero-initialized combine
+    /// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`).
+    pub fn qwen4_hc_row_fold_moe_gfx1201_enabled(&self) -> bool {
+        self.qwen4_hc_row_fold_mixer_gfx1201_enabled() && self.qwen4_moe_combine_zinit_enabled()
+    }
+
     /// Wave-per-token E512/top-10 router for batched prefill
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151 / gfx1201.
+    /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`). Exact
+    /// gfx1151 only.
+    pub fn qwen4_gdn_lanes_enabled(&self) -> bool {
+        self.qwen4_gdn_lanes && self.arch == "gfx1151"
+    }
+
+    pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
+        self.qwen4_moe_down_r4 && self.arch == "gfx1151"
+    }
+
+    pub fn qwen4_shared_down_fuse_enabled(&self) -> bool {
+        self.qwen4_shared_down_fuse && self.arch == "gfx1151"
+    }
+
     pub fn qwen4_router_fast_enabled(&self) -> bool {
         self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+    }
+
+    pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
+        self.qwen4_decode_zba_x3 && self.arch == "gfx1151"
+    }
+
+    /// Exact single-token decode MoE head fusion (`HIPFIRE_QWEN4_DECODE_HEAD_FUSE`):
+    /// the BF16 router/selector rows and the Q8_0 shared gate/up pair in one
+    /// launch. Exact gfx1151 only.
+    pub fn qwen4_decode_head_fuse_enabled(&self) -> bool {
+        self.qwen4_decode_head_fuse && self.arch == "gfx1151"
     }
 
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
@@ -1224,8 +1603,7 @@ impl FeatureFlags {
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
     /// keep standalone `quantize_int4_mmq_ds128`.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.iu4_prefill.unwrap_or(true)
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+        self.iu4_prefill.unwrap_or(true) && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
     /// True only on exact gfx1201 with the opt-in set. The producer emits
     /// the shared `block_i4_128` recipe, so output is bit-identical to the
@@ -1348,14 +1726,24 @@ impl FeatureFlags {
             g12_iu4_isa: false,
             pm_decode: false,
             a8_prefill: false,
+            gfx11_a8_prefill: false,
             a8_fused_prod: false,
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
+            qwen4_gdn_i8_fuse: false,
+            qwen4_gdn_chain_fuse: false,
+            qwen4_gdn_qkv_bf16: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
+            qwen4_hc_up_v2: false,
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
+            qwen4_gdn_lanes: false,
+            qwen4_moe_down_r4: false,
+            qwen4_shared_down_fuse: false,
+            qwen4_decode_zba_x3: false,
+            qwen4_decode_head_fuse: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
@@ -1397,6 +1785,11 @@ impl FeatureFlags {
             qwen4_mq6_x4_gfx1201: None,
             qwen4_mq6_x4_tile: None,
             qwen4_mq6_x4_regions: None,
+            gfx12_mq6_fp8: None,
+            gfx12_mq6_fp8_arm: crate::gemm_mq6_fp8::Mq6Fp8Arm::Split,
+            gfx12_mq6_fp8_db: false,
+            mq6_i8: None,
+            mq6_i8_pm: None,
             calib_force_bf16: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
@@ -1463,6 +1856,15 @@ impl FeatureFlags {
             cb_verify_iu4: None,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
+            fa_prefill_pm: false,
+            fa_prefill_pm_fp8_kv: false,
+            moe_iu4_wide_tiles: false,
+            fa_prefill_pm_qprep: false,
+            fa_prefill_pm_qprep_fp8_kv: false,
+            moe_rotate_i4_pm: false,
+            prefill_iu4_producer_fused: false,
+            prefill_iu4_c8_pm: false,
+            gdn_chunk_prep_pm: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
             attn_qresident_v2: false,
@@ -1524,6 +1926,10 @@ impl FeatureFlags {
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
+            qwen4_qsa_decode_splitk: false,
+            qwen4_qsa_extent_check: false,
+            qwen4_qsa_extent_sync: false,
+            qwen4_qsa_code_check: false,
         }
     }
 }
@@ -1534,25 +1940,225 @@ mod tests {
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
-    fn gfx12_mq4v2_gateup_k5120_opt_in_roundtrip_and_shape() {
+    fn qsa_extent_check_parses_only_exact_developer_modes() {
+        for (value, check, sync) in [
+            (None, false, false),
+            (Some("1"), true, false),
+            (Some("2"), true, true),
+            (Some("0"), false, false),
+            (Some("3"), false, false),
+            (Some("true"), false, false),
+            (Some("01"), false, false),
+            (Some(" 2"), false, false),
+            (Some(""), false, false),
+        ] {
+            let flags = FeatureFlags::from_lookup("gfx1151", |name| {
+                if name == "HIPFIRE_QWEN4_QSA_EXTENT_CHECK" {
+                    value.map(str::to_owned).ok_or(())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(flags.qwen4_qsa_extent_check, check, "{value:?}");
+            assert_eq!(flags.qwen4_qsa_extent_sync, sync, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn qsa_code_check_parses_only_exact_developer_mode() {
+        for (value, enabled) in [
+            (None, false),
+            (Some("1"), true),
+            (Some("2"), false),
+            (Some("0"), false),
+            (Some("true"), false),
+            (Some("01"), false),
+            (Some(" 1"), false),
+            (Some("1 "), false),
+            (Some(""), false),
+        ] {
+            let flags = FeatureFlags::from_lookup("gfx1151", |name| {
+                if name == "HIPFIRE_QWEN4_QSA_CODE_CHECK" {
+                    value.map(str::to_owned).ok_or(())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(flags.qwen4_qsa_code_check, enabled, "{value:?}");
+        }
+    }
+
+    const GRAPH_AR_ARCHES: [&str; 9] = [
+        "gfx906", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        "gfx942",
+    ];
+
+    /// #655: the built-in `experimental.graph.ar` default is off for Windows
+    /// exact gfx1100 only; Linux gfx1100 and every other arch/platform stay on.
+    #[test]
+    fn graph_ar_default_is_off_only_on_windows_exact_gfx1100() {
+        for arch in GRAPH_AR_ARCHES {
+            for windows in [false, true] {
+                assert_eq!(
+                    graph_ar_default(arch, windows),
+                    !(windows && arch == "gfx1100"),
+                    "{arch} windows={windows}"
+                );
+            }
+        }
+        // Exact match: a different gfx11 part or a suffixed spelling is not gfx1100.
+        assert!(graph_ar_default("gfx1101", true));
+        assert!(graph_ar_default("gfx1100:xnack-", true));
+        assert!(graph_ar_default("", true));
+    }
+
+    /// An explicit value always wins over the Windows gfx1100 default, in both
+    /// directions and on every platform; only the exact value `0` is off.
+    #[test]
+    fn graph_ar_explicit_value_overrides_the_windows_gfx1100_default() {
+        for arch in GRAPH_AR_ARCHES {
+            for windows in [false, true] {
+                assert!(
+                    !resolve_graph_ar(Some("0"), arch, windows),
+                    "{arch} windows={windows}: 0"
+                );
+                for raw in ["1", "true", "on", ""] {
+                    assert!(
+                        resolve_graph_ar(Some(raw), arch, windows),
+                        "{arch} windows={windows}: {raw:?}"
+                    );
+                }
+                assert_eq!(
+                    resolve_graph_ar(None, arch, windows),
+                    graph_ar_default(arch, windows),
+                    "{arch} windows={windows}: unset"
+                );
+            }
+        }
+    }
+
+    /// The full `FeatureFlags` lookup path honours the platform matrix and the
+    /// `HIPFIRE_AR_GRAPH` override, simulating Windows on any build host.
+    #[test]
+    fn graph_ar_flag_platform_matrix_through_feature_flags() {
+        for arch in GRAPH_AR_ARCHES {
+            for windows in [false, true] {
+                let flags = |raw: Option<&str>| {
+                    FeatureFlags::from_lookup_on_host(arch, windows, |name| match raw {
+                        Some(v) if name == "HIPFIRE_AR_GRAPH" => Ok(v.into()),
+                        _ => Err(()),
+                    })
+                };
+                let default_on = !(windows && arch == "gfx1100");
+                assert_eq!(
+                    flags(None).graph_ar,
+                    default_on,
+                    "{arch} windows={windows}: unset"
+                );
+                assert!(!flags(Some("0")).graph_ar, "{arch} windows={windows}: 0");
+                assert!(flags(Some("1")).graph_ar, "{arch} windows={windows}: 1");
+                // The sibling graph switches are not touched by the platform.
+                assert!(flags(None).graph_moe, "{arch} windows={windows}: graph_moe");
+                assert_eq!(
+                    flags(None).graph_forward,
+                    None,
+                    "{arch} windows={windows}: graph_forward"
+                );
+            }
+        }
+    }
+
+    /// Through the typed process config: the built-in default is carried as
+    /// absence (so the arch/platform default applies), and an explicit
+    /// `experimental.graph.ar` — by TOML key or legacy key — wins on Windows gfx1100.
+    #[test]
+    fn graph_ar_process_config_default_is_absence_and_explicit_wins() {
         let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
-        assert!(!FeatureFlags::from_process_config("gfx1201", &defaults)
-            .mq4v2_gateup_k5120_enabled(17408, 17408, 5120));
-        for key in ["kernel.gfx12_mq4v2_gateup_k5120", "gfx12_mq4v2_gateup_k5120"] {
+        assert_eq!(defaults.legacy_value("HIPFIRE_AR_GRAPH"), None);
+        let from = |arch: &str, windows: bool, config: &ProcessConfig| {
+            FeatureFlags::from_lookup_on_host(arch, windows, |name| {
+                config.legacy_value(name).ok_or(())
+            })
+            .graph_ar
+        };
+        assert!(!from("gfx1100", true, &defaults));
+        assert!(from("gfx1100", false, &defaults));
+        assert!(from("gfx1201", true, &defaults));
+        // The host build agrees with the simulated platform.
+        assert_eq!(
+            FeatureFlags::from_process_config("gfx1100", &defaults).graph_ar,
+            !cfg!(windows)
+        );
+        for key in ["experimental.graph.ar", "graph_ar"] {
             for (value, enabled) in [("true", true), ("false", false)] {
                 let mut layer = ConfigLayer::default();
                 layer.set_cli(key, value).unwrap();
                 let resolved = resolve([NamedLayer {
-                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    source: ConfigSource::GlobalUser {
+                        path: "config.toml".into(),
+                    },
                     layer,
-                }]).unwrap();
+                }])
+                .unwrap();
                 let config = ProcessConfig::from_resolved(&resolved).unwrap();
-                let config: ProcessConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
-                assert_eq!(config.legacy_value("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120"), Some(if enabled { "1" } else { "0" }.to_string()));
-                for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx906"] {
+                let config: ProcessConfig =
+                    serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert_eq!(
+                    config.legacy_value("HIPFIRE_AR_GRAPH"),
+                    Some(if enabled { "1" } else { "0" }.to_string())
+                );
+                for arch in GRAPH_AR_ARCHES {
+                    for windows in [false, true] {
+                        assert_eq!(
+                            from(arch, windows, &config),
+                            enabled,
+                            "{key}={value} {arch} windows={windows}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gfx12_mq4v2_gateup_k5120_opt_in_roundtrip_and_shape() {
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert!(!FeatureFlags::from_process_config("gfx1201", &defaults)
+            .mq4v2_gateup_k5120_enabled(17408, 17408, 5120));
+        for key in [
+            "kernel.gfx12_mq4v2_gateup_k5120",
+            "gfx12_mq4v2_gateup_k5120",
+        ] {
+            for (value, enabled) in [("true", true), ("false", false)] {
+                let mut layer = ConfigLayer::default();
+                layer.set_cli(key, value).unwrap();
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser {
+                        path: "config.toml".into(),
+                    },
+                    layer,
+                }])
+                .unwrap();
+                let config = ProcessConfig::from_resolved(&resolved).unwrap();
+                let config: ProcessConfig =
+                    serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert_eq!(
+                    config.legacy_value("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120"),
+                    Some(if enabled { "1" } else { "0" }.to_string())
+                );
+                for arch in [
+                    "gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx906",
+                ] {
                     let flags = FeatureFlags::from_process_config(arch, &config);
-                    assert_eq!(flags.mq4v2_gateup_k5120_enabled(17408, 17408, 5120), arch == "gfx1100" || (arch == "gfx1201" && enabled));
-                    for shape in [(17408, 17408, 2816), (17407, 17408, 5120), (17408, 17407, 5120)] {
+                    assert_eq!(
+                        flags.mq4v2_gateup_k5120_enabled(17408, 17408, 5120),
+                        arch == "gfx1100" || (arch == "gfx1201" && enabled)
+                    );
+                    for shape in [
+                        (17408, 17408, 2816),
+                        (17407, 17408, 5120),
+                        (17408, 17407, 5120),
+                    ] {
                         assert!(!flags.mq4v2_gateup_k5120_enabled(shape.0, shape.1, shape.2));
                     }
                 }
@@ -1594,25 +2200,94 @@ mod tests {
     /// kill switch, and no other arch admits them whatever the variable says.
     #[test]
     fn fn_lane_pm_rows_defaults_on_exact_gfx1151_and_zero_kills() {
-        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201",
+        ] {
             let flags = |raw: Option<&str>| {
                 FeatureFlags::from_lookup(arch, |name| match raw {
                     Some(v) if name == "HIPFIRE_FN_LANE_PM_ROWS" => Ok(v.into()),
                     _ => Err(()),
                 })
             };
-            assert_eq!(flags(None).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: unset");
+            assert_eq!(
+                flags(None).fn_lane_pm_rows_enabled(),
+                arch == "gfx1151",
+                "{arch}: unset"
+            );
             assert!(!flags(Some("0")).fn_lane_pm_rows_enabled(), "{arch}: 0");
-            assert_eq!(flags(Some("1")).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: 1");
+            assert_eq!(
+                flags(Some("1")).fn_lane_pm_rows_enabled(),
+                arch == "gfx1151",
+                "{arch}: 1"
+            );
         }
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
+    }
+
+    /// The QSA split decode knob is default on and only the exact value `0`
+    /// turns it off; the F32 split-K arch gate admits gfx1151 alone and the
+    /// q8 split-KV arch gate admits gfx1151 and gfx1100.
+    #[test]
+    fn qwen4_qsa_decode_splitk_defaults_on_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_QWEN4_QSA_DECODE_SPLITK" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let gfx1151 = arch == "gfx1151";
+            let q8_arch = arch == "gfx1151" || arch == "gfx1100";
+            assert!(flags(None).qwen4_qsa_decode_splitk, "{arch}: unset");
+            assert_eq!(
+                flags(None).qwen4_qsa_decode_splitk_enabled(),
+                gfx1151,
+                "{arch}: unset enabled"
+            );
+            assert_eq!(
+                flags(None).qwen4_qsa_decode_splitkv_q8_enabled(),
+                q8_arch,
+                "{arch}: unset q8 enabled"
+            );
+            assert!(!flags(Some("0")).qwen4_qsa_decode_splitk, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).qwen4_qsa_decode_splitk_enabled(),
+                "{arch}: 0 enabled"
+            );
+            assert!(
+                !flags(Some("0")).qwen4_qsa_decode_splitkv_q8_enabled(),
+                "{arch}: 0 q8 enabled"
+            );
+            for raw in ["1", "", "true", "TRUE", "on", "yes", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).qwen4_qsa_decode_splitk, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).qwen4_qsa_decode_splitk_enabled(),
+                    gfx1151,
+                    "{arch}: {raw:?} enabled"
+                );
+                assert_eq!(
+                    flags(Some(raw)).qwen4_qsa_decode_splitkv_q8_enabled(),
+                    q8_arch,
+                    "{arch}: {raw:?} q8 enabled"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag (dn_snapshot_flip, fn_gdn_dense_scan, ...).
+        assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
+        assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitkv_q8_enabled());
+        assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_decode_splitkv_q8_enabled());
     }
 
     #[test]
     fn mq4v2_gateup_k5120_is_default_on_exact_arch_and_shape() {
         for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx906"] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.mq4v2_gateup_k5120_enabled(17408, 17408, 5120), arch == "gfx1100");
+            assert_eq!(
+                unset.mq4v2_gateup_k5120_enabled(17408, 17408, 5120),
+                arch == "gfx1100"
+            );
             let off = FeatureFlags::from_lookup(arch, |name| {
                 if name == "HIPFIRE_MQ4V2_GATEUP_K5120" {
                     Ok("0".into())
@@ -1640,6 +2315,55 @@ mod tests {
                 assert!(!on.mq4v2_gateup_k5120_enabled(gate_m, up_m, k));
             }
         }
+    }
+
+    #[test]
+    fn a8_prefill_is_opt_in_and_scoped_per_arch() {
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        for arch in [
+            "gfx906", "gfx908", "gfx90a", "gfx942", "gfx1010", "gfx1030", "gfx1100", "gfx1101",
+            "gfx1102", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            // Default is false on every arch, through both resolution paths.
+            let from_defaults = FeatureFlags::from_process_config(arch, &defaults);
+            assert!(!from_defaults.gfx11_a8_prefill, "{arch}");
+            assert!(!from_defaults.a8_prefill_enabled(), "{arch}");
+            assert!(
+                !FeatureFlags::from_lookup(arch, |_| Err(())).a8_prefill_enabled(),
+                "{arch}"
+            );
+            assert!(!FeatureFlags::for_test(arch).a8_prefill_enabled(), "{arch}");
+            let only =
+                |env: &'static str| {
+                    FeatureFlags::from_lookup(arch, move |name| {
+                        if name == env {
+                            Ok("1".into())
+                        } else {
+                            Err(())
+                        }
+                    })
+                };
+            assert_eq!(
+                only("HIPFIRE_GFX11_A8_PREFILL").a8_prefill_enabled(),
+                matches!(arch, "gfx1100" | "gfx1151")
+            );
+            assert_eq!(
+                only("HIPFIRE_A8_PREFILL").a8_prefill_enabled(),
+                arch == "gfx1201"
+            );
+        }
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_a8_prefill", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert!(FeatureFlags::from_process_config("gfx1151", &process).a8_prefill_enabled());
+        assert!(!FeatureFlags::from_process_config("gfx1201", &process).a8_prefill_enabled());
     }
 
     #[test]
@@ -1698,12 +2422,16 @@ mod tests {
             move |name: &str| -> std::result::Result<String, ()> {
                 match name {
                     "HIPFIRE_QWEN4_HC_FUSE" => Ok(fuse.into()),
-                    "HIPFIRE_QWEN4_HC_UP_TILE" | "HIPFIRE_QWEN4_MOE_COMBINE_ZINIT" => Ok(rest.into()),
+                    "HIPFIRE_QWEN4_HC_UP_TILE" | "HIPFIRE_QWEN4_MOE_COMBINE_ZINIT" => {
+                        Ok(rest.into())
+                    }
                     _ => Err(()),
                 }
             }
         };
-        for arch in ["gfx906", "gfx1030", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+        for arch in [
+            "gfx906", "gfx1030", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
             let halo = arch == "gfx1151";
             let exact = matches!(arch, "gfx1151" | "gfx1201");
             let default_level = match arch {
@@ -1720,7 +2448,11 @@ mod tests {
             assert_eq!(off.qwen4_hc_fuse_level(), 0, "{arch}");
             assert!(!off.qwen4_hc_up_tile_enabled() && !off.qwen4_moe_combine_zinit_enabled());
             let on = FeatureFlags::from_lookup(arch, with("2", "1"));
-            assert_eq!(on.qwen4_hc_fuse_level(), if exact { 2 } else { 0 }, "{arch}");
+            assert_eq!(
+                on.qwen4_hc_fuse_level(),
+                if exact { 2 } else { 0 },
+                "{arch}"
+            );
             assert_eq!(on.qwen4_hc_up_tile_enabled(), exact, "{arch}");
             assert_eq!(on.qwen4_moe_combine_zinit_enabled(), exact, "{arch}");
             assert_eq!(
@@ -1734,15 +2466,93 @@ mod tests {
         }
     }
 
+    /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the gfx1151 accessor is unchanged (gfx1151
+    /// only, needs level 3 + zinit); gfx1201 takes its own two accessors, default
+    /// on at the gfx1201 default level 1, independent of levels >= 2/3, killed by
+    /// `=0`; the mixer fold needs the read-side pairing (level >= 1), the MoE fold
+    /// also the zero-initialized combine.
+    #[test]
+    fn qwen4_hc_row_fold_flag_gfx1151_unchanged_gfx1201_default_on() {
+        let with = |entries: &'static [(&'static str, &'static str)]| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                entries
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+                    .ok_or(())
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1030", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let (halo, rdna4) = (arch == "gfx1151", arch == "gfx1201");
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_hc_row_fold_enabled(), halo, "{arch}");
+            assert_eq!(
+                unset.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            assert_eq!(
+                unset.qwen4_hc_row_fold_moe_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            let killed =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_ROW_FOLD", "0")]));
+            assert!(!killed.qwen4_hc_row_fold_enabled(), "{arch}");
+            assert!(!killed.qwen4_hc_row_fold_mixer_gfx1201_enabled(), "{arch}");
+            assert!(!killed.qwen4_hc_row_fold_moe_gfx1201_enabled(), "{arch}");
+            let no_pairing =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_FUSE", "0")]));
+            assert!(
+                !no_pairing.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                "{arch}"
+            );
+            assert!(
+                !no_pairing.qwen4_hc_row_fold_moe_gfx1201_enabled(),
+                "{arch}"
+            );
+            assert!(!no_pairing.qwen4_hc_row_fold_enabled(), "{arch}");
+            let no_zinit =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT", "0")]));
+            assert_eq!(
+                no_zinit.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            assert!(!no_zinit.qwen4_hc_row_fold_moe_gfx1201_enabled(), "{arch}");
+            assert!(!no_zinit.qwen4_hc_row_fold_enabled(), "{arch}");
+            // An explicit `=1` enables nothing off gfx1151 / gfx1201.
+            let forced =
+                FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_ROW_FOLD", "1")]));
+            assert_eq!(
+                forced.qwen4_hc_row_fold_mixer_gfx1201_enabled(),
+                rdna4,
+                "{arch}"
+            );
+            assert_eq!(forced.qwen4_hc_row_fold_enabled(), halo, "{arch}");
+            // Level 3 on gfx1201 does not change which fold runs.
+            let level3 = FeatureFlags::from_lookup(arch, with(&[("HIPFIRE_QWEN4_HC_FUSE", "3")]));
+            assert!(!level3.qwen4_hc_row_fold_enabled() || halo, "{arch}");
+        }
+    }
+
     /// The fused PLE tail defaults on for exact gfx1151 / gfx1201; `0` turns it off.
     #[test]
     fn qwen4_ple_fuse_flag_defaults_on_exact_gfx1151_gfx1201() {
         let with = |value: &'static str| {
             move |name: &str| -> std::result::Result<String, ()> {
-                if name == "HIPFIRE_QWEN4_PLE_FUSE" { Ok(value.into()) } else { Err(()) }
+                if name == "HIPFIRE_QWEN4_PLE_FUSE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
             }
         };
-        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
             let exact = matches!(arch, "gfx1151" | "gfx1201");
             assert_eq!(
                 FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_ple_fuse_enabled(),
@@ -1761,18 +2571,77 @@ mod tests {
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.
     #[test]
     fn qwen4_router_fast_defaults_on_exact_gfx1151_gfx1201() {
-        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
             let exact = matches!(arch, "gfx1151" | "gfx1201");
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
             assert_eq!(unset.qwen4_router_fast_enabled(), exact, "{arch}");
             let off = FeatureFlags::from_lookup(arch, |n| {
-                if n == "HIPFIRE_QWEN4_ROUTER_FAST" { Ok("0".into()) } else { Err(()) }
+                if n == "HIPFIRE_QWEN4_ROUTER_FAST" {
+                    Ok("0".into())
+                } else {
+                    Err(())
+                }
             });
             assert!(!off.qwen4_router_fast_enabled(), "{arch}");
             let on = FeatureFlags::from_lookup(arch, |n| {
-                if n == "HIPFIRE_QWEN4_ROUTER_FAST" { Ok("1".into()) } else { Err(()) }
+                if n == "HIPFIRE_QWEN4_ROUTER_FAST" {
+                    Ok("1".into())
+                } else {
+                    Err(())
+                }
             });
             assert_eq!(on.qwen4_router_fast_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The decode MoE head fusion defaults on for exact gfx1151 only; `0` turns it off.
+    #[test]
+    fn qwen4_decode_head_fuse_defaults_on_exact_gfx1151() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1151";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_decode_head_fuse_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, |n| {
+                if n == "HIPFIRE_QWEN4_DECODE_HEAD_FUSE" {
+                    Ok("0".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert!(!off.qwen4_decode_head_fuse_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, |n| {
+                if n == "HIPFIRE_QWEN4_DECODE_HEAD_FUSE" {
+                    Ok("1".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(on.qwen4_decode_head_fuse_enabled(), exact, "{arch}");
+        }
+    }
+
+    #[test]
+    fn qwen4_decode_zba_x3_defaults_on_exact_gfx1151() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1151";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_decode_zba_x3_enabled(), exact, "{arch}");
+            for (value, expected) in [("0", false), ("1", exact)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_QWEN4_DECODE_ZBA_X3" {
+                        Ok(value.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.qwen4_decode_zba_x3_enabled(), expected, "{arch}");
+            }
         }
     }
 
@@ -1805,17 +2674,137 @@ mod tests {
             "gfx1200", "gfx1201",
         ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.qwen4_gdn_conv_qknorm_enabled(), arch == "gfx1151", "{arch}: unset");
+            assert_eq!(
+                unset.qwen4_gdn_conv_qknorm_enabled(),
+                arch == "gfx1151",
+                "{arch}: unset"
+            );
             assert!(!unset.qwen4_gdn_q8_inline_enabled(), "{arch}: unset");
             let zero = FeatureFlags::from_lookup(arch, off);
             assert!(!zero.qwen4_gdn_conv_qknorm_enabled(), "{arch}: 0");
             assert!(!zero.qwen4_gdn_q8_inline_enabled(), "{arch}: 0");
             let one = FeatureFlags::from_lookup(arch, on);
-            assert_eq!(one.qwen4_gdn_conv_qknorm_enabled(), arch == "gfx1151", "{arch}: 1");
-            assert_eq!(one.qwen4_gdn_q8_inline_enabled(), arch == "gfx1151", "{arch}: 1");
+            assert_eq!(
+                one.qwen4_gdn_conv_qknorm_enabled(),
+                arch == "gfx1151",
+                "{arch}: 1"
+            );
+            assert_eq!(
+                one.qwen4_gdn_q8_inline_enabled(),
+                arch == "gfx1151",
+                "{arch}: 1"
+            );
         }
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_gdn_conv_qknorm_enabled());
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_gdn_q8_inline_enabled());
+    }
+
+    /// The dense-GDN gate + out-projection A8 producer fusion: default on for
+    /// exact gfx1201 only, `0` is the kill switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_gdn_i8_fuse_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_GDN_I8_FUSE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_gdn_i8_fuse_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_gdn_i8_fuse_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_i8_fuse_enabled());
+    }
+
+    /// The persistent HC up+mix entry: default on for exact gfx1201 only, `0` is
+    /// the kill switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_hc_up_v2_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_HC_UP_V2" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_hc_up_v2_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_hc_up_v2_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_hc_up_v2_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_up_v2_enabled());
+    }
+
+    /// The dense-GDN chain fusion: default on for exact gfx1201 only, `0` is the kill
+    /// switch, `1` never reaches another arch.
+    #[test]
+    fn qwen4_gdn_chain_fuse_defaults_on_exact_gfx1201_with_kill_switch() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_GDN_CHAIN_FUSE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1152",
+            "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_gdn_chain_fuse_enabled(), exact, "{arch}: unset");
+            let zero = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!zero.qwen4_gdn_chain_fuse_enabled(), "{arch}: 0");
+            let one = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(one.qwen4_gdn_chain_fuse_enabled(), exact, "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_chain_fuse_enabled());
+    }
+
+    /// The BF16 qkv store is opt-in and needs the chain fusion: never on by default, never
+    /// with `HIPFIRE_QWEN4_GDN_CHAIN_FUSE=0`, never off gfx1201.
+    #[test]
+    fn qwen4_gdn_qkv_bf16_is_opt_in_behind_the_chain_fusion() {
+        let with = |chain: Option<&'static str>, qkv: Option<&'static str>| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                match (name, chain, qkv) {
+                    ("HIPFIRE_QWEN4_GDN_CHAIN_FUSE", Some(v), _) => Ok(v.into()),
+                    ("HIPFIRE_QWEN4_GDN_QKV_BF16", _, Some(v)) => Ok(v.into()),
+                    _ => Err(()),
+                }
+            }
+        };
+        let on = |arch: &str, chain, qkv| {
+            FeatureFlags::from_lookup(arch, with(chain, qkv)).qwen4_gdn_qkv_bf16_enabled()
+        };
+        assert!(!on("gfx1201", None, None));
+        assert!(on("gfx1201", None, Some("1")));
+        assert!(!on("gfx1201", Some("0"), Some("1")));
+        assert!(!on("gfx1201", None, Some("0")));
+        assert!(!on("gfx1151", None, Some("1")));
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_qkv_bf16_enabled());
     }
 
     #[test]
@@ -1928,6 +2917,89 @@ mod tests {
     }
 
     #[test]
+    fn gfx12_mq6_fp8_is_tri_state_and_arm_defaults_split() {
+        use crate::gemm_mq6_fp8::Mq6Fp8Arm;
+        let flags = |fp8: Option<&str>, arm: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, fp8, arm) {
+                ("HIPFIRE_GFX12_MQ6_FP8", Some(v), _) => Ok(v.to_owned()),
+                ("HIPFIRE_GFX12_MQ6_FP8_ARM", _, Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        assert_eq!(flags(None, None).gfx12_mq6_fp8, None);
+        assert_eq!(flags(Some("1"), None).gfx12_mq6_fp8, Some(true));
+        assert_eq!(flags(Some("0"), None).gfx12_mq6_fp8, Some(false));
+        assert_eq!(flags(Some("auto"), None).gfx12_mq6_fp8, None);
+        assert_eq!(flags(None, None).gfx12_mq6_fp8_arm, Mq6Fp8Arm::Split);
+        assert_eq!(
+            flags(None, Some("split")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Split
+        );
+        assert_eq!(
+            flags(None, Some("round")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Round
+        );
+        assert_eq!(
+            flags(None, Some("ROUND")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Round
+        );
+        assert_eq!(
+            flags(None, Some("bogus")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Split
+        );
+        // Arch-independent parse; the unit-test constructor stays auto + split.
+        let t = FeatureFlags::for_test("gfx1201");
+        assert_eq!(t.gfx12_mq6_fp8, None);
+        assert_eq!(t.gfx12_mq6_fp8_arm, Mq6Fp8Arm::Split);
+        // The DB variant flag: `1` on, anything else off; test constructor off.
+        let db = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_GFX12_MQ6_FP8_DB", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+            .gfx12_mq6_fp8_db
+        };
+        assert!(!db(None));
+        assert!(db(Some("1")));
+        assert!(!db(Some("0")));
+        assert!(!db(Some("bogus")));
+        assert!(!t.gfx12_mq6_fp8_db);
+    }
+
+    #[test]
+    fn mq6_i8_is_tri_state() {
+        let flag = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_MQ6_I8", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+            .mq6_i8
+        };
+        assert_eq!(flag(None), None);
+        assert_eq!(flag(Some("1")), Some(true));
+        assert_eq!(flag(Some("0")), Some(false));
+        assert_eq!(flag(Some("auto")), None);
+        assert_eq!(FeatureFlags::for_test("gfx1201").mq6_i8, None);
+        assert_eq!(FeatureFlags::for_test("gfx1151").mq6_i8, None);
+    }
+
+    #[test]
+    fn mq6_i8_pm_is_tri_state_and_unset_is_the_default() {
+        let flag = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_MQ6_I8_PM", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+            .mq6_i8_pm
+        };
+        assert_eq!(flag(None), None);
+        assert_eq!(flag(Some("1")), Some(true));
+        assert_eq!(flag(Some("0")), Some(false));
+        assert_eq!(flag(Some("auto")), None);
+        assert_eq!(FeatureFlags::for_test("gfx1201").mq6_i8_pm, None);
+    }
+
+    #[test]
     fn cb_verify_iu4_load_decision() {
         let decide = |iu4: Option<bool>, fp8: bool, block: usize| {
             let mut f = FeatureFlags::for_test("gfx1201");
@@ -2030,12 +3102,366 @@ mod tests {
     }
 
     #[test]
-    fn gfx1100_split_verify_is_default_off_and_opt_in() {
+    fn fa_prefill_pm_defaults_to_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.fa_prefill_pm,
+                qualified(arch, PrefillRoute::FaPrefillPm)
+            );
+            assert_eq!(unset.fa_prefill_pm, arch == "gfx1201");
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm);
+            assert_eq!(
+                unset.fa_prefill_pm_fp8_kv,
+                arch == "gfx1201",
+                "{arch}: fp8 default"
+            );
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_fp8_kv);
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_FA_PREFILL_PM" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.fa_prefill_pm, want, "{arch}: {raw}");
+                assert_eq!(flags.fa_prefill_pm_fp8_kv, want, "{arch}: fp8 {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn moe_iu4_wide_tiles_defaults_to_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
+        const ROUTE: PrefillRoute = PrefillRoute::MoeIu4WideTiles;
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.moe_iu4_wide_tiles, qualified(arch, ROUTE), "{arch}");
+            assert_eq!(unset.moe_iu4_wide_tiles, arch == "gfx1201", "{arch}");
+            assert!(!FeatureFlags::for_test(arch).moe_iu4_wide_tiles, "{arch}");
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_MOE_IU4_WIDE_TILES" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                // The flag is the typed request only; raw inventory is applied at selection.
+                assert_eq!(flags.moe_iu4_wide_tiles, want, "{arch}: {raw}");
+            }
+            // No other flag moves with it: an explicit PM `1` leaves the wide-tile default
+            // at its own qualification.
+            let only_other = FeatureFlags::from_lookup(arch, |name| {
+                if name == "HIPFIRE_FA_PREFILL_PM" {
+                    Ok("1".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(only_other.moe_iu4_wide_tiles, arch == "gfx1201", "{arch}");
+            assert!(only_other.fa_prefill_pm, "{arch}");
+        }
+        assert!(raw_inventory("gfx1201", ROUTE) && !raw_inventory("gfx1151", ROUTE));
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_MOE_IU4_WIDE_TILES is not a boolean")]
+    fn moe_iu4_wide_tiles_rejects_a_non_boolean_spelling() {
+        let _ = FeatureFlags::from_lookup("gfx1201", |name| {
+            if name == "HIPFIRE_MOE_IU4_WIDE_TILES" {
+                Ok("on".into())
+            } else {
+                Err(())
+            }
+        });
+    }
+
+    #[test]
+    fn moe_iu4_wide_tiles_selection_is_independent_of_the_combine_v2_and_multirow_flags() {
+        use crate::gemm::qwen4_moe_sym_nt8_pair;
+        // A3B top-8, 256 experts, 8192 rows: past the wide-tile shape floor.
+        const SLOTS: usize = 8192 * 8;
+        const EXPERTS: usize = 256;
+        let with = |wide: Option<&'static str>, combine: Option<&'static str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match name {
+                "HIPFIRE_MOE_IU4_WIDE_TILES" => wide.map(String::from).ok_or(()),
+                "HIPFIRE_MOE_COMBINE_V2" => combine.map(String::from).ok_or(()),
+                "HIPFIRE_MOE_ROUTER_TOPK_MULTIROW" => combine.map(String::from).ok_or(()),
+                _ => Err(()),
+            })
+        };
+        let pair = |flags: &FeatureFlags, host: bool| {
+            qwen4_moe_sym_nt8_pair("gfx1201", host, flags.moe_iu4_wide_tiles, SLOTS, EXPERTS)
+        };
+        // The F1 / F4 variables are read by `hipfire-dispatch`, never by `FeatureFlags`; setting
+        // them in the lookup proves nothing here reads them for the wide-tile flag.
+        for combine in [None, Some("0"), Some("1")] {
+            // F2 killed: resident stays the NT4 incumbent whatever F1 / F4 say.
+            let ctx = format!("wide=Some(\"0\") combine={combine:?}");
+            let flags = with(Some("0"), combine);
+            assert!(!flags.moe_iu4_wide_tiles, "{ctx}");
+            assert_eq!(pair(&flags, false), [false, false], "{ctx}");
+            // Host-mapped keeps its NT8 pair whatever any of the flags say.
+            assert_eq!(pair(&flags, true), [true, true], "{ctx}");
+            // F2 unset (qualified on exact gfx1201) or explicit 1: resident gate/up widens,
+            // down stays NT4, host-mapped unchanged.
+            for wide in [None, Some("1")] {
+                let ctx = format!("wide={wide:?} combine={combine:?}");
+                let flags = with(wide, combine);
+                assert!(flags.moe_iu4_wide_tiles, "{ctx}");
+                assert_eq!(pair(&flags, false), [true, false], "{ctx}");
+                assert_eq!(pair(&flags, true), [true, true], "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_qprep_defaults_to_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.fa_prefill_pm_qprep,
+                qualified(arch, PrefillRoute::FaPrefillPmQprep)
+            );
+            assert_eq!(unset.fa_prefill_pm_qprep, arch == "gfx1201");
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep);
+            assert_eq!(
+                unset.fa_prefill_pm_qprep_fp8_kv,
+                arch == "gfx1201",
+                "{arch}: fp8 default"
+            );
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep_fp8_kv);
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_FA_PREFILL_PM_QPREP" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.fa_prefill_pm_qprep, want, "{arch}: {raw}");
+                assert_eq!(flags.fa_prefill_pm_qprep_fp8_kv, want, "{arch}: fp8 {raw}");
+                // Independent of the PM attention flag: the PM flag stays the resolved
+                // qualification (on only on exact gfx1201), whatever the Q-prep flag says.
+                assert_eq!(
+                    flags.fa_prefill_pm,
+                    qualified(arch, PrefillRoute::FaPrefillPm),
+                    "{arch}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_qprep_resolves_beside_the_resolved_pm_flag() {
+        let with = |arch: &str, pm: Option<&'static str>, qprep: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match name {
+                "HIPFIRE_FA_PREFILL_PM" => pm.map(String::from).ok_or(()),
+                "HIPFIRE_FA_PREFILL_PM_QPREP" => qprep.map(String::from).ok_or(()),
+                _ => Err(()),
+            })
+        };
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let gfx1201 = arch == "gfx1201";
+            // Both unset: each resolves to its own qualification (on only on exact gfx1201),
+            // so the pair is admitted by default exactly there.
+            let unset = with(arch, None, None);
+            assert_eq!(unset.fa_prefill_pm, gfx1201, "{arch}");
+            assert_eq!(unset.fa_prefill_pm_qprep, gfx1201, "{arch}");
+            assert_eq!(unset.fa_prefill_pm_fp8_kv, gfx1201, "{arch}");
+            assert_eq!(unset.fa_prefill_pm_qprep_fp8_kv, gfx1201, "{arch}");
+            // PM unset + Q-prep 1: the resolved PM flag is on exactly where qualified.
+            let pm_unset = with(arch, None, Some("1"));
+            assert_eq!(pm_unset.fa_prefill_pm, gfx1201, "{arch}");
+            assert!(pm_unset.fa_prefill_pm_qprep, "{arch}");
+            assert!(pm_unset.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // PM 0 + Q-prep unset / 1: the PM route is off, so the fold has nothing to feed
+            // (the admission refuses it with `PmDisabled`); the Q-prep flag itself is its own.
+            let pm_off = with(arch, Some("0"), None);
+            assert!(!pm_off.fa_prefill_pm, "{arch}");
+            assert_eq!(pm_off.fa_prefill_pm_qprep, gfx1201, "{arch}");
+            assert!(!pm_off.fa_prefill_pm_fp8_kv, "{arch}");
+            assert_eq!(pm_off.fa_prefill_pm_qprep_fp8_kv, gfx1201, "{arch}");
+            let pm_off_on = with(arch, Some("0"), Some("1"));
+            assert!(!pm_off_on.fa_prefill_pm, "{arch}");
+            assert!(!pm_off_on.fa_prefill_pm_fp8_kv, "{arch}");
+            assert!(pm_off_on.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // Explicit PM and Q-prep values resolve independently for both KV codecs.
+            for (pm, want_pm) in [("0", false), ("1", true)] {
+                for (qprep, want_qprep) in [("0", false), ("1", true)] {
+                    let flags = with(arch, Some(pm), Some(qprep));
+                    assert_eq!(
+                        flags.fa_prefill_pm, want_pm,
+                        "{arch}: pm={pm} qprep={qprep}"
+                    );
+                    assert_eq!(
+                        flags.fa_prefill_pm_fp8_kv, want_pm,
+                        "{arch}: fp8 pm={pm} qprep={qprep}"
+                    );
+                    assert_eq!(
+                        flags.fa_prefill_pm_qprep, want_qprep,
+                        "{arch}: pm={pm} qprep={qprep}"
+                    );
+                    assert_eq!(
+                        flags.fa_prefill_pm_qprep_fp8_kv, want_qprep,
+                        "{arch}: fp8 pm={pm} qprep={qprep}"
+                    );
+                }
+            }
+            // Q-prep 0 kills the fold whatever the PM flag says.
+            for pm in [None, Some("0"), Some("1")] {
+                let flags = with(arch, pm, Some("0"));
+                assert!(!flags.fa_prefill_pm_qprep, "{arch}: pm {pm:?}");
+                assert!(!flags.fa_prefill_pm_qprep_fp8_kv, "{arch}: fp8 pm {pm:?}");
+            }
+        }
+    }
+    #[test]
+    fn prefill_iu4_c8_pm_follows_its_qualification_beside_the_resolved_f3_flag() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        let with = |arch: &str, f3: Option<&'static str>, c8: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match name {
+                "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED" => f3.map(String::from).ok_or(()),
+                "HIPFIRE_PREFILL_IU4_C8_PM" => c8.map(String::from).ok_or(()),
+                _ => Err(()),
+            })
+        };
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let gfx1201 = arch == "gfx1201";
+            let unset = with(arch, None, None);
+            // F3 and the C8 PM route both follow their exact-gfx1201 qualification.
+            assert_eq!(
+                unset.prefill_iu4_producer_fused,
+                qualified(arch, PrefillRoute::PrefillIu4ProducerFused),
+                "{arch}"
+            );
+            assert_eq!(unset.prefill_iu4_producer_fused, gfx1201, "{arch}");
+            assert_eq!(
+                unset.prefill_iu4_c8_pm,
+                qualified(arch, PrefillRoute::PrefillIu4C8Pm),
+                "{arch}"
+            );
+            assert_eq!(unset.prefill_iu4_c8_pm, gfx1201, "{arch}");
+            assert!(!FeatureFlags::for_test(arch).prefill_iu4_c8_pm, "{arch}");
+            assert!(
+                !FeatureFlags::for_test(arch).prefill_iu4_producer_fused,
+                "{arch}"
+            );
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = with(arch, None, Some(raw));
+                assert_eq!(flags.prefill_iu4_c8_pm, want, "{arch}: {raw}");
+                // Independent flag: F3 stays its own resolved qualification.
+                assert_eq!(flags.prefill_iu4_producer_fused, gfx1201, "{arch}: {raw}");
+            }
+            // An explicit F3 0 does not change the C8 PM flag itself (the wrapper nests).
+            let f3_off = with(arch, Some("0"), Some("1"));
+            assert!(!f3_off.prefill_iu4_producer_fused, "{arch}");
+            assert!(f3_off.prefill_iu4_c8_pm, "{arch}");
+        }
+    }
+
+    #[test]
+    fn moe_rotate_i4_pm_follows_its_qualification_and_explicit_overrides() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                qualified(arch, PrefillRoute::MoeRotateI4Pm),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert_eq!(unset.moe_rotate_i4_pm, arch == "gfx1201", "{arch}");
+            assert!(!FeatureFlags::for_test(arch).moe_rotate_i4_pm, "{arch}");
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_MOE_ROTATE_I4_PM" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                // The flag is the typed request only; raw inventory is applied at selection.
+                assert_eq!(flags.moe_rotate_i4_pm, want, "{arch}: {raw}");
+                // No other route flag moves with it.
+                assert_eq!(flags.fa_prefill_pm, unset.fa_prefill_pm, "{arch}: {raw}");
+                assert_eq!(
+                    flags.moe_iu4_wide_tiles, unset.moe_iu4_wide_tiles,
+                    "{arch}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_MOE_ROTATE_I4_PM is not a boolean")]
+    fn moe_rotate_i4_pm_rejects_a_non_boolean_spelling() {
+        let _ = FeatureFlags::from_lookup("gfx1201", |name| {
+            if name == "HIPFIRE_MOE_ROTATE_I4_PM" {
+                Ok("on".into())
+            } else {
+                Err(())
+            }
+        });
+    }
+
+    #[test]
+    fn gdn_chunk_prep_pm_follows_its_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.gdn_chunk_prep_pm,
+                qualified(arch, PrefillRoute::GdnChunkPrepPm)
+            );
+            assert_eq!(unset.gdn_chunk_prep_pm, arch == "gfx1201", "{arch}");
+            assert!(!FeatureFlags::for_test(arch).gdn_chunk_prep_pm);
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_GDN_CHUNK_PREP_PM" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.gdn_chunk_prep_pm, want, "{arch}: {raw}");
+                // Independent of every other route flag: they keep their own resolution.
+                assert_eq!(flags.fa_prefill_pm, arch == "gfx1201", "{arch}");
+                assert_eq!(flags.fa_prefill_pm_qprep, arch == "gfx1201", "{arch}");
+            }
+            // An explicit 1 resolves on whatever the architecture; the launcher admission
+            // adds the raw inventory (exact gfx1201).
+            assert_eq!(
+                raw_inventory(arch, PrefillRoute::GdnChunkPrepPm),
+                arch == "gfx1201"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1100_split_verify_defaults_only_on_exact_arch_and_keeps_two_opt_outs() {
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
         let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
         assert!(gfx1100.verify_attn);
-        assert!(!gfx1100.gfx1100_fa2_split_verify);
+        assert!(gfx1100.gfx1100_fa2_split_verify);
         for arch in ["gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
             assert!(
                 !FeatureFlags::from_process_config(arch, &process).gfx1100_fa2_split_verify,
@@ -2043,31 +3469,9 @@ mod tests {
             );
         }
 
-        let mut split_on = ConfigLayer::default();
-        split_on
-            .set_cli("kernel.gfx1100_fa2_split_verify", "true")
-            .unwrap();
-        let resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: "config.toml".into(),
-            },
-            layer: split_on,
-        }])
-        .unwrap();
-        let flags = FeatureFlags::from_process_config(
-            "gfx1100",
-            &ProcessConfig::from_resolved(&resolved).unwrap(),
-        );
-        assert!(flags.verify_attn);
-        assert!(flags.gfx1100_fa2_split_verify);
-
-        // The parent switch stays independent: the dispatch predicate
-        // requires both, so `kernel.verify_attn=false` still opts out.
+        // The parent switch stays independent: dispatch requires both.
         let mut parent_off = ConfigLayer::default();
         parent_off.set_cli("kernel.verify_attn", "false").unwrap();
-        parent_off
-            .set_cli("kernel.gfx1100_fa2_split_verify", "true")
-            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -2081,6 +3485,24 @@ mod tests {
         );
         assert!(!flags.verify_attn);
         assert!(flags.gfx1100_fa2_split_verify);
+
+        let mut split_off = ConfigLayer::default();
+        split_off
+            .set_cli("kernel.gfx1100_fa2_split_verify", "false")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer: split_off,
+        }])
+        .unwrap();
+        let flags = FeatureFlags::from_process_config(
+            "gfx1100",
+            &ProcessConfig::from_resolved(&resolved).unwrap(),
+        );
+        assert!(flags.verify_attn);
+        assert!(!flags.gfx1100_fa2_split_verify);
     }
 
     #[test]
@@ -2093,14 +3515,18 @@ mod tests {
         let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
         assert!(gfx1201.gfx12_silu_quant_fused);
         assert!(gfx1201.gfx12_silu_quant_fused_enabled());
-        for arch in ["gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+        for arch in [
+            "gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942",
+        ] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gfx12_silu_quant_fused, "arch={arch}");
             assert!(!flags.gfx12_silu_quant_fused_enabled(), "arch={arch}");
         }
 
         let mut layer = ConfigLayer::default();
-        layer.set_cli("kernel.gfx12_silu_quant_fused", "false").unwrap();
+        layer
+            .set_cli("kernel.gfx12_silu_quant_fused", "false")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -2130,14 +3556,18 @@ mod tests {
         let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
         assert!(gfx1201.gfx12_producer_quant_fused);
         assert!(gfx1201.gfx12_producer_quant_fused_enabled());
-        for arch in ["gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+        for arch in [
+            "gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942",
+        ] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gfx12_producer_quant_fused, "arch={arch}");
             assert!(!flags.gfx12_producer_quant_fused_enabled(), "arch={arch}");
         }
 
         let mut layer = ConfigLayer::default();
-        layer.set_cli("kernel.gfx12_producer_quant_fused", "false").unwrap();
+        layer
+            .set_cli("kernel.gfx12_producer_quant_fused", "false")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -2169,14 +3599,18 @@ mod tests {
             assert!(flags.gfx11_producer_quant_fused, "arch={arch}");
             assert!(flags.gfx11_producer_quant_fused_enabled(), "arch={arch}");
         }
-        for arch in ["gfx1201", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+        for arch in [
+            "gfx1201", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942",
+        ] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gfx11_producer_quant_fused, "arch={arch}");
             assert!(!flags.gfx11_producer_quant_fused_enabled(), "arch={arch}");
         }
 
         let mut layer = ConfigLayer::default();
-        layer.set_cli("kernel.gfx11_producer_quant_fused", "false").unwrap();
+        layer
+            .set_cli("kernel.gfx11_producer_quant_fused", "false")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -2213,7 +3647,9 @@ mod tests {
         let mut off = ConfigLayer::default();
         off.set_cli("kernel.gfx12_fp8_stream", "false").unwrap();
         let resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser { path: "config.toml".into() },
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
             layer: off,
         }])
         .unwrap();
@@ -2250,7 +3686,9 @@ mod tests {
                 let mut layer = ConfigLayer::default();
                 layer.set_cli("kernel.pm_decode", raw)?;
                 layers.push(NamedLayer {
-                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    source: ConfigSource::GlobalUser {
+                        path: "config.toml".into(),
+                    },
                     layer,
                 });
             }
@@ -2316,6 +3754,35 @@ mod tests {
         }
     }
 
+    /// `hipfire_config::effective("kernel.iu4_prefill")` is the Settings/CLI
+    /// prediction of the route gate; it must agree with
+    /// `FeatureFlags::iu4_prefill_enabled` under the default process policy.
+    #[test]
+    fn effective_iu4_prefill_matches_iu4_prefill_enabled() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::ConfigValue;
+
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030", "gfx1101"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: None,
+                registry_tag: None,
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            let predicted = effective("kernel.iu4_prefill", &resolved, &ctx);
+            assert_eq!(predicted.value, ConfigValue::Bool(true), "arch={arch}");
+            assert_eq!(
+                predicted.used_on_gpu,
+                flags.iu4_prefill_enabled(),
+                "arch={arch}"
+            );
+        }
+    }
+
     #[test]
     fn qkvza_split_tail_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1100");
@@ -2331,13 +3798,28 @@ mod tests {
     #[test]
     fn draft_shared_rotations_default_on_exact_gfx1100_with_independent_opt_out() {
         let keys = [
-            ("kernel.draft_shared_qkv_rotation", "HIPFIRE_DRAFT_SHARED_QKV_ROTATION"),
-            ("kernel.draft_shared_ffn_rotation", "HIPFIRE_DRAFT_SHARED_FFN_ROTATION"),
-            ("kernel.draft_shared_ctx_kv_rotation", "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION"),
+            (
+                "kernel.draft_shared_qkv_rotation",
+                "HIPFIRE_DRAFT_SHARED_QKV_ROTATION",
+            ),
+            (
+                "kernel.draft_shared_ffn_rotation",
+                "HIPFIRE_DRAFT_SHARED_FFN_ROTATION",
+            ),
+            (
+                "kernel.draft_shared_ctx_kv_rotation",
+                "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION",
+            ),
         ];
-        let arches = ["gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"];
+        let arches = [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942",
+        ];
         let triple = |f: &FeatureFlags| {
-            [f.draft_shared_qkv_rotation, f.draft_shared_ffn_rotation, f.draft_shared_ctx_kv_rotation]
+            [
+                f.draft_shared_qkv_rotation,
+                f.draft_shared_ffn_rotation,
+                f.draft_shared_ctx_kv_rotation,
+            ]
         };
 
         // Built-in true values must stay absent across the CLI-to-daemon
@@ -2349,7 +3831,10 @@ mod tests {
         decoded.validate().unwrap();
         assert_eq!(decoded, process);
         for (key, env) in keys {
-            assert_eq!(resolved.get(key).unwrap().value, hipfire_config::ConfigValue::Bool(true));
+            assert_eq!(
+                resolved.get(key).unwrap().value,
+                hipfire_config::ConfigValue::Bool(true)
+            );
             assert!(process.values.get(key).is_none(), "{key}");
             assert!(decoded.values.get(key).is_none(), "{key}");
             assert_eq!(decoded.legacy_value(env), None, "{env}");
@@ -2357,10 +3842,26 @@ mod tests {
         }
         for arch in arches {
             let expected = [arch == "gfx1100"; 3];
-            assert_eq!(triple(&FeatureFlags::from_process_config(arch, &process)), expected, "{arch}");
-            assert_eq!(triple(&FeatureFlags::from_process_config(arch, &decoded)), expected, "{arch}");
-            assert_eq!(triple(&FeatureFlags::from_lookup(arch, |_| Err(()))), expected, "{arch}");
-            assert_eq!(triple(&FeatureFlags::for_test(arch)), [false; 3], "{arch}: test baseline");
+            assert_eq!(
+                triple(&FeatureFlags::from_process_config(arch, &process)),
+                expected,
+                "{arch}"
+            );
+            assert_eq!(
+                triple(&FeatureFlags::from_process_config(arch, &decoded)),
+                expected,
+                "{arch}"
+            );
+            assert_eq!(
+                triple(&FeatureFlags::from_lookup(arch, |_| Err(()))),
+                expected,
+                "{arch}"
+            );
+            assert_eq!(
+                triple(&FeatureFlags::for_test(arch)),
+                [false; 3],
+                "{arch}: test baseline"
+            );
         }
 
         // Each switch independently carries both explicit true and false,
@@ -2375,11 +3876,18 @@ mod tests {
                 // TOML booleans lower to typed ConfigValue::Bool before set;
                 // use that pure API rather than a file or ambient environment.
                 let mut toml = ConfigLayer::default();
-                toml.set(key, hipfire_config::ConfigValue::Bool(enabled)).unwrap();
-                let toml_process = ProcessConfig::from_resolved(&resolve([NamedLayer {
-                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
-                    layer: toml,
-                }]).unwrap()).unwrap();
+                toml.set(key, hipfire_config::ConfigValue::Bool(enabled))
+                    .unwrap();
+                let toml_process = ProcessConfig::from_resolved(
+                    &resolve([NamedLayer {
+                        source: ConfigSource::GlobalUser {
+                            path: "config.toml".into(),
+                        },
+                        layer: toml,
+                    }])
+                    .unwrap(),
+                )
+                .unwrap();
 
                 for raw in spellings {
                     let mut cli = ConfigLayer::default();
@@ -2389,11 +3897,28 @@ mod tests {
                     let mut environment = ConfigLayer::default();
                     // load_env_layer uses this same schema parser for these
                     // stable aliases; no process-global env mutation needed.
-                    environment.set(key, schema.parse_cli(raw).unwrap()).unwrap();
+                    environment
+                        .set(key, schema.parse_cli(raw).unwrap())
+                        .unwrap();
                     for (source, layer) in [
-                        (ConfigSource::OneShot { argument: format!("{key}={raw}") }, cli),
-                        (ConfigSource::OneShot { argument: format!("{}={raw}", schema.legacy_key) }, legacy_cli),
-                        (ConfigSource::LegacyEnv { name: (*env).into() }, environment),
+                        (
+                            ConfigSource::OneShot {
+                                argument: format!("{key}={raw}"),
+                            },
+                            cli,
+                        ),
+                        (
+                            ConfigSource::OneShot {
+                                argument: format!("{}={raw}", schema.legacy_key),
+                            },
+                            legacy_cli,
+                        ),
+                        (
+                            ConfigSource::LegacyEnv {
+                                name: (*env).into(),
+                            },
+                            environment,
+                        ),
                     ] {
                         let resolved = resolve([NamedLayer { source, layer }]).unwrap();
                         let process = ProcessConfig::from_resolved(&resolved).unwrap();
@@ -2403,11 +3928,22 @@ mod tests {
                         decoded.validate().unwrap();
                         assert_eq!(decoded, process, "{key}={raw}");
                         let normalized = if enabled { "1" } else { "0" };
-                        assert_eq!(decoded.legacy_value(env).as_deref(), Some(normalized), "{key}={raw}");
+                        assert_eq!(
+                            decoded.legacy_value(env).as_deref(),
+                            Some(normalized),
+                            "{key}={raw}"
+                        );
                         for (j, (other_key, other_env)) in keys.iter().enumerate() {
                             if j != i {
-                                assert!(decoded.values.get(other_key).is_none(), "{key} changed {other_key}");
-                                assert_eq!(decoded.legacy_value(other_env), None, "{key} changed {other_env}");
+                                assert!(
+                                    decoded.values.get(other_key).is_none(),
+                                    "{key} changed {other_key}"
+                                );
+                                assert_eq!(
+                                    decoded.legacy_value(other_env),
+                                    None,
+                                    "{key} changed {other_env}"
+                                );
                             }
                         }
                         for arch in arches {
@@ -2419,7 +3955,11 @@ mod tests {
                                 "{arch}: {key}={raw}"
                             );
                             let from_env = FeatureFlags::from_lookup(arch, |name| {
-                                if name == *env { Ok(normalized.into()) } else { Err(()) }
+                                if name == *env {
+                                    Ok(normalized.into())
+                                } else {
+                                    Err(())
+                                }
                             });
                             assert_eq!(triple(&from_env), expected, "{arch}: {env}={normalized}");
                         }
@@ -2535,18 +4075,29 @@ mod tests {
             ("gfx1151", true),
             ("gfx1201", false),
         ] {
-            assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch}");
+            assert_eq!(
+                FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide,
+                expected,
+                "arch={arch}"
+            );
         }
         for (value, expected) in [("false", false), ("true", true)] {
             let mut layer = ConfigLayer::default();
             layer.set_cli("kernel.gfx11_q8_fa2_wide", value).unwrap();
             let resolved = resolve([NamedLayer {
-                source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
                 layer,
-            }]).unwrap();
+            }])
+            .unwrap();
             let process = ProcessConfig::from_resolved(&resolved).unwrap();
             for arch in ["gfx1100", "gfx1151"] {
-                assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch} value={value}");
+                assert_eq!(
+                    FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide,
+                    expected,
+                    "arch={arch} value={value}"
+                );
             }
         }
     }

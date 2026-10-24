@@ -6,7 +6,7 @@
 //! definite-assignment analysis remains authoritative for fully undefined reads.
 //! Fully undefined reads retain their separate entry-definedness findings.
 
-use super::{Flow, NDW, S0, EXEC_HI, EXEC_LO, reg_dwords};
+use super::{reg_dwords, Flow, EXEC_HI, EXEC_LO, NDW, S0};
 use crate::cfg::Body;
 use crate::inst::{Arch, Inst, Wave};
 use crate::operand::{ImmField, InlineConst, Operand, Special};
@@ -17,15 +17,45 @@ const SCALARS: usize = NDW - S0;
 // Each scalar bit is either definitely one, possibly one, or definitely zero.
 // On merge only facts true on all incoming paths survive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Mask { must: u32, may: u32 }
+struct Mask {
+    must: u32,
+    may: u32,
+}
 impl Mask {
-    const UNKNOWN: Self = Self { must: 0, may: u32::MAX };
-    fn exact(n: u32) -> Self { Self { must: n, may: n } }
-    fn known(self) -> Option<u32> { (self.must == self.may).then_some(self.must) }
-    fn and(self, rhs: Self) -> Self { Self { must: self.must & rhs.must, may: self.may & rhs.may } }
-    fn or(self, rhs: Self) -> Self { Self { must: self.must | rhs.must, may: self.may | rhs.may } }
-    fn not(self) -> Self { Self { must: !self.may, may: !self.must } }
-    fn join(self, rhs: Self) -> Self { Self { must: self.must & rhs.must, may: self.may | rhs.may } }
+    const UNKNOWN: Self = Self {
+        must: 0,
+        may: u32::MAX,
+    };
+    fn exact(n: u32) -> Self {
+        Self { must: n, may: n }
+    }
+    fn known(self) -> Option<u32> {
+        (self.must == self.may).then_some(self.must)
+    }
+    fn and(self, rhs: Self) -> Self {
+        Self {
+            must: self.must & rhs.must,
+            may: self.may & rhs.may,
+        }
+    }
+    fn or(self, rhs: Self) -> Self {
+        Self {
+            must: self.must | rhs.must,
+            may: self.may | rhs.may,
+        }
+    }
+    fn not(self) -> Self {
+        Self {
+            must: !self.may,
+            may: !self.must,
+        }
+    }
+    fn join(self, rhs: Self) -> Self {
+        Self {
+            must: self.must & rhs.must,
+            may: self.may | rhs.may,
+        }
+    }
 }
 type Constants = [Mask; SCALARS];
 
@@ -74,21 +104,31 @@ fn value(op: &Operand, state: &Constants) -> Mask {
 fn transfer(inst: &Inst, arch: Arch, old: &Constants, writes: &super::Bits) -> Constants {
     let mut next = *old;
     for d in S0..NDW {
-        if writes.has(d * 2) || writes.has(d * 2 + 1) { next[d - S0] = Mask::UNKNOWN; }
+        if writes.has(d * 2) || writes.has(d * 2 + 1) {
+            next[d - S0] = Mask::UNKNOWN;
+        }
     }
-    let Some(name) = inst.op.name(arch) else { return next };
+    let Some(name) = inst.op.name(arch) else {
+        return next;
+    };
     let ops = inst.operands.as_slice();
     if let Some((lo, hi)) = ops.first().and_then(pair_location) {
-        let (src_lo, src_hi) = ops.get(1).map_or((Mask::UNKNOWN, Mask::UNKNOWN), |op| pair_value(op, old));
+        let (src_lo, src_hi) = ops
+            .get(1)
+            .map_or((Mask::UNKNOWN, Mask::UNKNOWN), |op| pair_value(op, old));
         let old_exec = (old[EXEC_LO - S0], old[EXEC_HI - S0]);
         let value = match name {
             "s_mov_b64" => (src_lo, src_hi),
             "s_and_b64" => {
-                let (a, b) = ops.get(2).map_or((Mask::UNKNOWN, Mask::UNKNOWN), |op| pair_value(op, old));
+                let (a, b) = ops
+                    .get(2)
+                    .map_or((Mask::UNKNOWN, Mask::UNKNOWN), |op| pair_value(op, old));
                 (src_lo.and(a), src_hi.and(b))
             }
             "s_or_b64" => {
-                let (a, b) = ops.get(2).map_or((Mask::UNKNOWN, Mask::UNKNOWN), |op| pair_value(op, old));
+                let (a, b) = ops
+                    .get(2)
+                    .map_or((Mask::UNKNOWN, Mask::UNKNOWN), |op| pair_value(op, old));
                 (src_lo.or(a), src_hi.or(b))
             }
             "s_and_saveexec_b64" => {
@@ -107,7 +147,9 @@ fn transfer(inst: &Inst, arch: Arch, old: &Constants, writes: &super::Bits) -> C
         next[hi - S0] = value.1;
         return next;
     }
-    let Some(dst) = ops.first().and_then(location) else { return next };
+    let Some(dst) = ops.first().and_then(location) else {
+        return next;
+    };
     let src = |n| ops.get(n).map_or(Mask::UNKNOWN, |op| value(op, old));
     let result = match name {
         "s_mov_b32" => src(1),
@@ -116,8 +158,14 @@ fn transfer(inst: &Inst, arch: Arch, old: &Constants, writes: &super::Bits) -> C
         "s_xor_b32" => src(1).and(src(2).not()).or(src(1).not().and(src(2))),
         "s_andn2_b32" => src(1).and(src(2).not()),
         "s_orn2_b32" => src(1).or(src(2).not()),
-        "s_lshl_b32" => src(2).known().map_or(Mask::UNKNOWN, |b| Mask { must: src(1).must.wrapping_shl(b & 31), may: src(1).may.wrapping_shl(b & 31) }),
-        "s_lshr_b32" => src(2).known().map_or(Mask::UNKNOWN, |b| Mask { must: src(1).must.wrapping_shr(b & 31), may: src(1).may.wrapping_shr(b & 31) }),
+        "s_lshl_b32" => src(2).known().map_or(Mask::UNKNOWN, |b| Mask {
+            must: src(1).must.wrapping_shl(b & 31),
+            may: src(1).may.wrapping_shl(b & 31),
+        }),
+        "s_lshr_b32" => src(2).known().map_or(Mask::UNKNOWN, |b| Mask {
+            must: src(1).must.wrapping_shr(b & 31),
+            may: src(1).may.wrapping_shr(b & 31),
+        }),
         "s_and_saveexec_b32" => {
             let exec = old[EXEC_LO - S0];
             next[EXEC_LO - S0] = exec.and(src(1));
@@ -145,13 +193,21 @@ fn scalar_before(body: &Body, flow: &Flow, arch: Arch) -> Vec<Constants> {
         let mut incoming = [Mask::UNKNOWN; SCALARS];
         let mut have = p == 0;
         for &q in &flow.pred[p] {
-            if !reached[q] { continue; }
-            if !have { incoming = after[q]; have = true; }
-            else {
-                for (a, b) in incoming.iter_mut().zip(after[q]) { *a = a.join(b); }
+            if !reached[q] {
+                continue;
+            }
+            if !have {
+                incoming = after[q];
+                have = true;
+            } else {
+                for (a, b) in incoming.iter_mut().zip(after[q]) {
+                    *a = a.join(b);
+                }
             }
         }
-        if !have { continue; }
+        if !have {
+            continue;
+        }
         before[p] = incoming;
         let inst = body.insts.get(flow.ids[p]).expect("laid out");
         let out = transfer(inst, arch, &incoming, &flow.acc[p].writes);
@@ -159,7 +215,10 @@ fn scalar_before(body: &Body, flow: &Flow, arch: Arch) -> Vec<Constants> {
             reached[p] = true;
             after[p] = out;
             for &s in &flow.succ[p] {
-                if !queued[s] { queued[s] = true; work.push(s); }
+                if !queued[s] {
+                    queued[s] = true;
+                    work.push(s);
+                }
             }
         }
     }
@@ -169,12 +228,17 @@ fn scalar_before(body: &Body, flow: &Flow, arch: Arch) -> Vec<Constants> {
 fn active(state: &Constants, wave: Wave, writing: bool) -> u64 {
     let select = |mask: Mask| if writing { mask.must } else { mask.may };
     let low = select(state[EXEC_LO - S0]);
-    if wave == Wave::Wave32 { return u64::from(low); }
+    if wave == Wave::Wave32 {
+        return u64::from(low);
+    }
     u64::from(low) | (u64::from(select(state[EXEC_HI - S0])) << 32)
 }
 
 fn lane_index(inst: &Inst, state: &Constants) -> Option<u32> {
-    inst.operands.last().and_then(|op| value(op, state).known()).filter(|&lane| lane < 64)
+    inst.operands
+        .last()
+        .and_then(|op| value(op, state).known())
+        .filter(|&lane| lane < 64)
 }
 
 fn destination(inst: &Inst) -> Option<usize> {
@@ -184,21 +248,47 @@ fn destination(inst: &Inst) -> Option<usize> {
     }
 }
 
-fn written_lanes(inst: &Inst, flow: &Flow, p: usize, reg: usize, constants: &Constants, wave: Wave, arch: Arch) -> u64 {
+fn written_lanes(
+    inst: &Inst,
+    flow: &Flow,
+    p: usize,
+    reg: usize,
+    constants: &Constants,
+    wave: Wave,
+    arch: Arch,
+) -> u64 {
     if destination(inst) == Some(reg) && inst.op.name(arch) == Some("v_writelane_b32") {
         return lane_index(inst, constants).map_or(0, |lane| 1u64 << lane);
     }
     // DPP/SDWA selection can preserve destination lanes/halves even when the
     // operand table names a whole VGPR. Do not claim their full EXEC coverage.
-    if inst.mods.dpp.is_some() || inst.mods.sdwa.is_some() { return 0; }
+    if inst.mods.dpp.is_some() || inst.mods.sdwa.is_some() {
+        return 0;
+    }
     let bits = &flow.acc[p].writes;
     if bits.has(reg * 2) && bits.has(reg * 2 + 1) {
-        if super::is_vector_form(inst.form) { active(constants, wave, true) } else { u64::MAX }
-    } else { 0 }
+        if super::is_vector_form(inst.form) {
+            active(constants, wave, true)
+        } else {
+            u64::MAX
+        }
+    } else {
+        0
+    }
 }
 
-fn observes(inst: &Inst, flow: &Flow, p: usize, reg: usize, constants: &Constants, wave: Wave, arch: Arch) -> u64 {
-    if !flow.acc[p].reads.has(reg * 2) && !flow.acc[p].reads.has(reg * 2 + 1) { return 0; }
+fn observes(
+    inst: &Inst,
+    flow: &Flow,
+    p: usize,
+    reg: usize,
+    constants: &Constants,
+    wave: Wave,
+    arch: Arch,
+) -> u64 {
+    if !flow.acc[p].reads.has(reg * 2) && !flow.acc[p].reads.has(reg * 2 + 1) {
+        return 0;
+    }
     let name = inst.op.name(arch).unwrap_or("");
     if name == "v_writelane_b32" && destination(inst) == Some(reg) {
         // This table use is the unmodified lanes, not a consumed operand.
@@ -210,13 +300,23 @@ fn observes(inst: &Inst, flow: &Flow, p: usize, reg: usize, constants: &Constant
     if name == "v_readlane_b32" {
         return lane_index(inst, constants).map_or(u64::MAX, |lane| 1u64 << lane);
     }
-    if super::is_vector_form(inst.form) { active(constants, wave, false) } else { u64::MAX }
+    if super::is_vector_form(inst.form) {
+        active(constants, wave, false)
+    } else {
+        u64::MAX
+    }
 }
 
 /// Return the original partial-write sites whose preserved lanes cannot be
 /// observed uninitialised on any path. The half/dword pass continues to own
 /// fully undefined reads; this refinement only proves its open lane writes.
-pub(super) fn prove(body: &Body, flow: &Flow, arch: Arch, wave: Wave, sites: &[usize]) -> Vec<usize> {
+pub(super) fn prove(
+    body: &Body,
+    flow: &Flow,
+    arch: Arch,
+    wave: Wave,
+    sites: &[usize],
+) -> Vec<usize> {
     let constants = scalar_before(body, flow, arch);
     let mut by_reg: HashMap<usize, Vec<usize>> = HashMap::new();
     for &p in sites {
@@ -232,15 +332,28 @@ pub(super) fn prove(body: &Body, flow: &Flow, arch: Arch, wave: Wave, sites: &[u
         let mut queued = vec![true; flow.n];
         while let Some(p) = work.pop() {
             queued[p] = false;
-            let mut incoming = if p == 0 { if reg == 0 { u64::MAX } else { 0 } } else { u64::MAX };
-            for &q in &flow.pred[p] { incoming &= after[q]; }
+            let mut incoming = if p == 0 {
+                if reg == 0 {
+                    u64::MAX
+                } else {
+                    0
+                }
+            } else {
+                u64::MAX
+            };
+            for &q in &flow.pred[p] {
+                incoming &= after[q];
+            }
             before[p] = incoming;
             let inst = body.insts.get(flow.ids[p]).expect("laid out");
             let out = incoming | written_lanes(inst, flow, p, reg, &constants[p], wave, arch);
             if out != after[p] {
                 after[p] = out;
                 for &s in &flow.succ[p] {
-                    if !queued[s] { queued[s] = true; work.push(s); }
+                    if !queued[s] {
+                        queued[s] = true;
+                        work.push(s);
+                    }
                 }
             }
         }
@@ -253,13 +366,20 @@ pub(super) fn prove(body: &Body, flow: &Flow, arch: Arch, wave: Wave, sites: &[u
             let mut todo = flow.succ[p].to_vec();
             let mut valid = true;
             while let Some(q) = todo.pop() {
-                if std::mem::replace(&mut seen[q], true) { continue; }
+                if std::mem::replace(&mut seen[q], true) {
+                    continue;
+                }
                 let inst = body.insts.get(flow.ids[q]).expect("laid out");
                 let required = observes(inst, flow, q, reg, &constants[q], wave, arch);
-                if required & !before[q] != 0 { valid = false; break; }
+                if required & !before[q] != 0 {
+                    valid = false;
+                    break;
+                }
                 todo.extend(flow.succ[q].iter().copied());
             }
-            if valid { proved.push(p); }
+            if valid {
+                proved.push(p);
+            }
         }
     }
     proved
@@ -282,15 +402,33 @@ mod tests {
         assert_eq!(active(&state, Wave::Wave64, false), (1u64 << 34) | 3);
         state[EXEC_HI - S0] = Mask::UNKNOWN;
         assert_eq!(active(&state, Wave::Wave64, true), 3);
-        assert_eq!(active(&state, Wave::Wave64, false), (u64::from(u32::MAX) << 32) | 3);
+        assert_eq!(
+            active(&state, Wave::Wave64, false),
+            (u64::from(u32::MAX) << 32) | 3
+        );
 
-        let row = crate::isa::gfx12().iter().find(|r| r.name == "s_mov_b64").unwrap();
-        let src = RegRef { kind: Kind::S, base: 20, len: 2 };
+        let row = crate::isa::gfx12()
+            .iter()
+            .find(|r| r.name == "s_mov_b64")
+            .unwrap();
+        let src = RegRef {
+            kind: Kind::S,
+            base: 20,
+            len: 2,
+        };
         state[20] = Mask::exact(3);
         state[21] = Mask::exact(4);
-        let inst = Inst::from_parts(Arch::Gfx1201, row.op, row.form, FormFields::None,
+        let inst = Inst::from_parts(
+            Arch::Gfx1201,
+            row.op,
+            row.form,
+            FormFields::None,
             smallvec![Operand::Special(Special::Exec), Operand::Reg(src)],
-            Modifiers::default(), None, Provenance::default()).unwrap();
+            Modifiers::default(),
+            None,
+            Provenance::default(),
+        )
+        .unwrap();
         let access = super::super::access(Arch::Gfx1201, Wave::Wave64, &inst).unwrap();
         let out = transfer(&inst, Arch::Gfx1201, &state, &access.writes);
         assert_eq!(active(&out, Wave::Wave64, true), (1u64 << 34) | 3);

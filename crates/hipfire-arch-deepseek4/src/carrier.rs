@@ -99,23 +99,30 @@ pub fn load_bundle(
     // sidecar; any other mechanism (`Some(false)`) skips it so it never pages
     // into VRAM. `None` (auto / directly-driven daemon) keeps default-on.
     let load_dspark = ctx.spec.dspark != Some(false);
+    // Native in-trunk MTP layer load gate: the producer-capability verdict
+    // (`on` loads it; `auto` loads it only for a producer with a measured AR
+    // floor, which DeepSeek V4 lacks; `off` never). Independent of DSpark
+    // (its sidecar loads above whatever this says).
+    let load_mtp = hipfire_config::mtp_mode_admits(
+        hipfire_config::MtpMode::from_tri_state(ctx.spec.mtp),
+        crate::MTP_MEASURED_AR_FLOOR,
+    );
     let (config, weights) = match src {
         ModelSource::Hfq(mut hfq) => {
             let mut config = <DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
-            let weights =
-                <DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            config.load_mtp = load_mtp;
+            let weights = <DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
             (config, weights)
         }
         ModelSource::Dir(source) => {
-            let mut config = crate::config_from_safetensors(&source).ok_or_else(|| {
-                "deepseek4: failed to parse config from safetensors".to_string()
-            })?;
+            let mut config = crate::config_from_safetensors(&source)
+                .ok_or_else(|| "deepseek4: failed to parse config from safetensors".to_string())?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
-            let weights =
-                DeepseekV4::load_weights_from_safetensors(&source, &config, ctx.gpu)?;
+            config.load_mtp = load_mtp;
+            let weights = DeepseekV4::load_weights_from_safetensors(&source, &config, ctx.gpu)?;
             (config, weights)
         }
     };
@@ -135,12 +142,12 @@ pub fn load_bundle(
     }
     let mut state = DeepseekV4State::new(&config)?;
     state.compressor_cache_backend = ctx.kv_backend;
-    state.compressor_cache_dtype = if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16
-    {
-        rdna_compute::DType::F16
-    } else {
-        rdna_compute::DType::F32
-    };
+    state.compressor_cache_dtype =
+        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+            rdna_compute::DType::F16
+        } else {
+            rdna_compute::DType::F32
+        };
     let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())

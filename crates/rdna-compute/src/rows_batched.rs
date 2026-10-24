@@ -47,9 +47,16 @@ pub fn rows_twin_source(
 ) -> HipResult<String> {
     let define = format!("#define {entry_macro} {kernel}\n");
     if src.matches(&define).count() != 1 {
-        return Err(twin_err(format!("rows twin {kernel}: entry define `{}` not found exactly once", define.trim())));
+        return Err(twin_err(format!(
+            "rows twin {kernel}: entry define `{}` not found exactly once",
+            define.trim()
+        )));
     }
-    let mut out = src.replacen(&define, &format!("#define {entry_macro} {kernel}_row_body\n"), 1);
+    let mut out = src.replacen(
+        &define,
+        &format!("#define {entry_macro} {kernel}_row_body\n"),
+        1,
+    );
     let sig = format!("__global__ void {entry_macro}(");
     let mut rewritten = 0usize;
     let mut search_from = 0usize;
@@ -59,8 +66,14 @@ pub fn rows_twin_source(
             .rfind("extern \"C\"")
             .ok_or_else(|| twin_err(format!("rows twin {kernel}: entry without extern \"C\"")))?;
         let between = out[ext + "extern \"C\"".len()..at].trim();
-        if !(between.is_empty() || (between.starts_with("__launch_bounds__(") && between.ends_with(')') && !between.contains(';'))) {
-            return Err(twin_err(format!("rows twin {kernel}: unexpected entry qualifiers `{between}`")));
+        if !(between.is_empty()
+            || (between.starts_with("__launch_bounds__(")
+                && between.ends_with(')')
+                && !between.contains(';')))
+        {
+            return Err(twin_err(format!(
+                "rows twin {kernel}: unexpected entry qualifiers `{between}`"
+            )));
         }
         let replacement = format!("__device__ __forceinline__ void {entry_macro}(");
         out.replace_range(ext..at + sig.len(), &replacement);
@@ -68,11 +81,15 @@ pub fn rows_twin_source(
         search_from = ext + replacement.len();
     }
     if rewritten != entries {
-        return Err(twin_err(format!("rows twin {kernel}: found {rewritten} entry signatures, expected {entries}")));
+        return Err(twin_err(format!(
+            "rows twin {kernel}: found {rewritten} entry signatures, expected {entries}"
+        )));
     }
     for (from, to) in edits {
         if out.matches(from).count() != 1 {
-            return Err(twin_err(format!("rows twin {kernel}: checked edit `{from}` not found exactly once")));
+            return Err(twin_err(format!(
+                "rows twin {kernel}: checked edit `{from}` not found exactly once"
+            )));
         }
         out = out.replacen(from, to, 1);
     }
@@ -230,7 +247,9 @@ const GDN_ROWS_FRAME_KERNARG_OFFSET: u32 = 8 + 3 * 4;
 impl Gpu {
     fn ensure_rows_twin(&mut self, twin: &'static str) -> HipResult<()> {
         if !self.arch_caps.is_gfx1201() {
-            return Err(twin_err(format!("{twin}: rows twins are certified on gfx1201 only")));
+            return Err(twin_err(format!(
+                "{twin}: rows twins are certified on gfx1201 only"
+            )));
         }
         if !self.functions.contains_key(twin) {
             let src = rows_twin_module_source(twin)?;
@@ -239,7 +258,12 @@ impl Gpu {
         Ok(())
     }
 
-    fn stage_rows_table<T: Copy>(&self, what: &str, table: &GpuTensor, rows: &[T]) -> HipResult<()> {
+    fn stage_rows_table<T: Copy>(
+        &self,
+        what: &str,
+        table: &GpuTensor,
+        rows: &[T],
+    ) -> HipResult<()> {
         let bytes = as_bytes(rows);
         if table.buf.size() < bytes.len() {
             return Err(twin_err(format!(
@@ -249,7 +273,9 @@ impl Gpu {
             )));
         }
         if self.graphs.capture_mode {
-            return Err(twin_err(format!("{what}: row table staging during graph capture")));
+            return Err(twin_err(format!(
+                "{what}: row table staging during graph capture"
+            )));
         }
         self.bind_thread()?;
         self.hip.memcpy_htod(&table.buf, bytes)
@@ -285,7 +311,9 @@ impl Gpu {
             .collect();
         for (i, r) in rows.iter().enumerate() {
             if [r.q, r.k, r.v, r.gate, r.beta].contains(&0) {
-                return Err(twin_err(format!("gdn rows: row {i} has a null input pointer")));
+                return Err(twin_err(format!(
+                    "gdn rows: row {i} has a null input pointer"
+                )));
             }
         }
         validate_rows("gdn rows", row_tags, plan_tags, &writes).map_err(twin_err)?;
@@ -305,7 +333,9 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         if head_dim != GDN_HD || n_heads % 3 != 0 || rows == 0 || rows > u16::MAX as usize {
-            return Err(twin_err("gdn rows: requires head_dim 128, n_heads % 3 == 0, 1..=65535 rows"));
+            return Err(twin_err(
+                "gdn rows: requires head_dim 128, n_heads % 3 == 0, 1..=65535 rows",
+            ));
         }
         self.bind_thread()?;
         self.ensure_rows_twin(GDN_COMPACT3_B2_ROWS)?;
@@ -323,7 +353,9 @@ impl Gpu {
         ];
         let declared = [railgun::kernel::DeclaredWord {
             offset: GDN_ROWS_FRAME_KERNARG_OFFSET,
-            role: railgun::kernel::WordRole::GdnFrame { frames: rows as u32 },
+            role: railgun::kernel::WordRole::GdnFrame {
+                frames: rows as u32,
+            },
         }];
         self.launch_maybe_blob_declared(
             GDN_COMPACT3_B2_ROWS,
@@ -368,7 +400,9 @@ impl Gpu {
             })
             .collect();
         if let Some(i) = rows.iter().position(|r| r.input == 0) {
-            return Err(twin_err(format!("conv rows: row {i} has a null input pointer")));
+            return Err(twin_err(format!(
+                "conv rows: row {i} has a null input pointer"
+            )));
         }
         validate_rows("conv rows", row_tags, plan_tags, &writes).map_err(twin_err)?;
         self.stage_rows_table("conv rows", table, rows)
@@ -409,18 +443,25 @@ impl Gpu {
             &q_scale as *const _ as *mut c_void,
             &eps as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(CONV_QKNORM_B256_ROWS, [grid, 1, rows as u32], [block, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp);
-            b.push_ptr(wp);
-            b.push_i32(kd);
-            b.push_i32(vd);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_f32(q_scale);
-            b.push_f32(eps);
-            b
-        })
+        self.launch_maybe_blob(
+            CONV_QKNORM_B256_ROWS,
+            [grid, 1, rows as u32],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(wp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(q_scale);
+                b.push_f32(eps);
+                b
+            },
+        )
     }
 
     // ── gated norm + MQ rotate, AWQ, 48 heads x 128 (gfx1201) ──
@@ -432,10 +473,14 @@ impl Gpu {
         row_tags: &[u64],
         plan_tags: &[u64],
     ) -> HipResult<()> {
-        let writes: Vec<Vec<WriteExtent>> =
-            rows.iter().map(|r| vec![(r.x_rot, 48 * 128 * 4, "x_rot")]).collect();
+        let writes: Vec<Vec<WriteExtent>> = rows
+            .iter()
+            .map(|r| vec![(r.x_rot, 48 * 128 * 4, "x_rot")])
+            .collect();
         if let Some(i) = rows.iter().position(|r| r.x == 0 || r.z == 0) {
-            return Err(twin_err(format!("gated norm rows: row {i} has a null input pointer")));
+            return Err(twin_err(format!(
+                "gated norm rows: row {i} has a null input pointer"
+            )));
         }
         validate_rows("gated norm rows", row_tags, plan_tags, &writes).map_err(twin_err)?;
         self.stage_rows_table("gated norm rows", table, rows)
@@ -510,10 +555,18 @@ impl Gpu {
     ) -> HipResult<()> {
         let writes: Vec<Vec<WriteExtent>> = rows
             .iter()
-            .map(|r| vec![(r.q, 24 * 256 * 4, "q"), (r.gate, 24 * 256 * 4, "gate"), (r.k, 4 * 256 * 4, "k")])
+            .map(|r| {
+                vec![
+                    (r.q, 24 * 256 * 4, "q"),
+                    (r.gate, 24 * 256 * 4, "gate"),
+                    (r.k, 4 * 256 * 4, "k"),
+                ]
+            })
             .collect();
         if let Some(i) = rows.iter().position(|r| r.q_interleaved == 0 || r.pos == 0) {
-            return Err(twin_err(format!("fa prep rows: row {i} has a null input pointer")));
+            return Err(twin_err(format!(
+                "fa prep rows: row {i} has a null input pointer"
+            )));
         }
         validate_rows("fa prep rows", row_tags, plan_tags, &writes).map_err(twin_err)?;
         self.stage_rows_table("fa prep rows", table, rows)
@@ -545,15 +598,22 @@ impl Gpu {
             &eps as *const _ as *mut c_void,
             &freq_base as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(QWEN36_27B_FA_PREP_ROWS, [28, 1, rows as u32], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp);
-            b.push_ptr(qw);
-            b.push_ptr(kw);
-            b.push_f32(eps);
-            b.push_f32(freq_base);
-            b
-        })
+        self.launch_maybe_blob(
+            QWEN36_27B_FA_PREP_ROWS,
+            [28, 1, rows as u32],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(qw);
+                b.push_ptr(kw);
+                b.push_f32(eps);
+                b.push_f32(freq_base);
+                b
+            },
+        )
     }
 }
 
@@ -563,7 +623,12 @@ mod tests {
 
     #[test]
     fn all_twin_modules_assemble() {
-        for t in [GDN_COMPACT3_B2_ROWS, CONV_QKNORM_B256_ROWS, GATED_NORM_AWQ_K6144_ROWS, QWEN36_27B_FA_PREP_ROWS] {
+        for t in [
+            GDN_COMPACT3_B2_ROWS,
+            CONV_QKNORM_B256_ROWS,
+            GATED_NORM_AWQ_K6144_ROWS,
+            QWEN36_27B_FA_PREP_ROWS,
+        ] {
             let s = rows_twin_module_source(t).unwrap();
             assert!(s.contains(&format!("_ENTRY {t}\n")), "{t}");
             assert!(!s.contains("__global__ void HIPFIRE_GDN_KERNEL("), "{t}");
@@ -572,11 +637,37 @@ mod tests {
 
     #[test]
     fn signature_change_refused() {
-        let changed = kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC.replace("__launch_bounds__(HIPFIRE_CQN_BLOCK)\n", "");
-        assert!(rows_twin_source(&changed, "HIPFIRE_CQN_KERNEL", "conv1d_silu_split_qknorm_b256", 1, &[], "X").is_ok());
-        let renamed = kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC.replace("HIPFIRE_CQN_KERNEL conv1d", "HIPFIRE_CQN_KERNEL conv2d");
-        assert!(rows_twin_source(&renamed, "HIPFIRE_CQN_KERNEL", "conv1d_silu_split_qknorm_b256", 1, &[], "X").is_err());
-        assert!(rows_twin_source(kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC, "HIPFIRE_GDN_KERNEL", "gated_delta_net_q8_compact3_b2", 2, &[("no such line", "")], "X").is_err());
+        let changed = kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC
+            .replace("__launch_bounds__(HIPFIRE_CQN_BLOCK)\n", "");
+        assert!(rows_twin_source(
+            &changed,
+            "HIPFIRE_CQN_KERNEL",
+            "conv1d_silu_split_qknorm_b256",
+            1,
+            &[],
+            "X"
+        )
+        .is_ok());
+        let renamed = kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC
+            .replace("HIPFIRE_CQN_KERNEL conv1d", "HIPFIRE_CQN_KERNEL conv2d");
+        assert!(rows_twin_source(
+            &renamed,
+            "HIPFIRE_CQN_KERNEL",
+            "conv1d_silu_split_qknorm_b256",
+            1,
+            &[],
+            "X"
+        )
+        .is_err());
+        assert!(rows_twin_source(
+            kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC,
+            "HIPFIRE_GDN_KERNEL",
+            "gated_delta_net_q8_compact3_b2",
+            2,
+            &[("no such line", "")],
+            "X"
+        )
+        .is_err());
     }
 
     #[test]
@@ -586,6 +677,12 @@ mod tests {
         let bleed = vec![vec![(0x1000, 0x100, "s")], vec![(0x10ff, 0x100, "s")]];
         assert!(validate_rows("t", &[1, 2], &[1, 2], &bleed).is_err());
         assert!(validate_rows("t", &[1, 3], &[1, 2], &ok).is_err());
-        assert!(validate_rows("t", &[1, 2], &[1, 2], &[vec![(0, 4, "s")], vec![(8, 4, "s")]]).is_err());
+        assert!(validate_rows(
+            "t",
+            &[1, 2],
+            &[1, 2],
+            &[vec![(0, 4, "s")], vec![(8, 4, "s")]]
+        )
+        .is_err());
     }
 }

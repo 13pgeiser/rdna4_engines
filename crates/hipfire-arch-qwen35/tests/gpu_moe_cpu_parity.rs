@@ -505,8 +505,7 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
             let down_name = qwen35_tensor_name_candidates(&down_bare)
                 .into_iter()
                 .find(|n| hfq.find_tensor_info(n).is_some());
-            let (Some(down_name), Some(gu_info)) =
-                (down_name, hfq.find_tensor_info(&t.name))
+            let (Some(down_name), Some(gu_info)) = (down_name, hfq.find_tensor_info(&t.name))
             else {
                 continue;
             };
@@ -568,8 +567,10 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
     let mut loaded: Vec<Loaded> = Vec::new();
     let (mut dim, mut mi) = (0usize, 0usize);
     // Keep owners alive: pointer tables point into these buffers.
-    let mut owners: Vec<(hipfire_runtime::llama::WeightTensor, hipfire_runtime::llama::WeightTensor)> =
-        Vec::new();
+    let mut owners: Vec<(
+        hipfire_runtime::llama::WeightTensor,
+        hipfire_runtime::llama::WeightTensor,
+    )> = Vec::new();
     for (eid, gu_name, dn_name) in &chosen {
         let gu_info = hfq.find_tensor_info(gu_name).expect("gate_up info");
         let dn_info = hfq.find_tensor_info(dn_name).expect("down info");
@@ -600,8 +601,14 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
             qwen35_tensor_name_candidates,
             MemoryTarget::HostMapped,
         )?;
-        assert!(gpu.host_located(&gu.buf), "expert {eid} gate_up not host-mapped");
-        let gu_bytes = gpu.host_bytes(&gu.buf).expect("host gate_up bytes").to_vec();
+        assert!(
+            gpu.host_located(&gu.buf),
+            "expert {eid} gate_up not host-mapped"
+        );
+        let gu_bytes = gpu
+            .host_bytes(&gu.buf)
+            .expect("host gate_up bytes")
+            .to_vec();
         let dn_bytes = gpu.host_bytes(&dn.buf).expect("host down bytes").to_vec();
         let tag = hipfire_arch_qwen35::qwen35::mixed_expert_tag(gu.gpu_dtype, dn.gpu_dtype)
             .map_err(|e| format!("expert {eid}: {}", e.message))?;
@@ -619,8 +626,14 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
         owners.push((gu, dn));
     }
     let tags_seen: std::collections::BTreeSet<u8> = loaded.iter().map(|e| e.tag).collect();
-    assert!(tags_seen.len() >= 2, "need >=2 distinct tags, got {tags_seen:?}");
-    eprintln!("chained parity tags: {:?}", loaded.iter().map(|e| e.tag).collect::<Vec<_>>());
+    assert!(
+        tags_seen.len() >= 2,
+        "need >=2 distinct tags, got {tags_seen:?}"
+    );
+    eprintln!(
+        "chained parity tags: {:?}",
+        loaded.iter().map(|e| e.tag).collect::<Vec<_>>()
+    );
     let gu_ptr_bytes: Vec<u8> = loaded.iter().flat_map(|e| e.gu_ptr.to_ne_bytes()).collect();
     let dn_ptr_bytes: Vec<u8> = loaded.iter().flat_map(|e| e.dn_ptr.to_ne_bytes()).collect();
     let tag_bytes: Vec<u8> = loaded.iter().map(|e| e.tag).collect();
@@ -634,7 +647,9 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
             topk_ids.push(((b * 3 + r * 5 + b * r) % loaded.len()) as i32);
         }
     }
-    assert!(topk_ids.iter().all(|&id| id >= 0 && (id as usize) < loaded.len()));
+    assert!(topk_ids
+        .iter()
+        .all(|&id| id >= 0 && (id as usize) < loaded.len()));
     let topk_bytes: Vec<u8> = topk_ids.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let topk = gpu.upload_raw(&topk_bytes, &[topk_bytes.len()])?;
     let mut rng: u32 = 0x9e37_79b9;
@@ -649,7 +664,16 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
     let gate = gpu.zeros(&[N * KTOP * mi], DType::F32)?;
     let up = gpu.zeros(&[N * KTOP * mi], DType::F32)?;
     gpu.gemv_mixed_moe_gate_up_k8_indexed_batched(
-        &gu_ptrs, &tags, &topk, &x, &gate, &up, 2 * mi, dim, KTOP, N,
+        &gu_ptrs,
+        &tags,
+        &topk,
+        &x,
+        &gate,
+        &up,
+        2 * mi,
+        dim,
+        KTOP,
+        N,
     )?;
     let rot = gpu.zeros(&[N * KTOP * mi], DType::F32)?;
     gpu.fused_silu_mul_rotate_mq_batched(&gate, &up, &rot, mi, N * KTOP)?;
@@ -701,9 +725,21 @@ fn chained_graded_moe_batch4_parity() -> Result<(), Box<dyn std::error::Error>> 
         w_rot / s_rot,
         w_down / s_down
     );
-    assert!(w_gate <= s_gate * REL_TOL, "chained gate_up disagrees: rel {:.3e}", w_gate / s_gate);
-    assert!(w_rot <= s_rot * REL_TOL, "gpu silu+rotate disagrees: rel {:.3e}", w_rot / s_rot);
-    assert!(w_down <= s_down * REL_TOL, "chained down disagrees: rel {:.3e}", w_down / s_down);
+    assert!(
+        w_gate <= s_gate * REL_TOL,
+        "chained gate_up disagrees: rel {:.3e}",
+        w_gate / s_gate
+    );
+    assert!(
+        w_rot <= s_rot * REL_TOL,
+        "gpu silu+rotate disagrees: rel {:.3e}",
+        w_rot / s_rot
+    );
+    assert!(
+        w_down <= s_down * REL_TOL,
+        "chained down disagrees: rel {:.3e}",
+        w_down / s_down
+    );
     eprintln!("CHAINED_BATCH4_PARITY PASS (layer {l}, tags {tags_seen:?})");
     Ok(())
 }
@@ -768,7 +804,8 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
             let down_name = qwen35_tensor_name_candidates(&down_bare)
                 .into_iter()
                 .find(|n| hfq.find_tensor_info(n).is_some());
-            let (Some(down_name), Some(gu_info)) = (down_name, hfq.find_tensor_info(&t.name)) else {
+            let (Some(down_name), Some(gu_info)) = (down_name, hfq.find_tensor_info(&t.name))
+            else {
                 continue;
             };
             let dn_info = hfq.find_tensor_info(&down_name).expect("down info");
@@ -807,7 +844,10 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         }
     }
     assert_eq!(chosen.len(), KTOP, "bucket round-robin underfilled");
-    eprintln!("cpu multirow layer {l} buckets: {:?}", chosen.iter().map(|c| c.0).collect::<Vec<_>>());
+    eprintln!(
+        "cpu multirow layer {l} buckets: {:?}",
+        chosen.iter().map(|c| c.0).collect::<Vec<_>>()
+    );
 
     // Load each chosen expert host-mapped; keep the raw bytes + tier quant.
     let mut gu_bytes: Vec<Vec<u8>> = Vec::new();
@@ -816,8 +856,10 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     let mut dn_q: Vec<hipfire_cpu::quant::CpuQuant> = Vec::new();
     let (mut dim, mut mi) = (0usize, 0usize);
     // Keep the loaded hosts alive too (sanity: host_bytes matches them).
-    let mut kept: Vec<(hipfire_runtime::llama::WeightTensor, hipfire_runtime::llama::WeightTensor)> =
-        Vec::new();
+    let mut kept: Vec<(
+        hipfire_runtime::llama::WeightTensor,
+        hipfire_runtime::llama::WeightTensor,
+    )> = Vec::new();
     for (_, eid, gu_name, dn_name) in &chosen {
         let gu_info = hfq.find_tensor_info(gu_name).expect("gate_up info");
         let dn_info = hfq.find_tensor_info(dn_name).expect("down info");
@@ -858,7 +900,10 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         dn_q.push(cpu_quant(dn_info.quant_type).expect("dn decoder"));
         kept.push((gu, dn));
     }
-    assert!(dim % 256 == 0 && mi % 256 == 0, "engine needs 256-multiple dim/mi");
+    assert!(
+        dim % 256 == 0 && mi % 256 == 0,
+        "engine needs 256-multiple dim/mi"
+    );
 
     // Build the graded packing: one host-mapped owner per tag per projection,
     // expert bytes concatenated; record each expert's (tag, offset, len).
@@ -886,7 +931,6 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         dn_owner_idx.insert(*tag, dn_owners.len());
         dn_owners.push(gpu.upload_raw_host_mapped(blob, &[blob.len()])?);
     }
-
 
     let mut rng: u32 = 0x51ed_2701;
     let mut next_f32 = || {
@@ -968,7 +1012,18 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         })
     };
     moe_cpu_experts(
-        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+        &gpu,
+        dim,
+        mi,
+        N,
+        KTOP,
+        &x,
+        &indices,
+        &weights,
+        &residual,
+        false,
+        false,
+        |e| resolve(&gpu, e),
     )?;
     let got = gpu.download_f32(&residual)?;
     let scale = want.iter().fold(1e-6f32, |a, v| a.max(v.abs()));
@@ -1002,6 +1057,7 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         &prefix_w,
         &prefix_residual,
         false,
+        false,
         |e| resolve(&gpu, e),
     )?;
     let prefix_got = gpu.download_f32(&prefix_residual)?;
@@ -1027,7 +1083,10 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         (&residual, seed.as_slice()),
     ];
     let mut upload_stage = gpu.hip.transfer_buffer(
-        inputs.iter().map(|(_, data)| std::mem::size_of_val(*data)).sum(),
+        inputs
+            .iter()
+            .map(|(_, data)| std::mem::size_of_val(*data))
+            .sum(),
     )?;
     let mut offset = 0;
     for (tensor, data) in inputs {
@@ -1058,15 +1117,28 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
         offset += len;
     }
     moe_cpu_experts(
-        &gpu, dim, mi, N, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+        &gpu,
+        dim,
+        mi,
+        N,
+        KTOP,
+        &x,
+        &indices,
+        &weights,
+        &residual,
+        false,
+        false,
+        |e| resolve(&gpu, e),
     )?;
     // Exercise an actual same-stream GPU consumer before host readback. The
     // splice returns after enqueue, not after its residual DMA completes.
     gpu.add_inplace_f32(&residual, &delta)?;
-    gpu.hip.stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
+    gpu.hip
+        .stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
     let consumed: Vec<f32> = got.iter().map(|v| v + 0.125).collect();
     assert_eq!(
-        gpu.download_f32(&residual)?, consumed,
+        gpu.download_f32(&residual)?,
+        consumed,
         "GPU consumer overtook the nonblocking-stream CPU return",
     );
     let seed_bytes = unsafe {
@@ -1075,13 +1147,34 @@ fn graded_cpu_moe_experts_multirow_parity() -> Result<(), Box<dyn std::error::Er
     };
     gpu.hip.memcpy_htod(&residual.buf, seed_bytes)?;
     moe_cpu_experts(
-        &gpu, dim, mi, 1, KTOP, &x, &indices, &weights, &residual, false, |e| resolve(&gpu, e),
+        &gpu,
+        dim,
+        mi,
+        1,
+        KTOP,
+        &x,
+        &indices,
+        &weights,
+        &residual,
+        false,
+        false,
+        |e| resolve(&gpu, e),
     )?;
-    gpu.hip.stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
+    gpu.hip
+        .stream_synchronize(gpu.active_stream.as_ref().expect("test stream"))?;
     let single = gpu.download_f32(&residual)?;
-    assert_eq!(&single[..dim], &got[..dim], "stage reuse changed the committed row");
-    assert_eq!(&single[dim..], &seed[dim..], "splice overwrote spare residual rows");
-    gpu.hip.stream_destroy(gpu.active_stream.take().expect("test stream"))?;
+    assert_eq!(
+        &single[..dim],
+        &got[..dim],
+        "stage reuse changed the committed row"
+    );
+    assert_eq!(
+        &single[dim..],
+        &seed[dim..],
+        "splice overwrote spare residual rows"
+    );
+    gpu.hip
+        .stream_destroy(gpu.active_stream.take().expect("test stream"))?;
     eprintln!("GRADED_CPU_STREAM_REUSE_PARITY PASS (rows 3 -> 2 -> 3 -> 1)");
     Ok(())
 }

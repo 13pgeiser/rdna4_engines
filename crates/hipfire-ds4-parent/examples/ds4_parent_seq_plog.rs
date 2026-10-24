@@ -39,9 +39,7 @@ fn run() -> Result<(), String> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--model" => model = PathBuf::from(args.next().ok_or("missing --model")?),
-            "--token-ids" => {
-                tokens_path = PathBuf::from(args.next().ok_or("missing --token-ids")?)
-            }
+            "--token-ids" => tokens_path = PathBuf::from(args.next().ok_or("missing --token-ids")?),
             "--plog" => plog = PathBuf::from(args.next().ok_or("missing --plog")?),
             other => return Err(format!("unknown arg {other}")),
         }

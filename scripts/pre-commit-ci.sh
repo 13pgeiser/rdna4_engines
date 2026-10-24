@@ -12,9 +12,14 @@
 #   BASE_REF  the branch the PR targets, e.g. origin/beta; forwarded to
 #             ratchet-diff.sh (its default is origin/master).
 #
-# rustfmt checks the staged + unstaged .rs files vs HEAD. Runs every check,
-# then exits 1 if any failed. Missing cargo-deny is an unmet prerequisite,
-# not a supply-chain finding; report how to install it and fail closed.
+# rustfmt: the whole workspace must be clean (`cargo-fmt --all -- --check`;
+# beta is rustfmt-clean since the 0.4.3 sweep, and the generated AIE2P tables
+# are #[rustfmt::skip]), plus CI's per-file check on the staged + unstaged .rs
+# files vs HEAD, which also covers files outside the workspace (tools/).
+# `cargo-fmt` is called directly because .cargo/config.toml shadows `cargo fmt`.
+# Runs every check, then exits 1 if any failed. Missing cargo-deny is an unmet
+# prerequisite, not a supply-chain finding; report how to install it and fail
+# closed.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
@@ -37,6 +42,7 @@ else
     echo "ERROR: cargo-deny is unavailable; install it with: cargo install --locked cargo-deny" >&2
     failed+=("cargo deny check bans licenses sources (cargo-deny unavailable)")
 fi
+run cargo-fmt --all -- --check
 run bash scripts/ci-rustfmt-changed.sh
 run cargo clippy --workspace --all-targets --locked
 run python3 scripts/check-env-docs.py

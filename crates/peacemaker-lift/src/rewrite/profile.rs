@@ -27,7 +27,9 @@ use peacemaker_ir::operand::{CachePolicy, Modifiers, Msg, Operand};
 use peacemaker_ir::reg::{ClaimOwner, Kind, RegClaim, RegRef, Scope};
 use peacemaker_ir::wait::Counter;
 
-use super::build::{self, depctr, hw, imm, inst, op, s, s2, s4, simm16, smem_offset, ttmp, v, vmem_offset};
+use super::build::{
+    self, depctr, hw, imm, inst, op, s, s2, s4, simm16, smem_offset, ttmp, v, vmem_offset,
+};
 use super::{RewriteError, SourceMap};
 
 pub const PROFILED_SUFFIX: &str = "__pm_profile";
@@ -87,11 +89,18 @@ pub struct Plan {
 /// A point position: before layout index `at`, and before a label there (end of the
 /// previous block) when `before_label`.
 #[derive(Clone, Copy, Debug)]
-struct Gap { at: usize, before_label: bool }
+struct Gap {
+    at: usize,
+    before_label: bool,
+}
 
-fn client(reason: impl Into<String>) -> RewriteError { RewriteError::Client(reason.into()) }
+fn client(reason: impl Into<String>) -> RewriteError {
+    RewriteError::Client(reason.into())
+}
 
-fn name(i: &Inst) -> &'static str { super::mnemonic(i) }
+fn name(i: &Inst) -> &'static str {
+    super::mnemonic(i)
+}
 
 /// `(first, last)` layout positions of every `s_clause` / `s_delay_alu` window, as the
 /// text pass reads them (a delay skip does not count other `s_delay_alu` lines).
@@ -102,11 +111,18 @@ fn windows(insts: &[&Inst]) -> Vec<(usize, usize)> {
             Control::Clause => i + 1 + usize::from(inst.mods.clause.unwrap_or(0)),
             Control::Delay => {
                 let hint = inst.mods.delay.unwrap_or_default();
-                let mut left = if hint.instid1 != 0 { usize::from(hint.instskip) } else { 0 };
+                let mut left = if hint.instid1 != 0 {
+                    usize::from(hint.instskip)
+                } else {
+                    0
+                };
                 let mut t = i + 1;
                 let mut j = t + 1;
                 while left > 0 && j < insts.len() {
-                    if insts[j].effects.control != Control::Delay { t = j; left -= 1; }
+                    if insts[j].effects.control != Control::Delay {
+                        t = j;
+                        left -= 1;
+                    }
                     j += 1;
                 }
                 t
@@ -120,10 +136,27 @@ fn windows(insts: &[&Inst]) -> Vec<(usize, usize)> {
 
 /// Move a gap out of any window: up to the opener (`before`), down past the last member
 /// or target (`after`, labels).
-fn settle(mut gap: Gap, down: bool, windows: &[(usize, usize)], labels: &BTreeSet<usize>) -> (Gap, bool) {
+fn settle(
+    mut gap: Gap,
+    down: bool,
+    windows: &[(usize, usize)],
+    labels: &BTreeSet<usize>,
+) -> (Gap, bool) {
     let mut moved = false;
     while let Some(&(s, e)) = windows.iter().find(|&&(s, e)| gap.at > s && gap.at <= e) {
-        gap = if down { Gap { at: e + 1, before_label: labels.contains(&(e + 1)), ..gap } } else { Gap { at: s, before_label: false, ..gap } };
+        gap = if down {
+            Gap {
+                at: e + 1,
+                before_label: labels.contains(&(e + 1)),
+                ..gap
+            }
+        } else {
+            Gap {
+                at: s,
+                before_label: false,
+                ..gap
+            }
+        };
         moved = true;
     }
     (gap, moved)
@@ -137,18 +170,38 @@ fn pick(kernel: &Kernel, vgpr_count: u32, inputs: u16) -> Result<Registers, Rewr
     let mut used_s = BTreeSet::new();
     for &id in &kernel.body.layout {
         for operand in &kernel.body.insts.get(id).expect("laid out").operands {
-            let (Operand::Reg(r) | Operand::Half(r, _)) = operand else { continue };
-            let set = match r.kind { Kind::V => &mut used_v, Kind::S => &mut used_s, Kind::Ttmp => continue };
+            let (Operand::Reg(r) | Operand::Half(r, _)) = operand else {
+                continue;
+            };
+            let set = match r.kind {
+                Kind::V => &mut used_v,
+                Kind::S => &mut used_s,
+                Kind::Ttmp => continue,
+            };
             set.extend(r.base..r.base + u16::from(r.len));
         }
     }
     let limit = (vgpr_count.div_ceil(VGPR_GRANULE) * VGPR_GRANULE).min(256) as u16;
-    let scratch_vgpr = (0..limit).rev().find(|n| !used_v.contains(n)).ok_or_else(|| client(format!("no unreferenced VGPR below v{limit}")))?;
+    let scratch_vgpr = (0..limit)
+        .rev()
+        .find(|n| !used_v.contains(n))
+        .ok_or_else(|| client(format!("no unreferenced VGPR below v{limit}")))?;
     let mut taken: BTreeSet<u16> = (0..inputs).collect();
     let mut take = |n: u16, align: u16, unused_only: bool| -> Result<u16, RewriteError> {
-        let free = |unused: bool, taken: &BTreeSet<u16>| (0..SGPR_LIMIT).step_by(usize::from(align))
-            .find(|&b| b + n <= SGPR_LIMIT && (b..b + n).all(|r| !taken.contains(&r) && (!unused || !used_s.contains(&r))));
-        let b = free(unused_only, &taken).or_else(|| if unused_only { None } else { free(true, &taken) })
+        let free = |unused: bool, taken: &BTreeSet<u16>| {
+            (0..SGPR_LIMIT).step_by(usize::from(align)).find(|&b| {
+                b + n <= SGPR_LIMIT
+                    && (b..b + n).all(|r| !taken.contains(&r) && (!unused || !used_s.contains(&r)))
+            })
+        };
+        let b = free(unused_only, &taken)
+            .or_else(|| {
+                if unused_only {
+                    None
+                } else {
+                    free(true, &taken)
+                }
+            })
             .ok_or_else(|| client("not enough SGPRs for the profile record"))?;
         taken.extend(b..b + n);
         Ok(b)
@@ -160,34 +213,91 @@ fn pick(kernel: &Kernel, vgpr_count: u32, inputs: u16) -> Result<Registers, Rewr
     let entry_pair = take(2, 2, false)?;
     let realtime_pair = take(2, 2, false)?;
     let mut entry_singles = [0; 6];
-    for s in &mut entry_singles { *s = take(1, 1, false)?; }
-    Ok(Registers { scratch_vgpr, pointer, timestamp, exec_save, entry_quad, entry_pair, realtime_pair, entry_singles })
+    for s in &mut entry_singles {
+        *s = take(1, 1, false)?;
+    }
+    Ok(Registers {
+        scratch_vgpr,
+        pointer,
+        timestamp,
+        exec_save,
+        entry_quad,
+        entry_pair,
+        realtime_pair,
+        entry_singles,
+    })
 }
 
-fn nt_store() -> Modifiers { Modifiers { cpol: CachePolicy { th: 1, ..CachePolicy::default() }, ..Modifiers::default() } }
+fn nt_store() -> Modifiers {
+    Modifiers {
+        cpol: CachePolicy {
+            th: 1,
+            ..CachePolicy::default()
+        },
+        ..Modifiers::default()
+    }
+}
 
-fn wait_alu(raw: u16) -> Result<Inst, RewriteError> { Ok(op("s_wait_alu", vec![simm16(raw)])?) }
+fn wait_alu(raw: u16) -> Result<Inst, RewriteError> {
+    Ok(op("s_wait_alu", vec![simm16(raw)])?)
+}
 
-fn getreg(dst: u16, id: u16) -> Result<Inst, RewriteError> { Ok(op("s_getreg_b32", vec![s(dst), build::hwreg(id, 0, 32)])?) }
+fn getreg(dst: u16, id: u16) -> Result<Inst, RewriteError> {
+    Ok(op("s_getreg_b32", vec![s(dst), build::hwreg(id, 0, 32)])?)
+}
 
 fn writelane(r: &Registers, src: Operand, lane: i64) -> Result<Inst, RewriteError> {
-    Ok(op("v_writelane_b32", vec![v(r.scratch_vgpr), src, imm(lane)])?)
+    Ok(op(
+        "v_writelane_b32",
+        vec![v(r.scratch_vgpr), src, imm(lane)],
+    )?)
 }
 
 fn realtime(r: &Registers) -> Result<Inst, RewriteError> {
-    Ok(op("s_sendmsg_rtn_b64", vec![s2(r.realtime_pair), Operand::SendMsg(Msg { id: build::MSG_RTN_GET_REALTIME, op: 0 })])?)
+    Ok(op(
+        "s_sendmsg_rtn_b64",
+        vec![
+            s2(r.realtime_pair),
+            Operand::SendMsg(Msg {
+                id: build::MSG_RTN_GET_REALTIME,
+                op: 0,
+            }),
+        ],
+    )?)
 }
 
-fn kmcnt0() -> Result<Inst, RewriteError> { Ok(inst("s_wait_kmcnt", vec![simm16(0)], build::wait_mods(Counter::Km, 0))?) }
+fn kmcnt0() -> Result<Inst, RewriteError> {
+    Ok(inst(
+        "s_wait_kmcnt",
+        vec![simm16(0)],
+        build::wait_mods(Counter::Km, 0),
+    )?)
+}
 
 /// EXEC to `lanes` lanes, bump the pointer, store the scratch VGPR's lanes, restore EXEC.
 fn store(r: &Registers, lanes: u32, bytes: u32, va_sdst: bool) -> Result<Vec<Inst>, RewriteError> {
     let mut out = Vec::new();
-    if va_sdst { out.push(wait_alu(depctr::VA_SDST_0)?); }
+    if va_sdst {
+        out.push(wait_alu(depctr::VA_SDST_0)?);
+    }
     out.push(op("s_mov_b32", vec![s(r.exec_save), build::exec_lo()])?);
-    out.push(op("s_mov_b32", vec![build::exec_lo(), imm((1i64 << lanes) - 1)])?);
-    out.push(op("s_add_nc_u64", vec![s2(r.pointer), s2(r.pointer), imm(i64::from(bytes))])?);
-    out.push(inst("global_store_addtid_b32", vec![v(r.scratch_vgpr), s2(r.pointer), vmem_offset(-(bytes as i32))], nt_store())?);
+    out.push(op(
+        "s_mov_b32",
+        vec![build::exec_lo(), imm((1i64 << lanes) - 1)],
+    )?);
+    out.push(op(
+        "s_add_nc_u64",
+        vec![s2(r.pointer), s2(r.pointer), imm(i64::from(bytes))],
+    )?);
+    out.push(inst(
+        "global_store_addtid_b32",
+        vec![
+            v(r.scratch_vgpr),
+            s2(r.pointer),
+            vmem_offset(-(bytes as i32)),
+        ],
+        nt_store(),
+    )?);
     out.push(op("s_mov_b32", vec![build::exec_lo(), s(r.exec_save)])?);
     Ok(out)
 }
@@ -206,10 +316,15 @@ fn point(r: &Registers, id: u32, va_sdst: bool) -> Result<Vec<Inst>, RewriteErro
 fn entry(r: &Registers, ext: u32, va_sdst: bool) -> Result<Vec<Inst>, RewriteError> {
     let [w, h1, h2, ch, z, l] = r.entry_singles;
     let (q, rr, rt, p) = (r.entry_quad, r.entry_pair, r.realtime_pair, r.pointer);
-    let sop2 = |name: &str, d: u16, a: Operand, b: Operand| -> Result<Inst, RewriteError> { Ok(op(name, vec![s(d), a, b])?) };
+    let sop2 = |name: &str, d: u16, a: Operand, b: Operand| -> Result<Inst, RewriteError> {
+        Ok(op(name, vec![s(d), a, b])?)
+    };
     let mut out = vec![
         op("s_load_b128", vec![s4(q), s2(0), smem_offset(ext as i32)])?,
-        op("s_load_b64", vec![s2(rr), s2(0), smem_offset((ext + 16) as i32)])?,
+        op(
+            "s_load_b64",
+            vec![s2(rr), s2(0), smem_offset((ext + 16) as i32)],
+        )?,
         getreg(h1, hw::HW_ID1)?,
         getreg(h2, hw::HW_ID2)?,
         getreg(ch, hw::SHADER_CYCLES_HI)?,
@@ -259,12 +374,33 @@ fn exit(r: &Registers, id: u32, va_sdst: bool) -> Result<Vec<Inst>, RewriteError
 
 /// Instrument `symbol` of `program` (lifted from the object assembled from `source`) with
 /// the point `rules`; returns the core script, the sites and the registers.
-pub fn plan(program: &Program, symbol: &SymbolId, source: &str, rules: &[Rule]) -> Result<Plan, RewriteError> {
-    let kernel = program.kernels.iter().find(|k| &k.symbol == symbol).ok_or_else(|| client(format!("no kernel {}", symbol.0)))?;
-    let Abi::Hsa { descriptor, metadata } = &kernel.abi else { return Err(client("the profiler needs an HSA kernel")) };
-    if !descriptor.kernel_code_properties.wave32() { return Err(client("the profiler supports wave32 kernels only")); }
+pub fn plan(
+    program: &Program,
+    symbol: &SymbolId,
+    source: &str,
+    rules: &[Rule],
+) -> Result<Plan, RewriteError> {
+    let kernel = program
+        .kernels
+        .iter()
+        .find(|k| &k.symbol == symbol)
+        .ok_or_else(|| client(format!("no kernel {}", symbol.0)))?;
+    let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &kernel.abi
+    else {
+        return Err(client("the profiler needs an HSA kernel"));
+    };
+    if !descriptor.kernel_code_properties.wave32() {
+        return Err(client("the profiler supports wave32 kernels only"));
+    }
     let body = &kernel.body;
-    let insts: Vec<&Inst> = body.layout.iter().map(|&id| body.insts.get(id).expect("laid out")).collect();
+    let insts: Vec<&Inst> = body
+        .layout
+        .iter()
+        .map(|&id| body.insts.get(id).expect("laid out"))
+        .collect();
 
     // The source names the anchors: its instruction lines of this kernel are the
     // kernel's instructions one for one.
@@ -275,11 +411,24 @@ pub fn plan(program: &Program, symbol: &SymbolId, source: &str, rules: &[Rule]) 
     // Kernel facts the text pass reads from the source.
     let va_sdst = insts.iter().any(|i| name(i).starts_with("v_cmpx"));
     for (k, i) in insts.iter().enumerate() {
-        let store_count = i.mods.wait.as_ref().and_then(|w| w.per_counter[Counter::Store as usize]);
-        if store_count.is_some_and(|n| n != 0) { return Err(client(format!("instruction {k}: a nonzero store wait would count profile stores"))); }
+        let store_count = i
+            .mods
+            .wait
+            .as_ref()
+            .and_then(|w| w.per_counter[Counter::Store as usize]);
+        if store_count.is_some_and(|n| n != 0) {
+            return Err(client(format!(
+                "instruction {k}: a nonzero store wait would count profile stores"
+            )));
+        }
     }
     let rsrc2 = descriptor.compute_pgm_rsrc2.0;
-    let inputs = (rsrc2 >> 1 & 0x1f) + (rsrc2 >> 7 & 1) + (rsrc2 >> 8 & 1) + (rsrc2 >> 9 & 1) + (rsrc2 >> 10 & 1) + (rsrc2 & 1);
+    let inputs = (rsrc2 >> 1 & 0x1f)
+        + (rsrc2 >> 7 & 1)
+        + (rsrc2 >> 8 & 1)
+        + (rsrc2 >> 9 & 1)
+        + (rsrc2 >> 10 & 1)
+        + (rsrc2 & 1);
     let meta = &metadata.parsed;
     let registers = pick(kernel, meta.vgpr_count, inputs as u16)?;
 
@@ -290,43 +439,103 @@ pub fn plan(program: &Program, symbol: &SymbolId, source: &str, rules: &[Rule]) 
         let (prefix, down) = match (&rule.label, &rule.before, &rule.after) {
             (Some(label), None, None) => {
                 let at = map.at_label(label)?;
-                let (gap, moved) = settle(Gap { at, before_label: false }, true, &windows, &label_at);
+                let (gap, moved) = settle(
+                    Gap {
+                        at,
+                        before_label: false,
+                    },
+                    true,
+                    &windows,
+                    &label_at,
+                );
                 gaps.push((gap, rule.name.clone(), moved));
                 continue;
             }
             (None, Some(p), None) => (p.as_str(), false),
             (None, None, Some(p)) => (p.as_str(), true),
-            _ => return Err(client(format!("rule {}: give exactly one of label/before/after", rule.name))),
+            _ => {
+                return Err(client(format!(
+                    "rule {}: give exactly one of label/before/after",
+                    rule.name
+                )))
+            }
         };
-        let mut hits: Vec<usize> = (0..lines.len()).filter(|&k| lines[k].starts_with(prefix)).collect();
+        let mut hits: Vec<usize> = (0..lines.len())
+            .filter(|&k| lines[k].starts_with(prefix))
+            .collect();
         if let Some(mark) = &rule.first_after {
-            let marks: Vec<usize> = (0..lines.len()).filter(|&k| lines[k].starts_with(mark.as_str())).collect();
-            hits = marks.iter().enumerate().filter_map(|(n, &m)| {
-                let limit = marks.get(n + 1).copied().unwrap_or(lines.len());
-                hits.iter().copied().find(|&h| h > m && h < limit)
-            }).collect();
+            let marks: Vec<usize> = (0..lines.len())
+                .filter(|&k| lines[k].starts_with(mark.as_str()))
+                .collect();
+            hits = marks
+                .iter()
+                .enumerate()
+                .filter_map(|(n, &m)| {
+                    let limit = marks.get(n + 1).copied().unwrap_or(lines.len());
+                    hits.iter().copied().find(|&h| h > m && h < limit)
+                })
+                .collect();
         }
         if let Some(keep) = &rule.occurrences {
-            if keep.iter().any(|&k| k >= hits.len()) { return Err(client(format!("rule {}: occurrence out of range", rule.name))); }
+            if keep.iter().any(|&k| k >= hits.len()) {
+                return Err(client(format!(
+                    "rule {}: occurrence out of range",
+                    rule.name
+                )));
+            }
             hits = keep.iter().map(|&k| hits[k]).collect();
         }
-        if hits.is_empty() { return Err(client(format!("rule {}: no instruction starts with {prefix:?}", rule.name))); }
+        if hits.is_empty() {
+            return Err(client(format!(
+                "rule {}: no instruction starts with {prefix:?}",
+                rule.name
+            )));
+        }
         for h in hits {
-            let gap = if down { Gap { at: h + 1, before_label: label_at.contains(&(h + 1)) } } else { Gap { at: h, before_label: false } };
+            let gap = if down {
+                Gap {
+                    at: h + 1,
+                    before_label: label_at.contains(&(h + 1)),
+                }
+            } else {
+                Gap {
+                    at: h,
+                    before_label: false,
+                }
+            };
             let (gap, moved) = settle(gap, down, &windows, &label_at);
             gaps.push((gap, rule.name.clone(), moved));
         }
     }
     for k in (0..insts.len()).filter(|&k| name(insts[k]) == "s_endpgm") {
-        if windows.iter().any(|&(s, e)| k > s && k <= e) { return Err(client("s_endpgm inside a scheduling window")); }
+        if windows.iter().any(|&(s, e)| k > s && k <= e) {
+            return Err(client("s_endpgm inside a scheduling window"));
+        }
         let mut at = k;
-        let is_dealloc = |j: usize| name(insts[j]) == "s_sendmsg" && insts[j].operands.first() == Some(&Operand::SendMsg(Msg { id: 3, op: 0 }));
+        let is_dealloc = |j: usize| {
+            name(insts[j]) == "s_sendmsg"
+                && insts[j].operands.first() == Some(&Operand::SendMsg(Msg { id: 3, op: 0 }))
+        };
         if at > 0 && is_dealloc(at - 1) {
             at -= 1;
-            if at > 0 && name(insts[at - 1]) == "s_nop" && insts[at - 1].operands.first() == Some(&simm16(0)) { at -= 1; }
+            if at > 0
+                && name(insts[at - 1]) == "s_nop"
+                && insts[at - 1].operands.first() == Some(&simm16(0))
+            {
+                at -= 1;
+            }
         }
-        if (at + 1..=k).any(|j| label_at.contains(&j)) { return Err(client("label between the exit record and s_endpgm")); }
-        gaps.push((Gap { at, before_label: false }, "exit".into(), at != k));
+        if (at + 1..=k).any(|j| label_at.contains(&j)) {
+            return Err(client("label between the exit record and s_endpgm"));
+        }
+        gaps.push((
+            Gap {
+                at,
+                before_label: false,
+            },
+            "exit".into(),
+            at != k,
+        ));
     }
     gaps.sort_by_key(|(g, _, _)| (g.at, !g.before_label));
 
@@ -335,58 +544,152 @@ pub fn plan(program: &Program, symbol: &SymbolId, source: &str, rules: &[Rule]) 
     let ext = descriptor.kernarg_size.div_ceil(8) * 8;
     let r = &registers;
     let new_vgpr = meta.vgpr_count.max(u32::from(r.scratch_vgpr) + 1);
-    let ours = [r.pointer + 1, r.timestamp, r.exec_save, r.entry_quad + 3, r.entry_pair + 1, r.realtime_pair + 1].into_iter()
-        .chain(r.entry_singles).max().unwrap_or(0);
+    let ours = [
+        r.pointer + 1,
+        r.timestamp,
+        r.exec_save,
+        r.entry_quad + 3,
+        r.entry_pair + 1,
+        r.realtime_pair + 1,
+    ]
+    .into_iter()
+    .chain(r.entry_singles)
+    .max()
+    .unwrap_or(0);
     let new_sgpr = meta.sgpr_count.max(u32::from(ours) + 1);
     let arg = |name: &str, offset: u32, size: u32, kind: &str, space: Option<&str>| Kernarg {
-        name: name.into(), size, offset, value_kind: kind.into(), address_space: space.map(Into::into),
+        name: name.into(),
+        size,
+        offset,
+        value_kind: kind.into(),
+        address_space: space.map(Into::into),
     };
     let args = vec![
-        arg("pm_profile_records", ext, 8, "global_buffer", Some("global")),
+        arg(
+            "pm_profile_records",
+            ext,
+            8,
+            "global_buffer",
+            Some("global"),
+        ),
         arg("pm_slot_bytes", ext + 8, 4, "by_value", None),
         arg("pm_waves_per_wg", ext + 12, 4, "by_value", None),
         arg("pm_grid_x", ext + 16, 4, "by_value", None),
         arg("pm_grid_y", ext + 20, 4, "by_value", None),
     ];
-    let claim = |name: &str, reg: RegRef| RegClaim { name: name.into(), reg, scope: Scope::Whole, owner: ClaimOwner::Builder };
-    let sreg = |base: u16, len: u8| RegRef { kind: Kind::S, base, len };
+    let claim = |name: &str, reg: RegRef| RegClaim {
+        name: name.into(),
+        reg,
+        scope: Scope::Whole,
+        owner: ClaimOwner::Builder,
+    };
+    let sreg = |base: u16, len: u8| RegRef {
+        kind: Kind::S,
+        base,
+        len,
+    };
     let claims = vec![
         claim("pm_pointer", sreg(r.pointer, 2)),
         claim("pm_timestamp", sreg(r.timestamp, 1)),
         claim("pm_exec_save", sreg(r.exec_save, 1)),
-        claim("pm_record", RegRef { kind: Kind::V, base: r.scratch_vgpr, len: 1 }),
+        claim(
+            "pm_record",
+            RegRef {
+                kind: Kind::V,
+                base: r.scratch_vgpr,
+                len: 1,
+            },
+        ),
     ];
     let mut script = vec![
-        Edit::Descriptor { kernel: kernel_sym.clone(), change: DescriptorChange::KernargSize(ext + KERNARG_EXT_BYTES) },
-        Edit::Metadata { kernel: kernel_sym.clone(), change: MetaChange::AppendArgs(args) },
+        Edit::Descriptor {
+            kernel: kernel_sym.clone(),
+            change: DescriptorChange::KernargSize(ext + KERNARG_EXT_BYTES),
+        },
+        Edit::Metadata {
+            kernel: kernel_sym.clone(),
+            change: MetaChange::AppendArgs(args),
+        },
     ];
     // Counts the text pass leaves unchanged (`max(old, new)`) are not edited.
     if new_vgpr != meta.vgpr_count {
-        script.push(Edit::Descriptor { kernel: kernel_sym.clone(), change: DescriptorChange::NextFreeVgpr(new_vgpr) });
-        script.push(Edit::Metadata { kernel: kernel_sym.clone(), change: MetaChange::SetVgprCount(new_vgpr) });
+        script.push(Edit::Descriptor {
+            kernel: kernel_sym.clone(),
+            change: DescriptorChange::NextFreeVgpr(new_vgpr),
+        });
+        script.push(Edit::Metadata {
+            kernel: kernel_sym.clone(),
+            change: MetaChange::SetVgprCount(new_vgpr),
+        });
     }
     if new_sgpr != meta.sgpr_count {
-        script.push(Edit::Metadata { kernel: kernel_sym.clone(), change: MetaChange::SetSgprCount(new_sgpr) });
+        script.push(Edit::Metadata {
+            kernel: kernel_sym.clone(),
+            change: MetaChange::SetSgprCount(new_sgpr),
+        });
     }
     // Every insertion carries the claims: each step is its own transaction.
-    script.push(Edit::Insert { at: Cursor::before(BlockId(0), body.layout[0]), insts: entry(r, ext, va_sdst)?, claims: claims.clone() });
-    let block_of = |at: usize| body.blocks.iter().position(|b| b.range.0 <= at && at < b.range.1).expect("laid out");
-    let mut sites = vec![Site { id: 0, rule: "entry".into(), at: 0, moved: false }];
+    script.push(Edit::Insert {
+        at: Cursor::before(BlockId(0), body.layout[0]),
+        insts: entry(r, ext, va_sdst)?,
+        claims: claims.clone(),
+    });
+    let block_of = |at: usize| {
+        body.blocks
+            .iter()
+            .position(|b| b.range.0 <= at && at < b.range.1)
+            .expect("laid out")
+    };
+    let mut sites = vec![Site {
+        id: 0,
+        rule: "entry".into(),
+        at: 0,
+        moved: false,
+    }];
     for (k, (gap, rule, moved)) in gaps.iter().enumerate() {
         let id = k as u32 + 1;
-        if gap.at >= body.layout.len() { return Err(client(format!("rule {rule} lands after the last instruction"))); }
+        if gap.at >= body.layout.len() {
+            return Err(client(format!(
+                "rule {rule} lands after the last instruction"
+            )));
+        }
         let block = block_of(gap.at);
         let cursor = if gap.before_label && body.blocks[block].range.0 == gap.at {
-            if block == 0 { return Err(client(format!("rule {rule}: nothing precedes the entry label"))); }
+            if block == 0 {
+                return Err(client(format!(
+                    "rule {rule}: nothing precedes the entry label"
+                )));
+            }
             Cursor::end(BlockId(block - 1))
         } else {
             Cursor::before(BlockId(block), body.layout[gap.at])
         };
-        let seq = if rule == "exit" { exit(r, id, va_sdst)? } else { point(r, id, va_sdst)? };
-        script.push(Edit::Insert { at: cursor, insts: seq, claims: claims.clone() });
-        sites.push(Site { id, rule: rule.clone(), at: gap.at, moved: *moved });
+        let seq = if rule == "exit" {
+            exit(r, id, va_sdst)?
+        } else {
+            point(r, id, va_sdst)?
+        };
+        script.push(Edit::Insert {
+            at: cursor,
+            insts: seq,
+            claims: claims.clone(),
+        });
+        sites.push(Site {
+            id,
+            rule: rule.clone(),
+            at: gap.at,
+            moved: *moved,
+        });
     }
     let profiled = format!("{}{PROFILED_SUFFIX}", symbol.0);
-    script.push(Edit::Metadata { kernel: kernel_sym, change: MetaChange::Rename(profiled.clone()) });
-    Ok(Plan { profiled, registers, sites, script })
+    script.push(Edit::Metadata {
+        kernel: kernel_sym,
+        change: MetaChange::Rename(profiled.clone()),
+    });
+    Ok(Plan {
+        profiled,
+        registers,
+        sites,
+        script,
+    })
 }

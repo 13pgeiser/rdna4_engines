@@ -940,8 +940,14 @@ pub fn validate_ep_batch_compatibility(
         .and_then(|v| v.checked_add(peer_bytes_per_rank as u64))
         .ok_or_else(|| HipError::new(0, "per-rank total overflow"))?;
     // Per-device VRAM check using shared helper, not aggregate total vs min_free.
+    // EP spans several devices, which a single-device HIPFIRE_EMU budget cannot
+    // cover: refuse under emulation (no-op when off). Each rank's room is the
+    // capped per-device query (UMA-safe clamp, then the emu cap).
+    if let Some(first) = gpus.devices.first() {
+        first.emu_refuse_multi_device("qwen35 expert-parallel batch")?;
+    }
     for (idx, dev) in gpus.devices.iter().enumerate() {
-        if let Ok((free, _)) = dev.hip.get_vram_info() {
+        if let Ok((free, _)) = dev.device_mem_info_for(dev.device_id) {
             if per_rank_total > free as u64 {
                 return Err(HipError::new(
                     0,
@@ -2765,7 +2771,7 @@ impl Qwen35DecodeBatchEpState {
 /// Every rank holds **full replicated** weights / scratch / KV / DeltaNet
 /// state EXCEPT the MoE routed experts, which were sharded per rank at load by
 /// [`shard_moe_experts`]. Behaviorally this mirrors the single-GPU
-/// [`forward_scratch`] → [`forward_scratch_layers_lowered`] pipeline (embed →
+/// [`forward_scratch`] → `forward_scratch_layers` pipeline (embed →
 /// per-layer `LayerProgram` → final norm + lm_head), but runs each layer's
 /// program through the EP executor ([`hipfire_runtime::ep::run_layer_program_ep`]):
 /// the `Moe` super-op is all-reduce-EP'd across ranks (each rank computes only
@@ -2827,10 +2833,6 @@ pub fn forward_ep(
     assert_eq!(partials.len(), n, "forward_ep: partials.len() != n_ranks");
 
     let dim = config.dim;
-    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
-    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-    let n_v_heads = config.linear_num_value_heads;
-    let hd = config.linear_key_head_dim;
     let pos_i32 = pos as i32;
 
     // 1. Embed token + write pos on each rank (replicated; deterministic, since
@@ -2885,10 +2887,6 @@ pub fn forward_ep(
                 pos,
                 layer_idx,
                 delta_layer_idx,
-                k_dim,
-                v_dim,
-                n_v_heads,
-                hd,
                 precomputed_attn_x_rot: false,
                 fa_output_prerotated: false,
                 defer_routed_combine: false,
@@ -3432,7 +3430,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkvza_key_for(dt);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_qkvza_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -3719,7 +3718,7 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkv_key_for(dt);
+                            let key = hipfire_dispatch::families::fused_qkv::fused_qkv_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -4207,7 +4206,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkvza_key_for(dt);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_qkvza_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -4425,7 +4425,7 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkv_key_for(dt);
+                            let key = hipfire_dispatch::families::fused_qkv::fused_qkv_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,

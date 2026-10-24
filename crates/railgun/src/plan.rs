@@ -111,8 +111,17 @@ impl CacheTable {
         if !matches!(arch, "gfx1200" | "gfx1201") {
             return None;
         }
-        let dependent = Visibility { wait_idle: true, acquire: Rung::InterNode, pre_writer: false };
-        let row = |hazard, visibility, evidence| CacheRow { hazard, visibility, evidence, g4_receipt: None };
+        let dependent = Visibility {
+            wait_idle: true,
+            acquire: Rung::InterNode,
+            pre_writer: false,
+        };
+        let row = |hazard, visibility, evidence| CacheRow {
+            hazard,
+            visibility,
+            evidence,
+            g4_receipt: None,
+        };
         Some(Self {
             arch: arch.to_owned(),
             rows: vec![
@@ -121,7 +130,11 @@ impl CacheTable {
                 row(Hazard::Waw, dependent, GFX12_PARITY),
                 row(
                     Hazard::WarPreWriter,
-                    Visibility { wait_idle: true, acquire: Rung::System, pre_writer: true },
+                    Visibility {
+                        wait_idle: true,
+                        acquire: Rung::System,
+                        pre_writer: true,
+                    },
                     GFX12_PRE_WRITER,
                 ),
             ],
@@ -135,9 +148,17 @@ impl CacheTable {
     /// the table's rung stale fails the whole attach: the tier-D rung is
     /// unsafe on this silicon. Rows the probe did not cover stay open
     /// obligations. `source` names the file (path and digest) in each receipt.
-    pub fn attach_receipts(&mut self, probe: &G4Table, source: &str, min_trials: u64) -> Result<usize, String> {
+    pub fn attach_receipts(
+        &mut self,
+        probe: &G4Table,
+        source: &str,
+        min_trials: u64,
+    ) -> Result<usize, String> {
         if probe.identity.arch != self.arch {
-            return Err(format!("G4 table is for {}, cache table for {}", probe.identity.arch, self.arch));
+            return Err(format!(
+                "G4 table is for {}, cache table for {}",
+                probe.identity.arch, self.arch
+            ));
         }
         let mut attached = 0;
         for row in &mut self.rows {
@@ -150,8 +171,12 @@ impl CacheTable {
             };
             let mut evidence = Vec::new();
             for name in backing {
-                let Some(probed) = probe.rows.iter().find(|r| r.row == *name) else { break };
-                let Some(result) = probed.trials.iter().find(|t| t.rung == rung) else { break };
+                let Some(probed) = probe.rows.iter().find(|r| r.row == *name) else {
+                    break;
+                };
+                let Some(result) = probed.trials.iter().find(|t| t.rung == rung) else {
+                    break;
+                };
                 if result.stale_trials != 0 {
                     return Err(format!(
                         "{:?} row: probe row {name} saw {} stale trials at the table rung {rung} ({} trials)",
@@ -176,7 +201,10 @@ impl CacheTable {
     }
 
     pub fn row(&self, hazard: Hazard) -> &CacheRow {
-        self.rows.iter().find(|r| r.hazard == hazard).expect("every hazard has a row")
+        self.rows
+            .iter()
+            .find(|r| r.hazard == hazard)
+            .expect("every hazard has a row")
     }
 }
 
@@ -212,8 +240,12 @@ impl ArchLowering {
     /// sweep ran there, and gfx1200 has no bench card.
     pub fn for_arch(arch: &str) -> Self {
         match arch {
-            "gfx1201" => Self { post_dispatch_nop: GFX1201_POST_DISPATCH_NOP },
-            _ => Self { post_dispatch_nop: 0 },
+            "gfx1201" => Self {
+                post_dispatch_nop: GFX1201_POST_DISPATCH_NOP,
+            },
+            _ => Self {
+                post_dispatch_nop: 0,
+            },
         }
     }
 }
@@ -304,9 +336,17 @@ pub enum Pm4Op {
 }
 
 /// The HIP→PM4 ownership acquire before a segment's first dispatch.
-pub const ENTRY: Visibility = Visibility { wait_idle: false, acquire: Rung::System, pre_writer: false };
+pub const ENTRY: Visibility = Visibility {
+    wait_idle: false,
+    acquire: Rung::System,
+    pre_writer: false,
+};
 /// Segment exit + drained HIP stream + entry: the full barrier around a non-PM4 node.
-pub const BARRIER: Visibility = Visibility { wait_idle: true, acquire: Rung::System, pre_writer: false };
+pub const BARRIER: Visibility = Visibility {
+    wait_idle: true,
+    acquire: Rung::System,
+    pre_writer: false,
+};
 
 /// Derive edges and boundaries for `program` under `table`.
 pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> Pm4Plan {
@@ -314,9 +354,11 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
         let row = table.row(hazard);
         match (policy, &row.g4_receipt) {
             (RowPolicy::TierD, _) | (RowPolicy::UnreceiptedSystem, Some(_)) => row.visibility,
-            (RowPolicy::UnreceiptedSystem, None) => {
-                Visibility { wait_idle: true, acquire: Rung::System, pre_writer: row.visibility.pre_writer }
-            }
+            (RowPolicy::UnreceiptedSystem, None) => Visibility {
+                wait_idle: true,
+                acquire: Rung::System,
+                pre_writer: row.visibility.pre_writer,
+            },
         }
     };
     let n = program.nodes.len();
@@ -334,7 +376,11 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             if let Some(first) = segment_start.take() {
                 segments.push(Segment { first, end: j });
             }
-            boundaries.push(Boundary { visibility: BARRIER, edges: Vec::new(), split: true });
+            boundaries.push(Boundary {
+                visibility: BARRIER,
+                edges: Vec::new(),
+                split: true,
+            });
             continue;
         }
         let Some(first) = segment_start else {
@@ -346,7 +392,11 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             // After a non-PM4 node the entry follows a drained HIP stream.
             let after_barrier = j > 0;
             let visibility = if after_barrier { BARRIER } else { ENTRY };
-            boundaries.push(Boundary { visibility, edges: Vec::new(), split: true });
+            boundaries.push(Boundary {
+                visibility,
+                edges: Vec::new(),
+                split: true,
+            });
             note_loads(program, j, &mut last_vmem_load);
             continue;
         };
@@ -358,7 +408,14 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
                     if earlier.resource != effect.resource {
                         continue;
                     }
-                    let mut push = |hazard| edges.push(Edge { producer: i, consumer: j, hazard, resource: effect.resource.0 });
+                    let mut push = |hazard| {
+                        edges.push(Edge {
+                            producer: i,
+                            consumer: j,
+                            hazard,
+                            resource: effect.resource.0,
+                        })
+                    };
                     if earlier.writes() && effect.reads() {
                         push(Hazard::Raw);
                     }
@@ -373,15 +430,26 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             if effect.has(MemClass::VmemStore) {
                 if let Some(&i) = last_vmem_load.get(&effect.resource) {
                     if i >= last_system && i < j {
-                        edges.push(Edge { producer: i, consumer: j, hazard: Hazard::WarPreWriter, resource: effect.resource.0 });
+                        edges.push(Edge {
+                            producer: i,
+                            consumer: j,
+                            hazard: Hazard::WarPreWriter,
+                            resource: effect.resource.0,
+                        });
                     }
                 }
             }
         }
         edges.sort_by_key(|e| (e.hazard, e.producer, e.resource));
         edges.dedup();
-        let visibility = edges.iter().fold(Visibility::default(), |acc, e| acc.join(visibility_of(e.hazard)));
-        for hazard in edges.iter().map(|e| e.hazard).collect::<std::collections::BTreeSet<_>>() {
+        let visibility = edges.iter().fold(Visibility::default(), |acc, e| {
+            acc.join(visibility_of(e.hazard))
+        });
+        for hazard in edges
+            .iter()
+            .map(|e| e.hazard)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
             *rows_used.entry(hazard).or_insert(0usize) += 1;
         }
         if visibility.wait_idle {
@@ -392,15 +460,28 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
             last_system = j;
         }
         note_loads(program, j, &mut last_vmem_load);
-        boundaries.push(Boundary { visibility, edges, split: false });
+        boundaries.push(Boundary {
+            visibility,
+            edges,
+            split: false,
+        });
     }
     if let Some(first) = segment_start {
         segments.push(Segment { first, end: n });
     }
-    Pm4Plan { policy, segments, boundaries, rows_used }
+    Pm4Plan {
+        policy,
+        segments,
+        boundaries,
+        rows_used,
+    }
 }
 
-fn note_loads(program: &KernelProgram, node: usize, last_vmem_load: &mut HashMap<ResourceId, usize>) {
+fn note_loads(
+    program: &KernelProgram,
+    node: usize,
+    last_vmem_load: &mut HashMap<ResourceId, usize>,
+) {
     for effect in &program.nodes[node].effects {
         if effect.has(MemClass::VmemLoad) {
             last_vmem_load.insert(effect.resource, node);
@@ -459,7 +540,12 @@ mod tests {
     /// n0 loads A, stores B; n1 loads B, stores C; n2 stores A (writer of an
     /// allocation n0 loaded); n3 loads D only (independent of n2).
     fn chain() -> crate::kernel::KernelProgram {
-        let (a, b, c, d) = (0x7000_0000u64, 0x7100_0000u64, 0x7200_0000u64, 0x7300_0000u64);
+        let (a, b, c, d) = (
+            0x7000_0000u64,
+            0x7100_0000u64,
+            0x7200_0000u64,
+            0x7300_0000u64,
+        );
         let two = vec![ptr(0, &[VmemLoad]), ptr(8, &[VmemStore])];
         let launches = vec![
             launch(&[(0, a), (8, b)], 16, two.clone()),
@@ -476,9 +562,22 @@ mod tests {
         let p = plan(&chain(), &table, RowPolicy::TierD);
         assert_eq!(p.segments.len(), 1);
         assert_eq!(p.boundaries[0].visibility, ENTRY);
-        assert_eq!(p.boundaries[1].visibility, Visibility { wait_idle: true, acquire: Rung::InterNode, pre_writer: false });
-        assert!(p.boundaries[1].edges.iter().all(|e| e.hazard == Hazard::Raw && e.producer == 0));
-        assert!(p.boundaries[3].visibility.is_empty(), "n3 touches only D: no edge, no wait");
+        assert_eq!(
+            p.boundaries[1].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::InterNode,
+                pre_writer: false
+            }
+        );
+        assert!(p.boundaries[1]
+            .edges
+            .iter()
+            .all(|e| e.hazard == Hazard::Raw && e.producer == 0));
+        assert!(
+            p.boundaries[3].visibility.is_empty(),
+            "n3 touches only D: no edge, no wait"
+        );
     }
 
     #[test]
@@ -488,8 +587,21 @@ mod tests {
         // n2 stores A, loaded by n0 two nodes earlier: n0 is outside the open
         // epoch (n1's wait closed it) but no system acquire intervened.
         let b = &p.boundaries[2];
-        assert_eq!(b.visibility, Visibility { wait_idle: true, acquire: Rung::System, pre_writer: true });
-        assert_eq!(b.edges.iter().map(|e| (e.hazard, e.producer)).collect::<Vec<_>>(), [(Hazard::WarPreWriter, 0)]);
+        assert_eq!(
+            b.visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::System,
+                pre_writer: true
+            }
+        );
+        assert_eq!(
+            b.edges
+                .iter()
+                .map(|e| (e.hazard, e.producer))
+                .collect::<Vec<_>>(),
+            [(Hazard::WarPreWriter, 0)]
+        );
     }
 
     #[test]
@@ -501,27 +613,65 @@ mod tests {
             launch(&[(8, a)], 16, vec![ptr(8, &[VmemStore])]),
         ];
         let program = author("gfx1201", &launches);
-        let p = plan(&program, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD);
+        let p = plan(
+            &program,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        );
         // n1 overwrites what n0 loaded: WAR + pre-writer ⇒ system acquire.
-        assert_eq!(p.boundaries[1].visibility, Visibility { wait_idle: true, acquire: Rung::System, pre_writer: true });
+        assert_eq!(
+            p.boundaries[1].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::System,
+                pre_writer: true
+            }
+        );
         // n2 overwrites it again: n0's load is behind n1's system acquire, so
         // only the WAW on n1 remains.
-        assert_eq!(p.boundaries[2].visibility, Visibility { wait_idle: true, acquire: Rung::InterNode, pre_writer: false });
-        assert_eq!(p.boundaries[2].edges.iter().map(|e| e.hazard).collect::<Vec<_>>(), [Hazard::Waw]);
+        assert_eq!(
+            p.boundaries[2].visibility,
+            Visibility {
+                wait_idle: true,
+                acquire: Rung::InterNode,
+                pre_writer: false
+            }
+        );
+        assert_eq!(
+            p.boundaries[2]
+                .edges
+                .iter()
+                .map(|e| e.hazard)
+                .collect::<Vec<_>>(),
+            [Hazard::Waw]
+        );
         // §2.2 read strictly (no G4 receipt ⇒ system) lifts the WAW too.
-        let strict = plan(&program, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::UnreceiptedSystem);
+        let strict = plan(
+            &program,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::UnreceiptedSystem,
+        );
         assert_eq!(strict.boundaries[2].visibility.acquire, Rung::System);
     }
 
     fn g4(rows: &[(&str, &[(&str, u64, u64)])]) -> G4Table {
         G4Table {
-            identity: G4Identity { arch: "gfx1201".into() },
+            identity: G4Identity {
+                arch: "gfx1201".into(),
+            },
             rows: rows
                 .iter()
                 .map(|(row, rungs)| G4Row {
                     row: (*row).into(),
                     weakest_safe_rung: None,
-                    trials: rungs.iter().map(|(r, t, s)| G4RungTrials { rung: (*r).into(), trials: *t, stale_trials: *s }).collect(),
+                    trials: rungs
+                        .iter()
+                        .map(|(r, t, s)| G4RungTrials {
+                            rung: (*r).into(),
+                            trials: *t,
+                            stale_trials: *s,
+                        })
+                        .collect(),
                 })
                 .collect(),
         }
@@ -530,10 +680,19 @@ mod tests {
     #[test]
     fn receipts_need_every_backing_row_clean_at_the_table_rung() {
         const M: u64 = 1 << 20;
-        let clean = [("wait", M, 0), ("wait_inter_node", M, 0), ("wait_system", M, 0)];
+        let clean = [
+            ("wait", M, 0),
+            ("wait_inter_node", M, 0),
+            ("wait_system", M, 0),
+        ];
         // RAW is backed by both the VMEM and the SMEM consumer rows.
         let mut table = CacheTable::for_arch("gfx1201").unwrap();
-        let only_vmem = g4(&[("raw_vmem", &clean), ("war", &clean), ("waw", &clean), ("war_pre_writer", &clean)]);
+        let only_vmem = g4(&[
+            ("raw_vmem", &clean),
+            ("war", &clean),
+            ("waw", &clean),
+            ("war_pre_writer", &clean),
+        ]);
         assert_eq!(table.attach_receipts(&only_vmem, "t", M), Ok(3));
         assert!(table.row(Hazard::Raw).g4_receipt.is_none());
         assert!(table.row(Hazard::WarPreWriter).g4_receipt.is_some());
@@ -543,13 +702,27 @@ mod tests {
         assert_eq!(table.attach_receipts(&short, "t", M), Ok(0));
         // The table rung itself seen stale: refused.
         let mut table = CacheTable::for_arch("gfx1201").unwrap();
-        let stale = g4(&[("raw_vmem", &clean), ("raw_smem", &[("wait_inter_node", M, 3)])]);
-        assert!(table.attach_receipts(&stale, "t", M).unwrap_err().contains("raw_smem"));
+        let stale = g4(&[
+            ("raw_vmem", &clean),
+            ("raw_smem", &[("wait_inter_node", M, 3)]),
+        ]);
+        assert!(table
+            .attach_receipts(&stale, "t", M)
+            .unwrap_err()
+            .contains("raw_smem"));
         // A weaker rung being stale does not matter for the table rung.
         let mut table = CacheTable::for_arch("gfx1201").unwrap();
-        let weaker_stale = g4(&[("raw_vmem", &[("wait", M, 9), ("wait_inter_node", M, 0)]), ("raw_smem", &clean)]);
+        let weaker_stale = g4(&[
+            ("raw_vmem", &[("wait", M, 9), ("wait_inter_node", M, 0)]),
+            ("raw_smem", &clean),
+        ]);
         assert_eq!(table.attach_receipts(&weaker_stale, "t", M), Ok(1));
-        assert!(table.row(Hazard::Raw).g4_receipt.as_deref().unwrap().contains("raw_smem@wait_inter_node"));
+        assert!(table
+            .row(Hazard::Raw)
+            .g4_receipt
+            .as_deref()
+            .unwrap()
+            .contains("raw_smem@wait_inter_node"));
     }
 
     #[test]
@@ -557,10 +730,17 @@ mod tests {
         let mut launches = vec![launch(&[(0, 0x7000_0000)], 16, vec![ptr(0, &[VmemLoad])]); 3];
         launches[1].facts = Err("no record".into());
         let program = author("gfx1201", &launches);
-        let p = plan(&program, &CacheTable::for_arch("gfx1201").unwrap(), RowPolicy::TierD);
+        let p = plan(
+            &program,
+            &CacheTable::for_arch("gfx1201").unwrap(),
+            RowPolicy::TierD,
+        );
         assert_eq!(p.segments.len(), 2);
         assert!(p.boundaries[1].split && p.boundaries[1].visibility == BARRIER);
         assert!(p.boundaries[2].split && p.boundaries[2].visibility == BARRIER);
-        assert_eq!(p.segment_ops(&p.segments[1]), [Pm4Op::Entry, Pm4Op::Dispatch(2), Pm4Op::Exit]);
+        assert_eq!(
+            p.segment_ops(&p.segments[1]),
+            [Pm4Op::Entry, Pm4Op::Dispatch(2), Pm4Op::Exit]
+        );
     }
 }

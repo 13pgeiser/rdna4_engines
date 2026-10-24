@@ -76,15 +76,18 @@ fn get<'a>(v: &'a Value, key: &str) -> Res<&'a Value> {
 }
 
 fn str_of(v: &Value) -> Res<&str> {
-    v.as_str().ok_or_else(|| format!("expected string, got {v}"))
+    v.as_str()
+        .ok_or_else(|| format!("expected string, got {v}"))
 }
 
 fn array_of(v: &Value) -> Res<&Vec<Value>> {
-    v.as_array().ok_or_else(|| format!("expected array, got {v}"))
+    v.as_array()
+        .ok_or_else(|| format!("expected array, got {v}"))
 }
 
 fn uint_of(v: &Value) -> Res<u64> {
-    v.as_u64().ok_or_else(|| format!("expected unsigned integer, got {v}"))
+    v.as_u64()
+        .ok_or_else(|| format!("expected unsigned integer, got {v}"))
 }
 
 fn truthy(v: &Value) -> bool {
@@ -157,12 +160,20 @@ fn bit_layout(bits: &[Value]) -> Res<(u128, u128, u128, Vec<Field>)> {
             let var = str_of(get(bit, "var")?)?;
             let index = uint_of(get(bit, "index")?)?;
             if let Some(last) = fields.last_mut() {
-                if last.name == var && last.lsb + last.width == i && last.source + last.width as u64 == index {
+                if last.name == var
+                    && last.lsb + last.width == i
+                    && last.source + last.width as u64 == index
+                {
                     last.width += 1;
                     continue;
                 }
             }
-            fields.push(Field { name: var.to_string(), lsb: i, width: 1, source: index });
+            fields.push(Field {
+                name: var.to_string(),
+                lsb: i,
+                width: 1,
+                source: index,
+            });
         }
     }
     Ok((mask, value, dc, fields))
@@ -193,7 +204,11 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         for attempt in 0..64u128 {
-            let path = base.join(format!("{prefix}{:x}{:x}", std::process::id(), nanos.wrapping_add(attempt)));
+            let path = base.join(format!(
+                "{prefix}{:x}{:x}",
+                std::process::id(),
+                nanos.wrapping_add(attempt)
+            ));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => return Ok(TempDir(path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -236,7 +251,10 @@ fn dump_records(llvm: &Path, tblgen: &str, upstream: &Path) -> Res<Value> {
     )?;
     let old = read_text(&upstream.join("llvm/CodeGen/ValueTypes.td"))?;
     let def_re = Regex::new(r"def\s+(\w+)\s*:").unwrap();
-    let names: HashSet<&str> = def_re.captures_iter(&old).map(|c| c.get(1).unwrap().as_str()).collect();
+    let names: HashSet<&str> = def_re
+        .captures_iter(&old)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
     let mut extra: Vec<String> = Vec::new();
     let new = read_text(&include.join("llvm/CodeGen/ValueTypes.td"))?;
     let vt_re = Regex::new(r"def\s+(\w+)\s*:\s*(\w+)<([^;]+)>\s*;").unwrap();
@@ -251,11 +269,14 @@ fn dump_records(llvm: &Path, tblgen: &str, upstream: &Path) -> Res<Value> {
         } else if cls == "VTVec" {
             let second = parts.get(1).ok_or("IndexError: list index out of range")?;
             if second.trim() == "i48" {
-                let n: i128 = parts[0]
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("ValueError: invalid literal for int(): {:?}", parts[0]))?;
-                extra.push(format!("def {name} : ValueType<{}, {}>;", n * 48, parts[parts.len() - 1]));
+                let n: i128 = parts[0].trim().parse().map_err(|_| {
+                    format!("ValueError: invalid literal for int(): {:?}", parts[0])
+                })?;
+                extra.push(format!(
+                    "def {name} : ValueType<{}, {}>;",
+                    n * 48,
+                    parts[parts.len() - 1]
+                ));
             }
         }
     }
@@ -270,13 +291,21 @@ fn dump_records(llvm: &Path, tblgen: &str, upstream: &Path) -> Res<Value> {
     let output = stage.join("records.json");
     let mut command = Command::new(tblgen);
     command.arg("--dump-json");
-    for path in [stage, upstream, include.as_path(), target.as_path(), target.join("aie2p").as_path()] {
+    for path in [
+        stage,
+        upstream,
+        include.as_path(),
+        target.as_path(),
+        target.join("aie2p").as_path(),
+    ] {
         command.arg("-I").arg(path);
     }
     command.arg(&root).arg("-o").arg(&output);
     let status = command.status().map_err(|e| format!("{tblgen}: {e}"))?;
     if !status.success() {
-        return Err(format!("Command '{tblgen}' returned non-zero exit status {status}"));
+        return Err(format!(
+            "Command '{tblgen}' returned non-zero exit status {status}"
+        ));
     }
     let raw = fs::read_to_string(&output).map_err(|e| format!("{}: {e}", output.display()))?;
     serde_json::from_str(&raw).map_err(|e| format!("records.json: {e}"))
@@ -313,7 +342,9 @@ fn parse_bin(text: &str) -> Res<u128> {
 
 impl<'a> Gen<'a> {
     fn record(&self, name: &str) -> Res<&'a Value> {
-        self.records.get(name).ok_or_else(|| format!("KeyError: {name:?}"))
+        self.records
+            .get(name)
+            .ok_or_else(|| format!("KeyError: {name:?}"))
     }
 
     fn members(&mut self, name: &str) -> Res<Vec<String>> {
@@ -344,7 +375,11 @@ impl<'a> Gen<'a> {
         Ok(result)
     }
 
-    fn reg_table(&mut self, methods: &HashMap<String, Vec<Rule>>, kind: &str) -> Res<Vec<(String, String, u128)>> {
+    fn reg_table(
+        &mut self,
+        methods: &HashMap<String, Vec<Rule>>,
+        kind: &str,
+    ) -> Res<Vec<(String, String, u128)>> {
         let operand = self.record(kind)?;
         let cls = match operand.get("RegClass") {
             Some(rc) => str_of(get(rc, "def")?)?,
@@ -383,7 +418,9 @@ fn parse_methods(g: &mut Gen, emitter: &str) -> Res<HashMap<String, Vec<Rule>>> 
     let method_re = Regex::new(r"(?s)void AIE2PMCCodeEmitter::(\w+)\((.*?)\n\}").unwrap();
     let rule_re = Regex::new(r"(?s)(?:if|else if)\s*\((.*?)\)\s*\{\s*Result = ([^;]+);").unwrap();
     let ws = Regex::new(r"\s+").unwrap();
-    let cls_re = Regex::new(r"\AAIE2PMCRegisterClasses\[AIE2P::(\w+)RegClassID\]\.contains\(Reg\)\z").unwrap();
+    let cls_re =
+        Regex::new(r"\AAIE2PMCRegisterClasses\[AIE2P::(\w+)RegClassID\]\.contains\(Reg\)\z")
+            .unwrap();
     let reg_re = Regex::new(r"\AReg==AIE2P::(\w+)\z").unwrap();
     let shift_re = Regex::new(r"\A\(Encoding << (\d+)\) \| (0b[01]+)\z").unwrap();
     let const_re = Regex::new(r"\A0b[01]+\z").unwrap();
@@ -415,7 +452,11 @@ fn parse_methods(g: &mut Gen, emitter: &str) -> Res<HashMap<String, Vec<Rule>>> 
                 ),
                 None => (None, parse_bin(expression)?),
             };
-            rules.push(Rule { regs, shift: sh, value: val });
+            rules.push(Rule {
+                regs,
+                shift: sh,
+                value: val,
+            });
         }
         if rules.is_empty() {
             return Err(format!("assertion failed: {method}"));
@@ -426,7 +467,10 @@ fn parse_methods(g: &mut Gen, emitter: &str) -> Res<HashMap<String, Vec<Rule>>> 
 }
 
 fn generate(records: &Value, emitter: &str) -> Res<(String, usize, usize, usize)> {
-    let mut g = Gen { records, members_cache: HashMap::new() };
+    let mut g = Gen {
+        records,
+        members_cache: HashMap::new(),
+    };
     let methods = parse_methods(&mut g, emitter)?;
     let map = records.as_object().ok_or("records.json is not an object")?;
 
@@ -471,7 +515,11 @@ fn generate(records: &Value, emitter: &str) -> Res<(String, usize, usize, usize)
         register_tables.insert(kind, index);
         out.push(format!("static REGS_{index}: &[RegisterEncoding] = &["));
         for (name, asm, value) in regs {
-            out.push(format!("RegisterEncoding {{ name: {}, asm: {}, value: {value} }},", q(&name), q(&asm)));
+            out.push(format!(
+                "RegisterEncoding {{ name: {}, asm: {}, value: {value} }},",
+                q(&name),
+                q(&asm)
+            ));
         }
         out.push("];".to_string());
     }
@@ -484,12 +532,17 @@ fn generate(records: &Value, emitter: &str) -> Res<(String, usize, usize, usize)
             return Err(format!("assertion failed: len(Inst) == Size*8 for {name}"));
         }
         let mut order: HashMap<&str, usize> = HashMap::new();
-        for (i, item) in array_of(get(get(record, "InOperandList")?, "args")?)?.iter().enumerate() {
+        for (i, item) in array_of(get(get(record, "InOperandList")?, "args")?)?
+            .iter()
+            .enumerate()
+        {
             order.insert(str_of(item.get(1).ok_or("dag arg missing name")?)?, i);
         }
         let mut keyed = Vec::new();
         for f in fields.drain(..) {
-            let key = *order.get(f.name.as_str()).ok_or_else(|| format!("KeyError: {:?}", f.name))?;
+            let key = *order
+                .get(f.name.as_str())
+                .ok_or_else(|| format!("KeyError: {:?}", f.name))?;
             keyed.push((key, f));
         }
         keyed.sort_by_key(|(k, _)| *k);
@@ -518,7 +571,15 @@ fn generate(records: &Value, emitter: &str) -> Res<(String, usize, usize, usize)
         let (mask, value, dc, fields) = bit_layout(array_of(get(record, "Inst")?)?)?;
         let fields_rs = fields
             .iter()
-            .map(|f| format!("BitField {{ name: {}, lsb: {}, width: {}, source_lsb: {} }}", q(&f.name), f.lsb, f.width, f.source))
+            .map(|f| {
+                format!(
+                    "BitField {{ name: {}, lsb: {}, width: {}, source_lsb: {} }}",
+                    q(&f.name),
+                    f.lsb,
+                    f.width,
+                    f.source
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         let mut operands = Vec::new();
@@ -546,7 +607,10 @@ fn generate(records: &Value, emitter: &str) -> Res<(String, usize, usize, usize)
             }
         }
         let asm = str_of(get(record, "AsmString")?)?;
-        let mnemonic = asm.split_whitespace().next().ok_or("IndexError: list index out of range")?;
+        let mnemonic = asm
+            .split_whitespace()
+            .next()
+            .ok_or("IndexError: list index out of range")?;
         let slot_def = str_of(get(get(record, "Slot")?, "def")?)?;
         let slot = slot_name(slot_def.strip_suffix("_slot").unwrap_or(slot_def))?;
         out.push(format!(
@@ -573,7 +637,13 @@ struct Options {
 const USAGE: &str = "usage: tblgen2rs [-h] --llvm LLVM --output OUTPUT [--tblgen TBLGEN]\n                 [--upstream-include UPSTREAM_INCLUDE]";
 
 fn parse_args(args: &[String]) -> Res<Option<Options>> {
-    const LONG: [&str; 5] = ["--help", "--llvm", "--output", "--tblgen", "--upstream-include"];
+    const LONG: [&str; 5] = [
+        "--help",
+        "--llvm",
+        "--output",
+        "--tblgen",
+        "--upstream-include",
+    ];
     let (mut llvm, mut output, mut tblgen, mut upstream) = (None, None, None, None);
     let mut i = 0;
     let fail = |msg: String| format!("{USAGE}\ntblgen2rs: error: {msg}");
@@ -594,12 +664,20 @@ fn parse_args(args: &[String]) -> Res<Option<Options>> {
         let matches: Vec<&str> = if LONG.contains(&flag) {
             vec![LONG.iter().copied().find(|l| *l == flag).unwrap()]
         } else {
-            LONG.iter().copied().filter(|l| l.starts_with(flag)).collect()
+            LONG.iter()
+                .copied()
+                .filter(|l| l.starts_with(flag))
+                .collect()
         };
         let name = match matches.as_slice() {
             [one] => *one,
             [] => return Err(fail(format!("unrecognized arguments: {arg}"))),
-            many => return Err(fail(format!("ambiguous option: {flag} could match {}", many.join(", ")))),
+            many => {
+                return Err(fail(format!(
+                    "ambiguous option: {flag} could match {}",
+                    many.join(", ")
+                )))
+            }
         };
         if name == "--help" {
             println!("{USAGE}\n\n{DESCRIPTION}");
@@ -608,7 +686,9 @@ fn parse_args(args: &[String]) -> Res<Option<Options>> {
         let value = match inline {
             Some(v) => v,
             None => {
-                let v = args.get(i).filter(|v| !v.starts_with('-') || v.as_str() == "-");
+                let v = args
+                    .get(i)
+                    .filter(|v| !v.starts_with('-') || v.as_str() == "-");
                 match v {
                     Some(v) => {
                         i += 1;
@@ -633,7 +713,10 @@ fn parse_args(args: &[String]) -> Res<Option<Options>> {
         if output.is_none() {
             missing.push("--output");
         }
-        return Err(fail(format!("the following arguments are required: {}", missing.join(", "))));
+        return Err(fail(format!(
+            "the following arguments are required: {}",
+            missing.join(", ")
+        )));
     };
     Ok(Some(Options {
         llvm: PathBuf::from(llvm),
@@ -651,11 +734,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if opts.llvm.is_absolute() {
             opts.llvm.clone()
         } else {
-            std::env::current_dir().map(|d| d.join(&opts.llvm)).unwrap_or_else(|_| opts.llvm.clone())
+            std::env::current_dir()
+                .map(|d| d.join(&opts.llvm))
+                .unwrap_or_else(|_| opts.llvm.clone())
         }
     });
     let records = dump_records(&resolved, &opts.tblgen, &opts.upstream)?;
-    let emitter = read_text(&opts.llvm.join("llvm/lib/Target/AIE/MCTargetDesc/aie2p/AIE2PMCCodeEmitterGen.inc"))?;
+    let emitter = read_text(
+        &opts
+            .llvm
+            .join("llvm/lib/Target/AIE/MCTargetDesc/aie2p/AIE2PMCCodeEmitterGen.inc"),
+    )?;
     let (text, insts, formats, operands) = generate(&records, &emitter)?;
     if let Some(parent) = opts.output.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;

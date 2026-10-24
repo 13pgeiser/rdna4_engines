@@ -12,7 +12,14 @@
 use super::*;
 use peacemaker_npu::kernels::gemm_i8::{cpu_reference, design, Design};
 
-struct Side<'d> { ctx: HwCtx<'d>, _pdi: Bo, insts: Bo, inp: Bo, out: Bo, cmd: Bo }
+struct Side<'d> {
+    ctx: HwCtx<'d>,
+    _pdi: Bo,
+    insts: Bo,
+    inp: Bo,
+    out: Bo,
+    cmd: Bo,
+}
 
 fn side<'d>(dev: &'d Device, d: &Design, tiles: u32, input: &[u8]) -> Result<Side<'d>, String> {
     let ctx = HwCtx::create(dev, tiles, 2048)?;
@@ -26,16 +33,33 @@ fn side<'d>(dev: &'d Device, d: &Design, tiles: u32, input: &[u8]) -> Result<Sid
     out.as_mut_slice().fill(POISON);
     out.flush();
     let cmd = dev.cmd_bo()?;
-    Ok(Side { ctx, _pdi: pdi, insts, inp, out, cmd })
+    Ok(Side {
+        ctx,
+        _pdi: pdi,
+        insts,
+        inp,
+        out,
+        cmd,
+    })
 }
 
 impl Side<'_> {
-    fn submit(&mut self) -> Result<u64, String> { self.ctx.submit(&mut self.cmd, &self.insts, &[&self.inp, &self.out]) }
+    fn submit(&mut self) -> Result<u64, String> {
+        self.ctx
+            .submit(&mut self.cmd, &self.insts, &[&self.inp, &self.out])
+    }
     fn wait(&self, seq: u64, timeout: u64) -> Result<(), String> {
         let st = self.ctx.wait(&self.cmd, seq, timeout)?;
-        if st == ERT_STATE_COMPLETED { Ok(()) } else { Err(format!("state {st}")) }
+        if st == ERT_STATE_COMPLETED {
+            Ok(())
+        } else {
+            Err(format!("state {st}"))
+        }
     }
-    fn exact(&self, d: &Design, want: &[i32]) -> bool { self.out.flush(); d.unpack_out(self.out.as_slice()) == want }
+    fn exact(&self, d: &Design, want: &[i32]) -> bool {
+        self.out.flush();
+        d.unpack_out(self.out.as_slice()) == want
+    }
 }
 
 pub fn run(cfg: &Cfg) -> Result<bool, String> {
@@ -56,20 +80,40 @@ pub fn run(cfg: &Cfg) -> Result<bool, String> {
             let mut busy = Vec::new();
             let mut good = true;
             for _ in 0..cfg.iters {
-                let mut sa = match side(&dev, &d, tiles, &input) { Ok(s) => s, Err(e) => { println!("PARTS tiles={tiles}: context A refused: {e}"); good = false; break; } };
-                let mut sb = match side(&dev, &d, tiles, &input) { Ok(s) => s, Err(e) => { println!("PARTS tiles={tiles}: context B refused while A alive: {e}"); good = false; break; } };
+                let mut sa = match side(&dev, &d, tiles, &input) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("PARTS tiles={tiles}: context A refused: {e}");
+                        good = false;
+                        break;
+                    }
+                };
+                let mut sb = match side(&dev, &d, tiles, &input) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("PARTS tiles={tiles}: context B refused while A alive: {e}");
+                        good = false;
+                        break;
+                    }
+                };
                 let t = Instant::now();
                 if mode == "serial" {
-                    let q = sa.submit()?; sa.wait(q, cfg.timeout_ms)?;
-                    let q = sb.submit()?; sb.wait(q, cfg.timeout_ms)?;
+                    let q = sa.submit()?;
+                    sa.wait(q, cfg.timeout_ms)?;
+                    let q = sb.submit()?;
+                    sb.wait(q, cfg.timeout_ms)?;
                 } else {
                     let (qa, qb) = (sa.submit()?, sb.submit()?);
-                    sa.wait(qa, cfg.timeout_ms)?; sb.wait(qb, cfg.timeout_ms)?;
+                    sa.wait(qa, cfg.timeout_ms)?;
+                    sb.wait(qb, cfg.timeout_ms)?;
                 }
                 busy.push(t.elapsed().as_secs_f64() * 1e6);
                 good &= sa.exact(&d, &want) && sb.exact(&d, &want);
             }
-            if busy.is_empty() { ok = false; continue; }
+            if busy.is_empty() {
+                ok = false;
+                continue;
+            }
             println!("PARTS tiles={tiles} mode={mode} rounds={} pair_median_us={:.1} all=[{}] exact={good}", busy.len(), median(&busy),
                 busy.iter().map(|x| format!("{x:.0}")).collect::<Vec<_>>().join(","));
             ok &= good;

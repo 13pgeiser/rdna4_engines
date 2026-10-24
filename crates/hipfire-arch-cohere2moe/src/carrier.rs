@@ -45,7 +45,10 @@ fn tokenizer_from_dir(
 ///
 /// `dir_diag`, `resolve_source_meta`, `build_speculator`, `resolve_chat_template`,
 /// and `LoadedModel::skeleton` stay in the loader (loader-private / cycle edge).
-pub fn load_cohere2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Cohere2MoeBundle, String> {
+pub fn load_cohere2moe_bundle(
+    src: ModelSource,
+    ctx: &mut LoadCtx,
+) -> Result<Cohere2MoeBundle, String> {
     if ctx.pp > 1 {
         return Err("cohere2moe: pp>1 unsupported via registry".into());
     }
@@ -54,8 +57,9 @@ pub fn load_cohere2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Coh
             // HFQ path — mirrors `crate::load_cohere2moe` (config/weights/state/eos)
             // without the loader's `LoadedModel`/`chat_template` tail.
             let config = <crate::arch::Cohere2Moe as Architecture>::config_from_hfq(&hfq)?;
-            let weights =
-                <crate::arch::Cohere2Moe as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            let weights = <crate::arch::Cohere2Moe as Architecture>::load_weights(
+                &mut hfq, &config, ctx.gpu,
+            )?;
             let state = Cohere2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
                 .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
             let tokenizer =
@@ -65,7 +69,11 @@ pub fn load_cohere2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Coh
             let eos_tok: u32 = {
                 let try_one = |s: &str| -> Option<u32> {
                     let ids = tokenizer.encode(s);
-                    if ids.len() == 1 { Some(ids[0]) } else { None }
+                    if ids.len() == 1 {
+                        Some(ids[0])
+                    } else {
+                        None
+                    }
                 };
                 try_one("<|END_OF_TURN_TOKEN|>")
                     .or_else(|| try_one("</s>"))
@@ -99,4 +107,3 @@ pub fn load_cohere2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Coh
         }
     }
 }
-

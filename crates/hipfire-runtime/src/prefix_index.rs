@@ -1092,8 +1092,7 @@ impl PrefixIndex {
             cursor += 1;
 
             // Re-checks leaf/pin conditions (may have changed).
-            if let Some((freed, parent)) = self.evict_leaf(&domain, nid, pool, &mut evicted_phys)
-            {
+            if let Some((freed, parent)) = self.evict_leaf(&domain, nid, pool, &mut evicted_phys) {
                 bytes_freed += freed;
                 // Re-evaluate the parent in the same pass so eviction can
                 // collapse chains instead of stopping one level short.
@@ -1548,7 +1547,11 @@ fn insert_into_tree(
                 )?;
                 delta += d;
                 pages_adopted += p;
-                return Ok((delta, pages_adopted, requested.unwrap_or(CheckpointId::NONE)));
+                return Ok((
+                    delta,
+                    pages_adopted,
+                    requested.unwrap_or(CheckpointId::NONE),
+                ));
             }
         };
 
@@ -3673,7 +3676,9 @@ mod tests {
 
             // B < before is strict.
             assert_eq!(
-                index.lookup_checkpoint(&domain, &query, b, &pool).unwrap_err(),
+                index
+                    .lookup_checkpoint(&domain, &query, b, &pool)
+                    .unwrap_err(),
                 MissReason::NoCheckpoint,
                 "B={b}"
             );
@@ -3823,9 +3828,7 @@ mod tests {
             CheckpointId(1)
         );
         assert_eq!(
-            index
-                .lookup_checkpoint(&db, &key, 300, &pool)
-                .unwrap_err(),
+            index.lookup_checkpoint(&db, &key, 300, &pool).unwrap_err(),
             MissReason::NoMatch
         );
         // The same tokens in another domain are a different boundary.
@@ -3921,10 +3924,14 @@ mod tests {
         let h1 = index.lookup_checkpoint(&domain, &k300, 301, &pool).unwrap();
         let h2 = index.lookup_checkpoint(&domain, &k300, 301, &pool).unwrap();
         assert_eq!(h1.checkpoint, h2.checkpoint);
-        assert!(index.evict_unpinned_leaves(&mut pool, usize::MAX).is_empty());
+        assert!(index
+            .evict_unpinned_leaves(&mut pool, usize::MAX)
+            .is_empty());
         assert!(index.take_retired_checkpoints().is_empty());
         index.release_pin(&domain, h1.pin);
-        assert!(index.evict_unpinned_leaves(&mut pool, usize::MAX).is_empty());
+        assert!(index
+            .evict_unpinned_leaves(&mut pool, usize::MAX)
+            .is_empty());
         index.release_pin(&domain, h2.pin);
         assert_eq!(index.evict_unpinned_leaves(&mut pool, usize::MAX).len(), 2);
         assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
@@ -3969,12 +3976,24 @@ mod tests {
         let (mut table, handles) = alloc_exact(&mut pool, 1);
         assert_eq!(
             index
-                .publish_checkpoint(&domain, &make_tokens(300), &handles, CheckpointId(9), &mut pool)
+                .publish_checkpoint(
+                    &domain,
+                    &make_tokens(300),
+                    &handles,
+                    CheckpointId(9),
+                    &mut pool
+                )
                 .unwrap_err(),
             InsertError::MisalignedHandle
         );
         assert!(index
-            .publish_checkpoint(&domain, &make_tokens(200), &handles, CheckpointId::NONE, &mut pool)
+            .publish_checkpoint(
+                &domain,
+                &make_tokens(200),
+                &handles,
+                CheckpointId::NONE,
+                &mut pool
+            )
             .unwrap_err()
             .to_string()
             .contains("non-zero"));
@@ -4005,7 +4024,9 @@ mod tests {
         assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(1)]);
         assert!(index.take_retired_checkpoints().is_empty(), "drained once");
         assert_eq!(
-            index.lookup_checkpoint(&domain, &a, 101, &pool).unwrap_err(),
+            index
+                .lookup_checkpoint(&domain, &a, 101, &pool)
+                .unwrap_err(),
             MissReason::NoMatch
         );
         assert_eq!(index.checkpoint_count(), 2);
@@ -4029,7 +4050,9 @@ mod tests {
         assert_eq!(index.total_nodes(), 1, "the empty pageless leaf is pruned");
         assert_eq!(index.checkpoint_count(), 0);
         assert_eq!(
-            index.lookup_checkpoint(&domain, &a, 200, &pool).unwrap_err(),
+            index
+                .lookup_checkpoint(&domain, &a, 200, &pool)
+                .unwrap_err(),
             MissReason::NoMatch
         );
 
@@ -4040,7 +4063,9 @@ mod tests {
         assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(2)]);
         assert_eq!(index.total_nodes(), 2);
         assert_eq!(
-            index.lookup_checkpoint(&domain, &a, 200, &pool).unwrap_err(),
+            index
+                .lookup_checkpoint(&domain, &a, 200, &pool)
+                .unwrap_err(),
             MissReason::NoCheckpoint
         );
         index.release_pin(&domain, hit.pin);
@@ -4086,7 +4111,14 @@ mod tests {
         let other = domain_with("namespace", "beta");
         publish_exact(&mut index, &mut pool, &domain, &make_tokens(100), 1).unwrap();
         publish_exact(&mut index, &mut pool, &domain, &make_tokens(300), 2).unwrap();
-        publish_exact(&mut index, &mut pool, &other, &make_tokens_from(5000, 200), 3).unwrap();
+        publish_exact(
+            &mut index,
+            &mut pool,
+            &other,
+            &make_tokens_from(5000, 200),
+            3,
+        )
+        .unwrap();
         let pin = index
             .lookup_checkpoint(&domain, &make_tokens(300), 400, &pool)
             .unwrap();

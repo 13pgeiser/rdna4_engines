@@ -18,13 +18,18 @@
 use super::{vmm_map_room, Qwen35RequestState, Qwen35VmmStore};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::cb::{
-    mtp_cb_accept, mtp_cb_draft_batched, mtp_cb_verify, MtpCbDraftLane, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane,
+    mtp_cb_accept, mtp_cb_draft_batched, mtp_cb_verify, MtpCbDraftLane, MtpCbScratch,
+    MtpCbVerified, MtpCbVerifyLane,
 };
 use crate::mtp_spec::MtpDraftOutput;
-use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, sample_from_logits, MtpPrefillTarget, MtpPromptRoute};
+use crate::mtp_spec::{
+    prefill_trunk_and_mtp_cache_parts, sample_from_logits, MtpPrefillTarget, MtpPromptRoute,
+};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
 use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
+use hipfire_runtime::slot_batch::{
+    BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind,
+};
 use hipfire_runtime::spec::{SpecRequestConfig, Speculator};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -71,11 +76,21 @@ impl VmmSpecEngine {
                 return Err(format!("VMM spec engine: verify scratch: {e}"));
             }
         };
-        let live = |gpu: &Gpu| gpu.device_mem_info().map(|(f, _)| f + gpu.pool_parked_bytes());
+        let live = |gpu: &Gpu| {
+            gpu.device_mem_info()
+                .map(|(f, _)| f + gpu.pool_parked_bytes())
+        };
         let probed = (|| -> Result<usize, String> {
             let before = live(gpu).map_err(|e| e.to_string())?;
-            let st =
-                new_qwen35_mtp_lane_state(gpu, config, template_dn, &head, k, SpecRequestConfig::default(), ar_cap)?;
+            let st = new_qwen35_mtp_lane_state(
+                gpu,
+                config,
+                template_dn,
+                &head,
+                k,
+                SpecRequestConfig::default(),
+                ar_cap,
+            )?;
             let after = live(gpu).map_err(|e| e.to_string());
             st.free_gpu(gpu);
             Ok(before.saturating_sub(after?))
@@ -132,7 +147,12 @@ impl Qwen35VmmStore {
 
     /// Map KV positions `[0, end)` of `epoch` against the shared physical
     /// budget and the device memory a map can use (as `provision_step`).
-    pub(super) fn spec_provision(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, end: usize) -> Result<(), String> {
+    pub(super) fn spec_provision(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+        end: usize,
+    ) -> Result<(), String> {
         let mapped_total = self.mapped_kv_bytes()?;
         let device_room = vmm_map_room(
             gpu.device_mem_info()
@@ -140,7 +160,10 @@ impl Qwen35VmmStore {
                 .0,
             gpu.pool_parked_bytes(),
         );
-        let budget = self.kv_budget_bytes.saturating_sub(mapped_total).min(device_room);
+        let budget = self
+            .kv_budget_bytes
+            .saturating_sub(mapped_total)
+            .min(device_room);
         let s = self
             .slots
             .iter_mut()
@@ -148,12 +171,14 @@ impl Qwen35VmmStore {
             .find(|s| s.epoch == *epoch)
             .ok_or_else(|| format!("spec provision: unknown epoch {epoch:?}"))?;
         if end > s.kv.vmm_logical_bound() {
-            return Err(format!("spec provision: {end} positions > logical bound {}", s.kv.vmm_logical_bound()));
+            return Err(format!(
+                "spec provision: {end} positions > logical bound {}",
+                s.kv.vmm_logical_bound()
+            ));
         }
-        let grown = s
-            .kv
-            .provision_vmm_positions(gpu, end, budget)
-            .map_err(|e| format!("spec provision: map {end} positions for {epoch:?}: {e}"))?;
+        let grown =
+            s.kv.provision_vmm_positions(gpu, end, budget)
+                .map_err(|e| format!("spec provision: map {end} positions for {epoch:?}: {e}"))?;
         self.mapped_high_water = self.mapped_high_water.max(mapped_total + grown);
         Ok(())
     }
@@ -178,9 +203,16 @@ impl Qwen35VmmStore {
         if !matches!(self.phase, super::Phase::Idle) {
             return Err("spec prefill during an uncommitted step".into());
         }
-        let engine = self.spec.as_ref().ok_or("spec prefill: no MTP engine staged")?;
+        let engine = self
+            .spec
+            .as_ref()
+            .ok_or("spec prefill: no MTP engine staged")?;
         if prompt.is_empty() || prompt.len() >= engine.head_cap() {
-            return Err(format!("spec prefill: prompt {} outside 1..{}", prompt.len(), engine.head_cap()));
+            return Err(format!(
+                "spec prefill: prompt {} outside 1..{}",
+                prompt.len(),
+                engine.head_cap()
+            ));
         }
         let (route, k) = (engine.route, engine.k);
         self.spec_provision(gpu, epoch, prompt.len())?;
@@ -198,8 +230,9 @@ impl Qwen35VmmStore {
             // AR's penalty window bound: this scratch's `repeat_buf` (the
             // singleton drafter reads its slot's).
             let ar_cap = scratch.repeat_buf.buf.size() / 4;
-            let mut st = new_qwen35_mtp_lane_state(gpu, config, &s.dn, &engine.head, k, request, ar_cap)
-                .map_err(|e| format!("spec prefill: MTP state: {e}"))?;
+            let mut st =
+                new_qwen35_mtp_lane_state(gpu, config, &s.dn, &engine.head, k, request, ar_cap)
+                    .map_err(|e| format!("spec prefill: MTP state: {e}"))?;
             let filled = st.reset(gpu).map_err(|e| e.to_string()).and_then(|()| {
                 let mut target = MtpPrefillTarget {
                     weights,
@@ -208,21 +241,38 @@ impl Qwen35VmmStore {
                     dn_state: &mut s.dn,
                     scratch,
                 };
-                prefill_trunk_and_mtp_cache_parts(gpu, &mut target, &engine.head, &mut st, prompt, 0, route, |_, _, _| Ok(()))
-                    .map_err(|e| e.to_string())
+                prefill_trunk_and_mtp_cache_parts(
+                    gpu,
+                    &mut target,
+                    &engine.head,
+                    &mut st,
+                    prompt,
+                    0,
+                    route,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|e| e.to_string())
             });
             s.mtp = Some(st);
             filled.map_err(|e| format!("spec prefill: {e}"))?;
             // Mirror Qwen35MtpDrafter::mtp_prefill (mtp_speculator.rs:487-501):
             // the first token is unpenalized, and consumes the SAME MtpRng
             // subsequently used for drafts, acceptance, residual and bonus.
-            let logits = gpu.download_f32(&scratch.logits).map_err(|e| format!("spec prefill: seed logits: {e}"))?;
+            let logits = gpu
+                .download_f32(&scratch.logits)
+                .map_err(|e| format!("spec prefill: seed logits: {e}"))?;
             let st = s.mtp.as_mut().expect("installed above");
             let seed = if st.sampling.is_greedy() {
                 logits
                     .iter()
                     .enumerate()
-                    .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i as u32, v) } else { (bi, bv) })
+                    .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv {
+                            (i as u32, v)
+                        } else {
+                            (bi, bv)
+                        }
+                    })
                     .0
             } else {
                 sample_from_logits(&logits, &st.sampling, &mut st.rng).0
@@ -278,30 +328,51 @@ impl Qwen35VmmStore {
             .flatten()
             .find(|s| s.epoch == *epoch)
             .ok_or_else(|| format!("spec adopt: unknown epoch {epoch:?}"))?;
-        if s.mtp.is_some() || s.dflash.is_some() || s.pending_seed.is_none() || s.position != snap.rows {
+        if s.mtp.is_some()
+            || s.dflash.is_some()
+            || s.pending_seed.is_none()
+            || s.position != snap.rows
+        {
             return Err(format!(
                 "spec adopt: lane position {} / snapshot rows {} / seed {:?}",
                 s.position, snap.rows, s.pending_seed
             ));
         }
         if snap.rows >= engine.head_cap() {
-            return Err(format!("spec adopt: position {} >= MTP head capacity {}", snap.rows, engine.head_cap()));
+            return Err(format!(
+                "spec adopt: position {} >= MTP head capacity {}",
+                snap.rows,
+                engine.head_cap()
+            ));
         }
         let ar_cap = scratch.repeat_buf.buf.size() / 4;
-        let mut st = new_qwen35_mtp_lane_state(gpu, config, &s.dn, &engine.head, engine.k, request, ar_cap)
-            .map_err(|e| format!("spec adopt: MTP state: {e}"))?;
+        let mut st =
+            new_qwen35_mtp_lane_state(gpu, config, &s.dn, &engine.head, engine.k, request, ar_cap)
+                .map_err(|e| format!("spec adopt: MTP state: {e}"))?;
         let installed = (|| -> Result<(), String> {
             st.reset(gpu).map_err(|e| e.to_string())?;
             let rb = snap.row_bytes;
-            if st.mtp_kv.n_head_kv * (st.mtp_kv.head_dim / 32) * 34 != rb || st.prev_hidden.byte_size() != snap.prev_hidden.byte_size() {
+            if st.mtp_kv.n_head_kv * (st.mtp_kv.head_dim / 32) * 34 != rb
+                || st.prev_hidden.byte_size() != snap.prev_hidden.byte_size()
+            {
                 return Err("snapshot layout differs from the lane's MTP state".into());
             }
             let bytes = snap.rows * rb;
-            for (dst, src) in [(&st.mtp_kv.inner.k_gpu[0], &snap.k_rows), (&st.mtp_kv.inner.v_gpu[0], &snap.v_rows)] {
-                gpu.memcpy_dtod_at_auto(&dst.buf, 0, &src.buf, 0, bytes).map_err(|e| e.to_string())?;
+            for (dst, src) in [
+                (&st.mtp_kv.inner.k_gpu[0], &snap.k_rows),
+                (&st.mtp_kv.inner.v_gpu[0], &snap.v_rows),
+            ] {
+                gpu.memcpy_dtod_at_auto(&dst.buf, 0, &src.buf, 0, bytes)
+                    .map_err(|e| e.to_string())?;
             }
-            gpu.memcpy_dtod_at_auto(&st.prev_hidden.buf, 0, &snap.prev_hidden.buf, 0, snap.prev_hidden.byte_size())
-                .map_err(|e| e.to_string())?;
+            gpu.memcpy_dtod_at_auto(
+                &st.prev_hidden.buf,
+                0,
+                &snap.prev_hidden.buf,
+                0,
+                snap.prev_hidden.byte_size(),
+            )
+            .map_err(|e| e.to_string())?;
             st.prev_hidden_pos = snap.prev_hidden_pos;
             gpu.hip.device_synchronize().map_err(|e| e.to_string())
         })();
@@ -331,16 +402,27 @@ impl Qwen35VmmStore {
 
     /// Provision gate of one planned Verify request: a live spec lane (MTP or
     /// DFlash), its seed in the first row, rows within the lane's window.
-    pub(super) fn spec_check_verify(&self, r: &RequestRows, draft_len: usize, seed_row_token: u32) -> Result<(), String> {
+    pub(super) fn spec_check_verify(
+        &self,
+        r: &RequestRows,
+        draft_len: usize,
+        seed_row_token: u32,
+    ) -> Result<(), String> {
         let s = self
             .request_state(&r.epoch)
             .ok_or_else(|| format!("provision_step: stale or unknown epoch {:?}", r.epoch))?;
         if s.dflash.is_some() {
             return self.dflash_check_verify(s, r, draft_len, seed_row_token);
         }
-        let engine = self.spec.as_ref().ok_or("provision_step: Verify rows need the staged MTP engine")?;
+        let engine = self
+            .spec
+            .as_ref()
+            .ok_or("provision_step: Verify rows need the staged MTP engine")?;
         if s.mtp.is_none() || s.spec_draft.is_some() || s.spec_verified.is_some() {
-            return Err(format!("provision_step: {:?} is not an idle spec lane", r.epoch));
+            return Err(format!(
+                "provision_step: {:?} is not an idle spec lane",
+                r.epoch
+            ));
         }
         if draft_len > engine.k || r.rows.len != draft_len + 1 {
             return Err(format!(
@@ -349,10 +431,16 @@ impl Qwen35VmmStore {
             ));
         }
         if s.pending_seed != Some(seed_row_token) {
-            return Err(format!("provision_step: Verify seed row {seed_row_token} != pending seed {:?}", s.pending_seed));
+            return Err(format!(
+                "provision_step: Verify seed row {seed_row_token} != pending seed {:?}",
+                s.pending_seed
+            ));
         }
         if s.position + r.rows.len > engine.head_cap() {
-            return Err(format!("provision_step: Verify window end > MTP head capacity {}", engine.head_cap()));
+            return Err(format!(
+                "provision_step: Verify window end > MTP head capacity {}",
+                engine.head_cap()
+            ));
         }
         Ok(())
     }
@@ -370,7 +458,11 @@ impl Qwen35VmmStore {
         config: &Qwen35Config,
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
-        if !plan.requests.iter().any(|r| matches!(r.kind, RequestStepKind::Verify { .. })) {
+        if !plan
+            .requests
+            .iter()
+            .any(|r| matches!(r.kind, RequestStepKind::Verify { .. }))
+        {
             return Ok(());
         }
         let r = self
@@ -393,7 +485,9 @@ impl Qwen35VmmStore {
             .requests
             .iter()
             .filter_map(|r| match r.kind {
-                RequestStepKind::Verify { draft_len } if self.is_mtp_lane(&r.epoch) => Some((r.epoch, draft_len)),
+                RequestStepKind::Verify { draft_len } if self.is_mtp_lane(&r.epoch) => {
+                    Some((r.epoch, draft_len))
+                }
                 _ => None,
             })
             .collect();
@@ -402,7 +496,8 @@ impl Qwen35VmmStore {
         }
         let Self { slots, spec, .. } = self;
         let engine = spec.as_ref().expect("checked at provision");
-        let mut owners: Vec<Option<&mut Qwen35RequestState>> = planned.iter().map(|_| None).collect();
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> =
+            planned.iter().map(|_| None).collect();
         for s in slots.iter_mut().flatten() {
             if let Some(i) = planned.iter().position(|(e, _)| *e == s.epoch) {
                 owners[i] = Some(s);
@@ -411,8 +506,14 @@ impl Qwen35VmmStore {
         let mut lanes = Vec::with_capacity(planned.len());
         let mut outs: Vec<&mut Option<MtpDraftOutput>> = Vec::with_capacity(planned.len());
         for (o, &(_, draft_len)) in owners.into_iter().zip(&planned) {
-            let Qwen35RequestState { mtp, history, position, pending_seed, spec_draft, .. } =
-                o.expect("checked at provision");
+            let Qwen35RequestState {
+                mtp,
+                history,
+                position,
+                pending_seed,
+                spec_draft,
+                ..
+            } = o.expect("checked at provision");
             // Mirror mtp_speculator.rs:545,566-572: request-budget k and
             // generated-only emitted history, already including the pending
             // seed once. mtp_cb_draft rebuilds the penalty window from this.
@@ -462,7 +563,9 @@ impl Qwen35VmmStore {
         let epochs: Vec<RequestEpoch> = plan
             .requests
             .iter()
-            .filter(|r| matches!(r.kind, RequestStepKind::Verify { .. }) && self.is_mtp_lane(&r.epoch))
+            .filter(|r| {
+                matches!(r.kind, RequestStepKind::Verify { .. }) && self.is_mtp_lane(&r.epoch)
+            })
             .map(|r| r.epoch)
             .collect();
         if epochs.is_empty() {
@@ -471,7 +574,8 @@ impl Qwen35VmmStore {
         let eos = config.eos_token;
         let Self { slots, spec, .. } = self;
         let engine = spec.as_ref().expect("checked at provision");
-        let mut owners: Vec<Option<&mut Qwen35RequestState>> = epochs.iter().map(|_| None).collect();
+        let mut owners: Vec<Option<&mut Qwen35RequestState>> =
+            epochs.iter().map(|_| None).collect();
         for s in slots.iter_mut().flatten() {
             if let Some(i) = epochs.iter().position(|e| *e == s.epoch) {
                 owners[i] = Some(s);
@@ -480,9 +584,19 @@ impl Qwen35VmmStore {
         let mut outcomes_into: Vec<&mut Option<MtpCbVerified>> = Vec::with_capacity(epochs.len());
         let mut lanes: Vec<MtpCbVerifyLane<'_>> = Vec::with_capacity(epochs.len());
         for s in owners.into_iter() {
-            let s = s.ok_or_else(|| hip_bridge::HipError::new(0, "verify: planned owner vanished"))?;
-            let Qwen35RequestState { kv, dn, mtp, spec_draft, spec_verified, .. } = s;
-            let draft = spec_draft.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "verify: no draft"))?;
+            let s =
+                s.ok_or_else(|| hip_bridge::HipError::new(0, "verify: planned owner vanished"))?;
+            let Qwen35RequestState {
+                kv,
+                dn,
+                mtp,
+                spec_draft,
+                spec_verified,
+                ..
+            } = s;
+            let draft = spec_draft
+                .as_ref()
+                .ok_or_else(|| hip_bridge::HipError::new(0, "verify: no draft"))?;
             lanes.push(MtpCbVerifyLane {
                 kv_cache: kv,
                 dn_state: dn,
@@ -510,7 +624,10 @@ impl Qwen35VmmStore {
         scratch: &Qwen35Scratch,
         epoch: &RequestEpoch,
     ) -> Result<RequestAdvance, String> {
-        if self.request_state(epoch).is_some_and(|s| s.dflash.is_some()) {
+        if self
+            .request_state(epoch)
+            .is_some_and(|s| s.dflash.is_some())
+        {
             return self.dflash_commit_verify(gpu, weights, config, scratch, epoch);
         }
         let eos = config.eos_token;
@@ -520,9 +637,21 @@ impl Qwen35VmmStore {
             .flatten()
             .find(|s| s.epoch == *epoch)
             .ok_or_else(|| format!("commit_step: epoch {epoch:?} no longer owns its slot"))?;
-        let Qwen35RequestState { kv, dn, mtp, spec_draft, spec_verified, .. } = &mut *s;
-        let draft = spec_draft.take().ok_or("commit_step: verify without a draft")?;
-        let result = match spec_verified.take().ok_or("commit_step: verify without an outcome")? {
+        let Qwen35RequestState {
+            kv,
+            dn,
+            mtp,
+            spec_draft,
+            spec_verified,
+            ..
+        } = &mut *s;
+        let draft = spec_draft
+            .take()
+            .ok_or("commit_step: verify without a draft")?;
+        let result = match spec_verified
+            .take()
+            .ok_or("commit_step: verify without an outcome")?
+        {
             MtpCbVerified::Done(r) => r,
             MtpCbVerified::Pending => {
                 let mut lane = MtpCbVerifyLane {
@@ -532,7 +661,8 @@ impl Qwen35VmmStore {
                     draft: &draft,
                     eos_token_id: eos,
                 };
-                mtp_cb_accept(gpu, weights, config, scratch, &mut lane).map_err(|e| format!("commit_step: accept: {e}"))?
+                mtp_cb_accept(gpu, weights, config, scratch, &mut lane)
+                    .map_err(|e| format!("commit_step: accept: {e}"))?
             }
         };
         s.position += result.advance;
@@ -596,7 +726,10 @@ impl MtpLaneSnapshot {
             .mtp_live_state()
             .ok_or("MTP drafter has no live state")?;
         if st.mtp_kv.kv_mode != MtpKvMode::Q8 || rows > st.mtp_kv.max_seq {
-            return Err(format!("MTP head KV {:?} / rows {rows} > {}", st.mtp_kv.kv_mode, st.mtp_kv.max_seq));
+            return Err(format!(
+                "MTP head KV {:?} / rows {rows} > {}",
+                st.mtp_kv.kv_mode, st.mtp_kv.max_seq
+            ));
         }
         let row_bytes = st.mtp_kv.n_head_kv * (st.mtp_kv.head_dim / 32) * 34;
         let bytes = (rows * row_bytes).max(4);
@@ -607,10 +740,13 @@ impl MtpLaneSnapshot {
                 (&st.mtp_kv.inner.v_gpu[0], bytes),
                 (&st.prev_hidden, st.prev_hidden.byte_size()),
             ] {
-                let t = gpu.alloc_tensor(&[n.div_ceil(4)], DType::F32).map_err(|e| e.to_string())?;
+                let t = gpu
+                    .alloc_tensor(&[n.div_ceil(4)], DType::F32)
+                    .map_err(|e| e.to_string())?;
                 out.push(t);
                 let dst = out.last().expect("pushed");
-                gpu.memcpy_dtod_at_auto(&dst.buf, 0, &src.buf, 0, n.min(src.buf.size())).map_err(|e| e.to_string())?;
+                gpu.memcpy_dtod_at_auto(&dst.buf, 0, &src.buf, 0, n.min(src.buf.size()))
+                    .map_err(|e| e.to_string())?;
             }
             gpu.hip.device_synchronize().map_err(|e| e.to_string())
         })();
@@ -623,7 +759,14 @@ impl MtpLaneSnapshot {
         let prev_hidden = out.pop().expect("three tensors");
         let v_rows = out.pop().expect("three tensors");
         let k_rows = out.pop().expect("three tensors");
-        Ok(Self { rows, row_bytes, k_rows, v_rows, prev_hidden, prev_hidden_pos: st.prev_hidden_pos })
+        Ok(Self {
+            rows,
+            row_bytes,
+            k_rows,
+            v_rows,
+            prev_hidden,
+            prev_hidden_pos: st.prev_hidden_pos,
+        })
     }
 
     pub fn rows(&self) -> usize {

@@ -1298,7 +1298,7 @@
     {
      "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
      "kind": "embedded",
-     "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+     "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
@@ -3041,7 +3041,7 @@
     {
      "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
      "kind": "embedded",
-     "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+     "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
@@ -3090,7 +3090,7 @@
     {
      "module": "gemm_hfq4g256_rows_pm",
      "kind": "embedded",
-     "sha256": "797358d9320e112003efdfa3ebc7ba684323f7d2b754bc569bfa9207e8b084c7",
+     "sha256": "657eb7c1828fdb80f078c239f17527b4b6e249023824d7864178840bfe2129cb",
      "flags": null,
      "scheduler_profile": null,
      "symbols": [
@@ -4149,7 +4149,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4157,7 +4157,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4165,7 +4165,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    },
@@ -4173,7 +4173,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    }
@@ -5375,7 +5375,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5383,7 +5383,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5391,7 +5391,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    },
@@ -5399,7 +5399,7 @@
     "module": "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     "symbol": "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
     "kind": "embedded",
-    "sha256": "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc",
+    "sha256": "7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7",
     "flags": null,
     "scheduler_profile": null
    }

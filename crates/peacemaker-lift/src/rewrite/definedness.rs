@@ -39,23 +39,49 @@ struct Set([u64; WORDS]);
 impl Set {
     const EMPTY: Set = Set([0; WORDS]);
     const ALL: Set = Set([u64::MAX; WORDS]);
-    fn insert(&mut self, i: usize) { self.0[i / 64] |= 1 << (i % 64); }
-    fn contains(&self, i: usize) -> bool { self.0[i / 64] >> (i % 64) & 1 != 0 }
-    fn meet(&mut self, other: &Set) { for (a, b) in self.0.iter_mut().zip(other.0) { *a &= b; } }
+    fn insert(&mut self, i: usize) {
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+    fn contains(&self, i: usize) -> bool {
+        self.0[i / 64] >> (i % 64) & 1 != 0
+    }
+    fn meet(&mut self, other: &Set) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a &= b;
+        }
+    }
 }
 
 fn locations(reg: RegRef) -> impl Iterator<Item = usize> {
-    let base = match reg.kind { Kind::V => V0, Kind::S => S0, Kind::Ttmp => T0 };
+    let base = match reg.kind {
+        Kind::V => V0,
+        Kind::S => S0,
+        Kind::Ttmp => T0,
+    };
     (usize::from(reg.base)..usize::from(reg.base) + usize::from(reg.len)).map(move |r| base + r)
 }
 
 fn implicit(bits: u8, wave: Wave) -> Vec<usize> {
     let mut out = Vec::new();
     let wide = wave == Wave::Wave64;
-    if bits & ImplicitSet::SCC != 0 { out.push(SCC); }
-    if bits & ImplicitSet::VCC != 0 { out.push(VCC_LO); if wide { out.push(VCC_HI); } }
-    if bits & ImplicitSet::EXEC != 0 { out.push(EXEC_LO); if wide { out.push(EXEC_HI); } }
-    if bits & ImplicitSet::M0 != 0 { out.push(M0); }
+    if bits & ImplicitSet::SCC != 0 {
+        out.push(SCC);
+    }
+    if bits & ImplicitSet::VCC != 0 {
+        out.push(VCC_LO);
+        if wide {
+            out.push(VCC_HI);
+        }
+    }
+    if bits & ImplicitSet::EXEC != 0 {
+        out.push(EXEC_LO);
+        if wide {
+            out.push(EXEC_HI);
+        }
+    }
+    if bits & ImplicitSet::M0 != 0 {
+        out.push(M0);
+    }
     out
 }
 
@@ -64,22 +90,55 @@ fn name(i: usize) -> String {
         _ if i < S0 => format!("v{i}"),
         _ if i < T0 => format!("s{}", i - S0),
         _ if i < VCC_LO => format!("ttmp{}", i - T0),
-        VCC_LO => "vcc_lo".into(), VCC_HI => "vcc_hi".into(), EXEC_LO => "exec_lo".into(),
-        EXEC_HI => "exec_hi".into(), SCC => "scc".into(), _ => "m0".into(),
+        VCC_LO => "vcc_lo".into(),
+        VCC_HI => "vcc_hi".into(),
+        EXEC_LO => "exec_lo".into(),
+        EXEC_HI => "exec_hi".into(),
+        SCC => "scc".into(),
+        _ => "m0".into(),
     }
 }
 
 fn is_vector(form: Form) -> bool {
-    matches!(form, Form::Vop1 | Form::Vop2 | Form::Vop3 | Form::Vop3p | Form::Vopc | Form::Vopd | Form::Vinterp | Form::Ds | Form::Vmem(_) | Form::Export)
+    matches!(
+        form,
+        Form::Vop1
+            | Form::Vop2
+            | Form::Vop3
+            | Form::Vop3p
+            | Form::Vopc
+            | Form::Vopd
+            | Form::Vinterp
+            | Form::Ds
+            | Form::Vmem(_)
+            | Form::Export
+    )
 }
 
 /// (reads, full definitions) of one instruction.
 fn access(inst: &Inst, wave: Wave) -> (Vec<usize>, Vec<usize>) {
-    let half = |reg: &RegRef| inst.operands.iter().any(|op| matches!(op, Operand::Half(r, _) if r == reg));
-    let mut reads: Vec<usize> = inst.effects.uses.iter().flat_map(|r| locations(*r)).collect();
+    let half = |reg: &RegRef| {
+        inst.operands
+            .iter()
+            .any(|op| matches!(op, Operand::Half(r, _) if r == reg))
+    };
+    let mut reads: Vec<usize> = inst
+        .effects
+        .uses
+        .iter()
+        .flat_map(|r| locations(*r))
+        .collect();
     reads.extend(implicit(inst.effects.implicit.reads, wave));
-    if is_vector(inst.form) { reads.extend(implicit(ImplicitSet::EXEC, wave)); }
-    let mut defs: Vec<usize> = inst.effects.defs.iter().filter(|r| !half(r)).flat_map(|r| locations(*r)).collect();
+    if is_vector(inst.form) {
+        reads.extend(implicit(ImplicitSet::EXEC, wave));
+    }
+    let mut defs: Vec<usize> = inst
+        .effects
+        .defs
+        .iter()
+        .filter(|r| !half(r))
+        .flat_map(|r| locations(*r))
+        .collect();
     defs.extend(implicit(inst.effects.implicit.writes, wave));
     (reads, defs)
 }
@@ -91,7 +150,11 @@ fn entry(kernel: &Kernel) -> Set {
     let (user, wg_x, wg_yz) = match &kernel.abi {
         Abi::Hsa { descriptor, .. } => {
             let rsrc2 = descriptor.compute_pgm_rsrc2.0;
-            ((rsrc2 >> 1 & 0x1f) as usize, rsrc2 >> 7 & 1 != 0, rsrc2 >> 8 & 3 != 0)
+            (
+                (rsrc2 >> 1 & 0x1f) as usize,
+                rsrc2 >> 7 & 1 != 0,
+                rsrc2 >> 8 & 3 != 0,
+            )
         }
         Abi::Raw(raw) => {
             // Facts that do not validate define nothing.
@@ -112,17 +175,29 @@ fn entry(kernel: &Kernel) -> Set {
             return set;
         }
     };
-    for s in 0..user { set.insert(S0 + s); }
-    if wg_x { set.insert(T0 + 9); }
-    if wg_yz { set.insert(T0 + 7); }
+    for s in 0..user {
+        set.insert(S0 + s);
+    }
+    if wg_x {
+        set.insert(T0 + 9);
+    }
+    if wg_yz {
+        set.insert(T0 + 7);
+    }
     set.insert(V0);
-    for e in implicit(ImplicitSet::EXEC, kernel.wave) { set.insert(e); }
+    for e in implicit(ImplicitSet::EXEC, kernel.wave) {
+        set.insert(e);
+    }
     set
 }
 
 /// One instruction's reads that are not defined on every path, by layout index.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Undefined { pub index: usize, pub inst: InstId, pub locations: BTreeSet<String> }
+pub struct Undefined {
+    pub index: usize,
+    pub inst: InstId,
+    pub locations: BTreeSet<String>,
+}
 
 /// Every read of `kernel` that some path from the entry reaches undefined.
 pub fn undefined_reads(kernel: &Kernel) -> Vec<Undefined> {
@@ -131,7 +206,9 @@ pub fn undefined_reads(kernel: &Kernel) -> Vec<Undefined> {
     let inst = |p: usize| body.insts.get(body.layout[p]).expect("laid out");
     let transfer = |b: usize, mut set: Set| {
         for p in body.blocks[b].range.0..body.blocks[b].range.1 {
-            for d in access(inst(p), kernel.wave).1 { set.insert(d); }
+            for d in access(inst(p), kernel.wave).1 {
+                set.insert(d);
+            }
         }
         set
     };
@@ -143,23 +220,43 @@ pub fn undefined_reads(kernel: &Kernel) -> Vec<Undefined> {
         changed = false;
         for b in 0..n {
             let mut set = if b == 0 { seed } else { Set::ALL };
-            for p in &body.blocks[b].preds { set.meet(&out_sets[p.0]); }
-            if b != 0 && body.blocks[b].preds.is_empty() { continue; }
+            for p in &body.blocks[b].preds {
+                set.meet(&out_sets[p.0]);
+            }
+            if b != 0 && body.blocks[b].preds.is_empty() {
+                continue;
+            }
             let out = transfer(b, set);
-            if set != in_sets[b] || out != out_sets[b] { changed = true; }
+            if set != in_sets[b] || out != out_sets[b] {
+                changed = true;
+            }
             in_sets[b] = set;
             out_sets[b] = out;
         }
     }
     let mut found = Vec::new();
     for b in 0..n {
-        if b != 0 && body.blocks[b].preds.is_empty() { continue; }
+        if b != 0 && body.blocks[b].preds.is_empty() {
+            continue;
+        }
         let mut set = in_sets[b];
         for p in body.blocks[b].range.0..body.blocks[b].range.1 {
             let (reads, defs) = access(inst(p), kernel.wave);
-            let missing: BTreeSet<String> = reads.into_iter().filter(|&r| !set.contains(r)).map(name).collect();
-            if !missing.is_empty() { found.push(Undefined { index: p, inst: body.layout[p], locations: missing }); }
-            for d in defs { set.insert(d); }
+            let missing: BTreeSet<String> = reads
+                .into_iter()
+                .filter(|&r| !set.contains(r))
+                .map(name)
+                .collect();
+            if !missing.is_empty() {
+                found.push(Undefined {
+                    index: p,
+                    inst: body.layout[p],
+                    locations: missing,
+                });
+            }
+            for d in defs {
+                set.insert(d);
+            }
         }
     }
     found
@@ -170,34 +267,56 @@ pub fn undefined_reads(kernel: &Kernel) -> Vec<Undefined> {
 /// lifted back from the final bytes, instruction for instruction.
 pub fn check(base: &Kernel, edited: &Kernel, emitted: &Kernel) -> Result<(), String> {
     if emitted.body.layout.len() != edited.body.layout.len() {
-        return Err(format!("the final bytes hold {} instructions, the script produced {}", emitted.body.layout.len(), edited.body.layout.len()));
+        return Err(format!(
+            "the final bytes hold {} instructions, the script produced {}",
+            emitted.body.layout.len(),
+            edited.body.layout.len()
+        ));
     }
-    let before: std::collections::HashMap<InstId, BTreeSet<String>> =
-        undefined_reads(base).into_iter().map(|u| (u.inst, u.locations)).collect();
+    let before: std::collections::HashMap<InstId, BTreeSet<String>> = undefined_reads(base)
+        .into_iter()
+        .map(|u| (u.inst, u.locations))
+        .collect();
     let mut failures = Vec::new();
     for u in undefined_reads(emitted) {
         let id = edited.body.layout[u.index];
         let inst = edited.body.insts.get(id).expect("laid out");
         let mut missing = u.locations;
         if let Some(reg) = preserved_vgpr_destination(peacemaker_ir::inst::Arch::Gfx1201, inst) {
-            for d in locations(reg) { missing.remove(&name(d)); }
+            for d in locations(reg) {
+                missing.remove(&name(d));
+            }
         }
-        if missing.is_empty() { continue; }
-        let text = inst.text(peacemaker_ir::inst::Arch::Gfx1201).unwrap_or_default();
+        if missing.is_empty() {
+            continue;
+        }
+        let text = inst
+            .text(peacemaker_ir::inst::Arch::Gfx1201)
+            .unwrap_or_default();
         if inst.prov.edit.is_some() {
-            failures.push(format!("inserted `{text}` reads {missing:?} undefined on some path"));
+            failures.push(format!(
+                "inserted `{text}` reads {missing:?} undefined on some path"
+            ));
         } else if !missing.is_subset(before.get(&id).unwrap_or(&BTreeSet::new())) {
-            failures.push(format!("original `{text}` now reads {missing:?} undefined on some path"));
+            failures.push(format!(
+                "original `{text}` now reads {missing:?} undefined on some path"
+            ));
         }
     }
-    if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use peacemaker_ir::cfg::Arena;
-    use peacemaker_ir::descriptor::{KernargPreload, KernelCodeProperties, KernelDescriptor, Rsrc1, Rsrc2, Rsrc3};
+    use peacemaker_ir::descriptor::{
+        KernargPreload, KernelCodeProperties, KernelDescriptor, Rsrc1, Rsrc2, Rsrc3,
+    };
     use peacemaker_ir::inst::{KernelOrigin, SymbolId};
     use peacemaker_ir::metadata::{HsaKernelMetadata, KernelMeta};
     use peacemaker_ir::passes::cfg::build_blocks;
@@ -209,20 +328,45 @@ mod tests {
         let mut layout = Vec::new();
         for (k, w) in words.iter().enumerate() {
             let (mut inst, _) = peacemaker_ir::codec::gfx12::decode(&[*w]).unwrap();
-            if inserted.contains(&k) { inst.prov.edit = Some(EditId(1)); }
+            if inserted.contains(&k) {
+                inst.prov.edit = Some(EditId(1));
+            }
             layout.push(insts.insert(inst));
         }
-        let mut body = Body { insts, blocks: Vec::new(), layout };
+        let mut body = Body {
+            insts,
+            blocks: Vec::new(),
+            layout,
+        };
         build_blocks(&mut body, peacemaker_ir::inst::Arch::Gfx1201).unwrap();
         let descriptor = KernelDescriptor {
-            group_segment_fixed_size: 0, private_segment_fixed_size: 0, kernarg_size: 0, kernel_code_entry_byte_offset: 0,
-            compute_pgm_rsrc3: Rsrc3(0), compute_pgm_rsrc1: Rsrc1(0), compute_pgm_rsrc2: Rsrc2(2 << 1),
-            kernel_code_properties: KernelCodeProperties(1 << 10), kernarg_preload: KernargPreload(0), reserved: [0; 28],
+            group_segment_fixed_size: 0,
+            private_segment_fixed_size: 0,
+            kernarg_size: 0,
+            kernel_code_entry_byte_offset: 0,
+            compute_pgm_rsrc3: Rsrc3(0),
+            compute_pgm_rsrc1: Rsrc1(0),
+            compute_pgm_rsrc2: Rsrc2(2 << 1),
+            kernel_code_properties: KernelCodeProperties(1 << 10),
+            kernarg_preload: KernargPreload(0),
+            reserved: [0; 28],
         };
         Kernel {
-            symbol: SymbolId("k".into()), wave: Wave::Wave32,
-            abi: Abi::Hsa { descriptor, metadata: HsaKernelMetadata { raw_msgpack: Vec::new(), parsed: KernelMeta::default() } },
-            body, origin: KernelOrigin::Authored { builder_crate: "test".into(), version: "0".into(), git: "0".into() },
+            symbol: SymbolId("k".into()),
+            wave: Wave::Wave32,
+            abi: Abi::Hsa {
+                descriptor,
+                metadata: HsaKernelMetadata {
+                    raw_msgpack: Vec::new(),
+                    parsed: KernelMeta::default(),
+                },
+            },
+            body,
+            origin: KernelOrigin::Authored {
+                builder_crate: "test".into(),
+                version: "0".into(),
+                git: "0".into(),
+            },
         }
     }
 
@@ -238,7 +382,11 @@ mod tests {
     fn inserted_read_of_a_register_one_predecessor_leaves_undefined_fails() {
         let base = kernel(&[CMP, SKIP1, DEF_V200, ENDPGM], &[]);
         let edited = kernel(&[CMP, SKIP1, DEF_V200, READ_V200, ENDPGM], &[3]);
-        assert_eq!(edited.body.blocks.len(), 3, "diamond: [cmp, branch] [def v200] [join]");
+        assert_eq!(
+            edited.body.blocks.len(),
+            3,
+            "diamond: [cmp, branch] [def v200] [join]"
+        );
         let err = check(&base, &edited, &edited).unwrap_err();
         assert!(err.contains("v200"), "{err}");
     }
@@ -251,7 +399,11 @@ mod tests {
         let edited = kernel(&[DEF_V200, READ_V200, ENDPGM], &[1]);
         assert_eq!(check(&base, &edited, &edited), Ok(()));
         let base = kernel(&[CMP, SKIP1, DEF_V200, READ_V200, ENDPGM], &[]);
-        assert_eq!(undefined_reads(&base).len(), 1, "the original join read is undefined on the taken path");
+        assert_eq!(
+            undefined_reads(&base).len(),
+            1,
+            "the original join read is undefined on the taken path"
+        );
         assert_eq!(check(&base, &base, &base), Ok(()));
     }
 }

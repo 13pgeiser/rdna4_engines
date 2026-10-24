@@ -42,11 +42,20 @@ pub fn verify_tree(src: &Path, pin: &Value) -> Res<Value> {
     let patch_sha = sha256_file(&patch)?;
     let want_patch = jstr(pin, "patch.sha256")?;
     if patch_sha != want_patch {
-        return Err(format!("patch {} sha256 {patch_sha} != pinned {want_patch}", patch.display()));
+        return Err(format!(
+            "patch {} sha256 {patch_sha} != pinned {want_patch}",
+            patch.display()
+        ));
     }
-    let files = jget(pin, "patched_files_sha256")?.as_object().ok_or("patched_files_sha256 must be an object")?;
+    let files = jget(pin, "patched_files_sha256")?
+        .as_object()
+        .ok_or("patched_files_sha256 must be an object")?;
     let status = git(src, &["status", "--porcelain", "--untracked-files=all"])?;
-    let dirty: BTreeSet<String> = status.lines().filter(|l| l.len() > 3).map(|l| l[3..].to_owned()).collect();
+    let dirty: BTreeSet<String> = status
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| l[3..].to_owned())
+        .collect();
     let expect: BTreeSet<String> = files.keys().cloned().collect();
     if dirty != expect {
         return Err(format!(
@@ -71,11 +80,16 @@ pub fn cmd_build_mesa(a: &Args) -> Res<()> {
     let build = a.path("build-dir")?;
     let original = Path::new("/home/kaden/qcal/peacemaker/mesa");
     if std::fs::canonicalize(&src).map_err(err)? == std::fs::canonicalize(original).map_err(err)? {
-        return Err("refusing to patch the pinned original checkout; pass the isolated worktree".into());
+        return Err(
+            "refusing to patch the pinned original checkout; pass the isolated worktree".into(),
+        );
     }
     let head = git(&src, &["rev-parse", "HEAD"])?.trim().to_owned();
     if head != jstr(&pin, "commit")? {
-        return Err(format!("mesa HEAD {head} != pinned commit {}", jstr(&pin, "commit")?));
+        return Err(format!(
+            "mesa HEAD {head} != pinned commit {}",
+            jstr(&pin, "commit")?
+        ));
     }
     let status = git(&src, &["status", "--porcelain", "--untracked-files=all"])?;
     let patch = patch_path(&pin)?;
@@ -85,8 +99,16 @@ pub fn cmd_build_mesa(a: &Args) -> Res<()> {
         if got != want {
             return Err(format!("patch sha256 {got} != pinned {want}"));
         }
-        run(Command::new("git").arg("-C").arg(&src).args(["apply", "--check"]).arg(&patch))?;
-        run(Command::new("git").arg("-C").arg(&src).arg("apply").arg(&patch))?;
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&src)
+            .args(["apply", "--check"])
+            .arg(&patch))?;
+        run(Command::new("git")
+            .arg("-C")
+            .arg(&src)
+            .arg("apply")
+            .arg(&patch))?;
         eprintln!("applied {}", patch.display());
     }
     let evidence = verify_tree(&src, &pin)?;
@@ -94,9 +116,16 @@ pub fn cmd_build_mesa(a: &Args) -> Res<()> {
     let meson = a.opt("meson").map(PathBuf::from).unwrap_or_else(|| {
         let home = std::env::var("HOME").unwrap_or_default();
         let p = PathBuf::from(home).join(".local/bin/meson");
-        if p.is_file() { p } else { PathBuf::from("meson") }
+        if p.is_file() {
+            p
+        } else {
+            PathBuf::from("meson")
+        }
     });
-    let ninja = a.opt("ninja").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("ninja"));
+    let ninja = a
+        .opt("ninja")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ninja"));
     if !build.join("build.ninja").is_file() {
         let mut c = Command::new(&meson);
         c.arg("setup").arg(&build).arg(&src);
@@ -140,7 +169,16 @@ pub fn cmd_build_host(a: &Args) -> Res<()> {
         std::fs::create_dir_all(p).map_err(err)?;
     }
     let mut c = Command::new(cc);
-    c.args(["-O2", "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-parameter"]).arg(&src).arg("-o").arg(&out);
+    c.args([
+        "-O2",
+        "-std=gnu11",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+    ])
+    .arg(&src)
+    .arg("-o")
+    .arg(&out);
     for f in flags.split_whitespace() {
         c.arg(f);
     }

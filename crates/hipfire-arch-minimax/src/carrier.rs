@@ -51,17 +51,16 @@ pub fn load_minimax_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<MiniMa
     match src {
         ModelSource::Hfq(mut hfq_file) => {
             let config = <MiniMaxM2 as Architecture>::config_from_hfq(&hfq_file)?;
-            let weights = <MiniMaxM2 as Architecture>::load_weights(&mut hfq_file, &config, ctx.gpu)?;
+            let weights =
+                <MiniMaxM2 as Architecture>::load_weights(&mut hfq_file, &config, ctx.gpu)?;
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
             let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
                 .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
             let tokenizer =
                 hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq_file.metadata_json)
                     .map_err(|e| format!("tokenizer not found: {e}"))?;
-            let eos_tok = resolve_eos_tok(
-                &tokenizer,
-                &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
-            );
+            let eos_tok =
+                resolve_eos_tok(&tokenizer, &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"]);
             Ok(MiniMaxBundle {
                 config,
                 weights,
@@ -77,10 +76,8 @@ pub fn load_minimax_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<MiniMa
             let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
                 .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
             let tokenizer = tokenizer_from_dir(&source)?;
-            let eos_tok = resolve_eos_tok(
-                &tokenizer,
-                &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
-            );
+            let eos_tok =
+                resolve_eos_tok(&tokenizer, &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"]);
             Ok(MiniMaxBundle {
                 config,
                 weights,
@@ -90,4 +87,3 @@ pub fn load_minimax_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<MiniMa
         }
     }
 }
-

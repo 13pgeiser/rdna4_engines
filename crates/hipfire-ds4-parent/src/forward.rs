@@ -29,9 +29,7 @@ use crate::attention::{
     all_finite, l2_norm, parent_attention_swa, ParentAttnScratch, PARENT_DIM, PARENT_RMS_EPS,
 };
 use crate::codec::round_to_bf16;
-use crate::hc::{
-    parent_hc_post, parent_hc_pre, parent_rms_norm, ParentHcParams,
-};
+use crate::hc::{parent_hc_post, parent_hc_pre, parent_rms_norm, ParentHcParams};
 use crate::moe::{parent_moe_forward, parent_route, ParentMoeScratch};
 use crate::weights::ParentWeights;
 use crate::{Ds4ParentBackend, ParentQuantConfig};
@@ -162,18 +160,17 @@ impl ParentForwardScratch {
                 return Err(err(format!("forward post alloc: {e:?}")));
             }
         };
-        let comb =
-            match gpu.alloc_tensor(&[max_rows, PARENT_HC_MULT, PARENT_HC_MULT], DType::F32) {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = gpu.free_tensor(residual_hc);
-                    let _ = gpu.free_tensor(stream_y);
-                    let _ = gpu.free_tensor(stream_normed);
-                    let _ = gpu.free_tensor(stream_block);
-                    let _ = gpu.free_tensor(post);
-                    return Err(err(format!("forward comb alloc: {e:?}")));
-                }
-            };
+        let comb = match gpu.alloc_tensor(&[max_rows, PARENT_HC_MULT, PARENT_HC_MULT], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(residual_hc);
+                let _ = gpu.free_tensor(stream_y);
+                let _ = gpu.free_tensor(stream_normed);
+                let _ = gpu.free_tensor(stream_block);
+                let _ = gpu.free_tensor(post);
+                return Err(err(format!("forward comb alloc: {e:?}")));
+            }
+        };
         let moe_x_bf16 = match gpu.alloc_tensor(&[max_rows, PARENT_DIM], DType::BF16) {
             Ok(t) => t,
             Err(e) => {
@@ -426,7 +423,6 @@ fn parent_layer_forward_inner(
         )));
     }
 
-
     // Hash-routed layers need input_ids; score-routed layers must not require
     // them. Error, do not default.
     let is_hash = layer_idx < cfg.num_hash_layers;
@@ -491,19 +487,7 @@ fn parent_layer_forward_inner(
         scale: &layer.hc_attn_scale,
     };
     parent_hc_pre(
-        gpu,
-        backend,
-        x,
-        attn_hc,
-        rows,
-        hc,
-        dim,
-        eps,
-        sinkhorn,
-        hc_eps,
-        &stream_y,
-        &post,
-        &comb,
+        gpu, backend, x, attn_hc, rows, hc, dim, eps, sinkhorn, hc_eps, &stream_y, &post, &comb,
     )
     .map_err(|e| err(format!("layer {layer_idx} hc_pre_attn: {e}")))?;
     if let Some(t) = trace.as_mut() {
@@ -710,8 +694,7 @@ fn download_f32_prefix(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f3
         )));
     }
     let mut host = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| err(format!("download_f32_prefix: {e:?}")))?;
@@ -742,8 +725,7 @@ fn stage_f32_to_bf16(
     }
     {
         let dst = &mut scratch.host_f32[..nelems];
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, nbytes) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, nbytes) };
         gpu.hip
             .memcpy_dtoh(bytes, &src.buf)
             .map_err(|e| err(format!("stage_f32_to_bf16 dtoh: {e:?}")))?;
@@ -809,7 +791,7 @@ mod tests {
             + max_rows * PARENT_HC_MULT * 4             // post
             + max_rows * PARENT_HC_MULT * PARENT_HC_MULT * 4 // comb
             + max_rows * PARENT_DIM * 2; // moe_x_bf16
-        // Sanity: own tiles alone should be well under 16 MiB for 16 rows.
+                                         // Sanity: own tiles alone should be well under 16 MiB for 16 rows.
         assert!(own < 16 * 1024 * 1024, "own={own}");
         // HC dim contract.
         assert_eq!(PARENT_HC_DIM, 4 * 4096);
@@ -849,7 +831,6 @@ mod tests {
         assert!(msg.contains("input_ids required"));
         assert!(msg.contains("num_hash_layers=3"));
     }
-
 
     #[test]
     fn score_layer_does_not_require_ids() {

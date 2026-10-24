@@ -310,15 +310,9 @@ impl Scratch {
         let q_host = build_q();
         let cache_bytes = ctx * BYTES_PER_POS;
 
-        let q = gpu
-            .upload_f32(&q_host, &[B * H * HD])
-            .expect("upload Q");
-        let k = gpu
-            .upload_raw(&k_host, &[cache_bytes])
-            .expect("upload K");
-        let v = gpu
-            .upload_raw(&v_host, &[cache_bytes])
-            .expect("upload V");
+        let q = gpu.upload_f32(&q_host, &[B * H * HD]).expect("upload Q");
+        let k = gpu.upload_raw(&k_host, &[cache_bytes]).expect("upload K");
+        let v = gpu.upload_raw(&v_host, &[cache_bytes]).expect("upload V");
 
         // Raw dtype: sub_offset counts bytes (dtype.size()==1).
         let suf_bytes = B * BYTES_PER_POS;
@@ -370,7 +364,6 @@ impl Scratch {
             out_scalar_window,
         }
     }
-
 
     fn launch(&self, gpu: &mut Gpu, arm: Arm, ctx: usize) {
         match arm {
@@ -590,7 +583,9 @@ fn main() {
     s.launch(&mut gpu, Arm::LongspecExact, ctx);
     s.launch(&mut gpu, Arm::WmmaWindow2048, ctx);
     s.launch_scalar_window(&mut gpu, ctx);
-    gpu.hip.device_synchronize().expect("sync after corr launches");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after corr launches");
 
     let ref_full = gpu.download_f32(&s.out_scalar).expect("dl scalar_full");
     let wmma = gpu.download_f32(&s.out_wmma).expect("dl wmma_full");
@@ -634,7 +629,10 @@ fn main() {
             break;
         }
     }
-    assert!(any_l, "all prefix/suffix l values are zero — vacuous partials");
+    assert!(
+        any_l,
+        "all prefix/suffix l values are zero — vacuous partials"
+    );
 
     let host_merged = host_merge_partials(&pref_h, &suf_h);
     let (m_abs, m_ratio, m_ok) = merge_allclose(&longspec, &host_merged);

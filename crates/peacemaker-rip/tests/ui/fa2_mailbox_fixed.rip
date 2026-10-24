@@ -15,6 +15,9 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
     p.s::<8>("scalars", 0, Live::Whole)?;
     let mut b = Builder::new(kspec, p);
     let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    // registers initialized so the fixture is definedness-clean (R0604)
+    for r in [1, 2, 5] { op(wg.isa(), format!("v_mov_b32_e32 v{r}, 0"), &[v(r)], &[])?; }
+    for r in 8..12 { op(wg.isa(), format!("v_mov_b32_e32 v{r}, 0"), &[v(r)], &[])?; }
     let v_body = wg.lds::<VBody>("V", 16384, 16376)?;
     let mbox = wg.lds::<Mailbox>("mailbox", 32760, 8)?;
     let (mbox, st) = wg.ds_store(mbox, Instruction::new("ds_store_2addr_b32 v0, v1, v2 offset1:1", vec![], vec![v(0),v(1),v(2)]).memory(MemoryClass::DsStore))?;

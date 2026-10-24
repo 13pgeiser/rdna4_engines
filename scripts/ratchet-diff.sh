@@ -144,7 +144,7 @@ EMITTED="$(bash scripts/leanup-ratchets.sh --report 2>/dev/null \
 if [ -n "$EMITTED" ]; then
   while read -r name _op _val; do
     [ -n "$name" ] || continue
-    if ! echo "$EMITTED" | grep -qx "$name"; then
+    if ! grep -qxF -- "$name" <<<"$EMITTED"; then
       note "$name" "asserted but NO LONGER EMITTED  <-- silently unenforced"
       violations=$((violations + 1))
     fi

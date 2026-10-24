@@ -1,0 +1,482 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `mq6_i8_gemm` generator (MQ6G256V2 x block_i8_128 exact-INT8 GEMM, gfx1201), composed in
+// `.rip` from the `mq6::*` natives of `mq6_i8_gemm::blocks`.
+//
+// `mq6_i8_gemm::emit(spec)` (kernels/mq6_i8_gemm/mod.rs) is written over exactly the blocks this
+// script calls, so for every valid Spec the script re-emits the production kernel's bytes
+// (`s_text` and proof). A test in peacemaker-rip (`mq6_i8_gemm_twin_matches_the_rust_emit`)
+// requires it for every valid Spec on gfx1201. Edit the composition here and re-run: no rebuild.
+//
+// Unlike the `iu4_gemm` twin, the blocks are fine: no native owns an LDS ring. The natives that
+// touch LDS return `Instruction`s (`mq6::store_w_insns`, `mq6::step_load_insns`, ...) and THIS
+// SCRIPT issues them through the checked driver (`wg.ds_store`, `wg.ds_load_cur`) on rings it made
+// itself (`wg.lds` + `Ring::new`). Every wait, every split-barrier signal and every ring
+// transition below is a statement you can move; the driver refuses a wrong one (a read of a
+// buffer that is not published, a barrier that skips a drain, a loop body that leaves the rings in
+// another state). The other natives (fetch, decode, WMMA step, fold, seed, prologue set-up,
+// epilogue) emit straight into `wg.isa()`.
+//
+// Variant grammar: the shipped variant name, `Spec::variant_name()`:
+//
+//     TILE-EPI[-linear]
+//
+//     TILE    128x128x8 | 256x128x16 | 128x256x16   (rows x tokens x waves per workgroup; the
+//             first is the shipped tile, the others run 16 waves of the same 32 x 64 per-wave tile)
+//     EPI     set | set_bf16        (F32 overwrite | BF16 bits)
+//     linear  optional: the linear CTA raster (the CPU interpreter twin); default: banded (product)
+//
+// e.g. `128x128x8-set`, `256x128x16-set_bf16`, `128x256x16-set-linear`. `VARIANTS` lists every one.
+// gfx1201 only. The tile changes how many staging rounds a slab takes (`g.a_rounds()` /
+// `g.w_rounds()`), which this script reads; the per-tile geometry (waves, LDS layout, register
+// map, two buffers per ring) is the Rust generator's and needs a rebuild to change.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &[
+    "128x128x8-set",
+    "128x128x8-set-linear",
+    "128x128x8-set_bf16",
+    "128x128x8-set_bf16-linear",
+    "256x128x16-set",
+    "256x128x16-set-linear",
+    "256x128x16-set_bf16",
+    "256x128x16-set_bf16-linear",
+    "128x256x16-set",
+    "128x256x16-set-linear",
+    "128x256x16-set_bf16",
+    "128x256x16-set_bf16-linear",
+];
+
+region PayA, PayW, MetaD, MetaS;
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let g = Mq6Gen::new(mq6_spec(&spec.variant, spec.arch)?)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    author(&mut wg, &g)?;
+    b.finish()
+}
+
+// The variant name as the `Mq6Spec` it names.
+fn mq6_spec(variant: &str, arch: Arch) -> Result<Mq6Spec, String> {
+    let parts: Vec<&str> = variant.split('-').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(format!("variant `{variant}`: expected TILE-EPI[-linear]"));
+    }
+    let tile = match parts[0] {
+        "128x128x8" => Mq6Tile::T128x128,
+        "256x128x16" => Mq6Tile::T256x128,
+        "128x256x16" => Mq6Tile::T128x256,
+        t => return Err(format!("variant `{variant}`: unknown tile `{t}` (128x128x8, 256x128x16, 128x256x16)")),
+    };
+    let epi = match parts[1] {
+        "set" => Mq6Epi::Set,
+        "set_bf16" => Mq6Epi::SetBf16,
+        e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, set_bf16)")),
+    };
+    let raster = if parts.len() == 3 {
+        if parts[2] != "linear" {
+            return Err(format!("variant `{variant}`: unknown raster `{}` (linear)", parts[2]));
+        }
+        Raster::Linear
+    } else {
+        Raster::Banded
+    };
+    Ok(Mq6Spec { epi: epi, raster: raster, tile: tile, arch: arch })
+}
+
+// The Workgroup scope lives here, not in emit(): emit() mentions `b` again at finish(), which
+// would end the scope under any later `wg` use.
+fn author<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen) -> Result<(), String> {
+    let lds = declare_lds(wg, g)?;
+    let end = wg.exit(mq6::END)?;
+    // The product raster runs its K-loop at wave priority 1 and drops to 0 for the epilogue (in
+    // the epilogue native), so co-resident K-loops win issue arbitration over a finishing tile.
+    // Scheduling only.
+    if g.spec().raster == Raster::Banded {
+        op(wg.isa(), "s_setprio 1", vec![], vec![])?;
+    }
+    let lds = prologue(wg, g, end, lds)?;
+    let lds = kloop(wg, g, lds)?;
+    wg.label(mq6::EPI)?;
+    mq6::epilogue(wg, g)?;
+    wg.end(end)
+}
+
+// ---------------------------------------------------------------------------------------------
+// LDS: eight slots as four two-buffer rings (A, W, DS, SZ), every buffer Free.
+
+fn slot<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, name: &str) -> Result<Region, String> {
+    let (base, bytes) = g.slot(name).unwrap();
+    wg.lds::<PayA>(name, base, bytes)
+}
+
+fn declare_lds<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen) -> Result<[Ring; 4], String> {
+    let a0 = slot(wg, g, "A0")?;
+    let w0 = slot(wg, g, "W0")?;
+    let a1 = slot(wg, g, "A1")?;
+    let w1 = slot(wg, g, "W1")?;
+    let d0 = slot(wg, g, "DS0")?;
+    let d1 = slot(wg, g, "DS1")?;
+    let s0 = slot(wg, g, "SZ0")?;
+    let s1 = slot(wg, g, "SZ1")?;
+    Ok([Ring::new(a0, a1), Ring::new(w0, w1), Ring::new(d0, d1), Ring::new(s0, s1)])
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prologue: kernel arguments, CTA raster, descriptors, lane offsets, block 0's staging (decode,
+// publish) and the first rendezvous. Free rings in, Published/Free rings out.
+
+fn push_all<T: Target>(wg: &mut Wg<T>, insns: Vec<Instruction>) -> Result<(), String> {
+    for insn in insns {
+        wg.isa().push(insn)?;
+    }
+    Ok(())
+}
+
+fn prologue<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, end: Exit, lds: [Ring; 4]) -> Result<[Ring; 4], String> {
+    let (ra, rw, rd, rs) = (lds[0], lds[1], lds[2], lds[3]);
+    mq6::prologue_front(wg, g)?;
+    // Tiles past the problem exit (none for the host grid; kept for safety).
+    let outside = wg.scmp_wg_uniform(mq6::tile_outside_insn(g, 0)?)?;
+    wg.exit_if(outside, end)?;
+    let outside = wg.scmp_wg_uniform(mq6::tile_outside_insn(g, 1)?)?;
+    wg.exit_if(outside, end)?;
+    mq6::prologue_scalars(wg, g)?;
+    mq6::prologue_lanes(wg, g)?;
+
+    // Block 0: slab 0 (K32 half 0 now, half 1 after half 0 is published), token plane 0, row plane 0.
+    let a0r = g.reg("srd_a0").unwrap();
+    mq6::prologue_fetch(wg, g)?;
+    mq6::zero_acc(wg, g)?;
+    let _ = wg.begin_write(ra);
+    let _ = wg.begin_write(rw);
+    for rnd in 0..g.w_rounds() {
+        push_all(wg, mq6::decode_insns(g, rnd)?)?;
+        for insn in mq6::store_w_insns(g, 0, rnd)? {
+            wg.ds_store(rw, insn)?;
+        }
+    }
+    for insn in mq6::store_a_insns(g, 0, 0)? {
+        wg.ds_store(ra, insn)?;
+    }
+    // The raw staging registers are still sources of the sb 0 stores: retire them first.
+    mq6::wait_all(wg)?;
+    mq6::fetch_a(wg, g, 0, 1, a0r)?;
+    for insn in mq6::store_a_insns(g, 0, 1)? {
+        wg.ds_store(ra, insn)?;
+    }
+    // The metadata planes: VALU words first, then the rings begin their write.
+    let plane = rd.next_index();
+    mq6::meta_valu(wg, g)?;
+    let _ = wg.begin_write(rd);
+    let _ = wg.begin_write(rs);
+    let meta = mq6::meta_store_insns(g, plane)?;
+    wg.ds_store(rd, meta[0])?;
+    wg.ds_store(rs, meta[1])?;
+    let (da, dw, dd, ds) = wg.wait_all((ra, rw, rd, rs))?;
+    let arrived = wg.signal((prime(ra, da), prime(rw, dw), prime(rd, dd), prime(rs, ds)))?;
+    // Seed the ring: slab 1 of block 0 (K32 half 0 and the weight codes).
+    mq6::fetch_a(wg, g, 1, 0, a0r)?;
+    mq6::fetch_w(wg, g, 8 + 48)?;
+    mq6::seed_fill(wg, g)?;
+    wg.wait_arrived(arrived)?;
+    Ok([ra, rw, rd, rs])
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rolled K-loop. One trip is a whole 256-K group (two 128-K blocks, plane parity 0 then 1), so
+// every LDS address is an immediate and the trip ends in the state it started in; `loop_carried`
+// checks that. The last group is peeled: its second block fetches and publishes nothing.
+
+fn kloop<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, lds: [Ring; 4]) -> Result<[Ring; 4], String> {
+    wg.label(mq6::K_BEGIN)?;
+    // K == 256: no full trip; go straight to the peeled group.
+    let no_trip = wg.scmp_wg_uniform(mq6::trips_cmp_insn(g, "s_cmp_eq_u32")?)?;
+    let lds = wg.wg_skip_if(no_trip, mq6::tail_label(0), lds, |wg, lds| {
+        let lds = wg.loop_carried(mq6::K_LOOP, lds, |wg, lds| {
+            let lds = block(wg, g, "m0", 0, true, mq6::label("m1"), true, None, lds)?;
+            // The even-block descriptor was last read by block 0's slab-1 fetch; block 1 moves it to
+            // block 2g+2 before its own next-block fetch reads it (a step at the block's start).
+            let lds = block(wg, g, "m1", 1, true, mq6::K_LOOP_END, true, Some(0), lds)?;
+            // Trip end: the odd-block descriptor and the group offsets move on after every read of
+            // them in this trip.
+            mq6::trip_end(wg, g)?;
+            let more = wg.scmp_wg_uniform(mq6::trips_cmp_insn(g, "s_cmp_lg_u32")?)?;
+            Ok((lds, more))
+        })?;
+        wg.label(mq6::K_LOOP_END)?;
+        Ok(lds)
+    })?;
+    // The skip target is the peeled group's first block label, which this block's
+    // `entry_label = false` leaves for the `wg_skip_if` above to place.
+    let lds = block(wg, g, "t0", 0, true, mq6::label("t1"), false, None, lds)?;
+    block(wg, g, "t1", 1, false, mq6::EPI, true, None, lds)
+}
+
+// ---------------------------------------------------------------------------------------------
+// One K128 block on token/row plane `h`: two K64 slabs of four K16 steps (64 WMMAs per wave).
+//
+// Entry state: slab 0 published in slot 0, slab 1's raw A half 0 and weight dwords in the prefetch
+// registers, plane `h` of the DS / SZ rings published.
+//
+// Work that runs between the WMMAs is a queue of `Work` units. `phase` issues the K16 steps and
+// after every WMMA from index `start` on runs `per` units from the queue; the queue order, `start`
+// and `per` are the decode / store / fetch placement.
+
+enum Work {
+    Insn(Instruction),
+    StoreW(usize),
+    StoreA(u32),
+    FetchA(u32, u32, u8),
+    Meta,
+}
+
+// The four rings plus the queue. `a` and `w` are the rings of the slab being staged; `slot` is the
+// buffer the staging stores go to.
+struct Stage {
+    slot: usize,
+    work: Vec<Work>,
+    pos: usize,
+    a: Ring,
+    w: Ring,
+    d: Ring,
+    s: Ring,
+}
+
+fn queue_decode(st: &mut Stage, insns: Vec<Instruction>) {
+    for insn in insns {
+        st.work.push(Work::Insn(insn));
+    }
+}
+
+fn pump<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage, n: usize) -> Result<(), String> {
+    let mut ran = 0usize;
+    while ran < n && st.pos < st.work.len() {
+        let item = st.work[st.pos].clone();
+        st.pos += 1;
+        ran += 1;
+        match item {
+            Work::Insn(insn) => {
+                wg.isa().push(insn)?;
+            }
+            Work::StoreW(r) => {
+                for insn in mq6::store_w_insns(g, st.slot, r)? {
+                    wg.ds_store(st.w, insn)?;
+                }
+            }
+            Work::StoreA(sb) => {
+                for insn in mq6::store_a_insns(g, st.slot, sb)? {
+                    wg.ds_store(st.a, insn)?;
+                }
+            }
+            Work::FetchA(slab, sb, srd) => {
+                // The raw staging registers are still sources of the previous half's stores.
+                mq6::wait_all(wg)?;
+                mq6::fetch_a(wg, g, slab, sb, srd)?;
+            }
+            Work::Meta => {
+                // The VALU words first, then the DS / SZ rings begin their write.
+                let plane = st.d.next_index();
+                mq6::meta_valu(wg, g)?;
+                let _ = wg.begin_write(st.d);
+                let _ = wg.begin_write(st.s);
+                let meta = mq6::meta_store_insns(g, plane)?;
+                wg.ds_store(st.d, meta[0])?;
+                wg.ds_store(st.s, meta[1])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn flush<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage) -> Result<(), String> {
+    let n = st.work.len() - st.pos;
+    pump(wg, g, st, n)
+}
+
+// The `ds_load_b128`s of one K16 step into fragment set `set` from LDS slot `slot`: the weight
+// row-group pair (W ring), then the two token-group pairs (A ring).
+fn step_loads<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &Stage, slot: usize, step: u32, set: usize) -> Result<(), String> {
+    let loads = mq6::step_load_insns(g, slot, step, set)?;
+    wg.ds_load_cur(st.w, loads[0])?;
+    wg.ds_load_cur(st.a, loads[1])?;
+    wg.ds_load_cur(st.a, loads[2])?;
+    Ok(())
+}
+
+// Four K16 steps from `slot` on the two fragment sets (the next-but-one step loads while the
+// current one issues); after the n-th WMMA (n >= start) `per` work units run.
+fn phase<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &mut Stage, slot: usize, first: bool, start: usize, per: usize) -> Result<(), String> {
+    step_loads(wg, g, st, slot, 0, 0)?;
+    step_loads(wg, g, st, slot, 1, 1)?;
+    for step in 0..4u32 {
+        let set = (step & 1) as usize;
+        let base = 8 * (step as usize);
+        for i in 0..8usize {
+            mq6::mma(wg, g, step, set, first && step == 0, i)?;
+            if base + i >= start {
+                pump(wg, g, st, per)?;
+            }
+        }
+        if step + 2 < 4 {
+            step_loads(wg, g, st, slot, step + 2, set)?;
+        }
+    }
+    Ok(())
+}
+
+// One fold fragment `k = nb * 2 + rg`: the `msn` bias, then the four VOPD stages (8 mul/add
+// packets, 4 fmac pairs, 4 mul pairs, 4 fmac pairs).
+fn frag<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, nb: usize, rg: usize, sc: u8, zp: u8) -> Result<(), String> {
+    mq6::emit_msn(wg, g, nb)?;
+    for stage in 0..4usize {
+        mq6::fold_stage(wg, g, nb * 2 + rg, stage, sc, zp)?;
+    }
+    Ok(())
+}
+
+// `rel`: the byte offset inside plane `h` of the row planes (`sc` at 0, `z'` at 512, row group 1
+// at +64).
+fn sz_load<T: Target>(wg: &mut Wg<T>, g: &Mq6Gen, st: &Stage, h: usize, dst: u8, rel: u32) -> Result<(), String> {
+    wg.ds_load_cur(st.s, mq6::fold_sz_load_insn(g, h, dst, rel)?)
+}
+
+fn block<T: Target>(
+    wg: &mut Wg<T>,
+    g: &Mq6Gen,
+    tag: &str,
+    h: usize,
+    fetch_next: bool,
+    end: &str,
+    entry_label: bool,
+    step: Option<usize>,
+    lds: [Ring; 4],
+) -> Result<[Ring; 4], String> {
+    let (ra, rw, rd, rs) = (lds[0], lds[1], lds[2], lds[3]);
+    if rd.cur_index() != h || ra.cur_index() != 0 {
+        return Err(format!("block {tag}: LDS rings out of phase with plane {h}"));
+    }
+    let x = mq6::label(tag);
+    let xf = mq6::label(&format!("{tag}_fold"));
+    if entry_label {
+        wg.label(&x)?;
+    }
+    mq6::declare_block_regs(wg, g, &x, &xf, end)?;
+    if let Some(which) = step {
+        mq6::step_descriptor(wg, g, which)?;
+    }
+    let srd_a = [g.reg("srd_a0").unwrap(), g.reg("srd_a1").unwrap()];
+    let group: u32 = mq6::GROUP_BYTES;
+    let mut st = Stage { slot: 0, work: Vec::new(), pos: 0, a: ra, w: rw, d: rd, s: rs };
+
+    // ---------------------------------------------------------------- phase A
+    st.slot = st.a.next_index();
+    let _ = wg.begin_write(st.a);
+    let _ = wg.begin_write(st.w);
+    // Half 0 of this slab's activations was fetched a block ago: publish it first, so the refill
+    // of the raw staging registers (which must wait for these stores to read them) finds them long
+    // drained.
+    st.work.push(Work::StoreA(0));
+    queue_decode(&mut st, mq6::decode_insns(g, 0)?);
+    st.work.push(Work::FetchA(1, 1, srd_a[h]));
+    st.work.push(Work::StoreW(0));
+    // A tile with one weight round (128 rows on 512 threads) has no second round to decode.
+    if g.w_rounds() > 1 {
+        queue_decode(&mut st, mq6::decode_insns(g, 1)?);
+        st.work.push(Work::StoreW(1));
+    }
+    st.work.push(Work::StoreA(1));
+    // The seed octet is the decode scratch: decode starts after the last seeded WMMA.
+    phase(wg, g, &mut st, 0, true, 8, 3)?;
+    flush(wg, g, &mut st)?;
+    if fetch_next {
+        // Next block's token word and packed row header (header word of the next half; across a
+        // group boundary the group stride, since `goff` has not advanced).
+        mq6::fetch_meta(wg, g, h, if h == 0 { 4 } else { group })?;
+    }
+    // B1 is split: the next block's raw slab-0 fetch (VMEM, its registers are free once the stores
+    // drained) overlaps the rendezvous.
+    let (da, dw) = wg.wait_all((st.a, st.w))?;
+    let b1 = wg.signal((rotate(st.a, da), rotate(st.w, dw)))?;
+    if fetch_next {
+        mq6::fetch_a(wg, g, 0, 0, srd_a[h ^ 1])?;
+        mq6::fetch_w(wg, g, if h == 0 { 8 + 96 } else { group + 8 })?;
+    }
+    wg.wait_arrived(b1)?;
+
+    // ---------------------------------------------------------------- phase B
+    if fetch_next {
+        st.slot = st.a.next_index();
+        let _ = wg.begin_write(st.a);
+        let _ = wg.begin_write(st.w);
+        queue_decode(&mut st, mq6::decode_insns(g, 0)?);
+        st.work.push(Work::StoreW(0));
+        st.work.push(Work::StoreA(0));
+        st.work.push(Work::FetchA(0, 1, srd_a[h ^ 1]));
+        if g.w_rounds() > 1 {
+            queue_decode(&mut st, mq6::decode_insns(g, 1)?);
+            st.work.push(Work::StoreW(1));
+        }
+        st.work.push(Work::StoreA(1));
+        st.work.push(Work::Meta);
+    }
+    phase(wg, g, &mut st, 1, false, 6, 3)?;
+    flush(wg, g, &mut st)?;
+
+    // ---------------------------------------------------------------- fold
+    wg.label(&xf)?;
+    let scratch = g.reg("scratch").unwrap();
+    let cacc = g.reg("cacc").unwrap();
+    let fold_sc = g.reg("fold_sc").unwrap();
+    let fold_zp = g.reg("fold_zp").unwrap();
+    // Plane `h` addresses: token (d, float(s)) pairs via `msn` as the address temporary, rows'
+    // sc / z' from `sc_addr`.
+    mq6::fold_addr(wg, g, h)?;
+    for nb in 0..4usize {
+        wg.ds_load_cur(st.d, mq6::fold_token_load_insn(g, nb)?)?;
+    }
+    // Row group 0: sc octet then z' octet (planar, 8 rows of this lane's row half).
+    sz_load(wg, g, &st, h, fold_sc, 0)?;
+    sz_load(wg, g, &st, h, fold_sc + 4, 16)?;
+    sz_load(wg, g, &st, h, fold_zp, 512)?;
+    sz_load(wg, g, &st, h, fold_zp + 4, 512 + 16)?;
+    // Row group 1's z' into the decode scratch (free until the next block's decode).
+    sz_load(wg, g, &st, h, scratch, 64 + 512)?;
+    sz_load(wg, g, &st, h, scratch + 4, 64 + 512 + 16)?;
+    frag(wg, g, 0, 0, fold_sc, fold_zp)?;
+    // Fragment k = 0 is folded: its int32 registers now hold row group 1's sc.
+    sz_load(wg, g, &st, h, cacc, 64)?;
+    sz_load(wg, g, &st, h, cacc + 4, 64 + 16)?;
+    frag(wg, g, 1, 0, fold_sc, fold_zp)?;
+
+    let arrived = if fetch_next {
+        // B2 is split: signalled once the fold's LDS reads are issued and waited at the block end,
+        // overlapping the fold's remaining packets and the next block's slab-1 fetch.
+        let (da, dw, dd, ds) = wg.wait_all((st.a, st.w, st.d, st.s))?;
+        let b2 = wg.signal((rotate(st.a, da), rotate(st.w, dw), rotate(st.d, dd), rotate(st.s, ds)))?;
+        // Next block's slab 1 (K32 half 0 and the weight codes): `goff` has not advanced at the
+        // odd-to-even boundary, so its offsets carry the group stride.
+        mq6::fetch_a(wg, g, 1, 0, srd_a[h ^ 1])?;
+        mq6::fetch_w(wg, g, if h == 0 { 8 + 96 + 48 } else { group + 8 + 48 })?;
+        Some(b2)
+    } else {
+        None
+    };
+    frag(wg, g, 2, 0, fold_sc, fold_zp)?;
+    frag(wg, g, 3, 0, fold_sc, fold_zp)?;
+    for nb in 0..4usize {
+        frag(wg, g, nb, 1, cacc, scratch)?;
+    }
+    if fetch_next {
+        // Next block's WMMA seed octet (the scratch is dead after row group 1's fold).
+        mq6::seed_fill(wg, g)?;
+    }
+    if let Some(b2) = arrived {
+        wg.wait_arrived(b2)?;
+    }
+    Ok([st.a, st.w, st.d, st.s])
+}

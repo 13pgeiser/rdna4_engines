@@ -43,11 +43,11 @@ use serde_json::{json, Map, Value};
 use super::{
     capacity_preflight, checked_bf16_bytes, checked_product, i64_role, is_vision_tensor,
     load_inventory, load_optional_config, load_tokenizer_metadata, matrix_quant_type,
-    predicted_output_bytes, publish_qwen4, qwen4_quantized_dtype, quantized_data_len_for_dtype,
+    predicted_output_bytes, publish_qwen4, quantized_data_len_for_dtype, qwen4_quantized_dtype,
     read_i64_array, shape_u32, source_paths, stream_entry, sync_file, temporary_output_path,
-    validate_row_chunk, EntryKind, I64Role, PlannedEntry, PleMetadata, Qwen4Error,
-    Qwen4ReopenPlan, Qwen4Summary, ScratchTracker, SourceTensor, TokenizerMetadata,
-    DEFAULT_ROW_CHUNK, MAX_CHUNK_BYTES, QWEN4_ARCH_ID, QWEN4_I64_QUANT_TYPE, QWEN4_PLE_VERSION,
+    validate_row_chunk, EntryKind, I64Role, PlannedEntry, PleMetadata, Qwen4Error, Qwen4ReopenPlan,
+    Qwen4Summary, ScratchTracker, SourceTensor, TokenizerMetadata, DEFAULT_ROW_CHUNK,
+    MAX_CHUNK_BYTES, QWEN4_ARCH_ID, QWEN4_I64_QUANT_TYPE, QWEN4_PLE_VERSION,
 };
 use crate::quant_fwht::gen_fwht_signs;
 
@@ -285,7 +285,10 @@ fn plan_dev_entries(
             .iter()
             .map(|&dimension| {
                 u64::try_from(dimension).map_err(|_| {
-                    Qwen4Error::Invalid(format!("manifest shape of {} does not fit u64", entry.name))
+                    Qwen4Error::Invalid(format!(
+                        "manifest shape of {} does not fit u64",
+                        entry.name
+                    ))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -361,9 +364,9 @@ fn plan_dev_entries(
         None
     } else {
         let mut take = |role: I64Role| {
-            ple_arrays.remove(&role).ok_or_else(|| {
-                Qwen4Error::Invalid(format!("PLE I64 record {role:?} is missing"))
-            })
+            ple_arrays
+                .remove(&role)
+                .ok_or_else(|| Qwen4Error::Invalid(format!("PLE I64 record {role:?} is missing")))
         };
         Some(PleMetadata {
             multipliers: take(I64Role::Multipliers)?,
@@ -372,9 +375,10 @@ fn plan_dev_entries(
         })
     };
     let padded_rows = ple_entries.iter().try_fold(0u64, |sum, entry| {
-        let rows = entry.source.shape.first().copied().ok_or_else(|| {
-            Qwen4Error::Invalid(format!("{} PLE shard has no rows", entry.name))
-        })?;
+        let rows =
+            entry.source.shape.first().copied().ok_or_else(|| {
+                Qwen4Error::Invalid(format!("{} PLE shard has no rows", entry.name))
+            })?;
         sum.checked_add(rows)
             .ok_or_else(|| Qwen4Error::Invalid("PLE physical row count overflows".to_string()))
     })?;
@@ -622,9 +626,9 @@ fn entry_row_chunk(entry: &PlannedEntry, row_chunk: usize) -> Result<usize, Qwen
     } else {
         checked_product(&shape[1..], &entry.name)?
     };
-    let row_bytes = width.checked_mul(element_bytes).ok_or_else(|| {
-        Qwen4Error::Invalid(format!("{} row bytes overflow", entry.name))
-    })?;
+    let row_bytes = width
+        .checked_mul(element_bytes)
+        .ok_or_else(|| Qwen4Error::Invalid(format!("{} row bytes overflow", entry.name)))?;
     let fit = (MAX_CHUNK_BYTES / row_bytes.max(1)).max(1);
     Ok(row_chunk.min(usize::try_from(fit).unwrap_or(usize::MAX)))
 }
@@ -708,17 +712,14 @@ pub(crate) fn write_dev_tiny_artifact(
 ) -> Result<DevTinyReceipt, Qwen4Error> {
     let row_chunk = DEFAULT_ROW_CHUNK;
     validate_row_chunk(row_chunk)?;
-    if input
-        .to_str()
-        .is_some_and(|raw| raw.starts_with("hf://"))
-    {
+    if input.to_str().is_some_and(|raw| raw.starts_with("hf://")) {
         return Err(Qwen4Error::Invalid(format!(
             "--qwen4-dev-tiny needs a local safetensors directory, not {}",
             input.display()
         )));
     }
-    let input_metadata = fs::metadata(input)
-        .map_err(|error| Qwen4Error::io(input.display().to_string(), error))?;
+    let input_metadata =
+        fs::metadata(input).map_err(|error| Qwen4Error::io(input.display().to_string(), error))?;
     if !input_metadata.is_dir() {
         return Err(Qwen4Error::Invalid(format!(
             "--qwen4-dev-tiny needs a local safetensors directory, got {}",

@@ -295,7 +295,10 @@ fn arm(arm: OracleArm, backend: Backend, identity: ArmIdentity, plan: u8) -> Arm
     }
 }
 
-fn pair_receipt(hpm: &CertifiedExecutableRecord, vpm: &CertifiedExecutableRecord) -> PairOracleReceipt {
+fn pair_receipt(
+    hpm: &CertifiedExecutableRecord,
+    vpm: &CertifiedExecutableRecord,
+) -> PairOracleReceipt {
     let surfaces = surfaces();
     let claim = |lhs, rhs| PairClaim {
         lhs,
@@ -540,7 +543,10 @@ fn plan() -> UnionPlanRecord {
             placement: Placement::DeviceLocal,
             execution_mode: ExecutionMode::Eager,
         },
-        islands: vec![island(1, IslandBackend::Hip), island(2, IslandBackend::Vulkan)],
+        islands: vec![
+            island(1, IslandBackend::Hip),
+            island(2, IslandBackend::Vulkan),
+        ],
         edges: vec![IslandEdge {
             from: 1,
             to: 2,
@@ -572,7 +578,10 @@ fn certified_records_round_trip_for_every_envelope_kind() {
         let json = record.to_json().unwrap();
         let parsed = CertifiedExecutableRecord::from_json(&json).unwrap();
         assert_eq!(parsed, record);
-        assert_eq!(parsed.record_digest().unwrap(), record.record_digest().unwrap());
+        assert_eq!(
+            parsed.record_digest().unwrap(),
+            record.record_digest().unwrap()
+        );
     }
 }
 
@@ -618,16 +627,25 @@ fn every_other_record_round_trips() {
     off.edges.clear();
     off.boundaries.clear();
     off.resources.clear();
-    assert_eq!(UnionPlanRecord::from_json(&off.to_json().unwrap()).unwrap(), off);
+    assert_eq!(
+        UnionPlanRecord::from_json(&off.to_json().unwrap()).unwrap(),
+        off
+    );
 }
 
 #[test]
 fn record_digest_is_stable_and_domain_separated() {
     let record = hsa_adapted();
-    assert_eq!(record.record_digest().unwrap(), record.record_digest().unwrap());
+    assert_eq!(
+        record.record_digest().unwrap(),
+        record.record_digest().unwrap()
+    );
     let mut other = record.clone();
     other.raw.config_sha256 = h(99);
-    assert_ne!(other.record_digest().unwrap(), record.record_digest().unwrap());
+    assert_ne!(
+        other.record_digest().unwrap(),
+        record.record_digest().unwrap()
+    );
     // The private cache key is derived, never equal to its inputs.
     let envelope: PrivateEnvelopeDigest = h(34);
     let cert: StaticCertificateDigest = h(6);
@@ -689,7 +707,12 @@ fn unknown_fields_are_rejected_at_every_level() {
 #[test]
 fn other_schema_versions_are_rejected() {
     let json = radv_original().to_json().unwrap();
-    for version in [json!(0), json!(2), json!(UNION_SCHEMA_VERSION + 1), json!("1")] {
+    for version in [
+        json!(0),
+        json!(2),
+        json!(UNION_SCHEMA_VERSION + 1),
+        json!("1"),
+    ] {
         let mutated = mutate_json(&json, |value| value["schema_version"] = version.clone());
         assert!(
             matches!(
@@ -769,23 +792,35 @@ fn sidecar_config_and_entry_abi_are_distinct_bound_identities() {
     let digest = base.record_digest().unwrap();
     let mut changed = base.clone();
     changed.raw.sidecar_sha256 = h(98);
-    assert!(changed.validate().is_ok(), "sidecar is independent of the certificate");
+    assert!(
+        changed.validate().is_ok(),
+        "sidecar is independent of the certificate"
+    );
     assert_ne!(changed.record_digest().unwrap(), digest);
 
     let mut changed = base.clone();
     changed.raw.config_sha256 = h(98);
-    assert!(changed.validate().is_ok(), "config is independent of the sidecar");
+    assert!(
+        changed.validate().is_ok(),
+        "config is independent of the sidecar"
+    );
     assert_ne!(changed.record_digest().unwrap(), digest);
 
     // The entry ABI is bound to the certificate: changing it alone must reject.
     let mut changed = base.clone();
     changed.raw.entry_abi_sha256 = h(98);
-    assert!(matches!(changed.validate(), Err(UnionError::Mismatch { .. })));
+    assert!(matches!(
+        changed.validate(),
+        Err(UnionError::Mismatch { .. })
+    ));
 
     // And so is the certified code.
     let mut changed = base;
     changed.raw.code.sha256 = h(98);
-    assert!(matches!(changed.validate(), Err(UnionError::Mismatch { .. })));
+    assert!(matches!(
+        changed.validate(),
+        Err(UnionError::Mismatch { .. })
+    ));
 }
 
 #[test]
@@ -807,16 +842,29 @@ fn raw_bytes_are_verified_independently_of_stored_hashes() {
     let mut flipped = stream.clone();
     flipped[2100] ^= 1;
     assert!(artifact.verify_bytes(&flipped, &sidecar).is_err());
-    assert!(artifact.verify_bytes(&stream, b"{\"sidecar\":false}").is_err());
+    assert!(
+        artifact
+            .verify_bytes(&stream, b"{\"sidecar\":false}")
+            .is_err()
+    );
     assert!(artifact.verify_bytes(&stream[..4000], &sidecar).is_err());
 }
 
 #[test]
 fn raw_ranges_must_be_well_formed() {
     let mutations: Vec<(&str, Box<dyn Fn(&mut RawArtifact)>)> = vec![
-        ("zero code length", Box::new(|r: &mut RawArtifact| r.code.length = 0)),
-        ("code past stream", Box::new(|r: &mut RawArtifact| r.code.offset = 4000)),
-        ("code overflow", Box::new(|r: &mut RawArtifact| r.code.offset = u64::MAX)),
+        (
+            "zero code length",
+            Box::new(|r: &mut RawArtifact| r.code.length = 0),
+        ),
+        (
+            "code past stream",
+            Box::new(|r: &mut RawArtifact| r.code.offset = 4000),
+        ),
+        (
+            "code overflow",
+            Box::new(|r: &mut RawArtifact| r.code.offset = u64::MAX),
+        ),
         (
             "data past stream",
             Box::new(|r: &mut RawArtifact| r.data.as_mut().unwrap().offset = 4090),
@@ -825,9 +873,18 @@ fn raw_ranges_must_be_well_formed() {
             "data overlaps code",
             Box::new(|r: &mut RawArtifact| r.data.as_mut().unwrap().offset = 512),
         ),
-        ("entry outside code", Box::new(|r: &mut RawArtifact| r.entry_offset = 1024)),
-        ("empty entry name", Box::new(|r: &mut RawArtifact| r.entry_name = " ".to_owned())),
-        ("zero stream", Box::new(|r: &mut RawArtifact| r.total_length = 0)),
+        (
+            "entry outside code",
+            Box::new(|r: &mut RawArtifact| r.entry_offset = 1024),
+        ),
+        (
+            "empty entry name",
+            Box::new(|r: &mut RawArtifact| r.entry_name = " ".to_owned()),
+        ),
+        (
+            "zero stream",
+            Box::new(|r: &mut RawArtifact| r.total_length = 0),
+        ),
     ];
     for (name, mutate) in mutations {
         let mut record = hsa_adapted();
@@ -843,20 +900,35 @@ fn raw_ranges_must_be_well_formed() {
 #[test]
 fn producer_pins_are_complete_for_the_producer_kind() {
     let mutations: Vec<(&str, Box<dyn Fn(&mut CertifiedExecutableRecord)>)> = vec![
-        ("RADV without Mesa pin", Box::new(|r: &mut CertifiedExecutableRecord| r.producer.mesa = None)),
-        ("RADV without SPIR-V", Box::new(|r: &mut CertifiedExecutableRecord| r.producer.spirv_sha256 = None)),
-        ("RADV without driver", Box::new(|r: &mut CertifiedExecutableRecord| r.producer.driver = None)),
+        (
+            "RADV without Mesa pin",
+            Box::new(|r: &mut CertifiedExecutableRecord| r.producer.mesa = None),
+        ),
+        (
+            "RADV without SPIR-V",
+            Box::new(|r: &mut CertifiedExecutableRecord| r.producer.spirv_sha256 = None),
+        ),
+        (
+            "RADV without driver",
+            Box::new(|r: &mut CertifiedExecutableRecord| r.producer.driver = None),
+        ),
         (
             "patched without digest",
-            Box::new(|r: &mut CertifiedExecutableRecord| r.producer.mesa.as_mut().unwrap().patch_sha256 = None),
+            Box::new(|r: &mut CertifiedExecutableRecord| {
+                r.producer.mesa.as_mut().unwrap().patch_sha256 = None
+            }),
         ),
         (
             "unpatched with digest",
-            Box::new(|r: &mut CertifiedExecutableRecord| r.producer.mesa.as_mut().unwrap().patched = false),
+            Box::new(|r: &mut CertifiedExecutableRecord| {
+                r.producer.mesa.as_mut().unwrap().patched = false
+            }),
         ),
         (
             "empty compiler version",
-            Box::new(|r: &mut CertifiedExecutableRecord| r.producer.compiler.version = String::new()),
+            Box::new(|r: &mut CertifiedExecutableRecord| {
+                r.producer.compiler.version = String::new()
+            }),
         ),
     ];
     for (name, mutate) in mutations {
@@ -890,12 +962,21 @@ fn producer_pins_are_complete_for_the_producer_kind() {
 
 #[test]
 fn target_must_be_exact_and_match_the_device() {
-    for bad in ["gfx11", "gfx11-generic", "gfx1151:xnack+", "GFX1201", "", "navi48"] {
+    for bad in [
+        "gfx11",
+        "gfx11-generic",
+        "gfx1151:xnack+",
+        "GFX1201",
+        "",
+        "navi48",
+    ] {
         let mut record = radv_original();
         record.target.architecture = bad.to_owned();
         assert!(record.validate().is_err(), "`{bad}` accepted");
     }
-    for good in ["gfx1010", "gfx1100", "gfx1151", "gfx1201", "gfx90a", "gfx942"] {
+    for good in [
+        "gfx1010", "gfx1100", "gfx1151", "gfx1201", "gfx90a", "gfx942",
+    ] {
         let mut record = radv_original();
         record.target.architecture = good.to_owned();
         record.validate().unwrap();
@@ -976,7 +1057,10 @@ fn adapter_presence_follows_the_envelope_and_producer() {
     // Foreign (ACO) code in an HSA envelope needs an adapter.
     let mut record = hsa_adapted();
     record.adapter = None;
-    assert!(matches!(record.validate(), Err(UnionError::Incomplete { .. })));
+    assert!(matches!(
+        record.validate(),
+        Err(UnionError::Incomplete { .. })
+    ));
     // Original binaries are never rewritten.
     let mut original = radv_original();
     original.adapter = Some(adapter());
@@ -1050,9 +1134,7 @@ fn envelope_compatibility_rejects_wrong_kind_and_global_key() {
         .check_envelope_compat(&EnvelopeExpectation::Hsa)
         .unwrap();
     assert!(
-        hsa_adapted()
-            .check_envelope_compat(&ok)
-            .is_err(),
+        hsa_adapted().check_envelope_compat(&ok).is_err(),
         "HSA must not satisfy a RADV host"
     );
 
@@ -1124,7 +1206,10 @@ fn private_cache_key_must_derive_from_envelope_and_certificate() {
     if let EnvelopeRecord::RadvPrivatePm(private) = &mut record.envelope {
         private.cache_key_sha256 = h(99);
     }
-    assert!(matches!(record.validate(), Err(UnionError::Mismatch { .. })));
+    assert!(matches!(
+        record.validate(),
+        Err(UnionError::Mismatch { .. })
+    ));
 
     // Re-certifying with a different certificate invalidates the old key.
     let mut record = radv_private();
@@ -1176,11 +1261,19 @@ fn loaded_receipt_binds_to_exactly_the_certified_record() {
             "uploaded length",
             Box::new(|l: &mut LoadedExecutableReceipt| l.upload.uploaded_length += 4),
         ),
-        ("entry symbol", Box::new(|l: &mut LoadedExecutableReceipt| l.entry.name = "other".to_owned())),
-        ("entry offset", Box::new(|l: &mut LoadedExecutableReceipt| l.entry.offset = 4)),
+        (
+            "entry symbol",
+            Box::new(|l: &mut LoadedExecutableReceipt| l.entry.name = "other".to_owned()),
+        ),
+        (
+            "entry offset",
+            Box::new(|l: &mut LoadedExecutableReceipt| l.entry.offset = 4),
+        ),
         (
             "device arch",
-            Box::new(|l: &mut LoadedExecutableReceipt| l.target.architecture = "gfx1151".to_owned()),
+            Box::new(|l: &mut LoadedExecutableReceipt| {
+                l.target.architecture = "gfx1151".to_owned()
+            }),
         ),
         (
             "device wave",
@@ -1208,7 +1301,10 @@ fn loaded_receipt_binds_to_exactly_the_certified_record() {
             "relocated path without relocations",
             Box::new(|l: &mut LoadedExecutableReceipt| l.upload.path = UploadPath::RelocatedLoad),
         ),
-        ("empty upload", Box::new(|l: &mut LoadedExecutableReceipt| l.upload.uploaded_length = 0)),
+        (
+            "empty upload",
+            Box::new(|l: &mut LoadedExecutableReceipt| l.upload.uploaded_length = 0),
+        ),
     ];
     for (name, mutate) in mutations {
         let mut loaded = good.clone();
@@ -1294,7 +1390,10 @@ fn pair_receipt_binding_failures() {
 fn pair_receipt_structural_mutations_are_rejected() {
     let (_, _, receipt) = good_pair();
     let mutations: Vec<(&str, Box<dyn Fn(&mut PairOracleReceipt)>)> = vec![
-        ("fixture", Box::new(|r: &mut PairOracleReceipt| r.fixture_sha256 = h(99))),
+        (
+            "fixture",
+            Box::new(|r: &mut PairOracleReceipt| r.fixture_sha256 = h(99)),
+        ),
         (
             "arm pre-image",
             Box::new(|r: &mut PairOracleReceipt| r.arms.vpm.pre_image_sha256 = h(99)),
@@ -1343,9 +1442,12 @@ fn pair_receipt_structural_mutations_are_rejected() {
                 r.state_surface_sha256 = state_surface_digest(&r.surfaces).unwrap();
             }),
         ),
-        ("missing claim", Box::new(|r: &mut PairOracleReceipt| {
-            r.claims.pop();
-        })),
+        (
+            "missing claim",
+            Box::new(|r: &mut PairOracleReceipt| {
+                r.claims.pop();
+            }),
+        ),
         (
             "duplicate claim",
             Box::new(|r: &mut PairOracleReceipt| {
@@ -1385,9 +1487,14 @@ fn pair_receipt_structural_mutations_are_rejected() {
         ),
         (
             "negative control on unbound surface",
-            Box::new(|r: &mut PairOracleReceipt| r.negative_control.mutated_surface = "nowhere".to_owned()),
+            Box::new(|r: &mut PairOracleReceipt| {
+                r.negative_control.mutated_surface = "nowhere".to_owned()
+            }),
         ),
-        ("empty device", Box::new(|r: &mut PairOracleReceipt| r.device_uuid.clear())),
+        (
+            "empty device",
+            Box::new(|r: &mut PairOracleReceipt| r.device_uuid.clear()),
+        ),
         (
             "bad target",
             Box::new(|r: &mut PairOracleReceipt| r.target.architecture = "gfx11".to_owned()),
@@ -1408,7 +1515,10 @@ fn pair_receipt_requires_four_distinct_arms_in_json() {
         let mutated = mutate_json(&json, |value| {
             value["arms"].as_object_mut().unwrap().remove(arm);
         });
-        assert!(PairOracleReceipt::from_json(&mutated).is_err(), "missing {arm}");
+        assert!(
+            PairOracleReceipt::from_json(&mutated).is_err(),
+            "missing {arm}"
+        );
     }
     let mutated = mutate_json(&json, |value| {
         value["arms"]
@@ -1484,11 +1594,15 @@ fn vulkan_record_validates_and_rejects_mismatched_contracts() {
         ),
         (
             "extraction data overlaps code",
-            Box::new(|v: &mut VulkanExecutableRecord| v.extraction.data.as_mut().unwrap().offset = 600),
+            Box::new(|v: &mut VulkanExecutableRecord| {
+                v.extraction.data.as_mut().unwrap().offset = 600
+            }),
         ),
         (
             "extraction data digest",
-            Box::new(|v: &mut VulkanExecutableRecord| v.extraction.data.as_mut().unwrap().sha256 = h(99)),
+            Box::new(|v: &mut VulkanExecutableRecord| {
+                v.extraction.data.as_mut().unwrap().sha256 = h(99)
+            }),
         ),
         (
             "subgroup vs wave",
@@ -1551,7 +1665,9 @@ fn vulkan_record_validates_and_rejects_mismatched_contracts() {
         ),
         (
             "zero descriptor count",
-            Box::new(|v: &mut VulkanExecutableRecord| v.pipeline_layout.sets[0].bindings[0].count = 0),
+            Box::new(|v: &mut VulkanExecutableRecord| {
+                v.pipeline_layout.sets[0].bindings[0].count = 0
+            }),
         ),
         (
             "HSA envelope",
@@ -1591,31 +1707,45 @@ fn boundary_contracts_require_consistent_synchronization() {
     semaphore_boundary().validate().unwrap();
 
     let mutations: Vec<(&str, Box<dyn Fn(&mut BoundaryContractRecord)>)> = vec![
-        ("zero epoch", Box::new(|b: &mut BoundaryContractRecord| b.epoch = 0)),
+        (
+            "zero epoch",
+            Box::new(|b: &mut BoundaryContractRecord| b.epoch = 0),
+        ),
         (
             "same API both sides",
             Box::new(|b: &mut BoundaryContractRecord| b.consumer.api = Api::Hip),
         ),
-        ("no accesses", Box::new(|b: &mut BoundaryContractRecord| b.accesses.clear())),
+        (
+            "no accesses",
+            Box::new(|b: &mut BoundaryContractRecord| b.accesses.clear()),
+        ),
         (
             "empty range",
             Box::new(|b: &mut BoundaryContractRecord| b.accesses[0].range.length = 0),
         ),
         (
             "host fence missing",
-            Box::new(|b: &mut BoundaryContractRecord| b.visibility = vec![VisibilityOp::ProducerRelease]),
+            Box::new(|b: &mut BoundaryContractRecord| {
+                b.visibility = vec![VisibilityOp::ProducerRelease]
+            }),
         ),
         (
             "semaphore in host mode",
-            Box::new(|b: &mut BoundaryContractRecord| b.visibility.push(VisibilityOp::SemaphoreSignal)),
+            Box::new(|b: &mut BoundaryContractRecord| {
+                b.visibility.push(VisibilityOp::SemaphoreSignal)
+            }),
         ),
         (
             "duplicate op",
-            Box::new(|b: &mut BoundaryContractRecord| b.visibility.push(VisibilityOp::ProducerRelease)),
+            Box::new(|b: &mut BoundaryContractRecord| {
+                b.visibility.push(VisibilityOp::ProducerRelease)
+            }),
         ),
         (
             "host mode semaphore completion",
-            Box::new(|b: &mut BoundaryContractRecord| b.completion.kind = CompletionKind::BinarySemaphore),
+            Box::new(|b: &mut BoundaryContractRecord| {
+                b.completion.kind = CompletionKind::BinarySemaphore
+            }),
         ),
         (
             "completion epoch",
@@ -1675,7 +1805,10 @@ fn union_plan_validates_modes_edges_and_generations() {
             "off with islands",
             Box::new(|p: &mut UnionPlanRecord| p.mode = UnionMode::Off),
         ),
-        ("no islands", Box::new(|p: &mut UnionPlanRecord| p.islands.clear())),
+        (
+            "no islands",
+            Box::new(|p: &mut UnionPlanRecord| p.islands.clear()),
+        ),
         (
             "duplicate island",
             Box::new(|p: &mut UnionPlanRecord| p.islands[1].island_id = 1),
@@ -1698,7 +1831,13 @@ fn union_plan_validates_modes_edges_and_generations() {
         ),
         (
             "boundary direction",
-            Box::new(|p: &mut UnionPlanRecord| p.edges = vec![IslandEdge { from: 2, to: 1, boundary_id: Some(1) }]),
+            Box::new(|p: &mut UnionPlanRecord| {
+                p.edges = vec![IslandEdge {
+                    from: 2,
+                    to: 1,
+                    boundary_id: Some(1),
+                }]
+            }),
         ),
         (
             "unknown island",

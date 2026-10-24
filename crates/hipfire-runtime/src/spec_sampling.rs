@@ -290,6 +290,16 @@ impl SparseDist {
         self.entries.clear();
         self.entries.push((token, 1.0));
     }
+
+    /// A draft distribution given outright as `(token, probability)` pairs
+    /// (a selector's softmax over its candidates): stored as given, zero
+    /// entries dropped, no renormalization, so `prob` is the exact `q` the
+    /// draft was drawn from.
+    pub fn set_entries(&mut self, entries: impl IntoIterator<Item = (u32, f32)>) {
+        self.entries.clear();
+        self.entries
+            .extend(entries.into_iter().filter(|&(_, p)| p > 0.0));
+    }
 }
 
 /// Write the last `min(prompt.len() + emitted.len(), window)` tokens of
@@ -1162,9 +1172,7 @@ mod tests {
     // Penalty history, penalty-aware targets and lossless penalized windows
     // ------------------------------------------------------------------
 
-    use crate::sampler::{
-        apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, sample_cpu,
-    };
+    use crate::sampler::{apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, sample_cpu};
     use std::collections::HashMap;
 
     fn splitmix64(x: u64) -> u64 {
@@ -1434,10 +1442,7 @@ mod tests {
         assert!(s.blocked_tokens.is_empty());
         assert_eq!(cfg.penalty_window(), 64);
         // A positive min_p passes through; the defaults stay neutral.
-        let s = naive_target_sampler(&SpecRequestConfig {
-            min_p: 0.05,
-            ..cfg
-        });
+        let s = naive_target_sampler(&SpecRequestConfig { min_p: 0.05, ..cfg });
         assert_eq!(s.min_p, Some(0.05));
         let neutral = naive_target_sampler(&SpecRequestConfig::default());
         assert_eq!(neutral.repeat_penalty, 1.0);
@@ -1800,7 +1805,10 @@ mod tests {
                 "{name}: rejection never reached depths 0..{depths}: {cov:?}"
             );
             assert!(cov.all_accept > 0, "{name}: no all-accept bonus: {cov:?}");
-            assert!(cov.eos_accepted > 0, "{name}: no accepted EOS draft: {cov:?}");
+            assert!(
+                cov.eos_accepted > 0,
+                "{name}: no accepted EOS draft: {cov:?}"
+            );
             assert!(cov.k0 > 0, "{name}: no k = 0 window: {cov:?}");
             assert!(
                 cov.residual_outside_q > 0,
@@ -1983,11 +1991,7 @@ mod tests {
 
         // Gather the raw top-20, then penalize only the gathered candidates.
         let mut ranked: Vec<u32> = (0..vocab as u32).collect();
-        ranked.sort_by(|&a, &b| {
-            raw[b as usize]
-                .total_cmp(&raw[a as usize])
-                .then(a.cmp(&b))
-        });
+        ranked.sort_by(|&a, &b| raw[b as usize].total_cmp(&raw[a as usize]).then(a.cmp(&b)));
         let ids = &ranked[..20];
         assert!(ids.iter().all(|&t| t < 20), "raw top-20 is ids 0..20");
         let mut values: Vec<f32> = ids.iter().map(|&t| raw[t as usize]).collect();

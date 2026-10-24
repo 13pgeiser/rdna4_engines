@@ -69,11 +69,7 @@ impl<'a> Ctx<'a> {
             blocks.push((BlockId(0), (0, body.layout.len()), Vec::new()));
         } else {
             for block in &body.blocks {
-                blocks.push((
-                    block.id,
-                    block.range,
-                    block.succs.iter().copied().collect(),
-                ));
+                blocks.push((block.id, block.range, block.succs.iter().copied().collect()));
             }
         }
         let mut range_of = HashMap::new();
@@ -82,7 +78,12 @@ impl<'a> Ctx<'a> {
             range_of.insert(*id, *range);
             succ_of.insert(*id, succs.clone());
         }
-        Self { body, blocks, range_of, succ_of }
+        Self {
+            body,
+            blocks,
+            range_of,
+            succ_of,
+        }
     }
 
     fn barrier_at(&self, pos: usize) -> Option<(InstId, bool)> {
@@ -214,14 +215,21 @@ fn backward_inner(
 }
 
 fn ds_stores_pending(replay: &WaitReplay, id: InstId, arch: Arch) -> bool {
-    let counter = if arch == Arch::Gfx1201 { Counter::Ds } else { Counter::Lgkm };
+    let counter = if arch == Arch::Gfx1201 {
+        Counter::Ds
+    } else {
+        Counter::Lgkm
+    };
     replay.before.get(&id).is_some_and(|state| {
         state.pending.iter().any(|event| {
-            event.counters.contains(counter) && !event.satisfied.contains(counter)
+            event.counters.contains(counter)
+                && !event.satisfied.contains(counter)
                 && match arch {
-                    Arch::Gfx1100 | Arch::Gfx1151 =>
-                        matches!(event.class, crate::effects::MemClass::DsStore
-                            | crate::effects::MemClass::DsAtomic { .. }),
+                    Arch::Gfx1100 | Arch::Gfx1151 => matches!(
+                        event.class,
+                        crate::effects::MemClass::DsStore
+                            | crate::effects::MemClass::DsAtomic { .. }
+                    ),
                     _ => !event.src_locks.0.is_empty(),
                 }
         })
@@ -229,7 +237,11 @@ fn ds_stores_pending(replay: &WaitReplay, id: InstId, arch: Arch) -> bool {
 }
 
 fn drain_obligation(id: InstId, what: &str, arch: Arch) -> Obligation {
-    let counter = if arch == Arch::Gfx1201 { "DScnt" } else { "LGKMcnt" };
+    let counter = if arch == Arch::Gfx1201 {
+        "DScnt"
+    } else {
+        "LGKMcnt"
+    };
     Obligation {
         kind: ObligationKind::Hazard,
         insts: vec![id],
@@ -280,7 +292,9 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError>
                         }),
                     }
                     if ds_stores_pending(&replay, id, arch) {
-                        analysis.obligations.push(drain_obligation(id, "s_barrier_signal", arch));
+                        analysis
+                            .obligations
+                            .push(drain_obligation(id, "s_barrier_signal", arch));
                     }
                     let _ = index;
                 }
@@ -298,16 +312,23 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError>
                         });
                     }
                     if ds_stores_pending(&replay, id, arch) {
-                        analysis.obligations.push(drain_obligation(id, "s_barrier_wait", arch));
+                        analysis
+                            .obligations
+                            .push(drain_obligation(id, "s_barrier_wait", arch));
                     }
                 }
                 Control::Barrier(crate::cfg::BarrierKind::Full) => {
                     // gfx11 s_barrier synchronizes arrival and release in
                     // one instruction; it is not a gfx12 split-barrier
                     // signal with an independently reachable wait.
-                    analysis.pairs.push(BarrierPair { signal: id, waits: vec![id] });
+                    analysis.pairs.push(BarrierPair {
+                        signal: id,
+                        waits: vec![id],
+                    });
                     if ds_stores_pending(&replay, id, arch) {
-                        analysis.obligations.push(drain_obligation(id, "s_barrier", arch));
+                        analysis
+                            .obligations
+                            .push(drain_obligation(id, "s_barrier", arch));
                     }
                 }
                 Control::Barrier(_) => {}
@@ -351,7 +372,11 @@ mod kt48_tests {
     fn kt48_barriers_pair_cleanly() {
         let body = kt48_body();
         let analysis = super::analyze(&body, Arch::Gfx1201).unwrap();
-        assert!(analysis.obligations.is_empty(), "{:?}", analysis.obligations);
+        assert!(
+            analysis.obligations.is_empty(),
+            "{:?}",
+            analysis.obligations
+        );
         assert!(!analysis.pairs.is_empty(), "KT48 uses split barriers");
         for pair in &analysis.pairs {
             assert_eq!(pair.waits.len(), 1);
@@ -361,12 +386,12 @@ mod kt48_tests {
 
 #[cfg(test)]
 mod gfx11_tests {
-    use smallvec::SmallVec;
     use crate::cfg::Body;
     use crate::inst::{Arch, FormFields, Inst};
     use crate::operand::{ImmField, Modifiers, Operand};
     use crate::provenance::Provenance;
     use crate::reg::{Kind, RegRef};
+    use smallvec::SmallVec;
 
     fn body_of(insts: Vec<Inst>) -> Body {
         let mut body = Body::default();
@@ -380,13 +405,28 @@ mod gfx11_tests {
     #[test]
     fn gfx11_full_barrier_pairs_itself_but_requires_prior_lgkm_drain() {
         for arch in [Arch::Gfx1100, Arch::Gfx1151] {
-            let row = crate::isa::table(arch).iter().find(|row| row.name == "ds_store_b32").unwrap();
-            let v = |base| Operand::Reg(RegRef { kind: Kind::V, base, len: 1 });
+            let row = crate::isa::table(arch)
+                .iter()
+                .find(|row| row.name == "ds_store_b32")
+                .unwrap();
+            let v = |base| {
+                Operand::Reg(RegRef {
+                    kind: Kind::V,
+                    base,
+                    len: 1,
+                })
+            };
             let store = Inst::from_parts(
-                arch, row.op, row.form, FormFields::None,
+                arch,
+                row.op,
+                row.form,
+                FormFields::None,
                 SmallVec::from_vec(vec![v(1), v(2), Operand::Imm(ImmField::DsOffset(0))]),
-                Modifiers::default(), None, Provenance::default(),
-            ).unwrap();
+                Modifiers::default(),
+                None,
+                Provenance::default(),
+            )
+            .unwrap();
             let barrier = crate::codec::gfx11::decode(arch, &[0xbfbd_0000]).unwrap().0;
             let wait = crate::codec::gfx11::decode(arch, &[0xbf89_0000]).unwrap().0;
             let pending = body_of(vec![store.clone(), barrier.clone()]);
@@ -400,7 +440,10 @@ mod gfx11_tests {
             let drained = body_of(vec![store, wait, barrier]);
             let drained_facts = super::analyze(&drained, arch).unwrap();
             assert_eq!(drained_facts.pairs.len(), 1);
-            assert!(drained_facts.obligations.is_empty(), "{arch:?}: {drained_facts:?}");
+            assert!(
+                drained_facts.obligations.is_empty(),
+                "{arch:?}: {drained_facts:?}"
+            );
         }
     }
 }

@@ -104,7 +104,8 @@ fn bits(v: &[f32]) -> Vec<u32> {
 }
 
 fn poisoned(gpu: &mut Gpu, n: usize) -> GpuTensor {
-    gpu.upload_f32(&vec![f32::from_bits(POISON); n], &[n]).expect("poison upload")
+    gpu.upload_f32(&vec![f32::from_bits(POISON); n], &[n])
+        .expect("poison upload")
 }
 
 /// First differing index and the mismatch count between two bit vectors.
@@ -138,7 +139,10 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
     let mut cursor = 0usize;
     for &r in c.rows {
         cursor += c.gap;
-        lanes.push(DraftConvLane { row0: cursor, rows: r });
+        lanes.push(DraftConvLane {
+            row0: cursor,
+            rows: r,
+        });
         cursor += r;
     }
     let end = cursor;
@@ -176,13 +180,19 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
         in_h.iter_mut().for_each(|v| *v = 0.0);
         for ln in &lanes {
             let last = ln.row0 + ln.rows - 1;
-            in_h[last * hidden..(last + 1) * hidden].iter_mut().for_each(|v| *v = 1.0);
+            in_h[last * hidden..(last + 1) * hidden]
+                .iter_mut()
+                .for_each(|v| *v = 1.0);
         }
     }
 
-    let input = gpu.upload_f32(&in_h, &[total_rows * hidden]).expect("input");
+    let input = gpu
+        .upload_f32(&in_h, &[total_rows * hidden])
+        .expect("input");
     let base = gpu.upload_f32(&base_h, &[2 * k * hidden]).expect("base");
-    let dynamic = gpu.upload_f32(&dyn_h, &[total_rows * stride]).expect("dynamic");
+    let dynamic = gpu
+        .upload_f32(&dyn_h, &[total_rows * stride])
+        .expect("dynamic");
     let out_ref = poisoned(gpu, total_rows * hidden);
     let out_lanes = poisoned(gpu, total_rows * hidden);
     let out_again = poisoned(gpu, total_rows * hidden);
@@ -200,14 +210,20 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
         let inp = input.sub_offset(ln.row0 * hidden, ln.rows * hidden);
         let out = out_ref.sub_offset(ln.row0 * hidden, ln.rows * hidden);
         let dy = dynamic.sub_offset(ln.row0 * stride, ln.rows * stride);
-        gpu.dynamic_causal_conv_f32(&inp, &base_view, &dy, &out, ln.rows, hidden, k, gs, stride, offset)
-            .expect("per-lane conv");
+        gpu.dynamic_causal_conv_f32(
+            &inp, &base_view, &dy, &out, ln.rows, hidden, k, gs, stride, offset,
+        )
+        .expect("per-lane conv");
     }
     // Arm B: one lane launch (twice, into separate poisoned outputs).
-    gpu.dynamic_causal_conv_f32_lanes(&input, &base_view, &dynamic, &out_lanes, &lanes, hidden, k, gs, stride, offset)
-        .expect("lane conv");
-    gpu.dynamic_causal_conv_f32_lanes(&input, &base_view, &dynamic, &out_again, &lanes, hidden, k, gs, stride, offset)
-        .expect("lane conv repeat");
+    gpu.dynamic_causal_conv_f32_lanes(
+        &input, &base_view, &dynamic, &out_lanes, &lanes, hidden, k, gs, stride, offset,
+    )
+    .expect("lane conv");
+    gpu.dynamic_causal_conv_f32_lanes(
+        &input, &base_view, &dynamic, &out_again, &lanes, hidden, k, gs, stride, offset,
+    )
+    .expect("lane conv repeat");
 
     let ref_bits = bits(&gpu.download_f32(&out_ref).expect("dl ref"));
     let lane_bits = bits(&gpu.download_f32(&out_lanes).expect("dl lanes"));
@@ -232,10 +248,16 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
     // reference that also corrupted a guard cannot hide it).
     let mut owned = vec![false; total_rows];
     for ln in &lanes {
-        owned[ln.row0..ln.row0 + ln.rows].iter_mut().for_each(|o| *o = true);
+        owned[ln.row0..ln.row0 + ln.rows]
+            .iter_mut()
+            .for_each(|o| *o = true);
     }
     for (r, &o) in owned.iter().enumerate() {
-        if !o && lane_bits[r * hidden..(r + 1) * hidden].iter().any(|&b| b != POISON) {
+        if !o
+            && lane_bits[r * hidden..(r + 1) * hidden]
+                .iter()
+                .any(|&b| b != POISON)
+        {
             fail(format!("unowned guard row {r} was written"));
             break;
         }
@@ -243,8 +265,14 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
     // Owned rows must have been written (a sentinel NaN payload never results
     // from a finite computation).
     for ln in &lanes {
-        if lane_bits[ln.row0 * hidden..(ln.row0 + ln.rows) * hidden].iter().any(|&b| b == POISON) {
-            fail(format!("owned rows of lane at row0 {} were not written", ln.row0));
+        if lane_bits[ln.row0 * hidden..(ln.row0 + ln.rows) * hidden]
+            .iter()
+            .any(|&b| b == POISON)
+        {
+            fail(format!(
+                "owned rows of lane at row0 {} were not written",
+                ln.row0
+            ));
             break;
         }
     }
@@ -254,8 +282,10 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
     // boundary leak the lane-local guard prevents).
     if c.gap == 0 && k >= 2 && lanes.len() >= 2 {
         let out_g = poisoned(gpu, total_rows * hidden);
-        gpu.dynamic_causal_conv_f32(&input, &base_view, &dynamic, &out_g, end, hidden, k, gs, stride, offset)
-            .expect("global conv");
+        gpu.dynamic_causal_conv_f32(
+            &input, &base_view, &dynamic, &out_g, end, hidden, k, gs, stride, offset,
+        )
+        .expect("global conv");
         let g_bits = bits(&gpu.download_f32(&out_g).expect("dl global"));
         let (gn, _) = diff(&ref_bits[..end * hidden], &g_bits[..end * hidden]);
         if gn == 0 {
@@ -271,7 +301,12 @@ fn run_case(gpu: &mut Gpu, rng: &mut Rng, c: &Case) -> Result<(), String> {
 }
 
 /// API validation: the call must be refused.
-fn expect_refused(name: &str, r: Result<(), hip_bridge::HipError>, failures: &mut usize, cases: &mut usize) {
+fn expect_refused(
+    name: &str,
+    r: Result<(), hip_bridge::HipError>,
+    failures: &mut usize,
+    cases: &mut usize,
+) {
     *cases += 1;
     match r {
         Err(e) => println!("PASS validation {name}: refused ({e})"),
@@ -291,72 +326,118 @@ fn validation(gpu: &mut Gpu, failures: &mut usize, cases: &mut usize) {
     let output = poisoned(gpu, rows * hidden);
     let base = poisoned(gpu, k * hidden);
     let dynamic = poisoned(gpu, rows * stride);
-    let ok = [DraftConvLane { row0: 0, rows: 4 }, DraftConvLane { row0: 4, rows: 4 }];
+    let ok = [
+        DraftConvLane { row0: 0, rows: 4 },
+        DraftConvLane { row0: 4, rows: 4 },
+    ];
 
     // Sanity: the same operands are accepted.
     *cases += 1;
-    match gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &ok, hidden, k, gs, stride, 0) {
+    match gpu.dynamic_causal_conv_f32_lanes(
+        &input, &base, &dynamic, &output, &ok, hidden, k, gs, stride, 0,
+    ) {
         Ok(()) => println!("PASS validation baseline: valid call accepted"),
         Err(e) => {
             *failures += 1;
             println!("FAIL validation baseline: valid call refused ({e})");
         }
     }
-    let overlap = [DraftConvLane { row0: 0, rows: 4 }, DraftConvLane { row0: 3, rows: 4 }];
+    let overlap = [
+        DraftConvLane { row0: 0, rows: 4 },
+        DraftConvLane { row0: 3, rows: 4 },
+    ];
     expect_refused(
         "overlapping lanes",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &overlap, hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &output, &overlap, hidden, k, gs, stride, 0,
+        ),
         failures,
         cases,
     );
     let zero = [DraftConvLane { row0: 0, rows: 0 }];
     expect_refused(
         "zero-row lane",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &zero, hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &output, &zero, hidden, k, gs, stride, 0,
+        ),
         failures,
         cases,
     );
     expect_refused(
         "no lanes",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &[], hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input,
+            &base,
+            &dynamic,
+            &output,
+            &[],
+            hidden,
+            k,
+            gs,
+            stride,
+            0,
+        ),
         failures,
         cases,
     );
-    let many: Vec<DraftConvLane> = (0..DRAFT_CONV_LANES_MAX + 1).map(|i| DraftConvLane { row0: i, rows: 1 }).collect();
+    let many: Vec<DraftConvLane> = (0..DRAFT_CONV_LANES_MAX + 1)
+        .map(|i| DraftConvLane { row0: i, rows: 1 })
+        .collect();
     expect_refused(
         "too many lanes",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &many, hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &output, &many, hidden, k, gs, stride, 0,
+        ),
         failures,
         cases,
     );
     let beyond = [DraftConvLane { row0: 12, rows: 8 }];
     expect_refused(
         "lane beyond buffers",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &beyond, hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &output, &beyond, hidden, k, gs, stride, 0,
+        ),
         failures,
         cases,
     );
     expect_refused(
         "output aliases input",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &input, &ok, hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &input, &ok, hidden, k, gs, stride, 0,
+        ),
         failures,
         cases,
     );
     expect_refused(
         "window overruns stride",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &ok, hidden, k, gs, stride, 1),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &output, &ok, hidden, k, gs, stride, 1,
+        ),
         failures,
         cases,
     );
     expect_refused(
         "hidden not divisible by group_size",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base, &dynamic, &output, &ok, hidden, k, 5, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input, &base, &dynamic, &output, &ok, hidden, k, 5, stride, 0,
+        ),
         failures,
         cases,
     );
     expect_refused(
         "short base",
-        gpu.dynamic_causal_conv_f32_lanes(&input, &base.sub_offset(0, hidden), &dynamic, &output, &ok, hidden, k, gs, stride, 0),
+        gpu.dynamic_causal_conv_f32_lanes(
+            &input,
+            &base.sub_offset(0, hidden),
+            &dynamic,
+            &output,
+            &ok,
+            hidden,
+            k,
+            gs,
+            stride,
+            0,
+        ),
         failures,
         cases,
     );
@@ -367,7 +448,11 @@ fn validation(gpu: &mut Gpu, failures: &mut usize, cases: &mut usize) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
-    println!("arch={} draft_lane_conv_admitted={}", gpu.arch, gpu.draft_lane_conv_admitted());
+    println!(
+        "arch={} draft_lane_conv_admitted={}",
+        gpu.arch,
+        gpu.draft_lane_conv_admitted()
+    );
     if gpu.arch != "gfx1201" {
         eprintln!("draft_lane_conv_oracle: note: product admission is gfx1201-only; running the kernel on {}", gpu.arch);
     }
@@ -413,7 +498,21 @@ fn main() {
             for rows in &row_lists {
                 for &gap in &[0usize, 2] {
                     for &phase in &[Phase::Zero, Phase::One, Phase::Compact] {
-                        run(&mut gpu, &mut rng, Case { hidden, gs, k, rows, gap, phase, impulse: false }, &mut failures, &mut cases);
+                        run(
+                            &mut gpu,
+                            &mut rng,
+                            Case {
+                                hidden,
+                                gs,
+                                k,
+                                rows,
+                                gap,
+                                phase,
+                                impulse: false,
+                            },
+                            &mut failures,
+                            &mut cases,
+                        );
                     }
                 }
             }
@@ -424,7 +523,21 @@ fn main() {
         for &k in &[2usize, 3, 5] {
             for rows in [vec![4usize, 8], vec![1, 3, 4, 8, 9, 16], vec![8; 8]] {
                 for &phase in &[Phase::Zero, Phase::One] {
-                    run(&mut gpu, &mut rng, Case { hidden, gs, k, rows: &rows, gap: 0, phase, impulse: true }, &mut failures, &mut cases);
+                    run(
+                        &mut gpu,
+                        &mut rng,
+                        Case {
+                            hidden,
+                            gs,
+                            k,
+                            rows: &rows,
+                            gap: 0,
+                            phase,
+                            impulse: true,
+                        },
+                        &mut failures,
+                        &mut cases,
+                    );
                 }
             }
         }
@@ -432,7 +545,21 @@ fn main() {
     // The draft's real dimensions (h=5120, group 16, k=2), C8 shape and unequal lanes.
     for rows in [vec![8usize; 8], vec![1, 3, 4, 8, 9, 16]] {
         for &phase in &[Phase::Zero, Phase::One] {
-            run(&mut gpu, &mut rng, Case { hidden: 5120, gs: 16, k: 2, rows: &rows, gap: 0, phase, impulse: false }, &mut failures, &mut cases);
+            run(
+                &mut gpu,
+                &mut rng,
+                Case {
+                    hidden: 5120,
+                    gs: 16,
+                    k: 2,
+                    rows: &rows,
+                    gap: 0,
+                    phase,
+                    impulse: false,
+                },
+                &mut failures,
+                &mut cases,
+            );
         }
     }
 

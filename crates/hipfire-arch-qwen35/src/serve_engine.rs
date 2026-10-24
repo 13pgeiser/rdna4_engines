@@ -99,8 +99,10 @@ pub struct EngineConfig {
     /// MTP speculative decode depth (K candidates per cycle). 0 = MTP off.
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
-    /// cannot distinguish `auto` from an explicit `on`, so the slots arming
-    /// site reads this (not `mtp_k`) for the host-spill decline.
+    /// cannot distinguish `auto` from an explicit `on`, so `SlotEngine::spawn`
+    /// reads this (not `mtp_k`) for the producer-capability gate (`auto`
+    /// arms only with a declared measured AR floor, which qwen35 lacks) and
+    /// the arming site for the host-spill decline.
     pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (`--kv-mode`). Empty = fall
     /// back to `HIPFIRE_KV_MODE` / config, resolved through the slots site
@@ -234,7 +236,22 @@ impl SlotEngine {
 
     /// Build the rig on a new thread and start serving. Returns once the model
     /// is loaded, so a caller that gets `Ok` can submit immediately.
-    pub fn spawn(cfg: EngineConfig) -> Result<SlotEngine, String> {
+    ///
+    /// The producer-capability gate runs here, before any placement or head
+    /// resolution reads `mtp_k`: qwen35 declares no measured AR floor
+    /// ([`crate::MTP_MEASURED_AR_FLOOR`]), so an `auto` mode serves plain AR
+    /// (no head is resolved or reserved for) and only an explicit `on` keeps
+    /// its depth. The daemon's slots route and any direct caller get the same
+    /// verdict as the sequential loader.
+    pub fn spawn(mut cfg: EngineConfig) -> Result<SlotEngine, String> {
+        let admitted_k = slot_mtp_k(cfg.mtp_mode, cfg.mtp_k, crate::MTP_MEASURED_AR_FLOOR);
+        if cfg.mtp_k > 0 && admitted_k == 0 && cfg.mtp_mode == hipfire_config::MtpMode::Auto {
+            eprintln!(
+                "{}",
+                hipfire_config::mtp_no_floor_decline_line("qwen35 slots")
+            );
+        }
+        cfg.mtp_k = admitted_k;
         let (tx, rx) = channel::<EngineCommand>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let stats = Arc::new(Mutex::new(EngineStats::default()));
@@ -968,9 +985,7 @@ impl Rig {
         // Descriptor-kernel evidence: `test_bf16_slots_parity` check 4 on
         // gfx1201 covers zero/nonzero bases, two-slot reads, and writes.
         // This does not establish full-serve parity.
-        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8)
-            && !gpu.arch_caps.is_gfx1201()
-        {
+        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8) && !gpu.arch_caps.is_gfx1201() {
             return Err(format!(
                 "experimental multi-slot kv_mode \"fp8\" needs gfx1201 (have {}); \
                  use q8 or auto",
@@ -3254,6 +3269,7 @@ fn commit_sampled_token(
     rig: &mut Rig,
     slots: &mut [Option<InFlight>],
     work: &mut [PendingWork],
+    stats: &Mutex<EngineStats>,
     s: usize,
     tok: u32,
 ) {
@@ -3308,6 +3324,7 @@ fn commit_sampled_token(
         // the generated JSON is incomplete/invalid — emit a typed rejection
         // instead of a successful done (spec §7.1 G1, A17). ClientGone is
         // never overridden: the receiver is already dropped.
+        lock_stats(stats).note_slot_released();
         if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
             let _ = send_event(
                 &f.reply,
@@ -3805,7 +3822,7 @@ fn run_loop(
                 stats
                     .lock()
                     .expect("stats")
-                    .note_pool_free_pages(pp.free_pages());
+                    .note_pool_pages(pp.free_pages(), pp.n_pages());
             }
             // Expire timed-out waiters → typed queue timeout rejection. The
             // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
@@ -3899,6 +3916,10 @@ fn run_loop(
                 }
                 continue;
             }
+            // Slot occupancy for this step, after admission. Each terminal
+            // below releases its slot in the stats BEFORE posting its event,
+            // so the snapshot a `done` reads counts only slots still busy.
+            lock_stats(&stats).note_slots(slots.iter().flatten().count(), n);
 
             let image_pad_id = rig.tokenizer.special_token_id("<|image_pad|>");
             for s in 0..n {
@@ -3925,7 +3946,9 @@ fn run_loop(
                     pad,
                     grammar,
                 ) {
-                    Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
+                    Ok(tok) => {
+                        commit_sampled_token(&mut rig, &mut slots, &mut work, &stats, s, tok)
+                    }
                     Err(reason) => {
                         if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
@@ -5172,7 +5195,9 @@ fn run_loop(
                     match accept_outcome {
                         Ok(tokens) => {
                             for tok in &tokens {
-                                commit_sampled_token(&mut rig, &mut slots, &mut work, s, *tok);
+                                commit_sampled_token(
+                                    &mut rig, &mut slots, &mut work, &stats, s, *tok,
+                                );
                                 if slots[s].is_none() {
                                     break;
                                 }
@@ -5288,7 +5313,9 @@ fn run_loop(
                                 if crate::mtp_spec::mtp_trace_enabled() {
                                     eprintln!("[mtp-trace] prefill done seed={seed}");
                                 }
-                                commit_sampled_token(&mut rig, &mut slots, &mut work, s, seed);
+                                commit_sampled_token(
+                                    &mut rig, &mut slots, &mut work, &stats, s, seed,
+                                );
                             }
                         }
                         Err(reason) => {
@@ -5332,7 +5359,7 @@ fn run_loop(
                 if let Some(forced) = jump_forced[s].take() {
                     if !forced.token_ids.is_empty() {
                         for &tok in &forced.token_ids {
-                            commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok);
+                            commit_sampled_token(&mut rig, &mut slots, &mut work, &stats, s, tok);
                             if slots[s].is_none() {
                                 break;
                             }
@@ -5403,6 +5430,7 @@ fn run_loop(
                     // a typed rejection instead of a successful done (spec §7.1
                     // G1, A17). ClientGone is never overridden: the receiver is
                     // already dropped.
+                    lock_stats(&stats).note_slot_released();
                     if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                         let _ = send_event(
                             &f.reply,
@@ -7708,22 +7736,24 @@ mod spill_agreement_tests {
     /// The sequential twin's fact construction for these inputs (tp 1 by
     /// construction, EP never, pp/paged/REAP from the load, VL from the
     /// probe): one predicate call, mirroring `carrier::spill_facts`.
-    fn sequential_verdict(pp: usize, paged_experts: bool, reap_keep: bool, is_vl: bool) -> SpillSupport {
+    fn sequential_verdict(
+        pp: usize,
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+    ) -> SpillSupport {
         spill_support(6, 1, pp, None, paged_experts, reap_keep, is_vl)
     }
 
     /// The slots twin's fact construction: single-GPU by the capability gate,
     /// EP never, tower from `is_vl || vl_path`.
-    fn slots_verdict(paged_experts: bool, reap_keep: bool, is_vl: bool, vl_path: bool) -> SpillSupport {
-        spill_support(
-            6,
-            1,
-            1,
-            None,
-            paged_experts,
-            reap_keep,
-            is_vl || vl_path,
-        )
+    fn slots_verdict(
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+        vl_path: bool,
+    ) -> SpillSupport {
+        spill_support(6, 1, 1, None, paged_experts, reap_keep, is_vl || vl_path)
     }
 
     #[test]
@@ -7733,7 +7763,10 @@ mod spill_agreement_tests {
             sequential_verdict(1, false, false, false),
             SpillSupport::Supported
         );
-        assert_eq!(slots_verdict(false, false, false, false), SpillSupport::Supported);
+        assert_eq!(
+            slots_verdict(false, false, false, false),
+            SpillSupport::Supported
+        );
         // VL refuses on both routes now (the added term): inline tower on the
         // sequential twin, flag or sidecar path on the slots twin.
         assert_eq!(
@@ -7797,37 +7830,89 @@ mod spill_agreement_tests {
     }
 }
 
+/// The slots MTP depth after the producer-capability gate
+/// (`hipfire_config::mtp_mode_admits`): `mtp_k` when the mode admits the head
+/// for a producer with/without a declared measured AR floor, else `0` (plain
+/// AR, no head resolved or reserved for). `Off` is `0` regardless of `mtp_k`.
+fn slot_mtp_k(mode: hipfire_config::MtpMode, mtp_k: usize, measured_ar_floor: bool) -> usize {
+    if hipfire_config::mtp_mode_admits(mode, measured_ar_floor) {
+        mtp_k
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod mtp_spill_decline_tests {
+    use super::slot_mtp_k;
     use hipfire_config::{mtp_host_spill_policy, MtpMode};
 
     /// There is no GPU-free seam for `Rig::build` itself (it opens the HFQ,
     /// inits the GPU and loads weights before reaching the arming site), so
-    /// this pins the exact verdict the arming site computes from the built
-    /// weights: a host-mapped spill under `auto` declines (no head), while
-    /// `on` still arms. The parent's live bench covers the end-to-end load.
-    fn slots_arming_verdict(mode: MtpMode, host_mapped_expert_blobs: usize, arch: &str) -> bool {
-        // Mirrors the `Rig::build` arming site: `mtp_k > 0 && policy.attach`
-        // with qwen35's empty admitted list.
-        let mtp_k = 4;
+    /// this pins the exact verdict the arming sites compute: `spawn`'s
+    /// producer-capability gate (`slot_mtp_k`) and then, from the built
+    /// weights, `mtp_k > 0 && policy.attach`. A host-mapped spill under `auto`
+    /// declines (no head, AR), while `on` still arms. The parent's live bench
+    /// covers the end-to-end load.
+    fn slots_arming_verdict(
+        mode: MtpMode,
+        host_mapped_expert_blobs: usize,
+        arch: &str,
+        measured_ar_floor: bool,
+    ) -> bool {
+        // qwen35's admitted spill list is empty.
+        let mtp_k = slot_mtp_k(mode, 4, measured_ar_floor);
         mtp_k > 0 && mtp_host_spill_policy(mode, host_mapped_expert_blobs, arch, &[]).attach
     }
 
     #[test]
-    fn slots_arming_declines_spill_under_auto_and_arms_on_explicit_on() {
-        // Fully resident: auto arms (no decline).
-        assert!(slots_arming_verdict(MtpMode::Auto, 0, "gfx1201"));
-        // Host-mapped spill under auto: declines on every arch (no head, AR).
+    fn qwen35_declares_no_measured_ar_floor() {
+        assert!(!crate::MTP_MEASURED_AR_FLOOR);
+    }
+
+    #[test]
+    fn slots_arming_is_explicit_only_for_the_declared_qwen35_floor() {
+        let floor = crate::MTP_MEASURED_AR_FLOOR;
+        // `auto` stays AR on a producer without a measured floor, resident or not.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for blobs in [0, 24] {
+                assert!(
+                    !slots_arming_verdict(MtpMode::Auto, blobs, arch, floor),
+                    "qwen35 slots auto must stay AR ({arch}, blobs {blobs})"
+                );
+            }
+        }
+        // Explicit opt-in arms, resident and over a spill.
+        assert!(slots_arming_verdict(MtpMode::On, 0, "gfx1201", floor));
+        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100", floor));
+        // Off never arms.
+        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201", floor));
+        assert!(!slots_arming_verdict(MtpMode::Off, 24, "gfx1201", floor));
+    }
+
+    #[test]
+    fn slots_arming_declines_spill_under_auto_and_arms_on_explicit_on_with_a_floor() {
+        // A producer that did declare the floor keeps the spill policy:
+        // fully resident auto arms, a host-mapped spill under auto declines
+        // on every arch, explicit `on` arms over the same spill.
+        assert!(slots_arming_verdict(MtpMode::Auto, 0, "gfx1201", true));
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(
-                !slots_arming_verdict(MtpMode::Auto, 24, arch),
+                !slots_arming_verdict(MtpMode::Auto, 24, arch, true),
                 "slots must decline a spill under auto on {arch}"
             );
         }
-        // Explicit opt-in still arms over the same spill.
-        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100"));
-        // Off never arms.
-        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201"));
-        assert!(!slots_arming_verdict(MtpMode::Off, 24, "gfx1201"));
+        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100", true));
+        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201", true));
+    }
+
+    #[test]
+    fn slot_mtp_k_zeroes_every_non_admitted_mode() {
+        assert_eq!(slot_mtp_k(MtpMode::Off, 4, true), 0);
+        assert_eq!(slot_mtp_k(MtpMode::Off, 4, false), 0);
+        assert_eq!(slot_mtp_k(MtpMode::Auto, 4, false), 0);
+        assert_eq!(slot_mtp_k(MtpMode::Auto, 4, true), 4);
+        assert_eq!(slot_mtp_k(MtpMode::On, 4, false), 4);
+        assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
     }
 }

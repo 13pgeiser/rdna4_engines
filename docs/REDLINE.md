@@ -229,7 +229,14 @@ It ships together with the prefill gate in
 `crates/hipfire-arch-qwen35/src/qwen35/prefill.rs`: the chunked GDN prefill
 scan is withheld only while a forward is being **recorded**
 (`is_recording()`), not for the whole life of a Redline-enabled process, so a
-Redline process prefills exactly like the HIP-graph default.
+Redline process prefills exactly like the HIP-graph default. Batched prefill
+(`forward_prefill_batch`'s batched path and `forward_prefill_batch_multi`)
+also clears the plain-AR eligibility the previous decode forward left set
+(`ReplayController::enter_batched_forward`). Otherwise, once the prepared tape
+is `Ready`, `retained_body_active()` and the PM4/AQL routing predicates would
+read true for the whole prefill. The MoE prefill gates (symmetric IU4 experts,
+combine zinit, sealed retained admission) therefore evaluate exactly as on a
+fresh load; the next plain-AR `forward_scratch` re-arms eligibility.
 
 Opt-out: `replay.backend = "hip"` (or `HIPFIRE_REPLAY_BACKEND=hip`, or the
 wizard's built-in `hip` profile) restores the HIP AR graph for the process. A
@@ -736,6 +743,14 @@ metric looks attractive.
 | 6. Production serve | User-facing generation with exact model/settings has healthy decoded output, finish state, repetition/attractor behavior, and model-specific framing | Emitted tokens without semantic/framing health, runaway, empty response, or route ambiguity |
 | 7. Stationary matched performance | Certified baseline and retained route use identical binary, model, prompt/token stream, settings, process policy, and clocks; tok/s and ms/token reported | Cross-harness, cross-binary, cross-prompt, nonstationary, silent-fallback, or microkernel-only comparison |
 | 8. Long-context and lifecycle | Dynamic position, geometry, KV growth, recurrent/convolution state, request reset, failure behavior, and model swap pass throughout the supported range | Context drift, state leak, stale pointer, wrong reset, or same-forward fallback claim |
+
+Automatic captures enforce the launch half of gate 2 at prepare: when the
+window issued more kernel launches on the capturing thread than the tape holds
+(a launcher that calls `hip.launch_kernel` directly instead of the
+`Gpu::launch_maybe_blob*` funnel), prepare refuses with `unrecorded launch` and
+the route falls back to HIP (sticky), because every replay would skip that
+kernel. A per-token input staged before the window opens (the embedding row) is
+outside the window, not an unrecorded launch.
 
 Harness success without route proof is insufficient. A ratio from two nominal
 arms that both executed ordinary HIP is invalid evidence. A stable manual-capture

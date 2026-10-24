@@ -24,7 +24,10 @@ fn main() -> Result<(), String> {
     let n_valid = 96usize;
     let (qd, kvd) = (heads * hd, kvh * hd);
     let rep = heads / kvh;
-    println!("gpu {} | n={n} n_valid={n_valid} heads={heads} kv_heads={kvh} hd={hd}", gpu.arch);
+    println!(
+        "gpu {} | n={n} n_valid={n_valid} heads={heads} kv_heads={kvh} hd={hd}",
+        gpu.arch
+    );
 
     let mut s: u32 = 987654321;
     let mut frnd = || {
@@ -44,12 +47,24 @@ fn main() -> Result<(), String> {
     // reference below then takes the scores raw.
     let qscale = 1.0f32 / (hd as f32).sqrt();
     let qf: Vec<f32> = qf.iter().map(|x| x * qscale).collect();
-    let q16: Vec<u16> = qf.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
-    let k16: Vec<u16> = kf.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect();
+    let q16: Vec<u16> = qf
+        .iter()
+        .map(|x| half::f16::from_f32(*x).to_bits())
+        .collect();
+    let k16: Vec<u16> = kf
+        .iter()
+        .map(|x| half::f16::from_f32(*x).to_bits())
+        .collect();
 
     // ---- host reference (f32, from the same f16 Q/K the GPU sees) ----
-    let qh: Vec<f32> = q16.iter().map(|b| half::f16::from_bits(*b).to_f32()).collect();
-    let kh: Vec<f32> = k16.iter().map(|b| half::f16::from_bits(*b).to_f32()).collect();
+    let qh: Vec<f32> = q16
+        .iter()
+        .map(|b| half::f16::from_bits(*b).to_f32())
+        .collect();
+    let kh: Vec<f32> = k16
+        .iter()
+        .map(|b| half::f16::from_bits(*b).to_f32())
+        .collect();
     let mut ref_ctx = vec![0f32; n * qd];
     for h in 0..heads {
         let khd = h / rep;
@@ -68,9 +83,16 @@ fn main() -> Result<(), String> {
             let row = &mut scores[i * n..(i + 1) * n];
             let m = row[..n_valid].iter().cloned().fold(f32::MIN, f32::max);
             let mut sum = 0f32;
-            for x in row[..n_valid].iter_mut() { *x = (*x - m).exp(); sum += *x; }
-            for x in row[..n_valid].iter_mut() { *x /= sum; }
-            for x in row[n_valid..].iter_mut() { *x = 0.0; }
+            for x in row[..n_valid].iter_mut() {
+                *x = (*x - m).exp();
+                sum += *x;
+            }
+            for x in row[..n_valid].iter_mut() {
+                *x /= sum;
+            }
+            for x in row[n_valid..].iter_mut() {
+                *x = 0.0;
+            }
         }
         for i in 0..n {
             for d in 0..hd {
@@ -99,23 +121,39 @@ fn main() -> Result<(), String> {
         )
     };
 
-
     // ---- sanity: prove the GEMM's operand roles with an identity A ----
     // Y[b, m] = sum_k X[b, k] * A[m, k]. With A = I this must reproduce X, so
     // any mismatch here is an operand-mapping error, not attention math.
     {
         let (tn, tk) = (64usize, 64usize);
         let idn: Vec<u16> = (0..tn)
-            .flat_map(|i| (0..tk).map(move |j| if i == j { half::f16::from_f32(1.0) } else { half::f16::from_f32(0.0) }))
+            .flat_map(|i| {
+                (0..tk).map(move |j| {
+                    if i == j {
+                        half::f16::from_f32(1.0)
+                    } else {
+                        half::f16::from_f32(0.0)
+                    }
+                })
+            })
             .map(|v| v.to_bits())
             .collect();
         let xn: Vec<u16> = (0..tn * tk)
             .map(|i| half::f16::from_f32((i % 7) as f32 * 0.125 - 0.5).to_bits())
             .collect();
-        let xh: Vec<f32> = xn.iter().map(|b| half::f16::from_bits(*b).to_f32()).collect();
-        let a_dev = gpu.upload_f16_bits(&idn, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
-        let x_dev = gpu.upload_f16_bits(&xn, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
-        let y_dev = gpu.alloc_tensor(&[tn, tn], DType::F32).map_err(|e| format!("{e:?}"))?;
+        let xh: Vec<f32> = xn
+            .iter()
+            .map(|b| half::f16::from_bits(*b).to_f32())
+            .collect();
+        let a_dev = gpu
+            .upload_f16_bits(&idn, &[tn, tk])
+            .map_err(|e| format!("{e:?}"))?;
+        let x_dev = gpu
+            .upload_f16_bits(&xn, &[tn, tk])
+            .map_err(|e| format!("{e:?}"))?;
+        let y_dev = gpu
+            .alloc_tensor(&[tn, tn], DType::F32)
+            .map_err(|e| format!("{e:?}"))?;
         gemm_production(&a_dev, &x_dev, &y_dev, tn, tk, tn, tk, tk, true, &mut gpu)
             .map_err(|e| format!("identity gemm: {e:?}"))?;
         let y = gpu.download_f32(&y_dev).map_err(|e| format!("{e:?}"))?;
@@ -145,20 +183,36 @@ fn main() -> Result<(), String> {
             .map(|i| half::f16::from_f32((i % 13) as f32 * 0.0625 - 0.4).to_bits())
             .collect();
         // packed: first tk columns of each row.
-        let a_packed: Vec<u16> = (0..tn).flat_map(|r| a_full[r * pitch_a..r * pitch_a + tk].iter().copied()).collect();
-        let x_packed: Vec<u16> = (0..tn).flat_map(|r| x_full[r * pitch_x..r * pitch_x + tk].iter().copied()).collect();
-        let ap = gpu.upload_f16_bits(&a_packed, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
-        let xp = gpu.upload_f16_bits(&x_packed, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
-        let yp = gpu.alloc_tensor(&[tn, tn], DType::F32).map_err(|e| format!("{e:?}"))?;
+        let a_packed: Vec<u16> = (0..tn)
+            .flat_map(|r| a_full[r * pitch_a..r * pitch_a + tk].iter().copied())
+            .collect();
+        let x_packed: Vec<u16> = (0..tn)
+            .flat_map(|r| x_full[r * pitch_x..r * pitch_x + tk].iter().copied())
+            .collect();
+        let ap = gpu
+            .upload_f16_bits(&a_packed, &[tn, tk])
+            .map_err(|e| format!("{e:?}"))?;
+        let xp = gpu
+            .upload_f16_bits(&x_packed, &[tn, tk])
+            .map_err(|e| format!("{e:?}"))?;
+        let yp = gpu
+            .alloc_tensor(&[tn, tn], DType::F32)
+            .map_err(|e| format!("{e:?}"))?;
         gemm_production(&ap, &xp, &yp, tn, tk, tn, tk, tk, true, &mut gpu)
             .map_err(|e| format!("packed gemm: {e:?}"))?;
         let ref_y = gpu.download_f32(&yp).map_err(|e| format!("{e:?}"))?;
         // same data, but addressed through wider-pitch views.
-        let af = gpu.upload_f16_bits(&a_full, &[tn, pitch_a]).map_err(|e| format!("{e:?}"))?;
-        let xf = gpu.upload_f16_bits(&x_full, &[tn, pitch_x]).map_err(|e| format!("{e:?}"))?;
+        let af = gpu
+            .upload_f16_bits(&a_full, &[tn, pitch_a])
+            .map_err(|e| format!("{e:?}"))?;
+        let xf = gpu
+            .upload_f16_bits(&x_full, &[tn, pitch_x])
+            .map_err(|e| format!("{e:?}"))?;
         let av = af.sub_offset(0, (tn - 1) * pitch_a + tk);
         let xv = xf.sub_offset(0, (tn - 1) * pitch_x + tk);
-        let yv = gpu.alloc_tensor(&[tn, tn], DType::F32).map_err(|e| format!("{e:?}"))?;
+        let yv = gpu
+            .alloc_tensor(&[tn, tn], DType::F32)
+            .map_err(|e| format!("{e:?}"))?;
         gemm_production(&av, &xv, &yv, tn, tk, tn, pitch_a, pitch_x, true, &mut gpu)
             .map_err(|e| format!("pitched gemm: {e:?}"))?;
         let got_y = gpu.download_f32(&yv).map_err(|e| format!("{e:?}"))?;
@@ -167,7 +221,10 @@ fn main() -> Result<(), String> {
             num += ((got_y[i] - ref_y[i]) as f64).powi(2);
             den += (ref_y[i] as f64).powi(2);
         }
-        println!("pitched vs packed GEMM: rel_l2 = {:.3e}", (num / den).sqrt());
+        println!(
+            "pitched vs packed GEMM: rel_l2 = {:.3e}",
+            (num / den).sqrt()
+        );
         if let Some(i) = got_y
             .iter()
             .zip(&ref_y)
@@ -182,16 +239,36 @@ fn main() -> Result<(), String> {
     }
 
     // ---- GPU: the eager sequence, exactly as forward.rs runs it ----
-    let q_dev = gpu.upload_f16_bits(&q16, &[n, qd]).map_err(|e| format!("{e:?}"))?;
-    let k_dev = gpu.upload_f16_bits(&k16, &[n, kvd]).map_err(|e| format!("{e:?}"))?;
-    let v_dev = gpu.upload_f32(&vf, &[n * kvd]).map_err(|e| format!("{e:?}"))?;
-    let sc = gpu.alloc_tensor(&[n, n], DType::F32).map_err(|e| format!("{e:?}"))?;
-    let p16 = gpu.alloc_tensor(&[n * n], DType::F16).map_err(|e| format!("{e:?}"))?;
-    let vh = gpu.alloc_tensor(&[n * hd], DType::F32).map_err(|e| format!("{e:?}"))?;
-    let vht = gpu.alloc_tensor(&[hd * n], DType::F32).map_err(|e| format!("{e:?}"))?;
-    let vht16 = gpu.alloc_tensor(&[hd * n], DType::F16).map_err(|e| format!("{e:?}"))?;
-    let o = gpu.alloc_tensor(&[n * hd], DType::F32).map_err(|e| format!("{e:?}"))?;
-    let ctx = gpu.alloc_tensor(&[n * qd], DType::F32).map_err(|e| format!("{e:?}"))?;
+    let q_dev = gpu
+        .upload_f16_bits(&q16, &[n, qd])
+        .map_err(|e| format!("{e:?}"))?;
+    let k_dev = gpu
+        .upload_f16_bits(&k16, &[n, kvd])
+        .map_err(|e| format!("{e:?}"))?;
+    let v_dev = gpu
+        .upload_f32(&vf, &[n * kvd])
+        .map_err(|e| format!("{e:?}"))?;
+    let sc = gpu
+        .alloc_tensor(&[n, n], DType::F32)
+        .map_err(|e| format!("{e:?}"))?;
+    let p16 = gpu
+        .alloc_tensor(&[n * n], DType::F16)
+        .map_err(|e| format!("{e:?}"))?;
+    let vh = gpu
+        .alloc_tensor(&[n * hd], DType::F32)
+        .map_err(|e| format!("{e:?}"))?;
+    let vht = gpu
+        .alloc_tensor(&[hd * n], DType::F32)
+        .map_err(|e| format!("{e:?}"))?;
+    let vht16 = gpu
+        .alloc_tensor(&[hd * n], DType::F16)
+        .map_err(|e| format!("{e:?}"))?;
+    let o = gpu
+        .alloc_tensor(&[n * hd], DType::F32)
+        .map_err(|e| format!("{e:?}"))?;
+    let ctx = gpu
+        .alloc_tensor(&[n * qd], DType::F32)
+        .map_err(|e| format!("{e:?}"))?;
 
     for h in 0..heads {
         let khd = h / rep;
@@ -215,7 +292,10 @@ fn main() -> Result<(), String> {
                     den += (want as f64).powi(2);
                 }
             }
-            println!("  head {h} scores (pre-softmax): rel_l2 = {:.3e}", (num / den).sqrt());
+            println!(
+                "  head {h} scores (pre-softmax): rel_l2 = {:.3e}",
+                (num / den).sqrt()
+            );
         }
         // Masked row softmax, fused f32->f16 — the production op, not a
         // softmax+cast pair (it is what actually runs over padded segments).
@@ -224,8 +304,10 @@ fn main() -> Result<(), String> {
         let v_h = v_dev.sub_offset(khd * hd, (n - 1) * kvd + hd);
         gpu.copy_rows_strided_f32(&v_h, &vh, n, hd, kvd, hd, 0, None)
             .map_err(|e| format!("V gather h{h}: {e:?}"))?;
-        gpu.transpose_f32(&vh, &vht, n, hd).map_err(|e| format!("V transpose h{h}: {e:?}"))?;
-        gpu.cast_f32_to_f16(&vht, &vht16).map_err(|e| format!("cast V h{h}: {e:?}"))?;
+        gpu.transpose_f32(&vh, &vht, n, hd)
+            .map_err(|e| format!("V transpose h{h}: {e:?}"))?;
+        gpu.cast_f32_to_f16(&vht, &vht16)
+            .map_err(|e| format!("cast V h{h}: {e:?}"))?;
         gemm_production(&vht16, &p16, &o, hd, n, n, n, n, false, &mut gpu)
             .map_err(|e| format!("PV h{h}: {e:?}"))?;
         gpu.copy_rows_strided_f32(&o, &ctx, n, hd, hd, qd, h * hd, None)

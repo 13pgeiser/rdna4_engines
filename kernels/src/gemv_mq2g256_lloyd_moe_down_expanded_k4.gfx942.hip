@@ -18,7 +18,7 @@ void gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx942(
     float* __restrict__ expert_outputs,
     int M,
     int K,
-    int K_TOP
+    int K_TOP, int n_experts
 ) {
     const int tid = threadIdx.x;
     const int stripe = tid >> 5;
@@ -31,6 +31,11 @@ void gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx942(
     const int bid = blockIdx.z;
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (row < M && lane == 0)
+            expert_outputs[(long long)bid * K_TOP * M + (long long)krank * M + row] = 0.0f;
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =

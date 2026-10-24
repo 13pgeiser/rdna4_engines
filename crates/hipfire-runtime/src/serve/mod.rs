@@ -203,7 +203,9 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
         .map_err(|_| "client receiver dropped".to_string())
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Serialized as the `engine_stats` object of every multi-slot `done` event;
+/// the serve gateway exports it on `/metrics`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EngineStats {
     pub admitted: usize,
     pub rejected: usize,
@@ -222,6 +224,13 @@ pub struct EngineStats {
     /// telemetry). A monotonic decline across identical request cycles is
     /// the page-level leak signature the oracle asserts against.
     pub pool_free_pages: usize,
+    /// Physical KV pages in the pool; 0 when the engine is not paged.
+    pub pool_total_pages: usize,
+    /// Slots holding a request, out of `total_slots`: sampled before each
+    /// engine step and decremented as each request finishes, before its
+    /// terminal event, so a `done` snapshot counts only the slots still busy.
+    pub active_slots: usize,
+    pub total_slots: usize,
 }
 
 impl EngineStats {
@@ -244,8 +253,16 @@ impl EngineStats {
     pub fn note_prefix_hit(&mut self) {
         self.prefix_hits += 1;
     }
-    pub fn note_pool_free_pages(&mut self, n: usize) {
-        self.pool_free_pages = n;
+    pub fn note_pool_pages(&mut self, free: usize, total: usize) {
+        self.pool_free_pages = free;
+        self.pool_total_pages = total;
+    }
+    pub fn note_slots(&mut self, active: usize, total: usize) {
+        self.active_slots = active;
+        self.total_slots = total;
+    }
+    pub fn note_slot_released(&mut self) {
+        self.active_slots = self.active_slots.saturating_sub(1);
     }
 }
 
@@ -263,7 +280,6 @@ impl EngineStats {
 // own engine config without seeing arch types. It mirrors
 // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
 // them in lock-step (the qwen35 carrier maps them 1:1).
-
 
 /// Family-neutral multi-slot engine spawn parameters. Constructed once by
 /// the daemon from serve.* config keys + the load request, then handed to
@@ -283,16 +299,21 @@ pub struct SlotEngineConfig {
     /// Directory the swap manager writes cold slot snapshots to.
     pub swap_dir: PathBuf,
     /// The checkpoint is a VL model (vision tower present in the HFQ or in a
-    /// separate `.vl` sidecar). Affects RoPE/M-RoPE + embed routing.
+    /// separate `.vl` sidecar). Affects RoPE/M-RoPE + embed routing. On the
+    /// carrier-delegated slot route this is the load's ladder-gated answer
+    /// (`vision_mode=off` clears it), not a bare probe.
     pub is_vl: bool,
     /// Path to the `.vl` vision sidecar, if the vision weights live outside
-    /// the text HFQ.
+    /// the text HFQ. Ladder-gated like [`Self::is_vl`]: `off` leaves it
+    /// `None`, so an engine must not rediscover a sibling on its own.
     pub vl_path: Option<PathBuf>,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
     /// cannot distinguish `auto` from an explicit `on`, so the slots arming
-    /// site reads this (not `mtp_k`) for the host-spill decline.
+    /// site reads this (not `mtp_k`) for the producer-capability gate
+    /// (`hipfire_config::mtp_mode_admits`: `auto` arms only a producer that
+    /// declares a measured AR floor) and the host-spill decline.
     pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
@@ -342,10 +363,18 @@ pub struct SlotModelPreflight {
     pub tokenizer: crate::tokenizer::Tokenizer,
     /// A vision tower will be resident.
     pub is_vl: bool,
+    /// An audio tower will be resident (arch 18's `.vl` pack carries it next
+    /// to the vision tower; every other arch answers `false`). Capability,
+    /// not discovery: the load's sidecar gate turns it into residency.
+    pub audio: bool,
+    /// The embed route's video leg will be served (arch 18 only — its frames
+    /// ride the vision tower, so this tracks the same residency as `is_vl`
+    /// there and is `false` on every arch without a video leg). Capability,
+    /// not discovery: the load's sidecar gate turns it into residency.
+    pub video: bool,
     /// Resolved `.vl` sidecar path, when the tower lives outside the trunk.
     pub vl_path: Option<PathBuf>,
 }
-
 
 /// Which prompt the encoder wraps the input in. Queries and documents carry
 /// different markers and different truncation limits, and the document side
@@ -360,15 +389,31 @@ pub enum EmbedKind {
 /// One embedding encode request handed to a slot engine.
 ///
 /// The engine owns the tokenizer, so the text rides raw — the same split the
-/// sequential `embed` wire body uses. `image` is decoded image bytes; the
-/// engine runs the vision tower itself, on its own GPU thread.
+/// sequential `embed` wire body uses. `images`/`audios` are decoded media
+/// container bytes (PNG/JPEG, WAV), in request order; the engine runs the
+/// vision/audio towers itself, on its own GPU thread. Empty = text-only, and
+/// an arch whose tower is absent refuses a non-empty list per request rather
+/// than ignoring it.
+///
+/// `videos` is the third modality: ONE ENTRY PER VIDEO, each a list of that
+/// clip's FRAMES (encoded PNG/JPEG, in display order) — the sampler's input,
+/// not a container. Video is arch 18 only, and its frames ride the vision
+/// tower, so an arch without one refuses a non-empty list by name.
 #[derive(Clone, Debug)]
 pub struct EmbedRequest {
     pub kind: EmbedKind,
     pub text: String,
-    pub image: Option<Vec<u8>>,
+    pub images: Vec<Vec<u8>>,
+    pub audios: Vec<Vec<u8>>,
+    pub videos: Vec<Vec<Vec<u8>>>,
     /// The wire request id, for diagnostics only.
     pub request_tag: String,
+    /// Matryoshka output width (embeddinggemma2, arch 18): truncate the
+    /// pooled vector to this many components and re-normalize. `None`/0 =
+    /// the model's full width. A nonzero value is refused (not ignored) by
+    /// arches without MRL support — arch 17's encoder is multi-vector with a
+    /// fixed 128-d head, so a `dims` there is a caller error, not a no-op.
+    pub dims: Option<usize>,
 }
 
 /// One encode's result: the post-skiplist, L2-normalized token matrix
@@ -384,7 +429,6 @@ pub struct EmbedResponse {
     /// Tokens the input tokenized to, before the mask.
     pub n_input_tokens: usize,
 }
-
 
 /// Arch-erased multi-slot engine. The concrete engine runs its own thread
 /// and is driven through this narrow surface: submit a request, cancel a

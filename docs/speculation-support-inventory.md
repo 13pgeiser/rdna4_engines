@@ -40,7 +40,7 @@ architecture is admitted by this page or by that registry.
 | Term | Meaning |
 |---|---|
 | **n-gram drafter** | Model-free, arch-generic (`crates/hipfire-runtime/src/spec_ngram.rs`). Opt-in via `HIPFIRE_NGRAM_DRAFT=1` (env wins) or config `speculation.ngram` (default `off`), folded into `SpecLoadCfg`. Requires a `SpecTarget` verify seam. Distinct from the n-gram *takeover windows* (`speculation.mtp_ngram`, ngram-mod) that run inside native Qwen4 MTP. |
-| **MTP** | Learned multi-token-prediction head shipped with model weights. qwen35 (arch 5/6): a bundled `.mq4-mtp` trailer or a `<trunk>.mtp` sidecar, attached by default (`speculation.mtp = auto`). qwen4 / Flash-Next (arch 16): native in-trunk MTP layer. deepseek4 (arch 9): in-trunk MTP layer. |
+| **MTP** | Learned multi-token-prediction head shipped with model weights. qwen35 (arch 5/6): a bundled `.mq4-mtp` trailer or a `<trunk>.mtp` sidecar, attached only on an explicit `speculation.mtp = on` / `--spec mtp` (`auto` stays AR: no measured AR floor). qwen4 / Flash-Next (arch 16): native in-trunk MTP layer, armed by `auto` (declares a measured AR floor). deepseek4 (arch 9): in-trunk MTP layer, explicit only under the same gate (its layer is not even loaded under `auto`). The gate is `hipfire_config::mtp_mode_admits` over each producer's `MTP_MEASURED_AR_FLOOR` (`Carrier::mtp_measured_ar_floor`, default `false`). |
 | **DFlash** | Block-diffusion drafter (arXiv 2602.06036). Qwen35 path: `crates/hipfire-arch-qwen35/src/dflash_spec.rs`. Dense llama/plain-Qwen3 targets: generic chain/tree path `crates/hipfire-runtime/src/dflash_generic.rs` with an external arch_id=20 HFQ draft. Muse Glimmer (arch 14): its own arch_id=23 drafter (`crates/hipfire-arch-muse-glimmer/src/drafter.rs`). |
 | **DSpark** | Draft-sidecar path (`<stem>-dspark.<ext>`). Implemented for llama/plain-Qwen3 (arch 0/1), qwen35 (5/6), and deepseek4 (9). Preferred over DFlash/MTP/n-gram (or in-trunk MTP on deepseek4) when the sidecar loads and `ctx.spec.dspark != Some(false)`. |
 | **DDTree** | Tree-masked verify + SWOR sampling. Opt-in (`speculation.dflash_tree` / `HIPFIRE_DFLASH_TREE=1`, experimental); knobs `speculation.ddtree_budget` / `ddtree_topk` (`HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK`; config default budget `0` = chain). Refused on qwen4. |
@@ -58,8 +58,8 @@ All values are from [`CONFIG.md`](CONFIG.md) / `crates/hipfire-config/src/lib.rs
 |---|---|---|
 | `speculation` selector | `auto` | `off` / `auto` / `ngram` / `dflash` / `mtp` / `dspark`; forced names bypass heuristics, missing prerequisites fall back to AR with a warning |
 | `speculation.dflash` | `off` | One registry-scoped exception: Qwen3.8-27B tiers whose registry entry declares a paired `dflash` draft resolve `auto` (kill switch `dflash_mode off`). Daemon: `dflash_mode == "off"` skips draft load even if a draft path is supplied. |
-| `speculation.mtp` | `auto` | Uses a present head; `on` fails the load without one |
-| `speculation.mtp_k` | `auto` | 4 for native Qwen4 MTP on gfx1151, else 3 (`MTP_K_DEFAULT`); explicit 1–10 overrides |
+| `speculation.mtp` | `auto` | Arms a present head only for a producer that declares a measured AR floor (`MTP_MEASURED_AR_FLOOR`: qwen4 `true`; qwen35, deepseek4 and every other carrier `false`, so `auto` stays AR and logs `MTP: off by default (no measured AR floor); opt in with --spec mtp`); `on` arms any present head and fails the load without one; DSpark / DFlash selection is separate |
+| `speculation.mtp_k` | `auto` | Native Qwen4 MTP: `min(GPU row-exact verify rows, window of the CPU routed-expert mode that owns layers) − 1`, resolved at load after placement (7 on every GPU today with no CPU-owned experts, 3 on a D1/D2 CPU-placed load; `hipfire config` shows 7); else 3 (`MTP_K_DEFAULT`); explicit 1–10 overrides (`4` restores the previous gfx1151 cap) |
 | `speculation.mtp_sampled` | `true` | Documented for native Qwen4 MTP sampled serving |
 | `speculation.mtp_ngram` | `auto` | On for native Qwen4 MTP on gfx1151 / gfx1201; other producers off unless `on` |
 | `speculation.ngram` | `off` | Opt-in; `ngram_k` 12, `ngram_min_count` 2 |
@@ -73,20 +73,20 @@ n-gram arch gate in `build_speculator`:
 | Arch crate | arch_id | Family | In-repo mechanisms | Native learned drafter? | Load / route wiring (summary) |
 |---|---|---|---|---|---|
 | llama | 0 / 1 | LLaMA / Mistral / plain Qwen3 dense | **DSpark** sidecar + DFlash generic (arch_id=20 draft) + n-gram + SpecTarget | External DSpark (`-dspark`) and/or DFlash HFQ draft when present and mode allows | Carrier precedence **DSpark > DFlash > n-gram**. Route `LlamaSpec` when a speculator exists: greedy without penalties, or the sampled chain / DDTree SWOR gates |
-| qwen35 | 5 / 6 | Qwen3.5/3.6/3.8 DeltaNet hybrid (dense + A3B MoE) | **DSpark** sidecar + DFlash + native MTP head + n-gram + SpecTarget | DSpark; DFlash draft; native MTP head (bundled `.mq4-mtp` trailer or sibling `.mtp`) | Load precedence **DSpark > DFlash > MTP > n-gram** (one cascade; see MTP). MTP is on by default when a head is present; DFlash needs `dflash_mode` on/auto (registry `auto` for paired Qwen3.8-27B tiers). Route `QwenDflash` carries both DFlash and MTP; sampled MTP routes on temperature>0 (the qwen35 MTP drafter reports temperature verify) |
+| qwen35 | 5 / 6 | Qwen3.5/3.6/3.8 DeltaNet hybrid (dense + A3B MoE) | **DSpark** sidecar + DFlash + native MTP head + n-gram + SpecTarget | DSpark; DFlash draft; native MTP head (bundled `.mq4-mtp` trailer or sibling `.mtp`) | Load precedence **DSpark > DFlash > MTP > n-gram** (one cascade; see MTP). MTP is explicit-only (`--spec mtp` / `speculation.mtp = on`): qwen35 declares no measured AR floor, so `auto` stays AR and loads no head; DFlash needs `dflash_mode` on/auto (registry `auto` for paired Qwen3.8-27B tiers). Route `QwenDflash` carries both DFlash and MTP; sampled MTP routes on temperature>0 (the qwen35 MTP drafter reports temperature verify) |
 | qwen2 | 7 | Qwen2/2.5, VibeThinker | n-gram + SpecTarget (block-parallel verify available) | No | n-gram opt-in; route `Qwen2Spec` when a speculator exists (greedy, or n-gram can sample) |
 | dots-ocr | 8 | rednote dots.ocr (Qwen2-1.5B decoder) | n-gram on **decode phase only** after vision prefill | No | `generate_vl_dots_ocr` → n-gram decode loop when a speculator is built; vision prefill unchanged |
-| deepseek4 | 9 | DeepSeek-V4 MLA+MoE | **DSpark** and/or in-trunk MTP + SpecTarget | Yes — `-dspark` sidecar and/or in-trunk MTP | Precedence **DSpark > MTP**; route `Deepseek4Spec` requires `deepseek4_spec_requested` (installed DSpark, or `mtp_mode` on / auto with weights present) and a temperature-compatible drafter; **n-gram not in the n-gram arch gate** |
+| deepseek4 | 9 | DeepSeek-V4 MLA+MoE | **DSpark** and/or in-trunk MTP + SpecTarget | Yes — `-dspark` sidecar and/or in-trunk MTP | Precedence **DSpark > MTP**; route `Deepseek4Spec` requires `deepseek4_spec_requested` (installed DSpark, or `mtp_mode` `on` with weights present; `auto` stays AR: the native MTP has no measured AR floor, so its layer is not loaded) and a temperature-compatible drafter; **n-gram not in the n-gram arch gate** |
 | minimax | 10 | MiniMax-M2 MoE | n-gram + SpecTarget | No | n-gram opt-in; route `MiniMaxSpec` when a speculator exists |
 | lfm2moe | 11 | LFM2.5 hybrid conv+attn (+MoE variants) | n-gram + SpecTarget (conv-state snapshot/rollback) | No | n-gram opt-in; route `LfmSpec` when a speculator exists. **Not** a Redline or batched-prefill admission |
 | cohere2moe | 12 | Cohere2-MoE / North-Mini-Code | n-gram + SpecTarget + `Cohere2MoeEmit` | No | n-gram opt-in; route `CohereSpec` when a speculator exists |
-| gemma4 | 13 (+22 drafter) | Gemma 4 dense text | EAGLE draft (arch 22) via `params.drafter` only; **no** `build_speculator` mechanism (not in the n-gram gate; `params.draft` DFlash refused) | Arch-22 EAGLE drafter exists but is **gated off** | The EAGLE path runs only with `HIPFIRE_GEMMA4_EAGLE=1` (developer), greedy-only; E2B/E4B targets refuse a drafter. Default serve is plain AR |
+| gemma4 | 13 (+22 drafter) | Gemma 4 dense text | EAGLE draft (arch 22) via `params.drafter` only; **no** `build_speculator` mechanism (not in the n-gram gate; `params.draft` DFlash refused) | Arch-22 EAGLE drafter exists but is **gated off** | The EAGLE path runs only with `HIPFIRE_GEMMA4_EAGLE=1` (developer; it is slower than AR on gfx1151). Greedy requests verify by argmax; sampled and penalized requests by naive sampling (each verify row drawn with the AR sampler against the request's penalty history); `logprobs` come from the verify rows. E2B/E4B targets refuse a drafter. Default serve is plain AR |
 | muse-glimmer | 14 (+23 drafter) | Muse Glimmer dense text | DFlash with the arch-23 `muse_glimmer_assistant` draft | DFlash arch-23 drafter when supplied | Draft is loaded only when a draft path is set and `dflash_mode != off`; load failure falls back to AR. Route `GlimmerSpec` when a speculator exists. Gemma EAGLE `params.drafter` refused; n-gram not in the gate |
 | maple | 15 | Maple-Preview natively-ternary MoE | None | No | `MapleCarrier::caps()` declares no DFlash and no MTP; route is always `MapleAr` |
-| qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + SpecTarget (`mtp_spec.rs`) | Yes — native MTP | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). Admission **refuses** DFlash, DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, CASK, PFlash and a draft path. Route `Qwen4Spec` greedy, and sampled via rejection sampling when `mtp_sampled` is on. EP2/EP4 admit MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
+| qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + **DFlash2** (arch-20 draft, explicit only) + SpecTarget (`mtp_spec.rs`, `dflash_target.rs`) | Yes — native MTP; external DFlash2 draft | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). DFlash2 runs only on `--spec dflash` / `speculation.dflash = on` with a draft (`--model-draft`), single card, GPU-resident experts. Admission **refuses** DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, CASK, PFlash, a draft path without `dflash = on`, and DFlash under EP/PP. Route `Qwen4Spec` greedy, and sampled via rejection sampling (MTP when `mtp_sampled` is on; DFlash2 always, unpenalized requests). EP (2..=8 ranks) admits MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
 
 **Has a learned or diffusion drafter path in-tree today:** qwen35 (DSpark ± DFlash ± MTP),
-qwen4 (native MTP), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
+qwen4 (native MTP, or DFlash2 on request), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
 DFlash when draft/sidecar loaded), muse-glimmer (DFlash arch-23 draft). gemma4 has an EAGLE
 drafter path that is gated off. **n-gram-capable with SpecTarget:** arch ids in the gate above
 (qwen4 excluded by admission). Everything else remains plain autoregressive unless source gains
@@ -94,12 +94,12 @@ a new arm.
 
 ## Mechanism notes
 
-### DFlash (qwen35, dense generic, muse-glimmer)
+### DFlash (qwen35, dense generic, qwen4 DFlash2, muse-glimmer)
 
 - **Default:** `speculation.dflash = "off"` in `crates/hipfire-config/src/lib.rs`. `"auto"` turns dense
   Qwen3.5-style targets on and skips known-loss A3B/MoE cases ([`CONFIG.md`](CONFIG.md)). The registry
   layer lowers `auto` for the Qwen3.8-27B trunk tiers that declare a paired draft
-  (`crates/hipfire-registry/src/lib.rs`); an absent draft file wires nothing and the load keeps MTP `auto`.
+  (`crates/hipfire-registry/src/lib.rs`); an absent draft file wires nothing and the load keeps MTP `auto` (AR for qwen35, which declares no measured AR floor).
 - **Daemon:** `params.dflash_mode == "off"` skips draft load even if a draft
   path is supplied (`crates/hipfire-daemon/src/main.rs`).
 - **qwen35:** a loaded draft builds `DflashSpeculator` (chain by default; DDTree opt-in). Chain-mode
@@ -112,6 +112,22 @@ a new arm.
   supported path; see [Lifecycle](#lifecycle).
 - **llama 0/1:** `dflash_generic` requires arch_id=20 HFQ from `dflash_convert`.
   Chain is default; the tree arm is opt-in (`HIPFIRE_DFLASH_TREE=1`).
+- **qwen4 16 (DFlash2):** `Qwen4Carrier` builds the shared
+  `hipfire_runtime::dflash2_spec::Dflash2Speculator` (name `dflash2`) from an arch-20 DFlash2 draft
+  (`dflash_convert`, candidate selector + dynamic convs) only on `--spec dflash` /
+  `speculation.dflash = on` with `--model-draft`; native MTP stays the default and the two never load
+  together. The target captures the drafter's `target_layer_ids` as each layer's completed output
+  averaged over the 4 hyper-connection streams (`hc_mean_capture_f32`, run between interpreter steps
+  so the verify program is unchanged) in prefill and every verify; a capturing prefill is planned
+  GPU-only (the NPU trunk pair executor and the S1 layer-major prefill build their own steps, so
+  they are bypassed). Block width: `speculation.dflash_block`, Qwen4 `auto` = 8 (with the confidence
+  cut that verifies only the draft's confident prefix, the fastest measured on gfx1151), an explicit width clamped to the GPU's row-exact verify rows
+  (8 on gfx1151). The host keeps only the draft's 2048-row window of feature rows (≤ 2 × 2048 ×
+  51,200 B). Chain only: greedy is the selector's argmax walk (output = AR); sampled draws from the
+  selector's softmax over its top-16 and accepts with sparse-q rejection sampling against the AR
+  sampler's law (temperature, top_k, top_p, min_p). Penalized requests stay AR. EP, PP and
+  CPU-hosted routed experts refuse DFlash2. **Known gap:** the DFlash2 route never reuses the Qwen4
+  session / prefix cache (every request prefills cold; HIPF-143).
 - **muse-glimmer 14:** a distinct arch-23 draft (not a `dflash_convert` arch-20 artifact), loaded via
   `HIPFIRE_DFLASH_DRAFT` / `params.draft` while `dflash_mode != off`.
 - **Genre conditionality** is a measured property (see the historical table in
@@ -137,10 +153,10 @@ a new arm.
 (`resolve_qwen35_mtp_head_sourced` in `crates/hipfire-loader/src/lib.rs`): a bundled
 `.mq4-mtp` trailer first, then the sidecar (CLI-resolved `mtp_path`, else `<trunk>.mtp`);
 a head whose hidden size or vocab differs from the trunk is refused before upload. The head
-is attempted when arch is 5/6, no adaptive KV, no eviction, `speculation.mtp != off`, no
+is attempted when arch is 5/6, no adaptive KV, no eviction, the producer-capability gate admits `speculation.mtp` (`on`; `auto` only for a producer with a declared measured AR floor, which qwen35 lacks, so `auto` never loads a head and the load logs `qwen35 MTP: off by default (no measured AR floor); opt in with --spec mtp`; `off` never), no
 DFlash draft and no DSpark speculator. It is handed to the `build_speculator` MTP arm
 (`build_qwen35_mtp_speculator`, cascade DFlash → MTP → n-gram). `mtp=on` with no head fails
-the load; `auto` logs and falls back to AR/n-gram. K from `speculation.mtp_k` (`HIPFIRE_MTP_K`),
+the load; `auto` never reaches the head (see above). K from `speculation.mtp_k` (`HIPFIRE_MTP_K`),
 default 3, clamped 1–10. There is no separate opt-in env gate: `HIPFIRE_QWEN35_MTP` and
 `HIPFIRE_QWEN_MTP` have no readers under `crates/`, and the daemon has no `generate_qwen35_mtp`
 serve path. Route: `QwenDflash` (generic wrapper); the qwen35 MTP drafter has
@@ -152,14 +168,14 @@ through MTP. Penalties are applied to every verify row.
   drafters (n-gram, DFlash, DSpark) are refused on the mesh.
 - **qwen4 / Flash-Next (arch 16):** `Qwen4Carrier` builds a native MTP speculator
   (`hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator`) when
-  `qwen4_native_mtp` admits it (default on; off for retained-Redline `.mq4r`; `--spec mtp`
+  `qwen4_native_mtp` admits it (default on because Qwen4 declares a measured AR floor, `MTP_MEASURED_AR_FLOOR = true`, unchanged; off for retained-Redline `.mq4r`; `--spec mtp`
   forced on is refused on `.mq4r` and on a profile with no MTP head). K via `mtp_k`
-  (`auto` = 4 on gfx1151). Sampled requests use speculative rejection sampling when
+  (`auto` = `min(row-exact verify rows, CPU-owned-expert window) − 1`: 7 with no CPU-owned experts, 3 on a CPU-placed load). Sampled requests use speculative rejection sampling when
   `speculation.mtp_sampled` is on. MTP+ngram-mod takeover windows are a separate switch
   (`speculation.mtp_ngram`).
 - **deepseek4:** `Deepseek4MtpDrafter` reports `requires_greedy() == true`.
   Spec request from `HIPFIRE_DEEPSEEK4_SPEC_DECODE=1` or
-  `mtp_mode`/`HIPFIRE_MTP_MODE` auto/on with weights present. `spec_k` resolves at load
+  `mtp_mode`/`HIPFIRE_MTP_MODE` `on` with weights present (`auto` stays AR: no measured AR floor, and `DeepseekV4Config::load_mtp` leaves the MTP layer unloaded). `spec_k` resolves at load
   `HIPFIRE_DEEPSEEK4_SPEC_K` → configured `mtp_k` → `MTP_K_DEFAULT` (3).
   A DSpark sidecar, when present, is preferred over this in-trunk MTP at load.
 

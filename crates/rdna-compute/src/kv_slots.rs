@@ -309,16 +309,11 @@ pub const R9700_VRAM_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Headroom left for the rest of the system. Chosen so the desktop survives.
 const HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// `MemAvailable` from /proc/meminfo, in bytes. `None` if unreadable.
+/// Host RAM available to unmovable allocations (`MemAvailable - CMA`),
+/// in bytes. `None` if unreadable. Delegates to
+/// [`crate::uma_memory::mem_available_bytes`], the shared rule.
 pub fn mem_available_bytes() -> Option<u64> {
-    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in txt.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
+    crate::uma_memory::mem_available_bytes()
 }
 
 /// Refuse a planned allocation that would exceed the deployment target's
@@ -401,12 +396,25 @@ pub(crate) fn preflight_checks(
     } else {
         mem_available_bytes()
     };
+    preflight_headroom(planned_bytes, what, available, uma)
+}
+
+/// The host-headroom half of the guard for an already-resolved available
+/// figure: `MemAvailable - CMA` (plus TTM's pool when `uma`). Pure, so
+/// tests drive it with fixed `/proc/meminfo` text.
+fn preflight_headroom(
+    planned_bytes: u64,
+    what: &str,
+    available: Option<u64>,
+    uma: bool,
+) -> Result<(), String> {
+    let gib = |b: u64| b as f64 / 1073741824.0;
     match available {
         Some(avail) => {
             if planned_bytes.saturating_add(HEADROOM_BYTES) > avail {
                 return Err(format!(
-                    "{what}: needs {:.2} GiB but MemAvailable{} is only {:.2} GiB \
-                     (keeping {:.2} GiB headroom). This box has NO SWAP and GPU \
+                    "{what}: needs {:.2} GiB but MemAvailable (excluding CMA){} is only \
+                     {:.2} GiB (keeping {:.2} GiB headroom). This box has NO SWAP and GPU \
                      memory comes from system RAM, so proceeding risks a GLOBAL \
                      OOM that kills the user's applications, not this process. \
                      Skipping.",
@@ -528,7 +536,10 @@ pub fn validate_vmm_rows(
             .ok()
             .and_then(|s| descs.get(s))
             .ok_or_else(|| {
-                format!("VMM KV row {row} slot {slot} outside {} descriptors", descs.len())
+                format!(
+                    "VMM KV row {row} slot {slot} outside {} descriptors",
+                    descs.len()
+                )
             })?;
         if desc.owner_generation != generation {
             return Err(format!(
@@ -585,6 +596,39 @@ mod tests {
     fn mem_available_is_readable_and_sane() {
         let a = mem_available_bytes().expect("MemAvailable must be readable on Linux");
         assert!(a > 0, "MemAvailable should be positive");
+    }
+
+    /// hipx-shaped `/proc/meminfo`: `CmaTotal` is 0 and `CmaFree` is 0.45 GiB
+    /// (page cache filled the KHO scratch) of the 66.8 GiB `MemAvailable`.
+    const HIPX_MEMINFO: &str = "MemAvailable: 70000080 kB\nCmaTotal: 0 kB\nCmaFree: 470684 kB\n";
+
+    /// hipx `/proc/zoneinfo` `cma` lines: 3,465,216 pages = 13,536 MiB.
+    const HIPX_ZONEINFO: &str = "Node 0, zone      DMA\n        cma      0\n      nr_free_cma  0\n\
+        Node 0, zone    DMA32\n        cma      194560\n      nr_free_cma  61919\n\
+        Node 0, zone   Normal\n        cma      3270656\n      nr_free_cma  55000\n";
+
+    #[test]
+    fn preflight_headroom_excludes_the_cma_region() {
+        let gib = 1024 * 1024 * 1024u64;
+        let available =
+            crate::uma_memory::meminfo_available_bytes(HIPX_MEMINFO, Some(HIPX_ZONEINFO));
+        // Raw MemAvailable (66.8 GiB) would admit 55 GiB + 8 GiB headroom;
+        // MemAvailable - CMA region (53.6 GiB) must not.
+        let raw = crate::uma_memory::meminfo_field(HIPX_MEMINFO, "MemAvailable");
+        assert!(preflight_headroom(55 * gib, "test", raw, false).is_ok());
+        let e = preflight_headroom(55 * gib, "test", available, false).unwrap_err();
+        assert!(e.contains("excluding CMA"), "unexpected message: {e}");
+        // Within MemAvailable - CMA - headroom: still admitted.
+        assert!(preflight_headroom(45 * gib, "test", available, false).is_ok());
+    }
+
+    #[test]
+    fn preflight_headroom_refuses_when_only_cma_is_available() {
+        let cma_only = "MemAvailable: 13858816 kB\nCmaTotal: 0 kB\nCmaFree: 13858816 kB\n";
+        let available = crate::uma_memory::meminfo_available_bytes(cma_only, None);
+        assert_eq!(available, Some(0));
+        assert!(preflight_headroom(1, "test", available, false).is_err());
+        assert!(preflight_headroom(0, "test", None, false).is_err());
     }
 
     #[test]

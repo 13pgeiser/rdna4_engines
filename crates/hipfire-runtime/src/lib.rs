@@ -34,6 +34,10 @@ pub mod ddtree;
 pub mod device_mesh;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+/// Target-generic DFlash2 speculator (candidate selector, sparse-q sampled
+/// verify) over the `SpecTarget` seam.
+#[cfg(feature = "deltanet")]
+pub mod dflash2_spec;
 /// Adaptive DFlash verify-block controller — family-free policy object shared
 /// by arch speculators (`hipfire-arch-qwen35::dflash_spec`); the DSpark
 /// analogue is `dspark_block_controller`. Pure math, no GPU types.
@@ -42,6 +46,8 @@ pub mod dflash_generic;
 pub mod dflash_online;
 pub mod dspark_block_controller;
 pub mod dspark_core;
+/// CPU arithmetic oracles for the E8P-on-IU4 route (decode, SWAR unpack, `2C+s` fold, epoch, writer guard).
+pub mod e8p_i4_reference;
 pub mod ep;
 pub mod ep_row_gather;
 pub mod ep_tile_exchange;
@@ -59,8 +65,14 @@ pub mod llama_spec;
 pub mod lloyd_lut;
 pub mod loader_api;
 pub mod loop_guard;
+pub mod mesh_placement;
+pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;
+/// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
+pub mod mq_i4;
+/// CPU arithmetic twins for future MQ-I4 expert kernels; no dispatch changes.
+pub mod mq_i4_reference;
 pub mod multi_gpu;
 pub mod offload_calibrate;
 pub mod paro;
@@ -96,18 +108,23 @@ pub mod spec;
 
 pub mod ngram_mod;
 pub mod offload;
+pub mod spec_economics;
+pub mod spec_lookup;
 pub mod spec_ngram;
+/// Per-request spec → AR retirement policy. Pure math, no GPU types.
+pub mod spec_retire;
 pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
-pub mod trunk_overlay;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
-pub mod weight_manifest;
+pub mod trunk_overlay;
+pub mod verified_cache;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed
 /// manifest, source certificates and the `SCM_RIGHTS` handshake. Linux only.
 #[cfg(target_os = "linux")]
 pub mod weight_host;
+pub mod weight_manifest;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 pub mod weight_store;

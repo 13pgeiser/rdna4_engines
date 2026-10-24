@@ -13,7 +13,9 @@
 //! [`device_free_from`] is the one rule every free-memory sizing site uses
 //! (through `Gpu::device_mem_info`): a discrete GPU, or an APU whose device
 //! pool is its carve-out, keeps `hipMemGetInfo`'s figure; a GTT-backed APU
-//! takes `min(hipMemGetInfo free, MemAvailable + TTM pool estimate)`.
+//! takes `min(hipMemGetInfo free, MemAvailable - CMA + TTM pool estimate)`,
+//! where CMA is the larger of `CmaFree` and the CMA pageblocks (`CmaTotal`
+//! or `/proc/zoneinfo` `cma`, which includes KHO scratch).
 
 use std::path::Path;
 
@@ -59,8 +61,104 @@ const MEMINFO_TRACKED: &[&str] = &[
 pub fn meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
     meminfo.lines().find_map(|line| {
         let rest = line.strip_prefix(key)?.strip_prefix(':')?;
-        Some(rest.split_whitespace().next()?.parse::<u64>().ok()? * 1024)
+        rest.split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1024)
     })
+}
+
+/// `/proc/zoneinfo` page size. x86_64 is the only host ROCm supports.
+const ZONEINFO_PAGE_BYTES: u64 = 4096;
+
+/// Below this, a KHO scratch region is not worth a warning.
+pub const KHO_WARN_BYTES: u64 = 1 << 30;
+
+/// Pages of CMA pageblocks summed over every zone of `/proc/zoneinfo` text:
+/// the per-zone `cma` line, never `nr_free_cma` (free CMA pages). Includes
+/// pageblocks outside any registered CMA area (KHO scratch).
+pub fn zoneinfo_cma_pages(zoneinfo: &str) -> u64 {
+    zoneinfo
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next()? == "cma").then_some(())?;
+            words.next()?.parse::<u64>().ok()
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// Bytes of CMA pageblocks: `max(CmaTotal, Σ zoneinfo cma pages)`. Only
+/// movable allocations can use them. Without zoneinfo this is `CmaTotal`.
+/// A missing `CmaTotal` counts as 0.
+pub fn cma_region_bytes(meminfo: &str, zoneinfo: Option<&str>) -> u64 {
+    let cma_total = meminfo_field(meminfo, "CmaTotal").unwrap_or(0);
+    let zones = zoneinfo
+        .map(|text| zoneinfo_cma_pages(text).saturating_mul(ZONEINFO_PAGE_BYTES))
+        .unwrap_or(0);
+    cma_total.max(zones)
+}
+
+/// Bytes of CMA pageblocks outside any registered CMA area (`Σ zoneinfo cma
+/// − CmaTotal`), the Kexec HandOver scratch release on kernels with
+/// `CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y` (Ubuntu 7.0 generic). `None` when
+/// zoneinfo is unreadable or there is none.
+pub fn kho_scratch_from(meminfo: &str, zoneinfo: Option<&str>) -> Option<u64> {
+    let zones = zoneinfo_cma_pages(zoneinfo?).saturating_mul(ZONEINFO_PAGE_BYTES);
+    let scratch = zones.saturating_sub(meminfo_field(meminfo, "CmaTotal").unwrap_or(0));
+    (scratch > 0).then_some(scratch)
+}
+
+/// Host bytes available to unmovable allocations, including pinned GTT.
+///
+/// `MemAvailable` includes CMA pageblocks, but only movable allocations can
+/// use them: free pages (`CmaFree`) and page cache sitting in them (direct
+/// reclaim for unmovable requests skips CMA folios). Subtract
+/// `max(CmaFree, cma_region)` ([`cma_region_bytes`]) even when `CmaTotal` is
+/// zero (KHO scratch is in no registered area). Missing `CmaFree` counts as
+/// zero; missing `MemAvailable` returns `None`.
+pub fn meminfo_available_bytes(meminfo: &str, zoneinfo: Option<&str>) -> Option<u64> {
+    let cma = meminfo_field(meminfo, "CmaFree")
+        .unwrap_or(0)
+        .max(cma_region_bytes(meminfo, zoneinfo));
+    Some(meminfo_field(meminfo, "MemAvailable")?.saturating_sub(cma))
+}
+
+/// Live `/proc/zoneinfo` text; `None` when unreadable.
+pub fn read_zoneinfo() -> Option<String> {
+    std::fs::read_to_string("/proc/zoneinfo").ok()
+}
+
+/// Live [`kho_scratch_from`].
+pub fn kho_scratch_bytes() -> Option<u64> {
+    kho_scratch_from(
+        &std::fs::read_to_string("/proc/meminfo").ok()?,
+        read_zoneinfo().as_deref(),
+    )
+}
+
+/// The warning for KHO scratch of `bytes`, `None` under [`KHO_WARN_BYTES`].
+pub fn kho_scratch_warning(bytes: u64) -> Option<String> {
+    (bytes >= KHO_WARN_BYTES).then(|| {
+        format!(
+            "KHO scratch reserves {:.1} GiB unusable by the GPU; boot with kho=off to reclaim it",
+            bytes as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
+/// Live host RAM available to unmovable allocations, without TTM pool credit.
+pub fn mem_available_bytes() -> Option<u64> {
+    meminfo_available_bytes(
+        &std::fs::read_to_string("/proc/meminfo").ok()?,
+        read_zoneinfo().as_deref(),
+    )
+}
+
+/// Total host RAM from `/proc/meminfo`, in bytes.
+pub fn host_total_bytes() -> Option<u64> {
+    meminfo_field(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
 }
 
 /// A sysfs integer.
@@ -127,21 +225,33 @@ pub fn ttm_pool_bytes() -> u64 {
     estimate().unwrap_or(0)
 }
 
-/// Host RAM a GTT allocation can still take: `MemAvailable` plus TTM's pool
-/// estimate. `None` when `/proc/meminfo` has no `MemAvailable`.
-pub fn host_available_from(meminfo: &str, gtt_used: u64, pool_size_pages: u64) -> Option<u64> {
-    let available = meminfo_field(meminfo, "MemAvailable")?;
+/// Host RAM a GTT allocation can still take: `MemAvailable - CMA` (see
+/// [`meminfo_available_bytes`]) plus TTM's pool estimate. `None` when
+/// `/proc/meminfo` has no `MemAvailable`.
+pub fn host_available_from(
+    meminfo: &str,
+    zoneinfo: Option<&str>,
+    gtt_used: u64,
+    pool_size_pages: u64,
+) -> Option<u64> {
+    let available = meminfo_available_bytes(meminfo, zoneinfo)?;
     let pool = ttm_pool_estimate_from(meminfo, gtt_used, pool_size_pages).unwrap_or(0);
     Some(available.saturating_add(pool))
 }
 
 /// Live [`host_available_from`]: `None` when `MemAvailable` is unreadable;
-/// an unreadable TTM pool counts as empty.
+/// an unreadable TTM pool counts as empty, unreadable zoneinfo as no extra
+/// CMA region.
 pub fn host_available_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let pool_size_pages = read_sysfs_u64(TTM_PAGE_POOL_SIZE.as_ref()).unwrap_or(0);
     let gtt_used = amdgpu_gtt_used_bytes().unwrap_or(0);
-    host_available_from(&meminfo, gtt_used, pool_size_pages)
+    host_available_from(
+        &meminfo,
+        read_zoneinfo().as_deref(),
+        gtt_used,
+        pool_size_pages,
+    )
 }
 
 /// The amdgpu carve-out (`mem_info_vram_total`) of the PCI device
@@ -167,7 +277,7 @@ pub struct DeviceMemory {
     pub uma: bool,
     /// The carve-out (`mem_info_vram_total`), when sysfs exposes it.
     pub carveout_total: Option<u64>,
-    /// `MemAvailable` plus TTM's pool estimate ([`host_available_from`]).
+    /// `MemAvailable - CMA` plus TTM's pool estimate ([`host_available_from`]).
     pub host_available: Option<u64>,
 }
 
@@ -180,7 +290,7 @@ pub fn gtt_backed(device_total: u64, carveout_total: Option<u64>) -> bool {
 
 /// Free bytes a device allocation can take. Discrete GPUs and carve-out
 /// APUs: `hipMemGetInfo`'s free figure. GTT-backed APUs:
-/// `min(hipMemGetInfo free, MemAvailable + TTM pool)`; `None` when the host
+/// `min(hipMemGetInfo free, MemAvailable - CMA + TTM pool)`; `None` when the host
 /// side is unreadable there (callers refuse rather than size blind).
 pub fn device_free_from(memory: DeviceMemory) -> Option<u64> {
     if !memory.uma || !gtt_backed(memory.device_total, memory.carveout_total) {
@@ -189,11 +299,201 @@ pub fn device_free_from(memory: DeviceMemory) -> Option<u64> {
     Some(memory.device_free.min(memory.host_available?))
 }
 
+/// Apply the emu capacity cap (EMU-DESIGN.md §3) to a raw `(free, total)`
+/// already clamped by [`device_free_from`]. Pure; `Gpu::device_mem_info` feeds
+/// it a ledger snapshot only while an emu profile is installed.
+///
+/// `used` is this process's managed charge (committed + pending), never
+/// `real_total - real_free`.
+///
+/// - Discrete: `total = device_bytes`,
+///   `free = min(raw_free, total - used.device)`.
+/// - UMA: `total = G` (the GTT limit),
+///   `free = min(raw_free, G - used.gtt, S - used.shared_host)`; a device
+///   backing also consumes GTT and shared bytes, so those two dimensions
+///   already include device charges.
+pub fn emu_capped_mem_info(
+    raw_free: u64,
+    snapshot: &hipfire_config::emu_budget::BudgetSnapshot,
+) -> (u64, u64) {
+    let limits = &snapshot.limits;
+    let used = |committed: u64, pending: u64| committed.saturating_add(pending);
+    let total = if limits.uma {
+        limits.gtt_bytes.unwrap_or(limits.device_bytes)
+    } else {
+        limits.device_bytes
+    };
+    let mut free = raw_free.min(limits.device_bytes.saturating_sub(used(
+        snapshot.committed.device_bytes,
+        snapshot.pending.device_bytes,
+    )));
+    if limits.uma {
+        if let Some(gtt) = limits.gtt_bytes {
+            free = free.min(gtt.saturating_sub(used(
+                snapshot.committed.gtt_bytes,
+                snapshot.pending.gtt_bytes,
+            )));
+        }
+        if let Some(shared) = limits.shared_host_bytes {
+            free = free.min(shared.saturating_sub(used(
+                snapshot.committed.shared_host_bytes,
+                snapshot.pending.shared_host_bytes,
+            )));
+        }
+    }
+    (free, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    /// hipx (Strix Halo, Ubuntu 7.0 generic, KHO on): `CmaTotal` 0, the KHO
+    /// scratch (760 + 8,476 + 4,300 MiB) in the per-zone `cma` lines, and
+    /// `CmaFree` down to 0.45 GiB once page cache fills it.
+    const HIPX_MEMINFO: &str = "MemAvailable: 70000080 kB\nCmaTotal: 0 kB\nCmaFree: 470684 kB\n";
+    const HIPX_ZONEINFO: &str = "\
+Node 0, zone      DMA
+  pages free     3840
+        boost    0
+        managed  3840
+        cma      0
+      nr_free_pages 3840
+      nr_free_cma  0
+Node 0, zone    DMA32
+  pages free     123824
+        boost    0
+        spanned  1044480
+        managed  353871
+        cma      194560
+      nr_free_pages 123824
+      nr_free_cma  61919
+Node 0, zone   Normal
+  pages free     5000000
+        managed  32000000
+        cma      3270656
+      nr_free_pages 5000000
+      nr_free_cma  3000000
+Node 0, zone  Movable
+        cma      0
+      nr_free_cma  0
+Node 0, zone   Device
+        cma      0
+      nr_free_cma  0
+";
+    const HIPX_KHO_BYTES: u64 = 13_536 << 20;
+
+    #[test]
+    fn zoneinfo_cma_sums_the_cma_lines_only() {
+        assert_eq!(zoneinfo_cma_pages(HIPX_ZONEINFO), 3_465_216);
+        assert_eq!(zoneinfo_cma_pages(HIPX_ZONEINFO) * 4096, HIPX_KHO_BYTES);
+        // `nr_free_cma` and malformed lines never count.
+        assert_eq!(
+            zoneinfo_cma_pages("      nr_free_cma  99\n        cma      x\n"),
+            0
+        );
+        assert_eq!(zoneinfo_cma_pages(""), 0);
+    }
+
+    #[test]
+    fn hipx_available_excludes_the_whole_kho_scratch() {
+        let expected = 70_000_080 * 1024 - HIPX_KHO_BYTES;
+        assert_eq!(
+            meminfo_available_bytes(HIPX_MEMINFO, Some(HIPX_ZONEINFO)),
+            Some(expected)
+        );
+        assert_eq!(
+            host_available_from(HIPX_MEMINFO, Some(HIPX_ZONEINFO), 0, 0),
+            Some(expected)
+        );
+        assert_eq!(
+            cma_region_bytes(HIPX_MEMINFO, Some(HIPX_ZONEINFO)),
+            HIPX_KHO_BYTES
+        );
+        assert_eq!(
+            kho_scratch_from(HIPX_MEMINFO, Some(HIPX_ZONEINFO)),
+            Some(HIPX_KHO_BYTES)
+        );
+    }
+
+    #[test]
+    fn no_cma_host_is_unchanged() {
+        let host = "MemAvailable: 4096 kB\n";
+        let zoneinfo = "Node 0, zone   Normal\n        cma      0\n      nr_free_cma  0\n";
+        assert_eq!(meminfo_available_bytes(host, Some(zoneinfo)), Some(4 << 20));
+        assert_eq!(meminfo_available_bytes(host, None), Some(4 << 20));
+        assert_eq!(cma_region_bytes(host, Some(zoneinfo)), 0);
+        assert_eq!(kho_scratch_from(host, Some(zoneinfo)), None);
+        assert_eq!(meminfo_available_bytes("CmaFree: 4096 kB\n", None), None);
+    }
+
+    #[test]
+    fn real_cma_area_subtracts_the_region_and_is_not_kho() {
+        let host = "MemAvailable: 16777216 kB\nCmaTotal: 4194304 kB\nCmaFree: 1048576 kB\n";
+        let zoneinfo =
+            "Node 0, zone   Normal\n        cma      1048576\n      nr_free_cma  262144\n";
+        assert_eq!(
+            meminfo_available_bytes(host, Some(zoneinfo)),
+            Some(12 * GIB)
+        );
+        assert_eq!(kho_scratch_from(host, Some(zoneinfo)), None);
+        // Without zoneinfo CmaTotal alone is the region.
+        assert_eq!(meminfo_available_bytes(host, None), Some(12 * GIB));
+    }
+
+    #[test]
+    fn cma_free_above_the_region_wins() {
+        // No zoneinfo and no CmaTotal: CmaFree is the only figure.
+        let host = "MemAvailable: 81450396 kB\nCmaTotal: 0 kB\nCmaFree: 13858816 kB\n";
+        assert_eq!(
+            meminfo_available_bytes(host, None),
+            Some((81_450_396 - 13_858_816) * 1024)
+        );
+        // CmaFree 5 GiB over a 4 GiB region.
+        let host = "MemAvailable: 16777216 kB\nCmaTotal: 4194304 kB\nCmaFree: 5242880 kB\n";
+        assert_eq!(meminfo_available_bytes(host, None), Some(11 * GIB));
+    }
+
+    #[test]
+    fn zoneinfo_unreadable_falls_back_to_cma_total() {
+        let host = "MemAvailable: 16777216 kB\nCmaTotal: 2097152 kB\nCmaFree: 1048576 kB\n";
+        assert_eq!(meminfo_available_bytes(host, None), Some(14 * GIB));
+        assert_eq!(cma_region_bytes(host, None), 2 * GIB);
+        assert_eq!(kho_scratch_from(HIPX_MEMINFO, None), None);
+    }
+
+    #[test]
+    fn meminfo_available_saturates_when_cma_exceeds_available() {
+        assert_eq!(
+            meminfo_available_bytes("MemAvailable: 1024 kB\nCmaFree: 2048 kB\n", None),
+            Some(0)
+        );
+        let zoneinfo = "Node 0, zone   Normal\n        cma      262144\n";
+        assert_eq!(
+            meminfo_available_bytes("MemAvailable: 1024 kB\n", Some(zoneinfo)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn meminfo_available_rejects_byte_count_overflow() {
+        assert_eq!(
+            meminfo_available_bytes("MemAvailable: 18446744073709551615 kB\n", None),
+            None
+        );
+    }
+
+    #[test]
+    fn kho_warning_text_and_threshold() {
+        assert_eq!(
+            kho_scratch_warning(HIPX_KHO_BYTES).as_deref(),
+            Some("KHO scratch reserves 13.2 GiB unusable by the GPU; boot with kho=off to reclaim it")
+        );
+        assert_eq!(kho_scratch_warning(KHO_WARN_BYTES - 1), None);
+        assert!(kho_scratch_warning(KHO_WARN_BYTES).is_some());
+    }
 
     /// `/proc/meminfo` text from `(field, MiB)` pairs.
     fn meminfo(fields: &[(&str, u64)]) -> String {
@@ -255,7 +555,7 @@ mod tests {
             device_total: HALO_DEVICE_TOTAL,
             uma: true,
             carveout_total: Some(HALO_CARVEOUT),
-            host_available: host_available_from(meminfo, live_gtt, HALO_POOL_PAGES),
+            host_available: host_available_from(meminfo, None, live_gtt, HALO_POOL_PAGES),
         }
     }
 
@@ -291,7 +591,7 @@ mod tests {
             device_total: 32 * GIB,
             uma: false,
             carveout_total: Some(32 * GIB),
-            host_available: host_available_from(&host, 0, HALO_POOL_PAGES),
+            host_available: host_available_from(&host, None, 0, HALO_POOL_PAGES),
         };
         assert_eq!(device_free_from(memory), Some(30 * GIB));
         // Unreadable host memory does not matter there either.
@@ -313,7 +613,7 @@ mod tests {
             device_total: 96 * GIB,
             uma: true,
             carveout_total: Some(96 * GIB),
-            host_available: host_available_from(&host, 0, HALO_POOL_PAGES),
+            host_available: host_available_from(&host, None, 0, HALO_POOL_PAGES),
         };
         assert_eq!(device_free_from(memory), Some(90 * GIB));
     }
@@ -367,7 +667,115 @@ mod tests {
         };
         assert_eq!(device_free_from(unknown), Some(13_824 << 20));
         // An unreadable TTM pool counts as empty.
-        let no_pool = host_available_from(&host, 0, 0);
+        let no_pool = host_available_from(&host, None, 0, 0);
         assert_eq!(no_pool, Some(13_824 << 20));
+    }
+
+    mod emu_cap {
+        use super::*;
+        use hipfire_config::emu_budget::{BudgetLimits, BudgetSnapshot, BudgetUsage};
+
+        fn discrete(cap: u64, committed: u64, pending: u64) -> BudgetSnapshot {
+            BudgetSnapshot {
+                limits: BudgetLimits {
+                    device_bytes: cap,
+                    gtt_bytes: None,
+                    shared_host_bytes: None,
+                    uma: false,
+                },
+                committed: BudgetUsage {
+                    device_bytes: committed,
+                    ..Default::default()
+                },
+                pending: BudgetUsage {
+                    device_bytes: pending,
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn uma(g: u64, s: u64, committed: BudgetUsage, pending: BudgetUsage) -> BudgetSnapshot {
+            BudgetSnapshot {
+                limits: BudgetLimits {
+                    device_bytes: g,
+                    gtt_bytes: Some(g),
+                    shared_host_bytes: Some(s),
+                    uma: true,
+                },
+                committed,
+                pending,
+            }
+        }
+
+        #[test]
+        fn discrete_total_is_the_profile_capacity() {
+            let snap = discrete(16 * GIB, 0, 0);
+            assert_eq!(emu_capped_mem_info(32 * GIB, &snap), (16 * GIB, 16 * GIB));
+        }
+
+        #[test]
+        fn discrete_free_subtracts_committed_and_pending() {
+            let snap = discrete(16 * GIB, 5 * GIB, 2 * GIB);
+            assert_eq!(emu_capped_mem_info(30 * GIB, &snap), (9 * GIB, 16 * GIB));
+        }
+
+        #[test]
+        fn discrete_free_is_clamped_by_real_free() {
+            // Another process holds the card: real free is below the virtual room.
+            let snap = discrete(16 * GIB, GIB, 0);
+            assert_eq!(emu_capped_mem_info(3 * GIB, &snap), (3 * GIB, 16 * GIB));
+        }
+
+        #[test]
+        fn discrete_over_charge_saturates_to_zero() {
+            let snap = discrete(16 * GIB, 15 * GIB, 3 * GIB);
+            assert_eq!(emu_capped_mem_info(30 * GIB, &snap), (0, 16 * GIB));
+        }
+
+        #[test]
+        fn uma_total_is_g_and_free_is_min_of_gtt_and_shared_room() {
+            let (g, s) = (16 * GIB, 27 * GIB);
+            let empty = uma(g, s, BudgetUsage::default(), BudgetUsage::default());
+            // Plenty of real memory: the GTT limit G binds.
+            assert_eq!(emu_capped_mem_info(100 * GIB, &empty), (g, g));
+            // 10 GiB of GTT-pinned host + 4 GiB device: gtt used 14, shared 14.
+            let used = BudgetUsage {
+                device_bytes: 4 * GIB,
+                host_bytes: 10 * GIB,
+                gtt_bytes: 14 * GIB,
+                shared_host_bytes: 14 * GIB,
+            };
+            let snap = uma(g, s, used, BudgetUsage::default());
+            assert_eq!(emu_capped_mem_info(100 * GIB, &snap), (2 * GIB, g));
+        }
+
+        #[test]
+        fn uma_shared_host_room_can_bind_before_gtt() {
+            // Userptr host-application bytes consume only shared-host room.
+            let (g, s) = (16 * GIB, 27 * GIB);
+            let used = BudgetUsage {
+                device_bytes: 0,
+                host_bytes: 25 * GIB,
+                gtt_bytes: 0,
+                shared_host_bytes: 25 * GIB,
+            };
+            let snap = uma(g, s, used, BudgetUsage::default());
+            assert_eq!(emu_capped_mem_info(100 * GIB, &snap), (2 * GIB, g));
+        }
+
+        #[test]
+        fn uma_pending_reservations_participate_and_real_free_clamps() {
+            let (g, s) = (16 * GIB, 27 * GIB);
+            let pending = BudgetUsage {
+                device_bytes: 6 * GIB,
+                host_bytes: 0,
+                gtt_bytes: 6 * GIB,
+                shared_host_bytes: 6 * GIB,
+            };
+            let snap = uma(g, s, BudgetUsage::default(), pending);
+            assert_eq!(emu_capped_mem_info(100 * GIB, &snap), (10 * GIB, g));
+            // The existing UMA-safe real free (MemAvailable-clamped) still wins.
+            assert_eq!(emu_capped_mem_info(3 * GIB, &snap), (3 * GIB, g));
+        }
     }
 }

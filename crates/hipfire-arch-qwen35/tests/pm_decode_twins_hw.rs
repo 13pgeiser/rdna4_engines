@@ -98,12 +98,20 @@ const SYMBOLS: &[Symbol] = &[
     Symbol {
         name: "gemv_mq4g256v2_residual",
         k: 28,
-        args: &[Arg::Weight { ptr: 0, m: 24 }, Arg::X { ptr: 8 }, Arg::Y { ptr: 16, m: 24 }],
+        args: &[
+            Arg::Weight { ptr: 0, m: 24 },
+            Arg::X { ptr: 8 },
+            Arg::Y { ptr: 16, m: 24 },
+        ],
     },
     Symbol {
         name: "gemv_mq4g256v2_multirow_r2",
         k: 28,
-        args: &[Arg::Weight { ptr: 0, m: 24 }, Arg::X { ptr: 8 }, Arg::Y { ptr: 16, m: 24 }],
+        args: &[
+            Arg::Weight { ptr: 0, m: 24 },
+            Arg::X { ptr: 8 },
+            Arg::Y { ptr: 16, m: 24 },
+        ],
     },
 ];
 
@@ -114,7 +122,10 @@ fn env_path(key: &str, default: &str) -> PathBuf {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn rd_i32(kernarg: &[u8], off: usize) -> i32 {
@@ -126,7 +137,8 @@ fn rd_u64(kernarg: &[u8], off: usize) -> u64 {
 }
 
 fn mapped_len(gpu: &Gpu, t: &GpuTensor) -> usize {
-    gpu.vmm_mapped_bytes(t).map_or(t.buf.size(), |m| m.min(t.buf.size()))
+    gpu.vmm_mapped_bytes(t)
+        .map_or(t.buf.size(), |m| m.min(t.buf.size()))
 }
 
 /// Whole-surface snapshot of the state a decode step reads and writes.
@@ -202,7 +214,11 @@ fn download_args(gpu: &Gpu, sym: &Symbol, kernarg: &[u8]) -> Vec<(usize, Vec<u8>
             let mut b = vec![0u8; len];
             if len > 0 {
                 let va = rd_u64(kernarg, off) as *mut std::ffi::c_void;
-                assert!(!va.is_null(), "{}: null pointer @{off} with {len} bytes", sym.name);
+                assert!(
+                    !va.is_null(),
+                    "{}: null pointer @{off} with {len} bytes",
+                    sym.name
+                );
                 // SAFETY: non-owning view of the live model/scratch allocation
                 // the recorded launch addresses; `len` is the kernel's own
                 // declared extent of that argument.
@@ -224,14 +240,23 @@ fn capture_w1_decode_inputs() {
         ("HIPFIRE_GRAPH", "0"),
         ("HIPFIRE_AR_GRAPH", "0"),
     ] {
-        assert_eq!(std::env::var(key).as_deref(), Ok(want), "{key} must be {want}");
+        assert_eq!(
+            std::env::var(key).as_deref(),
+            Ok(want),
+            "{key} must be {want}"
+        );
     }
     let model = env_path(
         "PMDT_MODEL",
         "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
     );
-    let out = env_path("PMDT_OUT", "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs");
-    let ctx: usize = std::env::var("PMDT_CTX").ok().map_or(512, |v| v.parse().unwrap());
+    let out = env_path(
+        "PMDT_OUT",
+        "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs",
+    );
+    let ctx: usize = std::env::var("PMDT_CTX")
+        .ok()
+        .map_or(512, |v| v.parse().unwrap());
 
     let mut gpu = Gpu::init().expect("gpu init");
     assert_eq!(gpu.arch, "gfx1201", "capture is gfx1201-only");
@@ -243,27 +268,45 @@ fn capture_w1_decode_inputs() {
     // allocations and first-use kernel loads stay out of the recorded step.
     let prompt: Vec<u32> = (0..ctx as u32).map(|i| 10 + (i % 1000)).collect();
     {
-        let ModelSlot { weights, config, kv_cache, dn_state, scratch, .. } = &mut slot;
+        let ModelSlot {
+            weights,
+            config,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = &mut slot;
         qwen35::forward_prefill_batch(
             &mut gpu, weights, config, &prompt, 0, kv_cache, dn_state, scratch, None, None, None,
             None,
         )
         .expect("prefill");
-        qwen35::forward_scratch(&mut gpu, weights, config, TOKEN, ctx, kv_cache, dn_state, scratch)
-            .expect("warm decode");
+        qwen35::forward_scratch(
+            &mut gpu, weights, config, TOKEN, ctx, kv_cache, dn_state, scratch,
+        )
+        .expect("warm decode");
     }
     let pos = ctx + 1;
     let before = snapshot(&gpu, &slot);
     let frame = rdna_compute::norm::gdn_requant_frame_checkpoint();
 
     {
-        let ModelSlot { weights, config, kv_cache, dn_state, scratch, .. } = &mut slot;
+        let ModelSlot {
+            weights,
+            config,
+            kv_cache,
+            dn_state,
+            scratch,
+            ..
+        } = &mut slot;
         qwen35::prepare_scratch_inputs(&mut gpu, weights, config, TOKEN, pos, scratch)
             .expect("prepare inputs");
         gpu.hip.device_synchronize().expect("sync");
         gpu.replay.begin_capture().expect("begin capture");
-        qwen35::forward_scratch(&mut gpu, weights, config, TOKEN, pos, kv_cache, dn_state, scratch)
-            .expect("recorded decode");
+        qwen35::forward_scratch(
+            &mut gpu, weights, config, TOKEN, pos, kv_cache, dn_state, scratch,
+        )
+        .expect("recorded decode");
         gpu.hip.device_synchronize().expect("sync");
     }
     let summary = gpu.replay.finish_capture().expect("finish capture");
@@ -271,7 +314,15 @@ fn capture_w1_decode_inputs() {
         .replay
         .recorded_launches()
         .iter()
-        .map(|l| (l.kernel.clone(), l.grid, l.block, l.shared_mem, l.kernarg.clone()))
+        .map(|l| {
+            (
+                l.kernel.clone(),
+                l.grid,
+                l.block,
+                l.shared_mem,
+                l.kernarg.clone(),
+            )
+        })
         .collect();
     let recorded_logits = logits(&gpu, &slot);
     let recorded_state = snapshot(&gpu, &slot);
@@ -284,10 +335,16 @@ fn capture_w1_decode_inputs() {
     let prefix = |gpu: &mut Gpu, slot: &mut ModelSlot, count: usize| {
         restore(gpu, slot, &before);
         rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame);
-        let ModelSlot { weights, config, scratch, .. } = slot;
+        let ModelSlot {
+            weights,
+            config,
+            scratch,
+            ..
+        } = slot;
         qwen35::prepare_scratch_inputs(gpu, weights, config, TOKEN, pos, scratch)
             .expect("prepare inputs");
-        gpu.replay_recorded_hip_prefix(count).expect("prefix replay");
+        gpu.replay_recorded_hip_prefix(count)
+            .expect("prefix replay");
         gpu.hip.device_synchronize().expect("sync");
     };
 
@@ -295,7 +352,10 @@ fn capture_w1_decode_inputs() {
     prefix(&mut gpu, &mut slot, launches.len());
     let replay_logits = logits(&gpu, &slot);
     let replay_state = snapshot(&gpu, &slot);
-    assert!(replay_logits == recorded_logits, "full-prefix replay logits differ from recorded step");
+    assert!(
+        replay_logits == recorded_logits,
+        "full-prefix replay logits differ from recorded step"
+    );
     assert!(
         replay_state.tensors == recorded_state.tensors,
         "full-prefix replay recurrent/KV differ from recorded step"
@@ -303,9 +363,17 @@ fn capture_w1_decode_inputs() {
     eprintln!("restore check: full-prefix replay byte-identical (logits, KV, recurrent)");
 
     for sym in SYMBOLS {
-        let hits: Vec<usize> =
-            launches.iter().enumerate().filter(|(_, l)| l.0 == sym.name).map(|(i, _)| i).collect();
-        assert!(!hits.is_empty(), "{} not launched in the decode step", sym.name);
+        let hits: Vec<usize> = launches
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.0 == sym.name)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "{} not launched in the decode step",
+            sym.name
+        );
         let mut picks = vec![(0usize, hits[0])];
         if hits.len() > 1 {
             picks.push((hits.len() - 1, hits[hits.len() - 1]));
@@ -315,7 +383,8 @@ fn capture_w1_decode_inputs() {
             prefix(&mut gpu, &mut slot, index);
             let pre = download_args(&gpu, sym, &kernarg);
             let mut blob = kernarg.clone();
-            gpu.launch_kernel_blob(&kernel, grid, block, shm, &mut blob).expect("callsite launch");
+            gpu.launch_kernel_blob(&kernel, grid, block, shm, &mut blob)
+                .expect("callsite launch");
             let post = download_args(&gpu, sym, &kernarg);
             let dir = out.join(sym.name).join(format!("occ{ordinal}"));
             std::fs::create_dir_all(&dir).expect("mkdir");
@@ -351,9 +420,16 @@ fn capture_w1_decode_inputs() {
                 "restore_check": "full-prefix replay logits/KV/recurrent byte-identical",
                 "files": files,
             });
-            std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta).unwrap())
-                .expect("write meta");
-            eprintln!("captured {} occ{ordinal} launch {index} -> {}", sym.name, dir.display());
+            std::fs::write(
+                dir.join("meta.json"),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .expect("write meta");
+            eprintln!(
+                "captured {} occ{ordinal} launch {index} -> {}",
+                sym.name,
+                dir.display()
+            );
         }
     }
 }

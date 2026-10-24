@@ -256,7 +256,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
-            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkvza_mq4g256v2_wmma_f16"));
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
+                "gemm_qkvza_mq4g256v2_wmma_f16",
+            ));
         }
         if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
@@ -385,7 +387,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
-            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkv_mq4g256v2_wmma_f16"));
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
+                "gemm_qkv_mq4g256v2_wmma_f16",
+            ));
         }
         if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(
@@ -511,7 +515,9 @@ impl Gpu {
         split_verify_capture: bool,
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
-            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_gate_up_mq4g256v2_wmma_f16"));
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
+                "gemm_gate_up_mq4g256v2_wmma_f16",
+            ));
         }
         if !self.arch_caps.supports_dflash_f16_projection_fusions() {
             return Err(hip_bridge::HipError::new(

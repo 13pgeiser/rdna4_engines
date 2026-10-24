@@ -240,6 +240,35 @@ Then supersede `q36a3b-wt2-f32.kldref.bin` (8160 tokens) as the a3b baseline and
 **re-measure `.mq2`** to establish the new baseline number. Every prior a3b KLD
 in the investigation doc is tied to the old ref and does not transfer.
 
+### Scoring a prefill route against the ref
+
+`--kv-mode f32` makes `eval_hipfire` score per token: it measures the decode
+path and exercises no batched prefill route. To measure a prefill route, use
+q8 KV with whole-window prefill:
+
+```bash
+HIPFIRE_PREFILL_MAX_BATCH=512 HIPFIRE_PREFILL_CHUNK_ROWS=512 \
+./target/release/examples/eval_hipfire --model <artifact> \
+    --ref ~/.hipfire/kldref/q36a3b-wt2-f32.kldref.bin --kv-mode q8 \
+    --scoring-mode prefill-whole
+```
+
+`prefill-whole` (qwen35 only, opt-in) forwards each n_ctx window as one prefill
+call and scores the same reference positions. The split `--scoring-mode
+prefill` instead runs the 256-row prefix and the 255+1-row scored region as
+two calls, and its forward calls are unchanged. The whole-window plan is
+`eval_common::whole_window_plan`. The shared scoring (`kld_from_block`,
+`seq_stats`, `write_hfkseq`) was extracted into `eval_common` with its math and
+output preserved. A fixed-fixture golden checks its KLD/NLL/HFKSEQ output
+against a standalone copy of the pre-change scoring code. CPU
+tests: `cargo test -p hipfire-runtime --lib eval_common`. Compare arms only
+within one protocol. Measured on
+Qwen3.6-35B-A3B
+against the 8160-token ref (2026-10-18):
+- stock `.mq4r`: 0.206 under q8 + prefill-whole;
+- interim symmetric `.mq4rs`: 0.111 under q8 + prefill-whole, but 0.084 under
+  f32 per-token scoring.
+
 ---
 
 ## Failure modes

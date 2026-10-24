@@ -20,7 +20,7 @@ void gemv_mq2g256_lloyd_moe_gate_up_wave64x8_gfx942_candidate(
     const int* __restrict__ topk_indices,
     const float* __restrict__ x_rot,
     float* __restrict__ y_gate,
-    float* __restrict__ y_up
+    float* __restrict__ y_up, int n_experts
 ) {
     constexpr int M = 4096;
     constexpr int MI = 2048;
@@ -36,6 +36,13 @@ void gemv_mq2g256_lloyd_moe_gate_up_wave64x8_gfx942_candidate(
     const int krank = blockIdx.y;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (lane == 0) {
+            if (row < MI) y_gate[(long long)krank * MI + row] = 0.0f;
+            else          y_up[(long long)krank * MI + (row - MI)] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ weights =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const char* __restrict__ row_ptr = weights + (long long)row * ROW_BYTES;

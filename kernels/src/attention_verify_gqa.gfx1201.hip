@@ -11,8 +11,9 @@
 // `attention_flash_{q8_0,fp8_e4m3}_tile_batched`, byte for byte, and
 // `attention_verify_reduce_gfx1201` reduces them byte-identically to
 // `attention_flash_asym_reduce_batched`. Shape is compile-time: head_dim 256,
-// GQA group 6, tile 128, full causal, legacy single-slot KV (the host admits
-// nothing else).
+// GQA group 6 (8 rows per workgroup; fp8 and Q8) or, fp8 only, GQA group 8
+// (`attention_verify_gqa_fp8_gqa8_gfx1201`, 6 rows per workgroup), tile 128,
+// full causal, legacy single-slot KV (the host admits nothing else).
 //
 // Reference arithmetic reproduced (hipcc -O3 gfx1201 ISA of the tile_batched
 // pair; reference lane l covers dims 8l..8l+7):
@@ -45,8 +46,16 @@
 #define VA_WAVES 8
 #define VA_THREADS (VA_WAVES * 32)
 #define VA_ROWS 8
+// Group-8 shape (A3B, H16/KV2): 6 rows x 8 heads = 48 pairs = 6 per wave.
+#define VA_GROUP8 8
+#define VA_ROWS8 6
 // (row, head) pairs per wave: 8 rows x 6 heads over 8 waves.
 #define VA_PPW (VA_ROWS * VA_GROUP / VA_WAVES)
+// The pair loops are specialised for 1..6 pairs per wave (VA_TILES below);
+// every row/group shape must land on exactly VA_PPW pairs per wave.
+static_assert(VA_ROWS * VA_GROUP == VA_WAVES * VA_PPW && VA_ROWS8 * VA_GROUP8 == VA_WAVES * VA_PPW &&
+                  VA_PPW == 6,
+              "VerifyAttn row groups must hold 6 (row, head) pairs per wave");
 // Buffer descriptor dword3 for gfx12 raw buffer loads (as the decode tile).
 #define VA_RSRC_FLAGS 0x31004000u
 
@@ -304,7 +313,10 @@ __device__ __forceinline__ void va_tiles(
     }
 }
 
-template <int KV>
+// GROUP q heads x ROWS query rows per workgroup (6 x 8 or 8 x 6): both give
+// VA_PPW = 6 (row, head) pairs per wave. The defaults are the group-6 shape,
+// which the lane kernel (attention_verify_lanes.gfx1201.hip) instantiates.
+template <int KV, int GROUP = VA_GROUP, int ROWS = VA_ROWS>
 __device__ __forceinline__ void va_verify_gqa(
     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
@@ -312,13 +324,13 @@ __device__ __forceinline__ void va_verify_gqa(
     int batch_offset, float scale_attn) {
     __shared__ __attribute__((aligned(16))) float sc_lds[VA_WAVES][VA_PPW][VA_TILE];
 
-    const int n_heads = n_kv_heads * VA_GROUP;
-    const int n_rg = (n_rows + VA_ROWS - 1) / VA_ROWS;
+    const int n_heads = n_kv_heads * GROUP;
+    const int n_rg = (n_rows + ROWS - 1) / ROWS;
     const int kv_h = (int)blockIdx.x / n_rg;
     const int rg = (int)blockIdx.x - kv_h * n_rg;
     if (kv_h >= n_kv_heads) return;
-    const int row0 = rg * VA_ROWS;
-    const int rows_here = min(VA_ROWS, n_rows - row0);
+    const int row0 = rg * ROWS;
+    const int rows_here = min(ROWS, n_rows - row0);
 
     const int wave = __builtin_amdgcn_readfirstlane((int)threadIdx.x >> 5);
     const int rl = (int)threadIdx.x & 15;
@@ -332,8 +344,8 @@ __device__ __forceinline__ void va_verify_gqa(
     // The reference grid covers tiles < max_tiles only; never write past it.
     const int n_tiles = min((group_len + VA_TILE - 1) / VA_TILE, max_tiles);
 
-    // This wave's pairs: p = wave + 8j -> (row p/6, head p%6); valid pairs
-    // (row < rows_here) are the prefix j < np.
+    // This wave's pairs: p = wave + 8j -> (row p/GROUP, head p%GROUP); valid
+    // pairs (row < rows_here) are the prefix j < np.
     int np = 0;
     int pair_len[VA_PPW];
     size_t pair_base[VA_PPW];
@@ -341,8 +353,8 @@ __device__ __forceinline__ void va_verify_gqa(
 #pragma unroll
     for (int j = 0; j < VA_PPW; ++j) {
         const int p = wave + VA_WAVES * j;
-        const int r = p / VA_GROUP;
-        const int head = kv_h * VA_GROUP + (p - r * VA_GROUP);
+        const int r = p / GROUP;
+        const int head = kv_h * GROUP + (p - r * GROUP);
         pair_base[j] = ((size_t)(row0 + r) * n_heads + head) * max_tiles;
         pair_len[j] = (r < rows_here) ? positions[batch_offset + row0 + r] + 1 : 0;
         if (r < rows_here) {
@@ -403,6 +415,28 @@ __global__ void attention_verify_gqa_fp8_gfx1201(
     va_verify_gqa<VA_KV_FP8>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
                              batch_offset, scale_attn);
 }
+
+// Group-8 fp8 twin (n_heads / n_kv_heads == 8: H16/KV2 A3B). Same 10-argument
+// ABI and `[row][head][max_tiles][2 + 256]` partials as the entries above;
+// one workgroup serves VA_ROWS8 = 6 rows x 8 heads = 48 (row, head) pairs, so
+// every wave still owns exactly VA_PPW = 6 pairs (wave w = head w of rows
+// 0..5) and the register / LDS footprint equals the group-6 kernel's. Grid:
+// [ceil(n_rows/6) * n_kv_heads, S], block 256; the reduce below is group
+// agnostic (n_heads is an argument). The reduce is shared, not copied.
+// The lane module (lane_fa.rs concatenates this file with the lane entries)
+// defines VA_LANE_MODULE so it keeps exporting exactly the entries it exported
+// before the group-8 twin existed.
+#ifndef VA_LANE_MODULE
+extern "C" __launch_bounds__(VA_THREADS, 1)
+__global__ void attention_verify_gqa_fp8_gqa8_gfx1201(
+    const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
+    const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
+    int batch_offset, float scale_attn) {
+    va_verify_gqa<VA_KV_FP8, VA_GROUP8, VA_ROWS8>(q, k_cache, v_cache, partials, positions, n_rows,
+                                                  n_kv_heads, max_tiles, batch_offset, scale_attn);
+}
+#endif
 
 // Byte-identical parallel twin of attention_flash_asym_reduce_batched at
 // head_dim 256: one thread per dim, each running the reference's serial tile

@@ -102,7 +102,7 @@ fn main() {
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{
-        self, DflashFusionCtx, DeltaNetState, LayerType, LayerWeights, PrefillBatchScratch,
+        self, DeltaNetState, DflashFusionCtx, LayerType, LayerWeights, PrefillBatchScratch,
         Qwen35Scratch,
     };
     use hipfire_runtime::hfq::HfqFile;
@@ -195,7 +195,11 @@ fn main() {
     }
 
     const CHUNK: usize = 384; // gfx1201 arch chunk
-    assert_eq!(n_tokens % CHUNK, 0, "N={n_tokens} must be a multiple of {CHUNK}");
+    assert_eq!(
+        n_tokens % CHUNK,
+        0,
+        "N={n_tokens} must be a multiple of {CHUNK}"
+    );
     assert!(qstride >= 1);
 
     // ---------------- load model ----------------
@@ -232,7 +236,11 @@ fn main() {
     }
 
     let (nh, nkv, hd) = (config.n_heads, config.n_kv_heads, config.head_dim);
-    assert_eq!((nh, nkv, hd), (24, 4, 256), "FA2 gfx1201 needs H24/KV4/D256");
+    assert_eq!(
+        (nh, nkv, hd),
+        (24, 4, 256),
+        "FA2 gfx1201 needs H24/KV4/D256"
+    );
     let q_dim = nh * hd;
     let kv_dim = nkv * hd;
     let row_stride = nkv * (hd / 32) * 34; // stored-q8 row stride (self-check A only)
@@ -258,7 +266,11 @@ fn main() {
             .split_whitespace()
             .map(|s| s.parse().unwrap_or_else(|_| panic!("bad prompt id: {s}")))
             .collect();
-        assert!(ids.len() >= n_tokens, "prompt file has {} ids, need {n_tokens}", ids.len());
+        assert!(
+            ids.len() >= n_tokens,
+            "prompt file has {} ids, need {n_tokens}",
+            ids.len()
+        );
         eprintln!("prompt: {} ids from {}", ids.len(), p.display());
         format!("file:{}[..{n_tokens}]", p.display())
     } else if let Some(s) = prompt_range {
@@ -292,7 +304,11 @@ fn main() {
         }
         eprintln!(
             "=== screen layer L={want} ({}; prompt {prompt_desc}) ===",
-            if is_fa { "dense FullAttn" } else { "non-FA, census-only" }
+            if is_fa {
+                "dense FullAttn"
+            } else {
+                "non-FA, census-only"
+            }
         );
 
         // Fresh cache + DN state per layer so layers never see each other.
@@ -342,7 +358,9 @@ fn main() {
             let k = gpu.download_f32(&pbs.fa_k_batch).expect("fa_k");
             let v = gpu.download_f32(&pbs.fa_v_batch).expect("fa_v");
             let g = gpu.download_f32(&pbs.fa_gate_batch).expect("fa_gate");
-            let o = gpu.download_f32(&pbs.fa_attn_out_batch).expect("fa_attn_out");
+            let o = gpu
+                .download_f32(&pbs.fa_attn_out_batch)
+                .expect("fa_attn_out");
             assert_eq!(q.len(), CHUNK * q_dim, "fa_q shape c={c}");
             assert_eq!(k.len(), CHUNK * kv_dim, "fa_k shape c={c}");
             assert_eq!(v.len(), CHUNK * kv_dim, "fa_v shape c={c}");
@@ -379,7 +397,10 @@ fn main() {
             ("Oeng", &o_all),
             ("gate", &g_all),
         ] {
-            assert!(v.iter().all(|x| x.is_finite()), "non-finite in tapped {name}");
+            assert!(
+                v.iter().all(|x| x.is_finite()),
+                "non-finite in tapped {name}"
+            );
         }
         // §8.1(B) attribution census on the raw pre-quant taps (K and V).
         tap_census("K", &k_all, n_tokens, nkv, hd, kv_dim);
@@ -401,7 +422,9 @@ fn main() {
         );
         // Self-check A: stored-q8 blocks vs raw taps (proves block parse AND
         // that fa_k/fa_v are the true pre-writer rows).
-        self_check_a(&k_all, &v_all, &k_stored, &v_stored, n_tokens, nkv, hd, kv_dim, row_stride);
+        self_check_a(
+            &k_all, &v_all, &k_stored, &v_stored, n_tokens, nkv, hd, kv_dim, row_stride,
+        );
 
         // Kernel differential on the FINAL chunk (Q from fa taps = still
         // resident in pbs after the last chunk; K/V = full prefix cache).
@@ -423,7 +446,10 @@ fn main() {
         .unwrap_or_else(|e| panic!("fa2 diff launch: {e:?}"));
         let o_kern = gpu.download_f32(&d_out).expect("fa2 diff O");
         assert_eq!(o_kern.len(), CHUNK * q_dim, "fa2 diff O shape");
-        assert!(o_kern.iter().all(|x| x.is_finite()), "non-finite in fa2 diff O");
+        assert!(
+            o_kern.iter().all(|x| x.is_finite()),
+            "non-finite in fa2 diff O"
+        );
 
         // Gate probe: engine buffer pre- or post-gate?
         let fin0 = (n_tokens - CHUNK) * q_dim;
@@ -436,21 +462,26 @@ fn main() {
         let d_raw = max_abs_f32(&o_kern, eng);
         let d_gated = max_abs_f32(&gated, eng);
         // Bit-exact tap proof needs the right gate side; report both.
-        eprintln!(
-            "gate probe L={want}: max|kern-eng| raw={d_raw:.3e} gated-once={d_gated:.3e}"
-        );
+        eprintln!("gate probe L={want}: max|kern-eng| raw={d_raw:.3e} gated-once={d_gated:.3e}");
         let engine_post_gate = d_gated < d_raw;
         let tap_gap = d_gated.min(d_raw);
         eprintln!(
             "engine buffer is {} (tap gap {tap_gap:.3e}; bit-exact=0 required for tap proof)",
-            if engine_post_gate { "POST-gate" } else { "PRE-gate" }
+            if engine_post_gate {
+                "POST-gate"
+            } else {
+                "PRE-gate"
+            }
         );
         // Arm-1 bit-identity bundle: raw kernel O + gate for the md5 gate.
         if let Some(kdir) = &kernel_out {
             let ldir = kdir.join(format!("layer{want}"));
             std::fs::create_dir_all(&ldir).expect("kernel-out layer dir");
             write_f32(&ldir.join("kern.O.f32"), &o_kern);
-            write_f32(&ldir.join("kern.gate.f32"), &g_all[fin0..fin0 + CHUNK * q_dim]);
+            write_f32(
+                &ldir.join("kern.gate.f32"),
+                &g_all[fin0..fin0 + CHUNK * q_dim],
+            );
             std::fs::write(
                 ldir.join("kern.meta.txt"),
                 format!(
@@ -465,7 +496,10 @@ fn main() {
         if let Some(ddir) = &dump_dir {
             let ldir = ddir.join(format!("layer{want}"));
             std::fs::create_dir_all(&ldir).expect("dump layer dir");
-            write_f32(&ldir.join("q_final.f32"), &q_all[(n_tokens - CHUNK) * q_dim..]);
+            write_f32(
+                &ldir.join("q_final.f32"),
+                &q_all[(n_tokens - CHUNK) * q_dim..],
+            );
             write_f32(&ldir.join("k_raw.f32"), &k_all);
             write_f32(&ldir.join("v_raw.f32"), &v_all);
             write_f32(
@@ -550,9 +584,7 @@ fn main() {
             .fold(0.0, f64::max)
     }
     fn write_f32(path: &std::path::Path, v: &[f32]) {
-        let b: &[u8] = unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-        };
+        let b: &[u8] = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         std::fs::write(path, b).expect("write f32 blob");
     }
     fn resolve_layers(arg: &str, fa_layers: &[usize], allow_any: bool) -> Vec<usize> {
@@ -563,7 +595,9 @@ fn main() {
                 "early" => fa_layers[0],
                 "mid" => fa_layers[fa_layers.len() / 2],
                 "late" => fa_layers[fa_layers.len() - 1],
-                _ => item.parse().unwrap_or_else(|_| panic!("bad --layer item: {item}")),
+                _ => item
+                    .parse()
+                    .unwrap_or_else(|_| panic!("bad --layer item: {item}")),
             };
             if !allow_any {
                 assert!(
@@ -581,57 +615,59 @@ fn main() {
 }
 
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
-    /// Self-check A: stored q8_0 blocks vs raw pre-writer taps, over every
-    /// prefix row. Tolerance accounts for the write kernel's f32
-    /// `val*(127/amax)` vs stored f16(amax/127) tie ambiguity (half-ULP of
-    /// the block scale plus f16 rounding of the tap).
-    fn self_check_a(
-        k_all: &[f32],
-        v_all: &[f32],
-        k_stored: &[u8],
-        v_stored: &[u8],
-        n_tokens: usize,
-        nkv: usize,
-        hd: usize,
-        kv_dim: usize,
-        row_stride: usize,
-    ) {
-        let blks = hd / 32;
-        let mut worst = 0.0f64;
-        let mut tie_n = 0u64;
-        for (all, stored, tag) in [(k_all, k_stored, "K"), (v_all, v_stored, "V")] {
-            for p in 0..n_tokens {
-                for h in 0..nkv {
-                    for b in 0..blks {
-                        let ko = p * row_stride + (h * blks + b) * 34;
-                        let sf = f16_to_f32(u16::from_le_bytes([stored[ko], stored[ko + 1]]));
-                        assert!(sf.is_finite(), "non-finite stored scale");
-                        for j in 0..32 {
-                            let d = h * hd + b * 32 + j;
-                            let wv = (sf as f64) * (stored[ko + 2 + j] as i8 as f64);
-                            let got = all[p * kv_dim + d] as f64;
-                            let diff = (got - wv).abs();
-                            worst = worst.max(diff);
-                            let tol = 0.5 * (sf as f64) * (1.0 + 1e-6)
-                                + 2.0f64.powi(-9) * wv.abs().max(1e-6);
-                            if diff > tol {
-                                // Tie-adjacent write rounding: allow 0.75*sf.
-                                let qm = got / (sf as f64);
-                                let tie = ((qm - qm.floor()).abs() - 0.5).abs();
-                                assert!(
-                                    tie <= qm.abs() * 2.0f64.powi(-9) + 1e-6
-                                        && diff <= 0.75 * (sf as f64) + 2.0f64.powi(-9) * wv.abs().max(1e-6),
-                                    "{tag} unexplained p={p} d={d}: cache={wv} tap={got} sf={sf}"
-                                );
-                                tie_n += 1;
-                            }
+/// Self-check A: stored q8_0 blocks vs raw pre-writer taps, over every
+/// prefix row. Tolerance accounts for the write kernel's f32
+/// `val*(127/amax)` vs stored f16(amax/127) tie ambiguity (half-ULP of
+/// the block scale plus f16 rounding of the tap).
+fn self_check_a(
+    k_all: &[f32],
+    v_all: &[f32],
+    k_stored: &[u8],
+    v_stored: &[u8],
+    n_tokens: usize,
+    nkv: usize,
+    hd: usize,
+    kv_dim: usize,
+    row_stride: usize,
+) {
+    let blks = hd / 32;
+    let mut worst = 0.0f64;
+    let mut tie_n = 0u64;
+    for (all, stored, tag) in [(k_all, k_stored, "K"), (v_all, v_stored, "V")] {
+        for p in 0..n_tokens {
+            for h in 0..nkv {
+                for b in 0..blks {
+                    let ko = p * row_stride + (h * blks + b) * 34;
+                    let sf = f16_to_f32(u16::from_le_bytes([stored[ko], stored[ko + 1]]));
+                    assert!(sf.is_finite(), "non-finite stored scale");
+                    for j in 0..32 {
+                        let d = h * hd + b * 32 + j;
+                        let wv = (sf as f64) * (stored[ko + 2 + j] as i8 as f64);
+                        let got = all[p * kv_dim + d] as f64;
+                        let diff = (got - wv).abs();
+                        worst = worst.max(diff);
+                        let tol =
+                            0.5 * (sf as f64) * (1.0 + 1e-6) + 2.0f64.powi(-9) * wv.abs().max(1e-6);
+                        if diff > tol {
+                            // Tie-adjacent write rounding: allow 0.75*sf.
+                            let qm = got / (sf as f64);
+                            let tie = ((qm - qm.floor()).abs() - 0.5).abs();
+                            assert!(
+                                tie <= qm.abs() * 2.0f64.powi(-9) + 1e-6
+                                    && diff
+                                        <= 0.75 * (sf as f64)
+                                            + 2.0f64.powi(-9) * wv.abs().max(1e-6),
+                                "{tag} unexplained p={p} d={d}: cache={wv} tap={got} sf={sf}"
+                            );
+                            tie_n += 1;
                         }
                     }
                 }
             }
         }
-        eprintln!("self-check A (stored-q8 vs raw taps, all {n_tokens} rows): worst |diff|={worst:.3e} tie-adjacent={tie_n} — taps OK");
     }
+    eprintln!("self-check A (stored-q8 vs raw taps, all {n_tokens} rows): worst |diff|={worst:.3e} tie-adjacent={tie_n} — taps OK");
+}
 // ================= replay (GPU-free) =================
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn run_replay(dir: &std::path::Path, qstride: usize) {
@@ -648,12 +684,18 @@ fn run_replay(dir: &std::path::Path, qstride: usize) {
         subs.sort();
         layers = subs;
     }
-    assert!(!layers.is_empty(), "no layer bundles under {}", dir.display());
+    assert!(
+        !layers.is_empty(),
+        "no layer bundles under {}",
+        dir.display()
+    );
     for ldir in layers {
-        let manifest =
-            std::fs::read_to_string(ldir.join("manifest.json")).expect("read manifest");
+        let manifest = std::fs::read_to_string(ldir.join("manifest.json")).expect("read manifest");
         let m: serde_json::Value = serde_json::from_str(&manifest).expect("parse manifest");
-        let get = |k: &str| m[k].as_u64().unwrap_or_else(|| panic!("manifest lacks {k}")) as usize;
+        let get = |k: &str| {
+            m[k].as_u64()
+                .unwrap_or_else(|| panic!("manifest lacks {k}")) as usize
+        };
         let want = get("layer");
         let n_tokens = get("n_tokens");
         let chunk = get("chunk");
@@ -691,7 +733,17 @@ fn run_replay(dir: &std::path::Path, qstride: usize) {
             k_stored: std::fs::read(ldir.join("k_q8.bin")).expect("read k_q8"),
             v_stored: std::fs::read(ldir.join("v_q8.bin")).expect("read v_q8"),
         };
-        self_check_a(&bundle.k_raw, &bundle.v_raw, &bundle.k_stored, &bundle.v_stored, n_tokens, nkv, hd, kv_dim, bundle.row_stride);
+        self_check_a(
+            &bundle.k_raw,
+            &bundle.v_raw,
+            &bundle.k_stored,
+            &bundle.v_stored,
+            n_tokens,
+            nkv,
+            hd,
+            kv_dim,
+            bundle.row_stride,
+        );
         assert_eq!(bundle.q_final.len(), chunk * q_dim, "q_final shape");
         eprintln!("--- replay {} (layer {want}) ---", ldir.display());
         tap_census("K", &bundle.k_raw, n_tokens, nkv, hd, kv_dim);
@@ -741,8 +793,24 @@ fn run_cpu_screen(b: &CpuBundle) {
     // arm2: stored-q8 blocks -> f16 round points (production operands).
     let mut k1 = vec![0.0f64; b.n_tokens * b.kv_dim];
     let mut v1 = vec![0.0f64; b.n_tokens * b.kv_dim];
-    parse_q8_plane(&b.k_stored, &mut k1, b.n_tokens, b.nkv, b.hd, b.kv_dim, b.row_stride);
-    parse_q8_plane(&b.v_stored, &mut v1, b.n_tokens, b.nkv, b.hd, b.kv_dim, b.row_stride);
+    parse_q8_plane(
+        &b.k_stored,
+        &mut k1,
+        b.n_tokens,
+        b.nkv,
+        b.hd,
+        b.kv_dim,
+        b.row_stride,
+    );
+    parse_q8_plane(
+        &b.v_stored,
+        &mut v1,
+        b.n_tokens,
+        b.nkv,
+        b.hd,
+        b.kv_dim,
+        b.row_stride,
+    );
     // arms 3-5: native fp8 from RAW taps (plan §2 smallest-f16->= rule, f32-faithful).
     let mut k_codes = vec![0u8; b.n_tokens * b.kv_dim];
     let mut k_sc = vec![0.0f32; b.n_tokens * b.nkv];
@@ -781,8 +849,7 @@ fn run_cpu_screen(b: &CpuBundle) {
                     let mut icodes = [0i8; 256];
                     for blk in 0..blks {
                         let ko = base + blk * 34;
-                        scales[blk] =
-                            f16_to_f32(u16::from_le_bytes([stored[ko], stored[ko + 1]]));
+                        scales[blk] = f16_to_f32(u16::from_le_bytes([stored[ko], stored[ko + 1]]));
                         for j in 0..32 {
                             icodes[blk * 32 + j] = stored[ko + 2 + j] as i8;
                         }
@@ -808,8 +875,7 @@ fn run_cpu_screen(b: &CpuBundle) {
             let mut am = 0.0f32;
             for d in 0..b.hd {
                 let qv = b.q_final[r * b.q_dim + h * b.hd + d];
-                q1[(qi * b.nh + h) * b.hd + d] =
-                    f16_to_f64(f32_to_f16_bits(qv));
+                q1[(qi * b.nh + h) * b.hd + d] = f16_to_f64(f32_to_f16_bits(qv));
                 am = am.max(qv.abs());
             }
             // §3: sq = amax/448 in f32, zero row sq=1 (NOT f16-snapped).
@@ -925,8 +991,7 @@ fn run_cpu_screen(b: &CpuBundle) {
                         d0 += qf * kf;
                         d1 += q1[qo + d] * k1[ko + d];
                         d2 += q1[qo + d] * fp8_decode_q0(sk, k_codes[ko + d]);
-                        acc += e4m3_decode(q_codes[qo + d])
-                            * e4m3_decode(k_codes[ko + d]);
+                        acc += e4m3_decode(q_codes[qo + d]) * e4m3_decode(k_codes[ko + d]);
                     }
                     s0[j] = d0 * b.scale_attn;
                     s1[j] = f32r(d1 * b.scale_attn);
@@ -939,8 +1004,7 @@ fn run_cpu_screen(b: &CpuBundle) {
                     let skq = qk_sc[k * b.nkv + kh];
                     let mut accq: f64 = 0.0;
                     for d in 0..b.hd {
-                        accq += e4m3_decode(q_codes[qo + d])
-                            * e4m3_decode(qk_codes[ko + d]);
+                        accq += e4m3_decode(q_codes[qo + d]) * e4m3_decode(qk_codes[ko + d]);
                     }
                     let s5v = f32r(f32r(accq * (skq as f64)) * t_q);
                     s5[j] = s5v;
@@ -1061,7 +1125,8 @@ fn run_cpu_screen(b: &CpuBundle) {
                     for d in 0..b.hd {
                         o0[d] += p0 * (b.v_raw[ko + d] as f64);
                         o1[d] = f32r(o1[d] + p1 * v1[ko + d]);
-                        o2[d] = f32r(o2[d] + p2 * fp8_decode_q0(v_sc[k * b.nkv + kh], v_codes[ko + d]));
+                        o2[d] =
+                            f32r(o2[d] + p2 * fp8_decode_q0(v_sc[k * b.nkv + kh], v_codes[ko + d]));
                         let vdiag = sv3 * e4m3_decode(v_codes[ko + d]);
                         o3[d] = f32r(o3[d] + e3 * vdiag);
                         let vdiagq = svq5 * e4m3_decode(qv_codes[ko + d]);
@@ -1133,13 +1198,18 @@ fn run_cpu_screen(b: &CpuBundle) {
     let mut mags: Vec<f64> = o_ref.iter().map(|x| x.abs()).collect();
     mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let t99 = mags[(mags.len() as f64 * 0.99) as usize];
-    eprintln!("|O_ref|: p99 threshold T={t99:.6e}, max={:.6e}", mags[mags.len() - 1]);
+    eprintln!(
+        "|O_ref|: p99 threshold T={t99:.6e}, max={:.6e}",
+        mags[mags.len() - 1]
+    );
     // per-query worst (arm5 vs ref) for outlier triage.
     for qi in 0..nq {
         let mut w = 0.0f64;
         for h in 0..b.nh {
             for d in 0..b.hd {
-                w = w.max((o_sb[(qi * b.nh + h) * b.hd + d] - o_ref[(qi * b.nh + h) * b.hd + d]).abs());
+                w = w.max(
+                    (o_sb[(qi * b.nh + h) * b.hd + d] - o_ref[(qi * b.nh + h) * b.hd + d]).abs(),
+                );
             }
         }
         per_q_worst[qi] = w;
@@ -1150,8 +1220,7 @@ fn run_cpu_screen(b: &CpuBundle) {
     for (qi, &r) in qrows.iter().enumerate() {
         for h in 0..b.nh {
             for d in 0..b.hd {
-                kern_sampled[(qi * b.nh + h) * b.hd + d] =
-                    kern_f64[r * b.q_dim + h * b.hd + d];
+                kern_sampled[(qi * b.nh + h) * b.hd + d] = kern_f64[r * b.q_dim + h * b.hd + d];
             }
         }
     }
@@ -1192,19 +1261,46 @@ fn run_cpu_screen(b: &CpuBundle) {
     );
     println!("--- per-arm vs ARM 1 (kernel q8/f16 differential, pre-gate) ---");
     println!("{:<10} {:>12} {:>12}  note", "arm", "max-abs", "tail-1%");
-    println!("{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref vs arm1 (self-check-B mate)", "arm2", q8_a1, q8_a1t);
-    println!("{:<10} {:>12.3e} {:>12.3e}  Q0 format-only (the Q0 predictor)", "arm3", q0_a1, q0_a1t);
-    println!("{:<10} {:>12.3e} {:>12.3e}  fp8-QK + exact weighted PV", "arm4", qk_a1, qk_a1t);
-    println!("{:<10} {:>12.3e} {:>12.3e}  full stage-b route N (changing-unit O)", "arm5", sb_a1, sb_a1t);
-    println!("{:<10} {:>12.3e} {:>12.3e}  full stage-b route Q (changing-unit O)", "arm6", rq_a1, rq_a1t);
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref vs arm1 (self-check-B mate)",
+        "arm2", q8_a1, q8_a1t
+    );
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  Q0 format-only (the Q0 predictor)",
+        "arm3", q0_a1, q0_a1t
+    );
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  fp8-QK + exact weighted PV",
+        "arm4", qk_a1, qk_a1t
+    );
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  full stage-b route N (changing-unit O)",
+        "arm5", sb_a1, sb_a1t
+    );
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  full stage-b route Q (changing-unit O)",
+        "arm6", rq_a1, rq_a1t
+    );
     println!("--- per-arm vs EXACT (f64 reference) ---");
     println!("{:<10} {:>12} {:>12}  note", "arm", "max-abs", "tail-1%");
-    println!("{:<10} {:>12.3e} {:>12.3e}  arm1 production gap (kernel vs exact)", "arm1", kk_ex, kk_ext);
-    println!("{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref", "arm2", q8_ex, q8_ext);
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  arm1 production gap (kernel vs exact)",
+        "arm1", kk_ex, kk_ext
+    );
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref",
+        "arm2", q8_ex, q8_ext
+    );
     println!("{:<10} {:>12.3e} {:>12.3e}  Q0", "arm3", q0_ex, q0_ext);
     println!("{:<10} {:>12.3e} {:>12.3e}  qkdiag", "arm4", qk_ex, qk_ext);
-    println!("{:<10} {:>12.3e} {:>12.3e}  stageb-N", "arm5", sb_ex, sb_ext);
-    println!("{:<10} {:>12.3e} {:>12.3e}  stageb-Q", "arm6", rq_ex, rq_ext);
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  stageb-N",
+        "arm5", sb_ex, sb_ext
+    );
+    println!(
+        "{:<10} {:>12.3e} {:>12.3e}  stageb-Q",
+        "arm6", rq_ex, rq_ext
+    );
     println!();
     println!("score max|Δ| vs exact: q0={s_err_q0:.3e} qk={s_err_qk:.3e} sb={s_err_sb:.3e} rq={s_err_rq:.3e}");
     println!(
@@ -1219,7 +1315,14 @@ fn run_cpu_screen(b: &CpuBundle) {
         if u_pct <= 0.1 { "PASS" } else { "FAIL — stop the two-fp8-leg plan" },
         if uq_pct <= 0.1 { "PASS" } else { "FAIL — stop the two-fp8-leg plan" }
     );
-    println!("engine buffer: {}", if b.engine_post_gate { "POST-gate (CPU O gated-iff compared)" } else { "PRE-gate" });
+    println!(
+        "engine buffer: {}",
+        if b.engine_post_gate {
+            "POST-gate (CPU O gated-iff compared)"
+        } else {
+            "PRE-gate"
+        }
+    );
     // worst-3 sampled queries (absolute row in final chunk) for triage.
     let mut order: Vec<usize> = (0..nq).collect();
     order.sort_by(|&a, &c| per_q_worst[c].partial_cmp(&per_q_worst[a]).unwrap());
@@ -1234,7 +1337,11 @@ fn run_cpu_screen(b: &CpuBundle) {
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn online_step(mold: f64, bmax: f64) -> (f64, f64) {
     let nm = mold.max(bmax);
-    let a = if mold == f64::NEG_INFINITY { 0.0 } else { (mold - nm).exp() };
+    let a = if mold == f64::NEG_INFINITY {
+        0.0
+    } else {
+        (mold - nm).exp()
+    };
     (nm, a)
 }
 
@@ -1275,7 +1382,8 @@ fn parse_q8_plane(
                 let sf = f16_to_f32(u16::from_le_bytes([stored[ko], stored[ko + 1]]));
                 for j in 0..32 {
                     let d = h * hd + b * 32 + j;
-                    out[p * kv_dim + d] = rne_f16_f64((sf as f64) * (stored[ko + 2 + j] as i8 as f64));
+                    out[p * kv_dim + d] =
+                        rne_f16_f64((sf as f64) * (stored[ko + 2 + j] as i8 as f64));
                 }
             }
         }
@@ -1391,7 +1499,9 @@ fn requant_q8_row(scales: &[f32; 8], codes: &[i8; 256]) -> Result<(f32, Vec<u8>)
         }
     }
     if !(448.0f32 * s >= amax) {
-        return Err(format!("s_row invariant fails: 448*{s:.6e} < amax {amax:.6e}"));
+        return Err(format!(
+            "s_row invariant fails: 448*{s:.6e} < amax {amax:.6e}"
+        ));
     }
     let mut out = Vec::with_capacity(256);
     for b in 0..8 {
@@ -1426,7 +1536,11 @@ fn tap_census(tag: &str, raw: &[f32], n_tokens: usize, nkv: usize, hd: usize, kv
         for h in 0..nkv {
             let row = &raw[p * kv_dim + h * hd..p * kv_dim + (h + 1) * hd];
             let a = row.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            let s = if a == 0.0 { 1.0 } else { f16_ceil_pos(a / 448.0).max(5.9604645e-8) };
+            let s = if a == 0.0 {
+                1.0
+            } else {
+                f16_ceil_pos(a / 448.0).max(5.9604645e-8)
+            };
             for &x in row {
                 denom += 1;
                 if x != 0.0 {
@@ -1520,7 +1634,7 @@ fn codec_self_test() {
     row[0] = 448.01;
     let (s, _) = fp8_encode_row(&row).expect("bump row");
     assert_eq!(f32_to_f16_bits(s), 0x3C01); // 1.0 fails 448*1<448.01 -> next-up
-    // Route-Q §2.3 vectors: s_row = smallest f16 >= 127*maxsf/448.
+                                            // Route-Q §2.3 vectors: s_row = smallest f16 >= 127*maxsf/448.
     {
         // All-zero row -> s_row = 1, zero codes.
         let (s, c) = requant_q8_row(&[0.0f32; 8], &[0i8; 256]).expect("zero requant");
@@ -1566,7 +1680,10 @@ fn edge_case_self_test() {
             let bprev = (10.0f32 / 448.0f32).max(2.0f32.powi(-64)) * sv_prev.max(1e-30);
             let bnew = (10.0f32 / 448.0f32).max(2.0f32.powi(-64)) * sv_new.max(1e-30);
             let rho = (0.5f32 * bprev) / bnew;
-            assert!(rho.is_finite() && rho > 0.0, "rho finite for sv {sv_prev}->{sv_new}");
+            assert!(
+                rho.is_finite() && rho > 0.0,
+                "rho finite for sv {sv_prev}->{sv_new}"
+            );
         }
     }
     // 2^-64 floor contribution bound (§5): 32768*448*16*2^-64 ≈ 1.3e-11.
@@ -1576,10 +1693,15 @@ fn edge_case_self_test() {
     // a kernel-bringup check; host pins the exact values here).
     for bits in [0x0001u16, 0x0008, 0x0200, 0x03FF] {
         let v = f16_to_f32(bits);
-        assert!(v > 0.0 && v < 6.1035156e-5, "subnormal {bits:#06x} -> {v:.3e}");
+        assert!(
+            v > 0.0 && v < 6.1035156e-5,
+            "subnormal {bits:#06x} -> {v:.3e}"
+        );
         assert_eq!(f32_to_f16_bits(v), bits, "subnormal round-trip {bits:#06x}");
     }
-    eprintln!("edge-case self-test OK (masked/single-key/rho-sweep/floor-bound/subnormal round-trip)");
+    eprintln!(
+        "edge-case self-test OK (masked/single-key/rho-sweep/floor-bound/subnormal round-trip)"
+    );
 }
 
 // f32 → f16 bits, round-to-nearest-even (matches the kernel's (_Float16)

@@ -2278,6 +2278,7 @@ impl DeepseekV4 {
             let load_mtp = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
                 .map(|s| s != "0")
                 .unwrap_or(true)
+                && cfg.load_mtp
                 && cfg.reap_keep.is_none();
             if !load_mtp {
                 eprintln!(
@@ -2285,6 +2286,8 @@ impl DeepseekV4 {
                     if cfg.reap_keep.is_some() {
                         "REAP keep-map active — MTP unused for PPL/KLD and would \
                          need separate keep handling"
+                    } else if !cfg.load_mtp {
+                        "speculation.mtp = auto without a measured AR floor — plain AR"
                     } else {
                         "HIPFIRE_DEEPSEEK4_LOAD_MTP=0"
                     }
@@ -3647,11 +3650,13 @@ impl DeepseekV4 {
         if mtp_present {
             let load_mtp = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
                 .map(|s| s != "0")
-                .unwrap_or(true);
+                .unwrap_or(true)
+                && cfg.load_mtp;
             if !load_mtp {
                 eprintln!(
-                    "deepseek4: source contains MTP layer but \
-                    HIPFIRE_DEEPSEEK4_LOAD_MTP=0 — skipping MTP upload"
+                    "deepseek4: source contains MTP layer but the load skips it \
+                    (HIPFIRE_DEEPSEEK4_LOAD_MTP=0, or speculation.mtp = auto without a \
+                    measured AR floor) — skipping MTP upload"
                 );
             } else {
                 eprintln!("deepseek4: MTP layer present — uploading from safetensors source.");

@@ -71,7 +71,6 @@ impl Architecture for DotsOcr {
     // `eos_filter_overrides` MUST diverge from defaults — see §2.5
     // of the bring-up plan.
 
-
     fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
         // Primary EOS for an assistant turn is `<|endofassistant|>`
         // (id 151673). The wire-EOS `<|endoftext|>` (151643) also
@@ -86,10 +85,7 @@ impl Architecture for DotsOcr {
         // `strip_think = Some(false)` — dots.ocr is an OCR model, not
         // thinking-mode; it does not emit <think> blocks.
         EosFilterOverrides {
-            stop_at: vec![
-                b"<|endofassistant|>".to_vec(),
-                b"<|endoftext|>".to_vec(),
-            ],
+            stop_at: vec![b"<|endofassistant|>".to_vec(), b"<|endoftext|>".to_vec()],
             holdback_prefixes: vec![b"<|end".to_vec()],
             strip_think: Some(false),
         }

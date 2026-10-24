@@ -765,12 +765,12 @@ fn run_gemma_batched(
             .clear_gpu(gpu)
             .map_err(|e| format!("gemma kv full clear {si}: {e:?}"))?;
         hipfire_arch_gemma4::forward::forward_prefill_batch(cfg, weights, state, gpu, chunk, 0)
-        .map_err(|e| {
-            format!(
-                "gemma forward_prefill_batch seq {si} B {}: {e:?}",
-                chunk.len()
-            )
-        })?;
+            .map_err(|e| {
+                format!(
+                    "gemma forward_prefill_batch seq {si} B {}: {e:?}",
+                    chunk.len()
+                )
+            })?;
     }
     Ok(())
 }

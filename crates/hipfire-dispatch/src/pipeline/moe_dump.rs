@@ -91,8 +91,7 @@ impl Site {
             .join(format!("rank-{}", gpu.device_id))
             .join(format!("position-{position}"))
             .join(format!("layer-{layer}"));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| err(format!("create {}: {e}", dir.display())))?;
+        std::fs::create_dir_all(&dir).map_err(|e| err(format!("create {}: {e}", dir.display())))?;
         Ok(Some(Self { dir }))
     }
 
@@ -225,10 +224,7 @@ pub fn fold_end(
     site.write("routed-residual-input.f32", &pending.residual)?;
     site.write("fold-input.f32", &pending.target)?;
     site.write("fold-output.f32", &after)?;
-    site.write(
-        "route-indices.i32",
-        &read(gpu, info.indices, info.slots)?,
-    )?;
+    site.write("route-indices.i32", &read(gpu, info.indices, info.slots)?)?;
     site.write("route-weights.f32", &read(gpu, info.weights, info.slots)?)?;
     match info.expanded {
         Some((rows, stride)) => {

@@ -111,6 +111,31 @@ pub trait ArchModel: Send + std::any::Any {
         self.session_commit()
     }
 
+    /// Once per request, after prefill and before the first decode forward
+    /// (and so before any decode capture/record): map the model's
+    /// context-growing state ahead for a decode that starts at `position`,
+    /// may emit `remaining_new_tokens` more tokens and, when speculating,
+    /// writes up to `max_draft_rows` rows past a window's seed (0 for AR).
+    /// Best effort: an implementation logs and swallows failure, leaving
+    /// on-demand growth. Default is a no-op for models whose state does not
+    /// grow with context.
+    fn map_ahead_for_decode(
+        &mut self,
+        _gpu: &mut Gpu,
+        _position: usize,
+        _remaining_new_tokens: usize,
+        _max_draft_rows: usize,
+    ) {
+    }
+
+    /// One-shot advisory for the next session begin: this request will write
+    /// state rows at most up to absolute position `through` (prompt, decode
+    /// and any speculative rows). A model that parks side state may use it to
+    /// bound that parking before prefill. It is not validation and never
+    /// rejects a request; the limit applies to the next begin only. Default
+    /// is a no-op for models with no session side state.
+    fn session_request_write_limit(&mut self, _through: usize) {}
+
     /// Downcast hatch for the architecture composition root.
     ///
     /// `hipfire-generate` legitimately needs the concrete bundle to call a
@@ -123,7 +148,6 @@ pub trait ArchModel: Send + std::any::Any {
     /// A whole-struct accessor cannot: that distinction is why the accessor
     /// experiment converted 15 sites of 154 and this hatch is expected to do
     /// better.
-
 
     /// Return every GPU buffer this model owns.
     ///

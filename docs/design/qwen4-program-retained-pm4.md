@@ -49,6 +49,86 @@ Non-objectives, explicitly:
 - No promotion claim. Certification is the REDLINE §7 ladder, and §8 governs any
   number quoted.
 
+## Eager wide verify referencing retained AR
+
+The row-exact wide-verify contract does **not** widen this retained body.
+Verify remains eager; actual recording or graph capture is ineligible for
+wide verify. At a window boundary, `ar_launch_reference` reuses the singleton
+eligibility decision and binds `Qwen4VerifyReference::{Eager, Recorded}` for
+that window. `Recorded` requests the actual recorded singleton's QSA arithmetic
+and shape-selected LDS bound without setting recorder/graph flags. `None`
+preserves ordinary launch behavior. Row/reference scopes restore on both
+success and error, and the next window recomputes after replay-state changes.
+Diagnostic projection hooks that disable retained eligibility cannot certify
+the retained-reference case.
+
+Each query row derives its selected extent from its own absolute position.
+Batch only adjacent equal-policy runs, preserving the singleton split-K,
+split-KV or per-head recipe, split count, K/V representation and fold order.
+An eager-reference window crossing an LDS-fit boundary must not apply its
+last row's policy to earlier rows. Bound recorded-reference verify keeps
+per-head arithmetic; disabling retained AR globally or changing singleton
+arithmetic is not an acceptable substitute for this binding.
+
+**Capacity is not admission:** physical executor/storage capacity is 64 total
+rows (seed plus at most 63 native drafts), with fixed eight-row PM tiles.
+Shipping proven capability stays 8; CPU-owned experts retain their independent
+4-row restriction, and allocated forward/logit/capture capacities also bound
+the effective bundle window. New CPU storage supports 1..64 rows with exact
+input/mask/output/scratch slots (640 slots); CPU routing stays per-call eager
+with whole-window forward/capture, and the proven CPU default stays 4 until
+hardware, state, and performance proof land. Existing public capability getters
+remain the consumer contract. No new codec, PP/EP or lane-executor admission
+is implied.
+
+`Gpu::qwen4_row_tile_reference_supported` also checks the actual singleton
+MQ4 recipe: exact gfx1151 with resolved GEMV rows2, exact gfx1201 with
+resolved rows2 and PM decode enabled, or exact gfx1100 with native resolved
+rows1. Halo's forced-R1 LM shape is handled shape-locally by its tile.
+Other overridden singleton recipes remain at 8 until their own twins and
+qualification exist. This source-recipe refusal
+is distinct from the removed eager-versus-recorded QSA mismatch fallback;
+neither the helper nor an override grants widened capability.
+Exact gfx1100 lab overrides can reach64 in eager verify scope. Its dedicated
+Q8 tiles cover the actual singleton domains: generic large-K K>1536 divisible
+by32 (plain one-chain), small-K wide every positive K<=1536 divisible by32
+(four-chain including K320/K640 per reference ELF SHA
+`4de9f1a0a0c6f7ab9e7030ae8cfc920da48c2b4e70b9344c8267b855291bfe0e`, no Halo
+K640 staged special), exact K320 and pair-K2560 tiles, and HC K>0 divisible
+by256. These are not Halo aliases. Shipping capability stays8.
+
+The following widened cells are deliberately **unqualified**. Historical
+single-token retained receipts elsewhere in this document do not populate them.
+Integration replaces a pending cell only with pinned source/object/model/mode,
+all-width receipts and reviewed qualification; this documentation update runs
+no gates.
+
+| Architecture | Physical capacity / shipping proven rows | Actual-singleton bytes, logical state and greedy IDs at every R=1..64 | Paired full-window cost vs incumbent prefill-kernel verify | Widened default |
+|---|---|---|---|---|
+| gfx1201 | 64 / 8 | Pending | Pending | Not promoted |
+| gfx1151 | 64 / 8 | Pending | Pending | Not promoted |
+| gfx1100 | 64 / 8; architecture-specific bodies/admission required | Pending | Pending | Not promoted |
+
+Raw singleton **object** bytes, not PM C1 alone, are the stateless oracle.
+GDN/QSA/PLE require sequential singleton transitions from identical nonzero
+state, every vocabulary word and logical-state byte, every kept prefix through
+both native repair and generic commit, abort and subsequent continuation.
+Captured Q8 recurrence writes only the final state; native prefix repair reruns
+the kept recurrence from the saved live slot, not a 64-row retained state tape.
+Poison tails/guards and prove each width actually executed, including native,
+copy and product-adaptive greedy windows. A refusal/missing device or cell is
+not a passing skip; finite-input CPU evidence is not a GPU or exceptional-input
+proof.
+
+Only after bytes/state/IDs pass may paired full-window curves qualify a widened
+configuration. Use identical initial state, capture, output-head work and row
+width for the exact and incumbent prefill-kernel-routed verify arms; require
+cost per verified row below the incumbent with supporting uncertainty at each
+promoted cell. Component timing, a byte-exact host singleton loop or aggregate
+MTP tok/s does not satisfy this requirement. Eight-row tiling's performance
+benefit remains unproven, and proven tables stay at 8 until qualification and
+review.
+
 ## Baseline (measured, this box)
 
 Fixture: `~/.hipfire/models/qwen3.8-flash-next.mq4r` (`.mq4r` + gfx1151 + single
@@ -713,14 +793,17 @@ Two fresh processes, `.mq4r` artifact, greedy, two different prompt lengths:
 [redline] qwen4 capture census: effect-incomplete — 13 device copy(ies) and 48 memset(s) inside the window are state the tape cannot replay (kernelise them, or move them into the external boundary)
 ```
 
-`launched` is an independent count from `hip_bridge::launch_counters` (every
-launch, funnel or raw), so the comparison is not the recorder grading itself.
+`launched` (printed as `computed=` today) is an independent count from
+`hip_bridge::memory_effects` (every launch on the capturing thread, funnel or
+raw), so the comparison is not the recorder grading itself.
 
-The finalization hook treats an unequal census as a typed capture refusal:
-it poisons the retained route before closing or preparing the tape, logs the
-launched and recorded counts plus the HIP fallback, and leaves the completed
-warmup output intact. Later forwards use ordinary HIP. A matching census is
-necessary, not sufficient: effect and binding validation still gate preparation.
+An unequal census is a capture refusal. The check now lives in the shared
+prepare (`ReplayController::refuse_effect_incomplete_window`, HIPF-121), so it
+covers every automatic Redline route, not only Qwen4: prepare fails with
+`unrecorded launch`, the route is poisoned, the HIP fallback is logged, and the
+completed warmup output stays intact. Later forwards use ordinary HIP. A
+matching census is necessary, not sufficient: effect and binding validation
+still gate preparation.
 Shared launchers, including `Gpu::silu_f32`, use `launch_maybe_blob` so graph
 capture and retained recording own their kernarg bytes rather than stack pointers.
 
@@ -1058,6 +1141,7 @@ collected at context 128 only. It is **not** a promotion or an admission:
 | End-to-end census: recorded launches == compute launches | needs G4 | blocked by design |
 | Multi-position HIP vs recorded-blob vs PM4 parity | needs G3, G4 | blocked by design |
 | Serve health, stationary matched performance | REDLINE §7 gates 6–7 | blocked by design |
+| Expert-slab (ctl3-hot) capture/rebind gate | `cargo run -p hipfire-arch-qwen4 --features lab --example qwen4_g2_replay_gate -- --model CTL3-HOT.hfq --output gate.json` (gfx1201; JSON per-check exact mismatch counts): production-lifecycle capture, byte-exact production/plan/recorded-HIP replay against HIP at consecutive positions with proof each arm ran, and, after freeing and rebuilding the bundle between capture and replay, an explicit `retained replay refused: retained route identity …` from all three executors with no retained execution | **harness landed; hardware run pending** |
 
 Harness gap to be resolved with G3/G4 (not now): no dispatch-level or engine-level
 capture hook exists, and the arch-coupled bench harness

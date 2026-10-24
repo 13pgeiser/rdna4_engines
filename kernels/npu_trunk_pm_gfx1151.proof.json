@@ -2,15 +2,15 @@
   "module": "npu_trunk_pm_gfx1151",
   "arch": "gfx1151",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "unknown",
-  "s_text_sha256": "ae87e1da8bee40a822212719b439c6751ed9300fe2cc7f7eac8932b576809586",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "01adb8036db7df655ff5b356e4aee9001cd4a8c06a5687b7626de7739c233072",
   "kernels": [
     {
       "kernel_id": "npu_trunk",
       "variant": "npu_trunk_consume_bf16_pm",
       "arch": "gfx1151",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "work",
@@ -691,14 +691,14 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "d1f5a572ab05c93597fe7cbf65fb90a9058cbd5faa0f75cb5d510210ae0aedae"
+      "s_text_sha256": "57f42cd76975e28667c8a0fed560732384f8e8d697ffe9c2f95dff888dcaabb4"
     },
     {
       "kernel_id": "npu_trunk",
       "variant": "npu_trunk_consume_f32_pm",
       "arch": "gfx1151",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "work",
@@ -1379,14 +1379,14 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "99c9b30da89054f07cb4213c9820735b599bd34031a11d8792914a9876b5b9a2"
+      "s_text_sha256": "8a0cb77362b0c6db9bdd99309cf0adb82b5e712ebd9af5cec55925207f3aa1af"
     },
     {
       "kernel_id": "npu_trunk",
       "variant": "npu_trunk_i8_gemm_pm",
       "arch": "gfx1151",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "unknown",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "work",
@@ -2114,7 +2114,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "625bb1b8a4ba3f1187a7bc7daf5e2468068f1dd7b8e327e6f9783b3127cc80fc"
+      "s_text_sha256": "72d9b2e2ffb2f19e0537c4c8cd86f969d2e4153f8082638c7c987bdc983b86eb"
     }
   ]
 }

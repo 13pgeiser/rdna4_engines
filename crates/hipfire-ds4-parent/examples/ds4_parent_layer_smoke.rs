@@ -314,9 +314,7 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> Result<GpuTensor,
     let t = gpu
         .alloc_tensor(shape, DType::F32)
         .map_err(|e| format!("deepseek4 parent: alloc: {e:?}"))?;
-    let bytes = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     gpu.hip
         .memcpy_htod(&t.buf, bytes)
         .map_err(|e| format!("deepseek4 parent: htod: {e:?}"))?;
@@ -325,9 +323,7 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32], shape: &[usize]) -> Result<GpuTensor,
 
 fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, String> {
     let mut host = vec![0.0f32; nelems];
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nelems * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, nelems * 4) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: dtoh: {e:?}"))?;
@@ -336,9 +332,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
 
 fn zero_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<(), String> {
     let zeros = vec![0.0f32; nelems];
-    let bytes = unsafe {
-        std::slice::from_raw_parts(zeros.as_ptr() as *const u8, nelems * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(zeros.as_ptr() as *const u8, nelems * 4) };
     gpu.hip
         .memcpy_htod(&t.buf, bytes)
         .map_err(|e| format!("deepseek4 parent: zero htod: {e:?}"))?;

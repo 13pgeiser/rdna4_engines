@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/hipfire-arch-qwen35-embed",
+    "crates/hipfire-arch-embeddinggemma2",
     "crates/peacemaker-ir",
     "crates/peacemaker-lift",
     "crates/peacemaker-author",
@@ -59,11 +60,12 @@ members = [
     "crates/saddle-lab",
     "crates/hipfire-xdna",
     "crates/peacemaker-npu",
+    "crates/peacemaker-cdna",
     "crates/npu-tools",
 ]
 
 [workspace.package]
-version = "0.4.2+patch.1"
+version = "0.4.3"
 edition = "2021"
 # Outbound license for the work as a whole. Individual files whose authors
 # have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.
@@ -76,6 +78,7 @@ clap = "4.6"
 fancy-regex = "0.14"
 half = "2.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
 libjpeg-turbo-rs = "0.8"
 libloading = "0.9"
 libm = "0.2"
@@ -90,3 +93,21 @@ serde = "1"
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+
+# The PeaceMaker CPU emulator and the exhaustive row-tile oracles in
+# peacemaker-isa's tests run hours unoptimized. Optimize these crates in dev
+# and test builds; debug assertions and overflow checks stay on.
+[profile.dev.package.peacemaker-isa]
+opt-level = 3
+
+[profile.dev.package.peacemaker-ir]
+opt-level = 3
+
+[profile.dev.package.peacemaker-cdna]
+opt-level = 3
+
+[profile.dev.package.peacemaker-author]
+opt-level = 3
+
+[profile.dev.package.peacemaker-lift]
+opt-level = 3

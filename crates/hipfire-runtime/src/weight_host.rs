@@ -114,12 +114,18 @@ const DOMAIN_CERT: &str = "hipfire-source-cert/v1\0";
 /// Every failure of this module. All protocol failures are fail-closed.
 #[derive(Debug)]
 pub enum WeightHostError {
-    Io { context: &'static str, source: io::Error },
+    Io {
+        context: &'static str,
+        source: io::Error,
+    },
     /// The single handshake deadline (or a caller-supplied wait) expired.
     Timeout(&'static str),
     /// Peer closed the socket. EOF is not proof of GPU/process teardown.
     PeerClosed(&'static str),
-    UnsupportedVersion { got: u32, supported: u32 },
+    UnsupportedVersion {
+        got: u32,
+        supported: u32,
+    },
     Protocol(String),
     LimitExceeded(&'static str),
     PeerCredentials(String),
@@ -129,10 +135,16 @@ pub enum WeightHostError {
     /// Names the identity field that differed.
     IdentityMismatch(&'static str),
     ManifestInvalid(String),
-    FdCount { expected: usize, got: usize },
+    FdCount {
+        expected: usize,
+        got: usize,
+    },
     FdInvalid(String),
     AdmissionDenied(String),
-    ImportedBytesMismatch { expected: u64, got: u64 },
+    ImportedBytesMismatch {
+        expected: u64,
+        got: u64,
+    },
     InvalidState(&'static str),
     SourceMutated(String),
     SourceNotImmutable(String),
@@ -148,7 +160,10 @@ impl fmt::Display for WeightHostError {
             Timeout(w) => write!(f, "weight host timeout: {w}"),
             PeerClosed(w) => write!(f, "weight host peer closed: {w}"),
             UnsupportedVersion { got, supported } => {
-                write!(f, "unsupported weight host protocol version {got} (supported {supported})")
+                write!(
+                    f,
+                    "unsupported weight host protocol version {got} (supported {supported})"
+                )
             }
             Protocol(s) => write!(f, "weight host protocol violation: {s}"),
             LimitExceeded(w) => write!(f, "weight host limit exceeded: {w}"),
@@ -158,7 +173,10 @@ impl fmt::Display for WeightHostError {
             IdentityMismatch(w) => write!(f, "weight host identity mismatch: {w}"),
             ManifestInvalid(s) => write!(f, "weight manifest invalid: {s}"),
             FdCount { expected, got } => {
-                write!(f, "weight host fd count mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "weight host fd count mismatch: expected {expected}, got {got}"
+                )
             }
             FdInvalid(s) => write!(f, "weight host fd invalid: {s}"),
             AdmissionDenied(s) => write!(f, "weight host admission denied: {s}"),
@@ -241,7 +259,9 @@ impl Sha256Digest {
     pub fn from_hex(s: &str) -> Result<Self, WeightHostError> {
         let b = s.as_bytes();
         if b.len() != 64 {
-            return Err(WeightHostError::InvalidArgument("sha256 hex must be 64 characters".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "sha256 hex must be 64 characters".into(),
+            ));
         }
         fn nib(c: u8) -> Option<u8> {
             match c {
@@ -254,7 +274,9 @@ impl Sha256Digest {
         let mut out = [0u8; 32];
         for i in 0..32 {
             let (Some(hi), Some(lo)) = (nib(b[2 * i]), nib(b[2 * i + 1])) else {
-                return Err(WeightHostError::InvalidArgument("sha256 hex has a non-hex digit".into()));
+                return Err(WeightHostError::InvalidArgument(
+                    "sha256 hex has a non-hex digit".into(),
+                ));
             };
             out[i] = (hi << 4) | lo;
         }
@@ -311,13 +333,18 @@ impl Epoch {
         let mut off = 0;
         while off < b.len() {
             // SAFETY: valid writable buffer region.
-            let n = unsafe { libc::getrandom(b[off..].as_mut_ptr() as *mut libc::c_void, b.len() - off, 0) };
+            let n = unsafe {
+                libc::getrandom(b[off..].as_mut_ptr() as *mut libc::c_void, b.len() - off, 0)
+            };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(WeightHostError::Io { context: "getrandom", source: e });
+                return Err(WeightHostError::Io {
+                    context: "getrandom",
+                    source: e,
+                });
             }
             off += n as usize;
         }
@@ -455,12 +482,19 @@ impl<'a> Dec<'a> {
         }
     }
     /// Read a `u32` element count, bounded by `max` and by the bytes left.
-    fn count(&mut self, max: usize, what: &'static str, min_elem: usize) -> Result<usize, WeightHostError> {
+    fn count(
+        &mut self,
+        max: usize,
+        what: &'static str,
+        min_elem: usize,
+    ) -> Result<usize, WeightHostError> {
         let n = self.u32()? as usize;
         if n > max {
             return Err(WeightHostError::LimitExceeded(what));
         }
-        if n.checked_mul(min_elem).map_or(true, |b| b > self.remaining()) {
+        if n.checked_mul(min_elem)
+            .map_or(true, |b| b > self.remaining())
+        {
             return Err(proto("count exceeds remaining payload"));
         }
         Ok(n)
@@ -535,37 +569,81 @@ impl FieldValue {
         Self::F32BitsList(v.iter().map(|x| x.to_bits()).collect())
     }
     pub fn as_u64(&self) -> Option<u64> {
-        if let Self::U64(v) = self { Some(*v) } else { None }
+        if let Self::U64(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
     pub fn as_i64(&self) -> Option<i64> {
-        if let Self::I64(v) = self { Some(*v) } else { None }
+        if let Self::I64(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
     pub fn as_bool(&self) -> Option<bool> {
-        if let Self::Bool(v) = self { Some(*v) } else { None }
+        if let Self::Bool(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
     pub fn as_str(&self) -> Option<&str> {
-        if let Self::Str(v) = self { Some(v) } else { None }
+        if let Self::Str(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
     pub fn as_f32(&self) -> Option<f32> {
-        if let Self::F32Bits(v) = self { Some(f32::from_bits(*v)) } else { None }
+        if let Self::F32Bits(v) = self {
+            Some(f32::from_bits(*v))
+        } else {
+            None
+        }
     }
     pub fn as_f64(&self) -> Option<f64> {
-        if let Self::F64Bits(v) = self { Some(f64::from_bits(*v)) } else { None }
+        if let Self::F64Bits(v) = self {
+            Some(f64::from_bits(*v))
+        } else {
+            None
+        }
     }
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        if let Self::Bytes(v) = self { Some(v) } else { None }
+        if let Self::Bytes(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
     pub fn as_list(&self) -> Option<&[FieldValue]> {
-        if let Self::List(v) = self { Some(v) } else { None }
+        if let Self::List(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
     pub fn as_u64_list(&self) -> Option<&[u64]> {
-        if let Self::U64List(v) = self { Some(v) } else { None }
+        if let Self::U64List(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
     pub fn as_map(&self) -> Option<&CanonicalFields> {
-        if let Self::Map(v) = self { Some(v) } else { None }
+        if let Self::Map(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
     pub fn as_digest(&self) -> Option<&Sha256Digest> {
-        if let Self::Digest(v) = self { Some(v) } else { None }
+        if let Self::Digest(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
     pub fn as_f32_list(&self) -> Option<Vec<f32>> {
         if let Self::F32BitsList(v) = self {
@@ -779,7 +857,10 @@ pub struct LayoutRecipe {
 
 impl LayoutRecipe {
     pub fn new(schema: &str) -> Self {
-        Self { schema: schema.to_owned(), fields: CanonicalFields::new() }
+        Self {
+            schema: schema.to_owned(),
+            fields: CanonicalFields::new(),
+        }
     }
 
     pub fn with(mut self, key: &str, value: FieldValue) -> Self {
@@ -793,7 +874,9 @@ impl LayoutRecipe {
 
     fn encode(&self, e: &mut Enc) -> Result<(), WeightHostError> {
         if self.schema.is_empty() {
-            return Err(WeightHostError::InvalidArgument("recipe schema must not be empty".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "recipe schema must not be empty".into(),
+            ));
         }
         e.str(&self.schema)?;
         enc_fields(e, &self.fields, 0)
@@ -804,7 +887,10 @@ impl LayoutRecipe {
         if schema.is_empty() {
             return Err(proto("empty recipe schema"));
         }
-        Ok(Self { schema, fields: dec_fields(d, 0)? })
+        Ok(Self {
+            schema,
+            fields: dec_fields(d, 0)?,
+        })
     }
 
     /// Canonical bytes (no domain prefix).
@@ -834,7 +920,11 @@ pub struct LoaderAbi {
 
 impl LoaderAbi {
     pub fn new(schema_id: &str) -> Self {
-        Self { schema_id: schema_id.to_owned(), fields: CanonicalFields::new(), components: BTreeMap::new() }
+        Self {
+            schema_id: schema_id.to_owned(),
+            fields: CanonicalFields::new(),
+            components: BTreeMap::new(),
+        }
     }
 
     pub fn with(mut self, key: &str, value: FieldValue) -> Self {
@@ -845,7 +935,8 @@ impl LoaderAbi {
     /// Hash and record a loader-closure component given its full bytes (e.g.
     /// `include_bytes!` of the whole source file).
     pub fn add_component_bytes(&mut self, name: &str, bytes: &[u8]) {
-        self.components.insert(name.to_owned(), Sha256Digest::of(bytes));
+        self.components
+            .insert(name.to_owned(), Sha256Digest::of(bytes));
     }
 
     /// Hash and record a component file.
@@ -858,7 +949,9 @@ impl LoaderAbi {
 
     pub fn encode_canonical(&self) -> Result<Vec<u8>, WeightHostError> {
         if self.schema_id.is_empty() {
-            return Err(WeightHostError::InvalidArgument("loader ABI schema_id must not be empty".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "loader ABI schema_id must not be empty".into(),
+            ));
         }
         let mut e = Enc::new();
         e.str(&self.schema_id)?;
@@ -889,13 +982,17 @@ pub struct SourceDigest {
 /// is significant (base first, then resolved overlays in application order).
 pub fn model_content_sha256(sources: &[SourceDigest]) -> Result<Sha256Digest, WeightHostError> {
     if sources.is_empty() {
-        return Err(WeightHostError::InvalidArgument("model content needs at least one source".into()));
+        return Err(WeightHostError::InvalidArgument(
+            "model content needs at least one source".into(),
+        ));
     }
     let mut e = Enc::new();
     e.len(sources.len(), MAX_LIST_ITEMS, "sources")?;
     for s in sources {
         if s.role.is_empty() {
-            return Err(WeightHostError::InvalidArgument("source role must not be empty".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "source role must not be empty".into(),
+            ));
         }
         e.str(&s.role)?;
         e.u64(s.len);
@@ -1039,7 +1136,13 @@ impl WeightView {
             dtype: d.str()?,
             shape: dec_u64_vec(d)?,
             strides: dec_u64_vec(d)?,
-            matrix: d.opt(|d| Ok(MatrixDesc { m: d.u64()?, k: d.u64()?, row_stride_bytes: d.u64()? }))?,
+            matrix: d.opt(|d| {
+                Ok(MatrixDesc {
+                    m: d.u64()?,
+                    k: d.u64()?,
+                    row_stride_bytes: d.u64()?,
+                })
+            })?,
             quant: d.opt(|d| {
                 Ok(QuantDesc {
                     format: d.str()?,
@@ -1059,8 +1162,10 @@ impl WeightView {
 impl WeightManifest {
     /// Sort allocations by `owner_id` and views by `role` into canonical order.
     pub fn canonicalize(&mut self) {
-        self.allocations.sort_by(|a, b| a.owner_id.as_bytes().cmp(b.owner_id.as_bytes()));
-        self.views.sort_by(|a, b| a.role.as_bytes().cmp(b.role.as_bytes()));
+        self.allocations
+            .sort_by(|a, b| a.owner_id.as_bytes().cmp(b.owner_id.as_bytes()));
+        self.views
+            .sort_by(|a, b| a.role.as_bytes().cmp(b.role.as_bytes()));
     }
 
     /// Sum of rounded physical bytes (checked).
@@ -1072,11 +1177,16 @@ impl WeightManifest {
     }
 
     pub fn allocation_index(&self, owner_id: &str) -> Option<usize> {
-        self.allocations.binary_search_by(|a| a.owner_id.as_bytes().cmp(owner_id.as_bytes())).ok()
+        self.allocations
+            .binary_search_by(|a| a.owner_id.as_bytes().cmp(owner_id.as_bytes()))
+            .ok()
     }
 
     pub fn view(&self, role: &str) -> Option<&WeightView> {
-        self.views.binary_search_by(|v| v.role.as_bytes().cmp(role.as_bytes())).ok().map(|i| &self.views[i])
+        self.views
+            .binary_search_by(|v| v.role.as_bytes().cmp(role.as_bytes()))
+            .ok()
+            .map(|i| &self.views[i])
     }
 
     /// Structural validation: canonical ordering/uniqueness, checked extents,
@@ -1096,8 +1206,12 @@ impl WeightManifest {
         }
         let mut prev: Option<&str> = None;
         for a in &self.allocations {
-            if a.owner_id.is_empty() || a.device_arch.is_empty() || a.representation_tag.is_empty() {
-                return Err(bad_manifest(format!("allocation {:?} has an empty tag", a.owner_id)));
+            if a.owner_id.is_empty() || a.device_arch.is_empty() || a.representation_tag.is_empty()
+            {
+                return Err(bad_manifest(format!(
+                    "allocation {:?} has an empty tag",
+                    a.owner_id
+                )));
             }
             if let Some(p) = prev {
                 if a.owner_id.as_bytes() <= p.as_bytes() {
@@ -1106,15 +1220,27 @@ impl WeightManifest {
             }
             prev = Some(&a.owner_id);
             if a.granularity == 0 || a.physical_bytes == 0 {
-                return Err(bad_manifest(format!("allocation {:?} has zero granularity/physical size", a.owner_id)));
+                return Err(bad_manifest(format!(
+                    "allocation {:?} has zero granularity/physical size",
+                    a.owner_id
+                )));
             }
             if a.physical_bytes % a.granularity != 0 {
-                return Err(bad_manifest(format!("allocation {:?} physical size is not granularity aligned", a.owner_id)));
+                return Err(bad_manifest(format!(
+                    "allocation {:?} physical size is not granularity aligned",
+                    a.owner_id
+                )));
             }
             if a.logical_bytes > a.physical_bytes {
-                return Err(bad_manifest(format!("allocation {:?} logical bytes exceed physical bytes", a.owner_id)));
+                return Err(bad_manifest(format!(
+                    "allocation {:?} logical bytes exceed physical bytes",
+                    a.owner_id
+                )));
             }
-            if a.logical_bytes.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES).map_or(true, |need| a.physical_bytes < need) {
+            if a.logical_bytes
+                .checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES)
+                .map_or(true, |need| a.physical_bytes < need)
+            {
                 return Err(bad_manifest(format!(
                     "allocation {:?} lacks the mandatory {}-byte tail pad beyond its logical bytes",
                     a.owner_id, EXPORT_WEIGHT_TAIL_PAD_BYTES
@@ -1135,7 +1261,10 @@ impl WeightManifest {
             }
             prev = Some(&v.role);
             let Some(ai) = self.allocation_index(&v.owner_id) else {
-                return Err(bad_manifest(format!("view {:?} references unknown owner {:?}", v.role, v.owner_id)));
+                return Err(bad_manifest(format!(
+                    "view {:?} references unknown owner {:?}",
+                    v.role, v.owner_id
+                )));
             };
             let alloc = &self.allocations[ai];
             let end = v
@@ -1143,45 +1272,82 @@ impl WeightManifest {
                 .checked_add(v.byte_extent)
                 .ok_or_else(|| bad_manifest(format!("view {:?} extent overflows", v.role)))?;
             if end > alloc.logical_bytes {
-                return Err(bad_manifest(format!("view {:?} exceeds owner logical bytes", v.role)));
+                return Err(bad_manifest(format!(
+                    "view {:?} exceeds owner logical bytes",
+                    v.role
+                )));
             }
             if v.shape.len() > MAX_VIEW_RANK || v.strides.len() > MAX_VIEW_RANK {
                 return Err(WeightHostError::LimitExceeded("view rank"));
             }
             if !v.strides.is_empty() && v.strides.len() != v.shape.len() {
-                return Err(bad_manifest(format!("view {:?} stride rank differs from shape rank", v.role)));
+                return Err(bad_manifest(format!(
+                    "view {:?} stride rank differs from shape rank",
+                    v.role
+                )));
             }
-            if v.shape.iter().try_fold(1u64, |a, d| a.checked_mul(*d)).is_none() {
-                return Err(bad_manifest(format!("view {:?} element count overflows", v.role)));
+            if v.shape
+                .iter()
+                .try_fold(1u64, |a, d| a.checked_mul(*d))
+                .is_none()
+            {
+                return Err(bad_manifest(format!(
+                    "view {:?} element count overflows",
+                    v.role
+                )));
             }
             if let Some(m) = &v.matrix {
                 if m.m == 0 || m.k == 0 || m.row_stride_bytes == 0 {
-                    return Err(bad_manifest(format!("view {:?} has a zero matrix dimension", v.role)));
+                    return Err(bad_manifest(format!(
+                        "view {:?} has a zero matrix dimension",
+                        v.role
+                    )));
                 }
                 let need = m.m.checked_mul(m.row_stride_bytes);
                 if need.map_or(true, |n| n > v.byte_extent) {
-                    return Err(bad_manifest(format!("view {:?} rows exceed its byte extent", v.role)));
+                    return Err(bad_manifest(format!(
+                        "view {:?} rows exceed its byte extent",
+                        v.role
+                    )));
                 }
             }
             if let Some(q) = &v.quant {
                 if q.format.is_empty() {
-                    return Err(bad_manifest(format!("view {:?} has an empty quant format", v.role)));
+                    return Err(bad_manifest(format!(
+                        "view {:?} has an empty quant format",
+                        v.role
+                    )));
                 }
             }
             for (kind, role) in &v.companions {
                 if kind.is_empty() || self.view(role).is_none() {
-                    return Err(bad_manifest(format!("view {:?} has a dangling companion {:?}", v.role, kind)));
+                    return Err(bad_manifest(format!(
+                        "view {:?} has a dangling companion {:?}",
+                        v.role, kind
+                    )));
                 }
             }
             if let Some(target) = &v.alias_of {
                 let Some(t) = self.view(target) else {
-                    return Err(bad_manifest(format!("alias {:?} targets unknown view {:?}", v.role, target)));
+                    return Err(bad_manifest(format!(
+                        "alias {:?} targets unknown view {:?}",
+                        v.role, target
+                    )));
                 };
                 if t.alias_of.is_some() || t.role == v.role {
-                    return Err(bad_manifest(format!("alias {:?} targets an alias or itself", v.role)));
+                    return Err(bad_manifest(format!(
+                        "alias {:?} targets an alias or itself",
+                        v.role
+                    )));
                 }
-                if t.owner_id != v.owner_id || t.byte_offset != v.byte_offset || t.byte_extent != v.byte_extent {
-                    return Err(bad_manifest(format!("alias {:?} storage differs from its target", v.role)));
+                if t.owner_id != v.owner_id
+                    || t.byte_offset != v.byte_offset
+                    || t.byte_extent != v.byte_extent
+                {
+                    return Err(bad_manifest(format!(
+                        "alias {:?} storage differs from its target",
+                        v.role
+                    )));
                 }
             }
         }
@@ -1217,7 +1383,13 @@ impl WeightManifest {
         for _ in 0..nv {
             views.push(WeightView::decode(d)?);
         }
-        Ok(Self { arch, config, dispatch_metadata, allocations, views })
+        Ok(Self {
+            arch,
+            config,
+            dispatch_metadata,
+            allocations,
+            views,
+        })
     }
 
     /// Validate and canonically encode.
@@ -1259,7 +1431,10 @@ pub fn compute_layout_seals(
     e.digest(loader_abi);
     recipe.encode(&mut e)?;
     manifest.encode(&mut e)?;
-    Ok(LayoutSeals { recipe_sha256: recipe.sha256()?, layout_sha256: domain_hash(DOMAIN_LAYOUT, &e.buf) })
+    Ok(LayoutSeals {
+        recipe_sha256: recipe.sha256()?,
+        layout_sha256: domain_hash(DOMAIN_LAYOUT, &e.buf),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,7 +1474,9 @@ impl SourceFileIdentity {
 
 fn check_immutable_source(md: &std::fs::Metadata, what: &str) -> Result<(), WeightHostError> {
     if !md.file_type().is_file() {
-        return Err(WeightHostError::SourceNotImmutable(format!("{what} is not a regular file")));
+        return Err(WeightHostError::SourceNotImmutable(format!(
+            "{what} is not a regular file"
+        )));
     }
     if md.mode() & 0o222 != 0 {
         return Err(WeightHostError::SourceNotImmutable(format!(
@@ -1333,7 +1510,11 @@ impl SourceCertificate {
     }
     /// Input for [`model_content_sha256`].
     pub fn to_source_digest(&self) -> SourceDigest {
-        SourceDigest { role: self.role.clone(), len: self.identity.len, sha256: self.sha256 }
+        SourceDigest {
+            role: self.role.clone(),
+            len: self.identity.len,
+            sha256: self.sha256,
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, WeightHostError> {
@@ -1388,7 +1569,11 @@ impl SourceCertificate {
         if role.is_empty() {
             return Err(bad("empty role"));
         }
-        Ok(Self { role, identity, sha256 })
+        Ok(Self {
+            role,
+            identity,
+            sha256,
+        })
     }
 
     /// Atomically publish the certificate read-only (mode 0444) at `path`.
@@ -1424,10 +1609,14 @@ impl SourceCertificate {
             .map_err(io_ctx("open certificate"))?;
         let md = f.metadata().map_err(io_ctx("stat certificate"))?;
         if !md.file_type().is_file() {
-            return Err(WeightHostError::CertificateInvalid("certificate is not a regular file".into()));
+            return Err(WeightHostError::CertificateInvalid(
+                "certificate is not a regular file".into(),
+            ));
         }
         if md.uid() != euid() {
-            return Err(WeightHostError::CertificateInvalid("certificate not owned by the current user".into()));
+            return Err(WeightHostError::CertificateInvalid(
+                "certificate not owned by the current user".into(),
+            ));
         }
         if md.mode() & 0o222 != 0 {
             return Err(WeightHostError::CertificateInvalid(format!(
@@ -1436,10 +1625,14 @@ impl SourceCertificate {
             )));
         }
         if md.len() > MAX_CERT_FILE_BYTES {
-            return Err(WeightHostError::CertificateInvalid("certificate too large".into()));
+            return Err(WeightHostError::CertificateInvalid(
+                "certificate too large".into(),
+            ));
         }
         let mut bytes = Vec::with_capacity(md.len() as usize);
-        (&f).take(MAX_CERT_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(io_ctx("read certificate"))?;
+        (&f).take(MAX_CERT_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_ctx("read certificate"))?;
         Self::decode(&bytes)
     }
 
@@ -1460,14 +1653,19 @@ impl SourceCertificate {
 
     /// Load the trusted certificate, open the source and verify identity.
     /// Returns the retained source FD together with the certificate.
-    pub fn verify_source_path(cert_path: &Path, source_path: &Path) -> Result<(File, Self), WeightHostError> {
+    pub fn verify_source_path(
+        cert_path: &Path,
+        source_path: &Path,
+    ) -> Result<(File, Self), WeightHostError> {
         let cert = Self::load_trusted(cert_path)?;
         let file = File::open(source_path).map_err(io_ctx("open source"))?;
         cert.verify_against_file(&file)?;
         let path_md = std::fs::metadata(source_path).map_err(io_ctx("stat source path"))?;
         let fd_md = file.metadata().map_err(io_ctx("stat source"))?;
         if path_md.dev() != fd_md.dev() || path_md.ino() != fd_md.ino() {
-            return Err(WeightHostError::SourceMutated("source path was replaced while opening".into()));
+            return Err(WeightHostError::SourceMutated(
+                "source path was replaced while opening".into(),
+            ));
         }
         Ok((file, cert))
     }
@@ -1477,9 +1675,14 @@ impl SourceCertificate {
 /// streams the whole content through SHA-256 and requires identical identity
 /// before/after (and that the path still names the same inode). The retained
 /// `File` must be kept open for the host's lifetime.
-pub fn certify_source(path: &Path, role: &str) -> Result<(File, SourceCertificate), WeightHostError> {
+pub fn certify_source(
+    path: &Path,
+    role: &str,
+) -> Result<(File, SourceCertificate), WeightHostError> {
     if role.is_empty() {
-        return Err(WeightHostError::InvalidArgument("source role must not be empty".into()));
+        return Err(WeightHostError::InvalidArgument(
+            "source role must not be empty".into(),
+        ));
     }
     let file = File::open(path).map_err(io_ctx("open source"))?;
     let before = file.metadata().map_err(io_ctx("stat source"))?;
@@ -1489,13 +1692,24 @@ pub fn certify_source(path: &Path, role: &str) -> Result<(File, SourceCertificat
     let after = file.metadata().map_err(io_ctx("stat source"))?;
     let after_id = SourceFileIdentity::from_metadata(&after);
     if after_id != before_id || total != before_id.len {
-        return Err(WeightHostError::SourceMutated("source changed while hashing".into()));
+        return Err(WeightHostError::SourceMutated(
+            "source changed while hashing".into(),
+        ));
     }
     let path_md = std::fs::metadata(path).map_err(io_ctx("stat source path"))?;
     if path_md.dev() != after.dev() || path_md.ino() != after.ino() {
-        return Err(WeightHostError::SourceMutated("source path was replaced while hashing".into()));
+        return Err(WeightHostError::SourceMutated(
+            "source path was replaced while hashing".into(),
+        ));
     }
-    Ok((file, SourceCertificate { role: role.to_owned(), identity: after_id, sha256 }))
+    Ok((
+        file,
+        SourceCertificate {
+            role: role.to_owned(),
+            identity: after_id,
+            sha256,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1532,7 +1746,10 @@ pub struct ConnectOptions {
 
 impl Default for ConnectOptions {
     fn default() -> Self {
-        Self { handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT, expected_host_pid: None }
+        Self {
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            expected_host_pid: None,
+        }
     }
 }
 
@@ -1555,13 +1772,17 @@ impl HostHello {
     fn validate(&self) -> Result<(), WeightHostError> {
         let c = &self.card;
         if c.uuid.is_empty() || c.pci_bus_id.is_empty() || c.device_arch.is_empty() {
-            return Err(WeightHostError::InvalidArgument("card identity fields must not be empty".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "card identity fields must not be empty".into(),
+            ));
         }
         if self.admission_token.len() > MAX_ADMISSION_TOKEN_BYTES {
             return Err(WeightHostError::LimitExceeded("admission token"));
         }
         if self.options.handshake_timeout.is_zero() {
-            return Err(WeightHostError::InvalidArgument("handshake timeout must be non-zero".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "handshake timeout must be non-zero".into(),
+            ));
         }
         Ok(())
     }
@@ -1576,7 +1797,10 @@ pub struct PeerCredentials {
 }
 
 /// Same-effective-UID requirement plus optional exact pid.
-pub fn verify_peer(cred: &PeerCredentials, expected_pid: Option<u32>) -> Result<(), WeightHostError> {
+pub fn verify_peer(
+    cred: &PeerCredentials,
+    expected_pid: Option<u32>,
+) -> Result<(), WeightHostError> {
     if cred.uid != euid() {
         return Err(WeightHostError::PeerCredentials(format!(
             "peer uid {} differs from effective uid {}",
@@ -1585,11 +1809,16 @@ pub fn verify_peer(cred: &PeerCredentials, expected_pid: Option<u32>) -> Result<
         )));
     }
     if cred.pid == 0 {
-        return Err(WeightHostError::PeerCredentials("peer pid is not visible".into()));
+        return Err(WeightHostError::PeerCredentials(
+            "peer pid is not visible".into(),
+        ));
     }
     if let Some(p) = expected_pid {
         if cred.pid != p {
-            return Err(WeightHostError::PeerCredentials(format!("peer pid {} is not the expected pid {p}", cred.pid)));
+            return Err(WeightHostError::PeerCredentials(format!(
+                "peer pid {} is not the expected pid {p}",
+                cred.pid
+            )));
         }
     }
     Ok(())
@@ -1661,7 +1890,11 @@ fn encode_hello(h: &HostHello) -> Result<Vec<u8>, WeightHostError> {
 
 fn decode_hello(payload: &[u8]) -> Result<HostHello, WeightHostError> {
     let mut d = Dec::new(payload);
-    let card = CardIdentity { uuid: d.str()?, pci_bus_id: d.str()?, device_arch: d.str()? };
+    let card = CardIdentity {
+        uuid: d.str()?,
+        pci_bus_id: d.str()?,
+        device_arch: d.str()?,
+    };
     let source_sha256 = d.digest()?;
     let loader_abi_sha256 = d.digest()?;
     let recipe = LayoutRecipe::decode(&mut d)?;
@@ -1676,10 +1909,17 @@ fn decode_hello(payload: &[u8]) -> Result<HostHello, WeightHostError> {
         loader_abi_sha256,
         recipe,
         admission_token,
-        provenance: BuildProvenance { binary_sha256, kernel_image_sha256, label },
+        provenance: BuildProvenance {
+            binary_sha256,
+            kernel_image_sha256,
+            label,
+        },
         options: ConnectOptions::default(),
     };
-    if hello.card.uuid.is_empty() || hello.card.pci_bus_id.is_empty() || hello.card.device_arch.is_empty() {
+    if hello.card.uuid.is_empty()
+        || hello.card.pci_bus_id.is_empty()
+        || hello.card.device_arch.is_empty()
+    {
         return Err(proto("empty card identity"));
     }
     Ok(hello)
@@ -1721,7 +1961,16 @@ fn decode_ready(payload: &[u8]) -> Result<ReadyMsg, WeightHostError> {
     let manifest = WeightManifest::decode(&mut d)?;
     d.finish()?;
     manifest.validate()?;
-    Ok(ReadyMsg { epoch, source_sha256, loader_abi_sha256, recipe_sha256, layout_sha256, unique_bytes, fd_count, manifest })
+    Ok(ReadyMsg {
+        epoch,
+        source_sha256,
+        loader_abi_sha256,
+        recipe_sha256,
+        layout_sha256,
+        unique_bytes,
+        fd_count,
+        manifest,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1743,7 +1992,12 @@ fn encode_batch(b: &BatchMsg) -> Vec<u8> {
 
 fn decode_batch(payload: &[u8]) -> Result<BatchMsg, WeightHostError> {
     let mut d = Dec::new(payload);
-    let b = BatchMsg { index: d.u32()?, total: d.u32()?, first: d.u32()?, count: d.u32()? };
+    let b = BatchMsg {
+        index: d.u32()?,
+        total: d.u32()?,
+        first: d.u32()?,
+        count: d.u32()?,
+    };
     d.finish()?;
     Ok(b)
 }
@@ -1758,7 +2012,10 @@ fn encode_epoch_layout(epoch: &Epoch, layout: &Sha256Digest, imported: Option<u6
     e.buf
 }
 
-fn decode_epoch_layout(payload: &[u8], with_bytes: bool) -> Result<(Epoch, Sha256Digest, u64), WeightHostError> {
+fn decode_epoch_layout(
+    payload: &[u8],
+    with_bytes: bool,
+) -> Result<(Epoch, Sha256Digest, u64), WeightHostError> {
     let mut d = Dec::new(payload);
     let epoch = Epoch(d.arr::<16>()?);
     let layout = d.digest()?;
@@ -1781,7 +2038,8 @@ fn encode_reject(reason: &str) -> Vec<u8> {
 fn decode_reject(payload: &[u8]) -> Result<String, WeightHostError> {
     let mut d = Dec::new(payload);
     let n = d.count(MAX_REJECT_REASON_BYTES, "reject reason", 1)?;
-    let s = String::from_utf8(d.take(n)?.to_vec()).map_err(|_| proto("invalid UTF-8 in reject reason"))?;
+    let s = String::from_utf8(d.take(n)?.to_vec())
+        .map_err(|_| proto("invalid UTF-8 in reject reason"))?;
     d.finish()?;
     Ok(s)
 }
@@ -1821,7 +2079,12 @@ fn euid() -> u32 {
 #[repr(C, align(8))]
 struct CmsgBuf([u8; 512]);
 
-fn wait_fd(fd: RawFd, events: i16, deadline: Option<Instant>, what: &'static str) -> Result<(), WeightHostError> {
+fn wait_fd(
+    fd: RawFd,
+    events: i16,
+    deadline: Option<Instant>,
+    what: &'static str,
+) -> Result<(), WeightHostError> {
     loop {
         let timeout_ms: libc::c_int = match deadline {
             None => -1,
@@ -1834,7 +2097,11 @@ fn wait_fd(fd: RawFd, events: i16, deadline: Option<Instant>, what: &'static str
                 ms.min(libc::c_int::MAX as u128) as libc::c_int
             }
         };
-        let mut p = libc::pollfd { fd, events, revents: 0 };
+        let mut p = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
         // SAFETY: p is a valid pollfd for the duration of the call.
         let rc = unsafe { libc::poll(&mut p, 1, timeout_ms) };
         if rc < 0 {
@@ -1842,7 +2109,10 @@ fn wait_fd(fd: RawFd, events: i16, deadline: Option<Instant>, what: &'static str
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(WeightHostError::Io { context: "poll", source: e });
+            return Err(WeightHostError::Io {
+                context: "poll",
+                source: e,
+            });
         }
         if rc == 0 {
             return Err(WeightHostError::Timeout(what));
@@ -1853,7 +2123,10 @@ fn wait_fd(fd: RawFd, events: i16, deadline: Option<Instant>, what: &'static str
 
 fn sendmsg_once(fd: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
     debug_assert!(fds.len() <= 64);
-    let mut iov = libc::iovec { iov_base: data.as_ptr() as *mut libc::c_void, iov_len: data.len() };
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
     let mut ctl = CmsgBuf([0u8; 512]);
     // SAFETY: msghdr is plain data; all pointers below outlive the sendmsg call.
     unsafe {
@@ -1868,7 +2141,11 @@ fn sendmsg_once(fd: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len = libc::CMSG_LEN(payload) as _;
-            std::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cmsg), payload as usize);
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr() as *const u8,
+                libc::CMSG_DATA(cmsg),
+                payload as usize,
+            );
         }
         loop {
             let n = libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT);
@@ -1887,7 +2164,10 @@ fn sendmsg_once(fd: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
 /// Every received descriptor is wrapped into an `OwnedFd` before any error can
 /// be returned, so no path leaks a descriptor.
 fn recvmsg_once(fd: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
-    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
     let mut ctl = CmsgBuf([0u8; 512]);
     // SAFETY: buffers outlive the call; returned SCM_RIGHTS fds are freshly owned.
     unsafe {
@@ -1912,7 +2192,8 @@ fn recvmsg_once(fd: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                 let hdr = libc::CMSG_LEN(0) as usize;
-                let cnt = ((*cmsg).cmsg_len as usize).saturating_sub(hdr) / std::mem::size_of::<libc::c_int>();
+                let cnt = ((*cmsg).cmsg_len as usize).saturating_sub(hdr)
+                    / std::mem::size_of::<libc::c_int>();
                 let data = libc::CMSG_DATA(cmsg) as *const libc::c_int;
                 for i in 0..cnt {
                     let raw = std::ptr::read_unaligned(data.add(i));
@@ -1922,7 +2203,10 @@ fn recvmsg_once(fd: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ancillary data truncated"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ancillary data truncated",
+            ));
         }
         Ok(n)
     }
@@ -1945,7 +2229,9 @@ fn send_bytes(
                 // The ancillary data rides with the first byte accepted.
                 pending = &[];
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_fd(conn.fd(), libc::POLLOUT, deadline, what)?,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait_fd(conn.fd(), libc::POLLOUT, deadline, what)?
+            }
             Err(e) => return Err(map_io(e, what)),
         }
     }
@@ -1982,7 +2268,9 @@ fn recv_exact(
         match recvmsg_once(conn.fd(), &mut buf[off..], fds) {
             Ok(0) => return Err(WeightHostError::PeerClosed(what)),
             Ok(n) => off += n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_fd(conn.fd(), libc::POLLIN, deadline, what)?,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait_fd(conn.fd(), libc::POLLIN, deadline, what)?
+            }
             Err(e) => return Err(map_io(e, what)),
         }
         if fds.len() > MAX_FDS_PER_MESSAGE {
@@ -1992,7 +2280,11 @@ fn recv_exact(
     Ok(())
 }
 
-fn read_frame(conn: &Conn, deadline: Option<Instant>, what: &'static str) -> Result<Frame, WeightHostError> {
+fn read_frame(
+    conn: &Conn,
+    deadline: Option<Instant>,
+    what: &'static str,
+) -> Result<Frame, WeightHostError> {
     let mut fds: Vec<OwnedFd> = Vec::new();
     let mut hdr = [0u8; HEADER_LEN];
     recv_exact(conn, &mut hdr, &mut fds, deadline, what)?;
@@ -2002,7 +2294,10 @@ fn read_frame(conn: &Conn, deadline: Option<Instant>, what: &'static str) -> Res
     let le = |i: usize| u32::from_le_bytes([hdr[i], hdr[i + 1], hdr[i + 2], hdr[i + 3]]);
     let version = le(4);
     if version != PROTOCOL_VERSION {
-        return Err(WeightHostError::UnsupportedVersion { got: version, supported: PROTOCOL_VERSION });
+        return Err(WeightHostError::UnsupportedVersion {
+            got: version,
+            supported: PROTOCOL_VERSION,
+        });
     }
     let kind = MsgKind::from_u32(le(8))?;
     let len = le(12) as usize;
@@ -2016,7 +2311,10 @@ fn read_frame(conn: &Conn, deadline: Option<Instant>, what: &'static str) -> Res
     let mut payload = vec![0u8; len];
     recv_exact(conn, &mut payload, &mut fds, deadline, what)?;
     if fds.len() != fd_count {
-        return Err(WeightHostError::FdCount { expected: fd_count, got: fds.len() });
+        return Err(WeightHostError::FdCount {
+            expected: fd_count,
+            got: fds.len(),
+        });
     }
     Ok(Frame { kind, payload, fds })
 }
@@ -2034,8 +2332,16 @@ fn check_fd(fd: &impl AsRawFd, what: &str) -> Result<(), WeightHostError> {
     let raw = fd.as_raw_fd();
     match fd_is_cloexec(raw) {
         Ok(true) => {}
-        Ok(false) => return Err(WeightHostError::FdInvalid(format!("{what}: descriptor is not close-on-exec"))),
-        Err(e) => return Err(WeightHostError::FdInvalid(format!("{what}: not a valid descriptor ({e})"))),
+        Ok(false) => {
+            return Err(WeightHostError::FdInvalid(format!(
+                "{what}: descriptor is not close-on-exec"
+            )))
+        }
+        Err(e) => {
+            return Err(WeightHostError::FdInvalid(format!(
+                "{what}: not a valid descriptor ({e})"
+            )))
+        }
     }
     // SAFETY: st is a plain out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -2044,7 +2350,9 @@ fn check_fd(fd: &impl AsRawFd, what: &str) -> Result<(), WeightHostError> {
         return Err(WeightHostError::FdInvalid(format!("{what}: fstat failed")));
     }
     if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        return Err(WeightHostError::FdInvalid(format!("{what}: descriptor is a directory")));
+        return Err(WeightHostError::FdInvalid(format!(
+            "{what}: descriptor is a directory"
+        )));
     }
     Ok(())
 }
@@ -2054,22 +2362,43 @@ fn peer_credentials(fd: RawFd) -> Result<PeerCredentials, WeightHostError> {
     let mut uc: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let rc = unsafe {
-        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut uc as *mut _ as *mut libc::c_void, &mut len)
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut uc as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
     };
     if rc != 0 {
-        return Err(WeightHostError::Io { context: "SO_PEERCRED", source: io::Error::last_os_error() });
+        return Err(WeightHostError::Io {
+            context: "SO_PEERCRED",
+            source: io::Error::last_os_error(),
+        });
     }
-    Ok(PeerCredentials { pid: uc.pid as u32, uid: uc.uid, gid: uc.gid })
+    Ok(PeerCredentials {
+        pid: uc.pid as u32,
+        uid: uc.uid,
+        gid: uc.gid,
+    })
 }
 
 fn check_private_dir(dir: &Path) -> Result<(), WeightHostError> {
-    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     let md = std::fs::metadata(dir).map_err(io_ctx("stat socket directory"))?;
     if !md.is_dir() {
-        return Err(WeightHostError::InsecureSocket("socket parent is not a directory".into()));
+        return Err(WeightHostError::InsecureSocket(
+            "socket parent is not a directory".into(),
+        ));
     }
     if md.uid() != euid() {
-        return Err(WeightHostError::InsecureSocket("socket directory is not owned by the current user".into()));
+        return Err(WeightHostError::InsecureSocket(
+            "socket directory is not owned by the current user".into(),
+        ));
     }
     if md.mode() & 0o077 != 0 {
         return Err(WeightHostError::InsecureSocket(format!(
@@ -2084,10 +2413,14 @@ fn check_client_socket(path: &Path) -> Result<(), WeightHostError> {
     check_private_dir(path.parent().unwrap_or(Path::new(".")))?;
     let md = std::fs::symlink_metadata(path).map_err(io_ctx("stat socket"))?;
     if !md.file_type().is_socket() {
-        return Err(WeightHostError::InsecureSocket("path is not a unix socket".into()));
+        return Err(WeightHostError::InsecureSocket(
+            "path is not a unix socket".into(),
+        ));
     }
     if md.uid() != euid() {
-        return Err(WeightHostError::InsecureSocket("socket is not owned by the current user".into()));
+        return Err(WeightHostError::InsecureSocket(
+            "socket is not owned by the current user".into(),
+        ));
     }
     if md.mode() & 0o077 != 0 {
         return Err(WeightHostError::InsecureSocket(format!(
@@ -2104,23 +2437,41 @@ fn connect_unix(path: &Path) -> Result<OwnedFd, WeightHostError> {
     // SAFETY: sockaddr_un is plain data.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if bytes.is_empty() || bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
-        return Err(WeightHostError::InvalidArgument("socket path empty, too long or contains NUL".into()));
+        return Err(WeightHostError::InvalidArgument(
+            "socket path empty, too long or contains NUL".into(),
+        ));
     }
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     for (i, b) in bytes.iter().enumerate() {
         addr.sun_path[i] = *b as libc::c_char;
     }
     // SAFETY: plain syscalls; fd ownership transferred immediately.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
     if fd < 0 {
-        return Err(WeightHostError::Io { context: "socket", source: io::Error::last_os_error() });
+        return Err(WeightHostError::Io {
+            context: "socket",
+            source: io::Error::last_os_error(),
+        });
     }
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let rc = unsafe {
-        libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t)
+        libc::connect(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
     };
     if rc != 0 {
-        return Err(WeightHostError::Io { context: "connect", source: io::Error::last_os_error() });
+        return Err(WeightHostError::Io {
+            context: "connect",
+            source: io::Error::last_os_error(),
+        });
     }
     Ok(owned)
 }
@@ -2159,7 +2510,14 @@ impl WeightHostClient {
         let conn = Conn(connect_unix(socket)?);
         let peer = peer_credentials(conn.fd())?;
         verify_peer(&peer, hello.options.expected_host_pid)?;
-        send_frame(&conn, MsgKind::Hello, &hello_bytes, &[], deadline, "send Hello")?;
+        send_frame(
+            &conn,
+            MsgKind::Hello,
+            &hello_bytes,
+            &[],
+            deadline,
+            "send Hello",
+        )?;
 
         let frame = read_frame(&conn, deadline, "read Ready")?;
         match frame.kind {
@@ -2168,7 +2526,10 @@ impl WeightHostClient {
             k => return Err(proto(format!("expected Ready, got {k:?}"))),
         }
         if !frame.fds.is_empty() {
-            return Err(WeightHostError::FdCount { expected: 0, got: frame.fds.len() });
+            return Err(WeightHostError::FdCount {
+                expected: 0,
+                got: frame.fds.len(),
+            });
         }
         let ready = decode_ready(&frame.payload)?;
         if ready.epoch.is_zero() {
@@ -2183,18 +2544,34 @@ impl WeightHostClient {
         if ready.recipe_sha256 != recipe_sha {
             return Err(WeightHostError::IdentityMismatch("recipe_sha256"));
         }
-        let seals = compute_layout_seals(&hello.source_sha256, &hello.loader_abi_sha256, &hello.recipe, &ready.manifest)?;
+        let seals = compute_layout_seals(
+            &hello.source_sha256,
+            &hello.loader_abi_sha256,
+            &hello.recipe,
+            &ready.manifest,
+        )?;
         if seals.layout_sha256 != ready.layout_sha256 {
             return Err(WeightHostError::IdentityMismatch("layout_sha256"));
         }
         let unique = ready.manifest.unique_bytes()?;
         if unique != ready.unique_bytes {
-            return Err(WeightHostError::ImportedBytesMismatch { expected: unique, got: ready.unique_bytes });
+            return Err(WeightHostError::ImportedBytesMismatch {
+                expected: unique,
+                got: ready.unique_bytes,
+            });
         }
         if ready.fd_count as usize != ready.manifest.allocations.len() {
-            return Err(WeightHostError::FdCount { expected: ready.manifest.allocations.len(), got: ready.fd_count as usize });
+            return Err(WeightHostError::FdCount {
+                expected: ready.manifest.allocations.len(),
+                got: ready.fd_count as usize,
+            });
         }
-        if let Some(a) = ready.manifest.allocations.iter().find(|a| a.device_arch != hello.card.device_arch) {
+        if let Some(a) = ready
+            .manifest
+            .allocations
+            .iter()
+            .find(|a| a.device_arch != hello.card.device_arch)
+        {
             let _ = a;
             return Err(WeightHostError::IdentityMismatch("device_arch"));
         }
@@ -2220,10 +2597,16 @@ impl WeightHostClient {
                 return Err(proto("FdBatch count out of range"));
             }
             if b.count as usize != f.fds.len() {
-                return Err(WeightHostError::FdCount { expected: b.count as usize, got: f.fds.len() });
+                return Err(WeightHostError::FdCount {
+                    expected: b.count as usize,
+                    got: f.fds.len(),
+                });
             }
             if fds.len() + f.fds.len() > fd_count {
-                return Err(WeightHostError::FdCount { expected: fd_count, got: fds.len() + f.fds.len() });
+                return Err(WeightHostError::FdCount {
+                    expected: fd_count,
+                    got: fds.len() + f.fds.len(),
+                });
             }
             for (i, fd) in f.fds.into_iter().enumerate() {
                 check_fd(&fd, "allocation fd")?;
@@ -2232,7 +2615,10 @@ impl WeightHostClient {
             }
         }
         if fds.len() != fd_count {
-            return Err(WeightHostError::FdCount { expected: fd_count, got: fds.len() });
+            return Err(WeightHostError::FdCount {
+                expected: fd_count,
+                got: fds.len(),
+            });
         }
 
         Ok(WeightHostLease {
@@ -2355,14 +2741,27 @@ impl WeightHostLease {
     /// `imported_bytes` must equal [`Self::unique_bytes`].
     pub fn ack_import(&mut self, imported_bytes: u64) -> Result<(), WeightHostError> {
         if self.state != LeaseState::Received {
-            return Err(WeightHostError::InvalidState("import already acknowledged or lease released"));
+            return Err(WeightHostError::InvalidState(
+                "import already acknowledged or lease released",
+            ));
         }
         if imported_bytes != self.unique_bytes {
-            return Err(WeightHostError::ImportedBytesMismatch { expected: self.unique_bytes, got: imported_bytes });
+            return Err(WeightHostError::ImportedBytesMismatch {
+                expected: self.unique_bytes,
+                got: imported_bytes,
+            });
         }
         let deadline = Some(Instant::now() + self.control_timeout);
-        let payload = encode_epoch_layout(&self.epoch, &self.seals.layout_sha256, Some(imported_bytes));
-        send_frame(&self.conn, MsgKind::ImportAck, &payload, &[], deadline, "send ImportAck")?;
+        let payload =
+            encode_epoch_layout(&self.epoch, &self.seals.layout_sha256, Some(imported_bytes));
+        send_frame(
+            &self.conn,
+            MsgKind::ImportAck,
+            &payload,
+            &[],
+            deadline,
+            "send ImportAck",
+        )?;
         self.state = LeaseState::ImportAcked;
         Ok(())
     }
@@ -2384,16 +2783,29 @@ impl WeightHostLease {
     /// expected; the socket is shut down afterwards.
     pub fn release(&mut self) -> Result<(), WeightHostError> {
         match self.state {
-            LeaseState::Received => return Err(WeightHostError::InvalidState("release before import ack")),
-            LeaseState::Released => return Err(WeightHostError::InvalidState("lease already released")),
+            LeaseState::Received => {
+                return Err(WeightHostError::InvalidState("release before import ack"))
+            }
+            LeaseState::Released => {
+                return Err(WeightHostError::InvalidState("lease already released"))
+            }
             LeaseState::ImportAcked => {}
         }
         if !self.fds.is_empty() {
-            return Err(WeightHostError::InvalidState("allocation fds still open; close them before release"));
+            return Err(WeightHostError::InvalidState(
+                "allocation fds still open; close them before release",
+            ));
         }
         let deadline = Some(Instant::now() + self.control_timeout);
         let payload = encode_epoch_layout(&self.epoch, &self.seals.layout_sha256, None);
-        send_frame(&self.conn, MsgKind::Release, &payload, &[], deadline, "send Release")?;
+        send_frame(
+            &self.conn,
+            MsgKind::Release,
+            &payload,
+            &[],
+            deadline,
+            "send Release",
+        )?;
         self.state = LeaseState::Released;
         // SAFETY: valid socket fd; shutdown only flushes EOF to the host.
         unsafe {
@@ -2415,7 +2827,12 @@ fn peek_raw(conn: &Conn, what: &'static str) -> Result<PeekResult, WeightHostErr
     loop {
         // SAFETY: valid one-byte buffer.
         let n = unsafe {
-            libc::recv(conn.fd(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+            libc::recv(
+                conn.fd(),
+                b.as_mut_ptr() as *mut libc::c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
         };
         if n == 0 {
             return Ok(PeekResult::Eof);
@@ -2427,9 +2844,9 @@ fn peek_raw(conn: &Conn, what: &'static str) -> Result<PeekResult, WeightHostErr
         match e.kind() {
             io::ErrorKind::WouldBlock => return Ok(PeekResult::Empty),
             io::ErrorKind::Interrupted => continue,
-            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe => {
-                return Ok(PeekResult::Eof)
-            }
+            io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe => return Ok(PeekResult::Eof),
             _ => return Err(map_io(e, what)),
         }
     }
@@ -2447,7 +2864,9 @@ pub fn weight_host_socket_from_env() -> Result<Option<PathBuf>, WeightHostError>
         b"0" => Ok(None),
         b"1" => {
             let sock = std::env::var_os("HIPFIRE_WEIGHT_HOST_SOCKET").ok_or_else(|| {
-                WeightHostError::InvalidArgument("HIPFIRE_WEIGHT_HOST=1 requires HIPFIRE_WEIGHT_HOST_SOCKET".into())
+                WeightHostError::InvalidArgument(
+                    "HIPFIRE_WEIGHT_HOST=1 requires HIPFIRE_WEIGHT_HOST_SOCKET".into(),
+                )
             })?;
             let path = PathBuf::from(sock);
             if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
@@ -2457,7 +2876,9 @@ pub fn weight_host_socket_from_env() -> Result<Option<PathBuf>, WeightHostError>
             }
             Ok(Some(path))
         }
-        _ => Err(WeightHostError::InvalidArgument("HIPFIRE_WEIGHT_HOST must be unset, 0 or 1".into())),
+        _ => Err(WeightHostError::InvalidArgument(
+            "HIPFIRE_WEIGHT_HOST must be unset, 0 or 1".into(),
+        )),
     }
 }
 
@@ -2503,19 +2924,30 @@ impl WeightPublication {
         fds: Vec<OwnedFd>,
     ) -> Result<Self, WeightHostError> {
         if epoch.is_zero() {
-            return Err(WeightHostError::InvalidArgument("epoch must be non-zero".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "epoch must be non-zero".into(),
+            ));
         }
         if card.uuid.is_empty() || card.pci_bus_id.is_empty() || card.device_arch.is_empty() {
-            return Err(WeightHostError::InvalidArgument("card identity fields must not be empty".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "card identity fields must not be empty".into(),
+            ));
         }
         manifest.validate()?;
         if fds.len() != manifest.allocations.len() {
-            return Err(WeightHostError::FdCount { expected: manifest.allocations.len(), got: fds.len() });
+            return Err(WeightHostError::FdCount {
+                expected: manifest.allocations.len(),
+                got: fds.len(),
+            });
         }
         for (i, fd) in fds.iter().enumerate() {
             check_fd(fd, &format!("publication fd {i}"))?;
         }
-        if manifest.allocations.iter().any(|a| a.device_arch != card.device_arch) {
+        if manifest
+            .allocations
+            .iter()
+            .any(|a| a.device_arch != card.device_arch)
+        {
             return Err(WeightHostError::IdentityMismatch("device_arch"));
         }
         let seals = compute_layout_seals(&source_sha256, &loader_abi_sha256, &recipe, &manifest)?;
@@ -2533,7 +2965,18 @@ impl WeightPublication {
         if ready_payload.len() > MAX_FRAME_PAYLOAD {
             return Err(WeightHostError::LimitExceeded("Ready payload"));
         }
-        Ok(Self { epoch, card, source_sha256, loader_abi_sha256, recipe, manifest, seals, unique_bytes, ready_payload, fds })
+        Ok(Self {
+            epoch,
+            card,
+            source_sha256,
+            loader_abi_sha256,
+            recipe,
+            manifest,
+            seals,
+            unique_bytes,
+            ready_payload,
+            fds,
+        })
     }
 
     pub fn epoch(&self) -> Epoch {
@@ -2570,7 +3013,10 @@ pub struct ServeOptions {
 
 impl Default for ServeOptions {
     fn default() -> Self {
-        Self { handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT, expected_peer_pid: None }
+        Self {
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            expected_peer_pid: None,
+        }
     }
 }
 
@@ -2598,7 +3044,9 @@ pub struct WeightHostServer {
 
 impl fmt::Debug for WeightHostServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WeightHostServer").field("unlink", &self.unlink).finish()
+        f.debug_struct("WeightHostServer")
+            .field("unlink", &self.unlink)
+            .finish()
     }
 }
 
@@ -2612,18 +3060,33 @@ impl WeightHostServer {
         options: ServeOptions,
     ) -> Result<Self, WeightHostError> {
         if options.handshake_timeout.is_zero() {
-            return Err(WeightHostError::InvalidArgument("handshake timeout must be non-zero".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "handshake timeout must be non-zero".into(),
+            ));
         }
-        listener.set_nonblocking(true).map_err(io_ctx("set nonblocking"))?;
-        Ok(Self { listener, publication, options, unlink: None })
+        listener
+            .set_nonblocking(true)
+            .map_err(io_ctx("set nonblocking"))?;
+        Ok(Self {
+            listener,
+            publication,
+            options,
+            unlink: None,
+        })
     }
 
     /// Convenience bind: the parent directory must already be private (0700, same
     /// owner); the socket is chmod 0600. Fails if `path` exists.
-    pub fn bind(path: &Path, publication: Arc<WeightPublication>, options: ServeOptions) -> Result<Self, WeightHostError> {
+    pub fn bind(
+        path: &Path,
+        publication: Arc<WeightPublication>,
+        options: ServeOptions,
+    ) -> Result<Self, WeightHostError> {
         check_private_dir(path.parent().unwrap_or(Path::new(".")))?;
         if std::fs::symlink_metadata(path).is_ok() {
-            return Err(WeightHostError::InsecureSocket("socket path already exists; refusing to overwrite".into()));
+            return Err(WeightHostError::InsecureSocket(
+                "socket path already exists; refusing to overwrite".into(),
+            ));
         }
         let listener = UnixListener::bind(path).map_err(io_ctx("bind"))?;
         let cleanup = |e: WeightHostError| {
@@ -2633,7 +3096,9 @@ impl WeightHostServer {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(io_ctx("chmod socket"))
             .map_err(cleanup)?;
-        let md = std::fs::symlink_metadata(path).map_err(io_ctx("stat socket")).map_err(cleanup)?;
+        let md = std::fs::symlink_metadata(path)
+            .map_err(io_ctx("stat socket"))
+            .map_err(cleanup)?;
         let mut s = Self::from_listener(listener, publication, options).map_err(cleanup)?;
         s.unlink = Some((path.to_path_buf(), (md.dev(), md.ino())));
         Ok(s)
@@ -2650,11 +3115,19 @@ impl WeightHostServer {
         let stream = loop {
             match self.listener.accept() {
                 Ok((s, _)) => break s,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    wait_fd(self.listener.as_raw_fd(), libc::POLLIN, wait_deadline, "accept")?
-                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_fd(
+                    self.listener.as_raw_fd(),
+                    libc::POLLIN,
+                    wait_deadline,
+                    "accept",
+                )?,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(WeightHostError::Io { context: "accept", source: e }),
+                Err(e) => {
+                    return Err(WeightHostError::Io {
+                        context: "accept",
+                        source: e,
+                    })
+                }
             }
         };
         HostConnection::from_stream(stream, self.publication.clone(), self.options)
@@ -2685,7 +3158,9 @@ pub struct HostConnection {
 
 impl fmt::Debug for HostConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HostConnection").field("peer", &self.peer).finish()
+        f.debug_struct("HostConnection")
+            .field("peer", &self.peer)
+            .finish()
     }
 }
 
@@ -2701,7 +3176,9 @@ impl HostConnection {
         options: ServeOptions,
     ) -> Result<Self, WeightHostError> {
         if options.handshake_timeout.is_zero() {
-            return Err(WeightHostError::InvalidArgument("handshake timeout must be non-zero".into()));
+            return Err(WeightHostError::InvalidArgument(
+                "handshake timeout must be non-zero".into(),
+            ));
         }
         let deadline = Some(Instant::now() + options.handshake_timeout);
         let conn = Conn::from_stream(stream)?;
@@ -2712,7 +3189,10 @@ impl HostConnection {
             return Err(proto(format!("expected Hello, got {:?}", frame.kind)));
         }
         if !frame.fds.is_empty() {
-            return Err(WeightHostError::FdCount { expected: 0, got: frame.fds.len() });
+            return Err(WeightHostError::FdCount {
+                expected: 0,
+                got: frame.fds.len(),
+            });
         }
         let hello = decode_hello(&frame.payload)?;
         let p = &*publication;
@@ -2742,7 +3222,13 @@ impl HostConnection {
             );
             return Err(WeightHostError::IdentityMismatch(field));
         }
-        Ok(Self { conn, peer, hello, publication, deadline })
+        Ok(Self {
+            conn,
+            peer,
+            hello,
+            publication,
+            deadline,
+        })
     }
 
     pub fn peer(&self) -> &PeerCredentials {
@@ -2754,7 +3240,14 @@ impl HostConnection {
 
     /// Refuse the client with a reason (best effort) and close.
     pub fn reject(self, reason: &str) {
-        let _ = send_frame(&self.conn, MsgKind::Reject, &encode_reject(reason), &[], self.deadline, "send Reject");
+        let _ = send_frame(
+            &self.conn,
+            MsgKind::Reject,
+            &encode_reject(reason),
+            &[],
+            self.deadline,
+            "send Reject",
+        );
     }
 
     /// Run the authenticated admission callback. `Ok(())` registers a pending
@@ -2784,7 +3277,14 @@ impl HostConnection {
                 state: HostSessionState::Admitted,
             }),
             Err(reason) => {
-                let _ = send_frame(&self.conn, MsgKind::Reject, &encode_reject(&reason), &[], self.deadline, "send Reject");
+                let _ = send_frame(
+                    &self.conn,
+                    MsgKind::Reject,
+                    &encode_reject(&reason),
+                    &[],
+                    self.deadline,
+                    "send Reject",
+                );
                 Err(WeightHostError::AdmissionDenied(reason))
             }
         }
@@ -2880,10 +3380,19 @@ impl HostSession {
     /// absolute handshake deadline.
     pub fn send_allocations(&mut self) -> Result<(), WeightHostError> {
         if self.state != HostSessionState::Admitted {
-            return Err(WeightHostError::InvalidState("allocations already sent or session failed"));
+            return Err(WeightHostError::InvalidState(
+                "allocations already sent or session failed",
+            ));
         }
         let p = self.publication.clone();
-        if let Err(e) = send_frame(&self.conn, MsgKind::Ready, &p.ready_payload, &[], self.deadline, "send Ready") {
+        if let Err(e) = send_frame(
+            &self.conn,
+            MsgKind::Ready,
+            &p.ready_payload,
+            &[],
+            self.deadline,
+            "send Ready",
+        ) {
             return self.fail(e);
         }
         let total = batch_total(p.fds.len());
@@ -2898,7 +3407,14 @@ impl HostSession {
                 count: raw.len() as u32,
             });
             self.fds_exposed += raw.len();
-            if let Err(e) = send_frame(&self.conn, MsgKind::FdBatch, &payload, &raw, self.deadline, "send FdBatch") {
+            if let Err(e) = send_frame(
+                &self.conn,
+                MsgKind::FdBatch,
+                &payload,
+                &raw,
+                self.deadline,
+                "send FdBatch",
+            ) {
                 return self.fail(e);
             }
         }
@@ -2906,7 +3422,11 @@ impl HostSession {
         Ok(())
     }
 
-    fn read_control(&mut self, timeout: Option<Duration>, what: &'static str) -> Result<Frame, WeightHostError> {
+    fn read_control(
+        &mut self,
+        timeout: Option<Duration>,
+        what: &'static str,
+    ) -> Result<Frame, WeightHostError> {
         let deadline = timeout.map(|t| Instant::now() + t);
         match read_frame(&self.conn, deadline, what) {
             Ok(f) => {
@@ -2922,7 +3442,10 @@ impl HostSession {
 
     /// Wait for the tenant's explicit `ImportAck` (`None` blocks). EOF or timeout
     /// fails the session; neither proves the tenant released anything.
-    pub fn wait_import_ack(&mut self, timeout: Option<Duration>) -> Result<ImportAck, WeightHostError> {
+    pub fn wait_import_ack(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<ImportAck, WeightHostError> {
         if self.state != HostSessionState::FdsSent {
             return Err(WeightHostError::InvalidState("not awaiting ImportAck"));
         }
@@ -2943,10 +3466,17 @@ impl HostSession {
         }
         if bytes != p.unique_bytes {
             let expected = p.unique_bytes;
-            return self.fail(WeightHostError::ImportedBytesMismatch { expected, got: bytes });
+            return self.fail(WeightHostError::ImportedBytesMismatch {
+                expected,
+                got: bytes,
+            });
         }
         self.state = HostSessionState::ImportAcked;
-        Ok(ImportAck { epoch, layout_sha256: layout, imported_bytes: bytes })
+        Ok(ImportAck {
+            epoch,
+            layout_sha256: layout,
+            imported_bytes: bytes,
+        })
     }
 
     /// Wait for the tenant's explicit `Release` (`None` blocks). EOF before
@@ -3005,7 +3535,10 @@ impl HostSession {
             if e.raw_os_error() == Some(libc::ENOTCONN) {
                 return Ok(());
             }
-            return Err(WeightHostError::Io { context: "shutdown(write)", source: e });
+            return Err(WeightHostError::Io {
+                context: "shutdown(write)",
+                source: e,
+            });
         }
         Ok(())
     }
@@ -3013,7 +3546,10 @@ impl HostSession {
     /// Non-destructive check whether the tenant closed its socket (EOF). `Ok(true)`
     /// does not prove teardown; pending data reports `false`.
     pub fn peer_closed(&self) -> Result<bool, WeightHostError> {
-        Ok(matches!(peek_raw(&self.conn, "tenant control socket")?, PeekResult::Eof))
+        Ok(matches!(
+            peek_raw(&self.conn, "tenant control socket")?,
+            PeekResult::Eof
+        ))
     }
 }
 
@@ -3092,7 +3628,10 @@ mod tests {
     }
 
     fn open_fd_count() -> usize {
-        let names: Vec<_> = std::fs::read_dir("/proc/self/fd").unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         names.len()
     }
 
@@ -3116,7 +3655,11 @@ mod tests {
     }
 
     fn card() -> CardIdentity {
-        CardIdentity { uuid: "GPU-test-0".into(), pci_bus_id: "0000:03:00.0".into(), device_arch: "gfx1201".into() }
+        CardIdentity {
+            uuid: "GPU-test-0".into(),
+            pci_bus_id: "0000:03:00.0".into(),
+            device_arch: "gfx1201".into(),
+        }
     }
 
     fn alloc(id: &str, phys: u64, logical: u64) -> SharedAllocation {
@@ -3156,10 +3699,17 @@ mod tests {
             block_bytes: 136,
             packing: "mq4v2".into(),
         });
-        embed.metadata.insert("lut".into(), FieldValue::f32_list(&[0.0, -0.5, 0.25, 1.0]));
+        embed
+            .metadata
+            .insert("lut".into(), FieldValue::f32_list(&[0.0, -0.5, 0.25, 1.0]));
         let mut q = view("layer0.q", "b.layer0", 0, 8000);
-        q.matrix = Some(MatrixDesc { m: 100, k: 160, row_stride_bytes: 80 });
-        q.companions.insert("scales".into(), "layer0.q_scales".into());
+        q.matrix = Some(MatrixDesc {
+            m: 100,
+            k: 160,
+            row_stride_bytes: 80,
+        });
+        q.companions
+            .insert("scales".into(), "layer0.q_scales".into());
         let scales = view("layer0.q_scales", "b.layer0", 8192, 4096);
         let mut head = view("lm_head", "a.embed", 0, 8000);
         head.alias_of = Some("embed".into());
@@ -3171,7 +3721,10 @@ mod tests {
             arch: "test-dense".into(),
             config,
             dispatch_metadata: b"dispatch-v1".to_vec(),
-            allocations: vec![alloc("a.embed", 77_824, 8000), alloc("b.layer0", 81_920, 16000)],
+            allocations: vec![
+                alloc("a.embed", 77_824, 8000),
+                alloc("b.layer0", 81_920, 16000),
+            ],
             views: vec![embed, q, scales, head],
         }
     }
@@ -3189,7 +3742,9 @@ mod tests {
 
     fn seal_of(m: &WeightManifest) -> Sha256Digest {
         let (a, b) = digests();
-        compute_layout_seals(&a, &b, &base_recipe(), m).unwrap().layout_sha256
+        compute_layout_seals(&a, &b, &base_recipe(), m)
+            .unwrap()
+            .layout_sha256
     }
 
     // ---- identity ----
@@ -3214,10 +3769,17 @@ mod tests {
             r.encode_canonical().unwrap(),
             vec![1, 0, 0, 0, b'a', 1, 0, 0, 0, 1, 0, 0, 0, b'k', 2, 1, 0, 0, 0, 0, 0, 0, 0]
         );
-        let x = LayoutRecipe::new("s").with("b", FieldValue::U64(2)).with("a", FieldValue::Bool(true));
-        let y = LayoutRecipe::new("s").with("a", FieldValue::Bool(true)).with("b", FieldValue::U64(2));
+        let x = LayoutRecipe::new("s")
+            .with("b", FieldValue::U64(2))
+            .with("a", FieldValue::Bool(true));
+        let y = LayoutRecipe::new("s")
+            .with("a", FieldValue::Bool(true))
+            .with("b", FieldValue::U64(2));
         assert_eq!(x.sha256().unwrap(), y.sha256().unwrap());
-        assert_ne!(x.sha256().unwrap(), x.clone().with("c", FieldValue::Absent).sha256().unwrap());
+        assert_ne!(
+            x.sha256().unwrap(),
+            x.clone().with("c", FieldValue::Absent).sha256().unwrap()
+        );
         assert!(LayoutRecipe::new("").sha256().is_err());
     }
 
@@ -3229,7 +3791,9 @@ mod tests {
         let n1 = FieldValue::F32Bits(0x7fc0_0000);
         let n2 = FieldValue::F32Bits(0x7fc0_0001);
         assert_ne!(n1, n2);
-        let r = LayoutRecipe::new("s").with("n", n2.clone()).with("l", FieldValue::f32_list(&[f32::NAN, -0.0]));
+        let r = LayoutRecipe::new("s")
+            .with("n", n2.clone())
+            .with("l", FieldValue::f32_list(&[f32::NAN, -0.0]));
         let bytes = r.encode_canonical().unwrap();
         let mut d = Dec::new(&bytes);
         assert_eq!(LayoutRecipe::decode(&mut d).unwrap(), r);
@@ -3239,9 +3803,14 @@ mod tests {
     #[test]
     fn nested_values_roundtrip_and_depth_limit() {
         let mut inner = CanonicalFields::new();
-        inner.insert("x".into(), FieldValue::List(vec![FieldValue::I64(-3), FieldValue::Bytes(vec![1, 2, 3])]));
+        inner.insert(
+            "x".into(),
+            FieldValue::List(vec![FieldValue::I64(-3), FieldValue::Bytes(vec![1, 2, 3])]),
+        );
         inner.insert("d".into(), FieldValue::Digest(Sha256Digest::of(b"q")));
-        let r = LayoutRecipe::new("s").with("m", FieldValue::Map(inner)).with("f", FieldValue::f64(2.5));
+        let r = LayoutRecipe::new("s")
+            .with("m", FieldValue::Map(inner))
+            .with("f", FieldValue::f64(2.5));
         let bytes = r.encode_canonical().unwrap();
         let mut d = Dec::new(&bytes);
         assert_eq!(LayoutRecipe::decode(&mut d).unwrap(), r);
@@ -3295,23 +3864,43 @@ mod tests {
         c.add_component_bytes("model_load.rs", b"fn load() { changed }");
         assert_ne!(a.sha256().unwrap(), c.sha256().unwrap());
         let d = LoaderAbi::new("abi/v1").with("fwht_seed", FieldValue::U64(8));
-        assert_ne!(LoaderAbi::new("abi/v1").sha256().unwrap(), d.sha256().unwrap());
+        assert_ne!(
+            LoaderAbi::new("abi/v1").sha256().unwrap(),
+            d.sha256().unwrap()
+        );
         // provenance has no representation in the ABI or the layout seal
-        let h1 = BuildProvenance { binary_sha256: Some(Sha256Digest::of(b"A")), ..Default::default() };
-        let h2 = BuildProvenance { binary_sha256: Some(Sha256Digest::of(b"B")), kernel_image_sha256: Some(Sha256Digest::of(b"K")), label: "x".into() };
+        let h1 = BuildProvenance {
+            binary_sha256: Some(Sha256Digest::of(b"A")),
+            ..Default::default()
+        };
+        let h2 = BuildProvenance {
+            binary_sha256: Some(Sha256Digest::of(b"B")),
+            kernel_image_sha256: Some(Sha256Digest::of(b"K")),
+            label: "x".into(),
+        };
         assert_ne!(h1, h2);
         assert_eq!(seal_of(&base_manifest()), seal_of(&base_manifest()));
     }
 
     #[test]
     fn model_content_order_and_content_sensitive() {
-        let s = |role: &str, data: &[u8]| SourceDigest { role: role.into(), len: data.len() as u64, sha256: Sha256Digest::of(data) };
+        let s = |role: &str, data: &[u8]| SourceDigest {
+            role: role.into(),
+            len: data.len() as u64,
+            sha256: Sha256Digest::of(data),
+        };
         let base = s("base", b"AAAA");
         let ov = s("overlay", b"BB");
         let ab = model_content_sha256(&[base.clone(), ov.clone()]).unwrap();
-        assert_ne!(ab, model_content_sha256(&[ov.clone(), base.clone()]).unwrap());
+        assert_ne!(
+            ab,
+            model_content_sha256(&[ov.clone(), base.clone()]).unwrap()
+        );
         assert_ne!(ab, model_content_sha256(&[base.clone()]).unwrap());
-        assert_ne!(ab, model_content_sha256(&[base, s("overlay", b"BC")]).unwrap());
+        assert_ne!(
+            ab,
+            model_content_sha256(&[base, s("overlay", b"BC")]).unwrap()
+        );
         assert!(model_content_sha256(&[]).is_err());
     }
 
@@ -3321,19 +3910,28 @@ mod tests {
         let check = |label: &str, f: &dyn Fn(&mut WeightManifest)| {
             let mut m = base_manifest();
             f(&mut m);
-            m.validate().unwrap_or_else(|e| panic!("{label}: mutation invalid: {e}"));
+            m.validate()
+                .unwrap_or_else(|e| panic!("{label}: mutation invalid: {e}"));
             assert_ne!(seal_of(&m), base, "{label} must change the layout seal");
         };
-        check("quant packing", &|m| m.views[0].quant.as_mut().unwrap().packing = "mq4v3".into());
-        check("quant group", &|m| m.views[0].quant.as_mut().unwrap().group_size = 128);
+        check("quant packing", &|m| {
+            m.views[0].quant.as_mut().unwrap().packing = "mq4v3".into()
+        });
+        check("quant group", &|m| {
+            m.views[0].quant.as_mut().unwrap().group_size = 128
+        });
         check("awq mode", &|m| {
-            m.config.insert("awq_rms_fdiv".into(), FieldValue::Bool(false));
+            m.config
+                .insert("awq_rms_fdiv".into(), FieldValue::Bool(false));
         });
         check("z fold", &|m| {
             m.config.insert("z_fold".into(), FieldValue::Bool(true));
         });
         check("lut payload", &|m| {
-            m.views[0].metadata.insert("lut".into(), FieldValue::f32_list(&[0.0, -0.5, 0.25, 1.0000001]));
+            m.views[0].metadata.insert(
+                "lut".into(),
+                FieldValue::f32_list(&[0.0, -0.5, 0.25, 1.0000001]),
+            );
         });
         check("source tensor dtype", &|m| m.views[1].dtype = "f16".into());
         check("alias offset topology", &|m| {
@@ -3346,27 +3944,56 @@ mod tests {
                 a.device_arch = "gfx1100".into();
             }
         });
-        check("representation tag", &|m| m.allocations[0].representation_tag = "hfq-final/v2".into());
+        check("representation tag", &|m| {
+            m.allocations[0].representation_tag = "hfq-final/v2".into()
+        });
         check("granularity", &|m| {
             m.allocations[1].granularity = 8192;
         });
         check("padding extent", &|m| m.allocations[0].logical_bytes = 8100);
-        check("dispatch metadata", &|m| m.dispatch_metadata = b"dispatch-v2".to_vec());
-        check("dispatch metadata cleared", &|m| m.dispatch_metadata.clear());
+        check("dispatch metadata", &|m| {
+            m.dispatch_metadata = b"dispatch-v2".to_vec()
+        });
+        check("dispatch metadata cleared", &|m| {
+            m.dispatch_metadata.clear()
+        });
         check("expert placement config", &|m| {
-            m.config.insert("expert_layers".into(), FieldValue::U64List(vec![3, 4]));
+            m.config
+                .insert("expert_layers".into(), FieldValue::U64List(vec![3, 4]));
         });
 
         let (a, b) = digests();
         let m = base_manifest();
         let seal = |model: &Sha256Digest, abi: &Sha256Digest, r: &LayoutRecipe| {
-            compute_layout_seals(model, abi, r, &m).unwrap().layout_sha256
+            compute_layout_seals(model, abi, r, &m)
+                .unwrap()
+                .layout_sha256
         };
         let ok = seal(&a, &b, &base_recipe());
-        assert_ne!(ok, seal(&Sha256Digest::of(b"model2"), &b, &base_recipe()), "source payload");
-        assert_ne!(ok, seal(&a, &Sha256Digest::of(b"abi2"), &base_recipe()), "loader ABI");
-        assert_ne!(ok, seal(&a, &b, &base_recipe().with("pp", FieldValue::U64(2))), "recipe/placement");
-        assert_ne!(ok, seal(&a, &b, &base_recipe().with("placement", FieldValue::str("auto"))), "placement");
+        assert_ne!(
+            ok,
+            seal(&Sha256Digest::of(b"model2"), &b, &base_recipe()),
+            "source payload"
+        );
+        assert_ne!(
+            ok,
+            seal(&a, &Sha256Digest::of(b"abi2"), &base_recipe()),
+            "loader ABI"
+        );
+        assert_ne!(
+            ok,
+            seal(&a, &b, &base_recipe().with("pp", FieldValue::U64(2))),
+            "recipe/placement"
+        );
+        assert_ne!(
+            ok,
+            seal(
+                &a,
+                &b,
+                &base_recipe().with("placement", FieldValue::str("auto"))
+            ),
+            "placement"
+        );
     }
 
     #[test]
@@ -3378,7 +4005,10 @@ mod tests {
         extra.push(0);
         assert!(WeightManifest::decode_canonical(&extra).is_err());
         for cut in 0..bytes.len() {
-            assert!(WeightManifest::decode_canonical(&bytes[..cut]).is_err(), "prefix {cut} accepted");
+            assert!(
+                WeightManifest::decode_canonical(&bytes[..cut]).is_err(),
+                "prefix {cut} accepted"
+            );
         }
 
         let bad = |label: &str, f: &dyn Fn(&mut WeightManifest)| {
@@ -3389,27 +4019,43 @@ mod tests {
         };
         bad("empty", &|m| m.allocations.clear());
         bad("unsorted allocations", &|m| m.allocations.reverse());
-        bad("duplicate owner", &|m| m.allocations[1].owner_id = "a.embed".into());
+        bad("duplicate owner", &|m| {
+            m.allocations[1].owner_id = "a.embed".into()
+        });
         bad("zero granularity", &|m| m.allocations[0].granularity = 0);
-        bad("unaligned physical", &|m| m.allocations[0].physical_bytes = 8000);
-        bad("logical > physical", &|m| m.allocations[0].logical_bytes = 80_000);
-        bad("tail pad too small", &|m| m.allocations[0].physical_bytes = 65_536);
+        bad("unaligned physical", &|m| {
+            m.allocations[0].physical_bytes = 8000
+        });
+        bad("logical > physical", &|m| {
+            m.allocations[0].logical_bytes = 80_000
+        });
+        bad("tail pad too small", &|m| {
+            m.allocations[0].physical_bytes = 65_536
+        });
         bad("tail pad one aligned page short", &|m| {
             m.allocations[0].logical_bytes = 77_824 - EXPORT_WEIGHT_TAIL_PAD_BYTES + 1;
         });
-        bad("logical + pad overflows", &|m| m.allocations[0].logical_bytes = u64::MAX);
+        bad("logical + pad overflows", &|m| {
+            m.allocations[0].logical_bytes = u64::MAX
+        });
         bad("unsorted views", &|m| m.views.swap(0, 1));
         bad("unknown owner", &|m| m.views[1].owner_id = "zzz".into());
         bad("view beyond logical", &|m| m.views[2].byte_extent = 9000);
         bad("extent overflow", &|m| m.views[2].byte_offset = u64::MAX);
         bad("stride rank", &|m| m.views[0].strides = vec![1, 2]);
-        bad("matrix rows exceed", &|m| m.views[1].matrix.as_mut().unwrap().m = 1000);
-        bad("matrix mul overflow", &|m| m.views[1].matrix.as_mut().unwrap().row_stride_bytes = u64::MAX);
+        bad("matrix rows exceed", &|m| {
+            m.views[1].matrix.as_mut().unwrap().m = 1000
+        });
+        bad("matrix mul overflow", &|m| {
+            m.views[1].matrix.as_mut().unwrap().row_stride_bytes = u64::MAX
+        });
         bad("dangling companion", &|m| {
             m.views[1].companions.insert("zeros".into(), "nope".into());
         });
         bad("alias offset mismatch", &|m| m.views[3].byte_offset = 8);
-        bad("alias unknown target", &|m| m.views[3].alias_of = Some("nope".into()));
+        bad("alias unknown target", &|m| {
+            m.views[3].alias_of = Some("nope".into())
+        });
         bad("alias chain", &|m| {
             m.views[0].alias_of = Some("lm_head".into());
         });
@@ -3441,7 +4087,10 @@ mod tests {
 
         let (_f, loaded) = SourceCertificate::verify_source_path(&cert_path, &src).unwrap();
         assert_eq!(loaded, cert);
-        assert_eq!(SourceCertificate::decode(&cert.encode().unwrap()).unwrap(), cert);
+        assert_eq!(
+            SourceCertificate::decode(&cert.encode().unwrap()).unwrap(),
+            cert
+        );
 
         // tampered bytes (checksum)
         let mut raw = cert.encode().unwrap();
@@ -3450,7 +4099,10 @@ mod tests {
 
         // writable certificate is not trusted
         std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o664)).unwrap();
-        assert!(matches!(SourceCertificate::load_trusted(&cert_path), Err(WeightHostError::CertificateInvalid(_))));
+        assert!(matches!(
+            SourceCertificate::load_trusted(&cert_path),
+            Err(WeightHostError::CertificateInvalid(_))
+        ));
         std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         // symlinked certificate is not trusted
@@ -3471,7 +4123,10 @@ mod tests {
         let w = dir.path().join("writable");
         std::fs::write(&w, b"x").unwrap();
         std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(certify_source(&w, "base"), Err(WeightHostError::SourceNotImmutable(_))));
+        assert!(matches!(
+            certify_source(&w, "base"),
+            Err(WeightHostError::SourceNotImmutable(_))
+        ));
 
         // changed length is stale
         let src2 = dir.path().join("m2");
@@ -3494,12 +4149,25 @@ mod tests {
     #[test]
     fn peer_credential_rules() {
         let _g = fd_lock();
-        let me = PeerCredentials { pid: 42, uid: euid(), gid: 0 };
+        let me = PeerCredentials {
+            pid: 42,
+            uid: euid(),
+            gid: 0,
+        };
         assert!(verify_peer(&me, None).is_ok());
         assert!(verify_peer(&me, Some(42)).is_ok());
-        assert!(matches!(verify_peer(&me, Some(43)), Err(WeightHostError::PeerCredentials(_))));
-        let other = PeerCredentials { uid: euid().wrapping_add(1), ..me };
-        assert!(matches!(verify_peer(&other, None), Err(WeightHostError::PeerCredentials(_))));
+        assert!(matches!(
+            verify_peer(&me, Some(43)),
+            Err(WeightHostError::PeerCredentials(_))
+        ));
+        let other = PeerCredentials {
+            uid: euid().wrapping_add(1),
+            ..me
+        };
+        assert!(matches!(
+            verify_peer(&other, None),
+            Err(WeightHostError::PeerCredentials(_))
+        ));
         assert!(verify_peer(&PeerCredentials { pid: 0, ..me }, None).is_err());
     }
 
@@ -3520,7 +4188,13 @@ mod tests {
             allocations.push(alloc(&id, WIDE_PHYS, 4000));
             views.push(view(&format!("w{i:04}"), &id, 0, 4000));
         }
-        WeightManifest { arch: "test-dense".into(), config: CanonicalFields::new(), dispatch_metadata: Vec::new(), allocations, views }
+        WeightManifest {
+            arch: "test-dense".into(),
+            config: CanonicalFields::new(),
+            dispatch_metadata: Vec::new(),
+            allocations,
+            views,
+        }
     }
 
     fn fixture(n: usize) -> Fixture {
@@ -3528,9 +4202,23 @@ mod tests {
         let recipe = base_recipe();
         let fds: Vec<OwnedFd> = (0..n).map(|i| memfd(&[i as u8 + 1; 64])).collect();
         let publication = Arc::new(
-            WeightPublication::new(Epoch([7u8; 16]), card(), model, abi, recipe.clone(), wide_manifest(n), fds).unwrap(),
+            WeightPublication::new(
+                Epoch([7u8; 16]),
+                card(),
+                model,
+                abi,
+                recipe.clone(),
+                wide_manifest(n),
+                fds,
+            )
+            .unwrap(),
         );
-        Fixture { publication, model, abi, recipe }
+        Fixture {
+            publication,
+            model,
+            abi,
+            recipe,
+        }
     }
 
     fn hello_for(f: &Fixture) -> HostHello {
@@ -3540,8 +4228,14 @@ mod tests {
             loader_abi_sha256: f.abi,
             recipe: f.recipe.clone(),
             admission_token: "tok".to_string(),
-            provenance: BuildProvenance { label: "client".into(), ..Default::default() },
-            options: ConnectOptions { handshake_timeout: Duration::from_secs(5), expected_host_pid: None },
+            provenance: BuildProvenance {
+                label: "client".into(),
+                ..Default::default()
+            },
+            options: ConnectOptions {
+                handshake_timeout: Duration::from_secs(5),
+                expected_host_pid: None,
+            },
         }
     }
 
@@ -3556,7 +4250,10 @@ mod tests {
         let before = open_fd_count();
         {
             let f = fixture(3);
-            let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+            let server = Arc::new(
+                WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default())
+                    .unwrap(),
+            );
             assert_eq!(std::fs::metadata(&sock).unwrap().mode() & 0o777, 0o600);
             let s2 = server.clone();
             let host = thread::spawn(move || -> Result<(), WeightHostError> {
@@ -3565,7 +4262,11 @@ mod tests {
                 assert_eq!(conn.hello().provenance.label, "client");
                 let mut sess = conn.admit(|req| {
                     assert_eq!(req.fd_count, 3);
-                    if req.hello.admission_token == "tok" { Ok(()) } else { Err("bad token".into()) }
+                    if req.hello.admission_token == "tok" {
+                        Ok(())
+                    } else {
+                        Err("bad token".into())
+                    }
                 })?;
                 assert_eq!(sess.state(), HostSessionState::Admitted);
                 assert_eq!(sess.fds_exposed(), 0);
@@ -3598,17 +4299,32 @@ mod tests {
             let (idx, a, _) = lease.allocation("a0002").unwrap();
             assert_eq!((idx, a.physical_bytes), (2, WIDE_PHYS));
 
-            assert!(matches!(lease.release(), Err(WeightHostError::InvalidState(_))), "release before ack");
-            assert!(matches!(lease.ack_import(1), Err(WeightHostError::ImportedBytesMismatch { .. })));
+            assert!(
+                matches!(lease.release(), Err(WeightHostError::InvalidState(_))),
+                "release before ack"
+            );
+            assert!(matches!(
+                lease.ack_import(1),
+                Err(WeightHostError::ImportedBytesMismatch { .. })
+            ));
             assert!(!lease.is_import_acked());
             lease.ack_import(lease.unique_bytes()).unwrap();
-            assert!(matches!(lease.ack_import(lease.unique_bytes()), Err(WeightHostError::InvalidState(_))));
-            assert!(matches!(lease.release(), Err(WeightHostError::InvalidState(_))), "fds still open");
+            assert!(matches!(
+                lease.ack_import(lease.unique_bytes()),
+                Err(WeightHostError::InvalidState(_))
+            ));
+            assert!(
+                matches!(lease.release(), Err(WeightHostError::InvalidState(_))),
+                "fds still open"
+            );
             let taken = lease.take_allocation_fds();
             assert_eq!(taken.len(), 3);
             drop(taken);
             lease.release().unwrap();
-            assert!(matches!(lease.release(), Err(WeightHostError::InvalidState(_))));
+            assert!(matches!(
+                lease.release(),
+                Err(WeightHostError::InvalidState(_))
+            ));
             host.join().unwrap().unwrap();
         }
         assert_eq!(open_fd_count(), before, "descriptor leak");
@@ -3625,7 +4341,10 @@ mod tests {
             let before = open_fd_count();
             {
                 let f = fixture(n);
-                let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+                let server = Arc::new(
+                    WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default())
+                        .unwrap(),
+                );
                 let s2 = server.clone();
                 let host = thread::spawn(move || -> Result<(), WeightHostError> {
                     let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
@@ -3659,10 +4378,26 @@ mod tests {
         let (model, abi) = digests();
         let recipe = base_recipe();
         let publication = Arc::new(
-            WeightPublication::new(Epoch([1u8; 16]), card(), model, abi, recipe.clone(), wide_manifest(1), vec![r]).unwrap(),
+            WeightPublication::new(
+                Epoch([1u8; 16]),
+                card(),
+                model,
+                abi,
+                recipe.clone(),
+                wide_manifest(1),
+                vec![r],
+            )
+            .unwrap(),
         );
-        let f = Fixture { publication, model, abi, recipe };
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let f = Fixture {
+            publication,
+            model,
+            abi,
+            recipe,
+        };
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<HostSession, WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
@@ -3674,7 +4409,13 @@ mod tests {
         // write on the host-side write end, read through the received duplicate
         let mut wf = File::from(w);
         wf.write_all(b"ping").unwrap();
-        let mut rf = File::from(lease.allocation_fd(0).unwrap().try_clone_to_owned().unwrap());
+        let mut rf = File::from(
+            lease
+                .allocation_fd(0)
+                .unwrap()
+                .try_clone_to_owned()
+                .unwrap(),
+        );
         let mut buf = [0u8; 4];
         rf.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
@@ -3689,7 +4430,10 @@ mod tests {
         let before = open_fd_count();
         {
             let f = fixture(2);
-            let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+            let server = Arc::new(
+                WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default())
+                    .unwrap(),
+            );
             let s2 = server.clone();
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let host = thread::spawn(move || -> Result<(), WeightHostError> {
@@ -3718,12 +4462,16 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<HostSession, WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
             sess.send_allocations()?;
-            let e = sess.wait_import_ack(Some(Duration::from_millis(50))).unwrap_err();
+            let e = sess
+                .wait_import_ack(Some(Duration::from_millis(50)))
+                .unwrap_err();
             assert!(matches!(e, WeightHostError::Timeout(_)), "got {e:?}");
             assert_eq!(sess.state(), HostSessionState::Failed);
             Ok(sess)
@@ -3741,7 +4489,9 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<(), WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
@@ -3750,6 +4500,19 @@ mod tests {
         });
         let lease = WeightHostClient::connect(&sock, hello_for(&f)).unwrap();
         host.join().unwrap().unwrap();
+        // join() waits for the host thread to return, but the peer hangup
+        // reaches this socket asynchronously: on a loaded runner a single
+        // nonblocking MSG_PEEK can still see the socket Empty. Poll for the
+        // hangup, then confirm through the lease's own probe.
+        if lease.host_alive().unwrap() {
+            wait_fd(
+                lease.conn.fd(),
+                libc::POLLIN,
+                Some(Instant::now() + T),
+                "host hangup",
+            )
+            .unwrap();
+        }
         assert!(!lease.host_alive().unwrap());
         // FDs and manifest stay valid for draining the current request
         assert_eq!(lease.allocation_fds().len(), 1);
@@ -3762,27 +4525,51 @@ mod tests {
         let before = open_fd_count();
         type Mutator = Box<dyn Fn(&mut HostHello)>;
         let cases: Vec<(&str, Mutator)> = vec![
-            ("source_sha256", Box::new(|h| h.source_sha256 = Sha256Digest::of(b"other"))),
-            ("loader_abi_sha256", Box::new(|h| h.loader_abi_sha256 = Sha256Digest::of(b"other"))),
-            ("recipe_sha256", Box::new(|h| h.recipe.set("pp", FieldValue::U64(2)))),
+            (
+                "source_sha256",
+                Box::new(|h| h.source_sha256 = Sha256Digest::of(b"other")),
+            ),
+            (
+                "loader_abi_sha256",
+                Box::new(|h| h.loader_abi_sha256 = Sha256Digest::of(b"other")),
+            ),
+            (
+                "recipe_sha256",
+                Box::new(|h| h.recipe.set("pp", FieldValue::U64(2))),
+            ),
             ("card.uuid", Box::new(|h| h.card.uuid = "GPU-other".into())),
-            ("card.pci_bus_id", Box::new(|h| h.card.pci_bus_id = "0000:04:00.0".into())),
-            ("card.device_arch", Box::new(|h| h.card.device_arch = "gfx1100".into())),
+            (
+                "card.pci_bus_id",
+                Box::new(|h| h.card.pci_bus_id = "0000:04:00.0".into()),
+            ),
+            (
+                "card.device_arch",
+                Box::new(|h| h.card.device_arch = "gfx1100".into()),
+            ),
         ];
         for (field, mutate) in cases {
             let dir = private_tempdir();
             let sock = dir.path().join("h.sock");
             {
                 let f = fixture(2);
-                let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+                let server = Arc::new(
+                    WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default())
+                        .unwrap(),
+                );
                 let s2 = server.clone();
                 let host = thread::spawn(move || s2.accept(Some(T)).map(|_| ()));
                 let mut h = hello_for(&f);
                 mutate(&mut h);
                 let e = WeightHostClient::connect(&sock, h).unwrap_err();
-                assert!(matches!(&e, WeightHostError::Rejected(r) if r.contains(field)), "{field}: {e:?}");
+                assert!(
+                    matches!(&e, WeightHostError::Rejected(r) if r.contains(field)),
+                    "{field}: {e:?}"
+                );
                 let he = host.join().unwrap().unwrap_err();
-                assert!(matches!(he, WeightHostError::IdentityMismatch(x) if x == field), "{field}");
+                assert!(
+                    matches!(he, WeightHostError::IdentityMismatch(x) if x == field),
+                    "{field}"
+                );
             }
         }
         assert_eq!(open_fd_count(), before, "descriptor leak");
@@ -3797,14 +4584,25 @@ mod tests {
         let before = open_fd_count();
         {
             let f = fixture(1);
-            let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+            let server = Arc::new(
+                WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default())
+                    .unwrap(),
+            );
             let s2 = server.clone();
             let host = thread::spawn(move || {
-                s2.accept(Some(T)).and_then(|c| c.admit(|_| Err("no ledger capacity".to_string()))).map(|_| ())
+                s2.accept(Some(T))
+                    .and_then(|c| c.admit(|_| Err("no ledger capacity".to_string())))
+                    .map(|_| ())
             });
             let e = WeightHostClient::connect(&sock, hello_for(&f)).unwrap_err();
-            assert!(matches!(&e, WeightHostError::Rejected(r) if r == "no ledger capacity"), "{e:?}");
-            assert!(matches!(host.join().unwrap(), Err(WeightHostError::AdmissionDenied(_))));
+            assert!(
+                matches!(&e, WeightHostError::Rejected(r) if r == "no ledger capacity"),
+                "{e:?}"
+            );
+            assert!(matches!(
+                host.join().unwrap(),
+                Err(WeightHostError::AdmissionDenied(_))
+            ));
         }
         assert_eq!(open_fd_count(), before);
     }
@@ -3816,23 +4614,37 @@ mod tests {
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
         // client expects a different host pid: fails before sending Hello
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let mut h = hello_for(&f);
         h.options.expected_host_pid = Some(std::process::id().wrapping_add(1));
-        assert!(matches!(WeightHostClient::connect(&sock, h), Err(WeightHostError::PeerCredentials(_))));
+        assert!(matches!(
+            WeightHostClient::connect(&sock, h),
+            Err(WeightHostError::PeerCredentials(_))
+        ));
         drop(server);
 
         // host expects a different tenant pid
-        let opts = ServeOptions { expected_peer_pid: Some(std::process::id().wrapping_add(1)), ..Default::default() };
+        let opts = ServeOptions {
+            expected_peer_pid: Some(std::process::id().wrapping_add(1)),
+            ..Default::default()
+        };
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), opts).unwrap());
         let s2 = server.clone();
         let host = thread::spawn(move || s2.accept(Some(T)).map(|_| ()));
         let _ = WeightHostClient::connect(&sock, hello_for(&f)).unwrap_err();
-        assert!(matches!(host.join().unwrap(), Err(WeightHostError::PeerCredentials(_))));
+        assert!(matches!(
+            host.join().unwrap(),
+            Err(WeightHostError::PeerCredentials(_))
+        ));
         drop(server);
 
         // correct expectations succeed
-        let opts = ServeOptions { expected_peer_pid: Some(std::process::id()), ..Default::default() };
+        let opts = ServeOptions {
+            expected_peer_pid: Some(std::process::id()),
+            ..Default::default()
+        };
         let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), opts).unwrap());
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<(), WeightHostError> {
@@ -3851,16 +4663,25 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap();
+        let server =
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap();
         // never overwrite an existing path
-        assert!(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).is_err());
+        assert!(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).is_err()
+        );
         // group-accessible directory is refused by clients and by bind
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(WeightHostClient::connect(&sock, hello_for(&f)), Err(WeightHostError::InsecureSocket(_))));
+        assert!(matches!(
+            WeightHostClient::connect(&sock, hello_for(&f)),
+            Err(WeightHostError::InsecureSocket(_))
+        ));
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         // permissive socket mode refused
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(matches!(WeightHostClient::connect(&sock, hello_for(&f)), Err(WeightHostError::InsecureSocket(_))));
+        assert!(matches!(
+            WeightHostClient::connect(&sock, hello_for(&f)),
+            Err(WeightHostError::InsecureSocket(_))
+        ));
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
         drop(server);
         assert!(!sock.exists());
@@ -3870,7 +4691,10 @@ mod tests {
         let plain = dir.path().join("plain");
         std::fs::write(&plain, b"x").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(WeightHostClient::connect(&plain, hello_for(&f)), Err(WeightHostError::InsecureSocket(_))));
+        assert!(matches!(
+            WeightHostClient::connect(&plain, hello_for(&f)),
+            Err(WeightHostError::InsecureSocket(_))
+        ));
     }
 
     #[test]
@@ -3896,9 +4720,20 @@ mod tests {
         let _g = fd_lock();
         let (model, abi) = digests();
         let mk = |fds: Vec<OwnedFd>, epoch: Epoch| {
-            WeightPublication::new(epoch, card(), model, abi, base_recipe(), wide_manifest(2), fds)
+            WeightPublication::new(
+                epoch,
+                card(),
+                model,
+                abi,
+                base_recipe(),
+                wide_manifest(2),
+                fds,
+            )
         };
-        assert!(matches!(mk(vec![memfd(b"a")], Epoch([1; 16])), Err(WeightHostError::FdCount { .. })));
+        assert!(matches!(
+            mk(vec![memfd(b"a")], Epoch([1; 16])),
+            Err(WeightHostError::FdCount { .. })
+        ));
         assert!(mk(vec![memfd(b"a"), memfd(b"b")], Epoch([0; 16])).is_err());
         // non-CLOEXEC descriptor refused
         let leaky = {
@@ -3906,7 +4741,10 @@ mod tests {
             let raw = unsafe { libc::fcntl(memfd(b"c").as_raw_fd(), libc::F_DUPFD, 3) };
             unsafe { OwnedFd::from_raw_fd(raw) }
         };
-        assert!(matches!(mk(vec![memfd(b"a"), leaky], Epoch([1; 16])), Err(WeightHostError::FdInvalid(_))));
+        assert!(matches!(
+            mk(vec![memfd(b"a"), leaky], Epoch([1; 16])),
+            Err(WeightHostError::FdInvalid(_))
+        ));
         // device arch mismatch between allocations and card
         let mut other_card = card();
         other_card.device_arch = "gfx1100".into();
@@ -3929,7 +4767,9 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || s2.accept(Some(T)).map(|_| ()));
         let raw = Conn(connect_unix(&sock).unwrap());
@@ -3938,7 +4778,10 @@ mod tests {
         send_bytes(&raw, &bytes, &[], Some(Instant::now() + T), "t").unwrap();
         assert!(matches!(
             host.join().unwrap(),
-            Err(WeightHostError::UnsupportedVersion { got: 2, supported: 1 })
+            Err(WeightHostError::UnsupportedVersion {
+                got: 2,
+                supported: 1
+            })
         ));
     }
 
@@ -3967,7 +4810,8 @@ mod tests {
 
     fn good_ready(h: &HostHello, n: usize) -> ReadyMsg {
         let m = wide_manifest(n);
-        let seals = compute_layout_seals(&h.source_sha256, &h.loader_abi_sha256, &h.recipe, &m).unwrap();
+        let seals =
+            compute_layout_seals(&h.source_sha256, &h.loader_abi_sha256, &h.recipe, &m).unwrap();
         ReadyMsg {
             epoch: Epoch([9; 16]),
             source_sha256: h.source_sha256,
@@ -3981,11 +4825,23 @@ mod tests {
     }
 
     fn send_ready(c: &Conn, r: &ReadyMsg) {
-        let _ = send_frame(c, MsgKind::Ready, &encode_ready(r).unwrap(), &[], dl(), "evil");
+        let _ = send_frame(
+            c,
+            MsgKind::Ready,
+            &encode_ready(r).unwrap(),
+            &[],
+            dl(),
+            "evil",
+        );
     }
 
     fn send_batch(c: &Conn, b: BatchMsg, header_fds: u32, attach: &[RawFd]) {
-        let bytes = frame_bytes(PROTOCOL_VERSION, MsgKind::FdBatch as u32, &encode_batch(&b), header_fds);
+        let bytes = frame_bytes(
+            PROTOCOL_VERSION,
+            MsgKind::FdBatch as u32,
+            &encode_batch(&b),
+            header_fds,
+        );
         let _ = send_bytes(c, &bytes, attach, dl(), "evil");
     }
 
@@ -3999,7 +4855,13 @@ mod tests {
                 "wrong version",
                 Box::new(|c, h| {
                     let p = encode_ready(&good_ready(h, 1)).unwrap();
-                    let _ = send_bytes(c, &frame_bytes(2, MsgKind::Ready as u32, &p, 0), &[], dl(), "evil");
+                    let _ = send_bytes(
+                        c,
+                        &frame_bytes(2, MsgKind::Ready as u32, &p, 0),
+                        &[],
+                        dl(),
+                        "evil",
+                    );
                 }),
                 |e| matches!(e, WeightHostError::UnsupportedVersion { got: 2, .. }),
             ),
@@ -4032,7 +4894,14 @@ mod tests {
             (
                 "wrong message kind",
                 Box::new(|c, _| {
-                    let _ = send_frame(c, MsgKind::ImportAck, &encode_epoch_layout(&Epoch([1; 16]), &Sha256Digest::of(b"x"), Some(0)), &[], dl(), "evil");
+                    let _ = send_frame(
+                        c,
+                        MsgKind::ImportAck,
+                        &encode_epoch_layout(&Epoch([1; 16]), &Sha256Digest::of(b"x"), Some(0)),
+                        &[],
+                        dl(),
+                        "evil",
+                    );
                 }),
                 |e| matches!(e, WeightHostError::Protocol(_)),
             ),
@@ -4041,9 +4910,23 @@ mod tests {
                 Box::new(|c, h| {
                     let m = memfd(b"x");
                     let p = encode_ready(&good_ready(h, 1)).unwrap();
-                    let _ = send_bytes(c, &frame_bytes(PROTOCOL_VERSION, MsgKind::Ready as u32, &p, 1), &[m.as_raw_fd()], dl(), "evil");
+                    let _ = send_bytes(
+                        c,
+                        &frame_bytes(PROTOCOL_VERSION, MsgKind::Ready as u32, &p, 1),
+                        &[m.as_raw_fd()],
+                        dl(),
+                        "evil",
+                    );
                 }),
-                |e| matches!(e, WeightHostError::FdCount { expected: 0, got: 1 }),
+                |e| {
+                    matches!(
+                        e,
+                        WeightHostError::FdCount {
+                            expected: 0,
+                            got: 1
+                        }
+                    )
+                },
             ),
             (
                 "tampered layout seal",
@@ -4126,34 +5009,98 @@ mod tests {
                 "missing fd in batch",
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 1 }, 0, &[]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 0,
+                            count: 1,
+                        },
+                        0,
+                        &[],
+                    );
                 }),
-                |e| matches!(e, WeightHostError::FdCount { expected: 1, got: 0 }),
+                |e| {
+                    matches!(
+                        e,
+                        WeightHostError::FdCount {
+                            expected: 1,
+                            got: 0
+                        }
+                    )
+                },
             ),
             (
                 "extra fd beyond header",
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 2));
                     let (a, b, d) = (memfd(b"a"), memfd(b"b"), memfd(b"c"));
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 2 }, 2, &[a.as_raw_fd(), b.as_raw_fd(), d.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 0,
+                            count: 2,
+                        },
+                        2,
+                        &[a.as_raw_fd(), b.as_raw_fd(), d.as_raw_fd()],
+                    );
                 }),
-                |e| matches!(e, WeightHostError::FdCount { expected: 2, got: 3 }),
+                |e| {
+                    matches!(
+                        e,
+                        WeightHostError::FdCount {
+                            expected: 2,
+                            got: 3
+                        }
+                    )
+                },
             ),
             (
                 "batch count differs from attached",
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 2));
                     let a = memfd(b"a");
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 2 }, 1, &[a.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 0,
+                            count: 2,
+                        },
+                        1,
+                        &[a.as_raw_fd()],
+                    );
                 }),
-                |e| matches!(e, WeightHostError::FdCount { expected: 2, got: 1 }),
+                |e| {
+                    matches!(
+                        e,
+                        WeightHostError::FdCount {
+                            expected: 2,
+                            got: 1
+                        }
+                    )
+                },
             ),
             (
                 "batch numbering wrong",
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
                     let a = memfd(b"a");
-                    send_batch(c, BatchMsg { index: 1, total: 1, first: 0, count: 1 }, 1, &[a.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 1,
+                            total: 1,
+                            first: 0,
+                            count: 1,
+                        },
+                        1,
+                        &[a.as_raw_fd()],
+                    );
                 }),
                 |e| matches!(e, WeightHostError::Protocol(_)),
             ),
@@ -4162,7 +5109,17 @@ mod tests {
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
                     let a = memfd(b"a");
-                    send_batch(c, BatchMsg { index: 0, total: 2, first: 0, count: 1 }, 1, &[a.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 2,
+                            first: 0,
+                            count: 1,
+                        },
+                        1,
+                        &[a.as_raw_fd()],
+                    );
                 }),
                 |e| matches!(e, WeightHostError::Protocol(_)),
             ),
@@ -4171,7 +5128,17 @@ mod tests {
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
                     let a = memfd(b"a");
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 1, count: 1 }, 1, &[a.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 1,
+                            count: 1,
+                        },
+                        1,
+                        &[a.as_raw_fd()],
+                    );
                 }),
                 |e| matches!(e, WeightHostError::Protocol(_)),
             ),
@@ -4179,7 +5146,17 @@ mod tests {
                 "empty batch",
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 0 }, 0, &[]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 0,
+                            count: 0,
+                        },
+                        0,
+                        &[],
+                    );
                 }),
                 |e| matches!(e, WeightHostError::Protocol(_)),
             ),
@@ -4188,7 +5165,17 @@ mod tests {
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
                     let (a, b) = (memfd(b"a"), memfd(b"b"));
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 2 }, 2, &[a.as_raw_fd(), b.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 0,
+                            count: 2,
+                        },
+                        2,
+                        &[a.as_raw_fd(), b.as_raw_fd()],
+                    );
                 }),
                 |e| matches!(e, WeightHostError::FdCount { .. }),
             ),
@@ -4198,16 +5185,41 @@ mod tests {
                     send_ready(c, &good_ready(h, 33));
                     let owned: Vec<OwnedFd> = (0..33).map(|_| memfd(b"z")).collect();
                     let raw: Vec<RawFd> = owned.iter().map(|f| f.as_raw_fd()).collect();
-                    send_batch(c, BatchMsg { index: 0, total: 2, first: 0, count: 33 }, 33, &raw);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 2,
+                            first: 0,
+                            count: 33,
+                        },
+                        33,
+                        &raw,
+                    );
                 }),
-                |e| matches!(e, WeightHostError::LimitExceeded(_) | WeightHostError::Protocol(_)),
+                |e| {
+                    matches!(
+                        e,
+                        WeightHostError::LimitExceeded(_) | WeightHostError::Protocol(_)
+                    )
+                },
             ),
             (
                 "directory descriptor",
                 Box::new(|c, h| {
                     send_ready(c, &good_ready(h, 1));
                     let d = File::open("/").unwrap();
-                    send_batch(c, BatchMsg { index: 0, total: 1, first: 0, count: 1 }, 1, &[d.as_raw_fd()]);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 1,
+                            first: 0,
+                            count: 1,
+                        },
+                        1,
+                        &[d.as_raw_fd()],
+                    );
                 }),
                 |e| matches!(e, WeightHostError::FdInvalid(_)),
             ),
@@ -4217,14 +5229,31 @@ mod tests {
                     send_ready(c, &good_ready(h, 33));
                     let owned: Vec<OwnedFd> = (0..32).map(|_| memfd(b"z")).collect();
                     let raw: Vec<RawFd> = owned.iter().map(|f| f.as_raw_fd()).collect();
-                    send_batch(c, BatchMsg { index: 0, total: 2, first: 0, count: 32 }, 32, &raw);
+                    send_batch(
+                        c,
+                        BatchMsg {
+                            index: 0,
+                            total: 2,
+                            first: 0,
+                            count: 32,
+                        },
+                        32,
+                        &raw,
+                    );
                 }),
                 |e| matches!(e, WeightHostError::PeerClosed(_)),
             ),
             (
                 "reject frame instead of ready",
                 Box::new(|c, _| {
-                    let _ = send_frame(c, MsgKind::Reject, &encode_reject("go away"), &[], dl(), "evil");
+                    let _ = send_frame(
+                        c,
+                        MsgKind::Reject,
+                        &encode_reject("go away"),
+                        &[],
+                        dl(),
+                        "evil",
+                    );
                 }),
                 |e| matches!(e, WeightHostError::Rejected(r) if r == "go away"),
             ),
@@ -4258,7 +5287,10 @@ mod tests {
         let t0 = Instant::now();
         let e = WeightHostClient::connect(&sock, hello).unwrap_err();
         assert!(matches!(e, WeightHostError::Timeout(_)), "{e:?}");
-        assert!(t0.elapsed() < Duration::from_millis(550), "deadline did not bound the handshake");
+        assert!(
+            t0.elapsed() < Duration::from_millis(550),
+            "deadline did not bound the handshake"
+        );
         let _ = handle.join();
     }
 
@@ -4271,11 +5303,31 @@ mod tests {
         let f = fixture(1);
         let before = open_fd_count();
         {
-            let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+            let server = Arc::new(
+                WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default())
+                    .unwrap(),
+            );
             let cases: Vec<(&str, Vec<u8>, bool)> = vec![
-                ("hello with fd", frame_bytes(PROTOCOL_VERSION, MsgKind::Hello as u32, &encode_hello(&hello_for(&f)).unwrap(), 1), true),
-                ("not a hello", frame_bytes(PROTOCOL_VERSION, MsgKind::Release as u32, &[], 0), false),
-                ("garbage payload", frame_bytes(PROTOCOL_VERSION, MsgKind::Hello as u32, &[1, 2, 3], 0), false),
+                (
+                    "hello with fd",
+                    frame_bytes(
+                        PROTOCOL_VERSION,
+                        MsgKind::Hello as u32,
+                        &encode_hello(&hello_for(&f)).unwrap(),
+                        1,
+                    ),
+                    true,
+                ),
+                (
+                    "not a hello",
+                    frame_bytes(PROTOCOL_VERSION, MsgKind::Release as u32, &[], 0),
+                    false,
+                ),
+                (
+                    "garbage payload",
+                    frame_bytes(PROTOCOL_VERSION, MsgKind::Hello as u32, &[1, 2, 3], 0),
+                    false,
+                ),
             ];
             for (label, bytes, attach) in cases {
                 let s2 = server.clone();
@@ -4296,7 +5348,8 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap();
+        let server =
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap();
         let e = server.accept(Some(Duration::from_millis(30))).unwrap_err();
         assert!(matches!(e, WeightHostError::Timeout("accept")));
     }
@@ -4307,15 +5360,29 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<(), WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
-            assert!(matches!(sess.wait_import_ack(Some(T)), Err(WeightHostError::InvalidState(_))));
-            assert!(matches!(sess.wait_release(Some(T)), Err(WeightHostError::InvalidState(_))));
+            assert!(matches!(
+                sess.wait_import_ack(Some(T)),
+                Err(WeightHostError::InvalidState(_))
+            ));
+            assert!(matches!(
+                sess.wait_release(Some(T)),
+                Err(WeightHostError::InvalidState(_))
+            ));
             sess.send_allocations()?;
-            assert!(matches!(sess.send_allocations(), Err(WeightHostError::InvalidState(_))));
-            assert!(matches!(sess.wait_release(Some(T)), Err(WeightHostError::InvalidState(_))));
+            assert!(matches!(
+                sess.send_allocations(),
+                Err(WeightHostError::InvalidState(_))
+            ));
+            assert!(matches!(
+                sess.wait_release(Some(T)),
+                Err(WeightHostError::InvalidState(_))
+            ));
             Ok(())
         });
         let _lease = WeightHostClient::connect(&sock, hello_for(&f)).unwrap();
@@ -4328,18 +5395,27 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<(), WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
             sess.send_allocations()?;
             let e = sess.wait_import_ack(Some(T)).unwrap_err();
-            assert!(matches!(e, WeightHostError::IdentityMismatch("layout_sha256")), "{e:?}");
+            assert!(
+                matches!(e, WeightHostError::IdentityMismatch("layout_sha256")),
+                "{e:?}"
+            );
             assert_eq!(sess.state(), HostSessionState::Failed);
             Ok(())
         });
         let lease = WeightHostClient::connect(&sock, hello_for(&f)).unwrap();
-        let forged = encode_epoch_layout(&lease.epoch(), &Sha256Digest::of(b"forged"), Some(lease.unique_bytes()));
+        let forged = encode_epoch_layout(
+            &lease.epoch(),
+            &Sha256Digest::of(b"forged"),
+            Some(lease.unique_bytes()),
+        );
         send_frame(&lease.conn, MsgKind::ImportAck, &forged, &[], dl(), "t").unwrap();
         host.join().unwrap().unwrap();
     }
@@ -4356,7 +5432,14 @@ mod tests {
             // caller-owned listener: the server must not touch the filesystem
             let listener = UnixListener::bind(&sock).unwrap();
             std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let server = Arc::new(WeightHostServer::from_listener(listener, f.publication.clone(), ServeOptions::default()).unwrap());
+            let server = Arc::new(
+                WeightHostServer::from_listener(
+                    listener,
+                    f.publication.clone(),
+                    ServeOptions::default(),
+                )
+                .unwrap(),
+            );
             let s2 = server.clone();
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let host = thread::spawn(move || -> Result<(), WeightHostError> {
@@ -4404,7 +5487,10 @@ mod tests {
             lease.release().unwrap();
             host.join().unwrap().unwrap();
             drop(server);
-            assert!(sock.exists(), "from_listener must not unlink caller-owned sockets");
+            assert!(
+                sock.exists(),
+                "from_listener must not unlink caller-owned sockets"
+            );
         }
         assert_eq!(open_fd_count(), before);
     }
@@ -4415,7 +5501,9 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<(), WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
@@ -4447,7 +5535,9 @@ mod tests {
         let dir = private_tempdir();
         let sock = dir.path().join("h.sock");
         let f = fixture(1);
-        let server = Arc::new(WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap());
+        let server = Arc::new(
+            WeightHostServer::bind(&sock, f.publication.clone(), ServeOptions::default()).unwrap(),
+        );
         let s2 = server.clone();
         let host = thread::spawn(move || -> Result<(), WeightHostError> {
             let mut sess = s2.accept(Some(T))?.admit(|_| Ok(()))?;
@@ -4478,16 +5568,26 @@ mod tests {
             std::env::set_var("HIPFIRE_WEIGHT_HOST_SOCKET", "/tmp/x.sock");
             std::env::set_var("HIPFIRE_WEIGHT_HOST", "0");
         }
-        assert_eq!(weight_host_socket_from_env().unwrap(), None, "kill switch wins over socket");
+        assert_eq!(
+            weight_host_socket_from_env().unwrap(),
+            None,
+            "kill switch wins over socket"
+        );
         unsafe { std::env::set_var("HIPFIRE_WEIGHT_HOST", "1") };
-        assert_eq!(weight_host_socket_from_env().unwrap(), Some(PathBuf::from("/tmp/x.sock")));
+        assert_eq!(
+            weight_host_socket_from_env().unwrap(),
+            Some(PathBuf::from("/tmp/x.sock"))
+        );
         unsafe { std::env::set_var("HIPFIRE_WEIGHT_HOST_SOCKET", "relative.sock") };
         assert!(weight_host_socket_from_env().is_err());
         unsafe { std::env::remove_var("HIPFIRE_WEIGHT_HOST_SOCKET") };
         assert!(weight_host_socket_from_env().is_err());
         for bad in ["", "true", "2", "yes"] {
             unsafe { std::env::set_var("HIPFIRE_WEIGHT_HOST", bad) };
-            assert!(weight_host_socket_from_env().is_err(), "{bad:?} must fail closed");
+            assert!(
+                weight_host_socket_from_env().is_err(),
+                "{bad:?} must fail closed"
+            );
         }
         unsafe { std::env::remove_var("HIPFIRE_WEIGHT_HOST") };
     }
@@ -4500,7 +5600,10 @@ mod tests {
         assert_eq!(back, m);
         let mut big = base_manifest();
         big.dispatch_metadata = vec![0u8; MAX_BLOB_BYTES + 1];
-        assert!(matches!(big.encode_canonical(), Err(WeightHostError::LimitExceeded(_))));
+        assert!(matches!(
+            big.encode_canonical(),
+            Err(WeightHostError::LimitExceeded(_))
+        ));
     }
 
     #[test]
@@ -4519,8 +5622,16 @@ mod tests {
         abi.add_component_bytes("model_load.rs", b"fn load() {}");
         abi.add_component_bytes("weight_backend.rs", b"fn backend() {}");
         let model = model_content_sha256(&[
-            SourceDigest { role: "base".into(), len: 4, sha256: Sha256Digest::of(b"AAAA") },
-            SourceDigest { role: "overlay".into(), len: 2, sha256: Sha256Digest::of(b"BB") },
+            SourceDigest {
+                role: "base".into(),
+                len: 4,
+                sha256: Sha256Digest::of(b"AAAA"),
+            },
+            SourceDigest {
+                role: "overlay".into(),
+                len: 2,
+                sha256: Sha256Digest::of(b"BB"),
+            },
         ])
         .unwrap();
         let abi_sha = abi.sha256().unwrap();
@@ -4553,7 +5664,11 @@ mod tests {
         let out = dir.path().join("child-identity.txt");
         let module = module_path!().split_once("::").unwrap().1;
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("{module}::identity_child_helper"), "--test-threads=1"])
+            .args([
+                "--exact",
+                &format!("{module}::identity_child_helper"),
+                "--test-threads=1",
+            ])
             .env("HFWH_IDENTITY_CHILD_OUT", &out)
             .env("RUST_BACKTRACE", "0")
             .stdout(std::process::Stdio::null())
@@ -4562,6 +5677,10 @@ mod tests {
             .unwrap();
         assert!(status.success(), "child test process failed");
         let child = std::fs::read_to_string(&out).expect("child did not write its identity report");
-        assert_eq!(child, identity_report(), "identity digests differ across processes");
+        assert_eq!(
+            child,
+            identity_report(),
+            "identity digests differ across processes"
+        );
     }
 }

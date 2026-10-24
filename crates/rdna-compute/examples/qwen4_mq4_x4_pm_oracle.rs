@@ -191,7 +191,14 @@ fn diff_guarded<T: PartialEq + Copy>(got: &[T], expected: &[T], nan: T) -> usize
 
 /// The route the PM entries replace: F32 rotation, zeroed Y, hipcc bt4 on the F16
 /// conversion of that rotation (`gemm_qwen4_trunk_mq4_xf16`).
-fn reference(gpu: &mut Gpu, w: &GpuTensor, xrot: &GpuTensor, m: usize, k: usize, n: usize) -> Vec<u32> {
+fn reference(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    xrot: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<u32> {
     let zeros = vec![0u8; n * m * 4];
     let y = tensor(gpu, &zeros, DType::F32, n * m);
     gpu.gemm_mq4g256v2_residual_wmma_gfx1151_bt(w, xrot, &y, m, k, n, 4)
@@ -221,7 +228,9 @@ impl Report {
 }
 
 fn random_x(gpu: &mut Gpu, n: usize, k: usize, rng: &mut Rng) -> GpuTensor {
-    let x: Vec<f32> = (0..n * k).map(|_| (rng.unit() + rng.unit() - 1.0) * 1.5).collect();
+    let x: Vec<f32> = (0..n * k)
+        .map(|_| (rng.unit() + rng.unit() - 1.0) * 1.5)
+        .collect();
     gpu.upload_f32(&x, &[x.len()]).expect("upload x")
 }
 
@@ -247,7 +256,9 @@ fn main() {
     let mut mats: Vec<Mat> = Vec::new();
     for &(name, m, k) in &SHAPES {
         let bytes = pack_random_mq4g256v2(m, k, &mut rng);
-        let w = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload weights");
+        let w = gpu
+            .upload_raw(&bytes, &[bytes.len()])
+            .expect("upload weights");
         mats.push(Mat { name, m, k, w });
     }
     let find = |name: &str| mats.iter().position(|m| m.name == name).expect("shape");
@@ -261,7 +272,8 @@ fn main() {
         for k in [2560usize, 6144] {
             let x32 = random_x(&mut gpu, n, k, &mut rng);
             let xrot = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc xrot");
-            gpu.rotate_x_mq_batched(&x32, &xrot, k, n).expect("rotate f32");
+            gpu.rotate_x_mq_batched(&x32, &xrot, k, n)
+                .expect("rotate f32");
             let mut refs: Vec<Option<Vec<u32>>> = (0..mats.len()).map(|_| None).collect();
 
             for (i, mat) in mats.iter().enumerate().filter(|(_, mt)| mt.k == k) {
@@ -271,8 +283,12 @@ fn main() {
                 let xf16 = gpu.rotate_x_mq_batched_f16(&x32, k, n).expect("rotate f16");
                 let y = guarded_f32(&gpu, None, n * m);
                 let view = y.sub_offset(GUARD, n * m);
-                gpu.gemm_mq4g256v2_xf16(&mat.w, &xf16, &view, m, k, n).expect("xf16 launch");
-                report.add(&format!("(a) plain {label}"), diff_guarded(&fetch_u32(&gpu, &y), &want, NAN_F32));
+                gpu.gemm_mq4g256v2_xf16(&mat.w, &xf16, &view, m, k, n)
+                    .expect("xf16 launch");
+                report.add(
+                    &format!("(a) plain {label}"),
+                    diff_guarded(&fetch_u32(&gpu, &y), &want, NAN_F32),
+                );
                 gpu.free_tensor(y).expect("free y");
                 cases += 1;
                 // (b) BF16 output.
@@ -280,7 +296,8 @@ fn main() {
                     let yb = guarded_bf16(&gpu, n * m);
                     let view = yb.sub_offset(GUARD, n * m);
                     let xf16 = gpu.rotate_x_mq_batched_f16(&x32, k, n).expect("rotate f16");
-                    gpu.gemm_mq4g256v2_xf16(&mat.w, &xf16, &view, m, k, n).expect("bf16out launch");
+                    gpu.gemm_mq4g256v2_xf16(&mat.w, &xf16, &view, m, k, n)
+                        .expect("bf16out launch");
                     let want_bf16: Vec<u16> = want.iter().map(|&b| bf16_rne(b)).collect();
                     report.add(
                         &format!("(b) bf16out {label}"),
@@ -339,8 +356,12 @@ fn main() {
                     let proj = refs[wi].as_ref().expect("reference");
                     let wide = BRANCHES * HIDDEN;
                     // Gate logits [n][4].
-                    let gates_host: Vec<f32> = (0..n * BRANCHES).map(|_| (rng.unit() - 0.5) * 6.0).collect();
-                    let gates = gpu.upload_f32(&gates_host, &[gates_host.len()]).expect("gates");
+                    let gates_host: Vec<f32> = (0..n * BRANCHES)
+                        .map(|_| (rng.unit() - 0.5) * 6.0)
+                        .collect();
+                    let gates = gpu
+                        .upload_f32(&gates_host, &[gates_host.len()])
+                        .expect("gates");
                     let mixed_bytes: Vec<u8> = proj.iter().flat_map(|w| w.to_le_bytes()).collect();
                     let mixed = tensor(&gpu, &mixed_bytes, DType::F32, n * HIDDEN);
                     for bf16 in [false, true] {
@@ -348,8 +369,10 @@ fn main() {
                         let mut init = vec![NAN_F32; n * wide];
                         if bf16 {
                             for p in 0..n * wide / 2 {
-                                let lo = bf16_rne((((rng.unit() - 0.5) * 8.0).to_bits()) as u32) as u32;
-                                let hi = bf16_rne((((rng.unit() - 0.5) * 8.0).to_bits()) as u32) as u32;
+                                let lo =
+                                    bf16_rne((((rng.unit() - 0.5) * 8.0).to_bits()) as u32) as u32;
+                                let hi =
+                                    bf16_rne((((rng.unit() - 0.5) * 8.0).to_bits()) as u32) as u32;
                                 init[p] = lo | (hi << 16);
                             }
                         } else {
@@ -376,8 +399,10 @@ fn main() {
                         )
                         .expect("unfused hyper_write");
                         let xf16 = gpu.rotate_x_mq_batched_f16(&x32, k, n).expect("rotate f16");
-                        gpu.gemm_mq4g256v2_hcw(&mat.w, &xf16, None, mat.m, k, n, &fview, &gates, bf16)
-                            .expect("hcw launch");
+                        gpu.gemm_mq4g256v2_hcw(
+                            &mat.w, &xf16, None, mat.m, k, n, &fview, &gates, bf16,
+                        )
+                        .expect("hcw launch");
                         let (want, got) = (fetch_u32(&gpu, &unfused), fetch_u32(&gpu, &fused));
                         let mut start = vec![NAN_F32; GUARD];
                         start.extend_from_slice(&init);
@@ -389,7 +414,11 @@ fn main() {
                             bad += 1;
                         }
                         report.add(
-                            &format!("(d) hcw {} {} streams", mat.name, if bf16 { "bf16" } else { "f32" }),
+                            &format!(
+                                "(d) hcw {} {} streams",
+                                mat.name,
+                                if bf16 { "bf16" } else { "f32" }
+                            ),
                             bad,
                         );
                         cases += 1;
@@ -402,8 +431,18 @@ fn main() {
                     let streams = guarded_f32(&gpu, Some(&vec![0u32; n * wide]), 0);
                     let sview = streams.sub_offset(GUARD, n * wide);
                     let xf16 = gpu.rotate_x_mq_batched_f16(&x32, k, n).expect("rotate f16");
-                    gpu.gemm_mq4g256v2_hcw(&mat.w, &xf16, Some(&mview), mat.m, k, n, &sview, &gates, false)
-                        .expect("hcw mirror launch");
+                    gpu.gemm_mq4g256v2_hcw(
+                        &mat.w,
+                        &xf16,
+                        Some(&mview),
+                        mat.m,
+                        k,
+                        n,
+                        &sview,
+                        &gates,
+                        false,
+                    )
+                    .expect("hcw mirror launch");
                     report.add(
                         &format!("(d) hcw {} mirror", mat.name),
                         diff_guarded(&fetch_u32(&gpu, &mirror), proj, NAN_F32),
@@ -425,20 +464,26 @@ fn main() {
         let (m, k, n) = (mats[ai].m, mats[ai].k, 256usize);
         let x32 = random_x(&mut gpu, n, k, &mut rng);
         let xrot = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc xrot");
-        gpu.rotate_x_mq_batched(&x32, &xrot, k, n).expect("rotate f32");
+        gpu.rotate_x_mq_batched(&x32, &xrot, k, n)
+            .expect("rotate f32");
         let want = reference(&mut gpu, &mats[ai].w, &xrot, m, k, n);
-        let mut bytes = gpu.download_raw_bytes(&mats[ai].w).expect("download weights");
+        let mut bytes = gpu
+            .download_raw_bytes(&mats[ai].w)
+            .expect("download weights");
         for group in 0..m * (k / 256) {
             // Flip every nibble of the first 16 code bytes of every group.
             for b in 0..16 {
                 bytes[group * 136 + 8 + b] ^= 0xff;
             }
         }
-        let perturbed = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload perturbed");
+        let perturbed = gpu
+            .upload_raw(&bytes, &[bytes.len()])
+            .expect("upload perturbed");
         let xf16 = gpu.rotate_x_mq_batched_f16(&x32, k, n).expect("rotate f16");
         let y = guarded_f32(&gpu, None, n * m);
         let view = y.sub_offset(GUARD, n * m);
-        gpu.gemm_mq4g256v2_xf16(&perturbed, &xf16, &view, m, k, n).expect("control launch");
+        gpu.gemm_mq4g256v2_xf16(&perturbed, &xf16, &view, m, k, n)
+            .expect("control launch");
         let bad = diff_guarded(&fetch_u32(&gpu, &y), &want, NAN_F32);
         for t in [y, perturbed, xrot, x32] {
             gpu.free_tensor(t).expect("free");
@@ -447,7 +492,9 @@ fn main() {
     };
     println!("qwen4_mq4_x4_pm_oracle: negative control (perturbed weights) mismatch words = {control_bad}");
     if control_bad == 0 {
-        eprintln!("negative control FAILED: perturbed weights agreed with the reference (vacuous oracle)");
+        eprintln!(
+            "negative control FAILED: perturbed weights agreed with the reference (vacuous oracle)"
+        );
         std::process::exit(1);
     }
 
@@ -463,6 +510,10 @@ fn main() {
     }
     println!(
         "qwen4_mq4_x4_pm_oracle: PASS cases={cases} mismatch_bytes=0 pm={}",
-        if pm { "on" } else { "off (hipcc bt4 fallback; bf16out/regions/hcw skipped)" }
+        if pm {
+            "on"
+        } else {
+            "off (hipcc bt4 fallback; bf16out/regions/hcw skipped)"
+        }
     );
 }

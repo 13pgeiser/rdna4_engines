@@ -19,6 +19,11 @@
 //         (`ensure_int4_mmq_x`), layout [K/128 × N].
 //   - Y:  output [N × M] column-major: Y[col * M + row].
 //   - add: 1 => Y[..] += result (residual / _full_add); 0 => Y[..] = result.
+//   - full_add_v3 only: add == 2 (runtime) => shared-expert sigmoid residual,
+//     Y += sigmoid(shared_gate[col]) * (0.0f + result) (expression identical
+//     to sigmoid_scaled_residual_add_batched_f32); the 8th kernarg
+//     `const float* shared_gate` ([N] logits, offset 40, kernarg size 48; null
+//     for add != 2) is appended after `add`; the other entries keep 7 args.
 //
 // gfx12 K32 conventions (probe-verified on gfx1201, 2026-09-17 — one-hot /
 // half-split / nibble-slot sweeps over a single-call WMMA):
@@ -347,6 +352,8 @@ static __device__ __forceinline__ void iu4_bundle(
 
 // Shared compute body. `EPI` selects the writeback:
 //   IU4_EPI_SET / IU4_EPI_ADD: Y = / += result (full_set / full_add / residual).
+//   IU4_EPI_ADD also has a runtime `sigmoid_epi` mode (full_add_v3 add == 2):
+//   Y += sigmoid(shared_gate[token]) * (0.0f + result).
 //   IU4_EPI_SILU (F1-lite gate/up): A = W_gate, U = W_up, M rows each. The grid
 //     covers 2M virtual rows; virtual 16-row group g8 of a tile holds gate
 //     (g8 even) or up (g8 odd) rows blockIdx.x*64 + 16*(g8>>1) + 0..15, so a
@@ -359,13 +366,34 @@ enum { IU4_EPI_SET = 0, IU4_EPI_ADD = 1, IU4_EPI_SILU = 2 };
 #ifndef IU4_SILU_RGROUPS
 #define IU4_SILU_RGROUPS 2
 #endif
+// Shared-expert sigmoid residual epilogue (runtime mode of IU4_EPI_ADD,
+// full_add_v3 `add == 2`). Y holds the final residual stream. The unfused
+// incumbent zeroes a temporary, runs ADD (down_value = RN(+0 + acc), which
+// turns an acc of -0 into +0), then sigmoid_scaled_residual_add_batched_f32:
+//   sig = 1.0f / (1.0f + __expf(-gate[t]));  y += sig * down_value;
+// The incumbent's `y += sig * x` compiles to v_fmac_f32 under the default
+// fast contraction (p3b-h3-sigmoid-incumbent.s:112). Here the write-back is
+// merged with the plain-ADD one, and the compiler then selects the addend
+// (acc vs sig*acc) and adds, losing the contraction (mul + add, two
+// roundings). The fused multiply-add is therefore spelled explicitly: one
+// rounding, bit-identical to the incumbent's v_fmac_f32. No intermediate
+// store of down_value.
+static __device__ __forceinline__ float iu4_shared_sigmoid(float s) {
+    return 1.0f / (1.0f + __expf(-s));
+}
+static __device__ __forceinline__ float iu4_sigmoid_residual(float residual, float sig, float acc) {
+    const float down_value = 0.0f + acc;
+    return __builtin_fmaf(sig, down_value, residual);
+}
 template <int EPI>
 static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_body(
     const char*           __restrict__ A,   // [M × groups_per_row × 136]
     const char*           __restrict__ U,   // SILU: W_up, same layout as A
     const block_i4_128*   __restrict__ Xq,  // [K/128 × N]
     float*                __restrict__ Y,   // [N × M] column-major
-    int M, int K, int N
+    int M, int K, int N,
+    const float*          __restrict__ shared_gate = nullptr, // ADD sigmoid mode: [N] pre-sigmoid logits
+    bool                  sigmoid_epi = false                 // ADD only: runtime sigmoid residual mode
 ) {
     constexpr bool ADD = EPI == IU4_EPI_ADD;
     constexpr bool SILU = EPI == IU4_EPI_SILU;
@@ -984,10 +1012,20 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 if constexpr (ADD) {
                     const float4 old = *yp;
                     float4 out;
-                    out.x = old.x + v4.x;
-                    out.y = old.y + v4.y;
-                    out.z = old.z + v4.z;
-                    out.w = old.w + v4.w;
+                    if (sigmoid_epi) {
+                        // full_tile: every token column is < N.
+                        const float sig = iu4_shared_sigmoid(shared_gate[
+                            bs + (it >> 1) * 64 + nb * 16 + (it & 1) * 8 + wave]);
+                        out.x = iu4_sigmoid_residual(old.x, sig, v4.x);
+                        out.y = iu4_sigmoid_residual(old.y, sig, v4.y);
+                        out.z = iu4_sigmoid_residual(old.z, sig, v4.z);
+                        out.w = iu4_sigmoid_residual(old.w, sig, v4.w);
+                    } else {
+                        out.x = old.x + v4.x;
+                        out.y = old.y + v4.y;
+                        out.z = old.z + v4.z;
+                        out.w = old.w + v4.w;
+                    }
                     *yp = out;
                 } else {
                     *yp = v4;
@@ -998,6 +1036,22 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         return;
     }
 #endif
+    // Sigmoid residual epilogue (ADD, runtime `sigmoid_epi`): per-token gate
+    // sigmoid for the (h, nb) token columns this lane stores, computed once
+    // per lane instead of once per store. Dead for every other mode.
+    float sg[2][4] = {};
+    if constexpr (ADD) {
+        if (sigmoid_epi) {
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                #pragma unroll
+                for (int nb = 0; nb < 4; nb++) {
+                    const int col = bs + h * 64 + nb * 16 + store_x;
+                    if (col < N) sg[h][nb] = iu4_shared_sigmoid(shared_gate[col]);
+                }
+            }
+        }
+    }
     if (full_tile) {
         #pragma unroll
         for (int rg = 0; rg < 2; rg++) {
@@ -1020,7 +1074,13 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     if constexpr (ADD) {
                         const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
                             y_tile_rsrc, store_lane_off, phase_off, 0);
-                        const float out = __builtin_bit_cast(float, old_bits) + v;
+                        const float old = __builtin_bit_cast(float, old_bits);
+                        float out;
+                        if (sigmoid_epi) {
+                            out = iu4_sigmoid_residual(old, sg[h][nb], v);
+                        } else {
+                            out = old + v;
+                        }
                         __builtin_amdgcn_raw_buffer_store_b32(
                             __builtin_bit_cast(unsigned, out),
                             y_tile_rsrc, store_lane_off, phase_off, 0);
@@ -1056,7 +1116,11 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     if (row < M && col < N) {
                         float* yp = Y + (long long)col * M + row;
                         if constexpr (ADD) {
-                            *yp += v;
+                            if (sigmoid_epi) {
+                                *yp = iu4_sigmoid_residual(*yp, sg[h][nb], v);
+                            } else {
+                                *yp += v;
+                            }
                         } else {
                             *yp = v;
                         }
@@ -1069,15 +1133,20 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 }
 
 
+// full_add_v3: `add` != 2 => Y += result (the arg was always ignored here,
+// so every existing caller keeps ADD and passes a null `shared_gate`);
+// add == 2 => runtime shared-expert sigmoid residual epilogue, see
+// IU4_EPI_ADD above (Y = final residual, gate = [N] pre-sigmoid logits).
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
 void gemm_mq4g256v2_residual_mmq_iu4_full_add_v3(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,
     float*                __restrict__ Y,
-    int M, int K, int N, int
+    int M, int K, int N, int add,
+    const float*          __restrict__ shared_gate
 ) {
     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_ADD>(
-        A, nullptr, Xq, Y, M, K, N);
+        A, nullptr, Xq, Y, M, K, N, shared_gate, add == 2);
 }
 
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
@@ -1111,7 +1180,7 @@ void gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3(
 
 
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_v3(
-    const char*, const void*, float*, int, int, int, int
+    const char*, const void*, float*, int, int, int, int, const float*
 ) {}
 
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_v3(

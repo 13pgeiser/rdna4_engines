@@ -66,7 +66,10 @@ impl IntTy {
         }
     }
     pub fn signed(self) -> bool {
-        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Isize)
+        matches!(
+            self,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Isize
+        )
     }
     pub fn min(self) -> i128 {
         if self.signed() {
@@ -112,7 +115,9 @@ impl Ty {
     pub fn from_syn(t: &syn::Type) -> Ty {
         match t {
             syn::Type::Path(p) if p.qself.is_none() => {
-                let Some(seg) = p.path.segments.last() else { return Ty::Any };
+                let Some(seg) = p.path.segments.last() else {
+                    return Ty::Any;
+                };
                 let name = seg.ident.to_string();
                 if let Some(i) = IntTy::parse(&name) {
                     return Ty::Int(i);
@@ -277,7 +282,11 @@ pub struct Frame<'a> {
 pub type Env<'a> = Option<Rc<Frame<'a>>>;
 
 pub fn bind<'a>(env: &Env<'a>, name: &str, v: Value<'a>) -> Env<'a> {
-    Some(Rc::new(Frame { name: Rc::from(name), cell: Rc::new(RefCell::new(v)), parent: env.clone() }))
+    Some(Rc::new(Frame {
+        name: Rc::from(name),
+        cell: Rc::new(RefCell::new(v)),
+        parent: env.clone(),
+    }))
 }
 
 pub fn lookup<'a, 'e>(env: &'e Env<'a>, name: &str) -> Option<&'e Rc<RefCell<Value<'a>>>> {
@@ -301,9 +310,19 @@ pub fn values_eq(a: &Value, b: &Value) -> bool {
         (Float(x), Float(y)) => x == y,
         (Char(x), Char(y)) => x == y,
         (Str(x), Str(y)) => x == y,
-        (Tuple(x), Tuple(y)) | (Array(x), Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| values_eq(p, q)),
-        (Struct(n, x), Struct(m, y)) => n == m && x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.0 == q.0 && values_eq(&p.1, &q.1)),
-        (Enum(t, v, x), Enum(u, w, y)) => t == u && v == w && x.len() == y.len() && x.iter().zip(y).all(|(p, q)| values_eq(p, q)),
+        (Tuple(x), Tuple(y)) | (Array(x), Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| values_eq(p, q))
+        }
+        (Struct(n, x), Struct(m, y)) => {
+            n == m
+                && x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(p, q)| p.0 == q.0 && values_eq(&p.1, &q.1))
+        }
+        (Enum(t, v, x), Enum(u, w, y)) => {
+            t == u && v == w && x.len() == y.len() && x.iter().zip(y).all(|(p, q)| values_eq(p, q))
+        }
         (Nat(x), Nat(y)) => x.equals(y),
         (Range(x), Range(y)) => x.start == y.start && x.end == y.end && x.inclusive == y.inclusive,
         _ => false,

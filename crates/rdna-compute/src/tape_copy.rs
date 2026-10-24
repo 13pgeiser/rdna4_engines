@@ -65,7 +65,11 @@ impl Gpu {
         if copies.is_empty() {
             return Ok(());
         }
-        self.ensure_kernel(TAPE_COPY_BATCHED_SYMBOL, TAPE_COPY_BATCHED_SRC, TAPE_COPY_BATCHED_SYMBOL)?;
+        self.ensure_kernel(
+            TAPE_COPY_BATCHED_SYMBOL,
+            TAPE_COPY_BATCHED_SRC,
+            TAPE_COPY_BATCHED_SYMBOL,
+        )?;
         for chunk in copies.chunks(TAPE_COPY_MAX) {
             let mut args = TapeCopyBatchArgs {
                 src: [0; TAPE_COPY_MAX],
@@ -94,7 +98,12 @@ impl Gpu {
                 &mut params,
                 || {
                     let mut b = KernargBlob::new();
-                    for v in blob_args.src.iter().chain(&blob_args.dst).chain(&blob_args.cnt) {
+                    for v in blob_args
+                        .src
+                        .iter()
+                        .chain(&blob_args.dst)
+                        .chain(&blob_args.cnt)
+                    {
                         b.push_u64(*v);
                     }
                     b.push_u32(blob_args.n);

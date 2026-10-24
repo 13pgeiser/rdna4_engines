@@ -110,8 +110,7 @@ fn encode_matches_hf_reference_exactly() {
     let tokenizer = Tokenizer::from_hf_json(tok_json).expect("Tokenizer::from_hf_json");
 
     // --- cases ---
-    let cases_raw =
-        std::fs::read_to_string(dir.join("cases.jsonl")).expect("read cases.jsonl");
+    let cases_raw = std::fs::read_to_string(dir.join("cases.jsonl")).expect("read cases.jsonl");
 
     let mut groups: BTreeMap<String, GroupTally> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
@@ -206,7 +205,11 @@ fn encode_matches_hf_reference_exactly() {
         let m = mgroups
             .get(name)
             .unwrap_or_else(|| panic!("group `{name}` absent from manifest"));
-        assert_eq!(tally.cases as u64, u64_field(m, "n_cases"), "{name}: n_cases");
+        assert_eq!(
+            tally.cases as u64,
+            u64_field(m, "n_cases"),
+            "{name}: n_cases"
+        );
         assert_eq!(tally.tokens, u64_field(m, "n_tokens"), "{name}: n_tokens");
         assert_eq!(
             tally.text_bytes,
@@ -216,7 +219,10 @@ fn encode_matches_hf_reference_exactly() {
     }
     for (name, want_n) in REQUIRED_GROUPS {
         let have = groups.get(name).map_or(0, |g| g.cases);
-        assert_eq!(have, want_n, "required group `{name}` must have {want_n} cases");
+        assert_eq!(
+            have, want_n,
+            "required group `{name}` must have {want_n} cases"
+        );
     }
 
     // --- the actual contract: exact ID equality ---

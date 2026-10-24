@@ -14,12 +14,13 @@ use crate::config::{Qwen4Config, Qwen4PleConfig};
 use crate::ep::{Qwen4EpMesh, ReplicaFingerprint};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
-    qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4OutputRows,
-    QWEN4_FORWARD_HEADROOM_BYTES,
+    qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4GpuForwardError,
+    Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
+use crate::state::decode_map_ahead_tokens;
 use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
@@ -33,8 +34,8 @@ use hipfire_runtime::sampler::{
     apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
 use hipfire_runtime::session_cache::{
-    stride_boundaries, SessionCache, SessionDriver, SessionRoute, SessionState, SnapshotParts,
-    StateLayout,
+    stride_boundaries, SessionCache, SessionDriver, SessionPieceKey, SessionRoute, SessionState,
+    SnapshotParts, StateLayout,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -47,16 +48,32 @@ use std::time::Duration;
 
 #[path = "session_pair.rs"]
 mod session_pair;
-pub(crate) use session_pair::PairSessionStage;
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+pub(crate) use session_pair::SlowlinkFailPoint;
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+pub use session_pair::SLOWLINK_PRIMITIVES;
+pub(crate) use session_pair::{PairSessionStage, PromptTxn, SlowlinkOwner, SlowlinkScope};
+
+#[path = "bundle/pp.rs"]
+mod pp;
+use hipfire_runtime::multi_gpu::executor::MeshRoute;
+use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
+pub use pp::{Qwen4PpLaneExecutor, Qwen4PpWindow};
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn pp_owner_required() -> BundleError {
+    BundleError::Forward(
+        "qwen4 topology.pp requires the admitted Gpus owner; use the mesh entry point".into(),
+    )
+}
+
 /// Architecture-private owner for the fulfilled manifest census.
 ///
-/// Assembly takes every resident handle into [`Qwen4Weights`], so rollback at
-/// unload releases no duplicate device allocations.  The transaction still
-/// owns the immutable projections, aliases, and external PLE descriptors and
-/// is drained only after the reader, mutable state, and resident weights.
+/// Assembly takes logical resident handles into [`Qwen4Weights`]. Arena
+/// allocations, when selected, remain owned by this transaction while those
+/// handles are borrowed views. Its immutable projections, aliases, external
+/// PLE descriptors and arena roots drain after state and resident handles.
 pub(crate) struct AttachedWeightStore {
     transaction: WeightLoadTransaction,
 }
@@ -94,22 +111,32 @@ impl AttachedWeightStore {
 
 /// Where every owner of `route` sits when the live state can continue in
 /// place: the target position, for native MTP only when the head sits there
-/// too (a retired head lags, a missing one cannot continue), and never while
-/// a verify row capture is armed. Plain data, so it runs without a GPU.
+/// too (a missing head cannot continue; a retired request's head lags until
+/// it catches up, at the latest in the terminal pending-seed flush), and
+/// never while a verify row capture is armed. Plain data, so it runs without
+/// a GPU.
 fn live_position(
     route: SessionRoute,
     target_position: usize,
     head_position: Option<usize>,
     row_capture_armed: bool,
 ) -> Option<usize> {
-    (!row_capture_armed
-        && (route == SessionRoute::Ar || head_position == Some(target_position)))
-    .then_some(target_position)
+    (!row_capture_armed && (route == SessionRoute::Ar || head_position == Some(target_position)))
+        .then_some(target_position)
 }
 
 /// Environment flag that adds message-end snapshot boundaries (P1b), read once
 /// when the bundle is assembled. Off by default.
 const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
+/// Lineage-only split before the final message end, read once at assembly.
+const TAIL_SNAPSHOT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT";
+const TAIL_SNAPSHOT_MIN_GAP_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP";
+const TAIL_SNAPSHOT_MIN_PROMPT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_PROMPT";
+/// Below these the tail split's extra small tile costs more than the replay it
+/// can save: a gap under 1024 rows replays in well under a second, and on a
+/// short prompt the tile is a large share of the cold prefill.
+const TAIL_SNAPSHOT_MIN_GAP_DEFAULT: usize = 1024;
+const TAIL_SNAPSHOT_MIN_PROMPT_DEFAULT: usize = 16384;
 
 /// The PLE rows owner of a bundle: present exactly when the profile declares
 /// PLE (`config.ple`), so a profile without it holds no row store, hash
@@ -158,6 +185,13 @@ pub struct Qwen4Bundle {
     pub(crate) spec_top1: Option<GpuTensor>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
+    /// DFlash2 drafter's target layers and capture rows (`None`: no DFlash2
+    /// drafter is armed; a forward then captures the MTP wide hidden).
+    pub(crate) dflash: Option<crate::dflash_target::Qwen4DflashTarget>,
+    /// Lab observation of every speculative forward's logits; unarmed it
+    /// records nothing (`crate::lab_window`).
+    #[cfg(feature = "lab")]
+    lab_logits: crate::lab_window::LabLogitsTap,
     /// Staging of the GPU penalty prepass (`apply_penalty_table`), allocated
     /// by the first penalized row and kept until unload.
     penalty_stage: Option<PenaltyTableStage>,
@@ -167,9 +201,15 @@ pub struct Qwen4Bundle {
     /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
     session: Option<SessionDriver>,
     pub(crate) pair_session_stage: Option<PairSessionStage>,
+    /// Slow-link (S1) layer-major prompt transaction owner: admitted profile,
+    /// boundary stages, the open window, receipt and failure injection.
+    pub(crate) slowlink: SlowlinkOwner,
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
     turn_snapshots: bool,
+    tail_snapshot: bool,
+    tail_snapshot_min_gap: usize,
+    tail_snapshot_min_prompt: usize,
     /// The tokenizer's `<|im_end|>` id (`set_turn_end_token`).
     turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
@@ -181,10 +221,29 @@ pub struct Qwen4Bundle {
     /// daemon-facing call is replicated on the peer ranks. `None` = single
     /// device (the default; no behaviour change).
     pub(crate) ep: Option<Box<Qwen4EpMesh>>,
+    /// Band state and generic execution plans. This bundle is the output band;
+    /// callers borrow the sole hardware owner, `LoadedModel::pp_gpus`.
+    pub(crate) pp: Option<Box<Qwen4PpMesh>>,
+    /// This bundle's band identity under an attached PP mesh (index/count, layer
+    /// range, complete placement, devices, mesh and load epoch, canonical
+    /// chunk). Stamped on every band, root included, at attach so the session
+    /// scope and boundary chunk never depend on the taken forward or the
+    /// detached mesh; `None` outside PP.
+    pub(crate) pp_band: Option<Qwen4PpBandMeta>,
+    /// This rank's binding to its expert-parallel load's seal
+    /// (`bind_ep_seal`); `None` on a single-device load.
+    pub(crate) ep_seal: Option<crate::ep_seal::Qwen4EpRankSeal>,
     /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
     pub(crate) npu_model_index: Option<Result<String, String>>,
+    /// Actually reserved D1 CPU-owned expert window rows (logical window rows; 0 =
+    /// none). Stored only by the loader after the real prewarm lands (see
+    /// [`Self::note_cpu_d1_wide_storage_prewarmed`]), never inferred from scope: a
+    /// wide window stays refused until it is nonzero. Storage only, never a
+    /// qualification: the routing slice still gates on the per-call lab-wide scope
+    /// and the caller's live thread-local capacity.
+    pub(crate) cpu_d1_storage_rows: usize,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -208,7 +267,11 @@ pub fn session_snapshot_bytes(
     p: usize,
 ) -> Option<u64> {
     let part = |bytes: usize| bytes.checked_next_multiple_of(256);
-    let gdn_recurrent = format.gdn.state_units(
+    // A Q8Ef snapshot carries the plain Q8 payload only: the live F16
+    // residual plane is never snapshotted (it is zeroed on every restore), so
+    // the size is the `storage()` format's, equal to Q8's.
+    let gdn_storage = format.gdn.storage();
+    let gdn_recurrent = gdn_storage.state_units(
         config.linear_num_value_heads,
         config.linear_key_head_dim,
         config.linear_value_head_dim,
@@ -220,7 +283,7 @@ pub fn session_snapshot_bytes(
                 .linear_num_value_heads
                 .checked_mul(config.linear_value_head_dim)?,
         )?;
-    let gdn = part(gdn_recurrent.checked_mul(format.gdn.dtype().size())?)?.checked_add(part(
+    let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?.checked_add(part(
         conv_channels
             .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
             .checked_mul(4)?,
@@ -259,35 +322,144 @@ pub fn session_snapshot_bytes(
             .checked_add(2 * part(p.checked_mul(full_width * 4)?)?)?
             .checked_add(part(p.checked_mul(raw_width * 4)?)?)?
             .checked_add(part(pooled_rows.checked_mul(raw_width * 4)?)?)?
-            .checked_add(selected + part(4)? + part(feedback)?)?;
+            .checked_add(selected + part(4)? + part(feedback)?)?
+            // The head's target boundary-hidden row.
+            .checked_add(part(feedback)?)?;
     }
     u64::try_from(total).ok()
 }
 
+/// Device bytes one slow-link boundary stage costs (the target's fixed state:
+/// GDN recurrent + conv, QSA selections, PLE convolution, HC feedback, each
+/// part rounded to the cache's 256-byte packing): a snapshot of zero rows per
+/// stream. The entry snapshot reuses the state's existing arena and adds none.
+pub fn prompt_stage_bytes(config: &Qwen4Config, format: Qwen4StateFormat) -> Option<u64> {
+    session_snapshot_bytes(config, format, false, 0)
+}
+
+/// Host-only session settings every PP band must share with the root: they shape
+/// the boundary schedule (tail split, message ends), so they are part of each
+/// band's scope and the root's values are authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PpSessionPolicy {
+    pub(crate) turn_snapshots: bool,
+    pub(crate) tail_snapshot: bool,
+    pub(crate) tail_snapshot_min_gap: usize,
+    pub(crate) tail_snapshot_min_prompt: usize,
+    pub(crate) turn_end_token: Option<u32>,
+}
+
+impl PpSessionPolicy {
+    /// The schedule-relevant suffix of a PP band's scope. `turn_snapshots` is
+    /// already carried by the base scope's `/turns`.
+    fn scope_tag(&self) -> String {
+        let token = self
+            .turn_end_token
+            .map_or_else(|| "-".to_string(), |token| token.to_string());
+        format!(
+            "/tail{}:{}:{}/te{token}",
+            u8::from(self.tail_snapshot),
+            self.tail_snapshot_min_gap,
+            self.tail_snapshot_min_prompt
+        )
+    }
+}
+
+/// The session-cache scope of one bundle. Single (`band == None`) is exactly the
+/// historical string for the F32 and Q8 GDN formats; Q8Ef appends the distinct
+/// `/q8_ef-reset` spelling after the format (its snapshots carry Q8 payload
+/// only and restore zeroes the live residual, so they never alias a plain Q8
+/// or F32 scope). A PP band appends its band identity (index/count, layers,
+/// complete placement, devices, mesh and load epoch) and the shared schedule
+/// policy, so no two bands, placements, devices, meshes or loads alias.
+pub(crate) fn session_scope(
+    route: SessionRoute,
+    chunk: usize,
+    format: Qwen4StateFormat,
+    turns: bool,
+    band: Option<(&Qwen4PpBandMeta, PpSessionPolicy)>,
+) -> String {
+    // Message-end snapshots split prefill off the plain chunk schedule, so
+    // they never share a domain with chunk-only ones.
+    let turns = if turns { "/turns" } else { "" };
+    let gdn_abi = match format.gdn {
+        crate::GdnStateFormat::F32 | crate::GdnStateFormat::Q8 => "",
+        crate::GdnStateFormat::Q8Ef => "/q8_ef-reset",
+    };
+    let mut scope = format!("qwen4/{route:?}/chunk{chunk}/{format:?}{gdn_abi}{turns}");
+    if let Some((band, policy)) = band {
+        scope.push_str(&band.scope_tag());
+        scope.push_str(&policy.scope_tag());
+    }
+    scope
+}
+
 impl SessionState for Qwen4Bundle {
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
+        // An attached root is not a band: its aggregate scope is the mesh
+        // record. Detached (inside mesh callbacks) it is the band's own.
+        if self.pp.is_some() {
+            return None;
+        }
         let chunk = self.spec_chunk_rows()?;
         if route == SessionRoute::Mtp && self.mtp.is_none() {
             return None;
         }
-        // Message-end snapshots split prefill off the plain chunk schedule, so
-        // they never share a domain with chunk-only ones.
-        let turns = if self.turn_snapshots_active() {
-            "/turns"
-        } else {
-            ""
-        };
-        Some(format!(
-            "qwen4/{route:?}/chunk{chunk}/{:?}{turns}",
-            self.state_format
-        ))
+        let mut scope = session_scope(
+            route,
+            chunk,
+            self.state_format,
+            self.turn_snapshots_active(),
+            self.pp_band
+                .as_ref()
+                .map(|band| (band, self.pp_session_policy())),
+        );
+        // A slow-link load mixes in `tile_rows` tiles but checkpoints on its
+        // own cadence (`checkpoint_stride_rows`): the pair is a distinct
+        // numeric/cache identity, never aliasing an explicit chunk-1536
+        // cadence or the incumbent chunk-8192 math.
+        scope.push_str(&session_pair::slowlink_scope_tag(
+            self.slowlink
+                .profile
+                .map(|profile| (profile.tile_rows, profile.checkpoint_stride_rows)),
+        ));
+        // Approximate CPU arithmetic is a different prefix-state domain. Bind
+        // the actual armed layers and immutable hot-set/placement digest while
+        // preserving the GPU-only and pipeline-band scope.
+        if let Some(execution) = self.execution.as_ref() {
+            let host = execution.host_exec_identity();
+            if !host.is_empty() {
+                scope.push('/');
+                scope.push_str(&host);
+            }
+        }
+        Some(scope)
     }
 
     fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
-        let Some(chunk) = self.spec_chunk_rows() else {
+        let Some(chunk) = self.session_cadence_rows() else {
             return Vec::new();
         };
         stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
+    }
+
+    fn lineage_boundary(&self, prompt: &[u32], after: usize, up_to: usize) -> Option<usize> {
+        if !self.tail_snapshot {
+            return None;
+        }
+        let chunk = self.session_cadence_rows()?;
+        let token = self.turn_end_token?;
+        let p = prompt[..up_to].iter().rposition(|&id| id == token)?;
+        if p <= after
+            || prompt.len() < self.tail_snapshot_min_prompt
+            || p - after.max((p / chunk) * chunk) < self.tail_snapshot_min_gap
+            || up_to / chunk > p / chunk
+            || p % chunk == 0
+            || self.turn_end_token_active() == Some(prompt[p - 1])
+        {
+            return None;
+        }
+        Some(p)
     }
 
     fn snapshot_parts(
@@ -295,6 +467,9 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         position: usize,
     ) -> Result<SnapshotParts<'_>, String> {
+        if self.pp.is_some() {
+            return Err("session snapshots are not supported under qwen4 topology.pp yet".into());
+        }
         self.quiesce_ple().map_err(|e| e.to_string())?;
         let mtp = match route {
             SessionRoute::Ar => None,
@@ -307,7 +482,13 @@ impl SessionState for Qwen4Bundle {
         let staged = self
             .pair_session_stage
             .as_ref()
-            .filter(|stage| stage.position == Some(position));
+            .filter(|stage| stage.position == Some(position))
+            .or_else(|| {
+                self.slowlink
+                    .stages
+                    .iter()
+                    .find(|stage| stage.position == Some(position))
+            });
         if (staged.is_none() && self.state.position != position)
             || mtp.is_some_and(|mtp| mtp.position() != position)
         {
@@ -340,10 +521,22 @@ impl SessionState for Qwen4Bundle {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<StateLayout<'_>, String> {
-        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
+        if self.pp.is_some() {
+            return Err("session restore is not supported under qwen4 topology.pp yet".into());
+        }
         let (target_meta, mtp_meta) = meta
             .split_at_checked(self.state.session_meta_bytes())
             .ok_or("qwen4 session snapshot shape mismatch")?;
+        if route == SessionRoute::Mtp {
+            // Refuse an MTP snapshot of another shape or without a boundary
+            // row for its position before any owner mutates.
+            self.mtp
+                .as_ref()
+                .ok_or("Qwen4 MTP resources are not attached")?
+                .check_session_restore(mtp_meta)
+                .map_err(|e| e.to_string())?;
+        }
+        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
         let mut layout = self
             .state
             .prepare_session_restore(gpu, target_meta)
@@ -362,12 +555,31 @@ impl SessionState for Qwen4Bundle {
         Ok(layout)
     }
 
+    /// An MTP snapshot is restorable only when its head metadata passes the
+    /// same checks `restore_parts` runs first (shape, mark, and the boundary
+    /// row for its own position), so the session cache plans around one an
+    /// older build captured without the row: its prefix is prefilled again.
+    /// Without attached head resources the restore itself reports that.
+    fn snapshot_restorable(&self, route: SessionRoute, meta: &[u8]) -> bool {
+        if route != SessionRoute::Mtp {
+            return true;
+        }
+        let Some(mtp) = self.mtp.as_ref() else {
+            return true;
+        };
+        meta.split_at_checked(self.state.session_meta_bytes())
+            .is_some_and(|(_, mtp_meta)| mtp.check_session_restore(mtp_meta).is_ok())
+    }
+
     fn finish_restore(
         &mut self,
         gpu: &mut Gpu,
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String> {
+        if self.pp.is_some() {
+            return Err("session restore is not supported under qwen4 topology.pp yet".into());
+        }
         let (target_meta, mtp_meta) = meta
             .split_at_checked(self.state.session_meta_bytes())
             .ok_or("qwen4 session snapshot shape mismatch")?;
@@ -395,6 +607,32 @@ impl SessionState for Qwen4Bundle {
     fn growth_reserve_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
         let (context, gather) = self.context_growth_bytes(gpu, through);
         context.saturating_add(gather)
+    }
+
+    fn side_request_rows(&self, route: SessionRoute, through: usize) -> Option<Vec<usize>> {
+        if through > self.state.max_seq_len || self.state.row_capture_armed {
+            return None;
+        }
+        let mut rows = self.state.side_request_rows(through);
+        if route == SessionRoute::Mtp {
+            rows.extend(self.mtp.as_ref()?.side_request_rows(through));
+        }
+        Some(rows)
+    }
+
+    fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.begin_npu_trunk_request(gpu)
+            .map_err(|e| e.to_string())?;
+        if let Some(stage) = &mut self.pair_session_stage {
+            stage.position = None;
+        }
+        self.slowlink.clear_active();
+        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
+        self.state.reset_for_side(gpu).map_err(|e| e.to_string())?;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.reset_for_side(gpu).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -469,6 +707,7 @@ impl Qwen4Bundle {
             ple_source,
             state_format,
             backend,
+            None,
         )
     }
 
@@ -489,6 +728,39 @@ impl Qwen4Bundle {
     pub fn assemble_with_ple_rows(
         config: Qwen4Config,
         recipe: &Qwen4TierRecipe,
+        transaction: WeightLoadTransaction,
+        placements: &[Qwen4Placement],
+        gpu: &mut Gpu,
+        max_seq_len: usize,
+        metadata: impl Into<Option<PleHashMetadata>>,
+        ple_source: Qwen4PleRows,
+        state_format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    ) -> Result<Self, BundleError> {
+        let scope = crate::weights::Qwen4BandScope::single(&config);
+        Self::assemble_band_with_ple_rows(
+            config,
+            recipe,
+            transaction,
+            placements,
+            gpu,
+            max_seq_len,
+            metadata,
+            ple_source,
+            state_format,
+            backend,
+            expert_tiers,
+            &scope,
+        )
+    }
+
+    /// Assemble precisely one admitted pipeline band, including only its
+    /// pinned PLE/input resources and band-local mutable state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_band_with_ple_rows(
+        config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         mut transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
@@ -497,14 +769,43 @@ impl Qwen4Bundle {
         ple_source: Qwen4PleRows,
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+        scope: &crate::weights::Qwen4BandScope,
     ) -> Result<Self, BundleError> {
-        let ple_inputs = match admit_ple_inputs(&config, metadata.into(), ple_source) {
+        if let Err(error) = scope.validate(&config) {
+            return Err(cleanup_transaction(
+                BundleError::Forward(error),
+                transaction.rollback(gpu),
+            ));
+        }
+        let metadata = metadata.into();
+        let ple_inputs = if scope.input {
+            admit_ple_inputs(&config, metadata, ple_source)
+        } else if metadata.is_none() && matches!(ple_source, Qwen4PleRows::Absent) {
+            Ok(None)
+        } else {
+            Err(BundleError::Forward(
+                "qwen4 topology.pp: only the input band owns PLE rows and metadata".into(),
+            ))
+        };
+        let ple_inputs = match ple_inputs {
             Ok(inputs) => inputs,
             Err(error) => {
                 return Err(cleanup_transaction(error, transaction.rollback(gpu)));
             }
         };
-        let weights = match Qwen4Weights::assemble(&mut transaction, &config, recipe, placements) {
+        let assembled = match expert_tiers {
+            Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
+                &mut transaction,
+                &config,
+                recipe,
+                placements,
+                scope,
+                lease,
+            ),
+            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, scope),
+        };
+        let weights = match assembled {
             Ok(weights) => weights,
             Err(error) => {
                 return Err(cleanup_transaction(
@@ -517,9 +818,16 @@ impl Qwen4Bundle {
             (Some(inputs), Some(ple_config)) => {
                 // One prefill chunk prefetches `rows * head_count` n-gram rows
                 // in a single row-store request, so staging holds the
-                // requested chunk.
-                let staging_rows =
-                    qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * ple_config.head_count;
+                // requested chunk. The scratch mode is not known at assembly:
+                // the largest-default mode (`FnSymGfx1201`, 16384 rows on
+                // gfx1201) bounds every mode's chunk, so staging always
+                // covers the chunk the forward later picks. An explicit
+                // `HIPFIRE_PREFILL_CHUNK_ROWS` stays authoritative.
+                let staging_rows = qwen4_prefill_chunk_requested(
+                    gpu,
+                    max_seq_len,
+                    Qwen4ForwardScratchMode::FnSymGfx1201,
+                ) * ple_config.head_count;
                 match build_ple_row_store(
                     &inputs.source,
                     &transaction,
@@ -548,24 +856,30 @@ impl Qwen4Bundle {
             }
             _ => None,
         };
-        let mut state =
-            match Qwen4State::new_with_backend(gpu, &config, max_seq_len, state_format, backend) {
-                Ok(state) => state,
-                Err(error) => {
-                    // `unload` consumes the reader and joins its worker even on a
-                    // quiesce error, so source descriptors cannot outlive failure.
-                    if let Some(ple) = ple {
-                        let _ = ple.rows.unload();
-                    }
-                    let weight_result = weights.free_gpu(gpu);
-                    let cleanup = transaction.rollback(gpu);
-                    return Err(cleanup_bundle_failure(
-                        BundleError::State(error),
-                        weight_result,
-                        cleanup,
-                    ));
+        let mut state = match Qwen4State::new_with_backend_scoped(
+            gpu,
+            &config,
+            max_seq_len,
+            state_format,
+            backend,
+            scope,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                // `unload` consumes the reader and joins its worker even on a
+                // quiesce error, so source descriptors cannot outlive failure.
+                if let Some(ple) = ple {
+                    let _ = ple.rows.unload();
                 }
-            };
+                let weight_result = weights.free_gpu(gpu);
+                let cleanup = transaction.rollback(gpu);
+                return Err(cleanup_bundle_failure(
+                    BundleError::State(error),
+                    weight_result,
+                    cleanup,
+                ));
+            }
+        };
         state.bind_transaction_generation(transaction.inventory_len() as u64);
         Ok(Self {
             config,
@@ -579,16 +893,33 @@ impl Qwen4Bundle {
             spec_top1: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
+            dflash: None,
+            #[cfg(feature = "lab")]
+            lab_logits: crate::lab_window::LabLogitsTap::default(),
             penalty_stage: None,
             session: None,
             pair_session_stage: None,
+            slowlink: SlowlinkOwner::default(),
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
+            tail_snapshot: hipfire_config::developer_bool(TAIL_SNAPSHOT_ENV, true),
+            tail_snapshot_min_gap: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_GAP_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(TAIL_SNAPSHOT_MIN_GAP_DEFAULT),
+            tail_snapshot_min_prompt: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_PROMPT_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(TAIL_SNAPSHOT_MIN_PROMPT_DEFAULT),
             turn_end_token: None,
             state_format,
             lanes: None,
             ep: None,
+            pp: None,
+            pp_band: None,
+            ep_seal: None,
             trunk_overlay: None,
             npu_model_index: None,
+            cpu_d1_storage_rows: 0,
         })
     }
 
@@ -655,6 +986,14 @@ impl Qwen4Bundle {
         self.ple.as_mut().map(|ple| &mut ple.rows)
     }
 
+    /// Whole-request serving guard on the PLE row store's
+    /// [`hipfire_runtime::external_rows::FetchActivity`]: the prewarm
+    /// readers of the same table pause while it is held and resume once the
+    /// store has been idle.  `None` for a profile without PLE.
+    pub fn ple_serving_guard(&self) -> Option<hipfire_runtime::external_rows::ServingGuard> {
+        self.ple.as_ref().map(|ple| ple.rows.activity().serving())
+    }
+
     pub fn attached_origin(&self) -> Option<hipfire_runtime::weight_store::WeightOrigin> {
         self.weight_store.origin()
     }
@@ -665,6 +1004,34 @@ impl Qwen4Bundle {
 
     pub fn attached_external_rows_len(&self) -> usize {
         self.weight_store.external_rows_len()
+    }
+
+    /// The single S1 load plan shared by admission and its real allocation
+    /// owners. `None` on an individually allocated incumbent load.
+    pub fn slowlink_weight_arena_plan(
+        &self,
+    ) -> Option<&std::sync::Arc<rdna_compute::byte_arena::ModelWeightArenaPlan>> {
+        self.weight_store.transaction.weight_arena_plan()
+    }
+
+    /// Actual live owning capacities, in the shared weight plan's root order.
+    /// These are allocation capacities, not the planned requests.
+    pub fn weight_arena_root_capacities(&self) -> Vec<usize> {
+        self.weight_store.transaction.weight_arena_root_capacities()
+    }
+
+    /// Actual live shadow-root capacities, in plan order. An unallocated
+    /// lazy root is `None`, never reported as an observed allocation.
+    pub fn f16_shadow_arena_root_capacities(&self, gpu: &Gpu) -> Vec<Option<usize>> {
+        match (
+            self.slowlink_weight_arena_plan(),
+            gpu.f16_shadow_arena_plan(),
+        ) {
+            (Some(weights), Some(shadows)) if std::sync::Arc::ptr_eq(weights, shadows) => {
+                gpu.f16_shadow_arena_root_capacities()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Attach cheap base-HFQ identity captured before the source was moved.
@@ -735,12 +1102,307 @@ impl Qwen4Bundle {
         Ok(None)
     }
 
+    /// Whether every call of this load runs host arithmetic: the D1 CPU
+    /// splice, or a D2 split requested by the explicit `memory.offload_exec=cpu`
+    /// (the speculative-width caps key on this). A D2 split armed only by the
+    /// measured per-load default is per call and does not count; see
+    /// [`Self::split_layers`].
+    pub fn has_cpu_deferred_experts(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(Qwen4GpuForward::has_cpu_deferred_experts)
+    }
+
+    /// Verify rows the armed CPU routed-expert modes (D1 splice, any D2 tier
+    /// split including the measured per-call default) run row-exact, from
+    /// their own ownership (not [`Self::has_cpu_deferred_experts`], which
+    /// excludes the per-call default); `None` when no layer is CPU-owned. The
+    /// native MTP `auto` cap is one below the smaller of this and the GPU's
+    /// row-exact rows.
+    pub fn native_mtp_cpu_window_rows(&self) -> Option<usize> {
+        self.execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::native_mtp_cpu_window_rows)
+    }
+    /// Actually reserved D1 CPU-owned expert storage rows (logical window rows) of
+    /// this load: `0` when no lab-wide 64-row window was admitted AND prewarmed
+    /// (the legacy default, on-demand growth, byte-identical placement), else the
+    /// stored admitted + prewarmed window saturating at
+    /// [`hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS`]. Storage only —
+    /// never a qualification, never a default: wide routing still reads
+    /// [`Self::cpu_qualified_verify_rows`] with the per-call lab-wide scope, which
+    /// additionally gates on the caller's live thread-local capacity.
+    /// Stored (loader-proven), never inferred from scope: set to nonzero only by
+    /// [`Self::note_cpu_d1_wide_storage_prewarmed`] after the real prewarm lands, so
+    /// a wide window stays refused — fail-closed, never a metadata claim.
+    pub fn cpu_d1_storage_capacity_rows(&self) -> usize {
+        self.cpu_d1_storage_rows
+    }
+
+    /// Common actual CPU-owned expert capacity: the BINDING minimum of every actually
+    /// owned store — the stored D1 window when a D1 splice is armed, and the minimum
+    /// live D2 executor capacity across armed split layers. Unowned modes contribute
+    /// nothing (they must not mask an owned one): D1 storage 0 on a D2-only load does
+    /// NOT clip the D2 executor's 64, and absent executors do not clip a D1 64.
+    /// `0` when no CPU expert mode owns storage. Storage only, never qualification:
+    /// routing still gates on the per-call lab-wide scope + live capacities.
+    /// Rate reads this as the physical cap (with the still-frozen qualified getter).
+    pub fn cpu_storage_capacity_rows(&self) -> usize {
+        let d1 = self
+            .has_cpu_deferred_experts()
+            .then(|| self.cpu_d1_storage_rows);
+        match (d1, self.execution.as_ref()) {
+            (Some(d1), Some(forward)) => match forward.d2_storage_capacity_rows() {
+                Some(d2) => d1.min(d2),
+                None => d1,
+            },
+            (Some(d1), None) => d1,
+            (None, Some(forward)) => forward.d2_storage_capacity_rows().unwrap_or(0),
+            (None, None) => 0,
+        }
+    }
+
+    /// Qualified CPU verify width of this load, from actual storage plus scope:
+    /// [`crate::program::QWEN4_CPU_SPLICE_MAX_ROWS`] (4) on the default route;
+    /// the actual stored window only when `lab_armed` (the caller's per-call lab-wide
+    /// presence gate, from the canonical override signal on the sealing device —
+    /// never a stored constant) AND the admitted+prewarmed storage above covers it.
+    /// The frozen GPU width is informational arm width only — it never narrows the
+    /// CPU result below actual storage (wide8 presence with 64-row storage qualifies
+    /// the FULL R1..64 CPU backend for both lab arms). No override, no constant-64
+    /// claim: without the scope (or without admitted storage) this stays 4.
+    /// Pass the ACTUAL per-call override presence: storage without presence must not
+    /// qualify (prewarmed 64 + cleared override ⇒ product 4/K3, not a GPU fallback).
+    pub fn cpu_qualified_verify_rows(&self, gpu: &Gpu, lab_armed: bool) -> usize {
+        use hipfire_dispatch::families::moe::CpuWideVerifyScope;
+        let scope = CpuWideVerifyScope::from_lab_presence(
+            lab_armed,
+            crate::gpu_forward::qwen4_row_exact_verify_rows(gpu),
+        );
+        scope.qualified_max_rows(self.cpu_storage_capacity_rows())
+    }
+
+    /// Planned D1 storage need in rows: 0 unless carrying an admitted native capture
+    /// (the loader reserves the capture before any window grows it); the native-MTP
+    /// capture rows are the window need (`max_k` drafts + 1, saturating the physical
+    /// bound). `None` max_k (AR load) requests nothing. Pure, no allocation.
+    pub fn cpu_d1_requested_window_rows(&self) -> usize {
+        self.native_mtp_capture_rows()
+    }
+
+    /// Whether the load qualifies for a lab-wide D1 reservation before prewarm: the
+    /// single non-EP/PP/lane Flash-Next scope with an armed D1 splice
+    /// ([`Self::has_cpu_deferred_experts`]) whose allocated GPU scratch actually holds
+    /// the capture rows. D2-only loads (armed split, no D1 splice) are excluded: they
+    /// reserve their own executor storage and must never prewarm an unused D1 pinned
+    /// stage (the TLS host-slot scratch is shared; the pinned stage is per-mode).
+    /// Scope gate only (actual rows come from [`Self::cpu_d1_requested_window_rows`]);
+    /// the stored capacity above stays 0 until the real prewarm lands.
+    pub fn cpu_d1_owned_single_fn(&self) -> bool {
+        if !self.config.profile.is_flash_next()
+            || self.ep.is_some()
+            || self.pp.is_some()
+            || self.pp_band.is_some()
+            || self.lanes.is_some()
+        {
+            return false;
+        }
+        if !self.has_cpu_deferred_experts() {
+            return false;
+        }
+        let Some(forward) = self.execution.as_ref() else {
+            return false;
+        };
+        let need = self.cpu_d1_requested_window_rows();
+        need > 0
+            && forward.scratch.max_chunk >= need
+            && crate::gpu_forward::qwen4_spec_logit_rows(forward.scratch.max_chunk) >= need
+    }
+
+    /// Geometry `(hidden, intermediate, top_k)` the D1 splice actually runs: the
+    /// model config (`None` for zero `top_k`, which admits no expert window).
+    pub fn cpu_d1_geometry(&self) -> Option<(usize, usize, usize)> {
+        (self.config.num_experts_per_tok != 0).then_some((
+            self.config.hidden_size,
+            self.config.moe_intermediate_size,
+            self.config.num_experts_per_tok,
+        ))
+    }
+
+    /// Record the loader's real D1 prewarm: the actually reserved window `rows`
+    /// (logical rows, 1..=STORAGE, derived from [`cpu_d1_required_storage_rows`] and
+    /// reserved on the execution thread) after BOTH reservations land — the pinned
+    /// transfer stage (`2 * (rows * dim + rows * top_k)` f32 values, exactly
+    /// `moe_cpu_experts`' `(n_x + slots) * 8` stage bytes / 4) and the host-slot
+    /// scratch (`rows * top_k` slots) — with the GPU full-slot views checked
+    /// Refuses (returns `false`, storing nothing) when the scope/need is absent, when
+    /// `rows` exceeds the physical storage bound, or when live thread-local capacity
+    /// ([`hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows`]) does not
+    /// cover `rows` on the calling thread: no fake admitted metadata ever lands.
+    /// Called once, before the first window; retained pointer invalidations precede
+    /// the reservations (never after), so growth cannot strand live views.
+    pub fn note_cpu_d1_wide_storage_prewarmed(&mut self, rows: usize, device_id: i32) -> bool {
+        let Some((dim, mi, top_k)) = self.cpu_d1_geometry() else {
+            return false;
+        };
+        if rows == 0
+            || rows > hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS
+            || !self.cpu_d1_owned_single_fn()
+        {
+            return false;
+        }
+        let need = crate::expert_residency::cpu_d1_required_storage_rows(
+            true,
+            true,
+            self.cpu_d1_requested_window_rows(),
+        );
+        if need == 0 || rows > need {
+            return false;
+        }
+        let live = hipfire_dispatch::families::moe::cpu_d1_prewarmed_scratch_rows(
+            dim, mi, top_k, device_id,
+        );
+        if live < rows {
+            return false;
+        }
+        self.cpu_d1_storage_rows = rows;
+        true
+    }
+
+    /// Load-only D2 prewarm/reserve for the REAL requested window rows: resize every
+    /// armed split layer's default-4 executor to `requested_rows` (preserving the
+    /// load-immutable Return/Ready/Join selections), on the execution thread, BEFORE
+    /// the first window — never with a window in flight (the old executor is freed
+    /// before its replacement is built, so no old+new overlap peak exists to charge).
+    /// Unarmed layers (no cold owner / no executor) and executors that already cover
+    /// the request are a no-op. Returns whether any layer resized. A reservation
+    /// failure leaves that layer without an executor and returns the error: the caller
+    /// must fail the load (free GPU, load error), never run narrowed or silent.
+    pub fn reserve_cpu_d2_wide_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        requested_rows: usize,
+    ) -> Result<bool, BundleError> {
+        let Some(forward) = self.execution.as_mut() else {
+            return Ok(false);
+        };
+        let config = &self.config;
+        let mut resized_any = false;
+        for layer in forward.moe.iter_mut().flatten() {
+            let resized = layer
+                .reserve_d2_wide_rows(gpu, config, requested_rows)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+            resized_any |= resized;
+        }
+        Ok(resized_any)
+    }
+
+    /// Trunk layers armed for the opt-in CPU-cold/GPU-hot routed slot join.
+    pub fn split_layers(&self) -> Vec<usize> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_layers)
+            .unwrap_or_default()
+    }
+
+    /// Stable numerical identity of the frozen CPU split and expert hot set.
+    pub fn split_digest(&self) -> Option<String> {
+        self.execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::split_digest)
+    }
+
+    /// Owner kind (`"tier"` or `"whole-layer"`) of every armed D2 split layer,
+    /// as `(layer label, kind)` in layer order.
+    pub fn split_owner_kinds(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_owner_kinds)
+            .unwrap_or_default()
+    }
+
+    /// D2 cold-result return mode (`"mapped"` or `"copy"`) of every armed
+    /// D2 split layer, as `(layer label, mode)` in layer order.
+    pub fn split_return_modes(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_return_modes)
+            .unwrap_or_default()
+    }
+
+    /// D2 input readiness mode (`"event"` or `"sync"`) of every armed D2 split
+    /// layer, as `(layer label, mode)` in layer order.
+    pub fn split_ready_modes(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_ready_modes)
+            .unwrap_or_default()
+    }
+
+    /// D2 join mode (`"cpwait"` or `"host"`) of every armed D2 split layer, as
+    /// `(layer label, mode)` in layer order.
+    pub fn split_join_modes(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_join_modes)
+            .unwrap_or_default()
+    }
+
+    /// Cumulative D2 readiness/join counters of every armed D2 split layer, as
+    /// `(layer label, [ready_polls, ready_fallback_syncs, cpwait_joins,
+    /// cpwait_aborts, watchdog_fires])` in layer order.
+    pub fn split_readiness_counters(&self) -> Vec<(usize, [u64; 5])> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_readiness_counters)
+            .unwrap_or_default()
+    }
+
+    /// Numerical identity of every armed CPU arithmetic mode (D1 and the D2
+    /// owner kinds); empty when none is armed.
+    pub fn host_exec_identity(&self) -> String {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::host_exec_identity)
+            .unwrap_or_default()
+    }
+
+    /// Lab-only slot capture / serial-overlap controls. Off leaves production
+    /// execution unchanged; endpoint overrides require explicit configuration.
+    pub fn split_parity_configure(
+        &mut self,
+        config: hipfire_dispatch::cpu_split::SplitParityConfig,
+    ) -> Result<(), BundleError> {
+        self.execution
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 forward resources are not attached".into()))?
+            .split_parity_configure(config)
+            .map_err(|e| BundleError::Forward(e.to_string()))
+    }
+
+    /// Drain bounded lab parity records in execution order.
+    pub fn split_take_parity_records(
+        &mut self,
+    ) -> Vec<hipfire_dispatch::cpu_split::SplitParityRecord> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_take_parity_records)
+            .unwrap_or_default()
+    }
+
     /// Attach reusable ordinary-HIP execution resources after the manifest
     /// transaction and model state have assembled successfully.
     ///
     /// `mode` is the forward scratch plan the caller admitted and, for the
     /// loader, already charged to the automatic expert placement; the chunk
     /// rung search and the forward allocate exactly that plan.
+    ///
+    /// `max_chunk` caps the chunk: the requested rows
+    /// ([`qwen4_prefill_chunk_requested`]) are taken `min` it, so it can only
+    /// narrow them. The loader passes the chunk its expert placement was
+    /// sized from (the same requested chunk, never widened here); other
+    /// callers pass `max_seq`. The rung search below may still pick a smaller
+    /// rung against live free memory.
     pub fn attach_forward(
         &mut self,
         gpu: &mut Gpu,
@@ -765,7 +1427,17 @@ impl Qwen4Bundle {
             }
             _ => usize::MAX,
         };
-        let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk).min(ple_rows_cap);
+        // An admitted slow-link profile fixes the forward's chunk at EXACTLY
+        // its charged tile (never the incumbent helper's wider default, which
+        // would retain scratch the profile did not charge); the caller's and
+        // the PLE store's capacity must cover it, checked before any
+        // allocation. Every other load keeps the incumbent request unchanged.
+        let s1_tile = self.slowlink.profile.map(|profile| profile.tile_rows);
+        let requested =
+            session_pair::attach_chunk_request(s1_tile, max_chunk, ple_rows_cap, || {
+                qwen4_prefill_chunk_requested(gpu, max_chunk, mode)
+            })
+            .map_err(BundleError::Forward)?;
         if requested == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 PLE row store cannot stage one chunk row".to_string(),
@@ -809,6 +1481,24 @@ impl Qwen4Bundle {
                 );
             }
         }
+        // The gfx1201 BF16 split selector (`HIPFIRE_QWEN4_QSA_BF16_SPLIT`)
+        // keeps its score / filter scratch in the selector slot. Reserve the
+        // route's constant upper bound now, before any capture or record, so
+        // no retained decode tape ever sees that slot grow or move. A no-op
+        // unless the route can run (not killed with `=0`, gfx1201, BF16 pooled keys).
+        if let Some(qsa) = self.state.qsa.first() {
+            let reserved = rdna_compute::tensor_ops::reserve_qsa_bf16_split_scratch(
+                gpu,
+                qsa.pooled_keys.dtype,
+            )
+            .map_err(BundleError::Hip)?;
+            if reserved > 0 {
+                eprintln!(
+                    "  qwen4 QSA BF16 split selector: {} MiB score/filter scratch reserved",
+                    reserved >> 20
+                );
+            }
+        }
         // Admitted NPU numerics read stock MQ6, including z/a/b, before the
         // overlay swap. Effective off does no downloads, allocation or logging.
         #[cfg(target_os = "linux")]
@@ -834,23 +1524,77 @@ impl Qwen4Bundle {
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
         let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
-        let max_chunk = qwen4_prefill_chunk_rungs(requested)
-            .find(|&rows| {
-                qwen4_forward_device_bytes(&self.config, rows, mode)
-                    .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
-                    .is_some_and(|bytes| bytes <= free as u64)
-            })
-            .unwrap_or_else(|| requested.min(1536));
+        let max_chunk = match s1_tile {
+            // The charged tile, with no rung downshift: admission sized the
+            // placement and the arena for exactly these rows.
+            Some(tile) => tile,
+            None => qwen4_prefill_chunk_rungs(requested)
+                .find(|&rows| {
+                    qwen4_forward_device_bytes(&self.config, rows, mode)
+                        .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                        .is_some_and(|bytes| bytes <= free as u64)
+                })
+                .unwrap_or_else(|| requested.min(1536)),
+        };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
-        let forward = Qwen4GpuForward::new_inner(
+        let attempt = Qwen4GpuForward::new_inner(
             gpu,
             self,
             max_chunk,
             mode,
             #[cfg(target_os = "linux")]
             Some(npu_prepared),
-        )
-        .map_err(|error| BundleError::Forward(error.to_string()))?;
+        );
+        let (mut forward, max_chunk) = match attempt {
+            Ok(forward) => (forward, max_chunk),
+            // The compact plan was chosen before the payload was proven; the
+            // GPU symmetry check refused it and `new_inner` released all it
+            // allocated. Re-plan Full against the memory now free. The NPU
+            // trunk (gfx1151) never coexists with the gfx1201-only compact
+            // plan, so nothing prepared is lost. S1 keeps its charged tile.
+            Err(Qwen4GpuForwardError::CompactUnverified { verified, total })
+                if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
+            {
+                let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+                let rows = full_fallback_rows(&self.config, requested, free as u64);
+                eprintln!(
+                    "  qwen4 forward scratch: compact plan refused by the GPU symmetry check ({verified}/{total} layers verified); re-planned Full at {rows} rows"
+                );
+                let forward = Qwen4GpuForward::new_inner(
+                    gpu,
+                    self,
+                    rows,
+                    Qwen4ForwardScratchMode::Full,
+                    #[cfg(target_os = "linux")]
+                    Some(None),
+                )
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+                (forward, rows)
+            }
+            Err(error) => return Err(BundleError::Forward(error.to_string())),
+        };
+        if let Some(profile) = self.slowlink.profile {
+            forward.set_slowlink_profile(profile);
+        }
+        // The selected S1 load binds EVERY admitted physical owner here, before
+        // any product request can take the memory the placement charged: the
+        // page ring, route region, HC arena, window scratch and boundary stages
+        // (the native-MTP `pending` backup binds at `attach_mtp`). A mode or
+        // native-kernel capability this load cannot run is a named decline (S1
+        // stays unavailable and requests bypass with that reason, nothing was
+        // allocated); an allocation failure is a named load failure, never a
+        // mid-request fallback. Loads without a profile allocate nothing here.
+        if self.slowlink.profile.is_some() {
+            if let Err(reason) = crate::slowlink_prefill::bind_at_load(&mut forward, self, gpu) {
+                let teardown = match forward.free_gpu(gpu) {
+                    Ok(()) => "released to the device pool".to_string(),
+                    Err(error) => format!("reported {error}"),
+                };
+                return Err(BundleError::Forward(format!(
+                    "{reason}; forward teardown: {teardown}"
+                )));
+            }
+        }
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
@@ -909,7 +1653,31 @@ impl Qwen4Bundle {
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
+        // The S1 entry `pending` backup is charged by the admission of a
+        // native-MTP load: bind it with the head, never on a request.
+        self.slowlink_bind_pending_save(gpu)?;
         Ok(())
+    }
+
+    /// Reserve the GDN capture ring the first native MTP window captures into,
+    /// before any window or captured graph can grow it: the support and rows of
+    /// [`crate::mtp_spec::native_mtp_capture`] for a `max_k`-draft window, ensured
+    /// on the state ring (a no-op where the route captures no rows). The caller
+    /// passes the resource (reserve) drafts; execution keeps its own `max_k`.
+    /// Staged allocation failure leaves the bundle untouched.
+    pub fn prepare_native_mtp_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        max_k: usize,
+    ) -> Result<(), BundleError> {
+        let Some((_, rows)) =
+            crate::mtp_spec::native_mtp_capture(gpu, &self.config, self.state_format.gdn, max_k)
+        else {
+            return Ok(());
+        };
+        self.state
+            .ensure_row_capture(gpu, rows, self.config.linear_conv_kernel_dim - 1)
+            .map_err(BundleError::State)
     }
 
     /// Native MTP attaches only where the profile's weights carry an MTP head
@@ -930,7 +1698,13 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         rows: usize,
     ) -> Result<(), BundleError> {
-        self.ep_refuse("speculative decoding (spec hidden rows)")?;
+        // The root-only spec hidden allocation is the output band's under PP
+        // (the caller passes the output device); only EP has no such owner.
+        if self.ep.is_some() {
+            return Err(BundleError::Forward(
+                "speculative decoding (spec hidden rows) is unsupported under qwen4 EP".to_string(),
+            ));
+        }
         if rows == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 spec hidden capacity is zero".to_string(),
@@ -1005,6 +1779,14 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .map(|forward| forward.scratch.max_chunk)
+            .or_else(|| self.pp_band.as_ref().map(|band| band.chunk()))
+    }
+
+    /// The scratch plan the attached forward actually allocated: differs from
+    /// the plan `attach_forward` was given when a compact plan was refused by
+    /// the GPU symmetry check and re-planned Full.
+    pub fn forward_scratch_mode(&self) -> Option<Qwen4ForwardScratchMode> {
+        self.execution.as_ref().map(|forward| forward.scratch.mode)
     }
 
     pub(crate) fn npu_trunk_pipelined(&self) -> bool {
@@ -1019,15 +1801,47 @@ impl Qwen4Bundle {
             .is_some_and(|f| f.npu_trunk_planned())
     }
 
-    pub(crate) fn begin_npu_trunk_request(&mut self) {
+    /// Whether the request in flight tripped the NPU trunk fault latch; clears the per-request flag.
+    pub(crate) fn take_npu_trunk_fault(&mut self) -> bool {
+        self.execution
+            .as_mut()
+            .is_some_and(|f| f.take_npu_trunk_fault())
+    }
+
+    pub(crate) fn begin_npu_trunk_request(&mut self, gpu: &Gpu) -> Result<(), BundleError> {
         if let Some(forward) = &mut self.execution {
-            forward.begin_npu_trunk_request();
+            forward
+                .begin_npu_trunk_request(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Advance the NPU trunk executor before a driver asks for the next pair
+    /// (`prefill_schedule_rows`, `npu_trunk_pair_shape`).
+    pub(crate) fn poll_npu_trunk(&mut self, gpu: &Gpu) -> Result<(), BundleError> {
+        if let Some(forward) = &mut self.execution {
+            forward
+                .poll_npu_trunk(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// The first still-pending snapshot boundary strictly after `position`.
     pub(crate) fn session_boundary_after(&self, position: usize) -> Option<usize> {
         self.session.as_ref()?.next_boundary_after(position)
+    }
+
+    /// The turn's armed lineage split row strictly after `position`. A prefill
+    /// pair group ends there and the NPU request is planned through it: the
+    /// pair executor carries one interior snapshot row, so a split inside a
+    /// group that already holds one would drop the whole group to GPU tiles.
+    pub(crate) fn session_lineage_after(&self, position: usize) -> Option<usize> {
+        self.session
+            .as_ref()?
+            .turn_lineage()
+            .filter(|&p| p > position)
     }
 
     /// Banks and snapshot cut of the planned pair starting at `position`, the
@@ -1050,6 +1864,9 @@ impl Qwen4Bundle {
     }
 
     pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
+        let end = self
+            .session_lineage_after(position)
+            .map_or(end, |p| p.min(end));
         let next = self.session_next_boundary();
         let boundaries = crate::gpu_forward::SessionBoundaries {
             next,
@@ -1103,6 +1920,12 @@ impl Qwen4Bundle {
     /// at assembly). Changing it changes the snapshot scope, so call it before
     /// the first prefill that fills the cache.
     pub fn set_turn_snapshots(&mut self, on: bool) {
+        // Message-end snapshots stay refused under topology.pp (the aggregate
+        // record pins cold chunk pieces only).
+        if let Some(mesh) = self.pp.as_ref().filter(|_| on) {
+            eprintln!("  {}", pp::turn_snapshots_refusal(mesh.stages()));
+            return;
+        }
         let set = |bundle: &mut Self| {
             bundle.turn_snapshots = on;
             Ok(())
@@ -1112,6 +1935,24 @@ impl Qwen4Bundle {
             Ok(())
         }) {
             eprintln!("  qwen4 EP: set_turn_snapshots: {error}");
+        }
+    }
+
+    /// Override the tail-split thresholds read at assembly
+    /// (`HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP` / `_MIN_PROMPT`); hardware tests
+    /// use it to exercise the split on short prompts.
+    pub fn set_tail_snapshot_limits(&mut self, min_gap: usize, min_prompt: usize) {
+        let set = |bundle: &mut Self| {
+            bundle.tail_snapshot_min_gap = min_gap;
+            bundle.tail_snapshot_min_prompt = min_prompt;
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("set_tail_snapshot_limits", set, &|bundle, _, _| {
+            bundle.tail_snapshot_min_gap = min_gap;
+            bundle.tail_snapshot_min_prompt = min_prompt;
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: set_tail_snapshot_limits: {error}");
         }
     }
 
@@ -1213,7 +2054,14 @@ impl Qwen4Bundle {
                 tokens.len()
             )));
         }
-        let hidden = if capture_hidden {
+        // An armed DFlash2 drafter captures its target layers instead of the
+        // MTP head's wide hidden.
+        let layer_capture = if capture_hidden {
+            self.dflash_layer_capture(tokens.len())?
+        } else {
+            None
+        };
+        let hidden = if capture_hidden && layer_capture.is_none() {
             let width = self
                 .config
                 .hc_count
@@ -1238,9 +2086,11 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
+        forward.layer_capture = layer_capture;
         let result = forward
             .forward_chunk_silent(self, gpu, tokens, hidden.as_ref())
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.layer_capture = None;
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
@@ -1263,6 +2113,22 @@ impl Qwen4Bundle {
             return Err(BundleError::Forward(
                 "Qwen4 spec forward cannot process an empty block".to_string(),
             ));
+        }
+        if !prefill && self.has_cpu_deferred_experts() {
+            let qualified = self
+                .cpu_qualified_verify_rows(
+                    gpu,
+                    crate::gpu_forward::Qwen4GpuForward::cpu_lab_override_present(gpu),
+                )
+                .max(crate::program::QWEN4_CPU_SPLICE_MAX_ROWS);
+            if tokens.len() > qualified {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 spec verify of {} rows exceeds the {}-row qualified CPU routed-expert window (legacy {})",
+                    tokens.len(),
+                    qualified,
+                    crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
+                )));
+            }
         }
         let max_chunk = self
             .execution
@@ -1307,7 +2173,12 @@ impl Qwen4Bundle {
             .as_ref()
             .ok_or_else(|| BundleError::Forward("Qwen4 spec argmax is not attached".to_string()))?
             .sub_offset(0, top1_len);
-        let hidden = if capture_hidden {
+        let layer_capture = if capture_hidden {
+            self.dflash_layer_capture(tokens.len())?
+        } else {
+            None
+        };
+        let hidden = if capture_hidden && layer_capture.is_none() {
             let width = self
                 .config
                 .hc_count
@@ -1332,6 +2203,7 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, prefill);
+        forward.layer_capture = layer_capture;
         let result = forward
             .forward_chunk(
                 self,
@@ -1343,9 +2215,12 @@ impl Qwen4Bundle {
                 output_rows,
             )
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.layer_capture = None;
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
+        #[cfg(feature = "lab")]
+        self.lab_note_forward(gpu, tokens, &logits, output_count, prefill)?;
         if !download_picks {
             return Ok(Vec::new());
         }
@@ -1358,6 +2233,7 @@ impl Qwen4Bundle {
         gpu.hip
             .memcpy_dtoh(&mut self.spec_host_top1[..bytes_len], &top1.buf)
             .map_err(BundleError::Hip)?;
+        gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let mut picks = Vec::with_capacity(output_count);
         for bytes in self.spec_host_top1[..bytes_len].chunks_exact(4) {
             picks.push(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
@@ -1423,9 +2299,360 @@ impl Qwen4Bundle {
         .map_err(BundleError::Hip)
     }
 
+    /// Effective rows for an eager verify: admitted arithmetic (with the AR
+    /// reference bound at entry), CPU-expert restriction, physical capacity,
+    /// and the actually allocated forward/logit/argmax scratch. Before forward
+    /// resources are attached this retains the historic conservative getter.
+    /// The n-gram copy lane caps a window's take at this minus one.
+    pub(crate) fn row_exact_verify_rows(&self, gpu: &Gpu) -> usize {
+        let Some(forward) = self.execution.as_ref() else {
+            return rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
+        };
+        let logits_rows = self.spec_logits.as_ref().map_or(0, |tensor| {
+            tensor
+                .numel()
+                .checked_div(self.config.vocab_size)
+                .unwrap_or(0)
+        });
+        let top1_rows = self
+            .spec_top1
+            .as_ref()
+            .map_or(0, |tensor| tensor.byte_size() / std::mem::size_of::<i32>());
+        forward
+            .guarded_wide_verify_rows(self, gpu)
+            .min(logits_rows)
+            .min(top1_rows)
+    }
+
+    /// The actual AR arithmetic reference latched by the most recent
+    /// multi-row verify attempt, not the replay backend requested by flags.
+    /// Singleton forwards do not bind a verify reference.
+    #[cfg(feature = "lab")]
+    pub(crate) fn last_verify_reference(
+        &self,
+    ) -> Option<rdna_compute::prefill_invariant::Qwen4VerifyReference> {
+        self.execution
+            .as_ref()
+            .and_then(|forward| forward.last_verify_reference)
+    }
+
+    /// Checked device allocation plan for this loaded owner's capture ring,
+    /// both halves and all retained inputs/output/table, not a measured peak.
+    #[cfg(feature = "lab")]
+    pub(crate) fn row_capture_planned_bytes(&self, rows: usize) -> Option<usize> {
+        Qwen4State::row_capture_bytes_scoped(
+            &self.config,
+            self.state_format.gdn,
+            rows,
+            self.state.gdn.len(),
+        )
+    }
+
+    /// Checked byte census of the admitted CPU-owned expert window (D1 + D2): the real host
+    /// transfer-stage bytes, host-slot count, full-slot GPU view extents and the SUM of
+    /// actual D2 executor instance bytes at the stored common capacity: the SourceB
+    /// [`storage_bytes`]/[`transfer_bytes_for`] authorities plus the mapped cold-return
+    /// and `masked_indices` device bytes per armed layer, with the thread-local host-slot
+    /// scratch pool for the stored rows — every formula checked
+    /// (the existing [`expert_residency`] + [`gpu_forward`] + SourceB authorities),
+    /// `None` on overflow (the caller refuses before any allocation). No measured peak,
+    /// no second planner: only the D1 stage row-count term is D1-specific (0 on a
+    /// D2-only load reports the D2 shares and skips the pinned stage); input/output
+    /// stages are the one D1 stage formula, GPU views are the allocated
+    /// forward/provider extents, capture is the planned ring,
+    /// [`Self::cpu_d1_requested_window_rows`] is the plan need used pre-reserve.
+    /// `0`-storage loads report zeros (legacy default: nothing reserved).
+    pub fn cpu_storage_bytes(&self) -> Option<CpuStorageBytes> {
+        let rows = self.cpu_storage_capacity_rows();
+        if rows == 0 {
+            return Some(CpuStorageBytes::default());
+        }
+        let Some((dim, mi, top_k)) = self.cpu_d1_geometry() else {
+            return None;
+        };
+        // D1 owns the pinned transfer stage only when a D1 splice is armed; a D2-only
+        // load reports the shared scratch + D2 bytes with a 0 stage (nothing pinned).
+        let d1_stage_values = if self.has_cpu_deferred_experts() {
+            crate::expert_residency::cpu_d1_stage_values(dim, top_k, rows)?
+        } else {
+            0
+        };
+        let slots = crate::expert_residency::cpu_d1_host_slots(rows, top_k)?;
+        let stage_bytes = d1_stage_values.checked_mul(4)?;
+        let forward = self.execution.as_ref()?;
+        let need = |have: usize, need: usize| (have >= need).then_some(need);
+        let x_rot = need(forward.scratch.ffn_output.numel(), rows.checked_mul(dim)?)?;
+        let topk = need(forward.scratch.moe_topk_indices.numel(), slots)?;
+        let _ = need(forward.scratch.moe_topk_weights.numel(), topk)?;
+        let expanded = need(
+            forward.scratch.moe_down_expanded.numel(),
+            slots.checked_mul(dim)?,
+        )?;
+        let spec = crate::gpu_forward::qwen4_forward_device_bytes(
+            &self.config,
+            forward.scratch.max_chunk,
+            forward.scratch.mode,
+        )?;
+        let capture = self.row_capture_planned_bytes_lab(rows)?;
+        let (d2_input, d2_mask, d2_output, d2_transfer, d2_mapped, d2_device) =
+            self.cpu_d2_storage_bytes().unwrap_or((0, 0, 0, 0, 0, 0));
+        // The thread-local host-slot scratch the settled reservation actually grew:
+        // the live pool capacity translated back through SourceB's reserve formulas is
+        // thread-local and mutable state, so the settled census charges the SAME checked
+        // requested-size pool the preflight plan computed, never a live read.
+        let host_scratch_bytes = {
+            let count_f32 = |n: usize| n.checked_mul(4);
+            let count_u32 = |n: usize| n.checked_mul(4);
+            let slots2mi = slots.checked_mul(mi)?;
+            count_f32(slots2mi.checked_mul(2)?)?
+                .checked_add(count_f32(slots2mi)?)?
+                .checked_add(count_f32(slots.checked_mul(dim)?)?)?
+                .checked_add(count_f32((2usize).checked_mul(mi)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?.checked_mul(2)?)?
+                .checked_add(
+                    std::mem::size_of::<usize>()
+                        .checked_mul(slots.checked_add(1)?)?
+                        .checked_mul(2)?,
+                )?
+        };
+        Some(CpuStorageBytes {
+            rows,
+            slots,
+            stage_values: d1_stage_values,
+            stage_bytes,
+            x_rot_elements: x_rot,
+            topk_elements: topk,
+            down_expanded_elements: expanded,
+            forward_device_bytes: spec,
+            capture_bytes: capture,
+            d2_input_bytes: d2_input,
+            d2_mask_bytes: d2_mask,
+            d2_output_bytes: d2_output,
+            d2_transfer_bytes: d2_transfer,
+            d2_mapped_bytes: d2_mapped,
+            d2_device_bytes: d2_device,
+            host_scratch_bytes,
+        })
+    }
+
+    /// Actual D2 executor storage bytes summed over live instances: per armed layer the
+    /// SourceB [`storage_bytes`] triple for its allocated capacity rows plus the
+    /// [`transfer_bytes_for`] up+down for this load's cold slots (all-cold upper bound
+    /// `slots`), the mapped cold-return bytes (0 on the copy transport) and the
+    /// `masked_indices` device bytes — each checked (overflow ⇒ `None` ⇒ caller refuses
+    /// before allocation). `None` when no layer owns an executor (D2 contributes nothing)
+    /// or on overflow; `(0,0,0,0,0,0)` never returned for an armed layer (capacity rows
+    /// are always ≥ 1).
+    pub(crate) fn cpu_d2_storage_bytes(
+        &self,
+    ) -> Option<(usize, usize, usize, usize, usize, usize)> {
+        use hipfire_dispatch::cpu_split::CpuSplitExecutor;
+        let forward = self.execution.as_ref()?;
+        let mut total = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut armed = false;
+        for layer in forward.moe.iter().flatten() {
+            let Some(executor) = layer.cpu_split_storage_executor() else {
+                continue;
+            };
+            armed = true;
+            let cap = executor.capacity_rows();
+            let (input, mask, output) =
+                CpuSplitExecutor::storage_bytes(cap, executor.dim(), executor.top_k());
+            if input == usize::MAX || mask == usize::MAX || output == usize::MAX {
+                return None;
+            }
+            let Some((_, _, top_k)) = self.cpu_d1_geometry() else {
+                return None;
+            };
+            let slots = cap.checked_mul(top_k)?;
+            let mapped =
+                executor.return_mode() == hipfire_dispatch::cpu_split::D2ReturnMode::Mapped;
+            let (up, down) =
+                CpuSplitExecutor::transfer_bytes_for(executor.dim(), top_k, mapped, cap, slots);
+            if up == usize::MAX || down == usize::MAX {
+                return None;
+            }
+            let mapped_bytes = if mapped {
+                executor.dim().checked_mul(slots)?.checked_mul(4)?
+            } else {
+                0
+            };
+            total.0 = total.0.checked_add(input)?;
+            total.1 = total.1.checked_add(mask)?;
+            total.2 = total.2.checked_add(output)?;
+            total.3 = total.3.checked_add(up)?.checked_add(down)?;
+            total.4 = total.4.checked_add(mapped_bytes)?;
+            total.5 = total.5.checked_add(mask)?;
+        }
+        armed.then_some(total)
+    }
+
+    /// Checked REQUESTED storage plan for the loader's load-time CPU preflight: the
+    /// sum of actual armed-D2 per-layer requested bytes at `requested_rows` (replacement
+    /// executors) + the D1 owned stage for `d1_rows` (0 = D2-only, skip the pinned stage)
+    /// + the called-thread host-slot scratch real reservation bytes for `requested_rows`
+    /// + reconciled-not-charged GPU views (full-slot views must fit the allocated
+    /// forward scratch) and the planned capture ring. `None` on any overflow, on missing
+    /// geometry/executors, or when the settled GPU scratch cannot hold the request.
+    /// `0`-request loads report zeros (legacy default: nothing reserved). Called BEFORE
+    /// any allocation; the sibling [`Self::cpu_storage_bytes`] census reads the ACTUAL
+    /// settled instances so the loader reconciles plan with post-reserve fact. No
+    /// allocation, no mutation, no Vec: read through the existing authorities. The caller
+    /// owns the host/device charge of these bytes and the sequential-replacement
+    /// discipline (old freed before new is built), so no old+new peak is claimed here.
+    pub fn cpu_requested_storage_bytes(
+        &self,
+        requested_rows: usize,
+        d1_rows: usize,
+    ) -> Option<CpuStorageBytes> {
+        if requested_rows > hipfire_dispatch::cpu_split::CPU_SPLIT_STORAGE_MAX_ROWS {
+            return None;
+        }
+        if requested_rows == 0 {
+            return Some(CpuStorageBytes::default());
+        }
+        if d1_rows > requested_rows {
+            return None;
+        }
+        let Some((dim, mi, top_k)) = self.cpu_d1_geometry() else {
+            return None;
+        };
+        let forward = self.execution.as_ref()?;
+        // D1 owned stage: real f32 values + bytes for the D1-owned rows only (0 when
+        // D2-only; the TLS host-slot scratch below is still needed by D2). `slots` is
+        // the full-request host-slot count, so the plan's view terms match the full-slot
+        // extents the settled census reports.
+        let d1_stage_values = if d1_rows > 0 {
+            crate::expert_residency::cpu_d1_stage_values(dim, top_k, d1_rows)?
+        } else {
+            0
+        };
+        let d1_stage_bytes = d1_stage_values.checked_mul(4)?;
+        let slots = requested_rows.checked_mul(top_k)?;
+        // The thread-local host-slot scratch the loader reserves for the request: the
+        // actual `MOE_SCRATCH` vector capacities from SourceB's reserve formulas (gu,
+        // hidden, dn, gather, order/group_id/slot_group/slot_si, group_start/group_off),
+        // checked so any overflow refuses before allocation. D1 and D2 share the one
+        // TLS pool (`reserve_moe_cpu_host_slot_scratch(dim, mi, max_slots)`); the plan
+        // charges the request's full pool once, never per mode and never per layer.
+        let host_scratch_bytes = {
+            let count_f32 = |n: usize| n.checked_mul(4);
+            let count_u32 = |n: usize| n.checked_mul(4);
+            let slots2mi = slots.checked_mul(mi)?;
+            count_f32(slots2mi.checked_mul(2)?)?
+                .checked_add(count_f32(slots2mi)?)?
+                .checked_add(count_f32(slots.checked_mul(dim)?)?)?
+                .checked_add(count_f32((2usize).checked_mul(mi)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots)?)?
+                .checked_add(count_u32(slots.checked_add(1)?)?.checked_mul(2)?)?
+                .checked_add(
+                    std::mem::size_of::<usize>()
+                        .checked_mul(slots.checked_add(1)?)?
+                        .checked_mul(2)?,
+                )?
+        };
+        // Requested D2 bytes: the same SourceB authorities the settled census reads,
+        // evaluated at the REQUESTED rows (the replacement executors' capacity) with the
+        // CURRENT per-layer mapped/copy selection. Old+new overlap is not charged: the
+        // replacement discipline frees the old executor before building the new one.
+        use hipfire_dispatch::cpu_split::CpuSplitExecutor;
+        let mut d2_input = 0usize;
+        let mut d2_mask = 0usize;
+        let mut d2_output = 0usize;
+        let mut d2_transfer = 0usize;
+        let mut d2_mapped = 0usize;
+        let mut d2_device = 0usize;
+        for layer in forward.moe.iter().flatten() {
+            let Some(executor) = layer.cpu_split_storage_executor() else {
+                continue;
+            };
+            let (input, mask, output) =
+                CpuSplitExecutor::storage_bytes(requested_rows, executor.dim(), executor.top_k());
+            if input == usize::MAX || mask == usize::MAX || output == usize::MAX {
+                return None;
+            }
+            let mapped =
+                executor.return_mode() == hipfire_dispatch::cpu_split::D2ReturnMode::Mapped;
+            let (up, down) = CpuSplitExecutor::transfer_bytes_for(
+                executor.dim(),
+                top_k,
+                mapped,
+                requested_rows,
+                slots,
+            );
+            if up == usize::MAX || down == usize::MAX {
+                return None;
+            }
+            if mapped {
+                d2_mapped =
+                    d2_mapped.checked_add(executor.dim().checked_mul(slots)?.checked_mul(4)?)?;
+            }
+            d2_device = d2_device.checked_add(mask)?;
+            d2_input = d2_input.checked_add(input)?;
+            d2_mask = d2_mask.checked_add(mask)?;
+            d2_output = d2_output.checked_add(output)?;
+            d2_transfer = d2_transfer.checked_add(up)?.checked_add(down)?;
+        }
+        let need = |have: usize, need: usize| (have >= need).then_some(need);
+        let x_rot_elements = need(
+            forward.scratch.ffn_output.numel(),
+            requested_rows.checked_mul(dim)?,
+        )?;
+        let topk_elements = need(forward.scratch.moe_topk_indices.numel(), slots)?;
+        let _ = need(forward.scratch.moe_topk_weights.numel(), topk_elements)?;
+        let down_expanded_elements = need(
+            forward.scratch.moe_down_expanded.numel(),
+            slots.checked_mul(dim)?,
+        )?;
+        let forward_device_bytes = crate::gpu_forward::qwen4_forward_device_bytes(
+            &self.config,
+            forward.scratch.max_chunk,
+            forward.scratch.mode,
+        )?;
+        let capture_bytes = self.row_capture_planned_bytes_lab(requested_rows)?;
+        Some(CpuStorageBytes {
+            rows: requested_rows,
+            slots,
+            stage_values: d1_stage_values,
+            stage_bytes: d1_stage_bytes,
+            x_rot_elements,
+            topk_elements,
+            down_expanded_elements,
+            forward_device_bytes,
+            capture_bytes,
+            d2_input_bytes: d2_input,
+            d2_mask_bytes: d2_mask,
+            d2_output_bytes: d2_output,
+            d2_transfer_bytes: d2_transfer,
+            d2_mapped_bytes: d2_mapped,
+            d2_device_bytes: d2_device,
+            host_scratch_bytes,
+        })
+    }
+
+    /// [`Self::row_capture_planned_bytes`] without the lab gate: the loader's
+    /// production prewarm path reads the same checked plan the lab oracle does.
+    pub(crate) fn row_capture_planned_bytes_lab(&self, rows: usize) -> Option<usize> {
+        Qwen4State::row_capture_bytes_scoped(
+            &self.config,
+            self.state_format.gdn,
+            rows,
+            self.state.gdn.len(),
+        )
+    }
+
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
-    /// active snapshot ticket brackets, without re-running them; the ticket
-    /// stays active for the caller's commit or restore.
+    /// active snapshot ticket brackets, replaying only the captured recurrence
+    /// (not projections); the ticket stays active for commit or restore.
     pub(crate) fn rollback_verify_rows_retain(
         &mut self,
         gpu: &mut Gpu,
@@ -1434,14 +2661,15 @@ impl Qwen4Bundle {
         tokens: &[u32],
     ) -> Result<(), BundleError> {
         let ple_normed = {
-            let tensor = &self
+            let tensor = self
                 .execution
                 .as_ref()
                 .ok_or_else(|| {
                     BundleError::Forward("Qwen4 forward resources are not attached".to_string())
                 })?
                 .scratch
-                .ple_normed;
+                .ple_normed_for_rollback()
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
             tensor.sub_offset(0, tensor.numel())
         };
         self.rollback_verify_rows_retain_with(gpu, snapshot, keep, tokens, &ple_normed)
@@ -1487,14 +2715,15 @@ impl Qwen4Bundle {
             .hc_count
             .checked_mul(self.config.hidden_size)
             .ok_or_else(|| BundleError::Forward("PLE row width overflow".to_string()))?;
-        let tensor = &self
+        let tensor = self
             .execution
             .as_ref()
             .ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
             })?
             .scratch
-            .ple_normed;
+            .ple_normed_for_rollback()
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
         let offset = row
             .checked_mul(width)
             .ok_or_else(|| BundleError::Forward("PLE row offset overflow".to_string()))?;
@@ -1575,9 +2804,12 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result?;
+        #[cfg(feature = "lab")]
+        self.lab_note_forward(gpu, std::slice::from_ref(&token), &logits, 1, false)?;
         gpu.hip
             .memcpy_dtoh(&mut self.spec_host_top1[..top1_bytes], &top1.buf)
             .map_err(BundleError::Hip)?;
+        gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let bytes = &self.spec_host_top1[..top1_bytes];
         Ok(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
@@ -1585,7 +2817,8 @@ impl Qwen4Bundle {
     /// Copy the wide HC stream row the last [`Self::spec_ar_token`] (or any
     /// ordinary one-token forward) left in the forward scratch into
     /// `destination` (F32, exactly `hc_count * hidden_size` elements). Valid
-    /// only until the next forward; for calibration, not the hot path.
+    /// only until the next forward. The AR floor's calibration token and
+    /// every retired AR token take it (one copy or BF16 widen per token).
     pub(crate) fn copy_ar_hidden_to(
         &self,
         gpu: &mut Gpu,
@@ -1598,6 +2831,35 @@ impl Qwen4Bundle {
             })?
             .copy_last_wide_hidden_to(gpu, &self.config, destination)
             .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// [`Self::copy_ar_hidden_to`] into row `row` of the spec hidden capture,
+    /// the row a later batched or per-row head append reads.
+    pub(crate) fn copy_ar_hidden_to_spec_row(
+        &self,
+        gpu: &mut Gpu,
+        row: usize,
+    ) -> Result<(), BundleError> {
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let offset = row
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden row offset overflow".to_string()))?;
+        if offset
+            .checked_add(width)
+            .is_none_or(|end| end > source.numel())
+        {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden row is outside capture".to_string(),
+            ));
+        }
+        self.copy_ar_hidden_to(gpu, &source.sub_offset(offset, width))
     }
 
     pub(crate) fn mtp_forward_token(
@@ -1671,6 +2933,51 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    /// Arm (or disarm and clear) the lab taps: the speculative-forward logits
+    /// tap (`keep_logits` also keeps the rows) and the state's residual/ring
+    /// event tap. Arm before a restore to observe its pre-window events.
+    #[cfg(feature = "lab")]
+    pub fn lab_observe(&mut self, armed: bool, keep_logits: bool) {
+        self.lab_logits.set_armed(armed, keep_logits);
+        self.state.lab_observe_state(armed);
+    }
+
+    /// The lab taps are armed.
+    #[cfg(feature = "lab")]
+    pub fn lab_observed(&self) -> bool {
+        self.lab_logits.armed()
+    }
+
+    /// Drain the speculative forwards' logits observations recorded since
+    /// the last take.
+    #[cfg(feature = "lab")]
+    pub fn lab_take_forward_logits(&mut self) -> Vec<crate::lab_window::LabForwardLogits> {
+        self.lab_logits.take()
+    }
+
+    /// Record one speculative forward's output rows while the lab tap is
+    /// armed: a blocking read of the resident `logits` (`rows` rows). Does
+    /// nothing, and reads nothing back, unarmed.
+    #[cfg(feature = "lab")]
+    fn lab_note_forward(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        rows: usize,
+        prefill: bool,
+    ) -> Result<(), BundleError> {
+        if !self.lab_logits.armed() {
+            return Ok(());
+        }
+        let mut host = Vec::new();
+        gpu.download_f32_into(logits, &mut host)
+            .map_err(BundleError::Hip)?;
+        self.lab_logits
+            .record(tokens, prefill, rows, self.config.vocab_size, &host);
+        Ok(())
+    }
+
     /// Every byte family of the resident MTP head state
     /// ([`crate::mtp_gpu::lab_head_items`]) followed by its draft request
     /// state (`full_steps` u32 LE, `margin` f32 LE).
@@ -1729,6 +3036,9 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         if table.is_noop() {
             return Ok(());
+        }
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
         }
         if self.ep.is_some() {
             return self.ep_apply_penalty_table(gpu, logits, table);
@@ -1898,32 +3208,6 @@ impl Qwen4Bundle {
         .map_err(BundleError::Forward)
     }
 
-    pub(crate) fn mtp_advance_token(
-        &mut self,
-        gpu: &mut Gpu,
-        token: u32,
-        backbone_hidden: Option<&GpuTensor>,
-        position: usize,
-        fresh_qsa_selection: bool,
-    ) -> Result<(), BundleError> {
-        mapped_mtp(self.mtp.as_mut(), gpu, position)?
-            .forward_token(
-                gpu,
-                &self.weights,
-                &self.config,
-                token,
-                backbone_hidden,
-                position,
-                fresh_qsa_selection,
-                MtpStep::Advance,
-                self.execution
-                    .as_ref()
-                    .and_then(Qwen4GpuForward::mtp_ep_gather),
-            )
-            .map(|_| ())
-            .map_err(|error| BundleError::Forward(error.to_string()))
-    }
-
     /// The last MTP step of a chain: append only its K/V and index-key cache
     /// rows (see [`MtpStep::Append`]); the next step must bring its own
     /// backbone hidden and a fresh selection.
@@ -1970,9 +3254,49 @@ impl Qwen4Bundle {
         mapped_mtp(self.mtp.as_mut(), gpu, last_position).map(|_| ())
     }
 
+    /// Save the target boundary hidden into the head's snapshot state: call
+    /// right before the session capture at a prompt boundary, after the chunk's
+    /// append left `pending` holding the target hidden of the boundary's last
+    /// row (position `end - 1`). Reads `pending` only. A capture at a position
+    /// this was not called for stores no usable row (see
+    /// [`Self::session_restore_boundary_hidden`]).
+    pub(crate) fn session_save_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .save_boundary_hidden(gpu, pending)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// After `session_begin`: when the head was just restored from a snapshot
+    /// (restores refuse snapshots without a boundary row for their position),
+    /// copy that row into `pending` and return `true`. `false` means no
+    /// restore happened since (a live continuation, an AR route, or a repeat
+    /// call): `pending` is untouched and already the live hidden.
+    pub(crate) fn session_restore_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<bool, BundleError> {
+        match self.mtp.as_mut() {
+            Some(mtp) => mtp
+                .restore_boundary_hidden(gpu, pending)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(false),
+        }
+    }
+
     /// Batched prompt fill: [`MtpStep::Append`] for `tokens` at
     /// `position..position + tokens.len()`, row `i` paired with captured spec
-    /// hidden row `hidden_row0 + i`; the same (token p, hidden p) rows as
+    /// hidden row `hidden_row0 + i`. The caller supplies the rows: the token
+    /// at position `p` pairs with the target hidden of position `p - 1`
+    /// (prompt position 0 pairs with its own hidden), the same rows as
     /// calling [`Self::mtp_append_token`] per row after `copy_spec_hidden_row_to`.
     ///
     /// `trunk_ids_row` is `Some(r)` when `tokens` are rows `r..` of the spec
@@ -1996,11 +3320,6 @@ impl Qwen4Bundle {
         prompt_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
-        if tokens.is_empty() {
-            return Err(BundleError::Forward(
-                "Qwen4 MTP batched append has no rows".to_string(),
-            ));
-        }
         let width = self
             .config
             .hc_count
@@ -2025,6 +3344,41 @@ impl Qwen4Bundle {
             ));
         }
         let hidden = source.sub_offset(offset, len);
+        self.mtp_append_rows_hidden(
+            gpu,
+            context,
+            scratch,
+            tokens,
+            &hidden,
+            trunk_ids_row,
+            prompt_ids,
+            position,
+        )
+    }
+
+    /// [`Self::mtp_append_rows`] over an explicit F32 `hidden` tensor instead
+    /// of captured spec rows: row `i` of `tokens` pairs with `hidden` row `i`
+    /// (`hc_count * hidden_size` elements each; at least `tokens.len()` rows).
+    /// This is how a prompt chunk's first row takes the carried `pending`
+    /// hidden (position `p - 1`, from the previous chunk) through the same
+    /// DET kernels as the rest of the chunk. `trunk_ids_row`, `prompt_ids` and
+    /// `context` behave as in [`Self::mtp_append_rows`].
+    pub(crate) fn mtp_append_rows_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        context: MtpFillContext,
+        scratch: &mut MtpAppendScratch,
+        tokens: &[u32],
+        hidden: &GpuTensor,
+        trunk_ids_row: Option<usize>,
+        prompt_ids: Option<&GpuTensor>,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        if tokens.is_empty() {
+            return Err(BundleError::Forward(
+                "Qwen4 MTP batched append has no rows".to_string(),
+            ));
+        }
         // The ids the trunk forward already uploaded stand in for the head's
         // own copy; no forward runs between that upload and this call.
         let trunk_ids = trunk_ids_row.and_then(|row| {
@@ -2044,7 +3398,7 @@ impl Qwen4Bundle {
                 context,
                 scratch,
                 tokens,
-                &hidden,
+                hidden,
                 device_ids,
                 position,
             )
@@ -2167,6 +3521,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_token(gpu, token, logits, top1);
         }
@@ -2189,6 +3546,9 @@ impl Qwen4Bundle {
         token: Option<u32>,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_token_or_argmax(gpu, token, logits);
         }
@@ -2212,6 +3572,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_chunk(gpu, tokens, logits, top1, false);
         }
@@ -2239,9 +3602,36 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_forward_chunk(gpu, tokens, logits, top1, true);
         }
+        // The one selector verdict of this request, before any mutation: a
+        // qualified request runs layer-major, every other one the incumbent
+        // chunk-major forward below.
+        let entry = self.state.position;
+        let output = crate::slowlink_prefill::PromptOutput::Final { logits, top1 };
+        if self.slowlink_dispatch(gpu, tokens, output, SlowlinkScope::direct())? {
+            return Ok(());
+        }
+        let result = self.forward_chunk_final_incumbent(gpu, tokens, logits, top1);
+        if result.is_ok() {
+            self.slowlink_record_incumbent(entry, &[(0, tokens.len())]);
+        }
+        result
+    }
+
+    /// The incumbent chunk-major body of [`Self::forward_chunk_final`]: no
+    /// selector, no receipt (the prompt loop calls it once per chunk).
+    fn forward_chunk_final_incumbent(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2271,7 +3661,28 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         self.ep_refuse("silent chunk forward outside a replicated call")?;
+        let entry = self.state.position;
+        let output = crate::slowlink_prefill::PromptOutput::Silent;
+        if self.slowlink_dispatch(gpu, tokens, output, SlowlinkScope::direct())? {
+            return Ok(());
+        }
+        let result = self.forward_chunk_silent_incumbent(gpu, tokens);
+        if result.is_ok() {
+            self.slowlink_record_incumbent(entry, &[(0, tokens.len())]);
+        }
+        result
+    }
+
+    /// The incumbent chunk-major body of [`Self::forward_chunk_silent`].
+    fn forward_chunk_silent_incumbent(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), BundleError> {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2322,13 +3733,20 @@ impl Qwen4Bundle {
 
     /// Reset every owner for a cold prefill.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
-        self.begin_npu_trunk_request();
+        // A new request starts with a clear router fault word. Only here, never
+        // mid-pipeline: a clear would drop an earlier row's pending report.
+        gpu.clear_router_fault();
+        self.begin_npu_trunk_request(gpu)?;
         if let Some(stage) = &mut self.pair_session_stage {
             stage.position = None;
         }
+        self.slowlink.clear_active();
         // `None` while the cache itself resets (it drives `self` then).
         if let Some(session) = self.session.as_mut() {
             session.forget_live();
@@ -2345,6 +3763,9 @@ impl Qwen4Bundle {
     /// Device bytes the QSA context arenas commit now, `(target, MTP head)`:
     /// mapped pages of VMM owners, full allocations of legacy ones.
     pub fn qsa_context_committed_bytes(&self, gpu: &Gpu) -> Result<(usize, usize), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         let target = self
             .state
             .mapped_context_bytes(gpu)
@@ -2405,6 +3826,63 @@ impl Qwen4Bundle {
         let (context, gather) = self.context_growth_bytes(gpu, end_position);
         if let Some(cache) = self.session.as_mut() {
             cache.release_for(gpu, context.saturating_add(gather));
+        }
+    }
+
+    /// Per-request decode map-ahead: map the target QSA context (and the
+    /// attached MTP head's, when the request drafts) through
+    /// `min(position + remaining_new_tokens + max_draft_rows, admitted
+    /// capacity)` once, after prefill and before the first decode, so
+    /// per-token growth checks never remap and no growth reaches a decode
+    /// capture or record. Uses the forward's own growth path, with session
+    /// snapshots yielding first. `max_draft_rows` is the most drafts any
+    /// scheduled verify window carries (its rows are the seed plus those
+    /// drafts, so it ends that many positions past the seed): the drafter's
+    /// `proposal_capacity`, which is the native `max_k` or, with the n-gram
+    /// pool armed, the wider `n_max` (a window `k > max_k` is a copy
+    /// takeover verify; `mtp_step` refuses `k > proposal_capacity`). It must
+    /// not be the configured MTP `k`. Mapping only grows capacity: no
+    /// position, length or watermark commits, and the forward still maps its
+    /// actual end on demand. `max_draft_rows == 0` (AR) leaves the MTP head
+    /// unmapped. A failure is logged and swallowed: growth then happens on
+    /// demand as before. Expert-parallel bundles and a zero
+    /// `remaining_new_tokens` map nothing.
+    pub fn map_ahead_for_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        remaining_new_tokens: usize,
+        max_draft_rows: usize,
+    ) {
+        if self.ep.is_some() || self.pp.is_some() {
+            return;
+        }
+        let Some(target) = decode_map_ahead_tokens(
+            position,
+            Some(remaining_new_tokens),
+            max_draft_rows,
+            self.state.max_seq_len,
+        ) else {
+            return;
+        };
+        self.release_session_for_growth(gpu, target);
+        let mapped = self
+            .state
+            .ensure_mapped_capacity(gpu, target)
+            .map_err(|error| error.to_string())
+            .and_then(|()| match self.mtp.as_mut() {
+                Some(mtp) if max_draft_rows != 0 => mtp
+                    .ensure_mapped_capacity(gpu, target.min(mtp.context_capacity()))
+                    .map_err(|error| error.to_string()),
+                _ => Ok(()),
+            });
+        match mapped {
+            Ok(()) => eprintln!(
+                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens})"
+            ),
+            Err(error) => eprintln!(
+                "  qwen4 QSA map-ahead through {target} tokens failed ({error}); growing on demand"
+            ),
         }
     }
 
@@ -2469,7 +3947,15 @@ impl Qwen4Bundle {
 
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
     /// then restores and captures whole-chunk snapshots through it.
-    pub fn attach_session_cache(&mut self, cache: SessionCache) {
+    pub fn attach_session_cache(&mut self, mut cache: SessionCache) {
+        if let Some(policy) = session_pair::pressure_host_snapshot_policy(
+            self.slowlink
+                .profile
+                .map(|profile| profile.device_snapshot_budget_bytes),
+            || cache.usage().budget_bytes,
+        ) {
+            cache.enable_pressure_host_snapshots(policy);
+        }
         self.session = Some(SessionDriver::new(cache));
     }
 
@@ -2483,6 +3969,11 @@ impl Qwen4Bundle {
     /// published snapshots are demoted to disk instead of dropped. No-op
     /// without a cache.
     pub fn session_clear(&mut self, gpu: &mut Gpu) {
+        // Under an attached PP mesh `pp_session_clear` releases the aggregate
+        // pins before any band's cache frees its snapshots.
+        if self.pp.is_some() {
+            return;
+        }
         if self.ep.is_some() {
             return self.ep_session_clear(gpu);
         }
@@ -2515,6 +4006,14 @@ impl Qwen4Bundle {
             .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
     }
 
+    /// Whether a planned reuse continues current or parked live state rather
+    /// than a pool/resident boundary. Used by request-source tracing.
+    pub fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
+    }
+
     /// The host-visible request configuration every EP rank must share.
     pub(crate) fn ep_replication_fingerprint(&self) -> ReplicaFingerprint {
         ReplicaFingerprint {
@@ -2523,8 +4022,30 @@ impl Qwen4Bundle {
             state_format: self.state_format,
             turn_end_token: self.turn_end_token,
             turn_snapshots: self.turn_snapshots,
+            tail_snapshot: self.tail_snapshot,
+            tail_snapshot_min_gap: self.tail_snapshot_min_gap,
+            tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
             has_mtp: self.mtp.is_some(),
             has_lanes: self.lanes.is_some(),
+        }
+    }
+
+    /// Bound all row writes of the next request, including speculative
+    /// lookahead. Without this advisory bound, side-request parking is off.
+    pub(crate) fn session_request_write_limit(&mut self, through: usize) {
+        let set = |bundle: &mut Self| {
+            if let Some(session) = bundle.session.as_mut() {
+                session.set_request_write_limit(through);
+            }
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("session_request_write_limit", set, &|bundle, _, _| {
+            if let Some(session) = bundle.session.as_mut() {
+                session.set_request_write_limit(through);
+            }
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: session_request_write_limit: {error}");
         }
     }
 
@@ -2540,7 +4061,7 @@ impl Qwen4Bundle {
         route: SessionRoute,
     ) -> Result<(), BundleError> {
         self.ep_refuse("session_begin outside a replicated call")?;
-        self.begin_npu_trunk_request();
+        self.begin_npu_trunk_request(gpu)?;
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
         let capture = self.turn_snapshots_active();
@@ -2558,8 +4079,13 @@ impl Qwen4Bundle {
             ))),
         };
         if result.is_ok() {
+            let end = self
+                .session_lineage_after(reused)
+                .map_or(prompt.len(), |p| p.min(prompt.len()));
             if let Some(forward) = &mut self.execution {
-                forward.plan_npu_trunk_request(prompt.len() - reused, reused);
+                forward
+                    .plan_npu_trunk_request(gpu, end - reused, reused)
+                    .map_err(|error| BundleError::Forward(error.to_string()))?;
             }
         }
         result
@@ -2573,10 +4099,10 @@ impl Qwen4Bundle {
     pub(crate) fn spec_advance_session_boundary(
         &mut self,
         gpu: &mut Gpu,
-        prefix: &[u32],
+        position: usize,
     ) -> Result<(), BundleError> {
         if self.session.as_ref().and_then(SessionDriver::turn_route) == Some(SessionRoute::Ar) {
-            self.session_at_boundary(gpu, prefix)?;
+            self.publish_pair_session_boundary(gpu, position)?;
         }
         Ok(())
     }
@@ -2593,6 +4119,133 @@ impl Qwen4Bundle {
             .map_err(BundleError::Forward)
     }
 
+    /// The host-only schedule settings of this bundle (the root's are the
+    /// authoritative copy every PP band adopts).
+    pub(crate) fn pp_session_policy(&self) -> PpSessionPolicy {
+        PpSessionPolicy {
+            turn_snapshots: self.turn_snapshots,
+            tail_snapshot: self.tail_snapshot,
+            tail_snapshot_min_gap: self.tail_snapshot_min_gap,
+            tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
+            turn_end_token: self.turn_end_token,
+        }
+    }
+
+    /// Adopt the root's schedule settings so every band's scope and boundaries
+    /// match; called at every plan and prefill begin.
+    pub(crate) fn pp_adopt_session_policy(&mut self, policy: PpSessionPolicy) {
+        self.turn_snapshots = policy.turn_snapshots;
+        self.tail_snapshot = policy.tail_snapshot;
+        self.tail_snapshot_min_gap = policy.tail_snapshot_min_gap;
+        self.tail_snapshot_min_prompt = policy.tail_snapshot_min_prompt;
+        self.turn_end_token = policy.turn_end_token;
+    }
+
+    /// Whether `piece` is a published pool snapshot of this band (pure,
+    /// host-only: no pin, no GPU).
+    pub(crate) fn pp_session_piece_resident(&self, piece: &SessionPieceKey) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.piece_resident(piece))
+    }
+
+    /// This band's pool key of `prefix` on `route` under its current scope.
+    pub(crate) fn pp_session_piece_key(
+        &self,
+        prefix: &[u32],
+        route: SessionRoute,
+    ) -> Option<SessionPieceKey> {
+        self.session.as_ref()?.piece_key(self, prefix, route)
+    }
+
+    /// Cold-start (`reused == 0`) or restore this band's snapshot of the
+    /// aggregate record's prefix and arm its boundaries. Never continues a
+    /// live state ([`SessionDriver::begin_snapshot`]). Runs on the band's own
+    /// `gpu`, detached from the mesh.
+    pub(crate) fn pp_session_begin(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+    ) -> Result<(), String> {
+        if route != SessionRoute::Ar {
+            return Err(
+                "qwen4 topology.pp: MTP-route session snapshots are not supported".to_string(),
+            );
+        }
+        // A lookahead left by an aborted request names another prompt's rows.
+        self.set_ple_lookahead(&[]);
+        self.with_session(|session, bundle| {
+            session.begin_snapshot(gpu, bundle, prompt, route, reused)
+        })
+        .unwrap_or_else(|| Err("qwen4 topology.pp band has no session cache".to_string()))
+    }
+
+    /// Capture this band at `position` of `prompt` (enqueued on its own stream
+    /// after its forward work, pending until the aggregate commit) and name the
+    /// pool piece it will publish.
+    pub(crate) fn pp_session_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        position: usize,
+    ) -> Result<Option<SessionPieceKey>, String> {
+        let prefix = prompt
+            .get(..position)
+            .ok_or("qwen4 topology.pp session boundary exceeds the prompt")?;
+        self.session_at_boundary(gpu, prefix)
+            .map_err(|error| error.to_string())?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or("qwen4 topology.pp band has no session cache")?;
+        let route = session
+            .turn_route()
+            .ok_or("qwen4 topology.pp session boundary has no prefill in flight")?;
+        Ok(session.piece_key(&*self, prefix, route))
+    }
+
+    /// The boundaries this band's armed turn has yet to report and its lineage
+    /// split row; `None` without a session cache.
+    pub(crate) fn pp_session_schedule(&self) -> Option<(Vec<usize>, Option<usize>)> {
+        let session = self.session.as_ref()?;
+        Some((session.turn_boundaries(), session.turn_lineage()))
+    }
+
+    /// Replace this band's armed schedule with the root's canonical one.
+    pub(crate) fn pp_session_set_schedule(
+        &mut self,
+        boundaries: Vec<usize>,
+        lineage: Option<usize>,
+    ) -> Result<(), String> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| "qwen4 topology.pp band has no session cache".to_string())?
+            .set_boundaries(boundaries, lineage)
+    }
+
+    /// Drop this band's live state and every uncommitted capture. Only after
+    /// the device was drained (mesh reset).
+    pub(crate) fn pp_session_abort(&mut self, gpu: &mut Gpu) {
+        if let Some(session) = self.session.as_mut() {
+            session.abort(gpu);
+        }
+    }
+
+    /// Commit this band's pending captures (host only), keeping the live state
+    /// when `consumed` is given and extends the turn ([`SessionDriver::commit_live`]).
+    pub(crate) fn pp_session_commit_local(&mut self, consumed: Option<&[u32]>) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        match consumed {
+            Some(consumed) => session.commit_live(&*self, consumed),
+            None => session.commit(),
+        }
+        self.session = Some(session);
+    }
+
     /// AR prefill of the full canonical `prompt`, keeping only the final
     /// logits row: restore the `reused`-token snapshot (or reset), then run
     /// the rest in the cold schedule's global chunks, stopping at each
@@ -2605,12 +4258,50 @@ impl Qwen4Bundle {
         reused: usize,
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
         if self.ep.is_some() {
             return self.ep_prefill_final(gpu, prompt, reused, logits);
         }
+        // An NPU fault latches the route off; the request then reruns from the re-planned session start with the
+        // exact GPU-only schedule.
+        crate::npu_trunk::containment::rerun_after_fault(
+            self,
+            prompt.len(),
+            reused,
+            |bundle, start| bundle.prefill_final_from(gpu, prompt, start, logits),
+            |bundle| bundle.take_npu_trunk_fault(),
+            |bundle| bundle.session_plan_capped(prompt, SessionRoute::Ar, prompt.len()),
+        )
+    }
+
+    fn prefill_final_from(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+        logits: &GpuTensor,
+    ) -> Result<(), BundleError> {
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
+        // The one selector verdict of the WHOLE remaining prompt, before the
+        // session-boundary split below: a layer-major request keeps its
+        // boundaries as in-window cuts, so it sweeps the experts once per
+        // window rather than once per boundary chunk.
+        if reused < prompt.len() && self.state.position == reused {
+            let output = crate::slowlink_prefill::PromptOutput::Final { logits, top1: None };
+            if self.slowlink_dispatch(gpu, &prompt[reused..], output, SlowlinkScope::prompt())? {
+                return Ok(());
+            }
+        } else {
+            self.slowlink_note_bypass(
+                "no rows, or the entry position differs from the session start",
+            );
+        }
         let mut pos = reused;
+        let mut windows: Vec<(usize, usize)> = Vec::new();
         while pos < prompt.len() {
+            self.poll_npu_trunk(gpu)?;
             let end = if self.npu_trunk_planned() {
                 pos + self.prefill_schedule_rows(
                     pos,
@@ -2622,15 +4313,17 @@ impl Qwen4Bundle {
             };
             self.set_ple_lookahead(&prompt[end..]);
             if end < prompt.len() {
-                self.forward_chunk_silent(gpu, &prompt[pos..end])?;
+                self.forward_chunk_silent_incumbent(gpu, &prompt[pos..end])?;
             } else {
-                self.forward_chunk_final(gpu, &prompt[pos..end], logits, None)?;
+                self.forward_chunk_final_incumbent(gpu, &prompt[pos..end], logits, None)?;
             }
+            windows.push((pos - reused, end - pos));
             if self.session_next_boundary() == Some(end) {
                 self.session_at_boundary(gpu, &prompt[..end])?;
             }
             pos = end;
         }
+        self.slowlink_record_incumbent(reused, &windows);
         Ok(())
     }
 
@@ -2639,11 +4332,41 @@ impl Qwen4Bundle {
         self.state_format
     }
 
+    /// The exact singleton AR launch reference (`Eager` = ordinary HIP launches,
+    /// `Recorded` = retained-body route), from the attached forward's production
+    /// predicate; `None` while the forward is not attached. For the exact-load
+    /// chooser dynamic-route invalidation and the AR cost receipt n=1.
+    pub fn ar_verify_reference(
+        &self,
+        gpu: &Gpu,
+    ) -> Option<rdna_compute::prefill_invariant::Qwen4VerifyReference> {
+        let forward = self.execution.as_ref()?;
+        Some(match forward.ar_launch_reference(self, gpu) {
+            crate::gpu_forward::Qwen4ArLaunch::Eager => {
+                rdna_compute::prefill_invariant::Qwen4VerifyReference::Eager
+            }
+            crate::gpu_forward::Qwen4ArLaunch::Recorded => {
+                rdna_compute::prefill_invariant::Qwen4VerifyReference::Recorded
+            }
+        })
+    }
+
+    /// Measured native MTP capture rows: the state ring's actual
+    /// `row_capture_rows` (0 where the route captures no rows), not a
+    /// qualified cap or planner value. For the immutable load descriptor.
+    pub fn native_mtp_capture_rows(&self) -> usize {
+        self.state.row_capture_rows()
+    }
+
     /// Stage the exact lane store: `max_lanes` request owners, at most
     /// `row_budget` decode lanes per step. Lane states are allocated on first
     /// admission into a slot. With `spec` every lane is an MTP lane (native
     /// MTP windows of at most `spec.k` drafts); refused when the bundle has
     /// no MTP head or `k + 1` verify rows exceed `LANE_MAX_ROWS`.
+    ///
+    /// Under an attached EP mesh the store is staged on every rank (AR lanes
+    /// only; each rank checks its own free device memory) and rolled back on
+    /// every rank if any rank fails ([`Self::ep_stage_lanes`]).
     pub fn stage_lanes(
         &mut self,
         gpu: &mut Gpu,
@@ -2651,7 +4374,10 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
-        self.ep_refuse("continuous-batch lanes")?;
+        self.pp_refuse("continuous-batch lanes")?;
+        if self.ep.is_some() {
+            return self.ep_stage_lanes(gpu, max_lanes, row_budget, spec);
+        }
         if self.lanes.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 lanes are already staged".to_string(),
@@ -2663,15 +4389,24 @@ impl Qwen4Bundle {
             ));
         }
         if let Some(spec) = spec {
+            let verify_rows = if self.has_cpu_deferred_experts() {
+                self.cpu_qualified_verify_rows(
+                    gpu,
+                    crate::gpu_forward::Qwen4GpuForward::cpu_lab_override_present(gpu),
+                )
+                .max(crate::program::QWEN4_CPU_SPLICE_MAX_ROWS)
+            } else {
+                crate::gpu_forward_lanes::LANE_MAX_ROWS
+            };
             if self.mtp.is_none() {
                 return Err(BundleError::Forward(
                     "Qwen4 MTP lanes need the attached MTP head".to_string(),
                 ));
             }
-            if spec.k == 0 || spec.k + 1 > crate::gpu_forward_lanes::LANE_MAX_ROWS {
+            if spec.k == 0 || spec.k >= verify_rows {
                 return Err(BundleError::Forward(format!(
-                    "Qwen4 MTP lanes need 1 <= k <= {}, got {}",
-                    crate::gpu_forward_lanes::LANE_MAX_ROWS - 1,
+                    "Qwen4 MTP lanes need 1 <= k <= {} for this execution mode, got {}",
+                    verify_rows - 1,
                     spec.k
                 )));
             }
@@ -2729,6 +4464,9 @@ impl Qwen4Bundle {
         epoch: hipfire_runtime::slot_batch::RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, BundleError> {
+        if self.ep.is_some() {
+            return self.ep_admit_lane(gpu, epoch, prompt);
+        }
         self.with_lanes(|store, bundle| store.admit(gpu, bundle, epoch, prompt))
     }
 
@@ -2737,11 +4475,18 @@ impl Qwen4Bundle {
         &mut self,
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_release_lane(epoch);
+        }
         self.with_lanes(|store, _| store.release(epoch))
     }
 
     /// Mark `epoch`'s lane untrusted: it runs no further step.
     pub fn poison_lane(&mut self, epoch: &hipfire_runtime::slot_batch::RequestEpoch) {
+        if self.ep.is_some() {
+            self.ep_poison_lane(epoch);
+            return;
+        }
         if let Some(store) = self.lanes.as_mut() {
             store.poison(epoch);
         }
@@ -2754,7 +4499,79 @@ impl Qwen4Bundle {
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
         token: u32,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_force_lane_seed(epoch, token);
+        }
         self.with_lanes(|store, _| store.force_seed(epoch, token))
+    }
+
+    /// Developer / oracle entry (the serve path never calls it): replace the
+    /// row-local stage share policy of EVERY lane store of this load, so a
+    /// measurement can compare shared and per-lane stage execution on the
+    /// topology itself (the default policy is resolved per stage from the
+    /// `LANE_ROW_TWIN_PROOFS` rows by each store's actually bound weight
+    /// routes: a stage is shared only if every owned instance route matches a
+    /// proof row, so a stage with an unproved instance stays per lane: for
+    /// example a MoE layer outside the EP packed static-or-balanced class
+    /// (`LaneExpertRoute::EpPackedStaticOrBalanced`), or any route outside the
+    /// proof rows).
+    ///
+    /// - single: this bundle's store;
+    /// - EP: every rank's store, replicated through the soft lane fan-out
+    ///   (ranks must agree; a refusal all ranks report identically leaves the
+    ///   mesh usable);
+    /// - PP: every band's store, root included (host only; `gpus` is the mesh
+    ///   owner the other PP lane calls require and is mandatory under PP).
+    ///
+    /// Refused, with no store changed: lanes not staged on every store, a
+    /// step in flight, or a policy that fails
+    /// [`crate::gpu_forward_lanes::LaneStagePolicy::validate`]. Stateful
+    /// stages stay per lane (the policy type cannot say otherwise).
+    pub fn set_lane_stage_policy(
+        &mut self,
+        gpus: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), BundleError> {
+        policy.validate().map_err(BundleError::Forward)?;
+        if self.pp.is_some() {
+            let gpus = gpus.ok_or_else(|| {
+                BundleError::Forward(
+                    "qwen4 topology.pp: set_lane_stage_policy needs the mesh's Gpus".to_string(),
+                )
+            })?;
+            return self.pp_set_lane_stage_policy(gpus, policy);
+        }
+        if self.ep.is_some() {
+            return self.ep_set_lane_stage_policy(policy);
+        }
+        self.set_lane_stage_policy_local(policy)
+            .map_err(BundleError::Forward)
+    }
+
+    /// Check this bundle's own store can take a policy change.
+    pub(crate) fn lane_stage_policy_ready(&self) -> Result<(), String> {
+        let store = self
+            .lanes
+            .as_ref()
+            .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
+        if store.phase != crate::lane_exec::LanePhase::Idle {
+            return Err("set_lane_stage_policy: a step is in flight".to_string());
+        }
+        Ok(())
+    }
+
+    /// This bundle's store only (no mesh fan-out).
+    pub(crate) fn set_lane_stage_policy_local(
+        &mut self,
+        policy: crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), String> {
+        policy.validate()?;
+        self.lane_stage_policy_ready()?;
+        self.lanes
+            .as_mut()
+            .expect("checked by lane_stage_policy_ready")
+            .set_stage_policy(policy);
+        Ok(())
     }
 
     /// The resident owners must be at a clean window boundary to move into a
@@ -2801,6 +4618,11 @@ impl Qwen4Bundle {
         position: usize,
         parts: Option<crate::mtp_spec::Qwen4PromotionParts<'_>>,
     ) -> Result<usize, BundleError> {
+        if self.ep.is_some() {
+            return Err(crate::ep::ep_err(
+                "promotion into lanes is not supported yet",
+            ));
+        }
         let spec = self
             .lanes
             .as_ref()
@@ -2855,6 +4677,9 @@ impl Qwen4Bundle {
         &mut self,
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_abort_promotion(epoch);
+        }
         self.with_lanes(|store, _| store.release(epoch))
     }
 
@@ -2870,6 +4695,9 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         epoch: &hipfire_runtime::slot_batch::RequestEpoch,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_commit_promotion(gpu, epoch);
+        }
         self.with_lanes(|store, bundle| {
             if store.phase != crate::lane_exec::LanePhase::Idle {
                 return Err("promotion: a lane step is in flight".to_string());
@@ -2885,8 +4713,11 @@ impl Qwen4Bundle {
                     lane.host.status
                 ));
             }
-            if lane.spec.is_some() != bundle.mtp.is_some() {
-                return Err("promotion: the lane's MTP state does not match the bundle".to_string());
+            // An MTP lane needs the resident head to move in. An AR lane takes
+            // the trunk state only: a singleton that ran native MTP keeps its
+            // head resident, and the reset below clears it.
+            if lane.spec.is_some() && bundle.mtp.is_none() {
+                return Err("promotion: an MTP lane needs the resident MTP head".to_string());
             }
             if let Some(rows) = ring_rows {
                 if bundle.state.row_capture_rows() < rows {
@@ -2910,15 +4741,22 @@ impl Qwen4Bundle {
     }
 
     /// A fresh lane trunk state: the resident state's formats, QSA backend
-    /// and context bound, allocated through the same constructor.
+    /// and context bound, allocated through the same constructor over this
+    /// bundle's band (the whole model under the single scope; a PP band's
+    /// layers and endpoint state otherwise).
     pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
-        self.ep_refuse("continuous-batch lane/wave states")?;
-        Qwen4State::new_with_backend(
+        // Attached roots need the mesh owner; detached band/rank calls
+        // allocate the state local to their weight scope.
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
+        Qwen4State::new_with_backend_scoped(
             gpu,
             &self.config,
             self.state.max_seq_len,
             self.state_format,
             self.state.qsa_backend(),
+            self.weights.band_scope(),
         )
         .map_err(BundleError::State)
     }
@@ -3048,7 +4886,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         final_logits: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
-        self.ep_refuse("continuous-batch lane prefill")?;
+        self.pp_refuse("continuous-batch lane prefill")?;
         self.with_lane(state, None, |bundle| {
             let mut forward = bundle.execution.take().ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
@@ -3166,6 +5004,51 @@ impl Qwen4Bundle {
         self.state.commit_validated(snapshot);
     }
 
+    /// [`Self::commit_validated`] that keeps the arena entry active and
+    /// rollback-able instead (`SessionState::retain_validated` of the local
+    /// ticket): the target half of [`Self::retain_window`] for one band of
+    /// an aggregate window.
+    pub(crate) fn retain_target_validated(&mut self, snapshot: Qwen4StateSnapshot) {
+        self.state.retain_validated(snapshot);
+    }
+
+    /// The head half of [`Self::retain_window`], for an aggregate window.
+    pub(crate) fn mtp_retain_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.retain_validated(snapshot);
+        }
+    }
+
+    /// Keep a committed window's two tickets rollback-able ([`Self::restore_retain`]
+    /// and [`Self::mtp_restore_retain`]) until the next snapshot, reset or
+    /// [`Self::release_window`]: both validate first, so a stale pair retains
+    /// neither.
+    pub(crate) fn retain_window(
+        &mut self,
+        target: Qwen4StateSnapshot,
+        head: MtpGpuStateSnapshot,
+    ) -> Result<(), BundleError> {
+        self.validate_commit(target)?;
+        self.mtp_validate_commit(head)?;
+        self.state.retain_validated(target);
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.retain_validated(head);
+        }
+        Ok(())
+    }
+
+    /// Release a window retained by [`Self::retain_window`]. A ticket that no
+    /// longer validates (a snapshot, reset or session restore already
+    /// superseded it) is left alone.
+    pub(crate) fn release_window(&mut self, target: Qwen4StateSnapshot, head: MtpGpuStateSnapshot) {
+        if self.validate_commit(target).is_ok() {
+            self.commit_validated(target);
+        }
+        if self.mtp_validate_commit(head).is_ok() {
+            self.mtp_commit_validated(head);
+        }
+    }
+
     pub fn commit(
         &mut self,
         gpu: &mut Gpu,
@@ -3180,6 +5063,10 @@ impl Qwen4Bundle {
     /// leases/page-cache resources, free mutable GPU state, free finalized
     /// resident weights, then drain the attached transaction/census.
     pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            std::mem::forget(self);
+            return Err(pp_owner_required());
+        }
         // Peers drain and free first: their gather events and P2P reads end
         // before rank 0's buffers go.
         let ep_result = self.ep_close(gpu);
@@ -3193,8 +5080,10 @@ impl Qwen4Bundle {
             spec_logits,
             spec_top1,
             spec_hidden,
+            dflash,
             session,
             pair_session_stage,
+            slowlink,
             penalty_stage,
             lanes,
             ..
@@ -3221,6 +5110,11 @@ impl Qwen4Bundle {
                 }
             }
         }
+        for tensor in slowlink.into_tensors() {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                pair_stage_error.get_or_insert(error);
+            }
+        }
         let ple_result = ple_rows
             .map(|rows| rows.unload().map(|_| ()).map_err(BundleError::PleRows))
             .unwrap_or(Ok(()));
@@ -3234,6 +5128,9 @@ impl Qwen4Bundle {
             })
             .unwrap_or(Ok(()));
         let mut spec_error = pair_stage_error;
+        if let Some(Err(error)) = dflash.map(|target| target.free_gpu(gpu)) {
+            spec_error.get_or_insert(error);
+        }
         for tensor in [spec_logits, spec_top1, spec_hidden].into_iter().flatten() {
             if let Err(error) = gpu.free_tensor(tensor) {
                 spec_error.get_or_insert(error);
@@ -3295,10 +5192,22 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_cache_attached(&self) -> bool {
-        self.session.is_some()
+        match self.pp.as_ref() {
+            Some(mesh) => mesh.sessions_enabled(),
+            None => self.session.is_some(),
+        }
+    }
+
+    fn session_request_write_limit(&mut self, through: usize) {
+        Qwen4Bundle::session_request_write_limit(self, through);
     }
 
     fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+        // Under an attached PP mesh only the aggregate record plans
+        // (`pp_session_plan`); a root-only plan would restore one band.
+        if self.pp.is_some() {
+            return 0;
+        }
         if self.ep.is_some() {
             return self.ep_session_plan(prompt, route);
         }
@@ -3308,6 +5217,11 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_commit(&mut self) {
+        // The aggregate publication is `pp_session_commit`; committing the root
+        // alone would publish a partial record.
+        if self.pp.is_some() {
+            return;
+        }
         if self.ep.is_some() {
             return self.ep_session_commit(None);
         }
@@ -3317,12 +5231,13 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     /// Publish as [`Self::session_commit`] and keep the live state when
-    /// `consumed` (the host history the client committed) extends this turn's
-    /// prompt and the owners sit exactly at its end. The next turn of the
-    /// conversation then prefills only the suffix in place (session-exact,
-    /// decode lineage); the snapshots just published stay cold-exact because a
-    /// live turn captures none unless message-end snapshots are active.
+    /// `consumed` extends this turn's prompt and the owners sit exactly at its
+    /// end. Later turns prefill only the suffix; their pool snapshots are
+    /// session-exact, not cold-prefill references.
     fn session_commit_live(&mut self, consumed: &[u32]) {
+        if self.pp.is_some() {
+            return;
+        }
         if self.ep.is_some() {
             return self.ep_session_commit(Some(consumed));
         }
@@ -3330,6 +5245,22 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
             session.commit_live(self, consumed);
             self.session = Some(session);
         }
+    }
+
+    fn map_ahead_for_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        remaining_new_tokens: usize,
+        max_draft_rows: usize,
+    ) {
+        Qwen4Bundle::map_ahead_for_decode(
+            self,
+            gpu,
+            position,
+            remaining_new_tokens,
+            max_draft_rows,
+        );
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
@@ -3848,11 +5779,16 @@ fn ple_descriptors(
         // seal, file bounds) was already checked when the transaction was
         // fulfilled. Here the declaration only has to name a tier the reader
         // decodes, so a sealed BF16-PLE artifact stays loadable next to a
-        // Q8F16 one.
-        let accepted = [RowEncoding::Bf16, RowEncoding::Q8F16]
-            .into_iter()
-            .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
-            .collect::<Vec<_>>();
+        // Q8F16 one; the stock-FP8 recipe's qt=56 rows declare one byte per
+        // value.
+        let accepted = [
+            RowEncoding::Bf16,
+            RowEncoding::Q8F16,
+            RowEncoding::Fp8PerTensor,
+        ]
+        .into_iter()
+        .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
+        .collect::<Vec<_>>();
         if !accepted.contains(&row_bytes) || valid_rows != ple.shard_valid_rows(index) {
             return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                 entry.name.clone(),
@@ -3954,6 +5890,54 @@ fn first_bundle_error(results: [Result<(), BundleError>; 7]) -> Result<(), Bundl
     first.map_or(Ok(()), Err)
 }
 
+/// Checked byte census of the admitted CPU-owned expert window (D1 + D2): the real
+/// host transfer-stage bytes, host-slot count, full-slot GPU view extents and the
+/// SUM of actual D2 executor instance bytes at the stored common capacity, plus the
+/// real thread-local host-slot scratch pool bytes and the mapped cold-return bytes.
+/// Checked, `None` on overflow; `0`-storage loads report zeros (legacy default:
+/// nothing reserved). Read both pre-reserve (the REQUESTED plan:
+/// [`Self::cpu_requested_storage_bytes`]) and post-reserve (the settled instances:
+/// [`Self::cpu_storage_bytes`]) so the loader reconciles plan with fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuStorageBytes {
+    /// Logical window rows actually reserved (`0` = legacy default).
+    pub rows: usize,
+    /// Computed host slots (`rows * top_k`; 640 at the physical 64 x top_k 10).
+    pub slots: usize,
+    /// Pinned transfer-stage f32 values (`2 * (rows * dim + rows * top_k)`).
+    pub stage_values: usize,
+    /// Pinned transfer-stage bytes (`stage_values * 4`).
+    pub stage_bytes: usize,
+    /// Full-slot `x_rot` view elements covered (`rows * dim`).
+    pub x_rot_elements: usize,
+    /// Full-slot router `topk` view elements covered (`slots`).
+    pub topk_elements: usize,
+    /// Full-slot expanded-down view elements covered (`slots * dim`).
+    pub down_expanded_elements: usize,
+    /// Allocated forward device bytes at the attached chunk/scratch plan.
+    pub forward_device_bytes: u64,
+    /// Planned native-MTP capture-ring bytes at `rows`.
+    pub capture_bytes: usize,
+    /// SUM of live D2 executor `input` bytes over armed layers (0 = no D2 owner).
+    pub d2_input_bytes: usize,
+    /// SUM of live D2 executor `mask` bytes over armed layers (0 = no D2 owner).
+    pub d2_mask_bytes: usize,
+    /// SUM of live D2 executor `output` bytes over armed layers (0 = no D2 owner).
+    pub d2_output_bytes: usize,
+    /// SUM of live D2 executor transfer up+down bytes over armed layers (0 = none).
+    pub d2_transfer_bytes: usize,
+    /// SUM of requested/live D2 mapped cold-return bytes over mapped layers (0 = copy).
+    /// Host-mapped memory, never a device allocation; the charge is the host/GTT side.
+    pub d2_mapped_bytes: usize,
+    /// SUM of requested/live D2 device bytes (the `masked_indices` malloc per layer).
+    /// The pinned/mapped transfer buffers above are host allocations; this field is
+    /// the only device-side D2 allocation the preflight charges to device memory.
+    pub d2_device_bytes: usize,
+    /// Called-thread `MOE_SCRATCH` host-slot scratch pool bytes for the window (0 =
+    /// legacy default). D1 and D2 share the one TLS pool; charged once per request.
+    pub host_scratch_bytes: usize,
+}
+
 #[derive(Debug)]
 pub enum BundleError {
     Config(String),
@@ -4008,10 +5992,52 @@ impl fmt::Display for BundleError {
 
 impl std::error::Error for BundleError {}
 
+/// The chunk rows of the Full-plan re-attach after the GPU symmetry check
+/// refused the compact plan: the largest rung of
+/// [`qwen4_prefill_chunk_rungs`]`(requested)` whose Full forward bytes plus the
+/// headroom fit `free` device bytes. When none fits, `requested.min(1536)` is
+/// attempted regardless and fails at allocation if it must, as in the first
+/// attach.
+fn full_fallback_rows(config: &Qwen4Config, requested: usize, free: u64) -> usize {
+    qwen4_prefill_chunk_rungs(requested)
+        .find(|&rows| {
+            qwen4_forward_device_bytes(config, rows, Qwen4ForwardScratchMode::Full)
+                .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                .is_some_and(|bytes| bytes <= free)
+        })
+        .unwrap_or_else(|| requested.min(1536))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ple::PLE_HEAD_COUNT;
+
+    #[test]
+    fn full_fallback_rows_picks_the_largest_fitting_rung() {
+        let config = crate::config::compact_test_config();
+        let need = |rows: usize| {
+            qwen4_forward_device_bytes(&config, rows, Qwen4ForwardScratchMode::Full)
+                .unwrap()
+                .checked_add(QWEN4_FORWARD_HEADROOM_BYTES)
+                .unwrap()
+        };
+        // Plenty of memory: the requested rows, even above the default rungs.
+        assert_eq!(full_fallback_rows(&config, 8192, u64::MAX), 8192);
+        assert_eq!(full_fallback_rows(&config, 8192, need(8192)), 8192);
+        // One byte short of a rung steps down to the next one.
+        assert_eq!(full_fallback_rows(&config, 8192, need(8192) - 1), 4096);
+        assert_eq!(full_fallback_rows(&config, 8192, need(4096)), 4096);
+        assert_eq!(full_fallback_rows(&config, 8192, need(4096) - 1), 2048);
+        assert_eq!(full_fallback_rows(&config, 8192, need(2048)), 2048);
+        assert_eq!(full_fallback_rows(&config, 8192, need(1536)), 1536);
+        // Nothing fits: the smallest rung is attempted regardless.
+        assert_eq!(full_fallback_rows(&config, 8192, need(1536) - 1), 1536);
+        assert_eq!(full_fallback_rows(&config, 8192, 0), 1536);
+        // A request below the smallest rung is attempted as asked.
+        assert_eq!(full_fallback_rows(&config, 1024, 0), 1024);
+        assert_eq!(full_fallback_rows(&config, 1024, u64::MAX), 1024);
+    }
 
     /// The 128 canonical shard layouts of `encoding`, laid back to back from
     /// `base` (a sidecar's data section).
@@ -4310,6 +6336,89 @@ mod tests {
             let with_ple = session_snapshot_bytes(&with, format, false, p).expect("with PLE");
             let no_ple = session_snapshot_bytes(&without, format, false, p).expect("without PLE");
             assert_eq!(with_ple - no_ple, part(ple_bytes) as u64, "p={p}");
+        }
+    }
+
+    #[test]
+    fn side_request_parking_cost_is_fixed_parts_plus_bounded_rows() {
+        use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
+        let config = crate::config::compact_test_config();
+        // The measured chain used Q8 GDN; F32 below refers to QSA rows.
+        for (qsa, row_bytes) in [(QsaKvFormat::Q8, 21_632u64), (QsaKvFormat::F32, 61_568)] {
+            let format = Qwen4StateFormat {
+                qsa,
+                gdn: GdnStateFormat::Q8,
+                ..Qwen4StateFormat::F32
+            };
+            let fixed = session_snapshot_bytes(&config, format, true, 0).unwrap();
+            // The 34,180,608 B of fixed parts before the head's snapshot also
+            // kept the target boundary-hidden row (one 40,960 B part).
+            assert_eq!(fixed, 34_180_608 + 40_960);
+            let bounded = session_snapshot_bytes(&config, format, true, 8192).unwrap();
+            assert_eq!(bounded, fixed + 8192 * row_bytes);
+        }
+        let full_f32 = session_snapshot_bytes(&config, Qwen4StateFormat::F32, true, 0).unwrap();
+        assert_eq!(full_f32, 118_230_528 + 40_960);
+    }
+
+    fn precision_state_format(gdn: rdna_compute::tensor_ops::GdnStateFormat) -> Qwen4StateFormat {
+        Qwen4StateFormat {
+            gdn,
+            ..Qwen4StateFormat::F32
+        }
+    }
+
+    /// The session-cache scope (the cache's key domain for every snapshot) is
+    /// qualified by the full state format, so a Q8-state snapshot is never
+    /// planned, matched or restored into an F32-state bundle, or the reverse.
+    #[test]
+    fn gdn_precision_owner_accounting_session_scope_is_format_qualified() {
+        use rdna_compute::tensor_ops::GdnStateFormat;
+        let q8 = precision_state_format(GdnStateFormat::Q8);
+        let f32 = precision_state_format(GdnStateFormat::F32);
+        for route in [SessionRoute::Ar, SessionRoute::Mtp] {
+            for chunk in [256usize, 4096] {
+                for turns in [false, true] {
+                    let scope = |format| session_scope(route, chunk, format, turns, None);
+                    let (q8_scope, f32_scope) = (scope(q8), scope(f32));
+                    assert_ne!(q8_scope, f32_scope, "{route:?} chunk {chunk} turns {turns}");
+                    assert!(q8_scope.contains("gdn: Q8") && !q8_scope.contains("gdn: F32"));
+                    assert!(f32_scope.contains("gdn: F32") && !f32_scope.contains("gdn: Q8"));
+                    // The GDN format is the only difference.
+                    assert_eq!(
+                        q8_scope.replace("gdn: Q8", "gdn: F32"),
+                        f32_scope,
+                        "{route:?} chunk {chunk} turns {turns}"
+                    );
+                    // Same format, same scope.
+                    assert_eq!(scope(q8), q8_scope);
+                    assert_eq!(scope(f32), f32_scope);
+                }
+            }
+        }
+    }
+
+    /// A snapshot's fixed parts have the live state's byte lengths. Q8 and F32
+    /// recurrent parts differ in length, so the restore's per-part length check
+    /// (`hipfire-runtime` `session_cache`: "snapshot layout mismatch") refuses
+    /// one format's snapshot in the other format's state; no code converts it.
+    #[test]
+    fn gdn_precision_owner_accounting_session_entries_are_not_interchangeable() {
+        use rdna_compute::tensor_ops::GdnStateFormat;
+        let config = crate::config::compact_test_config();
+        let q8 = precision_state_format(GdnStateFormat::Q8);
+        let f32 = precision_state_format(GdnStateFormat::F32);
+        let recurrent_delta = (config.n_linear_layers() * (3_145_728 - 811_008)) as u64;
+        for native in [false, true] {
+            for p in [0usize, 1, 1536, 4096] {
+                let q8_bytes = session_snapshot_bytes(&config, q8, native, p).unwrap();
+                let f32_bytes = session_snapshot_bytes(&config, f32, native, p).unwrap();
+                assert_eq!(
+                    f32_bytes - q8_bytes,
+                    recurrent_delta,
+                    "native {native} p {p}"
+                );
+            }
         }
     }
 
