@@ -9710,7 +9710,10 @@ impl Qwen4GpuForward {
             .filter(|lease| lease.decode_share().is_some());
         let want_banks = decode_share_banks_requested(share_mode)
             && (!share_mode.uses_donor_backing() || donor_lease.is_some());
-        if decode_share_banks_requested(share_mode) && !want_banks {
+        // Logged only for an explicit knob: the unset product default stays
+        // silent on a load it does not apply to.
+        let share_explicit = crate::decode_share::DecodeShareMode::explicit();
+        if decode_share_banks_requested(share_mode) && !want_banks && share_explicit {
             eprintln!(
                 "  qwen4 decode-share: {}={} not taken (the load carries no donor tail); \
                  ordinary single scratch bank",
@@ -9728,7 +9731,7 @@ impl Qwen4GpuForward {
                 bundle.pp.is_some() || bundle.pp_band.is_some(),
                 bundle.slowlink_profile().is_some(),
             );
-            if let Some(reason) = refusal {
+            if let (Some(reason), true) = (refusal, share_explicit) {
                 eprintln!(
                     "  qwen4 decode-share: {}={} not taken ({reason}); \
                      ordinary single scratch bank",
@@ -9782,8 +9785,19 @@ impl Qwen4GpuForward {
             // The D2 default is decided per load, before any layer admission
             // reads it and before stage buffers take VRAM or host memory; it
             // never touches the process-wide host-exec mode.
-            let d2_default =
+            let d2_resolved =
                 crate::d2_default::resolve(gpu, &bundle.weights, &bundle.config, single_scope);
+            // A `fixed` / `on` load placed its donor tail already and the split
+            // has no host route for donors: the measured default stays off for
+            // this load instead of failing it (`bind` is a numerics control and
+            // keeps today's behavior).
+            let d2_default =
+                if d2_resolved && share_mode.uses_donor_backing() && donor_lease.is_some() {
+                    eprintln!("  qwen4 D2 default: off (decode-share load)");
+                    false
+                } else {
+                    d2_resolved
+                };
             if let Some(placement) = bundle.weights.ep_placement() {
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
                 populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {

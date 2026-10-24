@@ -586,7 +586,10 @@ mod tests {
         fake.log.clear();
         ctl.require_resident(&mut fake).unwrap();
         assert!(ctl.is_resident());
-        assert_eq!(fake.log, vec!["capturing", "enqueue 512", "wait", "verify 512"]);
+        assert_eq!(
+            fake.log,
+            vec!["capturing", "enqueue 512", "wait", "verify 512"]
+        );
         // Restoring: wait only.
         ctl.acquire(&mut fake, 512).unwrap();
         ctl.finish_prompt(&mut fake, true).unwrap();
@@ -683,7 +686,10 @@ mod tests {
             ctl.check(),
         ] {
             let error = result.unwrap_err();
-            assert!(error.contains("poisoned") && error.contains("recovery failed"), "{error}");
+            assert!(
+                error.contains("poisoned") && error.contains("recovery failed"),
+                "{error}"
+            );
         }
         assert!(fake.log.is_empty(), "a poisoned loan touches nothing");
         // finish_prompt and teardown of a poisoned loan do not restore either.

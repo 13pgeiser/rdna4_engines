@@ -360,6 +360,33 @@ pub fn auto_vram_reserve(
     mtp_bytes: Option<u64>,
     gather_bytes: Option<u64>,
 ) -> Result<u64, String> {
+    auto_vram_reserve_with_forward(
+        config,
+        context,
+        chunk_rows,
+        mode,
+        qsa_layout,
+        mtp_bytes,
+        gather_bytes,
+        None,
+    )
+}
+
+/// [`auto_vram_reserve`] with the forward term replaced by `forward` when
+/// given: a decode-share load charges only its dedicated forward
+/// ([`crate::gpu_forward::qwen4_decode_share_dedicated_bytes`]); `None` is
+/// the ordinary `qwen4_forward_device_bytes(config, chunk_rows, mode)`.
+#[allow(clippy::too_many_arguments)]
+pub fn auto_vram_reserve_with_forward(
+    config: &Qwen4Config,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+    qsa_layout: impl Into<rdna_compute::tensor_ops::QsaStateLayout>,
+    mtp_bytes: Option<u64>,
+    gather_bytes: Option<u64>,
+    forward: Option<u64>,
+) -> Result<u64, String> {
     let qsa_layout = qsa_layout.into();
     let qsa_format = qsa_layout.kv;
     let overflow = |seq| format!("QSA context state for max_seq {seq} overflows");
@@ -412,8 +439,11 @@ pub fn auto_vram_reserve(
         scratch.checked_add(spec as u64)
     })
     .ok_or_else(overflow)?;
-    let forward = crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
-        .ok_or_else(overflow)?;
+    let forward = match forward {
+        Some(bytes) => bytes,
+        None => crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
+            .ok_or_else(overflow)?,
+    };
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(forward))
@@ -478,14 +508,22 @@ impl ReserveCensus {
         })
     }
 
-    /// `name MiB, ...` for the placement log, every term.
     pub fn describe(&self) -> String {
+        self.describe_with(None)
+    }
+
+    /// [`Self::describe`] with `forward_note` appended to the `forward` term
+    /// (the decode-share dedicated charge).
+    pub fn describe_with(&self, forward_note: Option<&str>) -> String {
         let mut text = String::new();
         for (name, bytes) in self.terms() {
             if !text.is_empty() {
                 text.push_str(", ");
             }
             text.push_str(&format!("{name} {} MiB", bytes >> 20));
+            if let (Some(note), "forward") = (forward_note, name) {
+                text.push_str(&format!(" ({note})"));
+            }
         }
         text
     }
@@ -523,6 +561,19 @@ pub fn state_census(
     chunk_rows: usize,
     mode: Qwen4ForwardScratchMode,
 ) -> Result<StateCensus, String> {
+    state_census_with_forward(config, format, context, chunk_rows, mode, None)
+}
+
+/// [`state_census`] with the forward term replaced by `forward` when given
+/// (the decode-share dedicated charge).
+pub fn state_census_with_forward(
+    config: &Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+    forward: Option<u64>,
+) -> Result<StateCensus, String> {
     let overflow = |what: &str| format!("reserve census {what} overflows");
     let qsa_context = context
         .committed_layer_bytes(config, format.layout())
@@ -535,8 +586,11 @@ pub fn state_census(
     let state = state
         .checked_sub(qsa_context)
         .ok_or_else(|| overflow("state without its QSA context"))?;
-    let forward = crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
-        .ok_or_else(|| overflow("forward resources"))?;
+    let forward = match forward {
+        Some(bytes) => bytes,
+        None => crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
+            .ok_or_else(|| overflow("forward resources"))?,
+    };
     Ok(StateCensus {
         qsa_context,
         state,
@@ -1986,6 +2040,10 @@ pub struct AutoReserve {
     pub historical: Option<u64>,
     pub census: ReserveCensus,
     pub census_total: u64,
+    /// `Some(S)` when a decode-share load charged only its dedicated forward:
+    /// `S` bytes of prefill scratch are borrowed from the donor tail instead
+    /// of reserved ([`DecodeShareForward`]).
+    pub decode_share_borrowed: Option<u64>,
 }
 
 impl AutoReserve {
@@ -1995,7 +2053,27 @@ impl AutoReserve {
             historical,
             census,
             census_total,
+            decode_share_borrowed: None,
         })
+    }
+
+    /// Mark the forward term as the decode-share dedicated charge, with
+    /// `borrowed` bytes of prefill scratch lent by the donor tail.
+    pub fn with_decode_share(mut self, borrowed: u64) -> Self {
+        self.decode_share_borrowed = Some(borrowed);
+        self
+    }
+
+    /// The census with its `forward` term annotated when decode-share charged
+    /// the dedicated forward.
+    fn census_text(&self) -> String {
+        match self.decode_share_borrowed {
+            Some(borrowed) => self.census.describe_with(Some(&format!(
+                "decode-share dedicated; {} MiB prefill scratch borrowed from the donor tail",
+                borrowed >> 20
+            ))),
+            None => self.census.describe(),
+        }
     }
 
     /// The bytes `auto` reserves: `max(historical, census)`, or the census
@@ -2042,14 +2120,14 @@ impl AutoReserve {
                 self.bytes() >> 20,
                 historical >> 20,
                 self.census_total >> 20,
-                self.census.describe(),
+                self.census_text(),
                 self.winner()
             ),
             None => format!(
                 "{} MiB = census [{}] (historical floor retired: the census carries the \
                  measured HIP runtime overhead)",
                 self.bytes() >> 20,
-                self.census.describe()
+                self.census_text()
             ),
         }
     }
@@ -3570,6 +3648,27 @@ pub struct PlacementInputs {
 /// expert-parallel split and every example/gate that asks the S1 admission for
 /// a profile read it, so there is one convention.
 pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInputs, String> {
+    placement_inputs_with_forward(args, None)
+}
+
+/// The forward charge of an admitted decode-share `on` load: the dedicated
+/// bytes (resident bank, persistent token ids, speculative buffers) replace
+/// `qwen4_forward_device_bytes` in BOTH the census and the historical floor,
+/// and the prefill scratch spans `borrowed` bytes of the donor tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeShareForward {
+    /// [`crate::gpu_forward::qwen4_decode_share_dedicated_bytes`].
+    pub dedicated: u64,
+    /// [`crate::gpu_forward::qwen4_decode_share_borrow_bytes`].
+    pub borrowed: u64,
+}
+
+/// [`placement_inputs`] charging `share` as the forward term (`None` is
+/// byte-identical to [`placement_inputs`]).
+pub fn placement_inputs_with_forward(
+    args: &PlacementInputsArgs<'_>,
+    share: Option<DecodeShareForward>,
+) -> Result<PlacementInputs, String> {
     let PlacementInputsArgs {
         gpu,
         config,
@@ -3654,7 +3753,7 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
         None
     } else {
         Some(
-            auto_vram_reserve(
+            auto_vram_reserve_with_forward(
                 config,
                 &context,
                 chunk_rows,
@@ -3662,17 +3761,19 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
                 state_format.layout(),
                 mtp_bytes,
                 gather_bytes,
+                share.map(|share| share.dedicated),
             )
             .map_err(|error| format!("qwen4: {error}"))?,
         )
     };
     // The bottom-up census at the full admitted context.
-    let state = state_census(
+    let state = state_census_with_forward(
         config,
         state_format,
         &census_context,
         chunk_rows,
         scratch_mode,
+        share.map(|share| share.dedicated),
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     // Lazy BF16 -> F16 weight shadows of the owners the long-prefill F16 WMMA
@@ -3758,6 +3859,10 @@ pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInput
     };
     let reserve =
         AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
+    let reserve = match share {
+        Some(share) => reserve.with_decode_share(share.borrowed),
+        None => reserve,
+    };
     Ok(PlacementInputs {
         non_expert,
         layer_experts,
@@ -4386,6 +4491,83 @@ mod tests {
                 before.bytes() - after.bytes(),
                 charge.reserve_delta(),
                 "historical {historical:?}"
+            );
+        }
+    }
+
+    /// The `*_with_forward` overrides substitute exactly the forward term:
+    /// `None` is byte-identical to the ordinary functions; `Some(D)` lowers
+    /// the historical floor and the census forward term by `F - D`, and the
+    /// reserve's description names the dedicated charge.
+    #[test]
+    fn decode_share_forward_override_replaces_exactly_the_forward_term() {
+        let config = crate::config::compact_test_config();
+        let (chunk, mode) = (16384usize, FnSymGfx1201);
+        let f = crate::gpu_forward::qwen4_forward_device_bytes(&config, chunk, mode).unwrap();
+        let d =
+            crate::gpu_forward::qwen4_decode_share_dedicated_bytes(&config, chunk, mode).unwrap();
+        let s = crate::gpu_forward::qwen4_decode_share_borrow_bytes(&config, chunk, mode).unwrap();
+        assert!(d < f);
+
+        // Historical floor: `None` is the ordinary reserve, `Some(D)` is lower by F - D.
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let historical = |forward| {
+            auto_vram_reserve_with_forward(
+                &config, &measured, chunk, mode, F32, None, None, forward,
+            )
+            .unwrap()
+        };
+        let plain = auto_vram_reserve(&config, &measured, chunk, mode, F32, None, None).unwrap();
+        assert_eq!(historical(None), plain);
+        assert_eq!(plain - historical(Some(d)), f - d);
+
+        // Census forward term.
+        let ctx = crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, 16384, 16384, 2 << 20);
+        let ordinary = state_census(&config, target_state_format(), &ctx, chunk, mode).unwrap();
+        let none =
+            state_census_with_forward(&config, target_state_format(), &ctx, chunk, mode, None)
+                .unwrap();
+        let some =
+            state_census_with_forward(&config, target_state_format(), &ctx, chunk, mode, Some(d))
+                .unwrap();
+        assert_eq!(none, ordinary);
+        assert_eq!((ordinary.forward, some.forward), (f, d));
+        assert_eq!(
+            (some.qsa_context, some.state),
+            (ordinary.qsa_context, ordinary.state)
+        );
+
+        // Both expressions of the AutoReserve fall by exactly F - D (census-only
+        // path and the historical path where the census wins); the description of
+        // a decode-share reserve names the dedicated charge and the borrowed span.
+        let census = census_at(&config, 16384, chunk, mode, 700 << 20);
+        let dedicated = ReserveCensus {
+            forward: d,
+            ..census
+        };
+        for historical in [None, Some(1u64)] {
+            let off = AutoReserve::new(historical, census).unwrap();
+            let on = AutoReserve::new(historical, dedicated)
+                .unwrap()
+                .with_decode_share(s);
+            assert_eq!(off.bytes() - on.bytes(), f - d, "historical {historical:?}");
+            assert_eq!(off.decode_share_borrowed, None);
+            assert_eq!(on.decode_share_borrowed, Some(s));
+            assert_eq!(on.census.forward, d);
+            let text = on.describe();
+            assert!(
+                text.contains(&format!(
+                    "forward {} MiB (decode-share dedicated; {} MiB prefill scratch borrowed from the donor tail)",
+                    d >> 20,
+                    s >> 20
+                )),
+                "{text}"
+            );
+            // `off` reads exactly as before.
+            assert!(!off.describe().contains("decode-share"));
+            assert_eq!(
+                off.describe(),
+                AutoReserve::new(historical, census).unwrap().describe()
             );
         }
     }

@@ -32,6 +32,14 @@ pub const DECODE_SHARE_SYNC_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_SYNC";
 /// zeroed and restored bytes, host wait).
 pub const DECODE_SHARE_LOG_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_LOG";
 
+/// The mode an unset (or `auto`) [`DECODE_SHARE_ENV`] selects. The product
+/// default: an admitted load (exact gfx1201, single device, ranked hot set,
+/// compact scratch, no lanes) shares its prefill scratch with the expert
+/// donor tail and grows its resident expert set by the reclaimed bytes; every
+/// other load behaves exactly as without decode-share. Flip this one constant
+/// to ship the feature off by default.
+pub const DECODE_SHARE_DEFAULT: DecodeShareMode = DecodeShareMode::On;
+
 /// How a load uses decode-share.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DecodeShareMode {
@@ -48,18 +56,27 @@ pub enum DecodeShareMode {
 
 impl DecodeShareMode {
     /// Parse a knob value: ASCII case-insensitive, surrounding whitespace
-    /// ignored; unset and every unrecognised spelling are [`Self::Off`].
+    /// ignored. Unset and `auto` select [`DECODE_SHARE_DEFAULT`]; `off` and
+    /// `0` and every unrecognised spelling are [`Self::Off`].
     pub fn parse(raw: Option<&str>) -> Self {
         match raw
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
+            None | Some("auto") => DECODE_SHARE_DEFAULT,
             Some("bind") => Self::Bind,
             Some("bank") => Self::Bank,
             Some("fixed") => Self::Fixed,
             Some("on") => Self::On,
             _ => Self::Off,
         }
+    }
+
+    /// Whether [`DECODE_SHARE_ENV`] is set (any value): a refusal is logged
+    /// only for an explicit request, so a load the default does not admit
+    /// stays silent and exactly as today.
+    pub fn explicit() -> bool {
+        hipfire_config::developer_var(DECODE_SHARE_ENV).is_ok()
     }
 
     /// The mode from the process snapshot ([`DECODE_SHARE_ENV`]).
@@ -93,6 +110,12 @@ impl DecodeShareMode {
     /// (`fixed`, `on`); `bank` uses an owned test backing.
     pub fn uses_donor_backing(self) -> bool {
         matches!(self, Self::Fixed | Self::On)
+    }
+
+    /// Whether this mode reclaims residency (`on`): it grows the expert hot
+    /// budget by the reserve the dedicated scratch no longer needs.
+    pub fn grows_hot_budget(self) -> bool {
+        self == Self::On
     }
 }
 
@@ -139,8 +162,22 @@ pub struct DecodeShareFacts<'a> {
     /// `memory.offload_exec`. The measured (unset) default is decided inside
     /// `attach_forward` after materialization, so the loader re-checks it there.
     pub d2_default_forced: bool,
+    /// The load requests continuous batching (lanes staged after the load).
+    pub continuous_batch: bool,
     /// The prefill chunk the placement is sized from.
     pub prefill_chunk: usize,
+}
+
+/// An explicit hot budget (`HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB`, any fixed
+/// budget) does not grow, so `on` has no residency to reclaim and is `off` for
+/// that load (`bind` / `fixed` are controls and still apply). `Some(line)` is
+/// the log line naming it.
+pub fn pinned_budget_refusal(
+    mode: DecodeShareMode,
+    hot_budget_fixed: bool,
+) -> Option<&'static str> {
+    (mode.grows_hot_budget() && hot_budget_fixed)
+        .then_some("qwen4 decode-share: off (explicit hot budget: no residency to reclaim)")
 }
 
 /// Verdict change 5: whether a load may share donor VRAM. `Err` carries the
@@ -177,6 +214,9 @@ pub fn decode_share_admission(facts: &DecodeShareFacts<'_>) -> Result<(), &'stat
     ) {
         return Err("memory.offload_exec runs host experts on the CPU");
     }
+    if facts.continuous_batch {
+        return Err("continuous batching stages lanes (decode-share is single-stream)");
+    }
     if facts.d2_default_forced {
         return Err("HIPFIRE_QWEN4_D2_DEFAULT=1 forces the D2 CPU expert split");
     }
@@ -203,14 +243,20 @@ mod tests {
             dflash: false,
             offload_exec: None,
             d2_default_forced: false,
+            continuous_batch: false,
             prefill_chunk: 16_384,
         }
     }
 
     #[test]
-    fn decode_share_mode_parser_defaults_to_off() {
+    fn decode_share_mode_parser_defaults_to_the_product_default() {
+        assert_eq!(DECODE_SHARE_DEFAULT, DecodeShareMode::On);
+        assert_eq!(DecodeShareMode::parse(None), DecodeShareMode::On);
+        assert_eq!(DecodeShareMode::parse(Some("auto")), DecodeShareMode::On);
+        assert_eq!(DecodeShareMode::parse(Some(" AUTO ")), DecodeShareMode::On);
+        assert_eq!(DecodeShareMode::parse(Some("off")), DecodeShareMode::Off);
+        assert_eq!(DecodeShareMode::parse(Some("0")), DecodeShareMode::Off);
         assert_eq!(DecodeShareMode::default(), DecodeShareMode::Off);
-        assert_eq!(DecodeShareMode::parse(None), DecodeShareMode::Off);
         for raw in [
             "", "off", "OFF", "0", "1", "true", "bin", "bind1", "banked", "yes",
         ] {
@@ -250,6 +296,35 @@ mod tests {
         for mode in [DecodeShareMode::Off, DecodeShareMode::Bank] {
             assert!(!mode.plans_donors(), "{mode:?}");
         }
+    }
+
+    #[test]
+    fn decode_share_pinned_budget_turns_on_off_but_not_the_controls() {
+        let line = pinned_budget_refusal(DecodeShareMode::On, true).unwrap();
+        assert!(line.contains("explicit hot budget"));
+        assert_eq!(pinned_budget_refusal(DecodeShareMode::On, false), None);
+        for control in [
+            DecodeShareMode::Off,
+            DecodeShareMode::Bind,
+            DecodeShareMode::Bank,
+            DecodeShareMode::Fixed,
+        ] {
+            assert_eq!(pinned_budget_refusal(control, true), None, "{control:?}");
+        }
+    }
+
+    #[test]
+    fn decode_share_continuous_batching_is_refused() {
+        let batch = DecodeShareFacts {
+            continuous_batch: true,
+            ..admitted()
+        };
+        let reason = decode_share_admission(&batch).unwrap_err();
+        assert_eq!(
+            reason,
+            "continuous batching stages lanes (decode-share is single-stream)"
+        );
+        assert_eq!(decode_share_admission(&admitted()), Ok(()));
     }
 
     #[test]

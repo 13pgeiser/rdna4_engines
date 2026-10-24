@@ -1524,10 +1524,38 @@ impl Qwen4Bundle {
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
         let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+        // A load that placed its experts for decode-share (`fixed` / `on`, a
+        // donor tail in the lease) sized the placement for exactly this chunk and
+        // this scratch plan: the chunk is final (no rung downshift) and a
+        // compact -> Full re-plan cannot fit the donor tail.
+        let sharing = crate::decode_share::DecodeShareMode::from_env().uses_donor_backing()
+            && self
+                .weights
+                .expert_tiers()
+                .is_some_and(|lease| lease.decode_share().is_some());
         let max_chunk = match s1_tile {
             // The charged tile, with no rung downshift: admission sized the
             // placement and the arena for exactly these rows.
             Some(tile) => tile,
+            None if sharing => {
+                let need = crate::gpu_forward::qwen4_decode_share_dedicated_bytes(
+                    &self.config,
+                    requested,
+                    mode,
+                )
+                .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                .ok_or_else(|| {
+                    BundleError::Forward("decode-share dedicated forward bytes overflow".into())
+                })?;
+                if need > free as u64 {
+                    return Err(BundleError::Forward(format!(
+                        "decode-share: the {requested}-row chunk the placement was sized for needs {} MiB of dedicated forward resources plus headroom but only {} MiB are free; set HIPFIRE_QWEN4_DECODE_SHARE=off to load without sharing",
+                        need >> 20,
+                        free as u64 >> 20
+                    )));
+                }
+                requested
+            }
             None => qwen4_prefill_chunk_rungs(requested)
                 .find(|&rows| {
                     qwen4_forward_device_bytes(&self.config, rows, mode)
@@ -1552,6 +1580,11 @@ impl Qwen4Bundle {
             // allocated. Re-plan Full against the memory now free. The NPU
             // trunk (gfx1151) never coexists with the gfx1201-only compact
             // plan, so nothing prepared is lost. S1 keeps its charged tile.
+            Err(Qwen4GpuForwardError::CompactUnverified { verified, total }) if sharing => {
+                return Err(BundleError::Forward(format!(
+                    "decode-share: the compact scratch plan was refused by the GPU symmetry check ({verified}/{total} layers verified) and a Full plan cannot fit the donor tail; set HIPFIRE_QWEN4_DECODE_SHARE=off to load without sharing"
+                )));
+            }
             Err(Qwen4GpuForwardError::CompactUnverified { verified, total })
                 if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
             {

@@ -1361,7 +1361,9 @@ impl Qwen4Bundle {
             Qwen4Ops::Single(_) => self
                 .execution
                 .as_ref()
-                .ok_or_else(|| "Qwen4 spec scratch requires attached forward resources".to_string())?
+                .ok_or_else(|| {
+                    "Qwen4 spec scratch requires attached forward resources".to_string()
+                })?
                 .prompt_chunk_rows(),
             Qwen4Ops::Mesh(_) => self
                 .pp_chunk_rows()
