@@ -143,6 +143,10 @@ pub(super) struct MoeDecodeSelection {
     pub(super) ninepath_d4: bool,
     pub(super) ninepath_mq3l: bool,
     pub(super) ninepath_mq4v2: bool,
+    /// qt53 (`MQ4G128V2`) routed down on the typed fallback: the nine-path
+    /// kernel also owns the routed activation (silu*up + FWHT128), so the
+    /// Activation stage launches nothing. Implies `ninepath_d4`.
+    pub(super) ninepath_mq4g128v2: bool,
     pub(super) ninepath_mq6v2: bool,
     /// The routed expert FFN runs in the arch's CPU splice after this program:
     /// no routed GPU stage may be lowered (see
@@ -1501,6 +1505,11 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn activation(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
+            if selection.ninepath_mq4g128v2 {
+                // The fused down kernel forms silu(gate)*up and the qt53
+                // FWHT128 rotation itself; nothing is owed here.
+                return Ok(());
+            }
             let view = self.state.masked_decode(params, selection)?;
             let params = view.as_ref().unwrap_or(params);
             return super::decode_activation_stage(
@@ -1580,6 +1589,7 @@ impl<'a> SealedMoeOp<'a> {
                 selection.ninepath_d4,
                 selection.ninepath_mq3l,
                 selection.ninepath_mq4v2,
+                selection.ninepath_mq4g128v2,
                 selection.ninepath_mq6v2,
                 selection.down_last_combine,
                 selection.route,
@@ -3354,7 +3364,22 @@ pub(super) fn select_decode(
     let ninepath_mq6v2 = ninepath_shape_ok
         && params.dtypes.routed_gate_up == rdna_compute::DType::MQ6G256V2
         && params.dtypes.routed_down == rdna_compute::DType::MQ6G256V2;
-    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2 || ninepath_mq6v2;
+    // qwen35 qt53 routed-down typed fallback (A3B mq4rs): MQ4G256V2 gate/up and
+    // MQ4G128V2 down, F32 recipe, no specialized route. wave32 gfx1201 only
+    // (the kernel is exact-shaped: down_k 512, down_m % 16 == 0).
+    let ninepath_mq4g128v2 = ninepath_shape_ok
+        && route.is_none()
+        && !params.recipe.bf16_round_trip()
+        && ctx.arch.is_gfx1201()
+        && params.routed_down_k == 512
+        && params.routed_down_m % 16 == 0
+        && params.routed_gate_up_paro.is_none()
+        && params.routed_down_paro.is_none()
+        && params.dtypes.routed_gate_up == rdna_compute::DType::MQ4G256V2
+        && params.dtypes.routed_down == rdna_compute::DType::MQ4G128V2
+        && params.dtypes.qt53_routed_down_fallback();
+    let ninepath_eligible =
+        ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2 || ninepath_mq4g128v2 || ninepath_mq6v2;
     resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
@@ -3371,6 +3396,9 @@ pub(super) fn select_decode(
             && !matches!(ninepath_mode, "0" | "off" | "d3"),
         ninepath_mq3l: ninepath_mq3l && !cpu_split,
         ninepath_mq4v2: ninepath_mq4v2 && !cpu_split,
+        ninepath_mq4g128v2: ninepath_mq4g128v2
+            && !cpu_split
+            && !matches!(ninepath_mode, "0" | "off" | "d3"),
         ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,

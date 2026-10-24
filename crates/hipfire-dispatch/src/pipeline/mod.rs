@@ -6124,6 +6124,7 @@ fn decode_down_stage(
     ninepath_d4: bool,
     ninepath_mq3l: bool,
     ninepath_mq4v2: bool,
+    ninepath_mq4g128v2: bool,
     ninepath_mq6v2: bool,
     down_last_combine: bool,
     route: Option<MoeRouteCapability>,
@@ -6192,7 +6193,24 @@ fn decode_down_stage(
     }
     // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-    if p.dtypes.routed_down == DType::MQ4G128V2 {
+    if ninepath_d4 && ninepath_mq4g128v2 {
+        // qwen35 qt53 nine-path: the Activation stage launched nothing; this one
+        // kernel forms silu(gate)*up, the FWHT128 rotation, the eight routed
+        // down GEMVs and the ascending-slot weighted fold into `out_target`
+        // (single owner per row), so the shared combine below is skipped like
+        // every other ninepath arm. Byte-exact with the sequence it replaces.
+        hip!(gpu.gemv_mq4g128v2_moe_ninepath_d4(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.topk_weights,
+            p.gate_batch,
+            p.up_batch,
+            out_target,
+            down_m,
+            down_k,
+            p.n_exp,
+        ))?;
+    } else if p.dtypes.routed_down == DType::MQ4G128V2 {
         // qwen35 qt53 routed-down typed fallback: unweighted F32 expanded rows
         // `[k, hidden]` for the live `p.k` slots (the launcher's runtime k_top);
         // the existing F32 `moe_down_combine_k8_batched` applies route weights.

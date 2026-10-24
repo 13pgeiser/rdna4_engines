@@ -3673,6 +3673,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemv_mq4g256v2_residual_sigmoid_scaled_k512",]
         );
         add!(
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2",
+            kernels::GEMV_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_K512_R2_SRC,
+            ["gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2"]
+        );
+        add!(
             "repeat_interleave_qk_batched",
             kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC,
             ["repeat_interleave_qk_f32_batched"]
@@ -4091,6 +4096,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_hfq4g256_moe_ninepath_d4",
             kernels::GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC,
             ["gemv_hfq4g256_moe_ninepath_d4"]
+        );
+        // qt53 (MQ4G128V2) routed-down nine-path (`moe_program.rs`
+        // ninepath_mq4g128v2): fused silu*up + FWHT128 + down + combine.
+        add!(
+            "gemv_mq4g128v2_moe_ninepath_d4",
+            kernels::GEMV_MQ4G128V2_MOE_NINEPATH_D4_SRC,
+            ["gemv_mq4g128v2_moe_ninepath_d4"]
         );
         add!(
             "gemv_mq6g256v2_moe_ninepath_d4",
@@ -6264,6 +6276,12 @@ const QWEN36_27B_GFX1201_MTP_HIP: &[RouteHip] = &[
     ("deinterleave", &["deinterleave_f32"]),
     ("deinterleave_batched", &["deinterleave_f32_batched"]),
     ("dflash_gdn_replay_pre_ml", &["dflash_gdn_replay_pre_ml"]),
+    // The MQ4-v1 head runs the typed layer program's norm/activation
+    // producers and residual projections even when the trunk is all AWQ.
+    ("fused_gate_up_hfq4g256", &["fused_gate_up_hfq4g256"]),
+    ("fused_qkv_hfq4g256", &["fused_qkv_hfq4g256"]),
+    ("fused_rmsnorm_mq_rotate", &["fused_rmsnorm_mq_rotate"]),
+    ("fused_silu_mul_mq_rotate", &["fused_silu_mul_mq_rotate"]),
     (
         "fused_qk_l2_norm_scale_interleave_f32_batched",
         &["fused_qk_l2_norm_scale_interleave_f32_batched"],
@@ -6278,6 +6296,7 @@ const QWEN36_27B_GFX1201_MTP_HIP: &[RouteHip] = &[
         "gemv_hfq4g256_multirow_default",
         &["gemv_hfq4g256_multirow_r2"],
     ),
+    ("gemv_hfq4g256_residual", &["gemv_hfq4g256_residual"]),
     ("greedy_accept", &["greedy_accept_from_argmax_i32"]),
     ("kv_cache_write_q8_0", &["kv_cache_write_q8_0"]),
     (
@@ -6552,6 +6571,13 @@ pub fn route_entries_sealed(
     let corpus = route_corpus(input.arch, input.hipcc_extra_flags)?;
     let mut entries = embedded;
     for &(module, symbols) in hip.into_iter().flatten() {
+        // The MQ4 head and a no-AWQ trunk share plain producer entries.
+        if entries
+            .iter()
+            .any(|entry| entry.module() == module && entry.symbols() == symbols)
+        {
+            continue;
+        }
         if let Some(twin) =
             crate::pm_decode_twins::pm_decode_module(input.arch, input.flags.pm_decode, module)
         {
@@ -9977,6 +10003,24 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The 0.4.4 mq4rs (A3B MQ4G128V2) decode kernels: the fused qt53
+        // nine-path down and the two-row shared-expert k512 GEMV.
+        const MQ4RS_DECODE_ADDED_MODULES: [&str; 2] = [
+            "gemv_mq4g128v2_moe_ninepath_d4",
+            "gemv_mq4g256v2_residual_sigmoid_scaled_k512_r2",
+        ];
+        for module in MQ4RS_DECODE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing mq4rs decode module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -9989,7 +10033,8 @@ mod tests {
                 + SHARED_I8_ADDED_MODULES.len()
                 + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
-                + MOE_FRONT_ADDED_MODULES.len(),
+                + MOE_FRONT_ADDED_MODULES.len()
+                + MQ4RS_DECODE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
