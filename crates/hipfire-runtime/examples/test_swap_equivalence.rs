@@ -126,6 +126,7 @@ fn main() {
         .sum();
     let stamp = SnapshotStamp {
         model_hash: 0xFEED_FACE,
+        instance_id: 7,
         kv_dtype_tag: 1,
         per_pos_bytes: per_pos_bytes as u32,
         per_pos_v_bytes: per_pos_bytes as u32,
@@ -278,7 +279,7 @@ fn main() {
     // ---- CANDIDATE: A is evicted for B, then restored ----
     for (tier_label, budget) in [("host", 1u64 << 30), ("disk", 0u64)] {
         let dir = std::env::temp_dir().join(format!("hipfire-swap-equiv-{tier_label}"));
-        let mut mgr = SwapManager::new(dir, budget).expect("SwapManager");
+        let mut mgr = SwapManager::new(dir, budget, 1 << 30).expect("SwapManager");
 
         pool.reset(SlotId(0));
         dn_states[0].reset(&mut gpu).expect("dn reset");
