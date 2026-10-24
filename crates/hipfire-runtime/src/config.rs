@@ -486,7 +486,14 @@ mod tests {
     #[test]
     fn a3b_mq4rs_takes_retained_redline_on_gfx1201_only() {
         let f = "/models/qwen3.6-35b-a3b-d53.mq4rs";
-        assert!(retained_redline_default("gfx1201", "qwen3_5_moe", f, 1, 1, false));
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            false
+        ));
         assert!(retained_redline_default(
             "gfx1201",
             "qwen3_5_moe",
@@ -496,13 +503,43 @@ mod tests {
             false
         ));
         // drafter (MTP-loaded), other arches, multi-GPU, other families, other extensions
-        assert!(!retained_redline_default("gfx1201", "qwen3_5_moe", f, 1, 1, true));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            true
+        ));
         for arch in ["gfx1200", "gfx1100", "gfx1151", "gfx942"] {
-            assert!(!retained_redline_default(arch, "qwen3_5_moe", f, 1, 1, false));
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                f,
+                1,
+                1,
+                false
+            ));
         }
-        assert!(!retained_redline_default("gfx1201", "qwen3_5_moe", f, 2, 1, false));
-        assert!(!retained_redline_default("gfx1201", "qwen3_5_moe", f, 1, 2, false));
-        assert!(!retained_redline_default("gfx1201", "qwen3", f, 1, 1, false));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            2,
+            1,
+            false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            2,
+            false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3", f, 1, 1, false
+        ));
         assert!(!retained_redline_default(
             "gfx1201",
             "qwen3_5_moe",
@@ -511,7 +548,15 @@ mod tests {
             1,
             false
         ));
-        assert!(!redline_with_ep("gfx1201", "qwen3_5_moe", f, 1, 1, 2, false));
+        assert!(!redline_with_ep(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            2,
+            false
+        ));
     }
 
     #[test]
