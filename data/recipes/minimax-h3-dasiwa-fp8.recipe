@@ -1,0 +1,69 @@
+# minimax-h3-dasiwa-fp8.recipe -- the DaSiWa curve-form finetune with block-scaled fp8 linears.
+#
+# minimax-h3-fp8.recipe with its one modulation rule dropped, exactly as
+# minimax-h3-dasiwa-w8a8.recipe does for the int8 line: a curve-form checkpoint (config's
+# adaln_curve_grid set) replaces the timestep sinusoid + MLP with the shipped adaln_t_table,
+# and every modulation projection becomes a K=8 read of that table -- an 8-column GEMM has
+# nothing for a 128x128 E4M3 block to bite on, so the plugin declares the ada weights plain
+# bf16 (arch/minimaxh3/minimaxh3.cpp, declare_tables' curve branch) and they must store as
+# the checkpoint holds them. The table itself matches no rule and keeps its f32. That is the
+# ONLY difference: the DiT's four per-token linears, the text encoder and the token refiner
+# stay E4M3, and what is read once a step stays f32 or bf16, as in minimax-h3-fp8.recipe.
+# Serve with the fp8a8 DiT path.
+#
+#   rad-convert <pipeline directory whose transformer/ is the re-laid finetune> \
+#       --recipe data/recipes/minimax-h3-dasiwa-fp8.recipe -o minimax-h3-dasiwa-fp8.rad
+#
+# From a container of the uncensored base nothing but the DiT changes, so reuse the rest:
+#
+#   rad-convert <that directory> --recipe data/recipes/minimax-h3-dasiwa-fp8.recipe \
+#       --reuse <minimax-h3-ref2va-uncensored-fp8.rad> \
+#       --changed <every transformer. tensor name, one a line> \
+#       -o minimax-h3-dasiwa-fp8.rad
+#
+# The finetune itself is a ComfyUI-format convrot-int8 single file; convert-ref2va/
+# overlay-dasiwa.py dequantises it to the HF names and dtypes this recipe and the plugin
+# expect, writes config.json with the curve meta keys, and emits the --changed list. The
+# directory otherwise needs the usual components: text_encoder/, vae/, audio_vae/, the
+# processor or tokenizer, both scheduler folders and latent_upscaler/.
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_norm.weight            cast dtype=f32
+te.blk.*.ffn_norm.weight             cast dtype=f32
+ref.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+vae.blk.*.attn_qkv.weight            cast dtype=bf16
+vae.blk.*.attn_out.weight            cast dtype=bf16
+vae.blk.*.ffn_up.weight              cast dtype=bf16
+vae.blk.*.ffn_down.weight            cast dtype=bf16
+vae.proj_out.*                       cast dtype=bf16
+aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention/MLP pre-block run in a bf16 island
+# inside the f32 chain (arch/minimaxh3/minimaxh3.cpp, declare_aenc): conv1d, layernorm and gemm
+# pin every operand to one dtype, so their weights cast; the chain's own f32 weights are stored
+# folded from the checkpoint's weight-norm pairs.
+aenc.d*.w                              cast dtype=bf16
+aenc.d*.b                              cast dtype=bf16
+aenc.pb.*                              cast dtype=bf16
+aenc.b*.u*.c1.weight                   cast dtype=f32
+aenc.b*.u*.c2.weight                   cast dtype=f32
+aenc.cin.weight                        cast dtype=f32
+aenc.fin.weight                        cast dtype=f32
+# The video encoder: the implicit-GEMM kernel stores its 3x3x3 weights bf16 tap-major, so those
+# four name classes cast; conv_in (3 input channels) and the k=1 shortcut/quant convs run on the
+# reference kernel with their f32 weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                         cast dtype=bf16
+venc.l*.b*.c2w                         cast dtype=bf16
+venc.l*.dnw                            cast dtype=bf16
+venc.cout.weight                       cast dtype=bf16
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32
