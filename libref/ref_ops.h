@@ -153,6 +153,8 @@ int ref_chan_stats         (const RadArgs*, RadStream);
 /* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position (ref_sam_attn.cpp). */
 int ref_sam_attn           (const RadArgs*, RadStream);
 int ref_kv_store           (const RadArgs*, RadStream);
+/* the store of a streamed group: the host mirror always, the ring slot when the block is resident */
+int ref_kv_store_streamed  (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
@@ -242,6 +244,8 @@ int ref_qsa_score          (const RadArgs*, RadStream);
 int ref_qsa_select         (const RadArgs*, RadStream);
 int ref_qsa_tail_store     (const RadArgs*, RadStream);
 int ref_qsa_work           (const RadArgs*, RadStream);
+/* the residency map between a streamed group's block ids and its ring slots (ref_kvstream.cpp) */
+int ref_kv_resolve         (const RadArgs*, RadStream);
 int ref_dflash_conv        (const RadArgs*, RadStream);
 
 /* ---- mixture of experts */
@@ -406,6 +410,7 @@ REF_SHAPE_FN(ref_mix_rows);
 REF_SHAPE_FN(ref_chan_stats);
 REF_SHAPE_FN(ref_sam_attn);
 REF_SHAPE_FN(ref_kv_store);
+REF_SHAPE_FN(ref_kv_store_streamed);
 REF_SHAPE_FN(ref_rope);
 REF_SHAPE_FN(ref_rope_table);
 REF_SHAPE_FN(ref_qk_norm_rope);
@@ -487,6 +492,7 @@ REF_SHAPE_FN(ref_qsa_score);
 REF_SHAPE_FN(ref_qsa_select);
 REF_SHAPE_FN(ref_qsa_tail_store);
 REF_SHAPE_FN(ref_qsa_work);
+REF_SHAPE_FN(ref_kv_resolve);
 REF_SHAPE_FN(ref_dflash_conv);
 
 REF_SHAPE_FN(ref_router_topk);

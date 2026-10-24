@@ -403,6 +403,17 @@ static const RadParamSpec pKvStore[] = { P_INT("M"), P_INT("head_dim"), P_INT("n
                                          P_F64O("k_scale"), P_F64O("v_scale") };
 static const RadOperandSpec oKvStore[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
                                            INOUT("kv_cache") };
+/* The streamed store, `kv_store` with the group's two copies: `host` is the authoritative mirror
+ * (always written) and `res` is the residency map that says whether the block is in the ring. The
+ * parameters are kv_store's, because the layout and the conversion are the same; `res` is read,
+ * never written, since residency is `kv_resolve`'s decision. */
+static const RadParamSpec pKvStoreStreamed[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"), P_INT("block_size"), P_STR("kv_dtype"),
+    P_F64O("k_scale"), P_F64O("v_scale")
+};
+static const RadOperandSpec oKvStoreStreamed[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
+                                                   INOUT("kv_cache"), OPD("res"),
+                                                   INOUT("host") };
 
 static const RadParamSpec pRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                       P_INT("n_head_kv"), P_F64("theta"), P_F64("scale"),
@@ -457,6 +468,17 @@ static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
+/* The residency map of a streamed group (ref_kvstream.cpp, docs/KV-STREAMING.md §3.4). No
+ * `block_size`: the op moves whole blocks by the byte and never reads an element, and a
+ * `block_size` key would make it a KV group's consumer, taking the binding away from the resolved
+ * attention kernel (Builder::find_kv_consumer). `sel_pitch` and `block_bytes` are the selection's
+ * row pitch and one block of one layer's byte extent. The miss list is the row's scratch, not an
+ * operand. */
+static const RadParamSpec pKvResolve[] = { P_INT("M"), P_INT("blocks"), P_INT("slots"),
+                                           P_INT("sel_pitch"), P_INT("block_bytes") };
+static const RadOperandSpec oKvResolve[] = { INOUT("sel"), OPD("nsel"), INOUT("res"),
+                                             INOUT("slot_block"), INOUT("slot_state"),
+                                             INOUT("ctl"), OPD("host"), INOUT("kv_cache") };
 
 /* DFlash2's grouped convolution, libr4d's schema exactly. */
 static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
@@ -1383,6 +1405,11 @@ static const RadOpSchema kSchemas[] = {
 { "kv_store", ARR(pKvStore), ARR(oKvStore),
   "Writes k and v into the paged cache at slot_mapping; a negative slot is skipped. The cache is "
   "INOUT rather than the OUT docs/OPS.md draws, because the op touches only the mapped slots." },
+{ "kv_store_streamed", ARR(pKvStoreStreamed), ARR(oKvStoreStreamed),
+  "kv_store for a streamed group: writes the token's k and v into the group's host mirror ALWAYS, "
+  "at the block's identity row, and into the ring slot only when the residency map says the block "
+  "is resident. A negative slot is skipped. The mirror is the truth; a block absent from the ring "
+  "is copied in whole by kv_resolve." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable),
   "cos/sin for the positions a step names, at each position's own row of a [max_ctx, rot] plane: "
   "rot values a row, cos for the first half and sin for the second. The angles are `rope`'s "
@@ -1409,6 +1436,15 @@ static const RadOpSchema kSchemas[] = {
   "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, or the "
   "tail's at q % ring) staged contiguously, its block-key page and its first-token position; slots "
   "past the count get page -1. nc is each sequence's complete-block count." },
+{ "kv_resolve", ARR(pKvResolve), ARR(oKvResolve),
+  "Makes every block the selections name resident and rewrites them as ring slots: an epoch bump, "
+  "a hit or a single claim per distinct block, a free slot before any resident one and otherwise "
+  "one CLOCK (second-chance) victim per miss - never a slot this call uses - the two maps "
+  "re-pointed, each missed block copied from the host mirror "
+  "into its slot, then every valid sel entry replaced by the slot holding its block. nsel, and so "
+  "the attention's length, are unchanged. The ring must hold the call's distinct blocks; a call "
+  "that cannot place every miss latches ctl[3] and leaves those entries naming blocks, never a "
+  "fabricated slot." },
 { "dflash_conv", ARR(pDflashConv), ARR(oDflashConv),
   "DFlash2's grouped dynamic depthwise convolution: out[t][h] = sum over taps j, j == 0 or "
   "t % block_size >= j, of (base[j][h] + delta[t][j][h / group_size]) * x[t - j][h]." },
@@ -2234,6 +2270,9 @@ SIMPLE("ref_sam_attn", "sam_attn", "attn",
 ROW("ref_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_kv_store, nullptr),
+ROW("ref_kv_store_streamed", "kv_store_streamed", "attn",
+    "scatter k and v into the host mirror always and into the resident ring slot", DT_ANY,
+    nullptr, 0, nullptr, nullptr, ref_kv_store_streamed, nullptr),
 SIMPLE("ref_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, ref_rope),
 SIMPLE("ref_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary embedding",
        DT_FLOAT, ref_qk_norm_rope),
@@ -2276,6 +2315,9 @@ SIMPLE("ref_qsa_tail_store", "qsa_tail_store", "attn",
        ref_qsa_tail_store),
 SIMPLE("ref_qsa_work", "qsa_work", "attn",
        "QSA work list: completing blocks' keys, pages and positions", DT_FLOAT, ref_qsa_work),
+SIMPLE("ref_kv_resolve", "kv_resolve", "attn",
+       "streamed KV residency map: selected block ids become ring slots, misses copied in",
+       "i32 maps, u8 block planes", ref_kv_resolve),
 SIMPLE("ref_dflash_conv", "dflash_conv", "draft",
        "DFlash2 grouped dynamic depthwise convolution", DT_FLOAT, ref_dflash_conv),
 SIMPLE("ref_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, ref_row_topk),

@@ -22,6 +22,56 @@ typedef struct RadCtx RadCtx;
  * scheduler and the run phase the bounds without a device read. */
 enum { RAD_PHASE_PREFILL = 0, RAD_PHASE_DECODE = 1, RAD_PHASE_MIXED = 2 };
 
+/* ================================================================== KV streaming */
+/* A streamed KV group keeps its whole context in pinned host memory and only a ring of blocks on
+ * the card (docs/KV-STREAMING.md §3.2, §3.6, §4.2). The step batch carries this view of that
+ * group; a group whose KV is fully resident has none.
+ *
+ * Why one pointer to a struct rather than fields inside RadKVGroupBatch: the data is per group
+ * and fixed at bring-up, while the batch is rebuilt per step for every rank, so copying its
+ * pointers and geometry per group into every step's batch would be work that never changes. One
+ * trailing pointer also keeps a group's own layout as it was for every plugin that does not
+ * stream: the field is zero-defaulted, and a null `stream` means the group is fully resident and
+ * has no ring, no map and no host copy.
+ *
+ * The layout mirrors the pool, layer by layer: a layer's mirror is a dense run of `blocks` rows
+ * of `block_bytes`, and `host_layer_stride` is `blocks * block_bytes`. So layer l's row for block
+ * b is at `host + l * host_layer_stride + b * block_bytes`, and `block_bytes` is both the row
+ * pitch `kv_resolve` reads the mirror at and the length of every copy into the ring.
+ *
+ * `res`, `slot_block`, `slot_state` and `ctl` are device memory: a resolve launch reads and
+ * rewrites them every step, so a host round trip per lookup would cost the link latency the ring
+ * exists to avoid. Nothing here changes address for the engine's life, which is what lets a
+ * recorded pass replay a resolve. */
+typedef struct RadKVStream {
+    /* The group's mirror, pinned host memory, RAD_MEM_HOST_MAPPED so a device kernel reads it over
+     * the link in place. `blocks * bytes_per_block` bytes, all layers, zeroed at bring-up: a block
+     * no store has written yet reads as zeros rather than as whatever the page held. */
+    uint8_t* host;
+    /* Residency, both directions, ONE SLICE A LAYER: `res` is block -> ring slot or -1 (device,
+     * `n_layers * blocks` entries, layer l at `res + l * blocks`), `slot_block` is slot -> block or
+     * -1 (`n_layers * slots`), `slot_state` is `n_layers * slots * 2`: the epoch of a slot's last
+     * use and its CLOCK reference bit. A block is resident per layer because the resolve copies one
+     * layer's bytes; a group-wide map would call a block resident for a layer that was never
+     * copied. `ctl` is shared: its counters and overflow latch are the group's. */
+    int32_t* res;
+    int32_t* slot_block;
+    int32_t* slot_state;
+    /* The control block: epoch, clock hand, the last launch's miss count, the overflow latch, and
+     * the cumulative misses/lookups/calls counters (docs/OPS.md "kv_resolve"). */
+    int32_t* ctl;
+    /* Bytes one block of ONE layer occupies: the mirror's row pitch and the ring's slot pitch. */
+    int64_t  block_bytes;
+    /* Bytes one layer of the mirror occupies, i.e. the distance between layer l and layer l+1. */
+    int64_t  host_layer_stride;
+    /* Ring depth in blocks: the group's device pool is `slots` blocks deep while a selection names
+     * block ids over the group's whole context. */
+    int64_t  slots;
+    /* Bytes the host mirror occupies, all layers (`blocks * block_bytes * n_layers`), so a caller
+     * that only has this view can report or check the off-card tier. */
+    int64_t  host_bytes;
+} RadKVStream;
+
 typedef struct RadKVGroupBatch {
     rad_kvgroup group;
     int32_t*    slot_mapping;    /* [n_tok] flat slot index per token, device */
@@ -36,6 +86,10 @@ typedef struct RadKVGroupBatch {
     int64_t     state_index_pitch;
     int64_t     block_size;
     int64_t     max_blocks;
+    /* Null unless this group's KV streams: the mirror, the residency map and the ring's geometry
+     * (RadKVStream above). Trailing and zero-defaulted, so a plugin built against ABI 25 reads
+     * every field it knows at the same offset and simply never sees the ring. */
+    const RadKVStream* stream;
 } RadKVGroupBatch;
 
 typedef struct RadBatch {
@@ -721,6 +775,19 @@ int rad_step_fail(RadCtx* c, const char* what);
 
 /* ================================================================== run-phase queries */
 const RadBatch* rad_batch(RadCtx* c);
+/* The position of absolute model layer `layer` in the cache `group` holds, or -1 when this rank
+ * has no pool for it or the group does not hold that layer. It is the same lookup a RAD_KV operand
+ * makes (KVPoolBinding::layer_slot), and the index a streamed group's host mirror is laid out by:
+ * layer `i` of the group is at `stream->host + i * stream->host_layer_stride`. A group's bound
+ * layers need not be contiguous, so this is never `layer` itself. */
+int             rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer);
+/* Prefill staging (docs/KV-STREAMING.md §4.1). When the group's pass selected the one-layer stage
+ * view, copy this layer's whole host-mirror row into it, on the compute stream, after the layer's
+ * store and before its attention; returns 1 and the caller must not resolve. Returns 0 when the
+ * group has no stage view (a resident group, or the parity configuration's context-sized ring) and
+ * the caller proceeds normally. The ordering rule is in core/kvstream/stage.h. */
+int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb,
+                                   int layer);
 int             rad_rank(RadCtx* c);
 int             rad_world_size(RadCtx* c);
 RadStream       rad_stream(RadCtx* c);

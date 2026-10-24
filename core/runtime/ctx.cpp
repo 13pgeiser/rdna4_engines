@@ -3,6 +3,8 @@
  */
 #include <vector>
 #include "ctx.h"
+#include "kvstream/bind.h"
+#include "kvstream/stage.h"
 #include "xp_state.h"
 #include "../device/device.h"
 
@@ -921,7 +923,7 @@ int Ctx::lane_join(int from, int to) {
  * (below). */
 static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 360,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 72,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
@@ -957,6 +959,11 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);
         mix((uint64_t)k.block_table_pitch); ptr(k.seqused); ptr(k.state_index);
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
+        /* Null on a fully resident group, a fixed set of addresses on a streamed one. Two groups
+         * that differ here hand a kernel different memory, so they are different passes -- and the
+         * view's *address* must not enter the key: the builder's Out slot rotates every step, which
+         * would make every streamed pass a new one (kvstream/bind.h, kvstream_view_key). */
+        mix(kvstream_view_key(k.stream));
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);
@@ -1229,6 +1236,12 @@ int Ctx::play_pass(PassTape& t) {
             rc = xp_ ? xp_step_run(st.a) : RAD_OK;
             lane_ = l0;
             break;
+        case kTapeKvStage:
+        case kTapeKvStageAfter:
+            lane_ = st.lane;
+            rc = kvstage_run(this, st.a, st.b, st.kind == kTapeKvStageAfter);
+            lane_ = l0;
+            break;
         }
         if (rc < 0) {
             if (step_status_ >= 0) step_status_ = rc;
@@ -1254,7 +1267,8 @@ int Ctx::run_pass(const RadBatch* b) {
     /* A pass the stager armed for is issued live: see runtime/stager.h. */
     if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
     const uint64_t key = pass_key(b);
-    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b);
+        return RAD_OK; }
     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
         bump(pc_refused_);
         arch_step_(this, b);
@@ -1320,7 +1334,6 @@ int Ctx::run_pass(const RadBatch* b) {
 }
 
 int Ctx::run_step(const RadBatch* b) {
-
     if (!b) return RAD_E_INVAL;
     if (!arch_step_) {
         RAD_WARN("Ctx::run_step: no architecture step function was installed");
@@ -1337,6 +1350,7 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    kvstream_enter(this, b);
     {
         const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;

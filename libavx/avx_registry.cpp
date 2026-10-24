@@ -324,6 +324,28 @@ static const RadParamSpec pKvStore[]   = { P_INT("M"), P_INT("head_dim"), P_INT(
                                            P_F64O("k_scale"), P_F64O("v_scale") };
 static const RadOperandSpec oKvStore[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
                                            INOUT("kv_cache") };
+/* The streamed store: kv_store's parameters and the group's two copies beside the ring. `host` is
+ * the authoritative mirror and is always written; `res` is the residency map and is read only. */
+static const RadParamSpec pKvStoreStreamed[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"), P_INT("block_size"), P_STR("kv_dtype"),
+    P_F64O("k_scale"), P_F64O("v_scale")
+};
+static const RadOperandSpec oKvStoreStreamed[] = { OPD("k"), OPD("v"), OPD("slot_mapping"),
+                                                   INOUT("kv_cache"), OPD("res"),
+                                                   INOUT("host") };
+
+/* The residency map of a streamed group. Every operand is i32 state or a byte plane, so no dtype
+ * parameter: the op is the same code at every cache layout. `kv_cache` is the same RAD_KV operand
+ * (docs/OPS.md, `kv_resolve`) the attention and kv_store take, INOUT for the same reason kv_store's
+ * is -- only the slots a miss lands in are written. No constraint either: `block_size` is
+ * deliberately not a parameter here, because `Builder::find_kv_consumer` binds a KV group to the
+ * first unclaimed op after it carrying `block_size`, and that must stay the resolved attention
+ * kernel, not the op that only copies its pages. */
+static const RadParamSpec pKvResolve[] = { P_INT("M"), P_INT("blocks"), P_INT("slots"),
+                                           P_INT("sel_pitch"), P_INT("block_bytes") };
+static const RadOperandSpec oKvResolve[] = { INOUT("sel"), OPD("nsel"), INOUT("res"),
+                                             INOUT("slot_block"), INOUT("slot_state"),
+                                             INOUT("ctl"), OPD("host"), INOUT("kv_cache") };
 
 static const RadParamSpec pRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                         P_INT("n_head_kv"), P_F64("theta"), P_F64("scale"),
@@ -1026,6 +1048,20 @@ static const RadOpSchema kSchemas[] = {
   "each tile to all of its rows. logits = scale*q.k + q.Rh[i_h,j_h] + q.Rw[i_w,j_w] over the head's "
   "whole head_dim, softmax in f32 with the max subtracted, out = sum p*v, pad rows dropped." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore), "scatter k and v into the paged cache." },
+{ "kv_store_streamed", ARR(pKvStoreStreamed), ARR(oKvStoreStreamed),
+  "kv_store for a streamed group: writes k and v into the host mirror always, at the block's "
+  "identity row, and into the ring slot only when the residency map says the block is resident. A "
+  "negative slot is skipped; the mirror is the truth and a block absent from the ring is copied in "
+  "whole by kv_resolve." },
+{ "kv_resolve", ARR(pKvResolve), ARR(oKvResolve),
+  "Makes every block the selections name resident and rewrites them as ring slots: an epoch bump, "
+  "a hit or a single claim per distinct block, a free slot before any resident one and otherwise "
+  "one CLOCK (second-chance) victim per miss - never a slot this call uses - the two maps "
+  "re-pointed, each missed block copied from the host mirror "
+  "into its slot, then every valid sel entry replaced by the slot holding its block. nsel, and so "
+  "the attention's length, are unchanged. The ring must hold the call's distinct blocks; a call "
+  "that cannot place every miss latches ctl[3] and leaves those entries naming blocks, never a "
+  "fabricated slot." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
@@ -1601,6 +1637,12 @@ SIMPLE("avx_sam_attn", "sam_attn", "attn",
        L(sam_attn)),
 ROW("avx_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(kv_store)),
+ROW("avx_kv_store_streamed", "kv_store_streamed", "attn",
+    "scatter k and v into the host mirror always and into the resident ring slot", DT_ANY,
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(kv_store_streamed)),
+SIMPLE("avx_kv_resolve", "kv_resolve", "attn",
+       "streamed KV residency map: selected block ids become ring slots, misses copied in",
+       "i32 maps, u8 block planes", L(kv_resolve)),
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
 SIMPLE("avx_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT,
        L(rope_table)),

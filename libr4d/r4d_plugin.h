@@ -521,6 +521,7 @@ int r4d_rad_gated_had_quant_i8    (const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_norm_hq_i8  (const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope_gate     (const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope_gate_kv_store(const RadArgs*, RadStream);
+int r4d_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope_gate_kv_store_fp8v4(const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope_gate_kv_store_k6v4(const RadArgs*, RadStream);
 int r4d_rad_rope_table            (const RadArgs*, RadStream);
@@ -557,6 +558,9 @@ int r4d_rad_qsa_block_key   (const RadArgs*, RadStream);
 int r4d_rad_qsa_score       (const RadArgs*, RadStream);
 int r4d_rad_qsa_select      (const RadArgs*, RadStream);
 int64_t r4d_rad_qsa_select_scratch(const RadArgs*);
+int r4d_rad_kv_resolve      (const RadArgs*, RadStream);
+int64_t r4d_rad_kv_resolve_scratch(const RadArgs*);
+int r4d_rad_kv_store_streamed(const RadArgs*, RadStream);
 int r4d_rad_qsa_tail_store  (const RadArgs*, RadStream);
 int r4d_rad_qsa_work        (const RadArgs*, RadStream);
 int r4d_rad_sample_chain    (const RadArgs*, RadStream);
@@ -819,6 +823,7 @@ int r4d_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_silu_mul       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rope           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_kv_store       (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_kv_store_streamed (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_logits_gemm    (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_sample_penalties (const RadParam*, int, int operand, RadOpdDesc*);
@@ -839,6 +844,8 @@ int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam*, int, int operand, RadO
 int r4d_shape_qkv_norm_rope     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qkv_norm_rope_kv_store(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_add_rmsnorm(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, int operand,
+                                                  RadOpdDesc*);
 int r4d_shape_rope_table        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gdn_gated_rmsnorm (const RadParam*, int, int operand, RadOpdDesc*);
 
@@ -884,6 +891,7 @@ int r4d_shape_gram_accum         (const RadParam*, int, int operand, RadOpdDesc*
 int r4d_shape_qsa_block_key      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_score          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_select         (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_kv_resolve         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_tail_store     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*);
 
@@ -913,6 +921,8 @@ int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadF
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t, int,
+                                                 RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);

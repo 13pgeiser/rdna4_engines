@@ -688,6 +688,94 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8_kernel(
     }
 }
 
+// The store of a streamed KV group: `kv_store_fp8` into the group's two copies.
+//
+// A streamed group's ring is `slots` blocks deep while its block-id space is `blocks`, so a block's
+// id is not an address. Its host mirror is:
+//
+//     host[blocks, kv_heads, block_size, 2 * head_dim]      one block a row, identity layout
+//
+// and this kernel writes a token's k and v into the mirror's block `slot / block_size` ALWAYS, and
+// into the ring at `res[block]` only when the map says the block is resident. Both planes have the
+// same row pitch, so one offset serves both and the two copies cannot disagree.
+//
+// The residency test is here, not in the resolve, because the block a decode step writes is
+// usually the one the previous step already made resident: a mirror-only writer would leave the
+// ring's copy of that block short of this step's tokens, and the resolve does not re-copy a
+// resident block. The caller orders store, then resolve, then attention, so a block that is NOT
+// resident yet gets this step's bytes through the mirror and is copied in whole by the resolve.
+//
+// STATE FAULTS. libref refuses a slot naming a block past the id space and a map entry outside
+// [-1, slots) before writing anything. A device launch cannot return a host status, so this kernel
+// guards: a token whose block is out of range stores nothing, and a map entry outside its domain
+// reads as not resident (the mirror is still written, and the resolve refuses the step). A legal
+// call never takes either path and is bit-identical to the reference.
+template <int BF16>
+__global__ __launch_bounds__(kThreads) void kv_store_streamed_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
+    const int32_t* __restrict__ res, uint8_t* __restrict__ host,
+    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t blocks, uint32_t slots,
+    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv) {
+    const uint32_t t = blockIdx.x;
+    const int32_t s = slot[t];
+    if (s < 0) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    if (blk >= blocks) return;
+    /* Both planes are byte planes of the same paged layout; a bf16 element is two bytes, so every
+     * offset and pitch doubles while the row arithmetic stays one expression. */
+    const size_t EB = BF16 ? 2 : 1;
+    const size_t row = (size_t)kv_heads * block_size * 2 * head_dim * EB;
+    const size_t so  = (size_t)off * 2 * head_dim * EB;
+    uint8_t* const m = host + (size_t)blk * row + so;
+    const int32_t sl = res[blk];
+    /* A map entry outside [-1, slots) is not an address: treat it as absent. */
+    uint8_t* const c = (sl >= 0 && (uint32_t)sl < slots) ? kv + (size_t)sl * row + so : nullptr;
+    const size_t head_step = (size_t)block_size * 2 * head_dim * EB;
+
+    for (uint32_t j = threadIdx.x * 4u; j < kv_heads * head_dim; j += kThreads * 4u) {
+        const uint32_t h = j / head_dim, d = j % head_dim;
+        uint8_t* const mrow = m + (size_t)h * head_step;
+        uint8_t* const crow = c ? c + (size_t)h * head_step : nullptr;
+        float kf[4], vf[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            kf[e] = bf16_to_f32(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
+            vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
+        }
+        if constexpr (BF16) {
+            /* kv_store_bf16's bytes: the value itself, no descales (k_inv/v_inv are 1). */
+            uint16_t* const mk = (uint16_t*)mrow;
+            uint16_t* const mv = (uint16_t*)(mrow + (size_t)head_dim * 2);
+            uint16_t* const ck = crow ? (uint16_t*)crow : nullptr;
+            uint16_t* const cv = crow ? (uint16_t*)(crow + (size_t)head_dim * 2) : nullptr;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const uint16_t kb = f32_to_bf16(kf[e]), vb = f32_to_bf16(vf[e]);
+                mk[d + e] = kb;
+                mv[d + e] = vb;
+                if (ck) { ck[d + e] = kb; cv[d + e] = vb; }
+            }
+        } else {
+            int pk = 0, pv = 0;
+            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[0], -448.0f), 448.0f),
+                                                 fminf(fmaxf(kf[1], -448.0f), 448.0f), pk, false);
+            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[2], -448.0f), 448.0f),
+                                                 fminf(fmaxf(kf[3], -448.0f), 448.0f), pk, true);
+            pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf[0], -448.0f), 448.0f),
+                                                 fminf(fmaxf(vf[1], -448.0f), 448.0f), pv, false);
+            pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf[2], -448.0f), 448.0f),
+                                                 fminf(fmaxf(vf[3], -448.0f), 448.0f), pv, true);
+            *(uint32_t*)(mrow + d)        = (uint32_t)pk;
+            *(uint32_t*)(mrow + head_dim + d) = (uint32_t)pv;
+            if (crow) {
+                *(uint32_t*)(crow + d)        = (uint32_t)pk;
+                *(uint32_t*)(crow + head_dim + d) = (uint32_t)pv;
+            }
+        }
+    }
+}
+
 // The fp8_v4 store: K as kv_store_fp8 writes it, V as int4 in groups of 32 with an f16 scale
 // (absmax / 7). Four columns a thread as above, so a group of 32 is 8 lanes; head_dim is a multiple
 // of 32, so a group never straddles two heads. A token's row is `row` bytes. K6 is the k6_v4 store:
@@ -2219,6 +2307,70 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
 }
 extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 0); }
 extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }
+
+/* The store of a streamed group: `kv_store`'s geometry and E4M3 conversion, plus the group's
+ * residency map (`res`) and its host mirror (`host`). The mirror is the truth and is written for
+ * every token with a slot; the ring is written only when `res[block] >= 0`. Both are one block a
+ * row of the same byte pitch, so the row arithmetic is the cache's, unchanged.
+ *
+ * `res` is read, never written: residency is the resolve's decision, and this op must not move the
+ * map under a selection the indexer already resolved. A block id past the mirror's extent or a map
+ * entry outside [-1, slots) is a state fault that libref refuses; the kernel guards instead (see
+ * kv_store_streamed_kernel), since a device launch cannot return a host status.
+ *
+ * The cache is E4M3 or bf16. Streaming is dtype-agnostic beyond the two writers: the mirror and the
+ * ring are byte planes of one paged layout whose pitch is `block_bytes`, so a bf16 group doubles
+ * every offset and stores the values kv_store_bf16 stores. */
+extern "C" int r4d_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
+    KvStoreGeom g{};
+    const int rc = kv_store_geom(a, &g);
+    if (rc != RAD_OK) return rc;
+    if (g.kv->dtype != RAD_F8E4M3 && g.kv->dtype != RAD_BF16)
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    /* Four columns per thread, so a head must be whole groups. */
+    if (g.head_dim % 4) return R4D_NO(RAD_E_SHAPE);
+
+    const RadTensor* res  = r4d_opt(a, 4);
+    const RadTensor* host = r4d_opt(a, 5);
+    if (!res || !host) return R4D_NO(RAD_E_INVAL);
+    if (res->dtype != RAD_I32 || !r4d_contig(res)) return R4D_NO(RAD_E_STRIDE);
+    if (host->dtype != RAD_U8 || !r4d_contig(host) || host->rank != 2)
+        return R4D_NO(RAD_E_STRIDE);
+
+    const long long row    = g.kv_heads * g.block_size * 2 * g.head_dim *
+                             (g.kv->dtype == RAD_BF16 ? 2 : 1);
+    const long long blocks = host->shape[0], slots = g.kv->shape[0];
+    if (blocks <= 0 || slots <= 0 || row <= 0) return R4D_NO(RAD_E_SHAPE);
+    /* Both planes are dense rows of one block, so the same offset addresses the same element. */
+    if (host->shape[1] != row || host->stride[0] != row) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_numel(res) < blocks) return R4D_NO(RAD_E_SHAPE);
+
+    const double ks = r4d_getf(a, "k_scale", 1.0);
+    const double vs = r4d_getf(a, "v_scale", 1.0);
+    if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
+
+    const long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
+    const long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
+    const bool bf16 = g.kv->dtype == RAD_BF16;
+    /* kv_store_bf16 stores the value itself, so a bf16 group uses no descales. */
+    const float k_inv = bf16 ? 1.0f : (float)(1.0 / ks);
+    const float v_inv = bf16 ? 1.0f : (float)(1.0 / vs);
+    if (bf16)
+        return R4D_EMIT(stream, kv_store_streamed_kernel<1>, dim3((uint32_t)g.T), dim3(kThreads),
+                        0, (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
+                        (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
+                        (const int32_t*)r4d_addr(res), (uint8_t*)r4d_addr(host),
+                        (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                        (uint32_t)blocks, (uint32_t)slots, (uint32_t)k_ld, (uint32_t)v_ld,
+                        k_inv, v_inv) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+    return R4D_EMIT(stream, kv_store_streamed_kernel<0>, dim3((uint32_t)g.T), dim3(kThreads), 0,
+                    (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
+                    (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
+                    (const int32_t*)r4d_addr(res), (uint8_t*)r4d_addr(host),
+                    (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                    (uint32_t)blocks, (uint32_t)slots, (uint32_t)k_ld, (uint32_t)v_ld,
+                    k_inv, v_inv) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+}
 
 /* ------------------------------------------------------------------ logits_gemm
  *

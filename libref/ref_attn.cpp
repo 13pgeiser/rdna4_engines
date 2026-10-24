@@ -565,6 +565,126 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ kv_store_streamed */
+/* The store of a streamed group: the host mirror is the truth, the device pool is a cache of it.
+ *
+ * A streamed group's ring is `slots` blocks deep while the block-id space is `blocks`, and a block
+ * may be absent from it. This op is `kv_store` with the two copies the group keeps:
+ *
+ *   host[b]          is written ALWAYS, at the block's identity row, whatever the map says;
+ *   kv_cache[res[b]] is written only when `res[b] >= 0`, i.e. the block is resident now.
+ *
+ * The residency test belongs in the writer rather than in the resolve, and this is the case that
+ * decides it: at decode the block this step's tokens land in is the block the last step already
+ * made resident (a block is `ratio` tokens of one sequence), so a writer that only wrote the
+ * mirror would leave the ring holding that block's first tokens and every later token missing -
+ * and the resolve, seeing the block resident, would not copy it. Writing the ring when resident
+ * and the mirror always means a host block is never stale and a slot never holds a block the
+ * mirror disagrees with, which is the property the resolve's copy relies on.
+ *
+ * The order the caller must keep is store, then resolve, then attention (arch/common/
+ * rad_block_attn_gated_fp8.h): the block the current step writes may be absent from the ring, and
+ * the resolve then copies whole blocks out of the mirror, so it must see this step's bytes.
+ *
+ * The two planes are the same bytes in the same paged layout
+ * (`[notional block, kv_heads, block_size, 2 * head_dim]`, K then V in a slot), so one conversion
+ * writes both: the mirror is described as an E4M3 plane over the same row pitch and the loop
+ * stores into `host` and, when resident, `kv_cache`.
+ *
+ * `res` is read, not written: residency is the resolve's decision (libref/ref_kvstream.cpp). A
+ * `res` entry outside [-1, slots) for a block this call touches, or a slot naming a block past the
+ * id space, is a state fault and is refused before anything is written. */
+int ref_kv_store_streamed(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
+    const RadTensor *res = &a->t[4], *host = &a->t[5];
+
+    const int64_t head_dim   = p_int(a, "head_dim", k->rank >= 3 ? k->shape[k->rank - 1] : 0);
+    const int64_t block_size = p_int(a, "block_size", 0);
+    const int64_t kv_heads   = p_int(a, "n_head_kv", 0);
+    if (head_dim <= 0 || block_size <= 0 || kv_heads <= 0) return RAD_E_SHAPE;
+    if (k->dtype != RAD_BF16 || v->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (sm->dtype != RAD_I32 || res->dtype != RAD_I32) return RAD_E_DTYPE;
+    if (host->dtype != RAD_U8) return RAD_E_DTYPE;
+    /* E4M3 (the fp8 QSA family) or bf16 (the default cache dtype). Streaming is dtype-agnostic
+     * beyond the writer: both planes are byte planes of the same paged layout whose pitch is one
+     * block, so a bf16 group doubles every offset and stores the value itself, as kv_store_bf16
+     * does. A packed fp8_v4/k6_v4 group has no streamed row and is refused. */
+    const bool fp8 = kv->dtype == RAD_F8E4M3;
+    if (!fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+    if (kv->rank != 4) return RAD_E_SHAPE;
+    if (kv->shape[1] != kv_heads || kv->shape[2] != block_size ||
+        kv->shape[3] != 2 * head_dim) return RAD_E_SHAPE;
+    if (host->rank != 2) return RAD_E_SHAPE;
+
+    /* One block of one layer. Both planes are dense rows of it: a padded mirror row would copy a
+     * block's bytes over its neighbour's, and the two copies must address the same offsets. */
+    const int64_t EB = fp8 ? 1 : 2;
+    const int64_t row = kv_heads * block_size * 2 * head_dim * EB;
+    const int64_t slots = kv->shape[0], blocks = host->shape[0];
+    if (host->shape[1] != row || host->stride[0] * rad_dtype_bytes(host->dtype, 1) != row)
+        return RAD_E_STRIDE;
+    if (kv->stride[0] * rad_dtype_bytes(kv->dtype, 1) != row) return RAD_E_STRIDE;
+    if (slots <= 0 || blocks <= 0) return RAD_E_SHAPE;
+    if (numel(res) < blocks || res->stride[0] != 1) return RAD_E_SHAPE;
+
+    const int64_t M = numel(sm);
+    if (M <= 0 || numel(k) < M * kv_heads * head_dim || numel(v) < M * kv_heads * head_dim)
+        return RAD_E_SHAPE;
+
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1;
+    const int64_t k_hs = k->rank >= 3 ? k->stride[k->rank - 2] : head_dim * k_ds;
+    const int64_t k_rs = row_stride(k, kv_heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1;
+    const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
+    const int64_t v_rs = row_stride(v, kv_heads * head_dim);
+    /* kv_store_bf16 stores the value itself; only the E4M3 row divides by the reader's descales. */
+    const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
+    const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
+
+    /* Everything that can refuse is checked before the first write: a half-written mirror would
+     * make the next step's copies plausible and wrong. */
+    const int32_t* const R = (int32_t*)res->data;
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t s = ld_int(sm->dtype, sm->data, offlin(sm, t));
+        if (s < 0) continue;                      /* padded row, no cache slot */
+        const int64_t blk = s / block_size;
+        if (blk >= blocks) return RAD_E_SHAPE;
+        if (R[blk] < -1 || R[blk] >= slots) return RAD_E_INVAL;
+    }
+
+    /* The mirror, seen as the plane it holds (E4M3 or bf16): same bytes, same writer, so the two
+     * copies cannot round differently. */
+    RadTensor hkv = *host;
+    hkv.dtype = kv->dtype;
+    const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
+    const KVView hv  = kv_view(&hkv, head_dim, block_size, kv_heads);
+
+    REF_PAR_FOR(M * kv_heads * head_dim * 2)
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t s = ld_int(sm->dtype, sm->data, offlin(sm, t));
+        if (s < 0) continue;
+        const int64_t blk = s / block_size, off = s % block_size;
+        const int64_t hb = blk * hv.sb + off * hv.so;
+        /* A resident block keeps its slot current; a non-resident one is written to the mirror
+         * alone and the resolve copies the whole block in when it selects it. */
+        const int64_t cb = R[blk] >= 0 ? R[blk] * kvv.sb + off * kvv.so : -1;
+        for (int64_t h = 0; h < kv_heads; ++h) {
+            for (int64_t d = 0; d < head_dim; ++d) {
+                const float xk = ldt(k, t * k_rs + h * k_hs + d * k_ds) * ks;
+                const float xv = ldt(v, t * v_rs + h * v_hs + d * v_ds) * vs;
+                stt(&hkv, hb + h * hv.sh + d * hv.sd, xk);
+                stt(&hkv, hb + h * hv.sh + (head_dim + d) * hv.sd, xv);
+                if (cb >= 0) {
+                    stt(kv, cb + h * kvv.sh + d * kvv.sd, xk);
+                    stt(kv, cb + h * kvv.sh + (head_dim + d) * kvv.sd, xv);
+                }
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ rope */
 namespace {
 

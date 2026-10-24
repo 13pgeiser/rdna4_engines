@@ -587,6 +587,43 @@ extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, u
 }
 
 /* ==========================================================================================
+ * qk_norm_rope_gate_kv_store_streamed -- the same prologue with the STREAMED store folded on.
+ * (row: qk_norm_rope_gate_kv_store_streamed_fp8; kernel: r4d_qk_norm_rope_gate.hip under
+ * QK_KV_STREAMED)
+ *
+ * Operands: [0] q_gate?  [1] k  [2] cos_sin  [3] positions  [4] q_w?  [5] k_w  [6] q_out?
+ *           [7] k_out  [8] gate_out?  [9] v  [10] slot_mapping  [11] kv_cache
+ *           [12] res  [13] host
+ *
+ * The store is `kv_store_streamed`, whose `k` is the prologue's own `k_out`. */
+extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam* p, int n_p,
+                                                            uint64_t present, int step,
+                                                            RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    auto opt = [present](int i) { return opt_opd(present, i); };
+    switch (step) {
+    case 0: {
+        Step s(out, "qk_norm_rope_gate");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "head_dim").mirror(p, n_p, "n_head")
+         .mirror(p, n_p, "n_head_kv").mirror(p, n_p, "rot").mirror(p, n_p, "q_dtype")
+         .mirror_opt(p, n_p, "eps").mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "cs_f32")
+         .mirror_opt(p, n_p, "pos_i64");
+        return s.wire({ opt(0), 1, 2, 3, opt(4), 5, opt(6), 7, opt(8) });
+    }
+    case 1: {
+        Step s(out, "kv_store_streamed");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "head_dim").mirror(p, n_p, "n_head_kv")
+         .mirror(p, n_p, "block_size").mirror(p, n_p, "kv_dtype")
+         .mirror_opt(p, n_p, "k_scale").mirror_opt(p, n_p, "v_scale");
+        /* k_out, v, slot_mapping, kv_cache, res, host */
+        return s.wire({ 7, 9, 10, 11, 12, 13 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * qkv_norm_rope_kv_store -- qkv_norm_rope, then kv_store of its finished k and v.
  * (rows: qkv_norm_rope_kv_store_fp8 and _bf16; kernel: libr4d/r4d_qkv_norm_rope.hip,
  * qkv_norm_rope_kernel under KV)

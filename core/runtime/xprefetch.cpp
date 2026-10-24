@@ -202,7 +202,7 @@ void Ctx::xp_serve(XpState& x) {
             if (r.mark) rad_ride_release(r.mark, r.ms, kXpMarkHold);
             continue;
         }
-        if (rad_xp_list(x.device, r.mark, n, src, dst, bytes, x.done + r.g, r.seq) == RAD_OK) {
+        if (rad_xp_list(x.device, r.mark, n, src, dst, bytes, x.done + r.g, r.seq, 0) == RAD_OK) {
             ++x.lists;
             if (r.mark) x.marks.emplace_back(r.mark, x.lists);
         } else {

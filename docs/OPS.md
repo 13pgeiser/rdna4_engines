@@ -851,6 +851,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
 | `sam_attn` | `M`(range) `head_dim` `n_head` `grid_h` `grid_w` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_seqlens`, `out`, `rel_pos_h`w, `rel_pos_w`w |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
+| `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
@@ -1033,6 +1034,21 @@ declares bound it lower.
 `RadKVGroupBatch` carries the slot mapping, the block table and the sequence lengths, but the pool
 base belongs to the block manager, not the batch.
 
+**When the group streams, the pool is a ring and the operand is its layer.** The device pool then
+holds `slots` blocks and the sequence's block table still names up to `blocks` ids, so the sparse
+path needs one indirection: `kv_resolve` (in "Sparse attention (QSA)") rewrites the selected ids as
+ring slots and copies a block in from the pinned host mirror on a miss. Every other op reads the
+cache exactly as before, because it is handed a resolved table.
+
+Such a group is written by `kv_store_streamed` instead of `kv_store`: the token's k and v go into
+the host mirror ALWAYS and into the ring slot only when the residency map says the block is
+resident. The mirror is the truth; the ring is a cache of it. The order a layer keeps is **store,
+then resolve, then attention**, because a block this step writes may not be in the ring yet and the
+resolve copies such a block whole out of the mirror. The residency test belongs in the writer, not
+only in the resolve: at decode the block a step writes is usually the block the previous step made
+resident, so a mirror-only writer would leave the ring's copy of it missing this step's tokens and
+the resolve, seeing the block resident, would not copy it.
+
 **`kv_dtype` `fp8_v4` and `k6_v4`** (device-only) are the quantised layouts of
 `--kv-cache-dtype` (`RadBuildCtx::kv_quant`). A head's dims are grouped by 32, each group with an
 f16 scale (its absmax over the largest code, clamped so every code decodes finite in f16),
@@ -1056,7 +1072,39 @@ ratios over 4-token pages: `attn_{prefill,decode,decode_gq}_h256_gqa12_{fp8v4,k6
 gate and quantiser in the split-KV merge. `r4d_selftest` holds the stores to an exactly
 representable set and the attention rows to its inline oracle.
 
-### `qk_norm_rope_gate` (device-only)
+### `kv_store_streamed`
+
+`kv_store` for a group whose KV streams: one scatter into the group's two copies instead of one.
+
+- **`k`, `v`, `slot_mapping`** — as `kv_store`: bf16 activations, an i32 flat slot per token, a
+  negative slot skipped. `slot / block_size` is the block and `slot % block_size` the position in
+  it.
+- **`host`** — bytes, `[blocks, row]`, inout. The layer's authoritative mirror, one block a row,
+  the identity layout the design note gives it (`[block, kv_heads, block_size, 2 * head_dim]`,
+  K then V in a slot). **Written for every token with a slot, always.**
+- **`kv_cache`** — the ring, the same `RAD_KV(group, layer)` operand `attn_paged`, `kv_store` and
+  `kv_resolve` take. **Written at `res[block]` only when that is >= 0.**
+- **`res`** — `i32 [blocks]`, in. The residency map `kv_resolve` maintains. Read, never written:
+  residency is the resolve's decision, so the store cannot move the map under a selection that has
+  already been resolved.
+
+Both planes are dense rows of the same byte pitch, so one offset addresses the same element of the
+same block in either and the two copies cannot disagree. The conversion follows the cache's dtype:
+`kv_store_fp8`'s for E4M3 (divided by the reader's descales) and `kv_store_bf16`'s for bf16 (the
+value itself, no descales; every offset is two bytes wide). The rows are `kv_store_streamed_fp8`
+and `kv_store_streamed_bf16`, so the default `--kv-cache-dtype bf16` streams as well as fp8; a
+packed fp8_v4/k6_v4 group has no streamed row and the engine refuses to stream it rather than leave
+it without a writer.
+
+The caller's order, per layer, is **store → resolve → attention**. A block the current step writes
+may not be in the ring at all (a block's first tokens, or a block a previous resolve evicted); the
+resolve then copies the whole block out of the mirror, so the store must have written it. A block
+that is resident takes the token in both copies, so the ring never holds a stale block and the
+resolve never needs to re-copy a resident one. A map entry outside `[-1, slots)` is a state fault
+that libref refuses; the device kernel treats it as not resident, which writes the mirror and lets
+the resolve refuse the step.
+
+
 
 | op | params | operands |
 |---|---|---|
@@ -1078,6 +1126,7 @@ rank-2 view can express, which would otherwise take `heads` `rmsnorm` launches p
 | op | params | operands |
 |---|---|---|
 | `qk_norm_rope_gate_kv_store` | `M` `head_dim` `n_head` `n_head_kv` `rot` `q_dtype` `eps`:f64/opt `wadd`:f64/opt `cs_f32`/opt `pos_i64`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q_gate`?, `k`, `cos_sin`, `positions`, `q_w`w?, `k_w`w → `q_out`?, `k_out`, `gate_out`?; `v`, `slot_mapping`, `kv_cache`:inout |
+| `qk_norm_rope_gate_kv_store_streamed` | `M` `head_dim` `n_head` `n_head_kv` `rot` `q_dtype` `eps`:f64/opt `wadd`:f64/opt `cs_f32`/opt `pos_i64`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q_gate`?, `k`, `cos_sin`, `positions`, `q_w`w?, `k_w`w → `q_out`?, `k_out`, `gate_out`?; `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 
 **`qk_norm_rope_gate_kv_store`** is the prologue followed by `kv_store` in one launch: each k head's
 block already holds its token's rotated k one element a lane, so it also writes that element and
@@ -1093,6 +1142,25 @@ tolerance: a sum of squares folded in another order differs by an ULP, which a r
 accepts, but a rotated element is a difference of two products, so where those nearly cancel the
 ULP becomes a few percent and the transcript moves within a few dozen steps. The kernel reproduces
 the reference's fold exactly: widths above the head dim contribute zeros, and adding 0.0f is exact.
+
+**`qk_norm_rope_gate_kv_store_streamed`** is that fold for a group whose KV streams: the store is
+`kv_store_streamed` instead of `kv_store`, so it takes the residency map and the group's host
+mirror as its last two operands. The token's rotated k and its v go into the mirror's block row for
+every token with a slot, and into `kv_cache[res[block]]` only where the map calls the block
+resident; a negative or out-of-range slot stores nothing, and a map entry outside `[-1, slots)` is
+treated as not resident (libref refuses it as a state fault, and the resolve then refuses the
+step). Both planes are the same dense row of the same paged layout, and the rotated k is the value
+`k_out` receives, so the bytes are exactly `qk_norm_rope_gate` then `kv_store_streamed`'s. It has
+an E4M3 row (`_fp8`) and a bf16 row (`_bf16`, the default cache dtype; the two planes hold the
+rotated k and v themselves, two bytes wide). It
+exists because the pair costs a launch a layer on the decode path: one launch where the unfused
+prologue and the store were two, and one fewer hop between store, resolve and attention.
+
+The caller's order is unchanged -- **store, then resolve, then attention** -- and a staged pass
+keeps the stage-copy wait before the store, which is now the prologue's own write. The folded path
+takes the same guards as the hosted one: `T` at or below the fused rows and a pass at one rotary
+component per token (no mixed media positions). Where the row is absent, or a pass declines it, the
+layer runs `qk_norm_rope_gate` plus a separate store exactly as before.
 
 ## Image generation
 
@@ -2673,13 +2741,15 @@ order, not a slow one.
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
 | `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+| `kv_resolve` | `M`(range) `blocks` `slots` `sel_pitch` `block_bytes` | `sel`:inout, `nsel`, `res`:inout, `slot_block`:inout, `slot_state`:inout, `ctl`:inout, `host`, `kv_cache`:inout |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
 Five ops decompose one indexer, which scores blocks of key history against the query and hands
 `attn_paged` a shorter block table. `docs/QSA.md` describes the decomposition and
 `arch/common/rad_qsa.h` issues all five. libref implements all five (the oracle for libr4d's
-kernels), and libavx all five for the host path.
+kernels), and libavx all five for the host path. `kv_resolve` sits between the last of them and the
+attention when the group's KV streams; it is described below, after `qsa_select`.
 
 ### `qsa_block_key`
 
@@ -2807,6 +2877,124 @@ top-k and merges them, so a decode step uses more than `1 + n_spec` workgroups. 
 because a chunk's local top-k contains every global top-k member of that chunk, and identical in
 output layout too: the attention sums the selected pages in table order and float addition is not
 associative. Without scratch, or above 32 rows, one workgroup per query walks the whole list.
+
+### `kv_resolve`
+
+Turns `qsa_select`'s block ids into the ring slots that hold them, and copies a block in when it is
+not resident. It is the one op a streamed KV group needs: `sel` is the only place the sparse path
+names KV storage, because `qsa_select` already writes `tb[b]`, the group's pool page id, and
+`attn_paged` uses each entry as a raw pool index. When the group streams, the device pool is
+`slots` blocks deep and the id space is `blocks`, so an id is no longer an address; after this op
+every entry is a slot of `kv_cache` and the attention is unchanged.
+
+The layouts, which the schema cannot state (the maps are one format, and the two block planes are
+bytes, so the op is the same code at every cache layout). The shape given is the operand's extent:
+
+- **`sel`** — `i32 [M, sel_pitch]`, inout. In: block ids. Out: the ring slot holding each block, for
+  the entries below `nsel[q]`; the -1 padding of `qsa_select` past them is untouched.
+- **`nsel`** — `i32 [M]`, in. The valid entries of each row, as `qsa_select` wrote them.
+- **`res`** — `i32 [blocks]`, inout. Block id -> slot, or -1 absent; -2 is a claim this call has made
+  and never leaves it behind.
+- **`slot_block`** — `i32 [slots]`, inout. Slot -> block id, or -1 free.
+- **`slot_state`** — `i32 [slots, 2]`, inout. Column 0 is the epoch that last used the slot, column 1
+  a two-bit **heat counter** in `[0, 3]`: bumped by one, clamped at 3, on every use (a hit or a
+  placement, once a slot a call), and halved when the sweep passes the slot. 31 bits of the i32 are
+  unused, so the policy needs no new field and no ABI change.
+- **`ctl`** — `i32 [16]`, inout. `[0]` epoch, `[1]` clock hand, `[2]` blocks placed by the last call,
+  `[3]` overflow (latched), then `u64` misses, lookups and calls from `[4]`, 8-byte aligned, then
+  `[10]` the largest selection union one call has seen (distinct blocks, hits plus misses), `[11]`
+  the largest number of blocks one call has placed, and `[12]` the largest number of distinct
+  blocks one call has claimed — the depth its miss list had to hold. The maxima are the measurement
+  a ring and a claim list are sized from: `[10]` against the ring's depth says whether one launch
+  can overflow it, `[12]` against `max_seqs * sel_pitch` says whether a claim list is wide enough.
+- **`host`** — bytes, `[blocks, block_bytes]`, in. The layer's authoritative mirror, identity block
+  layout: block `b` at `b * block_bytes`, exactly as the design note lays it out.
+- **`kv_cache`** — bytes, `[slots, block_bytes]`, inout. The layer's ring, the same operand
+  `attn_paged` and `kv_store` take as `RAD_KV(group, layer)`.
+
+One call, in order: bump the epoch, one lookup per distinct block, one victim per miss, re-point
+both maps, copy each missed block, rewrite every valid selection entry. What each step owes:
+
+- **One call is one epoch.** The epoch is bumped first; a resident block takes the new epoch and
+  bumps its heat counter, so the sweep can tell what this call has already touched from what it may
+  take.
+- **One lookup per distinct block, and the map is its own set.** A miss is claimed once, `-1` to
+  `-2`, so a block named by several rows is claimed by the first of them. `sel` entries past
+  `nsel[q]` are `-1` padding and are not touched; `nsel[q]` above `sel_pitch` is refused rather than
+  steered into the neighbouring row.
+- **The miss list is in ascending block id, and that is part of the contract.** First-appearance
+  order would let the row that claimed a block first decide which slot it lands in, so two
+  implementations of one contract would produce different tables. Ascending is a fact about the
+  claim set, not about the map: a device launch sorts the claims it made, or — above the shared
+  claim list — collects the smallest `slots` of them a window of the id space at a time, both over
+  the selection's entries. `blocks` is the id space (`max_seqs * ceil(max_ctx / block_size)`, 102 400
+  at the parity shape) and never the size of one launch, so nothing here walks it.
+- **The claim list's depth is derived, not a constant.** One claim is one distinct absent block a
+  selection entry names, so a launch makes at most `M * sel_pitch` of them (and at most `lookups`,
+  which is `sum_q nsel[q]`). The device kernel sizes its shared list at
+  `next_pow2(min(M * sel_pitch, the workgroup's LDS room))`, so any `--max-num-seqs` follows from the
+  operands: `max_seqs * 513` is 2052 at four sequences, 4104 at eight. There is no cap to raise and
+  none to fall off, and `ctl[12]` reports the largest count a launch has made.
+- **The victim rule is the block's own slot if it is free, then a free slot, then CLOCK, from a hand
+  that ends just past the last slot taken, with second chance.** A miss whose id is inside the ring
+  and whose own slot is free goes to slot `b`, so while the context is shorter than the ring the map
+  is `res[b] = b` and adjacent block ids land in adjacent slots of one layer's stripe, which is the
+  order the attention's gather reads them in. That is placement only: it takes a slot only when
+  that slot is free and it does not move the hand, so it never evicts, and a miss it cannot place
+  falls through to the walk below from the hand it would always have seen -- at depth, where most ids
+  are past `slots`, the same blocks land in the same slots as before. A free slot holds no block, so
+  taking it costs nothing and it is claimed before any resident block is considered; the ring's empty
+  region fills before an eviction.
+  A slot this call already used (a hit's, or a miss's already claimed) is passed and keeps its
+  heat counter, free or not; when a whole turn finds no free slot, the sweep halves the counter of a
+  warm slot (`old >> 1`) and passes it, and takes a cold one (counter 0). The hand still **picks**
+  the victim -- a per-visit decision, not a search -- so the policy costs no reduction, no barrier
+  and no extra traffic: an add-and-clamp in place of a constant store and a shift in place of a
+  zero. That is why it is affordable where an exact LRU is not: the epoch-ordered minimum needs a
+  collective reduction per miss, which costs more than the choice is worth. The free scan halves no
+  counter and leaves the hand alone when it finds nothing, so a ring with no free slot takes exactly
+  the victim the sweep names. Every write clamps the counter to 3,
+  so two passes halve any value to 0 and the third places the miss: a sweep visits at most
+  `3 * slots` slots. The counter is the same decayed-use-count mechanism the streamed experts
+  already replace by (`core/place/heat.*`), at ring granularity.
+- **The ring must hold the union of one call's selection.** A hit holds a slot and a miss needs
+  another, so `hits + misses <= slots` is the sizing rule. What that union is depends on the launch:
+  a decode step takes the ring and a prefill step takes the one-layer stage, and a decode step issues
+  one row a sequence (`1 + n_spec` rows a sequence under speculation), so at most
+  `max_seqs * (1 + n_spec) * (topk + 1)` blocks -- which is the ceiling `--kv-resident` is held to at
+  startup, and `ctl[10]` is what says at run time that the bound held. Overflow is not silent: an unplaced miss reverts to `-1` (so a later call may claim it)
+  and its selection entries are rewritten to slot 0 -- a defined address inside the ring, because a
+  block id is an address past it that the attention dereferences unchecked -- with `ctl[3]` latched.
+  A caller that finds `ctl[3]` set must discard the step: those entries do not name their blocks, so
+  the launch's output is wrong by construction and is never served.
+- **The copied bytes are the mirror's bytes.** One `memcpy` per placed miss, `block_bytes` long,
+  nothing converted, so a streamed block is bit-identical to what the writer put in the mirror.
+  That is why `block_size` is not a parameter and `block_bytes` is: the op never reads an element,
+  and a `block_size` key would make it a KV group's consumer, taking the block size the block
+  manager reads away from the resolved attention kernel.
+- **`slots` is the operand's, not only the parameter's.** `slot_block`'s extent is the ring a call
+  may address, exactly as `sel`'s extent states `M` and its row pitch states `sel_pitch`; the declared
+  parameter is the ceiling a call may not pass. The pool is planned after the program is built, so a
+  ring the engine sized smaller (`--kv-resident`, when it streams at all) reaches the op as a
+  shorter operand. The declared ceiling is the ring the deployment carves -- `--kv-resident` in
+  tokens rounded up to whole blocks, clamped to the group's context (`RadBuildCtx::
+  kv_resident_blocks`) -- and not the block-id space `blocks`, so the geometry an engine reports for
+  this op is the ring it is issued with; with nothing streaming the two are equal. The ceiling also
+  sizes the row's scratch.
+- **The miss list is scratch, not an operand.** It is one launch's temporary; a device row declares
+  `next_pow2(slots) + slots` i32s through its scratch hook (the miss list, then the slots it pairs
+  with) and the reference needs none. The claim list before the sort is dynamic LDS, not scratch,
+  while it fits: the sort reads every element from every thread, so it belongs in the workgroup, and
+  the row sizes that launch's LDS from the bound above. A launch too wide for that room sorts the
+  list in the scratch's first plane, which is why it is padded to a power of two.
+- **The op is stateful, and therefore not concurrent.** epoch, hand, heat counters and counters
+  live between launches, so the row must not carry `rad_kernel_concurrent`
+  (`abi/rad_abi.h:493`); without the promise the engine orders the launch behind everything before
+  it, which is what the map needs. It is still recordable: the maps, the ring and the mirror are
+  fixed-size from the group's declaration, so addresses and pitches never move and a replay is
+  valid.
+- **The caller brings the state up.** `res` and `slot_block` filled with `-1`, `slot_state` and
+  `ctl` zeroed. There is no reset op: a residency map lives as long as its pool.
 
 ### `qsa_tail_store`
 
