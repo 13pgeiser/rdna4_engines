@@ -10,9 +10,10 @@
 // taken only when the caller's `prefill_fp8` asks for them.
 //
 // `opt` is a bitmask of optimisation steps:
-//     prefill 3954187 = f16 operands | mask skip | folded query scale | contiguous-k fragments
+//     prefill 3954187 | KLATE = f16 operands | mask skip | folded query scale | contiguous-k fragments
 //                     | prefetch 2 + scheduling barrier | dot2 row sum | block table in SGPRs
 //                     | wide K fetch | V prefetch across the m-tile loop | LDS-scoped barrier
+//                     | 8-bit K fetched a tile ahead (KLATE)
 //     decode  3429947 = the same minus the wide K fetch (its K never reaches LDS), plus K read
 //                       straight from the paged cache (bit 16) and f16 split-KV partials (32).
 // Each bit is defined where it is used (r4d_attn_prefill_h256_gqa6.hip,
@@ -50,7 +51,7 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 #define P_TILE   48
 // K prefetch 2, not 4: four fragments in flight make the m-tile loop spill at six waves per SIMD
 // (36-48 bytes per lane, ~4% of the prefill). At 2 the spill is 20 bytes, outside the WMMA groups.
-#define P_OPT    3954187
+#define P_OPT    (3954187 | O_KLATE)
 
 // ---- the prefill KV split (r4d_attn_prefill_split.h) -------------------------------------------
 // Query positions a workgroup: 64.
