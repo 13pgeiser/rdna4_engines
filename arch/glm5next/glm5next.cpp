@@ -214,6 +214,10 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
     c.selected = m.aw.core.selected;
     c.length = m.aw.core.length;
     c.nsel = decl_b(b, nm.f("selected_count"), RAD_I32, { T });
+    /* The MLA block's resolve names qsa_select's second output; it must never take `length`,
+     * the third output, which is a token count (glm5next.cpp's attention order is store ->
+     * select -> resolve -> attention). */
+    m.aw.core.nsel = c.nsel;
     if (g.world > 1) {
         c.cu_part = decl_b(b, nm.f("index_part_bounds"), RAD_I32, { g.max_seqs + 1 });
         c.sel_part = decl_b(b, nm.f("selected_part"), RAD_I32, { part, 513 });
@@ -396,6 +400,10 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     g.max_ctx = ctx->max_ctx;
     g.max_seqs = ctx->max_seqs;
     g.max_spec = ctx->max_spec;
+    /* --kv-resident in tokens. Geom is filled by hand here (not by the shared helper), and the
+     * resolve's declared `slots` is what the ring can address, so leaving this 0 would declare the
+     * whole context as the ring. */
+    g.kv_resident = ctx->kv_resident_blocks;
     g.max_logit_rows = std::min<int64_t>(g.max_tok, g.max_seqs * (g.max_spec + 1));
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
@@ -593,6 +601,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* A full MLA layer streams: rad_block_glm_mla.h declares the streamed store, which writes the
+     * host mirror, and the resolve that maps the indexer's block ids to ring slots. */
+    out->kv_stream_ok = 1;
     if (cfg(meta, "num_nextn_predict_layers", 0) == 1) out->draft_depth = GlmMtp::kDepth;
     // The tower's merged block, so a pass size the core picks itself is whole output rows.
     if (GlmVision::present(meta)) {

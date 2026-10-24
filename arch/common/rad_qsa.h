@@ -216,6 +216,10 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         d.head_dim  = c.head_dim / (2 * c.ratio);
         *bk = rad_decl_kv_group(b, nm.f("kv_qsa_bkey"), &d);
         if (!*bk) return RAD_E_INVAL;
+        /* qsa_score walks every complete block of the live history each step, so this group is
+         * read densely and cannot stream: its carve must hold every sequence's context while a
+         * sibling group's blocks live in host memory (kvstream/carve.h). */
+        RAD_ARCH_TRY(rad_kv_group_dense_read(b, *bk));
     }
     kv_bk = *bk;
     /* Under M-RoPE a block key rotates at its first token's three components, which qsa_work
@@ -255,6 +259,17 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                  RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
                       RAD_NOWEIGHTS),
                   {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
+
+    /* The selection's block ids become ring slots between here and the attention when the
+     * attention group streams. The resolve is declared and issued by the attention block, after
+     * that layer's KV store, not here: the store is what puts this step's bytes in the mirror, and
+     * a resolve that ran before it would copy a block short of the tokens just written
+     * (arch/common/rad_block_attn_gated_fp8.h, AttnGatedFP8::step). The indexer's own read of
+     * `sel` is only the buffer's producer.
+     *
+     * A ring smaller than the group's context is what the engine admits (--kv-resident), so `sel`'s
+     * entries are logical block ids and the resolve rewrites them as ring slots; prefill runs on
+     * the one-layer stage and never resolves (docs/KV-STREAMING.md §3.5). */
     return RAD_OK;
 }
 
@@ -368,6 +383,10 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * block table and complete-block count are the step's, so each row is scored and selected as
      * in one pass over the step, and a row two windows share is written twice with the same
      * bytes. */
+    /* The selection's block ids become ring slots in the attention block, after that layer's KV
+     * store (AttnGatedFP8::step): the store is what puts this step's bytes in the host mirror, and
+     * a resolve issued here -- before the store -- would copy a non-resident block short of the
+     * tokens this step writes. The indexer only produces the table; it never resolves it. */
     const int64_t PR = c.plane_rows > 0 ? c.plane_rows : T;
     if (T > PR) {
         if (S != 1 || !win_cu) {

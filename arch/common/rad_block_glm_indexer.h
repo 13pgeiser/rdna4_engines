@@ -90,6 +90,11 @@ struct DsaCache {
             d.n_head_kv = 1;
             d.head_dim = 17;
             *index_group = rad_decl_kv_group(b, nm.f("kv_dsa_index"), &d);
+            /* The indexer reads this group over the whole live history every step (dsa_score), so
+             * a ring cannot hold it back: it stays resident and its carve becomes a floor of
+             * max_seqs full contexts when a sibling group streams (kvstream/carve.cpp). Inert
+             * unless a sibling streams. */
+            RAD_ARCH_TRY(rad_kv_group_dense_read(b, *index_group));
         }
         index = *index_group;
         if (!index) return RAD_E_INVAL;

@@ -26,6 +26,17 @@
 namespace rad {
 namespace arch {
 
+/* Whether the streamed store has a row for this cache layout. libr4d's streamed rows are the E4M3
+ * and bf16 ones only (libr4d/r4d_rows.cpp, kv_store_streamed_{fp8,bf16}); a packed cache
+ * (--kv-cache-dtype fp8_v4 / k6_v4) has base-store rows and nothing that writes a host mirror. The
+ * declaration must not be emitted for it: the op is weightless, so a device miss is a hole and
+ * refuses startup even with --kv-resident off. A group that declares no streamed store takes the
+ * base path, and kvstream_configure tells the operator the layout, not the architecture, is why. */
+inline bool kv_store_streamed_dtype(const char* kv_dtype) {
+    return kv_dtype && (std::strcmp(kv_dtype, "fp8_e4m3") == 0 ||
+                        std::strcmp(kv_dtype, "bf16") == 0);
+}
+
 struct AttnGatedFP8 {
     struct Wire {
         rad_buf x    = 0;   /* [max_tok, n_embd]              the residual stream */
@@ -69,6 +80,7 @@ struct AttnGatedFP8 {
      * block table and context length: same op, same kernel, different list. `sel` is `topk + 1`
      * wide and the kernel takes its block-table pitch from the operand. */
     rad_buf     qsa_sel  = 0;
+    rad_buf     qsa_nsel = 0;   /* [max_tok] i32, the valid entries of each `qsa_sel` row */
     rad_buf     qsa_sequ = 0;
     /* Context length up to which dense attention gives the same result, `budget + ratio - 1`.
      * Below it every complete block is selected, the paths agree to the bit, and dense is cheaper
@@ -110,10 +122,23 @@ struct AttnGatedFP8 {
 
     rad_op     op_fused = 0;                                 /* qk_norm_rope_gate, if it resolves */
     rad_op     op_fused_kv = 0;                              /* the same with kv_store folded in */
+    /* The same with a streamed group's store folded in: the host mirror is written for every token
+     * and the ring slot only where the residency map says the block is resident, exactly as
+     * kv_store_streamed does. Declared beside the pair it replaces; issued only when the batch hands
+     * this group a stream, because the mirror and the map are the batch's. */
+    rad_op     op_fused_stream = 0;
     int64_t    fused_rows = 0;                               /* widest T the fused ops take */
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    /* kv_store_streamed, the store of a group whose KV streams: the host mirror always, the ring
+     * slot when `res` says the block is resident (docs/OPS.md "kv_store_streamed"). Zero when the
+     * rows do not serve it; a streamed group then fails the step rather than write the ring
+     * alone. */
+    rad_op     op_kv_stream = 0;
+    /* kv_resolve: this layer's selection made resident and rewritten as ring slots. Declared here,
+     * beside the store it must follow (step), and issued immediately before each sparse launch. */
+    rad_op     op_resolve = 0;
     /* The output gate as `sigmoid` then `mul`: the bf16-linear form (Geom::w_bf16), and with fp8
      * linears the chain gate_quant_fp8 fuses, where it is not served. `gate` is the sigmoid's
      * output (the wire's with bf16 linears, the block's own otherwise) and `q_gate` the chain's
@@ -143,6 +168,14 @@ struct AttnGatedFP8 {
      * by passes that only leave layer state behind, such as the MTP head's history pass over a
      * prompt chunk with no drafting row. */
     void store_kv(RadCtx* c, const RadBatch* batch) const;
+    /* The cache store of this layer, the one place a layer's KV reaches storage: `kv_store` for a
+     * hosted group, `kv_store_streamed` for a group whose KV streams. Called before the attention,
+     * and before the resolve, of the same layer. */
+    void store_cache(RadCtx* c, const RadKVGroupBatch* kvb, const int32_t* slot, int64_t T,
+                     bool staged = false) const;
+    /* The pool store a staged pass needs beside the mirror writer: the same bytes at block-id
+     * identity, which is the addressing a stage view reads. */
+    void store_stage_identity(RadCtx* c, const int32_t* slot, int64_t T) const;
 
     /* The block's tail, declared last by every rank: the all-reduce and the trailing add. */
     int  declare_out(RadBuilder* b, bool add_out);
@@ -162,7 +195,12 @@ struct AttnGatedFP8 {
      * normed pieces (ArPieces::in_ready): one prefill sequence in two pieces, each the chunk a
      * span of 1 makes, on the unfused prologue with one rotary component per token (every token's
      * components agree, so plane 0 of an M-RoPE batch's positions is each token's position) and
-     * the gate quantised by gate_quant_fp8. */
+     * the gate quantised by gate_quant_fp8.
+     *
+     * A streamed group never takes it: the pieces path issues the cache store as `op_kv_store` at
+     * the batch's slot mapping, which for a ring smaller than the context is a block id used as a
+     * slot and never reaches the host mirror, so the split would skip the whole streaming write
+     * (the group's own path in step() is the only one that writes both). */
     bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
         const int64_t T = batch->n_tok;
         const RadKVGroupBatch* kvb = kv_batch(batch, kv);
@@ -170,7 +208,7 @@ struct AttnGatedFP8 {
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
                !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
-               kvb && kvb->slot_mapping && kvb->block_table && kvb->seqused;
+               kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
     }
 };
 
@@ -326,10 +364,21 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
      * ids: an aperture violation outside the cache. rad_op_reads rather than rw() because the list
      * depends on whether the layer has an indexer. */
     if (op_attn) {
-        const rad_buf rd[3] = { w.q, qsa_sel, qsa_sequ };
-        rad_op_reads(b, op_attn, rd, (qsa_sel && qsa_sequ) ? 3 : 1);
+        const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, qsa_nsel };
+        rad_op_reads(b, op_attn, rd,
+                     (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
         rad_op_writes(b, op_attn, &w.attn.x, 1);
     }
+
+    /* This block owns the selection's residency: kv_resolve is issued immediately before each
+     * attention launch and after this layer's store (see step), because the store writes the mirror
+     * and the resident slots and a block that is not resident yet is copied in whole from the
+     * mirror -- so the resolve must see this step's bytes. Its band is the step's widest launch
+     * (`max_tok`: the gated sparse path takes a whole step in one launch) and its selection row is
+     * `qsa_topk + 1` entries wide, which is what the attention op declares too. The geometry is
+     * kv_resolve_declare's (arch/common/rad_arch.h). */
+    if (qsa_sel && qsa_nsel)
+        op_resolve = kv_resolve_declare(b, g, kv, qsa_sel, qsa_nsel, qsa_topk + 1);
 
     op_kv_store = rw(b, RAD_OP(b, "kv_store",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
@@ -339,12 +388,46 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                          RAD_NOWEIGHTS),
                      {w.k, w.v}, {});
 
+    /* The store of a group whose KV streams: kv_store's operands and parameters, plus the stream's
+     * residency map and the layer's host mirror, which the batch carries and declare cannot see.
+     * Declared beside kv_store and issued instead of it when the batch hands this group a stream
+     * (step, store_cache). Its `block_size` does not take the group's binding: `attn_paged` above
+     * already claimed it. Declared only for a cache the store has a row for: a packed layout
+     * declares neither this nor the fold below, so the group keeps its resident store (see
+     * kv_store_streamed_dtype). */
+    if (kv_store_streamed_dtype(g.kv_dtype) && rad_op_declared(b, "kv_store_streamed"))
+        op_kv_stream = rw(b, RAD_OP(b, "kv_store_streamed",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                        RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("n_head_kv", g.n_head_kv),
+                                        RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                        RAD_STR("kv_dtype", g.kv_dtype)),
+                             RAD_NOWEIGHTS),
+                         {w.k, w.v}, {});
+
     /* The fused prologue with the cache store folded in: a k head's block already holds its
      * token's rotated k, so it also writes k and v into the cache, byte-identical to kv_store.
      * Declared here because the cache block size is read back from the attention op above.
      * Resolves for E4M3 and bf16 caches. */
     if (op_fused && rad_op_declared(b, "qk_norm_rope_gate_kv_store"))
         op_fused_kv = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store",
+                            RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
+                                       RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
+                                       RAD_INT("n_head_kv", g.n_head_kv), RAD_INT("rot", n_rot),
+                                       RAD_STR("q_dtype", g.dtype), RAD_F64("eps", g.eps),
+                                       RAD_F64("wadd", g.wadd_qk), RAD_INT("cs_f32", 1),
+                                       RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                       RAD_STR("kv_dtype", g.kv_dtype)),
+                            RAD_WEIGHTS(w_q_norm, w_k_norm)),
+                         {w.qg, w.k, w.cos_sin, w.v}, {w.q, w.k});
+
+    /* The same fold for a group whose KV streams: the store also writes the layer's host mirror and
+     * consults the residency map, whose operands are the batch's, so they are added at issue
+     * (step). E4M3 or bf16, as the streamed store is, and gated on the same layouts for the same
+     * reason; a group that does not stream never issues it. */
+    if (op_fused && kv_store_streamed_dtype(g.kv_dtype) &&
+        rad_op_declared(b, "qk_norm_rope_gate_kv_store_streamed"))
+        op_fused_stream = rw(b, RAD_OP(b, "qk_norm_rope_gate_kv_store_streamed",
                             RAD_PARAMS(RAD_RANGE("M", 1, fused_rows),
                                        RAD_INT("head_dim", g.head_dim), RAD_INT("n_head", g.n_head),
                                        RAD_INT("n_head_kv", g.n_head_kv), RAD_INT("rot", n_rot),
@@ -469,6 +552,45 @@ inline int AttnGatedFP8::declare_out(RadBuilder* b, bool add_out) {
     return RAD_OK;
 }
 
+inline void AttnGatedFP8::store_stage_identity(RadCtx* c, const int32_t* slot, int64_t T) const {
+    RAD_ISSUE_N(c, op_kv_store, T, brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T),
+                kv_cache(kv, layer));
+}
+
+inline void AttnGatedFP8::store_cache(RadCtx* c, const RadKVGroupBatch* kvb,
+                                      const int32_t* slot, int64_t T, bool staged) const {
+    const RadKVStream* st = kvb ? kvb->stream : nullptr;
+    if (!st) {
+        RAD_ISSUE(c, op_kv_store,
+                  brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+        return;
+    }
+    /* A streamed group's cache is the host mirror; the ring slot is written only when the block is
+     * resident (docs/OPS.md "kv_store_streamed"). Falling back to kv_store here would write the
+     * ring alone, which for a ring smaller than the context is a block id used as a slot -- so a
+     * layer that resolves the stream but not the store fails the step instead. */
+    const int64_t bbytes = st->block_bytes;
+    const int64_t blocks = bbytes > 0 ? st->host_layer_stride / bbytes : 0;
+    const int64_t li     = rad_kv_layer_index(c, kv, layer);
+    const uint8_t* host  = li >= 0 ? st->host + li * st->host_layer_stride : nullptr;
+    const int32_t* res   = li >= 0 ? st->res + li * blocks : nullptr;
+    if (!op_kv_stream || !host || !res || blocks <= 0) {
+        rad_step_fail(c, "kv streaming: this layer's KV group streams but the build has no "
+                         "kv_store_streamed row to write its host mirror with, so the layer's KV "
+                         "would never reach storage");
+        return;
+    }
+    RAD_ISSUE(c, op_kv_stream,
+              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+              praw(res, RAD_I32, blocks), praw2(host, RAD_U8, blocks, bbytes));
+    /* A staged pass reads the pool at block-id identity while kv_store_streamed's device write is
+     * gated on the residency map, and the map holds nothing before the group's first decode: the
+     * mirror would advance and the stage would not, and the attention would read the previous
+     * layer's bytes. The identity store is the same bytes at the addressing this view uses, so a
+     * staged pass issues it too, after the mirror writer. */
+    if (staged) store_stage_identity(c, slot, T);
+}
+
 inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
     if (!ext_in) nq_h.step(c, T);
@@ -479,8 +601,9 @@ inline void AttnGatedFP8::store_kv(RadCtx* c, const RadBatch* batch) const {
     vp.step(c, w.h, w.v, T);
     RAD_ISSUE_N(c, op_k_norm, T * g.n_head_kv, brows(w.k, T), RAD_W(w_k_norm), brows(w.k, T));
     RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
-    RAD_ISSUE(c, op_kv_store,
-              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    bool staged = false;
+    if (kvb && kvb->stream) staged = kv_stage_wait(c, kv, kvb, layer) != 0;
+    store_cache(c, kvb, slot, T, staged);
 }
 
 inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
@@ -555,8 +678,45 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * token, so a pass with media tokens (differing components) takes the unfused path with the
      * full [3, T] positions. */
     const bool fuse_ok = T <= fused_rows && !rope_mixed(batch);
-    const bool fused_kv = op_fused_kv && fuse_ok;
-    if (fused_kv) {
+    /* A hosted group takes the fused store. A streamed group takes the folded *streamed* store
+     * instead (op_fused_stream), whose operands are the batch's mirror and residency map: it writes
+     * the mirror for every token and the ring slot only for a resident block, exactly what
+     * kv_store_streamed does, so the prologue plus a separate store becomes one launch and the
+     * chain between store, resolve and attention loses a hop. */
+    const bool streamed = kvb && kvb->stream;
+    const bool fused_kv = op_fused_kv && fuse_ok && !streamed;
+    /* The map and the mirror, read exactly as store_cache reads them; a layer with none leaves the
+     * pair to store_cache, which fails the step with its own message rather than serving KV that
+     * never reached storage. */
+    const uint8_t* kv_host = nullptr;
+    const int32_t* kv_res  = nullptr;
+    int64_t kv_blocks = 0, kv_bbytes = 0;
+    if (streamed && op_fused_stream && fuse_ok) {
+        const RadKVStream* st = kvb->stream;
+        kv_bbytes = st->block_bytes;
+        kv_blocks = kv_bbytes > 0 ? st->host_layer_stride / kv_bbytes : 0;
+        const int64_t li = rad_kv_layer_index(c, kv, layer);
+        kv_host = li >= 0 ? st->host + li * st->host_layer_stride : nullptr;
+        kv_res  = li >= 0 ? st->res + li * kv_blocks : nullptr;
+        if (!kv_host || !kv_res || kv_blocks <= 0) kv_host = nullptr;
+    }
+    const bool folded_stream = streamed && kv_host && kv_res;
+    bool staged_folded = false;
+    /* The folded prologue writes the store, so the stage copy must have landed before the launch
+     * rather than after it (core/kvstream/stage.h, the ordering rule). The fallback keeps the wait
+     * where it was, between the prologue and store_cache. */
+    if (folded_stream) staged_folded = kv_stage_wait(c, kv, kvb, layer) != 0;
+    if (folded_stream) {
+        RAD_ISSUE_N(c, op_fused_stream, T,
+                    brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
+                    RAD_W(w_q_norm), RAD_W(w_k_norm),
+                    brows(w.q, T), brows(w.k, T), RAD_NONE,
+                    brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+                    praw(kv_res, RAD_I32, kv_blocks), praw2(kv_host, RAD_U8, kv_blocks, kv_bbytes));
+        /* The stage view's identity store, for the reason store_cache states: the folded streamed
+         * store writes the ring slot the map names, never the block id a staged pass reads. */
+        if (staged_folded) store_stage_identity(c, slot, T);
+    } else if (fused_kv) {
         RAD_ISSUE_N(c, op_fused_kv, T,
                     brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
@@ -576,9 +736,15 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
     }
 
-    if (!fused_kv)
-        RAD_ISSUE(c, op_kv_store,
-                  brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    /* A staged group's copy reads the host mirror out of the DMA engine, so it must have landed
+     * before this layer's store writes this chunk's tokens into the stage: the mirror does not hold
+     * them yet, and a copy landing after the store would put its older bytes back over them. The
+     * wait is a barrier on this stream (core/kvstream/stage.h, the ordering rule). A no-op for a
+     * group with no stage view; already taken above when the store is folded into the prologue. */
+    bool staged_un = false;
+    if (streamed && !folded_stream) staged_un = kv_stage_wait(c, kv, kvb, layer) != 0;
+    if (!fused_kv && !folded_stream)
+        store_cache(c, kvb, slot, T, staged_un);
 
     /* Sparse attention issues one row per query. `attn_paged` indexes its block table and length
      * by row, and a row need not be a sequence, so T queries issued as T rows of q_len 1, each with
@@ -595,6 +761,37 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const bool    sparse = qsa_sel && qsa_sequ &&
                            (T == batch->n_seq || qsa_exact_to <= 0 || reach > qsa_exact_to);
     const bool gated = sparse && op_attn_gq;
+    /* Make this launch's rows resident and rewrite their `sel` entries before the attention reads
+     * them. The store above must come first: a block this step writes may not be in the ring yet,
+     * and the resolve then copies whole blocks out of the mirror, so it has to see this step's
+     * bytes. What the order is, per layer: store (mirror, and the resident slot) -> resolve (for
+     * each launch's rows) -> attention. The maps, the ring and the mirror are fixed at bring-up,
+     * so the resolve is a pure function of device state and sits on one stream: issue order is the
+     * ordering. `sel` is the same buffer the attention takes, row sliced to this launch. */
+    auto resolve_sel = [&](int64_t off, int64_t rows) {
+        /* A streamed group whose ring is smaller than its context selected the one-layer stage
+         * view for this pass: stage this layer (once) and leave `sel` as block ids, which address
+         * the identity stage directly. No resolve, so no ring can overflow in a prefill. */
+        if (kv_stage_layer(c, kv, kvb, layer)) return;
+        if (!op_resolve || !kvb || !kvb->stream || rows <= 0) return;
+        const RadKVStream* st = kvb->stream;
+        const int64_t bbytes = st->block_bytes;
+        const int64_t blocks = bbytes > 0 ? st->host_layer_stride / bbytes : 0;
+        const int64_t slots  = st->slots;
+        const int64_t li     = rad_kv_layer_index(c, kv, layer);
+        /* `host` is null exactly when `li < 0`, so it is the whole test for a mirror row. */
+        const uint8_t* host  = li >= 0 ? st->host + li * st->host_layer_stride : nullptr;
+        if (!host || blocks <= 0 || slots <= 0) return;
+        RAD_ISSUE_N(c, op_resolve, rows,
+                    brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                    brow_slice(qsa_nsel, off, rows, 1),
+                    praw(st->res + li * blocks, RAD_I32, blocks),
+                    praw(st->slot_block + li * slots, RAD_I32, slots),
+                    praw2(st->slot_state + li * slots * 2, RAD_I32, slots, 2),
+                    praw(st->ctl, RAD_I32, 16),
+                    praw2(host, RAD_U8, blocks, bbytes),
+                    kv_cache(kv, layer));
+    };
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated
      * sparse path every query row is its own (q_len 1) and the gate rides in the merge, so the
      * attention and out projection can finish a piece's rows and hand off its reduction while the
@@ -607,6 +804,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             const int64_t pn = T - p0 < pieces->rows ? T - p0 : pieces->rows;
             for (int64_t off = p0; off < p0 + pn; off += chunk) {
                 const int64_t rows = (p0 + pn - off) < chunk ? (p0 + pn - off) : chunk;
+                resolve_sel(off, rows);
                 RAD_ISSUE_N(c, op_attn_gq, 1,
                             brow_slice(w.q, off, rows, qw),
                             kv_cache(kv, layer),
@@ -621,6 +819,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             o.step(c, w.attn, w.h.x, T, p0, pn);
             if (p0 + pn < T) pieces->hand(p0, pn);
         }
+        /* Every attention launch of this layer is issued: start the next layer's stage copy now
+         * (the ride it waits on is completed by the next dispatch on this stream, which is behind
+         * all of them). */
+        if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
         return;
     }
     if (gated) {
@@ -628,6 +830,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t qw = g.q_dim(), hd = g.head_dim;
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
+            resolve_sel(off, rows);
             RAD_ISSUE_N(c, op_attn_gq, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
@@ -644,6 +847,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t qw = g.q_dim();
         for (int64_t off = 0; off < T; off += chunk) {
             const int64_t rows = (T - off) < chunk ? (T - off) : chunk;
+            resolve_sel(off, rows);
             RAD_ISSUE_N(c, op_attn, 1,
                         brow_slice(w.q, off, rows, qw),
                         kv_cache(kv, layer),
@@ -653,6 +857,11 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         brow_slice(w.attn.x, off, rows, qw));
         }
     } else {
+        /* Below qsa_exact_to the dense path reads a block id straight out of the block table and
+         * never resolves. A staged pass addresses blocks by their id, so this layer must be staged
+         * here too or a short prompt on a small ring would read slots out of an unstaged pool
+         * (docs/KV-STREAMING.md §3.5). A no-op for a group with no stage view. */
+        if (kvb && kvb->stream) (void)kv_stage_layer(c, kv, kvb, layer);
         RAD_ISSUE_N(c, op_attn, batch->max_q_len,
                     brows(w.q, T), kv_cache(kv, layer),
                     praw2(table, RAD_I32, batch->n_seq,
@@ -664,6 +873,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                     brows(w.attn.x, T));
     }
 
+    /* Every attention launch of this layer is issued: hand the next layer's copy to the DMA engine
+     * riding on the next dispatch here, so it crosses the link under the out projection and the next
+     * layer's own projections (core/kvstream/stage.h). */
+    if (kvb && kvb->stream) kv_stage_next(c, kv, layer);
     if (gated) {
         /* the sparse attention gated and quantised in its merge */
     } else if (op_sig) {

@@ -29,6 +29,11 @@ struct MlaLatent {
     };
     struct Wire {
         rad_buf q = 0, q_latent = 0, attn_latent = 0, out = 0, selected = 0, length = 0;
+        /* qsa_select's entry count (selected_count), one int per row. Not part of the attention's
+         * operands and not a declare requirement: only the streamed resolve needs it, and it fails
+         * the step if a streaming group's selection has no count. Never `length`, which is a token
+         * count. */
+        rad_buf nsel = 0;
     };
     Geom g{};
     Config c{};
@@ -128,7 +133,7 @@ struct GlmMla {
     QuantFP8 attn_quant{};
     MlaLatent core{};
     rad_weight q_gain = 0, kv_gain = 0;
-    rad_op op_kv_norm = 0, op_store = 0, op_ar = 0;
+    rad_op op_kv_norm = 0, op_store = 0, op_store_stream = 0, op_resolve = 0, op_ar = 0;
     LinearFP8 rows_q_b{}, rows_output{};
     QuantFP8 rows_quant{};
     rad_weight rows_kv_b = 0;
@@ -189,6 +194,24 @@ struct GlmMla {
         RAD_ARCH_TRY(output.declare(b, nm, g, nm.f("blk.%d.attn_output", layer), 4096,
                                     GlmTp::mla_width(g.world), RAD_SHARD_COL, grp_layer(layer),
                                     { nm.ckpt("%s.o_proj.weight", prefix) }, w.attn, w.out));
+        /* The store of a group whose KV streams: kv_store's operands and parameters, plus the
+         * stream's residency map and this layer's host mirror, which the batch carries and declare
+         * cannot see (prepare adds them at issue). A streamed group's store must write the mirror,
+         * so falling back to kv_store would leave it empty and a miss would copy zeros. */
+        if (rad_op_declared(b, "kv_store_streamed") && rad_kv_block_size(b, kv) == 4)
+            op_store_stream = rw(b,
+                                RAD_OP(b, "kv_store_streamed",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok),
+                                                  RAD_INT("head_dim", 256), RAD_INT("n_head_kv", 1),
+                                                  RAD_INT("block_size", 4),
+                                                  RAD_STR("kv_dtype", "bf16")),
+                                       RAD_NOWEIGHTS),
+                                { w.latent }, {});
+        /* The resolve that rewrites the selection from block ids into ring slots. It is issued in
+         * finish, after this layer's indexer selects and before the attention reads `selected`;
+         * that ordering is the whole correctness argument. `sel_pitch` is the selection row's
+         * pitch, which is what MlaLatent declares its attention with. */
+        op_resolve = kv_resolve_declare(b, g, kv, w.core.selected, w.core.nsel, core.c.blocks);
         if (reduce) op_ar = GlmTp::reduce(b, g, w.out);
         if (!op_store || ((reduce && g.world > 1) && !op_ar)) return RAD_E_INVAL;
         return reduce ? declare_rows(b, nm, prefix) : RAD_OK;
@@ -265,20 +288,112 @@ struct GlmMla {
         kv_a.step(ctx, w.input, w.kv_raw, T);
         q_norm.step(ctx, T);
         RAD_ISSUE_N(ctx, op_kv_norm, T, brows(w.kv_raw, T), RAD_W(kv_gain), brows(w.latent, T));
+        /* The row form splits the query projection into finish_rows (per rank), so q_b runs here
+         * only in the head form; the latent store below is full length either way. */
         if (!rows_take(T)) q_b.step(ctx, w.q_low, w.core.q, T);
-        RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
-                    praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+        const RadKVStream* st = kb->stream;
+        if (!st) {
+            RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
+            return;
+        }
+        /* A streamed group's cache is the host mirror: the ring slot is written only when the block
+         * is already resident. The wait must sit immediately before the store, so this chunk's
+         * bytes are the stage's last writer (core/kvstream/stage.h ORDERING RULE 1-2). Falling back
+         * to kv_store here would write the ring alone, which for a ring smaller than the context is
+         * a block id used as a slot, so the step fails instead. */
+        (void)kv_stage_wait(ctx, kv, kb, layer);
+        const int64_t bbytes = st->block_bytes;
+        const int64_t blocks = bbytes > 0 ? st->host_layer_stride / bbytes : 0;
+        const int64_t li     = rad_kv_layer_index(ctx, kv, layer);
+        const uint8_t* host  = li >= 0 ? st->host + li * st->host_layer_stride : nullptr;
+        const int32_t* res   = li >= 0 ? st->res + li * blocks : nullptr;
+        if (!op_store_stream || !host || !res || blocks <= 0) {
+            rad_step_fail(ctx, "GLM MLA: this layer's KV group streams but the build has no "
+                              "kv_store_streamed row to write its host mirror with, so the layer's "
+                              "KV would never reach storage");
+            return;
+        }
+        RAD_ISSUE_N(ctx, op_store_stream, T, bcol(w.latent, 0, 256, T),
+                    bcol(w.latent, 256, 256, T), praw(kb->slot_mapping, RAD_I32, T),
+                    kv_cache(kv, layer), praw(res, RAD_I32, blocks),
+                    praw2(host, RAD_U8, blocks, bbytes));
+        /* A staged pass reads the pool at block-id identity, and kv_store_streamed's device write is
+         * gated on the residency map: a block is written only where the *ring* holds it. The map is
+         * empty for every staged prefill before the group's first decode, so without this store the
+         * mirror would advance and the stage would not, and the attention would read the previous
+         * layer's bytes for this chunk. The identity store is the same bytes at the addressing this
+         * view uses, so a staged pass issues it too, after the mirror writer. `kv_stage_layer` is the
+         * predicate that gates the resolve below, answered here by the wait just taken: the layer is
+         * staged and must not resolve. */
+        if (kv_stage_layer(ctx, kv, kb, layer))
+            RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
     }
     void finish(RadCtx* ctx, const RadBatch* batch) const {
         const int64_t T = batch->n_tok;
+        const auto* kb = kv_batch(batch, kv);
+        if (kb && kb->stream) {
+            /* One `selected` buffer serves the whole model (glm5next.cpp assigns m.iw.selected =
+             * m.aw.core.selected), so this layer's indexer must have re-emitted fresh ids
+             * immediately above. Only one full layer resolves at a time, and only on a pass that
+             * takes the ring; a staged pass addresses block ids directly through the identity
+             * stage. Resolving outside that order makes layer n+1 resolve layer n's ring slots as
+             * block ids: in range, fluent, wrong. */
+            if (kv_stage_layer(ctx, kv, kb, layer)) {
+                /* staged: this pass leaves `selected` as block ids and must not resolve */
+            } else if (!w.core.nsel) {
+                rad_step_fail(ctx, "GLM MLA: the KV group streams but the selection has no entry "
+                                  "count (selected_count), so kv_resolve cannot rewrite it");
+                return;
+            } else if (!op_resolve) {
+                rad_step_fail(ctx, "GLM MLA: this layer's KV group streams but the build has no "
+                                  "kv_resolve row to rewrite its selection with, so the attention "
+                                  "would read block ids as ring slots");
+                return;
+            } else if (T > 0) {
+                const RadKVStream* st = kb->stream;
+                const int64_t bbytes = st->block_bytes;
+                const int64_t blocks = bbytes > 0 ? st->host_layer_stride / bbytes : 0;
+                const int64_t slots  = st->slots;
+                const int64_t li     = rad_kv_layer_index(ctx, kv, layer);
+                /* `host` is null exactly when `li < 0`, so it is the whole test for a mirror row. */
+                const uint8_t* host  = li >= 0 ? st->host + li * st->host_layer_stride : nullptr;
+                if (!host || blocks <= 0 || slots <= 0) {
+                    rad_step_fail(ctx, "GLM MLA: the KV group streams but this layer has no host "
+                                      "mirror row or residency map to resolve against");
+                    return;
+                }
+                /* The count operand is qsa_select's second output, the number of entries it wrote,
+                 * never `length` (its third output, a token count). The device clamps a too-large
+                 * count to sel_pitch and skips the -1 padding, so the wrong buffer serves the right
+                 * slots on the card while the reference refuses the same call -- the oracle dies
+                 * quietly (tests/arch_test.cpp asserts this handle). */
+                RAD_ISSUE_N(ctx, op_resolve, T,
+                            brow_slice(w.core.selected, 0, T, core.c.blocks),
+                            brow_slice(w.core.nsel, 0, T, 1),
+                            praw(st->res + li * blocks, RAD_I32, blocks),
+                            praw(st->slot_block + li * slots, RAD_I32, slots),
+                            praw2(st->slot_state + li * slots * 2, RAD_I32, slots, 2),
+                            praw(st->ctl, RAD_I32, 16),
+                            praw2(host, RAD_U8, blocks, bbytes),
+                            kv_cache(kv, layer));
+            }
+        }
+        /* The row form (upstream 1.12.0): a prefill-sized step under --tp-attn-split runs the
+         * attention over a rank's own rows and gathers, so the resolve above already rewrote
+         * `selected` for every row before either form reads it. */
         if (rows_take(T)) {
             finish_rows(ctx, T);
-            return;
+        } else {
+            core.step(ctx, T);
+            attn_quant.step(ctx, T);
+            output.step(ctx, w.attn, w.out, T);
+            if (op_ar) RAD_ISSUE_N(ctx, op_ar, T * 4096, brows(w.out, T), RAD_NONE);
         }
-        core.step(ctx, T);
-        attn_quant.step(ctx, T);
-        output.step(ctx, w.attn, w.out, T);
-        if (op_ar) RAD_ISSUE_N(ctx, op_ar, T * 4096, brows(w.out, T), RAD_NONE);
+        /* Behind every attention launch of this layer, so the next layer's copy starts only once
+         * the last read of the aliased stage is behind it (core/kvstream/stage.h). */
+        if (kb && kb->stream) kv_stage_next(ctx, kv, layer);
     }
     /* This rank's rows [first, first + n) end to end; the last rank's run may be short, and the
      * gather sends its unwritten tail rows, which land past T. */

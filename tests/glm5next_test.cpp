@@ -1611,9 +1611,14 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         uint64_t graph, steps;
         bool heads_only = false;   /* the default: the graph before the row form */
     };
-    const Case cases[] = { { 1, 0x906897570034f5f5ull, 0x68ffc03d2b640d51ull },
-                           { 8, 0x1d378152c40f8834ull, 0x82ed1094dbf4b637ull },
-                           { 8, 0x9f39f6f7a04dc4d3ull, 0x3818eedb4ac10d1bull, true } };
+    /* Both sides' rows, each from this test's own `pin:` printout after the 1.12.0 merge. Upstream
+     * 1.12.0 adds the row form (heads_only false, the default), whose pins it published; the head
+     * form's hashes move because our streamed ops (kv_store_streamed, kv_resolve) are declared in
+     * it. The row form's graph also carries those ops -- the MLP, indexer and store rows are shared
+     * -- so its hash is the merge's, not upstream's. */
+    const Case cases[] = { { 1, 0x8e12725b3ed3548dull, 0x68ffc03d2b640d51ull },
+                           { 8, 0xe4ba21765f690f70ull, 0x82ed1094dbf4b637ull },
+                           { 8, 0xf404ab12440b389full, 0x3818eedb4ac10d1bull, true } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
@@ -2018,6 +2023,193 @@ TEST(glm53_sizing_declares_with_the_vision_tower_match_the_real_graph) {
             CHECK(small.bufs[i].d.shape[0] <= full.bufs[i].d.shape[0]);
         }
     }
+}
+
+TEST(glm53_declaring_without_streamed_ops_ignores_the_flag) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 }, { "mtp.blk.45.ffn_down_exps", fp8 },
+               { "ffn_gate_up_exps", mx }, { "ffn_down_exps", mx },
+               { "ffn_gate_up_shexp", mx }, { "ffn_down_shexp", mx },
+               { "ffn_gate_up.weight", fp8 }, { "ffn_down.weight", fp8 } };
+    b.undeclared = { "kv_resolve", "kv_store_streamed" };
+    RadBuildCtx build{};
+    build.rank = 0;
+    build.world_size = 1;
+    build.max_tok = 512;
+    build.max_seqs = 2;
+    build.max_ctx = 4096;
+    build.max_spec = 0;
+    build.kv_resident_blocks = 32768;   /* the ring floor: 8 192 blocks. This fixture toggles the ops,
+                                         * not the ring; the undeclared list is the gate it tests. */
+    REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+    CHECK_EQ(count_op(b, "kv_resolve"), 0);
+    CHECK_EQ(count_op(b, "kv_store_streamed"), 0);
+    /* The base store is still there: the zeros are the gate, not a layer that never stores. */
+    CHECK(count_op(b, "kv_store") > 0);
+}
+
+TEST(glm53_streamed_decode_resolves_after_select_and_before_attention_with_the_entry_count) {
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 }, { "mtp.blk.45.ffn_down_exps", fp8 },
+               { "ffn_gate_up_exps", mx }, { "ffn_down_exps", mx },
+               { "ffn_gate_up_shexp", mx }, { "ffn_down_shexp", mx },
+               { "ffn_gate_up.weight", fp8 }, { "ffn_down.weight", fp8 } };
+    RadBuildCtx build{};
+    build.rank = 0;
+    build.world_size = 1;
+    build.max_tok = 512;
+    build.max_seqs = 2;
+    build.max_ctx = 4096;
+    build.max_spec = 3;                 /* so the drafter's layer 45 is the twelfth full layer */
+    build.kv_resident_blocks = 32768;   /* the ring floor, 8 192 blocks: above this fixture's spec-3
+                                         * raise of 2 x 4 x 513 = 4 104 blocks, so the engine raises
+                                         * nothing. The declared slots are the context's 2048 blocks
+                                         * either way, which is what the fake stream mirrors. */
+    REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+    const auto& m = *glm5next::models[0];
+    REQUIRE_EQ(m.latent, (rad_kvgroup)1);
+    REQUIRE_EQ(count_op(b, "kv_resolve"), 12);
+
+    /* A zeroed stream with the figures bring-up fixes: 4096 B a block (12 layers of 2 x 4 x
+     * 256 x bf16), a 2048-block mirror, and the ring the declaration states -- the context's
+     * 2048 blocks, because a 32 768-token ring is clamped to `blocks` for this 4096-token
+     * context. Only the latent group streams. */
+    const int64_t blocks = 2048, slots = 2048;
+    std::vector<uint8_t> host((size_t)blocks * 4096);
+    std::vector<int32_t> res(blocks), slot_block(slots), slot_state(slots * 2), ctl(16);
+    RadKVStream st{};
+    st.host = host.data();
+    st.res = res.data();
+    st.slot_block = slot_block.data();
+    st.slot_state = slot_state.data();
+    st.ctl = ctl.data();
+    st.block_bytes = 4096;
+    st.host_layer_stride = 4096 * blocks;
+    st.slots = slots;
+    st.host_bytes = (int64_t)host.size() * 12;
+
+    int32_t cu[] = { 0, 1, 2 }, positions[] = { 0, 1 }, ctxlens[] = { 1, 1 },
+            ids[] = { 7, 9 }, slots_map[] = { 0, 1 }, out[] = { 1 };
+    int32_t sidx[] = { 0, 0, 0, 1, 1, 1 }, ci[] = { 0 }, tables[64]{};
+    std::vector<RadKVGroupBatch> kv(b.kv_groups.size());
+    for (size_t i = 0; i < kv.size(); ++i) {
+        kv[i].group = (rad_kvgroup)i + 1;
+        kv[i].slot_mapping = slots_map;
+        kv[i].block_table = tables;
+        kv[i].block_table_pitch = 32;
+        kv[i].state_index = b.kv_groups[i].d.kind == RAD_KV_CONV ? ci : sidx;
+        kv[i].state_index_pitch = b.kv_groups[i].d.kind == RAD_KV_CONV ? 1 : 6;
+    }
+    kv[m.latent - 1].stream = &st;
+
+    RadBatch batch{};
+    batch.phase = RAD_PHASE_DECODE;
+    batch.n_tok = 2;
+    batch.n_seq = 2;
+    batch.token_ids = ids;
+    batch.positions = positions;
+    batch.cu_seqlens = cu;
+    batch.ctx_lens = ctxlens;
+    batch.kv = kv.data();
+    batch.n_kv_groups = (int)kv.size();
+    batch.n_out = 1;
+    batch.out_ids = out;
+    batch.max_ctx_len = 1;
+    batch.max_q_len = 1;
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.rank = 0;
+    ctx.world = 1;
+    ctx.batch = &batch;
+
+    auto resolve_count = [&] {
+        int n = 0;
+        for (const auto& issue : ctx.issues)
+            if (issue.op >= 1 && (size_t)issue.op <= b.ops.size() &&
+                b.ops[issue.op - 1].op == "kv_resolve")
+                ++n;
+        return n;
+    };
+    auto find_issue = [&](rad_op op) -> size_t {
+        for (size_t i = 0; i < ctx.issues.size(); ++i)
+            if (ctx.issues[i].op == op) return i;
+        return SIZE_MAX;
+    };
+    auto check_layer_order = [&](const glm5next::Layer& l) {
+        const size_t store = find_issue(l.mla.op_store_stream);
+        const size_t sel   = find_issue(l.index.cache.op_select);
+        const size_t res_i = find_issue(l.mla.op_resolve);
+        const size_t attn  = find_issue(l.mla.core.op_attn);
+        REQUIRE(store != SIZE_MAX);
+        REQUIRE(sel != SIZE_MAX);
+        REQUIRE(res_i != SIZE_MAX);
+        REQUIRE(attn != SIZE_MAX);
+        CHECK(store < sel);
+        CHECK(sel < res_i);
+        CHECK(res_i < attn);
+        /* §2: the count is `selected_count`, never the token count. */
+        CHECK_EQ(ctx.issues[res_i].opd[1].handle, m.aw.core.nsel);
+        CHECK(ctx.issues[res_i].opd[1].handle != m.aw.core.length);
+        CHECK_EQ(ctx.issues[res_i].n, (int64_t)2);
+    };
+
+    /* A decode pass: 11 trunk full layers resolve, and the draft layer does too. */
+    glm5next::step(&ctx, &batch);
+    CHECK(ctx.step_fail.empty());
+    CHECK_EQ(resolve_count(), 11);
+    for (const auto& l : m.layers)
+        if (l.full) check_layer_order(l);
+
+    ctx.issues.clear();
+    batch.draft_pass = 2;
+    glm5next::step(&ctx, &batch);
+    CHECK(ctx.step_fail.empty());
+    CHECK_EQ(resolve_count(), 1);
+    check_layer_order(m.draft);
+
+    /* A staged pass (prefill, or the stage view chosen for it) must not resolve: the selection
+     * keeps the block ids the identity stage addresses directly. */
+    ctx.issues.clear();
+    ctx.stages.clear();
+    ctx.stage_on = true;
+    batch.draft_pass = 0;
+    batch.phase = RAD_PHASE_PREFILL;
+    batch.n_tok = 4;
+    int32_t cu4[] = { 0, 2, 4 };
+    batch.cu_seqlens = cu4;
+    batch.max_q_len = 2;
+    glm5next::step(&ctx, &batch);
+    CHECK(ctx.step_fail.empty());
+    CHECK_EQ(resolve_count(), 0);
+    CHECK(!ctx.stages.empty());
 }
 
 RAD_TEST_MAIN()
