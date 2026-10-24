@@ -14,11 +14,47 @@ extern "C" {
 
 /* Bumped whenever anything a plugin compiles against changes shape: this header, rad_types.h,
  * rad_builder.h, rad_runtime.h, rad_device.h, rad_encoding.h, rad_quant.h, rad_sample.h or
- * rad_spechub.h. Every
- * kind of plugin reports it, and a plugin that does not report exactly this version is refused at
- * load with both versions printed. A new optional export (e.g. rad_plugin_reference) is not a
- * change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 27u
+ * rad_spechub.h. Every kind of plugin reports it, and a plugin that does not report exactly this
+ * version is refused at load with both versions printed. A new optional export (e.g.
+ * rad_plugin_reference) is not a
+ * change of shape: a plugin without it gets the default.
+ *
+ * 26: RadKVGroupBatch grows one trailing, zero-defaulted field (`stream`, a RadKVStream) so a
+ * plugin can see a streamed KV group's ring, residency map and host mirror, and RadBuildCtx grows
+ * `kv_resident_blocks` and `kv_stream_ok` (--kv-resident and the architecture's capability). Every
+ * earlier field keeps its offset, but the structs are larger, so out-of-tree plugins must be
+ * rebuilt against 26.
+ *
+ * 27: RadBuildCtx grows `cvec`, a rank's control-vector direction table (control vectors). Trailing
+ * and zero-defaulted as above, so a plugin built against 26 keeps every offset.
+ *
+ * 28: RadArchProbe grows two trailing, zero-defaulted fields that met in the same merge:
+ * `chain_pays` (the plugin measured its speculative step faster with chained launches) and
+ * `kv_stream_ok` (the architecture can move a KV group between host memory and a resident ring).
+ * Both are additions a 27 plugin never reads; a plugin that does set them must be built against
+ * 28, since 27's struct ends where these begin.
+ *
+ * 29: radiance 1.11.0's Unlimited-OCR and control-vector work meets KV streaming. RadBuildCtx
+ * grows `attn_prefill_fp8` (--attn-prefill-fp8, the prefill attention's products accepted in
+ * e4m3); it fills the four padding bytes ABI 28 already had after `kv_quant`, so no field moves.
+ * RadArchProbe grows `control_vector_ok` after ABI 28's `kv_stream_ok`: upstream 1.11.0 had it at
+ * the offset `kv_stream_ok` took in 28, so it moves to 80 and the struct grows, which is why this
+ * is a bump. Both trailing fields are zero-defaulted, but a plugin that sets either must be built
+ * against 29.
+ *
+ * 30: radiance 1.12.0 meets KV streaming. Upstream spent 27 on its own additions and this tree had
+ * already spent it, so the merge takes the next number for both: upstream's `RadBuildCtx` grows
+ * `tp_attn_rows`, `state_dtype` (--state-cache-dtype f16) and `draft_coupling`, and gains
+ * `rad_lane1_window_begin/end` and `rad_drafter_short_block`; `RadArchProbe` grows
+ * `tp_attn_rows_ok` and `state_f16_ok`; `RadAudioGenBatch` grows `prev_slot`/`prev_pos`/
+ * `prev_used` and the reference prompt's `n_ref`/`ref_samples`/`ref_audio`/`ref_cu`/`ref_cu_h`/
+ * `ref_frame`/`ref_frame_h`; `RadAudioGenDecl` grows `branches`, `input_special` and the
+ * `tmpl_ref`/`ref_*` reference template; and the plugin ABI gains `rad_spechub.h` (a whole new
+ * header) with the per-row `rad_kernel_reference` override. Every upstream field is trailing and
+ * zero-defaulted, and `RadKVStream` loses our never-read `scratch` (80 -> 72 bytes), so a plugin
+ * built against 26-29 keeps the offsets it reads only if it is rebuilt; the loss of a middle
+ * pointer in `RadKVStream` is why this is a bump even before upstream's additions. */
+#define RAD_ABI_VERSION 30u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:

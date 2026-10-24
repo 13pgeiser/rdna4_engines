@@ -291,6 +291,25 @@ static const RadOperandSpec oQkNormRopeGateKv[] = {
     { "slot_mapping", RAD_OPD_IN,     0 },
     { "kv_cache",     RAD_OPD_INOUT,  0 },
 };
+/* The prologue with a streamed group's store folded in: the same parameters and operands, then the
+ * residency map and the layer's host mirror, which the store needs and the ring does not. The cache
+ * is E4M3 only (streaming ships for the fp8 QSA family). */
+static const RadOperandSpec oQkNormRopeGateKvStreamed[] = {
+    { "q_gate",       RAD_OPD_IN,     1 },
+    { "k",            RAD_OPD_IN,     0 },
+    { "cos_sin",      RAD_OPD_IN,     0 },
+    { "positions",    RAD_OPD_IN,     0 },
+    { "q_w",          RAD_OPD_WEIGHT, 1 },
+    { "k_w",          RAD_OPD_WEIGHT, 0 },
+    { "q_out",        RAD_OPD_OUT,    1 },
+    { "k_out",        RAD_OPD_OUT,    0 },
+    { "gate_out",     RAD_OPD_OUT,    1 },
+    { "v",            RAD_OPD_IN,     0 },
+    { "slot_mapping", RAD_OPD_IN,     0 },
+    { "kv_cache",     RAD_OPD_INOUT,  0 },
+    { "res",          RAD_OPD_IN,     0 },
+    { "host",         RAD_OPD_INOUT,  0 },
+};
 /* Builds the cos/sin table the fused prologue reads, each position at its own row of a
  * [max_ctx, rot] plane. `rot`, `theta` and `scale` are spelled as `rope`'s, since both must compute
  * the same angles. */
@@ -1332,6 +1351,32 @@ static const RadOperandSpec oQsaSelect[] = {
     { "seqused", RAD_OPD_OUT, 0 },
 };
 
+/* `kv_resolve`, a new op whose schema this plugin fixes: the residency map of a streamed KV
+ * group, between `qsa_select` and the attention. `sel` is block ids in and ring slots out;
+ * `res`, `slot_block`, `slot_state` and `ctl` are the state it keeps between calls, so its row is
+ * not concurrent. The miss list is the row's scratch, not an operand: nothing outside the launch
+ * reads it. `block_bytes` is a byte extent, not `block_size`: the op only moves bytes, and a
+ * `block_size` key would make it the KV group's consumer, taking the block size the resolved
+ * attention kernel must read. */
+static const RadParamSpec pKvResolve[] = {
+    { "M",           RAD_P_INT, RAD_REQUIRED },
+    { "blocks",      RAD_P_INT, RAD_REQUIRED },
+    { "slots",       RAD_P_INT, RAD_REQUIRED },
+    { "sel_pitch",   RAD_P_INT, RAD_REQUIRED },
+    { "block_bytes", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oKvResolve[] = {
+    { "sel",        RAD_OPD_INOUT, 0 },
+    { "nsel",       RAD_OPD_IN,    0 },
+    { "res",        RAD_OPD_INOUT, 0 },
+    { "slot_block", RAD_OPD_INOUT, 0 },
+    { "slot_state", RAD_OPD_INOUT, 0 },
+    { "ctl",        RAD_OPD_INOUT, 0 },
+    { "host",       RAD_OPD_IN,    0 },
+    /* The group's ring, the same RAD_KV operand `attn_paged` and `kv_store` take. */
+    { "kv_cache",   RAD_OPD_INOUT, 0 },
+};
+
 /* `qsa_score`, a new op whose schema this plugin fixes: the indexer's score of each compressed
  * block of key history for one query.
  *
@@ -2040,6 +2085,27 @@ static const RadOperandSpec oKvStore[] = {
     { "v",            RAD_OPD_IN,    0 },
     { "slot_mapping", RAD_OPD_IN,    0 },
     { "kv_cache",     RAD_OPD_INOUT, 0 },
+};
+/* `kv_store` for a streamed group. `host` is the group's authoritative mirror and is always
+ * written, `res` is the residency map that says whether the block is in the ring (the ring slot is
+ * written only when `res[block] >= 0`). The parameters are kv_store's: the layout and the E4M3
+ * conversion are the same, only the destination set differs. */
+static const RadParamSpec pKvStoreStreamed[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    { "block_size", RAD_P_INT, RAD_REQUIRED },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
+    P_F64O("k_scale"),
+    P_F64O("v_scale"),
+};
+static const RadOperandSpec oKvStoreStreamed[] = {
+    { "k",            RAD_OPD_IN,    0 },
+    { "v",            RAD_OPD_IN,    0 },
+    { "slot_mapping", RAD_OPD_IN,    0 },
+    { "kv_cache",     RAD_OPD_INOUT, 0 },
+    { "res",          RAD_OPD_IN,    0 },
+    { "host",         RAD_OPD_INOUT, 0 },
 };
 
 static const RadParamSpec pEmbed[] = {
@@ -2913,6 +2979,13 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("kv_store", pKvStore, oKvStore,
            "scatter k and v into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim] -- K at "
            "[.., d] and V at [.., head_dim + d]. A negative slot stores nothing."),
+    SCHEMA("kv_store_streamed", pKvStoreStreamed, oKvStoreStreamed,
+           "kv_store for a streamed group: the token's k and v into the group's host mirror at the "
+           "BLOCK's identity row always, and into kv_cache[res[block]] only when the residency map "
+           "says the block is resident. The mirror is the truth and a block absent from the ring is "
+           "copied in whole by kv_resolve, so the caller orders store, then resolve, then "
+           "attention. A negative slot stores nothing; a map entry outside [-1, slots) is treated "
+           "as not resident, which libref refuses as a state fault."),
     SCHEMA("embed_lookup", pEmbedM, oEmbed,
            "the embedding gather. A negative token id writes a zero row, and so does one outside "
            "[vocab_offset, vocab_offset + n_vocab) -- which is what makes the table shardable "
@@ -3046,6 +3119,13 @@ static const RadOpSchema kSchemas[] = {
            "qk_norm_rope_gate followed by kv_store, in one launch: each k head's block also writes "
            "its rotated k and its v into the paged cache at the token's slot. The `k` kv_store "
            "reads is `k_out`, so the tail adds only `v`, `slot_mapping` and `kv_cache`."),
+    SCHEMA("qk_norm_rope_gate_kv_store_streamed", pQkNormRopeGateKv, oQkNormRopeGateKvStreamed,
+           "qk_norm_rope_gate followed by kv_store_streamed, in one launch: the token's rotated k "
+           "and its v into the group's host mirror at the BLOCK's identity row always, and into "
+           "kv_cache[res[block]] only when the residency map says the block is resident. The "
+           "mirror is the truth and a block absent from the ring is copied in whole by kv_resolve, "
+           "so the caller keeps store, then resolve, then attention. Replaces the prologue plus a "
+           "separate streamed store, one launch a layer. E4M3 caches only."),
     SCHEMA("rope_table", pRopeTable, oRopeTable,
            "the cos/sin `qk_norm_rope_gate` reads, written at each position's OWN row of a "
            "[max_ctx, rot] plane: rot values a row, cos for the first half and sin for the second. "
@@ -3344,6 +3424,20 @@ static const RadOpSchema kSchemas[] = {
            "nowhere else, so the effective query position is (nsel-1)*ratio + pos%ratio. Ties "
            "break to the LOWER block index through a prefix count, never through atomic order. "
            "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0)."),
+    SCHEMA("kv_resolve", pKvResolve, oKvResolve,
+           "make every block the selections name resident and rewrite them as ring slots: bump "
+           "the epoch, take a hit or make a single claim (-1 -> -2) per distinct block, compact "
+           "the claimed blocks in ASCENDING block id, take a free slot before any resident one and "
+           "otherwise one CLOCK second-chance victim per miss from ctl[1] -- a warm slot (two-bit "
+           "heat counter) is halved and passed, a cold one is taken, and a slot this call already "
+           "uses is never taken -- re-point both maps, copy "
+           "each missed block from the host mirror into its slot, then replace every entry below "
+           "nsel with the slot holding its block. nsel and the attention's length are unchanged. "
+           "The ring must hold the call's distinct blocks: a call that cannot place every miss "
+           "latches ctl[3], reverts the unplaced claims to -1 and leaves those entries naming "
+           "blocks, never a fabricated slot, so the caller must refuse the step. The maps, the "
+           "epoch, the hand and the heat counters keep state across launches, so the row is not "
+           "concurrent; the miss list is the row's scratch (2 * slots i32), not an operand."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "
@@ -4609,6 +4703,12 @@ static const RadConstraint cQsaTailStore[] = {
 /* No dtype: every operand is f32 or i32. */
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1), C_GE("ratio", 1) };
 
+/* The two byte planes are read by pitch, so only positivity is fixed: any block extent and any
+ * ring depth the device can address. */
+static const RadConstraint cKvResolve[] = {
+    C_GE("blocks", 1), C_GE("slots", 1), C_GE("sel_pitch", 1), C_GE("block_bytes", 1),
+};
+
 /* A lane owns n/32 dims of both operands, so n is a wave multiple, at most eight of them. The
  * head bound is the register file: the query stays resident across the block loop. */
 static const RadConstraint cQsaScore[] = {
@@ -4784,6 +4884,14 @@ static const RadConstraint cQkNormRopeGate[] = {
 static const RadConstraint cQkNormRopeGateKv[] = {
     C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
     C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cQkNormRopeGateKvStreamed[] = {
+    C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
+    C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cQkNormRopeGateKvStreamedBf16[] = {
+    C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
+    C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
 };
 static const RadConstraint cQkNormRopeGateKvFp8v4[] = {
     C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
@@ -5135,6 +5243,15 @@ static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("width"
                                              C_LE("width", 8) };
 static const RadConstraint cKvStore[]   = { C_GE("block_size", 1), C_IN("kv_dtype", "bf16") };
 static const RadConstraint cKvStoreFp8[] = { C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3") };
+/* The streamed store converts as the fp8 row does and requires the same divisible head. */
+static const RadConstraint cKvStoreStreamedFp8[] = { C_GE("block_size", 1),
+                                                     C_IN("kv_dtype", "fp8_e4m3"),
+                                                     C_DIV("head_dim", 4) };
+/* The same store into a bf16 cache: the mirror and the ring are the value itself, as kv_store_bf16
+ * writes it. Head_dim needs only the four-column grouping. */
+static const RadConstraint cKvStoreStreamedBf16[] = { C_GE("block_size", 1),
+                                                      C_IN("kv_dtype", "bf16"),
+                                                      C_DIV("head_dim", 4) };
 static const RadConstraint cKvStoreFp8v4[] = { C_GE("block_size", 1), C_DIV("head_dim", 32),
                                                C_IN("kv_dtype", "fp8_v4") };
 static const RadConstraint cKvStoreK6v4[] = { C_GE("block_size", 1), C_DIV("head_dim", 32),
@@ -5841,6 +5958,31 @@ static const RadKernelInfo kKernels[] = {
   ROW(cKvStoreK6v4), NOTUNE,
   nullptr, nullptr, r4d_rad_kv_store_k6v4, nullptr, nullptr, nullptr,
   nullptr },
+
+/* The store of a streamed KV group: the host mirror always, the ring slot when resident. One
+ * workgroup a token, two destinations; the mirror's row pitch is the block's, so a token's bytes
+ * land at the same offsets in both planes. */
+{ "kv_store_streamed_fp8", "kv_store_streamed", "attn",
+  "scatter k and v into the host mirror always and into the ring slot the residency map names",
+  "cache exactly [slots, kv_heads, block_size, 2*head_dim], mirror [blocks, the same row pitch]; "
+  "head_dim a multiple of 4; a negative slot stores nothing",
+  "bf16 k / v, E4M3 mirror and ring, i32 slot mapping and residency map, scalar descales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvStoreStreamedFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_store_streamed, nullptr, nullptr, nullptr,
+  r4d_shape_kv_store_streamed },
+
+/* The same store into a bf16 cache: the mirror and the ring hold the values themselves, as
+ * kv_store_bf16 writes them, and every plane offset is two bytes wide. */
+{ "kv_store_streamed_bf16", "kv_store_streamed", "attn",
+  "scatter k and v into the host mirror always and into the ring slot the residency map names",
+  "cache exactly [slots, kv_heads, block_size, 2*head_dim], mirror [blocks, the same row pitch as "
+  "bytes]; head_dim a multiple of 4; a negative slot stores nothing",
+  "bf16 k / v, bf16 mirror and ring, i32 slot mapping and residency map",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvStoreStreamedBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_store_streamed, nullptr, nullptr, nullptr,
+  r4d_shape_kv_store_streamed },
 
 { "logits_gemm_bf16", "logits_gemm", "vocab",
   "the lm_head projection: C[M, n_vocab] f32 = x[M, n_embd] @ lm_head[n_vocab, n_embd]^T",
@@ -8018,6 +8160,21 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,
   r4d_shape_qsa_select },
 
+/* The residency map of a streamed KV group. One workgroup: the CLOCK hand is serial state, and the
+ * phases are barriers over the entries, the block-id space and the ring. The copy is the same
+ * launch, so one step is one dispatch rather than one per claim. */
+{ "kv_resolve_i32", "kv_resolve", "attn",
+  "turn selected KV block ids into ring slots, evict by CLOCK and copy misses in from the host",
+  "any block count, ring depth and block byte extent; the mirror and the ring are read by byte "
+  "pitch, so every cache layout is the same launch",
+  "i32 selection and residency maps, u8 host mirror, the group's KV cache; the selection and both "
+  "maps are rewritten in place. A call that needs more distinct blocks than slots latches "
+  "ctl[3] and leaves those entries naming blocks, never a fabricated slot",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvResolve), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_resolve, r4d_rad_kv_resolve_scratch, nullptr, nullptr,
+  r4d_shape_kv_resolve },
+
 /* The indexer's score. One workgroup per query, one wave per block: a lane owns n/32 consecutive
  * dims of the query heads and the block key, so a head's dot product is one wave reduction and the
  * block key is read once for all heads (the head loop is inside the block loop). */
@@ -8490,6 +8647,35 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cQkNormRopeGateKv), NOTUNE,
   nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store, nullptr, nullptr, nullptr,
   r4d_shape_qk_norm_rope_gate_kv_store, nullptr, r4d_fuse_qk_norm_rope_gate_kv_store },
+
+/* The prologue and the STREAMED cache store in one launch: the mirror for every token, the ring
+ * only where the residency map says the block is resident. The operands are the pair's, plus the
+ * map and the mirror. */
+{ "qk_norm_rope_gate_kv_store_streamed_fp8", "qk_norm_rope_gate_kv_store_streamed", "attn",
+  "qk_norm_rope_gate, and kv_store_streamed (host mirror always, resident ring slot too) from the "
+  "same launch",
+  "qk_norm_rope_gate's shapes; cache exactly [slots, kv_heads, block_size, 2*head_dim], mirror "
+  "[blocks, the same row pitch], one slot a row; a negative slot stores nothing",
+  "bf16 in and out, E4M3 mirror and ring, i32 slot mapping and residency map, scalar descales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkNormRopeGateKvStreamed), NOTUNE,
+  nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store_streamed, nullptr, nullptr, nullptr,
+  r4d_shape_qk_norm_rope_gate_kv_store_streamed, nullptr,
+  r4d_fuse_qk_norm_rope_gate_kv_store_streamed },
+
+/* The same fold into a bf16 streamed group: the default `--kv-cache-dtype`, where both planes hold
+ * the rotated k and v themselves, as kv_store_streamed_bf16 writes them. */
+{ "qk_norm_rope_gate_kv_store_streamed_bf16", "qk_norm_rope_gate_kv_store_streamed", "attn",
+  "qk_norm_rope_gate, and kv_store_streamed (host mirror always, resident ring slot too) from the "
+  "same launch",
+  "qk_norm_rope_gate's shapes; cache exactly [slots, kv_heads, block_size, 2*head_dim], mirror "
+  "[blocks, the same row pitch as bytes], one slot a row; a negative slot stores nothing",
+  "bf16 in and out, bf16 mirror and ring, i32 slot mapping and residency map",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkNormRopeGateKvStreamedBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store_streamed, nullptr, nullptr, nullptr,
+  r4d_shape_qk_norm_rope_gate_kv_store_streamed, nullptr,
+  r4d_fuse_qk_norm_rope_gate_kv_store_streamed },
 
 /* The fold into an fp8_v4 cache: E4M3 K, int4 V in groups of 32 (a wave) with f16 scales. */
 { "qk_norm_rope_gate_kv_store_fp8v4", "qk_norm_rope_gate_kv_store", "attn",
@@ -9533,6 +9719,8 @@ extern "C" int rad_kernel_concurrent(int i) {
     if (k->family && std::strcmp(k->family, "ar") == 0) return 0;
     static const char* const kStateful[] = {
         "hc_", "mtp_enter", "ar_", "gemm_w4a8_tiled", "gemm_w8a8_tiled", "lora_",
+        /* The residency map's epoch, hand, heat counters and counters live across launches. */
+        "kv_resolve",
     };
     for (const char* p : kStateful)
         if (std::strncmp(k->name, p, std::strlen(p)) == 0) return 0;

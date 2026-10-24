@@ -50,10 +50,18 @@ struct QkKvStore {
   int   v_pitch, block_size, n_blocks;
   float k_inv, v_inv;
   int   row;   /* fp8_v4 / k6_v4: a token's bytes in a page, 25 or 22 * HD / 16 */
+  /* QK_KV_STREAMED only: the group's host mirror and per-layer residency map, as
+   * kv_store_streamed takes them (libr4d/r4d_model_bf16.hip). `blocks` is the mirror's block
+   * count (the id space) while `n_blocks` stays the ring depth. */
+  const int32_t*        res;
+  void*                 host;
+  int                   blocks;
 };
 
-/* The cache forms KV selects. */
-enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4 = 4 };
+/* The cache forms KV selects. The two STREAMED forms are the same store with two destination
+ * planes: E4M3 (the fp8 QSA family) and bf16 (the default cache dtype). */
+enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4 = 4,
+       QK_KV_STREAMED = 5, QK_KV_STREAMED_BF16 = 6 };
 
 /* KV folds kv_store in: a k head's block, holding the token's rotated k one element per lane, also
  * writes that element and the head's v element into the cache at the token's slot, as E4M3 with
@@ -151,7 +159,56 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
   if constexpr (KV != QK_KV_NONE) {
     if (isk && t < HD) {
       const int32_t sl = kvs.slot[tok];
-      if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.n_blocks) {
+      /* A streamed group's cache is the ring and its truth is the host mirror: the token goes to
+       * the mirror's block row ALWAYS and to the ring slot only where the residency map says the
+       * block is resident, exactly as kv_store_streamed writes it (libref/ref_attn.cpp states why
+       * the test belongs in the writer). The block id bounds the mirror, the map bounds the ring,
+       * and a slot names a ring block only through `res`. */
+      if constexpr (KV == QK_KV_STREAMED || KV == QK_KV_STREAMED_BF16) {
+        if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.blocks) {
+          const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
+          const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
+          /* One element of each plane. The mirror and the ring are byte planes of the same paged
+           * layout and `block_bytes` is their pitch, so a bf16 element is two bytes at twice the
+           * fp8 offset. */
+          const size_t EB = KV == QK_KV_STREAMED_BF16 ? 2 : 1;
+          const size_t rowb = (size_t)(2 * HD) * EB;
+          const size_t at = ((size_t)blk * nkv * kvs.block_size + off) * rowb +
+                            (size_t)lh * kvs.block_size * rowb;
+          const __hip_bfloat16 kb = __float2bfloat16(res);
+          const __hip_bfloat16 vb = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
+          const int32_t rs = kvs.res[blk];
+          unsigned char* const m = (unsigned char*)kvs.host + at;
+          unsigned char* const c =
+              (rs >= 0 && (uint32_t)rs < (uint32_t)kvs.n_blocks)
+                  ? (unsigned char*)kvs.cache +
+                        (((size_t)rs * nkv * kvs.block_size + off) * rowb +
+                         (size_t)lh * kvs.block_size * rowb)
+                  : nullptr;
+          if constexpr (KV == QK_KV_STREAMED_BF16) {
+            /* kv_store_bf16 writes the values themselves: no descales. */
+            *(__hip_bfloat16*)(m + EB * t)      = kb;
+            *(__hip_bfloat16*)(m + EB * (HD + t)) = vb;
+            if (c) {
+              *(__hip_bfloat16*)(c + EB * t)      = kb;
+              *(__hip_bfloat16*)(c + EB * (HD + t)) = vb;
+            }
+          } else {
+            const float kf = __bfloat162float(kb) * kvs.k_inv;
+            const float vf = __bfloat162float(vb) * kvs.v_inv;
+            const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
+                                                           0, false);
+            const int pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf, -448.0f), 448.0f), 0.0f,
+                                                           0, false);
+            m[t]      = (unsigned char)(pk & 0xFF);
+            m[HD + t] = (unsigned char)(pv & 0xFF);
+            if (c) {
+              c[t]      = (unsigned char)(pk & 0xFF);
+              c[HD + t] = (unsigned char)(pv & 0xFF);
+            }
+          }
+        }
+      } else if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.n_blocks) {
         const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
         const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
         const size_t rowb = (KV == QK_KV_F8V4 || KV == QK_KV_K6V4) ? (size_t)kvs.row : (size_t)(2 * HD);
@@ -261,7 +318,7 @@ __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
 // The two launches, as the plugin ABI's RadLaunchFn. See the note at the head of
 // r4d_quant_act_i8.hip on the argument list and status return.
 enum { QK_QGATE = 0, QK_K, QK_COSSIN, QK_POS, QK_WQ, QK_WK, QK_QOUT, QK_KOUT, QK_GOUT,
-       QK_V, QK_SLOT, QK_CACHE };
+       QK_V, QK_SLOT, QK_CACHE, QK_RES, QK_HOST };
 
 /* The body of both forms; KVF is the kv_store fold and `kvs` its cache, already checked. */
 template <int KVF>
@@ -384,6 +441,76 @@ extern "C" int r4d_rad_qk_norm_rope_gate_kv_store(const RadArgs* args, RadStream
   kvs.v_inv      = 1.0f / (float)vs;
   return kv->dtype == RAD_BF16 ? qk_body<QK_KV_BF16>(args, stream, kvs)
                                : qk_body<QK_KV_FP8>(args, stream, kvs);
+}
+
+/* The prologue with the STREAMED store folded in: a streamed group's cache is a ring of
+ * `n_blocks` slots over a `blocks`-wide block-id space, and its truth is the pinned host mirror.
+ * Each token's rotated k and its v go to the mirror's block row ALWAYS and to `kv_cache[res[block]]`
+ * only when the residency map calls the block resident (docs/OPS.md "kv_store_streamed"), so this
+ * row replaces `qk_norm_rope_gate` + `kv_store_streamed` with one launch a layer and one chain
+ * between store, resolve and attention.
+ *
+ * The bytes are the pair's exactly: `k_out`'s bf16 value is the one the E4M3 conversion reads, and
+ * both planes are the same dense rows of the same paged layout, so the folded write and the split
+ * write are the same arithmetic. The cache is E4M3 (the fp8 QSA family) or bf16 (the default
+ * `--kv-cache-dtype`, where both planes are the value itself, as kv_store_bf16 writes it). */
+extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args, RadStream stream) {
+  const RadTensor* k   = r4d_opt(args, QK_K);
+  const RadTensor* qg  = r4d_opt(args, QK_QGATE);
+  const RadTensor* v   = r4d_opt(args, QK_V);
+  const RadTensor* sm  = r4d_opt(args, QK_SLOT);
+  const RadTensor* kv  = r4d_opt(args, QK_CACHE);
+  const RadTensor* res = r4d_opt(args, QK_RES);
+  const RadTensor* ho  = r4d_opt(args, QK_HOST);
+  if (!k || !v || !sm || !kv || !res || !ho) return R4D_NO(RAD_E_INVAL);
+  const char* kvd = r4d_gets(args, "kv_dtype");
+  const uint32_t want = kvd ? rad_dtype_parse(kvd) : (uint32_t)RAD_DT_INVALID;
+  if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != want ||
+      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16) || res->dtype != RAD_I32 ||
+      ho->dtype != RAD_U8)
+    return R4D_NO(RAD_E_DTYPE);
+  if (!r4d_contig(sm) || !r4d_contig(kv) || !r4d_contig(res) || !r4d_contig(ho) ||
+      ho->rank != 2)
+    return R4D_NO(RAD_E_STRIDE);
+
+  const long long hd  = r4d_geti_or(args, "head_dim", 0);
+  const long long nkv = r4d_geti_or(args, "n_head_kv", 0);
+  const long long bs  = r4d_geti_or(args, "block_size", 0);
+  if (hd <= 0 || nkv <= 0 || bs <= 0) return R4D_NO(RAD_E_SHAPE);
+  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
+    return R4D_NO(RAD_E_SHAPE);
+  const long long M = qg ? qg->shape[0] : k->shape[0];
+  long long Mv = 0;
+  const long long v_ld = r4d_rows_pitch(v, nkv * hd, &Mv);
+  if (v_ld < 0) return R4D_NO(RAD_E_STRIDE);
+  if (Mv < M || r4d_numel(sm) != M) return R4D_NO(RAD_E_SHAPE);
+
+  /* One block of one layer: the mirror's row pitch and the ring's slot pitch are the same bytes,
+   * so the store addresses both with one row arithmetic. */
+  const long long row    = nkv * bs * 2 * hd * (kv->dtype == RAD_BF16 ? 2 : 1);
+  const long long blocks = ho->shape[0], slots = kv->shape[0];
+  if (blocks <= 0 || slots <= 0 || row <= 0) return R4D_NO(RAD_E_SHAPE);
+  if (ho->shape[1] != row || ho->stride[0] != row) return R4D_NO(RAD_E_STRIDE);
+  if (r4d_numel(res) < blocks) return R4D_NO(RAD_E_SHAPE);
+
+  const double ks = r4d_getf(args, "k_scale", 1.0);
+  const double vs = r4d_getf(args, "v_scale", 1.0);
+  if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
+
+  QkKvStore kvs{};
+  kvs.v          = (const __hip_bfloat16*)r4d_p(v);
+  kvs.slot       = (const int32_t*)r4d_p(sm);
+  kvs.cache      = r4d_wp(kv);
+  kvs.v_pitch    = (int)v_ld;
+  kvs.block_size = (int)bs;
+  kvs.n_blocks   = (int)slots;
+  kvs.k_inv      = 1.0f / (float)ks;
+  kvs.v_inv      = 1.0f / (float)vs;
+  kvs.res        = (const int32_t*)r4d_p(res);
+  kvs.host       = r4d_wp(ho);
+  kvs.blocks     = (int)blocks;
+  return kv->dtype == RAD_BF16 ? qk_body<QK_KV_STREAMED_BF16>(args, stream, kvs)
+                               : qk_body<QK_KV_STREAMED>(args, stream, kvs);
 }
 
 /* The fp8_v4 and k6_v4 forms: the same operands, the cache [n_blocks, kv_heads, block_size,

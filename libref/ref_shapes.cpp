@@ -1455,6 +1455,36 @@ int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("kv_store", operand, out);
 }
 
+/* The streamed store. Same geometry as `kv_store`, with the mirror and the residency map beside
+ * the ring: the mirror is one block a row of the same byte pitch.
+ *
+ * The described call touches ONE block, resident in ring slot 0. The draw vocabulary cannot express
+ * an injective residency map (block -> slot is a permutation, and a draw is a free choice per
+ * entry), and two blocks drawing one slot would make two tokens write the same ring byte -- a race
+ * the parallel rerun rightly reports. So the generated case exercises the conversion, the positions
+ * within a block, the mirror write and the resident ring write; a partly resident map and the
+ * mirror-only step are built by hand in tests/ref_test.cpp and libavx's hand cases. `M <= block_size`
+ * keeps every token on its own position of that one block. */
+int ref_kv_store_streamed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t kvh = gi(p, n_p, "n_head_kv", 0);
+    const int64_t bs  = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
+    const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
+    const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_F8E4M3 : kv;
+    const int64_t row = kvh * bs * 2 * hd * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
+
+    Opd o;
+    o.t((uint32_t)RAD_BF16, { M, kvh, hd });                       /* k */
+    o.t((uint32_t)RAD_BF16, { M, kvh, hd });                       /* v */
+    o.t_idx({ M }, bs, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);        /* slot_mapping, one block */
+    o.t(KV, { 1, kvh, bs, 2 * hd });                               /* kv_cache, INOUT */
+    o.t_idx({ 1 }, 1, -1, 0);                                      /* res -- resident in slot 0 */
+    o.t((uint32_t)RAD_U8, { 1, row });                             /* host, INOUT */
+    return o.finish("kv_store_streamed", operand, out);
+}
+
 int ref_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -1642,6 +1672,32 @@ int ref_qsa_work_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t((uint32_t)RAD_I32, { work });                             /* bpos */
     o.t((uint32_t)RAD_I32, { S });                                /* nc */
     return o.finish("qsa_work", operand, out);
+}
+
+/* The residency map and the two byte planes. `sel` is described as block ids, which is what
+ * `qsa_select` leaves there; past `nsel` it is -1 padding the op does not touch.
+ *
+ * A described residency map can only be an all-resident one: the description vocabulary draws an
+ * index in [0, idx_max) or a non-negative constant, and a cold entry is -1 (`res[b] == -1`, an
+ * absent block), which no draw expresses. So a tool that calls this op cold sees every block
+ * resident, which exercises the epoch, the rewrite and the bookkeeping but never a miss, an
+ * eviction or a copy. The service-shaped cases (a partly resident pool, a second chance, an
+ * eviction, an overflow) are built by hand in tests/ref_test.cpp and in libavx's hand cases. */
+int ref_kv_resolve_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t slots = gi(p, n_p, "slots", 0), pitch = gi(p, n_p, "sel_pitch", 0);
+    const int64_t bbytes = gi(p, n_p, "block_bytes", 0);
+    if (M <= 0 || blocks <= 0 || slots <= 0 || pitch <= 0 || bbytes <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M, pitch }, blocks, -1, 0);         /* sel -- one block id an entry */
+    o.t_idx({ M }, pitch + 1, -1, 0);             /* nsel -- 0 .. sel_pitch */
+    o.t_idx({ blocks }, slots, -1, 0);            /* res -- every block resident, no -2 */
+    o.t_idx({ slots }, blocks, -1, 0);            /* slot_block -- the reverse map */
+    o.t_idx({ slots, 2 }, 2, 0, 0);               /* slot_state -- cold: epoch 0, no reference */
+    o.t_idx({ 16 }, 2, 0, 0);                     /* ctl -- cold: epoch 0, hand 0 */
+    o.t((uint32_t)RAD_U8, { blocks, bbytes });    /* host -- the layer's mirror, a block a row */
+    o.t((uint32_t)RAD_U8, { slots, bbytes });     /* kv_cache -- the layer's ring, a block a row */
+    return o.finish("kv_resolve", operand, out);
 }
 
 /* `delta` is described as the whole [T, 2 * taps * NG] coefficient projection, of which the op

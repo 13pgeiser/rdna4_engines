@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include "ctx.h"
 #include "device/device.h"
+#include "kvstream/bind.h"
 #include "wtab.h"
 
 #include <cstring>
@@ -802,7 +803,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             const int64_t layer = (o.offset >= 0 && (size_t)o.offset < b.layer_slot.size())
                                       ? b.layer_slot[(size_t)o.offset]
                                       : -1;
-            const int64_t off   = layer * b.layer_stride;
+            const int64_t off   = kv_binding_offset(b, layer);
             if (layer < 0 || (b.bytes && off + b.layer_stride > b.bytes))
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d asks KV group %u for layer %lld, which is "
@@ -1044,6 +1045,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             g_iss_lau_p = g_iss_lau;
         }
     } else {
+        /* The launch alone, split from the band scan and operand resolution `own` covers above. */
         s = ip.launch(la, cur_stream());
     }
     if (hold) {
@@ -1251,6 +1253,17 @@ int rad_step_fail(RadCtx* c, const char* what) {
 }
 
 const RadBatch* rad_batch(RadCtx* c)      { return c ? static_cast<rad::Ctx*>(c)->batch() : nullptr; }
+
+int64_t rad::Ctx::kv_layer_index(rad_kvgroup g, int layer) const {
+    if (g >= kv_.size() || !kv_[g].base || layer < 0) return -1;
+    const std::vector<int32_t>& ls = kv_[g].layer_slot;
+    if ((size_t)layer >= ls.size()) return -1;
+    return ls[(size_t)layer];
+}
+
+int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
+    return c ? (int)static_cast<rad::Ctx*>(c)->kv_layer_index(group, layer) : -1;
+}
 int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->rank() : 0; }
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }

@@ -2668,9 +2668,10 @@ int64_t a_gate_room(RadStream rs) {
 
 /* Waits for the mark, then for the card's link gate if a collective has ever held it (under TP
  * the all-reduce shares the link and the step waits on it, not on these copies), copies, writes
- * `done`, then the list's number. */
+ * `done`, then the list's number. RAD_XP_NO_YIELD skips the gate: a list the compute stream waits on
+ * cannot outlast a hold whose release is behind that wait (core/kvstream/stage.cpp). */
 int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
-              uint32_t* done, uint32_t done_val) {
+              uint32_t* done, uint32_t done_val, unsigned flags) {
     DmaQueue* dq = xp_queue(ord);
     if (!dq) return RAD_E_UNSUPPORTED;
     Sig* in = (Sig*)mark;
@@ -2684,7 +2685,8 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
                                    10u /* interval */ | (0xfffu << 16) /* retry forever */ };
         rc = dma_put(dq, poll, 6);
     }
-    if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle) {
+    if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle &&
+        !(flags & RAD_XP_NO_YIELD)) {
         const uint64_t ga = (uint64_t)lane->gate.handle + offsetof(amd_signal_t, value);
         const uint32_t gate[6] = { kSdmaPoll | (3u << 28) /* equal */ | (1u << 31) /* memory */,
                                    (uint32_t)ga, (uint32_t)(ga >> 32), 0u, 1u /* the low bit */,
@@ -2717,6 +2719,34 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
     }
     dma_kick(dq);
     return rc;
+}
+
+/* An event the DMA engine completes (rad_event_dma): a fresh completion word for the event, which
+ * a rad_xp_list writes 0 to as its `done` once its bytes have landed, so a stream that waits on the
+ * event stops until the copy is done.
+ *
+ * The word comes back at 0 and the *caller* arms it with a write of 1 on the stream, because the arm
+ * must be ordered: a host store here would land ahead of a wait still queued for the group's previous
+ * copy (which would then block on this 1 and never see its 0), and an event record would not do
+ * either -- a record completes by decrementing its signal to 0, which is the value the wait is
+ * looking for. A fresh signal each time keeps two uses of one word from overlapping at all. */
+int a_event_dma(RadEvent re, RadStream rs, uint32_t** word) {
+    if (!word) { device_set_error("rad_event_dma: null word"); return RAD_E_INVAL; }
+    if (capturing()) {
+        device_set_error("rad_event_dma: a tape cannot record a DMA list; the caller must re-run "
+                         "this call with the tape paused");
+        return RAD_E_STATE;
+    }
+    Event* e = ev_of(re);
+    Stream* s = ours(rs);
+    if (!e || !s) { device_set_error("rad_event_dma: null or foreign argument"); return RAD_E_INVAL; }
+    Sig* g = sig_get(e->host);
+    if (!g) { device_set_error("rad_event_dma: no signal could be made"); return RAD_E_DEVICE; }
+    hsa_signal_silent_store_relaxed(g->h, 0);
+    g->agent = s->agent;
+    record_adopt(e, g);
+    *word = (uint32_t*)(uintptr_t)sig_value_addr(g);
+    return RAD_OK;
 }
 
 int64_t a_xp_behind(int ord) {
@@ -3376,9 +3406,17 @@ void* pin_pieces(int64_t bytes) {
     char* const p = (char*)at;
 
     prefer_numa_node(p, len, current_card_numa_node());
+    /* RADIANCE_NO_HUGE_PAGES asks for small pages, before the pin faults them in: the KV mirror's
+     * scattered 2 KiB reads are the case page size is supposed to matter for, and this is how that
+     * is measured rather than assumed (core/kvstream/mirror.cpp). Not a supported mode. */
+    const bool small_pages = std::getenv("RADIANCE_NO_HUGE_PAGES") != nullptr;
     if (len >= ((int64_t)2 << 20)) {
-        ::madvise(p, (size_t)len, MADV_HUGEPAGE);
-        warn_if_no_huge_pages();
+        if (small_pages) {
+            ::madvise(p, (size_t)len, MADV_NOHUGEPAGE);
+        } else {
+            ::madvise(p, (size_t)len, MADV_HUGEPAGE);
+            warn_if_no_huge_pages();
+        }
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
 
@@ -3604,6 +3642,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.stream_gate = a_stream_gate;
         g_aql.gate_open = a_gate_open;
         g_aql.gate_room = a_gate_room;
+        g_aql.event_dma = a_event_dma;
         return &g_aql;
     }();
     return b;

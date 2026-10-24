@@ -141,6 +141,18 @@ struct RouteSlot {
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */
+/* One of the two views a streamed group's allocation is addressed through. `depth` is the number
+ * of layer stripes the view presents: the ring keeps the group's `n_layers`, the stage presents
+ * one and every layer aliases offset 0. The field is a depth and NOT a rewritten `layer_slot`:
+ * that table is also the host mirror's row (rad_kv_layer_index), so collapsing it would write all
+ * layers into one mirror row (docs/KV-STREAMING.md §3.5.1). */
+struct KVViewState {
+    int64_t layer_stride = 0;
+    int64_t bytes = 0;
+    int64_t depth = 0;             /* 0: n_layers; 1: every layer at offset 0 */
+    int64_t shape0 = 0;            /* the operand's [blocks] extent for this view */
+};
+
 struct KVPoolBinding {
     void*    base = nullptr;
     int64_t  layer_stride = 0;      /* bytes between one layer's cache and the next */
@@ -152,7 +164,25 @@ struct KVPoolBinding {
     std::vector<int32_t> layer_slot;
     uint32_t rank = 0;              /* 0 when the group has no plan: the operand stays a flat span */
     int64_t  shape[RAD_MAX_RANK] = {0};
+    /* The active view's stripe count: 0 is n_layers, 1 is the one-layer prefill stage. */
+    int64_t  depth = 0;
+    /* Both fixed views over the group's one allocation. The ring is always present; the stage only
+     * for a group whose plan depth is 1 (its ring is smaller than its context). The active fields
+     * above are set from one of these before each pass (kvstream_enter), so a recorded pass that
+     * used a view replays against it: the pass key already carries the phase, which selects it. */
+    KVViewState ring;
+    KVViewState stage;
+    bool        has_stage = false;
+    /* Bytes of one layer's mirror row a staged pass must copy, from the block manager's highest
+     * held block (kvstream/stage.h). 0 copies the whole row, which is always correct and is what a
+     * caller with no manager (a test, a harness) leaves it at. Set once per step, before the pass,
+     * because the bound grows as a prefill appends blocks. */
+    int64_t     stage_live_bytes = 0;
 };
+
+/* The KV stage's driver, run again where a recorded pass made it (kvstream/stage.cpp). `after` is
+ * the call the architecture makes after a layer's attention instead of before it. */
+int kvstage_run(Ctx* c, int group, int layer, bool after);
 
 struct CtxDesc {
     Program*        program     = nullptr;
@@ -213,6 +243,20 @@ public:
     int             rank()       const { return rank_; }
     /* Whether repeated passes are recorded and played back (prepare() says when they are not). */
     bool            records_passes() const { return tape_on_; }
+    /* Whether the pass being issued is being recorded. Work a tape cannot record -- a DMA
+     * submission -- must be re-run where the pass made it instead (tape_kv_stage). */
+    bool            recording()  const { return rec_ != nullptr; }
+    /* While recording: a KV stage call becomes a host step that re-runs at every play, because the
+     * DMA list it hands the engine and the stream wait on the list's completion word are neither of
+     * them queue packets (kvstream/stage.cpp; xprefetch.cpp does the same for the prefetch). */
+    int tape_kv_stage(bool after, int group, int layer) {
+        TapeStep st;
+        st.kind = (uint8_t)(after ? kTapeKvStageAfter : kTapeKvStage);
+        st.a = group;
+        st.b = layer;
+        return tape_host(st, [&] { return kvstage_run(this, group, layer, after); });
+    }    /* This rank's device ordinal, for the calls that name a card rather than a stream. */
+    int             device()     const { return device_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
     Program*        program()    const { return program_; }
@@ -230,6 +274,17 @@ public:
 
     void* weight_ptr(rad_weight w);
     void* buf_ptr(rad_buf b);
+    /* The group-local position of absolute model layer `layer` in the binding's layer_slot, or -1.
+     * rad_kv_layer_index (rad_runtime.h) exposes it to a plugin, which needs it for the host
+     * mirror: that is laid out by the group's layers, not by model layer numbers. */
+    int64_t kv_layer_index(rad_kvgroup g, int layer) const;
+    /* The group's pool binding, for the view switch and the stage copy. */
+    const KVPoolBinding* kv_binding(rad_kvgroup g) const {
+        return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
+    }
+    KVPoolBinding* kv_binding(rad_kvgroup g) {
+        return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
+    }
 
     /* ---------------------------------------------------------- routing (spec §5.5) */
     int route_report(int layer, const RadRouting* r);
@@ -435,7 +490,8 @@ private:
      * issue. A difference means the key misses a dependency; the step fails, naming the first
      * differing dispatch. */
     enum TapeKind : uint8_t { kTapePlay = 0, kTapeTable = 1, kTapeHost = 2, kTapeRoute = 3,
-                              kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6 };
+                              kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6,
+                              kTapeKvStage = 7, kTapeKvStageAfter = 8 };
     /* A prefetch call (Ctx::xp_predict), run again where the pass made it. */
     struct TapeXp {
         RadPrefetchNext next{};

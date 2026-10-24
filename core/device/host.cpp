@@ -816,6 +816,7 @@ const DeviceBackend g_host = {
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 
     h_stream_gate, h_gate_open, h_gate_room,
+    nullptr,                     /* no DMA queue, so no event it could complete */
 };
 
 }  /* namespace */

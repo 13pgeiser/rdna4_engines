@@ -280,6 +280,8 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `hc_write_bf16` | `hc_write` |
 | `join_add_scale_bf16` | `join_add_scale` |
 | `kv_store_bf16` | `kv_store` |
+| `kv_store_streamed_bf16` | `kv_store_streamed` |
+| `kv_store_streamed_fp8` | `kv_store_streamed` |
 | `l2norm_chan_bf16` | `l2norm_chan` |
 | `lane_gather_w32` | `lane_gather` |
 | `lane_store_w32` | `lane_store` |
@@ -313,6 +315,8 @@ Rows declaring an optional hook (tuning, fusion, weight layout):
 | `qk_norm_rope_gate` | `qk_norm_rope_gate` |
 | `qk_norm_rope_gate_kv_store_bf16` | `qk_norm_rope_gate_kv_store` |
 | `qk_norm_rope_gate_kv_store_fp8` | `qk_norm_rope_gate_kv_store` |
+| `qk_norm_rope_gate_kv_store_streamed_fp8` | `qk_norm_rope_gate_kv_store_streamed` |
+| `qk_norm_rope_gate_kv_store_streamed_bf16` | `qk_norm_rope_gate_kv_store_streamed` |
 | `qkv_norm_rope_bf16` | `qkv_norm_rope` |
 | `qsa_block_key_bf16` | `qsa_block_key` |
 | `qsa_score_bf16` | `qsa_score` |
@@ -507,6 +511,7 @@ on a marked row is a hole this model falls into.
 | `hc_write` |   | host | device | host |
 | `join_add_scale` |   | - | device | - |
 | `kv_store` | yes | host | device | host |
+| `kv_store_streamed` |   | host | device | host |
 | `l2norm_chan` |   | - | device | host |
 | `lane_gather` |   | - | device | host |
 | `lane_store` |   | - | device | host |
@@ -534,6 +539,7 @@ on a marked row is a hole this model falls into.
 | `qk_norm_rope` |   | host | device | host |
 | `qk_norm_rope_gate` |   | - | device | - |
 | `qk_norm_rope_gate_kv_store` |   | - | device | - |
+| `qk_norm_rope_gate_kv_store_streamed` |   | - | device | - |
 | `qkv_norm_rope` |   | - | device | - |
 | `qsa_block_key` |   | host | device | host |
 | `qsa_score` |   | - | device | host |

@@ -57,6 +57,11 @@ struct Hand {
     int oracle_opd = -1;
     std::vector<float> oracle;
     double oracle_tol = 0;
+    /* An answer neither library computes: operand `oracle_opd`'s whole buffer must hold these
+     * bytes on both sides. For a case whose bytes follow from the layout by hand, so a store that
+     * writes the right values to the wrong place fails even when both libraries agree. */
+    int want_raw_opd = -1;
+    std::vector<uint8_t> want_raw;
 
     Hand(const char* n, const char* o, double t) : name(n), op(o), tol(t) {}
 
@@ -156,6 +161,13 @@ struct Hand {
     Hand& expect(int opd, std::vector<int64_t> v) {
         want_opd = opd;
         want = std::move(v);
+        return *this;
+    }
+
+    /* Operand `opd` (an output) must hold `bytes` verbatim on both sides. */
+    Hand& expect_bytes(int opd, std::vector<uint8_t> bytes) {
+        want_raw_opd = opd;
+        want_raw = std::move(bytes);
         return *this;
     }
 
@@ -273,6 +285,26 @@ struct Hand {
                         ok = false;
                         break;
                     }
+            }
+        }
+        if (want_raw_opd >= 0) {
+            const Buf& bf = bufs[(size_t)buf_of[(size_t)want_raw_opd]];
+            if (want_raw.size() != bf.orig.size()) {
+                fail("the expected bytes are " + std::to_string(want_raw.size()) + ", the operand " +
+                     std::to_string(bf.orig.size()));
+                ok = false;
+            } else {
+                for (int side = 0; side < 2; ++side) {
+                    const uint8_t* d = side ? bf.b.data() : bf.a.data();
+                    size_t at = 0;
+                    while (at < want_raw.size() && d[at] == want_raw[at]) ++at;
+                    if (at != want_raw.size()) {
+                        std::printf("  FAIL %-20s %s\n       %s byte %zu is 0x%02x, expected 0x%02x\n",
+                                    op.c_str(), name.c_str(), side ? who : "libref", at, d[at],
+                                    want_raw[at]);
+                        ok = false;
+                    }
+                }
             }
         }
         double core_rel = -1;
@@ -3136,6 +3168,449 @@ void qsa_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== the streamed KV residency map
+ *
+ * `kv_resolve`'s service shapes: a partly resident pool, an eviction, a second chance over the
+ * two-bit heat counter (including the cases where it must differ from a one-bit CLOCK), an
+ * overflow, one claim for a block several rows name, a copy whose length is not a vector multiple,
+ * and the state faults it refuses. libref's description can only draw an all-resident map (a cold
+ * entry is -1, which no index draw expresses), so every case below is one the table cannot reach.
+ *
+ * The pool starts as the maps say it is: a slot holding block `b` carries b's bytes and a free
+ * slot carries 0xEE, the marker tests/ref_test.cpp uses. Then the copies are visible element by
+ * element, and both libraries are compared over the whole of every map, the mirror's bytes and the
+ * ring. */
+namespace kvhand {
+
+enum { kNOB = 0xEE };
+
+/* The bytes block `b`, element `i` of its block: a pattern under 256 whose block digit is
+ * recoverable, so a copy that landed in the wrong slot shows. */
+float block_byte(int64_t b, int64_t i) { return (float)((29 * b + i) & 0xff); }
+
+/* A pool with its operands in the contract's order. `sel` and `sst` are flat, shaped here. */
+Hand pool(const char* name, int64_t M, int64_t blocks, int64_t slots, int64_t pitch,
+          int64_t bbytes, std::vector<int64_t> sel, std::vector<int64_t> nsel,
+          std::vector<int64_t> res, std::vector<int64_t> sblk, std::vector<int64_t> sst,
+          std::vector<int64_t> ctl) {
+    Hand h(name, "kv_resolve", 0.0);
+    h.dense(RAD_I32, { M, pitch },
+            [sel](int64_t i) { return (float)sel[(size_t)i]; }, true)
+     .idx(nsel)
+     .idx(res, true)
+     .idx(sblk, true)
+     .dense(RAD_I32, { slots, 2 },
+            [sst](int64_t i) { return (float)sst[(size_t)i]; }, true)
+     .idx(ctl, true)
+     .dense(RAD_U8, { blocks, bbytes },
+            [bbytes](int64_t i) { return block_byte(i / bbytes, i % bbytes); })
+     /* A slot's contents are the block `slot_block` says it holds; a free slot is the marker. */
+     .dense(RAD_U8, { slots, bbytes },
+            [sblk, bbytes](int64_t i) {
+                const int64_t b = sblk[(size_t)(i / bbytes)];
+                return b < 0 ? (float)kNOB : block_byte(b, i % bbytes);
+            },
+            true)
+     .pi("M", M).pi("blocks", blocks).pi("slots", slots).pi("sel_pitch", pitch)
+     .pi("block_bytes", bbytes);
+    return h;
+}
+
+}  /* namespace kvhand */
+
+void kv_cases(std::vector<Hand>& hs) {
+    using namespace kvhand;
+
+    /* Blocks 2 and 5 are resident; the selection names them, then 6 and 4. The epoch reaches both
+     * hit slots, the misses are claimed once each and placed in ascending block order (4 then 6),
+     * not in the order the rows name them. Pinned to the rule, so both libraries are held to it
+     * and not only to each other. */
+    {
+        Hand h = pool("hits take the epoch, misses land in block order", 2, 8, 4, 4, 8,
+                      { 2, 5, 6, -1, 2, 4, -1, -1 }, { 3, 2 },
+                      { -1, -1, 0, -1, -1, 3, -1, -1 }, { 2, -1, -1, 5 },
+                      { 0, 1, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 0, 3, 2, -1, 0, 1, -1, -1 });
+        hs.push_back(std::move(h));
+    }
+    /* An unreferenced resident slot is the victim and the block it held leaves the map; the hand
+     * starts on it, so the sweep takes it first. */
+    {
+        Hand h = pool("an unreferenced slot is the victim and its block is unmapped", 1, 8, 4, 1,
+                      4, { 0 }, { 1 }, { -1, 0, 1, 2, 3, -1, -1, -1 }, { 1, 2, 3, 4 },
+                      { 0, 1, 0, 0, 0, 1, 0, 0 }, { 0, 1, 0, 0, 0, 0, 0, 0,
+                                                   0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 1 });
+        hs.push_back(std::move(h));
+    }
+    /* A free slot is taken before an unreferenced resident slot, even when the hand starts on the
+     * resident one: the empty region is not a victim and the block in that slot stays. */
+    {
+        Hand h = pool("a free slot is taken before an unreferenced one", 1, 8, 4, 1, 4, { 0 }, { 1 },
+                      { -1, -1, -1, 0, -1, -1, -1, -1 }, { 3, -1, -1, -1 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0, 0,
+                                                   0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 1 });
+        hs.push_back(std::move(h));
+    }
+    /* Second chance: every slot is referenced, so a full turn clears every bit and the miss takes
+     * the slot the hand started on. The bits the sweep passed stay cleared. */
+    {
+        Hand h = pool("a referenced slot gets a second chance", 1, 8, 4, 2, 4, { 0, 1 }, { 2 },
+                      { -1, -1, -1, -1, 0, 1, 2, 3 }, { 4, 5, 6, 7 },
+                      { 0, 1, 0, 1, 0, 1, 0, 1 }, { 0, 0, 0, 0, 0, 0, 0, 0,
+                                                   0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 0, 1 });
+        hs.push_back(std::move(h));
+    }
+    /* The heat counter, and the three shapes that separate it from a one-bit CLOCK. Slot 0 was hit
+     * on two earlier calls (counter 2), slots 1 and 2 once each: a CLOCK sweep clears all three bits
+     * and evicts slot 0 on its second pass, while 2 -> 1 -> 0 leaves slot 0 resident and takes slot
+     * 1. Pinned to the victim, so both libraries are held to the rule and not only to each other. */
+    {
+        Hand h = pool("a slot hit twice survives two sweep passes", 1, 32, 3, 1, 8, { 20 }, { 1 },
+                      { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
+                      { 10, 11, 12 }, { 0, 2, 0, 1, 0, 1 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 1 });
+        hs.push_back(std::move(h));
+    }
+    /* The halving is only visible in `slot_state`, not in the victim (a cold slot 1 is taken either
+     * way), so this case pins the counter: a saturated 3 is 1 after one pass, not the 0 a one-bit
+     * CLOCK would leave. */
+    {
+        Hand h = pool("a saturated counter halves 3 -> 1 on one pass", 1, 32, 3, 1, 8, { 20 }, { 1 },
+                      { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
+                      { 10, 11, 12 }, { 0, 3, 0, 0, 0, 0 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(4, { 0, 1, 1, 1, 0, 0 });
+        hs.push_back(std::move(h));
+    }
+    /* A saturated counter (3) against three slots placed on the previous call (1 each): the sweep
+     * walks two full laps, spends the fresh counters first, and takes slot 1. CLOCK, for which all
+     * four are "referenced", takes slot 0 -- the hottest block in the ring. */
+    {
+        Hand h = pool("a saturated counter outlasts a fresh placement", 1, 32, 4, 1, 8, { 20 },
+                      { 1 },
+                      { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
+                      { 10, 11, 12, 13 }, { 0, 3, 0, 1, 0, 1, 0, 1 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 1 });
+        hs.push_back(std::move(h));
+    }
+    /* One bump a slot a call: block 10 is resident and named by both entries, so its counter goes
+     * 1 -> 2. A per-entry bump would leave 3, which is the disagreement this case exists for. */
+    {
+        Hand h = pool("a block two rows name gains one step of heat", 1, 32, 3, 2, 8, { 10, 10 },
+                      { 2 },
+                      { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, -1, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
+                      { 10, 11, 12 }, { 0, 1, 0, 0, 0, 0 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(4, { 1, 2, 0, 0, 0, 0 });
+        hs.push_back(std::move(h));
+    }
+
+    /* Overflow: three hits hold slots 0..2 and two misses want the one slot left. The first is
+     * placed, the second has nowhere and must not steal the slot the first took - every slot of
+     * the ring is stamped with this call's epoch - so it reverts to -1 and its entry keeps the
+     * block id, a value that is not a slot. */
+    {
+        Hand h = pool("an unplaceable miss latches overflow, never a used slot", 1, 8, 4, 5, 4,
+                      { 6, 7, 0, 1, 2 }, { 5 }, { 0, 1, 2, -1, -1, -1, -1, -1 }, { 0, 1, 2, -1 },
+                      { 0, 1, 0, 1, 0, 1, 0, 0 }, { 0, 3, 0, 0, 0, 0, 0, 0,
+                                                   0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 3, 0, 0, 1, 2 });
+        hs.push_back(std::move(h));
+    }
+    /* A block two rows name is claimed once, the list is ascending, a row of zero entries resolves
+     * nothing, and `block_bytes` 24 leaves the copy a tail shorter than a vector lane group.
+     * Placement: 4 fits the ring and takes slot 4, while 9 and 15 are past `slots` and take the
+     * first free slots from the hand (0 then 1). */
+    {
+        Hand h = pool("one claim per block, a 24-byte copy, an empty row", 3, 16, 6, 4, 24,
+                      { 9, 4, -1, -1, 9, 15, -1, -1, -1, -1, -1, -1 }, { 2, 2, 0 },
+                      { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
+                      { -1, -1, -1, -1, -1, -1 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+                      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 0, 4, -1, -1, 0, 1, -1, -1, -1, -1, -1, -1 });
+        hs.push_back(std::move(h));
+    }
+    /* An epoch is only ever compared for equality (docs/OPS.md), so a stamp that happens to equal
+     * the epoch this call takes reads as this call's own: the sweep passes that slot and takes the
+     * next. Nothing is validated about a stamp, and both implementations must read it the same
+     * way. */
+    {
+        Hand h = pool("a stamp equal to the new epoch is passed", 1, 8, 4, 2, 4, { 0 }, { 1 },
+                      { -1, -1, -1, -1, -1, -1, -1, -1 }, { 3, -1, -1, -1 },
+                      { 2, 1, 0, 0, 0, 0, 2, 0 }, { 1, 0, 0, 0, 0, 0, 0, 0,
+                                                   0, 0, 0, 0, 0, 0, 0, 0 });
+        h.expect(0, { 1 });
+        hs.push_back(std::move(h));
+    }
+
+    /* 2052 claims -- four rows of 513, which is what `--max-num-seqs 4` selects, and eight more than
+     * the largest fixed list can hold. Every slot is free, so all 2052 are placed: ids 100..2099
+     * take their own slot and the 52 past the ring (2100..2151) take the first free slots from the
+     * hand, which are 0..51. Pinned, so both libraries are held to the placement and not only to
+     * each other. The claim list is gathered from the selection, so the id space (`blocks`) is not
+     * in the cost. */
+    {
+        const int64_t M = 4, blocks = 4096, slots = 2100, pitch = 513, bbytes = 8, first = 100;
+        std::vector<int64_t> sel, nsel((size_t)M, 513), res((size_t)blocks, -1),
+            sblk((size_t)slots, -1), sst((size_t)(slots * 2), 0), ctl(16, 0),
+            want((size_t)slots, -1);
+        for (int64_t q = 0; q < M; ++q)
+            for (int64_t i = 0; i < 513; ++i) sel.push_back(first + q * 513 + i);
+        for (int64_t k = 0; k < 2052; ++k) {
+            const int64_t b = first + k;
+            want[(size_t)(b < slots ? b : b - slots)] = b;
+        }
+        Hand h = pool("2052 claims: identity below the ring, the rest from the hand", M, blocks,
+                      slots, pitch, bbytes, sel, nsel, res, sblk, sst, ctl);
+        h.expect(3, want);
+        hs.push_back(std::move(h));
+    }
+    /* More claims than the ring, and more than a fixed list holds: 12 distinct blocks and 8 slots,
+     * so the eight smallest ids are placed and the four largest revert to -1 with the
+     * overflow latched. 1, 2, 3, 5 and 7 fit the ring and take their own slots; 9, 11 and 100 are
+     * past it and take the first free slots from the hand, 0, then past the identity slots, 4 and
+     * 6. The claim list cannot be clipped at the ring's depth -- the order the sweep takes is the
+     * ascending order of the whole claim set. */
+    {
+        Hand h = pool("12 claims in 8 slots place the eight smallest", 1, 4096, 8, 12, 8,
+                      { 4090, 3, 2000, 7, 1, 4000, 5, 9, 11, 2, 100, 500 }, { 12 },
+                      std::vector<int64_t>((size_t)4096, -1), std::vector<int64_t>((size_t)8, -1),
+                      std::vector<int64_t>((size_t)16, 0), std::vector<int64_t>(16, 0));
+        h.expect(3, { 9, 1, 2, 3, 11, 5, 100, 7 });
+        hs.push_back(std::move(h));
+    }
+
+    /* ---- the refusals: state faults and a selection that does not fit, before any write ---- */
+    const std::vector<int64_t> res_ok = { -1, -1, -1, -1, -1, -1, -1, -1 };
+    const std::vector<int64_t> sblk_ok = { -1, -1, -1, -1 };
+    const std::vector<int64_t> sst_ok = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    const std::vector<int64_t> ctl_ok = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    {
+        Hand h = pool("a block id past the id space is refused", 1, 8, 4, 2, 4, { 8, -1 }, { 1 },
+                      res_ok, sblk_ok, sst_ok, ctl_ok);
+        h.refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h = pool("more entries than the row holds is refused", 1, 8, 4, 2, 4, { 1, 1 }, { 3 },
+                      res_ok, sblk_ok, sst_ok, ctl_ok);
+        h.refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h = pool("a claim in flight on entry is a state fault", 1, 8, 4, 2, 4, { 1, -1 }, { 1 },
+                      { -1, -2, -1, -1, -1, -1, -1, -1 }, sblk_ok, sst_ok, ctl_ok);
+        h.refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h = pool("a hand past the ring is a state fault", 1, 8, 4, 2, 4, { 1, -1 }, { 1 },
+                      res_ok, sblk_ok, sst_ok,
+                      { 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+        h.refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h = pool("a slot_block past the id space is a state fault", 1, 8, 4, 2, 4, { 1, -1 },
+                      { 1 }, res_ok, { 8, -1, -1, -1 }, sst_ok, ctl_ok);
+        h.refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    /* The mirror's row pitch is not `block_bytes`: a copy would move a block over its neighbour. */
+    {
+        const int64_t blocks = 8, slots = 4, pitch = 2, bbytes = 4, stride = bbytes + 4;
+        Hand h("a mirror row pitch that is not block_bytes is refused", "kv_resolve", 0.0);
+        h.dense(RAD_I32, { 1, pitch }, [](int64_t i) { return i == 0 ? 1.0f : -1.0f; }, true)
+         .idx({ 1 })
+         .idx(res_ok, true).idx(sblk_ok, true)
+         .dense(RAD_I32, { slots, 2 }, [](int64_t) { return 0.0f; }, true)
+         .idx(ctl_ok, true)
+         .view(RAD_U8, { blocks, bbytes }, { stride, 1 }, blocks * stride,
+               [bbytes](int64_t i) { return (float)((29 * (i / stride) + i % bbytes) & 0xff); })
+         .dense(RAD_U8, { slots, bbytes }, [](int64_t) { return (float)kNOB; }, true)
+         .pi("M", 1).pi("blocks", blocks).pi("slots", slots).pi("sel_pitch", pitch)
+         .pi("block_bytes", bbytes)
+         .refuses(RAD_E_STRIDE);
+        hs.push_back(std::move(h));
+    }
+    /* A ring shallower than `slots` blocks is refused before the sweep could walk past it. */
+    {
+        const int64_t blocks = 8, slots = 4, pitch = 2, bbytes = 4;
+        Hand h("a ring with fewer blocks than slots is refused", "kv_resolve", 0.0);
+        h.dense(RAD_I32, { 1, pitch }, [](int64_t i) { return i == 0 ? 1.0f : -1.0f; }, true)
+         .idx({ 1 })
+         .idx(res_ok, true).idx(sblk_ok, true)
+         .dense(RAD_I32, { slots, 2 }, [](int64_t) { return 0.0f; }, true)
+         .idx(ctl_ok, true)
+         .dense(RAD_U8, { blocks, bbytes }, [bbytes](int64_t i) { return block_byte(i / bbytes,
+                                                                                   i % bbytes); })
+         .dense(RAD_U8, { slots - 1, bbytes }, [](int64_t) { return (float)kNOB; }, true)
+         .pi("M", 1).pi("blocks", blocks).pi("slots", slots).pi("sel_pitch", pitch)
+         .pi("block_bytes", bbytes)
+         .refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(h));
+    }
+}
+
+/* ================================================================== the streamed KV store
+ *
+ * `kv_store_streamed` has two destinations, and the cases worth pinning are the ones a description
+ * cannot draw: a block absent from the ring beside one resident, a step that writes the mirror
+ * alone (every token of a block's first step), a negative slot, and the state faults libref
+ * refuses before its first write. Both libraries are compared over both planes -- the ring and the
+ * mirror -- and `k` / `v` are the engine's rank-2 column slices over a row stride twice the view's
+ * width, so a store that derives its pitch from the shape writes the previous token's rows.
+ */
+namespace kvstream {
+
+Hand store(const char* name, int64_t blocks, int64_t slots, int64_t bs, int64_t kvh, int64_t hd,
+           std::vector<int64_t> sm, std::vector<int64_t> res) {
+    const int64_t M    = (int64_t)sm.size();
+    const int64_t lane = kvh * hd;
+    const int64_t row  = kvh * bs * 2 * hd;
+    const int64_t span = M * 2 * lane;
+    Hand h(name, "kv_store_streamed", 0.0);
+    h.view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
+           [](int64_t i) { return (float)((int)(i % 31) - 15) * 0.5f; })          /* k */
+     .view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
+           [](int64_t i) { return (float)((int)(i % 13) - 6) * 0.25f; })           /* v */
+     .idx(sm)
+     .dense(RAD_F8E4M3, { slots, kvh, bs, 2 * hd },
+            [](int64_t i) { return (float)((int)(i % 5) + 1); }, true)            /* the ring */
+     .idx(res)
+     .dense(RAD_U8, { blocks, row },
+            [](int64_t i) { return (float)(int)((i * 37) % 251); }, true)         /* the mirror */
+     .pi("M", M).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
+     .ps("kv_dtype", "fp8_e4m3");
+    return h;
+}
+
+}  /* namespace kvstream */
+
+void kvstream_cases(std::vector<Hand>& hs) {
+    using namespace kvstream;
+    /* Block 0 absent, block 1 resident in slot 0, block 2 absent, block 3 resident in slot 1. */
+    {
+        Hand h = store("the mirror always, the resident slot too", 4, 2, 2, 2, 4,
+                       { 1, 3, 6, 2 }, { -1, 0, -1, 1 });
+        hs.push_back(std::move(h));
+    }
+    /* Nothing resident: the ring must come out untouched and the mirror must hold every row. */
+    {
+        Hand h = store("a cold ring takes the mirror alone", 4, 2, 2, 2, 4,
+                       { 0, 5, 6, 7 }, { -1, -1, -1, -1 });
+        hs.push_back(std::move(h));
+    }
+    /* A negative slot is a padded row: neither plane is written. */
+    {
+        Hand h = store("a negative slot stores nothing", 2, 1, 2, 1, 2, { -1, 3 }, { -1, 0 });
+        hs.push_back(std::move(h));
+    }
+    /* The parity configuration's identity map: the ring slot is the block, so the two planes hold
+     * the same bytes at every mapped position. */
+    {
+        Hand h = store("an identity map writes both planes alike", 3, 3, 2, 1, 2,
+                       { 0, 3, 5 }, { 0, 1, 2 });
+        hs.push_back(std::move(h));
+    }
+    /* The mirror's exact bytes, laid out by hand: four tokens fill both blocks at both offsets
+     * with constants, so the paged layout [kv_heads][block_size][2 * head_dim] and the E4M3
+     * encoding are pinned against an answer no library computes. Agreement alone cannot catch a
+     * store that writes the right values at the wrong address or with the wrong scale. */
+    {
+        const int64_t blocks = 2, slots = 2, bs = 2, kvh = 1, hd = 2, M = 4;
+        const int64_t lane = kvh * hd, row = kvh * bs * 2 * hd, span = M * 2 * lane;
+        const float kd[M][2] = { { 1, 2 }, { 3, 4 }, { 5, 6 }, { 7, 8 } };
+        const float vd[M][2] = { { -1, -2 }, { -3, -4 }, { -5, -6 }, { -7, -8 } };
+        Hand h("the mirror's bytes, block-id addressing and E4M3", "kv_store_streamed", 0.0);
+        h.view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
+               [&](int64_t i) { return i % 4 < 2 ? kd[i / 4][i % 4] : 0.0f; })
+         .view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
+               [&](int64_t i) { return i % 4 < 2 ? vd[i / 4][i % 4] : 0.0f; })
+         .idx({ 0, 1, 2, 3 })
+         .dense(RAD_F8E4M3, { slots, kvh, bs, 2 * hd }, [](int64_t) { return 0.0f; }, true)
+         .idx({ 0, 1 })
+         .dense(RAD_U8, { blocks, row }, [](int64_t) { return 0.0f; }, true)  /* the mirror */
+         .pi("M", M).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
+         .ps("kv_dtype", "fp8_e4m3");
+        std::vector<uint8_t> want((size_t)(blocks * row), 0);
+        for (int64_t t = 0; t < M; ++t) {
+            const float pair[2 * hd] = { kd[t][0], kd[t][1], vd[t][0], vd[t][1] };
+            uint8_t enc[2 * hd] = {};
+            h_narrow(pair, RAD_F8E4M3, 2 * hd, enc);
+            const int64_t blk = t / bs, off = t % bs;
+            for (int64_t j = 0; j < 2 * hd; ++j)
+                want[(size_t)(blk * row + off * 2 * hd + j)] = enc[j];
+        }
+        h.expect_bytes(5, want);
+        hs.push_back(std::move(h));
+    }
+    /* The default cache dtype: both planes hold the values themselves, two bytes an element. */
+    {
+        const int64_t blocks = 4, slots = 2, bs = 2, kvh = 2, hd = 4, M = 4;
+        const int64_t lane = kvh * hd, row = kvh * bs * 2 * hd * 2, span = M * 2 * lane;
+        Hand h("bf16: the mirror always, the resident slot too", "kv_store_streamed", 0.0);
+        h.view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
+               [](int64_t i) { return (float)((int)(i % 31) - 15) * 0.5f; })
+         .view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
+               [](int64_t i) { return (float)((int)(i % 13) - 6) * 0.25f; })
+         .idx({ 1, 3, 6, 2 })
+         .dense(RAD_BF16, { slots, kvh, bs, 2 * hd },
+                [](int64_t i) { return (float)((int)(i % 5) + 1); }, true)
+         .idx({ -1, 0, -1, 1 })
+         .dense(RAD_U8, { blocks, row },
+                [](int64_t i) { return (float)(int)((i * 37) % 251); }, true)
+         .pi("M", M).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
+         .ps("kv_dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    /* ---- the refusals, before any write ---- */
+    {
+        Hand h = store("a map entry past the ring is refused", 2, 1, 2, 1, 2, { 0, 1 }, { 1, 0 });
+        h.refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h = store("a claim in flight is a state fault", 2, 1, 2, 1, 2, { 0, 1 }, { -2, 0 });
+        h.refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h = store("a slot past the mirror is refused", 2, 1, 2, 1, 2, { 4, 1 }, { -1, 0 });
+        h.refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(h));
+    }
+    /* A mirror row that is not the block's pitch: a write would spill into the next block. */
+    {
+        const int64_t blocks = 2, slots = 1, bs = 2, kvh = 1, hd = 2, row = 8;
+        Hand h("a padded mirror row is refused", "kv_store_streamed", 0.0);
+        h.view(RAD_BF16, { 2, 2 }, { 4, 1 }, 8,
+               [](int64_t i) { return (float)((int)(i % 7) - 3); })
+         .view(RAD_BF16, { 2, 2 }, { 4, 1 }, 8,
+               [](int64_t i) { return (float)((int)(i % 5) - 2); })
+         .idx({ 0, 1 })
+         .dense(RAD_F8E4M3, { slots, kvh, bs, 2 * hd }, [](int64_t) { return 1.0f; }, true)
+         .idx({ -1, -1 })
+         .view(RAD_U8, { blocks, row }, { row + 4, 1 }, blocks * (row + 4),
+               [](int64_t i) { return (float)(int)(i % 251); }, true)
+         .pi("M", 2).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
+         .ps("kv_dtype", "fp8_e4m3")
+         .refuses(RAD_E_STRIDE);
+        hs.push_back(std::move(h));
+    }
+}
+
 /* ================================================================== weights of several planes
  *
  * A weight declared over several planes of one stored tensor reaches a host row joined
@@ -4333,6 +4808,8 @@ bool hand_cases(const Check& ck) {
     upscaler_cases(hs);
     vsa_cases(hs);
     qsa_cases(hs);
+    kv_cases(hs);
+    kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);
     Broken broken;

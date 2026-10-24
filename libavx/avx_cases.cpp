@@ -429,6 +429,22 @@ std::vector<Case> build_cases() {
         add("kv_store", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
                           HI("block_size", 16), HS("kv_dtype", "fp8_e4m3"), HF("k_scale", ks),
                           HF("v_scale", 1.0 / ks) });
+    /* The streamed store, on one block and one ring slot (see ref_shapes.cpp: a described map
+     * cannot be an injective permutation, so a multi-block call could draw two blocks one slot).
+     * The resident/mirror-only split is built by hand in avx_check_hand.cpp. */
+    for (double ks : { 1.0, 0.5 })
+        add("kv_store_streamed", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
+                                   HI("block_size", 32), HS("kv_dtype", "fp8_e4m3"),
+                                   HF("k_scale", ks), HF("v_scale", 1.0 / ks) });
+    add("kv_store_streamed", { HI("M", 3), HI("head_dim", 32), HI("n_head_kv", 1),
+                               HI("block_size", 4), HS("kv_dtype", "fp8_e4m3") });
+    /* The same store into a bf16 cache: both planes are the values themselves, two bytes wide. */
+    for (double ks : { 1.0, 0.5 })
+        add("kv_store_streamed", { HI("M", 12), HI("head_dim", 64), HI("n_head_kv", 2),
+                                   HI("block_size", 32), HS("kv_dtype", "bf16"),
+                                   HF("k_scale", ks), HF("v_scale", 1.0 / ks) });
+    add("kv_store_streamed", { HI("M", 3), HI("head_dim", 32), HI("n_head_kv", 1),
+                               HI("block_size", 4), HS("kv_dtype", "bf16") });
     for (const char* mode : { "neox", "gptj" }) {
         add("rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 2),
                       HF("theta", 10000.0), HF("scale", 1.0), HS("mode", mode),
@@ -528,6 +544,22 @@ std::vector<Case> build_cases() {
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
                       HI("work", 3), HS("dtype", "f32") });
+    /* The streamed group's residency map at a decode step's geometry and at the edges a check can
+     * describe: a ring shallower than the id space and deeper than it, one query row, a pitch of
+     * one, and a `block_bytes` that is not a multiple of a vector (a block is a whole number of
+     * 16-byte lanes in practice, but nothing in the schema says so and the copy's tail must still
+     * be right). libref describes the map as every block resident (ref_shapes.cpp), so these cases
+     * exercise the epoch, the hit stamp, the rewrite and the bookkeeping; a miss, an eviction, a
+     * second chance and an overflow need a cold map, which no description draws, and are built by
+     * hand in avx_check_hand.cpp. */
+    add("kv_resolve", { HI("M", 4), HI("blocks", 300), HI("slots", 96), HI("sel_pitch", 33),
+                        HI("block_bytes", 256) });
+    add("kv_resolve", { HI("M", 6), HI("blocks", 64), HI("slots", 128), HI("sel_pitch", 17),
+                        HI("block_bytes", 24) });
+    add("kv_resolve", { HI("M", 1), HI("blocks", 8), HI("slots", 4), HI("sel_pitch", 1),
+                        HI("block_bytes", 8) });
+    add("kv_resolve", { HI("M", 3), HI("blocks", 1), HI("slots", 1), HI("sel_pitch", 513),
+                        HI("block_bytes", 4096) });
     /* The proportional ladder: a partial rotary (rotary_dim < head_dim) with `ladder` head, so the
      * frequency denominator is head_dim. */
     for (const char* mode : { "neox", "gptj" }) {
@@ -1232,6 +1264,15 @@ std::vector<Case> build_cases() {
                   (double)M * blocks * 8, 0);
     speed("qsa_select", { HI("M", 2048), HI("blocks", 16384), HI("topk", 512), HI("ratio", 4),
                           HI("seqs", 1) }, 2048.0 * 16384 * 8, 0);
+    /* The residency map at a decode step: an 8K-block id space over a 2048-slot ring (a group at
+     * depth 3 with 256-token blocks), one query row and a four-row verify window, 512 selected
+     * blocks a row. libref describes the map all-resident, so this times the two selection passes,
+     * the compaction of the claim list, the rewrite and the bookkeeping; the block copies are one
+     * per miss, and which blocks miss is a cache state the geometry does not carry. */
+    for (const int64_t M : { 1, 4 })
+        speed("kv_resolve", { HI("M", M), HI("blocks", 8192), HI("slots", 2048),
+                              HI("sel_pitch", 513), HI("block_bytes", 2048) },
+              (double)M * 513 * 8, 0);
     /* The tail and the work list: four decoding sequences, and a prefill chunk's volume (512
      * sequences of four rows each completing a block, 2048 key rows staged). */
     speed("qsa_tail_store", { HI("M", 4), HI("n", 128), HI("ratio", 4), HI("ring", 7),

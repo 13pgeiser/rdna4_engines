@@ -1,6 +1,7 @@
 #include "runtime/tierexec.h"
 
 #include "rad_internal.h"
+#include "kvstream/plan.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,12 +32,18 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
     for (int32_t g : groups) {
         const KVGroupPlan* p = kv->plan(g);
         if (!p || !p->paged()) continue;
+        /* A streamed group's pool is one layer of its context, so a gather of layer L would copy
+         * the last staged layer n_layers times. Its mirror is the tier and the residency map
+         * restores a block on the next resolve (docs/KV-STREAMING.md §4.1). */
+        if (!kv_tier_cached(*p)) continue;
         GroupInfo gi;
         gi.g = g;
         gi.n_layers = p->n_layers;
         gi.frag = p->layer_bytes_per_block();
         gi.layer_stride = p->layer_stride();
-        gi.n_blocks = p->n_blocks;
+        /* The pool's depth: a streamed group backs fewer blocks than it addresses, and the tier
+         * gathers fragments of the blocks that are here (docs/KV-STREAMING.md §3.1). */
+        gi.n_blocks = p->pool_blocks();
         gi.base = p->base;
         gi.replicated = p->replicated;
         if (p->zero) {
@@ -109,6 +116,12 @@ int TierExec::slot_layout(const std::vector<const KVManager*>& ranks,
     for (int32_t g : groups) {
         const KVGroupPlan* p0 = ranks[0]->plan(g);
         if (!p0 || !p0->paged()) continue;
+        /* A streamed group is not part of a tier entry: its pool is one layer deep, so a gather
+         * of layer L would copy the last staged layer n_layers times, and its host mirror is the
+         * tier (docs/KV-STREAMING.md §4.1). TierExec::stage skips the same groups, so this
+         * arithmetic and its gather offsets agree. A streamed group is never replicated, so
+         * leaving it out of the replicated window too is the safe rule. */
+        if (!kv_tier_cached(*p0)) continue;
         bool replicated = false;
         for (size_t i = 0; i < ranks.size(); ++i) {
             const KVGroupPlan* p = ranks[i]->plan(g);
