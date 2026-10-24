@@ -128,11 +128,18 @@ class Scheduler {
 public:
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
      * sampled at the accepted position, and whether the sequence ended. No logits. */
+    /* The step's outcome, for the engine's reports. Both count what this step did, so a report
+     * line can say "the prompt completed here" or "a request ended here" without reading internal
+     * queues: `n_prefill_done` counts entries whose prompt was fully placed in this step (the
+     * point after which a decode step reads the ring), `n_finished` counts requests that reached a
+     * terminal state during it. */
     struct StepResult {
         int             n_seq = 0;
         const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
         const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
         const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
+        int             n_prefill_done = 0;
+        int             n_finished = 0;
         /* Logprobs, null on a step where no request asked: entry i's j-th emitted token (its
          * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
         const TokenLogprobs* lp = nullptr;
@@ -176,6 +183,12 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* Fail every request that was prefilling in the step just committed, with `why` reaching the
+     * client. The engine calls this when a streamed group's resolve latched overflow: those
+     * requests' selections are the ones whose ring placement failed, so their attention reads from
+     * a table that no longer addresses the pool. Failing them is the only honest outcome; it never
+     * serves a step from a half-resident selection (docs/KV-STREAMING.md §3.4). */
+    int      fail_prefilling(const char* why);
     /* Whether the request is still admitted and Running, read under the lock. */
     bool     running(uint64_t id) const;
     /* What the step just committed left for `seq`, copied by commit under the lock. False when
@@ -309,8 +322,9 @@ public:
     const RadBatch* step_next_locked();
     void            promote_next();
     /* Fold the step's outcome back in: append tokens, roll back rejected speculation, retire
-     * finished requests, feed the draft controller. */
-    int             commit(const StepResult& r);
+     * finished requests, feed the draft controller, and fill `r`'s report counts
+     * (n_prefill_done, n_finished). */
+    int             commit(StepResult& r);
     /* Ends the step for timing; call once per loop iteration that ran a step, after the drafter,
      * so the draft rounds are charged to the step (see the definition). Without it the counters
      * stay correct but there is no timing. */
@@ -553,6 +567,11 @@ private:
     std::vector<int32_t> running_;
     std::vector<int32_t> waiting_;
     std::vector<uint64_t> completed_;
+    /* What the step being committed did for the engine's reports (StepResult::n_prefill_done,
+     * n_finished): the prefill entries' request ids, and the terminal count. Reset at the start of
+     * every commit, so nothing is carried across steps. */
+    std::vector<uint64_t> last_prefill_ids_;
+    int                   step_finished_ = 0;
 
     /* Requests whose release waits on something that still refers to them (a deferred reap or a
      * deferred free). A count, so the sweeps cost nothing on the steps where there are none. */
@@ -577,6 +596,10 @@ private:
      * lives here). See add_locked. */
     int64_t     pool_tokens_ = -1;
     std::string pool_refusal_;
+    /* The message fail_prefilling() sends to a streamed request's client. A sink keeps the pointer
+     * until the HTTP thread writes the error, so it cannot be a temporary (Sink::why_); the same
+     * reason pool_refusal_ lives here. */
+    std::string stream_why_;
 
     /* Scratch for a prefix-cache hit's block ids, one row per cached group. Reserved at init so
      * an admission does not reach the allocator. */

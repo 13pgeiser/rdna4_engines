@@ -289,6 +289,10 @@ struct KVGroupInfo {
     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
     std::vector<int> layers;
     bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
+    /* rad_kv_group_dense_read: read over the whole live history every step (an indexer's block
+     * keys), so it cannot stream and its pool must hold every sequence's context while a group
+     * does stream. False on every other group. */
+    bool            dense_read = false;
     bool            replicated = false; /* rad_kv_group_replicated: the same bytes on every rank */
     /* Bound only at meta.n_layers and above: the drafter's own cache, which no trunk layer reads.
      * Set at declare (Builder::finish_kv_groups). */
@@ -819,6 +823,19 @@ struct Config {
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
      * attn_prefill_fp8_name() spells it as the flag does. */
     int attn_prefill_fp8 = 0;
+    /* --kv-resident N: the whole switch (docs/KV-STREAMING.md §5 Phase 4). It is the tokens of
+     * the sparse attention group's context its VRAM ring holds; absent or 0 and nothing streams,
+     * which is the base engine. A ring that covers the group's context (`max_seqs x max_ctx`)
+     * streams nothing either -- the group stays a plain resident pool, no mirror, no maps, no
+     * stage, no resolve -- so a configuration that fits pays nothing. Below the context, the ring
+     * must hold one decode step's whole selection, and anything smaller is refused at startup. */
+    int64_t kv_resident = 0;
+    /* Derived, never a flag: whether this run configuration streams a group at all. Set where the
+     * budget probe is capped (kvstream_cap_probe), before the pool is sized, because a streamed
+     * plan's ceiling is its ring and its one-layer stage rather than the whole cache; the cache's
+     * MiB rounding reads it. Engine::configure_kv asks the same question of the same numbers and
+     * must land on the same answer. */
+    bool kv_streams = false;
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read

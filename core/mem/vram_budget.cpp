@@ -239,6 +239,15 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     cfg.vram_weights_mib = to_mib_up(b.weights);
     const int64_t w_over = cfg.vram_weights_mib * kMiB - b.weights;
     cfg.vram_kv_mib      = to_mib(std::max<int64_t>(b.kv - w_over, 0));
+    /* A streamed plan's maps are charged inside kv_one but reserved outside the paged split, so
+     * the MiB truncation here leaves the pool a whole map short of the one conversation kv_one was
+     * sized for -- the target shape's indexer then caps at 47 185 of its 51 200 blocks. kv_one is a
+     * requirement in that case, not a target: round it back up. Only the streamed arms are held to
+     * it; without streaming this is the pre-existing 1 MiB truncation (204 648 for 204 800), which
+     * is a separate issue and not this feature's. */
+    if (cfg.kv_streams && kv_one > 0 &&
+        b.kv >= kv_one && cfg.vram_kv_mib * kMiB < kv_one)
+        cfg.vram_kv_mib = to_mib_up(kv_one);
     /* A cache given its whole ceiling is rounded up to cover it, out of the headroom as the
      * weights' MiB is: truncated, a ceiling under a MiB would be an empty pool and one just over a
      * whole MiB a pool short of its own context. */

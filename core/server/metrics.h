@@ -111,7 +111,10 @@ private:
     std::string labels_;        /* {model_name="...",engine="0"} */
 
     Gauge   g_running_, g_waiting_, g_kv_util_, g_prefix_hit_;
-    Gauge   g_kv_max_tokens_, g_kv_max_bytes_;
+    Gauge   g_kv_max_tokens_, g_kv_max_bytes_, g_kv_resident_blocks_;
+    /* KV streaming: blocks copied into a streamed group's ring, and the bytes they carried, both
+     * cumulative and both zero unless a group's pool is a resident window. */
+    Counter c_kv_stream_misses_, c_kv_stream_bytes_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
     /* The decode floor in seconds: the fastest and the most recent single-sequence window. 0
      * until a window completes, and render() omits a 0. */

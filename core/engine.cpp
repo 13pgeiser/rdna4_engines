@@ -15,6 +15,7 @@
 #include "device/device.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "kvstream/stage.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
@@ -73,6 +74,7 @@ Engine::~Engine() {
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
+    if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
@@ -96,6 +98,10 @@ Engine::~Engine() {
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) r->ctx.shutdown();
+    /* A streamed group's host mirror is pinned outside every pool; the ring's maps came from the
+     * KV pool and go with it in ranks_.clear(). After the contexts, since a pass reads the mirror,
+     * and safe after a failed bring-up: a group that never got one is skipped. */
+    for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
     step_state_fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
@@ -346,6 +352,12 @@ int Engine::prepare_release(const RadBatch* b) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    /* This pass's stage bound, for every rank. Block ids are one table and rank 0's allocator is
+     * the only one that hands them out (the followers follow, above), so rank 0's highest held
+     * block bounds what any rank's staged layers can be asked to read. Read here rather than in the
+     * rank threads: the ranks are parked, so the next step's allocations cannot race it
+     * (kvstream/stage.h, "VOLUME"). */
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, ranks_[0]->kv);
     return RAD_OK;
 }
 
@@ -690,6 +702,10 @@ int Engine::step_loop() {
         st = block_drafting() ? issue_block_drafter(b->step, so)
                               : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
+        /* Behind this step's last resolve and inside the step-end event, so collect_step's wait
+         * proves the counters landed and the step path pays no extra synchronisation. */
+        st = stream_probe_issue(b);
+        if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
@@ -754,6 +770,14 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        /* The step is drained (collect_step waited on its end event), so the counters are readable.
+         * A chunk that produced no row did not wait, so its copy may still be in flight and is
+         * simply read on a later step; a prompt that completed or a request that ended always
+         * produced a row. */
+        if (so.n_rows > 0) {
+            st = stream_probe_take(b, res.n_prefill_done > 0, res.n_finished > 0);
+            if (st < 0) return fail_loop(st);
+        }
 
         /* The drafter for the next step already ran on the card; what remains is to check its
          * acceptance against the host's and publish its proposals. Each driver returns
@@ -822,6 +846,136 @@ int Engine::collect_issue(StepOut& so) {
         }
     }
     return RAD_OK;
+}
+
+/* ================================================================== KV streaming's counters
+ *
+ * The resolve keeps its cumulative counters, the peak union of one launch and the overflow latch in
+ * each streamed group's device control block (libref/ref_kvstream.cpp, "The control block"). The
+ * ring's depth is decided at startup (kvstream_ring, kvstream/plan.h: one decode step's selections,
+ * the arch's `topk + 1` a row); these counters are what says at run time that the decision holds,
+ * and a launch that does not fit is failed rather than served (docs/KV-STREAMING.md §3.4, §5
+ * Phase 4).
+ *
+ * The step path never waits on the card, so this does not sync: the copy is enqueued on rank 0's
+ * compute stream *behind the step's last resolve and before the step-end event*, and the commit that
+ * already waits for that event reads the pinned landing area. The numbers are then this step's, at
+ * the cost of one 64-byte copy per streamed group per step. They are per rank; one rank's answer is
+ * every rank's, because the ranks resolve the same shared block ids through maps brought up
+ * identically.
+ *
+ * `ctl` is cumulative, so metrics are charged the deltas (KVManager::note_stream_traffic) and the log
+ * carries the absolute numbers. */
+int Engine::stream_probe_issue(const RadBatch* b) {
+    if (!b || b->n_kv_groups <= 0 || ranks_.empty()) return RAD_OK;
+    const size_t n = (size_t)b->n_kv_groups;
+    if (stream_ctl_n_ < n) {
+        if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
+        stream_ctl_p_ = static_cast<int32_t*>(
+            rad_dev_alloc((int64_t)n * 16 * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED));
+        stream_ctl_n_ = stream_ctl_p_ ? n : 0;
+        if (!stream_ctl_p_) {
+            RAD_ERR("kv streaming: no pinned host memory for the resolve's counters, so a streamed "
+                    "step could be neither measured nor checked for overflow");
+            return RAD_E_NOMEM;
+        }
+        /* Zero, so a group whose first copy has not landed reads as "no calls yet" rather than as
+         * whatever the page held. */
+        std::memset(stream_ctl_p_, 0, n * 16 * sizeof(int32_t));
+    }
+    RadStream st = ranks_[0]->ctx.stream();
+    for (size_t i = 0; i < n; ++i) {
+        const RadKVStream* sv = b->kv[i].stream;
+        if (!sv || !sv->ctl) continue;
+        if (rad_memcpy_async(stream_ctl_p_ + i * 16, sv->ctl, 16 * 4, st) < 0) {
+            RAD_ERR("kv streaming: the resolve's counters could not be copied to the host: %s",
+                    rad_dev_last_error());
+            return RAD_E_STATE;
+        }
+    }
+    return RAD_OK;
+}
+
+/* Read what stream_probe_issue() enqueued, at a point the step already drained. Charges the metrics
+ * and, when asked, logs a line for the request. A newly latched overflow is never served: every
+ * request that was prefilling in the step just committed is failed with the ring size and the union
+ * that did not fit, and the latch is cleared on the card so the next request is measured on its own
+ * -- the map itself is consistent again, because the resolve reverts a claim it could not place. */
+int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request_end) {
+    if (!b || !stream_ctl_p_ || b->n_kv_groups <= 0) return RAD_OK;
+    const size_t n = (size_t)b->n_kv_groups;
+    if (stream_prev_.size() < n) stream_prev_.assign(n, StreamRead{});
+    RadStream st = ranks_[0]->ctx.stream();
+    bool       overflowed = false;
+    std::string overflow_why;
+    for (size_t i = 0; i < n; ++i) {
+        const RadKVStream* sv = b->kv[i].stream;
+        if (!sv) continue;
+        const int32_t* c = stream_ctl_p_ + i * 16;
+        /* The counters are the three u64s from ctl[4] (libref/ref_kvstream.cpp, "The control
+         * block"), which is why the block is 8-byte aligned. */
+        const uint64_t* ctr = (const uint64_t*)(c + 4);
+        StreamRead r;
+        r.group       = (int32_t)b->kv[i].group;
+        r.misses      = (int64_t)ctr[0];
+        r.lookups     = (int64_t)ctr[1];
+        r.resolves    = (int64_t)ctr[2];
+        r.overflow    = c[3] != 0;
+        r.max_union   = c[10];
+        r.max_misses  = c[11];
+        r.max_claims  = c[12];
+        r.slots       = sv->slots;
+        r.block_bytes = sv->block_bytes;
+        const StreamRead& p = stream_prev_[i];
+        const int64_t dm = r.misses - p.misses;
+        ranks_[0]->kv.note_stream_traffic(dm, dm * r.block_bytes);
+        if (request_end || prefill_done) stream_report(request_end ? "request end" : "prefill complete", r, p);
+        if (r.overflow && !p.overflow && !overflowed) {
+            overflowed = true;
+            const KVGroupPlan* gp = ranks_[0]->kv.plan(r.group);
+            const int64_t bs = gp && gp->block_size > 0 ? gp->block_size : 1;
+            /* The union is the largest one launch has selected since bring-up, which for a
+             * failing request is the launch that overflowed (it is at least the ring's depth). */
+            overflow_why = fmt(
+                "kv streaming overflow: group '%s' ring holds %lld blocks (%lld tokens) and one "
+                "resolve launch selected %lld distinct blocks, %lld of them not resident. The "
+                "request is failed rather than served from a selection table that no longer "
+                "addresses the pool; raise --kv-resident above %lld tokens and retry",
+                gp ? gp->name.c_str() : "?", (long long)r.slots, (long long)(r.slots * bs),
+                (long long)r.max_union, (long long)r.max_misses,
+                (long long)(r.max_union * bs));
+            RAD_ERR("%s", overflow_why.c_str());
+        }
+        stream_prev_[i] = r;
+    }
+    if (overflowed) {
+        /* Every request whose prompt the last step was still laying down read the table the failed
+         * sweep produced; fail it with the number, and clear the latch so the next request's
+         * measurement is its own (the resolve reverted the unplaced claims, so the map is legal). */
+        (void)sched_.fail_prefilling(overflow_why.c_str());
+        for (size_t i = 0; i < n; ++i) {
+            const RadKVStream* sv = b->kv[i].stream;
+            if (sv && sv->ctl) (void)rad_memset_async(sv->ctl + 3, 0, 4, st);
+        }
+    }
+    return RAD_OK;
+}
+
+/* One line per group: cumulative resolves, lookups and misses, and the three measured maxima, which
+ * are the numbers a ring -- and a resolve's claim list -- are sized from. The delta since the
+ * previous report is the part this interval contributed, so a single request's cost reads
+ * directly. `largest launch claims` is `ctl[12]`: a claim is a distinct block the launch found
+ * absent, one call makes at most `max_seqs * sel_pitch` of them, and a value above that says the
+ * derivation is wrong somewhere -- which is why it is reported rather than assumed. */
+void Engine::stream_report(const char* when, const StreamRead& r, const StreamRead& prev) {
+    const KVGroupPlan* gp = ranks_.empty() ? nullptr : ranks_[0]->kv.plan(r.group);
+    RAD_INFO("kv streaming: group '%s' %s: %lld resolves, %lld lookups, %lld misses (+%lld this "
+             "interval); ring %lld blocks, largest launch union %lld distinct blocks, largest "
+             "launch misses %lld, largest launch claims %lld, overflow %s",
+             gp ? gp->name.c_str() : "?", when, (long long)r.resolves, (long long)r.lookups,
+             (long long)r.misses, (long long)(r.misses - prev.misses), (long long)r.slots,
+             (long long)r.max_union, (long long)r.max_misses, (long long)r.max_claims,
+             r.overflow ? "LATCHED" : "no");
 }
 
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
@@ -1554,8 +1708,18 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * PCIe read and unordered against the copies that fill it (see Set in batch.h). */
     std::vector<BatchBuilder::RankIO> rio;
     rio.reserve(ranks_.size());
-    for (auto& rk : ranks_)
-        rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    rank_stream_views_.assign(ranks_.size(), {});
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        const size_t ng = ranks_[r]->program.kv_groups.size();
+        rank_stream_views_[r].resize(ng, nullptr);
+        for (size_t g = 0; g < ng; ++g)
+            rank_stream_views_[r][g] = ranks_[r]->kv.stream_view((int32_t)g);
+    }
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        auto& rk = ranks_[r];
+        rio.push_back({ rk->device, rk->ctx.stream(), &rk->program, rk->pools.kv().base(),
+                        rank_stream_views_[r].data() });
+    }
     if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;

@@ -115,6 +115,7 @@ public:
     rad_buf     decl_buffer  (const char* name, const RadBufDecl* d);
     rad_kvgroup decl_kv_group(const char* name, const RadKVGroupDecl* d);
     int64_t     kv_block_size(rad_kvgroup g);
+    int64_t     kv_layer_bytes(rad_kvgroup g);
     int         bind_layer_kv(int layer, rad_kvgroup g);
     rad_op      decl_op      (const char* op, const RadParam* p, int n_p,
                               const rad_weight* w, int n_w);
@@ -146,6 +147,7 @@ public:
     int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
                                 const int64_t* total, int n);
     int kv_group_zero(rad_kvgroup g);
+    int kv_group_dense_read(rad_kvgroup g);
     int kv_group_replicated(rad_kvgroup g);
 
     /* Finalise: weight first/last use, KV group geometry, buffer liveness and packing. Returns

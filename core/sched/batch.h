@@ -105,6 +105,16 @@ public:
         int       device = 0;
         RadStream stream = nullptr;
         Program*  prog   = nullptr;
+        /* This rank's KV pool base, the origin the streamed group's device maps are rebased
+         * from (see build_groups). Rank 0's is the basis the manager's stream_view names. */
+        void*     kv_base = nullptr;
+        /* This rank's block manager. A streamed group's view must come from it, not from rank
+         * 0's: the device maps live in that rank's pool and the host mirror is that rank's pinned
+         * allocation. Sharing rank 0's host mirror let two ranks write different KV shards into
+         * the same bytes. The array is per group and owned by the engine; it is a pointer array,
+         * not the manager, so a test that drives the builder without a device does not link the
+         * real manager and its backend. */
+        const RadKVStream* const* kv_streams = nullptr;
     };
 
     /* `prog` is non-const because derived buffers are written into its arena, whose pointer lands
@@ -242,6 +252,10 @@ private:
     static constexpr int kOut = RAD_SCHED_MAX_SPEC + 4;
     struct Out {
         std::vector<std::vector<RadKVGroupBatch>> kv;
+        /* Per rank and group, the RadKVStream a batch names. The view is not in the slab: its
+         * device pointers are rebased into that rank's KV pool, and its host mirror is shared,
+         * so each rank needs its own copy of the struct to point at. */
+        std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
     };
 

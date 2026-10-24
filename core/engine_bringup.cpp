@@ -21,6 +21,8 @@
 #include "format/table_copy.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
+#include "kvstream/bringup.h"
+#include "kvstream/plan.h"
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
@@ -329,14 +331,10 @@ static void memory_cgroups(const std::function<bool(const std::string&, int64_t)
     }
 }
 
-/* Whether `need` more bytes fit in host memory after `still` more this process will allocate
- * first and `margin` (--host-headroom-mib) stays free, or why not. Checks MemAvailable; every
- * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by
- * the OOM killer); and, for an mlock()ed copy (`mlocks`), RLIMIT_MEMLOCK unless the process has
- * CAP_IPC_LOCK. Pinned memory a card reads is a driver userptr mapping, which RLIMIT_MEMLOCK
- * does not count. An unreadable limit is ignored, never guessed. */
-static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
-                          std::string* why) {
+/* Declared in engine_hostmem.h, which carries the contract and the comment: the mirror of a
+ * streamed KV group is a second caller (kvstream/bringup.cpp). */
+bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                   std::string* why) {
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -918,6 +916,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* --kv-resident, in tokens: the ring a streamed group carves. Declared geometry states it where
+     * an op needs a ring depth (kv_resolve), so the report is the ring and not the context. */
+    bc.kv_resident_blocks = cfg_.kv_resident;
+    /* The probe's answer, so a streamed-only op is declared only for an architecture that serves
+     * one AND a deployment that asked (core/kvstream/bringup.cpp, kvstream_op_gated). */
+    bc.kv_stream_ok = arch_probe_.kv_stream_ok;
     /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
      * declare only (the direction table never changes); the per-request switch rides the derived
      * mask, not this struct. */
@@ -928,6 +932,19 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
 }
 
 int Engine::declare() {
+    /* KV streaming is a capability before it is a choice: an architecture that does not declare the
+     * streamed ops declares none even with the flag set (core/kvstream/bringup.cpp), so the probe's
+     * answer is taken here, once, and rides every declare. With --kv-resident on and no capability
+     * the flag is turned off in one sentence naming the architecture, rather than letting a ring no
+     * store can write be discovered after declare. */
+    (void)rad_tools_probe(plugins_, meta_, &arch_probe_);
+    if (cfg_.kv_resident > 0 && arch_probe_.kv_stream_ok == 0) {
+        cfg_.kv_resident = 0;
+        decide("--kv-resident", "0",
+               std::string("architecture '") + (meta_.arch_id ? meta_.arch_id : "?") +
+                   "' cannot address a resident ring: it declares no streamed KV store or resolve, "
+                   "so nothing streams");
+    }
     RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
      * would skip positions the reference holds, so both are off, and an explicit depth is refused
@@ -1589,6 +1606,13 @@ int Engine::plan() {
             if (declare_ring_windows(probe, r->program) == RAD_OK &&
                 probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 ck_slot += probe.checkpoint_bytes();
+                /* The budget must see the streamed plan before it sizes the pool: with a
+                 * one-layer stage the group's ceiling is max(ring, one layer of its context), and
+                 * cap_resident_tokens only runs much later (docs/KV-STREAMING.md §4.1). Without
+                 * this the pool is still sized for the whole cache and the phase frees nothing.
+                 * It prices the ring raised to a decode step's selection, before any weight is
+                 * loaded. */
+                RAD_TRY(kvstream_cap_probe(probe, cfg_, r->program, ctx));
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
                 /* One --max-model-len sequence's pool, as the inverse of the real plan: its
@@ -3054,6 +3078,17 @@ int Engine::configure_kv() {
                          "block and the linear-state chunk), so a checkpoint is a legal chunk split",
                          (long long)geo_.quantum)
                    : std::string("the model keeps no linear state to checkpoint"));
+    /* KV streaming's policy, its refusals, the ring's ceiling and the cap on every rank's pool
+     * (kvstream/bringup.h). The group is chosen once, from rank 0's declarations, because a
+     * streamed group must be the same group on every rank. --kv-resident is the whole switch: a
+     * ring that covers the group's context leaves `stream.group` at -1 and the group runs the
+     * engine's ordinary resident path. */
+    KVStreamSetup stream;
+    if (!ranks_.empty())
+        RAD_TRY(kvstream_configure(cfg_, cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train,
+                                   ranks_[0]->program.kv_groups, ranks_[0]->program, &stream));
+    if (stream.group >= 0)
+        for (auto& r : ranks_) r->kv.cap_resident_tokens(stream.group, stream.ring_tokens);
     /* One block table serves every rank (serve() checks it), so every rank carves the same number
      * of paged blocks. Under an uneven split the pools differ (more delta-net heads, or zero
      * attention weights), so each rank is planned first and all are capped at the least before
@@ -3077,6 +3112,24 @@ int Engine::configure_kv() {
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
         if (least < 0 || t < least) least = t;
     }
+    /* KV streaming's host tier: the mirrors are the largest host allocation in the engine after
+     * the experts' pool, so they are checked once, before any rank takes one, against everything
+     * still to be pinned after them (kvstream/bringup.h). What is still to come is the rest of the
+     * engine's host tiers, so it is summed here: the prefix cache's, the activation arenas and the
+     * checkpoint store when its size is already fixed. */
+    KVStreamHostUse stream_host;
+    for (auto& r : ranks_) kvstream_host_add(&stream_host, r->kv);
+    if (stream_host.sum.host_bytes > 0) {
+        const int64_t MiB = (int64_t)1 << 20;
+        int64_t still = cfg_.prefix_cache_mib * MiB;
+        for (auto& r : ranks_) still += arena_host_bytes(r->program);
+        if (cfg_.checkpoint_slots > 0) {
+            int64_t slot = 0;
+            for (auto& r : ranks_) slot += r->kv.checkpoint_bytes();
+            still += slot * cfg_.checkpoint_slots;
+        }
+        RAD_TRY(kvstream_host_gate(stream_host, (int)ranks_.size(), still, host_headroom_bytes()));
+    }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
@@ -3088,7 +3141,15 @@ int Engine::configure_kv() {
                          (long long)least);
             r->kv.cap_paged_tokens(least);
         }
+        /* Before the carve: the manager refuses a streamed plan whose mirror and map are not
+         * there, because an unbacked block id is written past the layer stride. The mirror is
+         * host memory outside every pool; the maps come out of this rank's KV pool, so the paged
+         * split below already has them taken and the pool report names them. */
+        const KVManager::StreamCost sc = r->kv.stream_cost();
+        if (sc.groups > 0)
+            RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv()));
         RAD_TRY(r->kv.carve(r->pools.kv()));
+        if (sc.groups > 0) RAD_TRY(kvstream_fill(r->kv));   /* the maps, after the elastic pool */
         /* Without virtual memory management the cache cannot lend: everything still works, but
          * the expert slab never grows, which no counter shows, so log it once. */
         if (r->index == 0 && !r->pools.kv().elastic())
@@ -3289,6 +3350,9 @@ int Engine::configure_kv() {
     }
 
     RAD_INFO("kv: %s", ranks_[0]->kv.report().c_str());
+    /* Which groups stream and what they took on both tiers, the stage, or which group's context
+     * the ring covers so that nothing streams at all (kvstream/bringup.h). */
+    kvstream_report(stream, stream_host, (int)ranks_.size());
     /* The prefix cache's report: on or off, groups covered and skipped. It names the two things
      * that silently disable caching on a hybrid model: a windowed group cannot be served a prefix,
      * and a linear model with no checkpoint interval replays from zero. */
@@ -3571,8 +3635,8 @@ int Engine::start() {
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             for (int64_t L = 0; L < p.n_layers; ++L) {
                 LoanStrip st;
-                st.top = (char*)p.base + L * stripe + p.n_blocks * lbpb;
-                st.bytes = p.n_blocks * lbpb;
+                st.top = (char*)p.base + L * stripe + p.pool_blocks() * lbpb;
+                st.bytes = p.pool_blocks() * lbpb;
                 st.unit_bytes = lbpb;
                 st.unit_tokens = p.block_size;
                 strips.push_back(st);

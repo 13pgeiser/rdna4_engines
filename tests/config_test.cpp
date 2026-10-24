@@ -429,6 +429,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
+        { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
@@ -724,6 +725,29 @@ TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
+}
+
+/* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
+ * rounded up to the group's page at startup. The mode flag is gone, and a launch line that still
+ * passes it is refused by name rather than silently served without streaming. */
+TEST(kv_resident_is_the_whole_switch_and_its_ring_is_whole_tokens) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.kv_resident, 0ll);              /* nothing streams */
+    CHECK(!d.kv_streams);                      /* derived: no group streams either */
+    for (const char* old : { "auto", "on", "off", "measure" }) {
+        Config c;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse({ "--kv-streaming", old }, &c); });
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(log, "--kv-resident"));      /* the message names the replacement */
+    }
+    Config c;
+    CHECK_EQ(parse({ "--kv-resident", "262144" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_resident, 262144ll);
+    CHECK_EQ(parse({ "--kv-resident", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_resident, 0ll);
+    CHECK_EQ(parse({ "--kv-resident", "-1" }, &c), RAD_E_INVAL);
 }
 
 /* The embedding takes ram (default) or vram; the n-gram table takes auto (default), vram, ram or

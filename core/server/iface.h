@@ -60,6 +60,12 @@ struct SchedMetrics {
      * expert slab (`kv_bytes_carved` in bytes). The smallest over the paged groups, which share
      * one token axis; windowed groups are excluded, since their carve bounds lookback, not fit. */
     int64_t kv_tokens_max = 0;
+    /* KV streaming (docs/KV-STREAMING.md §4.2): the ring's depth over every streamed group, and
+     * the resolve's cumulative misses and bytes copied in from the host mirror. All zero unless a
+     * group's pool is a resident window rather than its whole context. */
+    int64_t kv_resident_blocks = 0;
+    int64_t kv_stream_misses = 0;
+    int64_t kv_stream_bytes_in = 0;
 
     double  prefix_hit_rate = 0.0;    /* 0..1 */
     /* Cumulative prefix-cache evictions. They rise as reusable prefixes are dropped, while

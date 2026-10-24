@@ -87,6 +87,12 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
         if (o.kv_tokens_max == 0 || t < o.kv_tokens_max) o.kv_tokens_max = t;
     }
 
+    /* KV streaming's totals pass through unchanged: none of them is a per-group figure the
+     * binding rule above applies to. */
+    o.kv_resident_blocks = m.kv_resident_blocks;
+    o.kv_stream_misses = m.kv_stream_misses;
+    o.kv_stream_bytes_in = m.kv_stream_bytes_in;
+
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged
      * in. */

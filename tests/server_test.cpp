@@ -2271,6 +2271,11 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_EQ(d.type["radiance:draft_acceptance_ratio"], std::string("gauge"));
     CHECK_EQ(d.type["radiance:decode_tokens_per_second"], std::string("gauge"));
     CHECK_EQ(d.type["radiance:http_admission_rejected_total"], std::string("counter"));
+    /* KV streaming (docs/KV-STREAMING.md §4.2), present even when no group streams so a dashboard
+     * can query the names before the feature is turned on. The bytes counter carries `dir`. */
+    CHECK_EQ(d.type["radiance:kv_resident_blocks"], std::string("gauge"));
+    CHECK_EQ(d.type["radiance:kv_stream_misses_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:kv_stream_bytes_total"], std::string("counter"));
 
     /* The scheduler's numbers reached the gauges. */
     auto find_one = [&](const std::string& prefix) -> double {
@@ -2283,6 +2288,10 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_NEAR(find_one("vllm:gpu_cache_usage_perc{"), 0.42, 1e-9);
     CHECK_NEAR(find_one("radiance:draft_acceptance_ratio{"), 0.61, 1e-9);
     CHECK_NEAR(find_one("vllm:generation_tokens_total{"), 5.0, 1e-9);
+    /* This server streams nothing, so every streaming number is zero. */
+    CHECK_NEAR(find_one("radiance:kv_resident_blocks{"), 0.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:kv_stream_misses_total{"), 0.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:kv_stream_bytes_total{"), 0.0, 1e-9);
 
     /* An unmeasured decode floor is absent, not 0, which a scrape would plot as the fastest step
      * ever. This fixture completes no single-stream window, so neither series appears. */

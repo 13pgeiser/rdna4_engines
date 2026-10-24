@@ -85,6 +85,15 @@ static const Flag g_flags[] = {
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
+    { "--kv-resident",        "N",      "tokens of the sparse attention group's KV its VRAM ring\n"
+    "                                    holds; the whole switch. Absent or 0 keeps every block on\n"
+    "                                    the card. At or above the group's context (sequences x\n"
+    "                                    --max-model-len) nothing streams either: the group stays a\n"
+    "                                    plain resident pool and the engine takes its ordinary path,\n"
+    "                                    with no mirror, no stage and no resolve. Below it, the rest\n"
+    "                                    of each block lives in pinned host memory and the ring must\n"
+    "                                    hold one decode step's whole selection; a smaller ring is\n"
+    "                                    raised to that many blocks at startup, with a warning" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
@@ -530,6 +539,20 @@ int config_parse(int argc, char** argv, Config* c) {
                 RAD_ERR("--attn-prefill-fp8 takes off, qk, pv or both, not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--kv-streaming")) {
+            RAD_ERR("--kv-streaming was removed: --kv-resident N is the whole switch. It is the "
+                    "tokens of the sparse attention group's KV its VRAM ring holds, and leaving it "
+                    "off keeps every block on the card; there is no mode to choose past it");
+            return RAD_E_INVAL;
+        }
+        else if (S("--kv-resident"))           { if (!num(0, INT64_MAX, &c->kv_resident)) return RAD_E_INVAL; }
+        else if (S("--kv-stream-threshold")) {
+            RAD_ERR("--kv-stream-threshold was removed: the streamed path is the cheap one. The "
+                    "base path for a live set that fits the ring measured 2.6-2.9%% slower a step "
+                    "(record §74), so --kv-resident N is the whole switch and there is no path to "
+                    "choose");
+            return RAD_E_INVAL;
         }
         else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
@@ -1091,6 +1114,8 @@ const ShowRow kShow[] = {
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
+    { "--kv-resident",        [](const Config& c) {
+          return c.kv_resident > 0 ? num(c.kv_resident) : std::string("0 (off: no group streams)"); } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },

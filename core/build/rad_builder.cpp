@@ -9,6 +9,7 @@
  * which makes fusion a selection rather than a compiler pass (spec §2.3).
  */
 #include "rad_build.h"
+#include "kvstream/bringup.h"
 #include "lora/lora.h"
 #include "../device/device.h"
 
@@ -466,6 +467,19 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
     return 0;
 }
 
+/* The per-layer byte pitch of a paged group's block. finish_kv_groups() computes the same figure
+ * times the number of bound layers; this is the one a kernel addressing a single layer sees, and
+ * a streamed group's host mirror rows are this far apart. */
+int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
+    if (g == 0 || g >= prog_.kv_groups.size()) return 0;
+    KVGroupInfo& gi = prog_.kv_groups[g];
+    if (gi.decl.kind != RAD_KV_FULL && gi.decl.kind != RAD_KV_WINDOW) return 0;
+    const int64_t bs = kv_block_size(g);
+    if (bs <= 0) return 0;
+    const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
+    return rad_dtype_bytes(gi.decl.dtype, 2 * bs * nh * gi.decl.head_dim);
+}
+
 /* ================================================================== ops */
 void Builder::record_tune_request(const Resolved& r) {
     if (!r.row || !r.row->info || r.row->info->n_tunables <= 0) return;
@@ -803,6 +817,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
 }
 
 int Builder::op_declared(const char* op) const {
+    if (kvstream_op_gated(prog_.ctx, op)) return 0; /* no ring: a streamed op does not exist */
     return op && reg_.schema(op) ? 1 : 0;
 }
 
@@ -955,6 +970,21 @@ int Builder::kv_group_zero(rad_kvgroup h) {
         return RAD_E_INVAL;
     }
     prog_.kv_groups[h].zero = true;
+    return RAD_OK;
+}
+
+int Builder::kv_group_dense_read(rad_kvgroup h) {
+    if (finished_) { err(RAD_E_STATE, "kv_group_dense_read after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    /* Paged groups only: a per-sequence state slot is already sized for every sequence, and a
+     * window already bounds its own history. Only a full group's block count can be short. */
+    const KVGroupInfo& gi = prog_.kv_groups[h];
+    if (gi.decl.kind != RAD_KV_FULL) {
+        err(RAD_E_INVAL, "kv group '%s': dense_read on a group that is not a full attention group",
+            gi.name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].dense_read = true;
     return RAD_OK;
 }
 
@@ -2448,6 +2478,11 @@ int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) {
     return B(b)->kv_block_size(g);
 }
 
+int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return 0;
+    return B(b)->kv_layer_bytes(g);
+}
+
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->bind_layer_kv(layer, g);
@@ -2508,6 +2543,11 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, 
 int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->kv_group_zero(g);
+}
+
+int rad_kv_group_dense_read(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_dense_read(g);
 }
 
 int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {

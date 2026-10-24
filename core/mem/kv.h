@@ -20,6 +20,7 @@
  * request by the other.
  */
 #pragma once
+#include "kvstream/mirror.h"
 #include "mem/hostarena.h"
 #include "mem/pools.h"
 #include "rad_core.h"
@@ -53,6 +54,10 @@ struct BundleComparison {
     std::string report() const;
 };
 BundleComparison compare_bundling(const std::vector<int64_t>& bundles);
+
+/* The name a refusal or a report uses for a RAD_KV_* kind (kvstream/carve.cpp names the kind it
+ * refuses; KVManager::report() the one it carved). */
+const char* kv_kind_name(int kind);
 
 /* ------------------------------------------------------------------ the runtime window */
 /* A sequence's per-sequence window on a RAD_KV_WINDOW group, set at runtime (R-SWA, the
@@ -123,11 +128,31 @@ struct KVGroupPlan {
      * snapshot would be read. */
     bool        win_snap = false;
 
-    int64_t     n_blocks = 0;          /* paged groups: blocks carved from the pool */
+    int64_t     n_blocks = 0;          /* paged groups: blocks the group addresses (its context) */
+    /* Paged groups: blocks the device pool actually backs, which may be fewer than `n_blocks`
+     * when the group's KV streams (docs/KV-STREAMING.md). Block ids stay dense over `n_blocks` --
+     * the manager, the refcounts, the block table, the prefix cache and every `id < n_blocks`
+     * guard count in the group's context, because the table a sequence holds names logical blocks.
+     * Only *addressing* uses this: the pool is carved `n_slots` blocks deep and the stride between
+     * layers is `n_slots` blocks long, so a residency map (block -> resident slot) is what turns a
+     * logical block into an address. Equal to `n_blocks` in every other case, so no existing
+     * layout moves. */
+    int64_t     n_slots = 0;
+    /* Layer stripes the pool's *staged* view presents: 0 means `n_layers` (the ring, and every
+     * group that does not stream), 1 means one layer and every layer aliases offset 0. It is a
+     * depth, not a rewritten layer table: `layer_slot` is also the host mirror's row
+     * (rad_kv_layer_index), so collapsing it would write every layer into one mirror row
+     * (docs/KV-STREAMING.md §3.5.1). Set by carve() when the group's ring is smaller than its
+     * context. */
+    int64_t     depth = 0;
     /* rad_kv_group_zero: this rank keeps no cache for the group. The plan keeps its position and
      * block count (one block table serves every rank); its costs are zero and nothing is carved.
      * No op on this rank names it (issue refuses a group with no pool bound). */
     bool        zero = false;
+    /* An indexer-style group a decode step reads over the whole live history, so it cannot
+     * stream (kvstream/carve.h). When a sibling streams, its carve is a floor of max_seqs full
+     * contexts, not the split's shared token count. */
+    bool        dense_read = false;
     /* rad_kv_group_replicated: every rank holds the same bytes, so a tier slot carries this
      * group once, in a window at its front that rank 0 writes and every rank reads
      * (TierExec::slot_layout). The pool is carved as for any group. */
@@ -147,13 +172,21 @@ struct KVGroupPlan {
 
     bool paged() const { return kind == RAD_KV_FULL || kind == RAD_KV_WINDOW; }
     bool stateful() const { return kind == RAD_KV_LINEAR || kind == RAD_KV_CONV; }
+    /* Blocks of device pool this group owns: `n_slots` for a paged group, which is `n_blocks`
+     * unless the group streams. The one place the two meanings may be confused is addressing, so
+     * every carve and every stride goes through here and every allocation and every guard uses
+     * `n_blocks`. */
+    int64_t     pool_blocks() const { return n_slots > 0 ? n_slots : n_blocks; }
+    /* The pool holds less than the group addresses: blocks beyond `n_slots` live off the card and
+     * a residency map decides which are here. */
+    bool        streamed() const { return paged() && n_slots > 0 && n_slots < n_blocks; }
 
     /* The pool is layer-major, as the ABI requires: a RAD_OPK_KV operand carries the layer as its
      * offset and resolves to `base + layer * layer_stride` (RadOperand in rad_runtime.h,
      * KVPoolBinding in core/runtime/ctx.h), so a kernel gets one base pointer per layer and
      * indexes it with the block table and slot mapping.
      *
-     * Layer i owns [base + i*layer_stride, + layer_stride): n_blocks blocks of
+     * Layer i owns [base + i*layer_stride, + layer_stride): pool_blocks() blocks of
      * `bytes_per_block / n_layers` for a paged group, n_states states of
      * `bytes_per_state / n_layers` for a stateful one. */
     int64_t layer_bytes_per_block() const {
@@ -163,7 +196,8 @@ struct KVGroupPlan {
         return n_layers > 0 ? bytes_per_state / n_layers : bytes_per_state;
     }
     int64_t layer_stride() const {
-        return paged() ? n_blocks * layer_bytes_per_block() : n_states * layer_bytes_per_state();
+        return paged() ? pool_blocks() * layer_bytes_per_block()
+                       : n_states * layer_bytes_per_state();
     }
 };
 
@@ -224,6 +258,33 @@ public:
      * because paged_split is monotone in the budget. */
     int64_t pool_mib_for_tokens(int64_t tokens, int64_t max_mib) const;
     void    cap_paged_tokens(int64_t tokens) { tokens_cap_ = tokens > 0 ? tokens : 0; }
+
+    /* ---------------- KV streaming (kvstream/mirror.h, kvstream/carve.h) ----------------
+     *
+     * A streamed group's device pool is a resident window and its blocks' authority is a pinned
+     * host copy plus a device residency map. The state, the cap and the mirror's life cycle are
+     * KVStreamStore's, one member of it below; these are the manager's own names for them, so a
+     * caller (the engine, the tests, core/sched/mem_iface.h) does not need the module's header.
+     * See kvstream/mirror.h for what each one promises. */
+    using StreamMap   = RadKVStream;      /* the ABI's view: the mirror and the ring's maps */
+    using StreamCost  = KVStreamCost;
+    using StreamStats = KVStreamStats;
+    void cap_resident_tokens(int32_t group, int64_t tokens) { stream_.cap(group, tokens); }
+    void set_stream_map(int32_t group, const StreamMap& m) { stream_.set_map(group, m); }
+    const StreamMap*  stream_map(int32_t group) const { return stream_.map(group); }
+    const RadKVStream* stream_view(int32_t group) const {
+        return stream_.view(plan(group), group);
+    }
+    StreamCost  stream_cost() const { return stream_.cost(plans_, max_ctx_, max_seqs_); }
+    int  alloc_stream(MemAllocator& host_alloc, Pool& kv_pool) {
+        return stream_.alloc(plans_, max_ctx_, max_seqs_, host_alloc, kv_pool);
+    }
+    int  init_stream(RadStream s) { return stream_.init(plans_, s); }
+    void free_stream(MemAllocator& host_alloc) { stream_.release(host_alloc); }
+    StreamStats stream_stats() const { return stream_.stats(plans_); }
+    void note_stream_traffic(int64_t misses, int64_t bytes) {
+        stream_.note_traffic(misses, bytes);
+    }
     int     carve(Pool& kv_pool);
 
     const std::vector<KVGroupPlan>& plans() const { return plans_; }
@@ -368,6 +429,13 @@ public:
     /* The carve: the range every block id is addressed against. live_blocks() is what the cache
      * keeps unlent. */
     int64_t total_blocks(int32_t group) const;
+    /* One past the highest held block, rounded up to a `held_hist_` bucket (0 on a group with
+     * nothing held). Every id a sequence's block table can name is held, so this is an UPPER bound
+     * on those ids -- what a streamed group's prefill stage copies its mirror row up to
+     * (kvstream/stage.h). It counts blocks the prefix cache or another sequence holds too, so it
+     * is exact only while one request is live; the alternative, a scan of the block tables per
+     * layer, is the one thing the stage cannot afford. */
+    int64_t held_top_blocks(int32_t group) const;
     int64_t free_states(int32_t group) const;
 
     /* Pool size in bytes, the only unit in which groups can be summed: paged and stateful groups
@@ -622,6 +690,12 @@ private:
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */
     int64_t   ckpts_ = 0;      /* --checkpoint-slots, kept for the warning on a model with none */
     int64_t   tokens_cap_ = 0; /* cap_paged_tokens(): the least any rank can carve; 0 is none */
+    /* KV streaming's state, by group handle: the resident window cap, the mirror and the ring's
+     * maps, and the resolve's counters (kvstream/mirror.h). Empty and zero on a manager that does
+     * not stream, which is every group on a server without --kv-resident and also a group whose
+     * ring covers its context. */
+    KVStreamStore stream_;
+
     /* declare_runtime_window(): group -> W. Survives forget(), which plan_groups() calls at its
      * start: it is a declaration about the program, not about a plan. */
     std::unordered_map<int32_t, int64_t> runtime_decl_;

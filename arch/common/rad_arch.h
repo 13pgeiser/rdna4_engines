@@ -663,6 +663,11 @@ struct Geom {
     int64_t max_tok    = 0;
     int64_t max_seqs   = 0;
     int64_t max_ctx    = 0;
+    /* --kv-resident, in tokens (RadBuildCtx::kv_resident_blocks), 0 when nothing streams. The
+     * streamed group's ring is this many tokens rounded up to whole blocks; a declaration that must
+     * state a ring depth states this rather than the whole context, so the geometry an op reports
+     * is the geometry it is issued with. */
+    int64_t kv_resident = 0;
     int     max_spec   = 0;
     /* Most rows the sampler can want in one step: one per sequence, or one per draft position per
      * sequence at a speculative verify. Bounds the logits buffer (at a 248K vocab, 63 MiB rather
@@ -939,6 +944,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.max_tok   = c->max_tok;
     g.max_seqs  = c->max_seqs;
     g.max_ctx   = c->max_ctx;
+    g.kv_resident = c->kv_resident_blocks;
     g.max_spec  = c->max_spec;
     g.max_logit_rows = c->max_seqs * (c->max_spec > 0 ? c->max_spec + 1 : 1);
     if (g.max_logit_rows > c->max_tok) g.max_logit_rows = c->max_tok;
@@ -1058,6 +1064,96 @@ inline int64_t vocab_head_rows(const Geom& g) {
  * the batch, so the operand names the group and layer and the core resolves it like a weight
  * handle. */
 inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, layer); }
+
+/* The row a streamed group's layer occupies in its host mirror, or null when the group does not
+ * stream on this rank. The mirror is layer-major over the group's BOUND layers, in the order
+ * KVPoolBinding::layer_slot holds them, not over absolute model layers: a group's layers need not
+ * be contiguous (Qwen3.8-Flash-Next's full-attention layers are every other layer, plus the MTP
+ * head), so `rad_kv_layer_index` makes the same lookup a RAD_KV operand does and `layer` alone
+ * would read another layer's bytes. */
+inline const uint8_t* kv_stream_host(RadCtx* c, rad_kvgroup group, int layer,
+                                     const RadKVStream* s) {
+    if (!s || !s->host || s->block_bytes <= 0) return nullptr;
+    const int64_t li = rad_kv_layer_index(c, group, layer);
+    return li >= 0 ? s->host + li * s->host_layer_stride : nullptr;
+}
+
+/* Stage this layer for a streamed group's prefill pass. True when the group selected the-one-layer
+ * stage view: a copy was issued (or this layer was already staged for the pass), so the caller must
+ * not resolve and must read block ids directly. The ordering rule that makes the aliasing safe is
+ * in core/kvstream/stage.h; do not move this call off the compute stream or the layer's place
+ * between its store and its attention. */
+inline bool kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer) {
+    return rad_kv_stage_layer(c, group, kvb, layer) != 0;
+}
+
+/* The prefill stage's two DMA seams (docs/KV-STREAMING.md §5 Phase 3). Not in the frozen ABI: they
+ * are what this architecture needs to keep the ordering rule in core/kvstream/stage.h, and any
+ * plugin that stages a group must make the same two calls.
+ *
+ *   kv_stage_wait -- immediately BEFORE the layer's store, so the copy that reads the mirror lands
+ *                    before the store's newer bytes go into the stage;
+ *   kv_stage_next -- after every attention launch of the layer, so the copy of the next layer starts
+ *                    only once the last read of the aliased stage is behind it, riding on the next
+ *                    dispatch on this stream. */
+extern "C" int rad_kv_stage_wait(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer);
+extern "C" int rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
+inline bool kv_stage_wait(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer) {
+    return rad_kv_stage_wait(c, group, kvb, layer) != 0;
+}
+inline void kv_stage_next(RadCtx* c, rad_kvgroup group, int layer) {
+    (void)rad_kv_stage_next(c, group, layer);
+}
+
+/* The `kv_resolve` a streamed group's block declares. Every architecture declares the same
+ * geometry, and none of it is a free parameter:
+ *
+ *   blocks      the block-id space a selection can name: max_seqs rows of the group's whole
+ *               context;
+ *   slots       the ring --kv-resident carves, in whole blocks, clamped to `blocks`. NOT the
+ *               block-id space: the resolve is issued with the pool's depth and can never address
+ *               more, so declaring the context would size the row's scratch for slots it cannot
+ *               reach. It is also a ceiling over the flag rather than the flag: an operator who
+ *               asks for a ring smaller than one decode step can name has it raised to
+ *               max_seqs x (1 + n_spec) x sel_pitch before anything is carved (kvstream_ring), and
+ *               the declaration must cover that product or the resolve would refuse the very ring
+ *               it was sized for. With nothing streaming the ring covers the context and `slots` is
+ *               `blocks`;
+ *   sel_pitch   the selection row's pitch, which is what the attention op declares its own rows
+ *               with (`qsa_topk + 1` on the sparse path, the indexer's count on GLM).
+ *
+ * The claim count the op's miss list has to hold is derived from these rather than stated
+ * anywhere: one claim is one distinct block a launch's selection names, so a launch makes at most
+ * `M * sel_pitch` of them, and those two operands are what the kernel sizes its shared claim list
+ * from (libr4d/r4d_kv_resolve.hip's kv_claim_cap). ctl[12] reports the largest claim count a
+ * launch has actually made, so a declaration that is ever wrong shows up in the engine's stream
+ * report.
+ *
+ * `sel` is declared read as well as written, so the arena keeps the selection live from its
+ * producer to the attention across this op. Returns 0 when the arch does not declare the op or the
+ * group has nothing to address, which is the caller's "no resolve on this path". */
+inline rad_op kv_resolve_declare(RadBuilder* b, const Geom& g, rad_kvgroup kv, rad_buf sel,
+                                 rad_buf nsel, int64_t sel_pitch) {
+    if (!rad_op_declared(b, "kv_resolve") || !sel || !nsel || sel_pitch <= 0) return 0;
+    const int64_t bs     = rad_kv_block_size(b, kv);
+    const int64_t bbytes = rad_kv_layer_bytes(b, kv);
+    const int64_t blocks = bs > 0 ? g.max_seqs * ((g.max_ctx + bs - 1) / bs) : 0;
+    if (bs <= 0 || bbytes <= 0 || blocks <= 0) return 0;
+    const int64_t ring  = g.kv_resident > 0 ? (g.kv_resident + bs - 1) / bs : 0;
+    const int64_t step  = g.max_seqs * (1 + (g.max_spec > 0 ? g.max_spec : 0)) * sel_pitch;
+    const int64_t want  = ring > 0 && step > ring ? step : ring;
+    const int64_t slots = want > 0 && want < blocks ? want : blocks;
+    const rad_op op = RAD_OP(b, "kv_resolve",
+                             RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("blocks", blocks),
+                                        RAD_INT("slots", slots), RAD_INT("sel_pitch", sel_pitch),
+                                        RAD_INT("block_bytes", bbytes)),
+                             RAD_NOWEIGHTS);
+    if (!op) return 0;
+    const rad_buf rd[2] = { sel, nsel };
+    rad_op_reads(b, op, rd, 2);
+    rad_op_writes(b, op, &sel, 1);
+    return op;
+}
 
 /* ================================================================== step-sized operands */
 /* Every operand a step issues carries the step's row count, not the buffer's.

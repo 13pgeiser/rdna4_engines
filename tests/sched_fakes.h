@@ -339,6 +339,14 @@ struct FakeKV : IKVManager {
         const KVGeom::G& gg = geom.g[(size_t)g];
         return gg.paged ? gg.block_size : 0;
     }
+    /* A streamed group's view, as KVManager::stream_view returns it. Tests install fake
+     * addresses to check that the builder rebases them into each rank's pool; with `streams`
+     * false the fake has none, which is every other scheduler test. */
+    RadKVStream stream{};
+    bool        streams = false;
+    const RadKVStream* stream_view(int32_t g) const override {
+        return streams && g == 0 ? &stream : nullptr;
+    }
 };
 
 struct FakePC : IPrefixCache {

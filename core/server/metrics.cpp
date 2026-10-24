@@ -136,6 +136,7 @@ void Metrics::sample(const SchedMetrics& m) {
     g_kv_util_.set(m.kv_util);
     g_kv_max_tokens_.set((double)m.kv_tokens_max);
     g_kv_max_bytes_.set((double)m.kv_bytes_carved);
+    g_kv_resident_blocks_.set((double)m.kv_resident_blocks);
     g_prefix_hit_.set(m.prefix_hit_rate);
     g_prefill_tps_.set(m.prefill_tps);
     g_decode_tps_.set(m.decode_tps);
@@ -200,6 +201,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_cut_resumed_below_.advance_to(m.hit_cut_resumed_below);
     c_restore_cuts_.advance_to(m.prefix_restore_cuts);
     c_cut_tokens_.advance_to(m.hit_cut_tokens);
+    c_kv_stream_misses_.advance_to((double)m.kv_stream_misses);
+    c_kv_stream_bytes_.advance_to((double)m.kv_stream_bytes_in);
     g_linear_hit_.set(m.linear_hit_rate);
 }
 
@@ -281,6 +284,24 @@ std::string Metrics::render() const {
     w.gauge("radiance:kv_cache_max_bytes",
             "VRAM the KV cache holds with every block it lends the experts taken back, one card.",
             L, g_kv_max_bytes_.get());
+    /* KV streaming (docs/KV-STREAMING.md §4.2): the ring's depth over every streamed group, and
+     * what the resolve has moved into it. All zero on a server whose groups are fully resident. */
+    w.gauge("radiance:kv_resident_blocks",
+            "Blocks of every streamed KV group the device ring holds; 0 when no group streams.",
+            L, g_kv_resident_blocks_.get());
+    w.counter("radiance:kv_stream_misses_total",
+              "Blocks copied into a streamed KV group's ring from the host mirror.",
+              L, c_kv_stream_misses_.get());
+    /* Split by direction, as the host tier may later gain a write-back: only `in` exists today,
+     * the misses' copy from the mirror into the ring. The label is spelled the way the design
+     * note does so a dashboard can ask for both from the start. */
+    w.help("radiance:kv_stream_bytes_total",
+           "Bytes a streamed KV group's resolve moved, by direction.", "counter");
+    w.out += "radiance:kv_stream_bytes_total";
+    w.out += L.substr(0, L.size() - 1);
+    w.out += ",dir=\"in\"} ";
+    w.out += num(c_kv_stream_bytes_.get());
+    w.out += '\n';
     w.gauge("vllm:gpu_prefix_cache_hit_rate",
             "GPU prefix cache block hit rate.", L, g_prefix_hit_.get());
 

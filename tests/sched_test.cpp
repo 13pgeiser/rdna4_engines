@@ -3336,6 +3336,78 @@ TEST(the_cards_block_tables_match_the_manager_after_every_build) {
     CHECK(checked > 100);
 }
 
+/* A streamed group's residency map and ring bookkeeping live in each rank's KV pool,
+ * but the manager the builder is given is rank 0's, so its pointers are rank 0's addresses. A
+ * two-rank batch must name rank r's own copies or device r resolves through device 0's memory
+ * (a page-not-present fault at --tp 2). The host mirror is the exception: RAD_MEM_HOST_MAPPED's
+ * device view is its host address on every card, so it is the same pointer on both ranks.
+ *
+ * The bases are fake and no map is dereferenced: what is under test is the rebasing arithmetic,
+ * not two cards. Both ranks use device 0 so the test runs on the host backend. */
+TEST(a_two_rank_batch_rebases_stream_maps_into_each_ranks_pool_and_shares_the_mirror) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+
+    /* Two pools' worth of address space, only ever differenced, never dereferenced. */
+    alignas(16) char pool0[0x200], pool1[0x200];
+    char* const base[2] = { pool0, pool1 };
+    const int64_t res_off = 0x40, sblk_off = 0x80, sst_off = 0xc0, ctl_off = 0x100;
+    alignas(16) uint8_t mirror[0x100];
+    f.kv.streams = true;
+    f.kv.stream.host        = mirror;
+    f.kv.stream.res         = (int32_t*)(base[0] + res_off);
+    f.kv.stream.slot_block  = (int32_t*)(base[0] + sblk_off);
+    f.kv.stream.slot_state  = (int32_t*)(base[0] + sst_off);
+    f.kv.stream.ctl         = (int32_t*)(base[0] + ctl_off);
+    f.kv.stream.block_bytes = 64;
+    f.kv.stream.slots       = 8;
+
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog, base[0] });
+    rio.push_back({ 0, nullptr, &f.prog, base[1] });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 80));
+    StepPlan p;
+    p.reset();
+    StepEntry e;
+    e.seq = 1;
+    e.card = 0;
+    e.n_tokens = 1;
+    e.ctx_len = 79;
+    p.e.push_back(e);
+    p.n_tok = 1;
+    REQUIRE(bb.build(p, f.kv, 0) != nullptr);
+
+    for (int r = 0; r < 2; ++r) {
+        const RadBatch* b = bb.batch_for(r);
+        REQUIRE(b != nullptr);
+        const RadKVStream* s = b->kv[0].stream;
+        REQUIRE(s != nullptr);
+        CHECK_EQ((void*)s->res,        (void*)(base[r] + res_off));
+        CHECK_EQ((void*)s->slot_block, (void*)(base[r] + sblk_off));
+        CHECK_EQ((void*)s->slot_state, (void*)(base[r] + sst_off));
+        CHECK_EQ((void*)s->ctl,        (void*)(base[r] + ctl_off));
+        /* Same mirror address, and the geometry is rank-independent. */
+        CHECK_EQ((void*)s->host, (void*)mirror);
+        CHECK_EQ(s->block_bytes, (int64_t)64);
+        CHECK_EQ(s->slots, (int64_t)8);
+        /* Groups that do not stream keep a null view. */
+        for (int gi = 1; gi < b->n_kv_groups; ++gi)
+            CHECK(b->kv[gi].stream == nullptr);
+    }
+    bb.fini();
+}
+
 /* A sequence that leaves a row and returns to it is restaged whole. Its change marks are taken
  * wherever it is written, so the old row's copy goes stale; restaging only later changes would
  * keep entries a rollback replaced earlier. The scheduler's own passes reorder rows, so this

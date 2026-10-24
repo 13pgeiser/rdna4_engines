@@ -4,6 +4,7 @@
 #include "mm/processor.h"
 #include "derive.h"
 #include "device/device.h"
+#include "kvstream/bind.h"
 
 #include <algorithm>
 #include <cassert>
@@ -233,6 +234,7 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
 
     for (Out& o : out_) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
+        o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
     }
     pitch_.assign(s.groups.size(), 1);
@@ -821,6 +823,8 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             a.tlen_off    = (const char*)s.d_tlen - d0;
         }
 
+        /* Each rank's own view of the group's ring and mirror (kvstream/bind.h). */
+        const RadKVStream* sv = kv.stream_view((int32_t)gi);
         for (size_t r = 0; r < ranks_.size(); ++r) {
             void* base = s.dev[r];
             RadKVGroupBatch& b = o.kv[r][gi];
@@ -833,6 +837,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             b.state_index_pitch = g.sidx_pitch;
             b.block_size = L.block_size;
             b.max_blocks = pitch;
+            b.stream = kvstream_step_view(&o.stream[r][gi],
+                                          ranks_[r].kv_streams ? ranks_[r].kv_streams[gi] : sv,
+                                          ranks_[r].kv_streams != nullptr,
+                                          ranks_[0].kv_base, ranks_[r].kv_base);
 
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }

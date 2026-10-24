@@ -114,6 +114,9 @@ private:
      * than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    /* Per rank and KV group, that rank manager's stream view, or null for a resident group. The
+     * batch builder takes these instead of dereferencing a manager it cannot know per rank. */
+    std::vector<std::vector<const RadKVStream*>> rank_stream_views_;
     /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
@@ -334,6 +337,33 @@ private:
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent step_end_ = nullptr;
 
+    /* ---- KV streaming's measured counters (docs/KV-STREAMING.md §3.4, §5 Phase 1) ----
+     *
+     * The resolve keeps its counters in each streamed group's device control block (`ctl[4..],
+     * [10], [11]`, libref/ref_kvstream.cpp). The step path must not wait on the card, so the copy
+     * is *enqueued* behind the step's last resolve and before the step-end event, and read at the
+     * commit that already waits for that event: the numbers are this step's, and no extra
+     * synchronisation is added. Pinned, because a device-to-host copy into pageable memory blocks
+     * on the stream.
+     *
+     * The reports are what one launch selects against what the ring holds, for the metrics and for
+     * a ring that turns out too shallow at run time. Overflow is never served -- the request is
+     * failed. */
+    struct StreamRead {
+        int64_t  resolves = 0, lookups = 0, misses = 0;
+        int64_t  max_union = 0, max_misses = 0, max_claims = 0;
+        int64_t  slots = 0, block_bytes = 0;
+        bool     overflow = false;
+        int32_t  group = -1;
+    };
+    std::vector<StreamRead> stream_prev_;   /* what metrics have already been charged */
+    /* Pinned landing area for the copies: [n_kv_groups][16] i32, grown on first use. */
+    int32_t*                stream_ctl_p_ = nullptr;
+    size_t                  stream_ctl_n_ = 0;
+    int  stream_probe_issue(const RadBatch* b);
+    int  stream_probe_take(const RadBatch* b, bool prefill_done, bool request_end);
+    void stream_report(const char* when, const StreamRead& r, const StreamRead& prev);
+
     /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
      * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the
      * string because RadDrafterDecl::name points into the Program. */
@@ -518,6 +548,10 @@ private:
     void decide(const std::string& key, const std::string& value, const std::string& why) {
         diag::decide(&decisions_, key, value, why);
     }
+    /* The architecture's capability table (RadArchProbe), asked once in declare(): a property of
+     * the model rather than of the deployment, so every RadBuildCtx this engine builds carries the
+     * one answer (RadBuildCtx::kv_stream_ok). Zeroed means nothing was asked yet. */
+    RadArchProbe arch_probe_{};
     std::string devnote_;            /* the devices usable_devices left out, and why */
     int         p2p_measured_ = -1;  /* 1 peer to peer, 0 through host memory, -1 not asked */
     std::string p2p_blocked_;

@@ -181,18 +181,34 @@ typedef struct RadBuildCtx {
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_quant;
 
-    /* ---- appended in ABI 26 (fp8 prefill attention) */
+    /* ---- appended in ABI 29 (fp8 prefill attention) */
     /* RAD_ATTN_FP8_* bits from --attn-prefill-fp8: the attention products the deployment accepts
      * in e4m3 rather than exactly. 0 (the zero-initialised default) is exact. A plugin passes a
      * nonzero value on as `attn_paged`'s `prefill_fp8` (docs/OPS.md) and omits the parameter at
      * 0, so an exact declare is unchanged. The engine refuses to start when no resolved kernel
      * takes it, so a plugin that ignores the field is refused rather than silently exact.
      *
-     * Zero-defaulted and in the padding after kv_quant, so no other field moves and a plugin built
-     * against the older struct is unchanged. */
+     * Zero-defaulted and in the padding after kv_quant, so no other field moves: it fills four
+     * bytes the ABI 28 layout already padded before kv_resident_blocks. */
     int      attn_prefill_fp8;
 
-    /* ---- appended in ABI 26 (control vectors) */
+    /* Nonzero: the storage of a streamed group's VRAM ring, from --kv-resident, and the only switch
+     * that turns KV streaming on (0: nothing streams). In tokens, as the flag spells it; the ring a
+     * group carves is this rounded up to whole blocks and clamped to the group's context, which is
+     * the number its `kv_resolve` is issued with. Declaring it lets a plugin state a ring depth in
+     * an op's geometry rather than the context bound, so the reported geometry is the real one.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int64_t  kv_resident_blocks;
+    /* RadArchProbe::kv_stream_ok, carried to the declare: the architecture can stream at all. A
+     * streamed-only op (`kv_store_streamed`, its folded form, `kv_resolve`) exists only when this
+     * is set AND kv_resident_blocks asks for a ring, so an architecture that cannot stream declares
+     * none and every `rad_op_declared` in it falls through to the path it had before streaming.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      kv_stream_ok;
+
+    /* ---- appended in ABI 27 (control vectors) */
     /* A control vector loaded from a GGUF `controlvector` file found for this model, or null.
      *
      * The engine loads and validates it once, at bringup, and the plugin only reads it: the
@@ -428,6 +444,11 @@ typedef struct RadKVGroupDecl {
 rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name, const RadKVGroupDecl* d);
 /* Valid only after the op that reads this group has been declared. 0 before that. */
 int64_t     rad_kv_block_size(RadBuilder* b, rad_kvgroup g);
+/* Bytes one block of ONE layer of a paged group occupies: the pitch of its device pool's slot and
+ * of its host mirror's row. Derived from the declaration and the block size the attention kernel
+ * supplies, the same figure KVGroupPlan::layer_bytes_per_block() carves. 0 for a group that is not
+ * paged, or before the block size is known. Additive export. */
+int64_t     rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g);
 
 /* Bind a layer to a group, so the block manager knows how many state instances a sequence owns. */
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g);
@@ -526,8 +547,18 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
  * rank computes whole, an indexer's key cache every rank pools into); the engine moves bytes and
  * cannot know. RADIANCE_DEBUG_TIER_VERIFY checks the claim: each follower hashes what it would
  * have written and the leader compares. Paged groups only, and never a group this rank declared
- * zero. No effect at one rank. Additive export; RAD_ABI_VERSION does not move. */
+ * zero. No effect at one rank. A replicated group is never streamed: every rank already holds
+ * it whole, so a streamed store would write the same bytes world times. Additive export;
+ * RAD_ABI_VERSION does not move. */
 int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g);
+
+/* This rank reads the group's whole live history every decode step, so it cannot be streamed
+ * from host memory: an indexer's block keys, which a scorer walks densely each step. While a
+ * sibling group streams, the carve funds this one for every sequence's full context instead of
+ * the split's shared token count -- the host mirror is sized for --max-num-seqs sequences, and an
+ * indexer funded for one would make that capacity a promise the engine cannot keep. A flag on the
+ * group, not a sizing hint: it does not change the group's dtype or site. Additive export. */
+int rad_kv_group_dense_read(RadBuilder* b, rad_kvgroup g);
 
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
@@ -1429,8 +1460,22 @@ typedef struct RadArchProbe {
      * then takes them. Zero keeps them off: plain decode measured slower chained, and a plugin
      * that never measured them asks for nothing. */
     int32_t chain_pays;
+    /* Nonzero when the architecture can move a KV group between host memory and a resident VRAM
+     * ring: its attention is sparse and block-addressed, and it declares a streamed store
+     * (`kv_store_streamed` or the folded form) and `kv_resolve` for both. This is the table entry
+     * that makes --kv-resident automatic: the core declares the streamed-only ops only for an
+     * architecture that says yes here (RadBuildCtx::kv_stream_ok, core/kvstream/bringup.cpp), so a
+     * model that does not stream keeps the graph, arena and kernels it had before streaming
+     * existed, and the operator's flag is turned off at startup with one sentence naming the
+     * architecture rather than failing after declare.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int32_t kv_stream_ok;
+    /* ---- appended in ABI 29 (control vectors) */
     /* Nonzero when the plugin applies RadBuildCtx::cvec for this model. --control-vector is
-     * refused at startup with the plugin named when this is 0. */
+     * refused at startup with the plugin named when this is 0.
+     *
+     * Trailing and zero-defaulted after ABI 28's kv_stream_ok. */
     int32_t control_vector_ok;
 
     /* ---- appended in ABI 27 (row-split prefill attention) */
