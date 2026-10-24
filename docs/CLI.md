@@ -15,7 +15,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag>` (on a terminal) | Asks only what the registry leaves open, then confirms: (1) the **tier**, when the registry has other tags `<tag>-<suffix>` of the same `arch_id` (aliases resolve first, so `qwen3.8:flash` offers the `qwen3.8:flash-next` tiers; same-artifact tags, a split entry's monolithic sibling, drafts and local-only entries are not tiers), each with its size, the first sentence of its `desc` and whether `min_vram_gb` fits the detected VRAM or VRAM+RAM; (2) the **PLE rows** of a split entry (published q4/q8, both, or none; preselected: what `--ple auto` fetches, or q4 when host RAM cannot hold the base plus the q8 rows); (3) the registry's **draft/MTP sidecars** (MTP, DSpark, DFlash; default yes); (4) a **summary** with every file, the total download and the free disk space (default no when it does not fit). Enter takes the default. A flag skips its question: name the tier's tag, `--ple`, `--draft` / `--no-draft`. A single-variant model with nothing to ask pulls without a prompt. `-y` / `--yes`, or a stdin that is not a terminal, asks nothing and takes the registry defaults (the tag as given, `--ple auto`, every declared sidecar), so scripts and CI are unchanged. |
 | `hipfire pull <tag> --no-draft` | Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash); `--draft` fetches them without asking (the default). Other declared sidecars are always fetched. |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere, the union over every detected GPU arch on a mixed host such as gfx1100 + gfx1151). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
-| `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
+| `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client, only on a host with a gfx1151 GPU (or no detected GPU); a gfx1100/gfx1201 host skips it. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
 | `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default (the interactive pull prompt asks it as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice; `--yes` and the TUI's Models-tab pull keep it), from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
@@ -150,7 +150,14 @@ weights and `=1` applies the overlay on any architecture.
 
 - **Pull.** `hipfire pull <tag>` downloads and SHA-256 verifies the pinned
   overlay with the other sidecars; a valid file already on disk is not
-  downloaded again, a stale one is refreshed. As for other sidecars, a failed
+  downloaded again, a stale one is refreshed. The loader applies the overlay
+  only on gfx1151, so the pull fetches it only when a detected GPU is a gfx1151
+  (a mixed host with one counts) or none is detected (the pull cannot know where
+  the model will run); on a host whose GPUs are all other architectures it
+  prints `Skipping Trunk overlay sidecar` and downloads nothing for it, and the
+  interactive summary does not list it. `HIPFIRE_QWEN4_TRUNK_OVERLAY=1` (apply
+  on any architecture) keeps the download everywhere. After adding a gfx1151
+  card, run `hipfire pull <tag>` again to fetch it. As for other sidecars, a failed
   overlay download prints a warning and the pull still succeeds (the base loads
   unchanged). Any other registry entry (e.g. the RTN-asym file) has no
   overlay.
