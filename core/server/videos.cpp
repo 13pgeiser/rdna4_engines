@@ -377,7 +377,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     static const char* kKnown[] = {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps",
-        "sampler", "shift", "audio_shift",
+        "sampler", "shift", "audio_shift", "first_frame_mode",
         "negative_prompt", "decoder", "loras", "lora",
         /* RadVideoGenBatch::guidance_h's order */
         "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
@@ -521,6 +521,25 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 return bad("last_frame", "task '" + kf_task + "' pins a last frame: give a "
                                          "last_frame part");
         }
+    }
+    /* How the FIRST keyframe is fitted to the canvas. The reference stretches it ("disabled"):
+     * every pixel survives, but an anchor whose aspect differs from the canvas's is distorted --
+     * a portrait photo pinned into a landscape video comes out squashed. "center" instead keeps
+     * the anchor's aspect and centre-crops the excess: true geometry, edges fall off the canvas.
+     * The last frame always centre-crops ("center"), as the reference does. Ignored without a
+     * first_frame part. */
+    bool first_center = false;
+    if (has(body, "first_frame_mode")) {
+        const std::string fm = body["first_frame_mode"].is_string()
+                             ? body["first_frame_mode"].get<std::string>() : "";
+        if (fm.empty() || fm == "stretch")
+            ;
+        else if (fm == "center")
+            first_center = true;
+        else
+            return bad("first_frame_mode", "expected \"stretch\" (the reference's own resize) "
+                                           "or \"center\" (keep the anchor's aspect, crop the "
+                                           "canvas)");
     }
     json target = json::object();
     if (has(body, "target")) {
@@ -914,13 +933,15 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             const size_t   n = m.data.size();
             if (m.kind == gen::VideoRefMedia::FIRST_FRAME ||
                 m.kind == gen::VideoRefMedia::LAST_FRAME) {
-                /* A keyframe anchor resized to the EXACT output canvas: first a plain stretch
-                 * ("disabled"), last a centre crop ("center") -- the reference's own resize. Its
-                 * latent grid is then the target's, so the pack's pinned rows (frame_rows wide)
-                 * match what the encoder writes into the image slot. */
+                /* A keyframe anchor resized to the EXACT output canvas: the first a plain stretch
+                 * ("disabled" -- the reference's own resize) unless the request asked
+                 * first_frame_mode=center, the last always a centre crop ("center"). Its latent
+                 * grid is then the target's, so the pack's pinned rows (frame_rows wide) match
+                 * what the encoder writes into the image slot. */
                 mm::Frame fr;
                 if (deps_.mm->encoder_image_canvas(p, n, (int32_t)W, (int32_t)H,
-                                                  m.kind == gen::VideoRefMedia::LAST_FRAME,
+                                                  m.kind == gen::VideoRefMedia::LAST_FRAME
+                                                      || first_center,
                                                   &fr, &why) < 0)
                     return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
                 m.enc_frames = 1;

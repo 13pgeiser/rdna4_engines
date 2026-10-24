@@ -654,6 +654,9 @@ TEST(fl2va_keyframes_feed_the_tower_and_pin_the_output_ends) {
     CHECK_EQ(mm.cenc_w, 256);
     CHECK_EQ(mm.cenc_h, 256);
     CHECK(mm.cenc_cover);                    /* the last call was the last frame's centre crop */
+    REQUIRE_EQ(mm.cenc_covers.size(), (size_t)2);
+    CHECK(!mm.cenc_covers[0]);               /* default first frame: the reference's stretch */
+    CHECK(mm.cenc_covers[1]);                /* the last frame: always the centre crop */
     const gen::VideoRequest& g = gen.last();
     REQUIRE_EQ(g.refs.size(), (size_t)2);
     CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::FIRST_FRAME);
@@ -677,6 +680,83 @@ TEST(fl2va_keyframes_feed_the_tower_and_pin_the_output_ends) {
     want.insert(want.end(), mm.expand.begin(), mm.expand.end());
     chars("fox");
     CHECK(g.tokens == want);
+}
+
+/* first_frame_mode=center: the FIRST anchor is cover-cropped to the canvas instead of stretched --
+ * the no-distortion answer for a portrait photo pinned into a landscape output. The flag reaches
+ * encoder_image_canvas on the first call; the last frame keeps its centre crop either way. */
+TEST(first_frame_mode_center_cover_crops_the_first_anchor) {
+    FakeMultimodal mm;
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 512;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "fl2va" },
+               FormPart{ "first_frame", "f.png", "image/png", "PF" },
+               FormPart{ "last_frame", "l.png", "image/png", "PL" },
+               FormPart{ "first_frame_mode", "", "", "center" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    REQUIRE_EQ(mm.cenc_covers.size(), (size_t)2);
+    CHECK(mm.cenc_covers[0]);                /* the first anchor: centre crop, not stretch */
+    CHECK(mm.cenc_covers[1]);                /* the last: unchanged */
+    CHECK_EQ(mm.cenc_w, 256);
+    CHECK_EQ(mm.cenc_h, 256);                /* still the EXACT canvas: pins need its grid */
+}
+
+/* first_frame_mode takes two values; anything else is refused naming the field, and an explicit
+ * "stretch" (or empty form field) keeps the reference's default. */
+TEST(first_frame_mode_refuses_a_mode_it_does_not_know) {
+    FakeMultimodal mm;
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 512;
+    } }));
+    auto post = [&](const char* mode) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/videos";
+        q.form = { FormPart{ "prompt", "", "", "fox" }, FormPart{ "size", "", "", "256x256" },
+                   FormPart{ "first_frame", "f.png", "image/png", "PF" } };
+        if (mode) q.form.push_back(FormPart{ "first_frame_mode", "", "", mode });
+        return f->srv->router().dispatch(q);
+    };
+    {
+        HttpResponse r = post("warp");
+        CHECK(r.status >= 400);
+        CHECK(r.body.find("first_frame_mode") != std::string::npos);
+    }
+    mm.cenc_covers.clear();
+    {
+        HttpResponse r = post("stretch");
+        REQUIRE_EQ(r.status, 200);
+        REQUIRE_EQ(mm.cenc_covers.size(), (size_t)1);
+        CHECK(!mm.cenc_covers[0]);
+    }
+    mm.cenc_covers.clear();
+    {
+        HttpResponse r = post("");           /* an empty form field is "not set" */
+        REQUIRE_EQ(r.status, 200);
+        REQUIRE_EQ(mm.cenc_covers.size(), (size_t)1);
+        CHECK(!mm.cenc_covers[0]);
+    }
 }
 
 /* Without a vision tower the keyframe request still renders: the anchors keep their VAE pin but carry

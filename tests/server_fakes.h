@@ -411,9 +411,11 @@ struct FakeMultimodal : IMultimodal {
     int32_t enc_frames = 5, enc_side = 16;
     int64_t enc_n = 850;
     int n_ienc = 0, n_venc = 0, n_aenc = 0, n_cenc = 0;
-    /* The canvas an anchor was resized to, and whether the last frame's cover-crop was asked for. */
+    /* The canvas an anchor was resized to, and the cover-crop asks -- cenc_cover is the LAST
+     * call's flag, cenc_covers records every call in order (first frame, then last). */
     int32_t cenc_w = 0, cenc_h = 0;
     bool cenc_cover = false;
+    std::vector<bool> cenc_covers;
     int encoder_image(const uint8_t*, size_t, int32_t, int32_t, mm::Frame* out,
                       std::string*) override {
         ++n_ienc;
@@ -425,6 +427,7 @@ struct FakeMultimodal : IMultimodal {
                              mm::Frame* out, std::string*) override {
         ++n_cenc;
         cenc_w = w; cenc_h = h; cenc_cover = cover;
+        cenc_covers.push_back(cover);
         out->w = w; out->h = h;
         out->rgb.assign((size_t)w * h * 3, 100);
         return RAD_OK;
