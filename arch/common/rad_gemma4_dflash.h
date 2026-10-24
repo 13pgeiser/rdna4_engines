@@ -40,7 +40,8 @@
  *   The sliding layers are causal and the full layer is not. The checkpoint's `layer_types` names
  *   four sliding layers and one full one, and the PR's test pins `causal True` on the sliding
  *   layers and `False` on the full one, so this block declares two attention ops and issues the one
- *   each layer's type names.
+ *   each layer's type names. A config that states `dflash_config.causal` (NVIDIA's E4B drafter:
+ *   false, all five layers sliding) sets the sliding layers' causality.
  *
  *   The logits are soft-capped, which is deliberately ignored: the draft is an argmax, and
  *   cap * tanh(x / cap) is strictly increasing.
@@ -115,18 +116,15 @@ inline double embed_scale(int64_t hidden) {
 /* prefetch where a library serves it: the 31B trunk reading the next GEMM's leading weight bytes
  * into the on-die cache beside the all-reduce in front of that GEMM, at decode heights (on lane 0
  * as a chained read, or on the second lane: rad_arch.h prefetch_lane0), and the DFlash2 drafter's
- * reads likewise. It writes nothing the model reads. Each read takes a weight's first 20 MB. With
- * the reads on lane 0 (two rounds on 4x R9700): 20 MB 391 / 391 code tok/s, 289 / 288 prose;
- * 16 MB 386 / 384, 285 / 283; 24 MB 388 / 387; 12 MB 368 / 369. */
+ * reads likewise. It writes nothing the model reads. Each read takes a weight's first 20 MB: on 4x
+ * R9700 with the reads on lane 0, 16 and 24 MB decoded 1-2% slower and 12 MB about 6%. */
 constexpr int64_t kPrefetchBytes = (int64_t)20 << 20;
 
-/* down_proj's read, the trunk GEMM no other read covers: its first 9 MB, beside the attention. It
- * took the place of o_proj's read there: the 31B at tp 4 on 4x R9700, two rounds, every reply
- * identical, 380 / 281 / 203 tok/s against 367 / 271 / 196 with o_proj's 16 MB; 10, 11, 12, 14
- * and 20 MB of down_proj 379, 377, 373, 373 and 362; down_proj beside o_proj's read, or beside the
- * feed-forward reduction, slower than either alone. The reads beside a reduction are one queue,
- * and a longer one beside the attention pushes gate_up's read past the reduction it should hide
- * in. */
+/* down_proj's read, the trunk GEMM no other read covers: its first 9 MB, beside the attention, in
+ * place of a read of o_proj there (about 3.5% faster on the 31B at tp 4 on 4x R9700; 10-20 MB of
+ * down_proj were slower, as were two reads beside one reduction). The reads beside a reduction
+ * are one queue, and a longer one beside the attention pushes gate_up's read past the reduction
+ * it should hide in. */
 constexpr int64_t kPrefetchDownBytes = (int64_t)9 << 20;
 
 /* Block fp8 as libr4d's fp8a8 GEMMs read it: fp8_e4m3 codes, a bf16 scale per 128x128 block, no
@@ -166,8 +164,8 @@ inline long long dflash_block(const RadModelMeta* meta) {
 
 /* DFlash proposes its whole block in one pass, so its depth is the block it was trained at less
  * the anchor, and nothing else: 15 for z-lab's Gemma 4 drafters (block_size 16). True when the
- * container carries one and `out` now names its depth. Chained launches measured a gain with it
- * (the 26B-A4B's speculative step, +1% on 4x R9700), so the probe asks for them
+ * container carries one and `out` names its depth. Chained launches pay with it (the 26B-A4B's
+ * speculative step is 1% faster on 4x R9700), so the probe asks for them
  * (RadArchProbe::chain_pays). */
 inline bool dflash_probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (dflash_kind(meta) != 1) return false;
@@ -181,8 +179,8 @@ inline bool dflash_probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 /* The same for a DFlash2 drafter, for a plugin that serves rad_block_dflash2.h (the 31B's): its
  * anchor predicts nothing either, so the depth is the trained block less one, 7 for RedHatAI's
- * gemma-4-31B-it-speculator.dflash2 (block_size 8). Chained launches measured a gain with it (the
- * 31B's speculative step, +13% on 4x R9700), so the probe asks for them. */
+ * gemma-4-31B-it-speculator.dflash2 (block_size 8). Chained launches pay with it (the 31B's
+ * speculative step is 13% faster on 4x R9700), so the probe asks for them. */
 inline bool dflash2_probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (dflash_kind(meta) != 2) return false;
     const long long bs = dflash_block(meta);
@@ -238,6 +236,7 @@ struct Dflash1 {
         int64_t n_taps = 0;      /* how many trunk layers `fc` concatenates */
         int64_t block  = 0;      /* query rows per sequence: the anchor plus block - 1 masks */
         int64_t window = 0;      /* the sliding layers' window; 0 for none */
+        int     causal = 1;      /* the sliding layers: causal (z-lab) or not (dflash_config.causal) */
         int     full[MAX_LAYERS] = {};   /* 1: a full-attention (non-causal, unwindowed) layer */
         double  escale = 1.0;    /* the target's embedding scale, rounded as the target holds it */
         int64_t kv_rep = 1;      /* how many times the cache holds each kv head (kv_rep_for) */
@@ -519,7 +518,12 @@ inline int Dflash1::Lin::declare(RadBuilder* b, Names& nm, const char* base, int
     int64_t p[RAD_MAX_ROW_PARTS] = {0};
     int     np = 0;
     for (int64_t q : row_parts) {
-        if (np >= RAD_MAX_ROW_PARTS || q % 16) return RAD_E_INVAL;
+        if (np >= RAD_MAX_ROW_PARTS || q % 16) {
+            fprintf(stderr, "radiance: '%s' has a %lld-row part per rank; an int8 weight takes at "
+                            "most %d parts, each a multiple of 16 rows.\n", base, (long long)q,
+                    (int)RAD_MAX_ROW_PARTS);
+            return RAD_E_INVAL;
+        }
         p[np++] = q;
     }
     w = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, access, shard, grp, p, np);
@@ -582,7 +586,11 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
         return RAD_E_UNSUPPORTED;
     }
     dc.block = trained;
-    if (dg.n_layer > MAX_LAYERS) return RAD_E_UNSUPPORTED;
+    if (dg.n_layer > MAX_LAYERS) {
+        fprintf(stderr, "radiance: gemma4: the DFlash drafter has %lld layers; this block carries "
+                        "at most %d\n", (long long)dg.n_layer, MAX_LAYERS);
+        return RAD_E_UNSUPPORTED;
+    }
     {
         std::vector<int> full;
         const char* lt = rad_meta_gets(meta, "draft.layer_types", nullptr);
@@ -610,6 +618,11 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
                                 "window\n");
                 return RAD_E_INVAL;
             }
+            /* z-lab's configs state no causality and train the sliding layers causal; NVIDIA's
+             * (Nemotron-3.5-Bolt-E4B's DFlash) states `dflash_config.causal: false`, every layer
+             * sliding and non-causal over its window. */
+            dc.causal = rad_meta_geti(meta, "draft.dflash_config.causal",
+                                      rad_meta_geti(meta, "draft.is_causal", 1)) != 0 ? 1 : 0;
         }
     }
     if (!head_sharded(dg) && dg.world > 1) {
@@ -664,11 +677,12 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
     int nfull = 0;
     for (int64_t l = 0; l < dg.n_layer; ++l) nfull += dc.full[l];
     rad_note(b, "the DFlash drafter is declared: %lld layers at absolute %d..%d (%d full, %lld "
-                "sliding over %lld causal), %lld heads / %lld kv x %lld, ffn %lld, reading the "
+                "sliding over %lld, %s), %lld heads / %lld kv x %lld, ffn %lld, reading the "
                 "trunk at %lld tap(s); linears %s. One forward over %lld rows proposes %lld "
                 "tokens; the head is %s, argmax %s",
              (long long)dg.n_layer, t.base_layer, t.base_layer + (int)dg.n_layer - 1, nfull,
-             (long long)(dg.n_layer - nfull), (long long)dc.window, (long long)dg.n_head,
+             (long long)(dg.n_layer - nfull), (long long)dc.window,
+             dc.causal ? "causal" : "non-causal", (long long)dg.n_head,
              (long long)dg.n_head_kv, (long long)dg.head_dim, (long long)dg.n_ff,
              (long long)t.n_taps,
              df->i8 ? "int8 (w8a8, an int8 activation per row)" : "on the E4M3 grid (fp8a8 / mxfp4a8)",
@@ -849,7 +863,7 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     };
     bool any_full = false, any_swa = false;
     for (int64_t l = 0; l < g.n_layer; ++l) (cfg.full[l] ? any_full : any_swa) = true;
-    if (any_swa)  op_attn_swa  = attn(1, cfg.window);
+    if (any_swa)  op_attn_swa  = attn(cfg.causal, cfg.window);
     if (any_full) op_attn_full = attn(0, 0);
 
     /* The copies into the cache's layout (rep_kv), a head-wide strided row copy each. Each pass's

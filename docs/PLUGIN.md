@@ -57,6 +57,7 @@ Five more exports are optional, each looked up by exactly this name:
 | `int rad_kernel_concurrent(int i)` | nonzero: kernel `i` touches nothing but its operands and scratch, so independent launches may overlap |
 | `int rad_kernel_collective(int i)` | nonzero: kernel `i` exchanges data with the other ranks' cards, so the engine keeps its own bulk link traffic away while it runs. 2: each launch ends that hold itself once the other ranks' bytes have landed, through the `link_gate` parameter (`rad_abi.h`). Without this export only the `all_reduce` op is a collective |
 | `int rad_plugin_reference(void)` | nonzero: a **reference implementation**, ranked below every unnamed library, refused for serving unless `--debug-accept-reference-kernels`, and what `rad-kbench` checks the others against. libref declares itself this way |
+| `int rad_kernel_reference(int i)` | per row: nonzero marks kernel `i` as a reference implementation and 0 as a production one, overriding `rad_plugin_reference` for that library. For a plugin that ships a device row and its host oracle side by side (`plugin/spechub`) |
 
 ---
 
@@ -361,10 +362,43 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   (`rad_op_resolved`) and is an error only if issued. The in-tree blocks do this for
   `qk_norm_rope_gate`.
 - **Read §8** if the model has a linear or recurrent block.
+- **Declare the second lane's window.** Work issued on the second lane (`rad_lane`,
+  `abi/rad_runtime.h`) runs beside lane 0 in time, so every buffer it touches is named to
+  `rad_buf_concurrent`, which keeps it live for the whole program: the planner cannot tell when
+  lane 1 runs. An architecture whose lane-1 work lies in one stretch of its declared ops says so,
+  calling `rad_lane1_window_begin(b)` before the first op of the stretch and
+  `rad_lane1_window_end(b)` after the last, once each and in that order, at declare. A concurrent
+  buffer is then live across the window and over its own declared uses only, so buffers used only
+  outside the window (a drafter's, the heads') share its bytes again. What the plugin promises:
+  it issues nothing on lane 1 outside the window. What the runtime does (`Ctx::issue`): an op
+  issued on lane 1 outside the window fails the step, naming the window's op range and the op's
+  position; an op issued on lane 0 outside the window, before or past it, joins lane 1 first when
+  lane 1 has work pending, so the plugin need not join before the window ends; an op the core appends behind a
+  declared one (runtime LoRA) counts at that op's position. The builder refuses a second `begin`,
+  an `end` without a `begin`, twice or around no op, a `begin` never closed, and either call after
+  declare. `qwen35_fp8` (with the plugins built from it) and `gemma3` declare one from the
+  embedding's all-reduce to the final norm. On Qwen3.8-27B with its DFlash2 drafter at 64 sequences
+  and speculation 7, on two R9700s, the activation arena went from 633.99 to 526.32 MiB a card, as
+  without a second lane, and with the second lane's own scratch region
+  ([IMPLEMENTATION.md](IMPLEMENTATION.md)) the KV pool from 86 208 to 93 856 tokens.
+  `tests/arch_test.cpp`'s builder applies the window to liveness as the core does, so the pinned
+  graphs and steps are the ones the core plans; the runtime (`Ctx::issue`) is what refuses a lane-1
+  op outside the window. Both calls are ABI 27 exports; a plugin that does not call them is
+  unaffected.
+- **A block drafter may serve a shorter block.** `rad_drafter_short_block(b, block)`, called once
+  after `rad_declare_drafter`, says the plugin declared its query pass at `block` rows a sequence as
+  well as at `RadDrafterDecl::block`, with the same anchor convention, so the core may stage a step
+  at either; the short block proposes `block - (RadDrafterDecl::block - depth)` tokens. The builder
+  refuses it without a block drafter, at or above the drafter's own block, and where it would
+  propose nothing. The engine runs it under `--draft-short-from` (GUIDE §4.6) and reads row `s` of
+  the proposals at `s * proposal_pitch`; a block drafter's `proposal_pitch` defaults to its
+  depth (a row holds the whole block's proposals and a short block fills its front) and is refused
+  below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
+  step (`rad_block_dflash2.h` does). Appended in ABI 27.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
-  expansion and positions, in four processor families (Qwen-VL, Gemma 4, LFM2-VL, GLM-5.3) chosen
-  by the container's `vision_config.model_type`. A vision model with another pipeline needs a core
-  change.
+  expansion and positions, in five processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
+  GLM-5.3) chosen by the container's `vision_config.model_type` (Unlimited-OCR's by its
+  `model_type`). A vision model with another pipeline needs a core change.
   Audio goes through one of two feature extractors, Gemma 4's and Qwen3-ASR's (Whisper's), chosen
   by `audio_config.model_type`.
 - **A speech model says how it hears**, through the optional

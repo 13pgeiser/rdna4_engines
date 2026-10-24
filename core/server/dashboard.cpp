@@ -55,6 +55,18 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     }
 
     if (req.method == "POST") {
+        /* The default applies to every client's requests that name no choice, so a server
+         * started without --api-key takes the change from a loopback client only, as it does a
+         * runtime adapter load. */
+        if (opt_.api_key.empty() && !req.peer_is_loopback()) {
+            ApiError e;
+            e.status  = 403;
+            e.type    = "permission_error";
+            e.message = "without --api-key, the control-vector default is changed only from a "
+                        "loopback client; start the server with --api-key to change it from "
+                        "elsewhere";
+            return error_response(e, req.peer);
+        }
         json body;
         try {
             body = json::parse(req.body.empty() ? "{}" : req.body);
@@ -138,6 +150,8 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     o["snapshot_store"] = { { "bytes_each", c.ck_bytes }, { "slots", c.ck_slots } };
     /* Entries and snapshots removed by --prefix-cache-ttl, from whichever tier held them. */
     o["expired"] = { { "entries", sm.prefix_expired }, { "snapshots", sm.prefix_ckpt_expired } };
+    /* And the ones a client gave up on purpose (DELETE /sessions). */
+    o["released"] = { { "entries", sm.prefix_released }, { "snapshots", sm.prefix_ckpt_released } };
     /* Step-thread time spent on tier moves; every request waits through it. */
     o["stall"] = { { "restores", c.restores }, { "restore_ms", (double)c.restore_ns / 1e6 },
                    { "flushes", c.flushes }, { "flush_ms", (double)c.flush_ns / 1e6 } };
@@ -164,6 +178,83 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
      * model, read `linear.hit_rate`. */
     o["prefix_hit_rate"] = sm.prefix_hit_rate;
     o["enabled"] = c.host_on;
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ------------------------------------------------------------------ DELETE /sessions
+ *
+ * A client that deletes a conversation, or replaces everything past a prefix of it, knows the
+ * rest is dead before the TTL does. Named by the label it sent (`session_id`, or Anthropic's
+ * `metadata.user_id`), or by the engine id `/sessions` shows. `keep_tokens` keeps the chain's
+ * start. Shared blocks and blocks a live request reads stay; a request of the same conversation
+ * in flight is a 409, since its close would publish the chain again. */
+HttpResponse Server::handle_session_release(const HttpRequest& req) {
+    if (!deps_.sched)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+
+    const std::string label = req.param("label");
+    uint64_t id = 0;
+    const std::string id_s = req.param("id");
+    if (!id_s.empty()) {
+        if (id_s.find_first_not_of("0123456789") != std::string::npos || id_s.size() > 19)
+            return error_response(err_bad("id", "expected the session's engine id, a decimal "
+                                                "integer as /sessions reports it"), req.peer);
+        id = std::stoull(id_s);
+        if (id == 0) return error_response(err_bad("id", "0 names no session"), req.peer);
+    }
+    if (label.empty() && id == 0)
+        return error_response(err_bad("label", "name the session: DELETE /sessions/<label>, "
+                                               "?label=<label> or ?id=<engine id>"), req.peer);
+    int64_t keep_tokens = 0;
+    const std::string keep_s = req.param("keep_tokens");
+    if (!keep_s.empty()) {
+        if (keep_s.find_first_not_of("0123456789") != std::string::npos || keep_s.size() > 12)
+            return error_response(err_bad("keep_tokens", "expected a non-negative integer: the "
+                                                         "prefix to keep, in tokens"), req.peer);
+        keep_tokens = std::stoll(keep_s);
+    }
+
+    SessionReleased r;
+    const int rc = deps_.sched->release_session(label, id, keep_tokens, &r);
+    if (rc == RAD_E_UNSUPPORTED)
+        return error_response(err_not_implemented(
+            "this engine has no prefix cache (started with --no-prefix-cache, or the model "
+            "declares no cacheable KV group)"), req.peer);
+    const std::string who = label.empty() ? "id " + std::to_string(id) : "'" + label + "'";
+    if (rc == RAD_E_NOTFOUND) {
+        ApiError e;
+        e.status = 404;
+        e.type = "not_found_error";
+        e.param = label.empty() ? "id" : "label";
+        e.message = "no stored session " + who + "; GET /sessions lists them";
+        return error_response(e, req.peer);
+    }
+    if (rc == RAD_E_STATE) {
+        ApiError e;
+        e.status = 409;
+        e.type = "conflict_error";
+        e.code = "session_in_use";
+        e.message = "a request of session " + who + " is queued or running; cancel it or wait "
+                    "for it to finish, then release again";
+        return error_response(e, req.peer);
+    }
+    if (rc == RAD_E_INVAL)
+        return error_response(err_bad("keep_tokens", rad_strerror(rc)), req.peer);
+    if (rc < 0) return error_response(err_internal(rad_strerror(rc)), req.peer);
+
+    json o;
+    if (!label.empty()) o["label"] = label;
+    if (id != 0) o["id"] = id;
+    o["keep_tokens"]  = keep_tokens;
+    o["sessions"]     = r.sessions;
+    o["entries"]      = r.entries;
+    o["tokens"]       = r.tokens;
+    o["device_bytes"] = r.device_bytes;
+    o["host_bytes"]   = r.host_bytes;
+    o["snapshots"]    = r.snapshots;
+    o["kept"] = { { "tokens", r.kept_tokens }, { "shared", r.kept_shared },
+                  { "live", r.kept_live } };
+    metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));
 }
 
@@ -222,6 +313,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["ckpt_evictions"]  = { { "retention", m.prefix_ckpt_retired },
                                  { "store_full", m.prefix_ckpt_lru } };
         o["ckpt_refused"]    = m.prefix_ckpt_refused;
+        o["released"]        = { { "entries", m.prefix_released },
+                                 { "snapshots", m.prefix_ckpt_released } };
         o["hit_cuts"]        = { { "no_snapshot", m.hit_cut_no_snapshot },
                                  { "windowed_group", m.hit_cut_window },
                                  { "adopt_failed", m.hit_cut_adopt },
@@ -568,16 +661,10 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
 .stack { display:grid; gap:14px; }
 @media (max-width:1000px) {
   .body { grid-template-columns:minmax(0,1fr); }
-  /* On a phone the page is one column you drag with your thumb. A nested scroller that
-   * refuses to chain (overscroll-behavior:contain, set for the desktop wheel so a scroll
-   * over the request table does not move the page behind it) traps the drag here: you
-   * scroll the card, it bottoms out, and the page will not follow, so you reach for the
-   * margins where no scroller lives to get the page moving again. On narrow screens let
-   * the scroll chain to the document; the desktop containment stays.
-   * .body .hold, not .hold: the base .hold rule is defined LATER in this file, so a bare
-   * .hold override here would match and still LOSE the cascade (equal specificity, later
-   * wins) -- judge slice 31 caught exactly that dead-code trap, and the operator's thumb
-   * confirmed it on the request table. .body .hold wins on specificity regardless of order. */
+  /* In one column a nested scroller with overscroll-behavior:contain (there so a desktop wheel
+   * over the request table does not move the page) traps a touch drag once it bottoms out, so
+   * narrow screens let the scroll chain to the document. `.body .hold` rather than `.hold`: the
+   * base .hold rule comes later in this sheet and would win at equal specificity. */
   .body .panel > .pbody, .body .hold { overscroll-behavior:auto; }
 }
 
@@ -1488,66 +1575,31 @@ function setMetric(key, value, text) {
   spark(key, hist[key]);
 }
 
-/* BEST / RECENT / NOW ON THE OTHER FOUR TILES, in the shape the decode step established.
- *
- * WHAT THESE ARE NOT: engine figures. The engine publishes a floor and a recent window for the
- * decode step alone (step_ns_decode_best / _recent); for tok/s, requests in flight and acceptance
- * it publishes ONE figure per poll and nothing older. So these three figures are page-side, and
- * they mean:
- *   best / highest - the extreme this page session has seen AT THE CURRENT CONCURRENCY.
- *                      Resets on reload, not on restart.
- *   recent         - the mean over the last 15 s at that concurrency; 5 s on prefill, whose
- *                      events are shorter than the window that would fit them. Shorter
- *                      than the sparkline on purpose:
- *                      a 60 s mean still read 31 tok/s fifty seconds after the lane went
- *                      quiet, which is the lane being remembered rather than measured.
+/* Best / recent / now on the decode, prefill, in-flight and acceptance tiles. The engine
+ * publishes a floor and a recent window only for the decode step; for these it publishes one
+ * figure per poll, so the three figures are the page's own:
+ *   best / highest - the extreme this page has seen at the current concurrency; it resets on
+ *                    reload, not on a server restart. "highest" where more is not better.
+ *   recent         - the mean of the last RECENT samples at that concurrency.
  *   now            - the current value as a percentage of that extreme.
- * "highest" rather than "best" on the two tiles where more is not better: a lane at its highest
- * request count is busy, not good. The word carries a direction the number alone does not.
+ * Figures are kept per concurrency ("@cN" past one), because a batched rate read against the
+ * single-stream best reports a batch arriving as a level change. Requests in flight keeps one
+ * bucket, since its value is the concurrency, and it samples idle polls too. Idle polls record
+ * nothing in a concurrency bucket, and the line keeps the last active concurrency's figures
+ * without a now clause. There is no ~99 cap as on the decode step: the extreme comes from the
+ * same series as `now`, so 100% is exact.
  *
- * PER-CONCURRENCY BUCKETS, the decode step's structure: a c8 rate read against the
- * single-stream best reports the batch arriving as a level change -- the mistake that took
- * the old drift line out. Every figure on the line describes the current concurrency, and
- * past c1 the line says so ("@c8"). Requests in flight is the exception: its value IS the
- * concurrency, so bucketing it by concurrency would pin "highest" to the current number
- * forever -- it keeps one session-wide bucket. While the lane is idle nothing new is
- * recorded and the line keeps the last active concurrency's figures: frozen, no now clause,
- * which is what the Decode Step tile does at idle.
- *
- * NO ~99 CAP HERE, unlike the decode step. That cap exists because `now` there is a 500 ms poll
- * mean measured against a 32-step window mean -- different instruments, so a fast stretch can read
- * faster than the floor without being one. Here the extreme is computed FROM the same series as
- * `now`, so exceeding it is arithmetically impossible and 100% is exact: you are at your best.
- */
-/* RECENT'S OWN WINDOW, deliberately shorter than the sparkline's. HIST is 60 s and that is right
- * for a picture -- a sparkline wants the whole minute to show shape. It is wrong for a number:
- * measured over real traffic (two 5 s bursts inside a quiet minute), a 60 s mean still read 31.7
- * tok/s fifty seconds after the lane went quiet, and 30 s only brought that to 26.9. Fifteen
- * seconds decays to zero within a quarter-minute of silence while still tracking the running mean
- * mid-burst (52.8 against an actual 53.3). Ten and five overshoot -- 79 and 144 against that same
- * 53 -- which is the current value wearing a different name, and the big number above already is
- * that. `best`/`highest` stay full-session: an extreme wants every chance to be broken.
- * Idle polls do not enter an active bucket -- the lane is not at that concurrency while it
- * sleeps -- but they DO count in requests in flight's window, whose value is meaningful
- * while nothing runs.
- *
- * PREFILL GETS ITS OWN WINDOW (RECENT_PREFILL, 5 s). Measured: small prompts prefill in 1.5-6 s
- * above 100 tok/s; the operator's compaction reload -- the big one -- runs 7-15 s by his own
- * count. A 15 s mean cannot report a 7 s event while it is running: it reaches barely half the
- * peak by the event's end, then spends a quarter-minute averaging it down. Five seconds is
- * shorter than the shortest event, so `recent` rides the prefill while it happens instead of
- * diluting it. The engine's own figure is already a windowed rate (its help text: "over the
- * scheduler's recent window"), so this window sits on top of the engine's smoothing -- it
- * decides how long the page remembers, not how sharply the engine measures. */
-const RECENT = 30;   /* 15 s at the 500 ms poll WHILE the quantity keeps updating; a quantity
-                      that skips polls (acceptance, which only samples when it drafts) spans
-                      30 UPDATES, which under sparse drafting is minutes, not 15 s. */
-const RECENT_PREFILL = 10;   /* 5 s: shorter than the shortest prefill event (see above) */
+ * RECENT is shorter than the sparkline's 60 s: a 60 s mean still shows a burst long after the lane
+ * went quiet, and 15 s decays within a quarter-minute while still tracking the mean mid-burst.
+ * Prefill's window is 5 s, so `recent` follows a prefill of several seconds while it runs instead
+ * of diluting it; the engine's prefill rate is itself already windowed. */
+const RECENT = 30;   /* 15 s at the 500 ms poll for a figure sampled every poll; acceptance is
+                        sampled only on polls that drafted, so its 30 samples can span minutes */
+const RECENT_PREFILL = 10;   /* 5 s */
 const extAt = {}, winAt = {};
 let lastActiveC = 0;
-/* `win` false records the extreme only. Acceptance keeps its own pooled ring (accPool) and
- * reads `highest` from extAt, so a window here would be a second, never-read copy of the
- * same samples -- dead weight that a reviewer reasonably reads as a second figure. */
+/* `win` false records the extreme only: acceptance pools its window in accPool and reads only
+ * `highest` from extAt. */
 function noteSample(key, c, value, cap, win) {
   if (value == null || !finite(value)) return;
   const e = extAt[key] || (extAt[key] = {});
@@ -1558,12 +1610,11 @@ function noteSample(key, c, value, cap, win) {
   s.push(value); if (s.length > (cap || RECENT)) s.shift();
 }
 function triple(key, c, label, fmt, showNow) {
-  /* RECENT IS A WINDOW MEAN, not a window maximum -- a maximum would sit equal to `best` on
-   * any steady lane, and two figures that always agree read as a broken instrument. */
+  /* `recent` is a window mean: a window maximum would equal `best` on any steady lane. */
   const e = extAt[key];
   if (!e || !(c in e)) return "";
-  /* A bucket whose extreme is zero still has a story -- requests in flight has seen nothing yet --
-   * so it renders. Only the `now` clause needs a nonzero extreme to divide by. */
+  /* A bucket whose extreme is zero still renders (requests in flight before the first request);
+   * only the `now` clause needs a nonzero extreme to divide by. */
   const s = winAt[key][c];
   let sum = 0;
   for (const v of s) sum += v;
@@ -1571,14 +1622,13 @@ function triple(key, c, label, fmt, showNow) {
   const now = s[s.length - 1];
   const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
   let out = label + " " + fmt(e[c]) + " · recent " + fmt(recent);
-  /* THE SAME GUARD THE DECODE STEP USES: no `now` clause while nothing is running. A rate of
-   * zero is the lane being idle, not the lane being slow, and "now 0% of best" reads as a
-   * fault. The "@cN" tag rides the tail, exactly where the decode step puts it. */
+  /* No `now` clause while nothing runs, as on the decode step: a zero rate is an idle lane, and
+   * "now 0% of best" would read as a fault. */
   if (showNow !== false && e[c] > 0) out += " · now " + Math.round(100 * now / e[c]) + "% of " + label + tag;
   return out;
 }
-/* The acceptance tile's detail line: highest stays the full-session extreme of window ratios
- * (an extreme is an extreme), but recent and now are POOLED ratios of sums (see above). */
+/* The acceptance tile's detail line. `highest` is the session's extreme of per-poll ratios;
+ * `recent` is a pooled ratio of sums over the ring (accWindow) and `now` the newest poll's. */
 function acceptTriple(c, showNow) {
   const e = extAt["accept"];
   const ring = accPool[c];
@@ -1594,26 +1644,20 @@ function acceptTriple(c, showNow) {
   return out;
 }
 
-/* WINDOWED ACCEPTANCE. The engine's figure is cumulative and exact -- tot_accepted_/tot_drafted_
- * over the life of the process -- so a best/recent/now line built on it would print the same
- * number three times and call it a trend. The per-position counters the acceptance chart already
- * reads are cumulative too, and the DIFFERENCE between two polls is exact acceptance over that
- * interval, which is the only figure a detail line can move on. Each sample is one poll's delta
- * (~500 ms, and only when it drafted); `recent` POOLS the last RECENT such deltas AT THAT
- * CONCURRENCY and `now` is the newest one -- different windows, free to disagree.
- * The counters go backwards when the engine restarts; that poll resets the window rather than
- * reporting a negative draft. */
+/* Acceptance over a window. The engine's draft_accept is accepted / drafted over the life of
+ * the process, so it barely moves on a long-running server. The per-position counters are
+ * cumulative too, and their difference between two polls is the exact conditional acceptance
+ * (accepted / reached) over that interval. Each ring entry is one poll that drafted; the ring is
+ * kept per concurrency and pooled as sum(accepted) / sum(reached), because polls carry unequal
+ * draft counts and a mean of their ratios would weigh a quiet poll like a busy one. */
 const accPool = {};          /* per concurrency: ring of {dr, da} for the pooled tile window */
 let accPrev = null, accUp = -1;
 function accWindow(s) {
   let reach = 0, hit = 0;
   for (const p of (s.draft_positions || [])) { reach += p.reached || 0; hit += p.accepted || 0; }
-  /* RESTART DETECTION (2026-10-20, Turnstone audit). Counters going BACKWARDS catches a restart
-   * the page was watching. uptime_s going backwards catches the one it missed: a backgrounded
-   * tab whose accPrev froze while a new process drafted past the old process's lifetime total,
-   * where the delta is positive and the first guard never fires. Either clears every pooled
-   * ring -- a pre-restart pair must not pool with a post-restart one -- and yields no delta,
-   * so the headline reads the idle 0 rather than a dead process's ratio. */
+  /* A server restart: the counters go backwards, or, for a hidden tab that stopped polling while
+   * a new process drafted past the old totals, uptime_s does. Either clears every ring, so counts
+   * from two processes never pool, and yields no delta for this poll. */
   const up = s.uptime_s;
   const restart = accPrev !== null && (reach < accPrev.r || hit < accPrev.a ||
                                        (typeof up === "number" && up < accUp));
@@ -1674,13 +1718,9 @@ function kvPanel(host, keys) {
   return out;
 }
 const totals = kvPanel($("totals"), ["Requests", "Steps"]);
-/* "Accepted of drafted" is the LIFETIME MARGINAL ratio -- the engine's figure, unchanged, and
- * the one this panel used to carry as its headline. A bullet now rather than the big number:
- * see the note at the accept tile. It divides by every token DRAFTED, so it is not comparable
- * with the live figure above it, which divides by the positions actually REACHED; the two bases
- * are worked through in README.md, section "Draft acceptance", and both are derivable from the
- * log. Each label names its own denominator, which is the whole distinction -- so neither needs
- * a tooltip, and a tooltip would be invisible on the phone anyway. */
+/* "Accepted of drafted" is the engine's lifetime draft_accept, accepted / drafted. The panel's
+ * big figure divides by the positions reached instead, so the two are not comparable; each label
+ * names its denominator (docs/GUIDE.md, section 6.1). */
 const spec = kvPanel($("spec"), ["Drafter", "Depth", "Accepted of drafted"]);
 
 /* ---------------------------------------------------------------- meters */
@@ -1915,7 +1955,7 @@ function renderRequests(list, poolTokens) {
 
 /* ---------------------------------------------------------------- update */
 let prev = null, prevAt = 0, bars = [], devs = [], layerBars = [];
-let lastStepMs = null;   /* lastTps retired with the per-step freeze (slice 26) */
+let lastStepMs = null;
 
 /* The single-stream floor and the engine's most recent window, shown as two numbers with no
  * verdict. The engine records the fastest single-sequence decode window it has measured
@@ -1937,13 +1977,9 @@ function update(s, dt) {
    * mixed load the answer is the mean of two populations. `step_ns_decode / steps_decode` is
    * neither -- it is what a decode step cost.
    *
-   * A window with no decode steps in it reads 0, not the last reading (operator ruling
-   * 2026-10-20, second pass): every other live figure on this page shows 0 when the lane is idle
-   * -- tps() renders 0 as "0" and the engine publishes 0 rates -- so 0 IS the idle signal here,
-   * and the dash stays reserved for a quantity that has no value at all. A held value was the
-   * original sin (a stale number wearing a current name); a dash was an over-correction that
-   * broke the convention. The floor and the engine's recent window below are the engine's own
-   * figures and stay put. */
+   * A window with no decode steps reads 0, the page's idle figure for every live value; a dash
+   * is kept for a quantity that has no value at all, and a held value would present a stale
+   * reading as current. The engine's floor and recent window below keep their values. */
   const dSteps = prev ? s.steps_decode - prev.steps_decode : 0;
   const stepMs = dSteps > 0 ? (s.step_ns_decode - prev.step_ns_decode) / 1e6 / dSteps : null;
   if (stepMs != null) lastStepMs = stepMs;
@@ -1967,10 +2003,8 @@ function update(s, dt) {
    * ~500 ms poll mean and `best` a 32-step window mean, so a short fast stretch can beat the
    * floor; the figure is capped at 99 and shown as ~99, "at the best", rather than claiming a
    * record the window cannot confirm. */
-  /* Gated on this window HAVING decode steps, not on the lane being busy: during a
-   * prefill-only stretch the lane is busy, lastStepMs holds the last DECODE poll, and the
-   * headline correctly reads 0 -- printing "now X% of best" under it would put a stale
-   * value under the word "now", the exact defect the idle-0 ruling exists to kill. */
+  /* Only for a window with decode steps in it: during a prefill-only stretch the headline reads
+   * 0 and lastStepMs is an older poll's, which `now` must not show. */
   if (stepMs != null && s.running > 0) {
     const k = s.running;
     if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
@@ -2022,41 +2056,22 @@ function update(s, dt) {
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
   if (awR != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, awR, null, false);
-  /* POOLED ACCEPTANCE WINDOW (2026-10-20, math audit before the production roll).
-   * triple()'s `recent` averages the per-poll RATIOS; polls carry unequal draft counts, so a
-   * quiet poll and a 500-draft poll would weigh the same -- a mean of ratios, not a ratio of
-   * sums. Measured on a live c8 burst: avg-of-ratios 65.7% vs pooled 54.7%, a 11-point skew
-   * that grows with burstiness. The honest window figure is sum(accepted)/sum(reached) over
-   * the same span, so the tile keeps its own ring of delta pairs per concurrency. */
+  /* The pooled ring (see accWindow), per concurrency. */
   if (aw != null && aw.dr > 0) {
     const c = s.running > 0 ? s.running : lastActiveC;
     const ring = accPool[c] || (accPool[c] = []);
     ring.push(aw); if (ring.length > RECENT) ring.shift();
   }
-  /* THE HEADLINE IS THE LIVE WINDOW, not the cumulative ratio. The engine's figure is exact but
-   * cumulative, so on a process that has been up for hours it cannot move: 559 fresh drafts moved
-   * it one point against a 33,000-draft denominator, and it froze outright the moment the lane
-   * went quiet. Every other tile's big number is the current value, and feeding the cumulative one
-   * here also fed the sparkline a quantity that is flat by construction.
-   * Polls with no new drafts read 0 (operator ruling 2026-10-20, second pass): the page's
-   * convention is that a live figure shows 0 when the lane is doing nothing, and the dash is for
-   * quantities with no value at all. The original freeze was the real defect -- a held value
-   * reads as a live measurement of a lane that drafted nothing. The lifetime ratio stays on
-   * /stats and /metrics; what the tile answers is "what is it accepting now", and now, idle,
-   * it is accepting nothing.
-   * THE SPARKLINE'S SCALE IS THE SAME as the other tiles -- 120 samples at the 500 ms poll, 60 s
-   * -- because setMetric samples every poll, idle polls included (0 is a value; see above). The
-   * one difference is the dash case: with no draft head there is no value to push, so those polls
-   * leave a gap and the line stretches over more wall-clock than 60 s. (Judge slice 4C: this
-   * comment claimed a 10 s window, then a drafting-only window; neither sampling scheme exists.) */
+  /* The headline is this poll's conditional acceptance, as every other tile's big number is the
+   * current value; the lifetime ratio stays in the Speculation panel, on /stats and on /metrics.
+   * A poll that drafted nothing reads 0, the page's idle figure, and the dash means there is no
+   * draft head. The sparkline takes a sample every poll, idle ones included, like the other
+   * tiles; without a draft head it takes none. */
   if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
   else if (awR != null) setMetric("accept", 100 * awR, pctn(awR, 0));
   else setMetric("accept", 0, pctn(0, 0));   /* drafted nothing this poll -> 0, the idle figure */
-  /* `now` is shown only when THIS poll drafted. The guard inside acceptTriple (last.dr > 0)
-   * cannot ever be false -- the ring only stores deltas with dr > 0 -- so the freshness test
-   * belongs here, where the poll's own delta is known. Otherwise a busy lane that drafted
-   * nothing this poll shows 0 in the headline and "now Z% of highest" one line below it,
-   * computed from the last drafted delta. highest/recent are session statistics and stay. */
+  /* `now` only when this poll drafted: the ring holds only polls that did, so its newest entry
+   * may be older than this poll, whose headline then reads 0. */
   $("m-acceptdet").textContent = acceptTriple(cNow, busy && awR != null);
   M.flight.u.textContent = "/ " + s.queue_cap;
 
@@ -2084,11 +2099,9 @@ function update(s, dt) {
   const kvLive = Math.max(0, (s.kv_tokens_used || 0) - kvCached);
   mKv.v.textContent = hbOf(s.kv_bytes_used, s.kv_bytes_total, " / ") + "  ·  " + pct(kvFrac);
   setSplit(mKv, kvLive, kvCached, s.kv_tokens_total || 0);
-  /* WHAT THE SEGMENTS ARE, IN THE WORDS OF WHAT THEY WOULD COST TO RECLAIM, because a dimmer bar
-     is not self-explanatory and the phrase this line used to carry -- "in flight" against "held
-     for the next turn" -- named neither thing it was measuring. The split is by who references
-     the blocks: the first part is context a request on the card is reading and cannot be taken
-     from it, the second is context nothing is reading and the next eviction frees. */
+  /* The segments named by what reclaiming them would cost, since a dimmer bar is not
+     self-explanatory. The split is by who references the blocks: the first part is context a
+     request on the card is reading, the second context nothing reads and the next eviction frees. */
   mKvSub.textContent = s.kv_tokens_used > 0
       ? cnt3(kvLive) + " tok read by running requests  ·  " + cnt3(kvCached) + " kept for reuse"
       : "";
@@ -2141,34 +2154,17 @@ function update(s, dt) {
      * gives tokens a step for the whole batch -- which grows with concurrency and says nothing
      * about the drafter. What speculation buys is tokens a step for ONE sequence. */
     const perStep = sps > 0 && s.decode_tps > 0 ? s.decode_tps / sps / seqs : null;
-    /* Reads 0 when this window took no decode steps -- the page's idle figure, same law as
-     * the step tile above it, which this figure is derived from. It used to hold the last
-     * value, so a lane that stopped decoding kept reporting what its steps used to cost.
-     * (Extension of the operator's idle-0 ruling by one figure: same defect, one line down,
-     * flagged by judge slice 26 as "pre-existing, now more visible".) */
+    /* 0 for a window with no decode steps, as on the step tile it derives from. */
     $("tps_n").firstChild.nodeValue = perStep == null ? "0" : sig3(perStep);
-    /* ACCEPTED IS THE LIVE FIGURE, matching the tile above it. `aw` is the same pooled drafting
-     * window the tile's headline reads, computed earlier in this function -- one derivation, two
-     * readers, so the panel and the tile cannot disagree.
-     * DESIGN DECISION, 10-19, at the Operator's direction: this section shows the REAL-TIME
-     * accepted percentage and the lifetime average sits in the bullets below it. The reasoning is
-     * on the tile; the short form is that a cumulative ratio on a process that has been up for
-     * hours is a number that cannot move, and a headline that cannot move reads as a dead page.
-     * PINNED, NOT PRICED: the Operator may prefer the average back in the big seat, and the swap
-     * is these two lines. What must not happen is the average returning as the headline with no
-     * bullet left behind, because then the live figure is the thing nobody can see.
-     * Nothing drafted this poll reads 0 -- the page's idle figure, same law as the accept tile
-     * (op ruling 2026-10-20, second pass). The defect being fixed is the FREEZE: a held value
-     * reads as a live measurement of a lane that drafted nothing. */
+    /* The same per-poll conditional acceptance as the accept tile's headline (accWindow), so the
+     * two cannot disagree; 0 when this poll drafted nothing. The lifetime ratio is the
+     * "Accepted of drafted" bullet below. */
     if (awR != null) $("acc_n").firstChild.nodeValue = pctn(awR, 0);
     else $("acc_n").firstChild.nodeValue = pctn(0, 0);   /* idle: 0, the page's idle figure */
     $("specaside").textContent = "depth " + dp.length;
     spec["Drafter"].textContent       = drafterName;
     spec["Depth"].textContent         = dp.length;
-    /* The lifetime marginal, always shown. Judge 22: guarding on >0 conflated "no drafts yet"
-     * with "drafts made, all rejected" -- a drafter that accepts nothing is exactly the case a
-     * reader needs to see, and a dash hid it. 0 is the honest figure for both, and the README's
-     * "Draft acceptance" section says which question this bullet answers. */
+    /* Always shown: 0% is also what a drafter that accepts nothing reads, which a dash would hide. */
     spec["Accepted of drafted"].textContent = pct(s.draft_accept, 0);
   }
 
@@ -3312,32 +3308,24 @@ async function identify() {
   } catch (err) { /* the header simply keeps its placeholder */ }
 }
 
-/* THE CONTROL VECTOR, asked when the Model view opens. It is not a polled value: it changes only
- * when this page (or an admin call) flips it, and a control that silently reverted under the
- * reader would be worse than one that is a second old. A deployment without a control vector
- * answers 404 and the panel stays hidden. */
+/* The control vector, read when the Model view opens rather than polled: only this page or an
+ * admin call changes it. 404 means the deployment has none and hides the panel; any other failure
+ * keeps the panel and says why, so a page without the API key does not look like a build without
+ * the feature. */
 async function loadControlVector() {
-  /* THREE OUTCOMES, and only one of them hides the panel:
-   *   404  this deployment has no control vector -- there is no such control, so it is omitted;
-   *   200  the vector is loaded -- show the switch and its state;
-   *   anything else (most often 401, the page has no API key yet) -- the feature may well be
-   *        there, so SAY that instead of hiding the control. A control that silently disappears
-   *        because the page has not signed in reads exactly like a build without the feature. */
   try {
     const r = await api("admin/control-vector");
     if (r.status === 404) { $("cvpanel").hidden = true; return; }
-    if (!r.ok) throw new Error(String(r.status));
+    if (!r.ok) { const err = new Error(String(r.status)); err.status = r.status; throw err; }
     const p = await r.json();
     $("cvpanel").hidden = false;
     $("cvbox").disabled = false;
     $("cvbox").checked = !!p.default;
-    /* The family leads: it is the one term that says whether this file belongs to the model on the
-     * card at all, and it is the loader's own answer, not a label the page invents. */
+    /* The family the loader validated the file against, then its range and scale. */
     $("cvsum").textContent = (p.arch ? p.arch + " \u00b7 " : "") + "layers " + p.first +
                                "\u2013" + p.last + " \u00b7 " + p.mode + " \u00b7 scale " + p.scale;
-    /* New requests only, because a running request keeps the choice it was admitted with; and a
-     * session whose context already holds a refusal can repeat it, since the refusal is in the
-     * prompt the next turn reads. */
+    /* A running request keeps the choice it was admitted with, and a refusal already in a
+     * session's context is in the prompt the next turn reads. */
     $("cvnote").textContent = "New requests only. A session with a refusal already in its " +
                                "context may repeat it.";
   } catch (e) {
@@ -3345,9 +3333,10 @@ async function loadControlVector() {
     $("cvbox").disabled = true;
     $("cvbox").checked = false;
     $("cvsum").textContent = "";
-    $("cvnote").textContent =
-      "Sign in with the API key (the field in the header) to read or change this: the vector " +
-      "is present on this deployment, but its state needs the key.";
+    $("cvnote").textContent = e.status === 401
+      ? "Sign in with the API key (the field in the header) to read or change this: the vector " +
+        "is present on this deployment, but its state needs the key."
+      : "The server did not report the control vector's state (" + (e.status || e.message) + ").";
   }
 }
 $("cvbox").addEventListener("change", async (e) => {
@@ -3360,11 +3349,17 @@ $("cvbox").addEventListener("change", async (e) => {
                              apiKey ? { Authorization: "Bearer " + apiKey } : {}),
       body: JSON.stringify({ enabled: want }),
     });
-    if (!r.ok) throw new Error(String(r.status));
+    if (!r.ok) {
+      let msg = String(r.status);
+      try { const j = await r.json(); if (j && j.error && j.error.message) msg = j.error.message; }
+      catch (_) { /* the status alone */ }
+      throw new Error(msg);
+    }
     const p = await r.json();
     $("cvbox").checked = !!p.default;
   } catch (err) {
     e.target.checked = !want;   // the server kept the old value
+    $("cvnote").textContent = "Not changed: " + err.message;
   } finally {
     e.target.disabled = false;
   }

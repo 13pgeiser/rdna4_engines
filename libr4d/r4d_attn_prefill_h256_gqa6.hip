@@ -2,7 +2,9 @@
 // 128-VGPR accumulator. The query is bf16 and the KV cache is fp8 or bf16; the 16-bit operand
 // format for both matmuls is f16 (see r4d_dt16.h for why).
 //
-// Two families: all-16-bit (bf16 KV) and 16/8 mixed (bf16 query, fp8 KV). No fp8-P variant.
+// Two families: all-16-bit (bf16 KV) and 16/8 mixed (bf16 query, fp8, fp8_v4 or k6_v4 KV). The
+// mixed family also has lossy e4m3 legs (QK8, PV8), launched only by the rows a caller's
+// `prefill_fp8` selects.
 //
 // Each option below can be turned off on its own after a geometry change:
 //
@@ -23,16 +25,21 @@
 //   DOT2  v_dot2_f32_f16 row sum from the packed f16 P: 4 instructions instead of 8, and the
 //         denominator uses the p values the PV matmul used.
 //   BTS/KWIDE/GPREV  tile staging; see each define.
+//   QK8   Lossy. Q rounded to e4m3 once at load, after the folded scale; K as e4m3 bytes in LDS
+//         (half the tile) and Q.K^T runs as fp8 WMMA at twice the f16 rate.
+//   PV8   Lossy. P rounded to e4m3 and V as e4m3 bytes in LDS, P.V as fp8 WMMA. GROW is 8
+//         octaves (e4m3's largest value is 448 = 2^8.8), and DOT2 is off: the denominator sums the
+//         p values before rounding.
+//         The LDS bytes are the cache's own for the fp8 cache and fp8_v4's K. k6_v4's K and the
+//         int4 V of fp8_v4/k6_v4 are widened to value * group scale, as for the f16 legs, and
+//         rounded once to e4m3 at staging. QK8 and PV8 need an 8-bit cache and CONTIG; a
+//         static_assert holds both.
 #include "r4d.h"
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 
 #define O_F16     1
 #define O_MSKIP   2
-// QK8/PV8 (ported from radiance-vllm-mxfp4 r4d_radiance_extras.patch): Q and P as e4m3,
-// K and V as e4m3 bytes in LDS, both matmuls as fp8 WMMA. Not with bf16 KV. On the fp8 cache (and
-// fp8_v4's K) the bytes are the cache's own; k6_v4's K and the int4 V of fp8_v4/k6_v4 are widened
-// to the value times its group scale and rounded once to e4m3 at staging.
 #define O_QK8    32
 #define O_PV8    64
 #define O_FOLDQ   8
@@ -117,6 +124,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
     constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
     constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
+    static_assert(!(OPT & (O_QK8 | O_PV8)) || !KVP,
+                  "the e4m3 legs need an 8-bit cache, or they compile to the exact form");
     static_assert(!QK8 || KWIDE, "QK8 raw-byte staging is written for the wide K fetch");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;

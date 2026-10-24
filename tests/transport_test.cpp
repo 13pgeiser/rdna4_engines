@@ -285,6 +285,15 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
     CHECK_EQ(ask(post("/tokenize", R"({"prompt":"a"})", "Authorization: Bearer k\r\n")).status, 200);
     CHECK_EQ(ask("OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
                  "Access-Control-Request-Headers: authorization\r\n\r\n").status, 204);
+    /* A release changes the server's state like any other route: it takes the key, and a
+     * browser's preflight for it is allowed the method. */
+    CHECK_EQ(ask("DELETE /sessions/chat-7 HTTP/1.1\r\nHost: t\r\n\r\n").status, 401);
+    CHECK(ask("DELETE /sessions/chat-7 HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer k\r\n\r\n")
+              .status != 401);
+    const Reply pre = ask("OPTIONS /sessions/chat-7 HTTP/1.1\r\nHost: t\r\n"
+                          "Access-Control-Request-Method: DELETE\r\n\r\n");
+    CHECK_EQ(pre.status, 204);
+    CHECK(has(pre.header("Access-Control-Allow-Methods"), "DELETE"));
     /* Headers that announce 100 MB and no body: the 401 comes without waiting for it. */
     const Reply big = ask("POST /v1/completions HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
                           "Content-Length: 100000000\r\n\r\n");

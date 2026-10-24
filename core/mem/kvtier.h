@@ -246,6 +246,31 @@ public:
      * microseconds apart. */
     std::vector<SessionInfo> sessions(Occupancy* occ = nullptr) const;
 
+    /* ---------------- a release names a session ----------------
+     *
+     * The cache keys by block and knows no conversation; the rows here are what a client can
+     * name. PrefixCache::release_session asks for the rows, walks their chains itself and
+     * reports back what is left of each. */
+    struct SessionChain {
+        uint64_t id = 0;
+        std::string label;
+        std::vector<BlockHash> chain;
+    };
+    /* Every row carrying `label`, or with `id` nonzero the one row of that id. A label is the
+     * client's and may stand on several leaves (a conversation branched and both ends were
+     * served); a release by label means all of them. */
+    void find_sessions(const std::string& label, uint64_t id,
+                       std::vector<SessionChain>* out) const;
+    /* How many blocks at the start of `chain` another stored session walks too: the longest
+     * common prefix with any row at the same root whose id is not in `except`. Those blocks
+     * belong to the other conversation as much as to this one. */
+    int64_t shared_prefix_blocks(const std::vector<BlockHash>& chain,
+                                 const std::vector<uint64_t>& except) const;
+    /* The release is done: the row keeps its first `keep_blocks` (covering `keep_tokens`),
+     * which is the kept prefix or, beyond it, the deepest block a live request held back; it
+     * goes when that is zero. A kept stub is a leaf again until a later turn extends it. */
+    void cut_session(uint64_t id, int64_t keep_blocks, int64_t keep_tokens);
+
     struct Stats {
         /* `to_host` counts copies to host memory (link traffic); `dropped` counts VRAM copies
          * then given up. An entry can be copied and never dropped. */

@@ -39,11 +39,6 @@ bool repo_part(const std::string& p) {
     return true;
 }
 
-bool ends_with(const std::string& s, const char* suf) {
-    const size_t n = std::strlen(suf);
-    return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
-}
-
 /* <exe>/../libexec/radiance/hfget.sh, which is where the install puts it and where the build
  * copies it. */
 std::string hfget_path() {
@@ -85,7 +80,7 @@ bool hf_repo_id(const std::string& s) {
     const std::string owner = s.substr(0, slash), name = s.substr(slash + 1);
     if (!repo_part(owner) || !repo_part(name)) return false;
     for (const char* suf : { ".rad", ".safetensors", ".gguf", ".json" })
-        if (ends_with(name, suf)) return false;
+        if (name.ends_with(suf)) return false;
     return true;
 }
 
@@ -102,7 +97,7 @@ std::string hf_served_path(const std::string& dir, std::string* why) {
     std::error_code ec;
     for (const fs::directory_entry& e : fs::directory_iterator(dir, ec)) {
         std::error_code fe;
-        if (e.is_regular_file(fe) && ends_with(e.path().filename().string(), ".rad"))
+        if (e.is_regular_file(fe) && e.path().filename().string().ends_with(".rad"))
             rad.push_back(e.path().filename().string());
     }
     if (ec) {

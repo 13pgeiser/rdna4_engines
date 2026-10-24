@@ -157,6 +157,21 @@ struct AttnGatedFP8 {
     /* Set before declare: the `overlap` issue_ar's collective is declared at, 0 for none. */
     int    ar_overlap = 0;
     rad_op op_ar_ov = 0;
+
+    /* Whether step() with `own_ar` false runs the dense path a piece at a time over a caller's
+     * normed pieces (ArPieces::in_ready): one prefill sequence in two pieces, each the chunk a
+     * span of 1 makes, on the unfused prologue with one rotary component per token (every token's
+     * components agree, so plane 0 of an M-RoPE batch's positions is each token's position) and
+     * the gate quantised by gate_quant_fp8. */
+    bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
+        const int64_t T = batch->n_tok;
+        const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+        return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
+               T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
+               batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
+               !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
+               kvb && kvb->slot_mapping && kvb->block_table && kvb->seqused;
+    }
 };
 
 inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
@@ -293,7 +308,7 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
 
     /* Declared before kv_store, which reads back the resolved `block_size`
      * (rad_block_attn_gated.h). */
-    op_attn = RAD_OP(b, "attn_paged",
+    op_attn = decl_attn(b, g, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", 0),
@@ -476,6 +491,51 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const int32_t* used  = kvb ? kvb->seqused      : nullptr;
 
     const int64_t T = batch->n_tok;
+
+    /* One prefill sequence in two pieces over the caller's normed input (takes_pieces): the
+     * projections, prologue, cache store, attention, gate and out projection of the first piece,
+     * then the second's, so the first piece's reduction runs beside all of the second piece's
+     * work. Each piece is the chunk a span of 1 makes: its rows, its positions, its slots, and an
+     * attention over its own query bounds (ArPieces::cu) that sees the cache up to its own end --
+     * the first piece's position after its last row, the step's seqused for the second, which
+     * reads the first piece's keys from the cache as a later chunk would. */
+    if (!own_ar && takes_pieces(batch, pieces)) {
+        const int64_t R = pieces->rows, hd = g.head_dim, qw = g.q_dim();
+        const int64_t qgw = g.n_head * 2 * hd, kvw = g.n_head_kv * hd;
+        const int64_t tpitch = kvb->block_table_pitch;
+        for (int64_t p = 0; p < 2; ++p) {
+            const int64_t r0 = p == 0 ? 0 : R;
+            const int64_t n  = p == 0 ? R : T - R;
+            const int32_t* pos = (batch->rope_pos ? batch->rope_pos : batch->positions) + r0;
+            qg.step(c, w.h, w.qg, T, r0, n);
+            kp.step(c, w.h, w.k,  T, r0, n);
+            vp.step(c, w.h, w.v,  T, r0, n);
+            RAD_ISSUE_N(c, op_q_norm, n * g.n_head,
+                        bcol_at(w.qg, r0, qgw, 0, hd, n), RAD_W(w_q_norm),
+                        brow_slice(w.q, r0, n, qw));
+            RAD_ISSUE_N(c, op_k_norm, n * g.n_head_kv,
+                        brow_slice(w.k, r0, n, kvw), RAD_W(w_k_norm),
+                        brow_slice(w.k, r0, n, kvw));
+            RAD_ISSUE_N(c, op_rope_q, n, brow_slice(w.q, r0, n, qw), praw(pos, RAD_I32, n));
+            RAD_ISSUE_N(c, op_rope_k, n, brow_slice(w.k, r0, n, kvw), praw(pos, RAD_I32, n));
+            RAD_ISSUE_N(c, op_kv_store, n,
+                        brow_slice(w.k, r0, n, kvw), brow_slice(w.v, r0, n, kvw),
+                        praw(slot + r0, RAD_I32, n), kv_cache(kv, layer));
+            RAD_ISSUE_N(c, op_attn, n,
+                        brows(w.q, T), kv_cache(kv, layer), praw2(table, RAD_I32, 1, tpitch),
+                        praw(p == 0 ? batch->positions + R : used, RAD_I32, 1),
+                        RAD_NONE, RAD_NONE, praw(pieces->cu + p, RAD_I32, 2),
+                        brows(w.attn.x, T));
+            RAD_ISSUE_N(c, op_gq, n * g.n_head,
+                        bcol_at(w.qg, r0, qgw, hd, hd, n), brow_slice(w.attn.x, r0, n, qw),
+                        brow_slice(w.attn.cq(), r0, n, qw),
+                        brow_slice(w.attn.cs(), r0, n, fp8_blocks(qw)),
+                        brow_slice(w.attn.x, r0, n, qw));
+            o.step(c, w.attn, w.h.x, T, r0, n);
+            if (p == 0) pieces->hand(r0, n);
+        }
+        return;
+    }
 
     if (!ext_in) nq_h.step(c, T);
     if (op_fill) {

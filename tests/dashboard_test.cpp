@@ -56,6 +56,23 @@ struct StatsScheduler : FakeScheduler {
         occ->host_cap_bytes = 64 << 20;
         return 1;
     }
+    /* The one stored conversation is "conv-7" (engine id 7); "busy" has a request in flight. */
+    std::vector<std::pair<std::string, int64_t>> released;
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionReleased* out) override {
+        if (label == "busy") return RAD_E_STATE;
+        if (label != "conv-7" && id != 7) return RAD_E_NOTFOUND;
+        released.push_back({ label.empty() ? "id" : label, keep_tokens });
+        out->sessions = 1;
+        out->entries = 48 - keep_tokens / 16;
+        out->tokens = out->entries * 16;
+        out->device_bytes = out->entries * 4096;
+        out->host_bytes = out->entries * 2048;
+        out->snapshots = 2;
+        out->kept_tokens = keep_tokens;
+        out->kept_shared = 2;
+        return RAD_OK;
+    }
     TierCounters tier_counters() const override {
         TierCounters c;
         c.to_host = 3; c.dropped = 2; c.promoted = 1; c.host_drops = 4; c.failures = 0;
@@ -214,6 +231,7 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s["passes"].value("played", (int64_t)0), (int64_t)10);
     CHECK_EQ(s["ckpt_evictions"].value("store_full", (int64_t)0), (int64_t)3);
     CHECK_EQ(s["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);
+    CHECK_EQ(s["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
     CHECK_EQ(s.value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
 
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
@@ -246,17 +264,77 @@ TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
     CHECK_EQ(s["linear"].value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
 }
 
+/* DELETE /sessions forgets one stored conversation by its label or engine id and answers with
+ * what went and what stayed; an unknown session is 404, one with a request in flight 409, a
+ * malformed count 400, and an engine without a prefix cache 501. */
+TEST(a_session_is_released_by_label_or_id_and_the_answer_says_what_went) {
+    Dash d(false);
+    HttpResponse r = d.srv->router().call("DELETE", "/sessions/conv-7");
+    CHECK_EQ(r.status, 200);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o.value("label", ""), std::string("conv-7"));
+    CHECK_EQ(o.value("entries", (int64_t)0), (int64_t)48);
+    CHECK_EQ(o.value("tokens", (int64_t)0), (int64_t)768);
+    CHECK_EQ(o.value("snapshots", (int64_t)0), (int64_t)2);
+    CHECK_EQ(o["kept"].value("shared", (int64_t)0), (int64_t)2);
+    CHECK_EQ(o["kept"].value("tokens", (int64_t)0), (int64_t)0);
+    REQUIRE_EQ(d.sched.released.size(), 1u);
+    CHECK_EQ(d.sched.released[0].second, (int64_t)0);
+
+    /* keep_tokens reaches the scheduler and comes back in the answer. */
+    r = d.srv->router().call("DELETE", "/sessions/conv-7?keep_tokens=160");
+    CHECK_EQ(r.status, 200);
+    o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o.value("keep_tokens", (int64_t)0), (int64_t)160);
+    CHECK_EQ(o.value("entries", (int64_t)0), (int64_t)38);
+    CHECK_EQ(o["kept"].value("tokens", (int64_t)0), (int64_t)160);
+    REQUIRE_EQ(d.sched.released.size(), 2u);
+    CHECK_EQ(d.sched.released[1].second, (int64_t)160);
+
+    /* By engine id, and by a label the path cannot carry. */
+    r = d.srv->router().call("DELETE", "/sessions?id=7");
+    CHECK_EQ(r.status, 200);
+    o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o.value("id", (int64_t)0), (int64_t)7);
+    CHECK(!o.contains("label"));
+    r = d.srv->router().call("DELETE", "/sessions?label=conv-7");
+    CHECK_EQ(r.status, 200);
+
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions/conv-8").status, 404);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions?id=8").status, 404);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions/busy").status, 409);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions").status, 400);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions?id=seven").status, 400);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions/conv-7?keep_tokens=-1").status, 400);
+    CHECK_EQ(d.sched.released.size(), 4u);
+
+    /* The stored-sessions view carries the counters beside the expiry ones. */
+    const json s = d.get("/sessions");
+    CHECK(s.contains("released"));
+    CHECK(s["released"].contains("entries"));
+    CHECK(s["released"].contains("snapshots"));
+}
+
+TEST(a_session_release_without_a_prefix_cache_is_not_implemented) {
+    FakeScheduler sched;      /* the base: no release_session */
+    FakeTokenizer tok;
+    Deps dd;
+    dd.sched = &sched;
+    dd.tok = &tok;
+    ServerOptions o;
+    o.model_id = "dash";
+    Server srv(dd, o);
+    CHECK_EQ(srv.router().call("DELETE", "/sessions/conv-7").status, 501);
+}
+
 /* ================================================================== the page's field contract */
 
 /* Every field the page's script reads from /stats (in its update and the request table) and from
  * /sessions (its loader and the session rows) is one the routes emit for a populated engine. A
  * rename on either side otherwise blanks a panel and reports nothing. */
-/* The price of a restart, measured rather than guessed: whatever decides whether a restart is
- * worth suffering needs this figure, and a guessed cost would decide the answer by itself. The
- * page stopped consuming it on 2026-10-18, when the payback clause it fed was withdrawn -- the
- * field stays because it is the missing half of that decision made downstream, by a human or a
- * tool. A test runs in microseconds, so a real note_ready() would compute 0 -- indistinguishable
- * from "never called". Passing a synthetic start exercises the arithmetic through the real route. */
+/* /stats reports the measured startup time, the cost side of any decision to restart; the page
+ * does not read it. A test starts in microseconds, where a real note_ready() would compute 0 (the
+ * same as "never called"), so a synthetic start exercises the arithmetic through the real route. */
 TEST(stats_reports_how_long_bringup_took_once_the_server_listens) {
     Dash d(false);
     /* Before the server has listened, there is no measured cost to report. */
@@ -275,22 +353,20 @@ TEST(stats_reports_how_long_bringup_took_once_the_server_listens) {
     CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)47);
 }
 
-/* The pooled ring's element shape is a contract between two functions in the page, and no
- * browser runs here to notice when they disagree. accWindow pushes {ratio, dr, da}; acceptTriple
- * iterates the ring as `d` and reads `last`. When a rename left acceptTriple reading accPrev's
- * {r, a} instead, the pooled figures became NaN and the detail line froze at "recent -" while
- * every C++ test stayed green (Turnstone judge slices 08 and 11, 2026-10-20). So: scan the page
- * text and hold the two sides to the same names. */
+/* The pooled acceptance ring's element shape is a contract between two functions of the page,
+ * and no browser runs here: accWindow returns {ratio, dr, da}, and acceptTriple reads the ring's
+ * entries as `d` and `last`. A field name it reads that the ring does not carry is undefined in
+ * JavaScript, and the pooled figures render as NaN. */
 TEST(the_pooled_acceptance_ring_reads_the_names_accWindow_writes) {
     Dash d(false);
     const std::string p = d.srv->router().call("GET", "/").body;
     const std::string aw = function_body(p, "function accWindow(");
     const std::string at = function_body(p, "function acceptTriple(");
     REQUIRE(!aw.empty() && !at.empty());
-    /* what goes INTO the ring */
+    /* what goes into the ring */
     CHECK(aw.find("dr: dr") != std::string::npos);
     CHECK(aw.find("da: da") != std::string::npos);
-    /* what comes OUT of it: every `d.<field>` and `last.<field>` must be a ring name */
+    /* what comes out of it: every `d.<field>` and `last.<field>` must be a ring name */
     const std::set<std::string> ring = {"dr", "da"};
     for (const std::string& n : fields(at, "d")) {
         CHECK(ring.count(n) == 1);
@@ -302,7 +378,7 @@ TEST(the_pooled_acceptance_ring_reads_the_names_accWindow_writes) {
         if (!ring.count(n))
             fprintf(stderr, "    acceptTriple reads last.%s, which the ring does not carry\n", n.c_str());
     }
-    /* and the ring must not be empty by construction: the push is gated on dr > 0 */
+    /* only polls that drafted enter the ring */
     CHECK(aw.find("dr <= 0") != std::string::npos);
 }
 
@@ -376,6 +452,8 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     group(2, 0, 8, 0, false, 500);        /* linear state, full, no token axis */
     group(3, 16, 4, 0, true, 64);         /* a drafter's window, always full */
     m.prefix_held_tokens = 5000;
+    m.hit_cut_resumed_below = 6;
+    m.prefix_restore_cuts = 7;
     m.draft_depth_seen = 70;
     for (int j = 0; j < 64; ++j) { m.draft_pos_reached[j] = 100 - j; m.draft_pos_accepted[j] = j; }
 
@@ -390,6 +468,8 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(o.kv_tokens_cached, o.kv_tokens_used);
     CHECK_EQ(o.draft_depth_seen, server::SchedMetrics::MAX_DRAFT_POS);
     CHECK_EQ(o.draft_pos_reached[63], (int64_t)37);
+    CHECK_EQ(o.hit_cut_resumed_below, (int64_t)6);
+    CHECK_EQ(o.prefix_restore_cuts, (int64_t)7);
 
     /* The fuller group binds wherever it sits in the list. */
     group(0, 16, 200, 10, false, 1000);

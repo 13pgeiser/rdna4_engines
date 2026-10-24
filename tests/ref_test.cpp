@@ -14,11 +14,13 @@
 #include "rad_test.h"
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
+#include "../core/sample/host_ref.h"   /* the host chain, for the whitelist's op-for-op form */
 #include "rad_sample.h"
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <string>
 #include <thread>
@@ -990,15 +992,16 @@ TEST(op_vocabulary) {
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
-        "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
+        "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
+        "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
         "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
         "all_reduce", "all_gather",
         "embed_lookup", "logits_gemm",
-        "sample_penalties", "sample_dry", "sample_temp", "sample_topk", "sample_topp",
-        "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
+        "sample_penalties", "sample_dry", "sample_ngram_ban", "sample_temp", "sample_topk",
+        "sample_topp", "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
         "sample_argmax", "sample_merge_topk", "sample_logprobs",
         /* The image generator's (arch/qwenimage21): a DiT's modulation and gates, the per-lane
          * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
@@ -1015,6 +1018,9 @@ TEST(op_vocabulary) {
         "conv1d", "conv_t1d", "snake", "cfg_topk_sample", "rvq_embed", "frame_mix_store",
         "end_status", "resample_nearest", "fourier_embed", "win_input", "win_prep", "win_finish",
         "chan_split", "interleave2", "iota", "cu_repeat", "int_affine", "frame_store",
+        /* Fish Audio drama-3's (arch/fishomni): the repetition-aware choice between two draws,
+         * and its codec encoder's residual quantiser step. */
+        "ras_pick", "vq_encode",
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
@@ -1036,12 +1042,16 @@ TEST(op_vocabulary) {
          * sampler step. */
         "rope_split", "head_gate", "ltx_guide",
         /* Its VAE's norm, resampling and patches; its vocoder's spectrogram and resampler. */
-        "pixel_norm", "d2s3d", "s2d3d", "pix_patch", "patch_pix8", "stft_logmel", "bwe_up",
+        "pixel_norm", "d2s3d", "s2d3d", "pix_patch", "stft_logmel", "bwe_up",
         /* Its VAE decoded in tiles: the boxes, a tile's latent, the blended stitch. */
         "tile_grid", "tile_crop", "tile_stitch",
         /* LTX-2.5's diffusion decoder: its rotary's voxel coordinates and its neighborhood
          * attention. */
         "vol_index", "attn_na3d",
+        /* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position. */
+        "sam_attn",
+        /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
+        "sub_i32",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -3993,6 +4003,50 @@ TEST(op_router_topk) {
     CHECK_NEAR(w2.at(1), 0.26894142f, 1e-6);
 }
 
+TEST(op_router_gemm_topk_scatter) {
+    /* THE GATE-ABSENT FORM: the plugin-owned shared arm issues the gate itself, so the fused op
+     * resolves with `gate_b` and `gate` as NULL SLOTS. Two tokens, three columns, four experts,
+     * top-two. */
+    const int64_t M = 2, K = 3, ne = 4, k = 2;
+    T x(RAD_F32, {M, K});   x.f({1, 0, 0,   0, 1, 0});
+    T w(RAD_F32, {ne, K});  w.f({1, 0, 0,   0, 2, 0,   0, 0, 3,   1, 1, 0});
+    T lg(RAD_F32, {M, ne});
+    T ids(RAD_I32, {M, k}), ew(RAD_F32, {M, k});
+    T sorted(RAD_I32, {M * k}), eoff(RAD_I32, {ne + 1}), ecnt(RAD_I32, {ne});
+    A a; a.t(x).t(w).tnull().t(lg).t(ids).t(ew).t(sorted).t(eoff).t(ecnt).tnull()
+          .i("M", M).i("K", K).i("n_expert", ne).i("n_local", ne).i("top_k", k).i("norm", 0)
+          .s("dtype", "f32").i("expert_base", 0);
+    CHECK_OK(run("router_gemm_topk_scatter", a));
+    /* Row 0: logits {1, 0, 0, 1} -- experts 0 and 3 tie at 1, the LOWER id is selected first,
+     * then 3; row 1: {0, 2, 0, 1} -- 1 at 2, then 3 at 1. */
+    CHECK_EQ(ids.iat(0), 0LL); CHECK_EQ(ids.iat(1), 3LL);
+    CHECK_EQ(ids.iat(2), 1LL); CHECK_EQ(ids.iat(3), 3LL);
+    CHECK_NEAR(lg.at(3), 1.0f, 1e-6);
+    CHECK_NEAR(lg.at(5), 2.0f, 1e-6);
+    /* The sort: expert 0 has slot 0, expert 1 slot 2, expert 3 slots 1 and 3 -- sorted by pair. */
+    CHECK_EQ(eoff.iat(0), 0LL); CHECK_EQ(eoff.iat(1), 1LL); CHECK_EQ(eoff.iat(2), 2LL);
+    CHECK_EQ(eoff.iat(3), 2LL); CHECK_EQ(eoff.iat(4), 4LL);
+    CHECK_EQ(sorted.iat(0), 0LL); CHECK_EQ(sorted.iat(1), 2LL);
+    CHECK_EQ(sorted.iat(2), 1LL); CHECK_EQ(sorted.iat(3), 3LL);
+    CHECK_NEAR(ew.at(0) + ew.at(1),
+               (std::exp(0.0f) + std::exp(0.0f)) /
+                   (2.0f * std::exp(0.0f) + 2.0f * std::exp(-1.0f)), 1e-5);
+
+    /* THE GATE PRESENT: `gate` = x @ gate_b^T at N = 1, beside the router, over the same x. */
+    T gb(RAD_F32, {1, K}); gb.f({2, 3, 0});
+    T gate(RAD_F32, {M, 1});
+    T lg2(RAD_F32, {M, ne});
+    T ids2(RAD_I32, {M, k}), ew2(RAD_F32, {M, k});
+    T sorted2(RAD_I32, {M * k}), eoff2(RAD_I32, {ne + 1}), ecnt2(RAD_I32, {ne});
+    A b; b.t(x).t(w).t(gb).t(lg2).t(ids2).t(ew2).t(sorted2).t(eoff2).t(ecnt2).t(gate)
+          .i("M", M).i("K", K).i("n_expert", ne).i("n_local", ne).i("top_k", k).i("norm", 1)
+          .s("dtype", "f32").i("expert_base", 0);
+    CHECK_OK(run("router_gemm_topk_scatter", b));
+    CHECK_NEAR(gate.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(gate.at(1), 3.0f, 1e-6);
+    CHECK_NEAR(ew2.at(0) + ew2.at(1), 1.0f, 1e-6);   /* renormalised to sum to one */
+}
+
 /* The four-class grouped GEMM: expert e is entry e / 4 of class e % 4, each class at its own
  * width, and a narrower class's columns past its width are zero. Ten experts, so classes 0 and 1
  * hold three and 2 and 3 hold two (the shape of a layer with 510 quantised experts), and class 1
@@ -5113,6 +5167,332 @@ TEST(op_sample_pick_draws_the_specified_uniform) {
         if (std::fabs(u - 0.25f) > 1e-5f) { CHECK_EQ(tk.iat(0), want); ++agree; }
     }
     CHECK(agree > 60);
+}
+
+/* ================================================================== the n-gram ban */
+/* Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor, ported straight from
+ * modeling_unlimitedocr.py:353-383 as the oracle's second formulation. `s` is the row's history
+ * oldest first; `whitelist` is its `whitelist_token_ids`, removed from the banned set after it is
+ * built (line 379). The result marks every global token id it bans. */
+static std::vector<char> ref_ngram_banned(const std::vector<int32_t>& s, int n, int window,
+                                          const std::vector<int32_t>& whitelist = {}) {
+    std::vector<char> banned(256, 0);
+    if (n <= 0 || (int64_t)s.size() < (int64_t)n) return banned;
+    const int64_t len = (int64_t)s.size();
+    const int64_t search_start = window > 0 ? std::max<int64_t>(0, len - window) : 0;
+    const int64_t search_end   = len - n + 1;
+    if (search_end <= search_start) return banned;
+    std::vector<int32_t> prefix;
+    if (n > 1) prefix.assign(s.begin() + (size_t)(len - n + 1), s.end());
+    for (int64_t idx = search_start; idx < search_end; ++idx) {
+        bool match = true;
+        for (size_t j = 0; j < prefix.size(); ++j)
+            if (s[(size_t)(idx + (int64_t)j)] != prefix[j]) { match = false; break; }
+        if (!match) continue;
+        const int32_t tok = s[(size_t)(idx + n - 1)];
+        if (tok >= 0 && tok < (int32_t)banned.size()) banned[(size_t)tok] = 1;
+    }
+    for (int32_t id : whitelist)
+        if (id >= 0 && id < (int32_t)banned.size()) banned[(size_t)id] = 0;
+    return banned;
+}
+
+/* The op over one row: returns the banned global ids it wrote as -infinity, and whether every other
+ * column is bit-for-bit its input. `whitelist` ids arrive as the bitmask operand (a set bit marks
+ * an exempt column); an empty list passes an all-zero plane, and `no_operand` passes no 5th
+ * operand at all -- the default serving form. */
+static std::vector<int32_t> ref_ngram_op(const std::vector<int32_t>& s, int n, int window,
+                                         int n_vocab, bool* untouched_out,
+                                         const std::vector<int32_t>& whitelist = {},
+                                         bool no_operand = false) {
+    const int64_t H = 8;   /* the history plane's extent in these cases */
+    T lg(RAD_F32, {1, n_vocab});
+    std::vector<float> in((size_t)n_vocab);
+    for (int64_t i = 0; i < n_vocab; ++i) in[(size_t)i] = 0.5f * (float)i - 1.0f;
+    lg.f(in);
+    T hist(RAD_I32, {1, H});
+    std::vector<int64_t> hv((size_t)H, 0);
+    for (size_t i = 0; i < s.size() && i < (size_t)H; ++i) hv[i] = s[i];
+    hist.n(hv);
+
+    SP sp(1);
+    sp[0].hist_off = 0;
+    sp[0].hist_len = (int32_t)std::min<size_t>(s.size(), (size_t)H);
+    T ng(RAD_I32, {1, 2}); ng.n({ n, window });
+    const int64_t words = (n_vocab + 31) / 32;
+    T wl(RAD_I32, {1, words});
+    std::vector<int64_t> wv((size_t)words, 0);
+    for (int32_t id : whitelist)
+        if (id >= 0 && id < n_vocab) wv[(size_t)(id >> 5)] |= 1LL << (id & 31);
+    wl.n(wv);
+
+    A a; a.t(lg).t(sp.operand()).t(hist).t(ng);
+    if (!no_operand) a.t(wl);
+    a.i("M", 1).i("n_vocab", n_vocab);
+    if (run("sample_ngram_ban", a) != RAD_OK) return { -99 };
+
+    std::vector<int32_t> banned;
+    bool untouched = true;
+    for (int64_t i = 0; i < n_vocab; ++i) {
+        const float v = lg.at(i);
+        if (std::isinf(v) && v < 0.0f) banned.push_back((int32_t)i);
+        else if (std::memcmp(&v, &in[(size_t)i], 4) != 0) untouched = false;
+    }
+    if (untouched_out) *untouched_out = untouched;
+    return banned;
+}
+
+/* The reference's banned set and the op's, over:
+ *   - every binary history of length 0..6, n 1..4 and windows 0, 2, 3, 4 and 64. A binary
+ *     alphabet makes repeats and the "abcabc" shapes dense, and lengths short of, equal to and
+ *     longer than n cover the early exits;
+ *   - 200 random histories over five ids, lengths 1..24, n 1..8 and windows 0..16, where the
+ *     window boundary falls inside repeated runs;
+ *   - 300 of those shapes repeated with a random whitelist of 0..32 ids (some outside the
+ *     vocabulary), asserting `banned.difference_update(self.whitelist)`: the whitelist removes
+ *     bans and bans nothing, and every column it spares keeps its input bits;
+ *   - the named shapes: an n-gram whose last token is the window's last (idx == search_end - 1),
+ *     an n-gram that starts at search_start while an earlier copy starts before it, n == 1 (the
+ *     empty prefix, every window token banned) and n == 0 (off), each once with a whitelist. */
+TEST(op_sample_ngram_ban_matches_the_reference_processor) {
+    int64_t trials = 0, mismatches = 0, bans = 0, wl_trials = 0, wl_bans = 0;
+    bool all_untouched = true;
+
+    auto trial = [&](const std::vector<int32_t>& s_in, int n, int window,
+                     const std::vector<int32_t>& whitelist = {}, bool wl_case = false) {
+        /* The engine's plane holds the LAST H tokens of the sequence (build_step truncates the
+         * oldest), so the oracle and the op must both see that span. */
+        const std::vector<int32_t> s = s_in.size() > 8
+                                           ? std::vector<int32_t>(s_in.end() - 8, s_in.end())
+                                           : s_in;
+        const int n_vocab = 8;
+        bool untouched = true;
+        const std::vector<int32_t> got = ref_ngram_op(s, n, window, n_vocab, &untouched, whitelist);
+        if (got.size() == 1 && got[0] == -99) { ++mismatches; return; }
+        const std::vector<char> want = ref_ngram_banned(s, n, window, whitelist);
+        ++trials;
+        bans += (int64_t)got.size();
+        if (wl_case) { ++wl_trials; wl_bans += (int64_t)got.size(); }
+        all_untouched = all_untouched && untouched;
+        int64_t live = 0;
+        for (int id = 0; id < n_vocab; ++id) live += want[(size_t)id] ? 1 : 0;
+        if (live != (int64_t)got.size()) { ++mismatches; return; }
+        for (int32_t id : got)
+            if (id < 0 || id >= n_vocab || !want[(size_t)id]) { ++mismatches; return; }
+    };
+
+    /* Every binary history of length 0..6. */
+    for (int64_t len = 0; len <= 6; ++len) {
+        for (int64_t bits = 0; bits < (int64_t)1 << len; ++bits) {
+            std::vector<int32_t> s;
+            for (int64_t i = 0; i < len; ++i) s.push_back((int32_t)((bits >> i) & 1));
+            for (int n = 1; n <= 4; ++n)
+                for (int w : { 0, 2, 3, 4, 64 }) trial(s, n, w);
+        }
+    }
+
+    /* Random histories over five ids. */
+    uint32_t rs = 0x9e3779b9u;
+    for (int it = 0; it < 200; ++it) {
+        rs = rs * 1664525u + 1013904223u;
+        const int64_t len = 1 + (int64_t)((rs >> 8) % 24u);
+        std::vector<int32_t> s((size_t)len);
+        for (int64_t i = 0; i < len; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            s[(size_t)i] = (int32_t)((rs >> 12) % 5u);
+        }
+        rs = rs * 1664525u + 1013904223u;
+        const int n = 1 + (int)((rs >> 8) % 8u);
+        rs = rs * 1664525u + 1013904223u;
+        const int w = (int)((rs >> 8) % 17u);
+        trial(s, n, w);
+    }
+
+    /* The same random shapes with random whitelists: 0..32 ids over a range wider than the
+     * vocabulary, so exempt tokens, non-banned tokens and out-of-vocabulary ids all occur. */
+    for (int it = 0; it < 300; ++it) {
+        rs = rs * 1664525u + 1013904223u;
+        const int64_t len = 1 + (int64_t)((rs >> 8) % 24u);
+        std::vector<int32_t> s((size_t)len);
+        for (int64_t i = 0; i < len; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            s[(size_t)i] = (int32_t)((rs >> 12) % 5u);
+        }
+        rs = rs * 1664525u + 1013904223u;
+        const int n = 1 + (int)((rs >> 8) % 8u);
+        rs = rs * 1664525u + 1013904223u;
+        const int w = (int)((rs >> 8) % 17u);
+        rs = rs * 1664525u + 1013904223u;
+        const int k = (int)((rs >> 8) % 33u);           /* 0..32 ids, empty included */
+        std::vector<int32_t> wl((size_t)k);
+        for (int j = 0; j < k; ++j) {
+            rs = rs * 1664525u + 1013904223u;
+            wl[(size_t)j] = (int32_t)((rs >> 12) % 12u);  /* ids 8..11 are out of vocabulary */
+        }
+        trial(s, n, w, wl, true);
+    }
+
+    /* The named shapes. [4,1,2, 4,1,2, 4,1,2] with n 3 and window 6: the newest complete n-gram
+     * starts exactly at search_end - 1, and the earlier copy at search_start bans the same token;
+     * window 3 moves search_start so that only the spanning copy is searched. */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6);
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 3);
+    trial({ 1, 1, 1, 1, 1, 1 }, 2, 4);        /* repeated tokens, every position matches */
+    trial({ 1, 1, 1, 1, 1, 1 }, 1, 3);        /* n 1: the entire window is banned */
+    trial({ 1, 1, 1, 1, 1, 1 }, 0, 3);        /* off */
+    trial({ 7, 2, 7, 2, 7 }, 2, 0);           /* window 0: the whole span */
+    /* The same shapes with whitelists: the banned token exempted (ban vanishes), a token that
+     * would not be banned exempted (inert), an out-of-vocabulary id (inert) and n 0 with a
+     * whitelist (still off). */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6, { 2 }, true);   /* a non-banned id: inert */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6, { 4 }, true);   /* the banned id: ban vanishes */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6, { 4, 2 }, true);
+    trial({ 1, 1, 1, 1, 1, 1 }, 1, 3, { 1 }, true);        /* n 1, the whole window exempted */
+    trial({ 1, 1, 1, 1, 1, 1 }, 1, 3, { 7 }, true);        /* out of vocabulary: inert */
+    trial({ 1, 1, 1, 1, 1, 1 }, 0, 3, { 1 }, true);        /* off stays off with a whitelist */
+    trial({ 7, 2, 7, 2, 7 }, 2, 0, { 7, 2 }, true);        /* every banned token exempted */
+
+    /* The whitelist as a plain bitmask must agree with the same case with the operand absent
+     * (the reference's empty whitelist): an all-zero plane bans exactly what no plane bans. */
+    {
+        bool u1 = true, u2 = true;
+        const std::vector<int32_t> s = { 4, 1, 2, 4, 1, 2, 4, 1 };
+        const std::vector<int32_t> a = ref_ngram_op(s, 3, 0, 8, &u1);
+        const std::vector<int32_t> b = ref_ngram_op(s, 3, 0, 8, &u2, {}, true);
+        CHECK(a == b);
+        CHECK(!a.empty());
+    }
+
+    CHECK(trials > 2500);
+    CHECK(mismatches == 0);
+    CHECK(bans > 0);
+    CHECK(wl_trials >= 300);
+    /* The whitelist bites: random whitelists leave bans on the table AND remove some, so a
+     * kernel that ignored the plane would fail the sweeps above, not merely agree with them. */
+    CHECK(wl_bans > 0);
+    /* Every column the reference does not ban is bit-for-bit its input: the op writes -infinity
+     * and nothing else, so penalties and temperature see the same numbers. */
+    CHECK(all_untouched);
+}
+
+/* Off is the default, and off must be invisible to greedy decoding: sample_ngram_ban writes
+ * nothing for a row with ngram_ban_n 0 -- with a whitelist plane present as well, the reference's
+ * empty-whitelist default -- so the argmax over the same row is the same token and the logits are
+ * bit-identical. With the ban on, the outcome changes exactly when the ban covers the argmax's
+ * token, and the whitelist moves it back. */
+TEST(op_sample_ngram_ban_off_leaves_greedy_decoding_unchanged) {
+    /* Token 5 is the clear maximum. Its id appears 4 times in the history, so both the ban and the
+     * penalties have something to do; the ban is off here. */
+    T hist(RAD_I32, {1, 8}); hist.n({ 5, 1, 5, 2, 5, 3, 5, 1 });
+
+    auto greedy = [&](int n, int window, std::vector<float>* after, int wl_id = -1) {
+        T lg(RAD_F32, {1, 8});
+        lg.f({ 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f });
+        SP sp(1);
+        sp[0].hist_off = 0;
+        sp[0].hist_len = 8;
+        T ng(RAD_I32, {1, 2}); ng.n({ n, window });
+        T wl(RAD_I32, {1, 1});
+        wl.n({ wl_id >= 0 ? (int64_t)1 << wl_id : 0 });
+        A a; a.t(lg).t(sp.operand()).t(hist).t(ng).t(wl).i("M", 1).i("n_vocab", 8);
+        CHECK_OK(run("sample_ngram_ban", a));
+        T tk(RAD_I32, {1});
+        A b; b.t(lg).t(sp.operand()).t(tk).i("M", 1).i("n_vocab", 8);
+        CHECK_OK(run("sample_argmax", b));
+        if (after)
+            for (int64_t i = 0; i < 8; ++i) after->push_back(lg.at(i));
+        return tk.iat(0);
+    };
+
+    std::vector<float> off_logits;
+    CHECK_EQ(greedy(0, 0, &off_logits, 5), 5);
+    /* Bit-identical to the input: the stage did not run, whitelist plane present or not. */
+    static const float kIn[8] = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f };
+    for (int64_t i = 0; i < 8; ++i) CHECK(std::memcmp(&off_logits[(size_t)i], &kIn[i], 4) == 0);
+    std::vector<float> off_plain;
+    CHECK_EQ(greedy(0, 0, &off_plain), 5);
+    CHECK(off_plain == off_logits);
+
+    /* The history's prefix (5,1) is followed by token 5 at positions 0 and 2 in [5,1,5,2,5,3,5,1]:
+     * with n 2 the ban covers 5, so greedy moves to the next best (token 7). */
+    CHECK_EQ(greedy(2, 8, nullptr), 7);
+    /* The whitelist removes 5 from the banned set (the reference's difference_update), and greedy
+     * is back on the maximum. */
+    CHECK_EQ(greedy(2, 8, nullptr, 5), 5);
+    /* A ban that only names other tokens leaves the argmax alone: with n 2 and a one-token window,
+     * search_start == search_end - 1 is impossible (window 1 < n), so nothing is banned. */
+    CHECK_EQ(greedy(2, 1, nullptr), 5);
+}
+
+/* The host chain (core/sample/host_ref.cpp) reproduces the reference op for op: the banned set,
+ * then the whitelist removed from it, then -inf -- and off (ngram_ban_n 0) leaves the logits
+ * bit-identical through the greedy chain, whitelist plane present or not. */
+TEST(host_ngram_ban_whitelist_matches_the_reference) {
+    using namespace rad;
+    const std::vector<float> in = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f };
+    const std::vector<int32_t> hist = { 5, 1, 5, 2, 5, 3, 5, 1 };
+    auto bit = [](std::vector<uint32_t>& v, int id) { v[(size_t)(id >> 5)] |= 1u << (uint32_t)(id & 31); };
+
+    /* The bare ban: token 5 (the prefix (1) is followed by 5 in the window) gets -infinity, every
+     * other candidate keeps its input bits. */
+    {
+        CandidateSet s;
+        s.from_logits(in.data(), 8);
+        host_ngram_ban(s, hist.data(), 8, 2, 8);
+        int64_t banned = 0;
+        for (const Candidate& c : s.c) {
+            if (std::isinf(c.logit) && c.logit < 0.0f) { ++banned; CHECK_EQ(c.id, 5); }
+            else CHECK(std::memcmp(&c.logit, &in[(size_t)c.id], 4) == 0);
+        }
+        CHECK_EQ(banned, 1LL);
+    }
+    /* The whitelist bit for the banned token: banned.difference_update, nothing written. */
+    {
+        std::vector<uint32_t> wl(1, 0);
+        bit(wl, 5);
+        CandidateSet s;
+        s.from_logits(in.data(), 8);
+        host_ngram_ban(s, hist.data(), 8, 2, 8, wl.data(), 1);
+        for (const Candidate& c : s.c) CHECK(std::memcmp(&c.logit, &in[(size_t)c.id], 4) == 0);
+    }
+    /* A bit for a token that is not banned is inert; a bit past the plane marks nothing, so the
+     * ban stands. */
+    {
+        std::vector<uint32_t> wl(1, 0);
+        bit(wl, 3);
+        CandidateSet s;
+        s.from_logits(in.data(), 8);
+        host_ngram_ban(s, hist.data(), 8, 2, 8, wl.data(), 1);
+        bool five = false;
+        for (const Candidate& c : s.c) {
+            if (c.id == 5) { five = std::isinf(c.logit) && c.logit < 0.0f; continue; }
+            CHECK(std::memcmp(&c.logit, &in[(size_t)c.id], 4) == 0);
+        }
+        CHECK(five);
+    }
+    /* Off is invisible to the whole greedy chain: ngram_ban_n 0 with the whitelist input set and
+     * with it clear take the same token over bit-identical logits. */
+    {
+        std::vector<uint32_t> wl(1, 0);
+        bit(wl, 5);
+        SamplingParams sp;
+        sp.temp = 0.0f;                       /* greedy */
+        HostRefInput plain;
+        plain.history = hist.data();
+        plain.n_history = 8;
+        HostRefInput with = plain;
+        with.ngram_whitelist = wl.data();
+        with.ngram_whitelist_words = 1;
+        CandidateSet a, b;
+        a.from_logits(in.data(), 8);
+        b.from_logits(in.data(), 8);
+        CHECK_EQ(host_sample_into(a, sp, plain), 5);
+        CHECK_EQ(host_sample_into(b, sp, with), 5);
+        for (size_t i = 0; i < a.c.size(); ++i) {
+            CHECK(std::memcmp(&a.c[i].logit, &in[(size_t)a.c[i].id], 4) == 0);
+            CHECK(std::memcmp(&b.c[i].logit, &in[(size_t)b.c[i].id], 4) == 0);
+        }
+    }
 }
 
 /* ================================================================== failure modes */
@@ -7179,6 +7559,68 @@ TEST(conv1d_act_clamp_bounds_the_output) {
     CHECK_EQ(y.at(2), -1.0f); CHECK_EQ(y.at(3), -0.75f);
 }
 
+/* conv1d `stride`: Fish Audio's causal downsampling conv (modded_dac.py, CausalConvNet), the reach
+ * k less the stride padded on the left. k 4, stride 2 over [1..8] pads 2: windows [0 0 1 2],
+ * [1 2 3 4], [3 4 5 6], [5 6 7 8] against taps 1, 10, 100, 1000 are 2100, 4321, 6543, 8765. A
+ * second sequence [1 2 3 4] starts its own padding; a bound that is not a whole stride, and a
+ * stride on the symmetric form, are refused. `cu_div` reads the same bounds in samples. */
+TEST(conv1d_stride_downsamples_each_sequence_causally) {
+    T x(RAD_F32, {12, 1}); x.f({1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4});
+    T w(RAD_F32, {1, 1, 4}); w.f({1, 10, 100, 1000});
+    T cu(RAD_I32, {3}); cu.n({0, 8, 12});
+    T y(RAD_F32, {6, 1});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(0), 2100.0f); CHECK_EQ(y.at(1), 4321.0f);
+    CHECK_EQ(y.at(2), 6543.0f); CHECK_EQ(y.at(3), 8765.0f);
+    CHECK_EQ(y.at(4), 2100.0f); CHECK_EQ(y.at(5), 4321.0f);
+    T cu2(RAD_I32, {3}); cu2.n({0, 7, 12});
+    A b; b.t(x).t(w).t(cu2).tnull().t(y).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", b), RAD_E_SHAPE);
+    T w3(RAD_F32, {1, 1, 3}); w3.f({1, 1, 1});
+    A c; c.t(x).t(w3).t(cu).tnull().t(y).i("M", 12).i("cin", 1).i("cout", 1).i("k", 3)
+          .i("dil", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", c), RAD_E_SHAPE);
+    /* The same bounds in units of 4 rows (samples, 4 a row): the same rows; a bound that is not
+     * a whole number of strides in rows is refused. */
+    T y2(RAD_F32, {6, 1});
+    T cu4(RAD_I32, {3}); cu4.n({0, 32, 48});
+    A d; d.t(x).t(w).t(cu4).tnull().t(y2).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).i("cu_div", 4).s("dtype", "f32");
+    CHECK_OK(run("conv1d", d));
+    for (int64_t i = 0; i < 6; ++i) CHECK_EQ(y2.at(i), y.at(i));
+    T cu6(RAD_I32, {3}); cu6.n({0, 28, 48});
+    A e; e.t(x).t(w).t(cu6).tnull().t(y2).i("M", 12).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).i("cu_div", 4).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", e), RAD_E_SHAPE);
+}
+
+/* vq_encode by hand. in_w scales the first channel by 2; codebook rows 0 and 2 point the same way
+ * (a cosine tie, so the lower index), row 1 the other; out_w the identity and out_b
+ * [0.5, -0.5]. Row [4, 1]: e [8, 1], code 0, x - [1.5, -0.5] = [2.5, 1.5]. Row [-1, 3]: e [-2, 3],
+ * code 1, x - [0.5, 1.5] = [-1.5, 1.5]. Row [0, 0]: e 0, every cosine 0, code 0. */
+TEST(vq_encode_takes_the_nearest_code_by_cosine_and_leaves_the_residual) {
+    T x(RAD_F32, {3, 2}); x.f({4, 1, -1, 3, 0, 0});
+    T iw(RAD_F32, {2, 2}); iw.f({2, 0, 0, 1});
+    T ib(RAD_F32, {2}); ib.f({0, 0});
+    T cb(RAD_F32, {3, 2}); cb.f({1, 0, 0, 2, 3, 0});
+    T ow(RAD_F32, {2, 2}); ow.f({1, 0, 0, 1});
+    T ob(RAD_F32, {2}); ob.f({0.5f, -0.5f});
+    T codes(RAD_I32, {3}); codes.n({-1, -1, -1});
+    A a; a.t(x).t(iw).t(ib).t(cb).t(ow).t(ob).t(codes).i("M", 3).i("n", 2).i("dim", 2)
+          .i("bins", 3).s("dtype", "f32");
+    CHECK_OK(run("vq_encode", a));
+    CHECK_EQ(codes.iat(0), 0); CHECK_EQ(codes.iat(1), 1); CHECK_EQ(codes.iat(2), 0);
+    CHECK_EQ(x.at(0), 2.5f); CHECK_EQ(x.at(1), 1.5f);
+    CHECK_EQ(x.at(2), -1.5f); CHECK_EQ(x.at(3), 1.5f);
+    CHECK_EQ(x.at(4), -1.5f); CHECK_EQ(x.at(5), 0.5f);
+    A b; b.t(x).t(iw).t(ib).t(cb).t(ow).t(ob).t(codes).i("M", 3).i("n", 2).i("dim", 2)
+          .i("bins", 4).s("dtype", "f32");
+    CHECK_EQ(run("vq_encode", b), RAD_E_SHAPE);
+}
+
 /* snake_aa's paddings, with the activation the identity (alpha 0: sin(0 u) = 0). Ratio 2, filters
  * of 4: P = 1. Sequence [10, 20, 40] pads to [10, 10, 20, 40, 40]; the transposed f_up [1, 2, 3, 4]
  * gives [10, 20, 40, 60, 50, 80, 100, 160, 160, 240, 120, 160], doubled and cropped by 3 a side:
@@ -8171,6 +8613,11 @@ std::vector<Geo> geometries() {
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
+        /* One-row segments, so M is also the segment count (n_seq, the description's hint for
+         * cu_seqlens). The real grids are op_sam_attn_*'s. */
+        G("sam_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("grid_h", 1)
+                              .i("grid_w", 1).i("window", 1).i("n_seq", R)
+                              .d("scale", 0.3535533905932738).s("dtype", "bf16")),
         G("kv_store", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 4)
                               .s("kv_dtype", "f32")),
         G("rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
@@ -8193,6 +8640,11 @@ std::vector<Geo> geometries() {
         G("scale_rows", "M", 3, a.i("M", R).i("n", 8).s("act", "sigmoid").s("dtype", "f32")),
         G("router_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                  .s("dtype", "f32")),
+        G("router_topk_scatter", "M", 3, a.i("M", R).i("n_expert", 6).i("n_local", 4)
+                                         .i("top_k", 2).i("norm", 1).s("dtype", "f32")),
+        G("router_gemm_topk_scatter", "M", 3, a.i("M", R).i("K", 32).i("n_expert", 4)
+                                              .i("n_local", 4).i("top_k", 2).i("norm", 0)
+                                              .s("dtype", "f32")),
         G("moe_scatter", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2)),
         G("moe_gemm", "M", 3, a.i("M", R).i("N", 16).i("K", 32).i("n_expert", 4).i("top_k", 2)
                               .s("a_order", "token").s("dtype", "f32")),
@@ -8233,6 +8685,7 @@ std::vector<Geo> geometries() {
         G("logits_gemm", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 8).s("dtype", "f32")),
         G("sample_penalties", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_dry", "M", 2, a.i("M", R).i("n_vocab", 64)),
+        G("sample_ngram_ban", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_temp", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_topk", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_topp", "M", 2, a.i("M", R).i("n_cand", 16)),
@@ -8312,6 +8765,9 @@ std::vector<Geo> geometries() {
         G("frame_mix_store", "M", 2, a.i("M", R).i("n_embd", 8).i("L", 3).i("stride", 4)
                                      .i("rep", 2).s("dtype", "bf16")),
         G("end_status", "M", 2, a.i("M", R).i("end", 5).i("rep", 2)),
+        G("ras_pick", "M", 2, a.i("M", R).i("win", 4).i("lo", 1).i("hi", 9).i("rep", 1)),
+        G("vq_encode", "M", 3, a.i("M", R).i("n", 16).i("dim", 4).i("bins", 24)
+                                .s("dtype", "f32")),
         G("resample_nearest", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("fourier_embed", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("win_input", "M", 8, a.i("M", R).i("n_lat", 4).i("n_zero", 2).i("n_cond", 3)
@@ -8324,6 +8780,7 @@ std::vector<Geo> geometries() {
         G("iota", "M", 4, a.i("M", R).i("start", 0).i("step", 1)),
         G("cu_repeat", "M", 3, a.i("M", R).i("mult", 2)),
         G("int_affine", "M", 3, a.i("M", R).s("src", "0 -1 2").s("mul", "2 0 4").s("add", "-1 5 -3")),
+        G("sub_i32", "M", 3, a.i("M", R)),
         G("frame_store", "M", 2, a.i("M", R).i("n_codes", 4).i("stride", 6).i("rep", 2)
                                  .i("skip", 0)),
         G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),
@@ -8378,7 +8835,6 @@ std::vector<Geo> geometries() {
         G("s2d3d", "M", 7, a.i("M", R).i("C", 6).i("st", 1).i("sh", 1).i("sw", 1)
                            .i("group", 2).s("mode", "mean").s("dtype", "f32")),
         G("pix_patch", "M", 4, a.i("M", R).i("p", 2).i("C", 3).s("dtype", "f32")),
-        G("patch_pix8", "M", 4, a.i("M", R).i("p", 2).i("C", 3).s("dtype", "f32")),
         G("stft_logmel", "M", 3, a.i("M", R).i("hop", 4).i("nfft", 8).i("n_mel", 3).i("ch", 2)
                                  .s("dtype", "f32")),
         G("bwe_up", "M", 6, a.i("M", R).i("ratio", 3).i("ch", 2).s("dtype", "f32")),
@@ -8825,4 +9281,354 @@ TEST(gather_rows_moves_packed_codes_exactly) {
      * 5 ties to the even code (4). */
     const float wf[6] = { 0.5f, 1.0f, -2.0f, 6.0f, 0.0f, 4.0f };
     for (int i = 0; i < 6; ++i) CHECK_EQ(e.at(i), wf[i]);
+}
+
+/* ================================================================== sam_attn
+ * Unlimited-OCR's SAM tower attention (arch/common/rad_block_sam.h, libref/ref_sam_attn.cpp).
+ *
+ * The expected values are a direct port of deepencoder.py's Attention.forward /
+ * add_decomposed_rel_pos / window_partition in double, not a second call into libref: the padding
+ * rule, the per-head rel_pos channel dot and the resampling of a table along its row axis each have
+ * a way to be wrong that an oracle sharing libref's code could not see. */
+
+namespace {
+
+struct SamIn {
+    int64_t gh = 1, gw = 1, win = 0, nh = 1, hd = 1, nseq = 1;
+    int64_t raw_rows = 0;                 /* 0: the geometry's own 2*tile-1; else the staged rows */
+    std::vector<float> q, k, v, rh, rw;   /* [M, nh*hd] and [tab(), hd], row-major */
+    int64_t W()    const { return nh * hd; }
+    int64_t rows() const { return nseq * gh * gw; }
+    int64_t tab()  const {
+        if (raw_rows > 0) return raw_rows;
+        return 2 * (win > 0 ? win : (gh > gw ? gh : gw)) - 1;
+    }
+};
+
+/* A deterministic draw in [-1, 1]: index-driven, so a wrong pitch or row map reads other numbers. */
+static void sam_fill(SamIn& in, uint32_t seed) {
+    uint32_t s = seed | 1u;
+    auto next = [&s] { s = s * 1664525u + 1013904223u; return ((s >> 8) & 0xffffu) / 32767.5f - 1.0f; };
+    in.q.resize((size_t)(in.rows() * in.W()));
+    in.k.resize(in.q.size());
+    in.v.resize(in.q.size());
+    for (auto* x : { &in.q, &in.k, &in.v })
+        for (auto& f : *x) f = next();
+    in.rh.resize((size_t)(in.tab() * in.hd));
+    in.rw.resize(in.rh.size());
+    for (auto* x : { &in.rh, &in.rw })
+        for (auto& f : *x) f = 0.1f * next();
+}
+
+/* F.interpolate(..., size=want, mode="linear"), align_corners False, over dim 0. */
+static std::vector<double> sam_table(const std::vector<float>& raw, int64_t hd, int64_t want) {
+    const int64_t rows = hd > 0 ? (int64_t)raw.size() / hd : 0;
+    std::vector<double> out((size_t)(want * hd), 0.0);
+    const double span = (double)rows / (double)want;
+    for (int64_t d = 0; d < want; ++d) {
+        double src = ((double)d + 0.5) * span - 0.5;
+        if (src < 0.0) src = 0.0;
+        if (src > (double)(rows - 1)) src = (double)(rows - 1);
+        const int64_t i0 = (int64_t)src, i1 = i0 + 1 < rows ? i0 + 1 : i0;
+        const double f = src - (double)i0;
+        for (int64_t c = 0; c < hd; ++c)
+            out[(size_t)(d * hd + c)] = raw[(size_t)(i0 * hd + c)] * (1.0 - f) +
+                                        raw[(size_t)(i1 * hd + c)] * f;
+    }
+    return out;
+}
+
+/* `drop_pads` is the WRONG reading of window_partition: pad keys removed from the softmax instead of
+ * attending as zeros. Used only to prove a case can tell the two apart. */
+static std::vector<float> sam_oracle(const SamIn& in, bool drop_pads = false) {
+    const int64_t W = in.W(), R = in.gh * in.gw, M = in.rows();
+    const int64_t th = in.win > 0 ? in.win : in.gh, tw = in.win > 0 ? in.win : in.gw;
+    const std::vector<double> Rh = sam_table(in.rh, in.hd, 2 * th - 1);
+    const std::vector<double> Rw = sam_table(in.rw, in.hd, 2 * tw - 1);
+    const double scale = 1.0 / std::sqrt((double)in.hd);
+    std::vector<float> out((size_t)(M * W), 0.0f);
+    std::vector<double> logits, acc;
+    for (int64_t s = 0; s < in.nseq; ++s)
+        for (int64_t ih = 0; ih < in.gh; ++ih)
+            for (int64_t iw = 0; iw < in.gw; ++iw) {
+                const int64_t row = s * R + ih * in.gw + iw;
+                const int64_t ty = in.win > 0 ? ih / in.win : 0;
+                const int64_t tx = in.win > 0 ? iw / in.win : 0;
+                const int64_t lh = ih - ty * th, lw = iw - tx * tw;
+                for (int64_t h = 0; h < in.nh; ++h) {
+                    const float* qf = &in.q[(size_t)(row * W + h * in.hd)];
+                    logits.clear();
+                    std::vector<int64_t> kvrow;
+                    for (int64_t jh = 0; jh < th; ++jh) {
+                        const double* hrp = &Rh[(size_t)((lh - jh + th - 1) * in.hd)];
+                        double hr = 0.0;
+                        for (int64_t c = 0; c < in.hd; ++c) hr += qf[c] * hrp[c];
+                        for (int64_t jw = 0; jw < tw; ++jw) {
+                            const int64_t kh = ty * th + jh, kw = tx * tw + jw;
+                            const bool real = kh < in.gh && kw < in.gw;
+                            if (drop_pads && !real) continue;
+                            const double* wrp = &Rw[(size_t)((lw - jw + tw - 1) * in.hd)];
+                            double sc = hr;
+                            for (int64_t c = 0; c < in.hd; ++c) sc += qf[c] * wrp[c];
+                            if (real) {
+                                const float* kf = &in.k[(size_t)((s * R + kh * in.gw + kw) * W +
+                                                                h * in.hd)];
+                                double d = 0.0;
+                                for (int64_t c = 0; c < in.hd; ++c) d += qf[c] * kf[c];
+                                sc += scale * d;
+                                kvrow.push_back(s * R + kh * in.gw + kw);
+                            } else {
+                                kvrow.push_back(-1);
+                            }
+                            logits.push_back(sc);
+                        }
+                    }
+                    double mx = -INFINITY;
+                    for (double v : logits) mx = std::max(mx, v);
+                    double sum = 0.0;
+                    for (double& v : logits) { v = std::exp(v - mx); sum += v; }
+                    acc.assign((size_t)in.hd, 0.0);
+                    for (size_t j = 0; j < logits.size(); ++j) {
+                        if (kvrow[j] < 0) continue;
+                        const float* vf = &in.v[(size_t)(kvrow[j] * W + h * in.hd)];
+                        const double p = logits[j] / sum;
+                        for (int64_t c = 0; c < in.hd; ++c) acc[(size_t)c] += p * vf[c];
+                    }
+                    for (int64_t c = 0; c < in.hd; ++c)
+                        out[(size_t)(row * W + h * in.hd + c)] = (float)acc[(size_t)c];
+                }
+            }
+    return out;
+}
+
+/* Run the op; `pitch` > 0 stores every operand at that row pitch (a column slice of a wider
+ * buffer), 0 uses W. Returns the output read back at the same pitch. */
+static std::vector<float> sam_run(const SamIn& in, int64_t pitch, int* rc) {
+    const int64_t W = in.W(), R = in.gh * in.gw, M = in.rows();
+    const int64_t ld = pitch > 0 ? pitch : W;
+    T q(RAD_BF16, { M, ld }), k(RAD_BF16, { M, ld }), v(RAD_BF16, { M, ld }), o(RAD_BF16, { M, ld });
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < W; ++c) {
+            st_dt(RAD_BF16, q.t.data, r * ld + c, in.q[(size_t)(r * W + c)]);
+            st_dt(RAD_BF16, k.t.data, r * ld + c, in.k[(size_t)(r * W + c)]);
+            st_dt(RAD_BF16, v.t.data, r * ld + c, in.v[(size_t)(r * W + c)]);
+        }
+    T rh(RAD_BF16, { in.tab(), in.hd }), rw(RAD_BF16, { in.tab(), in.hd });
+    for (size_t i = 0; i < in.rh.size(); ++i) {
+        st_dt(RAD_BF16, rh.t.data, (int64_t)i, in.rh[i]);
+        st_dt(RAD_BF16, rw.t.data, (int64_t)i, in.rw[i]);
+    }
+    T cu(RAD_I32, { in.nseq + 1 });
+    for (int64_t s = 0; s <= in.nseq; ++s) st_int(RAD_I32, cu.t.data, s, s * R);
+
+    A a;
+    /* A pitch wider than W is a strided VIEW of the storage: shape [M, W], stride[0] = ld, which is
+     * what the tower's column slices of one fused projection are. */
+    auto view = [&](const T& x) {
+        RadTensor v = x.t;
+        v.shape[1] = W;
+        v.stride[0] = ld;
+        v.stride[1] = 1;
+        return v;
+    };
+    a.ts.push_back(view(q));
+    a.ts.push_back(view(k));
+    a.ts.push_back(view(v));
+    a.t(cu);
+    a.ts.push_back(view(o));
+    a.t(rh).t(rw)
+     .i("M", M).i("head_dim", in.hd).i("n_head", in.nh).i("grid_h", in.gh).i("grid_w", in.gw)
+     .i("window", in.win).d("scale", 1.0 / std::sqrt((double)in.hd)).s("dtype", "bf16");
+    *rc = run("sam_attn", a);
+    std::vector<float> out((size_t)(M * W), 0.0f);
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < W; ++c) out[(size_t)(r * W + c)] = ld_dt(RAD_BF16, o.t.data, r * ld + c);
+    return out;
+}
+
+/* Compare two [M, W] rows: max absolute difference and the number outside 2e-3 + 2e-2 * |want|. */
+static void sam_cmp(const std::vector<float>& got, const std::vector<float>& want, float* maxd,
+                    int64_t* bad) {
+    *maxd = 0.0f;
+    *bad = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float d = std::fabs(got[i] - want[i]);
+        if (d > *maxd) *maxd = d;
+        if (d > 2e-3f + 2e-2f * std::fabs(want[i])) ++*bad;
+    }
+}
+
+}  /* namespace */
+
+/* One row, one key: the softmax is 1 and the output is v, bit for bit after bf16 rounding. The same
+ * with window 1 over a 1x3 grid, where every row is a tile of its own. */
+TEST(op_sam_attn_single_key_returns_v) {
+    SamIn one;
+    one.gh = one.gw = 1; one.win = 1; one.nh = 1; one.hd = 4;
+    one.q = { 3.0f, -1.0f, 0.5f, 2.0f };
+    one.k = { 1.0f, 2.0f, 3.0f, 4.0f };
+    one.v = { 0.5f, -1.0f, 2.0f, 0.25f };
+    one.rh.assign(4, 0.0f);
+    one.rw.assign(4, 0.0f);
+    int rc = 0;
+    std::vector<float> got = sam_run(one, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    for (int64_t c = 0; c < 4; ++c) CHECK_EQ(got[(size_t)c], one.v[(size_t)c]);
+
+    SamIn strip = one;
+    strip.gh = 1; strip.gw = 3;
+    strip.q = { 1, 2, 3, 4, -1, 0, 1, -2, 0.5f, 0.5f, 0.5f, 0.5f };
+    strip.k = { 1, 0, 0, 0, 1, 1, 0, 0, 2, 2, 2, 2 };
+    strip.v = { 0.5f, 0.25f, 0.125f, 0.0625f, -0.5f, -0.25f, -0.125f, -0.0625f,
+                9.0f, 8.0f, 7.0f, 6.0f };
+    strip.rh.assign(4, 0.25f);
+    strip.rw.assign(4, -0.25f);
+    got = sam_run(strip, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    for (int64_t i = 0; i < 12; ++i) CHECK_EQ(got[(size_t)i], strip.v[(size_t)i]);
+}
+
+/* Window 14 over 16x16: the grid pads to 28x28, so the last two rows and columns of the last window
+ * are ZERO keys that still take part in the softmax. Compared against the double port, then against
+ * the port with the pads removed: the two differ, which is what makes this case able to see the
+ * rule. */
+TEST(op_sam_attn_windowed_matches_the_reference_port) {
+    SamIn in;
+    in.gh = 16; in.gw = 16; in.win = 14; in.nh = 2; in.hd = 8;
+    sam_fill(in, 0x51ed2701u);
+    int rc = 0;
+    const std::vector<float> got = sam_run(in, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    float maxd = 0.0f; int64_t bad = 0;
+    const std::vector<float> want = sam_oracle(in);
+    sam_cmp(got, want, &maxd, &bad);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    const std::vector<float> nopad = sam_oracle(in, true);
+    float pad_max = 0.0f;
+    for (size_t i = 0; i < nopad.size(); ++i)
+        pad_max = std::max(pad_max, std::fabs(nopad[i] - want[i]));
+    CHECK(pad_max > 1e-3f);          /* the case can tell the two rules apart */
+}
+
+/* Window 0: the whole segment is one tile, over a square grid and over a 6x10 one whose rel_pos
+ * tables are 2*10-1 rows long and must be resampled to 2*6-1 for the row axis. */
+TEST(op_sam_attn_global_and_non_square) {
+    SamIn sq;
+    sq.gh = 16; sq.gw = 16; sq.win = 0; sq.nh = 2; sq.hd = 8;
+    sam_fill(sq, 0xa341316cu);
+    int rc = 0;
+    float maxd = 0.0f; int64_t bad = 0;
+    sam_cmp(sam_run(sq, 0, &rc), sam_oracle(sq), &maxd, &bad);
+    CHECK_EQ(rc, (int)RAD_OK);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    SamIn ns;
+    ns.gh = 6; ns.gw = 10; ns.win = 0; ns.nh = 3; ns.hd = 4;
+    sam_fill(ns, 0x7f4a7c15u);
+    CHECK_EQ(ns.tab(), 19LL);
+    sam_cmp(sam_run(ns, 0, &rc), sam_oracle(ns), &maxd, &bad);
+    CHECK_EQ(rc, (int)RAD_OK);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    /* The production case the tower hits: a 40x40 global block whose wanted rel_pos rows are 79,
+     * served from the checkpoint's 127-row tables (both axes resize). */
+    SamIn p40;
+    p40.gh = p40.gw = 40; p40.win = 0; p40.nh = 2; p40.hd = 8; p40.raw_rows = 127;
+    sam_fill(p40, 0x2545f491u);
+    CHECK_EQ(p40.tab(), 127LL);
+    sam_cmp(sam_run(p40, 0, &rc), sam_oracle(p40), &maxd, &bad);
+    CHECK_EQ(rc, (int)RAD_OK);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+}
+
+/* Two segments: each is one tile (window 0). The second segment's rows are computed from its own
+ * data only, so changing the first segment's q/k/v must leave them bit for bit unchanged while the
+ * first segment's move. */
+TEST(op_sam_attn_segments_are_independent) {
+    SamIn in;
+    in.gh = 8; in.gw = 8; in.win = 0; in.nh = 2; in.hd = 8; in.nseq = 2;
+    sam_fill(in, 0x2545f491u);
+    int rc = 0;
+    const std::vector<float> base = sam_run(in, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    float maxd = 0.0f; int64_t bad = 0;
+    sam_cmp(base, sam_oracle(in), &maxd, &bad);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    SamIn alt = in;
+    for (int64_t i = 0; i < 64 * in.W(); ++i) {        /* the first segment's rows */
+        alt.q[(size_t)i] = -alt.q[(size_t)i];
+        alt.k[(size_t)i] += 0.25f;
+    }
+    const std::vector<float> moved = sam_run(alt, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    const size_t half = base.size() / 2;
+    bool first_changed = false, second_same = true;
+    for (size_t i = 0; i < half; ++i)
+        first_changed |= base[i] != moved[i];
+    for (size_t i = half; i < base.size(); ++i)
+        second_same &= base[i] == moved[i];
+    CHECK(first_changed);
+    CHECK(second_same);
+}
+
+/* The tower's q/k/v are the three column slices of one fused projection, so every operand is read
+ * at a row pitch wider than W. The result must be bit-identical to the dense-pitch one. */
+TEST(op_sam_attn_reads_at_a_row_pitch) {
+    SamIn in;
+    in.gh = 16; in.gw = 16; in.win = 14; in.nh = 2; in.hd = 8;
+    sam_fill(in, 0x1234567u);
+    int rc = 0;
+    const std::vector<float> dense = sam_run(in, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    const std::vector<float> strided = sam_run(in, in.W() + 3, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    for (size_t i = 0; i < dense.size(); ++i) CHECK_EQ(strided[i], dense[i]);
+}
+
+/* Refusals: a segment that is not one grid, an absent table, a negative window, a zero head. */
+TEST(op_sam_attn_refuses_malformed_geometry) {
+    SamIn in;
+    in.gh = 4; in.gw = 4; in.win = 0; in.nh = 1; in.hd = 4; in.nseq = 2;
+    sam_fill(in, 0x9e3779b9u);
+    const int64_t W = in.W(), R = in.gh * in.gw, M = in.rows();
+
+    auto build = [&](T& q, T& k, T& v, T& cu, T& o, T& rh, T& rw, A& a, int64_t window) {
+        a.t(q).t(k).t(v).t(cu).t(o).t(rh).t(rw)
+         .i("M", M).i("head_dim", in.hd).i("n_head", in.nh).i("grid_h", in.gh)
+         .i("grid_w", in.gw).i("window", window).d("scale", 0.5).s("dtype", "bf16");
+    };
+    T q(RAD_BF16, { M, W }), k(RAD_BF16, { M, W }), v(RAD_BF16, { M, W }), o(RAD_BF16, { M, W });
+    q.f(in.q); k.f(in.k); v.f(in.v);
+    T rh(RAD_BF16, { in.tab(), in.hd }), rw(RAD_BF16, { in.tab(), in.hd });
+    rh.f(in.rh); rw.f(in.rw);
+
+    /* cu says the first segment is half a grid. */
+    T cu_short(RAD_I32, { 3 }); cu_short.n({ 0, R / 2, M });
+    A a1; build(q, k, v, cu_short, o, rh, rw, a1, 0);
+    CHECK_EQ(run("sam_attn", a1), (int)RAD_E_SHAPE);
+
+    T cu_ok(RAD_I32, { 3 }); cu_ok.n({ 0, R, M });
+    A a2; build(q, k, v, cu_ok, o, rh, rw, a2, 0);
+    CHECK_OK(run("sam_attn", a2));
+
+    /* An absent rel_pos table. */
+    A a3; a3.t(q).t(k).t(v).t(cu_ok).t(o).t(rh).tnull()
+          .i("M", M).i("head_dim", in.hd).i("n_head", in.nh).i("grid_h", in.gh)
+          .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("sam_attn", a3), (int)RAD_E_INVAL);
+
+    /* A negative window, and a zero head width. */
+    A a4; build(q, k, v, cu_ok, o, rh, rw, a4, -1);
+    CHECK_EQ(run("sam_attn", a4), (int)RAD_E_SHAPE);
+    A a5; a5.t(q).t(k).t(v).t(cu_ok).t(o).t(rh).t(rw)
+          .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
+          .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
 }

@@ -72,8 +72,8 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
     const char* base = std::strrchr(file, '/');
     base = base ? base + 1 : file;
 
-    /* A line longer than the stack buffer is formatted again in full: a trace row of many values
-     * (RADIANCE_DUMP_HEAD) was cut at 4 KiB without a mark (#113). */
+    /* A line longer than the stack buffer is formatted again in full, so a trace row of many
+     * values (RADIANCE_DUMP_HEAD) is never cut at 4 KiB. */
     char buf[4096];
     std::string big;
     va_list ap, ap2;

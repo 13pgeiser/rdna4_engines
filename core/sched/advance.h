@@ -60,6 +60,16 @@ struct AdvGroup {
     int64_t used_off;       /* [n_seq] seqused */
     int64_t bt_off;         /* [n_seq][pitch] block table */
     int64_t first_off;      /* [n_seq] the position each row's block table starts at */
+    /* The runtime window (KVManager::set_window / SeqWindow), so the card computes the same
+     * `used` and slots the host builder staged: a ring sequence keeps its reference and rewrites
+     * a fixed ring of blocks, so its held span stops at its own table and a position past its
+     * ring_pos maps modulo ring_blocks. Without it (ring 0) the advance is the linear mapping, as
+     * before. ring_pos and the table length are per sequence (each prompt has its own floor and
+     * table), ring_blocks is the same for the group (one W). */
+    int32_t ring;           /* 1: the group carries runtime windows */
+    int32_t ring_blocks;    /* whole blocks the ring holds */
+    int64_t rpos_off;       /* [n_seq] the sequence's block-aligned first ring position, 0 if none */
+    int64_t tlen_off;       /* [n_seq] the sequence's block-table length in blocks, 0 if none */
 };
 
 /* One advance: a mode, the build it patches, and where its inputs are. Passed by value as the

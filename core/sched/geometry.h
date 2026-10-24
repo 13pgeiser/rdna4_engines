@@ -51,11 +51,14 @@ struct ChunkGeometry {
     /* Every contributor by name, for the startup line and the refusal. */
     std::string why;
 
-    /* No linear state but a sliding window: the checkpoint snapshots only the window behind a
-     * prompt's tail (KVManager::has_window_snapshot). Chunks are not split at the interval, since
-     * a mid-prompt window snapshot gains nothing; the interval is only the shortest prompt worth
-     * a snapshot. */
+    /* No linear state but a sliding window: checkpoints snapshot the window behind an
+     * interval boundary or the prompt's tail (KVManager::has_window_snapshot). Intermediate
+     * snapshots let an edited prompt resume below its divergence instead of from zero.
+     * tip-only skips interval snapshots and keeps the original tail-only chunking. */
     bool window_ckpt = false;
+    /* Window checkpoints at interval boundaries too, not only at the tail: every policy but
+     * tip-only, which keeps the tail alone and so splits no chunk at the interval. */
+    bool window_periodic = false;
 
     bool checkpoints() const { return checkpoint_interval > 0; }
 };

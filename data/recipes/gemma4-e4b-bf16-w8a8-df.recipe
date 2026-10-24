@@ -1,0 +1,23 @@
+# gemma4-e4b-bf16-w8a8-df.recipe -- Gemma 4 E4B (text, vision, NVIDIA's DFlash drafter) from a bf16 checkpoint:
+# every trunk linear int8 with an f16 scale per 128 columns (w8a8), an int8 lm_head, the drafter on
+# block FP8, the vision tower bf16. Wikitext-2 KL against the bf16 original 0.076 (w4a8 recipe: 0.242).
+#
+#   rad-convert <checkpoint> --recipe data/recipes/gemma4-e4b-bf16-w8a8-df.recipe --draft-model <dflash-bf16> \
+#       --set quantization_config.quant_method=compressed-tensors -o gemma4-e4b-w8a8-df.rad
+
+blk.*.attn_qkv.weight    rtn  codes=i8 group=128 scale=f16
+blk.*.attn_q.weight      rtn  codes=i8 group=128 scale=f16
+blk.*.attn_o.weight      rtn  codes=i8 group=128 scale=f16
+blk.*.ffn_down.weight    rtn  codes=i8 group=128 scale=f16
+blk.*.ffn_gate_up.weight rtn  codes=i8 group=128 scale=f16
+
+output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16

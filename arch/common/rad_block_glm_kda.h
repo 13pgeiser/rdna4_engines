@@ -151,7 +151,8 @@ struct GlmKda {
             !w.input || !w.forget_low || !w.gate_low || !w.out || w.input == w.out ||
             w.forget_low == w.gate_low)
             return RAD_E_INVAL;
-        // All seven projections are plain BF16 in the pinned checkpoint.
+        // All seven projections are plain bf16 in the pinned checkpoint; under w_bf16,
+        // LinearFP8::declare refuses a quantised one by name.
         Geom bg = g;
         bg.w_bf16 = true;
         const int64_t width = GlmTp::kda_width(g.world), heads = GlmTp::heads(g.world);
@@ -193,9 +194,6 @@ struct GlmKda {
         RAD_ARCH_TRY(output.declare(b, nm, bg, nm.f("blk.%d.attn_output", layer), 4096, width,
                                     RAD_SHARD_COL, group, { nm.ckpt("%s.o_proj.weight", prefix) },
                                     act(w.core.out), w.out));
-        if (!qkv.bf16 || !beta.bf16 || !forget_a.bf16 || !forget_b.bf16 || !gate_a.bf16 ||
-            !gate_b.bf16 || !output.bf16)
-            return RAD_E_UNSUPPORTED;
         if (reduce) op_ar = GlmTp::reduce(b, g, w.out);
         return reduce && g.world > 1 && !op_ar ? RAD_E_INVAL : RAD_OK;
     }

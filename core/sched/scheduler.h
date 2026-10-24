@@ -111,6 +111,12 @@ struct SchedReq {
      * snapshot more than an interval below it. */
     enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt, ResumedBelow };
     HitCut   hit_cut = HitCut::None;
+    /* Admission waited a step for a sequence's deferred release before cutting its restore
+     * (Scheduler::admit_one); it waits once. */
+    bool     restore_waited = false;
+    /* That attempt's restore came back cut (SchedMetrics::prefix_restore_cuts, counted once the
+     * admission happens). */
+    bool     restore_cut = false;
 
     /* The whole sequence is prompt ++ output; n_computed indexes into it. */
     int64_t  seq_len() const {
@@ -131,6 +137,15 @@ public:
          * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
         const TokenLogprobs* lp = nullptr;
         const int32_t*       first_row = nullptr;  /* [n_seq] */
+    };
+
+    /* What commit left a sequence at: its committed length and whether it is still Running.
+     * Copied under the lock in commit because reap() may free the Request before the serial bind
+     * reads it. */
+    struct CommittedSeq {
+        uint64_t seq = 0;
+        uint64_t n_out = 0;
+        bool     live = false;
     };
 
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once because
@@ -161,6 +176,11 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* Whether the request is still admitted and Running, read under the lock. */
+    bool     running(uint64_t id) const;
+    /* What the step just committed left for `seq`, copied by commit under the lock. False when
+     * that step carried no such sequence. */
+    bool     committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const;
 
     /* Requests that reached a terminal state since the last call, oldest first, swapped into
      * `out` under the lock (old contents discarded). Only the engine consumes it, to drop
@@ -254,6 +274,13 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
+     * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
+     * conversation is queued or running: its blocks would be skipped as live and its close
+     * would publish the chain again, so the release would be half done and undone at once.
+     * Takes the step lock like reset_prefix_cache. */
+    int      release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                             SessionRelease* out);
 
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */
@@ -322,25 +349,27 @@ public:
      * A block-diffusion drafter (RAD_DRAFT_BLOCK) proposes a whole block of `block` positions in
      * one pass, so there are no rounds; instead it runs two passes of different shapes.
      *
-     *   block_begin       right after commit(), while plan() still describes the step just run.
-     *                  Reserves the draft KV block the query pass writes, and returns which
-     *                  sequences may draft.
+     *   block_begin       right after the step is issued, before commit(), while plan() still
+     *                  describes it. Reserves the draft KV block the query pass writes, and
+     *                  returns which sequences may draft.
      *   block_context     the context pass, draft_pass -1. Its entries mirror the trunk step's
      *                  row for row (BlockSeq).
      *   block_query       the query pass, draft_pass +1. One entry per drafting sequence: the
      *                  anchor at its next position, then `block - 1` masks; `out_ids` names the
      *                  last `depth` rows.
-     *   block_end         moves the filled range over what actually ran.
+     *   block_end         after commit(): moves the filled range over what actually ran.
      *
      * The drafter writes its proposal to its declared proposal buffer, not through the sampler,
      * and the engine publishes it through set_draft().
      *
-     * On the card (`on_card`), block_begin runs before commit() instead, right after the step is
-     * issued, so both passes queue behind it with no readback in between. The context pass is
-     * unchanged: it mirrors the trunk step, whose positions the host knows. The query pass's
-     * anchor depends on acceptance, so its rows are device rows (advance.h, ADV_BLOCK) staged at
-     * the furthest position acceptance could leave, and the reservation covers that far.
-     * block_end still runs after commit().
+     * Both passes queue behind the step with no readback in between. The context pass mirrors the
+     * trunk step, whose positions the host knows. The query pass's anchor depends on acceptance,
+     * so its rows are device rows (advance.h, ADV_BLOCK) staged at the furthest position
+     * acceptance could leave, and the reservation covers that far.
+     *
+     * With `on_card` false, block_begin runs after commit() instead and stages the query pass
+     * from the committed sequence. The engine does not use it; it is the reference the
+     * scheduler's tests hold the card's staging to.
      */
     struct BlockRow {
         uint64_t seq = 0;
@@ -353,6 +382,17 @@ public:
      * in the order block_query() emits them. */
     int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
                     bool on_card = false);
+    /* How many running sequences the step just run decoded (produced a token for), the load a
+     * block drafter's block length is chosen by. Read before block_begin(). */
+    int decoded_seqs() const;
+    /* Whether a block drafter runs its short block (--draft-short-from `from`), given whether it
+     * ran it last step and this step's decoded_seqs(): on from `from`, off again only at two
+     * below, so a load wavering at the threshold does not switch the pass shape every step. */
+    static bool short_block_on(bool was_on, int64_t decoded, int64_t from) {
+        if (decoded >= from) return true;
+        if (decoded + 2 <= from) return false;
+        return was_on;
+    }
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();
@@ -397,6 +437,12 @@ public:
      * --busy-prefill-chunk is off, or when auto has nothing to reserve. */
     int64_t busy_cap(int64_t n_computed, int64_t n_target, int64_t budget, int64_t reserve,
                      bool shared = false, bool rows_only = false) const;
+    /* Where a prefill chunk of a `n_target`-token sequence may end. For a sequence with a runtime
+     * window (IKVManager::set_window) a chunk ends at the prompt, and past it the output a
+     * recompute replays runs one token a step: the ring rewrites its slots in place, so a
+     * multi-token chunk past the floor would overwrite keys its own earlier rows still read, while
+     * one token a step attends as its decode step did. Otherwise `n_target`. */
+    int64_t chunk_end(const Request& r, int64_t n_target) const;
 
 private:
     Program*      prog_ = nullptr;
@@ -429,6 +475,13 @@ private:
      * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?
      * Unlike a drafter hole, recomputing the tail cannot repair it; see admit_one. */
     bool          hit_holes_trunk_ = false;
+    /* R-SWA: the groups whose KV manager carries per-sequence runtime windows, with the W a
+     * sequence is armed with (IKVManager::runtime_window_tokens). Empty for every model that does
+     * not declare one, in which case admission and commit are exactly as before. A sequence with
+     * one keeps its prompt as a reference and decodes into a ring after it; it is excluded from
+     * prefix publish, checkpoints and speculation (the window is runtime data). */
+    struct RswaWindow { int32_t group = -1; int64_t tokens = 0; };
+    std::vector<RswaWindow> rswa_windows_;
     /* Draft refill: the drafter's window where a hit can leave a hole in a windowed block
      * drafter's cache, else 0. The drafter would be declined until its window slid past the hole,
      * which on a chat's follow-up turn is most of the reply, so the hit ends one window before the
@@ -616,6 +669,8 @@ private:
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
     bool    step_open_ = false;
+    /* The step just committed: its sequences' committed length and liveness, in plan order. */
+    std::vector<CommittedSeq> committed_;
     /* The single-sequence decode floor (rad::DecodeFloor), fed by step_finished. */
     DecodeFloor decode_floor_;
 

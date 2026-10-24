@@ -174,6 +174,10 @@ struct Model {
     rad_buf     b_mtp_hin = 0, b_mtp_hw = 0, b_mtp_e = 0, b_mtp_hout = 0;
     rad_buf     b_mtp_dq = 0, b_mtp_ds = 0, b_mtp_dsum = 0;
     rad_buf     b_mtp_dlog = 0, b_mtp_didx = 0, b_mtp_dval = 0;
+    /* --draft-coupling: [max_seqs] draws staged before the serial passes and [max_spec,
+     * max_seqs] states read back after them. PERSIST: the engine writes them from the host and the
+     * head writes the states on the card, across a step boundary. */
+    rad_buf     b_mtp_couple_draws = 0, b_mtp_couple_state = 0;
     rad_buf     b_mtp_dpair = 0, b_mtp_dgath = 0;
 
     HcEnter   enter;
@@ -1261,6 +1265,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * vocab-parallel all-gather a 16-byte row (rad_block_mtp_hc.h, kDraftTopR). */
             m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_logit_rows, kDraftTopR});
             m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_logit_rows, kDraftTopR});
+
+            /* --draft-coupling (RadBuildCtx::draft_coupling). Q is the law of the 2-bit candidate
+             * head's reranked top-8; a plain bf16 head leaves one candidate and nothing to couple
+             * over. The engine checks the drafter shape (a linear serial chain). */
+            if (ctx->draft_coupling) {
+                if (!m.b_mtp_didx || g.max_spec < 1 || g.max_spec > RAD_MTP_COUPLE_MAX_ROUNDS) {
+                    rad_note(b, "--draft-coupling on requires the 2-bit candidate head's reranked "
+                                "top8 and max_spec 1..%d",
+                             RAD_MTP_COUPLE_MAX_ROUNDS);
+                    return RAD_E_UNSUPPORTED;
+                }
+                m.b_mtp_couple_draws = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                              {g.max_seqs, RAD_MTP_COUPLE_DRAW_WORDS},
+                                              RAD_BUF_PERSIST);
+                m.b_mtp_couple_state = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                              {g.max_spec, g.max_seqs,
+                                               RAD_MTP_COUPLE_STATE_WORDS},
+                                              RAD_BUF_PERSIST);
+                if (!m.b_mtp_couple_draws || !m.b_mtp_couple_state) return RAD_E_INVAL;
+                rad_note(b, "MTP coupled: the head samples x~Q from its reranked top8 each round "
+                            "(FP64), and the sampler couples the target's own draw to it; %lld "
+                            "round(s), fixed-seed tokens are NOT preserved",
+                         (long long)g.max_spec);
+            }
         }
 
         MtpHcBlock::Wire tw{};
@@ -1270,6 +1298,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq   = m.b_mtp_dq;   tw.ds = m.b_mtp_ds;    tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.dpair = m.b_mtp_dpair; tw.dgath = m.b_mtp_dgath;
+        tw.couple_draws = m.b_mtp_couple_draws; tw.couple_state = m.b_mtp_couple_state;
         /* The head reuses the trunk's working buffers, all dead by the time a draft round runs (a
          * second set would be 150 MiB). Only the wide stream and the carry are its own, since
          * they must survive the round that produced them. */
@@ -1555,7 +1584,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             if (p == K - 1) wait1();
             l.hc_ffn.write(c, T, r0(p), rn(p));
             /* The projection of this piece, before the next layer reads it. */
-            l.proj.step(c, r0(p), rn(p));
+            l.proj.step(c, batch, r0(p), rn(p));
             if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p));
         }
         if (ple_next) {
@@ -1600,7 +1629,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         l.mlp.step(c, batch);
         l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
-        l.proj.step(c, 0, T);
+        l.proj.step(c, batch, 0, T);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
 }
@@ -1677,6 +1706,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+    /* The gated residual applies a control vector after every block's write (HcProject). */
+    out->control_vector_ok = 1;
     return RAD_OK;
 }
 

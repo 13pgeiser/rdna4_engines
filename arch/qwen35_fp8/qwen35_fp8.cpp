@@ -193,9 +193,27 @@ struct Model {
     MediaRows   mrows{};
 
     std::vector<Layer> layers;
+
+    /* The pipelined prefill (step_pipelined): on where declare allowed it; the bounds buffer it
+     * cuts a step by, rewritten by every pipelined step from the pinned table `pipe_tbl` of
+     * {0, pipe_rows(T), T} for every T, made once; and whether rank 0 has said it pipelines. */
+    bool      pipe_on = false;
+    rad_buf   b_pipe_cu = 0;
+    int32_t*  pipe_tbl = nullptr;
+    bool      pipe_tbl_tried = false;
+    bool      pipe_noted = false;
+    bool      pipe_serial_noted = false;
 };
 
 static Model g_model[MAX_RANKS];
+
+#if !QWEN35_MOE
+/* The narrowest step the pipelined prefill takes, and its first piece: half the step rounded up
+ * to 64 rows, so both pieces sit in one bucket band (core/runtime/ctx.h) and the second is never
+ * wider than the first. */
+static const int64_t kPipeMinRows = 1024;
+static int64_t pipe_rows(int64_t T) { return ((T + 1) / 2 + 63) / 64 * 64; }
+#endif
 
 /* Checks the container's statement of its format, since every mismatch is silent: a
  * `weight_block_size` of [64,64] against kernels that shift by 7 reads the right bytes with the
@@ -264,6 +282,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DFlash2"));
 
     Dflash2::Config dc{};
+    dc.short_block = 1;   /* rad_drafter_short_block below */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -414,6 +433,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         return RAD_E_FORMAT;
     }
     RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+    if (m.df.block_lo > 0) RAD_ARCH_TRY(rad_drafter_short_block(b, m.df.block_lo));
 
     rad_note(b, "DFlash2 drafter: %lld layers at absolute %d..%d, %lld heads / %lld kv x %lld, "
                 "ffn %lld, %s attention with a %lld-token window, %d trunk tap(s); one forward "
@@ -430,6 +450,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
 
     Model& m = g_model[ctx->rank];
+    if (m.pipe_tbl) rad_dev_free(m.pipe_tbl, RAD_MEM_HOST_PINNED);
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -583,17 +604,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
                  (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
 
-    /* The SSM state cache is f32.
+    /* The SSM state cache is f32, or f16 under --state-cache-dtype f16 (RadBuildCtx::state_dtype).
      *
      * State reads and writes dominate the two GDN kernels: one [128,128] state is 64 KiB at f32,
-     * and a speculative step writes one per candidate token per head, since the surviving
-     * candidate is unknown until after the layer. At depth 7 that is hundreds of MB per rank per
-     * step; f16 would halve it. libr4d compiles both widths (`SDT`) and the f16 round-trip error is
-     * ~5e-4 relative (elements are O(0.1)); vLLM's `--mamba-ssm-cache-dtype` is commonly float16.
-     * It stays f32 because f16 changes the generated text. */
+     * and a step reads a sequence's state and writes it back (under the anchor form once, whatever
+     * the draft depth). libr4d compiles both widths (`SDT`, from the cache's dtype); the f16
+     * round trip is ~5e-4 relative (elements are O(0.1)). f16 halves the state pool, its host
+     * checkpoints and the state traffic, and changes the generated text, so f32 is the default. */
     RadKVGroupDecl sd{};
     sd.kind         = RAD_KV_LINEAR;
-    sd.dtype        = RAD_F32;
+    sd.dtype        = ctx->state_dtype == RAD_F16 ? RAD_F16 : RAD_F32;
+    if (sd.dtype == RAD_F16) rad_note(b, "GDN state cache f16 (--state-cache-dtype f16)");
     sd.n_head_kv    = gc.n_head_v;
     sd.state_dim[0] = gc.head_v;
     sd.state_dim[1] = gc.head_k;
@@ -717,6 +738,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         /* GPTQ calibration run (MoeFP8::Config::calib), on when the output directory is set. */
         mc.calib = calib_dir() != nullptr ? 1 : 0;
+        /* Each rank holds a width slice of every expert (n_ff is per rank), so its down
+         * projection's Hessian would be of the slice, without the cross terms between slices. */
+        if (mc.calib && g.world > 1) {
+            fprintf(stderr, "radiance: qwen35moe: calibration (RADIANCE_CALIB_DIR) runs at one "
+                            "rank; at %d ranks each holds a slice of every expert's width, and "
+                            "the down projection's Hessian would be of the slice\n", g.world);
+            return RAD_E_UNSUPPORTED;
+        }
         /* The experts' stored format, read from layer 0's first expert as qwen4exp does, so a
          * container with four-bit experts is served in that format. */
         {
@@ -846,7 +875,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, g.n_embd, m.b_x));
     /* Always exact, not g.wire_exact: this all_reduce sums disjoint rows (each token's embedding
      * comes from one rank, the others contribute zero), so a lossy wire would only add error.
-     * min_bytes stays 0 for the same reason. */
+     * min_bytes stays 0 for the same reason.
+     *
+     * The second lane's window opens here and closes after the final norm (rad_lane1_window_begin):
+     * the embedding's reduction and the pipelined prefill's boundaries are declared inside it, so
+     * the concurrent buffers stay live only there and the drafter and the heads can share their
+     * bytes. */
+    RAD_ARCH_TRY(rad_lane1_window_begin(b));
     if (g.world > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
                                RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -854,6 +889,35 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
+#if !QWEN35_MOE
+    /* The pipelined prefill (step_pipelined), at two ranks wherever a step can be wide enough.
+     * Its second lane needs a narrow `overlap` all-reduce beside the GEMMs; two ranks is the only
+     * rank count where the step has been timed against the serial one, so elsewhere prefill stays
+     * serial. The second lane touches the residual stream, the normed input in both forms and the
+     * bounds, so those leave the sharing pool (Ctx::lane1_; the drafter taps are copied on the
+     * first lane, pipe_taps); the bounds also because no declared op reads them, which would leave
+     * a transient dead before the kernels that take them raw.
+     *
+     * Not on a trunk whose norms write rotated int8 codes (qwen35_w8a8 where libr4d serves the
+     * `_had_quant_i8g` forms, a_h.q8_fed): the boundary norms on the second lane
+     * (NormQuantFP8::step_plain) issue the E4M3 pair only, so such a trunk prefills serially. */
+    if (m.a_h.q8_fed) {
+        if (g.world == 2 && g.max_tok >= kPipeMinRows && ctx->rank == 0)
+            fprintf(stderr, "radiance: qwen35: the pipelined prefill stays off on this trunk: its norms "
+                            "write rotated int8 codes, which the pipeline's boundary norms do not\n");
+    } else {
+        m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows;
+    }
+    if (m.pipe_on) {
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_x));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.x));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.q));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.s));
+        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_pipe_cu));
+    }
+#endif
+
     /* ---- the layers. */
     /* The rope table's fill, declared before the layers that read it. If it does not resolve,
      * `aw.cos_sin` is cleared and every attention block uses its unfused norm + rope pair. Its band
@@ -896,6 +960,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.full = is_full_attention(l, interval) ? 1 : 0;
+#if !QWEN35_MOE
+        /* The pipelined prefill runs every block's all-reduce beside the other piece's work, so
+         * each declares its collective a second time at `overlap` 1, a launch that leaves the CUs
+         * to that work (the lane rows of libr4d/r4d_rows.cpp); the fused all-reduce and norm
+         * would hold the card while it waits on the link. */
+        lay.attn.ar_overlap = lay.gdn.ar_overlap = lay.mlp.ar_overlap = m.pipe_on ? 1 : 0;
+#endif
 
         const LayerFold f = layer_fold(g, l, m.n_main, m.tap_layer, m.n_taps, m.op_embed_ar != 0);
 
@@ -960,6 +1031,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                         RAD_F64("eps", g.eps), RAD_F64("wadd", final_wadd), RAD_STR("dtype", g.dtype)),
                              RAD_WEIGHTS(m.w_out_norm)),
                          {m.b_x}, {m.a_h.x});
+    RAD_ARCH_TRY(rad_lane1_window_end(b));
 
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),
@@ -1130,6 +1202,235 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     return RAD_OK;
 }
 
+#if !QWEN35_MOE
+/* ============================== A prefill step in two pieces ==============================
+ *
+ * At two ranks every layer of a prefill chunk makes two all-reduces, each folded into the next
+ * block's norm (layer_fold) and each in a hard chain on one stream: block -> all-reduce + norm ->
+ * block. On a 2048-token chunk they are about a fifth of the step, nearly all of it the link, with
+ * nothing beside them.
+ *
+ * A step of one prefill sequence of at least kPipeMinRows tokens is cut into two pieces of about
+ * half (pipe_rows), each the chunk a narrower batch makes. Every block runs a piece at a time on
+ * the first lane, and the work between two blocks runs a piece at a time on the second: the
+ * block's all-reduce at `overlap` 1 (a narrow launch that leaves the CUs to the compute beside it;
+ * the fused all-reduce and norm would hold its blocks on the card while it waits on the link and
+ * slow the GEMM beside it by a third), then the next block's plain norm, and after a feed-forward
+ * that keeps its add, the add and the final norm (the drafter taps go on the first lane, pipe_taps).
+ *
+ *   mixer     the delta net and the dense attention run whole a piece at a time and hand the
+ *             first piece off behind its out projection (ArPieces), so its boundary runs beside
+ *             the second piece's mixer;
+ *   ffn       its first piece runs beside the mixer's second boundary, its second beside its own
+ *             first boundary; the next mixer's first piece runs beside its second.
+ *
+ * A piece computes the bytes the narrower chunk does: every op is per row, both pieces sit in the
+ * band of a whole step (pipe_rows), the all-reduce reduces within a row, the delta net carries its
+ * state through the cache as between two chunks, and each attention piece sees the cache up to its
+ * own end. The narrow all-reduce and the plain norm write the fused op's bytes, so a pipelined
+ * step is bit for bit the serial one.
+ *
+ * The second lane's requirements (Ctx::lane1_) hold: every collective of the step is on it, the
+ * embedding's included; none carries a device-wide arrival counter (the all-reduce's sequence
+ * counters order its own launches, which one lane keeps in order); and the buffers it touches left
+ * the sharing pool at declare (the drafter taps it does not touch: pipe_taps). */
+
+template <class F>
+static void pipe_on1(RadCtx* c, const F& issue) {
+    rad_lane(c, 1);
+    rad_lane_join(c, 0, 1);
+    issue();
+    rad_lane(c, 0);
+}
+/* Lane 0 waits for everything issued on lane 1 so far. */
+static void pipe_wait1(RadCtx* c) { rad_lane_join(c, 1, 0); }
+
+/* The work after block `s` (2l the mixer of layer l, 2l + 1 its feed-forward) for rows
+ * [r0, r0 + n). */
+static void pipe_boundary(RadCtx* c, const Model& m, int64_t T, int64_t s, int64_t r0, int64_t n) {
+    const Geom& g = m.g;
+    const int64_t li = s / 2;
+    const Layer& l = m.layers[(size_t)li];
+    if (s % 2 == 0) {
+        if (l.full) l.attn.issue_ar(c, r0, n);
+        else        l.gdn.issue_ar(c, r0, n);
+        l.mlp.nq_h.step_plain(c, T, r0, n);
+        return;
+    }
+    l.mlp.issue_ar(c, r0, n);
+    if (l.mlp.op_add)
+        RAD_ISSUE_N(c, l.mlp.op_add, n, brow_slice(m.b_x, r0, n, g.n_embd),
+                    brow_slice(m.a_h.x, r0, n, g.n_embd), brow_slice(m.b_x, r0, n, g.n_embd));
+    if (li + 1 < (int64_t)m.layers.size()) {
+        const Layer& nx = m.layers[(size_t)li + 1];
+        (nx.full ? nx.attn.nq_h : nx.gdn.nq_h).step_plain(c, T, r0, n);
+    } else {
+        RAD_ISSUE_N(c, m.op_final_norm, n, brow_slice(m.b_x, r0, n, g.n_embd), RAD_W(m.w_out_norm),
+                    brow_slice(m.a_h.x, r0, n, g.n_embd));
+    }
+}
+
+/* Layer `li`'s drafter taps of rows [r0, r0 + n), on lane 0. Issued once lane 0 has waited for that
+ * piece's feed-forward boundary (its add is the last write to those rows of x before the next
+ * block's boundary, which lane 1 starts only behind lane 0's next issues), so the taps buffer is
+ * never touched from lane 1 and stays in the sharing pool: rad_buf_concurrent would hold its
+ * [max_tok, n_taps * n_embd] for the whole program. */
+static void pipe_taps(RadCtx* c, const Model& m, int64_t li, int64_t r0, int64_t n) {
+    for (int t = 0; t < m.n_taps; ++t) {
+        if (m.tap_layer[t] != (int)li) continue;
+        RAD_ISSUE_N(c, m.op_tap, n, brow_slice(m.b_x, r0, n, m.g.n_embd),
+                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * m.g.n_embd, (int64_t)t * m.g.n_embd,
+                            m.g.n_embd, n));
+    }
+}
+
+/* A mixer's first piece is done (ArPieces): lane 0 takes the previous block's second boundary
+ * before the second piece (and the previous layer's second-piece taps behind it), and lane 1 this
+ * block's first behind it. */
+struct PipeHand {
+    RadCtx*      c = nullptr;
+    const Model* m = nullptr;
+    int64_t      T = 0, s = 0;
+};
+static void pipe_hand(void* u, int64_t r0, int64_t n) {
+    const PipeHand& h = *(const PipeHand*)u;
+    pipe_wait1(h.c);
+    if (h.s >= 2) {
+        const int64_t R = pipe_rows(h.T);
+        pipe_taps(h.c, *h.m, h.s / 2 - 1, R, h.T - R);
+    }
+    pipe_on1(h.c, [&] { pipe_boundary(h.c, *h.m, h.T, h.s, r0, n); });
+}
+
+/* The bounds of this step's pieces on the card, {0, pipe_rows(T), T}, if the step is pipelined;
+ * null for a serial step, and null with `failed` set when the step has been failed. Copied on the
+ * step's stream ahead of every layer from the pinned table, whose rows never change, so a captured
+ * step replays the same copy. */
+static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, bool* failed) {
+    const int64_t T = batch->n_tok;
+    if (!m.pipe_on || !m.b_pipe_cu || T < kPipeMinRows || T > m.g.max_tok ||
+        batch->phase != RAD_PHASE_PREFILL)
+        return nullptr;
+    /* A prefill step wide enough that runs serially says why, once, so a deployment that never
+     * pipelines does not look like one that gains nothing from it. */
+    auto serial = [&](const char* why) -> const int32_t* {
+        if (!m.pipe_serial_noted && m.g.rank == 0)
+            fprintf(stderr, "radiance: qwen35: a %lld-row prefill step runs serially: %s\n",
+                    (long long)T, why);
+        m.pipe_serial_noted = true;
+        return nullptr;
+    };
+    if (batch->n_seq != 1 || batch->n_seq_decode != 0) return serial("more than one sequence");
+    if (!batch->positions) return serial("no positions");
+    if (rope_mixed(batch) || batch->n_mm_rows > 0) return serial("media rows in the step");
+    if (dbg_resid_on()) return serial("residual debugging is on");
+    int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
+    if (!d) {
+        /* Not a rank-local fallback to the serial step: the other rank would pipeline, and the two
+         * would issue different collectives. Fail the step, as gemma3 does. */
+        rad_step_fail(c, "qwen35: the pipelined prefill's bounds have no storage");
+        *failed = true;
+        return nullptr;
+    }
+    const int64_t R = pipe_rows(T);
+    ArPieces pc{};
+    pc.rows = R; pc.done = pipe_hand; pc.cu = d; pc.in_ready = true;
+    for (const Layer& l : m.layers) {
+        if (!(l.full ? l.attn.takes_pieces(batch, &pc) : l.gdn.takes_pieces(batch, &pc)))
+            return serial(l.full ? "an attention block cannot run in pieces"
+                                 : "a delta-net block cannot run in pieces");
+        /* Every boundary issues its block's all-reduce itself, narrow, then the plain norm. */
+        if (!(l.full ? l.attn.op_ar_ov : l.gdn.op_ar_ov) || !l.mlp.op_ar_ov)
+            return serial("a block declares no overlap all-reduce");
+    }
+    if (!m.pipe_tbl_tried) {
+        m.pipe_tbl_tried = true;
+        const int64_t n = m.g.max_tok + 1;
+        m.pipe_tbl = (int32_t*)rad_dev_alloc(3 * n * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        if (m.pipe_tbl) {
+            for (int64_t t = 0; t < n; ++t) {
+                m.pipe_tbl[3 * t]     = 0;
+                m.pipe_tbl[3 * t + 1] = (int32_t)pipe_rows(t);
+                m.pipe_tbl[3 * t + 2] = (int32_t)t;
+            }
+        }
+    }
+    /* Everything above depends only on the batch and the build, the same on every rank; what
+     * follows is this rank's own, and falling back to the serial step here would leave the other
+     * rank pipelining, the two issuing different collectives on the shared all-reduce instance
+     * (a hang or a wrong sum). So it fails the step. */
+    if (!m.pipe_tbl ||
+        rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
+            RAD_OK) {
+        rad_step_fail(c, "qwen35: the pipelined prefill's piece bounds could not be put on the card "
+                         "(no pinned host memory, or the copy failed)");
+        *failed = true;
+        return nullptr;
+    }
+    return d;
+}
+
+static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok, R = pipe_rows(T);
+    const int64_t L = (int64_t)m.layers.size();
+    if (!m.pipe_noted) {
+        m.pipe_noted = true;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen35: prefill steps of one sequence from %lld rows are "
+                            "pipelined: two pieces, block boundaries on the second lane\n",
+                    (long long)kPipeMinRows);
+    }
+
+    RAD_ISSUE(c, m.op_embed,
+              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
+    /* The embedding's reduction and layer 0's norm over the whole step, on lane 1 with every
+     * other collective (the norm takes the reduction where the wire is exact). */
+    pipe_on1(c, [&] {
+        if (m.op_embed_ar && !ar_wire_is_exact(g, T))
+            RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.b_x, T), RAD_NONE);
+        if (L > 0) (m.layers[0].full ? m.layers[0].attn.nq_h : m.layers[0].gdn.nq_h).step(c, T);
+    });
+    pipe_wait1(c);
+    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
+
+    for (int64_t li = 0; li < L; ++li) {
+        const Layer& l = m.layers[(size_t)li];
+        PipeHand h{c, &m, T, 2 * li};
+        ArPieces pc{};
+        pc.rows = R; pc.done = pipe_hand; pc.u = &h; pc.cu = pcu; pc.in_ready = true;
+        if (l.full) l.attn.step(c, batch, false, &pc);
+        else        l.gdn.step(c, batch, false, &pc);
+        if (pc.handed != 1) {
+            rad_step_fail(c, "qwen35: a mixer did not run its two pieces in a pipelined prefill "
+                             "step (pipe_ready and the block's takes_pieces disagree)");
+            return;
+        }
+        pipe_wait1(c);
+        pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li, R, T - R); });
+        l.mlp.body(c, T, 0, R);
+        pipe_wait1(c);
+        pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, 0, R); });
+        l.mlp.body(c, T, R, T - R);
+        pipe_wait1(c);
+        pipe_taps(c, m, li, 0, R);
+        pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, R, T - R); });
+    }
+    pipe_wait1(c);
+    if (L > 0) pipe_taps(c, m, L - 1, R, T - R);
+
+    if (batch->n_out > 0) {
+        RAD_ISSUE_N(c, m.op_gather, batch->n_out,
+                    brows(m.a_h.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
+                    brows(m.b_hout, batch->n_out));
+        RAD_ISSUE_N(c, m.op_logits, batch->n_out,
+                    brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
+                    brows(m.b_logits, batch->n_out));
+    }
+}
+#endif
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
@@ -1167,6 +1468,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
         m.mtp.step(c, batch);
         return;
     }
+
+#if !QWEN35_MOE
+    bool pipe_failed = false;
+    if (const int32_t* pcu = pipe_ready(c, batch, m, &pipe_failed)) {
+        step_pipelined(c, batch, m, pcu);
+        return;
+    }
+    if (pipe_failed) return;
+#endif
 
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
@@ -1242,6 +1552,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
             out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
     }
+    /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
+    out->state_f16_ok = 1;
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "DFlash2")) {
         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);

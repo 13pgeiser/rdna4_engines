@@ -645,6 +645,56 @@ void shape_cases(std::vector<Hand>& hs) {
             .pi("seqs", 1)
             .ps("dtype", "fp8_e4m3");
         hs.push_back(std::move(s));
+        /* `row_part` scores one run of the step's rows from query operands that span the step,
+         * and writes the bounds rebased to the run's first row. Six rows in runs of two over two
+         * sequences ending at row 5: run 1 straddles the sequences, run 2 ends past the step. */
+        for (int part : { 1, 2 }) {
+            Hand r(part == 1 ? "DSA scorer row_part: a run across two sequences"
+                             : "DSA scorer row_part: a run past the step's last row",
+                   "dsa_score", 1e-5);
+            r.dense(RAD_F8E4M3, { 6 * 32, 128 }, hfill(215, 0.25f))
+                .dense(RAD_F32, { 6 * 32, 1 }, hfill(216))
+                .dense(RAD_F32, { 6, 32 }, hfill(217))
+                .dense(RAD_F8E4M3, { 6, 128 }, hfill(218, 0.25f))
+                .dense(RAD_F32, { 6 }, [](int64_t i) { return 0.25f + 0.125f * (float)i; })
+                .dense(RAD_I32, { 2, 4 },
+                       [](int64_t i) { return (float)(i == 3 ? -1 : i < 4 ? i : 7 - i); })
+                .idx({ 0, 3, 5 })
+                .idx({ 3, 4 })
+                .dense(
+                    RAD_F32, { 2, 4 }, [](int64_t) { return 0.0f; }, true)
+                .idx({ 0, 0, 0 }, true)
+                .expect(9, { -2 * part, 3 - 2 * part, 5 - 2 * part })
+                .pi("M", 2)
+                .pi("n", 128)
+                .pi("heads", 32)
+                .pi("blocks", 4)
+                .pi("seqs", 2)
+                .ps("dtype", "fp8_e4m3")
+                .pi("row_part", part);
+            hs.push_back(std::move(r));
+        }
+        /* Rebased bounds without a run to rebase them to are refused. */
+        Hand u("DSA scorer refuses cu_part without row_part", "dsa_score", 1e-5);
+        u.dense(RAD_F8E4M3, { 2 * 32, 128 }, hfill(219, 0.25f))
+            .dense(RAD_F32, { 2 * 32, 1 }, hfill(220))
+            .dense(RAD_F32, { 2, 32 }, hfill(221))
+            .dense(RAD_F8E4M3, { 3, 128 }, hfill(222, 0.25f))
+            .dense(RAD_F32, { 3 }, [](int64_t) { return 0.5f; })
+            .dense(RAD_I32, { 1, 3 }, [](int64_t i) { return (float)i; })
+            .idx({ 0, 2 })
+            .idx({ 3 })
+            .dense(
+                RAD_F32, { 2, 3 }, [](int64_t) { return 0.0f; }, true)
+            .idx({ 0, 0 }, true)
+            .refuses(RAD_E_INVAL)
+            .pi("M", 2)
+            .pi("n", 128)
+            .pi("heads", 32)
+            .pi("blocks", 3)
+            .pi("seqs", 1)
+            .ps("dtype", "fp8_e4m3");
+        hs.push_back(std::move(u));
     }
     /* ---- packed weight codes at odd element offsets ------------------------------------------ */
     {
@@ -4125,6 +4175,22 @@ void audio_cases(std::vector<Hand>& hs) {
                  .pi("stride", s).pi("pad", s / 2).ps("dtype", dn);
                 hs.push_back(std::move(h));
             }
+        }
+        for (const int64_t s : { 2, 4 }) {
+            /* A codec encoder's downsampling: kernel 2 stride, causal, the bounds in samples
+             * (cu_div 8 input rows), two clips of 4 and 2 strides from input row 2 s. */
+            const int64_t cin = 12, cout = 9, M = 8 * s;
+            Hand h(("stride " + std::to_string(s) + ", bounds in units of 8 rows" + sfx).c_str(),
+                   "conv1d", norm_tol);
+            h.dense(dt, { M, cin }, hfill(330 + s))
+             .dense(dt, { cout, cin, 2 * s }, hfill(334, 0.3f))
+             .idx({ (int32_t)(16 * s), (int32_t)(48 * s), (int32_t)(64 * s) })
+             .none()
+             .dense(dt, { M / s, cout }, hfill(335), true)
+             .dense(dt, { cout }, hfill(336, 0.5f))
+             .pi("M", M).pi("cin", cin).pi("cout", cout).pi("k", 2 * s).pi("dil", 1)
+             .pi("causal", 1).pi("stride", s).pi("cu_div", 8).ps("dtype", dn);
+            hs.push_back(std::move(h));
         }
         for (const int64_t s : { 5, 3 }) {
             /* A codec's odd strides at kernel 2 stride, causal, over sequences of 3, 1 and 5 rows

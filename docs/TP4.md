@@ -73,6 +73,11 @@ promotion truth; quick concurrency ladders within windows.
 4. ti8 **one-shot band** for 128 KiB–512 KiB lossy messages (currently every
    such message pays two-shot 1.5N + 2 syncs) — flagged upstream on #78.
 5. Draft-pass graph capture — only if low-concurrency latency ever matters.
+6. **The dense pipelined prefill at TP4** (`qwen35_fp8`, `qwen35_w8a8`, `gemma3`; GUIDE §4.5): a
+   prefill step of one sequence in two pieces, every block boundary's all-reduce on the second lane
+   at `overlap` 1, which at four ranks would take this table's `*_4rank_*_lane` rows (row 1). It
+   runs at two ranks only; enabling it here (`g.world == 2` in both plugins' declare) needs a
+   timing against the serial step at 18K-64K prompts and the chunk served.
 
 ## Interaction diagram
 

@@ -386,8 +386,8 @@ int ref_act_mul(const RadArgs* a, RadStream) {
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(A) < rows * n || numel(B) < rows * n) return RAD_E_SHAPE;
-    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid" };
-    const int act = p_enum(a, "act", kActs, 4, -1);
+    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" };
+    const int act = p_enum(a, "act", kActs, 5, -1);
     if (act < 0) return RAD_E_INVAL;
 
     REF_PAR_FOR(rows * n)
@@ -396,8 +396,13 @@ int ref_act_mul(const RadArgs* a, RadStream) {
         const int64_t as = laststride(A), bs = laststride(B), ys = laststride(Y);
         for (int64_t i = 0; i < n; ++i) {
             const float g = ldt(A, ab + i * as);
+            /* quick_gelu is x * sigmoid(1.702 x) with the scaled value rounded to y's dtype
+             * first, exactly the unfused mul-then-act_mul pair this replaces. */
             const float v = act == 0 ? act_silu(g) : act == 1 ? act_gelu(g)
-                          : act == 2 ? act_gelu_tanh(g) : act_sigmoid(g);
+                          : act == 2 ? act_gelu_tanh(g)
+                          : act == 3 ? act_sigmoid(g)
+                                     : act_sigmoid(round_dt(Y->dtype,
+                                                            g * round_dt(RAD_BF16, 1.702f)));
             stt(Y, yb + i * ys, round_dt(Y->dtype, v) * ldt(B, bb + i * bs));
         }
     }

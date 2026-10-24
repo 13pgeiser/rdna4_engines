@@ -33,7 +33,7 @@
 #include <vector>
 
 /* ==================================================================== the recording builder */
-namespace {
+namespace rad_fake {
 
 struct RecParam {
     std::string key;
@@ -81,7 +81,8 @@ struct RecIssue {
 /* A rad_lane_join: `to` behind everything `from` issued before issue number `at`. */
 struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 
-}  /* namespace */
+}  /* namespace rad_fake */
+using namespace rad_fake;
 
 struct RadBuilder {
     std::vector<RecWeight> weights;
@@ -116,9 +117,12 @@ struct RadBuilder {
     std::string    drafter_name;
     bool           drafter_shared = false;
     int            drafter_pos = -1;
+    int64_t        drafter_short = 0;     /* rad_drafter_short_block */
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
+    /* The second lane's window (rad_lane1_window_begin), first and last op index; -1 when none. */
+    int32_t lane1_w0 = -1, lane1_w1 = -1;
 
     /* The vision and audio encoder declarations (rad_declare_encoder), if any. */
     RadEncoderDecl encoder{};
@@ -296,6 +300,19 @@ extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     b->concurrent.push_back(buf);
     return RAD_OK;
 }
+/* Recorded: the second lane's window (qwen35_fp8, gemma3), applied by liveness() as the real builder
+ * applies it. Ops are handed out from 1 in declaration order, so the next op's index is size + 1. */
+extern "C" int rad_lane1_window_begin(RadBuilder* b) {
+    if (!b || b->lane1_w0 >= 0) return RAD_E_STATE;
+    b->lane1_w0 = (int32_t)b->ops.size() + 1;
+    return RAD_OK;
+}
+extern "C" int rad_lane1_window_end(RadBuilder* b) {
+    if (!b || b->lane1_w0 < 0 || b->lane1_w1 >= 0 || (int32_t)b->ops.size() < b->lane1_w0)
+        return RAD_E_STATE;
+    b->lane1_w1 = (int32_t)b->ops.size();
+    return RAD_OK;
+}
 extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
     if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
     if (lo < 0 || hi <= lo) return RAD_E_INVAL;
@@ -360,6 +377,14 @@ struct ChainOn {
     explicit ChainOn(int on) { g_chain_on = on; }
     ~ChainOn() { g_chain_on = 0; }
 };
+
+extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
+    const int64_t full = b ? (b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1) : 0;
+    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK) return RAD_E_STATE;
+    if (block >= full || block - (full - b->drafter.depth) < 1) return RAD_E_INVAL;
+    b->drafter_short = block;
+    return RAD_OK;
+}
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
     if (d->modalities == RAD_MM_AUDIO) {
@@ -477,13 +502,24 @@ extern "C" int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadSt
             c->copies.push_back({ c->issues.size(), h });
     return RAD_OK;
 }
+/* The pitched copy: recorded exactly as the 1-D one (its destination's first byte names the
+ * buffer); the unlimitedocr tower packs patch rows and lays out its map with it. */
+extern "C" int rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch,
+                                   int64_t width, int64_t height, RadStream s) {
+    (void)dpitch; (void)src; (void)spitch; (void)width; (void)height;
+    RadCtx* c = (RadCtx*)s;
+    if (c && c->b)
+        if (const rad_buf h = fake_buf_of(dst, c->b->bufs.size()))
+            c->copies.push_back({ c->issues.size(), h });
+    return RAD_OK;
+}
 extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
     (void)dst; (void)value; (void)bytes; (void)s;
     return RAD_OK;
 }
 
 /* ==================================================================== fixtures and helpers */
-namespace {
+namespace rad_fake {
 
 /* A deployment: one rank, 256 rows a step, eight sequences, 32k of context. */
 RadBuildCtx build_ctx(int rank = 0, int world = 1) {
@@ -660,7 +696,7 @@ int count_issued(const std::vector<std::string>& v, const std::string& name) {
     return (int)std::count(v.begin(), v.end(), name);
 }
 
-}  /* namespace */
+}  /* namespace rad_fake */
 
 /* ==================================================================== the step lint
  *
@@ -685,10 +721,11 @@ int count_issued(const std::vector<std::string>& v, const std::string& name) {
  *               this rank declared zero;
  *   strided     a GEMM whose input is a column slice narrower than its buffer (libr4d's GEMMs
  *               read whole rows and refuse it). */
-namespace {
+namespace rad_fake {
 
 /* One buffer's planned lifetime. `planned` is false for a buffer live over the whole program
- * (PERSIST, DERIVED, rad_buf_concurrent, or no declared use), which shares bytes with nothing. */
+ * (PERSIST, DERIVED, rad_buf_concurrent without a second-lane window, or no declared use), which
+ * shares bytes with nothing. */
 struct Live {
     int32_t lo = 0, hi = 0;
     bool    planned = false;
@@ -717,9 +754,15 @@ std::vector<Live> liveness(const RadBuilder& b) {
         Live& l = L[h];
         l.transient = d.kind == RAD_BUF_TRANSIENT;
         l.domain    = d.domain;
-        if (!l.transient || conc.count((rad_buf)h) || first[h] < 0) {
+        if (!l.transient || first[h] < 0 || (conc.count((rad_buf)h) && b.lane1_w1 < 0)) {
             l.lo = 0;
             l.hi = last_op;
+            continue;
+        }
+        if (conc.count((rad_buf)h)) {   /* under the window: across it and over its own uses */
+            l.planned = true;
+            l.lo = std::min(first[h], b.lane1_w0);
+            l.hi = std::max(last[h], b.lane1_w1);
             continue;
         }
         l.planned = true;
@@ -1045,7 +1088,7 @@ bool steps_ok(const std::vector<std::unique_ptr<RadCtx>>& v) {
     return ok;
 }
 
-}  /* namespace */
+}  /* namespace rad_fake */
 
 #define CHECK_LINT(b, ...) CHECK_EQ(report_lint(lint_step((b), { __VA_ARGS__ })), (size_t)0)
 /* The passes of one engine step (run_passes): none failed and the lint is clean over them. */
@@ -1056,7 +1099,7 @@ bool steps_ok(const std::vector<std::unique_ptr<RadCtx>>& v) {
     } while (0)
 
 /* ==================================================================== fingerprints */
-namespace {
+namespace rad_fake {
 
 /* A 64-bit FNV-1a fingerprint of everything a declare recorded: ops with their parameters,
  * weights, read and write sets and resolution; buffers, weights, KV groups, bindings, name maps,
@@ -1191,6 +1234,6 @@ uint64_t pinned_steps(RadBuilder& b, StepFn step, int rank, int world) {
     return issue_hash(b, all, kits);
 }
 
-}  /* namespace */
+}  /* namespace rad_fake */
 
 #endif /* RAD_ARCH_FAKES_H */

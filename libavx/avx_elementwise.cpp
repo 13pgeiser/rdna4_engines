@@ -117,16 +117,27 @@ AVX_KERNEL(mul_weight) {
  * rather than the algebraically equal g / (1 + e^(-2z)), which differs by an ulp or two and after
  * bf16 rounding measurably moves embeddings away from transformers'. vf_exp saturates, so the
  * large-|g| limits come out as g and 0. erf has no vector form here, so gelu stays scalar. */
-static inline float act_of(int act, float g) {
+static inline float round1(uint32_t dt, float v) {
+    if (dt == RAD_F32) return v;
+    uint16_t t;
+    row_from_f32(dt, &v, &t, 1);
+    float r;
+    row_to_f32(dt, &t, &r, 1);
+    return r;
+}
+
+static inline float act_of(int act, float g, uint32_t dt) {
     if (act == 0) return g / (1.0f + sc_exp(-g));
     if (act == 1) return 0.5f * g * (1.0f + sc_erf(g * 0.70710678118654752f));
     if (act == 3) return 1.0f / (1.0f + sc_exp(-g));
+    if (act == 4)   // quick_gelu: sigmoid of the 1.702*g the unfused mul would have stored
+        return 1.0f / (1.0f + sc_exp(-round1(dt, g * round1(RAD_BF16, 1.702f))));
     const float k0 = 0.7978845608028654f, k1 = 0.044715f;
     return 0.5f * g * (1.0f + sc_tanh(k0 * (g + k1 * g * g * g)));
 }
 
 /* sy[0..n) = act(g[0..n)) for silu (0) and gelu_tanh (2); the tail is the scalar form. */
-static inline void act_row(int act, const float* g, float* sy, int64_t n) {
+static inline void act_row(int act, const float* g, float* sy, int64_t n, uint32_t dt) {
     int64_t i = 0;
     const vf one = vf_set1(1.0f);
     if (act == 0) {
@@ -145,7 +156,7 @@ static inline void act_row(int act, const float* g, float* sy, int64_t n) {
             vf_storeu(sy + i, vf_mul(vf_mul(half, x), vf_add(one, t)));
         }
     }
-    for (; i < n; ++i) sy[i] = act_of(act, g[i]);
+    for (; i < n; ++i) sy[i] = act_of(act, g[i], dt);
 }
 
 AVX_KERNEL(act_mul) {
@@ -155,8 +166,8 @@ AVX_KERNEL(act_mul) {
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(A) < rows * n || numel(B) < rows * n) return RAD_E_SHAPE;
-    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid" };
-    const int act = p_enum(a, "act", kActs, 4, -1);
+    static const char* kActs[] = { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" };
+    const int act = p_enum(a, "act", kActs, 5, -1);
     if (act < 0) return RAD_E_INVAL;
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
@@ -166,7 +177,7 @@ AVX_KERNEL(act_mul) {
         float* sy = scratch_f32_c((size_t)n);
         const float* g = in_row(A, rowoff(A, r, n), n, sa);
         const float* u = in_row(B, rowoff(B, r, n), n, sb);
-        act_row(act, g, sy, n);
+        act_row(act, g, sy, n, Y->dtype);
         /* sa is free once the activation is taken (g is sa or the tensor); sb may hold u, which
          * is still needed. */
         roundtrip(Y->dtype, sy, n, sa);
@@ -314,7 +325,7 @@ AVX_KERNEL(conv2d) {
             if (gelu) {
                 /* The biased sum as y's dtype holds it, then the activation of the rounded value. */
                 const float* yr = in_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
-                for (int64_t e = 0; e < rout; ++e) acc[e] = act_of(1, yr[e]);
+                for (int64_t e = 0; e < rout; ++e) acc[e] = act_of(1, yr[e], RAD_F32);
                 out_row(Y, rowoff(Y, o0 + to, rout), rout, acc);
             }
         }

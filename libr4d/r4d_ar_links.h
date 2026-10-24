@@ -84,8 +84,8 @@ inline bool r4d_ar_weights_from_rates(const double* gbs, int ws, int* w) {
   return true;
 }
 
-// RADIANCE_AR8_SHARD_WEIGHTS=duplex: the weights that minimise the two-shot's link time when both
-// directions of a link run at once (the pieced kernel's aim). Rank r with shard fraction x_r sends
+// The duplex model: the weights that minimise the two-shot's link time when both directions of a
+// link run at once (the pieced kernel's aim). Rank r with shard fraction x_r sends
 // (1 - x_r) of the message in the first hop and (ws - 1) x_r in the second, and receives the same,
 // so each direction carries (1 + (ws - 2) x_r) N at rate B_r. The slowest rank sets the time T, so
 // the best table makes every rank with a shard finish together: x_r = (T B_r - 1) / (ws - 2) where
@@ -93,6 +93,10 @@ inline bool r4d_ar_weights_from_rates(const double* gbs, int ws, int* w) {
 // down). Four ranks at B and four at B / 2 give x of 2/9 and 1/36, 8 to 1 where the quadratic rule
 // above gives 4 to 1, and a time 10% lower (7/6 N / B / 2 against 1.3 N / B / 2). Scaled so the
 // largest weight is 64. False when a rank's rate is unknown.
+//
+// The engine keeps r4d_ar_weights_from_rates: on eight R9700 these weights lost their lead within
+// a timing run and served no faster at TP8. r4d_selftest --perfar8 prints this table beside the
+// engine's, to be set with --ar8-weights when timing another board.
 inline bool r4d_ar_weights_duplex(const double* gbs, int ws, int* w) {
   if (ws < 3 || ws > 16) return false;
   int order[16];

@@ -13,9 +13,10 @@
  *             row-interleaved all_gather, bit for bit the replicated projection
  *
  * The one rule for a run: ceil(T / world) rows, rounded up to whole 16-byte words of the gathered
- * row, because an all_gather moves whole words. The indexer gathers one i32 length a row beside
- * its page tables, so its runs are multiples of four rows. The last rank's run may be short, or
- * lie wholly past a small step (`run_of`). */
+ * row, because an all_gather moves whole words. The MLA gathers 4096-wide bf16 rows, so its runs
+ * are ceil(T / world); the indexer gathers one i32 length a row beside its page tables, so its
+ * runs are multiples of four rows. The last rank's run may be short, or lie wholly past a small
+ * step (`run_of`). */
 #ifndef RAD_GLM_TP_H
 #define RAD_GLM_TP_H
 #include "rad_arch.h"

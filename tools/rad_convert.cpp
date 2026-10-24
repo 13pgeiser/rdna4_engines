@@ -544,8 +544,13 @@ int main(int argc, char** argv) {
     /* A generator sizes its passes itself (RadArchProbe::gen_rows) and may refuse a smaller one;
      * declare at that size unless the command line names one. */
     if (!max_tok_given && probe.gen_rows > ctx.max_tok) ctx.max_tok = probe.gen_rows;
-    /* Likewise declare the encoders, the vision tower at the engine's default patch bound. */
-    if (rad_meta_geti(&meta.m, "vision_config.patch_size", 0) > 0) {
+    /* Likewise declare the encoders, the vision tower at the engine's default patch bound. A
+     * checkpoint states one either way round: a flat `vision_config.patch_size`, or only the
+     * per-width tables with `vision_config.image_size` above them (Unlimited-OCR's DeepEncoder,
+     * whose widths each carry their own patch_size). Either means its weights are here to map,
+     * and the plugin declares the encoder only when `max_enc_patches` leaves it a whole view. */
+    if (rad_meta_geti(&meta.m, "vision_config.patch_size", 0) > 0 ||
+        rad_meta_geti(&meta.m, "vision_config.image_size", 0) > 0) {
         ctx.max_enc_patches = 16384;
         if (probe.enc_merge > 1) ctx.max_enc_patches -= ctx.max_enc_patches % probe.enc_merge;
     }

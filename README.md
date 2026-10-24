@@ -34,6 +34,8 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Gemma 4 31B: int4 trunk, int8 activations and lm_head, DFlash drafter, vision | `gemma4-31b-dense-w4a8-df.rad` (22 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash) | `gemma4-31b-w4a8-df.yaml` |
 | Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
 | Gemma 4 31B on four cards: int4 trunk, int8 activations and lm_head, RedHatAI's DFlash2 drafter, vision | `gemma4-31b-dense-w4a8-df2-qkv.rad` (23 GiB) | [download](https://huggingface.co/Ashlyn4202025/gemma4-31b-w4a8-dflash2) | `gemma4-31b-w4a8-df2-tp4.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-E4B bf16 (Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-bf16.rad` (16 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-bf16) | `nemotron-3.5-bolt-e4b-bf16.yaml` |
+| NVIDIA-Nemotron-3.5-Bolt-E4B int8 (i8a8, Gemma 4 E4B), NVIDIA's DFlash drafter, vision, one card | `nemotron-3.5-bolt-e4b-i8g.rad` (12 GiB) | [download](https://huggingface.co/keptn/nemotron-3.5-bolt-e4b-i8g) | `nemotron-3.5-bolt-e4b-i8g.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
@@ -45,7 +47,9 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniMax-H3 FP8: video with its stereo soundtrack from text | `minimax-h3-fp8.rad` (60 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-h3-fp8) | `minimax-h3.yaml` |
 | FastH3 8-Step V2 FP8: the same in eight steps | `fasth3-8-step-v2-fp8.rad` (62 GiB) | [download](https://huggingface.co/StillDeadcode/fasth3-8-step-v2-fp8) | `fasth3.yaml` |
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |
+| Unlimited-OCR bf16: document parsing with the DeepEncoder tower | `unlimited-ocr-bf16.rad` (6.2 GiB) | [download](https://huggingface.co/Aijuus/unlimited-ocr-bf16) | `unlimited-ocr-bf16.yaml` |
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
+| Fish Audio drama-3: speech with speaker tags and inline direction, voices cloned from reference clips, whole, streamed or live; block-FP8 experts, two cards | `drama3-fp8.rad` (36 GiB) | [convert](#convert-a-checkpoint) | `drama3.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
 | TranslateGemma 27B MXFP4 (GPTQ), translation; optional DFlash2 drafter | `translategemma-27b-mxfp4-gptq.rad` (17 GiB) | [convert](#convert-a-checkpoint) | `translategemma-27b.yaml` |
 | GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, vision, eight cards | `glm53-flash-mxfp4.rad` (172 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
@@ -120,7 +124,12 @@ from lyrics and a description, 44.1 kHz stereo, made at about the speed it plays
 speech in a voice the request describes, made in 0.6 of its playing time on one card, its first
 streamed audio 0.21 s after the request. Breeze-TTS-2 also speaks text while it is being written,
 over the `/v1/audio/speech/stream` WebSocket; it is licensed for research and non-commercial use
-only.
+only. Fish Audio's drama-3 speaks a script whose speakers and direction are written in it
+(`<|speaker:1|>`, `[laughs]`), each speaker in the model's voice or one cloned from a reference
+clip and its transcript, at 0.3 of its playing time on two cards, its first streamed audio
+0.23 s after the request; under the Fish Audio Community License a service that lets others
+generate speech with it needs a licence from Fish Audio, and imitating a real person's voice needs
+their consent.
 
 ## Run with Docker
 
@@ -205,6 +214,7 @@ four-rank rows have no compose file. The other models' flags are in their compos
 | MiniMax-H3 and FastH3 | `--tp 2 --vision-tower-placement ram` |
 | MiniMax-Music3 | `--tp 2` |
 | Breeze-TTS-2 | `--tp 1` |
+| Fish Audio drama-3 | `--tp 2` |
 
 Every model here runs at up to 32 sequences a step. The Flash-Next rows (except the bf16 reference)
 and the 27B in bf16 keep 8: on a hybrid model each sequence holds its own recurrent state, and 32 of
@@ -307,27 +317,6 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 
 `CMakePresets.json` names the same runs (`ctest --preset fast`, `host`, `gpu`, `full`, `asan`), and
 [`docs/GUIDE.md`](docs/GUIDE.md) §1.3 describes the tiers and the test binaries' options.
-
-## Draft acceptance
-
-Speculative decoding drafts up to `--num-speculative-tokens` tokens a step; the target model
-verifies them in one pass, and a draft survives only if it matches what the target would have
-produced. A position is verified only when every earlier position survived, so the same events
-admit two ratios, and they differ only in the denominator:
-
-- **Conditional** -- accepted / *reached*: of the drafts actually verified at a position, how
-  many passed. The dashboard's live "conditionally accepted" figure and the per-position bars are
-  conditional. Always the higher number, and it moves with the workload.
-- **Marginal** -- accepted / *drafted*: of everything the drafter proposed, how much survived.
-  The engine's `draft_accept` (/stats, and `radiance:draft_acceptance_ratio` on /metrics) is
-  marginal, cumulative over the life of the process. Lower by construction, and slow to move.
-
-They cannot agree, and neither is the other one broken. At depth 3 a step drafts three tokens
-but reaches position 3 only when 1 and 2 both passed, so marginal is roughly the product of the
-conditionals: bars reading 56/75/77% give (0.56 + 0.56x0.75 + 0.56x0.75x0.77) / 3 = 43%. A live
-63% beside a lifetime 43% is one lane, two questions. Quote the conditional when asking "how
-good is the drafter right now"; quote the marginal when asking "what fraction of draft work
-became text." Never compare the two across that boundary.
 
 ## Documentation
 

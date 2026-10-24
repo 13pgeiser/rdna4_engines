@@ -41,14 +41,10 @@ bool occurs_inside(const std::string& inner, const std::string& outer) {
     return !inner.empty() && outer.size() > inner.size() && outer.find(inner, 1) != std::string::npos;
 }
 
-bool starts_with(const std::string& s, const std::string& p) {
-    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
-}
-
 /* Two delimiters an automaton scanning for both cannot report in start order: one begins or
  * occurs inside the other. */
 bool confusable(const std::string& a, const std::string& b) {
-    return starts_with(a, b) || starts_with(b, a) || occurs_inside(a, b) || occurs_inside(b, a);
+    return a.starts_with(b) || b.starts_with(a) || occurs_inside(a, b) || occurs_inside(b, a);
 }
 
 std::string show(const std::string& s) { return nlohmann::json(s).dump(); }

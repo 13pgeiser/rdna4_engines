@@ -241,6 +241,42 @@ TEST(a_discrete_model_takes_its_sampler_and_reads_the_prompt_in_windows) {
     CHECK_EQ(str_at(badk["error"], "param"), std::string("scheduler"));
 }
 
+/* `rebalance` is a boolean, JSON or form ("true", "1", "false", "0"). `true` reaches the generator
+ * as RAD_GEN_COND_REBALANCE only on a model that declares it, and is a 400 naming the field on
+ * one that does not; `false` is accepted by every model. */
+TEST(rebalance_reaches_a_model_that_declares_it_and_is_refused_by_one_that_does_not) {
+    Images s;
+    const json no = s.gen({ { "prompt", "x" }, { "rebalance", true } }, 400);
+    CHECK_EQ(str_at(no["error"], "param"), std::string("rebalance"));
+    CHECK(s.img.got.empty());
+    s.gen({ { "prompt", "x" }, { "rebalance", false } });
+    REQUIRE(!s.img.got.empty());
+    CHECK_EQ(s.last().cond_opts, (int32_t)0);
+    s.img.inf.cond_opts = RAD_GEN_COND_REBALANCE;
+    for (const json& bad : { json("yes"), json(1), json::array() }) {
+        const json e = s.gen({ { "prompt", "x" }, { "rebalance", bad } }, 400);
+        CHECK_EQ(str_at(e["error"], "param"), std::string("rebalance"));
+    }
+    s.gen({ { "prompt", "x" }, { "rebalance", true } });
+    CHECK_EQ(s.last().cond_opts, (int32_t)RAD_GEN_COND_REBALANCE);
+    s.gen({ { "prompt", "x" } });
+    CHECK_EQ(s.last().cond_opts, (int32_t)0);
+    s.gen({ { "prompt", "x" }, { "rebalance", nullptr } });
+    CHECK_EQ(s.last().cond_opts, (int32_t)0);
+    /* The form's text values. */
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/images/generations";
+    q.form = { FormPart{ "prompt", "", "", "a cat" }, FormPart{ "rebalance", "", "", "1" } };
+    CHECK_EQ(s.f->srv->router().dispatch(q).status, 200);
+    CHECK_EQ(s.last().cond_opts, (int32_t)RAD_GEN_COND_REBALANCE);
+    q.form[1].data = "false";
+    CHECK_EQ(s.f->srv->router().dispatch(q).status, 200);
+    CHECK_EQ(s.last().cond_opts, (int32_t)0);
+    q.form[1].data = "on";
+    CHECK_EQ(s.f->srv->router().dispatch(q).status, 400);
+}
+
 /* `background: auto` keeps an edited picture's transparency and is opaque otherwise; a mask must
  * be the first picture's size. */
 /* A model whose card states guidance as cond + s (cond - uncond) and guides by default (Krea 2):

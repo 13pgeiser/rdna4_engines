@@ -2187,8 +2187,9 @@ unsigned int* hc_mix_ctr(RadStream s) {
     if (fi < 0) return nullptr;
     void* p = nullptr;
     if (hipMalloc(&p, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
-    /* Zero before any launch reads it: the memset is on the null stream, which the engine's
-     * streams need not wait for, so wait here (as r4d_moe.hip's router counters do). */
+    /* Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has
+     * finished when it returns (core/device/aql.cpp); under HIP's own runtime (r4d_selftest) it
+     * runs on the null stream, which a non-blocking stream does not wait for, so wait here. */
     if (hipMemset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess ||
         hipDeviceSynchronize() != hipSuccess) {
         (void)hipFree(p);

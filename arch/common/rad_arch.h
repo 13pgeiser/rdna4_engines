@@ -596,25 +596,30 @@ inline rad_op rw(RadBuilder* b, rad_op h,
  * (core/runtime/ctx.h): it is no collective, keeps no counter and touches no arena byte.
  *
  * Only at decode and verify heights, up to kPrefetchRows rows: a DFlash2 verify's 8 a sequence, a
- * z-lab DFlash verify's 16, a plain decode's one. With the ceiling at 64, a prompt's prefill steps
- * (40 rows on the 31B's test prompt) took the reads too, and a freshly started 31B server's first
- * greedy reply then differed on 4 of 6 starts (4x R9700, the cards' memory scribbled before each
- * start); at 16, and with no reads at all, 0 of 6. Per-op output hashes later located that
- * divergence at the prefill all-reduce's first reuse of a double-buffered slot: a race in the
- * all-reduce, which its full fence on prefill-sized messages (libr4d) cures, not in anything the
- * reads touch. The reads stay off prompt steps all the same. */
+ * z-lab DFlash verify's 16, a plain decode's one. Prompt steps never take the reads: beside the
+ * prefill all-reduces they made a fresh server's first greedy reply differ, the slot-reuse race
+ * that libr4d's full fence on prefill-sized four-rank messages (kArFenceFromElems) also cures. */
 constexpr int64_t kPrefetchRows = 16;
-/* The read goes on lane 0 itself, right after the GEMM, where its chained form (libr4d
- * r4dchain_prefetch) waits for that GEMM and then reads beside the collective after it without
- * holding the collective: no join between the lanes, so no record on the GEMM and no barrier bit
- * on it, and the read starts as the GEMM's last block ends rather than ~10 us later on lane 1. On
- * 4x R9700 (31B DFlash2, three rounds, every reply identical): code 385-386 tok/s against 363-365,
- * prose 284-286 against 269-270, decode after a 6.4k prompt 580-583 against 538-541. Only where
- * launches chain (rad_chain_on, the core's decision), since a plain launch would read in series
- * there; elsewhere the read goes on lane 1, behind a join from lane 0. */
+/* Where launches chain (rad_chain_on, the core's decision) the read goes on lane 0 itself, right
+ * after the GEMM: its chained form (libr4d r4dchain_prefetch) waits for that GEMM and then reads
+ * beside the collective after it without holding the collective, so there is no join between the
+ * lanes and the read starts as the GEMM's last block ends rather than ~10 us later on lane 1 (on
+ * 4x R9700, the 31B with DFlash2 decoded 6-8% faster than with the read on lane 1). A plain launch
+ * would read in series on lane 0, so elsewhere the read goes on lane 1, behind a join from lane
+ * 0. */
 inline bool prefetch_lane0() { return rad_chain_on() != 0; }
+/* RADIANCE_PREFETCH_BESIDE=0 issues none of these reads. Beside another server on the same card
+ * the lane-1 form costs more than it gains: the card has fewer hardware queue slots than the two
+ * servers have queues, and the join puts a queue switch into every decode step. */
+inline bool prefetch_beside_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_PREFETCH_BESIDE");
+        return !(e && e[0] == '0' && e[1] == 0);
+    }();
+    return on;
+}
 inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
-    if (!op || T > kPrefetchRows) return;
+    if (!op || T > kPrefetchRows || !prefetch_beside_on()) return;
     if (prefetch_lane0()) {
         RAD_ISSUE(c, op, RAD_W(w));
         return;
@@ -622,15 +627,9 @@ inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
     if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK) RAD_ISSUE(c, op, RAD_W(w));
     rad_lane(c, 0);
 }
-/* RADIANCE_PREFETCH=0 declares no reads at all (docs/GUIDE.md); read at declare. */
-inline bool prefetch_enabled() {
-    const char* e = std::getenv("RADIANCE_PREFETCH");
-    return !(e && !std::strcmp(e, "0"));
-}
-/* The `prefetch` of `w`'s first `bytes`, where a library serves it and the reads are on; 0
- * otherwise. */
+/* The `prefetch` of `w`'s first `bytes` where a library serves it; 0 otherwise. */
 inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes) {
-    if (!w || bytes <= 0 || !prefetch_enabled() || !rad_op_declared(b, "prefetch")) return 0;
+    if (!w || bytes <= 0 || !rad_op_declared(b, "prefetch")) return 0;
     return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes)), RAD_WEIGHTS(w));
 }
 
@@ -687,6 +686,9 @@ struct Geom {
     /* Messages below this many bytes use the exact all-reduce even with a lossy wire. Passed as
      * `all_reduce`'s `min_bytes`; 0 leaves the default to the kernel plugin. */
     int64_t wire_min_bytes = 0;
+    /* RAD_ATTN_FP8_* bits: the attention products accepted in e4m3 (RadBuildCtx describes it).
+     * decl_attn passes it on as `attn_paged`'s `prefill_fp8`. */
+    int     attn_prefill_fp8 = 0;
     float   eps        = 1e-6f;
     /* GemmaRMSNorm's `1 +`. Qwen3.5, Qwen3-Next and Gemma normalise with `x_hat * (1 + w)` and
      * store `w` near 0.1, so reading it as a plain gain shrinks every normed activation 5-10x. An
@@ -957,6 +959,7 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.world     = c->world_size ? c->world_size : 1;
     g.wire_exact= c->tp_wire_lossy ? 0 : 1;
     g.wire_min_bytes = c->tp_wire_min_bytes;
+    g.attn_prefill_fp8 = c->attn_prefill_fp8;
     g.eps       = m->rms_eps;
     g.theta     = m->rope_theta;
     g.rope_scale= 1.0f;   /* yarn_from reads the model's rotary scaling */
@@ -1160,6 +1163,16 @@ inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
     p.push_back(RAD_F64("yarn_low", g.yarn.low));
     p.push_back(RAD_F64("yarn_high", g.yarn.high));
     p.push_back(RAD_F64("yarn_magnitude", g.yarn.magnitude));
+    return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
+}
+
+/* An `attn_paged` op with the deployment's `prefill_fp8` appended (docs/OPS.md). At 0 the
+ * parameters are passed unchanged, so op identities and tune keys do not change. */
+inline rad_op decl_attn(RadBuilder* b, const Geom& g, const char* name,
+                        const RadParam* params, int n, const rad_weight* weights, int nw) {
+    if (g.attn_prefill_fp8 == 0) return rad_decl_op(b, name, params, n, weights, nw);
+    std::vector<RadParam> p(params, params + n);
+    p.push_back(RAD_INT("prefill_fp8", g.attn_prefill_fp8));
     return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
 }
 

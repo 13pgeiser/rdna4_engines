@@ -900,6 +900,27 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
              "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "
              "41943040:ar_twoshot_3rank_exact ");
 
+    /* At `overlap` 1 (an all-reduce beside compute) the four-rank two-shot band takes the lane
+     * rows, exact and lossy; the one-shot band has no lane row past two ranks. Three and eight ranks
+     * have no lane row and keep the plain two-shot. */
+    auto lane = [&](int world, int exact) {
+        Geometry g;
+        g.set_i("world_size", world);
+        g.set_s("dtype", "bf16");
+        g.set_i("exact", exact);
+        g.set_i("min_bytes", 128 * 1024);
+        g.set_i("overlap", 1);
+        return r.build_bands("all_reduce", "numel", width, chunk * width, g);
+    };
+    CHECK_EQ(band_names(lane(4, 1)), "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
+             "5242880:ar_twoshot_4rank_exact_lane ");
+    CHECK_EQ(band_names(lane(4, 0)), "8192:ar_twoshot_4rank_ti8_lane 524288:ar_twoshot_4rank_ti8_lane "
+             "5242880:ar_twoshot_4rank_ti8_lane ");
+    CHECK_EQ(band_names(lane(3, 1)), "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "
+             "5242880:ar_twoshot_3rank_exact ");
+    CHECK_EQ(band_names(lane(8, 1)), "8192:ar_oneshot_8rank_exact 524288:ar_twoshot_8rank_exact "
+             "5242880:ar_twoshot_8rank_exact ");
+
     /* Above the two-shot's bound the one-shot takes the message back. */
     CHECK_EQ(band_names(bands(4, 1, 131072)),
              "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
@@ -975,6 +996,33 @@ TEST(libr4d_resolves_the_four_rank_fused_writes_on_the_exact_wire_only) {
     }
 }
 
+/* The fused all-reduce junction resolves by width: two ranks take the two-rank row, four the
+ * wide family's row (or its host-mailbox twin without peer access), and three or eight ranks have
+ * no row, so a caller keeps the pair. Geometry is Gemma 4 31B's at decode heights. */
+TEST(libr4d_resolves_the_fused_all_reduce_junction_at_two_and_four_ranks) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    auto bands = [&](int world) {
+        Geometry g;
+        g.set_i("n", 5376);
+        g.set_i("world_size", world);
+        g.set_s("dtype", "bf16");
+        g.set_f("eps", 1e-6);
+        g.set_f("wadd", 0.0);
+        return r.build_bands("ar_rmsnorm_quant_i8", "M", 1, 4, g);
+    };
+    r.set_device_fact(RAD_FACT_P2P, 1);
+    CHECK_EQ(band_names(bands(2)), "4:ar_rmsnorm_quant_i8 ");
+    CHECK_EQ(band_names(bands(4)), "4:ar_rmsnorm_quant_i8_4rank ");
+    for (int world : { 3, 8 })
+        for (const Band& b : bands(world)) CHECK(!b.dom[RAD_DOMAIN_DEVICE]);
+    r.set_device_fact(RAD_FACT_P2P, 0);
+    CHECK_EQ(band_names(bands(2)), "4:ar_rmsnorm_quant_i8_host ");
+    CHECK_EQ(band_names(bands(4)), "4:ar_rmsnorm_quant_i8_4rank_host ");
+}
+
 /* The vision tower's attention resolves as rad_block_vit.h declares it: head_dim 72, no
  * `window`. `window` is optional in attn_dense's schema and a constraint on an absent key does
  * not hold, so a row constraining it is unreachable for a caller that omits it. rad-kbench cannot
@@ -996,7 +1044,8 @@ TEST(libr4d_resolves_the_vision_attention_without_a_window) {
 }
 
 /* GLM-5.3-Flash's MLA at eight heads a rank: the matrix row ranks above the wave row and serves
- * every M up to its bound, a decode step's rows and a prefill chunk alike. */
+ * every M up to its bound, a decode step's rows and a prefill chunk alike. At 64 heads the rows
+ * row ranks above both. */
 TEST(libr4d_resolves_the_mla_attention_by_rows) {
     const std::string so = libr4d();
     if (so.empty()) return;
@@ -1010,6 +1059,71 @@ TEST(libr4d_resolves_the_mla_attention_by_rows) {
     g.set_s("dtype", "bf16");
     CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 2048, g)), "2048:mla_attn_matrix_bf16 ");
     CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 48, g)), "48:mla_attn_matrix_bf16 ");
+    // All 64 heads of a row, as GLM's prefill split by rows runs it: the rows row.
+    g.set_i("heads", 64);
+    CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 512, g)), "512:mla_attn_rows_bf16 ");
+    g.set_i("heads", 16);
+    CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 512, g)), "512:mla_attn_matrix_bf16 ");
+}
+
+/* GLM-5.3-Flash's MLA split by rows at eight ranks (arch/common/rad_block_glm_mla.h), with the
+ * parameters its ops declare against the container's encodings (block fp8 at f32 scales): every
+ * band of every op the row form adds resolves on the device, up to a 4096-token step's run of
+ * 512 rows. A form libr4d does not serve would stop a TP8 start at "resolved to no kernel". */
+TEST(libr4d_resolves_every_band_of_glm_mla_split_by_rows) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    r.set_device_fact(RAD_FACT_P2P, 1);
+    auto all_resolve = [&](const char* op, const char* ranged, int64_t lo, int64_t hi,
+                           const Geometry& g) {
+        const std::vector<Band> bands = r.build_bands(op, ranged, lo, hi, g);
+        bool ok = !bands.empty();
+        for (const Band& x : bands) ok = ok && x.dom[RAD_DOMAIN_DEVICE].row;
+        if (!ok) std::fprintf(stderr, "    %s: %s\n", op, band_names(bands).c_str());
+        return ok;
+    };
+    const int64_t R = 512;
+    for (const auto& [n, k] : { std::pair<int64_t, int64_t>{ 16384, 1536 }, { 4096, 16384 } }) {
+        Geometry g;
+        g.set_i("N", n);
+        g.set_i("K", k);
+        g.set_i("group", 128);
+        g.set_s("dtype", "fp8a8f32");
+        CHECK(all_resolve("gemm_nt_q", "M", 1, R, g));
+    }
+    for (const char* mode : { "absorb", "expand" }) {
+        Geometry g;
+        g.set_i("heads", 64);
+        g.set_i("head_dim", 256);
+        g.set_i("latent_dim", 512);
+        g.set_s("mode", mode);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("mla_project", "M", 1, R, g));
+    }
+    {
+        Geometry g;
+        g.set_i("latent_dim", 512);
+        g.set_i("heads", 64);
+        g.set_i("blocks", 513);
+        g.set_i("block_size", 4);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("mla_attn", "M", 1, R, g));
+    }
+    {
+        Geometry g;
+        g.set_i("n", 16384);
+        g.set_i("group", 128);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("quant_act_fp8", "M", 1, 4096, g));
+    }
+    {
+        Geometry g;
+        g.set_i("world_size", 8);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("all_gather", "numel", 4096, 4096 * 4096, g));
+    }
 }
 
 /* ================================================================== constraints that are not intervals */

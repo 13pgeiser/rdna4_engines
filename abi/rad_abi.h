@@ -13,11 +13,12 @@ extern "C" {
 #endif
 
 /* Bumped whenever anything a plugin compiles against changes shape: this header, rad_types.h,
- * rad_builder.h, rad_runtime.h, rad_device.h, rad_encoding.h, rad_quant.h or rad_sample.h. Every
+ * rad_builder.h, rad_runtime.h, rad_device.h, rad_encoding.h, rad_quant.h, rad_sample.h or
+ * rad_spechub.h. Every
  * kind of plugin reports it, and a plugin that does not report exactly this version is refused at
  * load with both versions printed. A new optional export (e.g. rad_plugin_reference) is not a
  * change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 26u
+#define RAD_ABI_VERSION 27u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -549,8 +550,20 @@ typedef int  (*RadKernelCollectiveFn)(int i);
  *   - the engine refuses to serve a model with an op only a reference library implements, unless
  *     given --debug-accept-reference-kernels;
  *   - rad-kbench checks every other library against it.
- * Without the symbol, or with 0, it is an ordinary library. Symbol name: `rad_plugin_reference`. */
+ * Without the symbol, or with 0, it is an ordinary library. Symbol name: `rad_plugin_reference`.
+ *
+ * It is a whole-library answer, because a library is usually one implementation of one thing. A
+ * plugin that ships a device row AND the host oracle beside it is not: marking the library would
+ * mark its device rows too, and the engine would refuse to serve an op that has a real kernel.
+ * Such a plugin exports `rad_kernel_reference` below and leaves this one 0. */
 typedef int  (*RadPluginReferenceFn)(void);
+
+/* Optional, per row: nonzero says kernel `i` of rad_kernel_at is that row's reference
+ * implementation. Overrides `rad_plugin_reference` for the rows it is exported for, so one
+ * library can declare a device row (0) and its host oracle (1) side by side. A plugin that
+ * exports neither leaves every row classified by `rad_plugin_reference`. Symbol name:
+ * `rad_kernel_reference`. */
+typedef int  (*RadKernelReferenceFn)(int i);
 
 #ifdef __cplusplus
 }   /* extern "C" */

@@ -98,10 +98,6 @@ int unsettled_for(const std::string& delay) {
     return 6;   /* medium */
 }
 
-bool starts_with(const std::string& s, const std::string& p) {
-    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
-}
-
 std::string rtrim(std::string s) {
     while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
     return s;
@@ -858,7 +854,7 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
             const std::string text = detok(ids, /*flush=*/true);
             const size_t at = speech_transcript_start(f, text, forced, /*closed=*/true);
             const std::string transcript = rtrim(text.substr(std::min(at, text.size())));
-            if (starts_with(transcript, t->sent)) delta(*t, transcript.substr(t->sent.size()));
+            if (transcript.starts_with(t->sent)) delta(*t, transcript.substr(t->sent.size()));
             ojson o = event("conversation.item.input_audio_transcription.completed");
             o["item_id"] = t->id;
             o["content_index"] = 0;
@@ -886,13 +882,13 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
         const size_t a = speech_transcript_start(f, settled_text, forced, /*closed=*/false);
         const std::string settled = a == std::string::npos ? std::string()
                                                            : rtrim(settled_text.substr(a));
-        if (settled.size() > t->sent.size() && starts_with(settled, t->sent))
+        if (settled.size() > t->sent.size() && settled.starts_with(t->sent))
             delta(*t, settled.substr(t->sent.size()));
         const std::string all_text = detok(ids, /*flush=*/false);
         const size_t b = speech_transcript_start(f, all_text, forced, /*closed=*/false);
         const std::string all = b == std::string::npos ? std::string()
                                                        : rtrim(all_text.substr(b));
-        const std::string tentative = starts_with(all, t->sent) ? all.substr(t->sent.size())
+        const std::string tentative = all.starts_with(t->sent) ? all.substr(t->sent.size())
                                                                 : std::string();
         if (tentative != t->tentative) {
             ojson o = event("radiance.input_audio_transcription.tentative");

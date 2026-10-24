@@ -75,9 +75,6 @@ __host__ __device__ __forceinline__ int r4d_attn_wlo(int ctx, int q_len, int qro
     const int lo = ctx - q_len + qrow - window + 1;
     return lo > 0 ? lo : 0;
 }
-__host__ __device__ __forceinline__ int r4d_attn_used(int ctx, int tile, int splits) {
-    int t = r4d_attn_tiles(ctx, tile), tps = r4d_attn_tps(ctx, tile, splits); return (t + tps - 1) / tps;
-}
 
 // WIN enables a sliding window (a.window positions ending at each row's causal limit). As a
 // template parameter defaulting to 0, full attention compiles with no window code.
@@ -236,7 +233,7 @@ void r4d_attn_decode_body(const R4DArgs& a, int splits)
                     if (WIN && kk < wlo0) kk = wlo0;
                     const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                     const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
-                                        + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                                        + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
                     v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
                     sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
                 }

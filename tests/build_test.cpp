@@ -834,6 +834,57 @@ TEST(linear_state_is_sized_per_sequence) {
              32LL * 128 * conv_window_entries(cd, 4) * 4);
 }
 
+/* rad_kv_group_replicated marks a paged group the same on every rank (the tiers keep it once a
+ * host slot). It is refused, by name, on a group that is not paged, beside rad_kv_group_zero in
+ * either order, on a handle that names no group, and after declare. */
+TEST(a_replicated_kv_group_is_paged_and_never_zero) {
+    NEED_PLUGIN(reg)
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_kvgroup g = decl_kv_full(b);
+        CHECK_OK(rad_kv_group_replicated(&b, g));
+        CHECK(b.program().kv_groups[g].replicated);
+        CHECK_EQ(rad_kv_group_zero(&b, g), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv group 'kv_full': kv_group_zero on a group declared "
+                                     "replicated"));
+        CHECK(!b.program().kv_groups[g].zero);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_kvgroup g = decl_kv_full(b);
+        CHECK_OK(rad_kv_group_zero(&b, g));
+        CHECK_EQ(rad_kv_group_replicated(&b, g), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv group 'kv_full': kv_group_replicated on a group declared "
+                                     "zero"));
+        CHECK(!b.program().kv_groups[g].replicated);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadKVGroupDecl ld{};
+        ld.kind = RAD_KV_LINEAR;
+        ld.dtype = RAD_F32;
+        ld.n_head_kv = 4;
+        ld.state_dim[0] = 16;
+        ld.state_dim[1] = 16;
+        const rad_kvgroup gl = b.decl_kv_group("gdn_state", &ld);
+        CHECK_EQ(rad_kv_group_replicated(&b, gl), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv group 'gdn_state': kv_group_replicated on a group that is "
+                                     "not paged"));
+        CHECK_EQ(rad_kv_group_replicated(&b, 7), (int)RAD_E_INVAL);
+        CHECK(has(b.errors().back(), "kv_group_replicated: 7 is not a declared KV group"));
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        const rad_kvgroup g = decl_kv_full(b);
+        decl_t_attn(b);
+        CHECK_OK(b.bind_layer_kv(0, g));
+        CHECK_OK(b.bind_layer_kv(1, g));
+        REQUIRE_EQ(b.finish(), RAD_OK);
+        CHECK_EQ(rad_kv_group_replicated(&b, g), (int)RAD_E_STATE);
+        CHECK(!b.program().kv_groups[g].replicated);
+    }
+}
+
 /* ================================================================== names, notes, the C surface */
 
 /* decl_name_map keeps `src_index`: a set index survives and an unset one is -1, not slice 0. The
@@ -1019,6 +1070,69 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK(p.drafter.name == nullptr);
     CHECK_EQ(p.drafter.kind, (int)RAD_DRAFT_SERIAL);
     CHECK_EQ(p.drafter.depth, 3);
+}
+
+/* rad_drafter_short_block applies only to a declared block drafter, and only to a block shorter
+ * than its own that still proposes a token; anything else is refused at declare, since the core
+ * would stage a block the plugin has no ops for. */
+TEST(a_block_drafters_short_block_is_shorter_and_still_proposes) {
+    Registry reg;
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        CHECK_EQ(rad_drafter_short_block(&b, 4), RAD_E_STATE);   /* nothing declared */
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_short_block(&b, 3), RAD_E_STATE);   /* a serial head */
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadBufDecl bd{};
+        bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 4;
+        const rad_buf prop = rad_decl_buffer(&b, "prop", &bd);
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = prop; d.proposal_pitch = 4;               /* block 5: the anchor + 4 */
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(rad_drafter_short_block(&b, 5), RAD_E_INVAL);   /* not shorter */
+        CHECK_EQ(rad_drafter_short_block(&b, 1), RAD_E_INVAL);   /* proposes nothing */
+        CHECK_EQ(b.program().drafter_short_block, 0);
+        CHECK_OK(rad_drafter_short_block(&b, 3));
+        CHECK_EQ(b.program().drafter_short_block, 3);
+    }
+}
+
+/* A block drafter's proposal pitch is its row pitch, which the engine reads row s at: left at 0 it
+ * defaults to depth, and under depth it is refused, since a row could not hold the proposals. */
+TEST(a_block_drafters_proposal_pitch_holds_its_proposals) {
+    Registry reg;
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 4;
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd);
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(b.program().drafter.proposal_pitch, 4);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd); d.proposal_pitch = 3;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(b.program().drafter.proposal_pitch, 1);
+    }
 }
 
 /* rad_drafter_shared_kv applies only to a declared serial drafter. With none declared, a block
@@ -1844,11 +1958,60 @@ TEST(the_logits_pooled_and_concurrent_buffers_live_past_their_declared_uses) {
             CHECK_EQ(by->first_def, 0);
             CHECK_EQ(by->last_use, 4);
             CHECK_EQ(p.scratch_regions, 2);
+            /* The second lane's region is bounded by the ops it may issue, never the larger. */
+            CHECK(p.scratch_bytes_lane1 >= 0 && p.scratch_bytes_lane1 <= p.scratch_bytes);
             /* Without the extension y (op 4) would take the bytes the output (op 1) left. */
             CHECK(by->arena_offset >= bo->arena_offset + bo->bytes ||
                   bo->arena_offset >= by->arena_offset + by->bytes);
         }
     }
+}
+
+/* Under a declared window (rad_lane1_window_begin) a concurrent buffer is live across the window and
+ * its own uses, not the whole program: a buffer used only past the window can take its bytes. */
+TEST(a_concurrent_buffer_under_a_window_lives_across_the_window_only) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I8;
+    bd.rank = 1;
+    bd.shape[0] = 4096;
+    bd.kind = RAD_BUF_TRANSIENT;
+    bd.domain = RAD_DOMAIN_DEVICE;
+    const rad_buf y = b.decl_buffer("y", &bd);
+    const rad_buf z = b.decl_buffer("z", &bd);
+    const rad_weight w = decl_w(b, "w0");
+    CHECK_OK(rad_lane1_window_begin(&b));
+    rad_op o1 = decl_gemm(b, w), o2 = decl_gemm(b, w);
+    CHECK_OK(rad_lane1_window_end(&b));
+    rad_op o3 = decl_gemm(b, w);
+    CHECK_OK(b.op_writes(o1, &y, 1));
+    CHECK_OK(b.op_reads(o2, &y, 1));
+    CHECK_OK(b.op_writes(o3, &z, 1));
+    CHECK_OK(b.buf_concurrent(y));
+    CHECK_OK(b.finish());
+    Program& p = b.program();
+    CHECK_EQ(p.lane1_w0, (int32_t)o1);
+    CHECK_EQ(p.lane1_w1, (int32_t)o2);
+    const BufferInfo* by = p.buffer(y);
+    const BufferInfo* bz = p.buffer(z);
+    CHECK_EQ(by->first_def, (int32_t)o1);
+    CHECK_EQ(by->last_use, (int32_t)o2);
+    /* z lives past the window only, so it shares y's bytes (whole program, it could not). */
+    CHECK_EQ(bz->first_def, (int32_t)o3);
+    CHECK(bz->arena_offset < by->arena_offset + by->bytes &&
+          by->arena_offset < bz->arena_offset + bz->bytes);
+}
+
+/* A window opened and never closed is refused at finish. */
+TEST(a_second_lane_window_must_be_closed) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    const rad_weight w = decl_w(b, "w0");
+    CHECK_OK(rad_lane1_window_begin(&b));
+    decl_gemm(b, w);
+    b.finish();
+    CHECK_EQ(b.status(), RAD_E_STATE);
 }
 
 /* ================================================================== the buffer plan, at random */

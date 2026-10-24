@@ -9,6 +9,7 @@
  * Chain order (reordering changes which tokens survive):
  *
  *     penalties (repetition / frequency / presence, then DRY)
+ *     the windowed no-repeat-ngram ban
  *     temperature
  *     the grammar mask
  *     top-k
@@ -47,6 +48,9 @@
  *   sample_penalties   M(range) n_vocab vocab_off?   logits, params, history  -> logits (inout)
  *   sample_dry         M(range) n_vocab vocab_off?   logits, params, history, breakers?
  *                                                                          -> logits (inout)
+ *   sample_ngram_ban   M(range) n_vocab vocab_off?   logits, params, history, ngram,
+ *                                                                          whitelist?
+ *                                                                          -> logits (inout)
  *   sample_temp        M(range) n_vocab   logits, params                  -> logits (inout)
  *   sample_mask        M(range) n_vocab   logits, params, bitmask         -> logits (inout)
  *   sample_topk        M(range) n_vocab vocab_off?   logits, params       -> cand_idx, cand_val,
@@ -64,13 +68,16 @@
  * a verify. `params` is [M] DeviceSampleParams rows. `history` is [M, max_hist] int32 global
  * token ids, row m addressed by its hist_off/hist_len. `breakers` is [M, max_hist] uint8 beside
  * it, nonzero where that token is a whole DRY sequence breaker. `bitmask` is [M, mask_words]
- * uint32, addressed by the row's mask_row. `vocab_off` is this rank's first vocabulary row,
+ * uint32, addressed by the row's mask_row. The ban's `whitelist` is a [M, mask_words] uint32
+ * bitmask (a SET bit exempts that column from the ban) addressed by the row itself, absent when
+ * no staged row carries one. `vocab_off` is this rank's first vocabulary row,
  * declared only when the vocabulary is split; the three ops that map between token ids and this
  * rank's logit columns use it. Every op has a libref implementation, which is both its fallback
  * and its oracle (spec §17).
  */
 #pragma once
 #include "rad_sample.h"
+#include "rad_spechub.h"
 
 #include "../rad_core.h"
 #include "grammar.h"
@@ -80,6 +87,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -109,6 +117,10 @@ struct SamplerConfig {
      * from this many of the most likely tokens, not the whole vocabulary. A request asking for a
      * larger top-k is refused at admission, not silently narrowed. */
     int64_t max_candidates = kSampleCandidates;
+
+    /* --draft-coupling: declare the coupled verify (`mtp_couple_verify`) behind the pick and the
+     * per-row state plane it reads. */
+    bool    draft_coupling = false;
 };
 
 /* ================================================================== the driver */
@@ -160,13 +172,18 @@ public:
     /* Whether allows_speculation's answer can no longer change. It changes only when a grammar
      * whose backend cannot rewind starts to constrain (on a commit). */
     bool speculation_fixed(uint64_t req_id) const;
+    /* --draft-coupling: bind the per-round states of the linear draft just published, `n` of
+     * them (0 clears). Each must name this request, the round it belongs to, and a `draw.mode` the
+     * row actually ran. RAD_E_NOTFOUND for a request already ended here. */
+    int set_mtp_couple(uint64_t req_id, const RadMtpCoupleState* states, int n);
 
     /* ---------------------------------------------------------- step path */
 
     /* Stage this step's parameter rows, penalty history and grammar bitmasks into pinned memory.
      * Scheduler thread, before the rank threads are released at the barrier. Allocates nothing;
-     * every buffer was sized at declare against max_seqs (spec §3.1). */
-    int build_step(const std::vector<Request*>& reqs);
+     * every buffer was sized at declare against max_seqs (spec §3.1). `step` is the engine's step
+     * the build stages for, carried into the coupling snapshot. */
+    int build_step(const std::vector<Request*>& reqs, int64_t step = -1);
 
     /* Stage `n` greedy rows for a drafter: no penalties, mask or history, and no RNG use, so
      * only the argmax runs. Draft output is a proposal checked by a greedy verifier
@@ -200,6 +217,26 @@ public:
      * meaningful only where the row carries RAD_SP_MASK. */
     const uint32_t* staged_mask(int64_t row) const { return mask_stage_ + row * mask_words_; }
     int64_t         mask_words() const { return mask_words_; }
+    /* Staged row `row`'s bound coupled state, as `run` uploads it: all-zero where the row carries
+     * none (bonus row, greedy row, uncoupled step). Lets a build be checked without a device. */
+    const RadMtpCoupleState& staged_couple(int64_t row) const { return couple_stage_[row]; }
+    /* Whether any row of the last build carries a bound state, i.e. whether `run` issues the
+     * verify op at all. Cleared by build_greedy: a gate for run(), not for evidence. */
+    bool staged_any_couple() const { return any_couple_; }
+    /* The verify op the last build resolved, for naming its kernel in a log line. */
+    rad_op staged_couple_op() const { return op_couple_; }
+
+    /* What build_step staged for the coupled verify. build_greedy, which runs between that build
+     * and the step's wait, clears any_couple_ but leaves this snapshot. */
+    struct CoupleBuild {
+        int64_t step = -1;   /* the engine step this build staged */
+        int64_t rows = 0;    /* bound rows */
+        /* The distinct sequences among them, with their bound rows. */
+        std::vector<std::pair<uint64_t, int64_t>> seqs;
+    };
+    const CoupleBuild& couple_build() const { return couple_build_; }
+    /* The engine step whose build run() last issued the verify op for, or -1. */
+    int64_t staged_couple_issued_step() const { return couple_issued_step_; }
 
 private:
     /* Whether the vocabulary is split, judged by this rank's logit width rather than the rank
@@ -218,6 +255,11 @@ private:
          * newly committed tokens only. Read only when the request carries a thinking budget. */
         ReasoningCount                  think;
         size_t                          think_seen = 0;
+        /* --draft-coupling: the linear draft's per-round states for the window the scheduler
+         * published, bound by set_mtp_couple and consumed by build_step. `couple_n` is how many of
+         * `couple` are live; 0 for a request whose drafts carry no coupled proposal. */
+        RadMtpCoupleState couple[RAD_MTP_COUPLE_MAX_ROUNDS]{};
+        int               couple_n = 0;
     };
 
     /* Mask staged row `row` to the reasoning block's close token, once the budget is spent
@@ -232,6 +274,9 @@ private:
     /* Declared op handles; RAD_NULL_HANDLE means unresolved, which admission refuses by name. */
     rad_op op_penalties_ = RAD_NULL_HANDLE;
     rad_op op_dry_       = RAD_NULL_HANDLE;
+    /* The windowed no-repeat-ngram ban (`sample_ngram_ban`), the stage Unlimited-OCR's
+     * generation_config asks for. It reads the same history plane as the two above. */
+    rad_op op_ngram_ban_ = RAD_NULL_HANDLE;
     rad_op op_temp_      = RAD_NULL_HANDLE;
     rad_op op_temp_late_ = RAD_NULL_HANDLE;   /* sample_temp over the candidates (temp_last) */
     rad_op op_mask_      = RAD_NULL_HANDLE;
@@ -244,6 +289,7 @@ private:
     rad_op op_argmax_    = RAD_NULL_HANDLE;
     rad_op op_allgather_ = RAD_NULL_HANDLE;
     rad_op op_merge_     = RAD_NULL_HANDLE;   /* the candidate merge, under tensor parallel */
+    rad_op op_couple_    = RAD_NULL_HANDLE;   /* --draft-coupling only */
     rad_op op_logprobs_  = RAD_NULL_HANDLE;   /* summary of the raw distribution */
     rad_op op_lp_gather_ = RAD_NULL_HANDLE;   /* every rank's summary, under a split vocabulary */
 
@@ -252,6 +298,10 @@ private:
     rad_buf buf_params_late_ = RAD_NULL_HANDLE;   /* the late temperature's rows */
     rad_buf buf_hist_    = RAD_NULL_HANDLE;
     rad_buf buf_brk_     = RAD_NULL_HANDLE;   /* DRY's single-token breaker marks, beside history */
+    rad_buf buf_ngram_   = RAD_NULL_HANDLE;   /* the n-gram ban's {n, window} pair a row */
+    /* The ban's whitelist bitmask, [rows, mask_words] like the grammar mask plane: a SET bit
+     * exempts that column from the ban. Uploaded with the ban, only when a staged row has one. */
+    rad_buf buf_ngram_wl_ = RAD_NULL_HANDLE;
     rad_buf buf_mask_    = RAD_NULL_HANDLE;
     rad_buf buf_cand_i_  = RAD_NULL_HANDLE;
     rad_buf buf_cand_v_  = RAD_NULL_HANDLE;
@@ -259,6 +309,12 @@ private:
     rad_buf buf_pairs_   = RAD_NULL_HANDLE;   /* this rank's candidates as (global id, logit) */
     rad_buf buf_lp_      = RAD_NULL_HANDLE;   /* sample_logprobs' stats, [rows, lp_width()] */
     rad_buf buf_lp_g_    = RAD_NULL_HANDLE;   /* and every rank's side by side */
+    rad_buf buf_couple_  = RAD_NULL_HANDLE;   /* [rows, RAD_MTP_COUPLE_STATE_WORDS], flag only */
+    RadMtpCoupleState* couple_stage_ = nullptr;   /* pinned, one row per sampled position */
+    bool    couple_      = false;   /* --draft-coupling */
+    bool    any_couple_  = false;   /* does any row this step carry a bound state? */
+    CoupleBuild couple_build_{};    /* what the last build_step staged, for the evidence line */
+    int64_t couple_issued_step_ = -1;   /* step whose verify op run() last issued */
 
     /* Pinned staging, allocated once at declare. */
     DeviceSampleParams* params_stage_ = nullptr;
@@ -275,6 +331,8 @@ private:
     const DeviceSampleParams* cur_stage_ = nullptr;   /* what the last build staged */
     int32_t*            hist_stage_   = nullptr;
     uint8_t*            brk_stage_    = nullptr;
+    int32_t*            ngram_stage_  = nullptr;   /* [rows][2]: n-gram length, window */
+    uint32_t*           ngram_wl_stage_ = nullptr; /* [rows][mask_words] exemption bitmask */
     uint32_t*           mask_stage_   = nullptr;
 
     int64_t mask_words_ = 0;      /* words for this rank's shard; what the mask op indexes */
@@ -282,6 +340,12 @@ private:
     /* Whether any DRY row this step has breakers; only then is the breaker plane uploaded and
      * passed to sample_dry. */
     bool    any_brk_    = false;
+    /* Whether any row this step runs the n-gram ban. Its history is the plane the penalties use,
+     * so this only decides whether that plane is uploaded and the op issued. */
+    bool    any_ngram_  = false;
+    /* Whether any banned row this step whitelists a column of this rank's shard; only then is
+     * the exemption plane uploaded and passed to sample_ngram_ban. */
+    bool    any_ngram_wl_ = false;
 
     /* The whole-vocabulary mask the grammar fills, from which this rank's shard is cut. Used
      * only when the head is sharded; see declare(). */

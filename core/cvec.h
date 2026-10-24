@@ -1,36 +1,26 @@
 /* cvec.h -- control vectors: one GGUF direction per layer, projected out of the residual stream.
  *
- * ============================== what it is ==============================
+ * The format is llama.cpp's `controlvector` GGUF: `direction.<l>` tensors of f32, n_embd wide. The
+ * operation is llama.cpp's `--cvec-mode project`
  *
- * The package at huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection carries one unit
- * direction per layer (`direction.1` .. `direction.47`, 2560 f32 each) and the configuration its
- * authors selected: the llama.cpp `--cvec-mode project` operation
+ *     h <- h - s_l (h . v_l) v_l          v_l = d_l / |d_l|,  s_l = |d_l| * package scale
  *
- *     h <- h - s_l (h . v_l) v_l          v_l = d_l / |d_l|,  s_l = |d_l|
+ * applied by an architecture plugin that declares RadArchProbe::control_vector_ok (qwen4exp_fp8
+ * issues `hc_project` on every stream of its gated residual). The layer range and scale come from
+ * the package's JSON beside the file; without one, every direction the file carries steers at
+ * scale 1.
  *
- * over layers 4..44, applied to every stream of the gated residual. Strata ports the same
- * package (`data/experimental-speed-projection`) with the same operation, range and per-request
- * switch; this is that port for radiance, which has its own graph and cannot use llama.cpp's
- * patch (arch/qwen4exp_fp8 issues `hc_project` from the op vocabulary instead).
+ * The vector shipped in data/vectors/ is a refusal-direction projection for Qwen3.8-Flash-Next:
+ * with it on, the model declines far fewer requests. It is loaded only with --control-vector, and
+ * each request can name its own choice.
  *
- * The vector is a refusal-direction projection: with it on the model declines far fewer requests.
- * Removing refusals removes a safety behaviour, so the default is OFF and every request names its
- * own choice, and the file is only read when the engine finds one for this container.
- *
- * ============================== compatibility, checked, not assumed ==============================
- *
- * Nothing here trusts the file's provenance. A vector is refused unless
+ * A file is refused unless
  *
  *   - `general.architecture` is `controlvector`,
- *   - `controlvector.model_hint`, when present, names this model's architecture plugin
- *     (`qwen4exp`), since a direction from another architecture's residual basis is noise,
- *   - every tensor is `direction.<l>`, F32, one dimension, and exactly the model's `n_embd`,
+ *   - `controlvector.model_hint`, when present, is this model's architecture id,
+ *   - every tensor is `direction.<l>`, F32, one dimension, exactly the model's `n_embd`, and
+ *     1 <= l < the model's layer count,
  *   - the layer range lies inside the model and every layer in it has a direction.
- *
- * The published Flash-Next vector passes all four against a Flash-Next container: 47 tensors of
- * 2560 f32, hint `qwen4exp`, range 4..44 of 48 layers. A 27B, Gemma or Qwen3.6 container refuses
- * it at startup with the reason, rather than serving a model whose hidden states are moved along
- * an unrelated direction.
  */
 #pragma once
 #include "rad_internal.h"
@@ -62,12 +52,9 @@ struct ControlVector {
     }
 };
 
-/* Read and validate `path` against a model of `n_embd` and `n_model_layers`.
- *
- * The operation's parameters come with the package, never from a command line: `path`'s own
- * `<stem>.json` (the JSON the vector is published with) supplies `layer_range` and `scale` when it
- * says `"mode": "project"`. Without one, the range is the published Qwen3.8-Flash-Next selection
- * (4..44) where the file has directions there, else every layer the file carries, at scale 1. */
+/* Read and validate `path` against a model of `n_embd` and `n_model_layers`. `path`'s own
+ * `<stem>.json` supplies `layer_range` and `scale`; one that is not JSON or names a mode other than
+ * `project` is refused. Without it, every layer the file carries steers at scale 1. */
 int control_vector_load(const std::string& path, const std::string& arch, int64_t n_embd,
                         int64_t n_model_layers, ControlVector* out, std::string* err);
 
@@ -77,8 +64,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
  * already knows the generation-config convention knows this one. */
 std::string control_vector_sidecar_path(const std::string& model_path);
 
-/* Resolve `auto`: sets *found to the first candidate that exists and is non-empty, or to "" when
- * none does. *tried receives the candidates, for the log line that says why the feature is
+/* Sets *found to the first candidate that exists and is non-empty, or to "" when none does. *tried receives the candidates, for the log line that says why the feature is
  * unavailable on this deployment. Discovery is a filesystem test only; whether the file is
  * compatible is control_vector_load's answer. */
 int control_vector_discover(const std::string& model_path, const std::string& arch,

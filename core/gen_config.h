@@ -20,17 +20,30 @@
 namespace rad {
 
 /* One config's sampler fields. -1 means "not stated", since 0 is a legal value of each (greedy
- * temperature, top_k off, min_p off). */
+ * temperature, top_k off, min_p off, n-gram ban off). */
 struct GenSampling {
     float temp = -1.0f, top_p = -1.0f, min_p = -1.0f;
     int   top_k = -1;
+    /* The windowed no-repeat-n-gram ban (transformers' no_repeat_ngram_size /
+     * no_repeat_ngram_window_size; Unlimited-OCR ships 35 over the last 128). `ngram_window` is
+     * normalized to 0, this sampler's "the whole sequence", when the config states it negative. */
+    int   ngram_ban_n = -1, ngram_window = -1;
+    /* The ban's whitelist: token ids the ban must never ban (the reference processor's
+     * `whitelist_token_ids`, removed from the banned set before the -inf writes). Transformers
+     * has no field for it; a container states it as `generation.no_repeat_ngram_whitelist`, a
+     * JSON array of ids. Empty means not stated. */
+    std::vector<int32_t> ngram_whitelist;
 
-    bool any() const { return temp >= 0.0f || top_p >= 0.0f || min_p >= 0.0f || top_k >= 0; }
+    bool any() const {
+        return temp >= 0.0f || top_p >= 0.0f || min_p >= 0.0f || top_k >= 0 ||
+               ngram_ban_n >= 0 || ngram_window >= 0 || !ngram_whitelist.empty();
+    }
 
     /* Overlay onto `base` field by field; unstated fields keep base's, so sources stack. */
     SamplingParams onto(SamplingParams base) const;
 
-    /* "temperature 0.70, top_k 20 (off), top_p 0.95, min_p 0.00", for the startup log line. */
+    /* "temperature 0.70, top_k 20 (off), top_p 0.95, min_p 0.00, ngram ban n 35 over the last 128
+     * tokens", for the startup log line (the last part only when a ban is on). */
     static std::string describe(const SamplingParams& sp);
 };
 

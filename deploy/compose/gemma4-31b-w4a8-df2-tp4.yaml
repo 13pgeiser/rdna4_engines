@@ -7,12 +7,12 @@
 # generation_config; thinking is switched per request (chat_template_kwargs).
 #
 # --tp 4 over four cards; chained launches, the weight reads beside the collectives and the prefill
-# overlap turn themselves on there (each has its RADIANCE_* override for an A/B, none needed here).
+# overlap turn themselves on there.
 # A prompt alone takes 8192-token prefill chunks; beside other users a chunk takes at most 512
 # tokens of a step, with one decode-only step after it, so a long prompt holds the others up by a
 # fraction of a chunk rather than all of it. 16 sequences, as measured below.
 #
-# On 4x R9700 (PCIe 4.0 x16), 2026-10-20: one user 390 code / 288 prose / 208 story tok/s, and
+# On 4x R9700 (PCIe 4.0 x16): one user 390 code / 288 prose / 208 story tok/s, and
 # 590 after a 6442-token prompt (prefill 5962 tok/s); 302 / 512 / 658 / 835 / 981 tok/s aggregate
 # at 1 / 2 / 4 / 8 / 16 users (BetterBench, thinking off).
 #

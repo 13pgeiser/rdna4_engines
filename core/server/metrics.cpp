@@ -140,8 +140,7 @@ void Metrics::sample(const SchedMetrics& m) {
     g_prefill_tps_.set(m.prefill_tps);
     g_decode_tps_.set(m.decode_tps);
     g_draft_accept_.set(m.draft_acceptance);
-    /* Nanoseconds in the scheduler, seconds on the wire: the base unit Prometheus expects, and
-     * what radiance:engine_step_seconds_* already use. */
+    /* Nanoseconds in the scheduler, seconds on the wire, as engine_step_seconds_* use. */
     g_step_best_.set((double)m.step_ns_decode_best / 1e9);
     g_step_recent_.set((double)m.step_ns_decode_recent / 1e9);
     const int seen = std::max(0, std::min(m.draft_depth_seen, (int)MAX_DRAFT_POS));
@@ -190,6 +189,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_prefix_ckpt_evict_.advance_to(m.prefix_ckpt_evictions);
     c_prefix_expired_.advance_to(m.prefix_expired);
     c_prefix_ckpt_expired_.advance_to(m.prefix_ckpt_expired);
+    c_prefix_released_.advance_to(m.prefix_released);
+    c_prefix_ckpt_released_.advance_to(m.prefix_ckpt_released);
     c_ckpt_retired_.advance_to(m.prefix_ckpt_retired);
     c_ckpt_lru_.advance_to(m.prefix_ckpt_lru);
     c_ckpt_refused_.advance_to(m.prefix_ckpt_refused);
@@ -330,25 +331,17 @@ std::string Metrics::render() const {
             "Prefill throughput over the scheduler's recent window.", L, g_prefill_tps_.get());
     w.gauge("radiance:decode_tokens_per_second",
             "Decode throughput over the scheduler's recent window.", L, g_decode_tps_.get());
-    /* THE DECODE FLOOR, the two figures the dashboard's Decode Step tile shows. They were on
-     * /stats only, and /stats is documented as not a stable API -- so the one figure worth
-     * comparing across restarts was reachable only from the surface automation is told not to
-     * use. Omitted until measured: a floor of 0 seconds is not an unmeasured floor, it is an
-     * infinitely fast one, and a scrape would plot it as a record. Both reset on restart, so a
-     * freshly started server simply has no floor to report yet. */
+    /* The decode floor the dashboard's step tile shows. Each series is omitted until its window
+     * has been measured, because a 0-second step would plot as the fastest ever. */
     if (g_step_best_.get() > 0)
         w.gauge("radiance:decode_step_seconds_best",
-                "Fastest single-sequence decode step window this process has run, in seconds "
-                "PER STEP. A mean over 32 consecutive single-stream steps, not a stopwatch "
-                "reading. Not seconds per token: with speculation a step can emit several "
-                "tokens, so per-token time is this divided by (1 + accepted per step), "
-                "not by the accepted figure alone. Resets on restart.", L, g_step_best_.get());
+                "Fastest single-sequence decode window this process has run, in seconds per "
+                "step: the mean of 32 consecutive single-stream steps. With speculation a step "
+                "emits 1 + accepted tokens. Resets on restart.", L, g_step_best_.get());
     if (g_step_recent_.get() > 0)
         w.gauge("radiance:decode_step_seconds_recent",
-                "Most recent single-sequence decode step window, in seconds PER STEP (see "
-                "_best: not a token rate). The gap "
-                "to _best tracks what else the machine is doing, not wear; see docs/GUIDE.md. "
-                "Freezes while the lane is idle, because no window is completing.",
+                "Most recent single-sequence decode window, in seconds per step (see _best). "
+                "Holds its value while no single-stream window completes.",
                 L, g_step_recent_.get());
     w.counter("radiance:engine_steps_total",
               "Scheduler steps executed. One forward pass of the model, plus whatever draft "
@@ -447,6 +440,13 @@ std::string Metrics::render() const {
                  c_ckpt_retired_.get());
         labelled("radiance:prefix_cache_ckpt_evictions_by_reason_total", "reason", "store_full",
                  c_ckpt_lru_.get());
+        w.help("radiance:prefix_cache_released_total",
+               "Prefix-cache entries and linear-state snapshots a client released on purpose "
+               "(DELETE /sessions).", "counter");
+        labelled("radiance:prefix_cache_released_total", "what", "entries",
+                 c_prefix_released_.get());
+        labelled("radiance:prefix_cache_released_total", "what", "snapshots",
+                 c_prefix_ckpt_released_.get());
         w.counter("radiance:prefix_cache_ckpt_refused_total",
                   "Checkpoints not written because every snapshot slot was in use by a restore "
                   "in the same step.", L, c_ckpt_refused_.get());
@@ -463,8 +463,9 @@ std::string Metrics::render() const {
                  c_cut_resumed_below_.get());
         w.counter("radiance:prefix_restore_cuts_total",
                   "Restores from the host tier the pool could not hold whole, even after giving "
-                  "up the VRAM copies of other stored conversations; each came back to a "
-                  "snapshot short of its end.", L, c_restore_cuts_.get());
+                  "up the VRAM copies of other stored conversations; each came back only in "
+                  "part, on a model with recurrent state up to the deepest snapshot the room "
+                  "reaches.", L, c_restore_cuts_.get());
         w.counter("radiance:prefix_hit_cut_tokens_total",
                   "Prompt tokens the attention cache held and admission computed again, because "
                   "the hit resumed at a snapshot below it or reused nothing.", L,

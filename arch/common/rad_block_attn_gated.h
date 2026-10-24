@@ -195,7 +195,7 @@ inline int AttnGatedBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
      *
      * The ranged parameter is q_len, not M: 1 at decode, up to n_spec+1 at a verify, thousands in
      * a prefill chunk, with a libr4d kernel per band. `scale` defaults to 1/sqrt(head_dim). */
-    op_attn = rw(b, RAD_OP(b, "attn_paged",
+    op_attn = rw(b, decl_attn(b, g, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", 0),

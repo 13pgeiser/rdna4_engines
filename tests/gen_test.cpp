@@ -646,4 +646,62 @@ TEST(a_second_tokenizers_ids_ride_in_each_conditioning) {
     CHECK_OK(drv.done());
 }
 
+/* A request's conditioning options (RAD_GEN_COND_*) ride in its COND passes and in no other, a
+ * request asking for one the generator does not declare is refused at submit, and a generator
+ * that declares an option this engine does not know is refused at init. */
+TEST(conditioning_options_ride_in_the_cond_passes_the_generator_declared) {
+    Program prog;
+    prog.generator = decl_base();
+    RadGeneratorDecl& d = prog.generator;
+    d.layout = RAD_GEN_LAYOUT_JOINT_STEP;
+    d.cond_rows = 16;
+    d.pad_multiple = 16;
+    d.pad_token = 99;
+    prog.ctx.max_tok = 2048;
+    prog.ctx.max_seqs = 8;
+    prog.kv_groups.emplace_back();
+    auto mk = [](int32_t opts) {
+        auto r = std::make_unique<gen::Request>();
+        r->width = 64;
+        r->height = 64;
+        r->pos.tokens = { 1, 2, 3 };
+        r->has_neg = true;
+        r->neg.tokens = { 5 };
+        r->cfg = 4.0f;
+        r->cond_opts = opts;
+        r->ticket = std::make_shared<gen::Ticket>();
+        return r;
+    };
+    std::string why;
+    {
+        gen::Driver drv;
+        REQUIRE_EQ(drv.init(prog, nullptr, { gen::Driver::RankIO{} }), (int)RAD_OK);
+        CHECK_EQ(drv.submit(mk(RAD_GEN_COND_REBALANCE), &why), (int)RAD_E_INVAL);
+        CHECK(has(why, "rebalance"));
+    }
+    d.cond_opts = RAD_GEN_COND_REBALANCE;
+    gen::Driver drv;
+    REQUIRE_EQ(drv.init(prog, nullptr, { gen::Driver::RankIO{} }), (int)RAD_OK);
+    REQUIRE_EQ(drv.submit(mk(RAD_GEN_COND_REBALANCE), &why), (int)RAD_OK);
+    for (int branch = 0; branch < 2; ++branch) {
+        const RadBatch* b = drv.next(branch);
+        REQUIRE(b != nullptr);
+        REQUIRE_EQ(b->gen, (int32_t)RAD_GEN_PASS_COND);
+        CHECK_EQ(b->gen_b->cond_opts, (int32_t)RAD_GEN_COND_REBALANCE);
+        CHECK_OK(drv.done());
+    }
+    const RadBatch* b = drv.next(2);
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->gen, (int32_t)RAD_GEN_PASS_DENOISE);
+    CHECK_EQ(b->gen_b->cond_opts, (int32_t)0);
+    CHECK_OK(drv.done());
+
+    d.cond_opts = 0x80;
+    gen::Driver bad;
+    int rc = 0;
+    const std::string said = stderr_of([&] { rc = bad.init(prog, nullptr, { gen::Driver::RankIO{} }); });
+    CHECK_EQ(rc, (int)RAD_E_UNSUPPORTED);
+    CHECK(has(said, "conditioning options 0x80"));
+}
+
 RAD_TEST_MAIN()

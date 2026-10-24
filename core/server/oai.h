@@ -94,10 +94,8 @@ struct OaiRequest {
 
     int             n = 1;
     SamplingParams  sp;
-    /* The control vector, tri-state: -1 the request named no choice (the deployment's
-     * runtime default applies), 0 it asked for the stock model, 1 for the loaded control vector.
-     * Parsed from `control_vector` (or Strata's `experimental_speed_projection`); a deployment
-     * with no vector refuses 1 rather than silently serving the stock model. */
+    /* `control_vector`, tri-state: -1 not sent (the deployment's runtime default applies), 0 the
+     * stock model, 1 the loaded control vector. A deployment with no vector refuses 1. */
     int             control_vector = -1;
     int32_t         max_tokens = 0;
     std::vector<std::string> stop;
@@ -162,6 +160,11 @@ struct OaiRequest {
     int64_t dimensions = 0;
     /* /v1/embeddings: a soft-token budget for the request's images, 0 the server's. */
     int32_t image_tokens = 0;
+
+    /* `images_config`: which of the checkpoint's picture modes a request's pictures get, and the
+     * sizes it states (Unlimited-OCR's gundam and base modes). 0 keeps the processor's choice
+     * (mm::ImageMode::Default). */
+    int32_t image_mode = 0, image_base_size = 0, image_size = 0;
 
     int  n_choices() const { return (int)prompts.size() * n; }
 };

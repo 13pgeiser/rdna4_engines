@@ -4,26 +4,32 @@
 //
 // At decode the GEMM is a weight stream and the goal is DRAM bandwidth. The skinny kernel (split-K
 // within a workgroup, weight straight to registers) falls short on narrow projections. This one
-// splits K across workgroups with a fused last-arriver reduction, unpacks the weight through LDS,
-// and streams it with non-temporal loads.
+// splits K across workgroups with a fused last-arriver reduction and streams the weight with
+// non-temporal loads.
 //
 // Tile: DWN = 8 waves over BND = 128 output columns (one 16-column fragment per wave) and DTM
-// 16-row M fragments, the fewest that cover M. Each K slab of DBK bytes stages A (16*DTM rows) and
-// 128 weight rows, unpacked to e4m3 through r4d_mxfp4.h.
+// 16-row M fragments, the fewest that cover M. Each K slab of DBK bytes stages A (16*DTM rows) in
+// LDS, shared by the eight waves; each wave loads its own fragment's weight words for the slab
+// straight to registers and unpacks them to e4m3 there (r4d_mxfp4.h). The one-fragment form
+// (M <= 16) stages the weight through LDS instead.
 //
 // Split-K is required: N/16 fragments alone (320 waves at N=5120) do not fill the part. DKS blocks
 // split the K slabs; each writes an fp32 partial [DKS][M][N], and the last to arrive (an
 // agent-scope counter per column block) sums them, with no second launch.
 //
-// Split, slab and load hint follow a rule tuned per cell on the 27B's per-rank shapes at
-// M = 8..128 (tunables `ks`, `bk`, `nt`; 0 selects the rule):
-//   - split: the smallest power of two whose grid reaches 48 blocks at M <= 16, 56 at M <= 96 and
-//     40 above; for K >= 8192 keep doubling while a split has >= 24 128-wide slabs; never past
+// Split, slab and load hint follow a rule tuned on the 27B's and TranslateGemma's per-rank shapes
+// (tunables `ks`, `bk`, `nt`; 0 selects the rule):
+//   - split up to 64 rows: the smallest power of two whose grid reaches 48 blocks at M <= 16 and
+//     56 above; for K >= 8192 keep doubling while a split has >= 24 128-wide slabs; never past
 //     ks*M = 512, where partial traffic outweighs the gain.
-//   - slab: 128, or 64 where LDS per block, (16*DTM + 128) * (DBK+8) bytes, would cost a wide or
-//     deeply split grid its resident blocks (see mxd_plan). A K not a multiple of 128 takes 64 (and
-//     a 2-way split widens to 4).
+//   - split past 64 rows: double only while every split keeps 16 128-wide slabs, towards a
+//     48-block grid or, at K >= 8192, regardless; never past ks*M = 1024.
+//   - slab: 128, or 64 where LDS per block would cost a wide grid its resident blocks (see
+//     mxd_plan); past 64 rows always 128. A K not a multiple of 128 takes 64 (and a 2-way split
+//     widens to 4).
 //   - non-temporal weight loads for weights of 4 MiB or more.
+// The split count sets a row's summation order, so a change to the rule moves the bits of the rows
+// it splits differently.
 //
 // No state is keyed on the stream, since a recorded pass may replay on another stream. The split
 // partial is the op's scratch (sized by the scratch hook, read+write, so overlapping ops get
@@ -77,9 +83,10 @@ static __device__ __forceinline__ T mxd_ld(const T* p) {
 // and writes its eight outputs as one 16-byte store (one 32-byte store of partials).
 
 // The (row, 128) scale grid: thread t < ROWS owns row t, loads the next boundary's two scales a
-// boundary early and writes s_prev / s_next to LDS at the boundary (published by the staging
-// barrier). A zero next block keeps the carried scale; after a zero block the carried scale is
-// looked up from the grid.
+// boundary early and writes s_prev / s_next to LDS for the boundary's slab (the one-fragment kernel
+// at that slab, published by its staging barrier; the multi-fragment kernel a slab early into the
+// other half of its double buffer, published by the slab's closing barrier). A zero next block
+// keeps the carried scale; after a zero block the carried scale is looked up from the grid.
 static __device__ __forceinline__ float mxd_ratio(float ns, float np, const float* __restrict__ row,
                                                   int kb) {
   return ns > 0.f ? (np > 0.f ? np : r4d_mxfp4_carried(row, kb - 2)) / ns : 1.f;
@@ -195,6 +202,12 @@ constexpr int mxd_waves(int dbk, int dtm, bool ablk) {
        : 6;
 }
 
+// The multi-fragment form (M > 16). A fragment-order weight word is the WMMA fragment's own
+// register (one dword a lane a k-step), so a wave loads its tile's words for a slab straight to
+// registers and folds them there, with no barrier between a wave and its weight. Only the
+// activation, shared by the eight tiles, goes through LDS, double-buffered so a slab takes one
+// barrier. The next slab's activation and weight are loaded while this slab computes. The fold,
+// k-step and slab order, scale carry and epilogue are the one-fragment form's (below).
 template <int DBK, int DKS, int DTM, bool NT, bool ABLK>
 __global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(mxd_waves(DBK, DTM, ABLK))
 void r4d_gemm_mxfp4a8_decode_kernel(
@@ -206,16 +219,16 @@ void r4d_gemm_mxfp4a8_decode_kernel(
   constexpr int DWN = R4D_MXD_DWN, BND = DWN * 16, NTHR = DWN * 32;
   constexpr int ROWS = R4D_MXD_MTILE * DTM;
   constexpr int STR = DBK + R4D_MXD_PAD;
-  __shared__ unsigned char sA[ROWS * STR];
-  __shared__ unsigned char sW[BND * STR];
-  __shared__ float sR[ROWS];     // ABLK: a boundary's ratio a row; then every row's final scale
+  constexpr int KST = DBK / 16;                       // k-steps a slab
+  constexpr int A_IT = (ROWS * DBK + NTHR * 16 - 1) / (NTHR * 16);
+  __shared__ unsigned char sA[2][ROWS * STR];
+  __shared__ float sR[2][ROWS];  // ABLK: a boundary's ratio a row; then every row's final scale
   __shared__ unsigned s_last;
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
   const int n0 = blockIdx.x * BND;
   const int ks = blockIdx.z;
-
   const int slabs = (K + DBK - 1) / DBK;
   const int spb = (slabs + DKS - 1) / DKS;
   const int s_lo = ks * spb, s_hi = min(slabs, s_lo + spb);
@@ -231,88 +244,104 @@ void r4d_gemm_mxfp4a8_decode_kernel(
     const int kb = ((s_lo * DBK) >> 7) + 1;
     if (tid < ROWS && ((s_lo * DBK) & 127) && kb * 128 < k_hi) { ns = asrow[kb]; np = asrow[kb - 1]; }
   }
-
+  // This wave's tile and this lane's column. A tile past N (N % 128 != 0) loads the last one, and
+  // the epilogue drops its columns.
+  const int nt = min(n0 / 16 + wave, N / 16 - 1);
+  const int ncol = nt * 16 + col;
+  const int ref = (int)Wref[ncol];
   const unsigned int* __restrict__ Wp = (const unsigned int*)W;
   const int ksteps_g = K / 16;
 
-  for (int s = s_lo; s < s_hi; ++s) {
+  unsigned rw[KST];
+  int re[KST / 2];
+  mxd_u4 ra[A_IT];
+  auto load = [&](int s) {
     const int k0 = s * DBK;
-    const bool bnd = ABLK && s > s_lo && (k0 & 127) == 0;
-    if constexpr (ABLK) {
-      if (bnd && tid < ROWS) sR[tid] = mxd_ratio(ns, np, asrow, k0 >> 7);
-    }
-    // ---- A: ROWS x DBK bytes, clamped rows, 16 B a thread
 #pragma unroll
-    for (int off = 0; off < ROWS * DBK; off += NTHR * 16) {
-      const int idx = off + tid * 16;
+    for (int j = 0; j < A_IT; ++j) {
+      const int idx = j * NTHR * 16 + tid * 16;
       if (idx < ROWS * DBK) {
         const int r = idx / DBK, c = idx % DBK;
         const int rc = r < M - 1 ? r : M - 1;              // clamp, never predicate
-        *(mxd_u4*)(&sA[r * STR + c]) = *(const mxd_u4*)(A + (size_t)rc * lda + k0 + c);
+        ra[j] = *(const mxd_u4*)(A + (size_t)rc * lda + k0 + c);
       }
     }
-    // ---- W: fragment-order slots, two adjacent rows a thread (an 8 B request), folded to e4m3
-    {
-      constexpr int KSTEPS_T = DBK / 16, NTILES_T = BND / 16;
-      const int kstep0 = k0 / 16;
 #pragma unroll
-      for (int off = 0; off < NTILES_T * KSTEPS_T * 32; off += NTHR * 2) {
-        const int sl = off + tid * 2;
-        const int lane_ = sl & 31, rest = sl >> 5;
-        const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
-        const int r = ntl * 16 + (lane_ & 15), kloc = kst * 16 + (lane_ >> 4) * 8;
-        const int gn = n0 + r;
-        // gn is even and N % 16 == 0, so clamping to N - 2 keeps the 8 B read aligned and gc + 1 in
-        // bounds; the slot address is recomputed from the clamped row.
-        const int gc = gn < N - 2 ? gn : N - 2;
-        const int lanec = (lane_ & 16) | (gc & 15);
-        const mxd_u2 wv =
-            mxd_ld<NT>((const mxd_u2*)&Wp[((size_t)(gc >> 4) * ksteps_g + kstep0 + kst) * 32 +
-                                          lanec]);
-        const int blk = (k0 + kst * 16) / R4D_MXFP4_GROUP;
+    for (int t = 0; t < KST; ++t)
+      rw[t] = mxd_ld<NT>(&Wp[((size_t)nt * ksteps_g + k0 / 16 + t) * 32 + lane]);
 #pragma unroll
-        for (int q = 0; q < 2; ++q) {
-          const int d = r4d_mxfp4_fold_d(Wref[gc + q], Ws[(size_t)blk * ldws + gc + q]);
-          unsigned int lo, hi;
-          r4d_mxfp4_unpack8(q ? wv[1] : wv[0], d, &lo, &hi);
-          *(mxd_u2*)(&sW[(r + q) * STR + kloc]) = mxd_u2{lo, hi};
-        }
+    for (int q = 0; q < KST / 2; ++q)
+      re[q] = (int)Ws[(size_t)(k0 / R4D_MXFP4_GROUP + q) * ldws + ncol];
+  };
+  auto store_a = [&](int buf) {
+#pragma unroll
+    for (int j = 0; j < A_IT; ++j) {
+      const int idx = j * NTHR * 16 + tid * 16;
+      if (idx < ROWS * DBK) {
+        const int r = idx / DBK, c = idx % DBK;
+        *(mxd_u4*)(&sA[buf][r * STR + c]) = ra[j];
       }
     }
-    __syncthreads();
+  };
+
+  if (s_lo < s_hi) {
+    load(s_lo);
+    store_a(0);                  // the first slab never rescales (s > s_lo below)
+  }
+  __syncthreads();
+  for (int s = s_lo; s < s_hi; ++s) {
+    const int buf = (s - s_lo) & 1;
+    const int k0 = s * DBK;
+    const bool bnd = ABLK && s > s_lo && (k0 & 127) == 0;
+    mxd_v2i wf[KST];
+#pragma unroll
+    for (int t = 0; t < KST; ++t) {
+      unsigned lo, hi;
+      r4d_mxfp4_unpack8(rw[t], r4d_mxfp4_fold_d(ref, re[t >> 1]), &lo, &hi);
+      wf[t][0] = (int)lo; wf[t][1] = (int)hi;
+    }
+    if (s + 1 < s_hi) load(s + 1);           // the next slab's loads fly across this slab's WMMAs
     if constexpr (ABLK) {
-      if (bnd) mxd_rescale(acc, sR, col);
+      if (bnd) mxd_rescale(acc, sR[buf], col);
       if (tid < ROWS && (k0 & 127) == 0 && k0 + 128 < k_hi) {
         ns = asrow[(k0 >> 7) + 1];
         np = asrow[k0 >> 7];
       }
     }
 #pragma unroll
-    for (int step = 0; step < DBK / 16; ++step) {
+    for (int step = 0; step < KST; ++step) {
       const int kk = step * 16 + kb8;
-      mxd_v2i af[DTM], wf;
+      mxd_v2i af[DTM];
 #pragma unroll
       for (int i = 0; i < DTM; ++i) {
-        const unsigned char* pa = &sA[(i * 16 + col) * STR + kk];
+        const unsigned char* pa = &sA[buf][(i * 16 + col) * STR + kk];
         af[i][0] = *(const int*)pa; af[i][1] = *(const int*)(pa + 4);
       }
-      const unsigned char* pw = &sW[(wave * 16 + col) * STR + kk];
-      wf[0] = *(const int*)pw; wf[1] = *(const int*)(pw + 4);
 #pragma unroll
       for (int i = 0; i < DTM; ++i)
-        acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf, af[i], acc[i]);
+        acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[step], af[i], acc[i]);
+    }
+    // The next slab's activation into the other buffer, and its boundary ratio (published by the
+    // barrier below; a wave still rescaling this slab reads the other half).
+    if (s + 1 < s_hi) {
+      store_a(buf ^ 1);
+      if constexpr (ABLK) {
+        const int k1 = (s + 1) * DBK;
+        if ((k1 & 127) == 0 && tid < ROWS) sR[buf ^ 1][tid] = mxd_ratio(ns, np, asrow, k1 >> 7);
+      }
     }
     __syncthreads();
   }
   const int kb_end = s_hi > s_lo ? (k_hi - 1) >> 7 : 0;
   mxd_epilogue<DTM, DKS, ABLK>(acc, As, as_rs, Wref, P, cnt, C, M, N, ldc, n0, wave, col, kb8, ks,
-                               kb_end, &s_last, sR);
+                               kb_end, &s_last, sR[0]);
 }
 
 // The one-fragment form (M <= 16), every single-sequence verify step. Same tile, fold and split as
-// above, plus: the next slab's A, codes and exponents are loaded into registers while this slab
-// computes, keeping loads in flight across barriers; a thread takes four adjacent slots (one 16 B
-// load); and each row's reference exponent is read once. Bit-identical to the kernel above.
+// above, with the weight staged through LDS, plus: the next slab's A, codes and exponents are
+// loaded into registers while this slab computes, keeping loads in flight across barriers; a thread
+// takes four adjacent slots (one 16 B load); and each row's reference exponent is read once.
+// Bit-identical to the kernel above.
 template <int DBK, int DKS, bool NT, bool ABLK>
 __global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(DBK == 64 ? 16 : 12)
 void r4d_gemm_mxfp4a8_decode1_kernel(
@@ -472,8 +501,9 @@ unsigned* mxd_out_ctr(const void* out) {
   const size_t n = R4D_MXD_MAX_N / (R4D_MXD_DWN * 16);
   unsigned* p = nullptr;
   if (hipMalloc((void**)&p, n * sizeof(unsigned)) != hipSuccess) return nullptr;
-  // Zero before any launch reads it: the memset is on the null stream, which the engine's streams
-  // need not wait for, so wait here (as r4d_moe.hip's router counters do).
+  // Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has finished
+  // when it returns (core/device/aql.cpp); under HIP's own runtime (r4d_selftest) it runs on the
+  // null stream, which a non-blocking stream does not wait for, so wait here.
   if (hipMemset(p, 0, n * sizeof(unsigned)) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
     (void)hipFree(p);
     return nullptr;
@@ -490,14 +520,24 @@ MxdPlan mxd_plan(int M, int K, int N, int KS, int BK, int NT) {
   const int tm = (M + R4D_MXD_MTILE - 1) / R4D_MXD_MTILE;
   MxdPlan p;
   int ks = 1;
-  const int fill = M <= 16 ? 48 : (M <= 96 ? 56 : 40);
-  while (ks < R4D_MXD_MAX_KS && nblk * ks < fill && 2 * ks * M <= 512) ks <<= 1;
-  if (K >= 8192)                       // a deep K: a split of 24 or more slabs still waits on them
-    while (ks < R4D_MXD_MAX_KS && (K / 128) / ks >= 24 && 2 * ks * M <= 512) ks <<= 1;
+  if (tm > 4) {
+    // Past 64 rows (see the header): split only while every split keeps 16 128-wide slabs, towards
+    // a 48-block grid, or at a deep K regardless.
+    const int slabs = K / 128;
+    while (ks < R4D_MXD_MAX_KS && (nblk * ks < 48 || K >= 8192) && slabs / (2 * ks) >= 16 &&
+           2 * ks * M <= 1024)
+      ks <<= 1;
+  } else {
+    const int fill = M <= 16 ? 48 : 56;
+    while (ks < R4D_MXD_MAX_KS && nblk * ks < fill && 2 * ks * M <= 512) ks <<= 1;
+    if (K >= 8192)                     // a deep K: a split of 24 or more slabs still waits on them
+      while (ks < R4D_MXD_MAX_KS && (K / 128) / ks >= 24 && 2 * ks * M <= 512) ks <<= 1;
+  }
   p.ks = KS > 0 ? KS : ks;
   // 64-wide slabs where LDS per block would cost resident blocks: DTM 4 unsplit on 110+ column
-  // blocks, and DTM 8 on those or at a split of 4 or more.
-  const bool slab64 = (tm == 4 && p.ks == 1 && nblk >= 110) || (tm == 8 && (nblk >= 110 || p.ks >= 4));
+  // blocks, by the split the launch runs (a pin or a tuned point included); past 64 rows the
+  // 128-wide slab always.
+  const bool slab64 = tm == 4 && p.ks == 1 && nblk >= 110;
   p.bk = BK > 0 ? BK : (slab64 ? 64 : 128);
   p.nt = NT == 1 || (NT == 0 && (long)N * K / 2 >= (4l << 20));
   if (K % p.bk) {                      // a slab may not run past K

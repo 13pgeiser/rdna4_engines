@@ -1,0 +1,25 @@
+# Unlimited-OCR (baidu/Unlimited-OCR), bf16, as data/recipes/unlimited-ocr-bf16.recipe builds it:
+# a 12-layer Llama-MoE trunk over the DeepEncoder vision tower (SAM + CLIP + projector, layout
+# tokens included), for document parsing through /v1/chat/completions. One card, RADIANCE_GPU.
+#
+# The checkpoint expects a 128-token generated-token ring, so the plugin declares RAD_KV_RING and
+# the request is kept out of prefix reuse. The towers live on the card (the default placement).
+# Whole-server footprint is ~7 GiB, so this service needs the card to itself: stop the other
+# model's compose file first (see common.yaml).
+#
+# gundam mode (the default for a single picture) crops a picture larger than 640 px into 640-px
+# tiles plus the 1024-px global view; base mode is one 640-px page (multi-page documents send one
+# image per page). `images_config` on the request selects a mode and restates its sizes.
+name: radiance-unlimited-ocr
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-unlimited-ocr
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/unlimited-ocr-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 8 --max-model-len 32768 --kv-cache-dtype fp8
+      --gpu-headroom-mib 96
+      --override-chat-template /chat-templates/unlimited-ocr-parser.jinja

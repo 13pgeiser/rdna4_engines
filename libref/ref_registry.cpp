@@ -357,7 +357,10 @@ static const RadParamSpec pAttnPaged[] = {
     /* For libr4d's scratch hook, which sizes its split-KV partial buffer at declare
      * (num_seqs * q_len * q_heads * splits rows; gqa is only the head ratio). Ref ignores them;
      * they are here because both plugins must agree on the parameter list. */
-    P_INTO("n_head"), P_INTO("max_seqs")
+    P_INTO("n_head"), P_INTO("max_seqs"),
+    /* The e4m3 products a caller accepts (docs/OPS.md). A permission, not a request: ref computes
+     * the exact form whatever it says. */
+    P_INTO("prefill_fp8")
 };
 static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
@@ -382,6 +385,16 @@ static const RadOperandSpec oAttnCross[] = { OPD("q"), OPD("k"), OPD("v"), OPD("
 static const RadParamSpec pAttnNa3d[] = { P_INT("M"), P_INT("head_dim"), P_INT("kt"), P_INT("kh"),
                                           P_INT("kw"), P_STR("dtype"), P_F64O("scale") };
 static const RadOperandSpec oAttnNa3d[] = { OPD("q"), OPD("k"), OPD("v"), OPD("geom"), OUT("out") };
+
+/* The SAM tower's attention. `q`, `k` and `v` are the three column slices of one fused projection,
+ * so each is read at its own row pitch. The two rel_pos tables are weights: [2*L-1, head_dim] with
+ * L the window (or the grid for a global layer), resampled along dim 0 when a geometry needs it.
+ * `grid_h` x `grid_w` rows a segment, `window` 0 for a whole-segment tile. */
+static const RadParamSpec pSamAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                         P_INT("grid_h"), P_INT("grid_w"), P_INT("window"),
+                                         P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oSamAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
+                                           OUT("out"), WGT("rel_pos_h"), WGT("rel_pos_w") };
 
 /* `k_scale` and `v_scale` are the descales an fp8 cache is read back with, so a store divides by
  * them; optional because a bf16 cache has none. */
@@ -479,6 +492,29 @@ static const RadParamSpec pScatter[] = { P_INT("M"), P_INT("n_expert"), P_INT("t
                                          P_STRO("protect") };
 static const RadOperandSpec oScatter[] = { OPD("expert_ids"), OUT("sorted_tok"),
                                            OUT("expert_offset"), OUT("expert_count") };
+
+/* The pair as one op: the union of the two parameter lists, and their operands with the shared
+ * `expert_ids` named once, as an output. Same schema as libr4d's fused row. */
+static const RadParamSpec pRouterTopkScatter[] = { P_INT("M"), P_INT("n_expert"),
+                                                   P_INTO("n_local"), P_INT("top_k"),
+                                                   P_INT("norm"), P_STR("dtype"),
+                                                   P_INTO("expert_base"),
+                                                   P_STRO("protect") };
+static const RadOperandSpec oRouterTopkScatter[] = { OPD("logits"), OUT("expert_ids"),
+                                                     OUT("expert_w"), OUT("sorted_tok"),
+                                                     OUT("expert_offset"),
+                                                     OUT("expert_count") };
+
+/* The router GEMM in front of the pair, and the gate's one-column GEMM beside it: the union of
+ * the three operand lists with `logits` named once, as the GEMM's output. */
+static const RadParamSpec pRouterGemmTopkScatter[] = { P_INT("M"), P_INT("K"),
+                                                       P_INT("n_expert"), P_INTO("n_local"),
+                                                       P_INT("top_k"), P_INT("norm"),
+                                                       P_STR("dtype"), P_INTO("expert_base"),
+                                                       P_STRO("protect") };
+static const RadOperandSpec oRouterGemmTopkScatter[] = {
+    OPD("a"), WGT("b"), WGT_O("gate_b"), OUT("logits"), OUT("expert_ids"), OUT("expert_w"),
+    OUT("sorted_tok"), OUT("expert_offset"), OUT("expert_count"), OUT_O("gate") };
 
 /* `a_order` says which rows the activation has; a routed block's two grouped GEMMs differ. gate_up
  * reads the block input, one row per token, so sorted row i gathers `a[sorted_tok[i] / top_k]`.
@@ -679,6 +715,13 @@ static const RadOperandSpec oPenalties[] = { INOUT("logits"), OPD("params"), OPD
  * is a whole DRY sequence breaker and never penalised. Absent, no token is exempt. */
 static const RadOperandSpec oDry[]       = { INOUT("logits"), OPD("params"), OPD("history"),
                                              OPD_O("breakers") };
+/* The windowed n-gram ban: penalties' operands plus a {n, window} pair a row.
+ * `whitelist` is optional: a bitmask plane [M, ceil(n_vocab/32)] like sample_mask's, a SET bit
+ * marking a token exempt from the ban (the reference's whitelist, removed from the banned set
+ * before the -inf writes). Absent, nothing is exempt. Rows are indexed by the sampled position,
+ * not by mask_row: every row the op bans reads its own words. */
+static const RadOperandSpec oNgramBan[]  = { INOUT("logits"), OPD("params"), OPD("history"),
+                                             OPD("ngram"), OPD_O("whitelist") };
 static const RadOperandSpec oTemp[]      = { INOUT("logits"), OPD("params") };
 /* `bitmask` is [rows, ceil(n_vocab/32)] uint32, addressed by the row's mask_row -- which is -1 for
  * an unconstrained sequence, so the plane is shared and shorter than M. */
@@ -898,7 +941,8 @@ static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 /* ---- audio generation (ref_audio.cpp) */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad") };
+                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad"),
+                                        P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
 static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
@@ -914,19 +958,28 @@ static const RadOperandSpec oSnakeAa[] = { OPD("x"), WGT("alpha"), WGT("beta"), 
 static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
                                          P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
                                          P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
-                                         P_INTO("sup_hi"), P_F64O("penalty") };
+                                         P_INTO("sup_hi"), P_F64O("penalty"),
+                                         P_F64O("top_p") };
 static const RadOperandSpec oCfgTopk[] = { OPD("logits"), OPD("seed"), OPD("frame"), OUT("ids"),
                                            OPD_O("cfg"), OPD_O("lane"), INOUT_O("hist") };
 static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
-                                          P_STR("dtype"), P_INTO("round") };
+                                          P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = { OPD("codes"), WGT("t0"), WGT("t1"), OUT("y") };
+static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), P_INT("bins"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
+                                            WGT("out_w"), WGT("out_b"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
                                             OPD("frame"), OPD("status"), INOUT("dst") };
 static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
 static const RadOperandSpec oEndStatus[] = { OPD("ids"), OPD("lane"), INOUT("status") };
+static const RadParamSpec pRasPick[] = { P_INT("M"), P_INT("win"), P_INT("lo"), P_INT("hi"),
+                                         P_INTO("rep"), P_INTO("clear") };
+static const RadOperandSpec oRasPick[] = { OPD("first"), OPD("alt"), OPD("lane"), INOUT("hist"),
+                                           OUT("ids") };
 static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
                                             P_INTO("rep"), P_INTO("skip") };
 static const RadOperandSpec oFrameStore[] = { OPD("codes"), OPD("lane"), OPD("frame"),
@@ -956,6 +1009,8 @@ static const RadOperandSpec oIota[] = { OUT("y") };
 static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
 static const RadParamSpec pIntAffine[] = { P_INT("M"), P_STR("src"), P_STR("mul"), P_STR("add") };
 static const RadOperandSpec oIntAffine[] = { OPD("x"), OUT("y") };
+static const RadParamSpec pSubI32[] = { P_INT("M") };
+static const RadOperandSpec oSubI32[] = { OPD("x"), OPD("s"), OUT("y") };
 static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 
 /* ================================================================== the schema table */
@@ -1327,6 +1382,14 @@ static const RadOpSchema kSchemas[] = {
 { "attn_na3d", ARR(pAttnNa3d), ARR(oAttnNa3d),
   "3-D neighborhood attention (NATTEN's na3d) over the voxels of geom = (T, H, W): a query sees the "
   "kt x kh x kw window centred on it, shifted inward at the border, each extent at most its axis." },
+{ "sam_attn", ARR(pSamAttn), ARR(oSamAttn),
+  "Unlimited-OCR's SAM tower attention: per cu segment of grid_h*grid_w rows in raster grid order, "
+  "pad to multiples of `window` with ZERO rows (window_partition, after norm1), cut into window x "
+  "window tiles and attend each tile to all of its rows; `window` 0 is one tile over the segment. "
+  "logits = scale*q.k + q.Rh[i_h,j_h] + q.Rw[i_w,j_w], dotted over the head's whole head_dim, "
+  "softmax in f32 over the tile's keys (pad keys included), out = sum p*v, written back in segment "
+  "row order with pad rows dropped. The tables are [2*L-1, head_dim], linearly resampled along "
+  "dim 0 when a geometry's axes need it (get_rel_pos)." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore),
   "Writes k and v into the paged cache at slot_mapping; a negative slot is skipped. The cache is "
   "INOUT rather than the OUT docs/OPS.md draws, because the op touches only the mapped slots." },
@@ -1398,6 +1461,16 @@ static const RadOpSchema kSchemas[] = {
   "sorts only its own slice, and the slots that went elsewhere simply contribute nothing to this "
   "rank's partial -- which the block's end-of-block all-reduce then sums. `expert_base` absent "
   "or 0 with n_expert the model's count is the whole-model case." },
+{ "router_topk_scatter", ARR(pRouterTopkScatter), ARR(oRouterTopkScatter),
+  "`router_topk` then `moe_scatter`, in one launch: exactly those two and in that order, over "
+  "the operands they share. The reference IS the pair -- the fused device kernel claims to be "
+  "byte-identical to these two launches, and this is what it is measured against. The sort's "
+  "outputs are sized by `n_local`, this rank's slice; absent it is the router's count." },
+{ "router_gemm_topk_scatter", ARR(pRouterGemmTopkScatter), ARR(oRouterGemmTopkScatter),
+  "`gemm_nt` of `a` against the router `b`, then `router_topk_scatter` over those logits, and "
+  "with `gate_b`/`gate` present the shared expert's `gemm_nt` at N = 1 over the same `a`. As "
+  "with the pair, the reference IS the launches: the gate weight and output come together or not "
+  "at all, and the operand count says which." },
 { "moe_gemm", ARR(pMoeGemm), ARR(oMoeGemm),
   "y[i] = a[row(i)] @ w[e]^T in SORTED order, e being the expert whose offset range contains i. "
   "`a_order` picks row(i): \"token\" gathers a[sorted_tok[i] / top_k] from an activation with one "
@@ -1524,6 +1597,15 @@ static const RadOpSchema kSchemas[] = {
   "repeats capped at the row's dry_rep_limit. Only lengths at or above allowed_length count, and "
   "a token the optional `breakers` plane marks is never penalised. dry_penalty_last_n windows the "
   "TAIL of the history; 0 turns the stage off for the row. Columns are ids less vocab_off." },
+{ "sample_ngram_ban", ARR(pPenal), ARR(oNgramBan),
+  "The windowed no-repeat-ngram ban (Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor): bans, "
+  "by setting -infinity, every token that would complete an n-gram the last `window` tokens of "
+  "the row's history already contain. `ngram` is one i32 {n, window} pair a row; the window "
+  "bounds the n-gram's START index, as in the reference, window <= 0 searches the whole span and "
+  "n 0 is off. The optional `whitelist` bitmask (a SET bit, word w bit b covering column 32w + b, "
+  "the row's own plane row) exempts a token from the ban, as the reference's "
+  "`banned.difference_update(whitelist)` does; absent, nothing is exempt. Columns are ids less "
+  "vocab_off." },
 { "sample_temp", ARR(pMVocab), ARR(oTemp),
   "logits /= temp, per row. temp <= 0 leaves the row untouched -- greedy decoding is "
   "sample_argmax, and a temperature of zero silently meaning something else is how a sampler "
@@ -1746,9 +1828,6 @@ static const RadOpSchema kSchemas[] = {
 { "pix_patch", ARR(pPixPatch), ARR(oPixPatch),
   "an image [H, W C] to patch rows [H/p, (W/p) C p p], channel c's (ph, pw) at c p p + pw p + ph "
   "(order wh) or c p p + ph p + pw (hw)." },
-{ "patch_pix8", ARR(pPixPatch), ARR(oPixPatch),
-  "patch rows [R, w C p p] to RGB bytes [R p, w p C] by to_rgba8's rule, pix_patch's channel "
-  "order." },
 { "vol_index", ARR(pVolIndex), ARR(oVolIndex),
   "a volume's voxel coordinates (t, i, j), component-major: attention's rotary positions." },
 { "tile_grid", ARR(pTileGrid), ARR(oTileGrid),
@@ -1761,7 +1840,7 @@ static const RadOpSchema kSchemas[] = {
 { "tile_stitch", ARR(pTileStitch), ARR(oTileStitch),
   "decoded tiles to RGB bytes: diffusers' in-place blend_v then blend_h of each tile with the one "
   "above and the one to its left, then blend_t of each time band with the one before, each kept to "
-  "its stride, then patch_pix8's bytes." },
+  "its stride, then to_rgba8's bytes." },
 { "stft_logmel", ARR(pStftMel), ARR(oStftMel),
   "each channel's causal log-mel spectrogram from a windowed DFT basis and a mel filterbank, every "
   "stored tensor rounded to y's dtype: frames S / hop, columns h n_mel + m." },
@@ -1803,11 +1882,19 @@ static const RadOpSchema kSchemas[] = {
   "a frame's embedding from code-major residual codes [n_codes, rows]: t0[c0 + off0] plus the sum "
   "of t1[c_k + (k - 1) vocab], times `scale`, rounded as bf16(bf16(t0 + bf16(sum)) * scale), or "
   "with `round` 1 one f32 sum in codebook order times scale, rounded once." },
+{ "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
+  "one residual vector quantiser step: e = in_w x + in_b, the code the row of cb of greatest "
+  "cosine with e (the lower index on a tie), then x -= out_w cb[code] + out_b; f32, x rounded "
+  "once." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's conditioning row: the softmax(logits)-weighted sum of hid's L planes times scale, "
   "stored at dst[lane * stride + frame - 1] for frame >= 1 and status[lane] >= 0." },
 { "end_status", ARR(pEndStatus), ARR(oEndStatus),
   "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]." },
+{ "ras_pick", ARR(pRasPick), ARR(oRasPick),
+  "repetition-aware sampling: ids[rep i] = alt[rep i] where first[rep i] is in [lo, hi) and in "
+  "the lane's window of its last `win` picks (hist [lanes, win], -1 empty, cleared first with "
+  "`clear` 1), else first[rep i]; the pick then enters the window." },
 { "frame_store", ARR(pFrameStore), ARR(oFrameStore),
   "a frame's codes into its lane's history: dst[(lane n_codes + k) stride + frame - skip] = "
   "codes[k, rep i] when frame >= skip and status[lane] >= 0." },
@@ -1841,6 +1928,8 @@ static const RadOpSchema kSchemas[] = {
 { "int_affine", ARR(pIntAffine), ARR(oIntAffine),
   "y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j] over three integer lists: shapes and "
   "bounds derived from a pass's device geometry." },
+{ "sub_i32", ARR(pSubI32), ARR(oSubI32),
+  "y[i] = x[i] - s[0], int32: a device length less a device offset." },
 };
 
 /* ================================================================== the kernel table */
@@ -2166,6 +2255,9 @@ SIMPLE("ref_attn_cross", "attn_cross", "attn",
        ref_attn_cross),
 SIMPLE("ref_attn_na3d", "attn_na3d", "attn", "3-D neighborhood attention over a volume", DT_FLOAT,
        ref_attn_na3d),
+SIMPLE("ref_sam_attn", "sam_attn", "attn",
+       "SAM tower attention: windowed tiles with decomposed relative position", DT_FLOAT,
+       ref_sam_attn),
 ROW("ref_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_kv_store, nullptr),
@@ -2181,6 +2273,12 @@ SIMPLE("ref_router_topk", "router_topk", "moe", "softmax then exact top-k routin
        ref_router_topk),
 SIMPLE("ref_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing slots by expert",
        "i32 indices", ref_moe_scatter),
+SIMPLE("ref_router_topk_scatter", "router_topk_scatter", "moe",
+       "the selection and the sort in one op, run as exactly the pair", DT_FLOAT,
+       ref_router_topk_scatter),
+SIMPLE("ref_router_gemm_topk_scatter", "router_gemm_topk_scatter", "moe",
+       "the router GEMM, the selection and the sort in one op, run as exactly the launches",
+       DT_FLOAT, ref_router_gemm_topk_scatter),
 SIMPLE("ref_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted rows", DT_FLOAT,
        ref_moe_gemm),
 ROW_CB("ref_moe_gemm_q", "moe_gemm_q", "moe",
@@ -2265,6 +2363,8 @@ SIMPLE("ref_sample_logprobs", "sample_logprobs", "sample", "the raw distribution
        DT_FLOAT, ref_sample_logprobs),
 SIMPLE("ref_sample_dry", "sample_dry", "sample", "DRY repetition-suffix penalty", DT_FLOAT,
        ref_sample_dry),
+SIMPLE("ref_sample_ngram_ban", "sample_ngram_ban", "sample",
+       "windowed no-repeat-ngram ban", DT_FLOAT, ref_sample_ngram_ban),
 SIMPLE("ref_sample_typical", "sample_typical", "sample", "locally typical narrowing in place",
        DT_FLOAT, ref_sample_typical),
 SIMPLE("ref_sample_xtc", "sample_xtc", "sample", "exclude-top-choices narrowing in place",
@@ -2361,7 +2461,6 @@ SIMPLE("ref_pixel_norm", "pixel_norm", "norm", "an RMS norm as bf16 tensors comp
 SIMPLE("ref_d2s3d", "d2s3d", "elem", "depth to space over voxel rows", DT_FLOAT, ref_d2s3d),
 SIMPLE("ref_s2d3d", "s2d3d", "elem", "space to depth over voxel rows", DT_FLOAT, ref_s2d3d),
 SIMPLE("ref_pix_patch", "pix_patch", "elem", "an image to patch rows", DT_FLOAT, ref_pix_patch),
-SIMPLE("ref_patch_pix8", "patch_pix8", "elem", "patch rows to RGB bytes", DT_FLOAT, ref_patch_pix8),
 SIMPLE("ref_vol_index", "vol_index", "elem", "a volume's voxel coordinates", DT_ANY, ref_vol_index),
 SIMPLE("ref_tile_grid", "tile_grid", "elem", "a tiled decode's boxes", DT_ANY, ref_tile_grid),
 SIMPLE("ref_tile_crop", "tile_crop", "elem", "a tile out of a volume", DT_FLOAT, ref_tile_crop),
@@ -2382,10 +2481,14 @@ SIMPLE("ref_cfg_topk_sample", "cfg_topk_sample", "sample", "a guided top-k pick 
        DT_FLOAT, ref_cfg_topk_sample),
 SIMPLE("ref_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its residual codes",
        DT_FLOAT, ref_rvq_embed),
+SIMPLE("ref_vq_encode", "vq_encode", "elem",
+       "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, ref_vq_encode),
 SIMPLE("ref_frame_mix_store", "frame_mix_store", "elem", "a frame's conditioning row into its lane",
        DT_FLOAT, ref_frame_mix_store),
 SIMPLE("ref_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,
        ref_end_status),
+SIMPLE("ref_ras_pick", "ras_pick", "elem", "a repetition-aware choice between two draws a lane",
+       DT_ANY, ref_ras_pick),
 SIMPLE("ref_frame_store", "frame_store", "elem", "a frame's codes into its lane's history", DT_ANY,
        ref_frame_store),
 SIMPLE("ref_resample_nearest", "resample_nearest", "elem", "rows resampled nearest-neighbour",
@@ -2406,6 +2509,8 @@ SIMPLE("ref_iota", "iota", "elem", "an arithmetic index sequence", DT_ANY, ref_i
 SIMPLE("ref_cu_repeat", "cu_repeat", "elem", "bounds of equal sequences", DT_ANY, ref_cu_repeat),
 SIMPLE("ref_int_affine", "int_affine", "elem", "integers derived from device geometry", DT_ANY,
        ref_int_affine),
+SIMPLE("ref_sub_i32", "sub_i32", "elem", "a device int32 vector less a device scalar", DT_ANY,
+       ref_sub_i32),
 };
 
 /* ================================================================== plugin exports */

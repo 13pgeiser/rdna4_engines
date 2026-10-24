@@ -20,7 +20,10 @@
 # earlier copy on 3 and refuses on the rest.
 #
 # Duplicate weight formats are skipped: when the listing holds any .safetensors, other weight
-# formats (pickle .bin, ONNX, GGUF, ...) are not fetched.
+# formats (pickle .bin, ONNX, GGUF, ...) are not fetched. A .pth is a duplicate only when it is the
+# model's own weights again (`pytorch_model*.pth`, `consolidated*.pth`); any other is a part the
+# safetensors do not hold (Fish Audio drama-3's codec.pth) and is fetched, as the checkpoint reader
+# reads it (core/format/torch_zip.h).
 #
 # HFGET_JOBS concurrent transfers, default 4. These are long sequential reads: a few streams
 # saturate the link and more only make the destination seek.
@@ -107,7 +110,7 @@ done
 echo "hfget: $page page(s) of listing"
 have_st=$(printf '%s' "$listing" | jq '[.[] | select(.path | endswith(".safetensors"))] | length')
 sel='.[] | select(.type == "file")'
-[ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|pth|msgpack|h5|onnx|onnx_data|gguf)$")) | not)'
+[ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|msgpack|h5|onnx|onnx_data|gguf)$") or test("(^|/)(pytorch_model|consolidated)[^/]*\\.pth$")) | not)'
 
 list=$(mktemp "${TMPDIR:-/tmp}/hfget.XXXXXX")
 trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM

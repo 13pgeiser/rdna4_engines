@@ -35,8 +35,6 @@
 static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
 static_assert(R4D_MAX_RANKS == 8, "the 8-rank entry point names exactly seven peers");
-static_assert((long long)R4D_AR8_MIN_ELEMS_MAX == (long long)R4D_AR_TWOSHOT_WIDE_MAX_ELEMS,
-              "r4d_ar_shards.h restates the two-shot band's top");
 
 /* ------------------------------------------------------------------ throw conversion
  *
@@ -72,16 +70,8 @@ struct Rendezvous {
     long flags  [R4D_MAX_RANKS] = { 0 };
     long seq    [R4D_MAX_RANKS] = { 0 };
     int  dev    [R4D_MAX_RANKS] = { 0 };
-    /* What each rank read for the eight-rank two-shot: settings that must agree, and its own
-     * card's link, which the weights are derived from. */
-    struct Ar8Seen {
-        int       mode = 0;
-        int       w[R4D_MAX_RANKS] = { 0 };
-        int       pieces = 0;
-        long long weights_min = 0, pieces_min = 0;
-        int       form = 0;
-        R4DArLink link;
-    } ar8[R4D_MAX_RANKS];
+    /* Each rank's card's link, which the eight-rank two-shot's weights are derived from. */
+    R4DArLink ar8_link[R4D_MAX_RANKS];
     int  failed = 0;
 };
 
@@ -129,14 +119,12 @@ struct ArInst {
      * scratch was sized for them and a recorded launch keeps its table. */
     int  shard_weighted = 0;
     int  shard_w[R4D_MAX_RANKS] = { 0 };
-    /* Its piece count (RADIANCE_AR8_PIECES), 0 for the size rule (r4d_ar8_auto_pieces); a launch's
-     * `pieces` parameter overrides it. */
+    /* Its piece count, 0 for the size rule (r4d_ar8_auto_pieces); a launch's `pieces` parameter
+     * overrides it. */
     int  pieces = 0;
     /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
     long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
     long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
-    /* Its form (RADIANCE_AR8_FORM); a launch's `form` parameter overrides it. */
-    int  form = R4D_AR8_FORM_LOCKSTEP;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -153,25 +141,14 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 
 long align16(long v) { return (v + 15) & ~15L; }
 
-/* RADIANCE_AR8_SHARD_WEIGHTS, read at every eight-rank build so a process can change it between
- * instances: unset or "auto" derives the weights from the links by r4d_ar_weights_from_rates,
- * "duplex" from the same links by r4d_ar_weights_duplex, "off" keeps the shards even, eight
- * integers set them. Anything else is "off", with one warning. */
-enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2, AR8_DUPLEX = 3 };
-int ar8_weights_mode(int* w) {
-    const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
-    if (!e || !*e || !std::strcmp(e, "auto")) return AR8_AUTO;
-    if (!std::strcmp(e, "duplex")) return AR8_DUPLEX;
-    if (!std::strcmp(e, "off")) return AR8_EVEN;
-    if (r4d_ar_shard_weights_parse(e, 8, w)) return AR8_SET;
-    static std::once_flag said;
-    std::call_once(said, [e] {
-        std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs auto, off or eight non-negative "
-                     "integers, comma-separated, sum > 0, or duplex); eight-rank two-shot shards "
-                     "stay even\n",
-                     R4D_AR8_SHARD_WEIGHTS_ENV, e);
-    });
-    return AR8_EVEN;
+/* The eight-rank two-shot's settings for the next build: the engine's defaults unless
+ * r4d_ar8_test_settings set others. */
+std::mutex     g_ar8_m;
+R4DAr8Settings g_ar8;
+
+R4DAr8Settings ar8_settings() {
+    std::lock_guard<std::mutex> lk(g_ar8_m);
+    return g_ar8;
 }
 
 /* This rank's card's slowest PCIe hop, from sysfs by the runtime's bus id. */
@@ -188,53 +165,6 @@ bool ar8_own_link(R4DArLink* l) {
     return r4d_ar_link_bottleneck("", bdf, l);
 }
 
-/* RADIANCE_AR8_PIECES and the two size floors, read like the weights. */
-int ar8_pieces() {
-    const char* e = std::getenv(R4D_AR8_PIECES_ENV);
-    if (!e || !*e) return 0;
-    long long v = 0;
-    if (!r4d_ar_parse_count(e, R4D_AR_TS_MAX_PIECES, &v) || v < 1) {
-        static std::once_flag said;
-        std::call_once(said, [e] {
-            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs 1..%d); the eight-rank "
-                         "two-shot takes its piece count from the message size\n",
-                         R4D_AR8_PIECES_ENV, e, (int)R4D_AR_TS_MAX_PIECES);
-        });
-        return 0;
-    }
-    return (int)v;
-}
-
-long long ar8_min_elems(const char* name, std::once_flag* said) {
-    const char* e = std::getenv(name);
-    if (!e || !*e) return R4D_AR8_MIN_ELEMS_DEFAULT;
-    long long v = 0;
-    if (!r4d_ar_parse_count(e, R4D_AR8_MIN_ELEMS_MAX, &v)) {
-        std::call_once(*said, [name, e] {
-            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs 0..%d elements); using %d\n",
-                         name, e, (int)R4D_AR8_MIN_ELEMS_MAX,
-                         (int)R4D_AR8_MIN_ELEMS_DEFAULT);
-        });
-        return R4D_AR8_MIN_ELEMS_DEFAULT;
-    }
-    return v;
-}
-
-/* RADIANCE_AR8_FORM: lockstep (or unset), ring or split. Anything else is lockstep, with one
- * warning. */
-int ar8_form() {
-    const char* e = std::getenv(R4D_AR8_FORM_ENV);
-    if (!e || !*e) return R4D_AR8_FORM_LOCKSTEP;
-    const int f = r4d_ar8_form_parse(e);
-    if (f >= 0) return f;
-    static std::once_flag said;
-    std::call_once(said, [e] {
-        std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs lockstep, ring or split); the "
-                     "eight-rank two-shot runs in lockstep\n", R4D_AR8_FORM_ENV, e);
-    });
-    return R4D_AR8_FORM_LOCKSTEP;
-}
-
 /* The eight-rank two-shot's choice for one message, a function of its size and the instance
  * alone: a recorded launch keeps the table and piece count it was recorded with, and replays of
  * the same size agree with it. */
@@ -246,86 +176,58 @@ long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
     return asked > 0 ? asked : r4d_ar8_auto_pieces(numel);
 }
 
-/* The eight-rank two-shot's settings, agreed before anything is sized: each rank publishes what
- * it read and its own card's link, and after one barrier every rank derives the same weights from
- * the same eight entries. Settings that differ between ranks would cut the message at different
- * words or take different handshake steps; all ranks compare the same entries, so all refuse
- * together. */
+/* The eight-rank two-shot's settings, fixed before anything is sized: each rank publishes its own
+ * card's link, and after one barrier every rank derives the same weights from the same eight
+ * entries. */
 int ar8_settle(ArInst* in, int rank, int world) {
-    static std::once_flag said_w, said_p, said_links, said_unknown, said_set;
-    Rendezvous::Ar8Seen me;
-    me.mode = ar8_weights_mode(me.w);
-    me.pieces = ar8_pieces();
-    me.weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
-    me.pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
-    me.form = ar8_form();
-    if ((me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) && !ar8_own_link(&me.link))
-        me.link = R4DArLink();
+    static std::once_flag said_links, said_unknown, said_set;
+    const R4DAr8Settings set = ar8_settings();
+    R4DArLink own;
+    if (set.weights == R4D_AR8_WEIGHTS_AUTO && !ar8_own_link(&own)) own = R4DArLink();
     {
         std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.ar8[rank] = me;
+        g_rv.ar8_link[rank] = own;
     }
     const int rc = rv_barrier(world);
     if (rc != RAD_OK) return rc;
 
-    const Rendezvous::Ar8Seen* all = g_rv.ar8;
-    for (int r = 0; r < world; ++r)
-        if (all[r].mode != me.mode || std::memcmp(all[r].w, me.w, sizeof(me.w)) ||
-            all[r].pieces != me.pieces || all[r].weights_min != me.weights_min ||
-            all[r].pieces_min != me.pieces_min || all[r].form != me.form) {
-            std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
-                         "settings (%s, %s and their _MIN_ELEMS, %s)\n", rank, r,
-                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV, R4D_AR8_FORM_ENV);
-            return RAD_E_STATE;
-        }
-    in->pieces = me.pieces;
-    in->weights_min = me.weights_min;
-    in->pieces_min = me.pieces_min;
-    in->form = me.form;
-    if (me.form != R4D_AR8_FORM_LOCKSTEP) {
-        static std::once_flag said_form;
-        const int f = me.form;
-        std::call_once(said_form, [f] {
-            std::fprintf(stderr, "[r4d] eight-rank two-shot form: %s (%s)\n",
-                         f == R4D_AR8_FORM_RING ? "ring" : "split", R4D_AR8_FORM_ENV);
-        });
-    }
+    const R4DArLink* all = g_rv.ar8_link;
+    in->pieces = set.pieces;
+    in->weights_min = set.weights_min;
+    in->pieces_min = set.pieces_min;
 
     int w[R4D_MAX_RANKS] = { 0 };
-    if (me.mode == AR8_SET) {
-        std::memcpy(w, me.w, sizeof(w));
+    if (set.weights == R4D_AR8_WEIGHTS_SET) {
+        std::memcpy(w, set.w, sizeof(set.w));
         std::call_once(said_set, [&w] {
             std::fprintf(stderr, "[r4d] eight-rank two-shot shards weighted "
-                         "%d,%d,%d,%d,%d,%d,%d,%d (%s)\n", w[0], w[1], w[2], w[3], w[4], w[5],
-                         w[6], w[7], R4D_AR8_SHARD_WEIGHTS_ENV);
+                         "%d,%d,%d,%d,%d,%d,%d,%d (r4d_ar8_test_settings)\n", w[0], w[1], w[2],
+                         w[3], w[4], w[5], w[6], w[7]);
         });
-    } else if (me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) {
+    } else if (set.weights == R4D_AR8_WEIGHTS_AUTO) {
         double gbs[R4D_MAX_RANKS] = { 0 };
-        for (int r = 0; r < world; ++r) gbs[r] = r4d_ar_link_gbs(all[r].link);
-        const bool known = me.mode == AR8_DUPLEX ? r4d_ar_weights_duplex(gbs, world, w)
-                                                 : r4d_ar_weights_from_rates(gbs, world, w);
-        if (!known) {
+        for (int r = 0; r < world; ++r) gbs[r] = r4d_ar_link_gbs(all[r]);
+        if (!r4d_ar_weights_from_rates(gbs, world, w)) {
             std::call_once(said_unknown, [all, world] {
                 std::string who;
                 for (int r = 0; r < world; ++r)
-                    if (r4d_ar_link_gbs(all[r].link) <= 0.0) who += " " + std::to_string(r);
+                    if (r4d_ar_link_gbs(all[r]) <= 0.0) who += " " + std::to_string(r);
                 std::fprintf(stderr, "[r4d] eight-rank two-shot: no PCIe link speed in sysfs for "
                              "rank%s; shards stay even\n", who.c_str());
             });
             return RAD_OK;
         }
-        const bool duplex = me.mode == AR8_DUPLEX;
-        std::call_once(said_links, [all, world, duplex, &w] {
+        std::call_once(said_links, [all, world, &w] {
             std::string l;
             for (int r = 0; r < world; ++r) {
                 char one[96];
                 std::snprintf(one, sizeof one, "%s r%d %.1f GT/s x%d %.1f GB/s w%d",
-                              r ? "," : "", r, all[r].link.gts, all[r].link.width,
-                              r4d_ar_link_gbs(all[r].link), w[r]);
+                              r ? "," : "", r, all[r].gts, all[r].width,
+                              r4d_ar_link_gbs(all[r]), w[r]);
                 l += one;
             }
             std::fprintf(stderr, "[r4d] eight-rank two-shot shard weights from the slowest PCIe "
-                         "hop of each card%s:%s\n", duplex ? " (duplex)" : "", l.c_str());
+                         "hop of each card:%s\n", l.c_str());
         });
         bool same = true;
         for (int r = 1; r < world; ++r) same = same && w[r] == w[0];
@@ -601,6 +503,11 @@ static int ar_init(const RadParam* p, int n_p, int rank, int world, int host, vo
     return RAD_OK;
 }
 
+extern "C" void r4d_ar8_test_settings(const R4DAr8Settings* s) {
+    std::lock_guard<std::mutex> lk(g_ar8_m);
+    g_ar8 = s ? *s : R4DAr8Settings();
+}
+
 extern "C" int r4d_rad_ar_init(const RadParam* p, int n_p, int rank, int world, void** out) {
     return ar_init(p, n_p, rank, world, 0, out);
 }
@@ -709,12 +616,10 @@ static int nb_for(long words16, int max_nb) {
  * the junction's tail form, the two-shot row up to kTsDecodeShard words a shard), over the words of
  * one shard: one block per 2688 words, floor 2, ceiling 8 (and max_nb). A two-shot takes two
  * handshakes, each a PCIe round trip a block, so a block more costs more than its share of the
- * bytes saves until the shards are large. One per 672 (the rule before 2026-10-19) launched 16
- * blocks at 64 rows of 5376, where the multi-user verify runs (8 users x DFlash2's 8 rows): on 4x
- * R9700, one launch at a time on the real payload, 64 rows took 85.6 us at 16 blocks against 75.3
- * at 4, 32 rows 58.9 at 16 / 47.1 at 8 against 44.2 at 4, 128 rows 143.5 at 16 against 137.9 at 8;
- * 8 rows (two blocks either way) 19.6. The block count moves no byte: every word is folded by one
- * thread in ascending rank order whatever the grid. */
+ * bytes saves until the shards are large. On 4x R9700, one launch at a time on the 31B's payload,
+ * 64 rows of 5376 (8 users x DFlash2's 8 rows) took 85.6 us at 16 blocks against 75.3 at 4, 32
+ * rows 47.1 at 8 against 44.2 at 4, and 128 rows 143.5 at 16 against 137.9 at 8. The block count
+ * moves no byte: every word is folded by one thread in ascending rank order whatever the grid. */
 /* The chained two-shot (r4d_chain.h) where the row resolved with `chain`, for a decode-sized
  * message only (64 rows of an 8192-wide residual): DFlash2's verify-height reductions. */
 static long ar_chain(const RadArgs* a, long numel) {
@@ -1160,10 +1065,10 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     const ArInst* in = c.in;
     /* A reduction beside compute (overlap 1) carries its pushes coded at ~12.2 bits a bf16 value
      * (r4d_ar_twoshot_Nrank_exact.hip, the coded form), at 4 blocks of 1024 threads, wherever the
-     * message fits that form; the same bytes either way. The 31B's prefill (4x R9700, a
-     * 5033-token prompt): 5724 -> 5949 tok/s (+3.9%), every reply identical; 8 x 512 gave +2.1%,
-     * 16 x 256 +1.3%, 6 x 1024 -1.9% (the blocks crowd the GEMM beside them). `coded` 0, a launch
-     * parameter no declaration carries, keeps the plain wire: r4d_selftest's plain arm. */
+     * message fits that form; the same bytes either way. On 4x R9700 4 x 1024 gave the 31B's
+     * prefill the most (+3.9%) against 8 x 512, 16 x 256 and 6 x 1024, whose blocks crowd the GEMM
+     * beside them. `coded` 0, a launch parameter no declaration carries, keeps the plain wire:
+     * r4d_selftest's plain arm. */
     const bool lane = r4d_geti_or(a, "overlap", 0) == 1;
     if (lane && r4d_geti_or(a, "coded", 1) != 0 &&
         r4d_ar_twoshot_coded_ok(c.numel, in->dtype, 4, in->slot16)) {
@@ -1209,9 +1114,13 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     const long long asked = r4d_pgeti_or(a->p, a->n_p, "pieces", in->pieces);
     if (asked < 0 || asked > R4D_AR_TS_MAX_PIECES) return RAD_E_INVAL;
     const long long pieces = ar8_pieces_for(in, c.numel, asked);
-    /* A diagnostic: a device buffer of nblocks * R4D_AR_TL_WORDS int64 stamps (r4d.h). */
+    /* Both for measuring a board (r4d_selftest --perfar8), never set by the engine: `timeline` a
+     * device buffer of nblocks * R4D_AR_TL_WORDS int64 stamps (r4d.h), `form` a schedule other than
+     * lockstep (r4d_ar_shards.h). Lockstep is the serving form: on eight R9700 the ring form takes
+     * 2-6% less time for 8 and 16 MiB messages, but at TP8 the split form, which includes the ring
+     * order, moves neither prefill nor decode beyond run-to-run noise. */
     const long long timeline = r4d_pgeti_or(a->p, a->n_p, "timeline", 0);
-    const long long form = r4d_pgeti_or(a->p, a->n_p, "form", in->form);
+    const long long form = r4d_pgeti_or(a->p, a->n_p, "form", R4D_AR8_FORM_LOCKSTEP);
     if (form < R4D_AR8_FORM_LOCKSTEP || form > R4D_AR8_FORM_SPLIT) return RAD_E_INVAL;
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
@@ -1596,12 +1505,6 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
-    /* The fence-free forms rest on fine-grained P2P scratch and a store drain; the host mailbox
-     * (pinned host memory, cached on the way) keeps both fences. */
-    if (in->host || cfgv.drain != 3) {
-        if (cfgv.pub == 2) cfgv.pub = 1;
-        if (cfgv.acq == 2) cfgv.acq = 0;
-    }
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)v.M;
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
     /* Above one-shot heights (the plugin's fold band at 5 rows and up), the `tail` axis's form:

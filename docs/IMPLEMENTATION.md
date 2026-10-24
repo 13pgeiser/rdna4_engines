@@ -88,6 +88,20 @@ to bisect it (`spec.md` §17).
 **No allocation and no synchronisation on the step path.** The arena is sized at declare. A
 `malloc` needed inside `rad_arch_step` or the scheduler's per-step work is a declare-phase bug.
 
+**Kernel scratch is per lane, each region sized by what its lane may issue.** In-order launch lets
+every op on one stream share one scratch region; a second lane is a second stream and gets a second
+region once the architecture names any buffer to `rad_buf_concurrent` (`Program::scratch_regions`).
+Region 0 holds the program's largest device scratch (`Program::scratch_bytes`). Region 1 holds the
+largest device scratch of an op the second lane may issue (`Program::scratch_bytes_lane1`, computed
+in `Builder::finish_buffer_liveness`): by `Ctx::lane1_`'s rule 3 such an op touches only
+concurrent buffers, so an op with any other transient buffer never runs there, and one with no
+transient buffer counts. `Arena::init` takes both sizes, `arena_plan_bytes` charges both to the VRAM
+budget, and startup prints them (`arena: ... device + ... scratch + ... for the second lane = ...`).
+A lane-1 request larger than region 1 comes from an op that breaks rule 3 in its buffers too, so
+`Ctx::issue` fails the step naming the kernel (`RAD_E_SCRATCH`) rather than let it overrun the
+region. On Qwen3.8-27B with its DFlash2 drafter region 1 is 0 B against region 0's 50 MiB a card
+at speculation 7 (17 MiB without speculation).
+
 **`rad_memset_async` refuses `RAD_MEM_HOST` on a card; the host backend cannot reproduce that.**
 `RAD_MEM_HOST` is pageable memory the GPU has never been shown, so the device backend returns
 `RAD_E_UNSUPPORTED` naming the rule (`core/device/aql.cpp`). On the host backend all memory kinds

@@ -1,0 +1,24 @@
+# unlimited-ocr-bf16.recipe -- baidu/Unlimited-OCR from its bf16 checkpoint, served at the
+# checkpoint's own precision.
+#
+#   rad-convert <Unlimited-OCR checkpoint> --recipe data/recipes/unlimited-ocr-bf16.recipe \
+#       -o unlimited-ocr-bf16.rad
+#
+# No rules: every decoder weight is plain bf16 as the checkpoint ships it, and the bf16 plugin
+# (arch/unlimitedocr_bf16) probes the first routed expert, reads the plain encoding and serves the
+# experts through the bf16 grouped GEMM. The checkpoint carries no quantization_config.
+#
+# The container carries the whole checkpoint the plugin's name map covers: the 12-layer Llama-MoE
+# trunk and its tied head, and the DeepEncoder vision tower (sam_model.*, vision_model.*,
+# projector.layers.*, image_newline, view_seperator) at the checkpoint's bf16.
+#
+# Two shapes the map re-reads as GEMM weights: SAM's patch_embed.proj.weight [768, 3, 16, 16] as
+# [768, 768] (one bf16 plane reshaped), and the bias-free 3x3 convolutions (neck.2, net_2, net_3)
+# as [cout, cin*9], which conv2d_unfold + gemm_nt consume. Everything else is copied unchanged.
+#
+# Quantisation follow-ups (after P5) get their own recipes: the 64-expert MoE is the qwen4exp
+# w4/w4nl64 tier's shape (moe_intermediate_size 896 = 7 x 128 scale groups, n_embd 1280 = 10 x 128
+# -- whole scale blocks both ways), with the tied 331 MB head and the vision tower kept bf16.
+
+# Nothing here is quantised: a recipe's rules are PATTERN QUANTISER pairs, and a weight no rule
+# matches keeps the checkpoint's own encoding (bf16 for every tensor here).

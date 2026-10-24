@@ -1159,10 +1159,9 @@ int body(const RadArgs* a, RadStream stream) {
     }
     /* The small-M form at GLM's TP8 slices, ahead of the expert-major band: gate_up up to 384
      * routed rows, down up to 32, where it stops gaining (at 5 to 8 tokens it reads 3 to 5 %
-     * slower than the staged form). Measured at those slices (perfmx, cold), expert-major against
-     * small-M: gate_up at 1, 3, 6, 8, 16 and 48 tokens 36.8/31.4, 79.5/69.5, 120.5/101.4,
-     * 145.0/122.4, 230.3/206.8 and 416.7/390.0 us; down at 1, 2 and 4 tokens 21.2/16.4, 26.0/22.5
-     * and 39.5/37.9 us. */
+     * slower than the staged form). At those slices on gfx1201 (perfmx, cold) it is 6 to 16 %
+     * faster than the expert-major form for gate_up from 1 to 48 tokens, and 4 to 23 % for down
+     * from 1 to 4. */
     if (tp8 && m.T <= (m.K <= 256 ? 32 : 384)) {
         const long rows = std::min<long>(m.experts, m.T) + 1;
 #define MX_SMALL(SK, CT)                                                                           \

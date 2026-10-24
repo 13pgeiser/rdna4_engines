@@ -15,6 +15,7 @@
 #include "rad_quant.h"
 #include "rad_runtime.h"
 #include "rad_sample.h"
+#include "rad_spechub.h"
 #include "rad_types.h"
 #include "rad_yarn.h"
 

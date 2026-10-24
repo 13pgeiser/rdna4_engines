@@ -47,12 +47,16 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * served by a different kernel may differ (§7.2). */
     bool has_linear = false, has_window = false;
     for (const KVGroupInfo& kg : prog.kv_groups) {
-        if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW) {
+        if (kg.decl.kind == RAD_KV_FULL || kg.decl.kind == RAD_KV_WINDOW ||
+            kg.decl.kind == RAD_KV_RING) {
             if (kg.block_size > 0) {
                 g.attn_block = lcm64(g.attn_block, kg.block_size);
                 note(g.why, "attn_block", kg.block_size, kg.name.c_str());
                 /* A drafter's window is recomputed by draft refill; only the trunk's needs a
-                 * snapshot for a prefix hit to resume. */
+                 * snapshot for a prefix hit to resume. A RAD_KV_RING group has no snapshot at all
+                 * (KVManager::declare_runtime_window): its window is each sequence's own prompt
+                 * length, which no slot could describe, so it is sized for the context plus a ring
+                 * and is never checkpointed. */
                 if (kg.decl.kind == RAD_KV_WINDOW && !kg.layers.empty() && !kg.drafter)
                     has_window = true;
             }
@@ -122,14 +126,15 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * retention.
      *
      * Without linear state there are no checkpoints, except for a trunk window under a prefix
-     * cache, which snapshots the window behind a prompt's tail (window_ckpt) without splitting
-     * chunks. */
+     * cache, which snapshots the window at interval boundaries and the prompt's tail
+     * (window_ckpt). */
     if ((has_linear || (has_window && cfg.prefix_cache)) && cfg.checkpoint_interval > 0)
         g.checkpoint_interval = align_up(cfg.checkpoint_interval, g.quantum);
     else
         g.checkpoint_interval = 0;
     g.window_ckpt = !has_linear && g.checkpoint_interval > 0;
-    /* A window snapshot splits no chunk (plan_chunk), so there is no interval grid to span. */
+    g.window_periodic = g.window_ckpt && cfg.checkpoint_policy != "tip-only";
+    /* Window checkpoints do not support skipping snapshots inside a prefill span. */
     g.span = (g.checkpoint_interval > 0 && !g.window_ckpt && cfg.prefill_span > 1)
            ? cfg.prefill_span : 1;
     g.shared_tok = prefill_shared_tok(cfg);
@@ -149,9 +154,11 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
 
     /* Log the effective chunk length. `plan_chunk` splits at the checkpoint interval first, so
      * when the interval is below --max-num-batched-tokens, raising the budget does not change the
-     * chunk; the log line makes that visible. A window snapshot splits nothing. */
+     * chunk; the log line makes that visible. tip-only window snapshots do not
+     * split at the interval, so their chunk is bounded by the token budget. */
     const int64_t span_tok = g.checkpoint_interval * g.span;
-    const int64_t eff = (g.checkpoint_interval > 0 && !g.window_ckpt && span_tok < cfg.max_tok)
+    const bool periodic = !g.window_ckpt || g.window_periodic;
+    const int64_t eff = (g.checkpoint_interval > 0 && periodic && span_tok < cfg.max_tok)
                       ? span_tok : cfg.max_tok;
     RAD_INFO("chunk geometry: quantum %lld (attn block %lld, state chunk %lld), checkpoint "
              "interval %lld, max_tok %lld -> prefill chunks of at most %lld%s",
