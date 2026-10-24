@@ -1989,10 +1989,10 @@
   {
    "commands": {
     "negative": [
-     "python3 scripts/serve_harness.py --port 28516 --model $MODEL --tp 3 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # tp degree exceeding visible devices must fail closed"
+     "python3 scripts/serve_harness.py --port 28516 --model $MODEL --tp 3 --devices $DEVICES --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # tp degree exceeding visible devices must fail closed"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
+     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices $DEVICES --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
     ]
    },
    "env": {
