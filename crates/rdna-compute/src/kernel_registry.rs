@@ -6240,6 +6240,12 @@ const QWEN36_27B_GFX1201_MTP_HIP: &[RouteHip] = &[
     ("deinterleave", &["deinterleave_f32"]),
     ("deinterleave_batched", &["deinterleave_f32_batched"]),
     ("dflash_gdn_replay_pre_ml", &["dflash_gdn_replay_pre_ml"]),
+    // The MQ4-v1 head runs the typed layer program's norm/activation
+    // producers and residual projections even when the trunk is all AWQ.
+    ("fused_gate_up_hfq4g256", &["fused_gate_up_hfq4g256"]),
+    ("fused_qkv_hfq4g256", &["fused_qkv_hfq4g256"]),
+    ("fused_rmsnorm_mq_rotate", &["fused_rmsnorm_mq_rotate"]),
+    ("fused_silu_mul_mq_rotate", &["fused_silu_mul_mq_rotate"]),
     (
         "fused_qk_l2_norm_scale_interleave_f32_batched",
         &["fused_qk_l2_norm_scale_interleave_f32_batched"],
@@ -6254,6 +6260,7 @@ const QWEN36_27B_GFX1201_MTP_HIP: &[RouteHip] = &[
         "gemv_hfq4g256_multirow_default",
         &["gemv_hfq4g256_multirow_r2"],
     ),
+    ("gemv_hfq4g256_residual", &["gemv_hfq4g256_residual"]),
     ("greedy_accept", &["greedy_accept_from_argmax_i32"]),
     ("kv_cache_write_q8_0", &["kv_cache_write_q8_0"]),
     (
@@ -6528,6 +6535,13 @@ pub fn route_entries_sealed(
     let corpus = route_corpus(input.arch, input.hipcc_extra_flags)?;
     let mut entries = embedded;
     for &(module, symbols) in hip.into_iter().flatten() {
+        // The MQ4 head and a no-AWQ trunk share plain producer entries.
+        if entries
+            .iter()
+            .any(|entry| entry.module() == module && entry.symbols() == symbols)
+        {
+            continue;
+        }
         if let Some(twin) =
             crate::pm_decode_twins::pm_decode_module(input.arch, input.flags.pm_decode, module)
         {
