@@ -517,10 +517,11 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
         };
         /* A picture or an endpoint keyframe folds through the VAE as a ONE-frame clip, which is
          * why it rides at a far larger side than a video can -- but "larger" is not "unbounded":
-         * the encoder's per-level buffers hold a full clip's worth of the DEEPEST temporal stage,
-         * so one frame cannot exceed a fifth of the pixels budget no matter how few frames it
-         * has. The geometry call answers that; asking it here refuses an over-cap media at
-         * accept, where a step-time refusal would stop the whole engine. */
+         * a one-frame clip never shrinks through the temporal downsamplers, so it must fit at
+         * every level ALONE; the buffers hold max(a full clip, one canvas-sized frame), leaving
+         * the model's whole canvas as a single frame's ceiling. The geometry call answers that;
+         * asking it here refuses an over-cap media at accept, where a step-time refusal would
+         * stop the whole engine. */
         auto one_frame = [&](const VideoRefMedia& m) {
             const int64_t in[4] = { 1, m.enc_h, m.enc_w, 3 };
             return !enc_geom_ || enc_geom_(RAD_GEN_PASS_VENCODE, in, eg, 25) >= 0;

@@ -389,6 +389,16 @@ enum : int {
  * latents into patch rows — up to 82 latent frames at 256 x 256 is 82 * 8 * 8 = 5248 rows of 96
  * columns — and the audio encoder writes its two channels' 625 latents, 1250 rows of 32. */
 enum { kEncMaxSide = 256, kEncMaxFrames = 289, kEncMaxSamples = 500000 };
+/* A ONE-frame media -- a reference picture, or an endpoint KEYFRAME -- is a one-frame clip,
+ * and a one-frame clip never shrinks through the temporal downsamplers (1 -> 1 -> 1 -> 1
+ * against a full clip's 17 -> 17 -> 9 -> 5): it rides every level ALONE. And a keyframe must
+ * ride the TARGET canvas -- it is resized to it before the VAE and its latent rows share the
+ * target grid (rad_ref2va_pack ref2va_build) -- so the level buffers must hold a single frame
+ * of the model's whole canvas kDefW x kDefH by themselves. In frames-at-the-tile-side that
+ * is 16 (1,032,192 / 256^2 rounded up); declare_venc sizes each level's rows as
+ * max(a full clip, this) and venc_geom's one-frame test is exactly this area. */
+enum { kEncOneFrames = ((int64_t)kDefW * kDefH + (int64_t)kEncMaxSide * kEncMaxSide - 1) /
+                       ((int64_t)kEncMaxSide * kEncMaxSide) };
 enum { kEncSlotsV = 13, kEncSlotsA = 6 };
 enum { kEncSlotRowsV = 82 * (kEncMaxSide / 32) * (kEncMaxSide / 32),
        kEncSlotRowsA = kAudioCh * (kEncMaxSamples / kAudioHop) };
@@ -2361,32 +2371,31 @@ static bool venc_geom(int64_t frames, int64_t h, int64_t w, int32_t* out) {
     const int64_t clip = frames == 1 ? 1 : kVaeClipLength;
     const int64_t n_clips = frames == 1 ? 1 : (frames + kVaeClipLength - 1) / kVaeClipLength;
     const int64_t t1 = (clip + 1) / 2, t2 = (t1 + 1) / 2;
-    /* The side the buffers set the ceiling on, not a flat number: they hold ONE clip's pixels at
-     * a time, sized for a full kVaeClipLength-frame clip at kEncMaxSide, so a media fits while
-     * clip * h * w stays within that volume. A multi-frame reference video is unchanged -- clip
-     * is kVaeClipLength, so the volume cap forces each side back to kEncMaxSide exactly as before.
-     * A ONE-frame media -- a reference picture, or an endpoint KEYFRAME -- is a single-frame clip
-     * and therefore rides at a far larger side. Keyframes must: the pack shares their latent rows
-     * across the TARGET grid (they are resized to the target canvas before the VAE, rad_ref2va_pack
-     * ref2va_build), so an endpoint pin at output resolution is what the DiT attends to; the flat
-     * kEncMaxSide cap used to refuse them at any output above 256. The slot-latent check below and
-     * step_venc's own overflow check bound the result; nothing here enlarges a buffer.
+    /* The buffers set a PER-VOLUME ceiling, not a flat side: they hold ONE clip's pixels at a
+     * time. A multi-frame reference video rides a full kVaeClipLength-frame clip, so the pixels
+     * volume forces each side back to kEncMaxSide. A ONE-frame media -- a reference picture, or
+     * an endpoint KEYFRAME -- never shrinks in time (1 -> 1 -> 1 -> 1), so it must fit at every
+     * level by itself; the level buffers are declared as max(full clip, kEncOneFrames) frames at
+     * the tile side (declare_venc), which leaves a single frame bounded only by the model's whole
+     * canvas, kEncOneFrames * kEncMaxSide^2 = kDefW * kDefH. Keyframes need exactly that: the
+     * pack shares their latent rows across the TARGET grid (they are resized to the target canvas
+     * before the VAE, rad_ref2va_pack ref2va_build), so an endpoint pin at output resolution is
+     * what the DiT attends to. The slot-latent check below and step_venc's own overflow check
+     * bound the result; nothing here enlarges a buffer.
      *
-     * The cap is per VOLUME, not just the pixels volume: the temporal downsamplers shrink a full
-     * clip 17 -> 17 -> 9 -> 5 but a one-frame clip only 1 -> 1 -> 1 -> 1, so the deep buffers --
-     * 5 frames' worth at their side -- bind a single frame at h * w <= 5 * kEncMaxSide^2 (a
-     * ~572-sided square), not the 17-frame budget's 17 * kEncMaxSide^2. A 544x736 keyframe proved
-     * it: it
-     * passed the volume check, then the engine died on `venc.l3.in` 6256 > 5120 rows. The spatial
-     * divisor is the same on both sides of each comparison, so it cancels and only the temporal
-     * factors remain. */
+     * The spatial divisor is the same on both sides of each comparison, so it cancels and only
+     * the temporal factors remain. A 544x736 keyframe once proved the old, narrower bound the
+     * hard way: it passed the pixels volume, then the engine died on `venc.l3.in` 6256 > 5120
+     * rows -- the deep buffers then held only 5 frames' worth. */
     {
         const int64_t tv[5] = { clip, clip, t1, t2, t2 };
-        const int64_t fv[5] = { kVaeClipLength, kVaeClipLength, (kVaeClipLength + 1) / 2,
-                                ((kVaeClipLength + 1) / 2 + 1) / 2,
-                                ((kVaeClipLength + 1) / 2 + 1) / 2 };
-        for (int i = 0; i < 5; ++i)
-            if (tv[i] * h * w > fv[i] * (int64_t)kEncMaxSide * kEncMaxSide) return false;
+        const int64_t tf5[5] = { kVaeClipLength, kVaeClipLength, (kVaeClipLength + 1) / 2,
+                                 ((kVaeClipLength + 1) / 2 + 1) / 2,
+                                 ((kVaeClipLength + 1) / 2 + 1) / 2 };
+        for (int i = 0; i < 5; ++i)   /* the same max() that sizes R[] in declare_venc */
+            if (tv[i] * h * w > std::max(tf5[i], (int64_t)kEncOneFrames) *
+                                    (int64_t)kEncMaxSide * kEncMaxSide)
+                return false;
     }
     const int64_t lat = vae_latent_frames(frames);
     const int64_t full = vae_clip_latents(clip);
@@ -2534,8 +2543,10 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         return wcopy(b, dn, src, RAD_F32, shape, acc, kGrpVencH);
     };
 
-    /* The clip's frames, rows and rows a frame at each level: a full 17-frame clip is the
-     * largest, and the buffers hold one clip at a time. */
+    /* The clip's frames, rows and rows a frame at each level: the buffers hold one clip at a
+     * time, and the largest clip is a full 17-frame one at the tile side -- except below
+     * level 2, where a single canvas-sized frame (the one-frame budget, kEncOneFrames)
+     * is the largest thing that ever rides. */
     int64_t tf[6], sd[6] = { 1, 1, 1, 1, 1, 1 }, R[6], PF[6];
     tf[0] = kVaeClipLength;
     for (int i = 1; i < 6; ++i) {
@@ -2545,7 +2556,10 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t HW = kEncMaxSide * kEncMaxSide;
     for (int i = 0; i < 6; ++i) {
         PF[i] = HW / (sd[i] * sd[i]);
-        R[i] = tf[i] * PF[i];
+        /* max() with the one-frame budget: below level 2 a single canvas-sized frame
+         * (a keyframe at the output resolution) outgrows a full clip at the tile side --
+         * it never shrinks in time (kEncOneFrames). */
+        R[i] = std::max(tf[i], (int64_t)kEncOneFrames) * PF[i];
     }
     const int64_t Rmax = R[0];
 
