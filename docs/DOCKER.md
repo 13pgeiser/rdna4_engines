@@ -133,6 +133,10 @@ the cards the engine runs on.
 | `ornith-1.5-35b-a3b.yaml` | `ornith-1.5-35b-a3b-fp8.rad` | Ornith-1.5-35B-A3B, FP8, MTP, vision |
 | `ornith-1.5-35b-a3b-w4a8.yaml` | `ornith-1.5-35b-a3b-w4a8.rad` | Ornith-1.5-35B-A3B with four-bit experts (GPTQ), a block-FP8 trunk, MTP, vision |
 | `ornith-1.5-35b-a3b-w4a8-tp1.yaml` | `ornith-1.5-35b-a3b-w4a8.rad` | The same on one card, every weight in VRAM |
+| `ornith-1.5-122b.yaml` | `ornith-1.5-122b-fp8.rad` | Ornith-1.5-122B, FP8, MTP, vision, on four cards with a 3 GiB pinned host pool per card and the vision tower in host memory |
+| `ornith-1.5-122b-df2.yaml` | `ornith-1.5-122b-fp8-dflash2.rad` | The same with incoai's DFlash2 drafter in place of the MTP head |
+| `ornith-1.5-122b-w4a8.yaml` | `ornith-1.5-122b-w4a8.rad` | Ornith-1.5-122B with four-bit experts (GPTQ), a block-FP8 trunk, MTP, vision, every weight in VRAM on four cards |
+| `ornith-1.5-122b-w4a8-df2.yaml` | `ornith-1.5-122b-w4a8-dflash2.rad` | The same with incoai's DFlash2 drafter in place of the MTP head |
 | `sage-a1.5.yaml` | `sage-a1.5-fp8.rad` | Sage-A1.5, FP8, MTP, vision |
 | `sage-a1.5-tp1.yaml` | `sage-a1.5-fp8.rad` | The same on one card: the expert plane partly in an 8 GiB pinned host pool, one 262,144-token session |
 | `sage-a1.5-df2.yaml` | `sage-a1.5-fp8-df2.rad` | Sage-A1.5 with incoai's Qwen3.6-35B-A3B DFlash2 drafter in place of the MTP head, vision |
@@ -143,6 +147,8 @@ the cards the engine runs on.
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
 | `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |
 | `gemma4-31b-heretic-ara-w4a8.yaml` | `gemma4-31b-heretic-ara-w4a8.rad` | The same for Gemma 4 31B heretic-ara (refusals removed) |
+| `nemotron-3.5-bolt-e4b-bf16.yaml` | `nemotron-3.5-bolt-e4b-bf16.rad` | NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B) in bf16 with NVIDIA's DFlash drafter, the vision tower in pinned host memory, on one card |
+| `nemotron-3.5-bolt-e4b-i8g.yaml` | `nemotron-3.5-bolt-e4b-i8g.rad` | The same with the trunk at int8 (i8a8) |
 | `translategemma-27b.yaml` | `translategemma-27b-mxfp4-gptq.rad` | TranslateGemma 27B MXFP4 with its chat template (`gemma3.jinja`) |
 | `glm53-flash.yaml` | `glm53-flash-mxfp4.rad` | GLM-5.3-Flash, MXFP4 experts and block-FP8 attention, on eight cards |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
@@ -178,7 +184,7 @@ docker compose -f flashnext.yaml down       # stop
 ```
 
 Every model listens on the same port and most take both cards (`flashnext-tp1.yaml`,
-`ornith-1.5-35b-a3b-w4a8-tp1.yaml`, `qwen3.8-27b-paro.yaml` and the files that read `RADIANCE_GPU` take one, `glm53-flash.yaml`
-eight), so run one at a time: `down` one before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
+`ornith-1.5-35b-a3b-w4a8-tp1.yaml`, `qwen3.8-27b-paro.yaml`, the `nemotron-3.5-bolt-e4b-*.yaml` files and the files that read `RADIANCE_GPU` take one, the
+`ornith-1.5-122b*.yaml` files four, `glm53-flash.yaml` eight), so run one at a time: `down` one before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
 the dashboard page answer without the API key, and the health check fetches `/health` with
 busybox's `wget`.

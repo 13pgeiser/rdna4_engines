@@ -25,6 +25,10 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B w4a8: 4-bit experts (GPTQ), MTP, vision, fits one card | `ornith-1.5-35b-a3b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-w4a8) | `ornith-1.5-35b-a3b-w4a8.yaml` |
+| Ornith-1.5-122B FP8, MTP, vision, four cards | `ornith-1.5-122b-fp8.rad` (118 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-fp8) | `ornith-1.5-122b.yaml` |
+| Ornith-1.5-122B FP8, DFlash2 drafter, vision, four cards | `ornith-1.5-122b-fp8-dflash2.rad` (116 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-fp8-dflash2) | `ornith-1.5-122b-df2.yaml` |
+| Ornith-1.5-122B w4a8: 4-bit experts (GPTQ), MTP, vision, four cards | `ornith-1.5-122b-w4a8.rad` (65 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-w4a8) | `ornith-1.5-122b-w4a8.yaml` |
+| Ornith-1.5-122B w4a8: 4-bit experts (GPTQ), DFlash2 drafter, vision, four cards | `ornith-1.5-122b-w4a8-dflash2.rad` (64 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-122b-w4a8-dflash2) | `ornith-1.5-122b-w4a8-df2.yaml` |
 | Sage-A1.5 FP8, MTP, vision | `sage-a1.5-fp8.rad` (35 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8) | `sage-a1.5.yaml`, `sage-a1.5-tp1.yaml` |
 | Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |

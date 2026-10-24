@@ -1,0 +1,18 @@
+# Ornith-1.5-122B, FP8 with one scale per 128x128 block, its own MTP head and the vision tower, on
+# four cards. The 118 GiB of weights fill the cards: a pinned host pool of 3 GiB per card
+# (--host-pool-mib counts per card) holds the experts that do not fit, and the vision tower sits in
+# host memory. At 8 sequences the cache holds 614,208 tokens, two full 262,144-token sessions; a
+# 16 GiB pool holds 2,097,280, but moves more experts over PCIe and decodes far slower. Sampling as
+# ornith-1.5-35b-a3b.yaml.
+name: radiance-ornith-1.5-122b
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-ornith-1.5-122b
+    command: >
+      --model /models/ornith-1.5-122b-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 4 --max-num-seqs 8 --max-model-len 262144 --kv-cache-dtype fp8
+      --placement expert_tiered --host-pool-mib 3072 --vision-tower-placement ram
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048
+      --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5
