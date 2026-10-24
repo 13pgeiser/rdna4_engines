@@ -104,7 +104,25 @@ struct G4Linear {
     rad_op     op = 0, op_q = 0;   /* the quantised GEMM and, for w4a8, its activation quantiser */
     rad_buf    q8 = 0, s8 = 0;     /* the int8 pair (i8 codes + f32 row scale) the quantiser writes */
     int64_t    N = 0, K = 0;
-    bool       quant = false;   /* true: w4a8 */
+    bool       quant = false;   /* true: w4a8 / w8a8 over a per-row int8 activation */
+    /* true: i8a8 as arch/gemma3's G3Linear: int8 codes with a bf16 scale per [1 x 128] (libquant
+     * `codes=i8 group=128 scale=bf16`) over quant_act_i8g, an activation scale per (row, 128).
+     * Gemma 4 E4B's activations carry a few channels 40-200 times the row's median (the down
+     * projection's input most), and one int8 scale a row spends its codes on them. There is no
+     * fused norm/quantiser at this grid, so the junctions stay off for a model that uses it. */
+    bool       i8g = false;
+    /* true: asymmetric int4 as arch/gemma3's G3Linear: u4 codes, a u8 zero point and an f16 scale
+     * per [1 x 128] (libquant `codes=u4 zero=u8 group=128 scale=f16`), gemm_nt_q at w4a8i8_asym
+     * over the same per-(row, 128) int8 activation as i8g. */
+    bool       a4 = false;
+    bool       grouped() const { return i8g || a4; }
+    /* a4 at decode heights, as LinearFP8's w4 (rad_fp8.h): up to kA4Split rows the bf16 input is
+     * cast to f16 (`a16`) for w4a16_asym's skinny kernel; w4a8i8_asym has only a prefill kernel,
+     * which at one row does 16 times the matrix work and reads its weight a quarter as fast. */
+    static constexpr int64_t kA4Split = 64;
+    int64_t    a4_split = 0;      /* rows up to which op_dec serves; 0: no decode band */
+    rad_buf    a16 = 0;
+    rad_op     op_a16 = 0, op_dec = 0;
     /* Reads another linear's int8 pair. q, k and v quantise the same norm output on the same
      * per-row grid, so with `in_from` set at declare this linear reads that linear's pair and
      * declares no quantiser of its own: one dispatch instead of three. */
@@ -175,6 +193,73 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
      * at w8a8 reads the same int8 activation and per-row scale as w4a8, so the quantiser is
      * shared. A recipe uses it for linears int4 hurts (attention, down_proj). */
     const uint32_t cdt = known && enc.n_planes > 0 ? enc.plane[0].dtype : 0;
+    i8g = known && linear_is_w8(enc);
+    {
+        const RadEncPlane* sp = rad_enc_plane(&enc, "scale");
+        const RadEncPlane* zp = rad_enc_plane(&enc, "zero");
+        a4 = known && rad_enc_is(&enc, "affine") && enc.n_planes == 3 && !enc.transform[0] &&
+             cdt == RAD_U4 && enc.plane[0].block[1] == 1 && sp && sp->dtype == RAD_F16 &&
+             sp->block[0] == 1 && sp->block[1] == RAD_FP8_BLOCK && zp && zp->dtype == RAD_U8 &&
+             zp->block[0] == 1 && zp->block[1] == RAD_FP8_BLOCK;
+    }
+    if (i8g || a4) {
+        if (N % 16 || K % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; it takes rows in 16s and K in "
+                            "whole %d-column activation scale groups\n", base, (long long)N,
+                    (long long)K, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        if (a4) {
+            w  = decl_view(b, wn, nullptr, "codes", RAD_U4, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
+                           RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        } else {
+            w  = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK },
+                           RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
+        }
+        if (!w || !ws) return RAD_E_INVAL;
+        /* not an a4 linear's pair: below its decode band it writes none */
+        if (in_from && in_from->grouped() && !in_from->a4 && in_from->q8 && in_from->K == K) {
+            q8 = in_from->q8;
+            s8 = in_from->s8;
+            shared_in = true;
+        } else {
+            q8 = decl_b(b, nm.f("%s.q8", base), RAD_I8,  { g.max_tok, K });
+            s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, K / RAD_FP8_BLOCK });
+            if (!q8 || !s8) return RAD_E_INVAL;
+            op_q = rw(b, RAD_OP(b, "quant_act_i8g",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
+                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
+                        RAD_NOWEIGHTS),
+                    { a }, { q8, s8 });
+            if (!op_q) return RAD_E_INVAL;
+        }
+        op = rw(b, RAD_OP(b, "gemm_nt_q",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", N), RAD_INT("K", K),
+                               RAD_INT("group", RAD_FP8_BLOCK),
+                               RAD_STR("dtype", a4 ? "w4a8i8_asym" : "i8a8")),
+                    RAD_WEIGHTS(w, ws)),
+                { q8, s8 }, { y });
+        if (!op) return RAD_E_INVAL;
+        if (a4) {
+            a4_split = std::min<int64_t>(kA4Split, g.max_tok);
+            a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { a4_split, K });
+            if (!a16) return RAD_E_INVAL;
+            op_a16 = rw(b, RAD_OP(b, "cast",
+                           RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("n", K),
+                                      RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
+                           RAD_NOWEIGHTS),
+                        { a }, { a16 });
+            op_dec = rw(b, RAD_OP(b, "gemm_nt_q",
+                            RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("N", N), RAD_INT("K", K),
+                                       RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "w4a16_asym")),
+                            RAD_WEIGHTS(w, ws)),
+                        { a16 }, { y });
+            if (!op_a16 || !op_dec) return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     if (known && g4_grid_w4(enc)) {
         if (N % 16 || K % 128) {
             fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a w4 weight takes rows in "
@@ -216,8 +301,8 @@ inline int G4Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
 
     char en[256];
     rad_enc_format(&enc, en, sizeof en);
-    fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, w4a8 or w8a8 -- "
-                    "neither matches\n", wn, en);
+    fprintf(stderr, "radiance: '%s' is %s, and this model's linears are plain bf16, w4a8, w8a8, "
+                    "int8 a 128 (i8a8) or asymmetric int4 a 128 -- none matches\n", wn, en);
     return RAD_E_DTYPE;
 }
 
@@ -229,6 +314,16 @@ inline void G4Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
         if (!shared_in)
             RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
         gemm(c, y, T);
+    } else if (a4 && T <= a4_split) {
+        /* the decode band: f16 copy of the input, the skinny kernel; operands as LinearFP8's w4 */
+        RAD_ISSUE_N(c, op_a16, T, brows(a, T), brows(a16, T));
+        RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
+                    RAD_NONE, RAD_NONE);
+    } else if (grouped()) {
+        /* quant_act_i8g takes x, q, scale: no optional `asum`. */
+        if (!shared_in)
+            RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T));
+        gemm(c, y, T);
     } else
         RAD_ISSUE(c, op, brows(a, T), RAD_W(w), brows(y, T));
 }
@@ -239,18 +334,29 @@ inline void G4Linear::gemm(RadCtx* c, rad_buf y, int64_t T) const {
 }
 
 inline void G4Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const {
-    if (!quant) {
+    if (a4 && n <= a4_split) {
+        RAD_ISSUE_N(c, op_a16, n, brow_slice(a, r0, n, K), brows(a16, n));
+        RAD_ISSUE_N(c, op_dec, n, brows(a16, n), RAD_NONE, RAD_W(w), RAD_W(ws),
+                    brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    if (!quant && !grouped()) {
         RAD_ISSUE_N(c, op, n, brow_slice(a, r0, n, K), RAD_W(w), brow_slice(y, r0, n, N));
         return;
     }
-    if (!shared_in)
+    const int64_t sw = grouped() ? K / RAD_FP8_BLOCK : 1;   /* the scale plane's row width */
+    if (!shared_in && grouped())
+        RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
+                    brow_slice(s8, r0, n, sw));
+    else if (!shared_in)
         RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
                     brow_slice(s8, r0, n, 1), RAD_NONE);
     gemm_rows(c, y, r0, n);
 }
 
 inline void G4Linear::gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) const {
-    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, 1), RAD_W(w), RAD_W(ws),
+    const int64_t sw = grouped() ? K / RAD_FP8_BLOCK : 1;
+    RAD_ISSUE_N(c, op, n, brow_slice(q8, r0, n, K), brow_slice(s8, r0, n, sw), RAD_W(w), RAD_W(ws),
                 brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
 }
 
@@ -376,8 +482,11 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     if (cls.has_v) RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src, v_src }));
     else           RAD_ARCH_TRY(map_concat(b, qkv_wn, { q_src, k_src }));
     {
+        /* one q|k|v GEMM wherever the weight is on a quantised grid: w4a8 / w8a8, i8a8 or a4 */
         RadEncoding e{};
-        fused = weight_enc(b, qkv_wn, &e) && g4_grid_w4(e);
+        fused = weight_enc(b, qkv_wn, &e) && (g4_grid_w4(e) || linear_is_w8(e) ||
+                                              (rad_enc_is(&e, "affine") && e.n_planes == 3 &&
+                                               e.plane[0].dtype == RAD_U4));
     }
     if (fused) {
         if (!qkv_slot) return RAD_E_INVAL;
