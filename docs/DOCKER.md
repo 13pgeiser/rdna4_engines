@@ -179,3 +179,8 @@ Every model listens on the same port and most take both cards (`flashnext-tp1.ya
 eight), so run one at a time: `down` one before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
 the dashboard page answer without the API key, and the health check fetches `/health` with
 busybox's `wget`.
+
+A container serving MiniMax-H3 doubles as ComfyUI's backend: `integrations/comfyui/ComfyUI-Radiance-MiniMax`
+dropped into `ComfyUI/custom_nodes/` gives a node that calls `/v1/videos` over HTTP — no model, no
+VRAM on the ComfyUI side, same box or across the network — and with `--lora-dir /models/loras/h3`
+on the command its LoRA dropdowns list the very files under `$RADIANCE_MODELS/loras/h3`.
