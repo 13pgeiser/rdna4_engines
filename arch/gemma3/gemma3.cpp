@@ -22,6 +22,7 @@
 #include <arch/rad_fp8.h>
 #include <arch/rad_block_dflash2.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -94,6 +95,13 @@ struct G3Linear {
     bool       i8g = false;
     bool       mx = false;
     bool       a4 = false;       /* asymmetric int4 over the per-(row, 128) int8 activation */
+    /* a4 at decode heights, as LinearFP8's w4 (rad_fp8.h): up to kA4Split rows the bf16 input is
+     * cast to f16 (`a16`) for w4a16_asym's skinny kernel; w4a8i8_asym has only a prefill kernel,
+     * which at one row does 16 times the matrix work. */
+    static constexpr int64_t kA4Split = 64;
+    int64_t    a4_split = 0;
+    rad_buf    a16 = 0;
+    rad_op     op_a16 = 0, op_dec = 0;
     bool       shared_in = false;
     /* Set before declare: an E4M3 (MXFP4) linear's input pair given by the caller (the pipelined
      * prefill's one pair for every block) instead of one of its own. It keeps its own quantiser
@@ -205,7 +213,8 @@ inline int G3Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
         ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
                        RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
         if (!w || !ws) return RAD_E_INVAL;
-        if (in_from && (in_from->i8g || in_from->a4) && in_from->q8 && in_from->K == K) {
+        /* not an a4 linear's pair: below its decode band it writes none */
+        if (in_from && in_from->i8g && in_from->q8 && in_from->K == K) {
             q8 = in_from->q8;
             s8 = in_from->s8;
             shared_in = true;
@@ -225,7 +234,21 @@ inline int G3Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "w4a8i8_asym")),
                     RAD_WEIGHTS(w, ws)),
                 { q8, s8 }, { y });
-        return op ? RAD_OK : RAD_E_INVAL;
+        if (!op) return RAD_E_INVAL;
+        a4_split = std::min<int64_t>(kA4Split, g.max_tok);
+        a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { a4_split, K });
+        if (!a16) return RAD_E_INVAL;
+        op_a16 = rw(b, RAD_OP(b, "cast",
+                       RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("n", K),
+                                  RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
+                       RAD_NOWEIGHTS),
+                    { a }, { a16 });
+        op_dec = rw(b, RAD_OP(b, "gemm_nt_q",
+                        RAD_PARAMS(RAD_RANGE("M", 1, a4_split), RAD_INT("N", N), RAD_INT("K", K),
+                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "w4a16_asym")),
+                        RAD_WEIGHTS(w, ws)),
+                    { a16 }, { y });
+        return (op_a16 && op_dec) ? RAD_OK : RAD_E_INVAL;
     }
     if (i8g || mx) {
         if (N % 16 || K % RAD_FP8_BLOCK) {
@@ -246,7 +269,7 @@ inline int G3Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
             ws = decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK }, RAD_ACCESS_PER_TOKEN, shard, grp, parts, np);
             if (!w || !ws) return RAD_E_INVAL;
         }
-        if (in_from && in_from->mx == mx && (in_from->i8g || in_from->a4) == i8g && in_from->q8 && in_from->K == K) {
+        if (in_from && in_from->mx == mx && in_from->i8g == i8g && !in_from->a4 && in_from->q8 && in_from->K == K) {
             q8 = in_from->q8;
             s8 = in_from->s8;
             shared_in = true;
@@ -288,6 +311,10 @@ inline void G3Linear::step(RadCtx* c, rad_buf a, rad_buf y, int64_t T) const {
         if (!shared_in)
             RAD_ISSUE_N(c, op_q, T, brows(a, T), brows(q8, T), brows(s8, T), RAD_NONE);
         gemm(c, y, T);
+    } else if (a4 && T <= a4_split) {
+        RAD_ISSUE_N(c, op_a16, T, brows(a, T), brows(a16, T));
+        RAD_ISSUE_N(c, op_dec, T, brows(a16, T), RAD_NONE, RAD_W(w), RAD_W(ws), brows(y, T),
+                    RAD_NONE, RAD_NONE);
     } else if (i8g || mx || a4) {
         /* quant_act_i8g / quant_act_fp8 take x, q, scale: no optional `asum`. */
         if (!shared_in)
@@ -308,6 +335,12 @@ inline void G3Linear::gemm_rows(RadCtx* c, rad_buf y, int64_t r0, int64_t n) con
 }
 
 inline void G3Linear::step_rows(RadCtx* c, rad_buf a, rad_buf y, int64_t r0, int64_t n) const {
+    if (a4 && n <= a4_split) {
+        RAD_ISSUE_N(c, op_a16, n, brow_slice(a, r0, n, K), brows(a16, n));
+        RAD_ISSUE_N(c, op_dec, n, brows(a16, n), RAD_NONE, RAD_W(w), RAD_W(ws),
+                    brow_slice(y, r0, n, N), RAD_NONE, RAD_NONE);
+        return;
+    }
     if (!shared_in)
         RAD_ISSUE_N(c, op_q, n, brow_slice(a, r0, n, K), brow_slice(q8, r0, n, K),
                     brow_slice(s8, r0, n, K / RAD_FP8_BLOCK));
