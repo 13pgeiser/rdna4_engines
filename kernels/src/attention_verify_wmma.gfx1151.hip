@@ -28,10 +28,12 @@
 //     O *= alpha and O = WMMA(P, V^T, O) with V^T dequantised once into LDS
 //     for all fragments. The final O * (1/l) goes straight to `out`.
 //
-// Fragments: a fragment is 16 (head, row) pairs of one kv head's 6 heads x
-// the row group's rows. `packed == 0` keeps the reference fragment exactly
-// (fragment = one head, fragment row = query row, 6 fragments); `packed == 1`
-// packs pair p -> (head p / rows, row p % rows), ceil(6*rows/16) fragments.
+// Fragments: a fragment is 16 (head, row) pairs of one kv head's `group`
+// heads (4 or 6) x the row group's rows. `packed == 0` keeps the reference
+// fragment exactly (fragment = one head, fragment row = query row, `group`
+// fragments); `packed == 1` packs pair p -> (head p / rows, row p % rows),
+// ceil(group*rows/16) fragments. The scratch keeps VW_NFMAX fragment slots
+// per (row group, kv head) whatever the group.
 // Every WMMA output element depends only on its own A row, B column and C
 // element, so both layouts reproduce the reference bits; the oracle proves it.
 // Row group rg = reference query tile rg (rows 16rg .. 16rg+15), so every row
@@ -54,11 +56,11 @@ typedef float __attribute__((ext_vector_type(8))) vw_float8;
 typedef float __attribute__((ext_vector_type(4))) vw_float4;
 
 #define VW_HD 256
-#define VW_GROUP 6
+#define VW_GROUP_MAX 6                 // q heads per kv head (kernarg `group`)
 #define VW_NT 16                       // keys per tile (reference N_TILE)
 #define VW_MT 16                       // rows per fragment (reference M_TILE)
 #define VW_DC (VW_HD / 16)             // 16-dim chunks
-#define VW_NFMAX 6                     // fragments per (kv head, row group)
+#define VW_NFMAX VW_GROUP_MAX          // fragments per (kv head, row group)
 #define VW_THREADS (VW_NFMAX * 32)
 #define VW_BLK 34
 #define VW_SEG (VW_HD / 32 * VW_BLK)   // bytes of one (key, kv head): 272
@@ -91,17 +93,19 @@ struct VwGroup {
     int q_base;   // first global row of the row group
     int rows;     // rows in the row group (1..16)
     int pack;     // pair stride: 16 (reference layout) or rows (packed)
+    int group;    // q heads per kv head
     int nf;       // fragments
     int seq_len;  // reference seq_len: max position of the row group + 1
 };
 
 __device__ __forceinline__ VwGroup vw_group(const int* __restrict__ positions, int n_rows, int rg,
-                                            int packed) {
+                                            int packed, int group) {
     VwGroup g;
     g.q_base = rg * VW_MT;
     g.rows = min(VW_MT, n_rows - g.q_base);
     g.pack = packed ? g.rows : VW_MT;
-    g.nf = (VW_GROUP * g.pack + VW_MT - 1) / VW_MT;
+    g.group = group;
+    g.nf = (group * g.pack + VW_MT - 1) / VW_MT;
     int s = 0;
     for (int r = 0; r < g.rows; ++r) s = max(s, positions[g.q_base + r] + 1);
     g.seq_len = s;
@@ -112,7 +116,7 @@ __device__ __forceinline__ VwGroup vw_group(const int* __restrict__ positions, i
 __device__ __forceinline__ bool vw_pair(const VwGroup& g, int p, int& hl, int& r) {
     hl = p / g.pack;
     r = p - hl * g.pack;
-    return hl < VW_GROUP && r < g.rows;
+    return hl < g.group && r < g.rows;
 }
 
 __device__ __forceinline__ float vw_code(unsigned int w, int i) {
@@ -142,13 +146,13 @@ extern "C" __launch_bounds__(VW_THREADS)
 __global__ void attention_verify_wmma_qk_gfx1151(
     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
     const int* __restrict__ positions, _Float16* __restrict__ s_scr, int n_rows, int n_kv_heads,
-    int t_stride, int packed, float scale_attn) {
+    int group, int t_stride, int packed, float scale_attn) {
     __shared__ __attribute__((aligned(16))) _Float16 k_lds[2 * VW_NT * VW_KS];
 
     const int n_rg = (n_rows + VW_MT - 1) / VW_MT;
     const int kv = (int)blockIdx.x / n_rg;
     const int rg = (int)blockIdx.x - kv * n_rg;
-    const VwGroup g = vw_group(positions, n_rows, rg, packed);
+    const VwGroup g = vw_group(positions, n_rows, rg, packed, group);
     const int n_tiles = min((g.seq_len + VW_NT - 1) / VW_NT, t_stride);
     const int split = (int)blockIdx.y;
     const int n_split = (int)gridDim.y;
@@ -161,7 +165,7 @@ __global__ void attention_verify_wmma_qk_gfx1151(
     const int half = lane & 15;
     const int half_id = lane >> 4;
     const bool active = wave < g.nf;
-    const int n_heads = n_kv_heads * VW_GROUP;
+    const int n_heads = n_kv_heads * group;
     const int q_stride = n_heads * VW_HD;
     const unsigned row_stride = (unsigned)n_kv_heads * VW_SEG;
     const unsigned head_off = (unsigned)kv * VW_SEG;
@@ -180,7 +184,7 @@ __global__ void attention_verify_wmma_qk_gfx1151(
         const bool ok = active && vw_pair(g, wave * VW_MT + half, hl, r);
         const auto q_rsrc = __builtin_amdgcn_make_buffer_rsrc(
             (void*)q, 0, (int)((unsigned)n_rows * (unsigned)q_stride * 4u), VW_RSRC);
-        const unsigned q_off = ok ? ((unsigned)(g.q_base + r) * (unsigned)q_stride + (unsigned)(kv * VW_GROUP + hl) * VW_HD) * 4u
+        const unsigned q_off = ok ? ((unsigned)(g.q_base + r) * (unsigned)q_stride + (unsigned)(kv * group + hl) * VW_HD) * 4u
                                   : 0x7ff00000u;
 #pragma unroll
         for (int dc = 0; dc < VW_DC; ++dc) {
@@ -384,7 +388,7 @@ template <int DCW, bool SPLIT, int PD>
 __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
                                       const int* __restrict__ positions,
                                       const _Float16* __restrict__ s_scr, float* __restrict__ out,
-                                      int n_rows, int n_kv_heads, int t_stride, int packed) {
+                                      int n_rows, int n_kv_heads, int group, int t_stride, int packed) {
     constexpr int DW = DCW * 16;           // dims owned
     constexpr int VUNITS = VW_NT * DW / 8; // 8-dim V chunks per tile (32 * DCW)
     __shared__ __attribute__((aligned(16))) _Float16 v_lds[2 * DW * VW_VS];
@@ -393,7 +397,7 @@ __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
     const int kv = (int)blockIdx.x / n_rg;
     const int rg = (int)blockIdx.x - kv * n_rg;
     const int d0 = (int)blockIdx.y * DW;
-    const VwGroup g = vw_group(positions, n_rows, rg, packed);
+    const VwGroup g = vw_group(positions, n_rows, rg, packed, group);
     const int n_tiles = min((g.seq_len + VW_NT - 1) / VW_NT, t_stride);
 
     const int tid = (int)threadIdx.x;
@@ -402,7 +406,7 @@ __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
     const int half = lane & 15;
     const int half_id = lane >> 4;
     const bool active = wave < g.nf;
-    const int n_heads = n_kv_heads * VW_GROUP;
+    const int n_heads = n_kv_heads * group;
     const int q_stride = n_heads * VW_HD;
     const unsigned row_stride = (unsigned)n_kv_heads * VW_SEG;
     const auto v_rsrc = __builtin_amdgcn_make_buffer_rsrc(
@@ -489,7 +493,7 @@ __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
         int hj, rj;
         if (!vw_pair(g, wave * VW_MT + 2 * j + half_id, hj, rj)) continue;
         const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-        float* orow = out + (size_t)(g.q_base + rj) * q_stride + (size_t)(kv * VW_GROUP + hj) * VW_HD + d0 + half;
+        float* orow = out + (size_t)(g.q_base + rj) * q_stride + (size_t)(kv * group + hj) * VW_HD + d0 + half;
 #pragma unroll
         for (int dc = 0; dc < DCW; ++dc) orow[dc * 16] = o[dc][j] * inv;
     }
@@ -499,11 +503,11 @@ __device__ __forceinline__ void vw_pv(const unsigned char* __restrict__ v_cache,
     extern "C" __launch_bounds__(VW_THREADS) __global__ void attention_verify_wmma_pv##DCW##SFX##_d##PD##_gfx1151( \
         const unsigned char* __restrict__ v_cache, const int* __restrict__ positions,                 \
         const _Float16* __restrict__ s_scr, float* __restrict__ out, int n_rows, int n_kv_heads,      \
-        int t_stride, int packed) {                                                                   \
-        vw_pv<DCW, SPLIT, PD>(v_cache, positions, s_scr, out, n_rows, n_kv_heads, t_stride, packed);  \
+        int group, int t_stride, int packed) {                                                        \
+        vw_pv<DCW, SPLIT, PD>(v_cache, positions, s_scr, out, n_rows, n_kv_heads, group, t_stride, packed); \
     }
 // The two P.V walkers kept from the Halo geometry sweep (24 variants of
 // DCW 1/2/4 x SPLIT x PD 1/2/4/8): pv1s_d4 wins at B 1..4 (1-3 fragments),
-// pv2_d2 at B 16 (6 fragments). The host picks by fragment count.
+// pv2_d2 at B 16 (6 fragments; GQA 6). The host picks by fragment count.
 VW_PV_ENTRY(1, true, s, 4)
 VW_PV_ENTRY(2, false, , 2)

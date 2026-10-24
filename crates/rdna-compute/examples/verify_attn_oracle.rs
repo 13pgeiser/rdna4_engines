@@ -43,18 +43,32 @@
 //   bench_rows                Q8 eager: multi-row R4/R8 vs VerifyAttn wall-clock
 //                             (gfx1100: its R4/R8 twin; gfx1201: the tile twin).
 //   sweep                     (gfx1151) candidate wall-clock per launch geometry.
+// VA_NH=16 runs every mode at 16 q heads / 4 kv heads (GQA 4, Qwen3.5-9B;
+// gfx1151 WMMA twin only); default 24.
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
 use rdna_compute::attention::{VerifyKv, VerifyWmmaGeometry, VerifyWmmaPv};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
-const NH: usize = 24;
+/// Q heads: `VA_NH` (default 24, the H2 GQA 6 shape; 16 = Qwen3.5-9B GQA 4,
+/// gfx1151 only).
+static NH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("VA_NH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24)
+});
+fn nh() -> usize {
+    *NH
+}
 const NKV: usize = 4;
 const HD: usize = 256;
 const TILE: usize = 128;
 const STRIDE: usize = 2 + HD;
-const QDIM: usize = NH * HD;
+fn qdim() -> usize {
+    nh() * HD
+}
 /// Guard elements on each side of the output view and after the partials view.
 const GUARD: usize = 4096;
 const POS_GUARD: i32 = 0x3fff_ffff;
@@ -224,7 +238,7 @@ impl Case {
         if self.wmma.is_some() {
             self.wmma_scratch_bytes() / 4
         } else {
-            self.partial_rows * NH * self.max_tiles() * STRIDE
+            self.partial_rows * nh() * self.max_tiles() * STRIDE
         }
     }
     /// f16 S tiles of the gfx1151 twin: row groups x kv heads x 6 x key tiles x 512 B.
@@ -265,20 +279,20 @@ struct Bufs {
 impl Bufs {
     fn new(gpu: &mut Gpu, c: &Case, seed: u64) -> Bufs {
         let mut rng = Rng(seed);
-        let mut qh = vec![0f32; c.b * QDIM + GUARD];
+        let mut qh = vec![0f32; c.b * qdim() + GUARD];
         for (i, x) in qh.iter_mut().enumerate() {
-            *x = if i >= c.b * QDIM {
+            *x = if i >= c.b * qdim() {
                 f32::NAN
             } else {
                 // Rows alternate between ordinary and 12x-scaled queries so
                 // some tiles run their softmax deep into expf underflow.
-                let row = i / QDIM;
+                let row = i / qdim();
                 let amp = if row % 3 == 2 { 12.0 } else { 1.0 };
                 (rng.unit() * 2.0 - 1.0) * amp
             };
         }
         let q_full = gpu.upload_f32(&qh, &[qh.len()]).expect("q");
-        let q = q_full.sub_offset(0, c.b * QDIM);
+        let q = q_full.sub_offset(0, c.b * qdim());
         let kh = fill_kv(c.kv, &mut rng, c.valid(), c.cap);
         let vh = fill_kv(c.kv, &mut rng, c.valid(), c.cap);
         let k = gpu.upload_raw(&kh, &[kh.len()]).expect("k");
@@ -288,9 +302,9 @@ impl Bufs {
         let pb: Vec<u8> = posh.iter().flat_map(|p| p.to_ne_bytes()).collect();
         let pos = gpu.upload_raw(&pb, &[posh.len()]).expect("pos");
         let out_full = gpu
-            .zeros(&[c.b * QDIM + 2 * GUARD], DType::F32)
+            .zeros(&[c.b * qdim() + 2 * GUARD], DType::F32)
             .expect("out");
-        let out = out_full.sub_offset(GUARD, c.b * QDIM);
+        let out = out_full.sub_offset(GUARD, c.b * qdim());
         let part_full = gpu
             .zeros(&[c.partials_len() + GUARD], DType::F32)
             .expect("partials");
@@ -348,7 +362,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.v,
                     &bf.out,
                     &bf.pos,
-                    NH,
+                    nh(),
                     NKV,
                     HD,
                     c.max_ctx_len(),
@@ -365,7 +379,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
                 HD,
                 c.max_ctx_len(),
@@ -387,7 +401,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
                 HD,
                 c.max_ctx_len(),
@@ -403,7 +417,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
                 HD,
                 c.max_ctx_len(),
@@ -427,7 +441,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
                 HD,
                 c.max_ctx_len(),
@@ -447,7 +461,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.v,
                     &bf.out,
                     &bf.pos,
-                    NH,
+                    nh(),
                     NKV,
                     HD,
                     c.cap,
@@ -466,7 +480,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.v,
                     &bf.out,
                     &bf.pos,
-                    NH,
+                    nh(),
                     NKV,
                     HD,
                     c.cap,
@@ -508,7 +522,7 @@ fn as_f32(b: &[u8]) -> Vec<f32> {
 }
 
 fn out_view(c: &Case, full: &[u8]) -> Vec<f32> {
-    as_f32(&full[GUARD * 4..(GUARD + c.b * QDIM) * 4])
+    as_f32(&full[GUARD * 4..(GUARD + c.b * qdim()) * 4])
 }
 
 /// Byte ranges of the partials the reference writes (tiles below each row's
@@ -533,8 +547,8 @@ fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
             };
             let seq = c.start() + off + last + 1;
             let nt = seq.div_ceil(TILE).min(mt);
-            for h in 0..NH {
-                let base = ((lr * NH + h) * mt) * STRIDE * 4;
+            for h in 0..nh() {
+                let base = ((lr * nh() + h) * mt) * STRIDE * 4;
                 r.push((base, base + nt * STRIDE * 4));
             }
         }
@@ -774,7 +788,7 @@ fn wmma_live_s(c: &Case) -> Vec<(usize, usize)> {
     for rg in 0..c.b.div_ceil(16) {
         let rows = (c.b - 16 * rg).min(16);
         let pack = if geom.packed { rows } else { 16 };
-        let nf = (6 * pack).div_ceil(16);
+        let nf = (nh() / NKV * pack).div_ceil(16);
         let n_tiles = (c.start() + 16 * rg + rows).div_ceil(16).min(t_stride);
         for kv in 0..NKV {
             for f in 0..nf {
@@ -793,7 +807,7 @@ fn describe_out(what: &str, a: &[u8], b: &[u8]) -> String {
         None => format!("{what}=0"),
         Some(i) => {
             let e = i / 4;
-            let (row, rem) = (e / QDIM, e % QDIM);
+            let (row, rem) = (e / qdim(), e % qdim());
             let got = f32::from_ne_bytes(a[e * 4..e * 4 + 4].try_into().unwrap());
             let want = f32::from_ne_bytes(b[e * 4..e * 4 + 4].try_into().unwrap());
             format!(
@@ -934,7 +948,7 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
                     .all(|(a, b)| a.to_bits() == b.to_bits());
                 // Guards keep this launch's poison byte.
                 let guard_ok = co[..GUARD * 4].iter().all(|&x| x == byte)
-                    && co[(GUARD + c.b * QDIM) * 4..].iter().all(|&x| x == byte);
+                    && co[(GUARD + c.b * qdim()) * 4..].iter().all(|&x| x == byte);
                 // Written partials equal the reference's (gfx1151: the S-tile
                 // scratch may hold anything); the rest keeps the poison.
                 let part_ok = c.wmma.is_some() || ranges.iter().all(|&(s, e)| cp[s..e] == rp[s..e]);
@@ -943,7 +957,7 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
                     .zip(&covered)
                     .filter(|&(&x, &cov)| !cov && x != byte)
                     .count();
-                let outb = co[GUARD * 4..(GUARD + c.b * QDIM) * 4].to_vec();
+                let outb = co[GUARD * 4..(GUARD + c.b * qdim()) * 4].to_vec();
                 let (first_ok, s_ok) = match &first {
                     None => {
                         first = Some((
@@ -1263,7 +1277,7 @@ fn bench_rows(gpu: &mut Gpu) {
                                 &bf.v,
                                 &bf.out,
                                 &bf.pos,
-                                NH,
+                                nh(),
                                 NKV,
                                 HD,
                                 c.max_ctx_len(),

@@ -3919,6 +3919,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     }
     if arch == "gfx1151" {
         add!(
+            "attention_dflash_wmma_kvsplit_gfx1151",
+            kernels::ATTENTION_DFLASH_WMMA_KVSPLIT_GFX1151_SRC,
+            ["attention_dflash_wmma_kvsplit_gfx1151"]
+        );
+        add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,
             ["attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",]
