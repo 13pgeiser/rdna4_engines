@@ -1373,7 +1373,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.fuse_mx_ar = ar;
     }
     /* ---- the weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h). Only at
-     * more than one rank; RADIANCE_PREFETCH=0 declares none (decl_prefetch). */
+     * more than one rank; RADIANCE_PREFETCH_BESIDE=0 issues none (prefetch_beside). */
     if (g.world > 1 && rad_op_declared(b, "prefetch")) {
         for (int64_t l = 0; l < g.n_layer; ++l) {
             Layer& lay = m.layers[(size_t)l];

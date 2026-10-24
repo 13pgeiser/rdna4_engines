@@ -1052,7 +1052,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * so the GEMM behind it has its weight's leading bytes read into the on-die cache there: gate_up
      * behind the mixer's reduction, the next layer's first projection (the delta net's in-projection,
      * an attention layer's q|gate) behind the feed-forward's. Only at more than one rank;
-     * RADIANCE_PREFETCH=0 declares none (decl_prefetch). */
+     * RADIANCE_PREFETCH_BESIDE=0 issues none (prefetch_beside). */
     if (g.world > 1 && rad_op_declared(b, "prefetch")) {
         for (int64_t l = 0; l < m.n_main; ++l) {
             Layer& lay = m.layers[(size_t)l];
