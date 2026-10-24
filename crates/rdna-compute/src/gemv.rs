@@ -15935,6 +15935,15 @@ impl Gpu {
         )
     }
 
+    /// The wave32 indexed HFQ4/MQ4 gate_up kernels compile the group tail out
+    /// (`tail = 0`, ec9ec35e6) and read only whole quads of 256-wide groups;
+    /// K2816 has its own fixed-tail build. Any other K with K/256 % 4 != 0
+    /// must take the batched kernel, which keeps the tail. MiniMax tiny
+    /// (K512, no whole quad) otherwise wrote all-zero gate/up (HIPF-92).
+    pub(crate) fn hfq4_gate_up_indexed_drops_tail(&self, k: usize) -> bool {
+        !self.arch_caps.is_wave64_native() && (k / 256) % 4 != 0 && k != 2_816
+    }
+
     /// Index-aware MoE gate_up GEMV. Reads expert_ids from a device-side
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.
@@ -15958,6 +15967,19 @@ impl Gpu {
         k: usize,
         n_ranks: usize,
     ) -> HipResult<()> {
+        if self.hfq4_gate_up_indexed_drops_tail(k) {
+            return self.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                expert_ptrs,
+                topk_indices,
+                x,
+                y_gate,
+                y_up,
+                m,
+                k,
+                n_ranks,
+                1,
+            );
+        }
         self.bind_thread()?;
         let gfx1151_persistent_rank8 = self.arch_caps.is_gfx1151()
             && k == 2_048
