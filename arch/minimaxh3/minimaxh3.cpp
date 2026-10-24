@@ -910,9 +910,9 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             const char* bn = nm.f("%s.bias", base);
             RAD_ARCH_TRY(map_rows(b, wn, { { src_w, (int)(md * ada_rows), ada_rows } }));
             RAD_ARCH_TRY(map_rows(b, bn, { { src_b, (int)(md * ada_rows), ada_rows } }));
-            B.ada[md].mapped = true;
+            /* The row slice is mapped above (DenseFP8 takes that as its argument). */
             RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
-                                           grp_layer(grp), { src_w }));
+                                           grp_layer(grp), { src_w }, {}, true));
             B.ada_b[md] = decl_w(b, bn, RAD_BF16, { m.Ws }, acc, RAD_SHARD_ROW, grp_layer(grp));
             if (!B.ada_b[md]) return RAD_E_INVAL;
             B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",

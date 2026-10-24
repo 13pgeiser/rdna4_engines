@@ -1563,8 +1563,6 @@ struct DenseFP8 {
      * works against the same E4M3 activation pair. */
     rad_weight ref = 0;
     bool       mx = false;
-    /* The caller made the name map (a row range of a checkpoint tensor); declare() does not. */
-    bool       mapped = false;
 
     /* `mapped`: the caller made the name map already, to ask the encoding before choosing this
      * struct over another grid's -- a COPY map declared twice is refused (rad_builder.cpp). */
