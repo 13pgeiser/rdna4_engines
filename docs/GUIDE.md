@@ -997,6 +997,19 @@ this family). Absent or `0`, nothing streams.
   `/metrics` carries `kv_resident_blocks`, `kv_stream_misses_total` and
   `kv_stream_bytes_total`.
 
+Which models can stream, and with which KV cache:
+
+| model (arch id) | streams | KV dtypes | notes |
+|---|---|---|---|
+| Qwen3.8-Flash-Next (`qwen4exp_fp8`) | **yes** | bf16, fp8 | sparse QSA; the measured path |
+| GLM-5.3-Flash (`glm5next`) | **yes** | bf16, fp8 | sparse MLA + DSA; declare/issue pinned, not served here (no weights) |
+| Qwen3.5/3.6/3.8 dense (`qwen35_bf16`, `qwen35_fp8`, `qwen35_w8a8`, `qwen35moe_fp8`) | no | — | dense attention reads the whole history every step |
+| all other architectures | no | — | no streamed store and no `kv_resolve` |
+
+The capability is one bit, `RadArchProbe::kv_stream_ok` (`abi/rad_builder.h`), set by the plugin's
+`probe` and read only in `Builder::op_declared` through `kvstream_op_gated`
+(`core/kvstream/bringup.cpp`); `docs/KV-STREAMING.md` §4.5 has the mechanics.
+
 **Measured.** One model, fp8 cache, one machine (2x16 GB, gfx1201), one request, two cold starts a
 configuration, 2 048 tokens decoded:
 
