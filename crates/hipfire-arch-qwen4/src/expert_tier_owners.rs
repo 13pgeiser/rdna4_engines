@@ -508,6 +508,9 @@ pub struct ExpertTierBinding {
     /// by the loader after materialization.
     hotset_sidecar_sha256: std::sync::OnceLock<String>,
     logical_digest: [u8; 32],
+    /// Set while one forward owns the donor tail's borrow protocol
+    /// ([`ExpertTierLease::claim_decode_share`]).
+    decode_share_claimed: std::sync::atomic::AtomicBool,
 }
 
 /// Cheap shared retention of a frozen materialized model binding.
@@ -618,6 +621,25 @@ impl ExpertTierLease {
         self.binding.view_digest(view)
     }
 
+    /// Claim the donor tail for one forward: while the claim lives, no other
+    /// forward may borrow it (two forwards would dirty the same bytes under
+    /// each other's loan state). `Err` when the lease carries no donor tail or
+    /// is already claimed. Dropping the claim releases it and retains the
+    /// lease, so the owners outlive every GPU use the claimant made.
+    pub fn claim_decode_share(&self) -> Result<DecodeShareClaim, String> {
+        if self.binding.decode_share.is_none() {
+            return Err("the tier lease carries no decode-share donor tail".to_string());
+        }
+        if !self.binding.try_claim_decode_share() {
+            return Err(
+                "the decode-share donor tail is already claimed by another forward".to_string(),
+            );
+        }
+        Ok(DecodeShareClaim {
+            lease: self.clone(),
+        })
+    }
+
     /// Debug/gate oracle: synchronize the device, copy the first
     /// `prefix_bytes` of the donor tail back in bounded chunks and compare
     /// them byte-for-byte with the pinned mirror. Returns the SHA-256 of the
@@ -666,6 +688,23 @@ impl ExpertTierLease {
     }
 }
 
+/// Exclusive ownership of a lease's donor tail ([`ExpertTierLease::claim_decode_share`]).
+pub struct DecodeShareClaim {
+    lease: ExpertTierLease,
+}
+
+impl DecodeShareClaim {
+    pub fn lease(&self) -> &ExpertTierLease {
+        &self.lease
+    }
+}
+
+impl Drop for DecodeShareClaim {
+    fn drop(&mut self) {
+        self.lease.binding.release_decode_share_claim();
+    }
+}
+
 /// Which expert table set a read goes through.
 ///
 /// `Resident` is the canonical placement: every table entry points at the
@@ -679,6 +718,23 @@ pub enum ExpertReadView {
 }
 
 impl ExpertTierBinding {
+    /// Take the donor-tail claim; `false` when it is already held.
+    fn try_claim_decode_share(&self) -> bool {
+        self.decode_share_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn release_decode_share_claim(&self) {
+        self.decode_share_claimed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// Digest of one read view; `None` for `BorrowPrefill` without donors.
     fn view_digest(&self, view: ExpertReadView) -> Option<[u8; 32]> {
         match view {
@@ -1620,6 +1676,7 @@ fn materialize_impl<'src>(
     };
     let binding = Arc::new(ExpertTierBinding {
         hotset_sidecar_sha256: std::sync::OnceLock::new(),
+        decode_share_claimed: std::sync::atomic::AtomicBool::new(false),
         owner_ranges,
         host_cpu_range: owners
             .host
@@ -2890,7 +2947,20 @@ mod decode_share_tests {
             host_cpu_range: None,
             generation: 1,
             hotset_sidecar_sha256: std::sync::OnceLock::new(),
+            decode_share_claimed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn decode_share_claim_is_exclusive_and_released() {
+        let binding = fake_binding(shared_plan());
+        assert!(binding.try_claim_decode_share());
+        assert!(!binding.try_claim_decode_share(), "a second claim refuses");
+        binding.release_decode_share_claim();
+        assert!(
+            binding.try_claim_decode_share(),
+            "released claims can be retaken"
+        );
     }
 
     #[test]

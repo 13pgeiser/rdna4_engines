@@ -8139,9 +8139,28 @@ fn tile_moe_of<'a, T>(borrow_active: bool, resident: &'a [T], borrowed: &'a [T])
     }
 }
 
-/// Whether the decode-share `bank` mode (owned test backing) is requested.
-fn decode_share_bank_requested() -> bool {
-    crate::decode_share::DecodeShareMode::from_env() == crate::decode_share::DecodeShareMode::Bank
+/// Whether the mode runs scratch banks: `bank` over an owned test backing,
+/// `fixed` and `on` over the real donor tail.
+fn decode_share_banks_requested(mode: crate::decode_share::DecodeShareMode) -> bool {
+    use crate::decode_share::DecodeShareMode;
+    matches!(
+        mode,
+        DecodeShareMode::Bank | DecodeShareMode::Fixed | DecodeShareMode::On
+    )
+}
+
+/// A call's own result merged with the result of its decode-share epilogue:
+/// the call's error comes first and keeps its text; a failed epilogue
+/// (restore or recovery) is appended, or reported when the call succeeded.
+fn merge_share_result(
+    result: Result<(), Qwen4GpuForwardError>,
+    epilogue: Result<(), Qwen4GpuForwardError>,
+) -> Result<(), Qwen4GpuForwardError> {
+    match (result, epilogue) {
+        (Ok(()), epilogue) => epilogue,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(extra)) => Err(invalid(format!("{error}; {extra}"))),
+    }
 }
 
 /// Why a load cannot take the decode-share scratch banks, `None` when the
@@ -8197,15 +8216,28 @@ fn prompt_chunk_rows_of(
 
 /// Memory the prefill banks of a decode-share load view.
 enum DecodeShareBacking {
-    /// S4: an owned device buffer of the largest class's span (a correctness
-    /// mode, charged nowhere). S5 adds the donor tail of expert VRAM.
+    /// `bank` mode: an owned device buffer of the largest class's span (a
+    /// correctness mode, charged nowhere).
     Owned(GpuTensor),
+    /// `fixed` / `on`: the real donor tail of the expert owner, borrowed under
+    /// the loan controller ([`DonorLoan`]). Nothing is allocated or written
+    /// at attach.
+    Donor { base: usize, bytes: usize },
 }
 
 impl DecodeShareBacking {
     fn base(&self) -> usize {
         match self {
             Self::Owned(tensor) => tensor.buf.as_ptr() as usize,
+            Self::Donor { base, .. } => *base,
+        }
+    }
+
+    /// Bytes the banks may span.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Owned(tensor) => tensor.buf.size(),
+            Self::Donor { bytes, .. } => *bytes,
         }
     }
 }
@@ -8241,6 +8273,8 @@ pub(crate) struct DecodeShareBanks {
     /// Persistent `TokenIds` of `max_chunk` rows every bank views.
     token_ids: GpuTensor,
     backing: DecodeShareBacking,
+    /// The donor-tail loan (`fixed` / `on`); `None` over an owned test backing.
+    loan: Option<DonorLoan>,
     /// Largest span of the classes used since the last restore (S5 restores
     /// this prefix of the donor tail).
     dirty_bytes: u64,
@@ -8270,8 +8304,9 @@ impl DecodeShareBanks {
         }
     }
 
-    /// Free the persistent token ids and the owned backing; the prefill banks
-    /// own nothing. The resident bank is freed by its forward.
+    /// Free the persistent token ids, the owned backing and the loan's
+    /// resources; the prefill banks own nothing. The resident bank is freed by
+    /// its forward. A donor tail is never freed here (the lease owns it).
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
         for bank in self.banks.into_iter().flatten().chain(self.parked) {
@@ -8279,9 +8314,217 @@ impl DecodeShareBanks {
                 first.get_or_insert(error);
             }
         }
-        let DecodeShareBacking::Owned(backing) = self.backing;
-        for tensor in [backing, self.token_ids] {
+        if let Some(loan) = self.loan {
+            if let Some(error) = loan.release(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        let owned = match self.backing {
+            DecodeShareBacking::Owned(backing) => Some(backing),
+            DecodeShareBacking::Donor { .. } => None,
+        };
+        for tensor in owned.into_iter().chain(std::iter::once(self.token_ids)) {
             if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
+/// The restore stream and its two events (compute -> restore handoff, restore
+/// completion).
+struct LoanHw {
+    stream: hip_bridge::Stream,
+    ready: hip_bridge::Event,
+    done: hip_bridge::Event,
+}
+
+/// The donor-tail loan of a `fixed` / `on` load: the exclusive lease claim, the
+/// dedicated restore stream and events (created at attach, destroyed at free)
+/// and the state machine ([`crate::decode_share_loan::LoanController`]).
+pub(crate) struct DonorLoan {
+    controller: crate::decode_share_loan::LoanController,
+    claim: crate::expert_tier_owners::DecodeShareClaim,
+    hw: LoanHw,
+    /// Device base of the donor tail and its byte extent.
+    base: usize,
+    bytes: usize,
+    /// Pinned CPU address of the tail's mirror.
+    mirror_cpu: usize,
+    /// `HIPFIRE_QWEN4_DECODE_SHARE_VERIFY=1`: re-verify the tail after every restore.
+    verify: bool,
+}
+
+/// [`crate::decode_share_loan::LoanOps`] over one forward's device.
+struct GpuLoanOps<'a> {
+    gpu: &'a mut Gpu,
+    claim: &'a crate::expert_tier_owners::DecodeShareClaim,
+    hw: &'a LoanHw,
+    base: usize,
+    bytes: usize,
+    mirror_cpu: usize,
+    verify: bool,
+}
+
+impl GpuLoanOps<'_> {
+    /// A non-owning view of `[offset, offset + len)` of the donor tail.
+    fn tail(&self, offset: u64, len: u64) -> Result<hip_bridge::DeviceBuffer, String> {
+        let (offset, len) = (
+            usize::try_from(offset).map_err(|_| "donor offset overflows".to_string())?,
+            usize::try_from(len).map_err(|_| "donor length overflows".to_string())?,
+        );
+        if offset.checked_add(len).map_or(true, |end| end > self.bytes) {
+            return Err(format!(
+                "donor range [{offset}, +{len}) exceeds the {}-byte donor tail",
+                self.bytes
+            ));
+        }
+        // SAFETY: the range lies inside the donor tail the claimed lease owns
+        // for this forward's life; the buffer is a `Borrowed` alias that no
+        // free path ever receives.
+        Ok(unsafe {
+            hip_bridge::DeviceBuffer::from_raw((self.base + offset) as *mut std::ffi::c_void, len)
+        })
+    }
+
+    /// The first `len` bytes of the pinned mirror.
+    fn mirror(&self, len: u64) -> Result<&[u8], String> {
+        let len = usize::try_from(len).map_err(|_| "mirror length overflows".to_string())?;
+        if len > self.bytes {
+            return Err(format!(
+                "mirror range +{len} exceeds the {}-byte tail",
+                self.bytes
+            ));
+        }
+        // SAFETY: `mirror_cpu` designates `bytes` bytes of the pinned host owner
+        // the claimed lease keeps alive; nothing writes the mirror after
+        // materialization.
+        Ok(unsafe { std::slice::from_raw_parts(self.mirror_cpu as *const u8, len) })
+    }
+
+    fn compute(&self) -> Result<&hip_bridge::Stream, String> {
+        self.gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "decode-share needs the compute stream".to_string())
+    }
+}
+
+impl crate::decode_share_loan::LoanOps for GpuLoanOps<'_> {
+    fn capturing(&mut self) -> Result<bool, String> {
+        match self.gpu.active_stream.as_ref() {
+            Some(stream) => self
+                .gpu
+                .hip
+                .stream_is_capturing(stream)
+                .map_err(|error| error.to_string()),
+            None => Ok(false),
+        }
+    }
+
+    fn memset_zero(&mut self, offset: u64, bytes: u64) -> Result<(), String> {
+        let buf = self.tail(offset, bytes)?;
+        let compute = self.compute()?;
+        self.gpu
+            .hip
+            .memset_async(&buf, 0, buf.size(), compute)
+            .map_err(|error| error.to_string())
+    }
+
+    fn enqueue_restore(&mut self, bytes: u64) -> Result<(), String> {
+        let dst = self.tail(0, bytes)?;
+        let src = self.mirror(bytes)?;
+        let compute = self.compute()?;
+        let hip = &self.gpu.hip;
+        let fail = |error: hip_bridge::HipError| error.to_string();
+        // Everything the compute stream ran so far (the borrowed tile that
+        // dirtied the tail, earlier readers) finishes before the copy lands.
+        hip.event_record(&self.hw.ready, Some(compute))
+            .map_err(fail)?;
+        hip.stream_wait_event(&self.hw.stream, &self.hw.ready)
+            .map_err(fail)?;
+        hip.memcpy_htod_async(&dst, src, &self.hw.stream)
+            .map_err(fail)?;
+        hip.event_record(&self.hw.done, Some(&self.hw.stream))
+            .map_err(fail)?;
+        // Later compute-stream work is ordered after the restore even before
+        // the host waits for it.
+        hip.stream_wait_event(compute, &self.hw.done).map_err(fail)
+    }
+
+    fn wait_restore(&mut self) -> Result<(), String> {
+        self.gpu
+            .hip
+            .event_synchronize(&self.hw.done)
+            .map_err(|error| error.to_string())?;
+        self.gpu
+            .take_device_wait_error()
+            .map_err(|error| error.to_string())
+    }
+
+    fn device_sync(&mut self) -> Result<(), String> {
+        self.gpu
+            .hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())
+    }
+
+    fn blocking_restore(&mut self, bytes: u64) -> Result<(), String> {
+        let dst = self.tail(0, bytes)?;
+        let src = self.mirror(bytes)?;
+        self.gpu
+            .hip
+            .memcpy_htod(&dst, src)
+            .map_err(|error| error.to_string())
+    }
+
+    fn verify(&mut self, bytes: u64) -> Result<(), String> {
+        if !self.verify {
+            return Ok(());
+        }
+        let prefix = usize::try_from(bytes).map_err(|_| "verify prefix overflows".to_string())?;
+        self.claim
+            .lease()
+            .verify_donor_tail(&mut *self.gpu, prefix)
+            .map(|_| ())
+    }
+}
+
+impl DonorLoan {
+    /// Run `f` over the controller and the device operations.
+    fn with_ops<R>(
+        &mut self,
+        gpu: &mut Gpu,
+        f: impl FnOnce(&mut crate::decode_share_loan::LoanController, &mut GpuLoanOps<'_>) -> R,
+    ) -> R {
+        let mut ops = GpuLoanOps {
+            gpu,
+            claim: &self.claim,
+            hw: &self.hw,
+            base: self.base,
+            bytes: self.bytes,
+            mirror_cpu: self.mirror_cpu,
+            verify: self.verify,
+        };
+        f(&mut self.controller, &mut ops)
+    }
+
+    /// Destroy the restore stream and events after proving them idle, then
+    /// release the claim. Call only after a successful teardown restore.
+    fn release(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = gpu.hip.stream_synchronize(&self.hw.stream).err();
+        let LoanHw {
+            stream,
+            ready,
+            done,
+        } = self.hw;
+        for result in [
+            gpu.hip.event_destroy(ready),
+            gpu.hip.event_destroy(done),
+            gpu.hip.stream_destroy(stream),
+        ] {
+            if let Err(error) = result {
                 first.get_or_insert(error);
             }
         }
@@ -9266,17 +9509,84 @@ impl Qwen4GpuForward {
         npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay, rows, mode)
     }
 
-    /// The scratch of a decode-share (`bank`) load: the resident bank, one
-    /// borrowed prefill bank per [`qwen4_decode_share_classes`] class over an
-    /// owned test backing (S4: a correctness mode, charged nowhere), and the
-    /// persistent token ids every bank views. Returns the resident bank, the
-    /// share state and the largest host token/PLE staging vectors.
+    /// Attach the donor-tail loan of a `fixed` / `on` load: claim the lease,
+    /// check the largest class fits the donor span, and create the dedicated
+    /// restore stream and events. Writes nothing into the donor tail.
+    fn attach_donor_loan(
+        gpu: &mut Gpu,
+        lease: &crate::expert_tier_owners::ExpertTierLease,
+        span_bytes: u64,
+    ) -> Result<(DecodeShareBacking, DonorLoan), Qwen4GpuForwardError> {
+        let ranges = lease
+            .decode_share()
+            .ok_or_else(|| invalid("the tier lease carries no decode-share donor tail"))?;
+        let (base, bytes) = ranges.donor_device;
+        let (mirror_cpu, mirror_bytes) = ranges.mirror_cpu;
+        if span_bytes > bytes as u64 || bytes > mirror_bytes {
+            return Err(invalid(format!(
+                "the largest decode-share scratch class needs {span_bytes} bytes but the donor \
+                 tail holds {bytes} (mirror {mirror_bytes})"
+            )));
+        }
+        let claim = lease.claim_decode_share().map_err(invalid)?;
+        gpu.ensure_capture_stream()?;
+        let stream = gpu.hip.stream_create_non_blocking()?;
+        let ready = match gpu
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+        {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = gpu.hip.stream_destroy(stream);
+                return Err(error.into());
+            }
+        };
+        let done = match gpu
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)
+        {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = gpu.hip.event_destroy(ready);
+                let _ = gpu.hip.stream_destroy(stream);
+                return Err(error.into());
+            }
+        };
+        Ok((
+            DecodeShareBacking::Donor { base, bytes },
+            DonorLoan {
+                controller: crate::decode_share_loan::LoanController::new(
+                    crate::decode_share::decode_share_sync_enabled(),
+                    crate::decode_share::decode_share_log_enabled(),
+                ),
+                claim,
+                hw: LoanHw {
+                    stream,
+                    ready,
+                    done,
+                },
+                base,
+                bytes,
+                mirror_cpu,
+                verify: crate::decode_share::decode_share_verify_enabled(),
+            },
+        ))
+    }
+
+    /// The scratch of a decode-share load: the resident bank, one borrowed
+    /// prefill bank per [`qwen4_decode_share_classes`] class, and the
+    /// persistent token ids every bank views. The banks view either an owned
+    /// test backing (`bank` mode, `donor` is `None`; charged nowhere) or the
+    /// real donor tail of `donor` (`fixed` / `on`), borrowed under the loan
+    /// controller. Returns the resident bank, the share state and the largest
+    /// host token/PLE staging vectors.
     fn build_decode_share(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
         scope: &Qwen4BandScope,
+        donor: Option<&crate::expert_tier_owners::ExpertTierLease>,
     ) -> Result<(Qwen4GpuForwardScratch, DecodeShareBanks, Vec<u8>, Vec<u8>), Qwen4GpuForwardError>
     {
         let classes = qwen4_decode_share_classes(max_chunk);
@@ -9311,11 +9621,16 @@ impl Qwen4GpuForward {
             }
         };
         let span_bytes = class_spans.iter().copied().max().unwrap_or(0);
-        let backing = match usize::try_from(span_bytes)
-            .map_err(|_| invalid("decode-share backing bytes overflow"))
-            .and_then(|span| gpu.zeros(&[span], DType::Raw).map_err(Into::into))
-        {
-            Ok(tensor) => DecodeShareBacking::Owned(tensor),
+        let backing = match donor {
+            Some(lease) => Self::attach_donor_loan(gpu, lease, span_bytes)
+                .map(|(backing, loan)| (backing, Some(loan))),
+            None => usize::try_from(span_bytes)
+                .map_err(|_| invalid("decode-share backing bytes overflow"))
+                .and_then(|span| gpu.zeros(&[span], DType::Raw).map_err(Into::into))
+                .map(|tensor| (DecodeShareBacking::Owned(tensor), None)),
+        };
+        let (backing, loan) = match backing {
+            Ok(pair) => pair,
             Err(error) => {
                 let _ = resident.free_gpu(gpu);
                 let _ = gpu.free_tensor(token_ids);
@@ -9331,12 +9646,13 @@ impl Qwen4GpuForward {
             active: None,
             token_ids,
             backing,
+            loan,
             dirty_bytes: 0,
             stats: DecodeShareStats::default(),
             prompt_depth: 0,
         };
         let mut host_token_bytes = vec![0u8; ids_bytes];
-        let (base, span) = (share.backing.base(), span_bytes as usize);
+        let (base, span) = (share.backing.base(), share.backing.bytes());
         let mut failure = None;
         for &rows in &share.classes.clone() {
             match Qwen4GpuForwardScratch::new_borrowed(
@@ -9384,7 +9700,25 @@ impl Qwen4GpuForward {
         check_band_admission(bundle, &scope, single_scope)?;
         let mesh_trunk_ops = mesh_trunk_op_range(&bundle.config, &scope)?;
         let flash_next = bundle.config.profile.is_flash_next();
-        let share_classes = if decode_share_bank_requested() {
+        // Decode-share scratch banks: `bank` over an owned test backing,
+        // `fixed` / `on` over the lease's real donor tail (only when the load
+        // planned one).
+        let share_mode = crate::decode_share::DecodeShareMode::from_env();
+        let donor_lease = bundle
+            .weights
+            .expert_tiers()
+            .filter(|lease| lease.decode_share().is_some());
+        let want_banks = decode_share_banks_requested(share_mode)
+            && (!share_mode.uses_donor_backing() || donor_lease.is_some());
+        if decode_share_banks_requested(share_mode) && !want_banks {
+            eprintln!(
+                "  qwen4 decode-share: {}={} not taken (the load carries no donor tail); \
+                 ordinary single scratch bank",
+                crate::decode_share::DECODE_SHARE_ENV,
+                share_mode.name()
+            );
+        }
+        let share_classes = if want_banks {
             let refusal = decode_share_refusal(
                 &gpu.arch,
                 mode,
@@ -9396,9 +9730,10 @@ impl Qwen4GpuForward {
             );
             if let Some(reason) = refusal {
                 eprintln!(
-                    "  qwen4 decode-share: {}=bank not taken ({reason}); \
+                    "  qwen4 decode-share: {}={} not taken ({reason}); \
                      ordinary single scratch bank",
-                    crate::decode_share::DECODE_SHARE_ENV
+                    crate::decode_share::DECODE_SHARE_ENV,
+                    share_mode.name()
                 );
             }
             refusal.is_none()
@@ -9406,13 +9741,20 @@ impl Qwen4GpuForward {
             false
         };
         let (scratch, host_token_bytes, host_ple_bytes, share) = if share_classes {
+            let donor = donor_lease.filter(|_| share_mode.uses_donor_backing());
             let (scratch, share, host_token_bytes, host_ple_bytes) =
-                Self::build_decode_share(gpu, &bundle.config, max_chunk, mode, &scope)?;
+                Self::build_decode_share(gpu, &bundle.config, max_chunk, mode, &scope, donor)?;
             eprintln!(
-                "  qwen4 decode-share[bank]: {}-row resident bank + prefill banks {:?} over an \
-                 owned test backing of {} MiB (prompt chunk {max_chunk})",
+                "  qwen4 decode-share[{}]: {}-row resident bank + prefill banks {:?} over {} of {} \
+                 MiB (prompt chunk {max_chunk})",
+                share_mode.name(),
                 scratch.max_chunk,
                 share.classes,
+                if donor.is_some() {
+                    "the donor tail"
+                } else {
+                    "an owned test backing"
+                },
                 share.class_spans.iter().copied().max().unwrap_or(0) >> 20
             );
             (scratch, host_token_bytes, host_ple_bytes, Some(share))
@@ -10705,27 +11047,68 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
-    /// Before a prompt tile swaps prefill class `class` in. S4: nothing to
-    /// acquire (the test backing is owned); S5 implements the donor loan state
-    /// machine here.
-    fn share_acquire(&mut self, _gpu: &mut Gpu, _class: usize) -> Result<(), Qwen4GpuForwardError> {
-        Ok(())
+    /// Before a prompt tile swaps prefill class `class` in: the loan
+    /// controller marks the donor tail dirty (and zero-fills the class's span
+    /// growth) before the tile's first write. Refuses before any write under
+    /// a stream capture or a poisoned loan. Nothing over an owned backing.
+    fn share_acquire(&mut self, gpu: &mut Gpu, class: usize) -> Result<(), Qwen4GpuForwardError> {
+        let Some(share) = self.share.as_mut() else {
+            return Ok(());
+        };
+        let span = share.class_spans[class];
+        match share.loan.as_mut() {
+            Some(loan) => loan
+                .with_ops(gpu, |controller, ops| controller.acquire(ops, span))
+                .map_err(invalid),
+            None => Ok(()),
+        }
     }
 
-    /// Before a call that runs on the resident bank (decode, verify, lanes,
-    /// every tile below the resident rows). S4: nothing; S5 waits for or
-    /// enqueues the donor restore here.
+    /// Before a call that runs on the resident bank and the Resident runtimes
+    /// (decode, verify, lanes, every tile below the resident rows): the donor
+    /// tail must be whole, so a dirty tail is restored (enqueued and waited)
+    /// and a pending restore is waited. Runs before the retained-eligibility
+    /// predicate and any replay submit.
     pub(crate) fn share_require_resident(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
     ) -> Result<(), Qwen4GpuForwardError> {
-        Ok(())
+        match self.share.as_mut().and_then(|share| share.loan.as_mut()) {
+            Some(loan) => loan
+                .with_ops(gpu, |controller, ops| controller.require_resident(ops))
+                .map_err(invalid),
+            None => Ok(()),
+        }
     }
 
     /// After every tile, with the resident bank back in `scratch` and whether
-    /// the tile succeeded. S4: nothing.
-    fn share_after_tile(&mut self, _gpu: &mut Gpu, _ok: bool) -> Result<(), Qwen4GpuForwardError> {
-        Ok(())
+    /// the tile succeeded: a failed tile must not leave dirty weights behind
+    /// even if the caller abandons the prompt (blocking recovery). `Err` only
+    /// when that recovery failed (the loan is poisoned).
+    fn share_after_tile(&mut self, gpu: &mut Gpu, ok: bool) -> Result<(), Qwen4GpuForwardError> {
+        match self.share.as_mut().and_then(|share| share.loan.as_mut()) {
+            Some(loan) => loan
+                .with_ops(gpu, |controller, ops| controller.after_tile(ops, ok))
+                .map_err(invalid),
+            None => Ok(()),
+        }
+    }
+
+    /// `Err` naming the reason when the donor loan is poisoned: every forward,
+    /// on any route, refuses.
+    fn share_check(&self) -> Result<(), Qwen4GpuForwardError> {
+        match self.share.as_ref().and_then(|share| share.loan.as_ref()) {
+            Some(loan) => loan.controller.check().map_err(invalid),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the donor tail is whole (always true without a donor loan).
+    fn share_state_resident(&self) -> bool {
+        self.share
+            .as_ref()
+            .and_then(|share| share.loan.as_ref())
+            .map_or(true, |loan| loan.controller.is_resident())
     }
 
     /// A whole-prompt entry begins: nested entries (a driver that issues
@@ -10738,27 +11121,41 @@ impl Qwen4GpuForward {
         }
     }
 
-    /// A whole-prompt entry ends (Ok and Err alike); the outermost one runs
-    /// [`Self::share_finish_prompt`]. No-op without decode-share.
-    pub(crate) fn share_prompt_end(&mut self, gpu: &mut Gpu) -> Result<(), Qwen4GpuForwardError> {
+    /// A whole-prompt entry ends (`ok`: it returned `Ok`); the outermost one
+    /// runs [`Self::share_finish_prompt`]. No-op without decode-share.
+    pub(crate) fn share_prompt_end(
+        &mut self,
+        gpu: &mut Gpu,
+        ok: bool,
+    ) -> Result<(), Qwen4GpuForwardError> {
         let Some(share) = self.share.as_mut() else {
             return Ok(());
         };
         share.prompt_depth = share.prompt_depth.saturating_sub(1);
         if share.prompt_depth == 0 {
-            self.share_finish_prompt(gpu)
+            self.share_finish_prompt(gpu, ok)
         } else {
             Ok(())
         }
     }
 
-    /// The last scratch consumer of a whole prompt has run. S4: nothing; S5
-    /// restores the dirtied prefix of the donor tail from the mirror here.
+    /// The last scratch consumer of a whole prompt has run. A dirty tail of a
+    /// prompt that ended `Ok` gets its restore enqueued on the dedicated
+    /// restore stream (the host wait is deferred to the next call that needs
+    /// the donors, so it overlaps sampling and emission and is not part of
+    /// TTFT; `HIPFIRE_QWEN4_DECODE_SHARE_SYNC=1` waits here). A prompt that
+    /// ended with an error takes the blocking recovery.
     pub(crate) fn share_finish_prompt(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
+        ok: bool,
     ) -> Result<(), Qwen4GpuForwardError> {
-        Ok(())
+        match self.share.as_mut().and_then(|share| share.loan.as_mut()) {
+            Some(loan) => loan
+                .with_ops(gpu, |controller, ops| controller.finish_prompt(ops, ok))
+                .map_err(invalid),
+            None => Ok(()),
+        }
     }
 
     /// Device bytes this forward's scratch is charged: the resident bank, the
@@ -10943,9 +11340,26 @@ impl Qwen4GpuForward {
             // `scratch` (and its owners are freed once, below).
             share.swap_out(&mut scratch);
             eprintln!(
-                "  qwen4 decode-share[bank]: {} prompt tiles ran on borrowed prefill banks ({} bank swaps)",
+                "  qwen4 decode-share: {} prompt tiles ran on borrowed prefill banks ({} bank swaps)",
                 share.stats.tiles_borrowed, share.stats.bank_swaps
             );
+            // The donors must be whole before the lease can go. A restore that
+            // cannot be proven complete leaks the loan (claim, lease retention,
+            // restore stream and events) instead of freeing under a pending DMA.
+            if let Some(loan) = share.loan.as_mut() {
+                let torn_down = loan.with_ops(gpu, |controller, ops| controller.teardown(ops));
+                eprintln!(
+                    "  qwen4 decode-share: donor loan {}",
+                    loan.controller.summary()
+                );
+                if let Err(error) = torn_down {
+                    eprintln!(
+                        "  qwen4 decode-share: teardown restore not proven ({error}); leaking the \
+                         donor loan rather than freeing under a possibly pending copy"
+                    );
+                    std::mem::forget(share.loan.take());
+                }
+            }
         }
         if let Some(error) = scratch.free_gpu(gpu) {
             first.get_or_insert(error);
@@ -11265,8 +11679,8 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_rows,
         );
-        let finish = self.share_prompt_end(gpu);
-        result.and(finish)
+        let finish = self.share_prompt_end(gpu, result.is_ok());
+        merge_share_result(result, finish)
     }
 
     /// The tile loop of [`Self::forward_chunk`].
@@ -11432,8 +11846,8 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_prompt_begin();
         let result = self.forward_chunk_silent_tiles(bundle, gpu, tokens, wide_hidden_capture);
-        let finish = self.share_prompt_end(gpu);
-        result.and(finish)
+        let finish = self.share_prompt_end(gpu, result.is_ok());
+        merge_share_result(result, finish)
     }
 
     /// The tile loop of [`Self::forward_chunk_silent`].
@@ -12055,6 +12469,7 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        self.share_check()?;
         if self.share.is_none() && self.moe_borrow.is_empty() {
             return self.forward_chunk_tile(
                 bundle,
@@ -12102,7 +12517,7 @@ impl Qwen4GpuForward {
             return result;
         }
         let after = self.share_after_tile(gpu, result.is_ok());
-        result.and(after)
+        merge_share_result(result, after)
     }
 
     /// One tile on the bank selected in `scratch`: every forward runs under
@@ -12595,6 +13010,9 @@ impl Qwen4GpuForward {
         // runtime fields only (`Self::tile_moe` would borrow all of `self`
         // across the program build and its closures).
         let tile_moe = tile_moe_of(self.borrow_runtimes_active, &self.moe, &self.moe_borrow);
+        // Whether the donor tail is whole for this call (read once, before the
+        // program closures borrow `self`; the loan state cannot change inside a tile).
+        let donor_resident = self.share_state_resident();
         // The MoE seal reads this call's canonical route rows from the
         // dispatch context (`batch_size = route_rows`): a short tail of a long
         // prefill keeps `rows != route_rows` and the GPU route, while a whole
@@ -13242,6 +13660,15 @@ impl Qwen4GpuForward {
                     return Err(invalid(format!("Qwen4 retained replay refused: {reason}")));
                 }
             }
+            // A retained replay never runs while the donor tail is borrowed:
+            // `share_require_resident` ran at `forward_chunk_inner` entry for
+            // every call that is not a borrowed prompt tile, and a borrowed
+            // tile (>= 512 rows) is never retained-eligible.
+            debug_assert!(
+                !(pm4_route || aql_route || shadow_route == Some(ShadowBodyRoute::HipOracle))
+                    || donor_resident,
+                "a retained replay was submitted while the donor tail is not resident"
+            );
             let routed = if pm4_route {
                 // Forced non-default retained route: HIP PLE staging (evidence
                 // 54ba6c5a6) is outside the PM4 queue's ordering, so drain the
@@ -15475,6 +15902,7 @@ mod tests {
             )),
             dirty_bytes: 0,
             stats: Default::default(),
+            loan: None,
             prompt_depth: 0,
         };
         let prompt_rows = |share: &super::DecodeShareBanks, scratch: &Scratch| {

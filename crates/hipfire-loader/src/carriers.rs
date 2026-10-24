@@ -4855,7 +4855,7 @@ fn load_qwen4_rank_scoped(
         None
     } else if !decode_share_mode.plans_donors() {
         eprintln!(
-            "  qwen4 decode-share: decode-share mode {} not wired yet; plain placement",
+            "  qwen4 decode-share: mode {} plans no donor tail; plain placement",
             decode_share_mode.name()
         );
         None

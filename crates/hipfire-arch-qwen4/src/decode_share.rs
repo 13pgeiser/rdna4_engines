@@ -19,8 +19,18 @@ use crate::gpu_forward::{Qwen4ForwardScratchMode, QWEN4_DECODE_SHARE_RESIDENT_RO
 pub const DECODE_SHARE_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE";
 
 /// Developer knob: `1` verifies the donor tail against its mirror right after
-/// materialization (a debug oracle; a mismatch fails the load).
+/// materialization and, in `fixed` / `on`, after every donor restore (a debug
+/// oracle; a mismatch fails the load or poisons the loan).
 pub const DECODE_SHARE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_VERIFY";
+
+/// Developer knob: `1` makes the donor restore host-wait right after it is
+/// enqueued (instead of at the next call that needs the donors), for A/B
+/// timing of the overlapped restore.
+pub const DECODE_SHARE_SYNC_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_SYNC";
+
+/// Developer knob: `1` logs one line per borrow epoch (tiles, class span,
+/// zeroed and restored bytes, host wait).
+pub const DECODE_SHARE_LOG_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_LOG";
 
 /// How a load uses decode-share.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,15 +81,34 @@ impl DecodeShareMode {
         }
     }
 
-    /// Whether the loader plans a donor tail for this mode (S2: `bind` only).
+    /// Whether the loader plans a donor tail for this mode: `bind`, `fixed`
+    /// and `on` share one placement plan (`bank` runs on an owned test
+    /// backing and needs no donors; growing the hot budget under `on` is the
+    /// loader's later step).
     pub fn plans_donors(self) -> bool {
-        self == Self::Bind
+        matches!(self, Self::Bind | Self::Fixed | Self::On)
+    }
+
+    /// Whether the forward builds its prefill banks over the real donor tail
+    /// (`fixed`, `on`); `bank` uses an owned test backing.
+    pub fn uses_donor_backing(self) -> bool {
+        matches!(self, Self::Fixed | Self::On)
     }
 }
 
 /// [`DECODE_SHARE_VERIFY_ENV`] from the process snapshot: exactly `1`.
 pub fn decode_share_verify_enabled() -> bool {
     hipfire_config::developer_bool(DECODE_SHARE_VERIFY_ENV, false)
+}
+
+/// [`DECODE_SHARE_SYNC_ENV`] from the process snapshot: exactly `1`.
+pub fn decode_share_sync_enabled() -> bool {
+    hipfire_config::developer_bool(DECODE_SHARE_SYNC_ENV, false)
+}
+
+/// [`DECODE_SHARE_LOG_ENV`] from the process snapshot: exactly `1`.
+pub fn decode_share_log_enabled() -> bool {
+    hipfire_config::developer_bool(DECODE_SHARE_LOG_ENV, false)
 }
 
 /// What the loader knows about a load when it decides decode-share.
@@ -211,13 +240,14 @@ mod tests {
         ] {
             assert_eq!(DecodeShareMode::parse(Some(mode.name())), mode);
         }
-        assert!(DecodeShareMode::Bind.plans_donors());
         for mode in [
-            DecodeShareMode::Off,
-            DecodeShareMode::Bank,
+            DecodeShareMode::Bind,
             DecodeShareMode::Fixed,
             DecodeShareMode::On,
         ] {
+            assert!(mode.plans_donors(), "{mode:?}");
+        }
+        for mode in [DecodeShareMode::Off, DecodeShareMode::Bank] {
             assert!(!mode.plans_donors(), "{mode:?}");
         }
     }

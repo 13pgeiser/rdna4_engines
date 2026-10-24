@@ -1792,12 +1792,12 @@ impl Qwen4Bundle {
         }
     }
 
-    /// The whole-prompt entry [`Self::share_prompt_begin`] opened ends (Ok and
-    /// Err alike); the outermost one finishes the prompt.
-    pub(crate) fn share_prompt_end(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+    /// The whole-prompt entry [`Self::share_prompt_begin`] opened ends (`ok`:
+    /// it returned `Ok`); the outermost one finishes the prompt.
+    pub(crate) fn share_prompt_end(&mut self, gpu: &mut Gpu, ok: bool) -> Result<(), BundleError> {
         match self.execution.as_mut() {
             Some(forward) => forward
-                .share_prompt_end(gpu)
+                .share_prompt_end(gpu, ok)
                 .map_err(|error| BundleError::Forward(error.to_string())),
             None => Ok(()),
         }
@@ -4299,7 +4299,7 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         self.share_prompt_begin();
         let result = self.prefill_final_tiles(gpu, prompt, reused, logits);
-        let finish = self.share_prompt_end(gpu);
+        let finish = self.share_prompt_end(gpu, result.is_ok());
         result.and(finish)
     }
 

@@ -1224,7 +1224,7 @@ impl Qwen4Bundle {
         self.share_prompt_begin();
         let result = self.spec_advance_tiles(gpu, tokens, start_pos, reset, abort, hidden_out);
         let finish = self
-            .share_prompt_end(gpu)
+            .share_prompt_end(gpu, result.is_ok())
             .map_err(|error| error.to_string());
         result.and_then(|advance| finish.map(|()| advance))
     }
@@ -8967,9 +8967,10 @@ impl Qwen4MtpDrafter {
         if !single {
             return result;
         }
+        let ok = result.is_ok();
         let finish = Self::bundle(target).and_then(|bundle| {
             bundle
-                .share_prompt_end(ops.gpu()?)
+                .share_prompt_end(ops.gpu()?, ok)
                 .map_err(|error| error.to_string())
         });
         result.and_then(|outcome| finish.map(|()| outcome))

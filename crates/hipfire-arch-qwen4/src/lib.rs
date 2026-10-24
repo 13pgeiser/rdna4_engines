@@ -27,6 +27,8 @@ pub mod config;
 pub mod d2_default;
 /// Decode-share developer knobs, mode enum and load admission.
 pub mod decode_share;
+/// Donor-tail loan state machine of decode-share (`fixed` / `on`).
+pub(crate) mod decode_share_loan;
 /// Target side of the shared DFlash2 drafter (layer capture, embed, head).
 pub(crate) mod dflash_target;
 pub mod ep;
