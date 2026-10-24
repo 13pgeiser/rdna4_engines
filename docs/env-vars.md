@@ -432,6 +432,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_VERIFY_GRAPH` / `_TIMING` / `_TREE` | verify-side graph diag |
 | `HIPFIRE_MMQ` / `HIPFIRE_WO_MMQ` | MMQ activation |
 | `HIPFIRE_MMQ_SCREEN` / `HIPFIRE_MMQ_SCREEN_THRESHOLD` / `HIPFIRE_MMQ_MIN_BATCH` | screening |
+| `HIPFIRE_GFX12_GATE_UP_TILE_LOOP` | gfx1201: on unless `0`; ignored elsewhere. Exact gfx1201, MQ4G256V2 MLP gate+up one-tile verify kernel (`gemm_gate_up_mq4g256v2_wmma_gfx12`, N 1..=16 on the plain arm): launches a reduced row-tile grid (`ceil(row_tiles / t)`, `t = ceil(row_tiles / (CUs * 32))`) and loops over row tiles with stride `gridDim.x`. Byte-identical; `0` restores grid x = row tiles. |
 | `HIPFIRE_PREFILL_BATCHED` / `HIPFIRE_PREFILL_CHUNK_ROWS` | batched prefill knobs (config mirrors). PFlash (`speculation.prefill.*`, `HIPFIRE_PFLASH_*`) is **deprecated since 0.4.0, removal in 0.5.0** |
 | `HIPFIRE_PREFILL_BATCHED` | RuntimeConfig: on unless `0` (Qwen-style batched prefill gate — **not** the LFM flag) |
 | `HIPFIRE_FLASH_PREFILL` | Developer override for Q8 WMMA flash prefill: `0` forces off, `1` forces on; unset uses the architecture/workload envelope. |
@@ -1600,6 +1601,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX12_FA_PREP_FP8Q` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX12_FA_PREP_FUSED` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX12_FP8_STREAM` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/batched.rs | stable |
+| `HIPFIRE_GFX12_GATE_UP_TILE_LOOP` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_GFX12_GDN_CHUNK_SCAN` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/batched.rs | stable |
