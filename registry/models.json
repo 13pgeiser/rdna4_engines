@@ -737,6 +737,9 @@
         }
       },
       "repo": "hipfire-models/qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
       "file": "qwen3.6-35b-a3b-d53.mq4rs",
       "size_gb": 18.7,
       "size_bytes": 18700570368,
