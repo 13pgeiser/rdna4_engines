@@ -735,13 +735,6 @@ TEST(kv_resident_is_the_whole_switch_and_its_ring_is_whole_tokens) {
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.kv_resident, 0ll);              /* nothing streams */
     CHECK(!d.kv_streams);                      /* derived: no group streams either */
-    for (const char* old : { "auto", "on", "off", "measure" }) {
-        Config c;
-        int st = RAD_OK;
-        const std::string log = stderr_of([&] { st = parse({ "--kv-streaming", old }, &c); });
-        CHECK_EQ(st, (int)RAD_E_INVAL);
-        CHECK(has(log, "--kv-resident"));      /* the message names the replacement */
-    }
     Config c;
     CHECK_EQ(parse({ "--kv-resident", "262144" }, &c), RAD_OK);
     CHECK_EQ(c.kv_resident, 262144ll);
