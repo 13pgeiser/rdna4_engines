@@ -865,7 +865,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1736
+**Count:** 1737
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2116,7 +2116,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_CACHE_QUALITY_OUT` | crates/hipfire-arch-qwen4/src/cache_quality.rs | developer |
 | `HIPFIRE_QWEN4_CAPACITY_BYTES` | crates/hipfire-quantize/src/qwen4.rs | developer |
 | `HIPFIRE_QWEN4_COMPACT_FORCE_UNVERIFIED` | crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
-| `HIPFIRE_QWEN4_COMPACT_SCRATCH` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_QWEN4_COMPACT_SCRATCH` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/host_link.rs | developer |
 | `HIPFIRE_QWEN4_CUT_LAYERS` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-loader/examples/fn_ep_oracle.rs | developer |
 | `HIPFIRE_QWEN4_D2_DEFAULT` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | developer |
 | `HIPFIRE_QWEN4_D2_JOIN` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
@@ -2218,7 +2218,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_SHARED_DOWN_EPI` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_SHARED_DOWN_FUSE` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_SHARED_GU_PM` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_SHARED_INT8` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/examples/shared_i8_bench.rs | developer |
+| `HIPFIRE_QWEN4_SHARED_INT8` | crates/hipfire-arch-qwen4/examples/qwen4_placement_receipt.rs, crates/hipfire-arch-qwen4/src/expert_residency.rs | developer |
 | `HIPFIRE_QWEN4_SLAB_K1_C1` | crates/hipfire-dispatch/src/pipeline/slab_route.rs, crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs | developer |
 | `HIPFIRE_QWEN4_SLAB_K1_CN` | crates/hipfire-runtime/examples/mq_i4_moe_gemv_c1_oracle.rs, crates/rdna-compute/src/slab_moe.rs | developer |
 | `HIPFIRE_QWEN4_SLOWLINK_PREFILL` | crates/hipfire-arch-qwen4/examples/qwen4_greedy_ids.rs, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | developer |
