@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.3.1
+
+- **A3B `qwen3.6:35b-a3b-mq4rs` decodes on retained Redline PM4 by default on gfx1201.** The symmetric-expert A3B file (`qwen3_5_moe`, `.mq4rs`) ran the HIP graph at 156 tok/s because `retained_redline_default` admitted only `.mq4r` and Qwen3.5 dense; it now takes the same retained PM4 default as `.mq4r` on exact gfx1201 with pp=tp=1 and no drafter (MTP-loaded requests, CPU offload, and `replay.backend = "hip"` are unchanged). Greedy ids are identical to the HIP route; tg128 ~232 tok/s at ctx 128, ~217 at 8K. Selection is by file extension, marked deprecated since 0.4.0 / removal 0.5.0 like the `.mq4r` route.
+- **Registry: `qwen3.6:35b-a3b-mq4rs` now declares the `qwen3.6-35b-a3b.mtp` sidecar** every other `qwen3.6:35b-a3b*` entry carries, so `--spec mtp` finds the head. `speculation.mtp=auto` still resolves to AR for Qwen3.5.
+
 ## v0.4.2.1 — 2026-10-14
 
 - **Strix Halo NPU trunk: the built-in calibration now applies on any Halo kernel and NPU firmware.** `npu_trunk=auto` armed only when the compiled-in Halo calibration matched the host exactly, including the kernel release, NPU firmware and GPU PCI address of the machine it was measured on, so every stock-kernel Halo logged `npu-trunk: off (calibration key mismatch: kernel.uname_release)` and served GPU-only. For the built-in calibration those three fields are now advisory: when any differs, it is used with its margin raised to 0.05 (the pipe must be predicted at least 5% faster than GPU-only, since the timings were measured on a different kernel/firmware), and the load logs `npu-trunk: built-in calibration measured on <kernel>/<fw>, this host <kernel>/<fw>; using it with margin 0.05`. Arch, build, model-index hash, epilogue and trunk route stay strict, and a user calibration file stays fully strict. Output is exact on either route; the calibration only chooses between them. First-load self-calibration is planned.
