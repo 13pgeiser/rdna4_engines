@@ -33541,6 +33541,19 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         use std::os::raw::c_void;
+        if self.hfq4_gate_up_indexed_drops_tail(k) {
+            return self.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                expert_ptrs,
+                topk_indices,
+                x_rot,
+                y_gate,
+                y_up,
+                m,
+                k,
+                8,
+                1,
+            );
+        }
         self.bind_thread()?;
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
