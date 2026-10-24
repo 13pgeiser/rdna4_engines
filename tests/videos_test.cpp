@@ -380,6 +380,10 @@ TEST(a_video_job_completes_and_serves_its_file) {
         SKIP("this build has no libavcodec to write the MP4 with");
     REQUIRE_EQ(str_at(o, "status"), std::string("completed"));
     CHECK_EQ(o["progress"].get<int>(), 100);
+    /* The step tally rides in the object (the fake generator lands 2 steps): a waiting client
+     * reads steps_done/steps_total while in_progress, and they survive into the finished object. */
+    CHECK_EQ(o["steps_done"].get<int>(), 2);
+    CHECK_EQ(o["steps_total"].get<int>(), 2);
     CHECK(o["completed_at"].is_number());
     CHECK(o["expires_at"].get<int64_t>() > o["completed_at"].get<int64_t>());
     CHECK(o["error"].is_null());

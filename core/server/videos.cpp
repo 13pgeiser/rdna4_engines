@@ -80,6 +80,12 @@ struct Server::VideoJob {
     /* Under Server::videos_m_ from here on. */
     std::string status = "queued";
     int         progress = 0;
+    /* The step tally while the ticket runs: denoiser steps landed and total (steps_total 0 until
+     * the first STEP event), and the first step's arrival on the steady clock in ns -- the
+     * per-step log line's rate and eta are measured from it, so queue and encode time do not
+     * inflate them. */
+    int         steps_done = 0, steps_total = 0;
+    int64_t     step_ns0 = 0;
     int64_t     completed_at = 0, expires_at = 0;
     bool        failed = false;
     std::string err_code, err_message;
@@ -1064,9 +1070,27 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
             continue;
         }
         if (e.kind == gen::VideoEvent::STEP) {
+            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             std::lock_guard<std::mutex> lk(videos_m_);
             j->status = "in_progress";
             j->progress = t.steps > 0 ? (int)(90LL * e.steps_done / t.steps) : 0;
+            j->steps_done = e.steps_done;
+            j->steps_total = t.steps;
+            if (!j->step_ns0) j->step_ns0 = now;
+            /* One line per step -- the per-step heartbeat the server deliberately never had, so
+             * `docker logs -f` (and any console) shows a waiting client progress and pace like a
+             * local sampler. The rate is the mean since the FIRST step landed (queue and encode
+             * time excluded); with a latent upscale the small steps are quicker than the refine
+             * ones, so the eta is a mean's guess -- the completion line's breakdown is exact. */
+            const double el = (double)(now - j->step_ns0) / 1e9;
+            const double per = e.steps_done > 1 ? el / (e.steps_done - 1) : 0.0;
+            if (per > 0)
+                RAD_INFO("video %s: step %d/%d, %.2f s/step, eta %.0f s",
+                         j->id.c_str(), e.steps_done, t.steps, per,
+                         per * (double)(t.steps - e.steps_done));
+            else
+                RAD_INFO("video %s: step %d/%d", j->id.c_str(), e.steps_done, t.steps);
         } else if (e.kind == gen::VideoEvent::LENGTH) {
             std::lock_guard<std::mutex> lk(videos_m_);
             j->seconds = rad::fmt("%.2f", (double)e.n * info.fps_den / info.fps_num);
@@ -1182,6 +1206,10 @@ json Server::video_json(const VideoJob& j) {
     o["model"] = j.model;
     o["status"] = j.status;
     o["progress"] = j.progress;
+    if (j.steps_total > 0) {   /* the step heartbeat; absent until the first step lands */
+        o["steps_done"] = j.steps_done;
+        o["steps_total"] = j.steps_total;
+    }
     o["created_at"] = j.created_at;
     o["completed_at"] = j.completed_at ? json(j.completed_at) : json(nullptr);
     o["expires_at"] = j.expires_at ? json(j.expires_at) : json(nullptr);
