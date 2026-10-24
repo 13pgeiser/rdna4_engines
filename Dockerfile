@@ -140,9 +140,12 @@ ARG JOBS=
 # libstdc++, which is also the runtime image's. gawk: tools/ops_doc_check.sh uses gensub, which
 # mawk lacks. libdav1d7, libwebp7 and libopenh264-7 are the runtime libraries of the ffmpeg stage's
 # AV1 decoder, WebP encoder and H.264 encoder; busybox-static goes into the runtime image.
+# libopenblas-dev: libquant's GPTQ factorises its Hessians through LAPACK where it finds OpenBLAS
+# (libquant/CMakeLists.txt); without it rad-convert's gptq rule runs single-threaded loops.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 libopenh264-7 busybox-static \
+      libopenblas-dev \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
