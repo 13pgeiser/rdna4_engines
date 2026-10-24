@@ -771,6 +771,8 @@ pub struct FeatureFlags {
     /// for gfx1151 (`0` is the kill switch); exact gfx1151, the lane step and
     /// the Qwen4 speculative verify only.
     pub fn_lane_pm_rows: bool,
+    /// Exact gfx1201: the MQ4G256V2 gate+up verify kernel launches a reduced row-tile grid and loops (`HIPFIRE_GFX12_GATE_UP_TILE_LOOP`).
+    pub gfx12_gate_up_tile_loop: bool,
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
     /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
     /// exactly `0` (kill switch for both). KLD-gated, not bit-exact against
@@ -1388,6 +1390,8 @@ impl FeatureFlags {
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
+            gfx12_gate_up_tile_loop: parse_bool("HIPFIRE_GFX12_GATE_UP_TILE_LOOP")
+                .unwrap_or(arch == "gfx1201"),
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref()
                 != Some("0"),
             qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
@@ -1479,6 +1483,13 @@ impl FeatureFlags {
     /// ([`crate::Gpu::lane_rows_pm_enabled`]).
     pub fn fn_lane_pm_rows_enabled(&self) -> bool {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
+    }
+
+    /// gfx1201 MQ4G256V2 gate+up verify: the one-tile WMMA kernel loops over row
+    /// tiles on a grid no larger than the resident wave slots
+    /// (`HIPFIRE_GFX12_GATE_UP_TILE_LOOP`, gfx1201: on unless `0`). Exact gfx1201 only.
+    pub fn gfx12_gate_up_tile_loop_enabled(&self) -> bool {
+        self.gfx12_gate_up_tile_loop && self.arch == "gfx1201"
     }
 
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
@@ -1926,6 +1937,7 @@ impl FeatureFlags {
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
+            gfx12_gate_up_tile_loop: false,
             qwen4_qsa_decode_splitk: false,
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
@@ -2194,6 +2206,33 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    #[test]
+    fn gfx12_gate_up_tile_loop_defaults_on_exact_gfx1201_and_zero_kills() {
+        for arch in ["gfx906", "gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_GFX12_GATE_UP_TILE_LOOP" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            assert_eq!(
+                flags(None).gfx12_gate_up_tile_loop_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            assert!(
+                !flags(Some("0")).gfx12_gate_up_tile_loop_enabled(),
+                "{arch}: 0"
+            );
+            assert_eq!(
+                flags(Some("1")).gfx12_gate_up_tile_loop_enabled(),
+                arch == "gfx1201",
+                "{arch}: 1"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").gfx12_gate_up_tile_loop_enabled());
     }
 
     /// The lane-rows PM kernels default on for exact gfx1151 only: `0` is the

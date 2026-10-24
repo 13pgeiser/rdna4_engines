@@ -1767,6 +1767,36 @@ fn mqv2_prefill_batch_tile(
     }
 }
 
+/// Resident-wave slots per CU for the 76-VGPR `__launch_bounds__(32, 2)` gate+up
+/// kernel on gfx1201: 2 SIMD x 16 waves.
+const GATE_UP_TILE_LOOP_SLOTS_PER_CU: usize = 32;
+
+/// Grid x for `gemm_gate_up_mq4g256v2_wmma_gfx12` when it loops over row tiles
+/// with stride `gridDim.x`: `ceil(row_tiles / t)` with `t = ceil(row_tiles / slots)`.
+/// Equals `row_tiles` whenever `row_tiles <= slots`.
+pub(crate) fn gate_up_tile_loop_grid_x(row_tiles: usize, cu_count: usize) -> usize {
+    let slots = (cu_count * GATE_UP_TILE_LOOP_SLOTS_PER_CU).max(1);
+    let t = row_tiles.div_ceil(slots).max(1);
+    row_tiles.div_ceil(t)
+}
+
+#[cfg(test)]
+mod gate_up_tile_loop_tests {
+    use super::gate_up_tile_loop_grid_x;
+
+    #[test]
+    fn grid_rule() {
+        assert_eq!(gate_up_tile_loop_grid_x(2176, 64), 1088);
+        assert_eq!(gate_up_tile_loop_grid_x(1088, 64), 1088);
+        assert_eq!(gate_up_tile_loop_grid_x(896, 64), 896);
+        assert_eq!(gate_up_tile_loop_grid_x(2048, 64), 2048);
+        assert_eq!(gate_up_tile_loop_grid_x(2049, 64), 1025);
+        // 4097 tiles -> t = 3 -> ceil(4097 / 3) = 1366
+        assert_eq!(gate_up_tile_loop_grid_x(4097, 64), 1366);
+        assert_eq!(gate_up_tile_loop_grid_x(0, 64), 0);
+    }
+}
+
 impl Gpu {
     /// Every condition of the gfx1201 builder `_b1` selection except the
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
@@ -35690,6 +35720,12 @@ impl Gpu {
         let total_m = gate_m + up_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 16 * bt_b - 1) / (16 * bt_b);
+        // Plain one-tile kernel only: persistent row-tile loop on a reduced grid.
+        let grid_x = if bt_b == 1 && self.flags.gfx12_gate_up_tile_loop_enabled() {
+            gate_up_tile_loop_grid_x(row_tiles, self.cu_count_or_default())
+        } else {
+            row_tiles
+        };
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
             + batch_size * k * 2
@@ -35697,7 +35733,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
+            [grid_x as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
